@@ -142,3 +142,6 @@ MOCHI_MIGRATION.md
 
 # Runtime/test artifacts
 sqlite_mcp_server.db
+
+# oh-my-claudecode operational state (session-local, never committed)
+.omc/
