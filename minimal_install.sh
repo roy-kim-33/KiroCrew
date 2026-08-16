@@ -7,7 +7,7 @@
 # No Brazil, no Builder Toolbox, no internal registries.
 #
 # Run from inside a cloned repo:
-#   git clone https://github.com/encomjp/kirocrew-customapi.git
+#   git clone https://github.com/roy-kim-33/KiroCrew.git
 #   cd kirocrew
 #   bash minimal_install.sh
 #

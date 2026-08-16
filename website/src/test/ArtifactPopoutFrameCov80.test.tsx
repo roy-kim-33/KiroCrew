@@ -58,21 +58,21 @@ describe('ArtifactPopoutFrame', () => {
 
   it('mirrors the fetched artifact name into the window title', async () => {
     renderFrame()
-    await waitFor(() => expect(document.title).toBe('zz-artifact-name — Kiro Crew'))
+    await waitFor(() => expect(document.title).toBe('zz-artifact-name — RoyCrew'))
     expect(artifact).toHaveBeenCalledWith('zz-slug')
   })
 
   it('titles from the slug until the name lands', () => {
     artifact.mockReturnValue(new Promise(() => {}))
     renderFrame()
-    expect(document.title).toBe('zz-slug — Kiro Crew')
+    expect(document.title).toBe('zz-slug — RoyCrew')
   })
 
   it('skips the fetch and registration without a slug', () => {
     renderFrame('/popout/artifact')
     expect(artifact).not.toHaveBeenCalled()
     expect(registerPopout).not.toHaveBeenCalled()
-    expect(document.title).toBe('Artifact — Kiro Crew')
+    expect(document.title).toBe('Artifact — RoyCrew')
   })
 
   it('returns to the main window from the labelled affordance', () => {

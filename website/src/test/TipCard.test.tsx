@@ -96,7 +96,7 @@ describe('TipCard (single-line strip)', () => {
     )
     const link = screen.getByRole('link', { name: /learn more/i }) as HTMLAnchorElement
     expect(link.href).toBe(
-      'https://github.com/encomjp/kirocrew-customapi/blob/main/src/kiro_crew/docs/cron-and-scheduling.md',
+      'https://github.com/roy-kim-33/KiroCrew/blob/main/src/kiro_crew/docs/cron-and-scheduling.md',
     )
     expect(link.target).toBe('_blank')
     expect(link.rel).toContain('noopener')
@@ -125,7 +125,7 @@ describe('TipCard (single-line strip)', () => {
     )
     const link = screen.getByRole('link', { name: /learn more/i }) as HTMLAnchorElement
     expect(link.href).toBe(
-      'https://github.com/kirodotdev/KiroCrew/blob/main/src/kiro_crew/docs/dynamic-subagent-sizing.md',
+      'https://github.com/roy-kim-33/KiroCrew/blob/main/src/kiro_crew/docs/dynamic-subagent-sizing.md',
     )
   })
 
@@ -139,7 +139,7 @@ describe('TipCard (single-line strip)', () => {
     )
     const preferred = screen.getByRole('link', { name: /learn more/i }) as HTMLAnchorElement
     expect(preferred.href).toBe(
-      'https://github.com/kirodotdev/KiroCrew/blob/main/src/kiro_crew/docs/skills.md',
+      'https://github.com/roy-kim-33/KiroCrew/blob/main/src/kiro_crew/docs/skills.md',
     )
   })
 

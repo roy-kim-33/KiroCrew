@@ -1,4 +1,4 @@
-"""Tests for the router model-id prefix contract (kirocrew-customapi fork).
+"""Tests for the router model-id prefix contract (RoyCrew fork).
 
 CLIProxyAPI (http://127.0.0.1:8317) rejects prefixed model ids with "unknown
 provider", so the ACP client must strip the known provider prefix before the

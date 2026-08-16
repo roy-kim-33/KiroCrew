@@ -1,12 +1,12 @@
 #!/bin/bash
-# Build KiroCrew-customapi Linux packages: .deb, .rpm, relocatable tarball.
+# Build KiroCrew Linux packages: .deb, .rpm, relocatable tarball.
 #
 # Produces (in dist/packages/):
-#   kirocrew-customapi_<ver>_amd64.deb
-#   kirocrew-customapi-<ver>-1.x86_64.rpm
-#   kirocrew-customapi-<ver>-linux-x86_64.tar.gz
+#   roycrew_<ver>_amd64.deb
+#   roycrew-<ver>-1.x86_64.rpm
+#   roycrew-<ver>-linux-x86_64.tar.gz
 #
-# Each package bundles a self-contained Python venv (/opt/kirocrew-customapi)
+# Each package bundles a self-contained Python venv (/opt/roycrew)
 # with ALL dependencies — no pip install at the consumer side. The Claude
 # Code backend (claude + claude-agent-acp via npm) is intentionally NOT
 # bundled; it is an optional runtime for provider=claude_code.
@@ -22,7 +22,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VERSION="${1:-$(grep -E '^version' "$REPO_ROOT/pyproject.toml" | head -1 | sed -E 's/version = "(.*)"/\1/')}"
-PKG="kirocrew-customapi"
+PKG="roycrew"
 STAGE="$(mktemp -d)/stage"
 DIST="$REPO_ROOT/dist/packages"
 mkdir -p "$STAGE/opt/$PKG" "$DIST"
@@ -63,11 +63,11 @@ mkdir -p "$STAGE/usr/bin" "$STAGE/usr/share/applications" \
          "$STAGE/usr/share/icons/hicolor/512x512/apps"
 cat > "$STAGE/usr/bin/kirocrew" <<'EOF'
 #!/bin/sh
-exec /opt/kirocrew-customapi/venv/bin/kirocrew "$@"
+exec /opt/roycrew/venv/bin/kirocrew "$@"
 EOF
 chmod 755 "$STAGE/usr/bin/kirocrew"
 
-cat > "$STAGE/usr/share/applications/kirocrew-customapi.desktop" <<'EOF'
+cat > "$STAGE/usr/share/applications/roycrew.desktop" <<'EOF'
 [Desktop Entry]
 Type=Application
 Name=Kiro Crew
@@ -99,8 +99,8 @@ Priority: optional
 Architecture: amd64
 Depends: python3 (>= 3.10)
 Recommends: nodejs, npm
-Maintainer: Adrian Kozlowski <encomjp@users.noreply.github.com>
-Homepage: https://github.com/encomjp/KiroCrew-customapi
+Maintainer: Roy Kim <roy-kim-33@users.noreply.github.com>
+Homepage: https://github.com/roy-kim-33/KiroCrew
 Description: Kiro Crew with the Claude Code ACP backend for custom LLM routers
  Kiro Crew is an open source development workspace that runs locally or
  remotely on your hardware. This fork re-enables the dormant claude_code
@@ -128,20 +128,20 @@ echo "==> .deb:   $DIST/${PKG}_${VERSION}-1_amd64.deb"
 
 # ---- tarball -------------------------------------------------------------
 TARBALL="$(mktemp -d)"
-mkdir -p "$TARBALL/kirocrew-customapi-$VERSION"
-cp -a "$STAGE/opt/$PKG/venv" "$TARBALL/kirocrew-customapi-$VERSION/"
-cat > "$TARBALL/kirocrew-customapi-$VERSION/install.sh" <<'EOF'
+mkdir -p "$TARBALL/roycrew-$VERSION"
+cp -a "$STAGE/opt/$PKG/venv" "$TARBALL/roycrew-$VERSION/"
+cat > "$TARBALL/roycrew-$VERSION/install.sh" <<'EOF'
 #!/bin/sh
-# KiroCrew-customapi installer - relocatable tarball install
-# Usage: ./install.sh [--prefix /opt/kirocrew-customapi] [--user]
+# KiroCrew installer - relocatable tarball install
+# Usage: ./install.sh [--prefix /opt/roycrew] [--user]
 set -e
-PREFIX="/opt/kirocrew-customapi"
+PREFIX="/opt/roycrew"
 MODE="system"
 case "$1" in
-  --user) PREFIX="$HOME/.local/share/kirocrew-customapi"; MODE="user" ;;
+  --user) PREFIX="$HOME/.local/share/roycrew"; MODE="user" ;;
   --prefix) PREFIX="$2"; shift ;;
 esac
-echo "==> Installing KiroCrew-customapi to $PREFIX"
+echo "==> Installing KiroCrew to $PREFIX"
 mkdir -p "$PREFIX"
 cp -a venv "$PREFIX/"
 # Rewrite shebangs to the actual install prefix (the tarball is relocatable)
@@ -169,22 +169,22 @@ echo "==> Done. Verify with: kirocrew --version"
 echo "    Optional backend for provider=claude_code:"
 echo "    npm install -g @anthropic-ai/claude-code @agentclientprotocol/claude-agent-acp"
 EOF
-chmod 755 "$TARBALL/kirocrew-customapi-$VERSION/install.sh"
-tar -czf "$DIST/kirocrew-customapi-$VERSION-linux-x86_64.tar.gz" \
-    -C "$TARBALL" "kirocrew-customapi-$VERSION"
-echo "==> tarball: $DIST/kirocrew-customapi-$VERSION-linux-x86_64.tar.gz"
+chmod 755 "$TARBALL/roycrew-$VERSION/install.sh"
+tar -czf "$DIST/roycrew-$VERSION-linux-x86_64.tar.gz" \
+    -C "$TARBALL" "roycrew-$VERSION"
+echo "==> tarball: $DIST/roycrew-$VERSION-linux-x86_64.tar.gz"
 
 # ---- .rpm ----------------------------------------------------------------
 RPMTOP="$(mktemp -d)"
 mkdir -p "$RPMTOP"/{BUILD,BUILDROOT,RPMS,SOURCES,SRPMS,SPECS} "$RPMTOP/rpmdb"
 RPMTARBALL="$RPMTOP/SOURCES/$PKG-$VERSION.tar.gz"
 TARBALL2="$(mktemp -d)"
-mkdir -p "$TARBALL2/kirocrew-customapi-$VERSION/opt"
-cp -a "$STAGE/opt/$PKG" "$TARBALL2/kirocrew-customapi-$VERSION/opt/"
-cp "$STAGE/usr/share/applications/kirocrew-customapi.desktop" \
+mkdir -p "$TARBALL2/roycrew-$VERSION/opt"
+cp -a "$STAGE/opt/$PKG" "$TARBALL2/roycrew-$VERSION/opt/"
+cp "$STAGE/usr/share/applications/roycrew.desktop" \
    "$STAGE/usr/share/icons/hicolor/512x512/apps/kirocrew.png" \
-   "$TARBALL2/kirocrew-customapi-$VERSION/" 2>/dev/null || true
-tar -czf "$RPMTARBALL" -C "$TARBALL2" "kirocrew-customapi-$VERSION"
+   "$TARBALL2/roycrew-$VERSION/" 2>/dev/null || true
+tar -czf "$RPMTARBALL" -C "$TARBALL2" "roycrew-$VERSION"
 
 cat > "$RPMTOP/SPECS/$PKG.spec" <<EOF
 Name:           $PKG
@@ -192,7 +192,7 @@ Version:        $VERSION
 Release:        1
 Summary:        Kiro Crew with Claude Code ACP backend for custom LLM routers
 License:        Apache-2.0
-URL:            https://github.com/encomjp/KiroCrew-customapi
+URL:            https://github.com/roy-kim-33/KiroCrew
 Source0:        %{name}-%{version}.tar.gz
 BuildArch:      x86_64
 Requires:       python3 >= 3.10
@@ -216,17 +216,17 @@ required for provider=claude_code.
 # payload is a pre-built relocatable venv
 
 %install
-mkdir -p %{buildroot}/opt/kirocrew-customapi
+mkdir -p %{buildroot}/opt/roycrew
 mkdir -p %{buildroot}/usr/bin
 mkdir -p %{buildroot}/usr/share/applications
 mkdir -p %{buildroot}/usr/share/icons/hicolor/512x512/apps
-cp -a opt/kirocrew-customapi/venv %{buildroot}/opt/kirocrew-customapi/
+cp -a opt/roycrew/venv %{buildroot}/opt/roycrew/
 cat > %{buildroot}/usr/bin/kirocrew <<'INNEREOF'
 #!/bin/sh
-exec /opt/kirocrew-customapi/venv/bin/kirocrew "\$@"
+exec /opt/roycrew/venv/bin/kirocrew "\$@"
 INNEREOF
 chmod 755 %{buildroot}/usr/bin/kirocrew
-cp kirocrew-customapi.desktop %{buildroot}/usr/share/applications/
+cp roycrew.desktop %{buildroot}/usr/share/applications/
 cp kirocrew.png %{buildroot}/usr/share/icons/hicolor/512x512/apps/
 
 %post
@@ -235,14 +235,14 @@ if command -v gtk-update-icon-cache >/dev/null 2>&1; then
 fi
 
 %files
-/opt/kirocrew-customapi/
+/opt/roycrew/
 /usr/bin/kirocrew
-/usr/share/applications/kirocrew-customapi.desktop
+/usr/share/applications/roycrew.desktop
 /usr/share/icons/hicolor/512x512/apps/kirocrew.png
 
 %changelog
-* $(date -u '+%a %b %d %Y') Adrian Kozlowski <encomjp@users.noreply.github.com> - $VERSION-1
-- Initial package: KiroCrew-customapi with bundled venv
+* $(date -u '+%a %b %d %Y') Roy Kim <roy-kim-33@users.noreply.github.com> - $VERSION-1
+- Initial package: KiroCrew with bundled venv
 EOF
 
 rpmbuild --define "_topdir $RPMTOP" --define "_dbpath $RPMTOP/rpmdb" \

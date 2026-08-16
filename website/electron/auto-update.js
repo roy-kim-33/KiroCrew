@@ -64,8 +64,8 @@ function isBundleContainerWritable(resourcesPath) {
 // The fork's own repo: the single update source. The GitHub provider resolves
 // release metadata (latest-mac.yml / latest-linux.yml) from the repo's releases
 // over the GitHub API, and bytes from the release assets — no CDN involved.
-const GITHUB_OWNER = "encomjp";
-const GITHUB_REPO = "kirocrew-customapi";
+const GITHUB_OWNER = "roy-kim-33";
+const GITHUB_REPO = "KiroCrew";
 const DOWNLOAD_BASE = `https://github.com/${GITHUB_OWNER}/${GITHUB_REPO}/releases/latest/download`;
 const CHECK_INTERVAL_MS = 4 * 60 * 60 * 1000; // every 4h while running
 const LAUNCH_CHECK_DELAY_MS = 30 * 1000; // let startup settle first
@@ -131,9 +131,9 @@ function buildFeedBase({ base, channel }) {
 function manualDownloadUrl(version, osPlatform) {
   if (!version) return null;
   const file = osPlatform === "darwin"
-    ? `kirocrew-customapi-${version}-arm64.dmg`
+    ? `RoyCrew-${version}-arm64.dmg`
     : osPlatform === "linux"
-      ? `kirocrew-customapi-${version}.AppImage`
+      ? `RoyCrew-${version}.AppImage`
       : null;
   if (!file) return null;
   return `${DOWNLOAD_BASE}/${file}`;

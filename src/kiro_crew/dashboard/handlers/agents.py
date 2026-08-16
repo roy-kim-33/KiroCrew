@@ -2001,10 +2001,31 @@ async def api_provider_test(request: web.Request) -> web.Response:
         return web.json_response(
             {"ok": False, "error": "url required", "code": "url_required"}, status=400
         )
+    from urllib.parse import urlparse
+
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        return web.json_response(
+            {"ok": False, "error": "url must be http(s)", "code": "url_scheme"}, status=400
+        )
     api_format = str(body.get("format") or "openai")
     api_key = str(body.get("api_key") or "")
     if not api_key and body.get("use_stored"):
+        # The stored key is only ever sent to the host it was saved for —
+        # otherwise any page that can reach the dashboard could exfiltrate it
+        # by pointing `url` at an attacker server. Loopback targets are fine
+        # (local routers are the normal case); foreign hosts are not.
         cfg = KiroCrewConfig.load()
+        saved = urlparse(cfg.agent.provider_base_url or "")
+        if not saved.hostname or (parsed.hostname, parsed.port) != (saved.hostname, saved.port):
+            return web.json_response(
+                {
+                    "ok": False,
+                    "error": "stored key may only be tested against the saved base URL",
+                    "code": "stored_key_host_mismatch",
+                },
+                status=400,
+            )
         api_key = (cfg.agent.provider_api_key or "").strip()
     headers: dict[str, str] = {}
     if api_key:
@@ -2016,7 +2037,8 @@ async def api_provider_test(request: web.Request) -> web.Response:
     fetch_url = f"{url.rstrip('/')}/v1/models"
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=8)) as session:
-            async with session.get(fetch_url, headers=headers) as resp:
+            # no redirects: a redirect could re-point the credentialed request
+            async with session.get(fetch_url, headers=headers, allow_redirects=False) as resp:
                 if resp.status != 200:
                     return web.json_response({"ok": False, "error": f"HTTP {resp.status}"})
                 data = await resp.json()

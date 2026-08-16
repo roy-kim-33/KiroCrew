@@ -32,7 +32,7 @@ def test_write_opencode_provider_config(tmp_path, monkeypatch) -> None:
     }
     client._write_opencode_provider_config()
 
-    cfg_path = tmp_path / ".config" / "kirocrew-customapi" / "opencode-home" / ".config" / "opencode" / "opencode.json"
+    cfg_path = tmp_path / ".config" / "roycrew" / "opencode-home" / ".config" / "opencode" / "opencode.json"
     data = json.loads(cfg_path.read_text(encoding="utf-8"))
     prov = data["provider"]["kirocrew"]
     assert prov["npm"] == "@ai-sdk/openai-compatible"
@@ -58,7 +58,7 @@ def test_write_opencode_provider_config_normalizes_ollama_cloud_url(tmp_path, mo
     client._write_opencode_provider_config()
 
     data = json.loads(
-        (tmp_path / ".config" / "kirocrew-customapi" / "opencode-home" / ".config" / "opencode" / "opencode.json").read_text(encoding="utf-8")
+        (tmp_path / ".config" / "roycrew" / "opencode-home" / ".config" / "opencode" / "opencode.json").read_text(encoding="utf-8")
     )
     provider = data["provider"]["kirocrew"]
     assert provider["options"]["baseURL"] == "https://ollama.com/v1"
@@ -73,7 +73,7 @@ def test_write_opencode_provider_config_is_isolated(tmp_path, monkeypatch) -> No
     client._write_opencode_provider_config()
 
     data = json.loads(
-        (tmp_path / ".config" / "kirocrew-customapi" / "opencode-home" / ".config" / "opencode" / "opencode.json").read_text(encoding="utf-8")
+        (tmp_path / ".config" / "roycrew" / "opencode-home" / ".config" / "opencode" / "opencode.json").read_text(encoding="utf-8")
     )
     assert data["provider"]["kirocrew"]["npm"] == "@ai-sdk/anthropic"
     assert data["provider"]["kirocrew"]["options"]["baseURL"] == "http://localhost:8317"

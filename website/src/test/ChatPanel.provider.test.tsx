@@ -10,7 +10,7 @@ import React from 'react'
 const { patchConfigMock, kirocrewConfigMock, modelsMock } = vi.hoisted(() => ({
   patchConfigMock: vi.fn(() => Promise.resolve({})),
   kirocrewConfigMock: vi.fn(() =>
-    Promise.resolve({ agent: { provider: 'claude_code', provider_base_url: '', provider_api_key: '', model: 'auto' } })
+    Promise.resolve({ agent: { acp_backend: 'claude', provider_base_url: '', provider_api_key: '', model: 'auto' } })
   ),
   modelsMock: vi.fn(() => Promise.resolve([{ model_name: 'auto', description: 'Default' }])),
 }))
@@ -54,7 +54,7 @@ describe('ChatPanel Provider section', () => {
   })
 
   it('prefills the URL from a preset and saves provider fields', async () => {
-    seed({ provider: 'claude_code', provider_base_url: '', provider_api_key: '', model: 'auto' })
+    seed({ acp_backend: 'claude', provider_base_url: '', provider_api_key: '', model: 'auto' })
     patchConfigMock.mockClear()
     wrap(<ChatPanel />)
 
@@ -74,14 +74,14 @@ describe('ChatPanel Provider section', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Save provider' }))
 
     await waitFor(() => {
-      expect(patchConfigMock).toHaveBeenCalledWith('agent.provider', 'opencode')
+      expect(patchConfigMock).toHaveBeenCalledWith('agent.acp_backend', 'opencode')
       expect(patchConfigMock).toHaveBeenCalledWith('agent.provider_base_url', 'https://api.groq.com/openai')
       expect(patchConfigMock).toHaveBeenCalledWith('agent.provider_api_key', 'sk-groq-1')
     })
   })
 
   it('shows a saved-key placeholder instead of the real key', async () => {
-    seed({ provider: 'claude_code', provider_base_url: 'http://localhost:8317', provider_api_key: 'sk-stored', model: 'auto' })
+    seed({ acp_backend: 'claude', provider_base_url: 'http://localhost:8317', provider_api_key: 'sk-stored', model: 'auto' })
     wrap(<ChatPanel />)
     const keyInput = await screen.findByLabelText('API key') as HTMLInputElement
     expect(keyInput.value).toBe('')

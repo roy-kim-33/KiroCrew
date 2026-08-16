@@ -185,11 +185,11 @@ test("manualDownloadUrl: fork GitHub release permalinks (per-platform)", () => {
   // passes the pending version (found/staged/running).
   assert.strictEqual(
     manualDownloadUrl("0.2.0-customapi.1", "darwin"),
-    `${DOWNLOAD_BASE}/kirocrew-customapi-0.2.0-customapi.1-arm64.dmg`,
+    `${DOWNLOAD_BASE}/RoyCrew-0.2.0-customapi.1-arm64.dmg`,
   );
   assert.strictEqual(
     manualDownloadUrl("0.2.0-customapi.1", "linux"),
-    `${DOWNLOAD_BASE}/kirocrew-customapi-0.2.0-customapi.1.AppImage`,
+    `${DOWNLOAD_BASE}/RoyCrew-0.2.0-customapi.1.AppImage`,
   );
 });
 
@@ -205,6 +205,6 @@ test("manualDownloadUrl: points at the fork's GitHub releases, not a CDN", () =>
   // A manual reinstall must land on the fork's own release assets.
   assert.match(
     manualDownloadUrl("0.2.0", "linux"),
-    /^https:\/\/github\.com\/encomjp\/kirocrew-customapi\/releases\/latest\/download\//,
+    /^https:\/\/github\.com\/roy-kim-33\/KiroCrew\/releases\/latest\/download\//,
   );
 });

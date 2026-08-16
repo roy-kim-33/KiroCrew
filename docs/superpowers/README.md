@@ -1,6 +1,6 @@
 # Superpowers docs
 
-Brainstorming specs and implementation plans for kirocrew-customapi feature work.
+Brainstorming specs and implementation plans for RoyCrew feature work.
 
 - [Design specs](specs/) — approved feature designs (`YYYY-MM-DD-<topic>-design.md`)
 - [Implementation plans](plans/) — task-by-task build plans (`YYYY-MM-DD-<topic>.md`)

@@ -664,7 +664,7 @@ describe('AppsPage — sources rail', () => {
     expect(within(rail).getByText('Built-in · kirocrew')).toBeInTheDocument()
     expect(within(rail).getByText('kirodotdev-labs')).toBeInTheDocument()
     expect(within(rail).getByText('ghost-registry')).toBeInTheDocument()
-    expect(within(rail).getByText('Kiro Crew registry')).toBeInTheDocument()
+    expect(within(rail).getByText('RoyCrew registry')).toBeInTheDocument()
     expect(within(rail).getByText('0 apps')).toBeInTheDocument()
   })
 })

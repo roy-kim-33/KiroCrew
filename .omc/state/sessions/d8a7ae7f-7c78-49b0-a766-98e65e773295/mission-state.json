@@ -1,0 +1,97 @@
+{
+  "updatedAt": "2026-08-16T18:48:14.771Z",
+  "missions": [
+    {
+      "id": "session:d8a7ae7f-7c78-49b0-a766-98e65e773295:none",
+      "source": "session",
+      "name": "none",
+      "objective": "Session mission",
+      "createdAt": "2026-08-16T08:19:50.422Z",
+      "updatedAt": "2026-08-16T18:48:14.771Z",
+      "status": "running",
+      "workerCount": 3,
+      "taskCounts": {
+        "total": 3,
+        "pending": 0,
+        "blocked": 0,
+        "inProgress": 1,
+        "completed": 2,
+        "failed": 0
+      },
+      "agents": [
+        {
+          "name": "research-setup:aresear",
+          "role": "research-setup",
+          "ownership": "aresearch-setup-125659fa225744d4",
+          "status": "done",
+          "currentStep": null,
+          "latestUpdate": "completed",
+          "completedSummary": null,
+          "updatedAt": "2026-08-16T18:48:14.771Z"
+        },
+        {
+          "name": "fork:aee2f69",
+          "role": "fork",
+          "ownership": "aee2f692fe3418b21",
+          "status": "done",
+          "currentStep": null,
+          "latestUpdate": "completed",
+          "completedSummary": null,
+          "updatedAt": "2026-08-16T08:25:33.899Z"
+        },
+        {
+          "name": "merge-executor:amerge-",
+          "role": "merge-executor",
+          "ownership": "amerge-executor-3d5483dc80bc820b",
+          "status": "running",
+          "currentStep": null,
+          "latestUpdate": null,
+          "completedSummary": null,
+          "updatedAt": "2026-08-16T10:07:06.548Z"
+        }
+      ],
+      "timeline": [
+        {
+          "id": "session-stop:a648ff1f243cffa97:2026-08-16T09:14:38.999Z",
+          "at": "2026-08-16T09:14:38.999Z",
+          "kind": "completion",
+          "agent": "research-setup:aresear",
+          "detail": "completed",
+          "sourceKey": "session-stop:a648ff1f243cffa97"
+        },
+        {
+          "id": "session-stop:af6e8d91edfe40116:2026-08-16T09:15:03.878Z",
+          "at": "2026-08-16T09:15:03.878Z",
+          "kind": "completion",
+          "agent": "research-setup:aresear",
+          "detail": "completed",
+          "sourceKey": "session-stop:af6e8d91edfe40116"
+        },
+        {
+          "id": "session-start:amerge-executor-3d5483dc80bc820b:2026-08-16T10:07:06.548Z",
+          "at": "2026-08-16T10:07:06.548Z",
+          "kind": "update",
+          "agent": "merge-executor:amerge-",
+          "detail": "started merge-executor:amerge-",
+          "sourceKey": "session-start:amerge-executor-3d5483dc80bc820b"
+        },
+        {
+          "id": "session-stop:af603ad08cd7c297d:2026-08-16T18:43:39.597Z",
+          "at": "2026-08-16T18:43:39.597Z",
+          "kind": "completion",
+          "agent": "research-setup:aresear",
+          "detail": "completed",
+          "sourceKey": "session-stop:af603ad08cd7c297d"
+        },
+        {
+          "id": "session-stop:ad1b6cf32e752b33a:2026-08-16T18:48:14.771Z",
+          "at": "2026-08-16T18:48:14.771Z",
+          "kind": "completion",
+          "agent": "research-setup:aresear",
+          "detail": "completed",
+          "sourceKey": "session-stop:ad1b6cf32e752b33a"
+        }
+      ]
+    }
+  ]
+}

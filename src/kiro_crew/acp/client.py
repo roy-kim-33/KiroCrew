@@ -2518,15 +2518,15 @@ class AcpClient:
     def _write_opencode_provider_config(self) -> None:
         """Write an isolated OpenCode config for the fork's custom provider.
 
-        Writes to ``~/.config/kirocrew-customapi/opencode-home/.config/opencode/
+        Writes to ``~/.config/roycrew/opencode-home/.config/opencode/
         opencode.json`` so that when the OpenCode ACP process is spawned with
-        ``HOME`` set to ``~/.config/kirocrew-customapi/opencode-home``, it sees
+        ``HOME`` set to ``~/.config/roycrew/opencode-home``, it sees
         only our provider — no user plugins (Honcho) or MCP servers that would
         stall the ACP session.
         """
         home = os.path.expanduser("~")
         cfg_dir = os.path.join(
-            home, ".config", "kirocrew-customapi", "opencode-home", ".config", "opencode"
+            home, ".config", "roycrew", "opencode-home", ".config", "opencode"
         )
         os.makedirs(cfg_dir, exist_ok=True)
         path = os.path.join(cfg_dir, "opencode.json")
@@ -3316,12 +3316,12 @@ class AcpClient:
             # (~/.config/opencode/opencode.json and .jsonc) which may contain
             # plugins (Honcho) and MCP servers that stall the ACP session.
             # _write_opencode_provider_config already wrote our isolated
-            # config to ~/.config/kirocrew-customapi/opencode-home/.config/
+            # config to ~/.config/roycrew/opencode-home/.config/
             # opencode/opencode.json — setting HOME to that root makes
             # OpenCode see ONLY our config, with zero user plugins or MCP.
             isolated_home = os.path.join(
                 os.path.expanduser("~"),
-                ".config", "kirocrew-customapi", "opencode-home",
+                ".config", "roycrew", "opencode-home",
             )
             env["HOME"] = isolated_home
         logger.debug(

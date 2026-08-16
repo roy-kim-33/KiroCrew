@@ -7,8 +7,8 @@
 blank_issues_enabled: true
 contact_links:
   - name: Question or idea
-    url: https://github.com/encomjp/kirocrew-customapi/discussions
+    url: https://github.com/roy-kim-33/KiroCrew/discussions
     about: Ask how something works, or float an idea before it is a request.
   - name: Security vulnerability
-    url: https://github.com/encomjp/kirocrew-customapi/blob/main/SECURITY.md
+    url: https://github.com/roy-kim-33/KiroCrew/blob/main/SECURITY.md
     about: Report privately by email. Do not open a public issue.

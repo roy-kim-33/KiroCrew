@@ -920,7 +920,7 @@ class TestAcpClientBackendSelection:
             await client._spawn()
 
         spawn_env = mock_exec.call_args.kwargs.get("env", {})
-        assert spawn_env.get("HOME", "").endswith("kirocrew-customapi/opencode-home"), (
+        assert spawn_env.get("HOME", "").endswith("RoyCrew/opencode-home"), (
             "OpenCode spawn must set HOME to an isolated directory"
         )
 

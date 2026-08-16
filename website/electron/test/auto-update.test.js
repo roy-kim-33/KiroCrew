@@ -119,7 +119,7 @@ test("configureUpdater: allowPrerelease=true (nightly/insider stamps are semver 
 test("CONTRACT: absolute artifact urls pass through newUrlFromBase unchanged (pointer/bytes split)", () => {
   const { newBaseUrl, newUrlFromBase } = require("electron-updater/out/util");
   const base = newBaseUrl(buildFeedBase({ base: "https://updates.crew.kiro.dev/feed", channel: "nightly" }));
-  const absolute = "https://download.crew.kiro.dev/desktop/nightly/0.1.0-nightly.20260728t112233/kirocrew-customapi-arm64.dmg";
+  const absolute = "https://download.crew.kiro.dev/desktop/nightly/0.1.0-nightly.20260728t112233/RoyCrew-arm64.dmg";
   // Base is on a DIFFERENT host than the artifact: the absolute url must win.
   assert.strictEqual(newUrlFromBase(absolute, base).href, absolute);
 });
@@ -689,8 +689,8 @@ test("default feed uses the fork's GitHub provider (single stable lane)", async 
   assert.ok(calls.setFeedURL.length >= 1);
   for (const o of calls.setFeedURL) {
     assert.strictEqual(o.provider, "github");
-    assert.strictEqual(o.owner, "encomjp");
-    assert.strictEqual(o.repo, "kirocrew-customapi");
+    assert.strictEqual(o.owner, "roy-kim-33");
+    assert.strictEqual(o.repo, "KiroCrew");
   }
 });
 
@@ -814,8 +814,8 @@ test("BLOCKING-fix contract: package.json declares the fork's GitHub publish ent
   const publish = pkg.build && pkg.build.publish;
   assert.ok(Array.isArray(publish) && publish.length > 0, "build.publish must be a non-empty array");
   assert.strictEqual(publish[0].provider, "github");
-  assert.strictEqual(publish[0].owner, "encomjp");
-  assert.strictEqual(publish[0].repo, "kirocrew-customapi");
+  assert.strictEqual(publish[0].owner, "roy-kim-33");
+  assert.strictEqual(publish[0].repo, "KiroCrew");
 });
 
 // ---------------------------------------------------------------------------
@@ -827,14 +827,14 @@ test("BLOCKING-fix contract: package.json declares the fork's GitHub publish ent
 test("manualDownloadUrl: linux points at the fork's latest AppImage release", () => {
   assert.strictEqual(
     manualDownloadUrl("0.2.0", "linux"),
-    "https://github.com/encomjp/kirocrew-customapi/releases/latest/download/kirocrew-customapi-0.2.0.AppImage",
+    "https://github.com/roy-kim-33/KiroCrew/releases/latest/download/RoyCrew-0.2.0.AppImage",
   );
 });
 
 test("manualDownloadUrl: darwin points at the fork's arm64 dmg", () => {
   assert.strictEqual(
     manualDownloadUrl("0.2.0", "darwin"),
-    "https://github.com/encomjp/kirocrew-customapi/releases/latest/download/kirocrew-customapi-0.2.0-arm64.dmg",
+    "https://github.com/roy-kim-33/KiroCrew/releases/latest/download/RoyCrew-0.2.0-arm64.dmg",
   );
 });
 
@@ -848,6 +848,6 @@ test("getInfo.downloadUrl uses the pending version (running version before disco
   const u = initAutoUpdate(deps);
   assert.strictEqual(
     u.getInfo().downloadUrl,
-    "https://github.com/encomjp/kirocrew-customapi/releases/latest/download/kirocrew-customapi-1.0.0.AppImage",
+    "https://github.com/roy-kim-33/KiroCrew/releases/latest/download/RoyCrew-1.0.0.AppImage",
   );
 });

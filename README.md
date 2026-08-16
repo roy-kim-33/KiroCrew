@@ -1,17 +1,17 @@
 <p align="center">
-  <img src="assets/banner.svg" alt="kirocrew-customapi. Keep work moving. Runs on your hardware, remembers across sessions, keeps working unattended.">
+  <img src="assets/banner.svg" alt="RoyCrew. Keep work moving. Runs on your hardware, remembers across sessions, keeps working unattended.">
 </p>
 
-<h1 align="center">kirocrew-customapi</h1>
+<h1 align="center">RoyCrew</h1>
 
 <p align="center">
-  <strong>kirocrew-customapi — with the Claude Code ACP backend re-enabled for self-hosted LLM routers.</strong>
+  <strong>RoyCrew — with the Claude Code ACP backend re-enabled for self-hosted LLM routers.</strong>
 </p>
 
 <p align="center">
   This fork of <a href="https://github.com/kirodotdev/KiroCrew">kirodotdev/KiroCrew</a> re-activates the
   dormant <code>claude_code</code> provider (the <code>ACP_BACKEND_CLAUDE</code> seam) so you can drive
-  kirocrew-customapi through <strong>your own model router</strong> — e.g. a local
+  RoyCrew through <strong>your own model router</strong> — e.g. a local
   <a href="https://github.com/decolua/9router">9router</a> or a
   <strong>CLIProxyAPI</strong> instance at <code>http://localhost:8317</code> speaking the Anthropic API —
   instead of Kiro's built-in Bedrock catalog.
@@ -33,19 +33,19 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/encomjp/kirocrew-customapi/releases/latest">
+  <a href="https://github.com/roy-kim-33/KiroCrew/releases/latest">
     <img alt="Download Linux AppImage" src="https://img.shields.io/badge/Linux-AppImage-3b82f6?style=for-the-badge&logo=linux&logoColor=white">
   </a>
-  <a href="https://github.com/encomjp/kirocrew-customapi/releases/latest">
+  <a href="https://github.com/roy-kim-33/KiroCrew/releases/latest">
     <img alt="Download macOS DMG" src="https://img.shields.io/badge/macOS-Apple%20Silicon-a3a3a3?style=for-the-badge&logo=apple&logoColor=white">
   </a>
-  <a href="https://github.com/encomjp/kirocrew-customapi/releases/latest">
+  <a href="https://github.com/roy-kim-33/KiroCrew/releases/latest">
     <img alt="Download Windows Setup" src="https://img.shields.io/badge/Windows-Setup%20.exe-00b4d8?style=for-the-badge&logo=windows&logoColor=white">
   </a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/encomjp/kirocrew-customapi/releases/latest">
+  <a href="https://github.com/roy-kim-33/KiroCrew/releases/latest">
     <strong>All assets &amp; older versions →</strong>
   </a>
 </p>
@@ -89,7 +89,7 @@ Attach any image via the composer's `+` / drag-drop (the native `FilePreviewStri
 
 ## Why
 
-kirocrew-customapi re-enables the dormant `claude_code` provider (the
+RoyCrew re-enables the dormant `claude_code` provider (the
 `ACP_BACKEND_CLAUDE` seam) and adds an `opencode` backend, so you can drive
 Kiro Crew through **your own model router** — Anthropic-compatible or
 OpenAI-compatible — instead of Kiro's built-in AWS Bedrock catalog and account.
@@ -110,10 +110,10 @@ kirodotdev/KiroCrew.
 ## How it works
 
 <p align="center">
-  <img src="assets/how-it-works.png" alt="kirocrew-customapi architecture: kirocrew-customapi -> claude-agent-acp -> Claude Code -> CLIProxyAPI" width="900">
+  <img src="assets/how-it-works.png" alt="RoyCrew architecture: RoyCrew -> claude-agent-acp -> Claude Code -> CLIProxyAPI" width="900">
 </p>
 
-- **kirocrew-customapi** (this fork) acts as the harness: sessions, tool permissions, memory, cron, dashboard.
+- **RoyCrew** (this fork) acts as the harness: sessions, tool permissions, memory, cron, dashboard.
 - **claude-agent-acp** is the ACP adapter (`@agentclientprotocol/claude-agent-acp` on npm) that exposes the
   Claude Code CLI as an ACP backend.
 - **Claude Code** is the agent engine. It talks to your router via `ANTHROPIC_BASE_URL` /
@@ -125,13 +125,13 @@ kirodotdev/KiroCrew.
 
 ## Installation
 
-### 1. Install kirocrew-customapi from this fork
+### 1. Install RoyCrew from this fork
 
 The quickest path is a source install into a virtualenv (Python 3.11+):
 
 ```bash
-git clone https://github.com/encomjp/kirocrew-customapi.git
-cd kirocrew-customapi
+git clone https://github.com/roy-kim-33/KiroCrew.git
+cd KiroCrew
 python3 -m venv .venv
 .venv/bin/pip install -e .
 .venv/bin/kirocrew --version
@@ -139,7 +139,7 @@ python3 -m venv .venv
 
 **Prefer the desktop app?** Grab the build for your OS with the buttons at the top of this README
 (AppImage for Linux, DMG for macOS Apple Silicon, Setup.exe for Windows), or browse everything under
-[the latest release](https://github.com/encomjp/kirocrew-customapi/releases/latest). Use the fork's build,
+[the latest release](https://github.com/roy-kim-33/KiroCrew/releases/latest). Use the fork's build,
 not upstream's: upstream's desktop shell is provider-agnostic, but only this fork's release is verified
 against the `claude_code` router backend.
 
@@ -202,7 +202,7 @@ environment variable (`ANTHROPIC_API_KEY` or `CLIPROXY_API_KEY`) if your router 
 
 CLIProxyAPI's five providers share model names — `deepseek-v4-flash` exists on both commandcode and
 opencode-go, `gpt-5.6-luna` on both commandcode and codex. The router picker therefore shows
-**prefixed ids** so you can tell them apart. Before the request reaches the proxy, kirocrew-customapi strips the
+**prefixed ids** so you can tell them apart. Before the request reaches the proxy, RoyCrew strips the
 known prefix and sends the **raw id** — CLIProxyAPI rejects prefixed spellings (`unknown provider`).
 
 Provider base URLs and notes:
@@ -315,7 +315,7 @@ curl -s -X POST "http://127.0.0.1:8317/v1/messages" \
 > Any other Anthropic-compatible router works too — [9router](https://github.com/decolua/9router)
 > being the classic reference setup. Only the prefixed-id catalog is CLIProxyAPI-specific.
 
-### Step 2 — Point kirocrew-customapi at it
+### Step 2 — Point RoyCrew at it
 
 ```bash
 .venv/bin/kirocrew config set agent.provider claude_code
@@ -426,7 +426,7 @@ catalog your router exposes:
 
 ## Updating from the fork
 
-This fork updates from **its own repo** (`encomjp/kirocrew-customapi`), never
+This fork updates from **its own repo** (`roy-kim-33/KiroCrew`), never
 from upstream `kirodotdev/KiroCrew`.
 
 - **Desktop app:** updates come from this repo's GitHub Releases (single

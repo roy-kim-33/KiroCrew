@@ -171,7 +171,7 @@ describe('App routing', () => {
       expect(localStorage.getItem('mc-import-onboarded')).toBe('1')
     })
     expect(screen.queryByRole('dialog', { name: 'Import agent setup' })).not.toBeInTheDocument()
-    expect(screen.queryByRole('dialog', { name: 'Welcome to kirocrew-customapi' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('dialog', { name: 'Welcome to RoyCrew' })).not.toBeInTheDocument()
   })
 
   it('waits for theme boot before deciding the foreign-agent import gate', async () => {
@@ -427,7 +427,7 @@ describe('App routing', () => {
     // kiro.dev link was removed.
     expect(screen.getByText('Star us')).toBeInTheDocument()
     expect(screen.getByText('Report issue')).toBeInTheDocument()
-    expect(screen.getByLabelText('Star kirocrew-customapi on GitHub')).toBeInTheDocument()
+    expect(screen.getByLabelText('Star RoyCrew on GitHub')).toBeInTheDocument()
     expect(
       screen.getByLabelText(
         'Report a problem — collects logs and crash reports, secrets removed',
@@ -735,7 +735,7 @@ describe('App routing', () => {
     localStorage.removeItem('mc-apps-expanded')
   })
 
-  it('renders kirocrew-customapi branding', () => {
+  it('renders RoyCrew branding', () => {
     localStorage.removeItem('mc-nav') // expanded sidebar shows the brand text
     renderWithProviders(<App />, { route: '/chat' })
     // Brand (logo + name) moved from the top bar into the sidebar menu row.

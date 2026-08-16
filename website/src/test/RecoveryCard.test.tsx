@@ -20,7 +20,7 @@ const BUSY = '[Session busy — automatic recovery]'
 function refusalBody(items: string[]): string {
   return [
     REFUSAL,
-    'One or more tool calls in your previous turn were blocked by a kirocrew-customapi safety policy, which ended the turn early. This was NOT a user action — do not treat it as a cancellation or interruption by the user.',
+    'One or more tool calls in your previous turn were blocked by a RoyCrew safety policy, which ended the turn early. This was NOT a user action — do not treat it as a cancellation or interruption by the user.',
     '',
     'Blocked:',
     ...items.map(i => `  - ${i}`),
