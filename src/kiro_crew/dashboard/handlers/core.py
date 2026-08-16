@@ -1537,10 +1537,11 @@ _MOVED_CONFIG_FIELDS: dict[str, str] = {
 
 
 _EDITABLE_CONFIG: dict[str, dict] = {
-    # Agent backend: kiro-native (acp/kiro-cli), Claude Code (claude_code,
-    # Anthropic-compatible base URL), or OpenCode (opencode, OpenAI-compatible
-    # base URL — OpenCode translates to Anthropic internally).
-    "agent.provider": {"type": "enum", "values": ["acp", "claude_code", "opencode"]},
+    # ACP harness: kiro-native (''/kiro-cli), KAS ('kas'), Claude Code ('claude',
+    # Anthropic-compatible base URL), or OpenCode ('opencode', OpenAI-compatible
+    # base URL — OpenCode translates to Anthropic internally). A harness is
+    # selected here, never via agent.provider (locked to "acp" — harness-parity).
+    "agent.acp_backend": {"type": "enum", "values": ["", "kas", "claude", "opencode"]},
     # Router base URL for the claude_code / opencode backends. Local
     # http://localhost:PORT and https endpoints both allowed; shell
     # metacharacters and whitespace rejected.
@@ -2025,8 +2026,8 @@ async def api_kirocrew_config_patch(request: web.Request) -> web.Response:
 
     cfg = KiroCrewConfig.load()
 
-    # If provider changed, reload the factory so new sessions use the new provider
-    if path_key in ("agent.provider", "agent.provider_base_url", "agent.provider_api_key", "agent.provider_api_format"):
+    # If the backend changed, reload the factory so new sessions use the new provider
+    if path_key in ("agent.acp_backend", "agent.provider_base_url", "agent.provider_api_key", "agent.provider_api_format"):
         state: DashboardState = request.app["state"]
         # Refresh agent artifacts so the target provider is immediately usable.
         # For claude_code this (re)writes ~/.claude/agents/kirocrew.mcp.json —
@@ -2047,7 +2048,8 @@ async def api_kirocrew_config_patch(request: web.Request) -> web.Response:
         state.push_slots_update()
         # Bug 3 fix: also clear the global default model when the provider
         # switches — the old provider's model id is invalid for the new one.
-        if path_key == "agent.provider" and cfg.agent.model:
+        if path_key == "agent.acp_backend" and cfg.agent.model:
+            from kiro_crew.agent import _atomic_json_write  # noqa: F811
             from kiro_crew.config.loader import config_path  # noqa: F811
 
             cfg_data = json.loads(config_path().read_text(encoding="utf-8"))
