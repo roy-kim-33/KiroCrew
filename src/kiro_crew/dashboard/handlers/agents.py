@@ -1993,10 +1993,14 @@ async def api_provider_test(request: web.Request) -> web.Response:
     try:
         body = await request.json()
     except Exception:
-        return web.json_response({"ok": False, "error": "invalid JSON"}, status=400)
+        return web.json_response(
+            {"ok": False, "error": "invalid JSON", "code": "invalid_json"}, status=400
+        )
     url = str(body.get("url") or "").strip()
     if not url:
-        return web.json_response({"ok": False, "error": "url required"}, status=400)
+        return web.json_response(
+            {"ok": False, "error": "url required", "code": "url_required"}, status=400
+        )
     api_format = str(body.get("format") or "openai")
     api_key = str(body.get("api_key") or "")
     if not api_key and body.get("use_stored"):

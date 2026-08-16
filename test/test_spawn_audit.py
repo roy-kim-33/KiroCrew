@@ -726,6 +726,12 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         "instances/token_mint.py::mint_remote_token",
         "instances/token_mint.py::run_remote_kirocrew",
         "mcp_core.py::_get_ppid",
+        # asyncio.run() driving the vision subagent's describe_image_via_chain
+        # coroutine — this call site constructs no argv itself. The eventual
+        # process spawn happens inside AcpClient's own spawn path (client.py),
+        # which is already routed through wrap_argv/sandboxed_spawn_argv there;
+        # an entry here would just duplicate that coverage one call removed.
+        "mcp_tools/vision.py::vision_analyze",
         "mcp_gateway/backend.py::spawn_backend",
         "mcp_gateway/gatewayd.py::main",
         "mcp_gateway/manager.py::_spawn_once",

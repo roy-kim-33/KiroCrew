@@ -2606,32 +2606,44 @@ async def api_mcp_gateway_set_poolable(request: web.Request) -> web.Response:
     gateway is disabled, the allowlist is persisted only (it takes effect when
     the gateway is enabled).  Returns ``{ok, name, poolable, ...}``.
     """
-    from kiro_crew.agent import _atomic_json_write
     from kiro_crew.config.loader import config_path  # noqa: F811
     from kiro_crew.dashboard.handlers.agents import _get_config_lock  # circular: agents imports mcp
 
     try:
         body = await request.json()
     except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
+        return web.json_response(
+            {"error": "invalid JSON", "code": "invalid_json"}, status=400
+        )
     name = str(body.get("name", "")).strip()
     poolable = body.get("poolable")
     if not name:
-        return web.json_response({"error": "name is required"}, status=400)
+        return web.json_response(
+            {"error": "name is required", "code": "name_required"}, status=400
+        )
     if not _is_valid_mcp_name(name):
-        return web.json_response({"error": "invalid server name"}, status=400)
+        return web.json_response(
+            {"error": "invalid server name", "code": "invalid_server_name"}, status=400
+        )
     if not isinstance(poolable, bool):
-        return web.json_response({"error": "poolable must be a boolean"}, status=400)
+        return web.json_response(
+            {"error": "poolable must be a boolean", "code": "poolable_not_boolean"}, status=400
+        )
 
     path = config_path()
     async with _get_config_lock():
         try:
             data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
         except (OSError, json.JSONDecodeError):
-            return web.json_response({"error": "config.json is corrupt"}, status=500)
+            return web.json_response(
+                {"error": "config.json is corrupt", "code": "config_corrupt"}, status=500
+            )
         section = data.setdefault("mcp_gateway", {})
         if not isinstance(section, dict):
-            return web.json_response({"error": "mcp_gateway is not an object"}, status=500)
+            return web.json_response(
+                {"error": "mcp_gateway is not an object", "code": "mcp_gateway_not_object"},
+                status=500,
+            )
         current = section.get("poolable_servers")
         servers_list = (
             [s for s in current if isinstance(s, str)] if isinstance(current, list) else []
@@ -2659,7 +2671,9 @@ async def api_mcp_gateway_set_poolable(request: web.Request) -> web.Response:
                 source="dashboard",
                 resources=f"name={name} poolable={poolable} error={exc}",
             )
-            return web.json_response({"error": f"apply failed: {exc}"}, status=500)
+            return web.json_response(
+                {"error": f"apply failed: {exc}", "code": "apply_failed"}, status=500
+            )
 
     sel().log_api_access(
         caller=request.get("user", "dashboard"),

@@ -61,8 +61,8 @@ def _kiro_request(tmp_path: Path) -> MagicMock:
 
 
 def _kiro_cfg() -> SimpleNamespace:
-    # Any non-"claude_code" provider takes the subprocess path under test.
-    return SimpleNamespace(agent=SimpleNamespace(provider="kiro"))
+    # Any non-"claude" acp_backend takes the subprocess path under test.
+    return SimpleNamespace(agent=SimpleNamespace(acp_backend=""))
 
 
 def _run(coro):

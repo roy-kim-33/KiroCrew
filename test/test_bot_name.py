@@ -40,15 +40,15 @@ class TestBotNameSubstitution:
 
         from kiro_crew.context import ContextBuilder
 
-        # When provider is ACP, default bot_name is "Kiro"
+        # When the acp_backend is kiro-cli (default), default bot_name is "Kiro"
         with patch("kiro_crew.context.KiroCrewConfig.load") as mock_cfg:
-            mock_cfg.return_value.agent.provider = "acp"
+            mock_cfg.return_value.agent.acp_backend = ""
             ctx = ContextBuilder(bot_name="")
             assert ctx._substitute_bot_name("You are {bot_name}.") == "You are Kiro."
 
-        # When provider is claude_code, default bot_name is "KiroCrew"
+        # When the acp_backend is claude, default bot_name is "KiroCrew"
         with patch("kiro_crew.context.KiroCrewConfig.load") as mock_cfg:
-            mock_cfg.return_value.agent.provider = "claude_code"
+            mock_cfg.return_value.agent.acp_backend = "claude"
             ctx = ContextBuilder(bot_name="")
             assert ctx._substitute_bot_name("You are {bot_name}.") == "You are KiroCrew."
 

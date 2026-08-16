@@ -22,8 +22,8 @@ from kiro_crew.dashboard.chat_utils import (
 )
 
 
-def _fake_config(provider: str):
-    return SimpleNamespace(agent=SimpleNamespace(provider=provider))
+def _fake_config(acp_backend: str):
+    return SimpleNamespace(agent=SimpleNamespace(acp_backend=acp_backend))
 
 
 def _make_app() -> web.Application:
@@ -34,10 +34,10 @@ def _make_app() -> web.Application:
     return app
 
 
-async def _get(provider: str):
+async def _get(acp_backend: str):
     with patch(
         "kiro_crew.dashboard.handlers.agents.KiroCrewConfig.load",
-        return_value=_fake_config(provider),
+        return_value=_fake_config(acp_backend),
     ):
         async with TestClient(TestServer(_make_app())) as client:
             resp = await client.get("/api/slash-commands")
@@ -57,7 +57,7 @@ def test_description_map_covers_slash_commands():
 class TestApiSlashCommands:
     @pytest.mark.asyncio
     async def test_default_provider_returns_described_commands(self):
-        payload = await _get("kiro")
+        payload = await _get("")
         by_name = {item["name"]: item["description"] for item in payload}
 
         # Default path returns the _SLASH_COMMANDS set minus the blocked
@@ -76,7 +76,7 @@ class TestApiSlashCommands:
         """Regression guard: no blocked command may appear in the suggestion
         payload. /tangent regressed this way once — present in _SLASH_COMMANDS
         (so the menu offered it) but rejected at execution time."""
-        payload = await _get("kiro")
+        payload = await _get("")
         names = {item["name"] for item in payload}
         leaked = names & _BLOCKED_SLASH_COMMANDS
         assert not leaked, f"blocked commands advertised in menu: {sorted(leaked)}"
@@ -90,7 +90,7 @@ class TestApiSlashCommands:
         state = SimpleNamespace(sessions=SimpleNamespace(active_providers=lambda: [provider]))
         with patch(
             "kiro_crew.dashboard.handlers.agents.KiroCrewConfig.load",
-            return_value=_fake_config("claude_code"),
+            return_value=_fake_config("claude"),
         ):
             app = _make_app()
             app["state"] = state

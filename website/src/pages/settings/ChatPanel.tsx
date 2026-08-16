@@ -96,6 +96,7 @@ const COMPLETION_KEEP_CHARS_MIN = 0
 // Mirrors RESULT_FILE_MAX_BYTES on the backend (handlers/core.py _EDITABLE_CONFIG).
 const COMPLETION_KEEP_CHARS_MAX = 512000
 const COMPLETION_KEEP_CHARS_DEFAULT = 3000
+const CHUNK_BUDGET_DEFAULT = 150
 
 export function ChatPanel() {
   const qc = useQueryClient()

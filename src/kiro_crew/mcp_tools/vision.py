@@ -16,6 +16,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from kiro_crew import mcp_core
 from kiro_crew.acp.vision import describe_image_via_chain, resolve_vision_providers
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.validation import VISION_ANALYZE_SCHEMA, validate_tool_args
@@ -120,9 +121,27 @@ def vision_analyze(name: str, args: dict[str, Any]) -> str:
             )
         )
     except Exception as exc:  # noqa: BLE001 - surface a clean tool error
+        mcp_core.sel().log_tool_invocation(
+            session_key=mcp_core._resolve_session_key(),
+            source="mcp",
+            tool_name="vision_analyze",
+            outcome="error",
+        )
         return f"Error: vision describe failed: {exc}"
     if not description or description == "unavailable":
+        mcp_core.sel().log_tool_invocation(
+            session_key=mcp_core._resolve_session_key(),
+            source="mcp",
+            tool_name="vision_analyze",
+            outcome="no_description",
+        )
         return "Error: vision describe failed (no description returned)"
+    mcp_core.sel().log_tool_invocation(
+        session_key=mcp_core._resolve_session_key(),
+        source="mcp",
+        tool_name="vision_analyze",
+        outcome="success",
+    )
     return description
 
 

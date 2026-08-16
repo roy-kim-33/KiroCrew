@@ -592,7 +592,11 @@ class TestResetPaths:
     def test_reset_state_unlinks_claude_settings_and_survives_pipe_errors(self, tmp_path):
         client = _client(tmp_path, acp_backend=ACP_BACKEND_CLAUDE)
         stale = tmp_path / ".claude" / "settings.local.json"
-        stale.parent.mkdir(parents=True)
+        # exist_ok=True: constructing a claude-backend client already seeds
+        # this file's parent dir (_write_claude_local_settings), so the
+        # directory can pre-exist before this test overwrites it with its own
+        # bypassPermissions fixture content.
+        stale.parent.mkdir(parents=True, exist_ok=True)
         stale.write_text('{"permissions": {"defaultMode": "bypassPermissions"}}')
 
         proc = MagicMock()

@@ -111,12 +111,17 @@ async def test_opencode_initialization_skips_kiro_mode() -> None:
     assert methods == ["initialize", "session/new"]
 
 
-def test_set_model_falls_back_to_default_when_unadvertised():
-    """A stale/unadvertised model must never reach the wire: set_model falls
-    back to the configured default, then 'auto', instead of raising."""
+def test_set_model_raises_on_a_stale_unadvertised_explicit_pick():
+    """set_model is the EXPLICIT-pick path (see AGENTS.md "Model selection"):
+    a stale/unadvertised model must raise AcpModelUnavailable, never silently
+    swap in a fallback — even when a usable default exists. A caller holding
+    an INHERITED value must pre-check with model_is_unusable and skip instead
+    of calling in here."""
     import asyncio
 
-    from kiro_crew.acp.client import AcpClient
+    import pytest
+
+    from kiro_crew.acp.client import AcpClient, AcpModelUnavailable
 
     client = object.__new__(AcpClient)
     client._acp_backend = "opencode"
@@ -130,13 +135,8 @@ def test_set_model_falls_back_to_default_when_unadvertised():
     client._resolved_model_id = ""
     client.last_prompt_stats = MagicMock()
 
-    async def _fake_send(*a, **k):
-        return None
-
-    client._send_request = _fake_send
-
-    asyncio.get_event_loop().run_until_complete(client.set_model("cmc/deepseek-v4-pro"))
-    assert client._model == "deepseek-v4-flash:0731", client._model
+    with pytest.raises(AcpModelUnavailable):
+        asyncio.get_event_loop().run_until_complete(client.set_model("cmc/deepseek-v4-pro"))
 
 
 def test_set_model_raises_only_when_default_also_unusable():

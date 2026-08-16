@@ -765,7 +765,7 @@ class TestSessionHandleRedirect:
             text_only_models = ["ol/deepseek-v4-flash:0731"]
             vision_providers = []
             vision_fallback_model = "kimi-k2.6"
-            provider = "opencode"
+            acp_backend = "opencode"
             provider_base_url = "https://ollama.com/v1"
             provider_api_key = "k"
             sandbox = "off"

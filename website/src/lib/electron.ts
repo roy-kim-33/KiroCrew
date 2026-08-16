@@ -82,10 +82,13 @@ export const WIN_CAPTION_OVERLAY_WIDTH = 138
 
 /**
  * True on Electron desktop platforms whose title bar is an overlay of native
- * caption buttons (Windows and Linux). macOS instead insets native traffic
- * lights on the left. Callers use this to reserve the right-side strip.
+ * caption buttons (Windows only — see WIN_CAPTION_OVERLAY_WIDTH). macOS
+ * instead insets native traffic lights on the left; frameless Linux has no
+ * native caption overlay at all, the SPA's own `.topbar-glass` drag region
+ * and controls take its place (see isLinuxFramelessElectron). Callers use
+ * this to reserve the right-side strip.
  */
-export const hasCaptionOverlay = isWinElectron || isLinuxElectron
+export const hasCaptionOverlay = isWinElectron
 
 /**
  * True when an app declares `platform.requiresDesktopApp` but we are in a

@@ -78,6 +78,7 @@ class TestBackendPredicates:
             provider.is_kiro_backend,
             provider.is_claude_backend,
             provider.is_kas_backend,
+            provider.is_opencode_backend,
         ]
         assert sum(held) == 1
 
@@ -85,9 +86,13 @@ class TestBackendPredicates:
     def test_acp_runtime_backend_is_the_positive_form_of_not_claude(self, backend):
         # The four provider sites that used to read ``not is_claude_backend``
         # now read ``is_acp_runtime_backend``; the two must stay equivalent for
-        # every known backend so the conversion is behavior-preserving.
+        # every AcpRuntime-eligible backend. The fork's opencode backend runs
+        # through AcpClient (one process per session), same as claude, so it
+        # is excluded from the equivalence on the same grounds claude is.
         provider = _build_provider(backend)
-        assert provider.is_acp_runtime_backend is (not provider.is_claude_backend)
+        assert provider.is_acp_runtime_backend is (
+            not provider.is_claude_backend and not provider.is_opencode_backend
+        )
 
 
 class TestUnknownBackendRejected:

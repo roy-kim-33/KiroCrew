@@ -4028,14 +4028,15 @@ class TestTokenPersistenceBackfill:
         slot = state.get_or_create_slot("s1")
         slot.model = ""  # CC has not yet emitted init when _run_chat begins
 
-        # This simulates a claude_code session, so the backfill must run under
-        # provider=claude_code for canonicalize_for_provider to map 'opus' ->
-        # 'opus-4.8-1m'. The default test config is provider=acp, under which the
-        # backfill (correctly) leaves a kiro/acp model unchanged — so force a CC
-        # config here. _run_chat reads only cfg.agent.provider (+ dashboard.
-        # merge_queued_messages) on this path, so a MagicMock cfg suffices.
+        # This simulates a claude session, so the backfill must run under
+        # acp_backend=claude for canonicalize_for_provider to map 'opus' ->
+        # 'opus-4.8-1m'. The default test config is acp_backend="", under which
+        # the backfill (correctly) leaves a kiro/acp model unchanged — so force
+        # a CC config here. _run_chat reads only cfg.agent.acp_backend (+
+        # dashboard.merge_queued_messages) on this path, so a MagicMock cfg
+        # suffices.
         _cc_cfg = MagicMock()
-        _cc_cfg.agent.provider = "claude_code"
+        _cc_cfg.agent.acp_backend = "claude"
         _cc_cfg.dashboard.merge_queued_messages = False
         monkeypatch.setattr("kiro_crew.dashboard.chat_runner.KiroCrewConfig.load", lambda: _cc_cfg)
 
