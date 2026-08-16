@@ -1,7 +1,8 @@
 {
-  "name": "kirocrew-electron-mac",
-  "version": "0.3.0",
-  "description": "Kiro Crew \u2014 AI agent desktop app",
+  "name": "kirocrew-customapi",
+  "version": "0.2.0-customapi.5",
+  "description": "kirocrew-customapi \u2014 AI agent desktop app (fork of Kiro Crew)",
+  "homepage": "https://github.com/encomjp/kirocrew-customapi",
   "main": "main.js",
   "scripts": {
     "start": "electron .",
@@ -24,8 +25,8 @@
     "js-yaml": "4.3.1"
   },
   "build": {
-    "appId": "com.amazon.kiro.crew",
-    "productName": "KiroCrew",
+    "appId": "com.kirocrew.customapi",
+    "productName": "kirocrew-customapi",
     "mac": {
       "category": "public.app-category.developer-tools",
       "icon": "icon.png",
@@ -40,18 +41,21 @@
       "notarize": false,
       "x64ArchFiles": "{**/backend-dist/**,**/backend-dist/**/.*/**}",
       "extendInfo": {
-        "CFBundleDisplayName": "Kiro Crew",
-        "NSMicrophoneUsageDescription": "Kiro Crew uses the microphone for voice input and dictation in chat. Audio is captured only while you hold or toggle the mic button."
+        "CFBundleDisplayName": "kirocrew-customapi",
+        "NSMicrophoneUsageDescription": "kirocrew-customapi uses the microphone for voice input and dictation in chat. Audio is captured only while you hold or toggle the mic button."
       }
     },
     "afterSign": "scripts/notarize.js",
     "linux": {
       "category": "Development",
-      "icon": "build/icons",
+      "icon": "icon.png",
+      "synopsis": "kirocrew-customapi \u2014 AI agent desktop app",
+      "description": "kirocrew-customapi is an open source development workspace (fork of Kiro Crew) that runs locally or remotely on your hardware. This fork re-enables the claude_code provider for custom LLM routers.",
+      "maintainer": "Adrian Kozlowski <encomjp@users.noreply.github.com>",
       "target": [
-        "AppImage"
-      ],
-      "artifactName": "${productName}-${version}-${arch}.${ext}"
+        "AppImage",
+        "deb"
+      ]
     },
     "dmg": {
       "writeUpdateInfo": false
@@ -59,8 +63,6 @@
     "files": [
       "main.js",
       "app-menu.js",
-      "windows-menu-model.js",
-      "windows-titlebar.js",
       "badge.js",
       "native-theme.js",
       "zoom.js",
@@ -77,10 +79,7 @@
       "sandbox-profile.js",
       "home-dir.js",
       "local-token.js",
-      "local-gateway.js",
       "window-state.js",
-      "linux-frame.js",
-      "global-hotkey.js",
       "gateway-liveness.js",
       "gateway-recovery.js",
       "pyspy-dump.js",
@@ -109,7 +108,6 @@
       "mochi/shortcuts.js",
       "mochi/pageUrl.js",
       "mochi/instanceGate.js",
-      "mochi/machineStore.js",
       "crew-companion/index.js",
       "crew-companion/petOverlay.js",
       "crew-companion/pageUrl.js",
@@ -121,9 +119,7 @@
       "loading.html",
       "token-prompt.html",
       "icon.png",
-      "icon-nightly.png",
-      "trayTemplate.png",
-      "trayTemplate@2x.png"
+      "icon-nightly.png"
     ],
     "extraResources": [
       {
@@ -138,8 +134,9 @@
     ],
     "publish": [
       {
-        "provider": "generic",
-        "url": "https://updates.crew.kiro.dev/feed/stable/"
+        "provider": "github",
+        "owner": "encomjp",
+        "repo": "kirocrew-customapi"
       }
     ],
     "win": {

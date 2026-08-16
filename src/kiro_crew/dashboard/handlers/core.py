@@ -1537,16 +1537,45 @@ _MOVED_CONFIG_FIELDS: dict[str, str] = {
 
 
 _EDITABLE_CONFIG: dict[str, dict] = {
-    "agent.provider": {"type": "enum", "values": ["acp"]},
+    # Agent backend: kiro-native (acp/kiro-cli), Claude Code (claude_code,
+    # Anthropic-compatible base URL), or OpenCode (opencode, OpenAI-compatible
+    # base URL — OpenCode translates to Anthropic internally).
+    "agent.provider": {"type": "enum", "values": ["acp", "claude_code", "opencode"]},
+    # Router base URL for the claude_code / opencode backends. Local
+    # http://localhost:PORT and https endpoints both allowed; shell
+    # metacharacters and whitespace rejected.
+    "agent.provider_base_url": {
+        "type": "str",
+        "max_len": 2048,
+        "pattern": r"^https?://[A-Za-z0-9._\-:\[\]/]+$",
+    },
+    # Router API key (masked in the config GET response; only ever written).
+    "agent.provider_api_key": {"type": "str", "max_len": 512},
+    # Wire format for the opencode backend: which AI-SDK adapter OpenCode uses
+    # for the custom provider (anthropic vs openai-compatible).
+    "agent.provider_api_format": {"type": "enum", "values": ["anthropic", "openai"]},
+    # Optional model allowlist: when non-empty, the picker only shows these ids
+    # (a user-curated subset of the provider's catalog).
+    "agent.model_whitelist": {
+        "type": "list",
+        "max_len": 200,
+        "item": {
+            "type": "str",
+            "max_len": 128,
+            "pattern": r"^(?!.*\.\.)[A-Za-z0-9._\-/:@+\[\]]*$",
+        },
+    },
     # Default model for new sessions. Membership can NOT be validated against a
     # fixed list: the real vocabulary is whatever the live kiro-cli advertises
     # (/api/models spawns it to find out), and it spans both canonical registry
     # keys ("opus-4.8-1m") and kiro's own ids ("claude-opus-4.8"). So this is a
-    # grammar check instead — model-id charset only, no separators or shell
-    # metacharacters — and an unknown-but-well-formed id is rejected downstream
-    # by kiro itself rather than silently accepted here. "auto"/"" = defer to
-    # the agent config / kiro's own default.
-    "agent.model": {"type": "str", "max_len": 64, "pattern": r"^[A-Za-z0-9._\-\[\]]*$"},
+    # grammar check instead — model-id charset only, no shell metacharacters —
+    # and an unknown-but-well-formed id is rejected downstream by kiro itself
+    # rather than silently accepted here. "auto"/"" = defer to the agent config
+    # / kiro's own default. The charset admits "/" and ":" because the fork's
+    # CLIProxyAPI routing uses prefixed ids ("cmc/…", "oc/…", "cx/…") and
+    # provider:model forms; "@"/"+" cover router-catalog naming.
+    "agent.model": {"type": "str", "max_len": 64, "pattern": r"^(?!.*\.\.)[A-Za-z0-9._\-/:@+\[\]]*$"},
     # Per-task-class model overrides. Same grammar as agent.model (the real
     # vocabulary is whatever the backend advertises). "" / "auto" defers to the
     # chat default. `validate_fn` additionally rejects a well-formed id the
@@ -1554,13 +1583,13 @@ _EDITABLE_CONFIG: dict[str, dict] = {
     "agent.role_models.background": {
         "type": "str",
         "max_len": 64,
-        "pattern": r"^[A-Za-z0-9._\-\[\]]*$",
+        "pattern": r"^(?!.*\.\.)[A-Za-z0-9._\-/:@+\[\]]*$",
         "validate_fn": _validate_role_model,
     },
     "agent.role_models.subagent": {
         "type": "str",
         "max_len": 64,
-        "pattern": r"^[A-Za-z0-9._\-\[\]]*$",
+        "pattern": r"^(?!.*\.\.)[A-Za-z0-9._\-/:@+\[\]]*$",
         "validate_fn": _validate_role_model,
     },
     "agent.reasoning_effort": {"type": "enum", "values": ["", *EFFORT_LEVELS]},
@@ -1804,6 +1833,21 @@ async def api_kirocrew_config_patch(request: web.Request) -> web.Response:
     if spec["type"] == "enum":
         if value not in spec["values"]:
             return _deny(f"invalid value, must be one of {spec['values']}", f"{path_key}={value}")
+    elif spec["type"] == "list":
+        if not isinstance(value, list):
+            return _deny("must be a list", f"{path_key}={value}")
+        max_items = spec.get("max_len", 200)
+        if len(value) > max_items:
+            return _deny(f"must have at most {max_items} entries", f"{path_key}={value}")
+        item = spec.get("item", {})
+        if item:
+            item_type = item.get("type", "str")
+            item_pattern = item.get("pattern")
+            for entry in value:
+                if item_type == "str" and not isinstance(entry, str):
+                    return _deny("list entries must be strings", f"{path_key}={value}")
+                if item_pattern and not re.fullmatch(item_pattern, entry):
+                    return _deny(f"invalid value for {path_key}", f"{path_key}={value}")
     elif spec["type"] == "int":
         try:
             value = int(value)
@@ -1982,7 +2026,7 @@ async def api_kirocrew_config_patch(request: web.Request) -> web.Response:
     cfg = KiroCrewConfig.load()
 
     # If provider changed, reload the factory so new sessions use the new provider
-    if path_key == "agent.provider":
+    if path_key in ("agent.provider", "agent.provider_base_url", "agent.provider_api_key", "agent.provider_api_format"):
         state: DashboardState = request.app["state"]
         # Refresh agent artifacts so the target provider is immediately usable.
         # For claude_code this (re)writes ~/.claude/agents/kirocrew.mcp.json —
@@ -2001,6 +2045,22 @@ async def api_kirocrew_config_patch(request: web.Request) -> web.Response:
             if slot.model:
                 slot.model = ""
         state.push_slots_update()
+        # Bug 3 fix: also clear the global default model when the provider
+        # switches — the old provider's model id is invalid for the new one.
+        if path_key == "agent.provider" and cfg.agent.model:
+            from kiro_crew.config.loader import config_path  # noqa: F811
+
+            cfg_data = json.loads(config_path().read_text(encoding="utf-8"))
+            agent_section = cfg_data.get("agent", {})
+            if agent_section.get("model"):
+                agent_section["model"] = ""
+            # Also clear the model whitelist — old provider's prefixed models
+            # (oc/mimo, cx/..., etc.) are invalid for the new provider.
+            if agent_section.get("model_whitelist"):
+                agent_section["model_whitelist"] = []
+            cfg_data["agent"] = agent_section
+            _atomic_json_write(config_path(), cfg_data)
+            logger.info("Cleared agent.model + model_whitelist on provider switch")
         logger.info(
             "Provider switched to %s — config rebuilt, factory reloaded, slot models cleared", value
         )

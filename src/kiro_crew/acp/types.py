@@ -114,6 +114,10 @@ ACP_CLIENT_CAPABILITIES: dict = {
 # ── ACP Backend Identifiers ──
 
 ACP_BACKEND_CLAUDE = "claude"
+# The fork's opencode CLI backend (spawned via AcpClient, one process per
+# session, same as claude — not on the AcpRuntime demux and not entitled to
+# any harness-parity capability it has not itself demonstrated).
+ACP_BACKEND_OPENCODE = "opencode"
 ACP_BACKEND_KAS = "kas"
 # The kiro-cli backend is spelled as the empty string throughout, so name it
 # rather than leaving every call site to infer it from "not claude".
@@ -126,14 +130,20 @@ ACP_BACKENDS_KNOWN = frozenset(
         ACP_BACKEND_KIRO,
         ACP_BACKEND_CLAUDE,
         ACP_BACKEND_KAS,
+        ACP_BACKEND_OPENCODE,
     }
 )
 # What an operator may actually persist in ``agent.acp_backend``, which is a
-# narrower question than what the code understands: ``ACP_BACKEND_CLAUDE`` is a
-# dormant seam reached by its own provider, not something to select here. Config
-# resolution degrades an unselectable value to the default, so a typo costs a log
-# line rather than a gateway that will not start.
-ACP_BACKENDS_SELECTABLE = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS})
+# narrower question than what the code understands. Upstream keeps
+# ``ACP_BACKEND_CLAUDE`` dormant (reached by its own provider, not selectable
+# here); this fork's whole purpose is a self-hosted Claude Code / router
+# backend, so it re-registers ``claude`` here and adds the sibling
+# ``opencode`` CLI backend the same way. Config resolution degrades an
+# unselectable value to the default, so a typo costs a log line rather than a
+# gateway that will not start.
+ACP_BACKENDS_SELECTABLE = frozenset(
+    {ACP_BACKEND_KIRO, ACP_BACKEND_KAS, ACP_BACKEND_CLAUDE, ACP_BACKEND_OPENCODE}
+)
 
 # ── Capability membership (harness-parity H6, H7) ──
 # Every capability a backend may claim is an OPT-IN set here, never a negation at
@@ -190,6 +200,7 @@ ACP_BACKENDS_ACP_RUNTIME = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS})
 PROVIDER_LABEL_DEFAULT = "acp"
 PROVIDER_LABEL_CLAUDE = "claude_code"
 PROVIDER_LABEL_KAS = "kas"
+PROVIDER_LABEL_OPENCODE = "opencode"
 
 # KAS reads only fs.readTextFile / fs.writeTextFile / terminal from the top
 # level of clientCapabilities; every other capability it honours lives under

@@ -24,6 +24,7 @@ from kiro_crew.acp.client import (
     AcpProcessDied,
     _format_acp_error,
     _is_model_substitution_advisory,
+    _is_transient_raw_error,
     _make_unified_diff,
     _resolve_vendored_claude_acp,
     _substitute_model_from_advisory,
@@ -35,7 +36,7 @@ from kiro_crew.acp.liveness import (
     VERDICT_WORKING,
     LivenessOracle,
 )
-from kiro_crew.acp.types import ACP_BACKEND_CLAUDE, AcpPromptStats
+from kiro_crew.acp.types import ACP_BACKEND_CLAUDE, ACP_BACKEND_OPENCODE, AcpPromptStats
 
 # Windows lacks os.killpg and POSIX process-tree APIs (ps, /proc).
 # Tests that exercise these paths are skipped on Windows.
@@ -877,6 +878,53 @@ class TestAcpClientBackendSelection:
                 await client._spawn()
 
     @pytest.mark.asyncio
+    async def test_spawn_opencode_backend_is_not_wrapped_as_kiro_cli(self, tmp_path):
+        client = AcpClient(work_dir=tmp_path, acp_backend=ACP_BACKEND_OPENCODE)
+        client._write_opencode_provider_config = MagicMock()
+        with (
+            patch("kiro_crew.acp.client._resolve_opencode_bin", return_value=["/usr/bin/opencode"]),
+            patch("kiro_crew.acp.client.wrap_argv", return_value=(["/usr/bin/opencode", "acp"], None)) as wrap,
+            patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec,
+            patch("kiro_crew.session._track_pid"),
+            patch("kiro_crew.session._track_session_pid"),
+        ):
+            mock_proc = MagicMock()
+            mock_proc.pid = 12345
+            mock_proc.returncode = None
+            mock_proc.stderr = None
+            mock_exec.return_value = mock_proc
+
+            await client._spawn()
+
+        assert wrap.call_args.kwargs["is_kiro_cli"] is False
+
+    @pytest.mark.asyncio
+    async def test_spawn_opencode_backend_isolates_user_config(self, tmp_path):
+        """OpenCode spawn must set OPENCODE_CONFIG_CONTENT to suppress user
+        plugins and MCP servers that would stall the ACP session."""
+        client = AcpClient(work_dir=tmp_path, acp_backend=ACP_BACKEND_OPENCODE)
+        client._write_opencode_provider_config = MagicMock()
+        with (
+            patch("kiro_crew.acp.client._resolve_opencode_bin", return_value=["/usr/bin/opencode"]),
+            patch("kiro_crew.acp.client.wrap_argv", return_value=(["/usr/bin/opencode", "acp"], None)),
+            patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec,
+            patch("kiro_crew.session._track_pid"),
+            patch("kiro_crew.session._track_session_pid"),
+        ):
+            mock_proc = MagicMock()
+            mock_proc.pid = 12345
+            mock_proc.returncode = None
+            mock_proc.stderr = None
+            mock_exec.return_value = mock_proc
+
+            await client._spawn()
+
+        spawn_env = mock_exec.call_args.kwargs.get("env", {})
+        assert spawn_env.get("HOME", "").endswith("kirocrew-customapi/opencode-home"), (
+            "OpenCode spawn must set HOME to an isolated directory"
+        )
+
+    @pytest.mark.asyncio
     async def test_spawn_kiro_backend_unchanged(self, tmp_path):
         """Default (non-claude) backend still spawns `kiro-cli acp --agent <name>`."""
         client = AcpClient(work_dir=tmp_path)
@@ -906,7 +954,7 @@ class TestAcpClientBackendSelection:
 
     @pytest.mark.asyncio
     async def test_initialize_protocol_version_per_backend(self, tmp_path):
-        """kiro expects a date string; claude-agent-acp expects an integer."""
+        """Kiro expects a date string; Claude and OpenCode expect an integer."""
         from kiro_crew.acp.client import (
             PROTOCOL_VERSION,
             PROTOCOL_VERSION_CLAUDE,
@@ -915,6 +963,7 @@ class TestAcpClientBackendSelection:
         for backend, expected in (
             ("", PROTOCOL_VERSION),
             (ACP_BACKEND_CLAUDE, PROTOCOL_VERSION_CLAUDE),
+            (ACP_BACKEND_OPENCODE, PROTOCOL_VERSION_CLAUDE),
         ):
             client = AcpClient(work_dir=tmp_path, acp_backend=backend)
             client._session_id = "sess-1"  # short-circuit past the new-session call
@@ -2138,6 +2187,33 @@ class TestAcpClientTrackUsageUpdate:
         assert stats.context_window_tokens == 200000
         # A real usage_update marks the counts authoritative.
         assert stats.context_tokens_from_usage is True
+
+    def test_sdk_200k_default_overridden_for_known_1m_router_model(self, tmp_path):
+        """Fork: claude-agent-acp reports its 200K default for router models it
+        does not know (deepseek-v4-flash serves at 1M). A known model's usage
+        update must prefer the central registry window over the SDK default so
+        the context meter does not read 200K for a 1M model."""
+        client = AcpClient(work_dir=tmp_path)
+        client._model = "cmc/deepseek-v4-flash"
+        client._resolved_model_id = "deepseek-v4-flash"
+        client._track_usage_update(self._usage_msg(100_000, 200_000))
+        stats = client.last_prompt_stats
+        # 100K of a 1M window → 10%, not 50% of a false 200K.
+        assert stats.context_window_tokens == 1_000_000
+        assert stats.context_pct == 10.0
+        assert stats.context_used_tokens == 100_000
+        assert stats.context_tokens_from_usage is True
+
+    def test_unknown_model_keeps_sdk_window(self, tmp_path):
+        """A model the registry does not know keeps the SDK-reported window —
+        the override must never invent a window."""
+        client = AcpClient(work_dir=tmp_path)
+        client._model = "cmc/unknown-model"
+        client._resolved_model_id = "unknown-model"
+        client._track_usage_update(self._usage_msg(50_000, 200_000))
+        stats = client.last_prompt_stats
+        assert stats.context_window_tokens == 200_000
+        assert stats.context_pct == 25.0
 
     def test_metadata_pct_does_not_clobber_authoritative_tokens(self, tmp_path):
         """Regression: a real usage_update (408K/1000K → 40.8%) followed by a
@@ -7093,14 +7169,20 @@ class TestProcessMessageUnknownServerRequest:
 
 
 class TestFormatAcpError:
-    """Tests for _format_acp_error — Bedrock-aware error rewriting.
+    """Tests for _format_acp_error — provider-aware error rewriting.
 
     Covers the bug filed at task 86089e43: ACP backend errors used
     to be surfaced as the raw JSON-RPC dict (`Prompt error: {'code': -32603,
     ...}`), which dead-ends users when the picker can't expose a valid
-    alternative. The helper rewrites known Bedrock failures into actionable
+    alternative. The helper rewrites known backend failures into actionable
     text while preserving the request_id for support correlation, and scrubs
     embedded credentials / exfiltration URLs as defense-in-depth.
+
+    Throttle wording is deliberately PROVIDER-AGNOSTIC: the same classifier
+    fronts Bedrock (ThrottlingException), OpenAI/Cursor (`rate_limit_error`),
+    and Anthropic (Retry after <window>), so the message must not hardcode
+    "Bedrock" or a Bedrock model name like "sonnet". When the provider ships
+    its own reset window, the message surfaces it.
     """
 
     def test_non_dict_falls_back(self):
@@ -7258,6 +7340,67 @@ class TestFormatAcpError:
         err = {"code": -32603, "message": "Rate limit exceeded", "data": ""}
         out = _format_acp_error(err)
         assert "throttling" in out.lower()
+
+    def test_openai_rate_limit_error_is_throttle(self):
+        """OpenAI/Cursor's `type: rate_limit_error` must classify as a throttle.
+
+        Regression: a plain `rate.?limit` word-boundary pattern fails to match
+        `rate_limit_error` (the `_error` suffix continues the word past the
+        `t` of `limit`, so the `\b` never fires), which dropped these bodies
+        into the raw-dict fallback — the user saw the entire JSON-RPC blob
+        instead of an actionable message.
+        """
+        err = {
+            "code": -32603,
+            "message": "Request rejected (429)",
+            "data": (
+                '{"error":{"message":"Update Required","type":"rate_limit_error",'
+                '"code":"ERROR_GPT_4_VISION_PR (reset after 4m 30s)"}}'
+            ),
+        }
+        out = _format_acp_error(err)
+        assert "throttling" in out.lower()
+        # Not raw JSON-RPC dict.
+        assert '{"error"' not in out
+        # The provider's reset window is surfaced, not a vague "wait".
+        assert "4m 30s" in out
+        assert "sonnet" not in out.lower()
+        # Retryable verdict must agree with the wording.
+        assert _is_transient_raw_error(err) is True
+
+    def test_cursor_rate_limit_error_with_full_reset_window(self):
+        """A compound reset window ("3m 6s") is captured whole, not truncated."""
+        err = {
+            "code": -32603,
+            "message": "Internal error",
+            "data": (
+                '{"error":{"message":"Update Required","type":"rate_limit_error",'
+                '"code":"ERROR_GPT_4_VISION_PR (reset after 3m 6s)"}}'
+            ),
+        }
+        out = _format_acp_error(err)
+        assert "3m 6s" in out
+        assert "throttling" in out.lower()
+
+    def test_bedrock_throttle_stays_retryable_and_provider_neutral(self):
+        """The Bedrock-named branch reads the same as any other provider.
+
+        No "Bedrock" or "sonnet" in the message: the user's picker may not
+        even offer a Bedrock model, and naming one would be actively wrong on
+        a Cursor/OpenAI endpoint.
+        """
+        err = {
+            "code": -32603,
+            "message": "Internal error",
+            "data": "ThrottlingException: Too many requests (request_id: aaaa-bbbb)",
+        }
+        out = _format_acp_error(err)
+        assert "throttling" in out.lower()
+        assert "bedrock" not in out.lower()
+        assert "sonnet" not in out.lower()
+        assert _is_transient_raw_error(err) is True
+        # Request id is still preserved for correlation.
+        assert "aaaa-bbbb" in out
 
     def test_credentials_in_data_are_redacted(self):
         """AWS access keys embedded in upstream errors must not leak to the UI.

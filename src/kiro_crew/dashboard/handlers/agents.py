@@ -888,8 +888,11 @@ def _cc_models(request: web.Request, configured_default: str = "") -> list[dict]
             # After "auto", never before it: "auto" is the configured default in
             # the general case and leads the list.
             merged.insert(
-                1 if merged and _normalize_model_key(merged[0].get("model_name", "")) == "auto"
-                else 0,
+                (
+                    1
+                    if merged and _normalize_model_key(merged[0].get("model_name", "")) == "auto"
+                    else 0
+                ),
                 {
                     "model_name": canonical_default,
                     "display_name": canonical_default,
@@ -905,6 +908,10 @@ def _cc_models(request: web.Request, configured_default: str = "") -> list[dict]
             entry["context_window"] = (
                 model_registry.model_window(name) or model_registry.REFERENCE_WINDOW_TOKENS
             )
+        if "supports_vision" not in entry:
+            flag = _model_supports_vision(entry.get("model_name", ""))
+            if flag is not None:
+                entry["supports_vision"] = flag
     return merged
 
 
@@ -928,8 +935,184 @@ def _wrap_list_models_argv(argv: list[str]) -> tuple[list[str], str | None]:
     return wrap_argv(argv, mode=configured_sandbox_mode(), is_kiro_cli=True)
 
 
+_NATIVE_VISION_FAMILY_PREFIXES = frozenset({"cmc", "oc", "ol", "cx", "ag"})
+
+
+def _model_supports_vision(model_id: str) -> bool | None:
+    """Reported vision capability for a model id, or None when unknown."""
+    from kiro_crew.acp.vision import decide_image_input_mode  # noqa: F811
+
+    try:
+        from kiro_crew.model_registry import model_supports_vision  # noqa: F811
+
+        flag = model_supports_vision(model_id)
+        if flag is not None:
+            return bool(flag)
+    except Exception:
+        pass
+    # Router-prefixed ids are not canonical registry keys, so the registry
+    # returns None for them — route via the same decision the runtime uses.
+    # Thread the text-only denylist so oc/deepseek-v4-flash and
+    # ol/deepseek-v4-flash:0731 report as text, matching the ACP redirect gate.
+    try:
+        from kiro_crew.acp.client import _DEFAULT_TEXT_ONLY_MODELS  # noqa: F811
+        from kiro_crew.config.loader import KiroCrewConfig as _KC  # noqa: F811
+
+        try:
+            cfg_text_only = _KC.load().agent.text_only_models  # type: ignore[attr-defined]
+            text_only: tuple[str, ...] | None = tuple(cfg_text_only) if cfg_text_only else None
+        except Exception:
+            text_only = None
+        if text_only is None:
+            text_only = tuple(_DEFAULT_TEXT_ONLY_MODELS)
+        mode = decide_image_input_mode(model_id, image_input_mode="auto", text_only_models=text_only)
+        if mode != "auto":
+            return mode == "native"
+    except Exception:
+        pass
+    return None
+
+
+def _cc_model_row(model_id: str, description: str = "") -> dict:
+    """One curated router-model row in the wire shape the picker SPA expects.
+
+    ``context_window_tokens`` comes from the central resolver (kiro-list cache >
+    static registry > supplementary map > ``[1m]`` heuristic), never a hardcoded
+    literal — the fork previously pinned every router model at 200k, which made
+    a 1M model (e.g. ``ocg/deepseek-v4-flash``) read as 200K in the picker. The
+    frontend learns this value into ``LIVE_WINDOWS``, so the composer's context
+    meter follows it too. Unknown ids resolve to the 1M reference rather than a
+    silent 200k.
+
+    ``supports_vision`` (when not None) is the single capability flag the
+    frontend picker groups on, so a Vision section can feel native in the
+    AppImage rather than bolted on via text filters. Router-prefixed ids
+    (``cmc/``, ``ol/``, …) are not canonical registry keys, so they are tagged
+    as vision-capable when they belong to a vision provider family — the same
+    families the ACP image-input routing treats as native.
+    """
+    if not description:
+        family = model_id.split("/", 1)[0] if "/" in model_id else model_id
+        description = f"{model_id.split('/')[-1]} via {family}"
+    row: dict[str, object] = {
+        "model_name": model_id,
+        "model_id": model_id,
+        "description": description,
+        "context_window_tokens": (
+            model_registry.model_window(model_id) or model_registry.REFERENCE_WINDOW_TOKENS
+        ),
+        "rate_multiplier": 1.0,
+        "rate_unit": "Credit",
+    }
+    flag = _model_supports_vision(model_id)
+    if flag is not None:
+        row["supports_vision"] = flag
+    return row
+
+
+async def _opencode_models_response(request: web.Request) -> web.Response:
+    """Model catalog for /api/models on the opencode backend.
+
+    Fetches the provider's ``/v1/models`` (both Anthropic- and
+    OpenAI-compatible endpoints expose it; the auth header differs by format).
+    Context windows come from the central resolver (model_registry), same as
+    the claude_code path. Falls back to the curated router whitelist when the
+    endpoint is unreachable, so a cold dashboard never shows an empty picker.
+    """
+    import aiohttp
+
+    cfg = KiroCrewConfig.load()
+    base = (cfg.agent.provider_base_url or "").rstrip("/")
+    rows: list[dict] = []
+    if base:
+        api_format = cfg.agent.provider_api_format or "openai"
+        headers: dict[str, str] = {}
+        if cfg.agent.provider_api_key:
+            if api_format == "anthropic":
+                headers["x-api-key"] = cfg.agent.provider_api_key
+                headers["anthropic-version"] = "2023-06-01"
+            else:
+                headers["Authorization"] = f"Bearer {cfg.agent.provider_api_key}"
+        url = f"{base}/v1/models"
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=8)) as session:
+                async with session.get(url, headers=headers) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        for item in data.get("data", []):
+                            mid = item.get("id") or ""
+                            if mid:
+                                row = _cc_model_row(
+                                    mid,
+                                    item.get("display_name") or item.get("description") or "",
+                                )
+                                # Prefer the catalog's own vision flag when it ships one
+                                # (router /v1/models may report capabilities.supports_vision,
+                                # capabilities.vision, or a top-level supports_vision).
+                                caps = (
+                                    item.get("capabilities")
+                                    if isinstance(item.get("capabilities"), dict)
+                                    else {}
+                                )
+                                catalog_flag: bool | None = None
+                                for key in ("supports_vision", "vision", "vision_capable"):
+                                    val = item.get(key) if key in item else caps.get(key)
+                                    if isinstance(val, bool):
+                                        catalog_flag = val
+                                        break
+                                if catalog_flag is not None:
+                                    row["supports_vision"] = catalog_flag
+                                rows.append(row)
+        except Exception:
+            logger.debug("opencode /v1/models fetch failed: %s", url, exc_info=True)
+    if cfg.agent.model_whitelist:
+        rows = [r for r in rows if r["model_id"] in cfg.agent.model_whitelist]
+    if not rows:
+        from kiro_crew.acp.client import AcpClient  # noqa: F811
+
+        rows = [_cc_model_row(mid) for mid in sorted(AcpClient.router_model_whitelist())]
+    return web.json_response(rows)
+
+
+def _cc_models_response(request: web.Request) -> web.Response:
+    """Curated router-catalog response for /api/models on the claude_code path.
+    The upstream handler spawns ``kiro-cli chat --list-models``, which returns
+    Kiro's Bedrock catalog — useless (and wrong) when the backend is Claude
+    Code talking to a custom LLM router. On the router path we serve the
+    curated whitelist instead: live advertised rows when a session has
+    captured them, otherwise the static whitelist so a cold dashboard never
+    shows an empty picker.
+    """
+    from kiro_crew.acp.client import AcpClient  # noqa: F811
+
+    whitelist = AcpClient.router_model_whitelist()
+    rows: list[dict] = []
+    for entry in _advertised_cc_models(request):
+        mid = entry.get("model_name") or ""
+        if mid and mid in whitelist:
+            rows.append(
+                _cc_model_row(
+                    mid,
+                    entry.get("description") or entry.get("display_name") or "",
+                )
+            )
+    if not rows:
+        rows = [_cc_model_row(mid) for mid in sorted(whitelist)]
+    cfg = KiroCrewConfig.load()
+    if cfg.agent.model_whitelist:
+        rows = [r for r in rows if r["model_id"] in cfg.agent.model_whitelist]
+    return web.json_response(rows)
+
+
 async def api_models(request: web.Request) -> web.Response:
     """GET /api/models — list available models from the live kiro-cli ACP session."""
+    # Fork: on the claude_code (custom LLM router) path the picker must show
+    # the curated router catalog, not kiro-cli's Bedrock list.
+    cfg = KiroCrewConfig.load()
+    if cfg.agent.acp_backend == "claude":
+        return _cc_models_response(request)
+    if cfg.agent.acp_backend == "opencode":
+        return await _opencode_models_response(request)
     # Signed-out gateways must never reach the spawn below. kiro-cli auto-opens
     # an interactive browser login for ANY subcommand run unauthenticated
     # (--no-interactive does not suppress it, and there is no opt-out env var),
@@ -1129,7 +1312,7 @@ async def api_effort_levels(request: web.Request) -> web.Response:
 async def api_slash_commands(request: web.Request) -> web.Response:
     """GET /api/slash-commands — list available slash commands (provider-aware)."""
     cfg = KiroCrewConfig.load()
-    if cfg.agent.provider == "claude_code":
+    if cfg.agent.acp_backend == "claude":
         state: DashboardState = request.app["state"]
         cc_commands: list[str] = []
         for provider in state.sessions.active_providers():
@@ -1794,3 +1977,59 @@ def _regen_conductor() -> None:
         generate_conductor_skill(SkillsLoader())
     except Exception:
         logger.exception("Failed to regenerate conductor skill")
+
+
+async def api_provider_test(request: web.Request) -> web.Response:
+    """POST /api/provider/test — probe a provider base URL + key.
+
+    Body: ``{url, api_key, format, use_stored}``. Fetches ``{url}/v1/models``
+    with the format-appropriate auth header and returns the advertised model
+    ids on success, or an error message. Used by the Provider settings "Test"
+    button. When ``use_stored`` is true and no ``api_key`` is provided, the
+    saved ``agent.provider_api_key`` is used.
+    """
+    import aiohttp
+
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"ok": False, "error": "invalid JSON"}, status=400)
+    url = str(body.get("url") or "").strip()
+    if not url:
+        return web.json_response({"ok": False, "error": "url required"}, status=400)
+    api_format = str(body.get("format") or "openai")
+    api_key = str(body.get("api_key") or "")
+    if not api_key and body.get("use_stored"):
+        cfg = KiroCrewConfig.load()
+        api_key = (cfg.agent.provider_api_key or "").strip()
+    headers: dict[str, str] = {}
+    if api_key:
+        if api_format == "anthropic":
+            headers["x-api-key"] = api_key
+            headers["anthropic-version"] = "2023-06-01"
+        else:
+            headers["Authorization"] = f"Bearer {api_key}"
+    fetch_url = f"{url.rstrip('/')}/v1/models"
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=8)) as session:
+            async with session.get(fetch_url, headers=headers) as resp:
+                if resp.status != 200:
+                    return web.json_response({"ok": False, "error": f"HTTP {resp.status}"})
+                data = await resp.json()
+                models = [m.get("id") or "" for m in data.get("data", []) if m.get("id")]
+                return web.json_response({"ok": True, "models": models})
+    except Exception as exc:  # noqa: BLE001 - surfaced to the UI verbatim
+        return web.json_response({"ok": False, "error": str(exc)[:200]})
+
+
+async def api_provider_status(request: web.Request) -> web.Response:
+    """GET /api/provider/status — check which ACP backends have their
+    required binary installed.  Returns ``{opencode: bool, claude_code: bool}``
+    so the frontend can warn users who select a backend without the binary.
+    """
+    from kiro_crew.acp.client import _resolve_claude_acp_bin, _resolve_opencode_bin
+
+    opencode_ok = _resolve_opencode_bin() is not None
+    # claude-agent-acp resolution can be slow (npm glob); run off the loop.
+    claude_ok = await asyncio.to_thread(lambda: _resolve_claude_acp_bin() is not None)
+    return web.json_response({"opencode": opencode_ok, "claude_code": claude_ok})

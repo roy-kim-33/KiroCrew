@@ -13,7 +13,7 @@
  * module covers that cross-app seam.
  *
  * Decision inputs: our own stamped version (identity family derives from it,
- * mirroring auto-update.js channelForVersion), the running gateway's
+ * see identityFamily() below), the running gateway's
  * /api/health payload ({ok, app, version}), and who LOCALLY owns the port's
  * LISTEN socket. Legacy gateways (health without identity fields) and
  * source-run dev gateways keep today's reuse behavior — the guard only
@@ -26,8 +26,6 @@
  * quit-by-name AppleScript (bundle id is shared, so targeting must be by
  * app NAME), the port-owner probe, and the port-free wait.
  */
-
-const { channelForVersion } = require("./auto-update");
 
 // The endpoint that carries the gateway's identity fields ({app, version}).
 // MUST be /api/health -- the shell's liveness probe uses /api/status, whose
@@ -91,10 +89,14 @@ const FAMILY_META = {
  * @returns {"prod"|"nightly"|null} null only for missing/unparseable versions
  */
 function identityFamily(version) {
-  const ch = channelForVersion(version);
-  if (ch === "nightly") return "nightly";
-  if (ch === "insider" || ch === "stable") return "prod";
-  return null;
+  // Inlined from the updater's (now removed) channel classifier: the fork runs
+  // a single stable lane, but the nightly app is a separate side-by-side
+  // install, so a -nightly.<stamp> version still means the nightly family.
+  // Every other parseable stamp (insider, stable, -customapi.N, ...) is the
+  // production install; missing/non-string versions are unclassifiable.
+  if (!version || typeof version !== "string") return null;
+  if (version.includes("-nightly.")) return "nightly";
+  return "prod";
 }
 
 /**
@@ -109,10 +111,18 @@ function identityFamily(version) {
  *        gateway-stop.js). Defaults to "unknown" so a caller that forgets to
  *        pass it fails SAFE (reuse) rather than inheriting the old
  *        evict-on-payload-alone behavior.
+ * @param {boolean} [opts.gatewayUsable=true] whether the dashboard root can
+ *        still be served. A packaged Linux backend can outlive its AppImage
+ *        mount; /api/health remains healthy while every UI request returns 500.
  * @returns {{action:"reuse", reason:string} |
+ *           {action:"restart-local", reason:string} |
  *           {action:"takeover-prompt", otherFamily:"prod"|"nightly", otherVersion:string}}
  */
-function decideGatewayAction(ownVersion, remoteHealth, { localOwner = "unknown" } = {}) {
+function decideGatewayAction(
+  ownVersion,
+  remoteHealth,
+  { localOwner = "unknown", gatewayUsable = true } = {},
+) {
   const own = identityFamily(ownVersion);
   // A shell we can't classify never evicts anyone.
   if (own === null) return { action: "reuse", reason: "unclassified-shell" };
@@ -123,6 +133,9 @@ function decideGatewayAction(ownVersion, remoteHealth, { localOwner = "unknown" 
     return { action: "reuse", reason: "unidentified-gateway" };
   }
   const remote = identityFamily(remoteHealth.version);
+  if (remote === own && !gatewayUsable && localOwner === "kirocrew") {
+    return { action: "restart-local", reason: "unusable-local-gateway" };
+  }
   if (remote === null || remote === own) {
     return { action: "reuse", reason: remote === own ? "same-family" : "dev-gateway" };
   }

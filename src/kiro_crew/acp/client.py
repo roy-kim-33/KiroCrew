@@ -47,6 +47,7 @@ from kiro_crew.acp.prompt_blocks import build_prompt_blocks
 from kiro_crew.acp.types import (
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_KIRO,
+    ACP_BACKEND_OPENCODE,
     ACP_BACKENDS_INTERNAL_SANDBOX,
     ACP_BACKENDS_STEER,
     ACP_CLIENT_CAPABILITIES,
@@ -484,6 +485,23 @@ def _resolve_claude_acp_bin() -> list[str] | None:
         if node_on_path:
             return [node_on_path, resolved]
 
+    return None
+
+
+def _resolve_opencode_bin() -> list[str] | None:
+    """Find the ``opencode`` CLI entry script and return argv.
+
+    Resolution order:
+      1. ``OPENCODE_BIN`` env override (explicit path).
+      2. Augmented PATH (includes mise shims, nvm, fnm, volta, npm -g).
+    """
+    override = os.environ.get("OPENCODE_BIN")
+    if override and Path(override).is_file():
+        return [override]
+    search_path = augmented_path(os.environ.get("PATH", ""))
+    on_path = shutil.which("opencode", path=search_path)
+    if on_path:
+        return [on_path]
     return None
 
 
@@ -1009,7 +1027,25 @@ _RE_INVALID_MODEL_ID = re.compile(r"[Ii]nvalid model ID:\s*([^\s,;'\"]+)")
 _RE_THROTTLE_NAMED = re.compile(
     r"\b(ThrottlingException|TooManyRequestsException|ServiceQuotaExceededException)\b"
 )
-_RE_THROTTLE_GENERIC = re.compile(r"\b(rate.?limit|throttl(?:e|ed|ing))\b", re.IGNORECASE)
+# `rate_limit_error` (OpenAI/Cursor's `type` field) must also match: a plain
+# `rate.?limit` word-boundary pattern would fail it because `_error` continues
+# the word past the `t` of `limit` — leaving the boundary unsatisfied. The
+# explicit `rate_limit` alternative (with an optional trailing `_error`) catches
+# that shape while staying distinct from a bare `rate limit` (matched above).
+_RE_THROTTLE_GENERIC = re.compile(
+    r"\b(rate.?limit|rate_limit(?:ed|_error)?|throttl(?:e|ed|ing))\b", re.IGNORECASE
+)
+# A provider-reported throttle reset window, e.g. OpenAI/Cursor's
+# "reset after 3m 6s", Anthropic's "Retry after 00:01:22", or AWS's
+# "try again in 2 seconds". Captured so the throttle branch can tell the user
+# HOW LONG they must wait instead of just "wait a few seconds". The capture
+# spans a compound duration ("3m 6s") so the whole window is surfaced.
+_RE_RESET_WINDOW = re.compile(
+    r"(?:reset|retry|back)\s+(?:after|in)\s+"
+    r"([0-9][0-9:. ]*(?:seconds?|minutes?|hours?|secs?|mins?|hrs?|h|s|m)?"
+    r"(?:\s+[0-9][0-9:. ]*(?:seconds?|minutes?|hours?|secs?|mins?|hrs?|h|s|m)?)?)",
+    re.IGNORECASE,
+)
 _RE_AUTH = re.compile(
     r"\b(AccessDenied(?:Exception)?|UnauthorizedException|ExpiredToken(?:Exception)?"
     r"|InvalidSignatureException|UnrecognizedClientException)\b"
@@ -1389,13 +1425,28 @@ def _format_acp_error(error: object, available_models: Sequence[str] | None = No
                 f"{req_id_suffix}"
             )
         elif _RE_THROTTLE_NAMED.search(haystack) or _RE_THROTTLE_GENERIC.search(haystack):
-            # Bedrock throttle / rate limit. Cover both AWS service exception
-            # names and the generic phrasing the ACP backend sometimes uses.
-            formatted = (
-                "Bedrock is throttling requests. Try: (1) wait a few seconds and "
-                "retry, or (2) switch to a different model in the picker (e.g. sonnet)."
-                f"{req_id_suffix}"
-            )
+            # Throttle / rate limit. Covers AWS service exception names
+            # (ThrottlingException, TooManyRequestsException), OpenAI/Cursor's
+            # `rate_limit_error` type, and generic "rate limited" phrasing. The
+            # provider is deliberately NOT named (Bedrock, OpenAI, Cursor, ...):
+            # the same wording must read correctly regardless of which backend
+            # ACP is fronting. When the provider includes its own reset window
+            # (e.g. "reset after 3m 6s", "Retry after 00:01:22"), surface it —
+            # it is the single most actionable detail in a 429 body.
+            _reset = _RE_RESET_WINDOW.search(haystack)
+            if _reset:
+                formatted = (
+                    "Rate limit hit — the model is throttling requests. "
+                    f"Retry after {_reset.group(1).strip()} clears, or switch to "
+                    "a different model in the picker."
+                    f"{req_id_suffix}"
+                )
+            else:
+                formatted = (
+                    "The model is throttling requests. Try: (1) wait a few seconds "
+                    "and retry, or (2) switch to a different model in the picker."
+                    f"{req_id_suffix}"
+                )
         elif _RE_AUTH.search(haystack):
             # Bedrock auth failure — almost always missing/expired AWS
             # credentials.
@@ -1883,6 +1934,311 @@ def _select_tool_title(title: object, raw_input: object) -> str | None:
     return None
 
 
+# Fork: prefixed model ids for the router picker. The GUI picker shows a
+# provider prefix (cmc/, oc/, ol/, cx/, ag/) so the user can disambiguate
+# providers that serve overlapping raw ids (e.g. gpt-5.6-luna exists under
+# both commandcode and Codex). The local CLIProxyAPI (http://127.0.0.1:8317)
+# serves RAW /v1/models ids and REJECTS the prefixed spelling ("unknown
+# provider"), so every picker id is stripped back to the raw form before it
+# goes upstream — see strip_router_model_prefix().
+_ROUTER_MODEL_PROVIDERS: dict[str, str] = {
+    "cmc": "commandcode",
+    "oc": "opencode-go",
+    "ol": "ollama-cloud",
+    "cx": "codex",
+    "ag": "antigravity",
+}
+
+# (Legacy prefix aliases were removed with the ocg/ spelling — see git history.
+# 9router re-introduces ocg/ and ollama/ as its OWN catalog prefixes, so they
+# are mapped here to the fork's canonical picker prefixes.)
+_ROUTER_PREFIX_ALIASES: dict[str, str] = {
+    "ocg": "oc",
+    "ollama": "ol",
+}
+
+# owned_by group in the proxy's /v1/models catalog -> picker prefix. The
+# Codex OAuth models are grouped under owned_by "openai" in that catalog.
+# The 9router aggregator reports the group as the prefix itself (ocg, ollama,
+# ag, cx, cmc, cu, gemini) — every group here maps to the fork's canonical
+# picker prefix so an already-prefixed 9router id is recognized.
+_ROUTER_OWNED_BY_TO_PREFIX: dict[str, str] = {
+    "commandcode": "cmc",
+    "opencode-go": "oc",
+    "ocg": "oc",  # 9router's group for the opencode-go provider
+    "ollama-cloud": "ol",
+    "ollama": "ol",  # 9router's group for the ollama provider
+    "openai": "cx",
+    "antigravity": "ag",
+    "ag": "ag",
+    "cx": "cx",
+    "cmc": "cmc",
+    "gemini": "ag",  # 9router gemini group rides the antigravity account
+}
+
+# Raw model ids per provider, exactly as the proxy advertises them in
+# /v1/models. Single source for BOTH the picker whitelist and the raw-id
+# translation — keep the two in lockstep. gpt-5.3-codex-spark is deliberately
+# absent: it returns 400 upstream (verified).
+_ROUTER_RAW_MODEL_IDS: dict[str, tuple[str, ...]] = {
+    "cmc": (
+        "deepseek/deepseek-v4-pro",
+        "deepseek/deepseek-v4-flash",
+        "moonshotai/Kimi-K3",
+        "moonshotai/Kimi-K2.7-Code",
+        "moonshotai/Kimi-K2.7-Code-Highspeed",
+        "moonshotai/Kimi-K2.6",
+        "moonshotai/Kimi-K2.5",
+        "zai-org/GLM-5.2",
+        "zai-org/GLM-5.2-Fast",
+        "zai-org/GLM-5.1",
+        "zai-org/GLM-5",
+        "MiniMaxAI/MiniMax-M3",
+        "MiniMaxAI/MiniMax-M2.7",
+        "MiniMaxAI/MiniMax-M2.5",
+        "xiaomi/mimo-v2.5-pro",
+        "xiaomi/mimo-v2.5",
+        "Qwen/Qwen3.8-Max",
+        "Qwen/Qwen3.7-Max",
+        "Qwen/Qwen3.7-Plus",
+        "Qwen/Qwen3.7-Flash",
+        "Qwen/Qwen3.6-Max-Preview",
+        "Qwen/Qwen3.6-Plus",
+        "stepfun/Step-3.7-Flash",
+        "stepfun/Step-3.5-Flash",
+        "tencent/hy3-paid",
+        "nvidia/nemotron-3-ultra-550b-a55b",
+        "thinkingmachines/inkling",
+        "thinkingmachines/inkling-small",
+        "poolside/laguna-s-2.1-free",
+        "meta/muse-spark-1.2",
+        "xai/grok-4.5",
+        "gpt-5.6-luna",
+    ),
+    "oc": (
+        # Full opencode-go (/zen/go/v1) catalog — every model this provider
+        # serves, so the picker can select any of them. Raw ids, exactly as
+        # the catalog advertises them; the picker shows them prefixed (oc/).
+        "minimax-m3",
+        "minimax-m2.7",
+        "minimax-m2.5",
+        "kimi-k3",
+        "kimi-k2.7-code",
+        "kimi-k2.6",
+        "kimi-k2.5",
+        "glm-5.2",
+        "glm-5.1",
+        "glm-5",
+        "deepseek-v4-pro",
+        "deepseek-v4-flash",
+        "qwen3.7-max",
+        "qwen3.8-max",
+        "qwen3.7-plus",
+        "qwen3.6-plus",
+        "qwen3.5-plus",
+        "mimo-v2-pro",
+        "mimo-v2-omni",
+        "mimo-v2.5-pro",
+        "mimo-v2.5",
+        "hy3",
+        "hy3-preview",
+        "gpt-5.6-luna",
+        "grok-4.5",
+    ),
+    "ol": (
+        # Full ollama-cloud (/v1) catalog. The plain and kimi/glm entries were
+        # previously hidden (operator preference); they are now exposed so the
+        # picker can select any ollama model.
+        "nemotron-3-ultra",
+        "deepseek-v4-flash:preview",
+        "minimax-m2.7",
+        "qwen3.5:397b",
+        "glm-5.2",
+        "deepseek-v4-pro",
+        "deepseek-v4-flash:0731",
+        "gpt-oss:20b",
+        "kimi-k3",
+        "gpt-oss:120b",
+        "gemma4:31b",
+        "nemotron-3-super",
+        "nemotron-3-nano:30b",
+        "minimax-m3",
+        "glm-5.1",
+        "kimi-k2.7-code",
+        "kimi-k2.6",
+        "mistral-large-3:675b",
+    ),
+    "cx": (
+        "gpt-5.6-luna",
+        "gpt-5.6-terra",
+        "gpt-5.6-sol",
+        "gpt-5.5",
+        "gpt-5.4",
+        "gpt-5.4-mini",
+        "codex-auto-review",
+    ),
+    "ag": (
+        "gemini-3-flash",
+        "gemini-3-flash-agent",
+        "gemini-3.5-flash-extra-low",
+        "gemini-3.1-pro-low",
+        "gemini-3.6-flash-high",
+        "gemini-pro-agent",
+        "gemini-3.1-flash-lite",
+        "gemini-3.1-flash-image",
+        "gemini-3.5-flash-low",
+        "claude-opus-4-6-thinking",
+        "claude-sonnet-4-6",
+        "gpt-oss-120b-medium",
+    ),
+}
+
+
+def _router_picker_id(prefix: str, raw: str) -> str:
+    """The picker spelling of a raw id: prefix + the model's short name.
+
+    Commandcode's raw ids carry a vendor namespace (``deepseek/deepseek-v4-pro``,
+    ``moonshotai/Kimi-K3``) that the picker drops — the prefix already names the
+    provider, so the vendor part is redundant there (the picker shows
+    ``cmc/deepseek-v4-pro``, not ``cmc/deepseek/deepseek-v4-pro``). Ids without a
+    vendor namespace keep their full spelling.
+    """
+    return f"{prefix}/{raw.rsplit('/', 1)[-1]}"
+
+
+def strip_router_model_prefix(model_id: str) -> str:
+    """Translate a picker model id to the raw id the proxy serves.
+
+    The GUI picker shows prefixed ids (``cmc/``, ``oc/``, ``ol/``, ``cx/``,
+    ``ag/``, so the user can disambiguate
+    providers, but CLIProxyAPI REJECTS the prefixed spelling ("unknown
+    provider"). Strip a known prefix and return the raw id — the full raw id
+    when the picker spelling already carries it (``cmc/deepseek/deepseek-v4-pro``),
+    otherwise the short name matched back to its raw form
+    (``cmc/deepseek-v4-pro`` -> ``deepseek/deepseek-v4-pro``). Ids without a
+    prefix and ids carrying an unknown prefix pass through unchanged, so this
+    is safe to apply on every upstream path.
+    """
+    prefix, _, rest = model_id.partition("/")
+    prefix = _ROUTER_PREFIX_ALIASES.get(prefix, prefix)
+    raws = _ROUTER_RAW_MODEL_IDS.get(prefix, ())
+    if not raws or not rest:
+        return model_id
+    if rest in raws:
+        return rest
+    for raw in raws:
+        if raw.rsplit("/", 1)[-1] == rest:
+            return raw
+    return model_id
+
+
+def prefixed_router_model_id(model_id: str, owned_by: str = "") -> str | None:
+    """Map a ``/v1/models`` entry to its prefixed picker id (or None).
+
+    Handles BOTH catalog formats:
+
+    * **CLIProxyAPI (raw ids + owned_by):** the entry is a raw id like
+      ``deepseek/deepseek-v4-pro`` and ``owned_by`` names the provider group
+      (``openai`` = Codex -> ``cx/``). The raw id must be a known entry of
+      that provider, so the catalog can never advertise a model the whitelist
+      does not show.
+    * **9router (already-prefixed ids):** the entry already carries the group
+      prefix (``ocg/kimi-k2.6``, ``ollama/glm-5.2``, ``ag/gemini-3.6-flash-high``)
+      and ``owned_by`` matches it. The source prefix is normalized to the
+      fork's canonical picker prefix (``ocg`` -> ``oc``, ``ollama`` -> ``ol``)
+      and the rest checked against that provider's whitelist.
+
+    When ``owned_by`` is absent or unknown, fall back to scanning the raw-id
+    sets and require an unambiguous match — ``gpt-5.6-luna`` is served by both
+    commandcode and Codex, so the raw id alone cannot disambiguate.
+    """
+    # An already-prefixed 9router id: the leading group IS the source prefix.
+    source_prefix, _, rest = model_id.partition("/")
+    if rest:
+        prefix = _ROUTER_OWNED_BY_TO_PREFIX.get(owned_by, "")
+        if not prefix:
+            # Fall back to recognizing the embedded prefix directly.
+            prefix = _ROUTER_OWNED_BY_TO_PREFIX.get(source_prefix, "")
+        if prefix:
+            if rest not in _ROUTER_RAW_MODEL_IDS.get(prefix, ()):
+                return None
+            return _router_picker_id(prefix, rest)
+        # Unknown owned_by + unknown prefix: the id is not a recognized model.
+        return None
+
+    prefix = _ROUTER_OWNED_BY_TO_PREFIX.get(owned_by, "")
+    if prefix:
+        if model_id not in _ROUTER_RAW_MODEL_IDS.get(prefix, ()):
+            return None
+        return _router_picker_id(prefix, model_id)
+    matches = [p for p, raw_ids in _ROUTER_RAW_MODEL_IDS.items() if model_id in raw_ids]
+    if len(matches) != 1:
+        return None
+    return _router_picker_id(matches[0], model_id)
+
+
+# Default vision-capable fallback for image prompts on text-only router
+# models. cmc/mimo-v2.5 (commandcode) accepts images (verified 200) and is
+# fast. Overridable per install via agent.vision_fallback_model.
+_DEFAULT_VISION_FALLBACK_MODEL = "cmc/mimo-v2.5"
+# Default text-only router MODELS whose upstream rejects image content (400).
+# Verified per model against the live upstreams (2026-08-07):
+#   - oc/deepseek-v4-flash (opencode-go) -> 400 "unknown variant image_url"
+#   - ol/deepseek-v4-flash:0731 (ollama-cloud) -> 400 "does not support image input"
+#   - oc/mimo-v2.5 (opencode-go) -> 200 WITH image (vision-capable, NOT listed)
+# Overridable per install via agent.text_only_models.
+_DEFAULT_TEXT_ONLY_MODELS: frozenset[str] = frozenset(
+    {
+        "oc/deepseek-v4-flash",
+        "ol/deepseek-v4-flash:0731",
+    }
+)
+# Tools that produce image content (screenshots) — disabled at session start
+# when the model is text-only so the SDK never forwards an image block to a
+# rejecting upstream. Claude Code tool names for computer use / browser
+# screenshots; unknown names are harmless (the SDK ignores them).
+_TEXT_ONLY_DISABLED_TOOLS: frozenset[str] = frozenset(
+    {
+        "ComputerUse",
+        "computer",
+        "browser_screenshot",
+        "Screenshot",
+    }
+)
+
+
+def _is_router_text_only_model(model_id: str) -> bool:
+    """True when *model_id* is a known text-only router model.
+
+    opencode-go's deepseek-v4-flash and ollama-cloud's deepseek-v4-flash:0731
+    reject image content upstream (400), so image prompts must be redirected
+    to a vision-capable model. Matched by exact model id — a per-model list,
+    because e.g. opencode-go's mimo-v2.5 DOES accept images (verified 200).
+    Instance-level overrides come from ``AcpClient._text_only_models``; this
+    module-level helper checks the defaults.
+    """
+    return model_id in _DEFAULT_TEXT_ONLY_MODELS
+
+
+def _message_has_image_path(message: str) -> bool:
+    """Best-effort check whether *message* references an image file on disk.
+
+    Reuses the same path regex ``build_prompt_blocks`` scans, so the redirect
+    fires exactly when the prompt builder would emit an image block. A false
+    negative (path not matched) simply skips the redirect and the upstream
+    rejects the image as before; a false positive only switches model for a
+    text-only model, which is harmless.
+    """
+    if not message or not message.strip():
+        return False
+    try:
+        from kiro_crew.acp.prompt_blocks import _PATH_RE
+
+        return bool(_PATH_RE.search(message))
+    except Exception:  # pragma: no cover - import/attr drift guard
+        return False
+
+
 class AcpClient:
     """JSON-RPC 2.0 client over stdio with kiro-cli acp."""
 
@@ -1901,6 +2257,11 @@ class AcpClient:
         mcp_gateway_settings_mcp_json: str | Path | None = None,
         mcp_gateway_socket: str | Path | None = None,
         permission_mode: str | None = None,
+        image_redirect: str = "subagent",
+        vision_fallback_model: str = "cmc/mimo-v2.5",
+        vision_providers: list[dict[str, Any]] | None = None,
+        text_only_models: list[str] | None = None,
+        image_input_mode: str = "auto",
     ):
         if work_dir:
             self._work_dir = Path(work_dir)
@@ -1918,6 +2279,37 @@ class AcpClient:
         self._agent = agent
         self._sandbox_mode = sandbox_mode
         self._acp_backend = acp_backend
+        # Fork: image-redirect configuration (text-only router models dispatch
+        # image prompts to a vision-capable model). Defaults match the module
+        # constants so direct constructions behave like before.
+        self._image_redirect = image_redirect or "subagent"
+        self._vision_fallback_model = vision_fallback_model or "cmc/mimo-v2.5"
+        self._vision_providers = list(vision_providers or [])
+        self._text_only_models = frozenset(text_only_models or _DEFAULT_TEXT_ONLY_MODELS)
+        self._image_input_mode = image_input_mode or "auto"
+        # Fork: when the claude backend points at a custom ANTHROPIC_BASE_URL
+        # (e.g. a local router), the model id is the router's own namespace and
+        # the claude-agent-acp adapter rejects it in set_config_option. Skip
+        # the wire set and let the model ride in via ANTHROPIC_MODEL env, which
+        # the adapter forwards to Claude Code as its default.
+        self._model_via_env = bool(
+            self._is_claude
+            and (extra_env or {}).get("ANTHROPIC_BASE_URL")
+            and model not in ("", "auto", DEFAULT_MODEL)
+            and not (extra_env or {}).get("ANTHROPIC_MODEL")
+        )
+        if self._model_via_env:
+            self._extra_env = dict(extra_env or {})
+            # The picker id is prefixed (cmc/...); the proxy serves raw ids
+            # and rejects the prefix, so translate before the env carries it.
+            self._extra_env["ANTHROPIC_MODEL"] = strip_router_model_prefix(model or "")
+        else:
+            self._extra_env = extra_env or {}
+        logger.debug(
+            "acp client init: backend=%r model=%r model_via_env=%s base_url=%s",
+            self._acp_backend, model, self._model_via_env,
+            (extra_env or {}).get("ANTHROPIC_BASE_URL", ""),
+        )
         # Claude backend permission mode (Auto-mode / permission-UI parity).
         # Inert on the kiro-cli path and unused by the public core; a companion
         # that drives the _is_claude seam reads/writes it and wires the
@@ -1932,7 +2324,7 @@ class AcpClient:
         # SubagentManager, so they never double-log.
         self._audit_source = audit_source
         self._channel_id = channel_id
-        self._extra_env = extra_env or {}
+        # NOTE: self._extra_env is set in the _model_via_env block above.
         # MCP gateway overlay: when set, the broker stubs in its rewritten specs
         # are injected into this session at ACP session/new, where they outrank
         # the same-named entries in the agent spec. Nothing is written to the
@@ -2089,6 +2481,15 @@ class AcpClient:
         # _capture_available_models, which parses the real dict-shaped `models`).
         self._acp_config_options: list[dict] = []
 
+        # Fork: seed the claude backend's per-session settings.local.json now
+        # that _model_via_env is known — the settings file is authoritative
+        # over ANTHROPIC_MODEL env, so the router model must be pinned there.
+        if self._is_claude:
+            try:
+                self._write_claude_local_settings()
+            except Exception:
+                logger.debug("claude local settings seed failed", exc_info=True)
+
     @property
     def backend(self) -> str:
         """ACP backend identifier (e.g. ACP_BACKEND_CLAUDE for claude-agent-acp)."""
@@ -2109,6 +2510,54 @@ class AcpClient:
         """
         return self.backend == ACP_BACKEND_KIRO
 
+    @property
+    def _is_opencode(self) -> bool:
+        """True when this client drives the fork's opencode CLI backend."""
+        return self.backend == ACP_BACKEND_OPENCODE
+
+    def _write_opencode_provider_config(self) -> None:
+        """Write an isolated OpenCode config for the fork's custom provider.
+
+        Writes to ``~/.config/kirocrew-customapi/opencode-home/.config/opencode/
+        opencode.json`` so that when the OpenCode ACP process is spawned with
+        ``HOME`` set to ``~/.config/kirocrew-customapi/opencode-home``, it sees
+        only our provider — no user plugins (Honcho) or MCP servers that would
+        stall the ACP session.
+        """
+        home = os.path.expanduser("~")
+        cfg_dir = os.path.join(
+            home, ".config", "kirocrew-customapi", "opencode-home", ".config", "opencode"
+        )
+        os.makedirs(cfg_dir, exist_ok=True)
+        path = os.path.join(cfg_dir, "opencode.json")
+        base_url = (self._extra_env or {}).get("ANTHROPIC_BASE_URL", "")
+        api_format = (self._extra_env or {}).get("OPENCODE_API_FORMAT", "") or "openai"
+        if base_url.rstrip("/") in ("https://ollama.com", "https://ollama.com/v1"):
+            base_url = "https://ollama.com/v1"
+            api_format = "openai"
+        api_key = (self._extra_env or {}).get("ANTHROPIC_API_KEY", "")
+        npm = "@ai-sdk/anthropic" if api_format == "anthropic" else "@ai-sdk/openai-compatible"
+        options: dict[str, object] = {"baseURL": base_url}
+        if api_key:
+            options["apiKey"] = api_key
+        model_id = (self._extra_env or {}).get("KIROCREW_DEFAULT_MODEL", "") or getattr(
+            self, "_model", DEFAULT_MODEL
+        )
+        model_id = strip_router_model_prefix(model_id or "")
+        models = {model_id: {"name": model_id}} if model_id and model_id != DEFAULT_MODEL else {}
+        # Fully isolated config — no user plugins, no user MCP servers.
+        config = {
+            "provider": {
+                "kirocrew": {"npm": npm, "options": options, "models": models},
+            },
+            "plugin": [],
+            "mcp": {},
+        }
+
+        from kiro_crew.atomic_write import atomic_write
+
+        atomic_write(path, json.dumps(config, indent=2) + "\n", mode=0o600)
+
     def _pooled_mcp_servers(self) -> list[dict[str, Any]]:
         """Broker-stub ``mcpServers`` entries for this session's ``session/new``.
 
@@ -2124,15 +2573,123 @@ class AcpClient:
     def _claude_session_mcp_servers(self) -> list:
         """MCP server array passed to a claude ``session/new`` / ``session/load``.
 
-        Overridable seam for the dormant ``_is_claude`` backend. The Default is
-        ``[]`` so the public core (kiro-cli only, which gets its servers via
-        ``--agent``) is byte-identical. An internal companion that re-registers
-        a Claude backend over the ``ACP_BACKEND_CLAUDE`` seam overrides this to
-        inject the kirocrew-core/cron + user MCP servers — the claude adapter
-        does not read ``kirocrew.mcp.json`` on its own, so without this a claude
-        session would have zero MCP tools.
+        Fork: re-enables the dormant seam. The claude adapter does NOT read
+        ``kirocrew.mcp.json`` on its own, so without this a claude session
+        would have zero MCP tools. We load the agent's own ``mcpServers``
+        from its spec (same shape kiro-cli consumes) and shape them into ACP
+        ``session/new`` entries, mirroring the kiro-cli path.
         """
-        return []
+        if not self._is_claude:
+            return []
+        try:
+            from kiro_crew.config.paths import kiro_agents_dir
+
+            spec_path = kiro_agents_dir() / f"{self._agent or CLIENT_NAME}.json"
+            if not spec_path.is_file():
+                return []
+            spec = json.loads(spec_path.read_text(encoding="utf-8"))
+            servers = spec.get("mcpServers") or {}
+            out: list[dict[str, Any]] = []
+            for name, entry in sorted(servers.items()):
+                if not isinstance(entry, dict) or not entry.get("command"):
+                    continue
+                shaped: dict[str, Any] = {
+                    "name": name,
+                    "command": entry["command"],
+                    "args": list(entry.get("args") or []),
+                }
+                if entry.get("env"):
+                    shaped["env"] = entry["env"]
+                if entry.get("timeout"):
+                    shaped["timeout"] = entry["timeout"]
+                if entry.get("autoApprove"):
+                    shaped["autoApprove"] = entry["autoApprove"]
+                out.append(shaped)
+            return out
+        except Exception:
+            logger.warning(
+                "claude session MCP server injection failed for agent %r",
+                self._agent,
+                exc_info=True,
+            )
+            return []
+
+    def _write_claude_local_settings(self) -> None:
+        """Seed the claude backend's per-session ``settings.local.json``.
+
+        Fork: re-enables the dormant seam. Without this the claude session
+        collapses to the 200K default window and permission routing is
+        absent. Writes into the CLAUDE_CONFIG_DIR the spawned adapter uses
+        (``.claude`` under the work dir when unset, else the env var).
+        """
+        import os as _os
+
+        config_dir = _os.environ.get("CLAUDE_CONFIG_DIR") or str(
+            Path(self._work_dir) / ".claude"
+        )
+        try:
+            Path(config_dir).mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return
+        settings_path = Path(config_dir) / "settings.local.json"
+        data: dict[str, Any] = {}
+        try:
+            if settings_path.is_file():
+                data = json.loads(settings_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            data = {}
+        # Permission routing: allow tool calls without interactive prompts —
+        # Kiro Crew's own approval flow sits above the ACP layer and prompts
+        # there, so the backend-level prompt would be a double prompt.
+        data.setdefault("permissions", {}).setdefault("defaultMode", "acceptEdits")
+        # Fork: on a custom base URL (router) the model id MUST be pinned in
+        # settings.local.json — Claude Code treats the settings file as
+        # authoritative over ANTHROPIC_MODEL env / _meta options, and with
+        # only an allowlist present it warns "Model X is restricted by your
+        # organization's settings" and falls back to its Bedrock default
+        # (claude-opus-5[1m]), which the router rejects. NOTE: the
+        # availableModels allowlist must NOT be written on this path — the
+        # wildcard is interpreted as an org restriction that blocks any
+        # router-namespace model id (verified end-to-end: with
+        # availableModels ["*"] present the adapter refuses
+        # oc/deepseek-v4-flash-free; without it, the pinned model runs).
+        if getattr(self, "_model_via_env", False) and self._model:
+            # Pin the RAW id — Claude Code treats the settings file as
+            # authoritative and forwards the pinned value verbatim to the
+            # proxy, which rejects prefixed spellings.
+            data["model"] = strip_router_model_prefix(self._model)
+            # Fork: session-start image guard — a text-only router model must
+            # never receive image content, including agent-taken screenshots
+            # (computer-use / browser screenshot tools return image blocks the
+            # SDK forwards upstream, where the text-only provider rejects
+            # them). Disable the screenshot-producing tools for this session.
+            from kiro_crew.acp.vision import decide_image_input_mode
+
+            if (
+                decide_image_input_mode(
+                    self._model,
+                    image_input_mode=self._image_input_mode,
+                    text_only_models=self._text_only_models,
+                )
+                == "text"
+            ):
+                disabled = set(data.get("disabledTools") or [])
+                for tool in _TEXT_ONLY_DISABLED_TOOLS:
+                    disabled.add(tool)
+                data["disabledTools"] = sorted(disabled)
+        else:
+            # availableModels allowlist unlocks the 1M-token window on claude
+            # backends that gate it (Bedrock path only).
+            if not data.get("availableModels"):
+                data["availableModels"] = ["*"]
+        try:
+            settings_path.write_text(
+                json.dumps(data, indent=2), encoding="utf-8"
+            )
+        except OSError:
+            logger.warning(
+                "claude settings seed failed for %s", settings_path, exc_info=True
+            )
 
     @property
     def is_ready(self) -> bool:
@@ -2206,6 +2763,13 @@ class AcpClient:
             channel_id,
         )
 
+    def _wire_model_id(self, model_id: str) -> str:
+        """Translate KiroCrew's model id into the active ACP backend namespace."""
+        raw = strip_router_model_prefix(model_id)
+        if self.backend == ACP_BACKEND_OPENCODE and raw != DEFAULT_MODEL:
+            return raw if raw.startswith("kirocrew/") else f"kirocrew/{raw}"
+        return raw
+
     async def set_model(self, model_id: str) -> None:
         """Switch model on a running session (used by warm pool post-claim)."""
         if not self._session_id:
@@ -2223,16 +2787,24 @@ class AcpClient:
         # instead of calling into here — otherwise the same stale setting that is
         # quietly withheld on a cold start would raise and kill a warm claim,
         # making the outcome depend on whether a pooled process happened to exist.
-        if self._is_kiro and self._model_is_unusable(model_id):
+        # set_model is the EXPLICIT-pick path (see AGENTS.md "Model selection"):
+        # it must raise AcpModelUnavailable rather than silently swap in a
+        # fallback, so a caller with an INHERITED value pre-checks with
+        # model_is_unusable and skips instead of calling in here. Covers both
+        # CLI backends that run their own entitlement-checked catalog (kiro,
+        # the fork's opencode); the dormant claude seam has no client-side
+        # catalog to validate against.
+        if (self._is_kiro or self._is_opencode) and self._model_is_unusable(model_id):
             _rejected_log, _ = redact_exfiltration_urls(str(model_id))
             _rejected_log, _ = redact_credentials(_rejected_log)
             raise AcpModelUnavailable(_rejected_log, self._advertised_model_ids())
         if self._is_claude:
-            await self.set_config_option("model", model_id)
+            if not getattr(self, "_model_via_env", False):
+                await self.set_config_option("model", model_id)
         else:
             await self._send_request(
                 METHOD_SET_MODEL,
-                {"sessionId": self._session_id, "modelId": model_id},
+                {"sessionId": self._session_id, "modelId": self._wire_model_id(model_id)},
             )
         self._model = model_id
         self._resolved_model_id = model_id
@@ -2247,6 +2819,54 @@ class AcpClient:
         )
         self.last_prompt_stats.rebase_to_window(win or 0)
 
+    # Fork: curated model whitelist for the GUI model picker on the router
+    # path. Picker ids are PREFIXED (cmc/, oc/, ol/, cx/, ag/ — the raw-id
+    # table is _ROUTER_RAW_MODEL_IDS) so the user can disambiguate providers;
+    # commandcode ids drop their vendor namespace (cmc/deepseek-v4-pro). The
+    # prefix is stripped again before any id goes upstream
+    # (strip_router_model_prefix()), because the local CLIProxyAPI serves raw
+    # ids and rejects the prefixed spelling.
+    _ROUTER_MODEL_WHITELIST: frozenset[str] = frozenset(
+        {
+            _router_picker_id(prefix, raw)
+            for prefix, raw_ids in _ROUTER_RAW_MODEL_IDS.items()
+            for raw in raw_ids
+        }
+    )
+
+    @classmethod
+    def router_model_whitelist(cls) -> frozenset[str]:
+        """The effective router-model whitelist: built-in defaults PLUS any ids
+        from the local overrides file (``model_whitelist.json`` under the config
+        dir), if present.
+
+        The local file lets a user add their own router models (e.g. a private
+        9router catalog entry) WITHOUT editing this source file or rebuilding —
+        the GUI picker then shows those models as selectable options. The file
+        is a flat JSON array of model-id strings::
+
+            ["cmc/vendor/my-private-model"]
+
+        Best-effort: a missing/empty/corrupt file degrades to the built-in
+        defaults and never raises. Non-string entries are skipped.
+        """
+        base = set(cls._ROUTER_MODEL_WHITELIST)
+        try:
+            from kiro_crew.config.paths import config_dir
+
+            path = config_dir() / "model_whitelist.json"
+            if path.is_file():
+                data = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    data = data.get("models", [])
+                if isinstance(data, list):
+                    for mid in data:
+                        if isinstance(mid, str) and mid.strip():
+                            base.add(mid.strip())
+        except Exception:  # pragma: no cover - config never fatal
+            logger.debug("model_whitelist.json unreadable; using defaults", exc_info=True)
+        return frozenset(base)
+
     def _capture_available_models(self, session_resp: dict) -> None:
         """Record the model list the backend advertised in a session response.
 
@@ -2259,7 +2879,17 @@ class AcpClient:
 
         Also records ``currentModelId`` for ``_track_metadata``'s context
         window lookup.
+
+        Fork: on the custom-base-URL (router) path the adapter advertises its
+        OWN Bedrock catalog (claude-opus-4.6, claude-sonnet-4.5, ...) which the
+        router does not serve — picking one in the dashboard dropdown would
+        fail with "model not available". Instead, fetch the router's real
+        catalog from ``GET {base_url}/v1/models`` and advertise THAT, so the
+        GUI model picker lists exactly the models that actually run.
         """
+        if getattr(self, "_model_via_env", False):
+            self._capture_router_models()
+            return
         models = session_resp.get("models")
         if not isinstance(models, dict):
             return
@@ -2278,13 +2908,87 @@ class AcpClient:
                 continue
             captured.append(
                 {
-                    "modelId": str(model_id),
-                    "name": str(m.get("name") or model_id),
-                    "description": str(m.get("description") or ""),
+                    "modelId": model_id,
+                    "name": m.get("name") or model_id,
+                    "description": m.get("description") or "",
                 }
             )
         if captured:
             self._available_models = captured
+            self._modes_advertised = True
+
+    def _capture_router_models(self) -> None:
+        """Advertise the router's own catalog (custom base URL path).
+
+        GET ``{base_url}/v1/models`` (OpenAI-style listing, which 9router and
+        most Anthropic-compatible gateways also expose) and map each entry to
+        the ``{modelId, name, description}`` shape the dashboard dropdown
+        expects. Falls back to keeping whatever the adapter advertised when
+        the router is unreachable or the listing is unparseable.
+
+        Fork: the catalog is filtered to a CURATED whitelist (the GUI picker
+        should list only the models the user actually wants to switch
+        between), and entries are advertised under their PREFIXED picker ids
+        (cmc/, oc/, ol/, cx/, ag/ — see prefixed_router_model_id()) so the
+        dropdown namespace matches what the user picks and what
+        strip_router_model_prefix() accepts.
+        """
+        base_url = (self._extra_env or {}).get("ANTHROPIC_BASE_URL", "")
+        # The key may live in _extra_env (provider_api_key) OR in the process
+        # environment (ANTHROPIC_API_KEY exported by the user, or the
+        # CLIProxyAPI-specific CLIPROXY_API_KEY) — the spawn env merges all
+        # three, so read them all here too.
+        import os as _os
+
+        api_key = (
+            (self._extra_env or {}).get("ANTHROPIC_API_KEY", "")
+            or _os.environ.get("ANTHROPIC_API_KEY", "")
+            or _os.environ.get("CLIPROXY_API_KEY", "")
+        )
+        if not base_url:
+            return
+        try:
+            import json as _json
+            import urllib.request as _request
+
+            url = base_url.rstrip("/") + "/v1/models"
+            req = _request.Request(url, headers={"x-api-key": api_key})
+            with _request.urlopen(req, timeout=5) as resp:
+                payload = _json.loads(resp.read().decode("utf-8"))
+            entries = payload.get("data") if isinstance(payload, dict) else None
+            if not isinstance(entries, list):
+                return
+            captured: list[dict[str, str]] = []
+            for m in entries:
+                if not isinstance(m, dict):
+                    continue
+                model_id = m.get("id") or m.get("model") or ""
+                if not model_id:
+                    continue
+                # Advertise the PREFIXED spelling — the picker namespace — and
+                # only entries the whitelist actually shows. The prefix is
+                # stripped again before any id goes upstream
+                # (strip_router_model_prefix()).
+                prefixed = prefixed_router_model_id(model_id, m.get("owned_by") or "")
+                if prefixed is None or prefixed not in self.router_model_whitelist():
+                    continue
+                captured.append(
+                    {
+                        "modelId": prefixed,
+                        "name": prefixed,
+                        "description": m.get("description") or "",
+                    }
+                )
+            if captured:
+                self._available_models = captured
+                self._modes_advertised = True
+                logger.debug(
+                    "claude router catalog: %d curated models advertised from %s",
+                    len(captured),
+                    url,
+                )
+        except Exception as exc:
+            logger.debug("claude router catalog fetch failed: %s", exc)
 
     def available_models(self) -> list[dict[str, str]]:
         """Models advertised by the backend at session init (may be empty)."""
@@ -2355,11 +3059,12 @@ class AcpClient:
             self._model = DEFAULT_MODEL
             return
         if self._is_claude:
-            await self.set_config_option("model", self._model)
+            if not getattr(self, "_model_via_env", False):
+                await self.set_config_option("model", self._model)
         else:
             await self._send_request(
                 METHOD_SET_MODEL,
-                {"sessionId": self._session_id, "modelId": self._model},
+                {"sessionId": self._session_id, "modelId": self._wire_model_id(self._model)},
             )
         logger.info("ACP model: %s", self._model)
 
@@ -2547,6 +3252,19 @@ class AcpClient:
                     f"script."
                 )
             argv: list[str] = claude_argv
+        elif self.backend == ACP_BACKEND_OPENCODE:
+            # OpenCode backend: seed ~/.config/opencode/opencode.json with the
+            # fork's custom provider (baseURL + apiKey + openai format), then
+            # spawn `opencode acp` over stdio — same ACP JSON-RPC contract as
+            # the claude backend. OpenCode translates OpenAI↔Anthropic itself.
+            await asyncio.to_thread(self._write_opencode_provider_config)
+            opencode_argv = await asyncio.to_thread(_resolve_opencode_bin)
+            if not opencode_argv:
+                raise AcpError(
+                    "opencode not found. Install it with 'npm i -g opencode-ai' "
+                    "(or set OPENCODE_BIN to its entry script)."
+                )
+            argv = [*opencode_argv, "acp"]
         else:
             try:
                 kiro_bin = await _resolve_kiro_bin_for_spawn()
@@ -2593,6 +3311,27 @@ class AcpClient:
         env = {**os.environ}
         if self._extra_env:
             env.update(self._extra_env)
+        if self.backend == ACP_BACKEND_OPENCODE:
+            # Isolate the OpenCode process from the user's global config
+            # (~/.config/opencode/opencode.json and .jsonc) which may contain
+            # plugins (Honcho) and MCP servers that stall the ACP session.
+            # _write_opencode_provider_config already wrote our isolated
+            # config to ~/.config/kirocrew-customapi/opencode-home/.config/
+            # opencode/opencode.json — setting HOME to that root makes
+            # OpenCode see ONLY our config, with zero user plugins or MCP.
+            isolated_home = os.path.join(
+                os.path.expanduser("~"),
+                ".config", "kirocrew-customapi", "opencode-home",
+            )
+            env["HOME"] = isolated_home
+        logger.debug(
+            "spawn env check: ANTHROPIC_MODEL=%r ANTHROPIC_BASE_URL=%r model_via_env=%s argv=%r cwd=%s",
+            env.get("ANTHROPIC_MODEL", "<unset>"),
+            env.get("ANTHROPIC_BASE_URL", "<unset>"),
+            getattr(self, "_model_via_env", False),
+            argv,
+            str(self._work_dir),
+        )
         # Parent-level scrub of gateway-owned channel credentials. The default
         # auto/standard sandbox launcher strips _AGENT_DENIED_ENV_KEYS only for
         # cc/strict, and this path copies a raw os.environ + wrap_argv (not
@@ -3025,9 +3764,23 @@ class AcpClient:
             ],
         }
         if self._is_claude:
-            new_params["_meta"] = {"claudeCode": {"options": {}}}
+            # Fork: with a custom base URL the model id lives in the router's
+            # namespace; the adapter rejects it in set_config_option but
+            # forwards _meta.claudeCode.options.model to Claude Code, which
+            # honors it. ANTHROPIC_MODEL env also rides along as the default.
+            cc_opts: dict[str, Any] = {}
+            if getattr(self, "_model_via_env", False) and self._model:
+                # The _meta model is forwarded verbatim to Claude Code, which
+                # sends it to the proxy — strip the picker prefix first.
+                cc_opts["model"] = strip_router_model_prefix(self._model)
+            new_params["_meta"] = {"claudeCode": {"options": cc_opts}}
+            logger.debug(
+                "claude session/new _meta options: %r (model=%r via_env=%s)",
+                cc_opts, self._model, getattr(self, "_model_via_env", False),
+            )
 
         self._last_substitution_model = None
+        logger.debug("claude session/new full params: %r", new_params)
         session_id = await self._send_request(METHOD_SESSION_NEW, new_params)
         session_resp = await self._wait_for_response(session_id, timeout=_INIT_TIMEOUT)
 
@@ -3079,7 +3832,9 @@ class AcpClient:
         """Handshake: initialize → session/load or session/new → set_mode → set_model."""
         # 1. Initialize
         protocol_version: int | str = (
-            PROTOCOL_VERSION_CLAUDE if self._is_claude else PROTOCOL_VERSION
+            PROTOCOL_VERSION_CLAUDE
+            if self.backend in {ACP_BACKEND_CLAUDE, ACP_BACKEND_OPENCODE}
+            else PROTOCOL_VERSION
         )
         init_id = await self._send_request(
             METHOD_INITIALIZE,
@@ -3211,7 +3966,7 @@ class AcpClient:
             except OSError:
                 self._jsonl_pos = 0
 
-        # 4. Activate agent via set_mode (claude-agent-acp does not support set_mode — skip).
+        # 4. Activate Kiro agent mode. Other ACP backends do not expose Kiro modes.
         #    Guard (A): fire only when the backend advertised this agent, or
         #    advertised no modes at all (older kiro-cli / fake → attempt,
         #    backward-compatible). If modes ARE advertised but this agent is
@@ -4607,14 +5362,135 @@ class AcpClient:
     async def _send_prompt(self, message: str) -> int:
         # Shared with AcpSessionHandle.prompt via prompt_blocks so the two paths
         # cannot drift.
+        # Fork: text-only router models (oc/deepseek-v4-flash, ol/…) reject
+        # image content upstream with a 400. When the active model is not
+        # vision-capable and the message carries an image path, dispatch the
+        # image to a one-shot VISION subagent (cmc/mimo-v2.5) and inject its
+        # text description in place of the image. The main session keeps its
+        # text-only model; the subagent session is spawned on demand and torn
+        # down after the turn.
+        model_id = self._model or ""
+        from kiro_crew.acp.vision import decide_image_input_mode
+
+        image_mode = decide_image_input_mode(
+            model_id,
+            image_input_mode=self._image_input_mode,
+            text_only_models=self._text_only_models,
+        )
+        needs_redirect = image_mode == "text" and _message_has_image_path(message)
+        if self._image_redirect != "off" and needs_redirect:
+            if self._image_redirect == "subagent":
+                try:
+                    message = await self._describe_images_with_vision(message)
+                except Exception:
+                    # Vision subagent failed — fall back to the session switch
+                    # so the image still has a chance instead of hard-erroring.
+                    logger.warning(
+                        "Vision subagent failed; switching session %s to %s",
+                        model_id,
+                        self._vision_fallback_model,
+                        exc_info=True,
+                    )
+                    await self._switch_to_vision_model()
+            else:  # "switch"
+                logger.info(
+                    "Image prompt on text-only model %s — switching to %s",
+                    model_id,
+                    self._vision_fallback_model,
+                )
+                await self._switch_to_vision_model()
         return await self._send_request(
             METHOD_PROMPT,
             {
                 "sessionId": self._session_id,
                 # Offloaded: see the note in session_handle.prompt -- image
                 # reads and base64 encoding must not block the event loop.
-                "prompt": await asyncio.to_thread(build_prompt_blocks, message),
+                # Fork: on a text-only model, image blocks are NEVER emitted
+                # (allow_image=False) — the image path stays as plain text so
+                # a tool-capable agent could still open it, but no image block
+                # reaches the SDK and therefore never hits the rejecting
+                # upstream. This is the session-start guard: text-only models
+                # cannot carry images in the conversation at all.
+                "prompt": await asyncio.to_thread(
+                    build_prompt_blocks,
+                    message,
+                    allow_image=image_mode == "native",
+                ),
             },
+        )
+
+    async def _describe_images_with_vision(self, message: str) -> str:
+        """Replace each image path in *message* with a vision-subagent description.
+
+        Spawns one-shot claude-agent-acp sessions on the configured vision
+        fallback chain (default ``cmc/mimo-v2.5``, same proxy env as this
+        client), sends each image with a describe prompt, collects the text
+        reply, and substitutes ``[image: <name>: <description>]`` for the path
+        in the message. The subagent processes are shut down afterwards, so the
+        main session keeps its text-only model. Raises on any failure so the
+        caller can fall back.
+        """
+        from kiro_crew.acp.prompt_blocks import _PATH_RE
+
+        paths = [m.group(1).strip() for m in _PATH_RE.finditer(message)]
+        if not paths:
+            return message
+        replacement = message
+        for path in paths:
+            description = await self._describe_image_via_chain(path)
+            name = Path(path).name
+            marker = f"[image: {name}: {description.strip() or 'unavailable'}]"
+            # Replace the FIRST occurrence of the literal path; the regex may
+            # also match substrings of other paths (e.g. shared dirs), so an
+            # anchored literal replace is safer than a global regex sub.
+            replacement = replacement.replace(path, marker, 1)
+        return replacement
+
+    async def _describe_image_via_chain(self, image_ref: str) -> str:
+        """Describe *image_ref* via the configured vision provider chain.
+
+        Builds the ordered chain from ``agent.vision_providers`` + the legacy
+        ``vision_fallback_model`` (see :func:`~kiro_crew.acp.vision.resolve_vision_providers`)
+        and returns the first successful description, else ``"unavailable"``.
+        """
+        from kiro_crew.acp.vision import describe_image_via_chain, resolve_vision_providers
+
+        providers = resolve_vision_providers(
+            vision_providers=self._vision_providers,
+            vision_fallback_model=self._vision_fallback_model,
+            main_env=self._extra_env,
+            main_backend=self._acp_backend,
+        )
+        return await describe_image_via_chain(
+            image_ref,
+            providers,
+            work_dir=self._work_dir / "vision-subagent",
+            sandbox_mode=self._sandbox_mode,
+        )
+
+    async def _switch_to_vision_model(self) -> None:
+        """Switch this session to the configured vision fallback model."""
+        if self._is_claude:
+            await self.set_config_option("model", self._vision_fallback_model)
+        else:
+            await self._send_request(
+                METHOD_SET_MODEL,
+                {"sessionId": self._session_id, "modelId": self._vision_fallback_model},
+            )
+        self._model = self._vision_fallback_model
+        self._resolved_model_id = self._vision_fallback_model
+
+    async def _vision_subagent_describe(self, image_path: str) -> str:
+        """One-shot vision subagent: describe *image_path* on the vision model."""
+        from kiro_crew.acp.vision import vision_subagent_describe
+
+        return await vision_subagent_describe(
+            image_path,
+            vision_model=self._vision_fallback_model,
+            work_dir=self._work_dir / "vision-subagent",
+            extra_env=self._extra_env,
+            acp_backend=self._acp_backend,
+            sandbox_mode=self._sandbox_mode,
         )
 
     async def _read_prompt_response(self, req_id: int, timeout: float) -> str:
@@ -4746,6 +5622,20 @@ class AcpClient:
             # chokepoint used by AcpSessionHandle._handle_update too.
             used, size = parse_usage_update(update)
             if used is not None and size and size > 0:
+                # Fork: the claude-agent-acp SDK reports its DEFAULT 200K
+                # window for router models it does not know (e.g.
+                # deepseek-v4-flash, served at 1M). The central registry knows
+                # the true window, so prefer it over the SDK's fallback — a
+                # 200K reading for a 1M model makes the context meter lie
+                # ("96K / 200K") and can force premature compaction.
+                resolved = self._resolved_model_id or self._model or ""
+                if (
+                    size <= 200_000
+                    and model_registry.has_known_window(resolved)
+                ):
+                    reg_win = model_registry.model_window(resolved)
+                    if reg_win and reg_win > size:
+                        size = int(reg_win)
                 self.last_prompt_stats.context_pct = round((used / size) * 100, 1)
                 # Keep the raw counts so the dashboard token text uses the real
                 # served window (size) instead of re-deriving it from the model id.

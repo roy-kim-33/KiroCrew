@@ -24,7 +24,7 @@ from collections.abc import Callable, Iterable, MutableMapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 from urllib.parse import urlsplit as _urlsplit
 
 from kiro_crew import __version__, model_registry, platform_compat
@@ -1174,6 +1174,99 @@ class AgentConfig:
         default="acp",
         metadata=_meta("Provider", "LLM provider backend (KiroACP / kiro-cli).", enum=["acp"]),
     )
+    provider_base_url: str = field(
+        default="",
+        metadata=_meta(
+            "Provider Base URL",
+            "ANTHROPIC_BASE_URL for the claude_code backend. Empty inherits "
+            "the environment. Local endpoints (http://127.0.0.1, "
+            "http://192.168.x.x) are always allowed.",
+        ),
+    )
+    provider_api_key: str = field(
+        default="",
+        metadata=_meta(
+            "Provider API Key",
+            "ANTHROPIC_API_KEY for the claude_code backend. Empty inherits "
+            "the environment (ANTHROPIC_API_KEY, or CLIPROXY_API_KEY for a "
+            "local CLIProxyAPI). Stored in config.json — prefer environment "
+            "variables for shared machines.",
+        ),
+    )
+    provider_api_format: str = field(
+        default="",
+        metadata=_meta(
+            "Provider API Format",
+            "Wire format for the opencode backend ('anthropic' or 'openai'). "
+            "Empty defaults to openai.",
+            enum=["anthropic", "openai"],
+        ),
+    )
+    model_whitelist: list[str] = field(
+        default_factory=list,
+        metadata=_meta(
+            "Model Whitelist",
+            "Optional allowlist of model ids shown in the picker. Empty = all "
+            "advertised/curated models.",
+        ),
+    )
+    image_redirect: str = field(
+        default="subagent",
+        metadata=_meta(
+            "Image Redirect",
+            "How image prompts on text-only router models are handled. "
+            "'subagent' (default): dispatch the image to a one-shot vision "
+            "subagent and inject its text description. 'switch': switch the "
+            "session to the vision fallback model. 'off': pass the image "
+            "through unchanged (upstream will reject it).",
+            enum=["subagent", "switch", "off"],
+        ),
+    )
+    vision_fallback_model: str = field(
+        default="cmc/mimo-v2.5",
+        metadata=_meta(
+            "Vision Fallback Model",
+            "Picker-spelling model id used for image redirects (subagent or "
+            "switch mode). Must be a vision-capable router model served by the "
+            "local proxy.",
+        ),
+    )
+    vision_providers: list[dict[str, Any]] = field(
+        default_factory=list,
+        metadata=_meta(
+            "Vision Providers",
+            "Ordered fallback chain of vision-capable backends used to describe "
+            "images on text-only models. Each entry is {provider, model, "
+            "base_url?, api_key?}. 'router' reuses the main session's router "
+            "endpoint and model must be a picker id; 'custom' (or any entry "
+            "with a base_url) targets an Anthropic-compatible endpoint (e.g. a "
+            "local Qwen-VL/LLaVA/Pixtral server). Entries are tried in order; "
+            "the first successful description wins. Empty = fall back to "
+            "agent.vision_fallback_model.",
+        ),
+    )
+    text_only_models: list[str] = field(
+        default_factory=lambda: ["oc/deepseek-v4-flash", "ol/deepseek-v4-flash:0731"],
+        metadata=_meta(
+            "Text-Only Models",
+            "Router model ids whose upstream rejects image content; image "
+            "prompts on these trigger the image_redirect behaviour. Empty list "
+            "disables the redirect entirely.",
+        ),
+    )
+    image_input_mode: str = field(
+        default="auto",
+        metadata=_meta(
+            "Image Input Mode",
+            "How user-attached images are presented to the model. 'auto' "
+            "(default): attach natively when the active model is vision-capable "
+            "(registry metadata or not in text_only_models), else run the "
+            "vision-subagent describe pipeline. 'native': always attach the "
+            "image as pixels (the model must accept image content). 'text': "
+            "always describe via the vision subagent and inject the text.",
+            enum=["auto", "native", "text"],
+        ),
+    )
     mcp_registry_mode: bool = field(
         default=False,
         metadata=_meta(
@@ -1194,9 +1287,12 @@ class AgentConfig:
         default="",
         metadata=_meta(
             "ACP Backend",
-            "Which ACP agent to drive: '' = kiro-cli (default), 'kas' = kiro-agent. "
+            "Which ACP agent to drive: '' = kiro-cli (default), 'kas' = kiro-agent, "
+            "'claude' = claude-agent-acp (Claude Code over ACP, pointing at any "
+            "ANTHROPIC_BASE_URL — e.g. a local router; see provider_base_url / "
+            "provider_api_key), 'opencode' = the opencode CLI over ACP. "
             "KAS runs chat but has no native subagent progress reporting yet.",
-            enum=["", "kas"],
+            enum=["", "kas", "claude", "opencode"],
         ),
     )
     default_agent: str = field(
@@ -5934,6 +6030,23 @@ class KiroCrewConfig:
                 provider=agent_data.get("provider", "acp"),
                 mcp_registry_mode=_safe_bool(agent_data.get("mcp_registry_mode", False), False),
                 acp_backend=_normalize_acp_backend(agent_data.get("acp_backend")),
+                provider_base_url=agent_data.get("provider_base_url", ""),
+                provider_api_key=agent_data.get("provider_api_key", ""),
+                provider_api_format=agent_data.get("provider_api_format", ""),
+                model_whitelist=list(agent_data.get("model_whitelist") or []),
+                image_redirect=agent_data.get("image_redirect", "subagent"),
+                vision_fallback_model=agent_data.get(
+                    "vision_fallback_model", "cmc/mimo-v2.5"
+                ),
+                vision_providers=list(agent_data.get("vision_providers") or []),
+                text_only_models=list(
+                    agent_data.get(
+                        "text_only_models",
+                        ["oc/deepseek-v4-flash", "ol/deepseek-v4-flash:0731"],
+                    )
+                    or []
+                ),
+                image_input_mode=agent_data.get("image_input_mode", "auto"),
                 default_agent=agent_data.get("default_agent", ""),
                 sandbox=agent_data.get("sandbox", "auto"),
                 sandbox_allow_no_isolation=bool(
@@ -6930,6 +7043,26 @@ class KiroCrewConfig:
         model = self.agent.model
         if model == DEFAULT_MODEL:
             model = self._resolve_agent_model()
+        # Fork: with a custom base URL (router), "auto" cannot resolve — the
+        # adapter would fall back to its Bedrock default (claude-opus-5[1m]),
+        # which the router rejects. Fall back to the global config model.
+        #
+        # A harness is selected at agent.acp_backend (harness-parity), never a
+        # second agent.provider value — that field stays locked to "acp".
+        # provider_backend carries the RAW acp_backend value through ("",
+        # "kas", "claude", "opencode") so a KAS selection is not flattened to
+        # kiro-cli by the router-only branches below, which only special-case
+        # "claude"/"opencode".
+        provider_backend = self.agent.acp_backend
+        provider_base_url = (self.agent.provider_base_url or "").strip()
+        provider_api_key = (self.agent.provider_api_key or "").strip()
+        if (
+            provider_backend == "claude"
+            and provider_base_url
+            and model in ("", "auto", DEFAULT_MODEL)
+            and self.agent.model not in ("", "auto", DEFAULT_MODEL)
+        ):
+            model = self.agent.model
 
         sandbox = self.agent.sandbox
         tool_search = self.agent.tool_search
@@ -6997,6 +7130,17 @@ class KiroCrewConfig:
                 m = model
             else:
                 m = self._resolve_named_agent_model(agent) or model
+            # Fork: with a custom base URL (router), "auto" must never reach
+            # the backend — the adapter resolves it to its Bedrock default
+            # (claude-opus-5[1m]) which the router rejects. Fall back to the
+            # config model.
+            if (
+                provider_backend == "claude"
+                and provider_base_url
+                and m in ("", "auto", DEFAULT_MODEL)
+                and self.agent.model not in ("", "auto", DEFAULT_MODEL)
+            ):
+                m = self.agent.model
             # Translation boundary (mirrors the _claude_code factory): the model
             # may be a canonical registry key (e.g. "opus-4.8-1m" — the wire /
             # dropdown value after /api/models canonicalization) OR an already-
@@ -7009,7 +7153,18 @@ class KiroCrewConfig:
             # …) are DISTINCT real kiro models and must pass through unchanged,
             # not get folded to Sonnet the way the claude_code path downgrades
             # them (the claude backend has no Haiku).
-            m = model_registry.to_acp_id(m) if m else m
+            # Fork: on the claude_code path the canonical keys ARE the wire
+            # format, so translate to the claude_code provider id instead.
+            # With a custom base URL (e.g. 9router or CLIProxyAPI) the model id
+            # is the router's own namespace (a prefixed picker id like
+            # cmc/deepseek-v4-pro, which the ACP client strips to the raw id
+            # before the wire) — never registry-translate, or the Bedrock-form
+            # global.anthropic.* id reaches a router that rejects it.
+            if provider_backend == "claude":
+                if not provider_base_url:
+                    m = model_registry.to_provider_id(m, "claude_code") if m else m
+            else:
+                m = model_registry.to_acp_id(m) if m else m
             # Thread the slot's effort into a per-model override so the kiro
             # cli.json overlay is written from it at spawn — without this, a
             # kiro cold start (or the handler's reset-then-respawn) would only
@@ -7027,6 +7182,37 @@ class KiroCrewConfig:
             _eff = reasoning_effort_override or base_effort
             if m and _eff and is_valid_effort(_eff) and model_supports_effort(m):
                 _eff_per_model[m] = _eff
+            # Fork: thread the claude_code / opencode backends + ANTHROPIC_*
+            # config into the provider. extra_env wins over config values.
+            _backend = provider_backend
+            _env: dict[str, str] = dict(extra_env or {})
+            if provider_backend in ("claude", "opencode"):
+                if provider_base_url and not _env.get("ANTHROPIC_BASE_URL"):
+                    _env["ANTHROPIC_BASE_URL"] = provider_base_url
+                if not _env.get("ANTHROPIC_API_KEY"):
+                    # Precedence: explicit extra_env (already handled above) >
+                    # config key > ANTHROPIC_API_KEY env (which the child would
+                    # inherit anyway; naming it keeps the catalog fetch in sync)
+                    # > CLIPROXY_API_KEY, the fork-specific key for a local
+                    # CLIProxyAPI, so a local proxy needs no credential in
+                    # config.json.
+                    api_key = (
+                        provider_api_key
+                        or os.environ.get("ANTHROPIC_API_KEY")
+                        or os.environ.get("CLIPROXY_API_KEY")
+                    )
+                    if api_key:
+                        _env["ANTHROPIC_API_KEY"] = api_key
+                if provider_backend == "opencode":
+                    # Wire format for the opencode custom provider — the ACP
+                    # client maps it to the AI-SDK adapter (npm package).
+                    _env.setdefault(
+                        "OPENCODE_API_FORMAT", self.agent.provider_api_format or "openai"
+                    )
+                # Permanent guard: the ACP client falls back to this default
+                # when a requested model is not advertised by the provider.
+                if self.agent.model and self.agent.model not in ("", "auto", DEFAULT_MODEL):
+                    _env.setdefault("KIROCREW_DEFAULT_MODEL", self.agent.model)
             return AcpProvider(
                 work_dir=wdir,
                 model=m,
@@ -7035,8 +7221,8 @@ class KiroCrewConfig:
                 sandbox_mode=sandbox,
                 session_key=session_key,
                 channel_id=channel_id,
-                extra_env=extra_env,
-                acp_backend=self.agent.acp_backend,
+                extra_env=_env,
+                acp_backend=_backend,
                 effort_per_model=_eff_per_model,
                 tool_search=tool_search,
                 tool_search_min_pct=tool_search_min_pct,
@@ -7044,6 +7230,13 @@ class KiroCrewConfig:
                 mcp_gateway_overlay=_gw_overlay,
                 mcp_gateway_settings_mcp_json=_gw_settings,
                 mcp_gateway_socket=_gw_socket,
+                # Fork: image-redirect configuration (text-only models dispatch
+                # image prompts to a vision-capable model).
+                image_redirect=self.agent.image_redirect,
+                vision_fallback_model=self.agent.vision_fallback_model,
+                vision_providers=list(self.agent.vision_providers or []),
+                text_only_models=list(self.agent.text_only_models),
+                image_input_mode=self.agent.image_input_mode,
             )
 
         return _acp

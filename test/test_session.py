@@ -3583,6 +3583,31 @@ class TestCloseAllPersistence:
             cwd="/tmp/test",
         )
 
+    @pytest.mark.asyncio
+    async def test_close_all_persists_opencode_provider_identity(self, cfg):
+        from kiro_crew.providers.acp import AcpProvider
+        from kiro_crew.session import _Session
+
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        mock_provider = MagicMock(spec=AcpProvider)
+        mock_provider.shutdown = AsyncMock()
+        mock_provider.context_usage_pct = MagicMock(return_value=0.0)
+        mock_provider.cwd = "/tmp/test"
+        mock_provider.client = MagicMock()
+        mock_provider.client._session_id = "opencode-sid"
+        mock_provider.client.backend = "opencode"
+
+        mgr._sessions["dashboard:slot0"] = _Session(provider=mock_provider)
+        with patch.object(mgr._session_map, "set") as mock_set:
+            await mgr.close_all()
+
+        mock_set.assert_called_once_with(
+            "dashboard:slot0",
+            "opencode-sid",
+            provider="opencode",
+            cwd="/tmp/test",
+        )
+
 
 class TestRemove:
     """Tests for remove() — shutdown but preserve session_map."""
@@ -4245,3 +4270,33 @@ class TestLoadRecoveryHistoryReplay:
         sess = next(iter(mgr._sessions.values()))
         assert sess.provider_switch_replay is False
         await mgr.close_all()
+
+
+class TestTextOnlyResumeGuard:
+    """Sessions on text-only router models must not resume image-bearing history."""
+
+    def test_helper_detects_text_only(self):
+        from kiro_crew.session import _model_is_text_only_for_session
+
+        class _Agent:
+            text_only_models = ["oc/deepseek-v4-flash", "ol/deepseek-v4-flash:0731"]
+
+        class _Cfg:
+            agent = _Agent()
+
+        assert _model_is_text_only_for_session(_Cfg(), "oc/deepseek-v4-flash") is True
+        assert _model_is_text_only_for_session(_Cfg(), "ol/deepseek-v4-flash:0731") is True
+        assert _model_is_text_only_for_session(_Cfg(), "cmc/mimo-v2.5") is False
+        assert _model_is_text_only_for_session(_Cfg(), "") is False
+        assert _model_is_text_only_for_session(_Cfg(), None) is False
+
+    def test_helper_tolerates_missing_config(self):
+        from kiro_crew.session import _model_is_text_only_for_session
+
+        class _Cfg:
+            pass  # no agent attr at all
+
+        # Missing config fails toward the SAFE side: an unknown model's image
+        # history must not resume into a rejecting upstream (the old default of
+        # False could replay image blocks onto a text-only model).
+        assert _model_is_text_only_for_session(_Cfg(), "oc/deepseek-v4-flash") is True

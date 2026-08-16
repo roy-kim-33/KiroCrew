@@ -222,6 +222,35 @@ def _provider_effectively_alive(provider: Any) -> bool:
     return alive
 
 
+def _model_is_text_only_for_session(cfg: "KiroCrewConfig", model: str | None) -> bool:
+    """True when *model* cannot take image content for the session's routing.
+
+    Text-only models reject image content upstream, so sessions on them must
+    never resume history that may contain image blocks (the SDK replays stored
+    image blocks and the upstream 400s). Uses the same
+    :func:`~kiro_crew.acp.vision.decide_image_input_mode` decision as the
+    prompt path so a registry-known vision model (Anthropic Claude) resumes
+    normally while the router text-only denylist stays protected.
+    """
+    if not model:
+        return False
+    try:
+        from kiro_crew.acp.vision import decide_image_input_mode
+
+        return (
+            decide_image_input_mode(
+                model,
+                image_input_mode=getattr(cfg.agent, "image_input_mode", "auto"),
+                text_only_models=getattr(cfg.agent, "text_only_models", None) or [],
+            )
+            == "text"
+        )
+    except Exception:
+        # Fail toward the safe side: an unknown model's image history must not
+        # resume into a rejecting upstream.
+        return True
+
+
 def detect_provider_switch(session_map: "SessionMap", session_key: str, new_provider: str) -> bool:
     """Detect if the provider for a session differs from the stored one.
 
@@ -1520,6 +1549,24 @@ class SessionManager:
         """
         # circular import: session -> acp.session_provider -> acp.client -> session
         from kiro_crew.acp.session_provider import AcpSessionProvider
+
+        # Fork: with a claude_code backend there is no shared AcpRuntime to
+        # multiplex onto — each session is its own claude-agent-acp process.
+        # Fall through to the dedicated get_or_create path (which builds the
+        # provider from the same factory, honoring claude_code).
+        try:
+            from kiro_crew.config.loader import KiroCrewConfig
+
+            _cc = KiroCrewConfig.load().agent.provider == "claude_code"
+        except Exception:
+            _cc = False
+        if _cc:
+            return await self.get_or_create(
+                session_key,
+                agent=agent,
+                cwd=cwd,
+                approval_policy=approval_policy,
+            )
 
         key = self._fold_key(session_key)
 
@@ -2822,6 +2869,22 @@ class SessionManager:
                     # Clear the incompatible SID from session_map so future
                     # lookups don't try to resume with a stale ID.
                     self._session_map.clear_sid(key)
+                # Fork: text-only image guard — a session resuming on a
+                # text-only router model would replay any image blocks the
+                # SDK stored in its history (from before a model switch or a
+                # previous vision-model session), and the text-only upstream
+                # rejects them (400). Discard the resume so the session starts
+                # fresh on the text-only model; conversation replay then
+                # carries only text.
+                if resume_sid and _model_is_text_only_for_session(self._cfg, model):
+                    logger.info(
+                        "Discarding resume for %s: model %s is text-only (image "
+                        "history would be rejected upstream)",
+                        key,
+                        model,
+                    )
+                    resume_sid = None
+                    self._session_map.clear_sid(key)
 
             # Set resume ID before start() triggers _initialize_session
             if resume_sid:
@@ -2988,9 +3051,10 @@ class SessionManager:
                     _cwd_str = provider.cwd
                     if not is_stateless and isinstance(provider, AcpProvider):
                         sid = provider.client._session_id
-                        _prov_label = _provider_label(provider)
                         if sid:
-                            self._session_map.set(key, sid, provider=_prov_label, cwd=_cwd_str)
+                            self._session_map.set(
+                                key, sid, provider=_provider_label(provider), cwd=_cwd_str
+                            )
                     elif (
                         not is_stateless
                         and ClaudeCodeProvider is not None
@@ -3873,12 +3937,12 @@ class SessionManager:
                             or self._is_continuable_key(key)
                         )
                     ):
-                        # Persist the provider label so detect_provider_switch
-                        # on next startup doesn't see a missing entry, default
-                        # to "acp", and falsely fire a switch for users still
-                        # on claude_code.
-                        _prov_label = _provider_label(sess.provider)
-                        self._session_map.set(key, sid, provider=_prov_label, cwd=_cwd_str)
+                        # Persist the concrete backend identity so incompatible
+                        # native, Claude Code, and OpenCode sessions are never
+                        # resumed across provider switches.
+                        self._session_map.set(
+                            key, sid, provider=_provider_label(sess.provider), cwd=_cwd_str
+                        )
                 elif ClaudeCodeProvider is not None and isinstance(
                     sess.provider, ClaudeCodeProvider
                 ):

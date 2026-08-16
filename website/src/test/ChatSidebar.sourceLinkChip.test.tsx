@@ -249,7 +249,7 @@ describe('ChatSidebar – PR chip', () => {
  * control live in one table.
  */
 describe('ChatSidebar – terminal PR chips suppress CI', () => {
-  const url = (n: number) => `https://github.com/kirodotdev/KiroCrew/pull/${n}`
+  const url = (n: number) => `https://github.com/encomjp/kirocrew-customapi/pull/${n}`
 
   function stateRows(): ChatSlot[] {
     return [

@@ -11,13 +11,17 @@ sentinel, not a served model.
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from kiro_crew import model_registry
+from kiro_crew.acp.client import AcpClient
+from kiro_crew.config.paths import config_dir
 from kiro_crew.dashboard.handlers.agents import (
     _advertised_cc_models,
     _cc_models,
+    _cc_models_response,
 )
 
 # Canonical registry rows now lead the dropdown (replaces _CC_CURATED_MODELS).
@@ -229,3 +233,172 @@ class TestCcModelsMerge:
         assert all(m["model_name"] for m in out)
         # the canonical "auto" row is still present, exactly once.
         assert names.count("auto") == 1
+
+
+class TestRouterModelWhitelistMerge:
+    """The router-model whitelist merges a local model_whitelist.json.
+
+    _isolate_kirocrew_home (autouse in conftest) pins config_dir() to a per-test
+    tmp dir, so writing model_whitelist.json there exercises the merge path
+    without touching the developer's real home.
+    """
+
+    def _write_whitelist(self, models):
+        path = config_dir() / "model_whitelist.json"
+        path.write_text(json.dumps({"models": models}), encoding="utf-8")
+
+    def test_local_json_models_merge_into_defaults(self):
+        self._write_whitelist(["cmc/meta/muse-spark-1.2-contributor"])
+        merged = AcpClient.router_model_whitelist()
+        # built-in defaults still present
+        assert "oc/deepseek-v4-flash" in merged
+        # local override added
+        assert "cmc/meta/muse-spark-1.2-contributor" in merged
+
+    def test_missing_file_degrades_to_defaults(self):
+        # no file written -> only built-in defaults, no error
+        merged = AcpClient.router_model_whitelist()
+        assert "oc/deepseek-v4-flash" in merged
+        assert "cmc/meta/muse-spark-1.2-contributor" not in merged
+
+    def test_corrupt_file_degrades_to_defaults(self):
+        path = config_dir() / "model_whitelist.json"
+        path.write_text("{not json", encoding="utf-8")
+        merged = AcpClient.router_model_whitelist()
+        assert "oc/deepseek-v4-flash" in merged
+        assert "cmc/meta/muse-spark-1.2-contributor" not in merged
+
+    def test_response_includes_local_override_models(self):
+        self._write_whitelist(["cmc/meta/muse-spark-1.2-contributor"])
+        resp = _cc_models_response(_request_with_providers({}))
+        body = resp.body.decode("utf-8") if isinstance(resp.body, bytes) else resp.body
+        payload = json.loads(body)
+        names = {m["model_name"] for m in payload}
+        assert "cmc/meta/muse-spark-1.2-contributor" in names
+        assert "oc/deepseek-v4-flash" in names
+
+
+class _FakeResp:
+    def __init__(self, data):
+        self.status = 200
+        self._data = data
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    async def json(self):
+        return self._data
+
+
+class _FakeSession:
+    def __init__(self, *a, **k):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    def get(self, url, headers=None):
+        if self._fail:
+            raise _Boom("offline")
+        return _FakeResp(
+            {
+                "data": [
+                    {"id": "deepseek-v4-flash", "display_name": "DeepSeek V4 Flash"},
+                    {"id": "gpt-5.6-sol", "display_name": "GPT 5.6 Sol"},
+                ]
+            }
+        )
+
+
+class _Boom(Exception):
+    pass
+
+
+def _opencode_config(monkeypatch):
+    from kiro_crew.config.loader import KiroCrewConfig
+
+    cfg = KiroCrewConfig()
+    cfg.agent = SimpleNamespace(
+        provider="opencode",
+        provider_base_url="http://localhost:8317",
+        provider_api_key="sk-x",
+        provider_api_format="openai",
+        model_whitelist=[],
+    )
+    monkeypatch.setattr("kiro_crew.dashboard.handlers.agents.KiroCrewConfig.load", lambda: cfg)
+    return cfg
+
+
+def test_opencode_models_response_uses_provider_catalog(monkeypatch):
+    """opencode backend: /api/models serves the provider's /v1/models rows."""
+    import aiohttp
+
+    from kiro_crew.dashboard.handlers.agents import _opencode_models_response
+
+    _opencode_config(monkeypatch)
+    session = _FakeSession()
+    session._fail = False
+    monkeypatch.setattr(aiohttp, "ClientSession", lambda *a, **k: session)
+
+    async def run():
+        return await _opencode_models_response(MagicMock())
+
+    resp = _run_async(run())
+    rows = json.loads(resp.text)
+    ids = [r["model_id"] for r in rows]
+    assert "deepseek-v4-flash" in ids
+    assert "gpt-5.6-sol" in ids
+    by_id = {r["model_id"]: r for r in rows}
+    assert by_id["deepseek-v4-flash"]["context_window_tokens"] > 0
+
+
+def test_opencode_models_response_falls_back_to_whitelist(monkeypatch):
+    """Unreachable provider endpoint still yields the curated whitelist."""
+    import aiohttp
+
+    from kiro_crew.dashboard.handlers.agents import _opencode_models_response
+
+    _opencode_config(monkeypatch)
+    session = _FakeSession()
+    session._fail = True
+    monkeypatch.setattr(aiohttp, "ClientSession", lambda *a, **k: session)
+
+    async def run():
+        return await _opencode_models_response(MagicMock())
+
+    resp = _run_async(run())
+    rows = json.loads(resp.text)
+    assert len(rows) > 0
+
+
+def _run_async(coro):
+    import asyncio
+
+    return asyncio.get_event_loop().run_until_complete(coro)
+
+
+def test_opencode_models_response_filters_to_whitelist(monkeypatch):
+    """The user model allowlist narrows the provider catalog."""
+    import aiohttp
+
+    from kiro_crew.dashboard.handlers.agents import _opencode_models_response
+
+    cfg = _opencode_config(monkeypatch)
+    cfg.agent.model_whitelist = ["gpt-5.6-sol"]
+    session = _FakeSession()
+    session._fail = False
+    monkeypatch.setattr(aiohttp, "ClientSession", lambda *a, **k: session)
+
+    async def run():
+        return await _opencode_models_response(MagicMock())
+
+    resp = _run_async(run())
+    rows = json.loads(resp.text)
+    ids = [r["model_id"] for r in rows]
+    assert ids == ["gpt-5.6-sol"]

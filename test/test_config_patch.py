@@ -94,6 +94,30 @@ class TestRoleModels:
             assert resp.status == 200
 
     @pytest.mark.asyncio
+    async def test_chat_default_router_model_allowed(self, tmp_config) -> None:
+        # Fork's CLIProxyAPI prefix routing: the chat-default model id carries a
+        # router prefix ("cmc/…", "oc/…", "cx/…", ...). The upstream model
+        # grammar allowed no "/", so saving any prefixed default failed with
+        # "invalid value for agent.model".
+        app = _make_app()
+        app["state"] = SimpleNamespace(
+            subagents=MagicMock(spec=["update_completion_keep"]),
+            sessions=SimpleNamespace(refresh_defaults=AsyncMock()),
+        )
+        async with TestClient(TestServer(app)) as c:
+            resp = await _patch(c, "agent.model", "cmc/deepseek-v4-flash")
+            assert resp.status == 200
+        data = json.loads(tmp_config.read_text(encoding="utf-8"))
+        assert data["agent"]["model"] == "cmc/deepseek-v4-flash"
+
+    @pytest.mark.asyncio
+    async def test_role_model_prefix_router_id_allowed(self, tmp_config) -> None:
+        # Same prefix-routing ids must be storable as per-role defaults.
+        async with TestClient(TestServer(_make_app())) as c:
+            resp = await _patch(c, "agent.role_models.subagent", "cmc/deepseek-v4-flash")
+            assert resp.status == 200
+
+    @pytest.mark.asyncio
     async def test_role_model_bad_grammar_rejected(self, tmp_config) -> None:
         async with TestClient(TestServer(_make_app())) as c:
             resp = await _patch(c, "agent.role_models.subagent", "bad; rm -rf /")
@@ -802,3 +826,99 @@ class TestTelemetryEnabledEgressGate:
             async with TestClient(TestServer(_make_app())) as c:
                 assert (await _patch(c, "telemetry.enabled", True)).status == 409
         reset.assert_not_called()
+
+
+class TestProviderPatch:
+    """Provider backend + router config (agent.acp_backend / provider_base_url / provider_api_key).
+
+    A harness is selected at ``agent.acp_backend`` (harness-parity); ``agent.provider``
+    stays locked to ``enum=["acp"]`` and is never a second selector.
+    """
+
+    @staticmethod
+    def _provider_app():
+        app = _make_app()
+        app["state"] = SimpleNamespace(
+            subagents=MagicMock(spec=["update_completion_keep"]),
+            sessions=SimpleNamespace(
+                reload_provider_factory=AsyncMock(), refresh_defaults=AsyncMock()
+            ),
+            _slots={},
+            push_slots_update=MagicMock(),
+        )
+        return app
+
+    @pytest.mark.asyncio
+    async def test_acp_backend_enum_accepts_backends(self, tmp_config) -> None:
+        with patch("kiro_crew.agent.rebuild_agent_config"):
+            async with TestClient(TestServer(self._provider_app())) as c:
+                for v in ("", "kas", "claude", "opencode"):
+                    assert (await _patch(c, "agent.acp_backend", v)).status == 200
+
+    @pytest.mark.asyncio
+    async def test_acp_backend_enum_rejects_unknown(self, tmp_config) -> None:
+        async with TestClient(TestServer(_make_app())) as c:
+            assert (await _patch(c, "agent.acp_backend", "groq")).status == 400
+
+    @pytest.mark.asyncio
+    async def test_provider_base_url_urls(self, tmp_config) -> None:
+        with patch("kiro_crew.agent.rebuild_agent_config"):
+            async with TestClient(TestServer(self._provider_app())) as c:
+                assert (
+                    await _patch(c, "agent.provider_base_url", "http://localhost:20128")
+                ).status == 200
+                assert (
+                    await _patch(c, "agent.provider_base_url", "https://api.anthropic.com")
+                ).status == 200
+                assert (
+                    await _patch(c, "agent.provider_base_url", "bad url; rm -rf /")
+                ).status == 400
+
+    @pytest.mark.asyncio
+    async def test_provider_api_key_persists(self, tmp_config) -> None:
+        with patch("kiro_crew.agent.rebuild_agent_config"):
+            async with TestClient(TestServer(self._provider_app())) as c:
+                assert (await _patch(c, "agent.provider_api_key", "sk-test-123")).status == 200
+        data = json.loads(tmp_config.read_text(encoding="utf-8"))
+        assert data["agent"]["provider_api_key"] == "sk-test-123"
+
+    @pytest.mark.asyncio
+    async def test_provider_base_url_triggers_reload(self, tmp_config) -> None:
+        app = self._provider_app()
+        with patch("kiro_crew.agent.rebuild_agent_config") as rebuild:
+            async with TestClient(TestServer(app)) as c:
+                assert (
+                    await _patch(c, "agent.provider_base_url", "http://localhost:8317")
+                ).status == 200
+            rebuild.assert_called_once()
+        app["state"].sessions.reload_provider_factory.assert_awaited_once()
+
+
+class TestProviderApiFormat:
+    @pytest.mark.asyncio
+    async def test_format_enum_accepted(self, tmp_config) -> None:
+        with patch("kiro_crew.agent.rebuild_agent_config"):
+            async with TestClient(TestServer(TestProviderPatch._provider_app())) as c:
+                assert (await _patch(c, "agent.provider_api_format", "anthropic")).status == 200
+                assert (await _patch(c, "agent.provider_api_format", "openai")).status == 200
+
+    @pytest.mark.asyncio
+    async def test_format_enum_rejects_unknown(self, tmp_config) -> None:
+        async with TestClient(TestServer(_make_app())) as c:
+            assert (await _patch(c, "agent.provider_api_format", "google")).status == 400
+
+
+class TestModelWhitelist:
+    @pytest.mark.asyncio
+    async def test_whitelist_list_accepted(self, tmp_config) -> None:
+        async with TestClient(TestServer(_make_app())) as c:
+            resp = await _patch(c, "agent.model_whitelist", ["cmc/deepseek-v4-flash", "oc/gpt-5.6-sol"])
+            assert resp.status == 200
+        data = json.loads(tmp_config.read_text(encoding="utf-8"))
+        assert data["agent"]["model_whitelist"] == ["cmc/deepseek-v4-flash", "oc/gpt-5.6-sol"]
+
+    @pytest.mark.asyncio
+    async def test_whitelist_rejects_non_list_and_bad_items(self, tmp_config) -> None:
+        async with TestClient(TestServer(_make_app())) as c:
+            assert (await _patch(c, "agent.model_whitelist", "cmc/deepseek-v4-flash")).status == 400
+            assert (await _patch(c, "agent.model_whitelist", ["../../etc/passwd"])).status == 400

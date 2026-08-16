@@ -77,6 +77,14 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     }
   },
   {
+    "id": "chat.api-key",
+    "label": "API key",
+    "labelKey": "pages.settings.chatPanel.provider_api_key",
+    "tab": "chat",
+    "type": "input",
+    "occurrence": 1
+  },
+  {
     "id": "chat.auto-compact-threshold",
     "label": "Auto-Compact Threshold",
     "labelKey": "pages.settings.chatPanel.auto_compact_threshold",
@@ -109,6 +117,14 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "labelKey": "pages.settings.chatPanel.background_model",
     "tab": "chat",
     "type": "select",
+    "occurrence": 1
+  },
+  {
+    "id": "chat.base-url",
+    "label": "Base URL",
+    "labelKey": "pages.settings.chatPanel.provider_url",
+    "tab": "chat",
+    "type": "input",
     "occurrence": 1
   },
   {
@@ -227,6 +243,14 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "occurrence": 1
   },
   {
+    "id": "chat.image-input-mode",
+    "label": "Image input mode",
+    "description": "How user-attached images are presented to the model.",
+    "tab": "chat",
+    "type": "select",
+    "occurrence": 1
+  },
+  {
     "id": "chat.link-previews",
     "label": "Link Previews",
     "labelKey": "pages.settings.chatPanel.link_previews",
@@ -254,12 +278,28 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "occurrence": 1
   },
   {
+    "id": "chat.on-text-only-models",
+    "label": "On text-only models",
+    "description": "What to do when the active model cannot take images.",
+    "tab": "chat",
+    "type": "select",
+    "occurrence": 1
+  },
+  {
     "id": "chat.pin-the-latest-prompt",
     "label": "Pin the latest prompt",
     "labelKey": "pages.settings.chatPanel.pin_last_prompt",
     "description": "Keep the most recent prompt visible as a sticky banner once it scrolls above the fold.",
     "tab": "chat",
     "type": "toggle",
+    "occurrence": 1
+  },
+  {
+    "id": "chat.preset",
+    "label": "Preset",
+    "labelKey": "pages.settings.chatPanel.provider_preset",
+    "tab": "chat",
+    "type": "select",
     "occurrence": 1
   },
   {
@@ -426,6 +466,14 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "Immediate mode shows raw chunks as they arrive. Smooth mode buffers and fades text in at a steady pace.",
     "tab": "chat",
     "type": "buttonGroup",
+    "occurrence": 1
+  },
+  {
+    "id": "chat.vision-fallback-model",
+    "label": "Vision fallback model",
+    "description": "Picker-spelling id the describe/switch path uses (must be vision-capable).",
+    "tab": "chat",
+    "type": "select",
     "occurrence": 1
   },
   {

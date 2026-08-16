@@ -2910,15 +2910,15 @@ def _model_rejected_reason(model_name: str) -> str | None:
     if not model_name or model_name == "auto":
         return None
     try:
-        provider = KiroCrewConfig.load().agent.provider
+        acp_backend = KiroCrewConfig.load().agent.acp_backend
     except Exception:  # pragma: no cover - config load is resilient
-        provider = ""
-    if provider == "claude_code":
+        acp_backend = ""
+    if acp_backend == "claude":
         return None
     if model_registry.is_canonical_key(model_name):
         return (
             f"{model_name!r} is a display-only model identifier the "
-            f"{provider or 'active'} provider does not accept; "
+            f"{acp_backend or 'active'} provider does not accept; "
             f"select a listed model or 'auto'."
         )
     return None

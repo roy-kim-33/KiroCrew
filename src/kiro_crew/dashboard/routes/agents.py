@@ -25,6 +25,9 @@ def register(app: web.Application) -> None:
     app.router.add_get("/api/agents/installed", handlers.api_agents_installed)
     app.router.add_get("/api/models", handlers.api_models)
     app.router.add_get("/api/effort-levels", handlers.api_effort_levels)
+    # Fork: self-hosted claude_code / opencode custom router probe + status.
+    app.router.add_post("/api/provider/test", handlers.api_provider_test)
+    app.router.add_get("/api/provider/status", handlers.api_provider_status)
     app.router.add_get("/api/slash-commands", handlers.api_slash_commands)
     app.router.add_get("/api/agents/detail/{name}", handlers.api_agent_detail)
     app.router.add_patch("/api/agents/detail/{name}", handlers.api_agent_detail)

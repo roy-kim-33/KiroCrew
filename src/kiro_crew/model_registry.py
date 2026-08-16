@@ -151,6 +151,109 @@ _SUPPLEMENTARY_WINDOWS: dict[str, int] = {
     "glm-4.7": 200_000,
     "glm-4.7-flash": 128_000,
     "qwen3-coder-480b": 256_000,
+    # deepseek-v4-flash via the 9router catalog (ocg/ = opencode-go free tier,
+    # cmc/ = commandcode, ollama/ = ollama cloud) and the CLIProxyAPI catalog
+    # (http://127.0.0.1:8317/v1/models, unprefixed raw ids: deepseek-v4-flash
+    # under opencode-go, deepseek-v4-flash:0731 under ollama-cloud,
+    # deepseek/deepseek-v4-flash under commandcode). The 9router /v1/models
+    # capabilities.contextWindow reports 1_000_000 / maxOutput 384_000 for all
+    # three spellings; CLIProxyAPI serves the same model family, and the
+    # longest-substring matcher below folds every spelling onto the 1M entry.
+    # 9router also serves deepseek-v4-pro at 1M — the two "deepseek-v4" keys
+    # below cover the pro spelling via longest-substring.
+    "deepseek-v4-flash": 1_000_000,
+    "deepseek-v4-flash:0731": 1_000_000,
+    "deepseek-v4-pro": 1_000_000,
+    "deepseek-v4": 1_000_000,
+    # CLIProxyAPI router catalog windows (http://127.0.0.1:8317/v1/models,
+    # commandcode /provider/v1/models). Keyed by the raw catalog ids plus the
+    # short names the picker strips to, so model_window() resolves both the
+    # prefixed picker id and the raw wire id. Without these, claude-agent-acp
+    # reports its 200K default for every unknown router model and the context
+    # meter lies (mimo-v2.5, Kimi, Qwen, GLM, … all serve 1M or more).
+    "mimo-v2.5": 1_000_000,
+    "mimo-v2.5-pro": 1_000_000,
+    "xiaomi/mimo-v2.5": 1_000_000,
+    "xiaomi/mimo-v2.5-pro": 1_000_000,
+    "meta/muse-spark-1.2": 1_048_576,
+    # cmc/ picker short spellings (vendor part stripped) for the longest-
+    # substring resolver, so the prefixed id also resolves.
+    "cmc/Kimi-K2.7-Code": 256_000,
+    "cmc/Kimi-K2.7-Code-Highspeed": 262_000,
+    "cmc/Kimi-K2.6": 256_000,
+    "cmc/Kimi-K2.5": 256_000,
+    "cmc/Kimi-K3": 1_000_000,
+    "cmc/GLM-5.2": 1_000_000,
+    "cmc/GLM-5.2-Fast": 1_000_000,
+    "cmc/GLM-5.1": 200_000,
+    "cmc/GLM-5": 200_000,
+    "cmc/MiniMax-M3": 1_000_000,
+    "cmc/MiniMax-M2.7": 200_000,
+    "cmc/MiniMax-M2.5": 200_000,
+    "cmc/Qwen3.8-Max": 1_000_000,
+    "cmc/Qwen3.7-Max": 1_000_000,
+    "cmc/Qwen3.7-Plus": 1_000_000,
+    "cmc/Qwen3.7-Flash": 1_000_000,
+    "cmc/Qwen3.6-Max-Preview": 200_000,
+    "cmc/Qwen3.6-Plus": 200_000,
+    "cmc/Step-3.7-Flash": 256_000,
+    "cmc/Step-3.5-Flash": 1_000_000,
+    "cmc/hy3-paid": 262_144,
+    "cmc/grok-4.5": 500_000,
+    "cmc/inkling": 256_000,
+    "cmc/inkling-small": 1_000_000,
+    "cmc/laguna-s-2.1-free": 256_000,
+    "cmc/nemotron-3-ultra-550b-a55b": 1_000_000,
+    "cmc/muse-spark-1.2": 1_048_576,
+    "cmc/gpt-5.6-luna": 1_050_000,
+    "cmc/deepseek-v4-flash": 1_000_000,
+    "cmc/deepseek-v4-pro": 1_000_000,
+    "moonshotai/Kimi-K3": 1_000_000,
+    "moonshotai/Kimi-K2.7-Code": 256_000,
+    "moonshotai/Kimi-K2.7-Code-Highspeed": 262_000,
+    "moonshotai/Kimi-K2.6": 256_000,
+    "moonshotai/Kimi-K2.5": 256_000,
+    "zai-org/GLM-5.2": 1_000_000,
+    "zai-org/GLM-5.2-Fast": 1_000_000,
+    "zai-org/GLM-5.1": 200_000,
+    "zai-org/GLM-5": 200_000,
+    "MiniMaxAI/MiniMax-M3": 1_000_000,
+    "MiniMaxAI/MiniMax-M2.7": 200_000,
+    "MiniMaxAI/MiniMax-M2.5": 200_000,
+    "Qwen/Qwen3.8-Max": 1_000_000,
+    "Qwen/Qwen3.7-Max": 1_000_000,
+    "Qwen/Qwen3.7-Plus": 1_000_000,
+    "Qwen/Qwen3.7-Flash": 1_000_000,
+    "Qwen/Qwen3.6-Max-Preview": 200_000,
+    "Qwen/Qwen3.6-Plus": 200_000,
+    "stepfun/Step-3.7-Flash": 256_000,
+    "stepfun/Step-3.5-Flash": 1_000_000,
+    "tencent/hy3-paid": 262_144,
+    "xai/grok-4.5": 500_000,
+    "thinkingmachines/inkling": 256_000,
+    "thinkingmachines/inkling-small": 1_000_000,
+    "poolside/laguna-s-2.1-free": 256_000,
+    "nvidia/nemotron-3-ultra-550b-a55b": 1_000_000,
+    "gpt-5.6-luna": 272_000,
+    "gpt-5.6-terra": 272_000,
+    "gpt-5.6-sol": 272_000,
+    "gpt-5.5": 200_000,
+    "gpt-5.4": 400_000,
+    "gpt-5.4-mini": 400_000,
+    # Antigravity-served models (3 OAuth accounts, round-robin): Gemini 3.x
+    # family and Claude models all serve 1M; gpt-oss-120b is 128K.
+    "gemini-3-flash": 1_048_576,
+    "gemini-3-flash-agent": 1_048_576,
+    "gemini-3.1-flash-lite": 1_048_576,
+    "gemini-3.1-flash-image": 1_048_576,
+    "gemini-3.1-pro-low": 1_048_576,
+    "gemini-3.5-flash-low": 1_048_576,
+    "gemini-3.5-flash-extra-low": 1_048_576,
+    "gemini-3.6-flash-high": 1_048_576,
+    "gemini-pro-agent": 1_048_576,
+    "claude-sonnet-4-6": 1_000_000,
+    "claude-opus-4-6-thinking": 1_000_000,
+    "gpt-oss-120b-medium": 131_072,
 }
 
 
@@ -582,6 +685,22 @@ def supports_effort(canonical_or_id: str) -> bool | None:
     if key is None:
         return None
     val = _REGISTRY[key].get("supports_effort")
+    return bool(val) if val is not None else None
+
+
+def model_supports_vision(canonical_or_id: str) -> bool | None:
+    """Registry-declared vision support for a model, or None if not declared.
+
+    None means "unknown" — callers (the image-input-mode decision) fall back to
+    their per-model text-only list / router metadata rather than guessing.
+    Router-prefixed picker ids (``cmc/…``, ``oc/…``) are NOT canonical registry
+    keys, so this returns None for them and the router whitelist in
+    ``acp.client`` stays authoritative for those.
+    """
+    key = _resolve_canonical(canonical_or_id, "claude_code")
+    if key is None:
+        return None
+    val = _REGISTRY[key].get("supports_vision")
     return bool(val) if val is not None else None
 
 

@@ -383,6 +383,21 @@ function fetchGatewayReadiness(readyUrl = `${BACKEND_URL}${READY_PATH}`) {
   });
 }
 
+// /api/health can remain healthy after a Linux AppImage shell exits while its
+// backend survives under an unmounted /tmp/.mount_* path. Probe the dashboard
+// root too: that request touches the bundled static files and exposes the stale
+// mount as HTTP 500 before Electron decides to reuse the process.
+function checkDashboardRoot(rootUrl = `${BACKEND_URL}/`) {
+  return new Promise((resolve) => {
+    const req = http.get(rootUrl, { timeout: 2000 }, (res) => {
+      res.resume();
+      resolve(res.statusCode < 500);
+    });
+    req.on("error", () => resolve(false));
+    req.on("timeout", () => { req.destroy(); resolve(false); });
+  });
+}
+
 // Ask the OTHER channel app to quit through its normal lifecycle (its
 // before-quit stops its own gateway). Never kill the gateway out from under
 // its shell — the shell's exit watcher would treat that as a crash.
@@ -485,7 +500,8 @@ async function resolveGatewayConflict(rebindDepth = 0) {
     glog(`:${PORT} is a configured remote host (${remoteHost}) — holder treated as non-local`);
   }
   const localOwner = remoteHost ? "foreign" : await probeGatewayPortOwner(PORT);
-  const decision = decideGatewayAction(app.getVersion(), health, { localOwner });
+  const gatewayUsable = remoteHost ? true : await checkDashboardRoot();
+  const decision = decideGatewayAction(app.getVersion(), health, { localOwner, gatewayUsable });
   if (decision.action === "reuse") {
     // Adopt-or-wait: the /api/status probe that got us here stays 200 while the
     // backend DRAINS after POST /api/shutdown, so "answering" is not "serving".
@@ -563,6 +579,15 @@ async function resolveGatewayConflict(rebindDepth = 0) {
     sendStatus(adoptedDraining ? "Connecting to the existing gateway…" : "Gateway already running ✓");
     return "reuse";
   }
+  if (decision.action === "restart-local") {
+    glog(`gateway on :${PORT} is locally owned but unusable (${decision.reason}) — restarting it`);
+    const stopped = await forceStopGatewayPort(PORT);
+    if (!stopped.freed) {
+      glog(`local gateway restart failed: :${PORT} is still occupied`);
+      return "abort";
+    }
+    return "spawn";
+  }
   const other = FAMILY_META[decision.otherFamily];
   glog(`gateway on :${PORT} is owned by ${other.appName} (${decision.otherVersion}) — prompting for takeover`);
   const canTakeover = process.platform === "darwin";
@@ -618,7 +643,7 @@ async function offerRelocationIfUnupdatable() {
   try {
     ({ response } = await dialog.showMessageBox({
       type: "warning",
-      title: "Move Kiro Crew to Applications?",
+      title: "Move kirocrew-customapi to Applications?",
       message: describeLocation(location, { bundleWritable }),
       detail: "Move it to your Applications folder to receive updates. "
         + "You can keep using it from here for now, but it will not update itself.",
@@ -3095,7 +3120,17 @@ app.whenReady().then(async () => {
       openConfigFile: () => shell.openPath(store.path),
     })
   );
-  Menu.setApplicationMenu(appMenu);
+  // The native menu bar is macOS-only. On Windows and Linux the window is
+  // frameless with a titleBarOverlay (caption buttons) and the dashboard's own
+  // 42px header as the title bar, so the File/Edit/View/Connection/Window/Help
+  // menu bar is removed entirely. The menu template is still built (and the
+  // accelerators registered) only on macOS; everywhere else a null application
+  // menu drops the visible bar.
+  if (IS_MAC) {
+    Menu.setApplicationMenu(appMenu);
+  } else {
+    Menu.setApplicationMenu(null);
+  }
 
   // Windows renders the menu surface in the custom titlebar so pointer hover
   // can switch between top-level menus. Native Menu.popup() captures input on

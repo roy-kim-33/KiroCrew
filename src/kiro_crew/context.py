@@ -1515,7 +1515,7 @@ class ContextBuilder:
             self._bot_name = bot_name
         else:
             cfg = KiroCrewConfig.load()
-            self._bot_name = "KiroCrew" if cfg.agent.provider == "claude_code" else "Kiro"
+            self._bot_name = "KiroCrew" if cfg.agent.acp_backend == "claude" else "Kiro"
         # Register default memory in the workspace cache
         _memory_stores["default"] = self.memory
 

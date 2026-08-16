@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
@@ -132,6 +133,23 @@ class WatchdogSettings:
     # OTel attrs (metrics/schema.py); per-agent joins happen via the always-on
     # token row store instead.
     agent_override: bool = False
+
+
+def _message_has_image_path(message: str) -> bool:
+    """Best-effort check whether *message* references an image file on disk.
+
+    Reuses the same path regex ``build_prompt_blocks`` scans, so the redirect
+    fires exactly when the prompt builder would emit an image block (parity
+    with ``AcpClient._message_has_image_path``).
+    """
+    if not message or not message.strip():
+        return False
+    try:
+        from kiro_crew.acp.prompt_blocks import _PATH_RE
+
+        return bool(_PATH_RE.search(message))
+    except Exception:  # pragma: no cover - import/attr drift guard
+        return False
 
 
 # Fraction of a turn's deadline that a watchdog idle window may occupy. A window
@@ -671,6 +689,45 @@ class AcpSessionHandle:
         # exception hierarchy. Re-raised unchanged, so cancellation still
         # propagates.
         try:
+            # Fork: text-only router models (deepseek-v4-flash family) reject
+            # image content upstream. When the active model routes images to
+            # text, describe each referenced image via the vision chain and
+            # inject its description, so no image block reaches the rejecting
+            # upstream. Mirrors AcpClient._send_prompt so the shared-runtime
+            # path (chat/dashboard/cron) behaves like the direct-client path.
+            image_mode = "native"
+            if _message_has_image_path(message):
+                # circular import: config.loader -> dashboard -> session -> acp
+                from kiro_crew.config.loader import KiroCrewConfig
+
+                cfg = KiroCrewConfig.load()
+                a = cfg.agent
+                main_env: dict[str, str] = {}
+                base_url = (a.provider_base_url or "").strip()
+                api_key = (
+                    (a.provider_api_key or "").strip()
+                    or os.environ.get("ANTHROPIC_API_KEY")
+                    or os.environ.get("CLIPROXY_API_KEY")
+                )
+                if base_url:
+                    main_env["ANTHROPIC_BASE_URL"] = base_url
+                if api_key:
+                    main_env["ANTHROPIC_API_KEY"] = api_key
+                main_backend = a.acp_backend if a.acp_backend in ("claude", "opencode") else ""
+                from kiro_crew.acp.vision import redirect_image_message
+
+                message, image_mode = await redirect_image_message(
+                    message,
+                    model_id=self._model,
+                    image_redirect=a.image_redirect,
+                    image_input_mode=a.image_input_mode,
+                    text_only_models=a.text_only_models,
+                    vision_providers=list(a.vision_providers or []),
+                    vision_fallback_model=a.vision_fallback_model,
+                    main_env=main_env,
+                    main_backend=main_backend,
+                    sandbox_mode=a.sandbox,
+                )
             req_id = await self._runtime.send_request(
                 METHOD_PROMPT,
                 {
@@ -688,7 +745,8 @@ class AcpSessionHandle:
                     "prompt": await asyncio.to_thread(
                         build_prompt_blocks,
                         message,
-                        allow_image=self._runtime.supports_image_prompt,
+                        allow_image=self._runtime.supports_image_prompt
+                        and image_mode == "native",
                     ),
                 },
             )
@@ -2687,6 +2745,19 @@ class AcpSessionHandle:
             if used is not None and size:
                 try:
                     if size > 0:
+                        # Fork: prefer the central registry's window over the
+                        # claude-agent-acp SDK's 200K default for unknown
+                        # router models (deepseek-v4-flash etc. serve at 1M) —
+                        # otherwise the context meter reports 200K for a 1M
+                        # model and can force premature compaction.
+                        resolved = self._resolved_model_id or self._model or ""
+                        if (
+                            size <= 200_000
+                            and model_registry.has_known_window(resolved)
+                        ):
+                            reg_win = model_registry.model_window(resolved)
+                            if reg_win and reg_win > size:
+                                size = int(reg_win)
                         self.last_prompt_stats.context_pct = round((used / size) * 100, 1)
                         self.last_prompt_stats.context_used_tokens = int(used)
                         self.last_prompt_stats.context_window_tokens = int(size)

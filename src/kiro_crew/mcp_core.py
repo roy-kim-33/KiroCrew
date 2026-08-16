@@ -12,6 +12,7 @@ Tools:
     learn_list      — list all lessons
     learn_remove    — remove lessons by substring
     task_run        — start the autonomous task runner
+    vision_analyze  — describe an image (path or URL) via a vision subagent
 """
 
 from __future__ import annotations

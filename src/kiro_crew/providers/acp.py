@@ -26,6 +26,7 @@ from kiro_crew.acp.types import (
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
+    ACP_BACKEND_OPENCODE,
     ACP_BACKENDS_ACP_RUNTIME,
     ACP_BACKENDS_KNOWN,
     ACP_BACKENDS_SESSION_SHARING,
@@ -33,6 +34,7 @@ from kiro_crew.acp.types import (
     PROVIDER_LABEL_CLAUDE,
     PROVIDER_LABEL_DEFAULT,
     PROVIDER_LABEL_KAS,
+    PROVIDER_LABEL_OPENCODE,
     STOP_REASON_CANCELLED,
     STOP_REASON_END_TURN,
 )
@@ -294,6 +296,11 @@ class AcpProvider(LLMProvider):
         mcp_gateway_socket: str | Path | None = None,
         permission_mode: str | None = None,
         crew_agent: str | None = None,
+        image_redirect: str = "subagent",
+        vision_fallback_model: str = "cmc/mimo-v2.5",
+        vision_providers: list[dict[str, Any]] | None = None,
+        text_only_models: list[str] | None = None,
+        image_input_mode: str = "auto",
     ) -> None:
         # An unrecognized backend would pass every ``_is_<backend>`` check and
         # spawn kiro-cli, so a typo'd config would drive the wrong agent with no
@@ -318,6 +325,12 @@ class AcpProvider(LLMProvider):
             # kiro-cli path — fully inert; a companion-registered backend threads
             # it.
             "permission_mode": permission_mode,
+            # Fork: image-redirect configuration.
+            "image_redirect": image_redirect,
+            "vision_fallback_model": vision_fallback_model,
+            "vision_providers": list(vision_providers or []),
+            "text_only_models": list(text_only_models or []),
+            "image_input_mode": image_input_mode,
         }
         if agent:
             kwargs["agent"] = agent
@@ -415,7 +428,7 @@ class AcpProvider(LLMProvider):
 
     @property
     def is_claude_backend(self) -> bool:
-        """True when this ACP provider talks to claude-agent-acp (vs kiro-cli)."""
+        """True when this ACP provider talks to claude-agent-acp."""
         return self._client.backend == ACP_BACKEND_CLAUDE
 
     @property
@@ -820,10 +833,18 @@ class AcpProvider(LLMProvider):
                 if model_is_unusable(configured_model, _advertised):
                     logger.warning(
                         "Configured model %s is not available to this account; "
-                        "leaving the session on the backend default (advertised: %s)",
+                        "%s the backend default (advertised: %s)",
                         configured_model,
+                        "resetting the resumed session to" if resumed else "leaving the session on",
                         ", ".join(_advertised),
                     )
+                    # A loaded session retains its previous model. Merely withholding
+                    # the stale configured override therefore leaves the transcript
+                    # pinned to the same unusable model and the next prompt still
+                    # fails. A fresh session is already on its backend default; only
+                    # resumed sessions need the explicit reset.
+                    if resumed and "auto" in _advertised:
+                        await handle.set_model("auto")
                 else:
                     _t_model = time.monotonic()
                     try:
@@ -901,11 +922,11 @@ class AcpProvider(LLMProvider):
     def _apply_effort_overlay(self) -> None:
         """Write the kiro workspace cli.json overlay for (current model, effort).
 
-        No-op for the claude backend (it uses live set_config_option) and when
-        the model is not effort-capable or no level resolves. Called before
-        every (re)spawn so resume/restart keeps the same level.
+        No-op for non-Kiro backends and when the model is not effort-capable or
+        no level resolves. Called before every Kiro (re)spawn so resume/restart
+        keeps the same level.
         """
-        if self.is_claude_backend:
+        if not self.is_kiro_backend:
             return
         model = self._client._model
         level = self._resolve_effort()
@@ -920,11 +941,11 @@ class AcpProvider(LLMProvider):
     def _apply_tool_search_overlay(self) -> None:
         """Write the kiro Tool Search setting into the workspace cli.json overlay.
 
-        No-op for the claude backend (Tool Search is a kiro-cli feature) and
-        when no toggle value was supplied (``self._tool_search is None``).
-        Called before every (re)spawn so resume/restart keeps the same setting.
+        No-op for non-Kiro backends and when no toggle value was supplied
+        (``self._tool_search is None``). Called before every Kiro (re)spawn so
+        resume/restart keeps the same setting.
         """
-        if self.is_claude_backend or self._tool_search is None:
+        if not self.is_kiro_backend or self._tool_search is None:
             return
         try:
             _write_tool_search_overlay(
@@ -1117,7 +1138,7 @@ class AcpProvider(LLMProvider):
             # sessions (session sharing).
             await self._start_kiro_runtime()
         else:
-            # ── CC path: legacy AcpClient (unchanged) ──
+            # Other ACP backends manage their own process through AcpClient.
             await self._client.ensure_ready()
 
         await self._apply_initial_effort()
@@ -1444,4 +1465,6 @@ def provider_label(provider: Any) -> str:
         return PROVIDER_LABEL_CLAUDE
     if backend == ACP_BACKEND_KAS:
         return PROVIDER_LABEL_KAS
+    if backend == ACP_BACKEND_OPENCODE:
+        return PROVIDER_LABEL_OPENCODE
     return PROVIDER_LABEL_DEFAULT

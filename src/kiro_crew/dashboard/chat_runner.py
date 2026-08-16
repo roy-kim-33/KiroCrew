@@ -3908,7 +3908,7 @@ async def _run_chat(
 
     # ── Slash commands: detect early, before session acquisition ──
     first_word = message.split()[0] if message.strip() else ""
-    _is_cc_provider = KiroCrewConfig.load().agent.provider == "claude_code"
+    _is_cc_provider = KiroCrewConfig.load().agent.acp_backend == "claude"
     is_slash = (first_word.startswith("/") and _is_cc_provider) or first_word in _SLASH_COMMANDS
 
     # Block dangerous/local-only commands before acquiring a session
@@ -4133,7 +4133,10 @@ async def _run_chat(
         crew_alias = slot.agent or ""
         try:
             cfg = KiroCrewConfig.load()
-            provider_name = cfg.agent.provider
+            # PROVIDER_LABEL_CLAUDE ("claude_code"), not agent.provider (locked
+            # to "acp") — a harness is selected at agent.acp_backend
+            # (ACP_BACKEND_CLAUDE == "claude"); see harness-parity.
+            provider_name = "claude_code" if cfg.agent.acp_backend == "claude" else ""
             # Warm the project agent index OFF the loop, then resolve inline. Only
             # the warm is offloaded: resolve_agent_bindings can raise StopIteration
             # on a malformed config, and StopIteration cannot be delivered through a
@@ -6335,7 +6338,11 @@ async def _run_chat(
                 _turn_model = read_effective_model(client)
                 if _u.input_tokens or _u.output_tokens or _u.credits:
                     try:
-                        _provider_name = cfg.agent.provider  # type: ignore[possibly-undefined]
+                        _provider_name = (
+                            "claude_code"
+                            if cfg.agent.acp_backend == "claude"  # type: ignore[possibly-undefined]
+                            else ""
+                        )
                     except (NameError, AttributeError):
                         _provider_name = ""
                     # Late backfill: CC reports model only via the `init`

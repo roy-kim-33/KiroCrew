@@ -21,6 +21,15 @@
         "role_efforts": {},
         "reasoning_effort": "",
         "provider": "acp",
+        "provider_base_url": "",
+        "provider_api_key": "",
+        "image_redirect": "subagent",
+        "vision_fallback_model": "cmc/mimo-v2.5",
+        "text_only_models": [
+          "oc/deepseek-v4-flash",
+          "ol/deepseek-v4-flash:0731"
+        ],
+        "image_input_mode": "auto",
         "default_agent": "",
         "sandbox": "off",
         "sandbox_allow_no_isolation": false,
@@ -195,12 +204,150 @@
       "sensitive": false,
       "tags": [],
       "label": "Provider",
-      "help": "LLM provider backend (KiroACP / kiro-cli).",
+      "help": "LLM provider backend. 'acp' drives kiro-cli; 'claude_code' drives claude-agent-acp (Claude Code over ACP, pointing at any ANTHROPIC_BASE_URL — e.g. a local router).",
       "hasChildren": false,
       "enumValues": [
-        "acp"
+        "acp",
+        "claude_code"
       ],
       "defaultValue": "acp"
+    },
+    {
+      "path": "agent.provider_base_url",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Provider Base URL",
+      "help": "ANTHROPIC_BASE_URL for the claude_code backend. Empty inherits the environment. Local endpoints (http://127.0.0.1, http://192.168.x.x) are always allowed.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": ""
+    },
+    {
+      "path": "agent.provider_api_key",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Provider API Key",
+      "help": "ANTHROPIC_API_KEY for the claude_code backend. Empty inherits the environment (ANTHROPIC_API_KEY, or CLIPROXY_API_KEY for a local CLIProxyAPI). Stored in config.json — prefer environment variables for shared machines.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": ""
+    },
+    {
+      "path": "agent.image_redirect",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Image Redirect",
+      "help": "How image prompts on text-only router models are handled. 'subagent' (default): dispatch the image to a one-shot vision subagent and inject its text description. 'switch': switch the session to the vision fallback model. 'off': pass the image through unchanged (upstream will reject it).",
+      "hasChildren": false,
+      "enumValues": [
+        "subagent",
+        "switch",
+        "off"
+      ],
+      "defaultValue": "subagent"
+    },
+    {
+      "path": "agent.vision_fallback_model",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Vision Fallback Model",
+      "help": "Picker-spelling model id used for image redirects (subagent or switch mode). Must be a vision-capable router model served by the local proxy.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": "cmc/mimo-v2.5"
+    },
+    {
+      "path": "agent.vision_providers",
+      "kind": "core",
+      "type": "array",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Vision Providers",
+      "help": "Ordered fallback chain of vision-capable backends used to describe images on text-only models. Each entry is {provider, model, base_url?, api_key?}. 'router' reuses the main session's router endpoint and model must be a picker id; 'custom' (or any entry with a base_url) targets an Anthropic-compatible endpoint (e.g. a local Qwen-VL/LLaVA/Pixtral server). Entries are tried in order; the first successful description wins. Empty = fall back to agent.vision_fallback_model.",
+      "hasChildren": true,
+      "enumValues": null,
+      "defaultValue": []
+    },
+    {
+      "path": "agent.vision_providers.*",
+      "kind": "core",
+      "type": "object",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "*",
+      "help": "",
+      "hasChildren": true,
+      "enumValues": null,
+      "defaultValue": null
+    },
+    {
+      "path": "agent.text_only_models",
+      "kind": "core",
+      "type": "array",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Text-Only Models",
+      "help": "Router model ids whose upstream rejects image content; image prompts on these trigger the image_redirect behaviour. Empty list disables the redirect entirely.",
+      "hasChildren": true,
+      "enumValues": null,
+      "defaultValue": [
+        "oc/deepseek-v4-flash",
+        "ol/deepseek-v4-flash:0731"
+      ]
+    },
+    {
+      "path": "agent.text_only_models.*",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "*",
+      "help": "",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": null
+    },
+    {
+      "path": "agent.image_input_mode",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Image Input Mode",
+      "help": "How user-attached images are presented to the model. 'auto' (default): attach natively when the active model is vision-capable (registry metadata or not in text_only_models), else run the vision-subagent describe pipeline. 'native': always attach the image as pixels (the model must accept image content). 'text': always describe via the vision subagent and inject the text.",
+      "hasChildren": false,
+      "enumValues": [
+        "auto",
+        "native",
+        "text"
+      ],
+      "defaultValue": "auto"
     },
     {
       "path": "agent.default_agent",

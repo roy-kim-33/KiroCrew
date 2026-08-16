@@ -1,8 +1,10 @@
 import { useState, useCallback, useRef, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { SettingsSection, SettingsCard, SettingsToggle, SettingsSelect, SettingsInput, SettingsButtonGroup } from '../../components/settings'
+import { Btn } from '../../components/ui'
 import { loadChatConfig, saveChatConfig, type ChatConfig, type ContentWidth, type DashboardConfig, type SendMode } from '../chat/ChatSettings'
 import { api } from '../../api/client'
+import { BACKEND_OPTIONS, PROVIDER_PRESETS, type AgentBackend } from './providerPresets'
 import { useAvailableModels } from '../../hooks/useAvailableModels'
 import { EFFORT_LEVELS, effortLabel, modelSupportsEffort } from '../../lib/effort'
 import { isMac } from '../../utils/platform'
@@ -153,6 +155,11 @@ export function ChatPanel() {
     session?: { autocompact_pct?: number }
     session_summary?: { enabled?: boolean }
     agent?: {
+      provider?: string
+      provider_base_url?: string
+      provider_api_key?: string
+      provider_api_format?: string
+      model_whitelist?: string[]
       model?: string
       role_models?: { background?: string; subagent?: string }
       role_efforts?: { background?: string; subagent?: string }
@@ -259,10 +266,73 @@ export function ChatPanel() {
     },
   })
 
+  // ── Vision (agent.image_input_mode / image_redirect / vision_fallback_model) ──
+  // Same card that owns the model picker, so Vision reads as a first-class
+  // section there rather than a hidden config.json toggle. The picker already
+  // groups by supports_vision; these controls govern HOW image prompts are
+  // handled on text-only models (the runtime's decide_image_input_mode + ACP
+  // redirect). Wrong-mode images veto session resume (SessionConfig), so the
+  // values here have UI-visible consequences — they deserve UI.
+  const IMAGE_MODE_OPTIONS: ('auto' | 'native' | 'text')[] = ['auto', 'native', 'text']
+  const IMAGE_MODE_LABELS = ['Auto (vision-aware)', 'Native (always pixels)', 'Text (always describe)']
+  const REDIRECT_OPTIONS = ['subagent', 'switch', 'off'] as const
+  const REDIRECT_LABELS = ['Describe via vision subagent', 'Switch session to vision model', 'Off (send through — may 400)']
+  const visionMode = (mcCfg?.agent as Record<string, unknown> | undefined)?.image_input_mode as string | undefined ?? 'auto'
+  const visionRedirect = (mcCfg?.agent as Record<string, unknown> | undefined)?.image_redirect as string | undefined ?? 'subagent'
+  const visionFallback = (mcCfg?.agent as Record<string, unknown> | undefined)?.vision_fallback_model as string | undefined ?? 'cmc/mimo-v2.5'
+  const fallbackOptions = ['cmc/mimo-v2.5', 'cmc/Kimi-K2.6', 'cmc/GLM-5.2', 'cmc/deepseek-v4-pro', 'ol/kimi-k2.6', 'ol/glm-5.2', 'oc/kimi-k2.6', 'oc/glm-5.2', 'oc/mimo-v2.5', 'ag/gemini-3-flash', 'ag/gemini-3.6-flash-high', 'cx/gpt-5.6-luna']
+  const visionModeMut = useMutation({
+    mutationFn: (v: string) => api.patchConfig('agent.image_input_mode', v),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['kirocrewConfig'] }),
+    onError: () => setSaveError(i18nT('pages.settings.chatPanel.failed_to_save_vision_mode')),
+  })
+  const visionRedirectMut = useMutation({
+    mutationFn: (v: string) => api.patchConfig('agent.image_redirect', v),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['kirocrewConfig'] }),
+    onError: () => setSaveError(i18nT('pages.settings.chatPanel.failed_to_save_vision_redirect')),
+  })
+  const visionFallbackMut = useMutation({
+    mutationFn: (v: string) => api.patchConfig('agent.vision_fallback_model', v),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['kirocrewConfig'] }),
+    onError: () => setSaveError(i18nT('pages.settings.chatPanel.failed_to_save_vision_fallback')),
+  })
+
+  const [localChunkBudget, setLocalChunkBudget] = useState('')
+  const chunkBudgetInitRef = useRef(false)
+  useEffect(() => {
+    if (mcQ.data && !chunkBudgetInitRef.current) {
+      chunkBudgetInitRef.current = true
+      setLocalChunkBudget(
+        String(mcQ.data.knowledge?.auto_ingest_chunk_budget ?? CHUNK_BUDGET_DEFAULT)
+      )
+    }
+  }, [mcQ.data])
+
+  const knowledgeMut = useMutation({
+    mutationFn: ({ path, value }: { path: string; value: boolean | number }) =>
+      api.patchConfig(path, value),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['kirocrewConfig'] }),
+    onError: () => {
+      setSaveError(i18nT('pages.settings.chatPanel.failed_to_save_knowledge_setting'))
+      setLocalChunkBudget(
+        String(mcCfg?.knowledge?.auto_ingest_chunk_budget ?? CHUNK_BUDGET_DEFAULT)
+      )
+    },
+  })
+  const knowledgeDisabled = !mcQ.isSuccess || knowledgeMut.isPending
+
   const keepModeMut = useMutation({
     mutationFn: (v: CompletionKeepMode) => api.patchConfig('agent.completion_keep', v),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['kirocrewConfig'] }),
     onError: () => setSaveError(i18nT('pages.settings.chatPanel.failed_to_save_completion_keep_mode')),
+  })
+
+  // Check which ACP backends have their binary installed so we can warn the
+  // user before they select a backend that will fail at chat time.
+  const { data: providerStatus } = useQuery({
+    queryKey: ['provider-status'],
+    queryFn: () => api.providerStatus(),
+    staleTime: 30_000,
   })
 
   // ── Default model + default reasoning effort ──
@@ -284,6 +354,123 @@ export function ChatPanel() {
     onSuccess: () => qc.invalidateQueries({ queryKey: ['kirocrewConfig'] }),
     onError: () => setSaveError(i18nT('pages.settings.chatPanel.failed_to_save_default_model')),
   })
+
+  // ── Provider (agent backend + router URL/key) ──
+  // The section edits a DRAFT that only becomes config on Save: the backend
+  // switch, preset prefill and URL/key inputs never write anything on their
+  // own. A draft overrides the loaded config until saved or the user edits
+  // something else; kiro-native (acp) manages its router itself.
+  //
+  // A harness is selected at agent.acp_backend (harness-parity), never a
+  // second agent.provider value — that field stays locked to "acp". The UI's
+  // AgentBackend vocabulary ('claude_code') predates that split and still
+  // matches the session-map PROVIDER_LABEL, so translate at this boundary
+  // rather than rename the whole panel: acp_backend '' <-> 'acp',
+  // 'claude' <-> 'claude_code', 'opencode' <-> 'opencode'.
+  const acpBackendToUi = (v: string | undefined): AgentBackend =>
+    v === 'claude' ? 'claude_code' : v === 'opencode' ? 'opencode' : 'acp'
+  const uiToAcpBackend = (v: AgentBackend): string =>
+    v === 'claude_code' ? 'claude' : v === 'opencode' ? 'opencode' : ''
+  const [draft, setDraft] = useState<{ backend: AgentBackend; preset: string; url: string; key: string; format?: 'anthropic' | 'openai' } | null>(null)
+  const [providerSaving, setProviderSaving] = useState(false)
+  const [providerSaveError, setProviderSaveError] = useState('')
+  const [providerTesting, setProviderTesting] = useState(false)
+  const [providerTestResult, setProviderTestResult] = useState<{ ok: boolean; message: string; models?: string[] } | null>(null)
+  const [modelSel, setModelSel] = useState<string[]>([])
+  useEffect(() => {
+    if (mcCfg?.agent?.model_whitelist) setModelSel(mcCfg.agent.model_whitelist)
+  }, [mcCfg])
+  const savedWhitelist = mcCfg?.agent?.model_whitelist ?? []
+  const whitelistChanged = modelSel.length !== savedWhitelist.length || modelSel.some((m, i) => m !== savedWhitelist[i])
+
+  const savedBackend: AgentBackend = acpBackendToUi(
+    (mcCfg?.agent as Record<string, unknown> | undefined)?.acp_backend as string | undefined
+  )
+  const effBackend: AgentBackend = draft?.backend ?? savedBackend
+  const effUrl = draft?.url ?? mcCfg?.agent?.provider_base_url ?? ''
+  // Bug 1 fix: derive preset from the saved URL so it doesn't reset to
+  // "custom" after save + reload.
+  const savedPreset = (() => {
+    const savedUrl = (mcCfg?.agent?.provider_base_url ?? '').replace(/\/+$/, '')
+    const presets = (savedBackend === 'claude_code' || savedBackend === 'opencode')
+      ? PROVIDER_PRESETS[savedBackend] : []
+    return presets.find(p => p.url === savedUrl)?.value ?? 'custom'
+  })()
+  const effPreset = draft?.preset ?? savedPreset
+  const effFormat: 'anthropic' | 'openai' = (draft?.format ??
+    (effBackend === 'opencode'
+      ? (mcCfg?.agent?.provider_api_format ?? 'openai')
+      : 'anthropic')) as 'anthropic' | 'openai'
+  const hasStoredKey = !!mcCfg?.agent?.provider_api_key
+  const providerPresets = effBackend === 'acp' ? [] : PROVIDER_PRESETS[effBackend]
+
+  const applyPreset = (value: string) => {
+    const preset = providerPresets.find(p => p.value === value)
+    setDraft(prev => ({
+      backend: effBackend,
+      preset: value,
+      url: preset ? preset.url : '',
+      key: prev?.key ?? '',
+      format: preset?.format ?? (effBackend === 'opencode' ? 'openai' : 'anthropic'),
+    }))
+  }
+
+  const switchBackend = (value: AgentBackend) => {
+    // Switching backend resets the draft to a clean custom entry — preset
+    // URLs are backend-specific.
+    setDraft({ backend: value, preset: 'custom', url: '', key: '', format: value === 'opencode' ? 'openai' : 'anthropic' })
+    setProviderTestResult(null)
+  }
+
+  const providerTest = async () => {
+    setProviderTesting(true)
+    setProviderTestResult(null)
+    try {
+      // Bug 2 fix: use the stored key when no draft key is entered (e.g.
+      // after a restart with no unsaved changes).
+      const key = draft?.key || (hasStoredKey ? undefined : undefined)
+      // When no draft key is present but a key is stored, the backend
+      // should use the saved key. Pass a flag so the endpoint knows.
+      const res = await api.providerTest({ url: effUrl, api_key: key, format: effFormat, use_stored: !draft?.key && hasStoredKey })
+      setProviderTestResult(res)
+    } catch {
+      setProviderTestResult({ ok: false, message: 'request failed' })
+    } finally {
+      setProviderTesting(false)
+    }
+  }
+
+  const toggleWhitelistModel = (id: string) => {
+    setModelSel(cur => (cur.includes(id) ? cur.filter(x => x !== id) : [...cur, id]))
+  }
+
+  const providerSave = async () => {
+    setProviderSaving(true)
+    setProviderSaveError('')
+    try {
+      if (draft?.backend && draft.backend !== savedBackend) {
+        await api.patchConfig('agent.acp_backend', uiToAcpBackend(draft.backend))
+      }
+      if (draft?.url !== undefined && draft.url !== (mcCfg?.agent?.provider_base_url ?? '')) {
+        await api.patchConfig('agent.provider_base_url', draft.url)
+      }
+      if (draft?.key) {
+        await api.patchConfig('agent.provider_api_key', draft.key)
+      }
+      if (draft?.format && draft.format !== (mcCfg?.agent?.provider_api_format ?? (draft.backend === 'opencode' ? 'openai' : 'anthropic'))) {
+        await api.patchConfig('agent.provider_api_format', draft.format)
+      }
+      if (modelSel.length !== savedWhitelist.length || modelSel.some((m, i) => m !== savedWhitelist[i])) {
+        await api.patchConfig('agent.model_whitelist', modelSel)
+      }
+      qc.invalidateQueries({ queryKey: ['kirocrewConfig'] })
+      setDraft(null)
+    } catch {
+      setProviderSaveError(i18nT('pages.settings.chatPanel.failed_to_save_provider'))
+    } finally {
+      setProviderSaving(false)
+    }
+  }
 
   const defaultEffort = mcCfg?.agent?.reasoning_effort ?? ''
   // Effort is only meaningful on reasoning-capable models. Rather than hide the
@@ -372,6 +559,99 @@ export function ChatPanel() {
           <button className="underline cursor-pointer bg-transparent border-none text-danger" onClick={() => mcQ.refetch()}>{i18nT('pages.settings.chatPanel.retry')}</button>
         </div>
       )}
+
+      <SettingsSection title={i18nT('pages.settings.chatPanel.provider')}>
+        <SettingsCard>
+          {/* Agent backend switch — each option carries its format subheader. */}
+          <div className="flex flex-wrap gap-1.5">
+            {BACKEND_OPTIONS.map(o => (
+              <button
+                key={o.value}
+                type="button"
+                aria-pressed={effBackend === o.value}
+                className={`flex flex-col items-center gap-0.5 px-3 py-2 rounded-lg border text-[13px] cursor-pointer transition-colors ${
+                  effBackend === o.value
+                    ? 'bg-bg-elevated text-text-strong border-border-strong shadow-sm font-semibold'
+                    : 'bg-transparent text-muted border-border font-medium hover:text-text-strong'
+                }`}
+                onClick={() => switchBackend(o.value)}
+              >
+                <span>{o.label}</span>
+                <span className={`text-[11px] font-normal ${effBackend === o.value ? 'text-muted' : 'text-muted/70'}`}>{o.sub}</span>
+              </button>
+            ))}
+          </div>
+
+          {effBackend === 'opencode' && providerStatus && !providerStatus.opencode && (
+            <p className="mt-2 text-[13px] text-warning">
+              OpenCode CLI not found. Install it with <code className="text-text-strong">npm i -g opencode-ai</code> or set <code className="text-text-strong">OPENCODE_BIN</code> to its path.
+            </p>
+          )}
+          {effBackend === 'claude_code' && providerStatus && !providerStatus.claude_code && (
+            <p className="mt-2 text-[13px] text-warning">
+              claude-agent-acp not found. Install it with <code className="text-text-strong">npm i -g @agentclientprotocol/claude-agent-acp</code>.
+            </p>
+          )}
+
+          {effBackend === 'acp' ? (
+            <p className="mt-3 text-[13px] text-muted">{i18nT('pages.settings.chatPanel.provider_managed_by_kiro_cli')}</p>
+          ) : (
+            <>
+              <SettingsSelect
+                label={i18nT('pages.settings.chatPanel.provider_preset')}
+                value={effPreset}
+                options={providerPresets.map(p => p.value)}
+                optionLabels={providerPresets.map(p => p.label)}
+                onChange={applyPreset}
+              />
+              <SettingsInput
+                label={i18nT('pages.settings.chatPanel.provider_url')}
+                aria-label={i18nT('pages.settings.chatPanel.provider_url')}
+                value={effUrl}
+                onChange={v => setDraft(prev => ({ backend: effBackend, preset: effPreset, url: v, key: prev?.key ?? '', format: prev?.format ?? effFormat }))}
+                placeholder="https://…"
+              />
+              <SettingsInput
+                label={i18nT('pages.settings.chatPanel.provider_api_key')}
+                aria-label={i18nT('pages.settings.chatPanel.provider_api_key')}
+                type="password"
+                value={draft?.key ?? ''}
+                placeholder={hasStoredKey ? i18nT('pages.settings.chatPanel.provider_api_key_saved') : ''}
+                onChange={v => setDraft(prev => ({ backend: effBackend, preset: effPreset, url: prev?.url ?? effUrl, key: v, format: prev?.format ?? effFormat }))}
+              />
+              <div className="mt-3 flex items-center gap-2">
+                <Btn onClick={providerTest} disabled={providerTesting || !effUrl}>
+                  {providerTesting ? '…' : i18nT('pages.settings.chatPanel.provider_test')}
+                </Btn>
+                <Btn primary onClick={providerSave} disabled={providerSaving || (!draft && !whitelistChanged)}>
+                  {i18nT('pages.settings.chatPanel.provider_save')}
+                </Btn>
+                {providerSaveError && <span className="text-[13px] text-danger">{providerSaveError}</span>}
+              </div>
+              {providerTestResult && (
+                <div className={`mt-2 text-[13px] ${providerTestResult.ok ? 'text-accent' : 'text-danger'}`}>
+                  {providerTestResult.ok
+                    ? `${i18nT('pages.settings.chatPanel.provider_test_ok')} (${providerTestResult.models?.length ?? 0})`
+                    : `${i18nT('pages.settings.chatPanel.provider_test_failed')}: ${providerTestResult.message}`}
+                </div>
+              )}
+              {(providerTestResult?.models?.length || savedWhitelist.length > 0) && (
+                <div className="mt-3">
+                  <div className="text-[13px] font-semibold text-text-strong mb-1">{i18nT('pages.settings.chatPanel.provider_models')}</div>
+                  <div className="max-h-40 overflow-y-auto rounded border border-border p-2 grid grid-cols-1 gap-1">
+                    {(providerTestResult?.models ?? savedWhitelist).map(id => (
+                      <label key={id} className="flex items-center gap-2 text-[13px] cursor-pointer">
+                        <input type="checkbox" checked={modelSel.includes(id)} onChange={() => toggleWhitelistModel(id)} className="accent-accent" />
+                        <span className="font-mono text-text truncate">{id}</span>
+                      </label>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </>
+          )}
+        </SettingsCard>
+      </SettingsSection>
 
       <SettingsSection title={i18nT('pages.settings.chatPanel.model')}>
         {/* Grouped by role so each block reads as "which model + how hard it
@@ -573,6 +853,39 @@ export function ChatPanel() {
             <SettingsSelect label={i18nT('pages.settings.chatPanel.restore_window')} description={i18nT('pages.settings.chatPanel.time_window_for_session_restoration')} value={String(dashCfg.restore_window_minutes)} options={RESTORE_OPTIONS} optionLabels={restoreLabels()} onChange={v => setDash({ restore_window_minutes: Number(v) })} disabled={dashDisabled} />
           )}
           <SettingsToggle label={i18nT('pages.settings.chatPanel.session_summaries')} description={i18nT('pages.settings.chatPanel.summarize_each_session_by_intent_in_the_right_pa')} checked={summaryEnabled} onChange={v => summaryMut.mutate(v)} disabled={!mcQ.isSuccess || summaryMut.isPending} />
+        </SettingsCard>
+      </SettingsSection>
+
+      <SettingsSection title="Vision">
+        <SettingsCard>
+          <SettingsSelect
+            label="Image input mode"
+            description="How user-attached images are presented to the model."
+            value={visionMode}
+            options={[...IMAGE_MODE_OPTIONS]}
+            optionLabels={IMAGE_MODE_LABELS}
+            onChange={v => visionModeMut.mutate(v)}
+            disabled={!mcQ.isSuccess}
+          />
+          <SettingsSelect
+            label="On text-only models"
+            description="What to do when the active model cannot take images."
+            value={visionRedirect}
+            options={[...REDIRECT_OPTIONS]}
+            optionLabels={[...REDIRECT_LABELS]}
+            onChange={v => visionRedirectMut.mutate(v)}
+            disabled={!mcQ.isSuccess}
+          />
+          <SettingsSelect
+            label="Vision fallback model"
+            description="Picker-spelling id the describe/switch path uses (must be vision-capable)."
+            value={visionFallback}
+            options={fallbackOptions.includes(visionFallback) ? fallbackOptions : [visionFallback, ...fallbackOptions]}
+            optionLabels={fallbackOptions.includes(visionFallback) ? fallbackOptions : [visionFallback, ...fallbackOptions]}
+            onChange={v => visionFallbackMut.mutate(v)}
+            disabled={!mcQ.isSuccess}
+          />
+          <p className="text-[12px] text-muted">Vision section mirrors the picker grouping (Vision — image input with an Image badge, then Text). On text-only models the active policy's fallback model is used; the text input stays the same — images ride the same composer attachment.</p>
         </SettingsCard>
       </SettingsSection>
 

@@ -84,6 +84,8 @@ from kiro_crew.dashboard.handlers.agents import (  # noqa: E402, F401
     api_kirocrew_agents_create,
     api_kirocrew_agents_sync,
     api_models,
+    api_provider_status,
+    api_provider_test,
     api_slash_commands,
 )
 
@@ -187,6 +189,7 @@ from kiro_crew.dashboard.handlers.mcp import (  # noqa: E402, F401
     api_mcp_gateway_enable,
     api_mcp_gateway_metrics,
     api_mcp_gateway_servers,
+    api_mcp_gateway_set_poolable,
     api_mcp_gateway_set_stub,
     api_mcp_gateway_status,
     api_mcp_global_scopes,

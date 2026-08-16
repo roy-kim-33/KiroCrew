@@ -73,11 +73,19 @@ export function pathForFile(file: File): string {
 export const TRAFFIC_LIGHT_INSET_PX = 84
 
 /**
- * Width reserved on the right for the Windows titleBarOverlay caption buttons
+ * Width reserved on the right for the titleBarOverlay caption buttons
  * (minimize/maximize/close). The overlay is 138px wide at default DPI on
- * Windows 10/11. The header must not place interactive controls in this zone.
+ * Windows 10/11 and on Linux desktops. The header must not place interactive
+ * controls in this zone.
  */
 export const WIN_CAPTION_OVERLAY_WIDTH = 138
+
+/**
+ * True on Electron desktop platforms whose title bar is an overlay of native
+ * caption buttons (Windows and Linux). macOS instead insets native traffic
+ * lights on the left. Callers use this to reserve the right-side strip.
+ */
+export const hasCaptionOverlay = isWinElectron || isLinuxElectron
 
 /**
  * True when an app declares `platform.requiresDesktopApp` but we are in a
