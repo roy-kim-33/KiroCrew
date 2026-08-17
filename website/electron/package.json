@@ -1,6 +1,6 @@
 {
   "name": "roycrew",
-  "version": "0.2.0-roycrew.5",
+  "version": "0.3.0-roycrew.1",
   "description": "RoyCrew — AI agent desktop app (fork of Kiro Crew)",
   "homepage": "https://github.com/roy-kim-33/KiroCrew",
   "main": "main.js",
