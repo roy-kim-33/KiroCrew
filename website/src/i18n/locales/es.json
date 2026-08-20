@@ -3848,9 +3848,6 @@
         "typesetting_hints_one": "{{count}} aviso de composición",
         "typesetting_hints_other": "{{count}} avisos de composición"
       },
-      "editor": {
-        "loading_editor": "Cargando el editor…"
-      },
       "fileTree": {
         "delete_file": "Eliminar {{file}}",
         "files": "Archivos",
@@ -5178,9 +5175,6 @@
       "split_view": "Vista dividida",
       "switch_to_split_view": "Cambiar a la vista dividida",
       "switch_to_unified_view": "Cambiar a la vista unificada",
-      "unchanged_lines_many": "{{count}} líneas sin cambios",
-      "unchanged_lines_one": "{{count}} línea sin cambios",
-      "unchanged_lines_other": "{{count}} líneas sin cambios",
       "unified_view": "Vista unificada"
     },
     "diffPanel": {

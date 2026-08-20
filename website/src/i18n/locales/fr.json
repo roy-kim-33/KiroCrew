@@ -3848,9 +3848,6 @@
         "typesetting_hints_one": "{{count}} remarque de composition",
         "typesetting_hints_other": "{{count}} remarques de composition"
       },
-      "editor": {
-        "loading_editor": "Chargement de l’éditeur…"
-      },
       "fileTree": {
         "delete_file": "Supprimer {{file}}",
         "files": "Fichiers",
@@ -5178,9 +5175,6 @@
       "split_view": "Vue divisée",
       "switch_to_split_view": "Passer à la vue divisée",
       "switch_to_unified_view": "Passer à la vue unifiée",
-      "unchanged_lines_many": "{{count}} lignes inchangées",
-      "unchanged_lines_one": "{{count}} ligne inchangée",
-      "unchanged_lines_other": "{{count}} lignes inchangées",
       "unified_view": "Vue unifiée"
     },
     "diffPanel": {

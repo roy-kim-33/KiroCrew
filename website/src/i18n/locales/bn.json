@@ -3791,9 +3791,6 @@
         "typesetting_hints_one": "{{count}}টি টাইপসেটিং পরামর্শ",
         "typesetting_hints_other": "{{count}}টি টাইপসেটিং পরামর্শ"
       },
-      "editor": {
-        "loading_editor": "এডিটর লোড হচ্ছে…"
-      },
       "fileTree": {
         "delete_file": "{{file}} মুছুন",
         "files": "ফাইল",
@@ -5103,8 +5100,6 @@
       "split_view": "স্প্লিট ভিউ",
       "switch_to_split_view": "স্প্লিট ভিউতে যাও",
       "switch_to_unified_view": "ইউনিফায়েড ভিউতে যাও",
-      "unchanged_lines_one": "{{count}}টি অপরিবর্তিত লাইন",
-      "unchanged_lines_other": "{{count}}টি অপরিবর্তিত লাইন",
       "unified_view": "ইউনিফায়েড ভিউ"
     },
     "diffPanel": {

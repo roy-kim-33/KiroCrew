@@ -94,6 +94,24 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "occurrence": 1
   },
   {
+    "id": "chat.auto-add-documents",
+    "label": "Auto-Add Documents",
+    "labelKey": "pages.settings.chatPanel.auto_add_documents",
+    "description": "Let the agent add documents it reads while working to your knowledge library, so they stay searchable later. The agent reads documents with tools you approve; Kiro Crew does not fetch them directly. Added documents appear in one “Auto-added” source you can remove in a click.",
+    "tab": "chat",
+    "type": "toggle",
+    "occurrence": 1
+  },
+  {
+    "id": "chat.auto-add-saved-artifacts",
+    "label": "Auto-Add Saved Artifacts",
+    "labelKey": "pages.settings.chatPanel.auto_add_saved_artifacts",
+    "description": "Mirror documents you save as artifacts into the library, keep them in sync as you edit, and remove them when you delete the artifact.",
+    "tab": "chat",
+    "type": "toggle",
+    "occurrence": 1
+  },
+  {
     "id": "chat.auto-compact-threshold",
     "label": "Auto-Compact Threshold",
     "labelKey": "pages.settings.chatPanel.auto_compact_threshold",
@@ -104,10 +122,27 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "configKey": "session.autocompact_pct"
   },
   {
+    "id": "chat.auto-ingest-limit-per-scan",
+    "label": "Auto-Ingest Limit Per Scan",
+    "labelKey": "pages.settings.chatPanel.auto_ingest_limit_per_scan",
+    "tab": "chat",
+    "type": "input",
+    "occurrence": 1
+  },
+  {
     "id": "chat.auto-open-git-in-side-panel",
     "label": "Auto-Open Git in Side Panel",
     "labelKey": "pages.settings.chatPanel.auto_open_git_panel",
     "description": "Expand the side panel to the Git tab each time you start a chat in a git project. The Git tab is created either way.",
+    "tab": "chat",
+    "type": "toggle",
+    "occurrence": 1
+  },
+  {
+    "id": "chat.auto-register-project-documents",
+    "label": "Auto-Register Project Documents",
+    "labelKey": "pages.settings.chatPanel.auto_register_project_documents",
+    "description": "Register the documents of each project you work in, so its design docs, specs and READMEs become searchable without adding the folder by hand. Documents only — never source code, agent instructions or generated files.",
     "tab": "chat",
     "type": "toggle",
     "occurrence": 1

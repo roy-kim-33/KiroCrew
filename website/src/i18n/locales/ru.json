@@ -3905,9 +3905,6 @@
         "typesetting_hints_one": "{{count}} замечание по вёрстке",
         "typesetting_hints_other": "{{count}} замечания по вёрстке"
       },
-      "editor": {
-        "loading_editor": "Загрузка редактора…"
-      },
       "fileTree": {
         "delete_file": "Удалить {{file}}",
         "files": "Файлы",
@@ -5253,10 +5250,6 @@
       "split_view": "Разделённый вид",
       "switch_to_split_view": "Переключить на разделённый вид",
       "switch_to_unified_view": "Переключить на объединённый вид",
-      "unchanged_lines_few": "{{count}} неизменённые строки",
-      "unchanged_lines_many": "{{count}} неизменённых строк",
-      "unchanged_lines_one": "{{count}} неизменённая строка",
-      "unchanged_lines_other": "{{count}} неизменённой строки",
       "unified_view": "Объединённый вид"
     },
     "diffPanel": {

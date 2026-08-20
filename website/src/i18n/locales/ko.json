@@ -3734,9 +3734,6 @@
         "no_messages": "컴파일러가 보고한 내용이 없습니다.",
         "typesetting_hints_other": "조판 힌트 {{count}}건"
       },
-      "editor": {
-        "loading_editor": "에디터를 불러오는 중…"
-      },
       "fileTree": {
         "delete_file": "{{file}} 삭제",
         "files": "파일",
@@ -5028,7 +5025,6 @@
       "split_view": "분할 보기",
       "switch_to_split_view": "분할 보기로 전환",
       "switch_to_unified_view": "통합 보기로 전환",
-      "unchanged_lines_other": "변경되지 않은 {{count}}줄",
       "unified_view": "통합 보기"
     },
     "diffPanel": {

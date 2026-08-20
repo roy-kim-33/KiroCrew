@@ -2769,9 +2769,6 @@
         "typesetting_hints_one": "{{count}} typesetting hint",
         "typesetting_hints_other": "{{count}} typesetting hints"
       },
-      "editor": {
-        "loading_editor": "Loading editor…"
-      },
       "fileTree": {
         "delete_file": "Delete {{file}}",
         "files": "Files",

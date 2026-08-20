@@ -3791,9 +3791,6 @@
         "typesetting_hints_one": "{{count}} Satzhinweis",
         "typesetting_hints_other": "{{count}} Satzhinweise"
       },
-      "editor": {
-        "loading_editor": "Editor wird geladen…"
-      },
       "fileTree": {
         "delete_file": "{{file}} löschen",
         "files": "Dateien",
@@ -5103,8 +5100,6 @@
       "split_view": "Geteilte Ansicht",
       "switch_to_split_view": "Zur geteilten Ansicht wechseln",
       "switch_to_unified_view": "Zur einheitlichen Ansicht wechseln",
-      "unchanged_lines_one": "{{count}} unveränderte Zeile",
-      "unchanged_lines_other": "{{count}} unveränderte Zeilen",
       "unified_view": "Einheitliche Ansicht"
     },
     "diffPanel": {

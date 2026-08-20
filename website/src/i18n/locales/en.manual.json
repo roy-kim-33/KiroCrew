@@ -1563,8 +1563,6 @@
       "split_view": "Split view",
       "switch_to_split_view": "Switch to split view",
       "switch_to_unified_view": "Switch to unified view",
-      "unchanged_lines_one": "{{count}} unchanged line",
-      "unchanged_lines_other": "{{count}} unchanged lines",
       "unified_view": "Unified view"
     },
     "discoverySearchBar": {
@@ -4497,7 +4495,7 @@
       "slackPanel": {
         "connected": "Connected",
         "copy_manifest_yaml": "Copy manifest YAML",
-        "create_the_slack_app_from_the_manifest": "Create the Slack app from the pre-filled manifest below (Socket Mode and permissions\n            included, named KiroCrew-{{alias}}). Install it to your\n            workspace, then paste the bot token and app-level token here.",
+        "create_the_slack_app_from_the_manifest": "Create the Slack app from the pre-filled manifest below (Socket Mode and permissions\n            included, named RoyCrew-{{alias}}). Install it to your\n            workspace, then paste the bot token and app-level token here.",
         "needs_setup": "Needs setup",
         "not_a_valid_id": "\"{{name}}\" is not a valid ID",
         "not_connected": "Not connected",

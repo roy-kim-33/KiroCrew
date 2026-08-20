@@ -3734,9 +3734,6 @@
         "no_messages": "编译器没有输出任何信息。",
         "typesetting_hints_other": "{{count}} 条排版提示"
       },
-      "editor": {
-        "loading_editor": "正在加载编辑器……"
-      },
       "fileTree": {
         "delete_file": "删除 {{file}}",
         "files": "文件",
@@ -5028,7 +5025,6 @@
       "split_view": "分屏视图",
       "switch_to_split_view": "切换到分屏视图",
       "switch_to_unified_view": "切换到统一视图",
-      "unchanged_lines_other": "{{count}} 行未更改",
       "unified_view": "统一视图"
     },
     "diffPanel": {

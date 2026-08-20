@@ -3848,9 +3848,6 @@
         "typesetting_hints_one": "{{count}} nota di impaginazione",
         "typesetting_hints_other": "{{count}} note di impaginazione"
       },
-      "editor": {
-        "loading_editor": "Caricamento dell’editor…"
-      },
       "fileTree": {
         "delete_file": "Elimina {{file}}",
         "files": "File",
@@ -5178,9 +5175,6 @@
       "split_view": "Vista divisa",
       "switch_to_split_view": "Passa alla vista divisa",
       "switch_to_unified_view": "Passa alla vista unificata",
-      "unchanged_lines_many": "{{count}} righe invariate",
-      "unchanged_lines_one": "{{count}} riga invariata",
-      "unchanged_lines_other": "{{count}} righe invariate",
       "unified_view": "Vista unificata"
     },
     "diffPanel": {

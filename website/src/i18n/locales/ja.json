@@ -3734,9 +3734,6 @@
         "no_messages": "コンパイラーが何も報告していません。",
         "typesetting_hints_other": "{{count}} 件の植字ヒント"
       },
-      "editor": {
-        "loading_editor": "エディターを読み込み中…"
-      },
       "fileTree": {
         "delete_file": "{{file}} を削除",
         "files": "ファイル",
@@ -5028,7 +5025,6 @@
       "split_view": "分割ビュー",
       "switch_to_split_view": "分割ビューに切り替え",
       "switch_to_unified_view": "統一ビューに切り替え",
-      "unchanged_lines_other": "{{count}} 行の変更なし",
       "unified_view": "統一ビュー"
     },
     "diffPanel": {
