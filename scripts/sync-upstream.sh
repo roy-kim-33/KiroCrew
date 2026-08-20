@@ -66,6 +66,11 @@ if ! git merge upstream/main --no-edit; then
      branches on top of them. Never take a whole file with `--ours`.
    - Router prefix stripping (cmc/ oc/ cx/ ol/ ag/) and the /api/provider/*
      routes are fork-only: upstream deleting them is not a conflict to accept.
+   - website/electron/auto-update.js is fork-OWNED, the one file to take whole
+     with `--ours`: upstream's updater fetches Kiro's CDN feed
+     (updates.crew.kiro.dev) across nightly/insider/stable channels, which would
+     push the upstream app over RoyCrew. The fork reads its own GitHub releases
+     instead, so upstream's updater/channel tests do not apply here.
 
   Then: git add -A && git commit && scripts/sync-upstream.sh verify
 RULES
