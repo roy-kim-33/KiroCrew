@@ -412,6 +412,19 @@ async def api_cron_update(request: web.Request) -> web.Response:
     ):
         if key in body:
             kwargs[key] = body[key]
+    # name routes through the same validator as POST (type check +
+    # sanitize_string + length cap) so the two REST surfaces cannot diverge:
+    # PATCH previously passed it through entirely unvalidated, letting a
+    # non-string or oversize name persist verbatim into crons.json.
+    if "name" in kwargs:
+        try:
+            kwargs["name"] = validate_string_field(
+                body, "name", max_len=MAX_SHORT_STRING
+            )
+        except ValidationError as exc:
+            return web.json_response(
+                {"error": str(exc), "code": "invalid_name"}, status=400
+            )
     # message routes through the same validator as POST (type check +
     # sanitize_string + length cap) so the two REST surfaces cannot diverge:
     # PATCH previously passed it through entirely unvalidated. Sanitizing here
@@ -1219,6 +1232,14 @@ async def api_crons(request: web.Request) -> web.Response:
             "created_ts": j.created_ts or None,
             "last_status": j.last_status,
             "agent": redact_credentials(redact_exfiltration_urls(j.agent_id or "")[0])[0] or None,
+            # The crews a sequence job actually wakes. Serialized because
+            # `agent_sequence` takes PRECEDENCE over `agent_id` at run time, so a
+            # consumer reading only `agent` would attribute such a job to the
+            # wrong crew (an empty `agent_id` reads as "the default crew").
+            "agent_sequence": [
+                redact_credentials(redact_exfiltration_urls(a or "")[0])[0]
+                for a in (j.agent_sequence or [])
+            ],
             "model": redact_credentials(redact_exfiltration_urls(j.model or "")[0])[0] or None,
             "channel": redact_credentials(redact_exfiltration_urls(j.channel or "")[0])[0] or None,
             "approval_mode": redact_credentials(redact_exfiltration_urls(j.approval_mode or "")[0])[

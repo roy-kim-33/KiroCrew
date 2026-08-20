@@ -180,6 +180,23 @@ def test_sandbox_allow_unsandboxed_exec_loads_from_config() -> None:
     assert enabled.agent.sandbox_allow_unsandboxed_exec is True
 
 
+def test_max_stop_hook_nudges_loads_from_config_and_round_trips() -> None:
+    """The Stop-hook nudge cap is built field-by-field in load(), so an
+    operator's value must hydrate and survive a to_dict() -> load() round-trip.
+    Without the loader wiring, load() re-defaults it to 100 and save() then
+    overwrites the operator's file value.
+    """
+    assert KiroCrewConfig().agent.max_stop_hook_nudges == 100
+    assert _load_from_dict({}).agent.max_stop_hook_nudges == 100
+    pinned = _load_from_dict({"agent": {"max_stop_hook_nudges": 7}})
+    assert pinned.agent.max_stop_hook_nudges == 7
+    # 0 = uncapped opt-in must survive too, not be re-defaulted to 100.
+    uncapped = _load_from_dict({"agent": {"max_stop_hook_nudges": 0}})
+    assert uncapped.agent.max_stop_hook_nudges == 0
+    # Round-trip: save() (to_dict) -> load() preserves the pinned value.
+    assert _load_from_dict(pinned.to_dict()).agent.max_stop_hook_nudges == 7
+
+
 def test_dashboard_tailscale_hydrates_and_survives_a_round_trip() -> None:
     """The opt-in must survive ``load()`` and a later ``save()``.
 
@@ -271,6 +288,30 @@ def test_publish_relocate_roots_parsed_and_round_trips():
     # Survives a to_dict() -> load() round-trip.
     reloaded = _load_from_dict(loaded.to_dict())
     assert reloaded.publish.relocate_roots == ["/srv/shared"]
+
+
+def test_agent_spawn_min_memory_gb_parsed_and_round_trips():
+    # Regression: agent.spawn_min_memory_gb was declared + consumed (the
+    # subagent admission gate) and emitted by to_dict(), but NOT parsed in
+    # load(), so an operator value was silently ignored (stuck at the 4.0
+    # default) and overwritten on the next save().
+    loaded = _load_from_dict({"agent": {"spawn_min_memory_gb": 9.5}})
+    assert loaded.agent.spawn_min_memory_gb == 9.5
+    # Survives a to_dict() -> load() round-trip.
+    reloaded = _load_from_dict(loaded.to_dict())
+    assert reloaded.agent.spawn_min_memory_gb == 9.5
+
+
+def test_slack_home_tab_sessions_per_kind_parsed_and_round_trips():
+    # Regression: slack.home_tab_sessions_per_kind was declared + consumed (the
+    # Slack Home Tab per-category cap) and emitted by to_dict(), but NOT parsed
+    # in load(), so an operator value was silently ignored (stuck at 5) and
+    # overwritten on the next save().
+    loaded = _load_from_dict({"slack": {"home_tab_sessions_per_kind": 42}})
+    assert loaded.slack.home_tab_sessions_per_kind == 42
+    # Survives a to_dict() -> load() round-trip.
+    reloaded = _load_from_dict(loaded.to_dict())
+    assert reloaded.slack.home_tab_sessions_per_kind == 42
 
 
 class TestMalformedConfigValuesNeverCrashLoad:
@@ -2738,6 +2779,73 @@ class TestSecurityBoundClamping:
         assert d["agent"]["subagent_max_turns"] == 200
         assert d["session"]["pool_size"] == 10
 
+    def test_numeric_string_ceiling_is_still_enforced_at_extraction(self) -> None:
+        """``_clamp_security_bounds`` runs over the RAW dict and deliberately
+        skips non-int values (see ``test_non_int_value_not_clamped``) --
+        ``_safe_int``'s own docstring says clamping at the coercion site is
+        what actually enforces the range for a numeric STRING that slips past
+        it. ``max_subagents``/``subagent_max_turns`` previously reached the
+        dataclass with NO coercion at all, and ``subagent_auto_max``/
+        ``pool_size`` were ``_safe_int``-coerced but without bounds -- all
+        four let a numeric-string value bypass the declared ceiling entirely."""
+        from kiro_crew.config.loader import (
+            POOL_SIZE_MAX,
+            SUBAGENT_AUTO_MAX_CEILING,
+            SUBAGENT_MAX_TURNS_CEILING,
+        )
+
+        cfg = _load_from_dict(
+            {
+                "agent": {
+                    "max_subagents": "200",
+                    "subagent_max_turns": "99999",
+                    "subagent_auto_max": "500",
+                },
+                "session": {"pool_size": "1000"},
+            }
+        )
+        assert cfg.agent.max_subagents == SUBAGENT_AUTO_MAX_CEILING == 64
+        assert cfg.agent.subagent_max_turns == SUBAGENT_MAX_TURNS_CEILING == 200
+        assert cfg.agent.subagent_auto_max == SUBAGENT_AUTO_MAX_CEILING == 64
+        assert cfg.session.pool_size == POOL_SIZE_MAX == 10
+        for v in (
+            cfg.agent.max_subagents,
+            cfg.agent.subagent_max_turns,
+            cfg.agent.subagent_auto_max,
+            cfg.session.pool_size,
+        ):
+            assert isinstance(v, int) and not isinstance(v, bool)
+
+    def test_numeric_string_in_range_still_parses(self) -> None:
+        """A well-formed numeric string within bounds must keep working --
+        the fix must not turn a previously-accepted legacy string value into
+        the default."""
+        cfg = _load_from_dict(
+            {
+                "agent": {
+                    "max_subagents": "8",
+                    "subagent_max_turns": "150",
+                    "subagent_auto_max": "32",
+                },
+                "session": {"pool_size": "4"},
+            }
+        )
+        assert cfg.agent.max_subagents == 8
+        assert cfg.agent.subagent_max_turns == 150
+        assert cfg.agent.subagent_auto_max == 32
+        assert cfg.session.pool_size == 4
+
+    def test_subagent_max_turns_as_string_no_longer_crashes_a_turn_limit_check(
+        self,
+    ) -> None:
+        """The concrete downstream failure this bug caused: subagent.py compares
+        ``turns > turn_limit`` where turns is always a real int -- a string
+        subagent_max_turns reaching that comparison raised TypeError on the
+        first tool call of every subagent. Assert the loaded value is always
+        int-comparable."""
+        cfg = _load_from_dict({"agent": {"subagent_max_turns": "50"}})
+        assert not (cfg.agent.subagent_max_turns > 999)  # must not raise TypeError
+
     def test_in_range_values_unchanged(self) -> None:
         with unittest.mock.patch("kiro_crew.config.loader._log_config_clamp_event") as mock_event:
             cfg = _load_from_dict(
@@ -4846,3 +4954,99 @@ class TestUpdateConfigLocked:
 
         assert result == {"repaired": True}
         assert json.loads(cfg.read_text()) == {"repaired": True}
+
+
+class TestMigrationBackupContainment:
+    """``load()`` must not create files beside a config path it does not own.
+
+    The one-time agents migration copies the pre-migration config aside. The
+    copy landed next to whatever ``config_path()`` resolved to, so every caller
+    that redirects the loader at its own temp file (this module's own helpers do
+    exactly that) silently accumulated a ``<tmpname>.json.bak`` orphan it never
+    cleaned up -- 72k of them on one dev host, against a tmpfs inode cap.
+    """
+
+    # A config with neither "agents" nor "default_agent" is what makes
+    # load() take the migration write-back branch that writes the backup.
+    _LEGACY = {"telegram": {"allow_forum": True}}
+
+    def _load_with(self, home: Path, cfg_file: Path) -> KiroCrewConfig:
+        with unittest.mock.patch(
+            "kiro_crew.config.loader.config_dir", return_value=home
+        ), unittest.mock.patch(
+            "kiro_crew.config.loader.config_path", return_value=cfg_file
+        ):
+            return KiroCrewConfig.load()
+
+    def test_no_sibling_left_beside_a_redirected_config(self, tmp_path: Path) -> None:
+        """A caller-owned directory gains nothing from a migrating load()."""
+        caller_dir = tmp_path / "caller-owned"
+        caller_dir.mkdir()
+        cfg_file = caller_dir / "tmpdeadbeef.json"
+        cfg_file.write_text(json.dumps(self._LEGACY), encoding="utf-8")
+        home = tmp_path / "home"
+        home.mkdir()
+
+        before = {p.name for p in caller_dir.iterdir()}
+        cfg = self._load_with(home, cfg_file)
+        after = {p.name for p in caller_dir.iterdir()}
+
+        # Guard the guard: assert the migration branch actually ran, otherwise
+        # this test would pass for the wrong reason if that branch stops firing.
+        assert cfg.agents, "migration write-back did not run, test is vacuous"
+        assert after == before, (
+            "load() left orphans beside the caller's config: %s" % sorted(after - before)
+        )
+
+    def test_real_config_in_the_data_home_is_still_backed_up(self, tmp_path: Path) -> None:
+        """The production path keeps its backup exactly where it always was."""
+        home = tmp_path / "home"
+        home.mkdir()
+        cfg_file = home / "config.json"
+        cfg_file.write_text(json.dumps(self._LEGACY), encoding="utf-8")
+
+        cfg = self._load_with(home, cfg_file)
+
+        assert cfg.agents, "migration write-back did not run, test is vacuous"
+        assert (home / "config.json.bak").exists()
+
+    def test_backup_appends_the_suffix_instead_of_replacing_it(self, tmp_path: Path) -> None:
+        """A config whose name is not ``*.json`` is backed up, not renamed.
+
+        ``Path.with_suffix(".json.bak")`` REPLACES the final suffix, so
+        ``settings.conf`` would have produced ``settings.json.bak``.
+        """
+        home = tmp_path / "home"
+        home.mkdir()
+        cfg_file = home / "settings.conf"
+        cfg_file.write_text(json.dumps(self._LEGACY), encoding="utf-8")
+
+        self._load_with(home, cfg_file)
+
+        assert (home / "settings.conf.bak").exists()
+        assert not (home / "settings.json.bak").exists()
+
+    def test_failed_backup_still_aborts_the_migration_save(self, tmp_path: Path) -> None:
+        """A config we could not copy aside is not rewritten either.
+
+        The caller's ``except`` is what skips ``cfg.save()``, so containing the
+        LOCATION decision must not also swallow a failing copy: otherwise the
+        only pre-migration copy is overwritten with no backup anywhere.
+        """
+        home = tmp_path / "home"
+        home.mkdir()
+        cfg_file = home / "config.json"
+        original = json.dumps(self._LEGACY)
+        cfg_file.write_text(original, encoding="utf-8")
+
+        with unittest.mock.patch(
+            "kiro_crew.config.loader.shutil.copy2",
+            side_effect=OSError("backup target is read-only"),
+        ):
+            cfg = self._load_with(home, cfg_file)
+
+        # load() still returns a usable config -- the write-back is best-effort.
+        assert cfg.agents
+        # But the on-disk config is untouched, so the migration retries next load.
+        assert json.loads(cfg_file.read_text(encoding="utf-8")) == json.loads(original)
+        assert not (home / "config.json.bak").exists()

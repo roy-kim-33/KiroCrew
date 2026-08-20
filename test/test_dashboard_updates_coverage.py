@@ -234,8 +234,8 @@ class TestGitCheckoutFailurePaths:
         self._assert_failed_check(updates._ERR_GIT_READ_FAILED)
 
     @pytest.mark.asyncio
-    async def test_version_read_timeout(self, monkeypatch, tmp_path):
-        argv = await self._run(
+    async def test_behind_count_timeout(self, monkeypatch, tmp_path):
+        await self._run(
             monkeypatch,
             tmp_path,
             [
@@ -246,12 +246,10 @@ class TestGitCheckoutFailurePaths:
             ],
         )
         self._assert_failed_check(updates._ERR_GIT_READ_FAILED)
-        # The version is read at the REMOTE sha when the two differ, not at HEAD:
-        # comparing HEAD against itself can never detect an update.
-        assert argv[-1] == ("git", "show", "bbb222:src/kiro_crew/__init__.py")
 
     @pytest.mark.asyncio
-    async def test_a_version_that_cannot_be_parsed_is_reported_as_such(self, monkeypatch, tmp_path):
+    async def test_behind_count_that_is_not_a_number_is_a_failed_check(self, monkeypatch, tmp_path):
+        """A count we cannot read is not licence to answer "up to date"."""
         await self._run(
             monkeypatch,
             tmp_path,
@@ -259,6 +257,44 @@ class TestGitCheckoutFailurePaths:
                 _FakeProc(),
                 _FakeProc(out=b"aaa111\n"),
                 _FakeProc(out=b"bbb222\n"),
+                _FakeProc(out=b"not a number\n"),
+            ],
+        )
+        self._assert_failed_check(updates._ERR_GIT_READ_FAILED)
+
+    @pytest.mark.asyncio
+    async def test_version_read_timeout(self, monkeypatch, tmp_path):
+        argv = await self._run(
+            monkeypatch,
+            tmp_path,
+            [
+                _FakeProc(),
+                _FakeProc(out=b"aaa111\n"),
+                _FakeProc(out=b"bbb222\n"),
+                _FakeProc(out=b"0\t7\n"),
+                _FakeProc(time_out=True, kill_raises=True),
+            ],
+        )
+        self._assert_failed_check(updates._ERR_GIT_READ_FAILED)
+        # The version is read at the REMOTE sha when the two differ, not at HEAD:
+        # comparing HEAD against itself can never detect an update.
+        assert argv[-1] == ("git", "show", "bbb222:src/kiro_crew/__init__.py")
+
+    @pytest.mark.asyncio
+    async def test_a_version_that_cannot_be_parsed_is_reported_as_such(self, monkeypatch, tmp_path):
+        """Unparseable version AND no commit distance — nothing left to answer with.
+
+        ``behind`` is scripted to 0 on purpose: a non-zero count is a verdict in
+        its own right and would (correctly) rescue the check.
+        """
+        await self._run(
+            monkeypatch,
+            tmp_path,
+            [
+                _FakeProc(),
+                _FakeProc(out=b"aaa111\n"),
+                _FakeProc(out=b"bbb222\n"),
+                _FakeProc(out=b"0\t0\n"),
                 _FakeProc(out=b'__version__ = "not/a/version"\n'),
             ],
         )
@@ -280,6 +316,7 @@ class TestGitCheckoutFailurePaths:
                 _FakeProc(),
                 _FakeProc(out=b"aaa111\n"),
                 _FakeProc(out=b"bbb222\n"),
+                _FakeProc(out=b"0\t7\n"),
                 _FakeProc(out=b'__version__ = "999.0.0"\n'),
                 _FakeProc(time_out=True, kill_raises=True),
             ],
@@ -309,6 +346,7 @@ class TestGitCheckoutFailurePaths:
                 _FakeProc(),
                 _FakeProc(out=b"aaa111\n"),
                 _FakeProc(out=b"bbb222\n"),
+                _FakeProc(out=b"0\t7\n"),
                 _FakeProc(out=b'__version__ = "999.0.0"\n'),
                 _FakeProc(out=diff),
             ],
@@ -780,11 +818,19 @@ class TestSafeWsSend:
 class TestRingLogHandler:
     """The always-on ring buffer plus its WebSocket fan-out."""
 
-    def test_set_state_off_the_loop_records_no_loop(self):
-        """Installed at import time on some paths, where no loop is running yet."""
+    def test_set_state_keeps_no_loop_of_its_own(self):
+        """The handler defers to the dashboard's one serving loop.
+
+        Its `emit()` runs on arbitrary threads while `set_state` captured a loop
+        ONCE, so any caller attaching the state from a non-loop context latches
+        None permanently and every later fan-out is dropped with nothing
+        surfaced. Today's only production caller runs inside `start_dashboard`,
+        so the capture did succeed -- this pins the shape, not a live bug.
+        Resolving through the state at emit time removes the latch entirely.
+        """
         handler = updates._RingLogHandler(collections.deque(maxlen=4))
         handler.set_state(MagicMock())
-        assert handler._loop is None
+        assert not hasattr(handler, "_loop")
 
     def test_emit_appends_to_the_ring_and_honours_maxlen(self):
         ring: collections.deque[str] = collections.deque(maxlen=2)
@@ -816,8 +862,8 @@ class TestRingLogHandler:
         ws.send_str = AsyncMock()
         state = MagicMock()
         state._ws_log_subscribers = {ws}
+        state.serving_loop = asyncio.get_running_loop()
         handler.set_state(state)
-        assert handler._loop is asyncio.get_running_loop()
 
         handler.emit(_record("broadcast me"))
         # The fan-out is scheduled via call_soon_threadsafe, so it lands on a
@@ -862,8 +908,10 @@ class TestRingLogHandler:
         state = MagicMock()
         state._ws_log_subscribers = {MagicMock()}
         handler._state = state
-        handler._loop = MagicMock()
-        handler._loop.call_soon_threadsafe.side_effect = RuntimeError("event loop is closed")
+        state.serving_loop = MagicMock()
+        state.serving_loop.call_soon_threadsafe.side_effect = RuntimeError(
+            "event loop is closed"
+        )
 
         handler.emit(_record("during shutdown"))
 
@@ -1200,12 +1248,19 @@ class TestUpdateInfoAccessors:
             "https://cdn.example.invalid",
         )
 
-    def test_the_recommended_command_pins_https_and_names_the_channel(self):
+    def test_the_recommended_command_pins_https_and_names_the_channel(self, monkeypatch):
+        # Asserts the invariants, not an exact string: the builder is shared with
+        # the gateway's unattended path, so its shape may change (it stopped
+        # piping curl into sh, which hid download failures) while these must hold.
+        monkeypatch.setenv("KIROCREW_CDN_BASE", "https://download.example.invalid")
         command = updates._wheel_update_command("insider", "https://download.example.invalid")
-        assert command == (
-            "curl -fsSL --proto '=https' https://download.example.invalid/cli.sh"
-            " | sh -s -- --channel insider"
-        )
+        assert "--proto '=https'" in command, "must refuse a plaintext override"
+        assert "https://download.example.invalid/cli.sh" in command
+        assert "--channel insider" in command, "a bare re-run would default to stable"
+        # The invariant is that the DOWNLOAD's failure fails the command.
+        # A pipe fed from an already-checked variable preserves that; only a
+        # bare `curl … | sh` would report just sh's status.
+        assert '_kc_body="$(curl' in command, "curl must not feed sh directly"
 
 
 class TestExternallyManagedCheck:

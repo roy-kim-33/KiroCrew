@@ -3,6 +3,11 @@ import { act, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { renderWithProviders, createTestStore } from './helpers'
 import InstancesViewport from '../components/InstancesViewport'
+
+// The postinstall patch (scripts/patch-happy-dom-iframe.mjs) makes happy-dom's
+// disabled-iframe path dispatch 'load' instead of throwing DOMException when
+// handleDisabledFileLoadingAsSuccess is true — no per-test workaround needed.
+
 vi.mock('../lib/embedded', () => ({ isEmbeddedPane: vi.fn(() => false) }))
 import { isEmbeddedPane } from '../lib/embedded'
 

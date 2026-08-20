@@ -2,13 +2,14 @@ import { useEffect, useState, useCallback, useRef, useMemo, createContext, type 
 import { createPortal } from 'react-dom'
 import { Routes, Route, Navigate, useLocation, useNavigate, useParams } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { useAppSelector, useAppDispatch, store } from './store'
+import { useAppSelector, useAppDispatch, useAppStore, store } from './store'
 import { fetchSlots, sseStatus, setUpdateProgress, setEnabledAppIds, changeApprovalMode } from './store/dashboardSlice'
 // Side-effect: registers every built-in surface in the registry. MUST run
 // before `getBuiltinSurfaces()` is invoked below to compute `NAV_ITEMS`.
 import './surfaces/builtins'
 import { getBuiltinSurfaces, getBuiltinSurface, selectSurfaceBadgeCount, selectSurfaceActivityCount, selectAllSurfacesAttention, surfaceLabel, surfacePreviewEnabled } from './surfaces/registry'
-import { createSlot, appendMessage, setAgentSwitchNotice, setSlotRunning, switchSlot, selectActiveSlotProject } from './store/chatSlice'
+import { createSlot, appendSlotMessage, setAgentSwitchNotice, setSlotRunning, switchSlot, selectActiveSlotProject } from './store/chatSlice'
+import { queryComposer } from './pages/chat/composerFocus'
 import { setNavIntentHandler as setArtifactNavIntentHandler } from './utils/artifactPopout'
 import { applyNavIntentInMain } from './utils/navIntent'
 import { installSoftNavigate } from './utils/errorReport'
@@ -31,6 +32,7 @@ import { api, isAuthBannerShown } from './api/client'
 import type { KiroCreditUsage, KiroUsagePayload } from './api/client'
 import { safeSetItem } from './utils/safeStorage'
 import { gcOrphanedStorage } from './utils/storageGc'
+import { isMetricNumber, metricNumber } from './utils/metrics'
 import { Rocket, Menu, Bell, Code, RefreshCw, Package, Loader2, Download, Hammer, XCircle, Check, AlertTriangle, CheckCircle, X, AudioWaveform, ChevronUp, MoreHorizontal, Coins, ArrowLeftToLine, LayoutGrid, SquareTerminal, Bot, Search as SearchIcon } from 'lucide-react'
 import { GithubIcon, DiscordIcon } from './components/BrandIcon'
 import { Toggle } from './components/ui'
@@ -38,7 +40,7 @@ import OnboardingFlow from './components/OnboardingFlow'
 import AgentImportFlow from './components/AgentImportFlow'
 import PrivacyChapter from './components/PrivacyChapter'
 import { OnboardingShellHost } from './components/OnboardingChapterShell'
-import { PREVIEW_FOCUS_EVENT } from './components/WebPreviewPanel'
+import { PREVIEW_EXPAND_EVENT } from './components/WebPreviewPanel'
 import { motion, AnimatePresence } from 'framer-motion'
 import { usePersistedBool } from './hooks/usePersistedBool'
 import { isMacElectron, isWinElectron, isLinuxFramelessElectron } from './lib/electron'
@@ -94,21 +96,22 @@ import { getBuiltinIcon } from './apps/builtinIcons'
 import { getThemeBranding } from './themeBranding'
 import { getTopBarWidgets } from './apps/topBarWidgets'
 import { getCapsuleSegments } from './apps/capsuleSegments'
-import { FEATURE_REQUEST_PROMPT_WITH_SKILL, FEATURE_REQUEST_PROMPT_FALLBACK } from './prompts/featureRequest'
+import { FEATURE_REQUEST_PROMPT_FALLBACK } from './prompts/featureRequest'
 import { useKeyboardShortcuts } from './hooks/useKeyboardShortcuts'
 import { useInstanceShortcuts } from './hooks/useInstanceShortcuts'
 import { useCommandPalette } from './hooks/useCommandPalette'
 import { useProvider } from './providers/context'
 import { useAgents } from './hooks/useAgents'
 import ShortcutsModal from './components/ShortcutsModal'
-import CommandPalette from './components/CommandPalette'
+import QuickSearchSurface from './components/QuickSearchSurface'
 import ReportProblemModal from './components/ReportProblemModal'
 import FeedbackPill from './components/FeedbackPill'
-import KiroAccountModal from './components/KiroAccountModal'
+import KiroAccountModal, { type KiroAccountUsage } from './components/KiroAccountModal'
 import WindowsTitlebarMenu from './components/WindowsTitlebarMenu'
 
 import { i18nT } from './i18n/t'
 import { appNavTarget } from './appNav'
+import { resolveSlotOverlays, type SlotOwners } from './apps/overlaySlots'
 import { fmtCompact, fmtPercent } from './i18n/format'
 
 const MAX_KIRO_BONUS_GRANT_NAME_CHARS = 100
@@ -129,6 +132,7 @@ interface AppListEntry {
     ui?: {
       entry?: string
       pages?: Array<{ route: string; icon?: string; iconUrl?: string; label?: string }>
+      overlays?: Array<{ id?: string; label?: string; replaces?: string }>
     }
   }
 }
@@ -172,6 +176,54 @@ export function metricColor(pct: number): string {
   return pct > 0.9 ? 'text-danger' : pct > 0.7 ? 'text-warn' : 'text-muted'
 }
 export const memColorClass = metricColor
+
+/**
+ * One `/api/system` metrics frame, as the topbar readout capsule consumes it.
+ *
+ * EVERY field is optional on purpose. `_collect_system_metrics` builds the
+ * payload key-by-key with per-probe `try/except: pass`, so a probe that fails
+ * (vm_stat timeout, unreadable /proc/meminfo, `system_memory()` returning None
+ * on Windows) simply omits its keys — while `mem_total_gb` can still be served
+ * from the cached STATIC system info the frame is seeded with. A frame with
+ * `mem_total_gb` but no `mem_used_gb` is therefore normal, not corrupt, and any
+ * readout must prove a value is a finite number before formatting it. Typing
+ * these as required `number` is what let `undefined.toFixed(1)` crash the root
+ * app-shell boundary; `api.system()` returns `any`, so only this annotation
+ * makes the compiler check the guards.
+ */
+type SysMetricsFrame = {
+  memUsed?: number
+  memTotal?: number
+  cpuPct?: number
+  diskTotal?: number
+  diskFree?: number
+  posture?: 'ample' | 'tight' | 'critical' | 'unknown'
+  availableGb?: number
+  subagentCap?: number
+}
+
+/**
+ * Validity flags + a sanitized frame for one metrics readout.
+ *
+ * Both readouts (the desktop button and the mobile passive row) derive their
+ * flags here so the two cannot drift apart: a `memTotal > 0` check says nothing
+ * about `memUsed`, and formatting a value the flag never proved is what crashed
+ * the shell.
+ */
+function readMetricsFrame(raw: SysMetricsFrame) {
+  return {
+    cpuValid: isMetricNumber(raw.cpuPct),
+    memValid: isMetricNumber(raw.memUsed) && isMetricNumber(raw.memTotal) && raw.memTotal > 0,
+    dskValid: isMetricNumber(raw.diskTotal) && isMetricNumber(raw.diskFree) && raw.diskTotal > 0,
+    m: {
+      cpuPct: metricNumber(raw.cpuPct),
+      memUsed: metricNumber(raw.memUsed),
+      memTotal: metricNumber(raw.memTotal),
+      diskTotal: metricNumber(raw.diskTotal),
+      diskFree: metricNumber(raw.diskFree),
+    },
+  }
+}
 
 // The top-bar search is laid out by CSS, not measured here: `.topbar` in
 // index.css is a three-track grid whose centre track is
@@ -736,7 +788,7 @@ function NotificationsBellButton() {
       >
         <Bell size={15} />
         {unacked.length > 0 && (
-          <span className="absolute -top-1 -right-1 min-w-[16px] h-[16px] px-1 rounded-full bg-accent text-accent-fg text-[10px] font-bold flex items-center justify-center shadow-[0_0_8px_var(--accent-glow)]" aria-hidden="true">
+          <span className="absolute -top-1 -right-1 min-w-[16px] h-[16px] px-1 rounded-full bg-accent text-accent-fg text-[10px] font-bold flex items-center justify-center shadow-[0_0_2px_var(--accent-glow)]" aria-hidden="true">
             {unacked.length > 99 ? '99+' : unacked.length}
           </span>
         )}
@@ -775,7 +827,7 @@ function NotificationsBellButton() {
                 the cards' own backdrop-blur still samples the page). */}
             <div
               aria-hidden="true"
-              className="absolute inset-y-0 -left-20 right-0 -z-10 pointer-events-none bg-black/[.03] [mask-image:linear-gradient(to_right,transparent,black_80px)] [-webkit-mask-image:linear-gradient(to_right,transparent,black_80px)]"
+              className="absolute inset-y-0 -left-20 right-0 -z-10 pointer-events-none bg-black/[.12] backdrop-blur-sm [mask-image:linear-gradient(to_right,transparent,black_80px)] [-webkit-mask-image:linear-gradient(to_right,transparent,black_80px)]"
             />
             <div className="flex-1 min-h-0 px-3 py-2 flex flex-col">
               <NotificationFeed
@@ -1072,10 +1124,10 @@ export default function App() {
   const [navCollapsed, setNavCollapsed] = useState(() => localStorage.getItem('mc-nav') === '1')
   const navCollapsedRef = useRef(navCollapsed)
   navCollapsedRef.current = navCollapsed
-  // Preview focus (expand) mode from the Web Preview tab collapses the left nav
+  // Preview expand mode from the Web Preview tab collapses the left nav
   // as a STARTING layout, not a lock — the brand toggle keeps its standard
-  // behavior while focus mode is on, so the rail can be brought back without
-  // leaving the preview. This ref holds the pre-focus state to restore on exit,
+  // behavior while expand mode is on, so the rail can be brought back without
+  // leaving the preview. This ref holds the pre-expand state to restore on exit,
   // and is cleared the moment the user toggles the rail themselves so their
   // choice is not undone. `navCollapsed` is driven directly rather than ORed
   // with a transient flag, because an OR makes the toggle look broken.
@@ -1086,9 +1138,9 @@ export default function App() {
   // already-cleared ref and lose the restore value.
   const navAutoCollapsed = useRef<boolean | null>(null)
   useEffect(() => {
-    const onFocus = (e: Event) => {
-      const focused = !!(e as CustomEvent<{ focused?: boolean }>).detail?.focused
-      if (focused) {
+    const onPreviewExpand = (e: Event) => {
+      const expanded = !!(e as CustomEvent<{ expanded?: boolean }>).detail?.expanded
+      if (expanded) {
         if (navAutoCollapsed.current === null) navAutoCollapsed.current = navCollapsedRef.current
         setNavCollapsed(true)
         return
@@ -1097,8 +1149,8 @@ export default function App() {
       navAutoCollapsed.current = null
       if (prior !== null) setNavCollapsed(prior)
     }
-    window.addEventListener(PREVIEW_FOCUS_EVENT, onFocus)
-    return () => window.removeEventListener(PREVIEW_FOCUS_EVENT, onFocus)
+    window.addEventListener(PREVIEW_EXPAND_EVENT, onPreviewExpand)
+    return () => window.removeEventListener(PREVIEW_EXPAND_EVENT, onPreviewExpand)
   }, [])
   const isMobile = useIsMobile()
   const [sidePanelDock] = useSidePanelDock()
@@ -1198,13 +1250,22 @@ export default function App() {
   // lingers. Mirrors ChatSidebar's handleSidebarDragCancel.
   const handleAppDragCancel = useCallback(() => setActiveAppDragId(null), [])
   const appNavRetryRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  // Monotonic stamp for app-nav fetches. Cancelling a pending RETRY is not enough:
+  // a fetch already in flight cannot be cancelled, so a slow mount response landing
+  // after an enable/disable refresh would publish stale slot ownership and bind the
+  // quick-search gesture to the wrong surface. Only the newest generation may write.
+  const appNavGenRef = useRef(0)
+  const [slotOwners, setSlotOwners] = useState<SlotOwners>({})
+  const queryClient = useQueryClient()
   const refreshAppNav = useCallback((attempt = 0) => {
     // Cancel any pending retry up-front so external triggers (the reconnect
     // effect, the mc:apps-changed handler) or a just-fired retry can never run
     // overlapping fetch chains — exactly one chain is ever active.
     if (appNavRetryRef.current) { clearTimeout(appNavRetryRef.current); appNavRetryRef.current = null }
+    const gen = ++appNavGenRef.current
     api.listApps()
       .then((apps: AppListEntry[]) => {
+        if (gen !== appNavGenRef.current) return
         const items = apps
           .flatMap(a => {
             // Eligibility, route, id and label come from the shared derivation in
@@ -1244,8 +1305,17 @@ export default function App() {
           })
         setAppNavItems(items)
         dispatch(setEnabledAppIds(items.map(i => i.id)))
+        // Publish this response under the shared apps key so readers that want the
+        // list -- an overlay opened later, the palette's apps provider -- are served
+        // from cache instead of issuing a second identical request.
+        queryClient.setQueryData(['apps'], apps)
+        // Which app (if any) currently owns a host overlay slot. Derived from the
+        // SAME response as the nav rail — an app-contributed overlay costs no
+        // extra request, and the shell never names a specific app.
+        setSlotOwners(resolveSlotOverlays(apps))
       })
       .catch(() => {
+        if (gen !== appNavGenRef.current) return
         // A transient failure (e.g. the gateway mid-restart right after a
         // `kirocrew update`, or the cold apps-dir scan) used to be swallowed
         // here, leaving the Apps rail empty until a manual reload or an app
@@ -1254,7 +1324,7 @@ export default function App() {
         if (attempt >= APP_NAV_MAX_RETRIES) return
         appNavRetryRef.current = setTimeout(() => refreshAppNav(attempt + 1), APP_NAV_RETRY_BASE_MS * 2 ** attempt)
       })
-  }, [dispatch])
+  }, [dispatch, queryClient])
   useEffect(() => {
     refreshAppNav()
     return () => { if (appNavRetryRef.current) clearTimeout(appNavRetryRef.current) }
@@ -1315,12 +1385,16 @@ export default function App() {
     mutationFn: () => dispatch(createSlot(undefined)).unwrap(),
     onSuccess: () => {
       navigate('/chat')
-      requestAnimationFrame(() => document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Message input"]')?.focus())
+      // Unguarded on purpose: this mutation only fires from the new-chat
+      // keyboard shortcut, and a pressed shortcut proves a keyboard exists —
+      // focusComposer()'s touch-device skip would wrongly suppress focus on a
+      // tablet with a physical keyboard. Next frame, so the new slot's
+      // composer has been committed to the DOM.
+      requestAnimationFrame(() => queryComposer()?.focus())
     },
   })
   const refreshTrigger = useAppSelector(s => s.dashboard.refreshTrigger)
   const { agents: installedAgents, defaultAgent } = useAgents(refreshTrigger)
-  const queryClient = useQueryClient()
   const provider = useProvider()
   const agentSwitchNotice = useAppSelector(s => s.chat.agentSwitchNotice)
   useEffect(() => {
@@ -1430,7 +1504,12 @@ export default function App() {
   // credits_covered on top — that double-counts the in-plan portion and is the
   // bug that rendered a capped 10K plan as "20.0K". Returns null until the
   // background cache warms.
-  const { data: kiroUsage } = useQuery<KiroCreditUsage | 'none' | null>({
+  //
+  // `isError` is read alongside `data` because `data` alone cannot tell "the
+  // backend cache has not warmed yet" (null) apart from "the request failed"
+  // (undefined) — both are falsy. Without it a failing endpoint renders as a
+  // spinner that never resolves, since the 30s refetch keeps retrying forever.
+  const { data: kiroUsage, isError: kiroUsageFailed } = useQuery<KiroCreditUsage | 'none' | null>({
     queryKey: ['kiro-usage'],
     queryFn: () => api.sessionsUsage().then(d => {
       const u: KiroUsagePayload = d?.usage || {}
@@ -1510,6 +1589,13 @@ export default function App() {
   useEffect(() => {
     if (kiroUsage === 'none') setKiroUsageOpen(false)
   }, [kiroUsage])
+  // ONE derivation feeds both the capsule segment and the account modal, so the
+  // drill-in can never report a different state from the pill that opened it —
+  // the modal spinning on "checking account" behind a pill that already says
+  // "unavailable" is the same falsy-collapse defect one level down.
+  const kiroUsageState: KiroAccountUsage = kiroUsageFailed && !kiroUsage
+    ? 'failed'
+    : (kiroUsage ?? null)
   const [metricsOpen, setMetricsOpen] = useState(() => localStorage.getItem('mc-topbar-metrics') === '1')
   // Readout capsule collapse: clicking the connection dot folds the capsule
   // down to just the dot; clicking again restores the full readout.
@@ -1534,7 +1620,7 @@ export default function App() {
   // separate strip inset to relay to Electron — positionTrafficLights centers on
   // the header height directly. Remote panes get their own inset via `macInset`.
   const macInset = isMacElectron && !macFullscreen
-  const { data: sysMetrics, isError: sysMetricsError, dataUpdatedAt: sysMetricsUpdatedAt } = useQuery({ queryKey: ['system-metrics'], queryFn: () => api.system().then(d => ({ memUsed: d.mem_used_gb, memTotal: d.mem_total_gb, cpuPct: d.cpu_pct, diskTotal: d.disk_total_gb, diskFree: d.disk_free_gb, posture: d.resource_posture as 'ample' | 'tight' | 'critical' | 'unknown' | undefined, availableGb: d.resource_available_gb as number | undefined, subagentCap: d.subagent_cap as number | undefined })), refetchInterval: metricsOpen ? 30_000 : 60_000, enabled: true })
+  const { data: sysMetrics, isError: sysMetricsError, dataUpdatedAt: sysMetricsUpdatedAt } = useQuery({ queryKey: ['system-metrics'], queryFn: () => api.system().then((d): SysMetricsFrame => ({ memUsed: d.mem_used_gb, memTotal: d.mem_total_gb, cpuPct: d.cpu_pct, diskTotal: d.disk_total_gb, diskFree: d.disk_free_gb, posture: d.resource_posture as 'ample' | 'tight' | 'critical' | 'unknown' | undefined, availableGb: d.resource_available_gb as number | undefined, subagentCap: d.subagent_cap as number | undefined })), refetchInterval: metricsOpen ? 30_000 : 60_000, enabled: true })
   // Tick every 10s while widget is open so `sysMetricsStale` re-evaluates even when the query stops refetching (backgrounded tab, network drop).
   const [, setStaleTick] = useState(0)
   useEffect(() => {
@@ -1659,31 +1745,72 @@ export default function App() {
     }
   }, [])
 
+  // The Provider's store, for reads inside async callbacks (requestFeature):
+  // the module-level singleton would bypass a test-injected store.
+  const appStore = useAppStore()
   const requestFeature = useCallback(async () => {
-    // Resolve skill availability in the dashboard so the agent never needs
-    // to probe the filesystem (which would trigger a tool-approval prompt).
-    let msg = FEATURE_REQUEST_PROMPT_FALLBACK
-    try {
-      const skills: { name: string }[] = await api.skills()
-      if (skills.some(s => s.name === 'feature-request')) {
-        msg = FEATURE_REQUEST_PROMPT_WITH_SKILL
-      }
-    } catch { /* skill list unavailable — use the self-contained fallback */ }
     const result = await dispatch(createSlot(undefined)).unwrap()
     const slot = result.key
+    const visibleMessage = i18nT('app.i_d_like_to_request_a_feature')
     navigate('/chat')
-    dispatch(appendMessage({ role: 'user', content: i18nT('app.i_d_like_to_request_a_feature'), cls: '', ts: new Date().toISOString() }))
-    dispatch(setSlotRunning(true))
+    // Both optimistic writes are addressed to the slot this flow CREATED, not
+    // the active one: createSlot.fulfilled has a switched-away guard, so when
+    // the user changes session while the create round-trip is in flight the
+    // new slot is registered but never activated — an active-slot append would
+    // put the bubble in an unrelated session's transcript, and an
+    // unconditional running flag would mark that session busy for a turn it
+    // never started (review finding on #4198).
+    dispatch(appendSlotMessage({ slot, message: { role: 'user', content: visibleMessage, cls: '', ts: new Date().toISOString() } }))
+    if (appStore.getState().chat.activeSlot === slot) dispatch(setSlotRunning(true))
+    // A send the server never accepted has to say so where the request landed
+    // (#4198): an HTTP 4xx/5xx RESOLVES rather than rejecting, so the catch
+    // alone never saw the errors that matter — a refused send left the
+    // optimistic bubble on screen next to a slot stuck `running`, with nothing
+    // said. The error row is addressed to the slot that OWNS the bubble, not
+    // the active one (the user can switch sessions while the POST is in
+    // flight); the optimistic `running` is undone only while that slot is
+    // still on screen, because `slotRunning` describes the ACTIVE slot and
+    // clearing it after a switch would clobber another session's live
+    // indicator (a stale flag on this slot self-heals from the server snapshot
+    // on the next switch-back). The payload is a canned constant, so unlike
+    // the chat composers there is no typed text to hand back — the retry
+    // affordance is the feedback pill itself.
+    const reportFailedSend = (reason?: string) => {
+      // FRAMED, not bare: a raw backend reason ("slot agent mismatch") reads
+      // as the agent erroring mid-work, not as "your request never went out".
+      // Both keys are core-owned siblings, so an app's catalog cannot reword a
+      // core error row.
+      dispatch(appendSlotMessage({
+        slot,
+        message: {
+          role: 'error',
+          content: reason ? i18nT('pages.chatPage.send_failed_with_error', { error: reason }) : i18nT('pages.chatPage.send_failed'),
+          cls: '',
+        },
+      }))
+      if (appStore.getState().chat.activeSlot === slot) dispatch(setSlotRunning(false))
+    }
     try {
-      await api.sendChat(msg, slot, colorTheme)
-    } catch { /* WS will handle response */ }
-  }, [dispatch, navigate, colorTheme])
+      // maxAge bounds the seed's lifetime: if the visible send below fails,
+      // the queued instructions expire server-side (drain_pending_context
+      // discards expired entries) instead of silently attaching the
+      // feature-request workflow to a later, unrelated message.
+      await api.chatSlotContext(slot, FEATURE_REQUEST_PROMPT_FALLBACK, { source: 'feature-request', maxAge: 60 })
+    } catch { /* Send the visible request even if hidden context is unavailable. */ }
+    try {
+      const r = await api.sendChat(visibleMessage, slot, colorTheme)
+      const body = await r.json().catch(() => ({}))
+      // Resolution is not success: the server accepted neither `ok` nor
+      // `queued`, so no turn started and no WS response is coming.
+      if (!body.ok && !body.queued) reportFailedSend(typeof body.error === 'string' ? body.error : undefined)
+    } catch { reportFailedSend() }
+  }, [dispatch, navigate, colorTheme, appStore])
 
   const toggleNav = () => {
     if (isMobile) { setMobileNavOpen(p => !p) }
     else {
-      // The user has taken ownership of the rail: leaving preview focus mode
-      // must not overwrite this with the pre-focus state.
+      // The user has taken ownership of the rail: leaving preview expand mode
+      // must not overwrite this with the pre-expand state.
       navAutoCollapsed.current = null
       setNavCollapsed(prev => { const next = !prev; safeSetItem('mc-nav', next ? '1' : '0'); return next })
     }
@@ -1814,13 +1941,24 @@ export default function App() {
 
       {/* Topbar */}
       {/* stable theming hook — see website/docs/theming-contract.md */}
-      <header className="topbar topbar-glass relative pl-3 pr-3 z-[45]" style={{ gridArea: 'topbar' }}>
+      <header className="topbar topbar-glass relative pl-2 pr-3 z-[45]" style={{ gridArea: 'topbar' }}>
         {/* Left: mobile menu toggle + inline instance selector. The brand now
             lives in the sidebar (item 1.1). The selector reuses InstanceTabBar's
             visibility rule — it renders nothing unless >=1 remote instance
             exists, so the common single-instance header-left is empty (only the
             macOS traffic-light clearance remains). */}
-        <div className={`tb-left relative h-full ${isMobile ? 'px-2' : ''}`}>
+        {/* No mobile-only `px-2` here on purpose. The icon buttons inside carry
+            their own 8px, so this padding stacked on top of the header's `pl-2`
+            and pushed the hamburger out past the page's own left edge. Dropping
+            it lands the button's BOX at 8 + 8 = 16px, the page gutter; the glyph
+            inside it then needs its own 2.5px correction because `Menu`'s artwork
+            does not fill its box (see the button below). Box and glyph together
+            put the hamburger, the page title and the chat session-list toggle on
+            one line. Deliberately only the LEFT cluster:
+            `.tb-right` carries a padding/negative-margin pair that keeps the
+            notification badge's 4px overhang from being clipped, and re-tuning
+            that needs a real WebKit check, not a local one. */}
+        <div className="tb-left relative h-full">
           {/* Windows only: the application menu shares this cluster. It needs no
               width reservation of its own: the identity group is sized by its own
               grid track, and the menu growing from the hamburger to its six
@@ -1830,41 +1968,85 @@ export default function App() {
 
           {isMobile && (
             <button className="p-2 rounded-md bg-transparent border-none cursor-pointer text-muted hover:text-text shrink-0" onClick={toggleNav} aria-label={i18nT('app.open_menu')}>
-              <Menu size={20} />
+              {/* `Menu` is the one icon in this app whose artwork does NOT fill its
+                  box: lucide draws its three rules from x=4 in a 24-unit viewBox, and
+                  the round cap adds half a stroke, so 3 units of the box are empty on
+                  the left. At size 20 that is 3 * 20/24 = 2.5px, which put the visible
+                  glyph at 18.5px while the button's box sat correctly on the 16px
+                  gutter -- reading as indented against a card border directly below it.
+                  A transform, not a margin: the box, the hit target and the hover pill
+                  stay on the 8px grid, and no sibling in the cluster shifts. Sized off
+                  the icon's own geometry, which `narrowFirstBaseline.test.ts` re-derives
+                  from lucide so a version bump that recentres `Menu` fails loudly.
+                  Icons that DO fill their box need none of this: the chat session
+                  toggle's `MessageSquare` starts at x=2, i.e. 0.67px at size 16. */}
+              <Menu size={20} className="-translate-x-[2.5px]" />
             </button>
           )}
-          {!isMobile && <InstanceTabBar variant="inline" />}
+          <InstanceTabBar variant="inline" />
         </div>
         {/* Centre track: the ⌘K trigger. A flow item, not an overlay — its width
             is the track's width, so it can never sit under a sibling cluster and
-            never has to be dropped to stay clear of one. On mobile the centre
-            track holds nothing and the trigger moves into the actions group. */}
+            never has to be dropped to stay clear of one. On mobile the same
+            track holds the icon-only form below. */}
         {!isMobile && (
           <button
             type="button"
             data-topbar-overlay
             onClick={commandPalette.openPalette}
             className="h-7 w-full px-3 rounded-md border border-border bg-card text-muted hover:text-text hover:border-border-hover transition-colors flex items-center justify-center gap-2 cursor-pointer shadow-none"
-            aria-label={i18nT('app.search_sessions_files_and_commands')}
-            title={i18nT('app.search_everywhere_k')}
+            /* The trigger has to describe the surface it actually opens. While an app
+               owns the quick-search slot the gesture opens a launcher -- typing runs
+               commands and does not search the corpora this label promises -- so
+               naming "search for anything" there is the most visible mispromise in
+               the product. */
+            aria-label={
+              slotOwners['quick-search']
+                ? i18nT('app.open_command_bar')
+                : i18nT('app.search_sessions_files_and_commands')
+            }
+            // Gated on the same condition as the label and aria-label above. Leaving
+            // this one unconditional made the hover contradict the words under the
+            // cursor and promise the corpus search the launcher deliberately omits --
+            // the diff's own fix applied to two of three attributes. The owned branch
+            // drops "(K)" because the chord is already printed in the visible label.
+            title={
+              slotOwners['quick-search']
+                ? i18nT('app.open_command_bar')
+                : i18nT('app.search_everywhere_k')
+            }
           >
-            <span className="text-[13px] truncate min-w-0">{i18nT('app.k_search_for_anything')}</span>
+            <span className="text-[13px] truncate min-w-0">
+              {slotOwners['quick-search']
+                ? i18nT('app.k_run_a_command')
+                : i18nT('app.k_search_for_anything')}
+            </span>
           </button>
         )}
-        {/* Mobile centre track: the same trigger in its icon-only form. A grid
-            child of its own, not a third sibling inside the actions group --
-            three action controls in one horizontal row is what
-            website/AUTOSDE.yaml's max-two-buttons-per-row forbids. */}
+        {/* Mobile centre track: the same trigger in its icon-only form, in the
+            same window-centred track the desktop one uses, so the control does
+            not change place at the breakpoint. A grid child of its own, not a
+            third sibling inside the actions group -- three action controls in one
+            horizontal row is what website/AUTOSDE.yaml's max-two-buttons-per-row
+            forbids. */}
         {isMobile && (
           <button
             type="button"
             onClick={commandPalette.openPalette}
             className="h-7 w-7 rounded-md border border-border bg-card text-muted flex items-center justify-center cursor-pointer shrink-0"
-            aria-label={i18nT('app.search_sessions_files_and_commands')}
+            aria-label={
+              slotOwners['quick-search']
+                ? i18nT('app.open_command_bar')
+                : i18nT('app.search_sessions_files_and_commands')
+            }
             // Not the "(⌘K)" title the desktop trigger carries: this form only
             // renders below 768px, where advertising a chord to a touch surface
             // names a gesture the device may have no way to produce.
-            title={i18nT('app.search_sessions_files_and_commands')}
+            title={
+              slotOwners['quick-search']
+                ? i18nT('app.open_command_bar')
+                : i18nT('app.search_sessions_files_and_commands')
+            }
           >
             <SearchIcon size={14} />
           </button>
@@ -1952,13 +2134,15 @@ export default function App() {
               } else if (!sysMetrics) {
                 if (sysMetricsError) segments.push(<button key="metrics" className={`${seg} text-danger text-[11px]`} title={i18nT('app.click_to_hide')} onClick={() => { setMetricsOpen(false); safeSetItem('mc-topbar-metrics', '0') }}><AudioWaveform size={11} /> {i18nT('app.metrics_unavailable')}</button>)
               } else {
-                const m = sysMetrics
-                const memPct = m.memTotal > 0 ? m.memUsed / m.memTotal : 0
+                // Validity is decided on the RAW frame; formatting happens on a
+                // sanitized copy. A `memTotal > 0` check says nothing about
+                // `memUsed`, and a frame carrying a total with no used is normal
+                // (see SysMetricsFrame) — that mismatch is what crashed the root
+                // app-shell boundary with `undefined.toFixed(1)`.
+                const { cpuValid, memValid, dskValid, m } = readMetricsFrame(sysMetrics)
+                const memPct = memValid ? m.memUsed / m.memTotal : 0
                 const dskUsed = m.diskTotal - m.diskFree
-                const dskPct = m.diskTotal > 0 ? dskUsed / m.diskTotal : 0
-                const memValid = m.memTotal > 0
-                const dskValid = m.diskTotal > 0
-                const cpuValid = typeof m.cpuPct === 'number' && Number.isFinite(m.cpuPct)
+                const dskPct = dskValid ? dskUsed / m.diskTotal : 0
                 const staleTitle = sysMetricsStale ? ` ${i18nT('app.stale_fetch_failing')}` : ''
                 // The container query can collapse this button to a bare icon, and
                 // the per-value tooltips ride on the spans it hides — so the
@@ -1998,23 +2182,50 @@ export default function App() {
                 </button>)
               }
             }
+            // Mobile: show metrics as a passive readout (not a button) when the
+            // capsule is expanded and data is available. No independent toggle —
+            // visibility is tied to the capsule expand/collapse state.
+            if (isMobile && sysMetrics) {
+              // Same derivation as the desktop readout, from the one helper, so
+              // the two cannot disagree about what a partial frame means.
+              const { cpuValid, memValid, dskValid, m } = readMetricsFrame(sysMetrics)
+              const memPct = memValid ? m.memUsed / m.memTotal : 0
+              const dskUsed = m.diskTotal - m.diskFree
+              const dskPct = dskValid ? dskUsed / m.diskTotal : 0
+              segments.push(<span key="metrics-mobile" className={`${seg} gap-2 text-[11px] font-mono tabular-nums`} aria-label={i18nT('app.system_metrics')}>
+                <span className={cpuValid ? metricColor(m.cpuPct / 100) : 'text-muted'}>{i18nT('app.cpu')} {cpuValid ? fmtPercent(m.cpuPct / 100) : '\u2014'}</span>
+                <span className={memValid ? metricColor(memPct) : 'text-muted'}>{i18nT('app.mem')} {memValid ? fmtPercent(memPct) : '\u2014'}</span>
+                <span className={dskValid ? metricColor(dskPct) : 'text-muted'}>{i18nT('app.dsk')} {dskValid ? fmtPercent(dskPct) : '\u2014'}</span>
+              </span>)
+            }
             // Usage segment — Kiro credit plan from KiroCrew's own usage
-            // cache. Spinner while the cache warms; hidden when unavailable.
-            if (kiroUsage !== 'none') {
-              if (!kiroUsage) {
+            // cache. Spinner while the cache warms, a dash when the fetch
+            // failed, hidden when the provider has no credit plan at all.
+            if (kiroUsageState !== 'none') {
+              if (kiroUsageState === 'failed') {
+                // Failed with nothing cached to fall back on. A dash says that;
+                // a spinner would claim a fetch is still in flight. A failure
+                // that arrives while a prior value is held keeps that value —
+                // the payload's own `stale` flag dims it instead.
+                //
+                // The dash renders on mobile too, where the reading and the
+                // spinner are both dropped: without it the failed and warming
+                // states are one coin glyph apart in opacity alone.
+                segments.push(<button key="usage" className={`${seg} text-muted opacity-60`} onClick={() => setKiroUsageOpen(true)} title={i18nT('app.kiro_credit_usage_unavailable')} aria-label={i18nT('app.kiro_credit_usage_unavailable')}><Coins size={12} /> <span className="font-mono text-[11px] tabular-nums">—</span></button>)
+              } else if (!kiroUsageState) {
                 segments.push(<button key="usage" className={`${seg} text-muted`} onClick={() => setKiroUsageOpen(true)} title={i18nT('app.kiro_credit_usage_checking')} aria-label={i18nT('app.kiro_credit_usage_checking_2')}><Coins size={12} /> {!isMobile && <Loader2 size={11} className="animate-spin" />}</button>)
               } else {
                 // Pool every bonus grant into the compact readout. Bonus is
                 // drawn down before the plan, so excluding it looks like a
                 // frozen counter while promotional credits are active.
-                const bonusUsed = kiroUsage.bonusCredits.reduce((sum, grant) => sum + grant.used, 0)
-                const bonusLimit = kiroUsage.bonusCredits.reduce((sum, grant) => sum + grant.total, 0)
-                const totalUsed = kiroUsage.used + bonusUsed
-                const totalLimit = kiroUsage.limit + bonusLimit
+                const bonusUsed = kiroUsageState.bonusCredits.reduce((sum, grant) => sum + grant.used, 0)
+                const bonusLimit = kiroUsageState.bonusCredits.reduce((sum, grant) => sum + grant.total, 0)
+                const totalUsed = kiroUsageState.used + bonusUsed
+                const totalLimit = kiroUsageState.limit + bonusLimit
                 const usedStr = fmtCompact(totalUsed)
                 const limitStr = fmtCompact(totalLimit)
                 const title = i18nT('components.kiroAccountModal.kiro_credit_usage')
-                segments.push(<button key="usage" className={kiroUsage.stale ? `${seg} opacity-60` : seg} onClick={() => setKiroUsageOpen(true)} title={title} aria-label={title}>
+                segments.push(<button key="usage" className={kiroUsageState.stale ? `${seg} opacity-60` : seg} onClick={() => setKiroUsageOpen(true)} title={title} aria-label={title}>
                   <Coins size={12} /> {!isMobile && <span className="tb-drop-usage font-mono text-[11px] whitespace-nowrap tabular-nums">{usedStr}<span className="text-muted">/{limitStr}</span></span>}
                 </button>)
               }
@@ -2595,13 +2806,20 @@ export default function App() {
         return isMobile ? (
           <AnimatePresence>
             {mobileNavOpen && (
+              /* mt-2, unlike the desktop rail's mt-0: this form is `fixed` to the
+                 VIEWPORT top rather than sitting in the grid row below the
+                 topbar, so mt-0 pressed the card's rounded top edge flat against
+                 the screen while mx-2/mb-2 inset the other three sides. Matching
+                 the 8px inset on all four keeps the drawer reading as one
+                 floating card. `top-0 bottom-0` with both margins resolves the
+                 height to viewport-16px, so nothing is clipped. */
               <motion.nav
                 key="mobile-nav-drawer"
                 initial={{ x: -240 }}
                 animate={{ width: 220, x: 0 }}
                 exit={{ x: -240 }}
                 transition={{ duration: 0.25, ease: [0.32, 0.72, 0, 1] }}
-                className="bg-bg-elevated border border-border rounded-xl flex flex-col mx-2 mt-0 mb-2 shadow-sm z-50 overflow-hidden fixed top-0 left-0 bottom-0"
+                className="bg-bg-elevated border border-border rounded-xl flex flex-col mx-2 mt-2 mb-2 shadow-sm z-50 overflow-hidden fixed top-0 left-0 bottom-0"
                 role="navigation"
                 aria-label={i18nT('app.main_navigation')}
               >
@@ -2685,8 +2903,9 @@ export default function App() {
     )}
     </WsContext.Provider>
     {shortcutsOpen && <ShortcutsModal onClose={() => setShortcutsOpen(false)} />}
-    <KiroAccountModal open={kiroUsageOpen} onClose={() => setKiroUsageOpen(false)} usage={kiroUsage ?? null} />
-    <CommandPalette
+    <KiroAccountModal open={kiroUsageOpen} onClose={() => setKiroUsageOpen(false)} usage={kiroUsageState} />
+    <QuickSearchSurface
+      owners={slotOwners}
       open={commandPalette.open}
       onClose={commandPalette.close}
       openShortcuts={toggleShortcutsModal}

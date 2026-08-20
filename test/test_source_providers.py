@@ -705,6 +705,39 @@ async def test_run_json_refuses_provider_cli_on_windows(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_run_json_resolves_the_provider_cli_off_the_event_loop(monkeypatch) -> None:
+    """Resolution stats every candidate and the whole parent chain of each hit,
+    and the sidebar chip refresh reaches it on a timer with no user present. On
+    the loop thread a slow filesystem freezes every task until the loop watchdog
+    kills the gateway, so the walk has to happen on a worker thread."""
+
+    class FakeProcess:
+        returncode = 0
+
+    resolver_threads: list[int] = []
+
+    def recording_resolver(_name: str) -> str:
+        resolver_threads.append(threading.get_ident())
+        return "/usr/bin/gh"
+
+    monkeypatch.setattr(source, "_resolve_provider_executable", recording_resolver)
+    monkeypatch.setattr(
+        source,
+        "sandboxed_spawn_argv",
+        lambda argv, **kwargs: (argv, kwargs["env"], None),
+    )
+    monkeypatch.setattr(
+        source.asyncio, "create_subprocess_exec", AsyncMock(return_value=FakeProcess())
+    )
+    monkeypatch.setattr(source, "_collect_process_output", AsyncMock(return_value=(b"{}", b"")))
+
+    assert await source._run_json("gh", "api", "repos/acme/repo") == {}
+
+    assert len(resolver_threads) == 1
+    assert resolver_threads[0] != threading.get_ident()
+
+
+@pytest.mark.asyncio
 async def test_run_json_sandboxes_with_minimal_provider_environment(monkeypatch) -> None:
     class FakeProcess:
         returncode = 0
@@ -832,11 +865,16 @@ async def test_run_json_awaits_critical_audit_off_loop_before_spawn(
     order: list[str] = []
 
     async def fake_to_thread(func, *args, **kwargs):
+        # Only the audit offload is under test; every other offload on this path
+        # (executable resolution) has to pass through with its real result.
+        if func is not source._audit_provider_cli:
+            return func(*args, **kwargs)
         order.append("audit-started")
         audit_started.set()
         await release_audit.wait()
-        func(*args, **kwargs)
+        result = func(*args, **kwargs)
         order.append("audit-completed")
+        return result
 
     class FakeProcess:
         returncode = 0
@@ -7290,6 +7328,9 @@ class TestGetJiraAuth:
             def load(cls):
                 return cls()
 
+            def load_credentials(self):
+                return {}
+
         monkeypatch.setattr(source, "KiroCrewConfig", FakeConfig)
         assert source._get_jira_auth("acme.atlassian.net") is None
 
@@ -7336,6 +7377,46 @@ class TestGetJiraAuth:
         monkeypatch.setattr(source, "KiroCrewConfig", FakeConfig)
         result = source._get_jira_auth("jira.internal")
         assert result == ("", "pat-token")
+
+    def test_raises_value_error_on_config_load_failure(self, monkeypatch):
+        """Config errors propagate as ValueError, not silent None."""
+
+        class BrokenConfig:
+            @classmethod
+            def load(cls):
+                raise RuntimeError("corrupt config.json")
+
+        monkeypatch.setattr(source, "KiroCrewConfig", BrokenConfig)
+        with pytest.raises(ValueError, match="jira_config_error"):
+            source._get_jira_auth("acme.atlassian.net")
+
+    def test_per_host_token_takes_precedence(self, monkeypatch):
+        """JIRA_TOKEN_<hex> is preferred over global JIRA_API_TOKEN."""
+
+        class FakeEntry:
+            host = "acme.atlassian.net"
+            email = "dev@acme.com"
+
+        class FakeDashboard:
+            jira_auth = [FakeEntry()]
+
+        class FakeConfig:
+            dashboard = FakeDashboard()
+
+            @classmethod
+            def load(cls):
+                return cls()
+
+            def load_credentials(self):
+                host_key = "acme.atlassian.net".encode().hex().upper()
+                return {
+                    "JIRA_API_TOKEN": "global-fallback",
+                    f"JIRA_TOKEN_{host_key}": "per-host-secret",
+                }
+
+        monkeypatch.setattr(source, "KiroCrewConfig", FakeConfig)
+        result = source._get_jira_auth("acme.atlassian.net")
+        assert result == ("dev@acme.com", "per-host-secret")
 
 
 class TestJiraIsCloud:

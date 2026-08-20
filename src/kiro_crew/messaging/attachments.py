@@ -46,6 +46,7 @@ from dataclasses import dataclass, field
 
 from kiro_crew import transcribe
 from kiro_crew.doc_parser import extract_text, is_parseable_document
+from kiro_crew.messaging.raster import SNIFF_BYTES, sniff_raster_mime
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
 
@@ -68,17 +69,6 @@ IMAGE_MIMETYPES = {
     "image/gif",
     "image/webp",
     "image/bmp",
-}
-
-#: Leading bytes per image type. Metadata and filenames are attacker-controlled;
-#: bytes are not. A claimed PNG that does not start with the PNG signature is
-#: rejected rather than handed to the model (CWE-434).
-_MAGIC: dict[str, tuple[bytes, ...]] = {
-    "image/png": (b"\x89PNG\r\n\x1a\n",),
-    "image/jpeg": (b"\xff\xd8\xff",),
-    "image/gif": (b"GIF87a", b"GIF89a"),
-    "image/webp": (b"RIFF",),  # RIFF....WEBP
-    "image/bmp": (b"BM",),
 }
 
 _TEXT_PREFIXES = ("text/",)
@@ -163,9 +153,7 @@ def classify(mimetype: str, name: str = "", audio_mimetypes: tuple[str, ...] = (
     mt = (mimetype or "").lower()
     if mt in IMAGE_MIMETYPES:
         return IMAGE
-    if any(mt.startswith(p) for p in audio_mimetypes):
-        return AUDIO
-    if any(mt.startswith(p) for p in _AUDIO_PREFIXES):
+    if any(mt.startswith(p) for p in (*audio_mimetypes, *_AUDIO_PREFIXES)):
         return AUDIO
     if any(mt.startswith(p) for p in _VIDEO_PREFIXES):
         return VIDEO
@@ -191,17 +179,10 @@ def sniff_image_mime(path: str) -> str | None:
     """
     try:
         with open(path, "rb") as fh:
-            head = fh.read(16)
+            head = fh.read(SNIFF_BYTES)
     except OSError:
         return None
-    for mime, prefixes in _MAGIC.items():
-        if any(head.startswith(p) for p in prefixes):
-            # WebP and other RIFF containers share the "RIFF" prefix; confirm the
-            # form tag so a RIFF/WAVE file is not mistaken for an image.
-            if mime == "image/webp" and head[8:12] != b"WEBP":
-                continue
-            return mime
-    return None
+    return sniff_raster_mime(head)
 
 
 #: Canonical suffix per image mimetype, so a downloaded file is renamed to match
@@ -497,7 +478,7 @@ async def transcribe_audio_attachments(result: IngestResult, source: str) -> Ing
 
     Lives here rather than in each channel adapter so the transcript wording and
     the STT-unavailable handling cannot drift between channels — Discord and
-    Telegram previously carried byte-identical copies of this block.
+    Telegram would otherwise each carry a byte-identical copy of this block.
 
     ``source`` names the channel for log lines only; it does not change behaviour.
     """

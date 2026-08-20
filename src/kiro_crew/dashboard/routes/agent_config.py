@@ -66,6 +66,8 @@ def register(app: web.Application) -> None:
     app.router.add_put("/api/mcp/custom/{name}", api_mcp_custom_update)
     app.router.add_post("/api/mcp/probe", handlers.api_mcp_probe)
     app.router.add_get("/api/mcp/probe", handlers.api_mcp_probe_cached)
+    app.router.add_post("/api/mcp/measure", handlers.api_mcp_measure_start)
+    app.router.add_get("/api/mcp/measure", handlers.api_mcp_measure_progress)
     app.router.add_post("/api/mcp/sync", handlers.api_mcp_sync)
     app.router.add_post("/api/mcp/apply", handlers.api_mcp_apply)
     app.router.add_post("/api/mcp/toggle", handlers.api_mcp_toggle)
@@ -87,6 +89,7 @@ def register(app: web.Application) -> None:
     app.router.add_post(
         "/api/mcp-gateway/servers/poolable", handlers.api_mcp_gateway_set_poolable
     )
+    app.router.add_post("/api/mcp-gateway/resolve-refresh", handlers.api_mcp_resolve_refresh)
     # AIM integration
     app.router.add_get("/api/capability/mcp", handlers.api_capability_mcp_list)
     app.router.add_post("/api/capability/mcp/install", handlers.api_capability_mcp_install)

@@ -4,6 +4,353 @@ All notable changes to KiroCrew are documented in this file.
 
 ## [0.2.0-customapi.5] — 2026-08-08 — Vision
 
+- **MCP servers can now be measured for shareability on purpose, and the answer
+  survives until the server itself changes.** The Sharing assessment could only
+  say as much as the number of servers carrying a measurement, and reaching one
+  was neither deliberate nor durable: the only trigger was an icon-only refresh
+  that evaluated two servers per press, so a fleet of thirty needed fifteen
+  presses and a guess about what the icon did. MCP Management now carries a
+  labelled action that names how much is left ("Measure 2 unmeasured servers")
+  and runs the whole set as a background pass with progress, while the
+  per-request budget of two stays exactly where it was. Two gaps in the
+  measurement itself are closed at the same time. The pre-flight already spawned
+  each server twice under two client identities, but compared only the
+  `initialize` capabilities, so a server that served a different TOOL SET per
+  caller passed; it now compares the tool list too, which costs no extra spawn
+  because the probe already fetched it and is the one facet decidable on a server
+  too old to send tool annotations at all. Which facet diverged is logged for
+  diagnosis but not reported per-row: every consumer of a stored measurement
+  reduces it to one boolean, so naming the facet to an operator is a change to
+  that whole path rather than to the prober. And a stored verdict now records the
+  version the server reported, so a runtime-resolved launch (`npx thing@latest`)
+  that swaps its own code upstream is re-measured instead of trusted -- the
+  launch fingerprint cannot see that, since command, environment and interpreter
+  all stay byte-identical.
+
+- **Switching Kiro accounts mid-session no longer leaves the chat showing a raw
+  `The bearer token included in the request is invalid.` with no way out.** A
+  `kiro-cli` child holds its credential for the life of the session, so an
+  external account switch invalidates it underneath a running session. That
+  rejection carries no status code and never uses expiry wording, so it matched
+  none of the auth classifiers: it reached the user as the raw upstream string
+  with no sign-in affordance, and counted as a retryable backend fault that
+  spent the whole retry ladder on a credential no retry can revive. A rejected
+  credential is now classified alongside session expiry — terminal, and carrying
+  the existing actionable "run `kiro-cli login`, then start a new chat"
+  guidance. (#3393)
+
+- **Issue Radar's AI summaries now follow the dashboard language.** The issue
+  triage summary, the PR summary, and the label-taxonomy recommendation always
+  produced English prose regardless of `dashboard.language`, making the AI card
+  the one unlocalized surface in an otherwise localized UI. When a dashboard
+  language is configured, each one-shot prompt now carries an output-language
+  directive for its prose (summary, per-label `reason`, recommendation
+  `rationale`) while label names — and a recommendation's `name`/`description`,
+  which become repo content on GitHub — stay untranslated. Caches regenerate on
+  a language switch instead of serving the old language: the PR-summary cache
+  folds the tag into its fingerprint, and the issue-AI cache stores the tag
+  beside the payload and treats a mismatch as a miss (recommendations remain
+  regenerate-only via their explicit button). Installs with no configured
+  language send byte-identical prompts and keep their cached digests. (#4290)
+
+- **xlsx files now render inline in the file viewer** instead of a
+  download-only card. A new `GET /api/file-sheet` endpoint parses OOXML
+  workbooks server-side with openpyxl (read-only, worker thread, ZIP
+  magic-byte check, 500x100 per-sheet cap with explicit truncation flags) and
+  the new `SheetViewer` renders sheet tabs, a column-letter header, and a
+  row-number gutter. Formula cells with no cached value — the shape of every
+  agent-generated workbook — show the formula source rather than an empty
+  cell. Legacy `.xls` and ODF formats keep the download card, and any parse
+  failure degrades to it. (#3865)
+
+- **A session that times out on startup now names the MCP server it was waiting
+  for.** Every cause of a stalled session start reported the same sentence,
+  `Request session/new timed out`, which named none of them: a slow MCP fleet, a
+  single unreachable remote server, a pending authorization, and an expired
+  credential were indistinguishable. The runtime already held both halves of the
+  answer at that moment and threw them away. It sends the server roster in the
+  request's own `mcpServers` array, and the reader loop stages every
+  `server_initialized` / `server_init_failure` / `oauth_request` frame that
+  arrives before the response, each carrying its server's name. A session-start
+  timeout now reads both and reports the difference, so the error says how many
+  servers reported out of how many were expected, which ones never reported,
+  which failed and why, and which are waiting on authorization. `session/load`
+  shares the budget and the staging, so it gets the same report. A failed
+  server's error text takes the same redaction the dashboard banner applies,
+  because a server's startup error can carry its own connection string, and each
+  listed name is redacted, collapsed onto one line and length-capped as well --
+  a name is config-derived, so an installed app chooses it, and an embedded
+  newline would otherwise forge a line in the gateway log while an unbounded one
+  would defeat the cap on how many names are listed. The reported count is taken
+  against the roster rather than against every staged frame, since the agent
+  spec's own servers report too and counting them produced impossible readings
+  like "2/1 reported". Timeouts now raise a dedicated `AcpRequestTimeout`, a subclass of
+  `AcpRuntimeError`, so a stall is distinguishable from a protocol fault without
+  changing what existing handlers catch. Startup telemetry also stops losing the
+  starts that failed: the `session_new` phase duration is recorded in a `finally`
+  like `session_load` already was, instead of only on success.
+
+- **Subagent rows in System → Sessions now report their process and MCP-stub
+  counts.** Both columns rendered an em dash on every task row, which read as
+  "a subagent carries no MCP stubs" — the opposite of the truth: a subagent
+  session spawns its own poolable stub set and reaches the shared backends
+  through the same gateway daemon a top-level session does (measured on a live
+  host: 18 `--poolable` stubs under one shared runtime, none of them falling
+  back to a private spawn). The reason was structural, not cosmetic: nothing
+  ever counted them. `task_memory_rows()` carried no `procs`/`mcp` fields at
+  all, and the reaper sweep that samples a task's RSS and CPU took no such
+  reading, so the frontend hardcoded both to null. The sweep now counts the
+  run's subtree in the same pass (one walk, no extra syscalls per column) and
+  attributes the counts the way RSS and CPU are already attributed — split
+  across the co-tenants of a shared runtime — with two rules a count needs and
+  a byte figure does not: the quotient rounds to a whole process, and a nonzero
+  total never rounds down to zero. Unmeasured stays null rather than becoming
+  "0", so an unsampled task still reads as an em dash instead of claiming to be
+  empty. The stub cmdline fingerprint is now one constant shared by the
+  rewriter that emits the launch line and both counters that match it, pinned
+  by a test: a private copy that drifted would not fail loudly, it would report
+  zero stubs.
+
+- **The subagent cost sweep no longer runs on the gateway event loop.**
+  ``_sample_live_costs`` walks ``/proc`` several times per live agent, and the
+  reaper called it inline, so every chat turn and heartbeat waited behind those
+  walks. It now runs on the maintenance executor. The body was made
+  thread-safe to go with it: the agent registry is snapshotted once and the
+  sharer count is derived from that snapshot, because iterating the live
+  registry from a worker thread raises ``RuntimeError`` the moment a spawn or
+  eviction lands mid-sweep.
+
+- **A delivered message no longer warns that it may not have been delivered.**
+  Every message typed in the dashboard composer grew a "Message not confirmed —
+  may not have been delivered" warning 30 seconds after it was sent, for the rest
+  of the turn, while the agent was visibly answering it. The indicator's
+  "delivered" signal was a `chat_message` echo of the user row — but that echo is
+  suppressed for dashboard sends by design (`DashboardState.append` defaults
+  `broadcast_user=False` precisely BECAUSE the composer already rendered the
+  bubble; only a row replayed from a channel transcript opts in). So the
+  pending-confirmation flag survived every composer send, the 30s sweep flagged
+  all of them, and the flag cleared only as a side effect of the end-of-turn
+  transcript refresh. Both composer surfaces now confirm from the send's own HTTP
+  response, which is the actual delivery receipt: an accepted immediate dispatch
+  retires the pending state and keeps the correlation id so a later echo still
+  reconciles in place instead of pushing a duplicate bubble. A `queued`
+  acceptance is deliberately NOT a receipt for that bubble -- the busy branch
+  queues only a non-empty message yet answers `{ok, queued}` either way, and when
+  it does queue, its own `queue_push` card owns the message, so cancelling it
+  leaves the bubble behind. The genuine failure paths are untouched -- a rejected
+  response, a transport error and the 10s client-side abort all leave the bubble
+  unconfirmed, which is what the indicator exists to say.
+
+- **Video and audio files now play inline in the file viewer.** Opening
+  `.mp4`, `.webm`, `.mp3`, `.wav` and friends previously fell through to the
+  code renderer, which displayed the binary as mojibake. A new
+  `GET /api/file-stream` endpoint serves media with HTTP Range support
+  (seeking needs 206 Partial Content) through the same security envelope as
+  the other file endpoints -- path validation, sensitive-path block,
+  symlink-refusing open, content sniffing so the served bytes decide the
+  type, and bounded chunked reads so memory stays constant regardless of
+  file size. The viewer routes video to an inline `<video>` player and audio
+  to an `<audio>` bar; any playback failure degrades to the download card.
+  (#4021)
+
+- **A succeeded publish no longer renders as a blank error, and a failed
+  re-publish no longer renders as a success.** The Publish panel recognized only
+  the deploy-shaped `{url}` response, so a provider that hands its confirmed
+  publish to `POST /api/artifacts/{slug}/publish` — the supported way to reuse the
+  core's single publish authorization and audit trail rather than growing a second
+  one — got its serialized-artifact response read as "no url", fell through to
+  `{url: ''}` and rendered the ERROR branch with an undefined message: a bare red
+  icon, no text, on a publish that had in fact succeeded (the bytes were pushed
+  and `publication` was persisted). `readPublishOutcome` now reads both shapes and
+  returns an outcome rather than a url: success is signalled by the return shape
+  instead of inferred from a non-empty url (a destination can publish and expose
+  no browsable link), an `error` field wins over anything else in the same body,
+  `publication: null` is not success, and an unrecognized shape is reported as a
+  NAMED error instead of an empty one. The mirror-image lie is fixed too — a 200
+  whose `publication.last_error` is non-empty is now reported as that error rather
+  than as "Published!", because `publish_sync.publish()` treats the version push
+  as best-effort on a re-publish: it persists the failure and returns normally, so
+  the remote content is stale behind a 200. The public-exposure warning and its
+  blocking acknowledgment are unchanged and still unconditional.
+
+- **Every builtin app now starts its content 8px from a phone screen edge, not 24px.**
+  The narrow-first page gutter (`px-2 md:px-6`) reached the core pages and Issue
+  Radar, while the remaining builtin apps kept an unconditional `px-6`, so their
+  content was inset 24px before any card inset stacked on top. Meetings, Code
+  Review Sage, Auto Research, Workflows, Mochi, Papyrus, PPTX Maker and Ops
+  Mission Control now carry the same gutter, converted a whole file at a time so
+  a header and the rows beneath it cannot render on two different left edges.
+  Centered empty states keep their `px-6`, where it is the element's only inset
+  and flushing it would push centered copy toward the edge for no width gain; a
+  guard test states that exclusion so a later pass does not read it as a miss.
+
+- **Destructive buttons look destructive on a phone.** `Btn`'s `danger`
+  variant coloured its label only on `:hover`, and a touch viewport never
+  produces `hover` — so a destructive button rendered identically to the
+  non-destructive buttons beside it. Same class of defect as a hover-revealed
+  control: the affordance existed only under a pointer. Found on the Channels
+  page at 390px, where `Close` (which dismisses every agent in the channel) sat
+  in a wrapped header row beside the frequent `3 agents` and `Clear Context`
+  buttons at identical visual weight. The label is now `text-danger`
+  unconditionally; hover still raises the border and adds a subtle fill, so the
+  pointer affordance is not lost, only made unnecessary for recognising the
+  control. (#3937)
+
+- **A parent agent can read its own sub-agent's result file again on a host
+  whose home is a symlink.** The result path handed back in a completion event
+  was built through `Path.resolve()`, which is correct for the traversal check
+  it exists to serve and wrong for a path somebody is told to go read: on an
+  Amazon cloud desktop, where `/home/<user>` is a symlink to
+  `/local/home/<user>`, that resolved spelling carries a `/local/home/...`
+  prefix the reader's own path allowlist -- keyed on the `$HOME` it was given --
+  does not match. The file was always readable; only the spelling was
+  unrecognized. So the read was refused, and refused as an approval prompt that
+  times out rather than as an error, which made a whole wave of sub-agent
+  results look unreadable while the parent concluded it lacked permission.
+  Paths emitted as TEXT (the completion event, the batch digest, `spawn_status`,
+  the prior-result hint on an unresumable conversation, and `info.result_path`
+  wherever it surfaces) now carry the declared home spelling, while every path
+  used to open a file stays symlink-resolved so the traversal check is unchanged.
+  Validation is delegated to the resolving helper rather than duplicated, so the
+  two cannot drift apart.
+- **Code Review Sage's "Ask the reviewer" no longer dies with the review's
+  session.** The reviewer's reasoning lives in the session that produced the
+  findings, and that session was kept resident only briefly — a 1800s idle TTL,
+  a 6h cap, a 4-session LRU cap, and gateway restart. Worse than "unloaded":
+  retiring it called `handle.destroy()`, which unlinks the kiro-cli transcript
+  unless `keep_transcript` is set, so the reasoning was DELETED and no amount of
+  waiting or re-opening could bring it back. Sage now keeps the transcript and
+  a follow-up RESUMES it as an ordinary chat session (`session/load`), filed in
+  a `Sage Review` folder and titled `followup-pr#<n>-<title>`. Nothing is held
+  resident between the review and the question: asking is the rare case, so a
+  follow-up pays a cold load from disk instead of pinning the shared reviewer
+  subprocess on the chance that someone asks. Because the follow-up is a normal
+  session, its tool use now runs through the dashboard's approval pipeline,
+  which sees real permission requests and can reject BEFORE execution — closing
+  the documented limitation that Sage's own gate was post-hoc for
+  spec-pre-approved tools. A resume that would not restore the review is refused
+  rather than attempted: the dashboard's fallback for a failed resume is to
+  replay Kiro Crew's conversation log, and a follow-up session has none, so a
+  session opened anyway would answer confidently about a review it knows nothing
+  about; the same reason a run that is still going is not offerable, since a
+  second coverage pass can replace the findings a mid-run conversation was
+  opened on. Follow-up offers are retired after two weeks with no activity,
+  measured from the transcript's own mtime so a conversation still in use keeps
+  its offer. Retiring an offer removes only Sage's own descriptor: the one
+  session id available there comes from a file the reviewer can write, so
+  deleting on that authority would let a prompt-injected review name any session
+  on the machine and have this app remove it.
+
+- **A long-running cron job's next tick is no longer dispatched up to 30s
+  late.** A job is invisible to the scheduler's wake computation while it's
+  executing (`_next_wake_secs` skips anything in `self._executing`), so for
+  a job whose run takes most of its interval, the timer's last wake before
+  completion — capped at the 30s poll interval — is what the next dispatch
+  had to wait for, since finishing a job never re-armed the timer. Measured
+  in the field on a 60s-interval job with a ~57s run: 20% of ticks landed
+  ≥20s late, costing roughly double the job's own `interval - duration`
+  idle-time floor. Job completion now re-arms the timer with its real
+  next-due delay. The naive version of this fix is unsafe: a job's
+  completion runs on its own task, not the timer's, so a blind
+  `_arm_timer()` call racing the timer's own in-flight dispatch sweep
+  (`_on_timer`, yielded at its worker-thread scan) would cancel that sweep
+  mid-flight and drop any due jobs not yet spawned for that tick. A job
+  completing in that narrow window now no-ops instead — `_on_timer`'s own
+  tick already unconditionally re-arms once the sweep finishes, by which
+  point the completed job is no longer `_executing`, so the corrected delay
+  still gets picked up, just moments later rather than being computed
+  twice.
+
+- **Reload session: relaunch a session's agent process in place.** A live
+  agent process mounts its MCP servers and builds its tool table once, at
+  session-init time, so config that changes afterwards — a newly added MCP
+  server, an env or agent-spec fix — never reaches an already-open session;
+  the only remedies were restarting the whole gateway or abandoning the
+  conversation for a new chat. The session actions menu now carries a
+  "Reload session" item (disabled while a turn runs) backed by
+  `POST /api/chat/slots/{slot}/reload`: it targets the slot's linked session
+  key, applies the cancel-route app-isolation policy, refuses with 409 while
+  a turn is in flight or sub-agent children are attached, tears the process
+  down through the same chokepoint the agent/workspace switches use, appends
+  a feed notice, and eagerly re-arms the resume spawn, so the relaunched
+  process re-reads its agent spec and environment and re-initializes MCP
+  servers via session/load with the conversation preserved. The busy check
+  is evaluated atomically with the session pop, closing the check-then-reset
+  race, and the notice kind is skipped by the last-real-message scans on
+  both backend and frontend.
+
+- **Removing a worktree in Dev Fleet no longer strands its pod's isolated
+  HOME.** Reclamation was gated on the pod's unit still being ACTIVE, which the
+  ordinary path never is: you stop the pod when testing ends and prune days
+  later once the PR merges. So the delete path that reclaims the HOME was
+  effectively never called, and every removal leaked a full isolated
+  `KIROCREW_HOME` — dominated by a per-instance copy of the embedding model, so
+  ~0.6 GB each — with the directory becoming unattributable the moment the
+  worktree's env pin went away. Removal now reclaims the HOME whether or not the
+  pod is running, using the same `orphan_homes` predicate as `pod ls` / `pod
+  prune` (so symlinks are skipped, and a macOS name mid-`up` is treated as
+  installed rather than orphaned). Attribution and teardown are ONE transaction
+  held under `pod_name_mutex`: pod identities are global basenames, so checking
+  ownership in one process and tearing down in another leaves a window where a
+  concurrent `pod up` from a different checkout claims the same name and the
+  teardown would stop that pod and delete its HOME. Both call sites — the
+  live-unit path and the orphaned-HOME path — go through the one locked helper,
+  which is necessarily in-process: the mutex is held per open-file-description
+  and `stop_pod` re-acquires it, so holding it around a `pod down` shell-out
+  would block the child being waited on. Because the delete needs positive
+  attribution, an ABSENT checkout pin refuses rather than assuming ownership
+  (`pod prune` still reclaims those), and a name handed to a new pod mid-teardown
+  refuses the removal outright, since that pod may be running out of the very
+  worktree about to be deleted.
+  The two outcomes are reported separately (`stopped_pod` vs
+  `reclaimed_pod_home`) rather than conflated into a shutdown that never
+  happened. Liveness checks keep failing CLOSED — they guard against deleting a
+  checkout under a live pod — while a reclamation that cannot run now degrades
+  to a logged leftover instead of refusing the removal, and a provably absent
+  pod backend logs the HOME it is leaving behind at WARNING with the verb that
+  reclaims it, replacing a debug-level line that hid the residue entirely.
+
+- **The one-time config migration no longer leaves a `.json.bak` orphan beside a
+  config path it does not own.** `KiroCrewConfig.load()` copied the
+  pre-migration config to `<path>.bak`, where `<path>` is whatever
+  `config_path()` resolved to -- so every caller that redirects the loader at
+  its own `tempfile` entry (tests and embedders do) silently accumulated one
+  orphan per load, since the caller unlinks the path it created and never learns
+  a sibling appeared. One dev host reached 72,327 such files in `/tmp`, 7% of a
+  tmpfs inode budget whose exhaustion fails every process on the box. The copy
+  is now gated on the config living in `config_dir()`, the one directory whose
+  contents we own; the production backup is unchanged, and a copy that fails
+  still aborts the migration save exactly as before, so a config we could not
+  copy aside is not rewritten either. The name is also built by
+  appending rather than `with_suffix(".json.bak")`, which REPLACED the final
+  suffix and so renamed a non-`*.json` config instead of backing it up.
+
+
+- **A knowledge source that errored during ingestion is no longer re-synced on
+  every sweep.** `KnowledgeIngestion` marks failure in the `sync_status`
+  **column**, but `SyncScheduler.sync_all`'s skip predicate read only the
+  `sync_status` copy inside the properties JSON, which the ingestion path never
+  sets. So an ingestion-errored source (bad credentials, deleted remote,
+  unparseable content) was retried on every sweep forever, flooding logs with
+  the same failing network call and giving the user no way to quiesce it short
+  of deleting the source. `sync_all` now treats an `'error'` value in EITHER
+  store as errored (legacy JSON-only rows are still skipped), and
+  `_record_failure` writes the column alongside the properties copy it keeps for
+  `consecutive_failures`.
+
+- **`test_redaction_timing_scales_linearly` no longer fails CI
+  intermittently** (observed "Redaction scaled super-linearly: 3.2x, limit
+  3.0x" on an otherwise-healthy matcher). The test took ONE
+  `perf_counter` sample per input size, so it billed itself for whatever
+  the OS gave the core to the sibling pytest-xdist workers — and one
+  unlucky reading of the SMALL input, the ratio's denominator, was enough
+  to push it over the bound. It now measures with `time.thread_time()`
+  (redaction is single-threaded pure-regex work, so per-thread CPU is its
+  complete cost) and takes best-of-3 per size, since scheduler noise only
+  ever adds and the minimum is the closest estimate of the true cost —
+  the same two techniques `TestIsDeniedReDoSResistance` already uses for
+  this class of assertion. The 3.0x bound is unchanged and detection is
+  intact: a genuinely quadratic implementation still measures ~4.3x.
 **Big feature: native vision — image models feel first-class, not bolted on.**
 
 ![Vision tool — describe any image on a text-only model](assets/vision-tool.png)
@@ -48,6 +395,619 @@ The kirocrew-customapi fork: Kiro Crew with the Claude Code ACP backend re-enabl
 
 ## [0.2.0-customapi.1] — 2026-08-06
 
+- **Apply & Restart now really mounts a newly installed server, and says so
+  honestly when it cannot.** The restart path runs the one serialized
+  discover→write entry point and reconciles the consumed agent config
+  unconditionally, so an edit that produces an empty discovery delta (a
+  `disabled: true` flip, a changed `env`) is still written out instead of
+  being skipped as "nothing new". A reconcile that FAILS is reported through
+  `mcp_sync_ok` on the restart response rather than being dressed up as a
+  successful apply.
+
+- **Publishing an artifact to the public internet now requires an explicit
+  acknowledgment, and an operator can remove the path entirely.** The warning
+  next to each confirm button could be scrolled past and read as decoration, and
+  the public-web destination was the one publish destination exempt from the
+  operator's publish policy — `deploy-web-aws` was appended to
+  `/api/publish-providers` unconditionally and `POST /api/deploy/deploy` consulted
+  no ceiling, so a team that had closed every other destination still had a
+  one-click path to a world-readable URL. Every surface that creates the public
+  resource (the Publish panel, its scan-override branch, and **Confirm deploy** on
+  a pending entry) now ends at a blocking dialog that names the artifact, states
+  that anyone with the link can view it, states how long the link stays public,
+  and requires pressing **I understand, publish publicly** — a button that is
+  neither pre-focused nor the default action, so no keystroke that dismisses an
+  ordinary dialog can publish by accident. The destination itself now goes through
+  the same `capabilities.publish` chokepoint as artifact publish: closing it in the
+  trust-root policy (or narrowing `publish.allowed_destinations` in `config.json`)
+  removes the button from the provider registry **and** answers 403 from
+  `/api/deploy/deploy` and `/api/deploy/pending/{id}/confirm`, including for the
+  agent-mediated `deploy_artifact` preview. Operators who had already narrowed
+  `publish.allowed_destinations` must add `deploy-web-aws` to keep deploying. (#3599)
+
+- **The Linux desktop app no longer shows two title bars on GNOME-family
+  Wayland desktops.** The window manager's native decoration used to stack on
+  top of the dashboard's own 42px header, wasting vertical space and
+  duplicating controls. On Wayland sessions of desktops that prefer
+  client-side decorations (GNOME, Ubuntu, Unity, Pantheon, Budgie) the window
+  now drops the native frame: the header doubles as the title bar via an
+  injected drag region, and a minimize/maximize/close cluster is injected at
+  the header's top-right (frameless Linux gets no OS-painted controls, unlike
+  the macOS traffic lights and the Windows caption overlay). X11 sessions,
+  desktops that expect server-side decorations (KDE, XFCE, tiling window
+  managers — including hybrids like Regolith that also report a GNOME token),
+  and unknown environments keep the native frame: frameless X11 windows lose
+  mouse edge-resize, which would be worse than the doubled bar. The
+  `linuxFrameless` key in the desktop app's own config (Connection → Open
+  Config File, also in the tray menu; read once at launch) forces either
+  shape. On frameless windows the menu bar auto-hides (press Alt to reveal
+  it) — kept visible it would re-create the stacked-bars problem, removed it
+  would take the menu away entirely. Connection windows follow the same
+  decision. (#3606)
+
+- **A lesson from a previous embedding-model generation could no longer get
+  silently deleted or offered as a false contradiction.** `write_lesson`'s
+  semantic dedup and `find_contradiction_candidates` compared raw embeddings
+  with a cosine helper that silently truncated a dimension mismatch to the
+  shorter vector instead of rejecting it, so a row embedded at a different
+  dimensionality (e.g. left over from an old embedding model) could score a
+  plausible-looking ~0.5 similarity against an unrelated new rule — landing
+  either past the 0.85 dedup line (deleting the old lesson as a "duplicate")
+  or inside the [0.4, 0.85) contradiction band (offered as a false
+  contradiction candidate). Both paths now converge onto the same
+  dimension-checked, float64-precision scorer the ranking paths already use,
+  which also removes a per-row query re-derivation from both loops. (#3466)
+
+- **Computer use no longer costs a 109 MB backend process per chat when it is
+  off — or on platforms where it cannot run at all.** `kirocrew-computer` was
+  registered into the agent spec unconditionally, and the keystone enable was
+  only checked *inside* the process the spec had already caused kiro-cli to
+  spawn: it suppressed the tool list, never the process. Every chat process paid
+  ~109 MB for a disabled capability, including every `spawn_run` subagent, and
+  on Linux/Windows it paid that for a feature with no driver (macOS is the only
+  supported platform) — measured at 16 processes / 1.75 GB on one Linux host.
+  The server is now withheld from the emitted spec, unless this is macOS *and*
+  the keystone is on; enabling it from Settings rebuilds the spec before
+  restarting sessions, so the tools still appear in the session you are sitting
+  in. Your `tools` entries are left untouched — a ref whose server the spec does
+  not define resolves to nothing, so a mount you had narrowed to a single tool
+  comes back exactly as you left it. Only the entry's own `autoApprove` and
+  custom `env` keys are reset by an off/on cycle and need re-applying,
+  deliberately: restoring an approval from a file the agent can write would
+  bypass the PreToolUse gate. The two in-process checks are kept as defence in
+  depth for a mid-session disable. (#3482)
+
+- **Folder-write audit lines now name the internal component that made the
+  write, instead of inferring the caller's identity from the internal secret's
+  presence.** Every MCP stdio server now declares its component name on
+  loopback gateway requests (`X-Internal-Caller`, attached centrally by the
+  shared request helpers), and the folder endpoints validate it against a
+  known-caller set before trusting it into the security event log's `caller`
+  field — `source` stays in SEL's interface vocabulary (`mcp`), so operator
+  queries over `source == "mcp"` keep matching folder writes. The old
+  inference was correct only while exactly one internal caller existed — a
+  second internal caller would have silently inherited the same label. An
+  authenticated internal write with a missing or unrecognized caller name is
+  audited as `caller="unknown-internal"` with a warning, so a new caller shows
+  up loudly until it is added to the known set alongside its own test. Browser
+  writes still audit as `dashboard`; the caller header alone grants nothing.
+  (#3503)
+
+- **`kirocrew policy show` no longer hides the 139 built-in denied-command
+  rules from the agent.** The rules are visible and configurable to the
+  user (Settings → Security), but the agent's only way to discover them was
+  to attempt a command and be refused — so it could plan multi-step work
+  that turned out to be impossible from the first step, walking the user
+  through setup effort (e.g. exporting AWS credentials) for a task a
+  hard-denied command would block later anyway. `policy show` now prints
+  the rule count grouped by category on every install, enterprise policy or
+  not; `--ids` lists each category's rule ids for citing a specific rule
+  when relaying a refusal. (#3454)
+
+- **Side-panel oversize-question refusal now reports an accurate character
+  target for every script, not just emoji.** The refusal derived its
+  character count from a fixed worst-case floor (4 bytes/char, the emoji
+  case), so an ASCII user over the byte budget was told to cut to ~8,192
+  characters when trimming a single character would do (4x over-deletion),
+  and a zh-CN user (3 bytes/char) was told 8,192 when ~10,922 actually fit.
+  The target is now derived from the submitted question's own byte density,
+  so it's accurate per script — the all-emoji case is unaffected (it already
+  sat at the 4-byte floor). (#3432)
+
+- **The skill browser no longer serves a different skill than the one you asked
+  for.** Three `package/` lookups compared a bare leaf name and returned the
+  first hit, so a request for `package/<name>` could answer with a file under
+  `<root>/<Pkg>/<name>`, or with whichever of two identically named files the
+  filesystem happened to yield. Exact keys now decide first, leaf matching
+  survives only where it is unambiguous, and a real collision resolves to
+  nothing — a 404, with the competing candidates logged — because the
+  `package/<path>` key cannot express which of the two files was meant. Every
+  lookup that previously resolved correctly still resolves to the same file.
+  **Edition maintainers:** roots the core already keys itself (`~/.kiro/skills`,
+  the data home, configured extra paths) are no longer *also* enumerated under
+  `package/`, which previously presented an editable skill as a read-only
+  package one. A stored reference to one of those duplicate `package/` keys
+  stops resolving; the file itself is untouched and still reachable under its
+  canonical key, but the stored reference has to be re-pointed. (#3369)
+
+- **MCP gateway daemons no longer leak when their launcher dies.** A `gatewayd`
+  whose launcher exited without signalling it (a torn-down `pytest` run, for
+  example) used to stay resident forever — invisible to every sweep, ~27 MB
+  each, accumulating without bound. The daemon now watches its own listening
+  socket path and gracefully self-exits once the path is gone (three
+  consecutive checks, POSIX only), and the untracked-orphan sweep reaps any
+  gatewayd whose `--socket` path no longer exists on disk, TERM-first so
+  pooled backends drain cleanly. (#3315)
+
+- **Aggregate memory ceiling across all concurrent agent spawns.** The cgroup
+  memory limit was per-spawn only (65% of RAM each), so many concurrent
+  subagents could collectively request several times host RAM without any
+  single limit breaching. The gateway now also caps their shared parent slice
+  (`kirocrew-agents.slice`) at 80% of RAM plus an aggregate task ceiling —
+  override via `resource_limits.max_total_memory_mb` /
+  `max_total_processes` — and logs which scopes were OOM-killed when the
+  aggregate ceiling engages. (#3316)
+
+- **Slack manifest: private channels now work out of the box.** The shipped app
+  manifest adds the `groups:history` and `users:read` bot scopes and subscribes
+  to the `message.groups` event, so a tracked private channel actually delivers
+  messages and profile lookups resolve real names. **Existing installs are not
+  fixed by upgrading alone**: Slack only grants new scopes on reinstall — update
+  the app's manifest (or re-import it), then reinstall the app to the workspace
+  and copy the new bot token. (#3206)
+
+## [0.3.0] — 2026-08-17
+
+The agent gained its own browser and can now run several threads of your work at
+once. Sessions explain themselves when you come back to them, the dashboard grew
+a Git panel and a docking side panel, Linux ARM64 and Windows join the
+first-class builds, and you can talk to it by holding a key.
+
+### Before you upgrade
+
+- **Node.js 22 is now the minimum** (24 LTS recommended). A Node 20 install is
+  refused rather than failing partway through a frontend build.
+- **Multi-account Telegram is withdrawn.** Only a single bot token is accepted;
+  move the token you want served to `telegram.bot_token`. Existing config is
+  still parsed and preserved, but nothing reads the account map.
+- **`kirocrew logout` now revokes refresh tokens**, not just access tokens, so
+  logging out actually ends the session everywhere.
+- **The terminal no longer scans its output for credentials.** That scan was
+  corrupting CJK text and emoji in the PTY stream, and it swallowed secrets you
+  printed deliberately. Terminal output is now passed through untouched.
+- **Knowledge auto-ingest is opt-in.** A fresh install ingests nothing, and
+  spends nothing on extraction, until you switch it on.
+
+### Run several threads at once
+
+- **Crew Mode** — Send the next message without waiting for the last one. Topics
+  are dispatched to parallel sub-sessions and answers arrive independently, so
+  one chat advances several pieces of work at the same time.
+- **Session summaries** — A side-panel tab says what each thread of a session was
+  trying to do and where it landed, with anything still open hoisted to the top.
+  Old sessions can be summarised on demand. Opt-in, with its token cost stated.
+- **Sessions resume instantly** — An earlier chat loads in the background while
+  you read it, so the first message sends immediately instead of waiting on a
+  cold start, and switching back restores your reading position.
+- **You can watch the context fill up** — The composer reports consumption as a
+  percentage and a token count, and the turn-stats footer names the model that
+  actually served the turn, which matters when you are running on Auto.
+- **A wedged turn recovers itself** — A stuck tool, a dead process, or a frozen
+  model call is detected and nudged back to life instead of hanging silently.
+- **Pinned messages, and a session that admits it needs you** — Pin messages for
+  reference; a session waiting on your answer says so instead of looking idle,
+  and one running a monitoring loop stays under "In progress" between cycles.
+
+### The agent gets its own browser
+
+- **The Browser panel is the browser** — The agent drives the dashboard's own
+  side panel directly: navigate, click, type, screenshot. Browsing happens where
+  you are already looking, with no second window and no security prompt. The
+  Playwright CLI remains for remote sessions and for a browser you are already
+  logged into.
+- **Nothing to install first** — Browsing no longer needs Node or npm on the
+  machine. A private, verified copy is fetched for you, so a locked-down laptop
+  is one click from a working browser rather than a dead end.
+- **Computer Use is offered only where it works** — Native desktop automation
+  appears on macOS, instead of everywhere and then failing.
+
+### New surfaces in the dashboard
+
+- **A Git panel** — Repository status and commit log in the side panel, opening
+  automatically alongside the folder tab once a session has a project.
+- **The side panel docks to the bottom** — As well as the right, toggled from the
+  panel header, which suits a tall or narrow monitor.
+- **Issue links become chips** — GitHub, GitLab, and Jira issue, PR, and MR URLs
+  render inline as icon plus `owner/repo#N`, and a Jira link shows the issue's
+  details in the side panel instead of sending you away.
+- **Feature Previews has its own page** — Preview opt-ins moved out of Developer
+  → Config into per-feature cards, and Webhooks moved into Settings rather than
+  holding a top-level nav slot.
+- **A redesigned session list** — Tighter rows with a colour bar, a status gutter
+  and a meta line, so session state is scannable; folders can be dragged onto
+  each other to nest them in board view.
+- **Crew members keep an activity log** — Each member of a crew gets its own
+  space with a persistent log of what it has been doing.
+- **Link previews, and previews that explain themselves** — URL unfurls now work
+  in your own messages as well as the agent's, and previewing the dashboard's own
+  address explains the loop instead of rendering a blank frame.
+
+### Faster
+
+- **The first message no longer stalls** — Embedding thread pinning cuts the
+  opening turn's latency from roughly 7.4 seconds to about 350 milliseconds.
+- **A cold dashboard load moves a quarter of the bytes** — Pre-compressed assets
+  take it from 7.8 MB to 1.85 MB, which is what a remote or tunnelled dashboard
+  feels most.
+- **Dictation is about twice as fast** on a many-core host, and no longer spikes
+  to thirty seconds under load.
+- **Streaming is smoother** — Block parsing is throttled during a stream, so a
+  long reply no longer builds quadratic pressure as it renders.
+
+### Two new apps, and a store worth browsing
+
+- **Personal Shopper** — Researches real stores on your behalf and recommends
+  something only when buying actually helps. It diagnoses the problem first, and
+  never touches a cart.
+- **Issue Radar Crews** — Put autonomous workers on claimed issues. Each crew
+  takes an issue into its own worktree, posts progress to a public claim ledger,
+  and pushes a pull request: hands-free from triage to code review.
+- **A curated App Store** — Discover renders editorial spotlights, themed
+  collections, and category rails with curator artwork, not one flat list.
+- **Meetings keeps the transcript** — Stored and shown beside the agent's notes,
+  and it survives a reload.
+- **Ask Code Review Sage why** — The reviewer stays available after it posts, so
+  you can question a finding instead of starting over.
+- **Research Lab and Spec Builder pick their own model** — Instead of always
+  falling through to your chat default.
+- **A public deploy asks first** — Publishing an artifact publicly requires an
+  explicit acknowledgement, and an operator can close the path entirely.
+
+### Reach it from anywhere
+
+- **Linux ARM64** — A native aarch64 desktop build, published with an
+  architecture check so nobody downloads the wrong one.
+- **Windows is a first-class build** — The same targets as macOS and Linux, with
+  its own install guide.
+- **Summon it from any app** — A system-wide hotkey (Cmd+Shift+K on macOS,
+  Alt+Shift+K elsewhere) raises the dashboard. Reconfigurable, or off.
+- **Change release channel without reinstalling** — Move between Stable, Insider,
+  and Nightly from About, and the gateway restarts in place after an update.
+- **Publish it on your tailnet** — `kirocrew tailnet up` puts the dashboard on
+  your Tailscale network, reachable from your other devices.
+- **Launch a cloud crew from the dashboard** — Remote EC2 provisioning, device
+  sign-in included, as a restartable job rather than a CLI session you must not
+  close, and `--subnet` pins it into a private subnet.
+- **One title bar on GNOME** — On desktops that draw their own decorations the
+  duplicate native title bar is gone; the dashboard header does the job.
+- **Connect to a gateway you run elsewhere** — A Developer setting stops the
+  desktop app from starting its own local one.
+- **Keep on Top** — Pin the window above everything else, remembered across
+  restarts.
+
+### Voice, terminal, and files
+
+- **Push to talk** — Hold a key to dictate, or tap to latch it on. The key, the
+  mode, and a live test strip are in Settings.
+- **The terminal docks where you want it** — Bottom or right, opening in the
+  session's own project directory, with your preferred shell.
+- **Images are kept as artifacts** — Screenshots and diagrams the agent produces
+  are preserved with a gallery, a detail page, and metadata.
+- **Reveal a file on disk** — Jump from the file viewer to its folder, named for
+  the file manager your platform actually has.
+- **Mermaid diagrams enlarge** — Click one for a lightbox instead of squinting at
+  inline width.
+
+### Channels
+
+- **Dashboard replies mirror back** — An answer you send from the dashboard is
+  relayed into the Discord or Telegram conversation it came from.
+- **Telegram has a real command menu** — Type `/` for autocomplete, switch models
+  with inline buttons, toggle auto-approve, and see markdown tables render as
+  tables rather than raw pipes.
+- **WeChat accepts attachments** — Photos, voice memos, and documents reach the
+  agent instead of being dropped.
+- **A channel can file its own sessions** — Point a channel at a named sidebar
+  folder and its conversations group themselves there.
+- **Too many choices degrade gracefully** — An option list past a platform's cap
+  becomes a numbered text list instead of silently losing the extra choices.
+
+### Tools and connections
+
+- **Connecting takes one click** — Connect mints the provider's approval link
+  immediately and consent finishes on the card, instead of waiting for a later
+  chat to trigger the challenge.
+- **Pooling works itself out** — Kiro Crew probes which MCP servers can safely
+  share a process. A per-server choice replaces the old global switch and its
+  guesswork.
+- **Per-agent tool sets** — Assign servers to particular agents so each sees its
+  own surface without editing global config, and the agent picker offers the
+  project-local agents found in the active session.
+- **Tune how tools defer** — Decide how aggressively Tool Search hides tools
+  until they are needed, trading context for immediacy.
+- **Authenticated custom servers** — Supply request headers when adding a remote
+  MCP server, instead of hand-editing a file.
+- **`kirocrew policy show` lists the denied-command catalog**, so you can read
+  what is blocked without going to the source.
+
+### Autonomy with a governor
+
+- **It knows when the machine is full** — Scheduled jobs defer and new subagents
+  are refused when memory is critically low, and the header shows the posture so
+  you know before heavy work fails.
+- **Each job sets its own time budget** — Up to 24 hours, replacing one fixed
+  thirty-minute cap, and a job's instructions can run to 50,000 characters.
+- **Read a script job without a terminal** — Its Python source is shown,
+  highlighted and read-only, in the job's detail view.
+- **Monitoring keeps its schedule** — Talking to a session mid-loop no longer
+  restarts the countdown, so checks land when they were meant to.
+- **A blip is not a failure** — Transient throttles and server errors retry
+  instead of counting toward auto-pause, a success resets the failure count, and
+  an unattended loop that loses tool approval says so instead of dying quietly.
+- **Subagents ask for permission like the main agent** — A subagent's approval
+  request now goes through trust, auto-approve, or a prompt, instead of being
+  dropped and leaving the child wedged.
+
+### Memory and knowledge
+
+- **Lessons surface by relevance** — Applicable older corrections stop decaying
+  out of context as the library grows, and a lesson keeps its "not this" clause
+  as a field of its own.
+- **Knowledge spending is bounded** — A sweep budget, per-source rate limits and
+  caps, a configurable extraction model, visible per-source cost, the files it
+  failed on, and JSON Lines, NDJSON and Org Mode among the formats it accepts.
+- **A tidier artifact library** — Sortable columns that remember their order, a
+  copy-content button, and a header that stays put while you scroll.
+- **Your own skills survive an upgrade** — A skill you wrote whose name collides
+  with a bundled one is no longer deleted on startup.
+
+### Security and governance
+
+- **An app sees only its own events** — Installed apps receive the event scopes
+  their manifest declares, and can no longer observe your chats, your scheduled
+  job results, or another app's activity.
+- **Scheduled jobs are re-vetted every run** — Checked against current policy
+  each time they fire rather than only when created, and a restored backup can no
+  longer smuggle shell commands past the approval system.
+- **The memory ceiling covers everything at once** — The cap applies to all
+  concurrent agents together, so many small spawns can no longer exhaust the host
+  between them.
+- **Credentials are scrubbed on the live stream** — Redaction now covers
+  real-time output as well as replayed history.
+- **A pinned policy floor cannot be lowered locally** — On a governed host the
+  policy wins over local configuration, including over the unsandboxed-exec
+  opt-in.
+- **Memory edits require a recognised session**, closing a path where a forged
+  key could delete stored memory.
+- **Bring your own identity provider** — Administrators can authorise their own
+  OAuth providers by configuration, without waiting for a release.
+
+### Notable fixes
+
+For anyone who wants to know whether their particular annoyance is gone.
+
+**Chat and composer.** Dropping a folder inserts its path instead of uploading
+it. A hover preview shows what a collapsed paste chip contains. An abandoned CJK
+composition no longer disables Enter until reload, and the side-panel composer is
+IME-safe too. Scrolling up through a long history stops skipping messages.
+Auto-scroll survives a content shrink. Tool rows animate in and out rather than
+teleporting the transcript, and a tool's elapsed timer survives navigating away.
+Queued-message controls are visible on light themes, and "run this next" promotes
+the card you clicked. A long session title stops pushing the header controls off
+screen. Closing the find bar returns focus to the composer. Bold-wrapped links,
+and URLs followed by CJK punctuation, render correctly.
+
+**Sessions and stopping.** Stopping a turn stops the session it is actually
+running on. A stalled subagent card reports how long it has been idle. A channel
+conversation keeps its thread identity when compaction fails or a context
+overflow recycles it. A resumed session keeps its pooled MCP servers. A mid-turn
+reset can no longer leave two turns interleaved in one session.
+
+**Apps and settings.** Editing agent config in the dashboard no longer breaks the
+agent until restart, and an agent spec Kiro CLI rejects is reported instead of
+silently degraded. The settings tab strip shows scroll cues and scrolls the active
+tab into view. Deep links highlight the right control in every language. An app
+installed from a path or from git reports honestly, runs its MCP server on its own
+interpreter, and starts its crons on `kirocrew app enable` without a restart. The
+skill browser serves the skill you asked for rather than another of the same leaf
+name. A folder knowledge source added from the dashboard can now actually be
+started. Speech-to-text settings stop offering to install Whisper on a machine
+that cannot run it. Notes render markdown tables, follow the active theme, and
+remember collapsed folders. Dev Fleet discovers your clone instead of assuming
+`~/kirocrew`, reattaches to an in-flight Pull and Build, and can force-remove kept
+worktrees.
+
+**Channels and notifications.** A Teams answer is no longer silently truncated
+when a send is rate-limited. Slack works in private channels out of the box (the
+shipped manifest requests the scopes), surfaces a permission problem instead of
+delivering nothing, judges an OPTIONS click against the right turn, evicts the
+prior owner when a thread is relinked, and reports its real connect state on the
+System page. WeCom recognises a command after the mandatory mention. Discord keeps
+a code fence open across message rotation. Notifications deep-link to the item,
+stay dismissed when a stale fetch resolves, clear across every open window, and
+retire themselves when the skill they refer to is handled.
+
+**Desktop, install, and CLI.** `kirocrew stop` and `restart` find a macOS
+framework Python. Ctrl+C exits `kirocrew chat` cleanly. Ctrl+Cmd+F toggles full
+screen instead of opening the find bar. The macOS tray icon follows the menu bar's
+theme. A failed update's card survives a reload. The installer's probe cannot hang
+forever. `kirocrew` commands start up to about 0.8 s faster. A remote instance's
+token-mint timeout is configurable for a slow network. A proxy-only host gets its
+proxy variables forwarded to the identity check, and a slow SSO refresh no longer
+parks you at the first-run gate. The frontend builds against a private npm
+registry.
+
+**Security and resources.** `agent.dangerously_skip_permissions` no longer treats
+any non-empty string as true, so a `"false"` in config cannot silently grant
+blanket approval. MCP gateway daemons no longer leak when their launcher dies.
+Computer use costs no backend process on a chat that never uses it. Folder-write
+audit lines name the component that made the write.
+
+**Everywhere else.** Every major panel collapses to a usable single pane at phone
+width, and the software keyboard no longer covers the composer. History search
+works in Chinese, Japanese, and Korean. Session storage loads in seconds and
+deletes in bulk. Theme packs report the CSS rules that were dropped and why, and
+their declared fonts now actually apply. The Online badge means "tools usable" and
+says when it was last checked, and Apply & Restart really mounts a newly installed
+server. Doctor warns about missing swap, gives an honest sandbox verdict, points at
+the thread that is genuinely stuck, and diagnoses an enterprise registry that has
+silently removed the managed tools.
+
+## [0.2.0] — 2026-08-09
+
+The first feature release after launch: a real browser for the agent, four new
+built-in apps, a native Windows desktop build, Korean and Japanese interfaces,
+setup that no longer assumes Slack, and several hundred fixes from the first
+weeks in the open.
+
+### The agent gets a browser
+
+- **Persistent Browser Mode** — Flip one switch in Settings and the agent can
+  operate a real browser: navigate, click, type, and fill forms, with the live
+  view streaming into the dashboard's Browser panel. Installation happens for
+  you and recovers on its own — enabling it never errors out — and the agent can
+  also serve browser work from the native embedded view.
+
+### Eight new built-in apps
+
+- **Spec Builder** — a spec-driven development surface: shape requirements into
+  a spec, then hand it to the agent to implement.
+- **Ops Mission Control** — an autonomous ops first responder with an incident
+  board and a knowledge ledger of fix patterns.
+- **Crew Companion** — a desk companion that reflects what your agent is doing.
+- **Auto-Improvement** — measurement-first self-improvement that proposes,
+  lands, and verifies its own changes GitHub-natively.
+- **Meetings** — transcribes a live meeting, keeps structured notes and diagrams
+  as it goes, and extracts action items you can review afterwards. Recordings
+  and notes can now be deleted from the app.
+- **Papyrus** — a LaTeX paper editor with a split-pane view, live PDF preview,
+  and an AI co-author.
+- **Mochi** — a desktop companion that lives on your screen in its own panel,
+  watches pages and feeds for you, and plans its day around your schedule.
+- **PPTX Maker** — describe the deck you want in chat and get a real `.pptx`
+  back, by way of an agent that interviews you and writes a brief, an outline,
+  and an art direction first.
+- Every one of these is **opt-in**: install it from the App Store and enable it
+  before it does anything.
+- Installed apps are searchable and launchable from the command palette, and
+  third-party apps now run under **per-app trust grants**, with a denial that
+  tells you exactly what to do about it.
+- **MCP Apps has its own switch** instead of riding the connection-pooling
+  toggle, and the shared MCP gateway follows it.
+- **Connections** gained a provider registry, so an integration declares what it
+  is asking for and its consent URL is validated before you are sent to it.
+- Pasting an OAuth return address for an approval that has already expired now
+  says so, instead of blaming the paste — a spent approval is told apart from a
+  failed delivery, so you know to start a fresh one rather than re-copy a dead
+  address.
+- Clicking **Connect** now asks for the provider's approval link instead of
+  waiting for one, so the card offers it within seconds rather than only after
+  some later chat happens to reach that server.
+- Code Review Sage works against **GitHub Enterprise Server** hosts.
+- An MCP server that authenticates with OAuth now receives the scope list and
+  client id in the fields kiro-cli actually reads, so those connections
+  authorize instead of silently failing.
+
+### Windows, properly
+
+- The desktop build moved to an **NSIS installer** with an integrated titlebar,
+  launcher spawn/stop fixes, and a configurable sandbox tier for agent
+  subprocesses. Skills, the usage ledger, and build tooling all learned the
+  platform's rules.
+
+### A dashboard you can operate
+
+- **System is now a task manager** — live per-session resource usage, plus a
+  **Storage** screen that reports what sessions cost on disk and reclaims space
+  to a trash, with an inventory that no longer calls idle sessions "in use".
+- **Releases tab** — this changelog, rendered per version in Settings.
+- **Webhooks** — named tokens, HMAC signing, and a kill switch for inbound
+  automation. The page is still being finished, so it now sits behind a
+  per-device **Preview pages** toggle under Developer and is hidden by default.
+- Redesigned sidebar folders, drag a session into an open chat to reference it,
+  suggested folders for new sessions, consistent empty states with a next step,
+  and a notification sound when an approval prompt needs you.
+- **Continue instead of retyping** — resume an interrupted turn from where it
+  stopped, on any idle session, and recover cleanly from tool-hook blocks and
+  failed restores. Queued messages can be reordered before they send.
+- The terminal panel pops out into its own window, completes subcommands and
+  flags (not just paths), and takes a configurable font.
+- **Agent Templates became a two-pane inspector**, and agents defined in the
+  project you are working in are discovered alongside your user-level ones.
+- **Send a copy of a session to another instance** — hand a conversation, with
+  its context, to a different Kiro Crew you run.
+- Jira issue URLs and setting references render as **link chips** you can click
+  straight through.
+- Stale auto-titles refresh in the background, the command palette tells a
+  failed scoped search apart from an empty one, sidebar search keeps its
+  relevance order, and the chat action footer grows to 40px targets on touch
+  devices.
+- Bold, italic, and strikethrough now render correctly in **CJK prose**.
+- While the agent is waiting on something, the wait shows a **live countdown**
+  with a button to end it early instead of leaving you guessing.
+
+### Channels, and setup that no longer assumes Slack
+
+- **`kirocrew setup` stops asking for Slack tokens.** The wizard finishes on the
+  dashboard and points at the full set of chat channels; walk through the Slack
+  credentials only when you ask for them with `kirocrew setup --slack`. Docs and
+  in-app copy describe Kiro Crew as multi-channel rather than Slack-first.
+- **Telegram** accepts inbound attachments — images for vision, documents, and
+  audio that is transcribed on arrival. Serving **multiple bot accounts per
+  gateway** was withdrawn before this release: a second bot is a second inbound
+  door, and it is only worth having once a bot can be turned off, given its own
+  security posture, and named honestly in the audit log on its own. A
+  `telegram.accounts` entry written by an earlier release candidate is preserved
+  in config but no longer starts a bot — move the token you want served to
+  `telegram.bot_token`.
+- A sub-agent's completion now reports back into **non-Slack** parent sessions,
+  Discord continues the connected session when a reply arrives, and Slack
+  renders an `OPTIONS` prompt as a real control everywhere it appears.
+
+### Voice, language, and models
+
+- **Korean and Japanese** join the dashboard — twelve interface languages.
+- **On-device Apple speech-to-text** with live streaming; switch the microphone
+  mid-recording; dictation lands at the cursor.
+- The model picker shows each model's **credit multiplier** and scopes itself to
+  what the account can actually use; background and sub-agent work take a
+  **configurable per-role model** and reasoning effort.
+
+### Autonomy with a governor
+
+- Sub-agents can be steered with queued follow-ups, scoped to exactly the
+  context a task needs, and report completions as cards in the chat.
+- Monitoring loops accept a **wall-clock runtime budget**; cron jobs group into
+  collapsible folders and start from a **template gallery** of 15 presets.
+- Skills show their **per-injection context cost** on a budget screen, can opt
+  out of injection, and the knowledge library adds documents automatically,
+  dedupes per document, and honors `.kiroignore`.
+
+### Diagnostics and trust
+
+- **Report a Problem** collects a support bundle from the CLI or the UI, and
+  every error message carries an "Ask the agent" hand-off.
+- Loopback requests no longer leak the internal secret to a proxy; sensitive
+  paths and credential redaction got faster without getting looser.
+- The ACP runtime survives oversize output frames, worker sessions are no longer
+  reaped as orphans, and `kirocrew update` works for wheel and `cli.sh` installs.
+- A refusal from one of **your own** deny patterns can carry your note
+  explaining it, and the seven always-on git-publish rules now render locked in
+  Settings instead of offering a toggle that never took effect.
+- The gateway **refuses to boot when its data home cannot persist state**,
+  rather than running and losing your work silently.
+- The tool-approval window and the watchdog's stall windows are both bounded by
+  the turn ceiling, so neither outlives the turn it belongs to.
+
+Plus roughly 280 further fixes across the dashboard, chat, the chat channels,
+ACP transport, history consolidation, packaging, and CI.
+
+## [0.1.3] — 2026-08-07
+
+A hot patch for model entitlement: the model picker scopes itself to what the
+account can use, a model the account cannot use is never sent, and an
+unavailable model is reported as an access problem instead of a capacity error
+or a raw JSON-RPC dump.
 Initial kirocrew-customapi fork. Re-enabled the dormant `claude_code` provider (the `ACP_BACKEND_CLAUDE` seam) so Kiro Crew can drive your own model router speaking the Anthropic API instead of Kiro's built-in Bedrock catalog.
 
 ## [0.1.2] — 2026-07-30

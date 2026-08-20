@@ -3,6 +3,7 @@
   "version": "0.3.0-roycrew.1",
   "description": "RoyCrew — AI agent desktop app (fork of Kiro Crew)",
   "homepage": "https://github.com/roy-kim-33/KiroCrew",
+  "desktopName": "roycrew.desktop",
   "main": "main.js",
   "scripts": {
     "start": "electron .",
@@ -29,7 +30,7 @@
     "productName": "RoyCrew",
     "mac": {
       "category": "public.app-category.developer-tools",
-      "icon": "icon.png",
+      "icon": "icon.icns",
       "target": [
         "dmg",
         "zip"
@@ -48,16 +49,83 @@
     "afterSign": "scripts/notarize.js",
     "linux": {
       "category": "Development",
-      "icon": "icon.png",
+      "icon": "build/icons",
+      "executableName": "roycrew",
       "synopsis": "RoyCrew — AI agent desktop app",
       "description": "RoyCrew is an open source development workspace (fork of Kiro Crew) that runs locally or remotely on your hardware. This fork re-enables the claude_code provider for custom LLM routers.",
       "maintainer": "Roy Kim <roy-kim-33@users.noreply.github.com>",
+      "syncDesktopName": true,
       "target": [
         "AppImage",
-        "deb"
+        "deb",
+        "rpm"
+      ],
+      "artifactName": "${productName}-${version}-${arch}.${ext}"
+    },
+    "deb": {
+      "packageName": "kirocrew",
+      "packageCategory": "devel",
+      "priority": "optional",
+      "publish": [
+        {
+          "provider": "generic",
+          "url": "https://updates.crew.kiro.dev/feed/stable/deb"
+        }
+      ],
+      "depends": [
+        "libgtk-3-0 | libgtk-3-0t64",
+        "libnotify4 | libnotify4t64",
+        "libnss3",
+        "libxss1",
+        "libxtst6",
+        "xdg-utils",
+        "libatspi2.0-0 | libatspi2.0-0t64",
+        "libuuid1",
+        "libsecret-1-0",
+        "libasound2 | libasound2t64"
+      ]
+    },
+    "rpm": {
+      "packageName": "kirocrew",
+      "packageCategory": "Development/Tools",
+      "publish": [
+        {
+          "provider": "generic",
+          "url": "https://updates.crew.kiro.dev/feed/stable/rpm"
+        }
+      ],
+      "depends": [
+        "gtk3",
+        "libnotify",
+        "nss",
+        "libXScrnSaver",
+        "libXtst",
+        "xdg-utils",
+        "at-spi2-core",
+        "libuuid",
+        "libsecret",
+        "alsa-lib"
       ]
     },
     "dmg": {
+      "background": "../../packaging/installer-assets/dmg-background.tiff",
+      "iconSize": 96,
+      "iconTextSize": 13,
+      "title": "${productName}",
+      "filesystem": "HFS+",
+      "contents": [
+        {
+          "x": 170,
+          "y": 246,
+          "type": "file"
+        },
+        {
+          "x": 490,
+          "y": 246,
+          "type": "link",
+          "path": "/Applications"
+        }
+      ],
       "writeUpdateInfo": false
     },
     "files": [
@@ -73,12 +141,14 @@
       "find-bin.js",
       "data-home.js",
       "auto-update.js",
+      "update-logger.js",
       "bundle-location.js",
       "gateway-auth-hint.js",
       "blocking-prompt.js",
       "gateway-stop.js",
       "gateway-wait.js",
       "sandbox-profile.js",
+      "windows-port.js",
       "home-dir.js",
       "local-token.js",
       "local-gateway.js",
@@ -153,7 +223,13 @@
         "nsis"
       ],
       "signtoolOptions": {
-        "sign": "./scripts/sign-windows.js"
+        "sign": "./scripts/sign-windows.js",
+        "signingHashAlgorithms": [
+          "sha256"
+        ],
+        "publisherName": [
+          "Amazon Web Services, Inc."
+        ]
       }
     },
     "nsis": {
@@ -161,7 +237,9 @@
       "perMachine": false,
       "allowToChangeInstallationDirectory": false,
       "deleteAppDataOnUninstall": false,
-      "runAfterFinish": true
+      "runAfterFinish": true,
+      "installerSidebar": "../../packaging/installer-assets/windows-installer-sidebar.bmp",
+      "installerHeader": "../../packaging/installer-assets/windows-installer-header.bmp"
     }
   },
   "author": "Kiro Crew"
