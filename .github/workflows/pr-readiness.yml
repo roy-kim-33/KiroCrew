@@ -145,12 +145,23 @@ jobs:
       - name: Install bounded retry helper for read-only gh calls
         run: |
           cat > "$RUNNER_TEMP/gh-retry.sh" <<'HELPER'
+          # CI runners are ubuntu and always have GNU `timeout`, but this helper
+          # is also executed directly by test_pr_readiness_*.py on developer
+          # machines, where macOS ships no `timeout` at all. Prefer it, then
+          # coreutils' gtimeout, and only as a last resort run unbounded — a
+          # missing bound is better than a hard "command not found" failure.
+          gh_bounded() {
+            local secs="$1"; shift
+            if command -v timeout >/dev/null 2>&1; then timeout "$secs" "$@"
+            elif command -v gtimeout >/dev/null 2>&1; then gtimeout "$secs" "$@"
+            else "$@"; fi
+          }
           gh_retry() {
             local attempt out err rc=1
             for attempt in 1 2 3; do
               # timeout bounds a HANGING attempt (gh applies no HTTP request
               # timeout of its own); rc 124 is just another retryable failure.
-              if out="$(timeout 120 "$@" 2>"$RUNNER_TEMP/gh-retry-err")"; then
+              if out="$(gh_bounded 120 "$@" 2>"$RUNNER_TEMP/gh-retry-err")"; then
                 cat "$RUNNER_TEMP/gh-retry-err" >&2
                 printf '%s\n' "$out"
                 return 0
@@ -599,7 +610,7 @@ jobs:
             # verdict is block a merge that a re-evaluation will unblock;
             # and pending-over-pending / no-status just refresh the
             # self-heal sweep's staleness clock.
-            existing_state="$(timeout 120 gh api "repos/$REPO/commits/$SHA/status" \
+            existing_state="$(gh_bounded 120 gh api "repos/$REPO/commits/$SHA/status" \
               --jq '[.statuses[] | select(.context == "PR Readiness")][0].state // empty' \
               2>/dev/null)" || existing_state="__unreadable__"
             if [ "$existing_state" = "failure" ] || [ "$existing_state" = "error" ]; then
@@ -803,7 +814,7 @@ jobs:
               description: $description,
               context: "PR Readiness"
             }' > "$RUNNER_TEMP/readiness-status.json"
-          if ! timeout 120 gh api --method POST "repos/$REPO/statuses/$SHA" \
+          if ! gh_bounded 120 gh api --method POST "repos/$REPO/statuses/$SHA" \
             --input "$RUNNER_TEMP/readiness-status.json" >/dev/null; then
             echo "::error::Failed to publish the readiness status for $SHA." \
               "The POST is not retried (a retry can overwrite a concurrent" \
