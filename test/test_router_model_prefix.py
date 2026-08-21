@@ -16,6 +16,8 @@ Contract:
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from kiro_crew.acp.client import (
@@ -206,8 +208,17 @@ class TestTextOnlyRedirect:
     def test_message_has_image_path(self) -> None:
         from kiro_crew.acp.client import _message_has_image_path
 
-        assert _message_has_image_path("look at /tmp/shot.png please") is True
-        assert _message_has_image_path("attach /home/me/pic.jpg and explain") is True
+        # The detector shares prompt_blocks' platform-gated _PATH_RE: POSIX
+        # shapes on POSIX, drive-letter/UNC shapes on Windows. Backslash and ":"
+        # are legal in POSIX filenames, so the grammars cannot be merged — the
+        # fixtures have to follow the host the same way the regex does.
+        png, jpg = (
+            (r"C:\tmp\shot.png", r"C:\home\me\pic.jpg")
+            if os.name == "nt"
+            else ("/tmp/shot.png", "/home/me/pic.jpg")
+        )
+        assert _message_has_image_path(f"look at {png} please") is True
+        assert _message_has_image_path(f"attach {jpg} and explain") is True
         assert _message_has_image_path("just text, no images here") is False
         assert _message_has_image_path("") is False
         assert _message_has_image_path("   ") is False
@@ -278,7 +289,8 @@ class TestSessionStartImageGuard:
     def test_prompt_blocks_allow_image_false_for_text_only(self) -> None:
         from kiro_crew.acp.client import AcpClient, _message_has_image_path
 
-        assert _message_has_image_path("look at /tmp/shot.png") is True
+        png = r"C:\tmp\shot.png" if os.name == "nt" else "/tmp/shot.png"
+        assert _message_has_image_path(f"look at {png}") is True
         # the guard flag is derived from the text-only set membership, which
         # the instance config controls; verify the set is consulted
         c = AcpClient(work_dir="/tmp/x", text_only_models=["oc/deepseek-v4-flash"])
