@@ -159,6 +159,12 @@ class ExtractedMeta:
     """
 
 
+_EXTRA_SPECIAL_PURPOSE = (
+    ipaddress.ip_network("192.0.0.0/24"),   # RFC 6890 IETF Protocol Assignments
+    ipaddress.ip_network("2002::/16"),      # RFC 3056 6to4
+)
+
+
 def _reject_if_internal_ip(candidate: str) -> None:
     """Raise ``blocked_url`` if *candidate* parses as a non-public IP.
 
@@ -199,6 +205,13 @@ def _reject_if_internal_ip(candidate: str) -> None:
     # forgot, and `test_vet_rejects_every_special_purpose_range` pins the union
     # against a table of IANA special-purpose prefixes so the next gap is found
     # by the suite instead of by a reviewer.
+    # Two IANA special-purpose ranges that every flag above still reports as
+    # global on CPython 3.12: 192.0.0.0/24 (IETF Protocol Assignments — only its
+    # lower half is special-cased) and 2002::/16 (6to4, whose embedded IPv4 can
+    # address an internal host). Named explicitly for the same reason the block
+    # above exists: a flag CPython does not set is a bypass, not a non-issue.
+    if any(ip in net for net in _EXTRA_SPECIAL_PURPOSE if ip.version == net.version):
+        raise UnfurlRejected("blocked_url")
     if (
         not ip.is_global
         or ip.is_multicast

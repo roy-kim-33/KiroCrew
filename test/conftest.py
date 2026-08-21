@@ -16,6 +16,16 @@ from kiro_crew.safety_override import reset_singleton as _reset_safety_override
 from kiro_crew.slack.client import SlackClientOps
 from kiro_crew.slack.handler import _PHASE_EMOJIS, _build_phase_emojis
 
+# ── No bytecode in the checkout ──────────────────────────────────────────
+# Several suites import scripts that live in the checked-out source tree via
+# spec_from_file_location, and some run them as subprocesses. Both drop
+# __pycache__ beside the source — a persistent side effect outside any tmp dir,
+# which the no-test-side-effects rule forbids and which
+# test_prepare_pr_prove.py asserts against. Guarding here covers every caller
+# (in-process and spawned) instead of each loader remembering to.
+sys.dont_write_bytecode = True
+os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
+
 # ── Hypothesis profiles ─────────────────────────────────────────────────
 # Default (CI): fast iteration.  Run ``HYPOTHESIS_PROFILE=thorough python -m pytest``
 # for deeper coverage.
