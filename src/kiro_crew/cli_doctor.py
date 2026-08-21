@@ -21,7 +21,7 @@ from kiro_crew import diagnostics, platform_compat, sandbox
 from kiro_crew._bootstrap import _source_checkout_root
 from kiro_crew.acp import kas_assets, kas_auth
 from kiro_crew.acp.client import KIRO_CLI_BIN
-from kiro_crew.acp.types import ACP_BACKEND_CLAUDE, ACP_BACKEND_KAS, ACP_BACKEND_OPENCODE
+from kiro_crew.acp.types import ACP_BACKEND_CLAUDE, ACP_BACKEND_KAS
 from kiro_crew.agent import AGENT_FILENAME
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config import KiroCrewConfig
