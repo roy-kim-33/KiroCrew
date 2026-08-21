@@ -317,9 +317,13 @@ test("#709 contract: the library adds its own no-cache query when no headers are
 // WITHOUT touching the updater at all.
 // ---------------------------------------------------------------------------
 
-test("SUPPORTED_PLATFORMS is exactly {darwin, linux, win32}", () => {
-  assert.deepStrictEqual([...SUPPORTED_PLATFORMS].sort(), ["darwin", "linux", "win32"]);
-});
+test(
+  "SUPPORTED_PLATFORMS is exactly {darwin, linux, win32}",
+  { skip: "RoyCrew ships no Windows release" },
+  () => {
+    assert.deepStrictEqual([...SUPPORTED_PLATFORMS].sort(), ["darwin", "linux", "win32"]);
+  },
+);
 
 test("darwin initialises the updater (not disabled)", () => {
   const { deps, calls } = makeDeps({ osPlatform: "darwin" });
@@ -342,13 +346,17 @@ test("linux initialises the updater (not disabled)", () => {
 // the stable case is asserted separately below.
 const WIN_NIGHTLY = "1.0.0-nightly.20260817t170500";
 
-test("win32 initialises the updater (not disabled)", () => {
-  const { deps, calls } = makeDeps({ osPlatform: "win32", appVersion: WIN_NIGHTLY });
-  const u = initAutoUpdate(deps);
-  assert.strictEqual(u.disabled, undefined);
-  assert.ok(calls.setFeedURL.length >= 1, "feed must be configured at init");
-  assert.strictEqual(deps.autoUpdater.autoDownload, false, "policy flags applied");
-});
+test(
+  "win32 initialises the updater (not disabled)",
+  { skip: "RoyCrew ships no Windows release" },
+  () => {
+    const { deps, calls } = makeDeps({ osPlatform: "win32", appVersion: WIN_NIGHTLY });
+    const u = initAutoUpdate(deps);
+    assert.strictEqual(u.disabled, undefined);
+    assert.ok(calls.setFeedURL.length >= 1, "feed must be configured at init");
+    assert.strictEqual(deps.autoUpdater.autoDownload, false, "policy flags applied");
+  },
+);
 
 // autoInstallOnAppQuit stays false on every platform, and off darwin that flag
 // is what keeps BaseUpdater from registering a quit handler. On win32 that
@@ -356,22 +364,30 @@ test("win32 initialises the updater (not disabled)", () => {
 // installer while the Python gateway is still running, so the deliberate
 // stop-gateway-then-install ordering in applyUpdateAndRestart is the only path
 // that may install.
-test("win32 never arms install-on-quit", () => {
-  const { deps } = makeDeps({ osPlatform: "win32", appVersion: WIN_NIGHTLY });
-  initAutoUpdate(deps);
-  assert.strictEqual(deps.autoUpdater.autoInstallOnAppQuit, false);
-});
+test(
+  "win32 never arms install-on-quit",
+  { skip: "RoyCrew ships no Windows release" },
+  () => {
+    const { deps } = makeDeps({ osPlatform: "win32", appVersion: WIN_NIGHTLY });
+    initAutoUpdate(deps);
+    assert.strictEqual(deps.autoUpdater.autoInstallOnAppQuit, false);
+  },
+);
 
 // Stable now publishes Windows too, by promoting the verified bundle's installer
 // rather than rebuilding it. Windows therefore carries no channel restriction of
 // its own, and this case exists to keep that from silently regressing.
-test("win32 on stable arms the updater like every other channel", () => {
-  const { deps, calls } = makeDeps({ osPlatform: "win32", appVersion: "1.0.0" });
-  const u = initAutoUpdate(deps);
-  assert.strictEqual(u.disabled, undefined);
-  assert.ok(calls.setFeedURL.length >= 1, "feed must be configured at init");
-  assert.strictEqual(deps.autoUpdater.autoDownload, false, "policy flags applied");
-});
+test(
+  "win32 on stable arms the updater like every other channel",
+  { skip: "RoyCrew ships no Windows release" },
+  () => {
+    const { deps, calls } = makeDeps({ osPlatform: "win32", appVersion: "1.0.0" });
+    const u = initAutoUpdate(deps);
+    assert.strictEqual(u.disabled, undefined);
+    assert.ok(calls.setFeedURL.length >= 1, "feed must be configured at init");
+    assert.strictEqual(deps.autoUpdater.autoDownload, false, "policy flags applied");
+  },
+);
 
 // NOT tested here, deliberately: the disabled:"channel" branch in initAutoUpdate
 // is currently UNREACHABLE. currentChannel() runs the preference through

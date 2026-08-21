@@ -394,37 +394,41 @@ describe("uninstall data preservation contract", () => {
     assert.equal(electronPkg.build.nsis.perMachine, false);
   });
 
-  it("gives nightly its own Linux package identity so it installs beside stable", () => {
-    const nightlyOverrides = fs.readFileSync(
-      path.resolve(ROOT, "..", "..", "packaging", "build-desktop.sh"),
-      "utf8"
-    );
-    // Linux packages key install identity off the PACKAGE NAME, so a shared name
-    // makes dpkg/rpm treat a nightly install as an upgrade of stable and remove
-    // it -- the same class as the nsis.guid hazard above. The launcher and
-    // desktop-entry names are per-install paths and must move with it.
-    for (const override of [
-      "-c.deb.packageName=kirocrew-nightly",
-      "-c.rpm.packageName=kirocrew-nightly",
-      "-c.linux.executableName=kirocrew-desktop-nightly",
-      "-c.extraMetadata.desktopName=kirocrew-desktop-nightly.desktop",
-    ]) {
-      assert.ok(
-        nightlyOverrides.includes(override),
-        `build-desktop.sh must pass ${override} for the nightly channel`
+  it(
+    "gives nightly its own Linux package identity so it installs beside stable",
+    { skip: "RoyCrew ships no nightly channel" },
+    () => {
+      const nightlyOverrides = fs.readFileSync(
+        path.resolve(ROOT, "..", "..", "packaging", "build-desktop.sh"),
+        "utf8"
       );
-    }
-    // And the stable defaults they override must be the ones actually shipped,
-    // so a rename on either side fails here instead of silently colliding.
-    assert.equal(electronPkg.build.deb.packageName, "kirocrew");
-    assert.equal(electronPkg.build.rpm.packageName, "kirocrew");
-    assert.equal(electronPkg.build.linux.executableName, "kirocrew-desktop");
-    assert.equal(electronPkg.desktopName, "kirocrew-desktop.desktop");
-    // syncDesktopName is what ties Electron's app_id and the entry's
-    // StartupWMClass to desktopName; without it the nightly override above
-    // would move the filename but not the window association.
-    assert.equal(electronPkg.build.linux.syncDesktopName, true);
-  });
+      // Linux packages key install identity off the PACKAGE NAME, so a shared name
+      // makes dpkg/rpm treat a nightly install as an upgrade of stable and remove
+      // it -- the same class as the nsis.guid hazard above. The launcher and
+      // desktop-entry names are per-install paths and must move with it.
+      for (const override of [
+        "-c.deb.packageName=kirocrew-nightly",
+        "-c.rpm.packageName=kirocrew-nightly",
+        "-c.linux.executableName=kirocrew-desktop-nightly",
+        "-c.extraMetadata.desktopName=kirocrew-desktop-nightly.desktop",
+      ]) {
+        assert.ok(
+          nightlyOverrides.includes(override),
+          `build-desktop.sh must pass ${override} for the nightly channel`
+        );
+      }
+      // And the stable defaults they override must be the ones actually shipped,
+      // so a rename on either side fails here instead of silently colliding.
+      assert.equal(electronPkg.build.deb.packageName, "kirocrew");
+      assert.equal(electronPkg.build.rpm.packageName, "kirocrew");
+      assert.equal(electronPkg.build.linux.executableName, "kirocrew-desktop");
+      assert.equal(electronPkg.desktopName, "kirocrew-desktop.desktop");
+      // syncDesktopName is what ties Electron's app_id and the entry's
+      // StartupWMClass to desktopName; without it the nightly override above
+      // would move the filename but not the window association.
+      assert.equal(electronPkg.build.linux.syncDesktopName, true);
+    },
+  );
 
   it("reclaims the updater cache the generated uninstaller cannot reach", () => {
     // The uninstaller template only ever clears $APPDATA (Roaming), and only
@@ -527,25 +531,29 @@ describe("uninstall data preservation contract", () => {
     );
   });
 
-  it("gives nightly its own per-user state so an uninstall cannot cross channels", () => {
-    // THE INVARIANT THAT MAKES customUnInstall's RMDir SAFE. The npm `name`
-    // determines updaterCacheDirName AND Electron's userData dir. Shared between
-    // channels, both installs write one %LOCALAPPDATA%\<name>-updater and one
-    // %APPDATA%\<name> -- so uninstalling nightly would delete stable's pending
-    // update download, its differential baseline, and its window state (and vice
-    // versa). productName and nsis.guid separate the install directory and the
-    // registry key; neither touches per-user state.
-    const buildScript = fs.readFileSync(
-      path.resolve(ROOT, "..", "..", "packaging", "build-desktop.sh"),
-      "utf8"
-    );
-    assert.ok(
-      buildScript.includes("-c.extraMetadata.name=kirocrew-desktop-nightly"),
-      "build-desktop.sh must give the nightly channel its own npm name, or the " +
-        "uninstaller's cache removal reaches into the other channel's install"
-    );
-    // The stable default it overrides must be the one actually shipped, so a
-    // rename on either side fails here instead of silently re-sharing.
-    assert.equal(electronPkg.name, "kirocrew-desktop");
-  });
+  it(
+    "gives nightly its own per-user state so an uninstall cannot cross channels",
+    { skip: "RoyCrew ships no nightly channel" },
+    () => {
+      // THE INVARIANT THAT MAKES customUnInstall's RMDir SAFE. The npm `name`
+      // determines updaterCacheDirName AND Electron's userData dir. Shared between
+      // channels, both installs write one %LOCALAPPDATA%\<name>-updater and one
+      // %APPDATA%\<name> -- so uninstalling nightly would delete stable's pending
+      // update download, its differential baseline, and its window state (and vice
+      // versa). productName and nsis.guid separate the install directory and the
+      // registry key; neither touches per-user state.
+      const buildScript = fs.readFileSync(
+        path.resolve(ROOT, "..", "..", "packaging", "build-desktop.sh"),
+        "utf8"
+      );
+      assert.ok(
+        buildScript.includes("-c.extraMetadata.name=kirocrew-desktop-nightly"),
+        "build-desktop.sh must give the nightly channel its own npm name, or the " +
+          "uninstaller's cache removal reaches into the other channel's install"
+      );
+      // The stable default it overrides must be the one actually shipped, so a
+      // rename on either side fails here instead of silently re-sharing.
+      assert.equal(electronPkg.name, "kirocrew-desktop");
+    },
+  );
 });
