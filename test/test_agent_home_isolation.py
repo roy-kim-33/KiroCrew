@@ -12,6 +12,7 @@ paths that no longer existed.
 
 from __future__ import annotations
 
+import ast
 import re
 import subprocess
 import sys
@@ -542,10 +543,20 @@ def test_no_new_hardcoded_global_agents_dir():
 
 
 def test_repo_has_no_python_syntax_regression():
-    """Cheap compile-all so a rewrite typo fails here rather than at import."""
-    proc = subprocess.run(
-        [sys.executable, "-m", "compileall", "-q", str(SRC)],
-        capture_output=True,
-        text=True,
-    )
-    assert proc.returncode == 0, proc.stdout + proc.stderr
+    """Cheap parse-all so a rewrite typo fails here rather than at import.
+
+    ``ast.parse`` rather than ``compileall``: both surface the same SyntaxError,
+    but compileall writes __pycache__ across the whole checkout as a side effect,
+    which the no-test-side-effects rule forbids and which
+    test_prepare_pr_prove.py::test_importing_prove_leaves_no_bytecode_in_the_checkout
+    asserts against — the two tests could not both pass in one session.
+    """
+    broken = []
+    for path in sorted(SRC.rglob("*.py")):
+        try:
+            ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        except SyntaxError as exc:
+            broken.append(f"{path.relative_to(SRC)}:{exc.lineno}: {exc.msg}")
+        except UnicodeDecodeError as exc:
+            broken.append(f"{path.relative_to(SRC)}: undecodable source ({exc})")
+    assert not broken, "python syntax regression:\n" + "\n".join(broken)
