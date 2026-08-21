@@ -1,9 +1,8 @@
-name: Build Desktop (fork, all platforms)
+name: Build Desktop (fork, macOS + Linux)
 
-# Fork-specific desktop build for macOS + Windows + Linux. It triggers on
-# release publication so EVERY fork release lands with the full desktop app
-# across all three platforms, plus a manual workflow_dispatch for ad-hoc
-# builds.
+# Fork-specific desktop build for macOS + Linux. It triggers on release
+# publication so EVERY fork release lands with the desktop app on both
+# shipped platforms, plus a manual workflow_dispatch for ad-hoc builds.
 #
 # Why a new standalone workflow instead of the upstream build-desktop.yml /
 # build-windows.yml: those are reusable (workflow_call) lanes driven by
