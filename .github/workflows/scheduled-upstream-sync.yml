@@ -1,0 +1,192 @@
+name: Scheduled Upstream Sync
+
+# Automates scripts/sync-upstream.sh on a schedule: fetches kirodotdev/KiroCrew
+# (upstream), merges its main into this fork, and -- the whole point -- runs
+# the claude_code/9router seam verification BEFORE anything can land. On a
+# clean merge it opens a PR for a human to merge; on conflict it opens a DRAFT
+# PR carrying the conflict list and sync-upstream.sh's resolution rules. It
+# never pushes to `main` itself: a bad auto-merge landing there would be
+# picked up by the gateway auto-updater, which does `git reset --hard` onto
+# whatever main resolves to.
+#
+# Standing instruction this automates: "pull and rebase from upstream without
+# overwriting the changes that allow claude code and router9 as backend
+# providers -- this should always apply for this project."
+#
+# WHY MERGE, NOT REBASE: rebasing would replay every one of the fork's ~90
+# commits on top of upstream on EVERY run, and upstream lands roughly 100
+# commits/day -- so a rebase-based sync redoes that replay from scratch each
+# time (rerere helps a human doing this locally, but this workflow's checkout
+# is not persisted across runs), and a rebase changes commit SHAs, which would
+# force-push a main that already has releases cut from it (see
+# mirror-upstream-release.yml and the nightly/release build lanes). A merge
+# commit is append-only and leaves prior history, tags and releases intact.
+#
+# ponytail: no rerere cache here (each run is a fresh checkout), so a conflict
+# already resolved once still needs a human to resolve it again in the draft
+# PR below. Add a cache on .git/rr-cache keyed off a persistent branch if
+# repeat conflicts become common enough to be worth it.
+#
+# LIMITATION: PRs opened here via GITHUB_TOKEN do not trigger other
+# `pull_request`-triggered workflows (ci.yml, Fork Workflow-Change Guard, ...)
+# -- a GitHub Actions restriction on GITHUB_TOKEN-authored events, and this
+# repo's rules forbid adding a PAT to work around it. The seam verification
+# below is therefore the real gate before merge; ci.yml still runs for real
+# once a human merges the PR (a genuine push to main, not GITHUB_TOKEN-authored).
+
+on:
+  schedule:
+    - cron: "30 5 * * *" # once a day, ahead of mirror-upstream-release.yml's polling
+  workflow_dispatch: {}
+
+concurrency:
+  group: scheduled-upstream-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    name: Sync upstream/main
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          ref: main
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/kirodotdev/KiroCrew.git
+          git fetch upstream main
+
+      - name: Check for new upstream commits
+        id: check
+        run: |
+          set -euo pipefail
+          BEHIND="$(git rev-list --count HEAD..upstream/main)"
+          echo "behind=$BEHIND" >> "$GITHUB_OUTPUT"
+          if [ "$BEHIND" -eq 0 ]; then
+            echo "already up to date with upstream/main"
+          else
+            echo "$BEHIND new upstream commit(s)"
+          fi
+
+      - name: Create sync branch
+        if: steps.check.outputs.behind != '0'
+        id: branch
+        run: |
+          set -euo pipefail
+          BRANCH="sync/upstream-$(date -u +%Y%m%d)-$(git rev-parse --short upstream/main)"
+          git checkout -b "$BRANCH"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+
+      - name: Attempt merge
+        if: steps.check.outputs.behind != '0'
+        id: merge
+        run: |
+          set -uo pipefail
+          if git merge upstream/main --no-edit; then
+            echo "conflict=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ---- conflict path: draft PR, nothing merge-verified ----
+
+      - name: Record conflicting files
+        if: steps.check.outputs.behind != '0' && steps.merge.outputs.conflict == 'true'
+        id: conflicts
+        run: |
+          set -euo pipefail
+          DELIM="EOF_$(date +%s%N)"
+          {
+            echo "files<<$DELIM"
+            git diff --name-only --diff-filter=U
+            echo "$DELIM"
+          } >> "$GITHUB_OUTPUT"
+          # Commit with the conflict markers left in place so a reviewer can
+          # `gh pr checkout` this exact state and resolve locally -- this PR is
+          # opened DRAFT and is never auto-mergeable, so committing unresolved
+          # markers here is safe.
+          git add -A
+          git commit -m "sync: upstream/main merge has unresolved conflicts"
+
+      - name: Push conflicted branch
+        if: steps.check.outputs.behind != '0' && steps.merge.outputs.conflict == 'true'
+        run: git push origin "HEAD:refs/heads/${{ steps.branch.outputs.branch }}"
+
+      - name: Write draft PR body
+        if: steps.check.outputs.behind != '0' && steps.merge.outputs.conflict == 'true'
+        env:
+          FILES: ${{ steps.conflicts.outputs.files }}
+        run: |
+          cat > /tmp/pr-body.md <<BODY_EOF
+          This scheduled sync could not merge kirodotdev/KiroCrew's \`main\` cleanly.
+
+          **Conflicting files:**
+          \`\`\`
+          $FILES
+          \`\`\`
+
+          **Resolve keeping BOTH sides** (from \`scripts/sync-upstream.sh\`'s header -- the fork dies if these are resolved upstream's way):
+
+          - \`agent.acp_backend\` must keep \`"claude"\` and \`"opencode"\` in its enum; \`agent.provider\` stays locked to \`"acp"\`.
+          - Keep upstream's new/renamed APIs, then re-apply the fork's claude/opencode branches on top of them. Never take a whole file with \`--ours\`.
+          - Router prefix stripping (\`cmc/ oc/ cx/ ol/ ag/\`) and the \`/api/provider/*\` routes are fork-only: upstream deleting them is not a conflict to accept.
+          - \`website/electron/auto-update.js\` is fork-OWNED, the one file to take whole with \`--ours\`.
+
+          After resolving locally (\`gh pr checkout\` this PR), run \`scripts/sync-upstream.sh verify\`, push, then mark this PR ready for review.
+          BODY_EOF
+
+      - name: Open draft PR
+        if: steps.check.outputs.behind != '0' && steps.merge.outputs.conflict == 'true'
+        run: |
+          gh pr create --draft \
+            --base main \
+            --head "${{ steps.branch.outputs.branch }}" \
+            --title "sync: upstream/main merge conflicts need resolution" \
+            --body-file /tmp/pr-body.md
+
+      # ---- clean path: verify the seam, then open a normal PR ----
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        if: steps.check.outputs.behind != '0' && steps.merge.outputs.conflict == 'false'
+        with:
+          python-version: "3.12"
+
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        if: steps.check.outputs.behind != '0' && steps.merge.outputs.conflict == 'false'
+
+      - name: Install dependencies
+        if: steps.check.outputs.behind != '0' && steps.merge.outputs.conflict == 'false'
+        run: uv pip install --system -e ".[voice,desktop]" --group dev
+
+      - name: Verify the claude_code/9router seam survived
+        if: steps.check.outputs.behind != '0' && steps.merge.outputs.conflict == 'false'
+        run: scripts/sync-upstream.sh verify
+
+      - name: Push sync branch
+        if: steps.check.outputs.behind != '0' && steps.merge.outputs.conflict == 'false'
+        run: git push origin "HEAD:refs/heads/${{ steps.branch.outputs.branch }}"
+
+      - name: Open PR
+        if: steps.check.outputs.behind != '0' && steps.merge.outputs.conflict == 'false'
+        env:
+          BEHIND: ${{ steps.check.outputs.behind }}
+        run: |
+          gh pr create \
+            --base main \
+            --head "${{ steps.branch.outputs.branch }}" \
+            --title "sync: merge upstream/main ($BEHIND commits)" \
+            --body "Merges kirodotdev/KiroCrew's \`main\` into this fork ($BEHIND new commit(s)). The claude_code/9router seam tests (\`scripts/sync-upstream.sh verify\`) passed on this merge commit. Merged, not rebased or squashed -- see this workflow's header for why."

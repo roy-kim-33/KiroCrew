@@ -1,0 +1,153 @@
+name: Mirror Upstream Release
+
+# When kirodotdev/KiroCrew (upstream) publishes a release, cut this fork's own
+# corresponding release. Upstream releases are not observable via GitHub
+# events on a fork (a release published on upstream never crosses the fork
+# boundary as an event here), so this polls upstream's release API on a
+# schedule instead.
+#
+# Publishing the release created here is what triggers build-desktop-fork.yml
+# (on release: published) to build and attach the macOS + Linux desktop
+# artifacts -- this workflow never builds anything itself.
+#
+# SEQUENCING WITH scheduled-upstream-sync.yml: that workflow is what actually
+# brings upstream's code onto this fork's main, via a PR a human reviews and
+# merges. This workflow only cuts the GitHub Release once main already carries
+# the matching version -- if upstream releases before that sync PR has been
+# merged, this workflow finds main not yet caught up and skips with a notice.
+# It never tags stale code under a new version number.
+#
+# VERSION SOURCE OF TRUTH: src/kiro_crew/__init__.py's __version__ on main
+# (mirrored in website/electron/package.json) already carries the fork's
+# "<upstream-version>-roycrew.<N>" suffix once a sync lands -- see
+# scripts/sync-upstream.sh. Rather than re-deriving N here, this workflow
+# trusts that string verbatim as the release tag; it only decides WHETHER a
+# release is due, not what N should be.
+
+on:
+  schedule:
+    - cron: "0 */4 * * *" # every 4 hours; upstream releases are infrequent, cheap to poll
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: mirror-upstream-release
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    name: Mirror upstream release
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+      UPSTREAM_REPO: kirodotdev/KiroCrew
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Compare upstream's latest release against this fork's
+        id: check
+        run: |
+          set -euo pipefail
+
+          UPSTREAM_JSON="$(gh api "repos/${UPSTREAM_REPO}/releases/latest")"
+          UPSTREAM_TAG="$(printf '%s' "$UPSTREAM_JSON" | jq -r '.tag_name')"
+          UPSTREAM_VERSION="${UPSTREAM_TAG#v}"
+          UPSTREAM_URL="$(printf '%s' "$UPSTREAM_JSON" | jq -r '.html_url')"
+          UPSTREAM_BODY="$(printf '%s' "$UPSTREAM_JSON" | jq -r '.body // ""')"
+
+          # This fork's most recent non-draft release. Empty on the fork's
+          # very first mirrored release.
+          FORK_LATEST_TAG="$(gh api "repos/${{ github.repository }}/releases" --jq 'first(.[] | select(.draft==false)).tag_name // empty')"
+          FORK_LATEST_BASE="$(printf '%s' "$FORK_LATEST_TAG" | sed -E 's/^v//; s/-roycrew\.[0-9]+$//')"
+
+          echo "upstream version: ${UPSTREAM_VERSION} (fork's latest release base: ${FORK_LATEST_BASE:-<none>})"
+
+          if [ -n "$FORK_LATEST_BASE" ]; then
+            NEWEST="$(printf '%s\n%s\n' "$FORK_LATEST_BASE" "$UPSTREAM_VERSION" | sort -V | tail -1)"
+            if [ "$FORK_LATEST_BASE" = "$UPSTREAM_VERSION" ]; then
+              echo "::notice::already mirrored upstream ${UPSTREAM_VERSION}; nothing to do."
+              echo "due=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            if [ "$NEWEST" = "$FORK_LATEST_BASE" ]; then
+              echo "::notice::fork's latest release (${FORK_LATEST_BASE}) is already newer than upstream's (${UPSTREAM_VERSION}); nothing to do."
+              echo "due=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
+          # Upstream is ahead of the fork's last mirrored release. Only cut a
+          # release if this fork's main has actually caught up -- i.e.
+          # scheduled-upstream-sync.yml's PR for this version has already been
+          # merged -- otherwise this would tag pre-sync code under a version
+          # number it doesn't contain.
+          FORK_VERSION="$(grep -m1 '__version__' src/kiro_crew/__init__.py | sed -E 's/.*=[[:space:]]*"([^"]+)".*/\1/')"
+          FORK_BASE="$(printf '%s' "$FORK_VERSION" | sed -E 's/-roycrew\.[0-9]+$//')"
+          if [ "$FORK_BASE" != "$UPSTREAM_VERSION" ]; then
+            echo "::notice::upstream released ${UPSTREAM_VERSION} but main is still at ${FORK_BASE}; waiting for the scheduled-upstream-sync PR to be reviewed and merged before mirroring."
+            echo "due=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          NEW_TAG="v${FORK_VERSION}"
+          if gh release view "$NEW_TAG" >/dev/null 2>&1; then
+            echo "::notice::${NEW_TAG} already exists; nothing to do (idempotent)."
+            echo "due=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          DELIM="EOF_$(date +%s%N)"
+          {
+            echo "due=true"
+            echo "tag=${NEW_TAG}"
+            echo "upstream_tag=${UPSTREAM_TAG}"
+            echo "upstream_url=${UPSTREAM_URL}"
+            echo "body<<$DELIM"
+            echo "$UPSTREAM_BODY"
+            echo "$DELIM"
+          } >> "$GITHUB_OUTPUT"
+
+      # Never release a red commit. The reusable build/publish lanes in this
+      # repo probe artifacts and skip cleanly on failure; a GitHub Release is
+      # different -- publishing it is irreversible-in-effect (it immediately
+      # fires build-desktop-fork.yml), so the gate lives here instead.
+      - name: Verify main's CI is green before releasing
+        if: steps.check.outputs.due == 'true'
+        run: |
+          set -euo pipefail
+          SHA="$(git rev-parse HEAD)"
+          CONCLUSION="$(gh run list --repo "${{ github.repository }}" --workflow=ci.yml --branch main \
+            --json headSha,conclusion --jq "[.[] | select(.headSha == \"$SHA\")][0].conclusion // empty")"
+          if [ "$CONCLUSION" != "success" ]; then
+            echo "::error::refusing to release ${SHA}: CI's most recent run for this commit is '${CONCLUSION:-<none found>}', not 'success'."
+            exit 1
+          fi
+          echo "CI is green for ${SHA}"
+
+      - name: Create the release
+        if: steps.check.outputs.due == 'true'
+        env:
+          TAG: ${{ steps.check.outputs.tag }}
+          UPSTREAM_TAG: ${{ steps.check.outputs.upstream_tag }}
+          UPSTREAM_URL: ${{ steps.check.outputs.upstream_url }}
+          UPSTREAM_BODY: ${{ steps.check.outputs.body }}
+        run: |
+          set -euo pipefail
+          NOTES="$(cat <<NOTES_EOF
+          Mirrors kirodotdev/KiroCrew's [${UPSTREAM_TAG}](${UPSTREAM_URL}).
+
+          Publishing this triggers \`build-desktop-fork.yml\`, which builds and attaches the macOS + Linux desktop artifacts.
+
+          ---
+
+          ${UPSTREAM_BODY}
+          NOTES_EOF
+          )"
+          gh release create "$TAG" \
+            --target "$(git rev-parse HEAD)" \
+            --title "$TAG" \
+            --notes "$NOTES"
