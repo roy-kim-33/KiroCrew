@@ -46,11 +46,11 @@ class TestBotNameSubstitution:
             ctx = ContextBuilder(bot_name="")
             assert ctx._substitute_bot_name("You are {bot_name}.") == "You are Kiro."
 
-        # When the acp_backend is claude, default bot_name is "KiroCrew"
+        # When the acp_backend is claude, default bot_name is "Kiro Crew"
         with patch("kiro_crew.context.KiroCrewConfig.load") as mock_cfg:
             mock_cfg.return_value.agent.acp_backend = "claude"
             ctx = ContextBuilder(bot_name="")
-            assert ctx._substitute_bot_name("You are {bot_name}.") == "You are KiroCrew."
+            assert ctx._substitute_bot_name("You are {bot_name}.") == "You are Kiro Crew."
 
     def test_no_placeholder_is_noop(self):
         from kiro_crew.context import ContextBuilder

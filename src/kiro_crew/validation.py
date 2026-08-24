@@ -1231,8 +1231,11 @@ SKILL_FETCH_SCHEMA = ToolSchema(
 
 # Absolute filesystem path. Empty string is allowed (clears the project) —
 # the validator skips the pattern check on empty values, so the regex only
-# needs to cover the non-empty case.
-_ABSOLUTE_PATH_RE = re.compile(r"^/")
+# needs to cover the non-empty case. Windows has no leading "/": a temp
+# attachment or project path there is a drive letter ("C:\..." / "C:/...")
+# or a UNC share ("\\host\..."), so a POSIX-only anchor rejected every
+# absolute path the gateway itself produces on that platform.
+_ABSOLUTE_PATH_RE = re.compile(r"^(?:/|[A-Za-z]:[\\/]|\\\\)")
 
 # vision_analyze describes an image (local path or http(s) URL) for a text-only
 # model via a one-shot vision subagent. The image ref is LLM-authored and, for
