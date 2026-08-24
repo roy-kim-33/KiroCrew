@@ -2701,7 +2701,9 @@ class AcpClient:
         from its spec (same shape kiro-cli consumes) and shape them into ACP
         ``session/new`` entries, mirroring the kiro-cli path.
         """
-        if not self._is_claude:
+        if self._is_claude is not True:  # harness-ok: positive read of the
+            # claude seam this method exists for; AcpClient also serves kiro and
+            # the fork's opencode, so "not claude" is not "kiro" (H5).
             return []
         try:
             from kiro_crew.config.paths import kiro_agents_dir

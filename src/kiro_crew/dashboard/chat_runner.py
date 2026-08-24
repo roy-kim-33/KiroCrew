@@ -26,6 +26,7 @@ from kiro_crew.acp.client import (
     model_is_unusable,
 )
 from kiro_crew.acp.types import (
+    ACP_BACKEND_CLAUDE,
     EVENT_AGENT_SWITCHED,
     EVENT_CLEAR_STATUS,
     EVENT_COMPACTION_STATUS,
@@ -4900,7 +4901,7 @@ async def _run_chat(
     first_word = message.split()[0] if message.strip() else ""
     # Harness selection is agent.acp_backend, never a second agent.provider value
     # (harness-parity); "claude" is the backend upstream calls claude_code.
-    _is_cc_provider = KiroCrewConfig.load().agent.acp_backend == "claude"
+    _is_cc_provider = KiroCrewConfig.load().agent.acp_backend == ACP_BACKEND_CLAUDE
     # Named rather than inlined so the quick-prompt exception is one testable rule
     # instead of a condition only reachable by driving this whole function: a macro
     # must NOT be forwarded to the harness as a command.
@@ -5134,8 +5135,8 @@ async def _run_chat(
             cfg = KiroCrewConfig.load()
             # PROVIDER_LABEL_CLAUDE ("claude_code"), not agent.provider (locked
             # to "acp") — a harness is selected at agent.acp_backend
-            # (ACP_BACKEND_CLAUDE == "claude"); see harness-parity.
-            provider_name = "claude_code" if cfg.agent.acp_backend == "claude" else ""
+            # (ACP_BACKEND_CLAUDE == ACP_BACKEND_CLAUDE); see harness-parity.
+            provider_name = "claude_code" if cfg.agent.acp_backend == ACP_BACKEND_CLAUDE else ""
             # Warm the project agent index OFF the loop, then resolve inline. Only
             # the warm is offloaded: resolve_agent_bindings can raise StopIteration
             # on a malformed config, and StopIteration cannot be delivered through a
@@ -7610,7 +7611,7 @@ async def _run_chat(
                     try:
                         _provider_name = (
                             "claude_code"
-                            if cfg.agent.acp_backend == "claude"  # type: ignore[possibly-undefined]
+                            if cfg.agent.acp_backend == ACP_BACKEND_CLAUDE  # type: ignore[possibly-undefined]
                             else ""
                         )
                     except (NameError, AttributeError):

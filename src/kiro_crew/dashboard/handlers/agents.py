@@ -17,6 +17,7 @@ from aiohttp import web
 
 from kiro_crew import agent_state, model_registry
 from kiro_crew.acp.client import advertised_model_ids, model_is_unusable
+from kiro_crew.acp.types import ACP_BACKEND_CLAUDE, ACP_BACKEND_OPENCODE
 from kiro_crew.agent import (
     AGENT_FILENAME,
     clear_model_pin,
@@ -1194,9 +1195,9 @@ async def api_models(request: web.Request) -> web.Response:
     # Fork: on the claude_code (custom LLM router) path the picker must show
     # the curated router catalog, not kiro-cli's Bedrock list.
     cfg = KiroCrewConfig.load()
-    if cfg.agent.acp_backend == "claude":
+    if cfg.agent.acp_backend == ACP_BACKEND_CLAUDE:
         return _cc_models_response(request)
-    if cfg.agent.acp_backend == "opencode":
+    if cfg.agent.acp_backend == ACP_BACKEND_OPENCODE:
         return await _opencode_models_response(request)
     # Signed-out gateways must never reach the spawn below. kiro-cli auto-opens
     # an interactive browser login for ANY subcommand run unauthenticated
@@ -1397,7 +1398,7 @@ async def api_effort_levels(request: web.Request) -> web.Response:
 async def api_slash_commands(request: web.Request) -> web.Response:
     """GET /api/slash-commands — list available slash commands (provider-aware)."""
     cfg = KiroCrewConfig.load()
-    if cfg.agent.acp_backend == "claude":
+    if cfg.agent.acp_backend == ACP_BACKEND_CLAUDE:
         state: DashboardState = request.app["state"]
         cc_commands: list[str] = []
         for provider in state.sessions.active_providers():
@@ -1968,7 +1969,7 @@ def _model_pin_rejected(model: str, request: web.Request, backend: str) -> str |
     # canonicalized before comparison.
     # Harness selection is agent.acp_backend (harness-parity); "claude" is the
     # backend upstream calls claude_code.
-    if backend == "claude":
+    if backend == ACP_BACKEND_CLAUDE:
         return None
 
     # The registry knows each model under several spellings and only one is what

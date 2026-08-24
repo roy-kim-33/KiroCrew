@@ -89,7 +89,7 @@
     "skip_to_content": "跳到主内容",
     "social_login": "社交账号登录",
     "stale_fetch_failing": "（已过期：获取失败）",
-    "star_kirocrew_on_github": "在 GitHub 上为 Kiro Crew 加星",
+    "star_kirocrew_on_github": "在 GitHub 上为 RoyCrew 加星",
     "star_us": "给我们加星",
     "starting_update": "正在启动更新…",
     "subagent_cap": "cap: {{cap}}",
@@ -127,7 +127,7 @@
   "apps": {
     "agentWorlds": {
       "manifest": {
-        "description": "把正在运行的代理变成动态像素画场景里的角色，一眼就能看出 Kiro Crew 有多忙。每个活跃代理都是一个精灵图，随着工作开始和结束做出反应；场景主题从经典办公室到巫师塔或水下实验室。弹出为独立窗口，就能在工作时把它放在第二块屏幕上。",
+        "description": "把正在运行的代理变成动态像素画场景里的角色，一眼就能看出 RoyCrew 有多忙。每个活跃代理都是一个精灵图，随着工作开始和结束做出反应；场景主题从经典办公室到巫师塔或水下实验室。弹出为独立窗口，就能在工作时把它放在第二块屏幕上。",
         "display_name": "Agent Worlds",
         "highlight_1": "实时查看哪些代理正在运行，以角色而非列表呈现",
         "highlight_2": "主题场景包括 Office、Panda Den、Neural Net、Wizard Tower 和 Deep Lab",
@@ -997,7 +997,7 @@
         "title": "Crew Companion"
       },
       "manifest": {
-        "description": "Kiro Crew 的桌面伙伴，帮你把一天过得有节奏。它会提醒你休息，记住你用自然语言设的提醒，在你需要放松时带你做一段简短呼吸练习。会话完成、失败或需要你确认时，它也会告诉你。",
+        "description": "RoyCrew 的桌面伙伴，帮你把一天过得有节奏。它会提醒你休息，记住你用自然语言设的提醒，在你需要放松时带你做一段简短呼吸练习。会话完成、失败或需要你确认时，它也会告诉你。",
         "display_name": "Crew Companion",
         "highlight_1": "轻声提醒你休息 — 喝水、伸展、远眺 — 间隔由你设定",
         "highlight_2": "用自然语言设置提醒，比如“20 分钟后喝水”",
@@ -1461,14 +1461,14 @@
     },
     "devFleet": {
       "manifest": {
-        "description": "开发 Kiro Crew 本身用的控制面板。列出每个功能工作树及其拉取请求状态、提交数和磁盘用量，还能把其中任意一个拉起为 Pod。Pod 是一套完整预览实例，占用独立端口和独立数据目录，于是你可以点开未做完的改动，而不影响正在运行的网关。周边杂活它也一并处理 — 拉取 main 并重新构建、给分支变基、流式查看 Pod 日志，以及清理工作已合并的工作树。",
+        "description": "开发 RoyCrew 本身用的控制面板。列出每个功能工作树及其拉取请求状态、提交数和磁盘用量，还能把其中任意一个拉起为 Pod。Pod 是一套完整预览实例，占用独立端口和独立数据目录，于是你可以点开未做完的改动，而不影响正在运行的网关。周边杂活它也一并处理 — 拉取 main 并重新构建、给分支变基、流式查看 Pod 日志，以及清理工作已合并的工作树。",
         "display_name": "Dev Fleet",
         "highlight_1": "把任意工作树拉起为独立 Pod，占用自己的端口和数据目录，正在运行的网关毫不受影响",
         "highlight_2": "机群视图显示每个分支的 PR 状态、提交数和磁盘用量",
         "highlight_3": "在仪表板里同步（拉取 main 并重新构建）或给分支变基",
         "highlight_4": "“Prune merged”不会删除仍有未提交或未跟踪改动的工作树，而是拒绝操作",
         "highlight_5": "在界面上流式查看 Pod 日志，并签发 Pod 访问令牌",
-        "highlight_6": "给开发 Kiro Crew 本身的人用 — 日常使用并不需要它",
+        "highlight_6": "给开发 RoyCrew 本身的人用 — 日常使用并不需要它",
         "highlight_7": "Pod 可以跑在 Linux（systemd --user）和 macOS（launchd）上 — 但 macOS 上的 Pod 没有强制的内存/CPU 上限；Make Live 仍然只支持 Linux；机群视图、PR 状态、同步、变基和清理在任何平台都可用",
         "page_label": "Dev Fleet"
       }
@@ -1500,7 +1500,7 @@
         "truncated": "· 已截断"
       },
       "manifest": {
-        "description": "不用离开仪表板，就能浏览和阅读运行 Kiro Crew 那台机器上的文件。多个文件在标签页里同时打开，沿目录树浏览时每个文件旁边都显示 git 状态，可以在整个文件夹里搜字符串，markdown 也是渲染后阅读而不是看源码。它按设计就是只读的：只打开和搜索文件，从不编辑、移动或删除，可访问范围仅限主目录以及 /tmp 和 /opt。",
+        "description": "不用离开仪表板，就能浏览和阅读运行 RoyCrew 那台机器上的文件。多个文件在标签页里同时打开，沿目录树浏览时每个文件旁边都显示 git 状态，可以在整个文件夹里搜字符串，markdown 也是渲染后阅读而不是看源码。它按设计就是只读的：只打开和搜索文件，从不编辑、移动或删除，可访问范围仅限主目录以及 /tmp 和 /opt。",
         "display_name": "文件",
         "highlight_1": "只读：只打开和搜索文件，从不写入、移动或删除",
         "highlight_2": "多个文件在标签页里同时打开，带语法高亮",
@@ -2686,7 +2686,7 @@
       "manifest": {
         "description": "AI 会议助手。实时转录会议，边开边整理结构化笔记和图示，提取行动项，并让你在提交之前先过一遍。",
         "display_name": "会议",
-        "highlight_1": "用 Kiro Crew 自带的语音转文字做实时转录 — 不需要额外守护进程，也不需要你现有之外的云账号",
+        "highlight_1": "用 RoyCrew 自带的语音转文字做实时转录 — 不需要额外守护进程，也不需要你现有之外的云账号",
         "highlight_2": "一组代理并行处理会议：结构化笔记、HTML/Mermaid 图示，以及行动项清单",
         "highlight_3": "用领域词典把反复出现的语音转文字错误纠正一次，之后每场会议都能认对",
         "highlight_4": "在提交任何内容之前先审阅提取出的行动项 — 噪音归档，其余提交",
@@ -3829,7 +3829,7 @@
         "no_source_files": "没有源文件。"
       },
       "manifest": {
-        "description": "带实时 PDF 预览和 AI 合著者的 LaTeX 论文编辑器。在分栏编辑器里写作，按 Cmd+S（Windows 和 Linux 上是 Ctrl+S）用 pdflatex 或 tectonic 编译，渲染好的 PDF 就在源码旁边。编译错误会解析成可点击的列表，点一下跳到出错的那一行。可以从任意 git 远端克隆已有论文，然后在工具栏里提交和推送。合著者面板是一个限定在这篇论文范围内的真实 Kiro Crew 会话，代理可以读写你的 LaTeX，你则看着 PDF 实时更新。",
+        "description": "带实时 PDF 预览和 AI 合著者的 LaTeX 论文编辑器。在分栏编辑器里写作，按 Cmd+S（Windows 和 Linux 上是 Ctrl+S）用 pdflatex 或 tectonic 编译，渲染好的 PDF 就在源码旁边。编译错误会解析成可点击的列表，点一下跳到出错的那一行。可以从任意 git 远端克隆已有论文，然后在工具栏里提交和推送。合著者面板是一个限定在这篇论文范围内的真实 RoyCrew 会话，代理可以读写你的 LaTeX，你则看着 PDF 实时更新。",
         "display_name": "Papyrus",
         "highlight_1": "分栏 LaTeX 编辑器，旁边是实时 PDF 预览",
         "highlight_2": "保存即编译（Cmd+S，Windows 和 Linux 上为 Ctrl+S），走 pdflatex 或 tectonic，bibtex 的多轮编译也帮你跑完",
@@ -4292,7 +4292,7 @@
         }
       },
       "manifest": {
-        "description": "在 Kiro Crew 内进行 spec 驱动开发：借助内嵌代理把一个功能想法变成需求 → 设计 → 任务，在应用内审阅 markdown，然后把已通过的方案交给一个自主执行会话去完成。",
+        "description": "在 RoyCrew 内进行 spec 驱动开发：借助内嵌代理把一个功能想法变成需求 → 设计 → 任务，在应用内审阅 markdown，然后把已通过的方案交给一个自主执行会话去完成。",
         "display_name": "Spec Builder",
         "page_label": "Spec Builder"
       },
@@ -4304,7 +4304,7 @@
     },
     "workflows": {
       "manifest": {
-        "description": "编写、运行并观察动态工作流：一些 Python 脚本，通常由代理根据你用自然语言写的目标生成，按顺序的阶段驱动多个 Kiro Crew 代理。脚本在任何东西开始运行之前，会先对照沙箱化的工作流命令集做检查，于是错误在不执行的情况下就能暴露出来；随后页面会随运行进展流式显示每个阶段和每次代理事件。应用自带可直接运行的示例，可以从它们开始。",
+        "description": "编写、运行并观察动态工作流：一些 Python 脚本，通常由代理根据你用自然语言写的目标生成，按顺序的阶段驱动多个 RoyCrew 代理。脚本在任何东西开始运行之前，会先对照沙箱化的工作流命令集做检查，于是错误在不执行的情况下就能暴露出来；随后页面会随运行进展流式显示每个阶段和每次代理事件。应用自带可直接运行的示例，可以从它们开始。",
         "display_name": "工作流",
         "highlight_1": "运行之前先校验工作流 — 错误会在什么都没执行的情况下暴露出来",
         "highlight_2": "实时观察运行，一个阶段接一个阶段，带每个代理的进度事件",
@@ -4578,7 +4578,7 @@
       "trust_tooltip": "在此对话中，{{productName}} 无需先询问即可工作",
       "yolo_desc": "在每个对话中，{{productName}} 无需先询问即可工作",
       "yolo_expiration_timed": "Turns itself off after {{duration}}, then asks again.",
-      "yolo_expiration_until_shutdown": "Stays on until Kiro Crew restarts — no timed expiry.",
+      "yolo_expiration_until_shutdown": "保持开启直到 RoyCrew 重启 — 不设定时过期。",
       "yolo_label": "YOLO",
       "yolo_mode_is_an_app_wide_setting": "YOLO 模式是全应用级设置",
       "yolo_tooltip": "在每个对话中，{{productName}} 无需先询问即可工作"
@@ -9699,7 +9699,7 @@
         "filter_servers_or_tools": "筛选服务器或工具…",
         "globals": "全局配置",
         "kiro": "Kiro",
-        "kirocrew": "Kiro Crew",
+        "kirocrew": "RoyCrew",
         "last_probed": "上次探测",
         "mcp_servers_count": "MCP 服务器（{{count}}）",
         "name": "名称",
@@ -9714,7 +9714,7 @@
         "pending_enable_click_to_revert": "待应用：启用（点击可撤销）",
         "pending_uninstall": "{{label}} — 待卸载",
         "probe_mcp_servers": "探测 MCP 服务器",
-        "servers_scope_tip": "Kiro Crew 与你的交互式 {{provider}}/Kiro 全局配置中的 MCP 服务器。Kiro Crew 徽章表示它是否会在 Kiro Crew 会话中加载；全局配置徽章表示它是否已共享到你的交互式 Kiro 全局配置。点击切换，然后应用更改。",
+        "servers_scope_tip": "RoyCrew 与你的交互式 {{provider}}/Kiro 全局配置中的 MCP 服务器。RoyCrew 徽章表示它是否会在 RoyCrew 会话中加载；全局配置徽章表示它是否已共享到你的交互式 Kiro 全局配置。点击切换，然后应用更改。",
         "status": "状态",
         "tool_list_read_from_the_package_s_declaration_th": "工具列表读取自软件包自身的声明；未实际启动服务器验证其可运行。",
         "tools": "工具",
@@ -9725,7 +9725,7 @@
       },
       "memoryGraphTab": {
         "all_count": "全部（{{count}}）",
-        "gpu_rendered_visualization_of_all_kirocrew_memor": "由 GPU 渲染的全部 Kiro Crew 记忆可视化视图。节点按类型着色。放大可显示标签，点击节点可检查，使用筛选器可聚焦。",
+        "gpu_rendered_visualization_of_all_kirocrew_memor": "由 GPU 渲染的全部 RoyCrew 记忆可视化视图。节点按类型着色。放大可显示标签，点击节点可检查，使用筛选器可聚焦。",
         "group_history_count": "历史（{{count}}）",
         "group_lessons_count": "经验（{{count}}）",
         "group_preferences_count": "偏好设置（{{count}}）",
@@ -9905,7 +9905,7 @@
         "skills": "技能",
         "skills_count": "技能（{{count}}）",
         "skills_from_read_only": "来自 {{name}} 的技能 — 只读",
-        "skills_tip": "按需加载的技能，当代理判断相关时才加载。带有 auto 标记的技能会始终注入每个会话。技能来自 Kiro Crew、kiro-cli 和 AIM 包。",
+        "skills_tip": "按需加载的技能，当代理判断相关时才加载。带有 auto 标记的技能会始终注入每个会话。技能来自 RoyCrew、kiro-cli 和 AIM 包。",
         "the_skill_this_update_targets_no_longer_exists_s": "此更新针对的技能已不存在，因此没有可更新的内容。请忽略此候选。",
         "this_skill_changed_after_this_update_was_written": "这个 skill 在这条更新写好之后又变过，所以现在应用它会撤销那些更新的改动。批准已被阻止——忽略这个候选项，系统会针对当前版本重新提出一条更新。",
         "update": "更新",
@@ -10135,7 +10135,7 @@
     },
     "popoutFrame": {
       "session": "会话",
-      "window_title": "{{label}} — Kiro Crew"
+      "window_title": "{{label}} — RoyCrew"
     },
     "projectDetailPage": {
       "analyzing_task_and_building_step_by_step_plan": "正在分析任务并制定分步计划",
@@ -10595,7 +10595,7 @@
         "downloading": "正在下载…",
         "insider": "Insider",
         "install_failed": "无法安装更新",
-        "installing_quiet_note": "正在安装——Kiro Crew 会安静一两分钟，然后自动重启。",
+        "installing_quiet_note": "正在安装——RoyCrew 会安静一两分钟，然后自动重启。",
         "is_available": "可用。",
         "loading_changelog": "正在加载更新日志…",
         "manual_install_fallback": "如果更新无法完成，你可以{{link}}并覆盖安装。你的设置、对话和文件都会保留。",
@@ -10680,7 +10680,7 @@
         "saving": "保存中…",
         "session_folder_name": "文件夹名称",
         "session_folder_name_desc": "保存这些设置时若不存在会自动创建。",
-        "settings_are_managed_on_the_machine_running_kiro": "设置在运行 Kiro Crew 的机器上管理，远程会话中为只读。",
+        "settings_are_managed_on_the_machine_running_kiro": "设置在运行 RoyCrew 的机器上管理，远程会话中为只读。",
         "setup_guide": "设置指南",
         "shared_channels": "共享频道",
         "soft_context_threshold": "软上下文阈值 %",
@@ -10960,7 +10960,7 @@
         "max_tree_nodes": "树节点上限",
         "not_applicable": "不适用",
         "not_detected": "未检测到",
-        "not_detected_does_not_always_mean_unavailable_ma": "未检测到并不总是意味着不可用 — macOS 会把权限授予记在启动 Kiro Crew 的进程上，而不是 Kiro Crew 本身。",
+        "not_detected_does_not_always_mean_unavailable_ma": "未检测到并不总是意味着不可用 — macOS 会把权限授予记在启动 RoyCrew 的进程上，而不是 RoyCrew 本身。",
         "on_windows_keystrokes_take_your_keyboard_focus": "在 Windows 上，按键会夺取你的键盘焦点，坐标点击会移动真实光标——这个平台没有面向单个应用的输入通道。",
         "open_system_settings": "打开系统设置",
         "open_system_settings_for": "打开{{label}}的系统设置",
@@ -11002,7 +11002,7 @@
         "thinking_label": "显示思考过程",
         "thread_allowlist_description": "可选。已批准的用户只能在这些指定的 Discord 话题中运行代理。留空 = 仅私聊。",
         "thread_help": "开启 Developer Mode 后，右键点击话题 → <mono>Copy Channel ID</mono>。用话题本身的 ID，而不是父频道的 ID。",
-        "thread_warning": "话题模式会启用 Discord 的全局 Message Content intent。Discord 会投递机器人可见的每个服务器频道的内容；Kiro Crew 会丢弃已批准话题之外的流量。任何能查看已批准话题的人都能读到代理回复和工具输出。",
+        "thread_warning": "话题模式会启用 Discord 的全局 Message Content intent。Discord 会投递机器人可见的每个服务器频道的内容；RoyCrew 会丢弃已批准话题之外的流量。任何能查看已批准话题的人都能读到代理回复和工具输出。",
         "threshold_description": "会话上下文超过此百分比时，提示使用 !compact 或 !new。",
         "token_description": "来自开发者门户的 Bot 页面（点击 Reset Token 查看一次）。",
         "token_placeholder": "粘贴 Discord 机器人令牌"
@@ -11091,7 +11091,7 @@
         "handle_placeholder": "+15551234567",
         "loading": "正在加载 iMessage 配置…",
         "macos_only": "iMessage 需要在已登录 Messages 的 macOS 上运行，且网关必须运行在那台 Mac 上。此主机无法访问 iMessage，因此这些设置为只读。",
-        "managed_locally": "iMessage 设置在运行 Kiro Crew 的机器上管理，因此在远程会话中为只读。",
+        "managed_locally": "iMessage 设置在运行 RoyCrew 的机器上管理，因此在远程会话中为只读。",
         "needs_setup": "需要设置",
         "not_active": "未激活",
         "prerequisites_body": "无需机器人，也无需令牌：代理通过本地桥接与你自己的 Messages 应用通信，因此传输环节不经过任何第三方。但你的提示词仍会发送给代理所配置的模型提供方，与在其他渠道时一样。你需要 macOS 14 或更新版本并已登录 Messages，安装好 imsg CLI，再授予两项一次性 macOS 权限——Full Disk Access 和针对 Messages 的 Automation。",
@@ -11405,7 +11405,7 @@
         "disabled_by_policy": "已由策略禁用",
         "disabled_for_this_surface": "已对主机面禁用",
         "disabling_a_rule_that_overlaps_an_always_on_cont": "禁用与常开控制项（敏感文件读取、IMDS、git 发布）重叠的规则并不会完全解除限制 — 纵深防御仍会阻止它。",
-        "disabling_all_built_in_denies_removes_kirocrew_s": "禁用所有内置拒绝规则会移除 Kiro Crew 针对破坏性命令和凭证外泄命令的保护。独立的纵深防御控制项（敏感路径、IMDS、git 发布）仍可能拦截部分命令。",
+        "disabling_all_built_in_denies_removes_kirocrew_s": "禁用所有内置拒绝规则会移除 RoyCrew 针对破坏性命令和凭证外泄命令的保护。独立的纵深防御控制项（敏感路径、IMDS、git 发布）仍可能拦截部分命令。",
         "disabling_weakens_protection": "禁用“{{name}}”会削弱针对破坏性命令和凭证外泄命令的保护。独立的纵深防御控制项仍可能拦截部分命令。",
         "do_not_enter_highly_sensitive_or_restricted_data": "请勿在 Kiro Crew 中输入高度敏感或受限数据。在决定与代理共享哪些内容时，请遵循任何适用的数据处理政策。",
         "documentation": "文档",
@@ -11432,7 +11432,7 @@
         "feature_sel_audit": "SEL 审计日志",
         "feature_sel_audit_description": "不可篡改、HMAC 链式的安全事件轨迹，转发前先对凭证脱敏",
         "feature_sensitive_paths": "敏感路径拦截",
-        "feature_sensitive_paths_description": "在工具执行前，于钩子层拦截凭证目录和 Kiro Crew 信任根",
+        "feature_sensitive_paths_description": "在工具执行前，于钩子层拦截凭证目录和 RoyCrew 信任根",
         "feature_suspicious_patterns": "可疑 Bash 模式",
         "feature_suspicious_patterns_description": "检测 shell 命令中的删除、外泄和管道执行攻击形态",
         "feature_token_auth": "仪表板令牌认证",
@@ -11468,7 +11468,7 @@
         "governance_status_is_temporarily_unavailable_enf": "治理状态暂时不可用。强制执行不受影响 — 此视图无法解析上限以供显示。",
         "hide_pattern": "隐藏规则",
         "host_surface": "主机接入面",
-        "i_understand_this_weakens_kirocrew_s_protection": "我理解这会削弱 Kiro Crew 的保护。",
+        "i_understand_this_weakens_kirocrew_s_protection": "我理解这会削弱 RoyCrew 的保护。",
         "interactive": "交互式",
         "invalid_regular_expression": "无效的正则表达式",
         "kiro_crew_security_policy_json": "~/.kiro/crew/security_policy.json",
@@ -11496,7 +11496,7 @@
         "process_sandbox": "进程沙箱",
         "profile": "配置文件：",
         "profile_2": "配置文件",
-        "profile_unusable_body": "下方列出的配置文件无法加载，因此其所属面被限制在策略回退上限——除非声明更宽松的回退，否则全部拒绝。请在 Kiro Crew 数据主目录的 profiles 文件夹中修正该文件——修好后会自动重新加载。",
+        "profile_unusable_body": "下方列出的配置文件无法加载，因此其所属面被限制在策略回退上限——除非声明更宽松的回退，否则全部拒绝。请在 RoyCrew 数据主目录的 profiles 文件夹中修正该文件——修好后会自动重新加载。",
         "profile_unusable_detail": "该文件不可读、解析失败，或它所继承的配置文件缺失。仅当文件本身适用于比当前运行版本更新的构建时，才需要重启。",
         "profile_unusable_title": "回退配置文件已生效",
         "profile_unusable_which": "受影响的配置文件：{{profiles}}。",
@@ -11545,7 +11545,7 @@
         "tailnet_unavailable": "无法读取 tailnet 设置，因此这里既不能显示也不能修改。如果它原本已开启，tailnet 名称仍然被允许；请重新加载页面后重试。",
         "tailnet_unresolved_note": "此项已开启，但 Kiro Crew 启动时没有解析到 tailnet 名称，因此没有向允许来源添加任何内容。通过 tailscale serve 访问的仪表板仍会被来源校验拒绝。名称可用后请重启 Kiro Crew。",
         "the_strictest_boundary_in_effect_for_each_govern": "每个受治理作用域当前生效的最严格边界，位于",
-        "third_party_apps_on_warning": "这会信任所有第三方应用，包括你以后才安装的，而不只是你正要启动那一个。受信任应用与 Kiro Crew 拥有同等访问权限：你的文件、你保存的凭据，以及网络。",
+        "third_party_apps_on_warning": "这会信任所有第三方应用，包括你以后才安装的，而不只是你正要启动那一个。受信任应用与 RoyCrew 拥有同等访问权限：你的文件、你保存的凭据，以及网络。",
         "third_party_apps_save_failed": "无法保存该设置。",
         "third_party_apps_scope_note": "立即生效。重新关闭时，此前获准运行的第三方应用也会停止——先运行其关闭钩子，再停止后端；任何未能停止的项都会报告给你。",
         "third_party_apps_section": "第三方应用",
@@ -11574,7 +11574,7 @@
         "turn_off_every_rule": "一次性关闭所有内置的拒绝命令规则。独立的纵深防御控制项（敏感路径、IMDS、git 发布）仍会强制执行。",
         "turn_off_every_rule_governance_locked": "一次性关闭所有内置的拒绝命令规则。独立的纵深防御控制项（敏感路径、IMDS、git 发布）仍会强制执行，以及由组织策略固定的规则仍会保持启用。",
         "yolo_active_expires_at": "自动批准已开启，会一直保持到 {{time}}。",
-        "yolo_active_until_restart": "自动批准已开启，会一直保持到 Kiro Crew 重启。",
+        "yolo_active_until_restart": "自动批准已开启，会一直保持到 RoyCrew 重启。",
         "yolo_auto_approve": "YOLO（自动批准）",
         "yolo_duration_12h": "12 小时",
         "yolo_duration_1h": "1 小时",
@@ -11585,7 +11585,7 @@
         "yolo_duration_locked": "已由组织策略禁用",
         "yolo_duration_next_activation_note": "下次开启自动批准时生效。",
         "yolo_duration_title": "自动批准保持开启的时长",
-        "yolo_duration_until_shutdown": "直到 Kiro Crew 重启",
+        "yolo_duration_until_shutdown": "直到 RoyCrew 重启",
         "your_custom_denies": "你的自定义拒绝规则"
       },
       "shortcutsPanel": {
@@ -11653,7 +11653,7 @@
         "slack_bot_token": "Slack 机器人令牌",
         "slack_connection_failed_at_startup": "Slack 启动时连接失败（{{error}}）。检查到 slack.com 的网络连通性，然后重启网关。",
         "slack_rejected_the_stored_tokens_invalid_auth_re": "Slack 拒绝了已存储的令牌（invalid_auth）。请在下方替换它们，然后重启网关。",
-        "slack_settings_are_managed_on_the_machine_runnin": "Slack 设置在运行 Kiro Crew 的机器上管理，远程会话中为只读。",
+        "slack_settings_are_managed_on_the_machine_runnin": "Slack 设置在运行 RoyCrew 的机器上管理，远程会话中为只读。",
         "slash_command": "斜杠命令",
         "talk_to_your_agents_from_slack_over_socket_mode": "通过 Socket Mode 从 Slack 与你的代理对话。添加允许的成员 ID，已连接的机器人才能回复。",
         "the_one_member_who_can_always_interact_with_the": "唯一始终可以与机器人交互的成员（KIROCREW_OWNER_ID）。以 U 或 W 开头。",
@@ -11830,7 +11830,7 @@
         "talk_to_your_agents_from_a_teams_1_1_chat_self_h": "从 Teams 一对一聊天与你的代理对话。通过 Bot Framework 自托管：\n            Teams 会向你网关的 HTTPS Webhook 推送消息，因此需要一个公网端点\n            （反向代理、App Service 或开发隧道）。",
         "teams_credential_check_failed": "Teams 凭证检查失败（{{error}}）。核对 App ID / 密码 / 租户，然后重启网关。",
         "teams_delivers_messages_by_calling_this_endpoint": "Teams 通过从互联网\n              调用此端点来投递消息，因此",
-        "teams_settings_are_managed_on_the_machine_runnin": "Teams 设置在运行 Kiro Crew 的机器上管理，远程会话中为只读。",
+        "teams_settings_are_managed_on_the_machine_runnin": "Teams 设置在运行 RoyCrew 的机器上管理，远程会话中为只读。",
         "tenant_id": "租户 ID",
         "to": "为",
         "tunnel_or_reverse_proxy_see_the_note_above_note": "（隧道或反向\n              代理）— 参见上方说明。记下最终得到的主机地址。",
@@ -11936,7 +11936,7 @@
         "webex": "Webex",
         "webex_account_emails_permitted_to_dm_the_bot_emp": "允许私聊机器人的 Webex 账户邮箱。留空 = 无人（默认拒绝）— 组织内任何人都能给 Webex 机器人发消息，所以只添加你自己。",
         "webex_bot_token": "Webex 机器人令牌",
-        "webex_settings_are_managed_on_the_machine_runnin": "Webex 设置在运行 Kiro Crew 的机器上管理，远程会话中为只读。",
+        "webex_settings_are_managed_on_the_machine_runnin": "Webex 设置在运行 RoyCrew 的机器上管理，远程会话中为只读。",
         "where_to_find_the_bot_token": "在哪里查找机器人令牌",
         "you_example_com": "you@example.com"
       },
@@ -12419,8 +12419,8 @@
     "dataNeverSentTitle": "绝不发送",
     "envOverrideWithSettingRef": "心跳已关闭，因为 <settingRef/> 在此环境中已设置。取消设置以在此处管理遥测。",
     "governanceOverrideNote": "你的管理员的安全策略已将其关闭，无法在此处更改。",
-    "installReceiptBody": "从 Kiro Crew 官方目录成功安装或更新后，会发送一条匿名回执。外部注册表、本地应用和自行注册的应用绝不会被报告。",
-    "installReceiptFields": "官方应用 slug · 每个应用独立的匿名令牌（无法跨应用关联）· 全新安装/更新标记 · Kiro Crew 版本",
+    "installReceiptBody": "从 RoyCrew 官方目录成功安装或更新后，会发送一条匿名回执。外部注册表、本地应用和自行注册的应用绝不会被报告。",
+    "installReceiptFields": "官方应用 slug · 每个应用独立的匿名令牌（无法跨应用关联）· 全新安装/更新标记 · RoyCrew 版本",
     "installReceiptTitle": "官方应用安装回执",
     "localDataBody": "使用记录和上下文记录。性能指标默认关闭。",
     "localDataTitle": "保留在你的设备上",
@@ -12448,7 +12448,7 @@
         "auto": "自动",
         "description": "仪表板界面的显示语言。",
         "label": "语言",
-        "sync_failed": "无法保存到 Kiro Crew 配置 — 此语言仅在此浏览器生效，重新加载后可能重置。"
+        "sync_failed": "无法保存到 RoyCrew 配置 — 此语言仅在此浏览器生效，重新加载后可能重置。"
       }
     },
     "groups": {
@@ -12501,7 +12501,7 @@
         "label": "显示"
       },
       "imports": {
-        "description": "从其他 AI 代理导入数据，并备份或恢复 Kiro Crew 配置",
+        "description": "从其他 AI 代理导入数据，并备份或恢复 RoyCrew 配置",
         "label": "导入 / 导出"
       },
       "instances": {

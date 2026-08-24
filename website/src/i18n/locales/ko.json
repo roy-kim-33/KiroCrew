@@ -89,7 +89,7 @@
     "skip_to_content": "본문으로 건너뛰기",
     "social_login": "소셜 로그인",
     "stale_fetch_failing": "(오래됨: 가져오기 실패 중)",
-    "star_kirocrew_on_github": "GitHub에서 Kiro Crew에 스타 주기",
+    "star_kirocrew_on_github": "GitHub에서 RoyCrew에 스타 주기",
     "star_us": "스타 주기",
     "starting_update": "업데이트 시작 중…",
     "subagent_cap": "cap: {{cap}}",
@@ -127,7 +127,7 @@
   "apps": {
     "agentWorlds": {
       "manifest": {
-        "description": "실행 중인 에이전트를 애니메이션 픽셀 아트 장면 속 캐릭터로 바꿔, 한눈에 Kiro Crew가 얼마나 바쁜지 알 수 있게 합니다. 활성 에이전트마다 스프라이트로 나타나 작업이 시작되고 끝날 때 반응하며, 고전적인 사무실부터 마법사 탑이나 심해 연구소까지 테마 장면을 넘나듭니다. 별도 창으로 띄워 작업하는 동안 두 번째 화면에 계속 띄워 둘 수 있습니다.",
+        "description": "실행 중인 에이전트를 애니메이션 픽셀 아트 장면 속 캐릭터로 바꿔, 한눈에 RoyCrew가 얼마나 바쁜지 알 수 있게 합니다. 활성 에이전트마다 스프라이트로 나타나 작업이 시작되고 끝날 때 반응하며, 고전적인 사무실부터 마법사 탑이나 심해 연구소까지 테마 장면을 넘나듭니다. 별도 창으로 띄워 작업하는 동안 두 번째 화면에 계속 띄워 둘 수 있습니다.",
         "display_name": "Agent Worlds",
         "highlight_1": "어떤 에이전트가 실행 중인지 목록이 아닌 캐릭터로 보여 주는 실시간 뷰",
         "highlight_2": "사무실·판다 굴·뉴럴 넷·마법사 탑·심해 연구소 등 테마 장면",
@@ -997,7 +997,7 @@
         "title": "Crew Companion"
       },
       "manifest": {
-        "description": "하루의 속도를 조절하도록 돕는 Kiro Crew의 데스크톱 컴패니언입니다. 휴식을 권하고, 일상적인 말로 설정한 리마인더를 기억하며, 재충전이 필요할 때 짧은 호흡 운동을 진행합니다. 세션이 끝나거나 실패하거나 승인이 필요할 때도 알려 줍니다.",
+        "description": "하루의 속도를 조절하도록 돕는 RoyCrew의 데스크톱 컴패니언입니다. 휴식을 권하고, 일상적인 말로 설정한 리마인더를 기억하며, 재충전이 필요할 때 짧은 호흡 운동을 진행합니다. 세션이 끝나거나 실패하거나 승인이 필요할 때도 알려 줍니다.",
         "display_name": "Crew Companion",
         "highlight_1": "물 마시기·스트레칭·먼 곳 보기 등 부드러운 휴식 알림을 원하는 간격으로",
         "highlight_2": "‘20분 뒤에 물 마시기’처럼 일상적인 말로 설정하는 리마인더",
@@ -1461,14 +1461,14 @@
     },
     "devFleet": {
       "manifest": {
-        "description": "Kiro Crew 자체를 개발하기 위한 제어판입니다. 모든 기능 워크트리를 풀 리퀘스트 상태, 커밋 수, 디스크 사용량과 함께 나열하고, 그중 어느 것이든 포드로 띄울 수 있습니다. 포드는 자체 포트와 자체 데이터 디렉터리를 갖는 완전한 미리 보기 인스턴스이므로, 실행 중인 게이트웨이를 건드리지 않고 완성되지 않은 변경을 직접 눌러 볼 수 있습니다. main 풀 및 재빌드, 브랜치 리베이스, 포드 로그 스트리밍, 이미 병합된 워크트리 정리 같은 주변 작업도 함께 처리합니다.",
+        "description": "RoyCrew 자체를 개발하기 위한 제어판입니다. 모든 기능 워크트리를 풀 리퀘스트 상태, 커밋 수, 디스크 사용량과 함께 나열하고, 그중 어느 것이든 포드로 띄울 수 있습니다. 포드는 자체 포트와 자체 데이터 디렉터리를 갖는 완전한 미리 보기 인스턴스이므로, 실행 중인 게이트웨이를 건드리지 않고 완성되지 않은 변경을 직접 눌러 볼 수 있습니다. main 풀 및 재빌드, 브랜치 리베이스, 포드 로그 스트리밍, 이미 병합된 워크트리 정리 같은 주변 작업도 함께 처리합니다.",
         "display_name": "Dev Fleet",
         "highlight_1": "어떤 워크트리든 자체 포트와 데이터 디렉터리를 쓰는 격리된 포드로 띄워, 실행 중인 게이트웨이는 그대로 둡니다",
         "highlight_2": "브랜치별 PR 상태, 커밋 수, 디스크 사용량을 보여 주는 플릿 화면",
         "highlight_3": "대시보드를 벗어나지 않고 브랜치를 동기화(main 풀 후 재빌드)하거나 리베이스",
         "highlight_4": "‘병합된 항목 정리’는 커밋되지 않았거나 추적되지 않는 작업이 있는 워크트리를 버리지 않고 삭제를 거부합니다",
         "highlight_5": "UI에서 포드 로그를 스트리밍하고 포드 액세스 토큰을 발급",
-        "highlight_6": "Kiro Crew 자체를 개발하는 사람을 위해 만들었습니다 — 일상적인 사용에는 필요하지 않습니다",
+        "highlight_6": "RoyCrew 자체를 개발하는 사람을 위해 만들었습니다 — 일상적인 사용에는 필요하지 않습니다",
         "highlight_7": "포드는 Linux(systemd --user)와 macOS(launchd)에서 실행됩니다 — 다만 macOS 포드에는 메모리/CPU 상한이 적용되지 않습니다. Make Live는 여전히 Linux 전용이며, 플릿 화면, PR 상태, 동기화, 리베이스, 정리는 모든 플랫폼에서 동작합니다",
         "page_label": "Dev Fleet"
       }
@@ -1500,7 +1500,7 @@
         "truncated": "· 잘림"
       },
       "manifest": {
-        "description": "대시보드를 벗어나지 않고 Kiro Crew가 실행 중인 머신의 파일을 살펴보고 읽습니다. 여러 파일을 탭으로 열어 두고, 각 파일의 git 상태가 옆에 표시되는 디렉터리 트리를 따라 이동하고, 폴더 전체에서 문자열을 검색하고, Markdown을 원본이 아닌 렌더링된 형태로 읽을 수 있습니다. 설계상 읽기 전용입니다. 파일을 열고 검색하지만 편집·이동·삭제는 절대 하지 않으며, 접근 범위는 홈 디렉터리와 /tmp, /opt로 한정됩니다.",
+        "description": "대시보드를 벗어나지 않고 RoyCrew가 실행 중인 머신의 파일을 살펴보고 읽습니다. 여러 파일을 탭으로 열어 두고, 각 파일의 git 상태가 옆에 표시되는 디렉터리 트리를 따라 이동하고, 폴더 전체에서 문자열을 검색하고, Markdown을 원본이 아닌 렌더링된 형태로 읽을 수 있습니다. 설계상 읽기 전용입니다. 파일을 열고 검색하지만 편집·이동·삭제는 절대 하지 않으며, 접근 범위는 홈 디렉터리와 /tmp, /opt로 한정됩니다.",
         "display_name": "파일",
         "highlight_1": "읽기 전용: 파일을 열고 검색하며, 쓰기·이동·삭제는 하지 않습니다",
         "highlight_2": "여러 파일을 탭으로 동시에 열고 구문 강조를 표시",
@@ -2686,7 +2686,7 @@
       "manifest": {
         "description": "AI 회의 도우미입니다. 진행 중인 회의를 전사하고, 진행에 맞춰 구조화된 노트와 다이어그램을 유지하며, 액션 아이템을 추출해 등록 전에 검토할 수 있게 합니다.",
         "display_name": "회의",
-        "highlight_1": "Kiro Crew 자체 음성 인식으로 실시간 전사 — 추가 데몬도, 이미 쓰고 있는 것 외의 클라우드 계정도 필요 없습니다",
+        "highlight_1": "RoyCrew 자체 음성 인식으로 실시간 전사 — 추가 데몬도, 이미 쓰고 있는 것 외의 클라우드 계정도 필요 없습니다",
         "highlight_2": "에이전트 팀이 회의를 병렬로 처리합니다: 구조화된 노트, HTML/Mermaid 다이어그램, 액션 아이템 목록",
         "highlight_3": "반복되는 음성 인식 오류를 도메인 사전으로 한 번 고치면 이후 모든 회의에서 올바르게 인식됩니다",
         "highlight_4": "등록 전에 추출된 액션 아이템을 검토합니다 — 불필요한 것은 보관하고 나머지는 등록하세요",
@@ -3829,7 +3829,7 @@
         "no_source_files": "소스 파일이 없습니다."
       },
       "manifest": {
-        "description": "실시간 PDF 미리보기와 AI 공동 저자를 갖춘 LaTeX 논문 에디터입니다. 분할 창 에디터에서 작성하고 Cmd+S(Windows 및 Linux에서는 Ctrl+S)를 눌러 pdflatex 또는 tectonic으로 컴파일하며, 소스 옆에서 렌더링된 PDF를 읽습니다. 컴파일 오류는 문제가 된 행으로 이동하는 클릭 가능한 목록으로 파싱됩니다. 임의의 git 리모트에서 기존 논문을 클론한 뒤 툴바에서 커밋하고 푸시하세요. 공동 저자 패널은 논문에 범위가 지정된 실제 Kiro Crew 채팅 세션이므로, PDF가 갱신되는 것을 보는 동안 에이전트가 LaTeX를 읽고 편집할 수 있습니다.",
+        "description": "실시간 PDF 미리보기와 AI 공동 저자를 갖춘 LaTeX 논문 에디터입니다. 분할 창 에디터에서 작성하고 Cmd+S(Windows 및 Linux에서는 Ctrl+S)를 눌러 pdflatex 또는 tectonic으로 컴파일하며, 소스 옆에서 렌더링된 PDF를 읽습니다. 컴파일 오류는 문제가 된 행으로 이동하는 클릭 가능한 목록으로 파싱됩니다. 임의의 git 리모트에서 기존 논문을 클론한 뒤 툴바에서 커밋하고 푸시하세요. 공동 저자 패널은 논문에 범위가 지정된 실제 RoyCrew 채팅 세션이므로, PDF가 갱신되는 것을 보는 동안 에이전트가 LaTeX를 읽고 편집할 수 있습니다.",
         "display_name": "Papyrus",
         "highlight_1": "실시간 PDF 미리보기를 옆에 둔 분할 창 LaTeX 에디터",
         "highlight_2": "저장 시 컴파일(Cmd+S, Windows 및 Linux에서는 Ctrl+S), pdflatex 또는 tectonic 경유, bibtex 주기까지 대신 실행",
@@ -4292,7 +4292,7 @@
         }
       },
       "manifest": {
-        "description": "Kiro Crew 안에서의 스펙 주도 개발: 내장 에이전트와 함께 기능 아이디어를 요구사항 → 설계 → 작업으로 바꾸고, 앱 안에서 Markdown을 검토한 뒤 승인된 계획을 자율 실행 세션으로 넘깁니다.",
+        "description": "RoyCrew 안에서의 스펙 주도 개발: 내장 에이전트와 함께 기능 아이디어를 요구사항 → 설계 → 작업으로 바꾸고, 앱 안에서 Markdown을 검토한 뒤 승인된 계획을 자율 실행 세션으로 넘깁니다.",
         "display_name": "Spec Builder",
         "page_label": "Spec Builder"
       },
@@ -4304,7 +4304,7 @@
     },
     "workflows": {
       "manifest": {
-        "description": "동적 워크플로를 작성, 실행, 관찰합니다: 보통 에이전트가 일상 영어 목표로부터 작성해 주는 Python 스크립트로, 여러 Kiro Crew 에이전트를 정해진 단계에 따라 구동합니다. 스크립트는 실행 전에 샌드박스화된 워크플로 명령 집합에 대해 검사되므로 실수가 실행 없이 드러나며, 이후 페이지가 실행이 진행되는 동안 각 단계와 에이전트 이벤트를 스트리밍합니다. 시작점으로 쓸 실행 가능한 예제가 앱에 함께 제공됩니다.",
+        "description": "동적 워크플로를 작성, 실행, 관찰합니다: 보통 에이전트가 일상 영어 목표로부터 작성해 주는 Python 스크립트로, 여러 RoyCrew 에이전트를 정해진 단계에 따라 구동합니다. 스크립트는 실행 전에 샌드박스화된 워크플로 명령 집합에 대해 검사되므로 실수가 실행 없이 드러나며, 이후 페이지가 실행이 진행되는 동안 각 단계와 에이전트 이벤트를 스트리밍합니다. 시작점으로 쓸 실행 가능한 예제가 앱에 함께 제공됩니다.",
         "display_name": "Workflows",
         "highlight_1": "실행 전에 워크플로를 검증합니다 — 아무것도 실행되지 않은 채 오류가 드러납니다",
         "highlight_2": "실행을 실시간으로, 단계별로, 에이전트별 진행 이벤트와 함께 관찰합니다",
@@ -4578,7 +4578,7 @@
       "trust_tooltip": "이 채팅에서 {{productName}}은(는) 먼저 묻지 않고 작업합니다",
       "yolo_desc": "모든 채팅에서 {{productName}}은(는) 먼저 묻지 않고 작업합니다",
       "yolo_expiration_timed": "{{duration}} 후 자동으로 꺼지고 다시 물어봅니다.",
-      "yolo_expiration_until_shutdown": "Kiro Crew가 재시작될 때까지 켜져 있습니다 — 시간 만료가 없습니다.",
+      "yolo_expiration_until_shutdown": "RoyCrew가 재시작될 때까지 켜져 있습니다 — 시간 만료가 없습니다.",
       "yolo_label": "YOLO",
       "yolo_mode_is_an_app_wide_setting": "YOLO 모드는 앱 전체 설정입니다",
       "yolo_tooltip": "모든 채팅에서 {{productName}}은(는) 먼저 묻지 않고 작업합니다"
@@ -9699,7 +9699,7 @@
         "filter_servers_or_tools": "서버 또는 도구 필터…",
         "globals": "전역 설정",
         "kiro": "Kiro",
-        "kirocrew": "Kiro Crew",
+        "kirocrew": "RoyCrew",
         "last_probed": "마지막 프로브",
         "mcp_servers_count": "MCP 서버 ({{count}})",
         "name": "이름",
@@ -9714,7 +9714,7 @@
         "pending_enable_click_to_revert": "보류 중: 활성화 (클릭하면 취소)",
         "pending_uninstall": "{{label}} — 제거 보류 중",
         "probe_mcp_servers": "MCP 서버 탐색",
-        "servers_scope_tip": "Kiro Crew와 대화형 {{provider}}/Kiro 전역 설정 전반의 MCP 서버입니다. Kiro Crew 배지는 Kiro Crew 세션에서 로드되는지를, 전역 배지는 대화형 Kiro 전역 설정과 공유되는지를 나타냅니다. 클릭해 전환한 뒤 적용하세요.",
+        "servers_scope_tip": "RoyCrew와 대화형 {{provider}}/Kiro 전역 설정 전반의 MCP 서버입니다. RoyCrew 배지는 RoyCrew 세션에서 로드되는지를, 전역 배지는 대화형 Kiro 전역 설정과 공유되는지를 나타냅니다. 클릭해 전환한 뒤 적용하세요.",
         "status": "상태",
         "tool_list_read_from_the_package_s_declaration_th": "도구 목록은 패키지의 선언에서 읽었습니다. 서버가 실제로 시작되는지 확인하지 않았습니다.",
         "tools": "도구",
@@ -9725,7 +9725,7 @@
       },
       "memoryGraphTab": {
         "all_count": "전체 ({{count}})",
-        "gpu_rendered_visualization_of_all_kirocrew_memor": "모든 Kiro Crew 메모리를 GPU로 렌더링한 시각화입니다. 노드는 유형별로 색상이 구분됩니다. 확대하면 레이블이 나타나고, 노드를 클릭하면 자세히 살펴볼 수 있으며, 필터로 범위를 좁힐 수 있습니다.",
+        "gpu_rendered_visualization_of_all_kirocrew_memor": "모든 RoyCrew 메모리를 GPU로 렌더링한 시각화입니다. 노드는 유형별로 색상이 구분됩니다. 확대하면 레이블이 나타나고, 노드를 클릭하면 자세히 살펴볼 수 있으며, 필터로 범위를 좁힐 수 있습니다.",
         "group_history_count": "기록 ({{count}})",
         "group_lessons_count": "학습 내용 ({{count}})",
         "group_preferences_count": "환경설정 ({{count}})",
@@ -9905,7 +9905,7 @@
         "skills": "스킬",
         "skills_count": "스킬 ({{count}})",
         "skills_from_read_only": "{{name}}의 스킬 — 읽기 전용",
-        "skills_tip": "온디맨드 스킬은 에이전트가 관련이 있다고 판단할 때 로드됩니다. ‘자동’ 배지가 붙은 스킬은 항상 모든 세션에 주입됩니다. 스킬은 Kiro Crew, kiro-cli (~/.kiro/skills), AIM 패키지에서 검색됩니다.",
+        "skills_tip": "온디맨드 스킬은 에이전트가 관련이 있다고 판단할 때 로드됩니다. ‘자동’ 배지가 붙은 스킬은 항상 모든 세션에 주입됩니다. 스킬은 RoyCrew, kiro-cli (~/.kiro/skills), AIM 패키지에서 검색됩니다.",
         "the_skill_this_update_targets_no_longer_exists_s": "이 업데이트의 대상 스킬이 더 이상 존재하지 않아 업데이트할 것이 없습니다. 이 후보를 무시하세요.",
         "this_skill_changed_after_this_update_was_written": "이 업데이트가 작성된 뒤 스킬이 변경되어, 지금 적용하면 그 이후의 변경 사항이 취소됩니다. 승인이 차단되었습니다 — 이 후보를 무시하면 현재 버전을 기준으로 새 업데이트가 제안됩니다.",
         "update": "업데이트",
@@ -10135,7 +10135,7 @@
     },
     "popoutFrame": {
       "session": "세션",
-      "window_title": "{{label}} — Kiro Crew"
+      "window_title": "{{label}} — RoyCrew"
     },
     "projectDetailPage": {
       "analyzing_task_and_building_step_by_step_plan": "작업을 분석해 단계별 플랜을 구성하는 중",
@@ -10595,7 +10595,7 @@
         "downloading": "다운로드 중…",
         "insider": "Insider",
         "install_failed": "업데이트를 설치할 수 없습니다",
-        "installing_quiet_note": "설치 중 — Kiro Crew가 1~2분 동안 응답하지 않다가 자동으로 재시작됩니다.",
+        "installing_quiet_note": "설치 중 — RoyCrew가 1~2분 동안 응답하지 않다가 자동으로 재시작됩니다.",
         "is_available": "사용 가능합니다.",
         "loading_changelog": "변경 기록 불러오는 중…",
         "manual_install_fallback": "업데이트가 잘 되지 않으면 {{link}} 후 이 사본 위에 다시 설치할 수 있습니다. 설정, 채팅, 파일은 그대로 유지됩니다.",
@@ -10680,7 +10680,7 @@
         "saving": "저장 중…",
         "session_folder_name": "폴더 이름",
         "session_folder_name_desc": "이 설정을 저장할 때 폴더가 아직 없으면 새로 만들어집니다.",
-        "settings_are_managed_on_the_machine_running_kiro": "설정은 Kiro Crew를 실행하는 컴퓨터에서 관리되며 원격 세션에서는 읽기 전용입니다.",
+        "settings_are_managed_on_the_machine_running_kiro": "설정은 RoyCrew를 실행하는 컴퓨터에서 관리되며 원격 세션에서는 읽기 전용입니다.",
         "setup_guide": "설정 가이드",
         "shared_channels": "공용 채널",
         "soft_context_threshold": "소프트 컨텍스트 임계값 %",
@@ -10960,7 +10960,7 @@
         "max_tree_nodes": "최대 트리 노드 수",
         "not_applicable": "해당 없음",
         "not_detected": "감지되지 않음",
-        "not_detected_does_not_always_mean_unavailable_ma": "감지되지 않았다고 해서 항상 사용할 수 없다는 뜻은 아닙니다 — macOS는 권한을 Kiro Crew 자체가 아니라 Kiro Crew를 실행한 프로세스에 부여합니다.",
+        "not_detected_does_not_always_mean_unavailable_ma": "감지되지 않았다고 해서 항상 사용할 수 없다는 뜻은 아닙니다 — macOS는 권한을 RoyCrew 자체가 아니라 RoyCrew를 실행한 프로세스에 부여합니다.",
         "on_windows_keystrokes_take_your_keyboard_focus": "Windows에서는 키 입력이 키보드 포커스를 가져가고 좌표 클릭이 실제 커서를 움직입니다. 이 플랫폼에는 앱별 입력 경로가 없습니다.",
         "open_system_settings": "시스템 설정 열기",
         "open_system_settings_for": "{{label}} 시스템 설정 열기",
@@ -11002,7 +11002,7 @@
         "thinking_label": "사고 과정 표시",
         "thread_allowlist_description": "선택 사항입니다. 승인된 사용자는 지정한 Discord 스레드에서만 에이전트를 실행할 수 있습니다. 비어 있으면 DM만 사용합니다.",
         "thread_help": "개발자 모드를 켠 상태에서 스레드를 오른쪽 클릭 → <mono>Copy Channel ID</mono>. 상위 채널 ID가 아니라 스레드의 ID를 사용하세요.",
-        "thread_warning": "스레드 모드는 Discord의 전역 Message Content 인텐트를 켭니다. Discord는 봇이 볼 수 있는 모든 서버 채널의 콘텐츠를 전달하며, Kiro Crew는 승인된 스레드 밖의 트래픽을 버립니다. 승인된 스레드를 볼 수 있는 사람은 누구나 에이전트 응답과 도구 출력을 읽을 수 있습니다.",
+        "thread_warning": "스레드 모드는 Discord의 전역 Message Content 인텐트를 켭니다. Discord는 봇이 볼 수 있는 모든 서버 채널의 콘텐츠를 전달하며, RoyCrew는 승인된 스레드 밖의 트래픽을 버립니다. 승인된 스레드를 볼 수 있는 사람은 누구나 에이전트 응답과 도구 출력을 읽을 수 있습니다.",
         "threshold_description": "세션 컨텍스트가 이 비율을 넘으면 !compact 또는 !new를 실행하도록 안내합니다.",
         "token_description": "Developer Portal의 Bot 페이지에서 가져옵니다(Reset Token으로 한 번만 볼 수 있습니다).",
         "token_placeholder": "Discord 봇 토큰 붙여넣기"
@@ -11091,7 +11091,7 @@
         "handle_placeholder": "+15551234567",
         "loading": "iMessage 설정을 불러오는 중…",
         "macos_only": "iMessage는 Messages에 로그인된 macOS가 필요하며, 게이트웨이가 해당 Mac에서 실행되어야 합니다. 이 호스트는 iMessage에 연결할 수 없으므로 이 설정은 읽기 전용입니다.",
-        "managed_locally": "iMessage 설정은 Kiro Crew를 실행하는 컴퓨터에서 관리되므로 원격 세션에서는 읽기 전용입니다.",
+        "managed_locally": "iMessage 설정은 RoyCrew를 실행하는 컴퓨터에서 관리되므로 원격 세션에서는 읽기 전용입니다.",
         "needs_setup": "설정 필요",
         "not_active": "비활성",
         "prerequisites_body": "봇도 토큰도 없습니다. 에이전트는 로컬 브리지를 통해 본인의 Messages 앱에 연결하므로 전송 과정에는 제3자가 개입하지 않습니다. 하지만 프롬프트는 다른 채널과 마찬가지로 에이전트에 구성된 모델 제공자에게 여전히 전송됩니다. Messages에 로그인된 macOS 14 이상, imsg CLI 설치, 그리고 두 가지 일회성 macOS 권한(Messages에 대한 Full Disk Access 및 Automation)이 필요합니다.",
@@ -11405,7 +11405,7 @@
         "disabled_by_policy": "정책으로 비활성화됨",
         "disabled_for_this_surface": "호스트 표면에서 비활성화됨",
         "disabling_a_rule_that_overlaps_an_always_on_cont": "항상 켜져 있는 제어(민감 파일 읽기, IMDS, git-publish)와 겹치는 규칙을 비활성화해도 완전히 허용되지는 않습니다 — 다층 방어가 계속 차단합니다.",
-        "disabling_all_built_in_denies_removes_kirocrew_s": "모든 기본 거부 규칙을 비활성화하면 파괴적인 명령과 자격 증명 유출 명령에 대한 Kiro Crew의 보호가 사라집니다. 일부 명령은 독립적인 다층 방어(민감 경로, IMDS, git-publish)로 계속 차단될 수 있습니다.",
+        "disabling_all_built_in_denies_removes_kirocrew_s": "모든 기본 거부 규칙을 비활성화하면 파괴적인 명령과 자격 증명 유출 명령에 대한 RoyCrew의 보호가 사라집니다. 일부 명령은 독립적인 다층 방어(민감 경로, IMDS, git-publish)로 계속 차단될 수 있습니다.",
         "disabling_weakens_protection": "‘{{name}}’을(를) 비활성화하면 파괴적인 명령이나 자격 증명 유출에 대한 보호가 약해집니다. 일부 명령은 독립적인 다층 방어로 계속 차단될 수 있습니다.",
         "do_not_enter_highly_sensitive_or_restricted_data": "매우 민감하거나 제한된 데이터를 Kiro Crew에 입력하지 마세요. 에이전트와 공유할 내용을 결정할 때는 적용되는 데이터 처리 정책을 따르세요.",
         "documentation": "문서",
@@ -11432,7 +11432,7 @@
         "feature_sel_audit": "SEL 감사 로깅",
         "feature_sel_audit_description": "전달 전에 자격 증명을 마스킹하는 변경 불가능한 HMAC 체인 보안 이벤트 기록",
         "feature_sensitive_paths": "민감 경로 차단",
-        "feature_sensitive_paths_description": "자격 증명 디렉터리와 Kiro Crew 신뢰 루트를 도구 실행 전 훅 계층에서 차단합니다",
+        "feature_sensitive_paths_description": "자격 증명 디렉터리와 RoyCrew 신뢰 루트를 도구 실행 전 훅 계층에서 차단합니다",
         "feature_suspicious_patterns": "의심스러운 Bash 패턴",
         "feature_suspicious_patterns_description": "셸 명령에서 삭제, 유출, 파이프 실행 공격 형태를 감지합니다",
         "feature_token_auth": "대시보드 토큰 인증",
@@ -11468,7 +11468,7 @@
         "governance_status_is_temporarily_unavailable_enf": "거버넌스 상태를 일시적으로 사용할 수 없습니다. 적용에는 영향이 없습니다 — 이 화면에서 표시용 상한을 확인할 수 없습니다.",
         "hide_pattern": "패턴 숨기기",
         "host_surface": "호스트 표면",
-        "i_understand_this_weakens_kirocrew_s_protection": "이 설정이 Kiro Crew의 보호를 약화시킨다는 점을 이해합니다.",
+        "i_understand_this_weakens_kirocrew_s_protection": "이 설정이 RoyCrew의 보호를 약화시킨다는 점을 이해합니다.",
         "interactive": "대화형",
         "invalid_regular_expression": "잘못된 정규식",
         "kiro_crew_security_policy_json": "~/.kiro/crew/security_policy.json",
@@ -11496,7 +11496,7 @@
         "process_sandbox": "프로세스 샌드박스",
         "profile": "프로필:",
         "profile_2": "프로필",
-        "profile_unusable_body": "아래에 표시된 프로필을 로드할 수 없어 해당 표면이 정책 폴백 상한에 묶입니다. 더 느슨한 폴백이 선언되지 않는 한 전체 거부입니다. Kiro Crew 데이터 홈의 profiles 폴더에서 파일을 수정하십시오. 수정하면 자동으로 다시 로드됩니다.",
+        "profile_unusable_body": "아래에 표시된 프로필을 로드할 수 없어 해당 표면이 정책 폴백 상한에 묶입니다. 더 느슨한 폴백이 선언되지 않는 한 전체 거부입니다. RoyCrew 데이터 홈의 profiles 폴더에서 파일을 수정하십시오. 수정하면 자동으로 다시 로드됩니다.",
         "profile_unusable_detail": "파일을 읽을 수 없거나, 구문 분석에 실패했거나, 확장 대상 프로필이 없습니다. 재시작은 파일이 실행 중인 빌드보다 최신 빌드용인 경우에만 필요합니다.",
         "profile_unusable_title": "폴백 프로필이 적용 중입니다",
         "profile_unusable_which": "영향을 받는 프로필: {{profiles}}.",
@@ -11545,7 +11545,7 @@
         "tailnet_unavailable": "tailnet 설정을 읽을 수 없어 여기에서 표시하거나 변경할 수 없습니다. 이미 켜져 있었다면 tailnet 이름은 계속 허용됩니다. 페이지를 새로 고쳐 다시 시도하세요.",
         "tailnet_unresolved_note": "켜져 있지만 Kiro Crew 시작 시 tailnet 이름이 확인되지 않아 허용 오리진에 아무것도 추가되지 않았습니다. tailscale serve를 통해 접속한 대시보드는 여전히 오리진 검사에서 거부됩니다. 이름을 사용할 수 있게 되면 Kiro Crew를 다시 시작하세요.",
         "the_strictest_boundary_in_effect_for_each_govern": "다음에서 관리되는 각 범위에 적용 중인 가장 엄격한 경계",
-        "third_party_apps_on_warning": "이는 나중에 설치할 앱까지 포함해 모든 서드파티 앱을 신뢰합니다 — 지금 시작하려던 앱 하나만이 아닙니다. 신뢰된 앱은 Kiro Crew와 동일한 권한으로 실행됩니다: 사용자의 파일, 저장된 인증 정보, 인터넷.",
+        "third_party_apps_on_warning": "이는 나중에 설치할 앱까지 포함해 모든 서드파티 앱을 신뢰합니다 — 지금 시작하려던 앱 하나만이 아닙니다. 신뢰된 앱은 RoyCrew와 동일한 권한으로 실행됩니다: 사용자의 파일, 저장된 인증 정보, 인터넷.",
         "third_party_apps_save_failed": "이 설정을 저장할 수 없습니다.",
         "third_party_apps_scope_note": "즉시 적용됩니다. 다시 끄면 그동안 허용하던 앱도 중지됩니다 — 종료 훅이 실행되고, 백엔드가 중지되며, 중지하지 못한 항목은 사용자에게 보고됩니다.",
         "third_party_apps_section": "서드파티 앱",
@@ -11574,7 +11574,7 @@
         "turn_off_every_rule": "내장된 모든 명령 차단 규칙을 한 번에 끕니다. 독립적인 다층 방어 제어(민감한 경로, IMDS, git 공개)는 계속 적용됩니다.",
         "turn_off_every_rule_governance_locked": "내장된 모든 명령 차단 규칙을 한 번에 끕니다. 독립적인 다층 방어 제어(민감한 경로, IMDS, git 공개)는 계속 적용되며, 조직 정책으로 고정된 규칙은 켜진 상태로 유지됩니다.",
         "yolo_active_expires_at": "자동 승인이 {{time}}까지 켜져 있습니다.",
-        "yolo_active_until_restart": "자동 승인이 켜져 있으며 Kiro Crew가 재시작될 때까지 유지됩니다.",
+        "yolo_active_until_restart": "자동 승인이 켜져 있으며 RoyCrew가 재시작될 때까지 유지됩니다.",
         "yolo_auto_approve": "YOLO(자동 승인)",
         "yolo_duration_12h": "12시간",
         "yolo_duration_1h": "1시간",
@@ -11585,7 +11585,7 @@
         "yolo_duration_locked": "조직 정책으로 비활성화됨",
         "yolo_duration_next_activation_note": "다음에 자동 승인을 켤 때 적용됩니다.",
         "yolo_duration_title": "자동 승인 유지 시간",
-        "yolo_duration_until_shutdown": "Kiro Crew가 재시작될 때까지",
+        "yolo_duration_until_shutdown": "RoyCrew가 재시작될 때까지",
         "your_custom_denies": "사용자 지정 차단"
       },
       "shortcutsPanel": {
@@ -11653,7 +11653,7 @@
         "slack_bot_token": "Slack 봇 토큰",
         "slack_connection_failed_at_startup": "시작 시 Slack 연결에 실패했습니다({{error}}). slack.com에 대한 네트워크 액세스를 확인한 다음 게이트웨이를 재시작하세요.",
         "slack_rejected_the_stored_tokens_invalid_auth_re": "Slack이 저장된 토큰을 거부했습니다(invalid_auth). 아래에서 토큰을 교체한 다음 게이트웨이를 재시작하세요.",
-        "slack_settings_are_managed_on_the_machine_runnin": "Slack 설정은 Kiro Crew를 실행하는 머신에서 관리되며 원격 세션에서는 읽기 전용입니다.",
+        "slack_settings_are_managed_on_the_machine_runnin": "Slack 설정은 RoyCrew를 실행하는 머신에서 관리되며 원격 세션에서는 읽기 전용입니다.",
         "slash_command": "슬래시 명령",
         "talk_to_your_agents_from_slack_over_socket_mode": "Socket Mode를 통해 Slack에서 에이전트와 대화합니다. 연결된 봇이 응답할 수 있도록 허용된 멤버 ID를 추가하세요.",
         "the_one_member_who_can_always_interact_with_the": "봇과 항상 상호작용할 수 있는 단 한 명의 멤버입니다(KIROCREW_OWNER_ID). U 또는 W로 시작합니다.",
@@ -11830,7 +11830,7 @@
         "talk_to_your_agents_from_a_teams_1_1_chat_self_h": "Teams 1:1 채팅에서 에이전트와 대화합니다. Bot Framework를 통한 자체 호스팅 방식입니다.\n Teams가 게이트웨이의 HTTPS 웹후크로 요청을 보내므로 공개 엔드포인트가 필요합니다\n (리버스 프록시, App Service 또는 개발 터널).",
         "teams_credential_check_failed": "Teams 인증 정보 확인에 실패했습니다({{error}}). 앱 ID / 암호 / 테넌트를 확인한 다음 게이트웨이를 재시작하세요.",
         "teams_delivers_messages_by_calling_this_endpoint": "Teams는 인터넷에서 이 엔드포인트를\n 호출해 메시지를 전달하므로,",
-        "teams_settings_are_managed_on_the_machine_runnin": "Teams 설정은 Kiro Crew를 실행하는 머신에서 관리되며 원격 세션에서는 읽기 전용입니다.",
+        "teams_settings_are_managed_on_the_machine_runnin": "Teams 설정은 RoyCrew를 실행하는 머신에서 관리되며 원격 세션에서는 읽기 전용입니다.",
         "tenant_id": "테넌트 ID",
         "to": "다음으로",
         "tunnel_or_reverse_proxy_see_the_note_above_note": "(터널 또는 리버스\n 프록시) — 위 참고를 확인하세요. 결과 호스트를 기록해 두세요.",
@@ -11936,7 +11936,7 @@
         "webex": "Webex",
         "webex_account_emails_permitted_to_dm_the_bot_emp": "봇에 DM을 보낼 수 있는 Webex 계정 이메일입니다. 비워 두면 아무도 허용하지 않습니다(실패 시 차단) — 조직의 누구나 Webex 봇에 메시지를 보낼 수 있으므로 본인 이메일만 추가하세요.",
         "webex_bot_token": "Webex 봇 토큰",
-        "webex_settings_are_managed_on_the_machine_runnin": "Webex 설정은 Kiro Crew를 실행하는 머신에서 관리되며 원격 세션에서는 읽기 전용입니다.",
+        "webex_settings_are_managed_on_the_machine_runnin": "Webex 설정은 RoyCrew를 실행하는 머신에서 관리되며 원격 세션에서는 읽기 전용입니다.",
         "where_to_find_the_bot_token": "봇 토큰을 찾는 위치",
         "you_example_com": "you@example.com"
       },
@@ -12419,8 +12419,8 @@
     "dataNeverSentTitle": "전송하지 않는 항목",
     "envOverrideWithSettingRef": "<settingRef/>이(가) 이 환경에 설정되어 있어 하트비트가 꺼져 있습니다. 여기에서 텔레메트리를 관리하려면 해제하세요.",
     "governanceOverrideNote": "관리자의 보안 정책이 이 기능을 꺼 두었습니다. 여기서는 변경할 수 없습니다.",
-    "installReceiptBody": "Kiro Crew 공식 카탈로그에서 설치 또는 업데이트가 성공하면 익명 영수증 하나가 전송됩니다. 외부 레지스트리, 로컬 앱, 자체 등록된 앱은 보고되지 않습니다.",
-    "installReceiptFields": "공식 앱 슬러그 · 앱별 익명 토큰(앱 간 연결 불가) · 신규/업데이트 플래그 · Kiro Crew 버전",
+    "installReceiptBody": "RoyCrew 공식 카탈로그에서 설치 또는 업데이트가 성공하면 익명 영수증 하나가 전송됩니다. 외부 레지스트리, 로컬 앱, 자체 등록된 앱은 보고되지 않습니다.",
+    "installReceiptFields": "공식 앱 슬러그 · 앱별 익명 토큰(앱 간 연결 불가) · 신규/업데이트 플래그 · RoyCrew 버전",
     "installReceiptTitle": "공식 앱 설치 영수증",
     "localDataBody": "사용 및 컨텍스트 기록. 성능 메트릭은 기본적으로 꺼져 있습니다.",
     "localDataTitle": "기기에 보관",
@@ -12448,7 +12448,7 @@
         "auto": "자동",
         "description": "대시보드 인터페이스 언어.",
         "label": "언어",
-        "sync_failed": "Kiro Crew 설정에 저장할 수 없습니다 — 언어는 이 브라우저에만 적용되며 다시 로드하면 초기화될 수 있습니다."
+        "sync_failed": "RoyCrew 설정에 저장할 수 없습니다 — 언어는 이 브라우저에만 적용되며 다시 로드하면 초기화될 수 있습니다."
       }
     },
     "groups": {
@@ -12501,7 +12501,7 @@
         "label": "표시"
       },
       "imports": {
-        "description": "다른 AI 에이전트에서 데이터 가져오기, Kiro Crew 설정 백업 및 복원",
+        "description": "다른 AI 에이전트에서 데이터 가져오기, RoyCrew 설정 백업 및 복원",
         "label": "가져오기 / 내보내기"
       },
       "instances": {

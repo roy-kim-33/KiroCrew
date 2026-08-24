@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from kiro_crew import model_registry
+from kiro_crew.acp.types import ACP_BACKEND_CLAUDE
 from kiro_crew.agent import _prompt_path
 from kiro_crew.agent_discovery import agent_skill_globs
 from kiro_crew.config.loader import KiroCrewConfig, workspace_dir_for
@@ -1788,7 +1789,7 @@ class ContextBuilder:
             self._bot_name = bot_name
         else:
             cfg = KiroCrewConfig.load()
-            self._bot_name = "KiroCrew" if cfg.agent.acp_backend == "claude" else "Kiro"
+            self._bot_name = "KiroCrew" if cfg.agent.acp_backend == ACP_BACKEND_CLAUDE else "Kiro"
         # Register default memory in the workspace cache
         _memory_stores["default"] = self.memory
 

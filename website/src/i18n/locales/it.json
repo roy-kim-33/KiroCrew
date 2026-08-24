@@ -89,7 +89,7 @@
     "skip_to_content": "Vai al contenuto",
     "social_login": "Accesso social",
     "stale_fetch_failing": "(obsoleto: recupero non riuscito)",
-    "star_kirocrew_on_github": "Metti una stella a Kiro Crew su GitHub",
+    "star_kirocrew_on_github": "Metti una stella a RoyCrew su GitHub",
     "star_us": "Mettici una stella",
     "starting_update": "Avvio dell'aggiornamento…",
     "subagent_cap": "cap: {{cap}}",
@@ -127,7 +127,7 @@
   "apps": {
     "agentWorlds": {
       "manifest": {
-        "description": "Trasforma gli agenti in esecuzione in personaggi di una scena animata in pixel art: un’occhiata ti dice quanto è occupato Kiro Crew. Ogni agente attivo appare come uno sprite che reagisce quando il lavoro inizia e finisce, in scene a tema che vanno da un ufficio classico a una torre da mago o a un laboratorio sottomarino. Aprila in una finestra separata per tenerla su un secondo schermo mentre lavori.",
+        "description": "Trasforma gli agenti in esecuzione in personaggi di una scena animata in pixel art: un’occhiata ti dice quanto è occupato RoyCrew. Ogni agente attivo appare come uno sprite che reagisce quando il lavoro inizia e finisce, in scene a tema che vanno da un ufficio classico a una torre da mago o a un laboratorio sottomarino. Aprila in una finestra separata per tenerla su un secondo schermo mentre lavori.",
         "display_name": "Agent Worlds",
         "highlight_1": "Vista in tempo reale di quali agenti sono in esecuzione, come personaggi anziché come elenco",
         "highlight_2": "Scene a tema tra cui Office, Panda Den, Neural Net, Wizard Tower e Deep Lab",
@@ -1047,7 +1047,7 @@
         "title": "Crew Companion"
       },
       "manifest": {
-        "description": "Un compagno da scrivania per Kiro Crew che ti aiuta a dare ritmo alla giornata: ti invita a fare pause, conserva i promemoria che imposti in linguaggio naturale e propone un breve esercizio di respirazione quando hai bisogno di ricaricarti. Ti avvisa anche quando una sessione finisce, va in errore o attende un tuo OK.",
+        "description": "Un compagno da scrivania per RoyCrew che ti aiuta a dare ritmo alla giornata: ti invita a fare pause, conserva i promemoria che imposti in linguaggio naturale e propone un breve esercizio di respirazione quando hai bisogno di ricaricarti. Ti avvisa anche quando una sessione finisce, va in errore o attende un tuo OK.",
         "display_name": "Crew Companion",
         "highlight_1": "Inviti gentili a fare una pausa — bere, allungarsi, guardare lontano — con l’intervallo che scegli tu",
         "highlight_2": "Promemoria che imposti in linguaggio naturale, come «bere acqua tra 20 minuti»",
@@ -1519,14 +1519,14 @@
     },
     "devFleet": {
       "manifest": {
-        "description": "Un pannello di controllo per lavorare su Kiro Crew stesso. Elenca ogni worktree di funzionalità con lo stato della sua pull request, il numero di commit e lo spazio occupato su disco, e può avviarne uno qualsiasi come pod: un’istanza di anteprima completa, su una porta e una cartella dati proprie, così puoi provare una modifica non finita senza disturbare il gateway attivo. Si occupa anche delle incombenze che ne derivano — fare pull di main e ricompilare, fare il rebase di un branch, seguire i log dei pod ed eliminare i worktree il cui lavoro è già stato unito.",
+        "description": "Un pannello di controllo per lavorare su RoyCrew stesso. Elenca ogni worktree di funzionalità con lo stato della sua pull request, il numero di commit e lo spazio occupato su disco, e può avviarne uno qualsiasi come pod: un’istanza di anteprima completa, su una porta e una cartella dati proprie, così puoi provare una modifica non finita senza disturbare il gateway attivo. Si occupa anche delle incombenze che ne derivano — fare pull di main e ricompilare, fare il rebase di un branch, seguire i log dei pod ed eliminare i worktree il cui lavoro è già stato unito.",
         "display_name": "Dev Fleet",
         "highlight_1": "Avvia qualsiasi worktree come pod isolato, su una porta e una cartella dati proprie, lasciando intatto il gateway attivo",
         "highlight_2": "Vista della flotta con stato della PR per branch, numero di commit e spazio su disco",
         "highlight_3": "Sincronizza (pull di main e ricompilazione) o fai il rebase di un branch senza uscire dalla dashboard",
         "highlight_4": "«Elimina i worktree uniti» si rifiuta di cancellare un worktree con lavoro non committato o non tracciato, invece di buttarlo via",
         "highlight_5": "Segui i log dei pod e genera le chiavi di accesso ai pod dall’interfaccia",
-        "highlight_6": "Pensata per chi sviluppa Kiro Crew stesso — non serve per l’uso quotidiano",
+        "highlight_6": "Pensata per chi sviluppa RoyCrew stesso — non serve per l’uso quotidiano",
         "highlight_7": "I pod funzionano su Linux (systemd --user) e macOS (launchd) — ma il pod su macOS non ha un limite di memoria/CPU imposto; Make Live resta solo per Linux; vista della flotta, stato della PR, sincronizzazione, rebase ed eliminazione funzionano su qualsiasi piattaforma",
         "page_label": "Dev Fleet"
       }
@@ -1558,7 +1558,7 @@
         "truncated": "· troncato"
       },
       "manifest": {
-        "description": "Sfoglia e leggi i file sulla macchina che esegue Kiro Crew senza uscire dalla dashboard. Tieni aperti più file in schede, percorri l’albero delle cartelle con accanto lo stato git di ciascun file, cerca una stringa in un’intera cartella e leggi il markdown formattato anziché grezzo. È di sola lettura per scelta: apre e cerca nei file ma non li modifica, non li sposta e non li elimina mai, e può raggiungere solo la tua home più /tmp e /opt.",
+        "description": "Sfoglia e leggi i file sulla macchina che esegue RoyCrew senza uscire dalla dashboard. Tieni aperti più file in schede, percorri l’albero delle cartelle con accanto lo stato git di ciascun file, cerca una stringa in un’intera cartella e leggi il markdown formattato anziché grezzo. È di sola lettura per scelta: apre e cerca nei file ma non li modifica, non li sposta e non li elimina mai, e può raggiungere solo la tua home più /tmp e /opt.",
         "display_name": "File",
         "highlight_1": "Sola lettura: apre e cerca nei file, e non li scrive, sposta o elimina mai",
         "highlight_2": "Più file aperti contemporaneamente in schede, con evidenziazione della sintassi",
@@ -2774,7 +2774,7 @@
       "manifest": {
         "description": "Un assistente AI per le riunioni. Trascrive la riunione dal vivo, tiene note e diagrammi strutturati mentre procede, estrae le azioni da fare e ti lascia rivederle prima di registrarle.",
         "display_name": "Riunioni",
-        "highlight_1": "Trascrizione dal vivo con il riconoscimento vocale integrato di Kiro Crew — nessun daemon aggiuntivo, nessun account cloud oltre a quelli che usi già",
+        "highlight_1": "Trascrizione dal vivo con il riconoscimento vocale integrato di RoyCrew — nessun daemon aggiuntivo, nessun account cloud oltre a quelli che usi già",
         "highlight_2": "Un gruppo di agenti lavora sulla riunione in parallelo: note strutturate, un diagramma HTML/Mermaid e un elenco di azioni da fare",
         "highlight_3": "Correggi una volta sola gli errori ricorrenti del riconoscimento vocale con un dizionario di dominio e tutte le riunioni successive li scriveranno bene",
         "highlight_4": "Rivedi le azioni estratte prima che qualcosa venga registrato — archivia il rumore, registra il resto",
@@ -3945,7 +3945,7 @@
         "no_source_files": "Nessun file sorgente."
       },
       "manifest": {
-        "description": "Un editor per articoli in LaTeX con anteprima PDF dal vivo e un coautore AI. Scrivi in un editor a due riquadri, premi Cmd+S (Ctrl+S su Windows e Linux) per compilare con pdflatex o tectonic e leggi il PDF prodotto accanto al sorgente. Gli errori di compilazione vengono raccolti in un elenco cliccabile che salta alla riga incriminata. Clona un articolo esistente da qualsiasi remoto git, poi fai commit e push dalla barra degli strumenti. Il pannello del coautore è una vera sessione di chat di Kiro Crew limitata all’articolo, così l’agente può leggere e modificare il tuo LaTeX mentre guardi il PDF aggiornarsi.",
+        "description": "Un editor per articoli in LaTeX con anteprima PDF dal vivo e un coautore AI. Scrivi in un editor a due riquadri, premi Cmd+S (Ctrl+S su Windows e Linux) per compilare con pdflatex o tectonic e leggi il PDF prodotto accanto al sorgente. Gli errori di compilazione vengono raccolti in un elenco cliccabile che salta alla riga incriminata. Clona un articolo esistente da qualsiasi remoto git, poi fai commit e push dalla barra degli strumenti. Il pannello del coautore è una vera sessione di chat di RoyCrew limitata all’articolo, così l’agente può leggere e modificare il tuo LaTeX mentre guardi il PDF aggiornarsi.",
         "display_name": "Papyrus",
         "highlight_1": "Editor LaTeX a due riquadri con l’anteprima PDF dal vivo accanto",
         "highlight_2": "Compilazione al salvataggio (Cmd+S, o Ctrl+S su Windows e Linux) con pdflatex o tectonic, e il ciclo bibtex eseguito per te",
@@ -4420,7 +4420,7 @@
         }
       },
       "manifest": {
-        "description": "Sviluppo guidato dalle spec dentro Kiro Crew: trasforma l’idea di una funzionalità in Requisiti → Progettazione → Attività con un agente integrato, rivedi il markdown nell’app e poi affida il piano approvato a una sessione di esecuzione autonoma.",
+        "description": "Sviluppo guidato dalle spec dentro RoyCrew: trasforma l’idea di una funzionalità in Requisiti → Progettazione → Attività con un agente integrato, rivedi il markdown nell’app e poi affida il piano approvato a una sessione di esecuzione autonoma.",
         "display_name": "Spec Builder",
         "page_label": "Spec Builder"
       },
@@ -4432,7 +4432,7 @@
     },
     "workflows": {
       "manifest": {
-        "description": "Scrivi, esegui e osserva workflow dinamici: script Python, di solito scritti per te da un agente a partire da un obiettivo in linguaggio naturale, che guidano più agenti Kiro Crew attraverso fasi ordinate. Prima che venga eseguito qualcosa lo script viene verificato contro un insieme di comandi di workflow in sandbox, così gli errori emergono senza esecuzione, e poi la pagina trasmette ogni fase e ogni evento degli agenti mentre l’esecuzione procede. Con l’app arrivano esempi eseguibili da cui partire.",
+        "description": "Scrivi, esegui e osserva workflow dinamici: script Python, di solito scritti per te da un agente a partire da un obiettivo in linguaggio naturale, che guidano più agenti RoyCrew attraverso fasi ordinate. Prima che venga eseguito qualcosa lo script viene verificato contro un insieme di comandi di workflow in sandbox, così gli errori emergono senza esecuzione, e poi la pagina trasmette ogni fase e ogni evento degli agenti mentre l’esecuzione procede. Con l’app arrivano esempi eseguibili da cui partire.",
         "display_name": "Workflow",
         "highlight_1": "Convalida un workflow prima di eseguirlo — gli errori emergono senza che nulla venga eseguito",
         "highlight_2": "Osserva l’esecuzione dal vivo, fase per fase, con eventi di progresso per ogni agente",
@@ -4708,7 +4708,7 @@
       "trust_tooltip": "In questa chat, {{productName}} lavora senza chiederti prima",
       "yolo_desc": "In ogni chat, {{productName}} lavora senza chiederti prima",
       "yolo_expiration_timed": "Turns itself off after {{duration}}, then asks again.",
-      "yolo_expiration_until_shutdown": "Stays on until Kiro Crew restarts — no timed expiry.",
+      "yolo_expiration_until_shutdown": "Resta attivo fino al riavvio di RoyCrew — nessuna scadenza a tempo.",
       "yolo_label": "YOLO",
       "yolo_mode_is_an_app_wide_setting": "La modalità YOLO è un'impostazione valida per tutta l'app",
       "yolo_tooltip": "In ogni chat, {{productName}} lavora senza chiederti prima"
@@ -9933,7 +9933,7 @@
         "filter_servers_or_tools": "Filtra server o strumenti…",
         "globals": "Valori globali",
         "kiro": "Kiro",
-        "kirocrew": "Kiro Crew",
+        "kirocrew": "RoyCrew",
         "last_probed": "Ultimo controllo",
         "mcp_servers_count": "Server MCP ({{count}})",
         "name": "Nome",
@@ -9950,7 +9950,7 @@
         "pending_enable_click_to_revert": "In attesa: attivazione (clicca per annullare)",
         "pending_uninstall": "{{label}} — disinstallazione in attesa",
         "probe_mcp_servers": "Sonda i server MCP",
-        "servers_scope_tip": "Server MCP in Kiro Crew e nei tuoi valori globali interattivi {{provider}}/Kiro. Il badge Kiro Crew indica se verrà caricato nelle sessioni Kiro Crew; il badge Valori globali indica se è condiviso con il tuo valore globale interattivo di Kiro. Clicca per attivare o disattivare, poi Applica.",
+        "servers_scope_tip": "Server MCP in RoyCrew e nei tuoi valori globali interattivi {{provider}}/Kiro. Il badge RoyCrew indica se verrà caricato nelle sessioni RoyCrew; il badge Valori globali indica se è condiviso con il tuo valore globale interattivo di Kiro. Clicca per attivare o disattivare, poi Applica.",
         "status": "Stato",
         "tool_list_read_from_the_package_s_declaration_th": "L'elenco degli strumenti è stato letto dalla dichiarazione del pacchetto; il server non è stato avviato per verificarne l'avvio.",
         "tools": "Strumenti",
@@ -9961,7 +9961,7 @@
       },
       "memoryGraphTab": {
         "all_count": "Tutti ({{count}})",
-        "gpu_rendered_visualization_of_all_kirocrew_memor": "Visualizzazione con rendering GPU di tutta la memoria di Kiro Crew. I nodi sono colorati per tipo. Ingrandisci per mostrare le etichette, clicca un nodo per ispezionarlo, usa i filtri per restringere il campo.",
+        "gpu_rendered_visualization_of_all_kirocrew_memor": "Visualizzazione con rendering GPU di tutta la memoria di RoyCrew. I nodi sono colorati per tipo. Ingrandisci per mostrare le etichette, clicca un nodo per ispezionarlo, usa i filtri per restringere il campo.",
         "group_history_count": "Cronologia ({{count}})",
         "group_lessons_count": "Lezioni ({{count}})",
         "group_preferences_count": "Preferenze ({{count}})",
@@ -10145,7 +10145,7 @@
         "skills": "Skill",
         "skills_count": "Skill ({{count}})",
         "skills_from_read_only": "Skill da {{name}} — sola lettura",
-        "skills_tip": "Competenze caricate su richiesta quando l’agente le ritiene pertinenti. Le competenze con il badge auto vengono sempre inserite in ogni sessione. Le competenze sono rilevate da Kiro Crew, kiro-cli e dai pacchetti AIM.",
+        "skills_tip": "Competenze caricate su richiesta quando l’agente le ritiene pertinenti. Le competenze con il badge auto vengono sempre inserite in ogni sessione. Le competenze sono rilevate da RoyCrew, kiro-cli e dai pacchetti AIM.",
         "the_skill_this_update_targets_no_longer_exists_s": "La skill a cui è destinato questo aggiornamento non esiste più, quindi non c’è nulla da aggiornare. Ignora questa candidata.",
         "this_skill_changed_after_this_update_was_written": "Questo skill è cambiato dopo che questo aggiornamento è stato scritto, quindi applicarlo ora annullerebbe quelle modifiche più recenti. L'approvazione è bloccata — scarta questo candidato e verrà proposto un aggiornamento nuovo sulla versione attuale.",
         "update": "Aggiorna",
@@ -10375,7 +10375,7 @@
     },
     "popoutFrame": {
       "session": "Sessione",
-      "window_title": "{{label}} — Kiro Crew"
+      "window_title": "{{label}} — RoyCrew"
     },
     "projectDetailPage": {
       "analyzing_task_and_building_step_by_step_plan": "Analisi dell'attività e creazione del piano passo a passo",
@@ -10851,7 +10851,7 @@
         "downloading": "Download in corso...",
         "insider": "Insider",
         "install_failed": "Non è stato possibile installare l'aggiornamento",
-        "installing_quiet_note": "Installazione in corso — Kiro Crew resterà inattivo per un minuto o due, poi si riavvierà da solo.",
+        "installing_quiet_note": "Installazione in corso — RoyCrew resterà inattivo per un minuto o due, poi si riavvierà da solo.",
         "is_available": "è disponibile.",
         "loading_changelog": "Caricamento del changelog…",
         "manual_install_fallback": "Se l'aggiornamento non funziona, puoi {{link}} e reinstallare sopra questa copia. Le tue impostazioni, chat e file vengono mantenuti.",
@@ -10936,7 +10936,7 @@
         "saving": "Salvataggio…",
         "session_folder_name": "Nome della cartella",
         "session_folder_name_desc": "Viene creata quando salvi queste impostazioni, se non esiste ancora.",
-        "settings_are_managed_on_the_machine_running_kiro": "le impostazioni sono gestite sulla macchina su cui è in esecuzione Kiro Crew e sono in sola lettura dalle sessioni remote.",
+        "settings_are_managed_on_the_machine_running_kiro": "le impostazioni sono gestite sulla macchina su cui è in esecuzione RoyCrew e sono in sola lettura dalle sessioni remote.",
         "setup_guide": "Guida alla configurazione",
         "shared_channels": "Canali condivisi",
         "soft_context_threshold": "Soglia flessibile del contesto %",
@@ -11216,7 +11216,7 @@
         "max_tree_nodes": "Nodi massimi dell'albero",
         "not_applicable": "Non applicabile",
         "not_detected": "Non rilevato",
-        "not_detected_does_not_always_mean_unavailable_ma": "«Non rilevato» non significa sempre non disponibile — macOS attribuisce la concessione di un permesso al processo che ha avviato Kiro Crew, non a Kiro Crew stesso.",
+        "not_detected_does_not_always_mean_unavailable_ma": "«Non rilevato» non significa sempre non disponibile — macOS attribuisce la concessione di un permesso al processo che ha avviato RoyCrew, non a RoyCrew stesso.",
         "on_windows_keystrokes_take_your_keyboard_focus": "Su Windows, i tasti premuti assumono il focus della tastiera e i clic per coordinate spostano il cursore reale: questa piattaforma non ha un percorso di input per singola app.",
         "open_system_settings": "Apri Impostazioni di Sistema",
         "open_system_settings_for": "Apri Impostazioni di Sistema per {{label}}",
@@ -11258,7 +11258,7 @@
         "thinking_label": "Mostra il ragionamento",
         "thread_allowlist_description": "Opzionale. Gli utenti approvati possono eseguire l’agente solo in questi thread Discord esatti. Vuoto = solo messaggi diretti.",
         "thread_help": "Con Developer Mode attivo, fai clic con il tasto destro sul thread → <mono>Copy Channel ID</mono>. Usa l’ID del thread, non quello del canale che lo contiene.",
-        "thread_warning": "La modalità thread attiva l’intent globale Message Content di Discord. Discord recapita il contenuto di ogni canale del server visibile al bot; Kiro Crew scarta il traffico esterno ai thread approvati. Chiunque possa vedere un thread approvato può leggere le risposte dell’agente e l’output degli strumenti.",
+        "thread_warning": "La modalità thread attiva l’intent globale Message Content di Discord. Discord recapita il contenuto di ogni canale del server visibile al bot; RoyCrew scarta il traffico esterno ai thread approvati. Chiunque possa vedere un thread approvato può leggere le risposte dell’agente e l’output degli strumenti.",
         "threshold_description": "Chiede di eseguire !compact o !new quando il contesto della sessione supera questa percentuale.",
         "token_description": "Dalla pagina Bot del Developer Portal (Reset Token per visualizzarlo una sola volta).",
         "token_placeholder": "Incolla il token del bot Discord"
@@ -11347,7 +11347,7 @@
         "handle_placeholder": "+15551234567",
         "loading": "Caricamento della configurazione di iMessage…",
         "macos_only": "iMessage richiede macOS con l'accesso effettuato a Messages, e il gateway deve essere in esecuzione su quel Mac. Questo host non può raggiungere iMessage, quindi queste impostazioni sono di sola lettura.",
-        "managed_locally": "Le impostazioni di iMessage sono gestite sulla macchina che esegue Kiro Crew, quindi sono di sola lettura da una sessione remota.",
+        "managed_locally": "Le impostazioni di iMessage sono gestite sulla macchina che esegue RoyCrew, quindi sono di sola lettura da una sessione remota.",
         "needs_setup": "Configurazione necessaria",
         "not_active": "Non attivo",
         "prerequisites_body": "Nessun bot e nessun token: l'agente raggiunge la tua app Messages tramite un bridge locale, quindi il trasporto non coinvolge terze parti. I tuoi prompt vengono comunque inviati al provider del modello con cui l'agente è configurato, come su qualsiasi canale. Ti servono macOS 14 o successivo con l'accesso effettuato a Messages, la CLI imsg installata e due autorizzazioni macOS una tantum: Full Disk Access e Automation per Messages.",
@@ -11661,7 +11661,7 @@
         "disabled_by_policy": "Disattivato dalla policy",
         "disabled_for_this_surface": "Disattivato per la superficie host",
         "disabling_a_rule_that_overlaps_an_always_on_cont": "Disattivare una regola che si sovrappone a un controllo sempre attivo (lettura di file sensibili, IMDS, git-publish) non la sblocca completamente — la difesa in profondità la mantiene bloccata.",
-        "disabling_all_built_in_denies_removes_kirocrew_s": "Disattivare tutti i divieti integrati rimuove la protezione di Kiro Crew contro i comandi distruttivi e di esfiltrazione delle credenziali. Alcuni comandi possono restare bloccati da controlli indipendenti di difesa in profondità (percorsi sensibili, IMDS, git-publish).",
+        "disabling_all_built_in_denies_removes_kirocrew_s": "Disattivare tutti i divieti integrati rimuove la protezione di RoyCrew contro i comandi distruttivi e di esfiltrazione delle credenziali. Alcuni comandi possono restare bloccati da controlli indipendenti di difesa in profondità (percorsi sensibili, IMDS, git-publish).",
         "disabling_weakens_protection": "Disattivare «{{name}}» riduce la protezione dai comandi distruttivi o di esfiltrazione di credenziali. Alcuni comandi possono restare bloccati da controlli indipendenti di difesa in profondità.",
         "do_not_enter_highly_sensitive_or_restricted_data": "Non inserire dati altamente sensibili o riservati in Kiro Crew. Rispetta le eventuali policy di gestione dei dati applicabili quando decidi cosa condividere con l'agente.",
         "documentation": "Documentazione",
@@ -11688,7 +11688,7 @@
         "feature_sel_audit": "Registrazione di audit SEL",
         "feature_sel_audit_description": "Traccia immutabile degli eventi di sicurezza concatenata con HMAC, con oscuramento delle credenziali prima dell’inoltro",
         "feature_sensitive_paths": "Blocco dei percorsi sensibili",
-        "feature_sensitive_paths_description": "Le directory delle credenziali e le radici di fiducia di Kiro Crew sono bloccate a livello di hook prima dell’esecuzione degli strumenti",
+        "feature_sensitive_paths_description": "Le directory delle credenziali e le radici di fiducia di RoyCrew sono bloccate a livello di hook prima dell’esecuzione degli strumenti",
         "feature_suspicious_patterns": "Pattern Bash sospetti",
         "feature_suspicious_patterns_description": "Rileva nei comandi shell le forme di attacco basate su cancellazione, esfiltrazione ed esecuzione tramite pipe",
         "feature_token_auth": "Autenticazione della dashboard tramite token",
@@ -11724,7 +11724,7 @@
         "governance_status_is_temporarily_unavailable_enf": "Lo stato della governance è temporaneamente non disponibile. L'applicazione non è compromessa — questa vista non è riuscita a risolvere il limite massimo per la visualizzazione.",
         "hide_pattern": "Nascondi il pattern",
         "host_surface": "superficie dell'host",
-        "i_understand_this_weakens_kirocrew_s_protection": "Comprendo che questo indebolisce la protezione di Kiro Crew.",
+        "i_understand_this_weakens_kirocrew_s_protection": "Comprendo che questo indebolisce la protezione di RoyCrew.",
         "interactive": "Interattivo",
         "invalid_regular_expression": "Espressione regolare non valida",
         "kiro_crew_security_policy_json": "~/.kiro/crew/security_policy.json",
@@ -11752,7 +11752,7 @@
         "process_sandbox": "Sandbox dei processi",
         "profile": "Profilo:",
         "profile_2": "profilo",
-        "profile_unusable_body": "Un profilo indicato sotto non è stato caricato, quindi la sua superficie resta al limite di ripiego della policy: rifiuto totale a meno che non sia dichiarato un ripiego meno restrittivo. Correggi il file nella cartella profiles della tua directory dati di Kiro Crew: verrà ricaricato automaticamente.",
+        "profile_unusable_body": "Un profilo indicato sotto non è stato caricato, quindi la sua superficie resta al limite di ripiego della policy: rifiuto totale a meno che non sia dichiarato un ripiego meno restrittivo. Correggi il file nella cartella profiles della tua directory dati di RoyCrew: verrà ricaricato automaticamente.",
         "profile_unusable_detail": "Il file era illeggibile, non è stato possibile analizzarlo oppure il profilo che estende è assente. Un riavvio serve solo se il file è già valido per una build più recente di quella in esecuzione.",
         "profile_unusable_title": "Profilo di ripiego attivo",
         "profile_unusable_which": "Profili interessati: {{profiles}}.",
@@ -11801,7 +11801,7 @@
         "tailnet_unavailable": "Non è stato possibile leggere l’impostazione tailnet, quindi qui non può essere mostrata né modificata. Se era già attiva, il nome tailnet resta consentito; ricarica la pagina per riprovare.",
         "tailnet_unresolved_note": "Questa opzione è attiva, ma all’avvio di Kiro Crew non è stato risolto alcun nome tailnet, quindi non è stato aggiunto nulla alle origini consentite. Una dashboard raggiunta tramite tailscale serve viene ancora rifiutata dal controllo dell’origine. Riavvia Kiro Crew quando il nome è disponibile.",
         "the_strictest_boundary_in_effect_for_each_govern": "Il limite più restrittivo in vigore per ogni ambito governato sulla",
-        "third_party_apps_on_warning": "Questo rende attendibili tutte le app di terze parti, comprese quelle che installerai in futuro — non solo quella che stavi provando ad avviare. Un’app attendibile viene eseguita con gli stessi accessi di Kiro Crew: i tuoi file, le tue credenziali salvate e internet.",
+        "third_party_apps_on_warning": "Questo rende attendibili tutte le app di terze parti, comprese quelle che installerai in futuro — non solo quella che stavi provando ad avviare. Un’app attendibile viene eseguita con gli stessi accessi di RoyCrew: i tuoi file, le tue credenziali salvate e internet.",
         "third_party_apps_save_failed": "Non è stato possibile salvare questa impostazione.",
         "third_party_apps_scope_note": "Ha effetto immediato. Disattivandolo si arrestano anche le app che erano ammesse: vengono eseguiti i loro hook di arresto, i backend vengono fermati e tutto ciò che non è stato possibile arrestare viene segnalato.",
         "third_party_apps_section": "App di terze parti",
@@ -11830,7 +11830,7 @@
         "turn_off_every_rule": "Disattiva in un colpo solo tutte le regole integrate sui comandi bloccati. I controlli indipendenti di difesa in profondità (percorsi sensibili, IMDS, git-publish) restano attivi.",
         "turn_off_every_rule_governance_locked": "Disattiva in un colpo solo tutte le regole integrate sui comandi bloccati. I controlli indipendenti di difesa in profondità (percorsi sensibili, IMDS, git-publish) restano attivi, e le regole fissate dalla policy della tua organizzazione restano attive.",
         "yolo_active_expires_at": "L’approvazione automatica è attiva fino alle {{time}}.",
-        "yolo_active_until_restart": "L’approvazione automatica è attiva e resta attiva fino al riavvio di Kiro Crew.",
+        "yolo_active_until_restart": "L’approvazione automatica è attiva e resta attiva fino al riavvio di RoyCrew.",
         "yolo_auto_approve": "YOLO (approvazione automatica)",
         "yolo_duration_12h": "12 ore",
         "yolo_duration_1h": "1 ora",
@@ -11841,7 +11841,7 @@
         "yolo_duration_locked": "Disattivato dai criteri della tua organizzazione",
         "yolo_duration_next_activation_note": "Si applica la prossima volta che attivi l’approvazione automatica.",
         "yolo_duration_title": "Durata dell’approvazione automatica",
-        "yolo_duration_until_shutdown": "Fino al riavvio di Kiro Crew",
+        "yolo_duration_until_shutdown": "Fino al riavvio di RoyCrew",
         "your_custom_denies": "I tuoi blocchi personalizzati"
       },
       "shortcutsPanel": {
@@ -11909,7 +11909,7 @@
         "slack_bot_token": "Token del bot Slack",
         "slack_connection_failed_at_startup": "Connessione a Slack non riuscita all’avvio ({{error}}). Controlla l’accesso di rete a slack.com, poi riavvia il gateway.",
         "slack_rejected_the_stored_tokens_invalid_auth_re": "Slack ha rifiutato i token salvati (invalid_auth). Sostituiscili qui sotto, poi riavvia il gateway.",
-        "slack_settings_are_managed_on_the_machine_runnin": "Le impostazioni di Slack sono gestite sulla macchina su cui è in esecuzione Kiro Crew e sono in sola lettura dalle sessioni remote.",
+        "slack_settings_are_managed_on_the_machine_runnin": "Le impostazioni di Slack sono gestite sulla macchina su cui è in esecuzione RoyCrew e sono in sola lettura dalle sessioni remote.",
         "slash_command": "Comando slash",
         "talk_to_your_agents_from_slack_over_socket_mode": "Parla con i tuoi agenti da Slack tramite la modalità Socket. Aggiungi gli ID dei membri consentiti così i bot connessi possono rispondere.",
         "the_one_member_who_can_always_interact_with_the": "L'unico membro che può sempre interagire con il bot (KIROCREW_OWNER_ID). Inizia con U o W.",
@@ -12086,7 +12086,7 @@
         "talk_to_your_agents_from_a_teams_1_1_chat_self_h": "Parla con i tuoi agenti da una chat 1:1 di Teams. Self-hosted tramite il Bot Framework:\n            Teams invia al webhook HTTPS del tuo gateway, quindi serve un endpoint pubblico\n            (reverse proxy, App Service o un tunnel di sviluppo).",
         "teams_credential_check_failed": "Verifica delle credenziali di Teams non riuscita ({{error}}). Controlla App ID / password / tenant, poi riavvia il gateway.",
         "teams_delivers_messages_by_calling_this_endpoint": "Teams consegna i messaggi\n              chiamando questo endpoint da Internet, quindi un",
-        "teams_settings_are_managed_on_the_machine_runnin": "Le impostazioni di Teams sono gestite sulla macchina su cui è in esecuzione Kiro Crew e sono in sola lettura dalle sessioni remote.",
+        "teams_settings_are_managed_on_the_machine_runnin": "Le impostazioni di Teams sono gestite sulla macchina su cui è in esecuzione RoyCrew e sono in sola lettura dalle sessioni remote.",
         "tenant_id": "ID tenant",
         "to": "a",
         "tunnel_or_reverse_proxy_see_the_note_above_note": "(tunnel o reverse\n              proxy) — vedi la nota sopra. Annota l'host risultante.",
@@ -12192,7 +12192,7 @@
         "webex": "Webex",
         "webex_account_emails_permitted_to_dm_the_bot_emp": "Email degli account Webex autorizzati a inviare messaggi diretti al bot. Vuoto = nessuno (fail closed) — chiunque in un'organizzazione può scrivere a un bot Webex, quindi aggiungi solo la tua.",
         "webex_bot_token": "Token del bot Webex",
-        "webex_settings_are_managed_on_the_machine_runnin": "Le impostazioni di Webex sono gestite sulla macchina su cui è in esecuzione Kiro Crew e sono in sola lettura dalle sessioni remote.",
+        "webex_settings_are_managed_on_the_machine_runnin": "Le impostazioni di Webex sono gestite sulla macchina su cui è in esecuzione RoyCrew e sono in sola lettura dalle sessioni remote.",
         "where_to_find_the_bot_token": "Dove trovare il token bot",
         "you_example_com": "you@example.com"
       },
@@ -12693,8 +12693,8 @@
     "dataNeverSentTitle": "Mai inviato",
     "envOverrideWithSettingRef": "L'heartbeat è disattivato perché <settingRef/> è impostata in questo ambiente. Rimuovila per gestire la telemetria qui.",
     "governanceOverrideNote": "I criteri di sicurezza del tuo amministratore lo disattivano. Non è modificabile qui.",
-    "installReceiptBody": "Dopo un’installazione o un aggiornamento riuscito dal catalogo ufficiale di Kiro Crew, viene inviata una ricevuta anonima. Registri esterni, app locali e app autoregistrate non vengono mai segnalati.",
-    "installReceiptFields": "slug dell’app ufficiale · token anonimo per app (non collegabile tra app) · nuova installazione/aggiornamento · versione di Kiro Crew",
+    "installReceiptBody": "Dopo un’installazione o un aggiornamento riuscito dal catalogo ufficiale di RoyCrew, viene inviata una ricevuta anonima. Registri esterni, app locali e app autoregistrate non vengono mai segnalati.",
+    "installReceiptFields": "slug dell’app ufficiale · token anonimo per app (non collegabile tra app) · nuova installazione/aggiornamento · versione di RoyCrew",
     "installReceiptTitle": "Ricevute di installazione delle app ufficiali",
     "localDataBody": "Registri di utilizzo e contesto. Le metriche di prestazione sono disattivate per impostazione predefinita.",
     "localDataTitle": "Resta sul tuo dispositivo",
@@ -12722,7 +12722,7 @@
         "auto": "Automatico",
         "description": "Lingua dell'interfaccia della dashboard.",
         "label": "Lingua",
-        "sync_failed": "Non è stato possibile salvarlo nella configurazione di Kiro Crew — la lingua vale solo in questo browser e potrebbe reimpostarsi al ricaricamento."
+        "sync_failed": "Non è stato possibile salvarlo nella configurazione di RoyCrew — la lingua vale solo in questo browser e potrebbe reimpostarsi al ricaricamento."
       }
     },
     "groups": {
@@ -12775,7 +12775,7 @@
         "label": "Visualizzazione"
       },
       "imports": {
-        "description": "Importa dati da un altro agente IA ed esegui il backup o il ripristino della configurazione di Kiro Crew",
+        "description": "Importa dati da un altro agente IA ed esegui il backup o il ripristino della configurazione di RoyCrew",
         "label": "Importa / Esporta"
       },
       "instances": {

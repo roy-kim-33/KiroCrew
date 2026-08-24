@@ -89,7 +89,7 @@
     "skip_to_content": "コンテンツにスキップ",
     "social_login": "ソーシャルログイン",
     "stale_fetch_failing": "（古い情報：取得に失敗）",
-    "star_kirocrew_on_github": "GitHub で Kiro Crew にスター",
+    "star_kirocrew_on_github": "GitHub で RoyCrew にスター",
     "star_us": "スターをください",
     "starting_update": "更新を開始中…",
     "subagent_cap": "cap: {{cap}}",
@@ -127,7 +127,7 @@
   "apps": {
     "agentWorlds": {
       "manifest": {
-        "description": "実行中のエージェントをアニメーション化されたピクセルアートシーンの文字に変えます。そのため、ひと目で Kiro Crew がどのくらい忙しいかがわかります。各アクティブなエージェントはスプライトとして表示され、仕事が開始および完了するときに反応します。クラシックなオフィスからウィザードタワーまたは水中ラボへのテーマシーンをまたいでいます。別のウィンドウにポップアウトして、作業中に2番目の画面に保つことができます。",
+        "description": "実行中のエージェントをアニメーション化されたピクセルアートシーンの文字に変えます。そのため、ひと目で RoyCrew がどのくらい忙しいかがわかります。各アクティブなエージェントはスプライトとして表示され、仕事が開始および完了するときに反応します。クラシックなオフィスからウィザードタワーまたは水中ラボへのテーマシーンをまたいでいます。別のウィンドウにポップアウトして、作業中に2番目の画面に保つことができます。",
         "display_name": "Agent Worlds",
         "highlight_1": "実行中のエージェントをリストではなく文字として表示するライブビュー",
         "highlight_2": "オフィス、パンダの巣穴、ニューラルネット、ウィザードタワー、ディープラボを含むテーマシーン",
@@ -997,7 +997,7 @@
         "title": "Crew Companion"
       },
       "manifest": {
-        "description": "Kiro Crewのデスクトップコンパニオン。1日のペースを保つのに役立ちます。休憩を取るように促し、プレーンテキストで設定したリマインダーを保持し、リセットが必要な場合は短い呼吸エクササイズを実行します。セッションが終了した場合、失敗した場合、またはOKが必要な場合も通知します。",
+        "description": "RoyCrewのデスクトップコンパニオン。1日のペースを保つのに役立ちます。休憩を取るように促し、プレーンテキストで設定したリマインダーを保持し、リセットが必要な場合は短い呼吸エクササイズを実行します。セッションが終了した場合、失敗した場合、またはOKが必要な場合も通知します。",
         "display_name": "Crew Companion",
         "highlight_1": "優しい休憩の促し — 水を飲む、ストレッチ、目をそらす — あなたが選んだ間隔で",
         "highlight_2": "プレーンテキストで設定したリマインダー。「20分で水を飲んで」のように",
@@ -1461,14 +1461,14 @@
     },
     "devFleet": {
       "manifest": {
-        "description": "Kiro Crew自体の作業用コントロールパネル。すべての機能ワークツリーを、プルリクエスト状態、コミット数、ディスク使用量と一緒にリストして、それらを任意のポッドとして表示できます。独自のポートと独自のデータディレクトリを持つ完全なプレビューインスタンスなので、ライブゲートウェイに影響を与えずに未完成の変更をクリックして確認できます。また、メインのプルとリビルド、ブランチのリベース、ポッドログのストリーミング、作業がマージされたワークツリーの削除など、その周囲の作業を処理します。",
+        "description": "RoyCrew自体の作業用コントロールパネル。すべての機能ワークツリーを、プルリクエスト状態、コミット数、ディスク使用量と一緒にリストして、それらを任意のポッドとして表示できます。独自のポートと独自のデータディレクトリを持つ完全なプレビューインスタンスなので、ライブゲートウェイに影響を与えずに未完成の変更をクリックして確認できます。また、メインのプルとリビルド、ブランチのリベース、ポッドログのストリーミング、作業がマージされたワークツリーの削除など、その周囲の作業を処理します。",
         "display_name": "Dev Fleet",
         "highlight_1": "任意のワークツリーを独自のポートとデータディレクトリ上の分離ポッドとして表示して、ライブゲートウェイに影響を与えない",
         "highlight_2": "フリートビューでブランチごとのPR状態、コミット数、ディスク使用量を表示",
         "highlight_3": "ダッシュボードを離れずにブランチを同期（メインをプルしてリビルド）またはリベース",
         "highlight_4": "「マージされたものをプルーン」は、破棄する代わりにコミットされていない作業またはトラッキングされていない作業を持つワークツリーの削除を拒否",
         "highlight_5": "UIからポッドログをストリーム配信してポッドアクセストークンを発行",
-        "highlight_6": "Kiro Crew自体を開発している人向けに構築 — 日常の使用には不要",
+        "highlight_6": "RoyCrew自体を開発している人向けに構築 — 日常の使用には不要",
         "highlight_7": "ポッドは Linux（systemd --user）と macOS（launchd）で実行されます。ただし、macOS のポッドにはメモリ/CPU 上限が強制されません。Make Live は引き続き Linux のみ対応です。フリート表示、PR 状態、同期、リベース、削除はどのプラットフォームでも利用できます",
         "page_label": "Dev Fleet"
       }
@@ -1500,7 +1500,7 @@
         "truncated": "· 省略"
       },
       "manifest": {
-        "description": "Kiro Crewが実行されているマシン上のファイルを閲覧して読み込み、ダッシュボードを離れる必要がありません。複数のファイルをタブで開いたままにして、各ファイルのGitステータスを表示させながらディレクトリツリーを操作して、フォルダー全体の文字列を検索して、マークダウンをレンダリングされたものとして読み込みます。設計上は読み取り専用です。ファイルを開いて検索しますが、決して編集、移動、削除することはなく、ホームディレクトリ、/tmp、/optのみにアクセスできます。",
+        "description": "RoyCrewが実行されているマシン上のファイルを閲覧して読み込み、ダッシュボードを離れる必要がありません。複数のファイルをタブで開いたままにして、各ファイルのGitステータスを表示させながらディレクトリツリーを操作して、フォルダー全体の文字列を検索して、マークダウンをレンダリングされたものとして読み込みます。設計上は読み取り専用です。ファイルを開いて検索しますが、決して編集、移動、削除することはなく、ホームディレクトリ、/tmp、/optのみにアクセスできます。",
         "display_name": "ファイル",
         "highlight_1": "読み取り専用：ファイルを開いて検索しますが、決して書き込み、移動、削除しません",
         "highlight_2": "複数のファイルが同時にタブで開かれ、構文ハイライトが表示",
@@ -2686,7 +2686,7 @@
       "manifest": {
         "description": "AIミーティングアシスタント。ライブ会議を文字起こしし、進行中に構造化されたノートとダイアグラムを保持し、アクションアイテムを抽出し、ファイリング前に確認できます。",
         "display_name": "会議",
-        "highlight_1": "Kiro Crew独自の音声テキスト変換によるライブ文字起こし—追加のデーモンなし、既に使用しているもの以上のクラウドアカウントなし",
+        "highlight_1": "RoyCrew独自の音声テキスト変換によるライブ文字起こし—追加のデーモンなし、既に使用しているもの以上のクラウドアカウントなし",
         "highlight_2": "エージェントのチームが会議で並列に作業します。構造化されたノート、HTML/Mermaidダイアグラム、アクションアイテムリスト",
         "highlight_3": "ドメイン辞書で音声テキスト変換の誤りを一度修正すると、その後のすべての会議で修正されます",
         "highlight_4": "抽出したアクションアイテムを確認してからファイリング—ノイズはアーカイブし、残りをファイル",
@@ -3829,7 +3829,7 @@
         "no_source_files": "ソースファイルがありません。"
       },
       "manifest": {
-        "description": "LaTeX ペーパーエディターで、ライブ PDF プレビューと AI 共著者を備えています。スプリットペインエディターで執筆し、Cmd+S（Windows および Linux では Ctrl+S）を押して pdflatex または tectonic でコンパイルします。ソースの横でレンダリングされた PDF を読みます。コンパイルエラーはクリック可能なリストに解析され、問題のある行にジャンプします。任意の git リモートから既存のペーパーをクローンして、ツールバーからコミットしてプッシュします。共著者パネルは、ペーパーにスコープされた実際の Kiro Crew チャットセッションであるため、エージェントは LaTeX を読み取りして編集でき、PDF が更新されるのを見ることができます。",
+        "description": "LaTeX ペーパーエディターで、ライブ PDF プレビューと AI 共著者を備えています。スプリットペインエディターで執筆し、Cmd+S（Windows および Linux では Ctrl+S）を押して pdflatex または tectonic でコンパイルします。ソースの横でレンダリングされた PDF を読みます。コンパイルエラーはクリック可能なリストに解析され、問題のある行にジャンプします。任意の git リモートから既存のペーパーをクローンして、ツールバーからコミットしてプッシュします。共著者パネルは、ペーパーにスコープされた実際の RoyCrew チャットセッションであるため、エージェントは LaTeX を読み取りして編集でき、PDF が更新されるのを見ることができます。",
         "display_name": "Papyrus",
         "highlight_1": "ライブ PDF プレビュー横のスプリットペイン LaTeX エディター",
         "highlight_2": "保存時にコンパイル（Cmd+S、または Windows および Linux では Ctrl+S）pdflatex または tectonic 経由、bibtex サイクルを実行します",
@@ -4292,7 +4292,7 @@
         }
       },
       "manifest": {
-        "description": "Kiro Crew内でのスペック駆動開発：機能のアイデアを「要件 → デザイン → タスク」に変換。組み込みエージェント付き、アプリ内でMarkdownを確認し、承認済みプランを自動実行セッションに引き渡します。",
+        "description": "RoyCrew内でのスペック駆動開発：機能のアイデアを「要件 → デザイン → タスク」に変換。組み込みエージェント付き、アプリ内でMarkdownを確認し、承認済みプランを自動実行セッションに引き渡します。",
         "display_name": "Spec Builder",
         "page_label": "Spec Builder"
       },
@@ -4304,7 +4304,7 @@
     },
     "workflows": {
       "manifest": {
-        "description": "動的ワークフローを作成、実行、監視：通常はエージェントが素の英語のゴールから書く Python スクリプト。複数の Kiro Crewエージェントを順序付けられたフェーズで駆動します。スクリプトは実行前にサンドボックス化されたワークフローコマンドセットに対してチェックされるため、ミスは実行なしで明らかになり、実行時はページがフェーズごとにストリーミングされます。実行可能な例がアプリに組み込まれています。",
+        "description": "動的ワークフローを作成、実行、監視：通常はエージェントが素の英語のゴールから書く Python スクリプト。複数の RoyCrewエージェントを順序付けられたフェーズで駆動します。スクリプトは実行前にサンドボックス化されたワークフローコマンドセットに対してチェックされるため、ミスは実行なしで明らかになり、実行時はページがフェーズごとにストリーミングされます。実行可能な例がアプリに組み込まれています。",
         "display_name": "Workflows",
         "highlight_1": "ワークフローを実行前に検証 — エラーが何も実行されずに明らかになります",
         "highlight_2": "ライブで実行を監視、フェーズごと、エージェントごとの進捗イベント付き",
@@ -4578,7 +4578,7 @@
       "trust_tooltip": "このチャットでは、{{productName}} は最初に確認せずに機能します",
       "yolo_desc": "すべてのチャットで、{{productName}} は最初に確認せずに機能します",
       "yolo_expiration_timed": "{{duration}} 後に自動的にオフになり、その後再び確認します。",
-      "yolo_expiration_until_shutdown": "Kiro Crew が再起動されるまでオンのままです—タイムアウト有効期限はありません。",
+      "yolo_expiration_until_shutdown": "RoyCrew が再起動されるまでオンのままです—タイムアウト有効期限はありません。",
       "yolo_label": "YOLO",
       "yolo_mode_is_an_app_wide_setting": "YOLO モードはアプリ全体の設定です",
       "yolo_tooltip": "すべてのチャットで、{{productName}} は最初に確認せずに機能します"
@@ -9699,7 +9699,7 @@
         "filter_servers_or_tools": "サーバーまたはツールをフィルター…",
         "globals": "グローバル",
         "kiro": "Kiro",
-        "kirocrew": "Kiro Crew",
+        "kirocrew": "RoyCrew",
         "last_probed": "最終プローブ",
         "mcp_servers_count": "MCP サーバー（{{count}}）",
         "name": "名前",
@@ -9714,7 +9714,7 @@
         "pending_enable_click_to_revert": "保留中：有効化（クリックで取り消し）",
         "pending_uninstall": "{{label}} — アンインストール保留中",
         "probe_mcp_servers": "MCP サーバーをプローブ",
-        "servers_scope_tip": "Kiro Crew とインタラクティブ {{provider}}/Kiro グローバルの MCP サーバー。Kiro Crew バッジは Kiro Crew セッションで読み込まれるかを示します。グローバルバッジはインタラクティブ Kiro グローバルと共有されるかを示します。クリックしてトグルしてから適用。",
+        "servers_scope_tip": "RoyCrew とインタラクティブ {{provider}}/Kiro グローバルの MCP サーバー。RoyCrew バッジは RoyCrew セッションで読み込まれるかを示します。グローバルバッジはインタラクティブ Kiro グローバルと共有されるかを示します。クリックしてトグルしてから適用。",
         "status": "ステータス",
         "tool_list_read_from_the_package_s_declaration_th": "ツール一覧はパッケージ自身の宣言から読み取ったものです。サーバーを起動して動作確認はしていません。",
         "tools": "ツール",
@@ -9725,7 +9725,7 @@
       },
       "memoryGraphTab": {
         "all_count": "すべて（{{count}}）",
-        "gpu_rendered_visualization_of_all_kirocrew_memor": "すべての Kiro Crew メモリの GPU レンダリング可視化。ノードはタイプ別に色分けされています。ズームインしてラベルを表示、ノードをクリックして検査、フィルターを使用してフォーカス。",
+        "gpu_rendered_visualization_of_all_kirocrew_memor": "すべての RoyCrew メモリの GPU レンダリング可視化。ノードはタイプ別に色分けされています。ズームインしてラベルを表示、ノードをクリックして検査、フィルターを使用してフォーカス。",
         "group_history_count": "履歴（{{count}}）",
         "group_lessons_count": "レッスン（{{count}}）",
         "group_preferences_count": "優先設定（{{count}}）",
@@ -9905,7 +9905,7 @@
         "skills": "スキル",
         "skills_count": "スキル ({{count}})",
         "skills_from_read_only": "{{name}} のスキル — 読み取り専用",
-        "skills_tip": "エージェントが関連性があると判断したときにオンデマンドスキルを読み込みます。「自動」バッジが付いているスキルは常にすべてのセッションに注入されます。スキルは Kiro Crew、kiro-cli (~/.kiro/skills)、および AIM パッケージから発見されます。",
+        "skills_tip": "エージェントが関連性があると判断したときにオンデマンドスキルを読み込みます。「自動」バッジが付いているスキルは常にすべてのセッションに注入されます。スキルは RoyCrew、kiro-cli (~/.kiro/skills)、および AIM パッケージから発見されます。",
         "the_skill_this_update_targets_no_longer_exists_s": "この更新のターゲットとなるスキルは存在しなくなったため、更新することはできません。この候補を破棄してください。",
         "this_skill_changed_after_this_update_was_written": "このスキルはこの更新が書かれた後に変更されたため、今すぐ適用するとそれより新しい変更が元に戻ります。承認がブロックされています — この候補を破棄するか、現在のバージョンに対して新しい更新が提案されます。",
         "update": "更新",
@@ -10135,7 +10135,7 @@
     },
     "popoutFrame": {
       "session": "セッション",
-      "window_title": "{{label}} — Kiro Crew"
+      "window_title": "{{label}} — RoyCrew"
     },
     "projectDetailPage": {
       "analyzing_task_and_building_step_by_step_plan": "タスクを分析してステップバイステップのプランを構築中",
@@ -10595,7 +10595,7 @@
         "downloading": "ダウンロード中…",
         "insider": "Insider",
         "install_failed": "更新をインストールできませんでした",
-        "installing_quiet_note": "インストール中 — Kiro Crew は 1 ～ 2 分間沈黙してから自動的に再起動します。",
+        "installing_quiet_note": "インストール中 — RoyCrew は 1 ～ 2 分間沈黙してから自動的に再起動します。",
         "is_available": "が利用可能です。",
         "loading_changelog": "変更ログを読み込み中…",
         "manual_install_fallback": "更新がうまくいかない場合は、{{link}} をして、このコピーの上に再インストールできます。設定、チャット、ファイルは保持されます。",
@@ -10680,7 +10680,7 @@
         "saving": "保存中…",
         "session_folder_name": "フォルダー名",
         "session_folder_name_desc": "この設定を保存したときに、まだ存在しなければ作成されます。",
-        "settings_are_managed_on_the_machine_running_kiro": "設定は Kiro Crew を実行しているマシンで管理され、リモートセッションからは読み取り専用です。",
+        "settings_are_managed_on_the_machine_running_kiro": "設定は RoyCrew を実行しているマシンで管理され、リモートセッションからは読み取り専用です。",
         "setup_guide": "セットアップガイド",
         "shared_channels": "共有チャネル",
         "soft_context_threshold": "ソフトコンテキスト閾値 %",
@@ -10960,7 +10960,7 @@
         "max_tree_nodes": "最大ツリーノード数",
         "not_applicable": "適用なし",
         "not_detected": "検出されません",
-        "not_detected_does_not_always_mean_unavailable_ma": "検出されないからといって、必ずしも利用できないわけではありません。macOS では、Kiro Crew を起動したプロセスに権限が付与され、Kiro Crew 自体には付与されません。",
+        "not_detected_does_not_always_mean_unavailable_ma": "検出されないからといって、必ずしも利用できないわけではありません。macOS では、RoyCrew を起動したプロセスに権限が付与され、RoyCrew 自体には付与されません。",
         "on_windows_keystrokes_take_your_keyboard_focus": "Windows では、キー入力はキーボードフォーカスを奪い、座標クリックは実際のカーソルを動かします。このプラットフォームにはアプリ単位の入力経路がありません。",
         "open_system_settings": "システム設定を開く",
         "open_system_settings_for": "{{label}}のシステム設定を開く",
@@ -11002,7 +11002,7 @@
         "thinking_label": "思考を表示",
         "thread_allowlist_description": "オプション。許可されたユーザーは、これらの特定の Discord スレッドでのみエージェントを実行できます。空の場合 = DM のみ。",
         "thread_help": "デベロッパーモードをオンにして、スレッドを右クリック → <mono>チャネル ID をコピー</mono>。親チャネル ID ではなく、スレッドの ID を使用してください。",
-        "thread_warning": "スレッドモードは Discord のグローバル Message Content インテントを有効にします。Discord はボットが表示できるあらゆるサーバーチャネルからコンテンツを配信します。Kiro Crew は許可されたスレッド外のトラフィックを破棄します。許可されたスレッドを表示できるユーザーは誰でも、エージェント応答とツール出力を読むことができます。",
+        "thread_warning": "スレッドモードは Discord のグローバル Message Content インテントを有効にします。Discord はボットが表示できるあらゆるサーバーチャネルからコンテンツを配信します。RoyCrew は許可されたスレッド外のトラフィックを破棄します。許可されたスレッドを表示できるユーザーは誰でも、エージェント応答とツール出力を読むことができます。",
         "threshold_description": "セッションコンテキストがこのパーセンテージを超えたときに !compact または !new をプロンプトします。",
         "token_description": "Developer Portal の Bot ページから（トークンをリセットして一度表示するため）。",
         "token_placeholder": "Discord ボットトークンを貼り付ける"
@@ -11091,7 +11091,7 @@
         "handle_placeholder": "+15551234567",
         "loading": "iMessage の設定を読み込み中…",
         "macos_only": "iMessage には Messages にサインイン済みの macOS が必要で、ゲートウェイはその Mac 上で実行する必要があります。このホストは iMessage に接続できないため、これらの設定は読み取り専用です。",
-        "managed_locally": "iMessage の設定は Kiro Crew を実行しているマシン上で管理されるため、リモートセッションからは読み取り専用です。",
+        "managed_locally": "iMessage の設定は RoyCrew を実行しているマシン上で管理されるため、リモートセッションからは読み取り専用です。",
         "needs_setup": "セットアップが必要",
         "not_active": "非アクティブ",
         "prerequisites_body": "ボットもトークンも不要です。エージェントはローカルのブリッジを通じてご自身の Messages アプリにアクセスするため、転送に第三者は関与しません。ただし、入力したプロンプトは他のどのチャネルとも同様に、エージェントに設定されたモデルプロバイダーへ送信されます。Messages にサインインした macOS 14 以降、インストール済みの imsg CLI、そして 2 つの一度限りの macOS 権限—Messages に対する Full Disk Access と Automation—が必要です。",
@@ -11405,7 +11405,7 @@
         "disabled_by_policy": "ポリシーで無効化",
         "disabled_for_this_surface": "ホスト表面では無効化",
         "disabling_a_rule_that_overlaps_an_always_on_cont": "常時オンコントロール(機密ファイルの読み取り、IMDS、git-publish)と重複するルールを無効化しても、完全には解除されません。多層防御がブロック状態に保ちます。",
-        "disabling_all_built_in_denies_removes_kirocrew_s": "すべての組み込み拒否を無効にすると、破壊的なコマンドや認証情報を持ち出すコマンドに対する Kiro Crew の保護が解除されます。一部のコマンドは、独立した多層防御（機密パス、IMDS、git-publish）によって引き続きブロックされる場合があります。",
+        "disabling_all_built_in_denies_removes_kirocrew_s": "すべての組み込み拒否を無効にすると、破壊的なコマンドや認証情報を持ち出すコマンドに対する RoyCrew の保護が解除されます。一部のコマンドは、独立した多層防御（機密パス、IMDS、git-publish）によって引き続きブロックされる場合があります。",
         "disabling_weakens_protection": "「{{name}}」を無効にすると、破壊的なコマンドや認証情報の持ち出しに対する保護が弱まります。独立した多層防御の制御によって引き続きブロックされるコマンドもあります。",
         "do_not_enter_highly_sensitive_or_restricted_data": "Kiro Crewに非常に機密性の高い、または制限されたデータを入力しないでください。エージェントと共有する内容を決定するときは、適用可能なデータ処理ポリシーに従ってください。",
         "documentation": "ドキュメント",
@@ -11432,7 +11432,7 @@
         "feature_sel_audit": "SEL監査ログ",
         "feature_sel_audit_description": "クレデンシャル削除付きの不変でHMAC-チェーンされたセキュリティイベント追跡",
         "feature_sensitive_paths": "機密パスブロッキング",
-        "feature_sensitive_paths_description": "クレデンシャルディレクトリおよび Kiro Crewトラストルートは、ツール実行前のフックレイヤーでブロックされます",
+        "feature_sensitive_paths_description": "クレデンシャルディレクトリおよび RoyCrewトラストルートは、ツール実行前のフックレイヤーでブロックされます",
         "feature_suspicious_patterns": "疑わしいBashパターン",
         "feature_suspicious_patterns_description": "シェルコマンドで削除、流出、パイプ実行攻撃の形状を検出します",
         "feature_token_auth": "ダッシュボードトークン認証",
@@ -11468,7 +11468,7 @@
         "governance_status_is_temporarily_unavailable_enf": "ガバナンスステータスは一時的に利用できません。適用は影響を受けません — このビューはディスプレイ用のシーリングを解決できませんでした。",
         "hide_pattern": "パターンを非表示",
         "host_surface": "ホスト表面",
-        "i_understand_this_weakens_kirocrew_s_protection": "これは Kiro Crewの保護を弱めることを理解しています。",
+        "i_understand_this_weakens_kirocrew_s_protection": "これは RoyCrewの保護を弱めることを理解しています。",
         "interactive": "インタラクティブ",
         "invalid_regular_expression": "無効な正規表現",
         "kiro_crew_security_policy_json": "~/.kiro/crew/security_policy.json",
@@ -11496,7 +11496,7 @@
         "process_sandbox": "プロセスサンドボックス",
         "profile": "プロファイル：",
         "profile_2": "プロファイル",
-        "profile_unusable_body": "下に示すプロファイルを読み込めなかったため、その表面はポリシーのフォールバック上限に保たれています。より緩やかなフォールバックが宣言されていないかぎり、全面拒否です。Kiro Crew のデータホームにある profiles フォルダー内のファイルを修正してください。修正すれば自動的に再読み込みされます。",
+        "profile_unusable_body": "下に示すプロファイルを読み込めなかったため、その表面はポリシーのフォールバック上限に保たれています。より緩やかなフォールバックが宣言されていないかぎり、全面拒否です。RoyCrew のデータホームにある profiles フォルダー内のファイルを修正してください。修正すれば自動的に再読み込みされます。",
         "profile_unusable_detail": "ファイルが読み取り不能、解析に失敗、または継承元のプロファイルが存在しません。再起動が必要なのは、ファイルが実行中のビルドより新しいビルド向けである場合のみです。",
         "profile_unusable_title": "フォールバックプロファイルが有効です",
         "profile_unusable_which": "対象のプロファイル: {{profiles}}。",
@@ -11545,7 +11545,7 @@
         "tailnet_unavailable": "tailnet の設定を読み取れなかったため、ここでは表示も変更もできません。すでにオンだった場合、tailnet 名は引き続き許可されます。ページを再読み込みしてやり直してください。",
         "tailnet_unresolved_note": "これはオンですが、Kiro Crew の起動時に tailnet 名が解決されなかったため、許可オリジンには何も追加されていません。tailscale serve 経由で開いたダッシュボードは、引き続きオリジンチェックで拒否されます。名前が利用できるようになったら Kiro Crew を再起動してください。",
         "the_strictest_boundary_in_effect_for_each_govern": "各管理スコープで有効な最も厳密な境界",
-        "third_party_apps_on_warning": "これはすべてのサードパーティアプリを信頼します。後でインストールするものも含みます。あなたが起動しようとしたものだけではありません。信頼されたアプリは Kiro Crewが持つのと同じアクセス権で実行されます：あなたのファイル、保存された認証情報、およびインターネット。",
+        "third_party_apps_on_warning": "これはすべてのサードパーティアプリを信頼します。後でインストールするものも含みます。あなたが起動しようとしたものだけではありません。信頼されたアプリは RoyCrewが持つのと同じアクセス権で実行されます：あなたのファイル、保存された認証情報、およびインターネット。",
         "third_party_apps_save_failed": "この設定を保存できませんでした。",
         "third_party_apps_scope_note": "直ちに有効になります。オフに戻すと、それまで許可していたアプリも停止されます — シャットダウンフックが実行され、バックエンドが停止され、停止できなかったものはあなたに報告されます。",
         "third_party_apps_section": "サードパーティアプリ",
@@ -11574,7 +11574,7 @@
         "turn_off_every_rule": "組み込みのすべての拒否コマンドルールを一度にオフにします。独立した多層防御コントロール（機密パス、IMDS、git公開）は引き続き強制されます。",
         "turn_off_every_rule_governance_locked": "組み込みのすべての拒否コマンドルールを一度にオフにします。独立した多層防御コントロール（機密パス、IMDS、git公開）は引き続き強制され、組織のポリシーで固定されたルールは有効なままです。",
         "yolo_active_expires_at": "自動承認は{{time}}まで有効です。",
-        "yolo_active_until_restart": "自動承認はオンで、Kiro Crewが再起動されるまでオンのままです。",
+        "yolo_active_until_restart": "自動承認はオンで、RoyCrewが再起動されるまでオンのままです。",
         "yolo_auto_approve": "YOLO（自動承認）",
         "yolo_duration_12h": "12時間",
         "yolo_duration_1h": "1時間",
@@ -11585,7 +11585,7 @@
         "yolo_duration_locked": "組織のポリシーによって無効化されています",
         "yolo_duration_next_activation_note": "次回自動承認をオンにするときに適用されます。",
         "yolo_duration_title": "自動承認が続く期間",
-        "yolo_duration_until_shutdown": "Kiro Crewが再起動されるまで",
+        "yolo_duration_until_shutdown": "RoyCrewが再起動されるまで",
         "your_custom_denies": "カスタム拒否"
       },
       "shortcutsPanel": {
@@ -11653,7 +11653,7 @@
         "slack_bot_token": "Slack ボットトークン",
         "slack_connection_failed_at_startup": "起動時に Slack への接続に失敗しました（{{error}}）。slack.com へのネットワークアクセスを確認し、ゲートウェイを再起動してください。",
         "slack_rejected_the_stored_tokens_invalid_auth_re": "Slack が保存されたトークンを拒否しました（invalid_auth）。以下のトークンを置き換えてから、ゲートウェイを再起動してください。",
-        "slack_settings_are_managed_on_the_machine_runnin": "Slack 設定は Kiro Crew を実行しているマシン上で管理され、リモートセッションから読み取り専用です。",
+        "slack_settings_are_managed_on_the_machine_runnin": "Slack 設定は RoyCrew を実行しているマシン上で管理され、リモートセッションから読み取り専用です。",
         "slash_command": "スラッシュコマンド",
         "talk_to_your_agents_from_slack_over_socket_mode": "Socket Mode 経由で Slack からエージェントと対話します。接続されたボットが応答できるように、許可されたメンバー ID を追加してください。",
         "the_one_member_who_can_always_interact_with_the": "常にボットと対話できる 1 人のメンバー（KIROCREW_OWNER_ID）。U または W で始まります。",
@@ -11830,7 +11830,7 @@
         "talk_to_your_agents_from_a_teams_1_1_chat_self_h": "Teams の 1 対 1 チャットからエージェントと会話できます。Bot Framework を使ったセルフホスト方式です。\n            Teams はゲートウェイの HTTPS Webhook に投稿するため、公開エンドポイントが必要です\n            （リバースプロキシ、App Service、または開発トンネル）。",
         "teams_credential_check_failed": "Teams の認証情報チェックに失敗しました（{{error}}）。App ID / パスワード / テナントを確認し、ゲートウェイを再起動してください。",
         "teams_delivers_messages_by_calling_this_endpoint": "Teams はこのエンドポイントを\n              インターネットから呼び出すことでメッセージを配信するため、",
-        "teams_settings_are_managed_on_the_machine_runnin": "Teamsの設定は Kiro Crewを実行しているマシンで管理され、リモートセッションから読み取り専用。",
+        "teams_settings_are_managed_on_the_machine_runnin": "Teamsの設定は RoyCrewを実行しているマシンで管理され、リモートセッションから読み取り専用。",
         "tenant_id": "テナントID",
         "to": "へ",
         "tunnel_or_reverse_proxy_see_the_note_above_note": "(トンネルまたはリバースプロキシ) — 上の注記を参照。\n              結果のホストをメモ。",
@@ -11936,7 +11936,7 @@
         "webex": "Webex",
         "webex_account_emails_permitted_to_dm_the_bot_emp": "ボットへのDMが許可されたWebexアカウントメールアドレス。空 = 誰も不可（デフォルト拒否） — 組織内の誰でもWebexボットにメッセージを送信できるため、自分自身のみ追加してください。",
         "webex_bot_token": "Webexボットトークン",
-        "webex_settings_are_managed_on_the_machine_runnin": "Webex設定は Kiro Crewを実行中のマシン上で管理され、リモートセッションからは読み取り専用です。",
+        "webex_settings_are_managed_on_the_machine_runnin": "Webex設定は RoyCrewを実行中のマシン上で管理され、リモートセッションからは読み取り専用です。",
         "where_to_find_the_bot_token": "ボットトークンの場所",
         "you_example_com": "you@example.com"
       },
@@ -12419,8 +12419,8 @@
     "dataNeverSentTitle": "送信されません",
     "envOverrideWithSettingRef": "<settingRef/> がこの環境で設定されているため、ハートビートはオフです。ここでテレメトリを管理するには、設定を解除してください。",
     "governanceOverrideNote": "管理者のセキュリティポリシーがこれをオフにしています。ここで変更することはできません。",
-    "installReceiptBody": "Kiro Crew の公式カタログから正常にインストールまたは更新された後、匿名レシートが1つ送信されます。外部レジストリ、ローカルアプリ、自己登録アプリは報告されません。",
-    "installReceiptFields": "公式アプリスラッグ · アプリごとの匿名トークン (アプリ間でリンク不可) · 新規/更新フラグ · Kiro Crew バージョン",
+    "installReceiptBody": "RoyCrew の公式カタログから正常にインストールまたは更新された後、匿名レシートが1つ送信されます。外部レジストリ、ローカルアプリ、自己登録アプリは報告されません。",
+    "installReceiptFields": "公式アプリスラッグ · アプリごとの匿名トークン (アプリ間でリンク不可) · 新規/更新フラグ · RoyCrew バージョン",
     "installReceiptTitle": "公式アプリインストールレシート",
     "localDataBody": "使用状況とコンテキスト記録。パフォーマンスメトリクスはデフォルトではオフです。",
     "localDataTitle": "デバイスに保持",
@@ -12448,7 +12448,7 @@
         "auto": "自動",
         "description": "ダッシュボードインターフェースの言語。",
         "label": "言語",
-        "sync_failed": "Kiro Crew 設定に保存できませんでした — 言語はこのブラウザーにのみ適用され、再読み込みでリセットされる場合があります。"
+        "sync_failed": "RoyCrew 設定に保存できませんでした — 言語はこのブラウザーにのみ適用され、再読み込みでリセットされる場合があります。"
       }
     },
     "groups": {
@@ -12501,7 +12501,7 @@
         "label": "表示"
       },
       "imports": {
-        "description": "別のAIエージェントからデータを取得し、Kiro Crew 設定をバックアップまたは復元",
+        "description": "別のAIエージェントからデータを取得し、RoyCrew 設定をバックアップまたは復元",
         "label": "インポート / エクスポート"
       },
       "instances": {

@@ -22,6 +22,7 @@ from aiohttp.client_exceptions import ClientConnectionResetError
 
 from kiro_crew import model_registry
 from kiro_crew.acp.client import AcpModelUnavailable
+from kiro_crew.acp.types import ACP_BACKEND_CLAUDE
 from kiro_crew.agent_discovery import cached_project_agent_names, warm_project_agent_names
 from kiro_crew.config.loader import (
     KiroCrewConfig,
@@ -3730,7 +3731,7 @@ def _model_rejected_reason(model_name: str, backend: str | None = None) -> str |
             backend = KiroCrewConfig.load().agent.acp_backend
         except Exception:  # pragma: no cover - config load is resilient
             backend = ""
-    if backend == "claude":
+    if backend == ACP_BACKEND_CLAUDE:
         return None
     if model_registry.is_canonical_key(model_name):
         return (

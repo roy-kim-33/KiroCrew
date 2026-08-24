@@ -122,6 +122,9 @@ export const ALWAYS_LATIN = [
   // detection or the `Crew` half orphans as a reportable Latin run.
   'AWS', 'Discord', 'Docker', 'Git', 'GitHub', 'GitLab', 'JSON', 'Kiro', 'Kiro Crew',
   'KiroCrew',
+  // The fork's product name, rendered from {{productName}}: a proper noun that
+  // stays Latin in every language, exactly like the stock name above it.
+  'RoyCrew',
   'MCP', 'Markdown', 'Node.js', 'OAuth', 'Playwright', 'Python', 'Slack',
   'Telegram', 'TypeScript', 'Webex', 'WhatsApp', 'YAML', 'iMessage', 'npm',
   // `WeCom` and `WeChat` are deliberately ABSENT despite rendering from the same

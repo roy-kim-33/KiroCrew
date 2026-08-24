@@ -41,7 +41,12 @@ export const CHUNK_BUDGETS = {
   // `src/i18n/all.ts` — Rolldown names the chunk after that entry. Grows a
   // little with every translated string, which is expected and fine; what this
   // ceiling catches is a NEW library or surface landing in the catalog chunk.
-  all: 9100 * KB, // measured 8666 KB
+  // Fork: RoyCrew carries what upstream does plus its own provider/vision
+  // settings UI, the router model picker, and ~200 extra catalog keys in each
+  // of 11 locales — the catalogs are eagerly bundled (see i18n/index.ts's
+  // lazy-loading note), so fork keys land in this chunk by design rather than
+  // by accident. Same ~5% headroom over measured as upstream's own entries.
+  all: 9600 * KB, // measured 9137 KB (upstream measured 8666 KB)
 
   // The i18n RUNTIME — the i18next singleton, `initI18n`, the English catalog —
   // named after `src/i18n/t.ts`. Held separately from `all` above because

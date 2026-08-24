@@ -980,7 +980,10 @@ class AcpProvider(LLMProvider):
         no level resolves. Called before every Kiro (re)spawn so resume/restart
         keeps the same level.
         """
-        if not self.is_kiro_backend:
+        if self.is_kiro_backend is not True:  # harness-ok: positive read of the
+            # kiro identity these overlays belong to. The fork serves a third
+            # backend (opencode), so upstream's "skip when claude" would let the
+            # kiro-only overlay run on it (H5).
             return
         model = self._client._model
         level = self._resolve_effort()
@@ -999,7 +1002,9 @@ class AcpProvider(LLMProvider):
         (``self._tool_search is None``). Called before every Kiro (re)spawn so
         resume/restart keeps the same setting.
         """
-        if not self.is_kiro_backend or self._tool_search is None:
+        if self.is_kiro_backend is not True or self._tool_search is None:
+            # harness-ok: see _apply_effort_overlay — kiro-only overlay, and the
+            # fork's third backend must skip it too.
             return
         try:
             _write_tool_search_overlay(

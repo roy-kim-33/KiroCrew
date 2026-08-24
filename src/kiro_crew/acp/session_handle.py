@@ -66,7 +66,9 @@ from kiro_crew.acp.liveness import (
 )
 from kiro_crew.acp.prompt_blocks import build_prompt_blocks
 from kiro_crew.acp.types import (
+    ACP_BACKEND_CLAUDE,
     ACP_BACKEND_KAS,
+    ACP_BACKEND_OPENCODE,
     EVENT_AGENT_SWITCHED,
     EVENT_CLEAR_STATUS,
     EVENT_COMPACTION_STATUS,
@@ -831,7 +833,7 @@ class AcpSessionHandle:
                     main_env["ANTHROPIC_BASE_URL"] = base_url
                 if api_key:
                     main_env["ANTHROPIC_API_KEY"] = api_key
-                main_backend = a.acp_backend if a.acp_backend in ("claude", "opencode") else ""
+                main_backend = a.acp_backend if a.acp_backend in (ACP_BACKEND_CLAUDE, ACP_BACKEND_OPENCODE) else ""
                 from kiro_crew.acp.vision import redirect_image_message
 
                 message, image_mode = await redirect_image_message(

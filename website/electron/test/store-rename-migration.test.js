@@ -447,7 +447,13 @@ test("the legacy directory name is the pre-rename npm package name", () => {
   assert.strictEqual(LEGACY_STORE_NAME, "kirocrew-electron-mac");
 });
 
-test("the Windows install guide does not contradict the code on the stable lane", () => {
+test(
+  "the Windows install guide does not contradict the code on the stable lane",
+  // RoyCrew ships no Windows release and replaces upstream's CDN/channel
+  // updater with one that reads this fork's GitHub releases, so there is no
+  // KNOWN_CHANNELS set for the guide to agree with.
+  { skip: "RoyCrew ships no Windows release and no channel updater" },
+  () => {
   // A stale doc paragraph claimed "Stable has no Windows lane yet", named a
   // WINDOWS_CHANNELS set that does not exist in auto-update.js, and stated the
   // promotion bundle carries no Windows installer. All three are false: release.yml

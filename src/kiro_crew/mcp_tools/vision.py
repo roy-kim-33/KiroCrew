@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from kiro_crew import mcp_core
+from kiro_crew.acp.types import ACP_BACKEND_CLAUDE, ACP_BACKEND_OPENCODE
 from kiro_crew.acp.vision import describe_image_via_chain, resolve_vision_providers
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.validation import VISION_ANALYZE_SCHEMA, validate_tool_args
@@ -73,7 +74,7 @@ def vision_analyze(name: str, args: dict[str, Any]) -> str:
     # router base URL + API key (config key > ANTHROPIC_API_KEY env >
     # CLIPROXY_API_KEY env, exactly the loader's precedence). A harness is
     # selected at agent.acp_backend, never agent.provider (harness-parity).
-    backend = cfg.agent.acp_backend if cfg.agent.acp_backend in ("claude", "opencode") else ""
+    backend = cfg.agent.acp_backend if cfg.agent.acp_backend in (ACP_BACKEND_CLAUDE, ACP_BACKEND_OPENCODE) else ""
     env: dict[str, str] = {}
     base_url = (cfg.agent.provider_base_url or "").strip()
     api_key = (
@@ -85,7 +86,7 @@ def vision_analyze(name: str, args: dict[str, Any]) -> str:
         env["ANTHROPIC_BASE_URL"] = base_url
     if api_key:
         env["ANTHROPIC_API_KEY"] = api_key
-    if backend == "opencode":
+    if backend == ACP_BACKEND_OPENCODE:
         env.setdefault("OPENCODE_API_FORMAT", cfg.agent.provider_api_format or "openai")
 
     providers = resolve_vision_providers(

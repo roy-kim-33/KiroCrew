@@ -8045,6 +8045,11 @@ class KiroCrewConfig:
         the kiro-cli backend. The factory accepts an optional ``session_key`` to
         create a per-session subdirectory under ``workspace_root()``.
         """
+        # Local, like the sibling imports below: kiro_crew.acp.types is itself
+        # dependency-free, but importing it pulls kiro_crew.acp's package
+        # __init__, and this module must stay importable alone
+        # (test_acp_backend_kas.py::test_config_loader_imports_alone).
+        from kiro_crew.acp.types import ACP_BACKEND_CLAUDE, ACP_BACKEND_OPENCODE
         from kiro_crew.providers.acp import (
             AcpProvider,  # circular: acp -> client -> session -> config.loader
         )
@@ -8066,7 +8071,7 @@ class KiroCrewConfig:
         provider_base_url = (self.agent.provider_base_url or "").strip()
         provider_api_key = (self.agent.provider_api_key or "").strip()
         if (
-            provider_backend == "claude"
+            provider_backend == ACP_BACKEND_CLAUDE
             and provider_base_url
             and model in ("", "auto", DEFAULT_MODEL)
             and self.agent.model not in ("", "auto", DEFAULT_MODEL)
@@ -8144,7 +8149,7 @@ class KiroCrewConfig:
             # (claude-opus-5[1m]) which the router rejects. Fall back to the
             # config model.
             if (
-                provider_backend == "claude"
+                provider_backend == ACP_BACKEND_CLAUDE
                 and provider_base_url
                 and m in ("", "auto", DEFAULT_MODEL)
                 and self.agent.model not in ("", "auto", DEFAULT_MODEL)
@@ -8169,7 +8174,7 @@ class KiroCrewConfig:
             # cmc/deepseek-v4-pro, which the ACP client strips to the raw id
             # before the wire) — never registry-translate, or the Bedrock-form
             # global.anthropic.* id reaches a router that rejects it.
-            if provider_backend == "claude":
+            if provider_backend == ACP_BACKEND_CLAUDE:
                 if not provider_base_url:
                     m = model_registry.to_provider_id(m, "claude_code") if m else m
             else:
@@ -8195,7 +8200,7 @@ class KiroCrewConfig:
             # config into the provider. extra_env wins over config values.
             _backend = provider_backend
             _env: dict[str, str] = dict(extra_env or {})
-            if provider_backend in ("claude", "opencode"):
+            if provider_backend in (ACP_BACKEND_CLAUDE, ACP_BACKEND_OPENCODE):
                 if provider_base_url and not _env.get("ANTHROPIC_BASE_URL"):
                     _env["ANTHROPIC_BASE_URL"] = provider_base_url
                 if not _env.get("ANTHROPIC_API_KEY"):
@@ -8212,7 +8217,7 @@ class KiroCrewConfig:
                     )
                     if api_key:
                         _env["ANTHROPIC_API_KEY"] = api_key
-                if provider_backend == "opencode":
+                if provider_backend == ACP_BACKEND_OPENCODE:
                     # Wire format for the opencode custom provider — the ACP
                     # client maps it to the AI-SDK adapter (npm package).
                     _env.setdefault(
