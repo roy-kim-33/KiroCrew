@@ -861,7 +861,13 @@ def mcp_search_path(env_path: str) -> str:
         *extra,
         augmented_path(os.environ.get("PATH", "")),
     ]
-    return dedup_path(os.pathsep.join(filter(None, parts)))
+    joined = dedup_path(os.pathsep.join(filter(None, parts)))
+    # The ambient PATH is the one contributor nothing has vetted: a shell-ism
+    # like "~/.dotnet/tools" is not expanded by exec, and any relative entry is
+    # re-resolved against the CHILD's cwd — the work-dir shadowing that
+    # _validated_bin_dir and _manager_version_bin_dirs already refuse. Applied
+    # to the assembled path so every source obeys the same posture.
+    return os.pathsep.join(d for d in joined.split(os.pathsep) if os.path.isabs(d))
 
 
 # Env keys a spec's declared ``env`` must never set on a process WE spawn.

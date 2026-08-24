@@ -161,6 +161,7 @@ class ExtractedMeta:
 
 _EXTRA_SPECIAL_PURPOSE = (
     ipaddress.ip_network("192.0.0.0/24"),   # RFC 6890 IETF Protocol Assignments
+    ipaddress.ip_network("2002::/16"),      # RFC 3056 6to4
 )
 
 
@@ -228,17 +229,20 @@ def _reject_if_internal_ip(candidate: str) -> None:
     mapped = getattr(ip, "ipv4_mapped", None)
     if mapped is not None:
         ip = mapped
-    # CPython only special-cased the whole of 192.0.0.0/24 (RFC 6890 IETF
-    # Protocol Assignments) in 3.12.4; on an older patch release of a version
-    # this project supports, 192.0.0.128 reports is_global with every category
-    # flag clean. 6to4 needs no such entry — upstream judges it by unwrapping
-    # the embedded IPv4, which is interpreter-independent.
-    if any(ip in net for net in _EXTRA_SPECIAL_PURPOSE if ip.version == net.version):
-        raise UnfurlRejected("blocked_url")
+    # 6to4 is ADDITIONALLY refused by unwrapping — see the docstring for why the
+    # two encodings are not symmetric.
     # 6to4 is an ADDITIONAL refusal rather than a substitution — see the docstring
     # for why the two encodings are not symmetric.
     sixtofour = getattr(ip, "sixtofour", None)
     if sixtofour is not None and _is_not_public(sixtofour):
+        raise UnfurlRejected("blocked_url")
+    # Interpreter floor. requires-python is >=3.10, but CPython only added
+    # 192.0.0.0/24 (RFC 6890) and 2002::/16 to its special-purpose tables in
+    # 3.10.14 / 3.11.9 / 3.12.4. Below those, 192.0.0.128 and a 6to4 address
+    # carrying a PUBLIC embedded IPv4 both report is_global with every category
+    # flag clean. Checked AFTER the unwrap above so the unwrap stays the thing
+    # that refuses a 6to4 wrapping a private address, on every interpreter.
+    if any(ip in net for net in _EXTRA_SPECIAL_PURPOSE if ip.version == net.version):
         raise UnfurlRejected("blocked_url")
     if _is_not_public(ip):
         raise UnfurlRejected("blocked_url")

@@ -16,6 +16,7 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
+from kiro_crew.dashboard.handlers import agents as agents_handlers
 from kiro_crew.dashboard.handlers.agents import api_provider_test
 
 
@@ -68,8 +69,14 @@ async def _post(body, session_cls):
     client = TestClient(TestServer(app))
     await client.start_server()
     try:
+        # The owner gate is exercised by test_agents_endpoints_owner_auth's route
+        # sweep; these cases are about what happens AFTER it, so grant it here.
+        async def _owner_ok(_request, _operation):
+            return None
+
         with (
             patch("kiro_crew.dashboard.handlers.agents.KiroCrewConfig") as cfg,
+            patch.object(agents_handlers, "_require_owner", _owner_ok),
             patch("aiohttp.ClientSession", session_cls),
         ):
             cfg.load.return_value = _fake_config()
