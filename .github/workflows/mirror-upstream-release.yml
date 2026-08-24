@@ -10,19 +10,25 @@ name: Mirror Upstream Release
 # (on release: published) to build and attach the macOS + Linux desktop
 # artifacts -- this workflow never builds anything itself.
 #
-# SEQUENCING WITH scheduled-upstream-sync.yml: that workflow is what actually
-# brings upstream's code onto this fork's main, via a PR a human reviews and
-# merges. This workflow only cuts the GitHub Release once main already carries
-# the matching version -- if upstream releases before that sync PR has been
-# merged, this workflow finds main not yet caught up and skips with a notice.
-# It never tags stale code under a new version number.
+# UPSTREAM RELEASE IS THE TRIGGER, NOT THE VERSION SOURCE. Upstream's release
+# tags lag its own `main` (observed: upstream's latest release is v0.3.0 while
+# upstream's main -- and this fork's main, after scheduled-upstream-sync.yml
+# merges it -- is already at 0.5.0). Deriving the fork's tag from upstream's
+# release version would therefore cut a REGRESSION (e.g. v0.3.0-roycrew.2)
+# against code the fork's own updater already considers newer. So the tag
+# always comes from this fork's own src/kiro_crew/__init__.py __version__
+# (mirrored in website/electron/package.json), never from upstream's tag.
 #
-# VERSION SOURCE OF TRUTH: src/kiro_crew/__init__.py's __version__ on main
-# (mirrored in website/electron/package.json) already carries the fork's
-# "<upstream-version>-roycrew.<N>" suffix once a sync lands -- see
-# scripts/sync-upstream.sh. Rather than re-deriving N here, this workflow
-# trusts that string verbatim as the release tag; it only decides WHETHER a
-# release is due, not what N should be.
+# IDEMPOTENCY: every release this workflow creates embeds an HTML-comment
+# marker naming the upstream release that prompted it. "Is a mirror due" is
+# answered by comparing upstream's current latest tag against the marker in
+# THIS fork's own latest release -- not by comparing version numbers across
+# repos, which is exactly the comparison that traps on the lag above.
+#
+# N: computed here, not trusted from __init__.py's suffix -- multiple upstream
+# releases can land between two fork version bumps, and each still needs its
+# own distinguishable roycrew build. N is one more than the highest existing
+# roycrew release for the fork's current base version (0 if none exist yet).
 
 on:
   schedule:
@@ -48,52 +54,50 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Compare upstream's latest release against this fork's
+      - name: Check whether a new upstream release needs mirroring
         id: check
         run: |
           set -euo pipefail
 
           UPSTREAM_JSON="$(gh api "repos/${UPSTREAM_REPO}/releases/latest")"
           UPSTREAM_TAG="$(printf '%s' "$UPSTREAM_JSON" | jq -r '.tag_name')"
-          UPSTREAM_VERSION="${UPSTREAM_TAG#v}"
           UPSTREAM_URL="$(printf '%s' "$UPSTREAM_JSON" | jq -r '.html_url')"
           UPSTREAM_BODY="$(printf '%s' "$UPSTREAM_JSON" | jq -r '.body // ""')"
 
-          # This fork's most recent non-draft release. Empty on the fork's
-          # very first mirrored release.
-          FORK_LATEST_TAG="$(gh api "repos/${{ github.repository }}/releases" --jq 'first(.[] | select(.draft==false)).tag_name // empty')"
-          FORK_LATEST_BASE="$(printf '%s' "$FORK_LATEST_TAG" | sed -E 's/^v//; s/-roycrew\.[0-9]+$//')"
+          # The fork's own latest non-draft release carries the marker this
+          # workflow wrote into it last time. No marker found (first-ever run,
+          # or the latest release predates this workflow) is treated as
+          # "nothing mirrored yet" -- conservative, triggers a mirror.
+          FORK_LATEST_BODY="$(gh api "repos/${{ github.repository }}/releases" --jq 'first(.[] | select(.draft==false)).body // ""')"
+          LAST_MIRRORED="$(printf '%s' "$FORK_LATEST_BODY" | sed -n 's/.*<!-- mirrors-upstream: \(v[^ ]*\) -->.*/\1/p' | head -1)"
 
-          echo "upstream version: ${UPSTREAM_VERSION} (fork's latest release base: ${FORK_LATEST_BASE:-<none>})"
+          echo "upstream latest: ${UPSTREAM_TAG} (fork last mirrored: ${LAST_MIRRORED:-<none>})"
 
-          if [ -n "$FORK_LATEST_BASE" ]; then
-            NEWEST="$(printf '%s\n%s\n' "$FORK_LATEST_BASE" "$UPSTREAM_VERSION" | sort -V | tail -1)"
-            if [ "$FORK_LATEST_BASE" = "$UPSTREAM_VERSION" ]; then
-              echo "::notice::already mirrored upstream ${UPSTREAM_VERSION}; nothing to do."
-              echo "due=false" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
-            if [ "$NEWEST" = "$FORK_LATEST_BASE" ]; then
-              echo "::notice::fork's latest release (${FORK_LATEST_BASE}) is already newer than upstream's (${UPSTREAM_VERSION}); nothing to do."
-              echo "due=false" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
-          fi
-
-          # Upstream is ahead of the fork's last mirrored release. Only cut a
-          # release if this fork's main has actually caught up -- i.e.
-          # scheduled-upstream-sync.yml's PR for this version has already been
-          # merged -- otherwise this would tag pre-sync code under a version
-          # number it doesn't contain.
-          FORK_VERSION="$(grep -m1 '__version__' src/kiro_crew/__init__.py | sed -E 's/.*=[[:space:]]*"([^"]+)".*/\1/')"
-          FORK_BASE="$(printf '%s' "$FORK_VERSION" | sed -E 's/-roycrew\.[0-9]+$//')"
-          if [ "$FORK_BASE" != "$UPSTREAM_VERSION" ]; then
-            echo "::notice::upstream released ${UPSTREAM_VERSION} but main is still at ${FORK_BASE}; waiting for the scheduled-upstream-sync PR to be reviewed and merged before mirroring."
+          if [ "$LAST_MIRRORED" = "$UPSTREAM_TAG" ]; then
+            echo "::notice::already mirrored ${UPSTREAM_TAG}; nothing to do."
             echo "due=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          NEW_TAG="v${FORK_VERSION}"
+          # Version comes from the fork's own file, never from $UPSTREAM_TAG.
+          FORK_VERSION="$(grep -m1 '__version__' src/kiro_crew/__init__.py | sed -E 's/.*=[[:space:]]*"([^"]+)".*/\1/')"
+          FORK_BASE="$(printf '%s' "$FORK_VERSION" | sed -E 's/-roycrew\.[0-9]+$//')"
+
+          # ponytail: FORK_BASE is interpolated into an ERE unescaped (dots
+          # match any char) -- negligible false-positive risk for a semver
+          # string, not worth an escaping helper for one grep.
+          # `|| true`: grep exits 1 on no match, e.g. the first-ever release
+          # of a new base version -- under `set -e` that would otherwise abort
+          # this step before NEW_TAG is computed, exactly the case this
+          # workflow exists to handle.
+          MAX_N="$(gh api "repos/${{ github.repository }}/releases" --jq '.[].tag_name' \
+            | { grep -E "^v${FORK_BASE}-roycrew\.[0-9]+\$" || true; } \
+            | sed -E 's/.*-roycrew\.([0-9]+)$/\1/' \
+            | sort -n | tail -1)"
+          NEW_TAG="v${FORK_BASE}-roycrew.$(( ${MAX_N:-0} + 1 ))"
+
+          # Belt-and-suspenders: should be unreachable given MAX_N+1 above,
+          # but never re-cut an existing tag.
           if gh release view "$NEW_TAG" >/dev/null 2>&1; then
             echo "::notice::${NEW_TAG} already exists; nothing to do (idempotent)."
             echo "due=false" >> "$GITHUB_OUTPUT"
@@ -145,6 +149,8 @@ jobs:
           ---
 
           ${UPSTREAM_BODY}
+
+          <!-- mirrors-upstream: ${UPSTREAM_TAG} -->
           NOTES_EOF
           )"
           gh release create "$TAG" \
