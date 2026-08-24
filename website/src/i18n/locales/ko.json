@@ -4616,7 +4616,6 @@
         "desktop_app": "데스크톱 앱",
         "desktop_app_hint": "여기서 활성화할 수 있지만, 앱 자체 창을 사용하려면 Kiro Crew 데스크톱 앱이 필요합니다.",
         "enable": "활성화",
-        "get": "설치",
         "installed": "설치됨",
         "view_details_for": "{{name}} 세부 정보 보기"
       },
@@ -11622,7 +11621,7 @@
         "copied": "복사됨",
         "copy_manifest_yaml": "매니페스트 YAML 복사",
         "create_slack_app": "Slack 앱 만들기",
-        "create_the_slack_app_from_the_manifest": "아래 미리 채워진 매니페스트로 Slack 앱을 만드세요(Socket Mode와 권한 포함,\n 이름은 KiroCrew-{{alias}}).\n 워크스페이스에 설치한 다음 봇 토큰과 앱 수준 토큰을 여기에 붙여 넣으세요.",
+        "create_the_slack_app_from_the_manifest": "아래 미리 채워진 매니페스트로 Slack 앱을 만드세요(Socket Mode와 권한 포함,\n 이름은 RoyCrew-{{alias}}).\n 워크스페이스에 설치한 다음 봇 토큰과 앱 수준 토큰을 여기에 붙여 넣으세요.",
         "e0123abc456": "E0123ABC456",
         "enterprise_grid_org_ids_to_allow_starts_with_e_o": "허용할 Enterprise Grid org ID입니다(E 또는 T로 시작). 비워 두면 모든 org를 허용합니다.",
         "from_oauth_permissions_after_installing_your_sla": "Slack 앱을 설치한 뒤 OAuth & Permissions에서 확인합니다(xoxb-로 시작).",

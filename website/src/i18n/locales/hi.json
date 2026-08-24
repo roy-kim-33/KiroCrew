@@ -4682,7 +4682,6 @@
         "desktop_app": "डेस्कटॉप ऐप",
         "desktop_app_hint": "यहाँ से चालू कर सकते हैं, लेकिन ऐप की अपनी विंडो के लिए Kiro Crew डेस्कटॉप ऐप चाहिए।",
         "enable": "सक्षम करें",
-        "get": "प्राप्त करें",
         "installed": "इंस्टॉल है",
         "view_details_for": "{{name}} का विवरण देखें"
       },
@@ -11750,7 +11749,7 @@
         "copied": "कॉपी किया गया",
         "copy_manifest_yaml": "मैनिफ़ेस्ट YAML कॉपी करें",
         "create_slack_app": "Slack ऐप बनाएँ",
-        "create_the_slack_app_from_the_manifest": "नीचे दिए गए पहले से भरे मेनिफ़ेस्ट से Slack ऐप बनाएँ (Socket Mode और अनुमतियाँ\n            शामिल हैं, नाम KiroCrew-{{alias}})। इसे अपने\n            वर्कस्पेस में इंस्टॉल करें, फिर बॉट टोकन और app-level टोकन यहाँ पेस्ट करें।",
+        "create_the_slack_app_from_the_manifest": "नीचे दिए गए पहले से भरे मेनिफ़ेस्ट से Slack ऐप बनाएँ (Socket Mode और अनुमतियाँ\n            शामिल हैं, नाम RoyCrew-{{alias}})। इसे अपने\n            वर्कस्पेस में इंस्टॉल करें, फिर बॉट टोकन और app-level टोकन यहाँ पेस्ट करें।",
         "e0123abc456": "E0123ABC456",
         "enterprise_grid_org_ids_to_allow_starts_with_e_o": "अनुमति देने के लिए Enterprise Grid org ID (E या T से शुरू होते हैं)। सभी orgs को अनुमति देने के लिए खाली छोड़ें।",
         "from_oauth_permissions_after_installing_your_sla": "अपना Slack ऐप इंस्टॉल करने के बाद OAuth & Permissions से लें (xoxb- से शुरू होता है)।",

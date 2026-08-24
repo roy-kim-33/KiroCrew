@@ -123,7 +123,10 @@ export function registerCatalogs(
  * byte-identical to the Python-side `app.json` prose (the manifest-sync gate),
  * so they keep the literal.
  */
-const DEFAULT_PRODUCT_NAME = 'Kiro Crew'
+// RoyCrew fork: this repo IS the downstream edition, so the default is the
+// fork's name. Upstream's setProductName() seam stays untouched for anyone
+// editioning downstream of this fork.
+const DEFAULT_PRODUCT_NAME = 'RoyCrew'
 let productName = DEFAULT_PRODUCT_NAME
 
 /**

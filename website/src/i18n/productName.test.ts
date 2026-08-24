@@ -34,12 +34,12 @@ i18next.addResource('en', 'translation', 'test.updating_product', 'Updating {{pr
 describe('productName interpolation variable', () => {
   it('defaults to the stock product name', () => {
     expect(i18next.options.interpolation?.defaultVariables).toMatchObject({
-      productName: 'Kiro Crew',
+      productName: 'RoyCrew',
     })
   })
 
   it('renders a placeholder-bearing value identically to the old literal', () => {
-    expect(i18next.t('test.updating_product')).toBe('Updating Kiro Crew…')
+    expect(i18next.t('test.updating_product')).toBe('Updating RoyCrew…')
   })
 
   it('lets a call-time variable win over the default', () => {

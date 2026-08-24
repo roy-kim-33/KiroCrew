@@ -26,7 +26,7 @@ vi.mock('framer-motion', () => ({
   AnimatePresence: ({ children }: any) => <>{children}</>,
 }))
 
-const RATING_QUESTION = 'How would you rate your experience with Kiro Crew today?'
+const RATING_QUESTION = 'How would you rate your experience with RoyCrew today?'
 const THANKS = 'Thanks for your feedback!'
 const DISMISS_LABEL = 'Dismiss survey'
 

@@ -454,7 +454,7 @@ describe('AppsPage — uninstall dialog', () => {
     expect(within(dialog).getByText(/the downloaded source code will be removed/)).toBeInTheDocument()
   })
 
-  it('warns about a self-managed app whose resources live outside Kiro Crew', async () => {
+  it('warns about a self-managed app whose resources live outside RoyCrew', async () => {
     listApps.mockResolvedValue([{ ...SECRETARY, origin: 'local', resources: 'app' }])
     const dialog = await openDialog()
     expect(within(dialog).getByText(/This is a self-managed app/)).toBeInTheDocument()

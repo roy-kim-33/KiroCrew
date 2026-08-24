@@ -167,7 +167,7 @@ function composer(): HTMLTextAreaElement {
  * flash it, which outlasts the default find window.
  */
 function findOfflineBanner() {
-  return screen.findByText('Kiro Crew disconnected', {}, { timeout: 5000 })
+  return screen.findByText('RoyCrew disconnected', {}, { timeout: 5000 })
 }
 
 /** An approval frame as the gateway pushes it. */
@@ -553,7 +553,7 @@ describe('ChatPanel offline banner', () => {
     await renderPanel()
     expect(await findOfflineBanner()).toBeInTheDocument()
     retryConnect.mockResolvedValueOnce({ ok: false, message: 'Gateway refused' })
-    await userEvent.click(screen.getByRole('button', { name: 'Start Kiro Crew' }))
+    await userEvent.click(screen.getByRole('button', { name: 'Start RoyCrew' }))
     expect(await screen.findByText('Gateway refused')).toBeInTheDocument()
   })
 
@@ -562,7 +562,7 @@ describe('ChatPanel offline banner', () => {
     await renderPanel()
     await findOfflineBanner()
     retryConnect.mockRejectedValueOnce(new Error('boom'))
-    await userEvent.click(screen.getByRole('button', { name: 'Start Kiro Crew' }))
+    await userEvent.click(screen.getByRole('button', { name: 'Start RoyCrew' }))
     expect(await screen.findByText(/Timed out/)).toBeInTheDocument()
   })
 
@@ -572,7 +572,7 @@ describe('ChatPanel offline banner', () => {
     await findOfflineBanner()
     emit('onBackendStatus', true)
     await waitFor(() =>
-      expect(screen.queryByText('Kiro Crew disconnected')).not.toBeInTheDocument(),
+      expect(screen.queryByText('RoyCrew disconnected')).not.toBeInTheDocument(),
     )
   })
 })
@@ -600,7 +600,7 @@ describe('ChatPanel context menu', () => {
     menu = await openMenu(container)
     await userEvent.click(menu.getByRole('menuitem', { name: 'Appearance Gallery' }))
     menu = await openMenu(container)
-    await userEvent.click(menu.getByRole('menuitem', { name: 'Kiro Crew Dashboard' }))
+    await userEvent.click(menu.getByRole('menuitem', { name: 'RoyCrew Dashboard' }))
     expect(openSettings).toHaveBeenCalledTimes(1)
     expect(galleryOpen).toHaveBeenCalledTimes(1)
     expect(openDashboard).toHaveBeenCalledTimes(1)
@@ -978,9 +978,9 @@ describe('ChatPanel live config and presence', () => {
     backendOnline = false
     await renderPanel()
     emit('onBackendSwitching', true)
-    expect(await screen.findByText('Connecting to Kiro Crew...', {}, { timeout: 5000 }))
+    expect(await screen.findByText('Connecting to RoyCrew...', {}, { timeout: 5000 }))
       .toBeInTheDocument()
-    expect(screen.queryByText('Kiro Crew disconnected')).not.toBeInTheDocument()
+    expect(screen.queryByText('RoyCrew disconnected')).not.toBeInTheDocument()
   })
 })
 

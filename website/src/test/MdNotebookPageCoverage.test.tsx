@@ -559,7 +559,7 @@ describe('MdNotebookPage — settings, guarded mutations and editor keys', () =>
     await waitFor(() => expect(clearBtn).not.toBeDisabled())
   })
 
-  it('records a vault dropping out of the Kiro Crew knowledge library', async () => {
+  it('records a vault dropping out of the RoyCrew knowledge library', async () => {
     api.listVaults.mockResolvedValue({
       vaults: [aVault({ knowledge: true })],
       hasPat: false,
@@ -569,7 +569,7 @@ describe('MdNotebookPage — settings, guarded mutations and editor keys', () =>
     await screen.findByRole('button', { name: 'One' })
     await openSettings()
 
-    await userEvent.click(screen.getByRole('switch', { name: 'Sync to Kiro Crew knowledge' }))
+    await userEvent.click(screen.getByRole('switch', { name: 'Sync to RoyCrew knowledge' }))
 
     // The disabled state is persisted FIRST, before the host source is removed.
     await waitFor(() =>

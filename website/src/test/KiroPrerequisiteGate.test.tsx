@@ -354,7 +354,7 @@ describe('KiroPrerequisiteGate', () => {
 
   it('gates on a spec that is PRESENT but which kiro-cli refuses', async () => {
     // The gap the missing-specs card cannot cover: statting the file says it is
-    // there, while kiro-cli drops it from its agent table, so Kiro Crew's agent
+    // there, while kiro-cli drops it from its agent table, so RoyCrew's agent
     // silently becomes kiro-cli's default one with none of its MCP servers.
     vi.mocked(api.kiroPrerequisite).mockResolvedValue(status({
       installed: true,
@@ -374,7 +374,7 @@ describe('KiroPrerequisiteGate', () => {
     )
 
     expect(
-      await screen.findByText("Kiro CLI will not load Kiro Crew's agent specs"),
+      await screen.findByText("Kiro CLI will not load RoyCrew's agent specs"),
     ).toBeInTheDocument()
     expect(screen.queryByText('Dashboard loaded')).not.toBeInTheDocument()
     // Exact match on the list entry: the reason below also contains the filename
@@ -407,7 +407,7 @@ describe('KiroPrerequisiteGate', () => {
     expect(note).toHaveTextContent('does not rewrite them')
     // The leading cause is a kiro-cli upgrade, which re-checking cannot fix, so
     // both remedies must be present as their own lines rather than buried.
-    expect(screen.getByText(/Update Kiro Crew\./)).toBeInTheDocument()
+    expect(screen.getByText(/Update RoyCrew\./)).toBeInTheDocument()
     expect(screen.getByText(/Rewrite the specs from scratch/)).toBeInTheDocument()
     // The command must NOT come from a catalog value: a translator must not be
     // able to alter a string the user pastes into a shell.
@@ -436,7 +436,7 @@ describe('KiroPrerequisiteGate', () => {
       await screen.findByText("RoyCrew's agent specs are not installed"),
     ).toBeInTheDocument()
     expect(
-      screen.queryByText("Kiro CLI will not load Kiro Crew's agent specs"),
+      screen.queryByText("Kiro CLI will not load RoyCrew's agent specs"),
     ).not.toBeInTheDocument()
   })
 

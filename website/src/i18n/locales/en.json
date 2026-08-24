@@ -3473,7 +3473,6 @@
         "desktop_app": "Desktop app",
         "desktop_app_hint": "Enabling works from here, but the app's own window needs the Kiro Crew desktop app.",
         "enable": "Enable",
-        "get": "Get",
         "installed": "Installed",
         "view_details_for": "View details for {{name}}"
       },
@@ -7015,7 +7014,7 @@
         "required": "Required",
         "session_folder_name": "Folder name",
         "session_folder_name_desc": "Created for you when you save these settings, if it does not exist yet.",
-        "settings_are_managed_on_the_machine_running_kiro": "settings are managed on the machine running Kiro Crew and are read-only from remote sessions.",
+        "settings_are_managed_on_the_machine_running_kiro": "settings are managed on the machine running RoyCrew and are read-only from remote sessions.",
         "setup_guide": "Setup guide",
         "soft_context_threshold": "Soft context threshold %"
       },
@@ -7505,7 +7504,7 @@
         "slack": "Slack",
         "slack_app_token": "Slack app token",
         "slack_bot_token": "Slack bot token",
-        "slack_settings_are_managed_on_the_machine_runnin": "Slack settings are managed on the machine running Kiro Crew and are read-only from remote sessions.",
+        "slack_settings_are_managed_on_the_machine_runnin": "Slack settings are managed on the machine running RoyCrew and are read-only from remote sessions.",
         "slash_command": "Slash command",
         "talk_to_your_agents_from_slack_over_socket_mode": "Talk to your agents from Slack over Socket Mode. Add allowed member IDs so connected bots can respond.",
         "the_one_member_who_can_always_interact_with_the": "The one member who can always interact with the bot (KIROCREW_OWNER_ID). Starts with U or W.",
@@ -7640,7 +7639,7 @@
         "start_the_channel_at_gateway_boot_when_the_app_i": "Start the channel at gateway boot when the App ID + password are set.",
         "talk_to_your_agents_from_a_teams_1_1_chat_self_h": "Talk to your agents from a Teams 1:1 chat. Self-hosted via the Bot Framework:\n            Teams posts to your gateway's HTTPS webhook, so it needs a public endpoint\n            (reverse proxy, App Service, or a dev tunnel).",
         "teams_delivers_messages_by_calling_this_endpoint": "Teams delivers messages by\n              calling this endpoint from the internet, so a",
-        "teams_settings_are_managed_on_the_machine_runnin": "Teams settings are managed on the machine running Kiro Crew and are read-only from remote sessions.",
+        "teams_settings_are_managed_on_the_machine_runnin": "Teams settings are managed on the machine running RoyCrew and are read-only from remote sessions.",
         "tenant_id": "Tenant ID",
         "to": "to",
         "tunnel_or_reverse_proxy_see_the_note_above_note": "(tunnel or reverse\n              proxy) — see the note above. Note the resulting host.",
@@ -7695,7 +7694,7 @@
         "webex": "Webex",
         "webex_account_emails_permitted_to_dm_the_bot_emp": "Webex account emails permitted to DM the bot. Empty = nobody (fail closed) — anyone in an org can message a Webex bot, so add only your own.",
         "webex_bot_token": "Webex bot token",
-        "webex_settings_are_managed_on_the_machine_runnin": "Webex settings are managed on the machine running Kiro Crew and are read-only from remote sessions.",
+        "webex_settings_are_managed_on_the_machine_runnin": "Webex settings are managed on the machine running RoyCrew and are read-only from remote sessions.",
         "you_example_com": "you@example.com"
       },
       "webhooksPanel": {

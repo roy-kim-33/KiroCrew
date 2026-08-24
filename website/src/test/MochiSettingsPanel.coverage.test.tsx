@@ -274,7 +274,7 @@ describe('SettingsPanel general section', () => {
   it('offers Auto plus the real language registry, and stages the pick', async () => {
     await mount()
     const select = screen.getByRole('combobox') as HTMLSelectElement
-    // '' is "follow Kiro Crew", which is what the stored empty value means.
+    // '' is "follow RoyCrew", which is what the stored empty value means.
     expect(select.value).toBe('')
     expect(within(select).getByRole('option', { name: 'Auto' })).toBeTruthy()
     expect(select.options.length).toBeGreaterThan(1)
@@ -947,7 +947,7 @@ describe('SettingsPanel about section', () => {
     await mount()
     openSection('About')
 
-    expect(screen.getByText(/is a desktop companion built into Kiro Crew/)).toBeTruthy()
+    expect(screen.getByText(/is a desktop companion built into RoyCrew/)).toBeTruthy()
     const link = screen.getByRole('link', { name: 'buluoray' })
 
     fireEvent.click(link)

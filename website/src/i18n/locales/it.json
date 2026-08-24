@@ -4748,7 +4748,6 @@
         "desktop_app": "App desktop",
         "desktop_app_hint": "L'attivazione funziona da qui, ma la finestra dell'app richiede l'app desktop di Kiro Crew.",
         "enable": "Attiva",
-        "get": "Ottieni",
         "installed": "Installato",
         "view_details_for": "Mostra i dettagli di {{name}}"
       },
@@ -11878,7 +11877,7 @@
         "copied": "Copiato",
         "copy_manifest_yaml": "Copia il manifest YAML",
         "create_slack_app": "Crea app Slack",
-        "create_the_slack_app_from_the_manifest": "Crea l'app Slack dal manifest precompilato qui sotto (modalità Socket e permessi\n            inclusi, denominata KiroCrew-{{alias}}). Installala nel tuo\n            workspace, poi incolla qui il token del bot e il token a livello di app.",
+        "create_the_slack_app_from_the_manifest": "Crea l'app Slack dal manifest precompilato qui sotto (modalità Socket e permessi\n            inclusi, denominata RoyCrew-{{alias}}). Installala nel tuo\n            workspace, poi incolla qui il token del bot e il token a livello di app.",
         "e0123abc456": "E0123ABC456",
         "enterprise_grid_org_ids_to_allow_starts_with_e_o": "ID delle organizzazioni Enterprise Grid da consentire (inizia con E o T). Lascia vuoto per consentire tutte le organizzazioni.",
         "from_oauth_permissions_after_installing_your_sla": "Da OAuth & Permissions dopo l'installazione della tua app Slack (inizia con xoxb-).",

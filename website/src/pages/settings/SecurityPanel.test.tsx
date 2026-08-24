@@ -744,7 +744,7 @@ describe('SecurityPanel — governance policy viewer', () => {  beforeEach(() =>
     expect(screen.getByText(/policy fallback ceiling/)).toBeInTheDocument()
     expect(screen.getByText(/Affected: host\./)).toBeInTheDocument()
     // The remedy is only useful if it says WHERE the file is.
-    expect(screen.getByText(/profiles folder of your Kiro Crew data home/)).toBeInTheDocument()
+    expect(screen.getByText(/profiles folder of your RoyCrew data home/)).toBeInTheDocument()
     // Causes and the restart caveat live on the demoted line, not in the body.
     expect(screen.getByText(/extends a profile that is missing/)).toBeInTheDocument()
   })

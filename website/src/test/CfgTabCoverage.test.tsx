@@ -1,5 +1,5 @@
 /**
- * KiroCrewCfgTab — the Kiro Crew config table on the developer page.
+ * KiroCrewCfgTab — the RoyCrew config table on the developer page.
  *
  * The file sat at ~3% before this suite: only its module-level constants ran.
  * Everything below aims at the cold paths — the query error/loading boundaries,
@@ -102,7 +102,7 @@ function seed(cfg: Cfg = CFG, patched: Cfg = CFG) {
 /** Render and wait for the first table to replace the skeleton. */
 async function renderTab() {
   const view = renderWithProviders(<KiroCrewCfgTab />)
-  expect(await screen.findByText('Kiro Crew Agents')).toBeInTheDocument()
+  expect(await screen.findByText('RoyCrew Agents')).toBeInTheDocument()
   return view
 }
 
@@ -147,11 +147,11 @@ describe('KiroCrewCfgTab — query boundaries', () => {
 
     const { container } = renderWithProviders(<KiroCrewCfgTab />)
     expect(container.querySelector('.skeleton')).not.toBeNull()
-    expect(screen.queryByText('Kiro Crew Agents')).toBeNull()
+    expect(screen.queryByText('RoyCrew Agents')).toBeNull()
 
     // Settle it before the test ends so the query never resolves after teardown.
     await act(async () => { release(CFG) })
-    expect(await screen.findByText('Kiro Crew Agents')).toBeInTheDocument()
+    expect(await screen.findByText('RoyCrew Agents')).toBeInTheDocument()
   })
 
   it('renders an Error rejection by its message', async () => {
