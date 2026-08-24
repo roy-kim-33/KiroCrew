@@ -33,6 +33,13 @@ from typing import Any
 from kiro_crew.computer_use import types as _cu_types
 from kiro_crew.constants import WINDOWS_DEVICE_STEMS
 
+# Reasoning-effort vocabulary: ``effort.py`` is the single source of truth for
+# the valid levels; EFFORT_VALUES additionally admits ``""`` ("unset — defer to
+# the role pin / provider default"). Import-safe: ``effort`` pulls in only
+# ``model_registry`` (stdlib-only), so no cycle back into validation.
+from kiro_crew.effort import EFFORT_VALUES
+from kiro_crew.project_scope import SCOPE_FRAGMENT_RE
+
 # ── Constants ──
 
 # Max lengths for string inputs
@@ -970,6 +977,10 @@ SPAWN_RUN_SCHEMA = ToolSchema(
         # Optional model override for the subagent (e.g. "deepseek-3.2").
         # When set, the subagent runs on this model instead of the gateway default.
         FieldSpec("model", str, max_len=MAX_SHORT_STRING, pattern=_MODEL_NAME_RE),
+        # Optional per-call reasoning-effort override for the subagent(s).
+        # Batch-wide, like ``model``. ``""`` (in EFFORT_VALUES) means "unset —
+        # defer to the role_efforts['subagent'] pin, else the provider default".
+        FieldSpec("reasoning_effort", str, allowed=EFFORT_VALUES),
         # keep=True makes the run a continuable conversation: its session
         # persists (hibernated on disk) after completion, and spawn_continue
         # can dispatch follow-up turns into it with full prior context.
@@ -1033,9 +1044,18 @@ LEARN_ADD_SCHEMA = ToolSchema(
         FieldSpec("rule", str, required=True, max_len=MAX_SHORT_STRING),
         FieldSpec("category", str, allowed=ALLOWED_LESSON_CATEGORIES, default="knowledge"),
         FieldSpec("negative", str, max_len=MAX_SHORT_STRING),
-        # scope/workspace: the learn_add MCP tool (mcp_core.py) and the
-        # /api/lessons handler support workspace-scoped lessons. The "workspace
-        # required when scope='workspace'" rule is enforced in the handler.
+        # Path fragment naming the repository a correction belongs to; absent means
+        # it applies everywhere. The pattern is the gate's own (imported, not
+        # restated), so a value the gate could never satisfy -- a dot segment,
+        # traversal, an empty segment, a drive-qualified path -- is refused HERE
+        # rather than stored as a lesson that reports success and applies nowhere.
+        # Whether the named path exists is still the gate's business, at injection.
+        FieldSpec("repo_scope", str, max_len=MAX_SHORT_STRING, pattern=SCOPE_FRAGMENT_RE),
+        # scope/workspace: the /api/lessons handler stores and lists
+        # workspace-scoped lessons, but that tier does NOT reach a prompt -- the
+        # context builder gates injected lessons on repo_scope instead. The
+        # "workspace required when scope='workspace'" rule is enforced in the
+        # handler.
         FieldSpec("scope", str, allowed=ALLOWED_LESSON_SCOPES, default="global"),
         FieldSpec("workspace", str, max_len=MAX_SHORT_STRING, pattern=WORKSPACE_NAME_RE),
     ],
@@ -1047,6 +1067,31 @@ LEARN_REMOVE_SCHEMA = ToolSchema(
         FieldSpec("query", str, required=True, max_len=MAX_SHORT_STRING),
     ],
 )
+
+# Session work ledger (session_ledger.py). Field caps mirror the core module's
+# own clamps so the route refuses loudly what the primitive would otherwise
+# truncate silently. ``artifacts`` inner shape (str->str, bounded) is enforced
+# by the core module's merge. No slot-key field on purpose: the backend
+# resolves the calling session's identity from the request, never the body.
+SESSION_LEDGER_RECORD_SCHEMA = ToolSchema(
+    tool_name="session_ledger_record",
+    fields=[
+        FieldSpec("goal", str, max_len=2000),
+        FieldSpec("phase", str, max_len=128),
+        FieldSpec("next", str, max_len=2000),
+        FieldSpec("tried_approach", str, max_len=2000),
+        FieldSpec("tried_rejected_because", str, max_len=2000),
+        FieldSpec("artifacts", dict),
+        FieldSpec("event", str, max_len=2000),
+        FieldSpec("event_kind", str, max_len=32),
+    ],
+)
+# Empty on purpose, and REGISTERED on purpose: with no schema in
+# MCP_CORE_SCHEMAS an unexpected argument passes through unvalidated
+# (the learn_list gap), while an empty registered schema rejects it
+# (the spawn_list / resource_status precedent). The tool takes no
+# arguments; the schema's job is to enforce exactly that.
+SESSION_LEDGER_READ_SCHEMA = ToolSchema(tool_name="session_ledger_read")
 
 SPAWN_STATUS_SCHEMA = ToolSchema(
     tool_name="spawn_status",
@@ -2365,8 +2410,16 @@ SEND_MESSAGE_SCHEMA = ToolSchema(
         FieldSpec("unfurl_media", bool),
         FieldSpec("thread_ts", str, max_len=30, pattern=re.compile(r"^\d+\.\d+$")),
         FieldSpec("reply_broadcast", bool),
+        # Must accept every value ``mcp_tools.messaging._SESSION_TARGETS``
+        # advertises: this pattern runs BEFORE the handler, so a value missing
+        # here is rejected as malformed even though the tool's own enum offers
+        # it. Spelled out rather than imported because ``mcp_tools`` imports this
+        # module; ``test_mcp_messaging_discord`` pins the two together.
         FieldSpec(
-            "session", str, max_len=MAX_SHORT_STRING, pattern=re.compile(r"^(origin|slack)$")
+            "session",
+            str,
+            max_len=MAX_SHORT_STRING,
+            pattern=re.compile(r"^(origin|slack|discord)$"),
         ),
         FieldSpec("caller_session", str, max_len=MAX_SHORT_STRING, pattern=CRON_SESSION_RE),
     ],
@@ -2455,7 +2508,16 @@ LOCAL_KNOWLEDGE_SEARCH_SCHEMA = ToolSchema(
     fields=[
         FieldSpec("query", str, required=True, max_len=500),
         FieldSpec("limit", int, required=False, min_val=1, max_val=5, default=3),
+        # Opaque source id (uuid4 today). No pattern: an unknown id must reach
+        # the handler for a graceful "use knowledge_list_sources" reply, not a
+        # ValidationError; every downstream use is a parameterized SQL bind.
+        FieldSpec("source_id", str, required=False, max_len=64),
     ],
+)
+
+KNOWLEDGE_LIST_SOURCES_SCHEMA = ToolSchema(
+    tool_name="knowledge_list_sources",
+    fields=[],
 )
 
 KNOWLEDGE_DEDUP_SCHEMA = ToolSchema(
@@ -2507,6 +2569,30 @@ LIST_SESSIONS_SCHEMA = ToolSchema(
     ],
 )
 
+SESSION_CREATE_SCHEMA = ToolSchema(
+    tool_name="session_create",
+    fields=[
+        FieldSpec("title", str, required=False, default="", max_len=200),
+        FieldSpec("agent", str, required=False, default="", max_len=MAX_SHORT_STRING),
+    ],
+)
+
+SESSION_STOP_SCHEMA = ToolSchema(
+    tool_name="session_stop",
+    fields=[
+        FieldSpec("target", str, required=True, max_len=MAX_SHORT_STRING),
+    ],
+)
+
+SESSION_READ_MESSAGE_SCHEMA = ToolSchema(
+    tool_name="session_read_message",
+    fields=[
+        FieldSpec("target", str, required=True, max_len=MAX_SHORT_STRING),
+        FieldSpec("limit", int, required=False, min_val=1, max_val=100, default=20),
+        FieldSpec("since", int, required=False, min_val=0),
+    ],
+)
+
 # ── Schema Registry ──
 
 MCP_CORE_SCHEMAS: dict[str, ToolSchema] = {
@@ -2517,6 +2603,8 @@ MCP_CORE_SCHEMAS: dict[str, ToolSchema] = {
     "spawn_status": SPAWN_STATUS_SCHEMA,
     "learn_add": LEARN_ADD_SCHEMA,
     "learn_remove": LEARN_REMOVE_SCHEMA,
+    "session_ledger_read": SESSION_LEDGER_READ_SCHEMA,
+    "session_ledger_record": SESSION_LEDGER_RECORD_SCHEMA,
     "skill_search": SKILL_SEARCH_SCHEMA,
     "skill_discover": SKILL_DISCOVER_SCHEMA,
     "skill_fetch": SKILL_FETCH_SCHEMA,
@@ -2535,6 +2623,7 @@ MCP_CORE_SCHEMAS: dict[str, ToolSchema] = {
     "local_knowledge_search": LOCAL_KNOWLEDGE_SEARCH_SCHEMA,
     "knowledge_dedup": KNOWLEDGE_DEDUP_SCHEMA,
     "knowledge_add_document": KNOWLEDGE_ADD_DOCUMENT_SCHEMA,
+    "knowledge_list_sources": KNOWLEDGE_LIST_SOURCES_SCHEMA,
     "search_chat_history": SEARCH_CHAT_HISTORY_SCHEMA,
     "get_chat_session": GET_CHAT_SESSION_SCHEMA,
     "list_sessions": LIST_SESSIONS_SCHEMA,
@@ -2675,6 +2764,16 @@ _CU_OPTIONAL_ELEMENT_FIELD = FieldSpec(
 )
 _CU_CLICK_METHODS = frozenset(_cu_types.CLICK_METHODS)
 _CU_MOUSE_BUTTONS = frozenset(_cu_types.MOUSE_BUTTONS)
+_CU_DRAG_PATHS = frozenset(_cu_types.DRAG_PATHS)
+# ``computer_launch_app``'s target is a NAME, and this field is where that is
+# enforced on the wire. Deliberately the same bounded single-line string shape as
+# ``app`` — there is no path field and no argument field, because a launch that
+# accepted either would be "run an arbitrary program with attacker-chosen input"
+# rather than "open an application". The drivers narrow it much further (a resolved
+# executable must sit under a protected install root); this is only the outer bound.
+_CU_LAUNCH_APP_FIELD = FieldSpec(
+    "app", str, required=True, max_len=_cu_types.MAX_LAUNCH_QUERY_LEN
+)
 
 
 def _cu_coord_field(name: str, *, required: bool = False) -> FieldSpec:
@@ -2707,6 +2806,9 @@ def _cu_coord_field(name: str, *, required: bool = False) -> FieldSpec:
 # routes validation through it, and a tool absent from its server's registry has
 # its args passed through raw.
 MCP_DASHBOARD_SCHEMAS: dict[str, ToolSchema] = {
+    "session_create": SESSION_CREATE_SCHEMA,
+    "session_stop": SESSION_STOP_SCHEMA,
+    "session_read_message": SESSION_READ_MESSAGE_SCHEMA,
     "chat_folder_tree": CHAT_FOLDER_TREE_SCHEMA,
     "chat_folder_create": CHAT_FOLDER_CREATE_SCHEMA,
     "chat_folder_move": CHAT_FOLDER_MOVE_SCHEMA,
@@ -2715,6 +2817,16 @@ MCP_DASHBOARD_SCHEMAS: dict[str, ToolSchema] = {
 
 MCP_COMPUTER_SCHEMAS: dict[str, ToolSchema] = {
     _cu_types.TOOL_LIST_APPS: ToolSchema(tool_name=_cu_types.TOOL_LIST_APPS, fields=[]),
+    _cu_types.TOOL_LAUNCH_APP: ToolSchema(
+        tool_name=_cu_types.TOOL_LAUNCH_APP,
+        # ONE field, and the absence of the others is the point. No ``path``, no
+        # ``args``, no ``url``: the target is a name resolved against the OS's own
+        # catalog of installed applications, and each of those fields would turn this
+        # into a way to run an arbitrary program with attacker-chosen input — which,
+        # because computer use is deliberately not governance-gated, would also skip
+        # the ``BUILTIN_DENIED_RULES`` floor every ``bash`` call passes.
+        fields=[_CU_LAUNCH_APP_FIELD],
+    ),
     _cu_types.TOOL_GET_STATE: ToolSchema(
         tool_name=_cu_types.TOOL_GET_STATE,
         fields=[
@@ -2767,6 +2879,17 @@ MCP_COMPUTER_SCHEMAS: dict[str, ToolSchema] = {
             # for a drag — enumerating a smaller set here would put the same rule
             # in two places and let them drift.
             FieldSpec("click_method", str, max_len=16, allowed=_CU_CLICK_METHODS),
+            # The PATH shape. ``steps`` has no default here: absent means the
+            # dispatcher's ``DEFAULT_DRAG_STEPS`` (the two-point form), and putting a
+            # default in the schema as well would make one of the two authoritative
+            # by accident.
+            FieldSpec(
+                "steps",
+                int,
+                min_val=_cu_types.MIN_DRAG_STEPS,
+                max_val=_cu_types.MAX_DRAG_STEPS,
+            ),
+            FieldSpec("path", str, max_len=16, allowed=_CU_DRAG_PATHS),
         ],
     ),
     _cu_types.TOOL_TYPE_TEXT: ToolSchema(

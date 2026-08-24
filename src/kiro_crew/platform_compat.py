@@ -27,9 +27,10 @@ import time
 import zlib
 from ctypes import wintypes  # type aliases only; imports cleanly on every platform
 from pathlib import Path
-from typing import Any, Callable, Iterator, Mapping, Optional
+from typing import Any, Callable, Iterator, Mapping, NamedTuple, Optional, Sequence
 
 from kiro_crew.executors import subprocess_executor
+from kiro_crew.subprocess_utf8 import UTF8_TEXT
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +38,32 @@ IS_WINDOWS: bool = sys.platform == "win32"
 IS_POSIX: bool = not IS_WINDOWS
 IS_LINUX: bool = sys.platform == "linux"
 IS_MACOS: bool = sys.platform == "darwin"
+
+# Python's os.rename() replaces an existing empty directory on POSIX. Directory
+# publication sometimes needs the stronger create-if-absent contract, which the
+# kernel exposes but the stdlib does not: renameat2(RENAME_NOREPLACE) on Linux
+# and renameatx_np(RENAME_EXCL) on macOS. Resolve the native seam once so callers
+# can advertise the capability honestly and fail closed everywhere else.
+_RENAME_NOREPLACE_FN: Any = None
+_RENAME_NOREPLACE_FLAG = 0
+if IS_LINUX or IS_MACOS:
+    try:
+        _rename_libc = ctypes.CDLL(None, use_errno=True)
+        _rename_symbol = "renameat2" if IS_LINUX else "renameatx_np"
+        _RENAME_NOREPLACE_FN = getattr(_rename_libc, _rename_symbol)
+        _RENAME_NOREPLACE_FN.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        _RENAME_NOREPLACE_FN.restype = ctypes.c_int
+        _RENAME_NOREPLACE_FLAG = 1 if IS_LINUX else 4
+    except (AttributeError, OSError):
+        _RENAME_NOREPLACE_FN = None
+
+RENAME_NOREPLACE_AVAILABLE: bool = _RENAME_NOREPLACE_FN is not None
 
 # Portable signal constants — signal.SIGKILL is undefined on Windows.
 SIGKILL: int = getattr(signal, "SIGKILL", 9)
@@ -175,6 +202,47 @@ TCC_LIBRARY_WALKABLE_CHILDREN: frozenset[str] = frozenset(
 #: The single ``~/Library`` component name, kept as a constant because the walk
 #: pruner compares it positionally rather than by membership.
 _LIBRARY_DIR = "Library"
+
+
+def rename_noreplace(
+    src: str | os.PathLike,
+    dst: str | os.PathLike,
+    *,
+    src_dir_fd: int,
+    dst_dir_fd: int,
+) -> None:
+    """Atomically rename *src* to an absent *dst*, or raise.
+
+    Unlike :func:`os.rename`, an existing destination is never replaced. Both
+    names are resolved relative to caller-pinned directory descriptors. A
+    filesystem or platform that cannot preserve that contract raises
+    :class:`NotImplementedError`; callers must not fall back to a check followed
+    by ordinary rename because another writer can create the destination between
+    those two operations.
+    """
+    fn = _RENAME_NOREPLACE_FN
+    if fn is None:
+        raise NotImplementedError("atomic no-replace rename is unavailable")
+    src_bytes = os.fsencode(src)
+    dst_bytes = os.fsencode(dst)
+    ctypes.set_errno(0)
+    if fn(
+        src_dir_fd,
+        src_bytes,
+        dst_dir_fd,
+        dst_bytes,
+        _RENAME_NOREPLACE_FLAG,
+    ) == 0:
+        return
+    error = ctypes.get_errno()
+    if error in {errno.EEXIST, errno.ENOTEMPTY}:
+        raise FileExistsError(error, os.strerror(error), os.fspath(dst))
+    unsupported = {errno.ENOSYS, errno.EINVAL}
+    unsupported.add(getattr(errno, "EOPNOTSUPP", errno.EINVAL))
+    unsupported.add(getattr(errno, "ENOTSUP", errno.EINVAL))
+    if error in unsupported:
+        raise NotImplementedError("filesystem lacks atomic no-replace rename")
+    raise OSError(error, os.strerror(error), os.fspath(dst))
 
 
 def tcc_protected_dirs_for_walk(root: str | os.PathLike) -> frozenset[str]:
@@ -323,17 +391,16 @@ else:
 # EACCES), so an unbounded spin would turn a permission error into a hang.
 #
 # Two ceilings, because on-loop and off-loop have opposite needs:
-#  - OFF the loop (cron, home migration, app backends — threads/subprocesses):
-#    the wait must cover a legitimately long holder. home_migration holds the
-#    lock across a full copy+verify+delete of the data home, which can exceed
-#    many seconds, and a waiter there must NOT give up and race it. So use a
-#    generous ceiling that no real hold approaches, matching POSIX's "wait for
-#    the lock" as closely as a bounded spin can.
+#  - OFF the loop (cron, app backends — threads/subprocesses): the wait must
+#    cover a legitimately long holder that can hold the lock across a
+#    multi-second operation, and a waiter there must NOT give up and race it. So
+#    use a generous ceiling that no real hold approaches, matching POSIX's "wait
+#    for the lock" as closely as a bounded spin can.
 #  - ON the loop (e.g. bridges._mcp_lock during app enable): a spin-sleep would
 #    freeze chat/heartbeat, so that path never sleeps at all (single-shot).
 _WIN_LOCK_POLL_SECS = 0.01
-# Generous off-loop ceiling: longer than any legitimate hold (a large data-home
-# migration), short enough that a truly stuck/permission-denied fd still fails.
+# Generous off-loop ceiling: longer than any legitimate hold, short enough that
+# a truly stuck/permission-denied fd still fails.
 _WIN_LOCK_TIMEOUT_SECS = 300.0
 
 
@@ -348,8 +415,8 @@ def _win_acquire_blocking(fd: int, *, timeout: float = _WIN_LOCK_TIMEOUT_SECS) -
     loop is detected the acquire is single-shot — take it if free, else return
     False at once — and the caller fails closed rather than stalling the loop.
     Off the loop (the common case) it polls up to ``timeout`` as a real
-    blocking wait, so a legitimately long holder (a data-home migration) is
-    waited out rather than raced.
+    blocking wait, so a legitimately long holder is waited out rather than
+    raced.
     """
 
     def _try_once() -> bool:
@@ -1047,6 +1114,17 @@ def _windows_system_dirs() -> tuple[str, ...]:
     unexpected case where the API call fails. PowerShell ships in a versioned
     directory beside the system binaries, not inside it, so it is appended per
     root rather than assumed to sit alongside ``taskkill``.
+
+    **The early ``return`` below is what makes "fallback" mean fallback**, and it is
+    load-bearing rather than tidy. Appending the environment-derived path alongside a
+    successful API read reintroduces the input this function exists to avoid: it carries
+    a different casefold from what ``GetSystemDirectoryW`` reports, so the dedupe does
+    not collapse the two, and any caller treating the result as "directories the user
+    cannot write" then trusts a path the user names. Measured: with ``SystemRoot``
+    pointed at a temp directory, ``<temp>\\System32`` appears in this tuple while the API
+    answers normally, and ``computer_use.launch_windows`` accepts a binary planted there
+    as system-installed. ``HKCU\\Environment`` is writable without elevation, so a
+    restarted process inherits such a value.
     """
 
     dirs: list[str] = []
@@ -1059,11 +1137,15 @@ def _windows_system_dirs() -> tuple[str, ...]:
             dirs.append(buf.value)
     except Exception:
         pass
+    if dirs:
+        # The API answered. Adding an environment-derived sibling here would buy
+        # nothing (the real directory is already in hand) and would cost the
+        # guarantee every caller of this function relies on.
+        return tuple(dirs) + tuple(os.path.join(d, "WindowsPowerShell", "v1.0") for d in dirs)
     root = os.environ.get("SystemRoot") or r"C:\Windows"
-    # Case-insensitive dedupe: GetSystemDirectoryW reports the on-disk casing
-    # ("C:\Windows\system32"), which names the same directory as the
-    # conventionally-cased fallback and must not be probed twice.
-    seen = {d.casefold() for d in dirs}
+    # Case-insensitive dedupe: the conventionally-cased fallback can name the same
+    # directory as the environment-derived one and must not be probed twice.
+    seen: set[str] = set()
     for fallback in (os.path.join(root, "System32"), r"C:\Windows\System32"):
         if fallback.casefold() not in seen:
             seen.add(fallback.casefold())
@@ -1817,6 +1899,61 @@ def _win_process_image_name(pid: int) -> str | None:
         return None
 
 
+def process_argv_matches_exact(pid: int, expected_argv: Sequence[str]) -> bool:
+    """Return True iff *pid*'s FULL command line is exactly *expected_argv*.
+
+    The strict identity check behind reclaiming a child this process's own
+    lineage spawned and then lost (a recorded pid surviving a supervisor
+    hard-kill): a recorded pid may have been recycled onto an unrelated
+    process, and :func:`process_matches`-style substring needles cannot tell
+    the two apart — partial argv matching against the process table is exactly
+    what once killed forwards operators had started themselves. So the whole
+    argv must match, element for element, and every failure answers False.
+
+    For a DESTRUCTIVE decision this check must be paired with a
+    :func:`process_start_time` pin recorded when the child was spawned: argv
+    equality alone cannot rule out a recycled pid running an identical
+    command line, and on macOS the comparison basis below makes equality
+    necessary but not sufficient for vector equality. The pair fails toward
+    "do not signal" on either mismatch.
+
+    Linux: ``/proc/<pid>/cmdline`` NUL-split and compared element-wise (an
+    empty cmdline — a zombie — never matches). macOS: ``ps -ww -o command=``
+    reports the argv space-joined, so the comparison is against
+    ``" ".join(expected_argv)``; exact only when no expected element contains
+    a space, which holds for the argv shapes this guards (option tokens and
+    validated host/target strings). Windows: always False — the raw
+    ``Win32_Process.CommandLine`` string (see :func:`process_command_line`)
+    carries shell quoting rather than an argv vector, so element-exact
+    equality is not verifiable there; the guard fails closed and callers must
+    not signal.
+    """
+    if type(pid) is not int or pid <= 1 or not expected_argv:
+        return False
+    try:
+        if sys.platform == "linux":
+            raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+            if not raw:
+                return False  # zombie / kernel thread: no argv to confirm
+            parts = raw.split(b"\0")
+            if parts and parts[-1] == b"":
+                parts.pop()  # trailing NUL terminator
+            return parts == [a.encode() for a in expected_argv]
+        if sys.platform == "darwin":
+            ps_bin = trusted_system_bin("ps")
+            if ps_bin is None:
+                return False
+            out = subprocess.check_output(
+                [ps_bin, "-ww", "-o", "command=", "-p", str(pid)],
+                stderr=subprocess.DEVNULL,
+                timeout=2,
+            )
+            return out.decode(errors="replace").strip() == " ".join(expected_argv)
+    except Exception:
+        return False
+    return False
+
+
 def listening_pid_tool() -> str:
     """Return the external tool find_listening_pids relies on: 'lsof' / 'netstat'."""
     return "netstat" if IS_WINDOWS else "lsof"
@@ -1839,15 +1976,96 @@ def listening_pid_tool_available() -> bool:
     return trusted_system_bin(listening_pid_tool()) is not None
 
 
-def find_listening_pids(port: int) -> list[int]:
-    """Return PIDs with a LISTEN socket on TCP *port* (best-effort, deduped).
+class PortListener(NamedTuple):
+    """One LISTEN socket on a TCP port: the owning PID plus the local address
+    it bound, so callers can scope port ownership to the address they actually
+    probed instead of claiming every listener on the port."""
 
-    POSIX: ``lsof -ti TCP:<port> -sTCP:LISTEN``.
-    Windows: parse ``netstat -ano`` (no lsof; netstat ships in-box). Matches
-    rows whose local address ends in ``:<port>`` and whose state is LISTENING,
-    taking the PID from the last column. Returns ``[]`` on any failure (caller
-    treats "no PID found" as "nothing to stop"; use listening_pid_tool_available()
-    to tell a genuine empty result apart from the tool being absent).
+    pid: int
+    #: Normalized local host part, brackets stripped: ``"127.0.0.1"``,
+    #: ``"0.0.0.0"``, ``"::"``, ``"::1"``, a specific interface address, or
+    #: ``"*"`` (lsof prints the wildcard bind of either family as ``*``).
+    address: str
+    #: Address family: ``"4"``, ``"6"``, or ``""`` when the source did not say.
+    #: Load-bearing for wildcards — lsof spells both families ``*``, and only
+    #: the family tells a v4 wildcard apart from a possibly-v6-only one.
+    family: str = ""
+
+
+# Local addresses whose listener can receive a connect to ``127.0.0.1``: the v4
+# loopback itself, the v4 wildcard, lsof's family-agnostic wildcard ``*``, and
+# the v6 wildcard ``::`` (dual-stack sockets accept v4-mapped loopback; treating
+# it as non-covering would refuse adoption of a legitimately ``[::]``-bound
+# backend, which is the breaking direction). ``::1`` is deliberately absent: a
+# v6-loopback-only listener can never answer a probe addressed to 127.0.0.1.
+_LOOPBACK_COVERING_ADDRESSES = frozenset({"127.0.0.1", "0.0.0.0", "*", "::"})
+
+# Bound so a wedged lsof (stale mount, jammed process table) degrades to "no
+# listener found" instead of hanging every caller of the port->PID lookup; the
+# Windows netstat branch carries its own inline bound.
+_LSOF_TIMEOUT_SECS = 5
+
+
+def _normalize_local_address(address: str) -> str:
+    """Bare lowercase host part: brackets stripped, v4-mapped prefix removed."""
+    addr = address.strip().strip("[]").lower()
+    if addr.startswith("::ffff:"):
+        # v4-mapped form of a v4 address; compare the embedded v4 part.
+        addr = addr[len("::ffff:"):]
+    return addr
+
+
+def address_covers_loopback(address: str) -> bool:
+    """Whether a listener bound to *address* can receive a ``127.0.0.1`` connect.
+
+    Used to scope port ownership to the address a health probe actually talked
+    to: a listener on some other specific local address shares the port number
+    but was never the thing that answered the probe.
+    """
+    return _normalize_local_address(address) in _LOOPBACK_COVERING_ADDRESSES
+
+
+def loopback_owner_pids(listeners: list[PortListener]) -> list[int]:
+    """PIDs of the listener(s) a successful ``127.0.0.1:<port>`` connect reached.
+
+    Mirrors the kernel's most-specific-bind dispatch — the first non-empty
+    tier wins, and every PID within it is returned (pre-fork / multi-worker
+    backends legitimately share one listening socket):
+
+    1. Exact v4-loopback binds (``127.0.0.1``, incl. the v4-mapped spelling):
+       when one exists the kernel routes a loopback connect to it, so wildcard
+       listeners on the same port never saw the probe.
+    2. IPv4 wildcard binds: a v4 connect reaches the v4 wildcard socket in
+       preference to a dual-stack v6 one.
+    3. Remaining loopback-covering binds (the v6 wildcard, or one whose family
+       the source did not report): callers only ask after a successful
+       127.0.0.1 probe, so when nothing more specific exists, what is left
+       must have been the responder (a dual-stack socket).
+
+    Tier 2 is what keeps an unrelated ``IPV6_V6ONLY`` wildcard process from
+    being claimed alongside the real v4 owner sharing its port.
+    """
+    exact = [e for e in listeners if _normalize_local_address(e.address) == "127.0.0.1"]
+    if exact:
+        return list(dict.fromkeys(e.pid for e in exact))
+    covering = [e for e in listeners if address_covers_loopback(e.address)]
+    v4 = [e for e in covering if e.family == "4"]
+    if v4:
+        return list(dict.fromkeys(e.pid for e in v4))
+    return list(dict.fromkeys(e.pid for e in covering))
+
+
+def find_port_listeners(port: int) -> list[PortListener]:
+    """Return (pid, local address) for each LISTEN socket on TCP *port*.
+
+    Best-effort, deduped on (pid, address, family), never raises. POSIX asks
+    ``lsof -nP -iTCP:<port> -sTCP:LISTEN -Fptn`` (field output per socket:
+    ``p<pid>``, ``t<IPv4|IPv6>``, ``n<addr>:<port>``); Windows parses
+    ``netstat -ano`` (no lsof; netstat ships in-box), matching rows whose
+    local address ends in ``:<port>`` and whose state is LISTENING. Returns
+    ``[]`` on any failure (callers treat "no listener found" as "nothing to
+    stop"; use listening_pid_tool_available() to tell a genuine empty result
+    apart from the tool being absent).
     """
     if IS_POSIX:
         lsof_bin = trusted_system_bin("lsof")
@@ -1855,13 +2073,43 @@ def find_listening_pids(port: int) -> list[int]:
             return []
         try:
             out = subprocess.check_output(
-                [lsof_bin, "-ti", f"TCP:{port}", "-sTCP:LISTEN"],
+                # -n/-P keep addresses and ports numeric so the field parse
+                # below never sees a resolved host or service name; the t
+                # (type) field carries the family, without which the two
+                # wildcard binds are indistinguishable (both print ``*``).
+                [lsof_bin, "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-Fptn"],
                 text=True,
                 stderr=subprocess.DEVNULL,
+                timeout=_LSOF_TIMEOUT_SECS,
             )
-        except (FileNotFoundError, subprocess.CalledProcessError, OSError):
+        except (FileNotFoundError, subprocess.SubprocessError, OSError):
+            # CalledProcessError included: lsof exits non-zero when nothing
+            # matches the filter, which is the ordinary "port is free" answer.
             return []
-        return list(dict.fromkeys(int(p) for p in out.split() if p.strip().isdigit()))
+        suffix = f":{port}"
+        listeners: list[PortListener] = []
+        seen: set[PortListener] = set()
+        cur_pid: int | None = None
+        cur_family = ""
+        for line in out.splitlines():
+            if not line:
+                continue
+            tag, value = line[0], line[1:]
+            if tag == "p":
+                cur_pid = int(value) if value.isdigit() else None
+                cur_family = ""
+            elif tag == "t":
+                cur_family = {"IPv4": "4", "IPv6": "6"}.get(value, "")
+            elif tag == "n" and cur_pid is not None and value.endswith(suffix):
+                # ``n127.0.0.1:8080`` / ``n*:8080`` / ``n[::1]:8080`` — strip
+                # the port suffix and the v6 brackets to the bare host part.
+                entry = PortListener(
+                    cur_pid, value[: -len(suffix)].strip("[]"), cur_family
+                )
+                if entry not in seen:
+                    seen.add(entry)
+                    listeners.append(entry)
+        return listeners
     # Windows: netstat -ano. Lines look like:
     #   TCP    127.0.0.1:7777         0.0.0.0:0    LISTENING    17152   (IPv4)
     #   TCP    [::1]:7777             [::]:0       LISTENING    17152   (IPv6)
@@ -1893,7 +2141,8 @@ def find_listening_pids(port: int) -> list[int]:
     except (FileNotFoundError, subprocess.SubprocessError, OSError, ValueError):
         return []
     suffix = f":{port}"
-    pids: list[int] = []
+    listeners = []
+    seen = set()
     for line in out.splitlines():
         parts = line.split()
         # Expect: proto local foreign state pid.
@@ -1924,10 +2173,29 @@ def find_listening_pids(port: int) -> list[int]:
             continue
         pid_str = parts[-1]
         if pid_str.isdigit():
-            pids.append(int(pid_str))
-    # Dedup: a dual-stack listener appears in BOTH a TCP4 row (0.0.0.0:port)
-    # and a TCP6 row ([::]:port) under the same PID — collapse to one entry.
-    return list(dict.fromkeys(pids))
+            # The bracketed address form is what distinguishes v4 vs v6 on
+            # Windows netstat output (the proto column says "TCP" for both).
+            entry = PortListener(
+                int(pid_str),
+                local[: -len(suffix)].strip("[]"),
+                "6" if local.startswith("[") else "4",
+            )
+            if entry not in seen:
+                seen.add(entry)
+                listeners.append(entry)
+    return listeners
+
+
+def find_listening_pids(port: int) -> list[int]:
+    """Return PIDs with a LISTEN socket on TCP *port* (best-effort, deduped).
+
+    Address-agnostic accessor over :func:`find_port_listeners` for callers that
+    only care whether/which processes hold the port. A dual-stack listener
+    appears once per bound address (``0.0.0.0`` and ``::``) under the same PID —
+    collapsed to one entry here, first-seen order preserved. Same failure
+    contract: ``[]`` on any failure, never raises.
+    """
+    return list(dict.fromkeys(entry.pid for entry in find_port_listeners(port)))
 
 
 def process_command_line(pid: int) -> str:
@@ -2049,6 +2317,36 @@ def pid_liveness(pid: int) -> str:
             # (leave it alone) rather than risk pruning/killing a live PID.
             return PID_UNSIGNALABLE
     return PID_ALIVE if pid_exists(pid) else PID_DEAD
+
+
+def pgroup_exists(pgid: int) -> bool:
+    """Return True iff any member of process GROUP ``pgid`` is alive (best-effort).
+
+    The tree-faithful liveness probe for a child spawned with
+    ``start_new_session=True``: the launcher's pid doubles as the group id and
+    ordinary descendants keep it after the launcher exits, so the group
+    outlives the launcher exactly as long as any member does. A descendant
+    that ``setsid()``s out of the group evades this probe precisely as it
+    evades ``kill_process_tree`` -- callers that must catch those use the
+    escaped-children reapers, not this.
+
+    POSIX: ``os.killpg(pgid, 0)`` -- conservative on EPERM (unsignalable
+    reads as alive). Windows: process groups in this sense do not exist and
+    ``kill_process_tree`` already walks the whole child tree via
+    ``taskkill /T``, so the group id (== the launcher pid) is probed as a
+    plain pid via :func:`pid_exists`.
+    """
+    if not IS_POSIX:
+        return pid_exists(pgid)
+    if pgid <= 0:
+        return False
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True  # exists but we can't signal it
+    return True
 
 
 def pid_exists(pid: int) -> bool:
@@ -2516,6 +2814,41 @@ def kill_process_tree_pinned(
         _close_process_handle(handle)
 
 
+def kill_pid_pinned(pid: int, expected_start_time: str, sig: int = SIGTERM) -> bool:
+    """Kill *pid* only while its verified identity is PINNED OPEN.
+
+    Single-process variant of :func:`kill_process_tree_pinned` — same Windows
+    guarantee (the query handle that verified the creation time stays open
+    across the terminate, so the PID ``taskkill`` resolves cannot have been
+    recycled between the check and the signal), delegating to :func:`kill_pid`
+    instead of tearing down the tree. Returns ``False`` — without signalling —
+    when the handle cannot be opened or the identity does not match; callers
+    treat that as "identity unconfirmed, do not kill". On a match it delegates
+    to :func:`kill_pid` and propagates its exceptions unchanged.
+
+    POSIX delegates straight through: ``os.kill`` is issued in-process by the
+    same interpreter that did the check and there is no handle to hold; the
+    residual probe-to-signal window there is the pre-existing one callers
+    mitigate by re-confirming identity before destructive escalation.
+    """
+    if not IS_WINDOWS:
+        return kill_pid(pid, sig)
+    handle = _open_process_query_handle(pid)
+    if handle is None:
+        return False
+    try:
+        identity = _windows_process_handle_identity(handle)
+        # (pid, creation_time, exit_time) -- the creation half is the identity.
+        if identity is None or str(identity[1]) != expected_start_time:
+            return False
+        # The handle stays open for the whole call: taskkill resolves the PID
+        # while this process object is still referenced, so the PID cannot have
+        # been recycled onto a different process in between.
+        return kill_pid(pid, sig)
+    finally:
+        _close_process_handle(handle)
+
+
 async def kill_pid_async(pid: int, sig: int = SIGTERM) -> bool:
     """Async variant of :func:`kill_pid` — offloads Windows ``taskkill`` off the loop.
 
@@ -2752,6 +3085,22 @@ def unlink_link_or_junction(path: str | os.PathLike) -> None:
 # the file. See:
 # https://learn.microsoft.com/en-us/windows/win32/secauthz/well-known-sids
 _OWNER_RIGHTS_SID = "*S-1-3-4"
+
+
+# icacls inheritance flags for a DIRECTORY grant: (OI) object-inherit
+# propagates the ACE to files created inside, (CI) container-inherit propagates
+# it to subdirectories. Neither sets (IO), so the ACE also applies to the
+# directory itself and traversal is preserved.
+#
+# Without these flags a grant applies to the named object ALONE. That is
+# correct and complete for a file, and silently wrong for a directory: a file
+# created inside an "owner-only" directory would carry no explicit ACE at all
+# and fall back to whatever the creating process's token grants by default
+# (typically owner + SYSTEM + Administrators) — a default rather than the
+# guarantee the caller asked for. The flags are meaningless on a file, which is
+# why this is a directory-only rights prefix and not something
+# :func:`restrict_to_owner` can pass unconditionally.
+_ICACLS_DIR_INHERIT = "(OI)(CI)"
 
 
 # Success-only memo for _current_user_sid. NOT functools.lru_cache: lru_cache
@@ -3034,6 +3383,76 @@ def current_user_sid() -> str | None:
     return sid
 
 
+def is_token_elevated() -> bool | None:
+    """Whether this process runs with an ELEVATED token, or ``None`` if unknown.
+
+    Lives here rather than beside its one caller because this module already
+    owns "read this process's own access token" for the codebase (see
+    :func:`_process_token_sid_unguarded`), and a second copy of the
+    ``OpenProcessToken`` / ``GetTokenInformation`` prototype pair is plumbing
+    that drifts.
+
+    The tri-state return is deliberate and the two non-``True`` answers are not
+    interchangeable: ``False`` means the token was read and is not elevated,
+    while ``None`` means it could not be read at all. A caller that treats
+    elevation as disqualifying must refuse on ``None`` too, because "unknown"
+    is not "fine". Returns ``False`` on POSIX, where the concept does not exist
+    and the equivalent question is ``geteuid() == 0``.
+    """
+    if not IS_WINDOWS:
+        return False
+    TOKEN_QUERY = 0x0008
+    TOKEN_ELEVATION = 20
+    try:
+        # Per-line ignore is this module's own convention for the Windows-only
+        # ctypes surface (typeshed guards it, and CI type-checks on Linux).
+        advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)  # type: ignore[attr-defined]
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+    except OSError:  # pragma: no cover - a Windows without advapi32
+        return None
+
+    # Same reason as _process_token_sid_unguarded: declare every prototype and
+    # pass ctypes instances, never bare Python ints.
+    advapi32.OpenProcessToken.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.HANDLE),
+    ]
+    advapi32.OpenProcessToken.restype = wintypes.BOOL
+    advapi32.GetTokenInformation.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    advapi32.GetTokenInformation.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+
+    token = wintypes.HANDLE()
+    if not advapi32.OpenProcessToken(
+        kernel32.GetCurrentProcess(), wintypes.DWORD(TOKEN_QUERY), ctypes.byref(token)
+    ):
+        return None
+    try:
+        elevation = wintypes.DWORD()
+        returned = wintypes.DWORD()
+        ok = advapi32.GetTokenInformation(
+            token,
+            ctypes.c_int(TOKEN_ELEVATION),
+            ctypes.byref(elevation),
+            wintypes.DWORD(ctypes.sizeof(elevation)),
+            ctypes.byref(returned),
+        )
+        if not ok:
+            return None
+        return bool(elevation.value)
+    finally:
+        kernel32.CloseHandle(token)
+
+
 def make_owner_only_dir(path: str | os.PathLike) -> None:
     """Create *path* (with parents) and make it readable only by this user.
 
@@ -3046,9 +3465,16 @@ def make_owner_only_dir(path: str | os.PathLike) -> None:
 
     ``0o700`` and not :func:`restrict_to_owner` on POSIX: that helper applies
     ``0o600``, correct for a secret-bearing file and wrong for a directory,
-    which needs the execute bit to be traversable at all. Windows has no such
-    split (``icacls ... :F`` grants traverse with everything else), and there the
-    DACL is the only carrier of access, so the fail-loud helper is right.
+    which needs the execute bit to be traversable at all. On Windows the split
+    is the inverse of inert: ``restrict_to_owner``'s grants are not inheritable
+    (correct for a file, where the flags mean nothing), so routing a directory
+    through it left every file created inside on the creating token's default
+    DACL. Both platforms therefore go through
+    :func:`restrict_dir_to_owner`, the directory-shaped twin.
+
+    Only newly created children are covered. A file that already exists inside
+    the directory keeps its own DACL — see :func:`restrict_dir_to_owner` for
+    why a tightened parent does not fix one.
 
     Best-effort on the tightening step: the directory is still created, and the
     caller decides whether an un-tightened directory is fatal.
@@ -3056,10 +3482,7 @@ def make_owner_only_dir(path: str | os.PathLike) -> None:
     p = Path(path)
     p.mkdir(parents=True, exist_ok=True, mode=0o700)
     try:
-        if IS_WINDOWS:
-            restrict_to_owner(p)
-        else:
-            p.chmod(0o700)
+        restrict_dir_to_owner(p)
     except OSError:
         logger.warning("could not restrict directory %s to owner-only", p, exc_info=True)
 
@@ -3118,6 +3541,80 @@ def restrict_to_owner(path: str | os.PathLike) -> None:
     if IS_POSIX:
         os.chmod(path, 0o600)
         return
+    # Misuse guard: this helper is FILE-shaped. Its grants carry no (OI)(CI),
+    # so handing it a directory tightens the directory itself and leaves every
+    # file created inside on the creating token's default DACL -- the exact
+    # defect restrict_dir_to_owner exists to close. Warn rather than raise:
+    # the ACE still applies to the named object, so the lockdown is partial
+    # rather than absent, and turning a partial protection into a runtime
+    # OSError would be the worse outcome. The argv tests cannot see this from
+    # the call site, so the check lives here.
+    try:
+        if Path(path).is_dir():
+            # The path is deliberately NOT logged. In this codebase a path can
+            # itself be the secret -- mcp_gateway/apps.py notes that its spool
+            # FILENAMES are live capability tokens -- so naming it here would be
+            # clear-text logging of sensitive information (CodeQL flagged exactly
+            # that). logging already records module/function/lineno, which is
+            # what locates the offending caller.
+            logger.warning(
+                "restrict_to_owner was called on a directory; its grants are not "
+                "inheritable, so files created inside will not be owner-only. "
+                "Use restrict_dir_to_owner for a directory."
+            )
+    except OSError:
+        pass
+    _icacls_owner_only(path, inherit=False)
+
+
+def restrict_dir_to_owner(path: str | os.PathLike) -> None:
+    """Fail-loud owner-only lockdown of a DIRECTORY, inherited by its children.
+
+    The directory twin of :func:`restrict_to_owner`, and separate from it
+    because the two shapes genuinely differ on both platforms:
+
+    POSIX: ``0o700`` rather than ``0o600`` — a directory needs the execute bit
+    to be traversable at all, so the file helper's mode would make the
+    directory useless.
+
+    Windows: the grants carry ``(OI)(CI)`` so they propagate to files and
+    subdirectories created inside. ``restrict_to_owner``'s grants deliberately
+    do not, because those flags are meaningless on a file; applying the
+    file-shaped helper to a directory is what left every file created inside an
+    "owner-only" directory on the creating token's default DACL.
+
+    Note the limit: inheritance governs what gets CREATED from here on. A file
+    that already exists inside the directory keeps its own DACL, and Windows
+    grants *Bypass Traverse Checking* to Everyone by default, so a permissive
+    pre-existing file stays reachable through a tightened parent. Repairing an
+    existing install needs a per-file pass over the known names; this helper is
+    the guarantee for new files, not a retrofit.
+
+    Fail-loud like :func:`restrict_to_owner`: any failure raises ``OSError`` so
+    callers reach their warn-and-continue handlers.
+    """
+    if IS_POSIX:
+        # Semgrep's insecure-file-permissions rule reads 0o700 as "widely
+        # permissive" and recommends 0o644, which is backwards for a DIRECTORY
+        # holding secrets: 0o644 drops owner-execute (making the directory
+        # untraversable) and ADDS world-read -- the exact exposure this helper
+        # exists to close. 0o700 is the restrictive mode here, so the finding is
+        # suppressed on the line below. Same reasoning as cloud/launch_job.py.
+        # nosemgrep: python.lang.security.audit.insecure-file-permissions.insecure-file-permissions  # noqa: E501
+        os.chmod(path, 0o700)
+        return
+    _icacls_owner_only(path, inherit=True)
+
+
+def _icacls_owner_only(path: str | os.PathLike, *, inherit: bool) -> None:
+    """Apply an owner-only DACL to *path* via icacls. Windows-only.
+
+    Shared by :func:`restrict_to_owner` (``inherit=False``, file shape) and
+    :func:`restrict_dir_to_owner` (``inherit=True``, directory shape). The only
+    difference between the two argv forms is the rights prefix, so they are one
+    function: an owner-only DACL that two call paths could drift apart on is
+    the defect this consolidation exists to prevent.
+    """
     icacls = shutil.which("icacls") or r"C:\Windows\System32\icacls.exe"
     # Resolve the invoking user's SID BEFORE building the argv. If whoami is
     # unavailable (missing from PATH under a stripped-down profile, subprocess
@@ -3132,19 +3629,21 @@ def restrict_to_owner(path: str | os.PathLike) -> None:
     user_sid = _current_user_sid()
     if user_sid is None:
         raise OSError(
-            "restrict_to_owner: cannot resolve current user SID via whoami; "
+            f"{'restrict_dir_to_owner' if inherit else 'restrict_to_owner'}: "
+            "cannot resolve current user SID via whoami; "
             "refusing to apply Owner-Rights-only DACL (would lock non-owner "
             f"users out of {path!s} — see _current_user_sid docstring)."
         )
+    rights = f"{_ICACLS_DIR_INHERIT}F" if inherit else "F"
     argv: list[str] = [
         icacls,
         os.fspath(path),
         "/inheritance:r",
         "/grant:r",
-        f"{_OWNER_RIGHTS_SID}:F",
+        f"{_OWNER_RIGHTS_SID}:{rights}",
     ]
     if user_sid != _OWNER_RIGHTS_SID:
-        argv += ["/grant:r", f"{user_sid}:F"]
+        argv += ["/grant:r", f"{user_sid}:{rights}"]
     try:
         r = subprocess.run(
             argv,
@@ -3255,8 +3754,9 @@ def find_python_interpreter(reject: Optional[Callable[[str], bool]] = None) -> s
             out = subprocess.check_output(
                 [p, "-c", "import sys; print('%d.%d' % sys.version_info[:2])"],
                 timeout=5,
-                text=True,
                 stderr=subprocess.DEVNULL,
+                env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+                **UTF8_TEXT,
             ).strip()
             major, _, minor = out.partition(".")
             if not (int(major) == 3 and int(minor) >= 10):
@@ -3275,21 +3775,135 @@ def find_python_interpreter(reject: Optional[Callable[[str], bool]] = None) -> s
 # Resource limits
 # ---------------------------------------------------------------------------
 
+#: ``task_info`` flavor selector for ``mach_task_basic_info``
+#: (``<mach/task_info.h>``). Chosen over the legacy ``TASK_BASIC_INFO`` because
+#: its sizes are 64-bit, so a footprint above 4 GiB is not truncated.
+_MACH_TASK_BASIC_INFO = 20
 
-def proc_rss_bytes() -> int:
-    """Return this process's resident set size in bytes, or 0 on failure.
 
-    POSIX: ``resource.getrusage(RUSAGE_SELF).ru_maxrss`` (KiB on Linux, bytes
-    on macOS). Windows: ``GetProcessMemoryInfo().WorkingSetSize``.
+class _MachTimeValue(ctypes.Structure):
+    """``time_value_t`` (``<mach/time_value.h>``).
+
+    Never read; present only so the fields after it in
+    :class:`_MachTaskBasicInfo` land at the offsets the kernel writes them to.
     """
-    if IS_POSIX:
-        try:
 
-            ru_maxrss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-            # Linux reports KiB; macOS reports bytes.
-            return ru_maxrss if sys.platform == "darwin" else ru_maxrss * 1024
-        except (ImportError, OSError, ValueError):
-            return 0
+    _fields_ = [("seconds", ctypes.c_int32), ("microseconds", ctypes.c_int32)]
+
+
+class _MachTaskBasicInfo(ctypes.Structure):
+    """``mach_task_basic_info`` (``<mach/task_info.h>``), in kernel order.
+
+    ``resident_size`` is the task's CURRENT resident footprint in bytes and
+    falls when pages are released; ``resident_size_max`` is the high-water mark
+    that never falls. Reading the wrong one of the two is exactly the bug this
+    layout exists to avoid, so both are named rather than indexed.
+
+    Module scope is load-bearing: ``ctypes.POINTER(T)`` memoises T in a
+    module-level dict inside ctypes that is never evicted, so declaring this
+    inside the probe would pin a fresh pair of type objects on every call — and
+    this probe is polled by the dashboard's system-metrics endpoint.
+    """
+
+    _fields_ = [
+        ("virtual_size", ctypes.c_uint64),
+        ("resident_size", ctypes.c_uint64),
+        ("resident_size_max", ctypes.c_uint64),
+        ("user_time", _MachTimeValue),
+        ("system_time", _MachTimeValue),
+        ("policy", ctypes.c_int),
+        ("suspend_count", ctypes.c_int),
+    ]
+
+
+#: ``task_info`` takes and returns a count in ``natural_t``-sized elements
+#: (``MACH_TASK_BASIC_INFO_COUNT``). Derived from the layout so it cannot go
+#: stale if a field is added above.
+_MACH_TASK_BASIC_INFO_COUNT = ctypes.sizeof(_MachTaskBasicInfo) // ctypes.sizeof(ctypes.c_int)
+
+
+def _scale_ru_maxrss(ru_maxrss: int) -> int:
+    """``ru_maxrss`` -> bytes. macOS reports bytes; Linux and other POSIX KiB.
+
+    The unit differs by platform with nothing in the value to tell them apart,
+    so every reader of ``ru_maxrss`` goes through here.
+    """
+    return ru_maxrss if sys.platform == "darwin" else ru_maxrss * 1024
+
+
+def _ru_maxrss_bytes() -> int | None:
+    """Peak (high-water) RSS in bytes from ``getrusage``, or None on failure.
+
+    POSIX only. This is a **peak**, not a live reading: ``ru_maxrss`` never
+    decreases for the life of the process.
+    """
+    try:
+        return _scale_ru_maxrss(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+    except (ImportError, OSError, ValueError, AttributeError):
+        return None
+
+
+def _linux_current_rss_bytes() -> int | None:
+    """Current RSS in bytes from ``/proc/self/statm``, or None if unreadable.
+
+    Field 1 of ``statm`` is the resident page count — the same quantity
+    ``/proc/self/status``'s ``VmRSS`` and ``ps -o rss=`` report, so the
+    dashboard's figure reconciles with what an operator measures by hand.
+    """
+    try:
+        fields = Path("/proc/self/statm").read_text().split()
+        return int(fields[1]) * os.sysconf("SC_PAGE_SIZE")
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _macos_current_rss_bytes() -> int | None:
+    """Current RSS in bytes via Mach ``task_info``, or None on any failure.
+
+    ``proc_rss_bytes_for_pid`` has no ctypes-only route for an ARBITRARY pid
+    (it needs a task port it cannot obtain), but ``mach_task_self()`` hands out
+    a port for THIS task unconditionally, so the self-only reading below is
+    always available — no subprocess, which matters because the macOS app
+    sandbox can deny spawning ``ps``.
+
+    Returns ``resident_size`` (what ``ps -o rss=`` reports), not
+    ``phys_footprint``: every other platform branch here reports RSS, and the
+    payload field it feeds is named for RSS. Activity Monitor's "Memory" column
+    is the phys_footprint variant and will read somewhat differently; that is a
+    separate accounting question from the peak-vs-current bug.
+    """
+    try:
+        libc = ctypes.CDLL("/usr/lib/libSystem.dylib", use_errno=True)
+    except OSError:
+        return None  # not macOS / libSystem unavailable
+    try:
+        libc.mach_task_self.restype = ctypes.c_uint
+        libc.task_info.restype = ctypes.c_int
+        libc.task_info.argtypes = [
+            ctypes.c_uint,
+            ctypes.c_uint,
+            ctypes.POINTER(_MachTaskBasicInfo),
+            ctypes.POINTER(ctypes.c_uint),
+        ]
+        info = _MachTaskBasicInfo()
+        count = ctypes.c_uint(_MACH_TASK_BASIC_INFO_COUNT)
+        # mach_task_self() returns a port name owned by the task itself, not a
+        # fresh send right, so unlike mach_host_self() it must NOT be deallocated.
+        kern_return = libc.task_info(
+            libc.mach_task_self(),
+            _MACH_TASK_BASIC_INFO,
+            ctypes.byref(info),
+            ctypes.byref(count),
+        )
+    except (AttributeError, OSError, ValueError):
+        return None
+    if kern_return != 0:  # non-zero kern_return_t -> failure
+        return None
+    return int(info.resident_size)
+
+
+def _windows_memory_counters() -> "_ProcessMemoryCounters | None":
+    """psapi ``PROCESS_MEMORY_COUNTERS`` for this process, or None on failure."""
     try:
 
         psapi = ctypes.WinDLL("psapi", use_last_error=True)  # type: ignore[attr-defined]
@@ -3311,10 +3925,52 @@ def proc_rss_bytes() -> int:
         if psapi.GetProcessMemoryInfo(
             kernel32.GetCurrentProcess(), ctypes.byref(counters), counters.cb
         ):
-            return int(counters.WorkingSetSize)
-        return 0
+            return counters
+        return None
     except Exception:
-        return 0
+        return None
+
+
+def proc_rss_bytes() -> int:
+    """Return this process's CURRENT resident set size in bytes, or 0 on failure.
+
+    "Current" is the contract, not an implementation detail: this feeds an
+    operator-facing live memory figure, so it must FALL when the gateway
+    releases memory and must reconcile with ``ps -o rss=``.
+
+    - Linux: ``/proc/self/statm`` resident pages.
+    - macOS: Mach ``task_info(MACH_TASK_BASIC_INFO).resident_size``.
+    - Windows: ``GetProcessMemoryInfo().WorkingSetSize``.
+    - Last resort on POSIX only: ``getrusage(RUSAGE_SELF).ru_maxrss``, which is
+      a **peak** that never decreases. It is here so an unreadable ``/proc`` or
+      an unavailable ``libSystem`` still yields an order-of-magnitude number
+      rather than 0, and it over-reports by construction — see
+      :func:`proc_peak_rss_bytes` for the peak as a deliberate reading.
+    """
+    if IS_POSIX:
+        current = (
+            _macos_current_rss_bytes() if sys.platform == "darwin" else _linux_current_rss_bytes()
+        )
+        if current is not None:
+            return current
+        return _ru_maxrss_bytes() or 0
+    counters = _windows_memory_counters()
+    return 0 if counters is None else int(counters.WorkingSetSize)
+
+
+def proc_peak_rss_bytes() -> int:
+    """Return this process's PEAK resident set size in bytes, or 0 on failure.
+
+    The high-water mark since the process started: it never decreases, which is
+    what makes it useful for diagnosing a transient spike that a live reading
+    has already forgotten — and useless as the live reading itself. POSIX reads
+    ``getrusage(RUSAGE_SELF).ru_maxrss``; Windows reads
+    ``GetProcessMemoryInfo().PeakWorkingSetSize``.
+    """
+    if IS_POSIX:
+        return _ru_maxrss_bytes() or 0
+    counters = _windows_memory_counters()
+    return 0 if counters is None else int(counters.PeakWorkingSetSize)
 
 
 def proc_rss_bytes_for_pid(pid: int) -> int | None:

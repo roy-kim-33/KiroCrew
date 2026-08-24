@@ -146,7 +146,7 @@ def _registration_source(app_name: str) -> tuple[AppManifest | None, Path]:
                 AppManifest.from_json_file(shipped_root / "app.json"),
                 shipped_root,
             )
-        except (OSError, ValueError, json.JSONDecodeError) as exc:
+        except (OSError, ValueError) as exc:
             logger.warning(
                 "App %s: shipped resource manifest is unreadable: %s",
                 app_name,
@@ -896,10 +896,19 @@ def _register_agents(app_name: str, manifest: AppManifest, app_root: Path) -> li
         # Read agent JSON to get the agent name
         try:
             agent_data = json.loads(agent_path.read_text(encoding="utf-8"))
-            agent_name = agent_data.get("name", agent_path.stem)
         except (json.JSONDecodeError, OSError) as exc:
             logger.warning("App %s: unreadable agent %s: %s", app_name, agent_path, exc)
             continue
+        if not isinstance(agent_data, dict):
+            # Valid JSON that is not an object (a list, a scalar, null) parses
+            # fine, but every `.get` below would raise. Same disposition as the
+            # unreadable case: skip this agent rather than register a config
+            # the spec never described.
+            logger.warning(
+                "App %s: agent spec %s is not a JSON object; skipping", app_name, agent_path
+            )
+            continue
+        agent_name = agent_data.get("name", agent_path.stem)
 
         # The agent name is app-controlled (read from the agent JSON) and is
         # about to become a filesystem path component. Reject any path separator
@@ -2273,7 +2282,6 @@ def _prune_stale_app_resources(app_name: str, manifest: AppManifest, app_root: P
             if not agent_path.resolve().is_relative_to(app_root.resolve()):
                 continue
             data = json.loads(agent_path.read_text(encoding="utf-8"))
-            agent_name = data.get("name", agent_path.stem)
         except (json.JSONDecodeError, OSError) as exc:
             # A declared agent we CANNOT read is not the same as a removed one. If
             # we skipped it, its name would be absent from `current_links` and the
@@ -2289,6 +2297,20 @@ def _prune_stale_app_resources(app_name: str, manifest: AppManifest, app_root: P
             )
             current_links = None  # type: ignore[assignment]  # sentinel: do not prune agents
             break
+        if not isinstance(data, dict):
+            # Valid JSON that is not an object (a list, a scalar, null) parses
+            # fine, but it carries no readable `name` — the same cannot-read !=
+            # removed situation as above. Abort the agent prune so this agent
+            # does not fall out of `current_links` and lose its last-good
+            # materialized config.
+            logger.warning(
+                "Skipping agent prune for %s: declared agent %s is not a JSON object",
+                app_name,
+                agent_path_str,
+            )
+            current_links = None  # type: ignore[assignment]  # sentinel: do not prune agents
+            break
+        agent_name = data.get("name", agent_path.stem)
         current_links.add(_safe_link_name(_namespace(app_name, agent_name)) + ".json")
     agents_dir = _kiro_agents_dir()
     if current_links is not None and agents_dir.is_dir():
@@ -2389,6 +2411,13 @@ def register_app(app_name: str) -> RegistrationResult:
     except Exception as exc:
         result.errors.append(f"agent registration failed: {exc}")
 
+    declared = len(manifest.agents or [])
+    if declared and not result.agents:
+        result.errors.append(
+            f"registered 0 of {declared} declared agent(s) for {app_name!r} "
+            "-- agent source missing or unreadable"
+        )
+
     try:
         result.skills = _register_skills(app_name, manifest, app_root)
     except Exception as exc:
@@ -2425,7 +2454,15 @@ def refresh_app_agents(app_name: str) -> list[str]:
     info = get_app(app_name)
     if info and info.get("resources") == "app":
         return []
-    return _register_agents(app_name, manifest, _app_resource_root(app_name))
+    app_root = _app_resource_root(app_name)
+    # Admission gate — mirror register_app. A re-materialization MUST honor the
+    # same execution decision, or a revoked app's agents (and the MCP servers
+    # merged into them) would be rewritten and become dispatchable again. On
+    # denial, scrub any stale materialized agents and register nothing.
+    if _registration_denied(app_name, action="resource_register", app_root=app_root):
+        _deregister_agents(app_name)
+        return []
+    return _register_agents(app_name, manifest, app_root)
 
 
 def reconcile_enabled_app_resources() -> dict[str, int]:

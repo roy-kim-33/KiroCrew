@@ -14,6 +14,7 @@ from __future__ import annotations
 import errno
 import json
 import logging
+import mmap
 import os
 import re
 import shutil
@@ -105,6 +106,45 @@ class TestFileLock:
             pc.release_lock(fd)
         finally:
             os.close(fd)
+
+
+class TestRenameNoReplace:
+    @pytest.mark.skipif(
+        not pc.RENAME_NOREPLACE_AVAILABLE,
+        reason="native atomic no-replace rename is unavailable",
+    )
+    def test_rename_is_atomic_and_preserves_an_existing_destination(self, tmp_path):
+        first = tmp_path / "first"
+        first.mkdir()
+        (first / "payload").write_text("published")
+        parent_fd = os.open(tmp_path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            pc.rename_noreplace("first", "published", src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+            assert not first.exists()
+            assert (tmp_path / "published" / "payload").read_text() == "published"
+
+            losing = tmp_path / "losing"
+            losing.mkdir()
+            destination = tmp_path / "occupied"
+            destination.mkdir(mode=0o700)
+            before = destination.stat()
+            with pytest.raises(FileExistsError):
+                pc.rename_noreplace(
+                    "losing",
+                    "occupied",
+                    src_dir_fd=parent_fd,
+                    dst_dir_fd=parent_fd,
+                )
+            after = destination.stat()
+            assert (after.st_dev, after.st_ino) == (before.st_dev, before.st_ino)
+            assert losing.is_dir()
+        finally:
+            os.close(parent_fd)
+
+    def test_unavailable_native_contract_fails_closed(self, monkeypatch):
+        monkeypatch.setattr(pc, "_RENAME_NOREPLACE_FN", None)
+        with pytest.raises(NotImplementedError):
+            pc.rename_noreplace("source", "target", src_dir_fd=-1, dst_dir_fd=-1)
 
 
 class TestProcessHelpers:
@@ -485,6 +525,76 @@ class TestResourceShims:
         # truncated without argtypes and this silently returned 0, disabling the
         # watchdog's RSS ceiling.
         assert pc.proc_rss_bytes() > 0
+
+    def test_proc_rss_bytes_falls_back_down_when_memory_is_released(self):
+        """The reading must be CURRENT residency, not the high-water mark.
+
+        Reported symptom: the dashboard's per-process memory figure only ever
+        rose, so it disagreed with Activity Monitor / ``ps -o rss=`` by however
+        much the gateway had ever transiently used. ``ru_maxrss`` never
+        decreases, so this drives a real allocation and requires the number to
+        come back down — the one property a peak cannot have.
+
+        The allocation is an ``mmap`` rather than a ``bytearray`` because the
+        RELEASE has to be observable on every platform, and only ``munmap`` is:
+        freeing a ``bytearray`` returns the pages to the allocator, which decides
+        for itself whether to hand them back to the OS. macOS's keeps all 128MB
+        resident, so the current reading did not move and this failed there while
+        agreeing exactly with ``ps -o rss=`` — a correct reading judged against an
+        allocator's discretion rather than against the property under test.
+        Closing a mapping unmaps immediately on Linux, macOS and Windows alike.
+        """
+        chunk = 128 * 1024 * 1024
+        page = 4096
+        baseline = pc.proc_rss_bytes()
+        buf = mmap.mmap(-1, chunk)
+        try:
+            for offset in range(0, chunk, page):  # fault the pages in
+                buf[offset] = 1
+            while_held = pc.proc_rss_bytes()
+            peak_while_held = pc.proc_peak_rss_bytes()
+        finally:
+            buf.close()
+        after_free = pc.proc_rss_bytes()
+
+        # Rose by most of the buffer while it was resident.
+        assert while_held - baseline > chunk // 2
+        # And gave a real part of it back. Deliberately relative to `while_held`
+        # rather than an absolute `baseline + chunk // 2` ceiling: how much the
+        # OS actually returns on free is its decision, not ours. Windows keeps
+        # freed pages in the working set until there is pressure, so it returned
+        # ~45MB of a 128MB buffer where Linux returns nearly all of it, and an
+        # absolute ceiling failed there on a reading that was behaving correctly.
+        # A peak-based implementation cannot pass this at any tolerance, because
+        # it returns a number that has not moved at all.
+        assert after_free < while_held - chunk // 8
+        # The decisive property, and the one the bug got wrong: after a free the
+        # CURRENT reading must be strictly below the peak. `ru_maxrss` returns
+        # exactly the peak here, so this is the assertion that fails for it.
+        assert after_free < peak_while_held
+        # The peak, by contrast, is not allowed to fall.
+        assert pc.proc_peak_rss_bytes() >= peak_while_held
+
+    def test_proc_peak_rss_bytes_reads_the_same_unit_as_the_current_reading(self):
+        # The property under test is the UNIT, not the ordering: ru_maxrss is KiB on
+        # Linux and bytes on macOS, so a missing or spurious conversion puts the two
+        # readings 1024x apart. Asserted as a bounded ratio rather than
+        # `peak >= current`, which reads as the tighter and more obvious invariant but
+        # is not atomically observable on Linux: the two come from DIFFERENT kernel
+        # accounting paths. proc_rss_bytes reads /proc/self/statm, recomputed on
+        # read, while proc_peak_rss_bytes reads getrusage's high-water mark, which
+        # the kernel maintains from per-CPU RSS deltas it syncs in batches. So while
+        # the process is allocating, the live reading legitimately sits a little
+        # above the last-synced peak -- measured up to 1.02x on this 32-core host,
+        # which is what made the strict form fail under a loaded full-suite run.
+        # 4x leaves that mechanism ~250x of headroom before a real unit error passes.
+        current = pc.proc_rss_bytes()
+        peak = pc.proc_peak_rss_bytes()
+        assert peak > 0
+        assert peak * 4 >= current, (
+            f"peak {peak} is more than 4x under the live reading {current} -- too far "
+            "apart to be counter-sync lag, so one side is in the wrong unit"
+        )
 
     def test_proc_rss_bytes_for_pid_self_positive(self):
         rss = pc.proc_rss_bytes_for_pid(os.getpid())
@@ -935,6 +1045,93 @@ class TestProcessIdentityPosix:
         assert isinstance(result, bool)
         if pc.IS_POSIX:
             assert result is False
+
+
+class TestProcessArgvMatchesExact:
+    """The strict identity check behind reclaiming a recorded-but-orphaned
+    child: the WHOLE argv must match, element for element, and every failure
+    answers False — an unconfirmable identity must never be signalled."""
+
+    def _spawn(self, token: str):
+        argv = [
+            sys.executable,
+            "-c",
+            f"import sys, time; sys.stdout.write('R'); sys.stdout.flush(); "
+            f"time.sleep(30)  # {token}",
+        ]
+        child = subprocess.Popen(
+            argv,
+            start_new_session=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        ready = child.stdout.read(1)
+        assert ready == b"R", f"child did not signal readiness: {ready!r}"
+        return child, argv
+
+    @staticmethod
+    def _reap(child):
+        child.kill()
+        try:
+            child.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+
+    def test_exact_argv_matches_and_near_misses_do_not(self):
+        if pc.IS_POSIX:
+            # A plain binary that does NOT re-exec, so its kernel-visible argv
+            # is exactly the spawn argv on Linux AND macOS (a macOS framework
+            # python re-execs Python.app and rewrites argv[0], which is a
+            # property of the interpreter stand-in, not of the production
+            # targets — ssh and the aws v2 binary do not re-exec).
+            sleep_bin = shutil.which("sleep") or "/bin/sleep"
+            argv = [sleep_bin, "300"]
+            child = subprocess.Popen(
+                argv, start_new_session=True, stderr=subprocess.DEVNULL
+            )
+        else:
+            child, argv = self._spawn("kirocrew-argvexact-probe")
+        try:
+            if pc.IS_POSIX:
+                # Exact match: retry briefly for slow /proc population on
+                # loaded runners (same shape as the process_matches test).
+                deadline = time.monotonic() + 10.0
+                result = pc.process_argv_matches_exact(child.pid, argv)
+                while not result and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                    result = pc.process_argv_matches_exact(child.pid, argv)
+                assert result is True
+                # Anything less than the whole argv is a different process:
+                # a subset (prefix), a superset, and a one-element difference
+                # must all answer False — substring semantics are exactly what
+                # this function exists to NOT have.
+                assert pc.process_argv_matches_exact(child.pid, argv[:-1]) is False
+                assert pc.process_argv_matches_exact(child.pid, argv + ["-x"]) is False
+                changed = list(argv)
+                changed[-1] = changed[-1] + " "
+                assert pc.process_argv_matches_exact(child.pid, changed) is False
+            else:
+                # Windows: element-exact argv equality is not verifiable (the
+                # raw command line carries shell quoting, not a vector) — the
+                # guard fails closed even for the true argv.
+                assert pc.process_argv_matches_exact(child.pid, argv) is False
+        finally:
+            self._reap(child)
+
+    def test_unconfirmable_identities_answer_false(self):
+        # A pid that cannot exist, reserved pids, and an empty expectation all
+        # fail closed rather than raising.
+        assert pc.process_argv_matches_exact(2_000_000_000, ("x",)) is False
+        assert pc.process_argv_matches_exact(0, ("x",)) is False
+        assert pc.process_argv_matches_exact(1, ("x",)) is False
+        assert pc.process_argv_matches_exact(-5, ("x",)) is False
+        assert pc.process_argv_matches_exact(os.getpid(), ()) is False
+
+    def test_own_process_with_wrong_argv_is_false(self):
+        result = pc.process_argv_matches_exact(
+            os.getpid(), ("zzz-not-this-interpreter", "--nope")
+        )
+        assert result is False
 
 
 class TestProcessStartTime:
@@ -1607,6 +1804,116 @@ class TestRestrictToOwnerArgvOnLinux:
         # applying a half-configured lockdown.
         assert called == [], f"icacls should not run when SID is unknown: {called}"
 
+    def test_directory_grants_are_inheritable(self, tmp_path, monkeypatch):
+        # The bug this pins: make_owner_only_dir used to delegate to the
+        # FILE-shaped restrict_to_owner, whose grants carry no (OI)(CI). Those
+        # ACEs apply to the directory alone, so a file created inside an
+        # "owner-only" directory got no explicit ACE and fell back to the
+        # creating token's default DACL. No mode assertion can catch this —
+        # NTFS reports 0o666 for any file regardless of its DACL — so the
+        # argv IS the observable, exactly as the file-shape test above.
+        monkeypatch.setattr(pc, "IS_POSIX", False)
+        monkeypatch.setattr(pc, "IS_WINDOWS", True)
+        monkeypatch.setattr(pc, "_USER_SID_CACHE", [])
+        monkeypatch.setattr(pc, "_current_user_sid", lambda: "*S-1-5-21-1-2-3-1000")
+        captured: dict = {}
+
+        def fake_run(argv, **_kw):
+            captured["argv"] = list(argv)
+            return types.SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+        monkeypatch.setattr(pc.subprocess, "run", fake_run)
+        d = tmp_path / "secrets-dir"
+        d.mkdir()
+        pc.restrict_dir_to_owner(d)
+        argv = captured["argv"]
+        assert os.fspath(d) in argv
+        assert "/inheritance:r" in argv
+        grants = [argv[i + 1] for i, a in enumerate(argv[:-1]) if a == "/grant:r"]
+        # Both grants must propagate to children, or the directory guarantee
+        # covers nothing created inside it.
+        assert "*S-1-3-4:(OI)(CI)F" in grants, grants
+        assert "*S-1-5-21-1-2-3-1000:(OI)(CI)F" in grants, grants
+
+    def test_file_grants_stay_non_inheritable(self, tmp_path, monkeypatch):
+        # The other half of the split, asserted negatively: (OI)(CI) is
+        # meaningless on a file, so restrict_to_owner must NOT acquire it when
+        # the directory shape does. Without this, "just add (OI)(CI) to
+        # restrict_to_owner" reads as a passing simplification.
+        monkeypatch.setattr(pc, "IS_POSIX", False)
+        monkeypatch.setattr(pc, "IS_WINDOWS", True)
+        monkeypatch.setattr(pc, "_USER_SID_CACHE", [])
+        monkeypatch.setattr(pc, "_current_user_sid", lambda: "*S-1-5-21-1-2-3-1000")
+        captured: dict = {}
+
+        def fake_run(argv, **_kw):
+            captured["argv"] = list(argv)
+            return types.SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+        monkeypatch.setattr(pc.subprocess, "run", fake_run)
+        f = tmp_path / "secret.key"
+        f.write_bytes(b"s" * 32)
+        pc.restrict_to_owner(f)
+        grants = [
+            captured["argv"][i + 1]
+            for i, a in enumerate(captured["argv"][:-1])
+            if a == "/grant:r"
+        ]
+        assert grants, captured["argv"]
+        for g in grants:
+            assert "(OI)" not in g and "(CI)" not in g, g
+
+    def test_file_helper_warns_when_handed_a_directory(self, tmp_path, monkeypatch, caplog):
+        # The misuse guard. The argv tests cannot see this from the call site, so
+        # a directory reaching the file-shaped helper has to be caught here --
+        # it tightens the directory but leaves files created inside on the
+        # creating token's default DACL. Warn, not raise: the ACE still applies
+        # to the named object, so the lockdown is partial rather than absent.
+        monkeypatch.setattr(pc, "IS_POSIX", False)
+        monkeypatch.setattr(pc, "IS_WINDOWS", True)
+        monkeypatch.setattr(pc, "_USER_SID_CACHE", [])
+        monkeypatch.setattr(pc, "_current_user_sid", lambda: "*S-1-5-21-1-2-3-1000")
+        monkeypatch.setattr(
+            pc.subprocess,
+            "run",
+            lambda *a, **k: types.SimpleNamespace(returncode=0, stdout=b"", stderr=b""),
+        )
+        d = tmp_path / "a-directory"
+        d.mkdir()
+        with caplog.at_level(logging.WARNING, logger=pc.logger.name):
+            pc.restrict_to_owner(d)
+        assert any("not inheritable" in r.getMessage() for r in caplog.records), [
+            r.getMessage() for r in caplog.records
+        ]
+
+    def test_file_helper_stays_quiet_for_a_file(self, tmp_path, monkeypatch, caplog):
+        # The guard must not fire on the helper's actual purpose, or every
+        # secret-file lockdown would emit a spurious warning.
+        monkeypatch.setattr(pc, "IS_POSIX", False)
+        monkeypatch.setattr(pc, "IS_WINDOWS", True)
+        monkeypatch.setattr(pc, "_USER_SID_CACHE", [])
+        monkeypatch.setattr(pc, "_current_user_sid", lambda: "*S-1-5-21-1-2-3-1000")
+        monkeypatch.setattr(
+            pc.subprocess,
+            "run",
+            lambda *a, **k: types.SimpleNamespace(returncode=0, stdout=b"", stderr=b""),
+        )
+        f = tmp_path / "secret.key"
+        f.write_bytes(b"s" * 32)
+        with caplog.at_level(logging.WARNING, logger=pc.logger.name):
+            pc.restrict_to_owner(f)
+        assert not [r for r in caplog.records if "not inheritable" in r.getMessage()]
+
+    def test_directory_shape_uses_0o700_on_posix(self, tmp_path, monkeypatch):
+        # The POSIX half of the split: 0o700, not the file helper's 0o600 —
+        # a directory without the execute bit is not traversable at all.
+        monkeypatch.setattr(pc, "IS_POSIX", True)
+        monkeypatch.setattr(pc, "IS_WINDOWS", False)
+        modes: list[int] = []
+        monkeypatch.setattr(pc.os, "chmod", lambda p, m: modes.append(m))
+        pc.restrict_dir_to_owner(tmp_path)
+        assert modes == [0o700], modes
+
     def test_sid_failure_is_not_cached_success_is(self, monkeypatch):
         # A transient whoami failure (timeout under AV scan, non-zero rc) must
         # NOT be memoized: with lru_cache the first failure poisoned every
@@ -1845,8 +2152,12 @@ class TestRestrictToOwner:
 
 
 class TestResourceShimFailures:
-    def test_proc_rss_bytes_returns_zero_on_getrusage_failure(self, monkeypatch):
-        # The failure branch: getrusage raising OSError must yield 0, not raise.
+    def test_proc_rss_bytes_returns_zero_when_every_source_fails(self, monkeypatch):
+        # getrusage is no longer the primary source for proc_rss_bytes -- it is
+        # the labelled last-resort peak -- so reaching 0 now needs BOTH the
+        # current-RSS reader and the fallback to fail. Asserting only the
+        # getrusage failure would pass on a platform whose primary reader was
+        # silently removed.
         if not pc.IS_POSIX:
             pytest.skip("POSIX resource.getrusage branch")
 
@@ -1854,7 +2165,21 @@ class TestResourceShimFailures:
             raise OSError("getrusage failed")
 
         monkeypatch.setattr(pc.resource, "getrusage", boom)
+        monkeypatch.setattr(pc, "_linux_current_rss_bytes", lambda: None)
+        monkeypatch.setattr(pc, "_macos_current_rss_bytes", lambda: None)
         assert pc.proc_rss_bytes() == 0
+
+    def test_proc_peak_rss_bytes_returns_zero_on_getrusage_failure(self, monkeypatch):
+        # The peak reading has getrusage as its ONLY POSIX source, so its
+        # failure branch is still a plain 0.
+        if not pc.IS_POSIX:
+            pytest.skip("POSIX resource.getrusage branch")
+
+        def boom(*args, **kwargs):
+            raise OSError("getrusage failed")
+
+        monkeypatch.setattr(pc.resource, "getrusage", boom)
+        assert pc.proc_peak_rss_bytes() == 0
 
     def test_proc_cpu_seconds_returns_zero_on_getrusage_failure(self, monkeypatch):
         # The failure branch: getrusage raising OSError must yield 0.0, not raise.
@@ -1940,12 +2265,62 @@ class TestFindListeningPidsErrors:
         assert pc.find_listening_pids(59998) == []
 
     def test_dedupes_pids_from_lsof_output(self, monkeypatch):
-        # lsof can emit the same PID multiple times (one row per fd); the helper
-        # must dedupe while preserving first-seen order.
+        # lsof can emit the same (pid, address) socket multiple times (one row
+        # per fd) and one PID can hold several addresses on the port; the PID
+        # accessor must dedupe while preserving first-seen order.
         if not pc.IS_POSIX:
             pytest.skip("POSIX lsof branch")
-        monkeypatch.setattr(pc.subprocess, "check_output", lambda *a, **k: "111\n111\n222\n")
+        blob = "p111\nn127.0.0.1:7777\nn127.0.0.1:7777\nn*:7777\np222\nn[::1]:7777\n"
+        monkeypatch.setattr(pc.subprocess, "check_output", lambda *a, **k: blob)
         assert pc.find_listening_pids(7777) == [111, 222]
+
+    def test_posix_listeners_carry_their_local_address(self, monkeypatch):
+        # The lsof -Fptn field output attributes each LISTEN socket's local
+        # address AND family to its owning PID, so callers can scope ownership
+        # to the address they actually probed (family is what tells the two
+        # wildcard binds apart — lsof prints both as ``*``). v6 brackets are
+        # stripped; rows for a different port (defensive — the -i filter
+        # already scopes) and malformed p-lines are ignored.
+        if not pc.IS_POSIX:
+            pytest.skip("POSIX lsof branch")
+        blob = (
+            "p111\n"
+            "tIPv4\n"
+            "n127.0.0.1:7777\n"
+            "p222\n"
+            "tIPv6\n"
+            "n[::1]:7777\n"
+            "tIPv4\n"
+            "n192.168.1.5:7777\n"
+            "pbogus\n"
+            "n10.0.0.1:7777\n"
+            "p333\n"
+            "tIPv4\n"
+            "n*:7778\n"
+        )
+        monkeypatch.setattr(pc.subprocess, "check_output", lambda *a, **k: blob)
+        assert pc.find_port_listeners(7777) == [
+            pc.PortListener(111, "127.0.0.1", "4"),
+            pc.PortListener(222, "::1", "6"),
+            pc.PortListener(222, "192.168.1.5", "4"),
+        ]
+
+    def test_posix_lookup_is_bounded_by_a_timeout(self, monkeypatch):
+        # A wedged lsof (stale mount, jammed process table) must degrade to
+        # "no listener found" instead of hanging every port->PID caller: the
+        # spawn carries a timeout, and its expiry folds into [].
+        if not pc.IS_POSIX:
+            pytest.skip("POSIX lsof branch")
+        captured: dict = {}
+
+        def _capture(argv, **kwargs):
+            captured["argv"] = list(argv)
+            captured["kwargs"] = kwargs
+            raise subprocess.TimeoutExpired(argv, kwargs.get("timeout", 0))
+
+        monkeypatch.setattr(pc.subprocess, "check_output", _capture)
+        assert pc.find_port_listeners(7777) == []
+        assert captured["kwargs"].get("timeout") == pc._LSOF_TIMEOUT_SECS
 
     def _fake_netstat(self, blob: str):
         """Return a fake subprocess.check_output that returns *blob*."""
@@ -2034,6 +2409,25 @@ class TestFindListeningPidsErrors:
         monkeypatch.setattr(pc.subprocess, "check_output", self._fake_netstat(blob))
         assert pc.find_listening_pids(7777) == [44]
 
+    def test_windows_listeners_carry_their_local_address(self, monkeypatch):
+        # The netstat parse attributes each row's local address to its PID so
+        # callers can scope ownership to the address they probed; a dual-stack
+        # listener keeps one entry per bound address, v6 brackets stripped.
+        blob = (
+            "  TCP    0.0.0.0:7777           0.0.0.0:0              LISTENING       99\n"
+            "  TCP    [::]:7777              [::]:0                 LISTENING       99\n"
+            "  TCP    192.168.1.5:7777       0.0.0.0:0              LISTENING       55\n"
+        )
+        monkeypatch.setattr(pc, "IS_POSIX", False)
+        monkeypatch.setattr(pc, "IS_WINDOWS", True)
+        _fake_windows_bins(monkeypatch)
+        monkeypatch.setattr(pc.subprocess, "check_output", self._fake_netstat(blob))
+        assert pc.find_port_listeners(7777) == [
+            pc.PortListener(99, "0.0.0.0", "4"),
+            pc.PortListener(99, "::", "6"),
+            pc.PortListener(55, "192.168.1.5", "4"),
+        ]
+
     @pytest.mark.skipif(not pc.IS_WINDOWS, reason="Windows netstat branch")
     def test_windows_finds_real_ipv6_loopback_listener(self):
         # End-to-end guard on a live host: bind AF_INET6 to ::1 at an ephemeral
@@ -2051,6 +2445,79 @@ class TestFindListeningPidsErrors:
             assert os.getpid() in pids, f"expected pid {os.getpid()} in {pids}"
         finally:
             s.close()
+
+
+class TestAddressCoversLoopback:
+    @pytest.mark.parametrize(
+        "address",
+        ["127.0.0.1", "0.0.0.0", "*", "::", "[::]", "::ffff:127.0.0.1", " 0.0.0.0 "],
+    )
+    def test_loopback_covering_addresses(self, address):
+        assert pc.address_covers_loopback(address) is True
+
+    @pytest.mark.parametrize(
+        "address",
+        # ::1 cannot receive a connect addressed to 127.0.0.1, so a
+        # v6-loopback-only listener is deliberately NOT loopback-covering.
+        ["::1", "[::1]", "192.168.1.5", "10.0.0.1", "fe80::1", "127.0.0.2", ""],
+    )
+    def test_other_addresses_do_not_cover_loopback(self, address):
+        assert pc.address_covers_loopback(address) is False
+
+
+class TestLoopbackOwnerPids:
+    """The most-specific-bind dispatch tiers of :func:`loopback_owner_pids`."""
+
+    def test_an_exact_loopback_bind_beats_wildcards(self):
+        # The kernel routes a 127.0.0.1 connect to the exact bind, so wildcard
+        # listeners on the same port never saw the probe and are not owners.
+        listeners = [
+            pc.PortListener(111, "127.0.0.1", "4"),
+            pc.PortListener(999, "*", "4"),
+            pc.PortListener(888, "::", "6"),
+        ]
+        assert pc.loopback_owner_pids(listeners) == [111]
+
+    def test_a_v4_wildcard_beats_a_possibly_v6only_wildcard(self):
+        # An unrelated IPV6_V6ONLY wildcard next to the real v4 owner must not
+        # be claimed: a v4 connect reaches the v4 wildcard socket, never the
+        # v6-only one. lsof spells both ``*`` — the family is the separator.
+        listeners = [
+            pc.PortListener(111, "*", "4"),
+            pc.PortListener(999, "*", "6"),
+        ]
+        assert pc.loopback_owner_pids(listeners) == [111]
+
+    def test_a_lone_v6_wildcard_is_the_responder(self):
+        # Callers only ask after a successful 127.0.0.1 probe; with nothing
+        # more specific on the port, the v6 wildcard must be dual-stack and is
+        # the adopted owner (refusing it would break [::]-bound externally
+        # managed backends).
+        listeners = [pc.PortListener(77, "::", "6")]
+        assert pc.loopback_owner_pids(listeners) == [77]
+
+    def test_multi_worker_backends_share_ownership(self):
+        # Pre-fork / multi-worker backends legitimately share one listening
+        # socket: every PID in the winning tier is recorded.
+        listeners = [
+            pc.PortListener(11, "127.0.0.1", "4"),
+            pc.PortListener(12, "127.0.0.1", "4"),
+            pc.PortListener(999, "*", "4"),
+        ]
+        assert pc.loopback_owner_pids(listeners) == [11, 12]
+
+    def test_unknown_family_wildcards_fall_to_the_covering_tier(self):
+        # A source that reported no family (old lsof output) still resolves:
+        # the covering tier keeps adoption working rather than refusing it.
+        listeners = [
+            pc.PortListener(11, "*"),
+            pc.PortListener(22, "192.168.1.5"),
+        ]
+        assert pc.loopback_owner_pids(listeners) == [11]
+
+    def test_no_covering_listener_yields_no_owner(self):
+        listeners = [pc.PortListener(999, "192.168.1.5", "4")]
+        assert pc.loopback_owner_pids(listeners) == []
 
 
 class TestKillAsyncVariants:
@@ -2314,6 +2781,9 @@ class TestCtypesStructsAreModuleScoped:
         "_win_process_image_name",
         "_process_token_sid_unguarded",
         "proc_rss_bytes",
+        "proc_peak_rss_bytes",
+        "_windows_memory_counters",
+        "_macos_current_rss_bytes",
         "proc_rss_bytes_for_pid",
         "system_memory",
         "apply_job_limits",
@@ -2337,6 +2807,8 @@ class TestCtypesStructsAreModuleScoped:
             "_JobObjectExtendedLimitInformation",
             "_ThreadEntry32",
             "_VMStatistics64",
+            "_MachTimeValue",
+            "_MachTaskBasicInfo",
         ):
             assert issubclass(getattr(pc, name), ctypes.Structure), name
 
@@ -2370,6 +2842,7 @@ class TestCtypesStructsAreModuleScoped:
         pid = os.getpid()
         probes = (
             pc.proc_rss_bytes,
+            pc.proc_peak_rss_bytes,
             lambda: pc.proc_rss_bytes_for_pid(pid),
             pc.system_memory,
             lambda: pc.get_ppid(pid),
@@ -2442,23 +2915,40 @@ class TestMakeOwnerOnlyDir:
         self, tmp_path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Windows derives access from the DACL, so the mode argument is inert
-        and restrict_to_owner is the only thing that protects the directory."""
+        and the DACL helper is the only thing that protects the directory.
+
+        It must be the DIRECTORY helper. ``restrict_to_owner`` is file-shaped:
+        its grants carry no ``(OI)(CI)``, so routing a directory through it
+        tightened the directory itself and left every file created inside on
+        the creating token's default DACL -- which is why the negative
+        assertion below is the load-bearing half of this test.
+        """
         calls: list[str] = []
+        wrong: list[str] = []
         monkeypatch.setattr(pc, "IS_WINDOWS", True)
-        monkeypatch.setattr(pc, "restrict_to_owner", lambda p: calls.append(str(p)))
+        monkeypatch.setattr(pc, "restrict_dir_to_owner", lambda p: calls.append(str(p)))
+        monkeypatch.setattr(pc, "restrict_to_owner", lambda p: wrong.append(str(p)))
         target = tmp_path / "win"
         pc.make_owner_only_dir(target)
         assert target.is_dir()
         assert calls == [str(target)]
+        assert wrong == [], "a directory must not go through the file-shaped helper"
 
     def test_directory_still_exists_when_tightening_fails(
         self, tmp_path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Best-effort on the tightening step: the caller decides whether an
-        un-tightened directory is fatal, so creation must not be rolled back."""
+        un-tightened directory is fatal, so creation must not be rolled back.
+
+        Patches the same helper ``make_owner_only_dir`` actually calls -- when
+        this named the file helper instead, the raise never fired and the test
+        passed without exercising the handler at all.
+        """
         monkeypatch.setattr(pc, "IS_WINDOWS", True)
         monkeypatch.setattr(
-            pc, "restrict_to_owner", lambda p: (_ for _ in ()).throw(OSError("nope"))
+            pc,
+            "restrict_dir_to_owner",
+            lambda p: (_ for _ in ()).throw(OSError("nope")),
         )
         target = tmp_path / "partial"
         pc.make_owner_only_dir(target)
@@ -3227,3 +3717,81 @@ class TestKillProcessTreePinned:
         assert pc.kill_process_tree_pinned(4321, recorded) is True
         # The exit half moves as the process dies and must never be the identity.
         assert pc.kill_process_tree_pinned(4321, "888") is False
+
+
+class TestKillPidPinned:
+    """Single-process variant of the pinned kill: same handle-lifetime
+    invariant as :class:`TestKillProcessTreePinned`, delegating to ``kill_pid``
+    instead of the tree teardown. Driven through the module seams with
+    ``IS_WINDOWS`` patched so every case runs on every platform."""
+
+    HANDLE = 4242
+
+    def _wire(self, monkeypatch, *, handle=HANDLE, identity=(4321, 777, None)):
+        opened: list[int] = []
+        closed: list[int] = []
+        killed: list[tuple[int, int]] = []
+
+        monkeypatch.setattr(pc, "IS_WINDOWS", True)
+
+        def _open(pid):
+            opened.append(pid)
+            return handle
+
+        def _identity(h):
+            assert h == handle, "the identity must be read from the handle just opened"
+            return identity
+
+        def _close(h):
+            closed.append(h)
+
+        def _kill(pid, sig):
+            killed.append((pid, sig))
+            return True
+
+        monkeypatch.setattr(pc, "_open_process_query_handle", _open)
+        monkeypatch.setattr(pc, "_windows_process_handle_identity", _identity)
+        monkeypatch.setattr(pc, "_close_process_handle", _close)
+        monkeypatch.setattr(pc, "kill_pid", _kill)
+        return opened, closed, killed
+
+    def test_a_matching_identity_kills_and_then_releases_the_handle(self, monkeypatch):
+        opened, closed, killed = self._wire(monkeypatch)
+
+        assert pc.kill_pid_pinned(4321, "777", pc.SIGTERM) is True
+
+        assert opened == [4321]
+        assert killed == [(4321, pc.SIGTERM)]
+        assert closed == [self.HANDLE]
+
+    def test_a_mismatched_identity_never_invokes_the_kill(self, monkeypatch):
+        _, closed, killed = self._wire(monkeypatch, identity=(4321, 999, None))
+
+        assert pc.kill_pid_pinned(4321, "777", pc.SIGKILL) is False
+
+        assert killed == []
+        assert closed == [self.HANDLE], "the handle must still be released"
+
+    def test_an_unopenable_process_never_invokes_the_kill(self, monkeypatch):
+        _, closed, killed = self._wire(monkeypatch, handle=None)
+
+        assert pc.kill_pid_pinned(4321, "777", pc.SIGTERM) is False
+
+        assert killed == []
+        assert closed == [], "nothing was opened, so nothing may be closed"
+
+    def test_an_unreadable_identity_never_invokes_the_kill(self, monkeypatch):
+        _, closed, killed = self._wire(monkeypatch, identity=None)
+
+        assert pc.kill_pid_pinned(4321, "777", pc.SIGTERM) is False
+
+        assert killed == []
+        assert closed == [self.HANDLE]
+
+    def test_posix_delegates_straight_through(self, monkeypatch):
+        killed: list[tuple[int, int]] = []
+        monkeypatch.setattr(pc, "IS_WINDOWS", False)
+        monkeypatch.setattr(pc, "kill_pid", lambda pid, sig: killed.append((pid, sig)) or True)
+
+        assert pc.kill_pid_pinned(4321, "777", pc.SIGTERM) is True
+        assert killed == [(4321, pc.SIGTERM)]

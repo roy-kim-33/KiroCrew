@@ -26,6 +26,7 @@ from kiro_crew.config.loader import (
 from kiro_crew.config.paths import data_home, kiro_agents_dir
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.env import emit_env
+from kiro_crew.loop_lock import LoopBoundLock
 from kiro_crew.mcp_discovery import (
     managed_server_is_session_bound,
     probe_metadata,
@@ -196,19 +197,13 @@ def _get_mcp_lock_sync() -> _McpFileLockSync:
 # config, B then re-adds the same server from a preserved spec — leaving config
 # pointing at a removed package. This coarse async mutex spans BOTH phases so
 # apply calls are fully serialized; the narrower file lock is retained inside for
-# cross-process coordination with bridges.py. Bound to the running loop
-# (Python 3.10 compat), mirroring agents.py::_get_config_lock.
-_apply_lock: asyncio.Lock | None = None
-_apply_lock_loop: asyncio.AbstractEventLoop | None = None
+# cross-process coordination with bridges.py. Loop-bound via the shared
+# LoopBoundLock (#4800).
+_apply_lock = LoopBoundLock()
 
 
-def _get_apply_lock() -> asyncio.Lock:
-    """Return the /api/mcp/apply mutex bound to the current event loop."""
-    global _apply_lock, _apply_lock_loop
-    loop = asyncio.get_running_loop()
-    if _apply_lock is None or _apply_lock_loop is not loop:
-        _apply_lock = asyncio.Lock()
-        _apply_lock_loop = loop
+def _get_apply_lock() -> LoopBoundLock:
+    """Return the /api/mcp/apply mutex (loop-bound; rebinds per running loop)."""
     return _apply_lock
 
 
@@ -225,6 +220,11 @@ _mcp_probe_cache: list[dict] = []
 _mcp_probe_ts: float = 0.0
 _MCP_PROBE_CACHE_SECS = 600  # 10 min
 _mcp_probe_in_progress = False
+# Handle on the one probe allowed to be in flight. `_mcp_probe_in_progress` is
+# the flag the request handlers below consult to avoid STACKING a re-probe; this
+# is the joinable object that makes `_bg_mcp_probe` single-flight, which the flag
+# alone cannot do (a caller cannot await a bool).
+_mcp_probe_task: asyncio.Task[None] | None = None
 
 
 def _sync_mcp_to_agent(name: str, enabled: bool, *, remove: bool = False) -> None:
@@ -476,8 +476,43 @@ def _sync_mcp_to_agent_batch_unlocked(names: list[str], enabled: bool) -> None:
 
 
 async def _bg_mcp_probe() -> None:
-    """Background MCP probe — populates cache at startup."""
+    """Populate the MCP probe cache — SINGLE-FLIGHT.
+
+    Two independent boot paths reach this: ``dashboard/server.py`` fires it as a
+    background task once the port is bound, and ``slack/gateway.py`` awaits it
+    before warming sessions (kiro-cli reads mcp.json at spawn time). Without a
+    join, boot spawns and handshakes EVERY enabled MCP server twice — doubling
+    the subprocess churn, doubling occupancy of probe_all()'s concurrency
+    semaphore (so the first URL waits longer), and giving each server two
+    chances to trip a rate limit or an auth prompt.
+
+    ``_mcp_probe_in_progress`` could not close this on its own: it was written
+    but never read here, and a bool cannot be awaited, so the second caller had
+    nothing to wait on. The task handle can be, so both callers get one fan-out
+    and both still return only once the cache is populated.
+
+    The join is SHIELDED so a caller giving up (gateway wraps this in
+    ``wait_for`` with a timeout) abandons its own wait without cancelling the
+    probe mid-handshake — the fan-out completes and the cache is populated for
+    whoever asks next, which is what the boot path's
+    "continuing without full probe" message already implies.
+    """
+    global _mcp_probe_task
+
+    inflight = _mcp_probe_task
+    if inflight is not None and not inflight.done():
+        await asyncio.shield(inflight)
+        return
+
+    task = asyncio.ensure_future(_run_mcp_probe())
+    _mcp_probe_task = task
+    await asyncio.shield(task)
+
+
+async def _run_mcp_probe() -> None:
+    """The probe fan-out itself. Reached only through `_bg_mcp_probe`."""
     global _mcp_probe_ts, _mcp_probe_in_progress
+    _mcp_probe_in_progress = True
     try:
         # circular import: mcp_discovery defers imports of kiro_crew.agent
         # which shares state with this module, so importing it at module top
@@ -2157,7 +2192,7 @@ async def api_mcp_gateway_metrics(request: web.Request) -> web.Response:
 # so two concurrent dashboard requests cannot interleave broker start/stop and
 # orphan a gatewayd process. The config write is guarded by _get_config_lock();
 # this lock guards the apply() side effect that runs AFTER that lock is released.
-_MCP_GATEWAY_APPLY_LOCK = asyncio.Lock()
+_MCP_GATEWAY_APPLY_LOCK = LoopBoundLock()
 
 
 def _local_overlay_section() -> dict:
@@ -2249,7 +2284,7 @@ def _freeze_stub_servers(section: dict, overlay: dict | None = None) -> None:
 #: slow, so two overlapping presses would double the network work and race each
 #: other's atomic commits. Deliberately NOT the gateway apply lock: a refresh
 #: must not block an operator toggling sharing while it runs.
-_MCP_RESOLVE_REFRESH_LOCK = asyncio.Lock()
+_MCP_RESOLVE_REFRESH_LOCK = LoopBoundLock()
 
 
 async def api_mcp_resolve_refresh(request: web.Request) -> web.Response:
@@ -2555,7 +2590,11 @@ def _stub_eligibility(
     """
     from kiro_crew.config.loader import KiroCrewConfig  # noqa: F811
     from kiro_crew.mcp_gateway.evaluate import identity_for
-    from kiro_crew.mcp_gateway.rewriter import UNPOOLABLE_SERVERS, _withheld_env_count
+    from kiro_crew.mcp_gateway.rewriter import (
+        UNPOOLABLE_SERVERS,
+        _withheld_env_count,
+        pool_identity_env_keys,
+    )
     from kiro_crew.mcp_gateway.verdict_cache import load_cache
 
     rows = _collect_server_rows()
@@ -2581,7 +2620,9 @@ def _stub_eligibility(
             skipped.append({"name": name, "reason": "cannot_stub"})
             continue
         if sharing_on and _withheld_env_count(
-            {k: "" for k in row["env_names"]}, forward_declared_env
+            {k: "" for k in row["env_names"]},
+            forward_declared_env,
+            pool_identity_env_keys(),
         ):
             skipped.append({"name": name, "reason": "pooling_blocked_by_env"})
             continue
@@ -2605,6 +2646,7 @@ def _stub_eligibility(
             env_names=tuple(sorted(row["env_names"])),
             observed_hazards=observed.get(name, ()),
             preflight=preflight,
+            identity_keys=pool_identity_env_keys(),
         )
         allowed = verdict.recommend_share if sharing_on else verdict.recommend_stub
         if not allowed:
@@ -2631,11 +2673,18 @@ async def api_mcp_gateway_servers(request: web.Request) -> web.Response:
     global switch (``mcp_gateway.enabled``), reported by the status endpoint.
     """
     from kiro_crew.config.loader import KiroCrewConfig  # noqa: F811
-    from kiro_crew.mcp_gateway.rewriter import UNPOOLABLE_SERVERS, _withheld_env_count
+    from kiro_crew.mcp_gateway.rewriter import (
+        UNPOOLABLE_SERVERS,
+        _withheld_env_count,
+        pool_identity_env_keys,
+    )
 
     gw_cfg = KiroCrewConfig.load().mcp_gateway
     stub_set = set(gw_cfg.stub_servers)
     forward_declared_env = bool(gw_cfg.forward_declared_env)
+    # Resolved ONCE for the whole payload, same reason the shareability files are:
+    # two rows in one response must not disagree about the operator's list.
+    identity_keys = pool_identity_env_keys()
 
     rows = await asyncio.to_thread(_collect_server_rows)
 
@@ -2677,7 +2726,9 @@ async def api_mcp_gateway_servers(request: web.Request) -> web.Response:
         # row builder's value-free discipline holds.
         pooling_blocked = bool(
             gw_cfg.enabled
-            and _withheld_env_count({k: "" for k in row["env_names"]}, forward_declared_env)
+            and _withheld_env_count(
+                {k: "" for k in row["env_names"]}, forward_declared_env, identity_keys
+            )
         )
         result.append(
             {
@@ -2707,6 +2758,7 @@ async def api_mcp_gateway_servers(request: web.Request) -> web.Response:
                     preflight=(
                         preflights.get(name) if len(row["launch_ids"]) <= 1 else None
                     ),
+                    identity_keys=identity_keys,
                 ).to_dict(),
             }
         )
@@ -2754,6 +2806,7 @@ def _assess_server(
     env_names: tuple[str, ...],
     observed_hazards: tuple[str, ...],
     preflight: tuple[bool, bool] | None,
+    identity_keys: Collection[str] = (),
 ) -> ShareVerdict:
     """Build evidence for one row and hand it to the verdict engine.
 
@@ -2785,7 +2838,8 @@ def _assess_server(
             observed_hazards=observed_hazards,
             preflight_ran=preflight[0] if preflight else None,
             preflight_caller_sensitive=preflight[1] if preflight else False,
-        )
+        ),
+        identity_keys,
     )
 
 

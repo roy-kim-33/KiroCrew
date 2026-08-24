@@ -7,7 +7,7 @@
  * State management: polling via useQuery refetchInterval.
  * Poll faster during streaming (1s), slower when idle (5s).
  */
-import { useState, useRef, useCallback, useEffect } from 'react'
+import { useState, useRef, useCallback, useEffect, type ReactNode } from 'react'
 import { useImeGuard } from '../hooks/useImeGuard'
 import { useQuery, useMutation } from '@tanstack/react-query'
 import { ArrowUp, Loader2 } from 'lucide-react'
@@ -47,6 +47,14 @@ export interface ChatEmbedProps {
    * refuse a stale send. Omitted, behaviour is unchanged.
    */
   onSend?: (message: string) => Promise<unknown> | void
+  /**
+   * Content rendered in normal flow directly ABOVE the composer, inside the
+   * embed's own column, so it always sits on top of the input regardless of the
+   * composer's height. A host uses this for a docked quote / reference bar
+   * instead of absolutely positioning one over the transcript with a brittle
+   * fixed offset that breaks whenever the composer's height changes.
+   */
+  aboveComposer?: ReactNode
 }
 
 /** Minimal shape of the chat-slot payload consumed by this embed. */
@@ -56,7 +64,7 @@ interface ChatSlotData {
   title?: string
 }
 
-function ChatEmbed({ slotKey, agent, placeholder, frameless, startAtBottom, onSend }: ChatEmbedProps) {
+function ChatEmbed({ slotKey, agent, placeholder, frameless, startAtBottom, onSend, aboveComposer }: ChatEmbedProps) {
   const api = useAppApi()
   const ime = useImeGuard()
   const [input, setInput] = useState('')
@@ -172,9 +180,14 @@ function ChatEmbed({ slotKey, agent, placeholder, frameless, startAtBottom, onSe
         {messages.length === 0 && !running && (
           <div className="text-center text-muted text-[13px] py-10">{i18nT('appSdk.chatEmbed.session_ready_type_a_message_to_start')}</div>
         )}
-        <ChatMessageList messages={messages} running={running} onApprove={approve} />
+        {/* canTrust: this embed's approve routes through the slot approve
+            endpoint (above), which records standing trust — the one mount
+            allowed to offer the tier (#5434). */}
+        <ChatMessageList messages={messages} running={running} onApprove={approve} canTrust />
         <div ref={endRef} />
       </div>
+
+      {aboveComposer && <div className="shrink-0">{aboveComposer}</div>}
 
       <div className={`flex items-center gap-2 px-3 py-2 shrink-0 ${frameless ? '' : 'border-t border-border bg-bg-subtle'}`}>
         <input
@@ -186,9 +199,8 @@ function ChatEmbed({ slotKey, agent, placeholder, frameless, startAtBottom, onSe
           {...ime.bindComposition()}
           onKeyDown={e => {
             if (e.key !== 'Enter' || e.shiftKey) return
-            // Rule 1: single-line input; the emptiness test stays outside the guard.
-            if (ime.isComposing(e)) return
-            if (input.trim()) { e.preventDefault(); send() }
+            // The emptiness test stays outside the guard.
+            if (input.trim() && ime.claimEnter(e)) send()
           }}
           placeholder={running ? i18nT('appSdk.chatEmbed.agent_is_working') : (placeholder || i18nT('appSdk.chatEmbed.message'))}
           disabled={sendMutation.isPending}

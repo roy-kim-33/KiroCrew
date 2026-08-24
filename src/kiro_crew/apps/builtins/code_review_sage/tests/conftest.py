@@ -1,18 +1,21 @@
 """Collection-time platform gate for the Code Review Sage suite.
 
-The app itself refuses to run off POSIX — `sage_lib/discovery.py` raises
-"Code Review Sage requires a POSIX platform (macOS/Linux); run the Kiro Crew
-gateway under WSL on Windows" — so these tests assert POSIX behaviour throughout:
-`0600` file modes, forward-slash path suffixes, and a `gh` binary the Windows
-runner never reaches because the platform guard fires first.
+The app itself now runs on Windows: the provider-CLI trust gate it shares with
+Issue Radar answers from the Windows ACL, and the review worker is handed the
+absolute interpreter the app resolves rather than the bare `python3` that is not
+an interpreter there.
 
-Running them on Windows therefore tests a configuration the app does not support,
-and the failures say nothing about the code. Skip the suite there rather than
-teaching nine assertions to be platform-agnostic for a platform the app rejects.
+What still gates the suite is the suite, not the app. These tests assert POSIX
+behaviour throughout — `0600` file modes as `st_mode` bits (Windows expresses
+owner-only as a DACL and always reports `0o666`), forward-slash path suffixes,
+and shell-script `gh` stubs the Windows runner cannot execute — so running them
+there would fail on the harness rather than on anything under test. Making them
+Windows-native is separate work from making the app run.
 
-This lives here, next to the suite it gates, so the reason travels with the tests
+This lives next to the suite it gates, so the reason travels with the tests
 rather than sitting in a CI workflow that would hide it.
 """
+
 import os
 
 import pytest
@@ -21,7 +24,7 @@ collect_ignore_glob = ["*"] if os.name == "nt" else []
 
 pytestmark = pytest.mark.skipif(
     os.name == "nt",
-    reason="Code Review Sage requires a POSIX platform (see sage_lib/discovery.py)",
+    reason="Code Review Sage's test harness is POSIX-only (see this conftest's docstring)",
 )
 
 

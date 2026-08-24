@@ -53,6 +53,7 @@ from kiro_crew.acp.client import (
 )
 from kiro_crew.acp.liveness import (
     EVIDENCE_ESTABLISHED_FLAT,
+    EVIDENCE_SHELL_CHILD_ABSENT,
     VERDICT_DEAD,
     VERDICT_STUCK_INPUT,
     VERDICT_UNKNOWN,
@@ -60,6 +61,7 @@ from kiro_crew.acp.liveness import (
     LivenessOracle,
     ToolCallState,
     _consume_future_exception,
+    boottime_now,
     consult_offloaded,
 )
 from kiro_crew.acp.prompt_blocks import build_prompt_blocks
@@ -80,6 +82,7 @@ from kiro_crew.acp.types import (
     EVENT_TEXT_CHUNK,
     EVENT_TOOL_CALL,
     EVENT_TOOL_RESULT,
+    JSONRPC_METHOD_NOT_FOUND,
     METHOD_CANCEL,
     METHOD_COMMANDS_EXECUTE,
     METHOD_PROMPT,
@@ -299,13 +302,19 @@ def _watchdog_evidence_class(evidence: str) -> str:
     evidence carries pids, byte deltas, and command fragments, so only its
     SHAPE is emitted. Buckets: ``established_flat`` (LLM-shaped — runtime-held
     backend socket, flat subtree), ``mcp_flat`` (opaque MCP tool, moving or
-    flat), ``shell`` (shell-child evidence), ``wait`` (the declared-duration
-    wait tool), ``degraded`` (everything else: sampling baseline, unreadable
-    /proc, no pid, oracle error — the oracle could not attest either way).
+    flat), ``shell_absent`` (shell tool in flight with nothing this dispatch
+    could have started still running), ``shell`` (other shell-child evidence),
+    ``wait`` (the declared-duration wait tool), ``degraded`` (everything else:
+    sampling baseline, unreadable /proc, no pid, oracle error — the oracle could
+    not attest either way).
     """
     e = evidence or ""
     if e.startswith(EVIDENCE_ESTABLISHED_FLAT):
         return "established_flat"
+    if e.startswith(EVIDENCE_SHELL_CHILD_ABSENT):
+        # Checked before the "shell child" substring below, which its evidence
+        # text also contains.
+        return "shell_absent"
     if "mcp subtree" in e:
         return "mcp_flat"
     if "shell child" in e:
@@ -1205,7 +1214,30 @@ class AcpSessionHandle:
             "_session/steer",
             {"sessionId": self._session_id, "message": wrapped},
         )
+        # Stamped HERE, at the innermost write, because this is the one point
+        # every steer funnels through: the dashboard steers the inner client
+        # directly while the IM transports steer the provider wrapper, and both
+        # end up on this line. A reader of the stamp therefore needs no
+        # per-transport wiring. See ``last_steer_monotonic``.
+        self._last_steer_monotonic = time.monotonic()
         return True
+
+    # Monotonic stamp of the last steer handed to the backend, 0.0 when this
+    # session has never been steered. Read by the dashboard's keepalive route to
+    # decide whether a sleeping `wait` should return early: a steer can only be
+    # injected at a model-inference boundary, and an in-flight tool call is the
+    # absence of one, so a sleep that outlasts the steer would hold the user's
+    # correction in the backend's queue until it elapses.
+    #
+    # Deliberately monotonic, not wall clock: it is only ever compared against
+    # another monotonic stamp taken in the same process (the sleep's start), and
+    # mixing the two clocks is how a suspend-resume silently reorders them.
+    _last_steer_monotonic: float = 0.0
+
+    @property
+    def last_steer_monotonic(self) -> float:
+        """Monotonic time of the last steer written to the backend (0.0 if none)."""
+        return self._last_steer_monotonic
 
     @property
     def supports_steer(self) -> bool:
@@ -1612,7 +1644,9 @@ class AcpSessionHandle:
         a finished session's state stays resident in the multiplexed process
         forever, so RSS climbs with cumulative sessions (the background-runtime
         unbounded-growth bug). ``terminate_session`` is best-effort + bounded and
-        ALWAYS unregisters the queue, so teardown neither hangs nor raises.
+        ALWAYS unregisters the queue, so teardown neither hangs nor fails on a
+        dead or slow runtime -- but see the `finally` below for the one
+        exception it cannot swallow.
 
         Each session on a shared runtime (a ``_bg`` op or a session-sharing
         subagent) is a distinct ``session/new`` with its own persisted
@@ -1631,9 +1665,19 @@ class AcpSessionHandle:
         still runs unconditionally: it is the RSS reclaim on the multiplexed
         process; only the unlink is deferred.
         """
-        await self._runtime.terminate_session(self._session_id)
-        if not getattr(self, "keep_transcript", False):
-            self._cleanup_transcript()
+        # The unlink runs in a `finally`, for the same reason
+        # `terminate_session` unregisters the queue in one: that method swallows
+        # `Exception`, but `asyncio.CancelledError` is a `BaseException` and
+        # propagates straight out of the await. Cancellation is exactly when
+        # teardown runs -- gateway shutdown, an abandoned turn -- so the
+        # sequential form skipped the cleanup on the path that produces the most
+        # of these files, and every survivor is permanent: nothing else deletes
+        # an ephemeral session's transcript.
+        try:
+            await self._runtime.terminate_session(self._session_id)
+        finally:
+            if not getattr(self, "keep_transcript", False):
+                self._cleanup_transcript()
 
     def _cleanup_transcript(self) -> None:
         """Best-effort delete of this session's kiro-cli transcript files.
@@ -1847,9 +1891,11 @@ class AcpSessionHandle:
                         # a tool, e.g. kiro-cli use_subagent) narrows to the
                         # model-silent budget, because its longest legitimate
                         # silent gap is minutes, not hours. Keyed STRICTLY on
-                        # the oracle's established_flat evidence tag: plain
-                        # flat-subtree or shell-child evidence (a quiet build /
-                        # quiet MCP tool) keeps the full window.
+                        # the oracle's evidence TAGS — established_flat, or
+                        # shell_child_absent for a shell command with no process
+                        # to its name. Untagged evidence (a quiet build's
+                        # unmatched-but-live tree, a quiet MCP tool) keeps the
+                        # full window.
                         # F3 — hard cap: watchdog_tool_stall_hard_cap_secs is
                         # the absolute ceiling for UNKNOWN forbearance. Apply
                         # min(suspect_window, hard_cap) so the configured cap
@@ -1862,6 +1908,22 @@ class AcpSessionHandle:
                         _narrowed = evidence.startswith(EVIDENCE_ESTABLISHED_FLAT)
                         if _narrowed:
                             _suspect = min(wd.model_silent_probe_secs, _suspect)
+                        elif evidence.startswith(EVIDENCE_SHELL_CHILD_ABSENT):
+                            # The oracle can see the runtime's tree and nothing
+                            # in it is young enough to be this dispatch's child:
+                            # the shell command is not running. Build-scale
+                            # forbearance exists for a QUIET build, not for an
+                            # absent one — a sub-second command whose result
+                            # frame was lost is never observed alive, so without
+                            # this it collects the full suspect window while the
+                            # matched-then-gone fork of the same state acts on
+                            # CHILD_EXIT_GRACE_SECS. Narrowed to the ordinary
+                            # silence window rather than to that grace: absence
+                            # is inferred from start times, so the verdict stays
+                            # UNKNOWN and the action stays the non-lethal
+                            # session cancel at a few minutes.
+                            _narrowed = True
+                            _suspect = min(wd.stale_window_secs, _suspect)
                         _suspect = min(_suspect, wd.tool_stall_hard_cap_secs)
                         _acting = (
                             verdict in (VERDICT_DEAD, VERDICT_STUCK_INPUT)
@@ -2090,7 +2152,9 @@ class AcpSessionHandle:
                     self._awaiting_permission = True
                     yield _perm_event
                 elif action == "server_request_unknown":
-                    await self._runtime.send_error(msg.id, -32601, "Method not found")
+                    await self._runtime.send_error(
+                        msg.id, JSONRPC_METHOD_NOT_FOUND, "Method not found"
+                    )
                 elif action == "update":
                     for ev in self._handle_update(msg):
                         yield ev
@@ -2149,7 +2213,17 @@ class AcpSessionHandle:
                     params = msg.params or {}
                     subs = params.get("subagents")
                     if isinstance(subs, list):
-                        yield AcpEvent(kind=EVENT_SUBAGENT_LIST, subagents=subs)
+                        # The roster notification carries no sessionId, so the
+                        # runtime fans it out to every co-tenant. Carry that
+                        # provenance through: a subagent consumer needs to tell
+                        # it apart from the SAME event kind produced by the
+                        # routed KAS lifecycle path below, which does belong to
+                        # this session.
+                        yield AcpEvent(
+                            kind=EVENT_SUBAGENT_LIST,
+                            subagents=subs,
+                            runtime_global=msg.fanout_no_owner,
+                        )
                 elif action == "subagent_activity":
                     params = msg.params or {}
                     ssid = str(params.get("sessionId") or "")
@@ -2353,8 +2427,9 @@ class AcpSessionHandle:
         (tool-stall recovery via _end_stalled_tool). Attrs are all closed
         enums (metrics/schema.py cardinality rule): the free-form evidence is
         bucketed by :func:`_watchdog_evidence_class`; ``window`` is one of:
-        "standard" (default), "narrowed" (tool-branch established_flat reduces
-        the build-scale suspect window to the model-silent budget), or "extended"
+        "standard" (default), "narrowed" (a tool-branch tag reduces the
+        build-scale suspect window — established_flat to the model-silent budget,
+        shell_child_absent to the ordinary silence window), or "extended"
         (model-wait established_flat extends the 300s stale window to the
         model-silent probe window for a non-streamed server-side think).
         ``agent_override`` is the per-agent-override BOOLEAN from the settings
@@ -3075,7 +3150,12 @@ class AcpSessionHandle:
                 self._stale_eligible = False
                 self._tool_dispatched = True
                 # Attribution snapshot for the liveness oracle: title + the
-                # already-redacted input + dispatch time + the trusted shell
+                # already-redacted input + dispatch time on BOTH clocks (monotonic
+                # for elapsed spans, boot for dating a child process against this
+                # dispatch) + the parking this turn has banked so far, which
+                # bounds how far this stamp can lag the runtime's actual spawn
+                # (the park is banked when the consumer returns, i.e. before this
+                # frame is processed, so it is complete here) + the trusted shell
                 # flag. A new dispatch retires the oracle so its tracked child
                 # and counter samples never bleed across tools — including from a
                 # walk still running against the previous tool's command.
@@ -3083,6 +3163,8 @@ class AcpSessionHandle:
                     title=ev.title,
                     command=ev.tool_input,
                     dispatch_ts=time.monotonic(),
+                    dispatch_boot_ts=boottime_now(),
+                    dispatch_parked_secs=self._parked_total,
                     is_shell=ev.is_shell,
                     tool_name=ev.tool_name,
                 )

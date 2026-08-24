@@ -93,6 +93,20 @@ describe('EmbeddedInstanceTabBar (option B)', () => {
     expect(screen.queryByTestId('crew-chip-row')).toBeNull()
   })
 
+  it('does not offer the stable-order toggle, which has no host-model relay yet', async () => {
+    // The stable-order preference is not relayed through the host model, so a
+    // pane toggling it would write only its own cross-origin localStorage and
+    // drift from the parent header and sibling panes. Until that relay exists the
+    // embedded switcher hides the control rather than half-working.
+    const store = createTestStore({
+      instances: { warm: {}, activeId: null, mru: [], unread: {}, host: model({ activeId: null }) },
+    })
+    renderWithProviders(<InstanceTabBar variant="inline" />, { store })
+    await userEvent.click(screen.getByRole('button', { name: /Switch crew/i }))
+    await screen.findByRole('menuitemradio', { name: /Cloud One/ })
+    expect(screen.queryByTestId('crew-stable-order-toggle')).toBeNull()
+  })
+
   it('relays a pin toggle up to the parent instead of writing its own store', async () => {
     const post = vi.spyOn(window.parent, 'postMessage').mockImplementation(() => {})
     const store = createTestStore({
@@ -146,5 +160,42 @@ describe('EmbeddedHostBridge (option B relay)', () => {
       )
     })
     expect(store.getState().instances.host).toBeNull()
+  })
+
+  it('keeps the pane\'s own focus mode when an older host sends a model without the field', async () => {
+    // Version skew, host side: an older host omits `focusMode` from its model
+    // AND ignores the pane's echoed `mc-set-focus-mode`. Coercing that absence
+    // to `false` would snap a user-toggled pane back off on every host
+    // re-broadcast. Absence must read as "no opinion"; a host that DOES send
+    // the field is still adopted.
+    const { focusModeEnabled, setFocusModeEnabled, __resetFocusMode } = await import('../hooks/useFocusMode')
+    __resetFocusMode()
+    vi.spyOn(window.parent, 'postMessage').mockImplementation(() => {})
+    const store = createTestStore()
+    renderWithProviders(<EmbeddedHostBridge />, { store })
+    try {
+      setFocusModeEnabled(true, { echo: false })
+
+      // Old host: model carries no focusMode — the pane's toggle survives.
+      act(() => {
+        window.dispatchEvent(new MessageEvent('message', {
+          source: window.parent,
+          data: { type: 'mc-host-model', ...model() },
+        }))
+      })
+      await waitFor(() => expect(store.getState().instances.host?.tabs).toHaveLength(1))
+      expect(focusModeEnabled()).toBe(true)
+
+      // New host: an explicit false IS an opinion and is adopted.
+      act(() => {
+        window.dispatchEvent(new MessageEvent('message', {
+          source: window.parent,
+          data: { type: 'mc-host-model', ...model({ focusMode: false }) },
+        }))
+      })
+      await waitFor(() => expect(focusModeEnabled()).toBe(false))
+    } finally {
+      __resetFocusMode()
+    }
   })
 })

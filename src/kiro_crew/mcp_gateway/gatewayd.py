@@ -39,7 +39,7 @@ import sys
 import time
 import traceback
 from pathlib import Path
-from typing import Any, Callable, Iterator, Optional
+from typing import Any, Callable, Collection, Iterator, Optional
 
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.config.loader import config_dir as _config_dir
@@ -49,6 +49,7 @@ from kiro_crew.mcp_caller import _parent_pid as _ppid_fn
 from kiro_crew.mcp_gateway import credwatch, hazards, socketsec, transport
 from kiro_crew.mcp_gateway.apps import sweep_spool as apps_sweep_spool
 from kiro_crew.mcp_gateway.backend import Backend, BackendGone, spawn_backend
+from kiro_crew.mcp_gateway.backend_tmp import sweep_all_backend_tmp
 from kiro_crew.mcp_gateway.breaker import CircuitBreaker
 from kiro_crew.mcp_gateway.hashing import hash_effective_env, non_secret_env
 from kiro_crew.mcp_gateway.manager import _scrub_sensitive_env, is_credential_env_key
@@ -70,9 +71,11 @@ from kiro_crew.mcp_gateway.rewriter import (
     env_sidecar_dir,
     env_sidecar_name,
     forward_declared_env_enabled,
+    pool_identity_env_keys,
     records_dir,
     resolve_overlay_dir,
 )
+from kiro_crew.mcp_gateway.secret_uri import resolve_secret_uris
 from kiro_crew.mcp_gateway.shutdown_budget import DRAIN_SECS, POOL_SHUTDOWN_SECS
 from kiro_crew.mcp_gateway.spill import cleanup_old_spill_files
 from kiro_crew.mcp_gateway.stub import fallback_counts as stub_fallback_counts
@@ -80,7 +83,8 @@ from kiro_crew.metrics.provider import get_recorder
 from kiro_crew.peer_resolve import resolve_peer_identity
 from kiro_crew.platform_compat import IS_WINDOWS
 from kiro_crew.platform_compat import get_process_start_id as _get_process_start_id
-from kiro_crew.sandbox import warm_backend
+from kiro_crew.platform_compat import proc_rss_bytes as _proc_rss_bytes
+from kiro_crew.sandbox import _PYTHON_ENV_PREFIXES, warm_backend
 from kiro_crew.sel import SecurityEventLog
 
 logger = logging.getLogger(__name__)
@@ -433,6 +437,7 @@ async def run_gatewayd(
     # a dangling socket that confuses the next startup probe.
     server: Optional[transport.TransportServer] = None
     sweeper: Optional[asyncio.Task[None]] = None
+    tmp_sweeper: Optional[asyncio.Task[None]] = None
     socket_liveness: Optional[asyncio.Task[None]] = None
     diagnostic: Optional[asyncio.Task[None]] = None
     heartbeat: Optional[asyncio.Task[None]] = None
@@ -481,6 +486,22 @@ async def run_gatewayd(
             _idle_sweeper(pool, idle_timeout_secs, sweep_interval, stop_event),
             name="mcp-gateway-idle-sweeper",
         )
+
+        # Backend temp containment (#5064): reclaim per-process temp dirs
+        # whose owner is dead AND whose content is idle (see backend_tmp --
+        # deletion deliberately lives ONLY here, never on a shutdown path,
+        # because a launcher's exit is not proof its process tree is gone).
+        # First pass at task start (same boot posture as the spool sweep),
+        # then hourly; offloaded and best-effort.
+        async def _backend_tmp_sweeper() -> None:
+            while True:
+                try:
+                    await asyncio.to_thread(sweep_all_backend_tmp)
+                except Exception:
+                    logger.debug("backend-tmp: sweep failed", exc_info=True)
+                await asyncio.sleep(3600)
+
+        tmp_sweeper = asyncio.create_task(_backend_tmp_sweeper(), name="mcp-gateway-tmp-sweeper")
 
         # Socket-liveness self-exit: the daemon is its own session/group
         # leader, so a launcher that dies without signalling it (pytest
@@ -689,6 +710,11 @@ async def run_gatewayd(
             sweeper.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await sweeper
+
+        if tmp_sweeper is not None:
+            tmp_sweeper.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await tmp_sweeper
 
         if socket_liveness is not None:
             socket_liveness.cancel()
@@ -1123,18 +1149,38 @@ def _declared_non_secret_env(pool_key: PoolKey) -> dict[str, str]:
     What survives is operator-declared, non-secret, and part of the PoolKey —
     every session sharing this backend agrees on it by construction.
 
+    A name in ``mcp_gateway.pool_identity_env`` survives (1) BECAUSE it is part
+    of the PoolKey: :func:`rewriter.pool_identity_env_keys` is the authoritative
+    read, the same one the coherence gate in :func:`_declared_env_pairs` uses, so
+    the sentence above stays true rather than being weakened. It cannot bypass
+    (2) — that helper drops credential-scrub names before returning them.
+
     BLOCKING: reads a file. Callers must run it off the event loop.
     """
-    pairs = _declared_env_pairs(pool_key)
-    return {k: v for k, v in non_secret_env(pairs).items() if not is_credential_env_key(k)}
+    identity_keys = pool_identity_env_keys()
+    pairs = _declared_env_pairs(pool_key, identity_keys)
+    return {
+        k: v
+        for k, v in non_secret_env(pairs, identity_keys=identity_keys).items()
+        if not is_credential_env_key(k)
+    }
 
 
-def _declared_env_pairs(pool_key: PoolKey) -> dict[str, str]:
+def _declared_env_pairs(pool_key: PoolKey, identity_keys: Collection[str]) -> dict[str, str]:
     """Return the declared env sidecar's contents for ``pool_key``, or ``{}``.
 
     Unfiltered, but coherence-gated: a sidecar whose contents no longer hash to
     ``pool_key.effective_env_hash`` yields ``{}``. Callers apply whatever
     co-tenancy filtering their acquisition path requires.
+
+    ``identity_keys`` is REQUIRED rather than read here, so the caller's ONE
+    snapshot of ``pool_identity_env_keys()`` governs both the hash recomputed
+    below and whatever filtering the caller then applies. Reading it here as well
+    would make those two decisions two different observations of a file an
+    operator can edit at any moment: the gate could accept a sidecar under one
+    set while the caller filtered under another, and the wider of the two would
+    decide what reaches the backend. Passing it in makes that mismatch
+    unrepresentable instead of merely unlikely.
 
     BLOCKING: reads a file. Callers must run it off the event loop.
     """
@@ -1173,7 +1219,18 @@ def _declared_env_pairs(pool_key: PoolKey) -> dict[str, str]:
     # Recomputing the hash here and requiring equality closes that window. The
     # construction mirrors the stub's ``_parse_env_json`` (str-coerced keys and
     # values, empty keys dropped) so a coherent sidecar always matches.
-    if hash_effective_env(pairs) != pool_key.effective_env_hash:
+    #
+    # ``identity_keys`` comes from the OPERATOR's config, never from the Register
+    # frame, and is the CALLER's single snapshot -- see this function's docstring
+    # for why it is a parameter rather than a second read. The stub was handed the
+    # same set on its argv only so it could compute this hash; a stub that claims a
+    # different set produces a hash this line does not reproduce, so the mismatch
+    # branch runs and nothing is forwarded. That is what keeps "which secrets may
+    # reach a shared backend" an operator decision while leaving the stub the
+    # untrusted client it is documented to be — and it needs no new check, because
+    # the gate that already guards a spec edited mid-session guards a lying stub
+    # identically.
+    if hash_effective_env(pairs, identity_keys=identity_keys) != (pool_key.effective_env_hash):
         logger.warning(
             "declared-env: sidecar for %r no longer matches the PoolKey it was "
             "hashed under (the spec was edited after this session started); "
@@ -1210,7 +1267,7 @@ def _declared_env_for_private_backend(pool_key: PoolKey) -> dict[str, str]:
 
     BLOCKING: never call this on the event loop.
     """
-    return _declared_env_pairs(pool_key)
+    return _declared_env_pairs(pool_key, pool_identity_env_keys())
 
 
 def _declared_env_to_forward(pool_key: PoolKey) -> dict[str, str]:
@@ -1266,10 +1323,14 @@ def env_target_resolver(pool_key: PoolKey) -> Optional[tuple[str, list[str], dic
         return None
     command, *args = parts
     env = _scrub_sensitive_env(dict(os.environ))
-    # Strip PYTHONPATH/PYTHONHOME so the KiroCrew process's own Python
-    # environment doesn't leak into Python-based MCP backends (import conflicts).
-    env.pop("PYTHONPATH", None)
-    env.pop("PYTHONHOME", None)
+    # Strip the Kiro Crew process's own Python env vars so they don't leak into
+    # Python-based MCP backends: PYTHONPATH/PYTHONHOME cause import conflicts,
+    # and PYTHONPYCACHEPREFIX (desktop-app-only, see pycache_gc.py) would make
+    # a pooled backend mirror its stdlib into the shared bytecode cache. Reuses
+    # sandbox._PYTHON_ENV_PREFIXES instead of hand-listing keys, so this scrub
+    # site can't drift from the kiro-cli/agent spawn path's scrub again.
+    for key in _PYTHON_ENV_PREFIXES:
+        env.pop(key, None)
     # No KIROCREW_CHANNEL_ID is exported into the backend env. It used to be
     # copied from PoolKey.channel_id, which only made sense while a backend was
     # owned by one channel. A pooled backend serves several channels, so a
@@ -2779,13 +2840,40 @@ async def _acquire_backend(
                 # too, so no value may reach the log.
                 ", ".join(sorted(declared)),
             )
+        # Resolve secret:// URIs in env values — ephemeral, in-memory only.
+        # The sidecar on disk retains the raw URI template; resolution happens
+        # at spawn time so values are always fresh from the vault.
+        spawn_env, _secret_keys = await asyncio.to_thread(
+            resolve_secret_uris,
+            spawn_env,
+            Path(_config_dir()),
+        )
         backend = await spawn_backend(
             pool_key=pool_key,
             command=command,
             args=list(args),
             env=spawn_env,
             work_dir=work_dir,
+            # Containment yields ONLY to a spec-declared temp. ``spawn_env``
+            # also carries the daemon's ambient TMPDIR/TMP/TEMP (macOS and
+            # Windows always export one), so spawn_backend cannot infer
+            # declaration from env membership -- this closure is the one
+            # place that still knows the declared set. Key NAMES are passed
+            # (matched case-insensitively inside; Windows env keys are
+            # case-insensitive) so spawn_backend can also prune the ambient
+            # keys the operator did NOT declare.
+            declared_temp_keys=tuple(
+                key for key in declared if key.upper() in ("TMPDIR", "TMP", "TEMP")
+            ),
         )
+        # Security note: resolved secrets exist ONLY in the local spawn_env
+        # dict passed to the child via Popen(env=...).  They are NEVER written
+        # to the parent's os.environ, so /proc/<gateway_pid>/environ cannot
+        # leak them — the /proc concern is architecturally moot.  The pop
+        # below is defense-in-depth: it removes the plaintext from the
+        # parent's Python heap once the child has inherited it at exec.
+        for _sk in _secret_keys:
+            spawn_env.pop(_sk, None)
         # Start the stdout pump immediately so replies to the first
         # forwarded message can route back. The task is owned by the
         # Backend and cancelled at shutdown().
@@ -3154,75 +3242,16 @@ def _count_open_fds() -> int:
 
 
 def _read_rss_kb() -> int:
-    """Return current RSS in kilobytes, or ``-1`` if unavailable.
+    """Return this process's CURRENT RSS in kilobytes, or ``-1`` if unavailable.
 
-    Platform implementations:
-    - Linux: ``/proc/self/status`` VmRSS field (already in KB).
-    - macOS: ``resource.getrusage`` (``ru_maxrss`` is in bytes on macOS).
-    - Other POSIX: ``resource.getrusage`` (``ru_maxrss`` is in KB on Linux,
-      but this branch only runs on non-Linux where it is bytes; if neither
-      applies we fall through to ``-1``).
-    - Windows: ``GetProcessMemoryInfo`` via ctypes (WorkingSetSize in bytes).
-
-    Returns ``-1`` when the platform cannot provide the value.
+    Delegates to :func:`platform_compat.proc_rss_bytes` — the one per-platform
+    current-RSS reader — so this diagnostic cannot drift from the figure the
+    dashboard reports. The per-platform duplicate that used to live here read
+    ``ru_maxrss`` on macOS, which is a high-water mark that never decreases, so
+    a spike the gateway had already released stayed in every later snapshot.
     """
-    # Linux — parse VmRSS from /proc/self/status (current RSS, not peak).
-    try:
-        with open("/proc/self/status", "r", encoding="ascii") as fh:
-            for line in fh:
-                if line.startswith("VmRSS:"):
-                    return int(line.split()[1])
-    except (OSError, ValueError, IndexError):
-        pass
-
-    # macOS / other POSIX — resource.getrusage gives ru_maxrss.
-    # On macOS ru_maxrss is in bytes; on other BSDs it is in KB.
-    if sys.platform != "win32":
-        try:
-            import resource
-
-            ru = resource.getrusage(resource.RUSAGE_SELF)
-            maxrss = ru.ru_maxrss
-            if maxrss > 0:
-                if sys.platform == "darwin":
-                    return maxrss // 1024  # bytes → KB
-                return maxrss  # already in KB on most other POSIX
-        except (OSError, ValueError, AttributeError, ImportError):
-            pass
-
-    # Windows — GetProcessMemoryInfo returns WorkingSetSize in bytes.
-    if sys.platform == "win32":
-        try:
-            import ctypes
-            import ctypes.wintypes as wintypes
-
-            SIZE_T = ctypes.c_size_t
-
-            class PROCESS_MEMORY_COUNTERS(ctypes.Structure):
-                _fields_ = [
-                    ("cb", wintypes.DWORD),
-                    ("PageFaultCount", wintypes.DWORD),
-                    ("PeakWorkingSetSize", SIZE_T),
-                    ("WorkingSetSize", SIZE_T),
-                    ("QuotaPeakPagedPoolUsage", SIZE_T),
-                    ("QuotaPagedPoolUsage", SIZE_T),
-                    ("QuotaPeakNonPagedPoolUsage", SIZE_T),
-                    ("QuotaNonPagedPoolUsage", SIZE_T),
-                    ("PagefileUsage", SIZE_T),
-                    ("PeakPagefileUsage", SIZE_T),
-                ]
-
-            psapi = ctypes.WinDLL("psapi", use_last_error=True)  # type: ignore[attr-defined]
-            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
-            pmc = PROCESS_MEMORY_COUNTERS()
-            pmc.cb = ctypes.sizeof(pmc)
-            handle = kernel32.GetCurrentProcess()
-            if psapi.GetProcessMemoryInfo(handle, ctypes.byref(pmc), pmc.cb):
-                return pmc.WorkingSetSize // 1024  # bytes → KB
-        except (OSError, AttributeError, ValueError):
-            pass
-
-    return -1
+    rss_bytes = _proc_rss_bytes()
+    return rss_bytes // 1024 if rss_bytes > 0 else -1
 
 
 def _collect_task_stacks() -> list[dict[str, Any]]:
@@ -3284,8 +3313,15 @@ def _snapshot_state(
     }
 
 
-def _write_diagnostic(path: Path, record: dict[str, Any]) -> None:
-    """Append one JSONL line to the diagnostic side-channel.
+def _write_diagnostic(path: Path, *records: dict[str, Any]) -> None:
+    """Append one JSONL line per record to the diagnostic side-channel.
+
+    Records that belong to the same event MUST be passed in a single call:
+    they share one open-append-close cycle. Back-to-back appends from
+    separate calls can collide on Windows — an open that lands while the
+    previous writer's handle is still closing fails with a sharing
+    violation — and the never-raises contract below turns that transient
+    collision into a silently dropped record.
 
     Never raises — the diagnostic task is defensive enough that a missing
     directory or EROFS on the log volume must not crash gatewayd itself.
@@ -3293,7 +3329,8 @@ def _write_diagnostic(path: Path, record: dict[str, Any]) -> None:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(record, separators=(",", ":")) + "\n")
+            for record in records:
+                fh.write(json.dumps(record, separators=(",", ":")) + "\n")
     except OSError as exc:  # pragma: no cover — defensive
         logger.warning("zombie diagnostic write failed: %s", exc)
 
@@ -3308,13 +3345,14 @@ async def _zombie_diagnostic(
 
     Every :data:`_ZOMBIE_PROBE_INTERVAL_SECS` seconds:
 
-    1. Collect a health snapshot via :func:`_snapshot_state`.
-    2. Append the snapshot to the diagnostic JSONL under the ``probe`` tag
-       so there is a continuous baseline to correlate against.
-    3. If ``server.is_serving()`` is ``False`` while ``stop_event`` is
-       still unset, the accept loop has died silently — dump every live
-       task stack, log at error level, and set ``stop_event`` so the
-       process exits cleanly and the watchdog respawns us.
+    1. Collect a health snapshot via :func:`_snapshot_state`, tagged
+       ``probe`` — the continuous baseline to correlate against.
+    2. If ``server.is_serving()`` is ``False`` while ``stop_event`` is
+       still unset, the accept loop has died silently — append the probe
+       baseline and a ``zombie_detected`` dump of every live task stack
+       through a single write, log at error level, and set ``stop_event``
+       so the process exits cleanly and the watchdog respawns us.
+    3. Otherwise append just the probe baseline.
     """
     diag_path = _zombie_diagnostic_path()
     try:
@@ -3338,23 +3376,31 @@ async def _zombie_diagnostic(
                 task_count=task_count,
             )
             snap["tag"] = "probe"
-            await asyncio.to_thread(_write_diagnostic, diag_path, snap)
 
             if snap["is_serving"] is False and not stop_event.is_set():
-                snap["tag"] = "zombie_detected"
-                snap["tasks"] = _collect_task_stacks()
-                snap["traceback"] = traceback.format_stack()
-                await asyncio.to_thread(_write_diagnostic, diag_path, snap)
+                # The accept loop died silently. The probe baseline and the
+                # zombie dump go through ONE _write_diagnostic call (a single
+                # open) — two back-to-back appends race on Windows, where the
+                # second open can hit a sharing violation while the first
+                # writer's handle is still closing, silently dropping the
+                # zombie_detected record.
+                dump = dict(snap)
+                dump["tag"] = "zombie_detected"
+                dump["tasks"] = _collect_task_stacks()
+                dump["traceback"] = traceback.format_stack()
+                await asyncio.to_thread(_write_diagnostic, diag_path, snap, dump)
                 logger.error(
                     "zombie gatewayd detected: is_serving=False while stop_event unset; "
                     "tasks=%d fd=%d rss_kb=%d — diagnostic dumped to %s; setting stop_event",
-                    snap["task_count"],
-                    snap["fd_count"],
-                    snap["rss_kb"],
+                    dump["task_count"],
+                    dump["fd_count"],
+                    dump["rss_kb"],
                     diag_path,
                 )
                 stop_event.set()
                 return
+
+            await asyncio.to_thread(_write_diagnostic, diag_path, snap)
     except asyncio.CancelledError:
         pass
 

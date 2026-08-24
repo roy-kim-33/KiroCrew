@@ -20,6 +20,7 @@ import {
   Ellipsis, RotateCw, FileText, GitCommit, Rocket, Info, AlertTriangle, ShieldAlert,
 } from 'lucide-react'
 import * as api from './devFleetApi'
+import { ApiError } from '../api/client'
 
 import { i18nT } from '../i18n/t'
 import { compareText } from '../i18n/format'
@@ -689,6 +690,13 @@ export default function DevFleetPage() {
   // so the fleet-driven reattach below never starts a second poll loop for a
   // run this session is already polling.
   const provAttachedRef = useRef<Set<string>>(new Set())
+  // Synchronous per-worktree in-flight guard for the provision() entry point.
+  // React state updates are asynchronous: setProv({ status: 'starting' })
+  // does not disable the Provision button until the next render commit.
+  // A rapid double-click therefore sends two POST requests before any re-render.
+  // This ref is checked and set BEFORE the first `await`, so the second click
+  // in the same render turn is blocked synchronously rather than racing the DOM.
+  const provInFlightRef = useRef<Set<string>>(new Set())
   // Poll-loop lifecycle: loops exit when the component unmounts or a run is
   // explicitly dismissed — otherwise navigation would leak up-to-900-request
   // closures, and dismissing the stepper would be undone by the next tick.
@@ -830,14 +838,40 @@ export default function DevFleetPage() {
     // A poll for this run is already in flight (it outlived a previous mount of
     // this page, which is intended — the build's auto-restart must not be lost
     // to navigation). Starting a second loop here would race it: both would see
-    // `done` and both would fire the restart POST. Skip and let the existing
-    // loop own the run.
-    if (_activeSyncPolls.has(rid)) return
+    // `done` and both would fire the restart POST. Skip — but start a
+    // lightweight state relay so this mount's UI stays updated.
+    if (_activeSyncPolls.has(rid)) {
+      _syncStateRelay(rid, startedAt)
+      return
+    }
     _activeSyncPolls.add(rid)
     try {
       await _pollSyncRunLoop(rid, startedAt)
     } finally {
       _activeSyncPolls.delete(rid)
+    }
+  }
+
+  // Lightweight relay: polls /run to keep THIS mount's syncRun state in sync
+  // while the primary poll (from a prior mount) handles the auto-restart logic.
+  // Exits when the run finishes, the component unmounts, or the run is dismissed.
+  async function _syncStateRelay(rid: string, startedAt: number) {
+    for (let i = 0; i < 900; i++) {
+      await sleep(2000)
+      if (!pollAliveRef.current) return
+      if (cancelledRunsRef.current.has(rid)) return
+      let run: { status?: string; output?: string[]; exit_code?: number; started?: number; step_label?: string } | null = null
+      try { run = await api.get('/run?id=' + rid) } catch { continue }
+      if (!run) continue
+      const t0 = run.started ? run.started * 1000 : startedAt
+      const out = run.output || []
+      const last = [...out].reverse().find((l: string) => l?.trim() && !STEP_MARKER_RE.test(l)) || ''
+      if (run.status === 'done' || run.status === 'timeout') {
+        const okRun = run.exit_code === 0
+        setSyncRun({ rid, status: okRun ? 'done' : 'error', lines: out, startedAt: t0, exit: run.exit_code, last })
+        return
+      }
+      setSyncRun({ rid, status: 'running', lines: out, startedAt: t0, last, stepLabel: run.step_label })
     }
   }
 
@@ -1018,6 +1052,20 @@ export default function DevFleetPage() {
   }
 
   async function provision(name: string) {
+    // Synchronous guard: blocks re-entry before React re-renders the button into
+    // its disabled state. A rapid double-click fires both event handlers in the
+    // same render turn (before any setState takes effect), so checking React state
+    // here would NOT catch the second click.  provInFlightRef is updated
+    // synchronously and persists across renders, so it reliably blocks the second
+    // invocation whether it arrives in the same turn or in a later one while the
+    // request is still awaited. The finally block releases the guard after the
+    // request/polling lifecycle exits; remounting creates a fresh ref.
+    if (provInFlightRef.current.has(name)) {
+      // The first invocation already owns the API request, polling, and UI state.
+      // Returning here prevents both a duplicate POST and a second poll loop.
+      return
+    }
+    provInFlightRef.current.add(name)
     const startedAt = Date.now()
     clearTimeout(provDoneTimersRef.current[name])
     setProvLogOpen((o) => { const n = { ...o }; delete n[name]; return n })
@@ -1045,6 +1093,11 @@ export default function DevFleetPage() {
       notify(msg, { type: 'error' })
       setProv((p) => ({ ...p, [name]: { status: 'failed', failed: true, lines: [msg], startedAt, exit: null } }))
       setProvLogOpen((o) => ({ ...o, [name]: true }))
+    } finally {
+      // Release the per-name guard so a retry after failure or dismissal can
+      // re-enter.  pollProvisionRun already owns its completion lifecycle;
+      // this only gates the entry point.
+      provInFlightRef.current.delete(name)
     }
   }
 
@@ -1060,12 +1113,33 @@ export default function DevFleetPage() {
     finally { setFlag(name + ':remove', false) }
   }
 
+  // Normalize a failed POST /sync into the shape the caller below already
+  // handles. The single-flight refusal is an HTTP 409 whose body names the run
+  // already in flight, so it arrives as a thrown error and never as a returned
+  // body — which is what left the `!ok && run_id` branch below unreachable.
+  // Every other status is a real failure carrying its message.
+  function syncPostFailure(e: unknown): { ok: false; run_id?: string; error: string } {
+    let rid: unknown
+    if (e instanceof ApiError && e.status === 409) {
+      try { rid = (JSON.parse(e.body) as { run_id?: unknown })?.run_id } catch { /* not JSON */ }
+    }
+    return {
+      ok: false,
+      run_id: typeof rid === 'string' && rid ? rid : undefined,
+      error: (e as Error)?.message || String(e),
+    }
+  }
+
   async function syncMain() {
     setFlag('__syncmain', true)
     try {
-      const r = await api.post<{ ok?: boolean; run_id?: string; error?: string }>('/sync', {})
+      const r = await api.post<{ ok?: boolean; run_id?: string; error?: string }>('/sync', {}).catch(syncPostFailure)
       if (!r?.ok && r?.run_id) {
-        // Sync already running — reattach to the in-flight run instead of erroring
+        // Sync already running — reattach to the in-flight run instead of erroring.
+        // A second press is a user who cannot see the run, so an error toast would
+        // leave them exactly where they started. `startedAt` is provisional: the
+        // poll loop recomputes elapsed from the run's own `started` on its first
+        // tick, and it refuses a second loop for a rid already being polled.
         setSyncRun({ rid: r.run_id, status: 'running', lines: [], startedAt: Date.now() })
         pollSyncRun(r.run_id, Date.now())
         return

@@ -866,6 +866,119 @@ class TestApiChatMemoryModeForwarding:
 
 
 @pytest.mark.asyncio
+class TestApiChatModeForwarding:
+    """api_chat propagates a validated body.mode to the auto-created slot.
+
+    The Design Critique app's worker slot (mode="design-critique") lives only
+    in gateway memory. After a gateway restart the app's next send() recreates
+    the slot through this auto-create path; without mode forwarding the slot
+    is reborn with mode="" — it then serializes surface="" and passes the chat
+    sidebar's surface allowlist, leaking the throwaway worker session into the
+    user's chat list. Mirrors TestApiChatMemoryModeForwarding above.
+    """
+
+    async def _post_chat(self, state, body):
+        async def fake_run_chat(st, sl, msg):
+            sl.append("chunk", "ack", "chunk")
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr("kiro_crew.dashboard.chat_handlers._run_chat", fake_run_chat)
+            async with TestClient(TestServer(_make_app(state))) as client:
+                resp = await client.post("/api/chat", json=body, timeout=None)
+                assert resp.status == 200
+                async for _chunk in resp.content.iter_any():
+                    break  # only need to drive slot creation
+                resp.close()
+                await asyncio.sleep(0.05)
+
+    async def test_design_critique_mode_propagates_to_new_slot(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+
+        await self._post_chat(
+            state,
+            {
+                "message": "critique this",
+                "slot": "dc-12345",
+                "memory_mode": "temporary",
+                "mode": "design-critique",
+            },
+        )
+
+        slot = state._slots.get("dc-12345")
+        assert slot is not None
+        assert slot.mode == "design-critique"
+        # The leak this guards against: the sidebar allowlist admits surfaces
+        # "", "orchestrator" and "crew" — the recreated worker must not
+        # serialize one of those.
+        assert slot.mode not in ("", "orchestrator", "crew")
+
+    async def test_bogus_mode_is_dropped(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+
+        await self._post_chat(
+            state,
+            {"message": "hello", "slot": "bogus-mode-slot", "mode": "not-a-mode"},
+        )
+
+        slot = state._slots.get("bogus-mode-slot")
+        assert slot is not None
+        assert slot.mode == ""
+
+    async def test_non_string_mode_is_dropped(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+
+        await self._post_chat(
+            state,
+            {"message": "hello", "slot": "nonstring-mode-slot", "mode": 42},
+        )
+
+        slot = state._slots.get("nonstring-mode-slot")
+        assert slot is not None
+        assert slot.mode == ""
+
+    async def test_crew_mode_dropped_for_crew_incapable_name(self, tmp_path, monkeypatch):
+        """Same boundary api_chat_slot_create enforces with a 400: a name whose
+        normalized key cannot host a crew store (e.g. a Win32 device basename)
+        must not become a crew slot via auto-create. Here it is dropped, not
+        refused — the slot is created with the default mode instead."""
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+
+        await self._post_chat(
+            state,
+            {"message": "hello", "slot": "CON", "mode": "crew"},
+        )
+
+        created = [s for k, s in state._slots.items() if k.lower() == "con"]
+        assert created, "slot should still be created, just without crew mode"
+        assert created[0].mode == ""
+
+    async def test_mode_ignored_for_existing_slot(self, tmp_path, monkeypatch):
+        """Repeating mode on send() must be safe when the slot survived: an
+        existing slot keeps its stored mode and no error is raised."""
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+        state.get_or_create_slot("dc-alive", mode="design-critique", memory_mode="temporary")
+
+        await self._post_chat(
+            state,
+            {
+                "message": "hello again",
+                "slot": "dc-alive",
+                "memory_mode": "temporary",
+                "mode": "design-critique",
+            },
+        )
+
+        slot = state._slots.get("dc-alive")
+        assert slot is not None
+        assert slot.mode == "design-critique"
+
+
+@pytest.mark.asyncio
 class TestApiChatNoBrowseMarker:
     """Browse is gated by tool AVAILABILITY, not a per-message marker: the chat
     handler injects nothing into the user message, and the agent itself decides
@@ -1519,12 +1632,12 @@ class TestSlotDetailPagination:
     ):
         """A disk window holding BOTH id-carrying and id-less rows must not duplicate.
 
-        A durable injection is written twice by design: ``slot.append`` puts it in the
-        window, where an id is minted, and ``append_if_absent`` persists the durable
-        copy with no ``meta`` at all (``history.py:2204-2245`` delegates to ``append``,
-        which has no ``meta`` parameter). When that durable copy lands before the next
-        slot save, the disk window holds earlier saved rows WITH ids plus this row
-        WITHOUT one.
+        The dual-write injectors stamp both copies of an injection with one id, so
+        a NEW injection no longer produces this state — but transcripts written
+        before the append path accepted an id hold exactly it, as does any caller
+        that passes no id: earlier saved rows WITH ids plus a durable row WITHOUT
+        one. The id-less ``append_if_absent`` call below is that legacy writer
+        shape, and it must keep working unmigrated.
 
         Selecting id matching because SOME row carries an id then applies it to a row
         that structurally cannot match, so the injection is treated as un-flushed and
@@ -1580,6 +1693,107 @@ class TestSlotDetailPagination:
         assert contents.count("injected result") == 1, (
             f"the durable injection was appended twice; got {contents}"
         )
+
+    @pytest.mark.asyncio
+    async def test_durable_injection_carrying_the_window_rows_id_matches_by_identity(
+        self, tmp_path, monkeypatch
+    ):
+        """Both copies of an injection carry ONE id, so the identity walk matches.
+
+        The dual-write shape: the window copy is appended through ``slot.append``,
+        which mints ``meta.mid`` and returns the row; the durable copy passes that
+        same id to ``append_if_absent``. The on-disk window region then holds ONLY
+        id-carrying rows, so the bounded read reconciles by identity rather than a
+        body heuristic, and the injection appears exactly once.
+
+        Guarded on the all-id premise: if the durable copy ever stops carrying the
+        id, the fixture degrades to the mixed shape and the guard names that,
+        instead of the count assertion passing by way of the ordered fallback.
+        """
+        from kiro_crew.dashboard.chat_persistence import _save_slot_to_history
+
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+        slot = state.get_or_create_slot("dualid")
+        key = "dashboard:dualid"
+
+        slot.append("user", "q1")
+        slot.append("assistant", "a1")
+        slot.drain()
+        # Real save: these disk rows carry the window's own ids.
+        _save_slot_to_history(state, slot, force=True)
+
+        # The injector shape: one id minted in the window, the SAME id persisted
+        # on the durable copy.
+        window_row = slot.append("assistant", "injected result")
+        slot.drain()
+        mid = window_row["meta"]["mid"]
+        assert state.conversation_log.append_if_absent(
+            key, "assistant", "injected result", mid=mid
+        ) is True
+
+        disk = state.conversation_log.read_messages_chained(key)
+        region_mids = [
+            m["meta"].get("mid") if isinstance(m.get("meta"), dict) else None
+            for m in disk
+        ]
+        assert all(isinstance(x, str) and x for x in region_mids), (
+            f"the durable copy dropped the id — the region is mixed, not all-id: {region_mids}"
+        )
+        assert mid in region_mids, "the durable copy's id is not the window row's id"
+
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.get("/api/chat/slots/dualid?limit=10")
+            assert resp.status == 200, await resp.text()
+            data = await resp.json()
+
+        contents = [m["content"] for m in data["messages"]]
+        assert contents.count("injected result") == 1, (
+            f"the identity walk failed to match the durable copy; got {contents}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_hydrated_slot_over_an_all_id_transcript_is_not_served_twice(
+        self, tmp_path, monkeypatch
+    ):
+        """Hydration must keep the disk rows' ids, or an all-id region doubles.
+
+        With durable injection copies id-carrying, a cron transcript's window
+        region can be ALL-id — the condition that selects the identity walk.
+        ``hydrate_slot_from_history`` re-appends those rows into a fresh slot;
+        if it dropped their ``meta``, every hydrated row would be re-minted a
+        fresh id, no window id would match the disk, and the walk would mark
+        the WHOLE history owed — a bounded read then serves every row twice
+        until the next flush rewrites the file.
+        """
+        from kiro_crew.dashboard.cron_inject import hydrate_slot_from_history
+
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+        key = "dashboard:cronhyd"
+
+        # An all-id transcript: what a session looks like once every writer
+        # (slot save and id-carrying durable appends) stamps meta.mid.
+        state.conversation_log.append(key, "user", "q1", mid="m-disk-0000000001")
+        state.conversation_log.append(key, "assistant", "a1", mid="m-disk-0000000002")
+        state.conversation_log.append(
+            key, "assistant", "cron result", mid="m-disk-0000000003"
+        )
+
+        slot = state.get_or_create_slot("cronhyd")
+        hydrate_slot_from_history(slot, state.conversation_log.read_messages(key))
+        slot.drain()
+
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.get("/api/chat/slots/cronhyd?limit=10")
+            assert resp.status == 200, await resp.text()
+            data = await resp.json()
+
+        contents = [m["content"] for m in data["messages"]]
+        for body in ("q1", "a1", "cron result"):
+            assert contents.count(body) == 1, (
+                f"a hydrated row was served twice; got {contents}"
+            )
 
     @pytest.mark.asyncio
     async def test_interleaved_foreign_row_does_not_duplicate_the_persisted_suffix(
@@ -6032,6 +6246,352 @@ class TestRuntimeWiring:
             assert data["workspace"] == "oncall-ws"
 
     @pytest.mark.asyncio
+    async def test_api_chat_slot_agent_failed_resolution_reports_slot_workspace(
+        self, tmp_path, monkeypatch
+    ):
+        """A binding-resolution failure must not fabricate workspace='default'.
+
+        The handler logs and proceeds when resolve_agent_bindings raises, and
+        slot.workspace keeps its previous value — so the response must name
+        THAT value. Since #5120 the acting tab writes the response's workspace
+        into its store optimistically; a fabricated 'default' would pin the
+        chip to a workspace the slot does not hold, and with the websocket
+        down (the optimistic write's whole premise) nothing corrects it.
+        """
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+        slot = state.get_or_create_slot("s1")
+        slot.workspace = "research-ws"
+        state.sessions.reset = AsyncMock()
+
+        def _boom():
+            raise RuntimeError("config unreadable")
+
+        monkeypatch.setattr("kiro_crew.dashboard.chat.KiroCrewConfig.load", _boom)
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_handlers.KiroCrewConfig.load", _boom
+        )
+
+        async with TestClient(TestServer(_make_app_with_agent_routes(state))) as client:
+            resp = await client.post("/api/chat/slots/s1/agent", json={"agent": "oncall"})
+            data = await resp.json()
+            assert resp.status == 200
+            assert data["ok"] is True
+            assert data["agent"] == "oncall"
+            # The slot's workspace was not changed by the failed resolution,
+            # and the response reports the value the slot actually holds.
+            assert slot.workspace == "research-ws"
+            assert data["workspace"] == "research-ws"
+
+    @pytest.mark.asyncio
+    async def test_api_chat_slot_agent_reset_failure_keeps_committed_agent(
+        self, tmp_path, monkeypatch
+    ):
+        """A throwing teardown reports SUCCESS with a warning; the agent stays.
+
+        The reset pops the session before its shutdown can fail, so by the
+        failure point the old binding's session no longer exists — every
+        future or replacement session cold-starts on the NEW agent. The
+        switch therefore succeeded: answering 500 would make the acting
+        tab's performSlotSwitch keep the OLD store value for a switch that
+        actually happened.
+        """
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+        slot = state.get_or_create_slot("s1")
+        slot.agent = "oncall"
+        slot.workspace = "oncall-ws"
+        slot.project = "/tmp/oncall"
+        state.sessions.reset = AsyncMock(side_effect=RuntimeError("shutdown blew up"))
+
+        mock_cfg = MagicMock()
+        mock_cfg.agents = {"research": MagicMock(workspace="research-ws", memory_store="default")}
+        mock_cfg.workspaces = {"research-ws": MagicMock(dir="/tmp/research")}
+        mock_cfg.default_workspace = "default"
+        mock_cfg.default_memory_store = "default"
+        mock_cfg.memory_stores = {}
+        mock_cfg.memory = MagicMock()
+        mock_bindings = MagicMock()
+        mock_bindings.workspace_dir = Path("/tmp/research")
+        mock_bindings.memory_store_name = "default"
+        mock_bindings.model = ""
+        monkeypatch.setattr("kiro_crew.dashboard.chat.KiroCrewConfig.load", lambda: mock_cfg)
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_handlers.KiroCrewConfig.load", lambda: mock_cfg
+        )
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat.resolve_agent_bindings",
+            lambda cfg, name, project_dir=None: mock_bindings,
+        )
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_handlers.resolve_agent_bindings",
+            lambda cfg, name, project_dir=None: mock_bindings,
+        )
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat._workspace_name_for_dir",
+            lambda cfg, ws_dir: "research-ws",
+        )
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_handlers._workspace_name_for_dir",
+            lambda cfg, ws_dir: "research-ws",
+        )
+
+        async with TestClient(TestServer(_make_app_with_agent_routes(state))) as client:
+            resp = await client.post("/api/chat/slots/s1/agent", json={"agent": "research"})
+            data = await resp.json()
+            # Success with a warning — the switch happened; only the old
+            # process's teardown degraded.
+            assert resp.status == 200
+            assert data["ok"] is True
+            assert data["agent"] == "research"
+            assert data["warning"] == "old session teardown incomplete"
+            # The committed bindings stay (the popped old session cannot come
+            # back) — agent and the derived workspace both advertise the new
+            # binding.
+            assert slot.agent == "research"
+            assert slot.workspace == "research-ws"
+
+    @pytest.mark.asyncio
+    async def test_api_chat_slot_agent_failed_reset_spares_concurrent_writes(
+        self, tmp_path, monkeypatch
+    ):
+        """A failed switch never disturbs values written while it was in flight.
+
+        Commit-after-reset means the failure path touches nothing, so state
+        written by a concurrent actor during the (failing) reset — e.g. the
+        project endpoint, which does not take the slot lock — survives
+        untouched. Restoring captured priors here (the old rollback shape)
+        would silently erase that concurrent success.
+        """
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+        slot = state.get_or_create_slot("s1")
+        slot.agent = "oncall"
+        slot.workspace = "oncall-ws"
+        slot.project = "/tmp/oncall"
+
+        async def _concurrent_switch_lands_then_reset_fails(*args, **kwargs):
+            # Simulate a concurrent request winning the race while this
+            # request's reset is in flight.
+            slot.agent = "writer"
+            slot.workspace = "writing-ws"
+            slot.project = "/tmp/writing"
+            raise RuntimeError("shutdown blew up")
+
+        state.sessions.reset = AsyncMock(side_effect=_concurrent_switch_lands_then_reset_fails)
+
+        mock_cfg = MagicMock()
+        mock_cfg.agents = {"research": MagicMock(workspace="research-ws", memory_store="default")}
+        mock_cfg.workspaces = {"research-ws": MagicMock(dir="/tmp/research")}
+        mock_cfg.default_workspace = "default"
+        mock_cfg.default_memory_store = "default"
+        mock_cfg.memory_stores = {}
+        mock_cfg.memory = MagicMock()
+        mock_bindings = MagicMock()
+        mock_bindings.workspace_dir = Path("/tmp/research")
+        mock_bindings.memory_store_name = "default"
+        mock_bindings.model = ""
+        monkeypatch.setattr("kiro_crew.dashboard.chat.KiroCrewConfig.load", lambda: mock_cfg)
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_handlers.KiroCrewConfig.load", lambda: mock_cfg
+        )
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat.resolve_agent_bindings",
+            lambda cfg, name, project_dir=None: mock_bindings,
+        )
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_handlers.resolve_agent_bindings",
+            lambda cfg, name, project_dir=None: mock_bindings,
+        )
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat._workspace_name_for_dir",
+            lambda cfg, ws_dir: "research-ws",
+        )
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_handlers._workspace_name_for_dir",
+            lambda cfg, ws_dir: "research-ws",
+        )
+
+        async with TestClient(TestServer(_make_app_with_agent_routes(state))) as client:
+            resp = await client.post("/api/chat/slots/s1/agent", json={"agent": "research"})
+            assert resp.status == 200
+            # The concurrent winner's values survive — no field snaps back to
+            # this request's priors.
+            assert slot.agent == "writer"
+            assert slot.workspace == "writing-ws"
+            assert slot.project == "/tmp/writing"
+
+    @pytest.mark.asyncio
+    async def test_api_chat_slot_agent_success_commit_spares_concurrent_pick(
+        self, tmp_path, monkeypatch
+    ):
+        """A pick landing during a SUCCESSFUL reset wins over derived values.
+
+        The project/workspace endpoints do not take the slot lock, so a
+        user's explicit pick can land while the agent switch's reset await is
+        in flight. The commit is compare-and-set against a pre-await
+        baseline: the switch's DERIVED workspace/project must not overwrite
+        the newer explicit pick, and the response names the slot's final
+        reality. `agent` itself still commits — it is owned exclusively by
+        this endpoint.
+        """
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+        slot = state.get_or_create_slot("s1")
+        slot.agent = "oncall"
+        slot.workspace = "oncall-ws"
+        slot.project = "/tmp/oncall"
+        seen_during_reset: list[tuple[str, str]] = []
+
+        async def _concurrent_pick_lands_then_reset_succeeds(*args, **kwargs):
+            # The derived bindings must already be committed when the reset
+            # runs: a send in this window cold-starts the replacement session
+            # from the slot's CURRENT values, and starting the new agent in
+            # the old project would run its tools in the wrong repository.
+            seen_during_reset.append((slot.workspace, slot.project))
+            # A project pick (unlocked endpoint) lands mid-reset.
+            slot.project = "/tmp/user-picked"
+            return True
+
+        state.sessions.reset = AsyncMock(side_effect=_concurrent_pick_lands_then_reset_succeeds)
+
+        mock_cfg = MagicMock()
+        mock_cfg.agents = {"research": MagicMock(workspace="research-ws", memory_store="default")}
+        mock_cfg.workspaces = {"research-ws": MagicMock(dir="/tmp/research")}
+        mock_cfg.default_workspace = "default"
+        mock_cfg.default_memory_store = "default"
+        mock_cfg.memory_stores = {}
+        mock_cfg.memory = MagicMock()
+        mock_bindings = MagicMock()
+        mock_bindings.workspace_dir = Path("/tmp/research")
+        mock_bindings.memory_store_name = "default"
+        mock_bindings.model = ""
+        monkeypatch.setattr("kiro_crew.dashboard.chat.KiroCrewConfig.load", lambda: mock_cfg)
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_handlers.KiroCrewConfig.load", lambda: mock_cfg
+        )
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat.resolve_agent_bindings",
+            lambda cfg, name, project_dir=None: mock_bindings,
+        )
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_handlers.resolve_agent_bindings",
+            lambda cfg, name, project_dir=None: mock_bindings,
+        )
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat._workspace_name_for_dir",
+            lambda cfg, ws_dir: "research-ws",
+        )
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_handlers._workspace_name_for_dir",
+            lambda cfg, ws_dir: "research-ws",
+        )
+
+        async with TestClient(TestServer(_make_app_with_agent_routes(state))) as client:
+            resp = await client.post("/api/chat/slots/s1/agent", json={"agent": "research"})
+            data = await resp.json()
+            assert resp.status == 200
+            # The agent itself committed; the derived workspace committed
+            # (untouched since baseline); the user's mid-reset project pick
+            # SURVIVED the commit instead of being overwritten by the
+            # derived project reset.
+            assert slot.agent == "research"
+            assert slot.workspace == "research-ws"
+            assert slot.project == "/tmp/user-picked"
+            # The derived workspace was already committed when the reset ran
+            # (a replacement session in that window starts under the NEW
+            # binding, not the old repository).
+            assert seen_during_reset[0][0] == "research-ws"
+            # The response names the slot's final reality.
+            assert data["workspace"] == "research-ws"
+
+    @pytest.mark.asyncio
+    async def test_api_chat_slot_agent_new_agent_visible_during_reset(
+        self, tmp_path, monkeypatch
+    ):
+        """The new agent is committed before the reset runs.
+
+        A message send landing while the reset await is in flight creates a
+        fresh session from the slot's CURRENT bindings — if the agent were
+        committed only after the reset, that session would cold-start on the
+        OLD agent and stay stale while the switch reports success.
+        (`agent` has no unlocked writers, so committing before the reset is
+        safe: the failure path's rollback races nobody.)
+        """
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+        slot = state.get_or_create_slot("s1")
+        slot.agent = "oncall"
+        seen_during_reset: list[str] = []
+
+        async def _observe_then_succeed(*args, **kwargs):
+            seen_during_reset.append(slot.agent)
+            return True
+
+        state.sessions.reset = AsyncMock(side_effect=_observe_then_succeed)
+
+        def _boom():
+            raise RuntimeError("config unreadable")
+
+        # Resolution outcome is irrelevant to the visibility property.
+        monkeypatch.setattr("kiro_crew.dashboard.chat.KiroCrewConfig.load", _boom)
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_handlers.KiroCrewConfig.load", _boom
+        )
+
+        async with TestClient(TestServer(_make_app_with_agent_routes(state))) as client:
+            resp = await client.post("/api/chat/slots/s1/agent", json={"agent": "research"})
+            assert resp.status == 200
+            assert seen_during_reset == ["research"]
+            assert slot.agent == "research"
+
+    @pytest.mark.asyncio
+    async def test_api_chat_slot_agent_response_names_workspace_picked_during_persist(
+        self, tmp_path, monkeypatch
+    ):
+        """The response snapshots the workspace LAST, before leaving the lock.
+
+        The metadata persist awaits a worker thread, yielding the event loop
+        — a concurrent /workspace pick landing in that window must be what
+        the response names, because the acting tab writes the response's
+        workspace into its store optimistically. A snapshot taken before the
+        persist would hand the tab a stale value that the pick had already
+        superseded.
+        """
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+        slot = state.get_or_create_slot("s1")
+        slot.workspace = "oncall-ws"
+        state.sessions.reset = AsyncMock()
+
+        def _boom():
+            raise RuntimeError("config unreadable")
+
+        # Resolution outcome is irrelevant; keep the derived commit a no-op.
+        monkeypatch.setattr("kiro_crew.dashboard.chat.KiroCrewConfig.load", _boom)
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_handlers.KiroCrewConfig.load", _boom
+        )
+
+        # A conversation_log whose update_metadata simulates a concurrent
+        # /workspace pick landing while the persist thread runs.
+        conv = MagicMock()
+
+        def _pick_lands_during_persist(*args, **kwargs):
+            slot.workspace = "user-picked-ws"
+
+        conv.update_metadata = MagicMock(side_effect=_pick_lands_during_persist)
+        state.conversation_log = conv
+
+        async with TestClient(TestServer(_make_app_with_agent_routes(state))) as client:
+            resp = await client.post("/api/chat/slots/s1/agent", json={"agent": "research"})
+            data = await resp.json()
+            assert resp.status == 200
+            # The response names the newest reality, not a pre-persist
+            # snapshot.
+            assert data["workspace"] == "user-picked-ws"
+
+    @pytest.mark.asyncio
     async def test_api_chat_slot_agent_updates_project_dir(self, tmp_path, monkeypatch):
         """Switching agent also updates slot.project to the new workspace dir.
 
@@ -6717,6 +7277,41 @@ class TestRunChatToolCallUpdate:
         ws_calls = [(c.args[0], c.args[1]) for c in state.broadcast_ws.call_args_list]
         (msg_update,) = [p for k, p in ws_calls if k == "chat_message_update"]
         assert msg_update["meta"]["purpose"] == "List the temp dir"
+
+    @pytest.mark.asyncio
+    async def test_tool_meta_persists_kind(self, tmp_path, monkeypatch):
+        """The persisted tool-message meta carries the ACP tool kind. The
+        dashboard gates the inline diff-card promotion on kind == 'edit'
+        (a shell command whose input looks like a diff must never promote),
+        and historical rows can only be gated from persisted meta."""
+        from kiro_crew.providers.base import (
+            EVENT_COMPLETE,
+            EVENT_TOOL_CALL,
+            LLMEvent,
+        )
+
+        events = [
+            LLMEvent(
+                kind=EVENT_TOOL_CALL,
+                title="fs_write",
+                tool_kind="edit",
+                tool_purpose="Edit app.py",
+                tool_input="--- /a/app.py\n+++ /a/app.py\n@@ -1 +1 @@\n-x = 1\n+x = 2",
+                tool_call_id="tc-kind1",
+            ),
+            LLMEvent(kind=EVENT_COMPLETE),
+        ]
+        state = self._make_state_for_run_chat(tmp_path, monkeypatch)
+        slot = state.get_or_create_slot("s1")
+        client = self._make_mock_client(events)
+        state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
+
+        from kiro_crew.dashboard.chat import _run_chat
+
+        await _run_chat(state, slot, "hello")
+
+        (tool_msg,) = [m for m in slot.messages if m.get("role") == "tool"]
+        assert tool_msg["meta"]["kind"] == "edit"
 
     @pytest.mark.asyncio
     async def test_refinement_broadcasts_chat_message_update(self, tmp_path, monkeypatch):
@@ -9734,7 +10329,10 @@ class TestFolderCRUD:
             )
 
             async def _both_queued() -> None:
-                while len(getattr(state._folders_lock, "_waiters", None) or ()) < 2:
+                # _folders_lock is a LoopBoundLock (#4800); the waiter queue
+                # lives on this loop's inner asyncio.Lock.
+                inner = state._folders_lock._bound()
+                while len(getattr(inner, "_waiters", None) or ()) < 2:
                     await asyncio.sleep(0.01)
 
             # Both requests have passed their pre-lock validation against the
@@ -11222,6 +11820,41 @@ class TestForkSlot:
 
         new_slot = state._slots.get(data["key"])
         assert new_slot.folder_id == ""
+
+    @pytest.mark.asyncio
+    async def test_fork_inherits_project(self, tmp_path):
+        """Fork must carry the source slot's active project directory."""
+        state = _make_state(tmp_path)
+        slot = state.get_or_create_slot("src")
+        slot.project = str(tmp_path / "repo")
+        slot.append("user", "hi", "msg msg-u")
+        slot.drain()
+
+        app = _make_app(state)
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post("/api/chat/slots/src/fork", json={})
+            assert resp.status == 200
+            data = await resp.json()
+
+        new_slot = state._slots.get(data["key"])
+        assert new_slot is not None
+        assert new_slot.project == str(tmp_path / "repo")
+
+    @pytest.mark.asyncio
+    async def test_fork_inherits_empty_project(self, tmp_path):
+        """Fork of a projectless slot stays projectless."""
+        state = _make_state(tmp_path)
+        slot = state.get_or_create_slot("src")
+        slot.append("user", "hi", "msg msg-u")
+        slot.drain()
+
+        app = _make_app(state)
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post("/api/chat/slots/src/fork", json={})
+            data = await resp.json()
+
+        new_slot = state._slots.get(data["key"])
+        assert new_slot.project == ""
 
     @pytest.mark.asyncio
     async def test_fork_inherits_tags(self, tmp_path):

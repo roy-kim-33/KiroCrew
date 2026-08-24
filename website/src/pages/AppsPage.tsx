@@ -2,9 +2,10 @@
  * AppsPage — the Apps page, per the locked hybrid design (editorial front,
  * marketplace engine).
  *
- * Discover (landing tab): featured spotlight + two secondary feature cards
- * (editorial layer, curator-driven via the registry-index ``featured`` flag
- * with a deterministic fallback), then an "All apps" section with a category
+ * Discover (landing tab): featured editorial blocks (published layout when the
+ * catalog carries one, otherwise the same block shape synthesized from the
+ * ``featured`` flag -- one render path either way), then an "All apps" section
+ * with a category
  * rail (canonical categories + registry sources with counts) and a sortable
  * dense list. The editorial layer shows only for the unfiltered All view.
  *
@@ -15,20 +16,20 @@
  * the Sources gear in the header (SourcesPopover).
  */
 import { useEffect, useMemo, useState } from 'react'
-import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { useQuery } from '@tanstack/react-query'
 import { useNavigate } from 'react-router-dom'
 import {
   Package, Bot, Zap, Clock, ShoppingBag, Lock, Trash2, X, ArrowUp, Boxes,
   AlertTriangle, PowerOff,
 } from 'lucide-react'
 import { api } from '../api/client'
+import { appNavTarget } from '../appNav'
 import { Btn, EmptyState, PageHeader, SearchInput } from '../components/ui'
 import SimpleSelect from '../components/SimpleSelect'
 import { recordEvent } from '../rum'
 import SegmentedControl from '../components/SegmentedControl'
 import FeaturedSpotlight from '../components/appstore/FeaturedSpotlight'
 import type { EditorialArtwork } from '../components/appstore/useEditorialArt'
-import FeatureCard from '../components/appstore/FeatureCard'
 import CategoryRail, { type SourceRow } from '../components/appstore/CategoryRail'
 import AppListRow from '../components/appstore/AppListRow'
 import InstalledAppCard from '../components/appstore/InstalledAppCard'
@@ -97,6 +98,15 @@ type EditorialItem = {
 type EditorialBlock = {
   form: 'full' | 'row'
   items: EditorialItem[]
+  /**
+   * Whether this block's placement was written by a curator (published
+   * document) or synthesized from the registry (`pickFeatured`). This is a
+   * DATA field, not a UI branch: both kinds render through the same path and
+   * components, and the only thing that reads it is FeaturedSpotlight's
+   * artwork sourcing (a curated card draws editorial art or nothing; a derived
+   * card may fall back to the app's own hero, since no curator chose its art).
+   */
+  curated: boolean
 }
 
 /** A collection below this has lost members; see the drop in `featuredSections`. */
@@ -222,9 +232,27 @@ export function pickFeatured(apps: RegistryApp[]): RegistryApp[] {
   return [...flagged, ...rest].slice(0, 3)
 }
 
+/**
+ * Whether an installed app belongs in the Library list.
+ *
+ * A disabled builtin is normally hidden: the wheel ships ~20 of them default-off
+ * and listing every one would bury the apps a reader actually uses. An app that
+ * REPLACES a host surface is the exception, because it is the only class a reader
+ * can turn off and then need to find again -- its own copy tells them to disable
+ * it to get the old surface back, and with the row gone from Library and no
+ * catalog row in Discover that would be a one-way switch. Keyed on `ui.overlays`
+ * rather than on the app id so the rule belongs to the capability, not to a name.
+ *
+ * Exported so its test exercises this predicate rather than a copy of it.
+ */
+export function keepInLibrary(
+  app: Pick<InstalledApp, 'origin' | 'enabled' | 'manifest'>,
+): boolean {
+  return !(app.origin === 'builtin' && !app.enabled && !app.manifest?.ui?.overlays?.length)
+}
+
 export default function AppsPage() {
   const navigate = useNavigate()
-  const queryClient = useQueryClient()
   const [tab, setTab] = useState<Tab>(initialTab)
   useEffect(() => { sessionStorage.setItem('appstore-tab', tab) }, [tab])
   const [query, setQuery] = useState('')
@@ -339,7 +367,7 @@ export default function AppsPage() {
             // through its floor here, and dropping it whole beats rendering a
             // half-width card against empty space.
             if (b.form === 'full' ? items.length !== 1 : items.length < 2) return []
-            return [{ form: b.form, items }]
+            return [{ form: b.form, items, curated: true }]
           })
         : []
       return {
@@ -421,29 +449,27 @@ export default function AppsPage() {
       .map(r => (r.origin === 'builtin' && !isBuiltinServerRow(r) ? { ...r, origin: 'registry' } : r))
   }, [apps, registry])
 
-  const featured = useMemo(() => pickFeatured(browseApps), [browseApps])
-  const [spotlight, ...secondary] = featured
-
   /**
-   * Editorial featured sections, resolved against the apps this client can
-   * actually show. A reference that resolves to nothing is dropped — the
-   * registry is the source of truth for what exists, so editorial can never
-   * conjure an app by naming one.
+   * The featured blocks Discover renders, whatever their source. Published
+   * editorial sections are resolved against the apps this client can actually
+   * show. A reference that resolves to nothing is dropped — the registry is
+   * the source of truth for what exists, so editorial can never conjure an
+   * app by naming one.
    *
    * A collection that falls below two resolvable apps is dropped whole rather
    * than demoted to a single-app card: the title states why several apps belong
    * together, and showing one survivor under that theme would claim something
    * the curator did not write.
    *
-   * Empty means "fall back to `pickFeatured`", which is what Discover did before
-   * the editorial document had a layout. That is also today's live state:
-   * `sections` is published empty, so the derived pick is what ships -- rendered
-   * by the same card, so the layout change reaches users before any curated
-   * section does.
+   * When no published block survives (today's live state: `sections` is
+   * published empty), the memo synthesizes blocks of the SAME shape from
+   * `pickFeatured`. The fallback is a data-level substitution — the render
+   * path consumes one list and cannot tell a curated block from a derived
+   * one except through the `curated` field it forwards.
    */
   const featuredSections = useMemo(() => {
     const byName = new Map(browseApps.map(a => [a.name, a]))
-    return (registryData?.editorialSections || []).flatMap(block => {
+    const published = (registryData?.editorialSections || []).flatMap(block => {
       const items = block.items.flatMap(item => {
         const resolved = item.appRefs.map(n => byName.get(n)).filter((a): a is RegistryApp => !!a)
         const floor = item.type === 'collection' ? MIN_COLLECTION_APPS : 1
@@ -454,8 +480,33 @@ export default function AppsPage() {
       // dissolved (its apps left the registry) is a full-width slot holding a
       // half-width card, which is an arrangement the curator did not write.
       if (block.form === 'full' ? items.length !== 1 : items.length < 2) return []
-      return [{ form: block.form, items }]
+      return [{ form: block.form, items, curated: block.curated }]
     })
+    if (published.length > 0) return published
+    // No usable published layout: synthesize the SAME block shape from the
+    // derived pick, so the fallback happens in DATA and the render path below
+    // never learns which source fed it. The lead takes the `full` slot the
+    // curator would have written; the remaining picks sit beside each other as
+    // a `row`. `curated: false` is what lets these cards draw the app's own
+    // hero art (no curator supplied editorial artwork to prefer).
+    const [lead, ...rest] = pickFeatured(browseApps)
+    if (!lead) return []
+    // Explicitly EditorialItem-shaped (plus the resolved apps), so a derived
+    // card and a published card are the same type to the render path -- the
+    // optional fields a curator could have written simply hold nothing here.
+    const derive = (app: RegistryApp): EditorialItem & { apps: RegistryApp[] } => ({
+      type: 'app',
+      appRefs: [app.name],
+      apps: [app],
+    })
+    const blocks: typeof published = [{ form: 'full', items: [derive(lead)], curated: false }]
+    // A row needs two cards to have anything to sit beside -- the same floor
+    // the published boundary applies. With one leftover pick, the lead stands
+    // alone rather than a half-width card against empty space.
+    if (rest.length >= 2) {
+      blocks.push({ form: 'row', items: rest.map(derive), curated: false })
+    }
+    return blocks
   }, [registryData, browseApps])
 
   // The published rail order decides the sequence of the categories it names;
@@ -509,7 +560,11 @@ export default function AppsPage() {
       : a.displayName.localeCompare(b.displayName))
   }, [browseApps, category, query, sort])
 
-  const showEditorial = category === 'All' && !query.trim() && featured.length > 0
+  /* The editorial layer survives a CATEGORY pick -- curated placements are
+     content, not list rows, so the rail only filters the All-apps list below.
+     A SEARCH still hides it: a typed query is a stated intent to find one
+     thing, and the spotlight would push the results below the fold. */
+  const showEditorial = !query.trim() && featuredSections.length > 0
 
   // ---- Library data --------------------------------------------------------
 
@@ -520,7 +575,7 @@ export default function AppsPage() {
   const installedApps = useMemo(
     () =>
       apps
-        .filter(a => !(a.origin === 'builtin' && !a.enabled))
+        .filter(keepInLibrary)
         .map(a => ({
           ...a,
           updateAvailable: updateMap.has(a.name),
@@ -545,9 +600,10 @@ export default function AppsPage() {
 
   // ---- Actions --------------------------------------------------------------
 
-  const invalidate = () => {
-    queryClient.invalidateQueries({ queryKey: ['apps'] })
-    queryClient.invalidateQueries({ queryKey: ['registry'] })
+  const announceAppsChanged = () => {
+    // Neither ['apps'] nor ['registry'] is invalidated here: the
+    // mc:apps-changed listener in App.tsx owns both caches, for every
+    // dispatch site at once.
     window.dispatchEvent(new Event('mc:apps-changed'))
   }
 
@@ -580,7 +636,7 @@ export default function AppsPage() {
   const runEnable = async (name: string) => {
     await api.enableApp(name)
     recordEvent('app_enable', { app: name })
-    invalidate()
+    announceAppsChanged()
   }
 
   const trust = useTrustGate(runEnable)
@@ -641,7 +697,7 @@ export default function AppsPage() {
       if (action === 'enable') await runEnable(name)
       else if (action === 'disable') await api.disableApp(name)
       else if (action === 'update') await api.updateApp(name)
-      invalidate()
+      announceAppsChanged()
       // An in-place sync is the one action here whose success is otherwise
       // INVISIBLE: re-copying a source directory usually carries the same
       // version, so the card re-renders byte-identical and the dev cannot tell
@@ -677,7 +733,7 @@ export default function AppsPage() {
     try {
       await api.uninstallApp(name, keepData, false, Array.from(keepSpecific))
       recordEvent('app_uninstall', { app: name, version: uninstallTarget.version })
-      invalidate()
+      announceAppsChanged()
     } catch (e) {
       setError((e as Error)?.message || i18nT('pages.appsPage.failed_to_uninstall', { name }))
     } finally {
@@ -702,7 +758,7 @@ export default function AppsPage() {
       setUpdatingAll({ done: i + 1, total: targets.length })
     }
     setUpdatingAll(null)
-    invalidate()
+    announceAppsChanged()
     if (failed.length) setError(i18nT('pages.appsPage.failed_to_update', { names: failed.join(', ') }))
     else {
       setSuccessMsg(`Updated ${targets.length} app${targets.length === 1 ? '' : 's'}.`)
@@ -756,7 +812,15 @@ export default function AppsPage() {
       />
 
       <div className="px-4 md:px-6 pb-8 overflow-y-auto flex-1 min-h-0">
-        {/* Notifications */}
+        {/* Width cap on the content column only (the scrollbar stays at the
+            viewport edge). Discover is the one storefront surface: uncapped,
+            an ultrawide monitor stretches the lead card's 16:9 art and the
+            copy's line length past comfortable reading. Utility pages stay
+            full-width; a content shelf follows store convention instead. */}
+        <div className="max-w-[1200px] mx-auto">
+        {/* Notifications. No hand-off on the error notice: the SourcesPopover's
+            install-path input shares this page — navigating away would discard
+            what the user typed. */}
         {displayError && (
           <ErrorNotice
             message={displayError}
@@ -925,18 +989,16 @@ export default function AppsPage() {
             />
           ) : (
             <>
-              {/* A published layout replaces the derived one entirely: mixing a
-                  curator's cards with `featured`-flag picks would show the
-                  same app twice and give the curator no way to say "only these". */}
-              {showEditorial && featuredSections.length > 0 ? (
-                /* Each block renders the arrangement its FORM names -- the
-                   grouping is the document's, not inferred from array position.
-                   `full` runs one card across the width with its art beside the
-                   copy; `row` lays its cards side by side, one column on a
-                   narrow viewport. The old rule here ("position 0 spans, the
-                   rest pair up") drew the same page for the 1+2 case but was a
-                   renderer secret: a curator adding a fourth card had no way to
-                   say which block it joined. */
+              {/* One render path, whatever fed it. `featuredSections` already
+                  resolved the choice between a published layout and the derived
+                  pick (a published layout replaces the derived one entirely:
+                  mixing a curator's cards with `featured`-flag picks would show
+                  the same app twice and give the curator no way to say "only
+                  these"). By here the source is invisible: each block renders
+                  the arrangement its FORM names -- `full` runs one card across
+                  the width with its art beside the copy; `row` lays its cards
+                  side by side, one column on a narrow viewport. */}
+              {showEditorial && (
                 <div className="flex flex-col gap-3.5 mb-6">
                 {featuredSections.map((block, position) => (
                   <div
@@ -962,7 +1024,11 @@ export default function AppsPage() {
                     scope={`apps:featured-section:${position}:${idx}:${section.type}`}
                     fallback={
                       <BrowseCardFallback
-                        label={section.title}
+                        /* A collection is labeled by its theme; an `app` item
+                           has no title by design, so its label is the app's
+                           own name -- same line the old dedicated fallback
+                           cards printed. */
+                        label={section.title || section.apps[0]?.displayName || section.apps[0]?.name}
                         message={i18nT('pages.appsPage.this_section_could_not_be_displayed')}
                         className="mb-6"
                       />
@@ -974,10 +1040,12 @@ export default function AppsPage() {
                       title={section.title}
                       blurb={section.blurb}
                       artwork={section.artwork}
-                      /* A published placement, so the lead app's own hero may
-                         not fill the art band -- see FeaturedSpotlight's
-                         `curated`. The derived card below leaves it false. */
-                      curated
+                      /* Data-driven, not a render branch: a curated placement
+                         draws editorial art or nothing (the lead app's own hero
+                         may not fill the art band -- see FeaturedSpotlight's
+                         `curated`); a derived placement may use the app's own
+                         hero, since no curator chose art for it. */
+                      curated={block.curated}
                       layout={block.form === 'full' ? 'side' : 'stacked'}
                       /* A row's collections fold their rows into a dialog: three
                          inline install rows per card made the row taller than
@@ -995,57 +1063,6 @@ export default function AppsPage() {
                   </div>
                 ))}
                 </div>
-              ) : showEditorial && spotlight && (
-                <>
-                  <ErrorBoundary
-                    /* Full-data key: see cardDataKey — remounts when ANY field
-                       of the corrected payload changes, same latched-error
-                       reason as the app-list-row boundary. */
-                    key={cardDataKey(spotlight)}
-                    scope={`apps:featured-section:${spotlight.name}`}
-                    fallback={
-                      <BrowseCardFallback
-                        label={spotlight.displayName || spotlight.name}
-                        message={i18nT('pages.appsPage.this_app_could_not_be_displayed')}
-                        className="mb-6"
-                      />
-                    }
-                  >
-                    <FeaturedSpotlight
-                      type="app"
-                      apps={[spotlight]}
-                      busyName={featuredBusyName(actionLoading, [spotlight])}
-                      onGet={name => getApp(name)}
-                      onEnable={name => enableApp(name)}
-                      onOpenApp={(name, e) => openDetail(name, e)}
-                    />
-                  </ErrorBoundary>
-                  {secondary.length > 0 && (
-                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3.5 mb-6">
-                      {secondary.map(app => (
-                        <ErrorBoundary
-                          /* Full-data key: see cardDataKey. */
-                          key={cardDataKey(app)}
-                          scope={`apps:feature-card:${app.name}`}
-                          fallback={
-                            <BrowseCardFallback
-                              label={app.displayName || app.name}
-                              message={i18nT('pages.appsPage.this_app_could_not_be_displayed')}
-                            />
-                          }
-                        >
-                          <FeatureCard
-                            app={app}
-                            busy={actionLoading === `${app.name}:enable`}
-                            onOpen={e => openDetail(app.name, e)}
-                            onGet={() => getApp(app.name)}
-                            onEnable={() => enableApp(app.name)}
-                          />
-                        </ErrorBoundary>
-                      ))}
-                    </div>
-                  )}
-                </>
               )}
 
               <div className="flex items-baseline justify-between mt-2 mb-3">
@@ -1197,7 +1214,7 @@ export default function AppsPage() {
                       app={app}
                       actionLoading={updatingAll ? `${app.name}:update` : actionLoading}
                       onAction={handleAction}
-                      onOpen={() => navigate(app.manifest?.ui?.pages?.[0]?.route || `/apps/${app.name}`)}
+                      onOpen={() => navigate(appNavTarget(app)?.route || `/apps/${app.name}`)}
                       onDetail={() => openDetail(app.name)}
                     />
                   </ErrorBoundary>
@@ -1206,6 +1223,7 @@ export default function AppsPage() {
             </>
           )
         )}
+        </div>
       </div>
     </>
   )

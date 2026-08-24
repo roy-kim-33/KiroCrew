@@ -8,6 +8,11 @@ import { useImeGuard } from '../hooks/useImeGuard'
 import { useRailWidth } from '../hooks/useRailWidth'
 import { SETTINGS_DEFAULT_MODEL_ID } from '../hooks/useSettingHighlight'
 import { isTouchDevice } from '../utils/isTouchDevice'
+import { isBrowseCommand } from '../utils/browseCommand'
+// Re-exported so the symbol `ChatPage` exported before this extraction stays
+// importable from here; the implementation lives in `utils/browseCommand` so a
+// pure test need not pull ChatPage's module graph.
+export { isBrowseCommand }
 import { useSwipeEdge } from '../hooks/useSwipeEdge'
 import type { ResizeInfo } from '../utils/resizeImage'
 import { useAppSelector, useAppDispatch, store } from '../store'
@@ -34,7 +39,9 @@ import { addNotification, removeNotificationByTs } from '../store/notificationsS
 import { onTerminalReady, sendToTerminalSession } from '../utils/terminalRegistry'
 import { addTab as addDockTerminal } from '../hooks/useBottomTerminal'
 import { interceptSlashCommand, isInterceptedSlashCommand } from './chat/ChatInput'
-import { sseSlotTitle, triggerRefresh } from '../store/dashboardSlice'
+import { sseSlotTitle, triggerRefresh, updateSlot } from '../store/dashboardSlice'
+import { performSlotSwitch } from '../lib/slotSwitch'
+import { performAgentSlotSwitch } from '../lib/agentSwitch'
 import { api } from '../api/client'
 import { resolveAskAfterSend } from '../lib/resolveAskAfterSend'
 import type { PlanStepInput } from '../api/client'
@@ -75,7 +82,12 @@ const SCROLL_AFTER_RENDER_MS = 100
 // applier); re-exported here for this page's historical importers.
 export { PREFILL_STORAGE_KEY } from '../utils/navIntent'
 import { PREFILL_STORAGE_KEY, writePrefill } from '../utils/navIntent'
-import { consumeChatHandoff, subscribeChatHandoff } from '../utils/errorReport'
+import {
+  consumeChatHandoff,
+  handoffToChat,
+  persistClaimedChatHandoffs,
+  subscribeChatHandoff,
+} from '../utils/errorReport'
 import WelcomeView from '../components/WelcomeView'
 import { usePanelTabs, openPanelView, clearInlineDraft, getInlineDraft, claimAppAutoOpen, useAnyLiveAppTab } from '../hooks/usePanelTabs'
 import { useFilteredDropdown } from '../hooks/useFilteredDropdown'
@@ -95,11 +107,12 @@ import ModelEffortDropdown from '../components/ModelEffortDropdown'
 
 import ChatInput from '../components/ChatInput'
 import ErrorNotice from '../components/ErrorNotice'
+import ChatDropOverlay, { useChatFileDrop } from '../components/ChatDropOverlay'
 import SessionGridView from '../components/SessionGridView'
 import { anchorForSlot, loadLayout, sessionSlots } from '../hooks/splitLayoutStore'
 import { modelSupportsEffort } from '../lib/effort'
 import { isEmbeddedPane } from '../lib/embedded'
-import { isSystemNoticeKind } from '../lib/systemNotice'
+import { countCompletedTurns } from '../lib/completedTurns'
 import { displayModel, pinIsWithheld } from '../lib/model'
 import FollowUpCard from '../components/FollowUpCard'
 import FolderSuggestionCard from './chat/FolderSuggestionCard'
@@ -126,6 +139,7 @@ import { usePushToTalk } from '../hooks/usePushToTalk'
 import VoiceDisabledModal from '../components/VoiceDisabledModal'
 import { ChatFooter, AssistantMessage, UserMessage, PinnedPrompt } from './chat'
 import type { TurnStats } from './chat/AssistantMessage'
+import { turnHadPolicyBlock } from '../app-sdk/turnPolicyBlock'
 import MarkdownRenderer from '../components/MarkdownRenderer'
 import { JiraHostsCtx } from '../lib/jiraHosts'
 import MessageErrorBoundary from '../components/MessageErrorBoundary'
@@ -141,7 +155,7 @@ import { setSessionPreviewPending, normalizeUrl, PREVIEW_EXPAND_EVENT, PREVIEW_S
 import { detectPreviewUrl, previewFeedDecision } from '../utils/detectPreviewUrl'
 import { fileLandingSlot } from '../utils/uploadRouting'
 import ChatSidebar, { SIDEBAR_MIN, SIDEBAR_MAX } from './ChatSidebar'
-import { toSlug } from '../utils/shareUrl'
+import { toSlug, resolveMsgIndex } from '../utils/shareUrl'
 import { DRAFT_SAVE_DEBOUNCE_MS, loadDrafts, mergeIntoDraft, saveDrafts as persistDrafts, setDraft } from '../utils/chatDrafts'
 import { loadFileDrafts, saveFileDrafts as persistFileDrafts, setFileDraft } from '../utils/chatFileDrafts'
 import { loadPasteDrafts, savePasteDrafts as persistPasteDrafts, setPasteDraft } from '../utils/chatPasteDrafts'
@@ -743,35 +757,6 @@ function renderFileSegment(content: string, meta: Record<string, unknown> | unde
  *  equal value when the slot has no app renders (avoids useless re-renders). */
 const EMPTY_APP_ID_SET: ReadonlySet<string> = new Set()
 
-/**
- * Whether a shell command preview is the START of a browse.
- *
- * Matches the INVOCATION, not a mention: `playwright-cli` has to be the first
- * word of a command, so `grep playwright-cli .` and `echo playwright-cli` are
- * not browses while `cd /tmp && playwright-cli open …` is. Exported so the
- * distinction is unit-tested rather than asserted in a comment -- a regex that
- * merely required leading WHITESPACE matched every mention.
- */
-export function isBrowseCommand(preview: string | undefined | null): boolean {
-  if (!preview) return false
-  // A real shell preview is the tool INPUT, which is JSON:
-  // `{"command":"playwright-cli open https://x"}`. Testing the raw string never
-  // matched, because `playwright-cli` sits behind a quote rather than at a
-  // command boundary -- so the panel never opened. Pull the command field out
-  // first, mirroring the backend's own `_extract_bash_command`, and fall back to
-  // the raw text for a preview that is already a bare command.
-  let cmd = preview
-  try {
-    const parsed: unknown = JSON.parse(preview)
-    if (parsed && typeof parsed === 'object' && typeof (parsed as { command?: unknown }).command === 'string') {
-      cmd = (parsed as { command: string }).command
-    }
-  } catch {
-    // Not JSON: use the preview verbatim.
-  }
-  return /(^|[;&|(]\s*)playwright-cli(\s|$)/.test(cmd)
-}
-
 // Per-action titles for the refused-press notice above the composer. A press
 // added later gets its refusal surfaced by adding one entry here and calling
 // `showRefusedPress` from its catch — the `as const` map keeps every key
@@ -870,19 +855,11 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   const messagesRef = useRef(messages)
   messagesRef.current = messages
   const kiroCrewVersion = useAppSelector(s => s.dashboard.status?.version) || ''
-  const assistantTurnCount = useMemo(
-    () =>
-      messages.filter(
-        m =>
-          m.role === 'assistant' &&
-          // Skip ALL assistant-role system notices (compaction, session_reload,
-          // and any future kind), not just compaction — otherwise a reload
-          // notice or stage separator counts as a completed assistant turn and
-          // can trip the survey's 3-turn threshold with no real interaction.
-          !isSystemNoticeKind(m.kind ?? (m.meta?.kind as string | undefined)),
-      ).length,
-    [messages],
-  )
+  // Count COMPLETED back-and-forths (one user message answered by an assistant
+  // reply), not raw assistant-role messages — see countCompletedTurns for why a
+  // plain assistant-message tally over-counts. Extracted to a pure helper so the
+  // counting rule is unit-tested directly (completedTurns.test.ts).
+  const completedTurnCount = useMemo(() => countCompletedTurns(messages), [messages])
   const knowledgeFetch = useKnowledgeFetch(activeSlot)
   const knowledgeFetchRef = useRef(knowledgeFetch)
   knowledgeFetchRef.current = knowledgeFetch
@@ -1012,6 +989,9 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   const cursorIsForActiveSlot = useAppSelector(s => s.chat.slotCursorKey === s.chat.activeSlot)
   const loadingOlder = useAppSelector(s => s.chat.loadingOlder)
   const olderFailed = useAppSelector(s => s.chat.slotOlderError)
+  // switchSlot.pending seeds the active view from the pane cache, which for a
+  // background pane is a BOUNDED page; the record is present only while it is.
+  const activeViewIsBoundedPage = useAppSelector(s => activeSlot ? s.chat.slotPaneBounded?.[activeSlot] !== undefined : false)
   const history = useAppSelector(s => s.chat.history)
   const historyHasMore = useAppSelector(s => s.chat.historyHasMore)
 
@@ -1267,6 +1247,31 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // companion panel mounts ChatPage fresh, so it hits this double-invoke every
   // first open. See the draft-restore effect below.
   const consumedPrefillRef = useRef<string | null>(null)
+  // Error hand-offs are claimed into a component-owned FIFO immediately, even
+  // while disconnected. That removes the sessionStorage TTL from the reconnect
+  // wait, while the processing flag guarantees only one create/switch sequence
+  // can run at a time.
+  const errorHandoffQueueRef = useRef<string[]>([])
+  const errorHandoffActiveRef = useRef<string | null>(null)
+  const errorHandoffActiveDurableRef = useRef(false)
+  const errorHandoffProcessingRef = useRef(false)
+  const errorHandoffConnectedRef = useRef(connected)
+  const errorHandoffModeRef = useRef(mode)
+  const errorHandoffMountedRef = useRef(false)
+  // Invalidates async processors when this effect lifecycle ends. Mounted alone
+  // is insufficient because StrictMode can clean up and re-run effects on the
+  // same component instance, reusing every ref while an old create is pending.
+  const errorHandoffLifecycleRef = useRef(0)
+  const processErrorHandoffsRef = useRef<() => void>(() => {})
+  const persistErrorHandoffClaims = useCallback(() => {
+    const active = errorHandoffActiveRef.current
+    persistClaimedChatHandoffs([
+      ...(active && !errorHandoffActiveDurableRef.current ? [active] : []),
+      ...errorHandoffQueueRef.current,
+    ])
+  }, [])
+  errorHandoffConnectedRef.current = connected
+  errorHandoffModeRef.current = mode
 
   // Auto-dismiss prefill hint after 10 seconds
   useEffect(() => {
@@ -1275,46 +1280,194 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     return () => clearTimeout(t)
   }, [prefillHint])
 
+  const processErrorHandoffs = useCallback(async () => {
+    if (
+      errorHandoffProcessingRef.current
+      || !errorHandoffMountedRef.current
+      || !errorHandoffConnectedRef.current
+    ) return
+    const prompt = errorHandoffQueueRef.current[0]
+    if (!prompt) return
+
+    const lifecycle = errorHandoffLifecycleRef.current
+    const ownsLifecycle = () => (
+      errorHandoffMountedRef.current
+      && errorHandoffLifecycleRef.current === lifecycle
+    )
+    let failureRestageAttempted = false
+    const restageFailure = (error: unknown) => {
+      failureRestageAttempted = true
+      const queued = errorHandoffQueueRef.current
+      const restaged = handoffToChat([prompt, ...queued])
+      if (restaged) {
+        queued.splice(0)
+        // Ingress now owns the entire FIFO in one atomic write. Clear the
+        // claimed copy only after that write succeeds.
+        persistClaimedChatHandoffs([])
+      } else {
+        // Keep a same-document retry path as well as the unchanged claimed
+        // crash copy when sessionStorage rejected the ingress write.
+        queued.unshift(prompt)
+      }
+      dispatch(addNotification({
+        ts: uniqueNotificationTs(),
+        kind: 'agent',
+        priority: 'critical',
+        title: i18nT('pages.chatPage.could_not_start_a_new_session'),
+        body: i18nT('pages.chatPage.could_not_start_session_message_restored', {
+          error: createFailReason(error),
+        }),
+      }))
+    }
+    errorHandoffProcessingRef.current = true
+    errorHandoffActiveRef.current = prompt
+    errorHandoffActiveDurableRef.current = false
+    // Persist the complete local FIFO before removing its head. A reload can
+    // now recover both the active diagnostic and every prompt waiting behind it.
+    persistClaimedChatHandoffs(errorHandoffQueueRef.current)
+    errorHandoffQueueRef.current.shift()
+    try {
+      let slotKey: string
+      try {
+        const slot = await dispatch(createSlot({ mode: errorHandoffModeRef.current, activate: false })).unwrap()
+        if (!slot?.key) throw new Error('the server returned no session')
+        slotKey = slot.key
+      } catch (e) {
+        // Cleanup may already have handed this FIFO to a newer ChatPage. An old
+        // rejection must not append a duplicate batch or clear its replacement's
+        // crash snapshot.
+        if (!ownsLifecycle()) return
+        restageFailure(e)
+        return
+      }
+
+      // A route remount may have re-staged this prompt while createSlot was in
+      // flight. The abandoned request may leave an unused server slot, but it
+      // must not write shared recovery state or steal focus from its successor.
+      if (!ownsLifecycle()) return
+      // Seed before switching: the draft-restore effect runs in the same commit
+      // as switchSlot.pending and would otherwise overwrite pendingInput with
+      // the new slot's empty draft. The keyed prefill survives that race.
+      if (!writePrefill(slotKey, prompt)) {
+        // Do not acknowledge durability or activate an empty session when the
+        // keyed prompt was rejected. Preserve active + queued work together.
+        restageFailure(new Error('browser storage is unavailable'))
+        return
+      }
+      // The keyed target-slot prefill is now the durable owner. A reload no
+      // longer needs to replay this active prompt, but queued prompts still do.
+      errorHandoffActiveDurableRef.current = true
+      persistErrorHandoffClaims()
+      try {
+        await dispatch(switchSlot(slotKey)).unwrap()
+      } catch {
+        // switchSlot.pending already activated the fresh slot. Its detail fetch
+        // may fail independently; keep the seeded composer usable in that slot.
+      }
+      // Do not dispatch pendingInput after the detail fetch. The keyed prefill
+      // seeded the composer when switchSlot.pending activated the slot; a late
+      // second write would overwrite anything the user typed during the fetch.
+      //
+      // The prefill channel is single-slot and the seeded prompt only becomes
+      // durable-in-slot when the input commit's persist effect records it under
+      // the fresh slot's draft key. Hold this turn (bounded well inside the
+      // prefill's 30s staleness window) until one of those in-component signals
+      // confirms the seed landed: yielding a single task is not enough — the
+      // next handoff's slot switch can outrun the consuming commit, and its
+      // outgoing-slot save would then overwrite this slot's draft with the
+      // stale empty composer, silently dropping the diagnostic.
+      for (let i = 0; i < 300 && ownsLifecycle(); i++) {
+        // Seed committed: the persist effect keyed a draft to the fresh slot,
+        // or the composer already holds exactly this prompt (a same-text
+        // setInput bails out of re-rendering, so no draft write follows).
+        if (Object.prototype.hasOwnProperty.call(drafts.current, slotKey)) break
+        if (inputRef.current === prompt) break
+        // User deliberately moved on; the keyed prefill stays staged for the
+        // fresh slot and expires on its own clock.
+        if (activeSlotRef.current !== slotKey) break
+        await new Promise(resolve => setTimeout(resolve, 10))
+      }
+    } finally {
+      // A newer lifecycle owns the shared claim key after unmount/remount. The
+      // stale processor may clean up only its abandoned local promise state.
+      if (!ownsLifecycle()) return
+      errorHandoffActiveRef.current = null
+      errorHandoffActiveDurableRef.current = false
+      errorHandoffProcessingRef.current = false
+      if (!failureRestageAttempted) persistErrorHandoffClaims()
+      // Yield a task between sessions. React gets a commit in which the current
+      // slot consumes its keyed prefill before another handoff can replace the
+      // single prefill channel and activate the next fresh slot. A create failure
+      // deliberately stops here: the atomically re-staged FIFO waits for a later
+      // user handoff/remount instead of entering an immediate retry loop.
+      if (
+        !failureRestageAttempted
+        && errorHandoffConnectedRef.current
+        && errorHandoffQueueRef.current.length
+      ) {
+        setTimeout(() => processErrorHandoffsRef.current(), 0)
+      }
+    }
+  }, [dispatch, persistErrorHandoffClaims])
+  processErrorHandoffsRef.current = () => { void processErrorHandoffs() }
+
   // Drain the error hand-off channel ("Ask the agent" on an error surface).
   // sessionStorage rather than Redux because the root ErrorBoundary's button has
   // to work after a hard reload, when the store it would have dispatched to is
-  // gone. Feeding pendingInput keeps a single downstream prefill path.
+  // gone. Claim every prompt synchronously into the local FIFO; processing waits
+  // for connection and opens one fresh slot at a time.
   //
   // Two triggers: on mount (arriving from another route, or a full reload) and on
   // the subscription (an error surface inside chat hands off with no route
   // change, so nothing remounts).
   useEffect(() => {
     if (embedded) return
-    // Wait for a slot before consuming. The channel is SINGLE-USE, and on the
-    // hard-nav path (the root ErrorBoundary reloads the page) this effect runs
-    // with activeSlot still null: the pending-input consumer then cannot persist
-    // the prompt as a draft, and the slot-restore that follows overwrites the
-    // composer — losing the prompt for good. The 60s hand-off TTL covers the wait,
-    // and this effect re-runs once the slot appears.
-    if (!activeSlot) return
+    errorHandoffLifecycleRef.current += 1
+    errorHandoffMountedRef.current = true
+    const handoffQueue = errorHandoffQueueRef.current
     const drain = () => {
-      const prompt = consumeChatHandoff()
-      if (!prompt) return
-      // APPEND when the composer already holds unsent text — same hazard, and
-      // same helper, as `followupAddToSession` below: the pending-input consumer
-      // replaces the draft AND persists it, so a plain set would silently
-      // destroy whatever the user was mid-way through typing. This is reachable
-      // precisely because the subscription fires with no route change, while
-      // error surfaces INSIDE chat (a failed PR action, a message that failed to
-      // render) hand off from under a composer in use.
-      // Merge against the text that actually belongs to `activeSlot`. On the
-      // hard-nav path the composer may not have adopted this slot's stored draft
-      // yet — `composerSlotRef` lags `activeSlot` — and merging against an empty
-      // composer would make the pending-input consumer persist the prompt OVER
-      // the stored draft. When they agree, the live composer value is the truth.
-      const base = composerSlotRef.current === activeSlot
-        ? inputRef.current
-        : drafts.current[activeSlot] ?? ''
-      dispatch(setPendingInput(mergeIntoDraft(base, prompt)))
+      let prompt: string | null
+      while ((prompt = consumeChatHandoff()) !== null) {
+        // A repeated click while the same diagnostic is creating/retrying is one
+        // retry request, not a request for a duplicate session.
+        if (
+          prompt !== errorHandoffActiveRef.current
+          && !handoffQueue.includes(prompt)
+        ) handoffQueue.push(prompt)
+      }
+      persistErrorHandoffClaims()
+      processErrorHandoffsRef.current()
     }
     drain()
-    return subscribeChatHandoff(drain)
-  }, [dispatch, embedded, activeSlot])
+    const unsubscribe = subscribeChatHandoff(drain)
+    return () => {
+      errorHandoffMountedRef.current = false
+      errorHandoffLifecycleRef.current += 1
+      unsubscribe()
+      // Atomically return every nondurable item in original FIFO order. The
+      // lifecycle token prevents the abandoned processor from later clearing a
+      // newer component's claim or switching its active slot.
+      const active = errorHandoffActiveRef.current
+      const restaged = [
+        ...(active && !errorHandoffActiveDurableRef.current ? [active] : []),
+        ...handoffQueue,
+      ]
+      if (handoffToChat(restaged)) {
+        handoffQueue.splice(0)
+        errorHandoffActiveRef.current = null
+        errorHandoffActiveDurableRef.current = false
+        errorHandoffProcessingRef.current = false
+        persistClaimedChatHandoffs([])
+      }
+    }
+  }, [embedded, persistErrorHandoffClaims])
+
+  // A disconnected mount still CLAIMS the handoff above. Reconnection only
+  // starts its queued network work, so waiting longer than the storage TTL cannot
+  // discard the diagnostic.
+  useEffect(() => {
+    if (!embedded && connected) processErrorHandoffsRef.current()
+  }, [embedded, connected, mode])
 
   // Consume pendingInput from Redux (e.g. from "Chat" button on Projects page)
   useEffect(() => {
@@ -1556,7 +1709,6 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     }
   }, [])
 
-  const [dragOver, setDragOver] = useState(false)
   const [uploading, setUploading] = useState(false)
   const [pendingFiles, setPendingFiles] = useState<string[]>([])
   // Staged folder chips DERIVE from the composer text: an `@rel/` token is the
@@ -1587,8 +1739,9 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       setFileDraft(fileDrafts.current, s, pendingFiles)
       saveDraftsDebounced()
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- draft key is
-    // composerSlotRef; slot-change effect handles that transition
+    // Draft key is composerSlotRef; the slot-change effect handles that
+    // transition.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pendingFiles, saveDraftsDebounced])
   // Collapsed paste blocks backing the `[ Paste #N · M lines ]` tokens in
   // `input`. Persisted per-slot via chatPasteDrafts (localStorage, 30-day TTL)
@@ -2928,8 +3081,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     if (slot === activeSlotRef.current) setInput(optimized)
   }, [saveDrafts])
 
-  const handleDrop = useCallback((e: React.DragEvent) => {
-    e.preventDefault(); e.stopPropagation(); setDragOver(false)
+  const handleDrop = useCallback((dataTransfer: DataTransfer) => {
     // Classify BEFORE acting (issue #743): a dropped folder inserts its path
     // into the composer as an `@rel/` token — the same reference the @-picker
     // stages — instead of taking the upload route, which cannot ingest a
@@ -2937,7 +3089,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     // plain browser no real path is visible, so classifyDrop leaves folders
     // on the upload route there (today's behaviour) rather than inserting a
     // misleading bare name.
-    const { files, dirPaths } = classifyDrop(e.dataTransfer)
+    const { files, dirPaths } = classifyDrop(dataTransfer)
     if (dirPaths.length) {
       // Short relative form when the folder lies inside the project root,
       // absolute otherwise — exactly the picker's own fallback convention.
@@ -2958,6 +3110,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       uploadFiles(files)
     }
   }, [uploadFiles])
+  const { active: dragOver, dropTargetProps } = useChatFileDrop(handleDrop)
 
   // Scroll to bottom helper — delegates to the virtualizer (single controller).
   const scrollBottom = useCallback((instant: boolean = false) => {
@@ -3333,7 +3486,27 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // New content while following is handled inside the virtualizer (RO re-pin
   // for in-place growth + append layout-effect pin for new items), so ChatPage
   // does not run its own message-length scroll effect.
-  useEffect(() => { dispatch(fetchHistory(false)) }, [dispatch])
+  // Older-sessions history is fetched lazily, not on mount (#765): the
+  // sidebar's "Older sessions" section self-fetches when expanded (see
+  // ChatSidebar's footer toggle -- the section starts collapsed and its open
+  // state is not persisted, so it can never be open at mount), which leaves
+  // the welcome-screen "Continue a previous chat?" suggestions as the only
+  // consumer that can need the payload before that. They need it only once
+  // the user has typed something, so seed on the FIRST keystroke (raw input,
+  // not the 300ms-debounced historyQuery -- keying off the debounce would
+  // stack a round-trip after it, and on the high-RTT tunnels this targets
+  // the suggestions could land after the user already hit Enter; this way
+  // the fetch rides inside the debounce window at the same request cost).
+  // An unconditional mount fetch cost one round-trip on every warm reload
+  // for a list that is usually never shown. Once-only: the ref latches even
+  // when the list is already populated (the sidebar fetched first), so
+  // typing never re-fetches.
+  const historySeededRef = useRef(false)
+  useEffect(() => {
+    if (historySeededRef.current || !input.trim()) return
+    historySeededRef.current = true
+    if (history.length === 0) dispatch(fetchHistory(false))
+  }, [input, history.length, dispatch])
   // Persist active slot to localStorage for refresh recovery (per-mode)
   const slotStorageKey = `mc-active-slot-${mode || 'chat'}`
   const slotStorageKeyRef = useRef(slotStorageKey); slotStorageKeyRef.current = slotStorageKey
@@ -3361,6 +3534,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // over owns the first switch of this mount — see the mount re-fetch effect.
   const deepLinkPendingRef = useRef(!!initialSidRef.current && initialSidRef.current !== activeSlot)
   const initialMsgRef = useRef(searchParams.get('msg'))
+  const initialMidRef = useRef(searchParams.get('mid'))
   const initialNewRef = useRef(searchParams.get('new') === '1')
   // Deep-link mount activation in progress — stops the sync effect from stripping
   // ?sid before activation lands. Cleared once activeSlot is truthy.
@@ -4286,8 +4460,14 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   }, [])
 
   const approve = useCallback(async (action: string) => { if (activeSlot) await api.approveChatSlot(activeSlot, action) }, [activeSlot])
+  // Approvals dismissed through this mapping resolve via the ONE-SHOT
+  // `api.resolveApproval` endpoint, which has no trust verb: it can honor
+  // exactly `approve` or `reject`, and the next identical call prompts again.
+  // Any UI feeding this path must offer only those decisions — a Trust
+  // affordance here would claim a standing grant the backend never records
+  // (#5400 on the spawn-approval card, #5434 on the collapsed tool row).
   const toApiDecision = (action: string): 'approve' | 'reject' =>
-    action === 'approved' || action === 'trust' ? 'approve' : 'reject'
+    action === 'approved' ? 'approve' : 'reject'
   const dismissApproval = useCallback((aid: string, decision?: string) => {
     dispatch(resolveByApprovalId({ id: aid, decision }))
     const n = store.getState().notifications.items.find(x => x.approval_id === aid)
@@ -4305,7 +4485,10 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     }
     dispatch(setAgentSwitchNotice(null))
     try {
-      await api.chatSlotAgent(activeSlot, agentName)
+      // Same protocol as switchModel below (#4523): the acting tab must not
+      // depend on the coalesced slots rebroadcast to see its own pick.
+      // performAgentSlotSwitch mirrors exactly what the response names.
+      await performAgentSlotSwitch(activeSlot, agentName, dispatch)
     } catch (error) {
       // Closing the picker is the call sites' job and already happens
       // synchronously alongside this call, so a failure surfaces as the shared
@@ -4326,21 +4509,50 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     // kiro-cli advertises `auto` as a real model id (and its default_model), and
     // the ChatPane + Alt+Shift model-cycle paths already send it verbatim.
     if (!activeSlot) { setPendingModel(modelName); return }
-    await api.chatSlotModel(activeSlot, modelName)
+    try {
+      // performSlotSwitch owns the whole protocol: per-slot+field serialized
+      // dispatch, latest-request-wins adjudication, hung-request timeout, and
+      // exactly-one store write on the authoritative value (#4523). The store
+      // write is deliberately NOT awaited on the server's slots rebroadcast:
+      // that push is coalesced and never arrives with the websocket down.
+      await performSlotSwitch('model', activeSlot, modelName,
+        async () => {
+          // The response's `model` is the stored value (deprecated ids are
+          // remapped server-side), so prefer it over the requested name.
+          const r = await api.chatSlotModel(activeSlot, modelName)
+          return r?.model ?? modelName
+        },
+        (value) => dispatch(updateSlot({ key: activeSlot, model: value })))
+    } catch (e) {
+      // Same failure surface as the agent switch beside this: the shared
+      // notice toast, preferring the server's own message. The chip keeps
+      // showing what is actually running either way.
+      dispatch(setAgentSwitchNotice(agentSwitchFailureMessage(e)))
+      // eslint-disable-next-line no-console -- surface switchModel failures for debugging
+      console.error('switchModel failed', e)
+    }
     // Keep the dropdown open after selecting — the user may switch models again
     // or drill into the reasoning-effort panel. Dismiss is via outside-click/Escape.
     // setPendingModel is a stable useState setter.
-  }, [activeSlot, setPendingModel])
+  }, [activeSlot, dispatch, setPendingModel])
   const setProject = useCallback(async (path: string) => {
     if (!activeSlot) { setPendingProject(path); return }
     try {
-      await api.chatSlotProject(activeSlot, path)
+      // Same protocol as switchModel above; the server realpath-normalizes
+      // the directory, so the response's spelling is what gets written.
+      await performSlotSwitch('project', activeSlot, path,
+        async () => {
+          const r = await api.chatSlotProject(activeSlot, path)
+          return r?.project ?? path
+        },
+        (value) => dispatch(updateSlot({ key: activeSlot, project: value })))
     } catch (e) {
+      dispatch(setAgentSwitchNotice(agentSwitchFailureMessage(e)))
       // eslint-disable-next-line no-console -- surface setProject failures for debugging
       console.error('setProject failed', e)
     }
     // setPendingProject is a stable ref-backed setter.
-  }, [activeSlot, setPendingProject])
+  }, [activeSlot, dispatch, setPendingProject])
 
   const currentSlot = slots.find(s => s.key === activeSlot)
   // One source for both same-meaning markers in the agent pop-up: the row's check and
@@ -5565,6 +5777,9 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     slotKey: string
     messageTs: string
     mid?: string
+    // Required, not optional: the two entry points render different copy, and a
+    // new caller that omitted it would silently show pin wording.
+    origin: 'pin' | 'earlier'
   } | null>(null)
   const pinnedJumpPageLoadsRef = useRef(0)
   const jumpToLoadedPinnedMessage = useCallback((messageTs: string, mid?: string): boolean => {
@@ -5590,7 +5805,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     if (activeSlot && (!cursorIsForActiveSlot || (slotHasMore && slotOldestIndex > 0))) {
       pinnedJumpPageLoadsRef.current = 0
       setPinNotice(null)
-      setPendingPinnedJump({ slotKey: activeSlot, messageTs, mid })
+      setPendingPinnedJump({ slotKey: activeSlot, messageTs, mid, origin: 'pin' })
       return
     }
     setPinNotice(i18nT('pages.chat.pins.message_unavailable'))
@@ -5602,9 +5817,21 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       setPendingPinnedJump(null)
       return
     }
+    // Captured per effect run so the async branches below report the entry point
+    // this jump came from, not whichever one ran last.
+    const notFoundNotice = pendingPinnedJump.origin === 'earlier'
+      ? i18nT('components.chatPane.earlier_messages_unavailable')
+      : i18nT('pages.chat.pins.message_unavailable')
+    // A fetch that errored is transient, so the not-found copy would tell the
+    // reader their history is gone. Pin origin has no paging-error string.
+    const loadFailedNotice = pendingPinnedJump.origin === 'earlier'
+      ? i18nT('components.chatPane.earlier_messages_load_failed')
+      : notFoundNotice
     if (jumpToLoadedPinnedMessage(pendingPinnedJump.messageTs, pendingPinnedJump.mid)) {
       pinnedJumpPageLoadsRef.current = 0
-      setPendingPinnedJump(null)
+      // A jump resolved against the bounded page is provisional: the full
+      // transcript prepends older rows, so re-resolve once it has replaced it.
+      if (!activeViewIsBoundedPage) setPendingPinnedJump(null)
       return
     }
     // The cursor still describes the chat we left; wait for the switch to settle
@@ -5612,7 +5839,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     if (!cursorIsForActiveSlot) return
     if (!slotHasMore || slotOldestIndex <= 0) {
       pinnedJumpPageLoadsRef.current = 0
-      setPinNotice(i18nT('pages.chat.pins.message_unavailable'))
+      setPinNotice(notFoundNotice)
       setPendingPinnedJump(null)
       return
     }
@@ -5623,7 +5850,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     void dispatch(loadOlderMessages()).unwrap().then(result => {
       if (!cancelled && result === null) {
         pinnedJumpPageLoadsRef.current = 0
-        setPinNotice(i18nT('pages.chat.pins.message_unavailable'))
+        setPinNotice(notFoundNotice)
         setPendingPinnedJump(null)
       }
     }).catch(err => {
@@ -5632,13 +5859,14 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       if (isSupersededPagingRejection(err)) return
       if (!cancelled) {
         pinnedJumpPageLoadsRef.current = 0
-        setPinNotice(i18nT('pages.chat.pins.message_unavailable'))
+        setPinNotice(loadFailedNotice)
         setPendingPinnedJump(null)
       }
     })
     return () => { cancelled = true }
   }, [
     activeSlot,
+    activeViewIsBoundedPage,
     cursorIsForActiveSlot,
     dispatch,
     jumpToLoadedPinnedMessage,
@@ -5680,7 +5908,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     void unpinById(id).catch(() => {})
   }, [unpinById])
   const pinStatus = pinNotice ?? (chatPinsError
-    ? i18nT(chatPinsError === 'pin' ? 'pages.chat.pins.pin_failed' : 'pages.chat.pins.unpin_failed')
+    ? i18nT(chatPinsError === 'pin' ? 'pages.chat.pins.pin_failed' : chatPinsError === 'pin_limit' ? 'pages.chat.pins.pin_limit_reached' : 'pages.chat.pins.unpin_failed')
     : null)
   const dismissPinStatus = useCallback(() => {
     setPinNotice(null)
@@ -5769,21 +5997,25 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   }, [focusToolCallId, messages, messageToDisplayIdx, navToDisplayIndex])
 
   // Deep-link: scroll to ?msg= timestamp on cold load.
+  // When ?mid= is also present (copied from a pinned-message link), resolve by
+  // mid first (stable per-message identity) and fall back to ts for legacy links.
   // The scroll-to-bottom effect above is suppressed while initialMsgRef is set.
-  // Safety net: clear initialMsgRef after 5s to restore scroll-to-bottom if deep-link fails.
+  // Safety net: clear both refs after 5s to restore scroll-to-bottom if deep-link fails.
   useEffect(() => {
     if (!initialMsgRef.current) return
-    const timer = setTimeout(() => { initialMsgRef.current = null }, 5000)
+    const timer = setTimeout(() => { initialMsgRef.current = null; initialMidRef.current = null }, 5000)
     return () => clearTimeout(timer)
   }, [])
   useEffect(() => {
     const targetTs = initialMsgRef.current
+    const targetMid = initialMidRef.current
     if (!targetTs || messages.length === 0) return
-    const msgIdx = messages.findIndex(m => m.ts === targetTs)
+    const msgIdx = resolveMsgIndex(messages, targetTs, targetMid)
     if (msgIdx < 0) return
     const di = messageToDisplayIdx.get(msgIdx)
     if (di === undefined) return
     initialMsgRef.current = null
+    initialMidRef.current = null
     setTimeout(() => {
       navToDisplayIndex(di, { behavior: 'auto', align: 'center' })
       setHighlightTs(targetTs)
@@ -5953,7 +6185,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
             })()
           ) : (
             <div className="flex flex-col gap-0">
-              <AssistantMessage linkPreviews={linkPreviewsOn} content={m.content} isStreaming={isStreaming} isRegenerating={regenerating && i === lastTextIdx} onFileOpen={handleFileOpen} onFolderOpen={handleFolderOpen} onArtifactOpen={handleArtifactOpen} onQuote={handleQuote} onAsk={handleAsk} slotRunning={slotRunning} planTaskId={planTaskId} timestamp={chatConfig.showTimestamps ? msgTime : undefined} timestampTitle={msgTimeFull} messageTs={m.ts} slotKey={activeSlot || undefined} slotTitle={activeSlotTitle} mode={mode} fileChanges={(m.meta as Record<string, unknown> | undefined)?.file_changes as FileChangeEntry[] | undefined} turnStats={chatConfig.showTurnStats ? (m.meta as Record<string, unknown> | undefined)?.turn_stats as TurnStats | undefined : undefined} onOpenDiff={handleOpenDiff} fileChipStyle={chatConfig.fileChipStyle} artifactPaths={artifactPaths} pinned={m.ts && (m.meta as Record<string, unknown> | undefined)?.mid ? isPinned((m.meta as Record<string, unknown>).mid as string) : false} onTogglePin={m.ts && (m.meta as Record<string, unknown> | undefined)?.mid ? () => handleTogglePinForMessage((m.meta as Record<string, unknown>).mid as string, m.ts!, 'assistant', m.content) : undefined} showFooter={(() => {
+              <AssistantMessage suppressSteerAck={turnHadPolicyBlock(messages, i)} linkPreviews={linkPreviewsOn} content={m.content} isStreaming={isStreaming} isRegenerating={regenerating && i === lastTextIdx} onFileOpen={handleFileOpen} onFolderOpen={handleFolderOpen} onArtifactOpen={handleArtifactOpen} onQuote={handleQuote} onAsk={handleAsk} slotRunning={slotRunning} planTaskId={planTaskId} timestamp={chatConfig.showTimestamps ? msgTime : undefined} timestampTitle={msgTimeFull} messageTs={m.ts} slotKey={activeSlot || undefined} slotTitle={activeSlotTitle} mode={mode} fileChanges={(m.meta as Record<string, unknown> | undefined)?.file_changes as FileChangeEntry[] | undefined} turnStats={chatConfig.showTurnStats ? (m.meta as Record<string, unknown> | undefined)?.turn_stats as TurnStats | undefined : undefined} onOpenDiff={handleOpenDiff} fileChipStyle={chatConfig.fileChipStyle} artifactPaths={artifactPaths} pinned={m.ts && (m.meta as Record<string, unknown> | undefined)?.mid ? isPinned((m.meta as Record<string, unknown>).mid as string) : false} onTogglePin={m.ts && (m.meta as Record<string, unknown> | undefined)?.mid ? () => handleTogglePinForMessage((m.meta as Record<string, unknown>).mid as string, m.ts!, 'assistant', m.content) : undefined} showFooter={(() => {
                 // Show footer on the last assistant message of each completed turn
                 if (isStreaming) return false
                 // Find next message after this one that's assistant, user, or streaming
@@ -6412,7 +6644,13 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
           <SessionGridView
             seedSlot={splitAnchor ?? activeSlot}
             onClose={() => setSplitMode(false)}
-            onCollapse={(slot) => { dispatch(switchSlot(slot)); setSplitMode(false) }}
+            onCollapse={(slot, anchorTs, anchorMid) => {
+              dispatch(switchSlot(slot))
+              setSplitMode(false)
+              // switchSlot.pending sets activeSlot synchronously, so the pending-jump
+              // effect pages back to the anchor instead of landing on the newest turn.
+              if (anchorTs) setPendingPinnedJump({ slotKey: slot, messageTs: anchorTs, mid: anchorMid, origin: 'earlier' })
+            }}
           />
         ) : !activeSlot ? (
           <div className="flex-1 flex flex-col items-center justify-center gap-4 px-8">
@@ -6421,12 +6659,12 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
           </div>
         ) : (
           <SearchHighlightContext.Provider value={searchCtxValue}>
-          <div className="relative flex flex-col flex-1 min-h-0">
+          <div className="relative flex flex-col flex-1 min-h-0" {...dropTargetProps}>
             {/* Claude-style title row — absolute overlay, solid top fading to transparent.
                 Inset on the right by the 6px scrollbar width (see ::-webkit-scrollbar
                 in index.css) so the overlay never paints over the scroller's scrollbar
                 track — otherwise the thumb is hidden/un-grabbable when scrolled to top. */}
-            <div className="absolute top-0 left-0 right-1.5 z-10 pointer-events-none" style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}>
+            <div className="absolute top-0 left-0 right-1.5 z-[45] pointer-events-none" style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}>
               {/* The row's left padding GLIDES between its open (20px) and
                   collapsed (60px, clearing the stationary toggle + divider)
                   values on the same 320ms curve as the panel — an instant
@@ -6568,6 +6806,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                 />
               )}
             </div>
+            <ChatDropOverlay active={dragOver} />
             {slotLoading && (
               <div className="absolute inset-0 flex items-center justify-center z-20 pointer-events-none">
                 <Loader size={20} className="animate-spin text-muted" />
@@ -6804,7 +7043,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                     key={activeSlot}
                     sessionId={activeSlot}
                     kiroCrewVersion={kiroCrewVersion}
-                    turnCount={assistantTurnCount}
+                    turnCount={completedTurnCount}
                     slotOrigin={currentSlot?.origin}
                     onLayoutChange={handleSurveyLayoutChange}
                   />
@@ -7042,10 +7281,9 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               projectBranch={projectBranch}
               projectDetached={!projectGitError && !!projectGit?.detached}
               isMac={isMac}
-              onDrop={handleDrop}
-              dragOver={dragOver}
-              onDragOver={e => { e.preventDefault(); e.stopPropagation(); setDragOver(true) }}
-              onDragLeave={e => { if (e.currentTarget === e.target) setDragOver(false) }}
+              onDrop={dropTargetProps.onDrop}
+              onDragOver={dropTargetProps.onDragOver}
+              onDragLeave={dropTargetProps.onDragLeave}
               voiceRecording={voiceOwned && voice.recording}
               voiceTranscribing={voiceOwned && voice.transcribing}
               voiceError={voice.error}

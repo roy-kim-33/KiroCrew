@@ -26,6 +26,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Awaitable, Callable, Iterable
 
+from kiro_crew.messaging.tables import TABLE_POLICY_AUTO
 from kiro_crew.messaging.transport import (
     ConfiguredChannelTarget,
     InboundMessage,
@@ -40,9 +41,9 @@ logger = logging.getLogger(__name__)
 DispatchFn = Callable[[WebexInbound], Awaitable[None]]
 
 # Webex capabilities: no streaming (10-edit cap per message), but edits exist
-# (budgeted status placeholder), no tappable chips (max_buttons=0 records the
-# fact; the renderer's [OPTIONS:] drop is unconditional and does not read it),
-# and proactive send is fine (a bot may post to a room / person at any time).
+# (budgeted status placeholder), no tappable chips (max_buttons=0, so the
+# renderer routes [OPTIONS:] through the shared numbered-text fallback), and
+# proactive send is fine (a bot may post to a room / person at any time).
 #
 # max_message_chars is a CHARACTER count, but Webex caps messages in UTF-8
 # BYTES (WEBEX_MAX_TEXT = 7000 bytes; see chunk_utf8's docstring on why the
@@ -61,6 +62,8 @@ WEBEX_CAPABILITIES = TransportCapabilities(
     files_outbound=False,
     rich_blocks=False,
     threads=False,
+    # Webex renders pipe tables literally.
+    table_mode=TABLE_POLICY_AUTO,
     max_message_chars=WEBEX_SAFE_MESSAGE_CHARS,
     max_buttons=0,
     supports_proactive_send=True,

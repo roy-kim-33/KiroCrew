@@ -247,6 +247,11 @@ def _patch_aws_on_path(monkeypatch) -> None:
         "kiro_crew.voice_reply.shutil.which",
         lambda name, *a, **k: _FAKE_AWS_CLI if name == "aws" else None,
     )
+    # The which stub above is name-sensitive ("aws" only), but the shared
+    # deploy-engine resolver (#4770) would feed it a PATH-hit absolute path.
+    # Pin the resolver to the bare name so this fixture keeps meaning exactly
+    # "the aws CLI is present" regardless of the host.
+    monkeypatch.setattr("kiro_crew.voice_reply.resolve_aws_bin", lambda: "aws")
 
 
 @pytest.fixture(autouse=True)
@@ -343,6 +348,49 @@ class TestIsAvailable:
 
     def test_unknown_provider_returns_false(self, caplog) -> None:
         assert is_available("bogus") is False
+
+
+# ── resolve_polly_cli() (#4770) ─────────────────────────────────────────
+
+
+class TestResolvePollyCli:
+    @pytest.mark.skipif(
+        os.name == "nt",
+        reason="fallback install dirs are POSIX literals; dead on Windows by design",
+    )
+    def test_resolved_absolutely_under_minimal_path(self, monkeypatch, tmp_path) -> None:
+        """A GUI-launched gateway's minimal PATH must still resolve the CLI
+        absolutely via the deploy engine's well-known-dirs resolver instead of
+        silently skipping TTS (#4770)."""
+        from kiro_crew import github_runner, voice_reply
+        from kiro_crew.deploy import engine
+
+        fake_aws = tmp_path / "aws"
+        fake_aws.write_text("#!/bin/sh\n")
+        fake_aws.chmod(0o755)
+        empty_bin = tmp_path / "emptybin"
+        empty_bin.mkdir()
+        monkeypatch.setenv("PATH", str(empty_bin))
+        monkeypatch.setattr(engine, "_AWS_BIN_DIRS", (str(tmp_path),))
+        monkeypatch.setattr(github_runner, "validate_provider_executable", lambda c: c)
+
+        assert voice_reply.resolve_polly_cli() == str(fake_aws)
+        # The converted is_available() probe site sees the same resolution.
+        assert is_available(PROVIDER_POLLY) is True
+
+    def test_none_when_cli_absent_everywhere(self, monkeypatch, tmp_path) -> None:
+        """Bare-name fallback that is not invocable maps to None — the value
+        every probe site already treats as 'unavailable'."""
+        from kiro_crew import voice_reply
+        from kiro_crew.deploy import engine
+
+        empty_bin = tmp_path / "emptybin"
+        empty_bin.mkdir()
+        monkeypatch.setenv("PATH", str(empty_bin))
+        monkeypatch.setattr(engine, "_AWS_BIN_DIRS", ())
+
+        assert voice_reply.resolve_polly_cli() is None
+        assert is_available(PROVIDER_POLLY) is False
 
 
 # ── _resolve_piper_binary() ─────────────────────────────────────────────
@@ -680,9 +728,48 @@ class TestSynthesizePiper:
 # ── _synthesize_polly() ──────────────────────────────────────────────────
 
 
+def _matching_identity(consent_mod, account: str):
+    """An async ``probe_identity`` stand-in that resolves to ``account``."""
+
+    async def _probe(_profile: str, _region: str, *, use_cache: bool = True):
+        return consent_mod.Identity(ok=True, account=account)
+
+    return _probe
+
+
+@pytest.fixture()
+def _polly_consented(tmp_path_factory, monkeypatch):
+    """Record operator consent for Polly under the default profile+region.
+
+    ``_synthesize_polly`` now refuses without one, so every test that means to
+    exercise the SYNTHESIS path has to consent first. The grant is written into
+    a throwaway data home, never the real one. Tests that assert the refusal
+    itself deliberately do not use this fixture (see ``test_aws_consent.py``).
+    """
+    home = tmp_path_factory.mktemp("consent-home")
+    monkeypatch.setenv("KIROCREW_HOME", str(home))
+    from kiro_crew import aws_consent
+    from kiro_crew.config.loader import config_dir
+
+    config_dir().mkdir(parents=True, exist_ok=True)
+    aws_consent.record_grant(
+        aws_consent.SERVICE_POLLY,
+        profile="",
+        region="",
+        account="111122223333",
+        arn="arn:aws:iam::111122223333:user/test",
+        granted_at="2026-08-21T00:00:00+00:00",
+    )
+    # The gate also verifies the LIVE account, which would spawn the AWS CLI.
+    # These cases are about synthesis, so return a matching identity instead.
+    monkeypatch.setattr(
+        aws_consent, "probe_identity", _matching_identity(aws_consent, "111122223333")
+    )
+
+
 class TestSynthesizePolly:
     @pytest.fixture(autouse=True)
-    def _passthrough_sandbox(self, monkeypatch):
+    def _passthrough_sandbox(self, monkeypatch, _polly_consented):
         # _synthesize_polly() calls wrap_argv before create_subprocess_exec.
         # wrap_argv fail-closes on any host with no OS sandbox backend (macOS 26,
         # every Windows host), which is caught and returns None. Patch to
@@ -717,6 +804,20 @@ class TestSynthesizePolly:
 
     @pytest.mark.asyncio
     async def test_profile_and_region_passed_through(self, tmp_path) -> None:
+        # The class fixture consents for the DEFAULT profile+region, and a grant
+        # is keyed on both -- so this case has to consent for the pair it
+        # actually uses. That is the gate working: consent for one account does
+        # not silently transfer to another profile or region.
+        from kiro_crew import aws_consent
+
+        aws_consent.record_grant(
+            aws_consent.SERVICE_POLLY,
+            profile="my-profile",
+            region="us-east-2",
+            account="111122223333",
+            arn="arn:aws:iam::111122223333:user/test",
+            granted_at="2026-08-21T00:00:00+00:00",
+        )
         proc = _mock_subprocess(returncode=0)
 
         captured: list[str] = []
@@ -1165,7 +1266,7 @@ class TestTextTypeAutoDetection:
     """Tests for --text-type dynamic selection (ssml vs text)."""
 
     @pytest.fixture(autouse=True)
-    def _passthrough_sandbox(self, monkeypatch):
+    def _passthrough_sandbox(self, monkeypatch, _polly_consented):
         # See TestSynthesizePolly._passthrough_sandbox.
         monkeypatch.setattr(
             "kiro_crew.voice_reply.wrap_argv", lambda argv, **k: (list(argv), None)

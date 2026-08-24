@@ -32,6 +32,10 @@ from kiro_crew.subagent import (
     SubagentManager,
 )
 
+# ``SubagentManager.spawn`` refuses -- registering no task -- while the host
+# looks short of memory, which is the runner's state, not this test's input.
+pytestmark = pytest.mark.usefixtures("healthy_host_memory")
+
 # Subagent-registry isolation is provided globally by the autouse
 # ``_isolate_subagents_dir`` fixture in ``conftest.py``.
 
@@ -47,11 +51,11 @@ class _FatalError(Exception):
 
 
 def _text_event(text: str) -> SimpleNamespace:
-    return SimpleNamespace(kind=EVENT_TEXT_CHUNK, text=text)
+    return SimpleNamespace(kind=EVENT_TEXT_CHUNK, text=text, runtime_global=False)
 
 
 def _complete_event() -> SimpleNamespace:
-    return SimpleNamespace(kind=EVENT_COMPLETE, stop_reason="end_turn")
+    return SimpleNamespace(kind=EVENT_COMPLETE, stop_reason="end_turn", runtime_global=False)
 
 
 def _mock_sessions(stream_factory) -> MagicMock:
@@ -321,6 +325,7 @@ async def test_unexpected_cancel_after_tool_activity_finalizes_without_respawn()
                 tool_kind="edit",
                 tool_call_id="tc1",
                 tool_input={},
+                runtime_global=False,
             )
             started.set()
             await asyncio.Event().wait()  # hang until cancelled — NO text ever
@@ -647,6 +652,7 @@ async def test_transient_error_after_tool_call_sends_continue_prompt():
                     tool_kind="edit",
                     tool_call_id="tc1",
                     tool_input={},
+                    runtime_global=False,
                 )
                 raise _TransientError("500 before first token")
             yield _text_event("done after tool")

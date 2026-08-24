@@ -15,15 +15,12 @@ build — the installer compresses its own already-signed executable — so that
 needs AWS credentials the shared build workflow deliberately does not hold.
 Current status:
 
-- **Published on nightly and insider** — `publish-windows.yml` writes the
-  installer, its `.blockmap` and the `latest.yml` feed to the download CDN. The
-  `latest/` alias is the human download:
+- **Published on every channel — nightly, insider and stable.** The `latest/`
+  alias is the human download:
   `https://download.crew.kiro.dev/desktop/<channel>/latest/KiroCrew-Setup.exe`.
-  **Stable has no Windows lane yet**: the stable release republishes the
-  immutable promotion bundle, whose artifact roles include no Windows installer,
-  so `WINDOWS_CHANNELS` in `auto-update.js` admits only `nightly` and `insider`
-  and a stable Windows client reports updates as unavailable rather than
-  resolving a feed nobody wrote.
+  A stable release republishes the already-signed installer it verified at
+  insider time rather than rebuilding it. If a Windows build fails, that release
+  simply ships without an installer instead of holding up the other platforms.
 - **Authenticode-signed** — signing runs during the build through AWS Signer and
   the publish lane refuses to publish bytes whose certificate table is empty,
   whose signer is not the pinned publisher, or which carry no RFC3161
@@ -42,18 +39,31 @@ Current status:
   `perMachine` is false, so the installer offers an install-mode page whose
   default is a per-user install into a directory named from the product name,
   with no UAC prompt. Choosing "for all users" on that page opts into an
-  elevated install under Program Files instead. The per-user default is what
+  elevated install under Program Files instead. The restored native flow does
+  not expose the former custom destination, desktop-shortcut, or start-with-
+  Windows controls. The per-user default is what
   keeps a nightly install (`KiroCrew Nightly`) side by side with a stable one
   rather than replacing it; nightly additionally pins its own `nsis.guid` so
-  the two channels do not share an uninstall registry key. Either mode leaves
+  the two channels do not share an uninstall registry key, and its own
+  `win.appId` so they do not share a shortcut **AppUserModelID**. That last one
+  is Windows-only on purpose: the shared `appId` is required on macOS, where
+  Squirrel.Mac validates an update against the host's designated requirement,
+  but on Windows it reaches `${APP_ID}`, which the NSIS uninstaller passes to
+  `WinShell::UninstAppUserModelId`. Shared, uninstalling one channel
+  deregisters the identity the *other* channel's desktop and Start Menu
+  shortcuts still carry, and the shell then reports that app as relocated or
+  missing even though its `.exe` is untouched. Either mode leaves
   the Kiro Crew home alone (`deleteAppDataOnUninstall` stays false, and
   `~/.kiro/crew` is outside the install directory).
 - **Guided Kiro Crew artwork** — the welcome and finish pages use the existing
   Kiro Crew logo and ghost family in the native NSIS sidebar, and intermediate
   pages retain a compact branded header. Buttons, progress, install-mode copy,
   keyboard behavior, and localization remain the standard Windows experience.
+  No custom page animation, bitmap timer, or UI-thread sleep is used; CI performs
+  a real silent install, records its duration, and fails if it exceeds 5 minutes.
 - **Uninstall removes the app and its caches, and keeps your data.** Removed:
   the install directory, the Start Menu shortcut, the uninstall registry key,
+  and any “start with Windows” Run entry left by an earlier custom installer,
   and — via the `customUnInstall` macro in `website/electron/build/installer.nsh`
   — this channel's electron-updater cache under
   `%LOCALAPPDATA%\<package-name>-updater`, which holds a full installer payload
@@ -66,7 +76,11 @@ Current status:
   channel cannot touch the other's pending download or window state. An install
   predating that split leaves a shared `kirocrew-electron-mac-updater` behind,
   which is deliberately NOT removed for the same reason — it may still belong to
-  the other channel. **Deliberately kept:** `~/.kiro/crew` — sessions, memory,
+  the other channel. **Your settings survive that rename**: the first launch after
+  it carries over your update channel, remote hosts, hotkey and window position,
+  so an Insider install is not quietly moved to Stable. A preference you have
+  already changed is never overwritten.
+  **Deliberately kept:** `~/.kiro/crew` — sessions, memory,
   the database and config. Delete it by hand to remove Kiro Crew's data too.
   Also kept, because it belongs to a different product:
   `%LOCALAPPDATA%\Kiro-Cli`.
@@ -210,11 +224,15 @@ while the other 503s. Concretely:
 | Feature | Status on Windows |
 |---------|-------------------|
 | Core gateway / chat / dashboard | works — a source install with a built `website/dist` is linked into `src/kiro_crew/static/dist` at gateway start via a **directory junction** (`platform_compat.symlink_or_junction`), which needs no privilege; a symlink there would need `SeCreateSymbolicLinkPrivilege` and would leave a non-elevated install serving the "not built" page |
+| Project skills (`<project>/.kiro/skills`) | not yet — Python on Windows does not expose handle-relative directory traversal that can reject every reparse point before resolving it. Catalog, consent and loading fail closed before canonicalizing the project path, preventing a raced junction to a UNC share from initiating SMB authentication. Global and installed skills continue to work. |
 | LLM cron jobs (the `message` kind) | works |
 | Script cron jobs | need the `agent.sandbox_allow_unsandboxed_exec` opt-in above — they run through `wrap_argv`, which fail-closes where no OS sandbox backend exists. Without it the job fails with a message naming that setting (it no longer raises an uncaught error) |
 | Command cron jobs (`sh -c "…"`) | not supported on Windows — the stored command is vetted under POSIX-sh semantics, and Windows ships no shell whose language matches: cmd.exe is not POSIX at all, and Git-for-Windows's `sh.exe` is bash and performs brace expansion that hides `cat ~/.a{w,w}s/credentials` from the vet. The job fails-closed with an explanation. Use a **script cron** or an LLM `message` cron on this platform |
 | Script hooks (Settings → Hooks) | need the `agent.sandbox_allow_unsandboxed_exec` opt-in above (like script crons — the hook command routes through `wrap_argv`, which fail-closes where no OS sandbox backend exists; without it the hook returns that message as its `error`). With the opt-in they run in **cmd.exe** language: a hook `command` runs as `%ComSpec% /c "<command>"`, so read the context env vars as `%KIROCREW_HOOK_EVENT%` / `%KIROCREW_HOOK_CONTEXT%` (not `$VAR`), and group arguments with double quotes only (cmd.exe gives `'…'` no meaning). The line reaches cmd.exe verbatim, so a quoted interpreter path with a space works. A hook authored on macOS/Linux is not portable and must be rewritten |
-| Pull-request source drawer provider fetch/check/resolve | not yet — provider CLIs require the POSIX OS-level sandbox and fail closed with a clear unsupported response |
+| Pull-request source drawer provider fetch/check/resolve | not yet — and for a different reason than it used to be. The provider-CLI **trust** check now works here (see Issue Radar below), but the drawer does not share Issue Radar's spawn: it keeps its own async, sandbox-routed one (`source_providers._run_json`), which refuses on Windows because no OS sandbox backend exists. So the blocker is the sandbox, not the binary check |
+| Issue Radar | works — its `gh` spawn is not sandbox-routed, so the trust check is the only gate, and that is answered by reading the binary's Windows ACL (`kiro_crew.windows_acl`) in place of the POSIX `st_uid` + write-bit walk, which reports nothing on this platform. Refused when any principal outside `{you, SYSTEM, Administrators, TrustedInstaller}` can replace the binary or a parent directory, when the security descriptor is unreadable, or when the gateway token is **elevated** (an elevated gateway spawns elevated children, which makes the walk vacuous). GitHub only on this platform unless `glab` is installed. **If a `gh` you trust is refused**, the override variables (`KIROCREW_ISSUE_RADAR_GH`, `KIROCREW_GH_BIN`) re-enter the same check rather than bypassing it, so the recourse is to install `gh` somewhere only you and the system can write — a per-user `%LOCALAPPDATA%` install is accepted — or to file an issue quoting the refusal, which names the offending principal or the ACE type it could not evaluate |
+| Spec Builder | works, except **Duplicate** — crash-safe copy publication pins a staging directory and uses the platform's atomic no-replace rename (`renameat2(RENAME_NOREPLACE)` on Linux, `renameatx_np(RENAME_EXCL)` on macOS). Windows provides neither that native contract nor CPython's directory-descriptor operations, so the backend reports the capability as unavailable and the dashboard omits Duplicate instead of falling back to a check-then-rename race or a junction-prone path write. Approval, per-task runs, labels, archive/restore, chat, and whole-plan execution work normally |
+| Code Review Sage | not yet — the provider-CLI trust check now passes, but its review worker hands the session `python3 sage_lib/…` commands and `python3` is not an interpreter on Windows (the name resolves to the Microsoft Store app-execution alias, or to nothing). It refuses with that reason rather than starting a review that produces no result |
 | Browser automation (`playwright-cli`) | works (`npm install -g @playwright/cli@latest`, needs Node.js 20 or newer) |
 | Vector memory / embeddings | works — embeddings run **in-process** through the vendored llama-cpp-python (`_vendor/llama_cpp_libs/win_amd64`), which loads the Qwen3-Embedding-0.6B GGUF from `~/.kiro/crew/models`. No remote endpoint, no Docker and no Ollama server is involved on any platform |
 | STT (whisper / optional cloud transcription) | works |
@@ -224,7 +242,7 @@ while the other 503s. Concretely:
 | MCP gateway (opt-in, OFF by default) | works — a named-pipe transport replaces the AF_UNIX socket, and the peer check uses `GetNamedPipeClientProcessId` + a SID comparison in place of `SO_PEERCRED`. Still opt-in: set `mcp_gateway.enabled` to turn it on |
 | Papyrus (LaTeX editor, opt-in builtin) | works, **but compiling and git need the `agent.sandbox_allow_unsandboxed_exec` opt-in above** — like chat, its spawns route through `wrap_argv`, which fail-closes where no OS sandbox backend exists. Without it, compile and clone/commit/push/pull answer a clear 422 (`compiler_sandbox_unavailable` / `git_sandbox_unavailable`) naming the remedy rather than a bare "internal error". The managed Tectonic compiler is Windows-pinned (`x86_64-pc-windows-msvc`); Windows-on-ARM has no upstream asset and keeps the manual install path |
 | Computer use — **reading** (`computer_list_apps`, `computer_get_state`) | works, still behind the operator's one keystone opt-in (Settings → Computer Use). Reads the UI Automation tree of a window and can attach a `PrintWindow` screenshot. Two Windows-specific limits: a **non-elevated gateway cannot see an elevated window** (UIPI, and the secure desktop is unreachable to any application — a security property, not a gap), and a window drawn on a swapchain surface **cannot be captured**, so WindowsTerminal returns a tree with no screenshot rather than a blank image. Walking is also markedly slower than macOS — a large Chromium window costs hundreds of milliseconds at the node budget — so raise `max_tree_nodes` deliberately |
-| Computer use — **input** (click, drag, type, key, set value, scroll, action) | works, behind the same keystone opt-in. **Element-addressed actions touch neither your cursor nor your focus** — they go through UI Automation control patterns, so the provider performs them inside the target application; prefer them, and they are what `click_method: "auto"` resolves to. The exceptions are forced by the platform: Windows has no per-process input delivery (no `CGEventPostToPid` analogue), so `type_text` / `press_key` TAKE your keyboard focus (the result says so), and a coordinate click needs `click_method: "global"` named explicitly because it moves your real cursor — `auto` refuses to resolve onto it. Every pointer gesture is confined to the authorized window first, comparing top-level handles rather than pids (one broker process fronts many packaged apps), and a drag confines both endpoints since the release is where a drop lands |
+| Computer use — **input** (click, drag, type, key, set value, scroll, action) | works, behind the same keystone opt-in. **Element-addressed actions touch neither your cursor nor your focus** — they go through UI Automation control patterns, so the provider performs them inside the target application; prefer them, and they are what `click_method: "auto"` resolves to. The exceptions are forced by the platform: Windows has no per-process input delivery (no `CGEventPostToPid` analogue), so `type_text` / `press_key` TAKE your keyboard focus (the result says so), and a coordinate click needs `click_method: "global"` named explicitly because it moves your real cursor — `auto` refuses to resolve onto it. Every pointer gesture is confined to the authorized window first, comparing top-level handles rather than pids (one broker process fronts many packaged apps), and a drag confines every point of its path since the release is where a drop lands |
 
 The not-yet items are tracked as Windows feature-parity follow-ups.
 
@@ -240,6 +258,65 @@ routes to `os.chmod(..., 0o600)` on POSIX and `icacls /inheritance:r /grant:r
 security-warning handlers in each caller fire — a naive `if IS_POSIX: os.chmod`
 guard would silently no-op on Windows, leaving secrets group/world-readable
 under NTFS.
+
+`restrict_to_owner` is file-shaped by design: its grants are deliberately
+non-inheritable (inheritance flags mean nothing on a file). A **directory**
+holding secrets must instead go through `platform_compat.restrict_dir_to_owner`
+— the directory twin — whose grants carry `(OI)(CI)` so files and
+subdirectories created inside it inherit the owner-only DACL, and which uses
+`0o700` on POSIX (a directory needs the execute bit to be traversable, which
+the file helper's `0o600` drops). `make_owner_only_dir` wraps creation
+(with parents) plus a best-effort tighten for the common case. Calling the
+file helper on a directory tightens only the directory node itself and leaves
+every file later created inside on the creating token's default DACL — the
+runtime logs a warning when it detects that misuse. Inheritance governs only
+what is created from then on: a file that already existed inside keeps its own
+DACL and — because Windows grants *Bypass Traverse Checking* to Everyone by
+default — stays reachable through the tightened parent, so repairing an
+existing install needs a per-file pass, not a parent tighten.
+
+### The memory store: why a per-file pass, not just the directory
+
+`memory.db` (semantic/episodic memories and their embeddings) is the first
+caller to need that repair pass, and it names every memory-bearing file rather
+than only the `.db`. It runs under `journal_mode=WAL`, so SQLite keeps
+`memory.db-wal` and `memory.db-shm` beside it, and a *committed* row lives in
+the `-wal` until a checkpoint moves it — locking the `.db` alone would leave
+committed memories readable under whatever DACL a pre-lockdown sidecar carries.
+The pass covers the `.db`, its `-wal`/`-shm` sidecars, and `memory.faiss` /
+`memory.ids.json` (the embedding index and its id map).
+
+`VectorMemoryStore.init()` calls `make_owner_only_dir` on the parent first, so
+everything SQLite and FAISS create from then on inherits owner-only access on
+both platforms. The per-file pass is for what already exists — a restored
+backup, a home migration, a manual edit, or simply an install predating this
+lockdown. It therefore runs on **every** init rather than only when init created
+the files: gating on creation would leave every pre-existing install permanently
+readable, which is most of them.
+
+It runs **twice**, once before `sqlite3.connect` and once after. The first call
+is what stops the schema migrations running against a file another local user
+can still write; the second covers whatever SQLite has just created.
+
+The Windows cost is up to 11 `icacls` spawns per init — one for the directory
+plus one per file on each of the two passes, and a file that does not exist
+still spawns (icacls exits non-zero and the caller warns). That is more than it
+sounds and still cheap in context: once per workspace per process, beside the
+`sqlite3.connect`, the migrations and the FAISS index load already in that
+function — and `context.get_memory_for` caches the store and is reached from a
+worker thread, not the gateway event loop.
+
+It is fail-soft (warn, keep going), which is the contract `restrict_to_owner`
+documents for its callers: memory being unavailable is a supported degraded
+state, so a read-only filesystem must not take init down.
+
+> **Scope note.** With the default `db_path`, "the directory" *is* the data home
+> (`config_dir()`), so a memory init tightens the whole home to owner-only. That
+> direction is right — the home also holds the security policy, sessions and
+> lessons, all private on the same boundary — but it is wider than memory and it
+> is the only place in the tree that does it today. `memory.py`'s FTS index
+> (`memory_index.db`) and its sidecars carry the same secrets and are **not** yet
+> covered by the per-file pass.
 
 ## File locking on Windows
 

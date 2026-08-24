@@ -6,8 +6,8 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 
 import { SETTINGS_REGISTRY } from '../../components/commandPalette/settingsRegistry.gen'
+import { localizedSettingLabel } from '../../components/commandPalette/settingsSearchCore'
 import { settingsSubtitle, settingsTabLabel } from '../../components/commandPalette/settingsTabLabel'
-import { i18nT } from '../../i18n/t'
 import CommandBarOverlay from './CommandBarOverlay'
 
 /**
@@ -51,9 +51,10 @@ function mount(onClose = vi.fn()) {
 const rowByText = (text: string) =>
   screen.getByText(text).closest('[role="option"]') as HTMLElement
 
-/** The title the overlay renders for a settings entry: catalog string when keyed. */
+/** The title the overlay renders for a settings entry — the shared resolver
+ *  (localized + fan-out suffix), same as the component. */
 const renderedTitle = (entry: (typeof SETTINGS_REGISTRY)[number]) =>
-  entry.labelKey ? i18nT(entry.labelKey) : entry.label
+  localizedSettingLabel(entry)
 
 const channelsEntry = SETTINGS_REGISTRY.find(e => e.tab === 'channels')!
 
@@ -329,6 +330,39 @@ describe('CommandBarOverlay rows', () => {
         expect(reader).not.toContain(' as Promise')
       }
     }
+  })
+
+  it('carries a focus cue on the field only when no row can hold one', () => {
+    // `aria-activedescendant` is the cue while rows exist, and it is omitted when
+    // there are none -- so the field must paint in exactly that state and stay
+    // unpainted otherwise, or the surface is either permanently boxed or, on the
+    // empty sessions view, shows a keyboard user no focus at all.
+    const src = readFileSync(
+      path.join(__dirname, 'CommandBarOverlay.tsx'),
+      'utf-8',
+    )
+    expect(src).toContain("rowCount === 0 ? ' focus-visible:ring-1 focus-visible:ring-accent/40' : ''")
+    // Unconditional forms are what produced the permanent box.
+    expect(src).not.toMatch(/placeholder:text-muted focus-visible:ring/)
+    expect(src).not.toMatch(/placeholder:text-muted focus-visible:bg/)
+  })
+
+  it('labels every row with what activating it produces', () => {
+    // Groups always render as contiguous blocks under their own header, so this is
+    // not about groups interleaving. The label earns its place because the only
+    // other per-row kind signal is the group icon, which reads only to someone who
+    // already knows it. `view` is called out separately from its group because it
+    // opens a surface inside the bar instead of acting and closing -- the one value
+    // the icon cannot convey, and the difference the reader acts on.
+    mount()
+    expect(rowByText('New Session').textContent).toContain('Command')
+    expect(rowByText('Search Sessions').textContent).toContain('View')
+    expect(rowByText('Search Sessions').textContent).not.toContain('Command')
+    expect(rowByText('Toggle Theme').textContent).toContain('Command')
+    // The arrow needs a slot on EVERY row: rendered inline it pushed a `view` row's
+    // label left by its own width and the labels stopped sharing a right edge.
+    const src = readFileSync(path.join(__dirname, 'CommandBarOverlay.tsx'), 'utf-8')
+    expect(src).toContain('shrink-0 w-[13px] flex justify-end')
   })
 
   it('reports a failed session search instead of claiming no matches', async () => {

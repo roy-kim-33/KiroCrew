@@ -6,17 +6,28 @@ export interface StatusData {
   cron_jobs: number
   subagents: number
   lessons: number
-  update_available?: boolean
   /**
-   * Can this install replace its own code? Only a git checkout can — a wheel
-   * install (the `cli.sh` managed venv) upgrades by re-running the installer, so
-   * `POST /api/update` would 409. Shipped with the availability flag so the UI
-   * can pick the right affordance without first running a check.
+   * Is a newer build available? `null`/absent means NO VERDICT — a check that
+   * never ran, or one that failed. Only `true` may light an update affordance,
+   * and only `false` alongside `update_check_status === 'succeeded'` may render
+   * "up to date". Treating a missing verdict as `false` is the bug this pair
+   * exists to prevent.
    */
-  update_self_updatable?: boolean
-  /** Did a check ever reach a verdict? Distinguishes "current" from "never checked". */
-  update_checked?: boolean
-  /** Upgrade command for an install that cannot replace itself ("" when it can). */
+  update_available?: boolean | null
+  /**
+   * Can the gateway apply an update in-process? Only a git checkout can — a wheel
+   * install (the `cli.sh` managed venv) upgrades by re-running the installer, and
+   * a desktop bundle is updated by its own updater, so `POST /api/update` would
+   * 400/409 on both. Shipped with the availability flag so the UI can pick the
+   * right affordance without first running a check.
+   */
+  update_can_apply?: boolean
+  /**
+   * How far the check itself got: `unchecked`, `checking`, `succeeded`, `failed`
+   * or `deferred` (another surface owns this install's updates).
+   */
+  update_check_status?: 'unchecked' | 'checking' | 'succeeded' | 'failed' | 'deferred'
+  /** Copyable upgrade command for an install that cannot apply in-process ("" when none). */
   update_command?: string
   /**
    * The release channel this INSTALL follows (the `channel` file `cli.sh` wrote).
@@ -27,6 +38,17 @@ export interface StatusData {
    * diverge between a channel switch and the new lane's build landing.
    */
   update_channel?: string
+  update_managed_by?: string
+  /**
+   * Commit distance from a git checkout's upstream, both directions. Diverged
+   * (both > 0) reports `update_available: false` exactly like a current
+   * checkout — the destructive apply paths must never be offered local
+   * commits — so this pair is what lets the About badge tell the two apart
+   * without waiting for a manual check. 0/0 on non-git layouts, before any
+   * check, and on older gateways (absent reads as 0).
+   */
+  update_commits_ahead?: number
+  update_commits_behind?: number
   update_progress?: { step: string; detail: string } | null
   version?: string
   /**
@@ -62,6 +84,48 @@ export interface StatusData {
   governance?: 'active' | 'degraded' | 'disabled' | 'unknown'
 }
 
+/**
+ * GET /api/update/check — the update capability contract for this install
+ * (`_update_info` in `dashboard/handlers/updates.py` plus the request-scoped
+ * extras). Every field is optional so an older gateway that predates one still
+ * type-checks; consumers treat absence as "unknown", never as a verdict.
+ */
+export interface UpdateCheckResult {
+  supported?: boolean
+  managed_by?: string
+  mode?: string
+  can_download?: boolean
+  can_apply?: boolean
+  requires_restart?: boolean
+  channel?: string
+  latest_version?: string
+  changes?: string
+  check_status?: 'unchecked' | 'checking' | 'succeeded' | 'failed' | 'deferred'
+  update_available?: boolean | null
+  version_newer?: boolean
+  /**
+   * Commit distance from the tracked git upstream, both directions. A diverged
+   * checkout (both counts > 0) reports `update_available: false` exactly like a
+   * current one — the destructive apply path must never be offered its local
+   * commits — so this pair is the only wire signal that "no update" means
+   * "rebase or merge" rather than "up to date". The diverged condition is
+   * derived at the render site (`commits_ahead > 0 && commits_behind > 0`), not
+   * shipped as a redundant server boolean. Both 0 outside a successful
+   * git-checkout check.
+   */
+  commits_ahead?: number
+  commits_behind?: number
+  error_code?: string | null
+  unavailable_reason?: string | null
+  remediation?: { kind?: string; message?: string; command?: string } | null
+  current_version?: string
+  auto_update?: boolean
+  minimum_version_enforced?: string
+  update_required?: boolean
+  /** Legacy alias some older payloads carried; `latest_version` is authoritative. */
+  version?: string
+}
+
 export interface SystemData {
   hostname: string; os: string; arch: string; cpu_count: number
   load_1m: number; load_5m: number; load_15m: number
@@ -79,7 +143,9 @@ export interface SystemData {
   net_rx_kbs: number; net_tx_kbs: number
   disk_total_gb?: number; disk_free_gb?: number
   python: string; pid: number; cwd: string
-  proc_mem_mb: number; proc_cpu_pct: number
+  /** Live resident set size. `proc_mem_peak_mb` is the high-water mark since
+   *  the gateway started, so it never falls; do not render it as live memory. */
+  proc_mem_mb: number; proc_mem_peak_mb?: number; proc_cpu_pct: number
   child_processes: number; thread_count: number
   mcp_processes?: { sandbox: number; kiro_cli: number; builder_mcp: number }
   mcp_total?: number
@@ -126,6 +192,31 @@ export interface SessionStorageCleanup {
   /** Empty on a dry run — nothing was staged, so there is no batch to undo. */
   batch_id?: string
   dry_run?: boolean
+}
+
+/**
+ * One empty of the trash, running or recently finished.
+ *
+ * POST /api/system/session-storage/empty answers 202 with this; GET on the same
+ * path returns the current one, and stops returning a finished one once it has gone
+ * stale — so an outcome is never presented as current days later. The gateway keeps
+ * a single slot, so a second empty is refused with 409 and this same shape rather
+ * than queued.
+ *
+ * `total_bytes` comes from the staged manifests — the same figure the trash row
+ * showed — so it is the denominator for `freed_bytes` and never a remeasurement.
+ */
+export interface SessionStorageEmptyJob {
+  job_id: string
+  running: boolean
+  total_bytes: number
+  freed_bytes: number
+  /** Empty unless the delete was refused or stopped on an error. */
+  error: string
+  /** Reason codes for batches deliberately KEPT. A kept batch is a refusal: the
+   *  user asked for it to be destroyed and it is still there, so an empty `error`
+   *  with a non-empty `skipped` is not a success. */
+  skipped: string[]
 }
 
 /* ── Session inventory (contract §1–§3) ── */
@@ -215,6 +306,11 @@ export interface CronJob {
   script?: string | null; command?: string | null; last_result?: string | null; last_error?: string | null
   is_running?: boolean; running_since?: number | null
   folder_id?: string
+  /** Chat session that owns this job — ownership decides chat-side reachability
+   * (cron_list only lists a session its own jobs). Null for an ownerless job,
+   * which is invisible to every chat session and manageable only from the
+   * Schedule page or the CLI. */
+  session_key?: string | null
 }
 
 export interface Lesson {
@@ -1185,6 +1281,28 @@ export interface WebAppTeardown {
   method: string;
   handle: string;
   reversible: boolean;
+}
+
+/** One row of `GET /api/workflows/runs` — the compact run view (no events).
+ *
+ *  This is the AUTHORITATIVE status of a dynamic-workflow run: the live
+ *  `workflow_run_event` WS stream is one-shot, so a client that was closed,
+ *  asleep, or disconnected when a run ended never sees its terminal frame.
+ *  Field names are the backend's (`RunHandle.snapshot`), snake_case on the wire.
+ */
+export interface WorkflowRunSummary {
+  run_id: string;
+  name?: string;
+  /** `running` | `finished` | `failed` | `cancelled`. Typed loosely on purpose —
+   *  an unrecognised value is treated as "no evidence" rather than coerced. */
+  status?: string;
+  error?: string | null;
+  /** Originating chat session, `""` for a UI-launched run that belongs to no chat. */
+  session_key?: string;
+  /** Title of the most recent `phase_started` event. */
+  phase?: string;
+  /** Most recent narrator `log` message. */
+  last_log?: string;
 }
 
 export interface WebAppMetadata {

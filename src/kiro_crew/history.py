@@ -19,6 +19,7 @@ import threading
 import time as _time
 from collections import OrderedDict
 from collections.abc import Callable, Container, Iterator
+from collections.abc import Set as AbstractSet
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Generic, NamedTuple, TypeVar
@@ -570,6 +571,7 @@ def append_if_absent_off_loop(
     *,
     agent: str | None = None,
     cls: str = "",
+    mid: str | None = None,
 ) -> Any:
     """Idempotent, loop-safe variant of :func:`append_off_loop`.
 
@@ -590,7 +592,7 @@ def append_if_absent_off_loop(
     """
 
     def _do() -> None:
-        conversation_log.append_if_absent(key, role, content, agent=agent, cls=cls)
+        conversation_log.append_if_absent(key, role, content, agent=agent, cls=cls, mid=mid)
 
     try:
         loop = asyncio.get_running_loop()
@@ -2228,6 +2230,32 @@ class ConversationLog:
         #: event loop may mark it stale — an unsynchronized rebuild/read/clear
         #: produced a transient empty index or ``AttributeError``.
         self._tab_id_index: dict[str, list[str]] | None = None
+        #: session key → (mtime, tab_id) memo feeding the rebuild above.
+        #: Deliberately an unbounded plain dict, NOT an _LRUCache: the rebuild is
+        #: a cyclic scan over every dashboard file, and a bounded cache under a
+        #: cyclic scan larger than the bound has a 0% hit rate (see
+        #: _SearchTextCache's docstring). Values are 12-char ids, so 1k sessions
+        #: is tens of KB.
+        #:
+        #: TWO guards, and neither is sufficient alone. The explicit pop in
+        #: _invalidate_cache covers writes THROUGH this class from THIS instance:
+        #: those restore the pre-write mtime (_restore_mtime), so a stamp alone
+        #: would not see them. The stamp covers rewrites that never reach that
+        #: pop -- a hand-edited tab_id, or a write through ANOTHER instance,
+        #: whose pop lands on its own memo and leaves ours intact.
+        #:
+        #: The stamp is (st_mtime_ns, st_size, st_ino), all from one stat. Size
+        #: rides along because timestamp granularity is coarse (worse on
+        #: Windows). ns rather than float seconds, and st_ino as well, because
+        #: another instance's equal-length tab_id rewrite preserves mtime and
+        #: size both -- see the cross-instance test.
+        self._tab_id_by_key: dict[str, tuple[tuple[int, int, int], str]] = {}
+        #: Bumped by _invalidate_cache. The rebuild samples it before reading a
+        #: file's metadata and declines to memoize if it moved, so a store cannot
+        #: land after a concurrent writer's pop and resurrect a stale id.
+        #: _invalidate_cache deliberately does not take self._lock, so the
+        #: rebuild cannot exclude it.
+        self._tab_id_generation = 0
         #: Coarse instance lock protecting the lazily-built ``_tab_id_index``
         #: rebuild/read/clear. The message/metadata/recent LRUs are each
         #: internally locked; this guards the shared mutable state that lives
@@ -2716,6 +2744,7 @@ class ConversationLog:
         agent: str | None = None,
         tab_id: str | None = None,
         cls: str = "",
+        mid: str | None = None,
     ) -> None:
         """Append a message with optional provenance to the session log.
 
@@ -2723,6 +2752,18 @@ class ConversationLog:
         carries one (``_ChatSlot.append``) but this durable copy had nowhere to
         put it, so any class-borne distinction silently vanished the moment a
         session's rows had to be replayed from disk after a restart.
+
+        *mid* persists the row's delivery identity as ``meta.mid`` — the SAME
+        field shape the dashboard slot save writes
+        (``chat_persistence._build_message_entry`` copies the window row's
+        ``meta`` dict to disk). A dual-writer that reflects a message in the
+        in-memory slot (``_ChatSlot.append``, which mints the id) AND persists
+        it here must pass that minted id, so both copies carry one identity and
+        the bounded-read reconciliation (``_append_unflushed_tail``'s
+        ``meta.mid`` walk) recognises the durable copy instead of treating the
+        window copy as still owed. Optional: a row appended without one carries
+        no ``meta`` at all, which is what pre-id transcripts hold — readers keep
+        their id-less fallback for exactly those rows.
 
         If the session file does not yet exist, it will be created with an
         initial metadata line.  When *agent* is supplied, the agent name is
@@ -2782,6 +2823,14 @@ class ConversationLog:
                 msg["source_thread"] = source_thread
             if source_user:
                 msg["source_user"] = source_user
+            if isinstance(mid, str) and mid:
+                # ``meta`` holding ``mid`` is the identity shape every reader of
+                # this file already matches on (the slot save writes it, the
+                # bounded-read walk consumes it); a second spelling would be
+                # invisible to both. Only a non-empty ``str`` counts, matching
+                # the read side — persisting any other shape would store an id
+                # the reader is structurally unable to honour.
+                msg["meta"] = {"mid": mid}
 
             # Session transcripts are intentionally local plaintext JSONL (the
             # documented storage format), not a credential/secret store.
@@ -2812,11 +2861,14 @@ class ConversationLog:
         agent: str | None = None,
         tab_id: str | None = None,
         cls: str = "",
+        mid: str | None = None,
     ) -> bool:
         """Append a message only if an identical one is not already persisted.
 
-        Returns ``True`` if the message was written, ``False`` if a message
-        with the same ``(role, content)`` already exists on disk.
+        Returns ``True`` if the message was written, ``False`` if it is already
+        on disk — judged by ``(role, content)`` when the caller supplies no
+        *mid*, and by ``(role, content)`` plus the SAME ``meta.mid`` when it
+        does (see below).
 
         The disk check and the append run together under ``_locked`` so they
         are ATOMIC against a concurrent writer of the same session file — in
@@ -2830,7 +2882,19 @@ class ConversationLog:
         agent turns. This is the workflow-result / cron-result double-append
         race: the read-modify-write must be one locked critical section, not a
         separate unlocked existence check followed by a later append.
+
+        What counts as "already persisted" depends on whether the caller holds
+        an identity. Without *mid*, any row with the same ``(role, content)``
+        does — body equality is all an id-less writer can check. WITH *mid*,
+        only a body-equal row carrying the SAME ``meta.mid`` does: that row is
+        this very message, landed by the slot save or an earlier attempt of
+        this write. A body-equal row under another id (or none) is a DIFFERENT
+        occurrence that happens to repeat the text — an id-carrying twin of an
+        earlier injection, or a pre-id legacy row — and skipping on it would
+        drop THIS occurrence's only durable copy: the in-memory window is lost
+        on restart, so nothing would replay the newer message.
         """
+        supplied_mid = mid if isinstance(mid, str) and mid else None
         with self._locked(key):
             if self._path(key).exists():
                 # Compare against the form ``append`` actually stores: the
@@ -2839,19 +2903,26 @@ class ConversationLog:
                 # that contained a credential and would append it twice.
                 persisted = _redact_at_write_boundary(role, content)
                 for m in self._read_messages(key):
-                    if m.get("role") == role and m.get("content") == persisted:
+                    if m.get("role") != role or m.get("content") != persisted:
+                        continue
+                    if supplied_mid is None:
+                        return False
+                    m_meta = m.get("meta")
+                    if isinstance(m_meta, dict) and m_meta.get("mid") == supplied_mid:
                         return False
             # Reentrant: ``append`` re-enters ``_locked`` for the same key on
             # this thread (RLock + refcounted flock), so the write stays inside
-            # the critical section we already hold.
-            self.append(key, role, content, agent=agent, tab_id=tab_id, cls=cls)
+            # the critical section we already hold. The skip paths above leave
+            # the persisted rows untouched — an id is never retrofitted onto a
+            # row already on disk.
+            self.append(key, role, content, agent=agent, tab_id=tab_id, cls=cls, mid=mid)
             return True
 
     def recent(
         self,
         key: str,
         max_messages: int = 20,
-        roles: set[str] | None = None,
+        roles: AbstractSet[str] | None = None,
         *,
         exclude_last_n: int = 0,
     ) -> list[dict]:
@@ -2888,7 +2959,7 @@ class ConversationLog:
         self,
         key: str,
         max_messages: int = 20,
-        roles: set[str] | None = None,
+        roles: AbstractSet[str] | None = None,
         *,
         exclude_last_n: int = 0,
     ) -> list[dict]:
@@ -3922,7 +3993,7 @@ class ConversationLog:
                     continue
                 try:
                     data = json.loads(line)
-                except (json.JSONDecodeError, ValueError):
+                except ValueError:
                     continue
                 if not isinstance(data, dict) or data.get("_type") == "metadata":
                     continue
@@ -4063,7 +4134,7 @@ class ConversationLog:
                     for _, line in zip(range(5), f):
                         try:
                             d = json.loads(line.strip())
-                        except (json.JSONDecodeError, ValueError):
+                        except ValueError:
                             continue
                         if d.get("_type") == "metadata" and is_incognito_transcript(
                             d.get("memory_mode")
@@ -4132,18 +4203,102 @@ class ConversationLog:
 
         Caller MUST hold ``self._lock`` — this replaces the shared
         ``_tab_id_index`` mapping.
+
+        Each file's tab_id is memoized in ``_tab_id_by_key`` under a
+        ``(st_mtime_ns, st_size, st_ino)`` stamp, so a file unchanged since the last rebuild
+        costs a ``stat`` instead of an ``open`` + ``readline`` + ``json.loads``.
+        A rebuild still runs on the first chained read, and whenever
+        ``note_tab_id`` falls back to invalidating instead of updating one entry
+        in place (no tab_id, an already-stale index, or a tab_id whose first
+        file this save just created), so the memo pays for itself on those.
+        Before that in-place update landed, ``append`` invalidated the index
+        unconditionally and one sent message re-read every session file on the
+        event loop.
+
+        TWO guards, because neither is sufficient alone. A write THROUGH this
+        class from THIS instance restores the pre-write mtime (see
+        :func:`_restore_mtime`, which exists so housekeeping does not reorder
+        ``list_sessions``), so the stamp cannot see it — ``_invalidate_cache``
+        pops the memo instead, on the line after the restore. Anything that
+        never reaches that pop is the stamp's job: a write AROUND the class, and
+        a write through ANOTHER instance of this class, whose pop lands on its
+        own memo and leaves ours untouched. That last case is why the stamp
+        carries ``st_mtime_ns`` and ``st_ino`` and not just ``(mtime, size)`` —
+        an equal-length ``tab_id`` rewrite preserves both mtime and size. Either
+        guard alone would keep serving a stale tab_id and silently drop that
+        session from its chain — the same vanished-history failure the removed
+        ``[]`` sentinel used to cause.
         """
         index: dict[str, list[str]] = {}
         for path in sorted(self._dir.glob(_TAB_ID_INDEX_GLOB)):
+            # Both derivations come from main's shared helpers rather than being
+            # respelled here: ``key`` feeds the memo AND the index append below,
+            # and ``note_tab_id`` looks entries up through the same helper, so a
+            # second copy would drift and its lookup would silently miss an
+            # entry that is really present.
+            key = _index_key_for_stem(path.stem)
             try:
-                with path.open(encoding="utf-8") as f:
-                    first_line = f.readline()
-                m = json.loads(first_line)
-                tid = m.get("tab_id")
-                if tid:
-                    index.setdefault(tid, []).append(_index_key_for_stem(path.stem))
-            except Exception:
+                st = path.stat()
+            except OSError:
                 continue
+            # Three terms, all off the one stat above, because the pop below
+            # only ever reaches the memo of the instance that did the writing:
+            # another instance's write restores the mtime AND leaves the size
+            # identical (a tab_id is fixed-length), so mtime+size alone serve a
+            # stale id. mtime_ns rather than mtime because _restore_mtime puts
+            # the time back through a float, which cannot carry ns; st_ino moves
+            # too, since a metadata rewrite is atomic_write (temp + os.replace),
+            # and it holds even if _restore_mtime later becomes ns-exact.
+            stamp = (st.st_mtime_ns, st.st_size, st.st_ino)
+            cached = self._tab_id_by_key.get(key)
+            if cached is not None and cached[0] == stamp:
+                tid = cached[1]
+            else:
+                # Sample the generation BEFORE the read: if a writer pops this key
+                # while we are reading, the value we got is already stale and must
+                # not be memoized. stamp is also the pre-read one, so a write that
+                # lands mid-read leaves a value that fails the guard next time.
+                generation = self._tab_id_generation
+                # We are on the MISS path, so this file changed since we
+                # memoized it -- or we never memoized it at all. _meta_cache is
+                # keyed on float mtime ALONE, which is strictly weaker than our
+                # stamp: a rewrite that restores the mtime and keeps the size
+                # compares EQUAL there and hands back the pre-write line, so
+                # widening the stamp alone would still serve a stale tab_id from
+                # this second layer. Pop UNCONDITIONALLY, because the cold-memo
+                # case is the dangerous one: get_metadata and the consolidation
+                # counters warm _meta_cache without ever touching this memo, and
+                # a stale line served there gets memoized below under the NEW,
+                # correct-looking stamp -- after which the warm path never
+                # re-reads it and the session stays off its chain for good.
+                # Costs one reread for a file warm here but cold in the memo; the
+                # warm path (stamp hit) returns above, so the win is unaffected.
+                self._meta_cache.pop(key, None)
+                try:
+                    meta, readable = self._read_metadata_status(key)
+                except Exception:
+                    continue
+                # _read_metadata_status, NOT _read_metadata: the latter drops the
+                # readability flag, so a transient failure (an AV scanner holding
+                # a freshly appended file, where stat succeeds but open does not)
+                # arrives as {} and would be memoized below as a definitive "no
+                # tab_id" against an unchanged stamp -- dropping the session from
+                # its chain until its next write. Retry on the next rebuild.
+                if not readable:
+                    continue
+                raw = meta.get("tab_id")
+                # "" memoizes "no tab_id at this stamp". Without it a session
+                # lacking one is re-read every rebuild and re-enters _meta_cache,
+                # evicting what other code paths in this process warmed (it is
+                # per-instance, not process-shared). A non-str tab_id reaches
+                # here only from corrupt metadata (and unhashable would abort the
+                # rebuild), so it folds into the same sentinel.
+                tid = raw if isinstance(raw, str) else ""
+                if self._tab_id_generation == generation:
+                    self._tab_id_by_key[key] = (stamp, tid)
+            if not tid:
+                continue
+            index.setdefault(tid, []).append(key)
         self._tab_id_index = index
 
     def invalidate_tab_id_cache(self) -> None:
@@ -4747,7 +4902,7 @@ class ConversationLog:
     _TAIL_MAX_GROWTHS = 6
 
     def _recent_via_tail(
-        self, key: str, max_messages: int, roles: set[str] | None
+        self, key: str, max_messages: int, roles: AbstractSet[str] | None
     ) -> list[dict] | None:
         """Return the formatted recent window via a tail read, or None to defer.
 
@@ -4801,7 +4956,7 @@ class ConversationLog:
         return [dict(m) for m in formatted]
 
     @staticmethod
-    def _recent_cache_key(key: str, max_messages: int, roles: set[str] | None) -> str:
+    def _recent_cache_key(key: str, max_messages: int, roles: AbstractSet[str] | None) -> str:
         """Build a stable ``_recent_cache`` key from the recent() parameters.
 
         ``\\x00`` cannot appear in a session key, so it is an unambiguous field
@@ -4812,7 +4967,7 @@ class ConversationLog:
         return f"{key}\x00{max_messages}\x00{roles_part}"
 
     def _read_tail_messages(
-        self, path: Path, max_messages: int, roles: set[str] | None
+        self, path: Path, max_messages: int, roles: AbstractSet[str] | None
     ) -> list[dict]:
         """Read the last *max_messages* messages by seeking to the file tail.
 
@@ -5051,6 +5206,13 @@ class ConversationLog:
         for ident in idents:
             self._msg_cache.pop(ident, None)
             self._meta_cache.pop(ident, None)
+            # The tab_id memo's mtime guard cannot see a write that goes through
+            # this class, because those restore the pre-write mtime. This pop is
+            # what does -- under every spelling, for the same reason as the rest:
+            # the rebuild keys its memo off the sanitized filename stem, so a
+            # single-spelling pop would leave an alias-keyed memo serving a stale
+            # tab_id under the restored mtime.
+            self._tab_id_by_key.pop(ident, None)
             # The folded search blob is derived from the messages, so it goes
             # stale exactly when they do. Its own mtime guard is not enough
             # here: the housekeeping rewrites below restore the pre-write
@@ -5068,6 +5230,10 @@ class ConversationLog:
             # _restore_mtime, so the recent cache's mtime guard alone would let
             # a stale window survive a content change.
             self._recent_cache.pop_prefix(f"{ident}\x00")
+        # Sampled by the rebuild before it reads a file's metadata, so a store
+        # cannot land after the pops above and resurrect a stale id. Bumped once
+        # per invalidation: it is a single counter, not per-identity.
+        self._tab_id_generation += 1
 
     #: Bytes read from the end of a session file for the last-message preview.
     #: One tail block comfortably covers several trailing JSONL lines without
@@ -5319,7 +5485,7 @@ class ConversationLog:
                     continue
                 try:
                     normalized = json.dumps(json.loads(ln), sort_keys=True)
-                except (json.JSONDecodeError, ValueError):
+                except ValueError:
                     dropped.append(ln)  # corrupted line → archive it
                     continue
                 if normalized not in kept_serialized:

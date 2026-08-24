@@ -30,6 +30,7 @@ from kiro_crew.apps.bridges import (
     _safe_link_name,
     deregister_app,
     load_app_cron_defs,
+    refresh_app_agents,
     register_app,
     register_app_crons_with_service,
 )
@@ -321,6 +322,30 @@ class TestAgentRegistration:
 
         assert link.is_file(), "the working config must survive a failed rewrite"
         assert link.read_text(encoding="utf-8") == good, "…with its old contents intact"
+
+    @pytest.mark.parametrize("content", ["[1, 2, 3]", "42", "null", "true", '"a string"'])
+    def test_a_valid_json_non_object_agent_spec_is_skipped(
+        self, tmp_path, app_env, content
+    ):
+        """A spec that is valid JSON but not an object parses fine, so the
+        JSONDecodeError guard never fires — but ``.get`` on the parsed value
+        would raise AttributeError and take down the whole registration pass.
+        Same disposition as the unreadable case: skip that agent, register
+        nothing for it, and do not crash.
+        """
+        src = _make_app_source(tmp_path)
+        install_app(src)
+        manifest = AppManifest.from_json_file(
+            app_env["home"] / "apps" / "test-app" / APP_MANIFEST_FILENAME
+        )
+        app_root = app_env["home"] / "apps" / "test-app"
+        (app_root / "agents" / "my-agent.json").write_text(content, encoding="utf-8")
+
+        registered = _register_agents("test-app", manifest, app_root)
+
+        assert registered == []
+        link = app_env["kiro_agents"] / "test-app--my-agent.json"
+        assert not link.exists(), "a spec that was never understood must not be materialized"
 
     def test_a_legacy_symlink_is_still_replaced(self, tmp_path, app_env):
         """A symlink from an older KiroCrew is dropped and replaced with a real file."""
@@ -697,6 +722,43 @@ class TestTopLevel:
         assert len(result.skills) == 1
         assert len(result.crons) == 1
         assert result.errors == []
+
+    def test_register_app_reports_zero_registered_when_agent_source_missing(
+        self, tmp_path, app_env
+    ):
+        # A manifest that DECLARES agents but whose agent source is absent /
+        # unreadable materializes none. That must surface as a visible error
+        # (which reconcile counts), not a silent 0-agent success.
+        src = _make_app_source(tmp_path)
+        install_app(src)
+        # Drop the declared agent's source from the installed snapshot.
+        (app_env["home"] / "apps" / "test-app" / "agents" / "my-agent.json").unlink()
+
+        result = register_app("test-app")
+
+        assert result.agents == []
+        assert any("0 of" in error and "test-app" in error for error in result.errors)
+
+    def test_refresh_app_agents_denied_scrubs_and_registers_nothing(
+        self, tmp_path, app_env, monkeypatch
+    ):
+        # An app whose execution admission was revoked must NOT be re-materialized
+        # by the from-source recovery path: refresh_app_agents must honor the same
+        # gate register_app does -- scrub any stale agent spec and register nothing
+        # -- or a revoked app's agent (and its merged MCP servers) becomes
+        # dispatchable again.
+        import kiro_crew.apps.execution as execution_mod
+
+        src = _make_app_source(tmp_path)
+        install_app(src)
+        assert refresh_app_agents("test-app")  # admitted: materializes, returns names
+        assert any(app_env["kiro_agents"].iterdir())
+
+        monkeypatch.setattr(execution_mod, "third_party_execution_allowed", lambda: False)
+        refreshed = refresh_app_agents("test-app")
+
+        assert refreshed == []
+        assert not any(app_env["kiro_agents"].iterdir())
 
     def test_install_while_execution_denied_registers_nothing(self, tmp_path, app_env, monkeypatch):
         import kiro_crew.apps.execution as execution_mod
@@ -3296,6 +3358,33 @@ class TestPruneAbortsOnUnreadableAgent:
 
         bridges_mod._prune_stale_app_resources("test-app", manifest, app_root)
         assert keep.is_file(), "prune must abort — not delete a config over an unreadable source"
+
+    @pytest.mark.parametrize("content", ["[1, 2, 3]", "42", "null", "true", '"a string"'])
+    def test_a_valid_json_non_object_agent_spec_aborts_the_agent_prune(
+        self, tmp_path, app_env, monkeypatch, content
+    ):
+        """Valid JSON that is not an object parses fine, so the JSONDecodeError
+        guard never fires — but ``.get`` on the parsed value would raise
+        AttributeError. A spec that cannot be read as an object is the same
+        cannot-read != removed situation: the agent must be RETAINED (treated
+        as present), never pruned out of its last-good materialized config.
+        """
+        from kiro_crew.apps import bridges as bridges_mod
+
+        src = _make_app_source(tmp_path)
+        install_app(src)
+        manifest = AppManifest.from_json_file(
+            app_env["home"] / "apps" / "test-app" / APP_MANIFEST_FILENAME
+        )
+        app_root = app_env["home"] / "apps" / "test-app"
+        # A materialized config that MUST survive if the prune aborts.
+        keep = app_env["kiro_agents"] / "test-app--my-agent.json"
+        keep.write_text('{"name": "my-agent"}', encoding="utf-8")
+        # Make the declared agent source valid JSON but not an object.
+        (app_root / "agents" / "my-agent.json").write_text(content, encoding="utf-8")
+
+        bridges_mod._prune_stale_app_resources("test-app", manifest, app_root)
+        assert keep.is_file(), "prune must retain the agent — a non-object spec is unreadable, not removed"
 
 
 class TestMalformedConfigIsNotClobbered:

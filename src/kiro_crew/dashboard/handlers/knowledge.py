@@ -54,6 +54,7 @@ from kiro_crew.knowledge.retrieval import HybridRetriever
 from kiro_crew.knowledge.spend import source_spend
 from kiro_crew.knowledge.sync import SyncScheduler
 from kiro_crew.knowledge.watcher import KnowledgeWatcher
+from kiro_crew.messaging.raster import SNIFF_BYTES
 from kiro_crew.security import is_sensitive_path
 from kiro_crew.sel import sel
 
@@ -537,18 +538,59 @@ async def get_related_items(request: web.Request) -> web.Response:
 
 
 async def get_full_graph(request: web.Request) -> web.Response:
-    """GET /api/knowledge/graph -- full entity graph (top N by connections)."""
+    """GET /api/knowledge/graph -- full entity graph (top N by connections).
+
+    Optional query params:
+      limit: max nodes (1-200, default 100)
+      source_id: comma-separated source IDs to filter entities by. When set,
+        only entities mentioned in items belonging to those sources are included.
+    """
     store = _store(request)
     try:
         limit = min(200, max(1, int(request.query.get("limit", 100) or 100)))
     except ValueError:
         return web.json_response({"error": "invalid limit"}, status=400)
-    nodes_by_degree = sorted(store.graph.nodes, key=lambda n: store.graph.degree(n), reverse=True)[:limit]
+
+    # Source filter: restrict to entities mentioned in items from specific sources
+    source_id_param = request.query.get("source_id", "").strip()
+    if source_id_param:
+        source_ids = [s.strip() for s in source_id_param.split(",") if s.strip()]
+        if not source_ids:
+            return web.json_response({"nodes": [], "edges": []})
+        placeholders = ",".join("?" * len(source_ids))
+        # Find entity IDs mentioned in items belonging to the given sources.
+        # Items belong to a source via items.source_id (ownership) OR via
+        # source_locations.source_id (deduplication — item survives in another
+        # source after a duplicate collapse).
+        rows = await asyncio.to_thread(
+            lambda: store.db.execute(
+                f"SELECT DISTINCT m.entity_id FROM mentions m "  # noqa: S608
+                f"JOIN items i ON m.item_id = i.id "
+                f"WHERE i.status = 'active' AND ("
+                f"  i.source_id IN ({placeholders})"
+                f"  OR i.id IN ("
+                f"    SELECT sl.item_id FROM source_locations sl"
+                f"    WHERE sl.source_id IN ({placeholders})"
+                f"  )"
+                f")",
+                source_ids + source_ids,
+            ).fetchall()
+        )
+        allowed_entities = {row["entity_id"] for row in rows}
+        if not allowed_entities:
+            return web.json_response({"nodes": [], "edges": []})
+        # Rank allowed entities by degree, take top N
+        nodes_by_degree = sorted(
+            allowed_entities, key=lambda n: store.graph.degree(n) if store.graph.has_node(n) else 0, reverse=True
+        )[:limit]
+    else:
+        nodes_by_degree = sorted(store.graph.nodes, key=lambda n: store.graph.degree(n), reverse=True)[:limit]
+
     if not nodes_by_degree:
         return web.json_response({"nodes": [], "edges": []})
     node_set = set(nodes_by_degree)
     nodes = [{"id": n, "name": store.graph.nodes[n].get("name"), "type": store.graph.nodes[n].get("entity_type")}
-             for n in node_set]
+             for n in node_set if store.graph.has_node(n)]
     edges = [{"source": u, "target": v, "type": d.get("relation_type"), "weight": d.get("weight")}
              for u, v, d in store.graph.edges(data=True) if u in node_set and v in node_set]
     return web.json_response({"nodes": nodes, "edges": edges})
@@ -1359,7 +1401,7 @@ async def ingest_file(request: web.Request) -> web.Response:
     try:
         total_size = 0
         # Capture the leading bytes so the claimed extension can be verified
-        # against the file signature; 16 bytes covers every prefix in the
+        # against the file signature; SNIFF_BYTES covers every signature in the
         # sibling gate (PNG magic is 8, WEBP needs bytes 8:12, zip/PDF fewer).
         head = bytearray()
         while True:
@@ -1372,8 +1414,8 @@ async def ingest_file(request: web.Request) -> web.Response:
                 Path(tmp.name).unlink(missing_ok=True)
                 return web.json_response(
                     {"error": f"file too large (max {_MAX_INGEST_FILE_SIZE // (1024 * 1024)} MB)"}, status=413)
-            if len(head) < 16:
-                head.extend(chunk[: 16 - len(head)])
+            if len(head) < SNIFF_BYTES:
+                head.extend(chunk[: SNIFF_BYTES - len(head)])
             tmp.write(chunk)
         tmp.close()
 

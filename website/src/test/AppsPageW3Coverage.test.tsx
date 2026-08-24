@@ -120,7 +120,6 @@ function renderPage() {
           <Route path="/apps" element={<AppsPage />} />
           <Route path="/apps/detail/:name" element={<DetailProbe />} />
           <Route path="/apps/:name" element={<DetailProbe />} />
-          <Route path="/secretary-ui" element={<div data-testid="app-ui-route" />} />
         </Routes>
       </MemoryRouter>
     </QueryClientProvider>,
@@ -372,12 +371,17 @@ describe('AppsPage — query failures and empty states', () => {
 })
 
 describe('AppsPage — Library actions', () => {
-  it('opens the app UI page from the card and the detail page from its name', async () => {
+  it('opens the app at its AppHost route from the card, and the detail page from its name', async () => {
     renderPage()
     await catalogReady()
     goLibrary()
+    // Open must resolve through the same appNavTarget derivation the sidebar and
+    // command palette use: a third-party (non-builtin) app is AppHost-routed at
+    // /apps/<name>, NOT its raw manifest page route (which only a native builtin
+    // serves, and which otherwise dead-ends at BuiltinAppRoute -> /chat).
     fireEvent.click(await screen.findByRole('button', { name: 'Open' }))
-    expect(await screen.findByTestId('app-ui-route')).toBeInTheDocument()
+    const probe = await screen.findByTestId('detail-route')
+    expect(probe).toHaveAttribute('data-path', '/apps/secretary')
   })
 
   it('routes to the detail page when the card name is clicked', async () => {
@@ -578,14 +582,20 @@ describe('AppsPage — editorial layer wiring', () => {
     expect(await screen.findByTestId('detail-route')).toHaveAttribute('data-path', '/apps/detail/pets')
   })
 
-  it('enables from the spotlight and Gets from the feature card', async () => {
+  it('enables from the lead card and Gets from a row card', async () => {
     // Pets sorts ahead of Zeta App (both verified), so the switched-off builtin
-    // takes the spotlight and the uninstalled core app takes the feature card.
+    // takes the derived `full` lead; Zeta App and Zulu Utility fill the derived
+    // `row` (which needs TWO cards -- with one leftover pick the lead stands
+    // alone and Zeta would only render as a list row).
     listApps.mockResolvedValue([BUILTIN_OFF])
     listRegistry.mockResolvedValue({
       apps: [
         {
           name: 'zeta-app', displayName: 'Zeta App', author: 'kirocrew', description: 'Later in the alphabet.',
+          version: '1.0.0', tags: ['github'], installed: false, provenance: 'core',
+        },
+        {
+          name: 'zulu-utility', displayName: 'Zulu Utility', author: 'kirocrew', description: 'Fills the second row slot.',
           version: '1.0.0', tags: ['github'], installed: false, provenance: 'core',
         },
         // Explore renders server rows, so the installed built-in reaches the

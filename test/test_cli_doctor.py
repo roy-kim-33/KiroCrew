@@ -7,8 +7,11 @@ command on Linux where there is no brew.
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
+
+import pytest
 
 from kiro_crew import cli_doctor
 
@@ -42,11 +45,11 @@ class TestFixHint:
 class TestDataHome:
     """`kirocrew doctor` Data Home section — location + leftover legacy home."""
 
-    def test_legacy_present_says_will_retry(self, monkeypatch, tmp_path: Path, capsys) -> None:
-        # A leftover ~/.kirocrew (a live gateway held it, the delete failed, or
-        # this is the first cold start) is always transient now — migration
-        # force-overwrites and deletes it on the next start, so "will retry" is
-        # correct in every case (there is no more divergence-abort state).
+    def test_legacy_present_default_path_says_not_the_data_home(
+        self, monkeypatch, tmp_path: Path, capsys
+    ) -> None:
+        # A leftover top-level ~/.kirocrew on the default path is not the data
+        # home — the doctor notes it as safe to delete, never as active state.
         monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
         monkeypatch.delenv("KIROCREW_HOME", raising=False)  # default-path case
         home = tmp_path / ".kiro" / "crew"
@@ -59,27 +62,8 @@ class TestDataHome:
         cli_doctor._doctor_data_home()
 
         out = capsys.readouterr().out
-        assert "will retry on next cold start" in out
-
-    def test_legacy_present_under_valid_override_says_ignored(
-        self, monkeypatch, tmp_path: Path, capsys
-    ) -> None:
-        # Under a VALID KIROCREW_HOME override migration is bypassed on every
-        # start, so a leftover legacy is NOT going to be migrated — the doctor
-        # must not claim "will retry" (GPT 5.6 MEDIUM).
-        monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
-        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "override"))
-        home = tmp_path / ".kiro" / "crew"
-        monkeypatch.setattr(cli_doctor, "config_dir", lambda: home)
-        home.mkdir(parents=True)
-        legacy = tmp_path / cli_doctor.LEGACY_CONFIG_DIR_NAME
-        legacy.mkdir()
-
-        cli_doctor._doctor_data_home()
-
-        out = capsys.readouterr().out
-        assert "IGNORED" in out and "override active" in out
-        assert "will retry on next cold start" not in out
+        assert "not the data home" in out
+        assert "ACTIVE" not in out
 
     def test_legacy_override_points_at_legacy_says_active_not_ignored(
         self, monkeypatch, tmp_path: Path, capsys
@@ -101,54 +85,28 @@ class TestDataHome:
         assert "IGNORED" not in out
         assert "will retry on next cold start" not in out
 
-    def test_marker_present_nonempty_legacy_renders_conflict(
+    def test_legacy_with_venv_is_never_advised_deletable(
         self, monkeypatch, tmp_path: Path, capsys
     ) -> None:
-        # Marker present + a NON-EMPTY legacy dir → a genuine conflict: the
-        # legacy is resurrection debris, NOT a pending migration. The doctor must
-        # render the conflict (⚠ / NOT used) and never claim a retry (GPT 5.6
-        # MEDIUM: pin the conflict-rendering branch so removing it fails a test).
+        # An older wheel install could nest its managed venv inside ~/.kirocrew,
+        # so the leftover dir may hold the running interpreter. The doctor must
+        # NOT tell the user it is safe to delete — that would remove their live
+        # install.
         monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
         monkeypatch.delenv("KIROCREW_HOME", raising=False)
-        home = tmp_path / ".kiro" / "crew"
-        monkeypatch.setattr(cli_doctor, "config_dir", lambda: home)
-        home.mkdir(parents=True)
-        (home / cli_doctor.MIGRATION_MARKER_NAME).write_text("done\n", encoding="utf-8")
+        monkeypatch.setattr(cli_doctor, "config_dir", lambda: tmp_path / ".kiro" / "crew")
         legacy = tmp_path / cli_doctor.LEGACY_CONFIG_DIR_NAME
-        legacy.mkdir()
-        (legacy / "sessions.db").write_text("stale", encoding="utf-8")  # non-empty debris
+        (legacy / "venv" / "bin").mkdir(parents=True)
 
         cli_doctor._doctor_data_home()
 
         out = capsys.readouterr().out
-        assert "conflict" in out and "NOT used" in out
-        assert "will retry on next cold start" not in out
-
-    def test_marker_present_empty_legacy_says_unused_not_retry(
-        self, monkeypatch, tmp_path: Path, capsys
-    ) -> None:
-        # Marker present + an EMPTY recreated legacy dir: migration already
-        # completed and is marker-authoritative, so it will NEVER retry. The
-        # doctor must call the dir UNUSED leftover, not claim a pending retry
-        # (GPT 5.6 MEDIUM — the misleading "will retry" would persist forever).
-        monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
-        monkeypatch.delenv("KIROCREW_HOME", raising=False)
-        home = tmp_path / ".kiro" / "crew"
-        monkeypatch.setattr(cli_doctor, "config_dir", lambda: home)
-        home.mkdir(parents=True)
-        (home / cli_doctor.MIGRATION_MARKER_NAME).write_text("done\n", encoding="utf-8")
-        legacy = tmp_path / cli_doctor.LEGACY_CONFIG_DIR_NAME
-        legacy.mkdir()  # empty debris
-
-        cli_doctor._doctor_data_home()
-
-        out = capsys.readouterr().out
-        assert "UNUSED" in out and "migration already completed" in out
-        assert "will retry on next cold start" not in out
+        assert "Do NOT delete" in out
+        assert "virtual environment" in out and "venv" in out
+        assert "safe to delete" not in out
 
     def test_no_legacy_stays_quiet(self, monkeypatch, tmp_path: Path, capsys) -> None:
-        # Fresh install / migration already completed: only the location line,
-        # no leftover-legacy nag. There is no archive to report either way.
+        # Fresh install: only the location line, no leftover-legacy nag.
         monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
         monkeypatch.setattr(cli_doctor, "config_dir", lambda: tmp_path / ".kiro" / "crew")
 
@@ -157,7 +115,6 @@ class TestDataHome:
         out = capsys.readouterr().out
         assert "Data Home" in out
         assert "legacy:" not in out
-        assert "rollback copy" not in out
         assert "rm -rf" not in out
 
 
@@ -547,6 +504,10 @@ class TestDoctorKas:
         self._patch_cfg(monkeypatch, "kas")
         from kiro_crew.acp import kas_assets, kas_auth
 
+        # Overrides select the direct-spawn path, whose diagnostics these
+        # assertions describe; without them doctor reports the cli-fronted
+        # branch instead.
+        monkeypatch.setenv(kas_assets.ENV_KAS_SCRIPT, "/nonexistent/acp-server.js")
         monkeypatch.setattr(kas_assets, "find_kas_node", lambda: None)
         monkeypatch.setattr(kas_assets, "find_kas_server_script", lambda: None)
 
@@ -567,6 +528,7 @@ class TestDoctorKas:
         self._patch_cfg(monkeypatch, "kas")
         from kiro_crew.acp import kas_assets, kas_auth
 
+        monkeypatch.setenv(kas_assets.ENV_KAS_SCRIPT, "/x/kas/9.9.9-hash/nm/acp-server.js")
         monkeypatch.setattr(kas_assets, "find_kas_node", lambda: Path("/x/node"))
         monkeypatch.setattr(
             kas_assets,
@@ -583,6 +545,45 @@ class TestDoctorKas:
         out = capsys.readouterr().out
         assert "9.9.9-hash" in out
         assert "2099-01-01T00:00:00Z" in out
+        assert "SECRET-DO-NOT-PRINT" not in out
+        assert issues == []
+
+    def test_cli_fronted_missing_kiro_cli_appends_issue(self, monkeypatch, capsys) -> None:
+        """Default (no override): readiness is kiro-cli itself being present."""
+        self._patch_cfg(monkeypatch, "kas")
+        from kiro_crew.acp import kas_assets, kas_auth
+
+        monkeypatch.delenv(kas_assets.ENV_KAS_NODE, raising=False)
+        monkeypatch.delenv(kas_assets.ENV_KAS_SCRIPT, raising=False)
+        monkeypatch.setattr(cli_doctor.shutil, "which", lambda _name: None)
+
+        async def _raise(*, timeout: float = 8.0):
+            raise kas_auth.KasAuthCallbackError("kiro-cli not found; cannot obtain a KAS token")
+
+        monkeypatch.setattr(kas_auth, "resolve_kas_access_token", _raise)
+        issues: list[str] = []
+        cli_doctor._doctor_kas(issues)
+        out = capsys.readouterr().out
+        assert "kiro-cli acp --agent-engine v3" in out
+        assert "KAS backend selected but kiro-cli not found" in issues
+
+    def test_cli_fronted_ready_reports_engine_flag(self, monkeypatch, capsys) -> None:
+        self._patch_cfg(monkeypatch, "kas")
+        from kiro_crew.acp import kas_assets, kas_auth
+
+        monkeypatch.delenv(kas_assets.ENV_KAS_NODE, raising=False)
+        monkeypatch.delenv(kas_assets.ENV_KAS_SCRIPT, raising=False)
+        monkeypatch.setattr(cli_doctor.shutil, "which", lambda _name: "/usr/bin/kiro-cli")
+        monkeypatch.setattr(cli_doctor, "_kas_engine_flag_supported", lambda _bin: True)
+
+        async def _ok(*, timeout: float = 8.0):
+            return {"accessToken": "SECRET-DO-NOT-PRINT", "expiresAt": "2099-01-01T00:00:00Z"}
+
+        monkeypatch.setattr(kas_auth, "resolve_kas_access_token", _ok)
+        issues: list[str] = []
+        cli_doctor._doctor_kas(issues)
+        out = capsys.readouterr().out
+        assert "engine flag" in out
         assert "SECRET-DO-NOT-PRINT" not in out
         assert issues == []
 
@@ -1007,3 +1008,735 @@ class TestSourceCheckout:
         # the environment.
         monkeypatch.setattr(cli_doctor, "_WINDOWS_GIT_DIRS", ("Z:\\nonexistent\\Git\\cmd",))
         assert cli_doctor._windows_git_bin() is None
+
+
+class TestCliInstallerResidue:
+    """Detection of leftover kiro-cli auto-update installers in the temp dir.
+
+    kiro-cli checks for updates on every process start, and Crew spawns a fresh
+    kiro-cli per session. On Windows the running binary cannot be replaced, so
+    each check leaves an installer behind that is never cleaned up (upstream
+    kirodotdev/Kiro#10970). These guard the doctor surface that makes the
+    resulting disk usage visible.
+    """
+
+    def _installer(self, directory: Path, name: str, size: int = 1024) -> Path:
+        path = directory / name
+        path.write_bytes(b"\0" * size)
+        return path
+
+    def test_scan_counts_matching_files_and_sums_bytes(self, tmp_path: Path) -> None:
+        self._installer(tmp_path, "kiro-installer-2.14.0.msi", size=2048)
+        self._installer(tmp_path, "kiro-installer-2.15.0.msi", size=1024)
+        assert cli_doctor._scan_cli_installer_residue(tmp_path) == (2, 3072)
+
+    def test_scan_ignores_unrelated_files(self, tmp_path: Path) -> None:
+        # Must not sweep in every temp file that happens to mention kiro.
+        self._installer(tmp_path, "kiro-installer-2.14.0.msi")
+        self._installer(tmp_path, "kiro-log.txt")
+        self._installer(tmp_path, "some-other-installer.msi")
+        count, _ = cli_doctor._scan_cli_installer_residue(tmp_path)
+        assert count == 1
+
+    def test_scan_ignores_directories(self, tmp_path: Path) -> None:
+        # A directory whose name matches must not be counted as a reclaimable
+        # file, nor make stat() sizes meaningless.
+        (tmp_path / "kiro-installer-dir").mkdir()
+        assert cli_doctor._scan_cli_installer_residue(tmp_path) == (0, 0)
+
+    def test_scan_is_non_recursive(self, tmp_path: Path) -> None:
+        # The installer lands at the top level; descending would make the scan
+        # unbounded over a shared temp dir.
+        nested = tmp_path / "nested"
+        nested.mkdir()
+        self._installer(nested, "kiro-installer-2.14.0.msi")
+        assert cli_doctor._scan_cli_installer_residue(tmp_path) == (0, 0)
+
+    def test_scan_returns_zero_for_missing_dir(self, tmp_path: Path) -> None:
+        # Note: glob() on a missing directory yields nothing rather than
+        # raising, so this pins the missing-dir OUTCOME, not the OSError
+        # handler — that branch is covered by the unreadable-dir test below.
+        assert cli_doctor._scan_cli_installer_residue(tmp_path / "gone") == (0, 0)
+
+    def test_scan_returns_zero_for_unreadable_dir(self, tmp_path: Path, monkeypatch) -> None:
+        # A temp dir the process cannot list (permissions, or a racing rmtree)
+        # must degrade to "nothing found" rather than crashing the doctor run.
+        def boom(self: Path, _pattern: str):  # type: ignore[no-untyped-def]
+            raise OSError("permission denied")
+
+        monkeypatch.setattr(Path, "glob", boom)
+        assert cli_doctor._scan_cli_installer_residue(tmp_path) == (0, 0)
+
+    def test_scan_skips_entry_that_races_a_delete(self, tmp_path: Path, monkeypatch) -> None:
+        # The updater (or a cleanup script) can remove a file mid-scan; one
+        # unreadable entry must not abort the diagnostic.
+        self._installer(tmp_path, "kiro-installer-a.msi", size=512)
+        self._installer(tmp_path, "kiro-installer-b.msi", size=512)
+        real_stat = Path.stat
+
+        def flaky_stat(self: Path, *a, **kw):  # type: ignore[no-untyped-def]
+            if self.name == "kiro-installer-a.msi":
+                raise OSError("vanished")
+            return real_stat(self, *a, **kw)
+
+        monkeypatch.setattr(Path, "stat", flaky_stat)
+        assert cli_doctor._scan_cli_installer_residue(tmp_path) == (1, 512)
+
+    def test_scan_stops_at_cap(self, tmp_path: Path, monkeypatch) -> None:
+        monkeypatch.setattr(cli_doctor, "_CLI_INSTALLER_SCAN_CAP", 3)
+        for i in range(6):
+            self._installer(tmp_path, f"kiro-installer-{i}.msi", size=10)
+        count, _ = cli_doctor._scan_cli_installer_residue(tmp_path)
+        assert count == 3
+
+    def test_single_file_is_silent(self, tmp_path: Path, monkeypatch, capsys) -> None:
+        # One file can be a download still in flight — not residue.
+        self._installer(tmp_path, "kiro-installer-2.14.0.msi")
+        monkeypatch.setattr(cli_doctor.tempfile, "gettempdir", lambda: str(tmp_path))
+        issues: list[str] = []
+        cli_doctor._doctor_cli_installer_residue(issues)
+        assert issues == []
+        assert capsys.readouterr().out == ""
+
+    def test_clean_host_is_silent(self, tmp_path: Path, monkeypatch, capsys) -> None:
+        monkeypatch.setattr(cli_doctor.tempfile, "gettempdir", lambda: str(tmp_path))
+        issues: list[str] = []
+        cli_doctor._doctor_cli_installer_residue(issues)
+        assert issues == []
+        assert capsys.readouterr().out == ""
+
+    def test_residue_is_reported_and_recorded(self, tmp_path: Path, monkeypatch, capsys) -> None:
+        self._installer(tmp_path, "kiro-installer-2.14.0.msi", size=1048576)
+        self._installer(tmp_path, "kiro-installer-2.15.0.msi", size=1048576)
+        monkeypatch.setattr(cli_doctor.tempfile, "gettempdir", lambda: str(tmp_path))
+        issues: list[str] = []
+        cli_doctor._doctor_cli_installer_residue(issues)
+        out = capsys.readouterr().out
+        assert "kiro-cli installer residue" in out
+        assert "2 in" in out
+        assert "2.0 MiB" in out
+        # The remedy must name the setting AND its cost, so a user is not talked
+        # into silently disabling their own security updates.
+        assert "app.disableAutoupdates true" in out
+        assert "per-user" in out
+        assert issues == ["kiro-cli installer residue in temp"]
+
+    def test_unusable_temp_volume_does_not_crash_doctor(self, monkeypatch, capsys) -> None:
+        # gettempdir() raises when no candidate temp dir is usable. A diagnostic
+        # must degrade to silence rather than abort the whole doctor run with a
+        # traceback on exactly the host that most needs the rest of it.
+        def boom() -> str:
+            raise FileNotFoundError("No usable temporary directory found")
+
+        monkeypatch.setattr(cli_doctor.tempfile, "gettempdir", boom)
+        issues: list[str] = []
+        cli_doctor._doctor_cli_installer_residue(issues)
+        assert issues == []
+        assert capsys.readouterr().out == ""
+
+    def test_large_total_renders_gib(self, monkeypatch, capsys) -> None:
+        # Formatting only: writing gigabytes to disk in a test is not acceptable.
+        monkeypatch.setattr(
+            cli_doctor, "_scan_cli_installer_residue", lambda _d: (700, 80 * 1073741824)
+        )
+        issues: list[str] = []
+        cli_doctor._doctor_cli_installer_residue(issues)
+        out = capsys.readouterr().out
+        assert "80.00 GiB" in out
+        # 700 is past the cap, so BOTH the count and the size are floors: the scan
+        # stopped summing at the cap, so an exact-looking size would contradict
+        # the "700+" beside it.
+        assert "700+" in out
+        assert "≥ 80.00 GiB" in out
+
+    def test_uncapped_size_is_not_marked_as_a_floor(self, monkeypatch, capsys) -> None:
+        # Below the cap the scan saw everything, so the figure is exact and must
+        # NOT be hedged -- otherwise every host reads as approximate.
+        monkeypatch.setattr(
+            cli_doctor, "_scan_cli_installer_residue", lambda _d: (4, 4 * 1048576)
+        )
+        issues: list[str] = []
+        cli_doctor._doctor_cli_installer_residue(issues)
+        out = capsys.readouterr().out
+        assert "4.0 MiB" in out
+        assert "≥" not in out
+        assert "4+" not in out
+
+
+class TestEffectiveModelSection:
+    """`kirocrew doctor`'s Model section (#2559).
+
+    The four-tier model precedence is not visible from any single file, so a
+    stale spec pin that outlived the setting which created it is otherwise only
+    diagnosable by hand-reading config.json, two agent-spec directories and the
+    sidecar. This section names the winning tier and, when a pin is deciding,
+    the exact command that clears it.
+
+    ISOLATION: the section reads the directory the RESOLVER reads, and that
+    resolver is ``kiro_home()``, which the suite's autouse fixtures deliberately
+    do NOT pin (see the note in the rootdir conftest) -- it resolves the real
+    machine-wide ``~/.kiro``. So every test here sets ``KIRO_HOME`` itself, and
+    ``_agents_dir`` asserts the resolved path really is under tmp before writing
+    a byte. Without that guard these tests overwrite the operator's live agent
+    spec.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _isolate_kiro_home(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("KIRO_HOME", str(tmp_path / "kiro-home"))
+        self._tmp = tmp_path
+
+    def _agents_dir(self) -> Path:
+        from kiro_crew.config.paths import kiro_agents_dir
+
+        agents_dir = kiro_agents_dir()
+        # Fail loudly rather than write into a real home if the override lapses.
+        assert self._tmp in agents_dir.parents or agents_dir.is_relative_to(self._tmp), (
+            f"KIRO_HOME isolation failed: {agents_dir} is outside {self._tmp}"
+        )
+        agents_dir.mkdir(parents=True, exist_ok=True)
+        return agents_dir
+
+    def _cfg(self, global_model: str):
+        from kiro_crew.config import KiroCrewConfig
+
+        cfg = KiroCrewConfig()
+        cfg.agent.model = global_model
+        return cfg
+
+    def _install_spec(self, model: str | None) -> Path:
+        from kiro_crew.agent import AGENT_FILENAME
+
+        body: dict = {"name": "kirocrew"}
+        if model is not None:
+            body["model"] = model
+        spec = self._agents_dir() / AGENT_FILENAME
+        spec.write_text(json.dumps(body), encoding="utf-8")
+        return spec
+
+    def test_spec_pin_decides_when_the_global_defers(self, capsys) -> None:
+        """The reported symptom: the global says auto, so the spec pin decides
+        and the report says so instead of leaving the user to work it out."""
+        self._install_spec("claude-opus-4.8")
+        issues: list[str] = []
+
+        cli_doctor._doctor_effective_model(self._cfg("auto"), "", issues)
+
+        out = capsys.readouterr().out
+        assert "effective:   'claude-opus-4.8'" in out
+        assert "decided by:  default spec pin" in out
+        assert "kirocrew agent reset-model" in out
+        # Advisory, not a setup failure: the state is legal and may be wanted.
+        assert issues == []
+
+    def test_explicit_global_outranks_the_spec_pin(self, capsys) -> None:
+        self._install_spec("claude-opus-4.8")
+        issues: list[str] = []
+
+        cli_doctor._doctor_effective_model(self._cfg("claude-haiku-4.5"), "", issues)
+
+        out = capsys.readouterr().out
+        assert "effective:   'claude-haiku-4.5'" in out
+        assert "decided by:  global agent.model" in out
+        # No pin is deciding, so no repair is offered.
+        assert "reset-model" not in out
+        assert issues == []
+
+    def test_report_and_resolver_agreement_is_asserted(self, capsys) -> None:
+        """The self-check must stay silent while the two agree -- if this line
+        ever fires it means the tier list drifted from the resolver."""
+        self._install_spec("claude-opus-4.8")
+        issues: list[str] = []
+
+        cli_doctor._doctor_effective_model(self._cfg("auto"), "", issues)
+        assert "out of date" not in capsys.readouterr().out
+        assert issues == []
+
+    def test_tracking_state_is_reported(self, capsys) -> None:
+        from kiro_crew import agent_state
+
+        agent_state.set_model_managed("kirocrew", False)
+        self._install_spec("claude-opus-4.8")
+        issues: list[str] = []
+
+        cli_doctor._doctor_effective_model(self._cfg("auto"), "", issues)
+        assert "tracking:    frozen (explicit pick)" in capsys.readouterr().out
+
+    def test_unrecorded_tracking_is_named(self, capsys) -> None:
+        self._install_spec("claude-opus-4.8")
+        issues: list[str] = []
+
+        cli_doctor._doctor_effective_model(self._cfg("auto"), "", issues)
+        assert "tracking:    not recorded" in capsys.readouterr().out
+
+    def test_unreadable_spec_is_reported_not_swallowed(self, capsys) -> None:
+        from kiro_crew.agent import AGENT_FILENAME
+
+        (self._agents_dir() / AGENT_FILENAME).write_text("{ not json", encoding="utf-8")
+        issues: list[str] = []
+
+        cli_doctor._doctor_effective_model(self._cfg("auto"), "", issues)
+        assert "unreadable" in capsys.readouterr().out
+        assert issues == ["agent spec unreadable"]
+
+    def test_project_local_spec_is_flagged_as_shadowing(self, capsys) -> None:
+        """kiro-cli resolves <project>/.kiro/agents FIRST and Kiro Crew's own
+        resolver never reads it, so that file can decide what actually runs while
+        every Kiro Crew surface reports something else."""
+        from kiro_crew.agent import AGENT_FILENAME
+
+        self._install_spec(None)
+        project = self._tmp / "proj"
+        (project / ".kiro" / "agents").mkdir(parents=True)
+        (project / ".kiro" / "agents" / AGENT_FILENAME).write_text(
+            json.dumps({"name": "kirocrew", "model": "claude-opus-4.8"}), encoding="utf-8"
+        )
+        issues: list[str] = []
+
+        cli_doctor._doctor_effective_model(self._cfg("auto"), str(project), issues)
+
+        out = capsys.readouterr().out
+        assert "project spec" in out
+        assert "claude-opus-4.8" in out
+        assert "kiro-cli loads this one first" in out
+        assert issues == ["project-local agent spec shadows the user-level one"]
+
+    def test_no_project_dir_prints_no_project_line(self, capsys) -> None:
+        self._install_spec(None)
+        issues: list[str] = []
+
+        cli_doctor._doctor_effective_model(self._cfg("auto"), "", issues)
+        assert "project spec" not in capsys.readouterr().out
+        assert issues == []
+
+    def _bind_custom_agent(self, cfg, name: str):
+        """Point the default alias at a non-built-in kiro agent."""
+        from kiro_crew.config.loader import KiroCrewAgentConfig
+
+        cfg.default_agent = "default"
+        cfg.agents["default"] = KiroCrewAgentConfig(kiro_agent=name)
+        return cfg
+
+    def test_a_bound_custom_agent_is_attributed_to_its_own_spec(self, capsys) -> None:
+        """The default alias may bind a kiro agent other than the built-in one,
+        and the resolver consults THAT spec's pin above the global (tier 2).
+        Reading kirocrew.json in both cases attributed the pin to the wrong file
+        and printed a reset command for the wrong agent (#4911 review)."""
+        self._install_spec(None)
+        agents_dir = self._agents_dir()
+        (agents_dir / "custom-agent.json").write_text(
+            json.dumps({"name": "custom-agent", "model": "claude-opus-4.8"}), encoding="utf-8"
+        )
+        cfg = self._bind_custom_agent(self._cfg("auto"), "custom-agent")
+        issues: list[str] = []
+
+        cli_doctor._doctor_effective_model(cfg, "", issues)
+
+        out = capsys.readouterr().out
+        assert "effective:   'claude-opus-4.8'" in out
+        assert "decided by:  bound agent pin ('custom-agent')" in out
+        # The repair must name the agent that actually holds the pin.
+        assert "kirocrew agent reset-model --agent 'custom-agent'" in out
+        # And the tier the resolver skipped for the built-in agent is shown here.
+        assert "bound agent pin ('custom-agent'):" in out
+        assert "out of date" not in out, "report must agree with the resolver"
+        assert issues == []
+
+    def test_the_builtin_agent_shows_no_bound_tier(self, capsys) -> None:
+        """Tier 2 is skipped for the built-in agent, so the list must not show
+        a tier the resolver never consulted."""
+        self._install_spec("claude-opus-4.8")
+        issues: list[str] = []
+
+        cli_doctor._doctor_effective_model(self._cfg("auto"), "", issues)
+
+        out = capsys.readouterr().out
+        assert "bound agent pin" not in out
+        assert "decided by:  default spec pin" in out
+        assert "kirocrew agent reset-model" in out
+        assert "--agent" not in out, "the built-in agent needs no --agent flag"
+
+    def test_tracking_names_the_agent_it_describes(self, capsys) -> None:
+        from kiro_crew import agent_state
+
+        self._install_spec(None)
+        agents_dir = self._agents_dir()
+        (agents_dir / "custom-agent.json").write_text(
+            json.dumps({"name": "custom-agent", "model": "claude-opus-4.8"}), encoding="utf-8"
+        )
+        agent_state.set_model_managed("custom-agent", False)
+        cfg = self._bind_custom_agent(self._cfg("auto"), "custom-agent")
+        issues: list[str] = []
+
+        cli_doctor._doctor_effective_model(cfg, "", issues)
+        assert "tracking:    frozen (explicit pick) ('custom-agent')" in capsys.readouterr().out
+
+    def test_project_spec_check_follows_the_bound_agent(self, capsys) -> None:
+        """kiro-cli dispatches the BOUND agent, so that is the filename whose
+        project-local copy can shadow the user-level spec."""
+        self._install_spec(None)
+        agents_dir = self._agents_dir()
+        (agents_dir / "custom-agent.json").write_text(
+            json.dumps({"name": "custom-agent"}), encoding="utf-8"
+        )
+        project = self._tmp / "proj"
+        (project / ".kiro" / "agents").mkdir(parents=True)
+        (project / ".kiro" / "agents" / "custom-agent.json").write_text(
+            json.dumps({"name": "custom-agent", "model": "claude-haiku-4.5"}), encoding="utf-8"
+        )
+        cfg = self._bind_custom_agent(self._cfg("auto"), "custom-agent")
+        issues: list[str] = []
+
+        cli_doctor._doctor_effective_model(cfg, str(project), issues)
+
+        out = capsys.readouterr().out
+        assert "custom-agent.json' -> 'claude-haiku-4.5'" in out
+        assert issues == ["project-local agent spec shadows the user-level one"]
+
+    def test_control_sequences_in_a_spec_model_are_escaped(self, capsys) -> None:
+        """An agent spec is not always trusted input -- an installed app writes
+        one and a cloned repository can ship a project-local one -- so an
+        OSC/ANSI sequence in `model` must reach the terminal inert rather than
+        executing controls or spoofing the surrounding diagnostic lines."""
+        hostile = "claude-opus-4.8\x1b]0;pwned\x07\x1b[2K"
+        self._install_spec(hostile)
+        issues: list[str] = []
+
+        cli_doctor._doctor_effective_model(self._cfg("auto"), "", issues)
+
+        out = capsys.readouterr().out
+        assert "\x1b" not in out, "raw escape reached the terminal"
+        assert "\x07" not in out
+        assert "\\x1b" in out, "the value is still shown, just escaped"
+
+    def test_control_sequences_in_a_project_spec_are_escaped(self, capsys) -> None:
+        from kiro_crew.agent import AGENT_FILENAME
+
+        self._install_spec(None)
+        project = self._tmp / "proj"
+        (project / ".kiro" / "agents").mkdir(parents=True)
+        (project / ".kiro" / "agents" / AGENT_FILENAME).write_text(
+            json.dumps({"name": "kirocrew", "model": "x\x1b[31mred"}), encoding="utf-8"
+        )
+        issues: list[str] = []
+
+        cli_doctor._doctor_effective_model(self._cfg("auto"), str(project), issues)
+
+        out = capsys.readouterr().out
+        assert "\x1b" not in out
+        assert "\\x1b" in out
+
+    def test_control_sequences_in_the_global_are_escaped(self, capsys) -> None:
+        self._install_spec("claude-opus-4.8")
+        issues: list[str] = []
+
+        cli_doctor._doctor_effective_model(self._cfg("auto\x1b[2J"), "", issues)
+
+        assert "\x1b" not in capsys.readouterr().out
+
+    def test_a_symlink_to_a_sensitive_target_is_refused(self, monkeypatch, capsys) -> None:
+        """The doctor read goes through agent_discovery's hardened reader, which
+        refuses a symlink whose RESOLVED target is sensitive (the documented
+        `evil.json -> ~/.aws/credentials` case) and caps the read size. Routing
+        through that one reader instead of hand-rolling the checks is the point
+        (#4911 review); a benign link is followed exactly as the resolver follows
+        it, so the report cannot disagree with what will actually run."""
+        from kiro_crew import agent_discovery
+        from kiro_crew.agent import AGENT_FILENAME
+
+        agents_dir = self._agents_dir()
+        target = self._tmp / "protected.json"
+        target.write_text(json.dumps({"model": "leaked-value"}), encoding="utf-8")
+        (agents_dir / AGENT_FILENAME).symlink_to(target)
+        monkeypatch.setattr(agent_discovery, "is_sensitive_path", lambda p: str(target) in str(p))
+        issues: list[str] = []
+
+        cli_doctor._doctor_effective_model(self._cfg("auto"), "", issues)
+
+        out = capsys.readouterr().out
+        # The report refuses to ATTRIBUTE the refused spec ...
+        assert "unreadable" in out
+        assert issues == ["agent spec unreadable"]
+        assert "(defers)" in out.split("default spec pin:", 1)[1].splitlines()[0]
+        # ... and explains the gap instead of accusing its own tier list of being
+        # stale. `effective` may still carry the value: the RESOLVER reads the
+        # spec through its own path, which follows the link, and hiding what will
+        # actually run would make the report lie. That resolver-side following is
+        # pre-existing and main-owned; noted as a follow-up, not changed here.
+        assert "refused to follow" in out
+        assert "out of date" not in out
+
+    def test_an_absent_spec_is_not_reported_as_a_fault(self, capsys) -> None:
+        """A clean install has no spec and the resolver just falls through, so
+        absence must not raise an issue."""
+        self._agents_dir()  # exists, but empty
+        issues: list[str] = []
+
+        cli_doctor._doctor_effective_model(self._cfg("auto"), "", issues)
+
+        assert "unreadable" not in capsys.readouterr().out
+        assert issues == []
+
+    def test_an_absolute_kiro_agent_binding_cannot_escape_the_agent_dir(self, capsys) -> None:
+        """`kiro_agent` is free text in config.json and reaches a path join, and
+        pathlib DISCARDS the left side when the right is absolute -- so an
+        unvalidated binding would turn a spec lookup into an arbitrary read
+        (#4911 review)."""
+        self._install_spec(None)
+        secret = self._tmp / "protected.json"
+        secret.write_text(json.dumps({"model": "leaked-value"}), encoding="utf-8")
+        cfg = self._bind_custom_agent(self._cfg("auto"), str(secret)[:-5])
+        project = self._tmp / "proj"
+        (project / ".kiro" / "agents").mkdir(parents=True)
+        issues: list[str] = []
+
+        cli_doctor._doctor_effective_model(cfg, str(project), issues)
+
+        out = capsys.readouterr().out
+        assert "leaked-value" not in out
+        assert "not a valid agent name" in out
+        assert "configured kiro_agent is not a valid agent name" in issues
+
+    def test_a_control_bearing_binding_is_escaped_and_refused(self, capsys) -> None:
+        self._install_spec(None)
+        cfg = self._bind_custom_agent(self._cfg("auto"), "evil\x1b[2Jname")
+        issues: list[str] = []
+
+        cli_doctor._doctor_effective_model(cfg, "", issues)
+
+        out = capsys.readouterr().out
+        assert "\x1b" not in out
+        assert "not a valid agent name" in out
+
+    def test_a_control_bearing_project_filename_is_escaped(self, monkeypatch, capsys) -> None:
+        """A cloned repository can TRACK a filename containing control bytes, so
+        the path itself is untrusted input on this line (#4911 review).
+
+        The hostile path is INJECTED rather than created: control bytes are
+        illegal in a Windows filename, so building it on disk would make this
+        assertion Windows-only-skipped, and what is under test is that the
+        printer escapes what it is handed.
+        """
+        hostile = Path("/tmp/proj/.kiro/agents/kirocrew\x1b[2J.json")
+        self._install_spec(None)
+        real_reader = cli_doctor._read_agent_spec
+        monkeypatch.setattr(cli_doctor, "project_agent_files", lambda d: [hostile])
+        monkeypatch.setattr(cli_doctor, "project_agent_name", lambda p: "kirocrew")
+        # Only the injected path is faked; the user-level spec still goes through
+        # the real reader so the report's own self-check is not disturbed.
+        monkeypatch.setattr(
+            cli_doctor,
+            "_read_agent_spec",
+            lambda p: {"model": "m"} if p == hostile else real_reader(p),
+        )
+        issues: list[str] = []
+
+        cli_doctor._doctor_effective_model(self._cfg("auto"), "/tmp/proj", issues)
+
+        out = capsys.readouterr().out
+        # Not vacuous: the shadow line must actually be reached.
+        assert "project spec" in out
+        assert issues == ["project-local agent spec shadows the user-level one"]
+        assert "\x1b" not in out, "raw escape from a tracked filename reached the terminal"
+        assert "\\x1b" in out, "the path is still shown, just escaped"
+
+    def test_a_non_string_kiro_agent_does_not_crash_the_report(self, capsys) -> None:
+        """The config loader deliberately KEEPS a type-mismatched value ("validated
+        by its consumer"), so a hand-edited non-string reaches this section intact
+        and a bare `re.match` would raise TypeError -- aborting the one command a
+        user runs BECAUSE their config is broken (#4911 review)."""
+        self._install_spec("claude-opus-4.8")
+        cfg = self._bind_custom_agent(self._cfg("auto"), "placeholder")
+        cfg.agents["default"].kiro_agent = 12345  # type: ignore[assignment]
+        issues: list[str] = []
+
+        cli_doctor._doctor_effective_model(cfg, "", issues)
+
+        out = capsys.readouterr().out
+        assert "not a valid agent name" in out
+        assert "configured kiro_agent is not a valid agent name" in issues
+        # It degrades to the built-in agent and still produces the report.
+        assert "effective:" in out
+        assert "tracking:" in out
+
+
+class TestWhatsAppSection:
+    """`kirocrew doctor`'s WhatsApp Integration section.
+
+    WhatsApp is the only channel whose whole runtime hangs off an OPTIONAL wheel
+    plus a locally stored credential, and neither absence produces an error the
+    operator sees: a message simply never arrives. So the section has to answer
+    both, and it has to answer them WITHOUT loading the Go core: a preflight that
+    initializes the subsystem it is inspecting is both slow and a side effect.
+    """
+
+    def _cfg(self, *, enabled: bool = True, groups: list | None = None):
+        from kiro_crew.config import KiroCrewConfig
+
+        cfg = KiroCrewConfig()
+        cfg.whatsapp.enabled = enabled
+        cfg.whatsapp.groups = groups if groups is not None else []
+        return cfg
+
+    @pytest.fixture()
+    def home(self, tmp_path: Path, monkeypatch) -> Path:
+        """Pin the data home the section reports on, so no real store is read."""
+        target = tmp_path / "home"
+        target.mkdir()
+        monkeypatch.setattr(cli_doctor, "data_home", lambda: target)
+        return target
+
+    @staticmethod
+    def _extra(monkeypatch, present: bool) -> None:
+        monkeypatch.setattr(
+            "kiro_crew.whatsapp.client.neonize_available", lambda: present
+        )
+
+    @staticmethod
+    def _pair(home: Path) -> Path:
+        from kiro_crew.whatsapp.client import default_db_path
+
+        store = default_db_path(home)
+        store.parent.mkdir(parents=True, exist_ok=True)
+        store.write_bytes(b"sqlite")
+        return store
+
+    def test_a_disabled_channel_names_the_two_ways_to_enable_it(
+        self, home: Path, monkeypatch, capsys
+    ) -> None:
+        """The channel must be VISIBLE in the preflight even when off, because that
+        is the
+        surface an operator checks before wondering why nothing arrives."""
+        self._extra(monkeypatch, True)
+        issues: list[str] = []
+
+        cli_doctor._doctor_whatsapp(self._cfg(enabled=False), issues)
+
+        out = capsys.readouterr().out
+        assert "WhatsApp Integration" in out
+        assert "not enabled" in out
+        assert "setup --whatsapp" in out
+        assert issues == []
+
+    def test_a_missing_extra_on_an_enabled_channel_is_a_reported_issue(
+        self, home: Path, monkeypatch, capsys
+    ) -> None:
+        """Config says the channel is on and the wheel it needs is absent: the
+        channel cannot start at all, and the fix is one offline pip install."""
+        self._extra(monkeypatch, False)
+        self._pair(home)
+        issues: list[str] = []
+
+        cli_doctor._doctor_whatsapp(self._cfg(), issues)
+
+        out = capsys.readouterr().out
+        assert "kirocrew[whatsapp]" in out
+        assert "whatsapp extra missing" in issues
+
+    def test_an_installed_extra_and_a_paired_store_report_clean(
+        self, home: Path, monkeypatch, capsys
+    ) -> None:
+        self._extra(monkeypatch, True)
+        store = self._pair(home)
+        issues: list[str] = []
+
+        cli_doctor._doctor_whatsapp(self._cfg(), issues)
+
+        out = capsys.readouterr().out
+        assert "extra:       ✅" in out
+        assert f"session:     ✅ paired session store at {store}" in out
+        assert issues == []
+
+    def test_an_unpaired_store_warns_but_never_fails_doctor(
+        self, home: Path, monkeypatch, capsys
+    ) -> None:
+        """Load-bearing split. Pairing is a QR scan served BY the running gateway,
+        so a freshly enabled channel legitimately has no store yet. Counting that
+        as an issue would exit 1 and break the documented
+        `kirocrew doctor && kirocrew gateway` chain at the one moment the operator
+        has to start the gateway to make progress.
+        """
+        self._extra(monkeypatch, True)
+        issues: list[str] = []
+
+        cli_doctor._doctor_whatsapp(self._cfg(), issues)
+
+        out = capsys.readouterr().out
+        assert "not paired yet" in out
+        assert "Settings → Channels" in out
+        assert issues == [], "an unpaired channel must not fail the preflight"
+
+    def test_the_reported_store_is_the_path_the_gateway_opens(
+        self, home: Path, monkeypatch, capsys
+    ) -> None:
+        """Doctor and the channel must resolve ONE path, or the report describes a
+        store the gateway never touches."""
+        from kiro_crew.whatsapp.client import default_db_path
+
+        self._extra(monkeypatch, True)
+        issues: list[str] = []
+
+        cli_doctor._doctor_whatsapp(self._cfg(), issues)
+
+        assert str(default_db_path(home)) in capsys.readouterr().out
+
+    def test_the_check_never_imports_neonize(
+        self, home: Path, monkeypatch, capsys
+    ) -> None:
+        """The whole point of the ``find_spec`` probe: importing neonize loads a
+        ~19 MB ctypes CDLL plus protobuf descriptors, and a health check must not
+        pay that (or construct a client as a side effect of asking a question).
+        """
+        import builtins
+
+        real_import = builtins.__import__
+
+        def _guard(name, *args, **kwargs):
+            if name.split(".")[0] == "neonize":
+                raise AssertionError(
+                    f"doctor imported {name!r}: the preflight must stay a find_spec check"
+                )
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", _guard)
+        issues: list[str] = []
+
+        cli_doctor._doctor_whatsapp(self._cfg(), issues)
+
+        assert "WhatsApp Integration" in capsys.readouterr().out
+
+    def test_configured_groups_are_counted_and_junk_entries_are_not(
+        self, home: Path, monkeypatch, capsys
+    ) -> None:
+        """A hand-edited config reaches this section intact, so a non-dict or a
+        blank JID must neither be counted nor crash the one command a user runs
+        BECAUSE their config is broken."""
+        self._extra(monkeypatch, True)
+        issues: list[str] = []
+        groups = [{"jid": "123@g.us"}, {"jid": "  "}, "not-a-dict", {"jid": "456@g.us"}]
+
+        cli_doctor._doctor_whatsapp(self._cfg(groups=groups), issues)
+
+        assert "groups:      ✅ 2 configured" in capsys.readouterr().out
+
+    def test_no_configured_groups_says_group_messages_are_ignored(
+        self, home: Path, monkeypatch, capsys
+    ) -> None:
+        self._extra(monkeypatch, True)
+        issues: list[str] = []
+
+        cli_doctor._doctor_whatsapp(self._cfg(groups=[]), issues)
+
+        assert "none configured" in capsys.readouterr().out
+
+    def test_the_section_is_wired_into_the_doctor_run(self) -> None:
+        """Guards the call site itself. Every other test here drives the helper
+        directly, so a deleted call would leave them all green and the operator
+        with no WhatsApp line, the exact gap this section was added to close.
+        ``_doctor()`` spawns subprocesses, probes the network and calls
+        ``sys.exit``, so its source is read rather than run.
+        """
+        import inspect
+
+        source = inspect.getsource(cli_doctor._doctor)
+        assert "_doctor_whatsapp(cfg, issues)" in source

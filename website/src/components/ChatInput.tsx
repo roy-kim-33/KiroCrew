@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useLayoutEffect, useCallback, useMemo, memo } from 'react'
+import { useState, useRef, useEffect, useLayoutEffect, useCallback, useMemo, useId, memo } from 'react'
 import { ArrowUpFromLine, ArrowUp, Loader2, RotateCw, Plus, Crop, Bot, Mic, Square, BookOpen, X, ClipboardList, CheckCircle, Ban, Sparkles, Target, Lock, Folder, FolderOpen, FileText } from 'lucide-react'
 import CopyBranchButton from './CopyBranchButton'
 import { usePointerDrag } from '../hooks/usePointerDrag'
@@ -27,6 +27,7 @@ import TrustDropdown from './TrustDropdown'
 import AutoNudgePopover, { type AutoNudgeLoop } from './AutoNudgePopover'
 import { useIsMobile } from '../hooks/useIsMobile'
 import { isTouchDevice } from '../utils/isTouchDevice'
+import { consumeComposerRelease } from '../pages/chat/composerFocus'
 import BusySendButton, { useBusySendMode } from './BusySendButton'
 import { isScreenSnipSupported } from '../hooks/useScreenSnip'
 import { useImeGuard } from '../hooks/useImeGuard'
@@ -112,6 +113,8 @@ import SlashCommandMenu from './SlashCommandMenu'
 import FilePickerMenu from './FilePickerMenu'
 import type { FileKind } from './FilePickerMenu'
 import SkillPickerMenu from './SkillPickerMenu'
+import { skillsCacheStaleTime } from '../lib/skillsCache'
+import ProjectSkillsTrustDialog from './ProjectSkillsTrustDialog'
 import { matchFileToken, matchSkillToken, replaceTokenAtCaret } from './composerTokens'
 import { useStopEscapeHatch } from '../hooks/useStopEscapeHatch'
 
@@ -279,8 +282,6 @@ interface ChatInputProps {
   isMac?: boolean
   /** Drag-and-drop handler for the entire input bar */
   onDrop?: (e: React.DragEvent) => void
-  /** Whether drag-over styling is active */
-  dragOver?: boolean
   /** Drag-over event handler */
   onDragOver?: (e: React.DragEvent) => void
   /** Drag-leave event handler */
@@ -401,6 +402,9 @@ interface ChatInputProps {
   /** Optional knowledge chip rendered above the input */
   knowledgeChip?: React.ReactNode
   /** When this key changes, focus the textarea (e.g. on chat session switch). */
+  /** Focus-on-switch key. Any new consumer of this prop must honor the
+   *  composerFocus one-shot (consumeComposerRelease) or macOS keyboard
+   *  switches will autofocus through the release — see composerFocus.ts. */
   autoFocusKey?: string | null
   /** Gateway WebSocket connection state. When false, send is blocked and a
    *  warning banner appears above the input. Defaults to true so callers that
@@ -420,7 +424,7 @@ interface ChatInputProps {
  *  the strip's overflow-x-auto can't clip it. */
 function ResizeBadge({ resize }: { resize: ResizeInfo }) {
   const [tip, setTip] = useState<{ top: number; left: number } | null>(null)
-  const ref = useRef<HTMLSpanElement>(null)
+  const ref = useRef<HTMLButtonElement>(null)
   const show = () => {
     const r = ref.current?.getBoundingClientRect()
     if (r) setTip({ top: r.top - 8, left: r.left })
@@ -438,13 +442,13 @@ function ResizeBadge({ resize }: { resize: ResizeInfo }) {
           wider of image and pill, so each locale pays only its own width and the
           thumbnail is never covered in any of them. `whitespace-nowrap` is what
           makes the chip grow instead of the pill wrapping. */}
-      <span
+      <button
+        type="button"
         ref={ref}
-        tabIndex={0}
         aria-label={i18nT('components.chatInput.resized_to_fit_model_limits_2', { fromW: resize.fromW, fromH: resize.fromH, toW: resize.toW, toH: resize.toH })}
-        className="px-1.5 py-[1px] rounded-full text-[10px] font-bold bg-accent text-accent-fg shadow-sm cursor-default whitespace-nowrap"
+        className="px-1.5 py-[1px] rounded-full border-0 text-[10px] font-bold bg-accent text-accent-fg shadow-sm cursor-default whitespace-nowrap"
         onMouseEnter={show} onMouseLeave={hide} onFocus={show} onBlur={hide}
-      >{i18nT('components.chatInput.resized')}</span>
+      >{i18nT('components.chatInput.resized')}</button>
       {tip && createPortal(
         <div
           role="tooltip"
@@ -513,6 +517,9 @@ function FilePreviewStrip({ files, dirs = NO_DIRS, resizedInfo, onRemove, onRemo
                   every image chip, including transparent PNGs. No ceiling: a
                   panorama makes a wide chip and scrolls its siblings out of view
                   in this overflow-x-auto strip, but nobody has reported that. */}
+              {/* The listener measures intrinsic layout; the image is inside the
+                  actual preview button and is not itself interactive. */}
+              {/* eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions */}
               <img src={src} alt={path} className="h-16 min-w-12 rounded border border-border object-contain bg-bg-hover hover:opacity-80 transition-opacity"
                 data-lightbox-image=""
                 // A thumbnail widens when its bytes arrive (h-16 + intrinsic
@@ -609,7 +616,6 @@ function ChatInput({
   onRemoveSessionRef,
   isMac = false,
   onDrop,
-  dragOver = false,
   onDragOver,
   onDragLeave,
   voiceRecording = false,
@@ -917,6 +923,7 @@ function ChatInput({
   // when the caret enters a token — the AT half of the paste-preview a11y fix.
   const [pastePreviewPanelId, setPastePreviewPanelId] = useState<string | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
+  const fileInputId = useId()
   // "+" drop-up menu (upload file / image + browse toggle).
   const [plusOpen, setPlusOpen] = useState(false)
   const [ctxPopoverOpen, setCtxPopoverOpen] = useState(false)
@@ -1066,6 +1073,7 @@ function ChatInput({
   }, [disabled, onFollowUpSend])
   const { botName } = useBranding()
   const isMobile = useIsMobile()
+  const directFilePicker = isMobile || isTouchDevice()
   const [attachControlRow, controlRowEdges, remeasureControlRow] = useScrollEdges<HTMLDivElement>()
   // The control row's chips are prop-driven (the auto-nudge loop chip, the
   // approval-mode picker) and appear or change label while the row keeps its
@@ -1105,6 +1113,17 @@ function ChatInput({
   const [fileQuery, setFileQuery] = useState('')
   const [skillPickerOpen, setSkillPickerOpen] = useState(false)
   const [skillQuery, setSkillQuery] = useState('')
+  // Project skill awaiting consent, together with the exact chat/project/request
+  // that initiated it. A grant can outlive this dialog, so completion must not
+  // write into a different draft or supersede a newer consent request.
+  const nextTrustRequestIdRef = useRef(0)
+  const activeTrustRequestIdRef = useRef<number | null>(null)
+  const [trustPrompt, setTrustPrompt] = useState<{
+    requestId: number
+    leaf: string
+    slotKey?: string
+    project?: string
+  } | null>(null)
   // Open an in-input trigger picker from the + menu (mirrors typing the sigil):
   //  '/' slash commands (whole-input), '@' file mention, '$' skill. Inserts the
   //  sigil at a word boundary, opens the matching picker, then refocuses the box.
@@ -1125,18 +1144,25 @@ function ChatInput({
       if (el) { el.focus(); const n = el.value.length; el.setSelectionRange(n, n) }
     })
   }
-  // Warm the shared ['skills'] cache when the input gains focus so the first
+  // Warm the per-slot-and-project skills cache when the input gains focus so the first
   // `$` trigger renders the picker instantly (the fetch is the only latency).
   // prefetchQuery is a no-op if the cache is already fresh (staleTime), so it's
-  // cheap to call on every focus. Shares the key with SkillPickerMenu + SkillsTab.
+  // cheap to call on every focus. The key and the session key must match
+  // SkillPickerMenu's exactly, or the prefetch warms a different entry and the
+  // menu still pays the fetch on open.
   const queryClient = useQueryClient()
+  const skillSlotKey = slotId ? `dashboard:${slotId}` : undefined
+  const skillSlotKeyRef = useRef(skillSlotKey)
+  skillSlotKeyRef.current = skillSlotKey
+  const skillProjectRef = useRef(project)
+  skillProjectRef.current = project
   const prefetchSkills = useCallback(() => {
     queryClient.prefetchQuery({
-      queryKey: ['skills'],
-      queryFn: () => api.skills(),
-      staleTime: 5 * 60 * 1000,
+      queryKey: ['skills', skillSlotKey ?? null, project ?? null],
+      queryFn: () => api.skills(skillSlotKey),
+      staleTime: skillsCacheStaleTime(project),
     })
-  }, [queryClient])
+  }, [queryClient, skillSlotKey, project])
   // Shared caret-relative token insertion for the @/$ pickers: replace the
   // sigil-token ending at the caret with `token`, commit, and restore the caret
   // just after it. One copy keeps the two onSelect handlers duplication-free.
@@ -1241,6 +1267,14 @@ function ChatInput({
   const prevAutoFocusKeyRef = useRef<typeof autoFocusKey>(undefined)
   useEffect(() => {
     if (autoFocusKey == null || autoFocusKey === prevAutoFocusKeyRef.current) {
+      prevAutoFocusKeyRef.current = autoFocusKey
+      return
+    }
+    // A keyboard-driven switch released the composer (macOS chord chaining —
+    // see releaseComposerForKeyboardSwitch): consume the one-shot and skip
+    // this transition's autofocus entirely. The ref advances so the
+    // disabled-retry path cannot resurrect the skipped focus later.
+    if (consumeComposerRelease()) {
       prevAutoFocusKeyRef.current = autoFocusKey
       return
     }
@@ -2407,9 +2441,9 @@ function ChatInput({
         </div>
       )}
 
-      <input ref={fileInputRef} type="file" aria-label={i18nT('components.chatInput.attach_files')} multiple accept={FILE_ACCEPT} className="hidden" onChange={handleFileInputChange} />
+      <input id={fileInputId} ref={fileInputRef} type="file" aria-label={i18nT('components.chatInput.attach_files')} multiple accept={FILE_ACCEPT} className="sr-only" onChange={handleFileInputChange} />
 
-      <SlashCommandMenu input={value} anchorRef={inputRef as React.RefObject<HTMLElement>} open={slashMenuOpen} onSelect={cmd => { onChange(cmd); setSlashMenuOpen(false) }} onClose={() => setSlashMenuOpen(false)} />
+      <SlashCommandMenu input={value} anchorRef={inputRef as React.RefObject<HTMLElement>} open={slashMenuOpen} sendOnEnter={sendOnEnter} onSelect={cmd => { onChange(cmd); setSlashMenuOpen(false) }} onClose={() => setSlashMenuOpen(false)} />
 
       {onFileSelect && (
         <FilePickerMenu
@@ -2417,6 +2451,7 @@ function ChatInput({
           anchorRef={inputRef as React.RefObject<HTMLElement>}
           open={filePickerOpen}
           project={project}
+          sendOnEnter={sendOnEnter}
           onFileOpen={onFileOpen}
           onSelect={({ path, relativePath, kind }) => {
             // relativePath already carries a trailing slash for directories
@@ -2434,13 +2469,59 @@ function ChatInput({
         query={skillQuery}
         anchorRef={inputRef as React.RefObject<HTMLElement>}
         open={skillPickerOpen}
+        sendOnEnter={sendOnEnter}
+        slotKey={skillSlotKey}
+        project={project}
         onSelect={({ leaf }) => {
           // Token left literal — backend appends the skill body; the user still
           // sees their $token marker. Caret-relative replace via shared helper.
           applyPickedToken(/(^|[\s])\$[a-z0-9/_-]*$/, `$${leaf} `)
           setSkillPickerOpen(false); setSkillQuery('')
         }}
+        onTrustRequest={({ leaf }) => {
+          // An unconsented project skill: close the menu and ask, rather than
+          // inserting a token that would resolve to nothing.
+          setSkillPickerOpen(false); setSkillQuery('')
+          const requestId = nextTrustRequestIdRef.current + 1
+          nextTrustRequestIdRef.current = requestId
+          activeTrustRequestIdRef.current = requestId
+          setTrustPrompt({ requestId, leaf, slotKey: skillSlotKey, project })
+        }}
         onClose={() => { setSkillPickerOpen(false); setSkillQuery('') }}
+      />
+      <ProjectSkillsTrustDialog
+        key={trustPrompt?.requestId ?? 0}
+        open={trustPrompt !== null}
+        skillLeaf={trustPrompt?.leaf ?? ''}
+        slotKey={trustPrompt?.slotKey}
+        onClose={() => {
+          activeTrustRequestIdRef.current = null
+          setTrustPrompt(null)
+        }}
+        onTrusted={leaf => {
+          const completedPrompt = trustPrompt
+          if (
+            !completedPrompt
+            || completedPrompt.requestId !== activeTrustRequestIdRef.current
+          ) return
+          if (
+            completedPrompt.slotKey !== skillSlotKeyRef.current
+            || completedPrompt.project !== skillProjectRef.current
+            || completedPrompt.leaf !== leaf
+          ) {
+            // Retire this prompt only if it is still current. A superseding
+            // request has a different id and must remain open.
+            activeTrustRequestIdRef.current = null
+            setTrustPrompt(current =>
+              current?.requestId === completedPrompt.requestId ? null : current)
+            return
+          }
+          activeTrustRequestIdRef.current = null
+          setTrustPrompt(null)
+          // The grant makes the token resolvable, so insert it now — the user
+          // asked for this skill and has just consented to its directory.
+          applyPickedToken(/(^|[\s])\$[a-z0-9/_-]*$/, `$${completedPrompt.leaf} `)
+        }}
       />
 
       {/* Unified input container — drag-to-resize targets the inner div. */}
@@ -2470,7 +2551,7 @@ function ChatInput({
       <div
         data-testid="input-wrapper"
         ref={wrapperRef}
-        className={`${hasApproval ? 'rounded-b-2xl rounded-t-none' : 'rounded-2xl'} relative transition-colors overflow-hidden ${manualHeight !== null ? 'flex flex-col min-h-0' : ''} ${(cleanMode || memoryMode === 'incognito' || memoryMode === 'temporary') ? 'border-2' : 'border'} ${dragOver ? 'border-accent bg-accent/10' : cleanMode ? 'border-accent bg-bg-elevated' : memoryMode === 'temporary' ? 'border-aim bg-bg-elevated' : memoryMode === 'incognito' ? 'border-warn bg-bg-elevated' : 'border-border bg-bg-elevated focus-within:border-accent/50'}`}
+        className={`${hasApproval ? 'rounded-b-2xl rounded-t-none' : 'rounded-2xl'} relative transition-colors overflow-hidden ${manualHeight !== null ? 'flex flex-col min-h-0' : ''} ${(cleanMode || memoryMode === 'incognito' || memoryMode === 'temporary') ? 'border-2' : 'border'} ${cleanMode ? 'border-accent bg-bg-elevated' : memoryMode === 'temporary' ? 'border-aim bg-bg-elevated' : memoryMode === 'incognito' ? 'border-warn bg-bg-elevated' : 'border-border bg-bg-elevated focus-within:border-accent/50'}`}
 
         onDragOver={onDragOver}
         onDragLeave={onDragLeave}
@@ -2524,14 +2605,14 @@ function ChatInput({
           onKeyDown={handleKeyDown}
           {...ime.bindComposition<HTMLTextAreaElement>({
             // The paste-hover preview dismisses on blur; the guard's latch reset rides
-            // in the binding itself, so this handler only carries what is local here.
+            // in the binding itself, so these handlers only carry what is local here.
+            onFocus: prefetchSkills,
             onBlur: () => { if (hoverRef.current) hoverRef.current.handleMouseLeave() },
           })}
           onPaste={handlePaste}
           onCopy={handleCopy}
           onCut={handleCut}
           onClick={handleTextareaClick}
-          onFocus={prefetchSkills}
           onMouseUp={handleSelectSnap}
           onSelect={handleSelectSnap}
           onInput={handleInput}
@@ -2547,19 +2628,33 @@ function ChatInput({
           <div className="flex items-center gap-0.5 min-w-0">
             {onUploadFiles && (
               <div className="relative shrink-0" ref={plusWrapRef}>
-                <button
-                  ref={plusBtnRef}
-                  className={`w-8 h-8 rounded-lg flex items-center justify-center cursor-pointer transition-all disabled:opacity-30 bg-transparent border-none ${plusOpen ? 'text-text bg-bg-hover' : 'text-muted hover:text-text hover:bg-bg-hover'}`}
-                  onClick={togglePlus}
-                  disabled={uploading}
-                  aria-haspopup="menu"
-                  aria-expanded={plusOpen}
-                  aria-label={i18nT('components.chatInput.add_files_options')}
-                  title={i18nT('components.chatInput.add_files_options')}
-                >
-                  {uploading ? <Loader2 size={18} className="animate-spin" /> : <Plus size={18} className={`transition-transform ${plusOpen ? 'rotate-45' : ''}`} />}
-                </button>
-                {plusOpen && plusRect && createPortal(
+                {directFilePicker ? (
+                  /* Association is intentionally absent while uploads disable the control. */
+                  // eslint-disable-next-line jsx-a11y/label-has-for
+                  <label
+                    htmlFor={uploading ? undefined : fileInputId}
+                    aria-disabled={uploading || undefined}
+                    className={`w-8 h-8 rounded-lg flex items-center justify-center transition-all bg-transparent ${uploading ? 'opacity-30 cursor-default' : 'cursor-pointer text-muted hover:text-text hover:bg-bg-hover'}`}
+                    aria-label={i18nT('components.chatInput.attach_files')}
+                    title={i18nT('components.chatInput.attach_files')}
+                  >
+                    {uploading ? <Loader2 size={18} className="animate-spin" /> : <Plus size={18} />}
+                  </label>
+                ) : (
+                  <button
+                    ref={plusBtnRef}
+                    className={`w-8 h-8 rounded-lg flex items-center justify-center cursor-pointer transition-all disabled:opacity-30 bg-transparent border-none ${plusOpen ? 'text-text bg-bg-hover' : 'text-muted hover:text-text hover:bg-bg-hover'}`}
+                    onClick={togglePlus}
+                    disabled={uploading}
+                    aria-haspopup="menu"
+                    aria-expanded={plusOpen}
+                    aria-label={i18nT('components.chatInput.add_files_options')}
+                    title={i18nT('components.chatInput.add_files_options')}
+                  >
+                    {uploading ? <Loader2 size={18} className="animate-spin" /> : <Plus size={18} className={`transition-transform ${plusOpen ? 'rotate-45' : ''}`} />}
+                  </button>
+                )}
+                {!directFilePicker && plusOpen && plusRect && createPortal(
                   <div
                     ref={plusMenuRef}
                     className="fixed w-[260px] rounded-xl bg-bg-elevated border border-border shadow-xl p-2 animate-slide-up z-[60]"

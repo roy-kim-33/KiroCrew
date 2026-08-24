@@ -143,6 +143,25 @@ describe('App routing', () => {
       onboarded: false,
       import_onboarded: false,
     } as never)
+    // Keep the import chapter open after its scan. An empty scan deliberately
+    // auto-completes the chapter, so asserting on the transient dialog races
+    // that completion under a loaded test shard.
+    vi.mocked(api.onboardingImportScan).mockResolvedValueOnce({
+      sources: [{
+        id: 'codex',
+        name: 'Codex',
+        detected: true,
+        detail: '~/.codex',
+        categories: [{
+          id: 'instructions',
+          label: 'Instructions',
+          count: 1,
+          description: 'Agent instructions',
+        }],
+      }],
+      skipped: [],
+      merge_only: true,
+    } as never)
 
     renderWithProviders(<App />, { route: '/chat' })
 
@@ -632,6 +651,45 @@ describe('App routing', () => {
     }
   })
 
+  it('invalidates the registry query on mc:apps-changed so install state refreshes', async () => {
+    // The Explore shelf renders Get vs Installed from the server-computed
+    // `installed` flag on the `['registry']` rows, cached with a multi-minute
+    // staleTime. Install/uninstall surfaces announce themselves via
+    // mc:apps-changed; the handler must drop that cache or a just-installed
+    // registry app keeps showing a "Get" button until the cache expires.
+    const { queryClient } = renderWithProviders(<App />, { route: '/chat' })
+    queryClient.setQueryData(['registry'], { apps: [] })
+    expect(queryClient.getQueryState(['registry'])?.isInvalidated).toBe(false)
+    act(() => { window.dispatchEvent(new Event('mc:apps-changed')) })
+    await waitFor(() => {
+      expect(queryClient.getQueryState(['registry'])?.isInvalidated).toBe(true)
+    })
+  })
+
+  it('marks the apps cache stale on mc:apps-changed even when the refetch fails', async () => {
+    // Dispatch sites do not invalidate ['apps'] themselves; this listener
+    // owns that cache. refreshAppNav publishes fresh data only on fetch
+    // SUCCESS, so the handler must invalidate the cache up front — otherwise
+    // a retry-exhausted refetch chain would leave stale ['apps'] rows marked
+    // fresh.
+    const { api } = await import('../api/client')
+    const listApps = api.listApps as ReturnType<typeof vi.fn>
+    listApps.mockReset()
+    listApps.mockRejectedValue(new Error('gateway down'))
+    try {
+      const { queryClient } = renderWithProviders(<App />, { route: '/chat' })
+      queryClient.setQueryData(['apps'], [])
+      expect(queryClient.getQueryState(['apps'])?.isInvalidated).toBe(false)
+      act(() => { window.dispatchEvent(new Event('mc:apps-changed')) })
+      await waitFor(() => {
+        expect(queryClient.getQueryState(['apps'])?.isInvalidated).toBe(true)
+      })
+    } finally {
+      listApps.mockReset()
+      listApps.mockResolvedValue([])
+    }
+  })
+
   it('shows a portaled hover label for a collapsed (icon-only) nav item', async () => {
     // Covers useNavTip: in collapsed mode nav rows hide their text label and
     // instead show it via a portal to <body> on hover (so the rail's vertical
@@ -766,22 +824,33 @@ describe('App routing', () => {
   it('renders the search trigger in the header centre track, not as a positioned overlay', () => {
     renderWithProviders(<App />, { route: '/chat' })
     const trigger = screen.getByRole('button', { name: 'Search sessions, files, and commands' })
-    // The trigger is a flow item now: it fills its grid track (`w-full`) and
-    // carries no positioning of its own. The previous implementation centred it
-    // on `50vw` with a JS-measured inline width, which is what forced it to
-    // reserve `max(left, right)` on BOTH sides and drop itself once that
-    // mirrored gutter fell under a floor.
-    expect(trigger).toHaveClass('w-full')
+    // The trigger is a flow item now: it fills its grid track and carries no
+    // positioning of its own. The previous implementation centred it on `50vw`
+    // with a JS-measured inline width, which is what forced it to reserve
+    // `max(left, right)` on BOTH sides and drop itself once that mirrored gutter
+    // fell under a floor.
+    //
+    // It shares the centre CELL with the focus-mode toggle, so it fills that
+    // cell (`flex-1`) rather than the track directly — the cell is what fills
+    // the track. Both halves of the original assertion still hold: nothing here
+    // is positioned, and the header keeps exactly three in-flow children.
+    expect(trigger).toHaveClass('flex-1')
     expect(trigger).not.toHaveClass('absolute')
     expect(trigger.style.left).toBe('')
     expect(trigger.style.width).toBe('')
-    // Header children, in order: left group · trigger · actions group. The
+    // Header children, in order: left group · centre cell · actions group. The
     // three-track grid depends on that being exactly three in-flow children.
-    const header = trigger.parentElement!
+    const centre = trigger.parentElement!
+    const header = centre.parentElement!
     const flow = [...header.children].filter(el => !el.className.includes('absolute'))
     expect(flow[0]).toHaveClass('tb-left')
-    expect(flow[1]).toBe(trigger)
+    expect(flow[1]).toBe(centre)
     expect(flow[2]).toHaveClass('tb-right')
+    // The centre cell holds the trigger and the focus-mode toggle, and nothing
+    // else: a third control there is what website/AUTOSDE.yaml's
+    // max-two-buttons-per-row rule forbids.
+    expect([...centre.children]).toHaveLength(2)
+    expect(centre.children[1]).toBe(screen.getByTestId('focus-mode-toggle'))
   })
 
   it('sizes the top-bar search from the window alone, with equal side tracks', () => {
@@ -1250,10 +1319,18 @@ describe('onCycleAgent keyboard shortcut', () => {
     store.dispatch({ type: 'dashboard/sseSlots', payload: [{ key: 'slot-1', messages: 0, running: false, agent: 'kirocrew' }] })
     store.dispatch({ type: 'chat/setActiveSlot', payload: 'slot-1' })
     renderWithProviders(<App />, { route: '/chat' })
-    act(() => {
+    // The switch now rides performSlotSwitch (#5120), so the API call lands a
+    // microtask after the keydown — flush with an async act.
+    await act(async () => {
       document.dispatchEvent(new KeyboardEvent('keydown', { key: 'A', code: 'KeyA', altKey: true, shiftKey: true, bubbles: true }))
     })
     expect(api.chatSlotAgent).toHaveBeenCalledWith('slot-1', 'reviewer')
+    // The pick must land in the store WITHOUT a slots round trip (#5120):
+    // no websocket exists in this harness, so only the optimistic write can
+    // move the row. The mock resolves {} — the requested-name fallback path.
+    await waitFor(() => expect(
+      store.getState().dashboard.slots.find((s: { key: string }) => s.key === 'slot-1')?.agent,
+    ).toBe('reviewer'))
   })
 
   it('does not call api.chatSlotAgent when no active slot', async () => {
@@ -1281,7 +1358,9 @@ describe('onCycleAgent keyboard shortcut', () => {
     store.dispatch({ type: 'chat/setActiveSlot', payload: 'slot-1' })
     renderWithProviders(<App />, { route: '/chat' })
 
-    act(() => {
+    // The switch now rides performSlotSwitch (#5120): flush the microtask
+    // chain so both the API call and the failure notice land.
+    await act(async () => {
       document.dispatchEvent(new KeyboardEvent('keydown', { key, code, altKey: true, shiftKey: true, bubbles: true }))
     })
 
@@ -1347,6 +1426,51 @@ describe('onCycleAgent edge cases', () => {
     })
     expect(api.chatSlotAgent).not.toHaveBeenCalled()
     useAgentsMock.mockReturnValue({ agents: [{ name: 'kirocrew' }, { name: 'reviewer' }, { name: 'oracle' }], defaultAgent: 'kirocrew' })
+  })
+})
+
+describe('onCycleReasoningEffort keyboard shortcut (#5120)', () => {
+  it('steps a burst from the in-flight target and writes the adjudicated level', async () => {
+    const { api } = await import('../api/client')
+    const { store } = await import('../store')
+    ;(api.chatSlotReasoningEffort as ReturnType<typeof vi.fn>).mockClear()
+    store.dispatch({ type: 'dashboard/sseSlots', payload: [{ key: 'slot-1', messages: 0, running: false, agent: 'kirocrew', reasoning_effort: 'max' }] })
+    store.dispatch({ type: 'chat/setActiveSlot', payload: 'slot-1' })
+    renderWithProviders(<App />, { route: '/chat' })
+    // Two presses in one synchronous batch: the first pick is still in
+    // flight when the second press computes its base. From 'max' the first
+    // press targets '' (clear the override — a REAL target), so the second
+    // press's base MUST come from pendingSlotSwitchTarget: reading the store
+    // (still 'max', nothing settled) would issue '' twice, and the ''-falsy
+    // accessor would misread the in-flight '' the same way.
+    await act(async () => {
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'D', code: 'KeyD', altKey: true, shiftKey: true, bubbles: true }))
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'D', code: 'KeyD', altKey: true, shiftKey: true, bubbles: true }))
+    })
+    expect(api.chatSlotReasoningEffort).toHaveBeenNthCalledWith(1, 'slot-1', '')
+    expect(api.chatSlotReasoningEffort).toHaveBeenNthCalledWith(2, 'slot-1', 'low')
+    // The adjudicated survivor (the newest pick) lands in the store without
+    // a slots round trip — no websocket exists in this harness.
+    await waitFor(() => expect(
+      store.getState().dashboard.slots.find((s: { key: string }) => s.key === 'slot-1')?.reasoning_effort,
+    ).toBe('low'))
+  })
+
+  it('cycles backward on Alt+Shift+C and writes the store', async () => {
+    const { api } = await import('../api/client')
+    const { store } = await import('../store')
+    ;(api.chatSlotReasoningEffort as ReturnType<typeof vi.fn>).mockClear()
+    store.dispatch({ type: 'dashboard/sseSlots', payload: [{ key: 'slot-1', messages: 0, running: false, agent: 'kirocrew', reasoning_effort: 'low' }] })
+    store.dispatch({ type: 'chat/setActiveSlot', payload: 'slot-1' })
+    renderWithProviders(<App />, { route: '/chat' })
+    await act(async () => {
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'C', code: 'KeyC', altKey: true, shiftKey: true, bubbles: true }))
+    })
+    // 'low' is index 1; backward reaches '' (provider default).
+    expect(api.chatSlotReasoningEffort).toHaveBeenCalledWith('slot-1', '')
+    await waitFor(() => expect(
+      store.getState().dashboard.slots.find((s: { key: string }) => s.key === 'slot-1')?.reasoning_effort,
+    ).toBe(''))
   })
 })
 
@@ -1453,7 +1577,9 @@ describe('onCycleApprovalMode and onCyclePrevAgent shortcuts', () => {
     store.dispatch({ type: 'dashboard/sseSlots', payload: [{ key: 'slot-1', messages: 0, running: false, agent: 'reviewer' }] })
     store.dispatch({ type: 'chat/setActiveSlot', payload: 'slot-1' })
     renderWithProviders(<App />, { route: '/chat' })
-    act(() => {
+    // Async act: the switch protocol (#5120) chains the wire call on a
+    // microtask, so the mock is invoked a tick after the keydown.
+    await act(async () => {
       document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Z', code: 'KeyZ', altKey: true, shiftKey: true, bubbles: true }))
     })
     expect(api.chatSlotAgent).toHaveBeenCalledWith('slot-1', 'kirocrew')

@@ -1,9 +1,7 @@
-# Superpowers docs
+# Agentic Implementation Plans
 
-Brainstorming specs and implementation plans for RoyCrew feature work.
+Contributor-facing execution plans produced from accepted design documents.
+These plans are implementation checklists, not current-behavior contracts; the
+owning system spec remains authoritative after a change ships.
 
-- [Design specs](specs/) — approved feature designs (`YYYY-MM-DD-<topic>-design.md`)
-- [Implementation plans](plans/) — task-by-task build plans (`YYYY-MM-DD-<topic>.md`)
-
-Convention: a feature is brainstormed into a design spec first, then expanded
-into an implementation plan, then executed task-by-task.
+- [plans/](plans/README.md) — dated implementation plans.

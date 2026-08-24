@@ -36,6 +36,25 @@ _POSIX_ONLY = pytest.mark.skipif(
 )
 
 
+@pytest.fixture(autouse=True)
+def _venv_maps_to_the_synced_checkout():
+    """Answer the sync's foreign-venv guard with "it maps", for tests not about it.
+
+    Both install paths now refuse a venv that serves a DIFFERENT checkout, and
+    answering that question RUNS the target interpreter — which every sync test
+    here points at a path that does not exist. Stubbing both halves keeps an
+    unrelated assertion from turning into an unrunnable-interpreter refusal. The
+    guard's own behaviour is asserted by
+    ``test_sync_refuses_a_venv_that_serves_another_checkout``, which patches it
+    back to a refusal, and the logic behind it lives in ``test/test_dep_sync.py``.
+    """
+    from kiro_crew import dep_sync
+
+    with patch.object(dep_sync, "installed_package_origin", return_value="<stubbed>"), \
+         patch.object(dep_sync, "venv_not_mapped_to", return_value=None):
+        yield
+
+
 # --- worktree porcelain parsing ---
 def test_parse_worktree_porcelain_basic():
     from kiro_crew.apps.builtins.dev_fleet.server import _parse_worktree_porcelain
@@ -254,17 +273,22 @@ async def test_remove_refuses_when_branch_oid_diverged():
     """Squash-safe race guard: branch OID != PR headRefOid -> refuse removal."""
     import kiro_crew.apps.builtins.dev_fleet.server as mod
 
+    full_head = "a" * 40
+    cache = AsyncMock(return_value={"state": "MERGED"})
+    git = AsyncMock(return_value=full_head)
     with patch.object(mod, "_find_worktree", new_callable=AsyncMock,
                       return_value=({"path": "/fake/wt", "branch": "feat-x", "is_main": False}, None)), \
          patch.object(mod, "_real_dirty", new_callable=AsyncMock, return_value=False), \
-         patch.object(mod, "_pr_status_cached", new_callable=AsyncMock, return_value={"state": "MERGED"}), \
+         patch.object(mod, "_pr_status_cached", cache), \
          patch.object(mod, "_own_commits_count", new_callable=AsyncMock, return_value=3), \
-         patch.object(mod, "_git", new_callable=AsyncMock, return_value="aaa1111"), \
-         patch.object(mod, "_fetch_pr_head_oid", new_callable=AsyncMock, return_value="bbb2222"), \
+         patch.object(mod, "_git", git), \
+         patch.object(mod, "_fetch_pr_head_oid", new_callable=AsyncMock, return_value="b" * 40), \
          patch.object(mod, "_upstream_remote", new_callable=AsyncMock, return_value="origin"):
         result = await mod._worktree_remove("feat-x", force=False)
     assert result["ok"] is False
     assert "OID diverged" in result["error"]
+    git.assert_any_await("/fake/wt", "rev-parse", "HEAD")
+    cache.assert_awaited_once_with("feat-x", full_head)
 
 
 @pytest.mark.asyncio
@@ -890,88 +914,9 @@ async def test_sync_script_emits_step_markers():
 
 
 # --- Windows: a write-locked console script must not be handed to pip ---
-def _make_scripts(tmp_path, *names):
-    """A fake venv Scripts/ dir, returning the interpreter path inside it."""
-    scripts = tmp_path / ".venv" / "Scripts"
-    scripts.mkdir(parents=True)
-    for name in names:
-        (scripts / name).write_bytes(b"MZ")
-    return scripts / "python.exe"
-
-
-def _raise_on(monkeypatch, name, exc):
-    """Make Path.open raise *exc* for the file called *name* only."""
-    real_open = Path.open
-
-    def fake_open(self, *args, **kwargs):
-        if self.name == name:
-            raise exc
-        return real_open(self, *args, **kwargs)
-
-    monkeypatch.setattr(Path, "open", fake_open)
-
-
-def test_write_locked_console_scripts_is_a_posix_noop(tmp_path, monkeypatch):
-    """POSIX can unlink an executing binary, so there is nothing to detect."""
-    import kiro_crew.apps.builtins.dev_fleet.server as mod
-
-    py = _make_scripts(tmp_path, "kirocrew.exe")
-    monkeypatch.setattr(platform_compat, "IS_WINDOWS", False)
-    _raise_on(monkeypatch, "kirocrew.exe", PermissionError(13, "in use"))
-
-    assert mod._write_locked_console_scripts(py) == []
-
-
-def test_write_locked_console_scripts_flags_a_locked_script(tmp_path, monkeypatch):
-    """The real failure: the exe the gateway is executing cannot be replaced."""
-    import kiro_crew.apps.builtins.dev_fleet.server as mod
-
-    py = _make_scripts(tmp_path, "kirocrew.exe")
-    monkeypatch.setattr(platform_compat, "IS_WINDOWS", True)
-    _raise_on(monkeypatch, "kirocrew.exe", PermissionError(13, "in use"))
-
-    locked = mod._write_locked_console_scripts(py)
-    assert len(locked) == 1
-    assert locked[0].endswith("kirocrew.exe")
-
-
-def test_write_locked_console_scripts_passes_a_writable_script(tmp_path, monkeypatch):
-    """A venv the gateway is NOT running from must still get its reinstall."""
-    import kiro_crew.apps.builtins.dev_fleet.server as mod
-
-    py = _make_scripts(tmp_path, "kirocrew.exe")
-    monkeypatch.setattr(platform_compat, "IS_WINDOWS", True)
-
-    assert mod._write_locked_console_scripts(py) == []
-
-
-def test_write_locked_console_scripts_ignores_unrelated_executables(tmp_path, monkeypatch):
-    """Only the scripts pip would rewrite matter.
-
-    Some other locked exe sharing the Scripts dir must not suppress the
-    reinstall — that would turn an unrelated process into a silent skip.
-    """
-    import kiro_crew.apps.builtins.dev_fleet.server as mod
-
-    py = _make_scripts(tmp_path, "kirocrew.exe", "unrelated.exe")
-    monkeypatch.setattr(platform_compat, "IS_WINDOWS", True)
-    _raise_on(monkeypatch, "unrelated.exe", PermissionError(13, "in use"))
-
-    assert mod._write_locked_console_scripts(py) == []
-
-
-def test_write_locked_console_scripts_lets_pip_judge_other_errors(tmp_path, monkeypatch):
-    """An unreadable-for-other-reasons script is not evidence of a lock.
-
-    Skipping on any OSError would suppress installs that would have worked.
-    """
-    import kiro_crew.apps.builtins.dev_fleet.server as mod
-
-    py = _make_scripts(tmp_path, "kirocrew.exe")
-    monkeypatch.setattr(platform_compat, "IS_WINDOWS", True)
-    _raise_on(monkeypatch, "kirocrew.exe", OSError(5, "I/O error"))
-
-    assert mod._write_locked_console_scripts(py) == []
+# The probe itself moved to kiro_crew.dep_sync with the substitute it feeds, and
+# its tests moved with it (test/test_dep_sync.py). What stays here is the sync's
+# use of the result: which install step gets built.
 
 
 def _steps_from_script(script):
@@ -1004,6 +949,9 @@ async def _run_sync(mod, locked):
     ambient makes them pass or fail on whether the HOST running them happens to
     sit in a Kiro Crew checkout. Assertions that quote the repo path must use
     ``_SYNC_REPO`` rather than reading ``mod.MAIN_REPO``.
+
+    The venv-origin guard is answered by the module's autouse fixture; a test
+    about that guard patches it back to a refusal.
     """
     mod._UPSTREAM_REMOTE = "origin"
     mod._SYNC_RID = None
@@ -1011,7 +959,7 @@ async def _run_sync(mod, locked):
          patch.object(mod, "_git", new_callable=AsyncMock, return_value="main"), \
          patch.object(mod, "_venv_python", return_value=Path("/fake/.venv/bin/python")), \
          patch.object(mod, "_trusted_bin", side_effect=lambda n: f"/usr/bin/{n}"), \
-         patch.object(mod, "_write_locked_console_scripts", return_value=locked), \
+         patch.object(mod.dep_sync, "locked_console_scripts", return_value=locked), \
          patch("kiro_crew.apps.builtins.dev_fleet.server.sandboxed_spawn_argv",
                side_effect=lambda cmd, mode, env=None: (cmd, env or {}, None)), \
          patch.object(mod, "_start_run", new_callable=AsyncMock, return_value="run-123") as mock_start:
@@ -1047,7 +995,7 @@ async def test_sync_substitutes_a_dependency_only_install_when_a_script_is_locke
     Windows layout — the ordinary one — with no working Pull+build at all.
     """
     import kiro_crew.apps.builtins.dev_fleet.server as mod
-    from kiro_crew.apps.builtins.dev_fleet import dep_sync
+    from kiro_crew import dep_sync
 
     result, script = await _run_sync(mod, [r"C:\repo\.venv\Scripts\kirocrew.exe"])
 
@@ -1086,7 +1034,7 @@ async def test_sync_keeps_the_editable_reinstall_when_nothing_is_locked():
     should.
     """
     import kiro_crew.apps.builtins.dev_fleet.server as mod
-    from kiro_crew.apps.builtins.dev_fleet import dep_sync
+    from kiro_crew import dep_sync
 
     result, script = await _run_sync(mod, [])
 
@@ -1129,6 +1077,39 @@ async def test_sync_runs_every_step_when_nothing_is_locked():
     labels = _steps_from_script(script)
     assert "pip install" in labels
     assert "Pull" in labels
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("locked", [[], [r"C:\repo\.venv\Scripts\kirocrew.exe"]],
+                         ids=["reinstall-branch", "substitute-branch"])
+async def test_sync_refuses_a_venv_that_serves_another_checkout(locked):
+    """The refusal covers BOTH install paths, and refuses before either runs.
+
+    `<repo>/.venv` is only where the interpreter was found; it can be an install
+    of a different checkout, and `pip install -e .` would then silently repoint
+    that editable install at this repo — so the OTHER checkout's gateway becomes
+    this code on its next restart. The dependency-only path has always refused
+    this; the reinstall path did not, which left the safer path as the only
+    guarded one. Parametrized over both branches because that asymmetry is
+    exactly the bug: a fix that only covers the one it was found on is not one.
+    """
+    import kiro_crew.apps.builtins.dev_fleet.server as mod
+    from kiro_crew import dep_sync
+
+    with patch.object(
+        dep_sync,
+        "venv_not_mapped_to",
+        return_value="the target venv imports this project from /other/checkout",
+    ):
+        result, script = await _run_sync(mod, locked)
+
+    assert result["ok"] is False
+    assert "/other/checkout" in result["error"]
+    # Remedy-first, like every other refusal on this endpoint.
+    assert "own editable install" in result["error"]
+    # Nothing ran: no fetch, no merge, no install. A refusal after the merge
+    # would leave the checkout moved with its dependencies unresolved.
+    assert script is None
 
 
 @pytest.mark.asyncio
@@ -1276,12 +1257,22 @@ async def test_worktree_remove_force_must_be_bool():
 # --- sync single-flight (409 on busy) ---
 @pytest.mark.asyncio
 async def test_sync_returns_409_when_already_running():
+    import asyncio
+
     import kiro_crew.apps.builtins.dev_fleet.server as mod
 
-    # Inject a fake running sync
+    # Inject a fake running sync with a live task + process
     mod._SYNC_RID = "fake123"
     async with mod._RUNS_LOCK:
         mod._RUNS["fake123"] = {"status": "running", "exit_code": None, "label": "sync", "output": []}
+
+    # Simulate a genuinely-running process (returncode=None)
+    from unittest.mock import MagicMock
+    mock_proc = MagicMock()
+    mock_proc.returncode = None
+    never_done = asyncio.get_event_loop().create_future()
+    running_task = asyncio.ensure_future(never_done)
+    mod._ACTIVE_RUNS["fake123"] = (running_task, mock_proc)
 
     try:
         result = await mod._sync()
@@ -1291,6 +1282,9 @@ async def test_sync_returns_409_when_already_running():
         async with mod._RUNS_LOCK:
             del mod._RUNS["fake123"]
         mod._SYNC_RID = None
+        mod._ACTIVE_RUNS.pop("fake123", None)
+        never_done.set_result(None)
+        await running_task
 
 
 # --- redaction ---
@@ -1402,9 +1396,18 @@ def test_build_pending_false_when_dist_missing():
         mod._START_EPOCH = original_start
 
 
-# --- sync_run_id exposed in fleet response ---
+# --- run pointers are NOT baked into the cached snapshot ---
 @pytest.mark.asyncio
-async def test_fleet_includes_sync_run_id():
+async def test_fleet_build_does_not_bake_run_pointers():
+    """`_build_fleet` must leave the run pointers to the request-time overlay.
+
+    The snapshot it returns is cached and served stale-while-revalidate, so a
+    pointer written here is a frozen answer to a live question: a run started
+    after the build would be invisible until the cache turned over, which is the
+    "no progress, press it again" bug. `_with_live_run_pointers` owns both
+    pointers; this pins that there is only one owner, so a future edit cannot
+    quietly reintroduce a second, staler one.
+    """
     import kiro_crew.apps.builtins.dev_fleet.server as mod
 
     mod._SYNC_RID = "test-rid-abc"
@@ -1421,7 +1424,8 @@ async def test_fleet_includes_sync_run_id():
              patch.object(mod, "_load_cfg", return_value=None), \
              patch.object(mod, "_build_pending", return_value=False):
             data = await mod._build_fleet()
-        assert data["sync_run_id"] == "test-rid-abc"
+        assert "sync_run_id" not in data
+        assert all("provision_run_id" not in w for w in data["worktrees"])
         assert "build_pending" in data
     finally:
         mod._SYNC_RID = None
@@ -1445,53 +1449,25 @@ async def test_fleet_includes_build_pending():
 
 
 # --- provision_run_id exposed in fleet response (reattach after reload) ---
-def _fleet_patches(stack, worktrees):
-    """Patch the fleet-build collaborators shared by the provision-id tests."""
-    stack.enter_context(patch.object(
-        mod, "_discover_worktrees", new_callable=AsyncMock, return_value=worktrees))
-    stack.enter_context(patch.object(mod, "_git_info", new_callable=AsyncMock, return_value={
-        "branch": "b", "head": "abc1234", "dirty": False,
-        "ahead": 0, "behind": 0, "last_updated_at": None,
-    }))
-    stack.enter_context(patch.object(
-        mod, "_pr_status_cached", new_callable=AsyncMock, return_value=None))
-    stack.enter_context(patch.object(
-        mod, "_git_ahead", new_callable=AsyncMock, return_value=0))
-    stack.enter_context(patch.object(
-        mod, "_context_cached", new_callable=AsyncMock,
-        return_value={"issues": [], "tickets": [], "summary": None}))
-    stack.enter_context(patch.object(mod, "_load_cfg", return_value=None))
-    stack.enter_context(patch.object(mod, "_build_pending", return_value=False))
-    stack.enter_context(patch.object(mod, "_POD_IMPORTED", False))
-
-
+# --- provision run-id selection (what a reloaded page can reattach to) ---
+# These pin the SELECTION semantics at their owning unit rather than through a
+# fleet build: the pointer reaches the payload via the request-time overlay
+# (`_with_live_run_pointers`), which
+# `test_fleet_handler_overlays_runs_started_after_snapshot` covers.
 @pytest.mark.asyncio
-async def test_fleet_exposes_provision_run_id_for_running_and_failed_runs():
-    wts = [
-        {"path": "/fake/wt-running", "head": "abc1234", "branch": "f/run", "is_main": False},
-        {"path": "/fake/wt-failed", "head": "abc1234", "branch": "f/fail", "is_main": False},
-    ]
+async def test_provision_reattach_ids_expose_running_and_failed_runs():
     with patch.dict(mod._PROVISION_INFLIGHT, {
         "wt-running": "rid-running", "wt-failed": "rid-failed",
     }, clear=True), patch.dict(mod._RUNS, {
         "rid-running": {"status": "running", "exit_code": None, "output": []},
         "rid-failed": {"status": "done", "exit_code": 1, "output": []},
     }, clear=True):
-        with ExitStack() as stack:
-            _fleet_patches(stack, wts)
-            data = await mod._build_fleet()
-    by_name = {w["name"]: w for w in data["worktrees"]}
-    assert by_name["wt-running"]["provision_run_id"] == "rid-running"
-    assert by_name["wt-failed"]["provision_run_id"] == "rid-failed"
+        rids = await mod._provision_reattach_ids()
+    assert rids == {"wt-running": "rid-running", "wt-failed": "rid-failed"}
 
 
 @pytest.mark.asyncio
-async def test_fleet_omits_provision_run_id_for_successful_and_evicted_runs():
-    wts = [
-        {"path": "/fake/wt-ok", "head": "abc1234", "branch": "f/ok", "is_main": False},
-        {"path": "/fake/wt-gone", "head": "abc1234", "branch": "f/gone", "is_main": False},
-        {"path": "/fake/main", "head": "abc1234", "branch": "main", "is_main": True},
-    ]
+async def test_provision_reattach_ids_omit_successful_and_evicted_runs():
     with patch.dict(mod._PROVISION_INFLIGHT, {
         # Success: nothing to reattach — the fleet row shows the built state.
         "wt-ok": "rid-ok",
@@ -1500,11 +1476,8 @@ async def test_fleet_omits_provision_run_id_for_successful_and_evicted_runs():
     }, clear=True), patch.dict(mod._RUNS, {
         "rid-ok": {"status": "done", "exit_code": 0, "output": []},
     }, clear=True):
-        with ExitStack() as stack:
-            _fleet_patches(stack, wts)
-            data = await mod._build_fleet()
-    for w in data["worktrees"]:
-        assert w["provision_run_id"] is None, w["name"]
+        rids = await mod._provision_reattach_ids()
+    assert rids == {}
 
 
 # --- SEL audit on mutations (Codex R17) ---
@@ -2619,7 +2592,7 @@ async def test_sync_unresolved_git_names_override_not_path(monkeypatch):
          patch.object(mod, "_venv_python",
                       return_value=Path("/fake/.venv/bin/python")), \
          patch.object(mod, "_trusted_bin", side_effect=lambda n: None), \
-         patch.object(mod, "_write_locked_console_scripts", return_value=[]):
+         patch.object(mod.dep_sync, "locked_console_scripts", return_value=[]):
         mod._SYNC_RID = None
         res = await mod._sync()
     assert res["ok"] is False
@@ -3401,6 +3374,20 @@ def _reset_make_live_committed_latch():
     mod._MAKE_LIVE_COMMITTED = False
     yield
     mod._MAKE_LIVE_COMMITTED = False
+
+
+@pytest.fixture(autouse=True)
+def _reset_shutdown_admission_state():
+    """``_SHUTDOWN_IN_PROGRESS`` is set by ``dev_fleet_cleanup`` and never cleared
+    in production (the process exits).  In-process pytest leaks the latched True
+    state into later tests that call ``_start_run`` directly, causing them to
+    raise RuntimeError instead of running normally.  Reset both the flag and the
+    lock around every test to mirror a fresh gateway process."""
+    mod._SHUTDOWN_IN_PROGRESS = False
+    mod._SHUTDOWN_ADMISSION_LOCK = asyncio.Lock()
+    yield
+    mod._SHUTDOWN_IN_PROGRESS = False
+    mod._SHUTDOWN_ADMISSION_LOCK = asyncio.Lock()
 
 
 def _mk_make_live_wt(tmp_path, *, venv: bool = False, dist: bool = False,
@@ -6015,19 +6002,22 @@ async def test_pr_query_one_carries_title_and_hides_body():
     payload = json.dumps([{
         "number": 42, "state": "OPEN",
         "url": "https://github.com/o/r/pull/42", "isDraft": False,
-        "title": "My PR title", "body": "Fixes #7",
+        "title": "My PR title", "body": "Fixes #7", "headRefOid": "a" * 40,
     }])
     with patch.object(mod, "_run_cmd", new_callable=AsyncMock, return_value=(0, payload, "")):
         pr = await mod._pr_query_one("o/r", "feat/x")
     assert pr is not None
     assert pr["title"] == "My PR title"
     assert pr["_body"] == "Fixes #7"
+    assert pr["_head_oid"] == "a" * 40
     assert "body" not in pr  # moved to internal _body
+    assert "headRefOid" not in pr
     redacted = mod._redact_pr(pr)
     assert redacted["title"] == "My PR title"
     assert redacted["number"] == 42
     assert "_body" not in redacted  # internal fields dropped from payload
     assert "_repo" not in redacted
+    assert "_head_oid" not in redacted
 
 
 # --- _build_context: parses PR body + commits, builds links ---
@@ -6168,6 +6158,29 @@ async def test_fleet_payload_marks_an_inferred_main_checkout():
 
     assert fleet["main_repo"] == mod.MAIN_REPO
     assert fleet["main_repo_inferred"] is True
+
+
+@pytest.mark.asyncio
+async def test_fleet_payload_redacts_credentials_in_main_repo():
+    sensitive = f"/tmp/ghp_{'A' * 40}/checkout"
+    with patch.object(mod, "_repo", return_value=sensitive):
+        fleet = await _fleet_with(
+            [{"path": "/repo", "branch": "main", "is_main": True}]
+        )
+
+    assert "ghp_" not in fleet["main_repo"]
+    assert "[REDACTED" in fleet["main_repo"]
+
+
+@pytest.mark.asyncio
+async def test_fleet_payload_preserves_ordinary_main_repo_path():
+    ordinary = "/home/user/oss/KiroCrew"
+    with patch.object(mod, "_repo", return_value=ordinary):
+        fleet = await _fleet_with(
+            [{"path": "/repo", "branch": "main", "is_main": True}]
+        )
+
+    assert fleet["main_repo"] == ordinary
 
 
 @pytest.mark.asyncio
@@ -9052,3 +9065,124 @@ async def test_gateway_start_id_foreground_fallback(monkeypatch, tmp_path):
          patch.object(mod, "shutil",
                       MagicMock(which=MagicMock(return_value=None))):
         assert await mod._gateway_start_id() is None
+
+
+# ---------------------------------------------------------------------------
+# Regression tests: make-live artifact validation inside the cutover lock
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+@_POSIX_ONLY
+async def test_make_live_artifact_changed_before_lock_is_revalidated(
+    monkeypatch, tmp_path
+):
+    """Artifacts that are valid at early-probe time but gone before the lock
+    is acquired are caught by the in-lock re-validation.
+
+    A side-effecting lock wrapper removes the venv binary at the instant the
+    lock is acquired, reproducing a concurrent provision that replaces the
+    binary between the early check and the commit.  The cutover must refuse
+    with ``missing_venv`` and must NOT write the pointer.
+
+    Without the production fix the early probe passes, the lock is acquired,
+    and the cutover proceeds to write the pointer and stage a restart — the
+    stale validation is never repeated and the race window is not closed.
+    This test proves the ordering by observing the final response code and
+    the pointer-file state.
+    """
+    wt = _mk_make_live_wt(tmp_path, venv=True, dist=True)
+    ptr_dir = tmp_path / "ptr"
+    _stub_make_live(monkeypatch, wt, pointer_dir=ptr_dir)
+    monkeypatch.setattr(mod, "_MAKE_LIVE_COMMITTED", False)
+
+    kcbin = wt / ".venv" / "bin" / "kirocrew"
+
+    # Wrap _MAKE_LIVE_LOCK so that entering the lock removes the binary,
+    # simulating a concurrent rebuild that completes between the early probe
+    # and the lock-acquire.
+    real_lock = asyncio.Lock()
+
+    class _SideEffectLock:
+        """Proxy that removes *kcbin* when the lock body is entered."""
+
+        def locked(self) -> bool:
+            return real_lock.locked()
+
+        async def __aenter__(self):
+            await real_lock.__aenter__()
+            # Binary vanishes at the moment the lock body begins.
+            kcbin.unlink(missing_ok=True)
+            return self
+
+        async def __aexit__(self, *args):
+            return await real_lock.__aexit__(*args)
+
+    monkeypatch.setattr(mod, "_MAKE_LIVE_LOCK", _SideEffectLock())
+
+    res = await mod._make_live(str(wt), dry_run=False)
+
+    assert res["ok"] is False, (
+        "cutover must be refused when the binary disappears inside the lock; "
+        "got ok=True — the in-lock re-validation is absent or not running"
+    )
+    assert res["code"] == "missing_venv", (
+        f"expected missing_venv from in-lock re-validation, got {res.get('code')!r}"
+    )
+    ptr_file = ptr_dir / "live_target.json"
+    assert not ptr_file.exists(), (
+        "the live-target pointer must NOT be written when in-lock re-validation fails"
+    )
+
+
+@pytest.mark.asyncio
+@_POSIX_ONLY
+async def test_make_live_artifact_checks_are_executor_offloaded(
+    monkeypatch, tmp_path
+):
+    """The artifact filesystem checks (``is_file`` / ``os.access``) are
+    submitted to ``loop.run_in_executor`` rather than called inline on the
+    event loop, preventing a slow or network-backed filesystem from stalling
+    all Dev Fleet requests.
+
+    The test wraps ``subprocess_executor()`` to record every callable submitted
+    via ``loop.run_in_executor``.  A helper named ``_validate_artifacts_sync``
+    must be submitted at least twice — once for the early probe and once for
+    the in-lock re-validation — proving the checks are offloaded.
+
+    Without the production fix, the checks are plain synchronous expressions
+    (``kcbin.is_file()``, ``os.access()``, ``dist_index.is_file()``) executed
+    inline; no callable named ``_validate_artifacts_sync`` is ever submitted.
+    """
+    wt = _mk_make_live_wt(tmp_path, venv=True, dist=True)
+    ptr_dir = tmp_path / "ptr"
+    _stub_make_live(monkeypatch, wt, pointer_dir=ptr_dir)
+    monkeypatch.setattr(mod, "_MAKE_LIVE_COMMITTED", False)
+    monkeypatch.setattr(mod, "_MAKE_LIVE_LOCK", asyncio.Lock())
+
+    submitted_qualnames: list[str] = []
+
+    # Intercept every run_in_executor call by wrapping the event loop's method.
+    # asyncio.get_running_loop() inside _make_live returns the SAME object that
+    # asyncio.get_event_loop() returns under pytest-asyncio's per-test loop.
+    # We patch the loop object's method directly so the intercept is in place
+    # when _make_live calls loop.run_in_executor(…).
+    running_loop = asyncio.get_running_loop()
+    real_run_in_executor = running_loop.run_in_executor
+
+    async def _recording_run_in_executor(executor, fn, *args):
+        submitted_qualnames.append(fn.__qualname__)
+        return await real_run_in_executor(executor, fn, *args)
+
+    monkeypatch.setattr(running_loop, "run_in_executor", _recording_run_in_executor)
+
+    await mod._make_live(str(wt), dry_run=False)
+
+    validate_submissions = [
+        q for q in submitted_qualnames if "_validate_artifacts_sync" in q
+    ]
+    assert len(validate_submissions) >= 2, (
+        "artifact validation must be submitted to the executor at least twice "
+        "(early probe + in-lock re-validation); "
+        f"all submitted callables: {submitted_qualnames!r}.  "
+        "Zero entries means the checks are still inline on the event loop."
+    )

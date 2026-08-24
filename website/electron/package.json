@@ -1,6 +1,6 @@
 {
   "name": "roycrew",
-  "version": "0.3.0-roycrew.1",
+  "version": "0.5.0-roycrew.1",
   "description": "RoyCrew — AI agent desktop app (fork of Kiro Crew)",
   "homepage": "https://github.com/roy-kim-33/KiroCrew",
   "desktopName": "roycrew.desktop",
@@ -19,7 +19,7 @@
   "devDependencies": {
     "@electron/notarize": "^3.1.1",
     "electron": "^43.2.0",
-    "electron-builder": "^26.15.3"
+    "electron-builder": "26.15.3"
   },
   "overrides": {
     "fast-uri": "3.1.5",
@@ -43,7 +43,8 @@
       "x64ArchFiles": "{**/backend-dist/**,**/backend-dist/**/.*/**}",
       "extendInfo": {
         "CFBundleDisplayName": "RoyCrew",
-        "NSMicrophoneUsageDescription": "RoyCrew uses the microphone for voice input and dictation in chat. Audio is captured only while you hold or toggle the mic button."
+        "NSMicrophoneUsageDescription": "RoyCrew uses the microphone for voice input and dictation in chat. Audio is captured only while you hold or toggle the mic button.",
+        "NSLocalNetworkUsageDescription": "RoyCrew connects to devices on your local network so agent commands can reach your own servers, NAS, containers, and dev machines. Only the addresses a command names are contacted."
       }
     },
     "afterSign": "scripts/notarize.js",
@@ -139,12 +140,16 @@
       "instance-guard.js",
       "context-menu.js",
       "find-bin.js",
+      "mac-env.js",
+      "bundle-integrity.js",
       "data-home.js",
       "auto-update.js",
       "update-logger.js",
       "bundle-location.js",
       "gateway-auth-hint.js",
       "blocking-prompt.js",
+      "hide-to-tray.js",
+      "html-fullscreen.js",
       "gateway-stop.js",
       "gateway-wait.js",
       "sandbox-profile.js",
@@ -152,18 +157,22 @@
       "home-dir.js",
       "local-token.js",
       "local-gateway.js",
+      "mochi-session-token.js",
       "window-state.js",
       "linux-frame.js",
       "global-hotkey.js",
       "gateway-liveness.js",
       "gateway-recovery.js",
+      "renderer-recovery.js",
       "pyspy-dump.js",
       "perf-metrics.js",
       "host-config.js",
+      "store-rename.js",
       "remote-token.js",
       "token-acquire.js",
       "token-retry.js",
       "display-media.js",
+      "focus-chrome.js",
       "permission-handler.js",
       "browser-view.js",
       "browser-control.js",

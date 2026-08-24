@@ -27,8 +27,10 @@ import pytest
 import yarl
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
+from windows_sim import replace_sharing_violation
 
 from conftest import requires_symlinks
+from kiro_crew import atomic_write as atomic_write_mod
 from kiro_crew import platform_compat
 from kiro_crew.apps.builtins.md_notebook import git_ops
 
@@ -1127,6 +1129,27 @@ async def test_concurrent_clones_do_not_lose_a_vault(fixtures) -> None:
         assert len(listing["vaults"]) == 2, listing
 
 
+def test_vault_registry_commit_retries_windows_sharing_violation(
+    fixtures, monkeypatch
+) -> None:
+    """A transient Windows handle on vaults.json must not lose a clone.
+
+    Clone/attach mutations are serialized, but Windows Search or an AV scanner
+    can still hold the registry open when the atomic rename lands. The shared
+    retry helper absorbs that bounded sharing-violation window.
+    """
+    server_mod, _remote, _seed = fixtures
+    monkeypatch.setattr(platform_compat, "IS_WINDOWS", True)
+    monkeypatch.setattr(atomic_write_mod, "_REPLACE_BACKOFF_SECONDS", 0)
+    vaults = [{"id": "v1", "localPath": "vault-one"}]
+
+    with replace_sharing_violation(match="vaults.json", times=1) as state:
+        server_mod._write_vaults_sync(vaults)
+
+    assert json.loads(server_mod._vaults_json().read_text(encoding="utf-8")) == vaults
+    assert state["n"] == 2, "the transient rename must be retried exactly once"
+
+
 # ---------------------------------------------------------------------------
 # Notes
 # ---------------------------------------------------------------------------
@@ -1141,11 +1164,45 @@ async def test_note_listing(fixtures) -> None:
         assert status == 200
         by_path = {n["path"]: n for n in body["notes"]}
         assert set(by_path) == {"One.md", "sub/Two.md"}
-        # Frontmatter title wins; otherwise the filename is used.
+        # The filename is the label. The seed's frontmatter `title` happens to
+        # equal its filename, so the divergent case is pinned separately below.
         assert by_path["sub/Two.md"]["title"] == "Two"
         assert by_path["One.md"]["title"] == "One"
         assert by_path["One.md"]["createdAt"] > 0
         assert by_path["One.md"]["syncStatus"] == "synced"
+
+
+@pytest.mark.asyncio
+async def test_display_name_is_the_filename_not_a_frontmatter_title(fixtures) -> None:
+    """A frontmatter ``title`` names a wikilink target, not the note in the rail.
+
+    One note must read the same on every surface -- the rail row, the editor header
+    and a search hit -- because the rail's rename field is seeded from that label
+    and renames the FILE. So display is the filename, while a link written against
+    a frontmatter title still resolves.
+    """
+    _mod, remote, _seed = fixtures
+    async with signed_client(_mod) as client:
+        await _clone(client, remote)
+        named = {"path": "Named.md", "content": "---\ntitle: A Different Title\n---\n\nbody\n"}
+        linker = {"path": "Linker.md", "content": "points at [[A Different Title]]\n"}
+        assert (await client.put("/api/note", named))[0] == 200
+        assert (await client.put("/api/note", linker))[0] == 200
+
+        status, body = await client.get("/api/notes")
+        assert status == 200, body
+        assert {n["path"]: n["title"] for n in body["notes"]}["Named.md"] == "Named"
+
+        # A search hit reads the same as the tree row for the same note, which also
+        # means the filename is what the boosted field matches on.
+        status, body = await client.get("/api/search?q=Named")
+        assert status == 200, body
+        assert {r["path"]: r["title"] for r in body["results"]}["Named.md"] == "Named"
+
+        # Resolution is unchanged: the frontmatter title is still a link target.
+        status, body = await client.get("/api/note?path=Named.md")
+        assert status == 200, body
+        assert [b["sourcePath"] for b in body["backlinks"]] == ["Linker.md"]
 
 
 @pytest.mark.asyncio
