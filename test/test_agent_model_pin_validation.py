@@ -263,13 +263,13 @@ class TestNoRedundantConfigLoad:
         monkeypatch.setattr(core, "_active_advertised_ids", lambda request: ["claude-opus-4.8"])
 
         reason = agents._model_pin_rejected(
-            "claude-opus-4-8", SimpleNamespace(app={}), provider="acp"
+            "claude-opus-4-8", SimpleNamespace(app={}), backend=""
         )
 
         assert reason is not None
         assert "registry maps that spelling to 'claude-opus-4.5'" in reason
 
-    def test_claude_code_provider_keeps_its_wire_id(self, monkeypatch):
+    def test_claude_backend_keeps_its_wire_id(self, monkeypatch):
         from kiro_crew.dashboard.handlers import agents, core
 
         monkeypatch.setattr(core, "_active_advertised_ids", lambda request: ["claude-opus-4-8"])
@@ -277,7 +277,7 @@ class TestNoRedundantConfigLoad:
         reason = agents._model_pin_rejected(
             "global.anthropic.claude-opus-4-8",
             SimpleNamespace(app={}),
-            provider="claude_code",
+            backend="claude",
         )
 
         assert reason is None

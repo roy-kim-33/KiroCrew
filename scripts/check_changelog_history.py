@@ -192,6 +192,9 @@ def grammar_of(renderer: object) -> Grammar:
 HEAD_GRAMMAR = grammar_of(_renderer)
 
 
+_FORK_RELEASE_SUFFIX_RE = re.compile(r"-(?:roycrew|customapi)\.\d+$")
+
+
 def is_shipped_heading(version: str, grammar: Grammar = HEAD_GRAMMAR) -> bool:
     """True when ``version`` is a bare release (``X.Y.Z``), not a draft.
 
@@ -204,6 +207,14 @@ def is_shipped_heading(version: str, grammar: Grammar = HEAD_GRAMMAR) -> bool:
     stripped = version.strip()
     if not stripped or not stripped[0].isdigit():
         return False
+    # Fork exception. Upstream's prereleases are insider/nightly builds nobody
+    # installs, so a suffix means "draft". This fork's suffix is an IDENTITY
+    # marker on a real GitHub release (0.5.0-roycrew.1 is shipped, downloadable,
+    # and what the desktop updater serves), so those sections are history and
+    # must be as immutable as a bare one. "customapi" is the same marker under
+    # the fork's previous name.
+    if _FORK_RELEASE_SUFFIX_RE.search(stripped):
+        return True
     return bool(grammar.fold(stripped) == stripped)
 
 

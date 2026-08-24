@@ -4170,7 +4170,6 @@ class TestAutoApplyUpdateResetPath:
 # ═══════════════════════════════════════════════════════════════════════════
 
 
-
 # ═══════════════════════════════════════════════════════════════════════════
 # Tests: _interactive_approval with thread context
 # ═══════════════════════════════════════════════════════════════════════════
@@ -7478,4 +7477,3 @@ class TestProviderNotificationIsVisible:
         assert handlers._update_info["update_available"] is True
         assert handlers._update_info["latest_version"] == "9.9.9"
         ds.push_refresh.assert_called_with("update_available")
-

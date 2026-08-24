@@ -4423,6 +4423,7 @@ class TestTextOnlyResumeGuard:
         # False could replay image blocks onto a text-only model).
         assert _model_is_text_only_for_session(_Cfg(), "oc/deepseek-v4-flash") is True
 
+
 class TestIneffectiveCompactionCooldown:
     """A compaction that completes but frees no meaningful headroom keeps the
     failure cooldown instead of clearing it — otherwise every "successful"

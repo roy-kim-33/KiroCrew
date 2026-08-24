@@ -442,8 +442,14 @@ class TestWorkerPromptInterpreter(unittest.TestCase):
         return [D.build_review_task(self.LINK), D.build_review_followup_task(self.LINK)]
 
     def test_no_prompt_names_a_bare_interpreter(self):
+        # Bare means STANDALONE. A plain substring check also matches the tail of
+        # the resolved path when the interpreter is itself named python3
+        # (".venv/bin/python3 sage_lib/..."), which is the normal shape on any
+        # venv and would fail this for the exact thing it is asking for.
         for p in self._prompts():
-            self.assertNotIn("python3 ", p)
+            self.assertIsNone(
+                re.search(r"(?<![\w./-])python3 ", p), "prompt names a bare python3"
+            )
             self.assertNotIn("`python ", p)
 
     def test_every_script_command_carries_the_resolved_interpreter(self):

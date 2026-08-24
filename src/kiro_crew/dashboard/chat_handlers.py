@@ -3735,7 +3735,7 @@ def _model_rejected_reason(model_name: str, backend: str | None = None) -> str |
     if model_registry.is_canonical_key(model_name):
         return (
             f"{model_name!r} is a display-only model identifier the "
-            f"{acp_backend or 'active'} provider does not accept; "
+            f"{backend or 'active'} provider does not accept; "
             f"select a listed model or 'auto'."
         )
     return None

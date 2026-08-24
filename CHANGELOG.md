@@ -3,7 +3,6 @@
 All notable changes to KiroCrew are documented in this file.
 
 ## [0.4.0] — 2026-08-21
-## [0.2.0-customapi.5] — 2026-08-08 — Vision
 
 The dashboard became a place to work on code rather than only talk about it: real
 side-by-side diffs, an editable file tree, a transcript you can scroll back
@@ -300,62 +299,6 @@ writing in.
 ### Contributors
 
 59 people wrote the code in this release. Thank you:
-- **`test_redaction_timing_scales_linearly` no longer fails CI
-  intermittently** (observed "Redaction scaled super-linearly: 3.2x, limit
-  3.0x" on an otherwise-healthy matcher). The test took ONE
-  `perf_counter` sample per input size, so it billed itself for whatever
-  the OS gave the core to the sibling pytest-xdist workers — and one
-  unlucky reading of the SMALL input, the ratio's denominator, was enough
-  to push it over the bound. It now measures with `time.thread_time()`
-  (redaction is single-threaded pure-regex work, so per-thread CPU is its
-  complete cost) and takes best-of-3 per size, since scheduler noise only
-  ever adds and the minimum is the closest estimate of the true cost —
-  the same two techniques `TestIsDeniedReDoSResistance` already uses for
-  this class of assertion. The 3.0x bound is unchanged and detection is
-  intact: a genuinely quadratic implementation still measures ~4.3x.
-**Big feature: native vision — image models feel first-class, not bolted on.**
-
-![Vision tool — describe any image on a text-only model](assets/vision-tool.png)
-
-Every model now reports `supports_vision`; the picker groups **Vision — image input** (muted **Image** pill) above **Text**, and **Settings → Chat → Vision** governs how text-only models handle images (describe subagent / switch / off + fallback model). Attach any image via the composer's `+` / drag-drop — it rides as native pixels on vision models, or as a one-shot `vision_subagent_describe` on text-only ones (the `vision_analyze` MCP tool is also available to the agent). Images are downscaled to model limits before they ever reach the gateway.
-
-### Added
-
-- **`vision_analyze` MCP tool** — the main agent can describe any local path or http(s) image URL on demand (`vision_analyze({ path|url })`), so screenshots the agent itself captures enter the conversation as text.
-- **Vision-aware image routing** — `prompt_blocks` downscales + `vision.decide_image_input_mode` routes `auto` → native vs text; `AcpClient` + shared-runtime `AcpSessionHandle` both honor it so Slack/cron/dashboard share one implementation. Two new config keys surface in `config.json` (`agent.image_input_mode: auto|native|text`, `agent.image_redirect: subagent|switch|off`) and the new Settings card.
-- **Reported `supports_vision` flag** — every `GET /api/models` row carries it (registry `supports_vision` + router catalog `capabilities` + ACP `oc/ol deepseek-v4-flash` denylist), wired `AcpAdapter` → `ModelDropdownList` grouping.
-- **Multi-provider picker — full catalogs** — `oc/` (opencode-go) and `ol/` (ollama) now expose their full catalogs (mimo-v2.5, glm, kimi, minimax, qwen, gemma, …), with 9router `ocg`/`ollama` normalization so `oc/mimo-v2.5`, `ol/glm-5.2` etc. are selectable end-to-end.
-- **Settings → Chat → Vision** — native `Image input mode`, `On text-only models`, and `Vision fallback model` selects, right next to Default Model. The model picker's Vision grouping is derived from the reported flag, not a hard-coded client list.
-
-### Fixed
-
-- AppImage gateway startup blockers (packaged-build path) and shared-runtime image prompt parity.
-
-## [0.2.0-customapi.4] — 2026-08-08
-
-The kirocrew-customapi fork: Kiro Crew with the Claude Code ACP backend re-enabled for self-hosted LLM routers (9router, CLIProxyAPI, OpenCode Zen, Ollama Cloud, and any Anthropic/OpenAI-compatible endpoint).
-
-### Fixed
-
-- **Endless loading in chat (OpenCode backend)** — the OpenCode ACP process now runs in an isolated `HOME`, so user-installed plugins (Honcho) and MCP servers can no longer stall the session.
-- **Ollama Cloud 405/Unauthorized** — Ollama Cloud's Anthropic endpoint rejects cloud API keys; the wire format is now forced to OpenAI (`/v1/chat/completions`) which accepts the same keys and models.
-- **Provider preset reset to "custom"** — the preset now derives from the saved URL, so it stays selected after save + reload.
-- **"connection failed: undefined" on Test** — the provider test now uses the stored API key when no draft key is entered.
-- **Stale model from old provider** — switching provider clears the default model and model whitelist, so old ids (e.g. `deepseek-v4-flash:0731`, `oc/mimo`) no longer leak into the new provider's picker.
-- **Router-prefixed models in kiro-native** — `cx/`, `oc/`, `ol/` prefixed models are cleared on provider switch and no longer appear in the kiro-native model list.
-
-### Added
-
-- **Provider binary warnings** — Settings > Chat now warns when the selected backend's binary (OpenCode CLI or claude-agent-acp) is not installed.
-- **New provider presets** — Ollama Cloud (OpenAI wire), OpenCode Zen/Go, commandcode.ai, 9router, CLIProxyAPI, OmniRouter, Anthropic, OpenRouter, xAI, Mistral, DeepSeek, Together, OpenAI, Groq.
-
-### Verified
-
-- 767 Python tests + frontend tests pass.
-- Live AppImage chat returns instantly.
-- All 14 provider URLs verified (200 or auth-required).
-
-## [0.2.0-customapi.1] — 2026-08-06
 
 @adiarora06, @amadsalmon, @anant-kaushik, @andreyaurelien, @aniketshukla1,
 @atomsbaza, @bolichen97, @buluoray, @cabbey, @chenmingwei23, @chuqijiang2026,
@@ -815,12 +758,59 @@ weeks in the open.
 Plus roughly 280 further fixes across the dashboard, chat, the chat channels,
 ACP transport, history consolidation, packaging, and CI.
 
+## [0.2.0-customapi.5] — 2026-08-08
+
+**Big feature: native vision — image models feel first-class, not bolted on.**
+
+![Vision tool — describe any image on a text-only model](assets/vision-tool.png)
+
+Every model now reports `supports_vision`; the picker groups **Vision — image input** (muted **Image** pill) above **Text**, and **Settings → Chat → Vision** governs how text-only models handle images (describe subagent / switch / off + fallback model). Attach any image via the composer's `+` / drag-drop — it rides as native pixels on vision models, or as a one-shot `vision_subagent_describe` on text-only ones (the `vision_analyze` MCP tool is also available to the agent). Images are downscaled to model limits before they ever reach the gateway.
+
+### Added
+
+- **`vision_analyze` MCP tool** — the main agent can describe any local path or http(s) image URL on demand (`vision_analyze({ path|url })`), so screenshots the agent itself captures enter the conversation as text.
+- **Vision-aware image routing** — `prompt_blocks` downscales + `vision.decide_image_input_mode` routes `auto` → native vs text; `AcpClient` + shared-runtime `AcpSessionHandle` both honor it so Slack/cron/dashboard share one implementation. Two new config keys surface in `config.json` (`agent.image_input_mode: auto|native|text`, `agent.image_redirect: subagent|switch|off`) and the new Settings card.
+- **Reported `supports_vision` flag** — every `GET /api/models` row carries it (registry `supports_vision` + router catalog `capabilities` + ACP `oc/ol deepseek-v4-flash` denylist), wired `AcpAdapter` → `ModelDropdownList` grouping.
+- **Multi-provider picker — full catalogs** — `oc/` (opencode-go) and `ol/` (ollama) now expose their full catalogs (mimo-v2.5, glm, kimi, minimax, qwen, gemma, …), with 9router `ocg`/`ollama` normalization so `oc/mimo-v2.5`, `ol/glm-5.2` etc. are selectable end-to-end.
+- **Settings → Chat → Vision** — native `Image input mode`, `On text-only models`, and `Vision fallback model` selects, right next to Default Model. The model picker's Vision grouping is derived from the reported flag, not a hard-coded client list.
+
+### Fixed
+
+- AppImage gateway startup blockers (packaged-build path) and shared-runtime image prompt parity.
+
+## [0.2.0-customapi.4] — 2026-08-08
+
+The kirocrew-customapi fork: Kiro Crew with the Claude Code ACP backend re-enabled for self-hosted LLM routers (9router, CLIProxyAPI, OpenCode Zen, Ollama Cloud, and any Anthropic/OpenAI-compatible endpoint).
+
+### Fixed
+
+- **Endless loading in chat (OpenCode backend)** — the OpenCode ACP process now runs in an isolated `HOME`, so user-installed plugins (Honcho) and MCP servers can no longer stall the session.
+- **Ollama Cloud 405/Unauthorized** — Ollama Cloud's Anthropic endpoint rejects cloud API keys; the wire format is now forced to OpenAI (`/v1/chat/completions`) which accepts the same keys and models.
+- **Provider preset reset to "custom"** — the preset now derives from the saved URL, so it stays selected after save + reload.
+- **"connection failed: undefined" on Test** — the provider test now uses the stored API key when no draft key is entered.
+- **Stale model from old provider** — switching provider clears the default model and model whitelist, so old ids (e.g. `deepseek-v4-flash:0731`, `oc/mimo`) no longer leak into the new provider's picker.
+- **Router-prefixed models in kiro-native** — `cx/`, `oc/`, `ol/` prefixed models are cleared on provider switch and no longer appear in the kiro-native model list.
+
+### Added
+
+- **Provider binary warnings** — Settings > Chat now warns when the selected backend's binary (OpenCode CLI or claude-agent-acp) is not installed.
+- **New provider presets** — Ollama Cloud (OpenAI wire), OpenCode Zen/Go, commandcode.ai, 9router, CLIProxyAPI, OmniRouter, Anthropic, OpenRouter, xAI, Mistral, DeepSeek, Together, OpenAI, Groq.
+
+### Verified
+
+- 767 Python tests + frontend tests pass.
+- Live AppImage chat returns instantly.
+- All 14 provider URLs verified (200 or auth-required).
+
 ## [0.1.3] — 2026-08-07
 
 A hot patch for model entitlement: the model picker scopes itself to what the
 account can use, a model the account cannot use is never sent, and an
 unavailable model is reported as an access problem instead of a capacity error
 or a raw JSON-RPC dump.
+
+## [0.2.0-customapi.1] — 2026-08-06
+
 Initial kirocrew-customapi fork. Re-enabled the dormant `claude_code` provider (the `ACP_BACKEND_CLAUDE` seam) so Kiro Crew can drive your own model router speaking the Anthropic API instead of Kiro's built-in Bedrock catalog.
 
 ## [0.1.2] — 2026-07-30
