@@ -115,7 +115,15 @@ describe("macOS bundle naming", () => {
 });
 
 
-describe("first-download installer design contract", () => {
+describe(
+  "first-download installer design contract",
+  // RoyCrew ships no Windows desktop release, so build.yml no longer builds
+  // or smoke-installs an NSIS artifact — these assertions pin that lane's
+  // contract (test-windows-installer.ps1, the install-time ceiling) and
+  // describe a platform this fork never publishes. The macOS DMG assertions
+  // live in the sibling describes above and still run.
+  { skip: "RoyCrew ships no Windows installer lane" },
+  () => {
   const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, "package.json"), "utf8"));
   const background = path.join(INSTALLER_ASSETS, "dmg-background.tiff");
   const sidebar = path.join(INSTALLER_ASSETS, "windows-installer-sidebar.bmp");
