@@ -1175,7 +1175,10 @@ def _cc_models_response(request: web.Request) -> web.Response:
     rows: list[dict] = []
     for entry in _advertised_cc_models(request):
         mid = entry.get("model_name") or ""
-        if mid and mid in whitelist:
+        # Advertised wins outright -- same rule _cc_models() applies to the kiro
+        # catalog. Intersecting it with the static whitelist dropped models the
+        # connected router was actively serving.
+        if mid:
             rows.append(
                 _cc_model_row(
                     mid,

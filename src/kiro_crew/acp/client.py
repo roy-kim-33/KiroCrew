@@ -2063,12 +2063,68 @@ def _select_tool_title(
 # serves RAW /v1/models ids and REJECTS the prefixed spelling ("unknown
 # provider"), so every picker id is stripped back to the raw form before it
 # goes upstream — see strip_router_model_prefix().
+# Ids the connected router's own /v1/models actually served, recorded by
+# AcpClient._capture_router_models(). CLIProxyAPI serves RAW ids, but 9router
+# serves PREFIXED ones (cx/gpt-5.5) and 404s the stripped spelling with
+# {"code": "model_not_found"} -- so "always strip" is only right for the
+# former. The catalog is the authority: an id the router itself advertised
+# goes upstream verbatim. Empty until a catalog is fetched, which leaves the
+# original strip-everything behaviour intact.
+_ROUTER_CATALOG_IDS: set[str] = set()
+
+# Cache per base URL so one probe serves every client in the process. Ordered:
+# a router lists its preferred model first, which is what "auto" resolves to.
+_ROUTER_CATALOG_CACHE: dict[str, list[str]] = {}
+
+
+def load_router_catalog_ids(base_url: str, api_key: str = "") -> list[str]:
+    """Record which model ids ``{base_url}/v1/models`` serves. Best-effort.
+
+    Called before the wire model id is computed, because that decision needs
+    to know whether this router publishes prefixed ids (9router) or raw ones
+    (CLIProxyAPI). ``_capture_router_models`` fetches the same catalog later
+    for the picker, but that is after the spawn env is already built -- too
+    late to choose the spelling. A failure here is silent and simply leaves
+    the historical strip-everything behaviour in place.
+    """
+    if not base_url:
+        return []
+    key = base_url.rstrip("/")
+    cached = _ROUTER_CATALOG_CACHE.get(key)
+    if cached is not None:
+        return cached
+    ids: list[str] = []
+    try:
+        import json as _json
+        import urllib.request as _request
+
+        req = _request.Request(key + "/v1/models", headers={"x-api-key": api_key})
+        with _request.urlopen(req, timeout=3) as resp:
+            payload = _json.loads(resp.read().decode("utf-8"))
+        entries = payload.get("data") if isinstance(payload, dict) else []
+        for m in entries if isinstance(entries, list) else []:
+            if isinstance(m, dict):
+                mid = m.get("id") or m.get("model") or ""
+                if mid and mid not in ids:
+                    ids.append(mid)
+    except Exception:  # noqa: BLE001 - probe only; never block a spawn
+        logger.debug("router catalog probe failed for %s", key, exc_info=True)
+    _ROUTER_CATALOG_CACHE[key] = ids
+    _ROUTER_CATALOG_IDS.update(ids)
+    return ids
+
+
 _ROUTER_MODEL_PROVIDERS: dict[str, str] = {
     "cmc": "commandcode",
     "oc": "opencode-go",
     "ol": "ollama-cloud",
     "cx": "codex",
     "ag": "antigravity",
+    # 9router exposes Claude Code's own models under cc/ once Anthropic
+    # credentials are present. Without this the four cc/* models it serves
+    # were dropped from the picker entirely, even though the wire accepted
+    # them (unknown prefixes pass through strip_router_model_prefix).
+    "cc": "claude-code",
 }
 
 # (Legacy prefix aliases were removed with the ocg/ spelling — see git history.
@@ -2096,6 +2152,9 @@ _ROUTER_OWNED_BY_TO_PREFIX: dict[str, str] = {
     "cx": "cx",
     "cmc": "cmc",
     "gemini": "ag",  # 9router gemini group rides the antigravity account
+    "claude-code": "cc",
+    "anthropic": "cc",
+    "cc": "cc",
 }
 
 # Raw model ids per provider, exactly as the proxy advertises them in
@@ -2241,6 +2300,10 @@ def strip_router_model_prefix(model_id: str) -> str:
     prefix and ids carrying an unknown prefix pass through unchanged, so this
     is safe to apply on every upstream path.
     """
+    # The router advertised this exact spelling, so it is what the router
+    # accepts -- stripping here is what produced "model_not_found".
+    if model_id in _ROUTER_CATALOG_IDS:
+        return model_id
     prefix, _, rest = model_id.partition("/")
     prefix = _ROUTER_PREFIX_ALIASES.get(prefix, prefix)
     raws = _ROUTER_RAW_MODEL_IDS.get(prefix, ())
@@ -2282,9 +2345,19 @@ def prefixed_router_model_id(model_id: str, owned_by: str = "") -> str | None:
             # Fall back to recognizing the embedded prefix directly.
             prefix = _ROUTER_OWNED_BY_TO_PREFIX.get(source_prefix, "")
         if prefix:
-            if rest not in _ROUTER_RAW_MODEL_IDS.get(prefix, ()):
-                return None
-            return _router_picker_id(prefix, rest)
+            if rest in _ROUTER_RAW_MODEL_IDS.get(prefix, ()):
+                return _router_picker_id(prefix, rest)
+            if source_prefix in _ROUTER_MODEL_PROVIDERS:
+                # The router itself published this id under a namespace we
+                # recognise, so the model is real even though the built-in
+                # table has not heard of it (routers add models constantly:
+                # cx/gpt-5.5-review and the codex-spark family were all being
+                # dropped here). The prefix is what disambiguates providers;
+                # the per-model list must not gate what the user's own router
+                # is allowed to serve. Passed through verbatim, which is also
+                # the spelling this router accepts back.
+                return model_id
+            return None
         # Unknown owned_by + unknown prefix: the id is not a recognized model.
         return None
 
@@ -2414,6 +2487,36 @@ class AcpClient:
         # the claude-agent-acp adapter rejects it in set_config_option. Skip
         # the wire set and let the model ride in via ANTHROPIC_MODEL env, which
         # the adapter forwards to Claude Code as its default.
+        # "auto" means "let the backend choose", which only has an answer when
+        # kiro-cli's entitlement service is choosing. On a router there is no
+        # such service: leaving ANTHROPIC_MODEL unset makes Claude Code fall
+        # back to its OWN default (claude-opus-5[1m]), a Bedrock id no router
+        # serves, and the turn dies with model_not_found. Resolve it to the
+        # router's first advertised model instead.
+        _router_base = (extra_env or {}).get("ANTHROPIC_BASE_URL", "")
+        if (
+            self._is_claude
+            and _router_base
+            and (model or DEFAULT_MODEL) in ("", "auto", DEFAULT_MODEL)
+            and not (extra_env or {}).get("ANTHROPIC_MODEL")
+        ):
+            _served = load_router_catalog_ids(
+                _router_base, (extra_env or {}).get("ANTHROPIC_API_KEY", "")
+            )
+            if _served:
+                model = _served[0]
+                # self._model is already assigned above and is what
+                # _write_claude_local_settings pins -- and that file is
+                # AUTHORITATIVE over ANTHROPIC_MODEL, so resolving only the
+                # local name left "auto" pinned and Claude Code fell back to
+                # its own default anyway.
+                self._model = model
+                logger.info(
+                    "claude router: 'auto' resolved to %r (first model %s serves)",
+                    model,
+                    _router_base,
+                )
+
         self._model_via_env = bool(
             self._is_claude
             and (extra_env or {}).get("ANTHROPIC_BASE_URL")
@@ -2422,8 +2525,14 @@ class AcpClient:
         )
         if self._model_via_env:
             self._extra_env = dict(extra_env or {})
-            # The picker id is prefixed (cmc/...); the proxy serves raw ids
-            # and rejects the prefix, so translate before the env carries it.
+            # Learn the router's own spelling FIRST: CLIProxyAPI serves raw ids
+            # and rejects a prefix, 9router serves prefixed ids and rejects the
+            # stripped form. Probing here (not at session init) is what makes
+            # the translation below correct for both.
+            load_router_catalog_ids(
+                self._extra_env.get("ANTHROPIC_BASE_URL", ""),
+                self._extra_env.get("ANTHROPIC_API_KEY", ""),
+            )
             self._extra_env["ANTHROPIC_MODEL"] = strip_router_model_prefix(model or "")
         else:
             self._extra_env = extra_env or {}
@@ -3089,13 +3198,22 @@ class AcpClient:
                 model_id = m.get("id") or m.get("model") or ""
                 if not model_id:
                     continue
+                # Record the router's own spelling before any mapping: this is
+                # what it will accept back on the wire.
+                _ROUTER_CATALOG_IDS.add(model_id)
                 # Advertise the PREFIXED spelling — the picker namespace — and
                 # only entries the whitelist actually shows. The prefix is
                 # stripped again before any id goes upstream
                 # (strip_router_model_prefix()).
                 prefixed = prefixed_router_model_id(model_id, m.get("owned_by") or "")
-                if prefixed is None or prefixed not in self.router_model_whitelist():
+                if prefixed is None:
                     continue
+                # NOT filtered against the built-in whitelist any more. The user
+                # pointed this install at THIS router, so its catalog is their
+                # curated set; a 94-entry list picked by someone else silently
+                # hid models the router was serving (e.g. every cx/*-review
+                # variant). agent.model_whitelist still narrows it when the user
+                # sets one -- that is their choice, not a shipped default.
                 captured.append(
                     {
                         "modelId": prefixed,
