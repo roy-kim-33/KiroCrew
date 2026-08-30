@@ -2,6 +2,30 @@
 
 All notable changes to KiroCrew are documented in this file.
 
+## [0.5.1-roycrew.1] — 2026-08-30
+
+**Router model ids now follow the router, not a built-in table.** Three
+failures against a live 9router install, all from assuming every router
+behaves like CLIProxyAPI (raw ids, prefixes rejected). 9router is the mirror
+image: it publishes `cx/gpt-5.5` and answers the stripped spelling with
+`model_not_found`.
+
+- An id the connected router advertised is sent upstream verbatim. The catalog
+  is probed when the spawn environment is built — where the decision is
+  actually made — rather than at session init, which happens too late to
+  choose the spelling. Routers that advertise nothing keep the previous
+  behaviour, so CLIProxyAPI is unaffected.
+- `auto` resolves to the router's first advertised model. It previously
+  resolved to nothing, so Claude Code fell back to its own default
+  (`claude-opus-5[1m]`) — a Bedrock id no router serves — and every turn died.
+- The picker lists what the router serves. A 94-entry built-in whitelist and
+  an id map that rejected unrecognised models were between you and your own
+  catalog; a live advertised list now wins outright, with the built-in list
+  kept only as the cold-start fallback. `agent.model_whitelist` still narrows
+  the list when you set one.
+- Registered the `cc/` namespace, which 9router exposes once Anthropic
+  credentials are present.
+
 ## [0.4.0] — 2026-08-21
 
 The dashboard became a place to work on code rather than only talk about it: real
