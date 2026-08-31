@@ -883,6 +883,18 @@ class TestProviderPatch:
         assert data["agent"]["provider_api_key"] == "sk-test-123"
 
     @pytest.mark.asyncio
+    async def test_acp_backend_triggers_reload(self, tmp_config) -> None:
+        """Switching the harness itself must reload the factory too, not just
+        the router fields -- otherwise a session already open when the user
+        flips claude -> opencode/kas keeps talking to the old backend."""
+        app = self._provider_app()
+        with patch("kiro_crew.agent.rebuild_agent_config") as rebuild:
+            async with TestClient(TestServer(app)) as c:
+                assert (await _patch(c, "agent.acp_backend", "opencode")).status == 200
+            rebuild.assert_called_once()
+        app["state"].sessions.reload_provider_factory.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_provider_base_url_triggers_reload(self, tmp_config) -> None:
         app = self._provider_app()
         with patch("kiro_crew.agent.rebuild_agent_config") as rebuild:

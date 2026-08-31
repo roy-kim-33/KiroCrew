@@ -397,6 +397,32 @@ class TestWarmPoolQueueRaces:
         stale.provider.shutdown.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_reload_provider_factory_swaps_backend_for_a_live_key(self, mgr) -> None:
+        """A chat session open under the OLD backend must not keep answering on
+        it after a provider switch: the live entry is evicted, its process is
+        killed, and the very next factory call for that SAME key is built from
+        the NEW config. Without this, a settings change would leave an
+        already-open chat "stuck" on the backend it started with (the
+        user-facing bug this guards against).
+        """
+        stale = _register(mgr, "chat:1", provider=_provider(backend="claude"))
+        new_cfg = KiroCrewConfig()
+        new_cfg.agent.acp_backend = "opencode"
+        with patch.object(mgr, "start_pool", AsyncMock()), patch(
+            "kiro_crew.session.KiroCrewConfig.load", return_value=new_cfg
+        ), patch(
+            "kiro_crew.session.build_provider_factory",
+            side_effect=lambda cfg: (
+                lambda key, **kw: _provider(backend=cfg.agent.acp_backend)
+            ),
+        ):
+            await mgr.reload_provider_factory()
+
+        assert "chat:1" not in mgr._sessions
+        stale.provider.shutdown.assert_awaited_once()
+        assert mgr._provider_factory("chat:1").backend == "opencode"
+
+    @pytest.mark.asyncio
     async def test_health_sweep_survives_a_lost_entry(self, mgr) -> None:
         mgr._pool_size = 1
         mgr._warm_pool = _RacedQueue()
