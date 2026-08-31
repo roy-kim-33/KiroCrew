@@ -54,12 +54,23 @@ describe('ChatPanel Provider section', () => {
   })
 
   it('prefills the URL from a preset and saves provider fields', async () => {
-    seed({ acp_backend: 'claude', provider_base_url: '', provider_api_key: '', model: 'auto' })
-    patchConfigMock.mockClear()
+    // The backend switch is applied IMMEDIATELY, so the config the panel
+    // re-reads afterwards must reflect it -- a mock frozen on the old value
+    // models a config write that silently did not persist, which is the very
+    // bug this panel had.
+    const agent: Record<string, unknown> = {
+      acp_backend: 'claude', provider_base_url: '', provider_api_key: '', model: 'auto',
+    }
+    kirocrewConfigMock.mockImplementation(() => Promise.resolve({ agent }) as never)
+    patchConfigMock.mockImplementation((path: string, value: unknown) => {
+      agent[String(path).replace(/^agent\./, '')] = value
+      return Promise.resolve({})
+    })
     wrap(<ChatPanel />)
 
     // Switch to OpenCode backend.
     fireEvent.click(await screen.findByRole('button', { name: /OpenCode/i }))
+    await waitFor(() => expect(agent.acp_backend).toBe('opencode'))
 
     // Pick the Groq preset — URL field must prefill.
     const options = await openSelect('Preset')
@@ -78,6 +89,55 @@ describe('ChatPanel Provider section', () => {
       expect(patchConfigMock).toHaveBeenCalledWith('agent.provider_base_url', 'https://api.groq.com/openai')
       expect(patchConfigMock).toHaveBeenCalledWith('agent.provider_api_key', 'sk-groq-1')
     })
+  })
+
+  it('persists the backend switch immediately, without waiting for Save', async () => {
+    // The panel used to park the switch in a draft until Save. Nothing reached
+    // the config, so the row highlighted and then read the old value straight
+    // back -- "stuck on Claude Code" -- and the endpoint's switch side effects
+    // (provider-factory reload, per-slot model clear) never ran either.
+    const agent: Record<string, unknown> = {
+      acp_backend: 'claude', provider_base_url: 'http://localhost:20128', model: 'auto',
+    }
+    kirocrewConfigMock.mockImplementation(() => Promise.resolve({ agent }) as never)
+    patchConfigMock.mockClear()
+    patchConfigMock.mockImplementation((path: string, value: unknown) => {
+      agent[String(path).replace(/^agent\./, '')] = value
+      return Promise.resolve({})
+    })
+    wrap(<ChatPanel />)
+    // Wait for the loaded config to render: before it arrives the panel shows
+    // kiro-native as current, so clicking it would be a no-op.
+    await screen.findByLabelText('Base URL')
+
+    fireEvent.click(await screen.findByRole('button', { name: /kiro-native/i }))
+
+    await waitFor(() =>
+      expect(patchConfigMock).toHaveBeenCalledWith('agent.acp_backend', '')
+    )
+    expect(agent.acp_backend).toBe('')
+  })
+
+  it('keeps the router URL when the backend changes', async () => {
+    // Switching used to reset the draft to a blank URL, so the next Save wrote
+    // an empty provider_base_url over a working router.
+    const agent: Record<string, unknown> = {
+      acp_backend: 'claude', provider_base_url: 'http://localhost:20128', model: 'auto',
+    }
+    kirocrewConfigMock.mockImplementation(() => Promise.resolve({ agent }) as never)
+    patchConfigMock.mockClear()
+    patchConfigMock.mockImplementation((path: string, value: unknown) => {
+      agent[String(path).replace(/^agent\./, '')] = value
+      return Promise.resolve({})
+    })
+    wrap(<ChatPanel />)
+
+    fireEvent.click(await screen.findByRole('button', { name: /OpenCode/i }))
+    await waitFor(() => expect(agent.acp_backend).toBe('opencode'))
+
+    expect(agent.provider_base_url).toBe('http://localhost:20128')
+    const url = (await screen.findByLabelText('Base URL')) as HTMLInputElement
+    expect(url.value).toBe('http://localhost:20128')
   })
 
   it('shows a saved-key placeholder instead of the real key', async () => {

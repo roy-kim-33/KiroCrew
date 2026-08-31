@@ -424,11 +424,40 @@ export function ChatPanel() {
     }))
   }
 
-  const switchBackend = (value: AgentBackend) => {
-    // Switching backend resets the draft to a clean custom entry — preset
-    // URLs are backend-specific.
-    setDraft({ backend: value, preset: 'custom', url: '', key: '', format: value === 'opencode' ? 'openai' : 'anthropic' })
+  const switchBackend = async (value: AgentBackend) => {
+    if (value === effBackend) return
     setProviderTestResult(null)
+    setProviderSaveError('')
+    // Optimistic first so the row responds instantly, then persisted. The
+    // URL is CARRIED OVER, never blanked: the same router usually serves both
+    // backends, and resetting it here meant a later Save wrote an empty
+    // provider_base_url over a working one.
+    const optimistic = {
+      backend: value,
+      preset: savedPreset,
+      url: draft?.url ?? mcCfg?.agent?.provider_base_url ?? '',
+      key: draft?.key ?? '',
+      format: (value === 'opencode' ? 'openai' : 'anthropic') as 'anthropic' | 'openai',
+    }
+    setDraft(optimistic)
+    // Written immediately rather than parked behind Save. A backend is a
+    // discrete choice with nothing partial to review, and leaving it unsaved
+    // is what made the panel look stuck on Claude Code -- the row highlighted,
+    // nothing reached the config, and the endpoint's switch side effects
+    // (provider-factory reload, per-slot model clear) never ran either.
+    setProviderSaving(true)
+    try {
+      await api.patchConfig('agent.acp_backend', uiToAcpBackend(value))
+      // Awaited: dropping the draft before the refetch lands re-renders from
+      // the STALE cache, which reads as the change reverting.
+      await qc.invalidateQueries({ queryKey: ['kirocrewConfig'] })
+      setDraft(null)
+    } catch {
+      // Keep the optimistic draft visible so the pick is not lost, and say so.
+      setProviderSaveError(i18nT('pages.settings.chatPanel.failed_to_save_provider'))
+    } finally {
+      setProviderSaving(false)
+    }
   }
 
   const providerTest = async () => {
@@ -472,7 +501,9 @@ export function ChatPanel() {
       if (modelSel.length !== savedWhitelist.length || modelSel.some((m, i) => m !== savedWhitelist[i])) {
         await api.patchConfig('agent.model_whitelist', modelSel)
       }
-      qc.invalidateQueries({ queryKey: ['kirocrewConfig'] })
+      // Awaited before the draft is dropped: otherwise the panel re-renders
+      // from the stale cache and every field appears to revert.
+      await qc.invalidateQueries({ queryKey: ['kirocrewConfig'] })
       setDraft(null)
     } catch {
       setProviderSaveError(i18nT('pages.settings.chatPanel.failed_to_save_provider'))
