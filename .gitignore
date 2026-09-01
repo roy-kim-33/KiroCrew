@@ -154,3 +154,6 @@ sqlite_mcp_server.db
 # oh-my-claudecode operational state (session-local, never committed)
 .omc/
 website/.vitest-reports/
+
+# Playwright MCP session snapshots (debug artifacts, never source)
+.playwright-mcp/
