@@ -32,7 +32,11 @@ test.describe('Settings Page', () => {
     await expect(page.getByRole('button', { name: 'Display', exact: true })).toBeVisible()
     await expect(page.getByRole('button', { name: 'Chat', exact: true })).toBeVisible()
     await expect(page.getByRole('button', { name: 'Remote Crew', exact: true })).toBeVisible()
-    await expect(page.getByRole('button', { name: 'About', exact: true })).toBeVisible()
+    // Not `exact`: while an update is available SettingsPage puts a presence
+    // dot inside this button, and its `aria-label` joins the button's
+    // accessible name ("About Update available"). An exact match then finds
+    // nothing, so this went red purely on whether an update happened to exist.
+    await expect(page.getByRole('button', { name: /^About\b/ })).toBeVisible()
   })
 
   test('defaults to the overview tab when no ?tab= param', async ({ page }) => {
@@ -58,7 +62,8 @@ test.describe('Settings Page', () => {
     await expect(page).toHaveURL(/[?&]tab=display/)
 
     // Click About tab button
-    await page.getByRole('button', { name: 'About', exact: true }).click()
+    // Anchored rather than exact, for the update-dot reason above.
+    await page.getByRole('button', { name: /^About\b/ }).click()
     await expect(page).toHaveURL(/[?&]tab=about/)
   })
 

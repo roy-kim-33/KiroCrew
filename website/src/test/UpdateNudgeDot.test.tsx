@@ -71,6 +71,23 @@ describe('SidePanelLayout tab dot', () => {
     { key: 'a', label: 'General', icon: <span /> },
     { key: 'about', label: 'About', icon: <span />, dot: true },
   ]
+  it('the dot joins the tab button\'s accessible name', () => {
+    // Why playwright/settings.spec.ts must not match the About tab with
+    // `exact: true`: the dot lives INSIDE the button, so its aria-label is
+    // concatenated into the button's accessible name. An exact "About" then
+    // matches nothing, and the e2e went red purely on whether an update
+    // happened to be available at the time.
+    render(
+      <MemoryRouter>
+        <SidePanelLayout title="Settings" tabs={tabs}>
+          {() => <div />}
+        </SidePanelLayout>
+      </MemoryRouter>,
+    )
+    expect(screen.queryAllByRole('button', { name: 'About' })).toHaveLength(0)
+    expect(screen.getAllByRole('button', { name: /^About\b/ }).length).toBeGreaterThanOrEqual(1)
+  })
+
   it('renders a presence dot on dotted tabs only', () => {
     render(
       <MemoryRouter>
