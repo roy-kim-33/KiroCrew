@@ -1735,11 +1735,15 @@ _EDITABLE_CONFIG: dict[str, dict] = {
     "agent.acp_backend": {"type": "enum", "values": ["", "kas", "claude", "opencode"]},
     # Router base URL for the claude_code / opencode backends. Local
     # http://localhost:PORT and https endpoints both allowed; shell
-    # metacharacters and whitespace rejected.
+    # metacharacters and whitespace rejected. EMPTY clears the setting: on the
+    # claude_code backend that is the native lane (no ANTHROPIC_BASE_URL is
+    # injected, so the adapter uses its own Anthropic credentials) — without
+    # an empty-accepting pattern a router URL could never be un-set from the
+    # dashboard.
     "agent.provider_base_url": {
         "type": "str",
         "max_len": 2048,
-        "pattern": r"^https?://[A-Za-z0-9._\-:\[\]/]+$",
+        "pattern": r"^$|^https?://[A-Za-z0-9._\-:\[\]/]+$",
     },
     # Router API key (masked in the config GET response; only ever written).
     "agent.provider_api_key": {"type": "str", "max_len": 512},

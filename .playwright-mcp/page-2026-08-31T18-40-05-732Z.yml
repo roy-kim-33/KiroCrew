@@ -1,0 +1,190 @@
+- generic [ref=e6]:
+  - link "Skip to content" [ref=e7] [cursor=pointer]:
+    - /url: "#main-content"
+  - banner [ref=e8]:
+    - generic [ref=e10]:
+      - button "Open Command Bar" [ref=e11] [cursor=pointer]:
+        - generic [ref=e12]: Run a command
+      - button "Focus mode" [ref=e13] [cursor=pointer]
+    - generic [ref=e20]:
+      - generic [ref=e21]:
+        - button "Gateway offline" [expanded] [ref=e22] [cursor=pointer]:
+          - status [ref=e24]: Gateway offline
+        - button "System metrics" [ref=e26] [cursor=pointer]
+        - button "Kiro credit usage — checking" [ref=e30] [cursor=pointer]
+      - generic [ref=e39]:
+        - button "Request a Feature" [ref=e40] [cursor=pointer]
+        - button "Report a problem on this Insider build" [ref=e44] [cursor=pointer]: Report problem
+      - button "Notifications" [ref=e55] [cursor=pointer]
+  - navigation "Main navigation" [ref=e59]:
+    - generic [ref=e60]:
+      - button "Collapse sidebar" [expanded] [ref=e62] [cursor=pointer]:
+        - generic [ref=e63]: Kiro Crew
+      - button "Sessions" [ref=e68] [cursor=pointer]
+      - button "Schedule" [ref=e74] [cursor=pointer]
+      - button "Artifacts" [ref=e80] [cursor=pointer]
+      - button "Knowledge" [ref=e89] [cursor=pointer]
+      - generic [ref=e94]:
+        - generic "Apps" [ref=e95]
+        - button "Explore Apps" [ref=e96] [cursor=pointer]: Explore
+    - generic [ref=e103]:
+      - button "Task Runner" [ref=e104] [cursor=pointer]
+      - status [ref=e108]
+    - generic [ref=e109]:
+      - button "Terminal" [ref=e110] [cursor=pointer]
+      - button "Agent Capabilities" [ref=e117] [cursor=pointer]
+      - button "Settings" [ref=e121] [cursor=pointer]
+      - generic [ref=e128]:
+        - generic [ref=e131]:
+          - link "Star RoyCrew on GitHub" [ref=e132] [cursor=pointer]:
+            - /url: https://github.com/roy-kim-33/KiroCrew
+            - text: Star us
+          - generic [ref=e133]: ·
+          - button "Report a problem — collects logs and crash reports, secrets removed" [ref=e134] [cursor=pointer]: Report issue
+        - link "Kiro Discord community" [ref=e135] [cursor=pointer]:
+          - /url: https://kiro.dev/discord/
+  - main [ref=e139]:
+    - generic [ref=e140]:
+      - button "Hide sessions sidebar" [ref=e141] [cursor=pointer]
+      - generic [ref=e147]:
+        - separator "Resize sidebar" [ref=e148]
+        - generic [ref=e150]:
+          - generic [ref=e151]: Sessions
+          - generic [ref=e153]:
+            - button "More options" [ref=e154] [cursor=pointer]
+            - generic [ref=e159]:
+              - button "New chat session" [ref=e160] [cursor=pointer]:
+                - generic [ref=e162]: New
+              - button "More create options" [ref=e164] [cursor=pointer]
+        - generic [ref=e168]:
+          - textbox "Search sessions…" [ref=e170]
+          - button "Sort and filter sessions" [ref=e172] [cursor=pointer]
+        - generic [ref=e174]:
+          - generic [ref=e176]:
+            - button "Sat 05:59 PM Qwen3 Local Installation Check There's an issue with the selected model (gpt-5.5). It may not exist or you may … More options Duplicate Close session" [disabled] [ref=e178]:
+              - generic [ref=e179]:
+                - generic [ref=e180]: Sat 05:59 PM
+                - generic "Qwen3 Local Installation Check" [ref=e184]
+                - generic [ref=e185]: There's an issue with the selected model (gpt-5.5). It may not exist or you may …
+              - generic [ref=e187]:
+                - button "More options" [disabled] [ref=e188] [cursor=pointer]
+                - button "Duplicate" [disabled] [ref=e193] [cursor=pointer]
+                - button "Close session" [disabled] [ref=e197] [cursor=pointer]
+            - button "default Sat 05:59 PM Claude Code 9router Model Unavailable There's an issue with the selected model (deepseek-v4-flash). It may not exist o… More options Duplicate Close session" [disabled] [ref=e202]:
+              - generic [ref=e203]:
+                - generic [ref=e204]:
+                  - generic [ref=e205]: default
+                  - generic [ref=e206]: Sat 05:59 PM
+                - generic "Claude Code 9router Model Unavailable" [ref=e208]
+                - generic [ref=e209]: There's an issue with the selected model (deepseek-v4-flash). It may not exist o…
+              - generic [ref=e211]:
+                - button "More options" [disabled] [ref=e212] [cursor=pointer]
+                - button "Duplicate" [disabled] [ref=e217] [cursor=pointer]
+                - button "Close session" [disabled] [ref=e221] [cursor=pointer]
+          - status [ref=e225]
+        - button "Older sessions" [ref=e227] [cursor=pointer]:
+          - generic [ref=e228]: Older Sessions
+      - generic [ref=e237]:
+        - generic:
+          - generic:
+            - generic [ref=e238]:
+              - button "Session options" [ref=e240] [cursor=pointer]
+              - generic [ref=e243]:
+                - button "Qwen3 Local Installation Check" [ref=e244] [cursor=pointer]
+                - button "Regenerate title with LLM" [ref=e248] [cursor=pointer]
+            - generic:
+              - button "Pop out session to its own window" [ref=e252] [cursor=pointer]
+              - button "Open activity panel" [ref=e257] [cursor=pointer]
+        - generic "Chat messages" [ref=e261]:
+          - generic [ref=e267]:
+            - paragraph [ref=e270]: is qwen3 model locally installed?
+            - generic [ref=e271]:
+              - button "Copy" [ref=e272] [cursor=pointer]
+              - button "Copy link to message" [ref=e276] [cursor=pointer]
+              - button "Pin message" [ref=e280] [cursor=pointer]
+              - button "Edit & Resend" [ref=e283] [cursor=pointer]
+              - generic "Sunday, August 16, 2026 at 12:24 AM" [ref=e287]: Aug 16, 12:24 AM
+          - generic [ref=e288]:
+            - button "Worked through 4 steps" [ref=e290] [cursor=pointer]
+            - generic [ref=e294]:
+              - paragraph [ref=e302]: I'll check if the qwen3 model is locally installed on your system.
+              - 'button "Show details for tool: Running: which qwen 2>/dev/null || echo \"not found\"" [ref=e306] [cursor=pointer]':
+                - generic [ref=e310]: Check if qwen CLI is available
+              - 'button "Show details for tool: Running: ls -la ~/.kiro/crew/models/ 2>/dev/null || echo \"models directory not found\"" [ref=e314] [cursor=pointer]':
+                - generic [ref=e318]: Check for locally installed models in Kiro Crew models directory
+              - 'button "Show details for tool: Running: ls -la ~/.kiro/crew/workspace/models/ 2>/dev/null || echo \"workspace models directory not found\"" [ref=e322] [cursor=pointer]':
+                - generic [ref=e326]: Check for locally installed models in workspace
+            - generic [ref=e331]:
+              - generic [ref=e333]:
+                - paragraph [ref=e334]: "Based on my check:"
+                - list [ref=e335]:
+                  - listitem [ref=e336]:
+                    - text: The
+                    - strong [ref=e337]: qwen3-embedding-0.6b.gguf
+                    - text: model is installed locally at
+                    - button "~/.kiro/crew/models/" [ref=e338] [cursor=pointer]
+                  - listitem [ref=e339]: This is an embedding model (0.6B parameters)
+                  - listitem [ref=e340]: The main Qwen3 chat model (qwen3-coder-next) appears to be a cloud-based model provided by KiroCrew's backend, not a locally installed one
+              - generic "Turn took 8.2s and used 0.18 credits" [ref=e341]:
+                - generic [ref=e342]: 0.18 credits ·
+                - generic [ref=e346]: 8.2s
+              - generic [ref=e347]:
+                - generic "Sunday, August 16, 2026 at 12:25 AM" [ref=e348]: Aug 16, 12:25 AM
+                - button "Copy" [ref=e349] [cursor=pointer]
+                - button "Copy link to message" [ref=e353] [cursor=pointer]
+                - button "Pin message" [ref=e357] [cursor=pointer]
+                - button "Fork conversation from here" [ref=e360] [cursor=pointer]
+                - button "Plan from here" [ref=e366] [cursor=pointer]
+                - button "Speak message" [ref=e370] [cursor=pointer]
+                - button "Switch to raw markdown view" [ref=e375] [cursor=pointer]: raw
+          - generic [ref=e382]:
+            - paragraph [ref=e385]: is qwen3 model locally installed?
+            - generic [ref=e386]:
+              - button "Copy" [ref=e387] [cursor=pointer]
+              - button "Copy link to message" [ref=e391] [cursor=pointer]
+              - button "Pin message" [ref=e395] [cursor=pointer]
+              - button "Edit & Resend" [ref=e398] [cursor=pointer]
+              - generic "Saturday, August 29, 2026 at 05:59 PM" [ref=e402]: Aug 29, 05:59 PM
+          - generic [ref=e407]:
+            - paragraph [ref=e410]: There's an issue with the selected model (gpt-5.5). It may not exist or you may not have access to it.
+            - generic [ref=e411]:
+              - generic "Saturday, August 29, 2026 at 05:59 PM" [ref=e412]: Aug 29, 05:59 PM
+              - button "Copy" [ref=e413] [cursor=pointer]
+              - button "Copy link to message" [ref=e417] [cursor=pointer]
+              - button "Pin message" [ref=e421] [cursor=pointer]
+              - button "Fork conversation from here" [ref=e424] [cursor=pointer]
+              - button "Plan from here" [ref=e430] [cursor=pointer]
+              - button "Speak message" [ref=e434] [cursor=pointer]
+              - button "Switch to raw markdown view" [ref=e439] [cursor=pointer]: raw
+              - button "Regenerate response" [ref=e443] [cursor=pointer]
+          - generic [ref=e450]:
+            - generic [ref=e451]: "❌ Internal error: There's an issue with the selected model (gpt-5.5). It may not exist or you may not have access to it.: {'errorKind': 'model_not_found'}"
+            - button "Continue" [ref=e452] [cursor=pointer]
+        - generic [ref=e459]:
+          - button "Attach files" [ref=e462]
+          - generic [ref=e464]:
+            - textbox "Message input" [active] [ref=e466]:
+              - /placeholder: Gateway offline — message will not send
+            - generic [ref=e467]:
+              - generic [ref=e468]:
+                - button "Add files & options" [ref=e470] [cursor=pointer]
+                - generic [ref=e473]:
+                  - button "Set a goal" [ref=e474] [cursor=pointer]
+                  - 'button "Approval mode: Normal" [ref=e479] [cursor=pointer]': Normal
+              - generic [ref=e484]:
+                - button "Voice input" [ref=e485] [cursor=pointer]
+                - button "Optimize disabled — gateway offline" [disabled] [ref=e489]
+                - button "Continue the interrupted turn disabled — gateway offline" [disabled] [ref=e493]: Resume
+          - generic [ref=e497]:
+            - generic [ref=e498]:
+              - 'button "Agent: default" [ref=e499] [cursor=pointer]':
+                - generic [ref=e503]: default
+              - 'button "Project: /Users/roykim/.kiro/crew/workspace" [ref=e505] [cursor=pointer]':
+                - generic [ref=e508]: workspace
+            - generic [ref=e509]:
+              - button "Context usage" [ref=e511] [cursor=pointer]:
+                - 'generic "Context: 0%" [ref=e512]'
+              - button "cx/gpt-5.5 High" [ref=e515] [cursor=pointer]:
+                - generic [ref=e516]: cx/gpt-5.5
+                - generic [ref=e517]: ·
+                - generic [ref=e518]: High

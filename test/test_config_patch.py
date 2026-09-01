@@ -870,9 +870,25 @@ class TestProviderPatch:
                 assert (
                     await _patch(c, "agent.provider_base_url", "https://api.anthropic.com")
                 ).status == 200
+                # "" is the native lane (and the ONLY way to un-set a router
+                # from the dashboard) -- the pattern must accept it.
+                assert (await _patch(c, "agent.provider_base_url", "")).status == 200
                 assert (
                     await _patch(c, "agent.provider_base_url", "bad url; rm -rf /")
                 ).status == 400
+
+    @pytest.mark.asyncio
+    async def test_provider_base_url_clears_to_native(self, tmp_config) -> None:
+        """Clearing provider_base_url to "" is the switch back to the native
+        lane (adapter's own Anthropic credentials) and must persist as "" ."""
+        with patch("kiro_crew.agent.rebuild_agent_config"):
+            async with TestClient(TestServer(self._provider_app())) as c:
+                assert (
+                    await _patch(c, "agent.provider_base_url", "http://localhost:20128")
+                ).status == 200
+                assert (await _patch(c, "agent.provider_base_url", "")).status == 200
+        data = json.loads(tmp_config.read_text(encoding="utf-8"))
+        assert data["agent"]["provider_base_url"] == ""
 
     @pytest.mark.asyncio
     async def test_provider_api_key_persists(self, tmp_config) -> None:

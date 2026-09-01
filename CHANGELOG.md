@@ -2,6 +2,27 @@
 
 All notable changes to KiroCrew are documented in this file.
 
+## [0.5.2-roycrew.1] — 2026-08-31
+
+**The provider picker now applies a backend switch immediately, and Claude
+Code native no longer borrows the router's credential.**
+
+- Switching the provider in Settings → Chat only set a local draft awaiting
+  Save, so nothing reached the config and the next render read the old value
+  straight back. The endpoint's switch side effects — provider-factory reload,
+  live-session eviction, per-slot model clear — never ran either, so even a
+  later Save could leave an open chat answering on the previous backend. The
+  choice is now written on click, and the config refetch is awaited before the
+  draft is dropped (dropping it first re-rendered the stale cache, which reads
+  as the change reverting).
+- Switching also reset the draft to an empty base URL, so a subsequent Save
+  wrote `""` over a working router. The URL now carries across the switch.
+- Claude Code native (no base URL) was still being handed
+  `agent.provider_api_key` as `ANTHROPIC_API_KEY`. That key is a ROUTER
+  credential; sent to Anthropic it failed every turn with 401 "API key is
+  invalid". The config key is now gated on there being a router to send it to.
+  An ambient `ANTHROPIC_API_KEY` still reaches the backend as before.
+
 ## [0.5.1-roycrew.1] — 2026-08-30
 
 **Router model ids now follow the router, not a built-in table.** Three

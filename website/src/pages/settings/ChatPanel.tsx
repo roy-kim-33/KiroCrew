@@ -403,6 +403,10 @@ export function ChatPanel() {
     const savedUrl = (mcCfg?.agent?.provider_base_url ?? '').replace(/\/+$/, '')
     const presets = (savedBackend === 'claude_code' || savedBackend === 'opencode')
       ? PROVIDER_PRESETS[savedBackend] : []
+    // An empty saved URL is not an unconfigured `custom` — on a backend that
+    // has a native lane it IS that lane, so resolve to it or the select snaps
+    // back to "Custom" on every reload.
+    if (!savedUrl) return presets.find(p => p.native)?.value ?? 'custom'
     return presets.find(p => p.url === savedUrl)?.value ?? 'custom'
   })()
   const effPreset = draft?.preset ?? savedPreset
@@ -668,6 +672,11 @@ export function ChatPanel() {
                 placeholder={hasStoredKey ? i18nT('pages.settings.chatPanel.provider_api_key_saved') : ''}
                 onChange={v => setDraft(prev => ({ backend: effBackend, preset: effPreset, url: prev?.url ?? effUrl, key: v, format: prev?.format ?? effFormat }))}
               />
+              {providerPresets.find(p => p.value === effPreset)?.native && (
+                <p className="mt-2 text-[13px] text-muted">
+                  No base URL: the adapter uses its own Anthropic credentials. Save clears any router URL.
+                </p>
+              )}
               <div className="mt-3 flex items-center gap-2">
                 <Btn onClick={providerTest} disabled={providerTesting || !effUrl}>
                   {providerTesting ? '…' : i18nT('pages.settings.chatPanel.provider_test')}

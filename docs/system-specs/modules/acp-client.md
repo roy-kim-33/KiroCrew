@@ -66,6 +66,14 @@ backend instead of (or alongside) kiro-cli's `acp` provider:
   `model_registry` translation (the Bedrock-form `global.anthropic.*` id would
   be rejected). On this path the model rides in via `ANTHROPIC_MODEL` env
   (`AcpClient._model_via_env`), not `session/set_model`.
+- **Native lane (empty base URL):** with `agent.provider_base_url` empty no
+  `ANTHROPIC_BASE_URL` is injected, so `_model_via_env` stays False: the model
+  goes through `session/set_model` and IS registry-translated
+  (`model_registry.to_provider_id(m, "claude_code")`), `auto` resolves
+  normally, and the picker shows the adapter's own advertised list captured by
+  `_capture_available_models`. Surfaced in Settings as the "Claude Code
+  (native)" preset; the dashboard PATCH validator for
+  `agent.provider_base_url` accepts `""` so the URL can be un-set.
 - **Key:** `agent.provider_api_key`, or the environment. The fork-specific
   `CLIPROXY_API_KEY` env var is mapped into `ANTHROPIC_API_KEY` at the provider
   factory, so a local proxy needs no credential in `config.json`

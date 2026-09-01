@@ -8203,7 +8203,16 @@ class KiroCrewConfig:
             if provider_backend in (ACP_BACKEND_CLAUDE, ACP_BACKEND_OPENCODE):
                 if provider_base_url and not _env.get("ANTHROPIC_BASE_URL"):
                     _env["ANTHROPIC_BASE_URL"] = provider_base_url
-                if not _env.get("ANTHROPIC_API_KEY"):
+                if provider_base_url and not _env.get("ANTHROPIC_API_KEY"):
+                    # Gated on the base URL, because agent.provider_api_key is a
+                    # ROUTER credential. On the native lane (no base URL, Claude
+                    # Code talking to Anthropic with its own sign-in) injecting a
+                    # leftover router key made every turn fail with 401 "API key
+                    # is invalid" -- the key is valid, just not for the endpoint
+                    # it was sent to. Ambient ANTHROPIC_API_KEY still reaches the
+                    # child by normal env inheritance, so a user running native
+                    # against their own Anthropic key is unaffected.
+                    #
                     # Precedence: explicit extra_env (already handled above) >
                     # config key > ANTHROPIC_API_KEY env (which the child would
                     # inherit anyway; naming it keeps the catalog fetch in sync)

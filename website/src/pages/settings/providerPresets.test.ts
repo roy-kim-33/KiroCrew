@@ -76,6 +76,30 @@ describe('provider presets', () => {
     expect(byValue['commandcode'].keyRequired).toBe(true)
   })
 
+  it('gives claude_code exactly one native lane, blank and key-free', () => {
+    // The native preset's blank URL means "use the adapter's own Anthropic
+    // credentials", not "unconfigured" — a second one or a stray keyRequired
+    // would make that lane ambiguous or block Save on a key it never needs.
+    const natives = PROVIDER_PRESETS.claude_code.filter(p => p.native)
+    expect(natives).toHaveLength(1)
+    expect(natives[0].url).toBe('')
+    expect(natives[0].keyRequired).toBeUndefined()
+  })
+
+  it('keeps custom distinguishable from the native lane', () => {
+    // Both are blank-URL entries; only `native` tells them apart, and custom
+    // must stay the first choice regardless.
+    const [first] = PROVIDER_PRESETS.claude_code
+    expect(first.value).toBe('custom')
+    expect(first.native).toBeUndefined()
+  })
+
+  it('gives opencode no native preset', () => {
+    // The OpenCode AI-SDK adapter needs an explicit baseURL; a blank one
+    // there is a broken config, not a lane.
+    expect(PROVIDER_PRESETS.opencode.some(p => p.native)).toBe(false)
+  })
+
   it('keeps the local router URLs on loopback', () => {
     for (const value of ['9router', 'cli-proxy-api']) {
       const preset = PROVIDER_PRESETS.claude_code.find(p => p.value === value)!

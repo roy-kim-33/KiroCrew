@@ -1,0 +1,385 @@
+- generic [ref=f3e6]:
+  - link "Skip to content" [ref=f3e7] [cursor=pointer]:
+    - /url: "#main-content"
+  - banner [ref=f3e8]:
+    - generic [ref=f3e10]:
+      - button "Open Command Bar" [ref=f3e282] [cursor=pointer]:
+        - generic [ref=f3e12]: Run a command
+      - button "Focus mode" [ref=f3e13] [cursor=pointer]
+    - generic [ref=f3e20]:
+      - generic [ref=f3e21]:
+        - button "Gateway offline" [expanded] [ref=f3e22] [cursor=pointer]:
+          - status [ref=f3e24]: Gateway offline
+        - button "System metrics" [ref=f3e26] [cursor=pointer]
+        - button "Kiro credit usage" [ref=f3e283] [cursor=pointer]:
+          - generic [ref=f3e284]:
+            - text: "1"
+            - generic [ref=f3e285]: /50
+      - generic [ref=f3e39]:
+        - button "Request a Feature" [ref=f3e40] [cursor=pointer]
+        - button "Report a problem on this Insider build" [ref=f3e287] [cursor=pointer]: Report problem
+      - button "Notifications" [ref=f3e44] [cursor=pointer]
+  - navigation "Main navigation" [ref=f3e48]:
+    - generic [ref=f3e49]:
+      - button "Collapse sidebar" [expanded] [ref=f3e51] [cursor=pointer]:
+        - generic [ref=f3e52]: Kiro Crew
+      - button "Sessions" [ref=f3e57] [cursor=pointer]
+      - button "Schedule" [ref=f3e63] [cursor=pointer]
+      - button "Artifacts" [ref=f3e69] [cursor=pointer]
+      - button "Knowledge" [ref=f3e78] [cursor=pointer]
+      - generic [ref=f3e83]:
+        - generic "Apps" [ref=f3e84]
+        - button "Explore Apps" [ref=f3e85] [cursor=pointer]: Explore
+    - generic [ref=f3e297]:
+      - button "Task Runner" [ref=f3e298] [cursor=pointer]
+      - status [ref=f3e92]
+    - generic [ref=f3e93]:
+      - button "Terminal" [ref=f3e94] [cursor=pointer]
+      - button "Agent Capabilities" [ref=f3e101] [cursor=pointer]
+      - button "Settings" [ref=f3e105] [cursor=pointer]
+      - generic [ref=f3e112]:
+        - generic [ref=f3e115]:
+          - link "Star RoyCrew on GitHub" [ref=f3e116] [cursor=pointer]:
+            - /url: https://github.com/roy-kim-33/KiroCrew
+            - text: Star us
+          - generic [ref=f3e117]: ·
+          - button "Report a problem — collects logs and crash reports, secrets removed" [ref=f3e118] [cursor=pointer]: Report issue
+        - link "Kiro Discord community" [ref=f3e119] [cursor=pointer]:
+          - /url: https://kiro.dev/discord/
+  - main [ref=f3e123]:
+    - generic [ref=f3e124]:
+      - navigation [ref=f3e125]:
+        - generic [ref=f3e126]: Settings
+        - button [ref=f3e127] [cursor=pointer]
+        - button [ref=f3e131] [cursor=pointer]
+        - generic [ref=f3e136]: Preferences
+        - button [active] [ref=f3e137] [cursor=pointer]
+        - button [ref=f3e141] [cursor=pointer]
+        - button [ref=f3e149] [cursor=pointer]
+        - button [ref=f3e154] [cursor=pointer]
+        - button [ref=f3e159] [cursor=pointer]
+        - button [ref=f3e163] [cursor=pointer]
+        - button [ref=f3e168] [cursor=pointer]
+        - generic [ref=f3e173]: System
+        - button [ref=f3e174] [cursor=pointer]
+        - button [ref=f3e179] [cursor=pointer]
+        - button [ref=f3e184] [cursor=pointer]
+        - button [ref=f3e189] [cursor=pointer]
+        - button [ref=f3e200] [cursor=pointer]
+        - button [ref=f3e205] [cursor=pointer]
+        - button [ref=f3e210] [cursor=pointer]
+        - separator
+        - button [ref=f3e215] [cursor=pointer]
+        - button [ref=f3e221] [cursor=pointer]
+        - generic [ref=f3e225]: Kiro Crew v0.5.1-roycrew.1
+      - generic [ref=f3e227]:
+        - generic [ref=f3e228]:
+          - generic [ref=f3e229]:
+            - generic [ref=f3e230]: Chat
+            - generic [ref=f3e231]: Message behavior, history, timestamps, and context
+          - combobox "Search settings" [ref=f3e233]
+        - generic [ref=f3e234]:
+          - heading "Provider" [level=4] [ref=f3e312]
+          - generic [ref=f3e314]:
+            - generic [ref=f3e315]:
+              - button "Claude Code anthropic endpoint" [pressed] [ref=f3e316] [cursor=pointer]:
+                - generic [ref=f3e317]: Claude Code
+                - generic [ref=f3e318]: anthropic endpoint
+              - button "OpenCode OpenAI-compatible endpoint" [ref=f3e319] [cursor=pointer]:
+                - generic [ref=f3e320]: OpenCode
+                - generic [ref=f3e321]: OpenAI-compatible endpoint
+              - button "kiro-native kiro-cli backend" [ref=f3e322] [cursor=pointer]:
+                - generic [ref=f3e323]: kiro-native
+                - generic [ref=f3e324]: kiro-cli backend
+            - generic [ref=f3e325]:
+              - generic [ref=f3e326]: Preset
+              - combobox "Preset" [ref=f3e329] [cursor=pointer]:
+                - generic: 9router
+            - generic [ref=f3e332]:
+              - generic [ref=f3e333]: Base URL
+              - textbox "Base URL" [ref=f3e335]:
+                - /placeholder: https://…
+                - text: http://localhost:20128
+            - generic [ref=f3e336]:
+              - generic [ref=f3e337]: API key
+              - textbox "API key" [ref=f3e339]:
+                - /placeholder: ••• saved (leave empty to keep)
+            - generic [ref=f3e340]:
+              - button "Test connection" [ref=f3e341] [cursor=pointer]
+              - button "Save provider" [disabled] [ref=f3e342]
+          - heading "Model" [level=4] [ref=f3e344]
+          - generic [ref=f3e346]:
+            - generic [ref=f3e347]: Chat
+            - generic [ref=f3e348]:
+              - generic [ref=f3e349]:
+                - generic [ref=f3e350]: Default Model
+                - button "More information" [ref=f3e351] [cursor=pointer]: "?"
+              - generic [ref=f3e352]: Which model new sessions start with when their agent pins none. Set a model per agent under Capabilities → Agents, or pick one inside a session to override it there.
+              - combobox "Default Model" [ref=f3e354] [cursor=pointer]:
+                - generic: Default (auto)
+            - generic [ref=f3e357]:
+              - generic [ref=f3e358]:
+                - generic [ref=f3e359]: Default Reasoning Effort
+                - button "More information" [ref=f3e360] [cursor=pointer]: "?"
+              - generic [ref=f3e361]: How long models think before answering by default. Higher is slower and costs more. Only available on reasoning-capable models (Opus, Sonnet, Fable, GPT-5.x).
+              - generic [ref=f3e362]:
+                - combobox "Default Reasoning Effort" [disabled]:
+                  - generic: High
+          - generic [ref=f3e364]:
+            - generic [ref=f3e365]: Background
+            - generic [ref=f3e366]: Model for background work — title generation, history compaction, and heartbeat polling.
+            - generic [ref=f3e367]:
+              - generic [ref=f3e368]:
+                - generic [ref=f3e369]: Background Model
+                - button "More information" [ref=f3e370] [cursor=pointer]: "?"
+              - combobox "Background Model" [ref=f3e372] [cursor=pointer]:
+                - generic: Auto (provider picks)
+            - generic [ref=f3e375]:
+              - generic [ref=f3e376]:
+                - generic [ref=f3e377]: Background Effort
+                - button "More information" [ref=f3e378] [cursor=pointer]: "?"
+              - generic [ref=f3e379]:
+                - combobox "Background Effort" [disabled]:
+                  - generic: Model default
+          - generic [ref=f3e381]:
+            - generic [ref=f3e382]: Sub-agents
+            - generic [ref=f3e383]: Model for spawned sub-agents.
+            - generic [ref=f3e384]:
+              - generic [ref=f3e385]:
+                - generic [ref=f3e386]: Subagent Model
+                - button "More information" [ref=f3e387] [cursor=pointer]: "?"
+              - combobox "Subagent Model" [ref=f3e389] [cursor=pointer]:
+                - generic: Auto (provider picks)
+            - generic [ref=f3e392]:
+              - generic [ref=f3e393]:
+                - generic [ref=f3e394]: Subagent Effort
+                - button "More information" [ref=f3e395] [cursor=pointer]: "?"
+              - generic [ref=f3e396]:
+                - combobox "Subagent Effort" [disabled]:
+                  - generic: Model default
+          - heading "About You" [level=4] [ref=f3e398]
+          - generic [ref=f3e400]:
+            - generic [ref=f3e401]:
+              - generic [ref=f3e402]: Your Role
+              - generic [ref=f3e404]: Kiro matches vocabulary and examples to your professional background
+              - combobox "Your Role" [ref=f3e406] [cursor=pointer]:
+                - generic: Developer
+            - generic [ref=f3e409]:
+              - generic [ref=f3e410]: Technical Comfort
+              - generic [ref=f3e412]: Sets how deep explanations go — plain language vs. full technical detail
+              - combobox "Technical Comfort" [ref=f3e414] [cursor=pointer]:
+                - generic: I write code
+          - heading "Power" [level=4] [ref=f3e418]
+          - button "Prevent sleep while running Keep your computer awake while a task is running Prevent sleep while running" [ref=f3e421] [cursor=pointer]:
+            - generic [ref=f3e422]:
+              - generic [ref=f3e423]: Prevent sleep while running
+              - generic [ref=f3e424]: Keep your computer awake while a task is running
+            - switch "Prevent sleep while running" [checked] [ref=f3e426]
+          - heading "Composer" [level=4] [ref=f3e429]
+          - generic [ref=f3e431]:
+            - generic [ref=f3e432]:
+              - generic [ref=f3e433]: Send shortcut
+              - generic [ref=f3e435]: Shift+Enter for newline
+              - combobox "Send shortcut" [ref=f3e437] [cursor=pointer]:
+                - generic: Enter sends
+            - button "Quick Send Click a suggested reply to send it instantly. ⇧+Click to select multiple. Quick Send" [ref=f3e440] [cursor=pointer]:
+              - generic [ref=f3e441]:
+                - generic [ref=f3e442]: Quick Send
+                - generic [ref=f3e443]: Click a suggested reply to send it instantly. ⇧+Click to select multiple.
+              - switch "Quick Send" [ref=f3e445]
+            - button "Merge Queued Messages Combine follow-up messages into a single labeled prompt while the agent is busy Merge Queued Messages" [ref=f3e447] [cursor=pointer]:
+              - generic [ref=f3e448]:
+                - generic [ref=f3e449]: Merge Queued Messages
+                - generic [ref=f3e450]: Combine follow-up messages into a single labeled prompt while the agent is busy
+              - switch "Merge Queued Messages" [ref=f3e452]
+            - generic [ref=f3e454]:
+              - generic [ref=f3e455]: Follow-Up Bar Layout
+              - generic [ref=f3e457]: Multiline wraps suggestions onto multiple rows. Single line keeps them on one horizontally-scrollable row.
+              - group "Follow-Up Bar Layout" [ref=f3e458]:
+                - button "Multiline" [ref=f3e459] [cursor=pointer]
+                - button "Single line" [pressed] [ref=f3e460] [cursor=pointer]
+            - generic [ref=f3e461]:
+              - generic [ref=f3e462]:
+                - generic [ref=f3e463]: Soft-stop budget (seconds)
+                - button "More information" [ref=f3e464] [cursor=pointer]: "?"
+              - spinbutton "Soft-stop budget (seconds)" [ref=f3e465]: "10"
+          - heading "Messages" [level=4] [ref=f3e467]
+          - generic [ref=f3e469]:
+            - generic [ref=f3e470]:
+              - generic [ref=f3e471]: Text Streaming Style
+              - generic [ref=f3e473]: Immediate mode shows raw chunks as they arrive. Smooth mode buffers and fades text in at a steady pace.
+              - group "Text Streaming Style" [ref=f3e474]:
+                - button "Immediate" [ref=f3e475] [cursor=pointer]
+                - button "Smooth" [pressed] [ref=f3e476] [cursor=pointer]
+            - button "Show Timestamps Display time on each message Show Timestamps" [ref=f3e477] [cursor=pointer]:
+              - generic [ref=f3e478]:
+                - generic [ref=f3e479]: Show Timestamps
+                - generic [ref=f3e480]: Display time on each message
+              - switch "Show Timestamps" [checked] [ref=f3e482]
+            - generic [ref=f3e484]:
+              - generic [ref=f3e485]: Content Width
+              - generic [ref=f3e487]: Compact is the original view. Comfortable and Full use more screen space.
+              - group "Content Width" [ref=f3e488]:
+                - button "Compact" [pressed] [ref=f3e489] [cursor=pointer]
+                - button "Comfortable" [ref=f3e490] [cursor=pointer]
+                - button "Full" [ref=f3e491] [cursor=pointer]
+            - button "Show Thinking Inline Show intermediate reasoning text between tool calls instead of collapsing everything Show Thinking Inline" [ref=f3e492] [cursor=pointer]:
+              - generic [ref=f3e493]:
+                - generic [ref=f3e494]: Show Thinking Inline
+                - generic [ref=f3e495]: Show intermediate reasoning text between tool calls instead of collapsing everything
+              - switch "Show Thinking Inline" [ref=f3e497]
+            - button "Pin the latest turn Keep the most recent turn visible as a sticky banner once it scrolls above the fold. Pin the latest turn" [ref=f3e499] [cursor=pointer]:
+              - generic [ref=f3e500]:
+                - generic [ref=f3e501]: Pin the latest turn
+                - generic [ref=f3e502]: Keep the most recent turn visible as a sticky banner once it scrolls above the fold.
+              - switch "Pin the latest turn" [checked] [ref=f3e504]
+            - button "Simplified Tool Call Names When enabled, inline tool pills show simplified tool use purpose instead of the exact command being run Simplified Tool Call Names" [ref=f3e506] [cursor=pointer]:
+              - generic [ref=f3e507]:
+                - generic [ref=f3e508]: Simplified Tool Call Names
+                - generic [ref=f3e509]: When enabled, inline tool pills show simplified tool use purpose instead of the exact command being run
+              - switch "Simplified Tool Call Names" [checked] [ref=f3e511]
+            - generic [ref=f3e513]:
+              - generic [ref=f3e514]: File Change Chips
+              - generic [ref=f3e516]: How file diff chips appear below assistant messages
+              - combobox "File Change Chips" [ref=f3e518] [cursor=pointer]:
+                - generic: Expanded (icon + name + stats)
+            - button "Link Previews Show a favicon and page title instead of the raw URL. This machine then fetches every link the model outputs, so each linked site sees a request from your IP address. Link Previews" [ref=f3e521] [cursor=pointer]:
+              - generic [ref=f3e522]:
+                - generic [ref=f3e523]: Link Previews
+                - generic [ref=f3e524]: Show a favicon and page title instead of the raw URL. This machine then fetches every link the model outputs, so each linked site sees a request from your IP address.
+              - switch "Link Previews" [ref=f3e526]
+            - generic [ref=f3e528]:
+              - generic [ref=f3e529]: Widget Density
+              - generic [ref=f3e531]: How aggressively the agent uses inline widgets for visual content
+              - combobox "Widget Density" [ref=f3e533] [cursor=pointer]:
+                - generic: More (encourage widgets)
+            - button "MCP Apps in Side Panel Render interactive MCP Apps (such as Excalidraw diagrams) in the right side panel instead of inline in the chat. The panel opens automatically. MCP Apps in Side Panel" [ref=f3e536] [cursor=pointer]:
+              - generic [ref=f3e537]:
+                - generic [ref=f3e538]: MCP Apps in Side Panel
+                - generic [ref=f3e539]: Render interactive MCP Apps (such as Excalidraw diagrams) in the right side panel instead of inline in the chat. The panel opens automatically.
+              - switch "MCP Apps in Side Panel" [checked] [ref=f3e541]
+            - button "Auto-Open Git in Side Panel Expand the side panel to the Git tab each time you start a chat in a git project. The Git tab is created either way. Auto-Open Git in Side Panel" [ref=f3e543] [cursor=pointer]:
+              - generic [ref=f3e544]:
+                - generic [ref=f3e545]: Auto-Open Git in Side Panel
+                - generic [ref=f3e546]: Expand the side panel to the Git tab each time you start a chat in a git project. The Git tab is created either way.
+              - switch "Auto-Open Git in Side Panel" [ref=f3e548]
+            - generic [ref=f3e550]:
+              - generic [ref=f3e551]: Response Verbosity
+              - generic [ref=f3e553]: "How terse the agent's prose is. Ultra-concise keeps the whole reply short: answer first, bullets over paragraphs, no filler. Code, commands, and error strings stay verbatim at every level, and security warnings and multi-step instructions keep full detail."
+              - combobox "Response Verbosity" [ref=f3e555] [cursor=pointer]:
+                - generic: Default — normal length
+            - button "Show Context Percentage Display usage percentage next to the context progress bar Show Context Percentage" [ref=f3e558] [cursor=pointer]:
+              - generic [ref=f3e559]:
+                - generic [ref=f3e560]: Show Context Percentage
+                - generic [ref=f3e561]: Display usage percentage next to the context progress bar
+              - switch "Show Context Percentage" [ref=f3e563]
+            - button "Show Context Tokens Display used and total tokens next to the context progress bar Show Context Tokens" [ref=f3e565] [cursor=pointer]:
+              - generic [ref=f3e566]:
+                - generic [ref=f3e567]: Show Context Tokens
+                - generic [ref=f3e568]: Display used and total tokens next to the context progress bar
+              - switch "Show Context Tokens" [ref=f3e570]
+            - button "Feature Tips Show occasional feature discovery tips above the composer while the agent is working Feature Tips" [ref=f3e572] [cursor=pointer]:
+              - generic [ref=f3e573]:
+                - generic [ref=f3e574]: Feature Tips
+                - generic [ref=f3e575]: Show occasional feature discovery tips above the composer while the agent is working
+              - switch "Feature Tips" [checked] [ref=f3e577]
+            - button "Folder suggestions Offer to file a new session into a matching folder once it has a title. Folder suggestions" [ref=f3e579] [cursor=pointer]:
+              - generic [ref=f3e580]:
+                - generic [ref=f3e581]: Folder suggestions
+                - generic [ref=f3e582]: Offer to file a new session into a matching folder once it has a title.
+              - switch "Folder suggestions" [checked] [ref=f3e584]
+          - heading "Sessions" [level=4] [ref=f3e587]
+          - generic [ref=f3e589]:
+            - 'button "Split View (Session Grid) Opt-in: split the chat into resizable session panes (⌘+D). Experimental. Split View (Session Grid)" [ref=f3e590] [cursor=pointer]':
+              - generic [ref=f3e591]:
+                - generic [ref=f3e592]: Split View (Session Grid)
+                - generic [ref=f3e593]: "Opt-in: split the chat into resizable session panes (⌘+D). Experimental."
+              - switch "Split View (Session Grid)" [ref=f3e595]
+            - button "History Expanded Expand history sidebar by default History Expanded" [ref=f3e597] [cursor=pointer]:
+              - generic [ref=f3e598]:
+                - generic [ref=f3e599]: History Expanded
+                - generic [ref=f3e600]: Expand history sidebar by default
+              - switch "History Expanded" [checked] [ref=f3e602]
+            - button "Confirm Before Closing Session Show a confirmation dialog when closing a session Confirm Before Closing Session" [ref=f3e604] [cursor=pointer]:
+              - generic [ref=f3e605]:
+                - generic [ref=f3e606]: Confirm Before Closing Session
+                - generic [ref=f3e607]: Show a confirmation dialog when closing a session
+              - switch "Confirm Before Closing Session" [ref=f3e609]
+            - button "Default to Autopilot Mode New sessions start in autopilot mode (plan → approve → execute). You can still toggle individual sessions. Default to Autopilot Mode" [ref=f3e611] [cursor=pointer]:
+              - generic [ref=f3e612]:
+                - generic [ref=f3e613]: Default to Autopilot Mode
+                - generic [ref=f3e614]: New sessions start in autopilot mode (plan → approve → execute). You can still toggle individual sessions.
+              - switch "Default to Autopilot Mode" [ref=f3e616]
+            - button "Tail-only Fork Fork keeps only the messages after the chosen point instead of those up to it. Tail-only Fork" [ref=f3e618] [cursor=pointer]:
+              - generic [ref=f3e619]:
+                - generic [ref=f3e620]: Tail-only Fork
+                - generic [ref=f3e621]: Fork keeps only the messages after the chosen point instead of those up to it.
+              - switch "Tail-only Fork" [ref=f3e623]
+            - button "Restore Sessions Re-open recently active sessions on startup Restore Sessions" [ref=f3e625] [cursor=pointer]:
+              - generic [ref=f3e626]:
+                - generic [ref=f3e627]: Restore Sessions
+                - generic [ref=f3e628]: Re-open recently active sessions on startup
+              - switch "Restore Sessions" [ref=f3e630]
+            - button "Session summaries Summarize each session by intent. Uses tokens on turns that change the session. Session summaries" [ref=f3e632] [cursor=pointer]:
+              - generic [ref=f3e633]:
+                - generic [ref=f3e634]: Session summaries
+                - generic [ref=f3e635]: Summarize each session by intent. Uses tokens on turns that change the session.
+              - switch "Session summaries" [ref=f3e637]
+          - heading "Vision" [level=4] [ref=f3e640]
+          - generic [ref=f3e642]:
+            - generic [ref=f3e643]:
+              - generic [ref=f3e644]: Image input mode
+              - generic [ref=f3e646]: How user-attached images are presented to the model.
+              - combobox "Image input mode" [ref=f3e648] [cursor=pointer]:
+                - generic: Auto (vision-aware)
+            - generic [ref=f3e651]:
+              - generic [ref=f3e652]: On text-only models
+              - generic [ref=f3e654]: What to do when the active model cannot take images.
+              - combobox "On text-only models" [ref=f3e656] [cursor=pointer]:
+                - generic: Describe via vision subagent
+            - generic [ref=f3e659]:
+              - generic [ref=f3e660]: Vision fallback model
+              - generic [ref=f3e662]: Picker-spelling id the describe/switch path uses (must be vision-capable).
+              - combobox "Vision fallback model" [ref=f3e664] [cursor=pointer]:
+                - generic: cmc/mimo-v2.5
+            - paragraph [ref=f3e667]: Vision section mirrors the picker grouping (Vision — image input with an Image badge, then Text). On text-only models the active policy's fallback model is used; the text input stays the same — images ride the same composer attachment.
+          - heading "Context" [level=4] [ref=f3e669]
+          - generic [ref=f3e672]:
+            - generic [ref=f3e673]: Auto-Compact Threshold
+            - generic [ref=f3e675]: Context usage % at which auto-compaction triggers. Lower = more frequent compaction, longer sessions
+            - combobox "Auto-Compact Threshold" [ref=f3e677] [cursor=pointer]:
+              - generic: 90%
+          - heading "Knowledge Library" [level=4] [ref=f3e681]
+          - generic [ref=f3e683]:
+            - button "Auto-Add Documents Let the agent add documents it reads while working to your knowledge library, so they stay searchable later. The agent reads documents with tools you approve; Kiro Crew does not fetch them directly. Added documents appear in one “Auto-added” source you can remove in a click. Auto-Add Documents" [ref=f3e684] [cursor=pointer]:
+              - generic [ref=f3e685]:
+                - generic [ref=f3e686]: Auto-Add Documents
+                - generic [ref=f3e687]: Let the agent add documents it reads while working to your knowledge library, so they stay searchable later. The agent reads documents with tools you approve; Kiro Crew does not fetch them directly. Added documents appear in one “Auto-added” source you can remove in a click.
+              - switch "Auto-Add Documents" [ref=f3e689]
+            - button "Auto-Register Project Documents Register the documents of each project you work in, so its design docs, specs and READMEs become searchable without adding the folder by hand. Documents only — never source code, agent instructions or generated files. Auto-Register Project Documents" [ref=f3e691] [cursor=pointer]:
+              - generic [ref=f3e692]:
+                - generic [ref=f3e693]: Auto-Register Project Documents
+                - generic [ref=f3e694]: Register the documents of each project you work in, so its design docs, specs and READMEs become searchable without adding the folder by hand. Documents only — never source code, agent instructions or generated files.
+              - switch "Auto-Register Project Documents" [ref=f3e696]
+            - button "Auto-Add Saved Artifacts Mirror documents you save as artifacts into the library, keep them in sync as you edit, and remove them when you delete the artifact. Auto-Add Saved Artifacts" [ref=f3e698] [cursor=pointer]:
+              - generic [ref=f3e699]:
+                - generic [ref=f3e700]: Auto-Add Saved Artifacts
+                - generic [ref=f3e701]: Mirror documents you save as artifacts into the library, keep them in sync as you edit, and remove them when you delete the artifact.
+              - switch "Auto-Add Saved Artifacts" [ref=f3e703]
+            - generic [ref=f3e705]:
+              - generic [ref=f3e706]:
+                - generic [ref=f3e707]: Auto-Ingest Limit Per Scan
+                - button "More information" [ref=f3e708] [cursor=pointer]: "?"
+              - spinbutton "Auto-Ingest Limit Per Scan" [ref=f3e709]: "150"
+          - heading "Subagents" [level=4] [ref=f3e711]
+          - generic [ref=f3e713]:
+            - generic [ref=f3e714]:
+              - generic [ref=f3e715]: Completion Event Truncation
+              - generic [ref=f3e717]: Which part of a subagent's stream to keep when injecting its completion event into the parent session. Head preserves the start (default, matches legacy behavior). Tail preserves the final summary. Both keeps a slice from each end with a marker between them.
+              - combobox "Completion Event Truncation" [ref=f3e719] [cursor=pointer]:
+                - generic: Head (preserve start of stream)
+            - generic [ref=f3e722]:
+              - generic [ref=f3e723]:
+                - generic [ref=f3e724]: Completion Event Characters
+                - button "More information" [ref=f3e725] [cursor=pointer]: "?"
+              - spinbutton "Completion event characters" [ref=f3e726]: "3000"

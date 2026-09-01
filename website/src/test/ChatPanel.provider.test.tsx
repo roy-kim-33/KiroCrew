@@ -140,6 +140,42 @@ describe('ChatPanel Provider section', () => {
     expect(url.value).toBe('http://localhost:20128')
   })
 
+  it('selects the native preset, clears the URL, and resolves back to it after save', async () => {
+    // Bug: an empty saved URL used to resolve to `custom` (the other blank
+    // entry) on reload, so a user who picked "Claude Code (native)" and saved
+    // saw "Custom" come back instead of their actual lane.
+    const agent: Record<string, unknown> = {
+      acp_backend: 'claude', provider_base_url: 'http://localhost:20128', model: 'auto',
+    }
+    kirocrewConfigMock.mockImplementation(() => Promise.resolve({ agent }) as never)
+    patchConfigMock.mockClear()
+    patchConfigMock.mockImplementation((path: string, value: unknown) => {
+      agent[String(path).replace(/^agent\./, '')] = value
+      return Promise.resolve({})
+    })
+    wrap(<ChatPanel />)
+
+    const options = await openSelect('Preset')
+    fireEvent.click(options.find(o => o.textContent === 'Claude Code (native)')!)
+
+    const urlInput = await screen.findByLabelText('Base URL') as HTMLInputElement
+    expect(urlInput.value).toBe('')
+
+    // The selection must HOLD before Save -- a draft that loses the pick here
+    // snaps the dropdown straight back to the previously saved preset.
+    const presetBeforeSave = await screen.findByRole('combobox', { name: 'Preset' })
+    expect(presetBeforeSave.textContent).toContain('Claude Code (native)')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Save provider' }))
+
+    await waitFor(() => {
+      expect(patchConfigMock).toHaveBeenCalledWith('agent.provider_base_url', '')
+    })
+
+    const preset = await screen.findByRole('combobox', { name: 'Preset' })
+    expect(preset.textContent).toContain('Claude Code (native)')
+  })
+
   it('shows a saved-key placeholder instead of the real key', async () => {
     seed({ acp_backend: 'claude', provider_base_url: 'http://localhost:8317', provider_api_key: 'sk-stored', model: 'auto' })
     wrap(<ChatPanel />)

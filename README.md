@@ -99,7 +99,7 @@ This fork adds:
 - `agent.provider` accepts **`claude_code`** and **`opencode`** in addition to the default `acp` (kiro-cli)
 - new config fields **`agent.provider_base_url`** and **`agent.provider_api_key`** (+ `provider_api_format` for OpenAI-compatible wire)
 - the provider factory spawns **claude-agent-acp** (Claude Code) or **opencode acp**, pointed at your base URL, with the model id passed through unchanged (router namespaces are not registry-translated)
-- **Settings → Chat provider picker** — pick a backend, then a preset (Ollama Cloud, OpenCode Zen/Go, commandcode.ai, 9router, CLIProxyAPI, OpenRouter, xAI, Mistral, DeepSeek, Together, Groq, OpenAI, Anthropic), test the connection, and allowlist models
+- **Settings → Chat provider picker** — pick a backend, then a preset (Claude Code native, Ollama Cloud, OpenCode Zen/Go, commandcode.ai, 9router, CLIProxyAPI, OpenRouter, xAI, Mistral, DeepSeek, Together, Groq, OpenAI, Anthropic), test the connection, and allowlist models
 - the GUI model picker shows **prefixed model ids** (`cmc/`, `oc/`, `ol/`, `cx/`, `ag/`); the prefix is stripped before the request leaves
 - `CLIPROXY_API_KEY` env var feeds the local proxy when `provider_api_key` / `ANTHROPIC_API_KEY` are unset
 - **image redirect** — when a text-only model (e.g. deepseek-flash) gets an image prompt, it's routed to a vision-capable fallback model (default `cmc/mimo-v2.5`) via `agent.image_redirect` / `agent.vision_fallback_model` / `agent.text_only_models`
@@ -413,9 +413,12 @@ the dormant seam (comments referencing `ACP_BACKEND_CLAUDE`) is preserved.
 
 Point the app at your own router — Claude Code (Anthropic endpoint) or
 OpenCode (OpenAI-compatible endpoint), with presets for the popular gateways
-(Ollama Cloud, OpenCode Zen/Go, commandcode.ai, 9router, CLIProxyAPI, OpenRouter,
-xAI, Mistral, DeepSeek, Together, Groq, OpenAI …), a connection test, and a
-model allowlist so the picker only shows the models you actually use.
+(Claude Code native, Ollama Cloud, OpenCode Zen/Go, commandcode.ai, 9router,
+CLIProxyAPI, OpenRouter, xAI, Mistral, DeepSeek, Together, Groq, OpenAI …), a
+connection test, and a model allowlist so the picker only shows the models you
+actually use. Choosing the **Claude Code (native)** preset leaves the base URL
+empty, so Claude Code uses its own Anthropic credentials and no router sits in
+the path.
 
 ![Provider settings](assets/provider-selection.png)
 

@@ -100,3 +100,37 @@ class TestAutoOnARouter:
             extra_env={"ANTHROPIC_BASE_URL": "http://localhost:20128"},
         )
         assert cl._model == "cx/gpt-5.5"
+
+
+class TestNativeLane:
+    """Claude Code native: no router in the path at all.
+
+    Selecting the native preset leaves ``agent.provider_base_url`` empty, which
+    means "talk to Anthropic with Claude Code's own sign-in". The router
+    credential in ``agent.provider_api_key`` must not come along for the ride:
+    it is a valid key for the ROUTER, and sending it to Anthropic fails every
+    turn with 401 "API key is invalid".
+    """
+
+    def _env_for(self, monkeypatch, base_url, key):
+        from kiro_crew.config import loader as L
+
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("CLIPROXY_API_KEY", raising=False)
+        cfg = L.KiroCrewConfig.load()
+        cfg.agent.acp_backend = "claude"
+        cfg.agent.provider_base_url = base_url
+        cfg.agent.provider_api_key = key
+        cfg.agent.model = "auto"
+        prov = cfg.create_provider_factory()()
+        return getattr(getattr(prov, "_client", None), "_extra_env", {}) or {}
+
+    def test_native_lane_does_not_send_the_router_key_to_anthropic(self, monkeypatch):
+        env = self._env_for(monkeypatch, "", "sk-router-only")
+        assert env.get("ANTHROPIC_API_KEY") != "sk-router-only"
+        assert "ANTHROPIC_BASE_URL" not in env
+
+    def test_router_lane_still_gets_its_key(self, monkeypatch):
+        env = self._env_for(monkeypatch, "http://localhost:20128", "sk-router-only")
+        assert env.get("ANTHROPIC_API_KEY") == "sk-router-only"
+        assert env.get("ANTHROPIC_BASE_URL") == "http://localhost:20128"

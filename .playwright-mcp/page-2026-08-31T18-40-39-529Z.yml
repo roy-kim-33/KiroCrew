@@ -1,0 +1,93 @@
+- generic [ref=f3e6]:
+  - link "Skip to content" [ref=f3e7] [cursor=pointer]:
+    - /url: "#main-content"
+  - banner [ref=f3e8]:
+    - generic [ref=f3e10]:
+      - button "Search sessions, files, and commands" [ref=f3e11] [cursor=pointer]:
+        - generic [ref=f3e12]: ⌘K — Search for anything…
+      - button "Focus mode" [ref=f3e13] [cursor=pointer]
+    - generic [ref=f3e20]:
+      - generic [ref=f3e21]:
+        - button "Gateway offline" [expanded] [ref=f3e22] [cursor=pointer]:
+          - status [ref=f3e24]: Gateway offline
+        - button "System metrics" [ref=f3e26] [cursor=pointer]
+        - button "Kiro credit usage — checking" [ref=f3e30] [cursor=pointer]
+      - button "Request a Feature" [ref=f3e40] [cursor=pointer]
+      - button "Notifications" [ref=f3e44] [cursor=pointer]
+  - navigation "Main navigation" [ref=f3e48]:
+    - generic [ref=f3e49]:
+      - button "Collapse sidebar" [expanded] [ref=f3e51] [cursor=pointer]:
+        - generic [ref=f3e52]: Kiro Crew
+      - button "Sessions" [ref=f3e57] [cursor=pointer]
+      - button "Schedule" [ref=f3e63] [cursor=pointer]
+      - button "Artifacts" [ref=f3e69] [cursor=pointer]
+      - button "Knowledge" [ref=f3e78] [cursor=pointer]
+      - generic [ref=f3e83]:
+        - generic "Apps" [ref=f3e84]
+        - button "Explore Apps" [ref=f3e85] [cursor=pointer]: Explore
+    - status [ref=f3e92]
+    - generic [ref=f3e93]:
+      - button "Terminal" [ref=f3e94] [cursor=pointer]
+      - button "Agent Capabilities" [ref=f3e101] [cursor=pointer]
+      - button "Settings" [ref=f3e105] [cursor=pointer]
+      - generic [ref=f3e112]:
+        - generic [ref=f3e115]:
+          - link "Star RoyCrew on GitHub" [ref=f3e116] [cursor=pointer]:
+            - /url: https://github.com/roy-kim-33/KiroCrew
+            - text: Star us
+          - generic [ref=f3e117]: ·
+          - button "Report a problem — collects logs and crash reports, secrets removed" [ref=f3e118] [cursor=pointer]: Report issue
+        - link "Kiro Discord community" [ref=f3e119] [cursor=pointer]:
+          - /url: https://kiro.dev/discord/
+  - main [ref=f3e123]:
+    - generic [ref=f3e124]:
+      - navigation [ref=f3e125]:
+        - generic [ref=f3e126]: Settings
+        - button [ref=f3e127] [cursor=pointer]
+        - button [ref=f3e131] [cursor=pointer]
+        - generic [ref=f3e136]: Preferences
+        - button [ref=f3e137] [cursor=pointer]
+        - button [ref=f3e141] [cursor=pointer]
+        - button [ref=f3e149] [cursor=pointer]
+        - button [ref=f3e154] [cursor=pointer]
+        - button [ref=f3e159] [cursor=pointer]
+        - button [ref=f3e163] [cursor=pointer]
+        - button [ref=f3e168] [cursor=pointer]
+        - generic [ref=f3e173]: System
+        - button [ref=f3e174] [cursor=pointer]
+        - button [ref=f3e179] [cursor=pointer]
+        - button [ref=f3e184] [cursor=pointer]
+        - button [ref=f3e189] [cursor=pointer]
+        - button [ref=f3e200] [cursor=pointer]
+        - button [ref=f3e205] [cursor=pointer]
+        - button [ref=f3e210] [cursor=pointer]
+        - separator
+        - button [ref=f3e215] [cursor=pointer]
+        - button [ref=f3e221] [cursor=pointer]
+        - generic [ref=f3e225]: Kiro Crew v—
+      - generic [ref=f3e227]:
+        - generic [ref=f3e228]:
+          - generic [ref=f3e229]:
+            - generic [ref=f3e230]: Overview
+            - generic [ref=f3e231]: System health, activity, and usage & memory at a glance
+          - combobox "Search settings" [ref=f3e233]
+        - generic [ref=f3e234]:
+          - generic [ref=f3e236]:
+            - generic [ref=f3e237]: Connecting…
+            - generic [ref=f3e239]: Up —
+          - generic [ref=f3e240]:
+            - generic [ref=f3e241]:
+              - generic [ref=f3e242]: Uptime
+              - generic [ref=f3e243]: —
+            - generic [ref=f3e244]: Sessions
+            - generic [ref=f3e247]: Messages
+            - generic [ref=f3e250]: Cron Jobs
+            - generic [ref=f3e253]: Subagents
+            - generic [ref=f3e256]: Lessons
+          - generic [ref=f3e259]:
+            - heading [level=3] [ref=f3e261]:
+              - text: Usage
+              - button "View details" [ref=f3e264] [cursor=pointer]
+            - heading [level=3] [ref=f3e269]:
+              - text: Memory
+              - button "View details" [ref=f3e278] [cursor=pointer]

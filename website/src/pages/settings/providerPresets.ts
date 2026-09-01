@@ -23,6 +23,12 @@ export interface ProviderPreset {
   /** OpenCode provider adapter format (ignored by claude_code). */
   format?: 'anthropic' | 'openai'
   keyRequired?: boolean
+  /**
+   * The empty-URL native lane: no base URL is injected, so the backend's own
+   * adapter credentials are used. Distinguishes this preset from `custom`,
+   * which is also blank but means "the user will type one".
+   */
+  native?: boolean
 }
 
 export const BACKEND_OPTIONS: BackendOption[] = [
@@ -34,6 +40,11 @@ export const BACKEND_OPTIONS: BackendOption[] = [
 export const PROVIDER_PRESETS: Record<'claude_code' | 'opencode', ProviderPreset[]> = {
   claude_code: [
     { value: 'custom', label: 'Custom', url: '' },
+    // Empty URL is the point: it clears agent.provider_base_url so the
+    // claude-agent-acp adapter uses its own Anthropic credentials
+    // (subscription login or ANTHROPIC_API_KEY from the environment) with no
+    // router in the path.
+    { value: 'claude-code-native', label: 'Claude Code (native)', url: '', native: true },
     { value: 'ollama-cloud', label: 'Ollama Cloud', url: 'https://ollama.com', keyRequired: true },
     { value: 'opencode-zen', label: 'OpenCode Zen', url: 'https://opencode.ai/zen', keyRequired: true },
     { value: 'opencode-go', label: 'OpenCode Go', url: 'https://opencode.ai/zen/go', keyRequired: true },
