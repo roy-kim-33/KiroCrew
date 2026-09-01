@@ -134,3 +134,80 @@ class TestNativeLane:
         env = self._env_for(monkeypatch, "http://localhost:20128", "sk-router-only")
         assert env.get("ANTHROPIC_API_KEY") == "sk-router-only"
         assert env.get("ANTHROPIC_BASE_URL") == "http://localhost:20128"
+
+
+class TestNativeModelPicker:
+    """The native lane must advertise the account's real models.
+
+    ``settings.local.json`` doubles as an org-policy allowlist. The Bedrock
+    path writes ``availableModels: ["*"]`` to unlock the 1M window, but the
+    adapter reads that literally: on the native lane it left a session whose
+    only "model" was the string ``*``, so the picker showed nothing real and
+    every genuine id came back ``Invalid value for config option model``.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _no_live_router(self, monkeypatch):
+        """Never probe a real router: a reachable one auto-resolves a model and
+        silently sends these through the pinned-model branch instead."""
+        monkeypatch.setattr(c, "load_router_catalog_ids", lambda *a, **k: [])
+
+    def _settings_after_seed(self, tmp_path, extra_env, seed=None):
+        import json
+
+        cl = c.AcpClient(
+            work_dir=str(tmp_path),
+            acp_backend=c.ACP_BACKEND_CLAUDE,
+            model="",
+            extra_env=extra_env,
+        )
+        path = tmp_path / ".claude" / "settings.local.json"
+        if seed is not None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(seed), encoding="utf-8")
+        cl._write_claude_local_settings()
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    def test_native_lane_writes_no_model_allowlist(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+        assert "availableModels" not in self._settings_after_seed(tmp_path, {})
+
+    def test_router_lane_keeps_the_window_unlock(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+        data = self._settings_after_seed(
+            tmp_path, {"ANTHROPIC_BASE_URL": "http://localhost:20128"}
+        )
+        assert data["availableModels"] == ["*"]
+
+    def test_a_wildcard_left_by_an_earlier_session_is_cleared(self, tmp_path, monkeypatch):
+        """Settings persist across backend switches; without this the native
+        lane stays poisoned forever, since the write is conditional."""
+        monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+        data = self._settings_after_seed(tmp_path, {}, seed={"availableModels": ["*"]})
+        assert "availableModels" not in data
+
+    def test_a_users_own_allowlist_is_not_touched(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+        data = self._settings_after_seed(tmp_path, {}, seed={"availableModels": ["opus"]})
+        assert data["availableModels"] == ["opus"]
+
+    def test_config_options_are_read_when_the_session_advertises_no_models(self):
+        """The native session/new response carries no `models` block at all --
+        the choices live in `configOptions`, and returning early there is what
+        left the picker empty."""
+        models = c.AcpClient._models_from_config_options(
+            {
+                "configOptions": [
+                    {"id": "mode", "options": [{"value": "plan", "name": "Plan"}]},
+                    {
+                        "id": "model",
+                        "currentValue": "default",
+                        "options": [
+                            {"value": "opus", "name": "Opus", "description": "big"},
+                            {"value": "haiku", "name": "Haiku"},
+                        ],
+                    },
+                ]
+            }
+        )
+        assert [m["modelId"] for m in models] == ["opus", "haiku"]

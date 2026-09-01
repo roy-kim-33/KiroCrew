@@ -18,7 +18,16 @@ export interface BackendOption {
 
 export interface ProviderPreset {
   value: string
-  label: string
+  /**
+   * Rendered as-is. Every preset here is a bare brand name, which is why a
+   * raw string is correct: brands are not translated.
+   */
+  label?: string
+  /**
+   * Set instead of `label` when the name carries a translatable word (the
+   * native lane's "(native)" qualifier). Resolved via `presetLabel`.
+   */
+  labelKey?: string
   url: string
   /** OpenCode provider adapter format (ignored by claude_code). */
   format?: 'anthropic' | 'openai'
@@ -44,7 +53,12 @@ export const PROVIDER_PRESETS: Record<'claude_code' | 'opencode', ProviderPreset
     // claude-agent-acp adapter uses its own Anthropic credentials
     // (subscription login or ANTHROPIC_API_KEY from the environment) with no
     // router in the path.
-    { value: 'claude-code-native', label: 'Claude Code (native)', url: '', native: true },
+    {
+      value: 'claude-code-native',
+      labelKey: 'pages.settings.chatPanel.provider_preset_claude_code_native',
+      url: '',
+      native: true,
+    },
     { value: 'ollama-cloud', label: 'Ollama Cloud', url: 'https://ollama.com', keyRequired: true },
     { value: 'opencode-zen', label: 'OpenCode Zen', url: 'https://opencode.ai/zen', keyRequired: true },
     { value: 'opencode-go', label: 'OpenCode Go', url: 'https://opencode.ai/zen/go', keyRequired: true },
@@ -90,4 +104,9 @@ export const PROVIDER_PRESETS: Record<'claude_code' | 'opencode', ProviderPreset
 /** True when the backend has a URL/key to configure (kiro-native does not). */
 export function backendNeedsProviderConfig(backend: AgentBackend): boolean {
   return backend === 'claude_code' || backend === 'opencode'
+}
+
+/** Resolve a preset's display name: a brand renders as-is, a key is translated. */
+export function presetLabel(preset: ProviderPreset, t: (key: string) => string): string {
+  return preset.labelKey ? t(preset.labelKey) : (preset.label ?? preset.value)
 }

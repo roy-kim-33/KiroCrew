@@ -4,6 +4,7 @@ import {
   BACKEND_OPTIONS,
   PROVIDER_PRESETS,
   backendNeedsProviderConfig,
+  presetLabel,
   type AgentBackend,
 } from './providerPresets'
 
@@ -105,6 +106,27 @@ describe('provider presets', () => {
       const preset = PROVIDER_PRESETS.claude_code.find(p => p.value === value)!
       expect(new URL(preset.url).hostname).toBe('localhost')
     }
+  })
+
+  it('gives every preset exactly one source of display text', () => {
+    // A preset with neither renders blank; one with both is ambiguous about
+    // which wins. Brands use `label`, translatable names use `labelKey`.
+    for (const backend of ['claude_code', 'opencode'] as const) {
+      for (const p of PROVIDER_PRESETS[backend]) {
+        expect(Boolean(p.label) !== Boolean(p.labelKey), `${p.value}`).toBe(true)
+      }
+    }
+  })
+
+  it('translates a labelKey preset and passes a brand label through untouched', () => {
+    // The native lane's name carries a translatable qualifier, so it must go
+    // through t(); brand names must NOT, or they'd render as raw key strings.
+    const t = (k: string) => `T[${k}]`
+    const native = PROVIDER_PRESETS.claude_code.find(p => p.native)!
+    expect(presetLabel(native, t)).toBe(`T[${native.labelKey}]`)
+
+    const brand = PROVIDER_PRESETS.claude_code.find(p => p.value === '9router')!
+    expect(presetLabel(brand, t)).toBe('9router')
   })
 
   it('accepts every declared backend value', () => {

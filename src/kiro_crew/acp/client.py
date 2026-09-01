@@ -2910,11 +2910,25 @@ class AcpClient:
                 for tool in _TEXT_ONLY_DISABLED_TOOLS:
                     disabled.add(tool)
                 data["disabledTools"] = sorted(disabled)
-        else:
+        elif (self._extra_env or {}).get("ANTHROPIC_BASE_URL"):
             # availableModels allowlist unlocks the 1M-token window on claude
             # backends that gate it (Bedrock path only).
+            #
+            # Native lane (no ANTHROPIC_BASE_URL) must NOT get this. There the
+            # adapter reads availableModels as a literal allowlist, so ["*"]
+            # leaves it with exactly one model whose id is the string "*":
+            # the picker offers nothing real and every genuine id -- opus,
+            # sonnet, claude-opus-5 -- comes back "Invalid value for config
+            # option model". Omitting it lets the adapter advertise the models
+            # the account actually has.
             if not data.get("availableModels"):
                 data["availableModels"] = ["*"]
+        elif data.get("availableModels") == ["*"]:
+            # Settings files persist across backend switches, so a wildcard
+            # written by an earlier router/Bedrock session would keep poisoning
+            # the native lane forever. Drop only our own marker; a hand-written
+            # allowlist is the user's and is left alone.
+            data.pop("availableModels")
         try:
             settings_path.write_text(
                 json.dumps(data, indent=2), encoding="utf-8"
@@ -3123,15 +3137,17 @@ class AcpClient:
         if getattr(self, "_model_via_env", False):
             self._capture_router_models()
             return
+        # A missing/!dict `models` block is the native lane's shape, not an
+        # error: the choices live in `configOptions` there, so carry on to the
+        # fallback below instead of returning with an empty picker.
         models = session_resp.get("models")
-        if not isinstance(models, dict):
-            return
-        current_model_id = models.get("currentModelId")
-        if isinstance(current_model_id, str) and current_model_id:
-            self._resolved_model_id = current_model_id
-        advertised = models.get("availableModels")
-        if not isinstance(advertised, list):
-            return
+        advertised: list = []
+        if isinstance(models, dict):
+            current_model_id = models.get("currentModelId")
+            if isinstance(current_model_id, str) and current_model_id:
+                self._resolved_model_id = current_model_id
+            if isinstance(models.get("availableModels"), list):
+                advertised = models["availableModels"]
         captured: list[dict[str, str]] = []
         for m in advertised:
             if not isinstance(m, dict):
@@ -3146,9 +3162,60 @@ class AcpClient:
                     "description": m.get("description") or "",
                 }
             )
+        if not captured:
+            # Fork: claude-agent-acp does not always fill `models`; on the
+            # native lane (no router, the user's own Claude Code sign-in) it
+            # advertises the selectable set under `configOptions` instead, as
+            # the option whose id is "model". Without reading that the picker
+            # fell back to the registry's Bedrock spellings, which the adapter
+            # rejects outright ("Invalid value for config option model:
+            # global.anthropic.claude-opus-4-8[1m]") -- i.e. no model on the
+            # native lane could actually be chosen.
+            captured = self._models_from_config_options(session_resp)
         if captured:
             self._available_models = captured
             self._modes_advertised = True
+
+    @staticmethod
+    def _models_from_config_options(session_resp: dict) -> list[dict[str, str]]:
+        """Model choices from a session's ``configOptions``, or ``[]``.
+
+        The option carries either a flat ``options`` list or grouped entries
+        that each hold their own ``options`` (the adapter flattens both the
+        same way before validating a value), so this mirrors that flattening —
+        anything it offers is exactly what ``session/set_config_option``
+        accepts.
+        """
+        opts = session_resp.get("configOptions")
+        if not isinstance(opts, list):
+            return []
+        out: list[dict[str, str]] = []
+        for option in opts:
+            if not isinstance(option, dict) or option.get("id") != "model":
+                continue
+            entries = option.get("options")
+            if not isinstance(entries, list):
+                continue
+            flat: list[dict] = []
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                nested = entry.get("options")
+                flat.extend(n for n in nested if isinstance(n, dict)) if isinstance(
+                    nested, list
+                ) else flat.append(entry)
+            for entry in flat:
+                value = entry.get("value") or ""
+                if not value:
+                    continue
+                out.append(
+                    {
+                        "modelId": value,
+                        "name": entry.get("name") or value,
+                        "description": entry.get("description") or "",
+                    }
+                )
+        return out
 
     def _capture_router_models(self) -> None:
         """Advertise the router's own catalog (custom base URL path).

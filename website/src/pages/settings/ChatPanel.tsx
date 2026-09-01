@@ -4,7 +4,7 @@ import { SettingsSection, SettingsCard, SettingsToggle, SettingsSelect, Settings
 import { Btn } from '../../components/ui'
 import { loadChatConfig, saveChatConfig, type ChatConfig, type ContentWidth, type DashboardConfig, type SendMode } from '../chat/ChatSettings'
 import { api } from '../../api/client'
-import { BACKEND_OPTIONS, PROVIDER_PRESETS, type AgentBackend } from './providerPresets'
+import { BACKEND_OPTIONS, PROVIDER_PRESETS, presetLabel, type AgentBackend } from './providerPresets'
 import { useAvailableModels } from '../../hooks/useAvailableModels'
 import { EFFORT_LEVELS, effortLabel, modelSupportsEffort } from '../../lib/effort'
 import { isMac } from '../../utils/platform'
@@ -654,7 +654,7 @@ export function ChatPanel() {
                 label={i18nT('pages.settings.chatPanel.provider_preset')}
                 value={effPreset}
                 options={providerPresets.map(p => p.value)}
-                optionLabels={providerPresets.map(p => p.label)}
+                optionLabels={providerPresets.map(p => presetLabel(p, i18nT))}
                 onChange={applyPreset}
               />
               <SettingsInput
@@ -674,7 +674,7 @@ export function ChatPanel() {
               />
               {providerPresets.find(p => p.value === effPreset)?.native && (
                 <p className="mt-2 text-[13px] text-muted">
-                  No base URL: the adapter uses its own Anthropic credentials. Save clears any router URL.
+                  {i18nT('pages.settings.chatPanel.provider_native_hint')}
                 </p>
               )}
               <div className="mt-3 flex items-center gap-2">

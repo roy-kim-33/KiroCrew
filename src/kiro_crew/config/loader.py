@@ -8174,10 +8174,15 @@ class KiroCrewConfig:
             # cmc/deepseek-v4-pro, which the ACP client strips to the raw id
             # before the wire) — never registry-translate, or the Bedrock-form
             # global.anthropic.* id reaches a router that rejects it.
-            if provider_backend == ACP_BACKEND_CLAUDE:
-                if not provider_base_url:
-                    m = model_registry.to_provider_id(m, "claude_code") if m else m
-            else:
+            # Neither claude lane gets a registry translation. With a router
+            # the id is that router's namespace. Without one (native Claude
+            # Code, the user's own sign-in) the adapter takes Anthropic's own
+            # names -- "opus", "sonnet", "default" -- and rejects the Bedrock
+            # form outright: picking Opus used to become
+            # global.anthropic.claude-opus-4-8[1m] and come back "Invalid value
+            # for config option model". The registry's Bedrock spellings belong
+            # to kiro-cli, i.e. only this branch.
+            if provider_backend != ACP_BACKEND_CLAUDE:
                 m = model_registry.to_acp_id(m) if m else m
             # Thread the slot's effort into a per-model override so the kiro
             # cli.json overlay is written from it at spawn — without this, a
