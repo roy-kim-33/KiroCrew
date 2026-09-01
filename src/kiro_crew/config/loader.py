@@ -8174,15 +8174,21 @@ class KiroCrewConfig:
             # cmc/deepseek-v4-pro, which the ACP client strips to the raw id
             # before the wire) — never registry-translate, or the Bedrock-form
             # global.anthropic.* id reaches a router that rejects it.
-            # Neither claude lane gets a registry translation. With a router
-            # the id is that router's namespace. Without one (native Claude
-            # Code, the user's own sign-in) the adapter takes Anthropic's own
-            # names -- "opus", "sonnet", "default" -- and rejects the Bedrock
-            # form outright: picking Opus used to become
-            # global.anthropic.claude-opus-4-8[1m] and come back "Invalid value
-            # for config option model". The registry's Bedrock spellings belong
-            # to kiro-cli, i.e. only this branch.
-            if provider_backend != ACP_BACKEND_CLAUDE:
+            if provider_backend == ACP_BACKEND_CLAUDE:
+                # Neither claude lane gets a registry translation. With a
+                # router the id is that router's namespace. Without one
+                # (native Claude Code, the user's own sign-in) the adapter
+                # takes Anthropic's own names -- "opus", "sonnet", "default"
+                # -- and rejects the Bedrock form outright: picking Opus used
+                # to become global.anthropic.claude-opus-4-8[1m] and come back
+                # "Invalid value for config option model".
+                #
+                # Kept as an explicit positive branch rather than folded into
+                # `!= ACP_BACKEND_CLAUDE` on the else: the harness-parity gate
+                # rejects the inequality, because it would silently hand every
+                # harness added later kiro-cli's Bedrock spellings.
+                pass
+            else:
                 m = model_registry.to_acp_id(m) if m else m
             # Thread the slot's effort into a per-model override so the kiro
             # cli.json overlay is written from it at spawn — without this, a
