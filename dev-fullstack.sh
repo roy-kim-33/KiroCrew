@@ -116,7 +116,9 @@ PIDS+=($!)
 # Vite picks 3000, or the next free port — read the real one from its banner.
 VITE_PORT=""
 for i in $(seq 1 30); do
-    VITE_PORT="$(grep -oE 'Local:.*localhost:[0-9]+' "$VITE_LOG" 2>/dev/null | grep -oE '[0-9]+$' | head -1)"
+    # Matches either host Vite prints: "localhost" by default, or a literal
+    # bind address (e.g. "127.0.0.1") when vite.config.ts pins server.host.
+    VITE_PORT="$(grep -oE 'Local:.*:[0-9]+' "$VITE_LOG" 2>/dev/null | grep -oE '[0-9]+$' | head -1)"
     [ -n "$VITE_PORT" ] && break
     sleep 1
 done

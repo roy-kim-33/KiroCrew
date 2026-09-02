@@ -632,6 +632,12 @@ export default defineConfig({
   },
   server: {
     port: 3000,
+    // Pin to IPv4 loopback. With no `host`, Vite binds whatever `localhost`
+    // resolves to on this machine -- observed landing on IPv6-only (`::1`)
+    // more than once, which leaves a browser hitting `http://localhost:PORT`
+    // (or anything using `127.0.0.1` explicitly) unable to connect while the
+    // server is, from Vite's own perspective, "up".
+    host: '127.0.0.1',
     proxy: {
       '/api': {
         target: `http://localhost:${backendPort}`,
