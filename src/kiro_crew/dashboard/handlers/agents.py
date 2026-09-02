@@ -773,22 +773,40 @@ def _normalize_model_key(name: str) -> str:
 
 
 def _advertised_cc_models(request: web.Request) -> list[dict]:
-    """Map the first active CC provider's advertised models to the API shape.
+    """Map the most recently started active CC provider's advertised models.
+
+    Iterates newest-first (see :func:`_entitled_kiro_models`'s identical
+    rationale): ``active_providers()`` returns sessions in creation order, and
+    a session started before a provider/backend switch still holds the
+    advertised list it captured at its own session/new. On a long-running tab
+    that has switched providers before, the old session can outlive the
+    switch in ``_sessions`` -- reading oldest-first picked it up permanently
+    (never self-healing, since nothing ever reorders or expires it), which is
+    exactly what a stale in-flight-refetch race would look like but isn't.
 
     claude-agent-acp captures its real versioned list at session init (see
-    AcpClient._capture_available_models). Backend provider ids are mapped back to
-    canonical registry keys (``from_provider_id``) so they dedup cleanly against
-    the registry rows in :func:`_cc_models` and the wire value stays canonical.
-    A provider id with no registry entry passes through unchanged (forward-compat
-    for models the registry doesn't list yet). Returns ``[]`` when no session has
-    initialized or the backend advertised nothing.
+    AcpClient._capture_available_models). The raw advertised id is used
+    VERBATIM, never remapped through the registry's ``from_provider_id`` --
+    that remap folds Claude Code's own short config-option aliases (``opus``,
+    ``sonnet``) onto Bedrock-flavored canonical keys (``opus-4.8-1m``,
+    ``sonnet-4.6-1m``) meant for a DIFFERENT id shape (kiro-cli/acp's own
+    ``global.anthropic.claude-opus-4-8[1m]``-style ids). A native claude_code
+    session never advertises that shape -- it only ever reports its own
+    aliases -- so the remap did nothing useful and broke the wire: selecting
+    the remapped row sent a value the adapter flatly rejects with "Invalid
+    value for config option model" (verified live -- ``opus``/``sonnet`` are
+    the two most-used non-default models, and both were unselectable from
+    this exact list). The remap's sole purpose was dedup against the static
+    registry catalog in :func:`_cc_models`, which has no live caller.
+    Returns ``[]`` when no session has initialized or the backend advertised
+    nothing.
     """
     try:
         state: DashboardState = request.app["state"]
         providers = state.sessions.active_providers()
     except (KeyError, AttributeError):
         return []
-    for provider in providers:
+    for provider in reversed(providers):
         getter = getattr(provider, "available_models", None)
         if not callable(getter):
             continue
@@ -799,9 +817,7 @@ def _advertised_cc_models(request: web.Request) -> list[dict]:
         if advertised:
             return [
                 {
-                    "model_name": model_registry.from_provider_id(
-                        m.get("modelId", ""), "claude_code"
-                    ),
+                    "model_name": m.get("modelId", ""),
                     "display_name": m.get("name", "") or m.get("modelId", ""),
                     "description": m.get("description", ""),
                 }
@@ -884,121 +900,6 @@ def _entitled_kiro_models(request: web.Request, models: list[dict]) -> list[dict
     ):
         return models
     return kept
-
-
-def _cc_models(request: web.Request, configured_default: str = "") -> list[dict]:
-    """Assemble the CC model dropdown, scoped to what the account can actually use.
-
-    The live backend's advertised set is AUTHORITATIVE when present. It is the
-    only source that reflects entitlement: claude-agent-acp captures it at session
-    init from what the signed-in account is actually served. The registry is a
-    static catalog of everything KiroCrew knows how to name, so a free-tier user
-    used to be offered the full flagship list and only discovered the truth when a
-    prompt failed.
-
-    So when anything is advertised, registry rows are FILTERED DOWN to it (keeping
-    the registry's cleaner display names for the survivors), and advertised models
-    the registry does not list are appended for forward-compat.
-
-    When NOTHING is advertised the registry is shown unfiltered. That is not a
-    fallback to the old behaviour by preference -- an empty advertised set means
-    "no session has initialized yet", which is indistinguishable from "this account
-    gets nothing", and showing an empty picker on a cold dashboard would be worse
-    than showing a superset.
-
-    ``auto`` is always present and always FIRST. It is the configured default
-    (``config.agent.model``) and a sentinel rather than a real model, so it is
-    never filtered by entitlement. It leads the list because the registry's own
-    ``default: true`` flag sorts the current flagship to the top, which presented
-    a specific paid model as the default in the picker.
-    """
-    advertised = _advertised_cc_models(request)
-    registry_rows = model_registry.display_list("claude_code")
-
-    if advertised:
-        advertised_keys = {
-            _normalize_model_key(e.get("model_name", ""))
-            for e in advertised
-            if _normalize_model_key(e.get("model_name", ""))
-        }
-        # Keep registry rows only when the backend also advertises them; "auto" is
-        # a sentinel, not an entitlement, so it survives regardless.
-        registry_rows = [
-            e
-            for e in registry_rows
-            if _normalize_model_key(e.get("model_name", "")) in advertised_keys
-            or _normalize_model_key(e.get("model_name", "")) == "auto"
-        ]
-
-    merged: list[dict] = []
-    seen: set[str] = set()
-    for entry in (*registry_rows, *advertised):
-        name = entry.get("model_name", "")
-        key = _normalize_model_key(name)
-        if not key or key in seen:
-            continue
-        seen.add(key)
-        merged.append(entry)
-    # "auto" leads. It may be absent entirely if a future registry drops the row,
-    # so synthesize it rather than assuming the filter above preserved one.
-    merged = [e for e in merged if _normalize_model_key(e.get("model_name", "")) == "auto"] + [
-        e for e in merged if _normalize_model_key(e.get("model_name", "")) != "auto"
-    ]
-    if not any(_normalize_model_key(e.get("model_name", "")) == "auto" for e in merged):
-        merged.insert(0, {"model_name": "auto", "display_name": "Auto", "description": ""})
-        seen.add("auto")
-    # Guarantee the configured default is present (e.g. a custom cc_model the
-    # backend doesn't advertise) so the selected model never vanishes. Resolve it
-    # to its canonical key first (it may be stored as a provider id or alias) so a
-    # default that already maps to a registry row does NOT produce a duplicate.
-    if configured_default:
-        canonical_default = model_registry.from_provider_id(
-            model_registry.to_provider_id(configured_default, "claude_code"), "claude_code"
-        )
-        # Skip a blank canonical key: cc_model="auto" round-trips to "" (auto's
-        # provider id is empty), and _normalize_model_key("")=="" is never in
-        # `seen` (which holds "auto"), so without the `if key` guard — the same
-        # one the merge loop above uses — a blank-named row would be inserted as
-        # the first/selected dropdown option. The "auto" registry row already
-        # covers this case.
-        key = _normalize_model_key(canonical_default)
-        # Only resurrect the configured default when entitlement cannot contradict
-        # it: either nothing was advertised (unknown, so trust config) or it WAS
-        # advertised but the registry lacked a row. Force-including a model the
-        # backend did not advertise would reintroduce exactly the unusable option
-        # this filter removes -- a stale config pick outliving the entitlement.
-        may_include = not advertised or key in {
-            _normalize_model_key(e.get("model_name", "")) for e in advertised
-        }
-        if key and key not in seen and may_include:
-            # After "auto", never before it: "auto" is the configured default in
-            # the general case and leads the list.
-            merged.insert(
-                (
-                    1
-                    if merged and _normalize_model_key(merged[0].get("model_name", "")) == "auto"
-                    else 0
-                ),
-                {
-                    "model_name": canonical_default,
-                    "display_name": canonical_default,
-                    "description": "Configured default",
-                },
-            )
-    # Enrich every row with a context_window via the central authority so the CC
-    # dropdown carries the same field the kiro branch does (the frontend picker
-    # + tooltip read it uniformly). None -> reference (never a silent 200k).
-    for entry in merged:
-        if "context_window" not in entry:
-            name = entry.get("model_name", "")
-            entry["context_window"] = (
-                model_registry.model_window(name) or model_registry.REFERENCE_WINDOW_TOKENS
-            )
-        if "supports_vision" not in entry:
-            flag = _model_supports_vision(entry.get("model_name", ""))
-            if flag is not None:
-                entry["supports_vision"] = flag
-    return merged
 
 
 def _wrap_list_models_argv(argv: list[str]) -> tuple[list[str], str | None]:
@@ -1160,24 +1061,86 @@ async def _opencode_models_response(request: web.Request) -> web.Response:
     return web.json_response(rows)
 
 
-def _cc_models_response(request: web.Request) -> web.Response:
+async def _live_router_cc_models(base_url: str, api_key: str) -> list[dict]:
+    """Probe ``{base_url}/v1/models`` directly, in the picker row shape.
+
+    Mirrors :func:`_opencode_models_response`'s live probe -- the claude_code
+    path had none, and depended entirely on ``_advertised_cc_models`` (a live
+    session's own captured catalog). That capture only exists once a session
+    has actually spawned against the CURRENT ``provider_base_url``, which the
+    picker's own invalidation fires well before: switching backend/preset
+    invalidates ``available-models`` the instant the config PATCH resolves,
+    but the old session (if any) was just torn down and the new one has not
+    spawned yet. That refetch landed on this function's static-whitelist
+    fallback below -- a generic cross-provider snapshot (``ag/``, ``cmc/``,
+    ``oc/``, ``ol/`` families) that has nothing to do with whichever router is
+    actually configured, and reads as a data problem even when the switch
+    itself worked. A direct probe has no such dependency: it is correct on
+    the very first fetch, race or not. Same header convention as
+    ``load_router_catalog_ids`` (``x-api-key`` -- claude_code speaks Anthropic
+    wire format only, no format branch needed here).
+    """
+    import aiohttp
+
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as session:
+            async with session.get(
+                f"{base_url}/v1/models", headers={"x-api-key": api_key}
+            ) as resp:
+                if resp.status != 200:
+                    return []
+                data = await resp.json()
+    except Exception:
+        logger.debug("claude_code router /v1/models probe failed: %s", base_url, exc_info=True)
+        return []
+    rows: list[dict] = []
+    for item in data.get("data", []) if isinstance(data, dict) else []:
+        mid = item.get("id") or item.get("model") or ""
+        if mid:
+            rows.append(_cc_model_row(mid))
+    return rows
+
+
+# Last non-empty model list served per claude_code lane, keyed by the pair that
+# decides WHICH catalog is correct: (acp_backend, provider_base_url). Scoping to
+# that pair is the whole point -- a router's list must never answer for the
+# native lane, or vice versa, which is exactly the bug an unscoped browser-side
+# cache produced.
+#
+# It exists because the native lane has no session-independent source. The
+# router lane can always probe {base_url}/v1/models, but native's ONLY source is
+# a live session's advertised list, and a provider switch tears every session
+# down (reload_provider_factory) before respawning one. For those seconds
+# /api/models had nothing to say and returned [], so every picker collapsed to
+# the "auto" sentinel until a session came back -- reading as "the switch
+# emptied my model list" rather than "still starting". This remembers what the
+# same lane last advertised so the gap is covered by the right answer.
+_LAST_CC_ROWS: dict[tuple[str, str], list[dict]] = {}
+
+
+async def _cc_models_response(request: web.Request) -> web.Response:
     """Curated router-catalog response for /api/models on the claude_code path.
     The upstream handler spawns ``kiro-cli chat --list-models``, which returns
     Kiro's Bedrock catalog — useless (and wrong) when the backend is Claude
-    Code talking to a custom LLM router. On the router path we serve the
-    curated whitelist instead: live advertised rows when a session has
-    captured them, otherwise the static whitelist so a cold dashboard never
-    shows an empty picker.
+    Code talking to a custom LLM router. Precedence: live advertised rows from
+    a session that has already captured them (freshest -- tier-aware), else a
+    direct probe of the configured router (no session-timing dependency),
+    else the static whitelist so a cold dashboard never shows an empty picker
+    -- but only when a router is actually configured. On the native lane
+    (no ``provider_base_url``) that whitelist is never correct either -- it is
+    built from router-prefixed ids, not Claude Code's own alias names -- so an
+    empty result (the picker's existing "still loading" state) beats
+    confidently showing 94 models that namespace-mismatch this account.
     """
     from kiro_crew.acp.client import AcpClient  # noqa: F811
 
-    whitelist = AcpClient.router_model_whitelist()
+    cfg = KiroCrewConfig.load()
+    base_url = (cfg.agent.provider_base_url or "").rstrip("/")
     rows: list[dict] = []
     for entry in _advertised_cc_models(request):
         mid = entry.get("model_name") or ""
-        # Advertised wins outright -- same rule _cc_models() applies to the kiro
-        # catalog. Intersecting it with the static whitelist dropped models the
-        # connected router was actively serving.
+        # Advertised wins outright. Intersecting it with the static whitelist
+        # dropped models the connected router was actively serving.
         if mid:
             rows.append(
                 _cc_model_row(
@@ -1185,9 +1148,19 @@ def _cc_models_response(request: web.Request) -> web.Response:
                     entry.get("description") or entry.get("display_name") or "",
                 )
             )
-    if not rows:
-        rows = [_cc_model_row(mid) for mid in sorted(whitelist)]
-    cfg = KiroCrewConfig.load()
+    if not rows and base_url:
+        rows = await _live_router_cc_models(base_url, cfg.agent.provider_api_key or "")
+    if not rows and base_url:
+        rows = [_cc_model_row(mid) for mid in sorted(AcpClient.router_model_whitelist())]
+    lane = (cfg.agent.acp_backend or "", base_url)
+    if rows:
+        _LAST_CC_ROWS[lane] = rows
+    else:
+        # Nothing live to report. On the native lane this is the post-switch
+        # respawn window, not a real "no models" answer -- serve what this same
+        # lane last advertised rather than an empty picker. Still empty on a
+        # lane never seen before, which is the honest answer there.
+        rows = _LAST_CC_ROWS.get(lane, [])
     if cfg.agent.model_whitelist:
         rows = [r for r in rows if r["model_id"] in cfg.agent.model_whitelist]
     return web.json_response(rows)
@@ -1199,7 +1172,7 @@ async def api_models(request: web.Request) -> web.Response:
     # the curated router catalog, not kiro-cli's Bedrock list.
     cfg = KiroCrewConfig.load()
     if cfg.agent.acp_backend == ACP_BACKEND_CLAUDE:
-        return _cc_models_response(request)
+        return await _cc_models_response(request)
     if cfg.agent.acp_backend == ACP_BACKEND_OPENCODE:
         return await _opencode_models_response(request)
     # Signed-out gateways must never reach the spawn below. kiro-cli auto-opens

@@ -51,6 +51,28 @@ describe('AcpAdapter.fetchAvailableModels', () => {
     expect(models[0].name).toBe('auto')
   })
 
+  it('serves AUTO-ONLY, never the cache, on an empty success (post-switch window)', async () => {
+    // The cache is one global key, so it holds the PREVIOUS backend's list.
+    // An empty success is what the native lane returns right after a provider
+    // switch (every session dropped, no router probe to cover it), so serving
+    // the cache there showed the old router's models in the native picker --
+    // wrong, unselectable, and it stuck because non-empty data looks fine.
+    ;(api.models as any).mockResolvedValueOnce([
+      { model_name: 'auto', description: 'a' },
+      { model_name: 'oc/kimi-k3', description: 'router model' },
+    ])
+    const adapter = new AcpAdapter()
+    await adapter.fetchAvailableModels() // primes the cache under the router
+
+    ;(api.models as any).mockResolvedValue([]) // now on native: nothing advertised yet
+    const served = await adapter.fetchAvailableModels()
+    expect(served.map(m => m.name)).toEqual(['auto'])
+    expect(served.some(m => m.name === 'oc/kimi-k3')).toBe(false)
+    // Still degraded → the 8s poll swaps in the real native list once a
+    // session advertises one.
+    expect(modelsDegraded('acp')).toBe(true)
+  })
+
   it('falls back to AUTO-ONLY when API throws (timeout, network error)', async () => {
     ;(api.models as any).mockRejectedValue(new Error('fetch timeout'))
     const models = await new AcpAdapter().fetchAvailableModels()

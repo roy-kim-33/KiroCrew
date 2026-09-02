@@ -355,10 +355,21 @@ export class AcpAdapter implements ProviderAdapter {
     try {
       const models = await api.models()
       if (!Array.isArray(models) || models.length === 0) {
-        // Empty/non-array success: NOT a live list — keep polling, serve the
-        // last-good live list if we have one, else auto-only.
+        // Empty/non-array success: NOT a live list — keep polling.
+        //
+        // Deliberately NOT served from cache, unlike the transient-failure
+        // branch below. The cache is a single global key, so it holds whatever
+        // the PREVIOUS backend last advertised. An empty success is exactly
+        // what the native lane returns in the window after a provider switch
+        // (reload_provider_factory drops every session, and native has no
+        // router probe to fall back on — it has nothing to advertise until a
+        // session respawns). Serving the cache there put the OLD backend's
+        // router models in the native picker and left them there: non-empty
+        // data that is wrong, and unselectable on this backend. auto-only is
+        // correct at that moment, and the degraded poll swaps in the real list
+        // as soon as a session advertises one.
         markModelsDegraded(this.id, true)
-        return readCachedModels() ?? this._defaultModels()
+        return this._defaultModels()
       }
       const result = models.map((m: RawModel) => {
         // Prefer the backend's resolved window over the bundled snapshot: the

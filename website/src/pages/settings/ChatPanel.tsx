@@ -455,6 +455,10 @@ export function ChatPanel() {
       // Awaited: dropping the draft before the refetch lands re-renders from
       // the STALE cache, which reads as the change reverting.
       await qc.invalidateQueries({ queryKey: ['kirocrewConfig'] })
+      // A backend switch changes what the picker should show right away --
+      // waiting on the WS session-spawn event alone left the list showing the
+      // old backend's models (or empty) until a new session happened to spawn.
+      qc.invalidateQueries({ queryKey: ['available-models'] })
       setDraft(null)
     } catch {
       // Keep the optimistic draft visible so the pick is not lost, and say so.
@@ -508,6 +512,9 @@ export function ChatPanel() {
       // Awaited before the draft is dropped: otherwise the panel re-renders
       // from the stale cache and every field appears to revert.
       await qc.invalidateQueries({ queryKey: ['kirocrewConfig'] })
+      // Same reason as switchBackend: a saved base URL / API key / preset
+      // change means the model list is now wrong, not just stale-later.
+      qc.invalidateQueries({ queryKey: ['available-models'] })
       setDraft(null)
     } catch {
       setProviderSaveError(i18nT('pages.settings.chatPanel.failed_to_save_provider'))

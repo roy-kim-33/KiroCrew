@@ -53,6 +53,31 @@ describe('ChatPanel Provider section', () => {
     expect(screen.getByRole('button', { name: /kiro-native/i }).textContent).toContain('kiro-cli backend')
   })
 
+  it('refetches the model list immediately on a backend switch, without waiting for a session to spawn', async () => {
+    // switchBackend/providerSave only invalidated ['kirocrewConfig']. The
+    // picker's ['available-models', ...] query has staleTime: Infinity, so
+    // with no direct invalidation it never refetched on its own -- the only
+    // thing that ever refreshed it was a WS 'session spawned' event, which
+    // lags behind (or, if it never fires, never happens at all). Confirmed
+    // live: after a real switch, zero /api/models calls followed until a
+    // page reload forced a fresh query.
+    const agent: Record<string, unknown> = {
+      acp_backend: 'claude', provider_base_url: '', provider_api_key: '', model: 'auto',
+    }
+    kirocrewConfigMock.mockImplementation(() => Promise.resolve({ agent }) as never)
+    patchConfigMock.mockImplementation((path: string, value: unknown) => {
+      agent[String(path).replace(/^agent\./, '')] = value
+      return Promise.resolve({})
+    })
+    wrap(<ChatPanel />)
+    await screen.findByRole('button', { name: /Claude Code/i })
+    const callsBefore = modelsMock.mock.calls.length
+
+    fireEvent.click(await screen.findByRole('button', { name: /OpenCode/i }))
+    await waitFor(() => expect(agent.acp_backend).toBe('opencode'))
+    await waitFor(() => expect(modelsMock.mock.calls.length).toBeGreaterThan(callsBefore))
+  })
+
   it('prefills the URL from a preset and saves provider fields', async () => {
     // The backend switch is applied IMMEDIATELY, so the config the panel
     // re-reads afterwards must reflect it -- a mock frozen on the old value

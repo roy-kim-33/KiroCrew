@@ -682,6 +682,15 @@ export function useWebSocket() {
         // Invalidate every slot's summary (the key is per-slot and we cannot
         // know which ones moved); react-query only refetches the observed ones.
         queryClient.invalidateQueries({ queryKey: ['session-summary'] })
+        // Same one-shot problem, config's version: a provider/backend switch
+        // (made by another tab or the desktop app) pushes `sessions_restarting`,
+        // which is the ONLY thing that refreshes `kirocrewConfig` and
+        // `available-models` — both are staleTime: Infinity, so freshness is
+        // push-driven, not poll-driven. Miss that push because the socket was
+        // down for the window it fired in, and every model picker serves the
+        // pre-switch backend's data until the page is reloaded.
+        invalidateRefreshQueries(queryClient)
+        queryClient.invalidateQueries({ queryKey: ['available-models'] })
         seedGoalLoops()
         dispatch(fetchNotifications()).then(() => syncPendingApprovals())
       syncPendingQuestions()
