@@ -476,6 +476,16 @@ class TestBoundedRecordReaders:
         runner does not leak in, and the best of several attempts is used
         because scheduling noise can only ever make a sample slower.
 
+        The ratio cancels the machine's SPEED but not its clock GRANULARITY, and
+        that gap is what made this test flake. Windows advances `process_time` on
+        the scheduler tick (~15.6 ms) while still reporting a 100 ns unit, so a
+        baseline of a couple of ticks forces the ratio onto small integers: one
+        tick against three reads as exactly 3.00x and failed a bar the reader
+        never crossed (`assert 3.0 < 3.0` on CI, twice). `base > 0` did not catch
+        it, because one tick is not zero. So the workload GROWS until the baseline
+        is many ticks wide, which is the only thing that makes quantisation error
+        small relative to the number being divided.
+
         Skipped under a TRACER because tracing breaks the ratio's premise rather
         than merely slowing things down: it charges per Python line executed, so
         it inflates the linear per-record bookkeeping while leaving the C-level
@@ -501,11 +511,39 @@ class TestBoundedRecordReaders:
                 assert got == count, got
             return best
 
-        base = best_of(100_000)
-        doubled = best_of(200_000)
-        assert base > 0, "process_time resolution too coarse to compare"
+        # The REPORTED resolution is not the granularity that bites (Windows
+        # reports 100 ns and advances ~15.6 ms), so measure the real quantum: the
+        # smallest nonzero step the clock actually takes.
+        def process_time_quantum() -> float:
+            start = time.process_time()
+            while True:
+                step = time.process_time() - start
+                if step > 0:
+                    return step
+
+        quantum = max(process_time_quantum() for _ in range(3))
+        # 40 ticks holds quantisation under ~2.5% of the baseline, so it cannot
+        # move a linear 2.0x onto the 3.0x bar.
+        floor = max(0.05, quantum * 40)
+
+        count = 100_000
+        base = best_of(count)
+        while base < floor and count < 1_600_000:
+            count *= 2
+            base = best_of(count)
+        if base < floor:
+            pytest.skip(
+                f"process_time quantum {quantum:.6f}s needs a baseline over {floor:.3f}s; "
+                f"{count} records only reached {base:.3f}s, so the ratio would be quantised"
+            )
+
+        doubled = best_of(count * 2)
         ratio = doubled / base
-        assert ratio < 3.0, f"doubling the records cost {ratio:.2f}x, which suggests quadratic work"
+        assert ratio < 3.0, (
+            f"doubling {count} records cost {ratio:.2f}x "
+            f"(base {base:.3f}s, doubled {doubled:.3f}s, quantum {quantum:.6f}s), "
+            "which suggests quadratic work"
+        )
 
     def test_strict_reader_refuses_invalid_utf8_rather_than_replacing_it(self, tmp_path):
         """The abort caller PERSISTS what it read, so a U+FFFD would be written back."""
@@ -569,17 +607,13 @@ _KERNEL_PSEUDO_FILE_READERS = {
 # if it is ever bounded the posture must be abort/count, never skip.
 _FENCED_READERS = {"sel.py"}
 
-# DEFERRED, not excused: this one is a known live bug, tracked separately, and
-# listed here so the scanner records it instead of going quiet about it.
-#
-# `snapshot._merge_notifications` copies records from one file into another
-# verbatim, which makes it the only site in the #6345 audit where reading
-# faithfully is not the whole contract -- the bytes must also be VALID FOR THE
-# DESTINATION. Converting it needs that write-side contract stated up front
-# (record boundary, dedupe-key type, framing, and encoding), and four successive
-# review rounds on PR #7651 each found one more property of it, so it is being
-# done as its own change rather than inferred from the read-side contract here.
-_DEFERRED_READERS = {"snapshot.py"}
+# DEFERRED, not excused: nothing is deferred today. `snapshot._merge_notifications`
+# was the one entry, and it is converted -- it reads both the destination and the
+# source through `strict_raw_records`, validates each record's encoding without
+# transforming it, and appends the original bytes. See #7771 for the write-side
+# contract that conversion needed (record boundary, dedupe-key type, framing,
+# encoding, abort-not-skip posture) and which is stated on the function itself.
+_DEFERRED_READERS: set[str] = set()
 
 _ALLOWED_UNBOUNDED_FILES = (
     {path for path, _ in _KERNEL_PSEUDO_FILE_READERS} | _FENCED_READERS | _DEFERRED_READERS

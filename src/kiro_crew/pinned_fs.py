@@ -67,6 +67,7 @@ __all__ = [
     "dir_flags",
     "drain_verified_chain",
     "fatal_skip_reporter",
+    "fd_real_path",
     "is_reparse_point",
     "is_regular_at",
     "stat_at",
@@ -82,6 +83,7 @@ __all__ = [
     "stage_tree_pinned",
     "supports_pinned_tree_walk",
     "supports_pinned_walk",
+    "unlink_verified",
 ]
 
 
@@ -347,6 +349,73 @@ def refuse_hardlink_alias(
             "refused on the open descriptor instead. Remove the extra link or use a "
             "different path."
         )
+
+
+def fd_real_path(fd: int) -> str | None:
+    """Real filesystem path of an OPEN descriptor, or ``None`` when unreadable.
+
+    The descriptor-pinned twin of ``realpath``: the name it returns is the
+    kernel's own answer for the inode already held open, so it carries no
+    symlink component left to swap -- which is what makes it usable as the
+    containment witness after an ``O_NOFOLLOW`` open (validate the path the
+    descriptor REALLY refers to, not the path it was opened by).
+
+    Platform routes: ``/proc/self/fd`` on Linux, ``fcntl.F_GETPATH`` on macOS,
+    ``GetFinalPathNameByHandleW`` on Windows. Every route FAILS CLOSED --
+    ``None``, never a fallback to the mutable pathname -- including the whole
+    Windows branch: a host where the handle's final path cannot be read gives
+    callers nothing to validate, and each caller decides whether that refusal
+    aborts (a containment check) or degrades (an advisory diagnostic).
+    """
+    if os.name == "nt":
+        try:
+            import ctypes
+            import msvcrt
+
+            win_dll = getattr(ctypes, "WinDLL", None)
+            get_osfhandle = getattr(msvcrt, "get_osfhandle", None)
+            if not callable(win_dll) or not callable(get_osfhandle):
+                return None
+            kernel32 = win_dll("kernel32", use_last_error=True)
+            get_final_path = kernel32.GetFinalPathNameByHandleW
+            get_final_path.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_wchar_p,
+                ctypes.c_uint32,
+                ctypes.c_uint32,
+            ]
+            get_final_path.restype = ctypes.c_uint32
+            buffer = ctypes.create_unicode_buffer(32768)
+            length = get_final_path(
+                ctypes.c_void_p(get_osfhandle(fd)),
+                buffer,
+                len(buffer),
+                0,
+            )
+            if length == 0 or length >= len(buffer):
+                return None
+            path = buffer.value
+            if path.startswith("\\\\?\\UNC\\"):
+                return "\\\\" + path[8:]
+            if path.startswith("\\\\?\\"):
+                return path[4:]
+            return path
+        except (AttributeError, ImportError, OSError, ValueError):
+            return None
+
+    try:
+        return os.readlink(f"/proc/self/fd/{fd}")  # Linux
+    except OSError:
+        pass
+    try:
+        import fcntl
+
+        if hasattr(fcntl, "F_GETPATH"):  # macOS
+            buf = fcntl.fcntl(fd, fcntl.F_GETPATH, bytes(1024))
+            return buf.split(b"\x00", 1)[0].decode()
+    except (OSError, ValueError, ImportError):
+        pass
+    return None
 
 
 def is_reparse_point(path: str | Path) -> bool:
@@ -1307,7 +1376,7 @@ def remove_dir_verified(
     return StagedRemoval(removed=True)
 
 
-def _unlink_verified(holder_fd: int, name: str, expect: tuple[int, int]) -> bool:
+def unlink_verified(holder_fd: int, name: str, expect: tuple[int, int]) -> bool:
     """Unlink *name* under *holder_fd*, only if it is still ``(st_dev, st_ino)`` *expect*.
 
     The residual is irreducible and better stated than implied: POSIX has no
@@ -1468,7 +1537,7 @@ def put_back_no_clobber(
             # tell from a corrupted one and a later retry cannot overwrite.
             with suppress(OSError):
                 os.ftruncate(dst, 0)
-            _unlink_verified(dst_dir_fd, dst_name, (created.st_dev, created.st_ino))
+            unlink_verified(dst_dir_fd, dst_name, (created.st_dev, created.st_ino))
             return PUT_BACK_FAILED
         finally:
             os.close(dst)
@@ -1585,7 +1654,7 @@ def remove_tree_pinned(
                         )
                     except OSError:
                         continue
-                    _unlink_verified(holder, key[-1], (device, ino))
+                    unlink_verified(holder, key[-1], (device, ino))
                 for key, ino in tree.files.items():
                     if key == deferred_key:
                         # Held back on purpose - see `keep_until_empty`. Removing it now and
@@ -1598,7 +1667,7 @@ def remove_tree_pinned(
                         )
                     except OSError:
                         continue
-                    _unlink_verified(holder, key[-1], (device, ino))
+                    unlink_verified(holder, key[-1], (device, ino))
                 # Dropped FIRST, so the directory phase re-opens every directory and
                 # re-checks its inode. Reusing a descriptor cached during the file phase
                 # would satisfy the check with the identity the directory had THEN, and
@@ -1746,5 +1815,5 @@ def _remove_with_deferred_entry(
             # retained copy is left unmentioned.
             staged_name=outcome.staged_name or debris,
         )
-    _unlink_verified(parent_fd, debris, (expect[0], landed))
+    unlink_verified(parent_fd, debris, (expect[0], landed))
     return TreeRemoval(removed=True)

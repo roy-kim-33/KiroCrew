@@ -70,6 +70,10 @@ class SessionClosingError(RuntimeError):
     """A turn was requested after manager shutdown began."""
 
 
+class SessionBusyError(RuntimeError):
+    """A caller requested an immediate turn claim while the session was held."""
+
+
 class SpeculativeResumeRefused(RuntimeError):
     """A speculative allocation may not consume an unrequested native resume."""
 
@@ -125,6 +129,7 @@ class AllocationDeps:
     load_watchdog_settings: Callable[[str], object]
     advertised_model_ids: Callable[[Any], list[str]]
     model_is_unusable: Callable[[str, list[str]], bool]
+    resolve_pin_spelling: Callable[[str, list[str]], str]
     to_provider_id: Callable[[str, str], str]
     to_acp_id: Callable[[str], str]
     inc_session_created: Callable[[], None]
@@ -182,7 +187,13 @@ class _AllocationOwner(Protocol):
         cwd: str | None = None,
     ) -> Any: ...
 
-    async def _reacquire_and_validate(self, key: str, session: Any) -> bool: ...
+    async def _reacquire_and_validate(
+        self,
+        key: str,
+        session: Any,
+        *,
+        wait_if_busy: bool = True,
+    ) -> bool: ...
 
     async def _evict_stale_session(self, key: str, session: Any) -> None: ...
 
@@ -235,7 +246,6 @@ def _collect_parent_runtime_kwargs(
         ("_sandbox_mode", "sandbox_mode"),
         ("_extra_env", "extra_env"),
         ("_mcp_gateway_overlay", "mcp_gateway_overlay"),
-        ("_mcp_gateway_settings_mcp_json", "mcp_gateway_settings_mcp_json"),
         ("_mcp_gateway_socket", "mcp_gateway_socket"),
         ("backend", "acp_backend"),
     ):
@@ -501,8 +511,18 @@ class SessionAllocationService:
                 )
         return await owner.get_subagent_runtime(parent_session_key, agent=agent)
 
-    async def _reacquire_and_validate(self, key: str, session: Any) -> bool:
+    async def _reacquire_and_validate(
+        self,
+        key: str,
+        session: Any,
+        *,
+        wait_if_busy: bool = True,
+    ) -> bool:
         """Acquire with the global lock released, then validate exact identity."""
+        if not wait_if_busy and session.semaphore.locked():
+            raise SessionBusyError(key)
+        # An idle Semaphore(1) acquires without suspension, so this is the
+        # authoritative non-waiting claim boundary after the locked check.
         await session.semaphore.acquire()
         try:
             async with self._lock:
@@ -1042,6 +1062,18 @@ class SessionAllocationService:
         cache[agent] = (model, directory_mtime, now)
         return model
 
+    @staticmethod
+    def _is_member_key(key: str) -> bool:
+        """Whether *key* addresses a crew member's pinned DM session.
+
+        Wrapper so the pool-bypass arm stays readable and the import stays off
+        module top level (circular import: members' module graph is heavy and
+        imports config, which sits below this module).
+        """
+        from kiro_crew.members import is_member_session_key
+
+        return is_member_session_key(key)
+
     async def _crew_pins_effort(self, agent: str | None, crew_agent: object) -> bool:
         """True when the crew this session runs as pins its own reasoning effort.
 
@@ -1092,6 +1124,7 @@ class SessionAllocationService:
         extra_env: dict[str, str] | None = None,
         speculative: bool = False,
         speculative_resume: bool = False,
+        wait_if_busy: bool = True,
         _won_race_retries: int = 0,
         **extra_factory_kwargs: Any,
     ) -> tuple[LLMProvider, bool, bool]:
@@ -1180,7 +1213,11 @@ class SessionAllocationService:
 
         if claimed is not None:
             session = claimed
-            if await owner._reacquire_and_validate(key, session):
+            if await owner._reacquire_and_validate(
+                key,
+                session,
+                wait_if_busy=wait_if_busy,
+            ):
                 first_turn = session.first_turn
                 if not speculative:
                     session.first_turn = self._deps.first_turn_nothing_armed
@@ -1229,6 +1266,14 @@ class SessionAllocationService:
             pool_decision = "bypass_resume"
         elif is_stateless:
             pool_decision = "bypass_stateless"
+        elif self._is_member_key(key):
+            # A pooled child was spawned with no session key, so it runs the
+            # factory's DEFAULT backend and none of the member construction
+            # route (per-session dispatch-tool mount, member backend). A warm
+            # hit would silently hand a member DM a session that cannot mount
+            # its tools; cold-starting through the factory is what makes the
+            # member route real. String check — as cheap as the arms above.
+            pool_decision = "bypass_member"
         elif cwd_blocks_pool:
             pool_decision = "bypass_cwd"
         elif extra_factory_kwargs.get("reasoning_effort_override"):
@@ -1304,9 +1349,22 @@ class SessionAllocationService:
                                 )
                             except Exception:  # pragma: no cover - defensive
                                 advertised = []
+                            _send_model = switch_model
                             if advertised and self._deps.model_is_unusable(
                                 switch_model, advertised
                             ):
+                                # A literal miss can be a stale `<namespace>::`
+                                # qualifier on a model the backend fully serves
+                                # (#8521): resolve to the advertised spelling and
+                                # send THAT — the same fold the cold-start spawn
+                                # and the display verdict use, so a warm claim
+                                # runs exactly what a cold start of the same pin
+                                # runs. A pin absent under either spelling still
+                                # takes the withhold below.
+                                _send_model = self._deps.resolve_pin_spelling(
+                                    switch_model, advertised
+                                )
+                            if not _send_model:
                                 self._deps.logger.warning(
                                     "Pool post-claim: model %s is not available to this "
                                     "account; leaving the claimed process on %s",
@@ -1314,10 +1372,10 @@ class SessionAllocationService:
                                     pool_model,
                                 )
                             else:
-                                await cast(Any, provider).client.set_model(switch_model)
+                                await cast(Any, provider).client.set_model(_send_model)
                                 self._deps.logger.info(
                                     "Pool post-claim: switched model to %s",
-                                    switch_model,
+                                    _send_model,
                                 )
                 self._deps.logger.info(
                     "Claimed warm-pool process for %s (agent=%s)",
@@ -1520,7 +1578,11 @@ class SessionAllocationService:
                         key,
                         exc_info=True,
                     )
-            if await owner._reacquire_and_validate(key, won_race_session):
+            if await owner._reacquire_and_validate(
+                key,
+                won_race_session,
+                wait_if_busy=wait_if_busy,
+            ):
                 first_turn = won_race_session.first_turn
                 if not speculative:
                     won_race_session.first_turn = self._deps.first_turn_nothing_armed
@@ -1545,6 +1607,7 @@ class SessionAllocationService:
                 extra_env=extra_env,
                 speculative=speculative,
                 speculative_resume=speculative_resume,
+                wait_if_busy=wait_if_busy,
                 _won_race_retries=_won_race_retries + 1,
                 **extra_factory_kwargs,
             )

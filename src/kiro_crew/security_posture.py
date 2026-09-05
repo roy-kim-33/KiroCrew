@@ -442,8 +442,10 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
         "scanned): it reached the browser verbatim. The session "
         "records go through it too, because `save_session` merges the caller's patch and the "
         "stored `title` is built from a finding's target. So do the route ERROR bodies: "
-        "`commit.py` builds its `error` from `(proc.stderr or '')[:160]` — raw git stderr, "
-        "which quotes refs, paths and whatever a repository's own hooks printed. That was "
+        "`commit.py` builds its `error` from git stderr — which quotes refs, paths and "
+        "whatever a repository's own hooks printed — scrubbed at that source "
+        "(redact-then-bound) so its character bound can never cut a credential mid-match. "
+        "That was "
         "latent while nothing rendered it; surfacing a refused commit at the finding row made "
         'it a live path to the browser, so all five `result.get("error")` responses plus the '
         "PR-status and draft bodies are scanned. "
@@ -627,6 +629,13 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
         "Workflow injections",
         "dashboard/workflow_inject.py",
         "Workflow progress summaries injected back into a session.",
+    ),
+    (
+        "Structured monitor wakes",
+        "monitoring/controller.py",
+        "Provider-controlled canonical facts and operator-authored wake instructions "
+        "before they are injected into an agent session. The complete bounded envelope "
+        "passes the exfiltration-URL and credential scanners before dispatch.",
     ),
     (
         "Crew Mode delivery",
@@ -1200,6 +1209,19 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
         "chokepoint that applies the credential + exfiltration-URL chain before the "
         "text reaches the dashboard.",
     ),
+    (
+        "Relayed remote-crew turn output",
+        "dashboard/remote_relay.py",
+        "Every string in a turn relayed from a bound remote crew: the assistant "
+        "text, and each mirrored frame's tool inputs and outputs. The peer is a "
+        "SEPARATE machine with its own agents, environment and secrets, so its "
+        "reply can quote a credential or an exfiltration URL that no local "
+        "redaction pass has ever seen. The peer redacts its own copy with this "
+        "same chain, but a hub that trusted that would inherit whatever an older "
+        "or misconfigured peer failed to scrub -- so the boundary where the "
+        "peer's bytes become this dashboard's transcript re-applies the "
+        "credential + exfiltration-URL chain itself, before any broadcast.",
+    ),
 )
 
 # Modules that call a redactor but are NOT an output egress boundary, so they do
@@ -1299,6 +1321,17 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         # no output of its own -- the registered sinks are the modules that call
         # it (slack/format.py, messaging/renderer.py).
         "messaging/display_safety.py",
+        # ``autonudge.py``'s ``_load`` credential-scrubs a persisted ``banner`` in
+        # memory and attempts to persist the masked value back, so a banner
+        # written to the store out-of-band (a hand-edited file, or a direct
+        # ``AutoNudgeService.add`` that skips the authorizer) is masked on the next
+        # load rather than served raw — best-effort, since a failed re-persist
+        # leaves the raw value on disk until the following load. It owns no output
+        # of its own — the egress that serves the banner is the registered
+        # ``dashboard/handlers/autonudge.py`` serializer and the gateway broadcast;
+        # this is at-rest sanitisation at the trust boundary where the store is
+        # read, not an egress pass.
+        "autonudge.py",
         "autonudge_authz.py",
         # Gate-side log hygiene for a channel whose user identity IS a phone
         # number or an Apple Account email. ``redact_handle`` shortens a handle
@@ -1369,6 +1402,22 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         # through ``_handle_deps_install`` in routes.py, the registered sink
         # for this app.
         "apps/builtins/auto_improvement/backend/deps.py",
+        # Same source-side pre-pass shape, for the app's git/gh subprocess stderr:
+        # git echoes the remote's userinfo URL on an auth failure, and the fixed
+        # character bound applied to each error string can cut a credential
+        # mid-match, so the companion-aware redact_via_context runs where the
+        # string is BUILT, before the bound.
+        # None of these owns an output boundary:
+        # - gate.py's scrubbed RuntimeError becomes the gate verdict detail, which
+        #   travels to the ledger and the candidate detail — surfaces owned by the
+        #   spine driver and the backend routes, this app's registered sinks.
+        # - clone_setup.py's error strings reach the dashboard only through the
+        #   backend routes (the registered sink for this app).
+        # - profile.py's GateResult.detail follows the same ledger/candidate path as
+        #   gate.py's verdicts.
+        "apps/builtins/auto_improvement/backend/clone_setup.py",
+        "apps/builtins/auto_improvement/profiles/github_repo/profile.py",
+        "apps/builtins/auto_improvement/spine/gate.py",
         # Inbound: the crew worker's slot title is derived from an issue title,
         # which is untrusted text anyone who can open an issue wrote. It is
         # scrubbed before it becomes a slot title (and fails CLOSED to the slot
@@ -1554,6 +1603,10 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         # Redacts INBOUND attacker-controllable provider metadata before it is
         # stored/displayed — a sanitizer on the way in, not an output boundary.
         "dashboard/handlers/mcp_discover.py",
+        # Inbound provider sanitization: check identities are stripped of URLs and
+        # credentials before they enter canonical monitor state. The controller's
+        # later agent-session injection is the registered output boundary.
+        "monitoring/github_pull_request.py",
         # Computer use: the redaction pass runs on third-party desktop content
         # (window titles, accessibility values) on its way INTO the model's
         # context, exactly like the MCP tool-result paths above. `policy.py` owns

@@ -1271,7 +1271,14 @@ async def api_chat_slot_pin(request: web.Request) -> web.Response:
                 {"error": "session was deleted or rebound", "code": "session_gone"}, status=409
             )
         prior_pinned = slot.pinned
-        new_pinned = bool(body.get("pinned", False))
+        new_pinned = body.get("pinned", False)
+        # Do not use Python truthiness for API booleans: JSON strings such as
+        # "false" are non-empty and therefore truthy.  The sibling metadata
+        # fields validate their types before mutating; pin must do the same.
+        if not isinstance(new_pinned, bool):
+            return web.json_response(
+                {"error": "pinned must be a boolean", "code": "pinned_not_bool"}, status=400
+            )
         slot.pinned = new_pinned
         if not await save_slot_off_loop(
             state, slot, force=True, expected_history_key=authorized_history_key
@@ -1364,6 +1371,21 @@ async def api_chat_slot_mode(request: web.Request) -> web.Response:
     if slot.mode == "member":
         return web.json_response(
             {"error": "member thread mode is locked", "code": "member_mode_locked"},
+            status=409,
+        )
+    # A crew-bound (remote) session runs PLAIN chat only — the same rule
+    # api_chat_slot_create enforces at birth, applied here to the post-create
+    # switch that would otherwise reopen it. A non-plain mode (crew,
+    # orchestrator, design-critique) is consumed by an earlier dispatch branch in
+    # api_chat that runs its tools and filesystem work on THIS machine, not on the
+    # peer the session is bound to (finding F3). Keyed on ``executor`` rather than
+    # ``is_remote`` so even a half-bound slot can never be switched into one.
+    if slot.executor == "remote" and mode:
+        return web.json_response(
+            {
+                "error": "a crew-bound session runs plain chat only; mode-specific work runs on the crew, not here",
+                "code": "remote_mode_unsupported",
+            },
             status=409,
         )
     # Crew keeps its durable queue in a directory named after the slot, and a

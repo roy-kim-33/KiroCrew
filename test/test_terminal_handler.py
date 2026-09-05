@@ -3432,6 +3432,140 @@ class TestTerminalWsIntegration:
         reason="POSIX login-shell semantics; needs a real bash on PATH",
     )
     @pytest.mark.asyncio
+    async def test_ws_bash_profile_assigning_prompt_command_stays_fail_closed(
+        self, monkeypatch, tmp_path,
+    ):
+        """A profile that ASSIGNS PROMPT_COMMAND drops the hook, and the barrier
+        must then stay SHUT rather than open on inferred progress.
+
+        `_bash_ready_env`'s docstring calls this outcome deliberate: the readiness
+        marker rides an inherited `PROMPT_COMMAND` because Bash reads an
+        `--init-file` only for a NON-login shell, so `PROMPT_COMMAND='history -a'`
+        in a profile replaces the hook and the marker never fires. Releasing the
+        barrier anyway -- on a timeout, or on a line-discipline guess -- risks
+        handing a queued command to a profile still blocked in `read`, which
+        consumes it silently: executed never, reported sent. #7641 shipped such a
+        release and had it reviewed back out.
+
+        Every sibling case here covers an arm where the hook SURVIVES: appended
+        scalar, appended array, inherited, restored, preserved, blank-inherited.
+        This is the arm where it does not. Without it, the barrier could be made
+        to open on a clobbered session and the whole suite would stay green --
+        which is exactly how the reviewed-out release passed local gates.
+
+        The assertion is deliberately PAIRED. A session that never spawned would
+        satisfy "no ready frame" on its own, so the shell is first proved live:
+        the profile chain ran, and a typed command executes (client input is not
+        gated on `shell_ready`, only the frontend's registration is). The point is
+        that the shell is genuinely usable while the gateway's barrier stays shut.
+
+        Tracked in #7657 with the remedy directions, and this pins only the
+        CURRENT deliberate behaviour without obstructing them: directions 1 and 3
+        both keep queued injection fail-closed and change only interactive typing,
+        so both survive this invariant.
+        """
+        home = tmp_path / "home"
+        home.mkdir()
+        # ASSIGN, not append -- this is the shape that replaces the exported
+        # readiness hook, and it is the assignment (which clobbers the hook), not
+        # the value, that this arm pins. The value is the side-effect-free `:`
+        # no-op rather than a realistic `history -a`, deliberately: a login Bash
+        # sources the system profile chain before this file, and `history -a`
+        # would append to whatever HISTFILE that chain leaves set -- which can be
+        # an absolute path outside tmp_path on a real dev box or CI runner. `:`
+        # drops the hook just as completely while writing nothing anywhere. The
+        # echo is the positive control: a sourced profile's text is not echoed to
+        # the PTY, so seeing it proves execution.
+        (home / ".bash_profile").write_text(
+            "PROMPT_COMMAND=':'\n"
+            "echo KC_PROFILE_RAN\n"
+        )
+
+        cfg_file = tmp_path / "config.json"
+        cfg_file.write_text(json.dumps({
+            "dashboard": {"terminal": {"enabled": True, "shell": "bash"}}
+        }))
+        monkeypatch.setattr(terminal, "config_path", lambda: cfg_file)
+        monkeypatch.setattr(terminal, "_sel", lambda: MagicMock())
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("SHELL", shutil.which("bash") or "/bin/bash")
+
+        registry: dict = {}
+        app = _make_app(registry=registry)
+
+        from aiohttp.test_utils import TestClient, TestServer
+
+        out = bytearray()
+        ready_frames: list[dict] = []
+        typed = False
+        shell_ready = None
+        try:
+            async with TestClient(TestServer(app)) as client:
+                async with client.ws_connect("/api/ws/terminal/pcassign-sess") as ws:
+                    loop = asyncio.get_event_loop()
+                    deadline = loop.time() + 20
+                    while loop.time() < deadline:
+                        try:
+                            msg = await ws.receive(timeout=deadline - loop.time())
+                        except asyncio.TimeoutError:
+                            # No `ready` is the EXPECTED outcome here, so the
+                            # window closing must surface as the assertions below
+                            # rather than as a TimeoutError from the harness.
+                            break
+                        if msg.type == web.WSMsgType.BINARY:
+                            out.extend(msg.data)
+                            blob = bytes(out)
+                            if not typed and b"KC_PROFILE_RAN" in blob:
+                                # Profile chain done, so the shell is at its first
+                                # prompt. EXECUTION-only marker: the typed bytes
+                                # carry LIVE''OK so the line-discipline echo of
+                                # our own keystrokes cannot satisfy the match.
+                                typed = True
+                                await ws.send_bytes(b"echo LIVE''OK=1.\n")
+                            elif typed and b"LIVEOK=1." in blob:
+                                break
+                        elif msg.type == web.WSMsgType.TEXT:
+                            frame = json.loads(msg.data)
+                            if frame.get("type") == "ready":
+                                ready_frames.append(frame)
+                        elif msg.type in (web.WSMsgType.CLOSE, web.WSMsgType.ERROR):
+                            break
+                    await ws.close()
+        finally:
+            spawned = registry.get("pcassign-sess")
+            if spawned is not None:
+                shell_ready = spawned.shell_ready
+                await terminal._kill_session(spawned)
+
+        tail = bytes(out)
+        # Positive control first: without these two, "no ready frame" is also
+        # satisfied by a session that never started, and the test would pass for
+        # the wrong reason.
+        assert b"KC_PROFILE_RAN" in tail, (
+            "the login profile never ran, so this session proves nothing about "
+            f"the readiness barrier. PTY tail: {tail[-400:]!r}"
+        )
+        assert b"LIVEOK=1." in tail, (
+            "the shell never executed a typed command, so it was not interactive "
+            f"and the barrier was not the thing under test. PTY tail: {tail[-400:]!r}"
+        )
+        # The invariant.
+        assert ready_frames == [], (
+            "the readiness barrier OPENED for a session whose profile ASSIGNED "
+            "PROMPT_COMMAND and therefore dropped the hook. Releasing here risks "
+            "handing a queued command to a profile still reading input, which is "
+            f"why #7641's release was reviewed out. frames={ready_frames!r}"
+        )
+        assert shell_ready is False, (
+            "shell_ready must stay False while the hook is clobbered (None means "
+            f"the session was never registered, which is also a failure), got {shell_ready!r}"
+        )
+
+    @pytest.mark.skipif(
+        terminal.platform_compat.IS_WINDOWS or not shutil.which("bash"),
+        reason="POSIX login-shell semantics; needs a real bash on PATH",
+    )
+    @pytest.mark.asyncio
     async def test_ws_bash_restores_an_inherited_prompt_command(
         self, monkeypatch, tmp_path,
     ):
@@ -4325,3 +4459,144 @@ class TestWriteSerialization:
 
         names = {f.name for f in dataclasses.fields(terminal._TerminalSession)}
         assert "write_lock" in names
+
+
+class TestPtyChildEnvStripsPythonStartupVars:
+    """``PYTHONPATH``/``PYTHONHOME``/``PYTHONPYCACHEPREFIX`` are searched BEFORE a
+    venv's own site-packages, so leaking the gateway's copies into an interactive
+    shell makes a user's Python 3.13 venv import Kiro Crew's 3.12 site-packages
+    and its C extensions fail to load. The agent surface already strips them
+    (``sandbox.scrub_agent_subprocess_env``); these pin the terminal surface,
+    which was never brought into line.
+    """
+
+    def test_python_startup_vars_are_dropped(self, monkeypatch):
+        monkeypatch.setenv("PYTHONPATH", "/gateway/site-packages")
+        monkeypatch.setenv("PYTHONHOME", "/gateway/python3.12")
+        monkeypatch.setenv("PYTHONPYCACHEPREFIX", "/gateway/pycache")
+        monkeypatch.setenv("KIROCREW_UNRELATED_KEEPME", "keep-this-value")
+
+        env = terminal._pty_child_env(
+            {"TERM": "xterm-256color", "KIROCREW_TERMINAL": "1"}
+        )
+
+        assert "PYTHONPATH" not in env
+        assert "PYTHONHOME" not in env
+        assert "PYTHONPYCACHEPREFIX" not in env
+        assert env["KIROCREW_TERMINAL"] == "1"
+        assert env["TERM"] == "xterm-256color"
+        assert env["KIROCREW_UNRELATED_KEEPME"] == "keep-this-value"
+
+    def test_credential_bearing_vars_survive(self, monkeypatch):
+        """Only the Python prefixes are dropped. This is the user's own
+        unsandboxed shell, so borrowing the AGENT spawn's credential scrub would
+        break git-over-SSH and the AWS CLI inside the panel."""
+        monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/ssh-abc/agent.1")
+        monkeypatch.setenv("AWS_SESSION_TOKEN", "FAKE-token")
+        monkeypatch.setenv("PYTHONPATH", "/gateway/site-packages")
+
+        env = terminal._pty_child_env({"KIROCREW_TERMINAL": "1"})
+
+        assert env["SSH_AUTH_SOCK"] == "/tmp/ssh-abc/agent.1"
+        assert env["AWS_SESSION_TOKEN"] == "FAKE-token"
+        assert "PYTHONPATH" not in env
+
+    @pytest.mark.asyncio
+    async def test_posix_pty_spawn_env_has_no_python_vars(self, monkeypatch):
+        """End-to-end through the POSIX branch: assert on the env actually handed
+        to the spawn, so rebuilding the dict in place is caught. The spawn is
+        made to fail AFTER the call is recorded so no read loop starts."""
+        monkeypatch.setenv("PYTHONPATH", "/gateway/site-packages")
+        monkeypatch.setenv("PYTHONHOME", "/gateway/python3.12")
+        monkeypatch.setenv("SHELL", "/bin/bash")
+        monkeypatch.setattr(
+            terminal.shutil, "which", lambda c: c if c == "/bin/zsh" else None
+        )
+
+        registry: dict = {}
+        req = _make_request(registry=registry, session_id="posix-pyenv")
+        req.query = MagicMock()
+        req.query.get = lambda *a, **k: None
+
+        ws = AsyncMock()
+        ws.closed = False
+
+        fds = os.pipe()  # real fds so the cleanup os.close() calls succeed
+        spawn = AsyncMock(side_effect=RuntimeError("stop before read loop"))
+        cfg = {"enabled": True, "shell": "/bin/zsh"}
+        with patch.object(terminal.platform_compat, "IS_POSIX", True), \
+             patch.object(terminal.platform_compat, "IS_WINDOWS", False), \
+             patch.object(terminal._pty, "openpty", return_value=fds), \
+             patch.object(terminal.fcntl, "ioctl", lambda *a: None), \
+             patch.object(terminal.asyncio, "create_subprocess_exec", spawn), \
+             patch.object(terminal, "_get_config", return_value=cfg), \
+             patch.object(terminal.web, "WebSocketResponse", return_value=ws), \
+             patch.object(terminal, "_sel") as mock_sel:
+            mock_sel.return_value.log_api_access = MagicMock()
+            await terminal.api_terminal_ws(req)
+
+        spawn.assert_awaited_once()
+        env = spawn.call_args.kwargs["env"]
+        assert "PYTHONPATH" not in env
+        assert "PYTHONHOME" not in env
+        assert env["KIROCREW_TERMINAL"] == "1"
+        assert env["TERM"] == "xterm-256color"
+        assert env["SHELL"] == "/bin/zsh"
+
+    @pytest.mark.asyncio
+    async def test_conpty_spawn_env_has_no_python_vars(self, monkeypatch, tmp_path):
+        """The Windows ConPTY branch IS reachable on Linux: ``IS_WINDOWS`` is a
+        module attribute and ``WindowsPty`` is a thin pywinpty wrapper the suite
+        already fakes, so the same code path runs here."""
+        monkeypatch.setenv("PYTHONPATH", "/gateway/site-packages")
+        monkeypatch.setenv("PYTHONHOME", "/gateway/python3.12")
+
+        cfg_file = tmp_path / "config.json"
+        cfg_file.write_text(json.dumps({"dashboard": {"terminal": {"enabled": True}}}))
+        monkeypatch.setattr(terminal, "config_path", lambda: cfg_file)
+        monkeypatch.setattr(terminal, "_sel", lambda: MagicMock())
+        monkeypatch.setattr(terminal.platform_compat, "IS_POSIX", False)
+        monkeypatch.setattr(terminal.platform_compat, "IS_WINDOWS", True)
+
+        captured: dict = {}
+
+        class _FakeWinPty:
+            def __init__(self, argv, cwd=None, env=None, cols=80, rows=24):
+                captured["env"] = env
+                self.pid = 4321
+                self._reads = iter((b"PS> ", b""))
+
+            def read(self, size=4096):
+                return next(self._reads)
+
+            def write(self, data):
+                return len(data)
+
+            def resize(self, cols, rows):
+                pass
+
+            def isalive(self):
+                return True
+
+            def terminate(self, force=True):
+                pass
+
+        monkeypatch.setattr("kiro_crew.conpty.WindowsPty", _FakeWinPty)
+
+        registry: dict = {}
+        app = _make_app(registry=registry)
+
+        from aiohttp.test_utils import TestClient, TestServer
+
+        async with TestClient(TestServer(app)) as client:
+            async with client.ws_connect("/api/ws/terminal/win-pyenv") as ws:
+                await ws.receive(timeout=3)
+                await ws.close()
+
+        if "win-pyenv" in registry:
+            await terminal._kill_session(registry["win-pyenv"])
+
+        env = captured["env"]
+        assert "PYTHONPATH" not in env
+        assert "PYTHONHOME" not in env
+        assert env["KIROCREW_TERMINAL"] == "1"

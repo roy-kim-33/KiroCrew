@@ -20,7 +20,6 @@ ACTIVATION_REVIEW
 APPROVAL_TURN_MARGIN_SECS
 AUTOCOMPACT_PCT_MAX
 AUTOCOMPACT_PCT_MIN
-AUTO_INGEST_CHUNK_BUDGET_MAX
 AgentConfig
 BACKGROUND_WORKER_AGENTS
 CHAT_ENTRY_CACHE_BYTES_DEFAULT
@@ -63,7 +62,6 @@ JAIL_MODE_AUTO
 JAIL_MODE_OFF
 JAIL_MODE_ON
 JiraAuthEntry
-KNOWLEDGE_MAX_SOURCES_MAX
 KiroCrewAgentConfig
 KnowledgeConfig
 LOOP_STALL_EXIT_AFTER_DEFAULT
@@ -116,6 +114,7 @@ TelegramAccountConfig
 TelegramConfig
 TelemetryConfig
 TunnelConfig
+WakaTimeConfig
 WatchdogConfig
 WeComConfig
 WebexConfig
@@ -173,6 +172,8 @@ _port_or_unset
 _read_auto_add_documents
 _read_skip_permissions
 _resolve_stt_model
+_resolve_stub_overrides
+_resolve_stub_roster
 _resolve_stub_servers
 _safe_bool
 _safe_color

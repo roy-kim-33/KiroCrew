@@ -22,7 +22,13 @@ const {
   describeLocation,
 } = require("./bundle-location");
 const { DEFAULT_REMOTE_BIN } = require("./remote-token");
-const { migrateRemoteHostConfig } = require("./host-config");
+const {
+  migrateRemoteHostConfig,
+  remoteHostPort,
+  getRemoteHostConfig,
+  isSelectablePort,
+} = require("./host-config");
+const { isLocalGatewayEnabled } = require("./local-gateway");
 const { seedRenamedStore } = require("./store-rename");
 const { resolveHome, secretCandidates } = require("./home-dir");
 const { identityFamily } = require("./instance-guard");
@@ -33,7 +39,25 @@ const { exitImmersiveModes } = require("./blocking-prompt");
 const { createMetricsRecorder } = require("./perf-metrics");
 const { initMochi, shutdownMochi } = require("./mochi/index");
 const { borrowSessionToken } = require("./mochi-session-token");
-const { initCrewCompanion, shutdownCrewCompanion } = require("./crew-companion/index");
+const {
+  initCrewCompanion,
+  shutdownCrewCompanion,
+  suspendCrewCompanion,
+  resumeCrewCompanion,
+} = require("./crew-companion/index");
+
+// An update install stops the gateway and quits the app. Close the Crew
+// Companion overlay at dispatch so it does not float orphaned over the vanished
+// dashboard during the quit handoff, and reopen it if the install fails and the
+// gateway is restored. suspend/resume keep the companion's loop and IPC handlers
+// intact, so the failure path needs no re-init. Both are best-effort — a
+// companion teardown must never block an update or its recovery.
+function closeCrewCompanionForUpdate() {
+  try { suspendCrewCompanion(); } catch { /* best effort */ }
+}
+function reopenCrewCompanionAfterUpdate() {
+  try { resumeCrewCompanion(); } catch { /* best effort */ }
+}
 const { createGatewaySupervisor } = require("./gateway-supervisor");
 const { createWindowLifecycle } = require("./window-lifecycle");
 const { createIpcRegistrar } = require("./ipc-registrar");
@@ -77,6 +101,33 @@ function resolvePort() {
 
   // dashboard.url in the resolved data home is the backend source of truth.
   const configuredPort = findConfiguredDashboardPort(fs, path, [KIROCREW_HOME]);
+
+  // With "Run a local gateway" off, a dashboard.url naming a port that has no
+  // remote host of its own records a backend which will not run here: nothing
+  // binds it and there is no host to mint a token from. A machine switched from
+  // local to remote-only keeps exactly that record, so honouring it would
+  // rebuild the dead end the opt-out is meant to avoid. A dashboard.url that
+  // DOES name a configured crew still wins -- that is the user choosing between
+  // crews rather than a leftover.
+  if (!isLocalGatewayEnabled(store)) {
+    if (
+      configuredPort
+      && isSelectablePort(configuredPort)
+      && getRemoteHostConfig(store, configuredPort)?.host
+    ) {
+      return configuredPort;
+    }
+    const remotePort = remoteHostPort(store);
+    if (remotePort) {
+      console.log(
+        "Local gateway is off; targeting the configured remote crew on port " + remotePort,
+      );
+      return remotePort;
+    }
+    // No crew is configured, so there is no better target than the local
+    // record: naming the port the user configured beats naming the default.
+  }
+
   if (configuredPort) return configuredPort;
   console.debug("No usable dashboard.url port in the data home, falling back to 5476");
   return 5476;
@@ -227,6 +278,8 @@ const ipcRegistrar = createIpcRegistrar({
   windows,
   gateway,
   glog,
+  closeCrewCompanionForUpdate,
+  reopenCrewCompanionAfterUpdate,
 });
 
 /**

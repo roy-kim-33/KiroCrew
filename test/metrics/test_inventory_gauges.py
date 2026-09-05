@@ -159,7 +159,7 @@ def test_unparseable_crons_publishes_the_failure_series_and_no_count(tmp_path, m
         (tmp_path / "crons.json").write_text("{not json", encoding="utf-8")
         metrics = _collect()
         assert ig.GAUGE_CRONS_ACTIVE not in metrics or not metrics[ig.GAUGE_CRONS_ACTIVE]
-        failures = {dp.attributes["probe"]: dp.value for dp in metrics[ig.COUNTER_PROBE_FAILURES]}
+        failures = {dp.attributes["probe"]: dp.value for dp in metrics[ig.GAUGE_PROBE_FAILURES]}
         assert failures.get(ig.PROBE_CRONS) == 1, f"crons fault not published: {failures}"
     finally:
         ig.reset_for_testing()
@@ -531,6 +531,23 @@ def test_all_names_pass_core_namespace_validation():
         assert validate_name(name) == name
 
 
+def test_lifetime_totals_are_declared_for_the_consumer_that_must_know():
+    """A lifetime-total gauge is not interchangeable with a state gauge.
+
+    Its newest sample is "since this process started", so a consumer that reports
+    the newest sample as a reading shows a number that only grows. The dashboard
+    aggregator differences them instead, and it finds them through this tuple —
+    which must therefore name exactly the one whose reading accumulates, and
+    must stay a subset of the roster. Adding a lifetime-total gauge without
+    listing it here — or leaving a stale name in the tuple after a roster
+    change — would silently demote the series to newest-sample, with nothing
+    failing; this is the inventory half of the guard the process family already
+    has in ``test_process_gauges``.
+    """
+    assert set(ig.LIFETIME_TOTAL_METRICS) == {ig.GAUGE_PROBE_FAILURES}
+    assert set(ig.LIFETIME_TOTAL_METRICS) <= set(ig.ALL_METRIC_NAMES)
+
+
 def test_collection_yields_every_instrument_with_the_expected_shape():
     with (
         patch.object(ig, "read_active_crons", return_value=3),
@@ -549,7 +566,7 @@ def test_collection_yields_every_instrument_with_the_expected_shape():
         metrics = _collect()
 
     for name in ig.ALL_METRIC_NAMES:
-        if name == ig.COUNTER_PROBE_FAILURES:
+        if name == ig.GAUGE_PROBE_FAILURES:
             # Absent by design on a healthy install: it publishes only once a probe
             # has failed, so a healthy host adds no series. Covered positively by
             # test_probe_failure_publishes_a_counter_series.
@@ -643,7 +660,7 @@ def test_probe_failure_publishes_a_counter_series():
         with patch.object(ig, "read_active_crons", side_effect=RuntimeError("boom")):
             metrics = _collect()
         assert ig.GAUGE_CRONS_ACTIVE not in metrics or not metrics[ig.GAUGE_CRONS_ACTIVE]
-        points = metrics.get(ig.COUNTER_PROBE_FAILURES) or []
+        points = metrics.get(ig.GAUGE_PROBE_FAILURES) or []
         assert points, "a failed probe published no failure series"
         counts = {p.attributes["probe"]: p.value for p in points}
         assert counts == {ig.PROBE_CRONS: 1}

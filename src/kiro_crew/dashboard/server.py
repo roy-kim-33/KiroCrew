@@ -20,6 +20,7 @@ from aiohttp import web
 
 from kiro_crew import platform_compat, port_resolution
 from kiro_crew.apps.backend import start_enabled_app_backends
+from kiro_crew.apps.hook_reconcile import init_hook_reconciler, stop_hook_reconciler
 from kiro_crew.apps.hooks_integration import (
     init_hooks_system,
     on_gateway_shutdown,
@@ -177,9 +178,10 @@ from kiro_crew.safety_override import (
     take_dropped_grant,
 )
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
-from kiro_crew.sel import sel
+from kiro_crew.sel import sel, warm_sel_singleton
 from kiro_crew.skill_usage import register_skill_read_observer
 from kiro_crew.skills import SkillsLoader, set_pending_consumed_hook, set_pending_staged_hook
+from kiro_crew.stall_attribution import attribute_dump, describe
 from kiro_crew.tunnel.setup import setup_tunnel
 
 if TYPE_CHECKING:
@@ -441,6 +443,10 @@ _STRICT_INTERNAL_API_PATHS = frozenset(
         "/api/session-control/close",
         "/api/session-control/send",
         "/api/session-control/read",
+        # MCP-only structured monitor inspection. The caller selects its
+        # session identity through X-Session-Key, so cookie authentication can
+        # never authorize this leaf.
+        "/api/autonudge/session-monitor",
     }
 )
 
@@ -454,39 +460,39 @@ _PRE_AUDIT_DENY_STATUSES = frozenset({401, 403})
 
 
 async def _audit_denied(caller: str, request: web.Request, error: str) -> None:
-    """Record a middleware refusal in the SEL, off the event loop, best-effort.
+    """Record a middleware refusal in the SEL, best-effort.
 
     Shared by every middleware that denies BEFORE ``sel_audit_middleware`` runs
     (that one is registered inner to them, so a bare raise produces a 403 that
     appears nowhere in the audit log). One helper rather than per-site calls
-    because both properties below are easy to omit at a new deny site and
+    because the property below is easy to omit at a new deny site and
     invisible when omitted:
 
-    * OFF THE LOOP — ``log_api_access`` only enqueues, but the first ``sel()``
-      of a process CONSTRUCTS the log: trust-dir creation, key validation, and
-      on Windows the owner-only DACL on the key file. A fresh
-      dashboard whose first state-changing request is cross-origin would run
-      that synchronously on the event loop and stall every other request.
     * BEST-EFFORT — a trust root too short to sign the chain makes construction
       raise, and an unguarded write would turn the refusal into a 500: losing
       the denial in order to report it.
 
+    No thread hop: the SEL singleton is warmed at startup
+    (:func:`kiro_crew.sel.warm_sel_singleton`, awaited by both start paths
+    before the middleware chain is built), so ``log_api_access`` here only
+    enqueues to the writer thread (after its one-time start on first
+    ``log()``) (#8608). The guard stays because a FAILED
+    warm leaves construction to retry on this thread and possibly raise.
+
     Calling this CLAIMS the request (:func:`origin.mark_audit_claimed`) so the
     deny-audit boundary outer to every barrier does not record the same refusal
     a second time. The claim is set unconditionally, before the write: a write
-    that failed here fails identically in the boundary, so a second doomed
-    thread hop buys nothing.
+    that failed here fails identically in the boundary, so retrying in the
+    boundary buys nothing.
     """
     mark_audit_claimed(request)
     try:
-        await asyncio.to_thread(
-            lambda: sel().log_api_access(
-                caller=caller,
-                operation=f"{request.method} {request.path}",
-                outcome="denied",
-                resources=request.path,
-                error=error,
-            )
+        sel().log_api_access(
+            caller=caller,
+            operation=f"{request.method} {request.path}",
+            outcome="denied",
+            resources=request.path,
+            error=error,
         )
     except Exception:
         logger.warning("Failed to log a middleware denial to SEL", exc_info=True)
@@ -1359,6 +1365,7 @@ def _register_mcp_routes(app: web.Application) -> None:
     # MCP Apps (SEP-1865): embedded app iframe -> gateway tool callback.
     app.router.add_post("/api/mcp-apps/call", handlers.api_mcp_apps_call)
     app.router.add_get("/api/spawn", handlers.api_spawn_list)
+    app.router.add_post("/api/spawn/stop-all", handlers.api_spawn_stop_all)
     app.router.add_get("/api/spawn/{agent_id}", handlers.api_spawn_status)
     app.router.add_delete("/api/spawn/{agent_id}", handlers.api_spawn_delete)
     app.router.add_post("/api/spawn/{agent_id}/retry", handlers.api_spawn_retry)
@@ -1377,6 +1384,11 @@ def _register_mcp_routes(app: web.Application) -> None:
     app.router.add_get("/api/crons/history", handlers.api_cron_history_all)
     app.router.add_delete("/api/crons/{job_id}", handlers.api_cron_delete)
     app.router.add_patch("/api/crons/{job_id}", handlers.api_cron_update)
+    # Operator-only vault-secret grants. The "/api/crons" prefix above makes
+    # this reachable with X-Internal-Secret, so the HANDLER refuses proven
+    # internal-secret callers (request["internal_auth"]) — machines request,
+    # humans grant. See the handler docstring.
+    app.router.add_put("/api/crons/{job_id}/secrets", handlers.api_cron_secret_grant)
     app.router.add_post("/api/crons/{job_id}/enable", handlers.api_cron_enable)
     app.router.add_post("/api/crons/{job_id}/run", handlers.api_cron_run)
     app.router.add_post("/api/crons/{job_id}/cancel", handlers.api_cron_cancel)
@@ -1459,13 +1471,27 @@ def _register_mcp_routes(app: web.Application) -> None:
         api_autonudge_list,
         api_autonudge_start,
         api_autonudge_update,
+        api_monitor_create,
+        api_monitor_restart,
+        api_monitor_slot_get,
+        api_monitor_stop,
+        api_monitor_update,
+        api_monitors_list,
+        api_session_monitor_get,
     )
 
     app.router.add_get("/api/autonudge", api_autonudge_list)
+    app.router.add_get("/api/autonudge/session-monitor", api_session_monitor_get)
     app.router.add_post("/api/autonudge", api_autonudge_start)
     app.router.add_get("/api/autonudge/slot/{slot_key}", api_autonudge_get)
     app.router.add_patch("/api/autonudge/{loop_id}", api_autonudge_update)
     app.router.add_delete("/api/autonudge/{loop_id}", api_autonudge_delete)
+    app.router.add_get("/api/monitors", api_monitors_list)
+    app.router.add_post("/api/monitors", api_monitor_create)
+    app.router.add_get("/api/monitors/slot/{slot_key}", api_monitor_slot_get)
+    app.router.add_patch("/api/monitors/{monitor_id}", api_monitor_update)
+    app.router.add_post("/api/monitors/{monitor_id}/stop", api_monitor_stop)
+    app.router.add_post("/api/monitors/{monitor_id}/restart", api_monitor_restart)
 
     # Agent questions. The MCP ask_question tool no longer posts here: it returns
     # a session directive and the dashboard posts a NON-BLOCKING card (see
@@ -2295,6 +2321,59 @@ def _dispatch_owner_dm(state: DashboardState, text: str) -> None:
         logger.debug("No running event loop — owner DM skipped")
         return
     task = loop.create_task(_dm_owner(state, text))
+    state._background_tasks.add(task)
+    task.add_done_callback(state._background_tasks.discard)
+
+
+def _register_connections_warm_lifecycle(app: web.Application, state: DashboardState) -> None:
+    """Retire warm generations on cleanup; startup scavenging is kicked post-bind.
+
+    The import sits inside the hook deliberately, against ``top-level-imports``, because
+    ``no-new-work-on-gateway-boot-path`` governs this file and wins: importing
+    ``connections.warm`` at module scope would pull its whole dependency graph -- the mint
+    table, the provider registry, tool aliases, MCP discovery -- onto the one ordered thread
+    between process start and the socket accepting requests. Startup scavenging is NOT an
+    ``on_startup`` hook for the same reason: aiohttp runs those inside ``runner.setup()``,
+    BEFORE the listener binds, so even a hook that only created the scavenge task put the
+    synchronous import in front of the bind. Both entrypoints instead call
+    ``_kick_connections_warm_scavenge`` strictly after ``_start_site`` returns.
+
+    The cleanup hook is registered here, before ``runner.setup()`` freezes aiohttp's signal
+    lists; it resolves the import only when a gateway is already stopping.
+    """
+
+    async def _connections_warm_shutdown(_app: web.Application) -> None:
+        try:
+            from kiro_crew.connections.warm import shutdown_warm_mint
+
+            await shutdown_warm_mint()
+        except Exception:  # noqa: BLE001 — one cleanup hook must not suppress later hooks
+            logger.warning("Connections warm shutdown failed", exc_info=True)
+
+    app.on_cleanup.append(_connections_warm_shutdown)
+
+
+def _kick_connections_warm_scavenge(state: DashboardState) -> None:
+    """Start the crash-residue scavenge as a tracked background task, post-bind.
+
+    Called by both gateway entrypoints only after ``_start_site`` has returned, so the
+    listener is already accepting requests. The deferred ``connections.warm`` import
+    happens INSIDE the worker thread: resolving that dependency graph on the event loop
+    would stall in-flight requests just as it would have stalled the bind.
+    """
+
+    def _scavenge_in_thread() -> None:
+        from kiro_crew.connections.warm import scavenge_warm_mint_artifacts
+
+        scavenge_warm_mint_artifacts()
+
+    async def _connections_warm_scavenge() -> None:
+        try:
+            await asyncio.to_thread(_scavenge_in_thread)
+        except Exception:  # noqa: BLE001 — fail closed by retaining unproved residue
+            logger.warning("Connections warm artifact scavenging failed", exc_info=True)
+
+    task = asyncio.create_task(_connections_warm_scavenge())
     state._background_tasks.add(task)
     task.add_done_callback(state._background_tasks.discard)
 
@@ -3304,16 +3383,51 @@ async def start_dashboard(
 
         await init_dev_mode_watcher(state.broadcast_ws)
 
+        # App hook reconciler: the CLI (`kirocrew app enable/disable/install/
+        # uninstall`) mutates apps on disk in a DIFFERENT process and never
+        # notifies this gateway, so a CLI reinstall left the old backend.hooks
+        # module live, its on_startup task running, and its .app_secret stale
+        # (issue #7880). This poll reloads changed hooks in-process — the same
+        # "CLI writes disk, gateway reconciles" contract already used for crons
+        # and UI files. Started AFTER on_gateway_startup so the boot pass has
+        # already recorded its loaded-hook signatures in the shared registry and
+        # the reconciler's first tick sees no drift. Synchronous + IO-free, so it
+        # adds nothing before the dashboard socket binds.
+        init_hook_reconciler(
+            cron_service=state.crons,
+            broadcast_fn=_app_event_broadcast,
+            spawn_impl=_app_spawn,
+        )
+
     app.on_startup.append(_hooks_startup)
 
     async def _hooks_shutdown(app_: web.Application) -> None:
-        await on_gateway_shutdown()
-        # Cancel the app dev-mode watcher started in _hooks_startup so an
-        # in-process gateway restart does not leak the module-global task (which
-        # holds a stale broadcast_ws targeting dead clients). Await cancellation.
+        # Stop the background pollers BEFORE the gateway hook shutdown sweep.
+        # The reconciler and the dev-mode watcher can each LOAD/START app hooks
+        # on a tick; if either is still live while on_gateway_shutdown() tears
+        # hooks down, a poll landing mid-sweep could re-import a module or spawn
+        # an on_startup task AFTER it was torn down, so that app's code would
+        # survive an in-process gateway restart. Cancelling them first also stops
+        # their module-global tasks from leaking stale gateway service handles /
+        # a stale broadcast_ws across the restart. Await cancellation so neither
+        # can fire one more tick during the sweep.
         from kiro_crew.apps.dev_mode import stop_dev_mode_watcher
 
-        await stop_dev_mode_watcher()
+        # on_gateway_shutdown() is the sweep that actually tears down app
+        # backends; it MUST run even if stopping a poller hangs (its bounded
+        # drain can burn its budget) or raises, otherwise a spawned app backend
+        # survives gateway exit. Stop the pollers first (preserving the
+        # no-tick-during-sweep ordering) but never let a stop failure abort the
+        # sweep: catch and log it, then always run on_gateway_shutdown.
+        try:
+            await stop_dev_mode_watcher()
+            await stop_hook_reconciler()
+        except Exception:
+            logger.exception(
+                "Error stopping background pollers on shutdown; proceeding to the "
+                "gateway hook shutdown sweep so app backends are torn down"
+            )
+        await on_gateway_shutdown()
 
     app.on_cleanup.append(_hooks_shutdown)
 
@@ -3519,6 +3633,13 @@ async def start_dashboard(
     # I/O lands on the loop on the first auth op.
     await warm_auth_singletons()
 
+    # Warm the SecurityEventLog singleton off the loop before any handler or
+    # middleware can be its first touch, so a first ``log_api_access`` is a
+    # non-blocking enqueue on every path — call sites need no per-site
+    # ``asyncio.to_thread`` hop (#8608). Best-effort inside the helper: a
+    # failed warm never blocks readiness.
+    await warm_sel_singleton()
+
     # Explicit middleware ordering — self-documenting and immune to future insertions
     app.middlewares[:] = [
         # Outermost: privacy-safe per-route latency (rec #1). Times the FULL
@@ -3623,6 +3744,7 @@ async def start_dashboard(
     # ``_register_instances_hooks`` for why ordering matters.
     _register_instances_hooks(app, state, port)
     _register_browser_view_cleanup(app)
+    _register_connections_warm_lifecycle(app, state)
 
     # Unix-socket cleanup hook — registered before runner.setup freezes the
     # signal lists; the path itself only becomes known after the site starts
@@ -3663,6 +3785,13 @@ async def start_dashboard(
     except OSError:
         await runner.cleanup()
         raise
+
+    # Listener is bound and credentials are published — now kick the warm
+    # crash-residue scavenge. Deliberately NOT an on_startup hook: those run
+    # inside runner.setup(), before the bind, and the scavenge's deferred
+    # import must never sit in front of the listener
+    # (no-new-work-on-gateway-boot-path).
+    _kick_connections_warm_scavenge(state)
 
     # Event-loop heartbeat: proves the asyncio loop is live (the off-loop /proc
     # sampler can't — it runs in a subprocess). Sleeps 10s, then logs actual
@@ -3797,6 +3926,16 @@ async def start_dashboard(
             # per dump — the dump is re-detected for up to 7 days on every
             # start, so notifying unconditionally would alert every restart.
             if await asyncio.to_thread(claim_dump_notification, _prior_dump):
+                # Say who the loop was working for, from the same evidence the
+                # doctor reads, so the person restarting knows which job to look
+                # at without opening the dump.
+                try:
+                    _attr_lines = describe(
+                        await asyncio.to_thread(attribute_dump, _prior_dump, data_home())
+                    )
+                except Exception:
+                    logger.debug("stall attribution for notification failed", exc_info=True)
+                    _attr_lines = []
                 try:
                     state.notify(
                         "heartbeat",
@@ -3804,8 +3943,9 @@ async def start_dashboard(
                         (
                             f"The previous gateway stopped responding and exited "
                             f"{_age_h:.1f}h ago, then restarted. Work in flight at "
-                            f"that moment was interrupted and not saved. Thread "
-                            f"stacks: {_prior_dump}"
+                            f"that moment was interrupted and not saved. "
+                            + ("".join(f"{ln}. " for ln in _attr_lines))
+                            + f"Thread stacks: {_prior_dump}"
                         ),
                         meta={"url": "/settings", "dump": str(_prior_dump)},
                     )
@@ -4316,6 +4456,11 @@ async def start_api_server(
     # (parity with start_dashboard) so no blocking key-file I/O hits the loop.
     await warm_auth_singletons()
 
+    # Warm the SecurityEventLog singleton off the loop (parity with
+    # start_dashboard) so the first audit on this entrypoint is also a
+    # non-blocking enqueue, never an on-loop ``_init_locked`` (#8608).
+    await warm_sel_singleton()
+
     # Explicit ordering mirrors start_dashboard: latency → deny-audit → host →
     # csrf → token → audit.
     app.middlewares[:] = [
@@ -4380,6 +4525,7 @@ async def start_api_server(
     # is what makes headless --slack-only keep the host awake during a long
     # Slack task, identically to the full dashboard.
     _register_prevent_sleep_shutdown(app, state)
+    _register_connections_warm_lifecycle(app, state)
 
     # Unix-socket cleanup hook — same holder pattern as start_dashboard,
     # registered before runner.setup freezes the signal lists.
@@ -4424,6 +4570,11 @@ async def start_api_server(
     except OSError:
         await runner.cleanup()
         raise
+
+    # Listener is bound — kick the warm crash-residue scavenge (parity with
+    # start_dashboard: never an on_startup hook, which would run the deferred
+    # import before the bind).
+    _kick_connections_warm_scavenge(state)
 
     logger.info("API-only server listening on %s:%d", bind_addr, port)
 

@@ -34,7 +34,11 @@ from kiro_crew.acp.client import (
 from kiro_crew.acp.mcp_session_report import McpSessionReport
 from kiro_crew.acp.runtime import AcpRuntime, AcpRuntimeDead, AcpRuntimeError, AcpSessionHandle
 from kiro_crew.acp.session_handle import WatchdogSettings
-from kiro_crew.acp.types import ACP_BACKENDS_KIRO_IDENTITY_STORE, STOP_REASON_END_TURN
+from kiro_crew.acp.types import (
+    ACP_BACKENDS_COMPACT,
+    ACP_BACKENDS_KIRO_IDENTITY_STORE,
+    STOP_REASON_END_TURN,
+)
 from kiro_crew.config.paths import kiro_sessions_dir
 from kiro_crew.constants import COMPACT_WAIT_TIMEOUT_SECS
 from kiro_crew.mcp_gateway.claim import schedule_claim
@@ -396,6 +400,16 @@ class AcpSessionProvider(LLMProvider):
         return self._runtime.is_alive()
 
     @property
+    def process_instance(self) -> str:
+        """Per-spawn identity of the shared runtime's current process (see base).
+
+        A direct read on purpose: a `getattr` hedge would convert a future
+        wiring break into "no banner is ever live", indistinguishable from
+        correct expiry.
+        """
+        return self._runtime.process_instance
+
+    @property
     def exit_code(self) -> int | None:
         """Runtime process exit code (None if still running)."""
         proc = getattr(self._runtime, "_process", None)
@@ -477,6 +491,20 @@ class AcpSessionProvider(LLMProvider):
         session under the kiro label.
         """
         return self._runtime.acp_backend
+
+    @property
+    def manual_compact_unsupported_backend(self) -> str | None:
+        """Backend id when a manual ``/compact`` cannot be served, else ``None``.
+
+        Same ``ACP_BACKENDS_COMPACT`` membership answer as
+        ``AcpProvider.manual_compact_unsupported_backend`` (#7800), for the
+        bare shared-subagent shape that is handed out without the
+        ``AcpProvider`` wrapper.
+        """
+        backend = self.backend
+        if not isinstance(backend, str) or backend in ACP_BACKENDS_COMPACT:
+            return None
+        return backend
 
     @property
     def uses_kiro_identity_store(self) -> bool:
@@ -660,6 +688,11 @@ class AcpSessionProvider(LLMProvider):
         return self._handle.served_model
 
     @property
+    def agent_version(self) -> str:
+        """The version the backing process runs — see :attr:`AcpSessionHandle.agent_version`."""
+        return self._handle.agent_version
+
+    @property
     def _session_id(self) -> str:
         """Session ID (AcpClient-compatible attribute)."""
         return self._handle.session_id
@@ -714,6 +747,15 @@ class AcpSessionProvider(LLMProvider):
     def last_prompt_stats(self):
         """Per-turn statistics (context usage, credits, etc.)."""
         return self._handle.last_prompt_stats
+
+    @property
+    def last_compaction_transient(self) -> bool:
+        """Whether that failure is worth retrying (from the live session handle).
+
+        Coerced to a real ``bool`` because the consumer compares against
+        ``True`` — a truthy stand-in must not read as a verdict.
+        """
+        return getattr(self._handle, "last_compaction_transient", False) is True
 
     # ── Streaming (AcpClient-compatible method name) ──
 

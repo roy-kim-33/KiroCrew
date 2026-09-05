@@ -55,12 +55,13 @@ function rect(top: number, height: number): DOMRect {
   } as DOMRect
 }
 
-function Harness({ items, scrollerRef }: {
+function Harness({ items, scrollerRef, estimatedHeight }: {
   items: Item[]
   scrollerRef: RefObject<HTMLDivElement | null>
+  estimatedHeight?: number
 }) {
   const v = useVirtualChat<Item>({
-    items, sessionId: 'prepend', getKey, overscan: 2, externalScrollerRef: scrollerRef,
+    items, sessionId: 'prepend', getKey, overscan: 2, externalScrollerRef: scrollerRef, estimatedHeight,
   })
   return (
     <div ref={scrollerRef as RefObject<HTMLDivElement>} data-scroller>
@@ -83,14 +84,15 @@ function Harness({ items, scrollerRef }: {
  *  capture resolves the PREVIOUS render's items and must therefore use the
  *  getKey snapshotted with them; this harness is what gives that contract a
  *  failing shape. */
-function PositionalHarness({ items, scrollerRef }: {
+function PositionalHarness({ items, scrollerRef, estimatedHeight }: {
   items: Item[]
   scrollerRef: RefObject<HTMLDivElement | null>
+  estimatedHeight?: number
 }) {
   const keys = items.map((it) => it.id)
   const positionalGetKey = (_it: Item, i: number) => keys[i] ?? `oob-${i}`
   const v = useVirtualChat<Item>({
-    items, sessionId: 'prepend-pos', getKey: positionalGetKey, overscan: 2, externalScrollerRef: scrollerRef,
+    items, sessionId: 'prepend-pos', getKey: positionalGetKey, overscan: 2, externalScrollerRef: scrollerRef, estimatedHeight,
   })
   return (
     <div ref={scrollerRef as RefObject<HTMLDivElement>} data-scroller>
@@ -221,10 +223,10 @@ describe('useVirtualChat: prepend compensation (load older history)', () => {
 
   /** Mounts 30 rows, then scrolls up so stick is released and the window sits
    *  mid-transcript — the state a user reading history is in. */
-  function mountScrolledUp(initial: Item[] = mkItems(30), H: typeof Harness = Harness) {
+  function mountScrolledUp(initial: Item[] = mkItems(30), H: typeof Harness = Harness, estimatedHeight?: number) {
     const scrollerRef: RefObject<HTMLDivElement | null> = { current: null }
     let scrollTop = 0
-    const view = rtlRender(<H items={initial} scrollerRef={scrollerRef} />)
+    const view = rtlRender(<H items={initial} scrollerRef={scrollerRef} estimatedHeight={estimatedHeight} />)
     const el = scrollerRef.current!
     Object.defineProperty(el, 'scrollTop', {
       configurable: true, get: () => scrollTop, set: (v: number) => { scrollTop = v },
@@ -288,6 +290,68 @@ describe('useVirtualChat: prepend compensation (load older history)', () => {
     expect(readScrollTop()).toBeGreaterThan(beforeTop)
   })
 
+  it('anchors by stable id when the ONLY visible row is renamed (phone wLost case)', () => {
+    // Field counters from a real phone: wLost=2 — two landings dropped their
+    // compensation entirely. The viewport there shows ONE giant turn; a
+    // landing regroups it and renames its display key; with key-based anchors
+    // there is no survivor to fall forward to and the capture stands down.
+    // Each such landing is a full-page-height lurch, with no native anchoring
+    // on iOS to soften it. getStableId — the row's TAIL identity — survives
+    // the regroup, so the SAME row anchors across the landing.
+    const scrollerRef: RefObject<HTMLDivElement | null> = { current: null }
+    let scrollTop = 0
+    // Every render renames every display key (generation counter) — the
+    // extreme regroup. Stable ids never change.
+    let generation = 0
+    function StableHarness({ items }: { items: Item[] }) {
+      const v = useVirtualChat<Item>({
+        items, sessionId: 'prepend-stable', overscan: 2, externalScrollerRef: scrollerRef,
+        getKey: (it: Item) => `${it.id}-g${generation}`,
+        getStableId: (it: Item) => it.id,
+      })
+      return (
+        <div ref={scrollerRef as RefObject<HTMLDivElement>} data-scroller>
+          <div ref={v.topSentinelRef} data-sentinel="top" />
+          <div data-spacer="before" style={{ height: v.offsetBefore }} />
+          {v.virtualItems.map((it) => (
+            <div key={it.key} data-index={it.index} data-key={it.key} ref={v.measureRef(it.index)} />
+          ))}
+          <div data-spacer="after" style={{ height: v.offsetAfter }} />
+          <div ref={v.bottomSentinelRef} data-sentinel="bottom" />
+        </div>
+      )
+    }
+    const view = rtlRender(<StableHarness items={mkItems(30)} />)
+    const el = scrollerRef.current!
+    Object.defineProperty(el, 'scrollTop', {
+      configurable: true, get: () => scrollTop, set: (v: number) => { scrollTop = v },
+    })
+    Object.defineProperty(el, 'clientHeight', { configurable: true, get: () => CLIENT })
+    Object.defineProperty(el, 'scrollHeight', { configurable: true, get: () => SCROLL_HEIGHT })
+    installFakeLayout(el, CLIENT)
+    act(() => { frames.forEach((cb) => cb(0)); frames.length = 0 })
+    act(() => { scrollTop = 2160; el.dispatchEvent(new Event('scroll')) })
+    act(() => { frames.forEach((cb) => cb(0)); frames.length = 0 })
+
+    const before = topVisible(el)
+    expect(before).not.toBeNull()
+    const beforeScrollTop = scrollTop
+
+    // The landing: 10 rows prepended AND every display key renamed at once.
+    generation = 1
+    act(() => {
+      view.rerender(<StableHarness items={[...mkItems(10, 'p'), ...mkItems(30)]} />)
+    })
+
+    // The anchored CONTENT (old index i, now i + 10) held its screen position:
+    // resolved through the stable id, since no display key survived.
+    const node = el.querySelector(`[data-index="${before!.idx + 10}"]`) as HTMLElement | null
+    expect(node).not.toBeNull()
+    const after = node!.getBoundingClientRect().top - el.getBoundingClientRect().top
+    expect(Math.abs(after - before!.top)).toBeLessThanOrEqual(1)
+    expect(scrollTop).toBeGreaterThan(beforeScrollTop)
+  })
+
   it('falls forward to a surviving row when regrouping retires the anchor key', () => {
     const { el, view, scrollerRef, readScrollTop } = mountScrolledUp()
 
@@ -317,7 +381,7 @@ describe('useVirtualChat: prepend compensation (load older history)', () => {
     expect(readScrollTop()).toBeGreaterThan(beforeTop)
   })
 
-  it('shows no blank band when a prepend retires EVERY visible key (no anchor to bind)', () => {
+  it('shows no blank band when a prepend retires EVERY visible key (positional anchor)', () => {
     const { el, view, scrollerRef, readScrollTop } = mountScrolledUp()
 
     const visible = visibleByIndex(el)
@@ -325,31 +389,101 @@ describe('useVirtualChat: prepend compensation (load older history)', () => {
     const scrollBefore = readScrollTop()
 
     // A prepend whose commit ALSO retires every previously-visible key (a
-    // wholesale refresh regrouping the transcript). No anchor survives, so the
-    // capture stands down entirely: no stage is set, part 1 never shifts the
-    // window, and the reading position is (acceptably) lost — but the window
-    // must still resolve to a range that covers the viewport, not strand it in
-    // spacer. Pins the deliberate no-anchor design so a future change to the
-    // capture cannot introduce a shift-without-correction path unnoticed.
+    // wholesale refresh re-identifying the transcript). No identity survives
+    // (this harness wires no getStableId, so ids fall back to the retired
+    // keys), so the anchor is re-found by POSITION (old index + nearest
+    // survivor displacement, net count when none) and the correction runs
+    // through the same DOM-measured part-1/part-2 path as a surviving key --
+    // which is what makes it inherently immune to double-compensation
+    // against native CSS scroll anchoring. Before any fallback existed the
+    // reader took the full block height as a lurch (the wLost full-page
+    // fall recorded on a real phone).
     act(() => {
       view.rerender(
         <Harness items={[...mkItems(10, 'p'), ...mkItems(30, 'r')]} scrollerRef={scrollerRef} />,
       )
     })
 
-    // Not vacuous: the old keys are genuinely gone (the anchor had nothing to
-    // bind to) and no correction moved the viewport.
+    // Not vacuous: the old keys are genuinely gone (no key-based anchor could
+    // bind), yet the correction moved the viewport over the inserted content.
+    // The pinned invariant is VISUAL (the positional successor holds the
+    // viewport top, asserted below), not an exact scrollTop: a wholesale
+    // retirement leaves every row estimate-priced, so the spacer above the
+    // anchor can be off by (estimate - real) per row until rows re-measure,
+    // and the DOM-measured delta absorbs that skew by design.
     for (const v of visible) expect(screenTopOf(el, v.key)).toBeNull()
-    expect(readScrollTop()).toBe(scrollBefore)
+    expect(readScrollTop()).toBeGreaterThan(scrollBefore)
 
-    // No blank band: a mounted row still covers the viewport top.
+    // No blank band: a mounted row still covers the viewport top, and it is the
+    // positional successor of the row that was there.
     const after = visibleByIndex(el)
     expect(after.length).toBeGreaterThan(0)
     expect(after[0].top).toBeLessThanOrEqual(1)
+    expect(after[0].idx).toBe(visible[0].idx + 10)
+  })
+
+  it("subtracts the browser's native scroll-anchoring correction from the arithmetic fallback", () => {
+    // Chromium ships CSS scroll anchoring: when rows are inserted above the
+    // reader, the BROWSER adjusts scrollTop at layout time, before our layout
+    // effects read it. The arithmetic fallback (anchor-miss path) must write
+    // only the REMAINDER -- a blind full-height write on top of the native
+    // correction doubles the compensation, and the reader leaps a page
+    // ('skips a long stretch', low-probability field report). jsdom has no
+    // native anchoring, so the sibling tests above pin the full-height write;
+    // this test simulates the native correction with a scrollTop getter that
+    // self-adjusts once the prepended rows are in the DOM.
+    const { el, view, scrollerRef, readScrollTop } = mountScrolledUp()
+    const visible = visibleByIndex(el)
+    expect(visible.length).toBeGreaterThan(0)
+    const scrollBefore = readScrollTop()
+    const insertedPx = 10 * 100
+
+    // Simulated native anchoring: once the regrouped rows are in the DOM
+    // (the commit's mutation -- the capture site's render-phase read still
+    // sees the old keys), the first forced-layout read of scrollTop returns
+    // the browser-corrected value, exactly as Chromium's scroll anchoring
+    // does. Writes go through normally.
+    let base = scrollBefore
+    let nativeApplied = false
+    Object.defineProperty(el, 'scrollTop', {
+      configurable: true,
+      get: () => {
+        if (!nativeApplied && el.querySelector('[data-key^="r"]') !== null) {
+          nativeApplied = true
+          base += insertedPx
+        }
+        return base
+      },
+      set: (v: number) => { base = v },
+    })
+
+    // Same wholesale-regroup prepend as the no-blank-band test: every visible
+    // key retires, so no anchor survives and the fallback path is the one that
+    // runs.
+    act(() => {
+      view.rerender(
+        <Harness items={[...mkItems(10, 'p'), ...mkItems(30, 'r')]} scrollerRef={scrollerRef} />,
+      )
+    })
+
+    // Native correction + our correction must land at no more than ONE
+    // inserted height above the pre-prepend position -- never two. The
+    // positional anchor feeds the DOM-measured part-2 path, which measures
+    // the row's real post-layout offset, so whatever native anchoring
+    // already moved is inherently included rather than added again (the
+    // double-compensation this test exists to forbid). The small downward
+    // slack covers estimate-vs-real spacer pricing after the wholesale
+    // retirement; the hard bound is the upper one. Read through the
+    // instrumented getter (readScrollTop closes over the harness's own
+    // variable, which this test's defineProperty replaced).
+    expect(el.scrollTop).toBeLessThanOrEqual(scrollBefore + insertedPx + 1)
+    expect(el.scrollTop).toBeGreaterThan(scrollBefore + insertedPx - 300)
   })
 
   it('holds the reading position across a prepend when getKey is INDEX-ADDRESSED (ChatPage shape)', () => {
-    const { el, view, scrollerRef, readScrollTop } = mountScrolledUp(mkItems(30), PositionalHarness)
+    // estimate == REAL_H for the same reason as the case above: pin identity
+    // re-finding, not estimate-vs-real pricing drift.
+    const { el, view, scrollerRef, readScrollTop } = mountScrolledUp(mkItems(30), PositionalHarness, REAL_H)
 
     const before = topVisible(el)
     expect(before).not.toBeNull()
@@ -467,6 +601,189 @@ describe('useVirtualChat: prepend compensation (load older history)', () => {
     const after = screenTopOf(el, before!.key)
     expect(after).not.toBeNull()
     expect(Math.abs(after! - before!.top)).toBeLessThanOrEqual(1)
+  })
+
+  it('holds a mid-transcript reader across a TURN-END rebuild (tail grows, tail key changes)', () => {
+    // Turn end is not a prepend: the streaming row is replaced by its server
+    // copy and the refresh may add a row, so the count grows AT THE TAIL while
+    // index 0 is untouched. Nothing above the reader moved, so the reader must
+    // not move either — the failure mode is crediting tail growth as front
+    // growth and writing the height of the FIRST N rows, which displaces a
+    // mid-transcript reader DOWN by a page or more ("I was in the upper part
+    // and the moment your turn ended it jumped down a long way").
+    const { el, view, scrollerRef, readScrollTop } = mountScrolledUp(mkItems(30), Harness, REAL_H)
+
+    const before = visibleByIndex(el)
+    expect(before.length).toBeGreaterThan(0)
+    const beforeTop = readScrollTop()
+
+    act(() => {
+      // Same 30 rows, plus one appended, plus the LAST row re-identified (the
+      // streaming bubble becoming its final server row).
+      const rebuilt = [...mkItems(29), { id: 'm29-final' }, { id: 'm30' }]
+      view.rerender(<Harness items={rebuilt} scrollerRef={scrollerRef} estimatedHeight={REAL_H} />)
+    })
+
+    const after = visibleByIndex(el)
+    expect(after.length).toBeGreaterThan(0)
+    // Same row, same index (nothing was inserted in front), same screen offset.
+    expect(after[0].idx).toBe(before[0].idx)
+    expect(Math.abs(after[0].top - before[0].top)).toBeLessThanOrEqual(1)
+    expect(readScrollTop()).toBe(beforeTop)
+  })
+
+  it('holds the reader by POSITION when a front growth retires every visible key', () => {
+    // estimate == REAL_H: a wholesale retirement reprices previously-measured
+    // rows back to the estimate, so with a skewed estimate the mounted-row
+    // set above the anchor prices differently across the rebuild and the row
+    // sits a few estimate-vs-real quanta off (trigger-7 corrects that drift
+    // separately -- see the heightSyncAnchor suite). This case pins the
+    // IDENTITY contract (re-found by position, same screen offset), so the
+    // pricing dimension is removed rather than slack-tolerated.
+    const { el, view, scrollerRef, readScrollTop } = mountScrolledUp(mkItems(30), Harness, REAL_H)
+
+    const before = visibleByIndex(el)
+    expect(before.length).toBeGreaterThan(0)
+    const beforeTop = readScrollTop()
+
+    // A wholesale transcript rebuild: hundreds of older rows materialise in
+    // front AND every row the reader can see is re-identified (a streamed row
+    // replaced by its server copy under a different key). No key survives for
+    // the anchor to follow, so the row is re-found by where it now sits.
+    const inserted = 1000
+    act(() => {
+      view.rerender(
+        <Harness items={[...mkItems(inserted, 'p'), ...mkItems(30, 'r')]} scrollerRef={scrollerRef} estimatedHeight={REAL_H} />,
+      )
+    })
+
+    const after = visibleByIndex(el)
+    expect(after.length).toBeGreaterThan(0)
+    // The reader is still on the tail region, at the same offset from the end —
+    // not on the first page of the transcript, which is where an uncorrected
+    // window (old indices, old scrollTop) lands once `inserted` rows sit in front.
+    expect(after[0].idx).toBe(before[0].idx + inserted)
+    expect(after[0].key).toBe(`r${before[0].idx}`)
+    expect(Math.abs(after[0].top - before[0].top)).toBeLessThanOrEqual(1)
+    expect(readScrollTop()).toBeGreaterThan(beforeTop)
+  })
+
+  it('holds the reader by POSITION across a total key retirement when getKey is INDEX-ADDRESSED', () => {
+    const { el, view, scrollerRef, readScrollTop } = mountScrolledUp(mkItems(30), PositionalHarness)
+
+    const before = visibleByIndex(el)
+    expect(before.length).toBeGreaterThan(0)
+    const beforeTop = readScrollTop()
+
+    // The positional anchor names a row of the NEW list, so it must be priced by
+    // the CURRENT render's getKey paired with the current items. Pricing it
+    // through the getKey snapshotted with the PREVIOUS items (the pairing the
+    // surviving-key path correctly uses) reads the old list at an index past
+    // its end, yielding a key no mounted row carries: part 1 re-bases the window
+    // but part 2 has nothing to correct against, and the viewport is left in
+    // spacer. An identity getKey cannot tell the two pairings apart; this one can.
+    const inserted = 1000
+    act(() => {
+      view.rerender(
+        <PositionalHarness items={[...mkItems(inserted, 'p'), ...mkItems(30, 'r')]} scrollerRef={scrollerRef} estimatedHeight={REAL_H} />,
+      )
+    })
+
+    const after = visibleByIndex(el)
+    expect(after.length).toBeGreaterThan(0)
+    expect(after[0].idx).toBe(before[0].idx + inserted)
+    expect(after[0].key).toBe(`r${before[0].idx}`)
+    // No blank band and no lost correction: the same screen offset, reached by
+    // a scrollTop write over the inserted content.
+    expect(Math.abs(after[0].top - before[0].top)).toBeLessThanOrEqual(1)
+    expect(readScrollTop()).toBeGreaterThan(beforeTop)
+  })
+
+  it('moves the positional anchor by the nearest SURVIVOR\'s displacement, not the net count growth', () => {
+    const { el, view, scrollerRef, readScrollTop } = mountScrolledUp()
+
+    const before = visibleByIndex(el)
+    expect(before.length).toBeGreaterThan(0)
+    const beforeTop = readScrollTop()
+    const firstVisible = before[0].idx
+
+    // Front growth of 10 AND tail growth of 5 in one commit (a reconnect refresh
+    // catching up on missed rows), with every VISIBLE row re-identified while the
+    // rows above the viewport keep their keys. The reader moved by 10 — the net
+    // count grew by 15. Anchoring by the net count would put them 5 rows past
+    // where they were reading.
+    const front = 10
+    const tail = 5
+    const kept = mkItems(30).slice(0, firstVisible)
+    const reidentified = mkItems(30, 'r').slice(firstVisible)
+    act(() => {
+      view.rerender(
+        <Harness
+          items={[...mkItems(front, 'p'), ...kept, ...reidentified, ...mkItems(tail, 't')]}
+          scrollerRef={scrollerRef}
+        />,
+      )
+    })
+
+    const after = visibleByIndex(el)
+    expect(after.length).toBeGreaterThan(0)
+    expect(after[0].idx).toBe(firstVisible + front)
+    expect(after[0].key).toBe(`r${firstVisible}`)
+    expect(Math.abs(after[0].top - before[0].top)).toBeLessThanOrEqual(1)
+    expect(readScrollTop()).toBeGreaterThan(beforeTop)
+  })
+
+  it('re-bases by the anchored row\'s own displacement when a surviving key is found', () => {
+    const { el, view, scrollerRef } = mountScrolledUp()
+
+    const before = topVisible(el)
+    expect(before).not.toBeNull()
+
+    // Front growth of 3 with a tail growth of 50: the visible row's key survives
+    // and it moved by 3. A re-base by the net count (53) would push the mounted
+    // window 50 rows past the anchor, leaving part 2 nothing to measure.
+    act(() => {
+      view.rerender(
+        <Harness items={[...mkItems(3, 'p'), ...mkItems(30), ...mkItems(50, 't')]} scrollerRef={scrollerRef} />,
+      )
+    })
+
+    const after = screenTopOf(el, before!.key)
+    expect(after).not.toBeNull()
+    expect(Math.abs(after! - before!.top)).toBeLessThanOrEqual(1)
+  })
+
+  it('holds the reader when rows ABOVE them coalesce while the tail grows (negative displacement)', () => {
+    const { el, view, scrollerRef, readScrollTop } = mountScrolledUp()
+
+    const before = topVisible(el)
+    expect(before).not.toBeNull()
+    const beforeTop = readScrollTop()
+
+    // Three rows above the reader collapse into one (index 0 is renamed, the
+    // reader's row moves UP by two) while ten rows append at the tail, so the
+    // count still GROWS by eight. The reader's displacement is -2, not +8: a
+    // re-base by the net count would carry the mounted window eight rows past a
+    // row that moved the other way, and standing down would leave the reader
+    // two rows' height above where they were reading.
+    act(() => {
+      view.rerender(
+        <Harness
+          items={[{ id: 'c0' }, ...mkItems(30).slice(3), ...mkItems(10, 't')]}
+          scrollerRef={scrollerRef}
+        />,
+      )
+    })
+
+    const after = screenTopOf(el, before!.key)
+    expect(after).not.toBeNull()
+    expect(Math.abs(after! - before!.top)).toBeLessThanOrEqual(1)
+    // The hold is a scrollTop write, not a coincidence of the geometry.
+    expect(readScrollTop()).not.toBe(beforeTop)
+    // And the correction left no blank band: a mounted row covers the top.
+    const visible = visibleByIndex(el)
+    expect(visible.length).toBeGreaterThan(0)
+    expect(visible[0].top).toBeLessThanOrEqual(1)
   })
 
   /** Lowest mounted virtual index — proves an upward shift actually happened,
@@ -638,6 +955,136 @@ describe('useVirtualChat: prepend compensation (load older history)', () => {
     const after = screenTopOf(el, before!.key)
     expect(after).not.toBeNull()
     expect(Math.abs(after! - before!.top)).toBeLessThanOrEqual(1)
+  })
+
+  it('holds the reader by POSITION when a splice retires every visible key', () => {
+    const base = mkItems(30)
+    const { el, view, scrollerRef, readScrollTop } = mountScrolledUp(base)
+
+    const before = visibleByIndex(el)
+    expect(before.length).toBeGreaterThan(0)
+    const at = before[0].idx
+    expect(at).toBeGreaterThan(1)
+    const beforeTop = readScrollTop()
+
+    // A "thinking" row mounts above the viewport in the SAME commit that
+    // re-identifies every visible row (each streamed row replaced by its server
+    // copy under a different key). Index 0 keeps its key, so this is the splice
+    // path, not a prepend — and no visible key survives for the anchor to
+    // follow, so the row must be re-found by where it now sits.
+    const rekeyed = base.map((it, i) =>
+      i >= at && i < at + before.length ? { id: `r${i}` } : it,
+    )
+    const spliced = [...rekeyed.slice(0, at - 1), { id: 'ghost' }, ...rekeyed.slice(at - 1)]
+    act(() => { view.rerender(<Harness items={spliced} scrollerRef={scrollerRef} />) })
+
+    // Not vacuous: every previously visible key is genuinely gone, and the
+    // ghost really mounted above the reader.
+    for (const v of before) expect(screenTopOf(el, v.key)).toBeNull()
+    expect(screenTopOf(el, 'ghost')).not.toBeNull()
+
+    // The topmost visible row is the positional successor of the row that was
+    // there, held at the same screen offset by a scrollTop write over the
+    // inserted row — without the positional anchor it moves down by the
+    // inserted row's height.
+    const after = visibleByIndex(el)
+    expect(after.length).toBeGreaterThan(0)
+    expect(after[0].idx).toBe(at + 1)
+    expect(after[0].key).toBe(`r${at}`)
+    expect(Math.abs(after[0].top - before[0].top)).toBeLessThanOrEqual(1)
+    expect(readScrollTop()).toBeGreaterThan(beforeTop)
+  })
+
+  it('holds the reader by POSITION across a splice-with-total-retirement when getKey is INDEX-ADDRESSED', () => {
+    // The positional anchor names a row of the NEW list, so it must be priced
+    // by the CURRENT render's getKey paired with the current items — the same
+    // pairing contract PR 8001 pinned for the prepend fallback. An identity
+    // getKey cannot tell the two pairings apart; this one can.
+    const base = mkItems(30)
+    const { el, view, scrollerRef, readScrollTop } = mountScrolledUp(base, PositionalHarness)
+
+    const before = visibleByIndex(el)
+    expect(before.length).toBeGreaterThan(0)
+    const at = before[0].idx
+    expect(at).toBeGreaterThan(1)
+    const beforeTop = readScrollTop()
+
+    const rekeyed = base.map((it, i) =>
+      i >= at && i < at + before.length ? { id: `r${i}` } : it,
+    )
+    const spliced = [...rekeyed.slice(0, at - 1), { id: 'ghost' }, ...rekeyed.slice(at - 1)]
+    act(() => { view.rerender(<PositionalHarness items={spliced} scrollerRef={scrollerRef} />) })
+
+    for (const v of before) expect(screenTopOf(el, v.key)).toBeNull()
+    expect(screenTopOf(el, 'ghost')).not.toBeNull()
+
+    const after = visibleByIndex(el)
+    expect(after.length).toBeGreaterThan(0)
+    expect(after[0].idx).toBe(at + 1)
+    expect(after[0].key).toBe(`r${at}`)
+    expect(Math.abs(after[0].top - before[0].top)).toBeLessThanOrEqual(1)
+    expect(readScrollTop()).toBeGreaterThan(beforeTop)
+  })
+
+  it('does not anchor the inserted row when the splice lands exactly at the viewport top', () => {
+    const base = mkItems(30)
+    const { el, view, scrollerRef, readScrollTop } = mountScrolledUp(base)
+
+    const before = visibleByIndex(el)
+    expect(before.length).toBeGreaterThan(0)
+    const at = before[0].idx
+    expect(at).toBeGreaterThan(1)
+    const beforeTop = readScrollTop()
+
+    // The ghost mounts AT the topmost visible row's own index while every
+    // visible key retires. Rows above the viewport keep their keys but did NOT
+    // move (they sit above the splice): borrowing their zero displacement
+    // would resolve the anchor to the ghost itself and hold the wrong row.
+    // The change boundary excludes them, so the displacement comes from the
+    // survivors below (+1).
+    const rekeyed = base.map((it, i) =>
+      i >= at && i < at + before.length ? { id: `r${i}` } : it,
+    )
+    const spliced = [...rekeyed.slice(0, at), { id: 'ghost' }, ...rekeyed.slice(at)]
+    act(() => { view.rerender(<Harness items={spliced} scrollerRef={scrollerRef} />) })
+
+    // Not vacuous: every previously visible key is genuinely gone, and the
+    // ghost really mounted.
+    for (const v of before) expect(screenTopOf(el, v.key)).toBeNull()
+    expect(screenTopOf(el, 'ghost')).not.toBeNull()
+
+    // The reader's row (its re-keyed copy, now one index down) is held at its
+    // screen offset; anchoring the ghost instead would leave it one row lower
+    // with no scrollTop write.
+    const held = screenTopOf(el, `r${at}`)
+    expect(held).not.toBeNull()
+    expect(Math.abs(held! - before[0].top)).toBeLessThanOrEqual(1)
+    expect(readScrollTop()).toBeGreaterThan(beforeTop)
+  })
+
+  it('does not anchor the inserted row at the viewport top when getKey is INDEX-ADDRESSED', () => {
+    const base = mkItems(30)
+    const { el, view, scrollerRef, readScrollTop } = mountScrolledUp(base, PositionalHarness)
+
+    const before = visibleByIndex(el)
+    expect(before.length).toBeGreaterThan(0)
+    const at = before[0].idx
+    expect(at).toBeGreaterThan(1)
+    const beforeTop = readScrollTop()
+
+    const rekeyed = base.map((it, i) =>
+      i >= at && i < at + before.length ? { id: `r${i}` } : it,
+    )
+    const spliced = [...rekeyed.slice(0, at), { id: 'ghost' }, ...rekeyed.slice(at)]
+    act(() => { view.rerender(<PositionalHarness items={spliced} scrollerRef={scrollerRef} />) })
+
+    for (const v of before) expect(screenTopOf(el, v.key)).toBeNull()
+    expect(screenTopOf(el, 'ghost')).not.toBeNull()
+
+    const held = screenTopOf(el, `r${at}`)
+    expect(held).not.toBeNull()
+    expect(Math.abs(held! - before[0].top)).toBeLessThanOrEqual(1)
+    expect(readScrollTop()).toBeGreaterThan(beforeTop)
   })
 
   it('still follows to the bottom when a row is SPLICED IN while PINNED', () => {

@@ -535,6 +535,7 @@ def file_lock(
     *,
     exclusive: bool = True,
     required: bool = False,
+    wait: bool = True,
 ) -> Iterator[None]:
     """Acquire an advisory lock on ``fd`` for the duration of the block.
 
@@ -557,12 +558,28 @@ def file_lock(
     the outcome (both paths refuse to proceed without the lock). On POSIX the
     acquire blocks until the lock is free, as before.
 
+    *wait* is for a caller whose work is OPTIONAL and retried later, and which
+    may run on the event-loop thread: with ``wait=False`` the acquire is
+    single-shot on every platform and raises :class:`BlockingIOError` at once
+    when the lock is held, instead of blocking the loop for as long as the holder
+    keeps it. POSIX gets that from ``LOCK_NB``; Windows already behaves this way
+    on the loop thread, and a zero timeout makes it uniform off the loop too.
+    ``BlockingIOError`` is an ``OSError``, so it is a NARROWING of what a caller
+    already had to handle, and it separates "someone else is writing right now"
+    from the stuck-holder ceiling above. It changes only how long we are willing
+    to wait, never whether the critical section is serialized -- a contended
+    ``wait=False`` acquire raises rather than proceeding.
+
     Note: on Windows, ``msvcrt.locking`` requires seeking to byte 0, so the
     ``fd`` must be a dedicated lock file; callers must not rely on the file
     offset being preserved across the context manager boundary.
     """
     if IS_POSIX:
         mode = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+        if not wait:
+            # BlockingIOError (an OSError) when held: same fail-closed contract
+            # as the Windows branch, reported by the platform rather than by us.
+            mode |= fcntl.LOCK_NB
         fcntl.flock(fd, mode)
         try:
             yield
@@ -579,9 +596,17 @@ def file_lock(
         # strictly safer, and callers already run under `with`, so the fd is
         # cleaned up. `required` is retained for call-site intent but no longer
         # changes the outcome — both paths now refuse to proceed lock-less.
-        if not _win_acquire_blocking(fd):
+        timeout = _WIN_LOCK_TIMEOUT_SECS if wait else 0.0
+        # Called with no keyword on the waiting path, so the default-argument
+        # call shape existing tests stub out stays exactly as it was.
+        acquired = _win_acquire_blocking(fd) if wait else _win_acquire_blocking(fd, timeout=0.0)
+        if not acquired:
+            if not wait:
+                # Held right now. BlockingIOError so the caller can tell this
+                # from the stuck-holder ceiling below, matching POSIX LOCK_NB.
+                raise BlockingIOError("file lock is held; not waiting for it")
             raise OSError(
-                f"could not acquire exclusive file lock within {_WIN_LOCK_TIMEOUT_SECS:g}s "
+                f"could not acquire exclusive file lock within {timeout:g}s "
                 "(a holder is stuck); refusing to proceed unserialized"
             )
         try:
@@ -914,6 +939,17 @@ _DARWIN_PROC_BSDINFO_SIZE = 136
 _DARWIN_PBI_START_TVSEC_OFFSET = 120
 _DARWIN_PBI_START_TVUSEC_OFFSET = 128
 
+# ``proc_pidinfo(PROC_PIDTASKINFO)`` fills a ``proc_taskinfo`` struct that opens
+# with six uint64 fields — ``pti_virtual_size``, ``pti_resident_size``,
+# ``pti_total_user``, ``pti_total_system``, ``pti_threads_user``,
+# ``pti_threads_system`` (48 bytes) — followed by twelve int32 counters (48),
+# for a struct size of 96. Only the two total-CPU fields matter here, and both
+# are already NANOSECONDS; the total size doubles as the layout check.
+_DARWIN_PROC_PIDTASKINFO = 4
+_DARWIN_PROC_TASKINFO_SIZE = 96
+_DARWIN_PTI_TOTAL_USER_OFFSET = 16
+_DARWIN_PTI_TOTAL_SYSTEM_OFFSET = 24
+
 _darwin_libproc: Any = None
 _darwin_libproc_loaded = False
 
@@ -1013,6 +1049,41 @@ def _darwin_process_start_microtime(pid: int) -> str | None:
         if sec <= 0:
             return None
         return f"{sec}.{usec:06d}"
+    except Exception:
+        return None
+
+
+def _darwin_process_cpu_nanos(pid: int) -> int | None:
+    """macOS total (user+system) CPU nanoseconds of *pid* via ``libproc``.
+
+    Same contract as the start-time probe above: no entitlement is needed for a
+    same-uid process, nothing is exec'd, and a fill size other than the exact
+    struct size means the assumed layout no longer matches, so the answer is
+    refused rather than sliced out of the wrong place.
+    """
+    lib = _darwin_libproc_handle()
+    if lib is None:
+        return None
+    try:
+        buf = ctypes.create_string_buffer(_DARWIN_PROC_TASKINFO_SIZE)
+        filled = lib.proc_pidinfo(
+            pid,
+            _DARWIN_PROC_PIDTASKINFO,
+            0,
+            buf,
+            _DARWIN_PROC_TASKINFO_SIZE,
+        )
+        if filled != _DARWIN_PROC_TASKINFO_SIZE:
+            return None
+        # Both x86_64 and arm64 macOS are little-endian.
+        user = int.from_bytes(
+            buf.raw[_DARWIN_PTI_TOTAL_USER_OFFSET:_DARWIN_PTI_TOTAL_SYSTEM_OFFSET], "little"
+        )
+        system = int.from_bytes(
+            buf.raw[_DARWIN_PTI_TOTAL_SYSTEM_OFFSET : _DARWIN_PTI_TOTAL_SYSTEM_OFFSET + 8],
+            "little",
+        )
+        return user + system
     except Exception:
         return None
 
@@ -4704,6 +4775,75 @@ def _proc_cpu_jiffies(pid: int) -> int:
             return _parse_cpu_jiffies(fh.read())
     except OSError:
         return 0
+
+
+def proc_cpu_nanos_for_pid(pid: int) -> int | None:
+    """Total (user+system) CPU time of *pid* in NANOSECONDS, or None.
+
+    The per-pid, cross-platform counterpart to :func:`proc_cpu_seconds`, which
+    can only measure the CALLING process. A caller samples this twice and
+    consumes the DELTA as evidence that a process is doing work; ``None`` means
+    no per-pid counter is readable on this host, which is evidence of neither
+    work nor death.
+
+    - Linux: ``_proc_cpu_jiffies`` scaled by ``SC_CLK_TCK``. Never None — an
+      unreadable pid reads 0 there, which a delta correctly sees as flat.
+    - macOS: ``libproc.proc_pidinfo(PROC_PIDTASKINFO)``, already nanoseconds.
+    - Windows: ``GetProcessTimes`` kernel+user (100-ns units) over a query-only
+      handle.
+    - Any other platform: None.
+
+    Root pid ONLY — deliberately no subtree walk, because neither macOS nor
+    Windows has a child enumeration cheap enough for a probe on a read loop's
+    cadence. A caller that needs the subtree total and knows it is on Linux uses
+    :func:`proc_subtree_sample` instead.
+    """
+    if type(pid) is not int or pid <= 0:
+        return None
+    if IS_LINUX:
+        try:
+            ticks = os.sysconf("SC_CLK_TCK") or 100
+        except (AttributeError, OSError, ValueError):
+            ticks = 100
+        return _proc_cpu_jiffies(pid) * (1_000_000_000 // ticks)
+    if IS_MACOS:
+        return _darwin_process_cpu_nanos(pid)
+    if not IS_WINDOWS:
+        return None
+    handle = _open_process_query_handle(pid)
+    if handle is None:
+        return None
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+        kernel32.GetProcessTimes.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+        ]
+        kernel32.GetProcessTimes.restype = wintypes.BOOL
+        creation = wintypes.FILETIME()
+        exited = wintypes.FILETIME()
+        kernel = wintypes.FILETIME()
+        user = wintypes.FILETIME()
+        if not kernel32.GetProcessTimes(
+            wintypes.HANDLE(handle),
+            ctypes.byref(creation),
+            ctypes.byref(exited),
+            ctypes.byref(kernel),
+            ctypes.byref(user),
+        ):
+            return None
+
+        def _hundred_ns(value: "wintypes.FILETIME") -> int:
+            return (value.dwHighDateTime << 32) | value.dwLowDateTime
+
+        return (_hundred_ns(kernel) + _hundred_ns(user)) * 100
+    except Exception:
+        return None
+    finally:
+        _close_process_handle(handle)
 
 
 class SubtreeSample(NamedTuple):

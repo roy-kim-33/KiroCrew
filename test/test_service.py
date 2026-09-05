@@ -163,7 +163,11 @@ class TestLinuxUnitRendering:
         # `in unit` check for the prefix passes even if the flag is dropped,
         # because the prefix is still a substring of the shorter line.
         assert 'ExecStart="/home/u/.toolbox/bin/kirocrew" gateway --no-open' in unit
-        assert "Restart=on-failure" in unit
+        # `always`, not `on-failure`: the stale-asset watchdog exits the
+        # gateway cleanly so the supervisor relaunches a fresh install, and
+        # on-failure never restarts an exit 0 (gateway stranded for hours).
+        assert "Restart=always" in unit
+        assert "Restart=on-failure" not in unit
         assert "RestartSec=10" in unit
         # System-level unit must run as the invoking user with the user's
         # actual primary group (which on Amazon Linux is `amazon`, not the
@@ -4253,7 +4257,7 @@ class TestHeadlessApiKeyWarning:
         assert warning, "a dropped credential must produce a warning"
         assert self.API_KEY in warning
         assert str(dotenv) in warning, "the warning must name the file to edit"
-        assert "kirocrew service restart" in warning
+        assert common.restart_command_hint() in warning
 
     def test_the_signed_out_claim_is_qualified(self, monkeypatch, tmp_path):
         """A login credential store under the baked `HOME` can still authenticate.

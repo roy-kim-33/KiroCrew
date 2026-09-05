@@ -338,8 +338,16 @@ def _safe_dict(value: object) -> dict:
     return value if isinstance(value, dict) else {}
 
 
-def _resolve_stub_servers(mcp_gateway_data: dict) -> list[str]:
-    """Which MCP servers are given a stub.
+def _resolve_stub_roster(mcp_gateway_data: dict) -> list[str]:
+    """The stub set as CONFIGURED, before the operator's own deviations.
+
+    This is the layer a distribution owns: an edition that wants its known
+    servers stubbed out of the box ships them here, and keeps shipping them as
+    the roster grows. Operator deviations live in ``stub_overrides`` and are
+    applied over this by :func:`_resolve_stub_servers` — which is what lets the
+    two move independently. Read this directly ONLY to answer "what does the
+    roster say"; everything that wants the set actually in effect wants
+    :func:`_resolve_stub_servers`.
 
     ``poolable_servers`` is the deprecated spelling and is consulted ONLY when
     ``stub_servers`` is absent from the file. Key presence, not truthiness, is
@@ -363,6 +371,59 @@ def _resolve_stub_servers(mcp_gateway_data: dict) -> list[str]:
     else:
         source = None
     return [s for s in _safe_list(source) if isinstance(s, str) and s]
+
+
+def _resolve_stub_overrides(mcp_gateway_data: dict) -> dict[str, bool]:
+    """The operator's per-server stub DECISIONS — what they changed, not the result.
+
+    Sparse by construction, and that is the whole point. A flat resulting list
+    can only be REPLACED: an operator who unstubs one server out of a shipped
+    roster would have to restate the survivors, and that restated list then
+    shadows the roster permanently — the next name the distribution adds never
+    reaches them, because their file already answers the question. Recording the
+    DECISION instead leaves every server they did not speak about following the
+    roster.
+
+    Absent means "no opinion", which is why a key whose value equals the roster's
+    answer is pruned on write rather than stored: an override that agrees with
+    its base is indistinguishable from silence in effect, but not in future —
+    stored, it would freeze that server against a later roster change, which is
+    the shadowing this map exists to avoid.
+
+    Non-bool values are dropped rather than coerced. A truthy string here would
+    be an operator's typo, and guessing which way they meant it is worse than
+    leaving that server on the roster's answer.
+    """
+    raw = _safe_dict(mcp_gateway_data.get("stub_overrides"))
+    return {
+        name: value
+        for name, value in raw.items()
+        if isinstance(name, str) and name and isinstance(value, bool)
+    }
+
+
+def _resolve_stub_servers(mcp_gateway_data: dict) -> list[str]:
+    """Which MCP servers are given a stub, roster and operator decisions together.
+
+    The set in EFFECT: :func:`_resolve_stub_roster` supplies the configured base
+    and :func:`_resolve_stub_overrides` the operator's deviations from it, so a
+    distribution can grow the roster without overwriting a choice the operator
+    made, and the operator can turn any single server off without pinning
+    themselves to today's roster.
+
+    Roster order is preserved (the resolver has always handed back what the file
+    held, duplicates included, and ``_freeze_stub_servers`` is what normalizes on
+    write); servers added by an override are appended in sorted order, because
+    they have no position in the file to preserve.
+    """
+    roster = _resolve_stub_roster(mcp_gateway_data)
+    overrides = _resolve_stub_overrides(mcp_gateway_data)
+    if not overrides:
+        return roster
+    resolved = [name for name in roster if overrides.get(name, True)]
+    already = set(resolved)
+    resolved.extend(name for name, on in sorted(overrides.items()) if on and name not in already)
+    return resolved
 
 
 def _safe_float(
@@ -412,6 +473,89 @@ def _safe_color(value: object) -> str:
     if _COLOR_HEX_RE.match(v):
         return v
     return ""
+
+
+#: String-valued ghost trait axes accepted in a per-crew avatar override.
+_AVATAR_GHOST_STR_TRAITS = ("eyes", "brows", "mouth", "accessory", "prop")
+#: Boolean-valued ghost trait axes.
+_AVATAR_GHOST_BOOL_TRAITS = ("blush", "flip")
+#: Cap on a single trait value, so hand-written junk cannot bloat config.json.
+_AVATAR_TRAIT_MAX_LEN = 32
+#: Formats an uploaded crew picture may be stored in. Shared with the avatar
+#: endpoints: the config's ``file`` pin and the files on disk speak this set.
+_AVATAR_IMAGE_EXTS = ("png", "jpg", "webp")
+#: The config's committed-picture pin: ``<16-hex content digest>.<ext>``.
+#: Each install lands at a digest-named path that never collides with the
+#: currently committed file, so nothing overwrites a committed picture before
+#: the config save that commits its replacement.
+_AVATAR_FILE_PIN_RE = _re.compile(r"^[0-9a-f]{16}\.(?:png|jpg|webp)$")
+
+
+def _safe_avatar(value: object) -> dict:
+    """Return a validated per-crew avatar override, or ``{}`` on junk.
+
+    Accepted shapes:
+
+    - ``{"kind": "ghost", "traits": {...}}`` — pins the ghost face
+      trait-by-trait instead of deriving it from the crew name.
+    - ``{"kind": "image"}`` (optional int ``v``, optional ``file``) — the crew
+      wears an uploaded picture, served from ``GET /api/agents/{name}/avatar``.
+      The file itself lives under the data home's agent-fenced
+      ``run/avatars/`` dir; the config
+      field only marks the choice. ``v`` is the upload's cache-busting stamp
+      (file mtime, nanoseconds): the frontend appends it as ``?v=`` so a
+      replaced picture is re-fetched without waiting out the browser cache.
+      ``file`` pins the exact committed file — a ``<digest>.<ext>`` suffix
+      under the crew's stem. Every install lands at a digest-named path, so a
+      replacement never overwrites the committed file before the config save
+      commits it, and serving resolves only the pinned file.
+
+    Empty means "no override" — the frontend keeps rendering the name-seeded
+    face. config.json is hand-editable (and agent-writable), so junk collapses
+    to ``{}`` rather than crashing the load.
+
+    Trait *values* are deliberately not checked against the frontend's trait
+    vocabulary: the renderer resolves an unknown option to "absent"
+    (``EYES[k] ?? ''``), and keeping the vocabulary in one place (the style
+    module) means a new hat needs no backend release. ``tile`` is the one
+    exception — it is interpolated into SVG markup, so it is pinned to a hex
+    color by the same validator session_color uses.
+    """
+    if not isinstance(value, dict):
+        return {}
+    if value.get("kind") == "image":
+        out: dict[str, object] = {"kind": "image"}
+        v = value.get("v")
+        # bool is an int subclass; a hand-written `"v": true` must not pass.
+        if isinstance(v, int) and not isinstance(v, bool) and v > 0:
+            out["v"] = v
+        f = value.get("file")
+        if isinstance(f, str) and _AVATAR_FILE_PIN_RE.fullmatch(f):
+            out["file"] = f
+        return out
+    if value.get("kind") != "ghost":
+        return {}
+    raw = value.get("traits")
+    if not isinstance(raw, dict):
+        return {}
+    traits: dict[str, object] = {}
+    for key in _AVATAR_GHOST_STR_TRAITS:
+        v = raw.get(key, "")
+        traits[key] = v[:_AVATAR_TRAIT_MAX_LEN] if isinstance(v, str) else ""
+    for key in _AVATAR_GHOST_BOOL_TRAITS:
+        # `is True`, not bool(): config.json is hand-editable and
+        # bool("false") is True, so a string-typed value would render the
+        # opposite of what its author wrote. Only a real boolean counts.
+        traits[key] = raw.get(key, False) is True
+    traits["tile"] = _safe_color(raw.get("tile", ""))
+    # An all-empty trait set (every axis absent) is indistinguishable in
+    # intent from "no override" but would render a featureless ghost. The
+    # builder cannot produce it (Apply always carries the seeded defaults), so
+    # it only arrives via hand-written config or direct API use — collapse it
+    # to the one canonical "reset" spelling instead of storing a third state.
+    if all(not v for v in traits.values()):
+        return {}
+    return {"kind": "ghost", "traits": traits}
 
 
 def _meta(label: str, help: str, **kwargs: object) -> dict:
@@ -588,6 +732,20 @@ class AgentConfig:
             # single gate (it logs the reason it degrades), and
             # ``GET /api/config/schema`` supplies the live values the dashboard
             # renders. See harness-parity H4.
+        ),
+    )
+    member_acp_backend: str = field(
+        default="kas",
+        metadata=_meta(
+            "Crew member ACP backend",
+            "Backend for crew-member DM sessions: 'kas' (default) or 'claude'. "
+            "Members dispatch work into worker sessions through session-control "
+            "tools mounted per session over the wire, which the kiro-cli v2 "
+            "backend cannot carry — a value resolving to kiro leaves member "
+            "threads as plain chat (no dispatch tools), logged at session start.",
+            # Same no-enum reasoning as acp_backend above: the live selectable
+            # set comes from the registry via resolve_selected_backend, never a
+            # frozen literal.
         ),
     )
     default_agent: str = field(
@@ -1018,18 +1176,21 @@ class AgentConfig:
         ),
     )
     session_control: bool = field(
-        default=False,
+        default=True,
         metadata=_meta(
             "Session Control",
-            "Let one chat session open a new session, and stop or read another "
-            "session of yours. No session writes into another session's "
-            "conversation: reading returns a transcript tail, stopping cancels an "
-            "in-flight turn, and a created session starts empty for you to type "
-            "into. Off by default: the three tools ride on a server you may "
-            "already have assigned for other work, so reaching another session "
-            "waits for you to grant it here rather than arriving with an upgrade. "
-            "Sessions can only reach peers in the same workspace; incognito, "
-            "app-scoped and scheduled sessions are never addressable.",
+            "Let one chat session open a new session, and stop, read or send to "
+            "another session of yours. Reading returns a transcript tail, stopping "
+            "cancels an in-flight turn, a created session starts empty for you to "
+            "type into, and a send runs text as the target's next turn. On by "
+            "default, because the grant that decides who can do this is the agent "
+            "config: the tools come from the kirocrew-dashboard MCP server, so an "
+            "agent that does not mount it never has them, exactly like any other "
+            "MCP server. Turn this off to withdraw the capability from every agent "
+            "at once without editing each spec. Sessions can only reach peers in "
+            "the same workspace; incognito, app-scoped and scheduled sessions are "
+            "never addressable, and a crew member or a scheduled run reaches only "
+            "sessions it created itself.",
         ),
     )
     subagent_cost_gb: float = field(
@@ -1634,34 +1795,6 @@ class KnowledgeConfig:
             "Renamed from auto_ingest_doc_links, which is still accepted.",
         ),
     )
-    auto_register_project_docs: bool = field(
-        default=False,
-        metadata=_meta(
-            "Auto-Register Project Documents",
-            "Register the documents of each project you work in as a Knowledge "
-            "source automatically, so a project's design docs, specs and READMEs "
-            "become searchable without adding the folder by hand. Only documents "
-            "are taken (.md/.pdf/.docx/.org above a small size floor, excluding "
-            "agent instructions, generated files and repository boilerplate) -- "
-            "never source code. There is no confirmation step once enabled: the "
-            "document filter and the per-sweep chunk budget below bound the cost, "
-            "and deleting the source keeps it deleted. Off by default, because "
-            "registering a repository is a decision to spend extraction calls on "
-            "it -- turning this on opts in every project you open.",
-        ),
-    )
-    auto_ingest_chunk_budget: int = field(
-        default=150,
-        metadata=_meta(
-            "Auto-Ingest Chunk Budget",
-            "Chunks an automatically-registered source may ingest per watcher "
-            "sweep. Each chunk costs one LLM extraction call, so this is what "
-            "actually bounds the cost of auto-registration -- file filters bound "
-            "pollution, not spend. Newest documents land first and the rest "
-            "trickle in on later sweeps, so a new project never arrives as a "
-            "burst. 0 removes the bound.",
-        ),
-    )
     folder_ingest_chunk_budget: int = field(
         default=300,
         metadata=_meta(
@@ -1712,17 +1845,6 @@ class KnowledgeConfig:
             "0 removes the bound.",
         ),
     )
-    max_sources: int = field(
-        default=50,
-        metadata=_meta(
-            "Max Sources",
-            "Maximum number of Knowledge sources that may be registered. "
-            "Prevents unbounded auto-discovery from registering hundreds of "
-            "sources when many projects are open. Registration attempts past "
-            "the cap are skipped (auto) or rejected (manual). 0 removes the "
-            "bound.",
-        ),
-    )
     embed_rate_limit: int = field(
         default=120,
         metadata=_meta(
@@ -1750,30 +1872,6 @@ class KnowledgeConfig:
             "Number of concurrent LLM workers for document extraction. More "
             "workers = faster ingestion but higher peak cost. Each worker holds "
             "a long-lived session. Requires restart to take effect.",
-        ),
-    )
-    auto_discover_folder: bool = field(
-        default=False,
-        metadata=_meta(
-            "Auto-Discover Documents Folder",
-            "Watch for a documents folder inside the active workspace and "
-            "register it as a Knowledge source automatically, so files dropped "
-            "there become searchable without adding the source by hand. The "
-            "folder is never created for you: its absence means you have not "
-            "opted in, and it is picked up within one watcher sweep of being "
-            "created -- no restart needed. Off by default because ingestion "
-            "spends LLM extraction on every supported file in the folder.",
-        ),
-    )
-    auto_discover_dirname: str = field(
-        default="knowledge-docs",
-        metadata=_meta(
-            "Documents Folder Name",
-            "Name of the folder inside the workspace that auto-discovery looks "
-            "for. A single path segment -- separators and traversal are rejected "
-            "so the source cannot be redirected outside the workspace. Avoid "
-            "'knowledge': that is where the Library's own SQLite store lives and "
-            "it always exists, which would defeat discovery.",
         ),
     )
 
@@ -2909,6 +3007,17 @@ class KiroCrewAgentConfig:
             deprecated=True,
         ),
     )
+    avatar: dict = field(
+        default_factory=dict,
+        metadata=_meta(
+            "Avatar",
+            "Per-crew avatar override. Empty means the face is derived from "
+            "the crew's name. {'kind': 'ghost', 'traits': {...}} pins explicit "
+            "ghost traits chosen in the avatar builder; {'kind': 'image'} "
+            "means an uploaded picture served from the per-crew avatar "
+            "endpoint.",
+        ),
+    )
 
 
 @dataclass
@@ -3538,11 +3647,9 @@ EXTRACTION_POOL_SIZE_MAX = 10
 # keeps returning the default for a negative value. Only the missing CEILING is
 # added here, which is where the actual exposure was: an absurd hand-edited
 # budget was loaded verbatim and became real work.
-AUTO_INGEST_CHUNK_BUDGET_MAX = 10000
 FOLDER_INGEST_CHUNK_BUDGET_MAX = 10000
 DEDUP_EVERY_N_SWEEPS_MAX = 288
 SWEEP_CHUNK_BUDGET_MAX = 50000
-KNOWLEDGE_MAX_SOURCES_MAX = 1000
 EMBED_RATE_LIMIT_MAX = 10000
 
 
@@ -3629,6 +3736,16 @@ _VALID_CHANNEL_PREFIXES = ("C", "D", "G")
 _WARNED_STT_PROVIDERS: set[str] = set()
 
 
+def stt_provider_is_coerced(value: object) -> bool:
+    """True when a stored ``stt.provider`` cannot take effect and is replaced.
+
+    The single source of truth for "this stored value is inert", so the surface that
+    offers to remove it (``kirocrew config defaults``) cannot come to disagree with
+    the loader about which providers are dispatchable.
+    """
+    return value not in _VALID_STT_PROVIDERS
+
+
 def _validated_stt_provider(value: object) -> str:
     """Return *value* if it is selectable, else degrade to ``local`` with a reason.
 
@@ -3636,6 +3753,11 @@ def _validated_stt_provider(value: object) -> str:
     an unusable one must leave voice input working the way
     :func:`_normalize_acp_backend` degrades an unusable persisted backend, rather
     than failing the load that read it.
+
+    The notice names the command that removes the dead value. A load never writes,
+    so without that pointer the line repeats on every invocation forever -- and
+    unlike a superseded default there is nothing here to preserve, since the stored
+    value cannot take effect either way.
     """
     if value in _VALID_STT_PROVIDERS:
         return str(value)
@@ -3647,13 +3769,15 @@ def _validated_stt_provider(value: object) -> str:
         logger.warning(
             "STT provider %r is retired; using %r instead. It needed a separate "
             "out-of-band install, which the bundled local engine removes while "
-            "recognising the same speech.",
+            "recognising the same speech. Run 'kirocrew config defaults --adopt' "
+            "to drop the stored value and this notice.",
             value,
             STT_PROVIDER_LOCAL,
         )
     else:
         logger.warning(
-            "Unknown STT provider %r; using %r instead. Selectable providers: %s",
+            "Unknown STT provider %r; using %r instead. Selectable providers: %s. "
+            "Run 'kirocrew config defaults --adopt' to drop the stored value.",
             value,
             STT_PROVIDER_LOCAL,
             ", ".join(_VALID_STT_PROVIDERS),
@@ -4265,6 +4389,50 @@ class McpGatewayConfig:
             "stub set.",
         ),
     )
+    stub_overrides: dict[str, bool] = field(
+        default_factory=dict,
+        metadata=_meta(
+            "Stub Overrides",
+            "Per-server deviations from stub_servers: a name mapped to true is "
+            "stubbed even when the roster omits it, false leaves it direct even "
+            "when the roster carries it. Holds what you CHANGED, not the result, "
+            "so a name you never touched keeps following the roster — which is "
+            "what lets an edition that ships its own stub_servers grow that list "
+            "without overwriting your choices, and lets you turn one server off "
+            "without pinning yourself to today's roster. Written by MCP "
+            "Management when a toggle disagrees with the roster, and dropped "
+            "again when you toggle it back to agree. Empty by default.",
+        ),
+    )
+    #: The roster EXACTLY as the file states it, carried so a full-file rewrite
+    #: can put it back.
+    #:
+    #: :attr:`stub_servers` above holds the EFFECTIVE set, because that is what all
+    #: seven of its consumers want (routing, the page's rows, ``stub_count``, the
+    #: doctor). But ``save()`` round-trips this dataclass through ``asdict``, so a
+    #: field whose value differs from the file's is a landmine: emitting the
+    #: effective set would rewrite ``stub_servers`` without the servers the operator
+    #: opted out of, turning a reversible deviation into a permanent deletion from a
+    #: layer that is not ours to edit -- and it would happen on any unrelated
+    #: ``save()``. Carrying the roster lets :meth:`KiroCrewConfig.to_dict` emit the
+    #: file's own value instead.
+    #:
+    #: Excluded from serialization (``repr=False``, popped by ``to_dict``) -- it is
+    #: not a config key and must never be written back as one. The leading
+    #: underscore keeps it out of the config schema/baseline machinery, which skips
+    #: private fields (same convention as ``_degraded_sections``); consumers read
+    #: the :attr:`stub_roster` property.
+    _stub_roster: list[str] = field(
+        default_factory=list,
+        repr=False,
+        compare=False,
+    )
+
+    @property
+    def stub_roster(self) -> list[str]:
+        """The stub roster as configured, before operator deviations."""
+        return self._stub_roster
+
     pool_identity_env: list[str] = field(
         default_factory=list,
         metadata=_meta(
@@ -4392,11 +4560,12 @@ class InstancesConfig:
             "at once. Least-recently-used instances beyond this are evicted and "
             "reconnected on demand. Bounds memory/socket use (each warm instance is a "
             "full dashboard SPA). 0 (the default) is automatic: the cap follows how "
-            "many crews are currently connected, so a crew you connected is never "
-            "evicted -- eviction cold-boots the pane and reads as a disconnect, so a "
-            "fixed cap below the connected count makes tab switching look like a "
-            "connection flap. Automatic is bounded by an internal ceiling; an explicit "
-            "value is honoured exactly, including one below the connected count.",
+            "many crews are configured, so up to an internal ceiling no crew you added "
+            "is evicted and the cap widens by itself when you add one -- eviction "
+            "cold-boots the pane and reads as a disconnect, so a cap below the number "
+            "of crews in use makes tab switching look like a connection flap. Past that "
+            "ceiling eviction resumes; an explicit value is honoured exactly, including "
+            "one below the number of configured crews.",
         ),
     )
     tunnel_base_port: int = field(
@@ -6146,3 +6315,27 @@ class TeamsConfig:
         self.soft_threshold_pct, self.hard_threshold_pct = _normalize_threshold_pair(
             self.soft_threshold_pct, self.hard_threshold_pct
         )
+
+
+@dataclass
+class WakaTimeConfig:
+    enabled: bool = field(
+        default=False,
+        metadata=_meta(
+            "Enabled",
+            "Enable the WakaTime integration (send coding-activity heartbeats "
+            "and read back stats). Requires the WAKATIME_API_KEY credential "
+            "stored in the dashboard secrets vault.",
+            tags=["wakatime"],
+        ),
+    )
+    api_base_url: str = field(
+        default="",
+        metadata=_meta(
+            "API Base URL",
+            "Override the WakaTime API base URL for a self-hosted, "
+            "API-compatible backend (Wakapi, Hackatime). Empty uses the public "
+            "WakaTime API at https://wakatime.com/api/v1.",
+            tags=["wakatime"],
+        ),
+    )

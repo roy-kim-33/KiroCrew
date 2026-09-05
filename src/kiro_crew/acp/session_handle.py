@@ -52,6 +52,7 @@ from kiro_crew.acp.client import (
     _is_tool_interrupted_marker,
     _raise_acp_error,
     compaction_failure_detail,
+    compaction_failure_is_transient,
     format_command_result,
     parse_slash_command,
     prompt_timeout_for_ceiling,
@@ -461,6 +462,15 @@ class AcpRuntimeProtocol(Protocol):
         """
         ...
 
+    @property
+    def agent_version(self) -> str:
+        """``agentInfo.version`` from the handshake — the version the process runs.
+
+        ``""`` until the handshake completes; a capability gate reading it
+        fails closed on that.
+        """
+        ...
+
     async def send_request(self, method: str, params: dict[str, Any]) -> int:
         ...
 
@@ -579,6 +589,13 @@ class AcpSessionHandle:
         # (None otherwise). Arms the post-failure budget in _dispatch_events,
         # which ends an abandoned turn instead of draining to the ceiling.
         self._compaction_failed_at: float | None = None
+        # Retryability of the LAST failed compaction, read by the dashboard's
+        # STOP_REASON_COMPACTION_FAILED branch to decide between re-queuing the
+        # abandoned message and giving up. Public (no leading underscore)
+        # because that consumer reaches it through getattr on whichever of the
+        # two client classes is serving the slot. Verdict only — see the twin
+        # comment in AcpClient for why the reason text is not forwarded.
+        self.last_compaction_transient: bool = False
         # Consumers that implement the low-fidelity child downgrade (dashboard
         # card / interactive approver) opt IN; for everyone else the handle
         # itself fail-closes low-fidelity child permission requests below, so
@@ -958,6 +975,15 @@ class AcpSessionHandle:
         # from an abandoned turn (or routed here for a backend child between
         # turns) gets the fail-closed reject; the live turn's requests are
         # handled by the dispatch loop as before.
+        # A DROPPED frame is invisible to every layer above: the abandoned turn's
+        # output vanishes here with nothing to show it existed, and a turn that
+        # loses its terminal this way reaches the dashboard as an empty response
+        # with no attributable cause. Count them and say how many, ONCE. Never
+        # what they were: a frame carries model text, tool arguments and tool
+        # results, and none of that belongs in a log — nor its size, which leaks
+        # response length. The count is bounded by the queue, and the log line is
+        # one per turn regardless of how many frames drained.
+        _stale_dropped = 0
         while True:
             try:
                 stale = self._queue.get_nowait()
@@ -1031,6 +1057,19 @@ class AcpSessionHandle:
                         _stale_sid if _stale_sid != self._session_id else ""
                     ),
                 )
+            else:
+                # Everything that is not a permission request is DISCARDED, which
+                # is correct (it belongs to a turn nobody is reading any more) but
+                # was silent. Count it.
+                _stale_dropped += 1
+
+        if _stale_dropped:
+            logger.warning(
+                "pre-turn drain discarded %d leftover frame(s) from a prior "
+                "abandoned turn on this session; those frames — possibly "
+                "including that turn's terminal — reached no consumer",
+                _stale_dropped,
+            )
 
         self.last_prompt_stats = self.last_prompt_stats.carry_over()
 
@@ -1071,6 +1110,16 @@ class AcpSessionHandle:
                 _mark(self._session_id, False)
             raise
 
+        # Did a terminal reach the consumer, and did this generator finish of its
+        # own accord? Together these answer a question no layer above can: the
+        # dashboard reads "no EVENT_COMPLETE" as an empty response and cannot tell
+        # whether the backend never closed the turn or the consumer simply walked
+        # away. Only a CLEAN exhaustion is reported, which is what makes the
+        # warning spam-free: a consumer close (GeneratorExit), a cancellation, and
+        # any raised error all leave `_exhausted_clean` False and are already
+        # logged by whoever caused them.
+        _yielded_terminal = False
+        _exhausted_clean = False
         try:
             # Surface any drain-time rejections (see the pre-turn drain above)
             # as crew-card activity before the turn's own events — the user
@@ -1104,6 +1153,11 @@ class AcpSessionHandle:
                 # single choke point because `_dispatch_events` yields from 15
                 # places and every one of them funnels through this `async for`.
                 self._parked_since = time.monotonic()
+                if event.kind == EVENT_COMPLETE:
+                    # Set BEFORE the yield: a consumer that closes the stream ON
+                    # the terminal still received it, and marking it after would
+                    # report a lost terminal that was in fact delivered.
+                    _yielded_terminal = True
                 try:
                     yield event
                 finally:
@@ -1116,11 +1170,26 @@ class AcpSessionHandle:
                     if self._parked_since is not None:
                         self._parked_total += time.monotonic() - self._parked_since
                         self._parked_since = None
+            # Reached only when the dispatch loop returned on its own — not on a
+            # close, a cancel, or an exception.
+            _exhausted_clean = True
         finally:
             if _mark is not None:
                 _mark(self._session_id, False)
             if not self._turn_done.is_set():
                 self._turn_done.set()
+            if _exhausted_clean and not _yielded_terminal:
+                # The dispatch loop synthesizes a terminal on every path it knows
+                # about (timeout, stale, tool stall, cancel-unacked), so reaching
+                # here means one of its exits has none — and the consumer is left
+                # deciding what an unclosed turn means. Content-free by
+                # construction: this line carries no count, no text and no ids,
+                # because the only fact it has to report is that it happened.
+                logger.warning(
+                    "prompt stream for this session ended without a terminal "
+                    "completion event; the caller will see the turn as producing "
+                    "nothing"
+                )
 
     # ── Turn park state (readable from OUTSIDE the turn) ──
 
@@ -1689,6 +1758,15 @@ class AcpSessionHandle:
         reported here. May be a profile-form id, which is a valid wire id.
         """
         return self._model or self._resolved_model_id
+
+    @property
+    def agent_version(self) -> str:
+        """The version the shared process RUNS (``""`` until its handshake).
+
+        Delegates to the runtime because the handshake is per process, not per
+        session: every handle on one runtime reports the same value.
+        """
+        return self._runtime.agent_version
 
     @property
     def config_options(self) -> list[dict[str, Any]]:
@@ -2607,6 +2685,9 @@ class AcpSessionHandle:
                             # reason so the notice stops collapsing to
                             # "unknown error".
                             self._compaction_failed_at = time.monotonic()
+                            self.last_compaction_transient = (
+                                compaction_failure_is_transient(params)
+                            )
                         summary = compaction_failure_detail(params)
                     yield AcpEvent(kind=EVENT_COMPACTION_STATUS, text=status_type, title=summary)
                 elif action == "clear":
@@ -3309,11 +3390,24 @@ class AcpSessionHandle:
                 status_type = "completed"
             elif kind == kas_wire.KIND_SUMMARIZATION_FAILED:
                 status_type = "failed"
+                # Parity with AcpClient._handle_compaction_status: log the WHOLE
+                # frame at WARNING. This branch previously logged nothing at
+                # all, so a KAS summarization failure left the chat row as the
+                # only record of it — and when the row's reason collapsed to a
+                # placeholder there was nothing to grep server-side and no way
+                # to learn which field the reason actually arrived in.
+                # redact_text, not the bare frame: conversationSummary rides in
+                # this payload, so an unredacted dump would persist whatever the
+                # conversation contained -- a pasted credential included -- into
+                # gateway.log. Same scrub the notice below applies, for the same
+                # reason.
+                logger.warning("KAS summarization failed — raw frame: %s", redact_text(str(kiro)))
                 # KAS is the third producer of a failed compaction status and
                 # rides the SAME dispatch loop, so it gets the same bounded
                 # post-failure wait — a KAS turn abandoned after failed
                 # summarization must not drain to the ceiling either.
                 self._compaction_failed_at = time.monotonic()
+                self.last_compaction_transient = compaction_failure_is_transient(kiro)
             else:
                 status_type = "started"
             # conversationSummary is backend-echoed, LLM-influenced text that

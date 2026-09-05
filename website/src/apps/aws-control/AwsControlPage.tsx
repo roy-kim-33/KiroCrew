@@ -17,10 +17,11 @@
  * in the crew or a dashboard confirmation card. The only writes are the
  * paid-service consent gates, which are their own durable-state components.
  */
-import { useState, useMemo } from 'react'
+import { useEffect, useState, useMemo } from 'react'
+import { useLocation, useNavigate } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
-  Cloud, RefreshCw, ChevronDown, ChevronsUpDown, Search, Check,
+  Cloud, RefreshCw, ChevronDown, ChevronRight, ChevronsUpDown, Search, Check,
   FolderClosed, Library, Archive, Share2, Users, Wallet,
 } from 'lucide-react'
 import type { LucideIcon } from 'lucide-react'
@@ -29,6 +30,9 @@ import {
   DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem,
 } from '../../components/ui/dropdown-menu'
 import AwsConsentGate from '../../components/AwsConsentGate'
+import { NavBackBar } from '../../components/NavBackBar'
+import { COARSE_TOUCH_TARGET, SUBNAV_PUSH_STATE, parsePathSegments } from '../../components/subNavParams'
+import { useIsNarrowViewport } from '../../hooks/useIsMobile'
 import { usePersistedString } from '../../hooks/usePersistedString'
 import { api, type AwsConsentStatus } from '../../api/client'
 import { i18nT } from '../../i18n/t'
@@ -36,7 +40,7 @@ import { fmtBytes, fmtNumber } from '../../i18n/format'
 import { awsControlApi, AwsControlError } from './api'
 import UsagePane, { ConnectionsSection, ReconnectAction, SetupCard } from './ConsoleView'
 import { DriveSectionView, LibrarySection, BackupSection, AccessSection } from './DrivePage'
-import { PaneHeader } from './shared'
+import { PaneHeader, AwsErrorNotice } from './shared'
 import type { AwsAccount, AccountHealth, DriveStatus } from './types'
 
 /** Tailwind token for each health light, keyed as an `as const` map (literal-safe). */
@@ -189,10 +193,12 @@ function AccountSwitcher({ accounts, selected, onSelect, onManage }: {
  * so its click toggles the inline Reconnect guidance instead — a red row must
  * always offer a way back to green.
  */
-function AccountRow({ account, current, onUse }: {
+function AccountRow({ account, current, onUse, askAgent }: {
   account: AwsAccount
   current: boolean
   onUse: () => void
+  /** Whether this row's Reconnect notice may hand off to the agent; the pane decides. */
+  askAgent: boolean
 }) {
   const keys = account.profiles.length
   const resolved = Boolean(account.account)
@@ -247,7 +253,7 @@ function AccountRow({ account, current, onUse }: {
       </button>
       {!resolved && showReconnect && account.profiles[0] && (
         <div className="px-3 pb-2" data-testid="row-reconnect">
-          <ReconnectAction profile={account.profiles[0]} />
+          <ReconnectAction profile={account.profiles[0]} askAgent={askAgent} />
         </div>
       )}
     </div>
@@ -261,18 +267,28 @@ function AccountRow({ account, current, onUse }: {
  * primary content. On success it invalidates the accounts query so a newly
  * registered profile appears without a manual refresh.
  */
-function AddAccounts() {
+function AddAccounts({ onDraftChange }: {
+  /**
+   * Fires with `true` while at least one profile is ticked and not yet
+   * registered, `false` once the selection is empty again. The ticks live only
+   * in this component's state, so anything on the pane that navigates away —
+   * an agent hand-off on a sibling notice — would drop them; the pane uses this
+   * to withhold those hand-offs while a selection is open.
+   */
+  onDraftChange: (hasDraft: boolean) => void
+}) {
   const queryClient = useQueryClient()
   const [open, setOpen] = useState(false)
   // The set of profile NAMES the operator has ticked. Names, not indices, so a
   // list refetch that reorders rows can't silently move a checkmark to another
   // profile — registering the wrong profile is a trust error, not a UI glitch.
   const [checked, setChecked] = useState<Set<string>>(new Set())
+  const hasDraft = checked.size > 0
+  useEffect(() => {
+    onDraftChange(hasDraft)
+  }, [hasDraft, onDraftChange])
 
-  const availableQ = useQuery({
-    queryKey: ['aws-control', 'profiles-available'],
-    queryFn: () => awsControlApi.availableProfiles(),
-  })
+  const availableQ = useAvailableProfilesQuery()
 
   const registerM = useMutation({
     mutationFn: (names: string[]) => awsControlApi.registerProfiles(names),
@@ -335,6 +351,17 @@ function AddAccounts() {
 
       {open && (
         <div className="mt-3" data-testid="add-accounts-body">
+          {/* A failed profile scan is not "no profiles to add": without this the
+              disclosure opened onto the none-left sentence, which asserts the
+              opposite of what happened. */}
+          <AwsErrorNotice
+            askAgent={!hasDraft}
+            error={availableQ.error}
+            message={availableQ.isError ? i18nT('apps.awsControl.page.add_accounts_load_error') : null}
+            onRetry={() => availableQ.refetch()}
+            className="mb-2"
+            testId="add-accounts-load-error"
+          />
           {data && (
             <p className="mb-2 text-[12px] text-muted" data-testid="add-accounts-count">
               {i18nT('apps.awsControl.page.add_accounts_count', {
@@ -344,7 +371,7 @@ function AddAccounts() {
             </p>
           )}
 
-          {unregistered.length === 0 ? (
+          {availableQ.isError ? null : unregistered.length === 0 ? (
             <p className="text-[13px] text-muted" data-testid="add-accounts-none">
               {i18nT('apps.awsControl.page.add_accounts_none')}
             </p>
@@ -378,12 +405,15 @@ function AddAccounts() {
               )}
 
               {/* Never fail silently: a rejected register keeps its message on
-                  screen so the operator knows nothing was added. */}
-              {registerM.isError && (
-                <p className="mt-2 text-[12px] text-danger" data-testid="add-accounts-error" role="alert">
-                  {i18nT('apps.awsControl.page.add_accounts_error')}
-                </p>
-              )}
+                  screen so the operator knows nothing was added. No hand-off:
+                  the ticked profiles are unsaved input, and the hand-off would
+                  navigate away from them. */}
+              <AwsErrorNotice
+                error={registerM.error}
+                message={registerM.isError ? i18nT('apps.awsControl.page.add_accounts_error') : null}
+                className="mt-2"
+                testId="add-accounts-error"
+              />
 
               <Btn
                 onClick={() => registerM.mutate([...checked])}
@@ -416,6 +446,26 @@ function AccountsPane({ accountsQ, selected, onUse }: {
 }) {
   const [query, setQuery] = useState('')
   const data = accountsQ.data
+  // Every hand-off on this pane is withheld while the Add-accounts disclosure
+  // holds ticked-but-unregistered profiles: "Ask the agent" navigates to chat,
+  // which unmounts the disclosure and drops the selection. The reconnect and
+  // orphaned-consent notices are the sites; the register notice beside the
+  // checkboxes never hands off. Same rule the Files pane applies to an open
+  // folder-name field.
+  const [registrationDraft, setRegistrationDraft] = useState(false)
+  const handOff = !registrationDraft
+
+  // The empty state's remedy is the Add-accounts disclosure further down this
+  // same pane, so the two must agree about whether that disclosure can serve
+  // this platform. On Windows profile discovery is unavailable and the
+  // disclosure says so, which leaves a Windows operator permanently at zero
+  // accounts -- an empty state still naming the disclosure would send them to a
+  // paragraph that refuses. There the subtitle is DROPPED rather than replaced:
+  // `empty_title` already says nothing is here, the disclosure carries the WSL
+  // constraint once, and a replacement subtitle would only restate the title in
+  // 12 catalogs. Undefined (still loading) reads as "can", so the ordinary
+  // platform never waits on this to render its own copy.
+  const canAddHere = useAvailableProfilesQuery().data?.supported !== false
 
   // Client-side filter over name + id; harmless when few accounts.
   const filtered = useMemo(() => {
@@ -509,7 +559,7 @@ function AccountsPane({ accountsQ, selected, onUse }: {
             testId="aws-control-empty"
             icon={<Cloud />}
             title={i18nT('apps.awsControl.page.empty_title')}
-            subtitle={i18nT('apps.awsControl.page.empty_body')}
+            subtitle={canAddHere ? i18nT('apps.awsControl.page.empty_body') : undefined}
           />
         </div>
       )}
@@ -531,6 +581,7 @@ function AccountsPane({ accountsQ, selected, onUse }: {
               account={a}
               current={Boolean(selected && a.account === selected.account)}
               onUse={() => onUse(a)}
+              askAgent={handOff}
             />
           ))}
         </div>
@@ -541,7 +592,7 @@ function AccountsPane({ accountsQ, selected, onUse }: {
           rather than on a page of its own. */}
       {selected && (
         <div className="mt-8" data-testid="accounts-connections">
-          <ConnectionsSection account={selected} />
+          <ConnectionsSection account={selected} askAgent={handOff} />
         </div>
       )}
 
@@ -556,12 +607,12 @@ function AccountsPane({ accountsQ, selected, onUse }: {
           <p className="text-[13px] text-text" data-testid="orphan-consent-note">
             {i18nT('apps.awsControl.page.orphan_consent')}
           </p>
-          {s3Orphan && <AwsConsentGate service="s3" />}
-          {ceOrphan && <AwsConsentGate service="ce" />}
+          {s3Orphan && <AwsConsentGate service="s3" askAgent={handOff} />}
+          {ceOrphan && <AwsConsentGate service="ce" askAgent={handOff} />}
         </div>
       )}
 
-      <AddAccounts />
+      <AddAccounts onDraftChange={setRegistrationDraft} />
     </section>
   )
 }
@@ -573,6 +624,24 @@ function useAccountsQuery() {
   return useQuery({
     queryKey: ['aws-control', 'accounts'],
     queryFn: () => awsControlApi.accounts(),
+  })
+}
+
+/**
+ * The local-profile scan, shared by the Add-accounts disclosure and by the
+ * accounts empty state.
+ *
+ * One hook rather than a `useQuery` at each site, because the two have to agree
+ * about `supported`: the empty state's copy names an action whose ONLY home is
+ * that disclosure, so an empty state that names it while the disclosure reports
+ * the platform cannot serve it is a promise the next paragraph refuses. Sharing
+ * the key already shares React Query's cache entry, so the second reader costs
+ * no request.
+ */
+function useAvailableProfilesQuery() {
+  return useQuery({
+    queryKey: ['aws-control', 'profiles-available'],
+    queryFn: () => awsControlApi.availableProfiles(),
   })
 }
 
@@ -616,6 +685,7 @@ function DrivePaneGate({ pane, account, drive, driveQ, children }: {
           <div data-testid="console-storage-consent">
             <p className="mb-2 text-[13px] text-muted">{i18nT('apps.awsControl.console.storage_consent_needed')}</p>
             <AwsConsentGate
+              askAgent
               service="s3"
               onConsentChange={() => qc.invalidateQueries({ queryKey: ['aws-control', 'drive', id] })}
             />
@@ -626,9 +696,24 @@ function DrivePaneGate({ pane, account, drive, driveQ, children }: {
             </div>
           </div>
         ) : (
-          <p className="text-[13px] text-muted" data-testid="console-unavailable">{i18nT('apps.awsControl.console.account_unavailable')}</p>
+          <AwsErrorNotice
+            askAgent
+            error={driveErr}
+            message={i18nT('apps.awsControl.console.account_unavailable')}
+            testId="console-unavailable"
+          />
         )
       )}
+      {/* Any other failure to read the drive. Left unrendered, a 5xx here showed
+          the pane title over nothing at all — not loading, not empty, not
+          broken — with no way to learn which. */}
+      <AwsErrorNotice
+        askAgent
+        error={driveQ.error}
+        message={driveQ.isError && !drive409 ? i18nT('apps.awsControl.console.drive_status_failed') : null}
+        onRetry={() => qc.invalidateQueries({ queryKey: ['aws-control', 'drive', id] })}
+        testId="drive-status-error"
+      />
       {/* No bucket yet, so the pane carries the one action that changes that. */}
       {drive && !drive.exists && (
         <div className="rounded-lg border border-border bg-card px-4 py-3" data-testid="capability-drive-setup">
@@ -639,8 +724,63 @@ function DrivePaneGate({ pane, account, drive, driveQ, children }: {
   )
 }
 
+/** The app's own base path; pane routes hang off it (/aws-control/usage). */
+const APP_PATH = '/aws-control'
+const ALL_PANES: RailPane[] = [...DRIVE_PANES, ...FOOT_PANES]
+
+/**
+ * The pane named by the URL, or null on the bare app path.
+ *
+ * Read synchronously from the path (never normalized through an effect, which
+ * would render the wrong pane for a frame before correcting itself), through
+ * the SAME positional parser the settings path-nav uses — it already pins the
+ * trailing-slash and empty-segment behavior (an empty segment stays in place
+ * and matches no key) and guards the base path, so this app cannot re-derive
+ * a divergent copy of those rules.
+ */
+function usePaneFromPath(): RailPane | null {
+  const location = useLocation()
+  const seg = parsePathSegments(APP_PATH, location.pathname)[0] ?? ''
+  if ((ALL_PANES as string[]).includes(seg)) return seg as RailPane
+  // Null means THE BARE PATH and nothing else. An unknown non-empty segment
+  // falls back to Files on every width — mapping it to null would read the
+  // same URL as Files on a desktop and as the root list on a phone, two
+  // meanings for one address.
+  return seg === '' ? null : 'files'
+}
+
+/**
+ * One row of the narrow-viewport root list: icon, label, count, chevron.
+ * iOS-style grouped list rows — the same navigation the settings root list
+ * uses on a phone, so the two apps read as one product on small screens.
+ */
+function RootListRow({ pane, count, onOpen }: {
+  pane: RailPane
+  count?: number
+  onOpen: () => void
+}) {
+  const Icon = PANE_ICON[pane]
+  return (
+    <button
+      onClick={onOpen}
+      data-testid={`root-${pane}`}
+      className={`flex w-full items-center gap-3 px-3 py-2.5 ${COARSE_TOUCH_TARGET} text-left cursor-pointer bg-transparent border-none hover:bg-bg-hover focus-ring`}
+    >
+      <Icon size={16} className="shrink-0 text-accent" aria-hidden="true" />
+      <span className="min-w-0 flex-1 truncate text-[14px] text-text-strong">{i18nT(PANE_LABEL_KEY[pane])}</span>
+      {count !== undefined && (
+        <span className="shrink-0 font-mono text-[12px] text-muted">{fmtNumber(count)}</span>
+      )}
+      <ChevronRight size={15} className="shrink-0 text-muted" aria-hidden="true" />
+    </button>
+  )
+}
+
 export default function AwsControlPage() {
-  const [pane, setPane] = useState<RailPane>('files')
+  const navigate = useNavigate()
+  const location = useLocation()
+  const paneFromPath = usePaneFromPath()
+  const narrow = useIsNarrowViewport()
   // The selected account survives visits, so a single-account operator (and a
   // returning multi-account one) lands straight in their drive. An id that no
   // longer resolves falls back to the first resolved account rather than a
@@ -668,15 +808,49 @@ export default function AwsControlPage() {
     enabled: Boolean(id),
   })
 
+  // Narrow drill-in from the ROOT LIST is a PUSH carrying the same marker the
+  // settings stack mints, so the platform back gesture pops one level exactly
+  // like the on-screen back bar. Everything else (wide rail clicks, pane→pane
+  // moves) REPLACES — walking every rail click on browser-back is not a
+  // history the reader asked for. Mirrors SettingsSubNav's contract.
+  const openPane = (p: RailPane) => {
+    const drillIn = narrow && paneFromPath === null
+    // A narrow pane->pane REPLACE must carry the current entry's push marker
+    // forward: replacing a pushed entry with a marker-less one would make the
+    // back bar replace-write a second root entry, and the next platform back
+    // lands root->root — visibly inert. The marker describes the ENTRY's
+    // provenance, and a replace keeps the entry.
+    const keepMarker =
+      narrow && !drillIn &&
+      Boolean((location.state as Record<string, unknown> | null)?.[SUBNAV_PUSH_STATE])
+    navigate(`${APP_PATH}/${p}`, {
+      replace: !drillIn,
+      state: drillIn || keepMarker ? { [SUBNAV_PUSH_STATE]: true } : undefined,
+    })
+  }
   const useAccount = (a: AwsAccount) => {
     setStoredId(a.account)
-    setPane('files')
+    openPane('files')
   }
+  const paneCount = (p: RailPane): number | undefined =>
+    p === 'shares'
+      ? sharesQ.data?.shares.length
+      : drive?.exists
+        ? drive.usage.sections[p === 'files' ? 'drive' : p === 'library' ? 'library' : 'backup'].objects
+        : undefined
 
   // A 403 app_disabled means the app was disabled after this bundle loaded (the
   // shell shows its own disabled state on first load). Show the standard
-  // disabled-app copy rather than a raw error wall.
-  if (accountsQ.isError && accountsQ.error instanceof AwsControlError && accountsQ.error.status === 403) {
+  // disabled-app copy rather than a raw error wall. Keyed on the CODE, not the
+  // status: the same route answers 403 for a non-owner caller
+  // (`dashboard_owner_required`), and that is an error to diagnose, not a
+  // disabled app to wait out.
+  if (
+    accountsQ.isError &&
+    accountsQ.error instanceof AwsControlError &&
+    accountsQ.error.status === 403 &&
+    accountsQ.error.message === 'app_disabled'
+  ) {
     return (
       <div className="flex h-full flex-col">
         <div className="flex-1 overflow-y-auto px-4 py-6 md:px-6">
@@ -692,21 +866,34 @@ export default function AwsControlPage() {
   }
 
   if (accountsQ.isError) {
+    // A 403 here is a permission answer (`dashboard_owner_required`), not a
+    // transient read, so it gets copy that names the fix instead of the generic
+    // "try again in a moment" — Retry only succeeds once the session is the
+    // owner's, and the sentence must not promise otherwise.
+    const forbidden = accountsQ.error instanceof AwsControlError && accountsQ.error.status === 403
     return (
       <div className="flex h-full flex-col">
         <div className="flex-1 overflow-y-auto px-4 py-6 md:px-6" data-testid="accounts-error">
-          <EmptyState
-            testId="aws-control-error"
-            icon={<Cloud />}
-            title={i18nT('apps.awsControl.page.error_title')}
-            subtitle={i18nT('apps.awsControl.page.error_body')}
-            action={
-              <Btn onClick={() => accountsQ.refetch()} data-testid="error-retry">
-                <RefreshCw size={13} />
-                {i18nT('apps.awsControl.page.retry')}
-              </Btn>
-            }
-          />
+          {/* The page's own error, not an EmptyState wearing red: an empty state
+              says "nothing here yet", and a failed read says nothing of the
+              sort. The notice carries the failure to the agent; Retry stays,
+              because a transient read is the one case the reader can clear. */}
+          <div className="mx-auto flex max-w-[480px] flex-col items-center gap-3 py-12">
+            <AwsErrorNotice
+              askAgent
+              error={accountsQ.error}
+              title={i18nT('apps.awsControl.page.error_title')}
+              message={i18nT(forbidden
+                ? 'apps.awsControl.page.error_forbidden_body'
+                : 'apps.awsControl.page.error_body')}
+              className="w-full"
+              testId="aws-control-error"
+            />
+            <Btn onClick={() => accountsQ.refetch()} data-testid="error-retry">
+              <RefreshCw size={13} />
+              {i18nT('apps.awsControl.page.retry')}
+            </Btn>
+          </div>
         </div>
       </div>
     )
@@ -725,92 +912,163 @@ export default function AwsControlPage() {
     )
   }
 
+  // Which pane the CONTENT area shows. On the bare path a wide viewport lands
+  // straight on Files (the thesis: the drive is the product), while a narrow
+  // one shows the root LIST — the same push-stack semantics as settings on a
+  // phone, where the bare path is the list and a segment is a pushed detail.
+  const pane: RailPane = paneFromPath ?? 'files'
+
+  const paneContent = (
+    <>
+      {pane === 'files' && (
+        <DrivePaneGate pane="files" account={selected} drive={drive} driveQ={driveQ}>
+          {(bucket) => <DriveSectionView account={id} bucket={bucket} />}
+        </DrivePaneGate>
+      )}
+      {pane === 'library' && (
+        <DrivePaneGate pane="library" account={selected} drive={drive} driveQ={driveQ}>
+          {(bucket) => <LibrarySection account={id} bucket={bucket} />}
+        </DrivePaneGate>
+      )}
+      {pane === 'backup' && (
+        <DrivePaneGate pane="backup" account={selected} drive={drive} driveQ={driveQ}>
+          {() => <BackupSection account={id} />}
+        </DrivePaneGate>
+      )}
+      {pane === 'shares' && (
+        <DrivePaneGate pane="shares" account={selected} drive={drive} driveQ={driveQ}>
+          {() => <AccessSection account={id} />}
+        </DrivePaneGate>
+      )}
+      {pane === 'accounts' && (
+        <AccountsPane accountsQ={accountsQ} selected={selected} onUse={useAccount} />
+      )}
+      {pane === 'usage' && <UsagePane account={selected} />}
+    </>
+  )
+
+  if (narrow) {
+    // Narrow viewport: iOS push-stack navigation, exactly like settings. The
+    // bare path is the grouped root list; a pane segment is a pushed detail
+    // with ONE back bar labelled with its parent (the app itself). The rail
+    // never renders here — two navigation patterns on one screen is the
+    // failure the settings redesign removed.
+    if (!paneFromPath) {
+      return (
+        <div className="flex h-full flex-col" data-testid="aws-root-list">
+          <div className="flex-1 overflow-y-auto px-4 pt-4 pb-6">
+            <div className="mb-4">
+              <AccountSwitcher
+                accounts={resolved}
+                selected={selected}
+                onSelect={(nextId) => setStoredId(nextId)}
+                onManage={() => openPane('accounts')}
+              />
+            </div>
+            <div className="overflow-hidden rounded-lg border border-border bg-card divide-y divide-border">
+              {DRIVE_PANES.map((p) => (
+                <RootListRow key={p} pane={p} count={paneCount(p)} onOpen={() => openPane(p)} />
+              ))}
+            </div>
+            <div className="mt-4 overflow-hidden rounded-lg border border-border bg-card divide-y divide-border">
+              {FOOT_PANES.map((p) => (
+                <RootListRow key={p} pane={p} onOpen={() => openPane(p)} />
+              ))}
+            </div>
+            {drive?.exists && (
+              <div className="mt-4 px-1 text-[11px] leading-relaxed text-muted" data-testid="rail-meta">
+                <span className="block truncate font-mono">{drive.bucket}</span>
+                <span className="block">
+                  {i18nT('apps.awsControl.console.stat_stored_value', {
+                    size: fmtBytes(drive.usage.bytes),
+                    objects: fmtNumber(drive.usage.objects),
+                  })}
+                  {' \u00b7 '}
+                  {drive.region}
+                </span>
+              </div>
+            )}
+          </div>
+        </div>
+      )
+    }
+    return (
+      <div className="flex h-full flex-col" data-testid="aws-pane-detail">
+        <div className="flex-1 overflow-y-auto px-4 pb-6">
+          <NavBackBar
+            label={i18nT('apps.awsControl.manifest.display_name')}
+            onBack={() => {
+              // Pop when this stack pushed the current entry (keeps push/pop
+              // symmetric for the platform back gesture); replace-write on a
+              // cold deep link, where back() would exit the app entirely.
+              if ((location.state as Record<string, unknown> | null)?.[SUBNAV_PUSH_STATE]) {
+                navigate(-1)
+                return
+              }
+              navigate(APP_PATH, { replace: true })
+            }}
+            className="-mx-4"
+          />
+          {/* Same account-keyed remount as the wide layout: a confirm armed on
+              one account must not survive onto another. */}
+          <div key={id}>
+            {paneContent}
+          </div>
+        </div>
+      </div>
+    )
+  }
+
   return (
-    <div className="flex h-full min-h-0 flex-col md:flex-row">
-      {/* The rail. On desktop a left column; on narrow viewports it flattens
-          to a horizontally scrollable strip above the pane, so 320px keeps
-          every pane reachable without a second navigation pattern. */}
+    <div className="flex h-full min-h-0 flex-row">
+      {/* The rail: wide viewports only. Narrow viewports use the push-stack
+          root list above instead of squeezing this column. */}
       <nav
-        className="flex w-full shrink-0 flex-row items-center gap-1 overflow-x-auto border-b border-border px-3 py-2 md:w-56 md:flex-col md:items-stretch md:overflow-x-visible md:border-b-0 md:border-r md:px-3 md:py-3"
+        className="flex w-56 shrink-0 flex-col items-stretch gap-1 border-r border-border px-3 py-3"
         aria-label={i18nT('apps.awsControl.rail.nav')}
         data-testid="aws-rail"
       >
-        <div className="order-first w-56 shrink-0 md:w-auto md:shrink">
-          <AccountSwitcher
-            accounts={resolved}
-            selected={selected}
-            onSelect={(nextId) => setStoredId(nextId)}
-            onManage={() => setPane('accounts')}
-          />
-        </div>
+        <AccountSwitcher
+          accounts={resolved}
+          selected={selected}
+          onSelect={(nextId) => setStoredId(nextId)}
+          onManage={() => openPane('accounts')}
+        />
         {DRIVE_PANES.map((p) => (
-          <RailItem
-            key={p}
-            pane={p}
-            active={pane === p}
-            onClick={() => setPane(p)}
-            count={
-              p === 'shares'
-                ? sharesQ.data?.shares.length
-                : drive?.exists
-                  ? drive.usage.sections[p === 'files' ? 'drive' : p === 'library' ? 'library' : 'backup'].objects
-                  : undefined
-            }
-          />
+          <RailItem key={p} pane={p} active={pane === p} onClick={() => openPane(p)} count={paneCount(p)} />
         ))}
-        <div className="hidden flex-1 md:block" />
+        <div className="flex-1" />
         {FOOT_PANES.map((p) => (
-          <RailItem key={p} pane={p} active={pane === p} onClick={() => setPane(p)} />
+          <RailItem key={p} pane={p} active={pane === p} onClick={() => openPane(p)} />
         ))}
         {/* The drive's identity, stated once at the rail's foot: bucket, size,
             and region — the facts every pane above shares. */}
         {drive?.exists && (
-          <div className="hidden border-t border-border px-2.5 pt-2 text-[11px] leading-relaxed text-muted md:block" data-testid="rail-meta">
+          <div className="border-t border-border px-2.5 pt-2 text-[11px] leading-relaxed text-muted" data-testid="rail-meta">
             <span className="block truncate font-mono">{drive.bucket}</span>
             <span className="block">
               {i18nT('apps.awsControl.console.stat_stored_value', {
                 size: fmtBytes(drive.usage.bytes),
                 objects: fmtNumber(drive.usage.objects),
               })}
-              {' · '}
+              {' \u00b7 '}
               {drive.region}
             </span>
           </div>
         )}
       </nav>
 
-      {/* Keyed by the selected account: every pane holds account-BOUND
-          transient state (an armed delete confirm, an open folder disclosure,
-          a half-typed share note), and React would otherwise reuse the same
-          component instances across a switch — a confirm armed on account A
-          would stay armed and then fire its mutation against account B's
-          same-named object. Remounting on switch is the reset that makes a
-          switch mean "start clean on the other account". */}
-      <div key={id} className="min-w-0 flex-1 overflow-y-auto px-4 pt-4 pb-6 md:px-6">
-        {pane === 'files' && (
-          <DrivePaneGate pane="files" account={selected} drive={drive} driveQ={driveQ}>
-            {(bucket) => <DriveSectionView account={id} bucket={bucket} />}
-          </DrivePaneGate>
-        )}
-        {pane === 'library' && (
-          <DrivePaneGate pane="library" account={selected} drive={drive} driveQ={driveQ}>
-            {(bucket) => <LibrarySection account={id} bucket={bucket} />}
-          </DrivePaneGate>
-        )}
-        {pane === 'backup' && (
-          <DrivePaneGate pane="backup" account={selected} drive={drive} driveQ={driveQ}>
-            {() => <BackupSection account={id} />}
-          </DrivePaneGate>
-        )}
-        {pane === 'shares' && (
-          <DrivePaneGate pane="shares" account={selected} drive={drive} driveQ={driveQ}>
-            {() => <AccessSection account={id} />}
-          </DrivePaneGate>
-        )}
-        {pane === 'accounts' && (
-          <AccountsPane accountsQ={accountsQ} selected={selected} onUse={useAccount} />
-        )}
-        {pane === 'usage' && <UsagePane account={selected} />}
+      <div className="min-w-0 flex-1 overflow-y-auto px-4 pt-4 pb-6 md:px-6">
+        {/* Keyed by the selected account: every pane holds account-BOUND
+            transient state (an armed delete confirm, an open folder disclosure,
+            a half-typed share note), and React would otherwise reuse the same
+            component instances across a switch — a confirm armed on account A
+            would stay armed and then fire its mutation against account B's
+            same-named object. Remounting on switch is the reset that makes a
+            switch mean "start clean on the other account". */}
+        <div key={id}>
+          {paneContent}
+        </div>
       </div>
     </div>
   )

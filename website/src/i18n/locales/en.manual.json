@@ -606,6 +606,9 @@
           "editor": {
             "agent_hint": "Any agent works.",
             "agent_label": "Agent",
+            "agent_roster_failed": "Couldn't load the agent list.",
+            "agent_roster_retry": "Retry",
+            "agent_roster_retrying": "Retrying…",
             "aria_create": "Create a new Crew",
             "aria_edit": "Edit Crew {{name}}",
             "automerge_hint": "Merges once a human approves.",
@@ -693,6 +696,7 @@
             "kind_reply": "Replied",
             "kind_review": "Review",
             "kind_skip": "Passed",
+            "kind_sweep": "Swept",
             "kind_yield": "Yielded",
             "no_next_recorded": "no next step recorded",
             "no_open_work_items": "Nothing in flight",
@@ -1216,6 +1220,7 @@
       "search_failed": "Search failed",
       "retry": "Retry",
       "action_enter": "Open View",
+      "action_continue": "Continue",
       "action_ask": "Ask",
       "group_attention": "Needs You",
       "ask_agent": "Ask the agent: “{{query}}”",
@@ -1231,7 +1236,13 @@
         "command": "Command",
         "setting": "Setting",
         "view": "View"
-      }
+      },
+      "placeholder_argument": "Enter a value…",
+      "argument_invalid": "That value is not accepted by this command.",
+      "argument_withdrawn": "That command is no longer available.",
+      "argument_changed": "This command changed. Check what will be sent, then press Enter again.",
+      "will_send": "Will send",
+      "will_send_clipped": "Scroll to read the rest — this instruction continues below."
     },
     "papyrus": {
       "workspace": {
@@ -1241,6 +1252,93 @@
     }
   },
   "components": {
+    "avatarBuilder": {
+      "apply": "Apply",
+      "apply_hint": "Applies here — press “Save changes” to keep it.",
+      "axis_accessory": "Headwear",
+      "axis_blush": "Blush",
+      "axis_brows": "Brows",
+      "axis_eyes": "Eyes",
+      "axis_mouth": "Mouth",
+      "axis_prop": "Item",
+      "axis_tile": "Background",
+      "cancel": "Cancel",
+      "customize": "Customize…",
+      "customized_note": "Using a custom face",
+      "field_hint": "The face this crew wears everywhere it appears.",
+      "field_label": "Avatar",
+      "image_load_failed": "The saved picture could not be loaded — showing the default face instead.",
+      "mirror": "Flip direction",
+      "mode_face": "Ghost face",
+      "mode_picture": "Picture",
+      "opt_angry": "Angry",
+      "opt_antenna": "Antenna",
+      "opt_bandana": "Bandana",
+      "opt_beanie": "Beanie",
+      "opt_blush": "Blush",
+      "opt_bolt": "Bolt",
+      "opt_bow": "Bow",
+      "opt_canon": "Classic",
+      "opt_cap": "Cap",
+      "opt_cat": "Cat",
+      "opt_closed": "Closed",
+      "opt_cross": "Sharp",
+      "opt_crown": "Crown",
+      "opt_cyclops": "Cyclops",
+      "opt_flat": "Flat",
+      "opt_flower": "Flower",
+      "opt_glass": "Magnifier",
+      "opt_glasses": "Glasses",
+      "opt_grin": "Grin",
+      "opt_halo": "Halo",
+      "opt_hardhat": "Hard hat",
+      "opt_heart": "Hearts",
+      "opt_mug": "Mug",
+      "opt_none": "None",
+      "opt_oh": "Oh",
+      "opt_open": "Open",
+      "opt_party": "Party hat",
+      "opt_phones": "Headphones",
+      "opt_raised": "Raised",
+      "opt_sleepy": "Sleepy",
+      "opt_smile": "Smile",
+      "opt_smirk": "Smirk",
+      "opt_sparkle": "Sparkle",
+      "opt_squint": "Squint",
+      "opt_star": "Star",
+      "opt_swirl": "Swirl",
+      "opt_term": "Terminal",
+      "opt_tongue": "Tongue",
+      "opt_visor": "Visor",
+      "opt_wide": "Wide",
+      "opt_wink": "Wink",
+      "opt_wobble": "Wobble",
+      "opt_wrench": "Wrench",
+      "randomize": "Randomize",
+      "reset_default": "Reset to the default face",
+      "tile_amber": "Amber",
+      "tile_bronze": "Bronze",
+      "tile_coral": "Coral",
+      "tile_cyan": "Cyan",
+      "tile_green": "Green",
+      "tile_indigo": "Indigo",
+      "tile_magenta": "Magenta",
+      "tile_olive": "Olive",
+      "tile_plum": "Plum",
+      "tile_purple": "Kiro purple",
+      "tile_red": "Red",
+      "tile_rose": "Rose",
+      "tile_sky": "Sky blue",
+      "tile_steel": "Steel blue",
+      "tile_teal": "Teal",
+      "title": "Customize avatar",
+      "title_named": "Customize avatar — {{name}}",
+      "upload_bad_image": "That file could not be read as an image.",
+      "upload_choose": "Choose a picture…",
+      "upload_hint": "Drag a picture here, or",
+      "upload_note": "PNG, JPEG, or WEBP. Cropped square and scaled to 512 px before it is stored.",
+      "upload_too_large": "That file is too large (20 MB max)."
+    },
     "crewWakeSection": {
       "active": "active",
       "pause_named": "Pause {{name}}",
@@ -1260,6 +1358,10 @@
       "setup_timeout": "Phone access did not reach a ready state. Re-check the setup, then try again."
     },
     "filePickerMenu": {
+      "type_2_chars_to_search_files_enter_held": "Type 2+ chars to search files and folders… — Enter won’t send yet; press Esc, then Enter sends the message",
+      "type_2_chars_to_search_files_ctrl_enter_held": "Type 2+ chars to search files and folders… — Ctrl+Enter won’t send yet; press Esc, then Ctrl+Enter sends the message",
+      "searching_enter_held": "Searching… — Enter won’t send yet; press Esc, then Enter sends the message",
+      "searching_ctrl_enter_held": "Searching… — Ctrl+Enter won’t send yet; press Esc, then Ctrl+Enter sends the message",
       "no_matches_ctrl_enter_sends": "No matching files — Ctrl+Enter sends the message",
       "no_matches_enter_sends": "No matching files — Enter sends the message"
     },
@@ -1481,7 +1583,9 @@
       "redaction_failed_retry": "Redaction failed — retry",
       "send_selection_to_chat": "Send selection to chat",
       "send_to_chat": "Send to chat",
-      "sending": "Sending…"
+      "sending": "Sending…",
+      "touch_select_anchor": "First point set — tap the other end",
+      "touch_select_done": "Range selected — tap Copy"
     },
     "codeBlock": {
       "copied": "Copied!",
@@ -1627,6 +1731,7 @@
     },
     "fileRenderers": {
       "media_preview_failed": "Playback failed — the browser cannot decode this file.",
+      "office_open_hint": "Preview isn't available for this file. Open it in its app, or download a copy.",
       "scroll_for_more_count": "Scroll for more… ({{count}} remaining)",
       "sheet_cols_truncated": "Additional columns not shown",
       "sheet_empty": "Empty sheet",
@@ -1835,7 +1940,16 @@
       "sso_helper": "Paste the AWS access portal URL your company gave you.",
       "sso_region_label": "AWS Region (optional)",
       "sso_continue": "Continue",
-      "sso_cancel": "Cancel"
+      "sso_cancel": "Cancel",
+      "loopback_aside_headline": "Finish in your browser",
+      "loopback_aside_body": "We opened Kiro sign-in in a new tab. Approve there and this page carries on by itself.",
+      "loopback_aside_footnote": "Nothing to type — the sign-in comes straight back to this computer.",
+      "loopback_waiting_title": "Waiting for your browser",
+      "loopback_waiting_body": "Complete the sign-in in the tab that just opened. If no tab appeared, open it again below.",
+      "loopback_open_again": "Open the sign-in page again",
+      "loopback_use_code": "Use a code instead",
+      "loopback_slow_hint": "Taking a while? If the sign-in page can't reach this computer, switch to a code — it works from any device.",
+      "loopback_fell_back": "The sign-in couldn't come back to this computer directly, so here's a code instead."
     },
     "kiroPrerequisiteGate": {
       "agent_specs_missing": "Agent specs missing",
@@ -1849,9 +1963,11 @@
       "if_you_are_diagnosing_this_from_a_terminal_kiro": "If you are diagnosing this from a terminal, note that kiro-cli diagnostic reports nothing until the Kiro CLI app itself is running — launch it with kiro-cli launch first. That refusal is not the cause of this.",
       "install_kiro_cli_from_kiros_official_setup_page": "Install Kiro CLI from Kiro's official setup page. It carries the steps for your platform and stays current.",
       "kiro_cli_is_installed_but_could_not_be_verified": "Kiro CLI is installed but could not be verified",
+      "kiro_cli_is_installed_and_signed_in_but_too_old": "Kiro CLI is installed and signed in, but this version predates the acp command {{productName}} launches every session through. Update it and this page continues on its own.",
       "kiro_cli_is_installed_finish_signing_in_to_conti": "Kiro CLI is installed. Finish signing in to continue.",
       "kiro_cli_is_required_on_the_gateway_host": "Kiro CLI is required on the {{platform}} gateway host.",
       "kiro_cli_s_reason": "Why it was refused",
+      "kiro_cli_update_needed": "Kiro CLI update needed",
       "kiro_cli_was_found_on_this_host": "Kiro CLI was found on this host.",
       "kiro_cli_will_not_load_kiro_crew_s_agent_specs": "Kiro CLI will not load {{productName}}'s agent specs",
       "kiro_crew_installs_the_agent_specs_kiro_cli_load": "{{productName}} installs the agent specs Kiro CLI loads before it can answer anything.",
@@ -1885,11 +2001,17 @@
       "the_gateway_returned_an_unexpected_error": "The gateway returned an unexpected error.",
       "the_gateway_returned_no_prerequisite_status": "The gateway returned no prerequisite status.",
       "the_repair_attempt_failed": "The repair attempt failed",
+      "the_update_attempt_failed": "The update attempt failed",
       "this_host_allows_user_namespaces_but_the_kernel_d": "This host allows user namespaces, but the kernel then denied the mount namespace — the signature of Ubuntu 23.10 and newer, which moves any process that creates a user namespace into a restricted AppArmor profile. {{productName}} refuses to run the agent unisolated rather than expose your credentials, so it stays blocked until the profile is in place.",
       "this_host_provides_no_os_level_sandbox_so_kiro_c": "This host provides no OS-level sandbox, so {{productName}} cannot isolate the agent. It refuses to run the agent unsandboxed rather than expose your credentials.",
       "this_kiro_cli_is_signed_in": "This Kiro CLI is signed in.",
+      "this_kiro_cli_is_too_old_for_the_acp_command": "This Kiro CLI is too old for the acp command {{productName}} needs. Update it here.",
       "this_page_detects_kiro_cli_automatically": "Leave this page open. It checks the gateway host and continues on its own once Kiro CLI is installed.",
-      "waiting": "Waiting"
+      "update_command_label": "Update command",
+      "update_kiro_cli": "Update Kiro CLI",
+      "updating_kiro_cli": "Updating Kiro CLI…",
+      "waiting": "Waiting",
+      "your_kiro_cli_is_out_of_date": "Your Kiro CLI is out of date"
     },
     "linkedSurfacesSection": {
       "connect_failed": "Could not connect to {{label}}: {{reason}}",
@@ -2082,6 +2204,7 @@
       "checks_unavailable": "Checks unavailable",
       "commits": "Commits",
       "confirm_auto_merge": "Confirm auto-merge",
+      "could_not_refresh_showing_cached": "Couldn't refresh — showing the last loaded version",
       "could_not_load_this_pull_request": "Could not load this pull request",
       "description": "Description",
       "enable_auto_merge": "Enable auto-merge",
@@ -2205,8 +2328,8 @@
       "root": "(root)"
     },
     "skillPickerMenu": {
-      "loading_skills_ctrl_enter_held": "Loading skills… — Ctrl+Enter won’t send yet; use the Send button",
-      "loading_skills_enter_held": "Loading skills… — Enter won’t send yet; use the Send button",
+      "loading_skills_ctrl_enter_held": "Loading skills… — Ctrl+Enter won’t send yet; press Esc, then Ctrl+Enter sends the message",
+      "loading_skills_enter_held": "Loading skills… — Enter won’t send yet; press Esc, then Enter sends the message",
       "no_matching_skills_ctrl_enter_sends": "No matching skills — Ctrl+Enter sends the message",
       "no_matching_skills_enter_sends": "No matching skills — Enter sends the message",
       "no_skills_mapped_to_agent": "No skills mapped to {{agent}}",
@@ -2245,7 +2368,7 @@
       "copy": "Copy",
       "copy_failed": "Copy failed",
       "copy_needs_https": "Copy needs a secure (HTTPS) connection",
-      "copy_no_selection": "Tap Select, then Copy",
+      "copy_no_selection": "Long-press a line or tap Select, then Copy",
       "copy_done": "Copied",
       "copy_permission_needed": "Allow clipboard access",
       "paste": "Paste",
@@ -2428,6 +2551,8 @@
       "title_md": "Medium width"
     },
     "slashCommandMenu": {
+      "loading_commands_enter_held": "Loading commands… — Enter won’t send yet; press Esc, then Enter sends the message",
+      "loading_commands_ctrl_enter_held": "Loading commands… — Ctrl+Enter won’t send yet; press Esc, then Ctrl+Enter sends the message",
       "commands_load_failed_ctrl_enter_sends": "Couldn't load commands — Ctrl+Enter sends the message",
       "commands_load_failed_enter_sends": "Couldn't load commands — Enter sends the message",
       "desc_agent": "Switch or manage the active agent",
@@ -2459,7 +2584,6 @@
       "desc_tools": "Show available tools",
       "desc_usage": "Show billing and usage information",
       "desc_workflow": "List or run a saved workflow by name",
-      "loading_commands": "Loading commands…",
       "no_matching_commands_ctrl_enter_sends": "No matching commands — Ctrl+Enter sends the message",
       "no_matching_commands_enter_sends": "No matching commands — Enter sends the message"
     },
@@ -2536,9 +2660,9 @@
       "pane_schedules": "Schedules",
       "pane_webhook": "Webhook",
       "pane_workspace_memory": "Workspace · Memory",
-      "rail_label": "Crew settings",
+      "rail_label": "Agent settings",
       "stat_active_schedules": "Active schedules",
-      "stat_crews_sharing": "Crews sharing its storage",
+      "stat_crews_sharing": "Agents sharing its storage",
       "stat_resolved_model": "Resolved model",
       "stat_unknown": "Unknown",
       "tag_shared": "Shared",
@@ -2550,19 +2674,19 @@
       "cancel": "Cancel"
     },
     "crewWebhookSection": {
-      "could_not_load_webhooks": "Could not load webhooks, so what wakes this crew is unknown right now.",
+      "could_not_load_webhooks": "Could not load webhooks, so what wakes this agent is unknown right now.",
       "inbound_webhooks_are_switched_off": "Inbound webhooks are switched off, so nothing can call in — bound tokens included.",
       "last_used_ago": "used {{time}}",
-      "no_tokens_are_bound_to_this_crew": "No webhook tokens are bound to this crew.",
+      "no_tokens_are_bound_to_this_crew": "No webhook tokens are bound to this agent.",
       "off": "Off",
       "open_webhooks": "Open Webhooks",
-      "outside_systems_holding_one_of_these_credentials": "Outside systems holding one of these tokens can start a turn as this crew. Create and revoke them on the Webhooks page.",
+      "outside_systems_holding_one_of_these_credentials": "Outside systems holding one of these tokens can start a turn as this agent. Create and revoke them on the Webhooks page.",
       "retry": "Retry",
       "signed": "Signed",
-      "unbound_tokens_can_wake_any_crew_one": "{{count}} token without a crew binding also exists; it can wake any crew, this one included.",
-      "unbound_tokens_can_wake_any_crew_other": "{{count}} tokens without a crew binding also exist; they can wake any crew, this one included.",
+      "unbound_tokens_can_wake_any_crew_one": "{{count}} token without an agent binding also exists; it can wake any agent, this one included.",
+      "unbound_tokens_can_wake_any_crew_other": "{{count}} tokens without an agent binding also exist; they can wake any agent, this one included.",
       "webhook": "Webhook",
-      "webhooks_that_wake_this_crew": "Webhooks that wake this crew"
+      "webhooks_that_wake_this_crew": "Webhooks that wake this agent"
     },
     "shortcutsModal": {
       "panel_toggles": "Panel toggles",
@@ -2941,6 +3065,10 @@
       "not_deployed_2": "Not deployed",
       "open_folder": "Open folder {{name}}",
       "preview": "Preview: {{slug}}",
+      "promote_slug_taken_title": "Saved under a different address",
+      "promote_slug_taken_body": "That name was taken, so your document was saved as “{{slug}}”. “{{taken}}” still holds the older artifact.",
+      "promote_slug_taken_open": "Open {{slug}}",
+      "promote_slug_taken_open_older": "Open older {{taken}}",
       "published": "Published ({{visibility}})",
       "published_sync_issue": "Published (sync issue)",
       "remove_artifact_confirm": "Remove artifact “{{slug}}” from your library?\n\nThis deletes the artifact entry and its version history. If this artifact came from a file on disk or a chat widget, the original is NOT touched — you can re-add it later.",
@@ -3075,7 +3203,8 @@
         "more_actions": "More actions",
         "needs_active_chat": "Available once this chat finishes opening",
         "needs_earlier_history_count_one": "Select to load earlier history — {{count}} earlier message remains",
-        "needs_earlier_history_count_other": "Select to load earlier history — {{count}} earlier messages remain"
+        "needs_earlier_history_count_other": "Select to load earlier history — {{count}} earlier messages remain",
+        "share_message": "Share as image"
       },
       "chatNavPanel": {
         "link": "Link"
@@ -3119,6 +3248,7 @@
       },
       "sideChat": {
         "ask_a_side_question_2": "Ask a side question…",
+        "context_only_tools_unavailable": "Context only · Tools and MCPs are unavailable here. Use the main chat to take action.",
         "question_too_long": "Question too long — reduce to under ~{{max}} characters (yours: {{current}})",
         "queue_cancel_failed": "Could not cancel that queued question",
         "queue_edit_failed": "Could not update that queued question",
@@ -3179,7 +3309,6 @@
         "open_in_subagents_sidebar": "Open {{label}} in subagents sidebar",
         "retry_failed_count": "Retry failed ({{count}})",
         "stop_all": "Stop all",
-        "stop_all_running_subagents": "Stop all running subagents",
         "stop_running_subagent": "Stop running subagent",
         "stop_subagent": "Stop subagent {{name}}"
       },
@@ -3308,6 +3437,37 @@
         "minimize_pinned_prompt": "Minimize pinned turn",
         "pinned_turn": "Pinned turn",
         "restore_pinned_prompt": "Restore pinned turn"
+      },
+      "share": {
+        "title": "Share to social media",
+        "description": "Turn this reply into a share card you can post anywhere.",
+        "preview_label": "Card preview",
+        "edit_hint": "Click the card text to edit it",
+        "card_footer": "Made with {{productName}}",
+        "include_question": "Include my question",
+        "caption_label": "Post text",
+        "caption_template": "{{productName}} just did this for me {{link}} #AIAgent",
+        "char_count": "{{count}} / {{limit}} · X limit",
+        "download_png": "Download PNG",
+        "copy_image_text": "Copy image + text",
+        "share_on_x": "Share on X",
+        "share_on_linkedin": "Share on LinkedIn",
+        "copied": "Copied — paste the image into the post box",
+        "copy_unavailable": "Clipboard unavailable here — the image was downloaded instead",
+        "intent_hint": "The post box opens with your text prefilled; paste the copied image to attach the card.",
+        "kind_aws_key": "an AWS access key",
+        "kind_token": "an API token",
+        "kind_private_key": "a private key",
+        "kind_local_path": "a local file path",
+        "kind_internal_url": "an internal URL",
+        "card_wordmark": "{{productName}}",
+        "sensitive_in_card": "Before you share — the card contains: {{kinds}}",
+        "sensitive_in_caption": "Before you share — the post text contains: {{kinds}}",
+        "withdrawn_by_policy": "Sharing was turned off by policy. Copy your text now if you want to keep it — it is not saved when you close this dialog.",
+        "copy_text_only": "Copy text",
+        "copied_text": "Copied",
+        "copy_text_failed": "Copy failed",
+        "copy_text_unavailable": "Clipboard is blocked here. Your post text is selected — press Ctrl+C / ⌘C. Copy card edits from the card itself."
       }
     },
     "chatPage": {
@@ -3369,7 +3529,9 @@
       "delete_folder_confirm": "Delete “{{name}}”? Sessions will be ungrouped.",
       "filter_tags": "Filter tags: {{name}}",
       "folder_2": "Folder {{name}}",
+      "folder_create_failed": "Could not create the chat.",
       "folder_options_for": "Folder options for {{name}}",
+      "folder_project_dir_missing": "The folder's project directory no longer exists: {{path}}. Update it in Folder settings.",
       "goal_loop_cycle": "Goal loop · cycle {{count}} of {{total}}",
       "goal_loop_cycle_no_cap": "Goal loop · cycle {{count}} (no cap)",
       "goal_loop_interrupted_title": "Goal loop armed — last turn was interrupted; resume the chat or wait for the next cycle",
@@ -3409,6 +3571,7 @@
       "show_hidden_folder_one": "Show {{count}} hidden folder",
       "show_hidden_folder_other": "Show {{count}} hidden folders",
       "sub_agent_needs_approval_one": "{{count}} sub-agent needs approval",
+      "runs_on_crew": "Runs on {{name}} — a connected crew, not this machine",
       "sub_agent_needs_approval_other": "{{count}} sub-agents need approval",
       "switch_failed": "Switch failed",
       "switch_to_board_view": "Switch to board view",
@@ -3467,7 +3630,7 @@
     },
     "connectionsPage": {
       "action_failed": "Action failed: {{error}}",
-      "authorize": "Authorize",
+      "before_you_connect": "Before you connect",
       "cancel": "Cancel",
       "complete_connection": "Complete",
       "connect": "Connect",
@@ -3492,6 +3655,11 @@
       "invalid_return_address": "Paste the full http://127.0.0.1:PORT/?code=… address from your browser.",
       "managed_by_connections": "Managed by Connections",
       "mcp_servers": "MCP Servers",
+      "mint_failure_process_gone": "The authorization process stopped before approval finished. Try connecting again.",
+      "mint_failure_server_absent": "The MCP server entry disappeared before authorization could start. Try connecting again.",
+      "mint_failure_timed_out": "Authorization setup timed out before an approval address was ready. Try connecting again.",
+      "mint_failure_unknown": "Authorization setup failed before an approval address was ready. Try connecting again.",
+      "mint_failure_url_rejected": "The provider returned an approval address containing credential-like data, so it was not displayed.",
       "needs_attention": "Needs attention",
       "no_matching_services": "No services match this search.",
       "not_connected": "Not connected",
@@ -3500,6 +3668,10 @@
       "not_verified_help": "{{productName}} cannot see the authorization for {{provider}} — the Kiro CLI holds the token. If an agent can already call it, it is working; if not, it still needs authorization.",
       "official_mcp_server": "Official MCP server",
       "open_managed_connection": "Open the {{provider}} connection card",
+      "prerequisite_atlassian": "Requires an Atlassian account with a Jira or Confluence site — without one, the consent page's Accept button stays disabled.",
+      "prerequisite_gitlab": "Enable GitLab Duo with beta and experimental features, and allow MCP server access for your top-level group — without them, connecting succeeds but exposes no tools.",
+      "prerequisite_gitlab_steps": "Enable GitLab Duo with beta and experimental features, and allow MCP server access for your top-level group.",
+      "prerequisites_for_provider": "{{provider}} prerequisites",
       "reconnect": "Reconnect",
       "reconnecting": "Reconnecting…",
       "relaying": "Sending…",
@@ -3514,7 +3686,9 @@
       "services": "Services",
       "services_available": "{{value}} available",
       "test_connection": "Test",
+      "test_blocked_by_sibling": "One connection test runs at a time — {{provider}} is testing",
       "test_failed": "The provider did not pass the connection test.",
+      "test_in_flight": "A connection test for {{provider}} is already running. Try again once it finishes.",
       "testing": "Testing…",
       "unknown_error": "Unknown error",
       "value_prop_atlassian": "Search Jira issues and read Confluence pages.",
@@ -3683,6 +3857,10 @@
         "config": {
           "description": "{{productName}} and agent configuration viewers (read-only)",
           "label": "Config"
+        },
+        "debugTools": {
+          "label": "Debug tools",
+          "description": "Overlays that report what the app is doing to itself, on the device where it happens."
         },
         "featurePreviews": {
           "description": "Unreleased features and pages, hidden from the sidebar and from Search Everywhere until you turn them on here. Per-device, and unpolished on purpose.",
@@ -3874,10 +4052,6 @@
         "title": "Ingestion Settings",
         "description": "Control how documents are extracted, indexed, and rate-limited. Changes take effect on the next watcher sweep unless noted otherwise.",
         "save_failed": "Failed to save knowledge setting",
-        "chunk_limit_label": "Per-source chunk limit",
-        "chunk_limit_desc": "Maximum chunks a single source may ingest per scan cycle. Each chunk costs one LLM extraction call. 0 = no limit.",
-        "max_sources_label": "Max sources",
-        "max_sources_desc": "Maximum number of auto-discovered knowledge sources. Manually added sources are not capped. 0 = no limit.",
         "embed_rate_label": "Embedding rate limit",
         "embed_rate_desc": "How many embedding requests per minute when indexing documents into the vector store. Lower values reduce system load but slow down indexing. 0 = unlimited.",
         "model_label": "Extraction model",
@@ -3888,8 +4062,6 @@
         "requires_restart": "restart required",
         "auto_add_label": "Auto-add documents",
         "auto_add_desc": "Let the agent add documents it reads during normal work to the Knowledge Library.",
-        "auto_project_label": "Auto-register project documents",
-        "auto_project_desc": "Register documents from each project you work in as a Knowledge source automatically.",
         "auto_artifacts_label": "Auto-add saved artifacts",
         "auto_artifacts_desc": "Mirror documents you save as artifacts into the Knowledge Library.",
         "load_failed": "Failed to load settings.",
@@ -4134,7 +4306,8 @@
         "failed_to_load_prompts": "Failed to load prompts",
         "no_prompts_match_query": "No prompts match “{{query}}”.",
         "saved_prompts_from": "Saved prompts from {{registry}} and ~/.kiro/prompts/. Invoke with @name in chat or /prompts get name.",
-        "user_prompts_count": "User Prompts ({{count}})"
+        "user_prompts_count": "User Prompts ({{count}})",
+        "retry_read": "Retry"
       },
       "skillsTab": {
         "adds_new_requirements_to": "Adds new requirements to {{target}} — {{description}}",
@@ -4201,7 +4374,8 @@
         "scope_hint_no_project": "Workspace scope needs a project. Open a chat, choose a folder with the project button beside the composer, then reopen this dialog.",
         "scope_hint_project_conflict": "Your open chats are on different projects, so no single project applies. Close or re-point one, then reopen this dialog.",
         "conflict_while_editing": "This file belongs to a project that is no longer active, so it cannot be saved here. Copy your changes somewhere safe before closing the editor.",
-        "conflict_list_refreshed": "The active project changed, so this list has been refreshed."
+        "conflict_list_refreshed": "The active project changed, so this list has been refreshed.",
+        "linked_read_only": "Linked from {{target}} — read-only. Edit the target file instead."
       },
       "displayTab": {
         "change_the_dashboard_font_family_persists_across": "Change the dashboard font family. Persists across sessions.",
@@ -4410,6 +4584,23 @@
       "script_source_download": "Download script",
       "script_source_failed": "Could not load the script source.",
       "script_source_truncated": "Truncated — the script is larger than the preview limit.",
+      "secrets_active_help": "Injected into this job's environment at run time. Names only — values stay in the vault.",
+      "secrets_approve": "Approve",
+      "secrets_deny": "Deny",
+      "secrets_direction_caption": "environment variable ← vault secret",
+      "secrets_none": "No secrets granted.",
+      "secrets_none_hint": "Ask the agent to request secrets for this job.",
+      "secrets_pending_badge": "Secret request awaiting approval",
+      "secrets_pending_help": "Approving injects these vault values into this job's environment at run time. The approval is pinned to the job's current code — if the script or command changes later, injection stops until you approve again.",
+      "secrets_pending_source": "Script this approval covers",
+      "secrets_pending_source_failed": "The script source could not be loaded, so this request cannot be approved.",
+      "secrets_pending_source_loading": "Loading the script this request would run. Approval unlocks once it is shown.",
+      "secrets_pending_source_truncated": "This script is larger than the reviewable limit, so this request cannot be approved.",
+      "secrets_pending_source_unreviewable": "Parts of this script cannot be shown as written (masked credential-like text or undecodable bytes), so what you see is not exactly what would run. This request cannot be approved.",
+      "secrets_pending_title": "Agent requested secrets",
+      "secrets_section": "Vault secrets",
+      "secrets_revoke_all": "Revoke all secrets",
+      "secrets_revoke_all_confirm": "Revoke all?",
       "confirm": "Confirm"
     },
     "servicesTab": {
@@ -4751,8 +4942,6 @@
         "update_setting_failed": "Failed to update setting: {{error}}"
       },
       "remoteCrewPanel": {
-        "chat_on_a_crew": "Chat on a crew",
-        "chat_on_a_crew_desc": "Adds “New chat on crew” to the create menu, which starts a session that runs on a connected crew. Unfinished: it opens in that crew’s own pane, and sessions running on a crew are not listed here yet.",
         "auto_connect": "Auto-connect crews",
         "auto_connect_desc": "When on, opening the web app connects every crew automatically, and reconnects them when you come back to the tab. Turn off to connect a crew only when you switch to it."
       },
@@ -4900,6 +5089,7 @@
         "gov_scope_sandbox_level": "Sandbox level",
         "gov_scope_script_hooks": "Script hooks",
         "gov_scope_spawn": "Spawn",
+        "gov_scope_social_share": "Share as image",
         "gov_scope_telemetry": "Anonymous telemetry",
         "gov_scope_theme_install": "Theme install",
         "gov_scope_theme_persona": "Theme persona",
@@ -5019,7 +5209,13 @@
         "unavailable_import_failed": "The speech recogniser is installed but could not be loaded on this machine.",
         "unavailable_model_missing": "The speech model is not on this machine yet. Download it below.",
         "unavailable_apple_unsupported": "Apple Speech needs macOS 26 or newer. Choose the local provider instead.",
-        "unavailable_apple_needs_toolchain": "Apple Speech needs the Xcode command line tools. Install them, then reload this page."
+        "unavailable_apple_needs_toolchain": "Apple Speech needs the Xcode command line tools. Install them, then reload this page.",
+        "decoder_fetch_prompt": "{{productName}} can fetch a digest-verified copy for this machine, so nothing has to be installed by hand.",
+        "download_decoder": "Download decoder",
+        "decoder_download_failed_reason": "The decoder download failed: {{error}}",
+        "let_the_agent_fix_it": "Let {{productName}} fix it",
+        "decoder_failure_unknown": "not reported",
+        "decoder_agent_prompt": "The audio decoder (ffmpeg) that {{productName}} needs in order to transcribe voice recordings could not be installed. Please get it working on this host.\n\nWhat failed: {{code}} — {{detail}}\nHost: {{os}} {{arch}}\n\n{{productName}} only executes an ffmpeg whose bytes match a pinned SHA-256 digest, and it looks in exactly these places: /usr/local/bin, /opt/homebrew/bin, this operating system's own program directories, and its own digest-verified decoder store at <data home>/models/ffmpeg/. The path is never the trust anchor, so ~/.local/bin is deliberately NOT trusted and a copy left there is ignored.\n\nWork out what this host actually needs — a package manager, a build from source, or another attempt at the decoder download — and decide for yourself whether elevated privileges are appropriate before using any. When you are done, re-check GET /api/stt/status and confirm that the Voice settings page no longer reports a missing decoder."
       },
       "teamsPanel": {
         "active": "Active",
@@ -5325,6 +5521,15 @@
     "worldsPopout": {
       "hide_controls": "Hide controls",
       "show_controls": "Show controls"
+    },
+    "developer": {
+      "agentBackendTab": {
+        "codex_signs_in_separately": "Codex signs in on its own: finish its sign-in, or name a model provider in ~/.codex/config.toml (CODEX_HOME moves that folder). Neither is checked here — the adapter reads them, not {{productName}}."
+      },
+      "featurePreviewsTab": {
+        "chat_on_a_crew": "Chat on a crew",
+        "chat_on_a_crew_desc": "Adds “New chat on crew” to the create menu, which starts a session that runs on a connected crew. Unfinished: it opens in that crew’s own pane, and sessions running on a crew are not listed here yet."
+      }
     }
   },
   "privacyDisclosure": {
@@ -5366,6 +5571,10 @@
         "description": "Language for the dashboard interface.",
         "label": "Language",
         "sync_failed": "Couldn't save this to your {{productName}} config — the language applies in this browser only and may reset on reload."
+      },
+      "plainDiff": {
+        "description": "Render diffs as plain unified-diff text instead of syntax-highlighted colour. Uses less memory on large diffs.",
+        "label": "Plain diffs"
       }
     },
     "groups": {
@@ -5450,7 +5659,8 @@
     },
     "offline": {
       "disabled_gateway_offline": "{{label}} disabled — gateway offline",
-      "gateway_offline_reconnect": "Gateway offline — reconnect to {{action}}"
+      "gateway_offline_reconnect": "Gateway offline — reconnect to {{action}}",
+      "submit_comments": "submit comments"
     },
     "popoutController": {
       "your_browser_blocked_the_pop_out_window_allow_po": "Your browser blocked the pop-out window. Allow pop-ups for this site and try again."
@@ -5568,7 +5778,12 @@
       "xhigh": "Extra High"
     },
     "sttProviders": {
-      "downloading_speech_model": "Downloading the speech model: {{pct}} ({{done}} of {{total}})"
+      "downloading_decoder": "Downloading the audio decoder: {{pct}} ({{done}} of {{total}})",
+      "downloading_speech_model": "Downloading the speech model: {{pct}} ({{done}} of {{total}})",
+      "stream_error_decode_failed": "Speech recognition could not finish this transcript. Dictate it again.",
+      "stream_error_max_duration": "Dictation reached its length limit. Start a new recording to continue.",
+      "stream_error_model_missing": "The speech model is not ready yet. Download it in the speech-to-text settings, then try again.",
+      "stream_error_session_failed": "The dictation session failed. Try recording again."
     }
   },
   "autoImprovement": {

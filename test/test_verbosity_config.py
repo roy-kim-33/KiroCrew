@@ -333,6 +333,31 @@ class TestAnswerOnlyBlock:
         )
         assert "evidence is opt-in: leave it out and offer it" in result
 
+    def test_answer_only_bounds_a_halted_or_deviated_task(self):
+        """Measured gap this closes: told to fold three things into a PR, the
+        model found that main had moved, correctly stopped -- and then wrote
+        seven paragraphs justifying the stop (what landed, a quoted docstring,
+        the design collision, why its own call was right) before the two
+        decisions the user actually had to make. Every other rule frames the
+        reply as answering a QUESTION, so a deviation had no answer shape and
+        the derivation became the reply. Justifying a deviation feels
+        non-optional in a way that explaining an answer does not, so the rule
+        has to say the reasoning is opt-in like any other explanation. ORDER is
+        the load-bearing half: the user's own manual repair of that reply
+        ("what is the suggested action here with simple words") produced an
+        imperative first line followed by two sentences of state, so the rule
+        names the action as the opener explicitly -- an unordered "state and
+        call" still licenses opening on the situation, which is the wall.
+        """
+        result = _resolve("{{VERBOSITY_BLOCK}}", "dashboard:x", verbosity="answer_only")
+        assert "Stopping or deviating is still an answer" in result
+        assert "LEAD WITH THE ACTION you recommend" in result
+        assert "not with what you found, not with the situation" in " ".join(
+            result.split()
+        )
+        assert "at most two sentences of the state" in result
+        assert "Justifying a deviation feels mandatory; it is not" in result
+
     def test_the_answer_itself_is_bounded_per_item(self):
         """The gap the user was papering over by hand. Every length rule in the
         block governed EXPLANATION -- the one-sentence cap, the cut list, plain
@@ -422,6 +447,49 @@ class TestAnswerOnlyBlock:
         # The old wholesale flip must be gone, or both readings survive and the
         # model picks the longer one.
         assert "The moment the user asks why" not in one_line
+
+    def test_the_whole_reply_is_pinned_to_explain_for_age_10(self):
+        """The bare plain-words rule left the register to taste, and the same
+        block also says answer like an expert -- so replies drifted back into
+        jargon. The `explain-for` skill already carries a calibrated Age 10 row,
+        so the block names it as the register for the WHOLE reply rather than
+        re-deriving one, and names it as the default so it is not a per-reply
+        judgement call the model can decline.
+        """
+        result = _resolve("{{VERBOSITY_BLOCK}}", "dashboard:x", verbosity="answer_only")
+        one_line = " ".join(result.split())
+        assert "Write the WHOLE reply at the `explain-for` skill's Age 10" in one_line
+        assert "That Age 10 row is the register for everything this mode emits" in one_line
+        assert "not a choice you weigh per reply" in one_line
+        # Register and depth are separate axes; conflating the two is how a
+        # plain-words rule turns into a licence to write more.
+        assert "It sets the REGISTER, never the depth" in one_line
+        assert "costs the answer nothing" in one_line
+
+    def test_the_age_10_pin_borrows_calibration_not_length(self):
+        """Pointing at another document imports whatever else it says, and
+        `explain-for` lifts terseness for explanation requests. Unscoped, the
+        two documents disagree about length and the model takes the longer
+        reading, which is the exact failure this mode exists to prevent. The pin
+        therefore borrows the calibration only and restates that the length
+        bound survives -- plus the two things that genuinely outrank it.
+        """
+        result = _resolve("{{VERBOSITY_BLOCK}}", "dashboard:x", verbosity="answer_only")
+        one_line = " ".join(result.split())
+        assert "load `explain-for`, follow its Age 10 row" in one_line
+        assert "its terseness clause lifts the ban on explaining, not" in one_line
+        assert "every length rule above still holds" in one_line
+        assert "An audience named in the request wins over Age 10" in one_line
+
+    def test_the_age_10_pin_is_unique_to_answer_only(self):
+        """The pin is a property of this tier, not house style. `concise` and
+        `ultra` have their own registers, and copying the pin upward would erase
+        the distinction between the levels.
+        """
+        for level in ("concise", "ultra"):
+            other = _resolve("{{VERBOSITY_BLOCK}}", "dashboard:x", verbosity=level)
+            assert "Age 10" not in other
+            assert "explain-for" not in other
 
     def test_unrequested_explanation_is_the_rare_exception(self):
         """The block previously carried a broad judgement-based licence to

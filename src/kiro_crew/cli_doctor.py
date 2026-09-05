@@ -55,7 +55,7 @@ from kiro_crew.config.paths import (
 )
 from kiro_crew.config.superseded_defaults import render_doctor_section
 from kiro_crew.constants import MIN_NODE_MAJOR
-from kiro_crew.cron import unhealthy_jobs_from_disk
+from kiro_crew.cron import job_pause_state_from_disk, unhealthy_jobs_from_disk
 from kiro_crew.dashboard.crash_dump_store import (
     dump_age_seconds,
     dump_first_stack_lines,
@@ -106,6 +106,7 @@ from kiro_crew.service import common as common_service
 from kiro_crew.service import controller as service_controller
 from kiro_crew.service import linux as service_linux
 from kiro_crew.session_pid_sig import signing_health
+from kiro_crew.stall_attribution import attribute_dump, describe
 from kiro_crew.subprocess_utf8 import UTF8_TEXT
 from kiro_crew.transcribe import _find_ffmpeg, availability_detail, ensure_ffmpeg_in_path
 from kiro_crew.validation import _AGENT_NAME_RE
@@ -994,6 +995,62 @@ def _doctor_data_home() -> None:
     )
 
 
+def _doctor_cron_script_sources(issues: list[str]) -> None:
+    """Report deployed cron scripts that no longer agree with their skill-asset source.
+
+    The packaged-to-installed hop is content-verified, ``scripts/`` included. The
+    installed-to-``crons/`` hop is a hand-run ``cp`` documented in the owning
+    skill, and nothing compares its two sides -- so a deploy can run superseded
+    code indefinitely while looking healthy, which is how the shipped PR watch
+    came to re-emit its wake footer once per observation long after the package
+    had split that out.
+
+    Divergence is reported WITHOUT a direction. A cron script body is
+    LLM-writeable by design, so the two sides disagreeing can mean a stale deploy
+    or a deliberate local edit, and nothing on disk distinguishes them. Doctor
+    surfaces the disagreement and leaves the reconciliation to whoever knows
+    which they intended.
+
+    Silent when nothing deployed has a source: a cron script without one is out
+    of scope here, not a finding.
+    """
+    from kiro_crew.skills import (
+        CRON_SOURCE_DIVERGED,
+        CRON_SOURCE_IN_SYNC,
+        deployed_cron_script_sources,
+    )
+
+    states = deployed_cron_script_sources()
+    if not states:
+        return
+
+    print("\nCron Script Sources")
+    for state in states:
+        # Both halves are read off disk and BOTH go through _safe_display. The
+        # crons dir is agent-writeable by design (see cron_script.py), so a
+        # deployed script's name is not merely untrusted in the abstract -- the
+        # design deliberately lets an agent choose it. A diagnostic that reads
+        # those names and prints them raw is exactly the wrong consumer for such
+        # a directory: an OSC/ANSI sequence or a newline in a filename would
+        # drive the terminal or forge the surrounding verdict lines.
+        name = _safe_display(state.name)
+        source = _safe_display(str(state.source))
+        if state.state == CRON_SOURCE_IN_SYNC:
+            print(f"  {name}:  ✅ agrees with {source}")
+        elif state.state == CRON_SOURCE_DIVERGED:
+            print(f"  {name}:  ❌ DIVERGED from {source}")
+        else:
+            print(f"  {name}:  ⏹ could not be compared against {source}")
+
+    if any(state.state == CRON_SOURCE_DIVERGED for state in states):
+        issues.append("deployed cron script diverged from its skill source")
+        print(
+            "               Reconcile using the owning skill's own copy recipe. "
+            "A diverged copy may be a stale deploy OR an intentional local edit "
+            "-- doctor cannot tell which, so it does not overwrite either one."
+        )
+
+
 def _doctor_managed_service_policy(issues: list[str]) -> None:
     """Surface installed service definitions that predate launch-class policy."""
     state = service_controller.installed_service_has_managed_marker()
@@ -1423,6 +1480,8 @@ def _linger_enabled(user: str) -> bool | None:
             ["loginctl", "show-user", user, "-p", "Linger", "--value"],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=5,
         )
     except (OSError, subprocess.SubprocessError):
@@ -1659,6 +1718,8 @@ def _detect_userspace_oom_killer() -> str | bool | None:
                 [systemctl, "is-active", unit],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=5,
             )
         except (OSError, subprocess.SubprocessError):
@@ -2748,6 +2809,8 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
                     [KIRO_CLI_BIN, "whoami"],
                     capture_output=True,
                     text=True,
+                    encoding="utf-8",
+                    errors="replace",
                     timeout=10,
                 )
                 if r.returncode == 0:
@@ -2807,6 +2870,8 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
                 ["node", "-v"],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=5,
             )
             major = int(node_ver_result.stdout.strip().lstrip("v").split(".")[0])
@@ -2946,6 +3011,7 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
 
     # ── Data Home (+ leftover legacy home) ──
     _doctor_data_home()
+    _doctor_cron_script_sources(issues)
     _doctor_path_launcher()
     _doctor_trust_root()
     _doctor_strict_identity(cfg)
@@ -3361,6 +3427,25 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
                     print("  MainThread stuck at:")
                     for _line in _stack:
                         print(f"    {_line}")
+                # Who the loop was working for. Read from the dump's wedged
+                # stack and the cron in-flight markers on disk -- no gateway
+                # needed -- and phrased as evidence plus the one action it
+                # supports, or the statement that it supports none.
+                _attribution = attribute_dump(_latest, config_dir())
+                print("  attribution:")
+                for _line in describe(_attribution):
+                    print(f"    {_line}")
+                # Same predicate as the breaker and describe(): a lone marker
+                # under a chat/Slack stack is a bystander, not the culprit.
+                if _attribution.is_cron and _attribution.job is not None:
+                    _paused_job = job_pause_state_from_disk(_attribution.job.job_id)
+                    if _paused_job is not None:
+                        print(f"    job is currently {_paused_job}")
+                    issues.append(
+                        "loop-stall dump attributed to cron job "
+                        f"{_safe_display(_attribution.job.name)} "
+                        f"({_safe_display(_attribution.job.job_id)})"
+                    )
                 issues.append(f"recent loop-stall crash dump ({_age_h:.0f}h ago)")
             else:
                 print(
@@ -3376,7 +3461,12 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
     print("\nConnectivity")
     if kiro:
         kiro_result = subprocess.run(
-            [KIRO_CLI_BIN, "--version"], capture_output=True, text=True, timeout=5
+            [KIRO_CLI_BIN, "--version"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5,
         )
         if kiro_result.returncode == 0:
             ver = kiro_result.stdout.strip() or kiro_result.stderr.strip()

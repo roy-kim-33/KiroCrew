@@ -65,9 +65,7 @@ src/kiro_crew/computer_use/cli.py 68.8   # 130/189
 src/kiro_crew/computer_use/macos_skylight.py 54.8   # 142/259
 src/kiro_crew/conpty.py 27.9   # 12/43
 src/kiro_crew/dashboard/_types.py 0.0   # 0/3
-src/kiro_crew/dashboard/handlers/cron.py 70.9   # 400/564
 src/kiro_crew/dashboard/handlers/portability.py 17.0   # 15/88
-src/kiro_crew/dashboard/handlers/prompts.py 64.5   # 260/403
 src/kiro_crew/dashboard/handlers/weixin_qr.py 47.0   # 119/253
 src/kiro_crew/dashboard/handlers/workflows.py 20.4   # 23/113
 src/kiro_crew/dashboard/handlers_channel.py 40.4   # 84/208
@@ -90,6 +88,5 @@ src/kiro_crew/slack/client.py 67.2   # 246/366
 src/kiro_crew/suggestions.py 18.7   # 31/166
 src/kiro_crew/telegram/client.py 61.8   # 306/495
 src/kiro_crew/telegram/gateway.py 15.5   # 11/71
-src/kiro_crew/tips.py 64.9   # 335/516
 src/kiro_crew/webex/client.py 64.1   # 173/270
 src/kiro_crew/weixin/gateway.py 20.4   # 11/54

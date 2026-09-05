@@ -313,6 +313,38 @@ _MULTIBYTE_TABLE = str.maketrans(
 # skills+steering pushed the total over. Independent caps (per the design) are
 # what make usage-ranked top-K meaningful; the cost is a larger startup
 # context (the sum), NOT a smaller memory budget.
+def _member_backend_can_dispatch(cfg: "KiroCrewConfig | None" = None) -> bool:
+    """Whether the configured member backend can mount the dispatch tools.
+
+    The member operating-mode block teaches ``session_*`` tools that arrive as
+    a per-session mount — a capability only wire-capable backends have. When
+    ``agent.member_acp_backend`` resolves outside that set (governance refusal,
+    unknown value degrading to kiro), the tools are simply not mounted, and
+    injecting instructions for tools the session does not hold would send the
+    member chasing refusals. Fail-safe both ways: on any resolution error the
+    block is withheld, which degrades to plain chat rather than to a lie.
+
+    ``cfg`` lets a caller that already loaded the config share the handle —
+    the context builder calls this once per member turn, so a second disk
+    read would be pure waste.
+    """
+    try:
+        from kiro_crew.acp_backends import (
+            ACP_BACKENDS_MEMBER_DISPATCH,
+            resolve_selected_backend,
+        )
+
+        if cfg is None:
+            from kiro_crew.config import KiroCrewConfig
+
+            cfg = KiroCrewConfig.load()
+        backend = resolve_selected_backend(cfg.agent.member_acp_backend)
+        return backend in ACP_BACKENDS_MEMBER_DISPATCH
+    except Exception:
+        logger.debug("member backend capability check failed", exc_info=True)
+        return False
+
+
 def _budget(fraction: float) -> int:
     """A section char cap as a percentage of the budget base."""
     return int(_CONTEXT_BUDGET_BASE * fraction)
@@ -1070,6 +1102,27 @@ def _build_ui_language_section(cfg: "KiroCrewConfig") -> str:
     )
 
 
+def steering_target_admissible(resolved: Path, base: Path | None = None) -> bool:
+    """Admission gate for a steering document's RESOLVED path.
+
+    The session loader (:func:`_load_steering_resources`) admits a glob hit —
+    symlinks included, since ``Path.resolve()`` follows them — when the target
+    stays under the trust base, is a regular file, and is not a sensitive
+    location. *base* defaults to ``$HOME``, the loader's own anchor; the
+    dashboard's steering listing admits a leaf symlink through this same
+    predicate with the source's LINK trust base (``$HOME`` for ``user``, the
+    steering root itself for ``workspace``), so a repository-committed link
+    can never read outside the root it ships in, and the ``user`` case cannot
+    disagree with what the loader injects.
+    """
+    base_resolved = str((base or Path.home()).resolve()) + os.sep
+    return (
+        str(resolved).startswith(base_resolved)
+        and resolved.is_file()
+        and not is_sensitive_path(str(resolved))
+    )
+
+
 def _load_steering_resources() -> str:
     """Load steering files from the agent config's resources array.
 
@@ -1102,21 +1155,13 @@ def _load_steering_resources() -> str:
             return ""
         resources = cfg.get("resources", [])
         parts: list[str] = []
-        home_resolved = str(Path.home().resolve()) + os.sep
         for res in resources:
             if not isinstance(res, str) or not res.startswith("file://"):
                 continue
             raw_pattern = res.removeprefix("file://")
             base = Path.home()
             for p in sorted(base.glob(raw_pattern)):
-                resolved = p.resolve()
-                if not str(resolved).startswith(home_resolved):
-                    continue
-                if (
-                    resolved.is_file()
-                    and p.suffix == ".md"
-                    and not is_sensitive_path(str(resolved))
-                ):
+                if p.suffix == ".md" and steering_target_admissible(p.resolve()):
                     try:
                         parts.append(safe_read_file(str(p)))
                     except PermissionError:
@@ -1149,6 +1194,14 @@ _DIFF_RULE_DASHBOARD = (
     "`+++ new_path` headers and an `@@` hunk line; use /dev/null for new "
     "files / deletions — the headers let the dashboard's diff viewer link to "
     "the file), because no card is rendered for those.\n"
+    "When a substantive report, synthesis, or results table is NOT your turn's "
+    "final message (more tool calls or messages follow it), end that message "
+    "with <!-- keep-visible --> as its final line. The dashboard transcript's "
+    "collapse-all mode shows only the turn's last substantive message and folds "
+    "earlier ones into the collapsed steps pane; this marker exempts the "
+    "message so mid-turn deliverables stay visible. The marker is an HTML "
+    "comment and renders as nothing in the dashboard -- do not use it on "
+    "routine progress notes, only on content the user must see.\n"
 )
 _DIFF_RULE_CHANNEL = (
     "After ANY file change (create, edit, append, delete), you MUST show a "
@@ -1997,7 +2050,10 @@ class ContextBuilder:
                 "destructive one-liner handed over with no undo path is not a "
                 "terse answer, it is a trap.\n"
                 "- Plain words, short sentences, and the point at the front of "
-                "each one. Plain does not mean childish — write for a capable "
+                "each one. Write the WHOLE reply at the `explain-for` skill's "
+                "Age 10 row: everyday words, plain cause and effect, and no "
+                "term that is not itself the fact. Plain does not mean "
+                "childish — write for a capable "
                 "reader in a hurry, not for a five-year-old. Brevity is not "
                 "enough: a short reply can still be dense and unreadable. Put "
                 "what the user must know in the first few words and stop; do "
@@ -2010,6 +2066,16 @@ class ContextBuilder:
                 "has to be read twice to find the point, rewrite it.\n"
                 "- Answer the question that was asked and nothing adjacent. "
                 "Take a position instead of listing options.\n"
+                "- Stopping or deviating is still an answer, not a case to "
+                "argue. LEAD WITH THE ACTION you recommend, as one plain "
+                "imperative sentence — not with what you found, not with "
+                "the situation. Then at most two sentences of the state that "
+                "makes that action necessary, and stop. What led there — "
+                "what you found, what it collides with, why the old plan no "
+                "longer fits, why your call is right — is explanation, "
+                "and stays opt-in like the rest. Justifying a deviation feels "
+                "mandatory; it is not, and the derivation buries the one thing "
+                "the user has to decide.\n"
                 "- Code, commands, paths, identifiers, error strings and file "
                 "contents stay verbatim and complete — this mode cuts prose, "
                 "never payload. Payload is what the user asked for or has to "
@@ -2037,6 +2103,19 @@ class ContextBuilder:
                 "review, a walkthrough, a deep dive, in detail, everything — "
                 "lifts the bound, and for that reply this mode is off: give "
                 "the full detail they asked for.\n\n"
+                "That Age 10 row is the register for everything this mode "
+                "emits — the answer, the verdict, the warning, the one allowed "
+                "reason, the option labels — and it is the default, not a "
+                "choice you weigh per reply. It sets the REGISTER, never the "
+                "depth: the reader is capable and in a hurry, so it buys "
+                "clarity, costs the answer nothing, and never talks down. When "
+                "the explanation is itself the reply, load `explain-for`, "
+                "follow its Age 10 row, and take its one analogy from the "
+                "reader's own daily life. Borrow only the calibration from that "
+                "skill: its terseness clause lifts the ban on explaining, not "
+                "the length bound, so every length rule above still holds. An "
+                "audience named in the request wins over Age 10, and an "
+                "explicit request for depth still lifts the bound.\n\n"
                 "Explaining in full, unasked, is the rare exception — not a "
                 "lane you look for. The default, even for judgement calls, is "
                 'the terse answer plus a one-line offer (e.g. "say why for '
@@ -2303,12 +2382,50 @@ class ContextBuilder:
                 f"or the task requires it.\n\n"
             )
 
+        # Crew-member operating mode — injected only for a member's pinned DM
+        # session (mode carries the slot's mode; "member" slots are born only
+        # through the members thread route). The member is a CONTROLLER: its
+        # DM thread stays the identity/management loop while real work runs in
+        # worker sessions it dispatches and patrols. The session_* tools this
+        # block names arrive as a per-session mount of the dashboard
+        # session-control server (members.member_dispatch_session_server), and
+        # the server authorizes member callers automatically
+        # (dashboard/session_control.py), bounded to sessions the member
+        # created itself — so the instructions hold with zero configuration.
+        #
+        # circular import: members' module graph is heavy and this file
+        # sits below it in the layering (the same cycle-break
+        # chat_persistence uses for the members module).
+        from kiro_crew.members import DM_SLOT_MODE as _member_mode
+
+        # User-profile / skills config, loaded once and ALSO consulted by the
+        # member capability gate below — one read per context build.
+        _cfg = KiroCrewConfig.load()
+
+        if mode == _member_mode and _member_backend_can_dispatch(_cfg):
+            parts.append(
+                f"[CREW MEMBER OPERATING MODE]\n"
+                f'You are the crew member "{agent_label}". This pinned conversation is '
+                f"your DM thread with the user — your identity, your inbox, and your "
+                f"ledger. Keep it for decisions, reports, and escalations; do NOT run "
+                f"long or heavy work inline here.\n"
+                f"When real work arrives (a task to implement, an investigation to "
+                f"run), DISPATCH it: open a worker session with session_create, seed "
+                f"it with a self-contained brief via session_send (the worker has "
+                f"none of this thread's context), then PATROL your workers with "
+                f"session_read_message on a monitor_start loop — you own noticing a "
+                f"worker that stalled or died, restarting it, or escalating. Stop a "
+                f"runaway with session_stop. You can only control sessions you "
+                f"created.\n"
+                f"Report outcomes back in this thread when work completes or needs "
+                f"a decision only the user can make.\n\n"
+            )
+
         # User profile — onboarding answers (role + technical comfort).
         # Injected for ALL agents like date/agent identity: it describes the
         # person, not the project or workspace. Empty (no block at all) when
-        # the user skipped the questions. The load below is mtime-cached and
-        # shared with the skills lazy-load gate further down.
-        _cfg = KiroCrewConfig.load()
+        # the user skipped the questions. Uses the ``_cfg`` loaded above the
+        # member block, shared with the skills lazy-load gate further down.
 
         # UI language — a rendering contract like [RUNTIME] above, not a
         # communication-style hint: it tells the model which language the
@@ -2722,9 +2839,20 @@ class ContextBuilder:
 
         # Session context on first message only
         if is_new_session:
+            # Resumed sessions (ACP ``session/load`` restored the full native
+            # transcript) already carry the original session-start injection —
+            # agent prompt, memory, lessons, and skills are all preserved in
+            # the restored history. Re-injecting the full session context on
+            # every idle-expire → resume cycle stacks ~40K duplicate tokens
+            # into the same window and accelerates compaction. Inject only the
+            # minimal header (fresh date/time + identity) plus a resume marker
+            # so the model knows where the full context lives.
+            slim_resume = resumed and not minimal_context
             # Agent prompt goes BEFORE session context wrapper
             # so the LLM treats it as its identity, not background info.
-            if is_cc:
+            if slim_resume:
+                agent_prompt = ""
+            elif is_cc:
                 # CC gets the SAME KiroCrew persona prompt as kiro — including
                 # the Output Format rules (diff blocks, image embeds, OPTIONS)
                 # which are dashboard UI contracts, not kiro-specific. Only the
@@ -2765,7 +2893,7 @@ class ContextBuilder:
                 mode=mode,
                 blocks_reads=blocks_reads,
                 provider_type=provider_type,
-                minimal_context=minimal_context,
+                minimal_context=minimal_context or slim_resume,
                 runtime_source=runtime_source,
                 exclude_last_n=exclude_last_n,
                 model_window=model_window,
@@ -2798,7 +2926,27 @@ class ContextBuilder:
                     )
                 else:
                     session_ctx = _neutralize_structural_markers(session_ctx)
-                if minimal_context:
+                if slim_resume:
+                    # Re-anchor the critical rules (dashboard/Slack UI
+                    # contracts: diff blocks, [OPTIONS:] buttons, absolute
+                    # paths). They were injected at the original session start
+                    # but sit deep in — and may be compacted out of — the
+                    # restored transcript; at ~1.5K chars they are cheap
+                    # insurance against output-format drift. Same variant
+                    # selection and per-agent opt-out gate as session start.
+                    _resume_rules = (
+                        _critical_rules_for(session_key, runtime_source)
+                        if _agent_includes_crew_context(agent)
+                        else ""
+                    )
+                    parts.append(
+                        "[SESSION RESUMED — the full session context (agent "
+                        "system prompt, memory, lessons, skills) was injected "
+                        "at the original session start and is preserved in the "
+                        "restored conversation history above. Refreshed rules "
+                        "and date/identity follow.]\n" + _resume_rules + session_ctx
+                    )
+                elif minimal_context:
                     parts.append(session_ctx)
                 else:
                     parts.append(

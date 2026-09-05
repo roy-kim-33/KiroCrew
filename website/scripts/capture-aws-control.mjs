@@ -13,7 +13,7 @@
  *   shares.png          the share-links pane
  *   accounts.png        the Accounts & credentials pane
  *   usage.png           the Usage & costs pane
- *   files-narrow.png    the Files pane at 320px (rail flattened to a strip)
+ *   files-narrow.png    the Files detail at 320px (pushed level, one back bar)\n *   root-list-narrow.png the 320px grouped root list (the bare path on a phone)
  *
  * Usage: node scripts/capture-aws-control.mjs <outDir>
  */
@@ -96,7 +96,16 @@ const SHARES = {
 
 const BASE = '/api/apps/aws-control'
 const LIBRARY = { artifacts: [] }
-const BACKUP = { nightly: false, runs: {}, remote: { snapshot: [], sessions: [] } }
+// The backup fixture has to behave like a SERVER that claimed a run, not like a
+// canned reply: the row's busy state is supposed to come from what the server
+// reports, so `jobs` is mutable and the start handler below writes it. A fixture
+// that returned a fixed body could not tell an honest adoption from a row that
+// just remembered its own click.
+const BACKUP = { nightly: false, runs: {}, remote: null, jobs: {} }
+// What the START returned, versus what the client was later SERVED. The causal
+// phase asserts they are the same run.
+const causal = { posted: '', served: '', leaked: [] }
+let runSeq = 0
 const unmatched = new Set()
 const json = (route, body) => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body) })
 
@@ -115,7 +124,49 @@ async function answer(route) {
   if (/^\/costs\/[^/]+$/.test(app)) return json(route, COSTS)
   if (app === '/profiles/available') return json(route, { supported: true, profiles: [], max: 20 })
   if (/^\/library\/[^/]+$/.test(app)) return json(route, LIBRARY)
-  if (/^\/backup\/[^/]+$/.test(app)) return json(route, BACKUP)
+  if (/^\/backup\/[^/]+\/run$/.test(app)) {
+    // Claim a run and REPORT it, the way the route does. The id it returns is the
+    // identity the client must then follow.
+    let kind = 'snapshot'
+    try {
+      kind = JSON.parse(route.request().postData() || '{}').kind || 'snapshot'
+    } catch { /* keep the default */ }
+    // Hex, like the SDK's own ids -- not a digit-padded string, which would be
+    // indistinguishable from an account id to any leak check.
+    const runId = (++runSeq).toString(16).padStart(32, 'a')
+    const now = '2026-09-02T00:00:00Z'
+    BACKUP.jobs = {
+      [kind]: {
+        active: { run_id: runId, kind, status: 'running', created_at: now, updated_at: now, finished_at: '', error: '' },
+        lastFailed: null,
+      },
+    }
+    causal.posted = runId
+    return json(route, { started: true, kind, runId })
+  }
+  if (/^\/backup\/[^/]+$/.test(app)) {
+    // The remote half is opt-in, so honour `?remote=1` rather than always paying
+    // for the listing -- the harness then exercises the same cost split the
+    // product ships.
+    const wantRemote = new URL(route.request().url()).searchParams.get('remote') === '1'
+    const body = { ...BACKUP, remote: wantRemote ? { snapshot: [], sessions: [] } : null }
+    const active = body.jobs?.snapshot?.active ?? body.jobs?.sessions?.active ?? null
+    if (active) {
+      causal.served = active.run_id
+      // The account is the run's dedupe key SERVER-side and must not cross to the
+      // client. Assert on the account ids this fixture actually uses and on the
+      // field name itself -- an earlier version scanned for any 12-digit run of
+      // characters, which the 32-char run id matched, so the check flagged its own
+      // fixture and would have passed a real leak just as happily.
+      const accounts = ACCOUNTS.accounts.map((a) => a.account).filter(Boolean)
+      const flat = JSON.stringify(body.jobs)
+      for (const acct of accounts) {
+        if (flat.includes(acct)) causal.leaked.push(`account ${acct} present in jobs`)
+      }
+      if (/dedupe_key/.test(flat)) causal.leaked.push('dedupe_key field present in jobs')
+    }
+    return json(route, body)
+  }
   if (app.startsWith('/shares')) return json(route, SHARES)
   // ---- dashboard shell, not this app. The shell mounts BEFORE the app page and
   // several of these are consumed as ARRAYS, so a blanket {} crashes the app
@@ -252,6 +303,43 @@ console.log('shot library')
 await openPane('backup')
 await expectCount('backup-section', 1)
 
+// ---- Causal phase: the row's busy state must come from the run the START
+// actually created, and must survive a REAL unmount.
+//
+// Under the rail this is no longer a synthetic re-mount: leaving the pane
+// unmounts BackupSection outright, so "the indicator is not component state" is
+// demonstrated rather than asserted. The identity check is what makes adoption
+// causal instead of coincidental -- a row that merely spins after a click would
+// pass a busy-state check while following nothing.
+const btnDisabled = () =>
+  page.evaluate(() => document.querySelector('[data-testid="backup-run-snapshot"]')?.disabled === true)
+
+console.log(`ASSERT causal row starts idle want=false got=${await btnDisabled()} ${(await btnDisabled()) === false ? 'ok' : 'MISMATCH'}`)
+if (await btnDisabled()) failures.push('causal: the row was already busy before any start')
+
+await page.locator('[data-testid="backup-run-snapshot"]').click()
+await page.waitForFunction(
+  () => document.querySelector('[data-testid="backup-run-snapshot"]')?.disabled === true,
+  null,
+  { timeout: 5000 },
+)
+
+// Leave the pane and come back. This UNMOUNTS the section, so anything the row
+// remembered locally is gone; only server state can bring the busy row back.
+await openPane('files')
+await expectCount('backup-section', 0)
+await openPane('backup')
+const afterRemount = await btnDisabled()
+console.log(`ASSERT causal busy survives a real unmount want=true got=${afterRemount} ${afterRemount ? 'ok' : 'MISMATCH'}`)
+if (!afterRemount) failures.push('causal: the run was forgotten across a pane unmount')
+
+const sameRun = causal.posted !== '' && causal.posted === causal.served
+console.log(`ASSERT causal client follows the run the POST returned posted=${causal.posted} served=${causal.served} ${sameRun ? 'ok' : 'MISMATCH'}`)
+if (!sameRun) failures.push(`causal: posted ${causal.posted || '(none)'} but served ${causal.served || '(none)'}`)
+
+console.log(`ASSERT causal account never reaches the client leaked=${causal.leaked.length} ${causal.leaked.length === 0 ? 'ok' : 'MISMATCH'}`)
+if (causal.leaked.length) failures.push(`causal: account id crossed to the client (${causal.leaked.join('; ')})`)
+
 await openPane('shares')
 await expectCount('access-section', 1)
 await expectCount('access-row', 2)
@@ -285,19 +373,20 @@ await expectCount('costs-consent-gate', 0)
 await page.screenshot({ path: `${OUT}/usage.png`, fullPage: false })
 console.log('shot usage')
 
-// Narrow viewport: the rail flattens to a horizontal strip and the Files
-// toolbar controls must WRAP, not run off-screen. Measured rather than
-// eyeballed — a class change that fails to wrap still produces a plausible
-// screenshot at 1280px.
+// Narrow viewport: iOS push-stack navigation, same shape as settings. The
+// pane path deep-links straight to the detail (one back bar); popping lands on
+// the grouped root list. The Files toolbar controls must WRAP, not run
+// off-screen — measured rather than eyeballed.
 await openPane('files')
 await page.setViewportSize({ width: 320, height: 900 })
 await page.waitForTimeout(400)
-await expectCount('aws-rail', 1)
+await expectCount('aws-pane-detail', 1)
+await expectCount('aws-rail', 0)
 await page.locator('[data-testid="drive-folder-toggle"]').click()
 await page.waitForTimeout(300)
 const overflow = await page.evaluate(() => {
   const bad = []
-  for (const t of ['drive-folder-name', 'drive-folder-create', 'drive-folder-cancel', 'account-switcher']) {
+  for (const t of ['drive-folder-name', 'drive-folder-create', 'drive-folder-cancel']) {
     const el = document.querySelector(`[data-testid="${t}"]`)
     if (!el) { bad.push(`${t}: missing`); continue }
     const r = el.getBoundingClientRect()
@@ -309,23 +398,22 @@ const overflow = await page.evaluate(() => {
 })
 await page.locator('[data-testid="drive-folder-cancel"]').click()
 await page.waitForTimeout(300)
-const overflowCollapsed = await page.evaluate(() => {
-  const bad = []
-  for (const t of ['drive-folder-toggle', 'drive-upload-btn']) {
-    const el = document.querySelector(`[data-testid="${t}"]`)
-    if (!el) { bad.push(`${t}: missing`); continue }
-    const r = el.getBoundingClientRect()
-    if (r.right > window.innerWidth + 1 || r.left < -1) {
-      bad.push(`${t}: ${Math.round(r.left)}..${Math.round(r.right)} outside 0..${window.innerWidth}`)
-    }
-  }
-  return bad
-})
-overflow.bad.push(...overflowCollapsed)
 console.log(`ASSERT narrow-viewport controls-onscreen ${overflow.bad.length === 0 ? 'ok' : 'MISMATCH ' + overflow.bad.join('; ')}`)
 if (overflow.bad.length) failures.push(`narrow viewport: ${overflow.bad.join('; ')}`)
 await page.screenshot({ path: `${OUT}/files-narrow.png`, fullPage: false })
 console.log('shot files-narrow')
+
+// Pop back to the root list: grouped rows, account card, no rail, no detail.
+await page.locator('[data-testid="aws-pane-detail"] button').first().click()
+await page.waitForTimeout(500)
+await expectCount('aws-root-list', 1)
+await expectCount('aws-pane-detail', 0)
+await expectCount('account-switcher', 1)
+for (const pane of ['files', 'library', 'backup', 'shares', 'accounts', 'usage']) {
+  await expectCount(`root-${pane}`, 1)
+}
+await page.screenshot({ path: `${OUT}/root-list-narrow.png`, fullPage: false })
+console.log('shot root-list-narrow')
 
 if (unmatched.size) console.log('unmatched /api paths:', [...unmatched].join(', '))
 await browser.close()

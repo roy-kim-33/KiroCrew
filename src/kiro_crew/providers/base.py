@@ -144,6 +144,17 @@ class LLMProvider(ABC):
         (safe) truth for them."""
         return None
 
+    @property
+    def last_compaction_transient(self) -> bool:
+        """Whether that failure is worth retrying.
+
+        The default is the SAFE value: False means "treat it as permanent", so a
+        provider that reports no verdict gives up the turn exactly as it did
+        before this capability existed, rather than replaying a message against
+        a compaction that cannot succeed.
+        """
+        return False
+
     def context_window_tokens(self) -> int:
         """Return the real served context window in tokens (0 if unknown).
 
@@ -213,6 +224,20 @@ class LLMProvider(ABC):
         override this to inspect the OS-level state directly.
         """
         return self.is_alive()
+
+    @property
+    def process_instance(self) -> str:
+        """Identity of the provider's CURRENT child process instance.
+
+        ``""`` for providers not backed by a child process, and for a
+        process-backed provider whose child is gone. Process-backed providers
+        override this with a per-spawn token so a resource minted by one child
+        (an MCP OAuth authorize link, whose loopback listener and PKCE verifier
+        live in that process) can be recognized as dead once the child is —
+        equality across spawns must be impossible, which is why the ACP session
+        id (reused by resume on a new process) can never serve here.
+        """
+        return ""
 
     @property
     def exit_code(self) -> int | None:
@@ -335,6 +360,23 @@ class LLMProvider(ABC):
         return False
 
     @property
+    def manual_compact_unsupported_backend(self) -> str | None:
+        """Backend id when this provider cannot serve a manual ``/compact``,
+        ``None`` when the command is fine to dispatch.
+
+        The manual entry points gate on this so an unsupported backend gets an
+        immediate, user-visible refusal instead of a prompt whose
+        compaction-status wait strands until ``COMPACT_WAIT_TIMEOUT_SECS``
+        (#7800). Default ``None`` — a provider that has not positively named an
+        unsupported backend passes through, because it handles ``/compact`` on
+        its own terms. Declared here with a safe default rather than probed off
+        the instance (harness-parity H14); the ACP implementations answer from
+        ``ACP_BACKENDS_COMPACT`` membership. Consumers must act only on a
+        non-empty ``str`` value, so a mocked provider's attribute never reads
+        as a refusal."""
+        return None
+
+    @property
     def uses_kiro_identity_store(self) -> bool:
         """True when this provider's child authenticates from kiro-cli's own
         identity store, so an external ``kiro-cli logout`` invalidates a process
@@ -345,6 +387,22 @@ class LLMProvider(ABC):
         that it reads that store does not inherit the claim (harness-parity
         H5/H14). Declared here rather than probed off the instance so the session
         layer never has to guess from private attributes."""
+        return False
+
+    @property
+    def mcp_config_hot_reload(self) -> bool:
+        """True when this provider's live process reconciles agent-config and
+        ``mcp.json`` edits on its own — only the changed MCP servers restart, the
+        conversation is kept — so the dashboard's MCP sync may leave it running
+        instead of resetting it.
+
+        Default False — the reset is the safe answer, and a harness that has not
+        demonstrated the reconcile must not inherit the skip (harness-parity
+        H6/H14). Declared here rather than probed off the instance; the ACP
+        implementation answers from ``ACP_BACKENDS_MCP_CONFIG_HOT_RELOAD``
+        membership plus the version its process reported at ``initialize``.
+        Consumers must act only on a literal ``True``, so a mocked provider's
+        attribute never reads as a skip."""
         return False
 
     def available_models(self) -> list[dict[str, str]]:

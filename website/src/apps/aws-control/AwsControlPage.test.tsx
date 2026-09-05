@@ -1,6 +1,15 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { screen, fireEvent, waitFor, within } from '@testing-library/react'
 import { renderWithProviders } from '../../test/helpers'
+
+// Controllable viewport switch: the shell branches on useIsNarrowViewport.
+// Mock BOTH exports — a partial mock leaves the sibling undefined (module's
+// own warning) and useIsMobile is consumed by nested library components.
+let narrowViewport = false
+vi.mock('../../hooks/useIsMobile', () => ({
+  useIsNarrowViewport: () => narrowViewport,
+  useIsMobile: () => narrowViewport,
+}))
 import { i18nT } from '../../i18n/t'
 import { fmtNumber } from '../../i18n/format'
 import type {
@@ -163,6 +172,7 @@ function share(id: string): SharesResponse['shares'][number] {
 
 /** Everything a drive-backed pane needs to mount for real. */
 function stubDrivePresent() {
+  narrowViewport = false
   vi.mocked(awsControlApi.drive).mockResolvedValue(driveExists)
   vi.mocked(awsControlApi.costs).mockResolvedValue(costsFresh)
   vi.mocked(awsControlApi.library).mockResolvedValue(emptyLibrary)
@@ -460,6 +470,24 @@ describe('edge states', () => {
     expect(await screen.findByTestId('drive-section')).toBeTruthy()
   })
 
+  it('a 403 that is NOT app_disabled is an error to diagnose, not a disabled app', async () => {
+    // The same route answers 403 for a non-owner caller. Showing "this app is
+    // disabled" for that would send the reader to wait out a setting that is
+    // not the problem; the notice (with its agent hand-off) is the right answer.
+    vi.mocked(awsControlApi.accounts).mockRejectedValue(
+      new AwsControlError('dashboard_owner_required', 403),
+    )
+    renderWithProviders(<AwsControlPage />)
+
+    const notice = await screen.findByTestId('aws-control-error')
+    expect(notice).toHaveTextContent(i18nT('apps.awsControl.page.error_title'))
+    // Permission-worded, not "try again in a moment": a retry cannot clear a 403.
+    expect(notice).toHaveTextContent(i18nT('apps.awsControl.page.error_forbidden_body'))
+    expect(notice).not.toHaveTextContent(i18nT('apps.awsControl.page.error_body'))
+    expect(within(notice).getByRole('button', { name: /ask the agent/i })).toBeTruthy()
+    expect(screen.queryByTestId('aws-control-disabled')).toBeNull()
+  })
+
   it('while accounts are still loading, the accounts pane renders full width, no rail', async () => {
     // There is nothing for the rail or the drive panes to show before the list
     // answers, so the pane that will handle "no resolved account" also carries
@@ -510,6 +538,35 @@ describe('edge states', () => {
     expect(await screen.findByTestId('aws-control-empty')).toBeTruthy()
     expect(screen.queryByTestId('account-card')).toBeNull()
     expect(screen.queryByTestId('aws-rail')).toBeNull()
+    // The remedy is the Add-accounts disclosure on this same pane, so the copy
+    // names it. Asserted against the KEY, not a fragment, so a copy edit moves
+    // both sides of this pair together — and paired with the unsupported case
+    // below, since a one-sided assertion passes just as well if both platforms
+    // collapsed onto one string.
+    expect(screen.getByTestId('aws-control-empty').textContent).toContain(
+      i18nT('apps.awsControl.page.empty_body'),
+    )
+  })
+
+  it('drops the Add-accounts pointer from the empty state where nothing can be added', async () => {
+    vi.mocked(awsControlApi.accounts).mockResolvedValue(
+      accountsPayload({ accounts: [], totals: { accounts: 0, profiles: 0, profilesHealthy: 0 } }),
+    )
+    vi.mocked(awsControlApi.availableProfiles).mockResolvedValue(
+      availablePayload({ profiles: [], supported: false, registeredCount: 0 }),
+    )
+    renderWithProviders(<AwsControlPage />)
+
+    // Discovery is POSIX-only, so an unsupported platform sits at zero accounts
+    // permanently and the disclosure below reports that it cannot list profiles.
+    // An empty state naming that disclosure would promise an action the next
+    // paragraph refuses, which is the same defect as naming a page that does not
+    // exist -- one scroll shorter. The subtitle goes away entirely rather than
+    // being replaced: the title already says nothing is here, and the WSL
+    // constraint belongs in the disclosure, once.
+    await screen.findByTestId('add-accounts-unsupported')
+    expect(screen.getByTestId('aws-control-empty-title')).toBeTruthy()
+    expect(screen.queryByTestId('aws-control-empty-subtitle')).toBeNull()
   })
 })
 
@@ -704,6 +761,160 @@ describe('add accounts', () => {
     fireEvent.click(boxes[0])
     fireEvent.click(screen.getByTestId('add-accounts-register'))
 
-    expect(await screen.findByTestId('add-accounts-error')).toBeTruthy()
+    const notice = await screen.findByTestId('add-accounts-error')
+    // No hand-off beside unsaved input: the ticked profiles survive the refusal.
+    expect(within(notice).queryByRole('button', { name: /ask the agent/i })).toBeNull()
+    expect(boxes[0]).toBeChecked()
+  })
+
+  it('a failed profile scan is a notice, not "nothing left to add"', async () => {
+    // With the scan failed, `unregistered` is an empty fallback — and the
+    // none-left sentence would assert the opposite of what happened.
+    vi.mocked(awsControlApi.availableProfiles).mockRejectedValue(
+      new AwsControlError('http_500', 500),
+    )
+    await openAccountsPane()
+
+    fireEvent.click(await screen.findByTestId('add-accounts-toggle'))
+    expect(await screen.findByTestId('add-accounts-load-error')).toHaveTextContent(
+      i18nT('apps.awsControl.page.add_accounts_load_error'),
+    )
+    expect(screen.queryByTestId('add-accounts-none')).toBeNull()
+  })
+
+  it('a ticked profile withholds every hand-off on the pane until the tick is cleared', async () => {
+    // The ticks live only in the disclosure's state. "Ask the agent" on any
+    // notice on this pane navigates to chat, which unmounts the disclosure and
+    // drops the selection — so while a tick is open the pane's other notices
+    // (here the row Reconnect) offer retry only, and the hand-off comes back
+    // once the selection is empty again.
+    vi.mocked(awsControlApi.accounts).mockResolvedValue(accountsPayload({
+      accounts: [UNRESOLVED_ROW],
+      totals: { accounts: 1, profiles: 1, profilesHealthy: 0 },
+    }))
+    vi.mocked(awsControlApi.reconnectPlan).mockRejectedValue(new AwsControlError('http_500', 500))
+    renderWithProviders(<AwsControlPage />)
+
+    fireEvent.click(await screen.findByTestId('account-card'))
+    const panel = await screen.findByTestId('row-reconnect')
+    fireEvent.click(within(panel).getByTestId('reconnect-toggle'))
+    const notice = await screen.findByTestId('reconnect-error')
+    // No draft yet: the hand-off is offered.
+    expect(within(panel).getByRole('button', { name: /ask the agent/i })).toBeTruthy()
+
+    fireEvent.click(screen.getByTestId('add-accounts-toggle'))
+    const boxes = await screen.findAllByTestId('add-accounts-checkbox')
+    fireEvent.click(boxes[0])
+    expect(boxes[0]).toBeChecked()
+    await waitFor(() =>
+      expect(within(panel).queryByRole('button', { name: /ask the agent/i })).toBeNull(),
+    )
+    // The notice itself and its retry stay; only the navigating action is gone.
+    expect(notice).toBeTruthy()
+    expect(within(panel).getByTestId('reconnect-error-retry')).toBeTruthy()
+
+    fireEvent.click(boxes[0])
+    expect(boxes[0]).not.toBeChecked()
+    await waitFor(() =>
+      expect(within(panel).getByRole('button', { name: /ask the agent/i })).toBeTruthy(),
+    )
+  })
+})
+
+describe('AwsControlPage — path-based navigation', () => {
+  it('deep link with a pane segment lands straight on that pane', async () => {
+    renderWithProviders(<AwsControlPage />, { route: '/aws-control/usage' })
+    expect(await screen.findByTestId('usage-pane')).toBeTruthy()
+    // The rail marks the routed pane current, not the default one.
+    expect(screen.getByTestId('rail-usage').getAttribute('aria-current')).toBe('page')
+    expect(screen.getByTestId('rail-files').getAttribute('aria-current')).toBeNull()
+  })
+
+  it('a trailing slash reads as the bare path, not a drilled-in level', async () => {
+    // The settings path-nav shipped a misfire where /settings/channels/ made a
+    // length>=2 check treat the level as drilled-in. Pin the same class here:
+    // /aws-control/ must render exactly what /aws-control renders.
+    renderWithProviders(<AwsControlPage />, { route: '/aws-control/' })
+    expect(await screen.findByTestId('drive-section')).toBeTruthy()
+    expect(screen.getByTestId('rail-files').getAttribute('aria-current')).toBe('page')
+  })
+
+  it('an unknown segment falls back to Files rather than a blank pane', async () => {
+    renderWithProviders(<AwsControlPage />, { route: '/aws-control/nonsense' })
+    expect(await screen.findByTestId('drive-section')).toBeTruthy()
+  })
+
+  it('a rail click writes the pane path (deep-linkable)', async () => {
+    renderWithProviders(<AwsControlPage />, { route: '/aws-control' })
+    await screen.findByTestId('drive-section')
+    fireEvent.click(screen.getByTestId('rail-backup'))
+    expect(await screen.findByTestId('backup-section')).toBeTruthy()
+    expect(screen.getByTestId('rail-backup').getAttribute('aria-current')).toBe('page')
+  })
+})
+
+describe('AwsControlPage — narrow viewport (iOS push stack)', () => {
+  beforeEach(() => { narrowViewport = true })
+
+  it('the bare path is the grouped root list, with no rail', async () => {
+    renderWithProviders(<AwsControlPage />, { route: '/aws-control' })
+    expect(await screen.findByTestId('aws-root-list')).toBeTruthy()
+    expect(screen.queryByTestId('aws-rail')).toBeNull()
+    // Account card on top, then every pane as a tappable row.
+    expect(screen.getByTestId('account-switcher')).toBeTruthy()
+    for (const pane of ['files', 'library', 'backup', 'shares', 'accounts', 'usage']) {
+      expect(screen.getByTestId(`root-${pane}`)).toBeTruthy()
+    }
+  })
+
+  it('tapping a row pushes the detail with exactly one back bar, and back pops to the list', async () => {
+    renderWithProviders(<AwsControlPage />, { route: '/aws-control' })
+    await screen.findByTestId('aws-root-list')
+
+    fireEvent.click(screen.getByTestId('root-usage'))
+    expect(await screen.findByTestId('aws-pane-detail')).toBeTruthy()
+    expect(screen.getByTestId('usage-pane')).toBeTruthy()
+    // Exactly ONE back affordance per level — never two stacked bars.
+    const backs = screen.getAllByText('AWS Control')
+    expect(backs.length).toBe(1)
+    expect(screen.queryByTestId('aws-root-list')).toBeNull()
+
+    fireEvent.click(backs[0])
+    expect(await screen.findByTestId('aws-root-list')).toBeTruthy()
+    expect(screen.queryByTestId('aws-pane-detail')).toBeNull()
+  })
+
+  it('an unknown segment reads as Files on a phone too — one meaning per URL', async () => {
+    renderWithProviders(<AwsControlPage />, { route: '/aws-control/bogus' })
+    expect(await screen.findByTestId('aws-pane-detail')).toBeTruthy()
+    expect(await screen.findByTestId('drive-section')).toBeTruthy()
+    expect(screen.queryByTestId('aws-root-list')).toBeNull()
+  })
+
+  it('a pane->pane move keeps the push marker, so back still pops to the list', async () => {
+    // Drill in from the root list (a PUSH), then move pane->pane via the
+    // accounts pane's row (a REPLACE). The replace must carry the entry's
+    // push marker forward — dropping it would stack a duplicate root entry
+    // on back and leave the next platform back visibly inert.
+    renderWithProviders(<AwsControlPage />, { route: '/aws-control' })
+    await screen.findByTestId('aws-root-list')
+
+    fireEvent.click(screen.getByTestId('root-accounts'))
+    expect(await screen.findByTestId('accounts-pane')).toBeTruthy()
+
+    // Selecting an account jumps to Files (pane->pane replace).
+    fireEvent.click(screen.getAllByTestId('account-card')[0])
+    expect(await screen.findByTestId('drive-section')).toBeTruthy()
+
+    // Back must POP to the root list (marker preserved), not replace-write.
+    fireEvent.click(screen.getByText('AWS Control'))
+    expect(await screen.findByTestId('aws-root-list')).toBeTruthy()
+  })
+
+  it('a deep link goes straight to the detail pane', async () => {
+    renderWithProviders(<AwsControlPage />, { route: '/aws-control/backup' })
+    expect(await screen.findByTestId('aws-pane-detail')).toBeTruthy()
+    expect(await screen.findByTestId('backup-section')).toBeTruthy()
+    expect(screen.queryByTestId('aws-root-list')).toBeNull()
   })
 })

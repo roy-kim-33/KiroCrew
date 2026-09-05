@@ -20,7 +20,7 @@ import re
 import threading
 import time as _time
 import uuid
-from collections.abc import Callable, Container, Iterator
+from collections.abc import Callable, Container, Iterator, Sequence
 from collections.abc import Set as AbstractSet
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -179,6 +179,18 @@ SLOT_OWNED_META_KEYS: frozenset[str] = frozenset(
         "mode",
         "workspace",
         "project",
+        # Remote-execution binding: owned by the slot, so clearing it in memory
+        # clears it on disk. Left unowned, a rebind or an unbind would be undone
+        # on the next save by the carried-forward copy.
+        "executor",
+        "instance_id",
+        "remote_slot",
+        # In-flight relay marker: the slot save writes it only while a relay is
+        # running and omits it once the turn ends. Absence therefore means "not
+        # in flight" and must clear the on-disk value — left unowned, the `true`
+        # written at relay start is carried forward past a clean completion, so
+        # every later restart would append a false "interrupted" row.
+        "relay_in_flight",
         "folder_id",
         "app",
         "artifact",
@@ -192,6 +204,78 @@ SLOT_OWNED_META_KEYS: frozenset[str] = frozenset(
         "tab_id",
     }
 )
+
+# The subset of :data:`SLOT_OWNED_META_KEYS` a ROWS-ONLY slot save still owns.
+#
+# A save that must persist a slot's messages onto a transcript whose metadata line
+# describes a DIFFERENT live slot cannot use the whole ownership claim above: the
+# rebuild would revert the other slot's title, folder, tags or pin. Such a save
+# preserves every slot-owned field the line already carries and keeps authority
+# over only these — the file's identity and accounting, which every writer
+# maintains and which the save carries forward from disk anyway.
+#
+# ``closed``/``closed_at`` are NOT here, even though the write is open-shaped and
+# the whole claim above would erase them. On a line another slot published, a
+# ``closed`` flag is that holder's own DISMISSAL, and the two mistakes cost
+# differently. Erasing a dismissal the holder just committed resurfaces a tab the
+# user put away and re-arms the channel reconciler on it, with the holder already
+# popped so nothing rewrites the flag. Leaving a stale flag in place instead costs
+# nothing durable: the live holder owns these keys on its own next full save.
+#
+# The one path that DOES clear a stale flag from outside the holder is the resume
+# route, and it only clears one it can prove predates its own boundary
+# (``clear_closed(..., only_if_closed_before=...)``, compared inside the store's
+# lock) — precisely because an unconditional clear "reopens a replacement the user
+# closed". A rows-only save carries no such boundary, so it defers, the same way
+# every other field on another writer's line does.
+#
+# Narrowing this far is only correct against ANOTHER slot's line, so the save
+# establishes that first (from the line's ``tab_id``) and falls back to the full
+# claim otherwise. Applied to a slot's own line it would strand that slot's
+# uncommitted metadata instead of protecting anyone's — and that fallback is where
+# an open-shaped write still clears a stale ``closed``, because a line this slot
+# published carries no other holder's dismissal to lose.
+ROWS_ONLY_OWNED_META_KEYS: frozenset[str] = frozenset({"_type", "created_at", "last_consolidated"})
+
+# The keys a ROWS-ONLY slot save must DROP from its rebuild so the on-disk values
+# are carried back verbatim.
+#
+# Named here in full rather than derived at the call site as
+# ``SLOT_OWNED_META_KEYS - ROWS_ONLY_OWNED_META_KEYS``, because that difference
+# under-approximates: the slot save also writes fields that DESCRIBE an owned one
+# without being owned themselves (absence must not erase them, so they are
+# deliberately outside the ownership claim and survive via
+# :func:`carry_unowned_metadata`). Deferring the described field while keeping the
+# describing one commits a line that matches NEITHER slot — worse than either,
+# because each half is separately valid and nothing downstream can detect the
+# mismatch. ``title_origin`` and ``title_refresh_mark`` are the title's provenance
+# and its background-refresh budget: read back beside another slot's title they
+# either unlock the refresh on a name a user typed by hand or lock a generated name
+# out of refresh permanently. They travel WITH the title, so they are deferred with
+# it.
+#
+# ``created_by`` and ``origin`` are the same shape and the highest-consequence
+# instance of it, because what they describe is AUTHORIZATION rather than
+# presentation. ``created_by`` is the attribution the member ownership boundary in
+# session-control reads, and it is meaningless without the ``mode`` that is deferred
+# beside it — a member ``mode`` from the live holder read next to a different
+# principal's ``created_by`` names an owner who never opened this session.
+# ``origin`` must round-trip with ``app``, also deferred: split, a tab reads back as
+# one holder's slot kind wearing the other's app binding, which is what decides
+# ``slots:user`` visibility and the unattended approval window. Both are attributes
+# of the SLOT, not facts about the conversation, so on a transcript with a live
+# holder the holder's are the true ones. Deferring them also fails CLOSED where the
+# line carries none: an absent ``created_by`` denies rather than grants, and an
+# absent ``origin`` restores to the empty sentinel the rehydrate paths already treat
+# that way.
+#
+# What is left out is left out deliberately: ``auto_tagged``, ``human_seen``,
+# ``channel_origin`` and ``channel_folder_filed`` are MONOTONE once-flags about the
+# CONVERSATION, set and never cleared, so a shared transcript's two writers cannot
+# disagree about them in a way that outlives the pair.
+ROWS_ONLY_DEFERRED_META_KEYS: frozenset[str] = (
+    SLOT_OWNED_META_KEYS - ROWS_ONLY_OWNED_META_KEYS
+) | frozenset({"title_origin", "title_refresh_mark", "created_by", "origin"})
 
 
 def carry_unowned_metadata(
@@ -479,6 +563,73 @@ def append_off_loop(
             logger.warning("append_off_loop: offloaded append failed key=%s: %r", key, exc)
 
     loop.run_in_executor(None, _do).add_done_callback(_report)
+
+
+def append_rows_if_absent_off_loop(
+    conversation_log: "ConversationLog",
+    key: str,
+    rows: "Sequence[tuple[str, str, str, str | None]]",
+    *,
+    agent: str | None = None,
+) -> Any:
+    """Persist SEVERAL rows of one turn as one indivisible off-loop write.
+
+    :func:`append_if_absent_off_loop` dispatches each row as its own executor
+    task, so a caller writing a prompt+result PAIR hands two worker threads two
+    independent writes: they can land out of order, and one can fail while the
+    other succeeds. The transcript then replays a run whose rows are reversed or
+    half-present, and no timestamp ordering repairs it because each row's ``ts``
+    is correct on its own.
+
+    This routes the whole group through ONE task holding
+    :meth:`ConversationLog.atomic_appends`, whose contract names this hazard as
+    the companion a multi-append caller needs precisely BECAUSE it moved the
+    write off the loop. ``_locked`` is reentrant per key per thread, so the
+    per-row locks inside ``append_if_absent`` reuse the hold rather than
+    deadlocking on it.
+
+    *rows* is an ordered sequence of ``(role, content, cls, mid)``; they are
+    appended in that order. Each row keeps ``append_if_absent``'s idempotence,
+    so a row the periodic slot save already serialized is skipped individually
+    without dropping its siblings.
+
+    Returns the executor future, or None when the write already happened inline
+    (no running loop). Best-effort like its siblings: a lock timeout or I/O
+    error only skips the durable replay copy the slot already carries.
+    """
+
+    def _do() -> None:
+        with conversation_log.atomic_appends(key):
+            for role, content, cls, mid in rows:
+                conversation_log.append_if_absent(key, role, content, agent=agent, cls=cls, mid=mid)
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    if loop is None:
+        try:
+            _do()
+        except Exception:  # noqa: BLE001 - best-effort durable copy
+            logger.warning(
+                "append_rows_if_absent_off_loop: inline append failed key=%s",
+                key,
+                exc_info=True,
+            )
+        return None
+
+    def _report(fut: "asyncio.Future[None]") -> None:
+        exc = fut.exception()
+        if exc is not None:
+            logger.warning(
+                "append_rows_if_absent_off_loop: offloaded append failed key=%s: %r",
+                key,
+                exc,
+            )
+
+    fut = loop.run_in_executor(None, _do)
+    fut.add_done_callback(_report)
+    return fut
 
 
 def append_if_absent_off_loop(
@@ -2511,6 +2662,24 @@ class ConversationLog:
 
     def read_messages_chained(self, key: str) -> list[dict]:
         return self._read_projection.read_messages_chained(key)
+
+    def read_messages_chained_full(self, key: str) -> list[dict]:
+        """Chained transcript INCLUDING each key's size-rotated archive head.
+
+        The pagination/fork index space: `before` / `next_before` cursors from
+        the slot-detail handler address rows of THIS corpus. The plain
+        `read_messages_chained` stays the window/consolidation corpus — its
+        callers hold offsets (``_disk_older_count``, ``last_consolidated``)
+        counted against the un-archived files, which rotated rows must not shift.
+        """
+        return self._read_projection.read_messages_chained_full(key)
+
+    def read_rotated_messages_chained(self, key: str) -> list[dict]:
+        return self._read_projection.read_rotated_messages_chained(key)
+
+    def chain_mid_rotation(self, key: str) -> bool:
+        """See ``HistoryReadProjection.chain_mid_rotation``."""
+        return self._read_projection.chain_mid_rotation(key)
 
     def _rebuild_tab_id_index(self) -> None:
         self._read_projection._rebuild_tab_id_index()

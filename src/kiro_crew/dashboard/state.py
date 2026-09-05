@@ -45,6 +45,7 @@ from kiro_crew.dashboard.interaction_coordinator import (
     QuestionCoordinator,
 )
 from kiro_crew.dashboard.notification_coordinator import NotificationCoordinator
+from kiro_crew.dashboard.remote_mirror import mirror_frame as _mirror_relay_frame
 from kiro_crew.dashboard.session_pulse_counter import increment_user_session_count_off_loop
 from kiro_crew.dashboard.side_state import SideState
 from kiro_crew.dashboard.slot_buffers import SlotBufferCoordinator
@@ -232,6 +233,10 @@ MAX_LIVE_SLOTS = 500
 #: alone.
 MAX_SLOTS_PER_CREATOR = 50
 
+# Structured monitor wakeups are automation, not user speech. The controller
+# owns the complete envelope; every delivery surface passes it through unchanged.
+MONITOR_WAKE_PREFIX = "[Monitor wake]"
+
 #: Return type of a mutate_folders callback.
 _T = TypeVar("_T")
 
@@ -270,6 +275,7 @@ def _slots_ws_frame(
     gitlab_hosts_gen: object,
     folders: object,
     folders_gen: object,
+    governance_gen: object,
 ) -> str:
     """Serialize the dashboard-user ``slots`` WS frame.
 
@@ -301,6 +307,13 @@ def _slots_ws_frame(
             "gitlabHostsGeneration": gitlab_hosts_gen,
             "folders": folders,
             "foldersGeneration": folders_gen,
+            # Which governance ceiling is installed. A centrally pushed policy
+            # (``policy_distribution.apply_ceiling``) swaps the ceiling mid-session
+            # and bumps this counter; the client invalidates its cached
+            # ``dashboardConfig`` on a change, so a governance-derived field there
+            # (``social_share_enabled``) follows the ceiling instead of waiting out
+            # its stale window. Process-local, like the two counters above.
+            "governanceGeneration": governance_gen,
         }
     )
 
@@ -1931,6 +1944,55 @@ def parse_cls_meta(cls_val: str) -> dict | None:
     return meta
 
 
+def chat_message_frame(note: dict, *, include_metadata: bool) -> dict[str, Any]:
+    """Serialise a broadcast note into the wire ``chat_message`` frame.
+
+    ONE serialiser for both delivery doors — the WebSocket arm in
+    ``_broadcast_note`` and the SSE arm in ``handlers/updates.py:api_stream``.
+    They are fed the same note by ``_broadcast()``, so a field added here
+    reaches both; building the frame twice is how the SSE door kept dropping
+    ``meta`` after #7981 fixed the WS one (#8045).
+
+    ``include_metadata`` is a REQUIRED keyword and names a property of the
+    TRANSPORT, not a preference: whether that door has per-client authorization
+    downstream of this call.
+
+    * The WS door does (``_send_ws_all`` -> ``_ws_client_allowed``, a
+      deny-by-default event-scope gate, then ``_serialize_for_client``), so it
+      passes ``True`` and lets the gate decide per socket.
+    * The SSE queue does NOT. ``_broadcast()`` fans the raw note out to every
+      registered queue with no per-app filtering, so ``api_stream`` must make
+      the decision itself and passes ``include_metadata`` only for a
+      dashboard-user token.
+
+    That asymmetry is load-bearing. ``meta`` carries tool/LLM content
+    (``tool_input``, a live ``oauth_url``, ``approval_id``), so putting it on an
+    unfiltered queue exposes it to any app token granted that route regardless
+    of its ``slots:*`` scope — the same class as GPT #6789, which leaked
+    public-repo status onto ``/api/stream`` by enriching a payload that feeds
+    both doors. Keep enrichment on the door that filters.
+
+    ``cls``/``meta`` are conditional in BOTH directions when included: carried
+    when the note has them (``meta.mid`` is the per-row delivery identity a
+    client dedups on, so a frame without it cannot be recognised as a
+    redelivery), and omitted entirely when it does not — an absent value must
+    not arrive as a ``null`` or ``{}`` key a consumer has to special-case.
+    """
+    frame: dict[str, Any] = {
+        "slot": note["slot"],
+        "role": note["role"],
+        "content": note["content"],
+        "ts": note.get("ts", ""),
+    }
+    if not include_metadata:
+        return frame
+    if note.get("cls"):
+        frame["cls"] = note["cls"]
+    if note.get("meta"):
+        frame["meta"] = note["meta"]
+    return frame
+
+
 def is_stop_event_row(m: dict) -> bool:
     """True when *m* is the card recorded because the user pressed Stop.
 
@@ -2167,6 +2229,72 @@ def row_mid(row: Any) -> str | None:
     meta = row.get("meta")
     mid = meta.get("mid") if isinstance(meta, dict) else None
     return mid if isinstance(mid, str) and mid else None
+
+
+def append_and_surface(
+    state: "DashboardState",
+    slot: "_ChatSlot",
+    role: str,
+    content: str,
+    cls: str = "",
+    *,
+    meta: dict | None = None,
+    broadcast_user: bool = False,
+    extra: dict | None = None,
+) -> dict[str, Any]:
+    """Append a row and surface it live -- through exactly one identity-carrying door.
+
+    The ONE way to append a window row that must also render in the open chat
+    immediately. ``_ChatSlot.append`` already delivers a live ``chat_message``
+    (via ``_on_message`` -> ``_broadcast_chat_message``, carrying the minted
+    ``meta.mid``) whenever ``not slot._has_reader`` -- so an unconditional
+    manual ``broadcast_ws("chat_message", ...)`` after an append ships the SAME
+    row a second time. Worse, the hand-built frames carried no ``meta.mid``,
+    and the frontend's redelivery guard declines mid-less frames rather than
+    guessing (``isRedeliveredMessage``), so each extra copy rendered as a new
+    bubble (#5981).
+
+    The manual frame is emitted only in the one case append's own callback is
+    suppressed (``slot._has_reader``: an HTTP stream reader is draining
+    ``_pending`` for the actively streaming client, and other windows still
+    need the row) -- mirroring the pattern at ``handlers/files.py`` -- and it
+    carries the appended row's ``ts`` + ``meta`` (mid included), so a client
+    that receives the row through two doors can now recognise "this row again"
+    instead of rendering a duplicate.
+
+    ``user`` rows: ``append`` skips broadcasting them by default because the
+    composer that submitted them already rendered them optimistically -- true
+    only of a message typed in THIS dashboard. Callers surfacing a user row
+    that originated elsewhere (a channel mirror, a Go-button label) pass
+    ``broadcast_user=True`` and get the same single identity-carrying delivery.
+
+    Redaction is the caller's job (unchanged from the sites this replaces):
+    content passed here must already be display-safe. The append path re-redacts
+    non-user content in ``_broadcast_chat_message``; the reader-suppressed frame
+    below does not, matching the manual frames it replaces.
+
+    Returns the appended row (so callers can read ``row_mid`` off it).
+    """
+    if broadcast_user:
+        msg = slot.append(role, content, cls, broadcast_user=True, meta=meta)
+    else:
+        msg = slot.append(role, content, cls, meta=meta)
+    if getattr(slot, "_has_reader", False):
+        frame: dict[str, Any] = {
+            "slot": slot.key,
+            "role": role,
+            "content": content,
+            "ts": msg.get("ts", ""),
+        }
+        if cls:
+            frame["cls"] = cls
+        row_meta = msg.get("meta")
+        if isinstance(row_meta, dict) and row_meta:
+            frame["meta"] = row_meta
+        if extra:
+            frame.update(extra)
+        state.broadcast_ws("chat_message", frame)
+    return msg
 
 
 #: Roles whose LIVE append starts the slot's next turn, and so consumes the answer
@@ -2460,6 +2588,14 @@ EMPTY_RESPONSE_RECOVERY_PREFIX = "[Empty response — automatic recovery]"
 # happened and the turn still billed. Body: _PROMISE_ONLY_CONTINUE_MSG in
 # chat_utils. One bounded attempt (slot._promise_only_retries), never a loop.
 PROMISE_ONLY_RECOVERY_PREFIX = "[Unfinished action — automatic recovery]"
+# Prefix on the runner-injected continuation sent when the BACKEND compacted the
+# conversation in the middle of a turn and then ended the turn without finishing
+# the work. The compaction itself succeeded — nothing failed — but the request
+# that was in flight when the context filled was abandoned, and the turn lands
+# looking clean (a settled footer with elapsed time), so without this the chat
+# just stops. Body: _COMPACTION_CONTINUE_MSG in chat_utils. One bounded attempt
+# (slot._compaction_continue_retries), never a loop.
+COMPACTION_RECOVERY_PREFIX = "[Context compacted — automatic recovery]"
 # Prefix on the continuation injected when the USER pressed Continue on an
 # interrupted turn. Body: _MANUAL_RESUME_MSG in chat_utils. Named into the
 # *_RECOVERY_PREFIX family because test_recovery_card_prefixes.py keys the
@@ -2583,7 +2719,7 @@ def parse_hook_continuations(stdouts: list[str]) -> list[str]:
 
 
 def build_refusal_recovery_prompt(
-    refusals: list[tuple[str, str]], *, credential_tool_hint: str = ""
+    refusals: list[tuple[str, str]], *, credential_tool_hint: str = "", answered: bool = False
 ) -> str:
     """Build the body of an automatic continuation after a recoverable tool refusal.
 
@@ -2608,6 +2744,25 @@ def build_refusal_recovery_prompt(
     different tool) or stop on its own with a reason. The caller prepends
     :data:`REFUSAL_RECOVERY_PREFIX`. Returns "" if there is nothing to recover.
 
+    ``answered`` says the turn ALREADY streamed text the user has read, despite
+    the block. The premise of the default wording — "the turn ended early, pick up
+    where you left off" — is then false, and acting on it makes the model re-answer
+    a question the user has already read, once per blocked call and at full turn
+    cost. So the body flips to awareness-only: same block reasons, same
+    remediation, but an explicit instruction not to restate what was sent.
+
+    That flag deliberately does NOT claim the turn *finished* — no caller can tell
+    a delivered answer from a one-line preamble ("Let me check the logs.") before
+    the blocked call, because the two are indistinguishable prose flushed at the
+    same point in the stream. So this branch conditions its instruction on whether
+    the task is done rather than asserting it: continue-from-there is the default
+    and stopping is the narrow case. Asserting a finished answer here would tell a
+    turn that had only narrated its intent to stop with the work undone.
+    The reason still has to be delivered rather than dropped, because on a backend
+    without mid-turn steer this turn is the ONLY channel for it — without it the
+    model's last word on the subject is kiro-cli's "User denied tool execution",
+    and it will keep attributing the block to the user in later turns.
+
     Lives here (a leaf module that owns the prefix) rather than in context.py so
     chat_runner can import it at module top without a circular import. There is
     deliberately no retry cap: the model decides when to stop, and the user's
@@ -2616,9 +2771,18 @@ def build_refusal_recovery_prompt(
     if not refusals:
         return ""
     lines = [
-        "One or more tool calls in your previous turn were blocked by a Kiro Crew "
-        "safety policy, which ended the turn early. This was NOT a user action — "
-        "do not treat it as a cancellation or interruption by the user.",
+        (
+            "One or more tool calls in your previous turn were blocked by a Kiro "
+            "Crew safety policy. This was NOT a user action — do not treat it as a "
+            "cancellation or interruption by the user. That turn already put text "
+            "on screen for the user, so this note is for awareness: carry on from "
+            "there rather than starting over."
+            if answered
+            else "One or more tool calls in your previous turn were blocked by a "
+            "Kiro Crew safety policy, which ended the turn early. This was NOT a "
+            "user action — do not treat it as a cancellation or interruption by "
+            "the user."
+        ),
         "",
         "Blocked:",
     ]
@@ -2626,10 +2790,19 @@ def build_refusal_recovery_prompt(
         lines.append(f"  - {title}: {reason}" if reason else f"  - {title}")
     lines += [
         "",
-        "Decide how to proceed: use an allowed alternative (for a shell command, "
-        "a read-only variant), a different tool, or — if the block is correct and "
-        "you genuinely cannot proceed — say so and stop. Otherwise continue the "
-        "task where you left off.",
+        (
+            "Do NOT repeat, restate or re-derive what you already sent — the user "
+            "has read it. If the task is NOT finished, continue from there: use an "
+            "allowed alternative (for a shell command, a read-only variant) or a "
+            "different tool, and say what it changed. Only if the task IS finished "
+            "and the block left nothing missing, reply with one short line noting "
+            "the block and stop."
+            if answered
+            else "Decide how to proceed: use an allowed alternative (for a shell "
+            "command, a read-only variant), a different tool, or — if the block is "
+            "correct and you genuinely cannot proceed — say so and stop. Otherwise "
+            "continue the task where you left off."
+        ),
     ]
     # Per-class remediation, de-duplicated across the turn's refusals: several
     # blocked calls in one turn are usually the same wall hit from different
@@ -3028,6 +3201,7 @@ class _ChatSlot:
         "_prefetch_ttl_task",
         "_dirty_flag",
         "_dirty_gen",
+        "_metadata_persist_inflight",
         "_orch_tracker",
         "_plan_cancelled",
         "_auto_run",
@@ -3073,7 +3247,9 @@ class _ChatSlot:
         "_empty_response_retries",
         "_promise_only_retries",
         "_promise_only_stop_gen",
+        "_compaction_continue_retries",
         "_batch_rejected",
+        "_compaction_failed_retries",
         "_compaction_fail_streak",
         "_compaction_fail_cooldown_until",
         "color_index",
@@ -3093,6 +3269,7 @@ class _ChatSlot:
         "forked_from",
         "_fork_lock",
         "_model_pick_lock",
+        "_remote_pick_lock",
         "_tab_id",
         "_channel_window_mtime",
         "_disk_older_count",
@@ -3105,6 +3282,13 @@ class _ChatSlot:
         "_pending_rewrite",
         "_file_changes",
         "linked_session_key",
+        # Remote-execution binding: this slot lives in the LOCAL list and local
+        # history, but its turns run on a connected peer crew. See
+        # ``dashboard/remote_relay.py``.
+        "executor",
+        "instance_id",
+        "remote_slot",
+        "_relay_in_flight",
         "_active_turn_session_key",
         "_side",
         "_acp_client",
@@ -3113,8 +3297,10 @@ class _ChatSlot:
         "_steer_segment_cut",
         "_native_subagent_tracker",
         "_native_subagent_output",
+        "_steer_confirmed",
         "_pending_steers",
         "_steer_delivery_ids",
+        "_steer_send_ids",
         "_wait_state",
         "_end_wait_request",
         "_wait_last_ping",
@@ -3155,6 +3341,23 @@ class _ChatSlot:
         self.mode = mode
         self.workspace = workspace
         self.project: str = ""
+        # Remote-execution binding. ``executor`` is "local" for every ordinary
+        # slot; "remote" means the turn is dispatched over an instance tunnel to
+        # ``instance_id`` and run by the peer's slot ``remote_slot``. The local
+        # side still owns the transcript, the sidebar row and history — only
+        # execution moves. Fail-closed: a slot whose executor says "remote" but
+        # whose instance_id or remote_slot is empty refuses to dispatch rather
+        # than silently falling back to running the turn on this machine, which
+        # would put the peer's work on the wrong host.
+        self.executor: str = "local"
+        self.instance_id: str = ""
+        self.remote_slot: str = ""
+        # True only while a remote turn is executing on the peer. Persisted (with
+        # the binding) so a gateway crash mid-turn is detectable on reload: a slot
+        # that comes back still carrying it lost its relay reader to the restart,
+        # and rehydration appends an "interrupted" row rather than leaving the
+        # transcript silently stopped. Set/cleared in ``remote_relay.relay_remote_turn``.
+        self._relay_in_flight: bool = False
         self.created_at: str = datetime.now(timezone.utc).isoformat()
         self.messages: list[dict[str, Any]] = []
         self._buffers = SlotBufferCoordinator()
@@ -3338,6 +3541,10 @@ class _ChatSlot:
         # Bumped by the _dirty setter on every True. Lets the periodic flush tell
         # "the True I started this save under" from "a NEW True set during it".
         self._dirty_gen: int = 0
+        # A guarded metadata write has changed this live slot but has not yet
+        # committed.  The periodic writer must not serialize that provisional
+        # state to an unpinned transcript while the guarded write waits.
+        self._metadata_persist_inflight: int = 0
         self._orch_tracker: Any = None  # OrchestrationTracker, set by gateway
         # Plan-cancel latch closing the cancel/Go race (#6046): the Cancel
         # handler can only stop a tracker that exists, but _stage_loop creates
@@ -3493,6 +3700,13 @@ class _ChatSlot:
         # is enqueued; the dispatch-point purge compares against it to catch a Stop
         # that pressed AND resolved to idle while the continuation waited (#2696).
         self._promise_only_stop_gen: int = 0
+        # One bounded synthetic continuation when the BACKEND compacted the
+        # conversation mid-turn and then ended the turn without finishing the
+        # work (see COMPACTION_RECOVERY_PREFIX). Bounded separately from the
+        # promise-only budget: the two failure modes are independent, and a turn
+        # that hits one must not be denied recovery from the other. Reset like
+        # the other per-turn retry budgets on a landed turn.
+        self._compaction_continue_retries: int = 0
         self._batch_rejected: bool = False
         # Per-turn compaction-status failure tracking (Mesh compaction-spam
         # fix). Distinct from SessionManager._compact_cooldown_until, which
@@ -3501,6 +3715,12 @@ class _ChatSlot:
         # chat_runner, which previously had no backoff at all and could
         # append one near-identical "Compaction failed: unknown error"
         # message per turn indefinitely.
+        # Retry budget for a turn the backend abandoned after a TRANSIENT
+        # compaction failure. Distinct from _compaction_fail_streak above,
+        # which only paces the NOTICE: this one bounds how many times the
+        # abandoned message is re-queued. Reset on a landed turn alongside the
+        # other recovery budgets.
+        self._compaction_failed_retries: int = 0
         self._compaction_fail_streak: int = 0
         self._compaction_fail_cooldown_until: float = 0.0
         self.color_index: int | None = None
@@ -3562,6 +3782,18 @@ class _ChatSlot:
         # slot._lock, which guards message-window edits and must not be held
         # across a multi-second network await.
         self._model_pick_lock: asyncio.Lock = asyncio.Lock()
+        # Serialises one remote header pick's whole transaction (forward to the
+        # peer → mirror locally → persist) on this slot. Concurrent picks each
+        # suspend at the tunnel await, so without this their peer writes and
+        # their metadata writes can complete in opposite orders and a restart
+        # restores a value the crew does not hold.
+        #
+        # Deliberately NOT ``slot._lock``, for the reason its sibling above
+        # gives: that lock guards message-window edits and must not be held
+        # across a multi-second network await. A remote pick is exactly such an
+        # await, so it gets its own lock rather than blocking every window edit
+        # on the tunnel's round-trip.
+        self._remote_pick_lock: asyncio.Lock = asyncio.Lock()
         self._tab_id: str = ""  # permanent tab identity for cross-restart session chaining
         # Transcript mtime the in-memory window was last brought up to date
         # against. Only meaningful for a slot bound to a channel session, whose
@@ -3686,6 +3918,15 @@ class _ChatSlot:
         # live and terminal state on the slot so reconnects can hydrate cards.
         self._native_subagent_tracker: dict[str, dict[str, Any]] = {}
         self._native_subagent_output: dict[str, list[str]] = {}
+        # Delivery ids whose steer a NON-EMPTY echo actually accounted for. The
+        # settle path can remove an entry from `_pending_steers` for two reasons
+        # that look identical afterwards: a matched echo (evidence), or the
+        # `settle_all_on_empty` sweep on an EMPTY echo (no evidence at all).
+        # `chat_delivery` infers `consumed` from the entry being gone, so without
+        # this it reads an empty frame as a confirmed injection and persists a
+        # success badge nothing proved. Keyed on the delivery id, not the text, so
+        # a later identical steer cannot inherit an earlier one's evidence.
+        self._steer_confirmed: set[str] = set()
         # Mid-turn steers handed to the backend but not yet confirmed consumed
         # (no steering_consumed / EVENT_STEER_CONSUMED echo yet). Appended by
         # the dashboard steer handler BEFORE the steer RPC's await (so a turn
@@ -3703,6 +3944,15 @@ class _ChatSlot:
         # persisted from one the running turn consumed — a distinction the bare
         # text cannot make.
         self._steer_delivery_ids: dict[str, str] = {}
+        # The client's `sendId` for an in-flight steer that supplied one, keyed by
+        # the same message text as `_steer_delivery_ids`. Kept in LOCKSTEP with
+        # that map -- every site that removes a delivery id removes this too -- so
+        # "present here" always implies "present there" and no reader has to ask
+        # which of the two a half-finished path left behind. Only the requeue reads
+        # it: it moves the id onto the queue entry's meta so the drained row
+        # carries `meta.sendId` like an accepted steer's row does (#6751). A steer
+        # that persists its own row stamps the id directly and drops this entry.
+        self._steer_send_ids: dict[str, str] = {}
         # In-flight `wait` tool sleep, as reported by the tool's own keepalive
         # ping: {"wait_id": str, "seconds": int, "deadline_ts": float}. The
         # deadline is on the dashboard's clock (see api_session_keepalive) so
@@ -3909,6 +4159,7 @@ class _ChatSlot:
         broadcast: bool = True,
         broadcast_user: bool = False,
         meta: dict | None = None,
+        mint_mid: bool = True,
     ) -> dict[str, Any]:
         # A LIVE turn-consuming row retires every unanswered STATELESS question:
         # the card's own submit path sends one, and anything else that starts the
@@ -4000,13 +4251,22 @@ class _ChatSlot:
         # id must survive the round trip or a post-restart redelivery of that row
         # would not be recognisable.
         #
+        # A restore caller passes ``mint_mid=False`` for a durable row whose disk
+        # representation has no id. Minting one only in the in-memory window would
+        # advertise an identity the full-history readers cannot resolve; features
+        # such as response-level Fork would then bypass their legacy pagination
+        # guard and fail against the still-id-less transcript. A supplied disk id
+        # remains in ``meta`` regardless of this flag.
+        #
         # Skipped for the wire-only roles: `chunk` is appended once per streamed
         # token and `done`/`streaming` are internal markers. None of them is ever
         # broadcast as a `chat_message` (the broadcast below excludes them) or
         # persisted (`_TRANSIENT_ROLES`), so an id would buy nothing and cost a
         # uuid4 plus a dict on the hottest path in the runner.
-        if role not in _WIRE_ONLY_ROLES and not (
-            isinstance(msg.get("meta"), dict) and msg["meta"].get("mid")
+        if (
+            mint_mid
+            and role not in _WIRE_ONLY_ROLES
+            and not (isinstance(msg.get("meta"), dict) and msg["meta"].get("mid"))
         ):
             existing = msg.get("meta")
             msg["meta"] = {
@@ -4083,6 +4343,18 @@ class _ChatSlot:
         """Queue an ephemeral frame for live SSE readers only."""
         self._buffers.push_wire_frame(self, cls, content)
 
+    @property
+    def is_remote(self) -> bool:
+        """True when this slot's turns must be dispatched to a peer crew.
+
+        Requires the whole binding, not just the ``executor`` marker: a slot
+        carrying ``executor == "remote"`` with no instance or no peer slot is
+        broken, and treating it as local would run the turn on this machine —
+        the one outcome the binding exists to prevent. Callers therefore get
+        False here and a refusal at the dispatch site, not a silent local run.
+        """
+        return bool(self.executor == "remote" and self.instance_id and self.remote_slot)
+
     def drain(self) -> list[dict[str, str]]:
         """Return and clear pending messages."""
         return self._buffers.drain(self)
@@ -4157,13 +4429,21 @@ class _ChatSlot:
         *,
         content: str | None = None,
         meta: dict | None = None,
+        mid: str | None = None,
     ) -> dict | None:
-        """Replace fields on a previously appended message identified by ts."""
+        """Replace fields on a previously appended message.
+
+        Identified by ``mid`` (this row's server-minted identity) when one is
+        given, falling back to ``ts``. Prefer ``mid``: two rows can carry the same
+        ``ts``, so a ts lookup resolves the first match and can patch the wrong
+        row.
+        """
         return self._buffers.update_message(
             self,
             ts,
             content=content,
             meta=meta,
+            mid=mid,
         )
 
     # ── Queue helpers (dict-based queue items) ──
@@ -5144,7 +5424,10 @@ class DashboardState:
         """
 
         async def _on_recycled(key: str, *, reason: str) -> None:
-            from kiro_crew.dashboard.chat_utils import dashboard_slot_key
+            from kiro_crew.dashboard.chat_utils import (
+                _broadcast_expired_oauth_banners,
+                dashboard_slot_key,
+            )
 
             # A channel-born session's key is the channel's own even while its
             # tab is open, so ask which tab displays it rather than reading the
@@ -5164,6 +5447,16 @@ class DashboardState:
             except Exception:
                 logging.getLogger(__name__).exception(
                     "Failed to append recycle notice to slot %s", slot_key
+                )
+            # The recycle ended the child that owned any open MCP OAuth
+            # banner's loopback listener; push the read gate's verdict so an
+            # open tab withdraws the dead Authorize link without waiting for
+            # its next refetch (issue #8149's RSS-recycle path).
+            try:
+                _broadcast_expired_oauth_banners(self, slot)
+            except Exception:
+                logging.getLogger(__name__).exception(
+                    "Failed to broadcast OAuth banner expiry for slot %s", slot_key
                 )
 
         self.sessions.set_recycle_callback(_on_recycled)
@@ -7413,6 +7706,7 @@ class DashboardState:
         from kiro_crew.dashboard.handlers.source_providers import (
             gitlab_hosts_generation,
         )
+        from kiro_crew.platform.context import governance_generation
 
         yolo_active = self.is_yolo_active()  # expire first if needed
         # PUBLIC-repo chip status rides the general frame so any authenticated
@@ -7478,6 +7772,7 @@ class DashboardState:
                 # blinked": this frame fires on routine slot activity, so the
                 # tree alone is not a change signal.
                 "foldersGeneration": self.folders_generation(),
+                "governanceGeneration": governance_generation(),
             }
         )
         # The owner frame is the owner's ONLY slots frame — `_send_ws_all` skips
@@ -7499,6 +7794,7 @@ class DashboardState:
                     gitlab_hosts_gen=gitlab_hosts_generation(),
                     folders=_safe_folder_tree(getattr(self, "_folders", None)),
                     folders_gen=self.folders_generation(),
+                    governance_gen=governance_generation(),
                 )
             )
 
@@ -7621,6 +7917,7 @@ class DashboardState:
                     gitlab_hosts_gen=note.get("gitlabHostsGeneration"),
                     folders=note.get("folders"),
                     folders_gen=note.get("foldersGeneration"),
+                    governance_gen=note.get("governanceGeneration"),
                 )
             elif msg_type == "slot_title":
                 ws_data = {"key": note["key"], "title": note["title"]}
@@ -7653,17 +7950,13 @@ class DashboardState:
                 ws_data = {"key": note["key"]}
                 ws_msg = json.dumps({"type": "session_summary", "data": ws_data})
             elif msg_type == "chat_message":
-                chat_data: dict[str, Any] = {
-                    "slot": note["slot"],
-                    "role": note["role"],
-                    "content": note["content"],
-                    "ts": note.get("ts", ""),
-                }
-                # Include cls for messages with metadata (e.g. permission with tool_input)
-                if note.get("cls"):
-                    chat_data["cls"] = note["cls"]
-                if note.get("meta"):
-                    chat_data["meta"] = note["meta"]
+                # One serialiser, both doors — see chat_message_frame().
+                # include_metadata=True because THIS door filters downstream:
+                # _send_ws_all -> _ws_client_allowed (deny-by-default event
+                # scope) decides per socket whether an app token may see this
+                # slot at all. The SSE door has no such gate and decides for
+                # itself; do not copy this True over there.
+                chat_data = chat_message_frame(note, include_metadata=True)
                 ws_data = chat_data
                 ws_msg = json.dumps({"type": "chat_message", "data": chat_data})
             else:
@@ -7701,6 +7994,12 @@ class DashboardState:
         _websocket_for(self)._send_ws_owners(msg)
 
     def broadcast_ws(self, msg_type: str, data: object) -> None:
+        # Mirror first, broadcast second. A relay reader consumes the SSE stream,
+        # so the mirrored copy must be queued before the frame fans out to local
+        # WebSocket clients — otherwise a turn that ends inside the broadcast
+        # (chat_done tearing the slot down) could publish to local clients a
+        # frame the relay never receives.
+        _mirror_relay_frame(self, msg_type, data)
         _websocket_for(self).broadcast_ws(msg_type, data)
 
     def broadcast_context_usage(self, slot_key: str, payload: dict) -> None:

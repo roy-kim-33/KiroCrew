@@ -21,7 +21,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-from kiro_crew import mcp_apps_render
+from kiro_crew import mcp_apps_render, session_directive
 from kiro_crew.acp.types import (
     EVENT_PERMISSION_REQUEST,
     EVENT_TEXT_CHUNK,
@@ -119,6 +119,21 @@ def attach_kas_custom_agents(
 def set_mode_params(session_id: str, agent: str) -> dict[str, Any]:
     """Params for ``session/set_mode`` (activate an agent on a session)."""
     return {"sessionId": session_id, "modeId": agent}
+
+
+def agent_version_from_init(resp: dict[str, Any]) -> str:
+    """``agentInfo.version`` from an ``initialize`` result, ``""`` when absent.
+
+    Shared by both clients so the two handshakes read the same field the same
+    way: kiro-cli reports ``{"agentInfo": {"name": ..., "version": "2.21.0"}}``.
+    A missing or non-string value reads as unknown rather than raising — the
+    handshake must not fail over a field only a capability gate consults.
+    """
+    info = resp.get("agentInfo") if isinstance(resp, dict) else None
+    if not isinstance(info, dict):
+        return ""
+    version = info.get("version")
+    return version.strip() if isinstance(version, str) else ""
 
 
 def parse_session_modes(resp: dict[str, Any]) -> tuple[list[str], str, bool]:
@@ -557,6 +572,77 @@ def parse_text_chunk(update: dict[str, Any]) -> tuple[str | None, bool]:
     if kind == UPDATE_AGENT_THOUGHT_CHUNK:
         return text_val, True
     return None, False
+
+
+# claude-agent-acp has no out-of-band compaction notification: where kiro-cli
+# sends ``_kiro.dev/compaction/status`` and KAS sends its summarization kinds
+# under ``_meta.kiro``, the Claude adapter reports compaction as PLAIN
+# ``agent_message_chunk`` TEXT, indistinguishable from model prose to any
+# client.  Verbatim from the shipped adapter (``dist/acp-agent.js``, the
+# ``status`` case of its SDK-message switch):
+#
+#   status === "compacting"          -> "Compacting..."
+#   compact_result === "success"     -> "\n\nCompacting completed."
+#   compact_result === "failed"      -> "\n\nCompacting failed{reason}"
+#
+# where ``reason`` is ``": " + compact_error`` or ``"."``.  Recognising these
+# here makes the Claude backend the third producer of EVENT_COMPACTION_STATUS,
+# so every consumer that already handles the kiro-cli and KAS shapes (the
+# dashboard notice + context-meter reset, the messaging drivers, and
+# ``wait_for_compaction``) works on Claude with no per-surface change.
+#
+# The notice TEXT is still forwarded on every path: classifying one of these
+# literals is a guess about bare prose, so a layer that dropped the chunk would
+# turn any wrong guess into deleted model output. Structured consumers get the
+# chunk flagged ``AcpEvent.control_notice`` instead, which lets them show it
+# without counting it as the turn's own answer.
+#
+# Only ``compact_result`` carries a terminal, and per the adapter's own comment
+# the SDK sends it for MANUAL ``/compact`` only: an AUTOMATIC mid-turn
+# compaction takes the adapter's ``compact_boundary`` case, which emits a
+# ``usage_update`` and no text at all.  So an auto-compaction produces a
+# ``started`` with no terminal, and callers must settle it at turn end rather
+# than waiting for one (see ``AcpClient._dispatch_events``).
+_CLAUDE_COMPACTION_STARTED_MARKER = "Compacting..."
+_CLAUDE_COMPACTION_COMPLETED_MARKER = "Compacting completed."
+_CLAUDE_COMPACTION_FAILED_MARKER = "Compacting failed"
+
+
+def parse_claude_compaction_notice(chunk: str) -> tuple[str, str] | None:
+    """Classify a claude-agent-acp compaction notice chunk.
+
+    Returns ``(status_type, detail)`` with ``status_type`` in
+    ``started``/``completed``/``failed`` — the same vocabulary kiro-cli's
+    ``_kiro.dev/compaction/status`` and KAS's summarization kinds already use —
+    or ``None`` when *chunk* is not one of the adapter's notices.
+
+    Matched on the STRIPPED chunk (the adapter prefixes the two terminals with
+    ``\\n\\n``), and every arm is anchored to a WHOLE chunk.  ``started`` and
+    ``completed`` are exact equality; ``failed`` accepts only the two shapes the
+    adapter actually emits — bare ``Compacting failed.`` or
+    ``Compacting failed: <reason>`` — rather than any chunk merely STARTING with
+    the marker.  Anchoring is the point, and it has to hold on all three arms: a
+    model that opens a real answer with "Compacting failed because…" would
+    otherwise be reclassified as a control notice and have its output erased
+    from the transcript.
+
+    The returned detail is NOT redacted: it is backend-echoed text, so callers
+    that surface it must pass it through their own redaction the same way they
+    already do for the kiro-cli/KAS compaction summaries.
+    """
+    text = chunk.strip()
+    if not text:
+        return None
+    if text == _CLAUDE_COMPACTION_STARTED_MARKER:
+        return "started", ""
+    if text == _CLAUDE_COMPACTION_COMPLETED_MARKER:
+        return "completed", ""
+    if text in (_CLAUDE_COMPACTION_FAILED_MARKER, f"{_CLAUDE_COMPACTION_FAILED_MARKER}."):
+        return "failed", ""
+    reason_prefix = f"{_CLAUDE_COMPACTION_FAILED_MARKER}: "
+    if text.startswith(reason_prefix):
+        return "failed", text[len(reason_prefix) :].strip().rstrip(".")
+    return None
 
 
 _ACP_SHELL_KIND = "execute"
@@ -1072,12 +1158,173 @@ def _mcp_content_text(payload: dict[str, Any]) -> str | None:
     return "\n".join(parts)
 
 
+def _marker_bearing_text(payload: dict[str, Any], _max_nodes: int = 512) -> str | None:
+    """Return the ONE string inside *payload* that carries the directive sentinel.
+
+    The last-resort companion to :func:`_mcp_content_text`, for a tool-result
+    envelope this module does not recognise as a pure text envelope. Such a
+    payload currently reaches the consumer through ``json.dumps``, which escapes
+    every quote in it -- so a directive marker embedded in one of its string
+    values arrives with ``\"kind\"`` instead of ``"kind"`` and
+    ``session_directive.peek`` can no longer parse the selector. The sentinel
+    itself survives that escaping unchanged, so the frame still LOOKS like it
+    carries a directive while naming no record: observed on the KAS backend as
+    ``json-unparseable (JSONDecodeError)`` with the envelope's own ``"}`` still
+    attached to the payload's tail.
+
+    Keyed on the SENTINEL rather than on any envelope field name, because the
+    field differs per backend and the sentinel is a fixed control token this
+    process emitted itself. Requires EXACTLY ONE match: zero means there is no
+    directive here and the caller should keep dumping the envelope, while two or
+    more means the frame is ambiguous about which string is the directive, and
+    guessing between them could apply the wrong payload. Bounded walk
+    (``_max_nodes``, depth 6) so a pathological envelope cannot spin here.
+    """
+    hits: list[str] = []
+    budget = [_max_nodes]
+
+    def _walk(node: Any, depth: int) -> None:
+        if budget[0] <= 0 or depth > 6 or len(hits) > 1:
+            return
+        budget[0] -= 1
+        if isinstance(node, str):
+            if session_directive.has_marker(node):
+                hits.append(node)
+        elif isinstance(node, dict):
+            for value in node.values():
+                _walk(value, depth + 1)
+        elif isinstance(node, list):
+            for value in node:
+                _walk(value, depth + 1)
+
+    _walk(payload, 0)
+    return hits[0] if len(hits) == 1 else None
+
+
+ELIDED_MARKER_VALUE = "[[directive marker emitted on its own line above]]"
+
+
+def _elide_marker_value(payload: Any, marker: str) -> Any:
+    """Copy *payload* with the one *marker*-bearing string replaced by a note.
+
+    The marker has to leave the envelope on its OWN line for
+    ``session_directive.peek`` to read it, but the envelope's other fields are
+    real tool output the user is owed -- dropping them to make room for the
+    marker loses transcript content (an exit status, a second text block). So
+    the marker goes out verbatim and this copy carries everything ELSE, with the
+    one value that already went out replaced by a short note instead of
+    duplicated.
+    """
+    if isinstance(payload, str):
+        return ELIDED_MARKER_VALUE if payload == marker else payload
+    if isinstance(payload, dict):
+        return {k: _elide_marker_value(v, marker) for k, v in payload.items()}
+    if isinstance(payload, list):
+        return [_elide_marker_value(v, marker) for v in payload]
+    return payload
+
+
+def _repair_escaped_marker(text: str) -> str | None:
+    """Recover a directive marker whose payload arrived JSON-ESCAPED, or None.
+
+    Some backends (observed on KAS) hand the whole tool result back already
+    serialised as JSON, so the text this module receives is the DUMP of an
+    envelope rather than the envelope itself. Every quote in the embedded
+    directive is then ``\\"`` and the envelope's own ``"}`` is glued to the
+    payload's tail, so the sentinel still arrives intact while
+    ``session_directive.peek`` can no longer read a selector out of it -- the
+    frame names a directive it cannot identify, and the parked record is never
+    claimed.
+
+    Two recoveries, tried in order, because the escaping can wrap the WHOLE text
+    or just reach the marker:
+
+    1. The whole text parses as JSON -- take the one string inside it that
+       carries the sentinel (:func:`_marker_bearing_text` for a container, the
+       value itself for a bare string).
+    2. Only the marker line is escaped -- unescape it and ``raw_decode`` the
+       first JSON value, which ignores the envelope's trailing punctuation.
+
+    ACCEPTANCE IS THE TEST, not the shape: a candidate is returned only when
+    ``peek`` actually reads a selector from it, so a wrong guess degrades to
+    None and leaves the original text untouched rather than substituting
+    something worse.
+    """
+    if not text or not session_directive.has_marker(text):
+        return None
+    if session_directive.peek(text) is not None:
+        return None  # already readable -- nothing to repair
+    if text.count(session_directive.SENTINEL) > 1:
+        # Ambiguous: recovery (2) below reads the FIRST marker line, which would
+        # be a GUESS about which directive the frame meant. Applying the wrong
+        # directive is worse than applying none, and a real frame carries one
+        # marker (a second directive arrives under its own toolCallId), so refuse.
+        return None
+
+    # (1) the entire text is a JSON dump.
+    try:
+        outer = json.loads(text)
+    except (ValueError, TypeError):
+        outer = None
+    if isinstance(outer, str):
+        if session_directive.peek(outer) is not None:
+            return outer
+    elif isinstance(outer, (dict, list)):
+        inner = _marker_bearing_text(outer if isinstance(outer, dict) else {"_": outer})
+        if inner is not None and session_directive.peek(inner) is not None:
+            # Siblings FIRST, marker LAST. Both placements keep peek working, but
+            # only this one survives display: session_directive.strip_marker cuts
+            # from the sentinel to the END of the string, so anything after the
+            # marker is dropped from the transcript the user actually reads.
+            siblings = json.dumps(_elide_marker_value(outer, inner), default=str)
+            return siblings + "\n" + inner
+
+    # (2) The escaped dump is only PART of the text -- another output part, or a
+    # line of prose, sits beside it -- so (1) cannot parse the whole thing. Undo
+    # the escaping on the marker's own line by decoding it AS the JSON string it
+    # came from: prepend the opening quote the dump's own key/colon consumed and
+    # raw_decode, which stops at that string's real closing quote and therefore
+    # ignores whatever the envelope glued onto the tail.
+    #
+    # A plain str.replace of \\" -> " CANNOT do this: a quote that was already
+    # escaped inside the directive (a message quoting a word) arrives as \\\\"
+    # and collapses to a dangling \\" that terminates the JSON string early, so
+    # every directive whose text contains a quote failed to recover.
+    idx = text.find(session_directive.SENTINEL)
+    if idx < 0:
+        return None
+    head = text[:idx]
+    rest = text[idx + len(session_directive.SENTINEL) :]
+    line, newline, following = rest.partition("\n")
+    try:
+        unescaped, _end = json.JSONDecoder().raw_decode('"' + line)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(unescaped, str):
+        return None
+    # Whatever the envelope glued on after the marker's own string (its closing
+    # `"}`, or real trailing text) is preserved BEFORE the marker, not after it.
+    # Two constraints pin that position: peek parses the marker's line as one
+    # JSON value, so the bytes cannot stay on that line; and strip_marker cuts
+    # from the sentinel to the END of the string, so a later line would be
+    # dropped from the transcript. Ahead of the marker satisfies both.
+    # `_end` indexes the quote-prefixed copy, so one char of it is our prefix.
+    suffix = line[_end - 1 :]
+    preserved = head + "".join(
+        part + "\n" for part in (suffix, following if newline else "") if part
+    )
+    candidate = preserved + session_directive.SENTINEL + unescaped
+    return candidate if session_directive.peek(candidate) is not None else None
+
+
 def _build_tool_result_event(update: dict[str, Any], cache_scope: str = "") -> AcpEvent | None:
     """Build an ``EVENT_TOOL_RESULT`` from a ``tool_call_update`` carrying output.
 
-    Two output shapes: ``content[].content.text`` blocks (stream mid-turn), or
-    ``rawOutput.items[]`` (``Text`` / ``Json.stdout``) on ``status=completed``.
-    Returns None when the update carries no output (refinement-only updates are
+    Three output shapes: ``content[].content.text`` blocks (stream mid-turn),
+    ``rawOutput.items[]`` (``Text`` / ``Json.stdout``) on ``status=completed``,
+    and -- since ``rawOutput`` is unstructured passthrough rather than a
+    contract -- any other non-empty ``rawOutput`` object, serialised. Returns
+    None when the update carries no output at all (refinement-only updates are
     handled by :func:`_build_tool_refinement_event`).
 
     ``cache_scope`` is the emitting session's origin scope, forwarded only so the
@@ -1130,14 +1377,98 @@ def _build_tool_result_event(update: dict[str, Any], cache_scope: str = "") -> A
                             output_parts.append(str(j["stdout"]))
                         else:
                             _mcp_text = _mcp_content_text(j)
+                            # Track provenance explicitly. Re-deriving it by
+                            # object identity (`_mcp_text is _mcp_content_text(j)`)
+                            # is wrong: a recognised text envelope with >=2 blocks
+                            # returns a FRESH join each call, so the identity test
+                            # reports "marker-bearing" for an ordinary result and
+                            # emits its whole envelope a second time.
+                            _marker_envelope = False
+                            if _mcp_text is None:
+                                # Not a recognised text envelope. Before dumping
+                                # it -- which would escape every quote and
+                                # destroy an embedded directive payload -- check
+                                # whether one of its strings IS the directive.
+                                _mcp_text = _marker_bearing_text(j)
+                                if _mcp_text is not None:
+                                    _marker_envelope = True
+                                    logger.warning(
+                                        "tool-result envelope is not a text envelope but "
+                                        "carries a session-directive marker; using that "
+                                        "string verbatim instead of json.dumps, which "
+                                        "would escape its payload. Envelope keys: %s",
+                                        sorted(j.keys()),
+                                    )
                             if _mcp_text is not None:
+                                if _marker_envelope:
+                                    # The envelope's other fields are real output.
+                                    # They go BEFORE the marker: strip_marker cuts
+                                    # from the sentinel to the end of the string,
+                                    # so anything after it is lost from display.
+                                    output_parts.append(
+                                        json.dumps(_elide_marker_value(j, _mcp_text), default=str)
+                                    )
                                 output_parts.append(_mcp_text)
                             else:
                                 output_parts.append(json.dumps(j, default=str))
+            # Path 3: an object that is not that envelope at all. ``rawOutput``
+            # is unstructured passthrough, so ``items[]`` is ONE producer's
+            # private wrapper rather than a contract, and an object Crew does
+            # not recognise is not evidence the tool produced no output.
+            # Treating it as absent returns None from this builder, which drops
+            # the whole EVENT_TOOL_RESULT -- the event that writes both
+            # ``meta["output"]`` and ``meta["done"]`` for the pill. The Output
+            # tab is lost outright; ``done`` survives only if assistant text
+            # follows the tool group, because chat_runner's EVENT_TEXT_CHUNK
+            # handler then sweeps unmarked tool rows done. Serialise it instead,
+            # which is already the policy one level in: an unrecognised ``Json``
+            # envelope is dumped rather than dropped (above), and
+            # ``parse_todo_snapshot`` likewise accepts a bare-dict ``rawOutput``.
+            # Gated on the ABSENCE of ``items`` so no ``items[]`` envelope
+            # changes here, including one that legitimately yields nothing. No
+            # ``not output_parts`` test is needed: this whole branch already runs
+            # only when Path 1 found nothing, which is what keeps a content block
+            # winning over the raw envelope.
+            if raw_output and "items" not in raw_output:
+                output_parts.append(json.dumps(raw_output, default=str))
     if not output_parts:
         return None
     joined = "\n".join(output_parts)
-    final_output = _redact(joined)[:8000]
+    # Repair a marker that arrived JSON-escaped, BEFORE redaction and the head
+    # cut: the consumer reads its selector out of this exact string, and an
+    # escaped payload names no parked record (see _repair_escaped_marker).
+    _repaired = _repair_escaped_marker(joined)
+    if _repaired is not None:
+        # No payload excerpt: this text is PRE-redaction (redaction runs on the
+        # join below) and these warnings land in the persistent log ring that
+        # /api/logs serves, so an excerpt here would publish credentials that
+        # the transcript itself never shows. Length is the diagnostic.
+        logger.warning(
+            "tool-result text carried a JSON-ESCAPED session-directive marker; "
+            "repaired it so the selector is readable (payload %d chars).",
+            len(joined),
+        )
+        joined = _repaired
+    elif session_directive.has_marker(joined) and session_directive.peek(joined) is None:
+        # The frame names a directive whose selector cannot be read and the
+        # repair could not recover it either. Logged HERE because a silent None
+        # from the repair is indistinguishable downstream from a transport that
+        # never carried a marker at all -- which is what made this class of
+        # failure invisible.
+        logger.warning(
+            "tool-result carries a session-directive marker whose selector is "
+            "UNREADABLE and could not be repaired: %s (payload %d chars).",
+            session_directive.peek_failure_reason(joined),
+            len(joined),
+        )
+    _redacted = _redact(joined)
+    final_output = _redacted[: session_directive.MAX_TOOL_RESULT_CHARS]
+    # Both session-directive sentinels are TAIL-anchored, and this cut runs AFTER
+    # redaction -- which can grow the text, since a credential is replaced by a
+    # longer placeholder. So a producer bounding its own length cannot guarantee
+    # the marker survives here; re-attach it when the cut removed it, exactly as
+    # the App render marker below is re-injected at this same seam.
+    final_output = session_directive.preserve_tail_marker(_redacted, final_output)
     # An MCP App render marker lives at offset 0 of its own text part, but the
     # 8000-char join cut is applied to the CONCATENATION of all parts: when the
     # marker part is preceded by other (up to 4000-char) parts, its offset in
@@ -1578,6 +1909,7 @@ __all__ = [
     "parse_usage_cost",
     "parse_prompt_token_usage",
     "parse_text_chunk",
+    "parse_claude_compaction_notice",
     "make_unified_diff",
     "select_tool_title",
     "is_shell_kind",

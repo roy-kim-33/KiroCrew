@@ -50,6 +50,7 @@ import JiraLogo from './icons/JiraLogo'
 import GithubLogo from './icons/GithubLogo'
 import GitlabLogo from './icons/GitlabLogo'
 import DiffBlock from './DiffBlock'
+import FoldableDiffBlock from './FoldableDiffBlock'
 import EditableCodeBlock from './EditableCodeBlock'
 import FilePathMenu, { revealOrOpen } from './FilePathMenu'
 import { SmoothResize } from './SmoothResize'
@@ -75,14 +76,99 @@ export function artifactSlugFromHref(href: string | null | undefined): string | 
  * Character-level shape of a local filesystem path: letters and digits in any
  * script (`\p{L}\p{N}` — filenames are not ASCII-only), combining marks
  * (`\p{M}` — macOS stores NFD-decomposed forms, and Indic/Thai/Arabic scripts
- * need marks even under NFC), underscore, dot, dash, @, ~, colon and space,
- * separated by slashes. Anchored at both ends, so anything carrying a URL
+ * need marks even under NFC), underscore, dot, dash, @, ~, colon, space and
+ * PARENTHESES, separated by slashes — EITHER kind, because a Windows gateway
+ * names its files with `\`. Anchored at both ends, so anything carrying a URL
  * scheme (`https://…`) or shell punctuation fails outright.
+ *
+ * The punctuation set is a DECIDED boundary, not an accumulation. Two review
+ * rounds each found one more character that is legal in a real filename —
+ * parentheses (`C:\Program Files (x86)`, the most-trodden directory on Windows)
+ * and then an apostrophe (`C:\Users\O'Neil`) — which is the signature of an
+ * allowlist being discovered one bug report at a time. So the rule is stated once
+ * instead: admit every character that is legal in a filename on BOTH platforms
+ * and is not a shell control operator, on both shapes, since the two describe one
+ * filesystem convention and an asymmetry is only a later bug report.
+ *
+ * IN: letters, marks, digits, `_ . @ ~ - space` and `' ! # % = + , ( ) [ ] { }`.
+ * A closing bracket may also END a path, so `App (old)` and `data [2026]`
+ * classify as directories.
+ *
+ * OUT, deliberately — these are what keep the anchored shape from matching a
+ * command or a URL: `$` and a backtick (expansion), `&` `;` `|` (chaining),
+ * `<` `>` (redirection), `"` (quoting), `?` `*` (globbing), and `:` anywhere but
+ * the last segment, where it serves `file:447`. Windows forbids `< > : " / \ | ?
+ * *` in a filename outright, so excluding them costs nothing there and buys the
+ * prose rejection everywhere.
+ *
+ * Widening the repertoire never widens the positive-signal rule, so punctuated
+ * prose (`foo/bar (baz)`, `a&&b/c.sh`) still carries neither a root nor an
+ * extension and is still refused below.
+ *
+ * Admitting `\` as a separator here is what lets a relative Windows path
+ * (`src\main.py`, `.\src\main.py`) reach the probe. It cannot express a
+ * DRIVE-rooted path, whose colon sits before the first separator while this
+ * shape allows a colon only in the last segment (where it serves `file:447`),
+ * so that form has its own shape below.
  *
  * Shape alone is NOT sufficient to linkify — see `isPathCandidate`.
  */
 const PATH_SHAPE_RE =
-  /^~?(?:\.{0,2}\/)?[\p{L}\p{M}\p{N}_.@~/ -]*\/[\p{L}\p{M}\p{N}_.@~: -]*[\p{L}\p{M}\p{N}_.]$/u
+  /^~?(?:\.{0,2}[/\\])?[\p{L}\p{M}\p{N}_.@~'!#%=+,()[\]{}/\\ -]*[/\\][\p{L}\p{M}\p{N}_.@~'!#%=+,()[\]{}: -]*[\p{L}\p{M}\p{N}_.)\]}]$/u
+
+/**
+ * Character-level shape of a DRIVE-rooted Windows path (`C:\x`, `c:/x`), whose
+ * root `PATH_SHAPE_RE` cannot carry: the colon precedes the first separator.
+ *
+ * The trailing segment may be empty so a bare drive root (`C:\`) — a real
+ * directory the file manager can reveal — still classifies, and segments carry
+ * the same repertoire `PATH_SHAPE_RE` allows, so both
+ * `C:\Program Files (x86)\app.txt` and `C:\Users\O'Neil\notes.md` resolve.
+ */
+const WIN_DRIVE_PATH_SHAPE_RE =
+  /^[A-Za-z]:[/\\](?:[\p{L}\p{M}\p{N}_.@~'!#%=+,()[\]{} -]+[/\\])*[\p{L}\p{M}\p{N}_.@~'!#%=+,()[\]{} -]*$/u
+
+/**
+ * A UNC prefix in EITHER spelling — `\\host\share\…` or `//host/share/…` —
+ * refused outright below.
+ *
+ * NOT an oversight that the Windows support here stops at drive letters. A UNC
+ * path names a HOST, and this pre-filter classifies markdown that may be
+ * attacker-authored (a rendered web page, a quoted file, any untrusted text a
+ * message carries), so admitting one would let that text make the dashboard ask
+ * the gateway to stat `\\attacker.example\share\x`. On Windows that stat is an
+ * outbound SMB connection, which offers the host's NTLM credentials — a
+ * credential-leak vector, from nothing but rendering a message.
+ *
+ * Windows reads ANY two leading separators as a UNC root, of either kind and in
+ * either order, so the character class is the whole point: matching two of the
+ * SAME kind (`\\\\` or `//`) leaves `\\/attacker.example\\share\\x` and its `/\\`
+ * mirror admitted, and those resolve to the same share. A mixed pair is the same
+ * vector under a different coat of paint, and unlike the `//` spelling it is a
+ * shape no pre-diff predicate here could even form.
+ *
+ * Three places in this codebase already hold exactly this line, and this is the
+ * fourth: `WINDOWS_ABS_PATH_RE` (utils/urlTransform.ts) excludes UNC for image
+ * `src` values, `MdAnchor` refuses a decoded `//`-prefixed link destination, and
+ * `WIN_PRODUCER_PATH_RE` (utils/fileTokens.ts) documents the producer/consumer
+ * asymmetry that makes all of them deliberate — our own upload endpoint may emit
+ * a UNC path because we trust it, while every consumer-side predicate over
+ * authorable text must refuse the host-naming shape.
+ *
+ * Cost on POSIX is nil: `//tmp/x` names the same file as `/tmp/x`, which is
+ * still a candidate. Cost on Windows is that a network-share path renders as a
+ * copy chip rather than an open chip — the same trade `MdAnchor` already makes.
+ */
+const UNC_PREFIX_RE = /^[/\\]{2}/
+
+/** The last path segment, split on EITHER separator so a Windows path yields its
+ *  real basename. `lastIndexOf('/')` alone returns -1 for `C:\a\notes` and hands
+ *  the whole string to `EXT_RE`, which then reads a dotted DIRECTORY name
+ *  (`project\v1.2\notes`) as an extension on the file. */
+function basenameOf(s: string): string {
+  const cut = Math.max(s.lastIndexOf('/'), s.lastIndexOf('\\'))
+  return s.slice(cut + 1)
+}
 
 /** A trailing `.ext` on the last segment, 1-8 chars — the only positive path
  *  signal available to a path that is neither rooted nor explicitly relative.
@@ -91,6 +177,9 @@ const PATH_SHAPE_RE =
  *  Unicode basename with an ASCII extension (`产品文档-v1.0.md`) still passes,
  *  because only the trailing `.ext` is matched. */
 const EXT_RE = /\.[A-Za-z0-9]{1,8}$/
+
+/** Explicitly relative, either separator: `./x`, `../x`, `.\x`, `..\x`. */
+const REL_PREFIX_RE = /^\.{1,2}[/\\]/
 
 /**
  * Could this inline-code text denote a local filesystem path?
@@ -106,18 +195,35 @@ const EXT_RE = /\.[A-Za-z0-9]{1,8}$/
  * of which then rendered as a clickable "file" that could only ever 404. So a
  * candidate must carry a positive signal that it names a location:
  *
- *   - rooted (`/x`, `~/x`), or
- *   - explicitly relative (`./x`, `../x`), or
- *   - a file extension on the last segment (`src/main.py`).
+ *   - rooted — POSIX (`/x`, `~/x`) or a Windows drive (`C:\x`, `C:/x`), or
+ *   - explicitly relative (`./x`, `../x`, `.\x`, `..\x`), or
+ *   - a file extension on the last segment (`src/main.py`, `src\main.py`).
  *
- * A bare two-segment identifier with no extension is rejected. Note the third
- * rule still admits `origin/feature/x.ts`; that is intentional — syntax cannot
- * settle it, and the stat probe will.
+ * A bare two-segment identifier with no extension is rejected. That rejection is
+ * what keeps the backslash separator safe on every platform: a `\`-joined
+ * non-path carries no extension, so an escape sequence (`\n`), a registry key
+ * (`HKEY_LOCAL_MACHINE\Software\Foo`) and a domain-qualified login
+ * (`CORP\alice`) all still fail here rather than becoming a chip that could only
+ * 404. Note the third rule still admits `origin/feature/x.ts`; that is
+ * intentional — syntax cannot settle it, and the stat probe will.
+ *
+ * UNC is refused FIRST, ahead of every shape and signal test, because the other
+ * rules would otherwise readmit it: the extension rule matches
+ * `\\host\share\x.txt`, and the leading-`/` rule matches `//host/share/x`.
+ * See `UNC_PREFIX_RE` for why that shape must never reach the probe.
  */
 export function isPathCandidate(s: string): boolean {
-  if (!PATH_SHAPE_RE.test(s)) return false
-  if (s.startsWith('/') || s.startsWith('~') || s.startsWith('./') || s.startsWith('../')) return true
-  return EXT_RE.test(s.slice(s.lastIndexOf('/') + 1))
+  if (UNC_PREFIX_RE.test(s)) return false
+  if (!PATH_SHAPE_RE.test(s) && !WIN_DRIVE_PATH_SHAPE_RE.test(s)) return false
+  if (s.startsWith('/') || s.startsWith('~') || REL_PREFIX_RE.test(s)) return true
+  // Rootedness is the positive signal, exactly as a leading `/` is on POSIX, so
+  // a drive-rooted path needs no extension: `C:\Windows` is a real directory.
+  // Reuses the consumer-side predicate `urlTransform` already applies to image
+  // `src` values rather than restating it, so the chip and the request it issues
+  // cannot drift on what "absolute" means — and this pre-filter inherits that
+  // predicate's deliberate exclusion of host-naming shapes.
+  if (WINDOWS_ABS_PATH_RE.test(s)) return true
+  return EXT_RE.test(basenameOf(s))
 }
 
 /**
@@ -752,6 +858,14 @@ function resolveSessionChip(raw: string, actions: SessionActions): { key: string
 
 type PathResolution = {
   candidate: boolean
+  /** Path SHAPE alone, independent of whether probing is enabled.
+   *
+   * `candidate` also requires the probe to be on, so it flips the moment a
+   * message stops streaming — and anything keyed to it would appear then,
+   * re-wrapping a paragraph whose text has just become final. The glyph reserve
+   * is keyed to this instead, so it is already in place before the probe's
+   * answer (or the probe itself) can arrive. */
+  shaped: boolean
   kind: PathKind | undefined
   path: string
   splitPath: string
@@ -767,7 +881,8 @@ type PathResolution = {
  */
 function usePathResolution(raw: string, probeEnabled: boolean): PathResolution {
   const { path: splitPath, line, endLine } = splitLineRef(raw)
-  const candidate = probeEnabled && isPathCandidate(splitPath)
+  const shaped = isPathCandidate(splitPath)
+  const candidate = probeEnabled && shaped
   const literalCandidate = candidate && line != null
   const splitKind = usePathKind(candidate ? splitPath : null)
   const literalKind = usePathKind(literalCandidate ? raw : null)
@@ -775,6 +890,7 @@ function usePathResolution(raw: string, probeEnabled: boolean): PathResolution {
 
   return {
     candidate,
+    shaped,
     kind: literalWins ? literalKind : splitKind,
     path: literalWins ? raw : splitPath,
     splitPath,
@@ -820,6 +936,41 @@ function activatePath(path: string, kind: PathKind, reveal: boolean, actions: Pa
 }
 
 const CHIP_BASE = 'bg-bg-elevated px-1.5 py-0.5 rounded text-accent text-sm font-mono'
+
+/** Geometry of a path chip's leading glyph, shared by the confirmed chip and by
+ *  the reserve that stands in for it while the path is unconfirmed.
+ *
+ *  Both sites MUST read these two values, because equal width in every state is
+ *  the whole mechanism: the glyph is an inline atom, so 16px (12px box + 4px
+ *  margin) appearing mid-paragraph can push a line over and change the row's
+ *  height. Measured in a browser at phone widths, that re-wrap costs 24px — one
+ *  line — and it lands under a reader who is scrolling history, because a path
+ *  is probed the first time its row mounts. Same rule the image reserve follows
+ *  (`reservedImageStyle`): reserve the box before the async answer arrives, so
+ *  the answer restyles instead of reflowing. */
+const CHIP_GLYPH_SIZE = 12
+const CHIP_GLYPH_GEOMETRY = 'inline align-middle mr-1'
+
+/**
+ * Invisible stand-in for the chip glyph, for a path-shaped span that is not (or
+ * not yet) a confirmed path.
+ *
+ * It renders the same icon element at the same size and margin, so it occupies
+ * the confirmed chip's width exactly rather than an approximation of it — the
+ * geometry cannot drift because a different icon or a different margin would
+ * have to be written at both sites. `opacity-0` rather than a blank span keeps
+ * the line box identical too: an empty inline-block contributes a different
+ * baseline than an svg does.
+ *
+ * Blank, deliberately NOT a dimmed glyph: `InlineCode`'s glyph is what tells a
+ * reader at rest which paths the backend actually confirmed, and a placeholder
+ * glyph would erase that distinction to buy nothing — the reserve only needs the
+ * space, not a mark.
+ */
+function ChipGlyphReserve({ path }: { path: string }) {
+  const Glyph = fileIcon(path)
+  return <Glyph size={CHIP_GLYPH_SIZE} aria-hidden="true" className={`${CHIP_GLYPH_GEOMETRY} opacity-0`} />
+}
 
 /**
  * The chip's hover instruction, naming the application shift+click will actually
@@ -1004,10 +1155,18 @@ function InlineCode({ children, ...props }: { children?: React.ReactNode } & Rec
 
   if (pathResolution.probePending
     || (pathResolution.kind !== 'file' && pathResolution.kind !== 'dir')) {
+    // Keyed to `shaped`, not to `candidate` or `probePending`, so the reserve is
+    // present in EVERY state this span can be in — streaming, probe in flight,
+    // and probe answered "not a path". A reserve that appeared only while a probe
+    // was pending would simply move the re-wrap to the moment it went away.
+    // A session chip needs none: `isPathCandidate` demands a separator, a drive
+    // or an extension, and a session key carries none of the three, so the two
+    // chips cannot claim the same span.
+    const reserve = pathResolution.shaped ? <ChipGlyphReserve path={pathResolution.splitPath} /> : null
     // Inside an anchor the link owns the click, so stay the inert span this was
     // before #4433 rather than cancelling the navigation to copy. Nothing is
     // lost: the browser's own "Copy link address" still reaches the URL.
-    if (insideLink) return <code className={CHIP_BASE} {...safeProps}>{children}</code>
+    if (insideLink) return <code className={CHIP_BASE} {...safeProps}>{reserve}{children}</code>
     const session = resolveSessionChip(raw, sessionActions)
     if (session) {
       return (
@@ -1019,7 +1178,7 @@ function InlineCode({ children, ...props }: { children?: React.ReactNode } & Rec
         >{children}</SessionChip>
       )
     }
-    return <CopyableCode className={CHIP_BASE} safeProps={safeProps} text={codeStr}>{children}</CopyableCode>
+    return <CopyableCode className={CHIP_BASE} safeProps={safeProps} text={codeStr}>{reserve}{children}</CopyableCode>
   }
   const isDir = pathResolution.kind === 'dir'
   const { path, splitPath, kind, line: targetLine, endLine: targetEndLine } = pathResolution
@@ -1078,7 +1237,7 @@ function InlineCode({ children, ...props }: { children?: React.ReactNode } & Rec
         // the location is already in the text the user is hovering.
         title={`${raw}\n${revealHint}\n${i18nT('components.markdownRenderer.ctrl_click_to_copy')}`}
       >
-        <Glyph size={12} aria-hidden="true" className="inline align-middle mr-1 opacity-70" />
+        <Glyph size={CHIP_GLYPH_SIZE} aria-hidden="true" className={`${CHIP_GLYPH_GEOMETRY} opacity-70`} />
         {targetLine != null && raw.length > splitPath.length
           // Keep the location suffix atomic. A range is the case that actually
           // misleads: broken across lines, `…2026.md:10-` / `16` reads as a citation
@@ -2095,16 +2254,16 @@ const SOFT_BREAK_RE = /[\t ]*(?:\r?\n|\r)/g
  * (mdast `break` → <br>). This is an inlined equivalent of the `remark-breaks`
  * package, kept local to avoid adding a runtime dependency.
  *
- * Opt-in via MarkdownRenderer's `softBreaks` prop and used ONLY for user
- * messages: the chat input lets people press Shift+Enter for a newline, so
- * those breaks must survive rendering. Assistant/LLM markdown keeps standard
- * CommonMark soft-break-collapse.
+ * Opt-in via MarkdownRenderer's `softBreaks` prop, for surfaces where a lone
+ * source newline is meaningful: user messages (Shift+Enter in the composer)
+ * and injected notes. Assistant/LLM markdown keeps standard CommonMark
+ * soft-break-collapse.
  *
  * Operates on `text` nodes only, so fenced code, inline code, math, and raw
  * HTML (whose content lives in `.value`, not `.children`) are untouched, and
  * blank-line block separators — already parsed as distinct blocks — are not
  * affected, so lists and paragraphs keep their normal block spacing. That is
- * what lets user messages drop container-level `white-space: pre-wrap`, which
+ * what lets those surfaces drop container-level `white-space: pre-wrap`, which
  * had made react-markdown's inter-block newline text nodes render as literal
  * blank lines and inflated list/paragraph gaps.
  */
@@ -3417,13 +3576,34 @@ function extractPathHintFromText(text: string | undefined): string | undefined {
   return undefined
 }
 
-function BlockRenderer({ block, prevBlock, onFileOpen, sourcePos, messageTs, widgetIndex, slotKey, glow, smooth, softBreaks, live, unfurl }: { block: ContentBlock; prevBlock?: ContentBlock; onFileOpen?: (path: string) => void; sourcePos?: boolean; messageTs?: string; widgetIndex?: number; slotKey?: string; glow?: boolean; smooth?: boolean; softBreaks?: boolean; live?: boolean; unfurl?: boolean }) {
+function BlockRenderer({ block, prevBlock, onFileOpen, sourcePos, messageTs, widgetIndex, slotKey, glow, smooth, softBreaks, live, unfurl, collapseDiffs }: { block: ContentBlock; prevBlock?: ContentBlock; onFileOpen?: (path: string) => void; sourcePos?: boolean; messageTs?: string; widgetIndex?: number; slotKey?: string; glow?: boolean; smooth?: boolean; softBreaks?: boolean; live?: boolean; unfurl?: boolean; collapseDiffs?: boolean }) {
   switch (block.type) {
     case 'diff': {
       const pathHint = prevBlock?.type === 'markdown'
         ? extractPathHintFromText(prevBlock.content)
         : undefined
-      const node = <DiffBlock code={block.content} complete={block.complete} onFileOpen={onFileOpen} pathHint={pathHint} streaming={!!smooth && !block.complete} />
+      // `collapseDiffs` is the CHAT TRANSCRIPT's opt-in, and only its opt-in.
+      // A fence in an assistant message is the model's own retelling of a
+      // change, and several of them bury the prose. Everywhere else this
+      // renderer is used — artifacts, specs, knowledge documents, the
+      // changelog, review reports — the patch IS the content, and collapsing
+      // it would take the text out of the DOM for find-in-page, whole-surface
+      // selection and printing.
+      //
+      // `foldKey` is slot + message + the fence's line, which is the identity
+      // the block list already keys on: stable across streaming, so an opened
+      // patch survives a re-mount. All THREE parts are required. Keyed on the
+      // line alone, two messages whose fences start on the same line would
+      // share one entry and open together; without the slot, a fork — which
+      // preserves the parent's message timestamps — would collide with the
+      // session it was forked from. Without a key the state is local, which
+      // only costs the re-mount memory.
+      const foldKey = slotKey != null && messageTs != null && block.startLine != null
+        ? `${slotKey}:${messageTs}:${block.startLine}`
+        : undefined
+      const node = collapseDiffs
+        ? <FoldableDiffBlock code={block.content} complete={block.complete} onFileOpen={onFileOpen} pathHint={pathHint} streaming={!!smooth && !block.complete} foldKey={foldKey} />
+        : <DiffBlock code={block.content} complete={block.complete} onFileOpen={onFileOpen} pathHint={pathHint} streaming={!!smooth && !block.complete} />
       // Smooth mode: wrap so the block height eases as lines arrive. The wrapper
       // is mounted for the whole message lifecycle (smooth is constant) so the
       // child never remounts when streaming flips to complete.
@@ -3457,7 +3637,7 @@ function BlockRenderer({ block, prevBlock, onFileOpen, sourcePos, messageTs, wid
   }
 }
 
-export default memo(function MarkdownRenderer({ content, streaming = false, onFileOpen, onFolderOpen, onArtifactOpen, onSessionOpen, sessions, activeSession, rawMode = false, sourcePos = false, messageTs, slotKey, glow = false, smooth, softBreaks = false, compactImages = false, linkPreviews = false }: { content: string; streaming?: boolean; onFileOpen?: (path: string, opts?: { line?: number; endLine?: number }) => void; onFolderOpen?: (path: string) => void; onArtifactOpen?: (slug: string) => void; onSessionOpen?: (key: string) => void; sessions?: ReadonlyMap<string, string>; activeSession?: string; rawMode?: boolean; sourcePos?: boolean; messageTs?: string; slotKey?: string; glow?: boolean; smooth?: boolean; softBreaks?: boolean; compactImages?: boolean; linkPreviews?: boolean }) {
+export default memo(function MarkdownRenderer({ content, streaming = false, onFileOpen, onFolderOpen, onArtifactOpen, onSessionOpen, sessions, activeSession, rawMode = false, sourcePos = false, messageTs, slotKey, glow = false, smooth, softBreaks = false, compactImages = false, linkPreviews = false, collapseDiffs = false }: { content: string; streaming?: boolean; onFileOpen?: (path: string, opts?: { line?: number; endLine?: number }) => void; onFolderOpen?: (path: string) => void; onArtifactOpen?: (slug: string) => void; onSessionOpen?: (key: string) => void; sessions?: ReadonlyMap<string, string>; activeSession?: string; rawMode?: boolean; sourcePos?: boolean; messageTs?: string; slotKey?: string; glow?: boolean; smooth?: boolean; softBreaks?: boolean; compactImages?: boolean; linkPreviews?: boolean; /** Chat transcript only: render a ```diff fence collapsed to a chip. Off everywhere else, where the patch IS the content rather than a retelling of it. */ collapseDiffs?: boolean }) {
   useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const blocks = useBlockAssembler(content, streaming)
 
@@ -3608,6 +3788,7 @@ export default memo(function MarkdownRenderer({ content, streaming = false, onFi
             unfurl={linkPreviews}
             smooth={smooth}
             softBreaks={softBreaks}
+            collapseDiffs={collapseDiffs}
           />
         ))}
       </ImageVersionCtx.Provider>
@@ -3964,7 +4145,7 @@ export function Lightbox() {
   // On any zoom change, recentre at fit and otherwise re-clamp the existing pan
   // to the new (smaller/larger) bounds — zooming out must not strand the image
   // off-screen. Runs post-layout, so offsetWidth already reflects the new box.
-  useEffect(() => { setPan(p => (zoom <= LIGHTBOX_ZOOM_MIN ? { x: 0, y: 0 } : clampPan(p.x, p.y))) }, [zoom, clampPan])
+  useEffect(() => { setPan(p => (zoom <= LIGHTBOX_ZOOM_MIN ? { x: 0, y: 0 } : clampPan(p.x, p.y))) }, [zoom, clampPan, setPan])
   useEffect(() => {
     if (!isOpen) return
     const onKey = (e: KeyboardEvent) => {
@@ -4004,7 +4185,7 @@ export function Lightbox() {
     // modal open and Escape closes only the viewer.
     window.addEventListener('keydown', onKey, true)
     return () => window.removeEventListener('keydown', onKey, true)
-  }, [isOpen, zoomIn, zoomOut])
+  }, [isOpen, zoomIn, zoomOut, setZoom])
   if (!state) return null
   const img = state.images[state.index]
   const zoomed = zoom > LIGHTBOX_ZOOM_MIN

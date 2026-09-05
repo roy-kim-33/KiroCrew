@@ -291,6 +291,22 @@ wins and reverts a correction the registration path had made. Fixing that revers
 the editor-snapshot-wins contract kept in #5899, and unlike resurrection it
 self-heals on the next gateway start, so it is left to a separate ruling.
 
+What the ruling is weighing, since "less severe than resurrection" understates it:
+the reverted value is the exact artefact `_register_mcp_servers` refuses to write
+and scrubs on sight — a `backend.port:"auto"` app's illustrative manifest port,
+i.e. a reachable-LOOKING dead URL whose cost that path states as breaking *every*
+kiro session, not just this app's. Two facts set the window. The PUT's own tail
+calls `_reset_all_sessions`, which drains every active session **and** the warm
+pool, so the next cold start reads the reverted row rather than the revert lying
+dormant. And the only writer that puts the live port back is
+`reconcile_enabled_app_resources`, whose single call site is the gateway boot path
+(`dashboard/server.py`) — the mid-turn rung `_recover_app_agent_binding` is gated
+on an UNRESOLVED agent binding, which a reverted port does not produce. So the
+self-heal is a restart, and nothing shorter. Both axes above plus this open cell
+are enumerated in one table by
+`test_the_app_namespace_region_decides_every_axis_it_claims_to`, so a change to
+any of them has to come through it.
+
 Writer: `apps/bridges.py::_apply_agent_mcp_policy`, `_mcp_json_path`,
 `_scrub_legacy_shared_mcp`;
 `dashboard/handlers/agents.py::_merge_unowned_servers` and
@@ -567,6 +583,35 @@ capabilities, so teardown awaits it to completion. The startup deadline governs
 successful async startup hook that returns within the deadline is unaffected.
 
 Writer: `apps/lifecycle.py::LifecycleDispatcher._invoke`.
+
+After the hook sweep, graceful shutdown stops the backend **processes this
+gateway spawned** (`apps/hooks_integration.py::on_gateway_shutdown` →
+`stop_app_backend`). Spawned backends are gateway children: without this stop
+they reparent to PID 1 when the gateway exits and keep listening on their
+ports, and the startup stale-reap only recovers them at the **next** boot.
+Ordering is deliberate — hooks first, so an app's `on_shutdown` still has its
+own backend alive. Stop targets come from the runtime tracking table
+(`apps/backend.py::spawned_backend_names`), never from persisted `enabled`
+metadata: the metadata filter is wrong in both directions (it would signal an
+**adopted** externally-managed backend, whose contract is to survive gateway
+exit and be re-adopted on the next start, and it would miss a still-running
+child whose app was disabled cross-process, metadata-only). Driving the sweep
+from the tracking table also keeps `stop_app_backend`'s pidfile-record erasure
+away from apps with nothing running, so a retained prior-generation orphan
+record stays recoverable by the stale-reap. The stops are offloaded to the
+subprocess executor and run **concurrently under one shared deadline**
+(`_BACKEND_STOP_BUDGET_SECS`, kept under the gateway's 10-second cooperative
+shutdown budget): a serial sweep would multiply the per-app SIGTERM grace by
+the number of apps, and the supervisor's force-exit would orphan every backend
+the sweep had not reached. The sweep runs in a `finally` around hook dispatch,
+so a wedged or failing `on_shutdown` hook (dispatch awaits an invoked hook to
+completion) cannot skip it — the shutdown deadline's cancellation still reaches
+the sweep on its way out. The stop futures are shielded from the deadline: the
+executor is shared with the rest of shutdown, so a stop can still be queued
+when the budget fires, and cancelling it then would mean that backend is never
+signalled at all — instead the sweep returns and the stops finish in the
+background. The sweep is not gated on the lifecycle dispatcher being
+initialized, and one app's failing stop does not skip the rest.
 
 ## 8. An app's EventBus only exists with a real broadcast function
 
