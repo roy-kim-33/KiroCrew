@@ -28,6 +28,7 @@ from aiohttp import web
 
 import kiro_crew.config.loader as loader
 import kiro_crew.dashboard.handlers.messaging as mod
+from kiro_crew.subagent import AGENT_NOT_FOUND_CODE
 
 
 class _Req:
@@ -100,6 +101,7 @@ def _info(**kw: Any) -> Any:
         "task": "do it",
         "done": False,
         "error": "",
+        "error_code": "",
         "result": "",
         "result_path": "",
         "started": 1_700_000_000.0,
@@ -185,7 +187,30 @@ class TestApiSpawn:
         mgr.spawn.return_value = _info(done=True, error="cwd not allowed")
         resp = _run(mod.api_spawn, _Req(_state(subagents=mgr), {"task": "x"}))
         assert resp.status == 400
-        assert _payload(resp) == {"error": "cwd not allowed", "counted": True}
+        # An un-coded rejection kind reports the generic identifier, so the body
+        # is machine-readable even where the manager mints nothing.
+        assert _payload(resp) == {
+            "error": "cwd not allowed",
+            "code": "spawn_rejected",
+            "counted": True,
+        }
+
+    def test_unknown_agent_rejection_carries_its_own_code(self) -> None:
+        """The one rejection a client acts on differently keeps its own identifier:
+        ``spawn_run`` stops re-posting a name the gateway already refused, and it
+        must not have to parse the prose to know which refusal this was."""
+        mgr = _mgr()
+        mgr.spawn.return_value = _info(
+            done=True,
+            error="agent 'ghost' not found; available: scout",
+            error_code=AGENT_NOT_FOUND_CODE,
+        )
+        resp = _run(mod.api_spawn, _Req(_state(subagents=mgr), {"task": "x", "agent": "ghost"}))
+        assert resp.status == 400
+        body = _payload(resp)
+        assert body["code"] == AGENT_NOT_FOUND_CODE
+        # Prose still travels for the model to read and self-correct from.
+        assert "available: scout" in body["error"]
 
     def test_success_coerces_string_flags_and_bounds_batch_total(self) -> None:
         mgr = _mgr()
@@ -819,6 +844,26 @@ class TestNotificationRoutes:
         state.crons.unack_job_async = AsyncMock(side_effect=CronStoreBusy("busy"))
         assert _payload(_run(mod.api_notification_unack, _Req(state, {"ts": "1"})))["ok"] is True
 
+    def test_unack_survives_an_unreadable_cron_store(self) -> None:
+        """The acked-item trim is best-effort, so a refused write must not 500.
+
+        Twin of the busy test above. `unack_job_async` refuses BEFORE mutating
+        once the store cannot be read, and that refusal is a new exception on
+        this path -- untranslated it escapes the handler and aiohttp turns it
+        into a 500, failing a notification unack that does not depend on the
+        cron store at all.
+        """
+        from kiro_crew.cron import CronStoreUnreadable
+
+        state = _state(
+            _notification_log=[{"ts": "1", "kind": "cron", "job_id": "j1"}],
+            unack_notification=AsyncMock(return_value=True),
+        )
+        state.crons.unack_job_async = AsyncMock(
+            side_effect=CronStoreUnreadable("move the file aside")
+        )
+        assert _payload(_run(mod.api_notification_unack, _Req(state, {"ts": "1"})))["ok"] is True
+
     def test_ack_all_marks_every_entry_and_rewrites(self) -> None:
         log: list[dict[str, Any]] = [{"ts": "1", "acked": False}, {"ts": "2"}]
         state = _state(_notification_log=log, _rewrite_notifications_async=AsyncMock())
@@ -1312,13 +1357,47 @@ class TestTeamsConfigSave:
     def test_purges_a_legacy_plaintext_secret_from_config_json(
         self, monkeypatch, tmp_path: Path
     ) -> None:
+        # The purge is safe only when the credential is also held in .env or being
+        # written to .env this save (Finding 1: purging the sole copy on a
+        # metadata-only save would erase the credential). Scenario: password in
+        # BOTH config.json AND os.environ (simulating a migrated, leaked copy).
+        env = tmp_path / ".env"
+        env.write_text("MICROSOFT_APP_PASSWORD=leaked\n", encoding="utf-8")
+        cfg_path = tmp_path / "config.json"
+        cfg_path.write_text(json.dumps({"teams": {"app_password": "leaked"}}), encoding="utf-8")
+        monkeypatch.setattr(loader, "env_path", lambda: env)
+        monkeypatch.setattr(loader, "config_path", lambda: cfg_path)
+        monkeypatch.setattr(mod, "is_direct_local_request", lambda req: True)
+        # The credential is held in os.environ (safe to purge the config copy).
+        monkeypatch.setenv("MICROSOFT_APP_PASSWORD", "leaked")
+
+        async def _accept(*a, **kw):
+            return None
+
+        monkeypatch.setattr(mod, "_validate_teams_app_credentials", _accept)
+        resp = _run(mod.api_teams_config_save, _Req(_state(), {"enabled": True}))
+        assert resp.status == 200
+        data = json.loads(cfg_path.read_text(encoding="utf-8"))
+        assert (
+            data["teams"]["app_password"] == ""
+        ), "When password is also in os.environ/.env, purge the legacy config.json copy"
+
+    def test_does_not_purge_legacy_secret_that_is_the_sole_credential_copy(
+        self, monkeypatch, tmp_path: Path
+    ) -> None:
+        # Finding 1 regression: app_password ONLY in legacy config.json (not in
+        # .env or os.environ) must survive a metadata-only save.
         (tmp_path / "config.json").write_text(
-            json.dumps({"teams": {"app_password": "leaked"}}), encoding="utf-8"
+            json.dumps({"teams": {"app_password": "legacy-only"}}), encoding="utf-8"
         )
         resp, _, cfg = self._save(monkeypatch, tmp_path, {"enabled": True})
-        assert "app_password_purged" in json.dumps(_payload(resp)) or resp.status == 200
+        # _save sets MICROSOFT_APP_PASSWORD="" so os.environ fallback is empty.
+        assert resp.status == 200
         data = json.loads(cfg.read_text(encoding="utf-8"))
-        assert data["teams"]["app_password"] == ""
+        assert data["teams"].get("app_password") == "legacy-only", (
+            "Password that lives ONLY in legacy config.json must survive a "
+            "metadata-only save (Finding 1)"
+        )
 
     def test_no_op_save_reports_no_restart_needed(self, monkeypatch, tmp_path: Path) -> None:
         (tmp_path / "config.json").write_text(
@@ -1332,6 +1411,34 @@ class TestTeamsConfigSave:
         resp, _, cfg = self._save(monkeypatch, tmp_path, {"enabled": True})
         assert resp.status == 200
         assert json.loads(cfg.read_text(encoding="utf-8"))["teams"]["enabled"] is True
+
+    def test_clear_config_write_failure_does_not_leave_env_cleared(
+        self, monkeypatch, tmp_path: Path
+    ) -> None:
+        """On a CLEAR the config.json purge runs BEFORE the .env delete. If the
+        config write fails the .env must be untouched — otherwise a restart would
+        fall back to any legacy config.json app_password, resurrecting the
+        credential the operator asked to clear."""
+        env = tmp_path / ".env"
+        cfg_path = tmp_path / "config.json"
+        env.write_text("MICROSOFT_APP_PASSWORD=live-pw\n", encoding="utf-8")
+        cfg_path.write_text(json.dumps({"teams": {"app_password": "legacy-pw"}}), encoding="utf-8")
+        monkeypatch.setattr(loader, "env_path", lambda: env)
+        monkeypatch.setattr(loader, "config_path", lambda: cfg_path)
+        monkeypatch.setattr(mod, "is_direct_local_request", lambda req: True)
+        monkeypatch.setenv("MICROSOFT_APP_PASSWORD", "")
+
+        import kiro_crew.agent as _agent
+
+        def _boom(*_a, **_k):
+            raise OSError("disk full during config write")
+
+        monkeypatch.setattr(_agent, "_atomic_json_write", _boom)
+        try:
+            _run(mod.api_teams_config_save, _Req(_state(), {"app_password_clear": True}))
+        except Exception:
+            pass
+        assert "MICROSOFT_APP_PASSWORD=live-pw" in env.read_text(encoding="utf-8")
 
 
 class TestTeamsActivity:
@@ -1429,6 +1536,32 @@ class TestWriteEnvUpdates:
 
         assert events == ["restrict", "write"], events
         assert env.read_text(encoding="utf-8") == "SLACK_BOT_TOKEN=xoxb-secret\n"
+
+    def test_aborts_when_shared_env_lock_is_held(self, monkeypatch, tmp_path: Path) -> None:
+        """A channel/token save serializes on the SAME .env.lock the importer
+        and the Weixin handler use, so it aborts (rather than racing the commit)
+        when another writer holds the lock — and leaves .env untouched."""
+        import os
+
+        from kiro_crew import platform_compat
+        from kiro_crew.secrets.migrate import _env_lock_path
+
+        env = tmp_path / ".env"
+        env.write_text("A=1\n", encoding="utf-8")
+        monkeypatch.setattr(loader, "env_path", lambda: env)
+
+        # Simulate the importer holding the shared advisory lock.
+        lock_path = _env_lock_path(env)
+        held_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        assert platform_compat.try_acquire_lock(held_fd, exclusive=True)
+        try:
+            with pytest.raises(OSError):
+                mod._write_env_updates({"B": "2"})
+            # .env is untouched — the aborted save did not partially write.
+            assert env.read_text(encoding="utf-8") == "A=1\n"
+        finally:
+            platform_compat.release_lock(held_fd)
+            os.close(held_fd)
 
 
 class _FakeResponse:

@@ -16,6 +16,13 @@ flag alone would fail the opt-in policy tests. Disabling the app hands the gestu
 legacy command palette, which is left in place precisely so that is a real choice rather than a
 downgrade; nothing about that path changes while the app is off.
 
+The flag reaches FRESH installs only. An install that registered `command-bar` while it was still
+default-off keeps `enabled: false` forever, and because this app has no page it appears in neither
+the launcher's own app list nor Discover — so those users have no way to learn it exists.
+`manager.backfill_default_on_builtins()`, which reads `manager._DEFAULT_ON_BACKFILL` and records
+delivery on the app's own record (`InstalledApp.defaultOnBackfilled`, written in the same atomic
+write that flips `enabled`), is what delivers the launcher to them; see app-kit-platform section 12.
+
 What makes the app worth existing is a single invariant: **the first page issues no network
 request.** The palette it replaces ran an unindexed scan over the sessions corpus on every
 keystroke, so fast typing could stall unrelated streaming. Command Bar's root carries only
@@ -128,11 +135,11 @@ Both directions have to work in the UI, and one of them nearly did not. The Apps
 builds its Discover shelf from the network-fetched catalog, which carries no row for this
 app, and its Library list hides disabled builtins -- so with the app off it would have
 appeared on neither surface and could only be re-enabled over the API. Library therefore
-keeps listing a disabled builtin that declares `ui.overlays`
-(`website/src/pages/AppsPage.tsx`): an app allowed to replace a host surface is the one
-class a reader turns off and then needs to find again, and its own description tells them
-to disable it to get the old surface back. The rule is keyed on the capability, not on this
-app's name, and it changes nothing for the default-off builtins that have no overlay.
+keeps listing a disabled builtin unless its manifest sets `hidden`
+(`keepInLibrary` in `website/src/pages/apps/useAppsData.ts`): an app a reader turns off and
+then needs to find again has to stay on the one surface that carries Enable, and this app's
+own description tells them to disable it to get the old surface back. The rule is keyed on
+being installed, not on this app's name, and it lists the other default-off builtins too.
 
 ## Deliberately not here
 

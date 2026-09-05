@@ -31,6 +31,7 @@ from kiro_crew.acp.client import (
     advertised_model_ids,
     model_is_unusable,
 )
+from kiro_crew.acp.mcp_session_report import McpSessionReport
 from kiro_crew.acp.runtime import AcpRuntime, AcpRuntimeDead, AcpRuntimeError, AcpSessionHandle
 from kiro_crew.acp.session_handle import WatchdogSettings
 from kiro_crew.acp.types import ACP_BACKENDS_KIRO_IDENTITY_STORE, STOP_REASON_END_TURN
@@ -281,9 +282,24 @@ class AcpSessionProvider(LLMProvider):
         return self._handle.supports_steer
 
     async def stream_command(self, command: str) -> AsyncIterator[LLMEvent]:
-        """Execute a slash command via prompt (kiro handles commands in-prompt)."""
-        async for event in self.stream(command):
-            yield event
+        """Execute a slash command natively via ``_kiro.dev/commands/execute``.
+
+        Routes through AcpSessionHandle.stream_command so kiro-cli executes the
+        command itself and returns its structured output deterministically —
+        no LLM round-trip. (Previously delegated to stream(), which sent the
+        command through session/prompt: a full model turn that summarized the
+        output instead of returning it.) The handle keeps /compact, /help, and
+        non-kiro backends (KAS) on the prompt transport — see its docstring.
+        Same exception translation as stream(): everything leaving this
+        surface stays within AcpError.
+        """
+        try:
+            async for event in self._handle.stream_command(command):
+                yield event
+        except AcpRuntimeDead as exc:
+            raise self._translate_dead(exc) from exc
+        except AcpRuntimeError as exc:
+            raise AcpError(str(exc)) from exc
 
     def _translate_dead(self, exc: AcpRuntimeDead) -> AcpProcessDied | AcpAuthRequired:
         """Map a shared-runtime death (AcpRuntimeDead — an AcpRuntimeError OUTSIDE
@@ -354,6 +370,17 @@ class AcpSessionProvider(LLMProvider):
     def context_used_tokens(self) -> int:
         """Return tokens used in the current context."""
         return self._handle.last_prompt_stats.context_used_tokens
+
+    def billing_stats(self) -> object | None:
+        """Live per-turn billing stats (public — see LLMProvider).
+
+        The same object ``last_prompt_stats`` exposes and the context accessors
+        above read; declaring it here is what makes the accounting path's read a
+        stated capability instead of a search for that attribute name. The handle
+        installs a fresh object as each turn begins, which is the identity the
+        accounting path compares against.
+        """
+        return self._handle.last_prompt_stats
 
     @property
     def session_id(self) -> str:
@@ -571,20 +598,38 @@ class AcpSessionProvider(LLMProvider):
         Raises :class:`AcpModelUnavailable` so the caller surfaces it as a user
         error instead of recovering with a session reset — a reset here would
         destroy the live conversation and still land on a different model.
+
+        A refusal is never issued on the session-init snapshot alone. That
+        snapshot is one answer, captured at one instant, and a lookup racing a
+        token refresh can answer with the default tier — freezing a
+        false "not entitled" verdict into the session for its whole life. So a
+        would-be refusal first revalidates against a fresh backend probe
+        (:meth:`AcpSessionHandle.refresh_available_models`) and only stands if
+        the fresh answer ALSO lacks the model. A failed probe keeps the stale
+        verdict (fail-safe: no evidence, no entitlement granted).
         """
         advertised = advertised_model_ids(self._handle.available_models)
         if model_is_unusable(model_id, advertised):
-            # PERMANENT guard: a model the active backend does not advertise
-            # must never reach the wire — whatever leaked it (a persisted slot
-            # from a previous provider, a stale picker value, a resumed chat).
-            # Fall back to 'auto' (the backend's own advertised default) so a
-            # new session runs instead of erroring. Only raise when 'auto'
-            # itself is unusable (a genuinely broken entitlement).
-            if "auto" in advertised:
-                model_id = "auto"
-                await self._guarded(self._handle.set_model("auto"))
-                return
-            raise AcpModelUnavailable(model_id, advertised)
+            fresh = advertised_model_ids(
+                await self._guarded(self._handle.refresh_available_models())
+            )
+            usable = fresh or advertised
+            if model_is_unusable(model_id, usable):
+                # PERMANENT guard: a model the active backend does not advertise
+                # must never reach the wire — whatever leaked it (a persisted slot
+                # from a previous provider, a stale picker value, a resumed chat).
+                # Fall back to 'auto' (the backend's own advertised default) so a
+                # new session runs instead of erroring. Only raise when 'auto'
+                # itself is unusable (a genuinely broken entitlement). Checked
+                # against `usable` (the fresh probe when it answered, else the
+                # stale snapshot) for the same reason the refusal above is: a
+                # racing token refresh must not freeze a false "not entitled"
+                # verdict for the whole session.
+                if "auto" in usable:
+                    model_id = "auto"
+                    await self._guarded(self._handle.set_model("auto"))
+                    return
+                raise AcpModelUnavailable(model_id, usable)
         await self._guarded(self._handle.set_model(model_id))
 
     async def set_mode(self, agent_name: str) -> None:
@@ -645,6 +690,10 @@ class AcpSessionProvider(LLMProvider):
     def pop_pending_oauth_requests(self) -> list[dict[str, str]]:
         """Drain OAuth requests captured while the shared session initialized."""
         return self._handle.pop_pending_oauth_requests()
+
+    def mcp_session_report(self) -> McpSessionReport:
+        """This session's MCP registration report."""
+        return self._handle.mcp_session_report()
 
     def get_valid_effort_levels(self) -> list[str]:
         """Valid effort levels from config options."""

@@ -13,6 +13,7 @@ from kiro_crew import autonudge as _an
 from kiro_crew import autonudge_authz as _autonudge_mod
 from kiro_crew.autonudge import AutoNudgeService, NudgeLoop
 from kiro_crew.dashboard.handlers.autonudge import render_nudge_message
+from kiro_crew.monitoring.models import MonitorOutcome, MonitorState
 
 
 @pytest.fixture(autouse=True)
@@ -23,6 +24,35 @@ def _enable(monkeypatch):
 @pytest.fixture
 def svc(tmp_path):
     return AutoNudgeService(base_dir=tmp_path)
+
+
+_FROZEN_NOW = 1_000_000.0
+
+
+def _freeze_clock(monkeypatch) -> None:
+    """Pin ``autonudge``'s clock so a deadline-anchored first delay is exact.
+
+    ``add()`` anchors ``next_due_ts = now + idle_secs``, then AWAITS an fsync of
+    the state file before ``_arm_from_deadline`` re-reads ``time.time()`` to
+    derive ``remaining``. Unfrozen, the first delay comes out short by however
+    long that write took (2.4s on a loaded Windows shard), so any tolerance on it
+    is really asserting that the runner never stalls between two statements.
+    Frozen, ``remaining`` is exactly ``idle_secs``, so every assertion below can
+    be exact -- a tolerance there would only hide a regression that reintroduces
+    the wall-clock dependency.
+    """
+    monkeypatch.setattr(_an.time, "time", lambda: _FROZEN_NOW)
+
+
+def _structured_monitor(**changes: object) -> MonitorState:
+    values: dict[str, object] = {
+        "kind": "github_pull_request",
+        "target": "owner/repo#123",
+        "objective": "review_ready",
+        "created_ts": 1_000.0,
+    }
+    values.update(changes)
+    return MonitorState(**values)
 
 
 @pytest.mark.asyncio
@@ -95,6 +125,119 @@ async def test_persistence_across_restart(tmp_path):
     assert restored.max_cycles == 5
     assert loop.id in svc2._timers  # timer re-armed
     svc2.stop()
+
+
+@pytest.mark.asyncio
+async def test_unwired_structured_monitor_is_not_armed_or_fired_on_start(tmp_path):
+    """PR1 persists structured monitors but cannot deliver them before Task4."""
+    store = {
+        "version": 1,
+        "loops": [
+            {
+                "id": "monitor01",
+                "slot_key": "chat-1-123",
+                "message": "must not dispatch",
+                "idle_secs": 15,
+                "active": True,
+                "monitor": {
+                    "kind": "github_pull_request",
+                    "target": "owner/repo#123",
+                    "objective": "review_ready",
+                    "created_ts": 1_000.0,
+                },
+            }
+        ],
+    }
+    (tmp_path / "autonudge.json").write_text(json.dumps(store), encoding="utf-8")
+    fired: list[NudgeLoop] = []
+
+    async def on_fire(loop):
+        fired.append(loop)
+        return True
+
+    service = AutoNudgeService(base_dir=tmp_path, on_fire=on_fire)
+    await service.start()
+    try:
+        loop = service._loops["monitor01"]
+        assert not loop.active
+        assert loop.id not in service._timers
+        assert fired == []
+    finally:
+        service.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "monitor",
+    (
+        _structured_monitor(),
+        _structured_monitor(version=99),
+        _structured_monitor(outcome=MonitorOutcome.BLOCKED),
+    ),
+)
+async def test_generic_update_cannot_reactivate_a_structured_monitor(tmp_path, monitor):
+    """The legacy PATCH path cannot revive current, future, or terminal monitors."""
+    service = AutoNudgeService(base_dir=tmp_path)
+    loop = NudgeLoop(
+        id="monitor02",
+        slot_key="chat-1-123",
+        message="must not dispatch",
+        active=False,
+        monitor=monitor,
+    )
+    service._loops[loop.id] = loop
+
+    updated = await service.update(loop.id, active=True)
+
+    assert updated is loop
+    assert not loop.active
+    assert loop.id not in service._timers
+
+
+@pytest.mark.asyncio
+async def test_unwired_structured_monitor_timer_dispatches_zero_turns(tmp_path):
+    """A pre-existing timer cannot reach legacy delivery after monitor attachment."""
+    fired: list[NudgeLoop] = []
+
+    async def on_fire(loop):
+        fired.append(loop)
+        return True
+
+    service = AutoNudgeService(base_dir=tmp_path, on_fire=on_fire)
+    loop = NudgeLoop(
+        id="monitor03",
+        slot_key="chat-1-123",
+        message="must not dispatch",
+        monitor=_structured_monitor(),
+    )
+    service._loops[loop.id] = loop
+
+    await service._timer(loop, delay=0)
+
+    assert fired == []
+    assert not loop.active
+
+
+@pytest.mark.asyncio
+async def test_unwired_structured_monitor_fire_cycle_dispatches_zero_turns(tmp_path):
+    """Legacy delivery stays closed if monitor state changes after timer checks."""
+    fired: list[NudgeLoop] = []
+
+    async def on_fire(loop):
+        fired.append(loop)
+        return True
+
+    service = AutoNudgeService(base_dir=tmp_path, on_fire=on_fire)
+    loop = NudgeLoop(
+        id="monitor04",
+        slot_key="chat-1-123",
+        message="must not dispatch",
+        monitor=_structured_monitor(),
+    )
+
+    await service._run_fire_cycle(loop)
+
+    assert fired == []
 
 
 @pytest.mark.asyncio
@@ -516,6 +659,7 @@ async def test_skip_when_delivery_returns_false(svc, monkeypatch):
         return None
 
     monkeypatch.setattr(_an.asyncio, "sleep", _sleep)
+    _freeze_clock(monkeypatch)
 
     fired: list[NudgeLoop] = []
 
@@ -543,7 +687,7 @@ async def test_skip_when_delivery_returns_false(svc, monkeypatch):
     assert not svc._timers[loop.id].done()
     # First sleep used the (deadline-anchored) full idle; the re-arm used the
     # shorter backoff.
-    assert sleep_calls[0] == pytest.approx(60, abs=1)
+    assert sleep_calls[0] == 60
     assert _an._REARM_BACKOFF_SECS in sleep_calls
     svc._cancel_timer(loop.id)  # cleanup
 
@@ -612,13 +756,7 @@ async def test_rearm_backoff_escalates_on_consecutive_failures(svc, monkeypatch)
         await real_sleep(0)
 
     monkeypatch.setattr(_an.asyncio, "sleep", _sleep)
-    # Freeze the clock for the arm. add() anchors next_due_ts = now + idle_secs,
-    # then AWAITS an fsync of the state file before _arm_from_deadline re-reads
-    # time.time() to derive `remaining`. Unfrozen, the first delay is short by
-    # however long that write took (1.8s on a loaded shard), so the assertion
-    # below was really asserting that the runner never stalls between two
-    # statements. Frozen, `remaining` is exactly idle_secs.
-    monkeypatch.setattr(_an.time, "time", lambda: 1_000_000.0)
+    _freeze_clock(monkeypatch)
 
     async def on_fire_skip(loop):
         return False
@@ -638,9 +776,6 @@ async def test_rearm_backoff_escalates_on_consecutive_failures(svc, monkeypatch)
             break
         task = nxt
     # First sleep = (deadline-anchored) full idle; then exponential backoff per failure.
-    # Exact, not approx: the frozen clock makes the first delay deterministic,
-    # so a tolerance here would only hide a regression that reintroduces the
-    # wall-clock dependency.
     assert sleep_calls == [10000, 15, 30, 60, 120]
     assert svc._loops[loop.id].active is True
     assert svc._rearm_fail_count[loop.id] == 4
@@ -706,6 +841,7 @@ async def test_failure_streak_resets_on_delivery(svc, monkeypatch):
         return None
 
     monkeypatch.setattr(_an.asyncio, "sleep", _sleep)
+    _freeze_clock(monkeypatch)
 
     results = [False, False, True]  # third fire delivers
     idx = {"i": 0}
@@ -730,7 +866,7 @@ async def test_failure_streak_resets_on_delivery(svc, monkeypatch):
         task = nxt
     # 2 skips escalated (15, 30), then delivery bumped cycle_count and the
     # delivered happy-path does not re-arm, so the chain stops at 3 sleeps.
-    assert sleep_calls == [pytest.approx(10000, abs=1), 15, 30]
+    assert sleep_calls == [10000, 15, 30]
     assert svc._loops[loop.id].cycle_count == 1
     assert loop.id not in svc._rearm_fail_count  # streak cleared on delivery
 
@@ -751,6 +887,7 @@ async def test_fire_removed_loop_does_not_rearm_orphan(svc, monkeypatch):
         return None
 
     monkeypatch.setattr(_an.asyncio, "sleep", _sleep)
+    _freeze_clock(monkeypatch)
 
     removed = _asyncio.Event()
 
@@ -773,7 +910,7 @@ async def test_fire_removed_loop_does_not_rearm_orphan(svc, monkeypatch):
     assert loop.id not in svc._timers
     assert loop.id not in svc._rearm_fail_count
     # Only the initial idle sleep ran; no backoff re-arm fired.
-    assert sleep_calls == [pytest.approx(60, abs=1)]
+    assert sleep_calls == [60]
 
 
 @pytest.mark.asyncio
@@ -931,6 +1068,7 @@ async def test_unrouted_channel_namespace_degrades_instead_of_raising(svc, monke
         return None
 
     monkeypatch.setattr(_an.asyncio, "sleep", _sleep)
+    _freeze_clock(monkeypatch)
 
     removed = _asyncio.Event()
 
@@ -954,7 +1092,7 @@ async def test_unrouted_channel_namespace_degrades_instead_of_raising(svc, monke
     assert loop.id not in svc._timers
     assert loop.id not in svc._rearm_fail_count
     # Only the initial idle sleep ran — no backoff re-arm was scheduled.
-    assert sleep_calls == [pytest.approx(60, abs=1)]
+    assert sleep_calls == [60]
     svc.stop()
 
 
@@ -1012,25 +1150,31 @@ def test_binding_key_for_does_not_widen_with_the_classifier():
 
     ``binding_key_for`` is the "may this session be armed?" answer, and honouring
     it additionally needs an ownership check in ``autonudge_authz`` and a fire
-    route in the gateway's ``_fire`` dispatcher — both implemented for ``slack:``
-    and ``discord:`` only. Passing weixin/webex/teams/imessage through here ahead
-    of those two would arm a loop that the chokepoint denies (or that is removed
-    on its first fire), which is strictly worse than the clean "not supported from
-    this session type" refusal it replaces.
+    route in the gateway's ``_fire`` dispatcher. Passing weixin/teams/imessage
+    through here ahead of those two would arm a loop that the chokepoint denies (or
+    that is removed on its first fire), which is strictly worse than the clean "not
+    supported from this session type" refusal it replaces.
     """
     from kiro_crew.autonudge import binding_key_for, is_channel_key
 
     for key in (
         "weixin:kirocrew:direct:oUserOpenId",
-        "webex:kirocrew:direct:user@example.com",
         "teams:kirocrew:direct:29:1abcdef",
         "imessage:kirocrew:direct:+15550100",
     ):
         assert is_channel_key(key)
         assert binding_key_for(key) is None
-    # The two namespaces that DO have both halves still pass through.
+    # The namespaces that DO have both halves pass through. Webex is here rather
+    # than in the list above because it ships both: ``_fire_webex_nudge`` in
+    # slack/gateway.py and a deny-by-default ownership branch in
+    # ``autonudge_authz`` (allow-listed DM sessions only, matched against the key
+    # the dispatcher currently derives) — the same pair Discord has.
     assert binding_key_for("slack:1700000000.123456") == "slack:1700000000.123456"
     assert binding_key_for("discord:kirocrew:direct:42") == "discord:kirocrew:direct:42"
+    assert (
+        binding_key_for("webex:kirocrew:direct:user@example.com")
+        == "webex:kirocrew:direct:user@example.com"
+    )
 
 
 @pytest.mark.asyncio
@@ -1663,6 +1807,66 @@ class TestAutonudgeUpdateConcurrency:
             stored = {lp["id"]: lp for lp in on_disk["loops"]}[loop_obj.id]
             assert stored["message"] == "second", "a stale write clobbered the newer state"
         finally:
+            svc.stop()
+
+    @pytest.mark.asyncio
+    async def test_repeated_cancellation_cannot_release_lock_during_snapshot(self, tmp_path):
+        """Every cancellation waits for the executor write before releasing the lock."""
+        entered = threading.Event()
+        gate = threading.Event()
+
+        svc = AutoNudgeService(base_dir=tmp_path)
+        await svc.start()
+        first: asyncio.Task | None = None
+        second: asyncio.Task | None = None
+        try:
+            loop_obj = await svc.add(slot_key="chat-9-4b", message="original", idle_secs=15)
+            svc._cancel_timer(loop_obj.id)
+            loop_obj.message = "first"
+            first_payload = svc._serialize_state()
+            loop_obj.message = "second"
+            second_payload = svc._serialize_state()
+            real_write = svc._write_state
+            calls = {"n": 0}
+
+            def _gated(payload):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    entered.set()
+                    gate.wait(5)
+                return real_write(payload)
+
+            svc._write_state = _gated  # type: ignore[method-assign]
+
+            async def _persist(payload):
+                async with svc._lock:
+                    await svc._write_monitor_snapshot_locked(payload)
+
+            first = asyncio.create_task(_persist(first_payload))
+            await asyncio.to_thread(entered.wait, 2)
+            first.cancel()
+            await asyncio.sleep(0)
+            assert not first.done(), "the first cancellation stopped draining the write"
+            first.cancel()
+            await asyncio.sleep(0)
+
+            second = asyncio.create_task(_persist(second_payload))
+            await asyncio.sleep(0.1)
+            assert not second.done(), "a repeated cancellation released the persistence lock"
+
+            gate.set()
+            with pytest.raises(asyncio.CancelledError):
+                await first
+            await asyncio.wait_for(second, timeout=5)
+            on_disk = json.loads((tmp_path / "autonudge.json").read_text(encoding="utf-8"))
+            stored = {lp["id"]: lp for lp in on_disk["loops"]}[loop_obj.id]
+            assert stored["message"] == "second", "a stale snapshot replaced the newer state"
+        finally:
+            gate.set()
+            await asyncio.gather(
+                *(task for task in (first, second) if task is not None),
+                return_exceptions=True,
+            )
             svc.stop()
 
     @pytest.mark.asyncio
@@ -2504,3 +2708,64 @@ class TestATimerOutlivesItsEventLoop:
         svc._cancel_timer("L1")
 
         await self._await_cancelled(task)
+
+
+def test_a_webex_session_is_nudge_able():
+    """Webex is in both rosters because it now has the two things that matter.
+
+    A fire adapter (``_fire_webex_nudge``) and an authorization branch in
+    ``autonudge_authz``. Listing a channel without both arms a loop that is then
+    denied or deleted on its first cycle while reporting itself healthy — which is
+    exactly why these rosters are narrow.
+    """
+    from kiro_crew.autonudge import binding_key_for, is_channel_key
+
+    key = "webex:kirocrew:direct:kyle@example.com"
+    assert is_channel_key(key)
+    assert binding_key_for(key) == key
+
+
+def test_the_channels_without_a_fire_adapter_stay_excluded():
+    """Deliberately narrow, and pinned so it stays a decision.
+
+    wecom / teams / weixin / imessage have no ``_fire_*_nudge`` and no authz
+    branch, so a loop bound there could never deliver.
+
+    Asserted on ``binding_key_for`` (may this be ARMED?) and not on
+    ``is_channel_key``, which answers the different question of whether the key
+    names a conversation rather than a chat slot — every channel namespace is a
+    channel key, deliberately, so that a loop whose transport is momentarily
+    absent is not misread as a dashboard slot and silently stops re-arming.
+    """
+    from kiro_crew.autonudge import binding_key_for, is_channel_key
+
+    for channel in ("wecom", "teams", "weixin", "imessage"):
+        key = f"{channel}:kirocrew:direct:someone"
+        assert is_channel_key(key), channel  # names a conversation...
+        assert binding_key_for(key) is None, channel  # ...but is not armable
+
+
+def test_a_unified_scope_key_is_never_bindable():
+    """``unified:`` collapses several users' DMs into one bucket.
+
+    It counts as a channel key (so the fixed-interval timer applies) but has no
+    single conversation to deliver to, so a loop must not bind there.
+    """
+    from kiro_crew.autonudge import binding_key_for, is_channel_key
+
+    assert is_channel_key("unified:kirocrew")
+    assert binding_key_for("unified:kirocrew") is None
+
+
+def test_every_nudge_able_channel_has_a_fire_adapter():
+    """The roster and the adapters cannot drift apart.
+
+    This is the invariant the first version of this change got wrong: ``webex:``
+    was added to ``binding_key_for`` while ``_fire`` still handled only slack and
+    discord, so an armed Webex loop was DELETED on its first cycle.
+    """
+    from kiro_crew.slack.gateway import GatewayOrchestrator
+
+    for prefix in ("slack:", "discord:", "webex:"):
+        channel = prefix.rstrip(":")
+        assert hasattr(GatewayOrchestrator, f"_fire_{channel}_nudge"), channel

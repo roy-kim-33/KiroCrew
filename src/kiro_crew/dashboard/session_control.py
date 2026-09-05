@@ -1,21 +1,32 @@
 """Session control: letting one chat session observe and interrupt another.
 
-Three operations — create a session, stop its turn, read its transcript — plus the
-authorization that decides whether a caller may address a target at all. The
-operations are deliberately thin: they reuse the same creation, stop and history
-paths the dashboard itself uses, so a controlled session behaves exactly like one
-a human is typing into.
+Four operations — create a session, stop its turn, close (archive) it, and read
+its transcript — plus the authorization that decides whether a caller may address
+a target at all. The operations are deliberately thin: they reuse the same
+creation, stop, close and history paths the dashboard itself uses, so a controlled
+session behaves exactly like one a human is typing into.
 
-**Nothing here writes into another session's conversation.** Reading returns a
-transcript tail; stopping cancels an in-flight turn the way the Stop button does;
-creating opens an empty session in the user's sidebar. Every verb is therefore
-resolved and authorized at the moment it acts, with no delivery that can be
-delayed past its own authorization.
+**One verb here writes into another session's conversation: ``session_send``.**
+Reading returns a transcript tail; stopping cancels an in-flight turn the way the
+Stop button does; closing archives the session the way the tab ✕ does (the
+conversation is saved to history and can be reopened — closing is not deletion);
+creating opens an empty session in the user's sidebar; sending
+delivers a message the target runs as its next turn, redacted through
+``sanitize_outbound`` and prefixed with a ``[sent by session … via session_send]``
+envelope so it can never render as something the person typed. An IDLE target runs
+it under the authorization that admitted it; a BUSY target queues it, and the
+generic drain re-asserts the target-side containment before the entry becomes a
+turn (issue #5911): producers stamp the constraints that held at admission
+(:func:`containment_meta`), and ``chat_runner``'s drain drops — with a visible
+notice and an SEL record — any entry for which a constraint holds at delivery
+that did not hold at admission. A human-typed queued message shares the same
+window and the same re-check.
 
 Authorization is deny-by-default and checked in one place
-(:func:`authorize_target`) for the two operations that take a target, so a guard
-cannot be present on one verb and missing on another. ``session_create`` has no
-target; it checks the caller's own eligibility with the same refusals.
+(:func:`authorize_target`) for the three operations that take a target — stop,
+close and read — so a guard cannot be present on one verb and missing on another.
+``session_create`` has no target; it checks the caller's own eligibility with the
+same refusals.
 """
 
 from __future__ import annotations
@@ -32,23 +43,26 @@ from kiro_crew.config.loader import (
     resolve_agent_bindings,
 )
 from kiro_crew.dashboard.chat_delivery import sanitize_outbound
+from kiro_crew.dashboard.chat_folders import _unhide_folder
 from kiro_crew.dashboard.chat_persistence import _TRANSIENT_ROLES as _PERSISTENCE_TRANSIENT_ROLES
-from kiro_crew.dashboard.chat_utils import slot_history_key
-from kiro_crew.dashboard.state import SlotOrigin
+from kiro_crew.dashboard.chat_utils import effective_session_key, slot_history_key
+from kiro_crew.dashboard.create_rate_limit import SESSION_CREATE, allow_create
+from kiro_crew.dashboard.state import (
+    MAX_LIVE_SLOTS,
+    MAX_SLOTS_PER_CREATOR,
+    SlotOrigin,
+    _safe_folder_tree,
+)
+from kiro_crew.dashboard.stop_retry import allow_escalation
 from kiro_crew.history import metadata_now_iso, transcript_stem
 from kiro_crew.security import redact, redact_and_truncate
 from kiro_crew.sel import sel
+from kiro_crew.validation import MAX_LONG_STRING
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from kiro_crew.dashboard.state import DashboardState, _ChatSlot
 
 logger = logging.getLogger(__name__)
-
-#: Live-slot ceiling for `session_create`, matching `_MAX_SLOTS_FOR_FORK` and
-#: `_MAX_SLOTS_FOR_IMPORT`. Every path that allocates a slot enforces the same
-#: number; a creator that skipped it would make the cap advisory, since nothing
-#: else bounds how many sessions one caller may open.
-_MAX_SLOTS_FOR_CREATE = 500
 
 # Reads are cheap but not free — each one walks the target's in-memory window.
 MAX_READ_MESSAGES = 100
@@ -167,8 +181,49 @@ def caller_slot_key(state: "DashboardState", session_key: str) -> str:
     return ""
 
 
-def _has_channel_mirror(state: "DashboardState", slot: "_ChatSlot") -> bool:
-    """Whether *slot*'s conversation is mirrored out to a channel.
+def _probe_channel_mirror(state: "DashboardState", slot: "_ChatSlot") -> str | None:
+    """The identity of *slot*'s outbound channel mirror, ``""`` when the
+    conversation is not mirrored, or ``None`` when the session store could not
+    answer.
+
+    The tri-state exists because the two consumers need OPPOSITE fail-closed
+    treatments of an unreadable store, and a collapsed boolean forces one of
+    them to lie: the refusal paths must treat unknown as mirrored (refuse rather
+    than open the boundary), while the queue-drain notice must not claim "the
+    session gained a mirror" for a state change that is merely unverifiable.
+
+    The identity (channel type + channel + thread) rather than a bare boolean,
+    because a mirror can be RETARGETED while a queue waits: rebinding session
+    mirror A to channel B keeps the boolean true from admission to drain while
+    substituting the audience — exactly the republication change the drain
+    re-check exists to catch (#5911).
+
+    Read on the EFFECTIVE session key, because that is the key the mirror is
+    registered under -- the slot key would miss a mirror on a session whose turns
+    run under a different identity.
+    """
+    sessions = getattr(state, "sessions", None)
+    getter = getattr(sessions, "get_mirror_link", None)
+    if getter is None:
+        return ""
+    try:
+        link = getter(slot_history_key(slot))
+    except Exception:
+        logger.debug("mirror-link probe failed", exc_info=True)
+        return None
+    if not link:
+        return ""
+    return (
+        f"{getattr(link, 'channel_type', '')}"
+        f":{getattr(link, 'channel_id', '') or ''}"
+        f":{getattr(link, 'thread_id', '') or ''}"
+    )
+
+
+def _has_channel_mirror(
+    state: "DashboardState", slot: "_ChatSlot", *, on_probe_failure: bool = True
+) -> bool:
+    """Boolean view of :func:`_probe_channel_mirror` for the refusal paths.
 
     `linked_session_key` catches a channel-BORN slot. It does not catch a
     dashboard-born slot that was later given an OUTBOUND mirror link, which
@@ -176,22 +231,273 @@ def _has_channel_mirror(state: "DashboardState", slot: "_ChatSlot") -> bool:
     on the slot, so a slot with an empty `linked_session_key` can still be
     republishing every turn to Slack or Telegram.
 
-    Read on the EFFECTIVE session key, because that is the key the mirror is
-    registered under -- the slot key would miss a mirror on a session whose turns
-    run under a different identity.
-
-    Best-effort by design: a store that cannot answer is treated as mirrored, so
-    an unreadable link fails closed rather than opening the boundary.
+    Best-effort by design: a store that cannot answer returns *on_probe_failure*,
+    and the default (``True``) keeps the refusal paths failing closed -- an
+    unreadable link is treated as mirrored rather than opening the boundary.
+    The enqueue-time containment snapshot passes ``False`` because ITS fail-closed
+    direction is inverted: recording "not mirrored" for an unreadable link is the
+    least-authorized admission state, so the drain-side re-check re-validates the
+    entry instead of waving it through (see :func:`containment_snapshot`).
     """
-    sessions = getattr(state, "sessions", None)
-    getter = getattr(sessions, "get_mirror_link", None)
-    if getter is None:
-        return False
-    try:
-        return bool(getter(slot_history_key(slot)))
-    except Exception:
-        logger.debug("mirror-link probe failed; treating as mirrored", exc_info=True)
-        return True
+    probed = _probe_channel_mirror(state, slot)
+    return on_probe_failure if probed is None else bool(probed)
+
+
+# ── Drain-time re-validation of queued prompts (issue #5911) ──
+#
+# Authorization is decided when a prompt is ADMITTED — `authorize_target` for
+# `session_send`, the authenticated composer for a human — but a busy target
+# QUEUES the prompt and delivers it later, and the containment those decisions
+# rest on can change in between: a target authorized while unlinked can gain a
+# channel or mirror link before its queue drains, and the queued prompt would
+# then execute and republish to an audience its admission never contemplated.
+# Producers stamp the constraints that held at admission on the queue entry
+# (`containment_meta`); `chat_runner`'s drain recomputes them and drops any
+# entry for which a constraint holds at delivery that did not hold at admission.
+
+# Queue-entry meta key carrying the admission-time containment snapshot.
+QUEUED_CONTAINMENT_META_KEY = "queued_containment"
+
+# Transcript-notice phrasing per snapshot field, for the drop notice a reader
+# of the session must be able to understand without knowing this module.
+_CONTAINMENT_CHANGE_LABELS = {
+    "linked": "the session was linked to a channel",
+    "mirrored": "the session gained an outbound channel mirror",
+    "mirror_retarget": "the session's outbound mirror was retargeted to a different channel",
+    "crew": "the session was switched to crew mode",
+    "ephemeral": "the session became incognito/temporary",
+    "app": "the session became app-scoped",
+    "unattended": "the session became unattended",
+    "workspace": "the session moved to a different workspace",
+}
+
+
+# Snapshot keys that are NOT constraints: carried for notice wording and
+# telemetry only, never compared by :func:`newly_held_constraints`.
+_NON_CONSTRAINT_KEYS = frozenset({"mirror_unverified"})
+
+# The one constraint a directive user-origin entry is exempt from at the drain:
+# a channel LINK on the entry's own session. The author of a directive entry is
+# an authenticated human typing into that session's own surface, and linking it
+# is that surface owner's deliberate act — dropping their already-typed messages
+# when they link would destroy user speech on a supported flow (`api_chat`
+# applies no linked refusal to composer input). `mirrored` is deliberately NOT
+# exempt: directive content can be authored by any allowed human in a linked
+# thread while only the session owner adds outbound mirror links, so a NEW
+# mirror widens the audience beyond anything the message's author controlled —
+# the exact republication issue #5911 closes. `session_send` and automation
+# entries never carry the flag and stay fully enforced.
+_AUDIENCE_CONSTRAINTS = frozenset({"linked"})
+
+
+def containment_snapshot(
+    state: "DashboardState", slot: "_ChatSlot", *, on_probe_failure: bool
+) -> dict[str, Any]:
+    """The target-side containment constraints of :func:`authorize_target`, as
+    they hold for *slot* right now.
+
+    Two call sites with OPPOSITE fail-closed directions, hence the mandatory
+    ``on_probe_failure``: the enqueue-time snapshot passes ``False`` so an
+    unreadable mirror link records the least-authorized admission state (the
+    drain then re-validates the entry), while the drain-time snapshot passes
+    ``True`` so an unreadable link refuses delivery rather than opening the
+    boundary. When the drain-side probe fails, ``mirror_unverified`` is set so
+    the drop notice can say the state could not be verified instead of claiming
+    a mirror appeared — the refusal is the same, the wording must not lie.
+    Every other field is a plain slot attribute read that cannot fail.
+
+    ``workspace`` is the seventh refusal (:func:`authorize_target`'s
+    ``workspace_mismatch``), an identity rather than a boolean: a CHANGE — the
+    slot moving to another workspace while the entry waited — invalidates the
+    admission, because the prompt would run with memory, lessons and project
+    context its admission never saw. It is compared only when the entry
+    recorded one; the unmarked fail-closed baseline stays the boolean set,
+    since there is no least-authorized workspace to assume.
+
+    ``unattended`` keys on the slot-key prefix exactly as ``authorize_target``
+    does. A slot key is immutable, so this field can never flip between enqueue
+    and drain for a TAGGED entry — it is carried for the unmarked fail-closed
+    path, where the baseline is all-False and any held constraint must count.
+    """
+    probed = _probe_channel_mirror(state, slot)
+    snap: dict[str, Any] = {
+        "linked": bool(getattr(slot, "linked_session_key", "")),
+        "mirrored": on_probe_failure if probed is None else bool(probed),
+        "crew": getattr(slot, "mode", "") == "crew",
+        "ephemeral": getattr(slot, "memory_mode", "persistent") != "persistent",
+        "app": bool(getattr(slot, "_app", "")),
+        "unattended": str(getattr(slot, "key", "")).startswith(UNATTENDED_SLOT_PREFIXES),
+        "workspace": str(getattr(slot, "workspace", "default") or "default"),
+    }
+    if probed is not None:
+        # The mirror's identity, compared like ``workspace``: a RETARGETED
+        # mirror (A -> B) keeps the boolean true across the wait while
+        # substituting the audience, so identity is what the drain must compare.
+        # Omitted on probe failure — there is no identity to compare then, and
+        # the drain fails closed on the unverifiable boolean instead
+        # (:func:`newly_held_constraints` treats ``mirror_unverified`` as a
+        # mirror change regardless of the admission snapshot).
+        snap["mirror_identity"] = probed
+    if probed is None and on_probe_failure:
+        snap["mirror_unverified"] = True
+    return snap
+
+
+def containment_meta(state: "DashboardState", slot: "_ChatSlot") -> dict[str, Any]:
+    """Queue-entry ``meta`` recording the containment that held at admission.
+
+    Every producer of a plain (user-speech) queue entry stamps this at enqueue;
+    the drain compares it against the constraints holding at delivery and drops
+    the entry when one is newly held (:func:`newly_held_constraints`). An entry
+    without the stamp fails closed — it is checked against the full
+    current-constraint set — so an untagged producer can never ride a queued
+    prompt past a boundary the tagged paths respect.
+    """
+    return {QUEUED_CONTAINMENT_META_KEY: containment_snapshot(state, slot, on_probe_failure=False)}
+
+
+def newly_held_constraints(
+    now: dict[str, Any], entry_meta: Any, *, directive_user_origin: bool = False
+) -> list[str]:
+    """Containment constraints in *now* that the entry's admission never saw.
+
+    *now* is the drain-time :func:`containment_snapshot`; *entry_meta* is the
+    queue entry's ``meta`` (any shape — untrusted plumbing, so a missing or
+    malformed snapshot degrades to the all-False baseline and the entry is
+    checked against every currently-held boolean constraint, failing closed).
+
+    A constraint recorded ``True`` at admission is not a change: the prompt was
+    knowingly admitted under it (a human typing into a channel-born session, an
+    app relaying into its own slot), and dropping it would refuse designed
+    behaviour rather than close a window.
+
+    ``workspace`` compares by identity and only when the entry recorded one —
+    an unmarked entry has no least-authorized workspace to assume, so its
+    fail-closed floor stays the boolean set. ``mirror_identity`` compares the
+    same way: a mirror retargeted to a different channel while the entry waited
+    is an audience substitution the boolean cannot see, reported as
+    ``mirror_retarget``.
+
+    *directive_user_origin* exempts the LINKED constraint only, for entries
+    carrying the authenticated-human provenance flag: the author typed into the
+    session's own surface and linking it is that owner's deliberate act, so
+    dropping their already-typed messages when they link the session would
+    destroy user speech on a supported flow (``api_chat`` applies no linked
+    refusal to composer input). A NEW outbound mirror is never exempt — the
+    message's author does not control mirror links, so it still drops. Every
+    other constraint — crew, ephemeral, app, unattended, workspace — applies
+    to directive entries too.
+    """
+    recorded: dict[str, Any] = {}
+    if isinstance(entry_meta, dict):
+        raw = entry_meta.get(QUEUED_CONTAINMENT_META_KEY)
+        if isinstance(raw, dict):
+            recorded = raw
+    changed: list[str] = []
+    for name, value in now.items():
+        if name in _NON_CONSTRAINT_KEYS:
+            continue
+        if name == "workspace":
+            admitted_ws = recorded.get("workspace")
+            if isinstance(admitted_ws, str) and admitted_ws != value:
+                changed.append(name)
+            continue
+        if name == "mirrored":
+            # Fail closed on an unverifiable drain-side probe REGARDLESS of the
+            # admission snapshot: an entry admitted under mirror A cannot be
+            # delivered when the store no longer answers, because the audience
+            # may have been retargeted since admission and there is no identity
+            # to compare (the probe-failure snapshot omits ``mirror_identity``).
+            # Matching ``authorize_target``'s posture — unreadable state refuses
+            # rather than opens the boundary; the notice wording says the state
+            # could not be verified (``mirror_unverified``), never that a mirror
+            # appeared.
+            if value and (now.get("mirror_unverified") or not bool(recorded.get(name, False))):
+                changed.append(name)
+            continue
+        if name == "mirror_identity":
+            # Identity comparison, like workspace: a mirror RETARGETED while the
+            # entry waited (A -> B) keeps ``mirrored`` true at both ends while
+            # substituting the audience, so the boolean can never see it. Fires
+            # only when both sides carry a verified, non-empty identity — a
+            # newly GAINED mirror is the boolean's job, and an unverifiable side
+            # omits the key. Never exempt for directive entries: the message's
+            # author does not control mirror links.
+            admitted_id = recorded.get("mirror_identity")
+            if value and isinstance(admitted_id, str) and admitted_id and admitted_id != value:
+                changed.append("mirror_retarget")
+            continue
+        if directive_user_origin and name in _AUDIENCE_CONSTRAINTS:
+            continue
+        if value and not bool(recorded.get(name, False)):
+            changed.append(name)
+    return changed
+
+
+def describe_containment_change(constraints: list[str], *, mirror_unverified: bool = False) -> str:
+    """One transcript-ready phrase naming what changed, for the drop notice.
+
+    *mirror_unverified* swaps the mirrored wording: when the drain-side probe
+    failed, the refusal stands (fail closed) but the notice must describe an
+    unverifiable state, not assert a mirror appeared.
+    """
+    labels = dict(_CONTAINMENT_CHANGE_LABELS)
+    if mirror_unverified:
+        labels["mirrored"] = "the session's channel-mirror state could not be verified"
+    return "; ".join(labels.get(c, c) for c in constraints)
+
+
+def audit_queued_drop(slot: "_ChatSlot", queue_id: str, constraints: list[str]) -> None:
+    """Record one drain-time drop in the SEL, best-effort and off the loop.
+
+    Logged as a denied tool invocation on the TARGET's EFFECTIVE session — a
+    linked slot's turns run under ``linked_session_key``, so filing under the
+    slot key would hide exactly the drops this feature exists to record. The
+    slot key stays in ``resources``/``metadata``. The admission-time caller may
+    be long gone, so there is no caller identity to attribute the drop to.
+    """
+    _audit_queue_drain(slot, outcome="denied", queue_ids=[queue_id], newly_held=constraints)
+
+
+def audit_queued_allow(slot: "_ChatSlot", queue_ids: list[str]) -> None:
+    """Record that re-validated queued entries were AUTHORIZED to become a turn.
+
+    The allow side of the same permission decision :func:`audit_queued_drop`
+    records the deny side of — both outcomes are auditable, matching
+    ``authorize_target``'s convention of logging ``allowed`` operations and not
+    only refusals. Emitted at CONSUMPTION (the moment the drain hands the
+    entries to a turn), not per sweep pass, so an entry that waits across
+    several drains produces one row when it actually executes rather than one
+    per re-check. One row covers the whole consumed batch.
+    """
+    _audit_queue_drain(slot, outcome="allowed", queue_ids=queue_ids, newly_held=None)
+
+
+def _audit_queue_drain(
+    slot: "_ChatSlot", *, outcome: str, queue_ids: list[str], newly_held: list[str] | None
+) -> None:
+    slot_key = str(getattr(slot, "key", ""))
+    session_key = effective_session_key(slot)
+    metadata: dict[str, Any] = {
+        "target": slot_key,
+        "queue_ids": ",".join(queue_ids),
+    }
+    if newly_held is not None:
+        metadata["newly_held"] = ",".join(newly_held)
+
+    def _do() -> None:
+        sel().log_tool_invocation(
+            session_key=session_key,
+            agent="",
+            source="dashboard",
+            tool_name="queue_drain_revalidation",
+            tool_kind="command",
+            outcome=outcome,
+            resources=f"target={slot_key}",
+            metadata=metadata,
+        )
+
+    _sel_off_loop(_do, "queue-drain revalidation audit")
 
 
 def _refuse_ineligible_creator(state: "DashboardState", caller_slot: "_ChatSlot") -> None:
@@ -293,6 +599,7 @@ async def create_session(
     caller_session_key: str,
     title: str = "",
     agent: str = "",
+    folder_id: str = "",
 ) -> dict[str, Any]:
     """Open a new session in the caller's workspace, persisted at birth.
 
@@ -306,6 +613,21 @@ async def create_session(
     there is no target yet), and the child inherits the caller's workspace. Both
     matter because a caller refusal missing here, or a workspace not inherited,
     would hand back a session outside the boundary the other verbs enforce.
+
+    ``folder_id`` files the slot as part of creation (#6118): it is assigned in
+    the same synchronous window that configures the slot, the whole
+    allocation-to-persist span runs under ``suspend_slots_push`` so the slot's
+    first broadcast frame already shows it filed, and the placement rides in the
+    persist-at-birth metadata so it survives a restart. An unknown folder
+    refuses the whole create -- nothing exists yet, so refusal loses nothing,
+    matching the move path's posture -- and existence is confirmed READ-ONLY
+    under the folder-store lock (``read_folders``) before the allocation; the
+    Model-B un-hide runs only after the filing has landed, so a refused create
+    leaves no folder-tree mutation behind. Authorization needs no new path: the
+    folder tree cannot be reshaped from here (the id must already exist), and
+    every caller class the move path's app-ownership rule exists to stop is
+    already refused above it -- an app-scoped caller cannot create a session at
+    all (`app_scoped_caller`).
     """
     if not session_control_enabled():
         raise SessionControlError(
@@ -436,10 +758,28 @@ async def create_session(
     # can see and take over the work. SYSTEM-origin slots fall outside the
     # `slots:user` WS scope, which would hide it from the sidebar.
 
+    if folder_id:
+        # Confirmed under the folder-store lock -- the only place existence
+        # cannot go stale against a concurrent delete (see `read_folders`) --
+        # and READ-ONLY on purpose: the Model-B un-hide is a durable mutation,
+        # and it runs only after the filing actually lands (below, after the
+        # persist), so a create the re-gate refuses leaves no folder-tree state
+        # behind. Placed BEFORE the re-gate so the last suspension this
+        # coroutine takes is here: after the re-gate nothing suspends until the
+        # slot is fully configured, so the folder confirmed here cannot be
+        # deleted before the assignment lands (folder mutations run on this
+        # loop).
+        def _exists(folders: list[dict[str, Any]]) -> bool:
+            return any(str(f.get("id") or "") == folder_id for f in _safe_folder_tree(folders))
+
+        if not await state.read_folders(_exists):
+            raise SessionControlError("folder not found", code="folder_not_found")
+
     # Re-resolved and re-gated HERE, adjacent to the allocation, because every
-    # decision above was made before this coroutine suspended -- twice, for the
-    # project directory and the config load -- and the inputs to those decisions are
-    # live state that can flip inside either window.
+    # decision above was made before this coroutine suspended -- for the
+    # project directory, the config load, and the folder confirmation -- and the
+    # inputs to those decisions are live state that can flip inside any of those
+    # windows.
     #
     # Re-reading the slot TABLE is the part that matters most: closing the caller's
     # tab removes its slot, and a Python reference to the removed object stays
@@ -471,10 +811,35 @@ async def create_session(
             code="caller_workspace_changed",
         )
     _refuse_ineligible_creator(state, live_caller)
-    if state.live_slot_count() >= _MAX_SLOTS_FOR_CREATE:
+    # The RATE guard, ahead of the capacity ceilings below. Those bound how many
+    # sessions can exist; this bounds how fast one caller may open them, which is
+    # the property an auto-approved verb loses -- a waived prompt leaves a loop
+    # nothing to push back on. Deliberately the control that needs no durable
+    # state: a lifetime quota means nothing across a restart unless every
+    # rehydrate path carries its attribution, while a five-minute window buys a
+    # restart one window rather than a clean slate.
+    if not allow_create(SESSION_CREATE, caller_key):
         raise SessionControlError(
-            f"slot cap reached ({_MAX_SLOTS_FOR_CREATE})",
+            "too many sessions created recently; retry shortly",
+            code="create_rate_limited",
+            status=429,
+        )
+    if state.live_slot_count() >= MAX_LIVE_SLOTS:
+        raise SessionControlError(
+            f"slot cap reached ({MAX_LIVE_SLOTS})",
             code="slot_cap_reached",
+            status=429,
+        )
+    # Then the per-creator sub-ceiling. The global cap above bounds the TOTAL but
+    # not the distribution, so without this one caller can hold all 500 and the
+    # person's own next chat tab gets the 429 -- the resource is bounded, but not
+    # from anyone else's point of view. This is the bound that makes the verb safe
+    # to auto-approve: the worst case of an automated creator looping on it is its
+    # own 50 slots, not everyone's 500.
+    if state.creator_slot_count(caller_key) >= MAX_SLOTS_PER_CREATOR:
+        raise SessionControlError(
+            f"per-caller slot cap reached ({MAX_SLOTS_PER_CREATOR})",
+            code="creator_slot_cap_reached",
             status=429,
         )
 
@@ -482,77 +847,141 @@ async def create_session(
     # the same reason: it decides which workspace actually EXECUTES the turn, so it
     # must never be observable as empty. Everything after this point is synchronous
     # until the slot is fully configured.
-    slot = state.get_or_create_slot(
-        None, agent=agent_name, workspace=workspace, origin=SlotOrigin.USER
-    )
-    # cwd must follow the workspace too, or file search and project-scoped agents
-    # resolve against a directory the slot does not claim -- the same
-    # authorization-vs-execution split as the agent binding, one layer down.
-    if not slot.project:
-        slot.project = project_dir
-    if title.strip():
-        slot.title = sanitize_outbound(title.strip())[:200]
-        slot._titled = True
-    # Persist at birth. `save_slot_off_loop` cannot do this: the save it wraps
-    # returns early on an empty message window -- before its `force` check -- so a
-    # freshly created session, which has no messages by definition, would write
-    # nothing at all. The tool would then hand back a session that does not survive
-    # a restart.
     #
-    # Awaited, and a failure RETRACTS the slot rather than merely propagating: an
-    # unpersisted slot stays in the table, usable in memory and addressable by its
-    # creator, then vanishes on restart. Reporting the failure while leaving that
-    # behind is the worse of the two outcomes, because the caller sees an error and
-    # the session exists anyway. Same retraction the fork path uses on a failed
-    # build.
-    try:
-        await asyncio.to_thread(
-            log.update_metadata,
-            slot_history_key(slot),
-            {
-                "_type": "metadata",
-                # The slot's OWN durable identity, and its origin, both of which
-                # the normal save path writes -- but a slot created here may never
-                # reach that path: `_save_slot_to_history` returns early on an
-                # empty message window, so for a session that is created and then
-                # sits idle THIS dict is the only record on disk. Omitting `origin`
-                # is silently destructive on the next restart: rehydrate falls back
-                # to the fail-closed empty sentinel, so a session opened as USER
-                # comes back unattributed and `slots:user` subscribers stop seeing
-                # it. Checked field-by-field against the save path; these are the
-                # only fields a slot carries at birth that it does not already
-                # write.
-                "tab_id": slot._tab_id,
-                "origin": slot._origin,
-                "created_at": metadata_now_iso(),
-                "workspace": slot.workspace,
-                "agent": slot.agent or "",
-                "project": slot.project or "",
-                "title": slot.title or "",
-                "memory_mode": getattr(slot, "memory_mode", "persistent"),
-            },
+    # The whole allocation-to-persist span runs under `suspend_slots_push`:
+    # `get_or_create_slot` broadcasts on a leading edge, so without the suspend an
+    # idle gateway serializes and sends the new slot BEFORE `folder_id` is
+    # assigned -- every client (and any app on `slots:user`) would render the
+    # session at the top level for a frame, the observable unfiled state #6118
+    # exists to remove. It also covers the persist and its failure retraction, so
+    # a slot whose birth write fails is never broadcast at all. Same pattern the
+    # move path uses ("file the slot before the coalesced broadcast").
+    with state.suspend_slots_push():
+        slot = state.get_or_create_slot(
+            None, agent=agent_name, workspace=workspace, origin=SlotOrigin.USER
         )
-    except Exception:
-        # Retract, but never at the cost of work already in flight. The slot is
-        # addressable from the moment `get_or_create_slot` publishes it, which is
-        # before this await, so a turn can have started on it while the write was
-        # in the worker thread. Popping the slot then would leave that turn running
-        # with nothing pointing at it -- unreachable, unstoppable, and invisible to
-        # the stop verb. A phantom session that vanishes on the next restart is the
-        # lesser harm, so liveness wins over tidiness and the slot stays.
-        if not slot.running and not slot.messages:
-            state._slots.pop(slot.key, None)
+        # Attribute the slot to the caller that asked for it, which is what makes the
+        # per-creator ceiling above countable. Written here, inside the synchronous
+        # window that follows the mint, so no suspension point separates the cap test
+        # from this write -- otherwise two concurrent creates could both pass a ceiling
+        # that one of them had already filled. Only this entry point sets it: a
+        # person's own tab and a fork reach `get_or_create_slot` directly and stay
+        # unattributed, so ordinary human use never consumes an automated caller's
+        # share.
+        slot._created_by = caller_key
+        # cwd must follow the workspace too, or file search and project-scoped agents
+        # resolve against a directory the slot does not claim -- the same
+        # authorization-vs-execution split as the agent binding, one layer down.
+        if not slot.project:
+            slot.project = project_dir
+        if folder_id:
+            # Filed inside the same synchronous window that configures the slot, so
+            # the session is never observable unfiled -- the atomicity #6118 exists
+            # for. Existence was confirmed under the store lock above, and folder
+            # mutations run on this loop, so the folder cannot have been deleted
+            # between that check and this assignment. No `_folder_changed` flag: the
+            # slot's first turn carries the armed first-turn breadcrumb injection
+            # (`is_new` in chat_runner), so the [FOLDER] line reaches the model
+            # without it.
+            slot.folder_id = folder_id
+        if title.strip():
+            slot.title = sanitize_outbound(title.strip())[:200]
+            slot._titled = True
+        # Persist at birth. `save_slot_off_loop` cannot do this: the save it wraps
+        # returns early on an empty message window -- a full save has nothing to
+        # write -- so a freshly created session, which has no messages by
+        # definition, would write nothing at all. The tool would then hand back a
+        # session that does not survive a restart.
+        #
+        # Awaited, and a failure RETRACTS the slot rather than merely propagating: an
+        # unpersisted slot stays in the table, usable in memory and addressable by its
+        # creator, then vanishes on restart. Reporting the failure while leaving that
+        # behind is the worse of the two outcomes, because the caller sees an error and
+        # the session exists anyway. Same retraction the fork path uses on a failed
+        # build.
+        try:
+            await asyncio.to_thread(
+                log.update_metadata,
+                slot_history_key(slot),
+                {
+                    "_type": "metadata",
+                    # The slot's OWN durable identity, and its origin, both of which
+                    # the normal save path writes -- but a slot created here may never
+                    # reach that path: `_save_slot_to_history` runs a full save only
+                    # when the window has messages, so for a session that is created
+                    # and then sits idle THIS dict is the only record on disk.
+                    # Omitting `origin` is silently destructive on the next restart:
+                    # rehydrate falls back to the fail-closed empty sentinel, so a
+                    # session opened as USER comes back unattributed and `slots:user`
+                    # subscribers stop seeing it. Checked field-by-field against the
+                    # save path; these are the only fields a slot carries at birth
+                    # that it does not already write.
+                    "tab_id": slot._tab_id,
+                    "origin": slot._origin,
+                    "created_at": metadata_now_iso(),
+                    "workspace": slot.workspace,
+                    "agent": slot.agent or "",
+                    "project": slot.project or "",
+                    "title": slot.title or "",
+                    "memory_mode": getattr(slot, "memory_mode", "persistent"),
+                    # Only when filed, mirroring the normal save path, which omits
+                    # `folder_id` from the metadata line when empty. Without this
+                    # the filing would not survive a restart: for an idle newborn
+                    # THIS dict is the only record of the placement on disk.
+                    **({"folder_id": slot.folder_id} if slot.folder_id else {}),
+                },
+            )
+        except Exception:
+            # Retract, but never at the cost of work already in flight. The slot is
+            # addressable from the moment `get_or_create_slot` publishes it, which is
+            # before this await, so a turn can have started on it while the write was
+            # in the worker thread. Popping the slot then would leave that turn running
+            # with nothing pointing at it -- unreachable, unstoppable, and invisible to
+            # the stop verb. A phantom session that vanishes on the next restart is the
+            # lesser harm, so liveness wins over tidiness and the slot stays.
+            if not slot.running and not slot.messages:
+                state._slots.pop(slot.key, None)
+            state.push_slots_update()
+            raise
+        if slot.folder_id:
+            # Model-B un-hide, applied only NOW that the filing has actually
+            # landed -- running it any earlier persists `hidden = False` for a
+            # create a later gate can still refuse, durably reversing a choice
+            # the user made for a call that failed. The move path holds the same
+            # order (assign, confirm, then un-hide). If the folder was deleted
+            # while the persist was in the worker thread, the delete's own sweep
+            # already unfiled this slot (it is published), so the guard reads
+            # the fresh value and skips; the metadata line can then briefly
+            # carry a dangling folder_id, the same accepted residual a move
+            # racing a delete leaves, and readers fall back to "(unfiled)".
+            #
+            # Best-effort: the create is already COMMITTED (slot published,
+            # persisted at birth), so a folder-store write failure here must not
+            # propagate -- the request would report failure for a session that
+            # exists, and the caller's retry would create a duplicate. A folder
+            # left hidden with a session inside is the recoverable lesser harm.
+            try:
+                await _unhide_folder(state, slot.folder_id)
+            except Exception:
+                logger.warning(
+                    "create_session: filing committed for %s but un-hiding folder %s failed",
+                    slot.key,
+                    slot.folder_id,
+                    exc_info=True,
+                )
         state.push_slots_update()
-        raise
-    state.push_slots_update()
     _audit(
         caller_session_key=caller_key,
         operation="create",
         slot_key=slot.key,
         outcome="allowed",
-        detail={"agent": slot.agent or ""},
+        detail={"agent": slot.agent or "", "folder_id": slot.folder_id or ""},
     )
-    return {"ok": True, "target": slot.key, "title": slot.title or slot.key}
+    return {
+        "ok": True,
+        "target": slot.key,
+        "title": slot.title or slot.key,
+    }
 
 
 def authorize_target(
@@ -561,12 +990,21 @@ def authorize_target(
     caller_session_key: str,
     target: str,
     operation: str,
+    skip_enabled_check: bool = False,
 ) -> "_ChatSlot":
     """Resolve *target* and decide whether *caller* may act on it.
 
     Deny-by-default: every refusal raises :class:`SessionControlError` and is
     recorded in the SEL, so an attempt to reach a session that is out of bounds
     is visible after the fact even though nothing happened.
+
+    ``skip_enabled_check`` omits ONLY the ``session_control_enabled()`` config
+    read. It exists for a re-check that must run SYNCHRONOUSLY with no event-loop
+    suspension (``close_target``'s point-of-no-return callback): the feature was
+    already confirmed enabled when the operation was first authorized, whether
+    session control got switched off mid-operation is not a containment boundary,
+    and the config read is the one part of this function that can touch the disk
+    on a cache miss. Every containment and identity refusal still runs.
     """
 
     def deny(reason: str, code: str, status: int = 403) -> SessionControlError:
@@ -602,7 +1040,7 @@ def authorize_target(
         )
         return SessionControlError(reason, status=status, code=code)
 
-    if not session_control_enabled():
+    if not skip_enabled_check and not session_control_enabled():
         raise deny(
             "session control is disabled in config (agent.session_control)",
             "session_control_disabled",
@@ -734,8 +1172,8 @@ def _audit(
 
     Dispatched OFF the loop when one is running, mirroring
     ``update_metadata_off_loop``. ``log_tool_invocation`` only enqueues, but the
-    FIRST ``sel()`` of a process CONSTRUCTS the log -- trust-dir creation, key
-    validation, and on Windows an ``icacls`` subprocess -- and this can genuinely
+    FIRST ``sel()`` of a process CONSTRUCTS the log -- trust-dir creation and
+    key validation, blocking file IO -- and this can genuinely
     be that first call: ``sel_audit_middleware`` logs AFTER ``await handler(...)``,
     so on a fresh gateway the first authenticated request constructs the log
     inside whatever handler runs first. Offloading here covers every call site
@@ -766,8 +1204,8 @@ def _sel_off_loop(write: "Callable[[], None]", what: str) -> None:
     to be found separately, having been missed while the other two were fixed.
 
     Two failure modes, both handled: a loop-blocking construct (a ``sel()`` that
-    creates the trust dir, validates keys, and on Windows shells out to
-    ``icacls``), and a construct that RAISES, which unguarded turns a 403 into a
+    creates the trust dir and validates keys — blocking file IO), and a construct
+    that RAISES, which unguarded turns a 403 into a
     500 -- losing the refusal in order to report it. An audit that cannot be
     written must never change what the caller is told.
     """
@@ -798,18 +1236,29 @@ async def stop_target(
 ) -> dict[str, Any]:
     """Stop *target*'s in-flight turn, via the same path as the Stop button.
 
-    A first call cancels cooperatively; calling again while that is pending
-    escalates to a hard kill. The escalation is decided by the target's own stop
-    state, not by anything the caller can ask for -- which is why there is no
-    force flag: `stop_slot_turn` escalates on a second press regardless of one,
-    so advertising it would promise a hard kill a first call cannot deliver.
+    A stop cancels cooperatively. The button escalates to a hard kill when a
+    second press lands while the first is still pending; this verb deliberately
+    does not do that for a repeat it cannot tell apart from a RETRY, because a
+    client that got no response inside its request timeout re-sends the same
+    request, and the kill path discards the target's queue and pending steers. So
+    within ``stop_retry.WINDOW_SECS`` of this caller's first stop of this target, a
+    repeat returns the existing "stop already in progress" no-op instead. A stop
+    arriving after that window still escalates, so a genuine second decision keeps
+    the capability — only a blind retry cannot reach it (issue #5074).
+
+    Withholding the escalation never costs the caller the stop it asked for: a
+    repeat that finds the target running again soft-stops it as a first call would.
+
+    Still no force flag: escalation is decided by the target's own stop state and
+    the window above, never by anything the caller can ask for, so advertising one
+    would promise a hard kill a first call cannot deliver.
     """
     # Prewarmed BEFORE `authorize_target`, and that ordering is load-bearing.
     # `stop_slot_turn`'s IDLE branch logs to the SEL with no await before it, so on
     # a fresh gateway a first `session_stop` against an idle slot would CONSTRUCT
-    # the log on the loop -- trust-dir creation, key validation, and on Windows an
-    # `icacls` subprocess. Constructing it off-loop first makes that call a cheap
-    # cache hit. Per-request, not a boot step: prewarming at startup is what
+    # the log on the loop -- trust-dir creation and key validation, blocking file
+    # IO. Constructing it off-loop first makes that call a cheap cache hit.
+    # Per-request, not a boot step: prewarming at startup is what
     # `no-new-work-on-gateway-boot-path` forbids, and a background task would only
     # narrow the race rather than close it.
     #
@@ -842,20 +1291,245 @@ async def stop_target(
         target=target,
         operation="stop",
     )
+    # Both calls below are SYNCHRONOUS, which is what lets them sit here at all:
+    # the rule the comment above states is that nothing may SUSPEND between the
+    # gate and the act, and neither of these does.
+    #
+    # `caller_slot_key` repeats the slot walk `authorize_target` just did rather
+    # than changing what that function returns for all three verbs. The walk is
+    # bounded by `MAX_LIVE_SLOTS` and touches no filesystem, and with no
+    # suspension between them the two resolutions cannot disagree — a rebind
+    # landing in that window is impossible, not merely unlikely.
+    caller_key = caller_slot_key(state, caller_session_key)
+    may_escalate = allow_escalation(caller_key, slot.key)
     # Deferred: ``chat_handlers`` imports ``dashboard.chat`` transitively, which
     # reaches back into the gateway at import time — a module-scope import here
     # closes that cycle through ``handlers.session_control`` -> ``server``.
     from kiro_crew.dashboard.chat_handlers import stop_slot_turn
 
-    result = await stop_slot_turn(state, slot, source="session_control")
+    result = await stop_slot_turn(state, slot, source="session_control", escalate=may_escalate)
     _audit(
         caller_session_key=caller_session_key,
         operation="stop",
         slot_key=slot.key,
         outcome="allowed",
-        detail={"result": result.get("info", "stopping")},
+        detail={
+            "result": result.get("info", "stopping"),
+            # Recorded on the ALLOWED line, not only inside `stop_slot_turn`'s
+            # own audit: this is the layer that made the retry judgement, so the
+            # session-control trail has to show it was made.
+            "escalation_withheld": not may_escalate,
+        },
     )
     return {"ok": True, "target": slot.key, **result}
+
+
+async def close_target(
+    state: "DashboardState",
+    *,
+    caller_session_key: str,
+    target: str,
+) -> dict[str, Any]:
+    """Close *target*, the same archival the tab ✕ performs.
+
+    Non-destructive: the conversation is saved to history and can be reopened
+    later — closing dismisses the LIVE tab, it does not delete the transcript.
+    An in-flight turn is cancelled first (its work is discarded), so this is a
+    strictly heavier act than :func:`stop_target`; the description tells the
+    caller to read the session before closing it.
+
+    Reuses the dashboard's own close path (:func:`chat_handlers.close_slot`), so
+    a controlled close and a human ✕ share the identical nudge-retirement and
+    app-notification ordering that keeps a dismissed tab from being resurrected.
+    Its three failure modes surface as their own ``SessionControlError`` codes
+    rather than a generic 500, so a caller can tell "the app refused the
+    dismissal" from "history could not be saved".
+    """
+    # Same prewarm ordering as `stop_target`, for the same reasons: the SEL write
+    # inside `authorize_target`'s deny path must be a cache hit, and the config
+    # warm must be the LAST suspension before the synchronous gate.
+    try:
+        await asyncio.to_thread(sel)
+    except Exception:  # noqa: BLE001 - a prewarm failure must not fail the close
+        logger.warning("session-control SEL prewarm failed", exc_info=True)
+    await prewarm_enabled_check()
+
+    slot = authorize_target(
+        state,
+        caller_session_key=caller_session_key,
+        target=target,
+        operation="close",
+    )
+    slot_key = slot.key
+    # Deferred for the same import cycle `stop_target` documents.
+    from kiro_crew.dashboard.chat_handlers import SlotCloseError, close_slot
+
+    def _reassert_closeable() -> None:
+        # Re-run the SAME target gate at close_slot's point of no return —
+        # SYNCHRONOUSLY, so there is NO event-loop suspension between it and the
+        # pop and nothing can change between the final authorization and the
+        # archival. The initial gate above ran before close_slot's awaits
+        # (nudge-loop retirement takes the AutoNudge lock; the app hook awaits
+        # external work), and a target that was unmirrored/unlinked then can gain
+        # a channel mirror or link in that window — archiving a now-channel-backed
+        # session the caller was never allowed to reach.
+        #
+        # `skip_enabled_check=True` omits the ONE part of authorize_target that
+        # can touch the disk (`session_control_enabled()`'s config read): the
+        # feature was already confirmed enabled above, whether it was switched off
+        # mid-close is not a containment boundary, and skipping it is what lets
+        # this run with no await — an async prewarm-then-check would put an await
+        # back before the pop and reopen the very window this closes. Every
+        # containment and identity refusal still runs.
+        try:
+            live = authorize_target(
+                state,
+                caller_session_key=caller_session_key,
+                target=slot_key,
+                operation="close",
+                skip_enabled_check=True,
+            )
+        except SessionControlError as exc:
+            # A stale-authorization refusal (mirrored/linked/workspace/caller-gone)
+            # becomes a SlotCloseError carrying that same status, so it round-trips
+            # to the caller as the specific 403 rather than a generic close failure.
+            raise SlotCloseError(exc.message, code=exc.code, status=exc.status) from exc
+        if live is not slot:
+            # The key was re-minted onto a DIFFERENT session while close_slot
+            # awaited (a concurrent close+reopen). authorize_target resolves by
+            # key, so it would authorize the replacement — but close_slot pops
+            # `name` and tears down / saves the ORIGINAL slot it holds. Comparing
+            # identity (not mere presence) is the same guard `create_session` uses
+            # for its re-minted-key window; abort so the replacement lives.
+            raise SlotCloseError(
+                "the target session was replaced during the close",
+                code="target_replaced",
+                status=409,
+            )
+
+    try:
+        await close_slot(state, slot, slot_key, pre_pop_check=_reassert_closeable)
+    except SlotCloseError as exc:
+        # The close path already rolled back every partial step and logged the
+        # cause; re-raise it as the surface's own error so the caller sees the
+        # specific reason (nudge/app/history) rather than a bare failure. Audited
+        # as a denied operation so the trail shows the close was attempted and did
+        # not take.
+        _audit(
+            caller_session_key=caller_session_key,
+            operation="close",
+            slot_key=slot_key,
+            outcome="denied",
+            detail={"code": exc.code},
+        )
+        raise SessionControlError(exc.message, status=exc.status, code=exc.code) from exc
+    _audit(
+        caller_session_key=caller_session_key,
+        operation="close",
+        slot_key=slot_key,
+        outcome="allowed",
+    )
+    return {"ok": True, "target": slot_key}
+
+
+#: Cap on one delivered message. Aliased to ``validation.MAX_LONG_STRING`` rather
+#: than restated as its own number: a seed prompt is that shape, the MCP schema
+#: layer already rejects on that constant, and two spellings of one 50k limit
+#: would drift apart the first time either moved.
+MAX_SEND_MESSAGE_CHARS = MAX_LONG_STRING
+
+#: Provenance prefix on every delivered message. The target's transcript renders
+#: the message as a user row, and without this line it is indistinguishable from
+#: something the person typed — the same reason auto-nudge tags its injected
+#: turns ``[auto-nudge cycle N]``. The model in the target session sees it too,
+#: so it can weigh the instruction as coming from a peer session, not its user.
+_SEND_PROVENANCE = "[sent by session {caller} via session_send]\n\n"
+
+
+async def send_to_target(
+    state: "DashboardState",
+    *,
+    caller_session_key: str,
+    target: str,
+    message: str,
+) -> dict[str, Any]:
+    """Deliver *message* to *target* as its next agent turn.
+
+    The delivery path is the same queue-vs-run decision the dashboard composer
+    uses (``enqueue_or_run_prompt``): an idle target starts a turn immediately,
+    a busy one queues the message for its next turn. Both outcomes are reported
+    distinctly — ``started`` says which happened — because "it ran" and "it will
+    run later" must not look the same to a caller coordinating several sessions.
+    A queued delivery is re-validated at the drain (issue #5911): the entry
+    carries the containment that held here, and a constraint newly held at
+    delivery time drops it with a visible notice instead of executing it under
+    the weaker authorization that admitted it.
+
+    The turn is NOT charged against the background-turn cap, and deliberately so:
+    that cap only binds unattended (app-owned) slots, and every target this
+    function can authorize is attended — see the comment at the delivery call.
+    """
+    # Same prewarm ordering as `stop_target`, for the same reasons: the SEL
+    # write inside `authorize_target`'s deny path must be a cache hit, and the
+    # config warm must be the LAST suspension before the synchronous gate.
+    try:
+        await asyncio.to_thread(sel)
+    except Exception:  # noqa: BLE001 - a prewarm failure must not fail the send
+        logger.warning("session-control SEL prewarm failed", exc_info=True)
+    await prewarm_enabled_check()
+
+    body = message.strip()
+    if not body:
+        raise SessionControlError("message is empty", code="message_empty", status=400)
+    if len(body) > MAX_SEND_MESSAGE_CHARS:
+        raise SessionControlError(
+            f"message exceeds {MAX_SEND_MESSAGE_CHARS} characters",
+            code="message_too_long",
+            status=400,
+        )
+
+    slot = authorize_target(
+        state,
+        caller_session_key=caller_session_key,
+        target=target,
+        operation="send",
+    )
+
+    # Deferred for the same import cycle `stop_target` documents.
+    from kiro_crew.dashboard.chat_runner import _run_chat
+
+    caller_key = caller_slot_key(state, caller_session_key)
+    # Sanitized on the same grounds as the steer path (``chat_delivery`` sanitizes
+    # before ``slot.append``): this body comes from ANOTHER session and is persisted
+    # into — and broadcast from — the target's transcript, so raw content must never
+    # reach that surface. The length gate above deliberately measures the RAW body:
+    # redaction can only shrink the text, so validating the raw form is the honest
+    # limit and keeps the error keyed to what the caller actually sent.
+    prompt = _SEND_PROVENANCE.format(caller=caller_key or "unknown") + sanitize_outbound(body)
+
+    # `_run_chat` is passed straight through, NOT wrapped in
+    # `state.run_background_turn`: that cap is structurally unreachable here.
+    # `run_background_turn` returns the coroutine untouched for an attended slot
+    # (`state.py`, "this wrapper is inert"), `_ChatSlot.unattended` is
+    # `bool(self._app) and not self._human_seen`, and `authorize_target` refuses
+    # every `_app` target above (`app_scoped_target`) — so no target this
+    # function can reach is ever unattended, and a wrapper would only add a
+    # never-taken timeout arm. The composer's own queued path does the same
+    # (`server.py` passes `_run_chat` directly).
+    started = bool(slot.enqueue_or_run_prompt(prompt, _run_chat, state))
+    try:
+        state.push_slots_update()
+    except Exception:  # pragma: no cover - sidebar refresh is best-effort
+        logger.debug("session_send: push_slots_update failed", exc_info=True)
+
+    _audit(
+        caller_session_key=caller_session_key,
+        operation="send",
+        slot_key=slot.key,
+        outcome="allowed",
+        detail={"started": started, "chars": len(body)},
+    )
+    return {"ok": True, "target": slot.key, "started": started}
 
 
 def read_messages(
@@ -887,12 +1561,22 @@ def read_messages(
 
     # Indexes are ABSOLUTE positions in the session, not offsets into the live
     # window. A slot keeps only the most recent ``_MAX_SLOT_MESSAGES`` in memory
-    # and credits each trimmed row to ``_disk_older_count``, so window length
+    # and credits each trimmed row to a frozen-prefix counter, so window length
     # stops growing once trimming starts. A cursor derived from that length
     # would freeze at the cap and never see another reply; adding the
     # frozen-prefix count makes it monotonic for the session's whole life.
     raw_window = list(slot.messages)
-    base = int(getattr(slot, "_disk_older_count", 0) or 0)
+    # The DURABLE frozen-prefix counter, never ``_disk_older_count``: that one
+    # counts every trimmed row, transient ones included, while the positions
+    # below are built over the durable rows the filter keeps. Basing on the
+    # all-rows counter shifted every position as soon as a transient row was
+    # trimmed, and a ``since`` read then served a durable message the caller
+    # already had. ``_disk_older_durable_count`` counts exactly the rows the
+    # ``TRANSIENT_ROLES`` filter below would have kept, so the two spaces agree
+    # for the session's whole life. Defensive ``getattr`` matches how the
+    # existing code reads ``_disk_older_count``: a slot restored by an older
+    # build simply has no trimmed prefix yet.
+    base = int(getattr(slot, "_disk_older_durable_count", 0) or 0)
     # Stop the cursor before the streaming tail (see ``TRANSIENT_ROLES``): those
     # rows are deleted when the segment flushes, so a cursor past them would sit
     # beyond the list that replaces them and never return the finished reply.
@@ -902,40 +1586,28 @@ def read_messages(
     if since is not None:
         if since < 0:
             raise SessionControlError("since must be >= 0", code="invalid_since")
-        if base:
-            # ``_disk_older_count`` counts every trimmed row, transient ones
-            # included (persistence writes them and only skips them when reading
-            # back), while the positions above are built over DURABLE rows only.
-            # The two agree until a transient row is trimmed into the frozen
-            # prefix — then `base` advances with no durable row behind it, every
-            # position shifts, and a `since` read serves a durable message the
-            # caller already had.
-            #
-            # An exact cursor needs a durable-only prefix count, which does not
-            # exist yet and cannot be added from here: ``_disk_older_count`` has a
-            # contract with the save model (it is the frozen prefix saves must not
-            # rewrite) and is read by backfill, rewind and channel slots. So this
-            # refuses loudly instead of quietly duplicating. Tail reads (no
-            # ``since``) still work, and the window is 10,000 rows, so only a very
-            # long-lived session reaches this at all. Tracked for the real fix.
+        if since < base:
+            # The cursor points into the trimmed prefix: those rows exist only
+            # on disk now, and this read serves the in-memory window. Starting
+            # at ``base`` instead would silently skip every row in
+            # ``[since, base)`` — a poller that lagged a whole window behind
+            # would lose messages with nothing in the response saying so. The
+            # refusal is loud and the tail-read fallback recovers, exactly like
+            # the past-the-end case below.
             raise SessionControlError(
-                "this session is long enough that older messages have been "
-                "trimmed, and cursor positions are no longer exact — read without "
-                "`since` to get the latest messages",
+                "this session is long enough that the messages at your cursor "
+                "have been trimmed from memory — read without `since` to get "
+                "the latest messages",
                 status=409,
                 code="cursor_unavailable",
             )
-        # `base` is 0 from here on — the guard above refused every trimmed
-        # session — so the absolute position and the window offset coincide.
-        #
         # A cursor PAST the end is the remaining inexact case, and it is not the
         # same as a stale one: rewind and regenerate shrink a transcript, so
         # `total` can move backwards under a caller that is still holding the old
         # position. Clamping it to `total` would start the read at the end and
         # silently skip every replacement row written below the old cursor, with
-        # nothing in the response saying so. That is the failure the trimmed-session
-        # guard above refuses loudly rather than answer approximately, so this
-        # refuses the same way. Reads without `since` are unaffected.
+        # nothing in the response saying so. So this refuses loudly rather than
+        # answer approximately. Reads without `since` are unaffected.
         if since > total:
             raise SessionControlError(
                 "this session is shorter than your cursor — it was rewound or "
@@ -945,13 +1617,16 @@ def read_messages(
                 code="cursor_unavailable",
             )
         start = since
-        offset = start
+        # Positions are absolute; the window slice below is offset-relative, so
+        # subtract the durable prefix that is no longer in memory.
+        offset = start - base
     else:
-        # A tail read is still served on a trimmed session (only `since` reads are
-        # refused), so the two spaces come apart here: slice the in-memory window
-        # by OFFSET, but report the index in ABSOLUTE terms so the number still
-        # means "position in the session". Conflating them returned an empty
-        # window, because `total` counts the frozen prefix the list does not hold.
+        # A tail read never refuses (only a `since` below the trimmed prefix or
+        # past the end is), and the two spaces come apart here: slice the
+        # in-memory window by OFFSET, but report the index in ABSOLUTE terms so
+        # the number still means "position in the session". Conflating them
+        # returned an empty window, because `total` counts the frozen prefix
+        # the list does not hold.
         offset = max(0, durable_end - limit)
         start = base + offset
     window = messages[offset:][:limit]
@@ -1004,13 +1679,11 @@ def read_messages(
         # `total` stays in the response as the backlog depth — the difference
         # from `next_since` is how far behind the caller still is.
         #
-        # Omitted once rows have been trimmed, because positions stop being exact
-        # there (see the `cursor_unavailable` refusal above). Handing back a
-        # cursor that the next call would reject is worse than saying it is gone,
-        # so its ABSENCE is the signal: a caller with no `next_since` falls back
-        # to tail reads. No separate flag says the same thing -- two encodings of
-        # one fact can disagree, and the reader already has to handle the absent
-        # key.
-        **({"next_since": start + len(out)} if not base else {}),
+        # Returned on trimmed sessions too: positions are based on the
+        # durable-only prefix counter, so they stay exact after rows age into
+        # the frozen prefix. The refusals above cover the cases that genuinely
+        # cannot be exact (a cursor under the trimmed prefix, or past the end of
+        # a rewound transcript).
+        "next_since": start + len(out),
         "messages": out,
     }

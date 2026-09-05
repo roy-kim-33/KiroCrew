@@ -44,6 +44,7 @@ directive tool and is ignored.
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 # The stateless, session-bound tools. ``ask_question`` joins
@@ -60,6 +61,7 @@ DIRECTIVE_TOOLS: frozenset[str] = frozenset(
         "set_project",
         "suggest_followup",
         "ask_question",
+        "reset_conversation",
     }
 )
 
@@ -102,6 +104,12 @@ MAX_DIRECTIVE_CHARS = 3800
 # no payload and grants no effect, so a model emitting the literal bytes can only
 # change how a log line reads, never what gets applied.
 _REFUSAL_SENTINEL = "[[KIROCREW_SESSION_DIRECTIVE_REFUSED]]"
+# A server-qualified canonical tool name separates server from tool with a RUN
+# of underscores, and the run length is transport-specific ("___" from kiro-cli,
+# "__" in the canonical MCP prefix form). Matching the run rather than one
+# spelling is what lets :func:`match_tool` accept both without widening to a
+# bare suffix match. Mirrors ``channel._MCP_SEPARATOR_RE``.
+_MCP_SEPARATOR_RE = re.compile(r"_{2,}")
 
 
 def encode(kind: str, args: dict[str, Any], human: str) -> str:
@@ -127,6 +135,19 @@ def encode(kind: str, args: dict[str, Any], human: str) -> str:
             f"nothing was applied.\n{_REFUSAL_SENTINEL}"
         )
     return out
+
+
+def has_marker(text: str | None) -> bool:
+    """True iff *text* carries the directive marker sentinel.
+
+    Used ONLY for diagnostics — never to authorize anything. A marker is
+    model-visible text, so its presence proves nothing about provenance; what it
+    does tell an operator is that a directive was EXPECTED here, which is the
+    signal that made an identity-gate drop invisible (the gate returns ``""``
+    with no log, so a backend that omits ``_meta.kiro`` produced silence rather
+    than a diagnosis).
+    """
+    return bool(text) and _SENTINEL in (text or "")
 
 
 def is_refusal(text: str | None) -> bool:
@@ -163,24 +184,68 @@ def decode(text: str, expected_tool: str) -> dict[str, Any] | None:
     return args if isinstance(args, dict) else {}
 
 
+def peek(text: str) -> tuple[str, dict[str, Any]] | None:
+    """Parse the marker's ``(kind, args)`` with NO identity check, or ``None``.
+
+    A SELECTOR, never a grant — and the distinction is the whole reason this is
+    separate from :func:`decode`. ``decode`` answers "may I apply what this text
+    says?" and therefore demands the trusted tool identity. This answers "which
+    parked record is this frame talking about?", and its answer is only ever used
+    to look one up: a caller matches it against a record the TOOL validated and
+    the gateway parked, then applies the RECORD's payload. Nothing read here
+    reaches an effect, so a model editing the JSON can only fail to find a record
+    — it cannot smuggle a value past the tool's validation.
+
+    Consequently ``kind`` is returned unvalidated except for being a known
+    directive tool: an unknown kind can match no record anyway, and rejecting it
+    here would only duplicate the lookup's own failure.
+    """
+    if not text:
+        return None
+    idx = text.find(_SENTINEL)
+    if idx < 0:
+        return None
+    line = text[idx + len(_SENTINEL):].split("\n", 1)[0]
+    try:
+        block = json.loads(line)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(block, dict):
+        return None
+    kind = block.get("kind")
+    if not isinstance(kind, str) or kind not in DIRECTIVE_TOOLS:
+        return None
+    args = block.get("args")
+    return kind, (args if isinstance(args, dict) else {})
+
+
 def match_tool(raw: str) -> str:
     """Return the directive-tool name a recorded CANONICAL tool name refers to,
     or ``""``.
 
     ``raw`` MUST be the trusted ``_meta.kiro.toolName`` (NOT the LLM-authored
     title). For an MCP tool that name is the bare tool name (``"monitor_start"``);
-    some transports server-qualify it as ``"<server>___<name>"``. Accept exact
-    membership plus that single ``___`` split — nothing wider, so a crafted
-    string cannot smuggle a directive name in as a path/namespace tail.
+    some transports server-qualify it, and the separator is NOT one fixed
+    spelling: kiro-cli reports ``"<server>___<name>"`` while the canonical MCP
+    prefix form is ``"mcp__<server>__<name>"``. Split on the LAST run of two or
+    more underscores so BOTH qualified forms resolve — the same normalization
+    ``channel._blocked_tool_named`` already applies for the same reason, which
+    this deliberately mirrors rather than re-inventing.
+
+    Still nothing wider than that: the separator must be a run of >= 2
+    underscores, so a crafted path/namespace tail (``"a/b/monitor_start"``,
+    ``"do_monitor_start"``) cannot smuggle a directive name in. The tool half
+    never authenticates the SERVER either way — :func:`directive_tool_for`
+    checks ``mcp_server_name`` independently, and that is the check a
+    third-party server fails.
     """
     if not raw:
         return ""
     if raw in DIRECTIVE_TOOLS:
         return raw
-    if "___" in raw:
-        tail = raw.rsplit("___", 1)[-1]
-        if tail in DIRECTIVE_TOOLS:
-            return tail
+    parts = _MCP_SEPARATOR_RE.split(raw)
+    if len(parts) > 1 and parts[-1] in DIRECTIVE_TOOLS:
+        return parts[-1]
     return ""
 
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import difflib
 import fnmatch
+import functools
 import hashlib
 import json
 import logging
@@ -218,12 +219,6 @@ def _emit_pending_consumed(payload: dict) -> None:
         logger.debug("pending-consumed hook failed", exc_info=True)
 
 
-# Derived lifecycle states for auto-skills (not persisted — computed from
-# usage recency at lifecycle-run time).
-SKILL_STATE_ACTIVE = "active"
-SKILL_STATE_STALE = "stale"
-SKILL_STATE_ARCHIVED = "archived"
-
 # Frontmatter field used to mark a skill as auto-generated.  Absence means
 # the skill is hand-authored (or legacy, pre-feature).
 AUTO_SKILL_SOURCE_VALUE = "auto"
@@ -278,24 +273,6 @@ class AutoSkillProvenance:
         if self.pinned:
             lines.append("pinned: true")
         return lines
-
-
-def _auto_name_from_title(raw: str) -> str:
-    """Convert a free-form title into a safe ``auto/<slug>`` skill name.
-
-    Strategy:
-    - lowercase
-    - replace any run of non-alphanumerics with a single hyphen
-    - strip leading/trailing hyphens
-    - truncate to 62 chars (leaves room for uniqueness suffix)
-
-    Returns the slug component only; caller prepends the namespace.
-    Returns an empty string if the input can't be sanitized.
-    """
-    slug = re.sub(r"[^a-z0-9]+", "-", raw.lower()).strip("-")[:62].rstrip("-")
-    if not _AUTO_NAME_PATTERN.match(slug):
-        return ""
-    return slug
 
 
 def _build_auto_skill_content(
@@ -595,6 +572,49 @@ def _walk_confined_skill_tree(base: Path) -> Iterator[tuple[str, list[str], list
         yield from _walk_confined_skill_fd(fd, base)
     finally:
         os.close(fd)
+
+
+def _disabled_app_names() -> frozenset[str]:
+    """Installed apps that are currently DISABLED.
+
+    Used to keep a disabled app's bundled skills out of trigger matching.
+    ``bridges`` registers each app skill under ``skills/<app>/<skill>`` (plus a
+    flat link), so the first path segment names the owning app.
+
+    Read once per matching pass rather than per skill: this runs on every
+    message, and ``is_app_enabled`` reads a JSON file per call. Failures return
+    an EMPTY set on purpose — the gate then hides nothing, which keeps a
+    transient read error from silently stripping an enabled app's skills.
+    Deferred import: ``apps.manager`` is a higher layer than this module.
+    """
+    try:
+        from kiro_crew.apps.manager import list_apps
+
+        return frozenset(
+            str(a.get("name")) for a in list_apps() if a.get("name") and not a.get("enabled")
+        )
+    except Exception:
+        logger.debug("skills: could not read app enablement", exc_info=True)
+        return frozenset()
+
+
+@functools.lru_cache(maxsize=None)
+def _builtin_dir_app_name(pkg_dir: str) -> str | None:
+    """The manifest name of the builtin app shipped in *pkg_dir*, or ``None``.
+
+    A shipped builtin's package directory is named for its Python package
+    (``auto_improvement``) while the app registry keys on the manifest name
+    (``auto-improvement``), so the mapping must come from the manifest itself —
+    the same source ``apps.discovery`` registers builtins from. Cached for the
+    process lifetime: the installed package tree is immutable while running,
+    and this is consulted from the per-message trigger-matching pass.
+    """
+    try:
+        with open(os.path.join(pkg_dir, "app.json"), encoding="utf-8") as fh:
+            name = json.load(fh).get("name")
+        return name if isinstance(name, str) and name else None
+    except Exception:
+        return None
 
 
 def _iter_skill_files(
@@ -1454,6 +1474,7 @@ class SkillsLoader:
         # slot would serve one session's project skills to a session working in
         # a different project for the whole TTL. (monotonic_deadline, results)
         self._iter_cache: dict[str, tuple[float, list[tuple[str, Path, str | None]]]] = {}
+        self._disabled_apps_cache: tuple[float, frozenset[str]] | None = None
         # (canonical key, allowed) pairs already audited, so the enforcement
         # record is written on first use rather than once per message.
         self._audited_projects: set[tuple[str, bool]] = set()
@@ -1596,6 +1617,27 @@ class SkillsLoader:
         self._iter_cache[key] = (time.monotonic() + _ITER_CACHE_TTL_SECS, results)
         return results
 
+    def _get_disabled_app_names(self) -> frozenset[str]:
+        now = time.monotonic()
+        if self._disabled_apps_cache is not None and now < self._disabled_apps_cache[0]:
+            return self._disabled_apps_cache[1]
+        disabled = _disabled_app_names()
+        self._disabled_apps_cache = (now + _ITER_CACHE_TTL_SECS, disabled)
+        return disabled
+
+    def _iter_visible(
+        self, project_dir: str | Path | None = None
+    ) -> list[tuple[str, Path, str | None]]:
+        """Return all ``(name, skill_file, within)`` pairs, filtering out disabled app skills."""
+        disabled_apps = self._get_disabled_app_names()
+        if not disabled_apps:
+            return self._iter(project_dir)
+        return [
+            (name, skill_file, within)
+            for name, skill_file, within in self._iter(project_dir)
+            if self._owning_app(name, skill_file) not in disabled_apps
+        ]
+
     def catalog_project_skills(self, project_dir: str | Path) -> list[dict]:
         """Return confined project rows without requiring or exercising trust.
 
@@ -1629,7 +1671,7 @@ class SkillsLoader:
                     "description": description,
                     "path": str(skill_file),
                     "dir": str(skill_file.parent),
-                    "always": meta.get("always", "").lower() == "true",
+                    "always": meta.get("always", "").strip().lower() == "true",
                     "repo_scope": repo_scope,
                     # Project paths cannot safely offer a live pointer to the
                     # agent, so report the effective forced-body behavior.
@@ -1703,6 +1745,7 @@ class SkillsLoader:
         stale parse. Dropping it here keeps the mutator's edit immediately
         reflected in ``list_skills`` / ``get_triggered_skills``.
         """
+        self._disabled_apps_cache = None
         self._iter_cache = {}
         self._fm_cache.clear()
 
@@ -1856,7 +1899,7 @@ class SkillsLoader:
         size and cache token come from bytes admitted by the no-link reader.
         """
         skills: list[dict] = []
-        for name, skill_file, _within in self._iter(project_dir):
+        for name, skill_file, _within in self._iter_visible(project_dir):
             if _within is not None:
                 meta, size_bytes = self._confined_frontmatter_and_size(skill_file, _within)
             else:
@@ -1880,12 +1923,15 @@ class SkillsLoader:
                     "description": meta.get("description", name),
                     "path": str(skill_file),
                     "dir": str(skill_file.parent),
-                    "always": meta.get("always", "").lower() == "true",
+                    "always": meta.get("always", "").strip().lower() == "true",
                     # Carried so a caller assembling context can drop a
                     # repo-scoped skill from the INDEX, not just from the
                     # injected body: a summary line the agent is told to read
-                    # advertises the skill just as effectively.
-                    "repo_scope": meta.get("repo_scope", ""),
+                    # advertises the skill just as effectively. Stripped because
+                    # the consumer guards on this value's truthiness before
+                    # calling the gate, so it has to agree with the other two
+                    # gate call sites about what counts as "no scope at all".
+                    "repo_scope": meta.get("repo_scope", "").strip(),
                     # Mirrors split_triggered: confined project rows always use
                     # the body; only an explicit `false` on an unconfined skill
                     # opts out. A malformed value therefore reads as injecting.
@@ -1899,6 +1945,47 @@ class SkillsLoader:
                 }
             )
         return skills
+
+    def _owning_app(self, name: str, skill_file: Path) -> str | None:
+        """The app whose bundle this skill came from, or ``None``.
+
+        Two shapes have to resolve to the same owner, because ``bridges``
+        registers every app skill twice and either registration can be the one
+        this walk kept (see ``_iter_skill_files``'s ``seen_real`` note):
+
+        * the namespaced ``skills/<app>/<skill>`` directory — the first segment
+          of ``name`` IS the app;
+        * the flat ``skills/<skill>`` link, whose name says nothing — so the
+          real path is consulted. An externally installed app resolves under
+          the data home's apps root, where the directory name IS the app name.
+          A shipped BUILTIN resolves inside the package tree
+          (``…/apps/builtins/<pkg dir>/skills/…``), and its package directory
+          (``auto_improvement``) is not its app name (``auto-improvement``) —
+          the manifest in that directory is the authoritative mapping (see
+          ``apps.discovery``).
+
+        Path-shaped, not manifest-keyed, on purpose: it must answer for a
+        third-party app just as well as a builtin, and the registration layout
+        is the one thing every app shares.
+        """
+        head = name.split("/", 1)[0]
+        if head != name:
+            return head
+        try:
+            from kiro_crew.apps.manager import apps_dir
+
+            real = Path(os.path.realpath(skill_file))
+            root = apps_dir()
+            if real.is_relative_to(root):
+                # <apps root>/<app>/... — the segment directly under the root.
+                return real.relative_to(root).parts[0]
+            builtins_root = Path(os.path.realpath(Path(__file__).parent)) / "apps" / "builtins"
+            if real.is_relative_to(builtins_root):
+                pkg_dir = builtins_root / real.relative_to(builtins_root).parts[0]
+                return _builtin_dir_app_name(str(pkg_dir))
+        except Exception:
+            return None
+        return None
 
     def _owned_hint(self, skill_file: Path) -> bool:
         """Whether *skill_file* sits under the directory Kiro Crew owns.
@@ -2741,7 +2828,7 @@ class SkillsLoader:
             # recorded rather than reading it unconfined for a ranking signal.
             meta = self._cached_frontmatter(Path(s["path"]), within=s.get("confine_root"))
             hits, anchor = self._auto_activity(key, s["path"], meta)
-            pinned = str(meta.get("pinned", "")).lower() == "true"
+            pinned = str(meta.get("pinned", "")).strip().lower() == "true"
             slug = key.split("/")[-1]
             exempt_row = (
                 pinned
@@ -3903,10 +3990,18 @@ class SkillsLoader:
         to the process working directory).
         """
         result: list[str] = []
-        for name, skill_file, _within in self._iter(project_dir):
+        for name, skill_file, _within in self._iter_visible(project_dir):
             meta = self._cached_frontmatter(skill_file, within=_within)
-            if meta.get("always", "").lower() == "true":
-                scope = meta.get("repo_scope", "")
+            if meta.get("always", "").strip().lower() == "true":
+                # Stripped so a whitespace-only value means "no scope" here exactly as it
+                # does at the other two gate call sites. The guard below tests this
+                # value's TRUTHINESS, and `repo_scope: |` over a blank line now resolves
+                # to a break rather than to "" -- truthy, so the gate would be handed
+                # whitespace and refuse it, suppressing a skill its author never scoped.
+                # A trailing break on a real path is NOT the concern:
+                # `project_scope_satisfied` strips its own fragment, so `src/x\n` was
+                # always gated as `src/x`.
+                scope = meta.get("repo_scope", "").strip()
                 if scope and not self._repo_scope_satisfied(scope, project_dir):
                     continue
                 result.append(name)
@@ -3938,22 +4033,23 @@ class SkillsLoader:
         Returns up to ``max_triggered`` skills sorted by best overlap score.
         """
         text_words = set(re.findall(r"\w+", text.lower()))
-
         scored: list[tuple[str, float]] = []
         # Skills a negative trigger actively excluded — a permission DENY that
         # must still be audited (see the audit event below).
         negated_skills: list[str] = []
-        for name, skill_file, _within in self._iter(project_dir):
+        for name, skill_file, _within in self._iter_visible(project_dir):
             meta = self._cached_frontmatter(skill_file, within=_within)
-            if meta.get("always", "").lower() == "true":
+            if meta.get("always", "").strip().lower() == "true":
                 continue
             triggers = meta.get("triggers", "")
             if not triggers:
                 continue
             # Repo-scoped skills are mechanically suppressed outside their
             # repo — word-overlap can fire on ordinary user phrasing, and a
-            # prose scope guard alone is probabilistic.
-            scope = meta.get("repo_scope", "")
+            # prose scope guard alone is probabilistic. Stripped so a
+            # whitespace-only value reads as "no scope" at every gate call site
+            # (see the always-on lister for why the truthiness test needs it).
+            scope = meta.get("repo_scope", "").strip()
             if scope and not self._repo_scope_satisfied(scope, project_dir):
                 continue
 
@@ -4488,7 +4584,7 @@ class SkillsLoader:
         # _iter() already applies local > extra-path precedence and dedupes
         # by full key, so the first full key seen for a given leaf wins.
         leaf_to_name: dict[str, str] = {}
-        for name, _path, _within in self._iter(project_dir):
+        for name, skill_file, _within in self._iter_visible(project_dir):
             leaf = name.rsplit("/", 1)[-1].lower()
             leaf_to_name.setdefault(leaf, name)
 
@@ -4576,13 +4672,19 @@ class SkillsLoader:
         """Remove YAML frontmatter from markdown.
 
         A fence LOCATOR, not a field parser — deliberately outside
-        ``kiro_crew.frontmatter``. Its closer grammar is stricter than
-        ``_parse_frontmatter``'s (``---`` must be followed by a newline), so
-        a ``---junk`` closer parses fields yet strips nothing; editing either
-        grammar means revisiting the other.
+        ``kiro_crew.frontmatter``. Its closer grammar matches
+        ``frontmatter._COLUMN0_BLOCK_RE`` — the ``column0_fence`` extraction
+        that ``frontmatter.SKILL_LOADER`` binds to the skills surface: the
+        closer is the first line after the opener that STARTS with ``---`` —
+        trailing text on the closer line is tolerated and consumed (#6182). Anything
+        the display parser reads as frontmatter must also be stripped here:
+        a stricter closer (the old ``---`` must-be-followed-by-newline
+        grammar) let a ``---junk`` or ``--- `` closer parse fields in the UI
+        while the whole block leaked to the model. Editing either grammar
+        means revisiting the other.
         """
         if content.startswith("---"):
-            match = re.match(r"^---\n.*?\n---\n", content, re.DOTALL)
+            match = re.match(r"^---\n.*?\n---[^\n]*\n?", content, re.DOTALL)
             if match:
                 return content[match.end() :].strip()
         return content

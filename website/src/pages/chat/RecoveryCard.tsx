@@ -4,6 +4,7 @@ import { ChevronRight, Info, Layers, RotateCcw, TriangleAlert } from 'lucide-rea
 import { i18nT } from '../../i18n/t'
 import { DENY_REASON_MARKER } from '../../utils/denyReason'
 import { useRowDisclosure } from './rowDisclosure'
+import { useLanguageGeneration } from '../../i18n/useLanguageGeneration'
 
 /**
  * The synthetic-continuation prefixes the gateway prepends when it recovers a
@@ -269,10 +270,18 @@ export function parseRecoveryMessage(content: string): ParsedRecovery | null {
   // `tool_blocked` carries its DENY CAUSE on the marker line, the way
   // `hook_halted` carries `#<depth>`. Read here rather than in that branch so the
   // generic marker slice stays the single place the first line is parsed.
-  const markerCause = raw
-    .slice(prefix.length)
-    .split('\n', 1)[0]
-    .trim()
+  const afterMarker = raw.slice(prefix.length)
+  const markerNewline = afterMarker.indexOf('\n')
+  const markerCause = (
+    markerNewline === -1 ? afterMarker : afterMarker.slice(0, markerNewline)
+  ).trim()
+  // The cause is a WIRE token (`policy`, `invalid_name`, `hook_error`), consumed
+  // above to pick the summary wording. It must not also survive as the first
+  // line of the expanded body, where it reads as machine noise above the host
+  // notice -- `hook_halted` strips its own marker line for the same reason.
+  // Rows written before the cause was added carry an empty marker line, and
+  // this drops that instead, which is what the generic `.trim()` did for them.
+  const blockedBody = markerNewline === -1 ? '' : afterMarker.slice(markerNewline + 1).trim()
   const patterns = new Set<string>()
   for (const m of body.matchAll(POLICY_RE)) patterns.add(m[1])
   const distinct = [...patterns]
@@ -304,7 +313,7 @@ export function parseRecoveryMessage(content: string): ParsedRecovery | null {
       // the policy wording, matching the backend's own cause default.
       detail: i18nT(TOOL_BLOCKED_DETAIL[markerCause] ?? TOOL_BLOCKED_DETAIL.policy),
       chip,
-      body,
+      body: blockedBody,
     }
   }
   return {
@@ -389,6 +398,7 @@ export function resolveInjectCard(m: { content: string; meta?: Record<string, un
  * NudgeCard.
  */
 export default memo(function RecoveryCard({ parsed, disclosureKey }: { parsed: ParsedRecovery; disclosureKey?: string }) {
+  useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const [expanded, setExpanded] = useRowDisclosure(disclosureKey, false)
   const { kind, title, detail, chip, body } = parsed
   // Severity split: a refusal or a stall means something was blocked or died and
@@ -430,7 +440,7 @@ export default memo(function RecoveryCard({ parsed, disclosureKey }: { parsed: P
         // one thing a screen-reader user would otherwise have to expand the raw
         // machine prose to learn. The inner text names the button (matching what
         // sighted users read) and aria-expanded carries the toggle state.
-        className="w-full flex items-center gap-2 px-3 py-2 min-w-0 text-left text-[13px] leading-5 hover:text-fg transition-colors"
+        className="w-full flex items-center gap-2 px-3 py-2 min-w-0 text-left text-[13px] leading-5 hover:text-text transition-colors"
         data-testid="recovery-card-toggle"
       >
         <ChevronRight
@@ -440,10 +450,10 @@ export default memo(function RecoveryCard({ parsed, disclosureKey }: { parsed: P
         />
         <Icon
           size={13}
-          className={`lucide-inline shrink-0 ${routine ? 'text-muted' : 'text-warning'}`}
+          className={`lucide-inline shrink-0 ${routine ? 'text-muted' : 'text-warn'}`}
           aria-hidden="true"
         />
-        <span className="font-medium text-fg shrink-0">{title}</span>
+        <span className="font-medium text-text shrink-0">{title}</span>
         <span className="truncate text-[12px] leading-5 opacity-75 min-w-0">{detail}</span>
         {chip && (
           <code

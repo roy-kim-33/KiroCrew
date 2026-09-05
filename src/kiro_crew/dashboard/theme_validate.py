@@ -86,6 +86,12 @@ _THEME_CSS_VARS = (
     "--shadow-sm",
     "--shadow-md",
     "--shadow-lg",
+    # Terminal ANSI hues. The other fourteen entries the built-in terminal needs
+    # are derived from --bg / --text / --danger / --ok / --warn / --info above;
+    # magenta and cyan carry no semantic meaning elsewhere in the UI, so a pack
+    # that wants its own terminal palette sets these two.
+    "--term-magenta",
+    "--term-cyan",
 )
 
 
@@ -1600,7 +1606,3 @@ def _resolve_theme_asset(slug: str, subpath: str) -> tuple[Path | None, str | No
     if not target.is_file() or target.is_symlink():
         return None, "not found"
     return target, None
-
-
-def _read_theme_text(target: Path) -> str:
-    return target.read_text(encoding="utf-8", errors="replace")

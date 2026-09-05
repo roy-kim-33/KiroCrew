@@ -109,6 +109,18 @@ class ServiceUrlStore:
         """The conversation a given (lowercased) identity was last seen in."""
         return self._by_identity.get(identity.lower(), "")
 
+    @property
+    def loaded(self) -> bool:
+        """Whether the persisted rows have been read yet.
+
+        Exposed for a SYNCHRONOUS caller that must tell "this conversation is not
+        in the store" from "the store has not been read yet". The two look
+        identical through :meth:`get` and :meth:`conversation_for`, and treating
+        the second as the first turns a route that is on disk into a route that
+        does not exist. See ``TeamsTransport.may_send_to``.
+        """
+        return self._loaded
+
     async def ensure_loaded(self) -> None:
         """Populate from disk once, off-loop. Never raises."""
         if self._loaded:
@@ -269,7 +281,9 @@ class ServiceUrlStore:
         conversations = data.get("conversations") if isinstance(data, dict) else None
         if not isinstance(conversations, dict):
             return empty
-        identities = data.get("identities") if isinstance(data, dict) else None
+        # ``data`` is a dict by here: any other payload leaves ``conversations``
+        # None and returns above.
+        identities = data.get("identities")
         by_identity = {
             key.lower(): value
             for key, value in (identities or {}).items()

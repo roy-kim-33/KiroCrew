@@ -56,13 +56,14 @@ import urllib.parse
 from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Any
 
-from kiro_crew.constants import OPTIONS_RE_TRAILER, split_trailing_protocol_suffix
+from kiro_crew.constants import split_trailing_protocol_suffix
 from kiro_crew.discord.client import (
     DISCORD_MAX_FILE_BYTES,
     DISCORD_MAX_FILES_PER_MESSAGE,
     DISCORD_MAX_TEXT,
     DISCORD_MAX_TOTAL_UPLOAD_BYTES,
 )
+from kiro_crew.messaging.approval import APPROVAL_TIMEOUT_S
 from kiro_crew.messaging.display_safety import redact_for_display
 from kiro_crew.messaging.outbound_files import (
     ExtractLimits,
@@ -77,6 +78,8 @@ from kiro_crew.messaging.renderer import (
     apply_options_cap,
     chunk_text,
     new_approval_nonce,
+    session_provenance_tag,
+    split_options_trailer,
 )
 from kiro_crew.messaging.split import split_markdown_safe
 from kiro_crew.messaging.status_reactions import (
@@ -128,7 +131,8 @@ _TYPING_REFRESH_S = 8.0
 _EDIT_THROTTLE_S = 1.2
 
 # Interactive approval wait; deny-by-default when it elapses with no press.
-_APPROVAL_TIMEOUT_S = 300.0
+# Owned by messaging.approval so every channel's window is the same one.
+_APPROVAL_TIMEOUT_S = APPROVAL_TIMEOUT_S
 
 #: Phase → reaction for the shared status ladder. Unicode only: Discord's
 #: reaction route takes the emoji itself as a path segment, so a Slack-style
@@ -168,14 +172,6 @@ _MAX_BUTTONS = _BUTTONS_PER_ROW * _MAX_ACTION_ROWS
 #: Component-spec ceiling on a button label.
 _BUTTON_LABEL_CHARS = 80
 
-# Trailing "[OPTIONS: a | b | c]" -- extracted for button-row rendering. Matched
-# only at the very END of the message, so use the DOTALL/trailer canonical
-# parser. Defined once in constants.py (shared with the Slack/dashboard/Telegram/
-# WeCom surfaces) so the ReDoS-hardened grammar can never drift; see
-# OPTIONS_RE_TRAILER for the full rationale. Per-choice whitespace is stripped by
-# the caller.
-_OPTIONS_RE = OPTIONS_RE_TRAILER
-
 # kiro-cli's inline "[STEERING steer-<id>: …]" steer-ack marker (see the
 # Telegram renderer for the full rationale — Discord likewise has no parser).
 _STEER_MARKER_RE = re.compile(r"\[STEERING\b[^\]\r\n]*\]", re.IGNORECASE)
@@ -183,17 +179,13 @@ _STEER_SUMMARY_RE = re.compile(r"\[STEERING\s+steer-[0-9a-f]+\s*:\s*([^\]\r\n]*)
 
 
 def _extract_options(text: str) -> tuple[str, list[str]]:
-    """Split text into (body, options). Handles the streamed partial too."""
-    m = _OPTIONS_RE.search(text)
-    if m:
-        body = text[: m.start()].rstrip()
-        options = [o.strip() for o in m.group(1).split("|") if o.strip()]
-        return body, options
-    # Hold back an incomplete "[OPTIONS…" fragment mid-stream.
-    idx = text.rfind("[OPTIONS")
-    if idx != -1 and "]" not in text[idx:]:
-        return text[:idx].rstrip(), []
-    return text, []
+    """Split text into ``(body, options)``, holding back a streamed partial.
+
+    ``hide_partial=True`` because this renderer STREAMS: a still-arriving
+    ``[OPTIONS…`` fragment really may be a marker mid-flight, and the next frame
+    re-renders from the full buffer, so hiding it costs nothing permanent.
+    """
+    return split_options_trailer(text, hide_partial=True)
 
 
 def _strip_steering(text: str) -> str:
@@ -278,17 +270,20 @@ def _neutralize_md(raw: str) -> str:
     return re.sub(r"[*_`\[\]()]", "", t)
 
 
-def build_option_components(options: list[str]) -> list[dict] | None:
+def build_option_components(options: list[str], origin_tag: str = "") -> list[dict] | None:
     """Build Discord button action rows from ``[OPTIONS:]`` labels.
 
-    ``custom_id`` is the index only (``opt:<i>``) -- Discord caps it at 100
-    chars and the label is recovered from the button text at interaction time.
-    Labels cap at 80 chars per the component spec. The ``max_buttons`` cap is
-    applied UPSTREAM via ``apply_options_cap`` (overflow degrades to numbered
-    text); the slice below is the platform hard-limit backstop only.
+    ``custom_id`` is ``opt:<i>:<origin_tag>`` (``opt:<i>`` when no tag is given --
+    the pre-provenance legacy shape) -- Discord caps it at 100 chars, which the
+    12-hex tag fits comfortably, and the label is recovered from the button text
+    at interaction time. Labels cap at 80 chars per the component spec. The
+    ``max_buttons`` cap is applied UPSTREAM via ``apply_options_cap`` (overflow
+    degrades to numbered text); the slice below is the platform hard-limit
+    backstop only.
     """
     if not options:
         return None
+    suffix = f":{origin_tag}" if origin_tag else ""
     rows: list[dict] = []
     row: list[dict] = []
     for i, opt in enumerate(options[:_MAX_BUTTONS]):
@@ -297,7 +292,7 @@ def build_option_components(options: list[str]) -> list[dict] | None:
                 "type": 2,  # button
                 "style": _STYLE_SECONDARY,
                 "label": opt[:_BUTTON_LABEL_CHARS],
-                "custom_id": f"opt:{i}",
+                "custom_id": f"opt:{i}{suffix}",
             }
         )
         if len(row) == _BUTTONS_PER_ROW:
@@ -712,7 +707,11 @@ class DiscordRenderer(Renderer):
         # the rotation above ran before that expansion -- re-check, or a
         # near-limit answer with over-cap options seals past the transport cap.
         await self._rotate_on_length()
-        components = build_option_components(opts) if opts else None
+        components = (
+            build_option_components(opts, session_provenance_tag(self._session_key))
+            if opts
+            else None
+        )
         sealed = bool(self._segment_text().strip()) or components is not None
         await self._seal_current(components=components)
         clean_summary = _neutralize_md(summary)
@@ -1109,6 +1108,7 @@ class DiscordRenderer(Renderer):
         request_id: str | int,
         tool_title: str = "",
         tool_purpose: str = "",
+        tool_input: str = "",
     ) -> None:
         # Approve/Deny as a SEPARATE message so ongoing streaming edits to the
         # answer bubble don't clobber the buttons. custom_id carries a
@@ -1197,7 +1197,11 @@ class DiscordRenderer(Renderer):
         body_text, opts = apply_options_cap(self._segment_text(), opts, self.capabilities)
         self._buf = []
         self._delivery_text = body_text
-        components = build_option_components(opts) if opts else None
+        components = (
+            build_option_components(opts, session_provenance_tag(self._session_key))
+            if opts
+            else None
+        )
         # No-rotation fallback: steers were injected but no marker rotated —
         # prepend one summary chip so they're still shown.
         if self._seal_count == 0 and self._steer_texts:
@@ -1309,9 +1313,3 @@ class DiscordRenderer(Renderer):
         ladder, self._ladder = self._ladder, None
         if ladder is not None:
             await ladder.close()
-
-    # -- helpers ------------------------------------------------------------
-    def _options(self) -> list[str]:
-        raw = "".join(self._buf).strip()
-        _, opts = _extract_options(raw)
-        return opts

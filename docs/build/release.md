@@ -64,18 +64,70 @@ rebuild that hopes for reproducibility. The mechanism:
   channel-sticky.
 - **Stable DISPLAYS a clean base version even though the bytes keep the RC
   stamp.** The embedded version cannot change under promotion, so the remedy is
-  at the read layer: `_display_version()` in
-  `src/kiro_crew/dashboard/handlers/updates.py` folds the running version to its
-  bare `X.Y.Z` on the **stable** channel only (insider/nightly keep the full
-  stamp), so About and the Releases page show `0.4.0`, not `0.4.0rc3` /
-  `0.4.0-insider.3`. It is DISPLAY-ONLY — every version *comparison* still reads
-  the raw `__version__`, so it cannot cause an update loop —
-  `test/test_stable_version_display.py` is the regression gate. **This fix must
-  ride in the RC bytes**: promotion never rebuilds, so a display change added
-  after the RC is cut can never reach the promoted stable. Land it before the RC
-  is cut, or stable shows the RC stamp with no in-band remedy.
+  at the read layer, and it is a CONTRACT over every surface, not a fix at two
+  spots — the 0.4.0 promotion shipped with only the running-version fold wired,
+  and users then reported the raw stamp on four other surfaces one by one (the
+  About panel's available-update line, the version chip, the Settings footer,
+  and the proactive update popup), each needing its own hotfix.
+
+  The contract:
+
+  - *Fold rule*: `_display_version()` in
+    `src/kiro_crew/dashboard/handlers/updates.py` folds a version to its bare
+    `X.Y.Z` on the **stable** channel only (insider/nightly keep the full
+    stamp, where the prerelease number is meaningful information). The SPA
+    mirror for desktop-reported versions that never cross the gateway is
+    `website/src/utils/displayVersion.ts` — keep it the ONLY TypeScript
+    spelling.
+  - *Every RAW version field is functional and must never be folded in place*:
+    `__version__` and the status frame's `version` (the SPA compares it across
+    pushes to force a reload over a gateway upgrade), `latest_version` /
+    `update_latest_version` (the arm target `verify_shadow_venv` compares
+    byte-for-byte, and the update popup's per-version snooze/skip keys),
+    Electron's `info.version` (`versionLooksPrerelease` derives the update lane
+    from the `-` suffix), and every `_is_newer` / floor comparison. Folding one
+    of these in place broke the entire stable in-app apply path once (caught in
+    review); folding the snooze key would make dismissing `0.4.0` swallow the
+    next release's rc candidate.
+  - *Display therefore always reads a folded SIBLING field, never the raw one*:
+    `version_display` and `update_latest_version_display` on the status frame,
+    `latest_version_display` on `/api/update/check` and the channel-switch
+    response, `current_version` on the check response. **Any NEW surface that
+    prints a version to the user must consume one of these (with a raw
+    fallback for older gateways) or add its own sibling — never render a raw
+    field directly.** A UI review that sees `status?.version`,
+    `update_latest_version`, or `info?.version` in display JSX should treat it
+    as a bug.
+
+  `test/test_stable_version_display.py`, the `version_display` /
+  `update_latest_version_display` tests in
+  `test/test_dashboard_status_snapshot.py`, and the AboutPanel /
+  UpdateFoundModal / SettingsPage frontend tests are the regression gates.
+  **The whole fold family must ride in the RC bytes**: promotion never
+  rebuilds, so a display change added after the RC is cut can never reach the
+  promoted stable. Land it before the RC is cut, or stable shows the RC stamp
+  with no in-band remedy.
 - **Hot patches follow the same rule**: at least one recorded RC before the
-  bare patch tag.
+  bare patch tag. A hot patch is the NEXT three-segment version (`0.4.0` →
+  `0.4.1`): the release workflow's Derive-Version step rejects a four-segment
+  base like `0.4.0.1` outright, and re-using the shipped version is impossible —
+  its published keys are immutable.
+- **A hotfix RC never moves the insider channel backward.** The channel feeds
+  are mutable last-writer-wins pointers, and the insider line is usually AHEAD
+  of the line being hotfixed — when `v0.4.1-insider.1` published while insider
+  served `0.5.0-insider.1`, the feed rolled back and every insider client was
+  offered a downgrade (electron-updater accepts one whenever the installed
+  version carries a prerelease suffix). Every publish workflow now runs
+  `scripts/check_feed_advance.py` before its pointer writes: the versioned
+  assets and the GitHub release always publish (that is what the stable gate
+  and promotion consume), but the feed, the legacy mac feed, and the `latest/`
+  aliases are rewritten only when this run's version is the newest the channel
+  has seen — judged against the live feed (via the public CDN; the publish
+  role is Put-only on `feed/*`) AND the repo's tags, which close the CDN's
+  `max-age` staleness window. Equal versions advance, so re-running a
+  half-finished publish stays idempotent. Promotion is unaffected: a stable
+  bare tag is newer than everything the stable feed has served.
+  `test/test_check_feed_advance.py` pins the verdicts and the wiring.
 
 ### Runbook: promoting an RC to stable
 
@@ -84,6 +136,12 @@ anything a stable user will see must already be in the RC that gets promoted** �
 there is no build step at stable-tag time to add it.
 
 1. **Before the RC is cut — bake the fix in.**
+   - *Version drop PR*: merge the PR that changes `__version__` from
+     `X.Y.Z-rc.N` to the bare `X.Y.Z` in all three version files — step 1 of
+     the three-step sequence in "Version numbering policy". **This PR is what
+     makes the next RC a promotion candidate**; the 0.4.0 promotion was nearly
+     tagged before it existed because this step lived only in the policy
+     section, not here. The checklist in step 2 below verifies it landed.
    - *CHANGELOG*: the release branch already carries `## [X.Y.Z] — <date>` (no
      `[Unreleased]`, enforced by the changelog gate). Confirm at cut time.
    - *Version display*: the base-version fold above must be merged to `main`
@@ -92,8 +150,14 @@ there is no build step at stable-tag time to add it.
 2. **Cut the RC — verify content, not PR status.** On the target commit confirm:
    `github-release` has an `if:`; `CHANGELOG.md` line 5 is `## [X.Y.Z]` with zero
    non-bare-release `##` headings; exactly one `### Contributors`;
-   `__version__ = "X.Y.Z"`; the bytecode/pycache test fix is present; the
-   base-version fold is present (stable About shows `X.Y.Z`); no existing bare
+   `__version__ = "X.Y.Z"` **in all three version files** (`src/kiro_crew/__init__.py`,
+   `pyproject.toml`, `website/electron/package.json` — the 0.4.0 promotion was
+   nearly tagged on a commit still declaring `0.4.0-rc.9` because only the tag
+   name was checked); the bytecode/pycache test fix is present; the display-fold
+   contract above is fully present (run the regression gates:
+   `test_stable_version_display.py` + the `version_display` tests — a stamped
+   stable build must show `X.Y.Z` on the version chip, the Settings footer, the
+   available-update line, AND the update popup); no existing bare
    `vX.Y.Z` tag. Then tag `vX.Y.Z-insider.N`.
 3. **Soak.** Ship the RC on insider and let real users run it. **Do not push any
    byte-affecting change to the release branch between soak and promote** — the
@@ -506,6 +570,48 @@ against that pinned key using the same `cli-manifest.py verify` checks the
 installer runs. A channel serving no feed at all is skipped with a warning,
 since publishing is not a regression for it.
 
+### Breaking releases: the forced-update floor
+
+A release that older clients must not keep running against (a feed-schema
+break, a protocol break, a data migration without back-compat) declares a
+**minimum supported version** in [`packaging/MIN_VERSION`](../../packaging/MIN_VERSION):
+one bare release version on its own line (comments and blank lines are
+ignored; more than one value line fails the publish). Every CLI feed manifest
+published from a commit carrying that value embeds it as the optional signed
+`min_version` field.
+
+What each consumer does with it:
+
+- **Running gateways** compare the floor against their own version on the
+  normal feed check — after verifying the manifest's signature against the
+  same pinned key the installer uses (`platform/feed_trust.py`), because the
+  floor coerces the UI and a tampered feed must not be able to hold every
+  dashboard hostage. Versions are folded per channel first (a promoted
+  stable build's `0.3.0rc13` stamp IS the `0.3.0` release). Below the floor,
+  `update_required` turns true on the status frame and
+  `GET /api/update/check`, and the dashboard's proactive update modal drops
+  its snooze/skip/Escape affordances — the prompt stays up until the install
+  is updated. The gateway itself keeps running, and every verification or
+  parse failure degrades to the ordinary dismissible prompt: the floor fails
+  toward freedom, never toward coercion.
+- **The installer** verifies the field's format and otherwise ignores it — it
+  always installs the signed version, which is exactly how a floored install
+  gets satisfied.
+- **The enterprise governance pin** (`updates.min_version` in
+  `security_policy.json`) is independent and OR'd with the feed floor;
+  either alone makes the update mandatory.
+
+Rules for setting the floor:
+
+- Set it to the first version old clients can safely land on — usually the
+  breaking release itself.
+- Never set it in the same release that introduces floor support: clients
+  only learn to read the field after updating once, so a floor only moves
+  clients that already run a floor-aware build.
+- Clear or lower it only to roll back a mistake; installs above the floor are
+  never affected. `cli-manifest.py` refuses a floor above the manifest's own
+  version and any non-bare-release value at publish time.
+
 ### Installing and switching channels
 
 ```bash
@@ -559,10 +665,18 @@ Two Windows details do not generalise from the other platforms:
   Windows arch is a second entry inside that one file, never a second feed, and
   it also has to contend with `Provider.findFile()` disambiguating entries by
   matching `process.arch` against the URL path.
-- **`quitAndInstall` passes `isSilent` on win32 only.** `NsisUpdater` adds `/S`
-  only when silent, and the installer is assisted (`nsis.oneClick: false`), so
-  without it the app would quit and then wait for the user to click through a
-  setup wizard rather than swapping silently the way macOS and Linux do.
+- **Windows updates are visible but non-interactive.** `quitAndInstall` passes
+  `isSilent=false` and `isForceRunAfter=true`. The assisted installer
+  (`nsis.oneClick: false`) uses update-only hooks in `installer.nsh` to skip the
+  Welcome, install-mode, and Finish decisions, leaving only the native
+  extraction page and its real progress visible. At completion it runs the
+  locked electron-builder `StartApp` contract and exits successfully. The same
+  hooks call `SetSilent normal` for `/S --updated`, so a client released before
+  this behavior change also gets visible progress on its first upgrade into it.
+  The downloaded installer owns this UI contract: a downgrade or channel
+  switch-back to an installer that predates these hooks shows that release's
+  legacy assisted wizard instead, so operators and users must retain the
+  install scope detected by that wizard.
 
 `SUPPORTED_PLATFORMS` is necessary but not sufficient: a channel can lack a
 desktop publish lane entirely, which is what `KNOWN_CHANNELS` and
@@ -621,7 +735,10 @@ those installs permanently with a manual DMG re-download as the only escape.
 safe to remove once no pre-migration installs remain.
 
 Four updater policy flags each differ from the library default on purpose:
-`autoDownload=false` (consent-first: discovery must never pull megabytes),
+`autoDownload=false` (the library must never fetch from inside
+`checkForUpdates`; whether a discovered update downloads without a click is a
+separate preference read per discovery, and keeping the flag false is what
+routes the automatic and the consented download through one guarded function),
 `autoInstallOnAppQuit=false` (the default would swap the bundle on quit without
 stopping the embedded Python gateway), `allowDowngrade=true` (the gate is
 difference-based, so a feed pointed at an older version is offered, which is
@@ -629,6 +746,24 @@ what makes a channel switch-back work), and `allowPrerelease=true` (every
 nightly and insider stamp is a semver prerelease and would otherwise be
 invisible to its own channel). The library still refuses an equal version before
 the `allowDowngrade` branch, which is what prevents a self-reinstall loop.
+
+**Desktop updates download automatically by default, and install on the next
+quit.** The `autoDownloadUpdates` preference (electron-store, default `true`,
+opt out in Settings → About) decides whether the `update-available` handler
+calls `startDownload()` itself. The INSTALL is not made automatic by this: the
+existing `update-downloaded` handler arms a `before-quit` install that stops the
+gateway first, so a downloaded update lands on the user's own next quit rather
+than interrupting a live session. `autoInstallOnAppQuit` stays false on every
+platform — on macOS that flag stages eagerly, which arms ShipIt to swap the
+bundle on ANY exit (including exits that skip the gateway teardown) and cannot
+be un-armed, so it would also defeat release retraction.
+
+Turning the preference off keeps bytes already fetched but **disarms the
+install-on-quit for a stage that was downloaded automatically**, so the update a
+user just declined does not land on their next quit; a stage they explicitly
+downloaded stays armed, because the preference is not what put it there. The
+stage itself is never discarded, so an explicit Install still applies it with
+nothing to re-download.
 
 **Which channel a build follows is a default plus an opt-in, not a property of
 the bytes.** `channelForVersion()` classifies the version stamp and `nightly`

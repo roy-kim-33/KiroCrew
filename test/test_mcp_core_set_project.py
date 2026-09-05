@@ -266,7 +266,12 @@ class TestSetProjectApplier:
         state = _FakeState()
         target = str(tmp_path)
         result = await apply_session_directive(
-            state, slot, slot.key, "set_project", {"project": target, "clear": False}
+            state,
+            slot,
+            slot.key,
+            "set_project",
+            {"project": target, "clear": False},
+            producer_is_user_facing=True,
         )
         assert slot.project == os.path.realpath(target)
         assert slot._pending_reset_history_key is not None
@@ -283,10 +288,41 @@ class TestSetProjectApplier:
             "kiro_crew.security.is_sensitive_path", lambda *a, **k: True
         )
         result = await apply_session_directive(
-            state, slot, slot.key, "set_project", {"project": str(tmp_path), "clear": False}
+            state,
+            slot,
+            slot.key,
+            "set_project",
+            {"project": str(tmp_path), "clear": False},
+            producer_is_user_facing=True,
         )
         assert "access denied" in result.lower()
         # Load-bearing: the slot was NOT repointed to the sensitive path.
+        assert slot.project == "/existing/project"
+
+    @pytest.mark.asyncio
+    async def test_data_home_overlap_refused_without_mutating_slot(self, tmp_path, monkeypatch):
+        """#7392 pre-flight on the directive path: set_project routes here
+        in-process (never through the HTTP endpoint), so the overlap check
+        must also live here or the refusal regresses to spawn time on every
+        channel surface (FP review round 1). Patched on the source module —
+        _set_project imports it lazily from kiro_crew.sandbox."""
+        slot = _FakeSlot(project="/existing/project")
+        state = _FakeState()
+        monkeypatch.setattr(
+            "kiro_crew.sandbox.voice_runtime_workspace_conflict",
+            lambda *a, **k: "macOS agent workspace overlaps the protected voice runtime",
+        )
+        result = await apply_session_directive(
+            state,
+            slot,
+            slot.key,
+            "set_project",
+            {"project": str(tmp_path), "clear": False},
+            producer_is_user_facing=True,
+        )
+        assert result.startswith("Error:")
+        assert "voice runtime" in result
+        # Load-bearing: the slot was NOT repointed to the overlapping path.
         assert slot.project == "/existing/project"
 
     @pytest.mark.asyncio
@@ -294,7 +330,12 @@ class TestSetProjectApplier:
         slot = _FakeSlot(project=str(tmp_path))
         state = _FakeState()
         result = await apply_session_directive(
-            state, slot, slot.key, "set_project", {"project": "", "clear": True}
+            state,
+            slot,
+            slot.key,
+            "set_project",
+            {"project": "", "clear": True},
+            producer_is_user_facing=True,
         )
         assert slot.project == ""
         assert "cleared" in result.lower()
@@ -343,6 +384,7 @@ class TestApplierAuditAndFailSoft:
         result = await apply_session_directive(
             state, slot, "dashboard:chat-1", "set_project",
             {"project": str(tmp_path), "clear": False},
+            producer_is_user_facing=True,
         )
         assert "Project set to" in result
         assert len(sel_spy.calls) == 1
@@ -364,6 +406,7 @@ class TestApplierAuditAndFailSoft:
         result = await apply_session_directive(
             state, slot, "dashboard:chat-1", "set_project",
             {"project": str(tmp_path), "clear": False},
+            producer_is_user_facing=True,
         )
         assert result == "Error: access denied (sensitive path)."
         assert [c["outcome"] for c in sel_spy.calls] == ["denied"]
@@ -421,6 +464,7 @@ class TestApplierAuditAndFailSoft:
         result = await apply_session_directive(
             state, slot, "dashboard:chat-1", "set_project",
             {"project": "~/.aws/definitely-not-there", "clear": False},
+            producer_is_user_facing=True,
         )
         assert result == "Error: access denied (sensitive path)."
         assert probed == [], f"sensitive path was stat'ed before the deny gate: {probed!r}"
@@ -464,6 +508,7 @@ class TestApplierAuditAndFailSoft:
         result = await apply_session_directive(
             state, slot, session_key, "set_project",
             {"project": str(tmp_path), "clear": False},
+            producer_is_user_facing=True,
         )
         assert "Project set to" in result
         assert slot.project == str(tmp_path)
@@ -475,6 +520,26 @@ class TestApplierAuditAndFailSoft:
         # channel-LINKED slot derives its linked channel key instead.
         assert slot._pending_reset_history_key == slot.key
         assert [c["outcome"] for c in sel_spy.calls] == ["success"]
+
+    @pytest.mark.asyncio
+    async def test_set_project_rejects_automation_using_user_destination_key(
+        self, tmp_path, monkeypatch, sel_spy
+    ):
+        """A cron/sub-agent turn borrows its destination slot and session key;
+        producer provenance must still prevent it from retargeting that slot."""
+        monkeypatch.setattr("kiro_crew.security.is_sensitive_path", lambda *a, **k: False)
+        slot = _FakeSlot(project="/original")
+        result = await apply_session_directive(
+            _FakeState(),
+            slot,
+            "slack:C123.456",
+            "set_project",
+            {"project": str(tmp_path), "clear": False},
+            producer_is_user_facing=False,
+        )
+        assert "Error" in result and "user-facing" in result
+        assert slot.project == "/original"
+        assert [call["outcome"] for call in sel_spy.calls] == ["denied"]
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -524,6 +589,7 @@ class TestApplierAuditAndFailSoft:
         result = await apply_session_directive(
             state, slot, "dashboard:chat-1", "set_project",
             {"project": missing, "clear": False},
+            producer_is_user_facing=True,
         )
         assert result.startswith("Error: not a directory")
         assert [c["outcome"] for c in sel_spy.calls] == ["error"]

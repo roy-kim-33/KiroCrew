@@ -174,9 +174,11 @@ def _looks_like_single_absolute_path(value: str) -> bool:
 
     Colon-joined values like ``PATH`` (``/usr/bin:/bin``) are NOT single paths
     and must not be stat-ed as one — that is the explicit false-positive to
-    avoid. The Windows list separator ``;`` is rejected for the same reason. A
-    Windows drive path (``C:\\Users\\...``) legitimately contains a colon, so
-    the colon test is scoped to the POSIX list-separator shape (see
+    avoid. The Windows list separator ``;`` is rejected for the same reason, as
+    is the comma separator that multi-value CLI flags conventionally use
+    (``--search-dirs /opt/a,/opt/b``). A Windows drive path
+    (``C:\\Users\\...``) legitimately contains a colon, so the colon test is
+    scoped to the POSIX list-separator shape (see
     :func:`_colon_scan_rejects`), leaving a bare drive-letter colon alone.
 
     Only absolute paths are considered: a bare token, a URL, a flag, or a
@@ -186,6 +188,14 @@ def _looks_like_single_absolute_path(value: str) -> bool:
         return False
     # Windows PATH-style list — never a single path.
     if ";" in value:
+        return False
+    # Comma-joined list — the separator multi-value CLI flags conventionally
+    # take. A comma is legal in a POSIX filename, so this trades a rare false
+    # negative (a real path containing a comma stops being checked) for
+    # removing a guaranteed false positive on every list-valued arg — the same
+    # blanket trade already made for ``;`` above. (``:`` is screened in scoped
+    # form instead, so a Windows drive path survives it.)
+    if "," in value:
         return False
     # POSIX PATH-style list.
     if _colon_scan_rejects(value):
@@ -229,6 +239,13 @@ _CREDENTIAL_KEY_MARKERS: tuple[str, ...] = (
     "PRIVATE",
 )
 
+# Opaque identifier flag operands that merely look like absolute paths
+# (e.g. --scope /spaces/nsp_abc123). Not filesystem paths — must not be
+# stat-ed, otherwise a healthy install is permanently red (see #7375).
+# Strict literal set: a heuristic would trade bounded false positive for
+# unbounded false negative.
+_IDENTIFIER_FLAGS: frozenset[str] = frozenset({"--scope", "--namespace", "--space"})
+
 _REDACTED_VALUE = "<redacted: credential-shaped key>"
 
 
@@ -253,6 +270,12 @@ def _walk_server_paths(server: str, entry: dict) -> list[DeadPath]:
                 and _looks_like_single_absolute_path(arg)
                 and _path_is_dead(arg)
             ):
+                # Skip an arg whose preceding arg is an identifier flag — the
+                # value is an opaque id, not a filesystem path. Safe on
+                # non-string / out-of-bounds / args[0]: those fall through to
+                # the normal dead-path check.
+                if i > 0 and isinstance(args[i - 1], str) and args[i - 1] in _IDENTIFIER_FLAGS:
+                    continue
                 dead.append(DeadPath(spec="", server=server, where=f"args[{i}]", path=arg))
 
     env = entry.get("env")

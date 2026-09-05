@@ -10,6 +10,7 @@ import { useRunSnapshot } from '../../apps/workflows/useRunSnapshot'
 import { runBelongsToSlot } from '../../apps/workflows/runModel'
 
 import { i18nT } from '../../i18n/t'
+import { useLanguageGeneration } from '../../i18n/useLanguageGeneration'
 const EMPTY_RUNS: Record<string, WorkflowRunProgress> = {}
 // How long a finished/failed/cancelled run lingers before being dropped.
 const TERMINAL_LINGER_MS = 4000
@@ -24,6 +25,7 @@ const TERMINAL_LINGER_MS = 4000
  *  The full run snapshot (with events + source) is fetched on expand and
  *  refreshed every ~2s while the run is still running. */
 const WorkflowProgressBar = memo(function WorkflowProgressBar({ slot }: { slot: string | null }) {
+  useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const dispatch = useAppDispatch()
   const runs = useAppSelector(s => s.chat.workflowRuns ?? EMPTY_RUNS)
   // Only show runs launched FROM this chat session — a run sticks to the chat
@@ -85,7 +87,11 @@ const WorkflowProgressBar = memo(function WorkflowProgressBar({ slot }: { slot: 
   const anyExpanded = visible.some(r => expanded[r.run_id])
 
   return (
-    <div className="px-4 mx-auto w-full" style={{ maxWidth: 'var(--mc-content-width, 900px)' }}>
+    // `relative z-[2]` clears the transcript's bottom mask (`z-[1]`), which
+    // overshoots below the scrollport edge for a composer status stack it assumes
+    // is empty. Whenever this bar is the topmost thing in that stack, an auto
+    // z-index let the mask's opaque tail shave its top border and corners.
+    <div className="px-4 mx-auto w-full relative z-[2]" style={{ maxWidth: 'var(--mc-content-width, 900px)' }}>
       <div
         data-testid="workflow-progress-bar"
         className={`mb-1 rounded-md bg-accent/10 border border-accent/20 animate-slide-up ${

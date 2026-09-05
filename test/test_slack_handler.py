@@ -626,7 +626,7 @@ class TestHandleMessage:
 
     @pytest.mark.asyncio
     async def test_trusted_bot_access_disabled(self):
-        """from_trusted_bot is always False — bot messages never bypass owner check."""
+        """from_trusted_bot=False (untrusted bot): error replies are NOT suppressed."""
         from kiro_crew.acp.client import AcpError
 
         class _RaisingProvider(FakeProvider):
@@ -2031,14 +2031,14 @@ class TestAutoTitleSlack:
 
     @pytest.fixture(autouse=True)
     def _clean_titled_threads(self):
-        import kiro_crew.slack.handler as _h
-        from kiro_crew.slack.handler import _titled_threads
+        # The claim LRU and its lock live in `messaging.auto_title`; `reset()` does
+        # both halves, which matters because a test that crashed mid-title leaves
+        # the claim marked AND the permit held.
+        from kiro_crew.messaging import auto_title
 
-        _titled_threads.clear()
-        _h._auto_title_lock = _h.LoopBoundLock()
+        auto_title.reset()
         yield
-        _titled_threads.clear()
-        _h._auto_title_lock = _h.LoopBoundLock()
+        auto_title.reset()
 
     @pytest.mark.asyncio
     async def test_auto_title_happy_path(self):
@@ -2075,7 +2075,11 @@ class TestAutoTitleSlack:
 
         slack = MockSlackClient()
         _mark_titled("sk-err")
-        with caplog.at_level(logging.WARNING, logger="kiro_crew.slack.handler"):
+        # The shared module's logger: the blanket handler this pins lives in
+        # `messaging.auto_title` now, and naming the wrong logger is not a harmless
+        # miss — `at_level` also SETS the level, so a DEBUG assertion against a
+        # logger that emits nothing passes vacuously (its sibling below did).
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.messaging.auto_title"):
             await _maybe_auto_title_slack(
                 slack, ExplodingSessionManager(), "C1", "sk-err", None, "help", "sure"
             )
@@ -2108,7 +2112,7 @@ class TestAutoTitleSlack:
 
         slack = MockSlackClient()
         _mark_titled("sk-slow")
-        with caplog.at_level(logging.DEBUG, logger="kiro_crew.slack.handler"):
+        with caplog.at_level(logging.DEBUG, logger="kiro_crew.messaging.auto_title"):
             await _maybe_auto_title_slack(
                 slack, TimingOutSessionManager(), "C1", "sk-slow", None, "help", "sure"
             )
@@ -2909,6 +2913,32 @@ class TestCompactCommand:
         assert any("Still working" in t for t in texts)
         assert not any("Compacting context" in t for t in texts)  # never started
         assert "destroy:thread1" not in sessions.removed
+
+
+class TestStopReasonCompactionFailed:
+    """A COMPACTION_FAILED terminal is synthetic — the backend abandoned the
+    turn after a failed auto-compaction and never sent end_turn, so it still
+    counts the prompt as in progress. The handler must reset the session or
+    the NEXT Slack message collides with "prompt already in progress"."""
+
+    @pytest.mark.asyncio
+    async def test_compaction_failed_resets_the_abandoned_session(self):
+        from kiro_crew.acp.types import STOP_REASON_COMPACTION_FAILED
+
+        slack = MockSlackClient()
+        provider = FakeProvider(
+            [
+                LLMEvent(kind="text_chunk", text="partial"),
+                LLMEvent(kind="complete", stop_reason=STOP_REASON_COMPACTION_FAILED),
+            ]
+        )
+        sessions = FakeSessionManager(provider)
+
+        await handle_message(slack, sessions, "C1", "hello", None, "msg1", "U1")
+
+        assert any(
+            r.startswith("reset:") for r in sessions.removed
+        ), f"no session reset after COMPACTION_FAILED: {sessions.removed}"
 
 
 class TestBuildTimingFooter:

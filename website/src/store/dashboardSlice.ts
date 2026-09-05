@@ -3,7 +3,7 @@ import { jsonEqual } from '../utils/structuralEqual'
 import { createSlice, createAsyncThunk, createSelector, type PayloadAction } from '@reduxjs/toolkit'
 import { api } from '../api/client'
 import { sanitizeLlmOutput, isUnsafeKey } from '../utils/sanitize'
-import type { StatusData, ChatSlot, TodoList } from '../types'
+import type { StatusData, ChatSlot, TodoList, McpSessionReport } from '../types'
 import type { SessionColorMode, PaletteName, DefaultColorSetting, IntensityName } from '../utils/sessionColors'
 
 export interface SubagentDetail {
@@ -199,6 +199,13 @@ const dashboardSlice = createSlice({
         state.updateProgress = action.payload.update_progress
       }
     },
+    // A slots frame carries only the live YOLO boolean, not a status snapshot.
+    // Keep the last authoritative status intact so fields such as yolo_duration
+    // remain available to the approval-mode confirmation copy.
+    sseYolo(state, action: PayloadAction<boolean>) {
+      if (state.status) state.status.yolo = action.payload
+      state.approvalMode = action.payload ? 'yolo' : (state.approvalMode === 'yolo' ? 'normal' : state.approvalMode)
+    },
     sseConnected(state) { state.connected = true; state.slotsLoaded = false; state.subagentRunning = {}; state.subagentDetails = {}; state.subagentText = {} },
     sseDisconnected(state) { state.connected = false },
     sseSlots(state, action: PayloadAction<ChatSlot[]>) {
@@ -226,6 +233,18 @@ const dashboardSlice = createSlice({
     sseTodoUpdate(state, action: PayloadAction<{ slot: string; todo: TodoList | null }>) {
       const slot = (state.slots ?? []).find(s => s.key === action.payload.slot)
       if (slot) slot.todo = action.payload.todo
+    },
+    // Live MCP session-report delta, same merge discipline as sseTodoUpdate. A
+    // null payload is meaningful and must be stored: it is what the gateway
+    // pushes when a session reset makes the previous report describe a session
+    // that no longer exists, and keeping the old value would leave a dead
+    // session's server list on screen as the live one's.
+    sseMcpReportUpdate(
+      state,
+      action: PayloadAction<{ slot: string; mcp_report: McpSessionReport | null }>,
+    ) {
+      const slot = (state.slots ?? []).find(s => s.key === action.payload.slot)
+      if (slot) slot.mcp_report = action.payload.mcp_report
     },
     // Bump a slot's recency timestamps on live message activity so the sidebar
     // re-ranks immediately off the finer-grained chat_message stream (vs waiting
@@ -436,7 +455,7 @@ const dashboardSlice = createSlice({
   },
 })
 
-export const { sseStatus, sseConnected, sseDisconnected, sseSlots, setSidebarOrder, sseTodoUpdate, touchSlotActivity, setChannelTrusted, sseSlotTitle, addSlotOptimistic, removeSlotOptimistic, updateSlot, updateSlotFolder, updateSlotPin, triggerRefresh, markSlotUnread, markSlotRead, setUpdateProgress,
+export const { sseStatus, sseYolo, sseConnected, sseDisconnected, sseSlots, setSidebarOrder, sseTodoUpdate, sseMcpReportUpdate, touchSlotActivity, setChannelTrusted, sseSlotTitle, addSlotOptimistic, removeSlotOptimistic, updateSlot, updateSlotFolder, updateSlotPin, triggerRefresh, markSlotUnread, markSlotRead, setUpdateProgress,
   setDesktopUpdateAvailable, sseSubagentStatus, sseSubagentText, sseSlotColor, setSessionDefaultColor, setSessionColorsMode, setSessionColorsPalette, setSessionColorsIntensity, setEnabledAppIds, patchSlotSourceLinks, patchSlotLink } = dashboardSlice.actions
 
 /**

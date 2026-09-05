@@ -4,9 +4,10 @@ import { FitAddon } from '@xterm/addon-fit'
 import { WebLinksAddon } from '@xterm/addon-web-links'
 import '@xterm/xterm/css/xterm.css'
 import { useMutation } from '@tanstack/react-query'
-import { MessageSquarePlus, Copy, Check } from 'lucide-react'
-import { ensureTerminalConnection, disposeTerminalConnection, getTerminalCwd } from '../utils/terminalRegistry'
+import { MessageSquarePlus, Copy, Check, PlugZap } from 'lucide-react'
+import { ensureTerminalConnection, disposeTerminalConnection, getTerminalCwd, useTerminalConnStatus, useTerminalManualRetry, retryTerminalConnection } from '../utils/terminalRegistry'
 import { getTerminalFont, resolveTerminalFontFamily, subscribeTerminalFont } from '../hooks/useTerminalFont'
+import { ansiPaletteFromVars } from '../utils/terminalPalette'
 import { useIsTouchDevice } from '../hooks/useIsTouchDevice'
 import TerminalCompletion from './TerminalCompletion'
 import TerminalKeyBar from './TerminalKeyBar'
@@ -21,11 +22,15 @@ const termCache = new Map<string, { term: Terminal; fit: FitAddon }>()
 /* ── Terminal theme from CSS custom properties ── */
 function getTermTheme() {
   const style = getComputedStyle(document.documentElement)
+  const read = (name: string) => style.getPropertyValue(name)
   return {
     background:          style.getPropertyValue('--bg').trim()            || '#1e1e2e',
     foreground:          style.getPropertyValue('--text').trim()          || '#cdd6f4',
     cursor:              style.getPropertyValue('--accent').trim()        || '#89b4fa',
     selectionBackground: style.getPropertyValue('--accent-subtle').trim() || '#313244',
+    // The 16 ANSI entries: without them xterm renders ANSI-coloured output with
+    // its own palette, which ignores the theme entirely.
+    ...ansiPaletteFromVars(read),
   }
 }
 
@@ -236,6 +241,21 @@ function TerminalView({ sessionId, cwd, visible, onSendToChat }: { sessionId: st
   // The soft keys exist for one reason — no physical keyboard.
   const touchDevice = useIsTouchDevice()
 
+  // Live socket state, so the view can surface a disconnected banner. The
+  // banner shows in two cases: the terminal 'disconnected' state (backoff
+  // ceiling reached), and while a USER-initiated reconnect is in flight — the
+  // latter as a "Reconnecting…" presentation so a failing manual retry is not
+  // silent. Ordinary automatic 'reconnecting' blips (tab hide/show) stay quiet
+  // to avoid flicker; only a manual retry sets manualRetry.
+  const connStatus = useTerminalConnStatus(sessionId)
+  const manualRetry = useTerminalManualRetry(sessionId)
+  // The manual "Reconnecting…" state: the user clicked Reconnect and the dial
+  // has not yet resolved. On failure the status flips back to 'disconnected'
+  // (manualRetry clears with it), returning the banner to its disconnected
+  // presentation; on success it flips to 'connected' and the banner is gone.
+  const reconnecting = manualRetry && connStatus === 'reconnecting'
+  const showBanner = connStatus === 'disconnected' || reconnecting
+
   if (!entryRef.current) {
     entryRef.current = getOrCreateTerm(sessionId)
   }
@@ -445,6 +465,28 @@ function TerminalView({ sessionId, cwd, visible, onSendToChat }: { sessionId: st
             feature that attaches its own handler here would silently replace it —
             extend the handler inside TerminalCompletion instead. */}
         <TerminalCompletion term={term} sessionId={sessionId} active={visible} />
+        {showBanner && (
+          <div
+            className="absolute inset-x-0 top-0 z-30 flex items-center gap-2 border-b border-border bg-bg-elevated/95 px-3 py-1.5 text-[12px] text-text shadow-sm backdrop-blur"
+            role="status"
+            aria-live="polite"
+          >
+            <PlugZap className={`h-3.5 w-3.5 shrink-0 ${reconnecting ? 'text-text-muted' : 'text-danger'}`} aria-hidden="true" />
+            <span className="min-w-0 flex-1 truncate">
+              {reconnecting
+                ? i18nT('components.cliPanel.reconnecting')
+                : i18nT('components.cliPanel.disconnected_message')}
+            </span>
+            <button
+              type="button"
+              onClick={() => retryTerminalConnection(sessionId)}
+              disabled={reconnecting}
+              className="shrink-0 rounded-md border border-border px-2 py-0.5 text-[12px] text-text hover:bg-bg-hover transition-colors disabled:cursor-default disabled:opacity-60 disabled:hover:bg-transparent"
+            >
+              {i18nT('components.cliPanel.reconnect')}
+            </button>
+          </div>
+        )}
       </div>
       {/* Below the terminal in flow, never over it: the shell prompt occupies the
           bottom row, so an overlay would hide the line being typed. The terminal

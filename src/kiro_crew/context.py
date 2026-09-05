@@ -20,6 +20,7 @@ from kiro_crew import model_registry
 from kiro_crew.acp.types import ACP_BACKEND_CLAUDE
 from kiro_crew.agent import _prompt_path
 from kiro_crew.agent_discovery import agent_skill_globs
+from kiro_crew.agent_sdk.provider_identity import is_claude_code
 from kiro_crew.config.loader import KiroCrewConfig, workspace_dir_for
 from kiro_crew.config.paths import kiro_agents_dir
 from kiro_crew.cron import get_local_tz
@@ -945,6 +946,43 @@ _UI_LANGUAGE_CATALOGS = frozenset(
 )
 
 
+def normalize_ui_language_tag(value: object, *, source: str = "language") -> str:
+    """Admit an arbitrary value as a usable UI language tag, or return ``""``.
+
+    The single gate a BCP-47 tag passes to become a *usable* UI language,
+    whatever its provenance: the persisted ``dashboard.language`` (see
+    :func:`ui_language_tag`) or a value handed over by a caller — e.g. a
+    request-scoped hint carrying the language a browser already resolved for
+    itself, which is the only way the backend can learn an implicitly chosen
+    language at all. Both clear the identical bar deliberately: the frontend
+    admits a language through exactly one gate, and a second, laxer copy here
+    would let the two disagree about what the active language is (#1130).
+
+    Rejected as ``""``: a non-string, a blank, a value that is not tag-shaped
+    (``_UI_LANGUAGE_TAG_RE``), and a shape-valid tag naming no shipped catalog
+    (``_UI_LANGUAGE_CATALOGS``) — the last because steering a model to a
+    language the chrome around it cannot render puts two languages on one
+    screen. ``""`` therefore always means "no usable language", never "English";
+    callers must treat it as unknown.
+
+    ``source`` labels the provenance in the debug line only — it never changes
+    the verdict.
+    """
+    if not isinstance(value, str):
+        return ""
+    tag = value.strip()
+    if not tag or not _UI_LANGUAGE_TAG_RE.match(tag):
+        return ""
+    if tag not in _UI_LANGUAGE_CATALOGS:
+        # Debug, not warning: this fires on every context build for as long as
+        # the value stays persisted, and the UI itself already degraded to
+        # auto-detect — but without a line here an operator cannot distinguish
+        # "not configured" from "rejected" when the steer is absent.
+        logger.debug("%s %r names no shipped catalog; not steering", source, tag)
+        return ""
+    return tag
+
+
 def ui_language_tag(cfg: "KiroCrewConfig") -> str:
     """Return ``dashboard.language`` as a validated, *shipped* tag, or ``""``.
 
@@ -969,22 +1007,12 @@ def ui_language_tag(cfg: "KiroCrewConfig") -> str:
     ``""`` means "the backend does not know" — nothing was chosen (the
     "follow the browser" sentinel, resolved in the SPA's ``resolveLanguage()``),
     the stored value is not tag-shaped, or it names no shipped catalog. Callers
-    must treat it as unknown rather than as English.
+    must treat it as unknown rather than as English. A caller that CAN learn an
+    unconfigured browser's resolved language (a request-scoped hint) validates it
+    through the same :func:`normalize_ui_language_tag` gate this delegates to,
+    so config and hint can never disagree about what counts as usable.
     """
-    lang = cfg.dashboard.language
-    if not isinstance(lang, str):
-        return ""
-    lang = lang.strip()
-    if not lang or not _UI_LANGUAGE_TAG_RE.match(lang):
-        return ""
-    if lang not in _UI_LANGUAGE_CATALOGS:
-        # Debug, not warning: this fires on every context build for as long as
-        # the value stays persisted, and the UI itself already degraded to
-        # auto-detect — but without a line here an operator cannot distinguish
-        # "not configured" from "rejected" when the steer is absent.
-        logger.debug("dashboard.language %r names no shipped catalog; not steering", lang)
-        return ""
-    return lang
+    return normalize_ui_language_tag(cfg.dashboard.language, source="dashboard.language")
 
 
 def _build_ui_language_section(cfg: "KiroCrewConfig") -> str:
@@ -1054,7 +1082,24 @@ def _load_steering_resources() -> str:
         cfg_path = kiro_agents_dir() / "kirocrew.json"
         if not cfg_path.exists():
             return ""
-        cfg = json.loads(safe_read_file(str(cfg_path)))
+        # The agents dir is user-writable and shared with other tools, so the
+        # spec goes through the hardened agent-spec reader. ``safe_read_file``
+        # screened the resolved target but read it with an unbounded
+        # ``fh.read()`` -- the size cap guards ``safe_read_file_bytes``, the
+        # other helper -- and emitted no SEL event, so an oversized spec was
+        # still read whole here and a refusal was never audited. Every outcome
+        # the blanket ``except`` below used to absorb (PermissionError on a
+        # sensitive target, AttributeError on non-object JSON) now arrives as
+        # ``None`` and returns the same empty string, without the read.
+        from kiro_crew.agent_discovery import _read_agent_spec
+
+        cfg = _read_agent_spec(
+            cfg_path,
+            operation="steering_resources",
+            source="unknown",
+        )
+        if cfg is None:
+            return ""
         resources = cfg.get("resources", [])
         parts: list[str] = []
         home_resolved = str(Path.home().resolve()) + os.sep
@@ -1119,6 +1164,9 @@ _CRITICAL_RULES_TAIL = (
     "When referencing file paths in your response, ALWAYS use the absolute path "
     "inside inline `code` backticks (e.g. `/home/user/project/src/main.py`). "
     "Never use relative paths or bare filenames. This enables the UI file viewer panel.\n"
+    "Backtick file PATHS only -- NEVER a URL. A backticked URL renders as a "
+    "click-to-copy chip, not a link, so the user cannot click through to it. "
+    "Write every URL as [text](url) instead.\n"
     "When presenting choices or options to the user, you MUST end your response "
     "with [OPTIONS: Choice A | Choice B | Choice C] as the very last line. "
     "This renders interactive buttons in the UI. Users can select multiple options before submitting.\n"
@@ -1135,6 +1183,17 @@ _CRITICAL_RULES_TAIL = (
     '"Yes, delete it"). Never phrase a label in your own voice or as your own '
     'next action ("I\'ll merge it", "Let me show the diff", "I can rebase '
     'first"), and never phrase it as a question back to the user.\n'
+    "Every option must be SELF-CONTAINED: each rendered chip carries its own "
+    "send control, so the user can send any single option alone, and ONLY that "
+    "option's text is sent -- none of its siblings come with it. Never write "
+    'an option that only makes sense combined with another one ("Build the '
+    'widget" | "Include the stop button too" -- sent alone, the second names '
+    "no action). Fold the shared base action into each label instead "
+    '("Build the widget with the stop button included").\n'
+    "Keep each option label SHORT -- aim for at most 8 words. The chip row "
+    "renders each label on a single line, so a long label displays cut off; "
+    "put supporting detail in the message body before the [OPTIONS:] line and "
+    "keep the label itself to the bare instruction.\n"
     "[END CRITICAL RULES]\n\n"
 )
 # The dashboard variant is the module's canonical block: tests and the
@@ -1789,7 +1848,16 @@ class ContextBuilder:
             self._bot_name = bot_name
         else:
             cfg = KiroCrewConfig.load()
-            self._bot_name = "Kiro Crew" if cfg.agent.acp_backend == ACP_BACKEND_CLAUDE else "Kiro"
+            # The joined spelling is the {bot_name} value the prompt
+            # substitutes, not prose about the product: respelling it would
+            # change what the model is told to answer to.
+            #
+            # Checked against acp_backend, not is_claude_code(cfg.agent.provider):
+            # this fork locks agent.provider to "acp" for upstream harness-parity
+            # (see harness-parity notes in acp/types.py), so provider alone is
+            # never "claude_code" here — the actual backend choice (kiro-cli vs
+            # the fork's claude-agent-acp seam) lives in acp_backend instead.
+            self._bot_name = "Kiro Crew" if cfg.agent.acp_backend == ACP_BACKEND_CLAUDE else "Kiro"  # brand-ok
         # Register default memory in the workspace cache
         _memory_stores["default"] = self.memory
 
@@ -1850,17 +1918,20 @@ class ContextBuilder:
                 'or any content that fails the test: "would the reader be '
                 'stuck without this line?"\n'
                 "- Code blocks and commands are the answer — never cut them.\n"
-                "- Never compress for brevity: security warnings, "
-                "irreversible-action confirmations, and ordered multi-step "
-                "instructions where a dropped step causes a mistake. Those "
-                "stay complete, and code, commands, paths, identifiers and "
-                "error strings stay verbatim.\n"
+                "- Stakes change what you must not omit, never the length: "
+                "security warnings and irreversible-action confirmations "
+                "always appear, each as one line naming the call, the risk, "
+                "and whether it can be undone; the mechanism and the failure "
+                "modes are not required. Ordered multi-step instructions "
+                "where a dropped step causes a mistake stay complete, and "
+                "code, commands, paths, identifiers and error strings stay "
+                "verbatim.\n"
                 "- When the user ASKS for something long (design doc, tutorial, "
                 "full implementation), ignore these constraints and deliver "
                 "what was asked.\n"
                 "- Required output formats are sacred and never cut: "
                 "[OPTIONS:] lines, diff blocks for file changes, full PR/MR "
-                "URLs, security warnings, and any format the rendering surface "
+                "URLs, and any format the rendering surface "
                 "needs. These go in their required position regardless of "
                 "brevity.\n"
                 "- Preserve the user's language."
@@ -1888,9 +1959,108 @@ class ContextBuilder:
                 "verbatim and complete. Brevity is for prose, never correctness.\n"
                 "- Preserve the user's language; compress the style, not the "
                 "content.\n\n"
-                "Ignore concise mode and keep full detail for: security warnings, "
-                "irreversible-action confirmations, and multi-step instructions "
-                "where order or omissions could cause a mistake."
+                "Stakes change what concise mode must not omit, never how "
+                "long it may run: security warnings and irreversible-action "
+                "confirmations always appear, each as one line naming the "
+                "call, the risk, and whether it can be undone; the mechanism "
+                "and the failure modes are not required. Likewise, multi-step "
+                "instructions where order or omissions could cause a mistake "
+                "stay complete."
+            )
+        elif verbosity == "answer_only":
+            verbosity_block = (
+                "## Response Verbosity: Answer Only\n\n"
+                "Answer-only mode is on. Deliver the answer, the artifact, or "
+                "the result — nothing else. Explanation is opt-in: either the "
+                "user asks for it, or it does not exist.\n\n"
+                "Rules:\n"
+                "- No explanation by default. When a reason earns its place at "
+                "all, it is ONE sentence — never a paragraph, and never a "
+                "re-derivation of a decision you have already made (e.g. once "
+                "you are confident in an action, show what it does and its "
+                "effect, not why you chose it).\n"
+                "- Cut entirely: preamble, restating the question, what you "
+                "are about to do, what you just did, rationale, alternatives "
+                "you rejected, caveats, trade-offs, unprompted next steps, and "
+                "closing offers to help.\n"
+                "- Whatever the user needs in order to know or to act IS the "
+                "answer — a change, a command, a value, a verdict. Lead with "
+                "it and stop; do not narrate it. The work that produced it — "
+                "the evidence, the search, the options you weighed — is "
+                "explanation, so it is opt-in like the rest. Naming your "
+                "findings is not naming the answer: if the user has to derive "
+                "it from what you found, you have not answered.\n"
+                "- One exception to stopping: when that command or change "
+                "destroys, overwrites or rewrites something, the undo path "
+                "rides along with it in the same reply — how to get it back, "
+                "or plainly that you cannot. One clause is enough. A "
+                "destructive one-liner handed over with no undo path is not a "
+                "terse answer, it is a trap.\n"
+                "- Plain words, short sentences, and the point at the front of "
+                "each one. Plain does not mean childish — write for a capable "
+                "reader in a hurry, not for a five-year-old. Brevity is not "
+                "enough: a short reply can still be dense and unreadable. Put "
+                "what the user must know in the first few words and stop; do "
+                "not make them assemble it across clauses chained with here, "
+                "then, but, so that or which means, and do not frame a fact as "
+                "a correction of something they never said (“this is not X, "
+                "it's Y” — just say Y). Drop jargon that dresses up a simple "
+                "point, hedges, and repetition; a technical term stays only "
+                "when it IS the fact, not when it is decoration. If a sentence "
+                "has to be read twice to find the point, rewrite it.\n"
+                "- Answer the question that was asked and nothing adjacent. "
+                "Take a position instead of listing options.\n"
+                "- Code, commands, paths, identifiers, error strings and file "
+                "contents stay verbatim and complete — this mode cuts prose, "
+                "never payload. Payload is what the user asked for or has to "
+                "act on. Material you quote to prove a point is evidence, not "
+                "payload, and evidence is opt-in: leave it out and offer it.\n"
+                "- One sentence per thing you are telling them. The verdict is "
+                "a sentence; each recommendation is a sentence; each item in a "
+                "list is a sentence. This bounds each item, not the reply, so "
+                "a procedure that genuinely needs seven steps gets seven "
+                "one-sentence steps — but a reply that has grown sections, "
+                "numbered findings or bullets with sub-bullets is a report, "
+                "and the answer is buried inside it.\n"
+                "- Verify against the real thing, then answer without showing "
+                "the work. Reading the code, the log or the document is what "
+                "keeps you from being wrong; a file path, a line number, a "
+                "quoted function or a count of the steps you took only shows "
+                "that you read it. Say what the thing does, not where you "
+                "found it, and hand the reference over when the user asks to "
+                "check it.\n"
+                "- A request for the reason is not a request for a document. "
+                "When the user asks why, or asks you to explain something, the "
+                "reason turns ON and every length rule stays in force: a few "
+                "plain sentences, one per point, and nothing adjacent to what "
+                "they asked. Only an explicit request for depth — a doc, a "
+                "review, a walkthrough, a deep dive, in detail, everything — "
+                "lifts the bound, and for that reply this mode is off: give "
+                "the full detail they asked for.\n\n"
+                "Explaining in full, unasked, is the rare exception — not a "
+                "lane you look for. The default, even for judgement calls, is "
+                'the terse answer plus a one-line offer (e.g. "say why for '
+                'the reasoning"). Assume the user will NOT read an unrequested '
+                "explanation; when you are unsure whether one is worth it, that "
+                "uncertainty means leave it out and offer it in one line.\n\n"
+                "High stakes change what you must NOT omit, never the length. "
+                "When something is destructive, irreversible, or touches "
+                "security, credentials, data exposure, permissions or spend, "
+                "lead with the call — what to do, or that you are not doing it "
+                "— plus ONE line naming the risk and whether it can be undone. "
+                "That single line is the whole warning; the mechanism, the "
+                "failure modes and the reasoning are opt-in like everything "
+                "else, so offer them in a clause and stop. The defect here is "
+                "silence about a one-way door, not brevity about it.\n\n"
+                "Two things stay complete regardless: an ordered multi-step "
+                "procedure the user must follow (a dropped step causes the "
+                "mistake), and any output format the surface REQUIRES, in its "
+                "required position and full form — for example [OPTIONS:] "
+                "lines, diff blocks for file changes, or full PR/MR URLs. That "
+                "list is illustrative, not exhaustive: whenever a format is "
+                "mandated elsewhere in your instructions, brevity never "
+                "overrides it.\n\n"
+                "Preserve the user's language."
             )
         else:
             verbosity_block = ""
@@ -2002,7 +2172,7 @@ class ContextBuilder:
         deployment's effective window), leaving that path byte-for-byte
         unchanged.
 
-        All providers — including ``provider_type="claude_code"`` — receive the
+        All providers — including Claude Code — receive the
         same injected context (critical rules, thread history, memory, skills,
         lessons); steering files are the one exception (see below). This keeps
         Claude Code at parity with kiro so dashboard/Slack UI contracts (diff
@@ -2011,7 +2181,7 @@ class ContextBuilder:
 
         *provider_type* is consumed again for the steering gate only: the
         steering block below is injected solely on the CC backend
-        (``provider_type == "claude_code"``). kiro-cli loads an agent's
+        (``is_claude_code(provider_type)``). kiro-cli loads an agent's
         ``resources`` natively when spawned with ``--agent`` (acp/client.py
         ``_spawn``), so re-injecting steering on the ACP/kiro backend would
         duplicate what kiro already loaded; the CC backend (claude-agent-acp)
@@ -2035,7 +2205,7 @@ class ContextBuilder:
         and hooks are injected for all agents.
         """
         is_custom = agent and agent != "kirocrew"
-        is_cc = provider_type == "claude_code"
+        is_cc = is_claude_code(provider_type)
         caps = _resolve_caps(model_window)
         parts: list[str] = []
 
@@ -2548,7 +2718,7 @@ class ContextBuilder:
         # Set together with the user's text part when user_text_range is given.
         _user_bounds: tuple[int, int] | None = None
         _user_part_index: int | None = None
-        is_cc = provider_type == "claude_code"
+        is_cc = is_claude_code(provider_type)
 
         # Session context on first message only
         if is_new_session:
@@ -3062,7 +3232,9 @@ class ContextBuilder:
                 "as the very last line — exactly once, nothing after it. "
                 "Users can select multiple options before submitting. Label each choice "
                 'in the user\'s voice as an instruction to you — "Merge it now", not '
-                '"I\'ll merge it".)'
+                '"I\'ll merge it". Make each choice self-contained — any single one can '
+                "be sent alone, so never write a choice that merely modifies a sibling "
+                '("Include the stop button too"); fold the base action into it.)'
             )
             # Situational nudges for tools that may otherwise never surface with
             # MCP Tool Search. Gated on having a dashboard tab open, because
@@ -3072,17 +3244,19 @@ class ContextBuilder:
             # wants none of the Crew's dashboard-tool nudges (it drives its own
             # UI through its MCP tools), so honor that here too, not just for
             # _CRITICAL_RULES.
-            # ask_question is a MID-turn blocking decision; [OPTIONS:] remains
-            # the cheaper END-turn choice mechanism on every interactive surface.
+            # ask_question posts a NON-BLOCKING card and the agent ends its turn:
+            # what blocks is the DECISION, not the tool call. [OPTIONS:] remains
+            # the cheaper choice mechanism on every interactive surface.
             if has_dashboard_surface(session_key or "") and _agent_includes_crew_context(agent):
                 parts.append(
-                    "\n\n(If you need the user's answer to a blocking question BEFORE "
-                    "you can continue the current turn, use the ask_question tool — it "
-                    "pauses and returns the answer as the tool result. Use it SPARINGLY: "
-                    "only when you genuinely cannot proceed without the answer. When you "
-                    "are ENDING your turn, use the final [OPTIONS:] line instead. Never "
-                    "interrupt the user for a non-blocking choice, and never ask what you "
-                    "can reasonably decide or discover yourself.)"
+                    "\n\n(If a decision is genuinely needed before the work can "
+                    "continue, use the ask_question tool to put it to the user as a card, "
+                    "then END YOUR TURN: the tool does not block, and the answer arrives "
+                    "as the user's next message rather than as the tool's result. Use it "
+                    "SPARINGLY: only when you cannot proceed without the answer. When you "
+                    "are ending your turn anyway, use the final [OPTIONS:] line instead. "
+                    "Never interrupt the user for a non-blocking choice, and never ask "
+                    "what you can reasonably decide or discover yourself.)"
                 )
                 # A follow-up card is distinct from both: it offers concrete NEXT
                 # tasks after work is done, optionally handing one to a worktree.

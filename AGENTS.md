@@ -40,6 +40,7 @@ in the **same commit** when you change what it documents.
 | MCP servers or tools (adding, changing, statelessness) | [mcp](docs/architecture/mcp.md) |
 | apps, App Kit, manifests, app agents | [app-kit-platform](docs/system-specs/modules/app-kit-platform.md) + [app-kit/](docs/app-kit/README.md) |
 | artifacts, companion chat | [artifacts](docs/system-specs/modules/artifacts.md) |
+| `stt/`, `transcribe.py`, `voice_reply.py`, the mic, dictation, TTS | [stt-streaming](docs/system-specs/features/stt-streaming.md) + [voice-streaming](docs/system-specs/features/voice-streaming.md) |
 | cron, learn, dashboard handlers | [learn-cron-dashboard](docs/system-specs/modules/learn-cron-dashboard.md) |
 | Slack, Discord, any channel, messaging, approvals | [messaging](docs/system-specs/modules/messaging.md) + [slack-gateway](docs/system-specs/modules/slack-gateway.md) |
 | subagents, spawn, orphan recovery | [subagent](docs/system-specs/modules/subagent.md) |
@@ -76,9 +77,20 @@ This repo is the de-Amazoned public fork of an internal package. Never re-add:
   holds): `sso_status.py`, `browser/auth.py`, `dashboard/handlers/sso_login.py`,
   `tunnel/manager.py`, `aim_agents.py`.
 - **Other providers.** Kiro Crew is KiroACP-only: `agent.provider` is fixed to
-  `acp` and kiro-cli is REQUIRED. Keep the dormant `ACP_BACKEND_CLAUDE` /
-  `_is_claude` seam in `acp/client.py` so an internal companion can re-register
-  Claude Code; do NOT re-add the public registration glue.
+  `acp` and kiro-cli is REQUIRED. `ACP_BACKEND_CLAUDE` is a **publicly selectable
+  harness**, not a dormant seam: `acp/client.py` owns its whole spawn path and the
+  adapter it needs is a public npm package, so it sits in
+  `BASELINE_SELECTABLE_BACKENDS` and any operator with the two binaries can choose it.
+  Two consequences to keep in mind rather than undo: a Claude session starts with **no
+  Crew MCP tools** (`_claude_session_mcp_servers` defaults to `[]`), and a tool
+  pre-approved in Claude's own settings — including a `.claude/settings.json` inside a
+  cloned project — never reaches Crew's approval path, so its deny rules and audit log
+  do not see that call. Both are disclosed on the Agent Backend panel and in
+  `docs/system-specs/features/claude-code-provider.md`; do not widen the harness's
+  reach further without closing them. A harness added at `agent.acp_backend` is
+  governed by
+  [Harness parity](#harness-parity-kiro-is-first-class-the-rest-are-adapted) —
+  adapted, never a second `agent.provider` value.
 - **OSS-flipped defaults:** always-on in-process embeddings, Piper TTS by default,
   a default-open Slack enterprise gate, lazy STT extras.
 - **Fork UX divergences:** the Channels app is hidden from the App Store and the
@@ -184,6 +196,54 @@ backend instead of (or alongside) kiro-cli's `acp` provider:
   `http://127.0.0.1:8317/v1/messages`, catalog at `/v1/models`. The two
   `gpt-image-*` entries are image-generation only and stay out of the picker
   whitelist.
+
+## Harness parity: Kiro is first-class, the rest are adapted
+
+Never express "this is the Kiro harness" as the ABSENCE of another harness. Kiro
+Crew drives one first-class harness — `kiro-cli` (`ACP_BACKEND_KIRO`, spelled
+`""`) — and adapts the others (the dormant `ACP_BACKEND_CLAUDE` seam, KAS, and
+any bring-your-own harness). A negative test like `not is_claude_backend` reads
+correctly with two harnesses and then silently hands the third a capability, a
+sandbox waiver, or a session label nobody granted it — and it fails toward the
+permissive answer, so nothing goes red until an operator who never opted into
+that harness pays for it.
+
+- **An added harness ADAPTS, it does not widen.** It may only fit itself to the
+  seams the Kiro harness already runs through: no new conditional, required
+  argument, awaited step, or failure mode on the Kiro path, and no collapsing a
+  per-harness literal (spawn argv, `PROTOCOL_VERSION`, client capabilities) into
+  one form every harness accepts. A harness that cannot land without changing the
+  Kiro path does not land yet.
+- **Identity is positive.** `is_kiro_backend` / `== ACP_BACKEND_KIRO`, or
+  membership in a named `ACP_BACKENDS_*` set in `acp/types.py`. Never a bare
+  string literal, an inequality, or a negation.
+- **Capabilities are opt-in membership sets** (`ACP_BACKENDS_SESSION_SHARING`,
+  `ACP_BACKENDS_STEER`, `ACP_BACKENDS_INTERNAL_SANDBOX`), and every harness's
+  membership is an explicit decision. `is_kiro_cli` is the one that fails OPEN:
+  it makes `sandbox.wrap_argv` SKIP Kiro Crew's own seatbelt in favour of the
+  harness's internal sandbox, so granting it to a harness without one leaves the
+  agent process unconfined.
+- **Kiro is the floor.** `agent.acp_backend` defaults to `ACP_BACKEND_KIRO` and it
+  is in `acp_backends.selectable_backends()` unconditionally (its baseline is
+  `BASELINE_SELECTABLE_BACKENDS`); an unusable persisted value degrades there with a
+  logged reason instead of raising. There is exactly one gate —
+  `resolve_selected_backend`, called from `_normalize_acp_backend` inside config
+  load — and it reads `selectable_backends()` per call, so registering a backend is
+  what makes a persisted value survive. The Kiro construction path gains no second
+  check (harness-parity H13). A harness is selected at `acp_backend` —
+  `agent.provider` stays `enum=["acp"]`.
+- **Registration is additive at the seam** — `platform/interfaces.py`'s
+  `ProviderRegistry`, a v1 addition with no `CONTRACT_VERSION` bump. A new
+  provider capability lands on the `LLMProvider` ABC with a safe default, never
+  as a `hasattr` probe on the Kiro path.
+- Invariant ids, and the test pinning each, are in
+  [harness-parity](docs/system-specs/modules/harness-parity.md). Cite them bare
+  (`H7`) in code comments and review findings.
+
+`scripts/check_harness_parity.py` fails on a newly added negative identity test
+under `src/kiro_crew/` (run it locally with
+`HARNESS_BASE_REF=origin/main python3 scripts/check_harness_parity.py`); the
+judgment half is the `harness-parity` rule in `AUTOSDE.yaml`.
 
 ### Prefix model ids (CLIProxyAPI picker)
 
@@ -430,6 +490,7 @@ Kiro Crew runs on macOS, Linux (x86_64 and ARM), and Windows (native). `fcntl`,
 | Process start time (PID-reuse guard) | `process_start_time(pid)` | `/proc/<pid>/stat` / `ps -o lstart=` (both answer `None` on Windows, so the guard silently never confirms) |
 | Signals | `platform_compat.SIGKILL` / `SIGTERM` | `signal.SIGKILL` (undefined on Windows) |
 | Spawn isolation | `start_new_session=IS_POSIX` + `creationflags=CREATE_NEW_PROCESS_GROUP` | bare `start_new_session=True` |
+| Re-exec the current Python module | `reexec_python_module(module, args)` | `os.execv(sys.executable, [sys.executable, ...])` (breaks when the Windows interpreter path contains spaces) |
 | Race-free Job object assignment | `creationflags \|= CREATE_SUSPENDED`, then `apply_job_limits`, then `resume_process_main_thread` | assigning a job to an already-running child (descendants it already spawned escape) |
 | Fork-bomb / memory ceiling on a spawned tree | `sandbox.apply_windows_resource_ceiling(pid)` after the spawn, alongside `cgroup_scope_argv` | `cgroup_scope_argv` alone (a no-op on Windows, so no ceiling at all) |
 | File mode | `chmod_safe(path, mode)` / `fchmod_safe(fd, mode)` | `os.chmod` / `os.fchmod` (no `os.fchmod` on Windows) |

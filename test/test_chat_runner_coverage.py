@@ -33,18 +33,22 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from chat_test_helpers import _make_ready_kiro_prerequisite
 
+from kiro_crew import name_grant
 from kiro_crew.acp.types import (
     EVENT_COMPLETE,
     EVENT_PERMISSION_REQUEST,
     EVENT_TEXT_CHUNK,
+    STOP_REASON_COMPACTION_FAILED,
     STOP_REASON_STALE_RECOVER,
     STOP_REASON_TOOL_STALL,
 )
 from kiro_crew.dashboard import chat_runner
 from kiro_crew.dashboard.state import DashboardState, _ChatSlot
 from kiro_crew.history import ConversationLog
+from kiro_crew.metrics import turns as turns_mod
 from kiro_crew.providers.base import LLMEvent
 from kiro_crew.security import oauth_url_contains_credential
+from kiro_crew.trust_patterns import canonical_non_shell_trust_key, exact_trust_pattern
 
 # ── Shared helpers ────────────────────────────────────────────────────────
 
@@ -65,6 +69,12 @@ def _state(tmp_path, **kwargs) -> DashboardState:
     sessions.set_slack_link = MagicMock()
     sessions.get_mirror_link = MagicMock(return_value=None)
     sessions.reset = AsyncMock()
+    # Returns whether it tore down; False means skip_if_busy refused.
+    sessions.discard_conversation = AsyncMock(return_value=True)
+    # Production returns None when no session is live for the key. Left as a bare
+    # MagicMock it would answer a truthy provider whose has_active_turn() is also
+    # truthy, so every busy-probe would read "turn in flight" on an idle state.
+    sessions.get_provider = MagicMock(return_value=None)
     sessions.remove = AsyncMock()
     sessions.record_failure = AsyncMock()
     sessions.remove_if_unclaimed = AsyncMock(return_value=False)
@@ -100,6 +110,11 @@ def _permission(
     tool_input: str = "",
     tool_kind: str = "execute",
     request_id: str = "req-cov-1",
+    *,
+    is_shell: bool = True,
+    tool_name: str = "",
+    mcp_server_name: str = "",
+    raw_tool_params: dict | None = None,
 ) -> LLMEvent:
     return LLMEvent(
         kind=EVENT_PERMISSION_REQUEST,
@@ -107,7 +122,10 @@ def _permission(
         tool_kind=tool_kind,
         tool_input=tool_input,
         request_id=request_id,
-        is_shell=True,
+        is_shell=is_shell,
+        tool_name=tool_name,
+        mcp_server_name=mcp_server_name,
+        raw_tool_params=raw_tool_params,
     )
 
 
@@ -296,8 +314,14 @@ class TestTurnMetric:
 
     def test_session_source_attribute_is_attached(self):
         recorder = MagicMock()
-        with patch.object(chat_runner, "infer_use_case", return_value="cron"), patch.object(
-            chat_runner, "get_recorder", return_value=recorder
+        # The emit and its source derivation moved to ``metrics/turns.py`` so
+        # every dispatch surface could reach them (they used to sit in
+        # chat_runner, which only the dashboard turn loop runs). The source now
+        # comes from ``telemetry_channel_of``, which — unlike infer_use_case —
+        # knows the background surfaces this metric was widened to cover.
+        with (
+            patch.object(turns_mod, "telemetry_channel_of", return_value="cron"),
+            patch.object(turns_mod, "get_recorder", return_value=recorder),
         ):
             chat_runner._emit_turn_metric(0, "end_turn", "cron:job", elapsed_ms=12)
 
@@ -308,8 +332,9 @@ class TestTurnMetric:
     def test_use_case_failure_does_not_block_the_emit(self):
         """A broken source lookup must still leave the histogram emitted."""
         recorder = MagicMock()
-        with patch.object(chat_runner, "infer_use_case", side_effect=RuntimeError("boom")), patch.object(
-            chat_runner, "get_recorder", return_value=recorder
+        with (
+            patch.object(turns_mod, "telemetry_channel_of", side_effect=RuntimeError("boom")),
+            patch.object(turns_mod, "get_recorder", return_value=recorder),
         ):
             chat_runner._emit_turn_metric(50, "end_turn", "dashboard:x")
 
@@ -363,9 +388,7 @@ class TestPreToolHookVerdicts:
         ],
     )
     def test_block_reason_falls_back_when_no_reason_is_authored(self, results):
-        assert (
-            chat_runner._pre_tool_block_reason(results) == "blocked by a PreToolUse policy hook"
-        )
+        assert chat_runner._pre_tool_block_reason(results) == "blocked by a PreToolUse policy hook"
 
 
 # ── snapshot helpers ──────────────────────────────────────────────────────
@@ -595,12 +618,15 @@ class TestConnectionsManagedNames:
             assert chat_runner._connections_managed_mcp_names() == frozenset()
 
     def test_intersection_of_managed_and_carded(self):
-        with patch.object(
-            chat_runner, "kirocrew_managed_names", return_value={"github", "handmade"}
-        ), patch.object(
-            chat_runner,
-            "get_visible_providers",
-            return_value=[{"slug": "github"}, {"slug": "slack"}],
+        with (
+            patch.object(
+                chat_runner, "kirocrew_managed_names", return_value={"github", "handmade"}
+            ),
+            patch.object(
+                chat_runner,
+                "get_visible_providers",
+                return_value=[{"slug": "github"}, {"slug": "slack"}],
+            ),
         ):
             assert chat_runner._connections_managed_mcp_names() == frozenset({"github"})
 
@@ -915,6 +941,10 @@ class TestCrossSurfaceReply:
         state = _state(tmp_path)
         transport = AsyncMock()
         transport.capabilities.max_message_chars = 10
+        # Explicit 0: a MagicMock attribute is a child object, not a number,
+        # so chunk_for_transport cannot compare it. 0 = not byte-capped, which
+        # is the character path this test is about.
+        transport.capabilities.max_message_bytes = 0
         link = MagicMock(channel_id="123", thread_id=None, channel_type="telegram")
 
         with patch.object(chat_runner, "_resolve_mirror_target", return_value=(link, transport)):
@@ -927,6 +957,7 @@ class TestCrossSurfaceReply:
         state = _state(tmp_path)
         transport = AsyncMock()
         transport.capabilities.max_message_chars = 4096
+        transport.capabilities.max_message_bytes = 0
         transport.send_message.side_effect = RuntimeError("offline")
         link = MagicMock(channel_id="123", thread_id=None, channel_type="telegram")
 
@@ -1019,11 +1050,10 @@ class TestScheduleWidgetRegistration:
     async def test_widget_and_image_each_schedule_one_task(self, tmp_path):
         state, slot = _state(tmp_path), _slot()
 
-        with patch.object(
-            chat_runner, "register_widgets_off_loop", new=AsyncMock()
-        ) as widgets, patch.object(
-            chat_runner, "register_images_off_loop", new=AsyncMock()
-        ) as images:
+        with (
+            patch.object(chat_runner, "register_widgets_off_loop", new=AsyncMock()) as widgets,
+            patch.object(chat_runner, "register_images_off_loop", new=AsyncMock()) as images,
+        ):
             chat_runner._schedule_widget_registration(
                 state, slot, "<mcwidget>x</mcwidget> ![a](/tmp/a.png)", "1"
             )
@@ -1054,9 +1084,12 @@ class TestExpandPromptMention:
     def test_sensitive_path_is_blocked(self, tmp_path):
         state, slot = _state(tmp_path), _slot()
 
-        with patch.object(
-            chat_runner, "_find_prompt", return_value={"path": "/home/u/.aws/credentials"}
-        ), patch.object(chat_runner, "is_sensitive_path", return_value=True):
+        with (
+            patch.object(
+                chat_runner, "_find_prompt", return_value={"path": "/home/u/.aws/credentials"}
+            ),
+            patch.object(chat_runner, "is_sensitive_path", return_value=True),
+        ):
             assert chat_runner._expand_prompt_mention("@sop", state, slot) == ("@sop", "blocked")
 
     def test_oversized_prompt_is_refused(self, tmp_path):
@@ -1064,18 +1097,24 @@ class TestExpandPromptMention:
         big = tmp_path / "big.md"
         big.write_text("y" * (chat_runner.MAX_PROMPT_BYTES + 1), newline="\n")
 
-        with patch.object(
-            chat_runner, "_find_prompt", return_value={"path": str(big), "fullName": "big"}
-        ), patch.object(chat_runner, "is_sensitive_path", return_value=False):
+        with (
+            patch.object(
+                chat_runner, "_find_prompt", return_value={"path": str(big), "fullName": "big"}
+            ),
+            patch.object(chat_runner, "is_sensitive_path", return_value=False),
+        ):
             assert chat_runner._expand_prompt_mention("@big", state, slot) == ("@big", "too_large")
 
     def test_unreadable_prompt_is_not_found(self, tmp_path):
         state, slot = _state(tmp_path), _slot()
         missing = tmp_path / "gone.md"
 
-        with patch.object(
-            chat_runner, "_find_prompt", return_value={"path": str(missing), "fullName": "gone"}
-        ), patch.object(chat_runner, "is_sensitive_path", return_value=False):
+        with (
+            patch.object(
+                chat_runner, "_find_prompt", return_value={"path": str(missing), "fullName": "gone"}
+            ),
+            patch.object(chat_runner, "is_sensitive_path", return_value=False),
+        ):
             assert chat_runner._expand_prompt_mention("@gone", state, slot) == (
                 "@gone",
                 "not_found",
@@ -1086,9 +1125,12 @@ class TestExpandPromptMention:
         sop = tmp_path / "sop.md"
         sop.write_text("Do the thing\n", newline="\n")
 
-        with patch.object(
-            chat_runner, "_find_prompt", return_value={"path": str(sop), "fullName": "sop"}
-        ), patch.object(chat_runner, "is_sensitive_path", return_value=False):
+        with (
+            patch.object(
+                chat_runner, "_find_prompt", return_value={"path": str(sop), "fullName": "sop"}
+            ),
+            patch.object(chat_runner, "is_sensitive_path", return_value=False),
+        ):
             expanded, status = chat_runner._expand_prompt_mention("@sop extra ask", state, slot)
 
         assert status == "ok"
@@ -1166,7 +1208,7 @@ class TestConsumePendingReset:
     async def test_no_pending_key_is_a_noop(self, tmp_path):
         state, slot = _state(tmp_path), _slot()
 
-        await chat_runner._consume_pending_reset(state, slot)
+        await chat_runner._consume_pending_reset(state, slot, allow_discard=True)
 
         state.sessions.reset.assert_not_awaited()
 
@@ -1175,7 +1217,7 @@ class TestConsumePendingReset:
         state, slot = _state(tmp_path), _slot()
         slot._pending_reset_history_key = "dashboard:chat-cov-1"
 
-        await chat_runner._consume_pending_reset(state, slot)
+        await chat_runner._consume_pending_reset(state, slot, allow_discard=True)
 
         state.sessions.reset.assert_awaited_once_with("dashboard:chat-cov-1")
         assert slot._pending_reset_history_key is None
@@ -1190,7 +1232,7 @@ class TestConsumePendingReset:
 
         state.sessions.reset = AsyncMock(side_effect=_reset)
 
-        await chat_runner._consume_pending_reset(state, slot)
+        await chat_runner._consume_pending_reset(state, slot, allow_discard=True)
 
         assert slot._pending_reset_history_key == "newer-key"
 
@@ -1200,9 +1242,353 @@ class TestConsumePendingReset:
         slot._pending_reset_history_key = "old-key"
         state.sessions.reset = AsyncMock(side_effect=RuntimeError("no session"))
 
-        await chat_runner._consume_pending_reset(state, slot)
+        await chat_runner._consume_pending_reset(state, slot, allow_discard=True)
 
         assert slot._pending_reset_history_key == "old-key"
+
+    @pytest.mark.asyncio
+    async def test_no_pending_discard_is_a_noop(self, tmp_path):
+        state, slot = _state(tmp_path), _slot()
+
+        await chat_runner._consume_pending_reset(state, slot, allow_discard=True)
+
+        state.sessions.discard_conversation.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_discard_passes_replay_through_and_clears_the_flag(self, tmp_path):
+        state, slot = _state(tmp_path), _slot()
+        slot._pending_discard_conversation_key = "dashboard:chat-cov-1"
+
+        await chat_runner._consume_pending_reset(state, slot, allow_discard=True)
+
+        state.sessions.discard_conversation.assert_awaited_once_with(
+            "dashboard:chat-cov-1", replay=False, skip_if_busy=True
+        )
+        assert slot._pending_discard_conversation_key is None
+
+    @pytest.mark.asyncio
+    async def test_the_discard_always_asks_for_no_replay(self, tmp_path):
+        """One value, not a plumbed choice: replaying the transcript into the
+        fresh conversation returns most of what the reset reclaimed. The manager
+        keeps the flag for the HTTP route, which does let a caller choose."""
+        state, slot = _state(tmp_path), _slot()
+        slot._pending_discard_conversation_key = "dashboard:chat-cov-1"
+
+        await chat_runner._consume_pending_reset(state, slot, allow_discard=True)
+
+        state.sessions.discard_conversation.assert_awaited_once_with(
+            "dashboard:chat-cov-1", replay=False, skip_if_busy=True
+        )
+
+    @pytest.mark.asyncio
+    async def test_discard_failure_leaves_the_flag_armed(self, tmp_path):
+        state, slot = _state(tmp_path), _slot()
+        slot._pending_discard_conversation_key = "old-key"
+        state.sessions.discard_conversation = AsyncMock(side_effect=RuntimeError("no session"))
+
+        await chat_runner._consume_pending_reset(state, slot, allow_discard=True)
+
+        assert slot._pending_discard_conversation_key == "old-key"
+
+    @pytest.mark.asyncio
+    async def test_a_discard_key_queued_during_the_await_is_not_clobbered(self, tmp_path):
+        state, slot = _state(tmp_path), _slot()
+        slot._pending_discard_conversation_key = "old-key"
+
+        async def _discard(_key, **_kw):
+            slot._pending_discard_conversation_key = "newer-key"
+
+        state.sessions.discard_conversation = AsyncMock(side_effect=_discard)
+
+        await chat_runner._consume_pending_reset(state, slot, allow_discard=True)
+
+        assert slot._pending_discard_conversation_key == "newer-key"
+
+    @pytest.mark.asyncio
+    async def test_both_deferrals_run_because_neither_subsumes_the_other(self, tmp_path):
+        """A project reset recreates the session but leaves replay suppression
+        alone, so skipping the discard would hand the next turn a rebuilt
+        [CONVERSATION HISTORY] block for the conversation that was discarded."""
+        state, slot = _state(tmp_path), _slot()
+        slot._pending_reset_history_key = "dashboard:chat-cov-1"
+        slot._pending_discard_conversation_key = "dashboard:chat-cov-1"
+
+        await chat_runner._consume_pending_reset(state, slot, allow_discard=True)
+
+        state.sessions.reset.assert_awaited_once_with("dashboard:chat-cov-1")
+        state.sessions.discard_conversation.assert_awaited_once_with(
+            "dashboard:chat-cov-1", replay=False, skip_if_busy=True
+        )
+        assert slot._pending_reset_history_key is None
+        assert slot._pending_discard_conversation_key is None
+
+    @pytest.mark.asyncio
+    async def test_a_failed_project_reset_does_not_block_the_discard(self, tmp_path):
+        state, slot = _state(tmp_path), _slot()
+        slot._pending_reset_history_key = "old-key"
+        slot._pending_discard_conversation_key = "old-key"
+        state.sessions.reset = AsyncMock(side_effect=RuntimeError("no session"))
+
+        await chat_runner._consume_pending_reset(state, slot, allow_discard=True)
+
+        state.sessions.discard_conversation.assert_awaited_once()
+        assert slot._pending_reset_history_key == "old-key"
+        assert slot._pending_discard_conversation_key is None
+
+
+def _subs(running, *, queued: int = 0):
+    """A subagent registry stub shaped like the two probes the guard reads."""
+    subs = MagicMock()
+    subs.running_agents_for = MagicMock(return_value=running)
+    subs._queued_depth = MagicMock(return_value=queued)
+    return subs
+
+
+class TestConsumePendingDiscardBoundary:
+    """The discard is a full provider teardown, so it is consumed ONLY at the
+    end-of-turn boundary. The other two consume points run just before a turn
+    acquires the session — a channel turn (Slack, Discord) runs on the linked
+    session with no dashboard task at all, so a teardown there lands under a
+    reply that is still streaming and loses it."""
+
+    @pytest.mark.asyncio
+    async def test_default_caller_may_not_consume_a_discard(self, tmp_path):
+        state, slot = _state(tmp_path), _slot()
+        slot._pending_discard_conversation_key = "dashboard:chat-cov-1"
+
+        torn_down = await chat_runner._consume_pending_reset(state, slot)
+
+        state.sessions.discard_conversation.assert_not_awaited()
+        assert slot._pending_discard_conversation_key == "dashboard:chat-cov-1"
+        assert torn_down is False
+
+    @pytest.mark.asyncio
+    async def test_the_end_of_turn_caller_may(self, tmp_path):
+        state, slot = _state(tmp_path), _slot()
+        slot._pending_discard_conversation_key = "dashboard:chat-cov-1"
+
+        torn_down = await chat_runner._consume_pending_reset(state, slot, allow_discard=True)
+
+        state.sessions.discard_conversation.assert_awaited_once_with(
+            "dashboard:chat-cov-1", replay=False, skip_if_busy=True
+        )
+        assert torn_down is True
+
+    @pytest.mark.asyncio
+    async def test_the_default_caller_still_consumes_a_project_reset(self, tmp_path):
+        """Scope pin: only the DISCARD moved to the end-of-turn boundary. The
+        project reset must still run before get_or_create or the turn would reuse
+        the stale session for one turn."""
+        state, slot = _state(tmp_path), _slot()
+        slot._pending_reset_history_key = "dashboard:chat-cov-1"
+
+        torn_down = await chat_runner._consume_pending_reset(state, slot)
+
+        state.sessions.reset.assert_awaited_once_with("dashboard:chat-cov-1")
+        assert torn_down is True
+
+    @pytest.mark.asyncio
+    async def test_the_discard_goes_through_the_atomic_skip_if_busy_path(self, tmp_path):
+        """The busy-check and the teardown must be ONE step under the session
+        lock. Probing here and tearing down afterwards leaves a window in which a
+        channel turn acquires the session's semaphore and begins streaming, and
+        the teardown then removes its provider. So the consumer must delegate the
+        check rather than perform it."""
+        state, slot = _state(tmp_path), _slot()
+        slot._pending_discard_conversation_key = "slack:C1:123"
+
+        await chat_runner._consume_pending_reset(state, slot, allow_discard=True)
+
+        state.sessions.discard_conversation.assert_awaited_once_with(
+            "slack:C1:123", replay=False, skip_if_busy=True
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_manager_refusal_leaves_the_discard_armed(self, tmp_path):
+        """False from the manager means it refused under the lock — a turn was in
+        flight. Nothing was torn down, so the flag must stay armed."""
+        state, slot = _state(tmp_path), _slot()
+        state.sessions.discard_conversation = AsyncMock(return_value=False)
+        slot._pending_discard_conversation_key = "slack:C1:123"
+
+        torn_down = await chat_runner._consume_pending_reset(state, slot, allow_discard=True)
+
+        assert slot._pending_discard_conversation_key == "slack:C1:123"
+        assert torn_down is False
+
+    @pytest.mark.asyncio
+    async def test_a_refused_discard_lands_at_a_later_boundary(self, tmp_path):
+        """The refusal is a wait, not a cancellation."""
+        state, slot = _state(tmp_path), _slot()
+        state.sessions.discard_conversation = AsyncMock(return_value=False)
+        slot._pending_discard_conversation_key = "slack:A"
+
+        await chat_runner._consume_pending_reset(state, slot, allow_discard=True)
+        assert slot._pending_discard_conversation_key == "slack:A"
+
+        state.sessions.discard_conversation = AsyncMock(return_value=True)
+        torn_down = await chat_runner._consume_pending_reset(state, slot, allow_discard=True)
+
+        assert slot._pending_discard_conversation_key is None
+        assert torn_down is True
+
+    @pytest.mark.asyncio
+    async def test_an_accepted_discard_reports_a_teardown(self, tmp_path):
+        state, slot = _state(tmp_path), _slot()
+        slot._pending_discard_conversation_key = "dashboard:chat-cov-1"
+
+        torn_down = await chat_runner._consume_pending_reset(state, slot, allow_discard=True)
+
+        assert torn_down is True
+        assert slot._pending_discard_conversation_key is None
+
+
+class TestConsumePendingDiscardWaitsForSubagents:
+    """``discard_conversation`` releases the shared runtime sub-agent children
+    run on, and turn end is exactly when they outlive their parent — the parent
+    turn ends first, so ``slot.running`` is already False while they keep going.
+    Consuming the discard there would kill their work, so an attached child
+    leaves the flag ARMED and a later consume applies it."""
+
+    @pytest.mark.asyncio
+    async def test_running_child_leaves_the_discard_armed(self, tmp_path):
+        state, slot = _state(tmp_path), _slot()
+        state.subagents = _subs([{"id": "a1"}])
+        slot._pending_discard_conversation_key = "dashboard:chat-cov-1"
+
+        torn_down = await chat_runner._consume_pending_reset(state, slot, allow_discard=True)
+
+        state.sessions.discard_conversation.assert_not_awaited()
+        assert slot._pending_discard_conversation_key == "dashboard:chat-cov-1"
+        assert torn_down is False
+
+    @pytest.mark.asyncio
+    async def test_queued_child_leaves_the_discard_armed(self, tmp_path):
+        """A spawn held by the concurrency gate is absent from the running list
+        yet WILL start on its own, so it counts as attached."""
+        state, slot = _state(tmp_path), _slot()
+        state.subagents = _subs([], queued=2)
+        slot._pending_discard_conversation_key = "dashboard:chat-cov-1"
+
+        await chat_runner._consume_pending_reset(state, slot, allow_discard=True)
+
+        state.sessions.discard_conversation.assert_not_awaited()
+        assert slot._pending_discard_conversation_key == "dashboard:chat-cov-1"
+
+    @pytest.mark.asyncio
+    async def test_inflight_result_delivery_leaves_the_discard_armed(self, tmp_path):
+        """The last child can finish — emptying both probes — while its
+        completion-event injection is still landing."""
+        state, slot = _state(tmp_path), _slot()
+        state.subagents = _subs([])
+        slot._subagent_deliveries_inflight = 1
+        slot._pending_discard_conversation_key = "dashboard:chat-cov-1"
+
+        await chat_runner._consume_pending_reset(state, slot, allow_discard=True)
+
+        state.sessions.discard_conversation.assert_not_awaited()
+        assert slot._pending_discard_conversation_key == "dashboard:chat-cov-1"
+
+    @pytest.mark.asyncio
+    async def test_a_failing_running_probe_leaves_the_discard_armed(self, tmp_path):
+        """A None running-probe is the probe FAILING, not a slot with no
+        children. Fail closed — unknown children are not zero children."""
+        state, slot = _state(tmp_path), _slot()
+        state.subagents = _subs(None)
+        slot._pending_discard_conversation_key = "dashboard:chat-cov-1"
+
+        await chat_runner._consume_pending_reset(state, slot, allow_discard=True)
+
+        state.sessions.discard_conversation.assert_not_awaited()
+        assert slot._pending_discard_conversation_key == "dashboard:chat-cov-1"
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_queue_leaves_the_discard_armed(self, tmp_path):
+        state, slot = _state(tmp_path), _slot()
+        subs = _subs([])
+        subs._queued_depth = MagicMock(side_effect=RuntimeError("queue unreadable"))
+        state.subagents = subs
+        slot._pending_discard_conversation_key = "dashboard:chat-cov-1"
+
+        await chat_runner._consume_pending_reset(state, slot, allow_discard=True)
+
+        state.sessions.discard_conversation.assert_not_awaited()
+        assert slot._pending_discard_conversation_key == "dashboard:chat-cov-1"
+
+    @pytest.mark.asyncio
+    async def test_the_armed_discard_lands_once_the_children_are_gone(self, tmp_path):
+        """The deferral is a wait, not a cancellation: the caller's reset still
+        happens, at the next consume that finds no children."""
+        state, slot = _state(tmp_path), _slot()
+        state.subagents = _subs([{"id": "a1"}])
+        slot._pending_discard_conversation_key = "dashboard:chat-cov-1"
+
+        await chat_runner._consume_pending_reset(state, slot, allow_discard=True)
+        state.sessions.discard_conversation.assert_not_awaited()
+
+        state.subagents = _subs([])
+        torn_down = await chat_runner._consume_pending_reset(state, slot, allow_discard=True)
+
+        state.sessions.discard_conversation.assert_awaited_once_with(
+            "dashboard:chat-cov-1", replay=False, skip_if_busy=True
+        )
+        assert slot._pending_discard_conversation_key is None
+        assert torn_down is True
+
+    @pytest.mark.asyncio
+    async def test_no_children_applies_the_discard(self, tmp_path):
+        state, slot = _state(tmp_path), _slot()
+        state.subagents = _subs([])
+        slot._pending_discard_conversation_key = "dashboard:chat-cov-1"
+
+        await chat_runner._consume_pending_reset(state, slot, allow_discard=True)
+
+        state.sessions.discard_conversation.assert_awaited_once_with(
+            "dashboard:chat-cov-1", replay=False, skip_if_busy=True
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_project_reset_is_not_gated_on_children(self, tmp_path):
+        """Scope pin: the guard covers the conversation discard this change
+        introduced. The pre-existing project-change reset keeps its behaviour."""
+        state, slot = _state(tmp_path), _slot()
+        state.subagents = _subs([{"id": "a1"}])
+        slot._pending_reset_history_key = "dashboard:chat-cov-1"
+
+        torn_down = await chat_runner._consume_pending_reset(state, slot, allow_discard=True)
+
+        state.sessions.reset.assert_awaited_once_with("dashboard:chat-cov-1")
+        assert slot._pending_reset_history_key is None
+        assert torn_down is True
+
+    @pytest.mark.asyncio
+    async def test_a_deferred_discard_does_not_hide_a_project_reset(self, tmp_path):
+        """Both queued, children attached: the project reset still runs and the
+        discard stays armed, so neither deferral swallows the other."""
+        state, slot = _state(tmp_path), _slot()
+        state.subagents = _subs([{"id": "a1"}])
+        slot._pending_reset_history_key = "dashboard:chat-cov-1"
+        slot._pending_discard_conversation_key = "dashboard:chat-cov-1"
+
+        torn_down = await chat_runner._consume_pending_reset(state, slot, allow_discard=True)
+
+        state.sessions.reset.assert_awaited_once_with("dashboard:chat-cov-1")
+        state.sessions.discard_conversation.assert_not_awaited()
+        assert slot._pending_reset_history_key is None
+        assert slot._pending_discard_conversation_key == "dashboard:chat-cov-1"
+        assert torn_down is True
+
+    @pytest.mark.asyncio
+    async def test_no_registry_abstains_rather_than_blocking_forever(self, tmp_path):
+        """No registry means no runtime for a child to be attached to. Blocking
+        on that would arm a discard that could never land."""
+        state, slot = _state(tmp_path), _slot()
+        state.subagents = None
+        slot._pending_discard_conversation_key = "dashboard:chat-cov-1"
+
+        await chat_runner._consume_pending_reset(state, slot, allow_discard=True)
+
+        state.sessions.discard_conversation.assert_awaited_once()
 
 
 # ── eager spawn / resume prefetch ─────────────────────────────────────────
@@ -1220,9 +1606,7 @@ class TestScheduleEagerSpawn:
     def test_config_load_failure_returns_no_task(self, tmp_path):
         state, slot = _state(tmp_path), _slot()
 
-        with patch.object(
-            chat_runner.KiroCrewConfig, "load", side_effect=RuntimeError("bad toml")
-        ):
+        with patch.object(chat_runner.KiroCrewConfig, "load", side_effect=RuntimeError("bad toml")):
             assert chat_runner.schedule_eager_spawn(state, slot) is None
 
     @pytest.mark.asyncio
@@ -1231,8 +1615,9 @@ class TestScheduleEagerSpawn:
         cfg = MagicMock()
         cfg.session.eager_spawn = True
 
-        with patch.object(chat_runner.KiroCrewConfig, "load", return_value=cfg), patch.object(
-            chat_runner, "_eager_spawn", new=AsyncMock()
+        with (
+            patch.object(chat_runner.KiroCrewConfig, "load", return_value=cfg),
+            patch.object(chat_runner, "_eager_spawn", new=AsyncMock()),
         ):
             first = chat_runner.schedule_eager_spawn(state, slot)
             second = chat_runner.schedule_eager_spawn(state, slot)
@@ -1412,10 +1797,10 @@ class TestStartNextQueuedTurn:
         slot.queue_append("two")
         state.subagents = None
 
-        with patch.object(
-            chat_runner.KiroCrewConfig, "load", side_effect=RuntimeError("bad toml")
-        ), patch.object(chat_runner, "spawn_guarded_turn", return_value=MagicMock()) as spawn, patch.object(
-            chat_runner, "_run_chat", return_value=MagicMock()
+        with (
+            patch.object(chat_runner.KiroCrewConfig, "load", side_effect=RuntimeError("bad toml")),
+            patch.object(chat_runner, "spawn_guarded_turn", return_value=MagicMock()) as spawn,
+            patch.object(chat_runner, "_run_chat", return_value=MagicMock()),
         ):
             assert await chat_runner._start_next_queued_turn(state, slot) is True
 
@@ -1439,9 +1824,10 @@ class TestStartNextQueuedTurn:
         slot._stopping = True
         state.subagents = None
 
-        with patch.object(
-            chat_runner, "spawn_guarded_turn", return_value=MagicMock()
-        ), patch.object(chat_runner, "_run_chat", return_value=MagicMock()):
+        with (
+            patch.object(chat_runner, "spawn_guarded_turn", return_value=MagicMock()),
+            patch.object(chat_runner, "_run_chat", return_value=MagicMock()),
+        ):
             assert await chat_runner._start_next_queued_turn(state, slot) is True
 
         assert any("Session reset" in err for err in _errors(slot))
@@ -1461,9 +1847,10 @@ class TestStartNextQueuedTurn:
         slot.queue_append("next please")
         state.subagents = None
 
-        with patch.object(
-            chat_runner, "spawn_guarded_turn", return_value=MagicMock()
-        ), patch.object(chat_runner, "_run_chat", return_value=MagicMock()):
+        with (
+            patch.object(chat_runner, "spawn_guarded_turn", return_value=MagicMock()),
+            patch.object(chat_runner, "_run_chat", return_value=MagicMock()),
+        ):
             assert await chat_runner._start_next_queued_turn(state, slot) is True
 
         roles = [m["role"] for m in slot.messages]
@@ -1502,9 +1889,10 @@ class TestStartNextQueuedTurn:
         slot2._deferred_notes.append({"content": "held", "cls": "reconcile-note"})
         slot2.queue_append("a plain user message")
         state2.subagents = None
-        with patch.object(
-            chat_runner, "spawn_guarded_turn", return_value=MagicMock()
-        ), patch.object(chat_runner, "_run_chat", return_value=MagicMock()):
+        with (
+            patch.object(chat_runner, "spawn_guarded_turn", return_value=MagicMock()),
+            patch.object(chat_runner, "_run_chat", return_value=MagicMock()),
+        ):
             assert await chat_runner._start_next_queued_turn(state2, slot2) is True
         assert slot2._deferred_notes == [], "control: the note should flush off-plan"
 
@@ -1558,9 +1946,12 @@ class TestRunPendingSynthesis:
         async def _boom():
             raise asyncio.TimeoutError
 
-        with patch.object(
-            chat_runner, "spawn_guarded_turn", return_value=asyncio.ensure_future(_boom())
-        ), patch.object(chat_runner, "_run_chat", return_value=MagicMock()):
+        with (
+            patch.object(
+                chat_runner, "spawn_guarded_turn", return_value=asyncio.ensure_future(_boom())
+            ),
+            patch.object(chat_runner, "_run_chat", return_value=MagicMock()),
+        ):
             await chat_runner._run_pending_synthesis(state, slot)
 
         assert slot._pending_synthesis is False
@@ -1594,9 +1985,10 @@ class TestRunPendingSynthesis:
             coro.close()  # never awaited; avoids an un-awaited-coroutine warning
             return asyncio.ensure_future(_ok())
 
-        with patch.object(chat_runner, "spawn_guarded_turn", side_effect=_capture), patch.object(
-            chat_runner, "_run_chat", return_value=MagicMock()
-        ) as run_chat:
+        with (
+            patch.object(chat_runner, "spawn_guarded_turn", side_effect=_capture),
+            patch.object(chat_runner, "_run_chat", return_value=MagicMock()) as run_chat,
+        ):
             await chat_runner._run_pending_synthesis(state, slot)
 
         assert seen.get("rows") == 1, "the row must exist BEFORE the turn is dispatched"
@@ -1681,9 +2073,10 @@ class TestFinishQueueCycle:
         slot._pending_synthesis = True
         state.subagents = MagicMock(running_agents_for=MagicMock(return_value=[]))
 
-        with patch.object(
-            type(slot), "flush_deferred_notes", return_value=0
-        ) as flush, patch.object(chat_runner, "_run_pending_synthesis", new=AsyncMock()):
+        with (
+            patch.object(type(slot), "flush_deferred_notes", return_value=0) as flush,
+            patch.object(chat_runner, "_run_pending_synthesis", new=AsyncMock()),
+        ):
             chat_runner._finish_queue_cycle(state, slot)
             await asyncio.sleep(0)
 
@@ -1760,9 +2153,10 @@ class TestFinishQueueCycle:
         state, slot = _state(tmp_path), _slot()
         slot._pending_synthesis = False
 
-        with patch.object(
-            type(slot), "flush_deferred_notes", return_value=0
-        ) as flush, patch.object(chat_runner, "maybe_refresh_title", new=AsyncMock()):
+        with (
+            patch.object(type(slot), "flush_deferred_notes", return_value=0) as flush,
+            patch.object(chat_runner, "maybe_refresh_title", new=AsyncMock()),
+        ):
             chat_runner._finish_queue_cycle(state, slot)
             await asyncio.sleep(0)
 
@@ -1909,7 +2303,9 @@ class TestNativeSubagentCards:
         assert buf == ["a" * 10]
 
     def test_done_result_marks_a_truncated_feed(self):
-        out = chat_runner._native_done_result(["z" * (chat_runner.NATIVE_SUBAGENT_DONE_RESULT_CAP + 5)])
+        out = chat_runner._native_done_result(
+            ["z" * (chat_runner.NATIVE_SUBAGENT_DONE_RESULT_CAP + 5)]
+        )
 
         assert out.startswith(chat_runner.NATIVE_SUBAGENT_DONE_TRUNC_MARKER)
 
@@ -1933,19 +2329,19 @@ class TestCommandParsing:
         assert list(restore.values()) == ["|"]
 
     def test_command_substitution_is_denied_by_default(self):
-        assert chat_runner._matches_trusted_pattern("Running: echo $(whoami)", {"echo*"}) is None
+        assert chat_runner._matches_trusted_pattern("echo $(whoami)", {"echo*"}) is None
 
     def test_every_segment_must_match_for_a_chained_command(self):
-        assert chat_runner._matches_trusted_pattern("Running: ls | rm -rf x", {"ls*"}) is None
+        assert chat_runner._matches_trusted_pattern("ls | rm -rf x", {"ls*"}) is None
 
     def test_all_matching_segments_return_joined_patterns(self):
-        matched = chat_runner._matches_trusted_pattern("Running: ls | wc -l", {"ls*", "wc*"})
+        matched = chat_runner._matches_trusted_pattern("ls | wc -l", {"ls*", "wc*"})
 
         assert matched is not None
         assert matched.count(",") == 1
 
     def test_redirect_forms_are_not_treated_as_separators(self):
-        assert chat_runner._matches_trusted_pattern("Running: ls 2>&1", {"ls*"}) is not None
+        assert chat_runner._matches_trusted_pattern("ls 2>&1", {"ls*"}) is not None
 
     def test_an_escaped_quote_does_not_hide_a_real_separator(self):
         """A closing quote followed by `\\'` leaves quoted context, so the `;`
@@ -1956,7 +2352,7 @@ class TestCommandParsing:
         command inherits whatever the first segment was allowed to do. Verified
         against a real shell: `echo 'foo'\\'; cmd` runs `cmd`.
         """
-        command = "Running: echo 'foo'\\'; whoami"
+        command = "echo 'foo'\\'; whoami"
         _, segments = chat_runner._split_command_segments(command) or ("", [])
 
         assert len(segments) == 2, segments
@@ -1968,7 +2364,7 @@ class TestCommandParsing:
         reading: the line is an unterminated quote, which a shell refuses to run
         at all rather than executing a second command, so there is nothing here
         for segmentation to protect against."""
-        command = 'Running: echo "foo\\"; whoami'
+        command = 'echo "foo\\"; whoami'
         _, segments = chat_runner._split_command_segments(command) or ("", [])
 
         assert len(segments) == 1, segments
@@ -1977,7 +2373,7 @@ class TestCommandParsing:
         """`\\;` is an escaped literal to the shell, not a separator -- but the
         allowlist must not approve the tail either way, so segmentation stays
         fail-closed rather than trying to model every escape."""
-        assert chat_runner._matches_trusted_pattern("Running: ls \\; whoami", {"ls*"}) is None
+        assert chat_runner._matches_trusted_pattern("ls \\; whoami", {"ls*"}) is None
 
     def test_a_backslash_inside_single_quotes_stays_literal(self):
         """The shell does not honor escapes inside single quotes, so a trailing
@@ -1988,10 +2384,10 @@ class TestCommandParsing:
         assert masked.endswith("&& wc -l")
 
     def test_base_command_extraction_dedups_across_segments(self):
-        assert chat_runner._extract_base_command("Running: cat a | wc -l | cat b") == "cat,wc"
+        assert chat_runner._extract_base_command("cat a | wc -l | cat b") == "cat,wc"
 
-    def test_full_command_strips_the_display_prefix(self):
-        assert chat_runner._extract_full_command("Running: ls -la") == "ls -la"
+    def test_full_command_preserves_canonical_text(self):
+        assert chat_runner._extract_full_command("Reading /usr/bin/id") == "Reading /usr/bin/id"
 
 
 # ── model backfill / pin guards ───────────────────────────────────────────
@@ -2040,29 +2436,31 @@ class TestModelBackfill:
 
 
 class TestPinnedModelWithheld:
-    @pytest.mark.parametrize("model,provider", [("", "kiro"), ("auto", "kiro"), ("x", "claude_code")])
+    @pytest.mark.parametrize(
+        "model,provider", [("", "kiro"), ("auto", "kiro"), ("x", "claude_code")]
+    )
     def test_unpinnable_combinations_are_never_withheld(self, model, provider):
-        assert chat_runner._pinned_model_withheld(MagicMock(), model, provider) is False
+        assert chat_runner._pinned_model_verdict(MagicMock(), model, provider) is None
 
     def test_claude_backend_is_exempt(self):
         client = MagicMock()
         client.is_claude_backend = True
 
-        assert chat_runner._pinned_model_withheld(client, "claude-opus-5", "kiro") is False
+        assert chat_runner._pinned_model_verdict(client, "claude-opus-5", "kiro") is None
 
     def test_provider_without_an_advertiser_leaves_the_pin_alone(self):
         client = MagicMock()
         client.is_claude_backend = False
         client.available_models = "not-callable"
 
-        assert chat_runner._pinned_model_withheld(client, "claude-opus-5", "kiro") is False
+        assert chat_runner._pinned_model_verdict(client, "claude-opus-5", "kiro") is None
 
     def test_advertiser_failure_fails_open(self):
         client = MagicMock()
         client.is_claude_backend = False
         client.available_models = MagicMock(side_effect=RuntimeError("no session"))
 
-        assert chat_runner._pinned_model_withheld(client, "claude-opus-5", "kiro") is False
+        assert chat_runner._pinned_model_verdict(client, "claude-opus-5", "kiro") is None
 
     def test_unadvertised_pin_is_reported_as_withheld(self):
         client = MagicMock()
@@ -2070,7 +2468,7 @@ class TestPinnedModelWithheld:
         client.available_models = MagicMock(return_value=[{"modelId": "claude-sonnet-4.6"}])
 
         with patch.object(chat_runner, "advertised_model_ids", return_value={"claude-sonnet-4.6"}):
-            assert chat_runner._pinned_model_withheld(client, "claude-opus-5", "kiro") is True
+            assert chat_runner._pinned_model_verdict(client, "claude-opus-5", "kiro") is True
 
 
 class TestContextUsagePayload:
@@ -2248,6 +2646,59 @@ class TestRunChatRecoveryLadders:
         assert slot._queue == []
 
     @pytest.mark.asyncio
+    async def test_compaction_failure_neither_retries_nor_claims_a_lost_link(self, tmp_path):
+        """A compaction-failed turn is terminal: the reason is in the "error:"
+        family, so without its own branch it lands in pipe-death recovery — a
+        re-queue plus a "Connection lost" card, both false. Compaction retry
+        policy is not this layer's to invent (issue #3583)."""
+        state, client = _runner_state(tmp_path)
+        slot = _slot()
+        _set_stream(
+            client,
+            [
+                LLMEvent(
+                    kind="compaction_status",
+                    text="failed",
+                    title="context window exceeded",
+                ),
+                _complete(STOP_REASON_COMPACTION_FAILED),
+            ],
+        )
+
+        await _drive(state, slot)
+
+        errors = _errors(slot)
+        assert not any("Connection lost" in err for err in errors), errors
+        assert not any("Session stuck" in err for err in errors), errors
+        assert slot._acp_pipe_death_retries == 0
+        assert slot._queue == []
+        # The failure is still explained — by the compaction notice the status
+        # path appended, which is the only message this turn needs.
+        assert any(
+            "Compaction failed" in m.get("content", "")
+            and "context window exceeded" in m.get("content", "")
+            for m in slot.messages
+        ), slot.messages
+
+    @pytest.mark.asyncio
+    async def test_compaction_failure_resets_the_abandoned_backend_session(self, tmp_path):
+        """The completion is synthetic — the client stopped reading; the
+        backend never sent end_turn — so without a reset the runtime still
+        counts the turn as in progress and the NEXT prompt collides with
+        "prompt already in progress". The finally must reset (tear down +
+        session/load resume) WITHOUT re-queuing anything."""
+        state, client = _runner_state(tmp_path)
+        slot = _slot()
+        state.sessions.reset = AsyncMock()
+        _set_stream(client, [_complete(STOP_REASON_COMPACTION_FAILED)])
+
+        await _drive(state, slot)
+
+        state.sessions.reset.assert_awaited_once()
+        assert slot._queue == []
+        assert slot._acp_pipe_death_retries == 0
+
+    @pytest.mark.asyncio
     async def test_tool_stall_recovery_names_the_stalled_tool(self, tmp_path):
         state, client = _runner_state(tmp_path)
         slot = _slot()
@@ -2335,6 +2786,322 @@ class TestRunChatRecoveryLadders:
 
 
 class TestRunChatAutoApproveRungs:
+    @pytest.fixture(autouse=True)
+    def _vouch_for_the_program(self):
+        """Let these tests exercise the RUNG, not the host's program layout.
+
+        Each rung now re-judges its own auto-approve by asking whether the
+        command's program names still identify the programs they name
+        (``name_grant``), which resolves against the real ``PATH`` and reads the
+        file behind each name. That made these tests depend on the machine: they
+        use ``ls -la``, which passes on Linux because ``ls`` lives in a trusted
+        system directory and FAILS on Windows, where there is no such ``ls`` --
+        so the rung declined, `approve_tool` was never called, and the assertions
+        below broke on one platform only. The thread hop the real check needs also
+        outlives these tests' event loop and crashed the xdist worker.
+
+        Stubbing it keeps each test measuring what its name claims -- does the
+        rung approve, reject, and render -- while the check itself is covered
+        directly in ``test/test_name_grant.py``. It patches the ONE off-loop
+        entry point every rung goes through; patching only the event-shaped
+        wrapper left two rungs spawning real threads, which is why the Windows
+        workers kept crashing after the first attempt at this.
+        """
+
+        with patch.object(
+            chat_runner, "_name_grant_refusal_off_loop", new=AsyncMock(return_value=None)
+        ):
+            yield
+
+    @pytest.mark.asyncio
+    async def test_a_non_shell_approval_mints_no_shell_witness(self, tmp_path):
+        """GPT 5.6 round-22: a non-shell approval must not pin a shell program.
+
+        `extract_bash_command` reads a `command` key out of ANY structured input,
+        so a non-shell MCP call carrying `{"command": "gh ..."}` would otherwise
+        record a durable identity for `gh` from an approval that was never about
+        running `gh`.
+        """
+        state, client = _runner_state(tmp_path)
+        slot = _slot()
+        _set_stream(
+            client,
+            [
+                _permission(
+                    title="Looking up the record",
+                    tool_input='{"command": "gh repo view"}',
+                    tool_kind="other",
+                    is_shell=False,
+                    tool_name="read_record",
+                    mcp_server_name="records:primary",
+                ),
+                _complete(),
+            ],
+        )
+
+        def _allow_once_when_registered():
+            future = slot._approval_futures.get("req-cov-1")
+            if future is not None and not future.done():
+                future.set_result("approved")
+
+        state.push_slots_update.side_effect = _allow_once_when_registered
+        with patch.object(chat_runner, "pin_human_approval") as pin:
+            await _drive(state, slot)
+
+        # The branch really was reached -- otherwise the assertion below would
+        # pass for the wrong reason, which is exactly how a guard like this gets
+        # a test that cannot fail.
+        client.approve_tool.assert_awaited_once_with("req-cov-1")
+        pin.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_declined_name_grant_is_audited(self, tmp_path):
+        """GPT 5.6 round-19: declining a grant is a security decision, so it is logged.
+
+        Without this the audit trail shows a command arriving at the interactive
+        card and never says a name grant was withheld, or why.
+        """
+        state, client = _runner_state(tmp_path)
+        slot = _slot()
+        slot._trust_reads = True
+        _set_stream(
+            client,
+            [_permission(title="Running: ls -la", tool_input='{"command": "ls -la"}'), _complete()],
+        )
+        refusal = name_grant.Refusal(name_grant.SHADOWED, "ls resolves to /writable/ls")
+        slot._empty_response_retries = 2
+        with (
+            patch.object(chat_runner, "sel") as mock_sel,
+            patch.object(
+                chat_runner, "_name_grant_refusal_off_loop", new=AsyncMock(return_value=refusal)
+            ),
+            patch.object(chat_runner, "tool_approval_timeout_secs", return_value=0.0),
+        ):
+            audit = MagicMock()
+            mock_sel.return_value = audit
+            await chat_runner._run_chat(state, slot, "hello")
+        await _settle(slot)
+
+        declined = [
+            c.kwargs
+            for c in audit.log_tool_invocation.call_args_list
+            if c.kwargs.get("outcome") == "auto_approve_declined"
+        ]
+        assert declined, audit.log_tool_invocation.call_args_list
+        assert declined[0]["metadata"]["code"] == name_grant.SHADOWED
+        assert declined[0]["metadata"]["tier"] == "trust_reads"
+        # The CODE, never the detail: the detail names resolved paths, and an
+        # audit sink is exactly where that becomes a disclosure.
+        assert "/writable/ls" not in json.dumps(declined[0], default=str)
+
+    @pytest.mark.asyncio
+    async def test_non_shell_trust_matches_cached_server_tool_identity(self, tmp_path):
+        state, client = _runner_state(tmp_path)
+        slot = _slot()
+        canonical = canonical_non_shell_trust_key("records:primary", "read_record")
+        slot._trusted_patterns = {exact_trust_pattern(canonical)}
+        _set_stream(
+            client,
+            [
+                _permission(
+                    title="Looking up the record",
+                    tool_kind="other",
+                    is_shell=False,
+                    tool_name="read_record",
+                    mcp_server_name="records:primary",
+                ),
+                _complete(),
+            ],
+        )
+
+        await _drive(state, slot)
+
+        client.approve_tool.assert_awaited_once_with("req-cov-1")
+
+    @pytest.mark.asyncio
+    async def test_structured_non_shell_reprompt_never_matches_tool_identity_trust(self, tmp_path):
+        """Consumed display input must not erase argument provenance."""
+        state, client = _runner_state(tmp_path)
+        slot = _slot()
+        canonical = canonical_non_shell_trust_key("records:primary", "read_record")
+        slot._trusted_patterns = {exact_trust_pattern(canonical)}
+        permission = _permission(
+            title="Looking up the record",
+            tool_input="",
+            tool_kind="other",
+            is_shell=False,
+            tool_name="read_record",
+            mcp_server_name="records:primary",
+            raw_tool_params={"record_id": "sensitive-record"},
+        )
+        _set_stream(client, [permission, _complete()])
+
+        with patch.object(chat_runner, "tool_approval_timeout_secs", return_value=0.0):
+            await _drive(state, slot)
+
+        client.approve_tool.assert_not_awaited()
+        client.reject_tool.assert_awaited_once_with("req-cov-1")
+        (card,) = [m for m in slot.messages if m.get("role") == "permission"]
+        meta = json.loads(card["cls"])
+        assert "full_command" not in meta
+        assert "trust_command_key" not in meta
+        assert "trust_command_grantable" not in meta
+        assert "trust_grantable" not in meta
+
+    @pytest.mark.asyncio
+    async def test_reused_non_shell_title_cannot_match_another_tools_trust(self, tmp_path):
+        """The title is model prose; only the cached ACP identity may match."""
+        state, client = _runner_state(tmp_path)
+        slot = _slot()
+        slot._trusted_patterns = {
+            exact_trust_pattern(canonical_non_shell_trust_key("records:primary", "read_record"))
+        }
+        _set_stream(
+            client,
+            [
+                _permission(
+                    title="Looking up the record",
+                    tool_kind="other",
+                    is_shell=False,
+                    tool_name="delete_record",
+                    mcp_server_name="records:primary",
+                ),
+                _complete(),
+            ],
+        )
+
+        with patch.object(chat_runner, "tool_approval_timeout_secs", return_value=0.0):
+            await _drive(state, slot)
+
+        client.approve_tool.assert_not_awaited()
+        client.reject_tool.assert_awaited_once_with("req-cov-1")
+
+    @pytest.mark.asyncio
+    async def test_non_shell_identity_collision_cannot_auto_approve_other_tool(self, tmp_path):
+        """One wire-shaped display identity may not imply one trust identity."""
+        state, client = _runner_state(tmp_path)
+        slot = _slot()
+        granted = canonical_non_shell_trust_key("github", "repo__delete")
+        colliding = canonical_non_shell_trust_key("github__repo", "delete")
+        assert granted != colliding
+        slot._trusted_patterns = {exact_trust_pattern(granted)}
+        _set_stream(
+            client,
+            [
+                _permission(
+                    title="Repository action",
+                    tool_kind="other",
+                    is_shell=False,
+                    tool_name="delete",
+                    mcp_server_name="github__repo",
+                ),
+                _complete(),
+            ],
+        )
+
+        with patch.object(chat_runner, "tool_approval_timeout_secs", return_value=0.0):
+            await _drive(state, slot)
+
+        client.approve_tool.assert_not_awaited()
+        client.reject_tool.assert_awaited_once_with("req-cov-1")
+
+    @pytest.mark.asyncio
+    async def test_non_shell_identity_cache_miss_stays_allow_once_or_reject(self, tmp_path):
+        state, client = _runner_state(tmp_path)
+        slot = _slot()
+        slot._trusted_patterns = {"*"}
+        _set_stream(
+            client,
+            [
+                _permission(
+                    title="Shared model-authored title",
+                    tool_kind="other",
+                    is_shell=False,
+                ),
+                _complete(),
+            ],
+        )
+
+        def _allow_once_when_registered():
+            future = slot._approval_futures.get("req-cov-1")
+            if future is not None and not future.done():
+                future.set_result("approved")
+
+        state.push_slots_update.side_effect = _allow_once_when_registered
+        await _drive(state, slot)
+
+        (card,) = [m for m in slot.messages if m.get("role") == "permission"]
+        meta = json.loads(card["cls"])
+        assert "full_command" not in meta
+        assert "trust_command_key" not in meta
+        assert "trust_command_grantable" not in meta
+        assert "trust_grantable" not in meta
+        client.approve_tool.assert_awaited_once_with("req-cov-1")
+
+    @pytest.mark.asyncio
+    async def test_redacted_command_never_matches_existing_trust_pattern(self, tmp_path):
+        state, client = _runner_state(tmp_path)
+        slot = _slot()
+        displayed = "echo [REDACTED: credential]"
+        # This exact pattern can legitimately be granted for a command whose
+        # literal argument is the display marker.  It must not cover a different
+        # command that only became identical after transport redaction.
+        slot._trusted_patterns = {exact_trust_pattern(displayed)}
+        permission = _permission(tool_input=json.dumps({"command": displayed}))
+        permission.tool_input_redacted = True
+        _set_stream(client, [permission, _complete()])
+
+        with patch.object(chat_runner, "tool_approval_timeout_secs", return_value=0.0):
+            await _drive(state, slot)
+
+        client.approve_tool.assert_not_awaited()
+        client.reject_tool.assert_awaited_once_with("req-cov-1")
+
+    @pytest.mark.asyncio
+    async def test_browser_cli_presence_does_not_skip_shell_approval(self, tmp_path, monkeypatch):
+        from kiro_crew.browser_cli import install
+
+        state, client = _runner_state(tmp_path)
+        slot = _slot()
+        _set_stream(
+            client,
+            [
+                _permission(
+                    title="Running: playwright-cli snapshot",
+                    tool_input=json.dumps({"command": "playwright-cli snapshot"}),
+                ),
+                _complete(),
+            ],
+        )
+        # Pin the capability as present without consulting or touching the host.
+        monkeypatch.setattr(install, "cli_path", lambda: "/agent-writable/playwright-cli")
+
+        with patch.object(chat_runner, "tool_approval_timeout_secs", return_value=0.0):
+            await _drive(state, slot)
+
+        client.approve_tool.assert_not_awaited()
+        client.reject_tool.assert_awaited_once_with("req-cov-1")
+
+    @pytest.mark.asyncio
+    async def test_browser_cli_explicit_trusted_pattern_still_auto_approves(self, tmp_path):
+        state, client = _runner_state(tmp_path)
+        slot = _slot()
+        slot._trusted_patterns = {"playwright-cli*"}
+        _set_stream(
+            client,
+            [
+                _permission(
+                    title="Running: playwright-cli snapshot",
+                    tool_input=json.dumps({"command": "playwright-cli snapshot"}),
+                ),
+                _complete(),
+            ],
+        )
+
+        await _drive(state, slot)
+
+        client.approve_tool.assert_awaited_once_with("req-cov-1")
+
     @pytest.mark.asyncio
     async def test_trusted_pattern_auto_approves_a_matching_command(self, tmp_path):
         state, client = _runner_state(tmp_path)
@@ -2352,8 +3119,7 @@ class TestRunChatAutoApproveRungs:
 
         client.approve_tool.assert_awaited_once_with("req-cov-1")
         assert any(
-            m.get("role") == "tool" and m.get("content", "").startswith("🔧")
-            for m in slot.messages
+            m.get("role") == "tool" and m.get("content", "").startswith("🔧") for m in slot.messages
         )
 
     @pytest.mark.asyncio
@@ -2423,6 +3189,85 @@ class TestRunChatAutoApproveRungs:
 
 
 class TestRunChatApprovalWindow:
+    @pytest.mark.asyncio
+    async def test_non_shell_card_separates_display_from_collision_free_trust_key(self, tmp_path):
+        state, client = _runner_state(tmp_path)
+        slot = _slot()
+        _set_stream(
+            client,
+            [
+                _permission(
+                    title="Repository action",
+                    tool_input="",
+                    tool_kind="other",
+                    is_shell=False,
+                    tool_name="repo__delete",
+                    mcp_server_name="github",
+                ),
+                _complete(),
+            ],
+        )
+
+        with patch.object(chat_runner, "tool_approval_timeout_secs", return_value=0.0):
+            await _drive(state, slot)
+
+        (card,) = [m for m in slot.messages if m.get("role") == "permission"]
+        meta = json.loads(card["cls"])
+        # Preserve the ACP-compatible UI label while keeping authority in the
+        # injective server-only field.
+        assert meta["full_command"] == "mcp__github__repo__delete"
+        assert meta["trust_command_key"] == canonical_non_shell_trust_key("github", "repo__delete")
+        assert meta["trust_command_key"] != canonical_non_shell_trust_key("github__repo", "delete")
+        assert meta["trust_command_grantable"] == "1"
+        client.reject_tool.assert_awaited_once_with("req-cov-1")
+
+    @pytest.mark.asyncio
+    async def test_redacted_command_still_allows_one_time_approval(self, tmp_path):
+        state, client = _runner_state(tmp_path)
+        slot = _slot()
+        permission = _permission(tool_input=json.dumps({"command": "echo [REDACTED: credential]"}))
+        permission.tool_input_redacted = True
+        _set_stream(client, [permission, _complete()])
+
+        def _approve_when_registered():
+            future = slot._approval_futures.get("req-cov-1")
+            if future is not None and not future.done():
+                future.set_result("approved")
+
+        state.push_slots_update.side_effect = _approve_when_registered
+
+        await _drive(state, slot)
+
+        client.approve_tool.assert_awaited_once_with("req-cov-1")
+        client.reject_tool.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_redacted_command_is_allow_once_only(self, tmp_path):
+        """Different hidden commands collapse to the same display marker.
+
+        The transport provenance therefore suppresses every durable command
+        scope while leaving the ordinary approval card live.
+        """
+        state, client = _runner_state(tmp_path)
+        slot = _slot()
+        permission = _permission(tool_input=json.dumps({"command": "echo [REDACTED: credential]"}))
+        permission.tool_input_redacted = True
+        _set_stream(client, [permission, _complete()])
+
+        with patch.object(chat_runner, "tool_approval_timeout_secs", return_value=0.0):
+            await _drive(state, slot)
+
+        (card,) = [m for m in slot.messages if m.get("role") == "permission"]
+        meta = json.loads(card["cls"])
+        assert meta["tool_input"] == '{"command": "echo [REDACTED: credential]"}'
+        assert "full_command" not in meta
+        assert "trust_command_key" not in meta
+        assert "base_command" not in meta
+        assert "trust_command_grantable" not in meta
+        assert "trust_base_grantable" not in meta
+        assert "trust_grantable" not in meta
+        client.reject_tool.assert_awaited_once_with("req-cov-1")
+
     @pytest.mark.asyncio
     async def test_no_remaining_budget_declines_without_waiting(self, tmp_path):
         state, client = _runner_state(tmp_path)
@@ -2521,8 +3366,9 @@ class TestRunChatPlanGate:
             ],
         )
 
-        with patch.object(chat_runner, "looks_like_plan", return_value=True), patch.object(
-            chat_runner, "_rephrase_plan_lite", new=AsyncMock(return_value=good)
+        with (
+            patch.object(chat_runner, "looks_like_plan", return_value=True),
+            patch.object(chat_runner, "_rephrase_plan_lite", new=AsyncMock(return_value=good)),
         ):
             await _drive(state, slot)
 
@@ -2581,23 +3427,20 @@ class TestAppAgentDispatchGuard:
         slot._app = "myapp"
         slot.agent = "my-app-agent"
 
-        cold = _bindings(
-            kiro_agent="kirocrew", resolved_alias="default", requested_resolved=False
-        )
+        cold = _bindings(kiro_agent="kirocrew", resolved_alias="default", requested_resolved=False)
         warm = _bindings(
             kiro_agent="my-app-agent",
             resolved_alias="my-app-agent",
             requested_resolved=True,
         )
         refresh = MagicMock()
-        with patch.object(
-            chat_runner, "resolve_agent_bindings", side_effect=[cold, warm]
-        ) as resolve, patch.object(
-            chat_runner, "refresh_materialized_agents", refresh
-        ), patch.object(
-            chat_runner, "subprocess_executor", MagicMock(return_value=None)
-        ), patch.object(
-            chat_runner, "warm_project_agent_names", new=AsyncMock()
+        with (
+            patch.object(
+                chat_runner, "resolve_agent_bindings", side_effect=[cold, warm]
+            ) as resolve,
+            patch.object(chat_runner, "refresh_materialized_agents", refresh),
+            patch.object(chat_runner, "subprocess_executor", MagicMock(return_value=None)),
+            patch.object(chat_runner, "warm_project_agent_names", new=AsyncMock()),
         ):
             await _drive(state, slot)
 
@@ -2620,9 +3463,7 @@ class TestAppAgentDispatchGuard:
         slot._app = "myapp"
         slot.agent = "my-app-agent"
 
-        cold = _bindings(
-            kiro_agent="kirocrew", resolved_alias="default", requested_resolved=False
-        )
+        cold = _bindings(kiro_agent="kirocrew", resolved_alias="default", requested_resolved=False)
         warm = _bindings(
             kiro_agent="my-app-agent",
             resolved_alias="my-app-agent",
@@ -2630,18 +3471,15 @@ class TestAppAgentDispatchGuard:
         )
         refresh = MagicMock()
         reregister = MagicMock(return_value=["my-app-agent"])
-        with patch.object(
-            chat_runner, "resolve_agent_bindings", side_effect=[cold, cold, warm]
-        ) as resolve, patch.object(
-            chat_runner, "refresh_materialized_agents", refresh
-        ), patch(
-            "kiro_crew.apps.bridges.register_app", reregister
-        ), patch(
-            "kiro_crew.apps.manager.is_app_enabled", MagicMock(return_value=True)
-        ), patch.object(
-            chat_runner, "subprocess_executor", MagicMock(return_value=None)
-        ), patch.object(
-            chat_runner, "warm_project_agent_names", new=AsyncMock()
+        with (
+            patch.object(
+                chat_runner, "resolve_agent_bindings", side_effect=[cold, cold, warm]
+            ) as resolve,
+            patch.object(chat_runner, "refresh_materialized_agents", refresh),
+            patch("kiro_crew.apps.bridges.register_app", reregister),
+            patch("kiro_crew.apps.manager.is_app_enabled", MagicMock(return_value=True)),
+            patch.object(chat_runner, "subprocess_executor", MagicMock(return_value=None)),
+            patch.object(chat_runner, "warm_project_agent_names", new=AsyncMock()),
         ):
             await _drive(state, slot)
 
@@ -2662,23 +3500,18 @@ class TestAppAgentDispatchGuard:
         slot._app = "myapp"
         slot.agent = "my-app-agent"
 
-        cold = _bindings(
-            kiro_agent="kirocrew", resolved_alias="default", requested_resolved=False
-        )
+        cold = _bindings(kiro_agent="kirocrew", resolved_alias="default", requested_resolved=False)
         refresh = MagicMock()
         reregister = MagicMock(return_value=[])
-        with patch.object(
-            chat_runner, "resolve_agent_bindings", side_effect=[cold, cold, cold]
-        ) as resolve, patch.object(
-            chat_runner, "refresh_materialized_agents", refresh
-        ), patch(
-            "kiro_crew.apps.bridges.register_app", reregister
-        ), patch(
-            "kiro_crew.apps.manager.is_app_enabled", MagicMock(return_value=True)
-        ), patch.object(
-            chat_runner, "subprocess_executor", MagicMock(return_value=None)
-        ), patch.object(
-            chat_runner, "warm_project_agent_names", new=AsyncMock()
+        with (
+            patch.object(
+                chat_runner, "resolve_agent_bindings", side_effect=[cold, cold, cold]
+            ) as resolve,
+            patch.object(chat_runner, "refresh_materialized_agents", refresh),
+            patch("kiro_crew.apps.bridges.register_app", reregister),
+            patch("kiro_crew.apps.manager.is_app_enabled", MagicMock(return_value=True)),
+            patch.object(chat_runner, "subprocess_executor", MagicMock(return_value=None)),
+            patch.object(chat_runner, "warm_project_agent_names", new=AsyncMock()),
         ):
             await _drive(state, slot)
 
@@ -2705,22 +3538,15 @@ class TestAppAgentDispatchGuard:
         slot._app = "myapp"
         slot.agent = "my-app-agent"
 
-        cold = _bindings(
-            kiro_agent="kirocrew", resolved_alias="default", requested_resolved=False
-        )
+        cold = _bindings(kiro_agent="kirocrew", resolved_alias="default", requested_resolved=False)
         reregister = MagicMock(return_value=["my-app-agent"])
-        with patch.object(
-            chat_runner, "resolve_agent_bindings", side_effect=[cold, cold, cold]
-        ), patch.object(
-            chat_runner, "refresh_materialized_agents", MagicMock()
-        ), patch(
-            "kiro_crew.apps.bridges.register_app", reregister
-        ), patch(
-            "kiro_crew.apps.manager.is_app_enabled", MagicMock(return_value=False)
-        ), patch.object(
-            chat_runner, "subprocess_executor", MagicMock(return_value=None)
-        ), patch.object(
-            chat_runner, "warm_project_agent_names", new=AsyncMock()
+        with (
+            patch.object(chat_runner, "resolve_agent_bindings", side_effect=[cold, cold, cold]),
+            patch.object(chat_runner, "refresh_materialized_agents", MagicMock()),
+            patch("kiro_crew.apps.bridges.register_app", reregister),
+            patch("kiro_crew.apps.manager.is_app_enabled", MagicMock(return_value=False)),
+            patch.object(chat_runner, "subprocess_executor", MagicMock(return_value=None)),
+            patch.object(chat_runner, "warm_project_agent_names", new=AsyncMock()),
         ):
             await _drive(state, slot)
 
@@ -2758,12 +3584,11 @@ class TestAppAgentDispatchGuard:
             resolved_alias="my-app-agent",
             requested_resolved=True,
         )
-        with patch.object(cr, "resolve_agent_bindings", return_value=warm), patch.object(
-            cr, "subprocess_executor", MagicMock(return_value=None)
-        ), patch(
-            "kiro_crew.apps.manager.is_app_enabled", MagicMock(return_value=True)
-        ), patch(
-            "kiro_crew.apps.bridges.register_app", slow_register
+        with (
+            patch.object(cr, "resolve_agent_bindings", return_value=warm),
+            patch.object(cr, "subprocess_executor", MagicMock(return_value=None)),
+            patch("kiro_crew.apps.manager.is_app_enabled", MagicMock(return_value=True)),
+            patch("kiro_crew.apps.bridges.register_app", slow_register),
         ):
             task = asyncio.create_task(
                 cr._recover_app_agent_binding(MagicMock(), slot, project=None)
@@ -2794,20 +3619,53 @@ class TestAppAgentDispatchGuard:
         # Never reached when the bail is present; set so a REMOVED bail would fail
         # on the assertion below (get_or_create awaited) rather than on unpacking.
         state.sessions.get_or_create = AsyncMock(return_value=(MagicMock(), True, False))
-        cold = _bindings(
-            kiro_agent="kirocrew", resolved_alias="default", requested_resolved=False
-        )
-        with patch.object(chat_runner.asyncio, "sleep", new=AsyncMock()), patch.object(
-            chat_runner, "_consume_pending_reset", new=AsyncMock()
-        ), patch.object(
-            chat_runner, "resolve_agent_bindings", side_effect=[cold, cold, cold]
-        ), patch.object(
-            chat_runner, "refresh_materialized_agents", MagicMock()
-        ), patch(
-            "kiro_crew.apps.bridges.register_app", MagicMock(return_value=[])
-        ), patch.object(
-            chat_runner, "subprocess_executor", MagicMock(return_value=None)
+        cold = _bindings(kiro_agent="kirocrew", resolved_alias="default", requested_resolved=False)
+        with (
+            patch.object(chat_runner.asyncio, "sleep", new=AsyncMock()),
+            patch.object(chat_runner, "_consume_pending_reset", new=AsyncMock()),
+            patch.object(chat_runner, "resolve_agent_bindings", side_effect=[cold, cold, cold]),
+            patch.object(chat_runner, "refresh_materialized_agents", MagicMock()),
+            patch("kiro_crew.apps.bridges.register_app", MagicMock(return_value=[])),
+            patch.object(chat_runner, "subprocess_executor", MagicMock(return_value=None)),
         ):
             await chat_runner._eager_spawn(state, slot)
 
         state.sessions.get_or_create.assert_not_awaited()
+
+
+class TestPromptSubmitTranscriptRead:
+    """The re-injection probe's transcript read must not run on the loop.
+
+    ``_run_chat`` compares the in-memory message count against the on-disk one to
+    decide whether a reset session needs its history re-injected. That disk count
+    comes from ``read_messages``, which parses the whole transcript -- 100-300 ms
+    on a large store, on the hottest path there is (issue #7408).
+    """
+
+    @pytest.mark.asyncio
+    async def test_disk_count_read_runs_off_the_loop_thread(self, tmp_path, monkeypatch):
+        state, client = _runner_state(tmp_path)
+        _set_stream(client, [_complete()])
+        slot = _slot()
+        # A non-empty in-memory window is what arms the probe; without it the
+        # branch holding the read is skipped and the test would pass vacuously.
+        slot.append("user", "an earlier turn", "msg msg-u")
+        seen: list[int] = []
+        real_read = ConversationLog.read_messages
+
+        def recording(self, key):  # noqa: ANN001 -- test double
+            seen.append(threading.get_ident())
+            return real_read(self, key)
+
+        monkeypatch.setattr(ConversationLog, "read_messages", recording)
+
+        await _drive(state, slot, "hello")
+
+        assert seen, (
+            "no transcript read happened on the prompt-submit path -- this test "
+            "no longer exercises the re-injection probe and would pass vacuously"
+        )
+        assert threading.get_ident() not in seen, (
+            "the re-injection probe read the transcript on the event-loop thread; "
+            "it must go through asyncio.to_thread"
+        )

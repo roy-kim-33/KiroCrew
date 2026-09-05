@@ -46,7 +46,7 @@ from typing import Any, Awaitable, Callable, TypeVar
 import aiohttp
 
 from kiro_crew.messaging.display_safety import redact_for_display
-from kiro_crew.messaging.outbound_files import OutboundFile
+from kiro_crew.messaging.outbound_files import OutboundFile, upload_filename
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 
 _T = TypeVar("_T")
@@ -64,17 +64,6 @@ DISCORD_MAX_FILES_PER_MESSAGE = 10
 DISCORD_MAX_TOTAL_UPLOAD_BYTES = 25 * 1024 * 1024
 
 # Sniffed MIME determines the canonical inline-rendering extension.
-_MIME_EXT = {
-    "image/png": "png",
-    "image/jpeg": "jpg",
-    "image/gif": "gif",
-    "image/webp": "webp",
-    "image/bmp": "bmp",
-}
-
-# Multipart filenames are restricted before entering Content-Disposition.
-_UNSAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
-
 _API_BASE = "https://discord.com/api/v10"
 _GATEWAY_URL = "wss://gateway.discord.gg/?v=10&encoding=json"
 
@@ -612,30 +601,50 @@ class DiscordClient:
         rather than as a shutdown.
         """
         self._closed = True
-        self._stop_heartbeat()
-        if self._ws is not None and not self._ws.closed:
+        # The session close is the LAST thing this method must do and the one
+        # thing it must not skip, so it lives in a `finally`. Every step above it
+        # can raise: `task.cancel()` on a task that ALREADY died with an error
+        # is a no-op, and the following `await self._task` then re-raises that
+        # error -- `except asyncio.CancelledError` does not catch it. A shutdown
+        # while this coroutine is itself being cancelled does the same, since
+        # `CancelledError` is a `BaseException`.
+        #
+        # Leaking the `ClientSession` leaves its connector and open sockets
+        # behind for the process lifetime (aiohttp reports it as "Unclosed
+        # client session" at GC), and `self._session` stays non-None, so a
+        # later close finds a session it believes is already handled.
+        try:
+            self._stop_heartbeat()
+            if self._ws is not None and not self._ws.closed:
+                try:
+                    await self._ws.close()
+                except Exception:
+                    pass
+            if self._task:
+                self._task.cancel()
+                try:
+                    await self._task
+                except asyncio.CancelledError:
+                    pass
+                finally:
+                    self._task = None
+        finally:
+            # The drain below awaits, so a cancellation landing DURING it would
+            # exit this finally before the session close -- the nested finally
+            # keeps the close unconditional either way.
             try:
-                await self._ws.close()
-            except Exception:
-                pass
-        if self._task:
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
-            self._task = None
-        # Snapshot first: a cancelled handler's done-callback mutates the set.
-        handlers = list(self._handler_tasks)
-        for handler in handlers:
-            handler.cancel()
-        if handlers:
-            # return_exceptions so one handler raising during unwind cannot
-            # abandon the others or skip the session close below.
-            await asyncio.gather(*handlers, return_exceptions=True)
-        if self._session and not self._session.closed:
-            await self._session.close()
-            self._session = None
+                # Snapshot first: a cancelled handler's done-callback mutates the set.
+                handlers = list(self._handler_tasks)
+                for handler in handlers:
+                    handler.cancel()
+                if handlers:
+                    # return_exceptions so one handler raising during unwind cannot
+                    # abandon the others or skip the session close below.
+                    await asyncio.gather(*handlers, return_exceptions=True)
+            finally:
+                if self._session and not self._session.closed:
+                    await self._session.close()
+                    self._session = None
 
     def set_message_handler(self, on_message: Callable[[DiscordInbound], Awaitable[None]]) -> None:
         """Set/replace the inbound-message handler after construction.
@@ -764,6 +773,49 @@ class DiscordClient:
             f"/channels/{channel_id}/messages",
             _create_payload(text, components, reply_to_message_id),
             files,
+        )
+        return str(result.get("id", "")) if result is not None else None
+
+    async def send_document(
+        self,
+        channel_id: str,
+        document: OutboundFile,
+        *,
+        caption: str | None = None,
+        reply_to_message_id: str | None = None,
+    ) -> str | None:
+        """Upload ONE file as a named attachment. Returns the message id or None.
+
+        The generic-file counterpart of :meth:`send_message_with_files`, for
+        attachments that are not raster images (PDF, CSV, archives — whatever the
+        caller's own gates admitted).
+
+        ``filenames`` pins the document's real name: the multipart sanitizer is
+        aimed at LLM-authored reference paths and maps any non-raster mime to
+        ``.bin``, and this caller's name has already passed the file_send gates —
+        letting the sanitizer rewrite the extension would deliver ``report.pdf``
+        as ``report.bin`` and break the receiver's file-type association.
+
+        Refuses over ``DISCORD_MAX_TOTAL_UPLOAD_BYTES`` rather than uploading
+        into a 413: one attachment IS the whole upload, so the message ceiling is
+        this file's ceiling. The caller gets None and keeps its existing
+        dashboard-link fallback.
+        """
+        if not document.data:
+            return None
+        if len(document.data) > DISCORD_MAX_TOTAL_UPLOAD_BYTES:
+            logger.warning(
+                "discord: refusing a %d-byte document (ceiling %d)",
+                len(document.data),
+                DISCORD_MAX_TOTAL_UPLOAD_BYTES,
+            )
+            return None
+        result = await self._api_multipart(
+            "POST",
+            f"/channels/{channel_id}/messages",
+            _create_payload(caption or "", None, reply_to_message_id),
+            [document],
+            filenames=[Path(document.path or "").name],
         )
         return str(result.get("id", "")) if result is not None else None
 
@@ -1389,13 +1441,19 @@ class DiscordClient:
         files: Sequence[OutboundFile],
         *,
         timeout: int = 60,
+        filenames: Sequence[str] | None = None,
     ) -> DiscordApiResult:
-        """Send multipart, rebuilding the single-use form for every attempt."""
+        """Send multipart, rebuilding the single-use form for every attempt.
+
+        *filenames*, when supplied, is used verbatim in place of
+        :func:`upload_filename` — see :meth:`send_document` for when that is the
+        right call. Omit it for anything whose name the model influenced.
+        """
         return await self._api_request(
             method,
             path,
             timeout=timeout,
-            build=lambda: {"data": _build_upload_form(payload, files)},
+            build=lambda: {"data": _build_upload_form(payload, files, filenames=filenames)},
         )
 
     async def _api(
@@ -1413,9 +1471,13 @@ class DiscordClient:
         payload: dict[str, Any],
         files: Sequence[OutboundFile],
         timeout: int = 60,
+        *,
+        filenames: Sequence[str] | None = None,
     ) -> Any:
         """:meth:`api_files` reduced to its body, mirroring :meth:`_api`."""
-        return (await self.api_files(method, path, payload, files, timeout=timeout)).data
+        return (
+            await self.api_files(method, path, payload, files, timeout=timeout, filenames=filenames)
+        ).data
 
     async def _api_request(
         self,
@@ -1553,25 +1615,26 @@ def _safe_description(alt: str) -> str:
     return out[:1024]
 
 
-def upload_filename(file: OutboundFile, index: int) -> str:
-    """Derive and re-scan a header-safe filename from an untrusted path."""
-    ext = _MIME_EXT.get(file.mime, "bin")
-    stem = _UNSAFE_FILENAME_RE.sub("_", Path(file.path).name).lstrip(".")
-    stem = stem[: -len(Path(stem).suffix)] if Path(stem).suffix else stem
-    stem = stem.strip("._")[:64]
-    name = f"{stem or f'image_{index}'}.{ext}"
-    redacted, _ = redact_exfiltration_urls(name)
-    redacted, _ = redact_credentials(redacted)
-    return name if redacted == name else f"image_{index}.{ext}"
+def _build_upload_form(
+    payload: dict[str, Any],
+    files: Sequence[OutboundFile],
+    *,
+    filenames: Sequence[str] | None = None,
+) -> aiohttp.FormData:
+    """Build matching attachment descriptors and indexed file parts.
 
-
-def _build_upload_form(payload: dict[str, Any], files: Sequence[OutboundFile]) -> aiohttp.FormData:
-    """Build matching attachment descriptors and indexed file parts."""
+    *filenames* is positional against *files* and used verbatim when supplied,
+    bypassing :func:`upload_filename` for a name the caller's own gates already
+    admitted (see :meth:`DiscordClient.send_document`). The descriptor and the
+    file part always carry the SAME name — Discord matches them by ``id``, and a
+    mismatch is what renames an attachment mid-upload.
+    """
     form = aiohttp.FormData()
     descriptors: list[dict[str, Any]] = []
     names: list[str] = []
     for index, file in enumerate(files):
-        name = upload_filename(file, index)
+        pinned = filenames[index] if filenames is not None and index < len(filenames) else ""
+        name = pinned or upload_filename(file, index)
         names.append(name)
         descriptor: dict[str, Any] = {"id": index, "filename": name}
         if file.alt:

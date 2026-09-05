@@ -6,6 +6,8 @@ import asyncio
 import os
 import pathlib
 import shutil
+import socket
+import struct
 import sys
 import warnings
 
@@ -25,6 +27,37 @@ from kiro_crew.slack.handler import _PHASE_EMOJIS, _build_phase_emojis
 # (in-process and spawned) instead of each loader remembering to.
 sys.dont_write_bytecode = True
 os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
+
+if os.name == "nt":
+
+    class _WindowsTestProactorEventLoop(asyncio.ProactorEventLoop):
+        """Close the loop wakeup socket without filling Windows' TIME_WAIT table."""
+
+        def _close_self_pipe(self) -> None:
+            # Windows implements ``socketpair`` with a localhost TCP connection.
+            # pytest-asyncio 0.20 creates two fresh loops per async test, so this
+            # 62k-test suite can consume the 16,384-port dynamic range before
+            # TIME_WAIT entries expire.  Abortive close is safe for the loop's
+            # private wakeup socket (it carries no application data) and releases
+            # the port immediately while preserving a fresh Proactor loop per test.
+            linger = struct.pack("hh", 1, 0)
+            # Only the write end gets abortive close.  ``ProactorEventLoop``
+            # cancels the pending read and normally closes ``_ssock`` first;
+            # resetting that read end itself turns otherwise-clean async-test
+            # teardown into ``ConnectionResetError``.  Resetting the peer after
+            # the read end has closed still prevents a TIME_WAIT entry.
+            write_socket = self._csock
+            if write_socket is not None:
+                try:
+                    write_socket.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, linger)
+                except OSError:
+                    pass
+            super()._close_self_pipe()
+
+    class _WindowsTestEventLoopPolicy(asyncio.WindowsProactorEventLoopPolicy):
+        _loop_factory = _WindowsTestProactorEventLoop
+
+    asyncio.set_event_loop_policy(_WindowsTestEventLoopPolicy())
 
 # ── Hypothesis profiles ─────────────────────────────────────────────────
 # Default (CI): fast iteration.  Run ``HYPOTHESIS_PROFILE=thorough python -m pytest``
@@ -73,6 +106,31 @@ requires_symlinks = pytest.mark.skipif(
     not _HAS_SYMLINKS,
     reason="creating a symlink needs SeCreateSymbolicLinkPrivilege on Windows",
 )
+
+
+def _find_posix_test_shell() -> str | None:
+    """Return a real POSIX shell without mistaking Windows' WSL launcher for one."""
+    if os.name != "nt":
+        return shutil.which("sh")
+
+    git = shutil.which("git")
+    candidates: list[pathlib.Path] = []
+    if git:
+        candidates.append(pathlib.Path(git).resolve().parents[1] / "bin" / "bash.exe")
+    for variable in ("ProgramFiles", "ProgramFiles(x86)"):
+        root = os.environ.get(variable)
+        if root:
+            candidates.append(pathlib.Path(root) / "Git" / "bin" / "bash.exe")
+    return next((str(path) for path in candidates if path.is_file()), None)
+
+
+@pytest.fixture
+def posix_test_shell() -> str:
+    """Provide a shell for POSIX command-plumbing tests on every supported host."""
+    shell = _find_posix_test_shell()
+    if shell is None:
+        pytest.skip("a POSIX test shell is not available")
+    return shell
 
 
 # ── Windows CI ──────────────────────────────────────────────────────────
@@ -155,11 +213,11 @@ def make_dir_link(link: pathlib.Path, target: pathlib.Path) -> None:
 
 @pytest.fixture(autouse=True)
 def _windows_restrict_to_owner_stub(request, monkeypatch):
-    """On Windows, no-op the icacls secret lockdown for hermetic tests.
+    """On Windows, no-op the secret lockdown for hermetic tests.
 
-    Many tests stub ``subprocess.run`` (or strip PATH) for hermeticity;
-    ``restrict_to_owner``'s whoami/icacls spawns then fail and its
-    DELIBERATE fail-loud OSError cascades into hundreds of unrelated
+    Many tests stub ``subprocess.run`` (or strip PATH) for hermeticity, or
+    monkeypatch the SID resolver; ``restrict_to_owner``'s DELIBERATE fail-loud
+    OSError then cascades into hundreds of unrelated
     tests. The real Windows implementation keeps direct coverage in
     test_platform_compat / test_spawn_audit (exempted here) and the
     POSIX chmod path keeps full coverage on the Linux matrix. Product
@@ -170,10 +228,23 @@ def _windows_restrict_to_owner_stub(request, monkeypatch):
     ``restrict_dir_to_owner`` is stubbed alongside it and must stay that
     way: it is the directory twin that ``make_owner_only_dir`` routes
     through, so stubbing only the file helper would leave every test that
-    creates an owner-only directory spawning a real icacls.
+    creates an owner-only directory writing a real DACL.
+
+    Note the lockdown no longer spawns anything -- it applies the DACL through
+    ``advapi32`` in-process -- so the subprocess-stub collision this fixture was
+    built for is mostly gone. The stub is kept because a hermetic test that
+    patches the SID resolver or the writer seam can still trip the fail-loud
+    OSError, and narrowing it is a change to hundreds of tests' blast radius
+    rather than part of the DACL swap.
     """
     if not platform_compat.IS_WINDOWS or request.module.__name__ in (
         "test_platform_compat",
+        # Exempted for the same reason as test_platform_compat: these modules own
+        # the direct Windows-branch coverage for the owner-only lockdown, so a
+        # stub would make their assertions vacuous. They were passing on Linux
+        # (where the fixture is inert) and silently asserting nothing on Windows.
+        "test_platform_compat_coverage",
+        "test_config_rmw_preserves_settings",
         "test_spawn_audit",
     ):
         yield
@@ -342,11 +413,51 @@ def pytest_internalerror(excrepr, excinfo) -> None:
 
 
 @pytest.fixture(autouse=True)
+def _release_stt_engine():
+    """Never let a loaded speech model outlive the test that loaded it.
+
+    ``kiro_crew.stt.engine`` keeps ONE recogniser per process on purpose: the
+    whole point of the module is that an utterance does not pay for a model load.
+    Under xdist that same property makes it cross-test state, and the instance
+    carries the idle-eviction window the first caller passed, so a later test
+    reading a different setting would silently get the earlier one.
+    """
+    yield
+    from kiro_crew.stt import engine as stt_engine
+
+    stt_engine._engine = None
+
+
+@pytest.fixture(autouse=True)
 def _reset_safety_override_between_tests():
     """Reset the SafetyOverride singleton between tests to prevent state leaking."""
     _reset_safety_override()
     yield
     _reset_safety_override()
+
+
+@pytest.fixture(autouse=True)
+def _reset_degraded_config_observations():
+    """Forget the loader's process-sticky malformed-config observations.
+
+    ``kiro_crew.config.loader`` remembers every malformed config section it has
+    ever seen for the LIFE OF THE PROCESS (deliberately: ``load()``'s migration
+    repairs the file on first read, so the observation is the only surviving
+    evidence, and the publish gate fails closed on it). Tests share one
+    interpreter, so without this reset any test that writes a malformed
+    ``config.json`` — loader error-path tests do — makes the publish/deploy
+    gate deny in every LATER test in the same worker, failing tests in files
+    that never touched the config (seen as ``TestPending`` 4xx refusals in
+    ``test_deploy_handlers_coverage.py`` under random orderings).
+
+    ``reset_degraded_observations`` documents tests as its only legitimate
+    caller; this fixture is that caller.
+    """
+    from kiro_crew.config.loader import reset_degraded_observations
+
+    reset_degraded_observations()
+    yield
+    reset_degraded_observations()
 
 
 @pytest.fixture(autouse=True)
@@ -422,7 +533,7 @@ def _disable_dev_fleet_background_tasks(monkeypatch):
     still be running when the test's client tears down, and cancelling it then
     is what leaked into unrelated tests and flaked ``Gateway Tests (macOS)``
     (issue #1832). A test that wants the real refresher overrides this itself
-    via ``monkeypatch.setattr(mod, "_background_tasks_disabled", lambda: False)``.
+    via ``monkeypatch.setattr(worktree_ops, "_background_tasks_disabled", lambda: False)``.
     """
     monkeypatch.setenv("KIROCREW_DEVFLEET_NO_BACKGROUND", "1")
 
@@ -482,16 +593,25 @@ def _isolate_message_entry_cache():
 
     The byte counter is part of the same state, so resetting only the dict would
     leave the memory ceiling mis-accounted and evict a healthy cache.
+
+    The memoised config bounds are reset for the same reason: they are resolved
+    once per process from whatever KIROCREW_HOME the first caller saw, so a test
+    that resolved them under its own home would otherwise leak its bounds into
+    every later test's cache behaviour.
     """
     from kiro_crew.dashboard import chat_persistence as _cp
 
     _cp._entry_cache.clear()
     _cp._entry_cache_bytes = 0
+    _cp._entry_cache_bounds_cached = None
+    _cp._entry_cache_bounds_read_warned = False
     try:
         yield
     finally:
         _cp._entry_cache.clear()
         _cp._entry_cache_bytes = 0
+        _cp._entry_cache_bounds_cached = None
+        _cp._entry_cache_bounds_read_warned = False
 
 
 @pytest.fixture(autouse=True)
@@ -572,12 +692,29 @@ def _ensure_event_loop():
         ``run_until_complete`` blows up with ``RuntimeError: Event loop is closed``. We
         detect a closed/absent loop and install a fresh open one so each test starts clean.
     """
+    created_loop = None
     try:
         loop = asyncio.get_event_loop()
         if loop.is_closed():
-            asyncio.set_event_loop(asyncio.new_event_loop())
+            created_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(created_loop)
     except RuntimeError:
-        asyncio.set_event_loop(asyncio.new_event_loop())
+        created_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(created_loop)
+
+    yield
+
+    # ``asyncio.run`` clears the policy's current loop, so the next test needs a
+    # replacement.  On Windows each ProactorEventLoop owns a socketpair; leaving
+    # every replacement open eventually exhausts the ephemeral-port range and
+    # makes ``new_event_loop()`` hang until pytest kills every xdist worker.
+    if created_loop is not None and not created_loop.is_closed():
+        created_loop.close()
+    try:
+        if asyncio.get_event_loop() is created_loop:
+            asyncio.set_event_loop(None)
+    except RuntimeError:
+        pass
 
 
 @pytest.fixture(autouse=True)
@@ -1112,3 +1249,28 @@ def healthy_host_memory(monkeypatch: pytest.MonkeyPatch) -> None:
     # Also keeps the 5s-TTL refresh thread behind the cached verdict from
     # starting, so no test leaves one probing the host after it ends.
     monkeypatch.setattr(subagent, "cached_admission_check", _admit)
+
+
+@pytest.fixture(autouse=True)
+def _reset_create_rate_limit_buckets():
+    """Clear the session/folder creation rate limiter between tests.
+
+    ``kiro_crew.dashboard.create_rate_limit`` keeps its per-(verb, caller)
+    buckets in MODULE-LEVEL state (deliberately: the production guard needs no
+    durable state), so every session-creating test in a pytest process
+    accumulates timestamps under shared caller keys. A shard whose test
+    composition performs more than the per-window budget of creates within one
+    wall-clock window then refuses a legitimate test create with
+    ``create_rate_limited`` — a pass/fail outcome decided by shard composition
+    and runner speed, not the code under test (#7836; observed twice on the
+    Windows shard in one day, on PRs touching neither the limiter nor
+    session_control). The limiter's own direct tests build their scenarios on
+    top of a clean slate, so clearing between tests changes nothing for them.
+    """
+    from kiro_crew.dashboard import create_rate_limit
+
+    with create_rate_limit._lock:
+        create_rate_limit._buckets.clear()
+    yield
+    with create_rate_limit._lock:
+        create_rate_limit._buckets.clear()

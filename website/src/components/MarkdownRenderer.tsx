@@ -2,11 +2,13 @@ import React, { createContext, useContext, memo, useEffect, useMemo, useRef, use
 import Clickable from './Clickable'
 import { HOVER_NONE_ACTION_BTN_CLS } from '../utils/touchActions'
 import { getImageDims, rememberImageDims } from '../utils/imageDims'
-import { Paperclip, X, Download, Plus, Minus, Search, Folder, Maximize2, Check } from 'lucide-react'
+import { X, Download, Plus, Minus, Search, Folder, Maximize2, Check, Copy, Image as ImageIcon, ImageOff, GitPullRequest, MessageSquare } from 'lucide-react'
 import { copyToClipboard } from '../utils/clipboard'
+import { canonicalChatHref, sessionKeyFrom, sessionKeyFromChatHref } from '../utils/sessionKeys'
 import ReactMarkdown from 'react-markdown'
 import type { Components, ExtraProps } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
+import remarkAutolinkRules from '../utils/remarkAutolinkRules'
 import remarkCjkFriendly from 'remark-cjk-friendly'
 import remarkCjkFriendlyGfmStrikethrough from 'remark-cjk-friendly-gfm-strikethrough'
 import remarkMath from 'remark-math'
@@ -31,24 +33,28 @@ function spliceChildren(parent: HastParent, index: number, nodes: Array<HastElem
   else parent.children.splice(index, 1, ...nodes)
 }
 import '../utils/hljs'
-import { api } from '../api/client'
 import { useBlockAssembler, maskInlineCode } from '../hooks/useBlockAssembler'
 import { usePathKind, type PathKind } from '../hooks/usePathKind'
 import { useGatewayPlatform, type GatewayPlatform } from '../hooks/useGatewayPlatform'
+import { DOUBLE_TAP_MS, DOUBLE_TAP_SLOP, DOUBLE_TAP_ZOOM } from '../hooks/usePinchZoom'
+import { useBranding } from '../hooks/useBranding'
 import { fileIcon } from '../utils/fileIcons'
 import { urlTransform, ALLOWED_PROTOCOLS, WINDOWS_ABS_PATH_RE, decodeLocalPath } from '../utils/urlTransform'
 import { safeHttpUrl } from '../lib/safeUrl'
 import { useLinkMeta, type LinkMeta } from '../lib/linkMeta'
 import { LinkChip, LinkCard } from './LinkPreview'
 import { parseSourceLinkUrl, forgeChipLabel, type PullRequestLink } from '../utils/pullRequestLinks'
+import { sourceProviderMeta } from '../utils/sourceProviderMeta'
 import { JiraHostsCtx } from '../lib/jiraHosts'
 import JiraLogo from './icons/JiraLogo'
 import GithubLogo from './icons/GithubLogo'
 import GitlabLogo from './icons/GitlabLogo'
 import DiffBlock from './DiffBlock'
 import EditableCodeBlock from './EditableCodeBlock'
+import FilePathMenu, { revealOrOpen } from './FilePathMenu'
 import { SmoothResize } from './SmoothResize'
 import type { ContentBlock } from '../types'
+import { useLanguageGeneration } from '../i18n/useLanguageGeneration'
 
 /** Extract the artifact slug from an `/artifacts/<slug>` href. Returns null
  *  when the href isn't an artifact route. Handles a leading origin, a trailing
@@ -66,16 +72,24 @@ export function artifactSlugFromHref(href: string | null | undefined): string | 
 }
 
 /**
- * Character-level shape of a local filesystem path: word chars, dot, dash, @,
- * ~, colon and space, separated by slashes. Anchored at both ends, so anything
- * carrying a URL scheme (`https://…`) or shell punctuation fails outright.
+ * Character-level shape of a local filesystem path: letters and digits in any
+ * script (`\p{L}\p{N}` — filenames are not ASCII-only), combining marks
+ * (`\p{M}` — macOS stores NFD-decomposed forms, and Indic/Thai/Arabic scripts
+ * need marks even under NFC), underscore, dot, dash, @, ~, colon and space,
+ * separated by slashes. Anchored at both ends, so anything carrying a URL
+ * scheme (`https://…`) or shell punctuation fails outright.
  *
  * Shape alone is NOT sufficient to linkify — see `isPathCandidate`.
  */
-const PATH_SHAPE_RE = /^~?(?:\.{0,2}\/)?[\w.@~/ -]*\/[\w.@~: -]*[\w.]$/
+const PATH_SHAPE_RE =
+  /^~?(?:\.{0,2}\/)?[\p{L}\p{M}\p{N}_.@~/ -]*\/[\p{L}\p{M}\p{N}_.@~: -]*[\p{L}\p{M}\p{N}_.]$/u
 
 /** A trailing `.ext` on the last segment, 1-8 chars — the only positive path
- *  signal available to a path that is neither rooted nor explicitly relative. */
+ *  signal available to a path that is neither rooted nor explicitly relative.
+ *  The extension itself stays ASCII on purpose: it is a POSITIVE signal, and
+ *  keeping it narrow is what stops slash-separated prose from classifying. A
+ *  Unicode basename with an ASCII extension (`产品文档-v1.0.md`) still passes,
+ *  because only the trailing `.ext` is matched. */
 const EXT_RE = /\.[A-Za-z0-9]{1,8}$/
 
 /**
@@ -344,6 +358,7 @@ function initMermaid(mermaid: MermaidApi): void {
 import { CodeBlock } from './CodeBlock'
 import { ExcalidrawBlock } from './ExcalidrawBlock'
 import DiagramLightbox from './DiagramLightbox'
+import { usePinchZoom } from '../hooks/usePinchZoom'
 
 /** Forward the `data-sourcepos` attribute from rehypeSourcepos onto the
  *  rendered element. Used in every MD_COMPONENTS override; returns an
@@ -354,7 +369,48 @@ const sp = (node?: HastElement) => {
   return { 'data-sourcepos': typeof v === 'string' ? v : undefined }
 }
 
+/** `sp` plus every attribute the sanitize schema admits for `tag`.
+ *
+ *  An MD_COMPONENTS override rebuilds its element to attach a className, and
+ *  a rebuild forwards only what it names. Naming just `sp(node)` silently
+ *  dropped every attribute `TAG_ATTRS` had already decided was safe: `<ol
+ *  start>` renumbered a fence-split step list back to 1, and a raw-HTML table
+ *  with `colspan` was admitted by sanitize and then flattened by the override.
+ *  Deriving the forward from the same table the sanitizer consults keeps the
+ *  two from drifting again — an attribute added there reaches the DOM without
+ *  a second edit here.
+ *
+ *  `className` is excluded because the override owns it. Values are narrowed to
+ *  what React will accept as an attribute; `false` is dropped rather than
+ *  forwarded, so a boolean attribute is present only when it is actually set.
+ *  hast keys stay in their own casing (`colSpan`, not `colspan`) because that
+ *  is what React expects — only the allow-list comparison is lowercased. */
+const spa = (tag: string, node?: HastElement): Record<string, string | number | boolean | undefined> => {
+  const out: Record<string, string | number | boolean | undefined> = sp(node)
+  const allowed = TAG_ATTRS[tag]
+  const props = node?.properties
+  if (!allowed || !props) return out
+  for (const [key, value] of Object.entries(props)) {
+    const k = key.toLowerCase()
+    if (k === 'classname' || k === 'class' || !allowed.has(k)) continue
+    if (typeof value === 'string' || typeof value === 'number' || value === true) out[key] = value
+  }
+  return out
+}
+
+/** `<ol type>` → the CSS `list-style-type` it stands for. Needed because the
+ *  attribute is only a presentational hint, which Tailwind's `list-style: none`
+ *  preflight overrides; the marker has to be restated as a real declaration. */
+const LIST_STYLE_TYPE: Record<string, string> = {
+  '1': 'decimal',
+  a: 'lower-alpha',
+  A: 'upper-alpha',
+  i: 'lower-roman',
+  I: 'upper-roman',
+}
+
 const MermaidBlock = memo(function MermaidBlock({ code }: { code: string }) {
+  useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const ref = useRef<HTMLDivElement>(null)
   const id = useId().replace(/:/g, '_')
   const renderedRef = useRef('')
@@ -441,6 +497,22 @@ function slugify(children: React.ReactNode): string | undefined {
   return raw || undefined
 }
 
+/**
+ * True for the markdown subtree rendered INSIDE an anchor's own text.
+ *
+ * `InlineCode` consults it so a code span used as a link label —
+ * ``[`https://example.com/x`](https://example.com/x)`` — stays inert instead of
+ * becoming a click-to-copy chip. The chip's handler calls `preventDefault`, and
+ * that cancels the anchor's default action from anywhere in propagation, so
+ * without this the label copied and the link silently stopped navigating (a
+ * regression from #4433, which gave non-path spans a primary-click copy).
+ *
+ * Provided only where `MdAnchor` places `children` inside an `<a>`. The Jira and
+ * forge chips render a parsed label instead of `children`, and a `LinkOverride`
+ * owns its element outright, so neither needs it.
+ */
+const InsideLinkCtx = createContext(false)
+
 /** Default markdown anchor, unless a `LinkOverrideCtx` provider claims the href.
  *
  * Extracted from the inline `MD_COMPONENTS.a` so it can read context (it is a
@@ -470,6 +542,7 @@ function MdAnchor({ node, href, children }: React.AnchorHTMLAttributes<HTMLAncho
   // canonical url drops), so a credential-smuggling `user:pass@github.com`
   // href must never be dressed up as a trusted-looking chip.
   const jiraHosts = useContext(JiraHostsCtx)
+  const sessionActions = useContext(SessionActionCtx)
   const source = useMemo(() => {
     if (!href || claimed) return null
     const link = parseSourceLinkUrl(href, [], jiraHosts)
@@ -487,6 +560,28 @@ function MdAnchor({ node, href, children }: React.AnchorHTMLAttributes<HTMLAncho
       const decodedHref = decodeURIComponent(href)
       if (!decodedHref.startsWith('//')) localHref = decodedHref
     } catch { /* keep it a normal link */ }
+  }
+  // Decoded but NOT narrowed to root-relative: the app mints its own share links
+  // absolute, and the recognizer's origin check is what refuses a foreign one.
+  let sessionCandidate: string | null = null
+  if (href) {
+    try {
+      sessionCandidate = decodeURIComponent(href)
+    } catch { /* keep it a normal link */ }
+  }
+  // Same gate as the inline chip, so a link and a bare key naming one session
+  // cannot disagree about whether it is reachable.
+  const sessionLink = sessionCandidate ? resolveSessionChip(sessionKeyFromChatHref(sessionCandidate) ?? '', sessionActions) : null
+  // The attribute carries the canonical key: a modified click goes to the browser,
+  // and an authored `dashboard_…` sid would open a session `?sid=` cannot resolve.
+  const sessionHref = sessionLink && sessionCandidate ? canonicalChatHref(sessionCandidate, sessionLink.key) : null
+  const onSessionClick = (e: React.MouseEvent<HTMLAnchorElement>) => {
+    // Only the PLAIN click is reinterpreted; the href stays real so Cmd+click
+    // still opens the session in its own tab.
+    const plainPrimaryClick = e.button === 0 && !e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey
+    if (!sessionLink || !plainPrimaryClick) return
+    e.preventDefault()
+    sessionActions.onSessionOpen!(sessionLink.key)
   }
   const pathResolution = usePathResolution(
     localHref ?? '',
@@ -535,6 +630,8 @@ function MdAnchor({ node, href, children }: React.AnchorHTMLAttributes<HTMLAncho
   }
   const forgeLabel = source ? forgeChipLabel(source) : null
   if (source && forgeLabel) {
+    const forgeMeta = sourceProviderMeta(source.provider)
+    const ForgeIcon = forgeMeta.icon
     return (
       <span className="group inline-flex max-w-full items-center gap-1 rounded-md border border-border/60 bg-accent/10 px-1.5 py-px align-baseline text-[13px] transition-colors hover:border-border hover:bg-accent/20 focus-within:border-border">
         <a
@@ -544,26 +641,45 @@ function MdAnchor({ node, href, children }: React.AnchorHTMLAttributes<HTMLAncho
           title={href}
           className="inline-flex min-w-0 items-center gap-1.5 text-text no-underline focus-ring"
         >
-          {source.provider === 'github'
+          {forgeMeta.logo === 'github'
             ? <GithubLogo size={12} className="shrink-0" />
-            : <GitlabLogo size={12} className="shrink-0" />}
+            : forgeMeta.logo === 'gitlab'
+              ? <GitlabLogo size={12} className="shrink-0" />
+              : ForgeIcon
+                // A registered provider's own mark, when its descriptor ships one.
+                ? <ForgeIcon size={12} className="shrink-0" />
+                // A registered provider with no bundled logo uses the neutral
+                // glyph rather than borrowing GitLab's mark.
+                : <GitPullRequest className="lucide-inline shrink-0" />}
           <span className="truncate max-w-[32ch]">{forgeLabel}</span>
         </a>
       </span>
     )
   }
-  if (target && meta) return <LinkChip meta={meta} href={target}>{children}</LinkChip>
+  if (target && meta) {
+    return (
+      <LinkChip meta={meta} href={target}>
+        <InsideLinkCtx.Provider value={true}>{children}</InsideLinkCtx.Provider>
+      </LinkChip>
+    )
+  }
   let ext = false
   try { ext = !!href && ALLOWED_PROTOCOLS.has(new URL(href, 'http://x').protocol) } catch { /* not a URL */ }
+  // A confirmed session link is in-app navigation, so it keeps in-place semantics.
+  if (sessionLink) ext = true
   return (
     <a
       {...sp(node)}
-      href={href}
-      onClick={pathResolution.candidate ? onPathClick : undefined}
+      href={sessionHref ?? href}
+      // A `/chat?sid=` href is never a path, so the session branch wins outright.
+      onClick={sessionLink ? onSessionClick : (pathResolution.candidate ? onPathClick : undefined)}
+      title={sessionLink
+        ? `${sessionLink.title}\n${i18nT('components.markdownRenderer.click_to_switch_to_this_session')}`
+        : undefined}
       {...(ext ? {} : { target: '_blank', rel: 'noopener noreferrer' })}
       className="text-accent underline underline-offset-2 decoration-accent/40 hover:decoration-accent"
     >
-      {children}
+      <InsideLinkCtx.Provider value={true}>{children}</InsideLinkCtx.Provider>
     </a>
   )
 }
@@ -589,6 +705,50 @@ const PathProbeCtx = createContext<boolean>(true)
  */
 type PathActions = { onFileOpen?: (path: string, opts?: { line?: number; endLine?: number }) => void; onFolderOpen?: (path: string) => void }
 const PathActionCtx = createContext<PathActions>({})
+
+/**
+ * Where a session chip sends its activation, plus the roster that decides whether
+ * a chip is offered at all.
+ *
+ * `sessions` ABSENT is deliberately not the same as an empty map: a caller that
+ * never wired it (most of the ~30 call sites) does not KNOW which sessions exist,
+ * so no chip is offered. An empty map is the opposite claim — a caller that does
+ * know, and has nothing open.
+ *
+ * The value is the display title, for the tooltip only. It is never substituted
+ * for the chip's text, which would make the visible span disagree with what
+ * Ctrl+click copies.
+ */
+type SessionActions = {
+  onSessionOpen?: (key: string) => void
+  sessions?: ReadonlyMap<string, string>
+  activeSession?: string
+}
+const SessionActionCtx = createContext<SessionActions>({})
+
+/**
+ * Whether a recognised slot key may render as a chip, and what to title it with.
+ *
+ * Mirrors the path chip's rule — an affordance only once the target is CONFIRMED —
+ * with the slot roster standing in for the stat probe. Three refusals, each of
+ * which must stay plain text rather than become a chip that cannot act:
+ *
+ *   - the caller wired no handler or no roster (see `SessionActions`);
+ *   - the key names a session that is not open, so there is nothing to switch to.
+ *     A closed session's transcript may still exist on disk, but reopening it is
+ *     a History-page resume rather than a slot switch, so `onSessionOpen` could
+ *     not honour a chip here;
+ *   - the key names the session the reader is ALREADY in, where a click would be
+ *     a visible no-op.
+ */
+function resolveSessionChip(raw: string, actions: SessionActions): { key: string; title: string } | null {
+  if (!actions.onSessionOpen || !actions.sessions) return null
+  const key = sessionKeyFrom(raw)
+  if (!key || key === actions.activeSession) return null
+  const title = actions.sessions.get(key)
+  if (title === undefined) return null
+  return { key, title }
+}
 
 type PathResolution = {
   candidate: boolean
@@ -637,15 +797,20 @@ function usePathResolution(raw: string, probeEnabled: boolean): PathResolution {
  * and a directory does not have one either.
  */
 function activatePath(path: string, kind: PathKind, reveal: boolean, actions: PathActions, line?: number, endLine?: number): void {
-  if (reveal) { api.revealPath(path); return }
+  // Route through the shared helper, not bare `api.revealPath`: the helper owns
+  // the clipboard write and the failure message. `api.revealPath` is side-effect-
+  // free, so a bare call on a remote/headless session would answer {ok, copy} and
+  // nobody would write the clipboard — the chip's "Shift+click to copy path"
+  // promise would silently do nothing.
+  if (reveal) { void revealOrOpen(path); return }
   if (kind === 'dir') {
     // No folder handler wired: fall back to the OS file manager rather than
     // silently doing nothing.
     if (actions.onFolderOpen) actions.onFolderOpen(path)
-    else api.revealPath(path)
+    else void revealOrOpen(path)
     return
   }
-  if (!actions.onFileOpen) { api.revealPath(path); return }
+  if (!actions.onFileOpen) { void revealOrOpen(path); return }
   // Called with ONE argument when there is no line, not with an explicit
   // `undefined`: the handler is also the app's general-purpose file opener, and
   // an omitted argument keeps a chip click indistinguishable from every other
@@ -670,7 +835,18 @@ const CHIP_BASE = 'bg-bg-elevated px-1.5 py-0.5 rounded text-accent text-sm font
  * Dateimanager", "dans le gestionnaire de fichiers", "ファイルマネージャーに表示"),
  * which a placeholder cannot carry.
  */
-function revealHintFor(isDir: boolean, platform: GatewayPlatform): string {
+function revealHintFor(isDir: boolean, platform: GatewayPlatform, directLocal: boolean): string {
+  // On a remote or tunneled session /api/reveal cannot drive the gateway host's
+  // file manager, so shift+click degrades to a clipboard copy (files.py answers
+  // the copy-degrade branch). Naming Finder/Explorer here would promise an action
+  // the backend no longer performs, so the hint tells the truth: shift+click
+  // copies the path. The click (open/browse) arm is unchanged — it drives the
+  // in-app viewer, which works remotely — so only the shift+click clause differs.
+  if (!directLocal) {
+    return isDir
+      ? i18nT('components.markdownRenderer.click_to_browse_shift_click_to_copy_path')
+      : i18nT('components.markdownRenderer.click_to_open_shift_click_to_copy_path')
+  }
   if (isDir) {
     if (platform === 'darwin') return i18nT('components.markdownRenderer.click_to_browse_shift_click_to_reveal_in_finder')
     if (platform === 'windows') return i18nT('components.markdownRenderer.click_to_browse_shift_click_to_open_in_file_explorer')
@@ -686,22 +862,37 @@ function revealHintFor(isDir: boolean, platform: GatewayPlatform): string {
  *  preserve line-wrapping. The copied state shows a small check icon inline;
  *  the icon is `pointer-events-none` and purely decorative so it cannot steal
  *  the click or affect layout reflow. */
+/**
+ * The 1.5s "Copied!" acknowledgment, shared by every chip that copies.
+ *
+ * One definition so the two chips cannot drift on how long it lasts or whether it
+ * appears at all — the session chip advertises Ctrl+click in its tooltip, so the
+ * gesture owes the same confirmation the click-to-copy chip gives.
+ */
+function useCopiedFlash(): { copied: boolean; flash: () => void } {
+  const [copied, setCopied] = useState(false)
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  useEffect(() => () => { if (timerRef.current) clearTimeout(timerRef.current) }, [])
+  const flash = () => {
+    setCopied(true)
+    if (timerRef.current) clearTimeout(timerRef.current)
+    timerRef.current = setTimeout(() => setCopied(false), 1500)
+  }
+  return { copied, flash }
+}
+
 function CopyableCode({ className, safeProps, text, children }: {
   className: string
   safeProps: Record<string, unknown>
   text: string
   children: React.ReactNode
 }) {
-  const [copied, setCopied] = useState(false)
-  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-  useEffect(() => () => { if (timerRef.current) clearTimeout(timerRef.current) }, [])
+  const { copied, flash } = useCopiedFlash()
   const handleCopy = (e: React.MouseEvent | React.KeyboardEvent) => {
     e.preventDefault()
     e.stopPropagation()
     copyToClipboard(text.trim())
-    setCopied(true)
-    if (timerRef.current) clearTimeout(timerRef.current)
-    timerRef.current = setTimeout(() => setCopied(false), 1500)
+    flash()
   }
   return (
     <code
@@ -716,6 +907,56 @@ function CopyableCode({ className, safeProps, text, children }: {
         : i18nT('components.markdownRenderer.click_to_copy')}
       {...safeProps}
     >
+      {children}
+      {copied && <Check size={12} aria-hidden="true" className="inline align-middle ml-0.5 opacity-70 pointer-events-none text-ok" />}
+    </code>
+  )
+}
+
+/**
+ * Click-to-switch inline chip for a confirmed dashboard session key.
+ *
+ * Deliberately shaped like the confirmed PATH chip rather than like the
+ * click-to-copy fallback it replaces: same `<code>` element and `CHIP_BASE`, a
+ * leading glyph so "this is actionable" is legible at rest rather than only on
+ * hover, and Ctrl/Cmd+click reserved for copying. A reader who has learned what a
+ * file chip does therefore already knows what this does.
+ *
+ * `stopPropagation` keeps the container's artifact-link delegation from also
+ * firing for a click this chip has handled.
+ */
+function SessionChip({ sessionKey, sessionTitle, safeProps, onOpen, children }: {
+  sessionKey: string
+  sessionTitle: string
+  safeProps: Record<string, unknown>
+  onOpen: (key: string) => void
+  children: React.ReactNode
+}) {
+  const { copied, flash } = useCopiedFlash()
+  const act = (e: { ctrlKey: boolean; metaKey: boolean; preventDefault: () => void; stopPropagation: () => void }) => {
+    e.preventDefault()
+    e.stopPropagation()
+    // The NORMALISED key, not the author's spelling: `?sid=` rejects a
+    // `dashboard_`-prefixed transcript filename.
+    if (e.ctrlKey || e.metaKey) { copyToClipboard(sessionKey); flash(); return }
+    onOpen(sessionKey)
+  }
+  return (
+    <code
+      className={`${CHIP_BASE} cursor-pointer hover:underline`}
+      // eslint-disable-next-line jsx-a11y/no-noninteractive-element-to-interactive-role -- <code> is intentionally interactive (click-to-switch)
+      role="button"
+      tabIndex={0}
+      onClick={act}
+      onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') act(e) }}
+      {...safeProps}
+      data-session-key={sessionKey}
+      // Title leads: the key alone does not say which conversation this is.
+      title={copied
+        ? i18nT('components.markdownRenderer.copied')
+        : `${sessionTitle}\n${i18nT('components.markdownRenderer.click_to_switch_to_this_session')}\n${i18nT('components.markdownRenderer.ctrl_click_to_copy')}`}
+    >
+      <MessageSquare size={12} aria-hidden="true" className="inline align-middle mr-1 opacity-70" />
       {children}
       {copied && <Check size={12} aria-hidden="true" className="inline align-middle ml-0.5 opacity-70 pointer-events-none text-ok" />}
     </code>
@@ -742,26 +983,47 @@ function InlineCode({ children, ...props }: { children?: React.ReactNode } & Rec
   const codeStr = String(children).replace(/\n$/, '')
   const probeEnabled = useContext(PathProbeCtx)
   const actions = useContext(PathActionCtx)
+  const sessionActions = useContext(SessionActionCtx)
+  const insideLink = useContext(InsideLinkCtx)
   const gatewayPlatform = useGatewayPlatform()
+  const { directLocal } = useBranding()
   const raw = codeStr.trim()
   const pathResolution = usePathResolution(raw, probeEnabled)
 
-  // `data-path` / `data-path-kind` describe a chip THIS component rendered, so
+  // `data-path*` / `data-session-key` describe a chip THIS component rendered, so
   // only it may set them. rehypeSanitize allowlists every `data-*` attribute
   // (isAllowedAttr: `k.startsWith('data')`), so raw HTML arrives here with a
   // forged pair intact; spreading it would publish attributes claiming a
   // backend-confirmed path that was never probed. Drop any inbound copy.
   const safeProps = Object.fromEntries(
-    Object.entries(props).filter(([k]) => !k.toLowerCase().startsWith('data-path')),
+    Object.entries(props).filter(([k]) => {
+      const name = k.toLowerCase()
+      return !name.startsWith('data-path') && !name.startsWith('data-session')
+    }),
   )
 
   if (pathResolution.probePending
     || (pathResolution.kind !== 'file' && pathResolution.kind !== 'dir')) {
+    // Inside an anchor the link owns the click, so stay the inert span this was
+    // before #4433 rather than cancelling the navigation to copy. Nothing is
+    // lost: the browser's own "Copy link address" still reaches the URL.
+    if (insideLink) return <code className={CHIP_BASE} {...safeProps}>{children}</code>
+    const session = resolveSessionChip(raw, sessionActions)
+    if (session) {
+      return (
+        <SessionChip
+          sessionKey={session.key}
+          sessionTitle={session.title}
+          safeProps={safeProps}
+          onOpen={sessionActions.onSessionOpen!}
+        >{children}</SessionChip>
+      )
+    }
     return <CopyableCode className={CHIP_BASE} safeProps={safeProps} text={codeStr}>{children}</CopyableCode>
   }
   const isDir = pathResolution.kind === 'dir'
   const { path, splitPath, kind, line: targetLine, endLine: targetEndLine } = pathResolution
-  const revealHint = revealHintFor(isDir, gatewayPlatform)
+  const revealHint = revealHintFor(isDir, gatewayPlatform, directLocal)
   // A leading glyph is what makes "this is actionable" legible at rest. Without
   // one, a confirmed chip and an inert one differ only on hover, so a reader
   // cannot tell which paths the backend actually resolved. Files use the same
@@ -784,39 +1046,48 @@ function InlineCode({ children, ...props }: { children?: React.ReactNode } & Rec
     if (e.ctrlKey || e.metaKey) { copyToClipboard(raw); return }
     activatePath(path, kind, e.shiftKey, actions, targetLine, targetEndLine)
   }
+  // Right-click opens the shared file-path menu (Open in default app / reveal /
+  // copy path), additive to the existing click/shift-click activation. The menu
+  // items self-gate on directLocal, so a remote session sees only Copy path.
+  // `kind` is threaded through so a directory chip hides "Open with default
+  // app" — the reveal endpoint 400s an `open` on a directory, which would land
+  // the user on an error for a click they cannot fix.
   return (
-    <code
-      className={`${CHIP_BASE} cursor-pointer hover:underline`}
-      role="button"
-      tabIndex={0}
-      onClick={act}
-      onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') act(e) }}
-      {...safeProps}
-      data-path={path}
-      data-path-kind={kind}
-      data-path-line={targetLine}
-      data-path-end-line={targetEndLine}
-      // The resolved path leads the tooltip, not just the instruction. A native
-      // tooltip paints in the browser's own layer, above page content, and any
-      // element overlaying the chip must be pointer-events-none to let the click
-      // reach it — so hovering always discloses the real target even when
-      // surrounding markup visually covers the chip's text. It also shows a long
-      // path in full when layout truncates it.
-      //
-      // `raw`, not `path`, so a `file:447` chip discloses the line it will jump
-      // to. That keeps the disclosure honest without a second catalog string:
-      // the location is already in the text the user is hovering.
-      title={`${raw}\n${revealHint}\n${i18nT('components.markdownRenderer.ctrl_click_to_copy')}`}
-    >
-      <Glyph size={12} aria-hidden="true" className="inline align-middle mr-1 opacity-70" />
-      {targetLine != null && raw.length > splitPath.length
-        // Keep the location suffix atomic. A range is the case that actually
-        // misleads: broken across lines, `…2026.md:10-` / `16` reads as a citation
-        // ending at line 10 until the eye reaches the next line. The path itself
-        // stays breakable, since that is what lets a long citation wrap at all.
-        ? <>{splitPath}<span className="whitespace-nowrap">{raw.slice(splitPath.length)}</span></>
-        : children}
-    </code>
+    <FilePathMenu filePath={path} kind={kind}>
+      <code
+        className={`${CHIP_BASE} cursor-pointer hover:underline`}
+        // eslint-disable-next-line jsx-a11y/no-noninteractive-element-to-interactive-role -- <code> is intentionally interactive (click-to-open path chip), same pattern as CopyableCode
+        role="button"
+        tabIndex={0}
+        onClick={act}
+        onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') act(e) }}
+        {...safeProps}
+        data-path={path}
+        data-path-kind={kind}
+        data-path-line={targetLine}
+        data-path-end-line={targetEndLine}
+        // The resolved path leads the tooltip, not just the instruction. A native
+        // tooltip paints in the browser's own layer, above page content, and any
+        // element overlaying the chip must be pointer-events-none to let the click
+        // reach it — so hovering always discloses the real target even when
+        // surrounding markup visually covers the chip's text. It also shows a long
+        // path in full when layout truncates it.
+        //
+        // `raw`, not `path`, so a `file:447` chip discloses the line it will jump
+        // to. That keeps the disclosure honest without a second catalog string:
+        // the location is already in the text the user is hovering.
+        title={`${raw}\n${revealHint}\n${i18nT('components.markdownRenderer.ctrl_click_to_copy')}`}
+      >
+        <Glyph size={12} aria-hidden="true" className="inline align-middle mr-1 opacity-70" />
+        {targetLine != null && raw.length > splitPath.length
+          // Keep the location suffix atomic. A range is the case that actually
+          // misleads: broken across lines, `…2026.md:10-` / `16` reads as a citation
+          // ending at line 10 until the eye reaches the next line. The path itself
+          // stays breakable, since that is what lets a long citation wrap at all.
+          ? <>{splitPath}<span className="whitespace-nowrap">{raw.slice(splitPath.length)}</span></>
+          : children}
+      </code>
+    </FilePathMenu>
   )
 }
 
@@ -938,8 +1209,8 @@ const MD_COMPONENTS: Components = {
   // horizontal scroll already handles.
   table({ node, children }) { return <div className="overflow-x-auto my-3"><table {...sp(node)} className="min-w-full border-collapse text-sm [overflow-wrap:normal] [word-break:normal]">{children}</table></div> },
   // Headers carry the column's meaning, so never break them mid-label.
-  th({ node, children }) { return <th {...sp(node)} className="text-left text-muted text-[13px] font-medium px-3 py-2 border-b border-border bg-bg-elevated whitespace-nowrap">{children}</th> },
-  td({ node, children }) { return <td {...sp(node)} className="px-3 py-2 border-b border-border text-sm">{children}</td> },
+  th({ node, children }) { return <th {...spa('th', node)} className="text-left text-muted text-[13px] font-medium px-3 py-2 border-b border-border bg-bg-elevated whitespace-nowrap">{children}</th> },
+  td({ node, children }) { return <td {...spa('td', node)} className="px-3 py-2 border-b border-border text-sm">{children}</td> },
   a: MdAnchor,
   blockquote({ node, children }) { return <blockquote {...sp(node)} className="border-l-[3px] border-accent pl-3 my-2 text-muted italic">{children}</blockquote> },
   hr({ node }) { return <hr {...sp(node)} className="border-border my-4" /> },
@@ -950,10 +1221,38 @@ const MD_COMPONENTS: Components = {
   h5({ node, children }) { const id = slugify(children); return <h5 {...sp(node)} id={id} className="text-sm font-medium mt-2 mb-1 text-text-strong">{children}</h5> },
   h6({ node, children }) { const id = slugify(children); return <h6 {...sp(node)} id={id} className="text-[13px] font-medium mt-2 mb-1 text-muted">{children}</h6> },
   ul({ node, children, className }) { const isTasks = className?.includes('contains-task-list'); return <ul {...sp(node)} className={isTasks ? 'list-none pl-4 my-2 space-y-1' : 'list-disc pl-8 my-2 space-y-1 marker:text-muted'}>{children}</ul> },
-  ol({ node, children, className }) { const isTasks = className?.includes('contains-task-list'); return <ol {...sp(node)} className={isTasks ? 'list-none pl-4 my-2 space-y-1' : 'list-decimal pl-8 my-2 space-y-1 marker:text-muted'}>{children}</ol> },
+  // `start` must reach the DOM, not be dropped while attaching a className: a
+  // fenced block SPLITS the message into independent markdown documents
+  // (useBlockAssembler), so the list after a code block is its own <ol> that
+  // legitimately begins at 2, 3, … Without `start` every one of those restarts
+  // at 1, which is what turned a numbered set of shell steps into four items
+  // all labelled "1.". `spa` forwards it — and `type`/`reversed` — from the
+  // same table the sanitizer consults.
+  ol({ node, children, className }) {
+    const isTasks = className?.includes('contains-task-list')
+    const type = node?.properties?.type
+    // Tailwind's preflight sets `ol { list-style: none }`. That is author CSS,
+    // so it beats the presentational hint the `type` attribute carries — simply
+    // omitting `list-decimal` for a typed list renders NO marker at all, which
+    // is worse than the wrong marker. Map the attribute to an explicit
+    // list-style-type instead, inline so it does not depend on Tailwind having
+    // scanned an arbitrary-value class. An unrecognized type keeps the decimal
+    // default.
+    const styleType = typeof type === 'string' ? LIST_STYLE_TYPE[type] : undefined
+    const typed = styleType != null && styleType !== 'decimal'
+    return (
+      <ol
+        {...spa('ol', node)}
+        style={typed ? { listStyleType: styleType } : undefined}
+        className={isTasks ? 'list-none pl-4 my-2 space-y-1' : `${typed ? '' : 'list-decimal '}pl-8 my-2 space-y-1 marker:text-muted`}
+      >
+        {children}
+      </ol>
+    )
+  },
   li({ node, children, className }) {
     const isTask = className?.includes('task-list-item')
-    if (!isTask) return <li {...sp(node)} className="text-sm leading-relaxed">{children}</li>
+    if (!isTask) return <li {...spa('li', node)} className="text-sm leading-relaxed">{children}</li>
     // Task items use block flow, NOT flex. The previous `flex items-start` row
     // broke two ways: (1) an item containing a NESTED list (tasks.md shape)
     // laid the child <ul> out BESIDE the text; (2) any item long enough to
@@ -974,7 +1273,7 @@ const MD_COMPONENTS: Components = {
     // it also lands on the loose-mode checkbox nested inside that first <p>.
     return (
       <li
-        {...sp(node)}
+        {...spa('li', node)}
         className="text-sm leading-relaxed break-words pl-5 -indent-5 [&_input[type=checkbox]]:mr-1.5 [&_input[type=checkbox]]:align-middle [&>ul]:indent-0 [&>ol]:indent-0 [&>p:not(:first-child)]:indent-0 [&>ul]:mt-1 [&>ol]:mt-1"
       >
         {children}
@@ -987,10 +1286,76 @@ const MD_COMPONENTS: Components = {
   img: ImgWithFallback,
 }
 
-/** Markdown image with a React-rendered Paperclip fallback when the URL is
- *  broken. The fallback is React-rendered rather than a hand-built SVG swapped
- *  in via .replaceWith(), so it never mutates DOM React owns — which could
- *  otherwise trigger "removeChild on Node" reconciliation crashes. */
+/** Markdown image with a React-rendered fallback chip when the URL is broken
+ *  (see `BrokenImage`). The fallback is React-rendered rather than a hand-built
+ *  SVG swapped in via .replaceWith(), so it never mutates DOM React owns —
+ *  which could otherwise trigger "removeChild on Node" reconciliation crashes. */
+/** Fallback chip for an image whose bytes failed to load.
+ *
+ * Chat images are read from disk at VIEW time (`/api/file-raw`), not stored in
+ * the message — so the dominant failure is a local file that no longer exists
+ * (a screenshot written to a temp directory that has since been cleaned), long
+ * after the message rendered fine for its author. The chip names that
+ * condition, and the whole chip is click-to-copy for the on-disk path:
+ * recovery starts from knowing WHICH file is gone, and the path is the one
+ * thing the transcript still holds.
+ *
+ * The `<img>` error event carries no status, so "file no longer exists" is
+ * NOT asserted from the error alone — a backend hiccup, a sensitive-path
+ * denial (403), or a file still being written all fire the same event. A
+ * cheap HEAD probe re-asks the endpoint, and only a confirmed 404 (the
+ * backend's not-found refusal) earns the missing-file wording; every other
+ * outcome — including a failed probe — keeps the generic load-failure line,
+ * so the chip never states a cause it did not verify. Remote URLs are never
+ * probed: a cross-origin HEAD says nothing reliable and the generic wording
+ * is already honest there.
+ */
+function BrokenImage({ path, alt, probeUrl }: { path: string; alt?: string; probeUrl?: string }) {
+  const { copied, flash } = useCopiedFlash()
+  const [confirmedGone, setConfirmedGone] = useState(false)
+  useEffect(() => {
+    if (!probeUrl) return
+    let cancelled = false
+    fetch(probeUrl, { method: 'HEAD' })
+      .then(r => { if (!cancelled && r.status === 404) setConfirmedGone(true) })
+      .catch(() => { /* unknown stays unknown — generic wording */ })
+    return () => { cancelled = true }
+  }, [probeUrl])
+  const handleCopy = (e: React.MouseEvent | React.KeyboardEvent) => {
+    e.preventDefault()
+    e.stopPropagation()
+    copyToClipboard(path)
+    flash()
+  }
+  // The path leads the tooltip (same rule as the file-path chip) so a
+  // truncated chip still discloses the real target — except when alt is
+  // empty: the visible label already IS the path, and repeating it in the
+  // tooltip adds nothing.
+  const idle = alt
+    ? `${path}\n${i18nT('components.markdownRenderer.click_to_copy')}`
+    : i18nT('components.markdownRenderer.click_to_copy')
+  return (
+    <span
+      className="inline-flex max-w-full items-center gap-1.5 rounded-md border border-border bg-bg-elevated px-2 py-1 text-sm text-muted cursor-pointer hover:text-text"
+      role="button"
+      tabIndex={0}
+      onClick={handleCopy}
+      onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') handleCopy(e) }}
+      title={copied ? i18nT('components.markdownRenderer.copied') : idle}
+    >
+      <ImageOff size={14} aria-hidden="true" className="shrink-0" />
+      <span className="truncate">{alt || path}</span>
+      <span className="shrink-0 opacity-75">
+        {confirmedGone
+          ? i18nT('components.markdownRenderer.image_file_no_longer_exists')
+          : i18nT('components.markdownRenderer.image_failed_to_load')}
+      </span>
+      {copied
+        ? <Check size={12} aria-hidden="true" className="shrink-0 text-ok" />
+        : <Copy size={12} aria-hidden="true" className="shrink-0 opacity-70" />}
+    </span>
+  )
+}
 /** Style reserving a not-yet-loaded transcript image's EXACT display box.
  *
  * The loaded layout follows the replaced-element min/max rules, which
@@ -1017,6 +1382,18 @@ export function reservedImageClass(compact: boolean): string {
   return compact ? 'mc-img-reserve mc-img-reserve-compact' : 'mc-img-reserve'
 }
 
+/** Fixed placeholder box for an image whose dimensions are not yet known
+ *  (first-ever load, nothing learned). An unloaded <img> has NO intrinsic
+ *  size — the max-w/max-h classes are only caps, so without a definite box it
+ *  collapses to a 0-wide border sliver. A fixed ~16:9 box (not full width —
+ *  full-width placeholders stack into a wall when a message carries several
+ *  images) reserves believable space; the compact box matches the sent-prompt
+ *  thumbnail caps exactly. Numbers are the DISPLAY size, so they sit under
+ *  each mode's max-w/max-h caps. */
+export function pendingImageBoxStyle(compact: boolean): React.CSSProperties {
+  return compact ? { width: '240px', height: '180px' } : { width: '420px', height: '236px' }
+}
+
 function ImgWithFallback({
   node,
   src,
@@ -1038,6 +1415,9 @@ function ImgWithFallback({
   const isLocal = src.startsWith('/') || src.startsWith('~') || src.startsWith('.') || isWinAbs
     || (basePath && !src.startsWith('http'))
   let url: string
+  // The on-disk path the backend is asked to read — what the broken-image
+  // fallback discloses and copies. Stays `src` verbatim for remote URLs.
+  let diskPath = src
   if (isLocal) {
     // micromark percent-encodes destinations in BOTH forms, so wrap-ness is
     // recovered from the source text at this node's position: only a
@@ -1054,8 +1434,10 @@ function ImgWithFallback({
     const localPath = wrapped ? decodeLocalPath(src) : src
     if (basePath && !src.startsWith('/') && !src.startsWith('~') && !isWinAbs) {
       const resolved = basePath.replace(/\/[^/]*$/, '') + '/' + localPath
+      diskPath = resolved
       url = `/api/file-raw?path=${encodeURIComponent(resolved)}`
     } else {
+      diskPath = localPath
       url = `/api/file-raw?path=${encodeURIComponent(localPath)}`
     }
     // See ImageVersionCtx: without this every impression of a rewritten file
@@ -1066,12 +1448,7 @@ function ImgWithFallback({
     url = src
   }
   if (errored) {
-    return (
-      <span className="text-sm text-muted inline-flex items-center gap-1">
-        <Paperclip size={14} aria-hidden="true" />
-        {' ' + (alt || src)}
-      </span>
-    )
+    return <BrokenImage path={diskPath} alt={alt} probeUrl={isLocal ? url : undefined} />
   }
   // SVGs authored with only a `viewBox` (no width/height) carry no intrinsic
   // size. Under the max-w/max-h-only CSS below they collapse to ~0px and look
@@ -1079,29 +1456,31 @@ function ImgWithFallback({
   // happen to declare width/height. Give SVGs a definite width basis; the
   // viewBox aspect ratio then derives the height, clamped by max-h.
   const isSvg = /\.svg([?#]|$)/i.test(src)
-  // Reserve vertical layout space BEFORE the bytes decode. A markdown image has
-  // no intrinsic dimensions in the source, so without this it lays out at ~0px
-  // until the network/decode completes, then snaps to its natural height —
-  // shoving every sibling below it (still-streaming text, the next block) down
-  // in one discrete jump. For a user reading a streaming message (or lazily
-  // loading an image below the fold) that reads as a "flash". Holding a
-  // min-height placeholder until `onLoad` reserves the space up front and
-  // bounds the on-load shift; the placeholder is released once loaded so the
-  // final layout is pixel-exact and history/completed images carry no floor.
-  // The floor is a heuristic (markdown gives us no aspect ratio): 120px sits
-  // below the common screenshot/diagram case (which then benefits) but above
-  // small icons/badges — for a sub-120px raster image the on-load change is a
-  // bounded (<=120px) collapse, an accepted residual since such images are
-  // uncommon in markdown. SVGs already get a definite width basis (their viewBox
-  // derives the height), so they need no placeholder. See
+  // Reserve layout space BEFORE the bytes decode. A markdown image has no
+  // intrinsic dimensions in the source, so without this it lays out at ~0px
+  // (zero WIDTH too — an unloaded <img> has no intrinsic size and max-width is
+  // only a cap, so the element collapses to a border-thin sliver) until the
+  // network/decode completes, then snaps to its natural size — shoving every
+  // sibling below it (still-streaming text, the next block) down in one
+  // discrete jump. For a user reading a streaming message (or lazily loading
+  // an image below the fold) that reads as a "flash". Holding a placeholder
+  // box until `onLoad` reserves the space up front and bounds the on-load
+  // shift; the placeholder is released once loaded so the final layout is
+  // pixel-exact and history/completed images carry no reserve.
+  // The box is a FIXED size, not full-width (a deliberate product decision:
+  // a full-width band reads as a much larger pending change than the image
+  // usually is, and several loading images stack into a wall). The size is a
+  // heuristic (markdown gives us no aspect ratio): a ~16:9 box near the
+  // common screenshot case, sized under each mode's max-w/max-h caps so the
+  // pending box never exceeds what the loaded image could occupy. See
   // MarkdownRenderer.streamingImageShift.test.tsx.
-  // Learned exact dimensions trump the heuristic floor: a transcript image
+  // Learned exact dimensions trump the heuristic box: a transcript image
   // remounts every time the virtualized window scrolls back over it, and a
-  // 120px floor under a 400-600px screenshot still realizes the difference as
-  // a visible jump on every (re)load. Recording naturalWidth/Height on first
-  // successful load (keyed by resolved URL, same mechanism as the artifact
-  // gallery's thumbnails) lets every later mount reserve the real aspect box
-  // via width/height attributes before any bytes arrive.
+  // heuristic box under a 400-600px screenshot still realizes the difference
+  // as a visible jump on every (re)load. Recording naturalWidth/Height on
+  // first successful load (keyed by resolved URL, same mechanism as the
+  // artifact gallery's thumbnails) lets every later mount reserve the real
+  // aspect box before any bytes arrive.
   const learned = !isSvg ? getImageDims(url) : undefined
   // The reserved box must resolve to EXACTLY the size the loaded image will
   // take, or the difference shows as a border wrapping empty space with the
@@ -1119,7 +1498,7 @@ function ImgWithFallback({
     ? { width: compact ? '240px' : '760px', height: 'auto' }
     : learned
       ? reservedImageStyle(learned)
-      : (loaded ? undefined : { minHeight: '120px' })
+      : (loaded ? undefined : pendingImageBoxStyle(compact))
   // Sent-prompt (user message) images render as a small preview so an attached
   // screenshot doesn't dominate the bubble; the lightbox still opens full size
   // on click. Response images keep the large inline size. See CompactImagesCtx.
@@ -1127,7 +1506,25 @@ function ImgWithFallback({
   // variable) so the i18n lint's className exemption still recognizes these as
   // class strings, not untranslated copy.
   return (
-    <span className="block my-2">
+    <span className="relative block my-2">
+      {/* Loading skeleton: a decorative overlay ON TOP of the (still
+          transparent) <img>, never a wrapper around it — the img's own layout
+          contract (ms-auto on the IMG, definite max-w caps, no shrink-to-fit
+          wrapper; see the className comment below) must not change shape
+          between loading and loaded. The overlay is a SIBLING that replicates
+          the img's box (same reserve class/style, same caps, same edge
+          alignment) and unmounts on load, so the img itself never remounts.
+          pointer-events-none keeps hover/click reaching the img. */}
+      {!loaded && !isSvg && (
+        <span
+          aria-hidden="true"
+          className={`pointer-events-none absolute top-0 ${compact ? 'end-0' : 'start-0'} flex items-center justify-center overflow-hidden rounded-md border border-border bg-bg-accent ${learned ? reservedImageClass(compact) + ' ' : ''}${compact ? 'max-w-[240px] max-h-[180px]' : 'max-w-[min(100%,760px)] max-h-[60vh]'}`}
+          style={learned ? reservedImageStyle(learned) : pendingImageBoxStyle(compact)}
+        >
+          <span className="absolute inset-0 animate-pulse bg-bg-hover" />
+          <ImageIcon size={28} className="relative animate-pulse text-muted" aria-hidden="true" />
+        </span>
+      )}
       {/* The <img> is the lightbox trigger; dispatchLightbox needs the image
           element itself as currentTarget and the [data-lightbox-image] query
           relies on it being an <img>, so it can't be a <button>. Keyboard users
@@ -1515,6 +1912,9 @@ const REMARK_PLUGINS: PluggableList = [
   remarkGfm,
   remarkCjkFriendlyGfmStrikethrough,
   [remarkMath, { singleDollarTextMath: false }],
+  // After gfm so an autolink literal is already a `link` node, but BEFORE the
+  // verbatim pass, which retypes an unknown tag to text and hides it.
+  remarkAutolinkRules,
   remarkVerbatimUnknownTags,
 ]
 
@@ -2647,6 +3047,146 @@ export function fixCjkAutolinkBoundaries(content: string): string {
   return out + content.slice(pos)
 }
 
+/**
+ * A `[text](https?://…?…)` span whose destination carries RAW spaces or tabs.
+ *
+ * CommonMark refuses whitespace inside an unbracketed link destination, so the
+ * whole span fails to parse as a link: the label renders as literal
+ * `[text](`-prefixed prose and GFM autolinks just the head of the URL — the
+ * href truncates at the first space (in practice the first unencoded query
+ * param value), which is how an agent-emitted pre-filled URL becomes
+ * unclickable.
+ *
+ * Three deliberate bounds, each the conservative direction:
+ *  - The head must carry a `?`, and the run's LAST chunk must contain a
+ *    `&name=` param start (see QUERY_CONTINUATION_RE below). An unencoded
+ *    QUERY STRING is the shape this pass exists for, and only a new param
+ *    opening in the final chunk proves the query spans every space to the
+ *    run's end. Without that proof — `[docs](https://x.com/a for the full
+ *    list)`, or `…?ref=1 for the full list` — the tail is PROSE after a
+ *    truncated link, and absorbing it into the href would delete visible
+ *    words and mint a dead URL, worse than the truncation it replaces. The
+ *    cost is that a spaced value in a SINGLE-param URL (`?title=a b`) is not
+ *    rescued: with no second param there is no evidence, and the issue's
+ *    reported shape carries several `&`-separated params.
+ *  - The label admits no brackets (`[^\][\n]`). A label that fails to close
+ *    makes every later `[` restart the scan over the same characters, which
+ *    is quadratic on `[`-heavy input — and a streaming message re-runs this
+ *    on every reparse. Excluding `[` makes each start position fail in O(1),
+ *    so the scan is linear; a nested-bracket label was never rescued before
+ *    and still is not.
+ *  - The chunks are `[^\s()]+`: a `(` or `)` inside the destination is
+ *    CommonMark's OTHER refusal (unbalanced parens), where the span's true
+ *    extent is genuinely ambiguous, so those spans are left alone.
+ *
+ * An uppercase scheme (`HTTPS://…`) is NOT rescued, and deliberately so: GFM
+ * autolinks the uppercase head (schemes are case-insensitive there), and the
+ * parse gate below sees that node as non-prose and skips the span. Reaching
+ * it would mean loosening the gate that protects every accepted span, for a
+ * casing agents do not emit.
+ */
+const BROKEN_LINK_DEST_RE =
+  /(\[[^\][\n]*\]\([ \t]*)(https?:\/\/[^\s()?]*\?[^\s()]*(?:[ \t]+[^\s()]+)+)[ \t]*\)/g
+
+/** A trailing `"…"` / `'…'` chunk at the end of a refused destination run.
+ *  Genuinely ambiguous: it is the author's TITLE in `[a](url x "t")` but QUERY
+ *  TEXT in `[a](https://x?q=crash when "Save As")`, and encoding or splitting
+ *  either reading corrupts the other. Same verdict as parens: no rescue. */
+const TRAILING_TITLE_RE = /[ \t]("[^"\n]*"|'[^'\n]*')$/
+
+/** Evidence that the run's FINAL chunk is still query string: it contains a
+ *  `&name=` param start (`&labels=bug` in `…?title=a b&labels=bug`). Only
+ *  that proves the whitespace before it belongs to a query VALUE — a last
+ *  chunk of plain words (`…?ref=1 for the full list`) is prose after a
+ *  truncated link, not a spaced value. */
+const QUERY_CONTINUATION_RE = /&[A-Za-z0-9_.~-]+=[^\s()]*$/
+
+/**
+ * Percent-encode raw whitespace inside a `[text](url)` destination that
+ * CommonMark REFUSED, so the link the author unambiguously delimited parses
+ * with its full URL.
+ *
+ * The author's own `](…)` delimiters prove the destination's extent, which is
+ * what makes this safe where the bare-URL case is not: a bare
+ * `https://… ?title=a b&c=d` run gives no evidence of where the URL ends, so
+ * it keeps GFM's stop-at-whitespace behaviour (the same call every other
+ * renderer makes).
+ *
+ * Gated on remark's OWN parse, exactly like `fixCjkAutolinkBoundaries`: a span
+ * is rewritten only when every character of it is PROSE in the parse — inline
+ * code, fenced/indented code, raw HTML, math, and (critically) every span that
+ * ALREADY parsed as a link are all off-limits by construction. That last
+ * exclusion is what protects the legal space-carrying forms — `<…>`-bracketed
+ * destinations and `[a](url "title")` titles — without this function having to
+ * re-derive CommonMark's grammar: if remark accepted it, it is not broken, and
+ * it is never touched.
+ *
+ * Scheme-confined to `http(s)://` by the regex, so no rewrite can widen the
+ * scheme surface — a `javascript:` destination never matches, and encoding
+ * spaces cannot mint a new scheme. Same-line only (`[^\][\n]` / `[ \t]`): a
+ * destination interrupted by a newline may be a paragraph boundary, and a cut
+ * is the risky direction.
+ *
+ * Image spans (`![alt](url a b)`) are IN scope: the leading `!` sits outside
+ * the match, the rescue makes the image parse, and a well-formed remote image
+ * already fetches on render — no boundary moves. A destination whose run ends
+ * in a quoted chunk (`[a](url x "t")`) is DECLINED: that chunk is the
+ * author's title in one reading and query text (`?title=Crash when "Save
+ * As"`) in the other, and either guess corrupts the other reading. An empty
+ * label (`[](url a b)`) is skipped: the rescued anchor would have no
+ * accessible name and nothing visible to click.
+ *
+ * NOT safe when `data-sourcepos` is in play: `%20` is three characters where
+ * the space was one, which shifts every later column on the line. The caller
+ * gates on that (see MarkdownBlock), mirroring `fixCjkAutolinkBoundaries`.
+ */
+export function fixUnencodedLinkDestinations(content: string): string {
+  if (!content.includes('](') || !content.includes('://')) return content
+  BROKEN_LINK_DEST_RE.lastIndex = 0
+  if (!BROKEN_LINK_DEST_RE.test(content)) return content
+  const { nonProse } = autolinkLiteralSpans(content)
+  let out = ''
+  let pos = 0
+  BROKEN_LINK_DEST_RE.lastIndex = 0
+  let m: RegExpExecArray | null
+  while ((m = BROKEN_LINK_DEST_RE.exec(content)) !== null) {
+    const start = m.index
+    const end = start + m[0].length
+    // An escaped `[` is a literal bracket the author wrote as prose; encoding
+    // inside it would visibly rewrite their text, not repair a link. The
+    // CLOSER gets the same check: `[a\](…)` is a literal `]` to CommonMark,
+    // so no link was ever delimited there either.
+    if (isEscapedAt(content, start)) continue
+    if (isEscapedAt(content, start + m[1].lastIndexOf(']'))) continue
+    // `[](url …)` would rescue an anchor with no accessible name and nothing
+    // visible to click — leave the refused span as the prose it renders as.
+    if (m[1].startsWith('[]')) continue
+    // Any masked character means remark already owns this span — it parsed as
+    // a real link (a legal title form), or it sits inside code/HTML/math.
+    let masked = false
+    for (let i = start; i < end; i++) {
+      if (nonProse[i]) { masked = true; break }
+    }
+    if (masked) continue
+    // A trailing quoted chunk is undecidable: the author's title in
+    // `[a](url x "t")`, but query TEXT in `?title=Crash when "Save As"` —
+    // treating it as a title would truncate that query out of the href.
+    // Decline the span entirely, the same verdict parens get.
+    if (TRAILING_TITLE_RE.test(m[2])) continue
+    // The final chunk must PROVE it is still query string (`&name=…`): a
+    // last chunk of plain words is prose after a truncated link, and
+    // absorbing prose deletes visible words and mints a dead URL.
+    const chunks = m[2].split(/[ \t]+/)
+    if (!QUERY_CONTINUATION_RE.test(chunks[chunks.length - 1])) continue
+    const destStart = start + m[1].length
+    out += content.slice(pos, destStart)
+    out += m[2].replace(/[ \t]/g, (ch) => (ch === ' ' ? '%20' : '%09'))
+    pos = destStart + m[2].length
+  }
+  if (pos === 0) return content
+  return out + content.slice(pos)
+}
+
 export function fixCodeFences(s: string): string {
   // Escape bare "N." lines so markdown doesn't render them as ordered lists.
   // CommonMark: 0-3 leading spaces = list item, 4+ = indented code block.
@@ -2776,6 +3316,7 @@ function deferIncompleteStreamingTable(content: string): string {
 }
 
 const MarkdownBlock = memo(function MarkdownBlock({ content, sourcePos, startLine, glow, smooth, softBreaks, live, unfurl }: { content: string; sourcePos?: boolean; startLine?: number; glow?: boolean; smooth?: boolean; softBreaks?: boolean; live?: boolean; unfurl?: boolean }) {
+  useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   // Declared before the early return below — Rules of Hooks.
   //
   // `sourcePos` force-disables unfurl: the inline-commenting flow maps a DOM
@@ -2823,7 +3364,12 @@ const MarkdownBlock = memo(function MarkdownBlock({ content, sourcePos, startLin
   // would anchor a comment to the wrong occurrence — so that surface keeps the
   // unfixed (but coordinate-accurate) render.
   const fenced = fixCodeFences(clean)
-  const prepared = sourcePos ? fenced : fixCjkAutolinkBoundaries(fenced)
+  // `fixUnencodedLinkDestinations` runs BEFORE the CJK pass: repairing a
+  // refused `[text](url)` turns the URL's autolinked head back into a real
+  // link node, so the CJK boundary pass must judge the repaired shape, not
+  // the broken one. Both passes shift columns, so both are gated off in
+  // sourcePos mode together.
+  const prepared = sourcePos ? fenced : fixCjkAutolinkBoundaries(fixUnencodedLinkDestinations(fenced))
   const md = (
     <MdSourceCtx.Provider value={prepared}>
       <ReactMarkdown remarkPlugins={softBreaks ? REMARK_PLUGINS_WITH_BREAKS : REMARK_PLUGINS} rehypePlugins={rehypePlugins} urlTransform={urlTransform} components={MD_COMPONENTS}>
@@ -2911,7 +3457,8 @@ function BlockRenderer({ block, prevBlock, onFileOpen, sourcePos, messageTs, wid
   }
 }
 
-export default memo(function MarkdownRenderer({ content, streaming = false, onFileOpen, onFolderOpen, onArtifactOpen, rawMode = false, sourcePos = false, messageTs, slotKey, glow = false, smooth, softBreaks = false, compactImages = false, linkPreviews = false }: { content: string; streaming?: boolean; onFileOpen?: (path: string, opts?: { line?: number; endLine?: number }) => void; onFolderOpen?: (path: string) => void; onArtifactOpen?: (slug: string) => void; rawMode?: boolean; sourcePos?: boolean; messageTs?: string; slotKey?: string; glow?: boolean; smooth?: boolean; softBreaks?: boolean; compactImages?: boolean; linkPreviews?: boolean }) {
+export default memo(function MarkdownRenderer({ content, streaming = false, onFileOpen, onFolderOpen, onArtifactOpen, onSessionOpen, sessions, activeSession, rawMode = false, sourcePos = false, messageTs, slotKey, glow = false, smooth, softBreaks = false, compactImages = false, linkPreviews = false }: { content: string; streaming?: boolean; onFileOpen?: (path: string, opts?: { line?: number; endLine?: number }) => void; onFolderOpen?: (path: string) => void; onArtifactOpen?: (slug: string) => void; onSessionOpen?: (key: string) => void; sessions?: ReadonlyMap<string, string>; activeSession?: string; rawMode?: boolean; sourcePos?: boolean; messageTs?: string; slotKey?: string; glow?: boolean; smooth?: boolean; softBreaks?: boolean; compactImages?: boolean; linkPreviews?: boolean }) {
+  useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const blocks = useBlockAssembler(content, streaming)
 
   /** Chip activation lives on the chip itself (see InlineCode); this handler is
@@ -2937,6 +3484,10 @@ export default memo(function MarkdownRenderer({ content, streaming = false, onFi
   /** Stable identity so every chip in a long transcript doesn't re-render when
    *  this component does. */
   const pathActions = useMemo<PathActions>(() => ({ onFileOpen, onFolderOpen }), [onFileOpen, onFolderOpen])
+  const sessionActions = useMemo<SessionActions>(
+    () => ({ onSessionOpen, sessions, activeSession }),
+    [onSessionOpen, sessions, activeSession],
+  )
 
   // Pre-compute the widget index for each widget block (0-based ordinal of
   // widgets within this message). WidgetFrame uses (messageTs, widgetIndex)
@@ -3024,6 +3575,7 @@ export default memo(function MarkdownRenderer({ content, streaming = false, onFi
           module-level, so the renderer cannot pass these down as props. */}
       <PathProbeCtx.Provider value={!streaming}>
       <PathActionCtx.Provider value={pathActions}>
+      <SessionActionCtx.Provider value={sessionActions}>
       {/* CompactImagesCtx: user-message ("sent prompt") callers pass compactImages
           so their attached images render as small previews. The provider wraps the
           blocks here (a context Provider renders no DOM node, so data-image-scope /
@@ -3060,6 +3612,7 @@ export default memo(function MarkdownRenderer({ content, streaming = false, onFi
         ))}
       </ImageVersionCtx.Provider>
       </CompactImagesCtx.Provider>
+      </SessionActionCtx.Provider>
       </PathActionCtx.Provider>
       </PathProbeCtx.Provider>
     </div>
@@ -3075,6 +3628,22 @@ type LightboxDetail = { images: LightboxImage[]; index: number }
 const LIGHTBOX_ZOOM_MIN = 1
 const LIGHTBOX_ZOOM_MAX = 5
 const LIGHTBOX_ZOOM_STEP = 0.5
+
+/** Swipe-to-dismiss (touch only, fit zoom only) tuning.
+ *
+ *  `SLOP` is the travel a touch must cover before the drag counts as a gesture
+ *  rather than a tap — below it the tap-to-close/tap-a-button paths are left
+ *  alone. `DISTANCE` is the release threshold that dismisses. `TRAVEL` is the
+ *  distance mapped to the full dim/shrink feedback, so the backdrop fades and
+ *  the image shrinks proportionally to how far the finger has pulled.
+ *
+ *  Distance is deliberately the ONLY dismiss criterion: a velocity path would
+ *  buy a sub-`DISTANCE` flick and cost per-move rate tracking plus its own
+ *  threshold, and the flick a user actually makes travels past `DISTANCE`
+ *  anyway. */
+const LIGHTBOX_DISMISS_SLOP = 8
+const LIGHTBOX_DISMISS_DISTANCE = 96
+const LIGHTBOX_DISMISS_TRAVEL = 260
 
 /** True when a keyboard event originates from an editable element, so global
  *  printable-key shortcuts (like the lightbox 'd' download) don't hijack typing. */
@@ -3151,35 +3720,64 @@ export function dispatchLightbox(target: HTMLImageElement): void {
  *  payload and the legacy { src, alt } single-image shape. */
 export function Lightbox() {
   const [state, setState] = useState<LightboxDetail | null>(null)
-  // Zoom (enlarge) factor for the current image. 1 = fit-to-screen; larger
-  // values scale the fit box up so the image overflows into the scrollable
-  // overlay. Reset to 1 whenever the shown image changes (see effect below).
-  const [zoom, setZoom] = useState(1)
-  const zoomIn = useCallback(() => setZoom(z => Math.min(LIGHTBOX_ZOOM_MAX, +(z + LIGHTBOX_ZOOM_STEP).toFixed(2))), [])
-  const zoomOut = useCallback(() => setZoom(z => Math.max(LIGHTBOX_ZOOM_MIN, +(z - LIGHTBOX_ZOOM_STEP).toFixed(2))), [])
-  // Pan offset (px) for dragging an enlarged image around. Only meaningful when
-  // zoom > 1. The image element itself is the drag surface; a small movement
-  // threshold distinguishes a pan-drag from a click (which steps the zoom).
-  const [pan, setPan] = useState({ x: 0, y: 0 })
   const imgRef = useRef<HTMLImageElement>(null)
+  /** The overlay root. Separate from `imgRef` because the transform target is the
+   *  image while the surface a user perceives as "the viewer" is the whole
+   *  backdrop — see the `containRef` note on the pinch hook. */
+  const overlayRef = useRef<HTMLDivElement>(null)
   const dragRef = useRef({ startX: 0, startY: 0, baseX: 0, baseY: 0, moved: 0, active: false, dragging: false })
   const [dragging, setDragging] = useState(false)
-  // Live zoom for the pointer/clamp closures (avoids stale-closure math in the
-  // fire-and-forget pointer handlers and the post-layout re-clamp effect).
-  const zoomRef = useRef(zoom)
-  zoomRef.current = zoom
-  // Clamp a candidate pan so the image can't be flung entirely off-screen. Zoom
-  // is applied as a CSS `scale()` transform, so the *visual* size is the layout
-  // box (offsetWidth/Height) times the current zoom; travel is allowed up to
-  // half that overflow beyond the viewport.
-  const clampPan = useCallback((x: number, y: number) => {
-    const el = imgRef.current
-    if (!el) return { x, y }
-    const z = zoomRef.current
-    const maxX = Math.max(0, (el.offsetWidth * z - window.innerWidth) / 2)
-    const maxY = Math.max(0, (el.offsetHeight * z - window.innerHeight) / 2)
-    return { x: Math.min(maxX, Math.max(-maxX, x)), y: Math.min(maxY, Math.max(-maxY, y)) }
-  }, [])
+  // `suppressClick` makes the click that follows a real gesture a no-op, so a
+  // spring-back or a finished pinch does not also close via the backdrop handler.
+  // Declared before the hook because `onPinchEnd` sets it.
+  const suppressClickRef = useRef(false)
+  // Zoom (enlarge) factor and pan offset for the current image, plus the pinch
+  // gesture that drives them. 1 = fit-to-screen; larger values scale the fit box
+  // up so the image overflows the viewport and can be panned. Reset to fit
+  // whenever the shown image changes (see effect below).
+  //
+  // The gesture lives in `usePinchZoom` because this is not the only surface that
+  // owns its own magnification — `DiagramLightbox` is the other, and shipping the
+  // math twice is how the two diverge.
+  const {
+    zoom, setZoom, pan, setPan, pinching, zoomRef, clampPan,
+    trackPointerDown, trackPointerMove, trackPointerUp, reset: resetZoom,
+  } = usePinchZoom({
+    targetRef: imgRef,
+    // Claim the gesture anywhere in the overlay, not just over the `<img>`. A
+    // small image leaves most of the full-screen backdrop unclaimed, and a pinch
+    // there would fall through to browser page zoom: the viewer is fit-invariant
+    // so nothing appears to happen, and the user closes it to find the dashboard
+    // behind it at a different zoom with no visible cause.
+    containRef: overlayRef,
+    // Only while an image is open. This component mounts ONCE for the app's
+    // lifetime and returns null when closed, so without this a non-passive
+    // `wheel` listener would sit on `window` forever — making the compositor wait
+    // on main-thread dispatch for every scroll in the app, viewer or not.
+    enabled: state !== null,
+    min: LIGHTBOX_ZOOM_MIN,
+    max: LIGHTBOX_ZOOM_MAX,
+    onPinchStart: () => {
+      // Both one-finger gestures lose their claim: a dismiss-drag would read the
+      // pinch's vertical component as pull-to-close, and the <img> pan would fight
+      // the scale over the same two contacts.
+      abortSwipeRef.current?.()
+      lastTapRef.current = { t: 0, x: 0, y: 0 }
+      const d = dragRef.current
+      if (d.active) { d.active = false; d.dragging = false; setDragging(false) }
+    },
+    // A finished pinch is not a tap. Without this the click synthesised after the
+    // last finger lifts reaches the backdrop handler and closes the viewer the
+    // user just spent the gesture zooming into.
+    onPinchEnd: () => { suppressClickRef.current = true },
+  })
+  const zoomIn = useCallback(() => setZoom(z => Math.min(LIGHTBOX_ZOOM_MAX, +(z + LIGHTBOX_ZOOM_STEP).toFixed(2))), [setZoom])
+  const zoomOut = useCallback(() => setZoom(z => Math.max(LIGHTBOX_ZOOM_MIN, +(z - LIGHTBOX_ZOOM_STEP).toFixed(2))), [setZoom])
+  /** `onPinchStart` fires from inside the hook, which is constructed before
+   *  `abortSwipe` exists — the ref is what lets the callback reach the later
+   *  definition without reordering the whole component around it. */
+  const abortSwipeRef = useRef<(() => void) | null>(null)
+
   // End a drag on either pointerup OR pointercancel (touch/pen interrupted, or
   // capture lost) so `active`/`dragging` never latch on with no contact held.
   const endDrag = useCallback((e: React.PointerEvent<HTMLImageElement>) => {
@@ -3187,6 +3785,144 @@ export function Lightbox() {
     if (d.active) { try { e.currentTarget.releasePointerCapture(e.pointerId) } catch { /* no capture */ } }
     d.active = false
     if (d.dragging) { d.dragging = false; setDragging(false) }
+  }, [])
+  // ── swipe-down-to-dismiss ────────────────────────────────────────────────
+  // A touch drag anywhere over the overlay pulls the image with the finger and
+  // dismisses on release. Gated to fit zoom (above it the same gesture already
+  // means "pan", handled on the <img>) and to non-mouse pointers, so the desktop
+  // click-backdrop-to-close behaviour is untouched.
+  const [swipeY, setSwipeY] = useState(0)
+  const [swiping, setSwiping] = useState(false)
+  // `engaged` flips once SLOP is crossed with vertical intent; until then the
+  // gesture is still a candidate tap. `suppressClick` makes the click that
+  // follows a real drag a no-op, so a spring-back does not also close via the
+  // backdrop handler.
+  //
+  // `pointerId` is what keeps a PINCH from reading as a dismiss. Every finger
+  // raises its own pointerdown/move/up, so without an id the second finger
+  // rewrites the gesture's origin and a two-finger zoom attempt walks the image
+  // down and closes the viewer the user was zooming into.
+  const swipeRef = useRef({ pointerId: -1, startX: 0, startY: 0, active: false, engaged: false })
+  // Abandon the in-flight gesture and return the image to rest. Used by the
+  // multi-touch bail-out and by pointercancel.
+  const abortSwipe = useCallback(() => {
+    const s = swipeRef.current
+    s.active = false
+    if (s.engaged) { s.engaged = false; setSwiping(false); suppressClickRef.current = true }
+    s.pointerId = -1
+    setSwipeY(0)
+  }, [])
+  // Publish it for the hook's `onPinchStart`, which is constructed above this.
+  abortSwipeRef.current = abortSwipe
+
+  // ── double-tap to zoom (touch) ───────────────────────────────────────────
+  const lastTapRef = useRef({ t: 0, x: 0, y: 0 })
+  const onDoubleTap = useCallback((e: React.PointerEvent<HTMLElement>): boolean => {
+    if (e.pointerType === 'mouse') return false
+    if ((e.target as HTMLElement | null)?.closest('button')) return false
+    const now = Date.now()
+    const last = lastTapRef.current
+    const isDouble = now - last.t < DOUBLE_TAP_MS && Math.hypot(e.clientX - last.x, e.clientY - last.y) < DOUBLE_TAP_SLOP
+    lastTapRef.current = { t: now, x: e.clientX, y: e.clientY }
+    if (!isDouble) return false
+    lastTapRef.current = { t: 0, x: 0, y: 0 }
+    suppressClickRef.current = true
+    abortSwipe()
+    const d = dragRef.current
+    if (d.active) { d.active = false; d.dragging = false; setDragging(false) }
+    if (zoomRef.current > LIGHTBOX_ZOOM_MIN) {
+      setZoom(LIGHTBOX_ZOOM_MIN)
+      setPan({ x: 0, y: 0 })
+      return true
+    }
+    const cx = window.innerWidth / 2
+    const cy = window.innerHeight / 2
+    const z = DOUBLE_TAP_ZOOM
+    setZoom(z)
+    setPan(clampPan((e.clientX - cx) * (1 - z), (e.clientY - cy) * (1 - z), z))
+    return true
+  }, [abortSwipe, clampPan, setPan, setZoom, zoomRef])
+  // ── pinch-to-zoom (touch, two fingers) ───────────────────────────────────
+  // Browser page zoom is off on touch across the shell (viewport meta in
+  // index.html, root `touch-action` in index.css, `gesturestart` suppression in
+  // utils/pageZoom.ts), because magnifying a fixed-height app shell strands the
+  // user in a layout with no scroll axis to reach what moved off-screen. This
+  // viewer is the surface where magnifying IS the point, so it owns the gesture
+  // instead of borrowing the browser's — and it drives the SAME `zoom` state the
+  // toolbar and keyboard drive, so pan clamping, the reset on image change and
+  // the `zoomed` cursor keep working with no parallel code path.
+  //
+  // The gesture itself is `usePinchZoom` (contact tracking, focal anchoring, pan
+  // clamping); what stays here is only the part that is specific to THIS viewer —
+  // which one-finger gesture yields to a pinch, and what a finished pinch means
+  // for the click that follows.
+  const onOverlayPointerDown = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
+    // Every click in this subtree is preceded by a pointerdown, so clearing here
+    // is what keeps the flag from latching when the click is swallowed upstream
+    // (the <img> stops propagation, so the overlay's own handler never runs).
+    suppressClickRef.current = false
+    if (e.pointerType === 'mouse') return
+    // Record the contact BEFORE any bail-out below. A pinch is only knowable from
+    // two tracked contacts, and every branch that follows returns early — so
+    // recording last would mean the second finger is never seen in exactly the
+    // cases (drag live, already zoomed) a pinch is most likely to start from.
+    // The hook records the contact and, when a pinch seats, calls `onPinchStart`
+    // (which drops the swipe and the <img> drag) and returns true.
+    if (trackPointerDown(e)) {
+      lastTapRef.current = { t: 0, x: 0, y: 0 }
+      return
+    }
+    // Toolbar taps must stay taps — never start a gesture from a control.
+    if ((e.target as HTMLElement | null)?.closest('button')) return
+    // A consumed double-tap changes zoom synchronously through the live ref's
+    // owner but React publishes that new value on the next render. Return now
+    // instead of consulting the still-fit ref and re-arming swipe-to-dismiss.
+    if (onDoubleTap(e)) return
+    if (zoomRef.current > LIGHTBOX_ZOOM_MIN) return // the <img> pan owns this gesture
+    swipeRef.current = { pointerId: e.pointerId, startX: e.clientX, startY: e.clientY, active: true, engaged: false }
+  }, [trackPointerDown, onDoubleTap, zoomRef])
+  const onOverlayPointerMove = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
+    // A live pinch consumes the move (scale + focal-anchored pan).
+    if (trackPointerMove(e)) return
+    const s = swipeRef.current
+    if (!s.active || e.pointerId !== s.pointerId) return
+    const dx = e.clientX - s.startX
+    const dy = e.clientY - s.startY
+    if (!s.engaged) {
+      if (Math.hypot(dx, dy) < LIGHTBOX_DISMISS_SLOP) return
+      // Horizontal intent is not a dismiss — drop the gesture rather than
+      // yanking the image sideways.
+      if (Math.abs(dx) > Math.abs(dy)) { s.active = false; return }
+      s.engaged = true
+      setSwiping(true)
+      lastTapRef.current = { t: 0, x: 0, y: 0 }
+    }
+    // Downward travel tracks the finger 1:1; upward is rubber-banded, since
+    // pulling up is not a dismiss but should not feel dead either.
+    setSwipeY(dy >= 0 ? dy : dy / 4)
+  }, [trackPointerMove])
+  const endSwipe = useCallback((e: React.PointerEvent<HTMLDivElement>, cancelled: boolean) => {
+    // The hook drops the contact and ends the pinch on the FIRST lift (rather than
+    // the last), which is what stops the finger still down from being re-read as a
+    // one-finger pan whose origin is wherever the pinch happened to leave it.
+    trackPointerUp(e)
+    const s = swipeRef.current
+    if (!s.active || e.pointerId !== s.pointerId) return
+    if (cancelled) { abortSwipe(); return }
+    s.active = false
+    s.pointerId = -1
+    if (!s.engaged) return
+    s.engaged = false
+    setSwiping(false)
+    suppressClickRef.current = true
+    if (e.clientY - s.startY > LIGHTBOX_DISMISS_DISTANCE) setState(null)
+    else setSwipeY(0)
+  }, [abortSwipe, trackPointerUp])
+  const onOverlayPointerUp = useCallback((e: React.PointerEvent<HTMLDivElement>) => endSwipe(e, false), [endSwipe])
+  const onOverlayPointerCancel = useCallback((e: React.PointerEvent<HTMLDivElement>) => endSwipe(e, true), [endSwipe])
+  const onOverlayClick = useCallback(() => {
+    if (suppressClickRef.current) { suppressClickRef.current = false; return }
+    setState(null)
   }, [])
   // Keep a fresh ref so the global keydown handler (subscribed once per open)
   // can read the current image for the download shortcut without a stale closure.
@@ -3210,8 +3946,21 @@ export function Lightbox() {
   const isOpen = state !== null
   // Reset the zoom whenever the lightbox opens/closes or the shown image
   // changes, so each image starts fit-to-screen rather than inheriting the
-  // previous one's zoom.
-  useEffect(() => { setZoom(LIGHTBOX_ZOOM_MIN) }, [isOpen, state?.index])
+  // previous one's zoom. The dismiss offset resets with it — a viewer reopened
+  // right after a spring-back must not start half-dragged.
+  useEffect(() => {
+    setSwipeY(0)
+    setSwiping(false)
+    lastTapRef.current = { t: 0, x: 0, y: 0 }
+    swipeRef.current.active = false
+    swipeRef.current.engaged = false
+    swipeRef.current.pointerId = -1
+    // Contacts do not survive the viewer: closing mid-pinch (or an image change
+    // driven from the keyboard while fingers are down) must not leave a stale
+    // pair behind for the next open to scale against. `resetZoom` clears the
+    // contact map and the pinch baseline along with the zoom and pan.
+    resetZoom()
+  }, [isOpen, state?.index, resetZoom])
   // On any zoom change, recentre at fit and otherwise re-clamp the existing pan
   // to the new (smaller/larger) bounds — zooming out must not strand the image
   // off-screen. Runs post-layout, so offsetWidth already reflects the new box.
@@ -3243,19 +3992,48 @@ export function Lightbox() {
         if (cur) void downloadLightboxImage(cur.images[cur.index])
       }
     }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
+    // CAPTURE phase, matching DiagramLightbox: dialog panels (Modal, the Radix
+    // ui/dialog family) stop bubble-phase keydown propagation so the page's
+    // global shortcuts don't fire under them, and this viewer opens ABOVE
+    // those dialogs (a README image inside SkillBrowserModal / McpBrowserModal
+    // etc). With focus still inside the dialog panel, a bubble-phase listener
+    // here never sees the key — arrows/zoom go dead while Escape still works.
+    // Capture runs before any panel handler. It also fixes Escape ordering
+    // over a Modal: this handler's preventDefault now lands BEFORE Modal's
+    // bubble-phase window listener, so its defaultPrevented skip keeps the
+    // modal open and Escape closes only the viewer.
+    window.addEventListener('keydown', onKey, true)
+    return () => window.removeEventListener('keydown', onKey, true)
   }, [isOpen, zoomIn, zoomOut])
   if (!state) return null
   const img = state.images[state.index]
   const zoomed = zoom > LIGHTBOX_ZOOM_MIN
+  // 0 → untouched, 1 → full dismiss feedback. Downward pull only; the
+  // rubber-banded upward direction keeps the backdrop at full strength.
+  const swipeProgress = Math.min(1, Math.max(0, swipeY) / LIGHTBOX_DISMISS_TRAVEL)
   return (
-    <Clickable className="fixed inset-0 z-[9999] bg-black/80 flex items-center justify-center overflow-hidden cursor-pointer" onClick={() => setState(null)}>
+    <Clickable
+      ref={overlayRef}
+      className={`fixed inset-0 z-[9999] bg-black/80 flex items-center justify-center overflow-hidden cursor-pointer touch-none ${swiping ? '' : 'transition-colors duration-200'}`}
+      // Inline background wins over the class only while a drag is live, so the
+      // default (and every non-touch) render keeps the plain bg-black/80 paint.
+      style={swipeProgress > 0 ? { backgroundColor: `rgba(0, 0, 0, ${(0.8 * (1 - swipeProgress * 0.75)).toFixed(3)})` } : undefined}
+      onClick={onOverlayClick}
+      onPointerDown={onOverlayPointerDown}
+      onPointerMove={onOverlayPointerMove}
+      onPointerUp={onOverlayPointerUp}
+      onPointerCancel={onOverlayPointerCancel}
+    >
       {/* Inner wrapper centres the image; when enlarged, the image is dragged
           around via a translate transform (see pointer handlers) rather than
           scrollbars — a flex-centred overflow container can't scroll to its
-          hidden top/left edges, so drag-to-pan is the reliable mechanism. */}
-      <div className="flex items-center justify-center w-full h-full">
+          hidden top/left edges, so drag-to-pan is the reliable mechanism.
+          This wrapper also carries the swipe-to-dismiss offset, kept off the
+          <img> so it composes with (rather than fights) the pan/zoom transform. */}
+      <div
+        className={`flex items-center justify-center w-full h-full ${swiping ? '' : 'transition-transform duration-200'}`}
+        style={swipeY !== 0 ? { transform: `translateY(${swipeY.toFixed(1)}px) scale(${(1 - swipeProgress * 0.15).toFixed(3)})` } : undefined}
+      >
         {/* The image is a drag surface for panning when zoomed; zoom itself
             lives in the toolbar + keyboard. A plain click only stops the
             backdrop-close from firing (clicking the image should not dismiss
@@ -3267,7 +4045,7 @@ export function Lightbox() {
           src={img.src}
           alt={img.alt}
           draggable={false}
-          className={`select-none object-contain rounded-lg shadow-2xl ${dragging ? '' : 'transition-transform duration-150'} ${zoomed ? (dragging ? 'cursor-grabbing' : 'cursor-grab') : 'cursor-default'}`}
+          className={`select-none object-contain rounded-lg shadow-2xl ${dragging || pinching ? '' : 'transition-transform duration-150'} ${zoomed ? (dragging ? 'cursor-grabbing' : 'cursor-grab') : 'cursor-default'}`}
           style={{ maxWidth: '90vw', maxHeight: '90vh', transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`, transformOrigin: 'center' }}
           onDragStart={e => e.preventDefault()}
           onPointerDown={e => {
@@ -3282,7 +4060,11 @@ export function Lightbox() {
             const dx = e.clientX - d.startX
             const dy = e.clientY - d.startY
             d.moved = Math.max(d.moved, Math.hypot(dx, dy))
-            if (d.moved > 4 && !d.dragging) { d.dragging = true; setDragging(true) }
+            if (d.moved > 4 && !d.dragging) {
+              d.dragging = true
+              setDragging(true)
+              lastTapRef.current = { t: 0, x: 0, y: 0 }
+            }
             setPan(clampPan(d.baseX + dx, d.baseY + dy))
           }}
           onPointerUp={endDrag}
@@ -3293,7 +4075,7 @@ export function Lightbox() {
       {/* Control cluster sits on its own translucent, blurred pill so the
           white icons stay legible even when a light/enlarged image is panned
           up behind the toolbar. */}
-      <div className="fixed top-4 right-4 flex items-center gap-0.5 rounded-full bg-black/60 backdrop-blur-md ring-1 ring-white/15 shadow-lg px-1 py-1">
+      <div className="fixed top-safe-offset-4 right-safe-offset-4 flex items-center gap-0.5 rounded-full bg-black/60 backdrop-blur-md ring-1 ring-white/15 shadow-lg px-1 py-1">
         {/* Zoom segment: − / reset (magnifier) / + always visible as a group. */}
         <button
           aria-label={i18nT('components.markdownRenderer.zoom_out')}

@@ -60,8 +60,36 @@ async def _turn(body: str | tuple[str, ...], **kw: Any) -> FakeClient:
     return cli
 
 
-def _fields(payload: dict, files: list) -> list[tuple[dict, Any, Any]]:
-    return [(o, h, v) for (o, h, v) in _build_upload_form(payload, files)._fields]
+def _fields(payload: dict, files: list, **kw: Any) -> list[tuple[dict, Any, Any]]:
+    return [(o, h, v) for (o, h, v) in _build_upload_form(payload, files, **kw)._fields]
+
+
+def _doc(name: str = "report.pdf", *, data: bytes = b"%PDF-1.4 body") -> Any:
+    return outbound.OutboundFile(
+        path=f"/tmp/outbox/{name}", data=data, alt="", mime="application/pdf"
+    )
+
+
+def _client(monkeypatch: Any, reply: dict) -> tuple[Any, list[dict]]:
+    """A DiscordClient whose session records the multipart body it was handed."""
+    from contextlib import asynccontextmanager
+
+    from kiro_crew.discord.client import DiscordClient
+
+    seen: list[dict] = []
+
+    @asynccontextmanager
+    async def request(method: str, url: str, **kw: Any) -> Any:
+        seen.append({k: v for k, v in kw.items() if k == "data"})
+
+        async def response_json(content_type: Any = None) -> Any:
+            return reply
+
+        yield SimpleNamespace(status=200, json=response_json)
+
+    client = DiscordClient(token="t")
+    monkeypatch.setattr(client, "_ensure_session", lambda: _done(SimpleNamespace(request=request)))
+    return client, seen
 
 
 def _description(alt: str) -> str:
@@ -78,8 +106,15 @@ def _slot(restricted: bool) -> Any:
 
 # fmt: off
 def _restricted(key: str, slot: Any = None) -> bool:
+    """Drive Discord's gate with a fake dashboard state holding *slot*.
+
+    Injects the STATE rather than stubbing the slot lookup, so the real
+    ``get_slot`` path in ``messaging/upload_gate.py`` is what answers.
+    """
     from kiro_crew.discord.transport_dispatch import DiscordDispatcher
-    dispatcher = SimpleNamespace(_live_dashboard_slot=lambda _key: slot)
+
+    state = SimpleNamespace(get_slot=lambda _name: slot)
+    dispatcher = SimpleNamespace(_session_resume=SimpleNamespace(dashboard_state=state))
     return asyncio.run(DiscordDispatcher._uploads_restricted(dispatcher, key))
 
 
@@ -239,9 +274,9 @@ class TestRestrictedGate:
 
     @pytest.mark.parametrize("restricted,events", [(True, 1), (False, 0)])
     def test_only_a_denied_upload_is_sel_audited(self, monkeypatch: pytest.MonkeyPatch, restricted: bool, events: int) -> None:
-        from kiro_crew.discord import transport_dispatch as td
+        from kiro_crew.messaging import upload_gate as ug
         seen: list[dict] = []
-        monkeypatch.setattr(td, "sel", lambda: SimpleNamespace(log_api_access=lambda **kw: seen.append(kw)))
+        monkeypatch.setattr(ug, "sel", lambda: SimpleNamespace(log_api_access=lambda **kw: seen.append(kw)))
         assert _restricted("dashboard:abc", _slot(restricted)) is restricted
         assert len(seen) == events
         if events:
@@ -249,39 +284,59 @@ class TestRestrictedGate:
             assert tuple(seen[0][key] for key in keys) == ("denied", "discord", "restricted_session", "dashboard:abc")
 
     def test_no_live_slot_falls_through_to_the_persisted_mode(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        from kiro_crew.discord import transport_dispatch as td
-        monkeypatch.setattr(td, "_persisted_mode_is_restricted", lambda key: key == "dashboard:ghost")
+        from kiro_crew.messaging import upload_gate as ug
+        monkeypatch.setattr(
+            ug, "_persisted_mode_is_restricted", lambda key, probe: key == "dashboard:ghost"
+        )
         assert _restricted("dashboard:ghost") is True
         assert _restricted("dashboard:kept") is False
 
     @pytest.mark.parametrize("mode,restricted", [("incognito", True), ("temporary", True), ("persistent", False), (None, True)])
     def test_the_persisted_mode_decides(self, monkeypatch: pytest.MonkeyPatch, mode: Any, restricted: bool) -> None:
         from kiro_crew.dashboard.handlers import _shared
-        from kiro_crew.discord import transport_dispatch as td
+        from kiro_crew.messaging import upload_gate as ug
+
+        # Injected, not imported: `messaging` may not reach `dashboard`, so the
+        # probe travels as an argument and the test supplies it directly.
+        probe = _shared._probe_persisted_session
         monkeypatch.setattr(_shared, "_probe_persisted_session", lambda name: (True, mode))
-        assert td._persisted_mode_is_restricted("dashboard:abc") is restricted
+        assert ug._persisted_mode_is_restricted("dashboard:abc", lambda n: (True, mode)) is restricted
+        assert probe is not None
 
     def test_an_ambiguous_stem_denies_instead_of_taking_the_first_match(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         from kiro_crew.dashboard.handlers import _shared
-        from kiro_crew.discord import transport_dispatch as td
+        from kiro_crew.messaging import upload_gate as ug
         _stage_sessions(monkeypatch, tmp_path, abc="persistent", dashboard_abc="incognito")
         assert _shared._persisted_session_memory_mode("abc") == "persistent"
         assert _shared._probe_persisted_session("abc") == (True, None)
-        assert td._persisted_mode_is_restricted("dashboard:abc") is True
+        assert (
+            ug._persisted_mode_is_restricted(
+                "dashboard:abc", _shared._probe_persisted_session
+            )
+            is True
+        )
 
     def test_a_single_unambiguous_persistent_transcript_still_allows(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-        from kiro_crew.discord import transport_dispatch as td
+        from kiro_crew.dashboard.handlers import _shared
+        from kiro_crew.messaging import upload_gate as ug
+
         _stage_sessions(monkeypatch, tmp_path, dashboard_solo="persistent")
-        assert td._persisted_mode_is_restricted("dashboard:solo") is False
+        assert (
+            ug._persisted_mode_is_restricted(
+                "dashboard:solo", _shared._probe_persisted_session
+            )
+            is False
+        )
 
     def test_an_unreadable_probe_denies(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from kiro_crew.dashboard.handlers import _shared
-        from kiro_crew.discord import transport_dispatch as td
+        from kiro_crew.messaging import upload_gate as ug
 
         def _boom(name: str) -> Any:
             raise OSError("sessions dir gone")
-        monkeypatch.setattr(_shared, "_probe_persisted_session", _boom)
-        assert td._persisted_mode_is_restricted("dashboard:abc") is True
+
+        assert ug._persisted_mode_is_restricted("dashboard:abc", _boom) is True
+        assert _shared is not None  # the real probe is unused here, by design
 
 
 class TestDescriptionRedaction:
@@ -400,16 +455,70 @@ class TestMultipartWire:
         assert asyncio.run(client.send_message_with_files("c1", "hi", [_file()])) == ""
 
 
-class TestTransportVerb:
-    def test_send_message_with_files_returns_the_message_id(self) -> None:
-        transport = DiscordTransport(cli := FakeClient(), allowed_user_ids=["u1"])  # type: ignore[arg-type]
-        file = _file()
-        assert asyncio.run(transport.send_message_with_files("c1", "hi", [file])).isdigit() and cli.uploaded_files == [file]
+class TestDocumentVerb:
+    """The name-preserving document send (issue #6058).
 
-    def test_over_cap_attachments_are_dropped_not_failed(self) -> None:
+    Separate from ``send_message_with_files`` on purpose: that path's sanitizer
+    is aimed at LLM-authored reference paths and maps every non-raster mime to
+    ``.bin``, so it would deliver ``report.pdf`` as ``report.bin``. These tests
+    pin BOTH halves — the admitted name survives here, and the extraction path's
+    derivation is untouched.
+    """
+
+    def test_the_extraction_path_still_derives_the_name(self) -> None:
+        # The guarantee `upload_filename` makes to its existing callers: an
+        # untrusted path, a non-raster mime, `.bin`. Unchanged by this verb.
+        assert upload_filename(_doc(), 0) == "report.bin"
+        fields = _fields({"content": ""}, [_doc()])
+        assert json.loads(fields[0][2])["attachments"][0]["filename"] == "report.bin"
+        assert fields[1][0]["filename"] == "report.bin"
+
+    def test_a_pinned_name_survives_into_descriptor_and_part(self) -> None:
+        # Discord matches a descriptor to its part by `id`; a name that differs
+        # between the two is what renames an attachment mid-upload.
+        fields = _fields({"content": ""}, [_doc()], filenames=["report.pdf"])
+        assert json.loads(fields[0][2])["attachments"][0]["filename"] == "report.pdf"
+        assert fields[1][0]["filename"] == "report.pdf" and fields[1][2] == b"%PDF-1.4 body"
+
+    def test_a_short_pin_list_falls_back_per_file(self) -> None:
+        fields = _fields({"content": ""}, [_doc(), _file("/tmp/b.png")], filenames=["report.pdf"])
+        assert [a["filename"] for a in json.loads(fields[0][2])["attachments"]] == ["report.pdf", "b.png"]
+
+    def test_send_document_pins_the_basename_on_the_wire(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        client, seen = _client(monkeypatch, {"id": "77"})
+        assert asyncio.run(client.send_document("c1", _doc(), caption="weekly numbers")) == "77"
+        form = seen[-1]["data"]._fields
+        payload = json.loads(form[0][2])
+        assert payload["content"] == "weekly numbers"
+        assert payload["attachments"] == [{"id": 0, "filename": "report.pdf"}]
+        assert form[1][0]["filename"] == "report.pdf" and form[1][2] == b"%PDF-1.4 body"
+
+    def test_a_document_over_the_upload_ceiling_is_refused(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # One attachment IS the whole upload, so the message ceiling is this
+        # file's ceiling. Refused locally rather than uploaded into a 413.
+        client, seen = _client(monkeypatch, {"id": "77"})
+        over = _doc(data=b"x" * (DISCORD_MAX_TOTAL_UPLOAD_BYTES + 1))
+        assert asyncio.run(client.send_document("c1", over)) is None and seen == []
+        assert asyncio.run(client.send_document("c1", _doc(data=b""))) is None and seen == []
+
+    def test_the_caption_is_clamped_to_the_content_limit(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        client, seen = _client(monkeypatch, {"id": "77"})
+        assert asyncio.run(client.send_document("c1", _doc(), caption="c" * (DISCORD_MAX_TEXT + 50))) == "77"
+        assert len(json.loads(seen[-1]["data"]._fields[0][2])["content"]) == DISCORD_MAX_TEXT
+
+    def test_the_transport_returns_the_message_id_and_routes_a_thread(self) -> None:
         transport = DiscordTransport(cli := FakeClient(), allowed_user_ids=["u1"])  # type: ignore[arg-type]
-        files = [_file(f"/tmp/{i}.png") for i in range(DISCORD_MAX_FILES_PER_MESSAGE + 3)]
-        assert asyncio.run(transport.send_message_with_files("c1", "hi", files)).isdigit() and len(cli.uploaded_files) == DISCORD_MAX_FILES_PER_MESSAGE
+        doc = _doc()
+        assert asyncio.run(transport.send_document("c1", doc, caption="hi")).isdigit()
+        # A Discord thread's snowflake IS its channel id, so a supplied
+        # thread_id is the destination rather than a second parameter.
+        assert asyncio.run(transport.send_document("c1", doc, thread_id="t9")).isdigit()
+        assert [(chan, f is doc, cap) for chan, f, cap in cli.documents] == [("c1", True, "hi"), ("t9", True, None)]
+
+    def test_a_refused_transport_send_reports_an_empty_id(self) -> None:
+        transport = DiscordTransport(cli := FakeClient(), allowed_user_ids=["u1"])  # type: ignore[arg-type]
+        cli.fail_uploads = True
+        assert asyncio.run(transport.send_document("c1", _doc())) == ""
 
 
 async def _done(value: Any) -> Any:

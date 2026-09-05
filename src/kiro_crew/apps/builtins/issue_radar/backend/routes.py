@@ -68,10 +68,16 @@ from functools import partial, wraps
 
 from aiohttp import web
 
-from kiro_crew.apps.builtins.issue_radar.backend import github_client, provider, store, watch
+from kiro_crew.apps.builtins.issue_radar.backend import (
+    github_client,
+    pipeline_routes,
+    provider,
+    store,
+    watch,
+)
 from kiro_crew.apps.manager import is_app_enabled
 from kiro_crew.config.loader import KiroCrewConfig
-from kiro_crew.context import ui_language_tag
+from kiro_crew.context import normalize_ui_language_tag, ui_language_tag
 from kiro_crew.loop_lock import LoopBoundLock
 from kiro_crew.sel import sel
 
@@ -1541,6 +1547,173 @@ def _deps_node_hints(
     return hints
 
 
+# ── /deps serve-stale-revalidate-behind ─────────────────────────────────────
+#
+# App-state key under which the in-flight background deps-refresh tasks live, one
+# per repo. A typed ``web.AppKey`` (same pattern as spec_builder) so the registry
+# shares the app's lifetime and shutdown can cancel every outstanding task — see
+# ``_stop_deps_refreshes`` (registered as an ``on_cleanup`` hook).
+_DepsRefreshTasks = dict[str, "asyncio.Task"]
+_DEPS_REFRESH_TASKS_APP_KEY: web.AppKey[_DepsRefreshTasks] = web.AppKey(
+    "issue_radar_deps_refresh_tasks", dict
+)
+
+# Per-repo rebuild mutex. Coalescing (above) only stops a SECOND BACKGROUND
+# refresh; it cannot order a background rebuild against a synchronous one, and
+# ``write_deps_cache`` stamps ``fetched_at`` at WRITE time. Without this lock:
+# a stale GET starts background rebuild A, an edge changes, ``refresh=1`` starts
+# synchronous rebuild B, B writes the fresh graph -- and then the slower A lands
+# on top with its older edges and stamps them fresh for a full TTL. Serializing
+# every rebuild for a repo makes the last write the last FETCH, which is the
+# property the cache's freshness stamp claims. Two concurrent ``refresh=1``
+# calls are ordered by the same lock.
+_DepsRebuildLocks = dict[str, "asyncio.Lock"]
+_DEPS_REBUILD_LOCKS_APP_KEY: web.AppKey[_DepsRebuildLocks] = web.AppKey(
+    "issue_radar_deps_rebuild_locks", dict
+)
+
+
+def _deps_reg_key(key: provider.RepoKey) -> str:
+    """The per-repo registry key shared by the refresh-task and lock registries."""
+    return f"{key.provider}:{key.host}:{key.owner}/{key.repo}"
+
+
+def _deps_refresh_registry(app: web.Application) -> _DepsRefreshTasks:
+    """The per-app ``repo-key -> in-flight refresh Task`` map, created on first use."""
+    reg = app.get(_DEPS_REFRESH_TASKS_APP_KEY)
+    if reg is None:
+        reg = {}
+        app[_DEPS_REFRESH_TASKS_APP_KEY] = reg
+    return reg
+
+
+def _deps_rebuild_lock(app: web.Application, key: provider.RepoKey) -> "asyncio.Lock":
+    """The per-repo rebuild mutex, created on first use.
+
+    Bound to the app (hence to one event loop), so this is a plain
+    :class:`asyncio.Lock` rather than a loop-bound one: it is never a module
+    global shared across loops.
+    """
+    locks = app.get(_DEPS_REBUILD_LOCKS_APP_KEY)
+    if locks is None:
+        locks = {}
+        app[_DEPS_REBUILD_LOCKS_APP_KEY] = locks
+    reg_key = _deps_reg_key(key)
+    lock = locks.get(reg_key)
+    if lock is None:
+        lock = asyncio.Lock()
+        locks[reg_key] = lock
+    return lock
+
+
+class _DepsScopeUnavailable(GhCliError):
+    """The open-issue scope a deps rebuild needs could not be read.
+
+    A dedicated type rather than a message pattern: the route maps this to the
+    ``deps_issue_scope_unavailable`` code and a plain :class:`GhCliError` to
+    ``deps_fetch_failed``. Both failures used to be told apart by which of two
+    ``try`` blocks caught them; now that one helper owns the whole build, the
+    distinction has to travel with the exception, and sniffing the message text
+    would silently reclassify every scope failure whose wording does not happen
+    to mention issues (``gh api ... failed`` mentions neither).
+    """
+
+
+async def _rebuild_deps(app: web.Application, key: provider.RepoKey) -> dict:
+    """Rebuild the dependency graph for ``key`` and persist it, returning the
+    normalized stored shape ``{"edges", "nodes", ...}``.
+
+    The single build path shared by the synchronous route (cold cache /
+    ``refresh=1``) and the background revalidation. Reads the open issues (the
+    graph's scope) plus the open pulls (node hints) from the caches the app
+    already keeps, syncs the native + inferred edges via
+    ``github_client.fetch_dependency_edges``, writes the deps cache, and re-reads
+    it so the caller gets the normalized/deduped shape a later cache hit would.
+
+    Holds the repo's rebuild mutex across fetch AND write, so a slow rebuild can
+    never land on top of a newer one and re-stamp older edges as fresh.
+
+    Raises :class:`_DepsScopeUnavailable` when the issue scope cannot be read and
+    a plain ``GhCliError`` when the edge fetch fails, so the synchronous caller
+    can keep the two 502 codes callers already see; the background caller catches
+    every exception instead (a background failure must leave the previous good
+    cache intact).
+    """
+    owner, repo = key.owner, key.repo
+    async with _deps_rebuild_lock(app, key):
+        try:
+            issues = await _load_open_issues_for_reco(key)
+        except GhCliError as exc:
+            raise _DepsScopeUnavailable(str(exc)) from exc
+        pulls = await _st(key, store.read_pulls_cache, owner, repo, state="open") or []
+        hints = _deps_node_hints(key, issues, pulls)
+        edges, nodes = await asyncio.to_thread(
+            partial(github_client.fetch_dependency_edges, owner, repo, issues, hints)
+        )
+        await _st(key, store.write_deps_cache, owner, repo, edges, nodes)
+        stored = await _st(key, store.read_deps_cache, owner, repo)
+    if stored is not None:
+        return stored
+    return {"edges": edges, "nodes": nodes}
+
+
+def _schedule_deps_refresh(app: web.Application, key: provider.RepoKey) -> None:
+    """Kick a background deps rebuild for ``key``, at most one in flight per repo.
+
+    Coalesces concurrent stale callers: while a refresh is running, later stale
+    requests see the live task in the registry and do NOT spawn a second — they
+    just serve their own stale copy. The task removes itself from the registry
+    when it finishes (in a ``finally`` so a crash cannot wedge the slot), and a
+    failure is logged and swallowed so the previous good cache stays intact. The
+    task is registered on ``app`` so shutdown can cancel it (no leaked task).
+    """
+    registry = _deps_refresh_registry(app)
+    reg_key = _deps_reg_key(key)
+    existing = registry.get(reg_key)
+    if existing is not None and not existing.done():
+        return  # a refresh for this repo is already in flight — coalesce
+
+    async def _run() -> None:
+        try:
+            await _rebuild_deps(app, key)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # never crash the loop; keep the prior good cache
+            logger.debug(
+                "issue-radar: background deps refresh failed for %s/%s; keeping cached graph",
+                key.owner,
+                key.repo,
+                exc_info=True,
+            )
+        finally:
+            # Drop ourselves only if we are still the registered task (a cancel
+            # during shutdown may have already cleared the slot).
+            if registry.get(reg_key) is task:
+                registry.pop(reg_key, None)
+
+    task = asyncio.create_task(_run(), name=f"issue-radar-deps-refresh:{reg_key}")
+    registry[reg_key] = task
+
+
+async def _stop_deps_refreshes(app: web.Application) -> None:
+    """``app.on_cleanup`` hook — cancel any outstanding background deps refreshes
+    on gateway shutdown so no unawaited task outlives the app."""
+    registry = app.get(_DEPS_REFRESH_TASKS_APP_KEY)
+    if not registry:
+        return
+    tasks = [t for t in registry.values() if not t.done()]
+    registry.clear()
+    for task in tasks:
+        task.cancel()
+    for task in tasks:
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception:  # pragma: no cover - defensive
+            logger.debug("issue-radar deps-refresh shutdown raised", exc_info=True)
+
+
 async def _handle_deps(request: web.Request) -> web.Response:
     """GET /deps?owner=<o>&repo=<r>[&refresh=1] — the repo's dependency graph.
 
@@ -1548,11 +1721,20 @@ async def _handle_deps(request: web.Request) -> web.Response:
     edge is ``{blocked, blocker, source: "native"|"inferred"}`` and ``nodes`` maps
     every number appearing in an edge to ``{kind, state, title}``.
 
-    Cache-first with a TTL (``store.DEPS_CACHE_TTL_SEC``), same freshness/auth/error
-    conventions as ``/ref`` and ``/issues``: served from ``deps-cache.json`` until
-    it ages out, ``refresh=1`` forces a rebuild. A rebuild reads the open issues
-    (the graph's scope) plus the pulls cache (node hints) and syncs the native +
-    inferred edges via ``github_client.fetch_dependency_edges``.
+    Cache-first, serve-stale-revalidate-behind: a FRESH cache (younger than
+    ``store.DEPS_CACHE_TTL_SEC``) is served as-is; a STALE cache is served
+    IMMEDIATELY while a single coalesced background refresh rebuilds it off the
+    request path — the ~11s rebuild never blocks a user. Only a genuinely
+    never-synced repo (no cache at all) still blocks on a build. ``refresh=1``
+    forces a SYNCHRONOUS rebuild so a user-initiated refresh returns fresh data.
+    A rebuild reads the open issues (the graph's scope) plus the pulls cache
+    (node hints) and syncs the native + inferred edges via
+    ``github_client.fetch_dependency_edges``.
+
+    The response shape is deliberately UNCHANGED by serve-stale. Whether the
+    served graph was fresh or aged is not reported, because no client reads such
+    a signal today; staleness stays an internal scheduling decision rather than
+    part of the contract.
 
     Dependency edges are a GitHub-native feature (the ``dependencies`` API);
     non-GitHub providers answer an empty graph rather than an error, so the M1
@@ -1591,7 +1773,13 @@ async def _handle_deps(request: web.Request) -> web.Response:
     force_refresh = request.query.get("refresh") == "1"
     if not force_refresh:
         cached = await _st(key, store.read_deps_cache, owner, repo)
-        if cached is not None and (time.time() - cached["fetched_at"]) < store.DEPS_CACHE_TTL_SEC:
+        if cached is not None:
+            fresh = (time.time() - cached["fetched_at"]) < store.DEPS_CACHE_TTL_SEC
+            if not fresh:
+                # Serve stale, revalidate behind: hand back the aged graph now and
+                # kick a single coalesced background rebuild. The ~11s fetch never
+                # blocks this request; a subsequent visit gets the refreshed graph.
+                _schedule_deps_refresh(request.app, key)
             return web.json_response(
                 {
                     **_identity(key),
@@ -1601,6 +1789,7 @@ async def _handle_deps(request: web.Request) -> web.Response:
                 }
             )
 
+    # No cache at all (a never-synced repo) or a forced refresh: build inline.
     # Build from the caches the app already keeps: open issues are the graph's
     # scope, and both lists seed the node hints so a cached item costs no API call.
     # A MISSING issues cache is unknown, not empty: building from it would persist
@@ -1608,31 +1797,19 @@ async def _handle_deps(request: web.Request) -> web.Response:
     # existing cache-first loader (fetch + cache on miss, provider-routed) the
     # tagging queue uses; a cold repo's first /deps call warms both caches.
     try:
-        issues = await _load_open_issues_for_reco(key)
-    except GhCliError as exc:
+        stored = await _rebuild_deps(request.app, key)
+    except _DepsScopeUnavailable as exc:
         return web.json_response(
             {"error": str(exc), "code": "deps_issue_scope_unavailable"}, status=502
-        )
-    pulls = await _st(key, store.read_pulls_cache, owner, repo, state="open") or []
-    hints = _deps_node_hints(key, issues, pulls)
-    try:
-        edges, nodes = await asyncio.to_thread(
-            partial(github_client.fetch_dependency_edges, owner, repo, issues, hints)
         )
     except GhCliError as exc:
         return web.json_response({"error": str(exc), "code": "deps_fetch_failed"}, status=502)
 
-    await _st(key, store.write_deps_cache, owner, repo, edges, nodes)
-    # Re-read so the response is the normalized/deduped stored shape (native-wins),
-    # exactly what a subsequent cache hit would return.
-    stored = await _st(key, store.read_deps_cache, owner, repo)
-    edges_out = stored["edges"] if stored else edges
-    nodes_out = stored["nodes"] if stored else nodes
     return web.json_response(
         {
             **_identity(key),
-            "edges": edges_out,
-            "nodes": nodes_out,
+            "edges": stored["edges"],
+            "nodes": stored["nodes"],
             "from_cache": False,
         }
     )
@@ -1716,6 +1893,60 @@ def _ui_language() -> str:
     except Exception:
         logger.debug("issue-radar ai: UI language lookup failed; prompting without a directive")
         return ""
+
+
+#: Query param (GET) and body field (POST) the SPA rides its resolved language on.
+_LANG_HINT_FIELD = "lang"
+
+
+def _hint_language(raw: object) -> str:
+    """A browser-resolved UI language handed over on the request, or ``""``.
+
+    The dashboard's default is "follow the browser", which the SPA resolves
+    client-side in ``resolveLanguage()``. The backend has no locale transport of
+    its own — ``Accept-Language`` is read nowhere — so it cannot reach that
+    answer by itself, and every prose surface stays English on an install that
+    never set a language explicitly. The SPA therefore sends the tag it ALREADY
+    resolved as a per-request hint.
+
+    Per-request and NOT persisted is the whole point. "Auto" is browser-relative,
+    so writing a resolved tag into ``dashboard.language`` would tell a *different*
+    browser, with different ``navigator.languages``, to discard its own explicit
+    pick — the incoherence ``website/src/i18n/LanguageProvider.tsx`` is written to
+    prevent. A hint dies with its request, so each browser steers only its own
+    prose. It also keeps the catalog matcher in ONE language: the SPA sends a
+    concrete tag, so nothing here re-implements ``detect.ts``.
+
+    Validated through the same gate as the configured value
+    (:func:`kiro_crew.context.normalize_ui_language_tag`) — this value arrives
+    from the client on every AI call, so a malformed or unshipped tag must append
+    nothing rather than paste client-supplied text into a model prompt.
+
+    An ``en`` hint resolves to ``""`` deliberately. The directive-free prompt
+    already produces English, so an English browser's hint carries no
+    information — while honouring it would restamp every unconfigured install's
+    caches from ``""`` to ``"en"`` on upgrade, discarding summaries whose prose is
+    already in the right language. Suppressing it keeps the default install
+    byte-identical, prompts and caches alike, and still reaches every
+    non-English implicit locale.
+    """
+    tag = normalize_ui_language_tag(raw, source="issue-radar language hint")
+    return "" if tag == "en" else tag
+
+
+def _resolve_ui_language(hint: object = "") -> str:
+    """The language AI prose is written in: the configured tag, else the hint.
+
+    An explicit ``dashboard.language`` is a workspace-wide instruction and
+    outranks whatever a browser resolved for itself, so the hint is consulted
+    ONLY on the ``""`` path (see :func:`_ui_language`). A request that carries no
+    hint resolves exactly as it always did, which keeps non-SPA callers and older
+    clients on byte-identical prompts.
+
+    **Call this OFF the event loop** (``asyncio.to_thread``): it reads config via
+    :func:`_ui_language`. The hint half is pure.
+    """
+    return _ui_language() or _hint_language(hint)
 
 
 def _language_directive(ui_language: str, fields: str) -> str:
@@ -1960,19 +2191,20 @@ async def _handle_issue_ai(request: web.Request) -> web.Response:
     force_refresh = request.query.get("refresh") == "1"
     # Resolved once per request, off-loop (config-file I/O — see _ui_language),
     # and used BOTH to validate the cache hit and to steer a fresh generation.
-    lang = await asyncio.to_thread(_ui_language)
+    # The query hint carries the language THIS browser resolved for itself, and
+    # is consulted only when nothing is configured (see _resolve_ui_language).
+    lang = await asyncio.to_thread(_resolve_ui_language, request.query.get(_LANG_HINT_FIELD))
     cached = (
-        None if force_refresh else await _st(key, store.read_issue_ai_cache, owner, repo, number)
+        None
+        if force_refresh
+        else await _st(key, store.read_issue_ai_cache, owner, repo, number, ui_language=lang)
     )
-    # A cached summary is only servable if it was generated for the CURRENT
-    # dashboard language — otherwise a language switch would keep rendering the
-    # old-language card indefinitely (the pull-ai path gets this from its
-    # fingerprint; this cache has no fingerprint, so the tag is stored beside
-    # the payload and compared here). Legacy entries carry no tag and read as
-    # "" — identical to the unconfigured sentinel — so installs that never set
-    # a language keep every cached entry across the upgrade.
-    if cached is not None and str(cached.get("ui_language") or "") != lang:
-        cached = None
+    # The cache is PARTITIONED by output language rather than gated on it, so a
+    # summary written in another language is simply absent here. Partitioning is
+    # what makes a per-browser language safe: one slot per issue would have two
+    # browsers regenerate over each other on every open, paying a model call each
+    # time and never keeping a usable entry. A legacy cache lives at the "" path,
+    # which is the partition an install that never configured a language reads.
     if cached is not None:
         return web.json_response(
             {
@@ -2012,7 +2244,8 @@ async def _handle_issue_ai(request: web.Request) -> web.Response:
             owner,
             repo,
             number,
-            {**ai, "ui_language": lang},
+            ai,
+            ui_language=lang,
         )
     return web.json_response(
         {
@@ -2367,13 +2600,27 @@ async def _handle_pull_ai(request: web.Request) -> web.Response:
 
     # Resolved once per request, off-loop (config-file I/O — see _ui_language),
     # and fed to BOTH the fingerprint and the prompt so the cached summary's
-    # language always matches the key it is stored under.
-    lang = await asyncio.to_thread(_ui_language)
+    # language always matches the key it is stored under. The query hint carries
+    # the language THIS browser resolved for itself and is consulted only when
+    # nothing is configured (see _resolve_ui_language).
+    lang = await asyncio.to_thread(_resolve_ui_language, request.query.get(_LANG_HINT_FIELD))
     fingerprint = _pr_ai_fingerprint(detail, timeline, checks, ui_language=lang)
+    # Partitioned by language as well as fingerprinted: the fingerprint decides
+    # whether the PR has MOVED, but one file holds one fingerprint, so with a
+    # single slot a second browser reading another language would evict the
+    # first's summary on every open. The two are complementary, not redundant.
     cached = (
         None
         if force_refresh
-        else await _st(key, store.read_pr_ai_cache, owner, repo, number, fingerprint=fingerprint)
+        else await _st(
+            key,
+            store.read_pr_ai_cache,
+            owner,
+            repo,
+            number,
+            fingerprint=fingerprint,
+            ui_language=lang,
+        )
     )
     if cached is not None:
         return web.json_response(
@@ -2409,6 +2656,7 @@ async def _handle_pull_ai(request: web.Request) -> web.Response:
             repo,
             number,
             {"summary": summary, "fingerprint": fingerprint},
+            ui_language=lang,
         )
     return web.json_response(
         {
@@ -3238,7 +3486,13 @@ def _build_reco_prompt(
 
 
 async def _compute_label_recommendations(
-    request: web.Request, owner: str, repo: str, existing_labels: list[dict], issues: list[dict]
+    request: web.Request,
+    owner: str,
+    repo: str,
+    existing_labels: list[dict],
+    issues: list[dict],
+    *,
+    ui_language: str = "",
 ) -> dict:
     """One-shot, tool-less, ephemeral-session model call proposing NEW labels.
 
@@ -3248,7 +3502,13 @@ async def _compute_label_recommendations(
     proposal is genuinely new), ``category`` is constrained to the known set,
     ``color`` is validated to 6-hex (else a per-category default), text fields are
     redacted + length-clamped, and ``examples`` are kept only if they are real
-    issue numbers from the sample."""
+    issue numbers from the sample.
+
+    ``ui_language`` is the resolved BCP-47 tag the ``rationale`` prose is written
+    in, resolved by the CALLER — the handler owns it now (as the other three
+    prose surfaces already do) because it also has to stamp the cache with the
+    same tag, and two independent reads could disagree if the language moved
+    between them."""
     from kiro_crew.llm_helpers import ToolApprovalPolicy, parse_llm_json, stream_and_collect
     from kiro_crew.security import redact
 
@@ -3257,9 +3517,7 @@ async def _compute_label_recommendations(
         raise RuntimeError("session manager unavailable")
 
     kiro_agent = "kirocrew-lite"
-    # Off-loop: the language read is config-file I/O (see _ui_language).
-    lang = await asyncio.to_thread(_ui_language)
-    prompt = _build_reco_prompt(owner, repo, existing_labels, issues, ui_language=lang)
+    prompt = _build_reco_prompt(owner, repo, existing_labels, issues, ui_language=ui_language)
 
     import uuid
 
@@ -3367,7 +3625,14 @@ async def _handle_get_recommendations(request: web.Request) -> web.Response:
             {"error": f"{owner}/{repo} is not connected — call /connect first"}, status=404
         )
 
-    cached = await _st(key, store.read_recommendations_cache, owner, repo)
+    # Each recommendation carries `rationale` prose, so a set is only meaningful in
+    # the language it was generated in. The cache is PARTITIONED by that language
+    # rather than gated on it: the language can differ per-browser, and one shared
+    # slot would let two browsers read each other's set as absent and overwrite it
+    # on regenerate, discarding paid model output back and forth. Resolved off-loop
+    # (config-file I/O — see _ui_language).
+    lang = await asyncio.to_thread(_resolve_ui_language, request.query.get(_LANG_HINT_FIELD))
+    cached = await _st(key, store.read_recommendations_cache, owner, repo, ui_language=lang)
     return web.json_response(
         {
             "owner": owner,
@@ -3407,8 +3672,15 @@ async def _handle_generate_recommendations(request: web.Request) -> web.Response
     except GhCliError as exc:
         return web.json_response({"error": str(exc)}, status=502)
 
+    # Resolved once per request, off-loop (config-file I/O — see _ui_language), and
+    # used both to steer the generation and to stamp what the cache was written
+    # in. The body hint carries the language THIS browser resolved for itself and
+    # is consulted only when nothing is configured (see _resolve_ui_language).
+    lang = await asyncio.to_thread(_resolve_ui_language, body.get(_LANG_HINT_FIELD))
     try:
-        result = await _compute_label_recommendations(request, owner, repo, existing_labels, issues)
+        result = await _compute_label_recommendations(
+            request, owner, repo, existing_labels, issues, ui_language=lang
+        )
     except Exception:
         logger.exception("reco: computation failed for %s/%s", owner, repo)
         return web.json_response(
@@ -3418,7 +3690,9 @@ async def _handle_generate_recommendations(request: web.Request) -> web.Response
 
     generated_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     payload = {"recommendations": result["recommendations"], "generated_at": generated_at}
-    await _st(key, store.write_recommendations_cache, owner, repo, payload)
+    # Written into this language's partition, so regenerating in one language never
+    # destroys another's set (see store.recommendations_cache_path).
+    await _st(key, store.write_recommendations_cache, owner, repo, payload, ui_language=lang)
     return web.json_response(
         {
             "owner": owner,
@@ -3465,14 +3739,23 @@ def _untagged(issues: list[dict]) -> list[dict]:
     return rows
 
 
-def _build_tagging_prompt(owner: str, repo: str, labels: list[dict], issues: list[dict]) -> str:
+def _build_tagging_prompt(
+    owner: str, repo: str, labels: list[dict], issues: list[dict], *, ui_language: str = ""
+) -> str:
     """Assemble the batched "label these untagged issues" prompt.
 
     Issue text is UNTRUSTED (anyone can open an issue containing prompt-injection
     text), so it is fenced and marked as data. The output is constrained
     downstream too: every proposed name is intersected with the repo's real label
     set, so an injected "add label X" cannot invent a label, and the issue numbers
-    are intersected with the batch, so it cannot reach issues it wasn't shown."""
+    are intersected with the batch, so it cannot reach issues it wasn't shown.
+
+    ``ui_language`` is a validated BCP-47 tag (see :func:`_ui_language`); ``""``
+    omits the language directive entirely, leaving the prompt byte-identical to
+    what it was before this argument existed. Only the ``reason`` is steered — the
+    label NAMES must stay exactly as the repository spells them, because the
+    validator intersects them against the real label set and a translated name
+    would be dropped as invented."""
     label_lines = (
         "\n".join(
             f"- {lab.get('name')}"
@@ -3515,11 +3798,18 @@ def _build_tagging_prompt(owner: str, repo: str, labels: list[dict], issues: lis
         "</issues>\n\n"
         'Respond with ONLY the JSON object, e.g. {"assignments": [{"number": 12, '
         '"labels": [{"name": "bug", "reason": "reports a crash"}]}]}.'
+        + _language_directive(ui_language, 'each "reason"')
     )
 
 
 async def _compute_tagging_suggestions(
-    request: web.Request, owner: str, repo: str, labels: list[dict], issues: list[dict]
+    request: web.Request,
+    owner: str,
+    repo: str,
+    labels: list[dict],
+    issues: list[dict],
+    *,
+    ui_language: str = "",
 ) -> dict[str, list[dict]]:
     """One batched, tool-less, ephemeral-session model call proposing labels for
     ``issues``; returns ``{"<number>": [{name, reason}]}``.
@@ -3527,13 +3817,17 @@ async def _compute_tagging_suggestions(
     Runs through :func:`_run_oneshot_model` exactly like the issue-triage and
     taxonomy paths. Output is validated: names are intersected with the repo's
     real labels, numbers with the batch that was actually shown, text is redacted
-    and clamped, and issues that got no valid label are dropped."""
+    and clamped, and issues that got no valid label are dropped.
+
+    ``ui_language`` is resolved by the caller (``_handle_generate_tagging``) rather
+    than here, so one request's prompt and the cache entry it produces cannot
+    disagree about the language — the same split the issue-ai path uses."""
     import uuid
 
     from kiro_crew.llm_helpers import parse_llm_json
     from kiro_crew.security import redact
 
-    prompt = _build_tagging_prompt(owner, repo, labels, issues)
+    prompt = _build_tagging_prompt(owner, repo, labels, issues, ui_language=ui_language)
     key = f"issue-radar-tagging:{owner}/{repo}:{uuid.uuid4().hex}"
     text = await _run_oneshot_model(request, key, prompt)
 
@@ -3610,6 +3904,22 @@ async def _handle_get_tagging(request: web.Request) -> web.Response:
         return web.json_response({"error": str(exc)}, status=502)
 
     cached = await _st(key, store.read_tagging_cache, owner, repo)
+    # Each cached suggestion carries `reason` prose, and the queue renders it as a
+    # tooltip. A suggestion generated before a language switch would keep that
+    # tooltip in the old language indefinitely -- and worse than plainly foreign,
+    # because the tooltip TEMPLATE around it is localized by the frontend, so the
+    # row reads half-translated. Serving nothing instead offers the user the
+    # regenerate they can actually act on. Resolved off-loop (config-file I/O) and
+    # compared exactly as the issue-ai cache does; a legacy entry carries no tag and
+    # reads as "", so installs that never set a language keep their suggestions.
+    #
+    # Config-only, NOT the per-request hint the other prose routes accept: see
+    # _handle_generate_tagging for why a per-browser language would destroy this
+    # cache. The GET must resolve it the same way the POST stamps it, or the gate
+    # would drop every entry the queue just paid to generate.
+    lang = await asyncio.to_thread(_ui_language)
+    if cached is not None and str(cached.get("ui_language") or "") != lang:
+        cached = None
     suggestions = cached["suggestions"] if cached else {}
     rows = [
         {
@@ -3716,6 +4026,21 @@ async def _handle_generate_tagging(request: web.Request) -> web.Response:
         )
 
     untagged = _untagged(issues)
+    # Resolved once per request, off-loop (config-file I/O — see _ui_language), and
+    # used for all three of: which issues still count as un-analysed, steering the
+    # generation, and stamping what the cache is written in.
+    #
+    # Config-only, NOT the per-request hint the other prose routes accept, and that
+    # is a correctness requirement rather than an omission. This cache is ONE
+    # document per repo that ACCUMULATES across many batched calls, and
+    # store.merge_tagging_suggestions drops every accumulated entry when the stored
+    # language differs from the batch's — sound while the language is install-wide,
+    # because that difference means a deliberate operator switch happened once. A
+    # per-browser language turns the same code into a loop: two browsers reading
+    # different languages would alternate, each wiping the queue the other just
+    # paid a model to build, with neither user having done anything. Localizing this
+    # surface needs the cache partitioned BY language first.
+    lang = await asyncio.to_thread(_ui_language)
     # `is not None`, not truthiness: an explicit empty `numbers` array means
     # "analyse exactly these (none)", and treating it as an omission started a
     # whole automatic batch the caller never asked for.
@@ -3726,13 +4051,23 @@ async def _handle_generate_tagging(request: web.Request) -> web.Response:
         batch = [i for i in untagged if i.get("number") in wanted]
     else:
         cached = await _st(key, store.read_tagging_cache, owner, repo)
-        done = set((cached or {}).get("suggestions") or {})
+        # An entry written in another language is NOT analysed for this purpose.
+        # Counting it would make "next un-analysed slice" skip exactly the rows
+        # whose reason the switch invalidated, so those rows could never be
+        # re-earned by the automatic batch — the queue would advance past them and
+        # leave them permanently blank.
+        stale_lang = cached is not None and str(cached.get("ui_language") or "") != lang
+        done = set() if stale_lang else set((cached or {}).get("suggestions") or {})
         batch = [i for i in untagged if str(i.get("number")) not in done]
     remaining = max(0, len(batch) - _TAG_BATCH_MAX)
     batch = batch[:_TAG_BATCH_MAX]
 
     if not batch:
         cached = await _st(key, store.read_tagging_cache, owner, repo)
+        # Same language gate as the GET route: nothing was generated, so the only
+        # thing to return is the cache, and it is servable only if it matches.
+        if cached is not None and str(cached.get("ui_language") or "") != lang:
+            cached = None
         return web.json_response(
             {
                 "owner": owner,
@@ -3745,7 +4080,9 @@ async def _handle_generate_tagging(request: web.Request) -> web.Response:
         )
 
     try:
-        produced = await _compute_tagging_suggestions(request, owner, repo, labels, batch)
+        produced = await _compute_tagging_suggestions(
+            request, owner, repo, labels, batch, ui_language=lang
+        )
     except Exception:
         logger.exception("tagging: computation failed for %s/%s", owner, repo)
         return web.json_response(
@@ -3759,7 +4096,55 @@ async def _handle_generate_tagging(request: web.Request) -> web.Response:
     # never advance.
     analyzed = [int(i["number"]) for i in batch if isinstance(i.get("number"), int)]
     merged_batch = {str(n): produced.get(str(n), []) for n in analyzed}
-    result = await _st(key, store.merge_tagging_suggestions, owner, repo, merged_batch)
+    result = await _st(
+        key,
+        store.merge_tagging_suggestions,
+        owner,
+        repo,
+        merged_batch,
+        ui_language=lang,
+        # Resolves the language exactly as this handler did (config only), so the
+        # in-lock re-check and the value the batch was generated under cannot
+        # disagree. If this route ever starts accepting the per-request hint, this
+        # callable has to carry the same hint or every hinted write is refused as a
+        # language switch and nothing is ever persisted.
+        verify_language=_ui_language,
+    )
+    # The store refused under its own lock: the configured language moved before
+    # the write. This is the ONLY language guard on the write path, and it belongs
+    # in the lock -- a pre-check out here would be strictly weaker, because it and
+    # the write are not atomic, so a switch landing between them would still let a
+    # stale generation replace a newer-language one that had already landed. Since
+    # the merge REPLACES on a language change, that lost race is lost DATA.
+    #
+    # Nothing was persisted, so nothing is claimed as analysed and the slice stays
+    # in `remaining` for the next call to re-generate under the current language.
+    #
+    # Returns NO suggestions, deliberately. The untouched document this refusal
+    # protected may still be in the language the switch just left, and handing it
+    # back would put exactly the stale prose this route exists to withhold into the
+    # client's cache -- the GET route gates on the language for that reason, and an
+    # error path that skips the gate reintroduces the defect through the back door.
+    # An empty answer cannot be wrong, and the client's next GET serves whatever is
+    # genuinely current under the gate that already exists there.
+    if result.get("stale_language"):
+        logger.info(
+            "tagging: store refused a batch for %s/%s generated under %r; the "
+            "dashboard language moved before the write",
+            owner,
+            repo,
+            lang or "(unset)",
+        )
+        return web.json_response(
+            {
+                "owner": owner,
+                "repo": repo,
+                "suggestions": {},
+                "analyzed": [],
+                "remaining": remaining + len(analyzed),
+                "generated_at": None,
+            }
+        )
     return web.json_response(
         {
             "owner": owner,
@@ -4272,6 +4657,13 @@ def _pr_action_error(op: str, target: str, exc: Exception) -> web.Response:
     the client could fix is 400, and anything else upstream is 502 — the same
     taxonomy the label/state routes use, so one action behaving differently is not
     something a caller has to discover.
+
+    The 502 relays ``str(exc)`` rather than a fixed string, unlike the read routes.
+    A PR action fails for a reason the caller can usually FIX — "Allow auto-merge is
+    off for this repository", "the base branch is protected" — and that reason lives
+    only in the provider's own text. Withholding it here would leave the operator
+    retrying a button that can never work. The read routes carry no such actionable
+    text, so they sanitize (see ``_handle_pull_runs``).
     """
     if isinstance(exc, GhPermissionError):
         _audit(op, target, "denied", error=str(exc))
@@ -4904,7 +5296,12 @@ async def _handle_pull_runs(request: web.Request) -> web.Response:
             )
         )
     except GhCliError as exc:
-        return web.json_response({"error": str(exc), "code": "provider_error"}, status=502)
+        # Fixed string, not `str(exc)`: the message is gh's stderr tail (command,
+        # exit code, upstream body). Logged for us, withheld from the caller.
+        logger.warning("issue-radar list_pr_workflow_runs provider error: %s", exc)
+        return web.json_response(
+            {"error": "upstream provider error", "code": "provider_error"}, status=502
+        )
     return web.json_response({**_identity(key), "number": number, "runs": runs})
 
 
@@ -5150,6 +5547,13 @@ def register_routes(app: web.Application) -> None:
 
     crew_routes.register_crew_routes(app)
 
+    # The pipeline dashboard's routes, same arrangement and for the same reason:
+    # its own module, registered HERE so this function stays the one place that
+    # lists this app's routes. Unlike crew_routes this import is NOT circular --
+    # pipeline_routes depends only on its fold and on `store` for the app name --
+    # so it is imported at module scope with the rest.
+    pipeline_routes.register_routes(app)
+
     # Background new-issue watcher: a single in-process asyncio loop (NOT a cron
     # job) that polls opted-in repos every ~60s and pushes a KiroCrew
     # notification when a new issue is opened. register_app_routes runs before
@@ -5159,5 +5563,8 @@ def register_routes(app: web.Application) -> None:
     try:
         app.on_startup.append(watch.start_watcher)
         app.on_cleanup.append(watch.stop_watcher)
+        # Cancel any in-flight background /deps revalidations on shutdown so a
+        # serve-stale rebuild never outlives the app as an unawaited task.
+        app.on_cleanup.append(_stop_deps_refreshes)
     except Exception:  # pragma: no cover - defensive
         logger.warning("issue-radar: could not register watcher lifecycle hooks", exc_info=True)

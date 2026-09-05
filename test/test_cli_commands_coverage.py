@@ -32,6 +32,7 @@ from kiro_crew import sel as sel_mod
 from kiro_crew.config.loader import KiroCrewAgentConfig, KiroCrewConfig, WorkspaceConfig
 from kiro_crew.cron import CronSchedule
 from kiro_crew.eval.scenario import AssertionType
+from kiro_crew.security import BUILTIN_DENIED_RULES
 from kiro_crew.vector_memory import LessonWriteOutcome, LessonWriteResult
 
 # ── helpers ──
@@ -41,7 +42,9 @@ def _ns(**kw: Any) -> argparse.Namespace:
     return argparse.Namespace(**kw)
 
 
-def _http_error(code: int, body: bytes | None = None, reason: str = "Boom") -> urllib.error.HTTPError:
+def _http_error(
+    code: int, body: bytes | None = None, reason: str = "Boom"
+) -> urllib.error.HTTPError:
     """Build an ``HTTPError`` whose ``.read()`` yields *body*."""
     fp = io.BytesIO(body if body is not None else b"")
     return urllib.error.HTTPError("http://localhost/x", code, reason, {}, fp)  # type: ignore[arg-type]
@@ -157,8 +160,12 @@ class TestWorkspaceDirGuard:
 
 
 class TestSpawnCli:
-    def test_list_prints_agents_with_status_glyphs(self, capsys: pytest.CaptureFixture[str]) -> None:
-        payload = {"agents": [{"id": "a1", "task": "do x", "done": True}, {"id": "a2", "task": "y"}]}
+    def test_list_prints_agents_with_status_glyphs(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        payload = {
+            "agents": [{"id": "a1", "task": "do x", "done": True}, {"id": "a2", "task": "y"}]
+        }
         with (
             patch("kiro_crew.cli_commands._internal_secret", return_value="s"),
             patch("kiro_crew.cli_commands.loopback_urlopen", return_value=_FakeResponse(payload)),
@@ -170,7 +177,10 @@ class TestSpawnCli:
     def test_list_empty_says_so(self, capsys: pytest.CaptureFixture[str]) -> None:
         with (
             patch("kiro_crew.cli_commands._internal_secret", return_value=""),
-            patch("kiro_crew.cli_commands.loopback_urlopen", return_value=_FakeResponse({"agents": []})),
+            patch(
+                "kiro_crew.cli_commands.loopback_urlopen",
+                return_value=_FakeResponse({"agents": []}),
+            ),
         ):
             cc._spawn(_ns(spawn_action="list", port=1234))
         assert "No subagents." in capsys.readouterr().out
@@ -193,7 +203,9 @@ class TestSpawnCli:
     ) -> None:
         with (
             patch("kiro_crew.cli_commands._internal_secret", return_value=""),
-            patch("kiro_crew.cli_commands.loopback_urlopen", side_effect=_http_error(503, b"<html>")),
+            patch(
+                "kiro_crew.cli_commands.loopback_urlopen", side_effect=_http_error(503, b"<html>")
+            ),
             pytest.raises(SystemExit),
         ):
             cc._spawn(_ns(spawn_action="list", port=1234))
@@ -204,7 +216,10 @@ class TestSpawnCli:
     ) -> None:
         with (
             patch("kiro_crew.cli_commands._internal_secret", return_value=""),
-            patch("kiro_crew.cli_commands.loopback_urlopen", side_effect=urllib.error.URLError("refused")),
+            patch(
+                "kiro_crew.cli_commands.loopback_urlopen",
+                side_effect=urllib.error.URLError("refused"),
+            ),
             pytest.raises(SystemExit) as exc,
         ):
             cc._spawn(_ns(spawn_action="list", port=4321))
@@ -348,9 +363,7 @@ class TestAppCli:
         out = capsys.readouterr().out
         assert "one" in out and "enabled" in out and "two" in out and "disabled" in out
 
-    def test_enable_success_counts_registrations(
-        self, capsys: pytest.CaptureFixture[str]
-    ) -> None:
+    def test_enable_success_counts_registrations(self, capsys: pytest.CaptureFixture[str]) -> None:
         with (
             patch("kiro_crew.cli_commands.enable_app", return_value=_result(True, message="on")),
             patch(
@@ -383,6 +396,30 @@ class TestAppCli:
         dereg.assert_called_once_with("demo")
         assert "off" in capsys.readouterr().out
 
+    def test_disable_flips_the_flag_before_deregistering(self) -> None:
+        """Order is a security control, not cosmetics (#5726 review).
+
+        A running gateway is a DIFFERENT process: it watches this app's backend and
+        re-registers its MCP servers and agents on a health recovery, gated on the
+        enabled flag it reads from installed.json. Deregistering first leaves a window
+        where that flag still says enabled and the resources are already gone — a
+        recovery landing there puts them back for the app being disabled.
+        """
+        order: list[str] = []
+        with (
+            patch("kiro_crew.cli_commands._cleanup_app_crons_from_scheduler"),
+            patch(
+                "kiro_crew.cli_commands.deregister_app",
+                side_effect=lambda n: order.append("deregister"),
+            ),
+            patch(
+                "kiro_crew.cli_commands.disable_app",
+                side_effect=lambda n: order.append("disable") or _result(True, message="off"),
+            ),
+        ):
+            cc._handle_app(_ns(app_action="disable", name="demo"))
+        assert order == ["disable", "deregister"], order
+
     def test_disable_failure_exits_1(self) -> None:
         with (
             patch("kiro_crew.cli_commands._cleanup_app_crons_from_scheduler"),
@@ -402,9 +439,7 @@ class TestAppCli:
         with (
             patch("kiro_crew.cli_commands._cleanup_app_crons_from_scheduler"),
             patch("kiro_crew.cli_commands.deregister_app"),
-            patch(
-                "kiro_crew.cli_commands.uninstall_app", return_value=_result(True)
-            ) as uninstall,
+            patch("kiro_crew.cli_commands.uninstall_app", return_value=_result(True)) as uninstall,
         ):
             cc._handle_app(_ns(app_action="uninstall", name="demo", purge_data=purge))
         uninstall.assert_called_once_with("demo", keep_data=expect_keep_data)
@@ -500,8 +535,12 @@ class TestAppCli:
 class TestRunAppMcpServer:
     def test_missing_module_exits_1_on_stderr(self, capsys: pytest.CaptureFixture[str]) -> None:
         """stdout is the JSON-RPC channel -- diagnostics must go to stderr."""
+        target = "kiro_crew.apps.builtins.my_app.mcp_server"
         with (
-            patch("importlib.import_module", side_effect=ImportError("nope")),
+            patch(
+                "importlib.import_module",
+                side_effect=ModuleNotFoundError(f"No module named {target!r}", name=target),
+            ),
             pytest.raises(SystemExit) as exc,
         ):
             cc._run_app_mcp_server("my-app")
@@ -509,6 +548,44 @@ class TestRunAppMcpServer:
         assert exc.value.code == 1
         assert captured.out == ""
         assert "my-app" in captured.err
+
+    def test_missing_parent_package_exits_1(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """A ModuleNotFoundError naming a PARENT package of the target is the
+        target being unimportable -- same clean refusal."""
+        parent = "kiro_crew.apps.builtins.my_app"
+        with (
+            patch(
+                "importlib.import_module",
+                side_effect=ModuleNotFoundError(f"No module named {parent!r}", name=parent),
+            ),
+            pytest.raises(SystemExit) as exc,
+        ):
+            cc._run_app_mcp_server("my-app")
+        assert exc.value.code == 1
+        assert "my-app" in capsys.readouterr().err
+
+    def test_missing_dependency_inside_module_propagates(self) -> None:
+        """A dependency missing INSIDE mcp_server.py is a real defect: it must
+        keep its traceback, not exit with a misleading 'has no MCP server'."""
+        with (
+            patch(
+                "importlib.import_module",
+                side_effect=ModuleNotFoundError(
+                    "No module named 'some_missing_dep'", name="some_missing_dep"
+                ),
+            ),
+            pytest.raises(ModuleNotFoundError, match="some_missing_dep"),
+        ):
+            cc._run_app_mcp_server("my-app")
+
+    def test_nameless_import_error_propagates(self) -> None:
+        """An ImportError that names no module cannot be attributed to the
+        target -- it must propagate."""
+        with (
+            patch("importlib.import_module", side_effect=ModuleNotFoundError("boom")),
+            pytest.raises(ModuleNotFoundError, match="boom"),
+        ):
+            cc._run_app_mcp_server("my-app")
 
     def test_module_without_runner_exits_1(self, capsys: pytest.CaptureFixture[str]) -> None:
         with (
@@ -1049,9 +1126,7 @@ class TestParseTimeSelector:
         Reading a bare date as local time would silently shift the window by the
         host's offset, so a window that looks right returns the wrong records.
         """
-        assert cc.parse_time_selector("2026-08-21") == datetime(
-            2026, 8, 21, tzinfo=timezone.utc
-        )
+        assert cc.parse_time_selector("2026-08-21") == datetime(2026, 8, 21, tzinfo=timezone.utc)
 
     def test_offset_is_normalized_to_utc(self) -> None:
         assert cc.parse_time_selector("2026-08-21T10:00:00+02:00") == datetime(
@@ -1099,18 +1174,30 @@ class TestPolicyCli:
         self, capsys: pytest.CaptureFixture[str]
     ) -> None:
         """Regression for #3454: an agent's only prior discovery mechanism for
-        the 139 built-in denied-command rules was to attempt one and be
-        refused. `policy show` must surface them even on a standalone
-        (non-enterprise) install, which is the common case the early-return
-        branch serves."""
+        the built-in denied-command rules was to attempt one and be refused.
+        `policy show` must surface them even on a standalone (non-enterprise)
+        install, which is the common case the early-return branch serves.
+
+        The totals are DERIVED from the catalog rather than spelled out: the
+        printer itself derives them, so a literal here would only duplicate
+        the explicit count assertion in ``test_denied_commands_security.py``
+        and rot on every rule that gets added (it did -- the docstring said
+        139 while the catalog held 140)."""
+        by_category: dict[str, int] = {}
+        for rule in BUILTIN_DENIED_RULES:
+            by_category[rule.category] = by_category.get(rule.category, 0) + 1
+        biggest, biggest_n = max(by_category.items(), key=lambda kv: kv[1])
         with patch(
             "kiro_crew.platform.context.current_context",
             return_value=SimpleNamespace(governance=None),
         ):
             cc._policy(_ns(policy_action="show"))
         out = capsys.readouterr().out
-        assert "commands.denied: 140 rules in 10 categories" in out
-        assert "aws-destructive(47)" in out
+        assert (
+            f"commands.denied: {len(BUILTIN_DENIED_RULES)} rules "
+            f"in {len(by_category)} categories"
+        ) in out
+        assert f"{biggest}({biggest_n})" in out
         # Counts only by default -- rule ids are the --ids opt-in.
         assert "aws-destructive-ec2-terminate-instances" not in out
 
@@ -1124,9 +1211,7 @@ class TestPolicyCli:
             cc._policy(_ns(policy_action="show"))
         assert "commands.denied:" in capsys.readouterr().out
 
-    def test_show_ids_lists_rule_ids_per_category(
-        self, capsys: pytest.CaptureFixture[str]
-    ) -> None:
+    def test_show_ids_lists_rule_ids_per_category(self, capsys: pytest.CaptureFixture[str]) -> None:
         # Named --ids, not --verbose: the top-level parser already defines
         # --verbose/-v as an int `count` (log level); a same-named store_true
         # on this subparser would collide via argparse's parent/subparser
@@ -1192,9 +1277,7 @@ class TestPolicyCli:
         assert "bad.json: INVALID→deny-all" in out
         assert "some profiles failed validation" in out
 
-    def test_explain_unknown_scope_lists_catalog(
-        self, capsys: pytest.CaptureFixture[str]
-    ) -> None:
+    def test_explain_unknown_scope_lists_catalog(self, capsys: pytest.CaptureFixture[str]) -> None:
         with (
             patch(
                 "kiro_crew.platform.context.current_context",
@@ -1218,9 +1301,7 @@ class TestPolicyCli:
         out = capsys.readouterr().out
         assert "Unknown scope" in out and "capabilities.telemetry" in out
 
-    def test_explain_known_scope_prints_verdicts(
-        self, capsys: pytest.CaptureFixture[str]
-    ) -> None:
+    def test_explain_known_scope_prints_verdicts(self, capsys: pytest.CaptureFixture[str]) -> None:
         decision = SimpleNamespace(
             permitted=False, rule="deny", layer="policy", reason="pinned off"
         )
@@ -1298,9 +1379,7 @@ class TestPolicyCli:
                 "kiro_crew.platform.context.current_context",
                 return_value=SimpleNamespace(governance=None),
             ),
-            patch(
-                "kiro_crew.platform.governance_profiles.get_store_profile", return_value=None
-            ),
+            patch("kiro_crew.platform.governance_profiles.get_store_profile", return_value=None),
         ):
             cc._policy(_ns(policy_action="profile", name="ghost"))
         assert "No profile named 'ghost'" in capsys.readouterr().out
@@ -1317,9 +1396,7 @@ class TestPolicyCli:
                 "kiro_crew.platform.context.current_context",
                 return_value=SimpleNamespace(governance=None),
             ),
-            patch(
-                "kiro_crew.platform.governance_profiles.get_store_profile", return_value=prof
-            ),
+            patch("kiro_crew.platform.governance_profiles.get_store_profile", return_value=prof),
         ):
             cc._policy(_ns(policy_action="profile", name="team"))
         out = capsys.readouterr().out
@@ -1333,9 +1410,7 @@ class TestPolicyCli:
                 "kiro_crew.platform.context.current_context",
                 return_value=SimpleNamespace(governance=None),
             ),
-            patch(
-                "kiro_crew.platform.governance_profiles.get_store_profile", return_value=prof
-            ),
+            patch("kiro_crew.platform.governance_profiles.get_store_profile", return_value=prof),
         ):
             cc._policy(_ns(policy_action="profile", name="empty"))
         out = capsys.readouterr().out
@@ -1747,6 +1822,198 @@ class TestArtifactCli:
                 )
             )
         assert "Saved: slug=new version=1" in capsys.readouterr().out
+
+    def test_save_warns_when_the_slug_was_suffixed(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # `save` has no --slug, so a colliding name silently lands a NEW
+        # artifact at a suffixed slug while the canonical one keeps its old
+        # content. The warning has to name both the taken slug and the verb
+        # that versions in place.
+        with _ArtifactHarness(
+            [
+                _FakeResponse(
+                    {
+                        "slug": "run-summary-2",
+                        "version": 1,
+                        "slug_collided_with": "run-summary",
+                    }
+                )
+            ]
+        ):
+            cc._artifact(
+                _ns(
+                    artifact_action="save",
+                    name="Run Summary",
+                    content="corrected",
+                    content_file=None,
+                    tags=None,
+                    kind=None,
+                    description=None,
+                )
+            )
+        captured = capsys.readouterr()
+        assert "Saved: slug=run-summary-2 version=1" in captured.out
+        assert "run-summary" in captured.err
+        assert "kirocrew artifact update run-summary" in captured.err
+
+    def test_save_is_silent_when_the_slug_was_free(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        with _ArtifactHarness([_FakeResponse({"slug": "fresh", "version": 1})]):
+            cc._artifact(
+                _ns(
+                    artifact_action="save",
+                    name="Fresh",
+                    content="body",
+                    content_file=None,
+                    tags=None,
+                    kind=None,
+                    description=None,
+                )
+            )
+        captured = capsys.readouterr()
+        assert "Saved: slug=fresh version=1" in captured.out
+        assert captured.err == ""
+
+    def test_save_forwards_an_explicit_slug(self) -> None:
+        with _ArtifactHarness([_FakeResponse({"slug": "chosen", "version": 1})]) as h:
+            cc._artifact(
+                _ns(
+                    artifact_action="save",
+                    name="Chosen",
+                    slug="chosen-by-hand",
+                    content="body",
+                    content_file=None,
+                    tags=None,
+                    kind=None,
+                    description=None,
+                )
+            )
+        body = json.loads(h.urlopen.call_args[0][0].data.decode())
+        assert body["slug"] == "chosen-by-hand"
+
+    def test_save_forwards_an_empty_explicit_slug(self) -> None:
+        # "" is a slug the caller named, not a request to derive one. Filtering it
+        # out would silently route an explicit save into the derive-and-suffix
+        # branch — the exact asymmetry this flag exists to close.
+        with _ArtifactHarness([_FakeResponse({"slug": "x", "version": 1})]) as h:
+            cc._artifact(
+                _ns(
+                    artifact_action="save",
+                    name="Empty Slug",
+                    slug="",
+                    content="body",
+                    content_file=None,
+                    tags=None,
+                    kind=None,
+                    description=None,
+                )
+            )
+        body = json.loads(h.urlopen.call_args[0][0].data.decode())
+        assert "slug" in body
+        assert body["slug"] == ""
+
+    def test_save_with_an_empty_slug_surfaces_the_refusal(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # Forwarding "" is only worth anything if the refusal reaches the caller.
+        # The store rejects it via _validate_slug and the handler answers 400, so
+        # it arrives on the CLI's existing error path — no new error surface.
+        err = _http_error(
+            400,
+            json.dumps({"error": "invalid slug '': must match ^[a-z0-9]..."}).encode(),
+        )
+        with _ArtifactHarness([err]), pytest.raises(SystemExit) as exc:
+            cc._artifact(
+                _ns(
+                    artifact_action="save",
+                    name="Empty Slug",
+                    slug="",
+                    content="body",
+                    content_file=None,
+                    tags=None,
+                    kind=None,
+                    description=None,
+                )
+            )
+        assert exc.value.code == 1
+        captured = capsys.readouterr()
+        assert "invalid slug" in captured.err
+        assert captured.out == ""
+
+    def test_save_omits_the_slug_key_when_none_was_given(self) -> None:
+        # An ABSENT flag must send no key at all. Forwarding it as "" would hand
+        # the store a slug it refuses, so every plain `save` would start failing;
+        # only an explicitly-passed value may reach the request body.
+        with _ArtifactHarness([_FakeResponse({"slug": "derived", "version": 1})]) as h:
+            cc._artifact(
+                _ns(
+                    artifact_action="save",
+                    name="Derived",
+                    slug=None,
+                    content="body",
+                    content_file=None,
+                    tags=None,
+                    kind=None,
+                    description=None,
+                )
+            )
+        body = json.loads(h.urlopen.call_args[0][0].data.decode())
+        # Positive control: this is the save request body, so the absence below
+        # is a fact about the field and not about a request that never went out.
+        assert body["name"] == "Derived"
+        assert "slug" not in body
+
+    def test_save_with_a_taken_slug_reports_the_conflict(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # The store refuses an explicit slug rather than suffixing it, so the
+        # handler answers 409. It has to reach the caller as the named condition
+        # and a non-zero exit, never a traceback.
+        err = _http_error(409, json.dumps({"error": "artifact already exists: taken"}).encode())
+        with _ArtifactHarness([err]), pytest.raises(SystemExit) as exc:
+            cc._artifact(
+                _ns(
+                    artifact_action="save",
+                    name="Taken",
+                    slug="taken",
+                    content="body",
+                    content_file=None,
+                    tags=None,
+                    kind=None,
+                    description=None,
+                )
+            )
+        assert exc.value.code == 1
+        captured = capsys.readouterr()
+        assert "artifact already exists: taken" in captured.err
+        assert captured.out == ""
+
+    def test_save_with_an_explicit_slug_emits_no_suffix_warning(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # The warning advises `artifact update`, which is wrong guidance for a
+        # caller who named the slug: they get a 409, never a rename. The CLI must
+        # therefore key it on the server's field alone and not on the flag being
+        # set. The server half — an explicit slug reporting no collision — is
+        # pinned in test_artifacts_handlers.py.
+        with _ArtifactHarness([_FakeResponse({"slug": "chosen-by-hand", "version": 1})]):
+            cc._artifact(
+                _ns(
+                    artifact_action="save",
+                    name="Run Summary",
+                    slug="chosen-by-hand",
+                    content="body",
+                    content_file=None,
+                    tags=None,
+                    kind=None,
+                    description=None,
+                )
+            )
+        captured = capsys.readouterr()
+        assert "Saved: slug=chosen-by-hand version=1" in captured.out
+        assert captured.err == ""
 
     def test_save_reads_content_file(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]

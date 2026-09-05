@@ -14,6 +14,7 @@ import pytest
 
 from kiro_crew.messaging.driver import APPROVAL_AUTO
 from kiro_crew.messaging.transport import InboundMessage
+from kiro_crew.session_allocation import SessionClosingError
 from kiro_crew.weixin.client import ContextTokenStore, TypingTicketCache
 from kiro_crew.weixin.commands import parse_command
 from kiro_crew.weixin.transport import WEIXIN_CAPABILITIES
@@ -100,6 +101,10 @@ class FakeSessions:
     def __init__(self, provider=None, busy=False):
         self.provider = provider or FakeProvider()
         self._busy = busy
+        # `closing` mirrors SessionManager._closing so begin_turn refuses the
+        # dispatch the way the real gate does after close_all.
+        self.closing = False
+        self.begin_turns = 0
         self.released = 0
         self.successes = 0
         self.failures = 0
@@ -113,6 +118,12 @@ class FakeSessions:
 
     async def get_or_create(self, key, agent=None, channel_id=None):
         return self.provider, True, False
+
+    def begin_turn(self, key):
+        """The real manager's synchronous pre-dispatch closing gate."""
+        self.begin_turns += 1
+        if self.closing:
+            raise SessionClosingError("SessionManager is closing")
 
     async def set_channel(self, key, channel_id):
         self.channels[key] = channel_id
@@ -604,7 +615,7 @@ def test_delivery_failure_is_not_recorded_as_success(tmp_path):
             raise RuntimeError("ilink send timeout")
 
     class Log:
-        def append(self, key, role, text, agent=None):
+        def append(self, key, role, text, agent=None, mid=None):
             rows.append((role, text))
 
         def set_title(self, key, title):
@@ -628,7 +639,7 @@ def test_persist_turn_writes_user_and_assistant_rows(tmp_path):
             self.rows: list[tuple[str, str]] = []
             self.title = ""
 
-        def append(self, key, role, text, agent=None):
+        def append(self, key, role, text, agent=None, mid=None):
             self.rows.append((role, text))
 
         def set_title(self, key, title):

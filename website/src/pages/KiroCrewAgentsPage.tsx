@@ -8,6 +8,7 @@ import { createSlot } from '../store/chatSlice'
 import { api, type WebhookTokenEntry } from '../api/client'
 import { useProvider } from '../providers'
 import { useAvailableModels } from '../hooks/useAvailableModels'
+import { FOLDER_COLOR_PALETTE } from '../components/folderColorCatalog'
 import { Btn, SendBtn, Input, Badge, SearchInput, PageHeader, EmptyState } from '../components/ui'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '../components/ui/table'
 import {
@@ -27,6 +28,8 @@ import { wakesCrew, crewWakeQueryKey, crewWebhooksQueryKey, webhookBoundToCrew, 
 import type { CronJob } from '../types'
 import type { KiroCrewAgent } from '../components/AgentSelector'
 import { SourceBadge } from '../components/SourceBadge'
+import { errMessage } from '../utils/thunkError'
+import { EFFORT_LEVELS, effortLabel, modelSupportsEffort } from '../lib/effort'
 
 import { i18nT } from '../i18n/t'
 import ErrorNotice from '../components/ErrorNotice'
@@ -43,6 +46,7 @@ interface CreatePayload {
   workspace: string
   memory_store: string
   triggers: string
+  session_color: string
 }
 
 /** Editable fields sent when updating an existing agent binding. */
@@ -54,6 +58,12 @@ interface AgentUpdatePayload {
   triggers: string
   /** '' = inherit (the kiro template's pin, then the global fallback). */
   model: string
+  /** '' = inherit the global default effort. Otherwise one of the levels the
+   *  backend accepts (low..max); a level is only honoured on a model that
+   *  supports effort at all. */
+  reasoning_effort: string
+  /** Default session color (#rrggbb hex) for new sessions. '' = no default. */
+  session_color: string
 }
 
 /** The stored spelling for "no per-agent pin, inherit the next tier down". The
@@ -149,7 +159,6 @@ function WorkspaceForm({
           <div className="flex flex-col gap-1">
             <div className="flex items-center gap-1">
               {/* Native input associated via htmlFor+id; label-has-for's nesting requirement is a false positive. */}
-              {/* eslint-disable-next-line jsx-a11y/label-has-for */}
               <label htmlFor="ws-name" className="text-[11px] text-muted uppercase tracking-wider font-medium">{i18nT('pages.kiroCrewAgentsPage.name')}</label>
               <InfoTip text={i18nT('pages.kiroCrewAgentsPage.a_unique_identifier_for_this_workspace_agents_re')} />
             </div>
@@ -158,7 +167,6 @@ function WorkspaceForm({
           <div className="flex flex-col gap-1">
             <div className="flex items-center gap-1">
               {/* Native input associated via htmlFor+id; label-has-for's nesting requirement is a false positive. */}
-              {/* eslint-disable-next-line jsx-a11y/label-has-for */}
               <label htmlFor="ws-dir" className="text-[11px] text-muted uppercase tracking-wider font-medium">{i18nT('pages.kiroCrewAgentsPage.directory')}</label>
               <InfoTip text={i18nT('pages.kiroCrewAgentsPage.subdirectory_inside_kiro_crew_where_this_workspa')} />
             </div>
@@ -352,6 +360,27 @@ export function ModelField({ options, value, onChange }: {
   )
 }
 
+/** The crew's reasoning-effort pin. Rendered only when the model the crew will
+ *  actually run on supports effort — the same gate the chat picker uses, so a
+ *  crew on Haiku is not offered a control the backend would drop. */
+export function EffortField({ value, onChange }: {
+  value: string; onChange: (v: string) => void
+}) {
+  return (
+    <Field label={i18nT('pages.kiroCrewAgentsPage.reasoning_effort')} hint={i18nT('pages.kiroCrewAgentsPage.reasoning_effort_hint')}>
+      <SimpleSelect
+        options={[...EFFORT_LEVELS]}
+        // '' is the inherit sentinel, labelled as such rather than as a level:
+        // it means "take the global default", which may itself be a level.
+        optionLabels={EFFORT_LEVELS.map(l => (l === '' ? i18nT('pages.kiroCrewAgentsPage.inherited') : effortLabel(l)))}
+        value={value}
+        onChange={onChange}
+        aria-label={i18nT('pages.kiroCrewAgentsPage.edit_reasoning_effort')}
+      />
+    </Field>
+  )
+}
+
 /** The routing-keyword input. Rendered by the create form and by the editor's
  *  routing pane, so it is a component rather than two copies. */
 export function TriggersField({ value, onChange }: { value: string; onChange: (v: string) => void }) {
@@ -363,6 +392,107 @@ export function TriggersField({ value, onChange }: { value: string; onChange: (v
         onChange={e => onChange(e.target.value)}
         aria-label={i18nT('pages.kiroCrewAgentsPage.triggers')}
       />
+    </Field>
+  )
+}
+
+/** Session color picker for agent configuration. Sets the default session
+ *  tint color for new sessions created with this agent. */
+export function SessionColorField({ value, onChange }: { value: string; onChange: (v: string) => void }) {
+  const HEX_RE = /^#[0-9a-f]{6}$/i
+  const [draft, setDraft] = useState(value || '')
+  // Re-sync the draft when the committed value changes from outside (e.g. the
+  // swatch, Clear, or opening the editor on a different crew).
+  useEffect(() => { setDraft(value || '') }, [value])
+  const commit = (raw: string) => {
+    const v = raw.trim().toLowerCase()
+    if (v === '') { onChange(''); setDraft('') }
+    else if (HEX_RE.test(v)) { onChange(v); setDraft(v) }
+    else { setDraft(value || '') } // invalid on blur → revert to committed
+  }
+  return (
+    <Field label={i18nT('pages.kiroCrewAgentsPage.session_color')} hint={i18nT('pages.kiroCrewAgentsPage.session_color_hint')}>
+      {/* Quick picks first, exact entry below — the order the session
+       *  right-click menu uses, so the two surfaces read the same way.
+       *
+       *  These are FOLDER_COLOR_PALETTE, the repo's existing fixed-hex identity
+       *  catalog, NOT the sidebar's generated palette. The sidebar's swatches
+       *  are a `color_index` into a palette derived from the theme accent, so
+       *  they re-derive when the theme changes; a crew's `session_color` is a
+       *  stored hex, so a swatch here has to commit exactly the literal it
+       *  shows and must not drift. That is the same job the folder catalog
+       *  already does, and reusing it keeps one visual language across folders,
+       *  tags and crews — as that file's own comment argues — instead of a
+       *  second preset list that would silently diverge from it. Read-only:
+       *  the catalog's KEEP IN SYNC contract with chat_folders.py governs
+       *  changes to its entries, and consuming it adds no such coupling.
+       *
+       *  The active ring is matched by hex, so a custom colour outside the
+       *  catalog correctly rings nothing.
+       *
+       *  No "no color" cell here: Clear already owns that, and two controls for
+       *  one action is worse than one. */}
+      <div className="mb-2 flex flex-wrap items-center gap-1.5">
+        {FOLDER_COLOR_PALETTE.map(({ value: c, label }) => {
+          const active = HEX_RE.test(value) && value.toLowerCase() === c
+          return (
+            <Btn
+              type="button"
+              key={c}
+              aria-label={label()}
+              aria-pressed={active}
+              title={label()}
+              // Btn, not a raw <button>, so the swatches inherit the standard
+              // press and disabled treatment. `p-0` and the sizing below win
+              // over Btn's own padding/radius/border because Btn twMerges
+              // `className` last; the inline background beats its
+              // `bg-transparent` (and its hover background) on specificity, so
+              // the dot keeps its colour in every state.
+              //
+              // `border-text-strong`, not `border-accent`: the accent is itself a
+              // purple in most themes, so an accent ring on the indigo and violet
+              // entries reads as no ring at all. The near-white ring is what
+              // SessionColorSwatches uses, and it separates from every hue here.
+              className={`h-5 w-5 p-0 cursor-pointer rounded-full border-2 transition-transform hover:scale-110 ${active ? 'border-text-strong scale-110' : 'border-border'}`}
+              style={{ background: c }}
+              onClick={() => onChange(c)}
+            />
+          )
+        })}
+      </div>
+      <div className="flex items-center gap-2">
+        <Input
+          type="color"
+          value={value || '#6366f1'}
+          onChange={e => onChange(e.target.value.toLowerCase())}
+          className="h-8 w-8 flex-none cursor-pointer p-0.5"
+          aria-label={i18nT('pages.kiroCrewAgentsPage.session_color')}
+        />
+        <Input
+          placeholder="#rrggbb"
+          value={draft}
+          onChange={e => {
+            const v = e.target.value.trim().toLowerCase()
+            setDraft(v)
+            // Live-commit only when the draft is a complete hex or cleared;
+            // partial values stay local so typing is never swallowed.
+            if (v === '' || HEX_RE.test(v)) onChange(v)
+          }}
+          onBlur={e => commit(e.target.value)}
+          className="flex-1 font-mono text-[13px]"
+          aria-label={i18nT('pages.kiroCrewAgentsPage.session_color_hex')}
+        />
+        {value && (
+          <Btn
+            type="button"
+            onClick={() => onChange('')}
+            className="text-[11px]"
+            aria-label={i18nT('pages.kiroCrewAgentsPage.session_color_clear')}
+          >
+            {i18nT('pages.kiroCrewAgentsPage.session_color_clear')}
+          </Btn>
+        )}
+      </div>
     </Field>
   )
 }
@@ -412,6 +542,7 @@ function CrewCard({ agent, isDefault, shared, onOpen }: {
       className={`group flex flex-col gap-3 rounded-lg border bg-card p-3.5 transition-all
                   hover:border-border-strong hover:shadow-md focus-ring
                   ${isDefault ? 'border-accent-subtle' : 'border-border'}`}
+      style={agent.session_color ? { borderLeftColor: agent.session_color, borderLeftWidth: '3px' } : undefined}
     >
       <div className="flex items-center gap-3">
         <CrewAvatar seed={agent.name} size={38} />
@@ -603,7 +734,9 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
   const [workspace, setWorkspace] = useState('default')
   const [memoryStore, setMemoryStore] = useState('default')
   const [triggers, setTriggers] = useState('')
+  const [sessionColor, setSessionColor] = useState('')
   const [editModel, setEditModel] = useState(INHERIT_MODEL)
+  const [editEffort, setEditEffort] = useState('')
   const [confirmDelete, setConfirmDelete] = useState(false)
   /** The armed confirm row, scrolled into view when it appears: the danger zone
    *  is the last section, so on a short window the confirm buttons land under
@@ -633,12 +766,31 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
     enabled: !!editing,
   })
 
+  /** The model an effort level would be applied to: the pending pick when the
+   *  crew pins one, otherwise whatever the inherit chain resolves to. Reading
+   *  the PENDING value is deliberate — the effort control has to appear and
+   *  disappear as the user moves the model select, not one save later.
+   *
+   *  `resolved` describes the SAVED state, so it only answers for a pending
+   *  Inherited when the saved state was Inherited too. Once a stored pin is
+   *  cleared but not yet saved, `resolved.model` is still that pin — reusing it
+   *  would keep offering an effort control on the strength of a model the crew is
+   *  about to stop using, and the level would then be dropped at spawn. Nothing
+   *  here can know what the inherit chain lands on until the write happens, so
+   *  that state reports unresolved and says so. */
+  const modelPinPendingClear = editModel === INHERIT_MODEL && !!editingAgent?.model
+  const effortModel = editModel !== INHERIT_MODEL
+    ? editModel
+    : modelPinPendingClear ? '' : (resolved?.model || '')
+  const effortCapable = modelSupportsEffort(effortModel)
+
   const openCreate = useCallback(() => {
     sheetEpoch.current += 1
     setError('')
     setConfirmDelete(false)
     setName(''); setKiroAgent(''); setWorkspace('default'); setMemoryStore('default')
     setTriggers('')
+    setSessionColor('')
     setSheet({ mode: 'create' })
   }, [])
 
@@ -648,7 +800,9 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
     setConfirmDelete(false)
     setKiroAgent(a.kiro_agent); setWorkspace(a.workspace); setMemoryStore(a.memory_store)
     setTriggers(a.triggers || '')
+    setSessionColor(a.session_color || '')
     setEditModel(a.model || INHERIT_MODEL)
+    setEditEffort(a.reasoning_effort || '')
     setSheet({ mode: 'edit', name: a.name })
   }, [defaultAgent])
 
@@ -716,7 +870,7 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
     // 'kirocrew' default: that default is what silently turns a new crew into an
     // alias for the DEFAULT agent (#1684).
     if (!kiroAgent) { setError(i18nT('pages.kiroCrewAgentsPage.agent_template_is_required')); return }
-    createMut.mutate({ name: n, kiro_agent: kiroAgent, workspace, memory_store: memoryStore, triggers, epoch: sheetEpoch.current })
+    createMut.mutate({ name: n, kiro_agent: kiroAgent, workspace, memory_store: memoryStore, triggers, session_color: sessionColor, epoch: sheetEpoch.current })
   }
 
   const saveEdit = () => {
@@ -733,6 +887,11 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
         // INHERIT_MODEL is normalized to '' server-side; send it verbatim so
         // clearing a pin is a real write rather than a skipped field.
         model: editModel,
+        // Sent unconditionally for the same reason as `model`: '' is a real
+        // value (clear the pin), so a skipped field would make clearing
+        // impossible.
+        reasoning_effort: editEffort,
+        session_color: sessionColor,
       },
     })
   }
@@ -748,8 +907,10 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
     } catch (e) {
       // `unwrap()` rethrows Redux Toolkit's SERIALIZED error, which is a plain
       // object carrying `message` rather than a real Error — an `instanceof`
-      // check alone renders it as "[object Object]".
-      const msg = e instanceof Error ? e.message : (e as { message?: string })?.message
+      // check alone renders it as "[object Object]". `errMessage` owns that
+      // extraction for every thunk-boundary reader, so this site cannot drift
+      // from the classifier in `utils/thunkError` that depends on the same fact.
+      const msg = errMessage(e)
       settleFor(epoch, msg || i18nT('pages.kiroCrewAgentsPage.failed_to_update_agent'))
       return
     }
@@ -888,9 +1049,11 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
       out.add('place')
     }
     if (editModel !== (editingAgent.model || INHERIT_MODEL)) out.add('model')
+    if (editEffort !== (editingAgent.reasoning_effort || '')) out.add('model')
     if (triggers !== (editingAgent.triggers || '')) out.add('routing')
+    if (sessionColor !== (editingAgent.session_color || '')) out.add('routing')
     return out
-  }, [editingAgent, kiroAgent, workspace, memoryStore, editModel, triggers])
+  }, [editingAgent, kiroAgent, workspace, memoryStore, editModel, editEffort, triggers, sessionColor])
 
   const sections = useCrewEditorSections({
     templateLabel: provider.labels.agentTemplateField,
@@ -1120,6 +1283,7 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
                 <section className="flex flex-col gap-3">
                   <h3 className="text-[12px] font-semibold uppercase tracking-wider text-muted">{i18nT('pages.kiroCrewAgentsPage.routing')}</h3>
                   <TriggersField value={triggers} onChange={setTriggers} />
+                  <SessionColorField value={sessionColor} onChange={setSessionColor} />
                 </section>
                 <section className="flex flex-col gap-3">
                   <h3 className="text-[12px] font-semibold uppercase tracking-wider text-muted">{i18nT('pages.kiroCrewAgentsPage.runtime_binding')}</h3>
@@ -1187,17 +1351,71 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
                   {pane === 'model' && (
                     <>
                       <ModelField options={modelOptions} value={editModel} onChange={setEditModel} />
+                      {/* Offered when the model the crew will actually run on
+                          accepts effort — OR when a pin is already stored on a
+                          model that does not, so the only way to clear a
+                          stranded pin is not to first switch the model back. */}
+                      {(effortCapable || !!editEffort) && (
+                        <EffortField value={editEffort} onChange={setEditEffort} />
+                      )}
+                      {!effortCapable && !!editEffort && (
+                        <div className="rounded-md border border-warn-subtle bg-warn-subtle px-3 py-2.5 text-[11.5px] leading-relaxed text-muted">
+                          {/* Two different reasons a stored pin cannot apply, and
+                              they need different sentences: naming a model only
+                              works when there IS one. With nothing resolved,
+                              substituting the "Inherited" label would read as
+                              "Inherited does not take a reasoning effort", which
+                              names no model and states nothing true. */}
+                          {effortModel
+                            ? i18nT('pages.kiroCrewAgentsPage.effort_ignored_on_this_model', { model: effortModel })
+                            : i18nT('pages.kiroCrewAgentsPage.effort_pin_needs_a_model')}
+                        </div>
+                      )}
                       {resolved && (
-                        <div className="rounded-md border border-border bg-bg-accent px-3 py-2.5 text-[11.5px] leading-relaxed text-muted">
-                          <span className="text-text">
-                            {i18nT('pages.kiroCrewAgentsPage.resolves_to', { model: resolved.model || i18nT('pages.kiroCrewAgentsPage.inherited') })}
-                          </span>
-                          {' — '}
-                          {resolved.pinned
-                            ? i18nT('pages.kiroCrewAgentsPage.pinned_on_this_crew')
-                            : resolved.model
-                              ? i18nT('pages.kiroCrewAgentsPage.inherited_from_the_agent_template')
-                              : i18nT('pages.kiroCrewAgentsPage.no_pin_anywhere_the_backend_chooses')}
+                        <div className="flex flex-col gap-1 rounded-md border border-border bg-bg-accent px-3 py-2.5 text-[11.5px] leading-relaxed text-muted">
+                          <div>
+                            <span className="text-text">
+                              {i18nT('pages.kiroCrewAgentsPage.resolves_to', { model: resolved.model || i18nT('pages.kiroCrewAgentsPage.inherited') })}
+                            </span>
+                            {' — '}
+                            {resolved.pinned
+                              ? i18nT('pages.kiroCrewAgentsPage.pinned_on_this_crew')
+                              : resolved.model
+                                ? i18nT('pages.kiroCrewAgentsPage.inherited_from_the_agent_template')
+                                : i18nT('pages.kiroCrewAgentsPage.no_pin_anywhere_the_backend_chooses')}
+                          </div>
+                          {/* The effort half of the same readout. It answers
+                              "what will this crew think at" in every case,
+                              including the one where no level can apply — an
+                              absent control with no line about it is what makes
+                              the setting look missing rather than unavailable.
+                              Suppressed only for the stranded pin, where the
+                              warning above already says it and says what to do. */}
+                          {(effortCapable || !editEffort) && (
+                            <div>
+                              {effortCapable ? (
+                                <>
+                                  <span className="text-text">
+                                    {i18nT('pages.kiroCrewAgentsPage.effort_resolves_to', {
+                                      effort: resolved.reasoning_effort
+                                        ? effortLabel(resolved.reasoning_effort)
+                                        : i18nT('lib.effort.default'),
+                                    })}
+                                  </span>
+                                  {' — '}
+                                  {resolved.effort_pinned
+                                    ? i18nT('pages.kiroCrewAgentsPage.pinned_on_this_crew')
+                                    : resolved.reasoning_effort
+                                      ? i18nT('pages.kiroCrewAgentsPage.effort_inherited_from_the_global_default')
+                                      : i18nT('pages.kiroCrewAgentsPage.no_effort_pin_the_model_decides')}
+                                </>
+                              ) : effortModel ? (
+                                i18nT('pages.kiroCrewAgentsPage.effort_unavailable_on_this_model', { model: effortModel })
+                              ) : (
+                                i18nT('pages.kiroCrewAgentsPage.effort_needs_a_model')
+                              )}
+                            </div>
+                          )}
                         </div>
                       )}
                     </>
@@ -1226,7 +1444,12 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
 
                   {pane === 'webhook' && <CrewWebhookSection crew={editing} />}
 
-                  {pane === 'routing' && <TriggersField value={triggers} onChange={setTriggers} />}
+                  {pane === 'routing' && (
+                    <>
+                      <TriggersField value={triggers} onChange={setTriggers} />
+                      <SessionColorField value={sessionColor} onChange={setSessionColor} />
+                    </>
+                  )}
 
                   {pane === 'danger' && (
                     <div className="flex flex-col gap-3 rounded-md border border-danger-subtle bg-danger-subtle p-3">

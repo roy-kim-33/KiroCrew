@@ -24,6 +24,26 @@ LAUNCHD_LABEL = "dev.kirocrew.gateway"  # launchd Label
 _AUTH_ENV_VAR = "KIRO_API_KEY"
 
 
+def systemd_quote(value: str) -> str:
+    """Double-quote a value for a systemd unit token.
+
+    systemd splits unquoted ``ExecStart`` / ``Environment=`` tokens on
+    whitespace, so paths and environment values containing spaces must be
+    quoted.  Percent signs are doubled because systemd performs specifier
+    expansion even inside quotes, and backslashes / quotes use C-style escapes.
+
+    Control characters are rejected rather than escaped: a newline would end
+    the physical value and let the remainder be parsed as fresh unit directives.
+    """
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in value):
+        raise ValueError(
+            "refusing to render a systemd unit value containing a control "
+            "character (possible unit-file injection): " + repr(value)
+        )
+    escaped = value.replace("%", "%%").replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
 def launchd_live_program() -> "os.PathLike[str]":
     """Stable path the launchd agent's ``ProgramArguments[0]`` points at.
 
@@ -132,6 +152,10 @@ def service_environment(home: str) -> "dict[str, str]":
         "PATH": service_path(home),
         "LANG": utf8_locale,
         "LC_ALL": utf8_locale,
+        # Cross-platform marker for runtime policies that differ in a managed
+        # background service. Older definitions without it are diagnosed by
+        # ``kirocrew doctor`` and regenerated with ``kirocrew service install``.
+        "KIROCREW_SERVICE_MANAGED": "1",
     }
     kiro_bin = os.environ.get("KIROCREW_KIRO_BIN", "").strip()
     if kiro_bin:
@@ -295,13 +319,9 @@ def service_path(home: str) -> str:
         "/bin",
     ]
     env_path = [p for p in os.environ.get("PATH", "").split(":") if p]
-    seen: set[str] = set()
-    out: list[str] = []
-    for entry in required + env_path:
-        if entry not in seen:
-            seen.add(entry)
-            out.append(entry)
-    return ":".join(out)
+    # dict.fromkeys dedupes on first occurrence and preserves insertion order,
+    # so the required prefixes keep their precedence over the installer's $PATH.
+    return ":".join(dict.fromkeys(required + env_path))
 
 
 class Platform(enum.Enum):

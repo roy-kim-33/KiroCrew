@@ -45,9 +45,14 @@ The electron-builder configuration lives in
 - Windows target: assisted NSIS. A 164×314 welcome/finish sidebar and a 150×57
   page header reuse the Kiro Crew logo while preserving native NSIS controls,
   localization, the per-user default, and the no-UAC default path. The installer
-  deliberately has no custom page animation or timer work on the NSIS UI thread;
+  cross-fades the native top-level dialog at page boundaries with Win32's
+  alpha-blended window animation, honoring the client-area animation preference.
+  It performs no timer-driven bitmap work or `Sleep` on the NSIS UI thread;
   Windows CI installs the real artifact, records its duration, and enforces a
-  5-minute ceiling.
+  5-minute ceiling. Auto-updates skip the assisted wizard's decision pages but
+  keep its native extraction progress visible, then relaunch Kiro Crew and close
+  automatically. A legacy silent `/S --updated` invocation is converted to the
+  same visible update path so the transition works from already-fielded clients.
 - linux targets: `AppImage`, `deb`, `rpm` (category `Development`). One backend
   tree is packaged three times, with `scripts/stamp-distribution.sh` re-run
   between electron-builder invocations so each artifact's beacon `dist` names
@@ -279,7 +284,10 @@ Step by step:
 3. **Install into bundle** — copies the PBS interpreter into
    `website/electron/backend-dist/kirocrew-backend/`, removes the
    `EXTERNALLY-MANAGED` marker, then runs `pip install` with
-   `PYTHONNOUSERSITE=1` to force the full closure into the bundle.
+   `PYTHONNOUSERSITE=1` to force the full closure into the bundle. The local
+   speech recogniser and its runtime dependencies are required on Windows,
+   Linux x64/arm64, and macOS Apple Silicon; a missing binary wheel fails the
+   release build. macOS Intel is the sole unsupported exception.
 4. **Stage dashboard** — copies the built SPA into the bundled
    `kiro_crew/static/dist` inside site-packages.
 5. **Prune** — removes `__pycache__`, test dirs, and unused stdlib modules
@@ -323,6 +331,21 @@ same way). Key details:
 - **Self-containment verified** — the build script runs
   `PYTHONNOUSERSITE=1 bin/python3.12 -m kiro_crew --version` to catch any
   missing dependency before packaging.
+- **Local dictation runtime bundled** — supported desktop builds include
+  `pywhispercpp`, the platform `imageio-ffmpeg` executable used for compressed
+  recordings, and all transitive runtime dependencies. The build imports the
+  recognizer and executes the exact packaged decoder before publishing — and
+  distinguishes a decoder that fails to AUTHENTICATE, which fails the build, from
+  one that authenticates but will not run on the build host, which warns and
+  ships (see [stt-streaming](../system-specs/features/stt-streaming.md)). Model
+  weights are deliberately excluded from the installer: the user selects a
+  model and clicks **Download now**, with no package manager or separate
+  dependency step. Intel macOS is the unsupported recognizer exception.
+  Every bundled executable ships **uncompressed** — the Apple notary service
+  decompresses archive members and rejects an unsigned executable found inside
+  one, which fails the whole macOS release (see
+  [stt-streaming](../system-specs/features/stt-streaming.md) for how the runtime
+  then authenticates a decoder whose bytes signing rewrote).
 - **Dashboard bundled** — the SPA is staged into
   `lib/python3.12/site-packages/kiro_crew/static/dist/` inside the bundle.
 - **Pruned** — `__pycache__`, test dirs, and unused stdlib (tkinter, idlelib,
@@ -330,12 +353,28 @@ same way). Key details:
 
 ## How the app finds and launches the backend
 
-When the app starts, [`main.js`](../../website/electron/main.js) first checks
-whether a gateway is already running. An existing gateway—including a local SSH
-forward to a remote gateway—is reused. Otherwise the shell locates the backend
-binary via [`find-bin.js`](../../website/electron/find-bin.js), spawns it as
-`kirocrew gateway --no-open`, polls `/api/status`, and loads the dashboard once
-it is healthy.
+When the app starts, [`main.js`](../../website/electron/main.js) composes the
+desktop lifecycle and delegates gateway ownership to
+[`gateway-supervisor.js`](../../website/electron/gateway-supervisor.js). The
+supervisor first checks whether a gateway is already running. An existing
+gateway—including a local SSH forward to a remote gateway—is reused. Otherwise
+it locates the backend binary via
+[`find-bin.js`](../../website/electron/find-bin.js), spawns it as `kirocrew
+gateway --no-open`, polls `/api/status`, and loads the dashboard once it is
+healthy.
+
+Host-runtime discovery stays behind the same main-process ownership boundaries.
+The `wsl:detect` handler in
+[`ipc-registrar.js`](../../website/electron/ipc-registrar.js) fails closed unless
+the sender has the fixed primary origin,
+[`window-lifecycle.js`](../../website/electron/window-lifecycle.js) proves that
+its window uses a local gateway rather than a configured tunnel, and
+[`gateway-supervisor.js`](../../website/electron/gateway-supervisor.js)
+positively identifies the primary listener as Kiro Crew or its service. A
+manual SSH tunnel, foreign listener, unbound port, or unavailable owner probe is
+therefore refused; only then may
+[`wsl-detection.js`](../../website/electron/wsl-detection.js) run the trusted
+system `wsl.exe` path.
 
 Before spawning a **bundled** backend the shell checks that the bundle's Python
 stdlib is fully on disk
@@ -381,8 +420,9 @@ Only a **bundled** backend qualifies — a user's own install or a `PATH` `kiroc
 failing on a stdlib import is a broken environment, and "wait for the installer"
 would be misleading advice there. And only the **current launch attempt** is read:
 the log is append-only across launches, so the text is sliced from the last spawn
-marker (`SPAWN_MARKER`, owned by `bundle-integrity.js` and logged by `main.js` so
-writer and reader cannot drift). Without that, an older traceback could relabel
+marker (`SPAWN_MARKER`, owned by `bundle-integrity.js` and logged by
+`gateway-supervisor.js` so writer and reader cannot drift). Without that, an
+older traceback could relabel
 this attempt's unrelated failure — a `SIGKILL`, or a bound port whose real remedy
 is force-stop rather than a bare Retry — and show a reassuring dialog over a live
 fault. When the marker has scrolled out of the tail, attribution is unknowable and
@@ -464,9 +504,9 @@ closes the popup and collapses the labels back to the hamburger. The menu surfac
 uses the dashboard theme because native Windows popups capture window input and
 cannot support hover switching; a narrow IPC bridge keeps command execution and
 standard Electron roles in the main process.
-When a remote crew is connected, the instance switcher shares the same bounded
-left region as the menu: it is a single trigger naming the crew on screen (see
-InstanceTabBar's SwitcherMenu), not a row of per-crew tabs, so it costs constant
+When a remote instance is connected, the instance switcher shares the same bounded
+left region as the menu: it is a single trigger naming the instance on screen (see
+InstanceTabBar's SwitcherMenu), not a row of per-instance tabs, so it costs constant
 width whether the menu is collapsed to a hamburger or expanded to full labels.
 The centered command palette yields that region rather than the reverse — the
 correct priority while the menu is open is labels > instance status > an idle
@@ -475,6 +515,39 @@ shortcut even while hidden.
 The command-palette trigger is positioned from the window midpoint rather than
 the remaining flex space, so asymmetric menu and status controls do not shift it.
 Linux retains the window manager's native frame and menu bar.
+
+#### Focus mode: verify these seams after an Electron or Radix bump
+
+Focus mode (hide the shell chrome behind hover) rests on three mechanisms that
+key on behavior no API contract guarantees, and each fails **silently** — the
+unit tests mock these seams, so a broken one still passes CI and only manual
+macOS testing catches it. Run this short checklist whenever you bump Electron or
+Radix (`website/electron/package.json`, `@radix-ui/*` in `website/package.json`):
+
+1. **Toggle focus mode, then drag the revealed header to move the window.**
+   Exercises the drag-region re-send in
+   [`website/electron/focus-chrome.js`](../../website/electron/focus-chrome.js):
+   Electron's `setWindowButtonVisibility` mutates the window styleMask and drops
+   the renderer's declared `-webkit-app-region:drag` regions, so the renderer
+   re-declares them by briefly adding a 1px drag element. If a bump changes when
+   Chromium re-sends the region set, the revealed header selects text instead of
+   moving the window.
+2. **Peek the header, then move the pointer down into the content.** The header
+   should close. Peek the rail, then move the pointer right past the rail track —
+   it should close too. Exercises the **positional** close in
+   [`website/src/App.tsx`](../../website/src/App.tsx) (`departWhen: clientY > 48`
+   for the top peek, `clientX > 248` for the rail): the revealed header doubles
+   as the drag surface and a drag region eats pointer events before hit-testing,
+   so the close is driven by pointer position, not by `mouseleave`. If a bump
+   changes hover/pointer-event delivery, the peek sticks open or never opens.
+3. **Peek the header, then open the instance switcher.** The header must stay on
+   screen while the switcher menu is open. Exercises the header-pin heuristic in
+   [`website/src/App.tsx`](../../website/src/App.tsx): Radix portals the menu to
+   `document.body`, so the pin rides on a `[aria-haspopup][aria-expanded="true"]`
+   query against the header rather than DOM containment. If a Radix bump changes
+   the ARIA a trigger emits (`aria-haspopup` absent, or `aria-expanded="true"`
+   emitted by default with nothing open), the header either slides away under the
+   open menu or pins permanently from first paint.
 
 ### `find-bin.js` — locating the binary
 
@@ -504,7 +577,7 @@ The function is pure — `fs`, `os`, `path`, `process.resourcesPath`,
 `__dirname`, and the arch are injected — so both arch branches are
 unit-testable without mocking globals.
 
-### `main.js` — spawning the gateway
+### `gateway-supervisor.js` — owning the gateway lifecycle
 
 - Ensures `KIROCREW_HOME` (default `~/.kiro/crew`, overridable via the
   `KIROCREW_HOME` env var) exists, then spawns the backend with
@@ -516,12 +589,23 @@ unit-testable without mocking globals.
   validated to `1–65535`). `BACKEND_URL` / health checks target that port.
 - Sets `KIROCREW_PROJECT_DIR` to the Electron app's parent directory so the
   bundled `agents/` and `skills/` are discovered.
+- On every desktop platform, pins `PYTHONUTF8=1` and
+  `PYTHONIOENCODING=utf-8:backslashreplace` at the Electron-to-Gateway spawn
+  boundary. This applies before CPython constructs redirected stdout/stderr and
+  is inherited by the Gateway's `os.execv` successor plus its MCP/session
+  children. Consequently the initial launch, Tailnet/explicit restart, update
+  and stale-asset re-exec, and Electron liveness respawn all use the same UTF-8
+  contract instead of falling back to the Windows ANSI code page or an
+  incompatible inherited POSIX encoding override.
 - Leaves the inherited child `PATH` unchanged. The gateway prerequisite service
-  probes supported Kiro CLI locations independently, so Finder-launched macOS
-  apps and Linux desktop launchers still find user-local installations without
-  mutating the shell environment.
-- On window close the app hides to the tray; quitting sends `SIGTERM` to the
-  gateway process.
+  probes supported Kiro CLI locations independently — including the Windows
+  per-user install at `%LOCALAPPDATA%\Kiro-Cli` — so desktop launches find
+  user-local installations without mutating the shell environment or requiring
+  the already-running gateway to inherit an installer-updated `PATH`.
+- [`window-lifecycle.js`](../../website/electron/window-lifecycle.js) hides the
+  app to the tray on window close; the composition root delegates quit-time
+  gateway teardown to the supervisor, which performs the graceful shutdown and
+  signal escalation contract.
 
 ## Code signing & notarization (macOS)
 

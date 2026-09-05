@@ -151,9 +151,11 @@ def _runs_file() -> Path:
 def _write_runs(payload: str) -> None:
     """Blocking half of :func:`_save_runs` — never call this on the event loop.
 
-    The owner-only lockdown spawns ``icacls`` on Windows, so this whole function
-    is a blocking syscall sequence and belongs in a worker thread (the same
-    reason ``_write_review_section`` and ``store.remove_run_dir`` are offloaded).
+    This whole function is a blocking syscall sequence — mkdir, temp creation,
+    lockdown (in-process per ``platform_compat``), payload write, replace — and
+    filesystem calls can stall on a slow volume, so it belongs in a worker
+    thread (the same reason ``_write_review_section`` and
+    ``store.remove_run_dir`` are offloaded).
     """
     f = _runs_file()
     f.parent.mkdir(parents=True, exist_ok=True)
@@ -455,12 +457,24 @@ async def _run_review_bg(run: dict, changes: list[str]) -> None:
             # the subprocess (and its memory) lives exactly as long as the batch. The
             # holder is reference-counted, so overlapping runs share one runtime and the
             # last one out tears it down.
-            await pool.begin_batch()
+            #
+            # Runtime preflight, read ONCE and reused: when the host cannot spawn a
+            # reviewer (no kiro-cli, ACP runtime unimportable) the batch is never
+            # opened — begin_batch would raise inside the spawn with a generic
+            # message — and the same verdict is handed to run_review, which fails
+            # every change fast with a reason naming the missing runtime. One
+            # reading keeps the bracket and the driver's verdict consistent.
+            # Offloaded: the executable resolution stats candidates across every
+            # PATH entry, and one stale network mount there would stall the loop.
+            runtime_error = await asyncio.to_thread(review_pool.runtime_preflight)
+            if not runtime_error:
+                await pool.begin_batch()
             try:
                 summary = await asyncio.to_thread(
                     review_driver.run_review, changes,  # type: ignore[attr-defined]
                     dispatch=dispatch, progress=_make_progress(run),
                     run_id=run_id, cancelled=lambda: run_id in _CANCELLED,
+                    preflight=lambda: runtime_error,
                     # One reviewer at a time. Workers share the staging directory and
                     # each has shell and file tools, so two running at once means one
                     # can write another change's record between that change's slot
@@ -472,7 +486,8 @@ async def _run_review_bg(run: dict, changes: list[str]) -> None:
                     concurrency=1,
                 )
             finally:
-                await pool.end_batch()
+                if not runtime_error:
+                    await pool.end_batch()
             run["summary"] = summary
             _collect_delivered(run, summary)
             run["report_slug"] = summary.get("report_slug") or run.get("report_slug")
@@ -531,6 +546,17 @@ def _first_change_error(summary: dict) -> str:
                 return {
                     "no_review_recorded": "the reviewer finished but wrote no "
                                           "findings record",
+                    "review_record_incomplete": "the reviewer wrote a findings "
+                                                "record but never completed the "
+                                                "review",
+                    # Reason-level fallback only: a preflight-failed record
+                    # carries the specific runtime message in its error fields,
+                    # which the key order above prefers, and the run-level error
+                    # for that case comes from the summary's own error. Kept so
+                    # the reason itself always renders as a cause, never as a
+                    # bare enum value.
+                    "runtime_unavailable": "the reviewer never ran: its agent "
+                                           "runtime is unavailable on this host",
                     "review_failed": "the review turn failed",
                 }.get(val, val)
     return ""

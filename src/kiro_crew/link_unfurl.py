@@ -198,18 +198,17 @@ def _is_not_public(
     )
 
 
-def _reject_if_internal_ip(candidate: str) -> None:
-    """Raise ``blocked_url`` if *candidate* parses as a non-public IP.
+def _literal_is_not_public(
+    ip: "ipaddress.IPv4Address | ipaddress.IPv6Address",
+) -> bool:
+    """Whether an already-PARSED literal is non-public, tunnel encodings unwrapped.
 
-    Returns silently when *candidate* is not an IP literal at all — the caller
-    then treats it as a hostname to resolve.
+    Split out so a caller holding a resolution result reaches the same decision
+    through :func:`address_is_not_public` instead of enumerating category flags
+    again. The two encodings handled here are about how an address was WRITTEN,
+    which is why they do not belong in :func:`_is_not_public`, and both are
+    bypasses if skipped:
 
-    Two normalizations matter here, and both are bypasses if skipped:
-
-    * ``canonicalize_ip`` folds the alternate IPv4 encodings the OS resolver
-      accepts but :mod:`ipaddress` rejects (``0x7f000001``, ``0177.0.0.1``,
-      ``2130706433``, ``127.1``). Without it those fall through to the hostname
-      branch and reach the metadata endpoint.
     * IPv4-mapped IPv6 is unwrapped explicitly. ``IPv6Address("::ffff:127.0.0.1")``
       reports ``is_loopback == False``, and its ``is_private`` only consults the
       mapped address on Python 3.13+ — so on every supported version below that,
@@ -222,10 +221,6 @@ def _reject_if_internal_ip(candidate: str) -> None:
       packet goes inward — and substituting the payload instead would let
       ``2002:8000::`` through, whose payload ``128.0.0.0`` is public.
     """
-    try:
-        ip = ipaddress.ip_address(canonicalize_ip(candidate))
-    except ValueError:
-        return  # a hostname, not a literal
     mapped = getattr(ip, "ipv4_mapped", None)
     if mapped is not None:
         ip = mapped
@@ -235,16 +230,66 @@ def _reject_if_internal_ip(candidate: str) -> None:
     # for why the two encodings are not symmetric.
     sixtofour = getattr(ip, "sixtofour", None)
     if sixtofour is not None and _is_not_public(sixtofour):
-        raise UnfurlRejected("blocked_url")
+        return True
     # Interpreter floor. requires-python is >=3.10, but CPython only added
     # 192.0.0.0/24 (RFC 6890) and 2002::/16 to its special-purpose tables in
     # 3.10.14 / 3.11.9 / 3.12.4. Below those, 192.0.0.128 and a 6to4 address
     # carrying a PUBLIC embedded IPv4 both report is_global with every category
     # flag clean. Checked AFTER the unwrap above so the unwrap stays the thing
     # that refuses a 6to4 wrapping a private address, on every interpreter.
+    # Folded in here (rather than left in the old single caller) so BOTH
+    # entry points that now share this function — address_is_not_public and
+    # _reject_if_internal_ip — get the same interpreter floor.
     if any(ip in net for net in _EXTRA_SPECIAL_PURPOSE if ip.version == net.version):
-        raise UnfurlRejected("blocked_url")
-    if _is_not_public(ip):
+        return True
+    return _is_not_public(ip)
+
+
+def address_is_not_public(address: str) -> bool:
+    """Whether *address*, an IP literal from a resolution result, is non-public.
+
+    The entry point for a caller that has ALREADY resolved a host and holds the
+    answers — the Teams attachment fetch and the WeCom media fetch — so the
+    address rules have one owner rather than a category-flag list re-enumerated
+    per channel. Each such list written independently has missed the same two
+    ranges: ``100.64.0.0/10`` (RFC 6598 shared space, what a tailnet and most
+    CGNAT hand out) is not in CPython's ``is_private`` table and only
+    ``is_global`` rejects it, and ``fec0::/10`` reports ``is_global=True`` so an
+    ``is_private``-only check approves it. :func:`_is_not_public` documents why
+    both halves are required.
+
+    Fails CLOSED: a value that does not parse as an IP literal returns ``True``.
+    That is the opposite of :func:`_reject_if_internal_ip`'s default, and
+    deliberately so — for the URL vet a non-literal is a hostname still to be
+    resolved, while here it is a resolution result about to reach a socket, and an
+    address this function cannot read is one it cannot approve.
+    """
+    try:
+        ip = ipaddress.ip_address(canonicalize_ip(address))
+    except ValueError:
+        return True
+    return _literal_is_not_public(ip)
+
+
+def _reject_if_internal_ip(candidate: str) -> None:
+    """Raise ``blocked_url`` if *candidate* parses as a non-public IP.
+
+    Returns silently when *candidate* is not an IP literal at all — the caller
+    then treats it as a hostname to resolve. :func:`address_is_not_public` is the
+    sibling for values that are already known to be addresses; it fails closed on
+    an unparseable one instead of passing it through as a name.
+
+    ``canonicalize_ip`` folds the alternate IPv4 encodings the OS resolver accepts
+    but :mod:`ipaddress` rejects (``0x7f000001``, ``0177.0.0.1``, ``2130706433``,
+    ``127.1``). Without it those fall through to the hostname branch and reach the
+    metadata endpoint. The ipv4-mapped and 6to4 unwrapping lives in
+    :func:`_literal_is_not_public`.
+    """
+    try:
+        ip = ipaddress.ip_address(canonicalize_ip(candidate))
+    except ValueError:
+        return  # a hostname, not a literal
+    if _literal_is_not_public(ip):
         raise UnfurlRejected("blocked_url")
 
 

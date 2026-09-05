@@ -93,17 +93,30 @@ time-to-first-token distribution.
 
 ## Sub-agent delivery failure
 
-The sub-agent completed but injecting its result into the parent session timed out.
-`subagent.py` builds:
+A sub-agent reached a terminal state but injecting its report into the parent
+session failed (most commonly a delivery timeout). `subagent.py` builds:
 
 ```
 [Subagent completion event]
 Agent `<id>` ❌ <reason>
 Task: <first 100 chars of the task>
-The agent finished but result delivery timed out.
+<outcome line>
 Result saved at: <path> (<n> bytes)
 Use the read tool to retrieve it if needed.
 ```
+
+The outcome line reflects the run's actual terminal state instead of asserting
+completion — this path fires for every terminal state, including runs that
+never executed (the never-ran reading comes from the record's execution marker,
+never from its error wording):
+
+- completed: `The agent finished but result delivery timed out.`
+- failed after execution began: `The agent failed before a result could be delivered.`
+- failed before execution (approval or queued rejection, no output exists):
+  `The run failed before it started, so there is no result to deliver.`
+- stopped before execution began (no output exists):
+  `The run was stopped before it started, so there is no result to deliver.`
+- stopped mid-run: `The run was stopped before it completed.`
 
 The result-path lines are present only when a result file exists. **The result is
 on disk**, so use the `read` tool to retrieve it rather than re-running the work.
@@ -285,6 +298,13 @@ next turn into the same slot:
 - Loops persist to `autonudge.json` under the data home and are re-armed on gateway
   restart. A slot that is unreachable (no history, deleted, or closed) has its loop
   removed.
+- Structured monitor action accounting is a separate internal completion
+  callback, not a new injected-message envelope. Until the probe dispatcher is
+  attached, structured records remain fail-closed. The dormant adapters do not
+  change the legacy `[auto-nudge cycle N]` body, delivered-cycle count, `fired`
+  event, or rearm timing. When attached, dashboard and Discord report only a raw
+  provider completion; Slack likewise requires the raw provider completion and
+  shares its one consumed usage result with telemetry.
 
 **How to treat it:** it is a self-prompt. Continue the work; the operator asked for
 the loop, but is not waiting on this specific message.

@@ -12,34 +12,19 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+
+# Shared with ``test_mcp_rebuild_reconsumption`` via a dedicated helpers module --
+# the repo's convention, since a test module is not importable from another one.
+# Re-exported under the original private names so the call sites below are unchanged.
+from mcp_merge_helpers import DEFAULT_MANAGED_MCPS as _DEFAULT_MANAGED_MCPS
+from mcp_merge_helpers import bundled_defaults as _bundled_defaults
+from mcp_merge_helpers import run_install_mcp_merge as _run_install_mcp_merge
 from windows_sim import replace_sharing_violation
 
+from conftest import requires_symlinks
 from kiro_crew import agent_state
 from kiro_crew import atomic_write as aw
 from kiro_crew.agent import install_agent, migrate_agent_specs
-
-
-def _bundled_defaults(tmp_path: Path) -> Path:
-    """Write a minimal bundled defaults.json and return its parent dir."""
-    cfg_dir = tmp_path / "config"
-    cfg_dir.mkdir()
-    defaults = {
-        "model": "claude-default",
-        "tools": ["ReadFile"],
-        "allowedTools": ["ReadFile"],
-        "mcpServers": {},
-        "toolsSettings": {"execute_bash": {"deniedCommands": ["rm -rf /"]}},
-        "hooks": {"preToolUse": "audit"},
-    }
-    (cfg_dir / "defaults.json").write_text(json.dumps(defaults))
-    (cfg_dir / "prompt.md").write_text("system prompt")
-    return cfg_dir
-
-
-_DEFAULT_MANAGED_MCPS = {
-    "kirocrew-cron": {"command": "/usr/bin/kirocrew", "args": ["mcp-cron"]},
-    "kirocrew-core": {"command": "/usr/bin/kirocrew", "args": ["mcp-core"]},
-}
 
 
 def _run_install(tmp_path: Path, cfg_dir: Path, managed_mcps: dict | None = None, **kwargs) -> Path:  # type: ignore[return]
@@ -538,6 +523,7 @@ class TestAtomicJsonWrite:
 class TestAllSkillPathsLocalSymlinks:
     """Test symlink resolution in _all_skill_paths for ~/.aim/skills/local/."""
 
+    @requires_symlinks
     def test_resolves_local_symlink_with_skills_parent(self, tmp_path: Path):
         """Symlink target whose parent is named 'skills' is added."""
         from kiro_crew.agent import _all_skill_paths
@@ -559,6 +545,7 @@ class TestAllSkillPathsLocalSymlinks:
 
         assert str(target_parent) in paths
 
+    @requires_symlinks
     def test_skips_symlink_with_non_skills_parent(self, tmp_path: Path):
         """Symlink target whose parent is NOT named 'skills' is excluded."""
         from kiro_crew.agent import _all_skill_paths
@@ -577,6 +564,7 @@ class TestAllSkillPathsLocalSymlinks:
 
         assert str(tmp_path / "project" / "other") not in paths
 
+    @requires_symlinks
     def test_skips_sensitive_parent_path(self, tmp_path: Path):
         """Symlink resolving into a sensitive directory is excluded."""
         from kiro_crew.agent import _all_skill_paths
@@ -596,6 +584,7 @@ class TestAllSkillPathsLocalSymlinks:
 
         assert str(sensitive_skills) not in paths
 
+    @requires_symlinks
     def test_skips_broken_symlink(self, tmp_path: Path):
         """Broken symlink raises OSError with strict=True and is logged."""
         from kiro_crew.agent import _all_skill_paths
@@ -635,6 +624,7 @@ class TestAllSkillPathsLocalSymlinks:
 
         assert str(local_dir / "not-a-symlink" / "skills") not in paths
 
+    @requires_symlinks
     def test_ignores_symlink_to_file(self, tmp_path: Path):
         """Symlink pointing to a file (not directory) is skipped."""
         from kiro_crew.agent import _all_skill_paths
@@ -657,6 +647,89 @@ class TestAllSkillPathsLocalSymlinks:
 
 class TestResolveKirocrewBin:
     """Tests for lazy kirocrew binary resolution."""
+
+    @pytest.fixture
+    def no_interpreter_scripts(self, tmp_path: Path):
+        """Neutralise the interpreter's-own-prefix resolution step.
+
+        That step answers from the REAL interpreter running this suite, whose
+        prefix legitimately holds a ``bin/kirocrew`` whenever the suite runs
+        inside an install — so it short-circuits resolution before any LATER
+        step can be observed. Tests asserting a later step must point it at an
+        empty prefix; tests asserting the step itself supply their own.
+        """
+        empty = tmp_path / "empty-prefix"
+        empty.mkdir(exist_ok=True)
+        with patch("sys.exec_prefix", str(empty)):
+            yield
+
+    def test_prefers_interpreter_scripts_dir_over_path(self, tmp_path: Path):
+        """A sibling-tree console script beats an unrelated one on PATH.
+
+        A prefix-style runtime can put the package under
+        ``<root>/lib/python3.12/site-packages/`` and the console script under
+        the interpreter prefix ``<root>/python3.12/`` — sibling trees, so the
+        parent walk cannot reach the script. Resolution used to fall through to
+        PATH and pick up whatever ``kirocrew`` an unrelated earlier install had
+        left there, then cache it as the command for the built-in MCP servers.
+
+        The launcher is created through ``_kirocrew_bin_subpath`` rather than at
+        a hardcoded ``bin/kirocrew``, so the layout is the one this OS actually
+        looks for (``Scripts\\kirocrew.exe`` on Windows).
+        """
+        import kiro_crew.agent as agent_mod
+        from kiro_crew.agent import _kirocrew_bin_subpath, _resolve_kirocrew_bin
+
+        root = tmp_path / "runtime"
+        pkg_dir = root / "lib" / "python3.12" / "site-packages" / "kiro_crew"
+        pkg_dir.mkdir(parents=True)
+        (pkg_dir / "__init__.py").write_text("")
+
+        # The console script lives under the interpreter PREFIX, a sibling tree
+        # of the package, not above site-packages.
+        prefix = root / "python3.12"
+        own_bin = _kirocrew_bin_subpath(prefix)
+        own_bin.parent.mkdir(parents=True, exist_ok=True)
+        own_bin.write_text("#!/bin/sh\nexec true\n")
+        own_bin.chmod(0o755)
+
+        # An unrelated install's launcher, earlier on PATH.
+        other = tmp_path / "elsewhere"
+        other.mkdir()
+        path_bin = other / "kirocrew"
+        path_bin.write_text("#!/bin/sh\nexec true\n")
+        path_bin.chmod(0o755)
+
+        mock_mc = unittest.mock.MagicMock()
+        mock_mc.__file__ = str(pkg_dir / "__init__.py")
+
+        # Keep the real validator but confine it to this tmp tree, so a
+        # ``kirocrew`` that happens to exist on the host cannot be selected.
+        _real_works = agent_mod._launcher_works
+
+        def _scoped_works(p: Path) -> bool:
+            return str(p).startswith(str(tmp_path)) and _real_works(p)
+
+        old_val = agent_mod._KIROCREW_BIN
+        try:
+            agent_mod._KIROCREW_BIN = None
+            with ExitStack() as stack:
+                stack.enter_context(patch.dict("sys.modules", {"kiro_crew": mock_mc}))
+                stack.enter_context(
+                    patch("kiro_crew.agent._launcher_works", side_effect=_scoped_works)
+                )
+                stack.enter_context(patch("sys.exec_prefix", str(prefix)))
+                stack.enter_context(
+                    patch(
+                        "shutil.which",
+                        side_effect=lambda c: str(path_bin) if c == "kirocrew" else None,
+                    )
+                )
+                result = _resolve_kirocrew_bin()
+            assert result == str(own_bin)
+            assert result != str(path_bin)
+        finally:
+            agent_mod._KIROCREW_BIN = old_val
 
     def test_finds_bin_in_parent_hierarchy(self, tmp_path: Path):
         """Walks up from package dir to find bin/kirocrew."""
@@ -690,7 +763,7 @@ class TestResolveKirocrewBin:
         finally:
             agent_mod._KIROCREW_BIN = old_val
 
-    def test_falls_back_to_shutil_which(self, tmp_path: Path):
+    def test_falls_back_to_shutil_which(self, tmp_path: Path, no_interpreter_scripts):
         """Falls back to PATH lookup when bin/ not found in hierarchy."""
         import kiro_crew.agent as agent_mod
         from kiro_crew.agent import _resolve_kirocrew_bin
@@ -732,7 +805,7 @@ class TestResolveKirocrewBin:
         finally:
             agent_mod._KIROCREW_BIN = old_val
 
-    def test_returns_kirocrew_when_not_found(self, tmp_path: Path):
+    def test_returns_kirocrew_when_not_found(self, tmp_path: Path, no_interpreter_scripts):
         """Returns 'kirocrew' string when not found anywhere."""
         import kiro_crew.agent as agent_mod
         from kiro_crew.agent import _resolve_kirocrew_bin
@@ -754,7 +827,7 @@ class TestResolveKirocrewBin:
         finally:
             agent_mod._KIROCREW_BIN = old_val
 
-    def test_skips_stale_shutil_which_result(self, tmp_path: Path):
+    def test_skips_stale_shutil_which_result(self, tmp_path: Path, no_interpreter_scripts):
         """Falls through to bare 'kirocrew' when shutil.which returns a
         path that no longer exists (e.g. deleted after Toolbox migration).
         Regression test for scenario where
@@ -790,7 +863,7 @@ class TestResolveKirocrewBin:
         finally:
             agent_mod._KIROCREW_BIN = old_val
 
-    def test_walk_and_path_miss_falls_back_to_bare(self, tmp_path: Path):
+    def test_walk_and_path_miss_falls_back_to_bare(self, tmp_path: Path, no_interpreter_scripts):
         """When the bin walk and PATH both miss, fall back to bare 'kirocrew'.
 
         The public install has no Brazil ``brazil-path run.runtimefarm`` step,
@@ -831,7 +904,7 @@ class TestResolveKirocrewBin:
         finally:
             agent_mod._KIROCREW_BIN = old_val
 
-    def test_brazil_path_failure_falls_through(self, tmp_path: Path):
+    def test_brazil_path_failure_falls_through(self, tmp_path: Path, no_interpreter_scripts):
         """brazil-path raising an exception falls through without crashing."""
         import kiro_crew.agent as agent_mod
         from kiro_crew.agent import _resolve_kirocrew_bin
@@ -1500,6 +1573,7 @@ class TestKiroHooksMerge:
         result = _merge_kiro_hooks({}, user)
         assert result["preToolUse"] == [{"command": hook, "matcher": "*"}]
 
+    @requires_symlinks
     def test_validate_rejects_symlink_to_sensitive(self, tmp_path: Path):
         """Symlinks resolving to sensitive paths are rejected."""
         from kiro_crew.agent import _validate_hook_command
@@ -2720,6 +2794,7 @@ class TestKiroHooksAutoimport:
         assert result["preToolUse"][0]["command"].endswith("/ok.sh")
         assert any("not executable" in rec.message for rec in caplog.records)
 
+    @requires_symlinks
     def test_kiro_hooks_autoimport_skips_sensitive_path(self, tmp_path: Path, monkeypatch):
         """Scripts resolving into a sensitive path (~/.ssh) are rejected."""
         from kiro_crew.agent import _autoimport_kiro_hooks
@@ -3597,6 +3672,7 @@ class TestKiroHooksAutoimport:
             for rec in caplog.records
         )
 
+    @requires_symlinks
     def test_kiro_hooks_autoimport_rejects_symlink_escaping_dir(self, tmp_path: Path, caplog):
         """A symlink inside hooks_dir pointing at an outside script is rejected.
 
@@ -3705,6 +3781,7 @@ class TestKiroHooksAutoimport:
         assert command == str(script)
         assert "failed validation" in reason
 
+    @requires_symlinks
     def test_kiro_hooks_dir_stored_as_resolved_path(self, tmp_path: Path, monkeypatch):
         """Regression: ``_autoimport_kiro_hooks`` receives the *resolved* hooks dir.
 
@@ -3901,6 +3978,7 @@ class TestKiroHooksAutoimport:
             f"(nothing was rejected); got: {sel_calls!r}"
         )
 
+    @requires_symlinks
     def test_kiro_hooks_autoimport_rejects_dir_equal_to_symlinked_home(
         self, tmp_path: Path, monkeypatch, caplog
     ):
@@ -4173,7 +4251,9 @@ class TestRefreshDynamicFieldsStripsStaleUrl:
             assert "url" not in entry, f"{name} still has stale url"
             assert "headers" not in entry, f"{name} still has stale headers"
             assert entry["command"]
-            assert entry["args"] == args
+            # Windows uses the interpreter-module fallback, which prepends
+            # ``-m kiro_crew.__main__`` before the same managed subcommand.
+            assert entry["args"][-len(args) :] == args
 
     def test_non_managed_server_url_preserved(self):
         from kiro_crew.agent import _refresh_dynamic_fields
@@ -4302,63 +4382,6 @@ def _make_exec(tmp_path: Path, name: str) -> str:
     p.write_text("#!/bin/sh\n")
     p.chmod(0o755)
     return str(p)
-
-
-def _run_install_mcp_merge(
-    tmp_path: Path,
-    cfg_dir: Path,
-    *,
-    cc_servers: dict,
-    kiro_servers: dict,
-    kirocrew_servers: dict | None = None,
-    which_side_effect=lambda c, **kw: c,
-) -> dict:
-    """Run install_agent with CC-global and Kiro-global mcp.json seeded and a
-    customizable shutil.which. Returns the parsed kirocrew.json config."""
-    kiro_dir = tmp_path / "kiro_agents"
-    kiro_dir.mkdir(exist_ok=True)
-    prompt = cfg_dir / "prompt.md"
-    mc_config = tmp_path / "empty_mc_config.json"
-    if not mc_config.exists():
-        mc_config.write_text(json.dumps({"agent": {"kiro_hooks_autoimport": False}}))
-    kiro_mcp = tmp_path / "fake_kiro_mcp.json"
-    cc_mcp = tmp_path / "fake_cc_mcp.json"
-    kiro_mcp.write_text(json.dumps({"mcpServers": kiro_servers}))
-    cc_mcp.write_text(json.dumps({"mcpServers": cc_servers}))
-    if kirocrew_servers is not None:
-        kc_home = tmp_path / "kirocrew_home"
-        kc_home.mkdir(parents=True, exist_ok=True)
-        (kc_home / "mcp.json").write_text(json.dumps({"mcpServers": kirocrew_servers}))
-
-    _user_home = tmp_path / "kirocrew_home"
-    patches = [
-        patch.multiple(
-            "kiro_crew.agent",
-            KIRO_AGENTS_DIR=kiro_dir,
-            _BUNDLED_CFG_DIR=cfg_dir,
-            _KIROCREW_BIN="/usr/bin/kirocrew",
-            _MANAGED_MCP_SERVERS=_DEFAULT_MANAGED_MCPS,
-            _KIRO_MCP_JSON=kiro_mcp,
-            _CC_MCP_JSON=cc_mcp,
-        ),
-        patch("kiro_crew.agent._user_dir", lambda: _user_home),
-        patch("kiro_crew.agent._prompt_path", return_value=prompt),
-        patch("kiro_crew.agent._shipped_defaults", return_value=cfg_dir / "defaults.json"),
-        patch("kiro_crew.agent._project_dir", return_value=None),
-        patch("kiro_crew.agent._aim_skill_paths", return_value=[]),
-        patch("kiro_crew.agent.shutil.which", side_effect=which_side_effect),
-        patch("kiro_crew.agent._mc_config_path", return_value=mc_config),
-        # A companion contributes the Claude Code scope via the CPP seam — the
-        # core no longer reads ~/.claude.json directly at rebuild time (OSS is
-        # Kiro-only). Point the seam at cc_mcp so these merge-priority tests
-        # exercise the seam-routed provider-global merge.
-        patch("kiro_crew.agent._extra_mcp_scope_globals", return_value=[cc_mcp]),
-    ]
-    with ExitStack() as stack:
-        for p in patches:
-            stack.enter_context(p)
-        path = install_agent()
-    return json.loads(path.read_text(encoding="utf-8"))
 
 
 class TestSpecEnvPathIsExpandedOnEmit:
@@ -4940,6 +4963,7 @@ class TestSpecPathRefusesSymlinks:
     readable location (#4911 review).
     """
 
+    @requires_symlinks
     def test_a_symlinked_spec_is_refused_and_the_target_is_not_copied(
         self, tmp_path: Path, monkeypatch
     ):
@@ -4960,6 +4984,7 @@ class TestSpecPathRefusesSymlinks:
         assert link.is_symlink()
         assert json.loads(secret.read_text(encoding="utf-8"))["secret"] == "s"
 
+    @requires_symlinks
     def test_the_name_scan_also_skips_a_symlink(self, tmp_path: Path, monkeypatch):
         import kiro_crew.agent as agent_mod
 
@@ -5264,3 +5289,46 @@ class TestResetOutputEscapesUntrustedPaths:
         # Both paths are repr'd, so a control byte in either could not execute.
         assert "'" in str(exc.value), "paths are quoted (repr), not raw"
         assert "a.json" in str(exc.value) and "b.json" in str(exc.value)
+
+
+class TestSelHookRejectedRedaction:
+    """#5582: ``_sel_hook_rejected`` must redact ``command`` before its 200-char cut.
+
+    The old spelling sliced ``command[:200]`` inside the f-string and redacted
+    the assembled message afterwards, so a credential cut at the boundary lost
+    its tail, stopped matching the credential regex, and the raw prefix escaped
+    into the SEL audit row.
+    """
+
+    def _capture_sel(self, monkeypatch) -> list:
+        import kiro_crew.agent as agent_mod
+
+        events: list = []
+
+        class _Log:
+            def log(self, event) -> None:
+                events.append(event)
+
+        monkeypatch.setattr(agent_mod, "sel", lambda: _Log())
+        return events
+
+    def test_credential_straddling_the_cut_is_not_leaked(self, monkeypatch) -> None:
+        from kiro_crew.agent import _sel_hook_rejected
+
+        events = self._capture_sel(monkeypatch)
+        # fabricated AKIA-shaped literal, inlined (a ``secret``-named binding
+        # trips CodeQL's name-based sensitive-source heuristic); the 200-char
+        # cut lands 8 chars into the 20-char key
+        command = "x" * 192 + "AKIAIOSFODNN7EXAMPLE" + " --flag"
+        _sel_hook_rejected("preToolUse", command, "denied")
+        assert len(events) == 1
+        assert "AKIA" not in events[0].resources
+
+    def test_plain_command_truncation_unchanged(self, monkeypatch) -> None:
+        """Ordinary path is result-preserving: no secret ⇒ the same 200-char slice."""
+        from kiro_crew.agent import _sel_hook_rejected
+
+        events = self._capture_sel(monkeypatch)
+        _sel_hook_rejected("preToolUse", "c" * 250, "denied")
+        assert len(events) == 1
+        assert events[0].resources == f"event=preToolUse command={'c' * 200}"

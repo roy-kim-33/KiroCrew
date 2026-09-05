@@ -1,6 +1,6 @@
 ---
 name: theme-pack-authoring
-description: Build, validate, and install Kiro Crew theme packs -- pack anatomy, the 54-variable palette, role-tagged fonts, the overrides.css allowlist (what installs vs what actually renders), and the install-verify cycle. Use when the user wants to create or edit a theme pack.
+description: Build, validate, and install Kiro Crew theme packs -- pack anatomy, the 56-variable palette, role-tagged fonts, the overrides.css allowlist (what installs vs what actually renders), and the install-verify cycle. Use when the user wants to create or edit a theme pack.
 triggers: theme pack, custom theme, theme.json, variables.json, overrides.css, install theme, theme font, dashboard theme, build a theme
 ---
 
@@ -8,15 +8,15 @@ triggers: theme pack, custom theme, theme.json, variables.json, overrides.css, i
 
 House rules for building theme packs. The authoritative contract is
 [`website/docs/theming-contract.md`](https://github.com/kirodotdev/KiroCrew/blob/main/website/docs/theming-contract.md);
-this skill is the task-oriented digest, plus the traps that cost real
-debugging time.
+this skill is the self-contained task-oriented digest, plus the traps that cost
+real debugging time.
 
 ## Pack anatomy
 
 ```
 my-theme/
 ├── theme.json          # manifest: slug, name, emoji, level, formatVersion, fonts[]
-├── variables.json      # dark + light palettes (54 allowlisted CSS vars)
+├── variables.json      # dark + light palettes (56 allowlisted CSS vars)
 ├── readme.md           # optional; attribution and notes
 ├── styles/
 │   ├── overrides.css   # optional; scoped structural CSS (see allowlist below)
@@ -71,10 +71,10 @@ a level-0 pack shipping a font is refused.
 
 ## variables.json — the palette
 
-Two blocks, `dark` and `light`, each holding up to **54 allowlisted variables**.
+Two blocks, `dark` and `light`, each holding up to **56 allowlisted variables**.
 Required minimum per block: `--bg`, `--text`, `--accent`. Unknown keys are
 REJECTED (install fails), so do not invent variables; the allowlist is
-`_THEME_CSS_VARS` in `src/kiro_crew/dashboard/theme_validate.py`.
+`_THEME_CSS_VARS` in `kiro_crew/dashboard/theme_validate.py`.
 
 - To clone a built-in theme's palette, transcribe its block from
   `website/src/index.css` (e.g. `[data-theme="kiro-dark"]`), keeping only

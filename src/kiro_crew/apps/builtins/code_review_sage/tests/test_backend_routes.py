@@ -23,6 +23,7 @@ import pytest
 from aiohttp import web
 
 from kiro_crew import platform_compat
+from kiro_crew.apps.builtins.code_review_sage.tests.fixtures import SYMLINKS_OK
 
 _APP_ROOT = Path(__file__).resolve().parent.parent
 _ROUTES = _APP_ROOT / "backend" / "routes.py"
@@ -41,8 +42,8 @@ from sage_lib.review_driver import _all_delivered  # noqa: E402
 async def _noop_save() -> None:
     """Stand-in for ``routes._save_runs``, which is a coroutine.
 
-    The registry write is offloaded to a worker thread because its owner-only
-    lockdown spawns ``icacls`` on Windows, so a plain ``lambda: None`` stub is
+    The registry write is offloaded to a worker thread because it is blocking
+    file IO (see ``_write_runs``), so a plain ``lambda: None`` stub is
     not awaitable and the patched call site would raise instead of no-op.
     """
 
@@ -145,9 +146,10 @@ class TestRunsPersistence(unittest.TestCase):
         self.assertIn("e5", runs.read_text(encoding="utf-8"))
 
     def test_the_lockdown_never_runs_on_the_event_loop(self):
-        """The owner-only lockdown spawns ``icacls`` on Windows, so persisting the
-        registry must not block the single gateway loop -- a freeze there stalls
-        every chat turn and the liveness heartbeat, not just this write.
+        """Persisting the registry is blocking file IO (the owner-only lockdown
+        itself is now in-process — ``platform_compat``), and it must not run on
+        the single gateway loop -- a stall there delays every chat turn and the
+        liveness heartbeat, not just this write.
 
         Asserted structurally rather than by timing, so it holds regardless of how
         fast the syscall happens to be on this host. The thread is RECORDED and
@@ -170,8 +172,8 @@ class TestRunsPersistence(unittest.TestCase):
         self.assertIn("write", seen, "_write_runs was never reached")
         self.assertNotEqual(
             seen["write"], seen["loop"],
-            "_write_runs ran on the event-loop thread; the icacls spawn inside it "
-            "would freeze the gateway")
+            "_write_runs ran on the event-loop thread; the blocking file IO inside "
+            "it would stall the gateway")
 
 
 class TestRecordReviewedDelivery(unittest.TestCase):
@@ -759,6 +761,7 @@ class TestAdoptionRefusesAPlantedLink:
     link across, and must not leave one behind to retry.
     """
 
+    @unittest.skipUnless(SYMLINKS_OK, "platform forbids unprivileged symlinks")
     def test_a_symlink_is_refused_and_removed(self, tmp_path):
 
         store.ensure_layout(tmp_path)
@@ -993,6 +996,7 @@ class TestPublishRefusesAPlantedDestinationLink:
             "counts": {"red": 0, "yellow": 1},
         }
 
+    @unittest.skipUnless(SYMLINKS_OK, "platform forbids unprivileged symlinks")
     def test_a_planted_link_is_replaced_not_followed(self, tmp_path):
 
         store.ensure_layout(tmp_path)
@@ -1126,6 +1130,7 @@ class TestPublishRefusesAPlantedSourceLink:
     direction.
     """
 
+    @unittest.skipUnless(SYMLINKS_OK, "platform forbids unprivileged symlinks")
     def test_a_symlinked_record_is_not_published(self, tmp_path):
 
         store.ensure_layout(tmp_path)
@@ -1184,6 +1189,7 @@ class TestReportWritesRefusePlantedLinks:
             "generated_at": "2026-01-01T00:00:00Z",
         }
 
+    @unittest.skipUnless(SYMLINKS_OK, "platform forbids unprivileged symlinks")
     @pytest.mark.parametrize("name", [
         "focus-report.html", "rows.json", "report.json", "index.json",
     ])
@@ -1216,7 +1222,11 @@ class TestReportWritesRefusePlantedLinks:
             assert p.is_file(), f"{name} was not written"
             # The temp file is chmod'ed before it takes the real name, so the
             # mode must hold on the final path with no separate chmod step.
-            assert oct(p.stat().st_mode)[-3:] == "600", f"{name} is not 0600"
+            # Windows expresses the same owner-only lockdown as a DACL, which
+            # st_mode never reflects (it always reports 0o666), so the mode
+            # bits are only observable on POSIX.
+            if platform_compat.IS_POSIX:
+                assert oct(p.stat().st_mode)[-3:] == "600", f"{name} is not 0600"
         assert list(rd.glob("*.tmp")) == [], "a staging temp file survived"
 
 
@@ -1462,6 +1472,7 @@ class TestReportsDirReadsDoNotFollowAPlant:
         (rd / name).symlink_to(secret)
         return rd / name
 
+    @unittest.skipUnless(SYMLINKS_OK, "platform forbids unprivileged symlinks")
     def test_a_planted_html_link_is_not_read(self, tmp_path):
         from sage_lib import report
 
@@ -1469,6 +1480,7 @@ class TestReportsDirReadsDoNotFollowAPlant:
         assert link.is_file()          # the link resolves — it just must not be read
         assert report.read_within_reports(link, tmp_path, "run-r1") is None
 
+    @unittest.skipUnless(SYMLINKS_OK, "platform forbids unprivileged symlinks")
     def test_a_planted_index_link_is_not_read(self, tmp_path):
         from sage_lib import report
 
@@ -1485,6 +1497,7 @@ class TestReportsDirReadsDoNotFollowAPlant:
         got = report.read_within_reports(rd / "index.json", tmp_path, "run-r2")
         assert json.loads(got or "{}")["report_slug"] == "ok"
 
+    @unittest.skipUnless(SYMLINKS_OK, "platform forbids unprivileged symlinks")
     def test_read_report_refuses_a_planted_report_json(self, tmp_path):
         """The consumer, not just the helper: a plant renders as no report."""
         from sage_lib import report
@@ -1492,6 +1505,7 @@ class TestReportsDirReadsDoNotFollowAPlant:
         self._plant(tmp_path, "report.json", json.dumps({"rows": ["leak"]}))
         assert report.read_report(tmp_path, "run-r1") is None
 
+    @unittest.skipUnless(SYMLINKS_OK, "platform forbids unprivileged symlinks")
     def test_set_report_slug_does_not_merge_a_planted_index(self, tmp_path):
         from sage_lib import report
 
@@ -1647,12 +1661,14 @@ class TestResultReadsDoNotFollowAPlantedLink:
         (rd / f"{results.safe_change_id(change_id)}.json").symlink_to(target)
         return rd
 
+    @unittest.skipUnless(SYMLINKS_OK, "platform forbids unprivileged symlinks")
     def test_read_result_refuses_a_planted_record(self, tmp_path):
         from sage_lib import results
 
         self._plant(tmp_path, "victim", "CR-1", {"change_id": "ATTACKER"})
         assert results.read_result("CR-1", tmp_path, "victim") is None
 
+    @unittest.skipUnless(SYMLINKS_OK, "platform forbids unprivileged symlinks")
     def test_list_results_skips_a_planted_record(self, tmp_path):
         from sage_lib import results
 
@@ -1695,6 +1711,7 @@ class TestResultReadsDoNotFollowAPlantedLink:
         store.ensure_layout(tmp_path)
         assert results.read_result("CR-NONE", tmp_path, "empty") is None
 
+    @unittest.skipUnless(SYMLINKS_OK, "platform forbids unprivileged symlinks")
     def test_the_reviewed_index_is_guarded_too(self, tmp_path):
         """It decides which PRs count as reviewed, so a swap suppresses reviews."""
         from sage_lib import results, store
@@ -2922,3 +2939,128 @@ class TestFollowupRunLiveAndReentry(unittest.IsolatedAsyncioTestCase):
         data = json.loads((await self.mod._handle_chat_get(
             _Req(query={"run_id": "run1", "change_id": "GH-o-r-42"}))).body)
         self.assertTrue(data["resumable"])
+
+
+class TestFailureStringMapping(unittest.TestCase):
+    """Each skipped_reason renders a DISTINCT, cause-naming sentence.
+
+    "The reviewer found nothing" and "the reviewer never ran" collapsing into one
+    message is the ambiguity that made these failures untriageable — a reader
+    must be able to tell the causes apart from the run-level error alone.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self._old_home = os.environ.get("KIROCREW_HOME")
+        self.addCleanup(self._restore_home)
+        os.environ["KIROCREW_HOME"] = self.tmp
+        self.mod = _load_routes_module()
+
+    def _restore_home(self):
+        if self._old_home is None:
+            os.environ.pop("KIROCREW_HOME", None)
+        else:
+            os.environ["KIROCREW_HOME"] = self._old_home
+
+    def _mapped(self, reason: str) -> str:
+        return self.mod._first_change_error(
+            {"per_change": [{"skipped_reason": reason}]})
+
+    def test_every_reason_maps_to_its_own_sentence(self):
+        reasons = ("no_review_recorded", "review_record_incomplete",
+                   "runtime_unavailable", "review_failed")
+        rendered = {reason: self._mapped(reason) for reason in reasons}
+        for reason, text in rendered.items():
+            self.assertNotEqual(text, reason,
+                                f"{reason} passed through unmapped")
+            self.assertTrue(text, f"{reason} rendered empty")
+        self.assertEqual(len(set(rendered.values())), len(reasons),
+                         f"reasons share a sentence: {rendered}")
+
+    def test_never_ran_and_found_nothing_read_apart(self):
+        never_ran = self._mapped("runtime_unavailable")
+        found_nothing = self._mapped("no_review_recorded")
+        self.assertIn("never ran", never_ran)
+        self.assertNotIn("never ran", found_nothing)
+
+    def test_specific_error_text_outranks_the_reason_mapping(self):
+        # A record carrying the preflight's own message (which names the missing
+        # runtime) surfaces that message verbatim rather than the generic map.
+        out = self.mod._first_change_error({"per_change": [{
+            "deep_error": "the reviewer cannot run: no kiro-cli executable was "
+                          "found on this host",
+            "skipped_reason": "runtime_unavailable",
+        }]})
+        self.assertIn("kiro-cli", out)
+
+
+class TestRuntimePreflightWiring(unittest.IsolatedAsyncioTestCase):
+    """The review path checks the runtime BEFORE spawning anything.
+
+    On a host that cannot spawn a reviewer, the run must fail fast with an error
+    naming the missing runtime — the batch is never opened, no session is
+    dispatched, and every change's progress carries the discriminated reason —
+    instead of "completing" and reporting an untriageable "no result record".
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self._old_home = os.environ.get("KIROCREW_HOME")
+        self.addCleanup(self._restore_home)
+        os.environ["KIROCREW_HOME"] = self.tmp
+        self.mod = _load_routes_module()
+        self.mod._RUNS = []
+
+    def _restore_home(self):
+        if self._old_home is None:
+            os.environ.pop("KIROCREW_HOME", None)
+        else:
+            os.environ["KIROCREW_HOME"] = self._old_home
+
+    async def test_failing_preflight_fails_the_run_without_spawning(self):
+        batch_calls: list[str] = []
+
+        class _FakePool:
+            async def begin_batch(self):
+                batch_calls.append("begin")
+
+            async def end_batch(self):
+                batch_calls.append("end")
+
+        def _refuse_dispatch(loop, pool, **kw):
+            def dispatch(task, timeout=0, **kwargs):
+                raise AssertionError("a session was dispatched despite a "
+                                     "failed runtime preflight")
+            return dispatch
+
+        async def _noop_async(*a, **k):
+            return None
+
+        url = "https://github.com/kirodotdev/KiroCrew/pull/33"
+        run: dict = {"run_id": "rp1", "status": "running", "changes": [url],
+                     "change_ids": [_rd.change_id_for(url)], "progress": {}}
+        self.mod._RUNS = [run]
+        with unittest.mock.patch.object(
+                self.mod.review_pool, "runtime_preflight",
+                lambda: "the reviewer cannot run: no kiro-cli executable was "
+                        "found on this host"), \
+                unittest.mock.patch.object(
+                    self.mod.review_pool, "get_pool", lambda: _FakePool()), \
+                unittest.mock.patch.object(
+                    self.mod.review_pool, "make_sync_dispatch",
+                    _refuse_dispatch), \
+                unittest.mock.patch.object(self.mod, "_save_runs", _noop_async), \
+                unittest.mock.patch.object(
+                    self.mod, "_notify_finished", _noop_async):
+            await self.mod._run_review_bg(run, [url])
+
+        self.assertEqual(batch_calls, [])            # runtime never spawned
+        self.assertEqual(run["status"], "error")
+        self.assertIn("kiro-cli", run["error"])
+        entry = run["progress"][_rd.change_id_for(url)]
+        self.assertEqual(entry["phase"], "failed")
+        self.assertIn("kiro-cli", entry["error"])
+        recs = run["summary"]["per_change"]
+        self.assertEqual(recs[0]["skipped_reason"], "runtime_unavailable")

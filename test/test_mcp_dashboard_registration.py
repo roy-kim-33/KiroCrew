@@ -342,6 +342,8 @@ class TestWhatThisSetGrants:
     SESSION_TOOLS = {
         "session_create",
         "session_stop",
+        "session_close",
+        "session_send",
         "session_read_message",
     }
     GRANTED_TOOLS = FOLDER_TOOLS | SESSION_TOOLS

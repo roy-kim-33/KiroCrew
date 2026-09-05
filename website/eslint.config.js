@@ -24,7 +24,21 @@ export default [
     },
     rules: {
       ...tsPlugin.configs.recommended.rules,
-      ...Object.fromEntries(Object.entries(jsxA11y.configs.recommended.rules || {}).map(([k, v]) => [k, 'warn'])),
+      // Downgrade jsx-a11y's recommended severities to 'warn' so they ride the
+      // --max-warnings ratchet instead of failing the build outright — but keep
+      // whatever the preset switched OFF off. A blanket rewrite to 'warn' also
+      // re-enables the rules the plugin deliberately disabled, which is how 44
+      // `label-has-for` warnings existed: the plugin marks that rule
+      // `deprecated: true, replacedBy: ['label-has-associated-control']` and
+      // ships it as 'off' in recommended, while the live replacement is already
+      // on. Those 44 were noise from a rule nobody chose, consuming ratchet
+      // headroom that a real a11y regression needs.
+      ...Object.fromEntries(
+        Object.entries(jsxA11y.configs.recommended.rules || {}).map(([k, v]) => [
+          k,
+          v === 'off' || v === 0 ? v : 'warn',
+        ]),
+      ),
       'jsx-a11y/no-autofocus': 'off',
       'react-hooks/rules-of-hooks': 'error',
       'react-hooks/exhaustive-deps': 'warn',
@@ -67,6 +81,27 @@ export default [
     // render unstyled there. They keep their native selects until that renderer
     // is brought onto the dashboard's styling.
     files: ['src/apps/mochi/src/renderer/**/*.{ts,tsx}'],
+    rules: {
+      'no-restricted-syntax': 'off',
+    },
+  },
+  {
+    // `ui/native-select.tsx` is the ONE sanctioned native `<select>` in the
+    // dashboard, and the exemption is deliberately the single file rather than a
+    // directory: the rule's job is still to stop native selects being scattered,
+    // and this file is the chokepoint that makes that enforceable — SimpleSelect
+    // routes to it on coarse pointers, so no other module ever needs one.
+    //
+    // The rule's reason is theming, and that reason does not reach a phone. The
+    // Radix popup's list is a `position:fixed` overflow scroller inside
+    // react-remove-scroll's lock, and iOS Safari does not reliably hand a finger
+    // drag to that shape: Settings → Voice → Language shows 7 of its ~41 BCP-47
+    // codes and the rest cannot be reached at all. A themed list nobody can
+    // scroll is worse than an OS-drawn list that works, so on touch the platform
+    // draws it. Pointer devices are untouched and still get the themed popup.
+    //
+    // See website/docs/page-layout.md §Forms, which records the same exception.
+    files: ['src/components/ui/native-select.tsx'],
     rules: {
       'no-restricted-syntax': 'off',
     },

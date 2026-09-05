@@ -1,9 +1,17 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { describe, it, expect, vi, beforeAll, beforeEach } from 'vitest'
 import { render, screen, fireEvent, waitFor } from '@testing-library/react'
 import DiffBlock, { extractFilePath } from '../components/DiffBlock'
 
+// These assertions exercise controls rendered by the lazy Pierre implementation,
+// not the Suspense fallback. Warm that chunk once so a saturated full-suite worker
+// cannot make Testing Library's default query timeout race module loading.
+beforeAll(() => import('../pierre/PierreImpl'))
+
 beforeEach(() => {
   globalThis.fetch = vi.fn(() => Promise.resolve({ ok: true })) as unknown as typeof fetch
+  // The split/unified layout persists app-wide (`mc-diff-split`); start each
+  // test from the unseeded default so no test inherits another's toggle.
+  localStorage.clear()
 })
 
 const simpleDiff = `--- a/file.ts
@@ -54,10 +62,21 @@ describe('DiffBlock', () => {
     expect(await screen.findByTitle('Copy patch')).toBeInTheDocument()
   })
 
-  it('toggles between unified and split view', async () => {
+  it('toggles between unified and split view and persists the choice', async () => {
     render(<DiffBlock code={simpleDiff} complete={true} />)
-    fireEvent.click(await screen.findByTitle('Split view'))
-    expect(await screen.findByTitle('Unified view')).toBeInTheDocument()
+    // Unseeded default is split — the shared `mc-diff-split` preference's
+    // default — so the button offers the way back to unified.
+    fireEvent.click(await screen.findByTitle('Unified view'))
+    expect(await screen.findByTitle('Split view')).toBeInTheDocument()
+    // The choice lands in the shared preference (#6024), not per-block state.
+    expect(localStorage.getItem('mc-diff-split')).toBe('0')
+  })
+
+  it('seeds the layout from the shared mc-diff-split preference', async () => {
+    localStorage.setItem('mc-diff-split', '0')
+    render(<DiffBlock code={simpleDiff} complete={true} />)
+    // Persisted unified → the button offers split.
+    expect(await screen.findByTitle('Split view')).toBeInTheDocument()
   })
 
   it('shows View file button when onFileOpen is provided', async () => {

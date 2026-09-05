@@ -27,7 +27,7 @@ from urllib.parse import urlparse
 from kiro_crew import mcp_core, platform_compat, session_directive
 from kiro_crew.mcp_shared import ToolCancelled, is_tool_cancelled
 from kiro_crew.mcp_tools._limits import _MONITOR_DEFAULT_MAX_CYCLES
-from kiro_crew.security import redact_credentials, redact_exfiltration_urls
+from kiro_crew.security import redact_and_truncate, redact_credentials, redact_exfiltration_urls
 from kiro_crew.session_surface import has_dashboard_surface
 from kiro_crew.validation import (
     ASK_QUESTION_SCHEMA,
@@ -35,6 +35,7 @@ from kiro_crew.validation import (
     MONITOR_START_SCHEMA,
     MONITOR_UPDATE_SCHEMA,
     REGISTER_HOOK_SCHEMA,
+    RESET_CONVERSATION_SCHEMA,
     SELECT_CREW_SCHEMA,
     SET_PROJECT_SCHEMA,
     SUGGEST_FOLLOWUP_SCHEMA,
@@ -167,17 +168,21 @@ def schemas() -> list[dict[str, Any]]:
         {
             "name": "ask_question",
             "description": (
-                "Ask the dashboard user one or more multiple-choice questions and "
-                "BLOCK until they answer. Renders a question card in the chat: the "
-                "user clicks an option (or types a custom answer in the card's "
-                "free-text field) and the answer is returned to you as this tool's "
-                "result — no extra turn, no [OPTIONS:] tag. Use when you need a "
-                "decision mid-task and cannot usefully continue without it "
-                "(which of these approaches, which account, confirm before I "
-                "refactor). Prefer the [OPTIONS: a | b | c] text tag when you are "
-                "ENDING your turn anyway — this tool is for pausing mid-turn. "
-                "Dashboard sessions only; returns a timeout notice if the user "
-                "does not answer within timeout_secs."
+                "Ask the dashboard user 1-4 multiple-choice questions by posting a "
+                "question card to the chat: the user clicks an option (or types a "
+                "custom answer in the card's free-text field). The tool is "
+                "NON-BLOCKING — it returns as soon as the card is requested, so END "
+                "YOUR TURN immediately after calling it. The answer arrives as the "
+                "user's next ordinary message, NOT as this tool's result, so do not "
+                "re-ask or guess in the meantime. Use it when a decision is genuinely "
+                "needed before the work can continue (which of these approaches, "
+                "which account, confirm before I refactor). When you are ending your "
+                "turn anyway a final [OPTIONS: a | b | c] tag is cheaper and renders "
+                "on every channel — the card's advantage is several questions at "
+                "once, multi-select and the free-text field, not saving a turn. "
+                "Dashboard sessions only: from another surface the call returns an "
+                "[OPTIONS:] steer instead of a card, and if no dashboard client is "
+                "attached the card is dropped."
             ),
             "inputSchema": {
                 "type": "object",
@@ -232,12 +237,8 @@ def schemas() -> list[dict[str, Any]]:
                             "required": ["question", "options"],
                         },
                     },
-                    "timeout_secs": {
-                        "type": "integer",
-                        "description": (
-                            "How long to wait for the answer (15-540, default 300)"
-                        ),
-                    },
+                    # No timeout_secs: it would imply a wait this tool does not
+                    # perform. Still accepted for compatibility, never read.
                 },
                 "required": ["questions"],
             },
@@ -409,6 +410,43 @@ def schemas() -> list[dict[str, Any]]:
             },
         },
         {
+            "name": "reset_conversation",
+            "description": (
+                "Give the calling chat session a clean context: the next message "
+                "starts a fresh conversation with no memory of this one. The tab "
+                "stays open and the TRANSCRIPT IS NOT TOUCHED — earlier messages "
+                "remain visible and on disk, so this drops the model's memory, not "
+                "the user's record."
+                "\n\n"
+                "Use when a session walks a list of independent items one at a time "
+                "(reviewing a queue, triaging tickets) and carrying item N's context "
+                "into item N+1 buys nothing but tokens. Also use when a long-lived "
+                "conversation has drifted off the thing it was about."
+                "\n\n"
+                "Do NOT use to escape a context you still need: anything not written "
+                "down somewhere durable — a file, a ticket, a memory — is gone from "
+                "the model's view after the reset, even though the user can still "
+                "read it in the tab. Record what carries forward BEFORE calling this."
+                "\n\n"
+                "Restrictions: headless callers (cron jobs, subagents, task runners) "
+                "are rejected — a cron turn can run on a user's dashboard slot and a "
+                "subagent shares its parent's slot, so neither may wipe it."
+                "\n\n"
+                "The reset lands at a turn BOUNDARY, not inline, so this tool returns "
+                "cleanly without tearing down its own caller mid-write. Normally that "
+                "is the end of this turn, so the next message starts fresh. It waits, "
+                "however, for anything whose work the teardown would destroy: a turn "
+                "still in flight on the session, or sub-agents running, queued, or "
+                "delivering a result. So it can land a turn or more later than the "
+                "next message, and the rest of the current turn always still sees the "
+                "full conversation."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+            },
+        },
+        {
             "name": "suggest_followup",
             "description": (
                 "Offer the user up to 3 follow-up items as a card below the chat "
@@ -500,8 +538,14 @@ def task_run(name: str, args: dict[str, Any]) -> str:
     if d.get("error"):
         return f"Error: {d['error']}"
 
-    safe_label, _ = redact_exfiltration_urls(task_name or spec[:80])
-    safe_label, _ = redact_credentials(safe_label)
+    # ``task_name`` is used whole; only the ``spec`` fallback is bounded, so
+    # only that branch needs the redact-then-bound composition — bounding first
+    # can cut a credential into fragments no redaction regex matches.
+    if task_name:
+        safe_label, _ = redact_exfiltration_urls(task_name)
+        safe_label, _ = redact_credentials(safe_label)
+    else:
+        safe_label = redact_and_truncate(spec, 80)
     return f"Task runner started: {safe_label}"
 
 
@@ -711,6 +755,44 @@ def register_hook(name: str, args: dict[str, Any]) -> str:
     )
 
 
+def _emit_directive(kind: str, args: dict[str, Any], human: str) -> str:
+    """Encode a validated directive AND publish it out of band; return the text.
+
+    Two delivery paths, one each way round:
+
+    * The MARKER in the returned text is the original path. A consumer that can
+      verify the call's ``_meta.kiro`` identity (kiro-cli) decodes and applies it
+      from there, exactly as before — this function changes nothing for that
+      backend.
+    * The out-of-band POST is the provider-neutral path. ``_post`` already carries
+      ``X-Session-Key`` (and the gateway kernel-verifies that claim on the unix
+      socket), so the gateway parks the payload for the RIGHT session without the
+      model's tool result being trusted for anything. A backend that emits no
+      ``_meta.kiro`` identity has no other way to reach its own control plane.
+
+    Order matters: encode FIRST. ``encode`` refuses an oversized payload by
+    returning a marker-less error string, and a refused directive must NOT be
+    published — otherwise the model is told "nothing was applied" while a record
+    sits waiting to apply it.
+
+    Fail-soft on the POST, and SILENT by design. An older gateway with no such
+    route, or one that is simply down, must not turn a working tool call into an
+    error: the marker is already in hand and the kiro-cli path still works. There
+    is no log line because this module runs as a stdio MCP server, where the
+    process's own streams are the protocol channel — and because the failure that
+    matters is reported at the CONSUMER, which is the side that knows whether a
+    directive actually landed.
+    """
+    out = session_directive.encode(kind, args, human)
+    if session_directive.is_refusal(out):
+        return out
+    try:
+        mcp_core._post("/api/session-directive", {"kind": kind, "args": args})
+    except Exception:
+        pass
+    return out
+
+
 def autonudge_stop(name: str, args: dict[str, Any]) -> str:
     args = validate_tool_args(args, AUTONUDGE_STOP_SCHEMA)
 
@@ -730,10 +812,18 @@ def autonudge_stop(name: str, args: dict[str, Any]) -> str:
             "a dashboard, Slack, or Discord session "
             f"(current session_key={sk!r})."
         )
-    return session_directive.encode(
+    return _emit_directive(
         "autonudge_stop",
         {"reason": args.get("reason", "").strip()},
-        "Stopping the auto-nudge loop on this session (if one is active).",
+        # NOT a confirmation, and worded so a model cannot read it as one: this
+        # tool resolves no session, so it cannot know whether a loop is bound
+        # here. The consumer applies the stop and records the real outcome —
+        # including "nothing was stopped" when the binding resolves no loop —
+        # onto the transcript, so a caller that reads this as success would be
+        # acting on an unverified claim.
+        "Stop REQUESTED for this session's auto-nudge loop. This is not "
+        "confirmation that a loop was found or stopped; the applied outcome is "
+        "recorded separately and may report that nothing was stopped.",
     )
 
 
@@ -756,7 +846,7 @@ def ask_question(name: str, args: dict[str, Any]) -> str:
             "turn with an [OPTIONS: a | b | c] tag instead — it renders "
             "clickable buttons on every channel that supports them."
         )
-    return session_directive.encode(
+    return _emit_directive(
         "ask_question",
         # Encode the AUTHORITATIVELY-validated + normalized questions (deep
         # per-question/option checks), not the shallow-schema args: a
@@ -802,7 +892,7 @@ def monitor_start(name: str, args: dict[str, Any]) -> str:
     # the runaway backstop; the runtime budget is for callers that need a
     # hard TIME bound (e.g. "babysit this for at most 2 hours").
     max_runtime_secs = int(args.get("max_runtime_secs") or 0)
-    return session_directive.encode(
+    return _emit_directive(
         "monitor_start",
         {
             "message": message,
@@ -868,7 +958,7 @@ def monitor_update(name: str, args: dict[str, Any]) -> str:
             "monitor_update: nothing to change — pass at least one of "
             "message, interval_secs, max_cycles, max_runtime_secs."
         )
-    return session_directive.encode(
+    return _emit_directive(
         "monitor_update",
         {"patch": patch},
         f"Monitor-loop update requested for this session "
@@ -881,13 +971,30 @@ def set_project(name: str, args: dict[str, Any]) -> str:
     args = validate_tool_args(args, SET_PROJECT_SCHEMA)
     # Stateless: the session-aware consumer (chat_runner) applies the
     # project change to ITS OWN slot — no session identity resolved here.
-    return session_directive.encode(
+    return _emit_directive(
         "set_project",
         {"project": args.get("path", ""), "clear": bool(args.get("clear"))},
         "Project change requested for this session; if the path is valid "
         "and permitted it takes effect on the next message (cold-start with "
         "the new CWD and project steering). An invalid or sensitive path is "
         "rejected when this turn's result is processed.",
+    )
+
+
+def reset_conversation(name: str, args: dict[str, Any]) -> str:
+    validate_tool_args(args, RESET_CONVERSATION_SCHEMA)
+    # Stateless: the session-aware consumer (chat_runner) queues the discard
+    # against ITS OWN slot — no session identity resolved here. The payload is
+    # empty because there is nothing to choose: a caller asking for a clean
+    # context always wants a clean one, and the HTTP route carries a replay flag
+    # for the rare caller that does not.
+    return _emit_directive(
+        "reset_conversation",
+        {},
+        "Conversation reset requested for this session; if this turn is "
+        "user-facing it takes effect at a turn boundary, and the next message "
+        "starts with no memory of this conversation. The transcript is not "
+        "deleted — write down anything that must carry forward.",
     )
 
 
@@ -898,7 +1005,7 @@ def suggest_followup(name: str, args: dict[str, Any]) -> str:
     # the card to ITS OWN slot; no session identity resolved here. The card
     # is broadcast-only (dropped if no client attached), so the confirmation
     # stays cautious — restate the follow-ups in reply text if they matter.
-    return session_directive.encode(
+    return _emit_directive(
         "suggest_followup",
         {"items": items},
         "Follow-up card requested for this session. It is delivered to a "
@@ -918,5 +1025,6 @@ HANDLERS: dict[str, Callable[[str, dict[str, Any]], str]] = {
     "monitor_start": monitor_start,
     "monitor_update": monitor_update,
     "set_project": set_project,
+    "reset_conversation": reset_conversation,
     "suggest_followup": suggest_followup,
 }
