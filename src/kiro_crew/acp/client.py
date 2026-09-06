@@ -3332,7 +3332,14 @@ class AcpClient:
         self._jsonl_pos: int = 0  # track read position in session JSONL for tool results
         self._stderr_task: asyncio.Task | None = None  # type: ignore[type-arg]
         self._last_activity: float = time.monotonic()
+        # Starts SET: "no turn in flight" is the truthful state before one is
+        # sent, and has_active_turn() reads this to refuse destructive steps.
+        # Left clear, a spawned-but-never-prompted client reports a turn it
+        # never had and every model switch 409s. Every prompt entry point
+        # (send_message / send_message_stream / stream_events) clears it
+        # immediately before _send_prompt, so a real turn still reads active.
         self._turn_done: asyncio.Event = asyncio.Event()
+        self._turn_done.set()
         # Serializes whole read turns on this client's single stdout StreamReader.
         # An asyncio StreamReader permits exactly ONE waiting reader; the shared
         # `_bg` session is streamed by ~8 callers and the per-session Semaphore(1)
@@ -5433,7 +5440,11 @@ class AcpClient:
         self._cancel_ts = 0.0
         self._cancel_grace_secs = _CANCEL_GRACE_SECS
         self._resumed = False
+        # Set for the same reason as __init__: a respawned client has no turn
+        # in flight, and _cancelled is cleared just above — leaving this clear
+        # made has_active_turn() true until the next turn happened to finish.
         self._turn_done = asyncio.Event()
+        self._turn_done.set()
         self._last_stop_reason = ""
         self._pending_oauth_requests.clear()
         self._oauth_emitted_servers.clear()

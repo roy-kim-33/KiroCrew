@@ -173,6 +173,37 @@ class TestAcpClientInit:
         # external audit loop, so they opt in to ACP-layer SEL tool auditing.
         assert AcpClient(audit_source="subagent")._audit_source == "subagent"
 
+    @staticmethod
+    def _with_live_process(client):
+        """A spawned client whose process is up — the state has_active_turn()
+        actually gates on (with no process it is False for any flag value)."""
+        client._process = types.SimpleNamespace(returncode=None)
+        return client
+
+    def test_no_turn_in_flight_before_first_prompt(self):
+        # has_active_turn() gates the destructive reset behind a model switch.
+        # _turn_done left clear at construction made a spawned-but-never-
+        # prompted client report a turn it never had, so the switch answered
+        # 409 "a turn is in flight" forever.
+        client = self._with_live_process(AcpClient())
+        assert not client.has_active_turn()
+
+    def test_active_turn_still_seen_once_a_prompt_starts(self):
+        # The guard must keep its teeth: every prompt entry point clears
+        # _turn_done just before _send_prompt, and that must still read active.
+        client = self._with_live_process(AcpClient())
+        client._turn_done.clear()
+        assert client.has_active_turn()
+
+    def test_no_turn_in_flight_after_respawn_reset(self):
+        # _reset_state() rebuilds the Event and clears _cancelled; both halves
+        # of has_active_turn() must agree that a respawned client is idle.
+        client = AcpClient()
+        client._turn_done.clear()  # mid-turn
+        client._reset_state()
+        assert client._turn_done.is_set()
+        assert not client._cancelled
+
 
 class TestAcpClientToolAudit:
     """Covers the _maybe_audit_tool_call ACP-layer SEL emit (worker-pool path)."""
