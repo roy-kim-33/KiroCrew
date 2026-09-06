@@ -398,7 +398,6 @@ export function ChatPanel() {
   const visionMode = (mcCfg?.agent as Record<string, unknown> | undefined)?.image_input_mode as string | undefined ?? 'auto'
   const visionRedirect = (mcCfg?.agent as Record<string, unknown> | undefined)?.image_redirect as string | undefined ?? 'subagent'
   const visionFallback = (mcCfg?.agent as Record<string, unknown> | undefined)?.vision_fallback_model as string | undefined ?? 'cmc/mimo-v2.5'
-  const fallbackOptions = ['cmc/mimo-v2.5', 'cmc/Kimi-K2.6', 'cmc/GLM-5.2', 'cmc/deepseek-v4-pro', 'ol/kimi-k2.6', 'ol/glm-5.2', 'oc/kimi-k2.6', 'oc/glm-5.2', 'oc/mimo-v2.5', 'ag/gemini-3-flash', 'ag/gemini-3.6-flash-high', 'cx/gpt-5.6-luna']
   const visionModeMut = useMutation({
     mutationFn: (v: string) => api.patchConfig('agent.image_input_mode', v),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['kirocrewConfig'] }),
@@ -458,6 +457,12 @@ export function ChatPanel() {
   // picker still overrides them per-slot; nothing here touches live sessions.
   // Same query key as every other model picker so the list is fetched once.
   const availableModels = useAvailableModels()
+  // Vision-fallback candidates come from the LIVE model list, not a literal.
+  // The hardcoded list this replaced was a CLIProxyAPI snapshot (cmc/, ol/,
+  // oc/ families), so on any other router it offered models the backend does
+  // not serve — kimi/GLM rows that survive a model_whitelist because this
+  // select never consulted /api/models — while hiding the ones it does.
+  const fallbackOptions = availableModels.filter(m => m.supportsVision).map(m => m.name)
   // '' in config means "unset" and resolves the same way 'auto' does, so both
   // render as the 'auto' option rather than as a missing selection.
   const defaultModel = mcCfg?.agent?.model || 'auto'
