@@ -1057,6 +1057,15 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "occurrence": 1
   },
   {
+    "id": "chat.plain-diffs",
+    "label": "Plain diffs",
+    "labelKey": "settings.chat.plainDiff.label",
+    "description": "Render diffs as plain unified-diff text instead of syntax-highlighted colour. Uses less memory on large diffs.",
+    "tab": "chat",
+    "type": "toggle",
+    "occurrence": 1
+  },
+  {
     "id": "chat.pr-and-issue-chips-on-session-cards",
     "label": "PR and Issue Chips on Session Cards",
     "labelKey": "pages.settings.chatPanel.session_card_source_links",
@@ -1240,11 +1249,19 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "occurrence": 1
   },
   {
+<<<<<<< HEAD
     "id": "chat.vision-fallback-model",
     "label": "Vision fallback model",
     "description": "Picker-spelling id the describe/switch path uses (must be vision-capable).",
     "tab": "chat",
     "type": "select",
+=======
+    "id": "chat.what-enter-does-while-the-agent-is-working",
+    "label": "What Enter does while the agent is working",
+    "labelKey": "pages.settings.chatPanel.what_enter_does_while_the_agent_is_working",
+    "tab": "chat",
+    "type": "buttonGroup",
+>>>>>>> upstream/main
     "occurrence": 1
   },
   {
@@ -1311,6 +1328,24 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "occurrence": 1
   },
   {
+    "id": "developer.chat-on-a-crew",
+    "label": "Chat on a crew",
+    "labelKey": "pages.developer.featurePreviewsTab.chat_on_a_crew",
+    "description": "Adds “New chat on crew” to the create menu, which starts a session on a remote instance — another machine you have connected under Settings > Remote Instances. Unfinished: the session opens in that instance’s own pane and is not listed in this dashboard’s sessions yet, so to return to it later, switch to that instance’s pane.",
+    "tab": "developer",
+    "type": "toggle",
+    "occurrence": 1
+  },
+  {
+    "id": "developer.crew-members-and-crew-mode",
+    "label": "Crew Members and Crew Mode",
+    "labelKey": "pages.developer.featurePreviewsTab.crew",
+    "description": "The Crew Members page and Crew Mode chats. Both are still being built, so neither is offered until you turn this on.",
+    "tab": "developer",
+    "type": "toggle",
+    "occurrence": 1
+  },
+  {
     "id": "developer.developer-mode",
     "label": "Developer Mode",
     "labelKey": "pages.settings.developerPanel.developer_mode",
@@ -1324,6 +1359,15 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "label": "Run a local gateway",
     "labelKey": "pages.settings.developerPanel.run_a_local_gateway",
     "description": "Start a gateway on this machine. Turn it off to use Kiro Crew as a client only, connecting to the gateway you have configured instead of running one here. Takes effect next time you open the app.",
+    "tab": "developer",
+    "type": "toggle",
+    "occurrence": 1
+  },
+  {
+    "id": "developer.webhooks",
+    "label": "Webhooks",
+    "labelKey": "pages.developer.featurePreviewsTab.webhooks",
+    "description": "Inbound webhook tokens, registered contexts, and run history. The API works; the page is not finished.",
     "tab": "developer",
     "type": "toggle",
     "occurrence": 1
@@ -1435,15 +1479,6 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "Choose a color palette for your sidebar sessions.",
     "tab": "display",
     "type": "buttonGroup",
-    "occurrence": 1
-  },
-  {
-    "id": "display.plain-diffs",
-    "label": "Plain diffs",
-    "labelKey": "settings.display.plainDiff.label",
-    "description": "Render diffs as plain unified-diff text instead of syntax-highlighted colour. Uses less memory on large diffs.",
-    "tab": "display",
-    "type": "toggle",
     "occurrence": 1
   },
   {
@@ -1836,7 +1871,8 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "labelKey": "pages.settings.sttSettings.language",
     "tab": "voice",
     "type": "select",
-    "occurrence": 1
+    "occurrence": 1,
+    "configKey": "stt.language_code"
   },
   {
     "id": "voice.live-transcript-refresh-ms",
@@ -1881,7 +1917,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "voice.piper-binary",
     "label": "Piper Binary",
     "labelKey": "pages.settings.voicePanel.piper_binary",
-    "description": "Path to the piper executable. Leave blank to auto-detect on PATH or ~/piper-venv/bin/piper",
+    "description": "Path to the piper executable. Leave blank to auto-detect on PATH or in a ~/piper-venv install",
     "tab": "voice",
     "type": "input",
     "occurrence": 1
@@ -1890,7 +1926,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "voice.piper-model",
     "label": "Piper Model",
     "labelKey": "pages.settings.voicePanel.piper_model",
-    "description": "Path to the Piper voice model (.onnx). Required — download from github.com/rhasspy/piper",
+    "description": "Path to the Piper voice model (.onnx). Required — download from huggingface.co/rhasspy/piper-voices",
     "tab": "voice",
     "type": "input",
     "occurrence": 1
@@ -1909,10 +1945,11 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "voice.provider-2",
     "label": "Provider",
     "labelKey": "pages.settings.voicePanel.provider",
-    "description": "Piper runs locally and offline; Amazon Polly uses AWS credentials + network",
+    "description": "The built-in engine needs no setup; Piper is offline with better quality; Amazon Polly uses AWS credentials + network",
     "tab": "voice",
     "type": "select",
-    "occurrence": 2
+    "occurrence": 2,
+    "settingId": "voice.provider-2"
   },
   {
     "id": "voice.shortcut-key",
@@ -1926,7 +1963,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "voice.speed",
     "label": "Speed",
     "labelKey": "pages.settings.voicePanel.speed",
-    "description": "Speech rate",
+    "description": "Speech rate for spoken replies (built-in engine)",
     "tab": "voice",
     "type": "select",
     "occurrence": 1
@@ -1935,10 +1972,19 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "voice.speed-2",
     "label": "Speed",
     "labelKey": "pages.settings.voicePanel.speed",
-    "description": "Piper speech speed (length scale)",
+    "description": "Speech rate for spoken replies (Amazon Polly)",
     "tab": "voice",
     "type": "select",
     "occurrence": 2
+  },
+  {
+    "id": "voice.speed-3",
+    "label": "Speed",
+    "labelKey": "pages.settings.voicePanel.speed",
+    "description": "Piper speech speed (length scale)",
+    "tab": "voice",
+    "type": "select",
+    "occurrence": 3
   },
   {
     "id": "voice.streaming",
@@ -1963,9 +2009,18 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "voice.voice",
     "label": "Voice",
     "labelKey": "pages.settings.voicePanel.voice",
-    "description": "Amazon Polly voice for TTS",
+    "description": "Voice from the host's built-in speech engine",
     "tab": "voice",
     "type": "select",
     "occurrence": 1
+  },
+  {
+    "id": "voice.voice-2",
+    "label": "Voice",
+    "labelKey": "pages.settings.voicePanel.voice",
+    "description": "Amazon Polly voice for TTS",
+    "tab": "voice",
+    "type": "select",
+    "occurrence": 2
   }
 ]

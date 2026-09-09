@@ -519,9 +519,9 @@ async def delete_item(request: web.Request) -> web.Response:
     await asyncio.to_thread(_delete_and_audit)
     # A now-empty source is reclaimed by the store's own orphan rule on the next
     # open, which checks the document-state tables, in-flight jobs and the location
-    # table first. Deleting the row here instead raised on the foreign keys those
-    # tables hold -- after the item delete had already committed -- and dropped a
-    # source that still held documents by location.
+    # table first. Deleting the row here instead raises on the foreign keys those
+    # tables hold -- after the item delete has already committed -- and drops a
+    # source that still holds documents by location.
     return web.json_response({"ok": True})
 
 
@@ -568,9 +568,20 @@ async def get_entity_graph(request: web.Request) -> web.Response:
         depth = min(5, max(1, int(request.query.get("depth", 2) or 2)))
     except ValueError:
         return web.json_response({"error": "invalid depth"}, status=400)
-    if not store.graph.has_node(entity_id):
+    # Materialise the graph off-loop before touching it. The store defers the
+    # load to its first reader, and every `.graph` read below runs on
+    # the event loop, where the loop-stall watchdog is armed -- so the scan has
+    # to happen on a worker thread, the same way this module already offloads
+    # the store's SQL.
+    await asyncio.to_thread(store.ensure_graph_loaded)
+    # get_entity_subgraph pins one graph reference internally and does the
+    # existence check against it, so the 404 decision and the walk read the SAME
+    # snapshot even if a worker-thread mutation swaps in a rebuilt graph; it
+    # returns None when the entity is absent.
+    result = store.get_entity_subgraph(entity_id, depth)
+    if result is None:
         return web.json_response({"error": "entity not found"}, status=404)
-    return web.json_response(store.get_entity_subgraph(entity_id, depth))
+    return web.json_response(result)
 
 
 async def get_entity_items(request: web.Request) -> web.Response:
@@ -649,6 +660,18 @@ async def get_full_graph(request: web.Request) -> web.Response:
     except ValueError:
         return web.json_response({"error": "invalid limit"}, status=400)
 
+    # Materialise the graph off-loop before any `.graph` read below. The store
+    # defers the load to its first reader; this handler already offloads its SQL
+    # for the same reason, and an inline graph read would stall the event loop.
+    await asyncio.to_thread(store.ensure_graph_loaded)
+
+    # Pin one graph reference for every read below. ``_load_graph`` publishes a
+    # rebuilt graph by swapping ``store._graph``; re-reading
+    # ``store.graph`` at each step (degree ranking, then per-node attribute
+    # reads, then edges) could otherwise mix an old and a new graph and drop a
+    # node between steps. One capture means this response is a single snapshot.
+    graph = store.graph
+
     # Source filter: restrict to entities mentioned in items from specific sources
     source_id_param = request.query.get("source_id", "").strip()
     if source_id_param:
@@ -679,18 +702,18 @@ async def get_full_graph(request: web.Request) -> web.Response:
             return web.json_response({"nodes": [], "edges": []})
         # Rank allowed entities by degree, take top N
         nodes_by_degree = sorted(
-            allowed_entities, key=lambda n: store.graph.degree(n) if store.graph.has_node(n) else 0, reverse=True
+            allowed_entities, key=lambda n: graph.degree(n) if graph.has_node(n) else 0, reverse=True
         )[:limit]
     else:
-        nodes_by_degree = sorted(store.graph.nodes, key=lambda n: store.graph.degree(n), reverse=True)[:limit]
+        nodes_by_degree = sorted(graph.nodes, key=lambda n: graph.degree(n), reverse=True)[:limit]
 
     if not nodes_by_degree:
         return web.json_response({"nodes": [], "edges": []})
     node_set = set(nodes_by_degree)
-    nodes = [{"id": n, "name": store.graph.nodes[n].get("name"), "type": store.graph.nodes[n].get("entity_type")}
-             for n in node_set if store.graph.has_node(n)]
+    nodes = [{"id": n, "name": graph.nodes[n].get("name"), "type": graph.nodes[n].get("entity_type")}
+             for n in node_set if graph.has_node(n)]
     edges = [{"source": u, "target": v, "type": d.get("relation_type"), "weight": d.get("weight")}
-             for u, v, d in store.graph.edges(data=True) if u in node_set and v in node_set]
+             for u, v, d in graph.edges(data=True) if u in node_set and v in node_set]
     return web.json_response({"nodes": nodes, "edges": edges})
 
 
@@ -761,6 +784,30 @@ async def source_counts(request: web.Request) -> web.Response:
     return web.json_response({"counts": counts, "total": total_row[0]})
 
 
+def _source_rows(store, uri_filter: str | None) -> list:
+    """The sources listing with per-source item counts, in one off-loop take.
+
+    Sync on purpose: the dashboard polls the sources list while a source is
+    syncing -- exactly the window in which the knowledge DB is contended --
+    and the LEFT JOIN aggregates over ``items``, which grows without bound.
+    The caller dispatches this to a worker thread; ``store.db`` is
+    thread-local, so the thread gets its own connection.
+    """
+    if uri_filter:
+        resolved_filter = str(Path(uri_filter).resolve()) if uri_filter.startswith('/') else uri_filter
+        return store.db.execute(
+            "SELECT s.*, COALESCE(c.cnt, 0) AS item_count "
+            "FROM sources s LEFT JOIN (SELECT source_id, COUNT(*) AS cnt FROM items GROUP BY source_id) c "
+            "ON s.id = c.source_id WHERE s.uri = ? ORDER BY s.updated_at DESC",
+            (resolved_filter,)
+        ).fetchall()
+    return store.db.execute(
+        "SELECT s.*, COALESCE(c.cnt, 0) AS item_count "
+        "FROM sources s LEFT JOIN (SELECT source_id, COUNT(*) AS cnt FROM items GROUP BY source_id) c "
+        "ON s.id = c.source_id ORDER BY s.updated_at DESC"
+    ).fetchall()
+
+
 async def list_sources(request: web.Request) -> web.Response:
     """GET /api/knowledge/sources.
 
@@ -771,21 +818,7 @@ async def list_sources(request: web.Request) -> web.Response:
     cost surfaces is a credit balance after the fact.
     """
     store = _store(request)
-    uri_filter = request.query.get("uri")
-    if uri_filter:
-        resolved_filter = str(Path(uri_filter).resolve()) if uri_filter.startswith('/') else uri_filter
-        rows = store.db.execute(
-            "SELECT s.*, COALESCE(c.cnt, 0) AS item_count "
-            "FROM sources s LEFT JOIN (SELECT source_id, COUNT(*) AS cnt FROM items GROUP BY source_id) c "
-            "ON s.id = c.source_id WHERE s.uri = ? ORDER BY s.updated_at DESC",
-            (resolved_filter,)
-        ).fetchall()
-    else:
-        rows = store.db.execute(
-            "SELECT s.*, COALESCE(c.cnt, 0) AS item_count "
-            "FROM sources s LEFT JOIN (SELECT source_id, COUNT(*) AS cnt FROM items GROUP BY source_id) c "
-            "ON s.id = c.source_id ORDER BY s.updated_at DESC"
-        ).fetchall()
+    rows = await asyncio.to_thread(_source_rows, store, request.query.get("uri"))
     sources = [dict(r) for r in rows]
     # Aggregate scans plus a size stat per outstanding file, and the dashboard polls
     # this list while a source is syncing -- offloaded so a large folder cannot stall
@@ -1290,14 +1323,25 @@ async def resume_source(request: web.Request) -> web.Response:
     return web.json_response({"status": "scanning"})
 
 
+def _folder_file_rows(store, source_id: str) -> list:
+    """A source's per-file scan state, in one off-loop take.
+
+    Sync on purpose: the dashboard polls this every few seconds during a scan
+    -- exactly the window in which the knowledge DB is contended. The caller
+    dispatches this to a worker thread; ``store.db`` is thread-local, so the
+    thread gets its own connection.
+    """
+    return store.db.execute(
+        "SELECT file_path, status, error_message, mtime, content_hash, item_ids, last_seen "
+        "FROM folder_file_state WHERE source_id = ? ORDER BY last_seen DESC",
+        (source_id,)).fetchall()
+
+
 async def list_source_files(request: web.Request) -> web.Response:
     """GET /api/knowledge/sources/{id}/files -- list files with scan status."""
     store = _store(request)
     source_id = request.match_info["id"]
-    rows = store.db.execute(
-        "SELECT file_path, status, error_message, mtime, content_hash, item_ids, last_seen "
-        "FROM folder_file_state WHERE source_id = ? ORDER BY last_seen DESC",
-        (source_id,)).fetchall()
+    rows = await asyncio.to_thread(_folder_file_rows, store, source_id)
     files = [{"file_path": r["file_path"], "status": r["status"] or "pending",
               "error_message": _redact(r["error_message"]) if r["error_message"] else None,
               "mtime": r["mtime"],
@@ -1510,10 +1554,9 @@ async def ingest_file(request: web.Request) -> web.Response:
     try:
         # The signature gate (CWE-434) and the byte ceiling are both enforced by
         # the shared streaming path, which judges the leading bytes while they
-        # are still in memory. That is stricter than this call site used to be:
-        # it wrote the whole file first and only then sniffed, so rejected
-        # content did reach the filesystem. Cleanup on cancellation is the
-        # helper's, not this function's -- see part_stream's docstring.
+        # are still in memory, so rejected content never reaches the filesystem.
+        # Cleanup on cancellation is the helper's, not this function's -- see
+        # part_stream's docstring.
         await part_stream.stream_part_to_file(
             field,  # type: ignore[arg-type]
             staged,
@@ -1713,16 +1756,29 @@ async def import_bundle(request: web.Request) -> web.Response:
 # ---------- Route registration ----------
 
 
-async def get_embedding_status(request: web.Request) -> web.Response:
-    """GET /api/knowledge/embedding/status -- embedding config and progress."""
-    store = _store(request)
-    embedder = request.app.get("knowledge_embedder")
+def _embedding_counts(store) -> tuple[int, int]:
+    """(total active items, active items with a vector) in one off-loop take.
+
+    Sync on purpose: the dashboard polls the status endpoint repeatedly, and
+    running these COUNTs on the gateway loop busy-waits every task (watchdog
+    heartbeat included) whenever the knowledge DB is contended. The caller
+    dispatches this to a worker thread; ``store.db`` is thread-local, so the
+    thread gets its own connection.
+    """
     total = store.db.execute(
         "SELECT COUNT(*) as c FROM items WHERE status = 'active'"
     ).fetchone()["c"]
     embedded = store.db.execute(
         "SELECT COUNT(*) as c FROM items WHERE status = 'active' AND embedding IS NOT NULL"
     ).fetchone()["c"]
+    return total, embedded
+
+
+async def get_embedding_status(request: web.Request) -> web.Response:
+    """GET /api/knowledge/embedding/status -- embedding config and progress."""
+    store = _store(request)
+    embedder = request.app.get("knowledge_embedder")
+    total, embedded = await asyncio.to_thread(_embedding_counts, store)
     # Polled every 30s by the frontend — loop-safe probe.
     available = await embedder.is_available_async() if embedder else False
     return web.json_response({

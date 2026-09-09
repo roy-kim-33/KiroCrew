@@ -122,10 +122,17 @@ Current status:
   Defender's post-install scanning. macOS and Linux still redirect bytecode out
   of the signed/read-only app tree. The loading screen retains its extended
   Windows handoff window as a slow-machine fallback; a child exit or spawn error
-  still fails immediately and includes the launch-log cause. CI starts the
-  just-installed bundled interpreter against an isolated data home and requires
-  `/api/ready` within 30 seconds, so both the packaged caches and the full gateway
-  handoff are covered rather than only a synthetic import benchmark.
+  still fails immediately and includes the launch-log cause.
+  `.github/scripts/test-windows-installer.ps1` can start the just-installed
+  bundled interpreter against an isolated data home and require `/api/ready`
+  within 30 seconds, covering both the packaged caches and the full gateway
+  handoff — but it is a **real-artifact check, not a CI gate**: the installer
+  job builds the NSIS package over a synthetic backend stub, so it has no
+  bundled interpreter to start and runs the script with
+  `-SkipGatewayValidation`. What CI enforces on every push is the native
+  installer's performance ceiling and its install-location contract; run the
+  script without that switch against a genuine backend payload to exercise the
+  gateway handoff.
 
 The source install below remains the fully supported path.
 
@@ -285,7 +292,7 @@ while the other 503s. Concretely:
 | Browser automation (`playwright-cli`) | works (`npm install -g @playwright/cli@latest`, needs Node.js 20 or newer) |
 | Vector memory / embeddings | works — embeddings run **in-process** through the vendored llama-cpp-python (`_vendor/llama_cpp_libs/win_amd64`), which loads the Qwen3-Embedding-0.6B GGUF from `~/.kiro/crew/models`. No remote endpoint, no Docker and no Ollama server is involved on any platform |
 | STT (whisper / optional cloud transcription) | works |
-| Voice reply (Piper TTS) | not yet — upstream rhasspy/piper ships no Windows binary; Polly (optional) works if the `aws` CLI is present **and** the `agent.sandbox_allow_unsandboxed_exec` opt-in above is set — the `aws polly` spawn routes through `wrap_argv`, which fail-closes where no OS sandbox backend exists. Without it synthesis returns no audio and the log names that setting |
+| Voice reply | works out of the box on the default `system` provider: it drives `System.Speech` through Windows PowerShell 5.1, needs no install, and deliberately does NOT route through `wrap_argv`, so the missing sandbox backend does not block it. `piper` and `polly` DO route through `wrap_argv` and therefore need the `agent.sandbox_allow_unsandboxed_exec` opt-in above; without it synthesis returns no audio and the log names that setting. `pip install piper-tts` does ship a Windows x64 wheel, so piper itself is installable |
 | SSH tunnel (`kirocrew cloud` remote dashboard) | not yet — needs the OpenSSH client on `PATH` and a signal-handling audit |
 | MCP server tool listing (dashboard MCP page, `kirocrew doctor`) | **built-in servers work, no opt-in** — `kirocrew-core` / `-cron` / `-computer` are probed for real: their command line is derived entirely inside the package (never user-config text), so the first-party carve-out spawns the handshake probe unconfined (env-scrubbed, SEL-audited as `unconfined`) even with no sandbox backend. When that probe cannot run (a transient sandbox failure, a governance sandbox floor, or a customized command for the server), the listing falls back to reading the package's own tool declaration and logs a WARNING noting that `ok` then means "declared" rather than "handshake succeeded". A **third-party** server has no declaration to read and never gets the carve-out, so its listing needs the `agent.sandbox_allow_unsandboxed_exec` opt-in — its binary is named by config and spawning it is what the sandbox exists to confine. The third-party server itself is unaffected: kiro-cli launches it from the agent config without this probe, so its tools still work in chat |
 | MCP gateway (opt-in, OFF by default) | works — a named-pipe transport replaces the AF_UNIX socket, and the peer check uses `GetNamedPipeClientProcessId` + a SID comparison in place of `SO_PEERCRED`. Still opt-in: set `mcp_gateway.enabled` to turn it on |
@@ -422,7 +429,7 @@ The scope is deliberately only the signal-0 *probe* form. The tree contains many
 raw POSIX call sites — `fcntl`, `resource`, `os.killpg`, `pty`, `termios` — and
 nearly all are legitimately POSIX-gated implementation detail, so auditing them
 here would bury the signal in noise; those are governed by the shim table in
-`AGENTS.md` and by review. What makes signal-0 worth its own gate is that getting
+[platform-compat](../system-specs/common/platform-compat.md) and by review. What makes signal-0 worth its own gate is that getting
 it wrong is destructive rather than merely unavailable, and that the added-line CI
 check cannot see a probe which arrives by a file move or a rebase. This test reads
 the whole tree on every run.
@@ -504,7 +511,7 @@ branches read `/proc`, `sysctl` or `resource` instead of calling Win32.
 
 Taking `ctypes.POINTER()` is what pins the type, so a struct that is only ever
 instantiated (never pointed at) does not leak — but the distinction is too subtle
-to rely on, and `test_platform_compat.py::TestWin32StructsAreModuleScoped`
+to rely on, and `test_platform_compat.py::TestCtypesStructsAreModuleScoped`
 enforces the blanket rule by parsing each helper's source. That check runs on the
 POSIX fleet too, where the Windows branches never execute.
 
@@ -579,6 +586,6 @@ stay Windows-skipped in `test/windows-expected-failures.txt`.
 
 - [README](../../README.md) — quick-start Platforms note
 - [install](install.md) — the build-target table shared with macOS and Linux
-- [AGENTS.md](../../AGENTS.md) — the cross-platform shim table
+- [platform-compat](../system-specs/common/platform-compat.md) — the cross-platform shim table
 - `src/kiro_crew/platform_compat.py` — the cross-platform shim
 - `make.ps1` — the Windows build driver
