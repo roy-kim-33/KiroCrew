@@ -532,6 +532,7 @@ def _governance_denial(ev: object, *, session_key: str, agent: str) -> str:
             app="auto-improvement",
             tool_kind=tool_kind,
             raw_params=getattr(ev, "raw_tool_params", None),
+            diff_path=getattr(ev, "diff_path", "") or "",
             command=command or None,
             # From the EVENT, not derived from the command. `HookManager.on_tool_call` denies
             # when `is_shell and not command` — a shell tool whose command could not be
@@ -1646,7 +1647,7 @@ def _repro_test_dir(worktree: Path) -> str:
     The prompt used to hard-code ``test/``, but a repo using ``tests/`` (plural) then got
     a reproducing test written into a directory that does not exist, so T2 could never
     collect it and EVERY candidate failed ``test_invalid`` regardless of fix quality.
-    Found by running docs/system-specs/modules/auto-improvement-test-plan.md against Zedmor/chess_test, which uses ``tests/``.
+    Found by running docs/system-specs/modules/auto-improvement.md against Zedmor/chess_test, which uses ``tests/``.
 
     The edit fence already permits both (``_ADDABLE_TEST_GLOBS``), so only the
     instruction was wrong. Prefers an EXISTING directory; falls back to ``test``.

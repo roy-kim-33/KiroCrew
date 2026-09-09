@@ -717,21 +717,30 @@ class TestRestoreIsAllOrNothing:
         def _no_writes_here(*args: object, **kwargs: object) -> None:
             raise AssertionError(f"the full-restore path wrote by name: {args!r}")
 
-        monkeypatch.setattr(session_storage, "atomic_write", _no_writes_here)
-        # A cleanup that DECLINES, which is what makes the stale listing reachable: the
-        # batch stays instead of going away with its manifest.
-        monkeypatch.setattr(session_storage, "_remove_emptied_batch", lambda *a, **k: False)
+        # Scoped to just these two patches: `monkeypatch` is the same instance
+        # the `stores` fixture pins KIROCREW_HOME/KIRO_HOME with, and
+        # `monkeypatch.undo()` unwinds its WHOLE stack in LIFO order, including
+        # entries pushed before this test ever ran. An `undo()` here to restore
+        # `atomic_write` also unpins the data home, and the `empty_trash()` call
+        # below then resolves `trash_root()` against the operator's real
+        # `~/.kiro/crew` and writes a real `trash/session-storage.lock`.
+        with pytest.MonkeyPatch.context() as scoped:
+            scoped.setattr(session_storage, "atomic_write", _no_writes_here)
+            # A cleanup that DECLINES, which is what makes the stale listing reachable: the
+            # batch stays instead of going away with its manifest.
+            scoped.setattr(session_storage, "_remove_emptied_batch", lambda *a, **k: False)
 
-        assert session_storage.restore(batch.batch_id) == 1
+            assert session_storage.restore(batch.batch_id) == 1
 
-        assert (kiro_home / "sessions" / "cli" / "aaaa1111.jsonl").read_bytes() == b"c" * 8
-        kept = session_storage.list_trash()
-        assert [b.batch_id for b in kept] == [batch.batch_id], "kept, not removed"
-        # The accepted residual, pinned so that clearing it later is a deliberate change.
-        assert kept[0].sessions == 1, "the listing goes stale rather than being rewritten"
+            assert (kiro_home / "sessions" / "cli" / "aaaa1111.jsonl").read_bytes() == b"c" * 8
+            kept = session_storage.list_trash()
+            assert [b.batch_id for b in kept] == [batch.batch_id], "kept, not removed"
+            # The accepted residual, pinned so that clearing it later is a deliberate change.
+            assert kept[0].sessions == 1, "the listing goes stale rather than being rewritten"
 
         # And the user is not stuck with it: the explicit empty still takes the batch.
-        monkeypatch.undo()
+        # KIROCREW_HOME/KIRO_HOME (set by the `stores` fixture, outside the `with`
+        # above) are still pinned here.
         session_storage.empty_trash()
         assert session_storage.list_trash() == []
 
@@ -1674,19 +1683,27 @@ class TestUntrustedNamesAreLogSafeOutsideListTrash:
         planted = OSError(13, "Permission denied", str(forged / self._FORGED_NAME))
 
         # ``session_storage.os`` is the global module, so this patch is also seen
-        # by ``shutil.rmtree`` during fixture teardown (which passes ``topdown=``
-        # on Windows).  Accept the real signature and divert only the walk of the
-        # forged batch, delegating every other call to the genuine ``os.walk``.
+        # by other walk users during teardown. Accept the real signature and
+        # divert only the walk of the forged batch, delegating every other call
+        # to the genuine function. Both mechanisms are patched because
+        # ``_unlisted_files`` picks fwalk-vs-walk at call time by availability
+        # (fwalk does not exist on Windows).
+        real_fwalk = getattr(os, "fwalk", None)
         real_walk = os.walk
 
-        def _walk(top, *args, onerror=None, **kwargs):  # type: ignore[no-untyped-def]
-            if Path(top) == forged:
-                assert callable(onerror)
-                onerror(planted)
-                return iter(())
-            return real_walk(top, *args, onerror=onerror, **kwargs)
+        def _divert(real):  # type: ignore[no-untyped-def]
+            def inner(top, *args, onerror=None, **kwargs):  # type: ignore[no-untyped-def]
+                if Path(top) == forged:
+                    assert callable(onerror)
+                    onerror(planted)
+                    return iter(())
+                return real(top, *args, onerror=onerror, **kwargs)
 
-        monkeypatch.setattr(session_storage.os, "walk", _walk)
+            return inner
+
+        monkeypatch.setattr(session_storage.os, "walk", _divert(real_walk))
+        if real_fwalk is not None:
+            monkeypatch.setattr(session_storage.os, "fwalk", _divert(real_fwalk))
         monkeypatch.setattr(session_storage, "_manifest_rels", lambda batch: [])
 
         with pytest.raises(SessionStorageError) as raised:
@@ -2307,7 +2324,10 @@ class TestSharedStoreRefusal:
                 onerror(OSError(5, "simulated read failure"))
             return iter(())
 
+        # Both mechanisms: ``_unlisted_files`` picks fwalk-vs-walk at call time
+        # by availability (fwalk does not exist on Windows).
         monkeypatch.setattr(session_storage.os, "walk", failing_walk)
+        monkeypatch.setattr(session_storage.os, "fwalk", failing_walk, raising=False)
 
         assert session_storage.empty_trash([batch.batch_id]) == 0
         # The batch survives, so nothing was destroyed on an unverifiable scan.

@@ -87,7 +87,13 @@ MONITOR_PUBLIC_FIELDS = (
 )
 
 
-def _is_finite_non_negative_number(value: object) -> bool:
+def is_finite_non_negative_number(value: object) -> bool:
+    """Whether *value* is a real, finite, non-negative timestamp-shaped number.
+
+    ``bool`` is excluded even though it is an ``int`` subclass, and an ``int``
+    too large to convert to a float (``10**400``) is rejected rather than
+    letting ``math.isfinite``'s ``OverflowError`` escape to the caller.
+    """
     if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
         return False
     try:
@@ -175,12 +181,7 @@ class MonitorActionCompletion:
                 raise ValueError(f"{name} must be a non-empty string")
         if not isinstance(self.disposition, MonitorActionDisposition):
             raise ValueError("disposition must be a MonitorActionDisposition")
-        if (
-            isinstance(self.completed_ts, bool)
-            or not isinstance(self.completed_ts, (int, float))
-            or not math.isfinite(self.completed_ts)
-            or self.completed_ts < 0
-        ):
+        if not is_finite_non_negative_number(self.completed_ts):
             raise ValueError("completed_ts must be a finite non-negative number")
         for name in ("input_tokens", "output_tokens"):
             value = getattr(self, name)
@@ -257,6 +258,53 @@ class MonitorObservation:
             raise ValueError("supplemental_provider_error must be a ProviderErrorKind")
 
 
+@dataclass(frozen=True)
+class MonitorVerdict:
+    """One decision and the observations it was rendered against.
+
+    The decision is a *field* rather than the return value of the decision
+    engine. A bare :class:`MonitorDecision` is an effect SELECTOR: it says what
+    the controller should do, and nothing about what it saw. The evidence is not
+    unreachable -- ``monitoring.controller.format_monitor_wake`` rebuilds both
+    the changed facts and the wake text downstream, from
+    ``MonitorState.last_observation`` and ``MonitorState.wake_instructions`` --
+    but it is reachable only by re-deriving it from persisted state the verdict
+    never named.
+
+    That indirection is what keeps a subject reduced to one comparable
+    fingerprint: a consumer obliged to rebuild the evidence itself cannot be
+    handed a list it never asked for, so a second entry has nowhere to go.
+    Naming the evidence on the verdict is what removes the re-derivation.
+
+    ``entries`` is plural from the start. A subject that reports several
+    independent conditions -- a failing check, a stale review stamp, an
+    un-dispositioned finding -- is the reason this type exists, even though a
+    single-subject probe fills it with exactly one entry today.
+
+    There is deliberately no operator-facing text field here. Delivery composes
+    the wake envelope from durable state in
+    ``monitoring.controller.format_monitor_wake``, so a text field on the verdict
+    would be a second way to say the same thing with nothing reading it. The
+    change that gives such a field a reader is the one that should add it, where
+    a single test can show the text being produced AND consumed.
+
+    Nothing here may name a provider. A fact meaningful to only one monitored
+    kind belongs on that kind's observation, never on the shared verdict.
+    """
+
+    decision: MonitorDecision
+    entries: tuple[MonitorObservation, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.decision, MonitorDecision):
+            raise ValueError("decision must be a MonitorDecision")
+        if not isinstance(self.entries, tuple):
+            raise ValueError("entries must be a tuple")
+        for entry in self.entries:
+            if not isinstance(entry, MonitorObservation):
+                raise ValueError("every verdict entry must be a MonitorObservation")
+
+
 @dataclass
 class MonitorState:
     """Restart-durable state for one structured monitor."""
@@ -294,16 +342,15 @@ class MonitorState:
     last_provider_error: ProviderErrorKind | None = None
     #: Adoption metering. Without these two numbers a probe gate that never
     #: fires and a probe gate that is doing its job are indistinguishable from
-    #: the outside -- which is how the earlier attempts at this saving stayed at
-    #: zero adoption, unnoticed, for over a week. ``quiet_ticks`` counts the ticks
-    #: the probe judged QUIET; ``wakes`` counts the turns actually DELIVERED because
-    #: it judged otherwise -- not every non-quiet tick, since a gate that could not
-    #: decide is ``gate_fallbacks`` below and a fire the slot refuses is charged to
-    #: neither. A quiet verdict is
-    #: not the same as a free tick: the streak floor below deliberately delivers on
-    #: one of them, so ``quiet_ticks`` minus ``floor_ticks`` is the count that cost
-    #: no model turn. Saying "cost no turn" here would overstate the saving by
-    #: exactly the floor, which is the one number this PR must not get wrong.
+    #: the outside, so a gate stuck at zero adoption goes unnoticed.
+    #: ``quiet_ticks`` counts the ticks the probe judged QUIET; ``wakes`` counts
+    #: the turns actually DELIVERED because it judged otherwise -- not every
+    #: non-quiet tick, since a gate that could not decide is ``gate_fallbacks``
+    #: below and a fire the slot refuses is charged to neither. A quiet verdict
+    #: is not the same as a free tick: the streak floor below deliberately
+    #: delivers on one of them, so ``quiet_ticks`` minus ``floor_ticks`` is the
+    #: count that cost no model turn. Reading ``quiet_ticks`` alone as "cost no
+    #: turn" overstates the saving by exactly the floor.
     quiet_ticks: int = 0
     wakes: int = 0
     #: Ticks where the gate could not decide, so the tick resolved toward firing on
@@ -399,7 +446,7 @@ class MonitorState:
             "stopped_at",
         ):
             value = getattr(self, name)
-            if not _is_finite_non_negative_number(value):
+            if not is_finite_non_negative_number(value):
                 raise ValueError(f"{name} must be a finite non-negative number")
         for name in (
             "wake_count",
@@ -520,7 +567,7 @@ def monitor_state_from_dict(raw: object) -> MonitorState:
             value = raw.get(key)
             values[key] = value if isinstance(value, str) and value else f"unsupported_{key}"
         created_ts = raw.get("created_ts")
-        values["created_ts"] = created_ts if _is_finite_non_negative_number(created_ts) else 0.0
+        values["created_ts"] = created_ts if is_finite_non_negative_number(created_ts) else 0.0
         values["budgets"] = MonitorBudgets()
         values["_raw_payload"] = deepcopy(raw)
         return MonitorState(**values)
@@ -539,8 +586,6 @@ def monitor_state_from_dict(raw: object) -> MonitorState:
     outcome = values.get("outcome")
     if outcome is not None:
         values["outcome"] = MonitorOutcome(outcome)
-    else:
-        values["outcome"] = None
     disposition = values.get("last_completion_disposition")
     if disposition is not None:
         values["last_completion_disposition"] = MonitorActionDisposition(disposition)
@@ -567,7 +612,7 @@ def quarantine_monitor_state(raw: object) -> MonitorState:
 
     raw_created_ts = raw.get("created_ts")
     created_ts: int | float = 0.0
-    if _is_finite_non_negative_number(raw_created_ts):
+    if is_finite_non_negative_number(raw_created_ts):
         assert isinstance(raw_created_ts, (int, float)) and not isinstance(raw_created_ts, bool)
         created_ts = raw_created_ts
     return MonitorState(

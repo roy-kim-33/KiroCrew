@@ -16,6 +16,7 @@ import pytest
 from hypothesis import HealthCheck, settings
 
 from kiro_crew.safety_override import reset_singleton as _reset_safety_override
+from kiro_crew.safety_override import reset_yolo_policy_state as _reset_yolo_policy_state
 from kiro_crew.slack.client import SlackClientOps
 from kiro_crew.slack.handler import _PHASE_EMOJIS, _build_phase_emojis
 
@@ -67,8 +68,6 @@ settings.register_profile("default", max_examples=20, suppress_health_check=[Hea
 settings.register_profile("thorough", max_examples=100)
 settings.load_profile(os.getenv("HYPOTHESIS_PROFILE", "default"))
 
-# Ensure .hypothesis/tmp exists (build environment may not have it)
-os.makedirs(os.path.join(os.path.dirname(__file__), "..", ".hypothesis", "tmp"), exist_ok=True)
 
 _HAS_GIT = shutil.which("git") is not None
 
@@ -106,6 +105,19 @@ _HAS_SYMLINKS = _can_create_symlink()
 requires_symlinks = pytest.mark.skipif(
     not _HAS_SYMLINKS,
     reason="creating a symlink needs SeCreateSymbolicLinkPrivilege on Windows",
+)
+
+# Captured at import, BEFORE any test can monkeypatch the constant away: tests that
+# simulate the flag's absence must not be confused with a platform that truly lacks it.
+_HAS_O_NOFOLLOW = bool(getattr(os, "O_NOFOLLOW", 0))
+
+requires_o_nofollow = pytest.mark.skipif(
+    not _HAS_O_NOFOLLOW,
+    reason=(
+        "notification import refuses outright without O_NOFOLLOW, because a by-name "
+        "reparse check followed by a by-name open is a check-to-open window; the "
+        "refusal itself is covered by TestNotificationCopyRefusalWithoutONofollow"
+    ),
 )
 
 
@@ -199,6 +211,77 @@ def make_dir_link(link: pathlib.Path, target: pathlib.Path) -> None:
     link.symlink_to(target, target_is_directory=True)
 
 
+def host_abs(*parts: str) -> str:
+    """A fixture path that is absolute on THIS host: ``/opt/shims`` or ``C:\\opt\\shims``.
+
+    Production filters and validates paths with ``os.path.isabs`` -- spec PATH
+    entries, trusted binaries, upload references, socket paths -- and from
+    Python 3.13 ``ntpath.isabs`` rejects a bare leading slash (a path
+    without a drive is relative to the current drive). A POSIX literal such as
+    ``"/usr/bin"`` therefore changes meaning per interpreter on Windows: absolute
+    on 3.12, relative on 3.13, so a test written with one silently exercises the
+    rejection branch there. Spell fixtures through this helper instead; it touches
+    no filesystem, and its result is what ``os.path.isabs`` accepts everywhere.
+    """
+    return os.path.abspath(os.path.join(os.sep, *parts))
+
+
+def forget_env_at_teardown(monkeypatch, *names: str) -> None:
+    """Make ``monkeypatch`` remove *names* from ``os.environ`` at teardown.
+
+    For a variable the code under test is about to WRITE (a saved channel token
+    exported for the running gateway, a ``PORT`` a booted server publishes, a
+    ``--env`` a CLI applies), neither obvious spelling restores the environment:
+
+    * ``monkeypatch.delenv(name, raising=False)`` BEFORE the write records nothing
+      when the variable is absent -- pytest only records an undo for a key that
+      existed -- so the value written later survives the test;
+    * ``monkeypatch.delenv(name)`` AFTER the write records the written value as
+      the thing to restore, so teardown puts the token BACK.
+
+    Both shapes were found leaking across tests in a full run. This records the
+    current state (absent or present) as the undo, so teardown returns the
+    variable to exactly what it was before the test, whatever the test wrote.
+    """
+    for name in names:
+        if name in os.environ:
+            monkeypatch.delenv(name)
+        else:
+            monkeypatch.setenv(name, "")  # records "was absent" as the undo
+            monkeypatch.delenv(name)
+
+
+def cap_project_root_walk(monkeypatch, ceiling: pathlib.Path) -> None:
+    """Make ``kiro_crew.artifact_source`` see NO project root above ``ceiling``.
+
+    ``classify_source`` walks up from a file looking for ``PROJECT_ROOT_MARKERS``
+    (``.git``, ``Makefile``, ``package.json``, ``.kiro``, ...), so a test that
+    asserts COPY for "a plain directory" under ``tmp_path`` is also asserting
+    that nothing ABOVE ``tmp_path`` carries a marker. That is not the test's to
+    decide: pytest's temp root sits wherever ``TMPDIR`` points, and a checkout or
+    a ``.kiro`` workspace a few levels up turns the whole temp tree into a
+    project. Observed with ``TMPDIR`` under ``~/.kiro/crew/workspace``: every
+    such assertion answered LINK to that workspace instead of COPY.
+
+    Directories outside ``ceiling`` report no marker; inside it the real probe
+    runs, so the markers a test plants (``proj/.git``) still count. Pair it with
+    the ``_tempdir`` narrowing these tests already do -- the two seams together
+    make the rest of ``tmp_path`` ordinary, UNMARKED filesystem.
+    """
+    from kiro_crew import artifact_source
+
+    real_marker = artifact_source.project_root_marker
+    top = os.path.normcase(os.path.realpath(str(ceiling)))
+
+    def _capped(directory: str) -> str | None:
+        here = os.path.normcase(os.path.realpath(directory))
+        if here != top and not here.startswith(top + os.sep):
+            return None
+        return real_marker(directory)
+
+    monkeypatch.setattr(artifact_source, "project_root_marker", _capped)
+
+
 #: ``pytest_collection_modifyitems`` -- which applies the
 #: ``windows-expected-failures.txt`` skips -- lives in the ROOTDIR ``conftest.py``.
 #: That list already names node ids under
@@ -253,6 +336,26 @@ def _windows_restrict_to_owner_stub(request, monkeypatch):
     monkeypatch.setattr(platform_compat, "restrict_to_owner", lambda p: None)
     monkeypatch.setattr(platform_compat, "restrict_dir_to_owner", lambda p: None)
     yield
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _release_source_corpus_after_module():
+    """Drop ``test/source_corpus.py``'s whole-tree caches at every module's teardown.
+
+    The corpus helper memoizes the raw and NFKC-normalized text of every module
+    under ``src/`` (~160 MB) the first time any ratchet in a module asks for it,
+    and an ``lru_cache`` global otherwise lives for the rest of the xdist
+    worker -- paid by every later test on that worker. Module scope keeps the
+    sharing the ratchets rely on (one parse per module) while bounding the
+    retention to the module that needed it. Import is deferred and tolerant so a
+    module that never touches the corpus pays nothing.
+    """
+    yield
+    try:
+        from source_corpus import _clear_caches
+    except ImportError:  # pragma: no cover - a partial checkout without the helper
+        return
+    _clear_caches()
 
 
 @pytest.fixture(autouse=True)
@@ -429,12 +532,66 @@ def _release_stt_engine():
     stt_engine._engine = None
 
 
+def absent_sysconf(name):
+    """Stand-in for a missing ``os.sysconf`` (Windows has none).
+
+    A test that fakes ONE ``os.sysconf`` name must delegate every other name to
+    the real function -- and on Windows there is no real function to delegate to.
+    Capturing ``getattr(os, "sysconf", absent_sysconf)`` gives the delegating fake
+    the same "unavailable" answer production sees there, instead of an
+    ``AttributeError`` at capture time.
+    """
+    raise ValueError(f"os.sysconf unavailable for {name!r}")
+
+
+def drain_breadcrumb_writes(timeout: float = 5.0) -> None:
+    """Block until every queued safety-override breadcrumb publish has run.
+
+    ``safety_override.flush_breadcrumb_writes`` is production's best-effort
+    drain and reports a bool; a test that relies on the drain to prove the
+    write landed inside its own context needs certainty, so a drain that does
+    not complete raises instead of returning a value a fixture could ignore.
+    """
+    from kiro_crew.safety_override import flush_breadcrumb_writes
+
+    if not flush_breadcrumb_writes(timeout):
+        raise TimeoutError(
+            f"breadcrumb worker did not drain within {timeout}s; a queued publish "
+            "may still run after this test's fixtures tear down"
+        )
+
+
 @pytest.fixture(autouse=True)
 def _reset_safety_override_between_tests():
-    """Reset the SafetyOverride singleton between tests to prevent state leaking."""
+    """Reset the SafetyOverride singleton between tests to prevent state leaking.
+
+    The pushed ``approval_modes`` verdict is reset WITH it, because it is the same
+    leak wearing different clothes. That verdict is a module-level flag resolved when
+    a platform context is installed, and this suite installs contexts constantly
+    (~30 files call ``set_context``/``reset_context``). A DENY pushed by an earlier
+    test therefore keeps refusing yolo arms in a later one that never configured a
+    policy, which surfaces as INTERMITTENT failures in files that never touch
+    governance — which tests share an xdist worker decides whether the stale flag is
+    present. Resetting it here makes the next reader resolve the ceiling actually
+    installed.
+    """
     _reset_safety_override()
+    _reset_yolo_policy_state()
     yield
+    # Drained BEFORE the reset below, and (by pytest's fixture teardown order --
+    # finalizers run in reverse of setup order, so a fixture set up AFTER this
+    # one, e.g. a test's own ``monkeypatch.setenv("KIROCREW_HOME", ...)``, tears
+    # down BEFORE this line runs) while any KIROCREW_HOME the test itself set is
+    # still in effect. A publish enqueued mid-test resolves ``config_dir()`` on
+    # the CALLING thread at enqueue time (see ``_sync_breadcrumb``), but the
+    # worker that runs the write is on its own thread and can still be
+    # mid-flight when the test function returns. Waiting here for that worker to
+    # finish, before this fixture's own KIROCREW_HOME-independent state reset,
+    # closes the window that let a delayed write land on the real operator home
+    # instead of the test's temp dir (found in review).
+    drain_breadcrumb_writes()
     _reset_safety_override()
+    _reset_yolo_policy_state()
 
 
 @pytest.fixture(autouse=True)
@@ -1368,3 +1525,37 @@ def gateway_posts(request, monkeypatch):
 
     monkeypatch.setattr(mcp_core, "_post", _capture)
     yield posted
+
+
+@pytest.fixture(autouse=True)
+def _no_leaked_interleave_hook():
+    """Fail a test that INHERITED a set ``chat_handlers._test_interleave``.
+
+    The seam suspends a session teardown mid-pop, so a leaked hook does not
+    merely pollute state -- it re-enters an unrelated test's teardown path and
+    can await an event that test will never set, which under ``-n auto`` reads as
+    a timeout in a file that never mentioned the seam. Nothing legitimately
+    leaves it set, so this restores AND fails.
+
+    Checked on the way IN, not at teardown, and that is not a preference. The
+    supported way to set the hook is ``monkeypatch``, whose undo is registered
+    against the shared ``monkeypatch`` fixture -- and that fixture is built early,
+    as a dependency of an autouse fixture above, so its teardown runs AFTER this
+    one. A teardown-side check therefore cannot tell a pending undo from a real
+    leak and fails every legitimate test. Entry-side, the only thing that can
+    still be set is a raw assignment, which is exactly the leak worth catching.
+    The cost is that the report names the test that inherited the hook rather
+    than the one that leaked it, so the message says so.
+
+    Read through ``sys.modules`` rather than an import: a test that never touches
+    the dashboard pays one dict lookup and does not drag ``chat_handlers`` and its
+    import graph into every worker's collection.
+    """
+    mod = sys.modules.get("kiro_crew.dashboard.chat_handlers")
+    if mod is not None and mod._test_interleave is not None:
+        mod._test_interleave = None
+        pytest.fail(
+            "chat_handlers._test_interleave was already set on entry, so an "
+            "earlier test leaked it (this test is the victim, not the cause). "
+            "Set it with monkeypatch.setattr so it reverts even on failure."
+        )

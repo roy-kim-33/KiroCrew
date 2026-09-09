@@ -37,12 +37,16 @@ import pluralKeys from './pluralKeys.json'
  * raise it. A rise means a new key was added and nothing uses it — usually a typo at
  * the call site, or copy that was deleted without its key.
  */
+<<<<<<< HEAD
 // Fork baseline (upstream's is 29). Higher here for two structural reasons,
 // not for new typos: upstream keys whose copy lives in panels this fork owns
 // its own version of are unreferenced in this tree, and this scanner cannot
 // resolve the `as const` key maps in the code-review-sage app. Lower it when
 // keys are genuinely removed; never raise it to make a red run green.
 const BASELINE = 206
+=======
+const BASELINE = 28
+>>>>>>> upstream/main
 
 const SRC = join(__dirname, '..')
 const PLURAL_SUFFIX = /_(zero|one|two|few|many|other)$/

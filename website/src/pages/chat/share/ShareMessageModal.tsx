@@ -4,6 +4,7 @@ import {
   Dialog, DialogContent, DialogHeader, DialogBody, DialogTitle, DialogDescription,
 } from '../../../components/ui/dialog'
 import { Btn } from '../../../components/ui'
+import ErrorNotice from '../../../components/ErrorNotice'
 import { i18nT } from '../../../i18n/t'
 import { fmtNumber } from '../../../i18n/format'
 import { copyToClipboard } from '../../../utils/clipboard'
@@ -32,6 +33,28 @@ function kindLabel(kind: SensitiveKind): string {
   }
 }
 
+/**
+ * Host-supplied wording for the two strings that describe WHAT is being shared.
+ *
+ * Both are optional and both default to the chat wording, so a host that omits this
+ * gets exactly the dialog it got before. A non-chat surface passes its own, because
+ * the defaults name a reply and a question that surface does not have.
+ */
+export interface ShareMessageCopy {
+  /** Dialog subtitle. Default speaks of "this reply". */
+  description?: string
+  /** Label for the checkbox that includes the paired text above the excerpt.
+   *  Default speaks of "my question". */
+  includeQuestion?: string
+  /** The caption the post STARTS with -- the text handed to the X / LinkedIn
+   *  composer and put on the clipboard beside the image. The user edits it in
+   *  the dialog; this is only its initial value. Default is the chat template
+   *  ("... just did this for me"), which describes a reply the assistant wrote
+   *  and reads as a lie for anything else, so a non-chat surface supplies the
+   *  words the post should actually carry. */
+  caption?: string
+}
+
 export interface ShareMessageModalProps {
   onClose: () => void
   /** The assistant reply being shared (steer markers already stripped). */
@@ -42,18 +65,26 @@ export interface ShareMessageModalProps {
    *  while this dialog is open, the dialog stays mounted so the user's edits are
    *  not destroyed: the actions are withdrawn and a notice says why. */
   shareEnabled: boolean
+  /** Surface-appropriate wording for the two strings that name the shared thing.
+   *  Omit it entirely on the chat surface: the defaults ARE the chat strings. */
+  copy?: ShareMessageCopy
 }
 
-export default function ShareMessageModal({ onClose, messageText, prevUserText, shareEnabled }: ShareMessageModalProps) {
+export default function ShareMessageModal({ onClose, messageText, prevUserText, shareEnabled, copy }: ShareMessageModalProps) {
   const initialExcerpt = useMemo(() => clampExcerpt(messageText), [messageText])
   // Q&A pairs travel best on social feeds, so the question defaults IN.
   const [includeQuestion, setIncludeQuestion] = useState(!!prevUserText)
-  const [caption, setCaption] = useState(() => i18nT('pages.chat.share.caption_template', { link: SHARE_REPO_URL }))
+  const [caption, setCaption] = useState(() => copy?.caption ?? i18nT('pages.chat.share.caption_template', { link: SHARE_REPO_URL }))
   // Mirrors of the card's contentEditable text; feed the scan, never the DOM.
   const [excerpt, setExcerpt] = useState(initialExcerpt)
   const [questionEdit, setQuestionEdit] = useState<string | null>(null)
   const [busy, setBusy] = useState<'download' | 'copy' | 'intent' | null>(null)
   const [feedback, setFeedback] = useState<'copied' | 'copy_unavailable' | null>(null)
+  // A thrown export — the on-demand `html-to-image` import or `toBlob` itself
+  // failing. Previously the three handlers used try/finally with no catch, so
+  // the throw became an unhandled rejection and the button merely un-busied,
+  // which read as a press that did nothing.
+  const [exportError, setExportError] = useState<string | null>(null)
   const wrapRef = useRef<HTMLDivElement>(null)
   // Latest permission for the async handlers: a click captures the closure's
   // value at click time, but the answer can change while the export awaits.
@@ -113,27 +144,36 @@ export default function ShareMessageModal({ onClose, messageText, prevUserText, 
   const captionFindings = useMemo(() => scanSensitive(caption), [caption])
 
   /** Rasterize the live card DOM at 2x. html-to-image is loaded on demand so
-   *  the chat bundle never pays for it before the first share. */
-  const exportBlob = async (): Promise<Blob | null> => {
+   *  the chat bundle never pays for it before the first share.
+   *
+   *  Always resolves to a Blob or THROWS. `toBlob` reports a failed canvas
+   *  encode as `null` rather than rejecting, and a missing card root is the
+   *  same "nothing to share" outcome; either used to slip past the callers'
+   *  `catch` as a silent no-op, and in `openIntent` fell through to opening the
+   *  composer with nothing on the clipboard. One failure path means one
+   *  handler per caller. */
+  const exportBlob = async (): Promise<Blob> => {
     const node = wrapRef.current?.querySelector<HTMLElement>('[data-share-card-root]')
-    if (!node) return null
+    if (!node) throw new Error('share card root not mounted')
     const { toBlob } = await import('html-to-image')
-    return toBlob(node, { pixelRatio: 2, cacheBust: true })
+    const blob = await toBlob(node, { pixelRatio: 2, cacheBust: true })
+    if (!blob) throw new Error('canvas encoder returned null')
+    return blob
   }
 
   const handleDownload = async () => {
-    setBusy('download'); setFeedback(null)
+    setBusy('download'); setFeedback(null); setExportError(null)
     try {
-      const blob = await exportBlob()
-      if (blob) downloadBlob(blob, `kiro-crew-share-${Date.now()}.png`)
+      downloadBlob(await exportBlob(), `kiro-crew-share-${Date.now()}.png`)
+    } catch {
+      setExportError(i18nT('pages.chat.share.export_failed'))
     } finally { setBusy(null) }
   }
 
   const handleCopy = async () => {
-    setBusy('copy'); setFeedback(null)
+    setBusy('copy'); setFeedback(null); setExportError(null)
     try {
       const blob = await exportBlob()
-      if (!blob) return
       if (await copyImageWithText(blob, caption)) {
         setFeedback('copied')
       } else {
@@ -142,6 +182,8 @@ export default function ShareMessageModal({ onClose, messageText, prevUserText, 
         downloadBlob(blob, `kiro-crew-share-${Date.now()}.png`)
         setFeedback('copy_unavailable')
       }
+    } catch {
+      setExportError(i18nT('pages.chat.share.export_failed'))
     } finally { setBusy(null) }
   }
 
@@ -157,17 +199,23 @@ export default function ShareMessageModal({ onClose, messageText, prevUserText, 
     const url = buildIntentUrl(platform, caption)
     const tab = window.open('', '_blank')
     if (tab) tab.opener = null
-    setBusy('intent'); setFeedback(null)
+    setBusy('intent'); setFeedback(null); setExportError(null)
     try {
       const blob = await exportBlob()
-      if (blob) {
-        if (await copyImageWithText(blob, caption)) {
-          setFeedback('copied')
-        } else {
-          downloadBlob(blob, `kiro-crew-share-${Date.now()}.png`)
-          setFeedback('copy_unavailable')
-        }
+      if (await copyImageWithText(blob, caption)) {
+        setFeedback('copied')
+      } else {
+        downloadBlob(blob, `kiro-crew-share-${Date.now()}.png`)
+        setFeedback('copy_unavailable')
       }
+    } catch {
+      // The card never rendered, so there is nothing on the clipboard and no
+      // download: opening the composer now is exactly the caption-only post
+      // the auto-copy above exists to prevent. Close the pre-opened tab, report,
+      // and leave the composer one click away once the export works.
+      setExportError(i18nT('pages.chat.share.export_failed'))
+      tab?.close()
+      return
     } finally { setBusy(null) }
     // The permission is re-read AFTER the awaits, from the ref rather than the
     // closure: a policy swap during the export must not be followed by the
@@ -186,7 +234,7 @@ export default function ShareMessageModal({ onClose, messageText, prevUserText, 
       <DialogContent maxWidth={960}>
         <DialogHeader>
           <DialogTitle>{i18nT('pages.chat.share.title')}</DialogTitle>
-          <DialogDescription>{i18nT('pages.chat.share.description')}</DialogDescription>
+          <DialogDescription>{copy?.description ?? i18nT('pages.chat.share.description')}</DialogDescription>
         </DialogHeader>
         <DialogBody>
           <div className="flex flex-col lg:flex-row gap-5">
@@ -204,8 +252,8 @@ export default function ShareMessageModal({ onClose, messageText, prevUserText, 
             <div className="flex flex-col gap-3 min-w-0 flex-1">
               {prevUserText && (
                 <label className="flex items-center gap-2 text-[13px] leading-5 text-text cursor-pointer select-none">
-                  <input type="checkbox" aria-label={i18nT('pages.chat.share.include_question')} checked={includeQuestion} onChange={(e) => { setIncludeQuestion(e.target.checked); setQuestionEdit(null) }} />
-                  {i18nT('pages.chat.share.include_question')}
+                  <input type="checkbox" aria-label={copy?.includeQuestion ?? i18nT('pages.chat.share.include_question')} checked={includeQuestion} onChange={(e) => { setIncludeQuestion(e.target.checked); setQuestionEdit(null) }} />
+                  {copy?.includeQuestion ?? i18nT('pages.chat.share.include_question')}
                 </label>
               )}
 
@@ -267,7 +315,17 @@ export default function ShareMessageModal({ onClose, messageText, prevUserText, 
                 <Btn disabled={busy !== null || !shareEnabled} onClick={() => openIntent('linkedin')} data-testid="share-linkedin">{i18nT('pages.chat.share.share_on_linkedin')}</Btn>
               </div>
 
-              {shareEnabled && (
+              {/* No hand-off: the caption textarea and the edited card text
+                  (question / excerpt) are unsaved local state — a navigation
+                  would discard them. */}
+              <ErrorNotice
+                variant="inline"
+                message={exportError}
+                onDismiss={() => setExportError(null)}
+                testId="share-export-error"
+              />
+
+              {shareEnabled && !exportError && (
               <p className="text-[12px] leading-5 text-muted m-0" role={feedback ? 'status' : undefined}>
                 {feedback === 'copied' ? i18nT('pages.chat.share.copied')
                   : feedback === 'copy_unavailable' ? i18nT('pages.chat.share.copy_unavailable')

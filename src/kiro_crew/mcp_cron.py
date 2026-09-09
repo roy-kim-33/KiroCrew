@@ -29,6 +29,7 @@ from typing import Any
 from kiro_crew import model_registry
 from kiro_crew.config.loader import config_dir
 from kiro_crew.cron import (
+    _JOB_TIMEOUT_SECS,
     CronJob,
     CronService,
     CronStoreBusy,
@@ -40,6 +41,7 @@ from kiro_crew.cron import (
     get_local_tz,
     is_valid_skip_date,
     is_valid_timezone,
+    lookup_cron_folder_id,
 )
 from kiro_crew.cron_script import (
     compute_secret_env_pin,
@@ -50,6 +52,7 @@ from kiro_crew.cron_script import (
 from kiro_crew.cron_trigger import _JOB_ID_RE, trigger_cron_job
 from kiro_crew.mcp_caller import current_caller
 from kiro_crew.mcp_core import (
+    _post,
     _resolve_session_key,
     require_strict_session_key,
     strict_identity_diagnosis,
@@ -66,7 +69,6 @@ from kiro_crew.security import (
     enabled_rule_ids,
     is_sensitive_bash_command,
     is_sensitive_path,
-    is_sensitive_source_body,
     scan_exfiltration_urls,
 )
 from kiro_crew.sel import sel
@@ -94,15 +96,43 @@ _UNIT_SECS = {
 }
 
 
+def _sub_floor_timeout_note(timeout_secs_val: object) -> str:
+    """Return a caller-facing note when ``timeout_secs`` is below the reaper floor.
+
+    The primary ``asyncio.wait_for`` guard in ``_execute_with_timeout`` honors any
+    value in ``1..86400``, so a sub-floor budget IS enforced on the normal path.
+    The reaper force-kill backstop, however, clamps its deadline to at least
+    ``_JOB_TIMEOUT_SECS`` (``max(min(timeout_secs, 86400), _JOB_TIMEOUT_SECS)``),
+    so if the event loop stalls or the task ignores cancellation the job is not
+    force-killed until that floor. Surfacing the gap at set time is cheaper than
+    letting the caller discover it from a job that outran its configured budget.
+
+    Returns an empty string when the value is absent, non-numeric, or already at
+    or above the floor, so callers can unconditionally append it to their reply.
+    """
+    if not isinstance(timeout_secs_val, (int, float, str)):
+        return ""
+    try:
+        secs = int(timeout_secs_val)
+    except (ValueError, TypeError):
+        return ""
+    if 1 <= secs < _JOB_TIMEOUT_SECS:
+        return (
+            f" Note: timeout_secs={secs}s is below the {_JOB_TIMEOUT_SECS}s reaper "
+            "floor -- the primary guard enforces it, but if the event loop stalls "
+            f"the force-kill backstop will not trigger until {_JOB_TIMEOUT_SECS}s."
+        )
+    return ""
+
+
 # Credential dirs/files a cron shell command must never reference directly. The
 # sandbox (cron_script.run_command_sandboxed, mode="cc") is the only
 # sanctioned access path. We reuse security._SENSITIVE_HOME_DIRS (the canonical
 # list, kept DRY so it can't drift) and match the token ANYWHERE in the command
-# — not only after a known read command like the shared is_sensitive_bash_command
-# regex does — because tools such as ``curl -d @~/.aws/credentials`` or
+# -- the shared is_sensitive_bash_command matches no paths at all (the OS sandbox
+# is its path control) -- because tools such as ``curl -d @~/.aws/credentials`` or
 # ``wget --post-file=$HOME/.ssh/id_rsa`` read files via flags with no recognizable
-# read-command prefix, evading that regex (verified: the canonical exfil payload
-# slipped through the three stock guards).
+# read-command prefix.
 _CRON_CRED_PATH_RE = re.compile(
     r"(?:^|[\s'\"=@/~`]|\$\{?HOME\}?)"
     r"(?:" + "|".join(re.escape(d) for d in _SENSITIVE_HOME_DIRS) + r")"
@@ -724,14 +754,22 @@ def _vet_shell_command(command: str) -> str | None:
     def _unquote(s: str) -> str:
         return s.replace('"', "").replace("'", "")
 
+    # sh also drops an escaping backslash during word expansion, so `~/.ss\h`
+    # names `.ssh` while the literal text keeps the name split. Unescaping runs
+    # AFTER unquoting: inside single quotes a backslash is literal, which the
+    # unquoted view no longer distinguishes, so this view over-approximates --
+    # a refusal on `'.ss\h'` is a false positive the vet accepts.
     resolved = _substitute_local_assignments(command)
     unquoted = _unquote(command)
+    unescaped = _BACKSLASH_ESCAPE_RE.sub(r"\1", unquoted)
     variants = (
         command,
         resolved,
         unquoted,
         _unquote(resolved),
         _substitute_local_assignments(unquoted),
+        unescaped,
+        _substitute_local_assignments(unescaped),
     )
     for variant in variants:
         if _CRON_CRED_PATH_RE.search(variant) or _glob_could_reach_credentials(variant):
@@ -776,40 +814,43 @@ def _vet_script_contents(text: str) -> str | None:
     that the agent itself can write (via its file-write tool) and then register.
     ``resolve_script_path`` validates only the *path*, so without this the body
     is never inspected. The script runs under ``mode="standard"`` (user scripts
-    may legitimately use creds), which does NOT hide ``~/.aws`` — so a body that
+    may legitimately use creds), which does NOT hide ``~/.aws`` -- so a body that
     reads ``~/.aws/credentials`` or ``os.environ["AWS_SECRET_ACCESS_KEY"]`` and
-    POSTs it out would succeed. We reuse the same credential-path / secret-env /
-    exfil detectors as the command path (plus a bare-name env match for
-    ``os.environ[...]`` style access). We deliberately do NOT run ``is_denied``
-    over a script body: it encodes shell tool-name semantics (e.g. ``*git*push*``)
-    that false-positive on ordinary Python source, and destructive-op risk is
-    covered by the now-required ``cron_add`` approval prompt. Credential
-    exfiltration — which a human rubber-stamping the prompt would not catch — is
-    the threat this gate closes.
+    POSTs it out would succeed. Credential exfiltration -- which a human
+    rubber-stamping the ``cron_add`` approval prompt would not catch -- is the
+    threat this gate closes.
 
-    ``is_sensitive_source_body`` is the same carve-out for the same reason,
-    one pass further in: ``is_sensitive_bash_command``'s pass 1b collapses
-    separator RUNS because a Win32 shell treats them as redundant, but in Python
-    source a backslash run is an ESCAPE. Collapsing strips it, so a body that
-    merely REDACTS or NAMES a fenced store — a ``re`` pattern, a docstring —
-    reads as an access to it and the job is denied at every fire, permanently
-    (the fire-time gate deliberately does not auto-pause).
+    The body is PYTHON SOURCE, not a shell command line, so it is scanned only with
+    the detectors that are meaningful on source text and are all linear, whole-body
+    matches: a credential-path spelling anywhere (``_CRON_CRED_PATH_RE``), a
+    protected secret env var by ``$NAME`` or bare name (``_CRON_SECRET_ENV_RE`` /
+    ``_CRON_SECRET_NAME_RE``), and an exfiltration URL (``scan_exfiltration_urls``).
 
-    Dropping that pass outright would reopen the doubled-separator fence bypass
-    INSIDE a script, so it is REPLACED rather than removed:
-    ``is_sensitive_source_body`` owns that pairing in ``security.py`` — it applies
-    the same three checks to each
-    DECODED string literal, which is where the run still exists —
-    ``open(r"...\\\\kiro-cli\\\\c.json")`` hands the OS two backslashes and Win32
-    collapses them. A literal is exonerated only when it provably flows into the
-    PATTERN operand of a pattern-consuming call, so an unknown sink over-blocks. A
-    body that does not
-    parse yields no literals to inspect, and then the raw shell scan runs WITH the
-    collapse, so an unparseable body is never quietly exonerated.
+    It is deliberately NOT handed to ``is_denied`` or ``is_sensitive_bash_command``.
+    Both read their subject with shell grammar -- tool-name globs like ``*git*push*``,
+    separator-run collapse (in source a backslash run is an ESCAPE), newline-split
+    pipeline stages under a fail-closed budget (every line of a script counted as a
+    stage, so ~512 lines was a permanent refusal), ordered-existence ``env | grep``
+    rules matching pieces hundreds of lines apart, and a ``find``-grammar parse of
+    English docstrings. Each produced a class of false denial on ordinary scripts
+    (#7912, #8563, #8643, #8812), each was closed by another layer of AST analysis in
+    ``security.py``, and the ~1500 lines that resulted still could not stop
+    ``open(os.environ["LOCALAPPDATA"] + r"\\kiro-cli\\config.json")``: static text
+    analysis of a Turing-complete body cannot be the fence. The runtime control for
+    what a script may OPEN is the sandbox ``run_script`` spawns it in (``wrap_argv``
+    bind-masks the crew home's credential leaves, the vault and the keystone in
+    ``standard`` mode); this gate stops the obvious register-a-malicious-script case
+    and nothing more. Destructive-op risk is covered by the required ``cron_add``
+    approval prompt.
 
-    Every other pass still runs, and ``_vet_script_file`` keeps its own
-    ``is_sensitive_path`` on the resolved path.
+    ``_vet_script_file`` keeps its own ``is_sensitive_path`` on the resolved path.
     """
+    if len(text) > _MAX_SCRIPT_SCAN_BYTES:
+        return (
+            "Error: cron script blocked: input is too large to security-scan "
+            f"({len(text)} chars > {_MAX_SCRIPT_SCAN_BYTES} limit); refused rather "
+            "than left unscanned"
+        )
     if _CRON_CRED_PATH_RE.search(text):
         return (
             "Error: cron script blocked: references a credential path "
@@ -817,13 +858,6 @@ def _vet_script_contents(text: str) -> str | None:
         )
     if _CRON_SECRET_ENV_RE.search(text) or _CRON_SECRET_NAME_RE.search(text):
         return "Error: cron script blocked: references a protected secret environment variable"
-    # One entry point owns the pairing: the literal scan replaces pass 1b for a source
-    # subject, and a body that did not parse keeps the raw-text collapse. See
-    # ``is_sensitive_source_body``.
-    reason = is_sensitive_source_body(text)
-    if reason:
-        safe_reason = redact(reason)
-        return f"Error: cron script blocked by security policy: {safe_reason}"
     exfil = scan_exfiltration_urls(text)
     if exfil:
         safe = redact("; ".join(exfil))
@@ -951,6 +985,52 @@ def _log_cron_denial(tool_name: str, error: str) -> None:
         )
     except Exception:
         logger.debug("SEL logging failed for cron denial", exc_info=True)
+
+
+_CRON_FOLDER_ID_RE = re.compile(r"[0-9a-f]{8}")
+
+
+def _resolve_cron_folder(ref: str, *, session_key: str | None) -> tuple[str, str | None]:
+    """Resolve a cron-folder reference (id or name) to a folder id, creating it.
+
+    Returns ``(folder_id, error)``; ``""`` with no error means ungrouped (empty
+    reference). The matching itself is ``cron.lookup_cron_folder_id`` — one
+    implementation of "empty / exact id / case-insensitive name / refuse an
+    ambiguous name", so the MCP tool and the CLI can never drift on which
+    folder a reference means. Only the two legs the read-only resolver
+    deliberately lacks live here, and both hang off ``missing``:
+
+    * An id-SHAPED reference that matched nothing is REFUSED rather than
+      created: folder ids are minted server-side, so a folder literally named
+      after a hex id is never what the caller meant (same contract as the chat
+      sidebar-folder resolver).
+    * A missing NAME is created through ``POST /api/cron-folders`` — the
+      dashboard's own endpoint — so the create happens under the same lock and
+      lands in the same in-memory list as a Schedule-page create; appending to
+      ``cron_folders.json`` directly from this process would be clobbered by
+      the dashboard's next wholesale save of its own list.
+
+    Any non-missing error is passed through untouched: an ambiguous name must
+    stay a refusal here too, never a second folder with the same name.
+    """
+    ref = str(ref or "").strip()
+    if not ref:
+        return "", None
+    found = lookup_cron_folder_id(ref)
+    if not found.missing:
+        return found.folder_id, (redact(found.error) if found.error else None)
+    if _CRON_FOLDER_ID_RE.fullmatch(ref):
+        return "", (
+            f"cron folder not found: {redact(ref)} — folder ids are minted "
+            "server-side; pass a folder name to create one"
+        )
+    made = _post("/api/cron-folders", {"name": ref}, session_key=session_key)
+    if made.get("error"):
+        return "", f"could not create cron folder {redact(ref)}: {made['error']}"
+    fid = str(made.get("id") or "")
+    if not fid:
+        return "", f"could not create cron folder {redact(ref)}: no id returned"
+    return fid, None
 
 
 def _parse_time_string(s: str) -> float | str:
@@ -1128,6 +1208,12 @@ def _list_tools() -> list[dict[str, Any]]:
                         "interpreted in this timezone. Falls back to global config timezone, "
                         "then UTC.",
                     },
+                    "folder": {
+                        "type": "string",
+                        "description": "Schedule-page folder to file this job in, by name or "
+                        "id (e.g. 'Veille'). A missing name is created. Empty or omitted "
+                        "leaves the job ungrouped.",
+                    },
                     "persistent_session": {
                         "type": "boolean",
                         "description": "Whether this cron reuses one agent session across "
@@ -1221,6 +1307,12 @@ def _list_tools() -> list[dict[str, Any]]:
                     },
                     "agent": {"type": "string", "description": "New agent name"},
                     "channel": {"type": "string", "description": "New channel ID"},
+                    "folder": {
+                        "type": "string",
+                        "description": "Move the job to this Schedule-page folder, by name "
+                        "or id. A missing name is created. Empty string moves the job out "
+                        "of its folder (ungrouped).",
+                    },
                     "thread_ts": {
                         "type": "string",
                         "description": "New thread timestamp to reply in.",
@@ -1597,6 +1689,58 @@ def _authz_session_key() -> str:
     # diagnosis) lives in :func:`_unidentified_caller_refusal`, which each
     # mutating tool composes itself.
     return require_strict_session_key("cron ownership authorization")[0]
+
+
+def _deny_channel_agent_cron(tool_name: str) -> str | None:
+    """Deny ``cron_add`` / ``cron_update`` to a channel agent, else ``None``.
+
+    Channel agents (session keys ``channel:<channel_id>:<agent_id>``) are
+    confined to channel-post communication -- ``CHANNEL_AGENT_BLOCKED_TOOLS``
+    holds back ``send_*`` and every ``session_*`` verb for exactly that reason.
+    Scheduling a cron job is the same shape made durable: ``cron_add`` takes an
+    ``agent`` and ``approval_mode`` that flow straight to ``add_job``, so a
+    channel agent could schedule ``agent="kirocrew", approval_mode="auto"`` and
+    have a full-tool agent run on the gateway host on a timer -- an escalation
+    past its own confinement that outlives both the turn and the channel.
+    ``cron_update`` maps ``agent`` onto ``agent_id``, so it re-targets the agent
+    of a job the calling session already owns.
+
+    The interactive guard in ``channel.py`` rejects blocked tools at the
+    permission-request event, but an AUTO-APPROVED call fires no such event: an
+    ``@kirocrew-cron/cron_add`` entry in a channel agent's ``allowedTools`` is
+    translated to a KAS auto-approve permission (``acp/kas_permissions.py``;
+    MCP tools are not in ``WITHHELD_FROM_AUTO_APPROVE``), and auto-approval is
+    the ABSENCE of a permission request -- so ``_blocked_tool_named`` never runs.
+    The containment therefore has to hold HERE, at MCP dispatch, keyed on the
+    verified caller identity (the strict resolver refuses forgeable sources).
+    Mirrors ``mcp_core._deny_channel_agent_messaging``.
+
+    Only the ``channel:`` orchestrator-agent namespace is confined; a
+    ``slack:``/``discord:`` session is an allow-listed HUMAN participant
+    scheduling their own recurring work, which is the legitimate flow the issue
+    is careful not to break. Best-effort SEL audit mirrors channel.py's
+    ``rejected_blocked_tool`` outcome; an audit failure never unblocks the deny.
+    """
+    caller_session = _authz_session_key()
+    if not caller_session.startswith("channel:"):
+        return None
+    try:
+        sel().log_tool_invocation(
+            session_key=caller_session,
+            source="mcp",
+            tool_name=tool_name,
+            tool_kind="kirocrew-cron",
+            outcome="rejected_blocked_tool",
+        )
+    except Exception:
+        # File-backed SEL write; stdio-silent (no logger -- stderr would corrupt
+        # the JSON-RPC stream). The deny below still holds.
+        pass
+    return (
+        f"Error: {tool_name} is not available to channel agents -- a channel "
+        "agent is confined to channel posts and may not schedule a job that "
+        "runs as another agent."
+    )
 
 
 #: A job with no recorded owner. Written by every creation path that has no
@@ -1986,6 +2130,13 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
         return _render_cron_list_compact(jobs)
 
     if name == "cron_add":
+        # Channel-agent containment FIRST: a channel agent may not schedule a
+        # durable job (which can run as another, more privileged agent). Keyed
+        # on the verified caller identity so an auto-approved call -- which fires
+        # no permission event for channel.py's guard to catch -- is still denied.
+        chan_err = _deny_channel_agent_cron("cron_add")
+        if chan_err:
+            return chan_err
         # Capability gate FIRST: if the calling surface's policy/profile disables
         # the cron capability, no job may be authored at all (command, script, or
         # message). This is the on/off gate, distinct from the per-command body
@@ -2086,6 +2237,15 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
         strict_schedule = args.get("strict_schedule")
         timeout_val = args.get("timeout", 0)
         timeout_secs_val = args.get("timeout_secs", 0)
+        # Resolve the folder BEFORE add_job so an unresolvable reference never
+        # leaves an orphaned job behind (same position as the model check
+        # above). A folder auto-created here that a subsequent add_job failure
+        # strands is benign: an empty folder, removable from the Schedule page.
+        folder_id = ""
+        if args.get("folder"):
+            folder_id, folder_err = _resolve_cron_folder(args["folder"], session_key=session_key)
+            if folder_err:
+                return f"Error: {folder_err}"
         try:
             job = svc.add_job(
                 name=n,
@@ -2104,6 +2264,7 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
                 silent=bool(silent),
                 strict_schedule=strict_schedule if isinstance(strict_schedule, bool) else False,
                 hide_in_chat=hide_in_chat if isinstance(hide_in_chat, bool) else False,
+                folder_id=folder_id,
                 command=command or "",
                 script=script or "",
                 persistent_session=(
@@ -2148,9 +2309,16 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
         return (
             f"Added job: {job.id} ({job.name}) [{sched_str}]. "
             f"Tell the user: scheduled for {sched_str}.{caveats}"
+            + _sub_floor_timeout_note(timeout_secs_val)
         )
 
     if name == "cron_update":
+        # Channel-agent containment FIRST (see cron_add): cron_update maps
+        # ``agent`` onto ``agent_id`` on an existing job, so it re-targets a
+        # job's agent -- the same escalation, reachable without creating a job.
+        chan_err = _deny_channel_agent_cron("cron_update")
+        if chan_err:
+            return chan_err
         jid = args["job_id"]
         # Ownership check
         own_err = _check_cron_job_ownership(svc, jid)
@@ -2186,6 +2354,13 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
             kwargs["timezone"] = tz_val
         if "strict_schedule" in args:
             kwargs["strict_schedule"] = args["strict_schedule"]
+        if "folder" in args:
+            # "" resolves to "" (ungrouped) with no error, so an explicit empty
+            # string moves the job out of its folder.
+            fid, folder_err = _resolve_cron_folder(args["folder"], session_key=_authz_session_key())
+            if folder_err:
+                return f"Error: {folder_err}"
+            kwargs["folder_id"] = fid
         if "persistent_session" in args:
             kwargs["persistent_session"] = args["persistent_session"]
         if "minimal_context" in args:
@@ -2248,7 +2423,8 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
             not (updated.command or updated.script),
             len(updated.agent_sequence),
         )
-        return f"Updated job: {updated.id} ({updated.name}) [{sched_str}]{caveat}"
+        note = _sub_floor_timeout_note(args["timeout_secs"]) if "timeout_secs" in args else ""
+        return f"Updated job: {updated.id} ({updated.name}) [{sched_str}]{caveat}{note}"
 
     if name == "cron_remove":
         jid = args["job_id"]

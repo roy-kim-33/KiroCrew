@@ -29,8 +29,8 @@ from kiro_crew.metrics.sessions import (
 if TYPE_CHECKING:
     from kiro_crew.providers.base import LLMProvider
 else:
-    # Importing providers.base from this leaf enters providers -> acp.runtime ->
-    # session_pid -> providers when the module is imported standalone.
+    # ProviderFactory below subscripts LLMProvider at module scope, so a name must
+    # exist at runtime; a real import would cross the agent-SDK boundary gate.
     LLMProvider = Any
 
 
@@ -1276,21 +1276,18 @@ class SessionAllocationService:
             pool_decision = "bypass_member"
         elif cwd_blocks_pool:
             pool_decision = "bypass_cwd"
-        elif extra_factory_kwargs.get("reasoning_effort_override"):
-            pool_decision = "bypass_effort"
         elif extra_env:
             pool_decision = "bypass_env"
         elif await self._crew_pins_effort(agent, extra_factory_kwargs.get("crew_agent")):
-            # Same reason as bypass_effort above, for the effort a CREW pins
-            # rather than one a caller passed: a pooled child was spawned under
-            # whatever effort overlay was current when the pool filled, and the
-            # claim path re-keys the model but never re-pushes effort — so a warm
-            # hit would silently run this crew at the wrong depth. Cold-starting
-            # is what makes the pin real.
+            # A CREW's pinned effort is fixed at spawn time and the warm-pool
+            # claim path never re-pushes it, so a warm hit would silently run
+            # this crew at the wrong depth.  Cold-starting is what makes the
+            # pin real.  (Caller-supplied reasoning_effort_override is handled
+            # post-claim via provider.change_effort instead — see below.)
             #
-            # Last in the chain on purpose: it is the only arm that needs to read
-            # config, so every cheaper reason to skip the pool is settled first
-            # and a bypassing session never pays for the lookup.
+            # Last in the chain on purpose: it is the only arm that needs to
+            # read config, so every cheaper reason to skip the pool is settled
+            # first and a bypassing session never pays for the lookup.
             pool_decision = "bypass_effort"
         else:
             pool_decision = ""
@@ -1377,6 +1374,37 @@ class SessionAllocationService:
                                     "Pool post-claim: switched model to %s",
                                     _send_model,
                                 )
+                    _effort_override = extra_factory_kwargs.get("reasoning_effort_override")
+                    if _effort_override:
+                        _eff = str(_effort_override)
+                        try:
+                            if not await provider.change_effort(_eff):
+                                _cur_model = (
+                                    getattr(cast(Any, provider).client, "_model", None) or ""
+                                )
+                                self._deps.logger.warning(
+                                    "reasoning effort '%s' will not be applied (session %s) — "
+                                    "model '%s' does not support effort configuration",
+                                    _eff,
+                                    key or "?",
+                                    _cur_model or "auto",
+                                )
+                            else:
+                                _cur_model = (
+                                    getattr(cast(Any, provider).client, "_model", None) or ""
+                                )
+                                self._deps.logger.info(
+                                    "Pool post-claim: applied reasoning effort %s to model %s",
+                                    _eff,
+                                    _cur_model,
+                                )
+                        except Exception:
+                            self._deps.logger.warning(
+                                "Pool post-claim: failed to apply reasoning effort '%s' (session %s)",
+                                _eff,
+                                key or "?",
+                                exc_info=True,
+                            )
                 self._deps.logger.info(
                     "Claimed warm-pool process for %s (agent=%s)",
                     key,

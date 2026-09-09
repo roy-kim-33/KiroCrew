@@ -37,6 +37,7 @@ from kiro_crew.config.loader import (
     SessionConfig,
     SlackConfig,
     SttConfig,
+    WatchdogConfig,
     WorkspaceConfig,
     _migrate_workspaces,
     _validated_stt_model,
@@ -344,6 +345,44 @@ def test_slack_home_tab_sessions_per_kind_parsed_and_round_trips():
     # Survives a to_dict() -> load() round-trip.
     reloaded = _load_from_dict(loaded.to_dict())
     assert reloaded.slack.home_tab_sessions_per_kind == 42
+
+
+class TestMemberDispatchLoad:
+    """agent.member_dispatch load-time coercion (issue #8073).
+
+    The operator ceiling on the member session-control bypass. A MISSING key
+    defaults to true (today's behaviour), but a PRESENT-but-malformed value —
+    the routine quoted `"false"` config mistake — must coerce to FALSE, so a
+    botched opt-out withdraws the bypass rather than silently leaving it on
+    (a governance ceiling that fails open otherwise).
+    """
+
+    def test_missing_key_defaults_true(self) -> None:
+        assert _load_from_dict({}).agent.member_dispatch is True
+
+    def test_explicit_true_and_false(self) -> None:
+        assert _load_from_dict({"agent": {"member_dispatch": True}}).agent.member_dispatch is True
+        assert _load_from_dict({"agent": {"member_dispatch": False}}).agent.member_dispatch is False
+
+    def test_quoted_false_coerces_to_false_not_true(self) -> None:
+        # The GPT-flagged fail-open: `"false"` is not a bool, and defaulting it
+        # to true would keep the bypass authorized against the operator's intent.
+        assert (
+            _load_from_dict({"agent": {"member_dispatch": "false"}}).agent.member_dispatch is False
+        )
+
+    def test_any_present_non_bool_coerces_to_false(self) -> None:
+        # A present but malformed value fails to the SAFE direction (bypass off),
+        # including a truthy-looking string that must not be trusted.
+        for bad in ("true", "yes", 1, 0, {}, [], None):
+            assert (
+                _load_from_dict({"agent": {"member_dispatch": bad}}).agent.member_dispatch is False
+            ), bad
+
+    def test_round_trips_through_to_dict(self) -> None:
+        loaded = _load_from_dict({"agent": {"member_dispatch": False}})
+        reloaded = _load_from_dict(loaded.to_dict())
+        assert reloaded.agent.member_dispatch is False
 
 
 class TestFallbackModelLoad:
@@ -3201,7 +3240,47 @@ class TestSecurityBoundClamping:
 
         with unittest.mock.patch("kiro_crew.config.loader._log_config_clamp_event"):
             cfg = _load_from_dict({"agent": {"subagent_max_turns": 99999}})
-        assert cfg.agent.subagent_max_turns == SUBAGENT_MAX_TURNS_CEILING == 200
+        assert cfg.agent.subagent_max_turns == SUBAGENT_MAX_TURNS_CEILING == 1000
+
+    def test_subagent_timeout_zero_sentinel_survives_the_clamp(self) -> None:
+        """``0`` means "use the default", so a MIN floor must not rewrite it.
+
+        Clamping it to the 60s floor hands a healthy subagent a one-minute
+        deadline -- the opposite of what the field's own help text promises.
+        Asserted for the int form (the raw-dict clamp) and the numeric-string
+        form (which that clamp skips and only the coercion site bounds).
+        """
+        with unittest.mock.patch("kiro_crew.config.loader._log_config_clamp_event"):
+            assert (
+                _load_from_dict({"agent": {"subagent_timeout_secs": 0}}).agent.subagent_timeout_secs
+                == 0
+            )
+            assert (
+                _load_from_dict(
+                    {"agent": {"subagent_timeout_secs": "0"}}
+                ).agent.subagent_timeout_secs
+                == 0
+            )
+            # A non-zero value below the floor is still raised to it.
+            assert (
+                _load_from_dict({"agent": {"subagent_timeout_secs": 5}}).agent.subagent_timeout_secs
+                == 60
+            )
+            assert (
+                _load_from_dict(
+                    {"agent": {"subagent_timeout_secs": "5"}}
+                ).agent.subagent_timeout_secs
+                == 60
+            )
+
+    def test_subagent_timeout_clamped_to_bounds(self) -> None:
+        from kiro_crew.config.loader import SUBAGENT_TIMEOUT_MAX, SUBAGENT_TIMEOUT_MIN
+
+        with unittest.mock.patch("kiro_crew.config.loader._log_config_clamp_event"):
+            hi = _load_from_dict({"agent": {"subagent_timeout_secs": 999999}})
+            lo = _load_from_dict({"agent": {"subagent_timeout_secs": 1}})
+        assert hi.agent.subagent_timeout_secs == SUBAGENT_TIMEOUT_MAX == 86400
+        assert lo.agent.subagent_timeout_secs == SUBAGENT_TIMEOUT_MIN == 60
 
     def test_pool_size_clamped_to_max(self) -> None:
         from kiro_crew.config.loader import POOL_SIZE_MAX
@@ -3300,13 +3379,13 @@ class TestSecurityBoundClamping:
             )
         assert cfg.agent.subagent_auto_max == 64
         assert cfg.agent.max_subagents == 64
-        assert cfg.agent.subagent_max_turns == 200
+        assert cfg.agent.subagent_max_turns == 1000
         assert cfg.session.pool_size == 10
 
         d = cfg.to_dict()
         assert d["agent"]["subagent_auto_max"] == 64
         assert d["agent"]["max_subagents"] == 64
-        assert d["agent"]["subagent_max_turns"] == 200
+        assert d["agent"]["subagent_max_turns"] == 1000
         assert d["session"]["pool_size"] == 10
 
     def test_numeric_string_ceiling_is_still_enforced_at_extraction(self) -> None:
@@ -3335,7 +3414,7 @@ class TestSecurityBoundClamping:
             }
         )
         assert cfg.agent.max_subagents == SUBAGENT_AUTO_MAX_CEILING == 64
-        assert cfg.agent.subagent_max_turns == SUBAGENT_MAX_TURNS_CEILING == 200
+        assert cfg.agent.subagent_max_turns == SUBAGENT_MAX_TURNS_CEILING == 1000
         assert cfg.agent.subagent_auto_max == SUBAGENT_AUTO_MAX_CEILING == 64
         assert cfg.session.pool_size == POOL_SIZE_MAX == 10
         for v in (
@@ -3398,12 +3477,12 @@ class TestSecurityBoundClamping:
         with unittest.mock.patch("kiro_crew.config.loader._log_config_clamp_event") as mock_event:
             cfg = _load_from_dict(
                 {
-                    "agent": {"subagent_auto_max": 64, "subagent_max_turns": 200},
+                    "agent": {"subagent_auto_max": 64, "subagent_max_turns": 1000},
                     "session": {"pool_size": 10},
                 }
             )
         assert cfg.agent.subagent_auto_max == 64
-        assert cfg.agent.subagent_max_turns == 200
+        assert cfg.agent.subagent_max_turns == 1000
         assert cfg.session.pool_size == 10
         mock_event.assert_not_called()
 
@@ -4195,7 +4274,7 @@ class TestOrchestratorWatchdogThemeAreParsed:
     def test_absent_sections_use_defaults(self) -> None:
         cfg = _load_from_dict({})
         assert cfg.orchestrator.stage_timeout_seconds == 1800
-        assert cfg.watchdog.tool_stall_hard_cap_secs == 3600.0
+        assert cfg.watchdog.tool_stall_hard_cap_secs == WatchdogConfig().tool_stall_hard_cap_secs
         assert cfg.dashboard.theme_mode == ""
         assert cfg.dashboard.onboarded is False
         assert cfg.dashboard.import_onboarded is False

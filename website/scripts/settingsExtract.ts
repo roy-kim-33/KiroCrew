@@ -145,6 +145,12 @@ export const PANEL_TAB_MAP: Record<string, PanelTarget> = {
     { tab: 'channels', params: { channel: 'wecom' }, labelSuffix: 'WeCom' },
   ],
   'DeveloperPanel.tsx': 'developer',
+  // The Feature Previews cards DeveloperPanel mounts. Indexed on purpose: the
+  // old Developer-page tab kept itself out of search so "webhooks" would not
+  // advertise a hidden page, but a control visible on a Settings pane that
+  // search cannot find is the coverage gap settingsCoverage.test.ts exists to
+  // close — and the hit reaches the labelled opt-in switch, not the page.
+  'FeaturePreviewsSection.tsx': 'developer',
   'AboutPanel.tsx': 'about',
   'SttSettings.tsx': 'voice',
   // The `instances` tab mounts RemoteCrewPanel (SettingsPage.tsx), which also
@@ -335,6 +341,7 @@ export function extractFromSource(
       const labelKey = extractTranslationKeyProp(props, 'label')
       const description = extractStringProp(props, 'description')
       const configKey = extractStringProp(props, 'configKey')
+      const settingId = extractStringProp(props, 'settingId')
       for (const target of targets) {
         const tab = typeof target === 'string' ? target : target.tab
         const params = typeof target === 'string' ? undefined : target.params
@@ -356,6 +363,7 @@ export function extractFromSource(
           occurrence: 1,
           ...(params ? { params } : {}),
           ...(configKey ? { configKey } : {}),
+          ...(settingId ? { settingId } : {}),
         })
       }
     }

@@ -872,8 +872,11 @@ def register_hook(name: str, args: dict[str, Any]) -> str:
     hook_file = mcp_core.config_dir() / "hooks.json"
     hook_file.parent.mkdir(parents=True, exist_ok=True)
     lock_path = hook_file.parent / "hooks.json.lock"
-    with open(lock_path, "w") as lock_fd:
-        with platform_compat.flock_exclusive(lock_fd.fileno()):
+    # Open non-truncating; see ``platform_compat.open_lock_file`` for why ``"w"``
+    # loses the lock on Windows (GH-9248). Same file as ``webhooks.locked``
+    # guards. Parent mkdir stays (the helper does not create parent dirs).
+    with platform_compat.open_lock_file(lock_path) as lock_fd:
+        with platform_compat.flock_exclusive(lock_fd):
             # Re-read under lock to avoid lost updates
             hooks = {}
             if hook_file.exists():
@@ -942,8 +945,13 @@ def _emit_directive(kind: str, args: dict[str, Any], human: str) -> str:
     * The out-of-band POST is the provider-neutral path. ``_post`` already carries
       ``X-Session-Key`` (and the gateway kernel-verifies that claim on the unix
       socket), so the gateway parks the payload for the RIGHT session without the
-      model's tool result being trusted for anything. A backend that emits no
-      ``_meta.kiro`` identity has no other way to reach its own control plane.
+      model's tool result being trusted for anything. What travels is the CALL
+      (tool name + raw arguments), never the payload: the gateway re-runs this
+      tool on those arguments to derive the payload and computes the claim key
+      itself, and the consumer recomputes that key from the ``tool_call``
+      frame — so neither the result body's shape nor a caller-authored payload
+      decides what lands. A backend that emits no ``_meta.kiro`` identity has
+      no other way to reach its own control plane.
 
     Order matters: encode FIRST. ``encode`` refuses an oversized payload by
     returning a marker-less error string, and a refused directive must NOT be
@@ -961,8 +969,29 @@ def _emit_directive(kind: str, args: dict[str, Any], human: str) -> str:
     out = session_directive.encode(kind, args, human)
     if session_directive.is_refusal(out):
         return out
+    # Gateway-side derivation (mcp_core.derive_directive) re-runs this very
+    # handler and wants the validated payload, not a POST.
+    if mcp_core.capture_directive(kind, args):
+        return out
+    _tool = mcp_core.current_call_name()
+    if not _tool:
+        # Not inside a ``_call_tool`` dispatch (a direct handler call, e.g. from a
+        # test): there is no call to report, and an empty one would only be
+        # refused by the gateway as not derivable.
+        return out
     try:
-        mcp_core._post("/api/session-directive", {"kind": kind, "args": args})
+        # The gateway is sent the CALL, not the payload: the tool's name and the
+        # raw arguments it was invoked with (recorded in _call_tool before
+        # validation). The gateway re-derives the payload by re-running the tool
+        # and computes the claim digest itself, so a caller who can reach the
+        # route controls only what the victim's own call would produce.
+        mcp_core._post(
+            "/api/session-directive",
+            {
+                "tool": _tool,
+                "raw_args": mcp_core.current_call_raw_args(),
+            },
+        )
     except Exception:
         pass
     return out
@@ -1140,12 +1169,15 @@ def monitor_start(name: str, args: dict[str, Any]) -> str:
             "fire to their turn's end without restarting the countdown)"
             + (f", stopping after {max_cycles} cycles" if max_cycles else ", with NO cycle cap")
             + (f", wall-clock budget {max_runtime_secs}s" if max_runtime_secs else "")
-            + ". End your turn now; once the loop is armed it wakes you on "
-            "that interval — but arming happens when this turn's result is "
-            "processed, and only a live dashboard/Slack/Discord session can "
-            "host a loop, so do NOT assume it armed. Call autonudge_stop when "
-            "the exit condition is met; hitting the cap is a runaway backstop, "
-            "not a finish. Use monitor_update if the instruction goes stale."
+            + ". End your turn now. Arming happens when this turn's result is "
+            "processed, so this ack cannot confirm it; the outcome is reported "
+            'as a transcript notice on this session — "Automation loop armed: '
+            'loop <id> … next wake …" or "Automation loop NOT armed: <reason> '
+            "[status N]\" — and the applier's own result replaces this text in "
+            "the transcript. If the notice says NOT armed, read the reason "
+            "before trying again. Call autonudge_stop when the exit condition is "
+            "met; hitting the cap is a runaway backstop, not a finish. Use "
+            "monitor_update if the instruction goes stale."
         ),
     )
 
@@ -1249,6 +1281,12 @@ def monitor_inspect(name: str, args: dict[str, Any]) -> str:
 def _compact_monitor_inspection(result: dict[str, Any]) -> dict[str, Any]:
     """Project the browser record into a bounded, agent-oriented status."""
     compact = {key: result.get(key) for key in ("enabled", "active", "monitor_id") if key in result}
+    # Surface the auto-nudge loop reading (#9194) so a caller can tell an armed
+    # auto-nudge loop from nothing armed. It is already a bounded, fixed-key dict
+    # from the handler, so it passes through as-is; absent on responses that
+    # predate the field, and None when no loop is armed.
+    if "autonudge_loop" in result:
+        compact["autonudge_loop"] = result.get("autonudge_loop")
     raw = result.get("monitor")
     if not isinstance(raw, dict):
         compact["monitor"] = None
