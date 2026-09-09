@@ -9763,7 +9763,7 @@ class GatewayOrchestrator:
             # in play — validating one remote while installing from another is
             # exactly the gap resolve_remote_url's docstring warns against.
             remote_proc = await asyncio.create_subprocess_exec(
-                "git",
+                _git,
                 "config",
                 "--get",
                 f"branch.{branch}.remote",

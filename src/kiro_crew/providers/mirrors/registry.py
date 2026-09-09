@@ -15,6 +15,7 @@ from kiro_crew.acp_backends import (
     ACP_BACKEND_CODEX,
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
+    ACP_BACKEND_OPENCODE,
 )
 from kiro_crew.providers.mirrors.base import AgentConfigMirror
 from kiro_crew.providers.mirrors.claude_code import ClaudeCodeMirror
@@ -42,6 +43,18 @@ NO_MIRROR: dict[str, str] = {
         "KAS's own capability vocabulary) — it simply has not moved into this folder "
         "yet. Tracked as the next PR in the mirror stack; NOT a claim that it needs "
         "no mirror"
+    ),
+    ACP_BACKEND_OPENCODE: (
+        "RoyCrew fork backend. Its only native-config write is the isolated "
+        "<opencode-home>/.config/opencode/opencode.json the spawn path seeds "
+        "(acp/client.py _write_opencode_provider_config): the fork's custom provider "
+        "entry — baseURL, apiKey and the openai wire format — plus a HOME override so "
+        "the user's own opencode config (plugins, MCP servers that stall the ACP "
+        "session) cannot leak in. That is provider credentials, not a projection of "
+        "the agent spec. It is deliberately NOT in ACP_BACKENDS_SESSION_MCP_ARRAY, so "
+        "it receives no spec-derived mcpServers — which matches what it did before the "
+        "upstream merge, and is an honest statement of today's behaviour rather than a "
+        "claim that projecting prompt/tools onto it would be worthless"
     ),
     ACP_BACKEND_CODEX: (
         "codex is in ACP_BACKENDS_KNOWN but not in BASELINE_SELECTABLE_BACKENDS, so "

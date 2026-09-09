@@ -75,8 +75,8 @@ from kiro_crew.acp.types import (
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_CODEX,
     ACP_BACKEND_KIRO,
-    ACP_BACKENDS_ADVERTISED_MODEL_SELECTION,
     ACP_BACKEND_OPENCODE,
+    ACP_BACKENDS_ADVERTISED_MODEL_SELECTION,
     ACP_BACKENDS_INTERNAL_SANDBOX,
     ACP_BACKENDS_MEMBER_DISPATCH,
     ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION,
@@ -3032,6 +3032,7 @@ def _message_has_image_path(message: str) -> bool:
     except Exception:  # pragma: no cover - import/attr drift guard
         return False
 
+
 def _sandbox_preflight(backend: str, mode: str) -> tuple[str, ...]:
     """Refuse an unmasked enforced adapter, then resolve its credential mask.
 
@@ -3414,14 +3415,16 @@ class AcpClient:
         # _capture_available_models, which parses the real dict-shaped `models`).
         self._acp_config_options: list[dict] = []
 
-        # Fork: seed the claude backend's per-session settings.local.json now
-        # that _model_via_env is known — the settings file is authoritative
-        # over ANTHROPIC_MODEL env, so the router model must be pinned there.
-        if self._is_claude:
-            try:
-                self._write_claude_local_settings()
-            except Exception:
-                logger.debug("claude local settings seed failed", exc_info=True)
+        # Fork: the router model pin lands via the settings file too, but the
+        # seed already runs on the primary spawn path below (``_spawn``,
+        # before the subprocess launches) — no separate write here. An eager
+        # write in __init__ would claim authorship of the file before that
+        # call ever runs, so a caller's own first ``_write_claude_local_settings``
+        # (a test, or the spawn path itself) sees ``authored=True`` already and
+        # takes the re-seed/ownership-verify branch instead of the O_EXCL
+        # create — silently reachable by a sibling session's race, and it also
+        # writes the model before ``resolve_wire_model_id`` runs, so it would be
+        # immediately overwritten by the real seed anyway.
 
     @property
     def backend(self) -> str:
@@ -3763,6 +3766,60 @@ class AcpClient:
         finally:
             os.close(fd)
 
+    def _clear_stale_wildcard(self, path: Path) -> bool:
+        """Drop a ``availableModels: ["*"]`` an earlier Crew session left behind.
+
+        Returns True when it handled the file (cleaned it, or found it already
+        clean of the marker but still Crew-recognisable), False to let the
+        caller fall through to its normal ownership handling.
+
+        Only the EXACT wildcard is treated as Crew's: that value is written by
+        exactly one place (the base-URL branch below) and means nothing to a
+        human, whereas any other list is the user's own allowlist and must
+        survive untouched. Best-effort -- an unreadable or non-JSON file is not
+        Crew's to interpret, so it falls through.
+        """
+        # Opened exactly as _claude_settings_is_still_ours opens it, and for the
+        # same reasons. This is the one path that touches a file Crew did not
+        # author, so by the time it runs the path is whatever the world left
+        # there: O_NOFOLLOW because _claude_settings_usable's symlink check ran
+        # earlier and re-opening by name would reopen the window it closed;
+        # O_NONBLOCK plus a regular-file check because a plain open of a FIFO
+        # blocks until someone writes, which would hold the whole gateway's event
+        # loop rather than just this session. Anything that is not a regular file
+        # answers "not Crew's" and is left untouched.
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        try:
+            fd = os.open(path, flags)
+        except OSError:
+            return False
+        try:
+            # fdopen takes ownership immediately, so the `with` is what closes the
+            # descriptor on every exit -- no separate close, and no double close.
+            with os.fdopen(fd, "r", encoding="utf-8") as handle:
+                if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                    return False
+                data = json.load(handle)
+        except (OSError, ValueError):
+            return False
+        if not isinstance(data, dict) or data.get("availableModels") != ["*"]:
+            return False
+        data.pop("availableModels")
+        payload = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+        try:
+            wfd = os.open(path, os.O_WRONLY | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0))
+            with os.fdopen(wfd, "wb") as handle:
+                handle.write(payload.encode("utf-8"))
+            logger.info(
+                "%s carried Crew's own availableModels wildcard from an earlier session; "
+                "cleared it so this native session can advertise the account's real models. "
+                "Nothing else in the file was touched, and Crew does not claim ownership of it.",
+                path,
+            )
+        except OSError:
+            logger.warning("could not clear the stale availableModels wildcard in %s", path)
+        return True
+
     def _write_claude_local_settings(self) -> None:
         """Seed ``<work_dir>/.claude/settings.local.json`` for this session.
 
@@ -3852,6 +3909,14 @@ class AcpClient:
             self._claude_settings_authored = False
             self._claude_settings_written = None
             return
+        if not authored and local_settings.exists() and self._clear_stale_wildcard(local_settings):
+            # Crew's OWN marker from an earlier session, now cleaned. Settings
+            # persist across a backend switch, so a ``["*"]`` written on the
+            # Bedrock/base-URL path would otherwise poison this native session
+            # forever -- the write below is conditional and would never reach it.
+            # Narrow on purpose: only the exact wildcard is Crew's; a
+            # hand-written allowlist is the user's and falls through untouched.
+            return
         if not authored and local_settings.exists():
             # Someone else's file: either the user's own project settings, or a
             # live sibling session's seed (``work_dir`` is caller-supplied and
@@ -3889,24 +3954,36 @@ class AcpClient:
         # every model the router actually serves ("Model X is restricted by
         # your organization's settings") and fall back to a Bedrock default
         # the router then rejects. Verified end-to-end.
+        # Fork: upstream seeds model_registry.seed_available_models() here (its
+        # Bedrock ``global.anthropic.*`` catalog). This fork must NOT: the
+        # adapter reads availableModels literally as an org allowlist, so on the
+        # NATIVE lane a Bedrock list leaves every real id ("opus", "sonnet",
+        # the ids the account actually serves) answering "Invalid value for
+        # config option model" -- the picker shows nothing selectable. Only the
+        # Bedrock/base-URL path gates the 1M window behind the allowlist, and
+        # there the wildcard is what unlocks it. So: wildcard when a base URL is
+        # in play, nothing at all on the native lane.
         router_lane = bool(getattr(self, "_model_via_env", False) and self._model)
-        allowlist = (
-            []
-            if router_lane
-            else model_registry.seed_available_models(self._model_registry_namespace)
-        )
-        if allowlist:
-            data["availableModels"] = allowlist
-        elif not router_lane:
-            # Only reachable with a corrupt/missing model registry (which the
-            # registry already warns about at import) AND a cold advertised-model
-            # cache. Without the allowlist the adapter can collapse the [1m] id to
-            # 200K, so say so here rather than degrade silently.
-            logger.warning(
-                "availableModels empty (corrupt/missing registry and cold advertised-model "
-                "cache?); settings.local.json written without an allowlist — the 1M-token "
-                "window may not resolve",
+        has_base_url = bool((self._extra_env or {}).get("ANTHROPIC_BASE_URL"))
+        if router_lane:
+            pass  # the router serves its own namespace; any allowlist refuses it
+        elif has_base_url:
+            # Bedrock/base-URL path: the wildcard is what unlocks the 1M window.
+            data["availableModels"] = ["*"]
+        elif model_registry.advertised_models(self._model_registry_namespace):
+            # WARM cache: these are the ids this backend actually served, so the
+            # allowlist is in the right namespace and upstream's window-unlock
+            # works as intended.
+            data["availableModels"] = model_registry.seed_available_models(
+                self._model_registry_namespace
             )
+        # COLD cache on the native lane: deliberately nothing. Upstream falls back
+        # to the static Bedrock registry here; this fork must not. Native is real
+        # Claude Code on the user's own sign-in, serving Anthropic's short ids, so
+        # a global.anthropic.* allowlist is read as an org restriction that makes
+        # every genuine id answer "Invalid value for config option model" -- the
+        # picker goes empty. Writing nothing lets the adapter advertise the
+        # account's real models, and the first capture warms the cache above.
         # self._model is a resolved provider id; DEFAULT_MODEL ("auto") is not one,
         # and omitting the key is what lets the adapter pick the allowlist head.
         if router_lane:
@@ -4267,7 +4344,6 @@ class AcpClient:
             return
         self._advertised_models_changed = False
         await asyncio.to_thread(model_registry.persist_advertised_models)
-
 
     @staticmethod
     def _models_from_config_options(session_resp: dict) -> list[dict[str, str]]:
@@ -7788,7 +7864,7 @@ class AcpClient:
                 # the true window, so prefer it over the SDK's fallback — a
                 # 200K reading for a 1M model makes the context meter lie
                 # ("96K / 200K") and can force premature compaction.
-                resolved = self._resolved_model_id or self._model or ""
+                resolved = getattr(self, "_resolved_model_id", None) or getattr(self, "_model", None) or ""
                 if (
                     size <= 200_000
                     and model_registry.has_known_window(resolved)
@@ -8610,7 +8686,13 @@ class AcpClient:
         lives on ``AcpPromptStats.backfill_context_window`` (the AcpSessionHandle
         path delegates to the same method, so the two can no longer drift).
         """
-        self.last_prompt_stats.backfill_context_window(pct, self._resolved_model_id or self._model)
+        # getattr defaults: a bare client (AcpClient.__new__, used by tests and
+        # by the usage-tracking path before __init__ runs) has neither attribute.
+        # "" rather than None keeps the declared str contract of the callee.
+        self.last_prompt_stats.backfill_context_window(
+            pct,
+            getattr(self, "_resolved_model_id", None) or getattr(self, "_model", None) or "",
+        )
 
     def _track_metadata(self, msg: JsonRpcMessage) -> None:
         params = msg.params or {}

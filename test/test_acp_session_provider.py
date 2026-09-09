@@ -35,6 +35,10 @@ def _make_handle(
     handle.reject_tool = AsyncMock()
     handle.cancel = AsyncMock()
     handle.wait_turn_done = AsyncMock(return_value=True)
+    # async in production (AcpSessionHandle.refresh_available_models), so the
+    # double must be awaitable too -- a plain MagicMock here made _guarded()
+    # await a MagicMock. Individual tests still override the return value.
+    handle.refresh_available_models = AsyncMock(return_value=[])
     return handle
 
 

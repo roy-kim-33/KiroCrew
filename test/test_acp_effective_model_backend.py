@@ -8,6 +8,19 @@ backends advertise in different namespaces). The warm-pool switch path
 (``session_allocation``) already keyed the translation on the backend, so the
 same pinned model behaved differently depending on whether a pooled process
 happened to exist. These pin that the two paths now agree.
+
+RoyCrew fork: upstream asserts the claude id lands in its Bedrock namespace
+(``global.anthropic.*``). This fork does NOT translate on either claude lane --
+see ``acp_effective_model``'s own comment, which records the live verification:
+native Claude Code takes Anthropic's short names ("opus", "sonnet") and answers
+the Bedrock form with "Invalid value for config option model", which made the
+two most-used models unselectable. The router lane needs the router's own
+namespace (cmc/..., oc/...) for the same reason.
+
+So the namespace assertions below are the FORK's: the id must not land in
+kiro's namespace (the real defect this file was written to catch, and which
+still applies here), and it stays the canonical registry key rather than being
+rewritten into Bedrock form.
 """
 
 from __future__ import annotations
@@ -37,7 +50,8 @@ def test_claude_backend_gets_a_claude_provider_id() -> None:
     """A canonical key resolves into the claude namespace, not kiro's."""
     resolved = _cfg(ACP_BACKEND_CLAUDE, PINNED).acp_effective_model(None, None)
     assert resolved != KIRO_ID, "kiro-namespaced id leaked to the claude backend"
-    assert "anthropic" in resolved, f"expected a claude provider id, got {resolved!r}"
+    # Fork: the canonical key goes out untranslated (see module docstring).
+    assert resolved == PINNED, f"expected the untranslated canonical key, got {resolved!r}"
 
 
 def test_kiro_backend_keeps_the_kiro_id() -> None:
@@ -64,4 +78,5 @@ def test_an_explicit_override_is_also_translated_for_claude() -> None:
     """``model_override`` wins the precedence chain and must not skip translation."""
     resolved = _cfg(ACP_BACKEND_CLAUDE, "").acp_effective_model(None, PINNED)
     assert resolved != KIRO_ID
-    assert "anthropic" in resolved
+    # Fork: override still bypasses kiro's namespace; it is not Bedrock-ised.
+    assert resolved == PINNED

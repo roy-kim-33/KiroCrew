@@ -640,18 +640,26 @@ class TestLocalSettingsSeed:
     def _client(self, tmp_path, **kw):
         return AcpClient(work_dir=tmp_path, acp_backend=ACP_BACKEND_CLAUDE, **kw)
 
-    def test_seed_writes_the_model_allowlist(self, tmp_path):
-        from kiro_crew import model_registry
+    def test_seed_writes_no_allowlist_on_the_native_lane(self, tmp_path):
+        """RoyCrew fork: upstream writes ``seed_available_models("claude_code")``
+        (its Bedrock ``global.anthropic.*`` catalog) here. This fork must not.
 
+        The adapter reads ``availableModels`` LITERALLY as an org allowlist. On
+        this fork's native lane the backend is real Claude Code on the user's own
+        sign-in, serving Anthropic's short ids -- so a Bedrock allowlist makes
+        every genuine id answer "Invalid value for config option model" and the
+        picker offers nothing selectable. The 1M-window unlock the upstream
+        assertion protects is gated behind the allowlist only on the Bedrock /
+        base-URL path, which keeps its own coverage in
+        ``test_router_auto_and_catalog.py::TestNativeModelPicker``
+        (``test_router_lane_keeps_the_window_unlock``), whose fixtures already
+        stop a live router probe from resolving a model and flipping this into
+        the pinned-model branch.
+        """
         client = self._client(tmp_path)
         client._write_claude_local_settings()
         data = json.loads((tmp_path / ".claude" / "settings.local.json").read_text())
-        # Without the allowlist the adapter can collapse a versioned [1m] id back
-        # to the 200K window. The seed writes the window-deduped list (a 200K base
-        # id is dropped when its 1M sibling is present), so it can differ from the
-        # raw registry list — compare against seed_available_models, the deduped
-        # source the seed actually uses.
-        assert data["availableModels"] == model_registry.seed_available_models("claude_code")
+        assert "availableModels" not in data
 
     def test_no_permission_mode_leaves_the_adapter_default(self, tmp_path):
         client = self._client(tmp_path)

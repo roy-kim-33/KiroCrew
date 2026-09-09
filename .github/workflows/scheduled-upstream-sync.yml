@@ -55,6 +55,9 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
+      # persist-credentials retained: sync/Push sync branch runs `git push origin`
+      # (and the conflict path's `git commit` + push), so this checkout's credential
+      # is the one that authenticates them. The other fork workflows opt out.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
@@ -152,11 +155,26 @@ jobs:
       - name: Open draft PR
         if: steps.check.outputs.behind != '0' && steps.merge.outputs.conflict == 'true'
         run: |
-          gh pr create --draft \
+          # The branch is already pushed, so a refusal to OPEN the PR is a
+          # policy decision, not a broken sync -- hand off the compare link and
+          # stay green. Any other failure is real and still fails loud.
+          rc=0
+          out="$(gh pr create --draft \
             --base main \
             --head "${{ steps.branch.outputs.branch }}" \
             --title "sync: upstream/main merge conflicts need resolution" \
-            --body-file /tmp/pr-body.md
+            --body-file /tmp/pr-body.md 2>&1)" || rc=$?
+          printf '%s\n' "$out"
+          if [ "$rc" -ne 0 ]; then
+            case "$out" in
+              *"not permitted to create or approve pull requests"*)
+                echo "::notice::Actions may not open PRs in this repo. The conflicted branch IS pushed; open it by hand:"
+                echo "::notice::https://github.com/${{ github.repository }}/compare/main...${{ steps.branch.outputs.branch }}?expand=1"
+                exit 0
+                ;;
+            esac
+            exit "$rc"
+          fi
 
       # ---- clean path: verify the seam, then open a normal PR ----
 
@@ -185,8 +203,22 @@ jobs:
         env:
           BEHIND: ${{ steps.check.outputs.behind }}
         run: |
-          gh pr create \
+          # Same handoff as the draft path: the branch is pushed and the seam
+          # tests passed, so a policy refusal must not turn a good sync red.
+          rc=0
+          out="$(gh pr create \
             --base main \
             --head "${{ steps.branch.outputs.branch }}" \
             --title "sync: merge upstream/main ($BEHIND commits)" \
-            --body "Merges kirodotdev/KiroCrew's \`main\` into this fork ($BEHIND new commit(s)). The claude_code/9router seam tests (\`scripts/sync-upstream.sh verify\`) passed on this merge commit. Merged, not rebased or squashed -- see this workflow's header for why."
+            --body "Merges kirodotdev/KiroCrew's \`main\` into this fork ($BEHIND new commit(s)). The claude_code/9router seam tests (\`scripts/sync-upstream.sh verify\`) passed on this merge commit. Merged, not rebased or squashed -- see this workflow's header for why." 2>&1)" || rc=$?
+          printf '%s\n' "$out"
+          if [ "$rc" -ne 0 ]; then
+            case "$out" in
+              *"not permitted to create or approve pull requests"*)
+                echo "::notice::Actions may not open PRs in this repo. The verified sync branch IS pushed; open it by hand:"
+                echo "::notice::https://github.com/${{ github.repository }}/compare/main...${{ steps.branch.outputs.branch }}?expand=1"
+                exit 0
+                ;;
+            esac
+            exit "$rc"
+          fi

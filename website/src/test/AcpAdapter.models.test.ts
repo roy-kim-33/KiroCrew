@@ -68,14 +68,14 @@ describe('AcpAdapter.fetchAvailableModels', () => {
     // switch (every session dropped, no router probe to cover it), so serving
     // the cache there showed the old router's models in the native picker --
     // wrong, unselectable, and it stuck because non-empty data looks fine.
-    ;(api.models as any).mockResolvedValueOnce([
+    ;(api.models as Mock).mockResolvedValueOnce([
       { model_name: 'auto', description: 'a' },
       { model_name: 'oc/kimi-k3', description: 'router model' },
     ])
     const adapter = new AcpAdapter()
     await adapter.fetchAvailableModels() // primes the cache under the router
 
-    ;(api.models as any).mockResolvedValue([]) // now on native: nothing advertised yet
+    ;(api.models as Mock).mockResolvedValue([]) // now on native: nothing advertised yet
     const served = await adapter.fetchAvailableModels()
     expect(served.map(m => m.name)).toEqual(['auto'])
     expect(served.some(m => m.name === 'oc/kimi-k3')).toBe(false)

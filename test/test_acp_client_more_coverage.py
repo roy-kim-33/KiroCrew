@@ -410,6 +410,13 @@ class TestClientAccessors:
         client._process = _live_process()
         assert client.is_process_alive() is True
         assert client.exit_code is None
+        # A live process alone is NOT an unfinished turn: _turn_done starts SET,
+        # so a client that has never run a turn reports none in flight. (Before
+        # that fix, has_active_turn() read true for any freshly spawned slot and
+        # the model-switch handler answered 409 "a turn is in flight" forever.)
+        assert client.has_unfinished_turn() is False
+
+        client._turn_done.clear()  # a turn is now genuinely in flight
         assert client.has_unfinished_turn() is True  # turn not done + process alive
 
         client._process.returncode = 3
@@ -1676,13 +1683,26 @@ class TestAdvertisedModelCacheWiring:
         client._write_claude_local_settings()
         assert self._read_seed(tmp_path)["availableModels"] == served
 
-    def test_seed_falls_back_to_registry_on_cold_cache(self, tmp_path, monkeypatch):
+    def test_cold_cache_seeds_no_allowlist_on_the_native_lane(self, tmp_path, monkeypatch):
+        """RoyCrew fork: upstream falls back to the static registry here; this
+        fork writes NOTHING instead.
+
+        The warm-cache case above is unchanged and still seeds the allowlist --
+        those are the ids the backend really advertised, so they are in the right
+        namespace and upstream's 1M-window unlock works. The COLD fallback is the
+        one that cannot survive here: it is the static Bedrock
+        ``global.anthropic.*`` catalog, and this fork's native lane is real Claude
+        Code on the user's own sign-in serving Anthropic's short ids. The adapter
+        reads ``availableModels`` literally as an org allowlist, so seeding
+        Bedrock ids makes every genuine id answer "Invalid value for config option
+        model" and the picker offers nothing selectable. Writing nothing lets the
+        adapter advertise the account's real models, and the first capture warms
+        the cache the test above covers.
+        """
         monkeypatch.setattr(mr, "_ADVERTISED_MODELS", {})
         client = _client(tmp_path, acp_backend=ACP_BACKEND_CLAUDE)
         client._write_claude_local_settings()
-        assert self._read_seed(tmp_path)["availableModels"] == mr.seed_available_models(
-            "claude_code"
-        )
+        assert "availableModels" not in self._read_seed(tmp_path)
 
     def test_claude_capture_feeds_and_flags_the_cache(self, tmp_path, monkeypatch):
         monkeypatch.setattr(mr, "_ADVERTISED_MODELS", {})

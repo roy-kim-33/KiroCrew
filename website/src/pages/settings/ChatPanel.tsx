@@ -832,7 +832,7 @@ export function ChatPanel() {
                   <div className="max-h-40 overflow-y-auto rounded border border-border p-2 grid grid-cols-1 gap-1">
                     {(providerTestResult?.models ?? savedWhitelist).map(id => (
                       <label key={id} className="flex items-center gap-2 text-[13px] cursor-pointer">
-                        <input type="checkbox" checked={modelSel.includes(id)} onChange={() => toggleWhitelistModel(id)} className="accent-accent" />
+                        <input type="checkbox" aria-label={id} checked={modelSel.includes(id)} onChange={() => toggleWhitelistModel(id)} className="accent-accent" />
                         <span className="font-mono text-text truncate">{id}</span>
                       </label>
                     ))}
