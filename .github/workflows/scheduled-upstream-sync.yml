@@ -53,7 +53,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      GH_TOKEN: ${{ github.token }}
+      # Same token for the gh CLI. Bonus: a PR opened with a PAT DOES trigger
+      # ci.yml, which a GITHUB_TOKEN-authored PR does not (see this file's header)
+      # -- so the sync PR now gets a real CI verdict before a human merges it.
+      GH_TOKEN: ${{ secrets.SYNC_PAT || github.token }}
     steps:
       # persist-credentials retained: sync/Push sync branch runs `git push origin`
       # (and the conflict path's `git commit` + push), so this checkout's credential
@@ -62,6 +65,15 @@ jobs:
         with:
           fetch-depth: 0
           ref: main
+          # SYNC_PAT, not github.token: upstream routinely changes its OWN
+          # .github/workflows/*, so a sync branch's diff contains workflow files
+          # -- and GITHUB_TOKEN is refused there ("refusing to allow a GitHub App
+          # to create or update workflow ... without `workflows` permission").
+          # There is no `workflows:` key for the permissions block, so this is the
+          # only mechanism. Falls back to github.token when the secret is absent,
+          # which keeps the workflow runnable (it will simply fail the same way at
+          # the push, as before) rather than erroring on a missing secret.
+          token: ${{ secrets.SYNC_PAT || github.token }}
 
       - name: Configure git identity
         run: |
