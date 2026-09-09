@@ -574,7 +574,9 @@ class TestEndpointPayloadShape:
         assert response.status == 200
 
         rows = json.loads(response.text or "{}")["backends"]
-        assert [r["policy_id"] for r in rows] == ["claude", "codex", "kas", "kiro"]
+        # RoyCrew fork adds "opencode" to ACP_BACKENDS_KNOWN; upstream doesn't
+        # know about it, so it wasn't in the pinned shape.
+        assert [r["policy_id"] for r in rows] == ["claude", "codex", "kas", "kiro", "opencode"]
         for row in rows:
             assert set(row) == {
                 "id",

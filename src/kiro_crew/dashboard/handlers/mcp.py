@@ -30,7 +30,7 @@ from kiro_crew.config.loader import (
     _resolve_stub_roster,
 )
 from kiro_crew.config.paths import data_home, kiro_agents_dir
-from kiro_crew.dashboard.handlers._shared import read_bounded_json
+from kiro_crew.dashboard.handlers._shared import read_bounded_json, require_owner_dashboard_request
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.env import emit_env
 from kiro_crew.loop_lock import LoopBoundLock
@@ -3615,6 +3615,15 @@ async def api_mcp_gateway_set_poolable(request: web.Request) -> web.Response:
     """
     from kiro_crew.config.loader import config_path  # noqa: F811
     from kiro_crew.dashboard.handlers.agents import _get_config_lock  # circular: agents imports mcp
+
+    # Owner gate BEFORE the body is read, matching every other gated mutating
+    # route: this writes config.json, so the name/shape validation below is
+    # defending against input only the owner may supply in the first place.
+    # Validating first also answered 400 to a non-owner, which tells an
+    # unauthorized caller whether their body was well-formed.
+    owner_denied = await require_owner_dashboard_request(request, "mcp_gateway.poolable")
+    if owner_denied is not None:
+        return owner_denied
 
     try:
         body = await request.json()

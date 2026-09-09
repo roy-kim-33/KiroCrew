@@ -22,6 +22,7 @@ from kiro_crew.acp_backends import (
     ACP_BACKEND_CODEX,
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
+    ACP_BACKEND_OPENCODE,
 )
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.dashboard.handlers.agents import _supply_live_enum
@@ -152,8 +153,16 @@ def test_baseline_ships_every_known_backend():
     probe for the adapter, so the switch would render with nothing to say about a
     session that failed to start.
     """
+    # RoyCrew fork: also ships ACP_BACKEND_OPENCODE (see acp_backends.py) --
+    # upstream doesn't know about this backend.
     baseline: List[str] = sorted(acp_backends.BASELINE_SELECTABLE_BACKENDS)
     assert baseline == sorted(
-        [ACP_BACKEND_KIRO, ACP_BACKEND_CLAUDE, ACP_BACKEND_KAS, ACP_BACKEND_CODEX]
+        [
+            ACP_BACKEND_KIRO,
+            ACP_BACKEND_CLAUDE,
+            ACP_BACKEND_KAS,
+            ACP_BACKEND_CODEX,
+            ACP_BACKEND_OPENCODE,
+        ]
     )
     assert baseline == sorted(acp_backends.ACP_BACKENDS_KNOWN - NOT_SHIPPED_SELECTABLE)

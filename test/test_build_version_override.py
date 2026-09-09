@@ -26,6 +26,7 @@ and ``--version`` all report the stamp, and the governance floor sees it too.
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -39,6 +40,11 @@ from kiro_crew import _build_version_override as build_version_override
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC = REPO_ROOT / "src"
 PKG_DIR = SRC / "kiro_crew"
+
+# A synthetic bare-numeric base for tests that need a stamp to actually
+# compose (see ``_stamped_package_root``'s ``version_override``). Disconnected
+# from this repo's real version on purpose.
+_STAMPABLE_BASE = "9.9.9"
 
 
 # ── build_version_override: the shape rule ──────────────────────────────────
@@ -165,7 +171,9 @@ def test_an_undecodable_file_keeps_the_base(tmp_path) -> None:
 # ── reach: a fresh interpreter importing a package that carries the file ────
 
 
-def _stamped_package_root(tmp_path: Path, stamp: str | None) -> Path:
+def _stamped_package_root(
+    tmp_path: Path, stamp: str | None, version_override: str | None = None
+) -> Path:
     """A ``kiro_crew`` package that IS the source tree's, with the file beside it.
 
     ``__init__.py`` is a byte copy of the real one (the code under test) plus a
@@ -173,11 +181,29 @@ def _stamped_package_root(tmp_path: Path, stamp: str | None) -> Path:
     so ``kiro_crew.dashboard...`` imports the real modules while
     ``kiro_crew.__file__`` -- the anchor the stamp is read beside -- is the
     copy. Nothing is written into the source tree, and no symlink is needed.
+
+    ``version_override``, when given, replaces the ``__version__ = "..."``
+    literal in the copy. This repo's actual base (``0.7.0-roycrew.1``) is a
+    prerelease shape and, per ``_BARE_RELEASE``, can never take a ``.N``
+    stamp -- that guard is by design (see ``_build_version_override``'s
+    docstring), not something these tests should route around. Tests that
+    exercise an *accepted* stamp use a bare-numeric override so they cover
+    the same reach mechanism the real ``__init__.py`` runs, over a base shape
+    the stamp feature actually supports.
     """
     root = tmp_path / "pkgroot"
     pkg = root / "kiro_crew"
     pkg.mkdir(parents=True)
     init_src = (PKG_DIR / "__init__.py").read_text(encoding="utf-8")
+    if version_override is not None:
+        init_src, count = re.subn(
+            r'^__version__ = "[^"]+"',
+            f'__version__ = "{version_override}"',
+            init_src,
+            count=1,
+            flags=re.MULTILINE,
+        )
+        assert count == 1, "expected exactly one __version__ assignment to override"
     (pkg / "__init__.py").write_text(
         init_src + f"\n__path__.append({str(PKG_DIR)!r})\n", encoding="utf-8"
     )
@@ -186,8 +212,13 @@ def _stamped_package_root(tmp_path: Path, stamp: str | None) -> Path:
     return root
 
 
-def _fresh_interpreter(tmp_path: Path, stamp: str | None, code: str) -> subprocess.CompletedProcess:
-    root = _stamped_package_root(tmp_path, stamp)
+def _fresh_interpreter(
+    tmp_path: Path,
+    stamp: str | None,
+    code: str,
+    version_override: str | None = None,
+) -> subprocess.CompletedProcess:
+    root = _stamped_package_root(tmp_path, stamp, version_override=version_override)
     env = dict(os.environ)
     # The stamped package root first; the parent's sys.path follows only for
     # third-party deps. No bytecode: the child must leave nothing behind, in
@@ -230,13 +261,25 @@ def _parse(out: str) -> dict[str, str]:
 
 def test_the_stamp_reaches_every_import_time_copy(tmp_path) -> None:
     """The property the file exists for: a package carrying it names the build
-    everywhere a user can read a version."""
-    base = _fresh_interpreter(tmp_path / "a", None, _REACH_PROBE)
+    everywhere a user can read a version.
+
+    Run over ``_STAMPABLE_BASE``, not this repo's real ``__version__``: the
+    fork's actual base is a prerelease shape (``0.7.0-roycrew.1``) that
+    ``_BARE_RELEASE`` refuses to extend by design (a composed
+    ``<prerelease>.N`` would not parse as PEP 440), so a bare-numeric base is
+    the only shape this reach property can be demonstrated over.
+    """
+    base = _fresh_interpreter(
+        tmp_path / "a", None, _REACH_PROBE, version_override=_STAMPABLE_BASE
+    )
     assert base.returncode == 0, base.stderr
     got_base = _parse(base.stdout)
+    assert got_base["version"] == _STAMPABLE_BASE
     stamped = f"{got_base['version']}.12"
 
-    proc = _fresh_interpreter(tmp_path / "b", stamped + "\n", _REACH_PROBE)
+    proc = _fresh_interpreter(
+        tmp_path / "b", stamped + "\n", _REACH_PROBE, version_override=_STAMPABLE_BASE
+    )
     assert proc.returncode == 0, proc.stderr
     got = _parse(proc.stdout)
     assert got["version"] == stamped
@@ -259,10 +302,18 @@ def test_a_refused_file_leaves_every_copy_on_the_base(tmp_path) -> None:
 
 def test_the_cli_version_flag_reports_the_build(tmp_path) -> None:
     """``kirocrew --version`` is an argparse ``action="version"`` that reads
-    ``__version__`` at parser build; it inherits the stamp with no CLI change."""
+    ``__version__`` at parser build; it inherits the stamp with no CLI change.
+
+    Run over ``_STAMPABLE_BASE`` -- see ``test_the_stamp_reaches_every_import_time_copy``
+    for why this repo's real prerelease base cannot take a stamp.
+    """
     base = _fresh_interpreter(
-        tmp_path / "a", None, "import kiro_crew; print(kiro_crew.__version__)"
+        tmp_path / "a",
+        None,
+        "import kiro_crew; print(kiro_crew.__version__)",
+        version_override=_STAMPABLE_BASE,
     )
+    assert base.stdout.strip() == _STAMPABLE_BASE
     stamped = f"{base.stdout.strip()}.12"
     proc = _fresh_interpreter(
         tmp_path / "b",
@@ -270,6 +321,7 @@ def test_the_cli_version_flag_reports_the_build(tmp_path) -> None:
         "import sys\nsys.argv = ['kirocrew', '--version']\n"
         "from kiro_crew.cli import main\n"
         "try:\n    main()\nexcept SystemExit as exc:\n    raise SystemExit(exc.code or 0)\n",
+        version_override=_STAMPABLE_BASE,
     )
     assert proc.returncode == 0, proc.stderr
     assert proc.stdout.strip() == f"kirocrew {stamped}"
@@ -278,7 +330,11 @@ def test_the_cli_version_flag_reports_the_build(tmp_path) -> None:
 def test_the_governance_floor_sees_the_stamp(tmp_path) -> None:
     """A fleet floor is written in the distribution's build numbers. Before
     the stamp the core base could never satisfy ``0.6.0.10`` and every host
-    read as permanently below the floor; with it the floor works as written."""
+    read as permanently below the floor; with it the floor works as written.
+
+    Run over ``_STAMPABLE_BASE`` -- see ``test_the_stamp_reaches_every_import_time_copy``
+    for why this repo's real prerelease base cannot take a stamp.
+    """
     code = (
         "import kiro_crew\n"
         "from kiro_crew.dashboard.handlers import updates\n"
@@ -287,10 +343,16 @@ def test_the_governance_floor_sees_the_stamp(tmp_path) -> None:
         "print('required', ug.update_required(updates._local_version))\n"
     )
     base = _fresh_interpreter(
-        tmp_path / "a", None, "import kiro_crew; print(kiro_crew.__version__)"
+        tmp_path / "a",
+        None,
+        "import kiro_crew; print(kiro_crew.__version__)",
+        version_override=_STAMPABLE_BASE,
     )
     core = base.stdout.strip()
-    proc = _fresh_interpreter(tmp_path / "b", f"{core}.12\n", code)
+    assert core == _STAMPABLE_BASE
+    proc = _fresh_interpreter(
+        tmp_path / "b", f"{core}.12\n", code, version_override=_STAMPABLE_BASE
+    )
     assert proc.returncode == 0, proc.stderr
     got = _parse(proc.stdout)
     assert got["version"] == f"{core}.12"

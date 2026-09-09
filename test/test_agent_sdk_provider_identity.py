@@ -48,8 +48,18 @@ CONVERTED = (
     "context.py",
     "cli_doctor.py",
     "knowledge/llm_pool.py",
-    "dashboard/chat_handlers.py",
     "dashboard/chat_runner.py",
+)
+
+#: RoyCrew fork: ``agent.provider`` is pinned to ``"acp"`` for upstream harness
+#: parity, so the ``provider == "claude_code"`` axis this module gates
+#: (``is_claude_code``) is unreachable in these two files. The merge replaced
+#: their old provider-identity branches with a check on
+#: ``agent.acp_backend == ACP_BACKEND_CLAUDE`` instead -- a different axis, not
+#: a dropped gate -- so they moved off ``CONVERTED`` and onto this list, whose
+#: own non-vacuity guard is :func:`test_acp_backend_gated_files_ask_the_backend_check`.
+ACP_BACKEND_GATED = (
+    "dashboard/chat_handlers.py",
     "dashboard/handlers/agents.py",
 )
 
@@ -209,6 +219,22 @@ def test_converted_files_ask_the_predicate(rel: str) -> None:
     """
     body = (SRC / rel).read_text(encoding="utf-8")
     assert "is_claude_code" in body, f"{rel} no longer asks is_claude_code()"
+
+
+@pytest.mark.parametrize("rel", ACP_BACKEND_GATED)
+def test_acp_backend_gated_files_ask_the_backend_check(rel: str) -> None:
+    """Non-vacuity guard for the files gated on ``acp_backend`` instead.
+
+    These files never ask ``is_claude_code()`` -- ``agent.provider`` is pinned
+    to ``"acp"`` in this fork -- but they still must gate on SOMETHING rather
+    than firing for every backend, so this pins the replacement check.
+    """
+    body = (SRC / rel).read_text(encoding="utf-8")
+    assert "is_claude_code" not in body, (
+        f"{rel} is pinned to the acp_backend axis (see ACP_BACKEND_GATED); "
+        f"if it now asks is_claude_code() too, move it back to CONVERTED"
+    )
+    assert "ACP_BACKEND_CLAUDE" in body, f"{rel} no longer gates on ACP_BACKEND_CLAUDE"
 
 
 def test_onboarding_import_source_id_is_left_alone() -> None:

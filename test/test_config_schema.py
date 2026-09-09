@@ -14,7 +14,9 @@ import typing
 from hypothesis import given
 from hypothesis import strategies as st
 
+from kiro_crew.config import loader as _loader_mod
 from kiro_crew.config import schema as _schema_module
+from kiro_crew.config import sections as _sections_mod
 from kiro_crew.config.loader import (
     AgentConfig,
     DashboardConfig,
@@ -36,6 +38,14 @@ from kiro_crew.config.schema import (
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+# Stringified annotations (``from __future__ import annotations``) are eval'd
+# against this namespace to get a runtime type. Every config dataclass lives
+# in one of these two modules (KiroCrewConfig in loader, everything it nests
+# in sections, e.g. ``agent.vision_providers: list[dict[str, Any]]`` needs
+# sections' ``Any`` import) -- merge both rather than guessing which module a
+# given field's class came from.
+_EVAL_NAMESPACE: dict = {**vars(_loader_mod), **vars(_sections_mod)}
 
 ALL_CONFIG_CLASSES: list[type] = [
     KiroCrewConfig,
@@ -71,10 +81,8 @@ def _all_fields_recursive(
         result.append((path, f))
         tp = f.type
         if isinstance(tp, str):
-            import kiro_crew.config.loader as _mod
-
             try:
-                tp = eval(tp, vars(_mod))  # noqa: S307
+                tp = eval(tp, _EVAL_NAMESPACE)  # noqa: S307
             except Exception:
                 continue
         origin = typing.get_origin(tp)
@@ -105,12 +113,10 @@ def _all_fields_recursive(
 
 def _resolve_type(f: dataclasses.Field) -> type:  # type: ignore[type-arg]
     """Resolve a field's type annotation to a runtime type."""
-    import kiro_crew.config.loader as _mod
-
     tp = f.type
     if isinstance(tp, str):
         try:
-            tp = eval(tp, vars(_mod))  # noqa: S307
+            tp = eval(tp, _EVAL_NAMESPACE)  # noqa: S307
         except Exception:
             return str
     return tp  # type: ignore[return-value]
