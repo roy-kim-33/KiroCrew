@@ -107,6 +107,7 @@ function safeApprovalUrl(value: string): string {
 // The loopback pre-check lives in `utils/loopbackReturnAddress` (shared with
 // the chat banner's relay affordance).
 import { isValidLoopbackReturnAddress, normalizeLoopbackReturnAddress } from '../../utils/loopbackReturnAddress'
+import { isElectron } from '../../lib/electron'
 import { useImeGuard } from '../../hooks/useImeGuard'
 
 export interface PendingConnect {
@@ -289,6 +290,38 @@ export function probeIndicatesConnected(status: string, grantPresent?: boolean):
  */
 export function confirmedGrantPresent(status: ConnectionStatus | undefined): boolean | undefined {
   return status && !status.grantIndeterminate ? status.grantPresent : undefined
+}
+
+/**
+ * Whether an error detail is EVIDENCE of the provider rejecting the authorization.
+ *
+ * The needs-attention banner's strongest copy asserts a provider VERDICT —
+ * "{{provider}} says this connection is no longer valid" — so it may only render
+ * over auth-shaped evidence (an OAuth error code, a 401/403, a revocation, a
+ * refused consent). Everything else a probe can surface (timeouts, DNS failures,
+ * connection resets) is transport noise the provider never spoke through, and
+ * claiming a verdict over it sends the user to revoke/reauthorize flows for a
+ * network blip. Default false: asserting a verdict needs positive evidence, an
+ * unknown error does not earn it.
+ *
+ * Exported for test.
+ */
+export function errorIndicatesProviderRejection(detail: string | undefined): boolean {
+  if (!detail) return false
+  const normalized = detail.toLowerCase()
+  // OAuth error codes and rejection words are matched as whole tokens: a bare
+  // substring test read "certificate has expired" (a TLS transport failure) as
+  // a provider rejection, re-creating the exact misattribution this classifier
+  // exists to prevent. "expired" only counts beside a credential noun, and the
+  // bare status digits only as standalone tokens (not inside a port or an id).
+  if (/\b(invalid_grant|invalid_token|invalid_client|unauthorized|forbidden|revoked)\b/.test(normalized)) {
+    return true
+  }
+  if (/\b(?:token|grant|authorization|credential|session)\b[^.]*\bexpired\b|\bexpired\b[^.]*\b(?:token|grant|authorization|credential|session)\b/.test(normalized)) {
+    return true
+  }
+  if (/\b(denied|consent)\b/.test(normalized)) return true
+  return /(?:^|[^\d.])(401|403)(?:[^\d.]|$)/.test(normalized)
 }
 
 export function connectionStateFor(
@@ -588,15 +621,32 @@ function ConnectionCard({
   // So the click opens a blank tab and this ref holds it until there is somewhere
   // to send it.
   const approvalTabRef = useRef<Window | null>(null)
+  // Whether the attempt whose URL is arriving was STARTED FROM THIS CARD's buttons.
+  // The desktop path's equivalent of `approvalTabRef`'s ownership discipline: the
+  // browser path can only fill a tab its own click opened, so a URL this card did
+  // not ask for reaches the fallback link and nothing else. The desktop path has
+  // no tab to stand in for that ownership, and `approvalUrl` alone does NOT carry
+  // it -- a chat `mcp_oauth` banner (external MCP content, no click of ours) folds
+  // into the same value through `latestOAuthByServer` -> `effectiveOAuth`, so an
+  // ungated hand-off would launch the OS browser at a provider consent page the
+  // user never initiated, and again on every return to the page while the banner
+  // lives. Only `startMint` sets this, so only Connect / Authorize / Reconnect can
+  // auto-open.
+  const startedFromThisCardRef = useRef(false)
+  // The URL already handed to the desktop shell, so an effect that runs twice for
+  // one delivery (StrictMode's double invoke) opens the browser once. State cannot
+  // carry this: both invocations run inside the same commit, before any re-render.
+  const browserHandoffRef = useRef('')
   // Tri-state, not a boolean, because "no tab" and "a tab the browser refused"
   // must read differently and `oauth.minted` cannot tell them apart: it stays
   // false for the whole poll window, so a boolean gated on it let a blocked-popup
   // user read "finish approving in your browser" about a tab they never got --
   // the exact claim this change exists to stop making.
-  //   none    -- this attempt was not started from this card's Connect button
-  //   open    -- the click opened a tab and it is waiting for a URL
-  //   refused -- the click asked for a tab and the browser said no
-  const [clickTab, setClickTab] = useState<'none' | 'open' | 'refused'>('none')
+  //   none     -- this attempt was not started from this card's Connect button
+  //   open     -- the click opened a tab and it is waiting for a URL
+  //   refused  -- the click asked for a tab and the browser said no
+  //   external -- the URL went to the OS default browser (desktop shell only)
+  const [clickTab, setClickTab] = useState<'none' | 'open' | 'refused' | 'external'>('none')
 
   const closeQuietly = (win: Window): boolean => {
     try {
@@ -635,22 +685,35 @@ function ConnectionCard({
   // The tab belongs to the moment a mint attempt starts, whichever button starts
   // it.
   const startMint = async (begin: () => Promise<unknown>) => {
-    let tab: Window | null = null
-    try {
-      // `noopener` is deliberately NOT passed: it makes window.open return null,
-      // and the handle IS the feature here. The reverse-tabnabbing reference it
-      // would have removed is severed on the next line instead, while the tab is
-      // still the same-origin blank document this call just created.
-      tab = window.open('', '_blank')
-      if (tab) tab.opener = null
-    } catch {
-      // A browser that refuses the tab outright is the same case as a blocked
-      // popup, and the fallback link below is the way in.
-      tab = null
+    // Claimed for BOTH hosts before either branch: this is the only place a mint
+    // attempt starts from this card, so it is the only honest place to record that
+    // a URL arriving later is one we asked for.
+    startedFromThisCardRef.current = true
+    // The desktop shell asks for no tab. Every window.open there is arbitrated by
+    // the main process (electron/external-scheme.js): a blank target cannot be
+    // parsed as a URL, so it is denied, the call returns null, and a browser-only
+    // reading of that null degrades the card to the fallback link as its ONLY
+    // route -- which is what made Connect a dead end in the app. Consent also
+    // belongs in the user's real browser, where their provider sessions live, so
+    // this path waits for the URL and hands it to the OS below.
+    if (!isElectron) {
+      let tab: Window | null = null
+      try {
+        // `noopener` is deliberately NOT passed: it makes window.open return null,
+        // and the handle IS the feature here. The reverse-tabnabbing reference it
+        // would have removed is severed on the next line instead, while the tab is
+        // still the same-origin blank document this call just created.
+        tab = window.open('', '_blank')
+        if (tab) tab.opener = null
+      } catch {
+        // A browser that refuses the tab outright is the same case as a blocked
+        // popup, and the fallback link below is the way in.
+        tab = null
+      }
+      if (tab) describeApprovalTab(tab)
+      approvalTabRef.current = tab
+      setClickTab(tab ? 'open' : 'refused')
     }
-    if (tab) describeApprovalTab(tab)
-    approvalTabRef.current = tab
-    setClickTab(tab ? 'open' : 'refused')
     // No reclaim branch here on purpose: a rejected mint ends the attempt without
     // a URL, which the invariant effect below already recognises. One reclaimer
     // rather than one per dead end.
@@ -665,6 +728,32 @@ function ConnectionCard({
   // closed is not ours to do -- the link below remains the way back.
   useEffect(() => {
     if (!approvalUrl) return
+    if (isElectron) {
+      // Nothing to open for a URL this card did not ask for. The browser path
+      // expresses the same rule one line below by finding no tab of its own and
+      // leaving the link as the way in ("a tab the user closed meanwhile is
+      // dropped rather than reopened"); a banner-delivered URL gets exactly that
+      // treatment here, and `clickTab` stays `none` so the heading claims nothing.
+      if (!startedFromThisCardRef.current) return
+      // Handed to the shell at ARRIVAL, not at the click. Electron's
+      // setWindowOpenHandler is main-process arbitration rather than a popup
+      // blocker, so it carries no user-activation requirement -- the constraint
+      // that forces the browser path to pre-open a blank tab does not exist here.
+      // A cross-origin https target classifies as `external`: the main process
+      // calls shell.openExternal and DENIES the in-app window, so the null return
+      // is this path's success shape and must never be read as a refusal. The
+      // hand-off can still fail inside the OS, silently by design, which is why
+      // the link below renders whenever a URL exists.
+      if (browserHandoffRef.current === approvalUrl) return
+      browserHandoffRef.current = approvalUrl
+      try {
+        window.open(approvalUrl, '_blank', 'noopener,noreferrer')
+      } catch {
+        // Nothing to recover: no handle was wanted and the link holds the URL.
+      }
+      setClickTab('external')
+      return
+    }
     const tab = approvalTabRef.current
     if (!tab) return
     approvalTabRef.current = null
@@ -700,6 +789,12 @@ function ConnectionCard({
     if (busy === 'connect') return
     if (state === 'waiting-for-approval') return
     setClickTab('none')
+    // Released with the attempt, exactly like the tri-state above: ownership must
+    // not outlive the attempt that earned it (a later banner would inherit it), and
+    // a later click hands its URL over again even when the mint reproduces the same
+    // URL.
+    startedFromThisCardRef.current = false
+    browserHandoffRef.current = ''
     const orphan = approvalTabRef.current
     if (!orphan) return
     approvalTabRef.current = null
@@ -867,12 +962,20 @@ function ConnectionCard({
                   false for the whole poll window, so gating on it told a
                   blocked-popup user to finish in a browser page they never got.
                   The click's own outcome decides instead, and a flow this card did
-                  not start (`none`) keeps the original rule. Existing keys only:
-                  the fuller copy rewrite needs a 14-locale pass and rides with the
-                  connections-copy slice. */}
-              {t(clickTab === 'open' || (clickTab === 'none' && !oauth?.minted)
-                ? 'pages.connectionsPage.finish_approving_in_browser'
-                : 'pages.connectionsPage.waiting_for_approval')}
+                  not start (`none`) keeps the original rule.
+
+                  The desktop shell has no tab of its own to name: it hands the URL
+                  to the OS default browser when it arrives (`external`), and until
+                  then nothing is open anywhere, so the neutral heading is the only
+                  true one -- the browser-tab claim would be about a window the app
+                  never opens. */}
+              {isElectron
+                ? t(clickTab === 'external'
+                  ? 'pages.connectionsPage.approval_opened_in_default_browser'
+                  : 'pages.connectionsPage.waiting_for_approval')
+                : t(clickTab === 'open' || (clickTab === 'none' && !oauth?.minted)
+                  ? 'pages.connectionsPage.finish_approving_in_browser'
+                  : 'pages.connectionsPage.waiting_for_approval')}
             </div>
             <div className="flex flex-wrap items-center gap-2">
               {approvalUrl ? (
@@ -981,13 +1084,24 @@ function ConnectionCard({
 
         {state === 'needs-attention' && (
           <div className="space-y-3">
-            <div className="flex items-start gap-2 rounded-md bg-danger-subtle p-2.5 text-[12px] text-danger">
-              <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden="true" />
-              <span>
-                {t('pages.connectionsPage.connection_invalid', { provider: provider.name })}
-                {(oauth?.error || server?.error) && <span className="mt-1 block text-[11px] text-muted">{oauth?.error || server?.error}</span>}
-              </span>
-            </div>
+            {/* The headline is copy selected by evidence (verdict vs could-not-reach);
+                the raw detail stays the ErrorNotice `message` so the journal lookup
+                key keeps its structured context. Detail absent: the headline itself
+                is the message so the notice still renders. askAgent is ON: a status
+                card holds no unsaved draft, so the hand-off can destroy nothing. */}
+            <ErrorNotice
+              title={(oauth?.error || server?.error) ? t(
+                errorIndicatesProviderRejection(oauth?.error || server?.error)
+                  ? 'pages.connectionsPage.connection_invalid'
+                  : 'pages.connectionsPage.connection_unreachable',
+                { provider: provider.name },
+              ) : undefined}
+              message={oauth?.error || server?.error || t(
+                'pages.connectionsPage.connection_unreachable',
+                { provider: provider.name },
+              )}
+              askAgent
+            />
             <div className="flex items-center justify-end gap-2">
               {prerequisiteTip}
               <Btn primary onClick={() => void startMint(onReconnect)} disabled={!!busy}>
@@ -1080,18 +1194,19 @@ function ConnectionCard({
 }
 
 /**
- * `servicesEnabled` gates the provider gallery. The Connections work is merged
- * on main but held for a later release, so the default is CLOSED: the Services
- * panel offers no providers, so no card, Connect button or OAuth flow is
- * reachable.
+ * `servicesEnabled` gates the provider gallery. The gallery ships ON, so the
+ * dashboard normally passes `true`; the PARAMETER default stays closed so a
+ * caller that forgets to pass it cannot open a gallery by omission. False means
+ * the instance pulled the `connections_ui` escape hatch: the Services panel
+ * offers no providers, so no card, Connect button or OAuth flow is reachable.
  *
- * The panel still RENDERS rather than being removed, which is deliberate.
+ * A closed panel still RENDERS rather than being removed, which is deliberate.
  * Hiding the sub-tab and defaulting to the MCP Servers table was tried and
  * reverted: it makes that table the default-rendered surface and so exposes its
  * pre-existing i18n debt to the render-time gate, which measured
  * `capabilities-mcp` going 44 -> 102 findings. Emptying the list keeps the
- * measured surface comparable to main (568 -> 558 overall, gate PASS) while
- * still removing every way to actually connect a provider.
+ * measured surface comparable (568 -> 558 overall, gate PASS) while still
+ * removing every way to actually connect a provider.
  */
 export default function ConnectionsPage({ servicesEnabled = false }: { servicesEnabled?: boolean } = {}) {
   const { t } = useTranslation()
@@ -1280,10 +1395,10 @@ export default function ConnectionsPage({ servicesEnabled = false }: { servicesE
   }, [servers, oauthByServer, mintByServer, locallyWaiting, queryClient, t])
 
   const filteredProviders = useMemo(() => {
-    // Held feature: offer nothing. No card renders, so no Connect button and no
-    // OAuth flow is reachable, while the panel itself still renders exactly the
-    // markup it renders on main -- which is what keeps the render-time i18n gate
-    // measuring a comparable surface.
+    // Opted out (`connections_ui: false`): offer nothing. No card renders, so no
+    // Connect button and no OAuth flow is reachable, while the panel itself still
+    // renders exactly the markup a launched gallery renders -- which is what keeps
+    // the render-time i18n gate measuring a comparable surface.
     if (!servicesEnabled) return []
     const needle = search.trim().toLowerCase()
     if (!needle) return CONNECTION_PROVIDERS

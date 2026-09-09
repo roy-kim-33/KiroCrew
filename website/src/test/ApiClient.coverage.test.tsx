@@ -159,6 +159,28 @@ describe('client transport', () => {
     expect(call().headers['X-Session-Key']).toBe('dashboard:chat-3')
   })
 
+  it('the feature-video routes put the caller\'s session key on the wire', async () => {
+    // Both routes are gated server-side by `_is_restricted_session`, which treats
+    // the shared `dashboard:ui` placeholder as NOT restricted -- so a key that never
+    // reaches the header makes that guard unreachable and lets a session which keeps
+    // nothing record a PERMANENT verdict.
+    await api.featureVideoNext('dashboard:chat-4')
+    expect(call().url).toBe('/api/feature-videos/next')
+    expect(call().headers['X-Session-Key']).toBe('dashboard:chat-4')
+
+    await api.featureVideoFeedback('vid-1', 'seen', 'dashboard:chat-4')
+    expect(call(1).url).toBe('/api/feature-videos/feedback')
+    expect(call(1).headers['X-Session-Key']).toBe('dashboard:chat-4')
+    expect(call(1).body).toEqual({ id: 'vid-1', status: 'seen' })
+  })
+
+  it('the feature-video routes fall back to the placeholder when no key is passed', async () => {
+    await api.featureVideoNext()
+    expect(call().headers['X-Session-Key']).toBe('dashboard:ui')
+    await api.featureVideoFeedback('vid-1', 'dismissed')
+    expect(call(1).headers['X-Session-Key']).toBe('dashboard:ui')
+  })
+
   it('createArtifact derives the session key from origin_session_key when none is passed', async () => {
     await api.createArtifact({ name: 'Doc', content: '<p/>', origin_session_key: 'chat-9' })
     expect(call().headers['X-Session-Key']).toBe('dashboard:chat-9')
@@ -577,6 +599,15 @@ describe('session-expired banner', () => {
 /* ──────────────────── 2. URL and body construction ──────────────────── */
 
 describe('query-string builders', () => {
+  it('wakatimeExportUrl builds the export href with encoded dates and the format', () => {
+    expect(api.wakatimeExportUrl('2026-09-01', '2026-09-07', 'csv')).toBe(
+      '/api/wakatime/export?start=2026-09-01&end=2026-09-07&format=csv',
+    )
+    expect(api.wakatimeExportUrl('2026-09-01', '2026-09-07', 'json')).toBe(
+      '/api/wakatime/export?start=2026-09-01&end=2026-09-07&format=json',
+    )
+  })
+
   it('kiroPrerequisite distinguishes latched read, coalesced poll and explicit probe', async () => {
     await api.kiroPrerequisite()
     expect(call().url).toBe('/api/kiro-prerequisite')
@@ -1421,18 +1452,73 @@ describe('publishToProvider', () => {
   })
 })
 
+describe('voice synthesis request ownership', () => {
+  it('announces the request synchronously and sends the same id to the gateway', async () => {
+    const started = vi.fn()
+    window.addEventListener('voice-synthesis-start', started)
+    try {
+      const synthesis = api.voiceSynthesize('slot-1', '你好')
+      expect(started).toHaveBeenCalledOnce()
+      const detail = (started.mock.calls[0][0] as CustomEvent).detail
+      expect(detail.slot).toBe('slot-1')
+      expect(detail.request_id).toEqual(expect.any(String))
+      await synthesis
+      expect(call().body).toEqual({ slot: 'slot-1', text: '你好', request_id: detail.request_id })
+    } finally {
+      window.removeEventListener('voice-synthesis-start', started)
+    }
+  })
+
+  it('preserves the structured HTTP error for the request owner to filter', async () => {
+    const failed = vi.fn()
+    fetchMock.mockResolvedValue(res(502, { error: 'provider unavailable', code: 'voice_model_config_invalid' }))
+    window.addEventListener('voice-synthesis-failed', failed)
+    try {
+      await expect(api.voiceSynthesize('slot-1', '你好', { request_id: 'request-1' })).rejects.toBeInstanceOf(ApiError)
+      expect(failed).toHaveBeenCalledOnce()
+      expect((failed.mock.calls[0][0] as CustomEvent).detail).toEqual({
+        slot: 'slot-1', request_id: 'request-1', code: 'voice_model_config_invalid',
+      })
+    } finally {
+      window.removeEventListener('voice-synthesis-failed', failed)
+    }
+  })
+})
+
 /* ─────────────────── 4. whole-surface request invariant ─────────────────── */
 
 describe('every api method issues one well-formed /api request', () => {
   // Exercised individually above with the fixtures they need (a Blob, a
   // ReadableStream, a File list, an object-URL download).
-  // `skills` and `slashCommands` join them because each wraps its fetch in a
-  // deadline, so it USES the signal argument rather than forwarding it.
-  const HAND_TESTED = new Set(['sttTranscribe', 'uploadFiles', 'uploadCrewAvatar', 'installFromRegistryStream', 'exportPlanYaml', 'skills', 'slashCommands'])
+  // `skills` joins them because it wraps the fetch in a deadline, so it USES the
+  // signal argument rather than forwarding it; junk there is not a URL question.
+  // `appSessionStatus` cannot be probed positionally: its 4th argument is a
+  // boolean selecting between the two prefixes an app backend may be served at,
+  // and the generic probe passes the truthy string 'sw-4', which legitimately
+  // routes to the reverse-proxy base `/apps/<app>/api/` rather than `/api/`.
+  // Covered exhaustively by `appSessionStatus.test.ts` — both prefixes, app-name
+  // encoding, the statusPath guard, and the junk-leak assertions this table
+  // would otherwise apply.
+  // `wakatimeExportUrl` is a pure URL builder: it RETURNS the string the export
+  // anchor navigates to and issues no fetch, so the one-request probe below
+  // cannot apply. Covered by a direct URL assertion in `query-string builders`.
+  const HAND_TESTED = new Set(['sttTranscribe', 'uploadFiles', 'uploadCrewAvatar', 'installFromRegistryStream', 'exportPlanYaml', 'skills', 'slashCommands', 'appSessionStatus', 'wakatimeExportUrl'])
 
   type AnyFn = (...args: unknown[]) => unknown
   const methods = Object.entries(api as unknown as Record<string, AnyFn>)
     .filter(([name, fn]) => typeof fn === 'function' && !HAND_TESTED.has(name))
+
+  // Methods whose URL comes out of an ARGUMENT'S FIELD rather than a positional
+  // string. The generic `'sw-1'` args below would make such a method build its
+  // URL from `undefined` — a harness artifact, not a defect in the method — so
+  // each one names the minimal shape its URL is read from.
+  const ARGS: Record<string, unknown[]> = {
+    // `invokeFileMenuItem(item, ctx)`: the URL is `item.endpoint`.
+    invokeFileMenuItem: [
+      { id: 'send', app: 'doc-store', endpoint: '/api/apps/doc-store/send' },
+      { surface: 'file-overflow', path: '/tmp/a.txt', kind: 'file' },
+    ],
+  }
 
   it('covers the whole surface (guards against the table silently shrinking)', () => {
     expect(methods.length).toBeGreaterThan(300)
@@ -1443,7 +1529,7 @@ describe('every api method issues one well-formed /api request', () => {
     // Generic positional arguments. Every method is a thin URL/body builder, so
     // what this asserts is the construction itself: a forgotten argument or a
     // botched template literal shows up as `undefined` inside the path.
-    await Promise.resolve(fn('sw-1', 'sw-2', 'sw-3', 'sw-4'))
+    await Promise.resolve(fn(...(ARGS[name] ?? ['sw-1', 'sw-2', 'sw-3', 'sw-4'])))
 
     expect(fetchMock, `${name} issued no request`).toHaveBeenCalledTimes(1)
     const { url, init } = call()

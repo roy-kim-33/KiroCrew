@@ -13,6 +13,7 @@ import math
 import os
 import re
 import shlex
+import sys
 import threading
 import time
 import traceback
@@ -83,7 +84,7 @@ from kiro_crew.notifications.resource_pressure import ResourcePressureNotifier
 from kiro_crew.notifications.settings import ChannelSettings
 from kiro_crew.preview_text import strip_markdown_preview
 from kiro_crew.release_channel import channel as _release_channel_of_build
-from kiro_crew.safety_override import safety_override
+from kiro_crew.safety_override import cached_disabled_approval_modes, safety_override
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
 
@@ -267,6 +268,57 @@ def _safe_folder_tree(folders: object) -> list[dict[str, Any]]:
     return [f for f in folders if isinstance(f, dict) and isinstance(f.get("id"), str)]
 
 
+def _slots_serialization_note(slots_data: object, *, path: str = "slots-broadcast") -> str:
+    """Name the slot and field that broke JSON serialization, for a traceback note.
+
+    A dump failure on the slots projection means EVERY slots read path is broken
+    — the coalesced broadcast, the dashboard-user WS frame (``_slots_ws_frame``),
+    the WS connect snapshot, and ``GET /api/chat/slots`` all serialize the same
+    shape — and the stock message — "Object of type X is not JSON serializable"
+    — names neither the slot nor the field, so such a failure reads as a
+    broadcast bug. All four paths route their dump failure through this note;
+    ``path`` names the one that raised. Values are withheld
+    by design: slot state can carry user text, and the type is enough to find
+    the producer.
+
+    Every caller passes ``serialize_slots()`` output (list-of-dicts by
+    construction), so the walk assumes that shape rather than re-checking it.
+    Diagnosis must never make the failure worse, so any surprise in the walk —
+    including a caller breaking that assumption — degrades to the generic
+    note below instead of raising.
+    """
+    try:
+        # Narrowing, not validation: every caller passes a list by construction,
+        # and a violation lands in the defensive except below (degrade, never
+        # raise) exactly like any other surprise in the walk.
+        assert isinstance(slots_data, list)
+        for i, entry in enumerate(slots_data):
+            try:
+                json.dumps(entry)
+                continue
+            except (TypeError, ValueError):
+                pass
+            key = entry.get("key")
+            slot_name = key if isinstance(key, str) else f"#{i}"
+            for field, value in entry.items():
+                try:
+                    json.dumps(value)
+                except (TypeError, ValueError):
+                    return (
+                        f"[{path}] slot {slot_name!r} field {field!r} is not "
+                        f"JSON-serializable: type {type(value).__name__} (value withheld)"
+                    )
+            # Every field dumps on its own, yet the entry does not: a non-string
+            # key is the one shape that gets here.
+            return (
+                f"[{path}] slot {slot_name!r} fails serialization as a whole; "
+                "no single offending field — check for non-string dict keys (value withheld)"
+            )
+        return f"[{path}] slot list fails serialization; no offending entry found"
+    except Exception:  # defensive: a diagnostic must not raise
+        return f"[{path}] slot projection is not JSON-serializable (offender walk failed)"
+
+
 def _slots_ws_frame(
     slots: object,
     *,
@@ -283,13 +335,12 @@ def _slots_ws_frame(
     :meth:`DashboardState._broadcast` and the owner frame in
     :meth:`DashboardState._do_slots_broadcast` — because they must carry the SAME
     keys and nothing else enforces that. ``_send_ws_all`` skips owner sockets for
-    ``slots``, so the generic frame no longer backstops an owner: a key present in
+    ``slots``, so the generic frame does not backstop an owner: a key present in
     one envelope and not the other silently deprives every owner window, with no
-    error anywhere. Hand-building both is exactly how they drifted before (the
-    owner frame was a strict subset, missing ``folders`` and
-    ``gitlabHostsGeneration``), so the remedy is one builder rather than a second
-    careful copy — drift becomes impossible by construction instead of merely
-    detectable.
+    error anywhere. Hand-building both is exactly how they drift (an owner frame
+    that is a strict subset, missing ``folders`` and ``gitlabHostsGeneration``),
+    so the remedy is one builder rather than a second careful copy — drift becomes
+    impossible by construction instead of merely detectable.
 
     DELIBERATELY NOT used for the app-token frame in
     :meth:`DashboardState._serialize_for_client`. That envelope diverges on
@@ -298,24 +349,32 @@ def _slots_ws_frame(
     it through here would widen an app's payload, so it is a third shape by
     design, not a duplicate awaiting cleanup.
     """
-    return json.dumps(
-        {
-            "type": "slots",
-            "data": slots,
-            "yolo": yolo,
-            "channelTrusted": channel_trusted,
-            "gitlabHostsGeneration": gitlab_hosts_gen,
-            "folders": folders,
-            "foldersGeneration": folders_gen,
-            # Which governance ceiling is installed. A centrally pushed policy
-            # (``policy_distribution.apply_ceiling``) swaps the ceiling mid-session
-            # and bumps this counter; the client invalidates its cached
-            # ``dashboardConfig`` on a change, so a governance-derived field there
-            # (``social_share_enabled``) follows the ceiling instead of waiting out
-            # its stale window. Process-local, like the two counters above.
-            "governanceGeneration": governance_gen,
-        }
-    )
+    frame = {
+        "type": "slots",
+        "data": slots,
+        "yolo": yolo,
+        "channelTrusted": channel_trusted,
+        "gitlabHostsGeneration": gitlab_hosts_gen,
+        "folders": folders,
+        "foldersGeneration": folders_gen,
+        # Which governance ceiling is installed. A centrally pushed policy
+        # (``policy_distribution.apply_ceiling``) swaps the ceiling mid-session
+        # and bumps this counter; the client invalidates its cached
+        # ``dashboardConfig`` on a change, so a governance-derived field there
+        # (``social_share_enabled``) follows the ceiling instead of waiting out
+        # its stale window. Process-local, like the two counters above.
+        "governanceGeneration": governance_gen,
+    }
+    # Same offender diagnostic as the coalesced broadcast: the
+    # dashboard-user frame serializes the ENRICHED projection, so a value that
+    # only enrichment adds raises here and nowhere else. Diagnosis only — the
+    # exception propagates unchanged. A clean-slots note ("no offending entry
+    # found") is itself evidence: the offender is in the envelope extras.
+    try:
+        return json.dumps(frame)
+    except (TypeError, ValueError) as exc:
+        exc.add_note(_slots_serialization_note(slots, path="ws-frame"))
+        raise
 
 
 def _split_namespaced_channel_id(channel_id: str | None) -> tuple[str, str] | None:
@@ -881,16 +940,16 @@ _GIT_REMOTE_WRITE_SUBCOMMANDS: frozenset[str] = frozenset(
     ("add", "remove", "rm", "rename", "set-url", "set-head", "set-branches", "prune", "update")
 )
 
-# Allowlist entries that name a VERSION PROBE, matched as a prefix like every
-# other entry — so a trailing operand was vouched for too. That is not academic:
-# `javac` does not act on `-version` and exit, it prints the version and then
-# compiles whatever else it was handed, so
+# Allowlist entries that name a VERSION PROBE, matched EXACTLY rather than as a
+# prefix like every other entry, because a prefix match vouches for a trailing
+# operand too. That is not academic: `javac` does not act on `-version` and exit,
+# it prints the version and then compiles whatever else it was handed, so
 #
 #     javac -version -processorpath evil.jar -processor Evil Payload.java
 #
-# auto-approved and ran an annotation processor — ordinary compiled Java on a
-# path the caller supplies, i.e. arbitrary code execution. Reported by #5038,
-# and the highest-severity shape in this family.
+# auto-approves and runs an annotation processor — ordinary compiled Java on a
+# path the caller supplies, i.e. arbitrary code execution, and the
+# highest-severity shape in this family.
 #
 # All five probes are listed, not only `javac`. Whether an interpreter ignores a
 # trailing operand is a property of the installed release rather than of the
@@ -910,10 +969,10 @@ _EXACT_ONLY_BASH_PREFIXES: frozenset[str] = frozenset(
 # `sort` is vetted POSITIVELY: every option token must be a recognised read-only
 # flag, and anything unrecognised goes to the human prompt.
 #
-# The inversion is here because the denylist demonstrably did not converge on this
-# one tool. Five review rounds produced six distinct spellings of the same escape:
+# The inversion is here because a denylist demonstrably does not converge on this
+# one tool: six distinct spellings of the same escape reach it —
 # `-o FILE`, `--output=FILE`, attached `-oFILE`, bundled `-uo FILE`, abbreviated
-# `--o FILE`, and finally `--compress-program=PROG` -- which is not a write at all
+# `--o FILE`, and `--compress-program=PROG` -- which is not a write at all
 # but arbitrary CODE EXECUTION. Verified: with the input large enough to spill to
 # temporaries, `sort -S 1k --compress-program=./payload big.txt` ran the payload and
 # exited 0. Enumerated from this box's own `sort --help`, so it is complete for that
@@ -1314,8 +1373,8 @@ def _operands(args: list[str], value_flags: frozenset[str] = frozenset()) -> lis
 #:     git diff --{out,out}put=/tmp/pwned    shlex: `--{out,out}put=` bash: `--output=…`
 #:
 #: Matched as ONE class rather than one spelling at a time. Closing ``$'`` alone
-#: left ``$"`` (locale translation) and ``${…}`` (parameter expansion) open on the
-#: identical path, and the remaining forms are bounded only by bash's grammar.
+#: leaves ``$"`` (locale translation) and ``${…}`` (parameter expansion) open on
+#: the identical path, and the remaining forms are bounded only by bash's grammar.
 #: Un-expanding them here would mean reimplementing that grammar, so a segment
 #: carrying one is refused instead: a read-only command has no need of any of
 #: them, and a rejected segment falls through to the human approval prompt.
@@ -1332,7 +1391,8 @@ def _operands(args: list[str], value_flags: frozenset[str] = frozenset()) -> lis
 #: Positional and special parameters (``$1``, ``$@``, ``$*``, ``$?``, ``$$``,
 #: ``$!``, ``$#``, ``$-``) belong to the same class and are matched by their own
 #: alternative. Their NAME is not an identifier, so the ``$[A-Za-z_]`` branch
-#: above never saw them, and in a `bash -c` string with no positional arguments
+#: above does not match them, and in a `bash -c` string with no positional
+#: arguments
 #: ``$@`` and ``$*`` expand to NOTHING — which is what makes them the sharpest
 #: spelling here rather than a curiosity:
 #:
@@ -1365,7 +1425,7 @@ _GLOB_META_RE = re.compile(r"[*?\[]")
 
 #: Bash EXTGLOB operators, which synthesize a token the same way an ordinary glob
 #: does — `git diff @(--output=pwned)` matches a file of that name and git writes
-#: it. Reported by #5038, which measured it.
+#: it.
 #:
 #: These get their own regex and their own verdict because `fnmatch` — the test
 #: that makes the plain-glob case precise — does not implement extglob: it reads
@@ -1695,14 +1755,14 @@ def _side_effect_reason(segment: str) -> str:
                     and tok[0] == "-"
                     and tok[1] != "-"
                     # EVERY character of the cluster must be a list letter or a
-                    # digit, not merely one of them. `any` read an attached VALUE
+                    # digit, not merely one of them. `any` reads an attached VALUE
                     # as part of the cluster, which is the same trap the note on
                     # the accept-list registry records for `date -Iseconds`: the `l` in
-                    # `git tag -ulin@kiro.co` selected list mode and the bare
-                    # operand it then licensed created a signed tag. A digit is
+                    # `git tag -ulin@kiro.co` selects list mode and the bare
+                    # operand it then licenses creates a signed tag. A digit is
                     # allowed because `-n` carries an optional count (`-n5`).
                     #
-                    # A MIXED cluster (`-lv`) is no longer a listing here and falls
+                    # A MIXED cluster (`-lv`) is NOT a listing here and falls
                     # through to the prompt. That is the intended trade: the letter
                     # this cannot distinguish from a value is exactly the letter a
                     # write flag arrives on, and the ordinary spellings — a separate
@@ -1814,7 +1874,7 @@ def _side_effect_reason(segment: str) -> str:
     # an option has to be recognised as a read before it passes, so a spelling nobody
     # thought of prompts instead of being admitted. This is what a per-tool write-flag
     # denylist could not give us on these four -- see the note above the registry for
-    # the six `sort` spellings that arrived one review round at a time.
+    # the six distinct `sort` spellings a denylist has to enumerate.
     if verb in _OPTION_ACCEPT_LISTS:
         violation = _option_accept_list_violation(verb, args)
         if violation:
@@ -1950,8 +2010,8 @@ def chat_message_frame(note: dict, *, include_metadata: bool) -> dict[str, Any]:
     ONE serialiser for both delivery doors — the WebSocket arm in
     ``_broadcast_note`` and the SSE arm in ``handlers/updates.py:api_stream``.
     They are fed the same note by ``_broadcast()``, so a field added here
-    reaches both; building the frame twice is how the SSE door kept dropping
-    ``meta`` after #7981 fixed the WS one (#8045).
+    reaches both; building the frame twice is how the SSE door drifts into
+    dropping ``meta`` while the WS one carries it.
 
     ``include_metadata`` is a REQUIRED keyword and names a property of the
     TRANSPORT, not a preference: whether that door has per-client authorization
@@ -1968,9 +2028,9 @@ def chat_message_frame(note: dict, *, include_metadata: bool) -> dict[str, Any]:
     That asymmetry is load-bearing. ``meta`` carries tool/LLM content
     (``tool_input``, a live ``oauth_url``, ``approval_id``), so putting it on an
     unfiltered queue exposes it to any app token granted that route regardless
-    of its ``slots:*`` scope — the same class as GPT #6789, which leaked
-    public-repo status onto ``/api/stream`` by enriching a payload that feeds
-    both doors. Keep enrichment on the door that filters.
+    of its ``slots:*`` scope — the same class as leaking public-repo status onto
+    ``/api/stream`` by enriching a payload that feeds both doors. Keep enrichment
+    on the door that filters.
 
     ``cls``/``meta`` are conditional in BOTH directions when included: carried
     when the note has them (``meta.mid`` is the per-row delivery identity a
@@ -2251,8 +2311,8 @@ def append_and_surface(
     manual ``broadcast_ws("chat_message", ...)`` after an append ships the SAME
     row a second time. Worse, the hand-built frames carried no ``meta.mid``,
     and the frontend's redelivery guard declines mid-less frames rather than
-    guessing (``isRedeliveredMessage``), so each extra copy rendered as a new
-    bubble (#5981).
+    guessing (``isRedeliveredMessage``), so each extra copy renders as a new
+    bubble.
 
     The manual frame is emitted only in the one case append's own callback is
     suppressed (``slot._has_reader``: an HTTP stream reader is draining
@@ -2439,8 +2499,8 @@ def _project_source_links(
             # DENY decision: a non-owner dashboard user requested status on a
             # change link but the repo is not confirmed public (private /
             # unknown / stale), so status is withheld. AUTOSDE requires the
-            # denial to be audited too — deduplicated the same way (GPT #6789
-            # round-15). include_check_status (owner) paths never reach here, and
+            # denial to be audited too — deduplicated the same way.
+            # include_check_status (owner) paths never reach here, and
             # app tokens set neither flag so they are not "denied dashboard-user"
             # decisions.
             _audit_public_status_denied(link["url"])
@@ -2626,9 +2686,9 @@ HOOK_HALTED_RECOVERY_PREFIX = "[Stop-hook nudge cap reached]"
 # Prefix on the DISPLAY-ONLY row appended when a tool deny's reason was steered
 # into the running turn (see chat_runner._steer_policy_notice). Nothing is
 # queued and no turn is dispatched — the agent already has the reason — so this
-# row exists purely so the person sees the same blocked-tool card they used to
-# get from the recovery continuation, instead of only a generic "Steered" chip
-# that reads as though they had steered the turn themselves.
+# row exists purely so the person sees the blocked-tool card, instead of only a
+# generic "Steered" chip that reads as though they had steered the turn
+# themselves.
 #
 # Named into the *_RECOVERY_PREFIX family because test_recovery_card_prefixes.py
 # keys its cross-language drift guard on that suffix — a marker outside the
@@ -2830,12 +2890,14 @@ def build_refusal_recovery_prompt(
 #: The notice's INVARIANT half — that this was not a user action, the generic
 #: string it is correcting, and the instruction to decide inside this turn — is
 #: identical for every cause; only the clause naming the cause and the guidance
-#: about what to do next differ. Kept as data rather than three near-copies of
-#: the notice so the invariant half cannot drift between them, which is the half
-#: doing the actual work of overwriting the model's wrong conclusion.
+#: about what to do next differ. Kept as data rather than a near-copy of the
+#: notice per cause so the invariant half cannot drift between them, which is the
+#: half doing the actual work of overwriting the model's wrong conclusion.
 DENY_CAUSE_POLICY = "policy"
 DENY_CAUSE_INVALID_NAME = "invalid_name"
 DENY_CAUSE_HOOK_ERROR = "hook_error"
+DENY_CAUSE_BATCH_CASCADE = "batch_cascade"
+DENY_CAUSE_APPROVAL_TIMEOUT = "approval_timeout"
 
 #: cause → (clause completing "The tool call you just made …", what to do next).
 _DENY_CAUSE_TEXT: dict[str, tuple[str, str]] = {
@@ -2856,6 +2918,23 @@ _DENY_CAUSE_TEXT: dict[str, tuple[str, str]] = {
         "treat this as a host fault, not a verdict on the action: nothing judged the "
         "call itself. Retrying the identical call is reasonable once; if it faults "
         "again, say what happened rather than working around it silently.",
+    ),
+    DENY_CAUSE_BATCH_CASCADE: (
+        "was auto-declined along with every remaining call in its batch, because "
+        "the host declined an earlier tool of the same batch",
+        "nothing judged these calls themselves — the group was cut short as a "
+        "whole. Address what declined that earlier tool (the reason above), then "
+        "re-issue the calls you still need; if you genuinely cannot proceed "
+        "without them, say so and stop with the reason.",
+    ),
+    DENY_CAUSE_APPROVAL_TIMEOUT: (
+        "was auto-declined because its approval prompt expired unanswered",
+        "nobody answered within the window, so the action itself was never judged — "
+        "do not abandon it or route around it on this evidence. State the "
+        "permission you need and why, then continue with what you can do without "
+        "it. Do not immediately reissue the same call: the person who did not "
+        "answer is still away, and re-prompting re-arms the same wait for the "
+        "same silence.",
     ),
 }
 
@@ -2887,9 +2966,11 @@ def build_refusal_steer_notice(
 
     *cause* selects the wording. The distinction is not cosmetic: a policy block
     is a verdict the model must route around, an invalid tool name is the model's
-    own malformed output and is the one case it can simply fix, and a hook fault
-    judged nothing at all. Telling the model "safety policy" for the latter two
-    would send it looking for an allowed alternative to an action nobody refused.
+    own malformed output and is the one case it can simply fix, a hook fault
+    judged nothing at all, a batch cascade cut the group short without judging
+    its members, and an expired approval prompt means nobody answered. Telling
+    the model "safety policy" for any non-policy cause would send it looking for
+    an allowed alternative to an action nobody refused.
     An unknown cause degrades to the policy wording rather than raising: a wrong
     noun is recoverable, and losing the notice would hand the model back
     kiro-cli's "user denied" with nothing to correct it.
@@ -2901,19 +2982,20 @@ def build_refusal_steer_notice(
         return ""
     clause, guidance = _DENY_CAUSE_TEXT.get(cause, _DENY_CAUSE_TEXT[DENY_CAUSE_POLICY])
     what = f"{title}: {reason}" if reason else title
-    # Class-specific remediation, for the policy cause only. The other two causes
-    # judged nothing about the action — an invalid tool name is the model's own
-    # malformed output and a hook fault is a host fault — so naming a sanctioned
-    # alternative there would answer a question nobody asked and imply the action
-    # itself had been refused.
+    # Class-specific remediation, for the policy cause only. The non-policy
+    # causes judged nothing about the action — an invalid tool name is the
+    # model's own malformed output, a hook fault is a host fault, a cascaded
+    # batch member was never reached, and an expired approval prompt was simply
+    # never answered — so naming a sanctioned alternative there would answer a
+    # question nobody asked and imply the action itself had been refused.
     remediation = (
         remediation_for(reason, title, credential_tool_hint=credential_tool_hint)
         if cause == DENY_CAUSE_POLICY
         else ""
     )
     tail = f"\n\nHow to do this properly: {remediation}" if remediation else ""
-    # "host notice", not "policy notice": the tag has to be true for all three
-    # causes, and only one of them IS a policy. Naming the ACTOR is also what the
+    # "host notice", not "policy notice": the tag has to be true for every
+    # cause, and only one of them IS a policy. Naming the ACTOR is also what the
     # notice exists to do — the model has just been told the user denied this, and
     # every sentence after this one is spent correcting that.
     return (
@@ -3038,10 +3120,10 @@ def _redact(text: str) -> str:
 
 def _parse_options(text: str) -> list[str]:
     """Extract pipe-separated choices from the LAST [OPTIONS: A | B | C] in text."""
-    matches = _OPTIONS_RE.findall(text)
+    matches = list(_OPTIONS_RE.finditer(text))
     if not matches:
         return []
-    parts = [p.strip() for p in matches[-1].split("|")]
+    parts = [p.strip() for p in matches[-1].group("labels").split("|")]
     return [p for p in parts if p]
 
 
@@ -3148,6 +3230,7 @@ class _ChatSlot:
         "model",
         "_model_withheld",
         "_model_withheld_for",
+        "served_model",
         "reasoning_effort",
         "autocompact_pct",
         "mode",
@@ -3249,6 +3332,7 @@ class _ChatSlot:
         "_promise_only_stop_gen",
         "_compaction_continue_retries",
         "_batch_rejected",
+        "_batch_rejected_cause",
         "_compaction_failed_retries",
         "_compaction_fail_streak",
         "_compaction_fail_cooldown_until",
@@ -3261,6 +3345,7 @@ class _ChatSlot:
         "_ephemeral",
         "_pending_context",
         "_deferred_notes",
+        "_dropped_note_ids",
         "_app",
         "_human_seen",
         "_origin",
@@ -3330,6 +3415,10 @@ class _ChatSlot:
         # when any of slot.model's writers re-pins the slot.
         self._model_withheld: bool = False
         self._model_withheld_for: str = ""
+        # The model id the live session resolved to, for a slot that is
+        # inheriting rather than pinning. "" = unknown. Written through
+        # `record_served_model`.
+        self.served_model: str = ""
         # Reasoning effort: "" = provider default, else one of low/medium/high/max.
         # Currently consumed by an alternate ACP backend (--effort flag); ACP wired later.
         self.reasoning_effort: str = ""
@@ -3546,7 +3635,7 @@ class _ChatSlot:
         # state to an unpinned transcript while the guarded write waits.
         self._metadata_persist_inflight: int = 0
         self._orch_tracker: Any = None  # OrchestrationTracker, set by gateway
-        # Plan-cancel latch closing the cancel/Go race (#6046): the Cancel
+        # Plan-cancel latch closing the cancel/Go race: the Cancel
         # handler can only stop a tracker that exists, but _stage_loop creates
         # the tracker lazily, so a cancel processed between a Go POST being
         # accepted and its _stage_loop coroutine starting would no-op on the
@@ -3614,7 +3703,7 @@ class _ChatSlot:
         # does not contain it until the row drains; the run loop therefore skips
         # its own ``mark_delivered`` and the drain settles these instead, so the
         # retention TTL is measured from consumption rather than from run
-        # completion (issue #4839). See ``take_pending_subagent_deliveries``.
+        # completion. See ``take_pending_subagent_deliveries``.
         self._subagent_delivery_pending: dict[str, list[str]] = {}
         self._recovery_retrigger_count: int = 0
         self._prompt_busy_retries: int = 0
@@ -3698,7 +3787,7 @@ class _ChatSlot:
         self._promise_only_retries: int = 0
         # Monotonic _stop_generation snapshot taken when a promise-only continuation
         # is enqueued; the dispatch-point purge compares against it to catch a Stop
-        # that pressed AND resolved to idle while the continuation waited (#2696).
+        # that pressed AND resolved to idle while the continuation waited.
         self._promise_only_stop_gen: int = 0
         # One bounded synthetic continuation when the BACKEND compacted the
         # conversation mid-turn and then ended the turn without finishing the
@@ -3708,13 +3797,21 @@ class _ChatSlot:
         # the other per-turn retry budgets on a landed turn.
         self._compaction_continue_retries: int = 0
         self._batch_rejected: bool = False
-        # Per-turn compaction-status failure tracking (Mesh compaction-spam
-        # fix). Distinct from SessionManager._compact_cooldown_until, which
-        # only gates the *proactive* session-level auto-compact trigger —
-        # this gates the per-turn EVENT_COMPACTION_STATUS notice path in
-        # chat_runner, which previously had no backoff at all and could
-        # append one near-identical "Compaction failed: unknown error"
-        # message per turn indefinitely.
+        # WHO/WHAT set ``_batch_rejected``: empty for an interactive user
+        # decline, else a short host-authored sentence naming the auto-decline
+        # (approval timeout, no turn budget, Slack delivery failure). The
+        # cascade site reads it to decide attribution: a user's refusal makes
+        # kiro-cli's "User denied tool execution" TRUE for the cascaded
+        # remainder, while a host-caused decline makes it false and worth a
+        # cause-specific in-band correction. Same lifetime as the flag itself —
+        # set together, cleared together.
+        self._batch_rejected_cause: str = ""
+        # Per-turn compaction-status failure tracking. Distinct from
+        # SessionManager._compact_cooldown_until, which only gates the
+        # *proactive* session-level auto-compact trigger — this gates the
+        # per-turn EVENT_COMPACTION_STATUS notice path in chat_runner, which
+        # without a backoff appends one near-identical "Compaction failed:
+        # unknown error" message per turn indefinitely.
         # Retry budget for a turn the backend abandoned after a TRANSIENT
         # compaction failure. Distinct from _compaction_fail_streak above,
         # which only paces the NOTICE: this one bounds how many times the
@@ -3747,6 +3844,11 @@ class _ChatSlot:
         self._ephemeral: bool = ephemeral  # Incognito mode: no memory writes
         self._pending_context: list[dict[str, Any]] = []
         self._deferred_notes: list[dict[str, Any]] = []
+        # Note ids dropped at the flush's rebind seam. A dropped
+        # note has no delivery obligation left, but its durable entry may only
+        # be retired by a save — the ids recorded here are how the next full
+        # save knows to retire entries whose rows will never exist.
+        self._dropped_note_ids: set[str] = set()
         self._app: str = ""  # App identity tag (App Kit §5.2)
         # FIX 1 (unattended approval park). Evidence that a HUMAN has driven
         # this slot through a dashboard-user route (typed a message, answered an
@@ -3858,7 +3960,7 @@ class _ChatSlot:
         # The session file is FROZEN-PREFIX (the first _disk_older_count on-disk
         # message lines, OLDER than the in-memory window) + a fresh re-serialize
         # of the whole window. The prefix is never rewritten, so a restart that
-        # loaded only a recent window can no longer destroy older history. This
+        # loaded only a recent window cannot destroy older history. This
         # caches the prefix bytes keyed by (path-mtime, path-size,
         # _disk_older_count) so a 5s flush is O(window), not O(file). The
         # (mtime, size) pair also doubles as the "did another process write this
@@ -3918,14 +4020,14 @@ class _ChatSlot:
         # live and terminal state on the slot so reconnects can hydrate cards.
         self._native_subagent_tracker: dict[str, dict[str, Any]] = {}
         self._native_subagent_output: dict[str, list[str]] = {}
-        # Delivery ids whose steer a NON-EMPTY echo actually accounted for. The
-        # settle path can remove an entry from `_pending_steers` for two reasons
-        # that look identical afterwards: a matched echo (evidence), or the
-        # `settle_all_on_empty` sweep on an EMPTY echo (no evidence at all).
-        # `chat_delivery` infers `consumed` from the entry being gone, so without
-        # this it reads an empty frame as a confirmed injection and persists a
-        # success badge nothing proved. Keyed on the delivery id, not the text, so
-        # a later identical steer cannot inherit an earlier one's evidence.
+        # Delivery ids whose steer a NON-EMPTY echo actually accounted for. An
+        # entry can leave `_pending_steers` for reasons that look identical
+        # afterwards, and only a matched, non-empty echo is evidence of
+        # consumption. `chat_delivery` therefore infers `consumed` from
+        # positive evidence rather than from the entry being gone, so no
+        # remover -- present or added later -- can turn an evidence-free frame
+        # into a confirmed injection. Keyed on the delivery id, not the text,
+        # so a later identical steer cannot inherit an earlier one's evidence.
         self._steer_confirmed: set[str] = set()
         # Mid-turn steers handed to the backend but not yet confirmed consumed
         # (no steering_consumed / EVENT_STEER_CONSUMED echo yet). Appended by
@@ -3950,7 +4052,7 @@ class _ChatSlot:
         # "present here" always implies "present there" and no reader has to ask
         # which of the two a half-finished path left behind. Only the requeue reads
         # it: it moves the id onto the queue entry's meta so the drained row
-        # carries `meta.sendId` like an accepted steer's row does (#6751). A steer
+        # carries `meta.sendId` like an accepted steer's row does. A steer
         # that persists its own row stamps the id directly and drops this entry.
         self._steer_send_ids: dict[str, str] = {}
         # In-flight `wait` tool sleep, as reported by the tool's own keepalive
@@ -4582,6 +4684,38 @@ class _ChatSlot:
         self._model_withheld = withheld
         self._model_withheld_for = self.model or ""
 
+    def record_served_model(self, model_id: str | None) -> None:
+        """Record the model id the live session actually resolved to.
+
+        The counterpart to :meth:`record_model_withheld` for the case that
+        verdict cannot describe: an INHERITED model. A slot pinned to nothing —
+        or one whose pin was withheld — runs on whatever the backend assigned,
+        and the pin alone cannot name it, so the composer chip can only say
+        "auto". This carries the id the session reports, so the chip can name
+        the model a turn will actually use.
+
+        ``None``/``""`` forgets it (back to unknown) — what a session teardown
+        does, since the id describes that session and not the slot. Unlike the
+        withhold verdict it is NOT pinned to ``slot.model``: it answers a
+        question about the SESSION, which the pin does not determine.
+
+        DISPLAY only. Never a write source: the persisted pin stays whatever the
+        user chose.
+        """
+        self.served_model = model_id or ""
+
+    def forget_session_model_state(self) -> None:
+        """Drop every fact that described the session being torn down.
+
+        The withhold verdict and the served model id are a PAIR: both describe
+        the session that advertised the list, not the slot, so a teardown that
+        forgets one and keeps the other labels the next session with the
+        previous one's answer. Every teardown site calls this one method so a
+        site added later cannot drop half the pair.
+        """
+        self.record_model_withheld(None)
+        self.record_served_model(None)
+
     @property
     def is_restricted(self) -> bool:
         """True when memory writes (consolidation, lessons) are blocked."""
@@ -4648,7 +4782,7 @@ class _ChatSlot:
             from kiro_crew.dashboard.session_control import containment_meta
 
             # Stamp the containment constraints holding at ADMISSION, so the
-            # queue drain can re-assert them at delivery (issue #5911): a target
+            # queue drain can re-assert them at delivery: a target
             # that gains a channel/mirror link while this prompt waits must not
             # execute it under the weaker constraints that admitted it.
             self.queue_append(prompt, meta=containment_meta(state, self))
@@ -4994,6 +5128,13 @@ class DashboardState:
         # Consumed claims whose durable finalization failed remain blocked from
         # redispatch while a later Spec Builder detail poll retries the ledger write.
         self._spec_decision_deliveries_consumed: set[tuple[str, str]] = set()
+        # Sandbox kind -> monotonic time of the last notification for it. Keyed on
+        # the sandbox layer's own closed kind set (three values), NEVER on request
+        # data: auto-speak synthesises one request per sentence, so a key carrying
+        # a caller-chosen slot would grow for the process lifetime on a host that
+        # refuses every one of them. Bounded at three entries by construction, so
+        # it needs no size cap and no eviction pass.
+        self._voice_sandbox_notified: dict[str, float] = {}
         # Slot keys that EXIST but are deliberately absent from ``_slots`` while
         # they are being built (see ``session_transfer``'s import path, which
         # retracts a slot so it is unreachable until its transcript and context
@@ -5005,15 +5146,15 @@ class DashboardState:
         # Live OPTIONS controls, keyed by the SESSION KEY that owns them.
         #
         # Deliberately here and not on ``_ChatSlot``: a plain Slack thread often
-        # has no dashboard slot at all, and a slot-held record was simply dropped
-        # for those sessions — so the whole expiry lifecycle never engaged and the
-        # stale click it exists to prevent stayed possible (#1694). Keying by
+        # has no dashboard slot at all, and a slot-held record is simply dropped
+        # for those sessions — the whole expiry lifecycle never engages and the
+        # stale click it exists to prevent stays possible. Keying by
         # session key makes the slotless case ordinary rather than special.
         #
         # One store, not a slot field plus a fallback: a slot can come into
         # existence at any moment (the channel surface reconciler creates one), so
         # a fallback map would go invisible the instant one appeared. It also
-        # removes the two-store divergence that let a record be filed under one
+        # avoids the two-store divergence that lets a record be filed under one
         # index and cleared under another.
         self._slack_options_by_key: dict[str, tuple[PostedOptions, ...]] = {}
         self._slot_counter = 0
@@ -5049,11 +5190,11 @@ class DashboardState:
         # Malformed chat_pins.json entries dropped at load time, kept verbatim
         # so save_chat_pins round-trips them back instead of erasing bytes a
         # hand-edit left in a shape the loader could not validate (mirrors the
-        # cron-folder unparsed-entry preservation, #5768/#5792).
+        # cron-folder unparsed-entry preservation).
         self._unparsed_chat_pin_entries: list[Any] = []
         # Serializes pin mutation + persistence so concurrent requests cannot
         # interleave snapshots and replace chat_pins.json out of order.
-        # LoopBoundLock, not asyncio.Lock (#4800): DashboardState outlives any
+        # LoopBoundLock, not asyncio.Lock: DashboardState outlives any
         # single event loop (in-process gateway restart, test loops).
         self._chat_pins_lock = LoopBoundLock()
         # Serializes read-modify-write of the folder store; see
@@ -5061,7 +5202,7 @@ class DashboardState:
         # concurrent first-callers cannot each make their own lock and
         # serialize against nothing. LoopBoundLock binds no loop at
         # construction, so building it off-loop is safe — and it stays valid
-        # across the loop changes this long-lived state survives (#4800).
+        # across the loop changes this long-lived state survives.
         self._folders_lock = LoopBoundLock()
         # Identifies the current folder-TREE snapshot; bumped by mutate_folders
         # (the store's only writer) on each confirmed write. See
@@ -5073,8 +5214,7 @@ class DashboardState:
         # save round-trips them back instead of erasing bytes a hand-edit left
         # in a shape the loader could not validate. This store's save path runs
         # DURING load (seed/back-fill), so without preservation a single
-        # hand-edited-but-malformed row is wiped at boot with no user action
-        # (#5792, the worst of the sibling cases).
+        # hand-edited-but-malformed row is wiped at boot with no user action.
         self._unparsed_tag_entries: list[Any] = []
         # True once load_tags() parsed tags.json successfully (or seeded a
         # fresh install). False means the vocabulary state is UNKNOWN (parse
@@ -5086,7 +5226,7 @@ class DashboardState:
         self._tag_boards: list[dict[str, Any]] = []
         # Malformed tag-board (sidebar column) entries dropped at load time,
         # kept verbatim so a save round-trips them back rather than erasing a
-        # hand-edited-but-typo'd column (#5792).
+        # hand-edited-but-typo'd column.
         self._unparsed_tag_board_entries: list[Any] = []
         self._background_tasks: set[asyncio.Task] = set()  # type: ignore[type-arg]
         # Gateway replacement is process-wide, not an ordinary repeatable
@@ -5451,7 +5591,7 @@ class DashboardState:
             # The recycle ended the child that owned any open MCP OAuth
             # banner's loopback listener; push the read gate's verdict so an
             # open tab withdraws the dead Authorize link without waiting for
-            # its next refetch (issue #8149's RSS-recycle path).
+            # its next refetch.
             try:
                 _broadcast_expired_oauth_banners(self, slot)
             except Exception:
@@ -5575,6 +5715,10 @@ class DashboardState:
         branch, commit = self._build_info
         return {
             "uptime": _fmt_duration(uptime),
+            # Auto-approve modes forbidden by the ``approval_modes`` policy
+            # scope. In the shared snapshot so HTTP/SSE/WS frames all agree —
+            # the picker hides these and the value must survive a WS push.
+            "disabled_approval_modes": cached_disabled_approval_modes(),
             "start_time": self.start_time,
             "sessions": self.sessions.count,
             "messages": self.messages_received,
@@ -5740,11 +5884,11 @@ class DashboardState:
     MAX_BACKGROUND_TURNS_CEIL = 16  # hard ceiling — config can raise up to here
     # Longest a queued turn may sit waiting for a permit. Needed because the
     # queue wait happens INSIDE the coroutine ``spawn_guarded_turn`` already
-    # bounds at ``CHAT_TURN_TIMEOUT`` (7200s), so an unbounded wait would let a
+    # bounds at ``CHAT_TURN_TIMEOUT`` (14400s), so an unbounded wait would let a
     # fully-saturated cap consume a turn's whole ceiling and then kill it with
-    # "turn exceeded the 7200s ceiling" — a true statement that names the wrong
-    # cause. 1800s never trips under ordinary throttling and leaves 90 minutes
-    # of the ceiling for the turn itself; on expiry the turn fails with a
+    # "turn exceeded the 14400s ceiling" — a true statement that names the wrong
+    # cause. 1800s never trips under ordinary throttling and leaves three and a half
+    # hours of the ceiling for the turn itself; on expiry the turn fails with a
     # message that says what actually happened.
     _BACKGROUND_QUEUE_WAIT_SECS = 1800
 
@@ -6372,7 +6516,7 @@ class DashboardState:
             # request-layer paths a person actually drives (chat-send
             # auto-create, new-chat tab, fork) opt in, so agent-minted USER
             # slots (the session-control create verb) do not satisfy the
-            # survey gate on their own (#6139). The
+            # survey gate on their own. The
             # origin conjunct stays as the invariant floor: a caller can never
             # count a non-USER slot, flag or not. Best-effort:
             # the helper swallows its own I/O errors and never raises into
@@ -6775,13 +6919,13 @@ class DashboardState:
     def load_chat_pins(self) -> None:
         """Load pinned chat messages from disk, dropping malformed records.
 
-        Legacy pins (pre-mid era) may lack the ``mid`` field — they are preserved
-        for backward compatibility; new pins always carry ``mid``.
+        A pin without a ``mid`` field is preserved as-is; new pins always carry
+        ``mid``.
 
         Individual malformed entries are dropped from the active list but kept
         verbatim in ``_unparsed_chat_pin_entries`` so the next ``save_chat_pins``
         round-trips them back to disk rather than silently erasing a user's
-        hand-edited-but-typo'd pin (mirrors the cron-folder contract, #5792).
+        hand-edited-but-typo'd pin (mirrors the cron-folder contract).
 
         Error classification:
         - Missing file: normal (first run) → empty list.
@@ -6964,7 +7108,7 @@ class DashboardState:
                     # Keep rows the active list dropped verbatim so the seed/
                     # back-fill save below (and every later save) round-trips
                     # them back instead of erasing a hand-edited-but-typo'd row
-                    # at boot with no user action (#5792).
+                    # at boot with no user action.
                     self._tags, unparsed = self._partition_preserving(
                         raw,
                         lambda t: isinstance(t, dict) and bool(t.get("id")),
@@ -7012,7 +7156,7 @@ class DashboardState:
                 if isinstance(raw, list):
                     # Preserve dropped columns verbatim so a later save
                     # round-trips them rather than erasing a hand-edited-but-
-                    # typo'd column (#5792).
+                    # typo'd column.
                     self._tag_boards, unparsed_cols = self._partition_preserving(
                         raw,
                         lambda c: isinstance(c, dict) and bool(c.get("id")),
@@ -7043,7 +7187,7 @@ class DashboardState:
         Appends any malformed entries preserved at load time
         (``_unparsed_tag_entries``) so a save — including the seed/back-fill
         save that runs during ``load_tags`` itself — cannot erase bytes a
-        hand-edit left in a shape the loader could not validate (#5792).
+        hand-edit left in a shape the loader could not validate.
         """
         unparsed = getattr(self, "_unparsed_tag_entries", [])
         self._atomic_write_json(config_dir() / self._TAGS_FILE, [*self._tags, *unparsed])
@@ -7058,7 +7202,7 @@ class DashboardState:
         ``save_tags`` -- keeping tests that patch it working unchanged.
 
         Malformed entries preserved at load time (``_unparsed_tag_entries``)
-        are appended so this write path preserves them too (#5792).
+        are appended so this write path preserves them too.
 
         Raises on I/O failure so callers can roll back in-memory state and
         surface HTTP 5xx rather than silently losing data.
@@ -7071,7 +7215,7 @@ class DashboardState:
 
         Appends any malformed columns preserved at load time
         (``_unparsed_tag_board_entries``) so a save cannot erase bytes a
-        hand-edit left in a shape the loader could not validate (#5792).
+        hand-edit left in a shape the loader could not validate.
         """
         unparsed = getattr(self, "_unparsed_tag_board_entries", [])
         self._atomic_write_json(
@@ -7090,7 +7234,7 @@ class DashboardState:
 
         Malformed columns preserved at load time
         (``_unparsed_tag_board_entries``) are appended so this write path
-        preserves them too (#5792).
+        preserves them too.
 
         Raises on I/O failure so callers can roll back in-memory state and
         surface HTTP 5xx rather than silently losing data.
@@ -7109,7 +7253,7 @@ class DashboardState:
 
         The shared "partition malformed rows at load, keep them verbatim so a
         later save round-trips them back" mechanic behind ``load_cron_folders``,
-        ``load_chat_pins``, ``load_tags`` and the tag-board load (all #5792).
+        ``load_chat_pins``, ``load_tags`` and the tag-board load.
         A row is active when ``predicate`` returns truthy; every other row is
         collected into ``unparsed`` so the caller's save path can re-append it
         (``[*active, *unparsed]``) at write time rather than silently erasing
@@ -7250,7 +7394,7 @@ class DashboardState:
         # Both the status read and the visibility revalidation below run the
         # operator's `gh`/`glab` credentials, so this turn-boundary refresh runs
         # ONLY when an OWNER window is open. A non-owner dashboard window never
-        # drives it (GPT #6789): the owner's own connection keeps the caches warm
+        # drives it: the owner's own connection keeps the caches warm
         # and non-owner windows render the result read-only via the fail-closed
         # is_repo_public gate. With no owner window open there is nobody entitled
         # to drive a credentialed read, so this is a no-op.
@@ -7269,7 +7413,7 @@ class DashboardState:
             # force=True: the status read above bypasses the TTL, so visibility
             # MUST be revalidated in lockstep — otherwise fresh (now-private)
             # status could be projected against a still-cached-public visibility
-            # entry, leaking private status to a non-owner (GPT #6789). Runs
+            # entry, leaking private status to a non-owner. Runs
             # AFTER the status schedule: both are fire-and-forget schedulers, and
             # ordering the status call first preserves the turn-boundary contract
             # while the downstream render gate (`_project_source_links` ->
@@ -7374,12 +7518,12 @@ class DashboardState:
             # Real on EVERY row, origin included: the conversation a session was
             # born in can be disconnected too, so it stops syndicating there and
             # the session carries on in the dashboard. `direction` still records
-            # the provenance the sidebar mark needs; it no longer decides whether
+            # the provenance the sidebar mark needs; it does not decide whether
             # the row has a control.
             #
             # Keyed to the row's SOURCE, not just its channel: a session born in
             # Discord that also mirrors to Telegram draws two non-Slack rows, and
-            # while both read one value, muting either silently muted the other.
+            # if both read one value, muting either silently mutes the other.
             if channel_type == SLACK_NAMESPACE:
                 paused = slack_paused
             elif direction == "origin":
@@ -7573,7 +7717,11 @@ class DashboardState:
 
         Depth-counted so nested use is safe (an inner block must not flush early),
         and ``@contextmanager``'s try/finally unwinds the depth even if the body
-        raises. Only flushes if something actually asked to push.
+        raises. Only flushes if something actually asked to push. A flush that
+        itself fails while the body's own exception is unwinding annotates its
+        exception (`PEP 678`) so the buried original stays visible — the flush's
+        exception otherwise replaces the body's in the caller's view, demoting
+        the actual fault to ``__context__``.
         """
         self._slots_push_suspend += 1
         try:
@@ -7582,7 +7730,19 @@ class DashboardState:
             self._slots_push_suspend -= 1
             if self._slots_push_suspend == 0 and self._slots_push_pending:
                 self._slots_push_pending = False
-                self.push_slots_update()
+                # Captured BEFORE the flush call: inside the `except` block below,
+                # sys.exc_info() would already name the flush's own exception.
+                unwinding_over = sys.exc_info()[1]
+                try:
+                    self.push_slots_update()
+                except BaseException as flush_exc:
+                    if unwinding_over is not None and unwinding_over is not flush_exc:
+                        flush_exc.add_note(
+                            "[slots-flush] the owed slots flush raised while unwinding "
+                            f"over an in-flight {type(unwinding_over).__name__}; that "
+                            "original exception is chained below as __context__"
+                        )
+                    raise
 
     def push_slots_update(self) -> None:
         """Push slots, keeping provider status confined to owner websockets.
@@ -7706,7 +7866,9 @@ class DashboardState:
         from kiro_crew.dashboard.handlers.source_providers import (
             gitlab_hosts_generation,
         )
-        from kiro_crew.platform.context import governance_generation
+        from kiro_crew.platform.governance_profiles import (
+            governance_answer_generation,
+        )
 
         yolo_active = self.is_yolo_active()  # expire first if needed
         # PUBLIC-repo chip status rides the general frame so any authenticated
@@ -7717,16 +7879,38 @@ class DashboardState:
         # ``_serialize_for_client`` -> ``filter_slots_for_app`` before delivery,
         # so widening the general list here never leaks status to an app scope.
         # SSE carries the BARE list (see below); the WS dashboard-user frame
-        # carries the enriched one. GPT #6789: the general ``_slots_list`` feeds
-        # BOTH the SSE queue (which has NO per-app filtering) and the WS frame,
-        # so enriching it here leaked public-repo status onto ``/api/stream`` for
-        # any app token allowed that route. Keep the broadcast list bare and put
+        # carries the enriched one. The general ``_slots_list`` feeds BOTH the SSE
+        # queue (which has NO per-app filtering) and the WS frame, so enriching it
+        # here leaks public-repo status onto ``/api/stream`` for any app token
+        # allowed that route. Keep the broadcast list bare and put
         # the public-repo enrichment only on the WS path, where
         # ``_serialize_for_client`` re-filters app tokens.
         slots_data = self.serialize_slots()
         slots_data_ws = self.serialize_slots(dashboard_user=True)
+        # The evidenced way this broadcast fails is a non-serializable value in
+        # slot state: the dump raises, and the bare TypeError
+        # names neither the slot nor the field. Serialize up front and annotate
+        # the failure with the offender so one traceback is enough to find it.
+        # Both coalescing branches (leading edge and trailing timer) funnel
+        # through this method, so both report identically by construction.
+        # Diagnosis only: the exception still propagates unchanged.
+        try:
+            slots_json = json.dumps(slots_data)
+        except (TypeError, ValueError) as exc:
+            exc.add_note(_slots_serialization_note(slots_data))
+            raise
         mgr = getattr(self, "channel_manager", None)
         ch_trusted = bool(mgr and any(ch.trusted for ch in mgr._channels.values()))
+        # ONE read, shared by the generic and owner frames below. Two independent
+        # reads could straddle a ceiling install or a profile reload and ship two
+        # different tokens for one broadcast, which would make one of the two
+        # audiences invalidate while the other did not.
+        # test_public_repo_status_rides_general_frame_owner_gets_full asserts the two
+        # frames' governanceGeneration values are equal, so a torn read reddens it.
+        # Filesystem-free by contract: governance_answer_generation is two locked
+        # integer reads. The profiles directory re-stat lives in poll_profiles_fresh,
+        # which only the async watcher calls, and only off the event loop.
+        answer_generation = governance_answer_generation()
         # Piggyback the allowlist generation so clients invalidate the cached
         # ['dashboardConfig'] query only when the GitLab-hosts allowlist actually
         # changed -- an event-driven refresh that replaces a constant 30s poll
@@ -7753,7 +7937,7 @@ class DashboardState:
                 # unfiltered stream.
                 "_slots_list_ws": slots_data_ws,
                 "_yolo": yolo_active,
-                "slots": json.dumps(slots_data),
+                "slots": slots_json,
                 "channelTrusted": ch_trusted,
                 "gitlabHostsGeneration": gitlab_hosts_generation(),
                 # getattr, not self._folders: this read path runs on EVERY slots
@@ -7772,16 +7956,15 @@ class DashboardState:
                 # blinked": this frame fires on routine slot activity, so the
                 # tree alone is not a change signal.
                 "foldersGeneration": self.folders_generation(),
-                "governanceGeneration": governance_generation(),
+                "governanceGeneration": answer_generation,
             }
         )
         # The owner frame is the owner's ONLY slots frame — `_send_ws_all` skips
         # owner sockets for `slots` (see there for why), so this envelope has to
-        # carry every key the generic one does. It previously carried a subset,
-        # which is why the owner had to receive both: `folders` seeds the
-        # first-paint folder tree and `gitlabHostsGeneration` drives the
-        # dashboard-config invalidation, and neither was here. Both frames are now
-        # built by `_slots_ws_frame`, so a key can no longer reach one and not the
+        # carry every key the generic one does: `folders` seeds the first-paint
+        # folder tree and `gitlabHostsGeneration` drives the dashboard-config
+        # invalidation, so a subset here leaves the owner without them. Both frames
+        # are built by `_slots_ws_frame`, so a key cannot reach one and not the
         # other.
         owner_ws_clients = getattr(self, "_owner_ws_clients", None)
         if owner_ws_clients:
@@ -7794,7 +7977,7 @@ class DashboardState:
                     gitlab_hosts_gen=gitlab_hosts_generation(),
                     folders=_safe_folder_tree(getattr(self, "_folders", None)),
                     folders_gen=self.folders_generation(),
-                    governance_gen=governance_generation(),
+                    governance_gen=answer_generation,
                 )
             )
 
@@ -8023,6 +8206,9 @@ class DashboardState:
     def ws_client_count(self) -> int:
         return _websocket_for(self).ws_client_count()
 
+    def dashboard_user_ws_count(self) -> int:
+        return _websocket_for(self).dashboard_user_ws_count()
+
     def broadcast_browser_event(self, event_type: str, data: dict) -> None:
         _websocket_for(self).broadcast_browser_event(event_type, data)
 
@@ -8201,18 +8387,34 @@ def _load_notifications() -> list[dict[str, Any]]:
 
 # Notification file I/O runs exclusively on this single-worker executor when
 # an event loop is running: appends (from the delivery sink) and rewrites
-# (from delete/ack/clear) execute strictly in submission order, so no lock is
-# needed and the loop never blocks on file I/O.
+# (from delete/ack/clear) execute strictly in submission order, so the QUEUE
+# needs no lock and the loop never blocks on file I/O. Creating the executor
+# does need one -- see _notification_io_executor.
 _notification_io_pool: concurrent.futures.ThreadPoolExecutor | None = None
+_notification_io_pool_lock = threading.Lock()
 
 
 def _notification_io_executor() -> concurrent.futures.ThreadPoolExecutor:
-    """Lazily create the single-worker executor for notification persistence."""
+    """Lazily create the single-worker executor for notification persistence.
+
+    The creation is locked, not just the queue. An unlocked check-then-set let two
+    threads each observe ``None``, each construct a pool, and each proceed: one
+    assignment won the global while the loser's worker was already live with its job
+    already queued, so the two callers were not serialised against one another at all
+    -- which is the single guarantee this executor exists to provide. Narrow window
+    (the first notification I/O of the process, twice at once) and unbounded harm: an
+    append landing inside a ``_rewrite_notifications`` whole-file write is simply gone,
+    because the rewrite did not include it and overwrote the bytes.
+
+    Double-checked so the lock is paid once rather than on every call.
+    """
     global _notification_io_pool
     if _notification_io_pool is None:
-        _notification_io_pool = concurrent.futures.ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="notif-io"
-        )
+        with _notification_io_pool_lock:
+            if _notification_io_pool is None:
+                _notification_io_pool = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=1, thread_name_prefix="notif-io"
+                )
     return _notification_io_pool
 
 

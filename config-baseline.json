@@ -65,16 +65,17 @@
         "admission_gate": true,
         "workflow_run_timeout_secs": 3600,
         "subagent_mem_buffer_pct": 20,
-        "chat_turn_timeout_secs": 7200,
+        "chat_turn_timeout_secs": 14400,
         "session_start_timeout_secs": 90,
         "tool_approval_timeout_secs": 600,
         "session_control": true,
+        "member_dispatch": true,
         "subagent_cost_gb": 0.5,
         "subagent_cpu_cost_cores": 1.0,
         "subagent_auto_max": 32,
         "subagent_spawn_stagger_secs": 2.0,
         "subagent_max_turns": 100,
-        "subagent_timeout_secs": 1800,
+        "subagent_timeout_secs": 10800,
         "subagent_stall_idle_secs": 120,
         "completion_keep": "head",
         "completion_keep_chars": 3000,
@@ -924,10 +925,10 @@
       "sensitive": false,
       "tags": [],
       "label": "Chat Turn Timeout (secs)",
-      "help": "Wall-clock ceiling for one chat turn. This is a runaway backstop, so it is clamped to 300s..86400s (24h) and can never be disabled. Raise it above the 2h default for long unattended turns (full test suites, long builds); the ACP transport's prompt wait follows it. Hitting the ceiling is visible: the turn ends with a card naming the limit. For work spanning days, prefer monitor/goal loops — they end the turn between cycles and survive restarts.",
+      "help": "Wall-clock ceiling for one chat turn. This is a runaway backstop, so it is clamped to 300s..86400s (24h) and can never be disabled. The 4h default covers the longest single turn the shipped budgets produce (a 90-minute test command plus a fix and a re-run, or a blocking subagent wave at its 2h wait cap); the ACP transport's prompt wait follows it. Hitting the ceiling is visible: the turn ends with a card naming the limit. For work spanning many hours or days, prefer monitor/goal loops — they end the turn between cycles and survive restarts, which a single marathon turn cannot.",
       "hasChildren": false,
       "enumValues": null,
-      "defaultValue": 7200
+      "defaultValue": 14400
     },
     {
       "path": "agent.session_start_timeout_secs",
@@ -967,6 +968,20 @@
       "tags": [],
       "label": "Session Control",
       "help": "Let one chat session open a new session, and stop, read or send to another session of yours. Reading returns a transcript tail, stopping cancels an in-flight turn, a created session starts empty for you to type into, and a send runs text as the target's next turn. On by default, because the grant that decides who can do this is the agent config: the tools come from the kirocrew-dashboard MCP server, so an agent that does not mount it never has them, exactly like any other MCP server. Turn this off to withdraw the capability from every agent at once without editing each spec. Sessions can only reach peers in the same workspace; incognito, app-scoped and scheduled sessions are never addressable, and a crew member or a scheduled run reaches only sessions it created itself.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": true
+    },
+    {
+      "path": "agent.member_dispatch",
+      "kind": "core",
+      "type": "boolean",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Member Dispatch",
+      "help": "Let a crew member's DM session open and drive worker sessions it creates, even when Session Control is off. On by default, because dispatching work into workers is the crew-member operating model, not an opt-in: this is the zero-configuration contract. Turn this off to put member callers back under the Session Control switch, so an operator who withdrew session control keeps member DM threads chat-only without disabling the member. When on, a member's reach is still bounded to sessions it created itself (creator ownership), the same fence that binds it when Session Control is on.",
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": true
@@ -1050,10 +1065,10 @@
       "sensitive": false,
       "tags": [],
       "label": "SubAgent Timeout (seconds)",
-      "help": "Wall-clock timeout per subagent execution. 0 uses hardcoded default (1800s).",
+      "help": "Wall-clock timeout per subagent execution. 0 uses the same default. Clamped to 60s..86400s at load (0 is preserved). Raising it past 2 hours only helps the fire-and-forget spawn_run path: a BLOCKING spawn_sub_agents call collects for at most 2 hours whatever this is set to, so use spawn_run for work longer than that.",
       "hasChildren": false,
       "enumValues": null,
-      "defaultValue": 1800
+      "defaultValue": 10800
     },
     {
       "path": "agent.subagent_stall_idle_secs",
@@ -1418,7 +1433,8 @@
       "hasChildren": true,
       "enumValues": null,
       "defaultValue": {
-        "stage_timeout_seconds": 1800
+        "stage_timeout_seconds": 1800,
+        "max_plan_duration_seconds": 7200
       }
     },
     {
@@ -1434,6 +1450,20 @@
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": 1800
+    },
+    {
+      "path": "orchestrator.max_plan_duration_seconds",
+      "kind": "core",
+      "type": "integer",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Max Plan Duration",
+      "help": "Ceiling for a WHOLE auto-run plan in seconds, checked at each stage boundary, with one warning at 75% of the budget. The per-stage timeout above multiplies by stage count, so without this a long plan can run unattended for hours. 0 disables. Default 2 h.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": 7200
     },
     {
       "path": "messaging",
@@ -1929,6 +1959,7 @@
         "dedup_every_n_sweeps": 12,
         "doc_ingest_hosts": [],
         "sweep_chunk_budget": 500,
+        "import_chunk_budget": 0,
         "embed_rate_limit": 120,
         "extraction_model": "",
         "extraction_pool_size": 3
@@ -2120,6 +2151,20 @@
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": 500
+    },
+    {
+      "path": "knowledge.import_chunk_budget",
+      "kind": "core",
+      "type": "integer",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Explicit Import Chunk Budget",
+      "help": "Maximum chunks ingested through the EXPLICIT one-shot import paths (a single-file add, an agent-driven add, a direct text ingest, and remote sync) within a rolling ~60s window -- the cross-file cost ceiling those paths lack, since they are many independent calls with no scan boundary the way a watcher sweep has. Each chunk costs an LLM extraction call. When the window is exhausted the next import is REFUSED with a reason rather than silently truncated, so a deliberate import never loses part of a file. A single file stays bounded by the 50-chunk per-file cap independently. 0 (the default) removes the bound -- opt in by setting it (e.g. 500, matching sweep_chunk_budget) so this changes nothing until you choose it. LIMITATION if you enable it: reservation is worst-case -- each in-flight import books the 50-chunk per-file maximum up front and reconciles to the real count only when it finishes, so several concurrent imports throttle below the nominal number you set here until that accounting is refined. Set it with that headroom in mind.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": 0
     },
     {
       "path": "knowledge.embed_rate_limit",
@@ -2673,7 +2718,7 @@
         "enabled": true,
         "provider": "local",
         "model": "base",
-        "language_code": "en-US",
+        "language_code": "auto",
         "streaming": true,
         "silence_ms": 700,
         "partial_interval_ms": 400,
@@ -2745,10 +2790,10 @@
       "sensitive": false,
       "tags": [],
       "label": "Language Code",
-      "help": "Language for speech recognition (e.g. en-US, fr-FR, es-ES).",
+      "help": "Language for speech recognition (e.g. zh-CN, en-US). The local provider defaults to auto-detect; choosing a language can improve short dictation.",
       "hasChildren": false,
       "enumValues": null,
-      "defaultValue": "en-US"
+      "defaultValue": "auto"
     },
     {
       "path": "stt.streaming",
@@ -2843,7 +2888,7 @@
       "sensitive": false,
       "tags": [],
       "label": "Timeout",
-      "help": "Transcription timeout in seconds.",
+      "help": "Maximum transcription time in seconds. Local streaming uses the same budget for pending audio after recording stops.",
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": 300
@@ -3532,10 +3577,10 @@
       "enumValues": null,
       "defaultValue": {
         "check_after_secs": 60.0,
-        "stale_window_secs": 300.0,
-        "tool_stall_suspect_secs": 3600.0,
-        "tool_stall_hard_cap_secs": 3600.0,
-        "model_silent_probe_secs": 900.0,
+        "stale_window_secs": 600.0,
+        "tool_stall_suspect_secs": 5400.0,
+        "tool_stall_hard_cap_secs": 7200.0,
+        "model_silent_probe_secs": 1800.0,
         "wellness_sample_secs": 3.0
       }
     },
@@ -3562,10 +3607,10 @@
       "sensitive": false,
       "tags": [],
       "label": "Stale probe window (s)",
-      "help": "Idle seconds before an UNKNOWN-verdict model-wait turn is safe-probed via session/cancel. Probes are non-lethal: a live turn auto-recovers.",
+      "help": "Idle seconds before an UNKNOWN-verdict model-wait turn is safe-probed via session/cancel. Probes are non-lethal, but a probe of a LIVE think cancels and regenerates it, so the window must clear an ordinary silent think. Default 10 min. A think the oracle can attest (an established backend socket) gets the longer model-silent window instead, so this one governs only thinks with no such evidence: a host without procfs, or a backend connection that is momentarily down. Its cost is wedge-recovery latency on a runtime that is already dead, never lost work.",
       "hasChildren": false,
       "enumValues": null,
-      "defaultValue": 300.0
+      "defaultValue": 600.0
     },
     {
       "path": "watchdog.tool_stall_suspect_secs",
@@ -3576,10 +3621,10 @@
       "sensitive": false,
       "tags": [],
       "label": "Tool stall suspect (s)",
-      "help": "Idle seconds before an UNKNOWN-verdict in-flight tool is cancelled and the turn routed to tool-stall recovery (continue-nudge, no re-run of the original message). WORKING tools (e.g. a matched live build child) are never cancelled regardless of duration. Default 1h: generous enough for long builds and MCP tools on macOS, where the liveness oracle degrades (no /proc) and cannot distinguish a live build from a stall, while still landing inside the turn's own ceiling (agent.chat_turn_timeout_secs) so recovery is reachable. Enforcement is at handle construction, not config load: a window past the headroom fraction of the transport's per-prompt timeout is clamped with a warning, while one that merely exceeds agent.chat_turn_timeout_secs is warned about but left as set, because the same handle also serves callers that pass a larger prompt timeout (review and cron turns).",
+      "help": "Idle seconds before an UNKNOWN-verdict in-flight tool is cancelled and the turn routed to tool-stall recovery (continue-nudge, no re-run of the original message). WORKING tools (a matched live build child, an MCP subtree with CPU movement) are never cancelled regardless of duration, so this window governs only what the liveness oracle cannot attest. Default 90 min: it clears every shipped budget a single tool call can legitimately spend silent (the task runner's 90-minute test command, a full test suite with one retry in one shell call) while still landing inside the turn's own ceiling (agent.chat_turn_timeout_secs) so recovery is reachable. Enforcement is at handle construction, not config load: a window past the headroom fraction of the transport's per-prompt timeout is clamped with a warning, while one that merely exceeds agent.chat_turn_timeout_secs is warned about but left as set, because the same handle also serves callers that pass a larger prompt timeout (review and cron turns).",
       "hasChildren": false,
       "enumValues": null,
-      "defaultValue": 3600.0
+      "defaultValue": 5400.0
     },
     {
       "path": "watchdog.tool_stall_hard_cap_secs",
@@ -3590,10 +3635,10 @@
       "sensitive": false,
       "tags": [],
       "label": "Hard cap (s)",
-      "help": "Absolute ceiling for UNKNOWN-verdict forbearance (e.g. the extended probably-thinking window). Applies ONLY to UNKNOWN verdicts — never to a WORKING session, which is deferred before this cap is consulted and is therefore bounded only by the turn's own ceiling. Default 1h, clamped against the transport's per-prompt timeout like the suspect window.",
+      "help": "Absolute ceiling for UNKNOWN-verdict forbearance (e.g. the extended probably-thinking window) and for any per-agent watchdog_tool_stall_* override. Applies ONLY to UNKNOWN verdicts — never to a WORKING session, which is deferred before this cap is consulted and is therefore bounded only by the turn's own ceiling. Default 2h, clamped against the transport's per-prompt timeout like the suspect window.",
       "hasChildren": false,
       "enumValues": null,
-      "defaultValue": 3600.0
+      "defaultValue": 7200.0
     },
     {
       "path": "watchdog.model_silent_probe_secs",
@@ -3604,10 +3649,10 @@
       "sensitive": false,
       "tags": [],
       "label": "Silent-think probe window (s)",
-      "help": "Extended probe window for a model-wait with an established backend connection but flat counters (non-streamed server-side reasoning, e.g. long xhigh thinks). Probing a live think cancels and regenerates it, so this window is deliberately generous.",
+      "help": "Extended probe window for a model-wait with an established backend connection but flat counters (non-streamed server-side reasoning, e.g. long xhigh thinks). Probing a live think cancels and regenerates it, so this window is deliberately generous: 30 min clears the long end of an extended-effort think.",
       "hasChildren": false,
       "enumValues": null,
-      "defaultValue": 900.0
+      "defaultValue": 1800.0
     },
     {
       "path": "watchdog.wellness_sample_secs",
@@ -6043,6 +6088,7 @@
           "trust_identity": false,
           "allowed_logins": [],
           "pin_scope": "node",
+          "bind_refresh_chains": true,
           "keep_awake": true
         },
         "restore_sessions": false,
@@ -6089,6 +6135,7 @@
         "user_role_other": "",
         "user_technical_level": "",
         "tips_enabled": true,
+        "feature_videos_enabled": false,
         "folder_suggestions_enabled": true,
         "tips_cadence_hours": 6.0,
         "tips_snooze_hours": 48.0,
@@ -6131,6 +6178,7 @@
         "trust_identity": false,
         "allowed_logins": [],
         "pin_scope": "node",
+        "bind_refresh_chains": true,
         "keep_awake": true
       }
     },
@@ -6203,6 +6251,20 @@
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": "node"
+    },
+    {
+      "path": "dashboard.tailscale.bind_refresh_chains",
+      "kind": "core",
+      "type": "boolean",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Bind Refresh Chains To The Device",
+      "help": "Bind a session's 30-day refresh chain to the tailnet peer that opened it, so a stolen refresh cookie cannot be replayed from a different allowed device. On by default. Only turn it off if you need one session to roam between your DEVICES while pin_scope is 'node' — with pin_scope 'login' the pin is your identity, not the device, so roaming already works. Turning it off means a stolen refresh cookie renews from any allowed node. Existing chains keep the binding they were opened with; the change applies to sessions started after the next gateway start.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": true
     },
     {
       "path": "dashboard.tailscale.keep_awake",
@@ -6837,6 +6899,20 @@
       "defaultValue": true
     },
     {
+      "path": "dashboard.feature_videos_enabled",
+      "kind": "core",
+      "type": "boolean",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Feature Videos Enabled",
+      "help": "Show short feature-intro clips for features this install has not used yet. Instance-wide kill switch.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": false
+    },
+    {
       "path": "dashboard.folder_suggestions_enabled",
       "kind": "core",
       "type": "boolean",
@@ -7368,6 +7444,20 @@
       "defaultValue": "kirocrew"
     },
     {
+      "path": "agents.*.starred",
+      "kind": "core",
+      "type": "boolean",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Starred",
+      "help": "Marks this crew as a favourite on the Crew Members page. Purely a roster preference: the page's star filter shows only starred crews, so the dozens of package-installed crews the agent sync writes here can be collapsed behind the few you actually drive. Never read by routing, spawning, or the orchestrator.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": false
+    },
+    {
       "path": "agents.*.watchdog_tool_stall_suspect_secs",
       "kind": "core",
       "type": "number",
@@ -7603,10 +7693,10 @@
       "sensitive": false,
       "tags": [],
       "label": "Connections UI",
-      "help": "Show the Connections gallery (held for a later release).",
+      "help": "Show the Connections services gallery (set false to hide it).",
       "hasChildren": false,
       "enumValues": null,
-      "defaultValue": false
+      "defaultValue": true
     },
     {
       "path": "timezone",

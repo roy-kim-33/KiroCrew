@@ -68,6 +68,17 @@ def schemas() -> list[dict[str, Any]]:
                             "IDs with knowledge_list_sources."
                         ),
                     },
+                    "namespace": {
+                        "type": "string",
+                        "description": (
+                            "Optional namespace to scope keyword/vector seeding "
+                            "to documents filed under one organisational label "
+                            "(graph traversal still surfaces cross-namespace "
+                            "connections). This is a relevance filter, not a "
+                            "security boundary. Discover namespaces in the "
+                            "dashboard Knowledge panel; composes with source_id."
+                        ),
+                    },
                 },
                 "required": ["query"],
             },
@@ -176,6 +187,7 @@ def local_knowledge_search(name: str, args: dict[str, Any]) -> str:
     query = args["query"]
     limit = args.get("limit", 3)
     source_id = args.get("source_id") or None
+    namespace = args.get("namespace") or None
 
     db_path = Path(mcp_core.config_dir()) / "workspace" / "knowledge" / "knowledge.db"
     if not db_path.exists():
@@ -225,7 +237,7 @@ def local_knowledge_search(name: str, args: dict[str, Any]) -> str:
     embed_fn = embedder.embed if embedder and embedder.is_available() else None
     retriever = mcp_core.HybridRetriever(store, embedder=embed_fn)
 
-    results = retriever.search(query, limit=limit, source_id=source_id)
+    results = retriever.search(query, limit=limit, source_id=source_id, namespace=namespace)
 
     # Filter by minimum confidence score
     min_score = 0.012
@@ -340,6 +352,16 @@ def knowledge_add_document(name: str, args: dict[str, Any]) -> str:
     if add_status == "duplicate":
         return (f"Already in the knowledge library, nothing added "
                 f"({resp.get('reason', 'duplicate content')}).")
+    if add_status == "deferred":
+        # The cross-file import budget refused this add, and the route reports that
+        # as a 200 with no `error` key -- so without this branch it would fall into
+        # the success line below and tell the agent a document that was never
+        # written is searchable. Nothing was stored, and the reason carries the
+        # budget, window and spend the agent needs to decide whether to wait.
+        return (f"Not added -- the knowledge import budget deferred it "
+                f"({resp.get('reason', 'import budget exhausted')}). Nothing was "
+                f"stored and it is NOT searchable. Retry once the window clears, or "
+                f"ask the operator to raise knowledge.import_chunk_budget.")
     # audit_title, not title: a document name is caller-supplied and free-form
     # enough to carry a credential, and this string is rendered into chat and
     # persisted in the transcript -- a wider audience than the audit log that

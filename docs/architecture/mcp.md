@@ -284,9 +284,21 @@ Probes run from `POST /api/mcp/probe`:
   excluded from the shared per-name probe cache, because a synthetic-identity
   handshake is a diagnostic and not the canonical observation the dashboard
   renders.
+- Remote header VALUES may carry `${VAR}`/`${env:VAR}` references — the
+  documented config form kiro-cli resolves at session runtime. The probe
+  resolves them through the gateway rewriter's declared-env expander
+  (`mcp_gateway.rewriter._expand_env_placeholders`): same regex, same
+  credential-filtered source view, and an unresolved reference stays literal —
+  so the probe presents the credential a session presents instead of sending
+  the reference as text and reporting the server's correct rejection as a
+  failing row. Probe-error redaction keys on the resolved values the probe
+  actually sent.
 - A remote server that answers the handshake with `401` — or with `403` carrying a
-  `WWW-Authenticate` challenge — and whose config has no static `Authorization`
-  header gets status `needs_auth` and an empty `error`, not `error`. The probe
+  `WWW-Authenticate` challenge — and whose sent headers carry no static
+  `Authorization` credential gets status `needs_auth` and an empty `error`, not
+  `error`. An `Authorization` value still carrying an unresolved `${VAR}`
+  reference (a missing or credential-filtered variable) supplied nothing, so it
+  does not count as a static credential here. The probe
   holds no OAuth token, because kiro-cli owns token custody
   ([design-notes/mcp-oauth-ownership.md](design-notes/mcp-oauth-ownership.md)), so
   the status code alone carries no verdict on the server: an unauthorized server
@@ -702,7 +714,23 @@ answers `tools/list` from):
   `browse_outline`, `browse_search`
 - **Workflows and hooks:** `workflow_author`, `workflow_list`,
   `workflow_cancel`, `workflow_rerun_subtree`, `register_hook`
-- **Diagnostics:** `resource_status`, `issue_radar_record_investigation`
+- **Diagnostics:** `resource_status`, `issue_radar_record_investigation`,
+  `kiro_cli_logs` — a redacted tail of kiro-cli's own mcp/lsp protocol logs, so
+  the agent can self-diagnose a rejected turn. Reads log files only: never the
+  fenced identity/token stores, and never the conversation-bearing sources
+  (`kiro-chat.log`, session transcripts), each of which is one shared host file
+  per gateway that would disclose another session's conversation. That scope
+  holds only while mcp.log / lsp.log record protocol traffic rather than full
+  frame bodies, since they share the chat log's single-fixed-path,
+  all-sessions-interleaved shape and an MCP `tools/call` frame carries
+  conversation-derived arguments. Measured on kiro-cli 2.21.1: mcp.log is empty
+  across a session of continuous MCP tool calls, every lsp.log record is a
+  single-line `<timestamp> ERROR <module>: <message>` with no JSON-RPC envelope
+  and a longest line of 313 bytes, and sentinel strings passed as tool-call
+  arguments appear in neither file. Because that measures one version of a
+  component this repo does not pin, a source whose text carries serialized frames
+  is REFUSED whole and visibly, so a kiro-cli that starts logging payloads
+  surfaces as a refusal instead of a silent widening
 - **App bridges (credentialed):** `ops_mission_control_api` — the MCP server
   process holds the gateway's internal secret and forwards only a frozen
   (method, path) allowlist of Ops Mission Control routes; the agent never

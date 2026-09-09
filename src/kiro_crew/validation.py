@@ -31,6 +31,7 @@ from typing import Any
 # no native library is loaded on any platform. Aliased so the schema block below
 # reads as "the computer-use vocabulary" rather than bare names.
 from kiro_crew.computer_use import types as _cu_types
+from kiro_crew.config.sections import SUBAGENT_MAX_TURNS_CEILING
 from kiro_crew.constants import (
     AWS_PROFILE_NAME_RE,
     CHANNEL_OWNER_DM_NAMESPACES,
@@ -53,6 +54,10 @@ from kiro_crew.monitoring.models import (
     MAX_MONITOR_TOKENS,
     MAX_MONITOR_WAKE_INSTRUCTIONS_CHARS,
     MIN_MONITOR_CADENCE_SECS,
+)
+from kiro_crew.monitoring.registry import (
+    publicly_armable_kinds,
+    publicly_armable_objectives,
 )
 from kiro_crew.project_scope import SCOPE_FRAGMENT_RE
 
@@ -232,32 +237,16 @@ _JOB_ID_RE = re.compile(r"^[a-f0-9]{1,16}$")
 # must not abuse that upgrade).
 CRON_SESSION_RE = re.compile(r"^cron:[a-zA-Z0-9]+(?::[a-zA-Z0-9]+)?$")
 
-# Hidden Unicode categories to strip (control chars, format chars, etc.)
-# Keeps: letters, numbers, punctuation, symbols, separators (space/newline)
-# Categories removed wholesale. ``Cf`` (format) is deliberately NOT here: it
-# holds ZWJ U+200D, ZWNJ U+200C and the variation selectors that emoji
-# sequences and Arabic / Persian / Indic scripts REQUIRE to render correctly,
-# so deleting the category corrupts user content instead of hardening anything
-# (``dashboard/chat_folders.py`` already treats U+200D / U+FE0F as meaningful
-# emoji modifiers, and test_context_marker_neutralization asserts ZWNJ/ZWJ
-# survive). ``Co`` (private use) is likewise excluded — Nerd Fonts and terminal
-# themes carry real icon glyphs there. The genuinely dangerous Cf members are
-# removed by codepoint via ``_BIDI_CONTROLS`` instead of by category.
-_HIDDEN_CATEGORIES = frozenset(
-    {
-        "Cc",  # control (except \n \r \t)
-        "Cs",  # surrogate — never valid in well-formed text
-    }
-)
-
-# Categories removed wholesale. ``Cf`` (format) IS included — it is stripped by
-# default and only the shaping characters named in ``_ALLOWED_FORMAT`` below get
-# through. Fail-closed is required here rather than aesthetic: this sanitizer
-# runs BEFORE credential redaction, so any invisible character it preserves can
-# be inserted into a credential to defeat ``redact_credentials``' patterns and
-# carry a recoverable secret into the dashboard and the notification JSONL. An
-# allowlist means a newly-assigned or simply un-enumerated ``Cf`` codepoint is
-# blocked instead of silently becoming an evasion vector.
+# Unicode categories :func:`strip_hidden_unicode` strips, minus the
+# ``_ALLOWED_CONTROL`` / ``_ALLOWED_FORMAT`` carve-outs below. ``Cf`` (format)
+# IS included — it is stripped by default and only the shaping characters named
+# in ``_ALLOWED_FORMAT`` get through, and only next to non-ASCII text.
+# Fail-closed is required here rather than aesthetic: this sanitizer runs BEFORE
+# credential redaction, so any invisible character it preserves can be inserted into a
+# credential to defeat ``redact_credentials``' patterns and carry a recoverable
+# secret into the dashboard and the notification JSONL. An allowlist means a
+# newly-assigned or simply un-enumerated ``Cf`` codepoint is blocked instead of
+# silently becoming an evasion vector.
 #
 # ``Co`` (private use) is excluded: Nerd Fonts and terminal themes carry real
 # icon glyphs there, and unlike ``Cf`` those are visible, so they cannot hide a
@@ -273,8 +262,8 @@ _HIDDEN_CATEGORIES = frozenset(
 # The ONLY format characters allowed through. Each has a real text-shaping job
 # that scripts and emoji sequences cannot express without it, so removing them
 # corrupts user content (``dashboard/chat_folders.py`` treats U+200D as a
-# meaningful emoji modifier, and test_context_marker_neutralization asserts
-# ZWNJ/ZWJ survive).
+# meaningful emoji modifier, and ``test_validation.TestStripHiddenUnicode`` pins
+# ZWNJ/ZWJ survival here).
 #
 # Everything else in ``Cf`` stays denied, including ZWSP U+200B, the word joiner
 # and invisible operators U+2060-2064, BOM U+FEFF, the bidi embedding/override/
@@ -1035,8 +1024,11 @@ SPAWN_RUN_SCHEMA = ToolSchema(
             item_max_len=MAX_SHORT_STRING,
             item_pattern=_AGENT_NAME_RE,
         ),
-        # 0 = "not set" → falls through to config default via `0 or config_value`
-        FieldSpec("max_turns", int, min_val=0, max_val=200),
+        # 0 = "not set" → falls through to config default via `0 or config_value`.
+        # Bounded by the same ceiling the config loader clamps
+        # ``agent.subagent_max_turns`` to, so a per-spawn override can never
+        # exceed what a pinned default is allowed to be.
+        FieldSpec("max_turns", int, min_val=0, max_val=SUBAGENT_MAX_TURNS_CEILING),
         # Optional working directory for the subagent subprocess. Must be
         # absolute, exist, and be under subagent_cwd_allowed_roots. Validated
         # in SubagentManager.spawn.
@@ -1069,7 +1061,7 @@ SPAWN_CONTINUE_SCHEMA = ToolSchema(
         FieldSpec("conversation", str, required=True, max_len=MAX_SHORT_STRING),
         FieldSpec("task", str, required=True, max_len=MAX_MEDIUM_STRING),
         FieldSpec("agent", str, max_len=MAX_SHORT_STRING, pattern=_AGENT_NAME_RE),
-        FieldSpec("max_turns", int, min_val=0, max_val=200),
+        FieldSpec("max_turns", int, min_val=0, max_val=SUBAGENT_MAX_TURNS_CEILING),
         FieldSpec("model", str, max_len=MAX_SHORT_STRING, pattern=_MODEL_NAME_RE),
     ],
 )
@@ -1208,9 +1200,9 @@ AUTONUDGE_STOP_SCHEMA = ToolSchema(
 MONITOR_WATCH_SCHEMA = ToolSchema(
     tool_name="monitor_watch",
     fields=[
-        FieldSpec("kind", str, required=True, allowed=frozenset({"github_pull_request"})),
+        FieldSpec("kind", str, required=True, allowed=publicly_armable_kinds()),
         FieldSpec("target", str, required=True, max_len=MAX_SHORT_STRING),
-        FieldSpec("objective", str, required=True, allowed=frozenset({"review_ready"})),
+        FieldSpec("objective", str, required=True, allowed=publicly_armable_objectives()),
         FieldSpec(
             "interval_secs",
             int,
@@ -1271,7 +1263,7 @@ MONITOR_UPDATE_SCHEMA = ToolSchema(
         FieldSpec("max_cycles", int, min_val=0, max_val=1000),
         FieldSpec("max_runtime_secs", int, min_val=0, max_val=604800),
         FieldSpec("target", str, max_len=MAX_SHORT_STRING),
-        FieldSpec("objective", str, allowed=frozenset({"review_ready"})),
+        FieldSpec("objective", str, allowed=publicly_armable_objectives()),
         FieldSpec("max_agent_turns", int, min_val=1, max_val=MAX_MONITOR_AGENT_TURNS),
         FieldSpec("max_tokens", int, min_val=1, max_val=MAX_MONITOR_TOKENS),
         FieldSpec("max_provider_errors", int, min_val=1, max_val=MAX_MONITOR_PROVIDER_ERRORS),
@@ -1353,6 +1345,20 @@ SKILL_FETCH_SCHEMA = ToolSchema(
     fields=[
         FieldSpec("id", str, required=True, max_len=MAX_SHORT_STRING),
         FieldSpec("provider", str, max_len=MAX_SHORT_STRING),
+    ],
+)
+
+# kiro_cli_logs reads kiro-cli's own log files (never the fenced identity
+# stores) and returns a redacted tail. ``tail`` is a line count bounded by the
+# reader's own hard BYTE cap — the schema ceiling only guards against an absurd
+# value; the byte cap is what actually bounds the output. ``since`` is a leading
+# slice of a log line's own timestamp, matched lexically, so it is a short
+# string, not a parsed datetime.
+KIRO_CLI_LOGS_SCHEMA = ToolSchema(
+    tool_name="kiro_cli_logs",
+    fields=[
+        FieldSpec("tail", int, min_val=1, max_val=100000),
+        FieldSpec("since", str, max_len=MAX_SHORT_STRING),
     ],
 )
 
@@ -2362,6 +2368,7 @@ CRON_ADD_SCHEMA = ToolSchema(
             item_pattern=re.compile(r"^\d{4}-\d{2}-\d{2}$"),
         ),
         FieldSpec("timezone", str, max_len=50, pattern=re.compile(r"^[A-Za-z0-9_/+-]+$")),
+        FieldSpec("folder", str, max_len=MAX_SHORT_STRING),
         FieldSpec("persistent_session", bool),
         FieldSpec("minimal_context", bool),
         FieldSpec("hide_in_chat", bool),
@@ -2777,6 +2784,11 @@ LOCAL_KNOWLEDGE_SEARCH_SCHEMA = ToolSchema(
         # the handler for a graceful "use knowledge_list_sources" reply, not a
         # ValidationError; every downstream use is a parameterized SQL bind.
         FieldSpec("source_id", str, required=False, max_len=64),
+        # Organisational namespace label (items.namespace). Same 64-char cap the
+        # store enforces on ingest (handlers/knowledge.py). No pattern: an
+        # unknown namespace just yields no results, and the value is a
+        # parameterized SQL bind. It is a relevance filter, not a boundary.
+        FieldSpec("namespace", str, required=False, max_len=64),
     ],
 )
 
@@ -2990,6 +3002,7 @@ MCP_CRON_SCHEMAS: dict[str, ToolSchema] = {
                 item_pattern=re.compile(r"^\d{4}-\d{2}-\d{2}$"),
             ),
             FieldSpec("timezone", str, max_len=50, pattern=re.compile(r"^[A-Za-z0-9_/+-]+$")),
+            FieldSpec("folder", str, max_len=MAX_SHORT_STRING),
             FieldSpec("persistent_session", bool),
             FieldSpec("minimal_context", bool),
             FieldSpec("hide_in_chat", bool),
@@ -3117,6 +3130,99 @@ MCP_DASHBOARD_SCHEMAS: dict[str, ToolSchema] = {
     "chat_folder_move": CHAT_FOLDER_MOVE_SCHEMA,
     "chat_folder_move_session": CHAT_FOLDER_MOVE_SESSION_SCHEMA,
 }
+
+# ── Tool Schemas (MCP Work ledger — server ``kirocrew-work``) ──
+#
+# Its own registry for the same reason the dashboard one is separate: the four
+# work-ledger tools ship on an opt-in server, and a session that is neither a
+# conductor nor a worker must not pay for their schemas. The caps restate the
+# store's own (``work_ledger.MAX_*``) rather than importing them, because
+# ``validation`` is imported by the gateway on every request path and the store is
+# not; ``test_work_ledger_tools.py`` pins the two together so they cannot drift.
+#
+# What is NOT here is the load-bearing part. ``WORK_REPORT_SCHEMA`` has no
+# ``item_id``, no ``session``, no ``acceptance``, no ``verdict`` and no ``state``:
+# a worker cannot write a conductor-owned field because no parameter carries one,
+# which is a stronger guarantee than an allowlist that must be kept correct as
+# fields are added.
+_WORK_STATUSES = frozenset({"progress", "done", "blocked", "question"})
+_WORK_VERDICTS = frozenset({"pass", "fail", "pending", "refused", "error"})
+_WORK_ITEM_STATES = frozenset({"open", "accepted", "rejected", "abandoned"})
+#: A superset of the store's six conductor actions: ``accept`` promotes a worker's
+#: claimed ``pr`` into ``acceptance`` and is served by its own store function.
+_WORK_RECORD_ACTIONS = frozenset({"create", "bind", "decide", "verdict", "close", "goal", "accept"})
+
+WORK_BRIEF_SCHEMA = ToolSchema(tool_name="work_brief")
+
+WORK_REPORT_SCHEMA = ToolSchema(
+    tool_name="work_report",
+    fields=[
+        FieldSpec("status", str, required=True, allowed=_WORK_STATUSES),
+        # NOT ``clamp_to_max``: a truncated summary the worker believes landed
+        # whole is a silent data loss the worker cannot detect, and the conductor
+        # reads this field to decide. Refusing names the cap so the worker retries
+        # with a shorter one.
+        FieldSpec("summary", str, required=True, max_len=500),
+        FieldSpec("artifacts", dict),
+        FieldSpec("pr", int, min_val=1, max_val=1_000_000_000),
+    ],
+    custom_validator=lambda cleaned: _validate_work_artifacts(cleaned.get("artifacts")),
+)
+
+WORK_LEDGER_READ_SCHEMA = ToolSchema(tool_name="work_ledger_read")
+
+WORK_LEDGER_RECORD_SCHEMA = ToolSchema(
+    tool_name="work_ledger_record",
+    fields=[
+        FieldSpec("action", str, required=True, allowed=_WORK_RECORD_ACTIONS),
+        # Server-minted ``it_<8 hex>``, so the pattern is what keeps a
+        # model-supplied string out of a path component even before the store
+        # re-checks it.
+        FieldSpec("item_id", str, max_len=16, pattern=re.compile(r"^it_[0-9a-f]{8}$")),
+        FieldSpec("title", str, max_len=200),
+        FieldSpec("acceptance", dict),
+        FieldSpec("worker_session_key", str, max_len=512),
+        FieldSpec("decision", str, max_len=2000),
+        FieldSpec("verdict", str, allowed=_WORK_VERDICTS),
+        FieldSpec("state", str, allowed=_WORK_ITEM_STATES),
+        FieldSpec("goal", str, max_len=2000),
+        FieldSpec("round", int, min_val=0, max_val=1_000_000),
+        FieldSpec("fails", int, min_val=0, max_val=1_000_000),
+    ],
+)
+
+
+def _validate_work_artifacts(artifacts: object) -> None:
+    """Bound a ``work_report`` artifacts map: 16 keys, key 64, value 512.
+
+    ``FieldSpec`` bounds a list's items but not a dict's, so the map's caps are
+    checked here rather than being left to the store alone. Refusing at the schema
+    keeps the failure a 400 that names the offending key, and the store still
+    enforces the same three numbers — this is the early, specific answer, not the
+    only one.
+    """
+    if artifacts is None:
+        return
+    if not isinstance(artifacts, dict):
+        raise ValidationError("artifacts", "must be a JSON object")
+    if len(artifacts) > 16:
+        raise ValidationError("artifacts", f"exceeds max items 16 (got {len(artifacts)})")
+    for key, value in artifacts.items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            raise ValidationError("artifacts", "must map strings to strings")
+        if len(key) > 64:
+            raise ValidationError("artifacts", f"key {key[:32]!r} exceeds max length 64")
+        if len(value) > 512:
+            raise ValidationError("artifacts", f"value for {key!r} exceeds max length 512")
+
+
+MCP_WORK_SCHEMAS: dict[str, ToolSchema] = {
+    "work_brief": WORK_BRIEF_SCHEMA,
+    "work_report": WORK_REPORT_SCHEMA,
+    "work_ledger_read": WORK_LEDGER_READ_SCHEMA,
+    "work_ledger_record": WORK_LEDGER_RECORD_SCHEMA,
+}
+
 
 MCP_COMPUTER_SCHEMAS: dict[str, ToolSchema] = {
     _cu_types.TOOL_LIST_APPS: ToolSchema(tool_name=_cu_types.TOOL_LIST_APPS, fields=[]),

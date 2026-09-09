@@ -22,7 +22,8 @@ from kiro_crew import name_grant
 from kiro_crew.acp.client import AcpError, AcpPromptBusy, advertised_model_ids
 from kiro_crew.acp.types import EVENT_STEER_CONSUMED, TurnUsage
 from kiro_crew.config.loader import KiroCrewConfig
-from kiro_crew.hooks import fire_tool_hooks, get_global_hook_store
+from kiro_crew.hooks import _EDIT_TOOL_KIND, fire_tool_hooks, get_global_hook_store
+from kiro_crew.platform.tool_paths import edit_target_candidates
 from kiro_crew.providers.base import (
     EVENT_COMPLETE,
     EVENT_PERMISSION_REQUEST,
@@ -37,6 +38,7 @@ from kiro_crew.security import (
     is_denied,
     is_sensitive_bash_command,
     is_sensitive_path,
+    is_sensitive_write_path,
     redact_credentials,
     redact_exfiltration_urls,
 )
@@ -949,6 +951,72 @@ def _title_denial(
     deny_reason = is_denied(title, denied_regexes=denied_regexes)
     if deny_reason:
         return ("regex", deny_reason)
+    return None
+
+
+def _edit_target_denial(
+    raw_params: dict | None, diff_path: str = ""
+) -> tuple[str, str, str] | None:
+    """The always-enforced denial for a file-EDIT tool call, or ``None``.
+
+    An edit's ``tool_input`` is a DOCUMENT: ``_dispatch.derive_edit_diff`` renders
+    the file's new content (or a strReplace pair) as a unified diff, and that text
+    is what ``event.tool_input`` carries. Handing it to :func:`_first_tool_input_denial`
+    read the document as a shell command line, so writing a Markdown page that says
+    ``git push origin main``, a docstring that says ``kirocrew restart``, or prose
+    that names ``~/.ssh`` was refused -- and a body over
+    :data:`_MAX_SCANNABLE_TOOL_INPUT_CHARS` was refused for its LENGTH (the
+    tool-input length-cap defect). That is the same class the cron-script body
+    gate rework closed: a document is not the shell gate's subject.
+
+    What an edit can actually do is decided by WHERE it writes, so the gate for an
+    edit is the resolved target path, exactly as ``hooks.on_tool_call`` decides it:
+    every accepted path spelling in the params (``target_paths``) goes through
+    :func:`is_sensitive_write_path`, which is the read+write keystone PLUS the
+    write-only tier (config, the agents dir). A walk that hit its work cap is
+    denied as unverifiable, mirroring the hook gate's fail-closed shape. The
+    title-tier scan of the request still runs before this, unchanged.
+
+    The target set is the UNION of the params' path spellings and *diff_path*,
+    the path the tool_call's ``{"type": "diff"}`` content block named. A backend
+    may stream trusted params that carry no path key at all and name the file
+    only in that block (``_dispatch`` caches it per toolCallId onto the
+    permission event as ``diff_path``), so judging the params alone would judge
+    nothing. Two unverifiable shapes fail closed: an EMPTY union (an edit whose
+    params and content block together name no target has no proven target to
+    judge, and the document scan is not a fallback here -- a document that
+    happens to contain no denied text is not evidence that the write is safe),
+    and an UNANCHORED diff path (relative after ``~``/env expansion, which
+    resolves against the gateway CWD rather than the agent workspace, so its
+    sensitivity cannot be established -- see ``edit_target_candidates``). The
+    caller reaches this on trusted provenance (see ``_resolve_permission``) or
+    on a client-cached diff block, which is write-plane evidence on its own;
+    a call with neither trusted params nor a diff block never gets here and
+    keeps the document scan.
+    """
+    candidates = edit_target_candidates(raw_params, diff_path)
+    if candidates.truncated:
+        return (
+            "path",
+            "Blocked: tool arguments too large to verify for sensitive paths " "(deny-by-default)",
+            "",
+        )
+    if candidates.unanchored:
+        return (
+            "path",
+            "Blocked: file edit names a relative target path that cannot be "
+            "verified (deny-by-default)",
+            "",
+        )
+    if not candidates:
+        return (
+            "path",
+            "Blocked: file edit names no target path to verify (deny-by-default)",
+            "",
+        )
+    for path in candidates:
+        if is_sensitive_write_path(path):
+            return ("path", f"Blocked: write to protected path: {path}", path)
     return None
 
 
@@ -2135,7 +2203,44 @@ async def _resolve_permission(
     # (kiro-cli convention), but tool_input may contain additional arguments or
     # the actual path when the title is a generic tool name (e.g. "Read", "Bash").
     _tool_input = event.tool_input or ""
-    _input_strings = _extract_tool_input_strings(_tool_input) if _tool_input else []
+    # A file EDIT's tool_input is the document being written, not a command
+    # line; its gate is the target path (see _edit_target_denial). The reroute is
+    # taken only on TRUSTED provenance, never on the payload's own word:
+    # ``tool_kind`` on a permission frame is the agent-influenced ``kind`` the
+    # payload carries (display/telemetry metadata -- see _dispatch), so a shell
+    # call could forge ``kind="edit"`` to skip the command scan. What the client
+    # itself established from the preceding tool_call frame is ``shell_classified``
+    # (the shell cache hit) with ``is_shell`` False, and ``raw_params_trusted`` (the
+    # params came from that same cache, not an inline fallback). A frame missing
+    # any of those has no proven target to judge and keeps the document scan as
+    # the fail-closed fallback. Once rerouted, the target set is the params'
+    # paths plus ``event.diff_path`` (the content block's path the client
+    # cached), and an empty set is denied -- see _edit_target_denial.
+    _edit_params = (
+        event.raw_tool_params
+        if (
+            event.tool_kind == _EDIT_TOOL_KIND
+            and event.shell_classified
+            and not event.is_shell
+            and event.raw_params_trusted
+            and isinstance(event.raw_tool_params, dict)
+        )
+        else None
+    )
+    # Target-gating and document-scan suppression are SEPARATE decisions. A
+    # diff content block is write-plane evidence on its own — ``diff_path`` is
+    # the client's own cache from the preceding tool_call frame, not the
+    # agent-influenced ``kind`` — so the target denial also runs for a
+    # kindless or mislabelled non-shell call that carries one (strictly
+    # tightening: that call keeps its document scan below AND gains the
+    # target gate). Suppressing the document scan stays keyed on the fully
+    # trusted edit reroute (``_edit_params is not None``) alone.
+    _edit_target_gated = _edit_params is not None or bool(event.diff_path and not event.is_shell)
+    _input_strings = (
+        []
+        if _edit_params is not None
+        else (_extract_tool_input_strings(_tool_input) if _tool_input else [])
+    )
 
     def _scan_off_loop() -> tuple[str, str, str, str] | None:
         # One worker hop for the title and the whole tool_input loop. Both are
@@ -2152,6 +2257,10 @@ async def _resolve_permission(
         title_hit = _title_denial(normalized, _denied_regexes)
         if title_hit is not None:
             return (title_hit[0], title_hit[1], normalized, "always_deny")
+        if _edit_target_gated:
+            edit_hit = _edit_target_denial(_edit_params, event.diff_path)
+            if edit_hit is not None:
+                return (*edit_hit, "always_deny_input")
         if _input_strings:
             input_hit = _first_tool_input_denial(_input_strings, _denied_regexes)
             if input_hit is not None:
@@ -2179,6 +2288,7 @@ async def _resolve_permission(
             app=app,
             tool_kind=event.tool_kind,
             raw_params=event.raw_tool_params,
+            diff_path=event.diff_path,
             command=event.shell_command,
             is_shell=event.is_shell,
         )

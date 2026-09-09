@@ -61,6 +61,14 @@ vi.mock('../../hooks/useVisualViewport', () => ({ useVisualViewport: () => ({ he
 vi.mock('../../hooks/useDialogFocusTrap', () => ({ useDialogFocusTrap: () => {} }))
 const cycleTheme = vi.fn()
 vi.mock('../../hooks/useTheme', () => ({ useTheme: () => ({ cycle: cycleTheme }) }))
+// Only the filing call is stubbed — it talks to the folder API. `commandFolderName`
+// stays REAL: it decides what the folder is called, which is exactly what these tests
+// assert, and a stub would let them agree with themselves.
+const fileSessionInCommandFolder = vi.fn(async () => 'folder-1')
+vi.mock('./sessionFolder', async importOriginal => ({
+  ...(await importOriginal<typeof import('./sessionFolder')>()),
+  fileSessionInCommandFolder: (...args: unknown[]) => fileSessionInCommandFolder(...(args as [])),
+}))
 
 /** Resolve the promise `createSlot` dispatch is expected to produce. */
 const resolvingDispatch = () => dispatch.mockReturnValue({ unwrap: () => Promise.resolve('slot-1') })
@@ -164,16 +172,21 @@ describe('CommandBarOverlay rows', () => {
   })
 
   it('renders settings subtitles that tell same-label rows apart', () => {
-    // Two `Speed` selects live in the Voice tab, distinguished in the registry only
-    // by their description. A tab-only subtitle renders them identically, which is
-    // the shipped defect: the user cannot tell which row they are choosing. The tab
-    // name must also be localized, never a raw machine key like `computer-use`.
+    // Several `Speed` selects live in the Voice tab, one per TTS provider,
+    // distinguished in the registry only by their description. A tab-only
+    // subtitle renders them identically, which is the shipped defect: the user
+    // cannot tell which row they are choosing. The tab name must also be
+    // localized, never a raw machine key like `computer-use`.
+    //
+    // The count is derived, not pinned: adding a provider adds a row, and a
+    // literal here would fail for that rather than for a lost subtitle. What
+    // must hold is one DISTINCT subtitle per duplicate row, whatever the count.
     mount()
     fireEvent.change(screen.getByRole('combobox'), { target: { value: 'speed' } })
     const dupes = SETTINGS_REGISTRY.filter(e => e.label === 'Speed' && e.tab === 'voice')
-    expect(dupes.length).toBe(2)
+    expect(dupes.length).toBeGreaterThan(1)
     const subtitles = dupes.map(e => settingsSubtitle(e))
-    expect(new Set(subtitles).size).toBe(2)
+    expect(new Set(subtitles).size).toBe(dupes.length)
     for (const s of subtitles) {
       expect(s).toContain(settingsTabLabel('voice'))
       expect(screen.getByText(s)).toBeTruthy()
@@ -618,6 +631,9 @@ describe('CommandBarOverlay rows', () => {
     )
     await waitFor(() => expect(dispatch).toHaveBeenCalledWith({ type: 'setPendingInput', text: 'why did the deploy stall' }))
     expect(enterInsertOrNewSession).not.toHaveBeenCalled()
+    // NOT filed into a command folder: this is a sentence the reader wrote, so it
+    // belongs wherever they are working rather than under a command's name.
+    expect(fileSessionInCommandFolder).not.toHaveBeenCalled()
   })
 
   it('keeps the question recoverable when the session cannot be created', async () => {
@@ -797,6 +813,7 @@ describe('CommandBarOverlay contributed commands', () => {
     enterInsertOrNewSession.mockReset()
     newSessionWithToken.mockReset()
     cycleTheme.mockReset()
+    fileSessionInCommandFolder.mockClear()
     storeState.dashboard = { slots: [], unreadSlots: [] }
     storeState.chat = { slotStatusDetail: {}, activeSlot: null }
     window.localStorage.clear()
@@ -932,6 +949,59 @@ describe('CommandBarOverlay contributed commands', () => {
     mountWithApps([appWith([STANDUP])])
     enterCommand(/Write my standup/)
     expect(dispatch).toHaveBeenCalledWith({ type: 'createSlot', arg: { activate: false } })
+  })
+
+  it("files the session it opened under the command's own folder", async () => {
+    dispatch.mockReturnValue({ unwrap: () => Promise.resolve({ key: 'slot-new' }) })
+    mountWithApps([appWith([STANDUP])])
+    enterCommand(/Write my standup/)
+    await waitFor(() => expect(fileSessionInCommandFolder).toHaveBeenCalled())
+    const [slotKey, folderName] = fileSessionInCommandFolder.mock.calls[0] as unknown as [
+      string,
+      string,
+    ]
+    expect(slotKey).toBe('slot-new')
+    // The row's own title, so a second command lands in a folder of its own rather
+    // than sharing one with every other row this app contributed.
+    expect(folderName).toBe('Write my standup')
+  })
+
+  it('files an argument-taking command under its title too', async () => {
+    dispatch.mockReturnValue({ unwrap: () => Promise.resolve({ key: 'slot-approve' }) })
+    mountWithApps([appWith([APPROVE_ALL])])
+    const input = enterCommand(/Approve all PRs/)
+    fireEvent.change(input, { target: { value: LINK } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    await waitFor(() => expect(fileSessionInCommandFolder).toHaveBeenCalled())
+    expect(fileSessionInCommandFolder.mock.calls[0]?.[1]).toBe('Approve all PRs')
+  })
+
+  it('files nothing when the seed was abandoned mid-flight', async () => {
+    // The prompt never became a message, so there is no session worth filing -- and a
+    // folder named after a command that did not run is worse than an unfiled session.
+    let resolveSlot: (v: unknown) => void = () => {}
+    dispatch.mockReturnValue({ unwrap: () => new Promise(res => (resolveSlot = res)) })
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    client.setQueryData(['apps'], [appWith([STANDUP])])
+    const onClose = vi.fn()
+    const view = render(
+      <QueryClientProvider client={client}>
+        <CommandBarOverlay open onClose={onClose} />
+      </QueryClientProvider>,
+    )
+    enterCommand(/Write my standup/)
+    // Dismissed while the create is still in flight, which revokes the run's claim.
+    view.rerender(
+      <QueryClientProvider client={client}>
+        <CommandBarOverlay open={false} onClose={onClose} />
+      </QueryClientProvider>,
+    )
+    await act(async () => {
+      resolveSlot({ key: 'slot-abandoned' })
+      await Promise.resolve()
+    })
+    expect(dispatch).not.toHaveBeenCalledWith({ type: 'setPendingInput', text: STANDUP.prompt })
+    expect(fileSessionInCommandFolder).not.toHaveBeenCalled()
   })
 
   it("refuses a value the app's own pattern rejects, creating nothing", async () => {
@@ -1368,7 +1438,9 @@ describe('CommandBarOverlay contributed commands', () => {
     // The composed meta, not a bare app-name match: with no subtitle the fallback renders
     // the app name too, so a loose matcher would pass on the subtitle alone and prove
     // nothing about the meta column this fix is about.
-    expect(screen.getByText(`PR Bulk Ops \u00B7 Command`)).toBeTruthy()
+    // The VALIDATED identifier, not the fixture's `displayName`: provenance never comes
+    // from a field the app chooses, or it could claim to be the host.
+    expect(screen.getByText(`pr-bulk-ops \u00B7 Command`)).toBeTruthy()
   })
 
   it('names the contributing app even when the app wrote its own subtitle', () => {
@@ -1379,7 +1451,7 @@ describe('CommandBarOverlay contributed commands', () => {
     mountWithApps([appWith([APPROVE_ALL])])
     enterCommand(/Approve all PRs/)
     expect(screen.getByText(APPROVE_ALL.subtitle)).toBeTruthy()
-    expect(screen.getByText('PR Bulk Ops')).toBeTruthy()
+    expect(screen.getByText('pr-bulk-ops')).toBeTruthy()
   })
 
   it.each(['__proto__', 'constructor', 'toString'])(
