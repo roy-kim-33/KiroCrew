@@ -640,7 +640,7 @@ class TestLocalSettingsSeed:
     def _client(self, tmp_path, **kw):
         return AcpClient(work_dir=tmp_path, acp_backend=ACP_BACKEND_CLAUDE, **kw)
 
-    def test_seed_writes_no_allowlist_on_the_native_lane(self, tmp_path):
+    def test_seed_writes_no_allowlist_on_the_native_lane(self, tmp_path, monkeypatch):
         """RoyCrew fork: upstream writes ``seed_available_models("claude_code")``
         (its Bedrock ``global.anthropic.*`` catalog) here. This fork must not.
 
@@ -656,6 +656,13 @@ class TestLocalSettingsSeed:
         stop a live router probe from resolving a model and flipping this into
         the pinned-model branch.
         """
+        # The advertised-model cache is a MODULE GLOBAL, so an earlier test in the
+        # same worker can leave it warm -- and a warm cache is exactly the branch
+        # that DOES seed an allowlist. Pin it cold so this asserts the cold-native
+        # lane it names rather than whatever ran before it.
+        from kiro_crew import model_registry as _mr
+
+        monkeypatch.setattr(_mr, "_ADVERTISED_MODELS", {})
         client = self._client(tmp_path)
         client._write_claude_local_settings()
         data = json.loads((tmp_path / ".claude" / "settings.local.json").read_text())
@@ -972,10 +979,20 @@ class TestLocalSettingsSeed:
         assert client._clear_stale_wildcard(fifo) is False
         assert stat.S_ISFIFO(fifo.stat(follow_symlinks=False).st_mode)
 
-    @pytest.mark.skipif(not hasattr(os, "symlink"), reason="symlinks are POSIX-only")
+    @pytest.mark.skipif(
+        not hasattr(os, "O_NOFOLLOW"), reason="O_NOFOLLOW is POSIX-only"
+    )
     def test_clearing_a_stale_wildcard_never_follows_a_symlink(self, tmp_path):
         """O_NOFOLLOW: a link pointing at a real wildcard file is refused, and the
-        target it points at is left untouched."""
+        target it points at is left untouched.
+
+        POSIX-only, and deliberately so: ``getattr(os, "O_NOFOLLOW", 0)`` makes the
+        flag a no-op on Windows, so this particular layer does not exist there.
+        It is defence in depth rather than the only guard -- the real call path
+        reaches this helper only after ``_claude_settings_usable`` has already
+        refused a symlink via ``Path.is_symlink()``, which is platform-independent.
+        This test calls the helper directly, so it bypasses that first guard.
+        """
         client = self._client(tmp_path)
         target = tmp_path / "real-settings.json"
         target.write_text(json.dumps({"availableModels": ["*"]}), encoding="utf-8")
