@@ -53,27 +53,26 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      # Same token for the gh CLI. Bonus: a PR opened with a PAT DOES trigger
-      # ci.yml, which a GITHUB_TOKEN-authored PR does not (see this file's header)
-      # -- so the sync PR now gets a real CI verdict before a human merges it.
-      GH_TOKEN: ${{ secrets.SYNC_PAT || github.token }}
+      # DELIBERATELY the scoped, short-lived GITHUB_TOKEN at job level, NOT the PAT.
+      # This job MERGES UPSTREAM CODE and then EXECUTES it (`uv pip install -e`
+      # runs build hooks; `sync-upstream.sh verify` runs pytest) -- both from the
+      # merged tree. A job-level PAT with repo+workflow scope would be readable by
+      # that upstream-authored code, which is a supply-chain exposure the
+      # GITHUB_TOKEN does not carry (it is scoped, auto-revoked, and categorically
+      # cannot modify .github/workflows/*). The PAT is therefore attached ONLY to
+      # the four steps that genuinely need it -- the two pushes and the two
+      # `gh pr create` calls -- none of which run upstream code.
+      GH_TOKEN: ${{ github.token }}
     steps:
-      # persist-credentials retained: sync/Push sync branch runs `git push origin`
-      # (and the conflict path's `git commit` + push), so this checkout's credential
-      # is the one that authenticates them. The other fork workflows opt out.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           ref: main
-          # SYNC_PAT, not github.token: upstream routinely changes its OWN
-          # .github/workflows/*, so a sync branch's diff contains workflow files
-          # -- and GITHUB_TOKEN is refused there ("refusing to allow a GitHub App
-          # to create or update workflow ... without `workflows` permission").
-          # There is no `workflows:` key for the permissions block, so this is the
-          # only mechanism. Falls back to github.token when the secret is absent,
-          # which keeps the workflow runnable (it will simply fail the same way at
-          # the push, as before) rather than erroring on a missing secret.
-          token: ${{ secrets.SYNC_PAT || github.token }}
+          # No persisted credential: this job executes upstream code from the
+          # merged tree, and a token left in .git/config is readable by it. The
+          # repo is public so the fetch needs none, and each push step supplies
+          # its own credential explicitly.
+          persist-credentials: false
 
       - name: Configure git identity
         run: |
@@ -139,7 +138,22 @@ jobs:
 
       - name: Push conflicted branch
         if: steps.check.outputs.behind != '0' && steps.merge.outputs.conflict == 'true'
-        run: git push origin "HEAD:refs/heads/${{ steps.branch.outputs.branch }}"
+        # SYNC_PAT here, not GITHUB_TOKEN: the sync branch's diff contains
+        # upstream's own .github/workflows/* changes, and GITHUB_TOKEN is refused
+        # there ("refusing to allow a GitHub App to create or update workflow ...
+        # without `workflows` permission"). There is no `workflows:` key for the
+        # permissions block, so a PAT is the only mechanism. Scoped to this step
+        # so it is absent while upstream code runs.
+        env:
+          SYNC_PAT: ${{ secrets.SYNC_PAT }}
+        run: |
+          if [ -z "${SYNC_PAT:-}" ]; then
+            echo "::error::SYNC_PAT is not set; the push would be refused for any" \
+                 "branch touching .github/workflows/*. Add a PAT with the workflow scope."
+            exit 1
+          fi
+          git push "https://x-access-token:${SYNC_PAT}@github.com/${{ github.repository }}" \
+            "HEAD:refs/heads/${{ steps.branch.outputs.branch }}"
 
       - name: Write draft PR body
         if: steps.check.outputs.behind != '0' && steps.merge.outputs.conflict == 'true'
@@ -166,6 +180,8 @@ jobs:
 
       - name: Open draft PR
         if: steps.check.outputs.behind != '0' && steps.merge.outputs.conflict == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_PAT || github.token }}
         run: |
           # The branch is already pushed, so a refusal to OPEN the PR is a
           # policy decision, not a broken sync -- hand off the compare link and
@@ -208,12 +224,30 @@ jobs:
 
       - name: Push sync branch
         if: steps.check.outputs.behind != '0' && steps.merge.outputs.conflict == 'false'
-        run: git push origin "HEAD:refs/heads/${{ steps.branch.outputs.branch }}"
+        # SYNC_PAT here, not GITHUB_TOKEN: the sync branch's diff contains
+        # upstream's own .github/workflows/* changes, and GITHUB_TOKEN is refused
+        # there ("refusing to allow a GitHub App to create or update workflow ...
+        # without `workflows` permission"). There is no `workflows:` key for the
+        # permissions block, so a PAT is the only mechanism. Scoped to this step
+        # so it is absent while upstream code runs.
+        env:
+          SYNC_PAT: ${{ secrets.SYNC_PAT }}
+        run: |
+          if [ -z "${SYNC_PAT:-}" ]; then
+            echo "::error::SYNC_PAT is not set; the push would be refused for any" \
+                 "branch touching .github/workflows/*. Add a PAT with the workflow scope."
+            exit 1
+          fi
+          git push "https://x-access-token:${SYNC_PAT}@github.com/${{ github.repository }}" \
+            "HEAD:refs/heads/${{ steps.branch.outputs.branch }}"
 
       - name: Open PR
         if: steps.check.outputs.behind != '0' && steps.merge.outputs.conflict == 'false'
         env:
           BEHIND: ${{ steps.check.outputs.behind }}
+          # Step-scoped: a PAT-authored PR also triggers ci.yml, which a
+          # GITHUB_TOKEN-authored PR does not (see this file's header).
+          GH_TOKEN: ${{ secrets.SYNC_PAT || github.token }}
         run: |
           # Same handoff as the draft path: the branch is pushed and the seam
           # tests passed, so a policy refusal must not turn a good sync red.
