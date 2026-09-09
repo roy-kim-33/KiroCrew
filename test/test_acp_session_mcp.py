@@ -953,6 +953,48 @@ class TestLocalSettingsSeed:
         assert stat.S_ISFIFO(path.stat(follow_symlinks=False).st_mode)
         assert client._claude_settings_authored is False
 
+    @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFOs are POSIX-only")
+    def test_clearing_a_stale_wildcard_never_blocks_on_a_fifo(self, tmp_path):
+        """``_clear_stale_wildcard`` runs ON the event loop, like its siblings.
+
+        It is the one path that opens a file Crew did NOT author, so by the time
+        it runs the path is whatever the world left there. A plain open of a FIFO
+        blocks until someone writes, which would hold the whole gateway's loop
+        rather than just this session -- the same hazard
+        ``_claude_settings_is_still_ours`` opens with O_NONBLOCK to avoid. This
+        pins that it answers promptly and leaves the FIFO alone.
+        """
+        client = self._client(tmp_path)
+        fifo = tmp_path / "fifo-settings.json"
+        os.mkfifo(fifo)
+
+        # Would block forever without O_NONBLOCK; must return promptly.
+        assert client._clear_stale_wildcard(fifo) is False
+        assert stat.S_ISFIFO(fifo.stat(follow_symlinks=False).st_mode)
+
+    @pytest.mark.skipif(not hasattr(os, "symlink"), reason="symlinks are POSIX-only")
+    def test_clearing_a_stale_wildcard_never_follows_a_symlink(self, tmp_path):
+        """O_NOFOLLOW: a link pointing at a real wildcard file is refused, and the
+        target it points at is left untouched."""
+        client = self._client(tmp_path)
+        target = tmp_path / "real-settings.json"
+        target.write_text(json.dumps({"availableModels": ["*"]}), encoding="utf-8")
+        link = tmp_path / "link-settings.json"
+        os.symlink(target, link)
+
+        assert client._clear_stale_wildcard(link) is False
+        assert json.loads(target.read_text(encoding="utf-8")) == {"availableModels": ["*"]}
+
+    def test_clearing_a_stale_wildcard_spares_a_users_own_allowlist(self, tmp_path):
+        """Only the EXACT wildcard is Crew's marker. A hand-written allowlist --
+        including one that merely contains ``*`` -- is the user's and survives."""
+        client = self._client(tmp_path)
+        for value in (["opus"], ["*", "opus"]):
+            path = tmp_path / "user-settings.json"
+            path.write_text(json.dumps({"availableModels": value}), encoding="utf-8")
+            assert client._clear_stale_wildcard(path) is False
+            assert json.loads(path.read_text(encoding="utf-8"))["availableModels"] == value
+
     def test_a_huge_replacement_is_refused_without_being_read(self, tmp_path):
         """Size settles it, so a multi-gigabyte file never enters memory.
 
