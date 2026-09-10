@@ -139,6 +139,14 @@ export interface StatusData {
   yolo_duration?: '30m' | '1h' | '6h' | '12h' | '24h' | 'until_shutdown'
   /** Whether enterprise governance currently allows the until_shutdown option. */
   yolo_until_shutdown_permitted?: boolean
+  /** Auto-approve modes forbidden by the `approval_modes` policy scope. Today the
+   * scope governs `yolo` only, so this is `['yolo']` or empty; `normal`, `trust`
+   * and `trust_reads` are non-deniable and never appear. The approval-mode picker
+   * HIDES each named mode, except one still selected when the policy lands — that
+   * row stays visible and disabled, so the button label always has a matching row.
+   * Absent/empty means every mode is selectable. List-driven so widening the
+   * scope's vocabulary needs no type change. */
+  disabled_approval_modes?: string[]
   no_crons?: boolean
   /** True when the gateway has a live Slack (Socket Mode) connection. */
   slack_connected?: boolean
@@ -396,6 +404,10 @@ export interface CronJob {
   /** When true, this cron's runs do not appear as a chat session in the active
    * session list (results still go to Slack/notifications + History). Default false. */
   hide_in_chat?: boolean
+  /** When true, this cron's runs skip memory, lessons, steering, skills and
+   * prior session history, so a routine job stops paying for context it never
+   * reads. Default false. */
+  minimal_context?: boolean
   last_run_ts?: number; next_run_ts?: number | null; has_result?: boolean; has_slot?: boolean
   /** IANA timezone the cron expression's hour/minute fields are stored in.
    * Absent / null for legacy jobs created without an explicit TZ — treat as UTC. */
@@ -872,6 +884,13 @@ export interface ChatSlot {
    *  the absence of an answer, never a denial. DISPLAY only — the pin is
    *  deliberately kept when withheld, so this must not drive a write. */
   model_withheld?: boolean | null
+  /** The model id the live session actually resolved to; `''`/absent when not
+   *  known. A slot with no pin — or one whose pin was withheld — runs on the
+   *  backend's own choice, which the pin cannot name, so this is what lets a
+   *  chip say the model instead of `auto`. DISPLAY only, like
+   *  `model_withheld`: it describes the session, so it must not drive a
+   *  write. */
+  served_model?: string
   /** Remote-execution binding. `executor` is "local" for an ordinary session and
    *  "remote" for one whose turns run on a connected crew; `instance_id` names
    *  that crew. The backend ships BOTH on every slot so "runs locally" is a
@@ -1290,6 +1309,18 @@ export interface ArtifactPublication {
   published_by: string
   /** Conflict / sync-failure message surfaced to the UI; empty when healthy. */
   last_error: string
+  /** Publish SUCCEEDED but the link is not usable yet (e.g. CloudFront still
+   *  rolling out). NOT an error — rendered as a neutral/warn line beside the
+   *  link, never in the danger surface `last_error` drives. Empty when the link
+   *  is already reachable. */
+  notice: string
+  /** Machine discriminator for `notice`, so the UI can pick the right copy
+   *  instead of assuming every notice is "still rolling out". One of
+   *  `"rolling_out"` | `"distribution_disabled"` | `"unknown"`, or empty when
+   *  there is no notice. The frontend selects its string from this and falls
+   *  back to a generic (no time promise) line for an unrecognised value.
+   *  Optional so an older gateway that omits it reads as "". */
+  notice_code?: string
 }
 
 /** A publishing provider's self-described capabilities for a given artifact kind,
@@ -1303,6 +1334,10 @@ export interface PublishProviderDescriptor {
   /** False => tooling not installed yet; installs automatically on first publish.
    *  Optional: older gateways omit it (treat as available). */
   available?: boolean
+  /** The provider's own remedy text for `available: false` -- which action makes it
+   *  available. Optional: older gateways omit it, and a row with no hint simply shows
+   *  none rather than inventing one. */
+  install_hint?: string
   sharing_model: {
     supports_private: boolean
     supports_shared: boolean

@@ -87,6 +87,175 @@ Attach any image via the composer's `+` / drag-drop (the native `FilePreviewStri
 <div align="center">
 
 | | |
+Every architecture below is a first-class lane: each gets its own build, its own
+auto-update feed, and its own SLSA provenance attestation.
+
+| Install path | x86_64 | aarch64 (ARM64) |
+|---|---|---|
+| **CLI one-liner / wheel** | yes | yes (the wheel is `py3-none-any`; native libraries are vendored per architecture) |
+| **Desktop `.deb` / `.rpm` / AppImage** | yes | yes |
+| **Docker image** | yes | yes (`linux/amd64` and `linux/arm64` under every tag, so `docker pull` picks yours) |
+
+Take Stable unless you have a reason not to — the table below says who each
+channel is for.
+
+### Release channels
+
+Every install path — desktop app, CLI, Docker image — offers the same three
+channels. Pick by how much churn you can absorb, not by version number:
+
+| Channel | Who it's for | Built from | Cadence |
+|---------|--------------|------------|---------|
+| **Stable** | Everyone. The default on every install path. | The Insider build that baked long enough to be promoted | On promotion, no calendar commitment |
+| **Insider** | Power users who want features days to weeks early and accept the new bugs that come with them | Release-branch release-candidate tags | Every RC |
+| **Nightly** | Us and contributors. Untested `main` HEAD — expect breakage. | `main`, 06:00 UTC daily | Daily |
+
+Stable and Insider are two update lanes of the **same** app. The desktop app
+switches between them in Settings → About, a CLI install switches by re-running
+the installer with `--channel`, and a container switches by pulling a different
+tag. Either way, the other lane's current version then arrives as an ordinary
+update.
+
+Because they are one app, keeping a Stable *and* an Insider copy side by side
+does not give you two independent installs. Both read the same desktop settings
+store, so the channel is a single value and whichever copy wrote it last wins —
+switch to Insider in one and the other follows. They share one update download
+cache as well. `KIROCREW_HOME` does not separate them either: it moves the data
+home, not the desktop settings.
+
+Nightly is a separate app with its own name and icon, so it installs *alongside*
+a Stable or Insider one rather than replacing it. That also makes it the one copy
+that keeps its own channel and its own settings store. It is not a sandbox,
+though: it reads the same `~/.kiro/crew` data home unless you point it elsewhere
+with `KIROCREW_HOME`.
+
+Running Insider or Nightly is a real contribution. When something looks wrong,
+please [open an issue](https://github.com/kirodotdev/KiroCrew/issues) so it gets
+fixed before it reaches Stable.
+
+### One-line install
+
+Install the prebuilt, SHA-256-verified wheel from the release CDN without
+cloning the repository or running `npm` and a local build.
+
+Stable, the default:
+
+```bash
+curl -fsSL https://download.crew.kiro.dev/cli.sh | sh
+```
+
+Track a faster channel, `insider` or `nightly` (see
+[Release channels](#release-channels) for who each one is for):
+
+```bash
+curl -fsSL https://download.crew.kiro.dev/cli.sh | sh -s -- --channel insider
+```
+
+Pin an exact version:
+
+```bash
+curl -fsSL https://download.crew.kiro.dev/cli.sh | sh -s -- --version 0.1.0
+```
+
+**Managed Python by default.** The installer runs Kiro Crew on a fully managed
+Python instead of the system one: it fetches a SHA-256-pinned
+[uv](https://docs.astral.sh/uv/) and provisions a self-contained CPython 3.12
+into `~/.kiro/crew-python`, so the install never depends on (or breaks with)
+the system interpreter. Existing installs migrate the next time this installer
+itself runs — a staged update applied from the dashboard or the CLI's update
+command keeps its current interpreter. To run
+on the system interpreter instead:
+
+```bash
+curl -fsSL https://download.crew.kiro.dev/cli.sh | sh -s -- --system-python
+```
+
+The choice is sticky: it is recorded next to the channel, so later re-runs of
+the installer keep it without
+the flag. Opt back in with `--managed-python`. If the managed interpreter
+cannot be downloaded (no network path to the mirror), the installer falls back
+to a usable system Python 3.12+ for that run; point air-gapped hosts at a
+mirror with `KIROCREW_UV_URL` (the uv tarball) and `UV_PYTHON_INSTALL_MIRROR`
+(the interpreter archive).
+
+Open `http://localhost:5476` and start a conversation. The web dashboard works
+without messaging credentials. Add a messaging channel —
+[Slack](docs/guides/slack-setup.md),
+[Discord](src/kiro_crew/docs/discord-integration.md),
+[Telegram](src/kiro_crew/docs/telegram-integration.md),
+[Teams](src/kiro_crew/docs/teams-integration.md),
+[Webex](src/kiro_crew/docs/webex-integration.md),
+[WeCom](src/kiro_crew/docs/wecom-integration.md),
+[WeChat](src/kiro_crew/docs/weixin-integration.md),
+[WhatsApp](src/kiro_crew/docs/whatsapp-integration.md),
+[Feishu](src/kiro_crew/docs/feishu-integration.md), or
+[iMessage](src/kiro_crew/docs/imessage-integration.md) — when you want to continue
+working with the same agent away from the dashboard. Apart from Teams (which
+needs a public HTTPS webhook — see its guide) and iMessage (which talks to
+Messages.app on the same Mac), these channels connect
+outbound, so you do not need to expose the dashboard port publicly.
+
+### Docker
+
+For always-on servers, the Gateway ships as a public multi-arch image on GHCR:
+
+```bash
+docker run -d --name kirocrew \
+  -p 127.0.0.1:5476:5476 \
+  -v kirocrew-home:/home/kirocrew \
+  ghcr.io/kirodotdev/kirocrew:stable
+```
+
+See the [Docker guide](docs/guides/docker.md) for first-run login, channel tags, and
+the container security model.
+
+### Build from source
+
+macOS and Linux require Python 3.12+, Node.js 22+ (24 LTS recommended), npm, and
+[`kiro-cli`](https://kiro.dev/docs/cli/). The first desktop or dashboard launch
+can install Kiro CLI on the Gateway host and guide device-code sign-in before
+chat opens. Windows is supported through a native source install; follow the
+[Windows guide](docs/guides/windows-install.md) instead of the shell steps below.
+
+```bash
+# 1. Clone and build Kiro Crew
+git clone https://github.com/kirodotdev/KiroCrew.git
+cd KiroCrew
+make build
+source .venv/bin/activate
+
+# 2. Configure, verify, and start
+kirocrew setup
+kirocrew doctor
+kirocrew gateway
+```
+
+## Why Kiro Crew
+
+Most agent sessions end when the chat closes. Kiro Crew runs continuously on
+hardware you control and keeps working between conversations.
+
+**Persistent.** Sessions, memory, schedules, and task checkpoints survive
+Gateway restarts, and scheduled or reactive work continues without someone at
+the terminal.
+
+**Self-learning.** Corrections and task failures become durable lessons.
+Preferences and project context carry into new sessions.
+
+**Self-evolving.** Repeated patterns become reusable skills. Memory, lessons,
+and skills stay visible and editable, so each Kiro Crew grows more tailored to
+the person and work around it.
+
+**Runs where you choose.** Your Mac, a local container, or a remote machine
+you control.
+
+**One Gateway, many surfaces.** Work directly in the desktop app or web dashboard,
+or continue the same work from the CLI and messaging surfaces like Slack and
+Discord.
+
+## What Kiro Crew does
+
+| Capability | What it gives you |
 |---|---|
 | **Works** | Vision picker grouping · Settings → Vision card · `vision_analyze` MCP tool · `agent.image_input_mode` / `image_redirect` / `vision_fallback_model` in `config.json` |
 | **Bundled** | Fresh AppImage `0.2.0-customapi.5` (vite + PBS 397M) — no dev fallback, `supports_vision` on every `GET /api/models` row |
@@ -120,6 +289,13 @@ kirodotdev/KiroCrew.
 <p align="center">
   <img src="assets/how-it-works.png" alt="RoyCrew architecture: RoyCrew -> claude-agent-acp -> Claude Code -> CLIProxyAPI" width="900">
 </p>
+```mermaid
+flowchart TD
+    S["Desktop app · Web dashboard · CLI · Messaging channels (Slack, Discord, Telegram, Teams, Webex, WeCom, WeChat, WhatsApp, Feishu, iMessage)"]
+    G["Gateway<br/>access · sessions · memory · schedules · approvals · apps"]
+    A["Agent sessions<br/>ACP runtime · kiro-cli · MCP tools · models"]
+    S --> G --> A
+```
 
 - **RoyCrew** (this fork) acts as the harness: sessions, tool permissions, memory, cron, dashboard.
 - **claude-agent-acp** is the ACP adapter (`@agentclientprotocol/claude-agent-acp` on npm) that exposes the
@@ -144,6 +320,113 @@ python3 -m venv .venv
 .venv/bin/pip install -e .
 .venv/bin/kirocrew --version
 ```
+**Gateway.** The Gateway is the long-running Kiro Crew process. It routes
+messages from the desktop app, web, CLI, and the messaging surfaces listed below. It persists
+session state, injects memory and skills, starts scheduled work, coordinates
+subagents, brokers approvals, enforces runtime policy, and exposes activity in
+the dashboard.
+
+**Agent sessions.** A dashboard conversation, Slack thread, or Discord DM maps to
+an isolated agent session. Scheduled jobs, task runs, other messaging-channel
+conversations, and subagents also use managed sessions. These sessions preserve
+conversation context and can run concurrently before returning results to a
+parent session or configured surface.
+
+**ACP runtime and turns.** Kiro Crew supports both a dedicated `kiro-cli` ACP
+process for a session and a shared ACP runtime that multiplexes multiple session
+handles. During each turn, the session sends a prompt, streams model and tool
+events, resolves approvals, and returns the final result. An agent session is a
+logical isolation boundary, not necessarily one OS process.
+
+**Use the surface that fits the moment.**
+
+| Surface | Best for |
+|---|---|
+| **Desktop app** | The simplest local experience, with a bundled Gateway plus multi-tab connections to local or remote Gateways. |
+| **Web dashboard** | Parallel conversations, files, approvals, activity, memory, schedules, apps, settings, and system status at `localhost:5476`. |
+| **Slack** | Work from DMs and threads with streaming replies, approvals, notifications, and session links back to the dashboard. |
+| **Telegram** | Reach your agent from private DMs on your phone or laptop, with streaming replies, inline approvals, and commands. |
+| **Discord** | Work from DMs with streaming replies and approvals delivered as message buttons. |
+| **Teams** | Reach your agent from Microsoft Teams chats — replies arrive as complete messages, and approvals are answered by typing. |
+| **Webex** | Work from Webex direct messages with inline approvals; progress shows as edits to one message, which the finished answer replaces. |
+| **WeCom** | Chat through an outbound-connected WeCom AI bot with configured user access and streaming replies. |
+| **WeChat (Weixin)** | Reach your agent from WeChat with configured user access; a typing indicator runs while the turn works and the reply arrives as complete messages. |
+| **WhatsApp** | Reach your agent from WhatsApp with streaming replies, file exchange, and reactions. |
+| **Feishu (Lark)** | Chat from Feishu DMs and allow-listed group chats through a custom app bot on an outbound long connection — replies arrive as complete messages. |
+| **iMessage** | Chat from the Messages app on your own Mac and Apple devices, with no bot to register and no token to paste — replies arrive as complete messages. |
+| **CLI** | Fast interactive chat and direct automation with `kirocrew chat`, `run`, `cron`, `spawn`, and `security`. |
+
+**Choose how work starts.**
+
+| Mode | Use it for | Entry point |
+|---|---|---|
+| **Scheduled** | Briefings, audits, backups, and recurring maintenance | `kirocrew cron` or a natural-language request |
+| **Proactive** | Goals that need another pass without waiting for a new user message | AutoNudge and goal-loop skills |
+| **Reactive** | CI alerts, external automation, messaging-channel activity, and other events | Authenticated agent webhooks and messaging events |
+| **Task runner** | Bounded projects with explicit steps, tests, review, and checkpoint resume | `kirocrew run TASK.md` |
+| **Subagents** | Independent workstreams that can run concurrently | `kirocrew spawn run "task"` |
+
+**Memory, learning, and evolution.** Kiro Crew maintains preferences, active
+project context, decaying history summaries, and durable lessons. Corrections
+and task failures can change later behavior, while repeated patterns can become
+reusable skills. In-process embeddings add semantic retrieval for memory and
+the knowledge library. The stored state remains inspectable and editable
+from the dashboard. Incognito and temporary session modes let you opt out when
+a conversation should not persist.
+
+**Skills, MCP, and apps.** Markdown skills supply reusable workflows and can be
+loaded only when relevant. The built-in `kirocrew-core`, `kirocrew-cron` and
+`kirocrew-computer` MCP servers expose task, subagent, learning, messaging,
+scheduling, and desktop-automation tools. You
+can discover additional MCP servers from Kiro or Kiro Crew configuration. The
+App Kit adds installable interfaces and domain workflows. Apps can add dashboard
+pages, use scoped Gateway APIs, subscribe to events, and register lifecycle
+hooks.
+
+## Security and control
+
+Kiro Crew gives an AI agent real tool access, so the controls are enforced at
+the runtime boundary instead of relying only on prompt instructions.
+
+- **Local by default.** The dashboard binds to loopback unless you explicitly
+  configure a network URL. Remote dashboards require token authentication.
+- **Interactive approvals.** Review tool requests in the dashboard or a
+  connected messaging channel like Slack, Discord, or Telegram.
+  Session-scoped trust can reduce repeated prompts without changing
+  the underlying deny and sensitive-path controls.
+- **OS sandbox.** On Linux and macOS, `kiro-cli` can run inside namespace or
+  Seatbelt isolation. Standard, strict, and off modes make the tradeoff
+  explicit. Windows offers no equivalent OS-level layer, so Kiro Crew fails
+  closed there: agent subprocesses are refused rather than run unconfined, until
+  you declare the
+  [`sandbox_allow_unsandboxed_exec` opt-in](docs/guides/windows-install.md#the-unsandboxed-exec-opt-in).
+- **Sensitive data guards.** Kiro Crew blocks direct access to protected paths,
+  strips sensitive environment variables, and redacts credential patterns from
+  output before it reaches a chat surface.
+- **Denied operations.** A bundled catalog of deny rules blocks destructive commands and
+  common exfiltration paths even when a session has broad approval.
+- **Auditability.** Security events and tool activity are recorded for review.
+  Use `kirocrew security events`, `audit`, and `verify` to inspect them.
+- **Governance ceiling.** Optional policy and profile files compose with a
+  tightest-wins model. A running app or agent can narrow the allowed scope but
+  cannot loosen the enterprise ceiling. Inspect it with `kirocrew policy show`,
+  `validate`, and `explain`.
+
+No agent security layer removes the need to protect credentials and review
+high-impact actions. Avoid pasting secrets or sensitive personal data into a
+chat. Read the [security architecture](docs/architecture/security-deep-dive.md) and use
+[SECURITY.md](SECURITY.md) for private vulnerability reporting.
+
+## Install, configure, and operate
+
+**Installer details.** The installer verifies the wheel's SHA-256, installs through `pipx` or a
+managed virtual environment, and records the channel — `stable`, `insider`, or
+`nightly` — in `~/.kiro/crew/channel`. On Linux and macOS it provisions its own
+CPython 3.12 by default from a SHA-256-pinned `uv`; `--system-python` opts out
+and the choice is sticky across updates. The mechanics, the env vars that
+override each path, and the two `pip` forms for a published wheel (channel
+index, or one wheel pinned by hash) are in
+[Installing and Building](docs/guides/install.md#c-self-contained-pip-wheel).
 
 **Prefer the desktop app?** Grab the build for your OS with the buttons at the top of this README
 (AppImage for Linux, DMG for macOS Apple Silicon, Setup.exe for Windows), or browse everything under
@@ -302,6 +585,24 @@ This is the whole point of the fork. Any router or gateway that speaks the **Ant
 CLIProxyAPI is a local Anthropic-compatible proxy that fronts five providers — commandcode,
 ollama-cloud, opencode-go, codex (Codex OAuth), and antigravity — behind one endpoint. Run it anywhere
 on your network so it listens on `http://127.0.0.1:8317`:
+This is separate from `telemetry.enabled`, which controls **local-only**
+performance metrics that never leave your machine. See
+[docs/system-specs/modules/metrics.md](docs/system-specs/modules/metrics.md).
+
+## Docs and contributing
+
+| Topic | Start here |
+|---|---|
+| Install and packaging | [Install and build](docs/guides/install.md), [Windows](docs/guides/windows-install.md), [Docker](docs/guides/docker.md), [Desktop](docs/build/desktop-app.md), [Remote host](docs/guides/remote-and-mobile.md), [Release process](docs/build/release.md) |
+| Product capabilities | [Features](src/kiro_crew/docs/index.md), [Skills](skills/README.md), [All user docs](src/kiro_crew/docs/README.md) |
+| All documentation | [docs/](docs/README.md) for contributor and architecture docs |
+| Channels | [Slack](docs/guides/slack-setup.md), [Discord](src/kiro_crew/docs/discord-integration.md), [Telegram](src/kiro_crew/docs/telegram-integration.md), [Teams](src/kiro_crew/docs/teams-integration.md), [Webex](src/kiro_crew/docs/webex-integration.md), [WeCom](src/kiro_crew/docs/wecom-integration.md), [WeChat (Weixin)](src/kiro_crew/docs/weixin-integration.md), [WhatsApp](src/kiro_crew/docs/whatsapp-integration.md), [Feishu (Lark)](src/kiro_crew/docs/feishu-integration.md), [iMessage](src/kiro_crew/docs/imessage-integration.md) |
+| Architecture | [System architecture](docs/architecture/overview.md), [Memory](docs/system-specs/modules/memory-skills-hooks.md), [MCP](docs/architecture/mcp.md), [App Kit](docs/app-kit/getting-started.md) |
+| Trust and dependencies | [Security](docs/architecture/security-deep-dive.md), [Security policy](SECURITY.md) |
+| Project work | [Contributing](CONTRIBUTING.md), [Tenets](TENETS.md), [Governance](GOVERNANCE.md), [Maintainers](MAINTAINERS.md), [AI assistant rules](AGENTS.md), [Changelog](CHANGELOG.md) |
+
+Contributions are welcome. Create a branch from `main`, keep changes focused,
+and run the relevant checks before opening a pull request:
 
 ```bash
 # see the CLIProxyAPI docs for the current install method

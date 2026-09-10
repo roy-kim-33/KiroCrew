@@ -9,12 +9,16 @@ import { addNotification, ackNotificationByTs, unackNotificationByTs, removeNoti
 import { dispatchMcNotification, TURN_DONE_KIND, APPROVAL_KIND, shouldChimeOnTurnDone } from './notificationEvent'
 import { emitThemeSound } from './themeSound'
 import { streamingFlushHoldMs } from '../lib/streamHold'
+import { VoicePcmPlayer, voiceBoundary, createVoiceRequestId } from '../lib/voicePlayback'
+import { reportVoiceFailure } from '../lib/voiceFailure'
 import {
   fetchHistory, missedChunkMarker, sseChatMessage, sseChatMessageUpdate, sseChatMessagePatchByTs, sseThinkingChunk, refreshSlot, warmSlotCache, sseContextUsage, clearMessages, clearSlotCache, setVoicePlaying, setVoiceAudio, resolveByApprovalId, clearSubagentsForSnapshot, sseSubagentPending, sseSubagentSpawn, sseSubagentQueued, sseSubagentTool, sseSubagentStalled, sseSubagentRetrying, sseSubagentDone, sseSubagentSnapshot, sseSubagentBatchUpdate, sseSubagentBatchChunks, sseToolActivity, sseToolResult, sseActivityEvent, sseSideResult, sseWorkflowEvent, setSlotStatusDetail, removeQueuedMessage, appendQueuedMessage, cancelQueuedMessage, editQueuedMessage, reorderQueuedMessages, appendSlotMessage, setQuestionCard, resolveQuestionCard, setFollowupCard, setFolderSuggestion, sseMcpAppRender, setGoalLoops, sseGoalLoop, sseSideQueue, reconcileWorkflowRuns
 } from '../store/chatSlice'
 import { anchorForSlot, loadLayout, sessionSlots } from './splitLayoutStore'
 import { TAB_ID } from '../api/tabId'
 import { api } from '../api/client'
+import { AUTONUDGE_LOOPS_QUERY_KEY } from '../components/autoNudgeLoop'
+import { forgetUnobservedMemberThreads } from '../api/membersQuery'
 import { sanitizeLlmOutput } from '../utils/sanitize'
 import { applyStatusDelta, parseStatusDelta } from '../utils/pullRequestStatusDelta'
 import { slotChangeUrls } from '../utils/pullRequestLinks'
@@ -59,6 +63,8 @@ function invalidateRefreshQueries(qc: QueryClient): void {
   qc.invalidateQueries({ queryKey: ['sessions-usage'] })
   qc.invalidateQueries({ queryKey: ['agents-installed'] })
   qc.invalidateQueries({ queryKey: ['mcp-tools'] })
+  // Prefix match on purpose: the Crew Members roster lives under this key
+  // (api/membersQuery.ts) and refreshes with the registry.
   qc.invalidateQueries({ queryKey: ['kirocrew-agents'] })
   qc.invalidateQueries({ queryKey: ['default-agent'] })
   qc.invalidateQueries({ queryKey: ['workspaces'] })
@@ -267,6 +273,10 @@ export function useWebSocket() {
   const lastSlotsArrayRef = useRef<ChatSlot[] | null>(null)
   const voiceQueueRef = useRef<string[]>([])
   const voicePlayingRef = useRef(false)
+  const pcmPlayerRef = useRef<VoicePcmPlayer | null>(null)
+  const voiceEpochRef = useRef(0)
+  const voiceRequestsRef = useRef(new Map<string, string>())
+  const pendingVoiceRef = useRef<{ slot: string; text: string; request_id: string } | null>(null)
   const activeAudioRef = useRef<HTMLAudioElement | null>(null)
   const autoSpeakRef = useRef(false)
   // Speech offsets belong to one concrete message. A segment for another slot
@@ -307,8 +317,19 @@ export function useWebSocket() {
 
   const stopVoice = useCallback(() => {
     voiceMutedRef.current = true
+    voiceEpochRef.current++
+    for (const [requestId, slot] of voiceRequestsRef.current) {
+      void api.voiceCancel?.(slot, requestId).catch(() => {})
+    }
+    voiceRequestsRef.current.clear()
+    pendingVoiceRef.current = null
+    synthChainRef.current = Promise.resolve()
+    pcmPlayerRef.current?.stop()
     if (activeAudioRef.current) {
+      activeAudioRef.current.onended = null
+      activeAudioRef.current.onerror = null
       activeAudioRef.current.pause()
+      URL.revokeObjectURL(activeAudioRef.current.src)
       activeAudioRef.current = null
     }
     voiceQueueRef.current.forEach(u => URL.revokeObjectURL(u))
@@ -317,6 +338,19 @@ export function useWebSocket() {
     dispatch(setVoicePlaying(false))
   }, [dispatch])
 
+  const getPcmPlayer = useCallback(() => {
+    pcmPlayerRef.current ??= new VoicePcmPlayer(
+      playing => dispatch(setVoicePlaying(playing)),
+      code => {
+        reportVoiceFailure({ slot: store.getState().chat.activeSlot, code })
+        // A playback failure affects the stream, not just one 200 ms chunk.
+        // Cancel synthesis so later chunks cannot repeatedly raise the same error.
+        stopVoice()
+      },
+    )
+    return pcmPlayerRef.current
+  }, [dispatch, stopVoice])
+
   const voiceProgressFor = useCallback((slot: string, message: ChatMessage): VoiceProgress | null => {
     const messageId = voiceMessageId(message)
     if (!messageId) return null
@@ -324,26 +358,46 @@ export function useWebSocket() {
     if (!current || current.slot !== slot || current.messageId !== messageId) {
       const next = { slot, messageId, spokenLen: 0 }
       voiceProgressRef.current = next
-      voiceMutedRef.current = false
       return next
     }
     return current
   }, [])
 
   const enqueueVoiceSynthesis = useCallback((slot: string, text: string) => {
-    synthChainRef.current = synthChainRef.current
-      .then(() => api.voiceSynthesize(slot, text))
-      .catch(() => {})
+    // The first sentence starts immediately. While it synthesizes, combine
+    // completed sentences into the next request to amortize local model startup.
+    const pending = pendingVoiceRef.current
+    if (pending?.slot === slot && pending.text.length + text.length < 4000) {
+      pending.text += '\n' + text
+      return
+    }
+    const epoch = voiceEpochRef.current
+    const request_id = createVoiceRequestId()
+    const request = { slot, text, request_id }
+    pendingVoiceRef.current = request
+    voiceRequestsRef.current.set(request_id, slot)
+    synthChainRef.current = synthChainRef.current.then(async () => {
+      if (pendingVoiceRef.current === request) pendingVoiceRef.current = null
+      if (epoch !== voiceEpochRef.current || voiceMutedRef.current) return
+      try {
+        await api.voiceSynthesize(slot, request.text, { request_id })
+      } catch {
+        if (!voiceRequestsRef.current.delete(request_id)) return
+        if (epoch === voiceEpochRef.current && slot === store.getState().chat.activeSlot) {
+          reportVoiceFailure({ slot, request_id, code: 'voice_synthesis_failed' })
+        }
+      }
+    })
   }, [])
 
   const flushVoiceTail = useCallback((slot: string, message: ChatMessage) => {
     const progress = voiceProgressFor(slot, message)
     if (!progress) return
     const remaining = message.content.slice(progress.spokenLen).trim()
-    // Mark the whole message consumed even when its tail is below the speech
-    // floor, so a later completion event cannot reconsider or repeat it.
+    // Mark the whole message consumed so a later completion event cannot
+    // reconsider or repeat a tail already queued for speech.
     progress.spokenLen = message.content.length
-    if (remaining.length >= 10) enqueueVoiceSynthesis(slot, remaining)
+    if (remaining) enqueueVoiceSynthesis(slot, remaining)
   }, [enqueueVoiceSynthesis, voiceProgressFor])
 
   const playNextVoiceChunk = useCallback(() => {
@@ -352,29 +406,31 @@ export function useWebSocket() {
     const url = voiceQueueRef.current.shift()!
     const audio = new Audio(url)
     activeAudioRef.current = audio
-    audio.onended = () => {
+    const finished = () => {
       URL.revokeObjectURL(url)
+      if (activeAudioRef.current !== audio) return
       activeAudioRef.current = null
       voicePlayingRef.current = false
-      if (voiceQueueRef.current.length > 0) {
-        playNextVoiceChunk()
-      } else {
-        dispatch(setVoicePlaying(false))
-      }
+      audio.onended = null
+      audio.onerror = null
+      if (voiceQueueRef.current.length) playNextVoiceChunk()
+      else dispatch(setVoicePlaying(false))
     }
+    audio.onended = finished
     audio.onerror = () => {
-      URL.revokeObjectURL(url)
-      activeAudioRef.current = null
-      voicePlayingRef.current = false
-      playNextVoiceChunk()
+      if (activeAudioRef.current !== audio) return
+      reportVoiceFailure({ slot: store.getState().chat.activeSlot, code: 'voice_playback_failed' })
+      stopVoice()
     }
-    audio.play().catch(() => {
-      URL.revokeObjectURL(url)
-      activeAudioRef.current = null
-      voicePlayingRef.current = false
-      playNextVoiceChunk()
+    audio.play().catch(error => {
+      if (activeAudioRef.current !== audio) return
+      reportVoiceFailure({
+        slot: store.getState().chat.activeSlot,
+        code: error?.name === 'NotAllowedError' ? 'voice_playback_blocked' : 'voice_playback_failed',
+      })
+      stopVoice()
     })
-  }, [dispatch])
+  }, [dispatch, stopVoice])
 
   /** Bumped by every `autonudge_state` frame. A seed captures this before its
    *  fetch and discards the response if a frame landed while it was in flight:
@@ -396,6 +452,9 @@ export function useWebSocket() {
     // an exception escaping here would silently strand those — a cosmetic seed
     // must never be able to do that.
     try {
+      // Same moment, same reason, for the full-registry readers: a stop that
+      // landed while the socket was down was a frame nobody received.
+      queryClient.invalidateQueries({ queryKey: AUTONUDGE_LOOPS_QUERY_KEY })
       api.autonudgeList()
         .then(res => {
           // A live frame superseded this snapshot — it is now stale, so drop it
@@ -410,7 +469,7 @@ export function useWebSocket() {
         })
         .catch(() => {})
     } catch { /* seed is cosmetic — never break the connect path */ }
-  }, [dispatch])
+  }, [dispatch, queryClient])
 
   const syncPendingApprovals = useCallback(async () => {
     try {
@@ -608,19 +667,13 @@ export function useWebSocket() {
       if (streaming) {
         const progress = voiceProgressFor(activeSlot, streaming)
         if (!progress) return
+        if (voiceMutedRef.current) return
         const full = streaming.content
-        let lastBound = -1
-        const re = /[.!?](?:\s|$)/g
-        let match
-        while ((match = re.exec(full)) !== null) {
-          if (match.index + 1 > progress.spokenLen) lastBound = match.index + 1
-        }
+        const lastBound = voiceBoundary(full, progress.spokenLen)
         if (lastBound > progress.spokenLen) {
           const newText = full.slice(progress.spokenLen, lastBound).trim()
-          if (newText.length >= 10) {
-            progress.spokenLen = lastBound
-            enqueueVoiceSynthesis(activeSlot, newText)
-          }
+          progress.spokenLen = lastBound
+          if (newText) enqueueVoiceSynthesis(activeSlot, newText)
         }
       }
     }
@@ -847,6 +900,16 @@ export function useWebSocket() {
         // pre-switch backend's data until the page is reloaded.
         invalidateRefreshQueries(queryClient)
         queryClient.invalidateQueries({ queryKey: ['available-models'] })
+        // A dropped socket is the one client-visible sign the gateway may have
+        // restarted — and a restart drops an unmessaged member slot while its
+        // binding survives. The Crew Members page mounts a cached thread key
+        // straight away on a return visit (api/membersQuery.ts), so a key
+        // confirmed BEFORE the drop is no longer known-mountable: forget the
+        // ones nobody is looking at, so the next open waits for the thread
+        // endpoint's answer again; the mounted one is re-confirmed by the page
+        // itself on this same reconnect (and must NOT be cleared here — it
+        // holds the pane, and the draft typed into it).
+        forgetUnobservedMemberThreads(queryClient)
         seedGoalLoops()
         dispatch(fetchNotifications()).then(() => syncPendingApprovals())
       syncPendingQuestions()
@@ -1339,7 +1402,11 @@ export function useWebSocket() {
             // A note breadcrumb starts no turn, so no chat_done arrives to undo either
             // effect: cutting speech would strand it and a thinking status would never clear.
             const isPassiveNote = data.role === 'inject' && isReconcileNote(data.cls)
-            if (!isPassiveNote && (data.role === 'user' || data.role === 'inject' || data.role === 'subagent')) { stopVoice(); voiceProgressRef.current = null; synthChainRef.current = Promise.resolve() }
+            if (!isPassiveNote && data.slot === store.getState().chat.activeSlot && (data.role === 'user' || data.role === 'inject' || data.role === 'subagent')) {
+              stopVoice()
+              voiceMutedRef.current = false
+              voiceProgressRef.current = null
+            }
             if (!isPassiveNote && data.slot && (data.role === 'user' || data.role === 'inject' || data.role === 'subagent')) {
               dispatch(setSlotStatusDetail({ slot: data.slot, kind: 'thinking', text: 'Thinking…', ts: Date.now() }))
             }
@@ -1432,6 +1499,16 @@ export function useWebSocket() {
               const buf = chunkBufRef.current
               let entry = buf.get(cs)
               if (!entry) { entry = { content: '', lastSeq: undefined, thinking: '' }; buf.set(cs, entry) }
+              // Idempotency guard: drop a replayed/repeated chunk (seq <= lastSeq).
+              // WS delivery is at-least-once (reconnect replay, retry re-stream), so a
+              // chunk can arrive twice. missedChunkMarker below only flags FORWARD gaps
+              // (curSeq - prevSeq - 1 > 0), so a repeat slips through and its content is
+              // appended a second time with no marker — the silent mid-stream "stutter".
+              // chat_done deletes the buffer entry, so lastSeq resets each turn and a
+              // fresh turn's seq is never suppressed.
+              if (entry.lastSeq !== undefined && data.seq !== undefined && data.seq <= entry.lastSeq) {
+                break
+              }
               // Cross-chunk gap detection via the shared missedChunkMarker,
               // single-sourced with the reducer so the two copies can't drift.
               if (entry.lastSeq !== undefined && data.seq !== undefined) {
@@ -1865,28 +1942,47 @@ export function useWebSocket() {
                 max_cycles: Number(nudge.loop?.max_cycles) || 0,
               }))
             }
+            // Readers of the FULL registry (the Crew Members drawer's patrol
+            // block needs stopped_reason, next_due_ts and banner, none of which
+            // ride this frame) re-read it in place rather than merging a partial
+            // payload — one seed path, not a third copy of the merge.
+            queryClient.invalidateQueries({ queryKey: AUTONUDGE_LOOPS_QUERY_KEY })
             break
           }
           case 'voice_chunk': {
-            if (voiceMutedRef.current) break
-            if (data.slot !== store.getState().chat.activeSlot) break
-            // Queue and play audio chunks as they arrive
-            const { audio: b64, audioMime } = data as { audio: string; audioMime?: string }
+            if (voiceMutedRef.current || data.slot !== store.getState().chat.activeSlot) break
+            const { audio: b64, audioMime, request_id } = data as { audio: string; audioMime?: string; request_id?: string }
+            if (!request_id || voiceRequestsRef.current.get(request_id) !== data.slot) break
             if (b64) {
               try {
                 const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0))
-                const blob = new Blob([bytes], { type: audioMime === 'audio/wav' ? 'audio/wav' : 'audio/mpeg' })
-                const url = URL.createObjectURL(blob)
-                voiceQueueRef.current.push(url)
-                dispatch(setVoicePlaying(true))
-                playNextVoiceChunk()
-              } catch { /* malformed base64 */ }
+                if (audioMime === 'audio/wav' && typeof AudioContext !== 'undefined') {
+                  getPcmPlayer().enqueue(bytes.buffer)
+                } else {
+                  const blob = new Blob([bytes], { type: audioMime === 'audio/wav' ? 'audio/wav' : 'audio/mpeg' })
+                  const url = URL.createObjectURL(blob)
+                  voiceQueueRef.current.push(url)
+                  dispatch(setVoicePlaying(true))
+                  playNextVoiceChunk()
+                }
+              } catch {
+                reportVoiceFailure({ slot: data.slot, request_id, code: 'voice_playback_failed' })
+              }
             }
             break
           }
           case 'voice_complete': {
-            const b64 = (data as { audio: string }).audio
+            const { audio: b64, request_id } = data as { audio?: string; request_id?: string }
+            if (voiceMutedRef.current || data.slot !== store.getState().chat.activeSlot) break
+            if (!request_id || !voiceRequestsRef.current.delete(request_id)) break
             if (b64) dispatch(setVoiceAudio(b64))
+            break
+          }
+          case 'voice_error': {
+            const { request_id, code } = data as { request_id?: string; code?: string }
+            if (!request_id || !voiceRequestsRef.current.delete(request_id)) break
+            if (voiceMutedRef.current || data.slot !== store.getState().chat.activeSlot || code === 'voice_cancelled') break
+            reportVoiceFailure({ slot: data.slot, request_id, code: code || 'voice_synthesis_failed' })
             break
           }
           case 'log':
@@ -2002,13 +2098,21 @@ export function useWebSocket() {
       wsRef.current = null
 
       if (closingRef.current) return
+      if (voiceRequestsRef.current.size || voicePlayingRef.current || store.getState().chat.voicePlaying) {
+        reportVoiceFailure({
+          slot: store.getState().chat.activeSlot, code: 'voice_playback_failed',
+        })
+        // Audio frames have no reconnect replay. Retrying the connection cannot
+        // recover the missing samples, so release the pending stream explicitly.
+        stopVoice()
+      }
       const delay = reconnectRef.current
       reconnectRef.current = Math.min(delay * 2, 10000)
       reconnectTimerRef.current = setTimeout(connect, delay)
     }
 
     ws.onerror = () => { /* onclose will fire */ }
-  }, [dispatch, flushChunks, flushBufferedThinking, scheduleChunkFlush, bufferSlotActivity, bufferSubagentChunk, flushSubagentChunks, playNextVoiceChunk, flushVoiceTail, queryClient, stopVoice, syncPendingApprovals, syncPendingQuestions, syncWorkflowRuns, seedGoalLoops, recordRetiredId])
+  }, [dispatch, flushChunks, flushBufferedThinking, scheduleChunkFlush, bufferSlotActivity, bufferSubagentChunk, flushSubagentChunks, playNextVoiceChunk, flushVoiceTail, queryClient, stopVoice, getPcmPlayer, syncPendingApprovals, syncPendingQuestions, syncWorkflowRuns, seedGoalLoops, recordRetiredId])
 
   /**
    * Force an immediate reconnect: cancels any pending backoff timer, closes
@@ -2044,12 +2148,33 @@ export function useWebSocket() {
   useEffect(() => {
     closingRef.current = false  // reset for StrictMode re-mount
     connect()
-    const onVoiceStop = () => stopVoice()
+    const onVoiceStop = () => {
+      stopVoice()
+      if (autoSpeakRef.current && typeof AudioContext !== 'undefined') getPcmPlayer().unlock()
+    }
+    const onVoiceStart = (event: Event) => {
+      const { slot, request_id } = (event as CustomEvent<{ slot: string; request_id: string }>).detail
+      voiceRequestsRef.current.set(request_id, slot)
+      if (slot === store.getState().chat.activeSlot) {
+        voiceMutedRef.current = false
+        if (typeof AudioContext !== 'undefined') getPcmPlayer().unlock()
+      }
+    }
+    const onVoiceFailed = (event: Event) => {
+      const detail = (event as CustomEvent<{ slot: string; request_id: string; code: string }>).detail
+      if (!voiceRequestsRef.current.delete(detail.request_id)) return
+      if (!voiceMutedRef.current && detail.slot === store.getState().chat.activeSlot) {
+        reportVoiceFailure(detail)
+      }
+    }
     const onVoiceConfigChanged = (e: Event) => {
       const detail = (e as CustomEvent).detail
       autoSpeakRef.current = !!detail?.autoSpeak
+      if (!autoSpeakRef.current) stopVoice()
     }
     window.addEventListener('voice-stop', onVoiceStop)
+    window.addEventListener('voice-synthesis-start', onVoiceStart)
+    window.addEventListener('voice-synthesis-failed', onVoiceFailed)
     window.addEventListener('voice-config-changed', onVoiceConfigChanged)
     // Slot-focus intent signal (resume prefetch). One shared sender for
     // every focus source — Redux activeSlot changes (sidebar, keyboard,
@@ -2062,11 +2187,14 @@ export function useWebSocket() {
       ws.send(JSON.stringify({ type: 'slot_focused', slot }))
     }
     sendSlotFocusedImpl = sendFocus
-    let lastFocusSent: string | null = null
+    let lastFocusSent: string | null = store.getState().chat.activeSlot
     const unsubFocus = store.subscribe(() => {
       const active = store.getState().chat.activeSlot
       if (active === lastFocusSent) return  // store.subscribe fires on EVERY action
       lastFocusSent = active
+      stopVoice()
+      voiceMutedRef.current = false
+      voiceProgressRef.current = null
       sendFocus(active)
     })
     const onVisibility = () => {
@@ -2092,13 +2220,18 @@ export function useWebSocket() {
       flushBufferedThinking()
       wsRef.current?.close()
       wsRef.current = null
+      stopVoice()
+      pcmPlayerRef.current?.close()
+      pcmPlayerRef.current = null
       window.removeEventListener('voice-stop', onVoiceStop)
+      window.removeEventListener('voice-synthesis-start', onVoiceStart)
+      window.removeEventListener('voice-synthesis-failed', onVoiceFailed)
       window.removeEventListener('voice-config-changed', onVoiceConfigChanged)
       document.removeEventListener('visibilitychange', onVisibility)
       unsubFocus()
       sendSlotFocusedImpl = () => {}
     }
-  }, [connect, stopVoice, flushSlotActivity, flushSubagentChunks, flushBufferedThinking])
+  }, [connect, stopVoice, getPcmPlayer, flushSlotActivity, flushSubagentChunks, flushBufferedThinking])
 
   /** Subscribe to log events — call with callback on mount, null on unmount. */
   const subscribeLogs = useCallback((cb: LogCallback) => {

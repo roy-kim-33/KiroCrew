@@ -44,12 +44,24 @@ def _request_with_providers(providers: dict) -> MagicMock:
     return req
 
 
-class _FakeProvider:
-    def __init__(self, models):
-        self._models = models
+def _FakeProvider(models, *, backend=None):
+    """A provider double carrying a REAL capability record, not an identity flag.
 
-    def available_models(self):
-        return self._models
+    ``_advertised_cc_models`` selects a session by
+    ``SessionCapabilities.resolves_model_from_advertised_list``, and
+    ``capabilities_of`` requires a genuine record: a ``MagicMock(spec=...)``'s
+    attributes are all truthy, so an attribute-shaped assertion would let this
+    double claim every capability at once. Setting the real record is what makes
+    the double describe a backend that exists.
+    """
+    from kiro_crew.acp_backends import ACP_BACKEND_CLAUDE
+    from kiro_crew.agent_sdk.capabilities import capabilities_for
+    from kiro_crew.providers.acp import AcpProvider
+
+    provider = MagicMock(spec=AcpProvider)
+    provider.capabilities = capabilities_for(ACP_BACKEND_CLAUDE if backend is None else backend)
+    provider.available_models.return_value = models
+    return provider
 
 
 class TestAdvertisedCcModels:
@@ -77,9 +89,7 @@ class TestAdvertisedCcModels:
         # adapter (verified live). The registry entry that used to own this
         # alias is untouched -- this only asserts the picker no longer
         # detours through it.
-        prov = _FakeProvider(
-            [{"modelId": "opus", "name": "Opus", "description": "Opus 5 · ..."}]
-        )
+        prov = _FakeProvider([{"modelId": "opus", "name": "Opus", "description": "Opus 5 · ..."}])
         out = _advertised_cc_models(_request_with_providers({"s": prov}))
         assert out[0]["model_name"] == "opus"
 
@@ -87,7 +97,17 @@ class TestAdvertisedCcModels:
         assert _advertised_cc_models(_request_with_providers({})) == []
 
     def test_skips_provider_without_accessor(self):
-        out = _advertised_cc_models(_request_with_providers({"s": object()}))
+        prov = _FakeProvider([])
+        prov.available_models = None
+        out = _advertised_cc_models(_request_with_providers({"s": prov}))
+        assert out == []
+
+    def test_skips_non_claude_providers(self):
+        prov = _FakeProvider(
+            [{"modelId": "claude-opus-5", "name": "Opus 5", "description": ""}],
+            backend="",
+        )
+        out = _advertised_cc_models(_request_with_providers({"s": prov}))
         assert out == []
 
     def test_newest_session_wins_over_a_lingering_older_one(self):
@@ -364,6 +384,48 @@ class TestCcModelsResponseRace:
         during = json.loads(_run_async(run(_request_with_providers({}))).text)
         assert {r["model_id"] for r in during} == {"opus", "sonnet"}
 
+    def test_advertised_set_filters_the_registry(self):
+        """Upstream: a registry model the backend did NOT advertise is filtered out."""
+        prov = _FakeProvider(
+            [{"modelId": "global.anthropic.claude-sonnet-4-6[1m]", "name": "Sonnet 4.6"}]
+        )
+        out = _cc_models(_request_with_providers({"s": prov}))
+        names = [m["model_name"] for m in out]
+        assert names[0] == "auto"
+        assert "global.anthropic.claude-sonnet-4-6[1m]" in names
+        # The flagship is in the registry but was NOT advertised -> filtered out.
+        assert "opus-4.8-1m" not in names
+        assert "opus-4.8" not in names
+
+    def test_registry_display_name_wins_for_survivors(self):
+        """Filtering keeps the registry's cleaner display name, not the adapter's,
+        while the row's wire value stays the advertised id the backend accepts."""
+        prov = _FakeProvider(
+            [{"modelId": "global.anthropic.claude-sonnet-4-6[1m]", "name": "sonnet-4-6-v1-ugly"}]
+        )
+        out = _cc_models(_request_with_providers({"s": prov}))
+        row = next(m for m in out if m["model_name"] == "global.anthropic.claude-sonnet-4-6[1m]")
+        assert row["display_name"] == "Sonnet 4.6 (1M context)"
+
+    def test_unknown_advertised_models_still_pass_through(self):
+        # Forward-compat: a model the registry does not list is still offered when
+        # the backend advertises it, otherwise a newly-served model is unreachable.
+        prov = _FakeProvider(
+            [
+                {"modelId": "claude-opus-4-1", "name": "Opus 4.1", "description": ""},
+                {"modelId": "claude-sonnet-4-5", "name": "Sonnet 4.5", "description": ""},
+            ]
+        )
+        out = _cc_models(_request_with_providers({"s": prov}))
+        names = [m["model_name"] for m in out]
+        assert "claude-opus-4-1" in names
+        assert "claude-sonnet-4-5" in names
+        # And the unentitled registry flagship is gone.
+        assert "opus-4.8-1m" not in names
+        # "auto" still leads and is never filtered by entitlement -- it is the
+        # configured-default sentinel, not a model the backend serves.
+        assert names[0] == "auto"
+
     def test_a_routers_list_never_answers_for_the_native_lane(self, monkeypatch):
         """Scoping proof: the store is keyed by lane, so the list a router
         advertised cannot be served once the base URL is cleared. Serving it
@@ -371,7 +433,9 @@ class TestCcModelsResponseRace:
         not selectable on native."""
         prov = _FakeProvider([{"modelId": "oc/kimi-k3", "name": "K3", "description": ""}])
         _cc_router_config(monkeypatch, base_url="http://localhost:20128")
-        served = json.loads(_run_async(_cc_models_response(_request_with_providers({"s": prov}))).text)
+        served = json.loads(
+            _run_async(_cc_models_response(_request_with_providers({"s": prov}))).text
+        )
         assert {r["model_id"] for r in served} == {"oc/kimi-k3"}
 
         # Base URL cleared (-> native lane) and no session yet: the router's
@@ -379,6 +443,44 @@ class TestCcModelsResponseRace:
         _cc_router_config(monkeypatch, base_url="")
         native = json.loads(_run_async(_cc_models_response(_request_with_providers({}))).text)
         assert native == []
+
+    def test_no_duplicate_when_adapter_lists_known_model(self):
+        # The adapter advertises provider ids that ARE in the registry; each
+        # collapses to one row carrying the advertised wire id (registry display).
+        prov = _FakeProvider(
+            [
+                {
+                    "modelId": "global.anthropic.claude-sonnet-4-6[1m]",
+                    "name": "Sonnet 4.6",
+                    "description": "",
+                },
+                {
+                    "modelId": "global.anthropic.claude-opus-4-8[1m]",
+                    "name": "Opus 4.8",
+                    "description": "",
+                },
+            ]
+        )
+        out = _cc_models(_request_with_providers({"s": prov}))
+        names = [m["model_name"] for m in out]
+        assert names.count("global.anthropic.claude-opus-4-8[1m]") == 1
+        assert names.count("global.anthropic.claude-sonnet-4-6[1m]") == 1
+
+    def test_registry_row_keeps_friendly_display_name(self):
+        # When the adapter advertises a known id, the registry's friendly display
+        # name wins while the wire value stays the advertised id.
+        prov = _FakeProvider(
+            [
+                {
+                    "modelId": "global.anthropic.claude-opus-4-8[1m]",
+                    "name": "Opus 4.8",
+                    "description": "",
+                },
+            ]
+        )
+        out = _cc_models(_request_with_providers({"s": prov}))
+        opus48 = next(m for m in out if m["model_name"] == "global.anthropic.claude-opus-4-8[1m]")
+        assert opus48["display_name"] == "Opus 4.8 (1M context)"
 
     def test_live_probe_used_when_nothing_advertised_yet(self, monkeypatch):
         """A router configured but not yet session-captured: probe it directly

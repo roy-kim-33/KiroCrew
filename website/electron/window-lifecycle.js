@@ -32,6 +32,7 @@ const { createAgentCommandChannel } = require("./browser-agent-channel");
 const { attachContextMenu } = require("./context-menu");
 const { validateRemoteSettings } = require("./validation");
 const { getRemoteHostConfig, setRemoteHostConfig } = require("./host-config");
+const { openPathHardened } = require("./open-path");
 const { DEFAULT_REMOTE_BIN, DEFAULT_REMOTE_PATH } = require("./remote-token");
 const { identityFamily } = require("./instance-guard");
 const { decideLinuxFrame, applyWindowControl } = require("./linux-frame");
@@ -45,6 +46,7 @@ const {
   OVERLAY_BACKGROUND: WINDOWS_TITLEBAR_BACKGROUND,
 } = require("./windows-titlebar");
 const { attachFrameLoadLogging } = require("./frame-load-log");
+const { attachPaneAssetJournal } = require("./pane-asset-journal");
 const { createMemoryWatchLog } = require("./memory-watch-log");
 const { createCageTrace } = require("./cage-trace");
 const { profilingEnabled } = require("./perf-metrics");
@@ -957,6 +959,11 @@ function createWindowLifecycle(options) {
     // enough on its own, because a pane can navigate the top-level window to a
     // remote document and inherit that position.
     attachFrameLoadLogging(mainWindow.webContents, glog, backendUrl);
+    // The pane's module graph is the one load stage no renderer-side line can
+    // report: a stalled hashed-chunk fetch leaves the entry module unevaluated,
+    // so nothing of ours runs in that frame to say so. The main process sees the
+    // request either way. See pane-asset-journal.js.
+    attachPaneAssetJournal(mainWindow.webContents.session, glog, backendUrl);
 
     const rendererRecovery = createRendererRecovery({
       isQuitting,
@@ -1100,7 +1107,7 @@ function createWindowLifecycle(options) {
       { type: "separator" },
       { label: "New Connection Window…", click: () => openNewConnectionWindow() },
       { type: "separator" },
-      { label: "Open Config File", click: () => shell.openPath(store.path) },
+      { label: "Open Config File", click: () => openPathHardened(shell, store.path) },
       { type: "separator" },
       { label: "Quit", click: requestQuit },
     ]));
@@ -1656,7 +1663,7 @@ function createWindowLifecycle(options) {
       renameCurrentWindow: () => renameCurrentWindow(),
       promptRemoteHost: () => promptRemoteHost(),
       refreshToken: () => refreshToken(),
-      openConfigFile: () => shell.openPath(store.path),
+      openConfigFile: () => openPathHardened(shell, store.path),
     }));
     // Fork: the native menu bar is macOS-only. On Windows and Linux the window
     // is frameless with a titleBarOverlay (caption buttons) and the dashboard's
