@@ -174,9 +174,7 @@ class TestNativeModelPicker:
 
     def test_router_lane_keeps_the_window_unlock(self, tmp_path, monkeypatch):
         monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
-        data = self._settings_after_seed(
-            tmp_path, {"ANTHROPIC_BASE_URL": "http://localhost:20128"}
-        )
+        data = self._settings_after_seed(tmp_path, {"ANTHROPIC_BASE_URL": "http://localhost:20128"})
         assert data["availableModels"] == ["*"]
 
     def test_a_wildcard_left_by_an_earlier_session_is_cleared(self, tmp_path, monkeypatch):
@@ -203,9 +201,7 @@ class TestNativeModelPicker:
         pins still hold: the ``model`` option is accepted with NO ``type`` key
         (the native lane advertises none), and the "mode" option is ignored.
         """
-        cl = c.AcpClient(
-            work_dir=str(tmp_path), acp_backend=c.ACP_BACKEND_CLAUDE, model=""
-        )
+        cl = c.AcpClient(work_dir=str(tmp_path), acp_backend=c.ACP_BACKEND_CLAUDE, model="")
         envelope = cl._models_from_config_options(
             {
                 "configOptions": [

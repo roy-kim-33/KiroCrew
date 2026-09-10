@@ -1865,7 +1865,11 @@ _EDITABLE_CONFIG: dict[str, dict] = {
     # / kiro's own default. The charset admits "/" and ":" because the fork's
     # CLIProxyAPI routing uses prefixed ids ("cmc/…", "oc/…", "cx/…") and
     # provider:model forms; "@"/"+" cover router-catalog naming.
-    "agent.model": {"type": "str", "max_len": 64, "pattern": r"^(?!.*\.\.)[A-Za-z0-9._\-/:@+\[\]]*$"},
+    "agent.model": {
+        "type": "str",
+        "max_len": 64,
+        "pattern": r"^(?!.*\.\.)[A-Za-z0-9._\-/:@+\[\]]*$",
+    },
     # Per-task-class model overrides. Same grammar as agent.model (the real
     # vocabulary is whatever the backend advertises). "" / "auto" defers to the
     # chat default. `validate_fn` additionally rejects a well-formed id the
@@ -2449,7 +2453,12 @@ async def api_kirocrew_config_patch(request: web.Request) -> web.Response:
     cfg = KiroCrewConfig.load()
 
     # If the backend changed, reload the factory so new sessions use the new provider
-    if path_key in ("agent.acp_backend", "agent.provider_base_url", "agent.provider_api_key", "agent.provider_api_format"):
+    if path_key in (
+        "agent.acp_backend",
+        "agent.provider_base_url",
+        "agent.provider_api_key",
+        "agent.provider_api_format",
+    ):
         state: DashboardState = request.app["state"]
         # Refresh agent artifacts so the target provider is immediately usable.
         # For claude_code this (re)writes ~/.claude/agents/kirocrew.mcp.json —

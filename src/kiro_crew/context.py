@@ -2088,7 +2088,9 @@ class ContextBuilder:
             # (see harness-parity notes in acp/types.py), so provider alone is
             # never "claude_code" here — the actual backend choice (kiro-cli vs
             # the fork's claude-agent-acp seam) lives in acp_backend instead.
-            self._bot_name = "Kiro Crew" if cfg.agent.acp_backend == ACP_BACKEND_CLAUDE else "Kiro"  # brand-ok
+            self._bot_name = (
+                "Kiro Crew" if cfg.agent.acp_backend == ACP_BACKEND_CLAUDE else "Kiro"
+            )  # brand-ok
         # Register default memory in the workspace cache
         _memory_stores["default"] = self.memory
 

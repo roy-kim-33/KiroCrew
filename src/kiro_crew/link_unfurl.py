@@ -177,8 +177,8 @@ class ExtractedMeta:
 
 
 _EXTRA_SPECIAL_PURPOSE = (
-    ipaddress.ip_network("192.0.0.0/24"),   # RFC 6890 IETF Protocol Assignments
-    ipaddress.ip_network("2002::/16"),      # RFC 3056 6to4
+    ipaddress.ip_network("192.0.0.0/24"),  # RFC 6890 IETF Protocol Assignments
+    ipaddress.ip_network("2002::/16"),  # RFC 3056 6to4
 )
 
 

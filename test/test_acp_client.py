@@ -1093,7 +1093,9 @@ class TestAcpClientBackendSelection:
         client._write_opencode_provider_config = MagicMock()
         with (
             patch("kiro_crew.acp.client._resolve_opencode_bin", return_value=["/usr/bin/opencode"]),
-            patch("kiro_crew.acp.client.wrap_argv", return_value=(["/usr/bin/opencode", "acp"], None)) as wrap,
+            patch(
+                "kiro_crew.acp.client.wrap_argv", return_value=(["/usr/bin/opencode", "acp"], None)
+            ) as wrap,
             patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec,
             patch("kiro_crew.session._track_pid"),
             patch("kiro_crew.session._track_session_pid"),
@@ -1116,7 +1118,9 @@ class TestAcpClientBackendSelection:
         client._write_opencode_provider_config = MagicMock()
         with (
             patch("kiro_crew.acp.client._resolve_opencode_bin", return_value=["/usr/bin/opencode"]),
-            patch("kiro_crew.acp.client.wrap_argv", return_value=(["/usr/bin/opencode", "acp"], None)),
+            patch(
+                "kiro_crew.acp.client.wrap_argv", return_value=(["/usr/bin/opencode", "acp"], None)
+            ),
             patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec,
             patch("kiro_crew.session._track_pid"),
             patch("kiro_crew.session._track_session_pid"),
@@ -1130,9 +1134,9 @@ class TestAcpClientBackendSelection:
             await client._spawn()
 
         spawn_env = mock_exec.call_args.kwargs.get("env", {})
-        assert spawn_env.get("HOME", "").endswith("roycrew/opencode-home"), (
-            "OpenCode spawn must set HOME to an isolated directory"
-        )
+        assert spawn_env.get("HOME", "").endswith(
+            "roycrew/opencode-home"
+        ), "OpenCode spawn must set HOME to an isolated directory"
 
     @pytest.mark.asyncio
     async def test_spawn_claude_missing_bin_reports_the_cached_search_path(

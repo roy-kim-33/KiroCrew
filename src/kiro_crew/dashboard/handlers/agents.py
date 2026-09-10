@@ -2094,7 +2094,9 @@ def _model_supports_vision(model_id: str) -> bool | None:
             text_only = None
         if text_only is None:
             text_only = tuple(_DEFAULT_TEXT_ONLY_MODELS)
-        mode = decide_image_input_mode(model_id, image_input_mode="auto", text_only_models=text_only)
+        mode = decide_image_input_mode(
+            model_id, image_input_mode="auto", text_only_models=text_only
+        )
         if mode != "auto":
             return mode == "native"
     except Exception:
@@ -2226,9 +2228,7 @@ async def _live_router_cc_models(base_url: str, api_key: str) -> list[dict]:
 
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as session:
-            async with session.get(
-                f"{base_url}/v1/models", headers={"x-api-key": api_key}
-            ) as resp:
+            async with session.get(f"{base_url}/v1/models", headers={"x-api-key": api_key}) as resp:
                 if resp.status != 200:
                     return []
                 data = await resp.json()
@@ -3915,7 +3915,9 @@ async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
         if "model" in body:
             # Validated before the write, reusing the config loaded just above so
             # this costs no extra read.
-            model_reason = _model_pin_rejected(pending_model, request, getattr(cfg.agent, "acp_backend", ""))
+            model_reason = _model_pin_rejected(
+                pending_model, request, getattr(cfg.agent, "acp_backend", "")
+            )
             if model_reason:
                 return web.json_response(
                     {"error": model_reason, "code": "invalid_model"}, status=400

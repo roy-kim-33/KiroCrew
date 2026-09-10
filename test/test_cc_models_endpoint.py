@@ -89,9 +89,7 @@ class TestAdvertisedCcModels:
         # adapter (verified live). The registry entry that used to own this
         # alias is untouched -- this only asserts the picker no longer
         # detours through it.
-        prov = _FakeProvider(
-            [{"modelId": "opus", "name": "Opus", "description": "Opus 5 · ..."}]
-        )
+        prov = _FakeProvider([{"modelId": "opus", "name": "Opus", "description": "Opus 5 · ..."}])
         out = _advertised_cc_models(_request_with_providers({"s": prov}))
         assert out[0]["model_name"] == "opus"
 
@@ -435,7 +433,9 @@ class TestCcModelsResponseRace:
         not selectable on native."""
         prov = _FakeProvider([{"modelId": "oc/kimi-k3", "name": "K3", "description": ""}])
         _cc_router_config(monkeypatch, base_url="http://localhost:20128")
-        served = json.loads(_run_async(_cc_models_response(_request_with_providers({"s": prov}))).text)
+        served = json.loads(
+            _run_async(_cc_models_response(_request_with_providers({"s": prov}))).text
+        )
         assert {r["model_id"] for r in served} == {"oc/kimi-k3"}
 
         # Base URL cleared (-> native lane) and no session yet: the router's

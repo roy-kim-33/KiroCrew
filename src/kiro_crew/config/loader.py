@@ -2840,9 +2840,7 @@ class KiroCrewConfig:
                 provider_api_format=agent_data.get("provider_api_format", ""),
                 model_whitelist=list(agent_data.get("model_whitelist") or []),
                 image_redirect=agent_data.get("image_redirect", "subagent"),
-                vision_fallback_model=agent_data.get(
-                    "vision_fallback_model", "cmc/mimo-v2.5"
-                ),
+                vision_fallback_model=agent_data.get("vision_fallback_model", "cmc/mimo-v2.5"),
                 vision_providers=list(agent_data.get("vision_providers") or []),
                 text_only_models=list(
                     agent_data.get(
