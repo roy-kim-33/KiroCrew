@@ -23,6 +23,7 @@ from kiro_crew.acp_backends import (  # noqa: F401 - re-exported for existing im
     ACP_BACKENDS_ADVERTISED_MODEL_SELECTION,
     ACP_BACKENDS_COMPACT,
     ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION,
+    ACP_BACKENDS_HOST_AUTH_CALLBACK,
     ACP_BACKENDS_INTERNAL_SANDBOX,
     ACP_BACKENDS_KIRO_IDENTITY_STORE,
     ACP_BACKENDS_KIRO_SLASH_COMMANDS,
@@ -30,10 +31,12 @@ from kiro_crew.acp_backends import (  # noqa: F401 - re-exported for existing im
     ACP_BACKENDS_MCP_CONFIG_HOT_RELOAD,
     ACP_BACKENDS_MEMBER_DISPATCH,
     ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION,
+    ACP_BACKENDS_POD_HOME_REMAP,
     ACP_BACKENDS_SEED_LOCAL_SETTINGS,
     ACP_BACKENDS_SESSION_MCP_ARRAY,
     ACP_BACKENDS_SESSION_SHARING,
     ACP_BACKENDS_STEER,
+    ACP_BACKENDS_STRUCTURED_REFUSAL,
     model_registry_namespace,
     selectable_backends,
 )
@@ -273,6 +276,12 @@ STOP_REASON_END_TURN = "end_turn"
 # retrying the same prompt hits the same refusal, so chat_runner surfaces an
 # actionable message instead of churning the retry ladder.
 STOP_REASON_REFUSAL = "refusal"
+# The Kiro service's own spelling of a content-filter refusal, as it appears in
+# the ``stopReason`` field of a ``_kiro.dev/metadata`` notification. It is
+# NORMALISED to ``STOP_REASON_REFUSAL`` on the ``EVENT_COMPLETE`` that follows
+# (see ``RefusalInfo``), so no consumer outside ``acp/`` ever compares against
+# it; named here so the parser and its tests share one literal.
+STOP_REASON_CONTENT_FILTERED_WIRE = "CONTENT_FILTERED"
 # Signalled by the ACP layer when a genuinely-wedged (stale) turn was probed via
 # session/cancel and got no ack within the grace window — a confirmed wedge, not
 # a done-but-missing-frame turn (which acks and completes normally). The
@@ -358,6 +367,34 @@ class JsonRpcMessage:
 
     def is_method(self, name: str) -> bool:
         return self.method == name
+
+
+@dataclass
+class RefusalInfo:
+    """Why the model declined a turn -- one shape for every harness.
+
+    A refusal is DETERMINISTIC (the same prompt hits the same filter), so the
+    thing a user needs is not a retry but the reason. Harnesses report that
+    reason very unevenly: the Kiro service sends a category, a canned
+    explanation and sometimes a model that would accept the request
+    (``ACP_BACKENDS_STRUCTURED_REFUSAL``); Anthropic's adapter sends the word
+    ``refusal`` and nothing else; a harness not yet written will send something
+    in between. Rather than a card per harness, every harness fills whatever
+    fields it has and leaves the rest EMPTY -- never a guessed value -- and the
+    single refusal card renders a line per non-empty field.
+
+    Every field is provider text bound for the dashboard: producers redact all
+    of them before they land here. A harness that reports no reason at all
+    (Anthropic's bare ``refusal`` stop reason) produces no instance -- the
+    stop reason alone drives the dashboard branch.
+    """
+
+    #: Provider's refusal class in its own spelling (``CYBER``). Empty = unknown.
+    category: str = ""
+    #: Provider's own words, already redacted. Empty = none given.
+    explanation: str = ""
+    #: A model the provider says would take the request. Empty = none named.
+    recommended_model: str = ""
 
 
 @dataclass
@@ -471,10 +508,26 @@ class AcpEvent:
     text: str = ""
     tool_call_id: str = ""
     title: str = ""
+    #: The backend's OWN ``title`` for a tool_call / tool_call_update frame,
+    #: untouched. ``title`` above is the DISPLAY label ``select_tool_title``
+    #: picks, which prefers a shell call's model-authored ``rawInput.description``
+    #: -- so it is model-controlled and must never feed a security decision.
+    #: This field is what kiro-agent's MCP wrapper stamps as
+    #: ``@<serverName>/<toolName>`` from its own tool config, and it is the only
+    #: title the out-of-band directive claim (``directive_tool_from_call``) reads.
+    #: Empty when the frame carried none.
+    wire_title: str = ""
     tool_kind: str = ""
     tool_purpose: str = ""
     context_usage_pct: float = 0.0
     stop_reason: str = ""
+    #: Set on ``EVENT_COMPLETE`` when the turn ended in a model-side refusal.
+    #: ``stop_reason`` is then always ``STOP_REASON_REFUSAL`` -- the Kiro
+    #: service's ``CONTENT_FILTERED`` metadata is folded onto it here so the
+    #: dashboard has one branch, and the structured fields travel alongside.
+    #: ``None`` on every other terminal, including a plain ``end_turn`` whose
+    #: metadata said nothing about a refusal.
+    refusal: "RefusalInfo | None" = None
     #: True when Kiro Crew fabricated this terminal event because the provider
     #: omitted its result frame. Consumers must not treat it as raw completion
     #: evidence even when compatibility requires ``stop_reason=end_turn``.
@@ -487,19 +540,14 @@ class AcpEvent:
     #: the original bytes never ride this display event.  Approval surfaces use
     #: it to refuse a durable command grant for a value the user could not see.
     tool_input_redacted: bool = False
-    #: The tool's result text, VERBATIM enough that a control marker embedded in
-    #: it still parses. Two consumers read markers out of this string rather than
-    #: out of a structured field: a session directive (``session_directive.peek``,
-    #: which arms/stops a monitor loop) and an MCP App render marker
-    #: (``mcp_apps_render.find_marker``). A builder that serialises an
-    #: unrecognised result envelope with ``json.dumps`` escapes every quote in it,
-    #: which leaves both sentinels intact while destroying the payload behind
-    #: them -- so the frame still looks like it carries a directive and names
-    #: nothing. EVERY builder must therefore run
-    #: ``acp/_dispatch._repair_escaped_marker`` over its joined output before
-    #: redaction and the head cut; a new provider's builder is pinned to that by
-    #: ``test_session_directive_transport.py``. See
-    #: docs/system-specs/features/agent-host-contract.md §9.
+    #: The tool's result text. One consumer reads a control marker out of this
+    #: string rather than out of a structured field: the MCP App render marker
+    #: (``mcp_apps_render.find_marker``). A session directive is NOT selected
+    #: from here: its marker is display-only and the parked record is claimed by
+    #: the tool CALL's input digest (``session_directive.call_input_digest``),
+    #: so a backend that re-serialises, duplicates or caps the result body
+    #: cannot lose the directive. See
+    #: docs/system-specs/modules/agent-host-contract.md §9.
     tool_output: str = ""
     tool_final: bool = False  # True when this tool_result is the final (status=completed) update
     usage: TurnUsage = field(default_factory=TurnUsage)
@@ -696,22 +744,31 @@ class AcpEvent:
         satisfy them.
 
         Requirements, each fail-closed on its cache: a child origin
-        (``sub_session_id``), a RESOLVED non-shell classification
-        (``shell_classified`` and not ``is_shell`` — an unclassified event
-        defaults to non-shell and must not pass as one; a shell tool's deny
-        gates need the command bytes this event lacks), the canonical
+        (``sub_session_id``), no RESOLVED shell classification to the contrary
+        (``not is_shell`` — a frame whose ``kind`` resolved to execute cached
+        True, and its deny gates need the command bytes this event lacks; the
+        transport identity must never waive that), the canonical
         ``mcp_server_name`` + ``tool_name`` pair recovered from the tool_call
         cache (empty on a miss, and populated only for genuinely MCP-served
         tools — a host shell/builtin can never carry a server name), and the
         explicit ``mcp_identity_trusted`` provenance flag set by the trusted
         population sites — non-emptiness alone is NOT proof of provenance, so
         an identity pair written by any future inline/agent-authored fallback
-        stays untrusted until that site earns the flag. A
-        non-child event returns False: parents never need the split.
+        stays untrusted until that site earns the flag.
+
+        ``shell_classified`` is deliberately NOT required: a backend may omit
+        ``kind`` on its MCP tool_call frames, leaving the shell cache
+        unwritten. The trusted transport identity is itself proof the call is
+        MCP-served and therefore not a host shell command — but that proof
+        stays confined to THIS identity-only property. Minting a resolved
+        ``shell_classified`` from it instead would flip ``child_low_fidelity``
+        to False and un-gate the content-matching auto-approve paths, letting
+        a kindless mutating call with a read-looking, agent-authored title
+        auto-approve without a prompt. A non-child event returns False:
+        parents never need the split.
         """
         return bool(
             self.sub_session_id
-            and self.shell_classified
             and not self.is_shell
             and self.mcp_identity_trusted
             and self.mcp_server_name
@@ -791,6 +848,14 @@ class AcpPromptStats:
     # first sees a session that just hit its context ceiling as brand new.
     # Cleared the moment a real percentage or usage_update lands.
     context_pct_unknown: bool = False
+    # The structured refusal this turn's metadata reported, if any. Written by
+    # the ``_kiro.dev/metadata`` tracker when the notification carries a
+    # ``refusal`` payload (``ACP_BACKENDS_STRUCTURED_REFUSAL``), read by the
+    # ``EVENT_COMPLETE`` builder to fold onto the terminal. PER-TURN: the
+    # notification precedes the terminal by milliseconds and describes only
+    # this turn, so ``carry_over()`` drops it -- a refusal that survived into
+    # the next turn would brand an ordinary answer as declined.
+    refusal: "RefusalInfo | None" = None
 
     def carry_over(self) -> "AcpPromptStats":
         """Return fresh per-turn stats carrying this turn's context state.
@@ -849,6 +914,23 @@ class AcpPromptStats:
         what the compacted transcript actually costs.
         """
         self.context_pct_unknown = False
+
+    def terminal_refusal(self, stop_reason: str) -> tuple[str, "RefusalInfo | None"]:
+        """Fold this turn's refusal evidence onto a terminal's stop reason.
+
+        A structured refusal recorded from metadata wins: the terminal's own
+        reason is unreliable there (Kiro reports ``end_turn`` after streaming
+        the canned explanation as text), so the reason is rewritten to
+        ``STOP_REASON_REFUSAL`` and the payload attached. Every other reason --
+        including a bare ``refusal`` (Anthropic's spelling, passed through by
+        every harness) -- is returned untouched with ``None``: the dashboard's
+        refusal branch keys on the stop reason, and its card renders ``None``
+        as the field-less card, so a payload with nothing in it would add
+        nothing.
+        """
+        if self.refusal is not None:
+            return STOP_REASON_REFUSAL, self.refusal
+        return stop_reason, None
 
     def apply_cost_cumulative(self, cumulative: float) -> None:
         """Fold a session-cumulative cost reading into the per-turn delta.

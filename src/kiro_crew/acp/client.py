@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import glob
+import hashlib
 import json
 import logging
 import os
@@ -27,10 +28,11 @@ import signal
 import stat
 import subprocess as subprocess_mod
 import sys
+import tempfile
 import time
 import uuid
 from collections import deque
-from contextlib import aclosing
+from contextlib import aclosing, suppress
 from pathlib import Path
 from typing import (
     Any,
@@ -44,23 +46,27 @@ from typing import (
 )
 
 from kiro_crew import acp_tool_gate, agent_scratch, model_registry, platform_compat
+from kiro_crew.acp import seed_provenance
 from kiro_crew.acp._dispatch import (
     _kiro_mcp_server_name,
     _kiro_tool_name,
-    _marker_bearing_text,
-    _repair_escaped_marker,
     agent_version_from_init,
     build_permission_event,
     derive_edit_diff,
+    error_is_refusal_terminal,
     extract_tool_purpose,
+    log_unrenderable_content,
     make_unified_diff,
     parse_claude_compaction_notice,
     parse_prompt_token_usage,
+    parse_refusal,
     parse_session_modes,
     parse_usage_cost,
     parse_usage_update,
     redact_text,
+    tool_call_content_text,
 )
+from kiro_crew.acp._frame_record import record_frame
 from kiro_crew.acp.liveness import (
     EVIDENCE_SAMPLING,
     VERDICT_WORKING,
@@ -80,9 +86,11 @@ from kiro_crew.acp.types import (
     ACP_BACKENDS_INTERNAL_SANDBOX,
     ACP_BACKENDS_MEMBER_DISPATCH,
     ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION,
+    ACP_BACKENDS_POD_HOME_REMAP,
     ACP_BACKENDS_SEED_LOCAL_SETTINGS,
     ACP_BACKENDS_SESSION_MCP_ARRAY,
     ACP_BACKENDS_STEER,
+    ACP_BACKENDS_STRUCTURED_REFUSAL,
     ACP_CLIENT_CAPABILITIES,
     EVENT_AGENT_SWITCHED,
     EVENT_CLEAR_STATUS,
@@ -137,6 +145,7 @@ from kiro_crew.acp.types import (
     model_registry_namespace,
 )
 from kiro_crew.agent import ensure_agent_materialized
+from kiro_crew.atomic_write import atomic_write
 from kiro_crew.browser_cli.launch import browser_session_env, browser_socket_env
 from kiro_crew.config.paths import kiro_sessions_dir
 from kiro_crew.constants import (
@@ -156,10 +165,12 @@ from kiro_crew.hooks import (
     fire_tool_hooks,
     get_global_hook_store,
 )
+from kiro_crew.identity_stores import IDENTITY_STORE_ROOTS
 from kiro_crew.kiro_cli import known_kiro_cli_dirs, resolve_kiro_cli
 from kiro_crew.mcp_gateway.claim import schedule_claim
 from kiro_crew.mcp_gateway.session_servers import injection_server_names, pooled_session_servers
 from kiro_crew.metrics.tool_calls import note_tool_call_started, record_tool_call_finished
+from kiro_crew.platform.context import redact_log_via_context
 from kiro_crew.providers.mirrors import mirror_for
 from kiro_crew.resource_status import inject_xdist_auto_cap
 from kiro_crew.sandbox import (
@@ -179,7 +190,6 @@ from kiro_crew.sandbox import (
 )
 from kiro_crew.security import is_sensitive_path, redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
-from kiro_crew.session_directive import content_free_digest
 from kiro_crew.skill_usage import get_global_skill_read_observer
 
 logger = logging.getLogger(__name__)
@@ -202,6 +212,9 @@ KIRO_CLI_BIN = "kiro-cli"
 KIRO_CLI_SUBCMD = "acp"
 
 CLAUDE_ACP_BIN = "claude-agent-acp"
+# A self-updating ACP adapter can briefly disappear or remain locked while its
+# executable is replaced. Delay the one permitted startup retry past that window.
+_ACP_RESPAWN_BACKOFF_S = 2.0
 # On-disk name of the Claude backend CLI.  The claude-agent-acp adapter
 # delegates the actual model turn to @anthropic-ai/claude-agent-sdk, which
 # needs a per-platform native binary (~250 MB each).  Those ship as npm
@@ -853,6 +866,325 @@ def _resolve_spawn_env(env: dict[str, str], *, kiro_api_key: bool = False) -> di
     return env
 
 
+#: The data-root override variables the identity store consults, DERIVED from
+#: ``identity_stores.IDENTITY_STORE_ROOTS`` so this set cannot drift from the table
+#: that actually resolves the store. Today: ``XDG_DATA_HOME`` (POSIX),
+#: ``LOCALAPPDATA`` and ``APPDATA`` (Windows). macOS rows carry no env var (fixed
+#: anchor), so nothing is scrubbed for them. Consumed by
+#: :func:`_apply_pod_home_remap`, which pops each one from a pod child's env.
+IDENTITY_STORE_ROOT_ENV_VARS: frozenset[str] = frozenset(
+    root.env_var for root in IDENTITY_STORE_ROOTS if root.env_var
+)
+
+
+#: Credential POINTERS: variables whose VALUE is an absolute path or URL the AWS
+#: SDK chain dereferences to obtain credentials. Popped from a pod child's env by
+#: :func:`_apply_pod_home_remap`.
+#:
+#: Why this is an explicit list and not a derivation. ``IDENTITY_STORE_ROOT_ENV_VARS``
+#: is derived from ``identity_stores.IDENTITY_STORE_ROOTS`` and correctly does NOT
+#: cover these: a store ROOT is a directory the product's own layout hangs off, while
+#: these name a credential FILE or a credential ENDPOINT directly. No table in this
+#: repo enumerates them, so deriving them would mean inventing one whose only
+#: consumer is this scrub -- a list with extra steps. They are enumerated here, with
+#: the rule for extending it stated rather than implied: a variable belongs here when
+#: its value is a LOCATION that yields credentials when followed.
+#:
+#: Why not ``sandbox._SENSITIVE_ENV_PREFIXES``, which is the repo's one global scrub.
+#: That set covers ``AWS_SECRET`` / ``AWS_SESSION`` -- variables that CARRY a secret --
+#: and deliberately stops there, because the standard sandbox tier leaves the real
+#: ``~/.aws`` visible so the AWS CLI and ``credential_process`` keep working for
+#: non-pod agent turns. Adding pointers there would break that supported path
+#: everywhere to fix a pod-only exposure. The exposure IS pod-only: outside a pod the
+#: pointer and the fence agree about where credentials live, while inside one ``HOME``
+#: moves and ``.aws/config`` / ``.aws/credentials`` / ``.aws/cli`` are empty-masked
+#: under the new home -- so an inherited ABSOLUTE pointer at the host path walks
+#: around the relocation entirely and the agent reads the operator's real credentials
+#: by dereferencing it. One philosophy, two scopes: secrets are scrubbed globally,
+#: pointers are scrubbed where the thing they point at has been relocated.
+#:
+#: REMOVED rather than re-anchored, for the same reason as the store roots: deleting
+#: the variable lets the SDK's own ``$HOME``-relative default resolve under the pod
+#: home (where the masks apply), and a wrong re-anchored value would fail OPEN.
+CREDENTIAL_POINTER_ENV_VARS: frozenset[str] = frozenset(
+    {
+        # Credential/config FILES the SDK reads directly.
+        "AWS_CONFIG_FILE",
+        "AWS_SHARED_CREDENTIALS_FILE",
+        # An OIDC token file exchanged for role credentials (web-identity flow).
+        "AWS_WEB_IDENTITY_TOKEN_FILE",
+        # The container credential provider: a URL the SDK GETs for credentials,
+        # plus the bearer that authorizes that GET. Not a filesystem path, so no
+        # mask or HOME remap can reach any of them -- which is exactly why they
+        # have to be dropped from the env rather than fenced.
+        #
+        # The authorization token has TWO spellings and both must go. The ``_FILE``
+        # form names a file holding the bearer; the bare form carries the bearer
+        # IN THE VALUE, in plain text. Per the SDK reference the bare form is the
+        # documented alternative used when ``_FILE`` is unset (and is what Lambda
+        # SnapStart sets), so scrubbing only ``_FILE`` leaves the strictly worse
+        # variable in the child's environment: a live bearer the agent can read
+        # straight out of ``env`` with no file to open and no path to fence.
+        "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+        "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+        "AWS_CONTAINER_AUTHORIZATION_TOKEN",
+        "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+    }
+)
+
+
+def _apply_pod_home_remap(env: dict[str, str], *, pod_home_remap: bool) -> dict[str, str]:
+    """Remap *env*'s ``HOME`` to the pod's own OAuth-grant tree, for a
+    pod-spawned kiro-cli child ONLY. Mutates *env* in place and returns it.
+
+    Gated on BOTH the pod marker (``KIROCREW_POD``, set by
+    ``pod.runtime.build_pod_env`` for the whole pod gateway) and
+    *pod_home_remap* (membership in ``ACP_BACKENDS_POD_HOME_REMAP`` --
+    harness-parity H6/H7, never a bare backend-name comparison), so this touches
+    nothing outside a pod and nothing for a harness whose credentials do not
+    follow ``$HOME``. That set is deliberately NOT
+    ``ACP_BACKENDS_INTERNAL_SANDBOX``: the two answer different questions --
+    "does this harness carry its own OS sandbox?" versus "does relocating this
+    harness's HOME move its credential store?" -- so reusing the sandbox set
+    would hand a harness added there for sandbox reasons credential-relocation
+    semantics it never opted into.
+
+    The marker is compared EXACTLY to ``"1"`` rather than tested for
+    truthiness. Every non-empty string is truthy in Python, so an inherited
+    ``KIROCREW_POD=false`` or ``KIROCREW_POD=0`` would otherwise remap ``HOME``
+    for a child that is not in a pod at all -- the inverse of what the value
+    says.
+
+    kiro-cli derives its MCP OAuth artifact directory
+    (``mcp_grant.kiro_oauth_cache_dir()``) from the SPAWNED PROCESS's real
+    ``$HOME`` -- there is no env var that
+    relocates just that one subtree (see ``config.paths.kiro_oauth_cache_home``
+    for why ``KIRO_HOME`` does not help either) -- so the only way to make
+    kiro-cli's OWN writes land in the pod's tree is to remap the child's
+    ``HOME`` at spawn time. ``KIROCREW_OS_HOME`` names the SAME directory
+    ``config.paths.kiro_oauth_cache_home()`` resolves for the pod's ``mcp_grant``
+    reads, which is what keeps kiro-cli's writer and every ``mcp_grant`` reader
+    looking at one tree instead of two independent derivations of "where do
+    grants live" (see ``mcp_grant.kiro_oauth_cache_dir``'s docstring for the
+    split this closes).
+
+    A remap absent ``KIROCREW_OS_HOME`` (the marker set with no pod-scoped
+    directory to point at -- a malformed pod env, or a caller that set the
+    marker without the directory) leaves ``env`` untouched: an unset ``HOME``
+    on a spawned child would break far more than OAuth grants, so the fail
+    mode here is "kiro-cli reads the real host home", the status quo, not a
+    broken spawn.
+
+    Three obligations come with moving ``HOME``, each closed here:
+
+    * kiro-cli's own sign-in must keep working. ``pod.runtime._seed_pod_os_home``
+      mirrors the AGENT RUNTIME's identity store (``~/.local/share/kiro-cli`` and
+      its per-platform siblings, derived from ``identity_stores``) into this tree
+      at pod boot, which is where the harness actually resolves its access token.
+      The host's ``.aws/sso/cache`` is NOT copied: that staging existed in an
+      earlier revision and was deleted, so a pod's ``.aws/sso/cache`` starts empty
+      and holds only grants the pod itself mints.
+    * ``USERPROFILE`` moves WITH ``HOME`` (Windows spelling of the same
+      concept) so a Windows pod does not read one remapped path and the other
+      unremapped.
+    * **AWS file-based credentials deliberately do NOT follow the child into the
+      pod.** ``AWS_CONFIG_FILE`` / ``AWS_SHARED_CREDENTIALS_FILE`` default to
+      ``$HOME/.aws/{config,credentials}`` when unset, so a remapped ``HOME``
+      sends the credential chain at the pod's own tree. An earlier revision
+      pinned both variables back to the REAL home so a pod agent turn could
+      still reach the operator's profiles. That pin is REMOVED, because naming
+      those files in the child environment is itself the leak: ``security.py``
+      matches command TEXT and performs no variable expansion, so the exported
+      name is a working alias for a path the sensitive-path fence refuses by
+      name -- and the alias is retrievable through an unbounded set of
+      spellings (``$VAR``, ``${VAR}``, ``%VAR%``, ``$env:VAR``,
+      ``os.environ['VAR']``, ``$(printenv VAR)``, ``eval``, indirect expansion,
+      a helper script). Three review rounds each closed one spelling; a text
+      matcher cannot close the class. Deleting the export deletes the alias,
+      which is the only fix that does not depend on out-matching command
+      substitution.
+
+      What this costs, stated rather than implied: **an ACP agent turn inside a
+      pod has no inherited AWS credentials on any path.** Both legs are closed,
+      and an earlier revision of this comment got the second one wrong:
+
+      * FILE credentials: removing the exports means ``~/.aws/{config,credentials}``
+        resolves under the remapped (empty) pod home, so a profile that lives only
+        in a file -- including a ``credential_process`` profile -- does not resolve.
+      * ENVIRONMENT credentials: ``sandbox.scrub_agent_subprocess_env`` scrubs
+        ``_SENSITIVE_ENV_PREFIXES``, which includes ``AWS_SECRET`` and
+        ``AWS_SESSION``, from every Kiro/ACP child. So ``AWS_SECRET_ACCESS_KEY``
+        and ``AWS_SESSION_TOKEN`` never reach the agent turn even when the
+        operator has them. ``AWS_ACCESS_KEY_ID`` survives (no ``AWS_ACCESS``
+        prefix), but a key id without its secret is not a credential.
+
+      This comment previously claimed "env-credentialed turns are unaffected",
+      pointing at ``build_pod_env`` keeping ``AWS_*``. That keep is real but it is
+      not the last word: ``build_pod_env`` shapes the pod GATEWAY's environment,
+      and the ACP child is scrubbed AFTER it, so the two statements are about
+      different processes. The corrected posture is strictly stronger than the one
+      claimed, and it is the intended one for a throwaway instance whose whole
+      purpose is to not hold machine-level credentials.
+
+      An operator who needs AWS from inside a pod therefore cannot get it by
+      exporting credentials into their shell; that is a deliberate property of the
+      agent-subprocess scrub, not something this function can or should undo.
+
+      An operator who sets either pointer variable in their OWN environment has it
+      REMOVED here too, which is the half a later round corrected: whose file the
+      variable names does not change what the pod's agent obtains by dereferencing
+      it, and an absolute host pointer walks around the ``HOME`` relocation
+      entirely. ``CREDENTIAL_POINTER_ENV_VARS`` carries the whole family, so the
+      scrub below covers an inherited pointer and a manufactured one alike.
+    """
+    if not pod_home_remap or env.get("KIROCREW_POD") != "1":
+        return env
+    os_home = env.get("KIROCREW_OS_HOME")
+    if not os_home:
+        return env
+    env["HOME"] = os_home
+    env["USERPROFILE"] = os_home
+    # Remapping HOME alone is NOT enough. The identity store's root is
+    # ``$HOME``-relative only when no OVERRIDE is set: ``identity_stores``
+    # resolves each store from ``StoreRoot.env_var`` first (``XDG_DATA_HOME`` on
+    # POSIX, ``LOCALAPPDATA`` / ``APPDATA`` on Windows; macOS anchors are fixed and
+    # carry no env var). An inherited override pointing at a host path therefore
+    # made the pod's kiro-cli read AND WRITE the HOST identity store, so its
+    # sign-in state survived ``pod down`` -- the exact escape this remap exists to
+    # prevent, reached around the side.
+    #
+    # REMOVED rather than re-anchored, deliberately. Deleting the variable lets the
+    # product's own ``$HOME``-relative default resolve under ``os_home``, which is
+    # the behaviour already tested and already staged into; re-anchoring would
+    # invent a second spelling of "where the store lives" that has to stay in sync
+    # with ``identity_stores`` forever, and a wrong value fails OPEN (a live store
+    # somewhere unintended) instead of closed. The set is DERIVED from the store
+    # table rather than restated, so a platform or product added there is scrubbed
+    # here without a second edit.
+    for var in IDENTITY_STORE_ROOT_ENV_VARS:
+        env.pop(var, None)
+    # Credential pointers, same removal for a different reason: their value is a
+    # LOCATION that yields credentials when followed, and an operator-set absolute
+    # one still names the HOST's file after ``HOME`` has moved. See
+    # ``CREDENTIAL_POINTER_ENV_VARS`` for why this set is explicit and why it is not
+    # folded into the repo's global secret scrub.
+    for var in CREDENTIAL_POINTER_ENV_VARS:
+        env.pop(var, None)
+    return env
+
+
+#: The executable name inside a toolbox kiro-cli bundle. The installed
+#: ``kiro-cli`` is frequently a SHIM that prefers ``exec aim sandbox --client
+#: kiro-cli "$@"`` and falls back to ``exec "$KIRO_CLI_PATH"``, which it derives
+#: as ``<bundle root>/kiro-cli`` from its own resolved symlink chain. Naming the
+#: same executable here keeps :func:`_kiro_cli_bundle_binary` single-sourced with
+#: the shim's own fallback instead of hardcoding one install layout.
+_KIRO_CLI_BUNDLE_EXECUTABLE = "kiro-cli"
+
+
+def _kiro_cli_bundle_binary(
+    executable: str,
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> str | None:
+    """The bundle binary the kiro-cli shim's OWN fallback would exec, or ``None``.
+
+    Mirrors the shim's two-step resolution rather than inventing a third one:
+    an executable ``KIRO_CLI_PATH`` wins outright (the shim honors a pre-set
+    value before it computes anything), otherwise the shim resolves its own
+    symlink chain, takes ``<dirname>/..`` as the bundle root and execs
+    ``<bundle root>/kiro-cli``.
+
+    Returns ``None`` -- meaning "spawn what was resolved, unchanged" -- for every
+    case where the swap is not provably available: *executable* IS already the
+    bundle binary (the computed candidate resolves back to it), the candidate
+    does not exist, or it is not executable. A caller therefore never has to
+    handle a path that cannot be spawned, and a host with no toolbox bundle keeps
+    the status quo instead of failing at spawn time.
+    """
+    env = os.environ if environ is None else environ
+    pinned = env.get("KIRO_CLI_PATH")
+    if pinned and os.path.isfile(pinned) and os.access(pinned, os.X_OK):
+        return pinned
+    try:
+        real = os.path.realpath(executable)
+        candidate = os.path.join(
+            os.path.dirname(os.path.dirname(real)), _KIRO_CLI_BUNDLE_EXECUTABLE
+        )
+    except OSError:  # pragma: no cover - defensive; a spawn must not fail on this
+        return None
+    if os.path.realpath(candidate) == real:
+        return None  # already the bundle binary; the shim is not in the chain
+    if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+        return candidate
+    return None
+
+
+def apply_pod_bundle_spawn(
+    argv: list[str],
+    *,
+    backend: str,
+    environ: Mapping[str, str] | None = None,
+) -> tuple[list[str], bool]:
+    """Resolve a pod child's kiro-cli spawn: which binary, and who sandboxes it.
+
+    Returns ``(argv, delegate_internal_sandbox)``. The second element is what
+    callers pass as ``wrap_argv``'s ``is_kiro_cli``, so the binary choice and the
+    sandbox-ownership choice cannot drift apart -- they are one decision with one
+    cause, made here once for both ACP transports rather than restated in each.
+
+    **Outside a pod this is a no-op by construction**: *argv* is returned
+    unchanged and ``delegate_internal_sandbox`` is plain membership in
+    ``ACP_BACKENDS_INTERNAL_SANDBOX``, byte-identical to what both call sites
+    computed inline before. The exception is stated POSITIVELY (pod condition
+    true) and gated on exactly the conditions that make
+    :func:`_apply_pod_home_remap` fire -- the pod marker compared exactly to
+    ``"1"``, membership in ``ACP_BACKENDS_POD_HOME_REMAP``, and a
+    ``KIROCREW_OS_HOME`` to point at -- never on a backend negation, so a harness
+    added to a set for some other reason cannot inherit this behaviour by
+    accident (harness-parity H6/H7).
+
+    **Why a pod child must not run the shim.** The remap gives the child a
+    pod-owned ``HOME`` so kiro-cli's OAuth grants die with the pod. The installed
+    ``kiro-cli`` is a shim that prefers ``aim sandbox``, and toolbox's sandbox
+    builds its mount plan around the REAL user home: under a remapped ``HOME`` it
+    fails to construct at all, exiting before kiro-cli starts (observed as
+    ``Failed to spawn child process: Device or resource busy (os error 16)``, and
+    inside a pod as ``toolbox: Unable to run aim: Command "aim" doesn't appear to
+    be associated with any tool`` followed by a broken ACP pipe). Staging state
+    into the pod home does not help -- an empty os-home, one carrying a
+    ``.toolbox`` symlink, and one carrying a real ``.toolbox`` skeleton all fail
+    identically -- because the obstacle is toolbox's mount plan, not a file the
+    child cannot find. The bundle binary the shim itself falls back to has no
+    such dependency: under the same remapped ``HOME`` it starts and reaches its
+    normal "not logged in" state, which is precisely the state
+    ``pod.runtime._seed_pod_os_home``'s staged SSO token answers.
+
+    **So Kiro Crew's own sandbox takes over for that child.** Skipping the
+    seatbelt/delegation is only sound while kiro-cli's internal sandbox actually
+    runs; bypassing the shim means it does not, so ``delegate_internal_sandbox``
+    goes ``False`` and ``wrap_argv`` wraps the child in Crew's launcher instead.
+    The substitution is per-pod-child and never reaches a host session.
+
+    If the bundle binary cannot be located the pair degrades to the status quo
+    (shim, internal sandbox) rather than spawning something unlaunchable; a pod
+    whose child cannot bootstrap is meant to be refused loudly at ``pod up``, not
+    papered over here.
+    """
+    delegate = backend in ACP_BACKENDS_INTERNAL_SANDBOX
+    env = os.environ if environ is None else environ
+    if env.get("KIROCREW_POD") != "1":
+        return argv, delegate
+    if backend not in ACP_BACKENDS_POD_HOME_REMAP or not env.get("KIROCREW_OS_HOME"):
+        return argv, delegate
+    if not argv:  # pragma: no cover - defensive; callers always pass argv[0]
+        return argv, delegate
+    bundle = _kiro_cli_bundle_binary(argv[0], environ=env)
+    if bundle is None:
+        return argv, delegate
+    return [bundle, *argv[1:]], False
+
+
 # Subprocess stdout buffer — kiro-cli can send large JSON-RPC lines (tool outputs)
 _STDOUT_BUFFER_LIMIT = 10 * 1024 * 1024  # 10MB
 # Ceiling on the bytes discarded while draining ONE oversize line. Per drain call
@@ -956,7 +1288,7 @@ def _mentions_skill_file(raw_params: dict | None, command: str | None) -> bool:
 # security filter cancels every tool use in an assistant turn (e.g. shell commands
 # containing "credentials").  After this text kiro-cli returns to an idle state waiting
 # for the next user prompt and NEVER sends a ``complete`` response for the in-flight
-# ``session/prompt`` — so without special handling KiroCrew waits the full 2h timeout.
+# ``session/prompt`` — so without special handling Kiro Crew waits the full prompt timeout.
 # Treating this chunk as end-of-turn unblocks the caller; the text itself is still
 # yielded so the user/agent sees what happened.  We use an exact (stripped) match so
 # the detection does not fire if the model merely quotes the marker string in prose.
@@ -1015,6 +1347,13 @@ def parse_slash_command(command: str) -> tuple[str, dict]:
 
 # Timeouts for session initialization steps
 _INIT_TIMEOUT = 240.0  # 4 min — MCP servers can be slow to initialize
+# The enforced-adapter preflight (sandbox-backend probe + credential-mask
+# resolution) is blocking filesystem work run off the loop; this bounds the
+# wait for it. Sized for a cold sandbox probe (its own subprocess budget is
+# 20 s) plus canonical resolution of the home and override roots on a slow
+# disk, with headroom. On expiry the adapter is REFUSED, never started with
+# its mask missing.
+_SANDBOX_PREFLIGHT_TIMEOUT = 60.0
 # set_mode/set_model: fire-and-forget.  kiro-cli accepts these commands
 # but usually never sends a JSON-RPC response — MCP servers load
 # asynchronously.  Any late responses land in _buffer and are harmlessly
@@ -1028,7 +1367,7 @@ _DRAIN_DURATION = 1.0  # hard cap on draining MCP server init notifications
 # active server. Must stay strictly below _DRAIN_DURATION, otherwise the hard cap
 # fires first and the idle path becomes dead code.
 _DRAIN_IDLE_EXIT = 0.5
-_DEFAULT_PROMPT_TIMEOUT = 7200.0  # 2 hours — allow very long tool execution
+_DEFAULT_PROMPT_TIMEOUT = 14400.0  # 4 hours — mirrors constants.CHAT_TURN_TIMEOUT
 # Slack the transport leaves ABOVE the configured turn ceiling. The dashboard's
 # own deadline (turn_dispatch._bounded_turn) must always fire first so the user
 # sees the "turn hit the N-hour limit" card; a transport cut at the same instant
@@ -1055,7 +1394,7 @@ def prompt_timeout_for_ceiling(configured: float) -> float:
 
 
 def resolve_prompt_timeout() -> float:
-    """Per-prompt transport timeout, honouring the configured turn ceiling.
+    """Per-prompt transport timeout, honouring every deadline layered above it.
 
     ``agent.chat_turn_timeout_secs`` may be raised above
     :data:`_DEFAULT_PROMPT_TIMEOUT` (up to the loader's ``CHAT_TURN_TIMEOUT_MAX``)
@@ -1063,6 +1402,15 @@ def resolve_prompt_timeout() -> float:
     dashboard's ceiling — otherwise the transport cuts the turn first and the
     larger configured value is a limit the system does not honour (the exact
     dishonesty ``turn_dispatch.chat_turn_timeout_secs`` clamps against).
+
+    This ONE wait is shared by every prompt dispatch, so it bounds against the
+    LARGEST such deadline rather than the turn ceiling alone.
+    ``agent.subagent_timeout_secs`` is the other one: a subagent's outer
+    ``asyncio.wait_for`` runs on that value while its prompt runs on this wait,
+    so a transport cut below it kills a healthy subagent early and reports a
+    transport failure rather than the deadline the operator configured. ``0``
+    there is the "use the default" sentinel, resolved the same way the manager
+    resolves it.
 
     Never returns less than :data:`_DEFAULT_PROMPT_TIMEOUT`: a LOWERED turn
     ceiling is enforced by the dashboard's own deadline, and shrinking the
@@ -1074,8 +1422,11 @@ def resolve_prompt_timeout() -> float:
     """
     try:
         from kiro_crew.config.loader import KiroCrewConfig
+        from kiro_crew.constants import SUBAGENT_TIMEOUT_SECS
 
-        configured = float(KiroCrewConfig.load().agent.chat_turn_timeout_secs)
+        agent = KiroCrewConfig.load().agent
+        subagent = float(agent.subagent_timeout_secs) or float(SUBAGENT_TIMEOUT_SECS)
+        configured = max(float(agent.chat_turn_timeout_secs), subagent)
     except Exception:
         logger.debug("turn-ceiling config unavailable; transport keeps default", exc_info=True)
         return _DEFAULT_PROMPT_TIMEOUT
@@ -1498,9 +1849,12 @@ _RE_AUTH = re.compile(
     r"\b(AccessDenied(?:Exception)?|UnauthorizedException|ExpiredToken(?:Exception)?"
     r"|InvalidSignatureException|UnrecognizedClientException)\b"
 )
+_5XX_SEP = r"[ \t_-]?"
 _RE_5XX_NAMED = re.compile(
-    r"\b(InternalServerError|InternalFailure|ServiceUnavailable(?:Exception)?"
-    r"|DispatchFailure|ConnectionReset(?:Error)?)\b"
+    rf"\b(internal{_5XX_SEP}server{_5XX_SEP}error|internal{_5XX_SEP}failure"
+    rf"|service{_5XX_SEP}unavailable(?:{_5XX_SEP}exception)?"
+    rf"|dispatch{_5XX_SEP}failure|connection{_5XX_SEP}reset(?:{_5XX_SEP}error)?)\b",
+    re.IGNORECASE,
 )
 _RE_5XX_STATUS = re.compile(r"(?:HTTP|status)\s*(?:code\s*)?(?:50[0234]|529)\b", re.IGNORECASE)
 # Genuine retry hint only. "response stream" is deliberately NOT matched here,
@@ -1526,7 +1880,7 @@ _RE_AUTH_STATUS = re.compile(r"(?:HTTP|status)\s*(?:code\s*)?(?:401|403)\b", re.
 _RE_SESSION_EXPIRED = re.compile(
     r"\b(?:session\s+(?:has\s+)?expired|session\s+timed?\s*out"
     r"|login\s+(?:has\s+)?expired|authentication\s+(?:has\s+)?expired"
-    r"|not\s+logged\s+in|not\s+authenticated"
+    r"|not\s+logged\s+in|not\s+authenticated|not\s+signed\s+in"
     r"|re-?authenticate|login\s+required|auth(?:entication)?\s+required)\b",
     re.IGNORECASE,
 )
@@ -1907,6 +2261,52 @@ def resolve_usable_model(preferred: str, advertised: Sequence[str] | None) -> st
     # ``""`` when the model is absent under both spellings — exactly the
     # inherit-the-default answer this path wants.
     return resolve_pin_spelling(preferred, ids)
+
+
+def pick_served_default(current: str, advertised: Sequence[str] | None) -> str:
+    """The served model a session on *current* must switch to, or ``""``.
+
+    ``session/new`` picks the model itself and reports it as
+    ``currentModelId``, and that choice is the backend's own default rather
+    than anything Crew asked for. A partition does not have to serve the model
+    its backend defaults to: an account whose region omits ``"auto"`` can be
+    handed ``"auto"`` at birth, and then every ``session/prompt`` dies with
+    "your account does not have access to model 'auto'". So inheriting the
+    backend default is only safe when the inherited model is one the same
+    response advertised, and this answers which served model to move to when it
+    is not.
+
+    Returns ``""`` — nothing to do, keep inheriting — whenever the question
+    cannot be answered or the answer is already right:
+
+      - ``advertised`` empty/None: entitlement is unknowable, exactly
+        :func:`model_is_unusable`'s empty-set-means-allow contract. Reading an
+        absent list as "nothing is served" would switch every session on a
+        backend that simply does not advertise;
+      - empty ``current``: the backend echoed no model, so there is no evidence
+        it picked an unserved one. Fail open rather than override a default we
+        cannot see;
+      - ``current`` served, under its own spelling or under a peeled
+        ``<namespace>::`` one (:func:`resolve_pin_spelling`, the shared fold):
+        the session is already on a model the account can run.
+
+    Otherwise the default is genuinely unserved and the session needs a real
+    model: ``"auto"`` when the backend advertises it — the same
+    "let the backend choose" id ``resolve_usable_model`` and the dashboard's
+    ``_wire_model_id`` send — else the FIRST advertised id, because a served
+    model chosen for the user beats a session that cannot answer a single
+    prompt.
+    """
+    ids = [m for m in (advertised or []) if m and m.strip()]
+    if not ids:
+        return ""
+    if not current.strip():
+        return ""
+    if not model_is_unusable(current, ids):
+        return ""
+    if resolve_pin_spelling(current, ids):
+        return ""
+    return "auto" if not model_is_unusable("auto", ids) else ids[0]
 
 
 def _format_acp_error(error: object, available_models: Sequence[str] | None = None) -> str:
@@ -3061,6 +3461,37 @@ def _sandbox_preflight(backend: str, mode: str) -> tuple[str, ...]:
         raise AcpToolGateUnroutable(str(exc)) from None
 
 
+async def _run_preflight_bounded(
+    preflight: Callable[[str, str], tuple[str, ...]], backend: str, mode: str
+) -> tuple[str, ...]:
+    """Run *preflight* off the loop and give up after ``_SANDBOX_PREFLIGHT_TIMEOUT``.
+
+    The mask half of the preflight canonicalizes the home and every override root
+    on disk, and on a stalled mount that wait has no natural end: nothing else on
+    the spawn path bounds it (``ensure_ready`` times the ACP handshake, which comes
+    AFTER the spawn), so without this the only backstop was the subagent startup
+    watchdog. Expiry raises :class:`AcpError`, the retryable kind: a stall is a
+    transient fact about the disk, not a configuration fact like
+    :class:`AcpToolGateUnroutable`, so the one retry ``ensure_ready`` grants is
+    the right shape. The adapter is never started without its mask.
+
+    Takes the preflight as a parameter so the deadline is testable without a
+    spawn; ``_spawn`` passes :func:`_sandbox_preflight`.
+    """
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(preflight, backend, mode), timeout=_SANDBOX_PREFLIGHT_TIMEOUT
+        )
+    except asyncio.TimeoutError:
+        raise AcpError(
+            f"Could not start the {backend} adapter: computing its sandbox credential "
+            "mask needs the home and credential roots resolved on disk, and that did "
+            f"not finish within {_SANDBOX_PREFLIGHT_TIMEOUT:.0f} s (a stalled or very "
+            "slow filesystem). The adapter is not started without its mask; retry "
+            "once the disk responds."
+        ) from None
+
+
 class AcpClient:
     """JSON-RPC 2.0 client over stdio with kiro-cli acp."""
 
@@ -3187,6 +3618,13 @@ class AcpClient:
         # theirs. So the flag says "Crew created it" and this says "and it is still
         # Crew's content" -- the re-seed and the reset unlink both require BOTH.
         self._claude_settings_written: str | None = None
+        # Identity this client claims its seed under, in the durable record. Two
+        # keyless clients share the default work_dir, so a token is what keeps
+        # "Crew wrote it" from collapsing into "any Crew client may take it": the
+        # durable record is for adopting an ORPHAN, and a sibling still running in
+        # this process does not have one. Per instance and never reset -- a client
+        # that re-spawns is the same owner across spawns.
+        self._seed_owner = uuid.uuid4().hex
         # This session's translated ``mcpServers`` array, resolved once per spawn.
         # Held here so the shared session-params call site is a pure in-memory
         # read: the translation touches disk, and doing that AT the call site
@@ -3323,6 +3761,10 @@ class AcpClient:
         # which carries only a truncated title — can recover the real path/url
         # the governance gate needs (filesystem.write / network.egress scopes).
         self._tool_call_params: dict[str, dict] = {}
+        # toolCallId -> path named by the tool_call's diff content block, so the
+        # permission event can carry diff_path for the edit gate when the params
+        # themselves carry no path key. Mirrors AcpSessionHandle's cache.
+        self._tool_call_diff_path: dict[str, str] = {}
         # Map JSON-RPC request id → {"once": optionId, "always": optionId} so
         # the host can echo back the exact optionIds the agent advertised.
         # kiro-cli uses "allow_once"/"allow_always"; claude-agent-acp uses
@@ -3694,18 +4136,29 @@ class AcpClient:
     def _codex_session_mcp_servers(self) -> list:
         """MCP server array passed to a codex ``session/new`` / ``session/load``.
 
-        The codex twin of :meth:`_claude_session_mcp_servers`, still ``[]``: codex is
-        in ``ACP_BACKENDS_KNOWN`` but not in ``BASELINE_SELECTABLE_BACKENDS``, so no
-        public build offers it and there is no session to give tools to yet. The
-        registry in :mod:`kiro_crew.providers.mirrors` records that as codex's
-        declared state rather than leaving the omission unexplained; when an edition
-        registers a codex provider, the mirror it needs goes in that folder beside
-        claude's and this hook returns it.
+        The codex twin of :meth:`_claude_session_mcp_servers`, still ``[]`` -- and
+        codex IS in ``BASELINE_SELECTABLE_BACKENDS``, so this is a state a plain
+        public build reaches TODAY, not a dormant seam. Nothing is PROJECTED onto a
+        codex session: the only entries it gets are the pooled broker stubs
+        ``_pooled_mcp_servers`` appends for every backend alike, empty when the
+        shared gateway is off. So Crew's own control plane -- ``kirocrew-core``,
+        ``kirocrew-cron`` -- is never projected here, but it is NOT thereby absent:
+        a stub the overlay wrapped still mounts, which makes the gateway rather than
+        this hook the thing that decides. With the gateway off, a codex session has
+        no MCP tools at all.
 
-        An edition overriding this must drop any entry whose transport the adapter
-        does not advertise. codex-acp answers ``session/new`` with ``-32602`` for
-        an unsupported transport rather than skipping that one server, so a single
-        bad entry costs the whole session.
+        It stays ``[]`` because no projection has been written and the shape this
+        adapter accepts is unverified, NOT because nobody can reach it. The registry
+        in :mod:`kiro_crew.providers.mirrors` records that as codex's declared state
+        rather than leaving the omission unexplained; when the mirror is written it
+        goes in that folder beside claude's and this hook returns it.
+
+        Empty rather than guessed is the fail-safe direction, and the one
+        established constraint is why: codex-acp answers ``session/new`` with
+        ``-32602`` for a transport it does not advertise rather than skipping that
+        one server, so a single bad entry costs the whole session. An edition
+        overriding this must drop any entry whose transport the adapter does not
+        advertise.
         """
         return []
 
@@ -3725,9 +4178,10 @@ class AcpClient:
         return base / "settings.local.json"
 
     def _claude_settings_is_still_ours(self) -> bool:
-        """Whether settings.local.json still holds the bytes THIS session wrote.
+        """Whether settings.local.json still holds the bytes CREW wrote.
 
-        The second half of the ownership test (the first is having created it).
+        The second half of the ownership test (the first is having created it --
+        in this session, or in an earlier one per the durable record).
         A user can replace the file atomically after Crew's create, and the
         replacement is theirs: it must not be overwritten by a re-seed nor
         deleted on reset. An unreadable path answers "not ours" -- declining to
@@ -3745,22 +4199,40 @@ class AcpClient:
         past the payload it is comparing against. Every refusal answers "not
         ours", which leaves the file alone -- the safe direction.
         """
-        written = getattr(self, "_claude_settings_written", None)
-        if written is None:
+        return self._settings_path_holds(
+            self._claude_local_settings_path(), self._expected_settings_fingerprint()
+        )
+
+    @staticmethod
+    def _settings_path_holds(path: Path, expectation: tuple[int, str] | None) -> bool:
+        """Whether *path* still holds exactly the ``(size, sha256)`` in *expectation*.
+
+        Split out from :meth:`_claude_settings_is_still_ours` so the teardown
+        transaction can be a pure function of arguments captured before it starts.
+        It runs in a thread while the client clears its instance flags, so a version
+        that re-read ``self`` could decide ownership against state that changed
+        underneath it. ``None`` means Crew has no claim to check, which reads as
+        "not ours".
+        """
+        if expectation is None:
             return False
-        expected = written.encode("utf-8")
+        size, sha = expectation
         flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
         try:
-            fd = os.open(self._claude_local_settings_path(), flags)
+            fd = os.open(path, flags)
         except OSError:
             return False
         try:
             st = os.fstat(fd)
             # A FIFO, device or directory is not Crew's file, and reading one is
             # the hazard. Size first: it settles a huge file without reading it.
-            if not stat.S_ISREG(st.st_mode) or st.st_size != len(expected):
+            if not stat.S_ISREG(st.st_mode) or st.st_size != size:
                 return False
-            return os.read(fd, len(expected) + 1) == expected
+            # ONE byte past the recorded length, so a file that grew between the
+            # fstat and the read is rejected on length rather than matching on a
+            # prefix hash. Bounded either way: a few hundred bytes, never the file.
+            chunk = os.read(fd, size + 1)
+            return len(chunk) == size and hashlib.sha256(chunk).hexdigest() == sha
         except OSError:
             return False
         finally:
@@ -3820,6 +4292,89 @@ class AcpClient:
             logger.warning("could not clear the stale availableModels wildcard in %s", path)
         return True
 
+    @staticmethod
+    def _claim_pathname_if_ours(path: Path, expectation: tuple[int, str] | None) -> Path | None:
+        """Atomically move *path* aside into a fresh name; return it IFF it is Crew's.
+
+        Closes the window between an ownership check and the delete or overwrite that
+        acts on it. ``_settings_path_holds`` verifies bytes by PATHNAME, but the delete
+        or re-seed then mutates that same pathname a moment later -- and a user who
+        atomically replaced the file in between would have their settings deleted or
+        clobbered. ``os.replace`` captures whatever is at the pathname in ONE atomic
+        step, so verifying the MOVED inode cannot then race: its bytes are fixed. A
+        match is Crew's own seed (the caller deletes or replaces the moved file); a
+        mismatch is a replacement that raced in, and it is put back untouched.
+
+        The capture destination is a FRESH name created by ``mkstemp`` (``O_EXCL``) in
+        the same directory, so it is a pathname this process just created and provably
+        did NOT pre-exist. A fixed sibling name (e.g. ``<name>.crew-gc``) could name a
+        file the project already owns, and ``os.replace`` onto it would clobber that
+        file atomically -- relocating the very data loss this helper prevents one
+        pathname over. ``os.replace`` onto our own fresh temp destroys only the empty
+        temp we just made.
+
+        ``None`` (nothing for the caller to mutate) when the path is gone, cannot be
+        moved, or holds a file that is not Crew's. A crash between the move and the
+        caller's follow-up leaves at most one such ``.crew-gc`` temp beside the target,
+        which the next session's fresh seed ignores.
+        """
+        try:
+            fd, tmp_name = tempfile.mkstemp(
+                dir=str(path.parent), prefix=path.name + ".", suffix=".crew-gc"
+            )
+        except OSError:
+            return None
+        os.close(fd)
+        aside = Path(tmp_name)
+        try:
+            os.replace(path, aside)
+        except OSError:
+            # Nothing to capture (path gone, or it cannot be moved): drop the empty
+            # temp so a refusal never litters a stray file beside the target.
+            with suppress(OSError):
+                aside.unlink()
+            return None
+        if AcpClient._settings_path_holds(aside, expectation):
+            return aside
+        # Not Crew's after all (a replacement raced in, or a symlink O_NOFOLLOW
+        # rejected): restore it exactly as found and touch nothing.
+        try:
+            os.replace(aside, path)
+        except OSError:  # pragma: no cover - defensive; a racing writer took the name
+            logger.warning(
+                "could not restore %s after it proved not to be Crew's; it is at %s",
+                path,
+                aside.name,
+            )
+        return None
+
+    def _expected_settings_fingerprint(self) -> tuple[int, str] | None:
+        """``(size, sha256)`` of the seed Crew believes is at the settings path.
+
+        Session memory first -- authoritative for a file this client just wrote,
+        and available even when the sidecar could not be persisted -- then the
+        durable record in :mod:`kiro_crew.acp.seed_provenance`, which is what lets
+        a seed orphaned by a killed session (or written by an older Crew) still be
+        recognized as Crew's own instead of reading as a stranger's file forever.
+        Both sources prove the same thing the same way: the bytes on disk are the
+        bytes Crew wrote. Neither is a permission to touch an arbitrary path.
+
+        ``None`` means Crew has no claim to check, which callers read as "not
+        ours" -- including the case where the durable record belongs to a SIBLING
+        client still seeding this path in this process, since an orphan is what
+        the record is for. In-memory only, so this stays safe to call from the
+        event loop.
+        """
+        written = getattr(self, "_claude_settings_written", None)
+        if written is not None:
+            payload = written.encode("utf-8")
+            return len(payload), hashlib.sha256(payload).hexdigest()
+        # getattr for the same reason as _reset_state's: tests build clients
+        # without __init__, and a shared "" owner there is a consistent identity.
+        return seed_provenance.recorded(
+            self._claude_local_settings_path(), getattr(self, "_seed_owner", "")
+        )
+
     def _write_claude_local_settings(self) -> None:
         """Seed ``<work_dir>/.claude/settings.local.json`` for this session.
 
@@ -3838,22 +4393,37 @@ class AcpClient:
            spec's ``disabledTools`` cannot ride along in the ``mcpServers`` array,
            and silently dropping a restriction while forwarding the server it
            narrows would widen the tool surface.
-        3. ``availableModels`` plus the resolved ``model``. The adapter merges
+        3. ``availableModels`` plus the resolved ``model``, and ONLY once the
+           backend has actually advertised a list. The adapter merges
            ``availableModels`` union+dedup across every settings source, so a user
            ``~/.claude`` carrying ``['opus','sonnet']`` is enough to collapse a
-           versioned ``[1m]`` id (1M-token window) back to 200K. Writing the full
-           registry allowlist here makes the id resolve by exact match.
+           versioned ``[1m]`` id (1M-token window) back to 200K -- and a
+           registry-derived list seeded here does exactly the same thing to any
+           model the registry has not caught up on. So on a cold advertised-model
+           cache both keys are omitted (the adapter's own provider list is
+           already right) and the re-seed after this session's capture fills them
+           in. See :func:`~kiro_crew.model_registry.seed_available_models`.
 
         **Crew touches only the file it owns.** Ownership is not the path -- a
         path under a checked-out repository is not Crew's to claim -- it is having
-        CREATED the file in this session (``_claude_settings_authored``) AND the
-        bytes on disk still being the ones Crew wrote
-        (``_claude_settings_written``). Both hold: overwrite, which is what lets
-        the model-substitution re-seed change the resolved model instead of
-        re-sending byte-identical params and taking the same advisory again.
-        Either fails: leave the path entirely alone. Absent: create with
-        ``O_EXCL``, so a sibling session racing the same ``work_dir`` loses the
-        create rather than clobbering the winner.
+        CREATED the file (``_claude_settings_authored``, or the durable record in
+        :mod:`kiro_crew.acp.seed_provenance` for a seed an earlier session left
+        behind) AND the bytes on disk still being the ones Crew wrote. Both hold:
+        overwrite by STAGE AND RENAME, which is what lets the model-substitution
+        re-seed change the resolved model instead of re-sending byte-identical
+        params and taking the same advisory again, without a partial write ever
+        being observable at the path. Either fails: leave the path entirely alone.
+        Absent: create with ``O_EXCL``, so a sibling session racing the same
+        ``work_dir`` loses the create rather than clobbering the winner.
+
+        The durable half is what makes the ownership test survive the process. A
+        session killed before ``_reset_state`` leaves its seed on disk, and with a
+        session-scoped test only, every later session read that orphan as a
+        stranger's file and refused to touch it -- so the stale allowlist, stale
+        ``model`` and stale ``permissions.defaultMode`` became permanent, and no
+        amount of re-running Crew could repair them. Recognizing the orphan by
+        digest lets it be re-seeded (or removed on reset) while a genuinely
+        user-authored file is still left exactly as it was.
 
         That is what keeps this seam out of a user's project state: nothing here
         reads, merges into, rewrites or deletes a file Crew did not author, so
@@ -3908,6 +4478,7 @@ class AcpClient:
             )
             self._claude_settings_authored = False
             self._claude_settings_written = None
+            seed_provenance.forget(local_settings, self._seed_owner)
             return
         if not authored and local_settings.exists() and self._clear_stale_wildcard(local_settings):
             # Crew's OWN marker from an earlier session, now cleaned. Settings
@@ -3917,18 +4488,61 @@ class AcpClient:
             # Narrow on purpose: only the exact wildcard is Crew's; a
             # hand-written allowlist is the user's and falls through untouched.
             return
+        # Set only when the live slot was taken from an ORPHAN below, so the write
+        # failure handler knows whether it owes a release().
+        adopted = False
         if not authored and local_settings.exists():
-            # Someone else's file: either the user's own project settings, or a
-            # live sibling session's seed (``work_dir`` is caller-supplied and
-            # every keyless client shares one default). Crew authors neither, so
-            # it touches neither.
-            logger.info(
-                "%s already exists; leaving it as the authoritative project settings. This "
-                "session therefore runs without Crew's availableModels allowlist and without "
-                "the permissions.deny rules from the agent spec.",
-                local_settings,
-            )
-            return
+            # The claim is part of the DECISION, not bookkeeping after it: ownership
+            # is read at a moment, so two clients starting together can both see the
+            # same orphan as adoptable. Only the one that wins the live slot rewrites
+            # it; the loser falls to the leave-it-alone branch below rather than
+            # writing its own permission mode over a session that is already using
+            # the file.
+            if self._claude_settings_is_still_ours() and seed_provenance.claim(
+                local_settings, self._seed_owner
+            ):
+                # Crew's OWN seed, orphaned: a previous session (or an older Crew)
+                # wrote exactly these bytes and never got to clean up -- a kill -9,
+                # a crash, an app replacement. Adopt it and fall through to the
+                # staged re-seed. Adoption is earned by the digest, not by the
+                # path: the durable record alone proves nothing, so a user's own
+                # file (or Crew's file after a user edit) still takes the
+                # leave-it-alone branch below.
+                #
+                # This is also the only way a stale permissions.defaultMode gets
+                # cleaned up. Previously such a file was frozen in place and the
+                # adapter kept reading it, so an inherited bypassPermissions
+                # outlived its session indefinitely; re-seeding overwrites the mode
+                # with THIS session's.
+                logger.info(
+                    "%s holds a settings seed Crew wrote in an earlier session; re-seeding it "
+                    "for this session instead of leaving stale model and permission settings "
+                    "in place.",
+                    local_settings,
+                )
+                # LOCAL only. The instance flag is what reset reads to decide
+                # whether to DELETE this path, and the durable record is what a
+                # later session reads to decide whether to adopt it, so neither
+                # moves until the re-seed below has actually landed: a claim taken
+                # here and a write that then failed would leave reset deleting a
+                # file whose bytes Crew never wrote. The live slot IS taken already
+                # -- ``claim`` above is the race arbiter and has to be -- so the
+                # write is wrapped below to hand it back if it does not land.
+                authored = True
+                adopted = True
+            else:
+                # Someone else's file: either the user's own project settings, or a
+                # live sibling session's seed (``work_dir`` is caller-supplied and
+                # every keyless client shares one default) -- including a sibling that
+                # won the same orphan a moment ago. Crew authors none of those, so it
+                # touches none of them.
+                logger.info(
+                    "%s already exists; leaving it as the authoritative project settings. This "
+                    "session therefore runs without Crew's availableModels allowlist and without "
+                    "the permissions.deny rules from the agent spec.",
+                    local_settings,
+                )
+                return
 
         data: dict[str, Any] = {}
         perms: dict[str, Any] = {}
@@ -3942,59 +4556,24 @@ class AcpClient:
         if perms:
             data["permissions"] = perms
         # Namespace-keyed (claude_code here), the registry index this backend's ids
-        # live in — see _model_registry_namespace. Provider-first: the ids the
-        # backend actually advertised (cached from a prior session/new) when the
-        # cache is warm, so the seed reflects what the account is served and a
-        # served-but-unregistered model gets its real window; the static registry
-        # allowlist is the cold-cache fallback (first-ever session), which is the
-        # exact list shipped before this cache existed.
-        # Fork: the router lane takes NO allowlist. availableModels is read by
-        # the adapter as an org restriction, and a registry allowlist cannot
-        # name a router-namespace id, so writing one makes the adapter refuse
-        # every model the router actually serves ("Model X is restricted by
-        # your organization's settings") and fall back to a Bedrock default
-        # the router then rejects. Verified end-to-end.
-        # Fork: upstream seeds model_registry.seed_available_models() here (its
-        # Bedrock ``global.anthropic.*`` catalog). This fork must NOT: the
-        # adapter reads availableModels literally as an org allowlist, so on the
-        # NATIVE lane a Bedrock list leaves every real id ("opus", "sonnet",
-        # the ids the account actually serves) answering "Invalid value for
-        # config option model" -- the picker shows nothing selectable. Only the
-        # Bedrock/base-URL path gates the 1M window behind the allowlist, and
-        # there the wildcard is what unlocks it. So: wildcard when a base URL is
-        # in play, nothing at all on the native lane.
+        # Fork: two lanes upstream does not have. The ROUTER lane takes no
+        # allowlist at all (availableModels reads as an org restriction, and no
+        # registry list can name a router-namespace id, so the adapter would
+        # refuse every model the router actually serves) and pins the RAW id,
+        # which is the spelling the proxy accepts. The BASE-URL/Bedrock lane
+        # gates the 1M window behind the allowlist, where the wildcard is the
+        # unlock. Everything else falls through to upstream's block below --
+        # which now seeds advertised-only and omits both keys on a cold cache,
+        # so upstream has converged on what this fork needed for the NATIVE lane
+        # and that divergence is gone.
         router_lane = bool(getattr(self, "_model_via_env", False) and self._model)
         has_base_url = bool((self._extra_env or {}).get("ANTHROPIC_BASE_URL"))
         if router_lane:
-            pass  # the router serves its own namespace; any allowlist refuses it
-        elif has_base_url:
-            # Bedrock/base-URL path: the wildcard is what unlocks the 1M window.
-            data["availableModels"] = ["*"]
-        elif model_registry.advertised_models(self._model_registry_namespace):
-            # WARM cache: these are the ids this backend actually served, so the
-            # allowlist is in the right namespace and upstream's window-unlock
-            # works as intended.
-            data["availableModels"] = model_registry.seed_available_models(
-                self._model_registry_namespace
-            )
-        # COLD cache on the native lane: deliberately nothing. Upstream falls back
-        # to the static Bedrock registry here; this fork must not. Native is real
-        # Claude Code on the user's own sign-in, serving Anthropic's short ids, so
-        # a global.anthropic.* allowlist is read as an org restriction that makes
-        # every genuine id answer "Invalid value for config option model" -- the
-        # picker goes empty. Writing nothing lets the adapter advertise the
-        # account's real models, and the first capture warms the cache above.
-        # self._model is a resolved provider id; DEFAULT_MODEL ("auto") is not one,
-        # and omitting the key is what lets the adapter pick the allowlist head.
-        if router_lane:
-            # Fork: pin the RAW id. Claude Code treats this file as
-            # authoritative over ANTHROPIC_MODEL/_meta and forwards the pinned
-            # value verbatim to the proxy, which rejects prefixed spellings.
             data["model"] = strip_router_model_prefix(self._model)
-            # Fork: session-start image guard -- a text-only router model must
-            # never receive image content, including agent-taken screenshots
-            # (computer-use / browser tools return image blocks the SDK
-            # forwards upstream, where the text-only provider rejects them).
+            # Session-start image guard: a text-only router model must never
+            # receive image content, including agent-taken screenshots (browser /
+            # computer-use tools return image blocks the SDK forwards upstream,
+            # where the text-only provider rejects them).
             from kiro_crew.acp.vision import decide_image_input_mode
 
             if (
@@ -4008,32 +4587,207 @@ class AcpClient:
                 disabled = set(data.get("disabledTools") or [])
                 disabled.update(_TEXT_ONLY_DISABLED_TOOLS)
                 data["disabledTools"] = sorted(disabled)
-        elif self._model and self._model != DEFAULT_MODEL:
-            data["model"] = self._model
+        elif has_base_url:
+            data["availableModels"] = ["*"]
+            if self._model and self._model != DEFAULT_MODEL:
+                # Folded by the writer itself, never written bare: an unfolded id
+                # names nothing in the list shipped beside it, which is the exact
+                # shape that resolves back to the base window. Pinned at source by
+                # test_acp_seed_provenance.py::
+                # test_the_written_model_id_is_folded_by_the_writer_itself.
+                data["model"] = model_registry.resolve_wire_model_id(
+                    self._model, self._model_registry_namespace
+                )
+        else:
+            # live in — see _model_registry_namespace. Provider-ONLY: the ids the
+            # backend actually advertised (cached from a prior session/new), so the seed
+            # reflects what the account is served and a served-but-unregistered model
+            # gets its real window. A cold cache returns nothing rather than falling
+            # back to the static registry, and the else branch below omits both model
+            # keys — the adapter's own provider list is already right, and a stale
+            # allowlist merged over it is not.
+            allowlist = model_registry.seed_available_models(self._model_registry_namespace)
+            if allowlist:
+                data["availableModels"] = allowlist
+                # DEFAULT_MODEL ("auto") is not a provider id, and omitting the key is
+                # what lets the adapter pick the allowlist head. Written only ALONGSIDE
+                # the allowlist: a model key that names no entry in the list it ships
+                # with is the exact shape that resolves to the base window.
+                if self._model and self._model != DEFAULT_MODEL:
+                    # Folded onto the advertised spelling HERE rather than trusting a
+                    # caller to have folded self._model first. The re-seed runs beside
+                    # the model-cache persist, which is BEFORE _apply_startup_model, so
+                    # depending on that fold would be an ordering coupling between two
+                    # distant steps -- and the failure it buys is silent (a bare id
+                    # writes a model key that is not in the allowlist beside it, i.e.
+                    # exactly the base-window bug this file exists to close). The
+                    # allowlist above is non-empty here, so the cache is warm and the
+                    # fold is the same one _apply_startup_model and set_model perform.
+                    data["model"] = model_registry.resolve_wire_model_id(
+                        self._model, self._model_registry_namespace
+                    )
+            else:
+                # Cold advertised-model cache -- the first session on this install,
+                # before any session/new has been captured. Both model keys are
+                # OMITTED rather than filled from the static registry, and that is the
+                # fix, not a degradation: the adapter merges availableModels
+                # union+dedup across settings sources, so a partial list here replaces
+                # a correct provider-derived one with a stale one, and a model id that
+                # matches nothing in it resolves to the base window. Writing neither
+                # key leaves the adapter on its own provider list, which already
+                # carries the versioned [1m] ids. This session's capture then warms the
+                # cache and the post-capture re-seed fills both keys in.
+                logger.info(
+                    "advertised-model cache is cold; seeding %s without availableModels/model so "
+                    "claude-agent-acp resolves the model from its own provider list. The re-seed "
+                    "after this session's model capture fills both keys in.",
+                    local_settings,
+                )
 
-        local_settings.parent.mkdir(parents=True, exist_ok=True)
         payload = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
-        # O_EXCL on the create is the whole ownership claim: if a sibling session
-        # (or the user) created the file between the check above and here, this
-        # raises rather than clobbering it. O_TRUNC is the re-seed, and it is
-        # reached only once BOTH ownership tests above passed, so the bytes it
-        # replaces are Crew's own. 0o600 either way -- Crew's own file.
-        flags = os.O_WRONLY | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
-        flags |= os.O_TRUNC if authored else os.O_EXCL
+        # An adoption already holds the path's live slot, because ``claim`` above
+        # has to be the race arbiter -- it cannot be deferred until after a
+        # successful write without letting two clients both decide the same orphan
+        # is theirs. So if the write does NOT land, the slot has to go back: a claim
+        # kept by a client that wrote nothing makes the orphan permanently
+        # unadoptable for the rest of the process (``recorded`` reports it as a live
+        # session's file), and an orphan that cannot be adopted cannot be repaired
+        # or deleted -- so a stale ``bypassPermissions`` in it would simply stay.
+        # BaseException, not Exception: a CancelledError or a KeyboardInterrupt
+        # through here wedges the slot exactly the same way. The record is left
+        # alone (``release``, not ``forget``): it is what keeps the path adoptable.
+        # The re-seed moves Crew's current file aside before overwriting, so this
+        # holds it for the ``except`` to restore if the write does not land.
+        reseed_aside: Path | None = None
         try:
-            fd = os.open(local_settings, flags, 0o600)
-        except FileExistsError:
-            logger.info("%s was created concurrently; leaving it alone", local_settings)
+            local_settings.parent.mkdir(parents=True, exist_ok=True)
+            # BYTES on both branches, never text mode: Python's text layer rewrites
+            # "\n" to "\r\n" on Windows, so the file on disk was LARGER than the
+            # payload and no longer the bytes this session recorded. The ownership
+            # check compares exact bytes, so that translation made every Windows
+            # session read as "not ours" -- the re-seed declined, reset never removed
+            # its own file, and the MCP array was withheld. 0o600 either way.
+            if authored:
+                # The re-seed of a file Crew owns, STAGED AND RENAMED rather than
+                # truncated in place. O_TRUNC destroyed the recorded bytes before the
+                # new ones landed, so a write that failed part-way (ENOSPC, EIO, a
+                # kill between truncate and write) left the adapter reading a
+                # truncated settings file AND a durable record whose digest matched
+                # nothing on disk -- unclaimable by every later session, which is the
+                # exact failure this module exists to remove. A temp + rename leaves
+                # the old, still-recorded bytes intact on failure, so the path is
+                # adopted again next time. The rename replaces a link at the leaf
+                # rather than refusing it (no O_NOFOLLOW to pass), which costs
+                # nothing here: this branch is reached only for a path whose bytes
+                # just matched Crew's record, i.e. one
+                # _claude_settings_is_still_ours() read as a REGULAR file a moment
+                # ago.
+                #
+                # INODE-PINNED: the ownership check above and this overwrite act on
+                # the same PATHNAME, and a user who atomically replaced the file in
+                # the gap would have their settings clobbered by the rename. Moving
+                # Crew's current file aside captures it in one atomic step; the write
+                # only proceeds when the MOVED inode is still Crew's, so a replacement
+                # that raced in is detected and left in place instead.
+                reseed_aside = self._claim_pathname_if_ours(
+                    local_settings, self._expected_settings_fingerprint()
+                )
+                if reseed_aside is None:
+                    logger.info(
+                        "%s was replaced just before the re-seed; leaving it in place and "
+                        "dropping Crew's claim rather than clobbering it. This session runs "
+                        "without Crew's availableModels allowlist and without the "
+                        "permissions.deny rules from the agent spec.",
+                        local_settings,
+                    )
+                    # Adopted this session -> only the live slot is ours to hand back;
+                    # a file Crew already owned but that is now the user's -> forget the
+                    # durable record too, exactly as the replaced-after-create branch does.
+                    if adopted:
+                        seed_provenance.release(local_settings, self._seed_owner)
+                    else:
+                        seed_provenance.forget(local_settings, self._seed_owner)
+                    self._claude_settings_authored = False
+                    self._claude_settings_written = None
+                    return
+                atomic_write(local_settings, payload.encode("utf-8"), mode=0o600)
+                # New payload is published; drop the moved old seed. Best-effort: a
+                # leftover ``.crew-gc`` is litter the next fresh seed ignores, not a
+                # reason to fail a write that already landed.
+                with suppress(OSError):
+                    reseed_aside.unlink(missing_ok=True)
+                reseed_aside = None
+            else:
+                # O_EXCL on the create is the whole ownership claim: if a sibling
+                # session (or the user) created the file between the check above and
+                # here, this raises rather than clobbering it. That is why the create
+                # keeps a direct open instead of joining the branch above --
+                # atomic_write publishes with a rename, which replaces whatever is at
+                # the name and so cannot arbitrate a create race at all.
+                flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+                try:
+                    fd = os.open(local_settings, flags, 0o600)
+                except FileExistsError:
+                    logger.info("%s was created concurrently; leaving it alone", local_settings)
+                    return
+                with os.fdopen(fd, "wb") as handle:
+                    handle.write(payload.encode("utf-8"))
+        except BaseException:
+            if reseed_aside is not None:
+                # The overwrite did not land after Crew's file was moved aside, so the
+                # pathname is empty and the recorded bytes are at ``reseed_aside``.
+                # Put them back so the path stays the adoptable orphan it was before.
+                with suppress(OSError):
+                    if local_settings.exists():
+                        reseed_aside.unlink(missing_ok=True)
+                    else:
+                        os.replace(reseed_aside, local_settings)
+            if adopted:
+                logger.info(
+                    "re-seed of the orphaned settings seed at %s did not land; releasing the "
+                    "claim so a later session can still adopt and repair it",
+                    local_settings,
+                )
+                seed_provenance.release(local_settings, self._seed_owner)
+            raise
+        # Durable half of the same claim, so the NEXT process can still recognize
+        # this file as Crew's after a kill that skips the reset path.
+        #
+        # NOT best-effort, and taken BEFORE the instance flags rather than after.
+        # An unrecorded seed is the one state nothing on the host can repair: this
+        # session would still unlink it, but a kill before teardown leaves a
+        # ``permissions.defaultMode`` the user never approved behind a file no later
+        # session is permitted to re-seed or remove, because ownership is the record.
+        # So if the grant cannot be made durable the seed is WITHDRAWN rather than
+        # left behind -- the session then runs on the adapter's own defaults, which
+        # is the same thing a cold advertised-model cache already does.
+        if not seed_provenance.record(local_settings, payload, self._seed_owner):
+            logger.warning(
+                "could not durably record Crew's claim on %s; removing the seed just written "
+                "rather than leaving a permission mode no later session is allowed to clean "
+                "up. This session runs without Crew's availableModels allowlist and without "
+                "the permissions.deny rules from the agent spec.",
+                local_settings,
+            )
+            # Safe to remove precisely because we are inside the branch that proved
+            # ownership a moment ago: either O_EXCL created the file, or its bytes
+            # matched Crew's record and this client holds the live claim.
+            with suppress(OSError):
+                local_settings.unlink(missing_ok=True)
+            if not seed_provenance.forget(local_settings, self._seed_owner):
+                # The sidecar is unwritable, which is why we are here at all. It
+                # still names the PREVIOUS digest, and the file it described is now
+                # gone, so ``_persist``'s prune drops the entry on the next
+                # successful write and nothing matches it in the meantime. Hand the
+                # live slot back so a replacement client in this process is not
+                # wedged behind a claim nobody is using.
+                seed_provenance.release(local_settings, self._seed_owner)
             return
-        # BINARY, not text mode: Python's text layer rewrites "\n" to "\r\n" on
-        # Windows, so the file on disk was LARGER than the payload and no longer the
-        # bytes this session recorded. The ownership check compares exact bytes, so
-        # that translation made every Windows session read as "not ours" -- the
-        # re-seed declined, reset never removed its own file, and the MCP array was
-        # withheld. Writing bytes keeps one canonical form on every platform.
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(payload.encode("utf-8"))
         # Only a file Crew created AND still owns is ever overwritten or removed.
+        # Set AFTER the write and after the durable record, so a failure in either
+        # propagates with the claim exactly as it was: an adoption leaves no instance
+        # flag for reset to act on, and a re-seed of Crew's own file leaves the
+        # record describing the bytes that are still on disk.
         self._claude_settings_authored = True
         self._claude_settings_written = payload
 
@@ -4170,8 +4924,13 @@ class AcpClient:
                 model_id, self._model_registry_namespace
             )
         if self.backend in ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION:
+            # Fork: the ROUTER lane pins its model through settings.local.json,
+            # not through session/set_config_option -- the router serves its own
+            # namespace and rejects the config-option spelling. Guard retained
+            # around upstream's new push helper rather than around the old raw
+            # set_config_option call.
             if not getattr(self, "_model_via_env", False):
-                await self.set_config_option("model", model_id)
+                model_id = await self._push_model_config_option(model_id, strict=True)
         else:
             await self._send_request(
                 METHOD_SET_MODEL,
@@ -4272,7 +5031,7 @@ class AcpClient:
 
         Fork: on the custom-base-URL (router) path the adapter advertises its
         OWN Bedrock catalog (claude-opus-4.6, claude-sonnet-4.5, ...) which the
-        router does not serve — picking one in the dashboard dropdown would
+        router does not serve -- picking one in the dashboard dropdown would
         fail with "model not available". Instead, fetch the router's real
         catalog from ``GET {base_url}/v1/models`` and advertise THAT, so the
         GUI model picker lists exactly the models that actually run.
@@ -4280,55 +5039,85 @@ class AcpClient:
         if getattr(self, "_model_via_env", False):
             self._capture_router_models()
             return
-        # A missing/!dict `models` block is the native lane's shape, not an
-        # error: the choices live in `configOptions` there, so carry on to the
-        # fallback below instead of returning with an empty picker.
         models = session_resp.get("models")
-        captured: list[dict[str, str]] = []
-        if isinstance(models, dict):
-            current_model_id = models.get("currentModelId")
-            if isinstance(current_model_id, str) and current_model_id:
-                self._resolved_model_id = current_model_id
-            # Imported lazily: acp.session_handle imports this module at module
-            # level, so a top-level import here would be a cycle.
-            from kiro_crew.acp.session_handle import parse_advertised_models
+        if not isinstance(models, dict):
+            # Adapters that omit `models` still advertise via configOptions --
+            # the native claude lane's shape. Upstream now synthesises the same
+            # envelope here, so the fork's separate configOptions fallback is
+            # gone: this IS that fix, just expressed as an envelope.
+            models = self._models_from_config_options(session_resp)
+            if models is None:
+                return
+        current_model_id = models.get("currentModelId")
+        if isinstance(current_model_id, str) and current_model_id:
+            self._resolved_model_id = current_model_id
+        # Imported lazily: acp.session_handle imports this module at module
+        # level, so a top-level import here would be a cycle.
+        from kiro_crew.acp.session_handle import parse_advertised_models
 
-            # Parse the gated sub-payload, not the whole response: the parser's
-            # dict-or-list fallback would otherwise let an EMPTY (falsy) models
-            # object fall through to a top-level ``availableModels`` key.
-            captured = parse_advertised_models({"models": models})
-        if not captured:
-            # Fork: claude-agent-acp does not always fill `models`; on the
-            # native lane (no router, the user's own Claude Code sign-in) it
-            # advertises the selectable set under `configOptions` instead, as
-            # the option whose id is "model". Without reading that the picker
-            # fell back to the registry's Bedrock spellings, which the adapter
-            # rejects outright ("Invalid value for config option model:
-            # global.anthropic.claude-opus-4-8[1m]") -- i.e. no model on the
-            # native lane could actually be chosen.
-            #
-            # Deliberately NOT behind upstream's early `return` on a non-dict
-            # `models`: that is precisely the native-lane shape, so returning
-            # there would skip this fallback and re-break it.
-            captured = self._models_from_config_options(session_resp)
+        # Parse the gated sub-payload, not the whole response: the parser's
+        # dict-or-list fallback would otherwise let an EMPTY (falsy) models
+        # object fall through to a top-level ``availableModels`` key, sourcing
+        # the list from a payload the dict gate above never saw.
+        captured = parse_advertised_models({"models": models})
         if captured:
             self._available_models = captured
+            # Fork: the picker reads this flag; without it the dropdown stays empty.
             self._modes_advertised = True
             # Feed the discovered ids into the cross-session provider-model cache
             # so the next session's settings seed can source availableModels (and
             # the wire model id) from what this backend actually serves rather
-            # than the static registry. In-memory + synchronous here (cheap, and
-            # this method is sync); the disk persist is offloaded by the async
-            # caller when this reports a change. Gated on capability, not on
-            # ``_is_claude`` (harness-parity H6): kiro-cli reaches its models via
-            # --agent and its windows via the --list-models cache, so it is not a
-            # member and feeds nothing; a future adapter with the same served-vs-
-            # stored spelling gap opts into the set and is fed here automatically,
-            # keyed by its own registry namespace.
+            # than the static registry.
             if self._uses_advertised_model_selection:
                 self._advertised_models_changed = model_registry.refresh_advertised_models(
                     self._model_registry_namespace, self._advertised_model_ids()
                 )
+
+    def _models_from_config_options(self, session_resp: dict) -> dict | None:
+        """Synthesize a ``models`` envelope from a configOptions model select, or None."""
+        if not self._uses_advertised_model_selection:
+            return None
+        for opt in session_resp.get("configOptions") or []:
+            # Fork: ``type`` is accepted when ABSENT as well as "select". The
+            # native claude lane advertises its model option with no ``type`` at
+            # all, so requiring "select" put the picker back to empty -- the exact
+            # bug this path exists to fix (test_router_auto_and_catalog.py::
+            # test_config_options_are_read_when_the_session_advertises_no_models).
+            if isinstance(opt, dict) and opt.get("id") == "model" and opt.get("type") in (
+                None,
+                "select",
+            ):
+                # Fork: the option carries either a flat ``options`` list or GROUPED
+                # entries that each hold their own ``options``. The adapter flattens
+                # both the same way before validating a value, so mirror that --
+                # otherwise a grouped payload yields zero selectable models.
+                flat: list = []
+                for entry in opt.get("options") or []:
+                    if not isinstance(entry, dict):
+                        continue
+                    nested = entry.get("options")
+                    if isinstance(nested, list):
+                        flat.extend(n for n in nested if isinstance(n, dict))
+                    else:
+                        flat.append(entry)
+                options = [o for o in flat if o.get("value")]
+                if not options:
+                    return None
+                envelope: dict = {
+                    "availableModels": [
+                        {
+                            "modelId": o["value"],
+                            "name": o.get("name") or o["value"],
+                            "description": o.get("description") or "",
+                        }
+                        for o in options
+                    ]
+                }
+                current = opt.get("currentValue")
+                if isinstance(current, str) and current:
+                    envelope["currentModelId"] = current
+                return envelope
+        return None
 
     async def _persist_advertised_models_if_changed(self) -> None:
         """Offload a disk persist of the provider-model cache when it changed.
@@ -4344,47 +5133,6 @@ class AcpClient:
             return
         self._advertised_models_changed = False
         await asyncio.to_thread(model_registry.persist_advertised_models)
-
-    @staticmethod
-    def _models_from_config_options(session_resp: dict) -> list[dict[str, str]]:
-        """Model choices from a session's ``configOptions``, or ``[]``.
-
-        The option carries either a flat ``options`` list or grouped entries
-        that each hold their own ``options`` (the adapter flattens both the
-        same way before validating a value), so this mirrors that flattening —
-        anything it offers is exactly what ``session/set_config_option``
-        accepts.
-        """
-        opts = session_resp.get("configOptions")
-        if not isinstance(opts, list):
-            return []
-        out: list[dict[str, str]] = []
-        for option in opts:
-            if not isinstance(option, dict) or option.get("id") != "model":
-                continue
-            entries = option.get("options")
-            if not isinstance(entries, list):
-                continue
-            flat: list[dict] = []
-            for entry in entries:
-                if not isinstance(entry, dict):
-                    continue
-                nested = entry.get("options")
-                flat.extend(n for n in nested if isinstance(n, dict)) if isinstance(
-                    nested, list
-                ) else flat.append(entry)
-            for entry in flat:
-                value = entry.get("value") or ""
-                if not value:
-                    continue
-                out.append(
-                    {
-                        "modelId": value,
-                        "name": entry.get("name") or value,
-                        "description": entry.get("description") or "",
-                    }
-                )
-        return out
 
     def _capture_router_models(self) -> None:
         """Advertise the router's own catalog (custom base URL path).
@@ -4495,6 +5243,122 @@ class AcpClient:
         """
         return model_is_unusable(model_id, self._advertised_model_ids())
 
+    @staticmethod
+    def _model_config_candidates(model_id: str) -> list[str]:
+        """Ordered fallback spellings for a config-option model push.
+
+        The cold-cache companion to :func:`resolve_wire_model_id`'s fold: with
+        an empty advertised cache there is nothing to fold against, so a
+        prefixed ``[1m]`` id would otherwise reach the wire verbatim. Candidates
+        are derived from the id itself — verbatim, then prefix-stripped, then
+        prefix- and window-stripped — and the adapter judges each; it knows
+        what it accepts.
+        """
+        out = [model_id]
+        stripped = model_registry.strip_provider_id_prefix(model_id)
+        if stripped != model_id:
+            out.append(stripped)
+        bare = stripped.replace("[1m]", "")
+        if bare != stripped:
+            out.append(bare)
+        return out
+
+    async def _push_model_config_option(self, model_id: str, *, strict: bool) -> str:
+        """Push ``model`` over ``session/set_config_option`` with cold-cache fallback.
+
+        The value-rejection twin of ``_set_effort_config_option``'s ladder in
+        ``providers.acp``: a model the adapter refuses must not bubble up as a
+        generic ``AcpError`` — that failure path resets the session and drops
+        the user onto the adapter default with no explanation. Each candidate
+        spelling is tried in turn; the first accepted one wins and is returned
+        so the caller records the spelling that actually went on the wire.
+
+        ``strict=True`` (an explicit user pick, ``set_model``) raises
+        ``AcpModelUnavailable`` when every candidate is refused — a silent
+        downgrade would report success while running something else.
+        ``strict=False`` (startup application of an inherited value) returns
+        ``""`` so the caller stays on the backend default, mirroring the
+        withhold contract in :meth:`_apply_startup_model`.
+        """
+        last_exc: AcpError | None = None
+        for cand in self._model_config_candidates(model_id):
+            try:
+                await self.set_config_option("model", cand)
+            except AcpError as exc:
+                msg = str(exc)
+                lowered = msg.lower()
+                if "unknown config option" in lowered:
+                    # No 'model' config option at all (other adapter build):
+                    # retrying spellings cannot help.
+                    if strict:
+                        raise
+                    logger.debug("adapter exposes no 'model' config option; skipping model push")
+                    return ""
+                if "config option model" not in lowered:
+                    raise  # transport/protocol failure — not a value rejection
+                last_exc = exc
+                continue
+            if cand != model_id:
+                logger.info(
+                    "ACP model %r rejected by the adapter; applied fallback spelling %r",
+                    model_id,
+                    cand,
+                )
+            return cand
+        _rejected_log, _ = redact_exfiltration_urls(str(model_id))
+        _rejected_log, _ = redact_credentials(_rejected_log)
+        if strict:
+            raise AcpModelUnavailable(_rejected_log, self._advertised_model_ids()) from last_exc
+        logger.warning(
+            "ACP model %s rejected by the adapter; staying on the backend default %s",
+            _rejected_log,
+            self._resolved_model_id or DEFAULT_MODEL,
+        )
+        return ""
+
+    async def _ensure_served_default(self) -> None:
+        """Move an inheriting session off a backend default it cannot run.
+
+        The companion to :meth:`_apply_startup_model`'s withhold: that one keeps
+        an unusable PIN off the wire, this one keeps an unusable INHERITED
+        default off the session. Both exits of that method leave the session on
+        whatever ``session/new`` assigned, and nothing else checks that id
+        against the list the same response advertised — so a partition whose
+        default is not in its own served list runs a session that fails on its
+        first prompt.
+
+        Only the kiro backend: its advertised ids are exactly the ids
+        ``session/set_model`` accepts, so "absent from the list" genuinely means
+        unusable. The claude backend advertises a different namespace than the
+        model it runs and announces its own substitutions instead.
+
+        ``self._model`` is deliberately left alone. ``""``/``"auto"`` there mean
+        "inherit" to every reader of that field (the settings seed, the
+        warm-pool re-apply), and this session IS still inheriting — the wire is
+        corrected, the intent is not rewritten.
+        """
+        if self._is_kiro:
+            advertised = self._advertised_model_ids()
+            unserved = self._resolved_model_id or ""
+            fallback = pick_served_default(unserved, advertised)
+            if not fallback:
+                return
+            _unserved_log = redact_log_via_context(str(unserved))
+            # The kiro gate also fixes the wire: kiro-cli takes the model via
+            # ``session/set_model``, never via a session config option.
+            await self._send_request(
+                METHOD_SET_MODEL,
+                {"sessionId": self._session_id, "modelId": fallback},
+            )
+            self._resolved_model_id = fallback
+            logger.warning(
+                "ACP backend default %s is not in this account's served list (advertised: %s); "
+                "switched the session to %s",
+                _unserved_log,
+                ", ".join(advertised),
+                fallback,
+            )
+
     async def _apply_startup_model(self) -> None:
         """Apply the configured model to a freshly initialized session.
 
@@ -4516,9 +5380,23 @@ class AcpClient:
         An EXPLICIT switch is handled the opposite way in :meth:`set_model`:
         there the user asked for that exact model, and quietly running another
         one would be a lie.
+
+        The fold onto the advertised spelling happens HERE, not only at spawn: by
+        this point ``session/new`` has been captured, so the advertised-model cache
+        is warm even on the first-ever session -- whereas the spawn-time fold ran
+        against a cold cache and was a no-op, sending a bare id that resolves to
+        the base window. Same call as :meth:`set_model` uses, so an explicit switch
+        and a startup application agree on one exact spelling.
         """
+        if self._uses_advertised_model_selection:
+            self._model = model_registry.resolve_wire_model_id(
+                self._model, self._model_registry_namespace
+            )
         if not self._model or self._model == DEFAULT_MODEL:
             logger.info("ACP model: %s (from agent config)", self._model or "auto")
+            # Inheriting is only safe when the inherited model is served; the
+            # backend can default to one this partition does not carry.
+            await self._ensure_served_default()
             return
         if self._is_kiro and self._model_is_unusable(self._model):
             # A literal miss can be a stale ``<namespace>::`` qualifier on a
@@ -4551,16 +5429,69 @@ class AcpClient:
                 # warm-pool re-apply path reads (session_provider), so leaving the
                 # unusable id here would re-offer it on every claim.
                 self._model = DEFAULT_MODEL
+                # Now inheriting, so the same served-default check applies: the
+                # default we fall back to can itself be one the account lacks.
+                await self._ensure_served_default()
                 return
         if self.backend in ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION:
+            # Fork: router lane pins via settings.local.json (see above), so it
+            # must not push a config option here either.
             if not getattr(self, "_model_via_env", False):
-                await self.set_config_option("model", self._model)
+                sent = await self._push_model_config_option(self._model, strict=False)
+                if not sent:
+                    # Every spelling refused: record the session as running the
+                    # default (the warm-pool re-apply path reads this field, so
+                    # leaving the refused id here would re-offer it every claim)
+                    # and let session/new's own model stand.
+                    self._model = DEFAULT_MODEL
+                    return
+                self._model = sent
         else:
             await self._send_request(
                 METHOD_SET_MODEL,
                 {"sessionId": self._session_id, "modelId": self._wire_model_id(self._model)},
             )
         logger.info("ACP model: %s", self._model)
+
+    async def _reseed_after_capture(self) -> None:
+        """Re-seed settings.local.json once the backend's model list is known.
+
+        The spawn-time seed necessarily runs BEFORE ``session/new`` --
+        ``permissions.defaultMode`` and ``permissions.deny`` have to be on disk by
+        the time the adapter builds its ``SettingsManager``. That is exactly why it
+        cannot write the model keys on a first-ever session: the advertised-model
+        cache is still cold, and the only list available to it would be a guessed
+        one. So the model half of the seed lands here instead, once
+        ``_capture_available_models`` has warmed that cache — which is what makes
+        the file name a model actually IN the allowlist shipped beside it.
+
+        Before this step existed the seed was written once, before capture, and
+        never revisited: session 1 wrote a registry-derived list and session 2 (see
+        :mod:`kiro_crew.acp.seed_provenance`) was not even allowed to correct it.
+
+        **Called from the pre-existing ``_uses_advertised_model_selection`` branch
+        beside the model-cache persist, NOT from a step of its own.** Adding a step
+        to :meth:`_initialize_session` would put a new conditional and a new await
+        on the first-class Kiro construction path in service of an adapter, which
+        harness-parity H13 forbids however the predicate is spelled -- the test is
+        not whether the Kiro path still works, it is whether it changed at all.
+        Riding a branch that already exists changes no line Kiro executes, and it
+        is the honest home for the work besides: this method exists BECAUSE the
+        backend advertises its own model list, which is the very capability that
+        branch tests.
+
+        The two capability sets are independent opt-ins, though, so the seeding
+        half is tested here rather than assumed from the caller's gate.
+
+        Off-loop (touches disk), and a failure costs model fidelity, not the
+        session.
+        """
+        if not self._seeds_local_settings:
+            return
+        try:
+            await asyncio.to_thread(self._write_claude_local_settings)
+        except (OSError, ValueError, TypeError):
+            logger.warning("post-capture re-seed of settings.local.json failed", exc_info=True)
 
     async def set_config_option(self, config_id: str, value: str) -> None:
         """Set a session config option (e.g. effort level) via session/set_config_option."""
@@ -4783,6 +5714,11 @@ class AcpClient:
             await self._kill_process(force=True)
         finally:
             await self._discard_bound_workspace()
+            # A failed startup that already wrote the seed owns one too, and the
+            # session it belonged to is over -- so it is discarded on exactly the
+            # terms a graceful shutdown uses. In the `finally` for the same reason
+            # the caller puts `_reset_state` in one: this is the last chance.
+            await self._discard_claude_settings_seed()
 
     async def _to_thread_guarding_sandbox(
         self, fn: Callable[..., _T], /, *args: Any, **kwargs: Any
@@ -4826,6 +5762,7 @@ class AcpClient:
         # kiro construction path gains no conditional, no awaited step and no new
         # failure point in service of an adapter (harness-parity H13).
         adapter_hidden_dirs: tuple[str, ...] = ()
+        adapter_expose: tuple[str, ...] = ()
 
         if self._is_claude:
             # Fold the requested model onto the exact spelling claude-agent-acp
@@ -4833,10 +5770,10 @@ class AcpClient:
             # prior session's _capture_available_models), so a model the static
             # registry does not carry still resolves to the versioned [1m] id the
             # backend serves rather than a bare form that collapses to the base
-            # window. Done here so BOTH the seed below and _apply_startup_model's
-            # set_model read the same id. No-op on a cold cache (first-ever
-            # session): the registry fallback in the seed still applies and this
-            # session's own capture warms the cache for the next one.
+            # window. Done here so the seed below carries the same id the wire
+            # will. No-op on a cold cache (first-ever session), which is why
+            # _apply_startup_model folds AGAIN after session/new has warmed the
+            # cache, and why the seed omits the model key entirely until then.
             self._model = model_registry.resolve_wire_model_id(
                 self._model, self._model_registry_namespace
             )
@@ -4897,8 +5834,10 @@ class AcpClient:
                 )
             argv = [*opencode_argv, "acp"]
         elif self._is_codex:
-            # Dormant seam — see method docstring. codex-acp takes no argv of its
-            # own: the adapter is spawned bare and driven entirely over the pipe,
+            # Selectable on a public build (BASELINE_SELECTABLE_BACKENDS), so this
+            # branch runs for real users; what is unwritten is the session MCP array
+            # (_codex_session_mcp_servers), not the spawn. codex-acp takes no argv of
+            # its own: the adapter is spawned bare and driven entirely over the pipe,
             # so unlike the kiro branch there is nothing to append. CODEX_PATH is
             # left exactly as the operator set it (the adapter ships its own Codex
             # binary; overriding it is an explicit choice, never a default).
@@ -4936,10 +5875,17 @@ class AcpClient:
             # OFF-LOOP: both halves touch the filesystem -- the refusal probes for
             # a sandbox backend (a cold probe shells out via subprocess.run) and
             # the mask resolves the home plus every env-override root -- so they
-            # run in ONE worker thread rather than blocking the gateway loop.
-            adapter_hidden_dirs = await asyncio.to_thread(
+            # run in ONE worker thread rather than blocking the gateway loop, and
+            # the wait is bounded (a stalled mount otherwise held the spawn open
+            # until the startup watchdog; found in review).
+            adapter_hidden_dirs = await _run_preflight_bounded(
                 _sandbox_preflight, self.backend, self._sandbox_mode
             )
+            # The other half of the Bedrock trade: ``.aws`` stays in the mask
+            # above and only ``.aws/config`` comes back read-only, through each
+            # backend's own carve-out primitive. Empty for every unenforced
+            # harness. Pure path projection, no disk access, so no thread hop.
+            adapter_expose = acp_tool_gate.adapter_expose_files(self.backend)
         else:
             # Pin ONE reading of the environment for both the search and the
             # message that reports it. The previous code resolved against the live
@@ -4986,6 +5932,14 @@ class AcpClient:
         # Crew's seatbelt on macOS and grants Windows's Kiro-only delegation in
         # favour of the harness's own internal sandbox, so a harness without one
         # must never be granted it by the absence of another harness.
+        #
+        # Inside a pod both answers come from apply_pod_bundle_spawn, which is
+        # where the ONE reason lives: the pod HOME remap breaks the toolbox shim's
+        # own sandbox, so the child runs the bundle binary and Crew's launcher
+        # wraps it. Off-loop because the resolution stats the candidate path.
+        argv, delegate_internal_sandbox = await asyncio.to_thread(
+            apply_pod_bundle_spawn, argv, backend=self.backend
+        )
         argv, self._sandbox_cleanup = await wrap_argv_async(
             argv,
             mode=self._sandbox_mode,
@@ -4994,7 +5948,8 @@ class AcpClient:
             # that an enforced adapter has no claim on. Empty for every harness
             # this core does not enforce, so their spawn arguments are unchanged.
             extra_hidden_dirs=adapter_hidden_dirs,
-            is_kiro_cli=self.backend in ACP_BACKENDS_INTERNAL_SANDBOX,
+            extra_expose_files=adapter_expose,
+            is_kiro_cli=delegate_internal_sandbox,
             _prepare=wrap_argv,
         )
         # cgroup v2 scope (OUTERMOST): bound this agent + all its MCP-server /
@@ -5087,6 +6042,18 @@ class AcpClient:
         # cannot reintroduce a denied pointer; KIRO_API_KEY remains available only
         # to the positively identified Kiro backend.
         env = scrub_agent_subprocess_env(env)
+        # Pod-scoped kiro-cli children write their OWN MCP OAuth grants,
+        # confined to the pod's tree instead of the real host's -- see
+        # _apply_pod_home_remap's docstring. No-op outside a pod
+        # (KIROCREW_POD is not exactly "1") and for every harness outside
+        # ACP_BACKENDS_POD_HOME_REMAP, which is deliberately its own set rather
+        # than the internal-sandbox one (H6). Kept AFTER
+        # scrub_agent_subprocess_env: neither HOME nor the AWS credential-file
+        # pointers are in that scrub's denied-prefix set, so ordering is not
+        # load-bearing here, but placing it beside every other
+        # identity-affecting mutation on this env keeps the sequence readable
+        # as one pass rather than two.
+        env = _apply_pod_home_remap(env, pod_home_remap=self.backend in ACP_BACKENDS_POD_HOME_REMAP)
         # Positive-identity marker for the orphan sweep: kiro-cli and every MCP
         # server it spawns inherit this, so escaped launcher trees (``npx
         # @playwright/mcp`` -> node) are identifiable as ours.
@@ -5447,6 +6414,139 @@ class AcpClient:
         retiring = getattr(self, "_liveness_oracle", None)
         self._liveness_oracle = retiring.fresh() if retiring is not None else LivenessOracle()
 
+    async def _discard_claude_settings_seed(self) -> None:
+        """Remove the ``settings.local.json`` THIS session seeded, off the loop.
+
+        So a permission mode never outlives its session and an inherited
+        ``bypassPermissions`` cannot persist after a crash. Only a file Crew
+        created AND still owns is removed: the writer declines a path that already
+        holds a foreign file, and the content check below covers the remaining
+        case -- a user replacing Crew's file atomically after the create, whose
+        replacement is theirs to keep (see ``_write_claude_local_settings``).
+
+        Async, because the disk half is blocking and this is teardown on the event
+        loop: the ownership hash, the durable revoke and the unlink all block, and a
+        heartbeat must not queue behind them. ``_reset_state`` keeps only the
+        in-memory ``release``.
+
+        **The whole disk half is ONE shielded thread, not a sequence of awaited
+        steps, and that is the cancellation contract.** Teardown runs on paths that
+        are themselves being cancelled -- a turn cancel, a session close, a
+        shutdown -- and a suspension point between the ownership check, the revoke
+        and the unlink meant a cancellation could land with the claim already
+        revoked and the file still on disk. That is the one state nothing can
+        repair: unrecorded bytes carrying a ``permissions.defaultMode`` that no
+        later session is permitted to touch. A thread cannot be interrupted
+        part-way, so the transaction has either not started or run to completion,
+        and ``asyncio.shield`` is what keeps a cancelled awaiter from abandoning it
+        before it is scheduled. Every caller pairs this with ``_reset_state`` in a
+        ``finally`` for the mirror-image reason: the in-memory reset must happen
+        even when the await is cancelled.
+        """
+        if not getattr(self, "_claude_settings_authored", False):
+            return
+        # Captured HERE, on the loop, so the transaction is a pure function of its
+        # arguments: the ``finally`` below may clear these flags while the thread is
+        # still running, and a transaction that re-read them could decide ownership
+        # against state that changed underneath it.
+        path = self._claude_local_settings_path()
+        owner = getattr(self, "_seed_owner", "")
+        payload = getattr(self, "_claude_settings_written", None)
+        expectation = self._expected_settings_fingerprint()
+        # A task rather than a bare coroutine: ``shield`` protects a future that
+        # already exists, and the point is that this one is scheduled and therefore
+        # WILL run even if the cancellation arrives before the first step. Needs no
+        # done-callback to consume an exception because the transaction contracts
+        # never to raise -- which is also what keeps a cancelled awaiter from
+        # leaving an unretrieved error behind.
+        settle = asyncio.ensure_future(
+            asyncio.to_thread(self._settle_claude_settings_seed, path, owner, payload, expectation)
+        )
+        try:
+            await asyncio.shield(settle)
+        finally:
+            self._claude_settings_authored = False
+            self._claude_settings_written = None
+
+    def _settle_claude_settings_seed(
+        self,
+        path: Path,
+        owner: str,
+        payload: str | None,
+        expectation: tuple[int, str] | None,
+    ) -> None:
+        """The seed's entire disk half, as one blocking transaction. Never raises.
+
+        **The pathname is claimed by an atomic move-aside, THEN revoked, THEN the
+        moved inode is deleted.** Verifying ownership by pathname and then unlinking
+        that pathname is a TOCTOU: a user who atomically replaced the file in the gap
+        (which this transaction widens, since the revoke now takes a cross-process
+        lock and writes) would have their settings deleted. ``_claim_pathname_if_ours``
+        closes it -- ``os.replace`` captures the file into ``aside`` in one step, and
+        only that fixed inode is ever deleted; a replacement that raced in is detected
+        and left in place. The revoke still happens BEFORE the delete: ``forget``
+        reports whether the sidecar on disk actually stopped naming the path, and
+        deleting first would let a failed sidecar write leave a record that outlives
+        its file, so the next process adopts, rewrites and deletes a byte-identical
+        copy the user had restored. On a failed revoke the moved file is restored
+        under its pathname, so a later session repairs the orphan.
+
+        Never raises, because the caller shields it: an exception here would reach
+        nobody but the "never retrieved" logger, and a half-settled transaction that
+        also lost its error is worse than one that logged and left the file owned.
+        """
+        try:
+            aside = self._claim_pathname_if_ours(path, expectation)
+            if aside is None:
+                logger.info(
+                    "%s no longer holds the bytes Crew wrote; leaving the replacement in "
+                    "place instead of deleting a file Crew does not own.",
+                    path,
+                )
+                return
+            # The file is now the moved inode ``aside`` and the pathname is free, so a
+            # user replacement racing in lands at a fresh ``path`` this never touches.
+            if not seed_provenance.forget(path, owner):
+                # Not revoked on disk, so the file must stay: a restart would still
+                # read Crew as its owner, and a later session repairs it. Restore it
+                # under the pathname and hand back the live claim.
+                logger.warning(
+                    "could not durably revoke Crew's claim on %s; restoring the file so a "
+                    "later session can re-seed or remove it rather than deleting it "
+                    "behind a revocation that never reached the disk",
+                    path,
+                )
+                try:
+                    os.replace(aside, path)
+                except OSError:  # pragma: no cover - defensive; a racing writer took the name
+                    logger.warning("could not restore %s; it is at %s", path, aside.name)
+                seed_provenance.release(path, owner)
+                return
+            try:
+                aside.unlink(missing_ok=True)
+            except OSError:
+                # Revoke landed but the moved inode will not delete. Put it back under
+                # the pathname and re-record, so the path is a repairable orphan rather
+                # than a frozen ``.crew-gc`` no session names.
+                logger.debug(
+                    "could not remove %s after session reset; re-recording Crew's claim so "
+                    "a later session can still re-seed or remove it",
+                    path,
+                    exc_info=True,
+                )
+                if payload is not None:
+                    restored = True
+                    try:
+                        os.replace(aside, path)
+                    except OSError:  # pragma: no cover - defensive
+                        restored = False
+                        logger.warning("could not restore %s; it is at %s", path, aside.name)
+                    if restored:
+                        seed_provenance.record(path, payload, owner)
+                        seed_provenance.release(path, owner)
+        except Exception:  # pragma: no cover - defensive; teardown must not raise
+            logger.debug("could not settle Crew's settings seed at %s", path, exc_info=True)
+
     def _reset_state(self) -> None:
         """Reset all session state (call after process is dead)."""
         if self._process:
@@ -5458,30 +6558,27 @@ class AcpClient:
                         pass
         # Clean up sandbox temp files (macOS seatbelt profile)
         self._discard_sandbox_cleanup()
-        # Remove the settings.local.json THIS session created, so a permission
-        # mode never outlives its session and an inherited bypassPermissions
-        # cannot persist after a crash. Only a file Crew created AND still owns is
-        # removed: the writer declines a path that already holds a foreign file,
-        # and the content check below covers the remaining case -- a user
-        # replacing Crew's file atomically after the create, whose replacement is
-        # theirs to keep (see _write_claude_local_settings). getattr: _reset_state
-        # runs on clients built without __init__ in tests.
+        # The settings.local.json THIS session seeded is removed by
+        # _discard_claude_settings_seed, which every caller awaits in the `try` of
+        # the `finally` that reaches here -- it is async because the ownership hash,
+        # the durable revoke and the unlink are all blocking, and this method is
+        # synchronous and runs on the event loop. That pairing also means this may
+        # run because the discard's await was CANCELLED: the flags below are already
+        # cleared by then, so this branch is skipped and the shielded transaction
+        # still finishes the disk half. getattr: _reset_state runs on clients built
+        # without __init__ in tests.
         if getattr(self, "_claude_settings_authored", False):
-            if self._claude_settings_is_still_ours():
-                try:
-                    self._claude_local_settings_path().unlink(missing_ok=True)
-                except OSError:
-                    logger.debug(
-                        "could not remove %s after session reset",
-                        self._claude_local_settings_path(),
-                        exc_info=True,
-                    )
-            else:
-                logger.info(
-                    "%s no longer holds the bytes Crew wrote; leaving the replacement in "
-                    "place instead of deleting a file Crew does not own.",
-                    self._claude_local_settings_path(),
-                )
+            # The seed itself is removed by ``_discard_claude_settings_seed``, which
+            # is awaited off the loop by every caller that reaches here. All this
+            # sync path does is hand back the LIVE claim, which is in-memory only
+            # and takes no lock -- so a client that is discarded without the async
+            # step (a test, or a future caller that forgets it) still cannot wedge
+            # the path behind a claim nobody is using: a replacement client in this
+            # process reads the seed as an adoptable orphan and repairs it. The
+            # durable record deliberately survives, because the file does.
+            seed_provenance.release(
+                self._claude_local_settings_path(), getattr(self, "_seed_owner", "")
+            )
             self._claude_settings_authored = False
             self._claude_settings_written = None
         # Drop the translated MCP array: the spec is read PER SPAWN, which is what
@@ -5801,6 +6898,7 @@ class AcpClient:
                         self._capture_available_models(load_resp)
                         if self._uses_advertised_model_selection:
                             await self._persist_advertised_models_if_changed()
+                            await self._reseed_after_capture()
                         self._store_session_config(load_resp)
                         logger.info("ACP session resumed: %s", resume_sid)
                 except (AcpError, AcpTimeoutError):
@@ -5825,6 +6923,7 @@ class AcpClient:
             self._capture_available_models(session_resp)
             if self._uses_advertised_model_selection:
                 await self._persist_advertised_models_if_changed()
+                await self._reseed_after_capture()
             self._store_session_config(session_resp)
             if not self._session_id:
                 # Both the initial attempt and the substitution retry failed to
@@ -5906,6 +7005,10 @@ class AcpClient:
         if acp_tool_gate.routing_for(self.backend) is acp_tool_gate.Routing.SESSION_CONFIG:
             await self._apply_session_permission_routing()
 
+        # (settings.local.json is re-seeded up in step 2/3, beside the model-cache
+        #  persist, rather than as a step of its own down here: see
+        #  _reseed_after_capture on why it rides an EXISTING adapter-only branch.)
+
         # Drain MCP server init notifications
         await self._drain_notifications()
 
@@ -5943,7 +7046,14 @@ class AcpClient:
                 try:
                     if self._process and self._process.returncode is not None:
                         await self._discard_bound_workspace()
-                        self._reset_state()
+                        # `finally`, because the discard is an await and this runs on
+                        # cancellable paths: the in-memory reset must land even when
+                        # the cancellation arrives during the seed's settle. The
+                        # settle itself is shielded, so it completes regardless.
+                        try:
+                            await self._discard_claude_settings_seed()
+                        finally:
+                            self._reset_state()
 
                     if not self._process:
                         await self._spawn()
@@ -5969,11 +7079,13 @@ class AcpClient:
                     await self._cleanup_failed_live_spawn()
                     self._reset_state()
                     raise
-                except (AcpTimeoutError, AcpError) as exc:
+                except (AcpTimeoutError, AcpError, OSError) as exc:
                     if attempt == 0:
                         logger.warning("ACP init failed (%s), retrying with fresh process...", exc)
                         await self._cleanup_failed_live_spawn()
                         self._reset_state()
+                        if isinstance(exc, OSError):
+                            await asyncio.sleep(_ACP_RESPAWN_BACKOFF_S)
                     else:
                         # AcpAuthRequired subclasses AcpError; label it distinctly
                         # so a not-logged-in exit is never counted as a generic
@@ -6026,7 +7138,13 @@ class AcpClient:
             await self._kill_process(force=True)
         finally:
             await self._discard_bound_workspace()
-            self._reset_state()  # untracks all PIDs (root + children)
+            # `finally` for the same reason the kill above has one: `_reset_state`
+            # untracks the PIDs and must run even if the seed's await is cancelled.
+            # The settle is shielded, so the disk half completes either way.
+            try:
+                await self._discard_claude_settings_seed()
+            finally:
+                self._reset_state()  # untracks all PIDs (root + children)
 
     # ── JSON-RPC Transport ──
 
@@ -6147,6 +7265,15 @@ class AcpClient:
         except json.JSONDecodeError:
             logger.debug("Skipping non-JSON line from ACP: %.100s", text)
             return None
+
+        # Opt-in raw-frame recording for the replay corpus. A no-op unless
+        # KIROCREW_ACP_RECORD_FRAMES names a directory, and the write is
+        # offloaded off this loop when it is set. It never raises -- see
+        # kiro_crew.acp._frame_record. Placed after the buffer early-return
+        # above so a frame is recorded once, when it comes off the wire, not
+        # again when a turn loop replays it out of _buffer.
+        if isinstance(data, dict):
+            await record_frame(self.backend, data, len(line))
 
         return JsonRpcMessage(
             id=data.get("id"),
@@ -6848,7 +7975,7 @@ class AcpClient:
           strict improvement on the gateway's Linux deploy target.
         - Subtree-aggregate movement. A busy *unrelated* descendant (e.g. an
           MCP child polling) can read WORKING even if the model turn itself is
-          wedged with a lost completion frame, extending that turn to the 2h
+          wedged with a lost completion frame, extending that turn to the
           ``_DEFAULT_PROMPT_TIMEOUT`` backstop rather than reaping at 90s. This
           is an inherent property of the shared ``LivenessOracle`` (the kiro
           path has it too); tighter per-branch attribution belongs in
@@ -6918,10 +8045,20 @@ class AcpClient:
                     # event is discarded — this API yields str — but the context
                     # counts it drops are what the meter reads next turn.
                     self._settle_claude_compaction(reason)
+                    reason, _ = self.last_prompt_stats.terminal_refusal(reason)
                     self._last_stop_reason = reason
                     self._turn_done.set()
                     return
                 if action == "error":
+                    if error_is_refusal_terminal(msg.error, self.last_prompt_stats.refusal):
+                        # The refusal's own -32603 terminal (see
+                        # _dispatch_events). This API yields str, so the fold
+                        # lands on _last_stop_reason and the turn ends cleanly
+                        # rather than raising a deterministic decline.
+                        reason, _ = self.last_prompt_stats.terminal_refusal("")
+                        self._last_stop_reason = reason
+                        self._turn_done.set()
+                        return
                     _raise_acp_error(msg.error, self._advertised_model_ids())
                 if action == "permission":
                     await self._handle_permission(msg)
@@ -6992,6 +8129,7 @@ class AcpClient:
         self._tool_call_mcp_server.clear()
         self._tool_call_tool_name.clear()
         self._tool_call_params.clear()
+        self._tool_call_diff_path.clear()
         # Reset the per-turn observed-tool-call bookkeeping (see __init__).
         self._observed_tool_calls.clear()
         # Clear stale permission options so an aborted/cancelled request from
@@ -7046,6 +8184,7 @@ class AcpClient:
                 _compaction_settle = self._settle_claude_compaction(reason)
                 if _compaction_settle is not None:
                     yield _compaction_settle
+                reason, _refusal = self.last_prompt_stats.terminal_refusal(reason)
                 # Turn is over — disarm the stall watchdog.
                 self._tool_dispatched = False
                 self._last_stop_reason = reason
@@ -7053,10 +8192,33 @@ class AcpClient:
                 yield AcpEvent(
                     kind=EVENT_COMPLETE,
                     stop_reason=reason,
+                    refusal=_refusal,
                     usage=self.last_prompt_stats.to_turn_usage(),
                 )
                 return
             if action == "error":
+                if error_is_refusal_terminal(msg.error, self.last_prompt_stats.refusal):
+                    # See AcpSessionHandle: a content-filter refusal can
+                    # terminate as a bare -32603. The reason is already on the
+                    # stats; surface it as the refusal terminal, never raise.
+                    #
+                    # Flush pending tool results first, exactly as the
+                    # `complete` branch does: a tool that finished just before
+                    # the filtered inference would otherwise have its result
+                    # dropped, or emitted into the NEXT turn.
+                    reason, _refusal = self.last_prompt_stats.terminal_refusal("")
+                    for tr_event in await asyncio.to_thread(self._read_new_tool_results_sync):
+                        yield tr_event
+                    self._tool_dispatched = False
+                    self._last_stop_reason = reason
+                    self._turn_done.set()
+                    yield AcpEvent(
+                        kind=EVENT_COMPLETE,
+                        stop_reason=reason,
+                        refusal=_refusal,
+                        usage=self.last_prompt_stats.to_turn_usage(),
+                    )
+                    return
                 _raise_acp_error(msg.error, self._advertised_model_ids())
             if action == "permission":
                 yield self._build_permission_event(msg)
@@ -7090,7 +8252,7 @@ class AcpClient:
                     if not is_thinking and _is_tool_interrupted_marker(chunk):
                         # kiro-cli's built-in security filter cancelled the turn's tools.
                         # It will not send a ``complete`` response — synthesize one so the
-                        # caller exits instead of waiting 2 hours for the prompt timeout.
+                        # caller exits instead of waiting out the prompt timeout.
                         # (_emit_tool_interrupted_sel logs + audits the cancellation.)
                         self._emit_tool_interrupted_sel("_dispatch_events")
                         got_complete = True
@@ -7732,10 +8894,25 @@ class AcpClient:
                 # See send_message_stream: settle for the context counts, drop
                 # the event this API cannot yield.
                 self._settle_claude_compaction(reason)
+                # Fold a metadata refusal onto the terminal, as the streaming
+                # paths do, so a caller reading ``last_stop_reason`` sees the
+                # refusal and does not retry a deterministic decline.
+                reason, _ = self.last_prompt_stats.terminal_refusal(reason)
                 self._last_stop_reason = reason
                 self._turn_done.set()
                 return "".join(output)
             if action == "error":
+                if error_is_refusal_terminal(msg.error, self.last_prompt_stats.refusal):
+                    # A content-filter refusal terminating as a bare -32603 (see
+                    # _dispatch_events). This API returns the turn's text, so
+                    # return what streamed (the canned explanation) under the
+                    # refusal stop reason rather than raising: an AcpError here
+                    # would discard the reason, feed the retry ladder a
+                    # deterministic decline, and retire a healthy worker.
+                    reason, _ = self.last_prompt_stats.terminal_refusal("")
+                    self._last_stop_reason = reason
+                    self._turn_done.set()
+                    return "".join(output)
                 _raise_acp_error(msg.error, self._advertised_model_ids())
             if action == "permission":
                 await self._handle_permission(msg)
@@ -8194,8 +9371,15 @@ class AcpClient:
             return None
         if update.get("sessionUpdate") == UPDATE_TOOL_CALL:
             title = update.get("title", "unknown")
+            _wire_title = title if isinstance(title, str) and title != "unknown" else ""
             kind = update.get("kind", "unknown")
-            raw_input = update.get("rawInput") or update.get("input") or update.get("params")
+            # First PRESENT key, not first truthy one -- an explicit empty
+            # rawInput is a real argument set for the directive digest. Mirrors
+            # _dispatch._build_tool_call_event.
+            raw_input = next(
+                (update[k] for k in ("rawInput", "input", "params") if update.get(k) is not None),
+                None,
+            )
             purpose = extract_tool_purpose(raw_input)
             logger.debug(
                 "ACP tool_call raw: %s",
@@ -8234,6 +9418,8 @@ class AcpClient:
                         old = cb.get("oldText") or ""
                         new = cb.get("newText") or ""
                         path = cb.get("path", "")
+                        if tool_call_id and path:
+                            self._tool_call_diff_path[tool_call_id] = path
                         diff_str = _make_unified_diff(old, new, path)
                         if diff_str:
                             input_str = diff_str
@@ -8264,7 +9450,12 @@ class AcpClient:
             # scopes (filesystem.write / network.egress). Bounded by the same
             # clear() as _tool_call_inputs; capped to avoid unbounded growth on a
             # stream that never sends a matching permission request.
-            if tool_call_id and isinstance(raw_input, dict):
+            # Truthy-gated, like _dispatch's raw_params_cache: this cache is the
+            # permission event's TRUSTED params source, and an empty ``{}`` here
+            # (Claude's initial frame) would be found by ``.get`` and suppress the
+            # inline-frame fallback, so the refinement's sensitive path never
+            # reached governance. The event's own raw_tool_params keeps the ``{}``.
+            if tool_call_id and isinstance(raw_input, dict) and raw_input:
                 if len(self._tool_call_params) > _MAX_CACHED_TOOL_PARAMS:
                     self._tool_call_params.clear()
                 self._tool_call_params[tool_call_id] = raw_input
@@ -8303,6 +9494,10 @@ class AcpClient:
             return AcpEvent(
                 kind=EVENT_TOOL_CALL,
                 title=title,
+                # The backend's OWN title, before select_tool_title swaps in a
+                # shell call's description: the directive claim's tool resolver
+                # reads this and only this (see AcpEvent.wire_title).
+                wire_title=_wire_title,
                 tool_kind=kind,
                 tool_purpose=purpose,
                 tool_input=input_str,
@@ -8362,13 +9557,9 @@ class AcpClient:
         content = update.get("content")
         if isinstance(content, list):
             for block in content:
-                if not isinstance(block, dict):
-                    continue
-                inner = block.get("content")
-                if isinstance(inner, dict) and inner.get("type") == "text":
-                    text = inner.get("text", "")
-                    if text:
-                        output_parts.append(str(text))
+                text = tool_call_content_text(block)
+                if text:
+                    output_parts.append(text)
 
         # Path 2: `rawOutput` (arrives with status=completed) — fallback when
         # there were no content blocks (e.g. some tools only emit rawOutput).
@@ -8391,26 +9582,7 @@ class AcpClient:
                             if "stdout" in j and j.get("stdout"):
                                 output_parts.append(str(j["stdout"]))
                             else:
-                                # An unrecognised structured envelope reaches the
-                                # consumer through json.dumps, which escapes every
-                                # quote in it. That is lossless for display but
-                                # fatal for a session-directive marker: the
-                                # sentinel survives while its payload becomes
-                                # \\"kind\\", so peek() can no longer name the
-                                # parked record and the directive is dropped. Emit
-                                # that one string verbatim instead.
-                                _marker = _marker_bearing_text(j)
-                                if _marker is not None:
-                                    logger.warning(
-                                        "tool-result rawOutput Json envelope carries a "
-                                        "session-directive marker; using that string "
-                                        "verbatim instead of json.dumps, which would "
-                                        "escape its payload. Envelope keys: %s",
-                                        sorted(j.keys()),
-                                    )
-                                    output_parts.append(_marker)
-                                else:
-                                    output_parts.append(json.dumps(j, default=str))
+                                output_parts.append(json.dumps(j, default=str))
                 # Path 3: an object that is not that envelope at all. Mirrors
                 # ``_dispatch._build_tool_result_event`` -- ``rawOutput`` is
                 # unstructured passthrough, so ``items[]`` is one producer's
@@ -8428,22 +9600,10 @@ class AcpClient:
                     output_parts.append(json.dumps(raw_output, default=str))
 
         if not output_parts:
+            log_unrenderable_content(logger, tool_use_id, content)
             return None
 
         final_output = "\n".join(output_parts)
-        # Repair a marker that arrived JSON-escaped, BEFORE redaction and the
-        # head cut: the consumer reads its selector out of this exact string.
-        _repaired = _repair_escaped_marker(final_output)
-        if _repaired is not None:
-            logger.warning(
-                "tool-result text carried a JSON-ESCAPED session-directive "
-                "marker; repaired it so the selector is readable. "
-                "Original: %dB sha=%s (content withheld -- this runs BEFORE "
-                "redaction, so the frame is unredacted here).",
-                len(final_output),
-                content_free_digest(final_output),
-            )
-            final_output = _repaired
         # Redact the WHOLE join, then bound -- never the reverse. Bounding first
         # can split a credential across the cut into fragments no pattern
         # matches: with a connection URI whose "@" lands on byte 8000, the head
@@ -8488,6 +9648,14 @@ class AcpClient:
         # updates (content/rawOutput only) are handled by the result extractor.
         if title is None and kind is None and not raw_input:
             return None
+        # The refinement carries the COMPLETE params (Claude streams an empty
+        # rawInput on the initial tool_call). Refresh the permission event's
+        # trusted-params cache from it, as _dispatch._build_tool_refinement_event
+        # does, so governance's sensitive-path scope reads the real arguments.
+        if tool_use_id and isinstance(raw_input, dict) and raw_input:
+            if len(self._tool_call_params) > _MAX_CACHED_TOOL_PARAMS:
+                self._tool_call_params.clear()
+            self._tool_call_params[tool_use_id] = raw_input
         # Build the input string the same way `_extract_tool_event` does so
         # the merged toolLog entry / message meta lines up across both events.
         input_str = ""
@@ -8507,6 +9675,8 @@ class AcpClient:
                     old = cb.get("oldText") or ""
                     new = cb.get("newText") or ""
                     path = cb.get("path", "")
+                    if path:
+                        self._tool_call_diff_path[tool_use_id] = path
                     diff_str = _make_unified_diff(old, new, path)
                     if diff_str:
                         input_str = diff_str
@@ -8560,6 +9730,7 @@ class AcpClient:
         return AcpEvent(
             kind=EVENT_TOOL_CALL_UPDATE,
             title=title_str,
+            wire_title=title if isinstance(title, str) else "",
             tool_kind=kind_str,
             tool_purpose=purpose,
             tool_input=input_str,
@@ -8614,16 +9785,7 @@ class AcpClient:
                                     if out:
                                         output_parts.append(out[:4000])
                                 else:
-                                    # See the rawOutput Json branch above: a dump
-                                    # escapes an embedded directive marker beyond
-                                    # what peek() can read.
-                                    _marker = (
-                                        _marker_bearing_text(d) if isinstance(d, dict) else None
-                                    )
-                                    if _marker is not None:
-                                        output_parts.append(_marker[:4000])
-                                    else:
-                                        output_parts.append(json.dumps(d, indent=2)[:4000])
+                                    output_parts.append(json.dumps(d, indent=2)[:4000])
                             elif rc.get("kind") == "text":
                                 output_parts.append(str(rc.get("data", ""))[:4000])
                         if output_parts:
@@ -8631,10 +9793,7 @@ class AcpClient:
                                 AcpEvent(
                                     kind=EVENT_TOOL_RESULT,
                                     tool_call_id=tool_use_id,
-                                    tool_output=(
-                                        _repair_escaped_marker("\n".join(output_parts))
-                                        or "\n".join(output_parts)
-                                    )[:8000],
+                                    tool_output="\n".join(output_parts)[:8000],
                                 )
                             )
         except Exception:
@@ -8663,6 +9822,8 @@ class AcpClient:
             tool_input_redacted_cache=getattr(self, "_tool_call_input_redacted", None),
             shell_cache=self._tool_call_is_shell,
             raw_params_cache=self._tool_call_params,
+            # Same compatibility shape as the redaction map above.
+            diff_path_cache=getattr(self, "_tool_call_diff_path", None),
             mcp_server_name_cache=self._tool_call_mcp_server,
             tool_name_cache=self._tool_call_tool_name,
         )
@@ -8696,6 +9857,13 @@ class AcpClient:
 
     def _track_metadata(self, msg: JsonRpcMessage) -> None:
         params = msg.params or {}
+        # Content-filter refusal envelope. Opt-in by membership (H6): a harness
+        # that has not demonstrated the payload does not have its metadata
+        # frames guessed at. Folded onto the terminal by ``terminal_refusal``.
+        if self.backend in ACP_BACKENDS_STRUCTURED_REFUSAL:
+            _refusal = parse_refusal(params)
+            if _refusal is not None:
+                self.last_prompt_stats.refusal = _refusal
         # A real usage_update is authoritative for both the token counts AND the
         # pct derived from them. kiro's metadata percentage can measure a
         # different window, so applying it here would desync the headline % from

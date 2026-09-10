@@ -1360,6 +1360,12 @@ Examples:
         help="Suppress auto-delivery; agent controls notifications",
     )
     cron_add.add_argument(
+        "--folder",
+        default="",
+        help="Schedule-page folder to file the job in (existing folder name or id). "
+        "The CLI does not create folders — create them in the dashboard's Schedule page.",
+    )
+    cron_add.add_argument(
         "--approval-mode",
         dest="approval_mode",
         choices=["auto"],
@@ -2086,6 +2092,22 @@ Examples:
     _c_login.add_argument(
         "--no-browser", action="store_true", help="Print the device URL but don't open a browser"
     )
+    _c_login.add_argument(
+        "--identity-provider",
+        default="",
+        help="IAM Identity Center start URL (for enterprise SSO login)",
+    )
+    _c_login.add_argument(
+        "--license",
+        default="",
+        choices=["", "free", "pro"],
+        help="Kiro license tier (pro for Identity Center, free for Builder ID/social)",
+    )
+    _c_login.add_argument(
+        "--idp-region",
+        default="",
+        help="IAM Identity Center region (e.g. us-east-1), NOT the EC2 instance region",
+    )
     _c_logout = cloud_sub.add_parser(
         "logout", help="Sign kiro-cli out on the instance (to switch Kiro account)"
     )
@@ -2196,6 +2218,10 @@ Examples:
     # Mounted only for an agent whose spec grants it, so an unassigned set costs
     # a session nothing: kiro-cli loads a server only when `tools` names it.
     sub.add_parser("mcp-dashboard")
+    # mcp-work (MCP server — the conductor work ledger's four tools). Opt-in
+    # like mcp-dashboard: mounted only for an agent whose spec grants it, so a
+    # session that is neither a conductor nor a worker spends nothing on it.
+    sub.add_parser("mcp-work")
 
     # Builtin app MCP servers (spawned by the agent backend, not user-facing).
     # Only builtins that actually ship an ``mcp_server`` module get a verb —
@@ -2691,6 +2717,14 @@ The dashboard port is set with the KIROCREW_PORT env var, not a config key.
         # DashboardContributor.start_services (which never fires for `token`
         # and only inside gateway async startup). Public default = no checks.
         run_preflight_checks()
+        # Under the desktop shell this process inherited Electron's Crashpad
+        # exception port, and so would every child it spawns (kiro-cli, MCP
+        # servers, and whatever THEY run). Their crashes would then land in
+        # OUR Crashpad database as foreign dumps nobody prunes. Cleared here,
+        # before the first child, so children fall back to the OS default.
+        from kiro_crew.crashpad_inherit import detach_inherited_crash_handler
+
+        detach_inherited_crash_handler()
         # Enable faulthandler for the long-lived gateway process: it makes
         # `kill -ABRT <pid>` dump every thread's stack to stderr (the gateway
         # log) on demand, and it is the signal the dashboard's stall watchdog
@@ -2788,6 +2822,10 @@ The dashboard port is set with the KIROCREW_PORT env var, not a config key.
         # below: `kirocrew gateway` boots through this module, and a default-off
         # optional subsystem must not be imported to start it.
         importlib.import_module("kiro_crew.mcp_dashboard").run_mcp_server()
+    elif args.command == "mcp-work":
+        # Same importlib form and the same reason as mcp-dashboard above: a
+        # default-off optional subsystem must not be imported to start the gateway.
+        importlib.import_module("kiro_crew.mcp_work").run_mcp_server()
     elif args.command.startswith("mcp-") and args.command[4:] in _BUILTIN_NAMES:
         # Registration gates this verb on _builtin_mcp_server_available, and
         # _run_app_mcp_server is the ONE dispatch-time spelling of "import the

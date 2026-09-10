@@ -237,7 +237,11 @@ class TestHumanOverrideHandler:
 
         assert 'if [ "$IS_FORK" = "true" ]; then' in script
         assert "check-runs?check_name=$enc" in script
-        assert 'select(.external_id == \\"$lane-pr-$PR\\")' in script
+        # The id is now attempt-scoped (<lane>-pr-<PR>-<run>-<attempt>), so the
+        # lookup matches the PR dimension by PREFIX and lets sort_by|last pick
+        # the newest attempt; the old attempt-blind exact match must be gone.
+        assert 'select(.external_id | startswith(\\"$lane-pr-$PR-\\"))' in script
+        assert 'select(.external_id == \\"$lane-pr-$PR\\")' not in script
         assert "sort_by(.started_at) | last" in script
         # The resolved run must be verified to belong to the expected fork
         # lane before anything is re-run: any workflow with checks:write
@@ -274,7 +278,11 @@ class TestHumanOverrideHandler:
         # POST and the finalize fallback POST (used when the job dies before
         # opening one) must carry the stamp -- and the fallback must also
         # carry the external_id the handler filters on, or the one check-run
-        # holding the run URL is never a lookup candidate.
+        # holding the run URL is never a lookup candidate. The id is now
+        # two-dimensional (PR + triggering run id + attempt), so a rerun on an
+        # unchanged head cannot reuse the previous attempt's verdict; the env
+        # must supply WR_RUN_ID and WR_RUN_ATTEMPT so a future edit cannot drop
+        # the attempt dimension silently.
         stamp = '-f details_url="$GITHUB_SERVER_URL/$REPO/actions/runs/$GITHUB_RUN_ID"'
         for name, lane in (
             ("fork-opus-review.yml", "opus"),
@@ -285,7 +293,11 @@ class TestHumanOverrideHandler:
         ):
             workflow = _workflow(name)
             assert workflow.count(stamp) >= 2, name
-            assert f'ext_args=(-f external_id="{lane}-pr-$PR")' in workflow, name
+            assert (
+                f'ext_args=(-f external_id="{lane}-pr-$PR-$WR_RUN_ID-$WR_RUN_ATTEMPT")' in workflow
+            ), name
+            assert "WR_RUN_ID: ${{ github.event.workflow_run.id }}" in workflow, name
+            assert "WR_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}" in workflow, name
 
     def test_handler_requires_write_permission_fresh_sha_and_reason(self) -> None:
         workflow = _workflow("ai-review-human-override.yml")
@@ -617,10 +629,10 @@ class TestPrReadiness:
         assert 'failed_passes="$(cat codex-failed-passes 2>/dev/null || true)"' in review_step
 
     def test_each_model_call_starts_on_a_fresh_bedrock_session(self) -> None:
-        """One AssumeRole session lasts an hour; the model calls used to share
-        it, so a first call that consumed most of the hour left the next to
-        die on `401 ... security token ... expired` and fail the gate closed
-        with no verdict. Every lane whose job timeout exceeds the session
+        """One AssumeRole session lasts an hour, so model calls that share it let
+        a first call consume most of the hour and leave the next to die on
+        `401 ... security token ... expired`, failing the gate closed with no
+        verdict. Every lane whose job timeout exceeds the session
         lifetime must re-assume before EACH call — the GPT lanes now make three
         (two CLI passes plus the Opus adjudication of the blocking verdict) —
         and each call must be wall-bounded under that lifetime where the lane
@@ -802,9 +814,9 @@ class TestPrReadiness:
         assert "      - CodeQL" in workflow
         for workflow_name in (
             "ci.yml|CI",
-            # Fast Gate carries the eleven cheap blocking gates that used to sit
-            # inside CI. Splitting them out gave the fork reviewers something to
-            # key on in ~1 minute instead of CI's ~54, but a split-out lane that
+            # Fast Gate carries the eleven cheap blocking gates, split out of
+            # CI so the fork reviewers have something to key on in ~1 minute
+            # instead of CI's ~54. But a split-out lane that
             # readiness does not aggregate is a gate that can go red without
             # turning the PR red -- so it is pinned here exactly like CI.
             "fast-gate.yml|Fast Gate",
@@ -846,11 +858,14 @@ class TestPrReadiness:
         assert '[ "$FORK" = "true" ]' in workflow
         # CodeQL stays the only ineligible fork lane.
         assert '"CodeQL (fork PR)"' in workflow
-        # AI reviews are now monitored on forks via check-run specs.
-        assert '"checkrun:Opus 4.8 Review|Opus 4.8 Review"' in workflow
-        assert '"checkrun:GPT 5.6 Review|GPT 5.6 Review"' in workflow
-        assert '"checkrun:Design Review|Design Review"' in workflow
-        assert '"checkrun:UX Review|UX Review"' in workflow
+        # AI reviews are now monitored on forks via check-run specs, each bound
+        # to THIS PR and attempt: the third field is the external_id prefix and
+        # the fourth is the triggering workflow (Fast Gate) whose newest run +
+        # attempt defines "current".
+        assert '"checkrun:Opus 4.8 Review|Opus 4.8 Review|opus-pr-|fast-gate.yml"' in workflow
+        assert '"checkrun:GPT 5.6 Review|GPT 5.6 Review|gpt-pr-|fast-gate.yml"' in workflow
+        assert '"checkrun:Design Review|Design Review|design-pr-|fast-gate.yml"' in workflow
+        assert '"checkrun:UX Review|UX Review|ux-pr-|fast-gate.yml"' in workflow
         assert "commits/$SHA/check-runs?check_name=$enc" in workflow
         # The blanket fork skip and the maintainer-review verdict are gone.
         assert '"GPT 5.6 Review (fork PR)"' not in workflow
@@ -1088,13 +1103,18 @@ class TestFirstPrinciplesReview:
         # Two open PRs can share a head commit, so a check-run of this name on this
         # head may belong to a DIFFERENT pull request -- completing it would publish
         # a verdict computed from another diff. The wedge fix is therefore scoped by
-        # external_id, so it can never reach a sibling's review.
+        # external_id, so it can never reach a sibling's review. The id now also
+        # carries the triggering run id + attempt, so a rerun on an unchanged head
+        # gets a fresh row; the sweep matches the PR dimension by PREFIX so it still
+        # catches a row stranded by a previous attempt (trailing hyphen keeps -pr-9
+        # from matching -pr-99).
         workflow = _workflow("fork-first-principles-review.yml")
         opened = _step_script(workflow, "Open check-run (in progress)")
         finalize = _step_script(workflow, "Finalize check-run (advisory)")
 
-        assert '-f external_id="first-principles-pr-$PR"' in opened
-        assert 'select(.external_id == \\"first-principles-pr-$PR\\")' in finalize
+        assert '-f external_id="first-principles-pr-$PR-$WR_RUN_ID-$WR_RUN_ATTEMPT"' in opened
+        assert 'select(.external_id | startswith(\\"first-principles-pr-$PR-\\"))' in finalize
+        assert 'select(.external_id == \\"first-principles-pr-$PR\\")' not in finalize
         assert '[ -n "${PR:-}" ]' in finalize
         # An unscoped sweep must not come back.
         assert 'select(.status != "completed") | .id' not in finalize
@@ -1231,8 +1251,8 @@ class TestFirstPrinciplesReview:
         )
 
     def test_one_contract_file_read_from_the_base_ref(self) -> None:
-        # The contract used to be inlined in BOTH lanes and held in sync by a
-        # byte-equality test -- guarding duplication instead of removing it, when
+        # Inlining the contract in BOTH lanes and holding it in sync by a
+        # byte-equality test guards duplication instead of removing it, when
         # `.github/review-prompts/` already existed for exactly this (2 consumers:
         # the Opus lanes). Reading it from the BASE ref is also load-bearing: an
         # inline prompt on the head lets a change edit the reviewer that judges it.
@@ -1358,7 +1378,10 @@ class TestFirstPrinciplesReview:
         assert "      - First Principles Review" in workflow
         assert "      - Fork First Principles Review" in workflow
         assert '"first-principles-review.yml|First Principles Review"' in workflow
-        assert '"checkrun:First Principles Review|First Principles Review"' in workflow
+        assert (
+            '"checkrun:First Principles Review|First Principles Review'
+            '|first-principles-pr-|fast-gate.yml"' in workflow
+        )
         # Advisory (UX-style), NOT a readiness blocker like Design Review: a
         # model must not wedge a merge on whether a feature should exist.
         advisory = '[ "$label" = "UX Review" ] || [ "$label" = "First Principles Review" ]'
@@ -1563,10 +1586,10 @@ class TestFirstPrinciplesIntentCapSurvivesALongBody:
 class TestIntentReadFailureFailsClosed:
     """Execute the ACTUAL PR-intent read from both lanes with ``gh`` stubbed.
 
-    `2>/dev/null || true` used to collapse a failed API read onto the same
-    empty string as a PR with no description, so the reviewer judged a PR that
-    appeared to state no intent and the author was blamed for a description
-    the workflow never read. These cases pin the three outcomes apart: a read
+    A bare `2>/dev/null || true` collapses a failed API read onto the same
+    empty string as a PR with no description, which would have the reviewer
+    judge a PR that appears to state no intent and blame the author for a
+    description the workflow never read. These cases pin the three outcomes apart: a read
     that succeeds is judged as written, a transient failure is absorbed by the
     bounded retry, and a read that never succeeds fails the step closed while
     naming the read as the cause.
@@ -1973,6 +1996,353 @@ class TestUxScopeGateSurvivesAWideDiff:
         assert "printf" not in gate, f"{lane}: writer is back in the pipeline"
 
 
+UX_BLIND_STEP = "Blind read of the committed screenshots (Fable 5)"
+UX_REVIEW_STEP = "UX review (Fable 5)"
+UX_EVIDENCE_STEP = "Collect blind-read evidence"
+UX_CAPTURE_STEP = "Capture the blind-read report"
+
+
+class TestUxReviewReadsTheScreenshotsBlindFirst:
+    """PR #6783 minimized a banner into a corner chip labelled "Pinned turn".
+    Every AI lane PASSed it -- this one wrote "self-teaching ... a visibly
+    labelled 'Pinned turn' chip" -- and the product owner could not tell what
+    the chip was. The reviewer had read the diff and the description before it
+    looked at the pixels, so the author's vocabulary had already primed it; a
+    prompt asking it to "imagine an uninformed reader" cannot undo that.
+
+    The fix is structural, not prose: a FIRST model call that can see only the
+    committed screenshots, and a SECOND that adjudicates its report against the
+    diff. These tests pin the wall between them.
+    """
+
+    def _steps(self, lane: str = "ux-review.yml") -> list[dict]:
+        doc = yaml.safe_load(_workflow(lane))
+        return list(doc["jobs"].values())[0]["steps"]
+
+    def _index(self, steps: list[dict], name: str) -> int:
+        for i, step in enumerate(steps):
+            if step.get("name") == name:
+                return i
+        raise AssertionError(f"no step named {name!r}")
+
+    def test_the_blind_pass_can_see_only_the_screenshots(self) -> None:
+        with_ = _step("ux-review.yml", UX_BLIND_STEP)["with"]
+        args = with_["claude_args"]
+        tools = _line_containing(args, "--allowedTools").strip()
+        # A PATH-SCOPED Read and nothing else: no shell (no `git diff`, no
+        # `gh pr view`), no Grep/Glob (no way to discover the code it is not
+        # supposed to read), and no bare `Read` -- an unscoped Read would let a
+        # screenshot carrying an injected instruction open /proc/self/environ
+        # and pull the job's Bedrock credentials into the transcript. Only the
+        # opaque-copy directory and the list file are admitted; the leading
+        # `/` before the expression makes the `//`-prefixed absolute-path rule.
+        assert tools.startswith('--allowedTools "Read('), tools
+        grants = tools[len('--allowedTools "') : -1].split(",")
+        assert grants == [
+            "Read(/${{ runner.temp }}/ux-blind/**)",
+            "Read(/${{ runner.temp }}/ux-screenshots.txt)",
+        ], grants
+        denied = _line_containing(args, "--disallowedTools")
+        for tool in ("Bash", "Grep", "Glob", "WebFetch"):
+            assert tool in denied, f"{tool} not denied to the blind reader"
+        # The checkout's CLAUDE.md / .claude/ are PR-controlled instructions the
+        # action would otherwise auto-load into the blind reader -- a channel
+        # that bypasses the wall without a single tool call. Only the runner's
+        # (empty) user source may be consulted.
+        assert _line_containing(args, "--setting-sources").strip() == "--setting-sources user"
+        # The only path it is handed is the screenshot list; the diff, the PR
+        # text and the blind-read report are never named to it.
+        system = _line_containing(args, "--append-system-prompt")
+        assert "ux-screenshots.txt" in system
+        # The map back to repository filenames is pass 2's; handing it to the
+        # blind reader would reopen the filename leak.
+        assert "ux-screenshot-map.txt" not in system
+        prompt = _flat(with_["prompt"])
+        for leak in ("git diff", "gh pr", "authentic.patch", "ux-blind-read.md", "pull request"):
+            assert leak not in prompt, f"blind-read prompt names {leak!r}"
+        assert "FIRST time" in prompt
+        assert "read no code, no ticket and no description" in prompt
+        assert "[UX-BLIND-READ]" in prompt
+
+    def test_the_blind_pass_runs_before_the_review_and_feeds_it_a_data_file(self) -> None:
+        steps = self._steps()
+        evidence = self._index(steps, UX_EVIDENCE_STEP)
+        blind = self._index(steps, UX_BLIND_STEP)
+        capture = self._index(steps, UX_CAPTURE_STEP)
+        review = self._index(steps, UX_REVIEW_STEP)
+        assert evidence < blind < capture < review
+        # Pass 2 reads the report the job wrote, not the pass-1 transcript.
+        review_args = _step("ux-review.yml", UX_REVIEW_STEP)["with"]["claude_args"]
+        system = _line_containing(review_args, "--append-system-prompt")
+        assert "ux-blind-read.md" in system
+        assert _step_env("ux-review.yml", UX_CAPTURE_STEP)["REPORT"].endswith("/ux-blind-read.md")
+        # The verdict the lane publishes is still pass 2's (id: review).
+        assert steps[review]["id"] == "review"
+        assert steps[blind]["id"] == "blind"
+
+    def test_each_ux_model_call_has_its_own_credential_assume(self) -> None:
+        """Same rule the GPT/Opus lanes pin: one AssumeRole session per call,
+        strictly interleaved, so pass 2 never inherits a session pass 1 spent."""
+        steps = self._steps()
+        creds, calls = [], []
+        for i, step in enumerate(steps):
+            uses = step.get("uses") or ""
+            if "configure-aws-credentials" in uses:
+                creds.append(i)
+            elif "claude-code-action" in uses:
+                calls.append(i)
+        assert len(calls) == 2, [steps[i].get("name") for i in calls]
+        assert len(creds) == 2
+        for slot, (call, assume) in enumerate(zip(calls, creds)):
+            assert assume < call
+            if slot + 1 < len(creds):
+                assert call < creds[slot + 1]
+
+    def test_a_failed_blind_read_degrades_to_an_evidence_gap_not_a_red_lane(self) -> None:
+        blind = _step("ux-review.yml", UX_BLIND_STEP)
+        assert blind.get("continue-on-error") is True
+        script = _step_script(_workflow("ux-review.yml"), UX_CAPTURE_STEP)
+        # The report is accepted only with the pass-1 marker (a mid-run message
+        # is not a report), and every no-report case writes WORDS pass 2 reads
+        # as a gap -- never an empty file that reads as "nothing to say".
+        assert 'grep -qF "[UX-BLIND-READ]" <<< "$report"' in script
+        assert "BLIND READ NOT PERFORMED" in script
+        assert "BLIND READ UNAVAILABLE" in script
+        # And pass 2 is told what the absence means.
+        prompt = _flat(_step("ux-review.yml", UX_REVIEW_STEP)["with"]["prompt"])
+        assert "If it says the blind read was not performed or is unavailable" in prompt
+        assert "every user-visible control this PR adds or changes is an evidence gap" in prompt
+
+    @pytest.mark.parametrize("lane", UX_LANES)
+    def test_review_prompts_carry_no_expression_so_the_21000_cap_cannot_bite(
+        self, lane: str
+    ) -> None:
+        """GitHub rejects the whole workflow file -- zero jobs, no error on the
+        PR -- when any expression-bearing string exceeds 21000 characters. Both
+        UX prompts sat at ~19000 WITH expressions before these rules were
+        added; they now exceed the cap, so the identity must ride in
+        `--append-system-prompt` and `prompt:` must stay expression-free."""
+        for step in self._steps(lane):
+            with_ = step.get("with") or {}
+            prompt = with_.get("prompt")
+            if not prompt:
+                continue
+            assert "${{" not in prompt, f"{lane}/{step.get('name')}: prompt carries an expression"
+            args = with_["claude_args"]
+            for value in args.split("\n"):
+                if "${{" in value:
+                    assert (
+                        len(value) < 2000
+                    ), f"{lane}: an expression-bearing claude_args line is {len(value)} chars"
+        review = _step(lane, UX_REVIEW_STEP)["with"]
+        system = _line_containing(review["claude_args"], "--append-system-prompt")
+        assert "HEAD sha ${{" in system, f"{lane}: the HEAD sha is not handed to the reviewer"
+        # `#` starting a claude_args line is stripped as a comment by the
+        # action's parser; the PR number must not be written as `#N` at a line
+        # start, and no claude_args line may begin with `#`.
+        for value in review["claude_args"].split("\n"):
+            assert not value.strip().startswith(
+                "#"
+            ), f"{lane}: claude_args line would be stripped as a comment"
+        prompt = _flat(review["prompt"])
+        assert "[UX-REVIEWED] <HEAD sha>" in prompt
+        assert "copied verbatim from your system prompt" in prompt
+
+    @pytest.mark.parametrize("lane", UX_LANES)
+    def test_the_five_second_proxy_is_replaced_not_duplicated(self, lane: str) -> None:
+        prompt = _flat(_step(lane, UX_REVIEW_STEP)["with"]["prompt"])
+        # The old lens asked a primed reviewer to imagine being unprimed. Two
+        # copies of the cold-read test -- one real, one imagined -- would let
+        # the imagined one PASS what the real one could not.
+        assert "Five-second proxy" not in prompt
+        assert "SCREENSHOT FIDELITY" not in prompt
+        assert "12. BLIND-READ RECONCILIATION & SCREENSHOT EVIDENCE" in prompt
+        assert "13. STATE-TRANSITION CONTINUITY" in prompt
+        assert "YOU JUDGE THE SURFACE, NOT THE CODE" in prompt
+        assert "### Evidence gaps" in prompt
+        # Evidence gaps cap the verdict; a hard swap and a misread primary
+        # control are decidable BLOCKs.
+        assert "the verdict cannot be PASS" in prompt
+        assert "flag ? <Chip/> : <Card/>" in prompt
+        # Scoped to a persistent, already-identified element: the mechanical
+        # predicate must not fire on loading/empty/error conditionals.
+        assert "PERSISTENT element the user has already seen" in prompt
+        assert "NOT in scope: async lifecycle states" in prompt
+        assert "An async lifecycle state is not this exit" in prompt
+        # A stochastic "a guess" self-rating is not a BLOCK; a misread is.
+        assert '"A guess" alone is not this exit' in prompt
+        assert "`prefers-reduced-motion` disables the motion, not the continuity" in prompt
+        assert "needs a recording" in prompt
+        assert "Pinned turn" in prompt  # the vocabulary-collision example stays concrete
+
+    def test_the_fork_lane_says_it_has_no_blind_read_rather_than_faking_one(self) -> None:
+        fork = _workflow("fork-ux-review.yml")
+        steps = self._steps("fork-ux-review.yml")
+        assert all(step.get("name") != UX_BLIND_STEP for step in steps)
+        assert sum("claude-code-action" in (s.get("uses") or "") for s in steps) == 1
+        prompt = _flat(_step("fork-ux-review.yml", UX_REVIEW_STEP)["with"]["prompt"])
+        assert "NO BLIND READ IN THIS LANE" in prompt
+        assert "Read it FIRST" not in prompt
+        # The fork head is never checked out, so the fork lane must not claim
+        # to hand the reviewer a screenshot list or a report it cannot have.
+        system = _line_containing(
+            _step("fork-ux-review.yml", UX_REVIEW_STEP)["with"]["claude_args"],
+            "--append-system-prompt",
+        )
+        assert "ux-blind-read.md" not in system
+        assert "ux-screenshots.txt" not in system
+        assert "authentic.patch" in system
+        assert "never applied to the tree" in fork
+
+    def _run_evidence_gate(
+        self, repo: Path, base: str, tmp_path: Path
+    ) -> tuple[str, str, str, str, Path]:
+        bash = _bash()
+        if bash is None:
+            pytest.skip("the evidence step runs only under Bash")
+        script = _step_script(_workflow("ux-review.yml"), UX_EVIDENCE_STEP)
+        blind_dir = tmp_path / "ux-blind"
+        shots = tmp_path / "shots.txt"
+        shot_map = tmp_path / "shot-map.txt"
+        clips = tmp_path / "clips.txt"
+        github_output = tmp_path / "github_output"
+        github_output.touch()
+        out = subprocess.run(
+            [bash, "-c", script],
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            cwd=repo,
+            env={
+                **self._git_env(tmp_path),
+                "BASE_SHA": base,
+                "BLIND_DIR": blind_dir.as_posix(),
+                "SHOTS": str(shots),
+                "SHOT_MAP": str(shot_map),
+                "CLIPS": str(clips),
+                "MAX_SHOTS": "40",
+                "GITHUB_OUTPUT": str(github_output),
+            },
+        )
+        assert out.returncode == 0, out.stderr
+        return (
+            shots.read_text(encoding="utf-8"),
+            shot_map.read_text(encoding="utf-8"),
+            clips.read_text(encoding="utf-8"),
+            github_output.read_text(encoding="utf-8"),
+            blind_dir,
+        )
+
+    @staticmethod
+    def _git_env(tmp_path: Path) -> dict[str, str]:
+        """An environment in which git can only see the scratch repository.
+
+        An inherited `GIT_DIR` / `GIT_WORK_TREE` / `GIT_INDEX_FILE` (set by a
+        hook, a wrapper, or a parent test runner) would make `git init` and
+        every write below land in THAT repository despite `cwd=repo`, so every
+        `GIT_*` location variable is dropped. Global and system config are
+        pointed away too, so a host-wide `commit.gpgsign` or hook path cannot
+        reach the fixture.
+        """
+        env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+        gitconfig = tmp_path / "gitconfig"
+        gitconfig.touch()
+        env["GIT_CONFIG_GLOBAL"] = str(gitconfig)
+        env["GIT_CONFIG_NOSYSTEM"] = "1"
+        return env
+
+    def _git(self, repo: Path, *args: str) -> str:
+        return subprocess.run(
+            ["git", "-c", "user.name=t", "-c", "user.email=t@t", *args],
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            cwd=repo,
+            env=self._git_env(repo.parent),
+        ).stdout.strip()
+
+    def test_the_evidence_step_copies_regular_images_under_opaque_names(
+        self, tmp_path: Path
+    ) -> None:
+        """Execute the ACTUAL evidence script. The blind reader is handed
+        copies named shot-NN.<ext>, never the repository paths: an author-named
+        `pinned-turn-chip.png` would prime it with the exact word the wall
+        hides. A tracked symlink under temp-screenshots/ would let a PR point
+        the reader -- which has only the Read tool -- at any file on the runner;
+        recordings are listed for the continuity lens and a GIF counts as both."""
+        if os.name == "nt":
+            pytest.skip("symlink creation needs privileges on Windows")
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        self._git(repo, "init", "-q")
+        (repo / "README").write_text("base\n")
+        self._git(repo, "add", "README")
+        self._git(repo, "commit", "-qm", "base")
+        base = self._git(repo, "rev-parse", "HEAD")
+        shots = repo / "temp-screenshots" / "f"
+        shots.mkdir(parents=True)
+        (shots / "pinned-turn-chip.png").write_bytes(b"\x89PNG")
+        (shots / "restore.GIF").write_bytes(b"GIF89a")
+        (shots / "c.webm").write_bytes(b"\x1a\x45")
+        (shots / "link.png").symlink_to(repo / "README")
+        (repo / "website").mkdir()
+        (repo / "website" / "App.tsx").write_text("x")
+        self._git(repo, "add", "-A")
+        self._git(repo, "commit", "-qm", "head")
+
+        shot_list, shot_map, clip_list, output, blind_dir = self._run_evidence_gate(
+            repo, base, tmp_path
+        )
+        # Opaque, order-numbered, extension kept (lower-cased) -- and nothing
+        # of the author's naming survives into what pass 1 can see.
+        assert shot_list.splitlines() == [
+            f"{blind_dir.as_posix()}/shot-01.png",
+            f"{blind_dir.as_posix()}/shot-02.gif",
+        ]
+        assert "pinned-turn" not in shot_list
+        assert sorted(p.name for p in blind_dir.iterdir()) == ["shot-01.png", "shot-02.gif"]
+        assert (blind_dir / "shot-01.png").read_bytes() == b"\x89PNG"
+        # Pass 2 gets the map back to the repository paths.
+        assert shot_map.splitlines() == [
+            "shot-01.png\ttemp-screenshots/f/pinned-turn-chip.png",
+            "shot-02.gif\ttemp-screenshots/f/restore.GIF",
+        ]
+        # `git diff --name-only` orders by path, so the recording list is
+        # byte-ordered too: c.webm sorts before restore.GIF.
+        assert clip_list.splitlines() == [
+            "temp-screenshots/f/c.webm",
+            "temp-screenshots/f/restore.GIF",
+        ]
+        assert "screens=true" in output
+
+    def test_the_evidence_step_reports_no_screens_for_a_code_only_ui_change(
+        self, tmp_path: Path
+    ) -> None:
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        self._git(repo, "init", "-q")
+        (repo / "README").write_text("base\n")
+        self._git(repo, "add", "README")
+        self._git(repo, "commit", "-qm", "base")
+        base = self._git(repo, "rev-parse", "HEAD")
+        (repo / "website").mkdir()
+        (repo / "website" / "App.tsx").write_text("x")
+        self._git(repo, "add", "-A")
+        self._git(repo, "commit", "-qm", "head")
+        shot_list, shot_map, clip_list, output, blind_dir = self._run_evidence_gate(
+            repo, base, tmp_path
+        )
+        assert shot_list == "" and shot_map == "" and clip_list == ""
+        assert list(blind_dir.iterdir()) == []
+        assert "screens=false" in output
+        # ...and the blind pass is gated on that output, so no model call is
+        # spent reading nothing.
+        blind = _step("ux-review.yml", UX_BLIND_STEP)
+        assert "steps.evidence.outputs.screens == 'true'" in str(blind["if"])
+
+
 ADVISORY_LANES = {
     "design-review.yml": "DESIGN-REVIEWED",
     "fork-design-review.yml": "DESIGN-REVIEWED",
@@ -2081,11 +2451,13 @@ class TestForkLaneStrandedRunSweeps:
     ) -> None:
         # Without an external_id at CREATION the sweep has nothing safe to
         # match on: a check-run of this name on this head can belong to a
-        # different PR that shares the commit.
+        # different PR that shares the commit. The id is now two-dimensional
+        # (PR + triggering run id + attempt) so a rerun on an unchanged head
+        # cannot reuse the previous attempt's verdict.
         opened = _step_script(_workflow(lane), "Open check-run (in progress)")
         assert (
-            f'-f external_id="{prefix}-pr-$PR"' in opened
-        ), f"{lane}: check-run created without a PR-scoped external_id"
+            f'-f external_id="{prefix}-pr-$PR-$WR_RUN_ID-$WR_RUN_ATTEMPT"' in opened
+        ), f"{lane}: check-run created without a PR+attempt-scoped external_id"
 
     @pytest.mark.parametrize(("lane", "check_name", "prefix", "finalize"), FORK_SWEEP_LANES)
     def test_finalize_sweeps_stranded_check_runs(
@@ -2102,11 +2474,17 @@ class TestForkLaneStrandedRunSweeps:
         self, lane: str, check_name: str, prefix: str, finalize: str
     ) -> None:
         # Two open PRs can share a head commit; an unscoped sweep would publish
-        # a verdict computed from another PR's diff.
+        # a verdict computed from another PR's diff. The match is a PREFIX on the
+        # PR dimension (not exact equality) so it still catches a row stranded by
+        # a PREVIOUS attempt, whose id carries a different run+attempt suffix; the
+        # trailing hyphen keeps -pr-9 from matching -pr-99.
         script = _step_script(_workflow(lane), finalize)
         assert (
-            f'select(.external_id == \\"{prefix}-pr-$PR\\")' in script
-        ), f"{lane}: sweep is not scoped by external_id"
+            f'select(.external_id | startswith(\\"{prefix}-pr-$PR-\\"))' in script
+        ), f"{lane}: sweep is not scoped by external_id prefix"
+        assert (
+            f'select(.external_id == \\"{prefix}-pr-$PR\\")' not in script
+        ), f"{lane}: sweep still uses the old attempt-blind exact match"
         assert '[ -n "${PR:-}" ]' in script, f"{lane}: sweep runs without a resolved PR"
         assert (
             'select(.status != "completed") | .id' not in script
@@ -3321,12 +3699,13 @@ class TestProtectedCheckNameHasOnePublisherPerPrType:
     def test_readiness_still_reads_the_protected_name_on_forks(
         self, workflow: str, check: str, fork: str
     ) -> None:
-        # Readiness reads fork verdicts from the head SHA's check-runs by name.
-        # It collapses every run of the name and treats "no completed run" as
-        # pending, so the rename removes a `skipped` row without making a
-        # missing review look green.
+        # Readiness reads fork verdicts from the head SHA's check-runs by name,
+        # bound to THIS PR and attempt via the spec's external_id prefix and
+        # triggering-workflow fields. It treats "no completed run bound to this
+        # PR+attempt" as pending, so the rename removes a `skipped` row without
+        # making a missing review look green.
         readiness = _workflow("pr-readiness.yml")
-        assert f'"checkrun:{check}|{check}"' in readiness, check
+        assert f'"checkrun:{check}|{check}|' in readiness, check
         assert '[ "$total" -eq 0 ] || [ "$incomplete" -gt 0 ]' in readiness
         assert 'pending+=("$label (not started)")' in readiness
 
@@ -3440,8 +3819,8 @@ class TestBlockAdjudicationContract:
         assert _step_env("fork-gpt-review.yml", ADJ_GATE)["REASONS"] == "|".join(reasons)
 
     def test_fenced_findings_get_an_annotate_only_pass_that_cannot_unblock(self) -> None:
-        """#8693: the fence's cost used to be a blind block -- no role in the
-        machine channel could say "this combination is too rare". The fenced
+        """A fence on its own costs a blind block: no role in the machine
+        channel can say "this combination is too rare". The fenced
         block gives the arbiter a voice with NO downgrade authority: a FLAG
         only pre-drafts the override rationale a repository writer must
         verify, and the gate never reads it."""
@@ -3483,7 +3862,7 @@ class TestBlockAdjudicationContract:
             if lane == "codex-review.yml":
                 # Only the same-repo lane advertises the ready-to-paste command;
                 # the fork lane's comment carries no override command by
-                # standing design (see TestForkGptVerdictVisibility).
+                # standing design, and the `else` arm below is what pins that.
                 assert "/ai-review override gpt $HEAD: $rtxt" in comment, lane
             else:
                 assert "/ai-review override" not in comment, lane
@@ -3967,7 +4346,7 @@ class TestBlockAdjudicationArithmetic:
         exists to remove -- so normalize decoration before parsing."""
         decorated = _adjudication(
             f"- **{FOOTER.format(total=2, uph=0, dwn=2)}**",
-            f"  * `{DOWN.format(fid='F1')}`",
+            f"    {DOWN.format(fid='F1')}",
             f"- {DOWN.format(fid='F2')}",
             f"**{MARKER}**",
         )
@@ -4288,6 +4667,242 @@ class TestBlockAdjudicationArithmetic:
         assert parsed["decision"] == "uphold"
         assert "contract is absent on the base commit" in parsed["note"]
         assert "/ai-review override" in parsed["note"]
+
+    @pytest.mark.parametrize("lane", LANES)
+    def test_an_api_error_with_fenced_findings_reports_a_failed_stage_not_a_ruling(
+        self, tmp_path: Path, lane: str
+    ) -> None:
+        """#9216: the adjudicator returned an API 400 on every PR (the runner's
+        Claude Code sat below the model's version floor), and the fenced branch
+        still rendered "withheld from adjudication, so the blocking verdict
+        stands" -- words that read like an adjudication ran and declined to
+        overturn. A stage whose output carries no adjudication marker at all
+        must be reported as one that FAILED TO RUN, whatever the fence held
+        back, and the verdict must still stand (fail closed)."""
+        api_error = (
+            "API Error: 400 Claude Code 2.1.240 does not support this model; "
+            "version 2.1.255 or newer is required. Run 'claude update', or "
+            "update the Claude desktop app, then try again."
+        )
+        decision, note = self._run(
+            tmp_path,
+            lane,
+            api_error,
+            count=2,
+            adjudicable=1,
+            fenced=1,
+            ids="F1",
+            fenced_ids="F2",
+        )
+        assert decision == "uphold"
+        assert "FAILED TO RUN" in note
+        assert "stands unreviewed" in note
+        assert "withheld" not in note
+
+    @pytest.mark.parametrize("lane", LANES)
+    def test_a_crashed_annotate_only_pass_is_reported_as_failed(
+        self, tmp_path: Path, lane: str
+    ) -> None:
+        """Same defect, fenced-only population: every blocking finding was
+        security-class, so only the annotate-only pass was requested -- and it
+        produced nothing. The old chain's fenced branch masked that entirely."""
+        decision, note = self._run(
+            tmp_path,
+            lane,
+            None,
+            count=1,
+            adjudicable=0,
+            fenced=1,
+            ids="",
+            fenced_ids="F2",
+        )
+        assert decision == "uphold"
+        assert "FAILED TO RUN" in note
+        assert "withheld" not in note
+
+    @pytest.mark.parametrize("lane", LANES)
+    def test_a_completed_ruling_with_fenced_findings_keeps_the_withheld_wording(
+        self, tmp_path: Path, lane: str
+    ) -> None:
+        """The mirror case: when the stage DID produce a ruling, the fenced
+        sentence is an accurate statement about the gate and stays."""
+        output = _adjudication(
+            "[ADJUDICATION] deadbeef total=1 uphold=0 downgrade=1",
+            DOWN.format(fid="F1"),
+            MARKER,
+            FFOOTER.format(n=1, k=0),
+            UPFENCED.format(fid="F2"),
+            FMARKER,
+        )
+        decision, note = self._run(
+            tmp_path,
+            lane,
+            output,
+            count=2,
+            adjudicable=1,
+            fenced=1,
+            ids="F1",
+            fenced_ids="F2",
+        )
+        assert decision == "uphold"
+        assert "withheld from adjudication" in note
+
+
+class TestAdjudicatorVersionFloor:
+    """#9216: the adjudicator model requires a minimum Claude Code version, and
+    the action's bundled installer can lag it -- which made every adjudication
+    call 400 while the check-run concluded normally. The floor is now asserted
+    at CONFIGURATION time, against a CLI installed from the committed
+    review-cli lockfile, so a model bump that outruns the pin fails one visible
+    step instead of failing once per PR forever."""
+
+    LANES = ("codex-review.yml", "fork-gpt-review.yml")
+    FLOOR_STEP = "Assert the adjudicator's Claude Code version floor"
+
+    @staticmethod
+    def _ver(version: str) -> tuple[int, ...]:
+        return tuple(int(part) for part in version.split("."))
+
+    @pytest.mark.parametrize("lane", LANES)
+    def test_the_model_call_uses_the_floor_asserted_executable(self, lane: str) -> None:
+        """The floor step gates the model call: same trigger condition, and the
+        adjudicate step consumes ITS executable, skipping the action's own
+        installer (whose bundled version is what fell behind). A floor breach
+        fails the assert step, the model step is skipped by its implicit
+        success() dependency, and the verdict step reports an adjudication that
+        did not run."""
+        floor_step = _step(lane, self.FLOOR_STEP)
+        model_step = _step(lane, ADJ_MODEL)
+        assert floor_step["if"] == model_step["if"], lane
+        assert (
+            model_step["with"]["path_to_claude_code_executable"]
+            == "${{ steps.adj_cli.outputs.path }}"
+        ), lane
+        script = _step_script(_workflow(lane), self.FLOOR_STEP)
+        # The comparison is a version sort, not a string compare, and every
+        # degraded path (no binary, unreadable version, floor unmet) exits
+        # nonzero rather than letting the model call proceed and 400.
+        assert "sort -V" in script, lane
+        assert "exit 1" in script, lane
+
+    def test_the_lanes_agree_on_the_floor(self) -> None:
+        floors = {
+            lane: _step_env(lane, self.FLOOR_STEP)["ADJ_CLAUDE_CODE_FLOOR"] for lane in self.LANES
+        }
+        assert len(set(floors.values())) == 1, floors
+
+    def test_the_committed_pin_satisfies_the_floor(self) -> None:
+        """The configuration-time assertion, mirrored where it is cheapest: a
+        floor bump without a manifest bump (or a manifest downgrade below the
+        floor) reds this test before any workflow run pays for it. The lockfile
+        must agree with the manifest, or `npm ci` installs something other than
+        the version this test just approved."""
+        floor = _step_env("codex-review.yml", self.FLOOR_STEP)["ADJ_CLAUDE_CODE_FLOOR"]
+        manifest = json.loads(
+            (ROOT / ".github" / "review-cli" / "package.json").read_text(encoding="utf-8")
+        )
+        pin = manifest["dependencies"]["@anthropic-ai/claude-code"]
+        assert re.fullmatch(
+            r"\d+\.\d+\.\d+", pin
+        ), f"the adjudicator CLI must be an exact pin, got {pin!r}"
+        assert self._ver(pin) >= self._ver(
+            floor
+        ), f"@anthropic-ai/claude-code pin {pin} is below the adjudicator floor {floor}"
+        lock = json.loads(
+            (ROOT / ".github" / "review-cli" / "package-lock.json").read_text(encoding="utf-8")
+        )
+        locked = lock["packages"]["node_modules/@anthropic-ai/claude-code"]["version"]
+        assert locked == pin, f"lockfile holds {locked}, manifest pins {pin}"
+
+    def _run_floor(
+        self, tmp_path: Path, lane: str, claude_body: str | None
+    ) -> tuple[int, str, dict[str, str]]:
+        """Execute the ACTUAL floor-step script with a fake `claude` binary.
+
+        ``claude_body`` is the fake binary's shell source; ``None`` installs no
+        binary at all (the review-cli manifest predating the pin).
+        """
+        if os.name == "nt":
+            pytest.skip("the floor step runs only on the Linux CI runner; skip on Windows")
+        bash = _bash()
+        if bash is None:
+            pytest.skip("the floor step executes only under Bash")
+        script = _step_script(_workflow(lane), self.FLOOR_STEP)
+        bin_dir = tmp_path / "review-cli" / "node_modules" / ".bin"
+        bin_dir.mkdir(parents=True, exist_ok=True)
+        if claude_body is not None:
+            fake = bin_dir / "claude"
+            fake.write_text(f"#!/bin/sh\n{claude_body}\n", encoding="utf-8")
+            fake.chmod(0o755)
+        outputs = tmp_path / "github-output"
+        outputs.touch()
+        env = dict(os.environ)
+        env.update(_step_env(lane, self.FLOOR_STEP))
+        env.update(RUNNER_TEMP=str(tmp_path), GITHUB_OUTPUT=str(outputs))
+        result = subprocess.run(
+            [bash, "-c", script],
+            cwd=tmp_path,
+            env=env,
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        )
+        parsed = dict(
+            line.split("=", 1)
+            for line in outputs.read_text(encoding="utf-8").splitlines()
+            if "=" in line
+        )
+        return result.returncode, result.stdout + result.stderr, parsed
+
+    @pytest.mark.parametrize("lane", LANES)
+    def test_a_version_above_the_floor_passes_and_exports_the_path(
+        self, tmp_path: Path, lane: str
+    ) -> None:
+        rc, out, parsed = self._run_floor(tmp_path, lane, 'echo "9.9.9 (Claude Code)"')
+        assert rc == 0, out
+        assert parsed["path"].endswith("node_modules/.bin/claude")
+
+    @pytest.mark.parametrize("lane", LANES)
+    def test_a_version_equal_to_the_floor_passes(self, tmp_path: Path, lane: str) -> None:
+        floor = _step_env(lane, self.FLOOR_STEP)["ADJ_CLAUDE_CODE_FLOOR"]
+        rc, out, _ = self._run_floor(tmp_path, lane, f'echo "{floor} (Claude Code)"')
+        assert rc == 0, out
+
+    @pytest.mark.parametrize("lane", LANES)
+    def test_a_version_below_the_floor_fails_naming_the_pin(
+        self, tmp_path: Path, lane: str
+    ) -> None:
+        """The #9216 shape itself: the installed CLI sits below the adjudicator
+        model's minimum. The step must fail (skipping the model call) and the
+        error must point at the pin to raise, not at the PR under review."""
+        rc, out, parsed = self._run_floor(tmp_path, lane, 'echo "2.1.240 (Claude Code)"')
+        assert rc != 0
+        assert "does not meet the adjudicator model's minimum" in out
+        assert "path" not in parsed
+
+    @pytest.mark.parametrize("lane", LANES)
+    def test_a_crashing_version_command_still_names_the_cause(
+        self, tmp_path: Path, lane: str
+    ) -> None:
+        """`set -e` must not kill the step before the empty-value check can emit
+        its diagnosis -- the extraction pipeline is `|| true`-guarded so the
+        friendly ::error:: is what a maintainer sees, not a bare nonzero exit."""
+        rc, out, _ = self._run_floor(tmp_path, lane, "exit 1")
+        assert rc != 0
+        assert "could not read the installed Claude Code version" in out
+
+    @pytest.mark.parametrize("lane", LANES)
+    def test_a_version_less_output_still_names_the_cause(self, tmp_path: Path, lane: str) -> None:
+        rc, out, _ = self._run_floor(tmp_path, lane, 'echo "no semver here"')
+        assert rc != 0
+        assert "could not read the installed Claude Code version" in out
+
+    @pytest.mark.parametrize("lane", LANES)
+    def test_a_missing_binary_points_at_the_manifest(self, tmp_path: Path, lane: str) -> None:
+        rc, out, _ = self._run_floor(tmp_path, lane, None)
+        assert rc != 0
+        assert "not in the review CLI install" in out
 
 
 class TestBlockAdjudicationExtraction:
@@ -4651,358 +5266,587 @@ class TestGptVerdictVisibility:
         assert "stale-notice" not in gate
 
 
-# The fork step writes its comment body to the workflow's hardcoded
-# `/tmp/fork-codex-comment.md` (a fork-lane idiom that is safe on an isolated CI
-# runner). These host-side cases exercise the REAL step, so `_run` rewrites that
-# absolute path under each test's own `tmp_path` before executing it: the writes
-# stay off the operator's machine and never race each other across xdist workers.
-class TestForkGptVerdictVisibility:
-    """The fork GPT lane must never bury a posted verdict under an incomplete body.
+def _exec_transcript(runner_temp: Path, review_text: str) -> dict[str, str]:
+    """Write a claude-code execution_file fixture and return its env binding.
 
-    ``fork-gpt-review.yml``'s ``Post/update summary comment`` step publishes its
-    verdict by editing ONE marker comment in place. A later incomplete run used
-    to PATCH that slot unconditionally, so a real ``[BLOCK-MERGE]`` verdict got
-    overwritten by a short "review incomplete" body -- recoverable only through
-    GraphQL ``userContentEdits``, which no REST reader or tool consults (#8292).
-    An incomplete run therefore NEVER modifies an existing comment: not even to
-    preserve the verdict and prepend a stale notice, because the preserving
-    PATCH is itself a stale-read overwrite (#8350) -- an incomplete run that
-    read verdict V1 would PATCH V1 back over a newer run's V2 that landed in
-    between. So when an existing bot comment is present, an incomplete run
-    leaves it entirely untouched (a diagnostic echo only); only blocked/clear
-    runs PATCH it. Each contract case runs the REAL fork step bash with a
-    stubbed ``gh``.
+    The design-family lanes read the model's review text from the action's
+    transcript (a single result object is one of the three shapes the step's
+    slurp+flatten parse accepts).
+    """
+    exec_file = runner_temp / "execution.json"
+    exec_file.write_text(json.dumps({"result": review_text}), encoding="utf-8")
+    return {"EXEC_FILE": str(exec_file), "REVIEW_OUTCOME": "success"}
 
-    The fork lane differs from the same-repo lane: the step runs under
-    ``set -uo pipefail`` with ``if: always()``, reads a cwd-relative
-    ``codex-review-output.md`` to decide ``kind`` (incomplete/blocked/clear --
-    there is NO human-override kind and NO override footer), and swallows gh
-    errors with ``|| true``.
+
+# One entry per review lane that carries the guarded comment upsert. Each
+# describes how to drive that lane's REAL posting step into a completed run
+# (body carries "<stamp> <head>") and an incomplete one (no verdict for the
+# current head), plus the phrase its incomplete body is known by.
+_GUARDED_LANES = [
+    {
+        "id": "fork-gpt",
+        "workflow": "fork-gpt-review.yml",
+        "step": "Post/update summary comment",
+        "marker": "<!-- codex-ai-review -->",
+        "stamp": "[GPT-REVIEWED]",
+        "incomplete_text": "review incomplete",
+        "needs_perl": False,
+        "env": {"ADJ_DECISION": "", "ADJ_NOTE": ""},
+        "completed": lambda cwd, rt, head: (
+            (cwd / "codex-review-output.md").write_text(
+                f"FINDINGS\n[GPT-REVIEWED] {head}\n", encoding="utf-8"
+            ),
+            {},
+        )[1],
+        "incomplete": lambda cwd, rt, head: {},
+    },
+    {
+        "id": "fork-opus",
+        "workflow": "fork-opus-review.yml",
+        "step": "Post/update summary comment",
+        "marker": "<!-- claude-ai-review -->",
+        "stamp": "[OPUS-REVIEWED]",
+        "incomplete_text": "review incomplete",
+        "needs_perl": False,
+        "env": {},
+        "completed": lambda cwd, rt, head: (
+            (cwd / "claude-review-output.md").write_text(
+                f"FINDINGS\n[OPUS-REVIEWED] {head}\n", encoding="utf-8"
+            ),
+            {},
+        )[1],
+        "incomplete": lambda cwd, rt, head: {},
+    },
+    {
+        "id": "design",
+        "workflow": "design-review.yml",
+        "step": "Post design review summary",
+        "marker": "<!-- design-review -->",
+        "stamp": "[DESIGN-REVIEWED]",
+        "incomplete_text": "could not complete",
+        "needs_perl": True,
+        "env": {"HUMAN_OVERRIDE": "false", "OVERRIDE_ACTOR": "", "ACTOR": "someone"},
+        "completed": lambda cwd, rt, head: _exec_transcript(
+            rt, f"Design-Verdict: PASS\n\nsolid reasoning\n\n[DESIGN-REVIEWED] {head}\n"
+        ),
+        "incomplete": lambda cwd, rt, head: _exec_transcript(
+            rt, "Design-Verdict: PASS\n\nstale reasoning\n\n[DESIGN-REVIEWED] feedbead\n"
+        ),
+    },
+    {
+        "id": "ux",
+        "workflow": "ux-review.yml",
+        "step": "Post UX review summary",
+        "marker": "<!-- ux-review -->",
+        "stamp": "[UX-REVIEWED]",
+        "incomplete_text": "could not complete",
+        "needs_perl": True,
+        "env": {
+            "HUMAN_OVERRIDE": "false",
+            "OVERRIDE_ACTOR": "",
+            "ACTOR": "someone",
+            "UI_SCOPE": "true",
+        },
+        "completed": lambda cwd, rt, head: _exec_transcript(
+            rt, f"UX-Verdict: PASS\n\nsolid reasoning\n\n[UX-REVIEWED] {head}\n"
+        ),
+        "incomplete": lambda cwd, rt, head: _exec_transcript(
+            rt, "UX-Verdict: PASS\n\nstale reasoning\n\n[UX-REVIEWED] feedbead\n"
+        ),
+    },
+    {
+        "id": "first-principles",
+        "workflow": "first-principles-review.yml",
+        "step": "Post first-principles review summary",
+        "marker": "<!-- first-principles-review -->",
+        "stamp": "[FIRST-PRINCIPLES-REVIEWED]",
+        "incomplete_text": "could not complete",
+        "needs_perl": True,
+        "env": {
+            "HUMAN_OVERRIDE": "false",
+            "OVERRIDE_ACTOR": "",
+            "ACTOR": "someone",
+            "SURFACE": "true",
+            "CONTRACT": "true",
+        },
+        "completed": lambda cwd, rt, head: _exec_transcript(
+            rt,
+            "First-Principles-Verdict: PASS\n\nsolid reasoning\n\n"
+            f"[FIRST-PRINCIPLES-REVIEWED] {head}\n",
+        ),
+        "incomplete": lambda cwd, rt, head: _exec_transcript(
+            rt,
+            "First-Principles-Verdict: PASS\n\nstale reasoning\n\n"
+            "[FIRST-PRINCIPLES-REVIEWED] feedbead\n",
+        ),
+    },
+    {
+        "id": "fork-design",
+        "workflow": "fork-design-review.yml",
+        "step": "Post/update design review comment",
+        "marker": "<!-- design-review -->",
+        "stamp": "[DESIGN-REVIEWED]",
+        "incomplete_text": "could not complete",
+        "needs_perl": False,
+        "env": {},
+        "completed": lambda cwd, rt, head: (
+            (rt / "design-review-output.md").write_text(
+                f"solid reasoning\n\n[DESIGN-REVIEWED] {head}\n", encoding="utf-8"
+            ),
+            {"VERDICT": "PASS", "REVIEW_OUTCOME": "success"},
+        )[1],
+        "incomplete": lambda cwd, rt, head: {"VERDICT": "UNKNOWN", "REVIEW_OUTCOME": "failure"},
+    },
+    {
+        "id": "fork-ux",
+        "workflow": "fork-ux-review.yml",
+        "step": "Post UX review summary",
+        "marker": "<!-- ux-review -->",
+        "stamp": "[UX-REVIEWED]",
+        "incomplete_text": "could not complete",
+        "needs_perl": True,
+        "env": {"UI_SCOPE": "true"},
+        "completed": lambda cwd, rt, head: _exec_transcript(
+            rt, f"UX-Verdict: PASS\n\nsolid reasoning\n\n[UX-REVIEWED] {head}\n"
+        ),
+        "incomplete": lambda cwd, rt, head: _exec_transcript(
+            rt, "UX-Verdict: PASS\n\nstale reasoning\n\n[UX-REVIEWED] feedbead\n"
+        ),
+    },
+    {
+        "id": "fork-first-principles",
+        "workflow": "fork-first-principles-review.yml",
+        "step": "Post/update first-principles review comment",
+        "marker": "<!-- first-principles-review -->",
+        "stamp": "[FIRST-PRINCIPLES-REVIEWED]",
+        "incomplete_text": "could not complete",
+        "needs_perl": False,
+        "env": {"WITHHELD": ""},
+        "completed": lambda cwd, rt, head: (
+            (rt / "first-principles-output.md").write_text(
+                f"solid reasoning\n\n[FIRST-PRINCIPLES-REVIEWED] {head}\n", encoding="utf-8"
+            ),
+            {"VERDICT": "PASS", "REVIEW_OUTCOME": "success"},
+        )[1],
+        "incomplete": lambda cwd, rt, head: {"VERDICT": "UNKNOWN", "REVIEW_OUTCOME": "failure"},
+    },
+]
+
+_GUARDED_LANE_PARAMS = [pytest.param(lane, id=lane["id"]) for lane in _GUARDED_LANES]
+
+
+class TestReviewLaneVerdictVisibility:
+    """No review lane may bury a posted verdict under an incomplete body (#8344).
+
+    Covers the eight lanes that upsert a marker-keyed summary comment outside
+    codex-review.yml. Each lane defines the guarded upsert as a byte-identical
+    ``guarded_comment_upsert`` bash function; the identity test pins every
+    copy to one canonical body so the invariant cannot drift lane by lane, and
+    the behavioral tests run each lane's REAL step bash with a stubbed ``gh``
+    for the contract cases.
+
+    The guarded transition is a NO-TOUCH, not a merge: a run whose body
+    carries no ``"<stamp> <head>"`` proof marker leaves an existing comment
+    entirely alone. Reading the body and PATCHing a merge of it back would
+    reopen the same class of loss from the other side, because runs for
+    different heads are not cancelled — a verdict published between the read
+    and the write is restored away.
     """
 
-    MARKER = "<!-- codex-ai-review -->"
-    HEAD = "f" * 40
-    OLD_HEAD = "a" * 40
-    BOT_COMMENT_ID = "555"
-    IMPOSTOR_COMMENT_ID = "666"
+    HEAD = "1234567890abcdef1234567890abcdef12345678"
+    OLD = "aaaa567890abcdef1234567890abcdef1234aaaa"
 
-    def _step(self) -> str:
-        return _step_script(_workflow("fork-gpt-review.yml"), "Post/update summary comment")
-
-    def _gh_stub(
-        self, comments_json: Path, patch_log: Path, created_log: Path, *, lookup_fails: bool = False
-    ) -> str:
-        """A gh stub that answers the three calls this step makes.
-
-        ``gh api .../comments --paginate --jq <f>``: runs the step's own jq
-        filter over an array fixture that holds both an impostor ``mallory``
-        comment and the ``github-actions[bot]`` comment, so the author guard is
-        exercised for real. ``gh api --method PATCH ...``: records the target id
-        and stdin body. ``gh pr comment ...``: records the created body.
-        """
+    def _verdict_body(self, lane: dict, sha: str) -> str:
         return (
-            "#!/usr/bin/env bash\n"
-            'if [ "${1:-}" = "api" ] && [ "${2:-}" = "--method" ] && [ "${3:-}" = "PATCH" ]; then\n'
-            f'  printf \'%s\\n\' "$4" >> "{patch_log}"\n'
-            "  # --field body=<value> follows; find it and record the value.\n"
-            "  shift 4\n"
-            '  while [ "$#" -gt 0 ]; do\n'
-            '    case "$1" in\n'
-            f'      body=*) printf \'%s\' "${{1#body=}}" >> "{patch_log}" ;;\n'
-            '      --field) shift; printf \'%s\' "${1#body=}" >> "' + str(patch_log) + '" ;;\n'
-            "    esac\n"
-            "    shift\n"
-            "  done\n"
-            "  exit 0\n"
-            "fi\n"
-            'if [ "${1:-}" = "api" ]; then\n'
-            # A lookup FAILURE: the comments-list API errors (network/5xx).
-            # The step must not treat the empty output as "no comment".
-            + ("  echo 'gh: API error' >&2\n  exit 1\n" if lookup_fails else "")
-            + "  # Locate the --jq filter and apply it to the array fixture.\n"
-            "  # `gh api --jq` emits RAW output (like `jq -r`), so an @json\n"
-            "  # record prints as compact JSON with no surrounding quotes --\n"
-            "  # the step's `jq -r '.id'` then reparses that line as an object.\n"
-            '  filter=""\n'
-            '  while [ "$#" -gt 0 ]; do\n'
-            '    if [ "$1" = "--jq" ]; then shift; filter="$1"; fi\n'
-            "    shift\n"
-            "  done\n"
-            f'  jq -r "$filter" "{comments_json}"\n'
-            "  exit 0\n"
-            "fi\n"
-            'if [ "${1:-}" = "pr" ] && [ "${2:-}" = "comment" ]; then\n'
-            "  # --body-file <path> is the last pair.\n"
-            '  file=""\n'
-            '  while [ "$#" -gt 0 ]; do\n'
-            '    if [ "$1" = "--body-file" ]; then shift; file="$1"; fi\n'
-            "    shift\n"
-            "  done\n"
-            f'  cat "$file" >> "{created_log}"\n'
-            "  exit 0\n"
-            "fi\n"
-            'echo "unexpected gh call: $*" >&2\n'
-            "exit 9\n"
+            f"{lane['marker']}\n"
+            "## Review — 🔴 changes requested (blocking)\n"
+            "\n"
+            f"a completed review of `{sha}`.\n"
+            "\n"
+            f"{lane['stamp']} {sha}\n"
         )
 
-    def _run(
+    def _run_step(
         self,
+        lane: dict,
         tmp_path: Path,
         *,
-        comments: list[dict],
-        review_output: str | None,
-        lookup_fails: bool = False,
-    ) -> tuple[subprocess.CompletedProcess, Path, Path]:
+        existing_body: str | None,
+        kind: str,
+        extra_env: dict[str, str] | None = None,
+    ) -> tuple[Path, "subprocess.CompletedProcess[bytes]"]:
         bash = _bash()
-        if bash is None:
-            pytest.skip("the step is Bash; skip where Bash is absent")
-        if shutil.which("jq") is None:
-            pytest.skip("the step shells out to jq")
+        if bash is None or shutil.which("jq") is None:
+            pytest.skip("lane upsert tests require Bash and jq")
+        if lane["needs_perl"] and shutil.which("perl") is None:
+            pytest.skip("this lane's posting step redacts with perl")
+        if os.name == "nt":
+            pytest.skip("stubbed-PATH gh interception is exercised on POSIX runners")
 
-        bin_dir = tmp_path / "bin"
-        bin_dir.mkdir()
-        comments_json = tmp_path / "comments.json"
-        comments_json.write_text(json.dumps(comments), encoding="utf-8")
-        patch_log = tmp_path / "patch.log"
-        patch_log.touch()
-        created_log = tmp_path / "created.log"
-        created_log.touch()
-
-        (bin_dir / "gh").write_text(
-            self._gh_stub(comments_json, patch_log, created_log, lookup_fails=lookup_fails),
-            encoding="utf-8",
-        )
-        (bin_dir / "gh").chmod(0o755)
-
-        # The step reads a cwd-relative codex-review-output.md to decide `kind`.
-        # Absent/empty output => incomplete; markers present => blocked/clear.
-        if review_output is not None:
-            (tmp_path / "codex-review-output.md").write_text(review_output, encoding="utf-8")
-
+        stub_dir = tmp_path / "stub"
+        stub_dir.mkdir()
+        calls_dir = tmp_path / "calls"
+        calls_dir.mkdir()
         runner_temp = tmp_path / "runner-temp"
         runner_temp.mkdir()
+        cwd = tmp_path / "workspace"
+        cwd.mkdir()
 
-        # The step writes its new comment body to the workflow's HARDCODED
-        # `/tmp/fork-codex-comment.md` (a fork-lane idiom that is safe on an
-        # isolated CI runner). A test must not touch the operator's machine, so
-        # redirect that absolute path under `tmp_path` before running the real
-        # step (AGENTS.md: no test side effects, a spawn's writes stay under
-        # `tmp_path`). The step's other temp files already honour RUNNER_TEMP.
-        comment_file = tmp_path / "fork-codex-comment.md"
-        step = self._step().replace("/tmp/fork-codex-comment.md", str(comment_file))
-        assert "/tmp/fork-codex-comment.md" not in step
+        finder_file = tmp_path / "finder-comments.json"
+        if existing_body is None:
+            finder_file.write_text("[]", encoding="utf-8")
+        else:
+            finder_file.write_text(
+                json.dumps(
+                    [
+                        {"id": 999, "user": {"login": "mallory"}, "body": existing_body},
+                        {
+                            "id": 123,
+                            "user": {"login": "github-actions[bot]"},
+                            "body": existing_body,
+                        },
+                    ]
+                ),
+                encoding="utf-8",
+            )
 
-        proc = subprocess.run(
-            # GitHub executes run-blocks as `bash -e {0}`.
-            [bash, "-e", "-c", step],
+        if kind == "completed":
+            case_env = lane["completed"](cwd, runner_temp, self.HEAD)
+        elif kind == "incomplete":
+            case_env = lane["incomplete"](cwd, runner_temp, self.HEAD)
+        else:
+            case_env = {}
+
+        gh_stub = stub_dir / "gh"
+        gh_stub.write_text(
+            "#!/usr/bin/env bash\n"
+            "# Emulates the two gh surfaces the step uses; records mutations.\n"
+            "# The finder branch runs the step's REAL --jq filter with real jq\n"
+            "# over an array fixture, so a drift in the filter (dropped .id,\n"
+            "# changed author guard) fails these tests instead of hiding.\n"
+            'if [ "$1" = "api" ] && [ "$2" = "--method" ] && [ "$3" = "PATCH" ]; then\n'
+            '  printf \'%s\\n\' "$4" >> "$STUB_CALLS/patch-calls.txt"\n'
+            '  for a in "$@"; do\n'
+            '    case "$a" in body=*) printf \'%s\' "${a#body=}" > "$STUB_CALLS/patched-body.md";; esac\n'
+            "  done\n"
+            "  exit 0\n"
+            "fi\n"
+            'if [ "$1" = "api" ] && [ -n "${FINDER_FAIL:-}" ]; then\n'
+            "  # Every attempt at the COMMENT lookup fails, so the retry is\n"
+            "  # visible in the recorded call count; the step must not read a\n"
+            '  # lookup error as "no comment exists".\n'
+            '  case "$2" in\n'
+            "    */comments)\n"
+            '      printf \'%s\\n\' "$2" >> "$STUB_CALLS/comment-reads.txt"\n'
+            "      exit 4\n"
+            "      ;;\n"
+            "  esac\n"
+            "fi\n"
+            'if [ "$1" = "api" ]; then\n'
+            "  # The PR object, from which the step reads the CURRENT head sha.\n"
+            "  # STUB_PR_HEAD unset means the PR still points at this run;\n"
+            "  # set-but-empty means every read fails, so the retry is visible\n"
+            "  # in the recorded call count.\n"
+            '  case "$2" in\n'
+            "    */pulls/*)\n"
+            '      printf \'%s\\n\' "$2" >> "$STUB_CALLS/pr-head-reads.txt"\n'
+            '      if [ -z "${STUB_PR_HEAD-unset}" ]; then exit 5; fi\n'
+            "      printf '%s\\n' \"${STUB_PR_HEAD:-$HEAD}\"\n"
+            "      exit 0\n"
+            "      ;;\n"
+            "  esac\n"
+            "fi\n"
+            'if [ "$1" = "api" ]; then\n'
+            '  filter=""\n'
+            "  grab=0\n"
+            '  for a in "$@"; do\n'
+            '    if [ "$grab" = 1 ]; then filter="$a"; grab=0; fi\n'
+            '    [ "$a" = "--jq" ] && grab=1\n'
+            "  done\n"
+            '  jq -r "$filter" < "$FINDER_COMMENTS_FILE"\n'
+            "  exit 0\n"
+            "fi\n"
+            'if [ "$1" = "pr" ] && [ "$2" = "comment" ]; then\n'
+            "  shift 3\n"
+            '  if [ "$1" = "--body-file" ]; then cp "$2" "$STUB_CALLS/created-body.md"; fi\n'
+            "  exit 0\n"
+            "fi\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        gh_stub.chmod(0o755)
+
+        script = _step_script(_workflow(lane["workflow"]), lane["step"])
+        script_file = tmp_path / "step.sh"
+        script_file.write_text(script, encoding="utf-8")
+
+        env = {
+            **os.environ,
+            "PATH": f"{stub_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+            "REPO": "example/repo",
+            "PR": "1",
+            "HEAD": self.HEAD,
+            "GH_TOKEN": "stub-token",
+            "RUNNER_TEMP": str(runner_temp),
+            "STUB_CALLS": str(calls_dir),
+            "FINDER_COMMENTS_FILE": str(finder_file),
+            "GITHUB_OUTPUT": str(tmp_path / "github-output.txt"),
+            **lane["env"],
+            **case_env,
+            **(extra_env or {}),
+        }
+        # GitHub runs `run:` blocks with `bash -e {0}` when no shell is set.
+        result = subprocess.run(
+            [bash, "-e", str(script_file)],
             check=False,
             capture_output=True,
-            text=True,
-            encoding="utf-8",
-            env={
-                **os.environ,
-                "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
-                "GH_TOKEN": "stub",
-                "REPO": "o/r",
-                "PR": "1",
-                "HEAD": self.HEAD,
-                "RUNNER_TEMP": str(runner_temp),
-            },
-            cwd=tmp_path,
+            cwd=cwd,
+            env=env,
         )
-        assert proc.returncode == 0, f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
-        return proc, patch_log, created_log
+        return calls_dir, result
 
-    def _fixture_comments(self, bot_body: str) -> list[dict]:
-        """An array with an impostor first, then the bot's marker comment.
-
-        The impostor plants the marker under a non-bot login: the author guard
-        (`.user.login == "github-actions[bot]"`) must reject it, so a match on
-        it would prove the guard is not exercised.
-        """
-        return [
-            {
-                "id": int(self.IMPOSTOR_COMMENT_ID),
-                "user": {"login": "mallory"},
-                "body": f"{self.MARKER}\nnice try",
-            },
-            {
-                "id": int(self.BOT_COMMENT_ID),
-                "user": {"login": "github-actions[bot]"},
-                "body": bot_body,
-            },
-        ]
-
-    def _blocking_verdict_body(self, head: str, *, extra: str = "") -> str:
-        """A prior completed BLOCK-MERGE verdict comment body, CRLF like GitHub."""
-        lines = [
-            self.MARKER,
-            "## GPT 5.6 Review (fork) — 🔴 changes requested (blocking)",
-            "",
-            f"_Reviewed `{head}` via the fork AI-review pipeline; updated in place on each push._",
-            "",
-            f"[GPT-REVIEWED] {head}",
-            f"[BLOCK-MERGE] {head}",
-            "",
-            "A real blocking finding lives here.",
-        ]
-        if extra:
-            lines.append(extra)
-        # GitHub returns bodies with CRLF; the step must normalize before grep.
-        return "\r\n".join(lines)
-
-    def test_incomplete_run_never_overwrites_a_posted_verdict(self, tmp_path: Path) -> None:
-        # A completed BLOCK-MERGE verdict already sits in the bot comment. An
-        # incomplete run must leave that comment ENTIRELY untouched: no PATCH,
-        # no create. Even a PATCH that "only" preserved the verdict and
-        # prepended a notice is itself the stale-read overwrite (#8350): the
-        # incomplete run read verdict V1, and PATCHing V1 (with a notice) back
-        # would clobber a newer run's V2 that landed in between. So no edit of
-        # any kind may target this comment.
-        verdict_body = self._blocking_verdict_body(self.OLD_HEAD)
-        comments = self._fixture_comments(verdict_body)
-        # review_output=None => the step's `kind` stays "incomplete".
-        _proc, patch_log, created_log = self._run(tmp_path, comments=comments, review_output=None)
-
-        # No PATCH targeted the bot comment (nor the impostor's), and no new
-        # comment was created. A revert to the old preserve-and-prepend PATCH
-        # would record a PATCH here and fail this assertion.
-        assert patch_log.read_text(encoding="utf-8") == ""
-        assert created_log.read_text(encoding="utf-8") == ""
-
-    def test_completed_verdict_still_replaces_the_comment_wholesale(self, tmp_path: Path) -> None:
-        # A completed run for the new HEAD must replace the old body outright:
-        # no stale-notice, old markers gone, new HEAD markers present.
-        old_body = self._blocking_verdict_body(self.OLD_HEAD)
-        comments = self._fixture_comments(old_body)
-        review_output = (
-            f"[GPT-REVIEWED] {self.HEAD}\n"
-            f"[BLOCK-MERGE] {self.HEAD}\n"
-            "Fresh blocking finding.\n"
-        )
-        _proc, patch_log, created_log = self._run(
-            tmp_path, comments=comments, review_output=review_output
+    @pytest.mark.parametrize("lane", _GUARDED_LANE_PARAMS)
+    def test_incomplete_run_never_overwrites_a_posted_verdict(
+        self, lane: dict, tmp_path: Path
+    ) -> None:
+        calls, result = self._run_step(
+            lane, tmp_path, existing_body=self._verdict_body(lane, self.OLD), kind="incomplete"
         )
 
-        patched = patch_log.read_text(encoding="utf-8")
-        # PATCH still targets the bot comment.
-        assert self.BOT_COMMENT_ID in patched
-        # New HEAD markers present; old HEAD markers gone.
-        assert f"[BLOCK-MERGE] {self.HEAD}" in patched
-        assert self.OLD_HEAD not in patched
-        # No stale-notice on a wholesale replace.
-        assert "codex-stale-notice-begin" not in patched
-        assert "did not produce a completed verdict" not in patched
-        assert created_log.read_text(encoding="utf-8") == ""
+        assert result.returncode == 0, result.stderr.decode()
+        # NOTHING was written: no PATCH of any comment, no new comment. The
+        # posted verdict is therefore still exactly what the completed run
+        # published, and no read-modify-write can restore a stale body over a
+        # verdict a concurrent run publishes in the meantime.
+        assert not (calls / "patch-calls.txt").exists()
+        assert not (calls / "patched-body.md").exists()
+        assert not (calls / "created-body.md").exists()
+        # The step says so, naming the comment it deliberately left alone --
+        # and it found that id through the real author-guarded --jq filter, so
+        # it is the bot's comment (123), never the impostor's (999).
+        stdout = result.stdout.decode()
+        assert "left existing comment #123 untouched" in stdout
+        assert "#999" not in stdout
 
-    def test_incomplete_run_never_overwrites_a_marker_absent_comment(self, tmp_path: Path) -> None:
-        # Stale-read race (#8292): overlapping runs for different SHAs. An older
-        # incomplete run reads the bot comment BEFORE a newer run PATCHes its
-        # verdict in, so at read time the body carries no `[GPT-REVIEWED]`
-        # marker yet. The older incomplete run must NOT PATCH -- doing so would
-        # clobber the newer run's just-published verdict with a "review
-        # incomplete" body, re-hiding the finding. An incomplete body never
-        # overwrites an existing comment, marker-present or not.
-        marker_absent_body = "\r\n".join(
-            [
-                self.MARKER,
-                "## GPT 5.6 Review (fork) — ⏳ review incomplete",
-                "",
-                "_No completed GPT verdict for this commit; see the Fork GPT 5.6 Review job logs._",
+    @pytest.mark.parametrize("lane", _GUARDED_LANE_PARAMS)
+    def test_incomplete_run_with_a_failed_lookup_posts_nothing(
+        self, lane: dict, tmp_path: Path
+    ) -> None:
+        # A lookup that errored cannot be read as "no comment exists": taking
+        # the create path there plants a second marker comment over a possibly
+        # live verdict, and a marker planted is not undone by a later run.
+        calls, result = self._run_step(
+            lane,
+            tmp_path,
+            existing_body=self._verdict_body(lane, self.OLD),
+            kind="incomplete",
+            extra_env={"FINDER_FAIL": "1"},
+        )
+
+        assert result.returncode == 0, result.stderr.decode()
+        assert not (calls / "patched-body.md").exists()
+        assert not (calls / "created-body.md").exists()
+        # Whether a comment exists is a gating input, so the read retries
+        # before the step concludes it could not be determined.
+        reads = (calls / "comment-reads.txt").read_text(encoding="utf-8").splitlines()
+        assert len(reads) == 3, reads
+        assert "comment lookup also failed" in result.stdout.decode()
+
+    @pytest.mark.parametrize("lane", _GUARDED_LANE_PARAMS)
+    def test_a_superseded_completed_verdict_leaves_the_comment_alone(
+        self, lane: dict, tmp_path: Path
+    ) -> None:
+        # The same loss arriving late: a run for an older head can COMPLETE
+        # after a newer run published its verdict into the shared slot -- the
+        # fork lanes' concurrency group is keyed per head so they are not
+        # cancelled, and a cancelled same-repo run still executes this
+        # if:always() step. Its verdict is real, but it is not this PR's
+        # verdict any more, so it must not replace the current one.
+        newer = "bbbb567890abcdef1234567890abcdef1234bbbb"
+        calls, result = self._run_step(
+            lane,
+            tmp_path,
+            existing_body=self._verdict_body(lane, newer),
+            kind="completed",
+            extra_env={"STUB_PR_HEAD": newer},
+        )
+
+        assert result.returncode == 0, result.stderr.decode()
+        assert not (calls / "patched-body.md").exists()
+        assert not (calls / "created-body.md").exists()
+        stdout = result.stdout.decode()
+        assert "is no longer this PR's head" in stdout
+        assert "left existing comment #123 untouched" in stdout
+
+    @pytest.mark.parametrize("lane", _GUARDED_LANE_PARAMS)
+    def test_an_unreadable_pr_head_retries_then_withholds(self, lane: dict, tmp_path: Path) -> None:
+        # Writing is the destructive half of the guard, so it must not proceed
+        # on an unknown: a head that stays unreadable is NOT confirmed current
+        # and the shared slot is left alone. A single blip is not evidence
+        # about the PR, so the read retries first, as this lane's other gating
+        # reads do.
+        calls, result = self._run_step(
+            lane,
+            tmp_path,
+            existing_body=self._verdict_body(lane, self.OLD),
+            kind="completed",
+            extra_env={"STUB_PR_HEAD": ""},
+        )
+
+        assert result.returncode == 0, result.stderr.decode()
+        reads = (calls / "pr-head-reads.txt").read_text(encoding="utf-8").splitlines()
+        assert len(reads) == 3, reads
+        assert not (calls / "patched-body.md").exists()
+        assert not (calls / "created-body.md").exists()
+        assert "unreadable after 3 attempts" in result.stdout.decode()
+
+    @pytest.mark.parametrize("lane", _GUARDED_LANE_PARAMS)
+    def test_completed_verdict_still_replaces_the_comment(self, lane: dict, tmp_path: Path) -> None:
+        calls, result = self._run_step(
+            lane, tmp_path, existing_body=self._verdict_body(lane, self.OLD), kind="completed"
+        )
+
+        assert result.returncode == 0, result.stderr.decode()
+        patched = (calls / "patched-body.md").read_text(encoding="utf-8")
+        # A completed verdict replaces the comment wholesale, exactly as before.
+        assert patched.startswith(f"{lane['marker']}\n")
+        assert f"{lane['stamp']} {self.HEAD}" in patched
+        assert f"{lane['stamp']} {self.OLD}" not in patched
+        assert not (calls / "created-body.md").exists()
+        # The author guard ran inside the real filter: the PATCH must target
+        # the bot's comment (123), not the marker-planting impostor's (999).
+        patch_calls = (calls / "patch-calls.txt").read_text(encoding="utf-8")
+        assert "/comments/123" in patch_calls
+        assert "/comments/999" not in patch_calls
+
+    @pytest.mark.parametrize("lane", _GUARDED_LANE_PARAMS)
+    def test_completed_verdict_creates_when_the_lookup_fails(
+        self, lane: dict, tmp_path: Path
+    ) -> None:
+        # The asymmetry that makes the guard safe in both directions: a
+        # duplicate comment is recoverable, an unposted verdict is not, so a
+        # completed verdict publishes even when the lookup could not confirm
+        # whether a comment already exists (#8350).
+        calls, result = self._run_step(
+            lane,
+            tmp_path,
+            existing_body=self._verdict_body(lane, self.OLD),
+            kind="completed",
+            extra_env={"FINDER_FAIL": "1"},
+        )
+
+        assert result.returncode == 0, result.stderr.decode()
+        created = (calls / "created-body.md").read_text(encoding="utf-8")
+        assert f"{lane['stamp']} {self.HEAD}" in created
+        assert not (calls / "patched-body.md").exists()
+
+    @pytest.mark.parametrize("lane", _GUARDED_LANE_PARAMS)
+    def test_incomplete_with_no_existing_comment_creates_as_before(
+        self, lane: dict, tmp_path: Path
+    ) -> None:
+        calls, result = self._run_step(lane, tmp_path, existing_body=None, kind="incomplete")
+
+        assert result.returncode == 0, result.stderr.decode()
+        created = (calls / "created-body.md").read_text(encoding="utf-8")
+        assert created.startswith(f"{lane['marker']}\n")
+        assert lane["incomplete_text"] in created
+        assert not (calls / "patched-body.md").exists()
+
+    def test_withheld_fork_fp_body_leaves_a_posted_verdict_alone(self, tmp_path: Path) -> None:
+        # The fork first-principles lane posts its withheld notice from a
+        # separate early site; it routes through the same guarded upsert, so a
+        # credential-shaped output discards the body without touching the
+        # previously posted verdict.
+        lane = next(entry for entry in _GUARDED_LANES if entry["id"] == "fork-first-principles")
+        calls, result = self._run_step(
+            lane,
+            tmp_path,
+            existing_body=self._verdict_body(lane, self.OLD),
+            kind="none",
+            extra_env={"WITHHELD": "true", "VERDICT": "UNKNOWN", "REVIEW_OUTCOME": "success"},
+        )
+
+        assert result.returncode == 0, result.stderr.decode()
+        assert not (calls / "patched-body.md").exists()
+        assert not (calls / "created-body.md").exists()
+        assert "left existing comment #123 untouched" in result.stdout.decode()
+
+    def test_skip_notice_still_replaces_the_comment_wholesale(self, tmp_path: Path) -> None:
+        # A skip notice is a COMPLETED determination about the current head
+        # (the revision ships no reviewable surface), not a review failure, so
+        # it deliberately keeps the unguarded replace: guarding it would pin a
+        # stale verdict onto a revision the lane has ruled out of scope.
+        lane = next(entry for entry in _GUARDED_LANES if entry["id"] == "ux")
+        calls, result = self._run_step(
+            lane,
+            tmp_path,
+            existing_body=self._verdict_body(lane, self.OLD),
+            kind="none",
+            extra_env={"UI_SCOPE": "false", "EXEC_FILE": "", "REVIEW_OUTCOME": "success"},
+        )
+
+        assert result.returncode == 0, result.stderr.decode()
+        patched = (calls / "patched-body.md").read_text(encoding="utf-8")
+        assert "⏭️ skipped" in patched
+        assert f"{lane['stamp']} {self.OLD}" not in patched
+
+    def test_guard_function_is_byte_identical_across_all_lanes(self) -> None:
+        bodies = set()
+        for lane in _GUARDED_LANES:
+            script = _step_script(_workflow(lane["workflow"]), lane["step"])
+            bodies.add(_shell_function(script, "guarded_comment_upsert"))
+        assert len(bodies) == 1, (
+            "guarded_comment_upsert must stay byte-identical across every "
+            "review lane; edit all copies together"
+        )
+        canonical = bodies.pop()
+        code_lines = [line for line in canonical.splitlines() if not line.lstrip().startswith("#")]
+        # The lookup reads the id and nothing else. Capturing the current body
+        # is what a merge-and-PATCH shape needs, and the presence of a body in
+        # this function is the signature of that shape coming back.
+        assert "| .id" in canonical
+        assert not any("| {id, body}" in line for line in code_lines)
+        # The first id is selected off the CAPTURED output, never via a
+        # `| head -n1` inside the pipeline (SIGPIPE under pipefail).
+        assert not any("head -n1" in line for line in code_lines)
+        assert any("| awk 'NR == 1'" in line for line in code_lines)
+        # Exactly two conditions withhold the write, and each names itself.
+        assert 'if ! grep -Fq "$stamp $HEAD" "$out_file"; then' in canonical
+        assert 'withhold="run for $HEAD produced no completed verdict"' in canonical
+        # BOTH gating reads retry a transient failure before deciding.
+        assert canonical.count("for attempt in 1 2 3; do") == 2
+        assert canonical.count('if [ "$attempt" -lt 3 ]; then') == 2
+        assert 'pr_head="$(gh api "repos/$REPO/pulls/$PR" --jq \'.head.sha\')"' in canonical
+        # An unreadable head is NOT confirmed current: the destructive write
+        # must not proceed on an unknown, so this arm withholds like the others.
+        assert 'if [ -z "$pr_head" ]; then' in canonical
+        assert "unreadable after 3 attempts" in canonical
+        assert 'elif [ "$pr_head" != "$HEAD" ]; then' in canonical
+        assert 'withhold="$HEAD is no longer this PR\'s head ($pr_head)"' in canonical
+        # A withheld write returns before reaching any PATCH: both no-touch
+        # arms (lookup failed, comment exists) `return 0`, so the only write
+        # left on that path is creating a comment where none exists.
+        withheld = canonical.split('if [ -n "$withhold" ]; then', 1)
+        assert len(withheld) == 2, "the two withhold reasons must share one no-touch block"
+        block = withheld[1].split("\n  fi\n", 1)[0]
+        assert "--method PATCH" not in block
+        assert block.count("return 0") == 3
+        # A failed lookup on a COMPLETED verdict for the current head still
+        # falls through to CREATE, never to silence.
+        assert 'gh pr comment "$PR" --body-file "$out_file"' in canonical
+
+    def test_every_lane_calls_the_guard_and_fork_fp_covers_both_sites(self) -> None:
+        for lane in _GUARDED_LANES:
+            script = _step_script(_workflow(lane["workflow"]), lane["step"])
+            calls = [
+                line.strip()
+                for line in script.splitlines()
+                if line.strip().startswith("guarded_comment_upsert ")
             ]
-        )
-        comments = self._fixture_comments(marker_absent_body)
-        # review_output=None => the step's `kind` stays "incomplete".
-        _proc, patch_log, created_log = self._run(tmp_path, comments=comments, review_output=None)
-
-        # The incomplete run left the existing comment untouched: no PATCH, no
-        # new comment. A revert of the workflow fix (unconditional PATCH in the
-        # else branch) would record a PATCH here and fail this assertion.
-        assert patch_log.read_text(encoding="utf-8") == ""
-        assert created_log.read_text(encoding="utf-8") == ""
-
-    def test_incomplete_run_with_no_existing_comment_creates_as_before(
-        self, tmp_path: Path
-    ) -> None:
-        # No bot comment exists (only the impostor). An incomplete run creates a
-        # fresh comment carrying the marker and the incomplete verdict, with no
-        # stale-notice and no PATCH.
-        comments = [
-            {
-                "id": int(self.IMPOSTOR_COMMENT_ID),
-                "user": {"login": "mallory"},
-                "body": f"{self.MARKER}\nnice try",
-            },
-        ]
-        _proc, patch_log, created_log = self._run(tmp_path, comments=comments, review_output=None)
-
-        created = created_log.read_text(encoding="utf-8")
-        assert created.startswith(self.MARKER)
-        assert "⚠️ review incomplete" in created
-        assert "codex-stale-notice-begin" not in created
-        # No PATCH happened -- nothing to edit.
-        assert patch_log.read_text(encoding="utf-8") == ""
-
-    def test_step_source_carries_the_fix_and_leaves_finalize_untouched(self) -> None:
-        # Static guards: an incomplete run over an existing comment does NOTHING
-        # to it, and the fail-closed finalize step (the fork analogue of
-        # codex-review.yml's "Gate on findings") is untouched by the fix.
-        workflow = _workflow("fork-gpt-review.yml")
-        comment_step = _step_script(workflow, "Post/update summary comment")
-        # The incomplete branch leaves the comment untouched (diagnostic only),
-        # so only the else branch (blocked/clear) PATCHes the existing comment.
-        assert 'if [ "$kind" = "incomplete" ]; then' in comment_step
-        assert "left existing comment #$existing untouched" in comment_step
-        # No stale-notice construction survives anywhere in the step: nothing
-        # writes a notice, builds a merged body, or strips one with sed.
-        assert "codex-stale-notice" not in comment_step
-        assert "fork-codex-merged-comment" not in comment_step
-        assert "fork-codex-existing-comment" not in comment_step
-        # The fork lane has NO human-override footer.
-        assert "/ai-review override" not in comment_step
-
-        finalize_step = _step_script(workflow, "Finalize check-run (fail closed)")
-        assert "stale-notice" not in finalize_step
-
-    def test_incomplete_run_on_lookup_failure_neither_patches_nor_creates(
-        self, tmp_path: Path
-    ) -> None:
-        # An INCOMPLETE run: a transient comments-list API failure must NOT be
-        # read as "no existing comment", which would send it down the create
-        # path and post a fresh "review incomplete" marker over a verdict that
-        # is really still there. So an incomplete run whose lookup failed makes
-        # no edit of any kind (diagnostic only); the fail-closed finalize step
-        # still gates merge.
-        verdict_body = self._blocking_verdict_body(self.OLD_HEAD)
-        comments = self._fixture_comments(verdict_body)
-        proc, patch_log, created_log = self._run(
-            tmp_path, comments=comments, review_output=None, lookup_fails=True
-        )
-
-        assert patch_log.read_text(encoding="utf-8") == ""
-        assert created_log.read_text(encoding="utf-8") == ""
-        assert "lookup failed" in proc.stdout.lower() or "skipping" in proc.stdout.lower()
-
-    def test_completed_run_on_lookup_failure_still_publishes_the_verdict(
-        self, tmp_path: Path
-    ) -> None:
-        # A COMPLETED verdict (blocked/clear) must become visible. The lookup
-        # failure guard is scoped to the incomplete case ONLY: suppressing a
-        # completed verdict on a transient lookup error would trade away the
-        # very visibility this fix restores. A duplicate comment is far more
-        # recoverable than a real verdict that never posts, so a completed run
-        # whose lookup failed falls through to CREATE rather than staying
-        # silent.
-        review_output = f"[GPT-REVIEWED] {self.HEAD}\n[BLOCK-MERGE] {self.HEAD}\nblocking finding"
-        comments = self._fixture_comments(self._blocking_verdict_body(self.OLD_HEAD))
-        _proc, patch_log, created_log = self._run(
-            tmp_path, comments=comments, review_output=review_output, lookup_fails=True
-        )
-
-        # No PATCH (the lookup could not confirm a target), but the verdict WAS
-        # published via create -- not silently dropped.
-        assert patch_log.read_text(encoding="utf-8") == ""
-        assert created_log.read_text(encoding="utf-8") != ""
+            expected = 2 if lane["id"] == "fork-first-principles" else 1
+            assert len(calls) == expected, (lane["id"], calls)
+            for call in calls:
+                assert f'"{lane["stamp"]}"' in call
 
 
 class TestGptRefusalTerminalState:
@@ -5246,9 +6090,7 @@ class TestGptRefusalTerminalState:
         # to remove.
         assert "re-run the workflow or inspect" not in proc.stdout
 
-    def test_completed_verdict_quoting_the_marker_is_not_reclassified(
-        self, tmp_path: Path
-    ) -> None:
+    def test_completed_verdict_quoting_the_marker_is_not_reclassified(self, tmp_path: Path) -> None:
         # On the clean path codex-review-output.md is verbatim model prose. A
         # review that QUOTES the refusal marker — say, while reviewing this
         # workflow — must not flip a completed verdict into a refusal: the
@@ -5296,3 +6138,1309 @@ class TestGptRefusalTerminalState:
         # re-run the incomplete notice advises.
         assert '{ [ "$kind" = "incomplete" ] || [ "$kind" = "refused" ]; }' in comment_step
         assert "very unlikely to produce a fresh verdict" in comment_step
+
+
+# The three design/premise/UX lanes on a fork, whose verdict lands as a
+# check-run this repo controls end to end.
+CONCERNS_FORK_LANES = (
+    ("fork-design-review.yml", "Design-Verdict:", "[DESIGN-REVIEWED]"),
+    (
+        "fork-first-principles-review.yml",
+        "First-Principles-Verdict:",
+        "[FIRST-PRINCIPLES-REVIEWED]",
+    ),
+    ("fork-ux-review.yml", "UX-Verdict:", "[UX-REVIEWED]"),
+)
+
+# Their same-repo twins, which own a JOB rather than a check-run and so cannot
+# report themselves neutral: (workflow, posting step, status step, lane label).
+CONCERNS_SAME_LANES = (
+    (
+        "design-review.yml",
+        "Post design review summary",
+        "Design review status (gates on BLOCK)",
+        "Design Review",
+    ),
+    (
+        "first-principles-review.yml",
+        "Post first-principles review summary",
+        "First-principles review status (gates on BLOCK)",
+        "First Principles Review",
+    ),
+    (
+        "ux-review.yml",
+        "Post UX review summary",
+        "UX review status (gates on BLOCK)",
+        "UX Review",
+    ),
+)
+
+DESIGN_LANES = ("design-review.yml", "fork-design-review.yml")
+
+
+class TestDesignVerdictCalibration:
+    """BLOCK must be REACHABLE for the class of change that takes a platform out.
+
+    The flat tie-breaker ("when torn, choose CONCERNS", "if any is
+    might/unclear it is CONCERNS at most") made it unreachable there by
+    construction: the reviewer has no shell and no Windows host, so a platform
+    premise is ALWAYS unclear to it. PR #8117 is the worked example -- the lane
+    wrote the exact failure mode (absent macOS-only settings file read as False
+    -> every classified Windows spawn fail-closes at session start) and still
+    resolved CONCERNS. The calibration is therefore scoped by REVERSIBILITY, and
+    an unverified premise is an INPUT to BLOCK rather than a reason to lower it.
+    """
+
+    FIRST = "Tie-breaker, SCOPED BY REVERSIBILITY"
+    LAST = "Size is never a BLOCK."
+
+    def _calibration(self, workflow: str) -> str:
+        lines = _workflow(workflow).splitlines()
+        start = next((i for i, line in enumerate(lines) if self.FIRST in line), None)
+        assert start is not None, f"{workflow} carries no reversibility-scoped tie-breaker"
+        end = next(i for i, line in enumerate(lines[start:], start) if self.LAST in line)
+        block = lines[start : end + 1]
+        indent = len(block[0]) - len(block[0].lstrip())
+        return "\n".join(line[indent:] if line.strip() else "" for line in block)
+
+    def test_both_design_lanes_carry_an_identical_calibration_block(self) -> None:
+        # The fork lane is the one that runs on an outside contributor's PR, so a
+        # calibration that lives in only one copy is a calibration that does not
+        # apply to the PRs it was written for.
+        blocks = {name: self._calibration(name) for name in DESIGN_LANES}
+        reference = blocks[DESIGN_LANES[0]]
+        for name, block in blocks.items():
+            assert block == reference, (
+                f"{name} verdict calibration drifted from {DESIGN_LANES[0]}; "
+                "both design lanes must carry the same text"
+            )
+
+    def test_tie_breaker_is_decided_by_the_consequence_not_by_certainty(self) -> None:
+        for name in DESIGN_LANES:
+            flat = _flat(self._calibration(name))
+            # Reversible -> CONCERNS is retained, so an ordinary judgement call
+            # still lands where it did.
+            assert "the consequence is REVERSIBLE" in flat, name
+            assert "a regression a revert fixes cleanly" in flat, name
+            assert "-> CONCERNS" in flat, name
+            # Irreversible-in-product -> BLOCK is the new half.
+            assert "STOPS WORKING" in flat, name
+            assert "session start, spawn, auth, gateway boot" in flat, name
+            assert "no in-product remedy short of disabling a safety control" in flat, name
+            assert "-> BLOCK" in flat, name
+
+    def test_an_unverified_premise_is_a_block_input(self) -> None:
+        for name in DESIGN_LANES:
+            flat = _flat(self._calibration(name))
+            assert "An UNVERIFIED premise is a BLOCK INPUT, not a reason to lower" in flat, name
+            # The reviewer's own blindness is named, because that is why the old
+            # rule collapsed: it cannot verify a platform claim, so the AUTHOR
+            # must, and BLOCK is what asks them to.
+            assert "no shell, no Windows host and no provider account" in flat, name
+            assert "name the evidence that clears it" in flat, name
+
+    def test_the_flat_tie_breaker_is_gone_from_both_lanes(self) -> None:
+        # The exact sentences that made BLOCK unreachable must not come back --
+        # either one restores the old behaviour on its own.
+        for name in DESIGN_LANES:
+            flat = _flat(_workflow(name))
+            assert (
+                "Tie-breaker: when torn between BLOCK and CONCERNS, choose CONCERNS." not in flat
+            ), name
+            assert (
+                'If any is "might", "unclear", or a matter of taste, it is a CONCERNS at most'
+                not in flat
+            ), name
+
+    def test_named_block_triggers_cover_the_shape_that_shipped(self) -> None:
+        for name in DESIGN_LANES:
+            flat = _flat(self._calibration(name))
+            # (1) the availability path gated on unestablished platform semantics
+            assert "gates a core availability path on a probe, file or setting" in flat, name
+            assert "ON THE AFFECTED PLATFORM this repo never establishes" in flat, name
+            assert "an absent file read as False is a decision, not a default" in flat, name
+            # (2) a deleted pin treated as a gap -- with the check that tells the
+            # two apart, since "it was a gap" is exactly what the PR asserted.
+            assert "pinned the OPPOSITE behaviour" in flat, name
+            assert "as a GAP rather than as a DECISION" in flat, name
+            assert "read the test's own message and its git history" in flat, name
+            # (3) an N/A manual-verification claim for an unexercised platform
+            assert '"Manual verification: N/A"' in flat, name
+            assert "a platform or in an environment CI does not exercise" in flat, name
+
+    def test_the_anti_bloat_rules_survive_the_recalibration(self) -> None:
+        # Making BLOCK reachable must not make it cheap: the budget and the
+        # size-is-not-a-finding rule are what keep this lane from turning into
+        # noise, so they are pinned alongside the new triggers.
+        for name in DESIGN_LANES:
+            flat = _flat(self._calibration(name))
+            assert "at most 1 BLOCK per review" in flat, name
+            assert "Size is never a BLOCK." in flat, name
+            assert "A matter of taste is never a BLOCK" in flat, name
+            assert "FALSIFY BEFORE YOU BLOCK" in flat, name
+            assert "never merely because the change is large or far-reaching" in _flat(
+                _workflow(name)
+            ), name
+
+    def test_every_blocker_and_watch_item_says_what_clears_it(self) -> None:
+        # A finding a coding loop cannot act on is a finding that does not get
+        # acted on. `Clears when:` is the actionable half, so the output
+        # contract demands it on BOTH sections, not just on Blockers.
+        for name in DESIGN_LANES:
+            workflow = _workflow(name)
+            blockers = workflow.index("### Blockers")
+            watch = workflow.index("### Watch", blockers)
+            suggestions = workflow.index("### Suggestions", watch)
+            for label, section in (
+                ("Blockers", workflow[blockers:watch]),
+                ("Watch", workflow[watch:suggestions]),
+            ):
+                assert (
+                    "`Clears when: <the concrete evidence or change that resolves this>`"
+                    in _flat(section)
+                ), (f"{name}: the {label} section does not require a Clears when line")
+            assert "an item with no `Clears when:` is not actionable" in _flat(
+                workflow[watch:suggestions]
+            ), name
+
+
+class TestConcernsIsVisibleInTheChecksUi:
+    """A CONCERNS verdict must be legible without opening the PR comment.
+
+    31 of 57 CONCERNS drew no human reply at all, and the mechanism is simple:
+    the lane reported a green check, so nothing in the Checks UI said there was
+    anything to read. The fork lanes own a check-run, so CONCERNS becomes
+    `neutral` -- still a pass to pr-readiness.yml, but its own state in the list
+    -- carrying the punchline and Watch items in `output.summary`. The same-repo
+    lanes own a JOB, which cannot be neutral, so they emit a warning annotation
+    and a step summary instead. No new command, no convention to learn.
+    """
+
+    def _digest_fn(self, workflow: str, step: str) -> str:
+        return _shell_function(_step_script(_workflow(workflow), step), "concerns_digest")
+
+    def test_fork_lanes_finalize_concerns_as_neutral(self) -> None:
+        for name, _, _ in CONCERNS_FORK_LANES:
+            finalize = _step_script(_workflow(name), "Finalize check-run (advisory)")
+            assert 'conclusion="neutral"; title="CONCERNS — read the Watch items"' in finalize, name
+            # The green tick must not come back: it is what made CONCERNS
+            # indistinguishable from PASS in the Checks list.
+            assert 'CONCERNS) conclusion="success"' not in finalize, name
+            assert 'title="CONCERNS (advisory)"' not in finalize, name
+            # A real BLOCK still fails, and an incomplete run still resolves
+            # neutral -- neither end of the contract moved.
+            assert 'conclusion="failure"' in finalize, name
+
+    def test_fork_lanes_put_the_punchline_and_watch_items_in_the_summary(self) -> None:
+        for name, header, marker in CONCERNS_FORK_LANES:
+            finalize = _step_script(_workflow(name), "Finalize check-run (advisory)")
+            assert 'concerns_digest "' in finalize, name
+            assert f'"{header}" "{marker}"' in finalize, name
+            # The digest REPLACES the generic "see the PR comment" summary only
+            # when it actually parsed something.
+            assert 'if [ "${VERDICT:-}" = "CONCERNS" ]; then' in finalize, name
+            assert 'if [ -n "$digest" ]; then' in finalize, name
+            assert '-f "output[summary]=$summary"' in finalize, name
+
+    def test_the_summary_reads_an_already_redacted_body(self) -> None:
+        # The publish boundary stays where it is. Each lane's digest reads the
+        # file its own redaction step rewrote in place, so no un-redacted text
+        # can reach a check-run summary.
+        bodies = {
+            "fork-design-review.yml": "design-review-output.md",
+            "fork-first-principles-review.yml": "first-principles-output.md",
+            "fork-ux-review.yml": "ux-comment.md",
+        }
+        for name, body in bodies.items():
+            workflow = _workflow(name)
+            finalize = _step_script(workflow, "Finalize check-run (advisory)")
+            assert body in finalize, name
+            # The same file is the one the perl redaction targets.
+            redaction = _line_containing(workflow, "perl -i -pe", "REDACTED-AWS-KEY-ID")
+            assert body in redaction or f'f="$RUNNER_TEMP/{body}"' in workflow, name
+
+    def test_pr_readiness_still_counts_neutral_as_a_pass(self) -> None:
+        # This is what makes the change safe: `neutral` is visible to a human
+        # and invisible to the gate, so an advisory CONCERNS cannot start
+        # blocking merges. Read-only assertion -- this PR does not edit the file.
+        readiness = _workflow("pr-readiness.yml")
+        assert 'IN("success","neutral")' in readiness
+        assert "success|neutral|skipped) passed+=" in readiness
+
+    def test_same_repo_lanes_annotate_concerns_and_still_exit_zero(self) -> None:
+        for name, _, status_step, lane in CONCERNS_SAME_LANES:
+            status = _step_script(_workflow(name), status_step)
+            assert f"::warning title={lane} CONCERNS::" in status, name
+            assert 'if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then' in status, name
+            assert '>> "$GITHUB_STEP_SUMMARY"' in status, name
+            # The exit contract does not move: CONCERNS stays inside the
+            # PASS|CONCERNS branch, so only BLOCK can fail this gate.
+            assert "\n  PASS|CONCERNS)\n" in status, name
+            assert '  if [ "$VERDICT" = "CONCERNS" ]; then' in status, name
+            assert "::error::" in status, name
+            block_at = status.index("\n  BLOCK)\n")
+            concerns_at = status.index("\n  PASS|CONCERNS)\n")
+            assert "exit 1" not in status[concerns_at:block_at], name
+
+    def test_the_annotation_falls_back_when_no_digest_was_threaded(self) -> None:
+        # A CONCERNS verdict whose body could not be parsed must still say that
+        # something needs reading, or the annotation goes missing on exactly the
+        # malformed output a human most needs to look at.
+        for name, _, status_step, lane in CONCERNS_SAME_LANES:
+            status = _step_script(_workflow(name), status_step)
+            assert (
+                f"${{CONCERNS_PUNCHLINE:-read the Watch items in the {lane} comment" in status
+            ), name
+            assert '"${CONCERNS_DIGEST:-$punchline}"' in status, name
+
+    def test_the_digest_is_threaded_through_github_output(self) -> None:
+        for name, post_step, _, _ in CONCERNS_SAME_LANES:
+            post = _step_script(_workflow(name), post_step)
+            assert 'if [ "$verdict" = "CONCERNS" ]; then' in post, name
+            assert "printf 'concerns_punchline=%s\\n'" in post, name
+            # Multi-line values need a delimiter the value cannot forge.
+            assert 'delim="CONCERNS_DIGEST_${RANDOM}${RANDOM}_EOF"' in post, name
+            assert "printf 'concerns_digest<<%s\\n' \"$delim\"" in post, name
+            # And the status step must actually receive them.
+            env = _step_env(name, [s for w, _, s, _ in CONCERNS_SAME_LANES if w == name][0])
+            assert env["CONCERNS_PUNCHLINE"] == "${{ steps.post.outputs.concerns_punchline }}", name
+            assert env["CONCERNS_DIGEST"] == "${{ steps.post.outputs.concerns_digest }}", name
+
+    def test_no_lane_caps_the_digest_with_a_pipe(self) -> None:
+        # `head -c` exits as soon as it has its bytes, so the writer takes
+        # SIGPIPE and `pipefail` turns that 141 into a step failure -- on
+        # exactly the over-long review the cap exists for. Same reason the
+        # first-principles intent cap uses perl rather than a pipe.
+        for name, _, _ in CONCERNS_FORK_LANES:
+            finalize = _step_script(_workflow(name), "Finalize check-run (advisory)")
+            assert "| head -c" not in finalize, name
+            assert "${digest:0:2000}" in finalize, name
+        for name, post_step, _, _ in CONCERNS_SAME_LANES:
+            post = _step_script(_workflow(name), post_step)
+            assert "| head -c" not in post, name
+            # The punchline is the first line; awk exits there, so it must not
+            # sit downstream of a pipe either.
+            assert "printf '%s\\n' \"$concerns_body\" | awk" not in post, name
+            assert "awk 'NF { print; exit }' <<< \"$concerns_body\"" in post, name
+
+    def test_the_digest_helper_is_byte_identical_in_every_lane(self) -> None:
+        # Six copies, one body. The header and marker are ARGUMENTS, so nothing
+        # about a lane needs its own version -- and a per-lane version is how
+        # one lane quietly stops publishing its Watch items.
+        copies = {
+            name: self._digest_fn(name, "Finalize check-run (advisory)")
+            for name, _, _ in CONCERNS_FORK_LANES
+        }
+        copies.update(
+            {name: self._digest_fn(name, post) for name, post, _, _ in CONCERNS_SAME_LANES}
+        )
+        reference = copies["fork-design-review.yml"]
+        for name, body in copies.items():
+            assert body == reference, f"{name}: concerns_digest drifted from fork-design-review.yml"
+
+    def test_digest_extracts_the_punchline_and_watch_section_only(self, tmp_path: Path) -> None:
+        # Execute the REAL helper: a wrong awk here publishes the whole review
+        # (or nothing) into a check-run summary, and no static assertion sees it.
+        bash = _bash()
+        if bash is None:
+            pytest.skip("the digest helper is Bash")
+        body = tmp_path / "comment.md"
+        body.write_text(
+            "<!-- design-review -->\n"
+            "## Design Review (Fable 5) — 🟡 CONCERNS\n"
+            "\n"
+            "_Design-level review of `abc`._\n"
+            "\n"
+            "Design-Verdict: CONCERNS\n"
+            "\n"
+            "**win32 delegation now hangs off a macOS-only settings file.**\n"
+            "\n"
+            "### Watch\n"
+            "- absent-file->False fails every classified spawn closed on Windows.\n"
+            "  Clears when: kiro-cli confirms the key's win32 semantics.\n"
+            "\n"
+            "### Suggestions\n"
+            "- drop the probe entirely.\n"
+            "\n"
+            "[DESIGN-REVIEWED] abc\n",
+            encoding="utf-8",
+        )
+        script = (
+            self._digest_fn("design-review.yml", "Post design review summary")
+            + f'\nconcerns_digest "{body}" "Design-Verdict:" "[DESIGN-REVIEWED]"\n'
+        )
+        result = subprocess.run(
+            [bash, "-euo", "pipefail", "-c", script],
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            cwd=tmp_path,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        out = result.stdout
+        assert out.startswith("**win32 delegation now hangs off a macOS-only settings file.**")
+        assert "### Watch" in out
+        assert "Clears when: kiro-cli confirms the key's win32 semantics." in out
+        # Neither the comment header nor the sections after Watch may ride along.
+        assert "<!-- design-review -->" not in out
+        assert "Design-Verdict:" not in out
+        assert "### Suggestions" not in out
+        assert "drop the probe entirely" not in out
+        assert "[DESIGN-REVIEWED]" not in out
+
+    def test_digest_caps_a_long_body_without_failing_the_step(self, tmp_path: Path) -> None:
+        bash = _bash()
+        if bash is None:
+            pytest.skip("the digest helper is Bash")
+        body = tmp_path / "comment.md"
+        body.write_text(
+            "UX-Verdict: CONCERNS\n\n**punchline**\n\n### Watch\n"
+            + ("- a very long watch item\n" * 500)
+            + "[UX-REVIEWED] abc\n",
+            encoding="utf-8",
+        )
+        script = (
+            self._digest_fn("fork-ux-review.yml", "Finalize check-run (advisory)")
+            + f'\nconcerns_digest "{body}" "UX-Verdict:" "[UX-REVIEWED]"\n'
+        )
+        result = subprocess.run(
+            [bash, "-euo", "pipefail", "-c", script],
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            cwd=tmp_path,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert len(result.stdout) == 2000
+
+    def test_digest_of_a_missing_body_is_empty_and_not_a_failure(self, tmp_path: Path) -> None:
+        # The finalize step is `if: always()`, so it runs on jobs that never
+        # wrote a body. A `set -e` failure there would strand the check-run.
+        bash = _bash()
+        if bash is None:
+            pytest.skip("the digest helper is Bash")
+        script = (
+            self._digest_fn("fork-design-review.yml", "Finalize check-run (advisory)")
+            + f'\nconcerns_digest "{tmp_path / "absent.md"}" "Design-Verdict:" "[DESIGN-REVIEWED]"\n'
+            + 'echo "rc=$?"\n'
+        )
+        result = subprocess.run(
+            [bash, "-euo", "pipefail", "-c", script],
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            cwd=tmp_path,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert result.stdout == "rc=0\n"
+
+    @pytest.mark.parametrize(
+        "lane",
+        [pytest.param(entry, id=entry[0].removesuffix(".yml")) for entry in CONCERNS_SAME_LANES],
+    )
+    def test_same_repo_status_step_emits_the_annotation_and_summary(
+        self, lane: tuple[str, str, str, str], tmp_path: Path
+    ) -> None:
+        # Execute the REAL status step on a CONCERNS verdict: the annotation and
+        # the step summary are the whole point of the change, and a mistyped
+        # workflow-command prefix produces no annotation and no error either.
+        name, _, status_step, label = lane
+        bash = _bash()
+        if bash is None:
+            pytest.skip("the status step is Bash")
+        summary_file = tmp_path / "step-summary.md"
+        summary_file.write_text("", encoding="utf-8")
+        script = _step_script(_workflow(name), status_step)
+        result = subprocess.run(
+            [bash, "-e", "-c", script],
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            cwd=tmp_path,
+            env={
+                "PATH": os.environ.get("PATH", ""),
+                "LC_ALL": "C.UTF-8",
+                "HEAD": "0" * 40,
+                "ACTOR": "someone",
+                "VERDICT": "CONCERNS",
+                "HUMAN_OVERRIDE": "false",
+                "OVERRIDE_ACTOR": "",
+                "CONCERNS_PUNCHLINE": "**the win32 probe reads a macOS-only file**",
+                "CONCERNS_DIGEST": (
+                    "**the win32 probe reads a macOS-only file**\n"
+                    "### Watch\n"
+                    "- every classified spawn fails closed on Windows.\n"
+                    "  Clears when: kiro-cli confirms the win32 semantics."
+                ),
+                "GITHUB_STEP_SUMMARY": str(summary_file),
+            },
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert (
+            f"::warning title={label} CONCERNS::**the win32 probe reads a macOS-only file**"
+            in result.stdout
+        )
+        written = summary_file.read_text(encoding="utf-8")
+        assert f"## {label} — 🟡 CONCERNS (advisory)" in written
+        assert "### Watch" in written
+        assert "Clears when: kiro-cli confirms the win32 semantics." in written
+
+    @pytest.mark.parametrize(
+        "lane",
+        [pytest.param(entry, id=entry[0].removesuffix(".yml")) for entry in CONCERNS_SAME_LANES],
+    )
+    def test_a_pass_verdict_emits_no_concerns_annotation(
+        self, lane: tuple[str, str, str, str], tmp_path: Path
+    ) -> None:
+        # The annotation must be a CONCERNS signal, not a per-run banner: a
+        # warning on every green run is a warning nobody reads.
+        name, _, status_step, label = lane
+        bash = _bash()
+        if bash is None:
+            pytest.skip("the status step is Bash")
+        summary_file = tmp_path / "step-summary.md"
+        summary_file.write_text("", encoding="utf-8")
+        result = subprocess.run(
+            [bash, "-e", "-c", _step_script(_workflow(name), status_step)],
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            cwd=tmp_path,
+            env={
+                "PATH": os.environ.get("PATH", ""),
+                "LC_ALL": "C.UTF-8",
+                "HEAD": "0" * 40,
+                "ACTOR": "someone",
+                "VERDICT": "PASS",
+                "HUMAN_OVERRIDE": "false",
+                "OVERRIDE_ACTOR": "",
+                "GITHUB_STEP_SUMMARY": str(summary_file),
+            },
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "::warning" not in result.stdout
+        assert summary_file.read_text(encoding="utf-8") == ""
+
+
+class TestFirstPrinciplesProblemsFirstContract:
+    """The lane's PASS was praise by construction, and its calibration made
+    BLOCK unreachable for the one class where the reviewer is structurally
+    unable to check the premise. Both were prompt text, so both are pinned
+    here: provenance for a claimed defect, symmetry as INHERITED, a deleted pin
+    as a prior decision, an availability-path premise as the BLOCK case, and an
+    output that leads with the problems rather than with the inventory."""
+
+    def test_a_claimed_defect_needs_a_provenance_the_reviewer_can_point_at(self) -> None:
+        # A `fix` whose only support is the description asserting a defect is
+        # indistinguishable from an addition: PR #8117 shipped a whole-platform
+        # regression behind "verified security finding" and no repro.
+        contract = _fp_contract()
+        assert "PROVENANCE OF A REPORTED DEFECT" in contract
+        assert "a test\n     this PR adds that fails on base" in contract
+        assert "linked issue" in contract
+        assert "has no provenance you can check, so the item is INHERITED" in contract
+
+    def test_symmetry_with_a_twin_is_never_a_justification(self) -> None:
+        # The measured failure: the lane tagged "aligns win32 with the macOS
+        # twin" as `justified`, which its own provenance lens already calls
+        # INHERITED. The tag has to be spelled out or the general rule loses.
+        contract = _fp_contract()
+        assert "SYMMETRY IS INHERITED, ALWAYS" in contract
+        assert "aligns X with its twin" in contract
+        assert "are NEVER a\n     justification on their own" in contract
+        assert "the symmetry form of\n     INHERITED" in contract
+        # The twin is not evidence about this side.
+        assert "nameable WITHOUT the twin" in contract
+
+    def test_a_deleted_pin_is_a_prior_decision_not_a_gap(self) -> None:
+        # The PR deleted a test whose message said the opposite and called the
+        # pin "a gap". That is the framing-contradicted-by-the-diff BLOCK
+        # trigger, so the contract must route it there by name.
+        contract = _fp_contract()
+        assert "A DELETED OR REWRITTEN\n   PIN IS A PRIOR DECISION" in contract
+        assert "pinned the OPPOSITE behaviour" in contract
+        assert "Treat it as standing" in contract
+        assert 'calls\n   it "a gap"' in contract
+        assert "framing contradicted by the diff" in contract
+        assert 'a deleted pin recast as "a gap" with no' in contract
+
+    def test_an_unverified_premise_on_an_availability_path_is_the_block_case(self) -> None:
+        # "When torn, choose CONCERNS" made BLOCK unreachable exactly where the
+        # reviewer cannot verify the premise at all -- it has no shell and no
+        # second platform -- so the tie-breaker is scoped to reversible cases
+        # and this one is named as a trigger.
+        contract = _fp_contract()
+        assert "UNVERIFIED PREMISE ON A CORE\n  AVAILABILITY PATH" in contract
+        assert "ONLY where being wrong is REVERSIBLE" in contract
+        assert 'Here "unclear" is the BLOCK case, not the CONCERNS case' in contract
+        assert "the author can" in contract
+        assert "Do not soften this to a Watch item" in contract
+        # The carve-outs stay a closed set of two; an open-ended third would
+        # put the tie-breaker back in charge of everything.
+        assert "there is no third" in contract
+        assert "The two exceptions are named at the" in contract
+        assert "The single exception is the combination" not in contract
+
+    def test_undeclared_and_rides_along_are_inventory_tags_not_verdicts(self) -> None:
+        # ~50% of PRs drew CONCERNS, so the signal cost nothing to ignore.
+        # These two tags print as inventory and do not carry the verdict by
+        # themselves; CONCERNS is reserved for premise and depth risks.
+        contract = _fp_contract()
+        assert "`undeclared` and `rides along`\n  are INVENTORY TAGS ONLY" in contract
+        assert "on\n  their own they do NOT reach CONCERNS" in contract
+        assert "a harm-free rider is inventory" in contract
+        # The tags themselves survive on the item line.
+        assert "undeclared | rides" in contract
+        # A premise risk carried BY the rider still reaches CONCERNS.
+        assert "when the rider itself\n  carries one of the premise risks" in contract
+
+    def test_output_leads_with_problems_and_drops_the_praise_punchline(self) -> None:
+        contract = _fp_contract()
+        # The PASS punchline does not argue the author's case.
+        assert "why every item earns its place" not in contract.split("Output EXACTLY")[0]
+        assert "Never\nexplain why every item earns its place" in contract
+        assert "the ONE thing a human should still verify before merge" in contract
+        assert "`Nothing to check.`" in contract
+        # Non-justified items are read FIRST, above the inventory.
+        assert "### Not justified as shipped" in contract
+        assert contract.index("### Not justified as shipped") < contract.index(
+            "### What this change ships"
+        )
+        # `justified` carries no reason -- the parenthetical was the praise.
+        assert "`justified` is exactly that ONE word" in contract
+        assert "Only a NON-justified tag carries a reason" in contract
+
+    def test_the_inventory_is_collapsed_on_every_verdict(self) -> None:
+        # The block was left EXPANDED on CONCERNS/BLOCK -- exactly the verdicts
+        # a human opens the comment for -- so the findings sat under a full
+        # list of the items that were fine. Every item a human must act on is
+        # already under `### Not justified as shipped`, so the inventory is an
+        # audit trail and stays one click away on every verdict, with the
+        # counts in the summary line.
+        contract = _fp_contract()
+        assert "ALWAYS COLLAPSED, on every verdict" in contract
+        assert "<details><summary>Inventory (N items) — M justified</summary>" in contract
+        assert "</details>" in contract
+        # The old conditional is gone in both directions.
+        assert "WHEN EVERY ITEM IS TAGGED `justified`" not in contract
+        assert "leave the block EXPANDED" not in contract
+        # The inventory is still always emitted -- collapsing is not omitting.
+        assert "ALWAYS present, even on PASS" in contract
+        assert "A PASS here is a claim about EVERY item" in contract
+        # The findings a human acts on live above the block, not in it.
+        assert "this block is the audit trail, not the summary" in contract
+
+    def test_every_finding_states_what_would_clear_it(self) -> None:
+        # A finding with no statable resolution is what produced 31 of 57
+        # unanswered CONCERNS: nothing told the author when they were done.
+        contract = _fp_contract()
+        assert "Every Watch item AND every Blocker ends with one line" in contract
+        assert "`Clears when: <the concrete evidence or change that resolves it>`" in contract
+        assert "is not a finding; drop it" in contract
+
+    def test_the_output_diet_tightened_and_kept_its_machine_read_lines(self) -> None:
+        contract = _fp_contract()
+        assert "review under ~180 words excluding the inventory lines" in contract
+        assert "~250 words" not in contract
+        # The two lines the workflows grep for are untouched, and still first
+        # and last in the emitted shape.
+        assert "First-Principles-Verdict: <PASS | CONCERNS | BLOCK>" in contract
+        assert contract.rstrip().endswith("[FIRST-PRINCIPLES-REVIEWED] <head sha>")
+        for name in FP_LANES:
+            workflow = _workflow(name)
+            assert "grep -iE '^First-Principles-Verdict:'" in workflow
+        # The subtraction-only stance and the SYSTEM RULES block stay.
+        assert contract.startswith("SYSTEM RULES (non-negotiable")
+        assert "EVERY suggestion you emit must be a SUBTRACTION" in contract
+        # Security boundaries, repo context and the user-count rule stay.
+        assert "REPO CONTEXT: Kiro Crew is an open-source AI agent platform" in contract
+        assert "DO NOT REASON FROM AN ASSUMED USER COUNT, in either direction" in contract
+        assert "the AGENT is untrusted with respect to its own governance" in contract
+
+
+def _review_contract_module():
+    """Import the REAL marker parser so a drift in its regexes fails these tests.
+
+    Re-declaring the patterns here would let the workflow's neutralization and
+    the parser drift apart silently, which is the whole failure mode under test.
+    Loaded via ``load_skill_script`` so the import writes no ``__pycache__``
+    into the checked-in scripts directory.
+    """
+    from skill_script_helpers import load_skill_script
+
+    return load_skill_script(
+        "_review_contract_under_test",
+        ROOT
+        / "src"
+        / "kiro_crew"
+        / "builtin_skills"
+        / "kirocrew-dev"
+        / "prepare-pr"
+        / "scripts"
+        / "_review_contract.py",
+    )
+
+
+class TestForkLaneRedactsCredentialValues:
+    """A BARE credential value must not survive into the posted body.
+
+    Every shape rule in these lanes misses a bare AWS secret access key: it is 40
+    characters of ``[A-Za-z0-9/+=]`` with no distinctive prefix, so it is not
+    ``AKIA``/``ASIA`` (that is the key *ID*), it carries no ``name=`` for the
+    named-pair rule to anchor on, and it is far short of the 200+ char base64 run
+    the withhold filter looks for. The reviewer runs agentically with those values
+    in its environment and a malicious fork can prompt it to print them, so the
+    lanes redact the VALUES too -- which cannot be evaded by how the model chooses
+    to format them.
+    """
+
+    # Shape-accurate stand-in: 40 chars from the AWS secret alphabet, no prefix.
+    FAKE_SECRET = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+
+    LANES = (
+        ("fork-gpt-review.yml", "Redact credential shapes", "codex-review-output.md"),
+        ("fork-opus-review.yml", "Capture and redact review output", "claude-review-output.md"),
+    )
+
+    def _run_redaction(
+        self, tmp_path: Path, workflow: str, step: str, out: str, body: str, cred: str
+    ):
+        bash = _bash()
+        if bash is None or shutil.which("perl") is None or shutil.which("jq") is None:
+            pytest.skip("redaction test requires Bash, perl and jq")
+        if os.name == "nt":
+            pytest.skip("the lanes' perl -i redaction is exercised on POSIX runners")
+
+        cwd = tmp_path / "ws"
+        cwd.mkdir()
+        (cwd / out).write_text(body, encoding="utf-8")
+        # The Opus lane folds redaction into its capture step, which reads the
+        # agent transcript; give it one so the real step runs unmodified.
+        exec_file = tmp_path / "exec.json"
+        exec_file.write_text(json.dumps({"result": body}), encoding="utf-8")
+
+        script_file = tmp_path / "step.sh"
+        script_file.write_text(
+            _step_script(_workflow(workflow), step), encoding="utf-8", newline="\n"
+        )
+        env = {**os.environ, "EXEC_FILE": str(exec_file)}
+        # Absent means "not configured", which must be a no-op rather than an
+        # empty pattern -- so the caller can ask for the unset case explicitly.
+        for name in ("AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_ACCESS_KEY_ID"):
+            env.pop(name, None)
+        if cred is not None:
+            env["AWS_SECRET_ACCESS_KEY"] = cred
+        result = subprocess.run(
+            [bash, "-e", str(script_file)], check=False, capture_output=True, cwd=cwd, env=env
+        )
+        return (cwd / out).read_text(encoding="utf-8"), result
+
+    @pytest.mark.parametrize(("workflow", "step", "out"), LANES)
+    def test_a_bare_secret_value_is_redacted(
+        self, tmp_path: Path, workflow: str, step: str, out: str
+    ) -> None:
+        body = f"the agent printed its environment: {self.FAKE_SECRET} and kept going\n"
+        text, result = self._run_redaction(tmp_path, workflow, step, out, body, self.FAKE_SECRET)
+        assert result.returncode == 0, result.stderr.decode()
+        assert self.FAKE_SECRET not in text, f"{workflow}: bare secret survived redaction"
+        assert "[REDACTED-CREDENTIAL]" in text
+        # Surrounding prose is untouched -- this redacts a value, not the body.
+        assert "and kept going" in text
+
+    @pytest.mark.parametrize(("workflow", "step", "out"), LANES)
+    def test_an_unset_credential_does_not_carpet_the_body(
+        self, tmp_path: Path, workflow: str, step: str, out: str
+    ) -> None:
+        """The guard that makes the loop safe.
+
+        ``\\Q\\E`` on an empty string is an empty pattern, which matches at every
+        position -- so an unconfigured credential would otherwise replace the gaps
+        between every character with the marker and destroy the review body.
+        """
+        body = "a perfectly ordinary review body with no secrets in it\n"
+        text, result = self._run_redaction(tmp_path, workflow, step, out, body, None)
+        assert result.returncode == 0, result.stderr.decode()
+        assert "[REDACTED-CREDENTIAL]" not in text
+        assert text.strip() == body.strip()
+
+
+class TestForkLaneSurfacesAnUnstampedReviewBody:
+    """A completed fork review whose verdict stamp is missing must stay readable.
+
+    Both fork lanes decide ``kind`` from the presence of ``[<NAME>-REVIEWED]
+    <head>`` in the captured output. When a review runs to completion but that
+    stamp is absent or SHA-corrupted -- a clean review can carry a truncated
+    sha -- ``kind`` falls to ``incomplete`` and the body goes only to the job
+    logs behind a one-line "no verdict" notice. A reader then cannot tell a
+    clean review with a mangled stamp from a review that produced nothing, and
+    those need opposite responses.
+
+    The branch prints the captured body with every marker DE-BRACKETED, which is
+    what keeps this a reporting change: ``REVIEWED_STAMP_RE`` and
+    ``BLOCK_MERGE_RE`` both anchor on a literal ``[``, so the surfaced body is
+    inert to the parser in exactly the way an absent body is. The check-run
+    conclusion is re-derived independently and still fails closed.
+
+    Deliberately NOT surfaced: the pass-failure stub. If GPT's pass 1 fails,
+    pass 2 still runs but against an empty discovery block, so its output
+    reviewed nothing; publishing it as findings would misrepresent it.
+    """
+
+    HEAD = "07bdb01215b9161c90ae28b11296bfc60ad30646"
+    # (workflow, captured-output filename, comment step, finalize step, stamp name)
+    LANES = (
+        (
+            "fork-gpt-review.yml",
+            "codex-review-output.md",
+            "Post/update summary comment",
+            "GPT",
+        ),
+        (
+            "fork-opus-review.yml",
+            "claude-review-output.md",
+            "Post/update summary comment",
+            "OPUS",
+        ),
+    )
+
+    def _findings_body(self, stamp: str | None) -> str:
+        """A complete review with two findings; ``stamp`` None means unstamped."""
+        body = (
+            "BLOCKING -- src/kiro_crew/apps/builtins/thing/app.json:2 -- new built-in app\n"
+            "Anchor: no-new-builtin-apps\n"
+            "\n"
+            "BLOCKING -- src/kiro_crew/dashboard/chat_folders.py:618 -- blocking call on the loop\n"
+            "Anchor: no-blocking-call-on-event-loop\n"
+            "\n"
+            f"[BLOCK-MERGE] {self.HEAD}\n"
+        )
+        if stamp is not None:
+            body += f"[{stamp}-REVIEWED] {self.HEAD}\n"
+        return body
+
+    def _run_step(
+        self,
+        tmp_path: Path,
+        *,
+        workflow: str,
+        output_file: str,
+        step: str,
+        review_output: str | None,
+        check_id: str = "",
+    ) -> tuple[Path, "subprocess.CompletedProcess[bytes]"]:
+        bash = _bash()
+        if bash is None or shutil.which("jq") is None:
+            pytest.skip("fork-lane comment tests require Bash and jq")
+        if os.name == "nt":
+            pytest.skip("stubbed-PATH gh interception is exercised on POSIX runners")
+
+        stub_dir = tmp_path / "stub"
+        stub_dir.mkdir()
+        calls_dir = tmp_path / "calls"
+        calls_dir.mkdir()
+        cwd = tmp_path / "workspace"
+        cwd.mkdir()
+        runner_temp = tmp_path / "runner-temp"
+        runner_temp.mkdir()
+
+        if review_output is not None:
+            (cwd / output_file).write_text(review_output, encoding="utf-8")
+
+        gh_stub = stub_dir / "gh"
+        gh_stub.write_text(
+            "#!/usr/bin/env bash\n"
+            "# Records the argv of every mutating call and answers the comment\n"
+            "# finder with an empty array, so the step takes its create path.\n"
+            'if [ "$1" = "api" ] && [ "$2" = "--method" ] && [ "$3" = "PATCH" ]; then\n'
+            '  printf \'%s\\n\' "$@" >> "$STUB_CALLS/patch-argv.txt"\n'
+            "  exit 0\n"
+            "fi\n"
+            'if [ "$1" = "api" ] && [ "$2" = "--method" ] && [ "$3" = "POST" ]; then\n'
+            '  printf \'%s\\n\' "$@" >> "$STUB_CALLS/post-argv.txt"\n'
+            '  echo "1"\n'
+            "  exit 0\n"
+            "fi\n"
+            'if [ "$1" = "api" ]; then\n'
+            '  echo -n ""\n'
+            "  exit 0\n"
+            "fi\n"
+            'if [ "$1" = "pr" ] && [ "$2" = "comment" ]; then\n'
+            "  shift 3\n"
+            '  if [ "$1" = "--body-file" ]; then cp "$2" "$STUB_CALLS/created-body.md"; fi\n'
+            "  exit 0\n"
+            "fi\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        gh_stub.chmod(0o755)
+
+        script_file = tmp_path / "step.sh"
+        script = _step_script(_workflow(workflow), step)
+        # Each lane assembles its comment under `$RUNNER_TEMP`, which this harness
+        # points at a per-test directory. That is what stops two parametrized cases
+        # from racing on one path and reading each other's body -- which is how a
+        # stamped case's live markers first showed up in the unstamped case's
+        # assertions. Assert the path stays RUNNER_TEMP-scoped, so a regression to a
+        # bare `/tmp` (shared between xdist workers, and the operator's own machine
+        # when the suite runs locally) fails here instead of silently restoring the
+        # race.
+        if step == "Post/update summary comment":
+            assert re.search(
+                r"\$\{RUNNER_TEMP:-[^}]*\}/fork-(?:codex|opus)-comment\.md", script
+            ), f"{workflow}: comment path must be RUNNER_TEMP-scoped, not a bare /tmp path"
+        # `newline="\n"`: text-mode translation writes CRLF on Windows and bash
+        # reads the CR as part of the token (`fi\r` is not the `fi` keyword). These
+        # cases skip on Windows today, so this is belt-and-braces.
+        script_file.write_text(script, encoding="utf-8", newline="\n")
+
+        env = {
+            **os.environ,
+            "PATH": f"{stub_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+            "REPO": "example/repo",
+            "PR": "1",
+            "HEAD": self.HEAD,
+            "GH_TOKEN": "stub-token",
+            "RUNNER_TEMP": str(runner_temp),
+            "STUB_CALLS": str(calls_dir),
+            "CHECK_ID": check_id,
+            "ADJ_DECISION": "",
+            "ADJ_NOTE": "",
+        }
+        result = subprocess.run(
+            [bash, "-e", str(script_file)],
+            check=False,
+            capture_output=True,
+            cwd=cwd,
+            env=env,
+        )
+        return calls_dir, result
+
+    @pytest.mark.parametrize(("workflow", "output_file", "step", "stamp"), LANES)
+    def test_a_completed_review_with_no_stamp_is_surfaced_not_dropped(
+        self, tmp_path: Path, workflow: str, output_file: str, step: str, stamp: str
+    ) -> None:
+        calls, result = self._run_step(
+            tmp_path,
+            workflow=workflow,
+            output_file=output_file,
+            step=step,
+            review_output=self._findings_body(stamp=None),
+        )
+        assert result.returncode == 0, result.stderr.decode()
+        posted = (calls / "created-body.md").read_text(encoding="utf-8")
+
+        # The lane still reports that it has no verdict -- that is true.
+        assert "No completed" in posted
+        # ...and the findings it DID produce are now readable on the PR rather
+        # than only in the job logs. Both findings, not just the first.
+        assert "no-new-builtin-apps" in posted
+        assert "no-blocking-call-on-event-loop" in posted
+        assert "chat_folders.py:618" in posted
+        # Framed so the body is not mistaken for a verdict.
+        assert "NOT a verdict" in posted
+
+    @pytest.mark.parametrize(("workflow", "output_file", "step", "stamp"), LANES)
+    def test_the_surfaced_body_is_inert_to_the_real_marker_parsers(
+        self, tmp_path: Path, workflow: str, output_file: str, step: str, stamp: str
+    ) -> None:
+        """The invariant that keeps this a reporting change.
+
+        Surfacing a raw body would publish ``[<NAME>-REVIEWED] <head>`` for a
+        review that never completed, and pr_status.py reads that stamp straight
+        out of comment text -- an unstamped review would start reading as freshly
+        reviewed. De-bracketing keeps the downstream view identical to today's.
+        """
+        contract = _review_contract_module()
+        calls, result = self._run_step(
+            tmp_path,
+            workflow=workflow,
+            output_file=output_file,
+            step=step,
+            # Worst case: the body carries BOTH a foreign reviewed-stamp and a
+            # blocking marker, while lacking this lane's own stamp for the head.
+            review_output=self._findings_body(stamp="SOMEOTHER"),
+        )
+        assert result.returncode == 0, result.stderr.decode()
+        posted = (calls / "created-body.md").read_text(encoding="utf-8")
+
+        # The body was surfaced...
+        assert "no-new-builtin-apps" in posted
+        # ...and carries nothing either parser can read.
+        assert contract.REVIEWED_STAMP_RE.findall(posted) == []
+        assert contract.BLOCK_MERGE_RE.findall(posted) == []
+        # The de-bracketed forms are present, so a human can still see what the
+        # model emitted and that it was neutralized rather than deleted.
+        assert "SOMEOTHER-REVIEWED-UNSTAMPED" in posted
+        assert "BLOCK-MERGE-UNSTAMPED" in posted
+
+    @pytest.mark.parametrize(("workflow", "output_file", "step", "stamp"), LANES)
+    def test_the_check_run_still_fails_closed_when_the_stamp_is_missing(
+        self, tmp_path: Path, workflow: str, output_file: str, step: str, stamp: str
+    ) -> None:
+        """Nothing blocks less: the conclusion is re-derived from the same
+        missing stamp and is unchanged by the reporting branch."""
+        calls, result = self._run_step(
+            tmp_path,
+            workflow=workflow,
+            output_file=output_file,
+            step="Finalize check-run (fail closed)",
+            review_output=self._findings_body(stamp=None),
+            check_id="4242",
+        )
+        assert result.returncode == 0, result.stderr.decode()
+        argv = (calls / "patch-argv.txt").read_text(encoding="utf-8")
+        assert "conclusion=failure" in argv
+        assert "conclusion=success" not in argv
+
+    @pytest.mark.parametrize(("workflow", "output_file", "step", "stamp"), LANES)
+    def test_a_marker_split_across_lines_is_still_neutralized(
+        self, tmp_path: Path, workflow: str, output_file: str, step: str, stamp: str
+    ) -> None:
+        """The bypass that a sha-anchored pattern would leave open.
+
+        Python's ``\\s+`` spans newlines; line-oriented ``sed`` cannot. So a body
+        emitting ``[GPT-REVIEWED]\\n<sha>`` would slip past a pattern that required
+        a sha on the same line, while pr_status.py still read it as a live stamp.
+        That spelling lands in THIS branch precisely because the lane's own
+        ``grep -Fq`` is single-line too and so fails to find the marker. The
+        neutralization therefore matches the bracketed token alone.
+        """
+        contract = _review_contract_module()
+        split_body = (
+            "BLOCKING -- src/foo.py:1 -- something\n"
+            f"[BLOCK-MERGE]\n{self.HEAD}\n"
+            f"[{stamp}-REVIEWED]\n{self.HEAD}\n"
+        )
+        # Precondition: the parser really does read the split spelling as live,
+        # otherwise this test would pass for the wrong reason.
+        assert contract.REVIEWED_STAMP_RE.findall(split_body) == [(stamp, self.HEAD)]
+        assert contract.BLOCK_MERGE_RE.findall(split_body) == [self.HEAD]
+
+        calls, result = self._run_step(
+            tmp_path,
+            workflow=workflow,
+            output_file=output_file,
+            step=step,
+            review_output=split_body,
+        )
+        assert result.returncode == 0, result.stderr.decode()
+        posted = (calls / "created-body.md").read_text(encoding="utf-8")
+
+        assert contract.REVIEWED_STAMP_RE.findall(posted) == []
+        assert contract.BLOCK_MERGE_RE.findall(posted) == []
+
+    @pytest.mark.parametrize(("workflow", "output_file", "step", "stamp"), LANES)
+    def test_credential_shaped_unstamped_output_is_withheld_entirely(
+        self, tmp_path: Path, workflow: str, output_file: str, step: str, stamp: str
+    ) -> None:
+        """Surfacing an unstamped body must not become a credential exfil path.
+
+        The reviewer runs agentically with credentials in its environment, and a
+        malicious fork can inject a prompt that BOTH dumps that environment and
+        omits the verdict stamp -- which routes into this branch by construction,
+        because the lane's stamp check is what sends it here. Before this branch
+        existed nothing was posted, so publishing the body is the exposure. The
+        redaction earlier in the lane catches an AWS key ID and named
+        ``key=value`` forms but not a bare secret value, a GitHub token or a PEM
+        block, so any surviving credential shape must withhold the WHOLE body.
+        """
+        secret = "ghp_" + "A1b2C3d4E5f6G7h8I9j0"  # noqa: S105 - shape, not a key
+        calls, result = self._run_step(
+            tmp_path,
+            workflow=workflow,
+            output_file=output_file,
+            step=step,
+            review_output=f"BLOCKING -- src/foo.py:1 -- finding\nenv dump: {secret}\n",
+        )
+        assert result.returncode == 0, result.stderr.decode()
+        posted = (calls / "created-body.md").read_text(encoding="utf-8")
+
+        # The credential shape never reaches the PR...
+        assert secret not in posted
+        # ...and neither does the body that carried it -- withheld wholesale, not
+        # partially scrubbed, because a partial scrub is what missed it already.
+        assert "src/foo.py:1" not in posted
+        assert "withheld" in posted
+        # The lane still reports honestly that it has no verdict.
+        assert "No completed" in posted
+
+    @pytest.mark.parametrize(("workflow", "output_file", "step", "stamp"), LANES)
+    def test_a_stamped_review_keeps_its_markers_intact(
+        self, tmp_path: Path, workflow: str, output_file: str, step: str, stamp: str
+    ) -> None:
+        """The neutralization must not leak out of the unstamped branch.
+
+        A properly stamped blocking review still publishes live markers, because
+        pr_status.py's freshness and blocking reads depend on them.
+        """
+        contract = _review_contract_module()
+        calls, result = self._run_step(
+            tmp_path,
+            workflow=workflow,
+            output_file=output_file,
+            step=step,
+            review_output=self._findings_body(stamp=stamp),
+        )
+        assert result.returncode == 0, result.stderr.decode()
+        posted = (calls / "created-body.md").read_text(encoding="utf-8")
+
+        assert (stamp, self.HEAD) in contract.REVIEWED_STAMP_RE.findall(posted)
+        assert self.HEAD in contract.BLOCK_MERGE_RE.findall(posted)
+        assert "UNSTAMPED" not in posted
+
+
+class TestForkGptLaneKeepsCredentialsOutOfTheModelShell:
+    """`codex exec` hands the model a shell; the Opus lane deliberately does not.
+
+    The Opus fork lane runs with ``--allowedTools "Read,Grep,Glob"``, so its model
+    has no way to read the environment. This lane's model does, and it runs on a
+    fork's UNTRUSTED diff, so a prompt-injected reviewer can be told to print its
+    environment. Redaction cannot close that by itself: it matches the
+    credential's shapes and its verbatim value, and a value printed in chunks,
+    with delimiters, or re-encoded defeats both. The credentials therefore must
+    not be in the shell's environment at all.
+    """
+
+    STEP = "Configure the review CLI for Amazon Bedrock"
+
+    def _config(self, tmp_path: Path) -> dict:
+        import tomllib
+
+        bash = _bash()
+        if bash is None:
+            pytest.skip("writing the review CLI config requires Bash")
+        home = tmp_path / "home"
+        home.mkdir()
+        script_file = tmp_path / "step.sh"
+        script_file.write_text(
+            _step_script(_workflow("fork-gpt-review.yml"), self.STEP),
+            encoding="utf-8",
+            newline="\n",
+        )
+        proc = subprocess.run(
+            [bash, "-e", str(script_file)],
+            check=False,
+            capture_output=True,
+            encoding="utf-8",
+            cwd=tmp_path,
+            env={**os.environ, "HOME": str(home)},
+        )
+        assert proc.returncode == 0, proc.stderr
+        written = home / ".codex" / "config.toml"
+        assert written.is_file(), "the step wrote no config.toml"
+        # PARSE, never grep: a heredoc emitting invalid TOML would still satisfy a
+        # substring assertion while codex discards the policy and the model's
+        # shell keeps the credentials.
+        return tomllib.loads(written.read_text(encoding="utf-8"))
+
+    def test_the_bedrock_provider_still_resolves(self, tmp_path: Path) -> None:
+        # The exclusions must not cost the lane its model: the provider reads its
+        # credentials from the codex PROCESS environment, which the shell policy
+        # does not touch.
+        config = self._config(tmp_path)
+        assert config["model_provider"] == "amazon-bedrock"
+        assert config["model"] == "openai.gpt-5.6-sol"
+
+    def test_every_aws_credential_variable_is_excluded(self, tmp_path: Path) -> None:
+        filters = self._config(tmp_path)["shell_environment_policy"]["filters"]
+        for name in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"):
+            assert filters.get(name) == "exclude", f"{name} still reaches the model's shell"
+        # The wildcard covers an AWS variable a later step introduces without
+        # anyone remembering to name it here.
+        assert filters.get("AWS_*") == "exclude"
+
+    def test_secret_named_variables_are_not_kept(self, tmp_path: Path) -> None:
+        # `ignore_default_excludes` reads backwards: it DEFAULTS TO TRUE, and true
+        # KEEPS variables whose names contain KEY, SECRET or TOKEN. It must be
+        # false so GH_TOKEN and future secret-shaped variables drop out too.
+        policy = self._config(tmp_path)["shell_environment_policy"]
+        assert policy["ignore_default_excludes"] is False
+
+
+class TestForkModelStepsDenyReadingTheEnvironment:
+    """Having no Bash is not the same as having no environment access.
+
+    These lanes run their models with ``--allowedTools "Read,Grep,Glob"`` and no
+    shell, which is why they need no `shell_environment_policy`. But `Read` is
+    path-unscoped and ``/proc/self/environ`` is an ordinary file, so an injected
+    prompt in the fork's untrusted diff could read the job's Bedrock credentials
+    through `Read` alone and print them into a body this PR now publishes.
+    Redaction cannot close that -- an encoded or chunked value evades both the
+    shape rules and the verbatim-value match -- so the read path is denied.
+
+    BOTH workflows this change edits are covered, not just the obvious one. The
+    GPT lane's own Opus ADJUDICATION step is a `claude-code-action` step too, and
+    the body it produces is posted by the SAME comment step that surfaces an
+    unstamped review -- so a fence that skipped it would leave the exposure
+    reachable in a file this diff already touches.
+    """
+
+    WORKFLOWS = ("fork-gpt-review.yml", "fork-opus-review.yml")
+    ACTION = "anthropics/claude-code-action"
+
+    def _model_steps(self) -> list[tuple[str, dict]]:
+        import yaml
+
+        found: list[tuple[str, dict]] = []
+        for workflow in self.WORKFLOWS:
+            doc = yaml.safe_load(_workflow(workflow))
+            steps = [
+                step
+                for job in (doc.get("jobs") or {}).values()
+                for step in (job.get("steps") or [])
+                if self.ACTION in str(step.get("uses") or "")
+            ]
+            # Enumerate rather than grep the file: a NEW model step added without
+            # the fence is exactly the regression this test exists to catch, and a
+            # whole-file substring assertion would still pass with one unfenced
+            # step sitting beside a fenced sibling.
+            assert steps, f"{workflow}: found no {self.ACTION} step to check"
+            found.extend((workflow, step) for step in steps)
+        return found
+
+    @staticmethod
+    def _args(workflow: str, step: dict) -> tuple[str, str]:
+        name = step.get("name") or step.get("id") or "<unnamed>"
+        return f"{workflow}:{name}", step.get("with", {}).get("claude_args", "")
+
+    def test_every_model_step_denies_reading_proc(self) -> None:
+        for workflow, step in self._model_steps():
+            where, args = self._args(workflow, step)
+            assert "--disallowedTools" in args, f"{where}: no --disallowedTools fence"
+            assert "Read(//proc/**)" in args, f"{where}: /proc is still readable"
+
+    def test_the_fence_is_a_deny_not_a_narrowed_allow(self) -> None:
+        # A deny rule outranks every allow rule and CLI flag, so the fence must
+        # not be expressed by narrowing --allowedTools: an allow rule that fails
+        # to match falls back to prompting, which in a non-interactive run is not
+        # a guarantee about what was read.
+        for workflow, step in self._model_steps():
+            where, args = self._args(workflow, step)
+            assert (
+                "Read(//proc" not in args.split("--disallowedTools")[0]
+            ), f"{where}: /proc appears before --disallowedTools, so it may be an allow rule"
+
+    def test_the_lanes_still_have_the_tools_they_review_with(self) -> None:
+        # The fence must not cost a lane its work: each reads the checked-out
+        # tree and its pre-fetched data through exactly these three tools.
+        for workflow, step in self._model_steps():
+            where, args = self._args(workflow, step)
+            assert '--allowedTools "Read,Grep,Glob"' in args, f"{where}: review tools changed"
+            # And Bash stays absent -- the no-shell property these lanes rest on.
+            assert "Bash" not in args, f"{where}: Bash reappeared in a fork model step"
+
+
+class TestModelStepsRunAfterTheCredentialFilesAreScrubbed:
+    """The environment fences do not cover the runner's on-disk copy.
+
+    ``configure-aws-credentials`` exports through ``core.exportVariable``, which
+    writes each value into ``$RUNNER_TEMP/_runner_file_commands/set_env_*``. Both
+    other fences guard the ENVIRONMENT -- the codex lane drops the AWS variables
+    from its shell tool's env, and the Opus steps deny ``Read(//proc/**)`` -- so
+    neither reaches a file sitting under a directory these lanes legitimately
+    read. A model told to open it can emit the value in chunks that match no
+    shape rule, which is why the value is removed rather than filtered.
+    """
+
+    WORKFLOWS = ("fork-gpt-review.yml", "fork-opus-review.yml")
+    SCRUB = "Scrub persisted credential files before the model runs"
+
+    def _jobs(self, workflow: str) -> list[list[dict]]:
+        import yaml
+
+        doc = yaml.safe_load(_workflow(workflow))
+        return [job.get("steps") or [] for job in (doc.get("jobs") or {}).values()]
+
+    @staticmethod
+    def _is_model_step(step: dict) -> bool:
+        if "anthropics/claude-code-action" in str(step.get("uses") or ""):
+            return True
+        # The codex lane invokes the model from a run block, so the `uses` test
+        # alone would miss both of its passes.
+        return "/.bin/codex" in str(step.get("run") or "")
+
+    def _scrub_bodies(self) -> list[str]:
+        bodies = []
+        for workflow in self.WORKFLOWS:
+            for steps in self._jobs(workflow):
+                for step in steps:
+                    if step.get("name") == self.SCRUB:
+                        bodies.append(step.get("run") or "")
+        return bodies
+
+    def test_every_model_step_is_directly_preceded_by_the_scrub(self) -> None:
+        seen = 0
+        for workflow in self.WORKFLOWS:
+            for steps in self._jobs(workflow):
+                for index, step in enumerate(steps):
+                    if not self._is_model_step(step):
+                        continue
+                    seen += 1
+                    where = f"{workflow}:{step.get('name') or step.get('id') or index}"
+                    assert index > 0, f"{where}: model step is first, so nothing scrubbed"
+                    assert steps[index - 1].get("name") == self.SCRUB, (
+                        f"{where}: the step before it is "
+                        f"{steps[index - 1].get('name')!r}, not the scrub"
+                    )
+        # Guard the enumeration itself: a rename that makes `_is_model_step` match
+        # nothing would otherwise turn this into a vacuous pass.
+        assert seen == 5, f"expected 5 model steps across both lanes, found {seen}"
+
+    def test_the_scrub_is_byte_identical_at_every_site(self) -> None:
+        bodies = self._scrub_bodies()
+        assert len(bodies) == 5, f"expected 5 scrub steps, found {len(bodies)}"
+        assert len(set(bodies)) == 1, "the scrub bodies have drifted apart"
+
+    def test_the_scrub_truncates_set_env_files_and_nothing_else(self, tmp_path: Path) -> None:
+        bash = _bash()
+        if bash is None:
+            pytest.skip("the scrub step is exercised on POSIX runners")
+        runner_temp = tmp_path / "runner"
+        commands = runner_temp / "_runner_file_commands"
+        commands.mkdir(parents=True)
+        (commands / "set_env_one").write_text(
+            "AWS_SECRET_ACCESS_KEY<<X\nsecret\nX\n", encoding="utf-8"
+        )
+        (commands / "set_env_two").write_text("AWS_SESSION_TOKEN<<Y\ntoken\nY\n", encoding="utf-8")
+        # A sibling command file the runner still needs: truncating it too would
+        # break state passing, so the pattern has to stay scoped to set_env_*.
+        (commands / "save_state_keep").write_text("keep\n", encoding="utf-8")
+
+        script = tmp_path / "scrub.sh"
+        script.write_text(self._scrub_bodies()[0], encoding="utf-8", newline="\n")
+        proc = subprocess.run(
+            [bash, "-e", str(script)],
+            check=False,
+            capture_output=True,
+            encoding="utf-8",
+            cwd=tmp_path,
+            env={**os.environ, "RUNNER_TEMP": str(runner_temp)},
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert (commands / "set_env_one").read_text(encoding="utf-8") == ""
+        assert (commands / "set_env_two").read_text(encoding="utf-8") == ""
+        assert (commands / "save_state_keep").read_text(encoding="utf-8") == "keep\n"
+
+    def test_a_missing_runner_directory_is_not_an_error(self, tmp_path: Path) -> None:
+        # The scrub runs unconditionally before every model step, so a job whose
+        # runner exposes no file-command directory must pass through it rather
+        # than failing the lane before the review starts.
+        bash = _bash()
+        if bash is None:
+            pytest.skip("the scrub step is exercised on POSIX runners")
+        script = tmp_path / "scrub.sh"
+        script.write_text(self._scrub_bodies()[0], encoding="utf-8", newline="\n")
+        proc = subprocess.run(
+            [bash, "-e", str(script)],
+            check=False,
+            capture_output=True,
+            encoding="utf-8",
+            cwd=tmp_path,
+            env={**os.environ, "RUNNER_TEMP": str(tmp_path / "absent")},
+        )
+        assert proc.returncode == 0, proc.stderr

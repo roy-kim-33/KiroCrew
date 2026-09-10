@@ -12,6 +12,8 @@ dashboard URL via the config file. (The dashboard *port* is set with the
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import copy
 import json
 import logging
 import math  # noqa: F401 - historical loader namespace compatibility
@@ -21,21 +23,26 @@ import shutil
 import stat as _stat
 import threading
 import uuid
-from collections.abc import Callable, Iterable, Mapping, MutableMapping
+from collections.abc import Callable, Iterable, Iterator, Mapping, MutableMapping
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit as _urlsplit  # noqa: F401 - compatibility facade
 
+# Module alias for post-split helpers. The `from ... import` list below is a
+# FROZEN pre-split alias snapshot (test_loader_reexports_historical_snapshot_by_identity),
+# so new resolution helpers are reached through the module, not re-exported.
+import kiro_crew.config.resolution as _resolution
 from kiro_crew import __version__, model_registry, platform_compat, windows_acl
-from kiro_crew.acp_backends import ACP_BACKEND_CLAUDE
+from kiro_crew.agent_sdk.capabilities import MODEL_NAMESPACE_ACP, capabilities_for
 
 # Leaf module (stdlib + platform_compat only) — no import cycle with config.
 from kiro_crew.atomic_write import atomic_write, on_event_loop
 
 # Computer-use defaults/ceilings come from the feature's constants module rather
-# than being re-spelled here (AGENTS.md: no hardcoded values in business logic).
+# than being re-spelled here (docs/system-specs/common/code-style.md: no
+# hardcoded values in business logic).
 # ``computer_use.types`` is deliberately dependency-free — it imports nothing from
 # ``kiro_crew`` — so this cannot create an import cycle with the loader, and the
 # ``computer_use`` package's ``__init__`` pulls in only ``platform_compat`` /
@@ -318,6 +325,11 @@ from kiro_crew.config.validation import (  # noqa: F401
     _mask_value,
 )
 from kiro_crew.config.validation import validate_config_data as _validate_config_data  # noqa: F401
+from kiro_crew.constants import (
+    SUBAGENT_TIMEOUT_MAX,
+    SUBAGENT_TIMEOUT_MIN,
+    SUBAGENT_TIMEOUT_SECS,
+)
 from kiro_crew.effort import is_valid_effort, model_supports_effort
 from kiro_crew.instances.constants import DEFAULT_CONNECT_TIMEOUT_SECS as _DEFAULT_CONNECT_TIMEOUT
 from kiro_crew.instances.constants import DEFAULT_MAX_RECOVERY_ATTEMPTS as _DEFAULT_MAX_RECOVERY
@@ -560,6 +572,18 @@ def _write_migration_backup(path: Path) -> None:
 MIGRATE_WORKSPACES = "workspaces"
 MIGRATE_AGENTS = "agents"
 MIGRATE_DEFAULT_AGENT = "default_agent"
+MIGRATE_CONNECTIONS_UI = "connections_ui"
+
+#: Sidecar marker recording that the one-shot ``connections_ui`` launch
+#: migration ran. Pre-launch builds materialized ``connections_ui: false`` into
+#: every config they saved (the key was the opt-in gate then, so a stored false
+#: was default noise, never a choice); post-launch the same bytes are the
+#: deliberate opt-out. The marker is the boundary between those two readings:
+#: a stored false found BEFORE it exists is stripped once, and any false found
+#: AFTER it exists is honoured forever. It lives beside ``config.json`` rather
+#: than inside it for the same reason as the superseded-defaults ack file — a
+#: full ``to_dict()`` rewrite carries only schema fields and would drop it.
+CONNECTIONS_UI_MIGRATION_MARKER = "connections_ui_migrated.json"
 
 
 def _apply_document_migrations(
@@ -630,6 +654,17 @@ def _apply_document_migrations(
                     )
                 )
             }
+            changed = True
+
+    # Strip the pre-launch materialized ``connections_ui: false``. Re-checked
+    # against *data*: only an exact stored ``false`` is touched, so a concurrent
+    # writer that already removed the key, or set it ``true``, is left alone.
+    # The one-shot boundary (a deliberate post-launch ``false`` must survive
+    # every later load) is enforced by the caller via the marker file — this
+    # delta is only ever pending on a load that found no marker.
+    if MIGRATE_CONNECTIONS_UI in pending:
+        if data.get("connections_ui") is False:
+            del data["connections_ui"]
             changed = True
 
     # Point default_agent at an agent that exists. Resolved against the
@@ -819,9 +854,8 @@ def computer_use_state_path() -> Path:
     grants full desktop observation plus input synthesis into the operator's real
     applications, which is a security ceiling, not a preference. Keeping it out
     of the agent-readable ``config.json`` is what makes it un-flippable by a
-    prompt-injected agent — ``is_sensitive_path`` blocks the tool path and
-    ``is_sensitive_bash_command`` blocks the shell forms (``cat``, ``>``,
-    ``tee``, archive extraction into the trust root).
+    prompt-injected agent — ``is_sensitive_path`` blocks the tool path and the
+    OS sandbox mounts the keystone read-only for the agent's shell.
 
     Holds ``{enabled, allowed_apps, extra_denied_apps}``; every read fails soft
     to DISABLED (see ``computer_use.enable_state``). The only writer is the
@@ -846,7 +880,7 @@ def oauth_endpoints_path() -> Path:
     ``_OAUTH_AUTHORIZATION_ENDPOINTS``), so an agent that could write this file
     could exempt an attacker-controlled host from the exfiltration heuristics —
     it is a trust boundary, not a preference. ``is_sensitive_path`` blocks the
-    tool path and ``is_sensitive_bash_command`` blocks the shell forms.
+    tool path and the OS sandbox mounts the keystone read-only for the shell.
 
     Holds ``{"additional_authorization_endpoints": [{"host": …, "path": …}]}``;
     every read fails soft to an EMPTY extension set (see
@@ -865,8 +899,8 @@ def aws_consent_path() -> Path:
     in ``config.json`` would leave it writable by any auto-approved agent shell,
     so a prompt-injected agent could mint the grant and consent, on the
     operator's behalf, to spending the operator's money in an account it picked.
-    ``is_sensitive_path`` blocks the tool path and ``is_sensitive_bash_command``
-    blocks the shell forms.
+    ``is_sensitive_path`` blocks the tool path and the OS sandbox mounts the
+    keystone read-only for the shell.
 
     Holds ``{"<service>": {profile, region, account, arn, granted_at}}``; every
     read fails soft to NO CONSENT (see ``aws_consent.read_grant``). The writers
@@ -875,6 +909,30 @@ def aws_consent_path() -> Path:
     than through this gate. Respects ``KIROCREW_HOME``.
     """
     return config_dir() / "aws_service_consent.json"
+
+
+def file_delivery_consent_path() -> Path:
+    """Return path to file_delivery_consent.json -- flagged-file delivery consent.
+
+    Same KEYSTONE reasoning as :func:`aws_consent_path`, and the leaf is on
+    ``security._CREW_SECRET_LEAVES`` for the same reason: a recorded consent to
+    deliver a file the credential scanner flagged is an authorization, not a
+    preference. Storing it in ``config.json`` would leave it writable by any
+    auto-approved agent shell, so a prompt-injected agent could mint the grant and
+    consent, on the owner's behalf, to shipping the owner's secrets -- the exact
+    shape ``CredentialPolicy.exempt_exact_hosts`` refuses when it says such a set
+    is "NEVER sourced from ``config.json``". ``is_sensitive_path`` blocks the tool
+    path and the OS sandbox mounts the keystone read-only for the shell.
+
+    Holds ``{"<destination_class>": {destination_class, granted_at}}``; every read
+    fails soft to NO CONSENT (see ``file_delivery_consent.read_grant``). The only
+    writer is the authenticated, OWNER-gated dashboard
+    ``/api/file-delivery/consent`` handler, which opens the path directly rather
+    than through this gate. There is deliberately NO CLI verb -- a terminal
+    command that records a grant on request is a grant an automated caller can
+    take. Respects ``KIROCREW_HOME``.
+    """
+    return config_dir() / "file_delivery_consent.json"
 
 
 def read_local_secret(port: int) -> str:
@@ -1117,6 +1175,66 @@ def write_config_atomically(path: Path, data: dict, *, fsync: bool = False) -> N
         atomic_write(path, payload, fsync=fsync, mode=mode)
 
 
+def coerce_dict_section(doc: dict, key: str) -> dict:
+    """Return ``doc[key]`` as a dict, REPLACING a degraded (non-dict) value.
+
+    The validated loader treats a malformed top-level section (``"workspaces":
+    []``, ``"agents": "oops"``) as absent and supplies defaults, so the
+    dataclass view never sees the damage. A raw delta mutator working on the
+    document as read (``update_config_locked``'s ``mutate``) must take the
+    same posture: a plain ``doc.setdefault(key, {})`` hands the degraded value
+    straight back, and the mutator then crashes on ``.values()``/``[name]``
+    with an HTTP 500 for the caller. Replacing the degraded section with a
+    fresh dict matches what the validated load already presents everywhere
+    else, and happens inside the same locked write, so the repair is atomic
+    with the mutation that needed it.
+    """
+    section = doc.get(key)
+    if not isinstance(section, dict):
+        section = {}
+        doc[key] = section
+    return section
+
+
+@contextlib.contextmanager
+def _config_write_lock(p: Path, *, wait: bool = True) -> Iterator[None]:
+    """Hold the sidecar advisory lock that serializes config-file writers.
+
+    THE one lock path for a config write: :func:`update_config_locked` and
+    :meth:`KiroCrewConfig.save` both come through here, so a second, subtly
+    different lock file can never reappear — the sidecar is always
+    ``<p>.lock`` beside the file being written (callers resolve a symlinked
+    config first, so it lands beside the TARGET; see :func:`_lock_target`).
+
+    The sidecar is opened (created if absent) and the advisory lock is taken
+    via :func:`platform_compat.file_lock` — ``fcntl.flock`` on POSIX, a bounded
+    ``msvcrt.locking`` spin on Windows, both fail-closed. The sidecar file
+    itself is deliberately left in place on exit: unlinking a lockfile that a
+    concurrent waiter has already opened re-introduces the race the lock
+    exists to prevent (the waiter would hold a lock on an unlinked inode while
+    a third writer creates a fresh sidecar and locks that instead), and on
+    Windows deleting a file another process holds open fails outright. One
+    stable sidecar per config file is the whole lifecycle.
+
+    **Lock ordering.** A caller that also holds the loop-side asyncio config
+    lock (``dashboard/handlers/agents._get_config_lock``) must acquire that
+    FIRST and this flock second, from a worker thread — the order
+    ``dashboard/chat_utils.run_config_write`` documents. Taking them in the
+    other order can deadlock against ``run_config_write`` holders. A POSIX
+    ``flock`` wait blocks its thread, so this must never be entered on the
+    event-loop thread with ``wait=True``; async callers offload (see
+    :meth:`KiroCrewConfig.save`).
+    """
+    lock_path = p.parent / (p.name + ".lock")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        with platform_compat.file_lock(fd, exclusive=True, wait=wait):
+            yield
+    finally:
+        os.close(fd)
+
+
 def update_config_locked(
     path: Path | None = None,
     *,
@@ -1142,29 +1260,25 @@ def update_config_locked(
     Read "direct caller outside this module" strictly: it is the exact set the
     ratchet checks, and it is NOT the same as "every writer that reaches
     ``config.json``".  :meth:`KiroCrewConfig.save` calls
-    :func:`write_config_atomically` and does NOT come through here -- see the
-    second family below.
+    :func:`write_config_atomically` and does NOT come through here -- but since
+    #4767 it holds the SAME sidecar lock (via :func:`_config_write_lock`), so
+    its rename can no longer land inside this function's read-modify-write.
+    ``save`` is still a whole-document publish of in-memory state, not an RMW:
+    a stale snapshot saved after a locked update overwrites it with older
+    values.  The lock fixes interleaving, not staleness.
 
     A SECOND family of writers still bypasses this lock, and the ratchet does
-    NOT reach it -- for two different reasons, neither of which is visible from a
-    call site:
+    NOT reach it: writers that reach ``config_path()`` through
+    ``kiro_crew.agent._atomic_json_write`` (``messaging.py``'s per-channel
+    savers, ``core.py``'s STT PUT, ``mcp.py``'s gateway-enable). The ratchet
+    matches calls to :func:`write_config_atomically`, and these make none.
 
-    * Writers that reach ``config_path()`` through
-      ``kiro_crew.agent._atomic_json_write`` (``messaging.py``'s per-channel
-      savers, ``core.py``'s STT PUT, ``mcp.py``'s gateway-enable). The ratchet
-      matches calls to :func:`write_config_atomically`, and these make none.
-    * Writers that go through :meth:`KiroCrewConfig.save` (``updates.py``'s
-      log-level PUT, ``core.py``'s theme PUT, several ``agents.py`` agent CRUD
-      endpoints). ``save`` DOES call :func:`write_config_atomically` directly,
-      but it does so from inside this module, which the ratchet exempts -- so the
-      write is invisible to it at every caller.
-
-    Both rely on the in-process asyncio ``_get_config_lock()`` only, which
-    serializes same-loop callers and nothing else, so they can still interleave
-    with a holder of this lock.  Converting them is follow-up work; do not read
-    the ratchet's green as covering them, and note that an ALIASED import of
-    :func:`write_config_atomically` would evade it for the same matching reason
-    as the first bullet.
+    That family relies on the in-process asyncio ``_get_config_lock()`` only,
+    which serializes same-loop callers and nothing else, so it can still
+    interleave with a holder of this lock.  Converting it is follow-up work; do
+    not read the ratchet's green as covering it, and note that an ALIASED
+    import of :func:`write_config_atomically` would evade it for the same
+    matching reason.
 
     Contract:
 
@@ -1248,27 +1362,21 @@ def update_config_locked(
             p = p.resolve()
     except OSError:
         pass
-    lock_path = p.parent / (p.name + ".lock")
-    p.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
-    try:
-        with platform_compat.file_lock(fd, exclusive=True, wait=wait_for_lock):
-            try:
-                data = read_config_for_update(p)
-            except ConfigReadError:
-                if on_corrupt == "fail":
-                    raise
-                # on_corrupt="reset": treat as empty inside the same lock hold.
-                data = {}
-            result = mutate(data)
-            if result is None:
-                return data
-            if stamp_meta:
-                result = stamp_config_meta(result)
-            write_config_atomically(p, result, fsync=fsync)
-            return result
-    finally:
-        os.close(fd)
+    with _config_write_lock(p, wait=wait_for_lock):
+        try:
+            data = read_config_for_update(p)
+        except ConfigReadError:
+            if on_corrupt == "fail":
+                raise
+            # on_corrupt="reset": treat as empty inside the same lock hold.
+            data = {}
+        result = mutate(data)
+        if result is None:
+            return data
+        if stamp_meta:
+            result = stamp_config_meta(result)
+        write_config_atomically(p, result, fsync=fsync)
+        return result
 
 
 # Keys already warned about in this process. The gateway loads config repeatedly
@@ -1536,9 +1644,11 @@ def strip_kiro_cli_api_key(env: MutableMapping[str, str]) -> MutableMapping[str,
 
     "Foreign process" is no longer the right framing for KAS: Crew reaches it
     through kiro-cli's ACP relay, so the child IS a kiro-cli. The strip still
-    applies because the v3 engine resolves its tokens from kiro-cli's OIDC store
-    (``--auth-method cli``) and never reads this variable — the test is what the
-    child's engine consumes, not which binary it is.
+    applies because the v3 engine resolves its tokens either from kiro-cli's
+    OIDC store (``--auth-method cli``) or from Crew's own vault over its
+    ``_kiro/auth/getAccessToken`` callback, and an API key in its environment
+    would take precedence over both — the test is what the child's engine
+    consumes, not which binary it is.
 
     Matches the platform env-key convention (exact on POSIX, case-folded on
     Windows) so a differently-cased Windows spelling cannot slip past. Mutates
@@ -1640,16 +1750,34 @@ def load_loop_stall_exit_after(
     return resolve_loop_stall_exit_after(dashboard_data, environ)
 
 
+def _subagent_timeout_from(raw: object) -> int:
+    """Coerce ``agent.subagent_timeout_secs``, preserving its ``0`` sentinel.
+
+    ``0`` means "use the default" and is normalized by the manager, so it must
+    survive coercion: running it through the ``[MIN, MAX]`` clamp turns a
+    documented sentinel into a 60-second deadline that kills healthy subagents.
+    Coercion still happens here as well as in ``_clamp_security_bounds``, because
+    that clamp skips non-int values and a numeric STRING (``"30"``) reaches this
+    site unbounded.
+    """
+    value = _safe_int(raw, SUBAGENT_TIMEOUT_SECS, 0, SUBAGENT_TIMEOUT_MAX)
+    return value if value == 0 else max(SUBAGENT_TIMEOUT_MIN, value)
+
+
 # (section, key, min, max) for each bounded field clamped at load time. The
 # mins match the runtime floors: subagent_auto_max has a floor of 3
 # (``subagent._LEGACY_DEFAULT_MAX`` — the auto-size minimum), so a value < 3 is
 # clamped UP to 3 with a warning, mirroring the > ceiling clamp. max_subagents
 # keeps a 0 floor here (0 = auto sentinel) — its 0-or-(>=3) rule is applied as a
-# special case after the generic loop. Only out-of-range values are altered.
+# special case after the generic loop. subagent_timeout_secs keeps a 0 floor for
+# the same reason: 0 is its documented "use the default" sentinel, which the
+# manager normalizes, so a MIN floor in the generic loop would turn it into a
+# 60-second deadline. Only out-of-range values are altered.
 _SECURITY_BOUNDED_FIELDS: tuple[tuple[str, str, int, int], ...] = (
     ("agent", "subagent_auto_max", 3, SUBAGENT_AUTO_MAX_CEILING),
     ("agent", "max_subagents", 0, SUBAGENT_AUTO_MAX_CEILING),
     ("agent", "subagent_max_turns", 1, SUBAGENT_MAX_TURNS_CEILING),
+    ("agent", "subagent_timeout_secs", 0, SUBAGENT_TIMEOUT_MAX),
     ("agent", "chat_turn_timeout_secs", CHAT_TURN_TIMEOUT_MIN, CHAT_TURN_TIMEOUT_MAX),
     (
         "agent",
@@ -1786,6 +1914,31 @@ def _clamp_security_bounds(data: dict) -> None:
                 SUBAGENT_AUTO_MAX_CEILING,
             )
 
+    # subagent_timeout_secs special case, and the reason its table floor is 0:
+    # 0 is the field's documented "use the default" sentinel, which the manager
+    # normalizes (``SubagentManager.__init__``). A MIN floor in the generic loop
+    # would rewrite that 0 to 60 and hand a healthy subagent a one-minute
+    # deadline, so 0 is preserved here and only a NON-zero value below the floor
+    # is raised to it.
+    if isinstance(agent, dict):
+        st = agent.get("subagent_timeout_secs")
+        if isinstance(st, int) and not isinstance(st, bool) and 0 < st < SUBAGENT_TIMEOUT_MIN:
+            agent["subagent_timeout_secs"] = SUBAGENT_TIMEOUT_MIN
+            logger.warning(
+                "config agent.subagent_timeout_secs=%d is below the floor of %d "
+                "(0 = use the default); clamped UP to %d",
+                st,
+                SUBAGENT_TIMEOUT_MIN,
+                SUBAGENT_TIMEOUT_MIN,
+            )
+            _log_config_clamp_event(
+                "agent.subagent_timeout_secs",
+                st,
+                SUBAGENT_TIMEOUT_MIN,
+                SUBAGENT_TIMEOUT_MIN,
+                SUBAGENT_TIMEOUT_MAX,
+            )
+
     # tool_approval_timeout_secs cross-field case: the approval window must end
     # inside the turn that opened it. At or above the turn ceiling it can never
     # fire — the turn is cut first, so the user is told "this turn timed out"
@@ -1852,9 +2005,39 @@ def _cached_validated_data(fp: tuple | None = None) -> dict | None:
     return _CONFIG_CACHE.get(fp if fp is not None else _config_fingerprint())
 
 
-def _store_validated_data(data: dict, fp: tuple) -> None:
-    """Cache a deep copy of *data* under fingerprint *fp* (see ConfigCache.store)."""
-    _CONFIG_CACHE.store(data, fp)
+def _store_validated_data(data: dict, fp: tuple, sidecar: dict | None = None) -> None:
+    """Cache a deep copy of *data* (+ *sidecar*) under *fp* (see ConfigCache.store)."""
+    _CONFIG_CACHE.store(data, fp, sidecar)
+
+
+#: Sidecar key under which the loader caches the pre-overlay base values of the
+#: top-level sections config.local.json touches. See ``_shadowed_base_sections``.
+_SIDECAR_BASE_SHADOW = "base_shadow"
+
+
+def _shadowed_base_sections(base: dict, overlay: dict) -> dict:
+    """The base document's copy of every top-level section the overlay touches.
+
+    ``_deep_merge`` lets an overlay leaf replace a base leaf, and after the merge
+    nothing remembers what the base held. That is fine for modelled keys — they
+    are parsed into fields and ``save()`` re-emits the field, while
+    ``_subtract_overlay`` keeps the overlay's value out of the base file. It is
+    NOT fine for the unknown keys ``_extra_sections`` / ``_extra_keys`` round-trip
+    verbatim: captured from the MERGED document they hold the overlay's value, so
+    ``save()`` emits it, the subtraction removes it (it equals the raw overlay
+    value), and the base file loses a key it had. Removing the overlay later then
+    reveals nothing — the base value is gone for good.
+
+    Capturing from the base instead makes the round-trip honest: ``save()`` emits
+    the base value, it differs from the overlay leaf so subtraction leaves it, and
+    the overlay still wins on the next load exactly as before.
+
+    Only sections the overlay names are kept (an overlay normally touches a few),
+    and only their base copy — the loader already has the merged copy. This rides
+    in the cache sidecar so a cache hit, where the overlay is no longer in scope,
+    can still capture correctly.
+    """
+    return {k: copy.deepcopy(base[k]) for k in overlay if k in base}
 
 
 def _invalidate_config_cache() -> None:
@@ -2102,10 +2285,10 @@ class KiroCrewConfig:
     #: is a strict ``=== true``, so coercing e.g. the string ``"true"`` would
     #: only make the two ends disagree about what was configured.
     connections_ui: bool = field(
-        default=False,
+        default=True,
         metadata=_meta(
             "Connections UI",
-            "Show the Connections gallery (held for a later release).",
+            "Show the Connections services gallery (set false to hide it).",
         ),
     )
     #: Top-level sections that were PRESENT on disk but not a JSON object, and
@@ -2172,6 +2355,16 @@ class KiroCrewConfig:
     # ConfigSchemaContributor seam — a companion writes its section, the core
     # round-trips it untouched.
     _extra_sections: dict = field(default_factory=dict)
+    # Unknown keys found INSIDE a modelled section, captured at load() and
+    # re-emitted by to_dict() for the same reason as _extra_sections one level
+    # up: a build that stops modelling ``<section>.<key>`` (a rename, a removal,
+    # an older config written by a newer edition) would otherwise erase the
+    # operator's value on the next save() of any kind, with no backup on that
+    # path. Shape: {section: {key: value}}. Populated only from disk, and only
+    # ever used to fill a key the emitted section LACKS, so it cannot clobber a
+    # live value. See resolution.capture_extra_section_keys for what counts as
+    # unknown (a schema-modelled key that validation rejected stays dropped).
+    _extra_keys: dict = field(default_factory=dict)
 
     def channel_config(self, channel_id: str) -> ChannelConfig:
         """Return the config for *channel_id*, falling back to defaults.
@@ -2288,9 +2481,18 @@ class KiroCrewConfig:
         # second pass would be filesystem I/O there for information already in
         # hand.
         fp = _config_fingerprint()
-        cached_data = _cached_validated_data(fp)
-        if cached_data is not None:
-            data = cached_data
+        # Data and sidecar come from ONE lock hold: fetched separately, a save()
+        # on another thread could clear the cache between the two and hand this
+        # load a merged document with an EMPTY base shadow — which would then be
+        # captured from as if no overlay existed (see _shadowed_base_sections).
+        cached = _CONFIG_CACHE.get_with_sidecar(fp)
+        # Pre-overlay base copy of the sections the overlay touched. Filled on the
+        # disk path below; read from the sidecar on a cache hit. Empty when there
+        # is no overlay, in which case the merged document IS the base.
+        base_shadow: dict = {}
+        if cached is not None:
+            data, sidecar = cached
+            base_shadow = sidecar.get(_SIDECAR_BASE_SHADOW, {})
         else:
             # fp was captured BEFORE reading, so a write landing during the read
             # is detected: we cache under it, it won't match the post-write
@@ -2352,6 +2554,9 @@ class KiroCrewConfig:
                     _mark_file_degraded(local_path)
 
             if local_data:
+                # Remember the base copy of what the overlay is about to shadow —
+                # the last moment both documents exist. See _shadowed_base_sections.
+                base_shadow = _shadowed_base_sections(data, local_data)
                 data = _deep_merge(data, local_data)
 
             # A present source that cannot be read or parsed may contain the
@@ -2405,6 +2610,19 @@ class KiroCrewConfig:
                 data["resource_limits"] = asdict(
                     ResourceLimitsConfig.from_raw(data["resource_limits"])
                 )
+            # Same fail-closed-before-validation reason for the member-dispatch
+            # ceiling. `agent.member_dispatch` gates whether a crew member
+            # bypasses `session_control`; its safe direction is FALSE (bypass
+            # off). Schema validation pops a present-but-malformed value and the
+            # missing-field default is TRUE, so a quoted `"false"` — a routine
+            # operator quoting mistake — would silently ride that default back
+            # to an authorized bypass. Coerce a present non-bool to False HERE,
+            # so validation sees a valid bool and keeps it; a genuinely absent
+            # key is left absent and still defaults to true (today's behaviour).
+            _agent_section = data.get("agent")
+            if isinstance(_agent_section, dict) and "member_dispatch" in _agent_section:
+                if not isinstance(_agent_section["member_dispatch"], bool):
+                    _agent_section["member_dispatch"] = False
             # Validate against JSON Schema (advisory — never fatal)
             _validate_config_data(data)
             # Clamp security-relevant resource-limit knobs to their API ceilings
@@ -2413,8 +2631,10 @@ class KiroCrewConfig:
             # on the disk-read path; cache hits below already serve clamped values.
             _clamp_security_bounds(data)
             # Cache the validated, merged dict under the PRE-read fingerprint so
-            # a mid-read write self-heals (next load misses and re-reads).
-            _store_validated_data(data, pre_read_fp)
+            # a mid-read write self-heals (next load misses and re-reads). The
+            # base shadow rides along so a hit can capture unknown keys from the
+            # base document exactly as this disk read did.
+            _store_validated_data(data, pre_read_fp, {_SIDECAR_BASE_SHADOW: base_shadow})
 
         # Collected during the parse that discards them — the only moment the
         # evidence exists, since the migration below rewrites config.json in
@@ -2529,6 +2749,10 @@ class KiroCrewConfig:
                         description=entry.get("description", ""),
                         triggers=raw_triggers if isinstance(raw_triggers, str) else "",
                         source=entry.get("source", "kirocrew"),
+                        # Hand-editable config: a quoted "true" or a stray int
+                        # must not become a truthy star, so only a real bool
+                        # is honoured and anything else reads as un-starred.
+                        starred=_safe_bool(entry.get("starred", False), False),
                         # Same guard family as model/triggers: config.json is
                         # hand-editable, so a junk value must collapse to 0
                         # (inherit the global window), never crash the load.
@@ -2582,9 +2806,17 @@ class KiroCrewConfig:
         # survives the load()->to_dict()->save() round-trip instead of being
         # silently dropped. ``meta`` is stamped by save() itself, so it is never
         # treated as an unknown section to preserve.
+        #
+        # Captured from the BASE view, not the merged one: for any section the
+        # overlay touched, ``base_shadow`` holds what config.json itself said.
+        # Capturing the merged value would make save() emit the overlay's leaf,
+        # which _subtract_overlay then removes — deleting the base file's own
+        # value. See _shadowed_base_sections. Sections the overlay did not touch
+        # are identical in both views.
+        capture_view = {**data, **base_shadow}
         extra_sections = {
             k: v
-            for k, v in data.items()
+            for k, v in capture_view.items()
             if k not in _KNOWN_CONFIG_SECTIONS and k not in CONFIG_RESERVED_TOP_KEYS
         }
 
@@ -2681,8 +2913,8 @@ class KiroCrewConfig:
                     agent_data.get("subagent_mem_buffer_pct", 20), 20
                 ),
                 chat_turn_timeout_secs=_safe_int(
-                    agent_data.get("chat_turn_timeout_secs", 7200),
-                    7200,
+                    agent_data.get("chat_turn_timeout_secs", 14400),
+                    14400,
                     CHAT_TURN_TIMEOUT_MIN,
                     CHAT_TURN_TIMEOUT_MAX,
                 ),
@@ -2708,6 +2940,14 @@ class KiroCrewConfig:
                 # `bool("false")` is `True`, and `_safe_bool` is what keeps a
                 # quoted opt-out from loading as enabled.
                 session_control=_safe_bool(agent_data.get("session_control", True), True),
+                # Default true preserves the zero-configuration member-dispatch
+                # grant (today's behaviour) for a MISSING key. A present-but-
+                # malformed value was already coerced to False upstream, BEFORE
+                # schema validation, so it cannot ride the missing-field default
+                # back to true — see the `member_dispatch` normalization above
+                # the `_validate_config_data` call. `_safe_bool` here is the
+                # final guard for a real bool.
+                member_dispatch=_safe_bool(agent_data.get("member_dispatch", True), True),
                 subagent_cost_gb=_safe_float(agent_data.get("subagent_cost_gb", 0.5), 0.5),
                 subagent_cpu_cost_cores=_safe_float(
                     agent_data.get("subagent_cpu_cost_cores", 1.0), 1.0
@@ -2725,7 +2965,9 @@ class KiroCrewConfig:
                 subagent_max_turns=_safe_int(
                     agent_data.get("subagent_max_turns", 100), 100, 1, SUBAGENT_MAX_TURNS_CEILING
                 ),
-                subagent_timeout_secs=agent_data.get("subagent_timeout_secs", 1800),
+                subagent_timeout_secs=_subagent_timeout_from(
+                    agent_data.get("subagent_timeout_secs", SUBAGENT_TIMEOUT_SECS)
+                ),
                 subagent_stall_idle_secs=_safe_int(
                     agent_data.get("subagent_stall_idle_secs", 120), 120
                 ),
@@ -2837,18 +3079,30 @@ class KiroCrewConfig:
                 stage_timeout_seconds=_safe_int(
                     orchestrator_data.get("stage_timeout_seconds", 1800), 1800
                 ),
+                # Default read off the dataclass rather than imported: the loader's
+                # re-export list from config.sections is a frozen boundary snapshot
+                # (test_config_module_boundaries), and this keeps
+                # DEFAULT_MAX_PLAN_DURATION as the single source of truth without
+                # adding an alias to it.
+                max_plan_duration_seconds=_safe_int(
+                    orchestrator_data.get(
+                        "max_plan_duration_seconds",
+                        OrchestratorConfig.max_plan_duration_seconds,
+                    ),
+                    OrchestratorConfig.max_plan_duration_seconds,
+                ),
             ),
             watchdog=WatchdogConfig(
                 check_after_secs=_safe_float(watchdog_data.get("check_after_secs", 60.0), 60.0),
-                stale_window_secs=_safe_float(watchdog_data.get("stale_window_secs", 300.0), 300.0),
+                stale_window_secs=_safe_float(watchdog_data.get("stale_window_secs", 600.0), 600.0),
                 tool_stall_suspect_secs=_safe_float(
-                    watchdog_data.get("tool_stall_suspect_secs", 3600.0), 3600.0
+                    watchdog_data.get("tool_stall_suspect_secs", 5400.0), 5400.0
                 ),
                 tool_stall_hard_cap_secs=_safe_float(
-                    watchdog_data.get("tool_stall_hard_cap_secs", 3600.0), 3600.0
+                    watchdog_data.get("tool_stall_hard_cap_secs", 7200.0), 7200.0
                 ),
                 model_silent_probe_secs=_safe_float(
-                    watchdog_data.get("model_silent_probe_secs", 900.0), 900.0
+                    watchdog_data.get("model_silent_probe_secs", 1800.0), 1800.0
                 ),
                 wellness_sample_secs=_safe_float(
                     watchdog_data.get("wellness_sample_secs", 3.0), 3.0
@@ -2887,10 +3141,18 @@ class KiroCrewConfig:
                 embed_model_url=memory_data.get("embed_model_url", ""),
                 embed_model_path=memory_data.get("embed_model_path", ""),
                 embed_model_id=memory_data.get("embed_model_id", ""),
-                semantic_confidence_threshold=memory_data.get("semantic_confidence_threshold", 0.8),
-                episodic_dedup_threshold=memory_data.get("episodic_dedup_threshold", 0.88),
-                episodic_max_results=memory_data.get("episodic_max_results", 8),
-                episodic_max_count=memory_data.get("episodic_max_count", 10_000),
+                semantic_confidence_threshold=_safe_float(
+                    memory_data.get("semantic_confidence_threshold", 0.8), 0.8, 0.0, 1.0
+                ),
+                episodic_dedup_threshold=_safe_float(
+                    memory_data.get("episodic_dedup_threshold", 0.88), 0.88, 0.0, 1.0
+                ),
+                episodic_max_results=_safe_int(
+                    memory_data.get("episodic_max_results", 8), 8, 1, None
+                ),
+                episodic_max_count=_safe_int(
+                    memory_data.get("episodic_max_count", 10_000), 10_000, 0, None
+                ),
                 decay_rates=(
                     dr if isinstance(dr := memory_data.get("decay_rates", {}), dict) else {}
                 ),
@@ -3255,6 +3517,9 @@ class KiroCrewConfig:
                 user_role_other=str(dashboard_data.get("user_role_other", "")),
                 user_technical_level=str(dashboard_data.get("user_technical_level", "")),
                 tips_enabled=bool(dashboard_data.get("tips_enabled", True)),
+                feature_videos_enabled=_safe_bool(
+                    dashboard_data.get("feature_videos_enabled"), False
+                ),
                 folder_suggestions_enabled=bool(
                     dashboard_data.get("folder_suggestions_enabled", True)
                 ),
@@ -3303,7 +3568,7 @@ class KiroCrewConfig:
                 enabled=_safe_bool(stt_data.get("enabled"), True),
                 provider=_validated_stt_provider(stt_data.get("provider", STT_PROVIDER_LOCAL)),
                 model=_validated_stt_model(stt_data.get("model", _STT_DEFAULT_MODEL)),
-                language_code=stt_data.get("language_code", "en-US"),
+                language_code=stt_data.get("language_code", _sections.STT_LANGUAGE_AUTO),
                 streaming=_safe_bool(stt_data.get("streaming"), True),
                 silence_ms=_safe_int(
                     stt_data.get("silence_ms"),
@@ -3403,7 +3668,7 @@ class KiroCrewConfig:
                 cursor_motion=_safe_bool(computer_use_data.get("cursor_motion", False), False),
             ),
             auto_update=data.get("auto_update", True),
-            connections_ui=_safe_bool(data.get("connections_ui", False), False),
+            connections_ui=_safe_bool(data.get("connections_ui", True), True),
             _degraded_sections=frozenset(_degraded | _OBSERVED_DEGRADED_SECTIONS),
             timezone=data.get("timezone", ""),
             snapshot_dir=data.get("snapshot_dir", ""),
@@ -3615,6 +3880,13 @@ class KiroCrewConfig:
             _extra_sections=extra_sections,
         )
 
+        # Unknown keys nested inside a modelled section. Captured AFTER
+        # construction because deciding what is unknown needs the built
+        # dataclasses' own field sets, not a second hand-maintained list that
+        # could drift from them. Same base-not-merged view as _extra_sections
+        # above, for the same reason.
+        cfg._extra_keys = _resolution.capture_extra_section_keys(capture_view, cfg)
+
         # Write-back migration: if the on-disk config has legacy format
         # (flat workspace strings, missing sections), back up the original
         # and save the migrated version.  One-shot — subsequent loads see
@@ -3653,10 +3925,25 @@ class KiroCrewConfig:
                     cfg.default_agent = "default"
                 pending.add(MIGRATE_DEFAULT_AGENT)
 
+            # One-shot launch migration for ``connections_ui`` (see the marker
+            # constant's docstring). Decided on the BASE document, not the
+            # merged view: the overlay is user-owned prose we never rewrite,
+            # and the stale materialization only ever landed in config.json.
+            connections_marker = config_dir() / CONNECTIONS_UI_MIGRATION_MARKER
+            connections_migrating = False
+            if not connections_marker.exists():
+                if data.get("connections_ui") is False:
+                    # In-memory half: this very load must already serve the
+                    # launch default — the strip below is the on-disk echo.
+                    cfg.connections_ui = True
+                    pending.add(MIGRATE_CONNECTIONS_UI)
+                connections_migrating = True
+
             needs_migration = bool(pending)
 
+            persisted = True
             if needs_migration and not cfg._degraded_sections:
-                _persist_config_migration(
+                persisted = _persist_config_migration(
                     path,
                     frozenset(pending),
                     default_kiro_agent=cfg.agent.default_agent or "kirocrew",
@@ -3676,6 +3963,30 @@ class KiroCrewConfig:
                     "degraded section(s) %s and writing back would erase the "
                     "evidence; fix the file to clear",
                     sorted(cfg._degraded_sections),
+                )
+
+            # Record the connections_ui boundary only after a pass that was
+            # allowed to act on it AND whose write-back actually landed. A
+            # degraded load skips both the strip and the marker; a contended
+            # lock makes _persist_config_migration return False with nothing
+            # written, and the marker MUST defer with the strip — marker
+            # without strip would freeze the stale false as a deliberate
+            # opt-out forever. (The already-migrated-by-another-writer path
+            # also returns False; the marker then lands on the next load,
+            # which finds nothing to strip. One extra boot, same endpoint.)
+            # Failure to write the marker itself is logged and retried next
+            # load — the strip's own condition makes the retry converge.
+            if connections_migrating and persisted and not cfg._degraded_sections:
+                atomic_write(
+                    connections_marker,
+                    json.dumps(
+                        {
+                            "migrated_at": datetime.now(timezone.utc).isoformat(),
+                            "stripped_stale_false": MIGRATE_CONNECTIONS_UI in pending,
+                        },
+                        indent=2,
+                    )
+                    + "\n",
                 )
         except Exception as e:
             # Migration write-back is best-effort; never block startup.
@@ -3772,6 +4083,13 @@ class KiroCrewConfig:
         else:
             slack_section.pop("trusted_bot_ids", None)
         slack_section["observe_ttl_hours"] = self.observe_ttl_hours
+        # Restore unknown keys captured INSIDE a modelled section (and inside the
+        # named records of agents/workspaces/memory_stores). Last in the method
+        # on purpose: every conditional and derived emission above has already
+        # run, so the fill-only rule reads the final truth and a captured copy
+        # can only ever FILL a gap, never overwrite a live value or undo a
+        # deliberate deletion.
+        _resolution.restore_extra_section_keys(d, self._extra_keys)
         return d
 
     def save(self) -> None:
@@ -3782,6 +4100,34 @@ class KiroCrewConfig:
 
         Values that exist in ``config.local.json`` are stripped from the
         output to prevent overlay settings from leaking into the base file.
+
+        **The write happens under the sidecar advisory lock** — the same
+        ``<config>.lock`` that :func:`update_config_locked` holds (#4767).
+        Without it, this whole-document rename could land INSIDE another
+        writer's read-modify-write (a CLI ``update_config_locked`` holder, a
+        boot refresh, a second gateway), and whichever renamed second
+        published a document that never saw the other's change. The lock
+        serializes the writes; it does NOT re-read the file — ``save()``
+        still publishes this object's in-memory snapshot.
+
+        **The staleness contract that follows.** Because the snapshot is
+        taken at ``load()`` and only the rename is locked, any suspension
+        point (an ``await``, a lock wait, a long computation) between the
+        load and this call is a window in which a concurrent writer's change
+        is silently overwritten by the eventual publish. ``save()`` is
+        therefore ONLY for single-flow callers with no suspension between
+        their load and their save — CLI one-shots and the boot default-config
+        write. Every read-modify-write flow, and every dashboard/coroutine
+        caller, belongs on :func:`update_config_locked` (via
+        ``dashboard/chat_utils.run_config_write``), which holds the flock
+        across the WHOLE read-mutate-write transaction; as of #4767 no
+        coroutine in the tree calls ``save()`` at all
+        (``TestNoInlineSaveOnTheEventLoop`` pins that structurally).
+
+        **Async callers must offload.** A contended POSIX ``flock`` blocks
+        the calling thread for as long as the holder keeps it, which on the
+        event-loop thread stalls the whole gateway — the exact failure that
+        reverted the first attempt at this lock (#4371).
         """
 
         d = self.to_dict()
@@ -3818,7 +4164,19 @@ class KiroCrewConfig:
         # Atomic + mode-preserving: a concurrent reader must never observe a
         # half-written config, and the write must not widen who can read a file
         # that may hold inline credentials. See write_config_atomically.
-        write_config_atomically(config_path(), stamp_config_meta(d))
+        #
+        # Resolve a symlinked config BEFORE locking (same logic as
+        # update_config_locked) so the sidecar sits beside the ACTUAL file the
+        # rename will replace — a lock beside the symlink would not serialize
+        # against a writer that resolved first.
+        p = config_path()
+        try:
+            if p.is_symlink():
+                p = p.resolve()
+        except OSError:
+            pass
+        with _config_write_lock(p):
+            write_config_atomically(p, stamp_config_meta(d))
         # Drop the validated-data cache so the next load() re-reads this write.
         # mtime-keying already detects the change; this makes it immediate even
         # if the filesystem mtime resolution is coarse.
@@ -3877,12 +4235,15 @@ class KiroCrewConfig:
         :meth:`_resolve_agent_model` when it is the ``auto`` sentinel).
 
         The result is translated into the namespace of the backend that will
-        actually be asked to run it: ``to_provider_id(…, "claude_code")`` for
-        the claude backend, ``model_registry.to_acp_id`` otherwise (canonical
-        keys become kiro ids). ``auto`` collapses to ``""`` either way.
+        actually be asked to run it, and the namespace is asked for as a
+        CAPABILITY (``SessionCapabilities.model_id_namespace``) rather than
+        inferred from the harness's name: a backend on its own provider namespace
+        goes through ``to_provider_id`` into that namespace, and one on the native
+        ``acp`` namespace goes through ``model_registry.to_acp_id`` (canonical keys
+        become kiro ids). ``auto`` collapses to ``""`` either way.
 
         Keying the translation on the backend is what the warm-pool model-switch
-        path already does (``session_allocation``, via ``is_claude_backend``).
+        path already does (``session_allocation``).
         Hardcoding ``to_acp_id`` here meant a COLD start handed the claude
         adapter a kiro-namespaced id — which its ``set_config_option`` rejects,
         and which nothing withheld, because the pre-wire availability guard is
@@ -3913,6 +4274,13 @@ class KiroCrewConfig:
         # (claude-opus-5[1m]), which the router rejects. Fall back to the
         # configured model. Runs before the empty-model return because ""
         # is one of the sentinels this covers.
+        # Local import, matching the factory below: acp.types pulls in the ACP
+        # stack, and this module must stay importable on its own
+        # (test_acp_backend_kas.py::test_config_loader_imports_alone). The merge
+        # that brought upstream's capability lookup here dropped the fork's
+        # module-level import, which made this a NameError on every claude call.
+        from kiro_crew.acp.types import ACP_BACKEND_CLAUDE
+
         if (
             self.agent.acp_backend == ACP_BACKEND_CLAUDE
             and (self.agent.provider_base_url or "").strip()
@@ -3933,7 +4301,16 @@ class KiroCrewConfig:
             # global.anthropic.claude-opus-4-8[1m] and came back "Invalid value
             # for config option model", making the two most-used models
             # unselectable (verified live).
+            #
+            # Kept as an explicit branch rather than folded into upstream's
+            # capability lookup below: the obvious way to express it there would
+            # be to make model_registry_namespace() answer "acp" for claude, but
+            # that value ALSO keys the advertised-model cache and
+            # seed_available_models, so changing it would silently re-key both.
             return m
+        namespace = capabilities_for(self.agent.acp_backend).model_id_namespace
+        if namespace != MODEL_NAMESPACE_ACP:
+            return model_registry.to_provider_id(m, namespace)
         return model_registry.to_acp_id(m)
 
     def crew_pinned_effort(self, agent: str | None, crew_agent: str | None = None) -> str:
@@ -4176,7 +4553,6 @@ class KiroCrewConfig:
             extra_env: dict[str, str] | None = None,
             reasoning_effort_override: str | None = None,
             crew_agent: str | None = None,
-            acp_backend: str | None = None,
             **_kwargs: object,
         ) -> AcpProvider:
             wdir = Path(cwd) if cwd else _session_work_dir(session_key)
@@ -4255,19 +4631,18 @@ class KiroCrewConfig:
                         m or "auto",
                     )
             # Per-session backend selection — ONE call to the selection gate's
-            # per-session half (members.select_provider_backend: explicit
-            # caller pick > member-DM auto-route > configured default). The
-            # factory body carries no branching of its own, so the kiro
-            # construction path gains no second check (harness-parity H3/H13);
-            # resolve_selected_backend inside the helper applies the same
-            # governance/selectability gate as the persisted field, so a
-            # denied or unknown value degrades to kiro — the member thread
-            # then runs as plain chat and the mount step logs why.
+            # per-session half (members.select_provider_backend: member-DM
+            # auto-route > configured default). The factory body carries no
+            # branching of its own, so the kiro construction path gains no
+            # second check (harness-parity H3/H13); resolve_selected_backend
+            # inside the helper applies the same governance/selectability gate
+            # as the persisted field, so a denied or unknown value degrades to
+            # kiro — the member thread then runs as plain chat and the mount
+            # step logs why.
             # circular import: members sits above config in the layering.
             from kiro_crew.members import select_provider_backend
 
             _backend = select_provider_backend(
-                acp_backend,
                 session_key,
                 self.agent.member_acp_backend,
                 self.agent.acp_backend,
