@@ -27,6 +27,12 @@ state are composed behind that facade:
 - `session_cleanup.py` — cleanup-task state, watchdog hooks, idle/RSS/stuck-turn
   policy, and process/filesystem sweeps
 
+A dashboard slot bound to a remote crew keeps one memory boundary on both sides.
+`remote_relay.create_peer_slot()` always includes the validated `memory_mode` in
+the peer's `POST /api/chat/slots` payload, while agent and model remain sparse
+explicit picks. Omitting the mode would let a local Incognito or Temporary row
+execute as Persistent on the peer and read or write memory the user disabled.
+
 Cross-boundary calls that were observable on `SessionManager` route back through
 the facade, and patchable module dependencies are resolved through injected
 call-time functions. Persistence remains owned by the existing `SessionMap`
@@ -61,7 +67,16 @@ It checks context usage and **recycles** (kill + fresh spawn) the session
 if needed — no compaction, since background tasks are stateless:
 
 - At ≥ 70% context → recycle (same threshold as chat's default compaction)
-- After 20 prompts with no metadata → recycle (blind fallback)
+- A reported 0% that the provider flags as *unknown* (`context_usage_unknown` —
+  the backend compacted in place) → recycle
+- After 40 prompts (`_BG_BLIND_RECYCLE_PROMPTS`) → recycle (blind backstop).
+  This backstop is **not** gated on the reported percentage: background turns are
+  tiny text prompts that never approach 70%, so keying it on "the backend reports
+  no metadata" retired it permanently as soon as any real percentage was read,
+  leaving the provider with no lifetime bound for the whole gateway uptime.
+  `recycle_background()` counts the turn itself (`check_context_usage` is a
+  chat-turn hook and never advances `_bg`), and the log names the backstop rather
+  than the percentage that did not trigger it.
 - Below thresholds → no-op (session stays warm)
 
 Callers: heartbeat callback, taskrunner lesson extraction.
@@ -88,18 +103,40 @@ and returning `AcpSessionHandle | _ProviderBgSession`. Dispatch is via
   upstream it is the dormant fallback for the reserved `ACP_BACKEND_CLAUDE`
   seam only.
 
-A backend switch displaces the cached `_bg_runtime`. The displacement policy
-has ONE implementation, `_displace_bg_runtime_locked()`, reached from
-`_retire_stale_backend_bg_runtime()` and from the mismatch check inside
-`get_bg_session()`'s runtime branch: a runtime whose `acp_backend` no longer
-matches config is killed if idle, and **parked on `_draining_bg_runtimes` if it
-has live or initializing handles** — parked runtimes never receive a new
-session (only `_bg_runtime` is offered to callers), their in-flight work
-finishes untouched (killing mid-turn would abort an in-flight title
-generation), and `_reap_drained_bg_runtimes_locked()` kills each once its last
-handle drains. Either way the slot is freed, so the very next background call
-runs under the configured backend even while the old runtime is still
-draining. Parked runtimes stay shielded from the orphan-PID sweep
+Two conditions displace the cached `_bg_runtime`: a **backend switch** and
+**staleness** (`AcpRuntime._is_stale()` → `"age"` past 6h, or `"rss"` past
+500 MiB across the descendant tree). The displacement policy has ONE
+implementation, `_detach_bg_runtime_locked(runtime, cause)`: the runtime is
+killed if idle, and **parked on `_draining_bg_runtimes` if it has live or
+initializing handles** — parked runtimes never receive a new session (only
+`_bg_runtime` is offered to callers), their in-flight work finishes untouched
+(killing mid-turn would abort an in-flight title generation), and
+`_reap_drained_bg_runtimes_locked()` kills each once its last handle drains.
+Either way the slot is freed in the same lock hold that spawns the replacement,
+so the very next background call runs on a fresh process even while the old one
+is still draining. `cause` is threaded into every log line the displacement
+emits, because a staleness recycle and a backend flap have different remedies
+and must not read alike.
+
+Two paths reach it. The backend-switch adapter
+`_displace_bg_runtime_locked(runtime, cached_backend, configured_backend)` is
+called from `_retire_stale_backend_bg_runtime()` and from the `acp_backend`
+mismatch check inside `get_bg_session()`'s runtime branch (the mismatch outranks
+staleness). The staleness probe sits in that same branch and is run on **every**
+eligible runtime, busy or idle, using the full `_is_stale()` predicate rather
+than the cheap age-only `_stale_by_age()`: waiting for a zero-session window is
+not a bound, since a multiplexed runtime under sustained background load never
+has one, and RSS — not age — was the growth mode observed (multi-GB over ~24h).
+The cost of probing the busy path too is that `_bg_runtime_lock` is now held
+across `_is_stale()`'s offloaded RSS read for busy runtimes as well; that is
+bounded by `_RSS_PROBE_MIN_AGE_SECS` (5 min), below which the probe returns
+without any executor round-trip, and a runtime that answers "stale" is displaced
+rather than re-probed. `_draining_bg_runtimes` has **no cap** — a retiree whose
+handles never drain stays parked and sweep-shielded — so the
+`%d _bg runtimes are parked draining` warning is the signal that displacement is
+outpacing the drain.
+
+Parked runtimes stay shielded from the orphan-PID sweep
 (`_companion_runtime_pids`), block the account-identity sweep's completeness
 (`_retire_kiro_bg_runtime`) while they drain, and are reaped by a periodic
 watchdog hook (`bg_drain_reap`) as the backstop for an idle gateway where no
@@ -157,7 +194,19 @@ send time.
      and suppressed while a Stop is active;
   3. **third empty** (the nudge also produced nothing) → terminal notice card
      asking the user to send a message; the counter resets so the next
-     genuine user turn gets a fresh budget.
+     genuine user turn gets a fresh budget. The card's wording is cause-aware,
+     mirroring rung 2's split: a productive turn is told the turn ended
+     without a closing reply and that completed steps will not re-run (never
+     "returned nothing", which is false for it and — read back by the model
+     via the transcript — invites a redo of landed side effects). For
+     non-productive turns the recovery clause appears only when the counter
+     shows budget was spent, and claims only that automatic recovery was
+     attempted — the counter counts budget, not which rungs ran (with the
+     auto-continue gate off, give-up arrives at one with no auto-continue).
+     Give-up with the counter at zero is reachable non-productive only on
+     nested depth>0 turns, where the card reports only the empty turn (the
+     gate-off zero-counter path is productive by construction and takes the
+     productive wording).
 
   **A PRODUCTIVE turn never reaches rung 1.** "Empty" at this branch means only
   that the FINAL assistant segment is empty, which is not the same as "the turn
@@ -181,6 +230,13 @@ send time.
   this case — its narrow meaning (only the mid-turn resets that are not tool
   boundaries: steer cut, compaction, clear, agent switch) is load-bearing for the
   promise-only guard.
+
+  A successfully delivered non-blocking `ask_question` directive is different
+  from a generic productive tool-only turn: its card is the intended terminal
+  output, and the tool explicitly tells the model to end until the user's answer
+  arrives as a new message. The runner therefore records the successful card
+  outcome and skips the entire empty-response ladder. Delivery failures keep the
+  normal behavior so the model can fall back to a plain-text question.
 
   **Turn-end diagnostics.** The branch emits ONE privacy-safe WARNING per empty
   verdict, after the rung is chosen, naming a closed `cause` and `rung` plus
@@ -281,8 +337,8 @@ send time.
   declined reset maps back to `"ok"`; the still-critical session re-attempts
   the whole compact-and-escalate cycle at its next threshold crossing after
   the cooldown, with the mid-stream overflow guard covering the interim).
-  Blind
-  fallback after 40 prompts if metadata never reports %.
+  There is no prompt-count fallback on this path — the 40-prompt blind backstop
+  belongs to `recycle_background()` alone (see "Context Overflow Protection").
 - **Circuit breaker**: force-resets session after 5 consecutive failures.
 - **Dead provider detection**: `get_or_create()` checks `provider.is_alive()`
   on the fast path. If the backing process died (crash, SIGKILL, orphan
@@ -397,8 +453,7 @@ send time.
 | Method | Purpose |
 |--------|---------|
 | `start_pool(blocking=True)` | Pre-spawn warm + background sessions. `blocking=False` for non-blocking mode. |
-| `get_or_create(key, agent=None, approval_policy="", speculative=False, speculative_resume=False)` | Returns `(LLMProvider, is_new, resumed)`. Uses warm pool for new sessions (default agent only). Sessions with a resume mapping skip warm pool (cold start needed for `session/load`). A `reasoning_effort_override` also skips the warm pool (`bypass_effort`): a pre-warmed provider was built without the override and post-claim fixups never touch effort, so the override must reach a fresh provider-factory call to be delivered — which also keeps the factory's effort gate the single authority reporting a dropped level. Every decision is counted via `_record_pool_decision` (`kirocrew.session.pool.decision`) with the single disqualifying reason, so the pool's hit rate and the frequency of the `bypass_resume` case are observable. Non-default agents skip warm pool and resolve their model by precedence via `_model_fallback()` — caller model > per-agent pin > global default: `model=None` (defer to kiro's agent-JSON resolution) only when the agent pins its own model, otherwise the global default, unless that default is the `"auto"` sentinel (also `None`). The per-agent pin is resolved off the event loop via `run_in_executor` using `_resolve_named_agent_model`; blank agents inherit the global, and `kirocrew` is excluded (tracks the global). `approval_policy` is persisted on the new `_Session` — callers (e.g. subagent) pass parent policy so the session inherits it. `speculative=True` (eager spawn) pre-creates ahead of a real first turn: the one-shot `_Session.first_turn` observation — a single three-member `FirstTurnState` enum (`NOTHING_ARMED` / `FRESH` / `RESUMED`), so a resume marker on an already-claimed session is unrepresentable rather than forbidden by convention — is registered ARMED (`FRESH`) and never consumed by speculative callers, and a resumable key raises `SpeculativeResumeRefused` — unless `speculative_resume=True` (resume prefetch) opts in, in which case the speculative creator performs the `session/load` and registers the observation as `RESUMED` when the load restored the transcript. The observation is consumed in one read-then-clear by the first real claimant under the per-session semaphore (fast path and won-race path alike), with the returned booleans derived from it at the return boundary — so that turn observes `(is_new=True, resumed=True)` exactly as if it had resumed itself, preserving its history-injection decision. |
-| `get_or_create(..., wait_if_busy=False)` | Optional non-waiting reuse for structured monitor delivery. It raises `SessionBusyError` at the semaphore claim boundary instead of waiting; same-key cold-start races apply the same rule. Channel callers pass the exact generation authorized by the gateway and refuse if it changes before this claim, rather than recomputing a newer conversation key. The default remains `True` for every ordinary caller. |
+| `get_or_create(key, agent=None, approval_policy="", speculative=False, speculative_resume=False)` | Returns `(LLMProvider, is_new, resumed)`. Uses warm pool for new sessions (default agent only). Sessions with a resume mapping skip warm pool (cold start needed for `session/load`). A `reasoning_effort_override` is applied post-claim via `provider.change_effort` (updating `_effort_per_model` and the `cli.json` overlay write) rather than bypassing the warm pool, recovering pool-hit startup latency. Every decision is counted via `_record_pool_decision` (`kirocrew.session.pool.decision`) with the single disqualifying reason, so the pool's hit rate and the frequency of the `bypass_resume` case are observable. Non-default agents skip warm pool and resolve their model by precedence via `_model_fallback()` — caller model > per-agent pin > global default: `model=None` (defer to kiro's agent-JSON resolution) only when the agent pins its own model, otherwise the global default, unless that default is the `"auto"` sentinel (also `None`). The per-agent pin is resolved off the event loop via `run_in_executor` using `_resolve_named_agent_model`; blank agents inherit the global, and `kirocrew` is excluded (tracks the global). `approval_policy` is persisted on the new `_Session` — callers (e.g. subagent) pass parent policy so the session inherits it. `speculative=True` (eager spawn) pre-creates ahead of a real first turn: the one-shot `_Session.first_turn` observation — a single three-member `FirstTurnState` enum (`NOTHING_ARMED` / `FRESH` / `RESUMED`), so a resume marker on an already-claimed session is unrepresentable rather than forbidden by convention — is registered ARMED (`FRESH`) and never consumed by speculative callers, and a resumable key raises `SpeculativeResumeRefused` — unless `speculative_resume=True` (resume prefetch) opts in, in which case the speculative creator performs the `session/load` and registers the observation as `RESUMED` when the load restored the transcript. The observation is consumed in one read-then-clear by the first real claimant under the per-session semaphore (fast path and won-race path alike), with the returned booleans derived from it at the return boundary — so that turn observes `(is_new=True, resumed=True)` exactly as if it had resumed itself, preserving its history-injection decision. |
 | `check_context_usage(key, provider)` | Returns %. Triggers compaction at configured threshold (default 70%), warns one `CONTEXT_WARN_MARGIN_PCT` below it. |
 | `compact_if_needed(key)` | Awaitable twin of the `check_context_usage` trigger for callers that must not start their next turn while a compaction is pending (the task runner's between-steps check, #4686). Same gates in the same order — both entry points consume the shared `_compaction_gate_decision` ladder, the single owner of the gate order (its docstring documents each rung) — then AWAITS `_compact_session`. Returns the outcome: `"absent"`, `"reset"` (the settled verdict on the prior attempt was ineffective-and-still-critical and the promoted escalation reset the session here, awaited), `"cc_managed"` (checked before the threshold, mirroring `check_context_usage`), `"below_threshold"`, `"compact_unsupported"` (the provider names a backend outside `ACP_BACKENDS_COMPACT`, so no `/compact` is dispatched and no semaphore is taken — checked AFTER the threshold so a declined backend keeps its per-turn usage log, #7812), `"unconfirmed"`, `"in_progress"`, `"cooldown"`, `"ok"`, `"busy"`, `"recycled"`, `"failed"`. A `"busy"` decline means a turn holds the semaphore — the caller leaves the session alone and retries later, never falls back to a direct `provider.compact()`. |
 | `record_success(key)` / `record_failure(key)` | Circuit breaker tracking. |
@@ -412,7 +467,6 @@ send time.
 | `close_all(drain_timeout=None)` | Pre-shutdown **drain** of in-flight turns (via `drain_active_turns`), then save all active session mappings, shut down every session, and drain the warm pool. `drain_timeout` bounds that drain (`None` = full default budget); a caller wrapping `close_all()` in its own hard deadline (Slack's restart wraps it in `wait_for(..., 5s)`) passes a smaller budget (e.g. `2.0`) so the kill path still fits inside the deadline. A cancel that fires mid-drain (outer deadline) **propagates** (CancelledError is deliberately not caught) so the caller's hard deadline stays honest; recovery of a still-held native-session lock is the next-startup orphan reaper's job. |
 | `drain_active_turns(timeout=None)` | Best-effort co-operative drain that brings in-flight prompts to a safe turn boundary **before** teardown, so kiro-cli closes its native turn and releases its session lock (`~/.kiro/sessions/cli/<uuid>.json`) on the subsequent SIGTERM — otherwise the next gateway's `session/load` hits "active in another process" and the slot returns empty completions (the Make-Live empty-response incident, #200). For each registered session with an **unfinished** turn (native turn-done not yet acked — independent of cancel state, so an already-cancelled-but-not-acked turn is still drained), it issues a graceful `session/cancel` and waits (bounded) for the ack; a turn already cancelled (`cancel()` → `"no_turn"`) is waited on directly via `wait_turn_done`. The whole operation is bounded by `timeout` (`None` → `_DRAIN_ACTIVE_TURNS_TIMEOUT_SECS`, default 5.0s; internal cap is `timeout+1.0`); on timeout it logs and returns so the caller falls through to the SIGTERM-first kill path — never hangs teardown, never raises. `timeout <= 0` disables the drain. Returns the count of unfinished turns (observability/tests). Only registered user sessions are drained; the warm pool holds never-prompted processes. |
 | `begin_turn(key)` | **Synchronous** pre-dispatch gate against the lease-dispatch race (#200 / Codex HIGH). A caller holds the per-session semaphore *lease* from `get_or_create` through the whole turn, but the native turn only opens on the first `provider.stream(...)` iteration; the `get_or_create` `_closing` gate cannot revoke a lease already issued before `close_all` set `_closing`. Callers (dashboard `chat_runner`, Slack handler, and structured Slack/Discord monitor adapters through `TurnDriver.closing_gate`) MUST call `begin_turn` synchronously — **no `await` between it and the `async for` stream drive** — so the `_closing` read and the stream's turn registration (`AcpClient.stream_events` clears `_turn_done` before its first `await`) form one yield-free span, strictly ordered w.r.t. `close_all`'s `_closing` set: the turn is either registered before the drain snapshot (and drained) or the caller aborts. Raises `SessionClosingError` (a `RuntimeError`) when closing; the caller's `finally` releases the lease. Deliberately NOT `async`/lock-guarded (an `await` would reopen the race). |
-| `warm_pool_size` | Property: number of warm sessions available. |
 
 ## Stop Orchestration
 
@@ -453,6 +507,135 @@ cold-starts from the original persisted history instead of resuming it.
 App-authenticated requests may rewind only a slot's own dashboard session:
 a channel-linked slot is refused, because its effective session is a
 conversation the app does not own.
+
+**`edit-resend` is the same boundary, not a lighter one.** It truncates and
+persists history exactly as rewind does, so it runs the same three-step sequence
+— discard the native conversation, flush the cleared resume sid, then rewrite the
+retained history — and refuses with `edit_resend_prepare_failed` /
+`edit_resend_session_busy` / `edit_resend_save_failed` /
+`edit_resend_slot_rebound` rather than reporting success on a boundary that did
+not land. Its own error vocabulary is deliberate: a client must be able to tell
+which endpoint refused without string-matching a sentence.
+
+**A busy SESSION is not the same question as a busy slot.** `slot.running` tracks
+only that slot's own task, while `discard_conversation` is a full teardown that
+also releases the shared sub-agent runtime. So `edit-resend` applies the same two
+guards the sibling `reset-conversation` teardown applies before the same call, in
+the same order and with the same codes: `slot_orchestrating` (409) when
+`slot._in_stage_execution` — an autopilot plan reads `running` False *between*
+stages while still mid-plan — and `slot_subagents_running` (409) via the shared
+`chat_utils.subagents_attached` predicate, because the parent turn ends before
+its children do. The predicate fails closed on an unreadable probe: unknown
+children are not zero children. `skip_if_busy=True` on the discard remains the
+atomic backstop for a turn admitted after these guards answered False.
+
+Eight properties are load-bearing on this boundary, and each fails toward the
+permissive answer if dropped. `edit-resend` carries all eight; the bullets name
+the four where `rewind` does not yet, so nobody reads them as already shared:
+
+- **The edited window is prepared on a copy, and the copy is SEVERED.**
+  `copy.copy` is shallow, so reassigning `messages` alone leaves `_queue`,
+  `_pending`, `_question_pending`, `_on_question_retired`, and `event` aliased to
+  the live slot — and `_ChatSlot.append` writes through four of them. An
+  un-severed copy therefore publishes the edited row to the live stream reader
+  and announces the live question cards as retired *before* any refusal path can
+  run, leaving a phantom row and a card-less "needs input" behind for an edit the
+  server rejected. The commit is the one place the prepared `_pending`,
+  `_question_pending`, `event` state and the retirement announcement become live.
+- **The slot is reserved before the awaits.** `slot.running` derives from
+  `slot.task` and the send path is not serialized on `slot._lock`, so a send
+  arriving while a durable boundary is pending would otherwise see an idle slot
+  and dispatch a competing turn that the commit then erases. The reservation
+  publishes a dispatch task that runs the turn only on commit; on abort it hands
+  a send it diverted to the queue to the canonical successor dispatch, so nothing
+  is stranded. An entry queued *before* the reservation keeps its own trigger.
+- **The commit re-checks its target on every path**, success included, through
+  ONE predicate so no path can check a different subset. Three axes move
+  independently across the awaits: the **transcript key** (a cron or workflow
+  injection re-links the slot; the snapshot froze the old routing, so the save's
+  own `expected_history_key` guard cannot see the live slot move and only this
+  loop-side check can), the **slot object** (a close-and-recreate under the same
+  name is a different conversation that leaves the transcript key unchanged, so
+  only object identity catches it), and the **dispatch reservation** (if
+  something else has taken `slot.task`, committing would run this handler's turn
+  alongside whatever now owns the slot — two concurrent turns writing one
+  window). Any of the three refuses with a retryable 503.
+- **The periodic dirty-slot flush is excluded for the whole rewrite.** Because
+  the live slot keeps the full window until the commit, a flush tick can snapshot
+  that stale window, block behind the rewrite on the per-session history lock,
+  and then write the snapshot back on top — restoring every message the rewrite
+  just discarded. `edit-resend` therefore saves through
+  `chat_persistence.save_slot_off_loop` (with `expected_history_key`, and
+  `best_effort=False` so a failure reaches its 503 rather than being swallowed
+  and re-armed as a dirty retry) instead of a bare `asyncio.to_thread`. That
+  helper raises `slot._metadata_persist_inflight` around the write and lowers it
+  in a `finally` — the flag `flush_slot_now` already honours to keep the unpinned
+  periodic writer off a slot with a guarded write pending. Shielding the
+  *wrapper* rather than the inner future is what keeps the exclusion held: a
+  cancellation reaching the shield leaves the coroutine running, so its `finally`
+  cannot release the flag early.
+- **The cancellation drain survives REPEATED cancellation.** The worker thread
+  cannot be interrupted, so once the rewrite starts it lands whether the handler
+  lives or not; the handler therefore has to learn the outcome and commit to
+  match. `CancelledError` is a `BaseException`, so a second cancellation — a
+  gateway shutdown reaching a handler already unwinding from a client disconnect
+  — is not absorbed by an `except Exception` and a bare `await` on the save task
+  abandons a landed rewrite. `edit-resend` re-shields the drain a bounded number
+  of times (`_SAVE_DRAIN_ATTEMPTS`) and reads the outcome off the **settled**
+  task rather than awaiting it, so a cancel landing between the two cannot lose
+  it. Giving up leaves the live slot untouched, which is the safe half of the
+  desync. **`rewind` still drains with a bare `await`**, so it remains exposed.
+- **A row that arrives during the boundary is carried, not replaced away.**
+  `workflow_inject` and `cron_inject` append through `append_and_surface` /
+  `slot.append` on the event loop and take no `slot._lock`, so a completion
+  landing mid-boundary reaches the live window while the boundary holds the lock.
+  A wholesale `slot.messages = prospective_slot.messages` drops it, and the
+  rewrite save cannot restore it because a rewrite deliberately skips the
+  cross-process-append scan (`collect_foreign = not rewrite`) — leaving the row
+  in neither the window nor the file. `edit-resend` therefore carries arrived
+  rows (identified by row object, since the window front can be trimmed and a
+  restore-path row has no `meta.mid`) onto the committed window and pending
+  queue. Appending them after the prospective window is the correct order, not
+  merely a convenient one: `monotonic_transcript_ts` only ever moves a row
+  forward, so an arrived row can never be stamped *earlier* than the edited one —
+  but it can be stamped **identically**, because on a coarse clock (Windows ticks
+  in ~15.6 ms steps) both appends read the same instant, and list order is what
+  separates that tie. Its question map is **retired in place** rather than adopted or
+  intersected: the commit deletes exactly the ids the edit retired, so a card answered
+  during the boundary stays retired (the answer pops it from the live dict) and a card
+  raised during the boundary survives (an intersection against the frozen copy would
+  erase it). A carried row reaches disk
+  the ordinary way — the commit sets `_dirty`, so the next periodic flush writes
+  the merged window — and deliberately **not** through a second guarded save
+  after the commit: no await may sit between the commit and the dispatch release
+  (see the next bullet), so that write is not available without paying a worse
+  failure. **`rewind` now applies the same delta commit**: it carries arrived rows in
+  both the window and the pending queue, drops a row the client already drained rather
+  than requeueing it, and retires question ids in place. The identity sets keep the
+  pre-await rows RETAINED, because an `id()` is only an identity while something holds
+  a reference and a cap trim would otherwise let a freed row's address be reused by an
+  arrival. The other rewrite-save callers (`regenerate`, `fork`) are **deliberately
+  still open** to the injected-row loss; closing them belongs with the shared boundary
+  contract rather than one endpoint, and the fixed subset is exactly `rewind` and
+  `edit-resend`.
+- **The commit and the dispatch release are separated by no await.** Once the
+  live slot has adopted the truncated window, the reserved dispatch is armed and
+  only `dispatch_ready.set()` in the handler's `finally` is left to run. An await
+  in that gap lets a cron or workflow completion rebind the slot, and the
+  released dispatch then runs the edited prompt against ANOTHER conversation —
+  and the commit-target fence cannot rescue it, because refusing after the live
+  slot has adopted the truncated window would leave a truncation with no turn.
+  So post-commit work is left to the next periodic flush rather than awaited
+  here. **`rewind` still awaits its orphan-session cleanup in that gap**, so it
+  remains exposed.
+- **App ownership is authorized through the shared gate**
+  (`_check_slot_app_ownership`, plus `_reauthorize_after_await` across the
+  body-read await), because discarding a native conversation is a destructive
+  capability. It authorizes the `_app` binding, the effective SESSION key, and
+  the TRANSCRIPT key, so a channel-linked slot and an unbound channel-origin slot
+  are both covered by one check rather than a per-endpoint link test. Denials are
+  404, not 403 — indistinguishable from a missing slot (anti-enumeration); the
+  real reason is in the SEL audit log.
 
 ### Eager Respawn
 
@@ -634,8 +817,19 @@ state a close compensates is not all scoped the same way.
   original's slot object.** A hand-over exit stops referencing the popped
   slot, and `_flush_dirty_slots` iterates exactly `state._slots`, so an
   unreferenced slot has NO retry path: anything past its last commit —
-  `messages[_disk_window_len:]`, plus a note the bulk path is still holding in the
-  in-memory-only `_deferred_notes` — would simply cease to exist. The pre-save
+  `messages[_disk_window_len:]`, plus a note the bulk path is still holding in
+  `_deferred_notes` — would simply cease to exist from this gateway's own
+  delivery paths. (Since #4093 a held note also has a durable copy in the
+  slot's metadata line, so a dropped hold is re-delivered after the NEXT
+  restart rather than lost outright — but deferring an acknowledged note to a
+  hypothetical future restart is not delivery, so the hand-over drain below
+  is still what honors it in this lifetime. One version-skew caveat: the
+  retirement invariant holds only for gateways that stamp `meta.noteId` on
+  delivered rows. An older gateway carries `deferred_notes` as unowned
+  metadata, its flush stamps no id and its save retires nothing, so a
+  downgrade-deliver-reupgrade cycle replays already-delivered notes as
+  duplicates — bounded harm, and the chosen at-least-once direction, but the
+  invariant silently does not hold across versions.) The pre-save
   exits need no store failure to reach it either; they return before the save is
   attempted, in a window that opens while a turn is in flight. So every hand-over
   exit routes through `_persist_handover_tail(state, name, slot)`, which flushes
@@ -969,11 +1163,20 @@ gen, dm_scope)`:
 - **Generation reset** rotates on `/new`, an idle window
   (`MessagingConfig.idle_reset_minutes`), or a daily boundary
   (`daily_reset_hour`), decided by `should_rotate_generation()`.
+- **Explicit `/new` is durable on every DM channel.** Discord, Telegram, Teams,
+  Webex, Feishu, iMessage, WhatsApp, Weixin and WeCom persist the new generation as
+  a monotonic floor on the stable `SessionMap` bucket and await its flush before
+  replying. A failed floor write leaves the in-memory bump intact but adds a
+  restart-safety warning. A zero-turn generation creates no conversation-log row:
+  it holds no work to recover, and repeated `/new` calls therefore update one floor
+  integer instead of crowding the newest-first picker with empty placeholders. The
+  first normal turn creates the real history row. Automatic idle/daily rotation still
+  materializes only when its first real turn runs.
 - **Restart-safe generation seeding.** The generation counter is in-memory (per
   `ConversationState`), so it resets on gateway restart. To stop `/new` from
   bumping a reset counter (0→1) straight onto a still-persisted generation and
   resurrecting that old conversation, the counter is seeded on first access to a
-  bucket from the highest persisted generation via
+  bucket from the highest mapped generation or explicit-new floor via
   `SessionMap.max_generation(bucket)` (shared helper
   `messaging.link.seed_generation`, used by every DM dispatcher). A normal
   post-restart message then resumes the latest generation (continuity); `/new`
@@ -1013,7 +1216,7 @@ dashboard. Two models relate the surfaces:
   dashboard surfaces it as a separate slot with its own sid. One logical
   conversation therefore has two backing sids, bridged by the mirror.
 
-`messaging.link.dashboard_mirror_key(channel_session_key)` computes the
+`messaging.link.legacy_dashboard_mirror_key(channel_session_key)` computes the
 dashboard-side key: `"dashboard:" + history._safe_key(channel_session_key)`. It
 MUST use the same `_safe_key` sanitizer as the slot-naming path (every non-word
 char → `_`, not only `:`); a narrower sanitizer silently mismatches for keys
@@ -1089,7 +1292,7 @@ only when a `mirror` `ChannelLink` exists on the dashboard-side key:
   keeps those rows keyboard-focusable, shows the reason inline, and announces
   the same reason instead of presenting an unexplained disabled action.
 - In-channel `/link` / `/unlink` — `/link` writes the link on the current
-  conversation's `dashboard_mirror_key`; it does not control display, history,
+  conversation's `legacy_dashboard_mirror_key`; it does not control display, history,
   or the inbound direction — only the outbound echo. `/unlink` frees the
   LOCATION via the shared `messaging.link.release_conversation_location`
   helper (one implementation for every DM dispatcher): after the key-addressed

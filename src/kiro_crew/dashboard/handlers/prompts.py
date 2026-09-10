@@ -27,6 +27,7 @@ from kiro_crew.hooks import (
     validate_file_path,
     verified_replace_file_nolink,
 )
+from kiro_crew.loop_lock import LoopBoundLock
 from kiro_crew.platform_compat import is_link_or_junction
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.skill_trust import ReviewedProjectChanged as _ReviewedProjectChanged
@@ -657,7 +658,7 @@ async def api_prompts(request: web.Request) -> web.Response:
     # "local" entries come from the requester's own checkout rather than the
     # process-wide KIROCREW_PROJECT_DIR — which on a source install names the
     # Kiro Crew tree itself and on a wheel install names nothing, so a prompt
-    # the user authored in their project was never listed here (#7345).
+    # the user authored in their project would never be listed here.
     state: DashboardState = request.app["state"]
     session_key = _read_session_key(request)
     project_dir = _prompt_local_project(request, state, session_key)
@@ -1029,13 +1030,13 @@ def _local_prompt_scan_root(project_dir: Path | None) -> tuple[Path, Path] | Non
 
     ``_resolve_prompt_dir`` answers WHETHER a root may be served; this answers
     which INODE that permission was granted for, and the two are different
-    questions. Every containment decision downstream used to re-resolve the
-    caller-addressed root — ``_prompt_dir_entry``'s parent comparison and the
-    ``within_root`` its description read is pinned inside — so a root swapped for
-    a link after validation resolved into the link's destination on BOTH sides of
-    every later comparison, and every file under the directory the swap named
-    looked confined. Resolving once here and comparing against that fixed value
-    refuses them instead:
+    questions. Re-resolving the caller-addressed root at every containment decision
+    downstream — ``_prompt_dir_entry``'s parent comparison and the ``within_root``
+    its description read is pinned inside — would let a root swapped for a link
+    after validation resolve into the link's destination on BOTH sides of every
+    later comparison, so every file under the directory the swap named would look
+    confined. Resolving once here and comparing against that fixed value refuses
+    them instead:
 
     * a swap landing BEFORE this resolve makes the pinned value escape the
       project, which the containment gate below catches;
@@ -1659,8 +1660,8 @@ async def _api_user_prompt_detail(request: web.Request, name: str, scope: str) -
         # name: it opens with O_NOFOLLOW and validates the inode it actually
         # read (st_nlink > 1, non-regular, or a real path outside the root is
         # refused), so a sensitive file hardlinked into the prompt dir cannot
-        # be served through this endpoint. It also enforces the size cap, so
-        # the separate stat() that used to do that is gone.
+        # be served through this endpoint. It also enforces the size cap, so no
+        # separate stat() is needed for it.
         # The stat above is a separate syscall from the gate's own open, so a
         # prompt that grows past the cap in between would make the gate raise.
         # FileTooLargeError is not an OSError, so catching it here is what keeps
@@ -1796,7 +1797,7 @@ async def _api_prompt_write(request: web.Request) -> web.Response:
 
     # Resolve the local project on the loop and close over it in _apply_locked so
     # a "local" update/delete addresses the requester's own checkout, through the
-    # same _prompt_local_project seam the scoped read used to seed the editor —
+    # same _prompt_local_project seam the scoped read uses to seed the editor —
     # the write lands in the file the read served, not in another project's copy
     # of the same stem.
     state: DashboardState = request.app["state"]
@@ -2014,13 +2015,148 @@ async def _api_prompt_write(request: web.Request) -> web.Response:
 # ``~/.kiro/skills`` and ``kiro-workspace/`` against ``<project>/.kiro/skills`` —
 # while the WRITE handlers (skills.create/update/delete_skill) join the key onto
 # a core root. That means the same key names a DIFFERENT file on write than the
-# reader was shown (issue #8244). These prefixes are documented read-only in
+# reader was shown. These prefixes are documented read-only in
 # api_skills, so the write path refuses them rather than silently writing the
 # core-root copy. The literals must match the prefixes _resolve_skill_root and
 # _skill_key_roots use so read and write agree on territory. The ``package/``
-# prefix is intentionally NOT listed here — that territory is handled separately
-# by PR #7105; this guard is its untracked kiro-user/ and kiro-workspace/ sibling.
+# prefix is intentionally NOT listed here — that territory is handled separately;
+# this guard covers the untracked kiro-user/ and kiro-workspace/ siblings.
 READONLY_SKILL_KEY_PREFIXES = ("kiro-user/", "kiro-workspace/")
+
+
+# Concurrent readers of the catalog share ONE scan. Nothing is stored and nothing
+# expires: the handoff below lives only while a reader is still queued for it.
+# Keyed on (loader, project), so two loaders cannot collide on one entry.
+_catalog_lock = threading.Lock()
+_catalog_waiters: dict[tuple[Any, str], int] = {}
+_catalog_handoff: dict[tuple[Any, str], list[dict[str, Any]]] = {}
+
+# One assembly lock PER KEY, so different projects still scan in parallel. Created
+# and dropped under _catalog_lock alongside the waiter count that bounds its life.
+_catalog_assembly_locks: dict[tuple[Any, str], LoopBoundLock] = {}
+
+
+async def _assemble_skills_catalog(skills: Any, project_dir: Path | None) -> list[dict[str, Any]]:
+    """Return the catalog for *project_dir*, sharing one scan across concurrent readers.
+
+    Shape: a fast path off the assembly lock, then the lock, then a re-check UNDER
+    it. The re-check is what coalesces -- readers queued behind the leader take the
+    rows it just finished instead of each scanning (0% -> 87.5% at 8-way, measured).
+
+    NOTHING is retained past the burst, so a read that is not concurrent with
+    another always scans current on-disk state. No generation or epoch check is
+    needed, but NOT because scans cannot overlap: cancelling a leader mid-scan
+    leaves its executor thread running (a started thread-pool task is not
+    cancellable) while a replacement leader starts its own, so two scans for one key
+    CAN overlap. What holds instead is that the handoff is published only after an
+    await returns, so a cancelled leader publishes nothing and its rows are
+    discarded; the offer is dropped when its last reader leaves.
+
+    The staleness this admits, stated exactly: any reader that shares a scan may be
+    served rows read before its own arrival -- a mid-assembly joiner, and equally a
+    reader arriving while the finished rows are still draining to their waiters. The
+    bound is one assembly for that key, since a reader never queues behind another
+    key's scan. There is NO read-after-write guarantee under a burst.
+
+    ONE assembly lock PER KEY, so readers of different projects still scan in
+    parallel exactly as the base did: this coalesces same-key readers without making
+    any reader wait on an unrelated catalog. That matters because assembly is not
+    reliably sub-second -- it can run seconds long on large skills x agents
+    catalogs -- so a shared lock would have handed a multi-project burst worse tail
+    latency than the base. A test pins the parallelism.
+
+    No work preservation when the leader disconnects: the assembly is awaited
+    inline, so cancelling the leader makes the next waiter start over. That buys the
+    removal of an in-flight task map and its cancellation bookkeeping.
+
+    The rows are returned as-is, not copied, so a caller that mutates an entry in
+    place must copy first.
+    """
+    key = (skills, str(project_dir) if project_dir is not None else "")
+    with _catalog_lock:
+        _catalog_waiters[key] = _catalog_waiters.get(key, 0) + 1
+        assembly_lock = _catalog_assembly_locks.get(key)
+        if assembly_lock is None:
+            assembly_lock = _catalog_assembly_locks[key] = LoopBoundLock()
+    try:
+        with _catalog_lock:
+            rows = _catalog_handoff.get(key)
+        if rows is not None:
+            return rows
+        async with assembly_lock:
+            # Re-check under the lock: the leader we queued behind may have just
+            # finished this catalog. This is the join.
+            with _catalog_lock:
+                rows = _catalog_handoff.get(key)
+            if rows is not None:
+                return rows
+            result = await _assemble_skills_catalog_uncached(skills, project_dir)
+            with _catalog_lock:
+                # Only offer the rows if someone else is queued; with no waiter
+                # there is nobody to hand them to.
+                if _catalog_waiters.get(key, 0) > 1:
+                    _catalog_handoff[key] = result
+            return result
+    finally:
+        with _catalog_lock:
+            remaining = _catalog_waiters.get(key, 1) - 1
+            if remaining > 0:
+                _catalog_waiters[key] = remaining
+            else:
+                _catalog_waiters.pop(key, None)
+                # Last reader out, so neither the offer nor this key's lock can
+                # outlive the burst that created them.
+                _catalog_handoff.pop(key, None)
+                _catalog_assembly_locks.pop(key, None)
+
+
+async def _assemble_skills_catalog_uncached(
+    skills: Any,
+    project_dir: Path | None,
+) -> list[dict[str, Any]]:
+    """Do the actual catalog assembly, with no sharing or reuse of any kind.
+
+    Called by :func:`_assemble_skills_catalog`, which awaits it inline while
+    holding the coalescing lock -- so a caller that disconnects mid-assembly
+    cancels it and the next waiter reassembles.
+
+    Runs the edition capability lookup async (on the loop, non-blocking), then
+    offloads ALL blocking filesystem work — kirocrew ``list_skills()`` (os.walk +
+    per-file frontmatter reads), package path globs, kiro per-skill resolve/read,
+    and the agent annotation — onto the dedicated DISCOVERY pool in one job. This
+    work would stall the event loop past the loop-stall watchdog (~25s) on large
+    skills×agents catalogs if run on-loop. Use the discovery pool (NOT
+    ``maintenance_executor``): this scan is browser-triggerable and can be
+    seconds-long, so the maintenance pool would let a few dashboard tabs occupy
+    the workers the orphan-reaper sweeps need to recover from a wedge (see
+    :mod:`kiro_crew.executors`).
+
+    PRESERVES THE BASE'S RECORDED DEFAULT. The base states, as a decision rather
+    than an omission: "No result cache: the endpoint always reflects current
+    on-disk state, so freshly created/installed skills appear immediately
+    (correctness over the latency a cache would add)." That still holds. Coalescing
+    stores no result and has no expiry: concurrent readers share ONE scan, and a
+    read that is not part of a concurrent burst always scans current on-disk state.
+
+    Sharing is what admits staleness rather than this function, and
+    :func:`_assemble_skills_catalog` is authoritative for that contract. The
+    consequence to respect here: do not build a mutation handler that returns this
+    catalog expecting the just-written skill.
+    """
+    mgr = _capability_manager()
+    try:
+        package_skills = await mgr.list_skills() if mgr.available() else []
+    except Exception:
+        # The capability manager is one of three skill sources; degrade to "no
+        # package skills" rather than 500 the whole /api/skills endpoint.
+        package_skills = []
+    return await asyncio.get_running_loop().run_in_executor(
+        discovery_executor(),
+        collect_skills_blocking,
+        skills,
+        package_skills,
+        project_dir,
+    )
 
 
 async def api_skills(request: web.Request) -> web.Response:
@@ -2063,37 +2199,12 @@ async def api_skills(request: web.Request) -> web.Response:
     skills = _get_skills(state)
     # Resolve the active project dir (cheap in-memory scan of slots) on the loop.
     # Scoped to the requesting chat slot: without the key, two chats on
-    # different projects made this fall to None and kiro-workspace skills
-    # silently vanished from the listing (#2457).
+    # different projects fall to None and kiro-workspace skills silently
+    # vanish from the listing.
     # Strict: must match what SkillsLoader will resolve for THIS chat, or the
     # catalog advertises a skill whose $token expands to nothing.
     project_dir: Path | None = requesting_slot_project(state, session_key)
-    # Run the edition capability lookup async (on the loop, non-blocking), then offload ALL
-    # blocking filesystem work — kirocrew list_skills() (os.walk + per-file
-    # frontmatter reads), package path globs, kiro per-skill resolve/read, and the
-    # agent annotation — onto the dedicated DISCOVERY pool in one job. This work
-    # would stall the event loop past the loop-stall watchdog (~25s) on large
-    # skills×agents catalogs if run on-loop. Use the discovery pool
-    # (NOT maintenance_executor): this scan is browser-triggerable and can be
-    # seconds-long, so the maintenance pool would let a few dashboard tabs
-    # occupy the workers the orphan-reaper sweeps need to recover from a wedge
-    # (see kiro_crew.executors). No result cache: the endpoint always reflects
-    # current on-disk state, so freshly created/installed skills appear
-    # immediately (correctness over the latency a cache would add).
-    mgr = _capability_manager()
-    try:
-        package_skills = await mgr.list_skills() if mgr.available() else []
-    except Exception:
-        # The capability manager is one of three skill sources; degrade to "no
-        # package skills" rather than 500 the whole /api/skills endpoint.
-        package_skills = []
-    result = await asyncio.get_running_loop().run_in_executor(
-        discovery_executor(),
-        collect_skills_blocking,
-        skills,
-        package_skills,
-        project_dir,
-    )
+    result = await _assemble_skills_catalog(skills, project_dir)
     agent = request.query.get("agent") or None
     if agent:
         globs = await asyncio.get_running_loop().run_in_executor(
@@ -2881,10 +2992,10 @@ async def api_skill_detail(request: web.Request) -> web.Response:
     # Refuse mutating verbs on the open-standard read-only territories. Their
     # READ path resolves per-session / per-machine (project or ~/.kiro/skills),
     # but update_skill/delete_skill would join the key onto a core root — so the
-    # write lands in a different file than the reader was shown (issue #8244).
+    # write lands in a different file than the reader was shown.
     # Guarding here, before the PUT/DELETE branches and any session-key work,
     # ensures the mutating verb never reaches skills.*; GET is untouched and keeps
-    # resolving via _resolve_skill_root. Same shape #7105 applies to package/.
+    # resolving via _resolve_skill_root. The package/ territory has the same shape.
     if request.method in ("PUT", "DELETE") and name.startswith(READONLY_SKILL_KEY_PREFIXES):
         return web.json_response(
             {
@@ -3037,7 +3148,7 @@ async def api_skills_create(request: web.Request) -> web.Response:
     # 'Kiro-Workspace/Foo' sanitises to 'kiro-workspace/foo'). create_skill joins
     # the key onto a core root, but the reader is served kiro-user/ and
     # kiro-workspace/ skills from a session/machine-scoped location — so a create
-    # here would write to a different file than the reader is shown (issue #8244).
+    # here would write to a different file than the reader is shown.
     if safe_name.startswith(READONLY_SKILL_KEY_PREFIXES):
         return web.json_response(
             {

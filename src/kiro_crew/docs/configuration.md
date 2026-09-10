@@ -109,14 +109,18 @@ id); that is deferred to the session-lifecycle work, not the display path.
 
 
 **KAS is served by kiro-cli's own ACP relay.** Kiro Crew spawns
-`kiro-cli acp --agent-engine v3 --auth-method cli` and speaks ordinary ACP to it;
-the relay forwards frames to KAS in both directions. Two consequences worth
-knowing:
+`kiro-cli acp --agent-engine v3` and speaks ordinary ACP to it; the relay
+forwards frames to KAS in both directions. Two consequences worth knowing:
 
-- **Credentials stay in kiro-cli.** `--auth-method cli` makes the relay resolve
-  access tokens from kiro-cli's own store, so Kiro Crew never handles a KAS
-  token. This works on any machine where `kiro-cli login` has succeeded; sign in
-  with kiro-cli before switching.
+- **Credentials come from one of two places, chosen per spawn.** If you have
+  signed in through Kiro Crew's own login (the KAS login gate), Kiro Crew is the
+  engine's auth owner: the relay is started without `--auth-method`, the engine
+  asks Kiro Crew for an access token over its `_kiro/auth/getAccessToken`
+  callback, and Kiro Crew answers from its encrypted vault (the refresh token
+  never leaves Kiro Crew). Otherwise Kiro Crew adds `--auth-method cli` and the
+  relay resolves tokens from kiro-cli's own store — this works on any machine
+  where `kiro-cli login` has succeeded. A sign-in or sign-out takes effect on the
+  next KAS process, not on one already running.
 - **No KAS assets to locate.** Kiro Crew does not read kiro-cli's extracted KAS
   bundle or its Node runtime, so there is nothing to point at and no override to
   set. What it does need is a kiro-cli new enough to offer `--agent-engine v3`;
@@ -174,8 +178,8 @@ Set via `kirocrew config set agent.acp_backend kas`.
   },
   "stt": {
     "enabled": true,
-    "provider": "whisper",
-    "streaming": false,
+    "provider": "local",
+    "streaming": true,
     "transcribe_region": "us-east-1",
     "language_code": "en-US"
   },
@@ -254,6 +258,7 @@ Set via `kirocrew config set agent.acp_backend kas`.
 | `dashboard.merge_queued_messages` | Concatenate follow-up messages while the agent is busy | `false` |
 | `dashboard.mcp_probe_timeout_secs` | Seconds to wait for an MCP server handshake during a probe (5-120) | `15` |
 | `dashboard.link_previews` | Fetch and render HTTP(S) link metadata in assistant messages. Off by default because each linked site receives a request from this machine | `false` |
+| `dashboard.feature_videos_enabled` | Play a short intro clip for a feature this install has not used yet. Instance-wide kill switch; see [Feature Videos](feature-videos.md). Off until real clips ship | `false` |
 
 ### Slack
 
@@ -270,8 +275,9 @@ Only the owner (`KIROCREW_OWNER_ID`) is authorized to interact over Slack.
 Multi-user access and open channels are refused regardless of what these lists
 contain, so treat them as bookkeeping rather than an access grant.
 
-Other channels (Discord, Telegram, Teams, Webex, WeCom, WeChat) are configured
-from the dashboard — see each channel's doc for keys and credentials.
+Every other messaging channel is configured from the dashboard — the roster is in
+[the documentation index](index.md#chat-channels), and each channel's own doc
+lists its keys and credentials.
 
 ### Speech-to-text
 
@@ -383,8 +389,9 @@ permission to spend. The authenticated dashboard is the only writer — there is
 deliberately no CLI verb, because a terminal command that records a grant on
 request is a grant an automated caller can take.
 
-Both local defaults (`piper` for TTS, `local` for STT) need no AWS account and no
-confirmation.
+Both local defaults (`system` for TTS, `local` for STT) need no AWS account and no
+confirmation. `system` additionally needs nothing installed on macOS and Windows,
+which is why it is the TTS default rather than `piper`.
 
 ### Memory and embeddings
 
@@ -440,6 +447,7 @@ them, so there is no enable switch here: only knobs for *which* model runs.
 | `knowledge.extraction_pool_size` | Concurrent LLM workers for document extraction; requires restart | `3` |
 | `knowledge.embed_rate_limit` | Maximum embedding generations per minute across all sources. `0` removes the bound | `120` |
 | `knowledge.sweep_chunk_budget` | Maximum chunks ingested across all sources in one watcher sweep. `0` removes the bound | `500` |
+| `knowledge.import_chunk_budget` | Maximum chunks ingested through the explicit one-shot import paths (single-file add, agent add, direct text ingest, remote sync) within a rolling ~60s window -- the cross-file cost ceiling those paths otherwise lack. When exhausted the next import is refused with a reason rather than silently truncated; a single file stays bounded by the 50-chunk per-file cap independently. `0` (the default) removes the bound; opt in by setting it (e.g. `500`). Limitation if enabled: reservation is worst-case (each in-flight import books the 50-chunk per-file maximum up front and reconciles to the real count only on completion), so concurrent imports throttle below the nominal number until that accounting is refined. | `0` |
 
 ### Top level
 

@@ -8,20 +8,31 @@ open before touching that subsystem: see
 
 ## What this is
 
+<<<<<<< HEAD
 Kiro Crew is an open-source personal AI agent: chat from Slack, a web dashboard, or
 the CLI; run multi-step tasks unattended; schedule cron jobs; keep memory across
 sessions. It drives an LLM through the KiroACP provider (the ACP adapter running
 `kiro-cli` over ACP JSON-RPC) plus MCP tools.
+=======
+Kiro Crew is an open-source personal AI agent: chat from the web dashboard, the
+CLI, or a messaging channel like Slack and Discord; run multi-step tasks
+unattended; schedule cron jobs; keep memory across sessions. It drives an LLM
+through the KiroACP provider (the ACP adapter running `kiro-cli` over ACP
+JSON-RPC) plus MCP tools.
+>>>>>>> upstream/main
 
-- **Backend:** Python package `kiro_crew` in `src/kiro_crew/`.
-- **Frontend:** React + TS + Vite SPA in `website/`; the built `dist/` is staged
-  into `src/kiro_crew/static/dist/` and served by the backend.
-- **Data home:** `~/.kiro/crew`, overridden with `KIROCREW_HOME`. The legacy
-  `~/.kirocrew` is fully deprecated and no longer auto-migrates; it survives only
-  in sensitive-path deny lists, which must keep covering it.
+- **Backend:** Python package `kiro_crew` in `src/kiro_crew/`. **Frontend:** React
+  + TS + Vite SPA in `website/`, built into `src/kiro_crew/static/dist/` and served
+  by the backend.
+- **Data home:** `~/.kiro/crew`, overridden with `KIROCREW_HOME`.
 - **Distribution:** public GitHub, plain setuptools, public PyPI / public npm.
 
-Full map: [`docs/architecture/overview.md`](docs/architecture/overview.md).
+Full map: [overview](docs/architecture/overview.md). This repo is the de-Amazoned
+public fork of an internal package; what must never come back is
+[oss-fork-boundaries](docs/system-specs/oss-fork-boundaries.md), gated by
+the `internal-content-scan` check (blocking on pull requests, forks included) and
+the
+`no-new-builtin-apps` rule in `AUTOSDE.yaml`.
 
 ## Read before you touch
 
@@ -34,136 +45,131 @@ in the **same commit** when you change what it documents.
 | `security.py`, `hooks.py`, denied commands, sensitive paths | [security](docs/system-specs/modules/security.md) + [sel](docs/system-specs/modules/sel.md) |
 | the security model as a whole, threat boundaries | [security-deep-dive](docs/architecture/security-deep-dive.md) |
 | `computer_use/` | [computer-use](docs/system-specs/modules/computer-use.md) |
+| monitoring loops, `monitoring/`, `irq.py`, watches | [monitor-architecture](docs/system-specs/modules/monitor-architecture.md) (the paradigm) + [agent-interrupt-controller](docs/system-specs/modules/agent-interrupt-controller.md) + [babysit-pr-watch](docs/system-specs/modules/babysit-pr-watch.md) |
 | `acp/`, kiro-cli transport, providers | [acp-client](docs/system-specs/modules/acp-client.md) + [providers](docs/system-specs/modules/providers.md) |
+<<<<<<< HEAD
+=======
+| picking or defaulting a model anywhere | [model-selection](docs/system-specs/common/model-selection.md) + [model-fallback](docs/system-specs/modules/model-fallback.md) |
+| adding or adapting an agent harness (BYO, KAS, claude) | [harness-parity](docs/system-specs/modules/harness-parity.md) (invariants) + [harness-parity-gate](docs/ci/harness-parity-gate.md) (CI) |
+| the publicly selectable Claude backend | [claude-code-provider](docs/system-specs/modules/claude-code-provider.md) |
+>>>>>>> upstream/main
 | sessions, slots, session keys, PIDs | [session](docs/system-specs/modules/session.md) + [history](docs/system-specs/modules/history.md) |
 | memory, embeddings, vectors, lessons, skills, hooks | [memory-skills-hooks](docs/system-specs/modules/memory-skills-hooks.md) |
 | MCP servers or tools (adding, changing, statelessness) | [mcp](docs/architecture/mcp.md) |
 | apps, App Kit, manifests, app agents | [app-kit-platform](docs/system-specs/modules/app-kit-platform.md) + [app-kit/](docs/app-kit/README.md) |
 | artifacts, companion chat | [artifacts](docs/system-specs/modules/artifacts.md) |
-| `stt/`, `transcribe.py`, `voice_reply.py`, the mic, dictation, TTS | [stt-streaming](docs/system-specs/features/stt-streaming.md) + [voice-streaming](docs/system-specs/features/voice-streaming.md) |
+| `stt/`, `transcribe.py`, `voice_reply.py`, the mic, dictation, TTS | [stt-streaming](docs/system-specs/modules/stt-streaming.md) + [voice-streaming](docs/system-specs/modules/voice-streaming.md) |
 | cron, learn, dashboard handlers | [learn-cron-dashboard](docs/system-specs/modules/learn-cron-dashboard.md) |
 | Slack, Discord, any channel, messaging, approvals | [messaging](docs/system-specs/modules/messaging.md) + [slack-gateway](docs/system-specs/modules/slack-gateway.md) |
 | subagents, spawn, orphan recovery | [subagent](docs/system-specs/modules/subagent.md) |
+| crews, `select_crew`, crew bindings, Crew Mode slots | [crew-mode](docs/system-specs/modules/crew-mode.md) |
+| the pipeline conductor agent or its skill | [pipeline-conductor](docs/system-specs/modules/pipeline-conductor.md) |
 | task runner | [task](docs/system-specs/modules/task.md) + [taskrunner](docs/system-specs/modules/taskrunner.md) |
-| `workflows/` (the dynamic-workflow engine) | [workflows](docs/system-specs/modules/workflows.md) + [workflow-gates](docs/system-specs/modules/workflow-gates.md) |
+| `workflows/` (the dynamic-workflow engine) | [workflows](docs/system-specs/modules/workflows.md) |
 | themes | [themes](docs/system-specs/modules/themes.md) + [theming-contract](website/docs/theming-contract.md) |
 | anything under `website/` | [`website/AGENTS.md`](website/AGENTS.md) |
 | user-facing strings, dates, numbers, sort order | [i18n-catalog](website/docs/i18n-catalog.md) (authoring) + [i18n-gates](docs/ci/i18n-gates.md) (CI) |
-| tests: flakes, speed, fixtures, sharding, side effects, conftest isolation | [testing-conventions](docs/system-specs/common/testing-conventions.md) + the [writing-tests](src/kiro_crew/builtin_skills/kirocrew-dev/writing-tests/SKILL.md) skill |
+| tests: flakes, hangs, speed, memory, fixtures, sharding, side effects, host state (`~/.kiro`, `Path.home()`, the systemd user manager), conftest isolation, `monkeypatch.undo()`, env-var leaks, host-dependent tests (Windows, Python 3.13, per-user tools), what `TMPDIR` must not be | [testing-conventions](docs/system-specs/common/testing-conventions.md) + the [writing-tests](src/kiro_crew/builtin_skills/kirocrew-dev/writing-tests/SKILL.md) skill; frontend and Electron tests: [website/docs/testing.md](website/docs/testing.md) |
 | browser E2E | [e2e-gate](docs/ci/e2e-gate.md) |
 | proving a worktree change against an isolated running gateway | [worktree-verification-recipes](docs/guides/worktree-verification-recipes.md) |
-| CI, PR flow, review gates | [ci-and-reviews](docs/ci/ci-and-reviews.md) + [CONTRIBUTING.md](CONTRIBUTING.md) |
-| constants, magic numbers, where a limit lives | [code-style](docs/system-specs/common/code-style.md) |
+| CI, PR flow, review gates, commit messages | [ci-and-reviews](docs/ci/ci-and-reviews.md) + [CONTRIBUTING.md](CONTRIBUTING.md) |
+| constants, comments, lint, code style, the brand name | [code-style](docs/system-specs/common/code-style.md) |
+| connections, connectors, an external account link | [connections](docs/system-specs/modules/connections.md) |
+| a POSIX call: locks, signals, PIDs, chmod, RSS | [platform-compat](docs/system-specs/common/platform-compat.md) + [windows-install](docs/guides/windows-install.md) |
 | injected `[Cron notification]` / `[Subagent completion event]` | [injected-messages](docs/system-specs/common/injected-messages.md) |
 | build, install, dev mode | [CONTRIBUTING.md](CONTRIBUTING.md) + [install](docs/guides/install.md) |
-| Windows / cross-platform process, signal, lock, metrics | [windows-install](docs/guides/windows-install.md) + the shim table below |
-| a release, or `CHANGELOG.md` | [release](docs/build/release.md) |
+| cutting a release | [release](docs/build/release.md) |
+| `CHANGELOG.md` | [changelog](docs/build/changelog.md) |
 | errors, retries, user-facing failure text | [error-handling](docs/system-specs/common/error-handling.md) |
+| what this public fork must never re-introduce | [oss-fork-boundaries](docs/system-specs/oss-fork-boundaries.md) |
+| any doc: moving, renaming, indexing it | [docs/README.md](docs/README.md) |
 
 The whole doc tree is indexed from [`docs/README.md`](docs/README.md). User-facing
 docs that ship in the package live in `src/kiro_crew/docs/` and are indexed by
 [its README](src/kiro_crew/docs/README.md).
 
-## Never re-introduce (this is a public OSS fork)
-
-This repo is the de-Amazoned public fork of an internal package. Never re-add:
-
-- **Build/infra:** Brazil (`Config`, root `AUTOSDE.yaml` is NOT this),
-  `CODE_APPROVERS.yaml`, `npm-pretty-much`, toolbox bundler, AIM hooks,
-  CodeArtifact registries. setuptools + public PyPI / public npm only.
-- **Services/auth:** enterprise SSO, MCS, Kerberos, federated login,
-  device-posture tunnels, Cognito/RUM ids, builder-mcp, `arcc`, Quip, internal
-  ticketing. The internal marker names are scrubbed from code, comments, and docs.
-- **Keep these stubbed** (public symbols preserved as no-ops so the import graph
-  holds): `sso_status.py`, `browser/auth.py`, `dashboard/handlers/sso_login.py`,
-  `tunnel/manager.py`, `aim_agents.py`.
-- **Other providers.** Kiro Crew is KiroACP-only: `agent.provider` is fixed to
-  `acp` and kiro-cli is REQUIRED. `ACP_BACKEND_CLAUDE` is a **publicly selectable
-  harness**, not a dormant seam: `acp/client.py` owns its whole spawn path and the
-  adapter it needs is a public npm package, so it sits in
-  `BASELINE_SELECTABLE_BACKENDS` and any operator with the two binaries can choose it.
-  Two consequences to keep in mind rather than undo: a Claude session starts with **no
-  Crew MCP tools** (`_claude_session_mcp_servers` defaults to `[]`), and a tool
-  pre-approved in Claude's own settings — including a `.claude/settings.json` inside a
-  cloned project — never reaches Crew's approval path, so its deny rules and audit log
-  do not see that call. Both are disclosed on the Agent Backend panel and in
-  `docs/system-specs/features/claude-code-provider.md`; do not widen the harness's
-  reach further without closing them. A harness added at `agent.acp_backend` is
-  governed by
-  [Harness parity](#harness-parity-kiro-is-first-class-the-rest-are-adapted) —
-  adapted, never a second `agent.provider` value.
-- **OSS-flipped defaults:** always-on in-process embeddings, Piper TTS by default,
-  a default-open Slack enterprise gate, lazy STT extras.
-- **Fork UX divergences:** the Channels app is hidden from the App Store and the
-  Board app is removed. An upstream sync must not restore them. The
-  `no-new-builtin-apps` rule in `AUTOSDE.yaml` blocks this in review — and
-  blocks any NEW built-in app: the built-in set is closed, and new apps ship
-  as external apps through the KiroCrewApps registry.
-
-`scripts/scrub-lint.sh` gates `src/`, `website/src/`, `scripts/`, `config/`,
-`packaging/`, and the top level; keep `docs/` clean by convention. Rationale for
-what was removed: [post-launch-removals](docs/system-specs/post-launch-removals.md).
-
-**Keep** the generic security controls: AKIA/ASIA credential redaction,
-destructive-command deny rules, `~/.aws` / `~/.ssh` path blocking, the SEL audit log.
-
 ## Security invariants (do NOT weaken)
 
-- **Keystone.** `security_policy.json`, `profiles/`, `admission_policy.json`, and
-  `computer_use.json` under the data home are in `security._SENSITIVE_HOME_DIRS`,
-  so the agent can neither read nor write its own ceiling. When editing
-  `security.py`'s sensitive-path or bash-command matchers, keep these covered,
-  including write and extract verbs. This single mechanism is what makes the
-  ceiling un-disableable.
-- **Governance.** `effective = POLICY ∩ PROFILE`, tightest-wins, enforced at
-  Kiro Crew's OWN PreToolUse gate: it denies a tool or MCP call even when the kiro
-  agent config granted it. The evaluator is scope-name-agnostic, so adding a scope
-  is a `SCOPE_CATALOG` data change, never an evaluator edit.
+Detail and rationale: [security](docs/system-specs/modules/security.md),
+[governance](docs/system-specs/modules/governance.md),
+[computer-use](docs/system-specs/modules/computer-use.md).
+
+- **Keystone.** `security_policy.json`, `profiles/`, `admission_policy.json` and
+  `computer_use.json` under the data home are the ceiling the agent is governed by.
+  **The enforcement point is the OS layer in `sandbox.py`, not a text matcher.** Every
+  crew-home leaf carries one of three dispositions, and which one it has IS the
+  statement of what is guaranteed: `HIDDEN` (bind-masked in every mode — the credential
+  homes, `.env`, `live_target.json`), `READONLY` (in-sandbox code reads it and a write
+  would let the agent choose its own ceiling — the four leaves above), or `VISIBLE`
+  (in-sandbox code needs read *and* write, so no OS rule applies and it rests on the
+  tool gate alone). Precisely, then: the agent **cannot write** its own ceiling in any
+  sandbox mode, and it **can read** it, deliberately — masking a policy file makes it
+  resolve to the permissive standalone default, so hiding a ceiling REMOVES it instead
+  of protecting it. Do not restore a read block by pattern-matching command text: a
+  spawned shell reaches a file through an `open()` that never routes through the tool
+  gate, so a path fenced only there is readable in any sandbox mode whatever the matcher
+  recognises, and each spelling closed (`/./`, a glued redirect, a variable, `cd`,
+  `pushd`) narrows an unbounded set by exactly one. `test_sandbox_governance_mask.py`
+  pins the union of the three dispositions equal to the crew-home half of
+  `security.sensitive_home_dirs()`, so a new leaf cannot land in none of them — that
+  pin, not a regex, is what keeps the ceiling un-disableable. One residual worth
+  carrying: `sel_hmac.key` is `VISIBLE`, so the SEL audit key has no OS fence; closing
+  that means moving its in-sandbox reader behind the gateway, never another matcher.
+- **Governance is `POLICY ∩ PROFILE`, tightest-wins**, enforced at Kiro Crew's OWN
+  PreToolUse gate even when the kiro agent config granted the call. The evaluator
+  is scope-name-agnostic, so adding a scope is a `SCOPE_CATALOG` data change, never
+  an evaluator edit.
 - **`CONTRACT_VERSION` stays pinned at 1 pre-launch.**
-- **Denied commands** are `DeniedCommandRule` records (`BUILTIN_DENIED_RULES`)
-  enforced only at the `hooks.py` PreToolUse gate. Never restate the rule count in
-  prose: `test/test_denied_commands_security.py` pins it, and a restated count goes
-  stale silently.
-- **Computer use is deliberately NOT governed.** It is one operator opt-in on the
-  keystone `computer_use.json`. Do not add `computer_use.*` scopes, capability
-  rows, approval ordinals, or pointer permits. Its refusals run **in band** on the
-  `tools._dispatch` path, never at the fail-OPEN `hooks` gate, because a
-  pre-authorized tool can skip that gate. Keep them there. Secure-field redaction
-  is an always-on floor with no policy key. `click_method: "auto"` must NEVER
-  resolve onto `"global"`: that is the only thing between an ordinary click and the
-  operator's real cursor.
+- **Never restate the denied-rule count in prose.**
+  `test/test_denied_commands_security.py` pins it, and a restated count goes stale
+  silently.
+- **A cron script body is never a shell-gate subject.** `is_sensitive_bash_command`
+  and `is_denied` read a SHELL COMMAND LINE; `mcp_cron._vet_script_contents` scans a
+  Python source body with whole-body, source-aware detectors only (credential path,
+  secret env name, exfil URL) and the sandbox is the runtime control. Handing the
+  body to the shell gate was tried (#4243 → #8811) and every shell-grammar pass
+  produced a permanent false denial on ordinary scripts (#7912, #8563, #8643,
+  #8812), each patched with another AST layer that still could not stop
+  `open(a + b)`. Do not add a `subject_is_*` flag, a `_traversal_subjects`
+  re-pointing, or an `is_sensitive_source_body` back. A new script detector is a
+  whole-body match in `_vet_script_contents`, or a sandbox mask. Pinned by
+  `test_the_shell_gate_has_no_source_body_entry_point` and
+  `test_script_body_is_never_a_shell_gate_subject`.
+- **A regex spelling-chase is a review smell, not a fix.** When a security review
+  finds "X also reaches the fence via spelling Y", ask first whether the SUBJECT is
+  wrong (a document handed to a command-line matcher) or whether the sandbox
+  already covers it. Add a table entry only when the subject is genuinely a shell
+  command line and the OS sandbox does not hold the path (#7441 went four rounds
+  of `command`/`exec -a`/`nice`/`env -i`/`timeout`/`busybox` before restructuring).
+- **Computer use is deliberately NOT governed**: it is one operator opt-in on the
+  keystone `computer_use.json`. Never add `computer_use.*` scopes, capability rows,
+  approval ordinals or pointer permits. Its refusals run **in band** on
+  `tools._dispatch`, never at the fail-OPEN `hooks` gate, because a pre-authorized
+  tool can skip that gate. `click_method: "auto"` must NEVER resolve onto
+  `"global"`: that is the only thing between an ordinary click and the operator's
+  real cursor.
 
-## Model selection
+## Never hardcode a model id
 
-Never hardcode a model id (`claude-*`, `opus*`, `sonnet*`, `haiku*`, `gpt-*`,
-`fable*`) as a default or fallback. Accounts differ in entitlement and even
-`"auto"` is not served in every partition, so a hardcoded id fails at runtime
-(silent until the first prompt) for anyone not entitled to it.
+`claude-*`, `opus*`, `sonnet*`, `haiku*`, `gpt-*` or `fable*` as a default or
+fallback fails at runtime for anyone not entitled to it, silently until the first
+prompt. The default is `"auto"`; resolve a substitute choice through
+`acp.client.resolve_usable_model`; pin a cheaper model only via
+`agent.role_models.<role>`. `code-review.yml` fails on a newly added hardcoded
+literal. Rules and the one exception:
+[model-selection](docs/system-specs/common/model-selection.md).
 
-- **Default is `"auto"`** (`agent.model` / `config/defaults.json`) — don't replace
-  it with a concrete model. `"auto"` is validated like any other id; it is not
-  assumed usable.
-- **Resolve, don't guess.** For a model chosen on the caller's behalf (background
-  one-liners, tips, inherited/cold-start applies) route through
-  `acp.client.resolve_usable_model(preferred, advertised)`: send a served id; send
-  `"auto"` only when advertised; otherwise return `""` = **inherit the session's
-  served backend default**. `run_bg_oneliner` adds a one-shot reactive retry on a
-  wire rejection as a backstop. An **explicit user pick** is the opposite — it
-  `raise`s `AcpModelUnavailable`; never silently swap a model the user chose.
-- **Pickers** MUST list options from `GET /api/models` (the advertised set), never
-  a static in-code list.
-- **Pin a cheaper model** only via `agent.role_models.<role>` (`background`,
-  `subagent`) → `AgentConfig.resolve_model(role)`; roles default to `"auto"` and
-  never inherit `agent.model`.
-- **Entitlement check:** always the shared predicate
-  `acp.client.model_is_unusable(id, advertised)` (with `advertised_model_ids(...)`);
-  an empty/unknown advertised set means "allow". Never hand-roll a membership test.
-- The `claude_code` seam's `cc_model` (`_BACKGROUND_CC_MODEL`) is the one allowed
-  concrete fallback (that backend can't resolve `"auto"`); keep it off the default path.
+## Harness parity
 
-`code-review.yml` fails on a newly added hardcoded model literal outside
-`model_registry*`, the config schema, and tests.
+Never express "this is the Kiro harness" as the ABSENCE of another one. A negative
+test fails toward the permissive answer, so nothing goes red until an operator who
+never opted into that harness pays for it — and every id in
+`acp_backends.BASELINE_SELECTABLE_BACKENDS` is selectable on a plain public build,
+so `not is_claude_backend` is already wrong on the non-Claude ones. Identity is
+positive: `is_kiro_backend`, `== ACP_BACKEND_KIRO`, or membership in a named
+`ACP_BACKENDS_*` set.
 
+<<<<<<< HEAD
 ### Custom LLM router wiring (fork)
 
 The fork can drive any Anthropic-compatible router through the `claude_code`
@@ -202,16 +208,19 @@ backend instead of (or alongside) kiro-cli's `acp` provider:
   whitelist.
 
 ## Harness parity: Kiro is first-class, the rest are adapted
+=======
+An added harness ADAPTS to the seams the Kiro path already runs through; it never
+moves, widens or generalizes them, and it is selected at `agent.acp_backend` —
+`agent.provider` stays `enum=["acp"]`. Invariant ids (cite them bare, `H7`),
+capability sets and the CI half:
+[harness-parity](docs/system-specs/modules/harness-parity.md). Run the added-line
+gate locally with
+`HARNESS_BASE_REF=origin/main python3 scripts/check_harness_parity.py`.
+>>>>>>> upstream/main
 
-Never express "this is the Kiro harness" as the ABSENCE of another harness. Kiro
-Crew drives one first-class harness — `kiro-cli` (`ACP_BACKEND_KIRO`, spelled
-`""`) — and adapts the others (the dormant `ACP_BACKEND_CLAUDE` seam, KAS, and
-any bring-your-own harness). A negative test like `not is_claude_backend` reads
-correctly with two harnesses and then silently hands the third a capability, a
-sandbox waiver, or a session label nobody granted it — and it fails toward the
-permissive answer, so nothing goes red until an operator who never opted into
-that harness pays for it.
+## Specs and docs
 
+<<<<<<< HEAD
 - **An added harness ADAPTS, it does not widen.** It may only fit itself to the
   seams the Kiro harness already runs through: no new conditional, required
   argument, awaited step, or failure mode on the Kiro path, and no collapsing a
@@ -268,16 +277,21 @@ judgment half is the `harness-parity` rule in `AUTOSDE.yaml`.
 - MUST add the doc to its directory `README.md` when creating one, and MUST update
   every index that points at a doc you move, rename, or delete. `scripts/docs-lint.sh`
   enforces this; run it before you commit a docs change.
+=======
+- MUST read the owning spec under `docs/system-specs/` before changing the code it
+  covers, and MUST update it in the SAME commit.
+>>>>>>> upstream/main
 - MUST NOT create additional markdown files unless explicitly instructed.
-- Task specs go in `docs/task-specs/YYYY/MM/${task-id}/`. Treat `docs/task-specs/`
-  as an archive, never as current context.
+- Everything else about adding, moving, indexing and linting a doc — including
+  `scripts/docs-lint.sh` — is [docs/README.md](docs/README.md). Treat
+  `docs/task-specs/` as an archive, never as current context.
 
 ## Git
 
 - Do NOT proactively `git commit`. Commit only when asked.
 - Do NOT `git push` unless the user explicitly says to push. Being asked to commit
   is NOT permission to push.
-- `main` is the default branch; changes land through a GitHub PR. Full flow:
+- `main` is the default branch; changes land through a GitHub PR. The full flow:
   [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ```
@@ -286,122 +300,22 @@ judgment half is the `harness-parity` rule in `AUTOSDE.yaml`.
 <body — what and why, not how; wrapped at 72>
 ```
 
-Types: `feat`, `fix`, `refactor`, `docs`, `test`, `chore`, `ci`, `build`, `revert`.
-One logical change per commit.
+Types the PR-title gate in `code-review.yml` accepts: `feat`, `fix`, `docs`,
+`style`, `refactor`, `perf`, `test`, `chore`, `ci`, `build`, `revert`. **One
+logical change per commit**, and at most two commits per PR.
 
-## Release Changelog
-
-> **Releasing or promoting a version? Read `docs/build/release.md` first.** It is
-> the authority on the channel model, version stamping, and the **RC → stable
-> runbook**. The one rule to carry in before reading it: **a stable release must
-> never ship a version number carrying a prerelease suffix.** Stable is therefore
-> BUILT fresh from the cleared commit under the bare `X.Y.Z`, not published by
-> reusing the candidate's bytes — those bytes are stamped from the prerelease tag
-> and nothing downstream can re-stamp them without invalidating the recorded
-> digests and macOS signatures. Byte-for-byte reuse survives as an escape hatch
-> (`vars.STABLE_PROMOTE_BYTES`, named per version) for when stable must run the
-> identical binary insiders validated, and its cost is exactly that RC-stamped
-> version. This section covers only the changelog rules.
-
-`CHANGELOG.md` is written **only when a version is bumped**, and everything
-already in it is immutable. Two halves enforce that: the
-`changelog-is-written-at-version-bump-only` rule in `AUTOSDE.yaml` applies the
-judgment a reviewer has to make (is this a commit dump? should this PR be touching
-the file at all?), and `scripts/check_changelog_history.py` enforces what needs no
-reading — every section the base documents as shipped survives byte-identical, and
-the file contains **only** shipped sections. The parser that renders it is
-`src/kiro_crew/changelog.py`.
+## CHANGELOG.md
 
 - **Your feature PR does not touch `CHANGELOG.md`.** The release PR writes the
-  section covering everything that shipped. A per-PR changelog line is how the
-  file grows into something nobody reads, and how it acquires an `## [Unreleased]`
-  section that then has to be untangled at release time. The commit subject is
-  the record until a bump names it.
-- **There is no `## [Unreleased]` section, and the gate refuses one.** To see what
-  is pending, read `git log --oneline <last-tag>..HEAD`. With shipped sections
-  frozen, that leaves exactly one legal shape for a changelog diff — prepend one new
-  section — because there is nowhere to append a per-PR line to.
-- **One section per release, newest first**, headed exactly
-  `## [X.Y.Z] - YYYY-MM-DD` (a plain hyphen; the parser also accepts the em and
-  en dashes older sections carry, but new sections do not use them). Never a
-  prerelease spelling: `0.3.0-insider.9` and `0.3.0-rc.2` are drafts of `0.3.0`,
-  are folded onto it by the parser, and must not get their own heading. The gate
-  refuses those too, so a release branch writes its section once, under the
-  release's final heading, rather than carrying a draft it renames later.
+  section covering everything that shipped.
+- **Never delete or edit a shipped section.** A release PR prepends one section and
+  leaves every earlier one byte-identical. This has already cost 322 lines of
+  released history once, which no test caught.
+- **A stable release must never ship a version carrying a prerelease suffix.**
 
-- **Never delete or edit a shipped section.** A release PR prepends one section
-  and leaves every earlier one byte-identical. This has already gone wrong once:
-  a section was *replaced* rather than prepended and 322 lines of released
-  history went with it, which no test caught and a user reported as an empty
-  Releases page.
-
-Format, which the `[0.6.0]` section is the reference for:
-
-- A one-to-three sentence opening paragraph naming the release's theme. Not a
-  count of commits.
-- Then `###` subsections grouped by **what the reader gets**, ordered most
-  interesting first. Never group by commit type: nobody opens a changelog looking
-  for the refactors.
-- **Three sentences per subsection, at most.** A subsection is up to three
-  bullets of one sentence each, or one short paragraph. The budget is what
-  forces the edit: the three things a reader of that area most needs to know
-  survive, the rest is folded into one of them or dropped. Past three, split
-  the theme or cut.
-- Each bullet is `- **Short name**: what the user can now do`, one sentence,
-  in plain language and the present tense.
-- **No em dashes or en dashes anywhere in the section**, in headings, bullets or
-  prose. Use a colon after the bolded name, a comma or a full stop elsewhere.
-- **Say where every feature lives, and how it is turned on.** Name the page,
-  panel and control, the composer button, the CLI command or the config key in
-  the same sentence ("under Developer → Agent Backend", "the composer's + menu
-  gains a Sketch row", "`kirocrew config defaults --adopt`"), and name the gate
-  when there is one (Developer Mode, Feature Previews, a default-off setting,
-  a required binary). Verify each location in the code, not from the commit
-  message: a panel that sits behind Developer Mode, a component that is never
-  mounted, or a label that differs from the commit subject are all things the
-  0.6.0 draft got wrong on the first pass. A reader who cannot find the switch
-  did not get the feature. A subsection whose whole surface sits behind
-  Developer Mode or Feature Previews carries `(Preview)` at the end of its
-  heading, so the reader knows before the first bullet that it is opt-in.
-- Describe the capability, not the mechanism. No commit hashes, PR numbers, file
-  paths, module names, or internal vocabulary.
-- **Never generate the section from a commit dump.** A list of commit subjects, a
-  `Bug Fixes (88 total)` header, or a trailing `and 65 more (see commit log)` is
-  the failure mode this format exists to prevent. Fixes that are invisible to the
-  reader are simply left out; fixes that are visible are described as an outcome
-  and folded into the subsection they belong to.
-- **Name the breaking changes first.** A `### Before you upgrade` section leads
-  when the release removes a capability, raises a floor (a minimum Node or Python
-  version), changes a default, or alters behaviour a user has configured around.
-  This is the part of a changelog with no substitute: a reader can discover a new
-  feature later, but a withdrawn one costs them an outage.
-- **A closing `### Notable fixes` section is allowed, and is not a commit dump.**
-  It exists so a reader can check whether their particular annoyance is gone,
-  written as what is now true ("Teams retries a rate-limited message instead of
-  dropping it"). Group the fixes by area into prose paragraphs under a bolded
-  lead (`**Chat and sessions.** ...`), and hold each paragraph to the same
-  three-sentence budget as a subsection. What makes it a dump instead is a total
-  count, a bare commit subject, a scope prefix, or an "and N more" tail; it
-  carries none of those, and a fix nobody would notice does not earn a line.
-- **The budget, not the range, decides the length.** A release covering twice
-  the commits still gets three sentences per subsection; it earns more
-  subsections only when it shipped more distinct things a reader gets. The
-  showcase body carries new surfaces, new capabilities, and perceptible
-  performance changes; everything fix-shaped goes to the grouped tail.
-- **Verify coverage against the commit range, not against your memory of it.**
-  Partition `git log <last-tag>..HEAD` and account for every commit, because the
-  omissions are systematic rather than random: a change whose subject names one
-  subsystem while touching a shared surface is exactly what a keyword or path
-  scan misses, and nothing downstream ever reports it. It is also systematically
-  biased *against* the release's headline: the PR that lands a large surface is
-  the least likely to have spent effort on a changelog line, so an accumulated
-  file over-represents small fixes and omits the features people upgraded for.
-  Accounting for a commit does not mean writing it up: the budget above decides
-  what survives, and the rest is a deliberate, recorded cut.
-- **No `### Contributors` section.** The GitHub Release page renders its own
-  contributor block from the tag range, natively, so a list in the changelog
-  duplicates it. Older sections carry one; do not add one to a new section, and
-  do not hand-write one into the release notes either.
+When, how, the heading shape and the format budget:
+[changelog](docs/build/changelog.md). Cutting a release, and the one escape hatch
+from the suffix rule: [release](docs/build/release.md).
 
 ## The gate before you commit
 
@@ -411,28 +325,27 @@ flake8 src/kiro_crew test && mypy src/kiro_crew
 python -m pytest
 ```
 
-**On macOS, add `--platform linux` to mypy.** CI type-checks on Linux, and
-typeshed guards `os.listxattr` / `getxattr` / `setxattr` behind
-`sys.platform == "linux"` even though macOS has them — so a local run reports 4
-errors in files you did not touch, and it MISSES Linux-only errors CI fails on.
-`mypy --platform linux src/kiro_crew` is the parity invocation.
+- **On macOS, run `mypy --platform linux src/kiro_crew`.** Without it a local run
+  reports errors you did not cause and MISSES the Linux-only errors CI fails on, so
+  a clean local run is a false green.
+- **Never run bare `black src/kiro_crew test`.** It reformats every baselined file
+  and buries your diff. Format only what you touched:
+  `black --target-version py310 <the files you changed>`.
+- Frontend: `cd website && npm run build && npm run test`.
+- A multi-test `--override-ini` MUST keep `-n auto --dist loadgroup
+  --max-worker-restart=2`; a bare override silently drops `--dist loadgroup` and
+  scatters `@pytest.mark.xdist_group` tests into flaky races.
 
-**Do not run bare `black src/kiro_crew test`.** 1,420 files are not black-clean
-yet, so it reformats ~95,800 lines on top of whatever you changed and buries your
-diff. The gate above enforces black on every file *outside*
-[`.github/black-baseline.txt`](.github/black-baseline.txt) instead, so format only
-what you touched: `black --target-version py310 <the files you changed>`. If a
-file you touched is listed in the baseline, formatting it is welcome but optional
-— do it in its own commit, and prune its line with
-`python3 scripts/check_black_formatting.py --update-baseline`.
+Gates, the six flake classes, the conftest isolation floor and the traps that are
+invisible when reading a test: [code-style](docs/system-specs/common/code-style.md) +
+[testing-conventions](docs/system-specs/common/testing-conventions.md). A test that
+can block forever is a lost RUN, not a failed test: on Windows pytest-timeout kills
+the xdist worker, and with `--max-worker-restart=0` one unbounded `await` aborts the
+whole job (class 6). Frontend and Electron: [website/docs/testing.md](website/docs/testing.md).
 
-Frontend: `cd website && npm run build && npm run test`. Faster loops (testmon,
-`--lf`, single-file runs) are in
-[testing-conventions](docs/system-specs/common/testing-conventions.md). A
-multi-test `--override-ini` MUST keep `-n auto --dist loadgroup
---max-worker-restart=2`, because a bare override silently drops `--dist loadgroup`
-and scatters `@pytest.mark.xdist_group` tests into flaky races.
+## Cross-platform
 
+<<<<<<< HEAD
 Gates you will trip:
 
 | Gate | Rule |
@@ -530,36 +443,29 @@ Kiro Crew runs on macOS, Linux (x86_64 and ARM), and Windows (native). `fcntl`,
 Verify process, signal, file-lock, and metrics changes on macOS + Linux. Frontend:
 Chrome, Firefox, Safari, Edge, using standard Web APIs and guarding the rest.
 Windows specifics: [windows-install](docs/guides/windows-install.md).
+=======
+Route POSIX calls through `platform_compat`: `fcntl`, `termios`, `resource` and
+`pty` do not exist on Windows, and **`os.kill(pid, 0)` TERMINATES the target
+there** — it is not a liveness probe. The full helper-per-call table:
+[platform-compat](docs/system-specs/common/platform-compat.md). Verify process,
+signal, file-lock and metrics changes on macOS + Linux.
+>>>>>>> upstream/main
 
 ## LLM-facing capabilities
 
-- **MCP-first.** A new LLM-facing CLI command MUST also ship as an MCP tool
-  (`mcp_cron.py` / `mcp_core.py`): kiro-cli calls MCP tools reliably and may refuse
-  to run a CLI command via bash. There is exactly one deliberate exception,
-  `kirocrew computer call`, a human debug harness rather than a capability; do not
-  add another without reading [mcp](docs/architecture/mcp.md). Do NOT add regex to
-  match natural-language variants, the LLM interprets NL.
-- **MCP tools MUST be stateless.** One server process serves many sessions and
-  sub-agents, so no module global may hold per-caller data. Resolve identity per
-  call, and route anything that mutates or targets a specific session through
-  `mcp_core.require_strict_session_key()` — the shared fail-closed gate — and
-  register the module in `mcp_core.REFLEXIVE_TOOL_MODULES` (the lenient resolver
-  walks process ancestors and a sub-agent would resolve to its parent slot; a
-  ratchet test rejects direct strict-resolver calls outside `mcp_core`). Durable
-  state lives behind a gateway
-  endpoint keyed by session. Why, plus the `ask_question` reference
-  implementation: [mcp](docs/architecture/mcp.md).
-- **A skill that any shipped feature, tool, or doc references MUST live in
-  `src/kiro_crew/builtin_skills/`.** That is the only path bundled into the
-  package and copied into a user's `~/.kiro/crew/skills/`. Top-level `skills/` is
-  repo-checkout-only and reaches no installed user.
+A new LLM-facing CLI command MUST also ship as an MCP tool, MCP tools MUST be
+stateless (no module global holds per-caller data), and a skill any shipped
+feature, tool or doc references MUST live in `src/kiro_crew/builtin_skills/` — the
+only tree bundled into the package. Why, plus the session-key gate:
+[mcp](docs/architecture/mcp.md) +
+[memory-skills-hooks](docs/system-specs/modules/memory-skills-hooks.md).
 
 ## Injected messages are not the user
 
-`[Cron notification from "job"]`, `[Subagent completion event]`, and
-`[auto-nudge cycle N]` arrive from automation, not from a human. Process them; do
-not answer them as if a user typed them. The user may not be present. Envelope
-formats: [injected-messages](docs/system-specs/common/injected-messages.md).
+`[Cron notification from "job"]`, `[Subagent completion event]` and
+`[auto-nudge cycle N]` arrive from automation. Process them; do NOT answer them as
+if a human typed them — the user may not be present. Envelopes:
+[injected-messages](docs/system-specs/common/injected-messages.md).
 
 ## Harness safety
 

@@ -88,7 +88,13 @@ class HybridRetriever:
         self.store = store
         self.embedder = embedder
 
-    def search(self, query: str, limit: int = 10, source_id: str | None = None) -> list[dict]:
+    def search(
+        self,
+        query: str,
+        limit: int = 10,
+        source_id: str | None = None,
+        namespace: str | None = None,
+    ) -> list[dict]:
         """Hybrid search with RRF fusion. Returns [{id, title, summary, content, score, source, match_type}].
 
         ``source_id`` scopes the SEED legs only (FTS5 keyword + vector
@@ -96,10 +102,24 @@ class HybridRetriever:
         vocabularies collide across a heterogeneous corpus. The graph leg is
         deliberately left unfiltered so cross-source entity connections can
         still contribute traversal context to the fused ranking.
+
+        ``namespace`` scopes the SAME seed legs to items in one namespace
+        (``items.namespace``), the organisational label the store and the
+        dashboard browse filter already use. It is a relevance/organisation
+        filter, NOT a security boundary: like ``source_id`` it narrows the
+        seeds, and the graph leg stays unfiltered for the same reason. The two
+        filters compose (both applied when both are given).
+
+        Returns at most ``limit`` ranked rows, plus at most ONE extra trailing
+        row -- the keyword leg's protected top hit (see below).
         """
-        kw = self._keyword_search(query, limit=limit * 2, source_id=source_id)
+        kw = self._keyword_search(
+            query, limit=limit * 2, source_id=source_id, namespace=namespace
+        )
         gr = self._graph_search(query, limit=limit * 2)
-        vec = self._vector_search(query, limit=limit * 2, source_id=source_id)
+        vec = self._vector_search(
+            query, limit=limit * 2, source_id=source_id, namespace=namespace
+        )
 
         # Vector leg is weighted higher so semantic matches dominate when the
         # keyword leg is weak. Weights align positionally
@@ -128,11 +148,11 @@ class HybridRetriever:
         gr_ids = {i for i, _ in gr}
         vec_ids = {i for i, _ in (vec or [])}
 
-        results = []
-        for item_id, score in fused[:limit]:
+        def _row(item_id: str, score: float) -> dict | None:
+            """A result row for one fused candidate, or None when the item does not resolve."""
             item = items_cache.get(item_id)
             if not item:
-                continue
+                return None
             types = []
             if item_id in kw_ids:
                 types.append("keyword")
@@ -140,7 +160,7 @@ class HybridRetriever:
                 types.append("graph")
             if item_id in vec_ids:
                 types.append("vector")
-            results.append({
+            return {
                 "id": item_id,
                 "title": item["title"],
                 "summary": item.get("summary"),
@@ -148,7 +168,35 @@ class HybridRetriever:
                 "score": score,
                 "source": item.get("source_id"),
                 "match_type": "+".join(types),
-            })
+            }
+
+        picks = fused[:limit]
+
+        # The keyword leg's own best match is protected from fusion truncation.
+        # The vector leg carries VECTOR_RRF_WEIGHT, so it can crowd a
+        # keyword-only document past `limit` even when that document is the
+        # single right answer -- the case where the query carries an exact error
+        # string, a ticket id or a rare technical term, and the caller otherwise
+        # sees related-but-wrong rows with no sign the right one was found and
+        # dropped. No weight setting avoids this, so the winner is appended as
+        # one extra trailing row instead: nothing already ranked is removed,
+        # reordered or demoted, so the rescue cannot regress a query the ranking
+        # already answers. Only rank 1 is protected -- promoting lower keyword
+        # ranks into the window would have to displace ranked rows, which is the
+        # regression this shape exists to avoid. The row keeps its real fused
+        # score, which downstream confidence floors depend on, and it is appended
+        # before the enrichment passes below so it stays as citable as any ranked
+        # row.
+        if kw:
+            top_kw_id = kw[0][0]
+            if all(item_id != top_kw_id for item_id, _ in picks):
+                picks += [(i, s) for i, s in fused if i == top_kw_id]
+
+        results = []
+        for item_id, score in picks:
+            row = _row(item_id, score)
+            if row is not None:
+                results.append(row)
 
         self._attach_source_locations(results)
         self._attach_citation_sources(results)
@@ -260,12 +308,18 @@ class HybridRetriever:
                 result["artifact_slug"], result["artifact_name"] = artifact
 
     def _keyword_search(
-        self, query: str, limit: int = 20, source_id: str | None = None
+        self,
+        query: str,
+        limit: int = 20,
+        source_id: str | None = None,
+        namespace: str | None = None,
     ) -> list[tuple[str, int]]:
         """FTS5 search. Returns [(item_id, rank)] where rank is position (1=best).
 
         ``source_id`` narrows matches to items of one source via a
-        parameterized WHERE clause (never string interpolation).
+        parameterized WHERE clause (never string interpolation). ``namespace``
+        narrows to items carrying that ``items.namespace`` label the same way;
+        both compose when given together.
         """
         # A legacy database still holds the pre-CJK-segmentation term
         # representation. Migrating it is a reader's job, not the constructor's,
@@ -289,6 +343,11 @@ class HybridRetriever:
                 " (SELECT sl.item_id FROM source_locations sl WHERE sl.source_id = ?))"
             )
             params.extend([source_id, source_id])
+        if namespace is not None:
+            # namespace lives directly on items (organisational label), so this
+            # is a plain column match -- no source_locations join.
+            sql += " AND i.namespace = ?"
+            params.append(namespace)
         sql += " ORDER BY fts.rank LIMIT ?"
         params.append(limit)
         try:
@@ -370,12 +429,18 @@ class HybridRetriever:
         return [(item_id, rank + 1) for rank, (item_id, _) in enumerate(sorted_items)]
 
     def _vector_search(
-        self, query: str, limit: int = 20, source_id: str | None = None
+        self,
+        query: str,
+        limit: int = 20,
+        source_id: str | None = None,
+        namespace: str | None = None,
     ) -> list[tuple[str, int]] | None:
         """Brute-force cosine similarity against stored embeddings. Returns None if no embedder.
 
         ``source_id`` narrows candidates to items of one source via a
-        parameterized WHERE clause (never string interpolation).
+        parameterized WHERE clause (never string interpolation). ``namespace``
+        narrows to items carrying that ``items.namespace`` label the same way;
+        both compose when given together.
         """
         if self.embedder is None:
             return None
@@ -384,14 +449,18 @@ class HybridRetriever:
         if not query_vec:
             return None
         sql = "SELECT id, embedding FROM items WHERE embedding IS NOT NULL AND status = 'active'"
-        params: tuple[str, ...] = ()
+        params: list[object] = []
         if source_id is not None:
             # Ownership OR location — same membership rule as _keyword_search.
             sql += (
                 " AND (source_id = ? OR id IN"
                 " (SELECT sl.item_id FROM source_locations sl WHERE sl.source_id = ?))"
             )
-            params = (source_id, source_id)
+            params.extend([source_id, source_id])
+        if namespace is not None:
+            # namespace lives directly on items — plain column match.
+            sql += " AND namespace = ?"
+            params.append(namespace)
         rows = self.store.db.execute(sql, params).fetchall()
 
         scored = []

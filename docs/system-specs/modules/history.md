@@ -217,12 +217,87 @@ no longer destroy older turns.
   `dashboard.tail_fork_enabled`; if the gate is off, a `direction="tail"`
   request falls back to a normal head-fork instead of erroring. The source
   slot's history file is untouched, so the head stays archived in the parent.
+- **Fork inherits `memory_mode`, and never loosens it**: an incognito or
+  temporary session forks like a persistent one, and the child is born with the
+  parent's mode -- passed to `get_or_create_slot` at creation so the child's
+  `dashboard:` key is registered restricted in the same step, never stamped on
+  afterwards. There is no `slot_not_persistent` refusal: one would buy no
+  privacy, for the reason the titling section below gives -- the parent's full
+  transcript is already in its session JSONL, and a fork copies transcript
+  while engaging neither guarantee the modes make (`is_restricted`,
+  `blocks_reads`). What a fork must not do is
+  produce a *persistent* child from a restricted parent -- that would hand
+  no-write content to consolidation -- so the request body carries no
+  `memory_mode` and the parent's value is the only source. A temporary child
+  still receives its copied turns: `build_session_context` assembles the
+  thread-history block before any `blocks_reads` gate. The response and the
+  `chat.slot_fork` audit event both report the inherited mode. The inherited
+  value is validated against `VALID_MEMORY_MODES` before the child is
+  allocated: rehydration copies the transcript header's `memory_mode` onto the
+  slot as written, so a hand-edited or partially written header can leave a
+  value outside the allowlist on a live parent, and passing it through would
+  raise out of the slot constructor as a 500. The fork instead answers 409
+  `fork_source_memory_mode_invalid` (SEL `denied`), and no child exists.
 - **Concurrency**: `_flush_dirty_slots` runs the save in an executor thread while
   `_run_chat` mutates `slot.messages` on the event loop. `slot._lock` is an
   asyncio lock (unusable from the thread), so the save instead takes a
   consistent snapshot: it reads `_disk_older_count`, snapshots
   `list(slot.messages)`, and re-checks `_disk_older_count` (bounded retry) so a
   concurrent trim cannot interleave with the read-serialize-write.
+- **Explicit-snapshot pairing (`expected_disk_older_count`)**: a caller that
+  freezes its own `messages` snapshot on the loop and then awaits the save cannot
+  use that retry — the snapshot is already frozen, and the counter the worker
+  reads belongs to a later moment. A trim at the window cap in that gap credits
+  the trimmed rows to `_disk_older_count`, so the write emits them twice: once in
+  the frozen prefix it now claims, once at the head of the still-frozen snapshot.
+  Such a caller passes the counter it observed in the SAME synchronous stretch as
+  the snapshot; the save refuses on drift (returns `False`, writes nothing) and
+  the caller answers its retryable refusal. The rewind boundary transaction does
+  this and re-adopts the same boundary at its commit, since the commit puts the
+  pre-trim window prefix back, together with `_disk_older_durable_count`, which
+  the trim advances beside the boundary — leaving either advanced counts a row as
+  having left the window front while it is back inside it. A trim landing after
+  the worker read the boundary cannot be refused (the correct file is already
+  written), so both are corrected at the commit instead. Neither is stamped by
+  the save, so the pre-await values are the file's truth in every interleaving.
+  Any other caller that freezes a snapshot across an await owes the same pairing;
+  `save_slot_off_loop` does not forward the parameter yet, so a boundary
+  transaction routed through it still reads the live counter in the worker.
+- **`_disk_window_len` is deliberately left possibly SHORT after such a trim, and
+  the direction is the whole argument.** The save stamps it *absolutely*, so a
+  trim landing BEFORE the stamp has its decrement erased while one landing after
+  it does not — and the commit cannot distinguish the two without the count the
+  save actually wrote, which is not `len(snapshot)` either (a note row authorized
+  elsewhere is filtered out of the write, so the snapshot can be longer than the
+  file's window region). Over-claiming is the harmful direction: a later trim then
+  credits rows to the frozen prefix that the file does not hold, and the next save
+  re-emits window rows. Under-claiming costs no rows — it under-credits the prefix,
+  warns about rows that are in fact on disk, and drops the following save onto a
+  whole-file re-read, while the foreign-append merge below preserves the on-disk
+  window line the memory window has dropped. Making it exact wants the save to
+  publish its whole witness set as ONE routing-keyed record, which is also what
+  the stamping race above wants. `_frozen_prefix_cache`, the trim's last casualty,
+  needs nothing: the trim sets it to `None`, which only costs the next save a
+  re-read.
+- **Witness stamping is routing-gated**: the post-write bookkeeping
+  (`_pending_rewrite`, `_disk_window_len`, `_disk_meta_*`, `_frozen_prefix_cache`)
+  describes the file this save wrote, but it lives on the live slot, which the
+  event loop can rebind mid-write. The write stays correct (it lands on the
+  transcript authorized before it), so the save re-confirms
+  `slot_history_key(slot)` against the key it wrote and SKIPS the stamping when
+  they differ — stamping would clear a `_pending_rewrite` the new transcript still
+  owes and claim its unsaved rows as persisted. Every witness left at its pre-save
+  value is the conservative reading, so the next save re-reads the prefix,
+  re-takes the archive-safe path, and re-observes the file. The
+  `ConversationLog` cache invalidation is keyed on the file that WAS written and
+  stays unconditional. Everything the stamp needs (the post-write `stat`, the
+  carried-forward `created_at`) is computed BEFORE the re-check so the stamped
+  region is assignments only — a save runs in a worker thread, and a syscall
+  inside that region is the realistic point at which the loop gets to rebind
+  under a half-applied stamp. Full atomicity against the loop is not reachable
+  from the thread (`slot._lock` is an asyncio lock, and once the rebind path has
+  recomputed these for its own transcript no undo is right); it wants the five
+  fields collapsed into one assignable record carrying the key it describes.
 - **Cross-process lock (`_locked`)**: `_save_slot_to_history` holds the session's
   cross-process `_locked` (the SAME lock `append` / `append_off_loop` / rotate /
   rewrite / metadata edits take) across its metadata read, frozen-prefix read,
@@ -680,7 +755,28 @@ Possible `state` values:
 The stop event is inserted at soft-start time with `state: "stopping"` and
 updated in place (same `id`) when the outcome resolves. The updated message
 is re-broadcast via `_on_message` so the frontend `StopEventCard` transitions
-from `stopping` → `stopped`/`stop_failed_reset`.
+from `stopping` → `stopped`/`stop_failed_reset`. A press that finds an
+orphaned card from a prior attempt **in the same turn** (no turn-opening row —
+`user`/`nudge`/`subagent`, mirroring `TURN_OPENER_ROLES` in
+`groupDisplayItems.ts` — after it) RE-ARMS that row in place (same `id`, back to `stopping`) instead of
+resolving it and appending a fresh row — the pane upserts stop cards by
+`meta.id`, so a resolve-plus-append put two chips on screen for one press
+(`_open_stop_event_card` in `chat_handlers.py`, shared by `/stop` and
+`/interrupt`). A cross-turn orphan is settled where it lies and the press's
+card is appended fresh, so the chip lands in the turn the user stopped.
+Because reuse makes card ids non-unique across presses, per-attempt identity
+for the resolver callbacks is carried by the monotonic
+`slot._stop_generation`, not by the card id.
+
+Stop rows are presentation, not conversation: the tail-preview reader
+(`TranscriptReadProjection.last_message_info`, which feeds the Crew Members
+roster subtitle and the session-list preview) skips rows matched by
+`is_stop_event_row` so a transcript ending on a stop never previews the raw
+JSON payload. The skip moves only the preview TEXT: the returned epoch reads
+the newest skipped STOP row (a stop is activity), falling back to the
+previewed row's own timestamp — every other non-previewable row (a quiet
+zero-width-space reply, an empty content row) leaves the timestamp travelling
+with the previewed row, so roster recency ordering is unaffected.
 
 After a cancelled turn, `context.build_cancelled_turn_preamble` reads the
 cancelled user prompt and partial assistant output from this log and

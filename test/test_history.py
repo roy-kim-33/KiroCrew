@@ -1472,6 +1472,70 @@ class TestForgeReferenceSearch:
         assert sorted(n.text for n in needles if n.required) == ["#4411", "4411"]
         assert [n for n in needles if not n.required] == []
 
+    @pytest.mark.parametrize("query", ["4411 !4411", "!4411 4411"])
+    def test_a_cross_family_repeat_does_not_score_a_required_spelling(self, query):
+        """"4411 !4411" gates the GitLab family; the hint must not re-score it.
+
+        The bare number's ranking hint is keyed on the GitHub spelling, so the
+        by-key sweep leaves it alone — but its alts carry BOTH families, and the
+        GitLab ones are exactly what the sigil made required. Every required
+        spelling (keys and the alts required needles carry) must be purged from
+        the hint, in either token order; the hint still ranks on the GitHub
+        spellings that survive.
+        """
+        needles, _, _ = history.parse_search_query(query)
+
+        required_spellings = {
+            s for n in needles if n.required for s in (n.text, *n.alts)
+        }
+        hints = [n for n in needles if not n.required]
+        assert hints, "the hint must survive on its remaining family"
+        for hint in hints:
+            assert not ({hint.text, *hint.alts} & required_spellings)
+        # The surviving hint still carries the OTHER family's spellings, at the
+        # forge weight, digit-bounded, and NOT as adjacency evidence — the
+        # rebuild must preserve the flags, not only the spellings.
+        assert any("#4411" in (n.text, *n.alts) for n in hints)
+        for hint in hints:
+            assert hint.weight == history_search._FORGE_REF_WEIGHT
+            assert hint.digit_bounded and not hint.adjacency
+
+    def test_a_provider_that_gates_every_hint_spelling_drops_the_hint(self, monkeypatch):
+        """A hint left with NO spelling of its own contributes nothing and goes.
+
+        Built-in spellings alone cannot empty a hint — its canonical form is
+        only ever a required KEY, which the by-key sweep already removes — but
+        a registered provider's alts can blanket the remainder. The purge must
+        drop the whole entry rather than emit a needle with zero effective
+        spellings.
+        """
+        gh = history_search._forge_spellings(history_search._ForgeRef("4411", False, None))
+        mr = history_search._forge_spellings(history_search._ForgeRef("4411", True, None))
+        spellings = {
+            "acme-a4411": (gh[0], *gh[1]),
+            "acme-b4411": (mr[0], *mr[1]),
+        }
+        monkeypatch.setattr(
+            history_search,
+            "_search_ref_resolver",
+            lambda token: (token, spellings[token]) if token in spellings else None,
+        )
+
+        needles, _, _ = history.parse_search_query("acme-a4411 acme-b4411 4411")
+
+        assert [n for n in needles if not n.required] == []
+        # The bare number still gates as a plain literal term.
+        assert any(n.required and n.text == "4411" for n in needles)
+
+    def test_a_single_form_query_keeps_its_ranking_hint(self):
+        """The purge must not touch a hint whose item was named only once."""
+        needles, _, _ = history.parse_search_query("4411")
+
+        hints = [n for n in needles if not n.required]
+        assert len(hints) == 1
+        assert "#4411" in (hints[0].text, *hints[0].alts)
+        assert "!4411" in (hints[0].text, *hints[0].alts)
+
     def test_a_glued_mr_token_is_the_gitlab_family(self):
         """The glued form carries no sigil, so its WORD names the family."""
         assert self._needle("mr-12").text == "!12"
@@ -5416,10 +5480,17 @@ class TestConsolidationValueGuard:
         assert store.get_semantic("project.beta.status") is None
 
     def test_well_formed_item_still_overwrites(self, tmp_path) -> None:
-        """Negative control: the harness above can detect a clobber when one happens."""
+        """Negative control: the harness above can detect a clobber when one happens.
+
+        The seeded row is a lower-confidence *consolidation* row rather than a
+        ``user_explicit`` one, because consolidation is never allowed to overwrite
+        ``user_explicit`` (see ``TestConsolidationDoesNotImpersonateUser``) — seeding one
+        here would make this control pass for the wrong reason and stop detecting clobbers.
+        """
         store = self._store(tmp_path)
         assert (
-            store.set_semantic("project.alpha.status", "curated text", 1.0, "user_explicit") is None
+            store.set_semantic("project.alpha.status", "curated text", 0.85, "consolidation:sess-0")
+            is None
         )
         c = self._consolidator(store)
 
@@ -5467,3 +5538,60 @@ class TestConsolidationValueGuard:
         ), "the cause was not read from the reject code"
         assert not any("value_empty" in m for m in msgs), "a non-empty value reported value_empty"
         assert any("0 skipped (no value), 1 refused" in m for m in msgs)
+
+
+class TestConsolidationDoesNotImpersonateUser:
+    """Consolidation writes under its own source, never under ``user_explicit``."""
+
+    @staticmethod
+    def _consolidator(store):
+        memory = MagicMock()
+        memory.read_preferences.return_value = ""
+        memory.read_projects.return_value = ""
+        return HistoryConsolidator(
+            log=MagicMock(),
+            memory=memory,
+            sessions=None,
+            vector_store=store,
+            migrated=True,
+        )
+
+    def _store(self, tmp_path):
+        from kiro_crew.vector_memory import VectorMemoryStore
+
+        store = VectorMemoryStore(db_path=tmp_path / "mem.db")
+        store.init()
+        return store
+
+    def test_confident_item_does_not_overwrite_a_user_explicit_row(self, tmp_path) -> None:
+        """A re-summarization at confidence 1.0 must lose the ``user_explicit`` conflict path."""
+        store = self._store(tmp_path)
+        assert (
+            store.set_semantic("project.alpha.status", "curated text", 1.0, "user_explicit") is None
+        )
+        c = self._consolidator(store)
+
+        c._write_structured_memory(
+            {"semantic": [{"key": "project.alpha.status", "value": "shrunk", "confidence": 1.0}]},
+            "sess-1",
+        )
+
+        row = store.get_semantic("project.alpha.status")
+        assert row["value_json"] == json.dumps("curated text")
+        assert row["source"] == "user_explicit"
+
+    def test_confident_item_still_creates_a_new_key_under_consolidation_source(
+        self, tmp_path
+    ) -> None:
+        """Demoting the source must not stop consolidation from writing its own keys."""
+        store = self._store(tmp_path)
+        c = self._consolidator(store)
+
+        c._write_structured_memory(
+            {"semantic": [{"key": "project.beta.status", "value": "fresh", "confidence": 1.0}]},
+            "sess-1",
+        )
+
+        row = store.get_semantic("project.beta.status")
+        assert row["value_json"] == json.dumps("fresh")
+        assert row["source"] == "consolidation:sess-1"

@@ -2031,7 +2031,7 @@ class TestCleanupStaleSandboxProfiles:
 
         with patch("kiro_crew.sandbox.config_dir", return_value=tmp_path / ".kirocrew"):
             with patch("kiro_crew.sandbox.platform_compat.pid_exists", return_value=False):
-                removed = cleanup_stale_sandbox_profiles(legacy_dir=str(tmp_path / "nonexistent"))
+                removed = cleanup_stale_sandbox_profiles(legacy_dir=str(tmp_path / "nonexistent"), data_home=sandbox_mod.config_dir())
 
         assert not stale_file.exists()
         assert removed == 1
@@ -2053,13 +2053,13 @@ class TestCleanupStaleSandboxProfiles:
         (holder / "kiro-cli").write_bytes(b"orphaned copy")
 
         with patch("kiro_crew.sandbox.config_dir", return_value=home):
-            removed = cleanup_stale_sandbox_profiles(legacy_dir=str(tmp_path / "nonexistent"))
+            removed = cleanup_stale_sandbox_profiles(legacy_dir=str(tmp_path / "nonexistent"), data_home=sandbox_mod.config_dir())
 
         assert not (home / "run" / "kiro-cli-snapshots").exists()
         assert removed == 1
         # The rest of run/ is untouched, and a second pass is a no-op.
         with patch("kiro_crew.sandbox.config_dir", return_value=home):
-            assert cleanup_stale_sandbox_profiles(legacy_dir=str(tmp_path / "nonexistent")) == 0
+            assert cleanup_stale_sandbox_profiles(legacy_dir=str(tmp_path / "nonexistent"), data_home=sandbox_mod.config_dir()) == 0
 
     def test_preserves_live_pid_profile(self, tmp_path):
         """Profile file whose PID is alive (current process) is preserved."""
@@ -2071,7 +2071,7 @@ class TestCleanupStaleSandboxProfiles:
         live_file.write_text("(version 1)")
 
         with patch("kiro_crew.sandbox.config_dir", return_value=tmp_path / ".kirocrew"):
-            removed = cleanup_stale_sandbox_profiles(legacy_dir=str(tmp_path / "nonexistent"))
+            removed = cleanup_stale_sandbox_profiles(legacy_dir=str(tmp_path / "nonexistent"), data_home=sandbox_mod.config_dir())
 
         assert live_file.exists()
         assert removed == 0
@@ -2086,7 +2086,7 @@ class TestCleanupStaleSandboxProfiles:
         other_file.write_text("keep me")
 
         with patch("kiro_crew.sandbox.config_dir", return_value=tmp_path / ".kirocrew"):
-            removed = cleanup_stale_sandbox_profiles(legacy_dir=str(tmp_path / "nonexistent"))
+            removed = cleanup_stale_sandbox_profiles(legacy_dir=str(tmp_path / "nonexistent"), data_home=sandbox_mod.config_dir())
 
         assert other_file.exists()
         assert removed == 0
@@ -2470,10 +2470,15 @@ class TestCgroupScopeArgv:
             assert sb._default_max_memory_mb() == sb._CGROUP_FALLBACK_MAX_MEMORY_MB
 
     @pytest.mark.skipif(sys.platform != "linux", reason="cgroup v2 scope enforcement is Linux-only")
+    @pytest.mark.usefixtures("real_user_session")
     def test_real_pids_max_enforced_when_available(self):
         """If this host actually has cgroup delegation, the scope must ENFORCE
         pids.max — a child under a tiny TasksMax cannot fork past it. Skips
-        cleanly where delegation is unavailable (the probe returns False)."""
+        cleanly where delegation is unavailable (the probe returns False).
+
+        The floor runs the suite without a systemd user session, so this is the
+        one test that opts back in (``real_user_session``), and that fixture stops
+        the transient slice the real ``systemd-run`` creates."""
         import kiro_crew.sandbox as sb
 
         self._reset_probe()
@@ -3195,13 +3200,16 @@ class TestKiroInternalSandboxExclusion:
         mock_ns.assert_called_once()
 
     def test_windows_explicit_kiro_backend_delegates_before_backend_probe(self, monkeypatch):
-        """Windows delegates only when the Kiro sandbox it delegates TO is on."""
+        """Fresh Windows installs use the positively identified Kiro sandbox."""
         monkeypatch.setattr("kiro_crew.sandbox.sys.platform", "win32")
         launch = r"C:\Program Files\Kiro\kiro-cli.exe"
         with (
             patch("kiro_crew.sel.sel", return_value=MagicMock()),
             patch("kiro_crew.sandbox.detect_backend") as mock_detect,
-            patch("kiro_crew.sandbox.kiro_internal_sandbox_enabled", return_value=True) as mock_cap,
+            patch(
+                "kiro_crew.sandbox.kiro_internal_sandbox_enabled",
+                side_effect=AssertionError("Windows delegation must not depend on macOS settings"),
+            ),
         ):
             argv, cleanup = wrap_argv(
                 [launch, "acp"],
@@ -3212,51 +3220,6 @@ class TestKiroInternalSandboxExclusion:
         assert argv == [launch, "acp"]
         assert cleanup is None
         mock_detect.assert_not_called()
-        # The capability is CONSULTED, not assumed: the unwrapped argv above is
-        # only safe because the layer it defers to actually exists.
-        mock_cap.assert_called()
-
-    def test_windows_kiro_sandbox_disabled_fails_closed(self, monkeypatch):
-        """Classification alone cannot buy the Windows delegation.
-
-        A classified Kiro spawn on a host whose internal sandbox is OFF has no
-        isolation layer to delegate to, so it must fall through to the normal
-        no-backend policy and fail closed — not return an unwrapped argv while
-        the audit trail claims a delegated sandbox.
-        """
-        monkeypatch.setattr("kiro_crew.sandbox.sys.platform", "win32")
-        monkeypatch.setattr("kiro_crew.sandbox._allow_unsandboxed_exec", lambda: False)
-        with (
-            patch("kiro_crew.sandbox.kiro_internal_sandbox_enabled", return_value=False),
-            patch("kiro_crew.sandbox.detect_backend", return_value="none") as mock_detect,
-            patch("kiro_crew.sel.sel", return_value=MagicMock()),
-            pytest.raises(sandbox_mod.SandboxUnavailableError),
-        ):
-            wrap_argv(
-                [r"C:\Program Files\Kiro\kiro-cli.exe", "acp"],
-                mode="auto",
-                is_kiro_cli=True,
-            )
-        # Fall-through reached the ordinary backend decision rather than
-        # short-circuiting into the delegation.
-        mock_detect.assert_called_once_with(config_mode="auto")
-
-    def test_windows_kiro_sandbox_disabled_honours_explicit_opt_in(self, monkeypatch):
-        """The fall-through is the NORMAL path, opt-in included — not a crash."""
-        monkeypatch.setattr("kiro_crew.sandbox.sys.platform", "win32")
-        monkeypatch.setattr("kiro_crew.sandbox._allow_unsandboxed_exec", lambda: True)
-        launch = r"C:\Program Files\Kiro\kiro-cli.exe"
-        with (
-            patch("kiro_crew.sandbox.kiro_internal_sandbox_enabled", return_value=False),
-            patch("kiro_crew.sandbox.detect_backend", return_value="none") as mock_detect,
-            patch("kiro_crew.sel.sel", return_value=MagicMock()),
-        ):
-            argv, cleanup = wrap_argv([launch, "acp"], mode="auto", is_kiro_cli=True)
-        assert argv[-2:] == [launch, "acp"]
-        assert cleanup is None
-        # Distinguishes the opted-in FALL-THROUGH from the delegation, which
-        # returns the same argv but short-circuits before any backend decision.
-        mock_detect.assert_called_once_with(config_mode="auto")
 
     @pytest.mark.parametrize("classification", [None, False])
     def test_windows_nonclassified_spawn_still_fails_closed(self, monkeypatch, classification):
