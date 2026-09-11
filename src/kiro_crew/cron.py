@@ -32,9 +32,9 @@ import time
 import uuid
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, Iterator
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Iterator, NamedTuple
 from zoneinfo import ZoneInfo
 
 if TYPE_CHECKING:
@@ -83,7 +83,10 @@ _CRON_STRING_FIELD_CAPS: tuple[tuple[str, int], ...] = (
     ("channel", CHANNEL_MAX_LEN),
     ("thread_ts", 30),
     ("agent_id", MAX_SHORT_STRING),
+    ("member_id", MAX_SHORT_STRING),
     ("created_by", MAX_SHORT_STRING),
+    ("source_preset", MAX_SHORT_STRING),
+    ("source_template_prompt", MAX_CRON_MESSAGE),
     ("folder_id", MAX_SHORT_STRING),
     ("session_key", MAX_SHORT_STRING),
     ("model", MAX_SHORT_STRING),
@@ -622,9 +625,39 @@ class CronJob:
     failure_recorded: bool = False
     context_enabled: bool = False
     agent_id: str = ""
+    # Member identity is distinct from the provider template in agent_id.
+    # These fields survive reload; omitted legacy records remain on V1.
+    member_id: str = ""
+    memory_store: str = ""
     approval_mode: str = ""  # "" (default/hook-based) | "auto" (auto-approve all tools)
     acked_items: list[str] = field(default_factory=list)
     created_by: str = ""  # Slack user ID of the creator (for DM fallback)
+    # Provenance of a job seeded from a Schedule-page template. Curated
+    # template prompts are COPIED into the job at save time (the user owns and
+    # edits their prompt), so a later fix to a template is unreachable for jobs
+    # already saved. Two create-only fields, written together by the dashboard
+    # create path ONLY (MCP / CLI / apps SDK / onboarding import never involve a
+    # template and leave both ""):
+    #
+    #   source_preset          -- the template preset id (e.g. "error-digest").
+    #   source_template_prompt -- the template's prompt text AS IT WAS at save
+    #                             time (a snapshot, written once, never updated).
+    #
+    # The snapshot is what makes "the template changed" an ATTRIBUTABLE claim.
+    # Comparing the job's live message against the template's CURRENT prompt is
+    # symmetric: it cannot tell a template that moved from a user who edited
+    # their own copy. The snapshot fixes one operand at save time, so the
+    # Schedule page can ask the two questions separately -- did the TEMPLATE
+    # move (snapshot != live preset prompt), which is the only thing that shows
+    # a "template updated" hint, versus did the USER edit their copy
+    # (message != snapshot), which shows nothing. It is a text snapshot, not a
+    # maintained revision integer, so it cannot drift out of date.
+    #
+    # "" for both means "unknown" -- a blank/non-dashboard create, or a job
+    # saved before these fields existed (_job_from_record defaults both to "").
+    # Such a job simply never shows the hint.
+    source_preset: str = ""
+    source_template_prompt: str = ""
     silent: bool = False  # suppress auto-delivery; agent sends via send_message
     session_key: str = ""  # session that created this job (for scoped removal)
     last_posted_hash: str = ""  # hash of last result posted to Slack (dedup)
@@ -1005,6 +1038,122 @@ def is_valid_skip_date(value: object) -> bool:
         return False
 
 
+_CRON_FOLDERS_FILE = "cron_folders.json"
+
+
+def _read_cron_folders() -> tuple[list[dict[str, Any]], bool]:
+    """Read ``cron_folders.json``, reporting whether the STORE was readable.
+
+    Returns ``(folders, readable)``. ``readable=False`` means the file exists
+    but could not be read or is not a JSON list — the folder set is UNKNOWN,
+    not empty. A caller that can create a folder must tell those apart: acting
+    on an unknown set as if it were empty creates a folder the store may
+    already hold, and the dashboard's next wholesale save of its own list
+    decides which version survives. A file that does not exist is readable and
+    genuinely empty; malformed ENTRIES inside a valid list are filtered out and
+    leave the store readable, because the list itself was intelligible.
+    """
+    path = config_dir() / _CRON_FOLDERS_FILE
+    try:
+        if not path.exists():
+            return [], True
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        logger.warning("Failed to read %s", _CRON_FOLDERS_FILE, exc_info=True)
+        return [], False
+    if not isinstance(loaded, list):
+        logger.warning("%s is not a JSON list", _CRON_FOLDERS_FILE)
+        return [], False
+    return [
+        f
+        for f in loaded
+        if isinstance(f, dict)
+        and isinstance(f.get("id"), str)
+        and f.get("id")
+        and isinstance(f.get("name"), str)
+        and f.get("name")
+    ], True
+
+
+def load_cron_folders() -> list[dict[str, Any]]:
+    """Read the cron folder definitions from disk (read-only).
+
+    Returns the usable entries of ``cron_folders.json`` — dicts with a
+    non-empty string ``id`` and ``name``. The file is OWNED by the dashboard
+    (its Schedule page creates, renames and deletes folders); this helper never
+    writes, so a non-dashboard caller can resolve a folder reference without
+    racing the dashboard's wholesale rewrites of the file. Malformed entries
+    and unreadable files degrade to "no folders" rather than raising: a folder
+    lookup is always best-effort decoration on top of the job itself. A caller
+    that CREATES folders must use ``_read_cron_folders`` instead, whose second
+    element separates an unreadable store from a genuinely empty one.
+    """
+    return _read_cron_folders()[0]
+
+
+class CronFolderLookup(NamedTuple):
+    """Outcome of resolving a cron-folder reference against existing folders.
+
+    ``missing`` distinguishes the three outcomes a caller must treat
+    differently. A reference that matched nothing in a READABLE store
+    (``missing=True``) may legitimately be turned into a create by a caller
+    that owns a create path. Every other error is a refusal no caller may paper
+    over: an ambiguous name, and — the case that is easy to miss — a store that
+    could not be read at all, where the folder set is unknown rather than
+    empty. Without that flag the only signal is the message text, and matching
+    on prose is how a create leg silently starts firing on an ambiguity or on a
+    corrupt file.
+    """
+
+    folder_id: str
+    error: str | None
+    missing: bool = False
+
+
+def lookup_cron_folder_id(ref: str) -> CronFolderLookup:
+    """Resolve an EXISTING cron folder reference (id or name) to its id.
+
+    An empty ``ref`` resolves to ``""`` (ungrouped) with no error. Matching
+    order: exact id first, then case-insensitive name. A name shared by several
+    folders is refused rather than resolved to an arbitrary one, and an unknown
+    reference is an error with ``missing=True`` — creating folders is the
+    dashboard's job (its state holds the canonical in-memory list and rewrites
+    the file wholesale, so an out-of-band append here could be silently
+    clobbered by the next UI folder operation). A caller that DOES own a
+    server-side create path (the MCP tool, via the dashboard's own endpoint)
+    keys off ``missing`` to take it.
+
+    An UNREADABLE store is an error with ``missing=False``: the folder set is
+    unknown, so the reference may well exist, and creating it would add a
+    duplicate whose survival is decided by the dashboard's next save.
+    """
+    ref = str(ref or "").strip()
+    if not ref:
+        return CronFolderLookup("", None)
+    folders, readable = _read_cron_folders()
+    if not readable:
+        return CronFolderLookup(
+            "",
+            f"cron folder store is unreadable, cannot resolve {ref!r} — "
+            f"repair or remove {_CRON_FOLDERS_FILE}",
+        )
+    if any(f["id"] == ref for f in folders):
+        return CronFolderLookup(ref, None)
+    matches = [f for f in folders if f["name"].strip().lower() == ref.lower()]
+    if len(matches) > 1:
+        ids = ", ".join(f["id"] for f in matches)
+        return CronFolderLookup(
+            "", f"{len(matches)} cron folders are named {ref!r} ({ids}) — pass the folder id"
+        )
+    if matches:
+        return CronFolderLookup(matches[0]["id"], None)
+    return CronFolderLookup(
+        "",
+        f"cron folder not found: {ref!r} — create it first in the dashboard's Schedule page",
+        missing=True,
+    )
+
+
 def get_local_tz() -> tuple[str, ZoneInfo]:
     """Return (tz_name, ZoneInfo) from the published config default, or UTC.
 
@@ -1024,6 +1173,78 @@ def get_local_tz() -> tuple[str, ZoneInfo]:
             exc_info=True,
         )
         return "UTC", ZoneInfo("UTC")
+
+
+# Patterns for parse_time_string
+_RE_IN_DURATION = re.compile(
+    r"^in\s+(\d+)\s*(s|sec|second|seconds|m|min|minute|minutes|h|hr|hour|hours)$", re.I
+)
+_UNIT_SECS = {
+    "s": 1,
+    "sec": 1,
+    "second": 1,
+    "seconds": 1,
+    "m": 60,
+    "min": 60,
+    "minute": 60,
+    "minutes": 60,
+    "h": 3600,
+    "hr": 3600,
+    "hour": 3600,
+    "hours": 3600,
+}
+
+
+def parse_time_string(s: str) -> float | str:
+    """Parse a human time string into a Unix timestamp. Returns error string on failure.
+
+    Lives here, next to :func:`get_local_tz`, because BOTH one-shot entry points
+    need it: the ``cron_add`` MCP tool and ``POST /api/crons``. A second copy
+    would let the two drift, and "5pm" resolving to different instants depending
+    on which door the request came through is exactly the class of bug a shared
+    parser prevents. Relative forms ("in 30 minutes") are absolute already;
+    everything else is interpreted in the CONFIGURED timezone, never the
+    process's, so a gateway running in UTC still honours the user's setting.
+    """
+    s = s.strip()
+    _, tz = get_local_tz()
+    now = datetime.now(tz)
+
+    # "in 5 minutes", "in 2 hours"
+    m = _RE_IN_DURATION.match(s)
+    if m:
+        secs = int(m.group(1)) * _UNIT_SECS[m.group(2).lower()]
+        return time.time() + secs
+
+    # Try common formats with optional "tomorrow"
+    tomorrow = False
+    text = s
+    if text.lower().startswith("tomorrow"):
+        tomorrow = True
+        text = re.sub(r"^at\b\s*", "", text[8:].strip())
+
+    # "5pm", "5:30pm", "17:00", "9:30am"
+    for fmt in ("%I%p", "%I:%M%p", "%H:%M", "%I %p", "%I:%M %p"):
+        try:
+            parsed = datetime.strptime(text, fmt)
+            result = now.replace(hour=parsed.hour, minute=parsed.minute, second=0, microsecond=0)
+            if tomorrow:
+                result += timedelta(days=1)
+            elif result <= now:
+                result += timedelta(days=1)  # "5pm" when it's already 6pm → tomorrow
+            return result.timestamp()
+        except ValueError:
+            continue
+
+    # ISO-ish: "YYYY-MM-DD HH:MM", space or "T" separator, seconds optional
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            parsed = datetime.strptime(text, fmt).replace(tzinfo=now.tzinfo)
+            return parsed.timestamp()
+        except ValueError:
+            continue
+
+    return f"Error: could not parse time '{s}'. Examples: '5pm', 'in 30 minutes', 'tomorrow 9am'"
 
 
 def _job_tz(job: CronJob) -> ZoneInfo:
@@ -1241,6 +1462,128 @@ def enabled_count_from_disk(path: Path) -> tuple[int, bool]:
     return (count, loadable)
 
 
+def _str_or_empty(value: Any) -> str:
+    """Return *value* when it is a string, else ``""``.
+
+    ``crons.json`` is hand-editable, so a record may carry a non-string where a
+    string is expected. A stored value that is not a string degrades to ``""``
+    (the field's "unset" value) rather than flowing into a consumer that calls
+    string methods on it -- the redacting serializer on ``GET /api/crons`` would
+    otherwise raise on ``.strip()``/regex and 500 the whole listing.
+    """
+    return value if isinstance(value, str) else ""
+
+
+def resolve_cron_memory(job: CronJob, *, validate_memory_files: bool = True) -> tuple[str, str]:
+    """Resolve the durable member identity without changing legacy V1 jobs.
+
+    The provider template never identifies a member. A newly-created job may
+    inherit its creator's recorded store; after first persistence its own
+    binding is authoritative even when the originating chat has been closed.
+    """
+    from kiro_crew.config.loader import KiroCrewConfig, resolve_agent_bindings
+    from kiro_crew.memory_stores import require_memory_store
+
+    if not isinstance(job.member_id, str) or not isinstance(job.memory_store, str):
+        raise ValueError("memory_unavailable: scheduled memory identity is malformed")
+    if job.member_id:
+        cfg = KiroCrewConfig.load()
+        if job.member_id not in cfg.agents or job.member_id == "default":
+            raise ValueError(f"memory_unavailable: unknown Crew Member '{job.member_id}'")
+        bindings = resolve_agent_bindings(
+            cfg, job.member_id, validate_memory_files=validate_memory_files
+        )
+        if job.memory_store and job.memory_store != bindings.memory_store_name:
+            raise ValueError("memory_unavailable: scheduled member's memory binding changed")
+        store, agent = bindings.memory_store_name, job.agent_id or bindings.kiro_agent
+    elif job.memory_store:
+        store = require_memory_store(job.memory_store, require_directory=validate_memory_files)
+        agent = job.agent_id
+    else:
+        store, agent = "", job.agent_id
+    # Deterministic runners lack the member provider's protected runtime identity.
+    # Reject before persistence and again before dispatch, including imported jobs.
+    if (job.command or job.script) and store:
+        record = KiroCrewConfig.load().memory_stores.get(store)
+        if record and record.memory_version == 2:
+            raise ValueError(
+                "memory_unavailable: private Crew Member schedules require an agent task; "
+                "command and script jobs cannot use member memory"
+            )
+    return store, agent
+
+
+def bind_cron_memory(job: CronJob) -> None:
+    """Pin a new schedule to its creator or explicitly selected member."""
+    creator_store = ""
+    creator_cfg = None
+    if job.session_key:
+        from kiro_crew.config.loader import KiroCrewConfig
+        from kiro_crew.history import ConversationLog
+        from kiro_crew.member_memory_auth import read_private_session_store
+        from kiro_crew.memory_stores import require_memory_store
+
+        creator_cfg = KiroCrewConfig.load()
+        if job.session_key.startswith("subagent:"):
+            from kiro_crew.subagent_persistence import read_run_memory_store
+
+            creator_store = read_run_memory_store(
+                job.session_key.removeprefix("subagent:"), validate_memory_files=False
+            )
+        else:
+            protected = read_private_session_store(job.session_key)
+            if protected is not None:
+                # Protected assignment remains readable inside a sandbox whose
+                # private DB and transcripts are hidden. Dispatch checks files.
+                creator_store = require_memory_store(
+                    protected, config=creator_cfg, require_directory=False
+                )
+            else:
+                meta, readable = ConversationLog().get_metadata_status(job.session_key)
+                if not readable:
+                    raise ValueError(
+                        "memory_unavailable: originating session metadata is unreadable"
+                    )
+                store = meta.get("memory_store", "")
+                if not isinstance(store, str):
+                    raise ValueError("memory_unavailable: invalid originating memory binding")
+                creator_store = (
+                    require_memory_store(store, config=creator_cfg, require_directory=False)
+                    if store not in ("", "default")
+                    else ""
+                )
+                # Scheduling may run inside a member sandbox where the private
+                # directory is intentionally hidden. Classify the declaration
+                # from the same validated config rather than reopening its
+                # ownership manifest; dispatch validates the files before use.
+                record = creator_cfg.memory_stores.get(creator_store)
+                if creator_store and record and record.memory_version == 2:
+                    raise ValueError(
+                        "memory_unavailable: private schedules require a trusted member assignment"
+                    )
+        if not job.member_id:
+            if job.memory_store and job.memory_store != creator_store:
+                raise ValueError(
+                    "memory_unavailable: a schedule cannot change its creator's memory"
+                )
+            job.memory_store = creator_store
+    if job.member_id or job.memory_store:
+        job.memory_store, _ = resolve_cron_memory(job, validate_memory_files=False)
+        if creator_store:
+            assert creator_cfg is not None
+            record = creator_cfg.memory_stores.get(creator_store)
+            if record and record.memory_version == 2 and job.memory_store != creator_store:
+                raise ValueError(
+                    "memory_unavailable: a Crew Member can schedule only its own private memory"
+                )
+        if not job.member_id and job.memory_store:
+            from kiro_crew.config.loader import KiroCrewConfig
+
+            cfg = creator_cfg or KiroCrewConfig.load()
+            store_cfg = cfg.memory_stores[job.memory_store]
+            job.member_id = store_cfg.owner_member
+
+
 def _job_from_record(j: dict[str, Any]) -> CronJob:
     """Build one :class:`CronJob` from its serialized record.
 
@@ -1295,9 +1638,13 @@ def _job_from_record(j: dict[str, Any]) -> CronJob:
         last_result_stamp=j.get("last_result_stamp", ""),
         context_enabled=j.get("context_enabled", False),
         agent_id=j.get("agent_id", ""),
+        member_id=j.get("member_id", ""),
+        memory_store=j.get("memory_store", ""),
         approval_mode=j.get("approval_mode", ""),
         acked_items=j.get("acked_items", []),
         created_by=j.get("created_by", ""),
+        source_preset=_str_or_empty(j.get("source_preset")),
+        source_template_prompt=_str_or_empty(j.get("source_template_prompt")),
         silent=j.get("silent", False),
         session_key=j.get("session_key", ""),
         last_posted_hash=j.get("last_posted_hash", ""),
@@ -1388,6 +1735,15 @@ class CronService:
         self._executing: set[str] = set()  # job IDs currently running
         self._running_tasks: dict[str, asyncio.Task[None]] = {}  # strong refs to prevent GC
         self._job_start_times: dict[str, float] = {}  # job ID → epoch start
+        # job ID → time.monotonic() at start, kept in lockstep with
+        # _job_start_times and read ONLY by the reaper's deadline comparison.
+        # The primary guard (asyncio.wait_for in _execute_with_timeout) counts
+        # down on the loop's monotonic clock, so the backstop has to measure on
+        # the same clock or the two disagree whenever the wall clock jumps (host
+        # suspend, NTP step) and the backstop force-kills a run wait_for still
+        # considers healthy. The epoch map stays for human-facing timestamps
+        # (running_since, history, the "ran Ns" log).
+        self._job_start_monotonic: dict[str, float] = {}  # job ID → monotonic start
         self._reaped_jobs: set[str] = set()  # job IDs killed by the reaper
         self._cancelled_jobs: set[str] = set()  # job IDs cancelled by the user
         self._job_jitter: dict[str, float] = {}  # job ID → jitter seconds applied
@@ -1561,6 +1917,7 @@ class CronService:
         while True:
             await asyncio.sleep(_REAPER_INTERVAL)
             now = time.time()
+            now_mono = time.monotonic()
             # Snapshot the job list CACHE-ONLY — no store lock, no _sync, no
             # disk I/O on the loop (same rationale as list_jobs/get_job). The
             # batch-remove worker (remove_jobs → asyncio.to_thread) builds a
@@ -1573,6 +1930,18 @@ class CronService:
             jobs_by_id = {j.id: j for j in self._jobs}
             for job_id, started in list(self._job_start_times.items()):
                 elapsed = now - started
+                # DECIDE and REPORT on the monotonic clock. An entry with no
+                # monotonic stamp (a run already in flight across an upgrade, or
+                # a test that seeds only the epoch map) falls back to the
+                # wall-clock elapsed, so the backstop never stops reaping — it
+                # just cannot tell suspend time apart for that run.
+                #
+                # The reported duration is monotonic too, not wall-clock: a
+                # backward wall-clock step during a >=30-min run would otherwise
+                # render a negative "ran -Ns"/"Reaped after -Ns" in the log and
+                # the persisted history. Monotonic elapsed is equally legible
+                # ("seconds since start") and cannot go negative.
+                elapsed_mono = now_mono - self._job_start_monotonic.get(job_id, now_mono - elapsed)
                 job = jobs_by_id.get(job_id)
                 deadline = (
                     max(min(job.timeout_secs, 86400), _JOB_TIMEOUT_SECS)
@@ -1580,21 +1949,22 @@ class CronService:
                     else _JOB_TIMEOUT_SECS
                 ) + (_pool_queue_allowance(job) + _gate_budget_allowance(job) + _vet_allowance(job))
                 jitter_allowance = self._job_jitter.get(job_id, 0.0)
-                if elapsed <= deadline + jitter_allowance:
+                if elapsed_mono <= deadline + jitter_allowance:
                     continue
                 task = self._running_tasks.get(job_id)
                 if task and task.done():
                     # Normal timeout path already completed; just clean up tracking.
                     self._job_start_times.pop(job_id, None)
+                    self._job_start_monotonic.pop(job_id, None)
                     continue
                 logger.warning(
                     "Reaper: cron job %s exceeded %ds (ran %.0fs), force-killing",
                     job_id,
                     deadline,
-                    elapsed,
+                    elapsed_mono,
                 )
                 try:
-                    await self._force_reap(job_id, elapsed, deadline)
+                    await self._force_reap(job_id, elapsed_mono, deadline)
                 except Exception:
                     logger.exception("Reaper: failed to reap cron job %s", job_id)
 
@@ -1610,6 +1980,7 @@ class CronService:
         reap_started_at = meta[0] if meta else time.time() - elapsed
         reap_trigger = meta[1] if meta else "scheduled"
         self._job_start_times.pop(job_id, None)  # prevent repeated reaping
+        self._job_start_monotonic.pop(job_id, None)
         # Kill the session process first.
         if self._sessions:
             try:
@@ -1805,6 +2176,7 @@ class CronService:
         trigger = meta[1] if meta else "scheduled"
         elapsed = time.time() - started_at
         self._job_start_times.pop(job_id, None)
+        self._job_start_monotonic.pop(job_id, None)
         self._job_jitter.pop(job_id, None)
 
         job = next((j for j in self._jobs if j.id == job_id), None)
@@ -1890,7 +2262,13 @@ class CronService:
                     "job_id": job_id,
                     "session_key": session_key,
                     "elapsed": int(elapsed),
-                    "killed_subprocess": killed_proc,
+                    # Named for what the return now MEANS, not for what it used
+                    # to. kill_running_process returns True either because it
+                    # signalled a live child OR because it recorded the cancel
+                    # against a spawn still in flight, where there is no child to
+                    # signal yet. Auditing that second case as
+                    # "killed_subprocess" asserted a kill that never happened.
+                    "cancellation_accepted": killed_proc,
                 },
             )
         except Exception:
@@ -1913,6 +2291,7 @@ class CronService:
         approval_mode: str = "",
         enabled: bool = True,
         agent_id: str = "",
+        member_id: str = "",
         model: str = "",
         silent: bool = False,
         timezone: str = "",
@@ -1972,6 +2351,7 @@ class CronService:
             approval_mode=approval_mode,
             enabled=enabled,
             agent_id=agent_id,
+            member_id=member_id,
             model=model,
             silent=silent,
             timezone=timezone,
@@ -2047,6 +2427,7 @@ class CronService:
             self._sync_for_write()
             if any(predicate(existing) for existing in self._jobs):
                 return False
+            bind_cron_memory(job)
             self._jobs.append(job)
             self._save()
         return True
@@ -2065,6 +2446,7 @@ class CronService:
         approval_mode: str = "",
         enabled: bool = True,
         agent_id: str = "",
+        member_id: str = "",
         model: str = "",
         silent: bool = False,
         timezone: str = "",
@@ -2115,6 +2497,7 @@ class CronService:
                 "channel": channel,
                 "thread_ts": thread_ts,
                 "agent_id": agent_id,
+                "member_id": member_id,
                 "created_by": created_by,
                 "folder_id": folder_id,
                 "session_key": session_key,
@@ -2174,6 +2557,7 @@ class CronService:
             created_by=created_by,
             approval_mode=approval_mode,
             agent_id=agent_id,
+            member_id=member_id,
             model=str(model or "").strip(),
             silent=silent,
             timezone=timezone,
@@ -2202,6 +2586,7 @@ class CronService:
         """
         with self._file_lock():
             self._sync_for_write()
+            bind_cron_memory(job)
             self._jobs.append(job)
             self._save()
 
@@ -2219,6 +2604,7 @@ class CronService:
         approval_mode: str = "",
         enabled: bool = True,
         agent_id: str = "",
+        member_id: str = "",
         model: str = "",
         silent: bool = False,
         timezone: str = "",
@@ -2235,6 +2621,8 @@ class CronService:
         minimal_context: bool = False,
         timeout: int = 0,
         timeout_secs: int = 0,
+        source_preset: str = "",
+        source_template_prompt: str = "",
     ) -> CronJob:
         """Event-loop-safe :meth:`add_job`: the lock+save runs off the loop.
 
@@ -2266,6 +2654,7 @@ class CronService:
             approval_mode=approval_mode,
             enabled=enabled,
             agent_id=agent_id,
+            member_id=member_id,
             model=model,
             silent=silent,
             timezone=timezone,
@@ -2283,6 +2672,16 @@ class CronService:
             timeout=timeout,
             timeout_secs=timeout_secs,
         )
+        # Dashboard-only template provenance. Set on the freshly-built job
+        # BEFORE the off-loop persist -- the object has no other reference yet,
+        # so this is still a single fully-formed first save, not a
+        # build-then-mutate-then-second-save. Kept off _build_job because only
+        # this async path is ever called with them (the sync add_job, CLI, MCP
+        # and apps SDK never carry a template), so threading them through the
+        # shared constructor would be surface with no consumer.
+        if source_preset:
+            job.source_preset = source_preset
+            job.source_template_prompt = source_template_prompt
         await asyncio.to_thread(self._persist_add_locked, job)
         self._arm_timer()
         logger.info("Added cron job '%s' (%s)", name, job.id)
@@ -2342,6 +2741,8 @@ class CronService:
             for job in self._jobs:
                 if job.id != job_id:
                     continue
+                if "member_id" in kwargs and (kwargs["member_id"] or "") != job.member_id:
+                    raise ValueError("member memory is fixed for this schedule; create a new job")
                 if expect_pending is not None and job.secret_env_pending != expect_pending:
                     raise CronPendingMismatch("pending secret request changed")
                 if expect_pending_ts is not None and job.secret_env_pending_ts != expect_pending_ts:
@@ -2492,6 +2893,20 @@ class CronService:
                     job.agent_id = kwargs["agent_id"] or ""
                 if "channel" in kwargs:
                     job.channel = kwargs["channel"] or None
+                if "thread_ts" in kwargs:
+                    # Paired with ``channel``: together they decide WHERE a run's
+                    # output lands, and ``add_job`` has always accepted both. With
+                    # no branch here the field was validated (see the caps table)
+                    # and then dropped, so the caller was told "Updated" while the
+                    # cron kept replying in the old thread. Falsy clears, mirroring
+                    # ``channel`` and how mcp_cron normalizes blank to None.
+                    #
+                    # A granted script job re-threaded this way fails its NEXT run
+                    # closed: thread_ts is bound into the grant's delivery
+                    # fingerprint (cron_script.delivery_fingerprint), so the pin
+                    # stops verifying until the operator re-approves. That is the
+                    # intended fail-closed path, not a regression.
+                    job.thread_ts = kwargs["thread_ts"] or None
                 if "approval_mode" in kwargs:
                     job.approval_mode = kwargs["approval_mode"] or ""
                 if "silent" in kwargs:
@@ -3619,6 +4034,10 @@ class CronService:
         started_at = meta[0] if meta else time.time()
         trigger = meta[1] if meta else "scheduled"
         self._job_start_times[job.id] = started_at
+        # Stamped here rather than derived from started_at: the two clocks share
+        # no epoch, so the reaper's deadline is only meaningful against a stamp
+        # taken on its own clock.
+        self._job_start_monotonic[job.id] = time.monotonic()
         # One increment per execution, before the jitter sleep so a run cancelled
         # during jitter still counts as fired. ``kind`` is the dispatch shape --
         # ``script`` and ``command`` bypass the model entirely, so this is the
@@ -3710,6 +4129,7 @@ class CronService:
             except Exception:
                 logger.debug("in-flight marker not cleared for %s", job.id, exc_info=True)
             self._job_start_times.pop(job.id, None)
+            self._job_start_monotonic.pop(job.id, None)
             self._job_jitter.pop(job.id, None)
             self._job_run_meta.pop(job.id, None)
             reaped = job.id in self._reaped_jobs
@@ -4799,9 +5219,13 @@ class CronService:
                     "last_result_stamp": j.last_result_stamp,
                     "context_enabled": j.context_enabled,
                     "agent_id": j.agent_id,
+                    "member_id": j.member_id,
+                    "memory_store": j.memory_store,
                     "approval_mode": j.approval_mode,
                     "acked_items": j.acked_items,
                     "created_by": j.created_by,
+                    "source_preset": j.source_preset,
+                    "source_template_prompt": j.source_template_prompt,
                     "silent": j.silent,
                     "session_key": j.session_key,
                     "last_posted_hash": j.last_posted_hash,

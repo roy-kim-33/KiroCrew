@@ -25,6 +25,7 @@ from typing import Any
 
 import pytest
 
+from conftest import host_abs
 from kiro_crew import github_runner as runner
 from kiro_crew import platform_compat, windows_acl
 
@@ -514,7 +515,9 @@ class TestProviderOutputIsDecodedAsUtf8:
         monkeypatch.setattr(runner.subprocess, "run", _fake_run)
         monkeypatch.setattr(runner, "_audit_run", lambda *a, **k: None)
 
-        proc = runner.run_gh(["/usr/bin/gh", "api", "user"], timeout=5, audit_caller="test")
+        proc = runner.run_gh(
+            [host_abs("usr", "bin", "gh"), "api", "user"], timeout=5, audit_caller="test"
+        )
 
         assert "encoding" not in seen and seen.get("text") is not True, (
             "run_gh must capture BYTES and decode in its own frame; letting "
@@ -533,7 +536,9 @@ class TestProviderOutputIsDecodedAsUtf8:
         monkeypatch.setattr(runner, "_audit_run", lambda *a, **k: None)
 
         with pytest.raises(runner.SetupError) as caught:
-            runner.run_gh(["/usr/bin/gh", "api", "user"], timeout=5, audit_caller="test")
+            runner.run_gh(
+                [host_abs("usr", "bin", "gh"), "api", "user"], timeout=5, audit_caller="test"
+            )
 
         message = str(caught.value)
         assert "not valid UTF-8" in message
@@ -1032,8 +1037,8 @@ class TestApplyOwnerOnlyOffWindows:
     def test_the_volume_is_never_consulted_by_this_mechanism(self, monkeypatch) -> None:
         """The writer applies the DACL on ANY volume; the gate is not its job.
 
-        local=False would have refused while the gate lived here. It no longer
-        does: an on-loop caller has to ask before it starts (see
+        This mechanism does not consult the volume; an on-loop caller has to ask
+        before it starts (see
         :func:`windows_acl.volume_is_local`), because a refusal at this depth
         arrives after the caller already paid the cost it was avoiding.
         """

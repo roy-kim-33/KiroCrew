@@ -17,6 +17,29 @@ Supports multiple concurrent tasks, interactive tool approval, per-step session 
 
 ## Module Architecture
 
+Private member tasks receive a protected `taskrunner:<task_id>:runtime` binding
+at trusted creation. Planning, steps, review, retry, and failure-lesson sessions
+inherit that binding before provider allocation; editable task records and
+later changes to the originating chat cannot select another store. Private
+history uses the task ID and carries the same protected binding, so restart
+and consolidation retain the member. Failure lessons use the member's vector
+store and a private session. Existing unbound tasks retain Global V1 behavior.
+Missing or corrupt private identity refuses execution instead of widening it.
+
+Internal HTTP callers inherit only their verified session identity. Body fields
+such as `created_by`, `session_key`, or `memory_store` cannot select authority.
+Run routes check the canonical run binding, including display-name resolution;
+internal cancellation uses a canonical ID and cannot follow a colliding name.
+Private file-based start/planning requires inline text instead: the host must not
+read Global or peer transcripts on a member's behalf. Chat-supplied plans consume
+the supplied text and steps, not an arbitrary source transcript. Private task
+results enter a fresh bound chat before any transcript append or provider call.
+Shared planning cancellation remains an owner-dashboard action when private
+boundaries are active. The guard runs on `POST /api/taskrunner/plan/cancel`
+before the shared planning task can be cancelled. Global-only installations
+retain internal cancellation, and the separate refinement endpoint keeps its
+private-member refusal rather than inheriting the cancellation guard.
+
 The task runner is split into an orchestrator plus 4 focused helper modules under `src/kiro_crew/`:
 
 ```
@@ -305,7 +328,8 @@ Every resolved task in a parallel group is dispatched at once and an
 finished task is refilled immediately (`taskrunner.py`):
 
 ```python
-sem = asyncio.Semaphore(self._max_parallel_steps)
+max_parallel_steps = self._max_parallel_steps  # bound ONCE per execution
+sem = asyncio.Semaphore(max_parallel_steps)
 
 async def _run_bounded(t: Task) -> bool:
     async with sem:
@@ -317,8 +341,9 @@ results = await asyncio.gather(
 )
 ```
 
-The limit is `self._max_parallel_steps`, computed once in `__init__` as
-`min(taskrunner.max_parallel_steps, compute_max_subagents(cfg))`:
+The limit is `self._max_parallel_steps`, computed in `__init__` as
+`min(taskrunner.max_parallel_steps, compute_max_subagents(cfg))` and re-derived
+at every run entry (see *Live config* below):
 
 - `compute_max_subagents` is the **host-safe ceiling** (derived from
   `agent.subagent_auto_max`, clamped to host memory/CPU headroom). It exists to
@@ -329,6 +354,34 @@ The limit is `self._max_parallel_steps`, computed once in `__init__` as
   host-safe maximum. A test that asserts a specific concurrency **must** pin
   `compute_max_subagents`, or it measures the runner's hardware rather than the
   knob — a small CI runner computes 3.
+
+### Live config: `taskrunner.max_parallel_steps` / `taskrunner.workspace_dir`
+
+The gateway constructs one `TaskRunner` from these two fields, but neither is
+boot-only. `_refresh_from_config()` runs at the entry of `run()`, `plan()` and
+`execute_plan()`: it reads `live.snapshot()` (the watcher's last applied config,
+a plain attribute read) and re-applies the clamp above to the parallel cap and
+`_resolve_workspace_dir` (the same sensitive-path validation the constructor
+runs) to the workspace. So a write from any writer takes effect on the NEXT run
+without a restart. Before the watcher has primed there is no snapshot and the
+refresh is skipped -- a `load()` there would parse and validate the file on the
+event loop these entry points run on -- so the constructor's values stand until
+the first run after priming. Three rules keep this predictable:
+
+- **A running execution keeps its values.** `_execute_tasks` binds the cap into a
+  local before its first group and every group of that run uses it; the work dir
+  is bound into `run.work_dir` at entry. A reload adopted by a later run's entry
+  never resizes or re-targets a run already in flight.
+- **Only a MOVED field is adopted.** The runner records the `taskrunner.*` values
+  config held at construction; a field whose value differs from that baseline is
+  taken from config, a field that is unchanged keeps the constructor's argument.
+  An embedder or test that passes an explicit `max_parallel_steps=2` or
+  `workspace_dir=...` is therefore not overridden by a `config.json` that never
+  mentioned them, and writing a field back to its construction-time value
+  restores the constructor's target exactly.
+- **A rejected `workspace_dir` keeps the current target.** The validator's
+  `ValueError` (sensitive / credential path, already SEL-audited) is logged at
+  WARNING and the previous work dir stays in force.
 
 Per-task sessions (`taskrunner:{task_id}:task{N}`) are reset in a `finally`
 block after the gather, so sessions are cleaned up even if `CancelledError`
@@ -486,6 +539,18 @@ Each task runs on an isolated git branch via `git_coord.py`:
 - **State summary**: `git log --oneline` + `git diff --stat` injected into step prompts
 - **Review diff**: `git diff HEAD~1` fed to independent review session
 - **Finalize**: worktree cleaned up on task completion
+- **Retry recovery**: a retry validates the saved worktree's path, repository,
+  and branch before dispatching more steps. A lost worktree is recreated from
+  its original repository and existing task branch only when a surviving Git
+  pointer positively identifies the stale checkout; an arbitrary replacement
+  directory is left untouched and the retry fails closed. The identified
+  checkout is renamed aside before it is deleted, so the delete can only ever
+  destroy the tree that was validated -- never whatever happens to occupy the
+  path afterwards. Ownership is proved a second time against the renamed tree,
+  because the first proof and the rename are separate moments: anything that
+  arrived in between is put back and the retry fails closed. A set-aside tree
+  that cannot be deleted is logged and left on disk beside the recreated
+  worktree rather than failing the retry.
 
 Git init failure is non-fatal — task continues without git coordination.
 
@@ -653,13 +718,11 @@ only job is to produce a better-written spec from the user's input.
 Left/right split layout: 260px sidebar + detail/compose area.
 
 - **Sidebar** (visible when runs exist): compact project cards with status icon, name, progress bar, cancel/delete buttons. "＋ New Project" button at top.
-- **Compose area** (no project selected): ✨ Compose | 📄 From Spec tabs, shared `AgentSelector`, `ProjectAnimation` shown in empty state
+- **Compose area** (no project selected): ✨ Compose | 📄 From Spec tabs, shared `AgentSelector`
 - **Compose mode**: textarea + "✨ Refine into Spec" + "📋 Plan" buttons, `PlanningBanner` with cancel
 - **From Spec mode**: textarea + file upload (`<input type="file">`) + "▶ Run" + "📋 Plan" buttons
-- **Project detail** (`ProjectDetailPage`): Idea/Tasks tab bar with 🎮 button (right-aligned)
+- **Project detail** (`ProjectDetailPage`): Idea/Tasks tab bar
   - **Idea tab**: read-only spec content + "✏️ Edit in Chat" button
   - **Tasks tab**: DAG/Phased view toggle with `DagView` and `PhasedView` components
-  - **🎮 button**: opens modal with pixel-art office animation (`PixelCanvasWidget` + `PixelCanvas`). 7 character sprites animate based on task status (typing/looking/celebrate). Badge shows active agent count.
 - **Action buttons**: Execute/Chat/Discard (planned), ■ Cancel (running), ↻ Restart/⏰ Schedule (completed/failed)
-- **`SubAgentActivity`**: shown below running projects — live subagent table with status pills (Running/Done/Failed)
 - **WS-driven updates**: `push_refresh("taskrunner")` on every notification, 3s auto-refresh polling

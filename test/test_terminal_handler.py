@@ -83,6 +83,125 @@ def _make_session(session_id="s1", alive=True, ws=None, disconnect=None):
 # ── _resolve_shell ──
 
 
+class TestAgentCanRewrite:
+    """Ownership, not current mode bits, decides whether a path is rewritable: the
+    owner of a 0555 directory can chmod it writable in one syscall."""
+
+    def test_a_directory_the_caller_owns_is_rewritable_even_at_mode_0555(self, tmp_path, request):
+        d = tmp_path / "bin"
+        d.mkdir()
+        d.chmod(0o555)
+        request.addfinalizer(lambda: d.chmod(0o755))
+        assert terminal._agent_can_rewrite(str(d), os.geteuid()) is True
+
+    def test_a_directory_owned_by_someone_else_is_not(self, tmp_path, request):
+        d = tmp_path / "bin"
+        d.mkdir()
+        d.chmod(0o555)
+        request.addfinalizer(lambda: d.chmod(0o755))
+        assert terminal._agent_can_rewrite(str(d), os.geteuid() + 1) is False
+
+    def test_a_rewritable_ancestor_taints_the_path(self, tmp_path, request):
+        outer = tmp_path / "outer"
+        inner = outer / "bin"
+        inner.mkdir(parents=True)
+        inner.chmod(0o555)
+        request.addfinalizer(lambda: inner.chmod(0o755))
+        # The caller owns `outer`, so it can rename it and substitute everything
+        # underneath, whatever `inner`'s own bits say.
+        assert terminal._agent_can_rewrite(str(inner), os.geteuid()) is True
+
+    def test_a_missing_path_fails_closed(self, tmp_path):
+        assert terminal._agent_can_rewrite(str(tmp_path / "nope"), os.geteuid()) is True
+
+
+class TestResolveFenceShells:
+    """Fence-shell discovery adds no trusted location and consults no PATH: each
+    name is probed inside the directory the session's own shell came from, and
+    nothing the gateway's user could rewrite is offered -- a reported path is
+    invoked later, when the user confirms, so anything it owns is swappable then."""
+
+    def _foreign_uid(self, monkeypatch):
+        """Run as a uid that owns nothing under tmp_path, so a real directory can
+        stand in for a system one without needing root to create it."""
+        monkeypatch.setattr(os, "geteuid", lambda: os.getuid() + 1)
+
+    def _sysdir(self, tmp_path, names, request=None):
+        """A read-only directory of read-only executables, like /usr/bin.
+
+        Restores the directory to a writable mode on teardown via a finalizer:
+        left at 0o555, pytest's own tmp_path cleanup cannot unlink entries
+        inside it, so it renames the tree to a `garbage-<uuid>` directory under
+        the shared pytest temp root and leaves it there forever. `request` is
+        optional so a caller with no fixture request (there are none left, but
+        this keeps the helper safe to call standalone) still gets a directory,
+        just without the guaranteed restore.
+        """
+        d = tmp_path / "bin"
+        d.mkdir(parents=True)
+        for name in names:
+            p = d / name
+            p.write_text("#!/bin/sh\n")
+            p.chmod(0o555)
+        d.chmod(0o555)
+        if request is not None:
+            request.addfinalizer(lambda: d.chmod(0o755))
+        return d
+
+    def test_reports_shells_beside_the_launched_one(self, tmp_path, monkeypatch, request):
+        d = self._sysdir(tmp_path, ("bash", "zsh", "fish"), request)
+        self._foreign_uid(monkeypatch)
+        found = terminal._resolve_fence_shells(str(d / "bash"))
+        assert found == {
+            "bash": str(d / "bash"), "zsh": str(d / "zsh"), "fish": str(d / "fish"),
+        }
+
+    def test_ignores_a_shell_in_another_directory(self, tmp_path, monkeypatch, request):
+        d = self._sysdir(tmp_path, ("bash",), request)
+        elsewhere = self._sysdir(tmp_path / "other", ("fish",), request)
+        assert (elsewhere / "fish").exists()
+        self._foreign_uid(monkeypatch)
+        assert terminal._resolve_fence_shells(str(d / "bash")) == {"bash": str(d / "bash")}
+
+    def test_probes_the_directory_rather_than_the_search_path(self, tmp_path, monkeypatch, request):
+        shims = self._sysdir(tmp_path / "s", ("fish",), request)
+        d = self._sysdir(tmp_path / "r", ("bash", "fish"), request)
+        monkeypatch.setenv("PATH", str(shims))
+        self._foreign_uid(monkeypatch)
+        found = terminal._resolve_fence_shells(str(d / "bash"))
+        assert found["fish"] == str(d / "fish")
+
+    def test_offers_nothing_from_a_directory_the_gateway_user_owns(self, tmp_path, request):
+        # The swap window, and the Homebrew/workspace prefix case: the caller owns
+        # this directory, so read-only mode bits are one chmod from irrelevant.
+        d = self._sysdir(tmp_path, ("bash", "fish"), request)
+        assert terminal._resolve_fence_shells(str(d / "bash")) == {}
+
+    def test_skips_a_world_writable_candidate(self, tmp_path, monkeypatch, request):
+        d = self._sysdir(tmp_path, ("bash",), request)
+        d.chmod(0o755)
+        (d / "fish").write_text("#!/bin/sh\n")
+        (d / "fish").chmod(0o757)  # anyone may overwrite it before invocation
+        d.chmod(0o555)
+        self._foreign_uid(monkeypatch)
+        found = terminal._resolve_fence_shells(str(d / "bash"))
+        assert "fish" not in found
+        assert found == {"bash": str(d / "bash")}
+
+    def test_skips_a_symlinked_candidate(self, tmp_path, monkeypatch, request):
+        d = self._sysdir(tmp_path, ("bash",), request)
+        target = self._sysdir(tmp_path / "elsewhere", ("fish",), request)
+        d.chmod(0o755)
+        (d / "fish").symlink_to(target / "fish")
+        d.chmod(0o555)
+        self._foreign_uid(monkeypatch)
+        found = terminal._resolve_fence_shells(str(d / "bash"))
+        assert "fish" not in found
+
+    def test_reports_nothing_without_a_launched_shell(self):
+        assert terminal._resolve_fence_shells("") == {}
+
+
 class TestResolveShell:
     """Shell resolution: configured → $SHELL (POSIX) → platform default, each
     candidate validated as an executable, and the value returned is the path
@@ -330,6 +449,36 @@ class TestKillSession:
                 patch("kiro_crew.dashboard.handlers.terminal.platform_compat.kill_process_tree") as mock_kill:
             await terminal._kill_session(sess)
         mock_kill.assert_any_call(12345, platform_compat.SIGTERM)
+
+    @pytest.mark.asyncio
+    async def test_the_process_tree_is_hung_up_and_ended_before_the_pty_is_closed(self):
+        """Signals first, close second, HUP among the signals: and the order is the fix.
+
+        Closing the PTY's controller end while the reader is blocked in ``os.read()``
+        on it only unblocks that read on Linux; on macOS/BSD ``close()`` WAITS for the
+        read, so with an interactive bash still holding the terminal end the close never
+        returned and four PTY tests timed out at 120 s on every macOS run. Ending the
+        process tree first releases the terminal end on both. SIGHUP is included because an interactive
+        shell ignores SIGTERM, which alone would cost the 5 s SIGKILL escalation on
+        every terminal close.
+        """
+        order: list[str] = []
+        sess = _make_session(alive=True)
+        sess.master_fd = 42  # wokeignore:rule=master
+
+        def _kill(pid, sig):
+            order.append(f"kill:{sig}")
+            return True
+
+        with patch("os.close", side_effect=lambda fd: order.append("close")), patch(
+            "kiro_crew.dashboard.handlers.terminal.platform_compat.kill_process_tree",
+            side_effect=_kill,
+        ):
+            await terminal._kill_session(sess)
+
+        assert "close" in order and f"kill:{platform_compat.SIGHUP}" in order
+        assert order.index(f"kill:{platform_compat.SIGHUP}") < order.index("close")
+        assert order.index(f"kill:{platform_compat.SIGTERM}") < order.index("close")
 
     @pytest.mark.asyncio
     async def test_skips_kill_when_process_already_exited(self):
@@ -2316,7 +2465,7 @@ class TestApiTerminalWs:
         args = spawn.call_args.args
         assert args[0].replace("\\", "/").endswith("/bin/bash")
         # A real login shell, so `shopt -q login_shell` is true and every
-        # profile stanza guarded on login-ness runs (#5885). The readiness
+        # profile stanza guarded on login-ness runs. The readiness
         # marker rides an inherited PROMPT_COMMAND instead of an rc file,
         # which Bash reads only for NON-login shells.
         assert args[1] == "-l"
@@ -2331,7 +2480,7 @@ class TestApiTerminalWs:
     @pytest.mark.asyncio
     async def test_windows_conpty_spawn_failure_sends_error(self, monkeypatch):
         """On Windows a new WS session spawns a ConPTY shell (kiro_crew.conpty);
-        the old 'not supported on Windows' refusal no longer exists. If the
+        the old 'not supported on Windows' refusal is gone. If the
         spawn fails, the handler pops the placeholder, sends an error frame, and
         closes. WindowsPty is mocked to raise so ``return ws`` is exercised
         without a real pseudo-console (and without needing pywinpty on POSIX CI).
@@ -2929,7 +3078,23 @@ class TestTerminalWsIntegration:
                 for _ in range(40):
                     msg = await ws.receive(timeout=3)
                     if msg.type == web.WSMsgType.TEXT:
-                        if json.loads(msg.data).get("type") == "ready":
+                        frame = json.loads(msg.data)
+                        if frame.get("type") == "ready":
+                            # The reconnecting client learns which shell this
+                            # PTY launched. It mints the session id and opens
+                            # the socket without asking what got spawned, so
+                            # the ready frame is its only source -- and a
+                            # caller writing shell syntax into the PTY has to
+                            # know which shell will read it.
+                            assert frame["shell"] == sess.shell
+                            assert frame["shell"]
+                            # Fence-nameable shells are reported by ABSOLUTE
+                            # path: a bare name would be re-resolved in the
+                            # terminal's project cwd, where a relative PATH
+                            # entry could supply a planted binary.
+                            assert frame["fence_shells"] == sess.fence_shells
+                            for name, path in frame["fence_shells"].items():
+                                assert os.path.isabs(path), (name, path)
                             break
                 else:
                     raise AssertionError("reconnected initialized shell did not send ready")
@@ -3073,7 +3238,11 @@ class TestTerminalWsIntegration:
                 assert prompt.type == web.WSMsgType.BINARY
                 assert prompt.data == b"PS> "
                 assert ready.type == web.WSMsgType.TEXT
-                assert json.loads(ready.data) == {"type": "ready"}
+                frame = json.loads(ready.data)
+                assert frame["type"] == "ready"
+                assert frame["shell"] == sess.shell
+                assert frame["shell"]
+                assert frame["fence_shells"] == sess.fence_shells
                 await ws.close()
 
         if "winok-sess" in registry:
@@ -3261,12 +3430,11 @@ class TestTerminalWsIntegration:
     )
     @pytest.mark.asyncio
     async def test_ws_bash_runs_a_login_guarded_profile(self, monkeypatch, tmp_path):
-        """Regression for #5885: a profile stanza behind a login-shell guard must
+        """A profile stanza behind a login-shell guard must
         run in a Kiro Crew terminal.
 
         The shell is spawned with ``-l``, so ``shopt -q login_shell`` is true and
-        the guard passes. Emulating the profile chain from an rc file (what
-        #4724's ``--init-file`` did) cannot substitute: the option is read-only,
+        the guard passes. Emulating the profile chain from an rc file (what an ``--init-file`` rc file did) cannot substitute: the option is read-only,
         stays off, and every such stanza silently no-ops — which is precisely
         what the reporter saw. On that code this test fails at the final assert
         with an EMPTY value, having still received the ready frame.
@@ -3444,7 +3612,7 @@ class TestTerminalWsIntegration:
         in a profile replaces the hook and the marker never fires. Releasing the
         barrier anyway -- on a timeout, or on a line-discipline guess -- risks
         handing a queued command to a profile still blocked in `read`, which
-        consumes it silently: executed never, reported sent. #7641 shipped such a
+        consumes it silently: executed never, reported sent. An earlier build shipped such a
         release and had it reviewed back out.
 
         Every sibling case here covers an arm where the hook SURVIVES: appended
@@ -3459,7 +3627,7 @@ class TestTerminalWsIntegration:
         gated on `shell_ready`, only the frontend's registration is). The point is
         that the shell is genuinely usable while the gateway's barrier stays shut.
 
-        Tracked in #7657 with the remedy directions, and this pins only the
+        The remedy directions are tracked separately; this pins only the
         CURRENT deliberate behaviour without obstructing them: directions 1 and 3
         both keep queued injection fail-closed and change only interactive typing,
         so both survive this invariant.
@@ -3841,8 +4009,7 @@ class TestBashShellReadiness:
         env = terminal._bash_ready_env("abc123")
 
         # The marker rides PROMPT_COMMAND because Bash reads an --init-file only
-        # for a NON-login shell, and a non-login shell is exactly what #5885
-        # reports: `shopt -q login_shell` false, so login-guarded profile
+        # for a NON-login shell, and a non-login shell is exactly what the login guard sees: `shopt -q login_shell` false, so login-guarded profile
         # stanzas never run.
         assert env[terminal._READY_TOKEN_VAR] == "abc123"
         hook = env["PROMPT_COMMAND"]

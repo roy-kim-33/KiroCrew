@@ -146,12 +146,29 @@ class TestDoctor:
 
         monkeypatch.setattr(_doc.sandbox, "detect_backend", lambda config_mode="auto": "namespace")
 
-    def test_doctor_with_kiro(self, tmp_path):
+    @pytest.fixture(autouse=True)
+    def _restore_path(self, monkeypatch):
+        """Put ``PATH`` back after each doctor run.
+
+        The doctor's media section calls ``transcribe.ensure_ffmpeg_in_path()``,
+        which PREPENDS a candidate ffmpeg directory to the process ``PATH`` when
+        the host has one there -- a permanent mutation of the worker's environment
+        that every later test on that worker then inherits (observed as a PATH
+        change leaking out of the first doctor test in a full run). Recording the
+        value through monkeypatch restores it at teardown whatever the doctor did.
+        """
+        monkeypatch.setenv("PATH", os.environ.get("PATH", ""))
+
+    def test_doctor_with_kiro(self, tmp_path, monkeypatch):
+        import kiro_crew.cli_doctor as _doc
+
         agent_file = tmp_path / "kirocrew.json"
         # A minimally healthy agent config so doctor walks the whole MCP
         # section cleanly and doesn't exit on "missing from mcpServers".
         _healthy_agent_file(agent_file)
         mock_run = MagicMock(returncode=0, stdout="kiro-cli 1.0.0", stderr="")
+        # Left unpatched this mutates the process PATH for every later test.
+        monkeypatch.setattr(_doc, "ensure_ffmpeg_in_path", lambda: None)
         with (
             patch(
                 "kiro_crew.cli_doctor.shutil.which",
@@ -237,7 +254,7 @@ class TestDoctor:
         both arms byte-for-byte — including the note mark's trailing pad
         space, which keeps the report columns aligned — AND that the twin
         report lines can never disagree, so a one-arm edit to either site
-        fails here (issue #5096)."""
+        fails here."""
         import kiro_crew.cli_doctor as _doc
 
         agent_file = tmp_path / "kirocrew.json"
@@ -283,10 +300,13 @@ class TestDoctor:
         assert f"  engine:      {expected_mark} no recogniser here" in out
         assert f"  ffmpeg:      {expected_mark} not found" in out
 
-    def test_doctor_reports_platform_boot_error_without_crashing(self, tmp_path, capsys):
+    def test_doctor_reports_platform_boot_error_without_crashing(
+        self, tmp_path, capsys, monkeypatch
+    ):
         """A PlatformCompositionError from boot must be REPORTED by the doctor,
         not crash it — the doctor is the tool that diagnoses a broken setup, so
         it has to survive the very failure it explains."""
+        import kiro_crew.cli_doctor as _doc
         from kiro_crew.platform import PlatformCompositionError
 
         agent_file = tmp_path / "kirocrew.json"
@@ -295,6 +315,8 @@ class TestDoctor:
         boot_err = PlatformCompositionError(
             "profile=amazon resolved no companion; set KIROCREW_PROFILE=standalone"
         )
+        # Left unpatched this mutates the process PATH for every later test.
+        monkeypatch.setattr(_doc, "ensure_ffmpeg_in_path", lambda: None)
         with (
             patch(
                 "kiro_crew.cli_doctor.shutil.which",
@@ -620,6 +642,7 @@ class TestCronCli:
                 every_secs=300,
                 channel="C0AP77JJSN6",
                 approval_mode="",
+                folder_id="",
             )
 
     def test_cron_add_with_cron_expr_and_channel(self, tmp_path):
@@ -654,7 +677,41 @@ class TestCronCli:
                 cron_expr="0 9 * * 1-5",
                 channel="C0APAPQ5GSY",
                 approval_mode="",
+                folder_id="",
             )
+
+    @pytest.mark.parametrize(
+        "name, cron_expr, every, expected",
+        [
+            ("bad dow", "0 9 * * 8", None, "Error: Invalid cron expression: 0 9 * * 8"),
+            ("n" * 501, None, 60, "Error: name exceeds max length 500"),
+        ],
+        ids=["cron_expr branch", "every branch"],
+    )
+    def test_cron_add_refuses_invalid_input(
+        self, name, cron_expr, every, expected, tmp_path, monkeypatch, capsys
+    ):
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "home"))
+        args = argparse.Namespace(
+            cron_action="add",
+            name=name,
+            message="m",
+            every=every,
+            cron_expr=cron_expr,
+            channel=None,
+            approval_mode="",
+            agent="",
+            silent=False,
+            folder="",
+        )
+
+        with pytest.raises(SystemExit) as exit_info:
+            _cron(args)
+
+        err = capsys.readouterr().err
+        assert exit_info.value.code == 1
+        assert err.splitlines()[-1] == expected
+        assert "Traceback" not in err
 
     def test_cron_add_with_approval_mode(self, tmp_path):
         with (
@@ -688,6 +745,7 @@ class TestCronCli:
                 every_secs=600,
                 channel=None,
                 approval_mode="auto",
+                folder_id="",
             )
             mock_sel.return_value.log_api_access.assert_called_once_with(
                 caller="cli",
@@ -729,6 +787,7 @@ class TestCronCli:
                 every_secs=300,
                 channel=None,
                 approval_mode="",
+                folder_id="",
             )
             # silent is set via post-create mutation, mirroring agent_id
             assert mock_job.silent is True
@@ -866,6 +925,7 @@ class TestCronCli:
                 every_secs=600,
                 channel=None,
                 approval_mode="",
+                folder_id="",
             )
             assert mock_job.agent_id == "customer360-code-agent"
             mock_svc._save.assert_called_once()
@@ -907,6 +967,7 @@ class TestCronCli:
                 cron_expr="0 9 * * 1-5",
                 channel=None,
                 approval_mode="",
+                folder_id="",
             )
             assert mock_job.agent_id == "ea-briefing"
             mock_svc._save.assert_called_once()
@@ -1918,10 +1979,10 @@ class TestIsKirocrewProcess:
             assert _is_kirocrew_process(1234) is True
 
     def test_returns_true_for_module_gateway_form(self):
-        """Regression: the real service launch form
-        ``python -m kiro_crew gateway`` must be recognized. Previously the
-        matcher only accepted the dotted ``kiro_crew.gateway`` form, so
-        ``kirocrew stop`` no-op'd on service installs.
+        """The real service launch form
+        ``python -m kiro_crew gateway`` must be recognized. The
+        matcher must accept the dotted ``kiro_crew.gateway`` form too, or
+        ``kirocrew stop`` no-op's on service installs.
 
         Patched through the cross-platform ``process_command_line`` seam (the
         Windows port routes _is_kirocrew_process through platform_compat rather
@@ -3833,7 +3894,7 @@ class TestDoctorMcpTools:
 
 
 class TestDoctorMcpSpecGate:
-    """Doctor's MCP checks consult the same ``spec_gate`` emission does (#6548).
+    """Doctor's MCP checks consult the same ``spec_gate`` emission does.
 
     Spec emission (``agent.build_agent_config`` / ``_refresh_dynamic_fields``)
     deliberately omits — and retracts — the ``mcpServers`` entry of a managed
@@ -3890,7 +3951,7 @@ class TestDoctorMcpSpecGate:
     def test_gate_closed_absent_entry_is_informational_not_an_issue(self, tmp_path, capsys):
         """Gate closed + entry absent = the healthy state on this host.
 
-        The exact #6548 report: no hard error, no ``issues`` entry (so doctor
+        The reported state: no hard error, no ``issues`` entry (so doctor
         exits 0), no auto-mount of the ref, and the line says WHY the server is
         absent rather than looking like a silent skip.
         """
@@ -4302,7 +4363,10 @@ class TestDoctorStt:
         )
 
         assert "ffmpeg:      ❌ not found" in out
-        assert "drop a static ffmpeg build into ~/.local/bin" in out
+        # The wiring assertion: doctor must print the module constant the
+        # resolvable-hint tests hold against the resolver's candidate list, so
+        # nobody can inline a literal back into the _os_fix_hint call.
+        assert _doc._FFMPEG_LINUX_HINT in out
         assert "reinstall Kiro Crew" not in out
         assert "❌ Fix these issues: " in out
         assert "ffmpeg" in out.split("❌ Fix these issues: ", 1)[1]
@@ -4729,10 +4793,10 @@ class TestSetupChannelGating:
 class TestSpawnCliAuth:
     """``kirocrew spawn`` attaches X-Internal-Secret on every gateway call.
 
-    Regression coverage for the CLI helpers in ``cli_commands.py``
-    used to open ``/api/spawn`` without the per-session IPC secret, which
-    caused 403 ``"gateway not running"`` errors when ``dashboard.url`` was
-    set to a non-loopback host (token_auth_middleware then required either
+    The CLI helpers in ``cli_commands.py`` attach the per-session IPC secret
+    on every ``/api/spawn`` call. Without it the call gets a 403, which
+    reads ``"gateway not running"`` when ``dashboard.url`` is
+    a non-loopback host (token_auth_middleware then requires either
     a session cookie or the secret header on every request).
     """
 
@@ -4945,7 +5009,7 @@ class TestMcpBuiltinDispatch:
         # Patch the registry the CLI reads when building subparsers and dispatching.
         monkeypatch.setattr(cli_mod, "_BUILTIN_NAMES", [builtin_name])
         # The verb is only registered (and dispatched) when the builtin's
-        # mcp_server module resolves (#5901) — make the synthetic one resolve.
+        # mcp_server module resolves — make the synthetic one resolve.
         monkeypatch.setattr(cli_mod, "_builtin_mcp_server_available", lambda _name: True)
         mock_module = MagicMock()
 
@@ -5400,8 +5464,8 @@ class TestWaitGatewayReady:
     def test_child_that_exits_during_the_last_probe_is_reported_as_died(self):
         """Exiting on the final probe must not be reported as "still running".
 
-        Otherwise the operator is sent looking for a live process that no longer
-        exists, with no exit status to explain it.
+        Otherwise the operator is sent looking for a process that is already gone,
+        with no exit status to explain it.
         """
         import types
 
@@ -5773,7 +5837,7 @@ class TestInstallPidfdChildWatcher:
         from kiro_crew.cli import _install_child_watcher
 
         monkeypatch.setattr("kiro_crew.cli.sys.platform", "linux")
-        # Regression for the 2026-07-10 gateway startup kill: a uv-managed /
+        # The gateway startup kill scenario: a uv-managed /
         # Clang-built CPython 3.12 whose build omits the os.pidfd_open wrapper
         # (present on the system python, absent in the venv interpreter). The
         # probe raises AttributeError, not OSError -- the old code caught it and
@@ -6010,7 +6074,7 @@ class TestTokenCommand:
     # `_token`'s stdout is regex-parsed by the remote-mint path
     # (kiro_crew.instances.token_mint.mint_remote_token) over SSH. Error prose on
     # stdout both breaks the Unix convention and hides the reason from a caller
-    # that captures stderr — which is how a failed remote mint used to surface as
+    # that captures stderr — which is how a failed remote mint surfaces as
     # a bare "<no stderr>".
 
     def _stub_token_env(self, tmp_path, monkeypatch, *, secret: bool = True) -> None:
@@ -6405,13 +6469,16 @@ class TestChatPermissionRequest:
     async def test_a_benign_title_cannot_hide_a_sensitive_command(self, monkeypatch, capsys):
         """The gate judges what executes, not what the model called it.
 
-        ``title`` for a shell tool is an LLM-authored description, so a
-        credential read labelled "List project files" is the bypass that keying
+        ``title`` for a shell tool is an LLM-authored description, so an IMDS
+        credential fetch labelled "List project files" is the bypass that keying
         on the title alone would let through. The user is never even asked.
         """
         provider, sels, reads = await self._drive(
             monkeypatch,
-            event=self._event(title="List project files", command="cat ~/.ssh/id_rsa"),
+            event=self._event(
+                title="List project files",
+                command="curl http://169.254.169.254/latest/meta-data/",
+            ),
             answer="a",  # the user WOULD have allowed it
         )
         assert provider.calls == [("reject", 7, False)]
@@ -6419,13 +6486,13 @@ class TestChatPermissionRequest:
         # A stable code, not the gate's reason: the reason names the very path
         # being protected, and an audit record must not restate it.
         assert sels[0]["error"] == "hook_deny"
-        assert ".ssh" not in json.dumps(sels[0])
+        assert "169.254.169.254" not in json.dumps(sels[0])
         # The reason still reaches the terminal, and it has to be the REAL one:
         # `is_shell` with no command also denies, via the gate's deny-by-default
         # backstop, so "it was denied" would pass just as well when the command
         # is never forwarded at all.
         err = capsys.readouterr().err
-        assert "sensitive credential path" in err
+        assert "IMDS endpoint" in err
         assert "could not be verified" not in err
 
     @pytest.mark.asyncio
@@ -6825,8 +6892,8 @@ class TestChatPermissionRequest:
 
     @pytest.mark.asyncio
     async def test_the_prompt_and_the_gate_share_one_set_of_path_spellings(self, monkeypatch):
-        """A ``filePath`` target used to be DISPLAYED as though it had been vetted
-        while the keystone never read that key. Both sides now resolve through
+        """A ``filePath`` target must not be DISPLAYED as though vetted while the
+        keystone never reads that key. Both sides resolve through
         ``hooks.target_paths``, so the parity is structural rather than asserted in
         a comment -- and a sensitive value under any spelling is refused by the
         gate before a human is ever asked.
@@ -7488,6 +7555,129 @@ class TestChatPermissionRequest:
         assert sels[0]["error"] == "unverified_shell"
 
     @pytest.mark.asyncio
+    async def test_kindless_mcp_tool_reaches_the_prompt_instead_of_auto_denying(self, monkeypatch):
+        """A backend that omits `kind` on an MCP tool_call must not cost the user
+        the tool. The frame's `_meta.kiro` transport identity earns the
+        _unverifiable_shell escape -- WITHOUT minting a shell classification, so
+        the low-fidelity gates elsewhere keep treating the title as unverified --
+        and the request reaches the normal approval prompt.
+
+        Drives the shared-runtime parser rather than hand-building the event: the
+        auto-deny came from the cache write being skipped, which an event built
+        with trusted identity fields would hide.
+        """
+        from kiro_crew.acp._dispatch import _build_tool_call_event, build_permission_event
+        from kiro_crew.acp.types import JsonRpcMessage
+
+        shell_cache: dict[str, bool] = {}
+        raw_cache: dict[str, dict] = {}
+        server_cache: dict[str, str] = {}
+        name_cache: dict[str, str] = {}
+        _build_tool_call_event(
+            {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "tc-kindless",
+                "title": "Asking the knowledge service",
+                "rawInput": {"question": "why"},
+                "_meta": {"kiro": {"mcpServerName": "kb", "toolName": "ask"}},
+            },
+            None,
+            shell_cache=shell_cache,
+            raw_params_cache=raw_cache,
+            mcp_server_name_cache=server_cache,
+            tool_name_cache=name_cache,
+        )
+        event, _ = build_permission_event(
+            JsonRpcMessage(
+                id="req-kindless",
+                method="session/request_permission",
+                params={
+                    "toolCall": {
+                        "toolCallId": "tc-kindless",
+                        "title": "Asking the knowledge service",
+                    },
+                    "options": [
+                        {"optionId": "allow", "name": "Allow once", "kind": "allow_once"},
+                        {"optionId": "reject", "name": "Deny", "kind": "reject_once"},
+                    ],
+                },
+            ),
+            shell_cache=shell_cache,
+            raw_params_cache=raw_cache,
+            mcp_server_name_cache=server_cache,
+            tool_name_cache=name_cache,
+        )
+
+        assert event.shell_classified is False  # no classification was minted
+        assert event.is_shell is False
+        assert event.mcp_identity_trusted is True  # the escape's actual carrier
+        provider, sels, reads = await self._drive(monkeypatch, event=event, answer="a")
+        assert provider.calls == [("approve", "req-kindless", False)]
+        assert reads["n"] == 1
+        assert [s["outcome"] for s in sels] == ["allowed"]
+
+    @pytest.mark.asyncio
+    async def test_low_fidelity_child_without_identity_is_rejected_not_prompted(
+        self, monkeypatch, capsys
+    ):
+        """The admission boundary of the child-fidelity opt-in: a child event
+        whose params never reached the cache AND whose MCP identity is
+        unverified must be rejected before any prompt. The prompt for such an
+        event would carry only the agent-authored title -- for an edit, no Path
+        line -- so approval would consent to an undisclosed write."""
+        from kiro_crew.acp.types import EVENT_PERMISSION_REQUEST, AcpEvent
+
+        event = AcpEvent(
+            kind=EVENT_PERMISSION_REQUEST,
+            request_id=9,
+            title="Tidying up the notes file",
+            sub_session_id="child-a",
+            tool_kind="edit",
+            is_shell=False,
+            shell_classified=False,
+            raw_params_trusted=False,
+            options=[{"id": "allow", "label": "Allow Once"}],
+        )
+        assert event.child_low_fidelity is True
+        assert event.child_mcp_identity_trusted is False
+        provider, sels, reads = await self._drive(monkeypatch, event=event, answer="a")
+        assert provider.calls == [("reject", 9, False)]
+        assert reads["n"] == 0  # the human was never asked
+        assert sels[0]["error"] == "child_unverified_context"
+        assert "without verifiable security context" in capsys.readouterr().err
+
+    @pytest.mark.asyncio
+    async def test_identity_trusted_low_fidelity_child_still_reaches_the_prompt(
+        self, monkeypatch, capsys
+    ):
+        """The one admission through that boundary: a child MCP call whose
+        `_meta.kiro` identity survived the cache is presented -- the prompt
+        shows the non-forgeable server/tool pair, the same args-blind consent
+        contract the dashboard's interactive card provides."""
+        from kiro_crew.acp.types import EVENT_PERMISSION_REQUEST, AcpEvent
+
+        event = AcpEvent(
+            kind=EVENT_PERMISSION_REQUEST,
+            request_id=10,
+            title="Asking the knowledge service",
+            sub_session_id="child-a",
+            tool_kind="fetch",
+            is_shell=False,
+            shell_classified=False,
+            raw_params_trusted=False,
+            mcp_server_name="kb",
+            tool_name="ask",
+            mcp_identity_trusted=True,
+            options=[{"id": "allow", "label": "Allow Once"}],
+        )
+        assert event.child_low_fidelity is True
+        assert event.child_mcp_identity_trusted is True
+        provider, sels, reads = await self._drive(monkeypatch, event=event, answer="a")
+        assert provider.calls == [("approve", 10, False)]
+        assert reads["n"] == 1
+        assert "MCP tool: kb / ask" in capsys.readouterr().out
+
+    @pytest.mark.asyncio
     async def test_ordinary_title_and_command_display_unchanged(self, monkeypatch, capsys):
         # The control-stripping must not disturb ordinary text: this is the
         # control for the three cases above.
@@ -7760,9 +7950,14 @@ class TestChatProviderShutdown:
         def __init__(self):
             self.started = 0
             self.shutdowns = 0
+            self.child_fidelity_aware = False
+            self.fidelity_aware_at_start: bool | None = None
 
         async def start(self):
             self.started += 1
+            # Record the flag as start() sees it: the opt-in must precede the
+            # backend spawn, or an early child permission frame races the gate.
+            self.fidelity_aware_at_start = self.child_fidelity_aware
 
         async def shutdown(self):
             self.shutdowns += 1
@@ -7812,6 +8007,25 @@ class TestChatProviderShutdown:
         with pytest.raises(RuntimeError, match="backend died"):
             await cli_chat._chat("hello", None)
         assert provider.shutdowns == 1
+
+    @pytest.mark.asyncio
+    async def test_chat_opts_into_the_child_fidelity_contract_before_start(self, monkeypatch):
+        """The CLI implements the low-fidelity child downgrade (hook gate ->
+        _unverifiable_shell fail-close -> trusted-fields-only human prompt), so
+        _chat must opt in -- and BEFORE start(), or an early child permission
+        frame races the handle's fail-close gate and is rejected as
+        `child_low_fidelity_unaware_consumer`, the auto-deny this fix ends."""
+        import kiro_crew.cli_chat as cli_chat
+
+        provider = self._FakeProvider()
+        self._patch(monkeypatch, provider)
+
+        async def done(*a, **k):
+            return None
+
+        monkeypatch.setattr(cli_chat, "_send_and_print", done)
+        await cli_chat._chat("hello", None)
+        assert provider.fidelity_aware_at_start is True
 
     @pytest.mark.asyncio
     async def test_shutdown_runs_exactly_once_on_the_normal_path(self, monkeypatch):

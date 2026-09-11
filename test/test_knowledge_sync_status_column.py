@@ -1,6 +1,6 @@
 """The sources.sync_status COLUMN is the single source of truth.
 
-A source's sync state used to live in two places: the ``sources.sync_status``
+A source's sync state could live in two places: the ``sources.sync_status``
 column and a ``sync_status`` key inside the ``properties`` JSON blob. Writers
 were split across the two -- most transitions wrote the column only, while the
 watcher's 'missing' marker went into the blob only -- and readers were split the
@@ -64,8 +64,8 @@ class TestFolderPreScanSkip:
     async def test_a_paused_folder_is_not_walked(self, store, tmp_path):
         """A pause recorded in the column stops the sweep.
 
-        The skip used to read the properties copy, so a pause the column knew
-        about still walked and delete-reconciled the whole folder every sweep.
+        A skip reading the properties copy lets a pause the column knew about
+        still walk and delete-reconcile the whole folder every sweep.
         """
         folder = tmp_path / "vault"
         folder.mkdir()
@@ -283,8 +283,18 @@ class TestSingleFileMissingMarker:
         store.db.commit()
 
         watcher = _watcher(store)
-        # The duplicate gate's shape: returns a terminal job id, writes no status.
-        watcher.pipeline.ingest_file = AsyncMock(return_value="dupe-job-id")
+
+        # The duplicate gate's shape: returns a terminal job id, writes no status,
+        # and reports the refusal through on_duplicate inside its transaction
+        # (ingestion._skip_as_duplicate) -- the latch the watcher reads to tell a
+        # terminal dedup from a rolled-back partial ingest.
+        async def _dupe_gate(path, **kwargs):
+            on_duplicate = kwargs.get("on_duplicate")
+            if on_duplicate is not None:
+                on_duplicate("text-hash-held-by-another-source")
+            return "dupe-job-id"
+
+        watcher.pipeline.ingest_file = AsyncMock(side_effect=_dupe_gate)
         await watcher._scan()
 
         watcher.pipeline.ingest_file.assert_awaited_once()

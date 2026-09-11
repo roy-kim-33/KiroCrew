@@ -1,7 +1,7 @@
 """Regression tests for splitting redaction between load time and display time.
 
-The startup restore used to redact BOTH `content` and `meta` on every message it
-loaded, and that pass was silently covering for four emit sites that did not
+A startup restore that redacts BOTH `content` and `meta` on every message it
+loads silently covers for four emit sites that do not
 redact. Removing it wholesale then leaked stored content through three further
 paths that build model prompts (side-chat, orchestrator stage file, title model).
 
@@ -165,20 +165,27 @@ def test_side_chat_parent_snapshot_keeps_user_text() -> None:
 
 
 def test_stage_result_capture_redacts_before_writing_to_disk(tmp_path, monkeypatch) -> None:
-    """_capture_stage_result writes assistant text to a NEW file on disk.
+    """The stage-result capture writes assistant text to a NEW file on disk.
 
     A gateway restart mid-orchestration leaves restored (now unredacted) turns in
     the window, so without redaction here those bytes would be written out.
+
+    Composed from the two halves the stage loop itself calls: the message walk
+    runs on the caller (it reads live slot state) and the redact-plus-write half
+    takes only strings, which is what makes it safe to hand to a worker thread.
     """
     monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
     monkeypatch.setattr("kiro_crew.dashboard.chat_orchestrator.config_dir", lambda: tmp_path)
-    from kiro_crew.dashboard.chat_orchestrator import _capture_stage_result
+    from kiro_crew.dashboard.chat_orchestrator import (
+        _collect_stage_result_parts,
+        _write_stage_result,
+    )
     from kiro_crew.dashboard.state import _ChatSlot
 
     slot = _ChatSlot("chat-1-stage")
     slot.append("assistant", f"result with {SECRET}", "msg msg-a", broadcast=False)
 
-    path = _capture_stage_result(slot, 1)
+    path = _write_stage_result(slot.key, 1, _collect_stage_result_parts(slot))
     written = pathlib.Path(path).read_text()
     assert SECRET not in written, "stage result persisted an unredacted credential"
 
@@ -233,7 +240,7 @@ def test_rehydrate_does_not_broadcast_replayed_messages(tmp_path, monkeypatch) -
     """Replayed history must not be broadcast even though content is now redacted.
 
     _broadcast_chat_message redacts non-user *content* (parity with
-    _prepare_messages, #1713) but deliberately not *meta* — so replaying history
+    _prepare_messages) but deliberately not *meta* — so replaying history
     through it would still push unredacted meta straight to connected clients.
     This helper also runs for on-demand cold-slot rehydrates, i.e. while clients
     are connected.
@@ -450,7 +457,7 @@ def test_oauth_url_corpus_survives_the_emit_path(monkeypatch) -> None:
                     # what a banner the user can still act on always carries:
                     # `_emit_mcp_oauth_request` is the only producer of these rows
                     # and it always stamps. An unstamped row means a dead flow and
-                    # is withdrawn on purpose (issues #7654, #8149) -- pinned by
+                    # is withdrawn on purpose -- pinned by
                     # the next test, so this one keeps measuring what it was
                     # written to measure: the redaction gate.
                     "meta": {
@@ -472,13 +479,12 @@ def test_oauth_url_corpus_survives_the_emit_path(monkeypatch) -> None:
 
 
 def test_a_legitimate_url_from_a_dead_child_is_withdrawn() -> None:
-    """The other side of the corpus test: a real URL is no longer a live one.
+    """The other side of the corpus test: a real URL is not a live one.
 
     A banner carrying no child stamp was persisted by an earlier build, so the
     process that owned its loopback listener and PKCE verifier is gone. The URL is
     still a perfectly well-formed provider URL — that is exactly why the scheme and
-    credential gates cannot catch it, and why the liveness gate has to (issues
-    #7654, #8149).
+    credential gates cannot catch it, and why the liveness gate has to.
     """
     from oauth_url_corpus import LEGIT_OAUTH_URLS
 
@@ -562,11 +568,11 @@ def test_oauth_completion_preserves_a_legitimate_url() -> None:
     assert meta.get("completed") is True
 
 
-# ── 7. WS broadcast redaction parity with the HTTP history path (#1713) ──────
+# ── 7. WS broadcast redaction parity with the HTTP history path ──────
 #
 # _prepare_messages (HTTP history) redacts non-user content at display time;
-# _broadcast_chat_message (live WS push) used to ship the same row verbatim, so
-# one chat row left the backend in two different byte forms depending on which
+# _broadcast_chat_message (live WS push) must redact too, or one chat row leaves
+# the backend in two different byte forms depending on which
 # consumer received it. These pin the parity on both sides of the role gate.
 
 

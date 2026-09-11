@@ -583,7 +583,10 @@ class TestApplyRefusals:
         monkeypatch.setenv("KIROCREW_PROJECT_DIR", str(plain))
         resp = await updates.api_update_apply(_request({}))
         assert resp.status == 409
-        assert "Not a git checkout" in json.loads(resp.body.decode())["error"]
+        error = json.loads(resp.body.decode())["error"]
+        assert "Not a git checkout" in error
+        assert "kirocrew update" in error
+        assert "cloud launch" not in error
 
     @pytest.mark.asyncio
     async def test_a_pinned_remote_is_refused_before_any_spinner_is_shown(
@@ -772,9 +775,15 @@ class TestLogLevel:
     @pytest.mark.asyncio
     async def test_applies_and_persists_a_valid_level_case_insensitively(self, monkeypatch):
         saved: list[str] = []
-        cfg = MagicMock()
-        cfg.save = lambda: saved.append(cfg.agent.log_level)
-        monkeypatch.setattr(updates.KiroCrewConfig, "load", staticmethod(lambda: cfg))
+
+        def _fake_update_config_locked(*args, **kwargs):
+            # The handler persists via a delta mutate through
+            # update_config_locked; record what it wrote.
+            doc = kwargs["mutate"]({})
+            saved.append(doc["agent"]["log_level"])
+            return doc
+
+        monkeypatch.setattr(updates, "update_config_locked", _fake_update_config_locked)
 
         resp = await updates.api_log_level(_request({"level": "warning"}))
 
@@ -792,9 +801,9 @@ class TestLogLevel:
         from blocking a debugging session.
         """
         monkeypatch.setattr(
-            updates.KiroCrewConfig,
-            "load",
-            staticmethod(MagicMock(side_effect=OSError("read-only fs"))),
+            updates,
+            "update_config_locked",
+            MagicMock(side_effect=OSError("read-only fs")),
         )
 
         resp = await updates.api_log_level(_request({"level": "DEBUG"}))
@@ -950,7 +959,7 @@ class TestRingLogHandler:
         """The gateway shuts its loop down while the handler stays attached.
 
         ``call_soon_threadsafe`` then raises, and losing the ring entry over a
-        subscriber that can no longer be reached would blind the Logs page during
+        subscriber that cannot be reached would blind the Logs page during
         exactly the shutdown a reader wants to see.
 
         The send coroutine is built BEFORE the scheduling call, so this path also
@@ -964,9 +973,7 @@ class TestRingLogHandler:
         state._ws_log_subscribers = {MagicMock()}
         handler._state = state
         state.serving_loop = MagicMock()
-        state.serving_loop.call_soon_threadsafe.side_effect = RuntimeError(
-            "event loop is closed"
-        )
+        state.serving_loop.call_soon_threadsafe.side_effect = RuntimeError("event loop is closed")
 
         handler.emit(_record("during shutdown"))
 
@@ -1040,8 +1047,7 @@ class TestLogsStream:
         # The queue handler is only installed AFTER the replay, so an abort here
         # must not leave one attached to the logger.
         assert not any(
-            isinstance(h, updates._QueueLogHandler)
-            for h in logging.getLogger("kiro_crew").handlers
+            isinstance(h, updates._QueueLogHandler) for h in logging.getLogger("kiro_crew").handlers
         )
 
     @pytest.mark.parametrize("raw", ["not-a-number", "", "1e5"])
@@ -1137,8 +1143,8 @@ def test_neither_chat_message_door_builds_the_frame_by_hand() -> None:
 
     `_broadcast()` feeds ONE note to two doors — the WS arm in `state.py` and
     the SSE arm in `handlers/updates.py`. While each built the frame by hand
-    they could disagree silently, which is exactly how `meta` stayed missing on
-    the SSE side after #7981 fixed the WS one (#8045).
+    they could disagree silently, which is exactly how `meta` can go missing on
+    the SSE side while the WS side carries it.
 
     Asserted on the SOURCE, not on a payload, because that is the only form
     that catches the regression this guards: a payload comparison calling
@@ -1331,7 +1337,7 @@ class TestDashboardStream:
         to drop a row an app may not see. `meta` carries tool/LLM content
         (`tool_input`, a live `oauth_url`, `approval_id`), so including it here
         would expose it to any app token granted this route regardless of its
-        `slots:*` scope — the class of GPT #6789, which leaked public-repo status
+        `slots:*` scope — the same class of leak that put public-repo status
         onto this same endpoint. The metadata therefore rides only the door that
         filters.
         """

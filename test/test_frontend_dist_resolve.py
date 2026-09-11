@@ -390,13 +390,13 @@ def test_stage_built_dist_replaces_symlink_with_real_copy(tmp_path):
     assert (static_dist / "assets" / "app-abc123.js").is_file()
 
     # The decisive property: wiping the Vite output (what `npm run build` does
-    # first) no longer touches what the gateway serves.
+    # first) does not touch what the gateway serves.
     shutil.rmtree(built)
     assert (static_dist / "index.html").is_file()
 
 
 def test_stage_built_dist_refreshes_an_existing_real_dir(tmp_path):
-    """Re-staging overwrites a previously staged tree instead of merging it."""
+    """Re-staging overwrites an already-staged tree instead of merging it."""
     _repo_with_build(tmp_path)
     static_dist = tmp_path / "src" / "kiro_crew" / "static" / "dist"
     static_dist.mkdir()
@@ -417,7 +417,7 @@ def test_stage_built_dist_reports_failure_when_build_missing(tmp_path):
 
 
 def test_stage_built_dist_keeps_serving_when_copy_fails(tmp_path):
-    """A failed copy must leave the previously staged tree in place.
+    """A failed copy must leave the already-staged tree in place.
 
     Staging runs against a live gateway, so a mid-stage error may not take the
     served assets down with it.
@@ -875,6 +875,12 @@ def test_build_and_stage_accepts_a_string_repo_path(tmp_path):
 
     class _Done:
         returncode = 0
+        # build_and_stage now also runs read-only `git status`/`rev-parse` to
+        # fingerprint the built source; stubbed git returns empty output, read as
+        # a clean tree with no resolvable id, so no fingerprint is written and
+        # the staged-bundle assertion below is unaffected.
+        stdout = b""
+        stderr = b""
 
         def wait(self, timeout=None):
             return 0

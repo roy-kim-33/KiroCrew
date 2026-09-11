@@ -39,7 +39,10 @@ Exit codes:
                   a blocking review marker on the current head, no
                   pull_request-event run for the current head, a disposition
                   comment violating the one-lane / one-rationale-per-finding
-                  rule, or anything that cannot be confirmed
+                  rule, an unanswered whole-design CONCERNS verdict for the
+                  current head (local loop only -- --disposition-gate and the
+                  required status are unchanged), or anything that cannot be
+                  confirmed
    2  ENV ERROR - gh missing or not authenticated, or PR not found
 """
 
@@ -82,6 +85,8 @@ REVIEWED_STAMP_RE = _review_contract.REVIEWED_STAMP_RE
 BLOCK_MERGE_RE = _review_contract.BLOCK_MERGE_RE
 DEFAULT_MARKER_AUTHORS = _review_contract.DEFAULT_MARKER_AUTHORS
 DEFAULT_MARKER_BINDINGS = _review_contract.DEFAULT_MARKER_BINDINGS
+VERDICT_LINE_RE = _review_contract.VERDICT_LINE_RE
+WHOLE_DESIGN_LANES = _review_contract.WHOLE_DESIGN_LANES
 _COMMENT_KEY_RE = _review_contract._COMMENT_KEY_RE
 FINDING_RE = _review_contract.FINDING_RE
 DISPOSITION_PREFIX = _review_contract.DISPOSITION_PREFIX
@@ -92,6 +97,10 @@ span_hash = _review_contract.span_hash
 sha_matches = _review_contract.sha_matches
 comment_key = _review_contract.comment_key
 extract_findings = _review_contract.extract_findings
+extract_design_items = _review_contract.extract_design_items
+design_lane_verdicts = _review_contract.design_lane_verdicts
+unanswered_concern_lanes = _review_contract.unanswered_concern_lanes
+unanswered_concerns_reason = _review_contract.unanswered_concerns_reason
 parse_disposition_record = _review_contract.parse_disposition_record
 
 
@@ -169,7 +178,7 @@ _CLOSING_REF = _CLOSING_VERB + r"[ \t]*:?[ \t]+" + _ISSUE_TARGET
 # refused for the same reason (it advances to the four-column stop).
 #
 # What the cap costs: a trailer indented four or more columns that GitHub WOULD
-# resolve as lazy paragraph continuation is no longer credited as a declaration.
+# resolve as lazy paragraph continuation is not credited as a declaration.
 # That is the cheap direction -- it prints an advisory notice on an odd body,
 # where the opposite error credits an EXAMPLE and silently suppresses a real
 # unrelated-closure warning -- and a trailer is written as a whole line of its
@@ -201,7 +210,7 @@ _CLOSING_REF_RE = re.compile(
     r"/issues/(?P<url_number>\d+))",
     re.IGNORECASE,
 )
-# Any issue-ish reference at all, used to tell "forgot the verb" from
+# Any issue-ish reference at all, to tell "forgot the verb" from
 # "genuinely closes nothing". Mirrors the same three targets, so a qualified
 # ref or an issue URL written without a verb is reported as a missing keyword
 # rather than as a body with no issue link at all.
@@ -578,7 +587,7 @@ def closing_link_reason(body, closing_refs, repo=None):
     if _CLOSING_KW_RE.search(visible_body):
         # A visible verb is present but the host resolved nothing: the number,
         # repository target, or issue state does not form a live closure. A code
-        # fence is no longer a candidate explanation -- fenced text is masked
+        # fence is not a candidate explanation -- fenced text is masked
         # before this runs, so it cannot reach here in the first place.
         return (
             "body has a closing keyword but the host resolved no issue "
@@ -852,7 +861,7 @@ def collapse_superseded(rollup):
 
     GitHub keeps superseded attempts (typically CANCELLED) in the rollup next
     to the run that replaced them; counting them inflates the failure count
-    with entries that are no longer live. Identity is the workflow-qualified
+    with entries that are not live. Identity is the workflow-qualified
     check name for CheckRuns and the context name for StatusContexts; newest
     is decided by startedAt (ISO-8601, so string comparison orders correctly).
     Entries that cannot be strictly ordered against the current winner are all
@@ -1021,11 +1030,17 @@ def evaluate_reviewer_markers(comments, head_sha, bindings, only=None):
             "blocking": [],
             "findings": {},
             "elided": [],
+            "verdicts": {},
             "pinned": only is not None,
         }
     fresh_by_name: dict = {name: False for name in (only or ())}
     findings: dict = {}
     blocking = set()
+    # Whole-design lanes (Design, UX, First Principles) end their body with a
+    # `<Lane>-Verdict: PASS|CONCERNS|BLOCK` line. Only BLOCK gates; CONCERNS is
+    # advisory -- but an unanswered CONCERNS is the review the loop most often
+    # misses, because nothing else prints it. Surface it, never gate on it.
+    verdicts: dict = {}
     # Reviewers whose freshness rests on an ELIDED stamp (see sha_matches). The
     # gate accepts those, but silently swallowing them would hide the emitter
     # defect for good: nobody would learn a lane is mangling the SHA it was
@@ -1052,6 +1067,9 @@ def evaluate_reviewer_markers(comments, head_sha, bindings, only=None):
                     findings[name] = len(FINDING_LINE_RE.findall(body))
                     if not any(head_sha.startswith(sha) for sha in own_stamps):
                         elided.add(name)
+                    vm = VERDICT_LINE_RE.search(body)
+                    if vm:
+                        verdicts[name] = vm.group(1).upper()
         for sha in BLOCK_MERGE_RE.findall(body):
             if sha_matches(sha, head_sha):
                 blocking.add(name or "(unattributed)")
@@ -1062,12 +1080,13 @@ def evaluate_reviewer_markers(comments, head_sha, bindings, only=None):
         "blocking": sorted(blocking),
         "findings": findings,
         "elided": sorted(elided),
+        "verdicts": verdicts,
         "pinned": only is not None,
     }
 
 
 def reviewer_round_settled(marker_eval):
-    """Whether the AI-review round is decided, regardless of the other checks.
+    """Whether AI review for this head is decided, regardless of the other checks.
 
     True only when the fleet was PINNED (``--reviewers`` / the loop's own
     profile names), the comments were readable, every pinned lane carries a
@@ -1220,6 +1239,7 @@ def decide(
     head_run="skip",
     rollup_notice="",
     disposition_eval=None,
+    concerns_eval=None,
 ):
     """Resolve PR state to (exit_code, status line). Fail-closed.
 
@@ -1271,6 +1291,14 @@ def decide(
        earns: a degraded read names its environment cause, so the reason (and
        ``progress_key.status``, which carries it) distinguishes an environment
        gap from a genuinely check-less PR.
+       ``concerns_eval`` (from unanswered_concern_lanes; None skips the gate)
+       belongs here for the same reason the marker conditions do: mid-round a
+       fresh CONCERNS with no ruling yet is expected, not a defect -- the
+       author has not been shown it. It gates only once the round has settled,
+       which is exactly the state that would otherwise return 0 and arm auto-merge
+       past an unanswered whole-design review. LOCAL ONLY: --disposition-gate
+       never reaches this function, so the repository's required status keeps
+       treating CONCERNS as advisory.
     """
     if state != "OPEN":
         return 20, "STATUS: BLOCKED - PR state is {} (not OPEN; terminal)".format(state or "?")
@@ -1376,6 +1404,10 @@ def decide(
                     "stale reviewer stamp(s) - no [<NAME>-REVIEWED] for current head: "
                     + ", ".join(marker_eval["stale"])
                 )
+    for lane in (concerns_eval or {}).get("unanswered") or []:
+        reasons.append(
+            unanswered_concerns_reason(lane, (concerns_eval or {}).get("head_sha") or "")
+        )
     if head_run is False:
         reasons.append(
             "no pull_request-event workflow run for the current head - the "
@@ -1417,7 +1449,7 @@ def _flag_value(argv, name):
 def disposition_gate(argv, environ):
     """Evaluate ONLY the disposition rule and print one JSON object; exit 0.
 
-    This is the server-side entry point (issue #6658): pr-readiness.yml calls
+    This is the server-side entry point: pr-readiness.yml calls
     it so a disposition record violating the one-lane / one-rationale-per-
     finding rule fails the repository's required status for EVERY writer, not
     only for a writer running the prepare-pr loop. It exists as a mode of this
@@ -1431,7 +1463,7 @@ def disposition_gate(argv, environ):
     Prints ``{"ok", "violations", "comments", "records", "unverified",
     "error"}``. ``ok`` is False when the record set could not be established,
     which the caller must treat as UNKNOWN (pending) rather than as a red: a
-    transient API failure red-lighting the required status is the #2753 class
+    transient API failure red-lighting the required status is that class
     of bug. Exit status is 0 for both outcomes -- the JSON carries the verdict,
     so a non-zero exit means only that this script itself failed to run, and
     the caller can tell the two apart. Enforcement scope is deliberately
@@ -1579,7 +1611,7 @@ def main(argv):
         "  unresolved threads (advisory): " + ("?" if n_unresolved is None else str(n_unresolved))
     )
 
-    # Reviewer-side conditions (issue #2550): the stamp and the comment body
+    # Reviewer-side conditions: the stamp and the comment body
     # are the signal -- never the review workflow's run conclusion, which is
     # unreliable in both directions on this repo.
     marker_authors = resolve_marker_authors(argv, os.environ)
@@ -1606,7 +1638,7 @@ def main(argv):
     else:
         for name in sorted(marker_eval["findings"]):
             print(
-                "  - {}: fresh{}{}{}".format(
+                "  - {}: fresh{}{}{}{}".format(
                     sanitize(name),
                     "  [BLOCK-MERGE]" if name in marker_eval["blocking"] else "",
                     (
@@ -1620,12 +1652,25 @@ def main(argv):
                         if name in (marker_eval.get("elided") or ())
                         else ""
                     ),
+                    (
+                        "  verdict={}{}".format(
+                            marker_eval["verdicts"][name],
+                            (
+                                "  <- whole-design review: answer per item, and read it "
+                                "BEFORE fixing line-level findings"
+                                if marker_eval["verdicts"][name] == "CONCERNS"
+                                else ""
+                            ),
+                        )
+                        if name in (marker_eval.get("verdicts") or {})
+                        else ""
+                    ),
                 )
             )
         for name in marker_eval["stale"]:
             print("  - {}: STALE (stamp names an older head)".format(sanitize(name)))
 
-    # Disposition-rule gate (issue #4187): a repository writer's disposition
+    # Disposition-rule gate: a repository writer's disposition
     # comment must claim exactly one span= finding identity from its own
     # target= lane. Each record is validated against the findings stamped for
     # the head its head= says it judged (in the ordinary fix-then-push round
@@ -1647,6 +1692,19 @@ def main(argv):
             disposition_records, bot_comments, head_sha, marker_bindings
         )
     disposition_eval = {"ok": disposition_ok, "violations": disposition_violation_list}
+    # A whole-design lane at CONCERNS for this head with no matching
+    # disposition record is the review the loop most often walked past: the
+    # rollup is green, so exit 0 armed auto-merge over it. Requires BOTH reads
+    # to have succeeded -- an unreadable side already gates above, and guessing
+    # "no CONCERNS" from an unread comment list is the wrong direction.
+    concerns_eval = None
+    if marker_eval.get("ok") and disposition_records is not None:
+        concerns_eval = {
+            "unanswered": unanswered_concern_lanes(
+                marker_eval.get("verdicts") or {}, disposition_records, head_sha
+            ),
+            "head_sha": head_sha,
+        }
     print("-- Disposition records (one lane, one rationale per finding) " + "-" * 6)
     if not disposition_ok:
         print("  ERROR: disposition records could not be established (fail-closed)")
@@ -1688,6 +1746,14 @@ def main(argv):
             print("  VIOLATION: " + sanitize(v))
         if not disposition_violation_list:
             print("  (no disposition-rule violations)")
+    for lane in (concerns_eval or {}).get("unanswered") or []:
+        print(
+            "  UNANSWERED: {} reported CONCERNS for this head and no "
+            "target={} disposition record names it - run pr_findings.py for "
+            "the Watch/Subtraction items and their span ids".format(
+                sanitize(lane), sanitize(lane.lower())
+            )
+        )
 
     # Assert a pull_request-event run exists for the current head, but only on
     # a PR that demonstrably uses Actions (a rollup entry with a workflowName);
@@ -1726,6 +1792,7 @@ def main(argv):
         head_run=head_run,
         rollup_notice=rollup_notice,
         disposition_eval=disposition_eval,
+        concerns_eval=concerns_eval,
     )
     print(status)
     if "--json" in argv[1:]:

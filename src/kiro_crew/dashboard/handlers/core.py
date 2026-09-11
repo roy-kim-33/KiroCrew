@@ -13,7 +13,7 @@ import platform
 import re
 import shlex
 import shutil
-from collections.abc import Coroutine
+from collections.abc import Coroutine, Iterable
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +21,7 @@ from aiohttp import web
 from aiohttp.client_exceptions import ClientConnectionResetError
 
 import kiro_crew
+import kiro_crew.config.resolution as _resolution
 from kiro_crew import beacon, platform_compat, stt
 from kiro_crew.acp_backends import selectable_backend_values
 from kiro_crew.computer_use.types import MAX_SCREENSHOT_MAX_PX as _CU_MAX_SCREENSHOT_MAX_PX
@@ -36,6 +37,7 @@ from kiro_crew.config.loader import (
     EXTRACTION_POOL_SIZE_MAX,
     EXTRACTION_POOL_SIZE_MIN,
     FOLDER_INGEST_CHUNK_BUDGET_MAX,
+    IMPORT_CHUNK_BUDGET_MAX,
     MAX_SUBAGENTS_FIXED_FLOOR,
     MCP_PROBE_TIMEOUT_MAX,
     MCP_PROBE_TIMEOUT_MIN,
@@ -53,9 +55,12 @@ from kiro_crew.config.loader import (
     KiroCrewConfig,
     config_path,
 )
+from kiro_crew.config.sections import STT_LANGUAGE_AUTO
 from kiro_crew.context_management import RESULT_FILE_MAX_BYTES
 from kiro_crew.dashboard.handlers._shared import (
     _pip_install_channel_available,
+    guard_owner_surface_routes,
+    owner_surface_guard,
     pip_extra_install_command,
 )
 from kiro_crew.dashboard.origin import check_host, is_direct_local_request
@@ -79,7 +84,9 @@ from kiro_crew.stt.limits import (
 from kiro_crew.transcribe import (
     _find_ffmpeg,
     _whisper_language,
+    audio_exceeds_secs,
     availability_detail,
+    batch_duration_cap_secs,
     ensure_ffmpeg_in_path,
     ffmpeg_source,
     is_available,
@@ -107,6 +114,77 @@ _SSE_INTERVAL_SECS = 5
 # distinct from "" so the UI can render a "set (hidden)" placeholder.
 _SENSITIVE_MASK = "••••••••"
 
+# Agent-record fields that carry agent- or package-writable FREE TEXT. An agent
+# can edit ``config.json`` directly, and agent sync copies ``description``
+# straight off a discovered agent spec, so a third-party package controls these
+# strings. They are not schema-``sensitive`` (they are not secrets the OWNER
+# stored), so the schema-driven walk in ``_masked_config_dict`` never touches
+# them — this named list is what closes that gap on the config endpoint.
+#
+# Scope: every ``str`` field of ``KiroCrewAgentConfig`` whose LOAD path does not
+# pin its shape. ``reasoning_effort`` (``coerce_effort`` collapses anything but
+# a known level to ``""``) and ``session_color`` (``_safe_color`` pins to
+# ``#rrggbb``) are excluded because their guards already refuse redactable
+# content; everything else — including fields with only an isinstance-str
+# guard, which constrains type but not content — is in. A test enumerates the
+# dataclass's ``str`` fields against this tuple plus that exception set, so a
+# newly added free-text field fails loudly instead of shipping unmasked.
+#
+# The record KEY (the agent name) is handled separately in the pass below:
+# a suspicious-keyed record is REMOVED from the browser-facing view (masking a
+# key would collide two suspicious records into one entry), and the
+# name-reference fields that could still spell it are masked. The create route
+# does not refuse a credential-shaped name, so this view cannot assume one never
+# arrives.
+_AGENT_UNTRUSTED_TEXT_FIELDS = (
+    "description",
+    "triggers",
+    "kiro_agent",
+    "workspace",
+    "memory_store",
+    "model",
+    "source",
+    "telegram_account",
+)
+
+
+def _mask_agent_free_text(value: object) -> object:
+    """Render ONE agent-record free-text value for the config response.
+
+    Same rule the roster endpoint's rows need: a value the
+    redactors would alter — credential- or exfiltration-URL-shaped text — is
+    replaced WHOLESALE by ``_SENSITIVE_MASK``; a non-string is masked too (it
+    is not renderable content, and ``description`` has no load-time type guard,
+    so one can genuinely arrive here). Benign content passes through
+    byte-identical, so an ordinary stored value renders exactly as written.
+    ``GET /api/agents`` ships these fields verbatim — that half of the class is
+    not this endpoint's.
+
+    A fixed sentinel rather than an in-place scrub: a scrubbed view is a
+    FUNCTION of the stored value, so any future write-side "treat the mask as
+    unchanged" rule would have to recompute the transform and breaks under
+    redaction-chain drift or a stale view; the sentinel is recognizable
+    regardless of either. Named cost: a value containing one credential-shaped
+    token is masked entirely, the same trade ``_masked_config_dict`` already
+    makes for schema-sensitive values.
+
+    Keyed on ``_redact_external`` itself rather than a second detector so this
+    rule and the roster's cannot drift apart. The import is function-local to
+    match this module's handler-import style, not for boot-path weight —
+    ``handlers.agents`` already imports ``discover`` at module level, so it is
+    loaded at handler setup regardless.
+    """
+    from kiro_crew.dashboard.handlers.discover import _redact_external
+
+    if not isinstance(value, str):
+        return _SENSITIVE_MASK
+    # No falsy pre-check on purpose: ``_redact_external`` returns falsy input
+    # unchanged, so ``""`` compares equal and passes through — a ``value and``
+    # guard here would only look like the fail-open bug class without being it.
+    if _redact_external(value) != value:
+        return _SENSITIVE_MASK
+    return value
+
 
 def _masked_config_dict(cfg: KiroCrewConfig) -> dict:
     """Return ``cfg.to_dict()`` with sensitive string values masked.
@@ -118,6 +196,24 @@ def _masked_config_dict(cfg: KiroCrewConfig) -> dict:
     is ever added it MUST treat ``_SENSITIVE_MASK`` as "unchanged" and keep the
     stored value. Sensitivity is schema-driven (``sensitive=True`` field
     metadata), so newly added sensitive fields are masked automatically.
+
+    Two masking passes. The schema walk covers owner-stored secrets
+    (``sensitive=True``). A second pass covers agent-record free text
+    (``_AGENT_UNTRUSTED_TEXT_FIELDS``): those values are agent- and
+    package-writable, so a credential- or exfiltration-URL-shaped one is
+    masked wholesale (``_mask_agent_free_text``) instead of shipping to the
+    browser verbatim. The write-side note above holds for this pass too:
+    neither branch of this endpoint can echo the mask into storage — the
+    PATCH allowlist (``_EDITABLE_CONFIG``) names no ``agents.*`` path, and
+    the PUT branch reads only the singular ``agent`` section against a
+    hardcoded key list. The agents CRUD route is the write path for these
+    fields; its read pair is ``GET /api/agents``, which ships them verbatim —
+    that half of the class needs the same mask plus a mask-means-unchanged
+    write rule this endpoint does not need. Named cost of the wider field set: the overview's config tab renders
+    ``kiro_agent``/``workspace``/``memory_store`` and cross-references the
+    latter two against the workspace and store lists, so a masked value breaks
+    that "used by" row — but only for a record whose value is already
+    credential-shaped, and therefore already meaningless as a reference.
     """
     from kiro_crew.config.schema import JSON_SCHEMA
     from kiro_crew.config.validation import _is_sensitive_path
@@ -136,6 +232,15 @@ def _masked_config_dict(cfg: KiroCrewConfig) -> dict:
     for _extra_key in getattr(cfg, "_extra_sections", {}):
         masked.pop(_extra_key, None)
 
+    # Same reasoning one level down (KiroCrewConfig._extra_keys): an unknown key
+    # captured INSIDE a modelled section — or inside a named agents/workspaces/
+    # memory_stores record — is absent from the schema too, so the sensitivity
+    # walk below cannot recognize it either; a credential a previous build stored
+    # under a since-renamed key (`slack.legacy_bot_token`) would ship verbatim.
+    # Preserving it for save() is the point of the capture; showing it to the
+    # browser is not.
+    _resolution.drop_extra_section_keys(masked, getattr(cfg, "_extra_keys", {}))
+
     def _walk(node: object, prefix: str) -> None:
         if isinstance(node, dict):
             for key, val in list(node.items()):
@@ -150,6 +255,44 @@ def _masked_config_dict(cfg: KiroCrewConfig) -> dict:
                     node[key] = _SENSITIVE_MASK
 
     _walk(masked, "")
+
+    # Second pass: agent-record free text. These fields are absent from the
+    # schema's sensitive set by design (they are not owner secrets), so the walk
+    # above cannot cover them; see _AGENT_UNTRUSTED_TEXT_FIELDS. Both response
+    # sites of this endpoint (the GET body and the PATCH echo) funnel through
+    # this one function, so this pass gives the redaction rule surface coverage
+    # here rather than point coverage.
+    #
+    # The record KEY (the agent name) is handled by REMOVAL, not masking: agent
+    # sync stores a discovered agent's name as this dict's key, so a
+    # credential-shaped package name would ship verbatim as a key — and masking
+    # a key would collide two suspicious records into one entry. Dropping the
+    # record from this browser-facing view (save() still carries it) leaks
+    # nothing and collides nothing; the name-reference fields that could still
+    # spell the removed name (``default_agent``, ``session.pool_agent``) are
+    # masked when they match. Named cost: a suspicious-keyed record is invisible
+    # in the config tab — the same trade the roster's project rows make, and the
+    # name was never renderable content.
+    agents = masked.get("agents")
+    if isinstance(agents, dict):
+        removed: set[object] = set()
+        for name in list(agents.keys()):
+            if not isinstance(name, str) or _mask_agent_free_text(name) != name:
+                agents.pop(name)
+                removed.add(name)
+                continue
+            record = agents[name]
+            if not isinstance(record, dict):
+                continue
+            for field_name in _AGENT_UNTRUSTED_TEXT_FIELDS:
+                if field_name in record:
+                    record[field_name] = _mask_agent_free_text(record[field_name])
+        if removed:
+            if masked.get("default_agent") in removed:
+                masked["default_agent"] = _SENSITIVE_MASK
+            session_section = masked.get("session")
+            if isinstance(session_section, dict) and session_section.get("pool_agent") in removed:
+                session_section["pool_agent"] = _SENSITIVE_MASK
     return masked
 
 
@@ -357,11 +500,14 @@ async def api_ready(request: web.Request) -> web.Response:
 
     * **Startup** — before the socket binds, connection failure is the external
       not-ready signal. After bind, ``DashboardState.ready`` remains false and
-      the probe returns 503 while session restoration, channel relaunch, tunnel
-      setup, and other startup work finish.
+      the probe returns 503 while session restoration, tunnel setup, and other
+      pre-ready wiring finishes.
     * **Serving** — the server publishes ``DashboardState.ready = True`` at the
       same final boundary used by the boot-to-ready metric; readiness is then
-      200 while required state is wired and shutdown has not been requested.
+      200 while required control state is wired and shutdown has not been
+      requested. The separately tracked memory preparation task starts at this
+      boundary: memory content routes remain fail-closed and agent turns wait
+      at admission until it settles.
     * **Shutdown requested** — when SIGTERM/SIGINT or ``POST /api/shutdown``
       sets the process-wide ``shutdown_event``, readiness changes to 503 while
       ``/api/live`` remains 200 until the HTTP server exits. Supervisors that
@@ -419,7 +565,7 @@ async def api_ready(request: web.Request) -> web.Response:
 #: non-catalog value degrades gracefully client-side). Membership IS enforced,
 #: but at the point of use: ``context.ui_language_tag`` gates the agent-steer
 #: read path on ``_UI_LANGUAGE_CATALOGS`` so a non-catalog tag is never claimed
-#: to the model as the UI language (#1130). A new backend consumer of
+#: to the model as the UI language. A new backend consumer of
 #: ``dashboard.language`` must route through that resolver rather than reading
 #: the raw field.
 _LANGUAGE_TAG_RE = re.compile(r"^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8}){0,2}$")
@@ -801,7 +947,7 @@ async def api_stt_config(request: web.Request) -> web.Response:
             "dictation_panel": cfg.stt.dictation_panel,
             "transcribe_region": cfg.stt.transcribe_region,
             "transcribe_profile": cfg.stt.transcribe_profile,
-            "language_code": cfg.stt.language_code,
+            "language_code": cfg.stt.effective_language_code,
             "silence_ms": cfg.stt.silence_ms,
             "partial_interval_ms": cfg.stt.partial_interval_ms,
             "idle_evict_secs": cfg.stt.idle_evict_secs,
@@ -817,7 +963,10 @@ async def api_stt_config(request: web.Request) -> web.Response:
             # streaming controls on a CAPABILITY rather than on a hardcoded provider
             # name — the latter silently hid the toggle when `apple` was added.
             "streaming_providers": list(_STREAMING_PROVIDERS),
-            "language_codes": list(_STT_LANGUAGE_CODES),
+            "language_codes": (
+                ([STT_LANGUAGE_AUTO] if cfg.stt.provider == PROVIDER_LOCAL else [])
+                + list(_STT_LANGUAGE_CODES)
+            ),
             "prereqs": prereqs,
             # True when no install channel can make Transcribe's import
             # requirement (`boto3` + `amazon-transcribe`) satisfiable in this
@@ -892,8 +1041,7 @@ async def api_stt_status(request: web.Request) -> web.Response:
             # reader's locale. `present` is why this cannot be a static frontend
             # table: it is per-host state that changes as models are fetched.
             "models": catalog,
-            # Whether a model is resident in this process, which is what decides
-            # between a 30 ms transcription and one that pays a load first.
+            # Residency avoids model loading, but says nothing about decode speed.
             "engine_loaded": engine_loaded,
             "download": dict(stt_models.store().status),
             # The decoder every compressed input goes through, and what can be
@@ -1068,10 +1216,10 @@ def _ffmpeg_install_commands() -> list[str]:
     on ``GET /api/stt/status`` is what says whether a decoder exists.
 
     There is deliberately no fallback command. A distribution with no FFmpeg
-    package (Amazon Linux, RHEL without EPEL) and no build script in reach used to
-    be handed ``echo 'Build ffmpeg from source: …'``, which a user pasted into a
-    terminal and got a URL echoed back at them -- a command whose only effect is to
-    print a sentence is a dead end wearing the costume of an instruction.
+    package (Amazon Linux, RHEL without EPEL) and no build script in reach gets an
+    empty list rather than ``echo 'Build ffmpeg from source: …'``: a command a user
+    pastes into a terminal only to get a URL echoed back -- one whose only effect is
+    to print a sentence -- is a dead end wearing the costume of an instruction.
     """
     ensure_ffmpeg_in_path()
     if _find_ffmpeg():
@@ -1193,7 +1341,29 @@ async def api_stt_transcribe(request: web.Request) -> web.Response:
                 {"error": "audio too large", "code": _CODE_STT_AUDIO_TOO_LARGE}, status=413
             )
 
-        text = await transcribe_audio(tmp)
+        duration_cap = batch_duration_cap_secs(cfg.stt)
+        if duration_cap is not None:
+            exceeds = await audio_exceeds_secs(tmp, duration_cap, timeout_secs=cfg.stt.timeout_secs)
+            if exceeds is None:
+                return web.json_response(
+                    {
+                        "error": "could not verify audio duration; retry the upload",
+                        "code": "stt_audio_duration_unverified",
+                    },
+                    status=503,
+                )
+            if exceeds:
+                return web.json_response(
+                    {
+                        "error": (
+                            f"audio exceeds the {duration_cap // 60}-minute transcription limit"
+                        ),
+                        "code": "stt_audio_too_long",
+                    },
+                    status=422,
+                )
+
+        text = await transcribe_audio(tmp, cfg.stt)
         if text:
             from kiro_crew.security import (  # noqa: F811
                 redact_credentials,
@@ -1246,8 +1416,8 @@ async def api_sel_verify(request: web.Request) -> web.Response:
 
     ``integrity`` is ``unverifiable`` when the segment dir refused to pin (or
     was swapped mid-verification): the rotated segments were not checked, and
-    the endpoint must not answer ``ok`` over the live log alone (#5051
-    review). ``detail`` carries the reason and is empty when verifiable.
+    the endpoint must not answer ``ok`` over the live log alone. ``detail``
+    carries the reason and is empty when verifiable.
     """
 
     # Same offload rationale as api_sel_events, including deferring _sel() into
@@ -1328,37 +1498,41 @@ async def api_security_posture(_request: web.Request) -> web.Response:
 # caller raising it arbitrarily (e.g. {"subagent_auto_max": 9999}) to bypass
 # the concurrency limit.
 
-# Agent settings whose ENFORCED effect is fixed at gateway startup.
-# ``SubagentManager`` is constructed with ``max_subagents`` and
-# ``subagent_max_turns`` and never re-reads the config afterwards;
-# ``max_concurrent`` is stored once with no setter, and ``subagent_auto_max``
-# only reaches that enforced value as the ``hard_cap`` inside
-# ``compute_max_subagents``, which the same construction calls.
-#
-# Precisely: persisting one of these does NOT change what the running gateway
-# ENFORCES. It is not inert, though — the advisory cap advertised to the model
-# re-resolves from config on each read, so after a write the reported cap can
-# move while the enforced one stays put. That divergence is pre-existing and
-# deliberate (overflow queues, so the advertised number is guidance rather than
-# a limit); this constant describes only the enforced side, which is what the
-# restart is for.
-#
-# ``dynamic-subagent-sizing.md`` states the contract this mirrors: "The cap is
-# computed once per gateway start. Restart to recompute." The ``restart_required``
-# response field is the existing convention for exactly this case — the channel
-# config handlers already return it for settings read at boot, and the frontend
-# API client already types it.
-#
-# ``conductor_skill`` is deliberately absent: it is applied inline by this
-# handler (the skill file is regenerated/removed in-request), so it takes effect
-# immediately and must not raise the restart hint.
-_STARTUP_READ_AGENT_KEYS = frozenset(
-    {
-        "max_subagents",
-        "subagent_max_turns",
-        "subagent_auto_max",
-    }
-)
+
+def _changed_paths_need_restart(changed: Iterable[str]) -> bool:
+    """Whether any of the dotted *changed* paths is declared ``restart=True``.
+
+    The schema metadata is the ONE statement of which fields a running gateway
+    cannot adopt; every other field is hot-applied by the config watcher, so a
+    handler never keeps its own list of boot-only keys. ``changed`` must hold
+    only paths whose value actually moved -- the dashboard sends every setting on
+    each save, so "was applied" is not "was changed".
+    """
+    from kiro_crew.config.schema import requires_restart
+
+    return any(requires_restart(p) for p in changed)
+
+
+async def _hot_apply_after_write() -> None:
+    """Run one watcher cycle so the handler answers after the cycle has dispatched.
+
+    With the watcher started this is the same path a CLI or ``$EDITOR`` write
+    takes, only synchronous. Every applier the cycle awaits has run when this
+    returns; the two that deliberately run off the cycle -- a channel reconnect
+    and a provider switch -- are scheduled by it and may still be in flight when
+    the handler answers. Before boot arms the watcher (or in a test that never
+    did) the loader's cache drop already makes the next ``load()`` see the
+    write, so there is nothing further to do.
+    """
+    from kiro_crew.config import live
+
+    w = live.watch()
+    if not w.started:
+        return
+    try:
+        await w.refresh_now()
+    except Exception:
+        logger.exception("config hot-apply after write failed; next poll retries")
 
 
 async def api_kirocrew_config(request: web.Request) -> web.Response:
@@ -1490,9 +1664,8 @@ async def api_kirocrew_config(request: web.Request) -> web.Response:
                 _validation_error.append(("no recognized settings provided", 400))
                 return None
 
-            restart_required = any(
-                key in _STARTUP_READ_AGENT_KEYS and agent.get(key) != before.get(key)
-                for key in applied
+            restart_required = _changed_paths_need_restart(
+                f"agent.{key}" for key in applied if agent.get(key) != before.get(key)
             )
             _result["applied"] = applied
             _result["restart_required"] = restart_required
@@ -1566,6 +1739,7 @@ async def api_kirocrew_config(request: web.Request) -> web.Response:
             )
 
         restart_required: bool = _result["restart_required"]  # type: ignore[assignment]
+        await _hot_apply_after_write()
         return web.json_response({"ok": True, "restart_required": restart_required})
 
     cfg = KiroCrewConfig.load()
@@ -1616,7 +1790,7 @@ def _validate_role_model(
     reuse the per-session provider guard (rejects display-only canonical keys for
     the active provider), then — when a live advertised set is known — apply the
     SAME entitlement predicate the session-init withhold uses
-    (:func:`model_is_unusable`, #1596) so the picker and the wire cannot disagree.
+    (:func:`model_is_unusable`) so the picker and the wire cannot disagree.
     No advertised set => accept (entitlement unknowable; don't accuse on no
     evidence), matching that predicate's own conservative default.
 
@@ -1672,6 +1846,7 @@ def _selectable_acp_backends() -> list[str]:
 
 _EDITABLE_CONFIG: dict[str, dict] = {
     "agent.provider": {"type": "enum", "values": ["acp"]},
+<<<<<<< HEAD
     # ACP harness: kiro-native (''/kiro-cli), KAS ('kas'), Claude Code ('claude',
     # Anthropic-compatible base URL), or this fork's OpenCode backend
     # ('opencode', OpenAI-compatible base URL — OpenCode translates to
@@ -1686,6 +1861,15 @@ _EDITABLE_CONFIG: dict[str, dict] = {
     # Resolved per request against the one code owner
     # (``acp_backends.selectable_backend_values``), so this can no longer
     # drift from what ``AcpProvider`` will actually serve.
+=======
+    # Which ACP agent drives a session: "" = kiro-cli, "kas" = kiro-agent.
+    # ``values_fn`` rather than a literal, because the set WIDENS after this module
+    # is imported: an edition registers a backend from
+    # ``ProviderRegistry.register_acp_backends`` at boot, and a literal would
+    # reject it here with a misleading "invalid value". Resolved per request
+    # against the one code owner, so this cannot drift from what ``AcpProvider``
+    # will actually serve.
+>>>>>>> upstream/main
     "agent.acp_backend": {"type": "enum", "values_fn": _selectable_acp_backends},
     # Router base URL for the claude / opencode backends. Local
     # http://localhost:PORT and https endpoints both allowed; shell
@@ -1770,6 +1954,7 @@ _EDITABLE_CONFIG: dict[str, dict] = {
     },
     "agent.sandbox": {"type": "enum", "values": ["auto", "off"]},
     "agent.sandbox_allow_no_isolation": {"type": "bool"},
+    "memory.private_provisioning_enabled": {"type": "bool"},
     "agent.completion_keep": {"type": "enum", "values": ["head", "tail", "both"]},
     "agent.completion_keep_chars": {
         "type": "int",
@@ -1783,7 +1968,7 @@ _EDITABLE_CONFIG: dict[str, dict] = {
     },
     "session.timeout_secs": {"type": "int", "min": SESSION_TIMEOUT_MIN, "max": SESSION_TIMEOUT_MAX},
     # Range shared with the load-time clamp in config/loader.py — one constant
-    # pair, so the write gate and the load path cannot drift (issue #4734).
+    # pair, so the write gate and the load path cannot drift.
     "session.autocompact_pct": {
         "type": "float",
         "min": AUTOCOMPACT_PCT_MIN,
@@ -1833,6 +2018,13 @@ _EDITABLE_CONFIG: dict[str, dict] = {
     # terminal — the save-time check exists to surface a typo immediately in
     # the Settings field.
     "dashboard.terminal.shell": {"type": "str", "max_len": 512},
+    # The Terminal tab's completion popup (Settings → Display → Terminal).
+    # Default on; the completion route reads it per request (handlers/
+    # terminal.py `_completion_disabled`), so a toggle takes effect on the
+    # next keystroke with no restart. The whole-panel `terminal.enabled`
+    # stays config-file-only: it also kills the PTY, which is not a display
+    # preference.
+    "dashboard.terminal.completion.enabled": {"type": "bool"},
     # Keep the host awake while the agent is running a task. Gateway-host
     # behavior (not a display pref), read by the prevent-sleep poll in
     # dashboard/server.py; off by default.
@@ -1879,6 +2071,11 @@ _EDITABLE_CONFIG: dict[str, dict] = {
     # empty allowlist stays off; an unrecognised pin_scope falls back to node).
     "dashboard.tailscale.trust_identity": {"type": "bool"},
     "dashboard.tailscale.pin_scope": {"type": "str", "max_len": 8},
+    # Refresh-chain peer binding. Editable here because the only
+    # direction a caller can move it is the one an operator may legitimately
+    # need for roaming, and the loader resolves anything non-boolean back to the
+    # bound default — so a malformed write cannot reopen the replay path.
+    "dashboard.tailscale.bind_refresh_chains": {"type": "bool"},
     # Local OTEL metric collection — the Privacy panel's recording switch. Safe
     # to expose where beacon_endpoint is not: turning this on writes JSONL under
     # ~/.kiro/crew/metrics. It is NOT unconditionally local, though —
@@ -1916,6 +2113,7 @@ _EDITABLE_CONFIG: dict[str, dict] = {
     },
     "knowledge.dedup_every_n_sweeps": {"type": "int", "min": 0, "max": DEDUP_EVERY_N_SWEEPS_MAX},
     "knowledge.sweep_chunk_budget": {"type": "int", "min": 0, "max": SWEEP_CHUNK_BUDGET_MAX},
+    "knowledge.import_chunk_budget": {"type": "int", "min": 0, "max": IMPORT_CHUNK_BUDGET_MAX},
     "knowledge.embed_rate_limit": {"type": "int", "min": 0, "max": EMBED_RATE_LIMIT_MAX},
     "knowledge.extraction_model": {"type": "str"},
     "knowledge.extraction_pool_size": {
@@ -2301,8 +2499,15 @@ async def api_kirocrew_config_patch(request: web.Request) -> web.Response:
 
     _log_sel("success", f"{path_key}={value}")
 
-    cfg = KiroCrewConfig.load()
+    # Everything a running gateway does in response to this write lives behind
+    # ``config.live.subscribe`` (the provider switch and role-model rebuild are
+    # registered in ``server.py``; session defaults, subagent budgets and the
+    # metrics recorder by their owners), so a dashboard PATCH, ``kirocrew config
+    # set`` and an ``$EDITOR`` save all apply identically. Waiting for the cycle
+    # here means the masked config returned below is the one already in force.
+    await _hot_apply_after_write()
 
+<<<<<<< HEAD
     # If the backend changed, reload the factory so new sessions use the new provider
     if path_key in ("agent.acp_backend", "agent.provider_base_url", "agent.provider_api_key", "agent.provider_api_format"):
         state: DashboardState = request.app["state"]
@@ -2421,6 +2626,14 @@ async def api_kirocrew_config_patch(request: web.Request) -> web.Response:
             logger.warning("metrics recorder reset after telemetry toggle failed", exc_info=True)
 
     return web.json_response(_masked_config_dict(cfg))
+=======
+    from kiro_crew.config import live
+
+    applied = live.snapshot()
+    if applied is None:
+        applied = await asyncio.to_thread(KiroCrewConfig.load)
+    return web.json_response(_masked_config_dict(applied))
+>>>>>>> upstream/main
 
 
 # ── Local token bootstrap (Electron / local apps) ─────────────────────
@@ -2459,6 +2672,24 @@ async def api_token_local(request: web.Request) -> web.Response:
             resources="invalid-secret",
         )
         return web.json_response({"error": "invalid secret"}, status=403)
+    from kiro_crew.member_memory_auth import local_owner_bootstrap_allowed
+
+    if not await asyncio.to_thread(local_owner_bootstrap_allowed, request):
+        _sel().log_api_access(
+            caller="local-process",
+            operation="token.local",
+            outcome="denied",
+            source="local-bootstrap",
+            resources="unverified-owner-process",
+        )
+        return web.json_response(
+            {
+                "error": "The gateway could not verify this process as the local owner. "
+                "Open the dashboard using its CLI login link on the gateway host.",
+                "code": "member_owner_token_refused",
+            },
+            status=403,
+        )
     ttl = MAX_SESSION_TTL_SECS
     ttl_param = request.query.get("ttl", "")
     if ttl_param:
@@ -2502,8 +2733,8 @@ def _invalid_session_path_id(session_id: str, agent_id: str | None = None) -> we
     set the path join refuses, no wider (a narrower guard would break the ``:``
     in a real key like ``dashboard:slot-3``) and no narrower (a wider one puts
     the 500 back). Shape follows ``cron.py``'s ``_invalid_path_id_response`` --
-    400 with an ``invalid_<name>`` ``code`` -- which is the contract #6301 names
-    and which AGENTS.md's code-field rule requires.
+    400 with an ``invalid_<name>`` ``code`` -- the contract
+    docs/system-specs/common/code-style.md requires of a backend-owned error body.
 
     ``agent_id`` is checked second because that is the order the sinks validate
     in, so the reported code names the half the caller must actually fix.
@@ -2779,3 +3010,18 @@ async def api_app_token(request: web.Request) -> web.Response:
         source="app_auth",
     )
     return web.json_response({"token": token})
+
+
+# The session sub-agent routes are owner surfaces under their own audit labels;
+# any other ``api_session_agent*`` handler is refused to private members under
+# its name.
+guard_owner_surface_routes(
+    globals(),
+    prefix="api_session_agent",
+    member_scoped=frozenset(),
+    resource_scoped={
+        "api_session_agents_list": owner_surface_guard("session.agents.list"),
+        "api_session_agent_result": owner_surface_guard("session.agent.result"),
+        "api_session_agent_stream": owner_surface_guard("session.agent.stream"),
+    },
+)

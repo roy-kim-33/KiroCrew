@@ -1,6 +1,6 @@
-"""Contract tests for the stateless session-directive tools (issue #755).
+"""Contract tests for the stateless session-directive tools.
 
-``monitor_start`` / ``monitor_update`` / ``autonudge_stop`` no longer resolve a
+``monitor_start`` / ``monitor_update`` / ``autonudge_stop`` do not resolve a
 session identity or make HTTP calls. Each VALIDATES its arguments and returns a
 DIRECTIVE string — a human-readable confirmation plus an opaque marker carrying
 the validated payload (and NO session key). The session-aware consumer
@@ -18,13 +18,13 @@ The tests split along that seam:
   resolver returns ``""`` and the tool DOES emit a directive.
 * **Applier invariants** — call ``apply_session_directive`` with a fake
   AutoNudge service and fake state/slot, preserving the security invariants
-  that used to live inside the tool: capped-loop refusal, paused-loop
+  enforced in the applier: capped-loop refusal, paused-loop
   protection, and ownership by the session binding key (never a caller-supplied
   loop id).
 
-The former mock-dashboard HTTP server, user-token handshake, and
-arm-failure/lost-response recheck tests are gone: that logic no longer exists —
-the tools are stateless and the loop mutation happens in-process in the applier.
+The tools carry no mock-dashboard HTTP server, user-token handshake, or
+arm-failure/lost-response recheck: they are stateless and the loop mutation
+happens in-process in the applier.
 """
 
 from __future__ import annotations
@@ -44,7 +44,7 @@ from kiro_crew.autonudge import (
     binding_key_for,
 )
 from kiro_crew.dashboard.session_directive_apply import apply_session_directive
-from kiro_crew.mcp_core import _call_tool_inner
+from kiro_crew.mcp_core import _call_tool, _call_tool_inner
 from kiro_crew.mcp_tools._limits import _MONITOR_DEFAULT_MAX_CYCLES
 from kiro_crew.validation import ValidationError
 
@@ -66,7 +66,7 @@ def default_install(monkeypatch):
 def test_monitor_start_returns_directive_with_validated_payload(default_install, gateway_posts):
     """A valid call returns a directive decoding to the validated payload with
     interval_secs mapped to idle_secs."""
-    result = _call_tool_inner(
+    result = _call_tool(
         "monitor_start",
         {"message": "check PR #1 until green", "interval_secs": 300, "max_cycles": 5},
     )
@@ -83,7 +83,19 @@ def test_monitor_start_returns_directive_with_validated_payload(default_install,
     }
     # BOTH halves of the delivery contract: the marker above, and the
     # out-of-band record parked for a consumer that never sees the marker.
-    assert gateway_posts == [("/api/session-directive", {"kind": "monitor_start", "args": args})]
+    assert gateway_posts == [
+        (
+            "/api/session-directive",
+            {
+                "tool": "monitor_start",
+                "raw_args": {
+                    "message": "check PR #1 until green",
+                    "interval_secs": 300,
+                    "max_cycles": 5,
+                },
+            },
+        )
+    ]
 
 
 def test_monitor_start_runtime_budget_passes_through(default_install):
@@ -211,11 +223,14 @@ def test_monitor_update_short_circuits_for_non_nudgeable_session(monkeypatch, ga
 
 
 def test_autonudge_stop_returns_directive_with_stripped_reason(default_install, gateway_posts):
-    result = _call_tool_inner("autonudge_stop", {"reason": "  PR is green  "})
+    result = _call_tool("autonudge_stop", {"reason": "  PR is green  "})
     assert session_directive.decode(result, "autonudge_stop") == {"reason": "PR is green"}
-    # The published record carries the same stripped reason as the marker.
+    # The CALL is reported raw; the gateway re-runs the tool and strips it again.
     assert gateway_posts == [
-        ("/api/session-directive", {"kind": "autonudge_stop", "args": {"reason": "PR is green"}})
+        (
+            "/api/session-directive",
+            {"tool": "autonudge_stop", "raw_args": {"reason": "  PR is green  "}},
+        )
     ]
 
 
@@ -235,8 +250,8 @@ def test_autonudge_stop_short_circuits_for_non_nudgeable_session(monkeypatch, ga
 
 # ── Applier invariants (dashboard.session_directive_apply) ────────────────────
 #
-# These preserve the security invariants that used to live inside the tool,
-# moved to the consumer that actually mutates loop state. The applier resolves
+# These preserve the security invariants enforced in the consumer that actually
+# mutates loop state. The applier resolves
 # the loop by ``svc.get_by_slot(binding_key_for(session_key))`` and calls the
 # authz cores; the fakes below record those calls without touching a real
 # AutoNudge service. The authz helpers are imported LAZILY inside the applier
@@ -565,7 +580,7 @@ def test_applier_monitor_update_revives_a_capped_loop_only_when_cap_is_raised(mo
 
 
 def test_applier_monitor_update_revives_a_budget_stopped_loop_on_budget_raise(monkeypatch):
-    """PAUSED-LOOP symmetry (design-review on #2116): a loop stopped by its
+    """PAUSED-LOOP symmetry: a loop stopped by its
     wall-clock budget gets the SAME agent-side recovery as a cap-stopped one —
     raising the budget above the loop's elapsed age revives it. Keyed on the
     persisted stopped_reason, not elapsed-time inference."""
@@ -599,7 +614,7 @@ def test_applier_monitor_update_revives_a_budget_stopped_loop_on_budget_raise(mo
 
 
 def test_applier_manual_pause_is_never_revived_by_a_budget_raise(monkeypatch):
-    """GPT P1 repro on #2116: pause a loop manually, let wall-clock pass its
+    """Pause a loop manually, let wall-clock pass its
     budget, then raise max_runtime_secs — the loop must STAY paused. Elapsed
     time cannot distinguish a pause from an expiry; only the persisted
     stopped_reason can, and 'manual' never auto-resumes."""

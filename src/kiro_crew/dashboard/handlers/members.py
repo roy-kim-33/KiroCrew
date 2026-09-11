@@ -26,7 +26,12 @@ from aiohttp import web
 import kiro_crew.dashboard.handlers as _h
 from kiro_crew import members as members_mod
 from kiro_crew.config.loader import KiroCrewConfig
-from kiro_crew.dashboard.chat_persistence import rehydrate_slot_from_history_async
+from kiro_crew.dashboard.chat_persistence import (
+    pin_private_agent_store,
+    rehydrate_slot_from_history_async,
+)
+from kiro_crew.dashboard.chat_utils import effective_session_key
+from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
 from kiro_crew.dashboard.state import DashboardState, request_slot_origin
 from kiro_crew.members import MemberSlugError
 from kiro_crew.validation import _AGENT_NAME_RE
@@ -76,10 +81,9 @@ async def _deny_app_caller(request: web.Request, operation: str) -> web.Response
     would confirm the surface exists to a caller that may not know about it.
 
     The audit is a bare enqueue: SEL is warmed at gateway startup
-    (``sel.warm_sel_singleton``), so the first-touch filesystem
-    initialization this call site used to offload never runs here (#8608).
-    Guarded because a FAILED warm leaves construction to retry on this
-    thread and possibly raise.
+    (``sel.warm_sel_singleton``), so the first-touch filesystem initialization
+    never runs on this call site. Guarded because a FAILED warm leaves
+    construction to retry on this thread and possibly raise.
     """
     request_app = request.get("app", "")
     if not request_app:
@@ -117,6 +121,25 @@ def _member_names_for_slug(cfg: KiroCrewConfig, slug: str) -> list[str]:
     return out
 
 
+#: The roster's origin vocabulary. ``source`` on the record is free text in a
+#: hand-editable, agent-writable config, so it never reaches the response raw:
+#: the two known non-package origins pass through and everything else -- the
+#: legacy ``aim`` spelling, a typo, a credential-shaped string -- collapses to
+#: ``package``, which is also what the sync's prune step treats as package.
+_SOURCE_KIROCREW = "kirocrew"
+_SOURCE_BUILTIN = "builtin"
+_SOURCE_PACKAGE = "package"
+
+
+def normalize_member_source(raw: object) -> str:
+    """Bound a record's ``source`` to the three values the roster renders."""
+    if raw == _SOURCE_KIROCREW:
+        return _SOURCE_KIROCREW
+    if raw == _SOURCE_BUILTIN:
+        return _SOURCE_BUILTIN
+    return _SOURCE_PACKAGE
+
+
 async def api_members(request: web.Request) -> web.Response:
     """GET /api/members — crew roster with DM binding and cheap live status.
 
@@ -141,23 +164,48 @@ async def api_members(request: web.Request) -> web.Response:
             slug = members_mod.slug_for_name(name)
         except MemberSlugError:
             continue
+        store = agent_cfg.memory_store
+        record = getattr(cfg, "memory_stores", {}).get(store)
+        version = getattr(record, "memory_version", 1 if store == "default" else None)
+        owner = getattr(record, "owner_member", "")
+        if name != "default" and version == 1 and not owner:
+            if any(item.owner_member == name for item in cfg.memory_stores.values()):
+                version = None
         rows.append(
             {
                 # Explicit allowlist — never a dataclass spread. The response
                 # is a network-boundary contract: spreading `AgentConfig`
                 # would ship every future field (including a credential-shaped
-                # one) to the roster endpoint automatically. These are
-                # exactly what the detail drawer renders.
+                # one) to the roster endpoint automatically. Each field below is
+                # here because a caller renders or routes on it.
                 "name": name,
                 "slug": slug,
                 "kiro_agent": agent_cfg.kiro_agent,
                 "workspace": agent_cfg.workspace,
                 "memory_store": agent_cfg.memory_store,
+                "memory_version": version,
+                "memory_owner": owner,
                 "model": agent_cfg.model,
                 # Presentation-only and validated by _safe_avatar at load, so
                 # it cannot carry a credential-shaped value. Without it every
                 # Members surface silently falls back to the name-derived face.
                 "avatar": agent_cfg.avatar,
+                # Roster-filter inputs. `source` lets the page collapse the
+                # package-installed majority the agent sync writes; it is
+                # NORMALIZED, never the raw config string (see
+                # normalize_member_source). `starred` is a load-time-coerced
+                # bool (the user's own favourite mark, PUT /api/agents/{name}).
+                "source": normalize_member_source(agent_cfg.source),
+                "starred": bool(agent_cfg.starred),
+                # A crew's IDENTITY: who it is, and the phrasings that should
+                # reach it. Both are operator-authored prose already stored on the
+                # crew, and both are needed off-config — a roster that shows a
+                # crew's memory store but not what it is for cannot answer "which
+                # of these should handle a ticket", by the reader or by a router.
+                # An empty `triggers` is meaningful rather than missing: it is the
+                # operator's opt-out from being routed to at all.
+                "description": agent_cfg.description,
+                "triggers": agent_cfg.triggers,
             }
         )
 
@@ -200,7 +248,13 @@ async def api_members(request: web.Request) -> web.Response:
         for row in rows:
             if not row["slot_key"]:
                 continue
-            log_key = f"dashboard:{row['slot_key']}"
+            # A non-empty slot_key came from read_dm_binding, which refuses
+            # any binding whose slot_key is not the slug's own derivation —
+            # so the canonical alias helper reads the same key the binding
+            # names, and the alias format stays owned by ONE function.
+            binding = bindings.get(row["slug"])
+            generation = binding.get("memory_store", "") if binding is not None else ""
+            log_key = members_mod.member_thread_session_alias(row["slug"], generation)
             mt = state.conversation_log.session_mtime(log_key)
             if not mt:
                 continue
@@ -219,6 +273,21 @@ async def api_members(request: web.Request) -> web.Response:
         row["last_message"] = preview
 
     return web.json_response({"members": rows})
+
+
+def _member_thread_slot(cfg, member: str, slug: str) -> tuple[str, str]:
+    """Keep protected V2 DMs; otherwise give private memory a fresh generation."""
+    from kiro_crew.member_memory_auth import read_private_session_store
+    from kiro_crew.memory_stores import require_member_memory_store
+
+    store = require_member_memory_store(cfg, member)
+    record = cfg.memory_stores.get(store)
+    if record is None or record.memory_version != 2:
+        return members_mod.member_slot_key(slug), ""
+    legacy_key = members_mod.member_thread_session_alias(slug)
+    if read_private_session_store(legacy_key) == store:
+        return members_mod.member_slot_key(slug), ""
+    return members_mod.member_slot_key(slug, store), store
 
 
 async def api_member_thread(request: web.Request) -> web.Response:
@@ -265,7 +334,21 @@ async def api_member_thread(request: web.Request) -> web.Response:
     # first crew (config order) whose name derives this slug. This keeps a
     # colliding slug's thread stably attributed to whoever bound it first.
     slug_owners = _member_names_for_slug(cfg, slug)
-    member_name = ""
+    member_name = (
+        binding["member"]
+        if binding is not None and binding.get("member") in slug_owners
+        else (slug_owners[0] if slug_owners else "")
+    )
+    slot_key, generation = "", ""
+    if member_name:
+        try:
+            slot_key, generation = await asyncio.to_thread(
+                _member_thread_slot, cfg, member_name, slug
+            )
+        except Exception as exc:
+            from kiro_crew.dashboard.handlers.memory import _store_unavailable_response
+
+            return _store_unavailable_response(cfg.agents[member_name].memory_store, exc)
     if binding is not None:
         if binding.get("member") in slug_owners:
             member_name = binding["member"]
@@ -309,7 +392,7 @@ async def api_member_thread(request: web.Request) -> web.Response:
         # the crew). A member key with NO history binds fresh as usual.
         if member_name and state.conversation_log is not None:
             _log = state.conversation_log
-            _history_key = f"dashboard:{members_mod.member_slot_key(slug)}"
+            _history_key = members_mod.member_thread_session_alias(slug, generation)
             # STRUCTURAL existence, not metadata truthiness: get_metadata
             # answers {} for both "never persisted" and "present but
             # malformed/unreadable", and treating the second as the first
@@ -340,7 +423,6 @@ async def api_member_thread(request: web.Request) -> web.Response:
             {"error": "no crew member for this slug", "code": "member_not_found"}, status=404
         )
 
-    slot_key = members_mod.member_slot_key(slug)
     slot = state._slots.get(slot_key)
     if slot is None:
         # A dormant thread (gateway restart outside the restore window, or a
@@ -402,6 +484,58 @@ async def api_member_thread(request: web.Request) -> web.Response:
             status=409,
         )
 
+    member_store = getattr(cfg.agents[member_name], "memory_store", "")
+    store_record = cfg.memory_stores.get(member_store) if member_store else None
+    if store_record is not None and store_record.memory_version == 2:
+        from kiro_crew.member_memory_auth import read_private_session_store
+
+        canonical_key = members_mod.member_thread_session_alias(slug, generation)
+        async with slot._lock:
+            if effective_session_key(slot) != canonical_key or slot.running:
+                return web.json_response(
+                    {
+                        "error": "the member thread is running or linked to another session",
+                        "code": "member_slot_conflict",
+                    },
+                    status=409,
+                )
+            # The owner selected this slug, not an editable transcript or DM
+            # binding. A colliding slug needs an already protected assignment.
+            slot._memory_assignment_from_history = True
+            try:
+                if (
+                    len(slug_owners) != 1
+                    and (await asyncio.to_thread(read_private_session_store, canonical_key))
+                    != member_store
+                ):
+                    return web.json_response(
+                        {
+                            "error": "choose distinct member names before opening this private thread",
+                            "code": "member_pin_mismatch",
+                        },
+                        status=409,
+                    )
+                assigned_store = await pin_private_agent_store(
+                    state, canonical_key, member_name, cfg
+                )
+            except Exception as exc:
+                from kiro_crew.dashboard.handlers.memory import _store_unavailable_response
+
+                return _store_unavailable_response(member_store, exc)
+            if (
+                state._slots.get(slot_key) is not slot
+                or effective_session_key(slot) != canonical_key
+                or slot.agent != member_name
+            ):
+                return web.json_response(
+                    {
+                        "error": "member thread changed during assignment",
+                        "code": "member_slot_conflict",
+                    },
+                    status=409,
+                )
+            slot.memory_store = assigned_store
+
     created = (
         binding is None
         or binding.get("slot_key") != slot.key
@@ -410,7 +544,9 @@ async def api_member_thread(request: web.Request) -> web.Response:
     if created:
         try:
             await asyncio.to_thread(
-                lambda: members_mod.write_dm_binding(slug, member=member_name, slot_key=slot.key)
+                lambda: members_mod.write_dm_binding(
+                    slug, member=member_name, slot_key=slot.key, memory_store=generation
+                )
             )
         except OSError:
             logger.warning("failed to persist dm binding for %r", slug, exc_info=True)
@@ -517,3 +653,228 @@ async def api_member_activity(request: web.Request) -> web.Response:
             "entries": [r[2] for r in rows[:_ACTIVITY_LIMIT]],
         }
     )
+
+
+async def api_member_rules_get(request: web.Request) -> web.Response:
+    """GET /api/members/{slug}/rules?member=<name> — user-owned permanent rules.
+
+    The read half of the rules API (a Members-page rules editor is a
+    follow-up; nothing in the frontend consumes this yet). ``member``
+    (query, REQUIRED) is the
+    exact crew name, same posture as the activity endpoint: slugification is
+    lossy, and the name-scoped read is what keeps a colliding slug's editor
+    from showing another member's safety rules. Absent rules read as ``""`` (a
+    legal state), never 404: the editor's empty state IS "no rules yet". An
+    EXISTING file that cannot be read answers 500 ``rules_unreadable`` rather
+    than an empty editor a save would then silently overwrite.
+    """
+    denied = await _deny_app_caller(request, "members.rules")
+    if denied is not None:
+        return denied
+    # Owner gate, same boundary as the PUT: the rules are the OWNER's private
+    # safety instructions for this member. Any allowed Slack user can mint a
+    # dashboard session (`!dashboard`), so without this gate a non-owner
+    # colleague could read boundaries the owner never shared — disclosure is
+    # one-way, so the read is gated exactly like the write.
+    owner_denied = await require_owner_dashboard_request(request, "members.rules.read")
+    if owner_denied is not None:
+        return owner_denied
+    slug = request.match_info["slug"]
+    try:
+        members_mod.validate_slug(slug)
+    except MemberSlugError:
+        return web.json_response(
+            {"error": "invalid member slug", "code": "invalid_member_slug"}, status=400
+        )
+    member = request.query.get("member", "")
+    if not member or not _AGENT_NAME_RE.match(member):
+        return web.json_response(
+            {"error": "member query parameter required", "code": "missing_member"}, status=400
+        )
+    try:
+        rules = await asyncio.to_thread(members_mod.read_member_rules, slug, member)
+    except members_mod.MemberRulesUnreadable:
+        logger.warning("member rules unreadable for %r", slug, exc_info=True)
+        return web.json_response(
+            {
+                "error": (
+                    "rules file exists but cannot be read; rewrite or clear "
+                    "the rules via PUT /api/members/{slug}/rules to repair it"
+                ),
+                "code": "rules_unreadable",
+            },
+            status=500,
+        )
+
+    # Successful reads leave an audit trace too: the rules are the owner's
+    # private safety boundary, so WHO read them matters as much as who was
+    # refused — a denied-only trail cannot answer "was this boundary
+    # disclosed". A direct enqueue, not a to_thread hop: the SEL singleton is
+    # warmed at startup (sel.warm_sel_singleton), so the first-touch
+    # initialization never runs on this call site. Guarded because a
+    # FAILED warm leaves construction to retry on this thread and possibly
+    # raise, and an audit must never change the outcome.
+    try:
+        _sel().log_api_access(
+            caller=request.remote or "",
+            operation="members.rules.read",
+            outcome="allowed",
+            source="dashboard",
+            resources=f"slug={slug}",
+        )
+    except Exception:  # pragma: no cover - audit must never change the outcome
+        logger.debug("SEL audit for members.rules.read failed", exc_info=True)
+    return web.json_response(
+        {"slug": slug, "rules": rules, "max_chars": members_mod.MEMBER_RULES_MAX_CHARS}
+    )
+
+
+async def api_member_rules_put(request: web.Request) -> web.Response:
+    """PUT /api/members/{slug}/rules — write a member's permanent rules.
+
+    This is the ONLY write path for the rules layer, and it is a HUMAN
+    dashboard action by construction: app tokens are denied like every member
+    surface, and the file itself lives under the keystone-gated ``trust/``
+    subtree the agent's tools cannot write. ``member`` in the body must name
+    the exact registered crew the slug belongs to, and when TWO registered
+    crews collide onto one slug the write is refused outright (409
+    ``rules_slug_ambiguous``): the rules file is one-per-slug, so either
+    colliding member's save would overwrite the other's safety boundary —
+    ambiguous ownership is refused, never resolved silently.
+
+    An empty ``rules`` string clears the rules (documented absent state).
+    Over-cap payloads are refused with 400, never truncated.
+    """
+    denied = await _deny_app_caller(request, "members.rules")
+    if denied is not None:
+        return denied
+    # Owner gate BEFORE any input validation: the rules layer is the USER's
+    # safety boundary for this member, so writing it is owner-only — the same
+    # server-side boundary the agent-config mutations enforce. Gating first
+    # also keeps the route's non-owner answer a uniform 401/403 (the owner-gate
+    # invariant test walks every mutating route), never a 400 that leaks
+    # which slugs validate.
+    owner_denied = await require_owner_dashboard_request(request, "members.rules.write")
+    if owner_denied is not None:
+        return owner_denied
+    slug = request.match_info["slug"]
+    try:
+        members_mod.validate_slug(slug)
+    except MemberSlugError:
+        return web.json_response(
+            {"error": "invalid member slug", "code": "invalid_member_slug"}, status=400
+        )
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid JSON body", "code": "invalid_json"}, status=400)
+    if not isinstance(body, dict):
+        # Valid JSON that is not an object (an array, a string) would raise on
+        # .get() below — a coded 400, never a 500, for a malformed request.
+        return web.json_response({"error": "invalid JSON body", "code": "invalid_json"}, status=400)
+    member = body.get("member", "")
+    if "rules" not in body:
+        # Absent is NOT empty: an explicit "" clears the rules (documented),
+        # but a payload that simply omitted the key must not silently delete
+        # the user's safety boundary.
+        return web.json_response(
+            {"error": "rules field required", "code": "missing_rules"}, status=400
+        )
+    rules = body.get("rules", "")
+    if not isinstance(member, str) or not member or not _AGENT_NAME_RE.match(member):
+        return web.json_response(
+            {"error": "member field required", "code": "missing_member"}, status=400
+        )
+    if not isinstance(rules, str):
+        return web.json_response(
+            {"error": "rules must be a string", "code": "invalid_rules"}, status=400
+        )
+    try:
+        # JSON allows escaped lone surrogates; UTF-8 does not. Refuse them with
+        # a coded 400 here — write_member_rules re-checks and raises ValueError
+        # as the storage-layer backstop, but that branch answers "too long".
+        rules.encode("utf-8")
+    except UnicodeEncodeError:
+        return web.json_response(
+            {
+                "error": "rules contain characters that cannot be encoded",
+                "code": "rules_not_encodable",
+            },
+            status=400,
+        )
+    try:
+        if members_mod.slug_for_name(member) != slug:
+            return web.json_response(
+                {"error": "member does not match slug", "code": "member_slug_mismatch"}, status=400
+            )
+    except MemberSlugError:
+        return web.json_response(
+            {"error": "member does not match slug", "code": "member_slug_mismatch"}, status=400
+        )
+    # Config load does filesystem reads + validation — off-loop, like every
+    # other handler's config access on a request path.
+    cfg = await asyncio.to_thread(KiroCrewConfig.load)
+    if member not in cfg.agents:
+        return web.json_response(
+            {"error": "no crew member for this slug", "code": "member_not_found"}, status=404
+        )
+    # Same collision scan the roster/thread paths use — the central helper
+    # applies the agent-name grammar filter and tolerates MemberSlugError, so
+    # a hand-edited config key that is not a valid agent name can neither
+    # crash this scan nor manufacture a phantom collision.
+    colliding = _member_names_for_slug(cfg, slug)
+    if colliding != [member]:
+        return web.json_response(
+            {
+                "error": "multiple crews share this slug; rules would be ambiguous",
+                "code": "rules_slug_ambiguous",
+            },
+            status=409,
+        )
+    try:
+        await asyncio.to_thread(members_mod.write_member_rules, slug, member=member, text=rules)
+    except ValueError:
+        return web.json_response(
+            {
+                "error": f"rules exceed {members_mod.MEMBER_RULES_MAX_CHARS} characters",
+                "code": "rules_too_long",
+            },
+            status=400,
+        )
+    except OSError:
+        logger.warning("member rules write failed for %r", slug, exc_info=True)
+        return web.json_response(
+            {"error": "could not persist rules", "code": "rules_write_failed"}, status=500
+        )
+
+    # Same audit posture as the GET: a successful boundary WRITE is the event
+    # an owner most needs a trace of — it is the moment the member's safety
+    # rules changed. Direct enqueue for the same reason (SEL warmed at startup).
+    try:
+        _sel().log_api_access(
+            caller=request.remote or "",
+            operation="members.rules.write",
+            outcome="allowed",
+            source="dashboard",
+            resources=f"slug={slug}",
+        )
+    except Exception:  # pragma: no cover - audit must never change the outcome
+        logger.debug("SEL audit for members.rules.write failed", exc_info=True)
+    # A warm member session injected its rules at session start; without this,
+    # the member keeps running under the OLD boundary until a compaction or a
+    # cold start happens to refresh it. Flag the thread's session for
+    # reinjection: the next turn re-injects the whole member section (fresh
+    # rules included) through the same post-compaction branch, no session
+    # teardown needed — and the flag is a no-op when no session is warm.
+    try:
+        state: DashboardState = request.app["state"]
+        binding = await asyncio.to_thread(members_mod.read_dm_binding, slug)
+        if binding is not None:
+            state.sessions.mark_needs_reinjection(
+                members_mod.member_thread_session_alias(slug, binding.get("memory_store", ""))
+            )
+    except Exception:
+        # Best-effort: the write LANDED (the durable state is correct), and a
+        # cold session picks the new rules up at its next start regardless.
+        logger.debug("could not flag member session for reinjection", exc_info=True)
+    return web.json_response({"slug": slug, "ok": True})

@@ -2,6 +2,7 @@ import { safeSetItem } from '../utils/safeStorage'
 import { jsonEqual } from '../utils/structuralEqual'
 import { createSlice, createAsyncThunk, createSelector, type PayloadAction } from '@reduxjs/toolkit'
 import { api } from '../api/client'
+import { ApiError } from '../api/apiError'
 import { sanitizeLlmOutput, isUnsafeKey } from '../utils/sanitize'
 import type { StatusData, ChatSlot, TodoList, McpSessionReport } from '../types'
 import type { SessionColorMode, PaletteName, DefaultColorSetting, IntensityName } from '../utils/sessionColors'
@@ -12,8 +13,18 @@ export interface SubagentDetail {
 
 interface DashboardState {
   status: StatusData | null
+  /** The ad-hoc auto-approve duration this tab last saved in Settings, or
+   *  undefined when it has saved none. Applied over every status write: the
+   *  save is the newest fact this tab holds, and a status reply that began
+   *  before it (the boot read, a slow earlier request) can carry the older
+   *  value. Reset by a page load, whose boot read then reads the stored one. */
+  savedYoloDuration?: NonNullable<StatusData['yolo_duration']>
   connected: boolean
   slots: ChatSlot[]
+  /** Increments for every accepted authoritative full-slot frame/reply. */
+  slotsGeneration: number
+  /** Per-key optimistic/reconciliation pin writes, independent of other slot fields. */
+  slotPinGenerations: Record<string, number>
   // Slot keys in the order the session sidebar actually DISPLAYS them
   // (pinned-first + the user's sort, flat-view aware). Published by
   // ChatSidebar; consumed by the chat-jump / chat-cycle keyboard shortcuts so
@@ -65,6 +76,8 @@ const initialState: DashboardState = {
   status: null,
   connected: false,
   slots: [],
+  slotsGeneration: 0,
+  slotPinGenerations: {},
   sidebarOrder: [],
   approvalMode: 'normal',
   channelTrusted: false,
@@ -85,10 +98,32 @@ const initialState: DashboardState = {
 
 export const fetchSlots = createAsyncThunk('dashboard/fetchSlots', () => api.chatSlots())
 
-export const changeApprovalMode = createAsyncThunk(
+/** Switch the approval mode, carrying a policy refusal back to the caller.
+ *
+ *  The gateway answers 403 `mode_disabled_by_policy` when the `approval_modes`
+ *  scope forbids the mode. A plain `throw` would reach the reducer as
+ *  `action.error.message` only, dropping the machine-readable code with it, so
+ *  the caller could not tell a policy refusal from a network failure — and the
+ *  picker would have nothing to show but silence. `rejectWithValue` keeps the
+ *  code, which is what makes the refusal reportable next to the control. */
+export const changeApprovalMode = createAsyncThunk<
+  string,
+  { mode: string; slot?: string },
+  { rejectValue: { code: string; message: string } }
+>(
   'dashboard/changeApprovalMode',
-  async ({ mode, slot }: { mode: string; slot?: string }) => {
-    await api.chatMode(mode, slot)
+  async ({ mode, slot }, { rejectWithValue }) => {
+    try {
+      await api.chatMode(mode, slot)
+    } catch (e) {
+      const body = e instanceof ApiError ? e.body : ''
+      let code = ''
+      try { code = JSON.parse(body || '{}')?.code ?? '' } catch { /* not JSON */ }
+      return rejectWithValue({
+        code,
+        message: e instanceof Error ? e.message : String(e),
+      })
+    }
     return mode
   },
 )
@@ -187,8 +222,30 @@ const dashboardSlice = createSlice({
   name: 'dashboard',
   initialState,
   reducers: {
+    // Two writers feed this reducer with different field sets. The HTTP
+    // `/api/status` reply carries the configured ad-hoc duration and whether
+    // policy permits `until_shutdown`; the 5-second WebSocket `dashboard` frame
+    // is built from the gateway's shared snapshot and omits both, because
+    // resolving them costs a config read and a governance evaluation the push
+    // loop must not pay. A frame is otherwise authoritative and REPLACES the
+    // status (a key it omits is an answer -- e.g. an older gateway sending no
+    // `version_display`), so only these two config-derived keys are carried
+    // forward when a frame lacks them. Without that the first push drops them
+    // and the approval-mode confirm card names the default 6-hour duration
+    // whatever the operator configured. A duration this tab saved in Settings
+    // outranks both the carried value and the payload's own: a reply that
+    // began before the save can carry the older token. The live-grant fields
+    // (`yolo_expires_at`, `yolo_until_shutdown`) are deliberately NOT carried:
+    // they change on every activation, and a stale expiry is worse than none.
     sseStatus(state, action: PayloadAction<StatusData>) {
-      state.status = action.payload
+      const prev = state.status
+      const next: StatusData = { ...action.payload }
+      const duration = state.savedYoloDuration ?? next.yolo_duration ?? prev?.yolo_duration
+      if (duration !== undefined) next.yolo_duration = duration
+      if (next.yolo_until_shutdown_permitted === undefined && prev?.yolo_until_shutdown_permitted !== undefined) {
+        next.yolo_until_shutdown_permitted = prev.yolo_until_shutdown_permitted
+      }
+      state.status = next
       state.connected = true
       // Sync YOLO from backend (authoritative source)
       if (action.payload.yolo !== undefined) {
@@ -206,6 +263,15 @@ const dashboardSlice = createSlice({
       if (state.status) state.status.yolo = action.payload
       state.approvalMode = action.payload ? 'yolo' : (state.approvalMode === 'yolo' ? 'normal' : state.approvalMode)
     },
+    // A duration the user just saved in Settings. The gateway stores the token
+    // as sent, so no re-read is needed: the picker can name it at once, and
+    // `sseStatus` keeps it over every later frame or reply, including one that
+    // was already in flight when the save landed. Recorded even before the
+    // first status arrives, so a save during cold load is not lost.
+    setYoloDuration(state, action: PayloadAction<NonNullable<StatusData['yolo_duration']>>) {
+      state.savedYoloDuration = action.payload
+      if (state.status) state.status.yolo_duration = action.payload
+    },
     sseConnected(state) { state.connected = true; state.slotsLoaded = false; state.subagentRunning = {}; state.subagentDetails = {}; state.subagentText = {} },
     sseDisconnected(state) { state.connected = false },
     sseSlots(state, action: PayloadAction<ChatSlot[]>) {
@@ -220,6 +286,7 @@ const dashboardSlice = createSlice({
       // claim a snapshot arrived when none has.
       if (action.payload.length === 0 && !state.slotsLoaded) return
       applySlots(state, action.payload)
+      state.slotsGeneration = (state.slotsGeneration ?? 0) + 1
       state.slotsLoaded = true
       reconcileSlots(state, new Set(action.payload.map(s => s.key)))
     },
@@ -357,7 +424,11 @@ const dashboardSlice = createSlice({
     },
     updateSlotPin(state, action: PayloadAction<{ key: string; pinned: boolean }>) {
       const slot = state.slots.find(s => s.key === action.payload.key)
-      if (slot) slot.pinned = action.payload.pinned
+      if (slot) {
+        slot.pinned = action.payload.pinned
+        state.slotPinGenerations ??= {}
+        state.slotPinGenerations[action.payload.key] = (state.slotPinGenerations[action.payload.key] ?? 0) + 1
+      }
     },
     triggerRefresh(state) { state.refreshTrigger += 1 },
     markSlotUnread(state, action: PayloadAction<string>) {
@@ -448,14 +519,32 @@ const dashboardSlice = createSlice({
         // badge self-heals — but eviction is withheld once the stream is live.
         const fresh = !state.slotsLoaded
         applySlots(state, action.payload)
+        state.slotsGeneration = (state.slotsGeneration ?? 0) + 1
         state.slotsLoaded = true
         reconcileSlots(state, new Set(action.payload.map((s: { key: string }) => s.key)), fresh)
       })
       .addCase(changeApprovalMode.fulfilled, (state, action) => { state.approvalMode = action.payload })
+      // The created slot joins the list on the SAME action that activates it
+      // (chatSlice's createSlot.fulfilled), so the sidebar row and the empty
+      // transcript land in one commit. A separate optimistic dispatch ahead of
+      // `fulfilled` would render the new row over the OLD chat for a frame and
+      // charge the sidebar its insertion render twice. Matched by type string
+      // rather than importing the thunk: chatSlice imports this slice, and a
+      // cycle here breaks module init. Idempotent by key, because the live
+      // `slots` frame announcing the slot usually arrives before the create
+      // response, so the row is often already present.
+      .addMatcher(
+        (action): action is PayloadAction<ChatSlot> => action.type === 'chat/createSlot/fulfilled',
+        (state, action) => {
+          if (!state.slots.find(s => s.key === action.payload.key)) {
+            state.slots.push(action.payload)
+          }
+        },
+      )
   },
 })
 
-export const { sseStatus, sseYolo, sseConnected, sseDisconnected, sseSlots, setSidebarOrder, sseTodoUpdate, sseMcpReportUpdate, touchSlotActivity, setChannelTrusted, sseSlotTitle, addSlotOptimistic, removeSlotOptimistic, updateSlot, updateSlotFolder, updateSlotPin, triggerRefresh, markSlotUnread, markSlotRead, setUpdateProgress,
+export const { sseStatus, sseYolo, setYoloDuration, sseConnected, sseDisconnected, sseSlots, setSidebarOrder, sseTodoUpdate, sseMcpReportUpdate, touchSlotActivity, setChannelTrusted, sseSlotTitle, addSlotOptimistic, removeSlotOptimistic, updateSlot, updateSlotFolder, updateSlotPin, triggerRefresh, markSlotUnread, markSlotRead, setUpdateProgress,
   setDesktopUpdateAvailable, sseSubagentStatus, sseSubagentText, sseSlotColor, setSessionDefaultColor, setSessionColorsMode, setSessionColorsPalette, setSessionColorsIntensity, setEnabledAppIds, patchSlotSourceLinks, patchSlotLink } = dashboardSlice.actions
 
 /**

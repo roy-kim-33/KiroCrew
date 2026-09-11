@@ -410,6 +410,7 @@ class TestClientAccessors:
         client._process = _live_process()
         assert client.is_process_alive() is True
         assert client.exit_code is None
+<<<<<<< HEAD
         # A live process alone is NOT an unfinished turn: _turn_done starts SET,
         # so a client that has never run a turn reports none in flight. (Before
         # that fix, has_active_turn() read true for any freshly spawned slot and
@@ -417,6 +418,13 @@ class TestClientAccessors:
         assert client.has_unfinished_turn() is False
 
         client._turn_done.clear()  # a turn is now genuinely in flight
+=======
+        # Idle == done: a live process with no prompt sent is NOT an unfinished
+        # turn (see test_acp_turn_done_idle_init). A turn begins when the prompt
+        # entry clear()s the Event.
+        assert client.has_unfinished_turn() is False
+        client._turn_done.clear()
+>>>>>>> upstream/main
         assert client.has_unfinished_turn() is True  # turn not done + process alive
 
         client._process.returncode = 3
@@ -444,7 +452,7 @@ class TestClientAccessors:
 
         assert client._session_key == "new"
         assert client._channel_id == "C-new"
-        # Stale context must not be handed to the new chat (#2932).
+        # Stale context must not be handed to the new chat.
         assert client.last_prompt_stats.context_pct == 0.0
         assert client.last_prompt_stats.context_used_tokens == 0
         assert client.last_prompt_stats.context_window_tokens == 0
@@ -604,7 +612,8 @@ class TestResetPaths:
         # The exception was retrieved, so asyncio will not report it at GC.
         assert done.exception() is not None
 
-    def test_reset_state_unlinks_claude_settings_and_survives_pipe_errors(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_teardown_unlinks_claude_settings_and_survives_pipe_errors(self, tmp_path):
         client = _client(
             tmp_path, acp_backend=ACP_BACKEND_CLAUDE, permission_mode="bypassPermissions"
         )
@@ -621,6 +630,10 @@ class TestResetPaths:
         client._pid = None
         client._child_pids = {}
 
+        # The pair every real caller runs: the seed's removal is a disk operation
+        # (revoke the durable grant, then unlink) so it lives in the async discard,
+        # while _reset_state stays synchronous and drops the in-memory claim.
+        await client._discard_claude_settings_seed()
         client._reset_state()
 
         assert not stale.exists()  # bypassPermissions must not persist a crash
@@ -690,9 +703,9 @@ class TestEnsureReady:
         """A gate refusal is a configuration fact, so a respawn re-reads it.
 
         ``AcpToolGateUnroutable`` documents itself Non-retryable, but it subclasses
-        ``AcpError``, so the generic transport ladder used to retry it: attempt 0
-        tore the child down, respawned, hit the identical refusal, and only then
-        raised. That is one wasted spawn plus teardown, and it spends the reconnect
+        ``AcpError``, so the generic transport ladder would retry it: attempt 0
+        tears the child down, respawns, hits the identical refusal, and only then
+        raises. That is one wasted spawn plus teardown, and it spends the reconnect
         budget the distinct type exists to protect.
 
         Revert-verified: dropping the dedicated handler makes both counters 2.
@@ -748,6 +761,47 @@ class TestEnsureReady:
 
         with pytest.raises(AcpToolGateUnroutable, match="no sandbox backend"):
             acp_client._sandbox_preflight("codex", "standard")
+
+    @pytest.mark.asyncio
+    async def test_sandbox_preflight_is_bounded_on_a_stalled_disk(self, monkeypatch):
+        """A preflight that never returns must not hold the spawn open.
+
+        The mask half canonicalizes the home and override roots on disk, and on a
+        stalled mount that wait has no end of its own; nothing else on the spawn
+        path bounds it (``ensure_ready`` times the handshake AFTER the spawn). The
+        deadline turns that into a retryable ``AcpError`` naming the slow disk, and
+        the adapter is not started without its mask.
+
+        Revert-verified: dropping the ``wait_for`` makes this test hang on the
+        stalled worker instead of raising.
+        """
+        import threading
+
+        monkeypatch.setattr(acp_client, "_SANDBOX_PREFLIGHT_TIMEOUT", 0.05)
+        release = threading.Event()
+
+        def _stalled(backend, mode):
+            release.wait(5.0)
+            return ()
+
+        try:
+            with pytest.raises(AcpError, match="did not finish within 0 s"):
+                await acp_client._run_preflight_bounded(_stalled, "codex", "standard")
+        finally:
+            release.set()  # let the worker thread go; the test must not leak it
+
+    @pytest.mark.asyncio
+    async def test_sandbox_preflight_within_budget_returns_the_mask(self):
+        calls = []
+
+        def _quick(backend, mode):
+            calls.append((backend, mode))
+            return ("/home/u/.aws",)
+
+        assert await acp_client._run_preflight_bounded(_quick, "codex", "standard") == (
+            "/home/u/.aws",
+        )
+        assert calls == [("codex", "standard")]
 
     @pytest.mark.asyncio
     async def test_shutdown_kills_and_resets(self, tmp_path):
@@ -1683,6 +1737,7 @@ class TestAdvertisedModelCacheWiring:
         client._write_claude_local_settings()
         assert self._read_seed(tmp_path)["availableModels"] == served
 
+<<<<<<< HEAD
     def test_cold_cache_seeds_no_allowlist_on_the_native_lane(self, tmp_path, monkeypatch):
         """RoyCrew fork: upstream falls back to the static registry here; this
         fork writes NOTHING instead.
@@ -1699,10 +1754,23 @@ class TestAdvertisedModelCacheWiring:
         adapter advertise the account's real models, and the first capture warms
         the cache the test above covers.
         """
+=======
+    def test_cold_cache_seeds_no_model_keys_at_all(self, tmp_path, monkeypatch):
+        # No static-registry fallback: a guessed allowlist poisons the adapter's
+        # union+dedup merge for any model the registry has not caught up on, so an
+        # unseeded file (adapter falls back to its own provider list) beats a stale
+        # one. The post-capture re-seed fills both keys in.
+>>>>>>> upstream/main
         monkeypatch.setattr(mr, "_ADVERTISED_MODELS", {})
-        client = _client(tmp_path, acp_backend=ACP_BACKEND_CLAUDE)
+        client = _client(tmp_path, acp_backend=ACP_BACKEND_CLAUDE, model="claude-opus-5")
         client._write_claude_local_settings()
+<<<<<<< HEAD
         assert "availableModels" not in self._read_seed(tmp_path)
+=======
+        seed = self._read_seed(tmp_path)
+        assert "availableModels" not in seed
+        assert "model" not in seed
+>>>>>>> upstream/main
 
     def test_claude_capture_feeds_and_flags_the_cache(self, tmp_path, monkeypatch):
         monkeypatch.setattr(mr, "_ADVERTISED_MODELS", {})

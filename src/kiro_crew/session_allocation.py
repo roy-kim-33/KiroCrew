@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
+from kiro_crew.member_memory_auth import private_memory_store_for_session
 from kiro_crew.metrics.sessions import (
     END_REASON_EVICTED,
     discard_session_start,
@@ -29,8 +30,8 @@ from kiro_crew.metrics.sessions import (
 if TYPE_CHECKING:
     from kiro_crew.providers.base import LLMProvider
 else:
-    # Importing providers.base from this leaf enters providers -> acp.runtime ->
-    # session_pid -> providers when the module is imported standalone.
+    # ProviderFactory below subscripts LLMProvider at module scope, so a name must
+    # exist at runtime; a real import would cross the agent-SDK boundary gate.
     LLMProvider = Any
 
 
@@ -391,6 +392,8 @@ class SessionAllocationService:
 
     async def get_subagent_runtime(self, parent_session_key: str, agent: str | None = None) -> Any:
         """Get or spawn the canonical shared companion runtime for a parent."""
+        if await asyncio.to_thread(private_memory_store_for_session, parent_session_key):
+            raise RuntimeError("Private member memory requires a dedicated runtime")
         runtime_type, runtime_dead = self._deps.runtime_types()
         max_retries = 1
         attempt = 0
@@ -468,6 +471,8 @@ class SessionAllocationService:
         cwd: str | None = None,
     ) -> Any:
         """Adopt a configured bootstrap provider's runtime for a task run."""
+        if await asyncio.to_thread(private_memory_store_for_session, parent_session_key):
+            raise RuntimeError("Private member memory requires a dedicated runtime")
         owner = self._owner
         if not owner._provider_factory:
             # Outside the per-key lock: get_subagent_runtime takes that lock and
@@ -579,6 +584,18 @@ class SessionAllocationService:
 
         owner = self._owner
         key = owner._fold_key(session_key)
+        private_stores = await asyncio.gather(
+            asyncio.to_thread(private_memory_store_for_session, key),
+            asyncio.to_thread(private_memory_store_for_session, parent_session_key),
+        )
+        if private_stores[1] and not private_stores[0]:
+            raise RuntimeError(
+                "A private member task requires a trusted child memory binding before execution"
+            )
+        if any(private_stores):
+            return await owner.get_or_create(
+                key, agent=agent, approval_policy=approval_policy, cwd=cwd
+            )
 
         async with self._lock:
             existing = self._sessions.get(key)
@@ -679,6 +696,8 @@ class SessionAllocationService:
         session = self._sessions.get(parent_session_key)
         if session is None:
             return False
+        if getattr(session.provider, "_private_memory", False) is True:
+            return False
         return getattr(session.provider, "is_session_sharing_eligible", False)
 
     @staticmethod
@@ -745,47 +764,6 @@ class SessionAllocationService:
         )
         for parent_key, runtime in list(self._subagent_runtimes.items()):
             add(f"Subagent runtime ({parent_key})", runtime, "")
-
-    def context_info(self) -> list[dict[str, object]]:
-        """Return the dashboard-facing context snapshot for live sessions."""
-        result: list[dict[str, object]] = []
-        for key, session in self._sessions.items():
-            provider = session.provider
-            pct = provider.context_usage_pct()
-            model = "unknown"
-            agent = ""
-            if self._deps.is_claude_provider(provider):
-                model = provider._model or "auto"
-                agent = provider._agent or ""
-            elif self._deps.is_acp_provider(provider):
-                model = provider.client._model or "auto"
-                agent = provider.client._agent or ""
-                if model == "auto" and agent and agent != "kirocrew":
-                    model = self._owner._resolve_agent_model(agent)
-                model = model or "auto"
-
-            if key == self._deps.constants.background_key:
-                name = "Background (titles, cron, heartbeat)"
-            elif key.startswith("dashboard:"):
-                name = f"Chat ({key.split(':', 1)[1]})"
-            else:
-                name = key
-
-            window = 0
-            if hasattr(provider, "context_window_tokens"):
-                window = provider.context_window_tokens()
-            result.append(
-                {
-                    "key": key,
-                    "name": name,
-                    "model": model,
-                    "agent": agent,
-                    "context_pct": round(pct, 1),
-                    "context_window_tokens": window,
-                    "prompts": session.prompt_count,
-                }
-            )
-        return result
 
     def record_success(self, key: str) -> None:
         session = self._sessions.get(self._owner._fold_key(key))
@@ -1138,6 +1116,9 @@ class SessionAllocationService:
         owner = self._owner
         constants = self._deps.constants
         key = owner._fold_key(key)
+        # A binding can belong to any session kind (cron, delegated run, or
+        # consolidation), and must be checked before even reusing a live client.
+        private_memory = bool(await asyncio.to_thread(private_memory_store_for_session, key))
         stale_provider: LLMProvider | None = None
         stale_session: Any | None = None
         claimed: Any | None = None
@@ -1154,6 +1135,13 @@ class SessionAllocationService:
                 recycling = existing is not None and owner._recycling.get(key) is existing
                 if existing is not None and not recycling:
                     session = existing
+                    if (
+                        getattr(session.provider, "_private_memory", False) is True
+                    ) != private_memory:
+                        raise RuntimeError(
+                            "Session runtime memory isolation does not match its trusted binding; "
+                            "restart the session before continuing"
+                        )
                     alive = session.provider.is_process_alive()
                     if not alive:
                         if (
@@ -1262,6 +1250,8 @@ class SessionAllocationService:
         cwd_blocks_pool = bool(cwd and cwd != owner._pool_cwd)
         if not owner._pool_size:
             pool_decision = "disabled"
+        elif private_memory:
+            pool_decision = "bypass_private_memory"
         elif resume_sid:
             pool_decision = "bypass_resume"
         elif is_stateless:
@@ -1276,21 +1266,18 @@ class SessionAllocationService:
             pool_decision = "bypass_member"
         elif cwd_blocks_pool:
             pool_decision = "bypass_cwd"
-        elif extra_factory_kwargs.get("reasoning_effort_override"):
-            pool_decision = "bypass_effort"
         elif extra_env:
             pool_decision = "bypass_env"
         elif await self._crew_pins_effort(agent, extra_factory_kwargs.get("crew_agent")):
-            # Same reason as bypass_effort above, for the effort a CREW pins
-            # rather than one a caller passed: a pooled child was spawned under
-            # whatever effort overlay was current when the pool filled, and the
-            # claim path re-keys the model but never re-pushes effort — so a warm
-            # hit would silently run this crew at the wrong depth. Cold-starting
-            # is what makes the pin real.
+            # A CREW's pinned effort is fixed at spawn time and the warm-pool
+            # claim path never re-pushes it, so a warm hit would silently run
+            # this crew at the wrong depth.  Cold-starting is what makes the
+            # pin real.  (Caller-supplied reasoning_effort_override is handled
+            # post-claim via provider.change_effort instead — see below.)
             #
-            # Last in the chain on purpose: it is the only arm that needs to read
-            # config, so every cheaper reason to skip the pool is settled first
-            # and a bypassing session never pays for the lookup.
+            # Last in the chain on purpose: it is the only arm that needs to
+            # read config, so every cheaper reason to skip the pool is settled
+            # first and a bypassing session never pays for the lookup.
             pool_decision = "bypass_effort"
         else:
             pool_decision = ""
@@ -1354,8 +1341,8 @@ class SessionAllocationService:
                                 switch_model, advertised
                             ):
                                 # A literal miss can be a stale `<namespace>::`
-                                # qualifier on a model the backend fully serves
-                                # (#8521): resolve to the advertised spelling and
+                                # qualifier on a model the backend fully serves:
+                                # resolve to the advertised spelling and
                                 # send THAT — the same fold the cold-start spawn
                                 # and the display verdict use, so a warm claim
                                 # runs exactly what a cold start of the same pin
@@ -1377,6 +1364,37 @@ class SessionAllocationService:
                                     "Pool post-claim: switched model to %s",
                                     _send_model,
                                 )
+                    _effort_override = extra_factory_kwargs.get("reasoning_effort_override")
+                    if _effort_override:
+                        _eff = str(_effort_override)
+                        try:
+                            if not await provider.change_effort(_eff):
+                                _cur_model = (
+                                    getattr(cast(Any, provider).client, "_model", None) or ""
+                                )
+                                self._deps.logger.warning(
+                                    "reasoning effort '%s' will not be applied (session %s) — "
+                                    "model '%s' does not support effort configuration",
+                                    _eff,
+                                    key or "?",
+                                    _cur_model or "auto",
+                                )
+                            else:
+                                _cur_model = (
+                                    getattr(cast(Any, provider).client, "_model", None) or ""
+                                )
+                                self._deps.logger.info(
+                                    "Pool post-claim: applied reasoning effort %s to model %s",
+                                    _eff,
+                                    _cur_model,
+                                )
+                        except Exception:
+                            self._deps.logger.warning(
+                                "Pool post-claim: failed to apply reasoning effort '%s' (session %s)",
+                                _eff,
+                                key or "?",
+                                exc_info=True,
+                            )
                 self._deps.logger.info(
                     "Claimed warm-pool process for %s (agent=%s)",
                     key,
@@ -1402,6 +1420,10 @@ class SessionAllocationService:
                 extra_env=extra_env,
                 **extra_factory_kwargs,
             )
+            if self._deps.is_acp_provider(provider):
+                await cast(Any, provider).prepare_private_memory()
+            if (getattr(provider, "_private_memory", False) is True) != private_memory:
+                raise RuntimeError("Provider does not match the session's memory isolation")
             provider_switched = False
             if resume_sid:
                 is_claude_now = self._deps.is_claude_provider(
@@ -1484,6 +1506,12 @@ class SessionAllocationService:
                 recycling = existing is not None and owner._recycling.get(key) is existing
                 if existing is not None and not recycling:
                     session = existing
+                    if (
+                        getattr(session.provider, "_private_memory", False) is True
+                    ) != private_memory:
+                        raise RuntimeError(
+                            "Concurrent session runtime has incompatible memory isolation"
+                        )
                     session.last_used = time.monotonic()
                     if approval_policy:
                         session.approval_policy = approval_policy

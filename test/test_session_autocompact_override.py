@@ -272,7 +272,8 @@ class TestAutocompactEndpoint:
     async def test_error_bodies_carry_machine_readable_codes(
         self, payload: str, expected_code: str
     ) -> None:
-        # AGENTS.md: new non-2xx JSON bodies MUST carry a stable ``code`` so
+        # docs/system-specs/common/code-style.md: new non-2xx JSON bodies MUST
+        # carry a stable ``code`` so
         # clients can branch without parsing the human-readable message.
         slot = _ChatSlot("test")
         state = _mock_state(slot)
@@ -688,7 +689,7 @@ class TestAliasSlotsShareOneTranscript:
 class TestLegacyMetadataDeleteWon:
     """The delete-won guard must cover LEGACY transcripts (no ``created_at``).
 
-    Legacy metadata records no ``created_at``, which used to leave the slot's
+    Legacy metadata records no ``created_at``, which leaves the slot's
     observed identity EMPTY — the guard read that as "fresh slot, no evidence"
     and a save racing a permanent delete recreated the deleted transcript. The
     observation is now tracked as its own bit, so the missing-file witness
@@ -924,7 +925,7 @@ class TestSlotlessDeletionClearsOverride:
 
     @pytest.mark.asyncio
     async def test_slotless_history_delete_sweeps_the_override(self) -> None:
-        """The GPT round-18 scenario: no live slot, delete must still sweep."""
+        """A slotless history delete must still sweep the override."""
         from kiro_crew.dashboard.handlers.sessions import _remove_slot_for_history_key
 
         key = "dashboard_chat-77-1788240000"

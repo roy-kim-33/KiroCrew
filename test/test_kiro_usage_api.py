@@ -145,6 +145,38 @@ class TestMapResponse:
         ]}
         assert "bonus_limit" not in api._map_response(data)
 
+    def test_warns_on_two_credit_typed_pools(self, caplog):
+        # The exact payload nobody has captured: TWO entries typed literally
+        # "CREDIT". The picker takes the first by list order; detection must fire
+        # AND selection must stay byte-for-byte identical (first entry wins).
+        data = {"usageBreakdownList": [
+            {"resourceType": "CREDIT", "currentUsage": 5, "usageLimit": 100},
+            {"resourceType": "CREDIT", "currentUsage": 999, "usageLimit": 2000},
+        ]}
+        with caplog.at_level("WARNING", logger=api.logger.name):
+            out = api._map_response(data)
+        # Selection unchanged: the first CREDIT entry still wins.
+        assert out["credits_used"] == 5.0
+        assert out["credits_plan"] == 100.0
+        warnings = [r for r in caplog.records if "CREDIT-typed pools" in r.getMessage()]
+        assert len(warnings) == 1
+        msg = warnings[0].getMessage()
+        assert "2 CREDIT-typed pools" in msg
+        assert "index 0" in msg
+        # Shape only — no balances/identifiers leak into the log line.
+        assert "999" not in msg and "2000" not in msg
+
+    def test_no_warn_on_single_credit_typed_pool(self, caplog):
+        # Mutate the fixture: one CREDIT entry. Detection must NOT fire — a
+        # detector that fires on every payload is worse than none.
+        data = {"usageBreakdownList": [
+            {"resourceType": "CREDIT", "currentUsage": 5, "usageLimit": 100},
+            {"resourceType": "FREE_TRIAL", "currentUsage": 10, "usageLimit": 50},
+        ]}
+        with caplog.at_level("WARNING", logger=api.logger.name):
+            api._map_response(data)
+        assert not [r for r in caplog.records if "CREDIT-typed pools" in r.getMessage()]
+
     def test_none_when_response_not_dict(self):
         assert api._map_response([]) is None
         assert api._map_response(None) is None
@@ -484,8 +516,8 @@ class TestWindowsCliStore:
         # Same end-to-end path for the CURRENT Windows layout
         # (%LOCALAPPDATA%\kiro-cli): a token read out of a Local-layout store
         # carries from_cli_store=True, so the provenance path accepts it when
-        # whoami reports no profile ARN -- the exact case #5783 reports, where
-        # the store exists only under AppData/Local and the pill vanished.
+        # whoami reports no profile ARN -- the case where the store exists only
+        # under AppData/Local, which would otherwise blank the pill.
         db = tmp_path / "AppData" / "Local" / "kiro-cli" / "data.sqlite3"
         db.parent.mkdir(parents=True)
         con = sqlite3.connect(str(db))
@@ -1040,8 +1072,8 @@ class TestCandidateOrdering:
 
     def test_freshest_expiry_ranks_first(self, tmp_path):
         # A stale-but-unexpired JSON credential sits in the highest-priority PATH
-        # slot; the SQLite store holds a newer one. Path order used to decide,
-        # which is how a signed-out profile won.
+        # slot; the SQLite store holds a newer one. Deciding on path order here
+        # would let a signed-out profile win.
         now = datetime.now(timezone.utc)
         soon = (now + timedelta(minutes=20)).isoformat()
         later = (now + timedelta(hours=8)).isoformat()

@@ -20,7 +20,7 @@ from kiro_crew import platform_compat
 # APIs (os.killpg / os.getpgrp / os.getpgid), POSIX identity/age probes
 # (os.getuid / os.sysconf, /proc, ps), the raw signal.SIGKILL constant, and the
 # POSIX kill path of the orphan sweep (which no-ops on Windows). None of these
-# have a Windows equivalent, so they are skipped on Windows. See issue #2041.
+# have a Windows equivalent, so they are skipped on Windows.
 _POSIX_ONLY = pytest.mark.skipif(
     sys.platform == "win32", reason="POSIX process-management semantics only; see issue #2041"
 )
@@ -761,7 +761,7 @@ class TestKillOrphanMcps:
         assert killed == 0
 
     def test_skips_recycled_pid_on_reverify(self) -> None:
-        """If cmdline no longer matches at kill time, PID is skipped (TOCTOU)."""
+        """If cmdline stops matching at kill time, the PID is skipped (TOCTOU)."""
         from kiro_crew.session_pid import kill_orphan_mcps
 
         with (
@@ -1796,11 +1796,11 @@ class TestSpawnedMarkerInjection:
 
 
 # ── PID-recycle identity guard + cross-platform spawn grace ───────────
-# Regression cover for the quit->reopen race reproduced on macOS 2026-07-29:
-# a stale ``<dead_gw>:<pid>`` entry whose PID had been recycled onto a LIVE
-# kiro-cli was SIGKILL'd by the startup sweep (surfacing to the user as
-# "process exited (rc=None)"), because the file sweep verified only the
-# cmdline and the spawn-grace window was silently Linux-only.
+# The quit->reopen race: a stale ``<dead_gw>:<pid>`` entry whose PID has been
+# recycled onto a LIVE kiro-cli must not be SIGKILL'd by the startup sweep
+# (which would surface to the user as "process exited (rc=None)"). The file
+# sweep must verify more than the cmdline, and the spawn-grace window must not
+# be Linux-only.
 
 
 class TestPidStartTokenIdentityGuard:
@@ -2171,7 +2171,7 @@ class TestSpawnGraceCrossPlatform:
     sys.platform == "win32", reason="POSIX-only: relies on fork/exec + ps for identity"
 )
 class TestSweepSparesLiveProcess:
-    """End-to-end repro of the 2026-07-29 macOS incident with a REAL process.
+    """End-to-end repro with a REAL process that the sweep spares a live kiro-cli.
 
     The mock-based tests above pin the decision logic; this one proves the
     whole sweep leaves an actually-running process alive. The victim is a
@@ -2385,7 +2385,7 @@ class TestPidFileRewriteIsAtomic:
         )
 
 
-# ── Untracked managed-agent runtime orphan (REPORT-ONLY, issue #2930) ──
+# ── Untracked managed-agent runtime orphan (REPORT-ONLY) ──
 
 
 @pytest.fixture()
@@ -2558,7 +2558,7 @@ class TestUntrackedRuntimeReportIntegration:
         reset_untracked_report_dedup: None,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """The regression this fixes: the leak was previously silent.
+        """An untracked runtime leak is reported, not silently dropped.
 
         Every existing reaper declines an untracked runtime, so before this arm
         the sweep produced no candidate AND no diagnostic. The report must
@@ -2719,7 +2719,7 @@ class TestUntrackedRuntimeReportIntegration:
         child entry name processes no reaper terminates through that entry.
         Once such an owner has died and its PID has been recycled into a leaked
         runtime, treating the field as tracked would return the sweep to the
-        exact silence issue #2930 reports.
+        exact silence the report exists to prevent.
         """
         from kiro_crew.session_pid import find_orphan_mcp_candidates
 
@@ -2768,7 +2768,7 @@ class TestUntrackedRuntimeReportIntegration:
         assert [r for r in caplog.records if "4646" in r.getMessage()] == []
 
 
-# ── Orphaned playwright-cli browser daemon sweep (issue #5986) ───────────────
+# ── Orphaned playwright-cli browser daemon sweep ───────────────
 
 #: A realistic NUL-separated cliDaemon argv. playwright-core spawns the daemon
 #: as ``node <...>/entry/cliDaemon.js <sessionName> [flags]`` (see
@@ -2993,3 +2993,93 @@ class TestBrowserSessionOwnerAlive:
         with patch.object(sp, "sys") as mock_sys:
             mock_sys.platform = "darwin"
             assert sp._browser_session_owner_alive(900, b"kc-1a2b3c4d") is True
+
+
+class TestAcquiringAPidLockDoesNotTruncateTheLockFile:
+    """A lock file must be opened WRITABLE but never TRUNCATING.
+
+    ``msvcrt.locking`` needs a writable handle, so the fd cannot be opened
+    ``"r"``. But ``"w"`` truncates at open, and on Windows a truncating open of a
+    lock file whose first byte another holder already locked raises a sharing
+    violation instead of waiting — so the contending acquirer crashes with a bare
+    ``OSError`` *before* it reaches ``file_lock``, and the serialisation the lock
+    exists to provide never happens. POSIX ``flock`` tolerates the truncate, which
+    is why the defect is invisible on Linux and reddened only the Windows shards.
+
+    Same defect and same fix as ``work_ledger._open_lock`` and
+    ``dashboard/handlers/mcp.py``'s ``_McpFileLock``, which is already
+    written this way.
+
+    Truncation is the direct, PLATFORM-INDEPENDENT observable, and that is what
+    these assert: seed the lock file with bytes, take and release the lock, and
+    require the bytes to have survived. Under the old ``open(lock_path, "w")``
+    every one of these fails on every platform, so the guard does not depend on
+    running the suite on Windows to have teeth.
+    """
+
+    SEED = b"lock-file-content-that-must-survive"
+
+    def test_session_pid_file_lock_preserves_the_lock_file(self, session_pid_file: Path) -> None:
+        from kiro_crew.session_pid import _session_pid_file_lock, _session_pid_file_path
+
+        lock_path = _session_pid_file_path().with_suffix(".lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path.write_bytes(self.SEED)
+
+        with _session_pid_file_lock():
+            pass
+
+        assert lock_path.read_bytes() == self.SEED
+
+    def test_pid_file_lock_preserves_the_lock_file(self, pid_file: Path) -> None:
+        from kiro_crew.session_pid import _pid_file_lock, _pid_file_path
+
+        lock_path = _pid_file_path().with_suffix(".lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path.write_bytes(self.SEED)
+
+        with _pid_file_lock():
+            pass
+
+        assert lock_path.read_bytes() == self.SEED
+
+    def test_the_periodic_sweep_preserves_the_lock_file(self, session_pid_file: Path) -> None:
+        """The sweep is the site most likely to feel this in production.
+
+        It runs on a timer while ``_track_session_pid`` contends for the same
+        lock, which is exactly the interleaving a truncating open turns into a
+        crash rather than a wait.
+        """
+        from kiro_crew.session_pid import _periodic_pid_sweep, _session_pid_file_path
+
+        path = _session_pid_file_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # The sweep returns early unless the pid file exists, so it must exist
+        # for the lock to be reached at all.
+        path.write_text(f"{os.getpid()}:999999\n", encoding="utf-8")
+        lock_path = path.with_suffix(".lock")
+        lock_path.write_bytes(self.SEED)
+
+        _periodic_pid_sweep(os.getpid(), set())
+
+        assert lock_path.read_bytes() == self.SEED
+
+    def test_the_lock_is_still_actually_acquired(self, pid_file: Path) -> None:
+        """Guard the guard: a non-truncating open that never locks would pass above.
+
+        ``file_lock`` is asked for the lock through the same helper the production
+        path uses, so this fails if the fd stopped being writable — the failure
+        mode a naive ``"r"`` fix would introduce, and the reason ``"r+"`` rather
+        than ``"r"`` is the answer.
+        """
+        from kiro_crew.session_pid import _pid_file_path
+
+        lock_path = _pid_file_path().with_suffix(".lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path.write_bytes(self.SEED)
+
+        lock_path.touch(exist_ok=True)
+        with open(lock_path, "r+") as fd:
+            with platform_compat.file_lock(fd.fileno(), exclusive=True):
+                pass
+        assert lock_path.read_bytes() == self.SEED

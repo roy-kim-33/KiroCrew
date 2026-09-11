@@ -16,7 +16,7 @@ delivers a message the target runs as its next turn, redacted through
 envelope so it can never render as something the person typed. An IDLE target runs
 it under the authorization that admitted it; a BUSY target queues it, and the
 generic drain re-asserts the target-side containment before the entry becomes a
-turn (issue #5911): producers stamp the constraints that held at admission
+turn: producers stamp the constraints that held at admission
 (:func:`containment_meta`), and ``chat_runner``'s drain drops — with a visible
 notice and an SEL record — any entry for which a constraint holds at delivery
 that did not hold at admission. A human-typed queued message shares the same
@@ -42,6 +42,7 @@ from kiro_crew.config.loader import (
     default_project_dir,
     resolve_agent_bindings,
 )
+from kiro_crew.config.resolution import DEGRADED_WHOLE_CONFIG
 from kiro_crew.dashboard.chat_delivery import sanitize_outbound
 from kiro_crew.dashboard.chat_folders import _unhide_folder
 from kiro_crew.dashboard.chat_persistence import _TRANSIENT_ROLES as _PERSISTENCE_TRANSIENT_ROLES
@@ -55,6 +56,7 @@ from kiro_crew.dashboard.state import (
 )
 from kiro_crew.dashboard.stop_retry import allow_escalation
 from kiro_crew.history import metadata_now_iso, transcript_stem
+from kiro_crew.memory_stores import named_store_or_empty
 from kiro_crew.security import redact, redact_and_truncate
 from kiro_crew.sel import sel
 from kiro_crew.validation import MAX_LONG_STRING
@@ -219,7 +221,7 @@ def _app_owned_cron_refusal(state: "DashboardState", caller_key: str) -> tuple[s
     an app" and not a third. **A new field on the job that can name a principal is
     a hole here until it is added to this function.**
 
-    Fail-CLOSED when ``session_key`` names a session that is no longer open: its
+    Fail-CLOSED when ``session_key`` names a closed session: its
     ``_app`` cannot be read, and "could not verify the owner is not an app" must
     not read as "has no owner". ``mcp_cron``'s ``cron_add`` records an app's
     authority ONLY in ``session_key`` -- so once that slot is gone, allowing the
@@ -351,6 +353,67 @@ def session_control_enabled() -> bool:
         return False
 
 
+def member_dispatch_enabled() -> bool:
+    """Whether a crew member's DM session may bypass the ``session_control`` switch.
+
+    The operator ceiling on the zero-configuration member grant. Default true
+    reproduces today's behaviour exactly: a member caller bypasses
+    ``agent.session_control`` and dispatches into workers it created. Set
+    ``agent.member_dispatch`` to false and a member caller stops bypassing —
+    it falls back under ``session_control_enabled()`` like any ordinary caller,
+    so an operator who turned session control off keeps member DM threads
+    chat-only without disabling the member itself.
+
+    Fails CLOSED in BOTH ways the ceiling can lose the operator's value, the
+    same direction :func:`session_control_enabled` does:
+
+    * a config read that RAISES resolves to false; and
+    * a config that LOADS but discarded the ``agent`` section (or the whole
+      file) resolves to false too. ``load()`` does not raise on a malformed
+      section -- it coerces it away, falls back to the field default (which is
+      ``member_dispatch=True``, permissive), and records the loss in
+      ``degraded_sections``. Without this second check a degraded ``agent``
+      overlay carrying ``member_dispatch: false`` would silently revert to the
+      bypass the operator meant to withdraw -- a governance-ceiling fail-open.
+      This is the same "could not read it" vs "was never set" distinction
+      :func:`tailnet_identity_unknown` and the publish gate already draw from
+      ``degraded_sections``. The bypass never fails open.
+    """
+    try:
+        cfg = KiroCrewConfig.load()
+    except Exception:
+        logger.warning(
+            "member_dispatch: config read failed — withdrawing member bypass until config loads",
+            exc_info=True,
+        )
+        return False
+    if cfg.degraded_sections & {DEGRADED_WHOLE_CONFIG, "agent"}:
+        # The agent section (or the whole file) was discarded, so a stored
+        # `member_dispatch: false` was replaced by the permissive default.
+        # Withdraw the bypass rather than trust that default.
+        logger.warning("member_dispatch: agent config section degraded — withdrawing member bypass")
+        return False
+    return bool(cfg.agent.member_dispatch)
+
+
+def _member_bypass(caller_key: str) -> bool:
+    """Whether *caller_key* may skip the ``session_control`` switch as a member.
+
+    The single expression both switch gates key on, extracted rather than
+    copy-pasted so the member-bypass condition cannot drift between
+    :func:`create_session` and :func:`authorize_target`. A member caller
+    bypasses only while the operator ceiling ``agent.member_dispatch`` is on;
+    turned off, the member is no longer exempt and the switch gate applies to
+    it like any other caller.
+
+    Keyed on the immutable slot-key prefix (via :func:`_member_caller`) AND the
+    config ceiling — the two together decide the bypass, and neither is a proxy
+    for it. ``member_dispatch_enabled`` is read at the gate, synchronously,
+    right before the act, exactly as ``session_control_enabled`` is beside it.
+    """
+    return _member_caller(caller_key) and member_dispatch_enabled()
+
+
 async def prewarm_enabled_check() -> None:
     """Warm the config cache in a thread so the sync gate reads the cached path.
 
@@ -419,7 +482,7 @@ def _probe_channel_mirror(state: "DashboardState", slot: "_ChatSlot") -> str | N
     because a mirror can be RETARGETED while a queue waits: rebinding session
     mirror A to channel B keeps the boolean true from admission to drain while
     substituting the audience — exactly the republication change the drain
-    re-check exists to catch (#5911).
+    re-check exists to catch.
 
     Read on the EFFECTIVE session key, because that is the key the mirror is
     registered under -- the slot key would miss a mirror on a session whose turns
@@ -466,7 +529,7 @@ def _has_channel_mirror(
     return on_probe_failure if probed is None else bool(probed)
 
 
-# ── Drain-time re-validation of queued prompts (issue #5911) ──
+# ── Drain-time re-validation of queued prompts ──
 #
 # Authorization is decided when a prompt is ADMITTED — `authorize_target` for
 # `session_send`, the authenticated composer for a human — but a busy target
@@ -487,7 +550,6 @@ _CONTAINMENT_CHANGE_LABELS = {
     "linked": "the session was linked to a channel",
     "mirrored": "the session gained an outbound channel mirror",
     "mirror_retarget": "the session's outbound mirror was retargeted to a different channel",
-    "crew": "the session was switched to crew mode",
     "ephemeral": "the session became incognito/temporary",
     "app": "the session became app-scoped",
     "unattended": "the session became unattended",
@@ -508,8 +570,8 @@ _NON_CONSTRAINT_KEYS = frozenset({"mirror_unverified"})
 # exempt: directive content can be authored by any allowed human in a linked
 # thread while only the session owner adds outbound mirror links, so a NEW
 # mirror widens the audience beyond anything the message's author controlled —
-# the exact republication issue #5911 closes. `session_send` and automation
-# entries never carry the flag and stay fully enforced.
+# the exact republication this drain re-check catches. `session_send` and
+# automation entries never carry the flag and stay fully enforced.
 _AUDIENCE_CONSTRAINTS = frozenset({"linked"})
 
 
@@ -546,7 +608,6 @@ def containment_snapshot(
     snap: dict[str, Any] = {
         "linked": bool(getattr(slot, "linked_session_key", "")),
         "mirrored": on_probe_failure if probed is None else bool(probed),
-        "crew": getattr(slot, "mode", "") == "crew",
         "ephemeral": getattr(slot, "memory_mode", "persistent") != "persistent",
         "app": bool(getattr(slot, "_app", "")),
         "unattended": str(getattr(slot, "key", "")).startswith(UNATTENDED_SLOT_PREFIXES),
@@ -608,7 +669,7 @@ def newly_held_constraints(
     destroy user speech on a supported flow (``api_chat`` applies no linked
     refusal to composer input). A NEW outbound mirror is never exempt — the
     message's author does not control mirror links, so it still drops. Every
-    other constraint — crew, ephemeral, app, unattended, workspace — applies
+    other constraint — ephemeral, app, unattended, workspace — applies
     to directive entries too.
     """
     recorded: dict[str, Any] = {}
@@ -854,7 +915,7 @@ async def create_session(
     than at entry, so revoking mid call yields an untrusted child. See the block
     around the assignment.
 
-    ``folder_id`` files the slot as part of creation (#6118): it is assigned in
+    ``folder_id`` files the slot as part of creation: it is assigned in
     the same synchronous window that configures the slot, the whole
     allocation-to-persist span runs under ``suspend_slots_push`` so the slot's
     first broadcast frame already shows it filed, and the placement rides in the
@@ -876,11 +937,13 @@ async def create_session(
         )
     # The caller is resolved BEFORE the config gate so a member DM session —
     # for which dispatching work into workers is the operating model, not an
-    # opt-in — passes without `agent.session_control`. Every other caller
-    # still needs the switch. The member's automatic grant is bounded by
-    # ownership in `authorize_target`, not here: creation makes the caller
-    # the owner by construction.
-    if not session_control_enabled() and not _member_caller(caller_key):
+    # opt-in — passes without `agent.session_control`. That member bypass is
+    # itself gated by the operator ceiling `agent.member_dispatch` (default
+    # true = today's behaviour); with it off the member falls back under the
+    # switch like any other caller. Every other caller still needs the switch.
+    # The member's automatic grant is bounded by ownership in `authorize_target`,
+    # not here: creation makes the caller the owner by construction.
+    if not session_control_enabled() and not _member_bypass(caller_key):
         raise SessionControlError(
             "session control is disabled in config (agent.session_control)",
             code="session_control_disabled",
@@ -966,12 +1029,12 @@ async def create_session(
         # awaited HERE, still ahead of the caller re-resolve below, so the decisions
         # that authorize the allocation are all made after the last suspension.
         cfg = await asyncio.to_thread(KiroCrewConfig.load)
+        bindings = await asyncio.to_thread(resolve_agent_bindings, cfg, agent_name, project_dir)
     except Exception:
         raise SessionControlError(
             "cannot verify the effective agent's workspace binding",
             code="agent_unverifiable",
         ) from None
-    bindings = resolve_agent_bindings(cfg, agent_name, project_dir)
     agent_workspace = _workspace_name_for_dir(cfg, bindings.workspace_dir)
     if agent_workspace != workspace:
         who = repr(agent_name) if agent_name else "the default agent"
@@ -1132,8 +1195,8 @@ async def create_session(
     # `get_or_create_slot` broadcasts on a leading edge, so without the suspend an
     # idle gateway serializes and sends the new slot BEFORE `folder_id` is
     # assigned -- every client (and any app on `slots:user`) would render the
-    # session at the top level for a frame, the observable unfiled state #6118
-    # exists to remove. It also covers the persist and its failure retraction, so
+    # session at the top level for a frame -- the observable unfiled state this
+    # suspend removes. It also covers the persist and its failure retraction, so
     # a slot whose birth write fails is never broadcast at all. Same pattern the
     # move path uses ("file the slot before the coalesced broadcast").
     with state.suspend_slots_push():
@@ -1203,6 +1266,11 @@ async def create_session(
         inherited_trust_reads = bool(getattr(live_caller, "_trust_reads", False))
         slot._trust = inherited_trust
         slot._trust_reads = inherited_trust_reads
+        # The agent's memory silo, from the bindings already resolved above. Held
+        # on the slot so every later save can name it: `memory_store` is
+        # slot-owned metadata, so a save that could not read it would drop the
+        # key and silently return this session to the global store.
+        slot.memory_store = bindings.memory_store_name
         # cwd must follow the workspace too, or file search and project-scoped agents
         # resolve against a directory the slot does not claim -- the same
         # authorization-vs-execution split as the agent binding, one layer down.
@@ -1210,8 +1278,8 @@ async def create_session(
             slot.project = project_dir
         if folder_id:
             # Filed inside the same synchronous window that configures the slot, so
-            # the session is never observable unfiled -- the atomicity #6118 exists
-            # for. Existence was confirmed under the store lock above, and folder
+            # the session is never observable unfiled -- that atomicity is the point.
+            # Existence was confirmed under the store lock above, and folder
             # mutations run on this loop, so the folder cannot have been deleted
             # between that check and this assignment. No `_folder_changed` flag: the
             # slot's first turn carries the armed first-turn breadcrumb injection
@@ -1268,6 +1336,21 @@ async def create_session(
                     # losing it on restart would strand every worker a member
                     # dispatched — controllable in memory, orphaned after reboot.
                     **({"created_by": slot._created_by} if slot._created_by else {}),
+                    # The agent's memory silo, recorded ONLY when it is not the
+                    # default. This is what lets the consolidator write an agent's
+                    # semantic, episodic and lesson rows into its own store
+                    # instead of the global one, and this dict is the only record
+                    # for a session that is created and then sits idle.
+                    #
+                    # Omitted for the default store on purpose: absence is the
+                    # signal for "global", so a default user's metadata line stays
+                    # byte-identical and a session written before crews had stores
+                    # reads the same as one written now.
+                    **(
+                        {"memory_store": _named_store}
+                        if (_named_store := named_store_or_empty(slot.memory_store))
+                        else {}
+                    ),
                 },
             )
         except Exception:
@@ -1395,9 +1478,11 @@ def authorize_target(
         raise deny("caller session could not be identified", "caller_unidentified")
     # Resolved before the config gate: a member DM session is authorized
     # WITHOUT `agent.session_control` — dispatching and patrolling workers is
-    # its operating model — and is bounded instead by the ownership check
-    # below, which restricts it to slots it created itself.
-    if not skip_enabled_check and not session_control_enabled() and not _member_caller(caller_key):
+    # its operating model — while the operator ceiling `agent.member_dispatch`
+    # (default true = today's behaviour) is on. Turn that ceiling off and the
+    # member falls back under the switch. The member's reach stays bounded by
+    # the ownership check below, which restricts it to slots it created itself.
+    if not skip_enabled_check and not session_control_enabled() and not _member_bypass(caller_key):
         raise deny(
             "session control is disabled in config (agent.session_control)",
             "session_control_disabled",
@@ -1459,19 +1544,6 @@ def authorize_target(
         # that channel's content back and a stop would act on a conversation
         # other people are party to.
         raise deny("sessions mirrored to a channel are not addressable", "mirrored_target")
-    if getattr(slot, "mode", "") == "crew":
-        # A crew session's ingress is NOT a turn. `/api/chat` routes it to
-        # `state.crew.ingest`, which makes the message a durable queue entry and
-        # fans it out to topic sub-sessions; the orchestrator acks instantly and
-        # the message is only shown once the entry is durable. Delivering here as
-        # a turn instead would run generic work that is neither queued nor routed
-        # -- accepted, apparently fine, and silently outside the mode.
-        #
-        # Refused rather than emulated, for the same reason a channel-linked
-        # target is: a target whose turn lifecycle differs needs its own
-        # handling rather than a second, drifting copy of the orchestrator's
-        # rules.
-        raise deny("crew-mode sessions are not addressable", "crew_mode_target")
 
     # The caller's own isolation gates it too, and for the same reasons the
     # target's does: an incognito or temporary session is one the user asked to
@@ -1636,7 +1708,7 @@ async def stop_target(
     within ``stop_retry.WINDOW_SECS`` of this caller's first stop of this target, a
     repeat returns the existing "stop already in progress" no-op instead. A stop
     arriving after that window still escalates, so a genuine second decision keeps
-    the capability — only a blind retry cannot reach it (issue #5074).
+    the capability — only a blind retry cannot reach it.
 
     Withholding the escalation never costs the caller the stop it asked for: a
     repeat that finds the target running again soft-stops it as a first call would.
@@ -1852,7 +1924,7 @@ async def send_to_target(
     a busy one queues the message for its next turn. Both outcomes are reported
     distinctly — ``started`` says which happened — because "it ran" and "it will
     run later" must not look the same to a caller coordinating several sessions.
-    A queued delivery is re-validated at the drain (issue #5911): the entry
+    A queued delivery is re-validated at the drain: the entry
     carries the containment that held here, and a constraint newly held at
     delivery time drops it with a visible notice instead of executing it under
     the weaker authorization that admitted it.
@@ -1893,8 +1965,8 @@ async def send_to_target(
     # on THIS machine and diverge the local and peer transcripts, the same failure
     # the send / regenerate / rewind / continue paths refuse. Relaying a
     # cross-session send is a separate mechanism (open a peer turn, mirror it
-    # back); until that exists the send is refused rather than run locally
-    # (GPT #7693). Keyed on ``executor``, so a half-open binding is refused too.
+    # back); until that exists the send is refused rather than run locally.
+    # Keyed on ``executor``, so a half-open binding is refused too.
     if slot.executor == "remote":
         raise SessionControlError(
             "that session runs on a remote crew; sending into a crew-bound "

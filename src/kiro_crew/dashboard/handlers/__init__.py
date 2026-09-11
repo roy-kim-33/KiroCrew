@@ -61,6 +61,9 @@ from kiro_crew.dashboard.handlers.agents import (  # noqa: E402, F401
     _installed_agent_config,
     api_agent_config,
     api_agent_detail,
+    api_agent_fork,
+    api_agent_publish,
+    api_agent_reset,
     api_agents_installed,
     api_capability_agents_install,
     api_capability_agents_list,
@@ -91,6 +94,16 @@ from kiro_crew.dashboard.handlers.agents import (  # noqa: E402, F401
     api_slash_commands,
 )
 
+# ── Crew appearance library (handlers/appearances.py) ──
+from kiro_crew.dashboard.handlers.appearances import (  # noqa: E402, F401
+    api_appearance_delete,
+    api_appearance_detail,
+    api_appearance_slot,
+    api_appearances_import,
+    api_appearances_list,
+    api_appearances_petdex_fetch,
+)
+
 # ── Connections OAuth relay (handlers/connections.py) ──
 from kiro_crew.dashboard.handlers.connections import (  # noqa: E402, F401
     api_connections_cancel,
@@ -119,6 +132,7 @@ from kiro_crew.dashboard.handlers.cron import (  # noqa: E402, F401
     api_cron_script_source,
     api_cron_secret_grant,
     api_cron_to_chat,
+    api_cron_tools,
     api_cron_update,
     api_crons,
     api_crons_create,
@@ -229,6 +243,8 @@ from kiro_crew.dashboard.handlers.mcp_apps import (  # noqa: E402, F401
 # ── Crew Members (handlers/members.py) ──
 from kiro_crew.dashboard.handlers.members import (  # noqa: E402, F401
     api_member_activity,
+    api_member_rules_get,
+    api_member_rules_put,
     api_member_thread,
     api_members,
 )
@@ -236,6 +252,7 @@ from kiro_crew.dashboard.handlers.memory import (  # noqa: E402, F401
     _get_vector_store,
     _redact_memory_field,
     _set_migrated,
+    api_memory_carve,
     api_memory_consolidate,
     api_memory_context_preview,
     api_memory_disable_embeddings,
@@ -259,6 +276,28 @@ from kiro_crew.dashboard.handlers.memory import (  # noqa: E402, F401
     api_memory_semantic_write,
     api_memory_settings,
     api_memory_stats,
+)
+
+# ── Memory store administration (handlers/memory_admin.py) ──
+from kiro_crew.dashboard.handlers.memory_admin import (  # noqa: E402, F401
+    api_memory_backup,
+    api_memory_backups,
+    api_memory_restore,
+    api_memory_restore_cancel,
+    api_memory_retired,
+    api_memory_retired_restore,
+    api_memory_stores,
+)
+from kiro_crew.dashboard.handlers.memory_edit import (  # noqa: E402, F401
+    api_memory_bulk_apply,
+    api_memory_bulk_preview,
+    api_memory_record_history,
+    api_memory_records,
+    api_memory_records_refresh,
+)
+from kiro_crew.dashboard.handlers.memory_member import (  # noqa: E402, F401
+    api_memory_recall,
+    api_memory_seed,
 )
 
 # ── Messaging (extracted to handlers/messaging.py) ──
@@ -299,7 +338,6 @@ from kiro_crew.dashboard.handlers.messaging import (  # noqa: E402, F401
     api_slack_profile,
     api_slack_reactions,
     api_spawn,
-    api_spawn_clear,
     api_spawn_continue,
     api_spawn_delete,
     api_spawn_list,
@@ -315,6 +353,7 @@ from kiro_crew.dashboard.handlers.messaging import (  # noqa: E402, F401
     api_teams_config_save,
     api_telegram_config_get,
     api_telegram_config_save,
+    api_update_message,
     api_webex_config_get,
     api_webex_config_save,
     api_wecom_config_get,
@@ -385,7 +424,7 @@ from kiro_crew.dashboard.handlers.sessions import (  # noqa: E402, F401
     api_session_tool_policy,
     api_sessions,
     api_sessions_clear,
-    api_sessions_context,
+    api_sessions_clearable_count,
     api_sessions_health,
     api_sessions_memory,
     api_sessions_restart,
@@ -483,6 +522,11 @@ from kiro_crew.dashboard.handlers.themes import (  # noqa: E402, F401
     api_themes_install,
 )
 
+# ── Browser UI preference backup (extracted to handlers/ui_prefs.py) ──
+from kiro_crew.dashboard.handlers.ui_prefs import (  # noqa: E402, F401
+    api_ui_prefs,
+)
+
 # ── Updates & Logs (extracted to handlers/updates.py) ──
 # NOTE: api_stream passes update_available= to status_snapshot (see updates.py)
 from kiro_crew.dashboard.handlers.updates import (  # noqa: E402, F401
@@ -516,6 +560,10 @@ from kiro_crew.dashboard.handlers.usage import (  # noqa: E402, F401
     api_kiro_usage,
     api_usage,
 )
+from kiro_crew.dashboard.handlers.wakatime import (  # noqa: E402, F401
+    api_wakatime_export,
+    api_wakatime_stats,
+)
 
 # ── Themes: validation/parsing core (extracted to theme_validate.py) ──
 from kiro_crew.dashboard.theme_validate import (  # noqa: E402, F401
@@ -526,6 +574,15 @@ from kiro_crew.dashboard.theme_validate import (  # noqa: E402, F401
     _strip_to_allowed_vars,
     _validate_theme_data,
 )
+
+# ── Conductor work ledger (handlers/work_ledger.py) ──
+# DELIBERATELY NOT IMPORTED HERE. ``kirocrew-work`` is an opt-in MCP server, so its
+# four handlers are an optional subsystem, and an eager import would put them on the
+# gateway boot path — which ``no-new-work-on-gateway-boot-path`` clause 5 forbids
+# ("gate the import, not just the handler"). ``server._deferred_work_ledger`` binds
+# the routes at boot and imports the module on the first request instead, exactly as
+# ``_deferred_session_control`` does for the feature-flagged session-control routes.
+
 
 # ── Prompts & Skills (extracted to handlers/prompts.py) ──
 
@@ -611,9 +668,9 @@ def _prompt_dir_entry(path: Path, root_real: Path, src: str) -> dict[str, Any] |
       the scoped read already refuses a hardlinked prompt outright, so a listing
       that offered one would advertise a file its own scope will not serve.
     * An unreadable file is NOT refused. It keeps its entry with an empty
-      description, exactly as before — a bad mode or a transient I/O error must
-      surface as the read path's own error, not as a prompt silently vanishing
-      from the user's library.
+      description: a bad mode or a transient I/O error must surface as the read
+      path's own error, not as a prompt silently vanishing from the user's
+      library.
     * The stem must satisfy ``_plain_stem_ok``, the single predicate create, the
       scoped read and both write verbs already address a prompt by. A stem it
       rejects is one every other verb on this API answers ``invalid_name`` for, so
@@ -875,6 +932,14 @@ from kiro_crew.dashboard.handlers.core import (  # noqa: E402, F401
     index,
     logo,
     pwa_file,
+)
+
+# Flagged-file delivery consent — owner-gated, and the ONLY writer of
+# ``file_delivery_consent.json``. No CLI counterpart, deliberately.
+from kiro_crew.dashboard.handlers.file_delivery_consent import (  # noqa: E402, F401
+    api_file_delivery_consent_delete,
+    api_file_delivery_consent_get,
+    api_file_delivery_consent_post,
 )
 from kiro_crew.dashboard.handlers.notifications_push import (  # noqa: E402, F401
     api_push_notification,

@@ -789,7 +789,7 @@ class TestLocalLookupIsBounded:
         assert names == ["local-sop"]
 
     def test_the_project_independent_half_still_wins_a_stem_collision(self, tmp_path):
-        """Ordering is unchanged: both halves used to be one list, global first."""
+        """The two halves form a single ordering, global first, so it wins a stem collision."""
         _user_prompt(tmp_path, "shared", "# Global\nGLOBAL-BODY\n")
         proj = tmp_path / "checkout"
         d = proj / ".kiro" / "prompts"
@@ -1195,7 +1195,7 @@ class TestPromptReadsGoThroughTheDescriptorGate:
         the description READ into a blanket link refusal without going red.
 
         Asserted on the reader directly, and with a link that stays inside the
-        prompt root, because the LISTING no longer offers a linked entry to reach
+        prompt root, because the LISTING does not offer a linked entry to reach
         it with: ``_prompt_dir_entry`` refuses one outright so the local scope
         offers exactly the names its own read, update and delete verbs can
         address. That withdrawal is pinned by
@@ -1482,7 +1482,7 @@ class TestUnscopedDetailReadStaysOffTheEventLoop:
     Offloading only the resolution was survivable while a match could name nothing
     but a package root or the gateway's own ``~/.kiro/prompts``. A match can now
     name ``<project>/.kiro/prompts``, a directory the gateway does not own and that
-    may be network-backed, so the ``stat`` and ``read_text`` that used to run after
+    may be network-backed, so the ``stat`` and ``read_text`` that would run after
     the metadata came back would stall every other request and the heartbeat on
     exactly the storage this route newly reaches. The scoped branch already reads
     inside one job (``_api_user_prompt_detail``'s ``_read``); this is the unscoped
@@ -1709,7 +1709,7 @@ class TestEveryPromptReaderUsesTheNoLinkGate:
     def test_a_user_scope_read_with_no_serveable_root_is_refused_not_widened(self, tmp_path):
         """``None`` from the root derivation means REFUSE, never "unconstrained".
 
-        A user-scope entry that can no longer name a serveable root is exactly the
+        A user-scope entry that cannot name a serveable root is exactly the
         state a swapped root leaves, so falling back to the canonical path's own
         parent there would pin the read inside the directory the swap named — the
         leak the pin exists to close. A package SOP takes that fallback, because
@@ -1945,9 +1945,9 @@ class TestApiPromptsCreate:
         assert "slot-local" in _listed_names(project=proj)
 
     def test_local_create_is_not_listed_for_a_different_slot(self, tmp_path, mock_sel):
-        """The bug #7345 fixes: a local prompt created under slot A's project
-        must NOT leak into a different slot B bound to a different project.
-        Per-slot resolution keeps each slot's local prompts to itself."""
+        """A local prompt created under slot A's project must NOT leak into a
+        different slot B bound to a different project. Per-slot resolution keeps
+        each slot's local prompts to itself."""
         proj_a = tmp_path / "proj-a"
         proj_a.mkdir()
         proj_b = tmp_path / "proj-b"
@@ -2305,7 +2305,7 @@ class TestApiPromptUpdate:
 
 class TestPromptEditCompareAndSwap:
     """A PUT names the file state its edit was based on; the writer refuses when
-    the file no longer matches. Without this, an edit started before someone
+    the file does not match. Without this, an edit started before someone
     else's save silently discards their work on completion."""
 
     def test_stale_base_hash_answers_409_and_leaves_the_file(self, tmp_path, mock_sel):
@@ -3177,8 +3177,8 @@ class TestCreateAndDeletePinTheDirectory:
         """Every outcome is audited, including a non-OS failure, and the create fd
         is owned here so each failed attempt closes exactly one.
 
-        A ``MemoryError`` stands in for the whole class the narrower ``OSError``
-        catch used to let escape: it would have answered 500 with no audit line,
+        A ``MemoryError`` stands in for the whole class a narrower ``OSError``
+        catch lets escape: that would answer 500 with no audit line,
         which is the one thing this handler promises not to do.
 
         Descriptors are counted through the process's own fd directory: Linux
@@ -3351,6 +3351,10 @@ class TestCreateAndDeletePinTheDirectory:
             "bool",
         }, f"boot-path constant calls something that may touch the filesystem: {sorted(calls)}"
 
+    @pytest.mark.skipif(
+        not _prompts_mod._UNNAMED_CREATE_SUPPORTED or not os.path.isdir("/proc/self/fd"),
+        reason="platform cannot build an unnamed inode (O_TMPFILE + /proc/self/fd)",
+    )
     def test_the_body_is_durable_before_the_name_appears(self, tmp_path, mock_sel, monkeypatch):
         """The flush precedes the publish, and the DIRECTORY is flushed too.
 
@@ -3506,6 +3510,10 @@ class TestCreateAndDeletePinTheDirectory:
         ).exists(), "the fallback left behind a prompt whose entry it could not flush"
         assert _outcomes(mock_sel)[-1] == "error"
 
+    @pytest.mark.skipif(
+        not _prompts_mod._UNNAMED_CREATE_SUPPORTED or not os.path.isdir("/proc/self/fd"),
+        reason="platform cannot build an unnamed inode (O_TMPFILE + /proc/self/fd)",
+    )
     def test_a_create_cannot_disturb_a_prompt_already_at_the_name(
         self, tmp_path, mock_sel, monkeypatch
     ):

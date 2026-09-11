@@ -25,7 +25,6 @@ from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.paths import config_dir
 from kiro_crew.constants import KIROCREW_SPAWNED_ENV, KIROCREW_SPAWNED_VALUE
 from kiro_crew.mcp_gateway.shutdown_budget import TOTAL_SHUTDOWN_BUDGET_SECS
-from kiro_crew.providers.base import LLMProvider
 
 logger = logging.getLogger(__name__)
 
@@ -146,8 +145,11 @@ def _session_pid_file_lock():  # type: ignore[no-untyped-def]
     """Exclusive file lock for session PID file operations."""
     lock_path = _session_pid_file_path().with_suffix(".lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(lock_path, "w") as lock_fd:
-        with platform_compat.file_lock(lock_fd.fileno(), exclusive=True):
+    # Open non-truncating; see ``platform_compat.open_lock_file`` for why ``"w"``
+    # loses the lock on Windows (GH-9248). The helper does the create-or-open in
+    # one syscall; the parent mkdir above stays because it does not.
+    with platform_compat.open_lock_file(lock_path) as lock_fd:
+        with platform_compat.file_lock(lock_fd, exclusive=True):
             yield
 
 
@@ -182,8 +184,11 @@ def _pid_file_lock():  # type: ignore[no-untyped-def]
     """Exclusive file lock for all PID file read-modify-write operations."""
     lock_path = _pid_file_path().with_suffix(".lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(lock_path, "w") as lock_fd:
-        with platform_compat.file_lock(lock_fd.fileno(), exclusive=True):
+    # Open non-truncating; see ``platform_compat.open_lock_file`` for why ``"w"``
+    # loses the lock on Windows (GH-9248). The helper does the create-or-open in
+    # one syscall; the parent mkdir above stays because it does not.
+    with platform_compat.open_lock_file(lock_path) as lock_fd:
+        with platform_compat.file_lock(lock_fd, exclusive=True):
             yield
 
 
@@ -498,7 +503,15 @@ def _periodic_pid_sweep(my_gw_pid: int, active_pids: set[int]) -> tuple[set[str]
     lock_path = path.with_suffix(".lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        lock_fd = open(lock_path, "w")
+        # Non-truncating, for the reason spelled out in `_session_pid_file_lock`.
+        # This site is the likeliest of the three to feel it: the sweep runs on a
+        # timer while `_track_session_pid` is contending for the same lock, which
+        # is exactly the interleaving a truncating open turns into a crash.
+        # Kept inline rather than routed through `platform_compat.open_lock_file`:
+        # this fd is held across the try/finally below, not a `with` block, so a
+        # with-scoped opener that closes the fd at block exit does not fit.
+        lock_path.touch(exist_ok=True)
+        lock_fd = open(lock_path, "r+")
     except OSError:
         return set(), []
     try:
@@ -547,12 +560,23 @@ def _kill_confirmed_and_writeback(
     return orphan_killed
 
 
-def _sync_kill_provider(provider: LLMProvider) -> None:
+def _sync_kill_provider(provider: object) -> None:
     """Synchronously kill a provider's process.
 
     Used during CancelledError handling where async shutdown is unreliable
     (asyncio.shield + await raises CancelledError immediately, leaving
     shutdown fire-and-forget).  Falls back to SIGKILL if SIGTERM fails.
+
+    ``provider`` is deliberately ``object`` rather than ``LLMProvider``.  Every
+    read below goes through ``getattr(..., None)`` against a PRIVATE attribute
+    that the provider ABC does not declare, so the ABC never described this
+    parameter -- and importing it here for the annotation alone closed a cycle:
+    session_pid -> providers.base -> acp.types -> acp/__init__ -> acp.runtime ->
+    session_pid.  That cycle was fatal, not cosmetic: importing this module
+    first raised ``ImportError`` on ``_track_pid``.  It is why sibling
+    leaves carry ``LLMProvider = Any`` runtime stubs and why this module reaches
+    acp.client through function-local imports.  ``test_agent_lifecycle_cycle.py``
+    pins the absence; keep this leaf ignorant of the agent layer.
     """
     # ACP provider: long-lived process via client._pid
     client = getattr(provider, "_client", None)
@@ -1124,7 +1148,7 @@ _MARKED_MCP_LAUNCHER_MARKERS = (
     b"mcp start-server",  # generic ``<launcher> mcp start-server <name>`` shims
 )
 
-# ── Stranded playwright-cli browser daemon (issue #5986) ─────────────────────
+# ── Stranded playwright-cli browser daemon ───────────────────────────────────
 # playwright-core spawns its browser daemon as
 #   ``node <...>/playwright-core/lib/entry/cliDaemon.js <session-name> [flags]``
 # with ``detached: true`` and no ``env`` override (cli-client/session.js
@@ -1289,7 +1313,7 @@ def _is_sweepable_orphan_browser_daemon(pid: int, cmdline: bytes, age_seconds: f
 
     Every signal is a kernel fact (argv, exec-time environ, SID, process
     liveness). Nothing here reads agent-writable filesystem state, which is
-    what made the previously withdrawn reapers unsafe.
+    what would make a reaper unsafe.
     """
     if age_seconds < _ORPHAN_WORK_MIN_AGE_SECONDS:
         return False
@@ -1714,8 +1738,9 @@ _reported_untracked_agent_pids: set[int] = set()
 # ``_cleanup_orphaned_mcp_servers`` kills the child once its parent is gone), and
 # an owner is never reclaimed *through* the entry that names it. Counting an
 # owner field would let a stale entry whose owner has died and had its PID
-# recycled silently suppress a genuine leak report — exactly the silence issue
-# #2930 is about. A bare line names its own process, whichever file it is in.
+# recycled silently suppress a genuine leak report — exactly the silence this
+# field exists to prevent. A bare line names its own process, whichever file it
+# is in.
 _REAPABLE_PID_FIELD: tuple[tuple[str, int], ...] = (
     ("session", 1),  # kiro_session_pids.txt: <gateway_pid>:<child_pid>[:start-id]
     ("child", 0),  # kiro_pids.txt: <child_pid>:<parent_pid>

@@ -156,6 +156,22 @@ class TestAddDocument:
         assert "the interesting design body" in _items(kstore, res["source_id"])
 
     @pytest.mark.asyncio
+    async def test_add_surfaces_import_budget_refusal_as_deferred(self, pipeline):
+        # The agent path must surface WHY the import was deferred, not swallow it
+        # into a generic error. Enable a tiny budget and exhaust the window, then
+        # the next agent add returns a 'deferred' status carrying the reasoned
+        # message rather than 'error'/500.
+        from unittest.mock import patch
+        with patch("kiro_crew.knowledge.ingestion._import_chunk_budget", return_value=1):
+            pipeline._import_budget.set_budget(1)
+            pipeline._import_budget.reserve()  # exhaust the window
+            res = await add_agent_document(
+                pipeline, title="Doc", content="body", source_uri="test://Doc")
+        assert res["status"] == "deferred"
+        assert "import_chunk_budget" in res["reason"]
+        assert res["reason"].isascii()
+
+    @pytest.mark.asyncio
     async def test_second_identical_add_ingests_once(self, pipeline, kstore):
         first = await add_agent_document(pipeline, title="Doc", content="same body", source_uri="test://Doc")
         second = await add_agent_document(pipeline, title="Doc", content="same body", source_uri="test://Doc")
@@ -746,7 +762,7 @@ async def test_a_deduped_row_does_not_block_a_later_retry(pipeline, kstore):
         "SELECT content_hash FROM agent_item_state WHERE source_id = ? AND slug = ?",
         (sid, document_slug("/repo/doc.md"))).fetchone()["content_hash"]
 
-    # Removing the holder no longer destroys the document: the refusal recorded this
+    # Removing the holder does not destroy the document: the refusal recorded this
     # source as a location, so ownership MOVES here and the row adopts what it
     # inherits. "Unchanged" is then the truthful answer -- the Library does hold it.
     kstore.delete_source_cascade(other)

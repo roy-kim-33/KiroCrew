@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from kiro_crew import env as env_mod
 from kiro_crew.browser_cli import install as mod
 
 # The real implementation, captured before the autouse fixture below replaces
@@ -15,6 +16,27 @@ from kiro_crew.browser_cli import install as mod
 # restore THIS (re-reading ``mod._required_revisions`` there would just re-bind
 # the stub to itself, silently leaving every test on the fallback path).
 _REAL_REQUIRED_REVISIONS = mod._required_revisions
+
+
+@pytest.fixture(autouse=True)
+def _clear_node_bin_dir_caches() -> None:
+    """``node_bin_dirs`` / ``_node_all_bin_dirs`` are ``lru_cache``d for the
+    process lifetime, keyed on nothing (the former) or on ``(home, mise_data)``
+    (the latter). ``cli_path()`` reaches both via ``find_node_tool`` ->
+    ``node_augmented_path`` -> ``node_bin_dirs()``. Once any earlier test in
+    this worker (this file or another) resolves a node tool with the real
+    ``$HOME``, the memoized real-machine mise/volta/nvm directories stay
+    prepended to every later PATH lookup regardless of a test's own ``HOME``
+    override -- ``test_the_cli_is_found_where_the_standalone_installer_puts_it``
+    got the operator's real mise-installed ``playwright-cli`` shim instead of
+    the ``tmp_path``-rooted wrapper it wrote, only when an earlier test had
+    warmed the cache first (no-test-side-effects; mirrors the fixture in
+    test_node_toolchain_resolution.py)."""
+    env_mod.node_bin_dirs.cache_clear()
+    env_mod._node_all_bin_dirs.cache_clear()
+    yield
+    env_mod.node_bin_dirs.cache_clear()
+    env_mod._node_all_bin_dirs.cache_clear()
 
 
 @pytest.fixture(autouse=True)
@@ -240,7 +262,7 @@ def test_install_falls_back_without_deps_when_the_package_step_is_refused(
 ) -> None:
     """A refused ``apt-get`` must not cost the operator the browser.
 
-    Regression for a real dev-desktop failure: ``--with-deps`` shells out to
+    ``--with-deps`` shells out to
     ``apt-get`` as root, sudo policy refuses it, and because the flag and the
     download are one CLI invocation the download failed too -- even though it
     needs no privilege at all.
@@ -683,7 +705,7 @@ class TestFailureDetailIsRedactedAtTheSource:
         """A URL credential whose ``@`` anchor sits past the display cap.
 
         Truncating first would split ``://user:pass@host`` so the trailing
-        ``@`` is gone; the regex no longer matches, leaking the password
+        ``@`` is gone; the regex does not match, leaking the password
         fragment. Redacting before truncation eliminates this.
         """
         # Place the URL so its @ lands past _STDERR_CAP.
@@ -741,7 +763,7 @@ class TestFailureDetailIsRedactedAtTheSource:
     def test_redaction_timing_scales_linearly(self):
         """Redaction must not blow up super-linearly on adversarial input.
 
-        **What this asserts, and why it is no longer a tight ratio.** The bound
+        **What this asserts, and why it is not a tight ratio.** The bound
         this test exists to defend is the gap between LINEAR and CATASTROPHIC,
         which is the gap between milliseconds and seconds-to-minutes. It does
         not need to resolve 2.0x from 3.0x, and trying to do so is what made it
@@ -898,7 +920,7 @@ def test_the_standalone_command_writes_no_fixed_name_into_the_working_directory(
 def test_detect_offers_the_os_appropriate_standalone_installer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The panel's Node-blocked state used to end at "Download Node.js", which is
+    """The panel's Node-blocked state must not end at "Download Node.js", which is
     the one thing the operator it describes often cannot do -- no admin rights, or a
     registry that needs a login. `detect()` therefore carries the standalone
     installer command, and composes it HERE because only the gateway knows which OS

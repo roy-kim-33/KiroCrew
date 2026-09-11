@@ -8,6 +8,18 @@ See also the SEL section in [`security.md`](security.md) for the threat-model vi
 
 Storage: `~/.kiro/crew/security_events.jsonl` (append-only JSONL with HMAC-SHA256 chain).
 
+Private member subprocesses keep a separate diagnostic chain in their isolated
+execution log directory: the host path is
+`memory_stores/.execution-logs/member-<random>/audit-<pid>/security_events.jsonl`.
+This host location is hidden from Global V1 and private peers. Linux exposes only
+that execution directory at the child's `agent-logs/`; outer Seatbelt denies peer
+execution paths. The directory choice is established at launch, before protected
+PID publication, so early MCP initialization cannot append to the global chain.
+These are process-local diagnostics with their own keys, not trusted gateway
+audit or session-identity authority. The gateway continues to record memory API
+mutations in its original chain. CLI text logs are persisted beside these local
+chains; write failures remain explicit. V1 storage and verification are unchanged.
+
 ## Event Schema
 
 Each entry records:
@@ -77,6 +89,13 @@ first later touch, on its caller's thread. `critical=True` writes are
 synchronous by design and their call sites still offload themselves when
 reached from the loop.
 
+Private-member authorization denials keep their typed 403 responses even when
+SEL initialization or event submission fails. Their shared denial audit resolves
+the singleton and submits the event in a worker thread, including after an
+unsuccessful startup warm. Audit failure is diagnostic only: it cannot grant
+access or allow the protected handler to read or mutate a resource. Critical
+grant audits retain their audit-or-deny contract.
+
 - **Durability**: eventually-durable, not synchronously-durable — a crash/kill
   can lose at most the events still queued. Acceptable for an audit log; the
   hot path (e.g. per-message skill triggering) no longer pays fsync/lock latency.
@@ -106,7 +125,7 @@ Default 365 days. Pruned daily by heartbeat service (`_PRUNE_TICKS`).
 | MCP core tools | `spawn_run`, `learn_add`, `task_run` calls and outcomes | `mcp_core.py` |
 | MCP cron tools | `cron_add`, `cron_remove`, etc. calls and outcomes | `mcp_cron.py` |
 | Session directives | Structured monitor create/update/stop application outcomes; every refusal records `denied` rather than `success` | `dashboard/session_directive_apply.py` |
-| Dashboard API | All POST/PUT/DELETE operations via middleware, plus allowed and denied project-skill trust, app-slot, saved-workflow, and strict session-monitor read authorization decisions | `dashboard/server.py`, `dashboard/handlers/prompts.py`, `dashboard/handlers/workflows.py`, `dashboard/handlers/autonudge.py` |
+| Dashboard API | All POST/PUT/DELETE operations via middleware, plus allowed and denied project-skill trust, app-slot, saved-workflow, strict session-monitor read authorization, and in-app update authorization decisions (`update.arm` / `update.approve`; denial audits are best-effort, while a granted approval fails closed when its audit is unwritable) | `dashboard/server.py`, `dashboard/handlers/prompts.py`, `dashboard/handlers/workflows.py`, `dashboard/handlers/autonudge.py`, `dashboard/handlers/updates.py` |
 | ACP worker-pool audit | Per-`tool_call` `auto_approved` `tool_invocation` (`source=subagent`), bounded by `_SEL_AUDIT_TIMEOUT_SECONDS` (5.0s) and offloaded off the event loop so a wedged SEL backend never gates dispatch. Two emitters: the knowledge LLMPool via `AcpClient._maybe_audit_tool_call` (gated on the `audit_source` ctor param, offloaded to `subprocess_executor()`); and **code-review-sage's ReviewPool**, which migrated to the shared `AcpRuntime` (no `audit_source`) and re-emits the same per-tool record itself | `acp/client.py`, `apps/builtins/code_review_sage/sage_lib/review_pool.py` |
 | Structured monitor mutation audit | Critical `monitor_update` / `monitor_stop` invocation records are audit-before-mutation. Both singleton resolution and the synchronous write run in a worker thread, so SEL initialization or disk latency cannot block the gateway event loop | `autonudge_authz.py` |
 | Token auth | `internal_auth`, `app_scope_check`, `dashboard_sessions_revoked`, `refresh_token_initial_mint`, `nonce_evicted` (`source=token_auth`) | `dashboard/token_auth.py` |

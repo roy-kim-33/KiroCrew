@@ -34,7 +34,7 @@ from kiro_crew.loop_lock import LoopBoundLock
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
 
-from .ingestion import DUPLICATE_JOB_STATUS, IngestionPipeline
+from .ingestion import DUPLICATE_JOB_STATUS, ImportChunkBudgetError, IngestionPipeline
 from .store import AUTO_ADDED_PROP, KnowledgeStore
 
 logger = logging.getLogger(__name__)
@@ -232,7 +232,7 @@ def remove_document(store: KnowledgeStore, source_id: str, slug: str) -> int:
         # A document that LOST a dedup owns nothing but still holds the winner's
         # items. Removing it has to release that claim, exactly as the artifact
         # path does, or a later winner deletion resurfaces content this aggregate
-        # no longer has.
+        # does not have.
         store.detach_source_location_by_hash(source_id, prev_hash or "")
     store.db.execute(
         "DELETE FROM agent_item_state WHERE source_id = ? AND slug = ?",
@@ -377,6 +377,15 @@ async def _add_agent_document(
             on_duplicate=lambda _text_hash: _record_deduped_state(
                 store, source_id, slug, content_hash, title),
         )
+    except ImportChunkBudgetError as exc:
+        # The cross-file import budget refused this add. Surface WHY to the agent
+        # -- the exception's message is the reasoned, ASCII, budget/window/spent
+        # text built for exactly this, and the whole point of refusing rather than
+        # silently truncating is that the caller can report it. Nothing was
+        # written, so no state to record; the agent can retry after the window
+        # rolls over or the operator can raise knowledge.import_chunk_budget.
+        return {"status": "deferred", "reason": str(exc),
+                "slug": slug, "source_id": source_id}
     finally:
         if tmp_path:
             try:

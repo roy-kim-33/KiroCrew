@@ -1,22 +1,31 @@
-import { type ReactNode } from 'react'
+import { lazy, Suspense, type ReactNode } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
-import { ArrowLeft, ArrowRight, BarChart3, Brain } from 'lucide-react'
+import { ArrowLeft, ArrowRight, BarChart3, Brain, Clock } from 'lucide-react'
 import { useAppSelector } from '../store'
 import { useUptime } from '../hooks/useUptime'
 import { api } from '../api/client'
-import { Card, CardTitle, StatCard } from '../components/ui'
+import type { WakaTimeStats } from '../api/client'
+import { Card, CardTitle, StatCard, Btn, ContentSkeleton } from '../components/ui'
 import { TunnelStatus } from '../components/TunnelStatus'
 import { TailnetMobileCard } from '../components/TailnetMobileCard'
+import { KiroSignInCard } from './settings/KiroSignInCard'
 import ErrorBoundary from '../components/ErrorBoundary'
+import ErrorNotice from '../components/ErrorNotice'
+import { useGuardedLeave } from '../components/NavigationLeaveGuard'
 import { getOverviewStatCards } from './overviewStatCards'
 import { getOverviewPanel } from './overviewPanel'
 import { isOverviewBuiltinSuppressed } from './overviewBuiltins'
-import { MemoryTab, UsageTab } from './overview'
+import { UsageTab, WakaTimeTab } from './overview'
 import { useProvider } from '../providers'
 import type { NormalizedUsage } from '../providers'
 
 import { i18nT } from '../i18n/t'
+import { fmtDuration } from '../i18n/format'
+
+// The record editor and recovery tools are needed only inside this drill-in.
+// Keep them out of the dashboard shell's initial bundle.
+const MemoryTab = lazy(() => import('./overview/MemoryTab'))
 /**
  * Settings > Overview — mission control.
  *
@@ -28,7 +37,7 @@ import { i18nT } from '../i18n/t'
  * on the Import tab.
  */
 
-const DRILL_VIEWS = ['memory', 'usage'] as const
+const DRILL_VIEWS = ['memory', 'usage', 'wakatime'] as const
 type DrillView = (typeof DRILL_VIEWS)[number]
 
 function fmtNum(n: number | undefined | null): string {
@@ -39,18 +48,19 @@ function fmtNum(n: number | undefined | null): string {
 }
 
 /** Back link + drill-in content, mirroring the Channels back affordance. */
-function DrillIn({ title, onBack, children }: { title: string; onBack: () => void; children: ReactNode }) {
+function DrillIn({ title, onBack, children, hideTitle = false }: { title: string; onBack: () => void; children: ReactNode; hideTitle?: boolean }) {
+  const leave = useGuardedLeave()
   return (
     <div>
-      <button
-        onClick={onBack}
+      <Btn
+        onClick={() => leave(onBack)}
         aria-label={i18nT('pages.overviewPage.back_to_overview')}
         className="flex items-center gap-1.5 text-[13px] font-medium text-accent bg-transparent border-none cursor-pointer px-0 py-1 mb-2 hover:underline"
       >
-        <ArrowLeft size={14} />
+        <ArrowLeft className="lucide-inline" />
         {i18nT('pages.overviewPage.overview')}
-      </button>
-      <div className="text-xl font-bold tracking-tight text-text-strong mb-3">{title}</div>
+      </Btn>
+      {!hideTitle && <div className="text-xl font-bold tracking-tight text-text-strong mb-3">{title}</div>}
       {children}
     </div>
   )
@@ -59,7 +69,7 @@ function DrillIn({ title, onBack, children }: { title: string; onBack: () => voi
 /** Usage summary card — shares the query cache with the Usage drill-in. */
 function UsageSummaryCard({ onOpen }: { onOpen: () => void }) {
   const provider = useProvider()
-  const { data } = useQuery<NormalizedUsage>({
+  const { data, isError, error } = useQuery<NormalizedUsage>({
     queryKey: ['provider-usage', provider.id],
     queryFn: () => provider.fetchUsage(),
     enabled: provider.capabilities.usageBilling,
@@ -76,6 +86,10 @@ function UsageSummaryCard({ onOpen }: { onOpen: () => void }) {
       </CardTitle>
       {!provider.capabilities.usageBilling ? (
         <div className="text-[13px] text-muted">{i18nT('pages.overviewPage.usage_tracking_is_not_available_for')} {provider.displayName}.</div>
+      ) : isError ? (
+        // askAgent on: a read of the provider's usage report; the card holds no
+        // input. Without this branch a rejected fetch left the skeleton up forever.
+        <ErrorNotice message={error?.message} askAgent testId="overview-usage-error" />
       ) : !data ? (
         <div className="skeleton h-14 rounded" />
       ) : (
@@ -104,9 +118,46 @@ function UsageSummaryCard({ onOpen }: { onOpen: () => void }) {
   )
 }
 
+/** WakaTime summary card — shares the query cache with the WakaTime drill-in. */
+function WakaTimeSummaryCard({ onOpen }: { onOpen: () => void }) {
+  const { data, isError, error } = useQuery<WakaTimeStats>({
+    queryKey: ['wakatime-stats', 'last_7_days'],
+    queryFn: () => api.wakatimeStats('last_7_days'),
+  })
+  const total = data?.stats?.total_seconds ?? 0
+  const fmtHm = (s: number) => {
+    // Round to whole minutes first, then split, so 7199s -> 2h 0m, not 1h 60m.
+    const totalMin = Math.round(Math.max(0, s) / 60)
+    const h = Math.floor(totalMin / 60)
+    const m = totalMin % 60
+    return fmtDuration([[h, 'hour'], [m, 'minute']], { dropZero: true })
+  }
+  return (
+    <Card>
+      <CardTitle>
+        <Clock className="lucide-inline" /> {i18nT('pages.overviewPage.wakatime')}
+        <Btn onClick={onOpen} className="ml-auto border-none bg-transparent px-0 py-0 text-[12px] font-medium text-accent hover:bg-transparent hover:underline">
+          {i18nT('pages.overviewPage.view_details')} <ArrowRight size={12} />
+        </Btn>
+      </CardTitle>
+      {isError ? (
+        <ErrorNotice message={error?.message} askAgent testId="overview-wakatime-error" />
+      ) : !data ? (
+        <div className="skeleton h-14 rounded" />
+      ) : !data.configured ? (
+        <div className="text-[13px] text-muted">{i18nT('pages.overviewPage.wakatime_not_connected')}</div>
+      ) : (
+        <div className="text-[13px] text-muted">
+          {i18nT('pages.overviewPage.wakatime_last_7_days')} <span className="text-text font-mono">{fmtHm(total)}</span>
+        </div>
+      )}
+    </Card>
+  )
+}
+
 /** Memory summary card — consolidation cadence + retention at a glance. */
 function MemorySummaryCard({ onOpen }: { onOpen: () => void }) {
-  const { data } = useQuery<{ history_idle_hours?: number; history_max_days?: number; migrated?: boolean }>({
+  const { data, isError, error } = useQuery<{ history_idle_hours?: number; history_max_days?: number; migrated?: boolean }>({
     queryKey: ['memory-settings'],
     queryFn: () => api.memorySettings(),
   })
@@ -118,7 +169,11 @@ function MemorySummaryCard({ onOpen }: { onOpen: () => void }) {
           {i18nT('pages.overviewPage.view_details')} <ArrowRight size={12} />
         </button>
       </CardTitle>
-      {!data ? (
+      {isError ? (
+        // askAgent on: a read of the persisted memory settings; the card holds no
+        // input. Without this branch a rejected fetch left the skeleton up forever.
+        <ErrorNotice message={error?.message} askAgent testId="overview-memory-error" />
+      ) : !data ? (
         <div className="skeleton h-14 rounded" />
       ) : (
         <div className="flex flex-col gap-1 text-[13px] text-muted">
@@ -167,10 +222,21 @@ export default function OverviewPage() {
   }, { replace: true })
 
   if (view === 'memory') {
-    return <DrillIn title={i18nT('pages.overviewPage.memory')} onBack={() => setView(null)}><MemoryTab refreshTrigger={refreshTrigger} /></DrillIn>
+    const selectedStore = params.get('store') || ''
+    return <DrillIn title={i18nT('pages.overviewPage.memory')} hideTitle={!!selectedStore && selectedStore !== 'default'} onBack={() => setView(null)}>
+      <Suspense fallback={<ContentSkeleton rows={6} />}><MemoryTab refreshTrigger={refreshTrigger} selectedStore={selectedStore} onStoreNavigate={store => setParams(previous => {
+        const next = new URLSearchParams(previous)
+        if (store) next.set('store', store)
+        else next.delete('store')
+        return next
+      }, { replace: true })} /></Suspense>
+    </DrillIn>
   }
   if (view === 'usage') {
     return <DrillIn title={i18nT('pages.overviewPage.usage')} onBack={() => setView(null)}><UsageTab /></DrillIn>
+  }
+  if (view === 'wakatime') {
+    return <DrillIn title={i18nT('pages.overviewPage.wakatime')} onBack={() => setView(null)}><WakaTimeTab /></DrillIn>
   }
 
   // Resolved once per render, and bound to a capitalized local so JSX treats it
@@ -223,6 +289,18 @@ export default function OverviewPage() {
         })}
       </div>
 
+      {/* Kiro sign-in. First among the guided cards because it decides WHICH
+          identity every agent process runs as; a lapsed or missing sign-in is
+          the one Overview fact the rest of the dashboard cannot work around.
+          Same isolation and suppression contract as the tailnet card below. */}
+      {!isOverviewBuiltinSuppressed('kiro-sign-in') && (
+        <ErrorBoundary scope="overview-kiro-sign-in" fallback={null}>
+          <div className="mb-6">
+            <KiroSignInCard />
+          </div>
+        </ErrorBoundary>
+      )}
+
       {/* Mobile access. Above the summary cards and full width, because it is a
           guided sequence rather than a metric: it owns the one next action, and
           in its terminal state it renders a QR the operator scans off the screen.
@@ -245,6 +323,7 @@ export default function OverviewPage() {
       {/* Deep-surface summary cards */}
       <div className="grid gap-3.5 grid-cols-2 max-[760px]:grid-cols-1">
         <UsageSummaryCard onOpen={() => setView('usage')} />
+        <WakaTimeSummaryCard onOpen={() => setView('wakatime')} />
         <MemorySummaryCard onOpen={() => setView('memory')} />
       </div>
 

@@ -20,7 +20,7 @@ Redeemability takes TWO questions and they die independently: the PKCE verifier 
 the PROCESS (``generation_is_live``) while the loopback listener answering the redirect
 belongs to the SESSION (``activation_is_live``). Process liveness alone passed a
 terminated-session row, which is how a card kept serving an unredeemable URL. Both
-failures are recorded in ``docs/architecture/design-notes/connections-warm-table.md``.
+failures are recorded in ``docs/system-specs/modules/connections.md``.
 
 Four rules are load-bearing and recorded in that same note: the SESSION is HELD (see
 :func:`_warm_row_alive`), specs are enumerated ONCE at spawn -- which fixes the mode's
@@ -584,7 +584,7 @@ def _resident_roster_is_asked_for(resident: _WarmSpecPlan, wanted: _WarmSpecPlan
 def _warm_spec_plan(providers: list[Provider]) -> _WarmSpecPlan:
     """Build (but do not write) the warm process's spec set."""
     agents_dir = _agent.kiro_agents_dir_path()
-    # Through the hardened reader (#6736's migration): the agents dir is user-writable and
+    # Through the hardened reader: the agents dir is user-writable and
     # shared with other tools, so a symlink planted at this path pointed a raw ``_load_json``
     # at a file outside it -- followed, parsed, uncapped and unaudited -- and the contents
     # then DECIDED the plan, because a configured entry vetoes its provider below. A refusal
@@ -923,6 +923,25 @@ def _recorded_runtime_is_dead(work_dir: Path) -> bool:
     return _process_identity_live(pid, str(owner.get("runtime_started") or "")) is False
 
 
+def _spawn_left_no_process(runtime: Any, work_dir: Path) -> bool:
+    """Whether this tree's marker never named a process and no process exists to name it.
+
+    True only for the PROVISIONAL marker :func:`_create_warm_generation_dir` writes before a
+    spawn, on a runtime that never reached a PID -- the state a spawn refused outright leaves
+    behind. Both halves are required: the marker says no identity was ever published, and the
+    runtime says there is no child that could be reading the tree.
+    """
+    if int(getattr(runtime, "pid", 0) or 0) > 0:
+        return False
+    owner = _read_warm_generation_owner(work_dir)
+    if owner is None:
+        return False
+    try:
+        return int(owner.get("runtime_pid") or 0) <= 0
+    except (TypeError, ValueError):
+        return False
+
+
 def _release_runtime_generation(runtime: Any) -> bool:
     """Release a killed process's generation tree, once that death is actually proven.
 
@@ -934,6 +953,18 @@ def _release_runtime_generation(runtime: Any) -> bool:
     would therefore ``rmtree`` the cwd and private agent scope of a process still reading
     them, which is the one loss this whole ownership marker exists to prevent.
 
+    A marker that never named a process is the one case that proof cannot judge, and it is
+    accepted through :func:`_spawn_left_no_process` instead. :func:`_bind_warm_generation`
+    publishes the runtime identity only after ``spawn()`` returns, so an attempt that failed
+    earlier keeps the provisional ``runtime_pid: 0`` marker -- which
+    :func:`_recorded_runtime_is_dead` and the scavenger's :func:`_process_identity_live` both
+    read as UNPROVED, so neither ever released the tree and every failed spawn left another
+    one behind. A runtime with no PID never had a child to read that tree, which is the same
+    evidence the ``runtime is None`` branch of
+    :meth:`_WarmMintRuntime._abandon_spawn_locked` already removes on. One that does carry a
+    PID still needs the identity proof: a spawn that failed after its child started may leave
+    it running.
+
     ``False`` leaves the tree attached. Startup scavenging reclaims it once both recorded
     identities are dead, so an unkillable child costs clutter until the next gateway start
     instead of costing the running process its specs.
@@ -941,7 +972,7 @@ def _release_runtime_generation(runtime: Any) -> bool:
     work_dir = _runtime_generation_dir(runtime)
     if work_dir is None:
         return True
-    if not _recorded_runtime_is_dead(work_dir):
+    if not _recorded_runtime_is_dead(work_dir) and not _spawn_left_no_process(runtime, work_dir):
         return False
     removed = _remove_warm_generation_dir(work_dir)
     if removed:
@@ -1851,8 +1882,11 @@ _warm_mint = _WarmMintRuntime()
 
 
 async def shutdown_warm_mint() -> None:
-    """Gateway cleanup hook: retire every live or parked warm generation."""
-    await _warm_mint.shutdown()
+    """Gateway cleanup hook: settle every scheduled re-arm, then retire every generation."""
+    try:
+        await _settle_invalidation_rearms()
+    finally:
+        await _warm_mint.shutdown()
 
 
 def _warm_row_alive(entry: MintState) -> bool:
@@ -1880,10 +1914,10 @@ async def _expire_shared_mints(reason: str, *, generation: int | None = None) ->
     """Flip live shared mints stale. Called when a process is gone.
 
     ``generation`` is the only narrowing there is, and every caller passes it: the rows a
-    dead process can no longer redeem are exactly the ones it minted. A pass narrowed by
-    the CALLER's own row tokens instead used to exist here; it read as "spare my retry" but
-    meant "expire every other generation", which withdrew a parked generation's redeemable
-    URL. Withdrawal follows the verifier, so it follows the generation.
+    dead process cannot redeem are exactly the ones it minted. Narrowing by the
+    CALLER's own row tokens instead reads as "spare my retry" but means "expire every
+    other generation", which withdraws a parked generation's redeemable URL.
+    Withdrawal follows the verifier, so it follows the generation.
     """
     flipped: list[str] = []
     async with _mints_lock:
@@ -2013,6 +2047,124 @@ async def _rearm_dead_warm_mint(generation: int) -> list[str]:
     return await warm_mint_all(candidates, arm_supervision=False)
 
 
+#: One in-flight invalidation re-arm per provider slug, and the only strong reference to each
+#: task: nothing awaits them, so without this the loop's own weak reference lets a re-arm be
+#: collected mid-activation. Keyed by slug so a second invalidation of the SAME provider is a
+#: no-op while its re-arm runs, and two different providers never serialize behind each other.
+_invalidation_rearms: dict[str, asyncio.Task] = {}
+
+
+def _forget_invalidation_rearm(slug: str, task: asyncio.Task) -> None:
+    """Drop ``task``'s registration, unless a newer re-arm has already taken its place."""
+    if _invalidation_rearms.get(slug) is task:
+        del _invalidation_rearms[slug]
+
+
+async def _settle_invalidation_rearms() -> None:
+    """Cancel and await every in-flight invalidation re-arm. Called only from teardown.
+
+    The same settlement :meth:`_WarmMintRuntime.shutdown` gives its own supervision re-arm --
+    cancel, then ``gather`` with ``return_exceptions=True`` so the child's ``CancelledError`` is
+    consumed here instead of surfacing out of teardown. These tasks need it MORE, not less:
+    nothing awaits them in the ordinary course, so a Disconnect landing moments before teardown
+    otherwise leaves a task unsettled at loop close -- reported as ``Task was destroyed but it is
+    pending`` -- with its activation half-way through minting.
+
+    Settled BEFORE the processes are retired (see :func:`shutdown_warm_mint`). A re-arm cancelled
+    first rolls its claims back through ``warm_mint_all``'s own protected region; retiring first
+    would leave an activation already past that point free to spawn a replacement process after
+    teardown had finished, which is the leak this settlement exists to prevent, one layer down.
+
+    A task that already completed is left alone -- its result and its own done callback's
+    bookkeeping are untouched -- and the registry is emptied either way, because once teardown
+    has run no re-arm is in flight by definition.
+    """
+    current = asyncio.current_task()
+    pending = [
+        task
+        for task in list(_invalidation_rearms.values())
+        if task is not current and not task.done()
+    ]
+    for task in pending:
+        task.cancel()
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+    _invalidation_rearms.clear()
+
+
+async def _rearm_invalidated_provider(slug: str) -> list[str]:
+    """Restore a ready premint for ``slug`` after its stored grant was invalidated.
+
+    An invalidated grant is what makes a provider warmable again, and nothing else was asking:
+    the pool premints ahead of need, so a provider that held a grant was deliberately skipped
+    and stayed skipped once that grant went away. The user's next Authorize then paid the full
+    cold mint -- measured at ~23s against a warm sub-second -- for a card the pool could have
+    had ready.
+
+    ELIGIBILITY IS NOT RE-DERIVED HERE. The ordinary tri-state candidate scan is the authority,
+    so this inherits every veto arming already has: a disabled entry, a provider with no usable
+    auth configuration (no DCR and no pre-registered client id), a configured entry asking for
+    something different from the registry, a grant that is still PRESENT because the revoke was
+    refused or failed, and a grant cache that could not be read at all -- an absence nobody
+    confirmed must not initiate consent. A provider the scan does not return is therefore
+    skipped rather than warmed into a mint that would itself fail cold.
+
+    A live row is left alone. Re-arming a provider already ``minting`` or ``waiting`` would
+    displace a URL the card is showing and the user may be part-way through redeeming, which
+    is the opposite of the readiness this exists to provide.
+
+    ``arm_supervision`` is false for the same reason the death-driven re-arm sets it false:
+    this replacement inherits whatever lifecycle the page already armed instead of recursively
+    earning another automatic one.
+    """
+    try:
+        candidates, audit_recorded = await asyncio.to_thread(_audited_mintable_providers)
+    except Exception:  # noqa: BLE001 -- the cold path remains available to every Connect
+        logger.debug("warm mint invalidation re-arm candidate scan failed", exc_info=True)
+        return []
+    provider = next((item for item in candidates if item["slug"] == slug), None)
+    if provider is None:
+        logger.debug("Not re-arming %s after invalidation: it is not a warm candidate", slug)
+        return []
+    if not audit_recorded:
+        logger.warning(
+            "grant-presence audit for the invalidation re-arm scan could not be recorded; "
+            "proceeding unaudited"
+        )
+    async with _mints_lock:
+        prior = _mints.get(slug)
+        if prior is not None and prior.get("state") in _LIVE_STATES:
+            logger.debug("Not re-arming %s after invalidation: a live row already holds it", slug)
+            return []
+    logger.info("Re-arming the premint for %s after its stored grant was invalidated", slug)
+    return await warm_mint_all([provider], arm_supervision=False)
+
+
+def rearm_invalidated_provider(slug: str) -> None:
+    """Schedule a premint re-arm for ``slug``, without waiting for one.
+
+    SYNCHRONOUS AND FIRE-AND-FORGET, because the callers are the invalidation paths
+    themselves: a Disconnect must answer the user as soon as its own transaction lands, and an
+    activation spawns a helper process and negotiates OAuth, which is seconds of work no
+    invalidation may hang on. Scheduling is all this does -- whether a re-arm is warranted at
+    all is :func:`_rearm_invalidated_provider`'s judgement, made on the pool's own scan.
+
+    Off the loop -- a synchronous caller with no running loop -- there is nothing to schedule
+    onto and nothing to warm for: the next activation's scan picks the provider up.
+    """
+    running = _invalidation_rearms.get(slug)
+    if running is not None and not running.done():
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        logger.debug("no running loop for the %s invalidation re-arm; leaving it to the scan", slug)
+        return
+    task = loop.create_task(_rearm_invalidated_provider(slug))
+    _invalidation_rearms[slug] = task
+    task.add_done_callback(lambda done: _forget_invalidation_rearm(slug, done))
+
+
 async def _warm_mint_reaper(generation: int) -> None:
     """Retire the shared process once no card is waiting on it.
 
@@ -2092,10 +2244,10 @@ def _mint_is_adopted(entry: MintState | None) -> bool:
 async def _adopt_shared_row(slug: str, mcp_url: str) -> str | None:
     """Take ownership of ``slug``'s UNCLAIMED premint. Returns its new row token, or None.
 
-    THE handoff, and the reason the premint has a consumer at all. Connect used to call
-    ``reserve_mint_row`` unconditionally, which pops WHATEVER row is at the slug -- so
-    ``start_oauth_mint`` disposed the very URL the warm table had minted for that click
-    and the cold spawn it then paid was the only thing the user ever saw. ``None`` means
+    THE handoff, and the reason the premint has a consumer at all. Without it Connect
+    would call ``reserve_mint_row`` unconditionally, which pops WHATEVER row is at the
+    slug -- so ``start_oauth_mint`` disposes the very URL the warm table minted for that
+    click, and the cold spawn it then pays is the only thing the user sees. ``None`` means
     no row was adoptable at this instant; the public flow may recover a late frame from the
     existing live session before it falls through to the dedicated cold path.
 
@@ -2117,7 +2269,7 @@ async def _adopt_shared_row(slug: str, mcp_url: str) -> str | None:
     adopting tab against the premint's own rollback and against a sibling tab, but
     every write in :func:`~kiro_crew.connections.mint._mint_watcher` is guarded on the
     token it was started with -- so rotating alone would leave the row watched by a
-    task that can no longer touch it: nothing would flip it to ``granted``, nothing
+    task that cannot touch it: nothing would flip it to ``granted``, nothing
     would expire it, and it would hold the shared process resident for good. Re-arming
     is therefore part of the same synchronous run, not a follow-up.
 
@@ -2175,10 +2327,10 @@ async def _claim_shared_mints(slugs: list[str]) -> tuple[dict[str, str], list[Mi
     same reasoning for the cold engine).
 
     ATOMIC BY CONSTRUCTION: the loop contains NO await, so the caller either gets every
-    claim or none. It used to await ``_dispose_mint`` on each replaced row, which suspends
+    claim or none. Awaiting ``_dispose_mint`` on each replaced row would suspend
     on a client teardown and again on the shielded spec removal in that function's
     ``finally`` -- and the claim is taken BEFORE ``warm_mint_all`` enters the try that rolls
-    it back, so a cancellation there left earlier slugs installed as ``minting`` with no
+    it back, so a cancellation there would leave earlier slugs installed as ``minting`` with no
     caller holding their tokens. Nothing withdraws such a row (``expire_dead_mints`` judges
     ``waiting`` only) and it keeps ``_shared_mints_pending`` true, so the process is never
     retired either. The replaced rows come back for the caller to dispose INSIDE that try
