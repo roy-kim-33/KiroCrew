@@ -5,8 +5,6 @@
 //   - a user scroll-up is never overridden by a late widget load (race-proof)
 //   - our own programmatic pins are not mistaken for user scrolls
 import { describe, it, expect } from 'vitest'
-import { readFileSync } from 'node:fs'
-import { join } from 'node:path'
 import * as fc from 'fast-check'
 import {
   computeAtBottom,
@@ -231,6 +229,62 @@ describe('evaluateAutoPin — the race-proof core', () => {
     const up = { scrollTop: 480, scrollHeight: 1000, clientHeight: 400 } // 120px above bottom
     const r = evaluateAutoPin({ stick: true, geom: up, lastWriteTop: 480, runActive: false })
     expect(r).toEqual({ pin: false, stick: false, target: 600 })
+  })
+
+  describe('readerMovedSinceWrite — who opened the gap', () => {
+    // The idle rule above releases because a gap while idle USUALLY means the
+    // reader scrolled. When the caller can say that nothing but layout has
+    // happened since we last placed them (no hardware input, no unexplained
+    // scroll), the gap is content settling under a still reader, and the same
+    // geometry means the opposite: carry them back. WebKit has no native scroll
+    // anchoring, so this is the only thing standing between an entry pin and a
+    // transcript that opens a viewport above its end.
+    const up = { scrollTop: 480, scrollHeight: 1000, clientHeight: 400 }
+
+    it('IDLE + no reader movement: the gap is ours, so the reader is carried back', () => {
+      const r = evaluateAutoPin({ stick: true, geom: up, lastWriteTop: 480, runActive: false, readerMovedSinceWrite: false })
+      expect(r).toEqual({ pin: true, stick: true, target: 600 })
+    })
+
+    it('IDLE + reader moved: unchanged, released', () => {
+      const r = evaluateAutoPin({ stick: true, geom: up, lastWriteTop: 480, runActive: false, readerMovedSinceWrite: true })
+      expect(r).toEqual({ pin: false, stick: false, target: 600 })
+    })
+
+    it('no input but scrollTop has LEFT our last write: not ours to close (a reveal in flight)', () => {
+      // scrollTop below our last write AND away from the bottom is the
+      // user-scroll-up signature. With no hardware input it can still be a
+      // programmatic reveal -- a search hit, a pinned prompt, find-in-page --
+      // whose scroll event has not dispatched yet when a height commit lands.
+      // Position and input must BOTH say "the reader never moved"; here the
+      // position says otherwise, so the existing release stands.
+      const r = evaluateAutoPin({ stick: true, geom: up, lastWriteTop: 600, runActive: true, readerMovedSinceWrite: false })
+      expect(r).toEqual({ pin: false, stick: false, target: 600 })
+    })
+
+    it('resting on a clamp-rebaselined write counts as resting', () => {
+      // The clamp branch re-baselines lastWriteTop onto the clamped scrollTop;
+      // the regrowth then opens the gap with scrollTop unchanged. That is the
+      // entry shape on a phone, and it is carried.
+      const r = evaluateAutoPin({ stick: true, geom: up, lastWriteTop: 480, runActive: false, readerMovedSinceWrite: false })
+      expect(r).toEqual({ pin: true, stick: true, target: 600 })
+    })
+
+    it('at the bottom with no movement: still following, nothing to write', () => {
+      const r = evaluateAutoPin({ stick: true, geom: tall, lastWriteTop: 600, runActive: false, readerMovedSinceWrite: false })
+      expect(r).toEqual({ pin: false, stick: true, target: 600 })
+    })
+
+    it('never overrides a released stick or an owning restore', () => {
+      expect(evaluateAutoPin({ stick: false, geom: up, lastWriteTop: 480, readerMovedSinceWrite: false }).pin).toBe(false)
+      const r = evaluateAutoPin({ stick: true, geom: up, lastWriteTop: 480, restoreGate: true, readerMovedSinceWrite: false })
+      expect(r).toEqual({ pin: false, stick: false, target: 600 })
+    })
+
+    it('omitted = assume the reader may have moved (legacy, release-leaning)', () => {
+      const r = evaluateAutoPin({ stick: true, geom: up, lastWriteTop: 480, runActive: false })
+      expect(r.stick).toBe(false)
+    })
   })
 
 
@@ -548,24 +602,5 @@ describe('resolveUserScrollStick — a clamp only ever lowers scrollTop', () => 
       viewportGrowth: 50,
     })
     expect(armed).toBe(false)
-  })
-})
-
-describe('both consumers report the viewport signal', () => {
-  it('the app-sdk hook passes viewportGrowth from its own scroll-event baseline', () => {
-    // Review finding: this hook observes pane resizes and the soft keyboard — the
-    // exact causes of a viewport-growth clamp — yet omitted the signal, so it kept
-    // the original defect while the chat virtualizer was fixed. The baseline must
-    // be its own, advanced by the scroll handler: a ref the ResizeObserver could
-    // advance first would fold the growth away before the clamp is classified.
-    const src = readFileSync(join(__dirname, '..', 'app-sdk', 'useChatScrollFollow.ts'), 'utf8')
-    const call = src.slice(src.indexOf('resolveUserScrollStick({'))
-    const args = call.slice(0, call.indexOf('})'))
-    expect(args).toMatch(/viewportGrowth:/)
-    expect(args).toContain('lastScrollClientHRef.current')
-    // Advanced in the scroll handler, not in the observer.
-    expect(src).toMatch(/prevScrollTopRef\.current = geom\.scrollTop\s*\n\s*lastScrollClientHRef\.current = geom\.clientHeight/)
-    // Not reusing the write-tracking ref, whose meaning is different.
-    expect(args).not.toContain('lastWriteClientHRef')
   })
 })

@@ -39,7 +39,7 @@ from contextlib import asynccontextmanager, contextmanager
 from copy import deepcopy
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, AsyncIterator, Awaitable, Callable, Iterator
+from typing import Any, AsyncIterator, Awaitable, Callable, Iterator
 
 from kiro_crew import irq, platform_compat, probes, shutdown_event
 from kiro_crew.atomic_write import replace_with_retry
@@ -65,16 +65,16 @@ from kiro_crew.monitoring.models import (
     MonitorDispatchResult,
     MonitorObservationStatus,
     MonitorOutcome,
+    MonitorProbeResult,
     MonitorState,
+    MonitorVerdict,
     monitor_state_from_dict,
     monitor_state_to_dict,
     quarantine_monitor_state,
 )
+from kiro_crew.monitoring.registry import REVIEW_READY, kind_supports_objective
 from kiro_crew.probes import targets
 from kiro_crew.security import is_sensitive_path, redact_credentials, redact_exfiltration_urls
-
-if TYPE_CHECKING:
-    from kiro_crew.monitoring.github_pull_request import GitHubPullRequestProbeResult
 
 logger = logging.getLogger(__name__)
 
@@ -519,7 +519,7 @@ class NudgeLoop:
     #: Whether this loop may be observation-gated. Defaults to FALSE, which is what
     #: a record stored before this field existed decodes to.
     #:
-    #: THE PRINCIPLE, stated once because four review rounds circled it: gating is
+    #: THE PRINCIPLE, stated once because it is easy to get backwards: gating is
     #: the state that can silently stop work -- a gated loop whose subject is merged
     #: or closed DEACTIVATES -- so every uncertainty resolves to UNGATED, and only an
     #: explicit boolean true gates. An absent key is a loop nobody chose to gate,
@@ -571,6 +571,12 @@ class NudgeLoop:
     # Optional observation/controller state. ``gate=True`` records belong to the
     # prompt path; controller-owned records carry state with ``gate=False``.
     monitor: MonitorState | None = None
+    # Durable delivery generation outside MonitorState. A future-version monitor
+    # is retained as an opaque payload, so mutating a field inside its local view
+    # cannot survive serialization. Keeping the exact terminal identity on the
+    # stable outer record preserves both the opaque bytes and restart dedupe.
+    terminal_notification_outcome: str = ""
+    terminal_notification_stopped_at: float = 0.0
     # Optional SHORT stand-in for ``message`` in the VISIBLE dashboard
     # transcript row. Empty (the default) means the row is byte-identical to
     # what it has always been, so no existing loop changes behaviour.
@@ -594,11 +600,47 @@ class NudgeLoop:
     # ``_load`` filters unknown keys, so a downgrade degrades to the verbose
     # display instead of raising.
     banner: str = ""
+    # WHO armed this loop, reduced to the one distinction the authorizer needs:
+    # True when the arming request came from a turn OF THE BOUND SESSION ITSELF
+    # (the ``monitor_start`` / ``monitor_watch`` session directive, applied by
+    # the turn loop to the exact session that produced it), False for every
+    # external arm (REST, workflow ``ctx.nudge``, an app handler).
+    #
+    # Exists because crew- and member-mode slots refuse automation turns armed
+    # from OUTSIDE the session -- nothing may inject work into a member's own
+    # thread -- yet a member is by definition a self-directed resident agent,
+    # and refusing its own ``monitor_start`` left the conductor member thread
+    # never waking again (the very loop it exists to run). The authorizer
+    # admits the self-arm and records it here so the FIRE-time re-check in
+    # ``GatewayOrchestrator._fire_dashboard_nudge`` can tell "this slot was a
+    # member when its own turn armed the loop" from "this slot switched into
+    # crew mode after an outsider armed it", which is the case that guard
+    # exists to stop. Persisted for the same reason ``gate`` is: a restart
+    # re-arms every loop, and a self-armed member loop that lost this bit
+    # would be refused at its first post-restart wake. Absent in a store
+    # written before the field existed decodes to False -- every such loop
+    # was armed under the old rule, which admitted no self-arm.
+    self_armed: bool = False
 
 
 def is_structured_monitor_loop(loop: NudgeLoop) -> bool:
     """Distinguish controller records from prompt loops carrying probe state."""
     return getattr(loop, "monitor", None) is not None and not getattr(loop, "gate", False)
+
+
+def terminal_notification_delivery_matches(
+    loop: NudgeLoop,
+    outcome: MonitorOutcome,
+    stopped_at: float,
+) -> bool:
+    """Whether this exact terminal generation has a durable delivery record."""
+    if loop.terminal_notification_outcome:
+        return (
+            loop.terminal_notification_outcome == outcome.value
+            and loop.terminal_notification_stopped_at == stopped_at
+        )
+    state = loop.monitor
+    return state is not None and state.terminal_notification_delivered
 
 
 class MonitorUpdateConflict(ValueError):
@@ -692,7 +734,7 @@ def infer_monitor(message: str, now: float) -> MonitorState | None:
         return MonitorState(
             kind=target.kind,
             target=target.subject,
-            objective="review_ready",
+            objective=REVIEW_READY,
             created_ts=now,
         )
     except ValueError:
@@ -799,9 +841,9 @@ class AutoNudgeService:
                 # asked not to be. Normalise it here, at the boundary, rather than
                 # hardening each read site.
                 # PRESENT-AND-NOT-A-BOOL, which includes ``null``, normalised to
-                # FALSE. Round 8 normalised it to True on the grounds that reading
+                # FALSE. Normalising it to True instead -- on the grounds that reading
                 # corrupt data as an opt-out would ungate loops nobody chose to
-                # ungate. That had the asymmetry backwards: gating is the state that
+                # ungate -- has the asymmetry backwards: gating is the state that
                 # can silently STOP a loop, so an unreadable value must resolve to
                 # ungated -- costing a turn per interval, which is today's cost --
                 # rather than to gated, which can deactivate a recurring task whose
@@ -814,6 +856,20 @@ class AutoNudgeService:
                         loop_values["gate"],
                     )
                     loop_values["gate"] = False
+                # ``self_armed`` is the ONE bit that relaxes the crew/member
+                # fire-time guard, and this store is agent-writable. A persisted
+                # non-boolean (the string "false" is truthy) must therefore
+                # normalise to the REFUSING value, exactly as ``gate`` above
+                # normalises to its safe value: only an explicit boolean True
+                # admits, and the fire-time check compares ``is True`` besides.
+                if "self_armed" in loop_values and not isinstance(loop_values["self_armed"], bool):
+                    logger.warning(
+                        "AutoNudge: loop %s stored a non-boolean self_armed (%r); "
+                        "treating it as externally armed",
+                        raw.get("id"),
+                        loop_values["self_armed"],
+                    )
+                    loop_values["self_armed"] = False
                 loop = NudgeLoop(**loop_values)
                 if "monitor" in raw:
                     monitor_raw = raw["monitor"]
@@ -822,10 +878,11 @@ class AutoNudgeService:
                         loop.monitor = monitor_state_from_dict(monitor_raw)
                     except (TypeError, ValueError):
                         monitor_quarantined = True
+                        quarantine_needs_rewrite = loop.active or loop.next_due_ts != 0.0
                         loop.monitor = quarantine_monitor_state(monitor_raw)
                         loop.active = False
                         loop.next_due_ts = 0.0
-                        self._store_dirty = True
+                        self._store_dirty = self._store_dirty or quarantine_needs_rewrite
                         logger.warning(
                             "AutoNudge: quarantined malformed monitor record for loop %s",
                             loop.id,
@@ -966,6 +1023,37 @@ class AutoNudgeService:
                     loop.monitor.next_probe_at = loop.next_due_ts
                     self._store_dirty = True
                 if due_repaired or idle_repaired:
+                    self._store_dirty = True
+                notification_stopped_at, notification_time_repaired = _repair_number(
+                    loop.terminal_notification_stopped_at,
+                    lo=0.0,
+                    fallback=0.0,
+                )
+                loop.terminal_notification_stopped_at = notification_stopped_at
+                notification_outcome = loop.terminal_notification_outcome
+                valid_notification_outcomes = {item.value for item in MonitorOutcome}
+                if (
+                    not isinstance(notification_outcome, str)
+                    or notification_outcome not in valid_notification_outcomes
+                ):
+                    if (
+                        notification_outcome
+                        or notification_stopped_at
+                        or notification_time_repaired
+                    ):
+                        self._store_dirty = True
+                    loop.terminal_notification_outcome = ""
+                    loop.terminal_notification_stopped_at = 0.0
+                elif notification_time_repaired:
+                    self._store_dirty = True
+                if (
+                    loop.monitor is not None
+                    and loop.monitor.outcome is not None
+                    and loop.monitor.terminal_notification_delivered
+                    and not loop.terminal_notification_outcome
+                ):
+                    loop.terminal_notification_outcome = loop.monitor.outcome.value
+                    loop.terminal_notification_stopped_at = loop.monitor.stopped_at
                     self._store_dirty = True
                 # ``banner`` is display-only, but it is ``.strip()``ed on the
                 # fire path, so a non-string value there raises AttributeError
@@ -1117,7 +1205,7 @@ class AutoNudgeService:
         # the old complete file or the new complete file, never a partial one.
         # The rename goes through replace_with_retry because on Windows it can
         # fail with PermissionError while another handle is transiently open on
-        # the fresh temp file (indexer / AV), which loses the write (issue #1105).
+        # the fresh temp file (indexer / AV), which loses the write.
         # Blocking (fsync) — async callers offload this to an executor.
         self._path.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp_path = tempfile.mkstemp(dir=self._path.parent, suffix=".tmp")
@@ -1277,6 +1365,8 @@ class AutoNudgeService:
         gate: bool = False,
         replace_existing: bool = True,
         replace_stopped: bool = False,
+        self_armed: bool = False,
+        loop_id: str | None = None,
     ) -> NudgeLoop:
         # CANCELLATION SAFETY: the mutate+persist runs as a SHIELDED task. If
         # the awaiting caller is cancelled mid-write, a bare await would release
@@ -1303,6 +1393,8 @@ class AutoNudgeService:
                 gate=gate,
                 replace_existing=replace_existing,
                 replace_stopped=replace_stopped,
+                self_armed=self_armed,
+                loop_id=loop_id,
             )
         )
         self._inflight_adds.add(inner)
@@ -1331,6 +1423,8 @@ class AutoNudgeService:
         expected_existing_monitor_id: str | None = None,
         expected_existing_config_generation: int | None = None,
         admission_check: Callable[[], bool] | None = None,
+        self_armed: bool = False,
+        loop_id: str | None = None,
     ) -> NudgeLoop:
         """Create one durable structured record without legacy prompt routing."""
         inner: "asyncio.Task[NudgeLoop]" = asyncio.ensure_future(
@@ -1348,6 +1442,8 @@ class AutoNudgeService:
                 expected_existing_monitor_id=expected_existing_monitor_id,
                 expected_existing_config_generation=expected_existing_config_generation,
                 admission_check=admission_check,
+                self_armed=self_armed,
+                loop_id=loop_id,
             )
         )
         self._inflight_adds.add(inner)
@@ -1376,6 +1472,8 @@ class AutoNudgeService:
         expected_existing_monitor_id: str | None,
         expected_existing_config_generation: int | None,
         admission_check: Callable[[], bool] | None,
+        self_armed: bool = False,
+        loop_id: str | None = None,
     ) -> NudgeLoop:
         created = time.time() if now is None else now
         cadence = max(_MIN_IDLE_SECS, min(_MAX_IDLE_SECS, int(cadence_secs)))
@@ -1431,13 +1529,19 @@ class AutoNudgeService:
                         raise MonitorUpdateConflict(
                             "the session's stopped automation is retained as evidence "
                             "and is not replaceable by a re-arm; its owner must clear "
-                            "it first"
+                            "it first from the dashboard's goal popover"
                         )
                     if existing_monitor is not None and existing_monitor.wake_in_flight:
                         raise MonitorUpdateConflict(
                             "existing monitor cannot be replaced while a wake is in flight"
                         )
                 due = created + cadence
+                # Refused HERE rather than discovered later. This is the one place a
+                # caller-supplied kind reaches persistence, and a monitor stored under
+                # a kind nothing registered would be probed by whatever provider the
+                # controller happens to hold.
+                if not kind_supports_objective(kind, objective):
+                    raise ValueError(f"no monitored kind {kind!r} supports objective {objective!r}")
                 monitor = MonitorState(
                     kind=kind,
                     target=target,
@@ -1449,13 +1553,14 @@ class AutoNudgeService:
                     next_probe_at=due,
                 )
                 loop = NudgeLoop(
-                    id=uuid.uuid4().hex[:8],
+                    id=self._mint_loop_id(loop_id),
                     slot_key=slot_key,
                     message="",
                     idle_secs=cadence,
                     created_ts=created,
                     next_due_ts=due,
                     monitor=monitor,
+                    self_armed=self_armed,
                 )
                 replacement_payload = {
                     "version": _STORE_VERSION,
@@ -1469,11 +1574,31 @@ class AutoNudgeService:
                 await self._write_monitor_snapshot_locked(replacement_payload)
                 if existing is not None:
                     self.remove_sync(existing.id, persist=False)
+                    # The snapshot above already committed the replacement.
+                    self._revoke_self_arm_for(existing)
                 self._loops[loop.id] = loop
                 if self._on_monitor_tick is not None:
                     self._arm_from_deadline(loop)
         self._emit("added", loop)
         return loop
+
+    def _mint_loop_id(self, requested: str | None) -> str:
+        """The new loop's id: the caller's pre-minted one, else a fresh one.
+
+        A caller pre-mints an id when something must be recorded ABOUT the loop
+        before it exists -- the authorizer writes the keystone-gated self-arm
+        entry first, so a failed trust write denies before this store is
+        touched and a loop this arm would displace is never removed for
+        nothing. Called under ``_lock``, so the in-use check is not racy; an id
+        already in use is a caller bug (or a collision on 8 hex chars, which is
+        not worth silently re-minting over -- the caller's record would name
+        the wrong loop) and is refused as a conflict.
+        """
+        if requested is None:
+            return uuid.uuid4().hex[:8]
+        if requested in self._loops:
+            raise MonitorUpdateConflict(f"loop id {requested!r} is already in use")
+        return requested
 
     async def _add_locked(
         self,
@@ -1489,6 +1614,8 @@ class AutoNudgeService:
         gate: bool = False,
         replace_existing: bool = True,
         replace_stopped: bool = False,
+        self_armed: bool = False,
+        loop_id: str | None = None,
     ) -> NudgeLoop:
         async with _maintenance_lock(self._base_dir):
             return await self._add_unserialized(
@@ -1503,6 +1630,8 @@ class AutoNudgeService:
                 gate=gate,
                 replace_existing=replace_existing,
                 replace_stopped=replace_stopped,
+                self_armed=self_armed,
+                loop_id=loop_id,
             )
 
     async def _add_unserialized(
@@ -1519,6 +1648,8 @@ class AutoNudgeService:
         gate: bool = False,
         replace_existing: bool = True,
         replace_stopped: bool = False,
+        self_armed: bool = False,
+        loop_id: str | None = None,
     ) -> NudgeLoop:
         idle_secs = max(_MIN_IDLE_SECS, min(_MAX_IDLE_SECS, int(idle_secs)))
         async with self._lock:
@@ -1575,7 +1706,8 @@ class AutoNudgeService:
                     raise MonitorUpdateConflict(
                         "the session's stopped automation is retained as evidence "
                         f"(stop reason: {existing.stopped_reason or 'manual'!s}) and is "
-                        "not replaceable by a re-arm; its owner must clear it first"
+                        "not replaceable by a re-arm; its owner must clear it first "
+                        "from the dashboard's goal popover"
                     )
                 if existing_monitor is not None and existing_monitor.wake_in_flight:
                     raise MonitorUpdateConflict(
@@ -1584,7 +1716,7 @@ class AutoNudgeService:
                 self.remove_sync(existing.id, persist=False, emit=False)
             now = time.time()
             loop = NudgeLoop(
-                id=uuid.uuid4().hex[:8],
+                id=self._mint_loop_id(loop_id),
                 slot_key=slot_key,
                 message=message,
                 idle_secs=idle_secs,
@@ -1626,6 +1758,7 @@ class AutoNudgeService:
                 monitor=infer_monitor(message, now) if gate else None,
                 gate=gate,
                 banner=banner,
+                self_armed=self_armed,
             )
             self._loops[loop.id] = loop
             # Persist WITHOUT blocking the event loop (no-blocking-call rule:
@@ -1645,6 +1778,9 @@ class AutoNudgeService:
                 raise
             self._arm_from_deadline(loop)
             if existing is not None:
+                # Committed: the displaced row is gone from the store, so its
+                # self-arm entry is revoked now, not before the write.
+                self._revoke_self_arm_for(existing)
                 self._emit("removed", existing)
         self._emit("added", loop)
         logger.info("AutoNudge: added loop %s on slot %s (idle=%ds)", loop.id, slot_key, idle_secs)
@@ -2088,9 +2224,60 @@ class AutoNudgeService:
         self._accepted_monitor_turns.pop(loop_id, None)
         if persist:
             self._save()
+            # Revoke the keystone-gated self-arm entry only AFTER the store
+            # committed the removal: a save that raises leaves the loop's
+            # durable row in place, and a loop that is still stored must keep
+            # the entry it needs to fire. ``persist=False`` callers own the
+            # commit and call ``_revoke_self_arm`` themselves once it lands
+            # (``_remove_unserialized``, ``_add_unserialized``).
+            self._revoke_self_arm_for(loop)
         if emit:
             self._emit("removed", loop)
         return loop
+
+    def _revoke_self_arm_for(self, loop: NudgeLoop) -> None:
+        """Revoke for EVERY loop leaving the store, not only ``self_armed`` ones.
+
+        The ``self_armed`` bit lives in the agent-writable store, so keying the
+        revocation on it would let a forged ``false`` (plus a restart) skip the
+        revoke and leave the keystone entry orphaned for a later loop that
+        reuses the id on the same slot -- the exact adversary the trust record
+        exists to defeat. Revocation therefore keys on the one fact the store
+        cannot forge: the loop is being removed. A loop with no entry costs one
+        offloaded read (``forget_self_arm`` writes only when it deletes).
+        """
+        self._revoke_self_arm(loop.id)
+
+    @staticmethod
+    def _revoke_self_arm(loop_id: str) -> None:
+        """Drop the keystone-gated self-arm entry for a loop leaving the store.
+
+        Every removal path (explicit remove, session close, replacement by a
+        new arm) funnels through ``remove_sync``, so this is the one place the
+        trust record is told a loop has left the store -- and the ONLY path that
+        drops an entry, since ``record_self_arm`` is a pure upsert. Otherwise a
+        removed id would keep its authorization indefinitely, and a forged
+        store entry reusing that id on the same slot would inherit it.
+        File IO is offloaded when an event loop is running (``remove_sync`` is
+        reached from async paths that must not block on fsync); the sync
+        fallback covers shutdown/test callers with no loop. Best-effort: a
+        revocation failure is logged inside ``forget_self_arm`` and never
+        breaks the removal.
+        """
+        from kiro_crew import autonudge_selfarm
+
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            autonudge_selfarm.forget_self_arm(loop_id)
+            return
+        fut = running.run_in_executor(None, autonudge_selfarm.forget_self_arm, loop_id)
+
+        def _log(f: "asyncio.Future[None]") -> None:
+            if not f.cancelled() and f.exception() is not None:
+                logger.warning("self-arm revocation failed for %s", loop_id, exc_info=f.exception())
+
+        fut.add_done_callback(_log)
 
     async def remove(self, loop_id: str) -> None:
         lock = await self._acquire_mutation_lock(loop_id)
@@ -2113,11 +2300,59 @@ class AutoNudgeService:
                 await self._remove_unserialized(loop.id)
             return loop
 
-    async def _remove_unserialized(self, loop_id: str) -> None:
+    async def clear_terminal_monitor(self, monitor_id: str) -> bool:
+        """Remove a structured monitor row ONLY while it is still terminal.
+
+        The owner-facing clear (``authorize_and_clear_monitor``) checks the
+        record's state, then audits — and the audit hands off to a thread, which
+        yields the event loop. In that window a concurrent
+        ``restore_monitor_after_failed_session_close`` can put the SAME row back
+        into service, so an unconditional removal afterwards would delete a live
+        watch with no record it existed: exactly the harm the live-monitor
+        refusal exists to prevent, reached from the other side.
+
+        So the decision is re-taken here, under the one lock hold that also
+        performs the removal. Returns ``False`` when the row moved on (restored,
+        already gone, or a wake accepted since), and removes nothing.
+        """
+
+        def _still_terminal(loop: NudgeLoop) -> bool:
+            state = loop.monitor
+            if state is None or state.outcome is None:
+                return False
+            if state.version != MONITOR_STATE_VERSION:
+                return False
+            return not state.wake_in_flight
+
+        lock = await self._acquire_mutation_lock(monitor_id)
+        if lock is None:
+            return False
+        try:
+            return await self._remove_unserialized(monitor_id, precondition=_still_terminal)
+        finally:
+            lock.release()
+
+    async def _remove_unserialized(
+        self,
+        loop_id: str,
+        *,
+        precondition: Callable[[NudgeLoop], bool] | None = None,
+    ) -> bool:
+        """Remove one loop. Returns whether the removal happened.
+
+        ``precondition`` is evaluated on the LIVE row inside the same ``_lock``
+        hold that removes it, so a caller whose decision was taken before an
+        await can re-take it atomically here instead of racing whatever landed
+        in between. A refused precondition changes nothing.
+        """
         async with self._lock:
             existed = loop_id in self._loops
             if not existed and loop_id not in self._pending_removals:
-                return
+                return False
+            if precondition is not None:
+                current = self._loops.get(loop_id)
+                if current is None or not precondition(current):
+                    return False
             # Remove in-memory but SKIP the blocking save: _save() -> _write_state
             # fsyncs, and a wedged disk must not freeze the event loop. Snapshot
             # under THIS lock hold (serialization vs the post-fire write). Keep
@@ -2162,6 +2397,7 @@ class AutoNudgeService:
                     raise
                 self._pending_removals.discard(loop_id)
                 if removed_loop is not None:
+                    self._revoke_self_arm_for(removed_loop)
                     self._emit("removed", removed_loop)
                 raise
             except Exception:
@@ -2173,7 +2409,11 @@ class AutoNudgeService:
             else:
                 self._pending_removals.discard(loop_id)
                 if removed_loop is not None:
+                    # The store committed: the row is gone, so its self-arm
+                    # entry may go too (see remove_sync for why not earlier).
+                    self._revoke_self_arm_for(removed_loop)
                     self._emit("removed", removed_loop)
+                return True
 
     def get_by_id(self, loop_id: str) -> NudgeLoop | None:
         """The loop with this id, or ``None``.
@@ -2242,31 +2482,39 @@ class AutoNudgeService:
     async def apply_monitor_probe(
         self,
         monitor_id: str,
-        result: GitHubPullRequestProbeResult,
+        result: MonitorProbeResult,
         *,
         now: float,
         config_generation: int,
-    ) -> MonitorDecision:
-        """Persist one probe decision and any wake claim as one transition."""
+    ) -> MonitorVerdict:
+        """Persist one probe decision and any wake claim as one transition.
+
+        A refusal that never reaches the decision engine carries no entries: no
+        observation was judged, so the verdict has nothing to name.
+        """
         async with self._lock:
             loop = self._loops.get(monitor_id)
             state = loop.monitor if loop is not None else None
             if loop is None or state is None or not loop.active or state.outcome is not None:
-                return MonitorDecision.STOP_BLOCKED
+                return MonitorVerdict(decision=MonitorDecision.STOP_BLOCKED)
             staged = deepcopy(loop)
             staged_state = staged.monitor
             assert staged_state is not None
             if state.config_generation != config_generation:
                 self._set_monitor_deadline(staged, now + staged_state.cadence_secs)
                 decision = MonitorDecision.NO_CHANGE
+                verdict = MonitorVerdict(decision=decision)
             elif state.wake_in_flight:
-                return MonitorDecision.NO_CHANGE
+                return MonitorVerdict(decision=MonitorDecision.NO_CHANGE)
             else:
-                decision = decide_monitor(staged_state, result.observation, now=now)
+                verdict = decide_monitor(staged_state, result.observation, now=now)
+                decision = verdict.decision
                 staged_state.probe_count += 1
                 staged_state.last_probe_at = now
                 staged_state.last_decision = decision
                 observation = result.observation
+                staged_state.last_observation_status = observation.status
+                staged_state.last_observation_reason_code = observation.reason_code
                 provider_error = (
                     observation.provider_error or observation.supplemental_provider_error
                 )
@@ -2318,7 +2566,32 @@ class AutoNudgeService:
             if not loop.active:
                 self._sync_terminal_completion_timer(loop)
         self._emit("updated", loop)
-        return decision
+        return verdict
+
+    async def stop_monitor_if_budget_exhausted(
+        self,
+        monitor_id: str,
+        *,
+        now: float,
+    ) -> bool:
+        """Stop a spent structured monitor before starting another provider probe."""
+        stopped_loop: NudgeLoop | None = None
+        async with self._lock:
+            loop = self._loops.get(monitor_id)
+            state = loop.monitor if loop is not None else None
+            if loop is not None and state is not None and loop.active and state.outcome is None:
+                reason = monitor_budget_reason(state, now=now)
+                if reason:
+                    stopped = deepcopy(loop)
+                    if stopped.monitor is not None:
+                        stopped.monitor.last_decision = MonitorDecision.STOP_BUDGET
+                    self._apply_monitor_budget_stop(stopped, reason, stopped_at=now)
+                    await self._persist_staged_monitor_locked(loop, stopped)
+                    self._sync_terminal_completion_timer(loop)
+                    stopped_loop = loop
+        if stopped_loop is not None:
+            self._emit("updated", stopped_loop)
+        return stopped_loop is not None
 
     def _set_monitor_deadline(self, loop: NudgeLoop, deadline: float) -> None:
         """Write the scheduler authority and inspection mirror together."""
@@ -2354,6 +2627,34 @@ class AutoNudgeService:
             self._sync_terminal_completion_timer(loop)
         self._emit("updated", loop)
         return loop
+
+    async def mark_terminal_notification_delivered(
+        self,
+        monitor_id: str,
+        outcome: MonitorOutcome,
+        stopped_at: float,
+    ) -> bool:
+        """Persist delivery only when the same terminal generation still exists."""
+        async with self._lock:
+            loop = self._loops.get(monitor_id)
+            state = loop.monitor if loop is not None else None
+            if (
+                loop is None
+                or state is None
+                or loop.active
+                or state.outcome is not outcome
+                or state.stopped_at != stopped_at
+                or terminal_notification_delivery_matches(loop, outcome, stopped_at)
+            ):
+                return False
+            staged = deepcopy(loop)
+            staged_state = staged.monitor
+            assert staged_state is not None
+            staged_state.terminal_notification_delivered = True
+            staged.terminal_notification_outcome = outcome.value
+            staged.terminal_notification_stopped_at = stopped_at
+            await self._persist_staged_monitor_locked(loop, staged)
+        return True
 
     async def retire_monitor_for_session_close(
         self, monitor_id: str, *, now: float | None = None
@@ -2457,6 +2758,16 @@ class AutoNudgeService:
             if target is not None:
                 staged_state.target = target
             if objective is not None:
+                # The objective allowlist upstream is a union across every publicly
+                # armable kind, so it is a first filter and never the whole check.
+                # This is the boundary that knows BOTH halves -- the monitor's kind is
+                # already fixed -- so the pairing is refused here rather than
+                # discovered at probe time.
+                if not kind_supports_objective(staged_state.kind, objective):
+                    raise ValueError(
+                        f"monitored kind {staged_state.kind!r} does not support "
+                        f"objective {objective!r}"
+                    )
                 staged_state.objective = objective
             if cadence_secs is not None:
                 cadence = max(_MIN_IDLE_SECS, min(_MAX_IDLE_SECS, int(cadence_secs)))
@@ -2486,6 +2797,8 @@ class AutoNudgeService:
             if reset_baseline:
                 staged_state.config_generation += 1
                 staged_state.last_observation = {}
+                staged_state.last_observation_status = None
+                staged_state.last_observation_reason_code = ""
                 staged_state.last_fingerprint = ""
                 staged_state.last_observed_at = 0.0
                 staged_state.last_decision = None
@@ -3591,8 +3904,8 @@ class AutoNudgeService:
                 loop.id,
                 ",".join(verdict.keys) or "unattributed",
             )
-            # SERIALIZED against ``update``. Round 13 removed this path's own second
-            # await; this closes the other side of the same race, which is
+            # SERIALIZED against ``update``. This path has no second await of its
+            # own; this closes the other side of the same race, which is
             # ``update``'s. That method takes the MAINTENANCE lock (not ``_lock``)
             # and awaits inside it, so a retarget could pass its precheck, yield,
             # let this branch settle the OLD subject with ``active = False``, and
@@ -3716,8 +4029,8 @@ class AutoNudgeService:
                     await self._write_monitor_snapshot_locked()
             except Exception:
                 # NOT rolled back -- and there is deliberately no saved copy to roll
-                # back TO. Round 31 restored the debt here to keep memory and disk in
-                # agreement, which is the right instinct almost everywhere and the
+                # back TO. Restoring the debt here to keep memory and disk in
+                # agreement is the right instinct almost everywhere and the
                 # wrong one here: a trustworthy live observation has just DISPROVED
                 # the debt, so restoring it lets the next delivered turn settle a
                 # terminal state that no longer holds and silently stop a watch whose
@@ -3886,7 +4199,8 @@ class AutoNudgeService:
             self._emit("expired", loop)
             return
         # Proved unable to act? Checked LAST, so a loop that is also out of
-        # cycles or budget still reports the bound it historically would have. This one is reactive by construction: it fires only on recorded
+        # cycles or budget still reports the bound it would otherwise report. This
+        # one is reactive by construction: it fires only on recorded
         # evidence that a cycle's approval went unanswered (see
         # ``notify_approval_stalled``), never on a reading of whether a grant
         # happens to be in force — a loop that only ever calls auto-approved
@@ -4185,8 +4499,8 @@ class AutoNudgeService:
                         if not await self._terminal_still_holds(loop, monitor):
                             # The subject came back while the turn was being delivered.
                             # Every earlier guard for a reopened subject lives on the
-                            # NEXT TICK -- the debt clearing added in round 31, the
-                            # forced re-observation added in round 34 -- and this
+                            # NEXT TICK -- the debt clearing and the forced
+                            # re-observation -- and this
                             # settlement runs before any tick can happen, so the window
                             # between the terminal observation and the turn landing had
                             # no evidence in it at all. A channel turn runs inline and
@@ -4201,8 +4515,8 @@ class AutoNudgeService:
                             #
                             # SKIPPED, not returned from. This block's own comment forbids
                             # an early exit because the rest of the fire cycle still has
-                            # to run, and round 35 was that exact rule being broken by a
-                            # re-raise leaving through the same door.
+                            # to run, and a re-raise leaving through the same door breaks
+                            # that exact rule.
                             monitor.terminal_pending = ""
                             self._persist_soon()
                             logger.info(
@@ -4365,6 +4679,95 @@ class AutoNudgeService:
         # handles any overlap.
         if is_channel_key(loop.slot_key) and loop.active and loop.id in self._loops:
             self._arm_from_deadline(loop)
+
+    async def fire_now(self, loop_id: str) -> tuple["NudgeLoop | None", str, int]:
+        """Bring one loop's next cycle forward to now, out of band from its countdown.
+
+        Returns ``(loop, "", 200)`` once the cycle is armed to run, or
+        ``(None, reason, status)`` on refusal — the ``(obj, error, status)``
+        shape the authz chokepoints in :mod:`kiro_crew.autonudge_authz` already
+        use, so the HTTP handler stays a thin mapping.
+
+        WHAT THIS DELIBERATELY DOES NOT DO: it does not deliver the nudge
+        itself. It re-arms through :meth:`_arm_timer`, so the cycle runs inside
+        the ordinary :meth:`_timer` body — the stop sentinel, the cycle cap, the
+        wall-clock budget, the approval-stall stop and the probe gate all apply
+        exactly as they do on a scheduled tick, and the delivery goes through the
+        one ``_on_fire`` path. Calling :meth:`_run_fire_cycle` directly would have
+        needed that whole ladder restated here, and a second copy of a
+        five-condition gate is a divergence waiting to happen.
+
+        ``delay=0.0`` rather than :meth:`_arm_from_deadline`'s
+        ``_OVERDUE_REARM_SECS`` beat. That beat exists so an elapsed deadline
+        does not ambush a user mid-conversation — they keep deferring it simply
+        by typing. A manual trigger IS the user asking, so the condition the beat
+        protects against is not present.
+
+        Three refusals, and each one is load-bearing rather than defensive:
+
+        * **Not registered** -> 404. Nothing to fire. This is also where the stop
+          SENTINEL lands: it goes through ``remove``, so the loop is gone rather
+          than merely inactive.
+        * **Not active** -> 409. The non-removing terminal bounds — the cycle
+          cap, the wall-clock budget and the approval stall — all leave the loop
+          registered but inactive, so this ONE condition covers them without
+          restating the list. A manual press must not buy a turn past a bound the
+          user armed.
+        * **Mid-fire** -> 409. :meth:`_arm_timer` cancels the existing timer
+          task, and during the fire window that task may be parked on
+          ``_persist_locked()`` writing the delivered cycle; cancelling it there
+          loses the ``cycle_count`` bump. This is the same window
+          ``notify_turn_complete``/``notify_user_input`` defer around, and the
+          same answer the sibling immediate-trigger route gives for a run
+          already in flight (``POST /api/crons/{id}/run`` -> 409).
+
+        NO SUSPENSION POINT, and that is the design rather than an omission.
+        ``async def`` for the caller's convenience, but nothing inside awaits, so
+        the guards and the arm are atomic with respect to the event loop: between
+        reading ``loop`` and arming it, no other coroutine can run.
+
+        This shape was arrived at the hard way and the history is worth keeping.
+        An earlier revision wrote ``next_due_ts = time.time()`` and awaited a
+        DURABLE persist before arming, so a restart between the press and the
+        fire would resume overdue. That await was a suspension window, and this
+        module has several writers to ``next_due_ts`` that hold NO lock while
+        writing it — the quiet-tick re-arm on the gated-wake branch is one. Each
+        guard added to close one writer's window exposed the next: a concurrent
+        ``remove`` arming a stale object, a cancelled caller abandoning the write,
+        a countdown entering ``_firing`` mid-persist, a quiet tick overwriting the
+        deadline, then the refused path leaving its own value durably committed.
+        Five rounds, each caused by the fix before it. The window is not closable
+        at this call site, because the racing writers take no lock at all.
+
+        SO THE WRITE IS GONE. ``_arm_timer(delay=0.0)`` is what brings the cycle
+        forward: :meth:`_timer` sleeps the delay it is given and fires WITHOUT
+        consulting ``next_due_ts``. The write was only ever for restart cosmetics,
+        and that is exactly what is given up — a gateway restart between the press
+        and the fire resumes on the loop's own schedule instead of overdue, and
+        the operator presses again. That is the same degradation
+        :meth:`_persist_soon` documents as acceptable for every other deadline
+        assignment in this class ("a lost write degrades to a fresh full countdown
+        after restart, never a premature or dropped fire"), and a far better trade
+        than a sixth guard on an uncloseable window.
+
+        The countdown reset callers ask for is UNAFFECTED, because it never
+        came from this write: a delivered cycle clears ``next_due_ts`` in
+        :meth:`_run_fire_cycle` and the re-arm then starts a fresh full interval.
+        """
+        loop = self.get_by_id(loop_id)
+        if loop is None:
+            return None, "loop not found", 404
+        if not loop.active:
+            return None, "loop is not active", 409
+        if loop_id in self._firing:
+            return None, "loop is already firing", 409
+        self._arm_timer(loop, delay=0.0)
+        logger.info(
+            "AutoNudge: loop %s brought forward by hand — cycle %d armed to run now",
+            loop.id,
+            loop.cycle_count + 1,
+        )
+        return loop, "", 200
 
 
 class _AutoNudgeMaintenanceView:

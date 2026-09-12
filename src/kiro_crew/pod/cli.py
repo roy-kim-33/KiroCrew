@@ -11,6 +11,7 @@ import contextlib
 import io
 import json
 import logging
+import os
 import re
 import subprocess
 import sys
@@ -205,6 +206,10 @@ def _up(cfg: PodConfig, args: argparse.Namespace) -> None:
         if crons:
             env_updates["CRONS"] = "1"
             boot_flags.append("--crons")
+        no_embeddings = bool(getattr(args, "no_embeddings", False))
+        if no_embeddings:
+            env_updates["EMBEDDINGS"] = "0"
+            boot_flags.append("--no-embeddings")
 
         # Read the unit's state BEFORE choosing a port, and inside the mutex: the
         # two questions are one decision. An `up` against an already-active pod is
@@ -299,16 +304,32 @@ def _up(cfg: PodConfig, args: argparse.Namespace) -> None:
                     f"(kirocrew pod down {name} && kirocrew pod up {name} {joined}).",
                     file=sys.stderr,
                 )
-        # Record boot-time settings: a pod in `yolo` auto-approves every tool and
-        # one with the scheduler on runs work unattended, so the audit trail must
-        # say so rather than recording only that a pod came up. Mark the
+        # Record boot-time settings: a pod in `yolo` auto-approves every tool, one
+        # with the scheduler on runs work unattended, and one without embeddings
+        # answers search from a different index than a normal pod -- so the audit
+        # trail must say so rather than recording only that a pod came up. Mark the
         # requested-but-not-yet-effective case: `boot` reads these once at start,
         # so a setting recorded against a live pod has not applied yet.
+        # `embeddings=off` is keyed on what the pod boots WITH, not on this command's
+        # flag. The merge-preserving env file keeps EMBEDDINGS=0 from an earlier `up`,
+        # so a re-up without the flag boots the same embedding-light pod; and a
+        # KIROCREW_SKIP_MODEL_DOWNLOAD=1 already in this environment is what
+        # pod_context hands every `pod exec` and what an inheriting boot carries,
+        # with no key ever written. Either pod answers search from a different
+        # index, and a row that said nothing would contradict the journal line
+        # `boot` prints for both (it keys on the effective env the same way).
+        embeddings_off = (
+            no_embeddings
+            or rt.embeddings_disabled(rt.read_env_file(cfg, name))
+            or os.environ.get(rt.SKIP_MODEL_DOWNLOAD_ENV) == "1"
+        )
         resources = f"name={name} port={port}"
         if approval:
             resources += f" approval={approval}"
         if crons:
             resources += " crons=on"
+        if embeddings_off:
+            resources += " embeddings=off"
         if boot_flags and was_active:
             resources += " applied=next_boot"
         _audit("pod.up", "allowed", resources)
@@ -517,7 +538,41 @@ def _ls(cfg: PodConfig, args: argparse.Namespace) -> None:
             print(f"{n:<28} {p:<7} {_health_label(rt.health(cfg, n, p))}")
     else:
         print("no pods running")
+    _print_refusals(cfg)
     _print_orphans(cfg, orphans)
+
+
+def _print_refusals(cfg: PodConfig) -> None:
+    """Report pods whose LAST boot refused terminally.
+
+    ``PodConfig.refusal_file``'s whole justification is that a terminal refusal is
+    visible in different amounts on the two service managers -- systemd leaves the
+    unit ``failed``, while launchd sees the exit-0 that stops its restart loop and
+    reads it as an ordinary clean exit -- and that ``pod ls`` should report the same
+    fact either way. It did not: a refused pod is not running, so it fell out of the
+    listing entirely and ``ls`` printed "no pods running". The note existed with no
+    reader, and a pod that silently vanishes from ``ls`` is exactly how a boot
+    failure hides.
+
+    Rendered as its own section rather than a row in the main table, mirroring
+    :func:`_print_orphans`: a refused pod has no port and no health, so a table row
+    would have to invent both.
+    """
+    try:
+        names = sorted(p.name[: -len(".refused")] for p in cfg.pods_dir.glob("*.refused"))
+    except OSError:
+        return
+    refused = [(n, rt.refusal_reason(cfg, n)) for n in names]
+    refused = [(n, why) for n, why in refused if why]
+    if not refused:
+        return
+    print(
+        f"\n{len(refused)} pod(s) REFUSED to boot — the last attempt stopped on a "
+        "safety check and did not start a gateway:"
+    )
+    for name, why in refused:
+        print(f"  {name:<26} {why}")
+        print(f"  {'':<26} clear: kirocrew pod down {name}")
 
 
 def _print_orphans(cfg: PodConfig, orphans: list[str]) -> None:
@@ -992,8 +1047,23 @@ def _run_internal(cfg: PodConfig, args: argparse.Namespace) -> None:
     # Audit BEFORE boot — boot() exec()s the gateway and never returns on success.
     _audit("pod.boot", "allowed", f"name={args.name}")
     rc = rt.boot(cfg, args.name)
+    # Audit the HONEST code, before any service-manager translation below.
     _audit("pod.boot", "failure", f"name={args.name}", error=f"exit={rc}")
-    sys.exit(rc)
+    # launchd has no RestartPreventExitStatus: its only restart discriminator is
+    # the success/failure axis, and this backend's KeepAlive restarts on NON-ZERO.
+    # A terminal refusal must therefore exit 0 or launchd re-runs it every 5s.
+    # ``rt.terminal_exit_code`` is the record-CONDITIONAL gate -- it translates only
+    # when the refusal note actually landed, so a refusal that could not be recorded
+    # keeps its honest non-zero instead of looking like a clean exit. Do NOT call
+    # ``launchd.launchd_exit_code`` directly here; it states the platform semantics
+    # but knows nothing about whether the record exists.
+    exit_code = rt.terminal_exit_code(cfg, args.name, rc)
+    if exit_code != rc:
+        print(
+            f"kirocrew-pod: exiting 0 instead of {rc} so launchd does not restart "
+            f"into the same refusal every 5s; recorded at {cfg.refusal_file(args.name)}"
+        )
+    sys.exit(exit_code)
 
 
 def _cleanup_internal(cfg: PodConfig, args: argparse.Namespace) -> None:

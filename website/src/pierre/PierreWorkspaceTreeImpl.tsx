@@ -9,7 +9,8 @@
  * Like the diff/code surfaces, the heavy `@pierre/trees` runtime loads behind
  * a lazy boundary (see `./tree.tsx`) so the eager bundle stays clean.
  */
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
 import { useQuery } from '@tanstack/react-query'
 import type { GitStatus, GitStatusEntry } from '@pierre/trees'
 // The package root re-exports the tree's context-menu types under shorter
@@ -21,8 +22,10 @@ import type {
 import { FileTree, useFileTree } from '@pierre/trees/react'
 import { AtSign, FileDiff, FolderOpen } from 'lucide-react'
 import { api } from '../api/client'
+import ErrorNotice from '../components/ErrorNotice'
 import { useMenuKeyboard } from '../hooks/useMenuKeyboard'
 import { i18nT } from '../i18n/t'
+import { useFileMenuItems, visibleFileMenuItems, invokeFileMenuItem, FileMenuItemIcon, FileMenuItemLabel, type ContributedFileMenuItem, type ReportFileMenuError } from '../apps/fileMenuContributions'
 import { normalizeWindowsPath } from '../utils/fileTokens'
 import { TreeSkeleton } from './tree'
 
@@ -31,16 +34,29 @@ import { TreeSkeleton } from './tree'
  *  Pierre's `'directory' | 'file'`, so map at the boundary. */
 type TreeEntryKind = 'file' | 'dir'
 
-/** Row-level right-click menu projected into Pierre's `context-menu` slot.
- *  Pierre owns the anchor, the outside-click wash, and open/close; this renders
- *  only the item list — a single "Add to chat" action (row click already opens
- *  a file, so the menu deliberately carries no Open duplicate). The action
- *  closes the menu itself so focus returns to the row. */
-function TreeContextMenu({ item, context, root, onAddToContext }: {
+/** Row-level right-click menu for Pierre's `context-menu` slot -- rendered via a
+ *  `document.body` PORTAL rather than into the slot itself. Pierre owns the
+ *  anchor, the outside-click wash, and open/close (the portal root's
+ *  `data-file-tree-context-menu-root` marker is the library's documented way to
+ *  keep a portaled surface counting as "inside"); this renders only the item
+ *  list: the built-in "Add to chat" action, plus any row an installed app
+ *  contributes for the `tree-context` surface (row click already opens a file,
+ *  so the menu deliberately carries no Open duplicate). Every action closes the
+ *  menu itself so focus returns to the row. */
+function TreeContextMenu({ item, context, root, onAddToContext, contribItems, onError }: {
   item: FileTreeContextMenuItem
   context: FileTreeContextMenuOpenContext
   root: string
   onAddToContext?: (absPath: string, kind: TreeEntryKind) => void
+  /** Contributed `tree-context` rows, resolved by the PARENT (which already holds
+   *  the `['apps']` query) and passed down. Deliberately a prop rather than a hook
+   *  call here: this component mounts inside Pierre's context-menu slot, and a
+   *  `useQuery` in the leaf would make every host of the tree — and every test
+   *  rendering just this menu — require a `QueryClientProvider` it never needed. */
+  contribItems: readonly ContributedFileMenuItem[]
+  /** Where a contributed row's dispatch failure goes. Owned by the parent because
+   *  activating a row closes this menu, so it cannot render the notice itself. */
+  onError: ReportFileMenuError
 }) {
   const isDir = item.kind === 'directory'
   // Pierre paths are POSIX (`/`), but on native Windows `root` is
@@ -56,6 +72,7 @@ function TreeContextMenu({ item, context, root, onAddToContext }: {
   // two slashes, leaving a stray leading `/` on the relativized path (a
   // root-relative-looking path instead of project-relative).
   const abs = `${normalizeWindowsPath(root).replace(/\/$/, '')}/${item.path}`
+  const rows = visibleFileMenuItems(contribItems, { path: abs, kind: isDir ? 'dir' : 'file' })
   // role="menuitem" divs (an interactive ARIA role) with a keyboard handler:
   // the correct menu semantics inside the role="menu" container, and the role
   // is what makes an onClick div compliant rather than a static-element one.
@@ -79,42 +96,160 @@ function TreeContextMenu({ item, context, root, onAddToContext }: {
   // `restoreFocus`), so this does not strand focus inside a dismissed menu.
   const firstItemRef = useRef<HTMLDivElement>(null)
   useEffect(() => {
-    firstItemRef.current?.focus()
+    // Focus the first row on open: the built-in "add to context" row when a host
+    // supplies onAddToContext, otherwise the first app-contributed row. The
+    // querySelector arm is not redundant with the ref: the built-in row is gated on
+    // onAddToContext, so in an app-only menu `firstItemRef` is attached to a row that
+    // may itself have been filtered out by its `when` predicate.
+    ;(firstItemRef.current
+      ?? menuRef.current?.querySelector<HTMLElement>('[role="menuitem"]'))?.focus()
   }, [])
-  // The DEGENERATE single-item case of the shared role="menu" keyboard contract
-  // (#6231): with exactly one item the arrows have nothing to move between, so
-  // the wiring buys no navigation today. It is here because the CONTRACT is
-  // what role="menu" advertises to assistive technology, and honouring it
-  // per-surface-by-item-count is how surfaces drift: an arrow inside an open
-  // menu must be consumed rather than scrolling the tree behind it, Tab must
-  // stay contained (#2533), and IME composition keys must not reach the menu at
-  // all — all true of a one-item menu. It also means the day this menu grows a
-  // second action (an Open, a Reveal), real navigation arrives with it instead
-  // of being a second bug to find. `enabled: true` unconditionally because
-  // Pierre only mounts this component while the menu is open.
+  // The shared role="menu" keyboard contract (#6231). The item count is no longer
+  // fixed: the built-in row is gated on `onAddToContext` and an installed app may
+  // contribute any number of rows its `when` admits, so this menu can hold one row
+  // or several and the arrows do real navigation whenever it holds more than one.
+  // Honouring the contract per-surface-by-item-count is how surfaces drift anyway —
+  // an arrow inside an open menu must be consumed rather than scrolling the tree
+  // behind it, Tab must stay contained (#2533), and IME composition keys must not
+  // reach the menu at all, all true whatever the count. `enabled: true`
+  // unconditionally because Pierre only mounts this component while the menu is open.
   // focusFirstOnOpen: false — the firstItemRef effect above already owns focus
   // entry (it must, because Pierre focuses the tree ROW, not this slotted
   // content); letting the hook also focus would be a redundant second move.
   const menuRef = useRef<HTMLDivElement>(null)
   useMenuKeyboard({ enabled: true, containerRef: menuRef, focusFirstOnOpen: false })
-  return (
+  // PORTALED to document.body, positioned from the open context's anchorRect
+  // (#10100). Pierre's default slot placement puts the menu in a width-0 slot
+  // hung at the row's trailing edge, inside the tree root -- and that root is
+  // `overflow: hidden`, so with this app's `--trees-padding-inline-override:
+  // 0px` the slot sits ~7px from the panel's right edge and the menu clips to
+  // a sliver flush against the border at EVERY panel width (it reads as a
+  // truncated, unclickable "..." control; the same in-slot growth is what shifted
+  // the trigger vertically while open). The library documents the escape
+  // hatch: a portaled menu marked `data-file-tree-context-menu-root="true"`
+  // still counts as inside for Pierre's outside-click wash and Escape close.
+  //
+  // Placement: below the anchor, right edges aligned for the "..." button (its
+  // rect has width; a right-click anchor is a zero-width point and aligns
+  // left), clamped into the viewport and flipped above when the bottom would
+  // overflow -- measured in a layout effect so the first painted frame is
+  // already at its final position (hidden until measured).
+  const [pos, setPos] = useState<{ top: number; left: number } | null>(null)
+  useLayoutEffect(() => {
+    const menu = menuRef.current
+    if (!menu) return
+    const a = context.anchorRect
+    const m = menu.getBoundingClientRect()
+    const margin = 8
+    let left = a.width > 0 ? a.right - m.width : a.left
+    left = Math.min(left, window.innerWidth - m.width - margin)
+    left = Math.max(margin, left)
+    let top = a.bottom + 2
+    if (top + m.height > window.innerHeight - margin) {
+      top = Math.max(margin, a.top - m.height - 2)
+    }
+    setPos({ top, left })
+    // `rows.length` is a dep because a contributed-row refetch while the menu
+    // is open changes the menu's height, and a stale measurement would let the
+    // grown menu run past the bottom clamp.
+  }, [context, rows.length])
+  // DISMISS when the row can move out from under the fixed-position menu.
+  // The tree renders inside a SHADOW ROOT and `scroll` is a non-composed
+  // event, so a window listener never sees the virtualized tree's own
+  // scroller (the drift source that matters) while it DOES fire for
+  // unrelated light-DOM scrolls -- a streaming reply auto-scrolling the chat
+  // transcript would snatch a just-opened menu with no action taken. So the
+  // scroll listener goes capture-phase on the ANCHOR'S OWN root node (the
+  // tree's shadow root), which sees every scroll container inside the tree
+  // and nothing outside it. Row movement without a scroll -- the rail or
+  // panel being drag-resized -- is covered by a ResizeObserver on the shadow
+  // host (skipping its mandatory initial delivery), and window resize stays
+  // as the cheap catch-all. Close rather than re-track: it is the native
+  // context-menu convention, and a right-click anchor is a pointer POINT
+  // that no element rect can re-derive after the rows have moved.
+  useEffect(() => {
+    const onDismiss = () => context.close()
+    const root = context.anchorElement.getRootNode()
+    root.addEventListener('scroll', onDismiss, true)
+    let ro: ResizeObserver | null = null
+    const host = root instanceof ShadowRoot ? root.host : null
+    if (host && typeof ResizeObserver !== 'undefined') {
+      let initialDelivery = true
+      ro = new ResizeObserver(() => {
+        if (initialDelivery) {
+          initialDelivery = false
+          return
+        }
+        context.close()
+      })
+      ro.observe(host)
+    }
+    window.addEventListener('resize', onDismiss)
+    return () => {
+      root.removeEventListener('scroll', onDismiss, true)
+      ro?.disconnect()
+      window.removeEventListener('resize', onDismiss)
+    }
+  }, [context])
+  // Render nothing rather than an empty bordered popup: with no host row AND no
+  // app row that its `when` admits for this node, there is nothing to show and
+  // no menuitem for the focus effect to land on.
+  if (!onAddToContext && rows.length === 0) return null
+  return createPortal(
     <div
       ref={menuRef}
       role="menu"
-      className="min-w-[176px] rounded-lg border border-border bg-bg-elevated p-1 shadow-lg"
+      data-file-tree-context-menu-root="true"
+      style={pos ? { top: pos.top, left: pos.left } : { top: context.anchorRect.bottom + 2, left: context.anchorRect.left, visibility: 'hidden' }}
+      className="fixed z-50 min-w-[176px] max-w-[min(420px,calc(100vw-2rem))] rounded-lg border border-border bg-bg-elevated p-1 shadow-lg"
     >
-      <div
-        ref={firstItemRef}
-        role="menuitem"
-        tabIndex={-1}
-        className={itemCls}
-        onClick={activate(() => onAddToContext?.(abs, isDir ? 'dir' : 'file'))}
-        onKeyDown={activate(() => onAddToContext?.(abs, isDir ? 'dir' : 'file'))}
-      >
-        <AtSign className="lucide-inline text-muted" />
-        {i18nT('pages.chat.fileBrowserRail.ctx_add_to_chat')}
-      </div>
-    </div>
+      {onAddToContext && (
+        <div
+          ref={firstItemRef}
+          role="menuitem"
+          tabIndex={-1}
+          className={itemCls}
+          onClick={activate(() => onAddToContext(abs, isDir ? 'dir' : 'file'))}
+          onKeyDown={activate(() => onAddToContext(abs, isDir ? 'dir' : 'file'))}
+        >
+          <AtSign className="lucide-inline text-muted" />
+          {i18nT('pages.chat.fileBrowserRail.ctx_add_to_chat')}
+        </div>
+      )}
+      {/* App-contributed rows (contributes.fileMenuItems, surface 'tree-context').
+          An installed app declares these in its manifest; core POSTs the node
+          context to the app's endpoint on activation and never imports app code.
+          Already filtered by each row's `when` predicate; the stock build (no
+          declaring app) renders nothing. */}
+      {rows.map((mi, idx) => {
+        const dispatch = () =>
+          invokeFileMenuItem(
+            mi,
+            {
+              surface: 'tree-context',
+              path: abs,
+              kind: isDir ? 'dir' : 'file',
+              root,
+            },
+            onError,
+          )
+        return (
+          <div
+            key={`${mi.app}:${mi.id}`}
+            ref={!onAddToContext && idx === 0 ? firstItemRef : undefined}
+            role="menuitem"
+            tabIndex={-1}
+            className={itemCls}
+            onClick={activate(dispatch)}
+            onKeyDown={activate(dispatch)}
+          >
+            <FileMenuItemIcon name={mi.icon} />
+            <FileMenuItemLabel item={mi} />
+          </div>
+        )
+      })}
+    </div>,
+    document.body,
   )
 }
 
@@ -135,8 +270,9 @@ export function PierreWorkspaceTreeImpl({ projectDir, onFileOpen, onAddToContext
   onFileOpen?: (absPath: string) => void
   /** Right-click "Add to context" on a row: hands the host the ABSOLUTE path
    *  and whether it is a file or a directory, so the composer can insert the
-   *  same `@`-mention the file picker does. Absent → the menu item is still
-   *  shown but inert (the tree has no host to mention into). */
+   *  same `@`-mention the file picker does. Absent → the built-in row is not
+   *  rendered, and the context menu opens only if an app contributes a
+   *  'tree-context' row this node matches. */
   onAddToContext?: (absPath: string, kind: TreeEntryKind) => void
   /** Forwarded into the tree's search session (null clears it). */
   searchQuery?: string | null
@@ -149,6 +285,13 @@ export function PierreWorkspaceTreeImpl({ projectDir, onFileOpen, onAddToContext
    *  prop never re-fire `onFileOpen`. */
   selectedPath?: string | null
 }) {
+  // Whether any app contributes a 'tree-context' row at all — gates whether the
+  // tree wires a context menu (per-node `when` filtering happens in the menu).
+  const treeItems = useFileMenuItems('tree-context')
+  // A contributed row's dispatch failure, rendered above the tree. It lives here rather
+  // than in the context menu because activating a row closes that menu, so a notice
+  // inside it would unmount with the thing that raised it.
+  const [actionError, setActionError] = useState<string | null>(null)
   const { data: tree } = useQuery({
     queryKey: ['project-tree', projectDir],
     queryFn: () => api.projectTree(projectDir),
@@ -302,6 +445,11 @@ export function PierreWorkspaceTreeImpl({ projectDir, onFileOpen, onAddToContext
   onAddToContextRef.current = onAddToContext
   const rootRef = useRef(root)
   rootRef.current = root
+  // Ref'd like the two above so this callback stays identity-stable: Pierre takes
+  // `renderContextMenu` as a prop, and a new function each render would remount the
+  // slotted menu mid-interaction.
+  const treeItemsRef = useRef(treeItems)
+  treeItemsRef.current = treeItems
   const renderContextMenu = useCallback(
     (item: FileTreeContextMenuItem, ctx: FileTreeContextMenuOpenContext) => (
       <TreeContextMenu
@@ -309,6 +457,8 @@ export function PierreWorkspaceTreeImpl({ projectDir, onFileOpen, onAddToContext
         context={ctx}
         root={rootRef.current}
         onAddToContext={onAddToContextRef.current}
+        contribItems={treeItemsRef.current}
+        onError={setActionError}
       />
     ),
     [],
@@ -340,6 +490,20 @@ export function PierreWorkspaceTreeImpl({ projectDir, onFileOpen, onAddToContext
 
   return (
     <div className="flex-1 min-h-0 flex flex-col">
+      {/* A contributed row's endpoint refused or never answered. askAgent on: this
+          subtree holds no editable draft, only the tree's own selection. */}
+      {actionError && (
+        <div className="px-2 pt-1.5">
+          <ErrorNotice
+            variant="inline"
+            className="whitespace-normal"
+            message={actionError}
+            askAgent
+            onDismiss={() => setActionError(null)}
+            testId="workspace-tree-action-error"
+          />
+        </div>
+      )}
       {mode === 'all' && tree?.truncated && (
         <div className="px-3 py-1 text-[11px] text-muted">
           {i18nT('pages.chat.activityViewer.workspace_truncated')}
@@ -353,7 +517,7 @@ export function PierreWorkspaceTreeImpl({ projectDir, onFileOpen, onAddToContext
         // (FileTree's own renderContextMenu != null check) forces the menu
         // enabled unconditionally, so passing it regardless of onAddToContext
         // would open a menu whose only action closes itself and does nothing.
-        renderContextMenu={onAddToContext ? renderContextMenu : undefined}
+        renderContextMenu={(onAddToContext || treeItems.length > 0) ? renderContextMenu : undefined}
       />
     </div>
   )

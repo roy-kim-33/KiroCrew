@@ -18,6 +18,7 @@ import mmap
 import os
 import re
 import shutil
+import socket
 import stat
 import subprocess
 import sys
@@ -30,6 +31,80 @@ from pathlib import Path
 import pytest
 
 from kiro_crew import platform_compat as pc
+
+
+@pytest.mark.skipif(
+    sys.platform not in {"win32", "linux", "darwin"}, reason="supported kernel identity contract"
+)
+@pytest.mark.parametrize("family, host", [(socket.AF_INET, "127.0.0.1"), (socket.AF_INET6, "::1")])
+def test_native_tcp_peer_identifies_client_process_not_server(family, host):
+    with socket.socket(family) as listener:
+        listener.settimeout(10)
+        listener.bind((host, 0))
+        listener.listen()
+        child = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import os,socket,sys; s=socket.socket(int(sys.argv[1])); "
+                "s.connect((sys.argv[2],int(sys.argv[3]))); print(os.getpid(),flush=True); "
+                "sys.stdin.read(1)",
+                str(int(family)),
+                host,
+                str(listener.getsockname()[1]),
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        try:
+            accepted, _ = listener.accept()
+            # A Windows venv launcher may exec a different interpreter PID.
+            assert child.stdout is not None
+            client_pid = int(child.stdout.readline())
+            with accepted:
+                server = accepted.getsockname()[:2]
+                client = accepted.getpeername()[:2]
+                assert pc.get_tcp_peer_pid(server, client) == client_pid
+                start = pc.get_process_start_id(client_pid)
+                assert start and start == pc.get_process_start_id(client_pid)
+                assert start != pc.get_process_start_id(os.getpid())
+                assert pc.get_tcp_peer_pid((server[0], server[1] % 65535 + 1), client) is None
+                assert pc.get_tcp_peer_pid(("203.0.113.1", server[1]), client) is None
+        finally:
+            child.communicate(b"x", timeout=10)
+
+
+def test_tcp_peer_identity_unavailable_on_unknown_platform(monkeypatch):
+    monkeypatch.setattr(pc, "IS_WINDOWS", False)
+    monkeypatch.setattr(pc.sys, "platform", "unsupported")
+    assert pc.get_tcp_peer_pid(("127.0.0.1", 1000), ("127.0.0.1", 2000)) is None
+
+
+@pytest.mark.parametrize("host", ["127.0.0.1", "::1"])
+@pytest.mark.parametrize("scenario", ["match", "other_port", "ambiguous", "unreadable"])
+def test_macos_tcp_peer_requires_an_exact_unique_connection(monkeypatch, host, scenario):
+    monkeypatch.setattr(pc, "IS_WINDOWS", False)
+    monkeypatch.setattr(pc.sys, "platform", "darwin")
+    monkeypatch.setattr(pc, "trusted_system_bin", lambda name: "/usr/sbin/lsof")
+    rendered = f"[{host}]" if ":" in host else host
+    port = 2001 if scenario == "other_port" else 2000
+    data = f"p2468\nn{rendered}:{port}->{rendered}:1000\n"
+    if scenario == "ambiguous":
+        data += f"p9753\nn{rendered}:{port}->{rendered}:1000\n"
+
+    def query(argv, **kwargs):
+        assert argv == ["/usr/sbin/lsof", "-nP", "-a", "-iTCP:2000", "-sTCP:ESTABLISHED", "-Fpn"]
+        assert kwargs["timeout"] == 2
+        if scenario == "unreadable":
+            raise subprocess.TimeoutExpired(argv, 2)
+        return data.encode("ascii")
+
+    monkeypatch.setattr(subprocess, "check_output", query)
+    assert pc.get_tcp_peer_pid((host, 1000), (host, 2000)) == (
+        2468 if scenario == "match" else None
+    )
+
 
 #: The REAL same-group probe, bound at module import so this file can test it.
 #: The rootdir conftest pins ``pc._shares_own_process_group`` for every test
@@ -405,7 +480,7 @@ class TestProcessCwd:
 
     def test_darwin_refuses_a_short_write(self, monkeypatch):
         # A byte count other than the exact struct size means the layout the
-        # offsets assume no longer matches the kernel's, so the path cannot be
+        # offsets assume does not match the kernel's, so the path cannot be
         # sliced out safely — the caller falls back instead of getting garbage.
         monkeypatch.setattr(
             pc,
@@ -650,11 +725,10 @@ class TestUtf8Console:
         assert "KiroCrew" in out
 
     def test_rewraps_cp1252_stream_so_emoji_log_record_survives(self, monkeypatch):
-        # Regression for the gateway-worker UnicodeEncodeError: when the worker's
-        # stderr is a cp1252 TextIOWrapper that reconfigure() can't flip (observed
-        # through the 3-layer Windows spawn), a logging StreamHandler bound to it
-        # crashed on the first non-ASCII log record. ensure_utf8_console() must
-        # re-wrap the underlying buffer so the record emits cleanly.
+        # When the worker's stderr is a cp1252 TextIOWrapper that reconfigure()
+        # can't flip (the 3-layer Windows spawn), a logging StreamHandler bound to
+        # it crashes on the first non-ASCII log record, so ensure_utf8_console()
+        # must re-wrap the underlying buffer so the record emits cleanly.
         #
         # This stream repair is WINDOWS-only behavior: on POSIX the function
         # publishes the environment for children but leaves current streams
@@ -1014,6 +1088,63 @@ class TestDirLinkShims:
         assert os.readlink(str(link)) == str(target)
 
 
+class TestPinDirectory:
+    """``pin_directory``: hold a directory so a child written by PATH stays put.
+
+    Every platform: the open refuses anything that is not a real directory.
+    Windows only: the held handle blocks rename/delete -- the property the
+    caller relies on when a same-UID watcher could otherwise swap the directory
+    for a junction between a check and a child process's open.
+    """
+
+    def test_a_real_directory_pins_and_releases(self, tmp_path):
+        target = tmp_path / "dir"
+        target.mkdir()
+        fd = pc.pin_directory(target)
+        try:
+            assert fd >= 0
+            assert stat.S_ISDIR(os.fstat(fd).st_mode)
+        finally:
+            os.close(fd)
+        # Released: the directory is ordinary again.
+        target.rename(tmp_path / "moved")
+
+    def test_a_file_at_the_name_is_refused(self, tmp_path):
+        regular = tmp_path / "f.txt"
+        regular.write_text("x")
+        with pytest.raises(NotADirectoryError):
+            pc.pin_directory(regular)
+
+    def test_a_link_at_the_name_is_refused_not_followed(self, tmp_path):
+        # A watcher's whole move is to put a link where the directory was; the
+        # pin must fail on it rather than pin the link's TARGET in its place.
+        target = tmp_path / "target"
+        target.mkdir()
+        link = tmp_path / "link"
+        pc.symlink_or_junction(target, link)
+        with pytest.raises(OSError):
+            pc.pin_directory(link)
+
+    @pytest.mark.skipif(not pc.IS_WINDOWS, reason="a held handle blocks rename only on Windows")
+    def test_a_pinned_directory_cannot_be_renamed_or_removed(self, tmp_path):
+        # The pin is on the DIRECTORY: its children can still be removed (the
+        # caller holds its own file open for that), but the directory itself
+        # can be neither renamed nor deleted until the handle is released.
+        target = tmp_path / "dir"
+        target.mkdir()
+        fd = pc.pin_directory(target)
+        try:
+            with pytest.raises(OSError):
+                target.rename(tmp_path / "swapped")
+            with pytest.raises(OSError):
+                target.rmdir()
+            assert target.is_dir()
+        finally:
+            os.close(fd)
+        target.rename(tmp_path / "swapped")
+        assert (tmp_path / "swapped").is_dir()
+
+
 # ---------------------------------------------------------------------------
 # POSIX-branch coverage for the new platform_compat helpers. The
 # tests below deliberately exercise the ``if IS_POSIX:`` / Linux ``/proc`` paths
@@ -1064,8 +1195,8 @@ class TestFileLockContention:
 
     @pytest.mark.skipif(not pc.IS_WINDOWS, reason="Windows LK_LOCK ceiling regression")
     def test_windows_blocking_acquire_waits_past_lk_lock_ceiling(self, tmp_path):
-        # Regression for issue #470: msvcrt's LK_LOCK "blocking" code gives up
-        # after ~10s with EDEADLOCK and the old shim treated that as "acquired".
+        # msvcrt's LK_LOCK "blocking" code gives up after ~10s with EDEADLOCK,
+        # which must not be treated as "acquired".
         # A holder that keeps the lock LONGER than that ceiling must make a
         # blocking contender WAIT (until release or its own timeout) — never
         # fall through and enter the critical section unserialized at ~10s.
@@ -1099,7 +1230,7 @@ class TestFileLockContention:
             entered_at["t"] = time.monotonic()
             assert got is True, "contender never acquired the lock after release"
             # It entered only AFTER the holder released — proving it waited past
-            # the 10s ceiling that used to let it slip through early.
+            # the 10s ceiling instead of slipping through early.
             assert entered_at["t"] >= released_at["t"], (
                 "contender entered the critical section before the holder "
                 "released — the blocking acquire fell through the LK_LOCK ceiling"
@@ -1962,7 +2093,7 @@ class TestKillSubprocessPosix:
         try:
             assert pc.pid_exists(child.pid) is True
             assert pc.kill_pid(child.pid, pc.SIGKILL) is True
-            # Reap the killed child so it is no longer a zombie occupying the
+            # Reap the killed child so it is not left a zombie occupying the
             # PID; otherwise os.kill(pid, 0) would still report it as existing.
             child.wait(timeout=5)
             deadline = time.monotonic() + 2.0
@@ -2086,8 +2217,8 @@ class TestRestrictToOwnerArgvOnLinux:
     on AL2). A regression that drops the S-1-3-4 grant or the invoking-user grant
     silently reopens the parent-inherited-DACL gap.
 
-    The observable used to be the ``icacls`` argv. The lockdown now goes through
-    ``windows_acl.apply_owner_only`` in-process, so the observable is that call's
+    The lockdown goes through ``windows_acl.apply_owner_only`` in-process, so the
+    observable is that call's
     arguments instead -- the same seam, one layer down, and still the only thing
     visible off Windows (NTFS reports 0o666 for any file regardless of its DACL,
     so no mode assertion can substitute).
@@ -2170,10 +2301,9 @@ class TestRestrictToOwnerArgvOnLinux:
         assert calls == [], f"no DACL write may happen when the SID is unknown: {calls}"
 
     def test_directory_grants_are_inheritable(self, tmp_path, monkeypatch):
-        # The bug this pins: make_owner_only_dir used to delegate to the
-        # FILE-shaped restrict_to_owner, whose grants are not inheritable. Those
+        # FILE-shaped restrict_to_owner grants are not inheritable: those
         # ACEs apply to the directory alone, so a file created inside an
-        # "owner-only" directory got no explicit ACE and fell back to the
+        # "owner-only" directory gets no explicit ACE and falls back to the
         # creating token's default DACL.
         calls = self._capture(monkeypatch)
         d = tmp_path / "secrets-dir"
@@ -2438,7 +2568,7 @@ class TestRestrictToOwner:
         # The fail-loud contract on Windows: a DACL that cannot be applied MUST
         # raise OSError so the caller's warn-and-continue handler fires
         # (dead-code otherwise, per review-bot). Simulate at the writer seam --
-        # there is no longer a subprocess to make un-launchable, and the failure
+        # there is no subprocess to make un-launchable, and the failure
         # this models (SetNamedSecurityInfoW returning ERROR_ACCESS_DENIED on a
         # file whose owner we cannot change) is not reproducible on demand.
         if not pc.IS_WINDOWS:
@@ -2456,8 +2586,8 @@ class TestRestrictToOwner:
 
 class TestResourceShimFailures:
     def test_proc_rss_bytes_returns_zero_when_every_source_fails(self, monkeypatch):
-        # getrusage is no longer the primary source for proc_rss_bytes -- it is
-        # the labelled last-resort peak -- so reaching 0 now needs BOTH the
+        # getrusage is not the primary source for proc_rss_bytes -- it is
+        # the labelled last-resort peak -- so reaching 0 needs BOTH the
         # current-RSS reader and the fallback to fail. Asserting only the
         # getrusage failure would pass on a platform whose primary reader was
         # silently removed.
@@ -3279,10 +3409,9 @@ class TestCurrentUserSidNeverSpawns:
     admission check, the client-side server check, and the pipe DACL builder --
     which runs once per pipe instance and so sits on the accept path.
 
-    It used to delegate to a helper whose fallback was a ``whoami`` subprocess
-    with a 5 s timeout, so a token-lookup failure stalled accepts for seconds at
-    a time, repeatedly. That helper is gone: the owner-only lockdown was its last
-    caller and now reads the token directly too, so no path here can spawn.
+    None of these can spawn: a ``whoami`` subprocess fallback with a 5 s timeout
+    would stall accepts for seconds at a time on a token-lookup failure, so the
+    builder reads the token directly and no path here spawns a subprocess.
     """
 
     @staticmethod
@@ -4160,7 +4289,7 @@ class TestTrustedGitBin:
 
 
 class TestKillAndReap:
-    """The shared kill-the-tree + bounded-pipe-draining-reap helper (#5989)."""
+    """The shared kill-the-tree + bounded-pipe-draining-reap helper."""
 
     @staticmethod
     def _proc(pid: int = 4242):
@@ -4322,9 +4451,486 @@ class TestKillAndReap:
         await started.wait()
         task.cancel()
         await asyncio.sleep(0)
-        task.cancel()  # the repeat cancellation that used to abort the reap
+        task.cancel()  # a repeat cancellation must not abort the reap
         await asyncio.sleep(0)
         release.set()
         with pytest.raises(asyncio.CancelledError):
             await task
         assert events == ["killed", "reap-started", "reaped"]
+
+
+class TestPublishDirNoreplace:
+    """Workspace installs must never replace a raced empty
+    destination -- POSIX os.rename silently replaces an empty directory, so
+    the publish goes through the no-replace rename primitive."""
+
+    def test_publishes_into_absent_destination(self, tmp_path):
+        src = tmp_path / ".ws.staging-abc"
+        src.mkdir()
+        (src / "f.txt").write_text("x", encoding="utf-8")
+        dst = tmp_path / "ws"
+        pc.publish_dir_noreplace(src, dst)
+        assert (dst / "f.txt").read_text(encoding="utf-8") == "x"
+        assert not src.exists()
+
+    def test_refuses_an_existing_empty_destination(self, tmp_path):
+        """The exact race: an EMPTY directory at the destination survives."""
+        src = tmp_path / ".ws.staging-abc"
+        src.mkdir()
+        (src / "f.txt").write_text("x", encoding="utf-8")
+        dst = tmp_path / "ws"
+        dst.mkdir()  # a racer's just-created empty dir
+        before = dst.stat().st_ino
+        with pytest.raises((FileExistsError, OSError)):
+            pc.publish_dir_noreplace(src, dst)
+        assert dst.stat().st_ino == before, "the racer's directory was replaced"
+        assert src.exists(), "the staged tree was consumed by a refused publish"
+
+    def test_refuses_non_sibling_paths(self, tmp_path):
+        src = tmp_path / "a" / ".ws.staging-abc"
+        src.mkdir(parents=True)
+        dst = tmp_path / "b" / "ws"
+        (tmp_path / "b").mkdir()
+        if pc.IS_WINDOWS:
+            pytest.skip("sibling contract is POSIX-only (Windows uses os.rename)")
+        with pytest.raises(ValueError):
+            pc.publish_dir_noreplace(src, dst)
+
+    def test_fallback_without_renameat2_publishes_and_still_refuses_occupied(
+        self, tmp_path, monkeypatch
+    ):
+        """A host without renameat2 (glibc < 2.28, NFS/FUSE)
+        must not crash with NotImplementedError -- the mkdir-claim fallback
+        publishes into an absent destination and still refuses an existing
+        one, preserving the no-replace guarantee for creation races."""
+        if pc.IS_WINDOWS:
+            pytest.skip("fallback is POSIX-only (Windows os.rename never replaces)")
+
+        def _unsupported(*args, **kwargs):
+            raise NotImplementedError("filesystem lacks atomic no-replace rename")
+
+        monkeypatch.setattr(pc, "rename_noreplace", _unsupported)
+
+        # Publishes into an absent destination.
+        src = tmp_path / ".ws.staging-abc"
+        src.mkdir()
+        (src / "f.txt").write_text("x", encoding="utf-8")
+        dst = tmp_path / "ws"
+        pc.publish_dir_noreplace(src, dst)
+        assert (dst / "f.txt").read_text(encoding="utf-8") == "x"
+        assert not src.exists()
+
+        # Refuses an existing EMPTY destination; nothing is consumed.
+        src2 = tmp_path / ".ws2.staging-abc"
+        src2.mkdir()
+        dst2 = tmp_path / "ws2"
+        dst2.mkdir()  # a racer's just-created empty dir
+        before = dst2.stat().st_ino
+        with pytest.raises(FileExistsError):
+            pc.publish_dir_noreplace(src2, dst2)
+        assert dst2.stat().st_ino == before, "the racer's directory was replaced"
+        assert src2.exists(), "the staged tree was consumed by a refused publish"
+
+    def test_fallback_rename_failure_drops_the_claim(self, tmp_path, monkeypatch):
+        """When the fallback's rename fails, the empty mkdir
+        claim is removed so a retry is not permanently blocked, and the
+        staged tree is not consumed."""
+        if pc.IS_WINDOWS:
+            pytest.skip("fallback is POSIX-only")
+
+        def _unsupported(*args, **kwargs):
+            raise NotImplementedError("filesystem lacks atomic no-replace rename")
+
+        monkeypatch.setattr(pc, "rename_noreplace", _unsupported)
+
+        real_rename = os.rename
+
+        def _failing_rename(src, dst, **kwargs):
+            raise OSError(errno.EXDEV, "simulated cross-device rename failure")
+
+        src = tmp_path / ".ws.staging-abc"
+        src.mkdir()
+        (src / "f.txt").write_text("x", encoding="utf-8")
+        dst = tmp_path / "ws"
+        monkeypatch.setattr(os, "rename", _failing_rename)
+        try:
+            with pytest.raises(OSError):
+                pc.publish_dir_noreplace(src, dst)
+        finally:
+            monkeypatch.setattr(os, "rename", real_rename)
+        assert not dst.exists(), (
+            "the failed fallback left an orphaned empty claim that would "
+            "permanently block retries"
+        )
+        assert (src / "f.txt").exists(), "the staged tree was consumed by a failed publish"
+
+
+class TestOpenLockFile:
+    """GH-9248: acquiring a lock must not truncate the file it locks."""
+
+    def test_preserves_existing_content(self, tmp_path):
+        # The defect shape: open(path, "w") truncates BEFORE the lock is
+        # held, so a contending process can observe an empty lock file
+        # mid-acquire. The helper must open the file without touching its
+        # bytes. Content is read while the fd is OPEN but not LOCKED, and
+        # again after release — on Windows msvcrt region locks are
+        # MANDATORY, so a read while the lock is held answers EACCES and
+        # would test the platform's locking semantics instead of the
+        # helper's non-truncation property.
+        lock = tmp_path / "x.lock"
+        lock.write_text("holder-pid 1234")
+        from kiro_crew.platform_compat import file_lock, open_lock_file
+
+        with open_lock_file(lock) as fd:
+            assert isinstance(fd, int)
+            assert lock.read_text() == "holder-pid 1234"  # open did not truncate
+            with file_lock(fd, exclusive=True):
+                pass  # lockable with content present
+        assert lock.read_text() == "holder-pid 1234"  # intact after release
+
+    def test_creates_missing_file_and_is_lockable(self, tmp_path):
+        lock = tmp_path / "sub" / "y.lock"
+        lock.parent.mkdir(parents=True)
+        from kiro_crew.platform_compat import flock_exclusive, open_lock_file
+
+        with open_lock_file(lock) as fd:
+            with flock_exclusive(fd):
+                pass
+        assert lock.exists()
+        assert lock.read_bytes() == b""
+
+    def test_no_lock_site_opens_truncating(self):
+        # CONTRACT (the work-ledger fix's test shape, applied fleet-wide): grep the source
+        # tree for a truncating open whose descriptor is handed to a
+        # file_lock-family acquire within the next two lines. Every site was
+        # converted to open_lock_file in this change; a new offender fails
+        # here with its file and line.
+        import kiro_crew
+
+        src_root = os.path.dirname(os.path.abspath(kiro_crew.__file__))
+        # deploy/pending.py and deploy/profiles.py are owned by an in-flight
+        # deploy-locks fix; drop the exemptions once it merges — the scan
+        # will then enforce those sites too.
+        exempt = {
+            os.path.join(src_root, "deploy", "pending.py"),
+            os.path.join(src_root, "deploy", "profiles.py"),
+        }
+        offenders = []
+        open_w = re.compile(r"""\bopen\([^)]*["']wb?["']\)""")
+        acquire = re.compile(r"\b(file_lock|flock_exclusive|acquire_lock)\(\s*\w+\.fileno\(\)")
+        for dirpath, _dirnames, filenames in os.walk(src_root):
+            for name in filenames:
+                if not name.endswith(".py"):
+                    continue
+                path = os.path.join(dirpath, name)
+                if path in exempt:
+                    continue
+                with open(path, encoding="utf-8", errors="replace") as fh:
+                    lines = fh.readlines()
+                for i, line in enumerate(lines):
+                    if not open_w.search(line):
+                        continue
+                    window = "".join(lines[i + 1 : i + 3])
+                    if acquire.search(window):
+                        offenders.append(f"{path}:{i + 1}")
+        assert not offenders, (
+            "lock files opened truncating before the acquire (GH-9248); "
+            "use platform_compat.open_lock_file: " + ", ".join(offenders)
+        )
+
+
+class TestLiveThreadGroupLeaders:
+    """``live_thread_group_leaders`` narrows liveness; it must fail OPEN."""
+
+    @pytest.mark.skipif(sys.platform != "linux", reason="/proc lists leaders on Linux only")
+    def test_own_process_is_a_leader(self):
+        leaders = pc.live_thread_group_leaders()
+        assert leaders is not None
+        assert os.getpid() in leaders
+
+    @pytest.mark.skipif(sys.platform != "linux", reason="tids share the pid space on Linux only")
+    def test_a_live_thread_is_not_a_leader(self):
+        """The whole point: a tid is signalable and has /proc, but is not a process.
+
+        Uses a real thread's native id rather than a synthetic ``/proc`` so the
+        assertion rests on kernel behaviour, not on a fixture's idea of it.
+        """
+        box: dict[str, int] = {}
+        captured = threading.Event()
+        release = threading.Event()
+
+        def _hold() -> None:
+            box["tid"] = threading.get_native_id()
+            captured.set()
+            release.wait(timeout=30)
+
+        holder = threading.Thread(target=_hold, daemon=True)
+        holder.start()
+        try:
+            assert captured.wait(timeout=30)
+            tid = box["tid"]
+            assert tid != os.getpid()
+            # Signalable and openable under /proc — the two things a naive check reads.
+            assert pc.pid_exists(tid) is True
+            leaders = pc.live_thread_group_leaders()
+            assert leaders is not None
+            assert tid not in leaders, "a non-leader tid must not appear in the /proc listing"
+            assert os.getpid() in leaders, "its group leader must still appear"
+        finally:
+            release.set()
+            holder.join(timeout=30)
+
+    def test_non_linux_fails_open(self, monkeypatch):
+        """Off Linux the question is unanswerable, so never claim 'thread'."""
+        monkeypatch.setattr(pc, "IS_LINUX", False)
+        assert pc.live_thread_group_leaders() is None
+
+    def test_unreadable_proc_fails_open(self, monkeypatch):
+        """An OSError reading /proc yields None (retain), never an empty set."""
+        monkeypatch.setattr(pc, "IS_LINUX", True)
+
+        def _boom(*_args, **_kwargs):
+            raise OSError("permission denied")
+
+        monkeypatch.setattr(pc.os, "listdir", _boom)
+        assert pc.live_thread_group_leaders() is None
+
+    def test_numberless_proc_fails_open(self, monkeypatch):
+        """A listing with no pids is nonsense, not 'every recorded pid is a thread'."""
+        monkeypatch.setattr(pc, "IS_LINUX", True)
+        monkeypatch.setattr(pc.os, "listdir", lambda *_a, **_k: ["cpuinfo", "meminfo", "self"])
+        assert pc.live_thread_group_leaders() is None
+
+
+class TestIsThreadGroupLeader:
+    """The per-pid re-read, for a pid a host-wide snapshot answers wrongly."""
+
+    @pytest.mark.skipif(sys.platform != "linux", reason="/proc carries Tgid on Linux only")
+    def test_own_process_is_a_leader(self):
+        assert pc.is_thread_group_leader(os.getpid()) is True
+
+    @pytest.mark.skipif(sys.platform != "linux", reason="tids share the pid space on Linux only")
+    def test_a_live_thread_is_not_a_leader(self):
+        """The whole point: a signalable tid must answer False, not None."""
+        box: dict[str, int] = {}
+        captured = threading.Event()
+        release = threading.Event()
+
+        def _hold() -> None:
+            box["tid"] = threading.get_native_id()
+            captured.set()
+            release.wait(timeout=30)
+
+        holder = threading.Thread(target=_hold, daemon=True)
+        holder.start()
+        try:
+            assert captured.wait(timeout=30), "helper thread never reported its tid"
+            tid = box["tid"]
+            assert tid != os.getpid()
+            assert pc.pid_exists(tid) is True, "a tid is signalable -- that is the trap"
+            assert pc.is_thread_group_leader(tid) is False
+        finally:
+            release.set()
+            holder.join(timeout=30)
+
+    def test_non_linux_is_unknowable(self, monkeypatch):
+        monkeypatch.setattr(pc, "IS_LINUX", False)
+        assert pc.is_thread_group_leader(os.getpid()) is None
+
+    def test_missing_status_is_unknowable(self, monkeypatch):
+        """A pid that has gone must not read as 'not a process'."""
+        monkeypatch.setattr(pc, "IS_LINUX", True)
+
+        def _boom(*_a, **_k):
+            raise FileNotFoundError("no such pid")
+
+        monkeypatch.setattr("builtins.open", _boom)
+        assert pc.is_thread_group_leader(4242) is None
+
+    def test_malformed_status_is_unknowable(self, monkeypatch):
+        """A status file with no parsable Tgid answers None, never False."""
+        import io
+
+        monkeypatch.setattr(pc, "IS_LINUX", True)
+        monkeypatch.setattr(
+            "builtins.open", lambda *_a, **_k: io.StringIO("Name:\tx\nTgid:\tnotanumber\n")
+        )
+        assert pc.is_thread_group_leader(4242) is None
+
+
+class TestOwnerOnlyDaclIsIdempotent:
+    """The lockdown must probe before writing, and must fail TOWARD writing.
+
+    Applying an owner-only DACL to a DIRECTORY carries inheritable ACEs, which
+    Windows propagates to every descendant, so the write is O(descendants) --
+    measured 0.238 ms per object, i.e. 2.94 s on a 12358-object data home, paid on
+    every gateway boot because ``vector_memory.init()`` locks down the whole home.
+    Reading this object's own descriptor is O(1), so an unchanged DACL should cost
+    a constant check.
+
+    These run on the POSIX matrix (the seam is the ``windows_acl`` call, which is
+    what the suite can observe off Windows), and they pin BOTH directions: the skip
+    must happen when it is safe, and must NOT happen when anything differs.
+    """
+
+    @staticmethod
+    def _capture(monkeypatch, *, matches, sid="S-1-5-21-1-2-3-1000"):
+        """Force the Windows branch; record probe questions and DACL writes."""
+        monkeypatch.setattr(pc, "IS_POSIX", False)
+        monkeypatch.setattr(pc, "IS_WINDOWS", True)
+        monkeypatch.setattr(pc, "_TOKEN_SID_CACHE", [])
+        monkeypatch.setattr(pc, "current_user_sid", lambda: sid)
+        probed: list[dict] = []
+        written: list[dict] = []
+
+        def fake_probe(path, *, inherit, sids, **_kw):
+            probed.append({"path": os.fspath(path), "inherit": inherit, "sids": tuple(sids)})
+            if isinstance(matches, Exception):
+                raise matches
+            return matches
+
+        def fake_apply(path, *, inherit, sids, **_kw):
+            written.append({"path": os.fspath(path), "inherit": inherit, "sids": tuple(sids)})
+
+        monkeypatch.setattr(pc.windows_acl, "owner_only_dacl_matches", fake_probe)
+        monkeypatch.setattr(pc.windows_acl, "apply_owner_only", fake_apply)
+        return probed, written
+
+    def test_an_already_correct_dacl_is_not_rewritten(self, tmp_path, monkeypatch):
+        # The whole point: the O(descendants) propagation must not run when the
+        # descriptor already says what we would write.
+        probed, written = self._capture(monkeypatch, matches=True)
+        d = tmp_path / "home"
+        d.mkdir()
+        pc.restrict_dir_to_owner(d)
+        assert len(probed) == 1, probed
+        assert written == [], "an unchanged DACL must not be re-applied"
+
+    def test_a_mismatched_dacl_is_still_written(self, tmp_path, monkeypatch):
+        # Guards the failure mode that would make this change a security bug:
+        # the skip must never swallow a write that is actually needed.
+        probed, written = self._capture(monkeypatch, matches=False)
+        d = tmp_path / "home"
+        d.mkdir()
+        pc.restrict_dir_to_owner(d)
+        assert len(probed) == 1, probed
+        assert len(written) == 1, written
+        assert written[0]["inherit"] is True
+
+    def test_a_probe_that_raises_is_treated_as_a_mismatch(self, tmp_path, monkeypatch):
+        # Fail-safe direction: an unanswerable probe costs a redundant write,
+        # never a skipped lockdown.
+        probed, written = self._capture(monkeypatch, matches=OSError("descriptor unreadable"))
+        d = tmp_path / "home"
+        d.mkdir()
+        pc.restrict_dir_to_owner(d)
+        assert len(probed) == 1, probed
+        assert len(written) == 1, "a probe failure must fall back to writing"
+
+    def test_the_probe_is_asked_about_exactly_what_would_be_written(self, tmp_path, monkeypatch):
+        # If the probe were asked a different question than the write answers, a
+        # match could authorise skipping a DACL that does not exist yet.
+        probed, written = self._capture(monkeypatch, matches=False)
+        f = tmp_path / "secret.key"
+        f.write_bytes(b"s" * 32)
+        pc.restrict_to_owner(f)
+        assert len(probed) == 1 and len(written) == 1
+        assert probed[0] == written[0], (probed[0], written[0])
+        # File shape, so the grants must NOT be inheritable.
+        assert probed[0]["inherit"] is False
+        assert probed[0]["sids"] == ("S-1-3-4", "S-1-5-21-1-2-3-1000")
+
+
+class TestOwnerOnlyDaclMatchesIsConservative:
+    """``windows_acl.owner_only_dacl_matches`` must never answer True on doubt."""
+
+    # (ace_type, ace_flags, mask, sid) as the ctypes half parses them.
+    _PROTECTED = 0x1000
+    _ALLOWED = 0
+    _OI_CI = 0x01 | 0x02
+    _ALL = 0x001F01FF
+    _SIDS = ("S-1-3-4", "S-1-5-21-1-2-3-1000")
+
+    def _dir_aces(self):
+        return [(self._ALLOWED, self._OI_CI, self._ALL, s) for s in self._SIDS]
+
+    def _matches(self, **over):
+        kw = {
+            "control": self._PROTECTED,
+            "aces": self._dir_aces(),
+            "inherit": True,
+            "sids": self._SIDS,
+        }
+        kw.update(over)
+        return pc.windows_acl.owner_only_dacl_matches_parsed(**kw)
+
+    def test_the_exact_shipped_shape_matches(self):
+        # The positive case. Without this, every rule below could pass by always
+        # answering False and the probe would be a no-op that never skips.
+        assert self._matches() is True
+
+    def test_order_does_not_matter(self):
+        # The kernel may normalise ACE order; the grant SET is the policy.
+        assert self._matches(aces=list(reversed(self._dir_aces()))) is True
+
+    def test_an_unprotected_dacl_never_matches(self):
+        # Inheritance not stripped: applying PROTECTED would still change it.
+        assert self._matches(control=0) is False
+
+    def test_a_missing_grant_never_matches(self):
+        assert self._matches(aces=self._dir_aces()[:1]) is False
+
+    def test_an_extra_grant_never_matches(self):
+        extra = self._dir_aces() + [(self._ALLOWED, self._OI_CI, self._ALL, "S-1-1-0")]
+        assert self._matches(aces=extra) is False
+
+    def test_a_different_principal_never_matches(self):
+        aces = self._dir_aces()
+        aces[1] = (self._ALLOWED, self._OI_CI, self._ALL, "S-1-1-0")
+        assert self._matches(aces=aces) is False
+
+    def test_a_deny_ace_never_matches(self):
+        aces = self._dir_aces()
+        aces[0] = (1, self._OI_CI, self._ALL, self._SIDS[0])  # ACCESS_DENIED
+        assert self._matches(aces=aces) is False
+
+    def test_a_narrower_mask_never_matches(self):
+        aces = self._dir_aces()
+        aces[0] = (self._ALLOWED, self._OI_CI, 0x120089, self._SIDS[0])  # read-ish
+        assert self._matches(aces=aces) is False
+
+    def test_directory_shape_rejects_non_inheritable_grants(self):
+        # inherit=True wants (OI)(CI); a file-shaped ACE would leave children
+        # uncovered, so it must not read as already correct.
+        assert self._matches(aces=[(self._ALLOWED, 0, self._ALL, s) for s in self._SIDS]) is False
+
+    def test_file_shape_rejects_inheritable_grants(self):
+        # The mirror: inherit=False wants no inheritance flags.
+        assert self._matches(inherit=False) is False
+
+    def test_file_shape_matches_its_own_flags(self):
+        assert (
+            self._matches(
+                inherit=False, aces=[(self._ALLOWED, 0, self._ALL, s) for s in self._SIDS]
+            )
+            is True
+        )
+
+    def test_an_unresolvable_sid_never_matches(self):
+        aces = self._dir_aces()
+        aces[0] = (self._ALLOWED, self._OI_CI, self._ALL, "")
+        assert self._matches(aces=aces) is False
+
+    def test_no_grants_never_matches(self, tmp_path):
+        # apply_owner_only refuses an empty grant set, so "matches" is meaningless
+        # here; answering True would skip a lockdown that never happened.
+        assert self._matches(aces=[], sids=()) is False
+        assert pc.windows_acl.owner_only_dacl_matches(tmp_path, inherit=True, sids=()) is False
+
+    def test_an_unavailable_platform_api_never_matches(self, tmp_path):
+        # Off Windows there is no descriptor to compare. This is the case the whole
+        # POSIX matrix exercises, and it must read as "write", not "already correct".
+        assert (
+            pc.windows_acl.owner_only_dacl_matches(tmp_path, inherit=True, sids=("S-1-3-4",))
+            is False
+        )

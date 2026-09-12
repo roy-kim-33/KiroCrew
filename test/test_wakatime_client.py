@@ -14,7 +14,11 @@ from typing import Any
 import aiohttp
 import pytest
 
-from kiro_crew.wakatime.client import WakaTimeAuthError, WakaTimeClient
+from kiro_crew.wakatime.client import (
+    WakaTimeAuthError,
+    WakaTimeClient,
+    WakaTimeUnavailableError,
+)
 
 pytestmark = pytest.mark.asyncio
 
@@ -126,6 +130,66 @@ async def test_transport_error_degrades_to_empty() -> None:
     session = _FakeSession([aiohttp.ClientError("boom")])
     client = _client_with(session)
     assert await client.get_durations("2026-09-03") == []
+
+
+async def test_fetch_summaries_returns_data_on_success() -> None:
+    session = _FakeSession([_FakeResp(200, {"data": [{"grand_total": {"hours": 3}}]})])
+    client = _client_with(session)
+    result = await client.fetch_summaries("2026-09-01", "2026-09-03")
+    assert result == [{"grand_total": {"hours": 3}}]
+
+
+async def test_fetch_summaries_returns_empty_on_genuine_empty_2xx() -> None:
+    session = _FakeSession([_FakeResp(200, {"data": []})])
+    client = _client_with(session)
+    assert await client.fetch_summaries("2026-09-01", "2026-09-03") == []
+
+
+async def test_fetch_summaries_raises_on_transport_error() -> None:
+    session = _FakeSession([aiohttp.ClientError("boom")])
+    client = _client_with(session)
+    with pytest.raises(WakaTimeUnavailableError):
+        await client.fetch_summaries("2026-09-01", "2026-09-03")
+
+
+async def test_fetch_summaries_raises_on_server_error() -> None:
+    session = _FakeSession([_FakeResp(500)])
+    client = _client_with(session)
+    with pytest.raises(WakaTimeUnavailableError):
+        await client.fetch_summaries("2026-09-01", "2026-09-03")
+
+
+async def test_fetch_summaries_raises_when_response_has_no_data_list() -> None:
+    # _api coerces a 200 with a non-JSON body to {}, which carries no data list;
+    # a self-hosted backend behind a proxy can return an HTML 200. That must be a
+    # failure, not a false-empty export.
+    session = _FakeSession([_FakeResp(200, {})])
+    client = _client_with(session)
+    with pytest.raises(WakaTimeUnavailableError):
+        await client.fetch_summaries("2026-09-01", "2026-09-03")
+
+
+async def test_fetch_stats_returns_data_dict_on_success() -> None:
+    session = _FakeSession([_FakeResp(200, {"data": {"languages": [{"name": "Python"}]}})])
+    client = _client_with(session)
+    result = await client.fetch_stats("last_7_days")
+    assert result == {"languages": [{"name": "Python"}]}
+
+
+async def test_fetch_stats_raises_on_server_error() -> None:
+    session = _FakeSession([_FakeResp(500)])
+    client = _client_with(session)
+    with pytest.raises(WakaTimeUnavailableError):
+        await client.fetch_stats("last_7_days")
+
+
+async def test_fetch_stats_raises_when_response_has_no_data_dict() -> None:
+    # A non-JSON 200 coerces to {} in _api; no data dict means failure, not a
+    # false-empty stats payload.
+    session = _FakeSession([_FakeResp(200, {})])
+    client = _client_with(session)
+    with pytest.raises(WakaTimeUnavailableError):
+        await client.fetch_stats("last_7_days")
 
 
 async def test_verify_raises_on_rejected_key() -> None:

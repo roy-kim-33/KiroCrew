@@ -139,6 +139,14 @@ export interface StatusData {
   yolo_duration?: '30m' | '1h' | '6h' | '12h' | '24h' | 'until_shutdown'
   /** Whether enterprise governance currently allows the until_shutdown option. */
   yolo_until_shutdown_permitted?: boolean
+  /** Auto-approve modes forbidden by the `approval_modes` policy scope. Today the
+   * scope governs `yolo` only, so this is `['yolo']` or empty; `normal`, `trust`
+   * and `trust_reads` are non-deniable and never appear. The approval-mode picker
+   * HIDES each named mode, except one still selected when the policy lands — that
+   * row stays visible and disabled, so the button label always has a matching row.
+   * Absent/empty means every mode is selectable. List-driven so widening the
+   * scope's vocabulary needs no type change. */
+  disabled_approval_modes?: string[]
   no_crons?: boolean
   /** True when the gateway has a live Slack (Socket Mode) connection. */
   slack_connected?: boolean
@@ -384,6 +392,8 @@ export interface SessionTrashResult {
 }
 
 export interface CronJob {
+  member_id?: string
+  memory_store?: string
   id: string; name: string; message: string
   enabled: boolean; schedule: string; last_status: string
   cron_expr?: string | null; every?: number | null; every_secs?: number | null
@@ -396,6 +406,10 @@ export interface CronJob {
   /** When true, this cron's runs do not appear as a chat session in the active
    * session list (results still go to Slack/notifications + History). Default false. */
   hide_in_chat?: boolean
+  /** When true, omit optional saved context and prior session history. V1 also
+   * skips its memory, lessons, steering and skills injection; member V2 retains
+   * its complete essential guidance and protected identity. Default false. */
+  minimal_context?: boolean
   last_run_ts?: number; next_run_ts?: number | null; has_result?: boolean; has_slot?: boolean
   /** IANA timezone the cron expression's hour/minute fields are stored in.
    * Absent / null for legacy jobs created without an explicit TZ — treat as UTC. */
@@ -418,10 +432,105 @@ export interface CronJob {
    * which is invisible to every chat session and manageable only from the
    * Schedule page or the CLI. */
   session_key?: string | null
+  /** Schedule-page template preset id this job was seeded from (e.g.
+   * "error-digest"), or null/absent for a blank create or any non-dashboard
+   * create surface. Compared against the live SCHEDULE_PRESETS catalog on the
+   * Schedule page to hint when the source template's prompt has since changed. */
+  source_preset?: string | null
+  /** The source template's prompt text as it was when this job was saved. The
+   * Schedule page compares THIS against the live template prompt (did the
+   * template move?), never the job's current message (which the user may have
+   * edited), so the "template updated" hint is attributable. Null/absent when
+   * the job carries no template lineage. */
+  source_template_prompt?: string | null
 }
 
 export interface Lesson {
   rule: string; category: string; ts: string
+}
+
+/** One row of `GET /api/memory/stores` — a declared memory store.
+ *
+ *  Every count is BEST-EFFORT. A store whose file is missing or unreadable
+ *  answers `exists: false` with null counts instead of failing the listing, so
+ *  one damaged silo cannot hide every healthy one from the picker. `null`
+ *  therefore means "not known" and must never be rendered as zero.
+ */
+export interface MemoryStoreSummary {
+  /** Declared name. `'default'` addresses the global store. */
+  name: string
+  owner_member?: string
+  /** The owner's validated avatar override; use owner_member as its exact seed. */
+  owner_avatar?: unknown
+  memory_version?: number | null
+  is_default: boolean
+  /** `'v1'` is the shared schema every install starts on; `'crew'` is the
+   *  faceted per-silo schema. Typed open so a lineage added later still
+   *  renders instead of falling through a closed union. */
+  lineage: 'v1' | 'crew' | string
+  exists: boolean
+  semantic_count: number | null
+  episodic_count: number | null
+  lessons_count: number | null
+  /** Whether carve facets apply. False on the v1 lineage, whose rows carry no
+   *  facet columns at all — which is a different answer from "no rows". */
+  facets_supported: boolean
+  backup_count: number | null
+  /** ISO-8601 UTC, or null when the store has never been backed up. */
+  newest_backup: string | null
+}
+
+/** One row of `GET /api/memory/retired` — an episode a semantic write superseded.
+ *
+ *  Nothing hard-deletes an episode, so the text survives and the row can be put
+ *  back. `retired_times` counts retirements rather than rows, because an episode
+ *  can be retired, restored and retired again.
+ */
+export interface RetiredMemory {
+  id: string
+  text: string
+  /** Key of the semantic entry that superseded it; empty when unrecorded. */
+  superseded_by?: string
+  retired_times?: number
+  /** ISO-8601 stamp of the MOST RECENT retirement. */
+  ts?: string
+}
+
+/** One row of `GET /api/memory/backups`.
+ *
+ *  `name` is the only handle a restore takes. The route returns no filesystem
+ *  path on purpose: that would hand the browser the data-home layout.
+ */
+export interface MemoryBackup {
+  name: string
+  size_bytes: number
+  /** ISO-8601 UTC, read from the stamped file name rather than the file's mtime,
+   *  which a copy or a restore rewrites while the name still says when the
+   *  contents were taken. */
+  taken_at: string
+}
+
+/** One row of a carve page (`GET /api/memory/carve` with no `count_by`).
+ *
+ *  The embedding and `value_json` are absent from the wire by design, so a
+ *  carve hands back a partition rather than a vector.
+ */
+export interface MemoryCarveEntry {
+  id: string
+  kind: string
+  key?: string
+  text?: string
+  tags?: string
+  importance?: number
+  confidence?: number
+  source?: string
+  created_at?: string
+  updated_at?: string
+  scope?: string
+  surface?: string
+  crew?: string
+  session_key?: string
+  derived_from?: string
 }
 
 export interface Skill {
@@ -773,6 +882,15 @@ export interface TodoList {
 export interface McpSessionReport {
   /** Server names Kiro Crew put on the wire for this session. */
   configured: string[]
+  /**
+   * Agent-spec `@server` tool refs that named no server this session receives.
+   *
+   * A different claim from every bucket below: those say what a *configured*
+   * server reported, this says the spec asked for one that was never
+   * configured — so it has no row here to be missing from. Optional because a
+   * gateway from before the guard shipped sends no such key.
+   */
+  unresolved_refs?: string[]
   /** Reported initialized. */
   ready: string[]
   /** Reported a startup failure. */
@@ -872,6 +990,13 @@ export interface ChatSlot {
    *  the absence of an answer, never a denial. DISPLAY only — the pin is
    *  deliberately kept when withheld, so this must not drive a write. */
   model_withheld?: boolean | null
+  /** The model id the live session actually resolved to; `''`/absent when not
+   *  known. A slot with no pin — or one whose pin was withheld — runs on the
+   *  backend's own choice, which the pin cannot name, so this is what lets a
+   *  chip say the model instead of `auto`. DISPLAY only, like
+   *  `model_withheld`: it describes the session, so it must not drive a
+   *  write. */
+  served_model?: string
   /** Remote-execution binding. `executor` is "local" for an ordinary session and
    *  "remote" for one whose turns run on a connected crew; `instance_id` names
    *  that crew. The backend ships BOTH on every slot so "runs locally" is a
@@ -881,7 +1006,7 @@ export interface ChatSlot {
    *  inside a request routed back through that instance. */
   executor?: 'local' | 'remote'
   instance_id?: string
-  key: string; title?: string; messages: number; running: boolean; stopping?: boolean; pending_approval?: boolean; created?: string; last_ts?: string; last_turn_ts?: string; last_message?: string; agent?: string; model?: string; reasoning_effort?: string; mode?: string; surface?: string; workspace?: string; trust?: boolean; trust_reads?: boolean; folder_id?: string; pinned?: boolean; tags?: string[]; links?: SessionLink[]; slack_linked?: boolean; slack_channel?: string; slack_thread_ts?: string; color_index?: number | null; color_hex?: string | null; memory_mode?: 'persistent' | 'incognito' | 'temporary'; clean_mode?: boolean; project?: string; forked_from?: string | null; source_links?: { provider: SourceProviderId; number: number; url: string; label?: string; repo?: string; ci?: 'running' | 'passed' | 'failed' | null; state?: 'open' | 'draft' | 'merged' | 'closed'; mergeable?: string; mergeStateStatus?: string; kind?: 'change' | 'issue' }[]; source_links_total?: number
+  key: string; title?: string; messages: number; running: boolean; stopping?: boolean; pending_approval?: boolean; created?: string; last_ts?: string; last_turn_ts?: string; last_message?: string; agent?: string; model?: string; reasoning_effort?: string; mode?: string; surface?: string; workspace?: string; trust?: boolean; trust_reads?: boolean; folder_id?: string; pinned?: boolean; tags?: string[]; tags_revision?: string; links?: SessionLink[]; slack_linked?: boolean; slack_channel?: string; slack_thread_ts?: string; color_index?: number | null; color_hex?: string | null; memory_mode?: 'persistent' | 'incognito' | 'temporary'; project?: string; forked_from?: string | null; source_links?: { provider: SourceProviderId; number: number; url: string; label?: string; repo?: string; ci?: 'running' | 'passed' | 'failed' | null; state?: 'open' | 'draft' | 'merged' | 'closed'; mergeable?: string; mergeStateStatus?: string; kind?: 'change' | 'issue' }[]; source_links_total?: number
   /** Provenance bucket from the backend `SlotOrigin` ("user" | "app" | "cron"
    * | "system"; absent/"" for untagged background slots). The session-pulse
    * survey shows only on a "user" slot, so an imported Slack thread, a
@@ -907,6 +1032,12 @@ export interface ChatSlot {
    * `waiting_for_input` (true of every finished turn, and therefore no signal)
    * and separate from `pending_approval` (a tool gate). */
   needs_input?: boolean
+  /** A buried [OPTIONS:] decision: an earlier assistant turn offered choices
+   * and a later option-less reply (a monitor-loop cycle, typically) shadowed
+   * the composer chips, with no human row in between. Derived server-side from
+   * the transcript on every push — null/absent when nothing is owed. `ts`
+   * names the options row for `api.dismissPendingDecision`. */
+  pending_decision?: PendingDecision | null
   /** The transcript shows the last turn ending without a reply (trailing error
    * row or unanswered user row) — the state behind the composer's Resume
    * button. Always false while `running`. Lets the sidebar stop rendering a
@@ -1234,6 +1365,16 @@ export interface PendingApproval {
   request_id: string
 }
 
+/** The slot payload's buried [OPTIONS:] decision (see `ChatSlot.pending_decision`). */
+export interface PendingDecision {
+  /** The choices the buried marker offered, in order. */
+  options?: string[]
+  /** The options turn's text with the marker stripped, capped server-side. */
+  excerpt?: string
+  /** Transcript ts of the options row — the identity a dismissal names. */
+  ts?: string
+}
+
 export interface SubagentInfo {
   id: string; task: string; done: boolean; error?: string; result?: string
 }
@@ -1290,6 +1431,18 @@ export interface ArtifactPublication {
   published_by: string
   /** Conflict / sync-failure message surfaced to the UI; empty when healthy. */
   last_error: string
+  /** Publish SUCCEEDED but the link is not usable yet (e.g. CloudFront still
+   *  rolling out). NOT an error — rendered as a neutral/warn line beside the
+   *  link, never in the danger surface `last_error` drives. Empty when the link
+   *  is already reachable. */
+  notice: string
+  /** Machine discriminator for `notice`, so the UI can pick the right copy
+   *  instead of assuming every notice is "still rolling out". One of
+   *  `"rolling_out"` | `"distribution_disabled"` | `"unknown"`, or empty when
+   *  there is no notice. The frontend selects its string from this and falls
+   *  back to a generic (no time promise) line for an unrecognised value.
+   *  Optional so an older gateway that omits it reads as "". */
+  notice_code?: string
 }
 
 /** A publishing provider's self-described capabilities for a given artifact kind,
@@ -1303,6 +1456,10 @@ export interface PublishProviderDescriptor {
   /** False => tooling not installed yet; installs automatically on first publish.
    *  Optional: older gateways omit it (treat as available). */
   available?: boolean
+  /** The provider's own remedy text for `available: false` -- which action makes it
+   *  available. Optional: older gateways omit it, and a row with no hint simply shows
+   *  none rather than inventing one. */
+  install_hint?: string
   sharing_model: {
     supports_private: boolean
     supports_shared: boolean

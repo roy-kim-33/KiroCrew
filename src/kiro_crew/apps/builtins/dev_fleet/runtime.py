@@ -13,7 +13,7 @@ import sys
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from kiro_crew import platform_compat
 from kiro_crew.apps.builtins.dev_fleet import npm_preflight, sync_runner
@@ -60,7 +60,7 @@ _RUN_DEADLINE_S = 1800
 #                    ``prov.has_dist``, both plain filesystem checks) may be
 #                    called. True on every platform unless the import failed.
 #   _POD_AVAILABLE — pods can actually RUN here, i.e. Linux with ``systemctl``.
-# Conflating the two used to report every worktree as "not built" off Linux,
+# Conflating the two reports every worktree as "not built" off Linux,
 # even though the build state is knowable everywhere.
 _POD_IMPORTED = False
 _POD_AVAILABLE = False
@@ -330,10 +330,10 @@ def _bin_override_var(name: str) -> str:
 def _unresolved_tool_message(name: str) -> str:
     """User-facing message for an unresolved trusted tool.
 
-    Blames the HOST toolchain, not the checkout (issue #2530: the previous
-    wording folded this failure into "git worktree discovery failed in
-    <repo>", sending users to debug a healthy repository), and names the
-    operator remedy in the same voice as the missing-checkout branch. The
+    Blames the HOST toolchain, not the checkout (folding this failure into
+    "git worktree discovery failed in <repo>" sends users to debug a healthy
+    repository), and names the operator remedy in the same voice as the
+    missing-checkout branch. The
     trusted-PATH detail stays in the log line, not here: it is unactionable
     noise in a UI banner.
     """
@@ -590,8 +590,8 @@ def _kill_tree_sync(pid: int) -> None:
         try:
             platform_compat.kill_process_tree(child)
         except (ProcessLookupError, OSError, ValueError):
-            # Already reaped by the group kill, or a pid we may no longer
-            # signal — the primary kill has happened either way.
+            # Already reaped by the group kill, or a pid we may not be able
+            # to signal — the primary kill has happened either way.
             continue
 
 
@@ -616,7 +616,7 @@ _ACTIVE_RUNS: dict[str, tuple[asyncio.Task, Any]] = {}
 # there is no risk of asyncio lock contention or done-callback deadlocks.
 # LoopBoundLock (not a bare asyncio.Lock) because a module-global primitive
 # binds to the import-time loop and raises RuntimeError from any other loop
-# (Python 3.10+, see #4800) — this module is imported once but serves
+# (Python 3.10+) — this module is imported once but serves
 # whichever loop the gateway runs.
 _SHUTDOWN_ADMISSION_LOCK = LoopBoundLock()
 _SHUTDOWN_IN_PROGRESS = False
@@ -698,11 +698,18 @@ async def _start_run(
     cwd: str | None = None,
     env: dict | None = None,
     cleanup_paths: list[str] | None = None,
+    on_finish: Callable[[], None] | None = None,
 ) -> str:
     """Start a background subprocess with output streaming and watchdog.
 
     ``cleanup_paths``: sandbox launcher/profile temp files from
     ``sandboxed_spawn_argv`` — deleted when the run finishes.
+
+    ``on_finish``: invoked once when the run reaches ANY terminal state
+    (done, timeout, spawn failure, shutdown abort, cancellation) — a killed
+    run may still have mutated disk, so terminal means finished, not
+    succeeded. Must be a cheap synchronous callable; exceptions are logged
+    and never propagate into the worker's own cleanup.
     """
     rid = uuid.uuid4().hex[:12]
     # The run KIND, captured before the output loop can touch it. `label` is
@@ -906,6 +913,11 @@ async def _start_run(
                 _RUNS[rid]["exit_code"] = -1
                 _RUNS[rid]["output"].append("[error] " + str(exc))
         finally:
+            if on_finish is not None:
+                try:
+                    on_finish()
+                except Exception:  # noqa: BLE001
+                    logger.exception("run %s on_finish callback failed", rid)
             for cp in cleanup_paths or []:
                 # A caller may register a temp FILE, or a temp directory it
                 # created for one (the dependency-only sync stages a snapshot

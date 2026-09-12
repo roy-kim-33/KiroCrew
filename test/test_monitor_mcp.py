@@ -9,9 +9,15 @@ from kiro_crew import mcp_core, session_directive
 from kiro_crew.mcp_tools import control
 
 
+def test_monitor_watch_does_not_offer_an_unenforced_evidence_scope():
+    schema = next(item for item in control.schemas() if item["name"] == "monitor_watch")
+
+    assert "evidence_scope" not in schema["inputSchema"]["properties"]
+
+
 def test_monitor_watch_is_stateless_and_canonical(gateway_posts):
     with patch("kiro_crew.mcp_core._resolve_session_key_strict", return_value="dashboard:chat-1"):
-        result = control.monitor_watch(
+        result = mcp_core._call_tool(
             "monitor_watch",
             {
                 "kind": "github_pull_request",
@@ -28,7 +34,11 @@ def test_monitor_watch_is_stateless_and_canonical(gateway_posts):
     # BOTH halves of the delivery contract: the marker above, and the
     # out-of-band record parked for a consumer that never sees the marker —
     # carrying the same canonicalized payload the marker carries.
-    assert gateway_posts == [("/api/session-directive", {"kind": "monitor_watch", "args": args})]
+    # The CALL is reported (tool + raw args); the gateway derives the record.
+    assert len(gateway_posts) == 1
+    assert gateway_posts[0][0] == "/api/session-directive"
+    assert gateway_posts[0][1]["tool"] == "monitor_watch"
+    assert gateway_posts[0][1]["raw_args"]["target"] == "https://www.github.com/acme/widgets/pull/7"
 
 
 def test_monitor_watch_rejects_native_subagent_binding(gateway_posts):
@@ -64,7 +74,7 @@ def test_monitor_watch_rejects_webex_while_finite_legacy_loop_remains_available(
                 "objective": "review_ready",
             },
         )
-        legacy = control.monitor_start(
+        legacy = mcp_core._call_tool(
             "monitor_start",
             {
                 "message": "Check the pull request and stop when ready.",
@@ -86,8 +96,8 @@ def test_monitor_watch_rejects_webex_while_finite_legacy_loop_remains_available(
     assert legacy_args["max_cycles"] == 24
     assert legacy_args["max_runtime_secs"] == 14_400
     # Only the accepted legacy loop publishes; the three refusals park nothing.
-    assert gateway_posts == [
-        ("/api/session-directive", {"kind": "monitor_start", "args": legacy_args})
+    assert [(p, b["tool"]) for p, b in gateway_posts] == [
+        ("/api/session-directive", "monitor_start")
     ]
 
 
@@ -181,9 +191,13 @@ def test_monitor_inspect_passes_strict_identity_without_fallback():
                     "kind": "github_pull_request",
                     "created_ts": 123.0,
                     "wake_count": 3,
+                    "token_usage_known": False,
                     "wake_instructions": "large prompt omitted from inspect",
                     "last_wake_reason_code": "checks_failed",
                     "user_stop_reason": "operator stopped",
+                    "last_observation_status": "pending",
+                    "last_observation_reason_code": "checks_pending",
+                    "last_observation_summary": "Two checks are pending.",
                     "last_observation": {
                         "head_revision": "abc123",
                         "checks": {"passed": [f"check-{index}" for index in range(20)]},
@@ -201,6 +215,10 @@ def test_monitor_inspect_passes_strict_identity_without_fallback():
     assert payload["monitor"]["wake_count"] == 3
     assert payload["monitor"]["last_wake_reason_code"] == "checks_failed"
     assert payload["monitor"]["user_stop_reason"] == "operator stopped"
+    assert payload["monitor"]["token_usage_known"] is False
+    assert payload["monitor"]["last_observation_status"] == "pending"
+    assert payload["monitor"]["last_observation_reason_code"] == "checks_pending"
+    assert "last_observation_summary" not in payload["monitor"]
     assert payload["monitor"]["observation"]["checks"]["passed_count"] == 20
     assert "wake_instructions" not in payload["monitor"]
     assert "check-0" not in result
@@ -224,3 +242,56 @@ def test_monitor_inspect_reports_internal_read_failure_as_error():
         result = control.monitor_inspect("monitor_inspect", {})
 
     assert result == "Error: Monitor inspection failed: gateway unavailable"
+
+
+def test_monitor_inspect_surfaces_armed_autonudge_loop():
+    """monitor_inspect must let a caller see an armed auto-nudge loop.
+
+    The gateway reports ``monitor: None`` (no structured monitor) together with
+    a truthful ``autonudge_loop`` reading; the compact projection must pass that
+    reading through so the caller can tell armed-auto-nudge from nothing armed.
+    """
+    with (
+        patch("kiro_crew.mcp_core._resolve_session_key_strict", return_value="dashboard:chat-1-1"),
+        patch(
+            "kiro_crew.mcp_core._get",
+            return_value={
+                "enabled": True,
+                "monitor": None,
+                "autonudge_loop": {
+                    "id": "lp-9",
+                    "active": True,
+                    "idle_secs": 300,
+                    "cycle_count": 4,
+                    "last_fire_ts": 123.0,
+                },
+            },
+        ),
+    ):
+        result = control.monitor_inspect("monitor_inspect", {})
+
+    payload = json.loads(result)
+    assert payload["monitor"] is None
+    assert payload["autonudge_loop"] == {
+        "id": "lp-9",
+        "active": True,
+        "idle_secs": 300,
+        "cycle_count": 4,
+        "last_fire_ts": 123.0,
+    }
+
+
+def test_monitor_inspect_reports_no_loop_distinctly_from_armed():
+    """The no-loop reading carries ``autonudge_loop: None``, distinct from armed."""
+    with (
+        patch("kiro_crew.mcp_core._resolve_session_key_strict", return_value="dashboard:chat-1-1"),
+        patch(
+            "kiro_crew.mcp_core._get",
+            return_value={"enabled": True, "monitor": None, "autonudge_loop": None},
+        ),
+    ):
+        result = control.monitor_inspect("monitor_inspect", {})
+
+    payload = json.loads(result)
+    assert payload["monitor"] is None
+    assert payload["autonudge_loop"] is None

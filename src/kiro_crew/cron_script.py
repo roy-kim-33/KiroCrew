@@ -39,7 +39,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 from kiro_crew import platform_compat
 from kiro_crew.agent_discovery import _read_agent_spec
@@ -332,7 +332,7 @@ def grant_epoch_ids() -> set[str]:
 #: the cross-process half of the guarantee is the flock in
 #: :func:`_grant_epochs_guard`. Both are needed: job-removal paths bump
 #: epochs and removals also run from the CLI (``kirocrew cron remove``), so
-#: the writer set is no longer one gateway process — a thread lock alone
+#: the writer set is not one gateway process — a thread lock alone
 #: would let a gateway revoke and a CLI removal read one epoch map and
 #: overwrite each other's bump, reviving a revoked pin.
 _GRANT_EPOCHS_LOCK = threading.Lock()
@@ -717,13 +717,100 @@ def _secret_env_precheck(
 _PROCS_LOCK = threading.Lock()
 _RUNNING_PROCS: dict[str, subprocess.Popen] = {}
 _CANCELLED_PROC_JOBS: set[str] = set()
+#: Jobs whose sandboxed child is being SPAWNED right now but is not yet in
+#: ``_RUNNING_PROCS``. Without this, ``kill_running_process`` sees no registered
+#: child, returns False and records NOTHING -- so a cancel arriving inside
+#: ``popen_limited``'s interpreter-ENOENT backoff is discarded rather than
+#: delayed, and the retry then runs work the user cancelled while the run still
+#: reports ``ok``. Membership makes that window cancellable.
+_SPAWNING_JOBS: set[str] = set()
 
 _KILL_ESCALATION_GRACE_SECS = 5.0
 
 
-def _register_proc(job_id: str, proc: subprocess.Popen) -> None:
+def _begin_spawn(job_id: str | None) -> bool:
+    """Claim the spawn slot for *job_id*. False means REFUSED, do not proceed.
+
+    Refused when this job is already spawning or already registered, because
+    every cancellation surface here is keyed on the job id ALONE:
+    ``kill_running_process`` takes only a job id, and ``_RUNNING_PROCS`` holds one
+    child per job. Two concurrent runs of one job therefore make "cancel this
+    job" ambiguous by construction, and the flag is consumed by whichever run
+    finishes its spawn first -- so a cancel aimed at a run still in its ENOENT
+    backoff could be eaten by a rerun that was never cancelled. That rerun then
+    kills its own child and reports cancelled, while the run the user actually
+    cancelled sees no flag and executes.
+
+    Refusing the overlap makes the per-job cancellation contract well defined.
+    It also closes a standing hazard: a second concurrent run would overwrite
+    the ``_RUNNING_PROCS`` entry, orphaning the first child from cancellation
+    entirely.
+
+    An unidentified run (``job_id is None``) is never registered or cancellable,
+    so it is always allowed and claims nothing.
+    """
+    if job_id is None:
+        return True
     with _PROCS_LOCK:
+        if job_id in _SPAWNING_JOBS or job_id in _RUNNING_PROCS:
+            return False
+        _SPAWNING_JOBS.add(job_id)
+        return True
+
+
+def _finish_spawn(job_id: str | None, proc: subprocess.Popen) -> bool:
+    """Atomically move *job_id* from spawning to registered.
+
+    Both mutations happen under a single hold of ``_PROCS_LOCK``, so
+    ``kill_running_process`` -- which takes the same lock -- can never observe a
+    moment where the job is NEITHER spawning nor registered. Doing this as two
+    separate calls left exactly that gap, and a cancel landing in it was dropped.
+
+    Returns True when a cancel was recorded while the spawn was in flight. The
+    child launched regardless (the cancel raced the successful ``Popen``), so
+    nothing else will ever signal it and the caller MUST kill it. The flag is
+    CONSUMED here: leaving it set would make ``_unregister_proc`` attribute this
+    cancellation to a later run of the same job.
+    """
+    if job_id is None:
+        return False
+    with _PROCS_LOCK:
+        _SPAWNING_JOBS.discard(job_id)
+        if job_id in _CANCELLED_PROC_JOBS:
+            _CANCELLED_PROC_JOBS.discard(job_id)
+            return True
         _RUNNING_PROCS[job_id] = proc
+        return False
+
+
+def _abandon_spawn(job_id: str | None) -> bool:
+    """Clear spawn state after a spawn that produced NO child.
+
+    Returns True when a cancel had been recorded, so the caller reports the run
+    cancelled instead of raising. Either way the cancellation flag is cleared:
+    there is no child for it to signal, and leaving it set would make the NEXT
+    run of the same job report itself cancelled.
+    """
+    if job_id is None:
+        return False
+    with _PROCS_LOCK:
+        _SPAWNING_JOBS.discard(job_id)
+        cancelled = job_id in _CANCELLED_PROC_JOBS
+        _CANCELLED_PROC_JOBS.discard(job_id)
+        return cancelled
+
+
+def _spawn_cancelled(job_id: str | None) -> bool:
+    """True when a cancel landed while this job's spawn was in flight.
+
+    A PEEK, not a take, because this is the ``abort_retry`` hook: it may be
+    consulted several times across the backoff. The flag is consumed by
+    :func:`_finish_spawn` or :func:`_abandon_spawn`, whichever ends the spawn.
+    """
+    if job_id is None:
+        return False
+    with _PROCS_LOCK:
+        return job_id in _CANCELLED_PROC_JOBS
 
 
 def _unregister_proc(job_id: str, proc: subprocess.Popen) -> bool:
@@ -777,6 +864,14 @@ def kill_running_process(job_id: str) -> bool:
     with _PROCS_LOCK:
         maybe_proc = _RUNNING_PROCS.get(job_id)
         if maybe_proc is None or maybe_proc.poll() is not None:
+            # No live child to signal. If a spawn is in flight the cancellation
+            # must still be RECORDED, or it is lost: the spawn's retry backoff
+            # would finish, launch the command, and the run would report ok
+            # having done the work the caller cancelled. The spawner consults
+            # this flag before spawning and the run is reported cancelled.
+            if job_id in _SPAWNING_JOBS:
+                _CANCELLED_PROC_JOBS.add(job_id)
+                return True
             return False
         proc: subprocess.Popen = maybe_proc
         _CANCELLED_PROC_JOBS.add(job_id)
@@ -1389,6 +1484,28 @@ def _resolve_internal_secret(port: int) -> str:
     return read_local_secret(port)
 
 
+def _child_internal_secret(
+    provider: Callable[[], str] | None,
+    port: int,
+) -> str:
+    """The secret the script child sends as ``X-Internal-Secret``.
+
+    A ``provider`` returns the gateway's LIVE in-memory secret and takes
+    precedence: the in-process scheduler runs inside the gateway that minted
+    that value, so handing back its own secret is authoritative. Only when it
+    yields nothing (or no provider was given — a runner constructed outside a
+    gateway process, or a gateway with no dashboard) does resolution fall back
+    to the env/file derivation. The provided value is used only to write the
+    0600 temp file the child reads; it is never logged, put in the env, or
+    placed in an error string.
+    """
+    if provider is not None:
+        live = provider()
+        if live:
+            return live
+    return _resolve_internal_secret(port)
+
+
 def _resolve_dial_port() -> int:
     """The ONE port this cron dials, used for both the credential and the child.
 
@@ -1415,10 +1532,23 @@ def run_script_sandboxed(
     secret_env: dict[str, str] | None = None,
     secret_env_pin: str = "",
     delivery: str = "",
+    internal_secret_provider: Callable[[], str] | None = None,
 ) -> dict:
     """Run a cron script in a sandboxed subprocess via wrap_argv().
 
     Returns: {"status": "ok"|"skip"|"done"|"error", "message": "...", "error": "..."}
+
+    ``internal_secret_provider`` returns the gateway's LIVE in-memory internal
+    secret — the one the auth middleware actually compares against. The
+    in-process cron scheduler passes it so the child's ``notify()`` credential
+    is the running gateway's own value rather than one re-derived from the
+    environment or a per-port file. Env/file derivation
+    (``_resolve_internal_secret``) is the fallback for a runner constructed
+    OUTSIDE a gateway process (tests, ``kirocrew cron preview``) or a gateway
+    started with no dashboard (``--no-dashboard`` / API-only), where there is
+    no live secret to hand over. A stale ``KIROCREW_INTERNAL_SECRET`` in an
+    operator shell or a stale per-port ``.secret`` file otherwise wins the
+    derivation and every ``notify()`` 403s.
 
     ``secret_env``/``secret_env_pin`` carry an operator grant of vault secrets
     (see the grant block near ``_CRON_ENV_DENY``). When a grant is present the
@@ -1571,6 +1701,13 @@ def run_script_sandboxed(
     # --port auto bind between two resolutions would pair a credential with the
     # wrong port and 403 the callback.
     dial_port = _resolve_dial_port()
+    # Prefer the gateway's LIVE in-memory secret (the value the auth middleware
+    # compares against) when the in-process scheduler supplied a provider;
+    # otherwise derive it from env/file. Deriving is correct only OUTSIDE a
+    # gateway process (tests, cron preview) or when no dashboard started —
+    # inside a live gateway a stale KIROCREW_INTERNAL_SECRET or a stale per-port
+    # .secret file would win the derivation and 403 every notify().
+    internal_secret = _child_internal_secret(internal_secret_provider, dial_port)
     # Write secret to temp file for ScriptContext (scrubbed from env)
     secret_fd, secret_path = tempfile.mkstemp(prefix="kirocrew_secret_")
     try:
@@ -1588,7 +1725,7 @@ def run_script_sandboxed(
             # unlinks the secret + launcher (otherwise the fd leaks and temp
             # files persist).
             platform_compat.restrict_to_owner(secret_path)
-            os.write(secret_fd, _resolve_internal_secret(dial_port).encode())
+            os.write(secret_fd, internal_secret.encode())
         finally:
             os.close(secret_fd)
         try:
@@ -1629,7 +1766,23 @@ def run_script_sandboxed(
             )
         else:
             hidden = ()
-        sandbox_mode = "strict" if stdin_payload is not None else "standard"
+        # Same tier as ``run_command_sandboxed`` below: a script body is
+        # agent-written, so it is the HIGHER-capability cron surface, and it
+        # ran the WIDER profile — ``standard`` leaves ~/.aws/credentials, the
+        # SSO cache, ~/.kube, ~/.netrc, ~/.git-credentials, ~/.npmrc and
+        # ~/.pypirc open to the child, while a fixed command has always run
+        # ``cc``. The static body vet cannot be the fence (its own docstring
+        # says so and names the sandbox as the runtime control), so the two
+        # cron spawn paths are aligned on ``cc`` here. ``cc`` is the Claude
+        # Code provider's tier, and on macOS it deliberately leaves ``~/.aws``
+        # readable for that provider's Bedrock ``credential_process`` auth
+        # (see ``sandbox._seatbelt_profile``); a cron borrowing the tier
+        # inherits that residual, which is the same exposure the command path
+        # has always had there. A script that needs a host credential takes
+        # the existing route an operator already approves per job: a vault
+        # secret_env grant, which runs ``strict`` and injects the one approved
+        # secret instead of exposing a store.
+        sandbox_mode = "strict" if stdin_payload is not None else "cc"
         sandboxed_argv, sandbox_cleanup = wrap_argv(
             argv, mode=sandbox_mode, extra_hidden_dirs=hidden
         )
@@ -1686,16 +1839,67 @@ def run_script_sandboxed(
         clean_env.update(prevalidated_gh_env())
 
         sandboxed_argv = cgroup_scope_argv(sandboxed_argv)  # cgroup DoS ceiling
-        proc = popen_limited(
-            sandboxed_argv,
-            stdin=subprocess.PIPE if stdin_payload is not None else None,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            env=clean_env,
-            start_new_session=True,
-        )
-        _register_proc(job_id, proc)
+        # The spawn-in-flight window makes popen_limited's interpreter-ENOENT
+        # backoff cancellable: without it a cancel arriving mid-backoff is
+        # recorded nowhere, and the retry runs the cancelled job anyway.
+        #
+        # A refusal means this job is already spawning or running. Return WITHOUT
+        # touching any spawn or cancellation state: that state belongs to the
+        # other run, and clearing it here is exactly how a rerun eats the
+        # cancel aimed at a run still in its backoff.
+        #
+        # Status is "skipped", NOT "error". This is a second overlap guard behind
+        # the scheduler's own (which logs "previous execution still running,
+        # skipping" and returns silently), covering the tail where a claimed
+        # worker outlives its deadline: the first guard clears while the child
+        # runs on. Beyond that tail it earns its place for a different reason --
+        # it is what keeps the job-keyed cancel flag unambiguous. Every
+        # cancellation surface here takes a job id ALONE, so two concurrent runs
+        # of one job make "cancel this job" undecidable however the scheduler
+        # arrived at them; refusing the overlap is what gives _CANCELLED_PROC_JOBS
+        # a single owner. An overlapping wake is not a job defect, so it must not
+        # count a failure strike toward auto-pause -- inflating strikes for a
+        # transient condition is the harm this change exists to reduce.
+        if not _begin_spawn(job_id):
+            return {
+                "status": "skipped",
+                "error": "Another run of this job is already starting or running",
+            }
+        try:
+            proc = popen_limited(
+                sandboxed_argv,
+                stdin=subprocess.PIPE if stdin_payload is not None else None,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=clean_env,
+                start_new_session=True,
+                abort_retry=lambda: _spawn_cancelled(job_id),
+                # Locale decoding, declared deliberate. A cron runs an ARBITRARY
+                # command, so its output is in the host's encoding, not
+                # necessarily UTF-8. Forcing encoding="utf-8" with
+                # errors="replace" turned every non-UTF-8 byte into U+FFFD
+                # BEFORE the output was persisted and delivered -- irreversible
+                # corruption of the very thing the user asked to see. Locale
+                # decoding is what their shell does, and it is what this call
+                # did before the encoding gate was satisfied by pinning it.
+                text=True,  # subprocess-encoding: locale
+            )
+        except Exception:
+            # No child exists, so a cancel recorded against this spawn can never
+            # be signalled -- clear it here rather than let it leak into the next
+            # run of this job. Covers abort_retry's deliberate re-raise and a
+            # genuinely broken install alike.
+            if _abandon_spawn(job_id):
+                return {"status": "cancelled", "error": "Cancelled by user"}
+            raise
+        if _finish_spawn(job_id, proc):
+            # The cancel raced the successful spawn, so the child is live and was
+            # never registered: this is the only place that can still stop it.
+            # Reporting "cancelled" without this kill would claim the work was
+            # stopped while it ran on and mutated state.
+            _kill_proc_group(proc)
+            _drain_after_kill(proc, job_id)
+            return {"status": "cancelled", "error": "Cancelled by user"}
         try:
             try:
                 stdout, stderr = proc.communicate(
@@ -1909,21 +2113,37 @@ def run_command_sandboxed(
             "remove it from the cron store.",
             "exit_code": -1,
         }
-    shell = _resolve_command_shell()
-    if shell is None:
+    # Claimed BEFORE the shell probe, not merely before the spawn. Resolving the
+    # shell (_resolve_command_shell -> _shell_is_posix_strict -> run_limited)
+    # carries run_limited's own interpreter-ENOENT backoff, so on a cold
+    # _POSIX_STRICT_CACHE it can sleep for seconds while this job is registered
+    # NOWHERE. A cancel landing in that window found the job in neither
+    # _SPAWNING_JOBS nor _RUNNING_PROCS, so kill_running_process returned False
+    # and DISCARDED it -- and this function then launched the very command the
+    # user cancelled, side effects and all. Holding the claim across the probe
+    # makes such a cancel RECORDED; the pre-spawn check below turns it into a
+    # launch that never happens.
+    #
+    # The secret-grant refusal above stays AHEAD of the claim: it fails closed
+    # without doing any work, so it must not take a slot it would only release.
+    #
+    # A refusal returns WITHOUT touching spawn or cancellation state -- that state
+    # belongs to the run already in flight -- and reports "skipped" rather than
+    # "error" so an overlapping wake costs no auto-pause strike. See the script
+    # path for the full rationale.
+    if not _begin_spawn(job_id):
         return {
-            "status": "error",
-            "output": (
-                "❌ No POSIX shell available to run this command cron. Command "
-                "crons execute with `sh -c` under POSIX-sh semantics (what the "
-                "storage-time vet gate assumes); Windows ships no such shell "
-                "(Git for Windows's sh.exe is bash and would widen the language "
-                "past the vet). Use a script cron or an LLM `message` cron on "
-                "this platform, or run the gateway under POSIX."
-            ),
+            "status": "skipped",
+            "output": "⏭️ Another run of this job is already starting or running",
             "exit_code": -1,
         }
-    argv = [shell, "-c", command]
+    # True while the claim is still ours to release. _finish_spawn and
+    # _abandon_spawn each end the spawn and clear it; the finally below covers
+    # every OTHER exit, all of which now happen with the claim held. Without that
+    # release an early return -- no POSIX shell, wrap_argv fail-closing, any
+    # raised error -- would leak the claim and _begin_spawn would then refuse
+    # every future wake of this job for the life of the process.
+    spawn_claimed = True
     # mode="cc" (not "standard"): the command string is fully model-supplied via
     # cron_add and executes outside the kiro-cli ACP permission/hook flow, so this
     # is a low-trust exec path. "cc" hides the credential dirs/files (.aws, .kube,
@@ -1942,20 +2162,87 @@ def run_command_sandboxed(
     # instead of a job it could mark failed, so the remedy never reached the user.
     sandbox_cleanup: str | None = None
     try:
+        # Inside the claim (see above) AND inside the try: the probe can raise on
+        # a host with no OS sandbox backend, and that has to reach the handlers
+        # below as a job the scheduler can mark failed.
+        shell = _resolve_command_shell()
+        if shell is None:
+            return {
+                "status": "error",
+                "output": (
+                    "❌ No POSIX shell available to run this command cron. Command "
+                    "crons execute with `sh -c` under POSIX-sh semantics (what the "
+                    "storage-time vet gate assumes); Windows ships no such shell "
+                    "(Git for Windows's sh.exe is bash and would widen the language "
+                    "past the vet). Use a script cron or an LLM `message` cron on "
+                    "this platform, or run the gateway under POSIX."
+                ),
+                "exit_code": -1,
+            }
+        argv = [shell, "-c", command]
         sandboxed_argv, sandbox_cleanup = wrap_argv(argv, mode="cc")
         sandboxed_argv = cgroup_scope_argv(sandboxed_argv)  # cgroup DoS ceiling
         clean_env = _clean_cron_env()
-        proc = popen_limited(
-            sandboxed_argv,
-            stdin=None,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            env=clean_env,
-            start_new_session=True,
-        )
-        if job_id:
-            _register_proc(job_id, proc)
+        if _spawn_cancelled(job_id):
+            # Cancelled while the probe above sat in its interpreter-ENOENT
+            # backoff. Report it WITHOUT spawning: not launching is the entire
+            # point, and a spawn-then-kill would still have run the command for
+            # however long the signal took to land -- long enough to delete a
+            # file or push a commit. No child exists, so the flag is consumed
+            # here rather than left to leak into this job's next run.
+            spawn_claimed = False
+            _abandon_spawn(job_id)
+            return {
+                "status": "cancelled",
+                "output": "Cancelled by user",
+                "exit_code": -1,
+            }
+        try:
+            proc = popen_limited(
+                sandboxed_argv,
+                stdin=None,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=clean_env,
+                start_new_session=True,
+                abort_retry=lambda: _spawn_cancelled(job_id),
+                # Locale decoding, declared deliberate. A cron runs an ARBITRARY
+                # command, so its output is in the host's encoding, not
+                # necessarily UTF-8. Forcing encoding="utf-8" with
+                # errors="replace" turned every non-UTF-8 byte into U+FFFD
+                # BEFORE the output was persisted and delivered -- irreversible
+                # corruption of the very thing the user asked to see. Locale
+                # decoding is what their shell does, and it is what this call
+                # did before the encoding gate was satisfied by pinning it.
+                text=True,  # subprocess-encoding: locale
+            )
+        except Exception:
+            # See the script path: no child exists, so clear any recorded cancel
+            # rather than let it leak into this job's next run.
+            spawn_claimed = False
+            if _abandon_spawn(job_id):
+                return {
+                    "status": "cancelled",
+                    "output": "Cancelled by user",
+                    "exit_code": -1,
+                }
+            raise
+        spawn_claimed = False
+        if _finish_spawn(job_id, proc):
+            # Cancel raced the successful spawn; the child is live and
+            # unregistered, so kill it rather than report a stop that never
+            # happened.
+            _kill_proc_group(proc)
+            _drain_after_kill(proc, job_id)
+            # Same shape as the post-communicate cancellation below: a cancelled
+            # command cron reports the CHILD's returncode (the signal that
+            # stopped it), not a synthetic -1. Reporting -1 here diverged from
+            # that contract for the raced-cancel case alone.
+            return {
+                "status": "cancelled",
+                "output": "Cancelled by user",
+                "exit_code": proc.returncode,
+            }
         cancelled = False
         try:
             try:
@@ -2003,5 +2290,10 @@ def run_command_sandboxed(
     except Exception as exc:
         return {"status": "error", "output": f"❌ Command failed: {exc}", "exit_code": -1}
     finally:
+        if spawn_claimed:
+            # Left this function without ever reaching _finish_spawn or
+            # _abandon_spawn -- an early return or a raised error. Release the
+            # claim, or _begin_spawn refuses every future wake of this job.
+            _abandon_spawn(job_id)
         if sandbox_cleanup:
             Path(sandbox_cleanup).unlink(missing_ok=True)

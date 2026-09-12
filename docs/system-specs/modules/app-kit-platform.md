@@ -107,6 +107,33 @@ design: `_enrich_with_install_status` and `_apply_trust_fields` run afterwards
 and stamp them server-side, so an index-supplied value for one of them can
 never be read before it is replaced.
 
+The fetched `app.json` that feeds this merge is cached on disk
+(`cache/app-manifests/`), and the cache identity is the row's FULL source
+coordinates, not its name: `_manifest_cache_path` digests the normalized
+credential-free clone origin, the effective ref (always the configured
+branch, plus the pinned commit when the row carries one — non-catalog pins
+are data fidelity, not what the listing fetch resolves, so the branch must
+stay in the key), the repository subdirectory, and the app name into the
+file name. Changing the configured branch is therefore a cache MISS by
+construction, two same-name apps from different repositories never share (or
+poison) each other's cached metadata, and a failed fetch cannot silently
+attach a manifest cached for another branch or repo — the name-keyed
+predecessor could not establish provenance and did all three (#10145). The
+registry-refresh sweep expires caches through the same path derivation, so a
+row whose coordinates changed in the new index expires the OLD coordinates'
+file via the prior index's row. Coordinate churn orphans the old files
+themselves — no reader ever derives their path again — so the write path
+garbage-collects files older than every TTL plus a grace window
+(`_gc_manifest_cache_dir`; the grace is derived from the expiry backdate
+slack so an expired-but-preserved file is never GC-eligible in the same
+breath), which bounds what an index that rotates its coordinates can
+accumulate while staying invisible to reads. Manifest files live in the
+`by-source/` subdirectory and only that subdirectory is swept: registry
+index caches stay at the cache-dir root, making the GC boundary structural —
+an index cannot spell a directory into an app name, where a name-prefix
+convention (skip `_registry_*`) would be imitable by an app literally named
+`_registry_x` and hand a hostile index files the sweep never reclaims.
+
 The client
 (`isVerified`/`sourceLabel` in `website/src/components/appstore/types.ts`)
 reads the server fields, still rejects a `_registry`-tagged row first (so
@@ -998,7 +1025,7 @@ resolution), `dashboard/state.py` (`_send_ws_all`, `_ws_client_allowed`,
 (`_granted_list`, `RESERVED_APP_PATH_SEGMENTS`); consumers: `website/src/app-sdk/index.ts` (mirrors the tables
 for developer-facing diagnostics, drift-guarded by
 `website/src/test/appSdkEventScope.test.ts`). Runtime-facing summary for app
-authors: [../../../src/kiro_crew/docs/app-platform-trust-model.md](../../../src/kiro_crew/docs/app-platform-trust-model.md).
+authors: [../../architecture/app-platform-trust-model.md](../../architecture/app-platform-trust-model.md).
 
 ## 14. The published catalog is the store's inventory
 
@@ -1791,3 +1818,33 @@ Writers: `apps/backend.py` (`_health_check_loop`, `_watch_backend_health`,
 `_demote`, `_promote`, `_supervise_backend_health`, `_start_health_supervisor`,
 `_start_adopted_health_watch`, `AppProcess.is_running`), `apps/routes.py`
 (`handle_list_apps`).
+
+## 18. An app UI is a dynamically imported ESM module, not an iframe
+
+A gateway-managed app's dashboard UI is a real ESM module loaded into the
+dashboard's own React tree, so it shares one React instance and the host theme
+instead of living behind an iframe boundary. `AppHost` reads `ui.entry` from the
+manifest and dynamic-`import()`s `/apps/<app>/ui/<entry>`, served from the app's
+static UI directory. An app whose manifest declares no `ui.entry` renders the
+no-UI placeholder: the entry is optional, never defaulted.
+
+Cache-busting applies to the entry module alone. Busting the whole graph would
+re-fetch every chunk the entry statically imports, so a reload is driven by the
+`mc:app-reload` event instead: a module specifier already resolved in the page
+cannot be re-evaluated, so the host reloads the window when the named app
+announces new bytes.
+
+Shared host capability reaches an app through `@kirocrew/app-sdk`, which the host
+provides rather than publishing to npm — the SDK lives in the dashboard bundle, so
+an app externalizes it at build time instead of vendoring a second copy and a
+second React. Apps receive host events as `CustomEvent`s on `window`
+(`mc:app:<event>`) and raise host notifications through `mc:notify`.
+
+This is a different mechanism from the MCP App (SEP-1865) `srcdoc` iframes, which
+load their own ESM runtime from a CDN through an import map and are confined by
+the response CSP. §13 covers their token scoping;
+`src/kiro_crew/docs/mcp-apps.md` covers the iframe contract itself.
+
+Writers: `website/src/components/AppHost.tsx`, `apps/manifest.py` (the manifest
+`entry` field), `apps/routes.py` (static UI serving),
+`dashboard/server.py` (the CSP allowances the CDN import map needs).

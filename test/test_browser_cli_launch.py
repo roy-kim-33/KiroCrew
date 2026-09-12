@@ -202,17 +202,11 @@ def test_the_launch_config_is_write_protected_from_the_agent(
     monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "home"))
     path = str(mod.launch_config_path())
 
-    # 1. the file-edit gate
+    # The file-edit gate. The shell gate matches no paths in command text, and the
+    # sandbox keeps this leaf VISIBLE on purpose (the CLI opens it on every
+    # invocation), so a shell write is the accepted residual: the agent can already
+    # point PLAYWRIGHT_MCP_CONFIG at a file of its own.
     assert security.is_sensitive_write_path(path) is True
-    # 2. the shell gate, across the spellings it does cover
-    for command in (
-        "echo x > ~/.kiro/crew/playwright-cli-config.json",
-        "echo x > $HOME/.kiro/crew/playwright-cli-config.json",
-        "echo x > ~/.kirocrew/playwright-cli-config.json",  # legacy data home
-        "tee ~/.kiro/crew/playwright-cli-config.json",
-        "cp /tmp/evil.json ~/.kiro/crew/playwright-cli-config.json",
-    ):
-        assert security.is_sensitive_bash_command(command) is not None, command
     # Readable through Python: the CLI opens it on every invocation.
     assert security.is_sensitive_path(path) is False
 
@@ -220,15 +214,9 @@ def test_the_launch_config_is_write_protected_from_the_agent(
 def test_launch_config_shell_protection_matches_an_existing_protected_leaf() -> None:
     """The shell gate treats this leaf exactly as it treats a long-standing one.
 
-    Parity is the honest assertion, and the durable one. The leaf is deliberately
-    ANCHORED rather than bare-token: per the scope note on
-    ``_BARE_TOKEN_PROTECTED_LEAVES``, a leaf earns anchor-independent matching only
-    when the filename IS the grant, and here it is not -- the agent can point
-    ``PLAYWRIGHT_MCP_CONFIG`` at a file of its own. So a ``cd``-relative write is
-    the accepted residual, exactly as it is for the on-call schedule.
-
-    Asserting parity is what protects the invariant: it fails if someone protects
-    one leaf and not the other, and it does not pretend a gap is closed.
+    Parity is the honest assertion, and the durable one: the gate matches no paths
+    in command text, so neither leaf is refused there, and this fails the moment
+    someone fences one of the two by text without the other.
     """
     from kiro_crew import security
 
@@ -241,9 +229,7 @@ def test_launch_config_shell_protection_matches_an_existing_protected_leaf() -> 
         "tee ~/.kiro/crew/{leaf}",
         "cd ~/.kiro/crew && printf x > {leaf}",
     ):
-        assert (
-            security.is_sensitive_bash_command(form.format(leaf=ours)) is not None
-        ) == (
+        assert (security.is_sensitive_bash_command(form.format(leaf=ours)) is not None) == (
             security.is_sensitive_bash_command(form.format(leaf=existing)) is not None
         ), form
 
@@ -501,9 +487,7 @@ def test_a_foreign_configured_root_is_still_honoured(
     additions = mod.browser_socket_env(env)
     assert additions[mod.SOCKETS_ENV] == str(elsewhere / "a1b2c3d4" / "s")
     # the unset sibling still falls to the default root
-    assert additions[mod.DAEMON_DIR_ENV] == str(
-        home / mod._LIFECYCLE_DIR / "a1b2c3d4" / "d"
-    )
+    assert additions[mod.DAEMON_DIR_ENV] == str(home / mod._LIFECYCLE_DIR / "a1b2c3d4" / "d")
 
 
 def test_browser_socket_env_ignores_an_inherited_root_from_another_home(
@@ -597,3 +581,98 @@ def test_browser_socket_env_refuses_relative_configured_roots(
     }
 
     assert mod.browser_socket_env(env) == {}
+
+
+# ── ui_socket_env: the root the gateway's OWN CLI children share ──────────────
+
+
+def test_ui_socket_env_prepares_the_shared_owner_only_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    prepared: list[Path] = []
+    monkeypatch.setattr(mod, "config_dir", lambda: tmp_path)
+    monkeypatch.setattr(mod, "_UNIX_SOCKET_PATH_MAX_BYTES", 10_000)
+    monkeypatch.setattr(mod, "cli_lifecycle_env_supported", lambda: True)
+    monkeypatch.setattr(
+        mod.platform_compat, "make_owner_only_dir", lambda path: prepared.append(Path(path))
+    )
+    monkeypatch.setattr(mod.platform_compat, "restrict_dir_to_owner", lambda _path: None)
+
+    expected = tmp_path / "pw" / "ui" / "s"
+    registry = tmp_path / "pw" / "ui" / "d"
+    both = {mod.SOCKETS_ENV: str(expected), mod.DAEMON_DIR_ENV: str(registry)}
+    assert mod.ui_socket_env({}) == both
+    # Both directories prepared owner-only: the socket root and, beside it, the
+    # daemon session registry the panel's sessions register in.
+    assert prepared == [expected, registry]
+    # Deterministic: the show child and the launcher must land on ONE root, and
+    # a gateway life after a crash on the same registry as the one before it.
+    assert mod.ui_socket_env({}) == both
+
+
+def test_ui_root_is_never_a_generated_session_namespace() -> None:
+    """``ui`` is not 8-hex, so no reaper or lifecycle helper can read the
+    gateway's own root as an agent session's."""
+    assert mod._session_leaf("kc-ui") == ""
+    assert not mod._is_generated_leaf("ui")
+
+
+def test_ui_socket_env_namespaces_an_operator_root_and_ignores_its_own(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(mod, "config_dir", lambda: tmp_path / "home")
+    monkeypatch.setattr(mod, "_UNIX_SOCKET_PATH_MAX_BYTES", 10_000)
+    monkeypatch.setattr(mod, "cli_lifecycle_env_supported", lambda: True)
+    monkeypatch.setattr(mod.platform_compat, "make_owner_only_dir", lambda _path: None)
+    monkeypatch.setattr(mod.platform_compat, "restrict_dir_to_owner", lambda _path: None)
+
+    operator_root = tmp_path / "operator-sockets"
+    assert mod.ui_socket_env({mod.SOCKETS_ENV: str(operator_root)}) == {
+        mod.SOCKETS_ENV: str(operator_root / "ui" / "s"),
+        mod.DAEMON_DIR_ENV: str(operator_root / "ui" / "d"),
+    }
+    # Our own root arriving by inheritance is regenerated, never nested.
+    own = tmp_path / "elsewhere" / "pw" / "ui" / "s"
+    assert mod.ui_socket_env({mod.SOCKETS_ENV: str(own)}) == {
+        mod.SOCKETS_ENV: str(tmp_path / "home" / "pw" / "ui" / "s"),
+        mod.DAEMON_DIR_ENV: str(tmp_path / "home" / "pw" / "ui" / "d"),
+    }
+    # A generated session's root arriving by inheritance likewise.
+    agent = tmp_path / "elsewhere" / "pw" / "a1b2c3d4" / "s"
+    assert mod.ui_socket_env({mod.SOCKETS_ENV: str(agent)}) == {
+        mod.SOCKETS_ENV: str(tmp_path / "home" / "pw" / "ui" / "s"),
+        mod.DAEMON_DIR_ENV: str(tmp_path / "home" / "pw" / "ui" / "d"),
+    }
+
+
+def test_ui_socket_env_fails_back_to_the_cli_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(mod, "config_dir", lambda: tmp_path)
+    monkeypatch.setattr(mod.platform_compat, "IS_WINDOWS", False)
+    created: list[Path] = []
+    monkeypatch.setattr(
+        mod.platform_compat, "make_owner_only_dir", lambda p: created.append(Path(p))
+    )
+    monkeypatch.setattr(mod.platform_compat, "restrict_dir_to_owner", lambda _path: None)
+
+    # The installed CLI does not expose the hook: no directory, no override.
+    monkeypatch.setattr(mod, "cli_lifecycle_env_supported", lambda: False)
+    assert mod.ui_socket_env({}) == {}
+    assert created == []
+    # A root that would overflow AF_UNIX (a pod's long home): no override.
+    monkeypatch.setattr(mod, "cli_lifecycle_env_supported", lambda: True)
+    monkeypatch.setattr(mod, "config_dir", lambda: tmp_path / ("x" * 100))
+    assert mod.ui_socket_env({}) == {}
+    # A relative operator root is refused, as browser_socket_env refuses it.
+    monkeypatch.setattr(mod, "config_dir", lambda: tmp_path)
+    monkeypatch.setattr(mod, "_UNIX_SOCKET_PATH_MAX_BYTES", 10_000)
+    assert mod.ui_socket_env({mod.SOCKETS_ENV: "relative/root"}) == {}
+    # An unpreparable directory: no partial answer.
+    monkeypatch.setattr(mod, "config_dir", lambda: tmp_path)
+
+    def refuse(_path: Path) -> None:
+        raise OSError("read-only")
+
+    monkeypatch.setattr(mod.platform_compat, "make_owner_only_dir", refuse)
+    assert mod.ui_socket_env({}) == {}

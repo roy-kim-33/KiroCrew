@@ -290,7 +290,9 @@ class TestRestrictedGate:
     def test_no_live_slot_falls_through_to_the_persisted_mode(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from kiro_crew.messaging import upload_gate as ug
         monkeypatch.setattr(
-            ug, "_persisted_mode_is_restricted", lambda key, probe: key == "dashboard:ghost"
+            ug,
+            "_persisted_mode_is_restricted",
+            lambda key, probe, unknown_denies=True: key == "dashboard:ghost",
         )
         assert _restricted("dashboard:ghost") is True
         assert _restricted("dashboard:kept") is False
@@ -460,7 +462,7 @@ class TestMultipartWire:
 
 
 class TestDocumentVerb:
-    """The name-preserving document send (issue #6058).
+    """The name-preserving document send.
 
     Separate from ``send_message_with_files`` on purpose: that path's sanitizer
     is aimed at LLM-authored reference paths and maps every non-raster mime to
