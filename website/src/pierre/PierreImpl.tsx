@@ -344,11 +344,13 @@ export function PierreCodeImpl({ file, options, className, langHint, scrollClass
   )
 }
 
-export function PierrePatchImpl({ patch, options, className, renderHeaderMetadata }: {
+export function PierrePatchImpl({ patch, options, className, renderHeaderMetadata, renderHeaderPrefix, renderHeaderFilenameSuffix }: {
   patch: string
   options?: PierreDiffOptions
   className?: string
   renderHeaderMetadata?: () => React.ReactNode
+  renderHeaderPrefix?: () => React.ReactNode
+  renderHeaderFilenameSuffix?: () => React.ReactNode
 }) {
   const dark = useIsDark()
   const surfaceId = useId()
@@ -404,14 +406,15 @@ export function PierrePatchImpl({ patch, options, className, renderHeaderMetadat
           options={resolved}
           disableWorkerPool={poolBroken}
           renderHeaderMetadata={i === 0 && renderHeaderMetadata ? renderHeaderMetadata : undefined}
+          renderHeaderPrefix={i === 0 ? renderHeaderPrefix : undefined}
+          renderHeaderFilenameSuffix={i === 0 ? renderHeaderFilenameSuffix : undefined}
         />
       ))}
     </PierreShell>
   )
 }
 
-export function PierreFilePairImpl({ oldFile, newFile, options, className, renderHeaderMetadata, renderHeaderPrefix, renderHeaderFilenameSuffix }: {
-  oldFile: FileContents | null
+export function PierreFilePairImpl({ oldFile, newFile, options, className, renderHeaderMetadata, renderHeaderPrefix, renderHeaderFilenameSuffix }: {  oldFile: FileContents | null
   newFile: FileContents | null
   options?: PierreDiffOptions
   className?: string
@@ -433,13 +436,13 @@ export function PierreFilePairImpl({ oldFile, newFile, options, className, rende
   )
   const poolBroken = useWorkerPoolBroken()
   const [plain] = usePlainDiff()
-  // Plain mode (Settings → Display → Plain diffs) reaches this surface too, but
-  // it cannot arrive the way it does at `PierrePatch`: a file PAIR is handed two
-  // bodies and no patch, so the diff still has to be COMPUTED here — printing
-  // raw text would mean implementing a diff algorithm, which is not a rendering
-  // choice. What plain mode drops instead is the colour: both sides are declared
-  // `text`, Pierre's plaintext grammar, so the rows, gutters and ± markers all
-  // survive and only the tokenization goes away.
+  // Plain mode (Settings → Chat → Messages → Plain diffs) reaches this surface
+  // too, but it cannot arrive the way it does at `PierrePatch`: a file PAIR is
+  // handed two bodies and no patch, so the diff still has to be COMPUTED here —
+  // printing raw text would mean implementing a diff algorithm, which is not a
+  // rendering choice. What plain mode drops instead is the colour: both sides
+  // are declared `text`, Pierre's plaintext grammar, so the rows, gutters and ±
+  // markers all survive and only the tokenization goes away.
   //
   // Which is also why the workers go with it rather than merely being bypassed.
   // Plain text has nothing to tokenize, so a worker would be spawned to do no

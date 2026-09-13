@@ -115,6 +115,8 @@ function bmpDarkPixelCount(file, { left, top, right, bottom }) {
   return count;
 }
 
+const { BUILD_TIME_INPUTS } = require("./build-time-inputs");
+
 describe("electron-builder files list", () => {
   const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, "package.json"), "utf8"));
   const bundledFiles = pkg.build.files;
@@ -137,8 +139,21 @@ describe("electron-builder files list", () => {
   });
 
   it("does not reference files that no longer exist", () => {
-    const stale = bundledFiles.filter(f => !fs.existsSync(path.join(ROOT, f)));
+    // Every entry is checked-in source EXCEPT the build-time inputs a build
+    // places here on demand (BUILD_TIME_INPUTS, shared with shell-contract.test.js):
+    // absent in a checkout by design, so their absence is not staleness.
+    const stale = bundledFiles.filter(f => !fs.existsSync(path.join(ROOT, f)) && !BUILD_TIME_INPUTS.has(f));
     assert.deepStrictEqual(stale, [], `Stale entries in build.files: ${stale.join(", ")}`);
+  });
+
+  it("lists the baked EXTERNALLY-MANAGED marker so a build that places it packs it into app.asar", () => {
+    // build-desktop.sh copies KIROCREW_MANAGED_INSTALL_MARKER here; without this
+    // entry electron-builder would leave it out and readExternallyManaged would
+    // find nothing beside main.js -- the edition silently ships un-managed.
+    assert.ok(bundledFiles.includes("EXTERNALLY-MANAGED"));
+    const script = fs.readFileSync(path.join(ROOT, "..", "..", "packaging", "build-desktop.sh"), "utf8");
+    assert.match(script, /KIROCREW_MANAGED_INSTALL_MARKER/);
+    assert.match(script, /\$ELECTRON_DIR\/EXTERNALLY-MANAGED/);
   });
 });
 
@@ -301,7 +316,11 @@ describe(
     assert.match(runtimeScript, /^\$MaxGatewayReadySeconds = 30$/m);
     assert.match(runtimeScript, /silent-install-seconds=/);
     assert.match(runtimeScript, /gateway-ready-seconds=/);
-    assert.match(runtimeScript, /startupPycCount -lt 1000/);
+    // The pyc floor is a parameter now (build.yml passes a lower value for the
+    // PR-time job, whose payload has no voice extras); the 1000 default is the
+    // full-bundle contract and stays pinned here.
+    assert.match(runtimeScript, /^\s*\[int\]\$MinStartupPycs = 1000$/m);
+    assert.match(runtimeScript, /startupPycCount -lt \$MinStartupPycs/);
     assert.match(runtimeScript, /\/api\/ready/);
     assert.match(
       runtimeScript,

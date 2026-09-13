@@ -687,7 +687,7 @@ class TestEffortControl:
         provider._client.set_config_option = AsyncMock(side_effect=RuntimeError("rejected"))
         with pytest.raises(RuntimeError):
             await provider.change_effort("xhigh")
-        # Override rolled back (was previously unset).
+        # Override rolled back to unset.
         assert "claude-opus-4.7" not in provider._effort_per_model
 
     @pytest.mark.asyncio
@@ -774,8 +774,12 @@ class TestStartKiroRuntimeResume:
         runtime.create_session.assert_not_awaited()
         args = runtime.load_session.await_args.args
         loaded_path, loaded_sid = args[0], args[1]
-        # First positional is the full transcript path, never the bare sid.
-        assert loaded_path.endswith("/.kiro/sessions/cli/abc-123.json")
+        # First positional is the full transcript path under kiro-cli's session
+        # store -- wherever the resolver says that is (the test floor pins it) --
+        # never the bare sid.
+        from kiro_crew.config.paths import kiro_sessions_dir
+
+        assert loaded_path == str(kiro_sessions_dir() / "abc-123.json")
         assert loaded_path != "abc-123"
         # Second positional is the original sid, adopted as the resumed sessionId.
         assert loaded_sid == "abc-123"

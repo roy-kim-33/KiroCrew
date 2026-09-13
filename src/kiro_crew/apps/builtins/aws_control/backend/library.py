@@ -38,7 +38,7 @@ from kiro_crew.apps.manager import app_data_dir
 from kiro_crew.artifacts import ArtifactValidationError, _validate_slug, get_default_store
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.deploy.engine import AWSError
-from kiro_crew.platform_compat import file_lock
+from kiro_crew.platform_compat import file_lock, open_lock_file
 
 logger = logging.getLogger(__name__)
 
@@ -124,7 +124,7 @@ def _read_ledger_for_update() -> dict[str, Any]:
     offers a re-push (a duplicate billable upload) and leaves the real cloud
     copies with no record to remove them by.
 
-    Corruption propagates too (#7805, mirroring #7794): "cannot merge into" is
+    Corruption propagates too: "cannot merge into" is
     not "safe to destroy". A truncated ledger still holds most of its records
     verbatim, and replacing it discards the operator's only chance to recover
     them by hand. Two shapes that never reach ``json.loads``'s own raise are
@@ -139,8 +139,7 @@ def _read_ledger_for_update() -> dict[str, Any]:
     The per-ACCOUNT tolerance in :func:`_update_ledger` (a corrupted scalar
     entry for the account being written is reset) is deliberately untouched:
     it replaces one account's unusable entry while carrying every other row
-    forward verbatim, not the whole document. The sidecar-preserve alternative
-    for even that case is tracked in #7789.
+    forward verbatim, not the whole document.
     """
     try:
         data = json.loads(_ledger_path().read_text(encoding="utf-8"))
@@ -193,8 +192,8 @@ def _update_ledger(account: str, mutate: Callable[[dict[str, Any]], bool]) -> bo
     """
     lock_path = _ledger_path().with_suffix(".lock")
     _ledger_path().parent.mkdir(parents=True, exist_ok=True)
-    with open(lock_path, "w") as fd:
-        with file_lock(fd.fileno(), exclusive=True, required=True):
+    with open_lock_file(lock_path) as fd:
+        with file_lock(fd, exclusive=True, required=True):
             ledger = _read_ledger_for_update()
             slugs = ledger.get(account)
             if not isinstance(slugs, dict):
