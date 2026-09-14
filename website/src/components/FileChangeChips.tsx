@@ -5,12 +5,13 @@ import { useRowDisclosure } from '../pages/chat/rowDisclosure'
 import { PierreFilePair } from '../pierre'
 import {
   ROW_ANIM_MS,
+  ROW_BODY_MAX_H,
   ROW_CSS_CLICKABLE_TITLE,
   ROW_CSS_CLOSING,
   ROW_CSS_OPEN,
 } from './fileChangeChipsCss'
 import { countLines } from '../utils/diffLineCounts'
-import { usePersistedBool } from '../hooks/usePersistedBool'
+import { useDiffSplit } from '../hooks/useDiffSplit'
 
 import { i18nT } from '../i18n/t'
 import { useLanguageGeneration } from '../i18n/useLanguageGeneration'
@@ -26,6 +27,7 @@ export interface FileChangeEntry {
 export { countLines }
 
 const basename = (p: string) => p.split('/').pop() || p
+const FALLBACK_CONTENT_STYLE = { maxHeight: ROW_BODY_MAX_H, overflowY: 'auto' } as const
 
 /* Removals first, additions second — the order Pierre's own file headers use
  * (`createMetadataElement` pushes the deletions span before the additions one),
@@ -363,6 +365,7 @@ function ExpandedRow({ fc, added, removed, isArtifact, onFileOpen, disclosureKey
             ? `${fc.after.slice(0, ROW_WARM_FALLBACK_MAX_CHARS)}\n${ROW_WARM_FALLBACK_ELLIPSIS}`
             : fc.after}
           fallbackClassName="max-h-[376px] overflow-auto"
+          fallbackContentStyle={FALLBACK_CONTENT_STYLE}
           onVisible={completeOpenFocus}
           renderHeaderPrefix={prefix}
           renderHeaderFilenameSuffix={filenameSuffix}
@@ -401,9 +404,9 @@ function ExpandedList({ fileChanges, onFileOpen, artifactPaths, disclosureKey }:
 }) {
   const [expanded, setExpanded] = useRowDisclosure(disclosureKey, false)
   // Shares the app-wide `mc-diff-split` preference with the other diff
-  // surfaces (#6024). Owned by the card, not the rows, so toggling flips
-  // every file in the card at once (same-key hook instances don't live-sync).
-  const [sideBySide, setSideBySide] = usePersistedBool('mc-diff-split', true)
+  // surfaces (#6024). One toggle on the card, not per row, so it flips the
+  // layout of every file in the card together.
+  const [sideBySide, setSideBySide] = useDiffSplit()
   const n = fileChanges.length
   // Count once per file: reused by each row AND the header roll-up.
   const stats = fileChanges.map(fc => countLines(fc.before, fc.after))

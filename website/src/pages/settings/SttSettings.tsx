@@ -42,6 +42,8 @@ import {
 
 import { i18nT } from '../../i18n/t'
 import ErrorNotice from '../../components/ErrorNotice'
+import { errMessage } from '../../utils/thunkError'
+
 interface SttConfig {
   enabled: boolean
   provider: string
@@ -176,9 +178,8 @@ const SILENCE_MS_DEFAULT = 700
 /**
  * Bounds and step for the partial-transcript refresh interval, in milliseconds.
  *
- * Floor: a re-decode costs tens of milliseconds and the text churns faster than
- * it can be read below ~150 ms. Ceiling: past a second the transcript stops
- * reading as live, which is the entire point of streaming.
+ * Bounds the pause between completed partial decodes. Faster refresh can make
+ * text churn; the model's inference time still determines the actual cadence.
  */
 const PARTIAL_INTERVAL_MS_MIN = 150
 const PARTIAL_INTERVAL_MS_MAX = 1000
@@ -415,6 +416,9 @@ export default function SttSettings({ cardIndex }: {
   // applied via getUserMedia constraints). Device labels are blank until the
   // page has been granted mic access at least once.
   const [mics, setMics] = useState<MediaDeviceInfo[]>([])
+  // Before permission, an anonymous device can share the system-default value.
+  // It cannot be selected separately, so offer it through System default only.
+  const selectableMics = mics.filter(device => device.deviceId !== '')
   const [micId, setMicId] = useState(getPreferredMicId())
   const refreshMics = useCallback(async () => { setMics(await listMicrophones()) }, [])
   useEffect(() => {
@@ -517,7 +521,16 @@ export default function SttSettings({ cardIndex }: {
     // skeleton at the same position, and a differing delay would hold the
     // already-loaded content blank for the delay after the swap.
     <SettingsCard index={cardIndex}>
-      <FormSkeleton rows={['toggle', 'info', 'field', 'field', 'field', 'info']} />
+      {sttQ.isError ? (
+        // A skeleton that never resolves is indistinguishable from a slow load.
+        // Nothing to lose: no control is mounted in this branch.
+        <ErrorNotice
+          message={errMessage(sttQ.error) || i18nT('pages.settings.sttSettings.config_load_failed')}
+          askAgent
+        />
+      ) : (
+        <FormSkeleton rows={['toggle', 'info', 'field', 'field', 'field', 'info']} />
+      )}
     </SettingsCard>
   )
 
@@ -532,7 +545,8 @@ export default function SttSettings({ cardIndex }: {
     ? stt.streaming_providers
     : FALLBACK_STREAMING_PROVIDERS
   const canStream = streamingProviders.includes(provider)
-  const languageOptions = stt.language_codes?.length ? stt.language_codes : ['en-US']
+  const defaultLanguage = provider === PROVIDER_LOCAL ? 'auto' : 'en-US'
+  const languageOptions = stt.language_codes?.length ? stt.language_codes : [defaultLanguage]
 
   // The catalog and the availability verdict. Treated as absent rather than as
   // "nothing to download" while the status query is in flight, so a slow probe
@@ -597,11 +611,20 @@ export default function SttSettings({ cardIndex }: {
     <>
       {/* Only mutation failures reach here, so dismissing simply clears it. There
           is no server-held error to re-read: a failed model download reports
-          itself through the status query's own `download.error`. */}
+          itself through the status query's own `download.error`.
+          askAgent is gated on the drafts (the SecretsPanel shape): the AWS
+          profile / region inputs commit `onBlur`, so a failed save leaves the
+          typed-but-rejected text in them — kept on purpose, so it can be
+          corrected rather than retyped. No hand-off while either differs from
+          the stored value: `localProfile` / `localRegion`. */}
       <ErrorNotice
         message={err}
         onDismiss={() => setErr('')}
         className="mb-4 animate-rise"
+        askAgent={
+          localProfile.trim() === (stt.transcribe_profile || '')
+          && localRegion.trim() === (stt.transcribe_region || '')
+        }
       />
       <SettingsCard index={cardIndex}>
         <SettingsToggle label={i18nT('pages.settings.sttSettings.enabled')} description={i18nT('pages.settings.sttSettings.transcribe_voice_into_the_message_box_when_you_c')} checked={stt.enabled} onChange={v => set({ enabled: v })} disabled={saving} />
@@ -619,13 +642,24 @@ export default function SttSettings({ cardIndex }: {
         {!available && unavailableText && (
           <p className="text-[12px] text-muted -mt-1 mb-1">{unavailableText}</p>
         )}
+        {/* The probe itself failed: the badge above is then showing the config's
+            plain boolean, not a verdict, and the model catalog is absent. Status
+            row, nothing editable → hand-off on. */}
+        {statusQ.isError && (
+          <ErrorNotice
+            variant="inline"
+            className="-mt-1 mb-1"
+            message={errMessage(statusQ.error) || i18nT('pages.settings.sttSettings.status_unavailable')}
+            askAgent
+          />
+        )}
 
         <SettingsSelect
           label={i18nT('pages.settings.sttSettings.microphone')}
           description={i18nT('pages.settings.sttSettings.input_device_used_to_capture_your_voice')}
           value={micId}
-          options={['', ...mics.map(d => d.deviceId)]}
-          optionLabels={[i18nT('pages.settings.sttSettings.system_default'), ...mics.map((d, i) => d.label || i18nT('pages.settings.sttSettings.microphone_2', { n: i + 1 }))]}
+          options={['', ...selectableMics.map(d => d.deviceId)]}
+          optionLabels={[i18nT('pages.settings.sttSettings.system_default'), ...selectableMics.map((d, i) => d.label || i18nT('pages.settings.sttSettings.microphone_2', { n: i + 1 }))]}
           onChange={changeMic}
           disabled={saving}
         />
@@ -681,10 +715,15 @@ export default function SttSettings({ cardIndex }: {
                 </Btn>
               </div>
             ) : null}
+            {/* A finished-and-failed transfer (the job's own `error`). Status
+                panel with nothing editable in this block → hand-off on. */}
             {download?.step === DOWNLOAD_STEP_FAILED && download.error && (
-              <p className="text-[12px] text-danger -mt-1 mb-1">
-                {i18nT('pages.settings.sttSettings.download_failed_reason', { error: download.error })}
-              </p>
+              <ErrorNotice
+                variant="inline"
+                className="-mt-1 mb-1"
+                message={i18nT('pages.settings.sttSettings.download_failed_reason', { error: download.error })}
+                askAgent
+              />
             )}
           </>
         )}
@@ -727,7 +766,7 @@ export default function SttSettings({ cardIndex }: {
 
         {stt.enabled && <PushToTalkConfig />}
 
-        <SettingsSelect label={i18nT('pages.settings.sttSettings.language')} hint={i18nT('pages.settings.sttSettings.bcp_47_language_code_for_speech_recognition')} value={stt.language_code || 'en-US'} options={languageOptions} onChange={v => set({ language_code: v })} disabled={saving} />
+        <SettingsSelect configKey="stt.language_code" label={i18nT('pages.settings.sttSettings.language')} hint={i18nT('pages.settings.sttSettings.bcp_47_language_code_for_speech_recognition')} value={stt.language_code || defaultLanguage} options={languageOptions} optionLabels={languageOptions.map(code => code === 'auto' ? i18nT('pages.settings.sttSettings.language_auto') : code)} onChange={v => set({ language_code: v })} disabled={saving} />
 
         {isTranscribe && (
           <>
