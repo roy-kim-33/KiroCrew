@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
+from functools import cached_property
 from typing import Literal, Protocol, runtime_checkable
 
 # Event kinds — re-exported from the single source of truth
@@ -29,6 +30,7 @@ from kiro_crew.acp.types import (  # noqa: F401
 )
 from kiro_crew.acp.types import AcpEvent as LLMEvent  # noqa: F401
 from kiro_crew.constants import COMPACT_WAIT_TIMEOUT_SECS
+from kiro_crew.essential_delivery import EssentialDelivery
 
 CancelOutcome = Literal["acked", "timeout", "no_turn", "error"]
 
@@ -77,6 +79,31 @@ class SessionMcpReport(Protocol):
 class LLMProvider(ABC):
     """Abstract LLM backend."""
 
+    @cached_property
+    def essential_delivery(self) -> EssentialDelivery:
+        """Private prompt receipts belong to this provider, never the builder."""
+        return EssentialDelivery()
+
+    @property
+    def context_incarnation(self) -> object:
+        """Identity of the native conversation retaining injected instructions."""
+        return (id(self), self.session_id)
+
+    @property
+    def context_provider_type(self) -> str:
+        """Actual provider label used by context assembly, not global config."""
+        return "acp"
+
+    @property
+    def native_steering(self) -> bool:
+        """Whether the serving harness owns conditional steering selection."""
+        return False
+
+    @property
+    def native_context_documents(self) -> dict[str, str]:
+        """Exact documents supplied at native startup, empty without evidence."""
+        return {}
+
     @abstractmethod
     async def start(self) -> None:
         """Initialize the provider (spawn process, create client, etc.)."""
@@ -117,6 +144,20 @@ class LLMProvider(ABC):
         session. Callers that act on a threshold need the two apart. Default
         False for providers that never compact unobserved.
         """
+        return False
+
+    @property
+    def defer_replay_sid_promotion(self) -> bool:
+        """Whether replay settlement must precede publishing a fresh native SID.
+
+        The safe default is False: adapters added later publish their own session
+        identity normally unless they explicitly adopt the deferred-SID contract.
+        """
+        return False
+
+    @property
+    def is_claude_backend(self) -> bool:
+        """True when this provider drives claude-agent-acp."""
         return False
 
     @property
@@ -237,6 +278,16 @@ class LLMProvider(ABC):
         equality across spawns must be impossible, which is why the ACP session
         id (reused by resume on a new process) can never serve here.
         """
+        return ""
+
+    @property
+    def member_capabilities_supported(self) -> bool:
+        """Whether a dedicated startup can load a complete member agent spec."""
+        return False
+
+    @property
+    def loaded_capability_template(self) -> str:
+        """Confirmed active full-spec template; empty means no loading evidence."""
         return ""
 
     @property
@@ -366,8 +417,8 @@ class LLMProvider(ABC):
 
         The manual entry points gate on this so an unsupported backend gets an
         immediate, user-visible refusal instead of a prompt whose
-        compaction-status wait strands until ``COMPACT_WAIT_TIMEOUT_SECS``
-        (#7800). Default ``None`` — a provider that has not positively named an
+        compaction-status wait strands until ``COMPACT_WAIT_TIMEOUT_SECS``.
+        Default ``None`` — a provider that has not positively named an
         unsupported backend passes through, because it handles ``/compact`` on
         its own terms. Declared here with a safe default rather than probed off
         the instance (harness-parity H14); the ACP implementations answer from
@@ -425,3 +476,16 @@ class LLMProvider(ABC):
         """Reasoning-effort levels the provider accepts. Default empty for a
         provider with no effort control."""
         return []
+
+    def supports_effort(self) -> bool:
+        """True when the current model accepts a reasoning-effort level. Default False."""
+        return False
+
+    async def change_effort(self, level: str) -> bool:
+        """Change reasoning effort live for the current model. Returns True on success,
+        False when effort is unsupported. Default False."""
+        return False
+
+    async def clear_effort(self) -> bool:
+        """Clear the slot's reasoning-effort override for the current model. Default False."""
+        return False

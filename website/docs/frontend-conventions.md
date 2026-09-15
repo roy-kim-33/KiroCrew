@@ -6,6 +6,23 @@ Page structure is in [page-layout](page-layout.md); color and CSS-var rules are
 in [theming-contract](theming-contract.md); user-facing strings are in
 [i18n-catalog](i18n-catalog.md).
 
+## The stack
+
+React 18, Redux Toolkit, React Query (`@tanstack/react-query`), React Router v7,
+Framer Motion, Tailwind CSS 3, Lucide React, DOMPurify, highlight.js, Monaco,
+TypeScript, Vite 8. Read the pins from `website/package.json` rather than this list.
+
+Prefer the library already here over a new dependency. Every addition is bytes in a
+bundle a user downloads and a supply-chain surface someone has to review, and two
+libraries doing one job is how a codebase ends up with two animation systems whose
+transitions do not compose.
+
+## Browser support
+
+Chrome, Firefox, Safari and Edge. Use standard Web APIs only, and guard the
+browser-specific ones (`typeof Notification !== 'undefined'`): an unguarded API
+throws at module scope, so the page renders blank rather than degrading.
+
 ## Shared components
 
 `src/components/ui.tsx` is the primitive set. Compose from it rather than
@@ -15,7 +32,16 @@ hand-rolling:
 `SearchInput`, `Badge`, `SourceBadge`, `StatCard`, `Skeleton`,
 `ContentSkeleton`, `SkeletonToggleRow`, `SkeletonField`, `SkeletonInfoRow`,
 `FormSkeleton`, `EmptyState`, `PanelSectionHeader`, `PageHeader`, `Toggle`,
-`Slider`, `Checkbox`, `Select`.
+`Slider`, `Checkbox`, `FilteredEmpty`.
+
+There is deliberately no `Select` primitive: use `SimpleSelect`,
+`SettingsSelect`, `SearchableSelect`, or `SettingsMultiSelect` for a searchable
+checkbox list in Settings.
+
+`SimpleSelect` accepts optional decorative `optionIcons` alongside its text
+labels. Desktop rows and the selected value show those identities; touch devices
+retain the native text option list and show the selected icon beside the control.
+An icon does not replace the option's accessible name or typeahead text.
 
 The provenance pill is **`SourceBadge`**, not a badge named after any one source.
 Two implementations exist on purpose:
@@ -49,6 +75,13 @@ Other shared modules:
 `@kirocrew/ui`. Adding a primitive there makes it app-facing API, so add
 deliberately.
 
+Stories for these primitives live in `src/stories/` and render them in isolation
+under every theme (`npm run storybook`); see
+[testing § Component stories](testing.md#choosing-a-layer). Seven primitives have
+one today. A story is the cheapest place to look at a new variant or prop, so add
+or update one when you touch a primitive that has one; a per-primitive
+requirement is not in force until the change that makes CI render stories.
+
 ### Which switcher
 
 Three components render the same pill, because a user should see one control for
@@ -65,6 +98,13 @@ All three take their metrics from `ui/tabsPill.ts`, so they cannot drift apart
 visually — `src/test/tabsPillParity.test.tsx` pins that. Do NOT hand-roll a
 fourth: a `border-b-2` row of buttons has no keyboard model and no selected state
 for assistive tech, which is the defect this consolidation removed.
+
+Radix Tabs uses a static selected indicator when reduced motion is requested.
+Setting a shared-layout spring's duration to zero still permits projection
+transforms; those can cover another tab after a layout change. Memory record
+selection panels and cards likewise disable layout projection in this mode.
+The rail owns the stacking context for its indicators, so a sliding background
+stays behind every tab label while crossing between segments.
 
 A navigation rail sits in `TABS_RAIL_ROW_CLASS` (rail, rule, then content). The
 rule is load-bearing rather than decoration: it is the only thing telling a
@@ -211,6 +251,15 @@ All `dangerouslySetInnerHTML` content goes through DOMPurify, via
 
 A bypass is an XSS bug, so there is no "just this once" case.
 
+The shared markdown pass `remarkVerbatimUnknownTags` preserves unknown single
+tags as inert source text, including their case, bare attributes and quoted `>`
+characters. Its single-tag recognizer scans each character with a fixed set of
+attribute states; it must not backtrack over an entire raw HTML node. Malformed
+block HTML reaches this check before the tag allowlist, so even an allowlisted
+tag can carry an adversarial attribute sequence. This preserves the existing
+permissive empty/unquoted-value handling without normalizing placeholders or
+changing the separate sanitizer, executable-tag and multi-tag-block behavior.
+
 ## URL sanitization
 
 `react-markdown` strips protocols it does not know. `src/utils/urlTransform.ts`
@@ -234,6 +283,35 @@ constant also decides which paths are treated as local file reads, so the two
 decisions must stay on the one exported copy in `urlTransform.ts`.
 
 ## Data fetching
+
+The shared memory editor keeps the existing global V1 Key/Value/Set action
+inside the lazily loaded Overview memory drill-in. The shell shows the shared
+`ContentSkeleton` while that chunk loads; the member/store URL remains the
+navigation owner throughout loading. This keeps record editing and recovery
+tools out of the initial dashboard bundle. The create action remains
+beside the paged browser. Its unscoped semantic writer is available only when
+the selected store is global and the surface is not private. The narrow form
+stacks its inputs and submit button; its draft joins the store-switch guard,
+pending submission disables the fields, and an error retains them for retry.
+
+Private recall presents the returned fact and experience snippets as compact
+evidence cards. Exact serialized model context and source diagnostics live in
+the collapsed Source and retrieval details disclosure. Rules have their own
+indicator and full context there; fact snippets do not represent the rules
+included in recall. The disclosure accepts the recall API's structured copy
+origin as well as the record browser's serialized origin.
+
+Before a legacy member opts into private V2, a confirmation dialog explains that
+the next chat starts a fresh conversation and the member cannot switch back to V1.
+Only its explicit create action submits the request; Cancel keeps the existing
+binding. Prior conversations and V1 data remain. The Crew Manager notice
+distinguishes new members from existing V1 members. A disabled Manage memory
+action shows its unsaved-changes reason as visible helper text for keyboard and
+touch users. Member status distinguishes an explicitly
+different configured owner from an unavailable or unverified binding. Unavailable
+memory views retain Retry and offer guarded Crew Manager navigation for inspecting
+settings, using an exact catalog owner when available and the manager list
+otherwise. This navigation does not grant ownership or promise an automatic repair.
 
 Always React Query (`useQuery` / `useMutation`) for server state. Do NOT use
 manual `useState` + `useEffect` + `useCallback` for an API call. Prefer optimistic
@@ -344,6 +422,25 @@ Shared CSS utilities in `index.css`: `.top-bar-pill`, `.topbar-glass`,
 `.scroll-shadow`, `.table-striped`, `.skeleton`, `.focus-ring`. A theme change
 crossfades through a `transition` on `body`.
 
+## Large file-pair diffs
+
+All old/new source pairs render through `PierreFilePair` in `src/pierre/index.tsx`.
+That wrapper owns a layout-independent renderer-thread budget before the lazy
+Pierre chunk loads, because Pierre constructs the raw diff synchronously before
+its worker pool or row virtualizer participates. Inputs outside the budget keep
+both complete files, header controls, native selection, wrapping, and theme
+styling in a bounded plain side-by-side or sequential surface. A translated
+status identifies the simplified view; it omits syntax colour and hunk
+interleaving by default, and a "Show line-by-line diff" control in a strip
+between the header and the scroller opts one pair into the real diff: the
+computation runs in a Web Worker (`src/pierre/diffOffThread.ts`), so the
+renderer never blocks, and the result renders through the hunk-based patch
+path with unchanged ranges folded. The content limit is measured in JavaScript UTF-16
+code units rather than encoded bytes so the guard stays allocation-free while an
+editor changes. Editable live diffs use the same
+predicate and degrade to the ordinary editable file surface rather than becoming
+read-only. Do not duplicate or weaken the limits at call sites.
+
 ## Typography scale
 
 Body is 14px (`0.875rem`, set on `body`). Descriptions and details use
@@ -376,3 +473,46 @@ against `location.pathname` only, so a multi-segment, query, or hash route would
 register and then never resolve. The same constraint and the reasoning behind it
 are in [extension-seams](extension-seams.md), which covers registering routes and
 icons from a downstream edition instead of editing the seed maps.
+
+## Crew capability drafts
+
+The Crew editor has an independent Capabilities rail pane with MCP, Tools,
+Auto-approved and Skills categories. It stays mounted while hidden so both its
+local draft and its signed server preview survive rail changes. Its footer owns
+Discard draft and Review/save; the generic crew save cannot discard a capability
+draft. Closing or opening chat asks before losing that draft. A capability
+request in progress holds dismissal. Dirty and busy state reach the parent in
+layout effects, before paint, so an immediate Escape after pasting cannot close
+against an older clean state. Browser unload also warns about the draft.
+Opening the embedded editor writes an explicit `tab=crews` route, so a resize
+cannot replace its ancestry with the mobile root list. On narrow screens the
+member identity owns a full header row. The capability form scrolls independently
+above a non-overlapping footer. The horizontally scrollable category strip does
+not flex-shrink when an expanded transport form exceeds the pane height; all
+category labels retain their full height. Review shows values from the server's sanitized
+projected rows, never from secret-bearing local drafts. Source validation errors
+are distinct from provider loading failures.
+
+The editor reads and writes through `api/crewCapabilities.ts`, using the shared
+transport. Preview and save send the same explicit inheritance operations; save
+adds only the server-issued preview token. A stale version preserves the draft
+and requires reloading and reviewing against the new version. Save success never
+stands in for runtime application: runtime status comes from the server and
+active sessions are not promised a hot reload.
+
+The legacy template pane keeps its instant-save behavior for independent and
+shared definitions. Enrolled definitions direct model and skill edits to
+Capabilities instead. Reset and publish remain in the template pane but lock
+while a capability draft exists. A mask is never a literal replacement value.
+The form can keep unchanged secrets, select a configured connection, or replace the
+whole transport using a blank form. MCP set operations carry a complete transport
+plus RFC6901 `retain_paths` for unchanged `[REDACTED]` leaves. Each pointer keeps
+its original member/revision binding. Editing a hidden value removes that pointer;
+a typed mask without a retained pointer blocks preview. Hidden argument positions
+and hidden map keys cannot move until their values are replaced explicitly.
+Environment and HTTP header values remain password inputs. Managed transport
+fields use the row's authoritative `managed` flag, independently of the connection
+catalog; their supported enable switch sends only `disabled`. Absent prompt/model
+rows can be set, and model choices use the shared advertised-model query. Version
+hashes live in a collapsed details section rather than in the main status banner.
+Parent-change and impact previews use the server's redacted projection.

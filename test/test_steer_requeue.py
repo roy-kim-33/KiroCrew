@@ -2,8 +2,8 @@
 
 A steer handed to kiro-cli lives inside the running turn; if the turn dies
 before kiro-cli echoes ``steering_consumed`` (stall-cancel, soft STOP, error,
-or a steer racing the turn's natural end) the message used to vanish silently
-(2026-07-17 incident). The fix tracks pending steers on the slot:
+or a steer racing the turn's natural end) the message would vanish silently.
+Pending steers are tracked on the slot:
 
   * the steer handler registers in ``slot._pending_steers`` BEFORE the steer
     RPC's await (unwound on failure), so a turn dying mid-write still sees it;
@@ -49,7 +49,7 @@ class TestDeliveryIdLifecycle:
     entry is bounded by the queue -- but a delivery that persists its own row is
     terminal here and nothing downstream will read it again.
 
-    `_steer_send_ids` (#6751) is the same shape with the same failure mode, and is
+    `_steer_send_ids` is the same shape with the same failure mode, and is
     removed in LOCKSTEP with the delivery id at every site, so these pins assert
     BOTH maps rather than growing a parallel test class. Each POST below carries a
     `meta.sendId`, without which the second assertion would be vacuous.
@@ -76,7 +76,7 @@ class TestDeliveryIdLifecycle:
                     # Carries a send id so the `_steer_send_ids` assertion below is a
                     # real pin rather than a vacuous one: without it that map is
                     # never populated and the assertion holds even with the pop
-                    # removed (#6751).
+                    # removed.
                     "meta": {"sendId": "s-m4k2p1-9x7"},
                 },
             )
@@ -116,7 +116,7 @@ class TestDeliveryIdLifecycle:
 
         assert slot._steer_delivery_ids == {}
         # The unwind hands delivery to the queue fallback, which mints no steer, so
-        # nothing will read this entry either (#6751).
+        # nothing will read this entry either.
         assert slot._steer_send_ids == {}
 
     @pytest.mark.asyncio
@@ -142,7 +142,7 @@ class TestDeliveryIdLifecycle:
                         "message": f"unique message {n}",
                         "steer": True,
                         # A distinct id per send: the growth shape is what makes this
-                        # a leak, so each send must contribute its own key (#6751).
+                        # a leak, so each send must contribute its own key.
                         "meta": {"sendId": f"s-m4k2p1-{n}"},
                     },
                 )
@@ -245,15 +245,16 @@ class TestSteerConsumedClears:
         )
         assert slot._pending_steers == []
 
-    def test_empty_snapshot_falls_back_to_settling_all(self, tmp_path, monkeypatch):
-        # Older backend / redacted echo: no usable text -> pre-review behavior
-        # (settle all; duplicate is visible+cancellable, loss is not).
+    def test_empty_snapshot_settles_nothing(self, tmp_path, monkeypatch):
+        # Older backend / redacted echo: no usable text is no evidence of
+        # consumption, so everything stays pending for the turn-end requeue.
+        # A duplicate card is visible and cancellable; a silent loss is not.
         from kiro_crew.dashboard.chat_runner import _settle_consumed_steers
 
         slot = self._slot(tmp_path, monkeypatch)
         slot._pending_steers = ["a", "b"]
         _settle_consumed_steers(slot, "   ")
-        assert slot._pending_steers == []
+        assert slot._pending_steers == ["a", "b"]
 
     def test_substring_steer_not_falsely_settled(self, tmp_path, monkeypatch):
         # review-bot regression: "fix" is a SUBSTRING of the consumed block
@@ -491,7 +492,7 @@ class TestSteerRequeueOnTurnDeath:
         _requeue_unconsumed_steers(state, slot)
 
         # steers land at the HEAD, preserving their relative order,
-        # ahead of the previously queued message
+        # ahead of the message already queued
         contents = [item["content"] for item in slot._queue]
         assert contents == ["steer-1", "steer-2", "queued-later"]
         assert slot._pending_steers == []
@@ -540,9 +541,9 @@ class TestSteerLifecycleState:
     injected at a model-inference boundary, so a turn streaming text without
     dispatching a tool can end without ever reaching one -- the backend then
     echoes no `steering_consumed`, the teardown requeues the message, and it runs
-    as its own turn. The row used to claim a successful mid-turn injection from
-    write-ack alone, so that path rendered "steered into the running turn" for a
-    turn that was never redirected (#7246).
+    as its own turn. Claiming a successful mid-turn injection from write-ack
+    alone would render "steered into the running turn" for a turn that was never
+    redirected.
 
     These assert the wire values as LITERALS on purpose. Importing the state
     constants would make every test here fail on an unfixed tree with an
@@ -609,6 +610,79 @@ class TestSteerLifecycleState:
         assert patch_payload["meta"]["steerState"] == "consumed"
 
     @pytest.mark.asyncio
+    async def test_a_consumed_steer_retires_a_late_stateless_question(
+        self, tmp_path, monkeypatch, _patch_sel
+    ):
+        """Provider consumption closes the card-registration ordering gap.
+
+        The dashboard persists the user's steer row as soon as the steer RPC
+        accepts it. The agent can then post an ``ask_question`` card before
+        kiro-cli emits ``steering_consumed`` for that same user message. The
+        earlier row append cannot retire a card that did not exist yet, so the
+        consumption event must finish that lifecycle without disturbing a
+        legacy blocking ask.
+        """
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+        state.broadcast_ws = MagicMock()
+        state.broadcast_ws_owners = MagicMock()
+        slot = _running_slot(state)
+        client_mock = MagicMock()
+        client_mock.supports_steer = True
+        client_mock.steer = AsyncMock(return_value=True)
+        slot._acp_client = client_mock
+
+        from kiro_crew.dashboard.chat_delivery import steer_into_running_turn
+        from kiro_crew.dashboard.chat_runner import _settle_consumed_steers
+
+        # The accepted steer writes its row first. The card is registered only
+        # afterwards, reproducing the ordering from the dashboard report.
+        await steer_into_running_turn(state, slot, "build the recommended option")
+        state.mark_question_pending(
+            "test",
+            blocking=False,
+            card_id="card-late",
+            questions=[{"question": "Which option?", "options": [{"label": "B"}]}],
+        )
+        state.mark_question_pending("test", blocking=True, card_id="ask-parked")
+
+        _settle_consumed_steers(
+            slot,
+            "<user_message>\nbuild the recommended option\n</user_message>",
+            state,
+        )
+
+        assert list(slot._question_pending) == ["ask-parked"]
+        state.broadcast_ws_owners.assert_any_call(
+            "question_card_resolved", {"card_id": "card-late", "slot": "test"}
+        )
+
+    def test_unmatched_or_empty_echo_does_not_retire_a_question(self, tmp_path, monkeypatch):
+        """Only positive consumption evidence closes the answer channel."""
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+        state.broadcast_ws_owners = MagicMock()
+        slot = state.get_or_create_slot("test")
+        slot._pending_steers = ["still pending"]
+        state.mark_question_pending(
+            "test",
+            blocking=False,
+            card_id="card-live",
+            questions=[{"question": "Which option?", "options": [{"label": "B"}]}],
+        )
+
+        from kiro_crew.dashboard.chat_runner import _settle_consumed_steers
+
+        _settle_consumed_steers(slot, "<user_message>\nsomething else\n</user_message>", state)
+        assert list(slot._question_pending) == ["card-live"]
+
+        # Legacy empty echoes settle the steer list to avoid message loss, but
+        # they prove no user message was consumed and must not retire the card.
+        _settle_consumed_steers(slot, "", state)
+        assert list(slot._question_pending) == ["card-live"]
+        state.broadcast_ws_owners.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_a_requeued_steer_row_stops_claiming_injection(
         self, tmp_path, monkeypatch, _patch_sel
     ):
@@ -655,7 +729,7 @@ class TestSteerLifecycleState:
         The settle then removes the pending entry BEFORE any row exists, so it has
         nothing to promote. If the row that follows claimed `written`, a CONFIRMED
         injection would be understated forever -- nothing runs the promotion twice.
-        This is the mirror of the #7246 defect: overstating and understating are
+        This is the mirror case: overstating and understating are
         both the row disagreeing with the backend.
         """
         monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
@@ -665,8 +739,8 @@ class TestSteerLifecycleState:
 
         async def _consume_during_rpc(_msg):
             # Drive the REAL settle with a REAL echo rather than hand-clearing the
-            # list. A bare `_pending_steers.clear()` reproduces the EVIDENCE-FREE
-            # `settle_all_on_empty` sweep, not a matched echo -- an injection
+            # list. A bare `_pending_steers.clear()` would reproduce an
+            # EVIDENCE-FREE sweep, not a matched echo -- an injection
             # narrower than the fault this test names, which let it pass while
             # `chat_delivery` was inferring `consumed` from absence alone.
             from kiro_crew.dashboard.chat_runner import _settle_consumed_steers
@@ -697,12 +771,12 @@ class TestSteerLifecycleState:
     ):
         """An EMPTY echo is no evidence, so the row must not claim consumption.
 
-        `_settle_consumed_steers` passes `settle_all_on_empty=True`, so an empty
-        frame clears the pending list without matching anything. `chat_delivery`
-        used to infer `consumed` from the entry being gone, which turned a frame
-        that proved nothing into a success badge -- and a row persisted as
-        `consumed` is terminal, so nothing ever corrected it. That is the #7246
-        defect this change exists to remove, reached by a different route.
+        An empty frame settles nothing, so the entry stays registered -- the
+        still-registered path, which yields `written`. If `chat_delivery` inferred
+        `consumed` from the entry being gone, a frame that proved nothing becomes
+        a success badge -- and a row persisted as `consumed` is terminal, so
+        nothing would correct it. That is the defect this change removes, reached
+        by a different route.
         """
         monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
         state = _make_state(tmp_path)
@@ -727,8 +801,9 @@ class TestSteerLifecycleState:
         outcome = await steer_into_running_turn(state, slot, "go north")
 
         assert outcome == STEER_STEERED
-        # The sweep really did clear it, so this is the absence-inferring path.
-        assert slot._pending_steers == []
+        # The empty echo settled nothing, so the entry is still registered when
+        # the RPC resumes -- the still-registered path, which yields `written`.
+        assert slot._pending_steers == ["go north"]
         row = next(m for m in slot.messages if m.get("meta", {}).get("steer"))
         assert (
             row["meta"].get("steerState") == "written"
@@ -794,7 +869,7 @@ class TestSteerLifecycleState:
         belongs to which steer is then unknowable from the row, so neither is
         patched: understating a state is recoverable, while patching the wrong row
         would claim the wrong message was the one the turn consumed. Real identity
-        for a pending steer is the refactor tracked in #4333.
+        for a pending steer is a separate refactor, out of scope here.
         """
         monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
         state = _make_state(tmp_path)
@@ -847,10 +922,10 @@ class TestSteerLifecycleState:
         nothing left to attribute, and both rows take the SAME new state, so which
         row is which cannot be observed. ``steer_settle`` already settles this
         group (`test_a_redaction_collision_settles_when_every_member_was_echoed`);
-        the row resolver used to disagree with it and leave two CONFIRMED
+        the row resolver must not disagree with it and leave two CONFIRMED
         injections reading `written` for the slot's life. That understates the
-        state -- the mirror of #7246 -- and needs no real steer identity, which
-        remains #4333's job.
+        state -- the mirror case -- and needs no real steer identity, which is a
+        separate refactor.
         """
         monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
         state = _make_state(tmp_path)
@@ -906,7 +981,7 @@ class TestSteerLifecycleState:
         This is the other side of that discrimination and it must not err
         permissive: if the echo left a twin PENDING, which row belongs to the
         settled steer is unknowable again, so the row keeps `written`. Erring the
-        other way would confirm a steer whose attribution is unknown -- the #7246
+        other way would confirm a steer whose attribution is unknown -- the
         defect this whole change exists to prevent -- so "cannot prove the group
         fully settled" and "partial" have to be the same branch.
 
@@ -1094,14 +1169,14 @@ class TestSteerLifecycleState:
 
     @pytest.mark.asyncio
     async def test_an_empty_echo_never_claims_consumption(self, tmp_path, monkeypatch, _patch_sel):
-        """An empty echo clears the pending list but must not promote any row.
+        """An empty echo leaves the pending list untouched and promotes no row.
 
-        `settle_all_on_empty=True` is this path's long-standing behaviour and it
-        stays, so an empty echo still suppresses the requeue. But an empty echo is
-        no evidence of consumption -- `steer_settle` says exactly that -- so writing
-        `consumed` off it would reinstate the defect this change exists to remove:
-        the row, the transcript and the history all asserting an injection nothing
-        confirmed.
+        An empty EVENT_STEER_CONSUMED echo must not clear the whole pending list
+        with no evidence: doing so suppresses `_requeue_unconsumed_steers` and
+        the user's correction is silently lost while its row claims delivery. An
+        empty echo is no evidence of consumption (`steer_settle` says exactly that),
+        so the entry must stay pending, nothing may be promoted, and the
+        turn-end requeue must render a visible, cancellable queue card.
         """
         monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
         state = _make_state(tmp_path)
@@ -1113,7 +1188,10 @@ class TestSteerLifecycleState:
         slot._acp_client = client_mock
 
         from kiro_crew.dashboard.chat_delivery import steer_into_running_turn
-        from kiro_crew.dashboard.chat_runner import _settle_consumed_steers
+        from kiro_crew.dashboard.chat_runner import (
+            _requeue_unconsumed_steers,
+            _settle_consumed_steers,
+        )
 
         await steer_into_running_turn(state, slot, "go north")
         row = next(m for m in slot.messages if m.get("meta", {}).get("steer"))
@@ -1121,13 +1199,22 @@ class TestSteerLifecycleState:
 
         _settle_consumed_steers(slot, "   ", state)
 
-        # pending-list behaviour unchanged: the empty echo still settles it
-        assert slot._pending_steers == []
-        # but nothing was CLAIMED about the row
+        # the empty echo settled NOTHING: the entry is still pending
+        assert slot._pending_steers == ["go north"]
+        # and nothing was CLAIMED about the row
         assert row["meta"].get("steerState") == "written"
         assert not any(
             c.args[0] == "chat_message_update" for c in state.broadcast_ws.call_args_list
         )
+
+        # the turn ends with the entry still pending, so the teardown requeue
+        # (wired into _run_chat's outer finally) renders a cancellable card
+        # instead of the correction being silently dropped
+        _requeue_unconsumed_steers(state, slot)
+
+        assert [entry["content"] for entry in slot._queue] == ["go north"]
+        assert slot._pending_steers == []
+        assert row["meta"].get("steerState") == "requeued"
 
     @pytest.mark.asyncio
     async def test_a_duplicate_pending_steer_settles_one_entry_only(self, tmp_path, monkeypatch):
@@ -1248,13 +1335,13 @@ class TestHardKillDiscardsSteers:
 class TestRequeuedSteerCarriesTheClientSendId:
     """A steer the turn never confirmed must reach its ROW with the client id.
 
-    An ACCEPTED steer persists its own row and stamps `meta.sendId` there
-    (#6075). A REQUEUED steer does not persist anything: the teardown degrades it
+    An ACCEPTED steer persists its own row and stamps `meta.sendId` there.
+    A REQUEUED steer does not persist anything: the teardown degrades it
     into a queue card and the DRAIN writes the row. So the id has to travel one
     step further -- registration, queue entry meta, drained row -- or the row is
     id-less and `mergePreservedThinking` has nothing to resolve the tab's
     optimistic bubble against, leaving the pre-steer thinking chip stranded at the
-    tail until a reload (#6751).
+    tail until a reload.
 
     The three `STEER_REQUEUED` returns are deliberately NOT the write site, which
     is why no test here asserts against them: one of them returns BEFORE the

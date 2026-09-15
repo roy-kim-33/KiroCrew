@@ -174,6 +174,80 @@ verification. Route names below are relative to that prefix.
 | `/apps/dev-fleet/api/restart-gateway` | — | Restart the live gateway through its service-manager backend; returns the pre-restart `start_id` for the restart handshake |
 | `/apps/dev-fleet/api/make-live` | `{path, dry_run?}` | Repoint the live gateway at another worktree (see Make Live); a real cutover returns `start_id` for the restart handshake |
 
+### Agent surface (gateway process, `/api/apps/dev-fleet/pod/*`)
+
+A second, deliberately small pod surface exists for AGENT sessions, served **in the
+gateway process** rather than by the backend subprocess (`agent_pod_api.py`).
+
+Why it is separate rather than a reuse of the proxied routes above: an agent session
+runs behind a sandbox with its own user namespace, so it cannot `connect(2)` the
+systemd user-bus socket that every pod verb needs, and `kirocrew pod up` in an agent
+shell fails with a bare `Permission denied`. The gateway is the process the sandbox
+launcher descends from, so it holds the host bus. The agent reaches these routes the
+way it reaches any tool — an MCP call, then loopback HTTP — with no D-Bus passthrough
+into the sandbox. The proxied `/apps/dev-fleet/api/*` routes cannot serve this: they
+require a dashboard cookie or token, which an agent does not hold, and admitting an
+internal-secret caller there would expose the app's whole backend surface.
+
+| Method | Route | Input | Description |
+|--------|-------|-------|-------------|
+| POST | `/api/apps/dev-fleet/pod/up` | `{worktree}` | Boot a pod; answers the CLI's `--json` handle (`base_url`, `token`, `port`, `ttl`). Provisioning is NOT reachable here: a cold venv + SPA build is minutes of work, and one blocking request for that dies to any timeout with no way to learn the outcome. An unbuilt worktree is refused with the CLI's own remedy; the dashboard's Provision button streams the same work under a run id |
+| POST | `/api/apps/dev-fleet/pod/down` | `{worktree}` | Stop the pod and reclaim its isolated HOME |
+| GET | `/api/apps/dev-fleet/pod/status?worktree=` | — | `{name, status, port, health}`, as `pod status --json` reports it |
+| GET | `/api/apps/dev-fleet/pod/list` | — | `{pods: [{name, port, health}]}` for every pod active on the host, unfiltered by repo |
+
+Contract:
+
+- **Gated on the app being enabled** (`_require_enabled`), since routes are
+  registered at startup and Dev Fleet ships `defaultEnabled: false`.
+- **No operator opt-in and no per-call approval, deliberately.** A pod runs the code
+  in a git worktree an agent can write, started by the user systemd manager, so it
+  executes outside the agent's sandbox. That reachability is Kiro Crew's DOCUMENTED
+  posture rather than something these routes introduce: `security.md`, under "Scoped
+  user-bus locator forward", records that sandboxed agent shells legitimately run
+  `systemctl --user` and the `kirocrew pod` CLI, and names the residual in the same
+  paragraph; the builtin `pod-e2e` skill has always told agents to boot pods. An
+  extra gate here would not close that residual — every other path to it stays open —
+  it would only stop the agent-driven QA loop these routes exist to restore. Agent
+  pod control is an intended capability, so it is not gated. State the residual
+  precisely rather than comfortably: on a host whose OUTER sandbox denies the user
+  bus, these routes are the one path from an agent-writable worktree to code running
+  unsandboxed as the user, so enabling Dev Fleet on such a host now carries that
+  surface. App admission policy can deny the app outright where that is unwanted.
+- **Named one by one in `server._STRICT_INTERNAL_API_PATHS`**, never as a
+  `/api/apps/dev-fleet/pod` prefix. That table is exact-or-prefix
+  (`path == entry or path.startswith(entry + "/")`), and this app's neighbourhood
+  includes worktree prune and the Make Live cutover, which must not become reachable
+  by holding the internal secret.
+- **STRICT, not mixed** — no browser calls them. Each handler re-asserts local origin
+  AND `internal_auth`, because a `local_only=False` deployment reclassifies strict
+  paths as mixed (same reason `/api/computer-use/frame` re-asserts both). Local origin
+  is the UNION of the AF_UNIX socket and a loopback address, mirroring the
+  middleware's own `_unix_sock is not None or is_loopback(...)`: `mcp_core` prefers
+  the gateway's unix socket whenever the file exists, and `request.remote` is empty
+  over AF_UNIX, so testing the loopback half alone would refuse every call on the
+  platform pods actually run on.
+- **No pod logic of its own.** Every handler delegates to the same `worktree_ops`
+  helpers the dashboard's buttons call, so "up" means one thing and a pod's status
+  has one definition.
+- **Refusals are 409 with a literal `code`** (`pod_up_failed`, `pod_down_failed`,
+  `pod_status_failed`, `pod_list_failed`); malformed input is 400
+  (`invalid_worktree`, `invalid_body`). A refused lifecycle op is a host-state
+  answer, not a gateway bug. `repository._repo()` raises when no main checkout is
+  configured, and the read verbs catch that rather than letting a setup problem
+  surface as a 500.
+- **Every lifecycle CHANGE and every guard denial is written to the Security Event
+  Log** under `dev_fleet.agent.*` (`pod_up`, `pod_down`, `machine_guard`): the caller
+  is unattended, so the trail is what makes the run reviewable. The read verbs are
+  not audited there — they change nothing, and the framework-level tool log already
+  records the call.
+
+The model-facing half is the `pod_up` / `pod_down` / `pod_status` / `pod_ls` tools on
+`kirocrew-core` (`mcp_tools/apps.py`). The pod token is returned to the agent
+verbatim — redacting it would hand back an unusable handle — which is safe because it
+is a 2h credential scoped to that pod's own gateway, minted server-side from the
+pod's `.local_secret` so the agent never touches the secret itself.
+
 ## Authorization
 
 All endpoints inherit gateway session auth. No additional RBAC — all authenticated users
@@ -256,7 +330,8 @@ it as hung clicks again or reloads mid-scan.
 
 Relies on `kiro_crew.pod` subpackage (optional import — degrades gracefully if unavailable):
 
-- `runtime.active_names(cfg)` — systemctl list (blocking, offloaded via `run_in_executor`)
+- `runtime.active_names(cfg)` — one point-in-time systemctl/launchctl listing per fleet build
+  (blocking, offloaded via `run_in_executor`), shared by every worktree row
 - `runtime.derive_port(cfg, name)` — cksum-based port derivation (blocking, offloaded)
 - `runtime.health(cfg, name, port, timeout)` — identity-gated HTTP probe (blocking,
   offloaded). Takes the pod's NAME, not just its port, because a derived port is
@@ -572,6 +647,26 @@ scheduling the restart and hands it to the frontend:
   `POST …/make-live` cutover also returns the pre-restart `start_id` and the UI
   recovers on an identity change.
 
+### Completed-cutover Undo banner
+
+After the reloaded fleet proves the pointer target is the checkout actually
+running, `undo_target` exposes the validated, still-discovered
+`previous_checkout`. The page renders a persistent success banner naming the
+current checkout and a **Switch back to `<previous>`** button. The inverse action opens a confirmation
+that names the destination and accurately distinguishes an automatic restart
+from a staged/manual one, then posts `{path, undo: true}` through the same Make
+Live transaction and restart handshake.
+
+The banner is deliberately absent while a pointer is staged but not running:
+**Cancel staged cutover** is the inverse in that state, while Undo is the inverse
+of a completed cutover. Dismissing the banner stores its current
+`current→previous` pair in per-tab `sessionStorage`, so page reloads and Dev Fleet
+revisits keep that pair hidden. The stored pair is spent as soon as a loaded fleet
+payload reports a different pair or none at all, so a later Make Live is visible
+even when it recreates the very same pair (feature → main dismissed, back to main,
+the same feature live again). A successful Undo consumes `previous_checkout`, so the reloaded page has
+no accidental redo banner.
+
 ### Restarting UI state
 
 While the handshake runs, the frontend holds an explicit **"Restarting —
@@ -648,6 +743,56 @@ the STOCK SPA; staging that would silently replace the edition dashboard with
 upstream's. Skipping is what makes it safe, and it costs an edition nothing —
 the only artifact this path could produce for it is a bundle it must never
 serve.
+
+**The frontend half is also suppressed on a backend-only sync — one whose
+incoming ref changes nothing under `website/`.** Both `npm ci` and `npm build +
+stage` are then work with no output: no new lockfile to install, no new source to
+build, and the staged bundle is already the current one. The decision is made by
+the `Verify dependencies` preflight, the one step that runs after `fetch` has
+pinned the incoming ref and before `merge` makes the worktree equal to it — the
+only point where "does the incoming ref touch the frontend?" has a correct answer.
+It cannot be decided when the step list is assembled, because the per-PID sync ref
+is not written until fetch runs; on a long-lived gateway's second sync it would
+still point at the prior tip. The preflight signals the verdict by exiting a
+reserved code (`EXIT_FRONTEND_SKIP`, 48) that the runner trusts ONLY from the
+preflight's own label — a worktree-run step exiting the same code is demoted to a
+plain failure, so it cannot forge a "skip the build". The runner then suppresses
+the two frontend steps whole, transaction included: a suppressed `npm ci` must not
+enter the `node_modules` transaction, whose move-aside-then-drop-backup on a no-op
+exit would delete the tree.
+
+The suppression fires only when ALL of these hold together, so the tree that
+produced the staged bundle and the tree now on disk are provably identical across
+tracked files, untracked files, and installed packages:
+
+1. the incoming ref changes nothing under `website/` (the tracked `git diff` the
+   probe skip already computes);
+2. the working subtree is clean INCLUDING untracked files (`git status
+   --porcelain --untracked-files=normal -- website` empty) — the same check the
+   fingerprint is STAMPED behind, re-checked before it is TRUSTED, so an untracked
+   `website/` file added between build and skip cannot ride through;
+3. `node_modules` is complete against the lockfile (`npm ls --all` exits 0), which
+   closes the partial-tree residual a bare "populated" check would leave;
+4. a build-source fingerprint — the git tree id of `website/` stamped beside the
+   staged bundle on the last successful build, and only when that build's tree was
+   clean — equals the incoming ref's `website/` tree.
+
+Any single failure, or any uncertainty (missing or failing `git`/`npm`, a
+timeout), returns "run", so the unknown case always rebuilds; the suppression
+cannot hold while a rebuild is owed.
+
+**Declared bound: this is a skip optimisation, so it has an inherent
+check-then-skip window.** The preflight decides before the merge, the runner
+suppresses after it, and the fingerprint is read right after the build; a tree
+changed by a concurrent writer in between yields a STALE build, never a wrong or
+corrupt one. This is the defining window of every build cache — closing it
+completely would need a lock held across the whole build, which destroys the
+~28 s the suppression saves. The worst outcome is a stale build on the operator's
+OWN checkout, rebuilt by re-running Pull + Build: no data lost, nothing corrupted,
+and whoever changed the tree mid-sync is who sees the result. The window is kept
+as narrow as it cheaply can be without a lock — the cleanliness check and the
+tree-id read run back-to-back under the staging lock, and the preflight runs
+immediately before the merge.
 
 The final **npm build + stage** step builds the frontend and copies `website/dist` into
 `src/kiro_crew/static/dist` under the Dev Fleet backend's OWN interpreter, with
@@ -737,15 +882,14 @@ still probes. Anything the comparison cannot answer — a failing or missing `gi
 a timeout — probes as well: the unknown case costs an install rather than a
 guarantee.
 
-A populated tree is evidence, not a verified install, and the bound is worth
-stating: a prior frontend sync whose post-merge `npm ci` died partway can leave a
-partial tree beside the merged lockfile, and later backend-only syncs will skip on
-it, since from there on the subtree is unchanged and nothing re-examines it. The
-consequence is the same class as the dead-registry residual — the skip decides only
-whether this sync pays for a rehearsal, so a refusal lands one step later rather
-than never, and the transaction keeps the checkout consistent either way. Issue
-[#7132](https://github.com/kirodotdev/KiroCrew/issues/7132) tracks the stronger
-evidence check that would close it.
+A populated tree is evidence, not a verified install. On its own that would let a
+partial tree — a prior frontend sync whose post-merge `npm ci` died partway,
+leaving packages missing beside the merged lockfile — pass as "populated". For
+the PROBE skip that residual is benign (the skip decides only whether this sync
+pays for a rehearsal, so a refusal lands one step later rather than never, and the
+transaction keeps the checkout consistent either way). For the frontend-STEP
+suppression below it would not be benign, so that path does not rely on the
+populated check alone — see the build-currency preconditions there.
 
 The condition is the whole subtree rather than just `package-lock.json` /
 `package.json` / `.npmrc`, and the difference is load-bearing. With those three
@@ -773,6 +917,97 @@ reserved code arriving from any step OTHER than the probe is demoted to a plain
 failure, because every other step runs worktree-controlled code that can exit any
 number it likes; and only the sync run kind is stamped at all, since `_start_run`
 is shared with `provision`, whose script enforces no such reservation.
+
+**When there is no reserved code, the failure is named from the failing step's
+stderr — never from the last output line.** Every step's stdout and stderr land
+in ONE pipe (`_start_run` spawns the runner with `stderr=STDOUT`, and steps
+inherit it), and a child block-buffers stdout to a pipe while writing stderr
+unbuffered — so the stdout buffer flushes at process EXIT, *after* the
+diagnostic. The stream order is therefore not evidence of what failed. A refused
+`git merge --ff-only` demonstrates it exactly:
+
+```
+error: Your local changes to the following files would be overwritten by merge:
+        config-baseline.json
+Please commit your changes or stash them before you merge.
+Aborting
+Updating 2f9ed9724..bf09e50e5     <- stdout, flushed last
+```
+
+`run_step` therefore gives each step's stderr its own pipe, pumps it through to
+stdout line by line (so the log and the live "current activity" line are
+unchanged), and remembers its last `_STEPERR_TAIL` non-blank lines. When the step
+fails, `run_steps` re-emits those as `::steperr::<idx>::<line>` markers, and the
+UI's ladder is `cause` → the `::steperr::` block → the last output line. Both
+marker families are filtered out of the log panel: the stderr lines already
+appear there in their own order, so the markers would only duplicate the tail.
+
+Order WITHIN each stream is preserved; order ACROSS the two is unspecified. The
+child writes stdout straight to the inherited descriptor while the pump relays
+stderr, so the two interleave by timing rather than by causality. That is the
+premise of the change rather than a gap in it — a position in this stream was
+never evidence of what failed, which is why the tail is labelled instead of
+located.
+
+**The pump reads with a cap, it does not iterate the handle.** A step runs
+worktree-controlled code, so it can write a newline-free blob of any length, and
+`for line in stream` would allocate the whole blob inside the runner — the
+unbounded-read shape `test_jsonl_util.py::TestNoUnboundedHandleIteration`
+refuses. `readline(_STEPERR_READ_CAP)` bounds every allocation instead: a longer
+run arrives as cap-sized pieces, each forwarded, so splitting is the only effect and
+the
+blob is merely split across lines. The repo's own `jsonl_util` bounded readers
+are unavailable here — this module is stdlib-only and executes from a snapshot by
+path — so the bound is spelled with the stdlib.
+
+**That cap is derived from the gateway's byte limit, not chosen.** The two ends
+count different units: `readline` caps CHARACTERS because the stream is a text
+wrapper, while the gateway reads this pipe with `asyncio.StreamReader.readline()`,
+whose 64 KiB limit counts BYTES — and a line past it raises `LimitOverrunError`
+there, whose handler reaps the whole process tree. A character encodes to at most
+4 UTF-8 bytes and the pump appends one newline, so the cap is
+`(_GATEWAY_LINE_BYTES - 1) // 4`. A round-number character cap would satisfy the
+byte ceiling only for ASCII, and multibyte stderr — a non-ASCII checkout path, a
+localized git message — is ordinary. `test_dev_fleet_sync_runner.py` asserts the
+ENCODED length of every forwarded line, since an ASCII fixture cannot see the
+gap. A remembered tail line is separately capped at `_STEPERR_LINE_CHARS`, because
+the tail is rendered in a one-notice banner rather than in a log.
+
+**The drain after the step exits is bounded too.** `pump.join` waits
+`_STEPERR_DRAIN_S` and no longer. EOF on that pipe needs every writer gone, and a
+GRANDCHILD inherits the write end — `npm` spawns several — so one survivor keeps
+it open and EOF never arrives. An unbounded join would turn that survivor from a
+cosmetic leak into a wedged Pull+Build, so late lines are dropped instead. What
+that costs is precise: everything the STEP ITSELF wrote is relayed, since its
+bytes are in the pipe by the time `wait()` returns; what can be dropped is output
+written after the cutoff by something that outlived the step, which is the
+survivor this bound exists for.
+
+**This runner is the SOLE writer to its stdout pipe, and that is what makes the
+byte bound real.** Capping our own writes bounds nothing while a step also owns
+the descriptor: it can emit a newline-free blob that prepends to a terminated
+relay line, and the merged inter-newline run the gateway reads then exceeds
+`_GATEWAY_LINE_BYTES` however tightly each writer capped itself — which raises in
+the reader and reaps the process tree. So `run_step` pipes stdout as well as
+stderr, relays each on its own pump, and every write in the module — both pumps
+and every `::step::` / `::steperr::` / transaction line — goes through `emit`,
+which holds one lock for the whole line. A step that deliberately interleaves
+newline-free stdout blobs with terminated stderr lines produces 15 spliced lines
+without that, which `test_concurrent_stdout_cannot_splice_a_relayed_line` pins by
+mutation.
+
+`run_step`'s docstring states the guarantees exhaustively, as four numbered
+lines. Read them there rather than inferring them from prose here — sweeping
+wording about the log being complete or in order is what made this paragraph wrong
+twice.
+
+`::steperr::` is a **label on a worktree-controlled stream, not a diagnosis.** It
+never sets `lastIsCause`, so it renders as the raw tail it is — a step printing a
+plausible sentence to stderr gains exactly what it already had, its output shown
+verbatim. The one shape that is guarded is an all-blank forged tail, which would
+resolve to the empty string and make `ErrorNotice` render nothing: blank marker
+texts are dropped, and the last-line fallback skips marker lines too, so a forged
+marker can neither hide the notice nor be surfaced raw.
 
 The build and the copy are ONE step because they share ONE holder of the staging
 lock (`.dist.staging.lock`, next to `static/dist`). `npm run build` empties
@@ -809,8 +1044,22 @@ Location: `config_dir() / "live_target.json"` (inside the active data home,
 typically `~/.kiro/crew/live_target.json`). Contents:
 
 ```json
-{"checkout": "/absolute/path/to/worktree"}
+{
+  "checkout": "/absolute/path/to/worktree",
+  "previous_checkout": "/absolute/path/to/previous-worktree"
+}
 ```
+
+`previous_checkout` is optional and records exactly one completed cutover for the
+post-restart **Undo** banner. Both fields validate as executable Kiro Crew
+checkouts before they are written. At read time, `checkout` follows the normal
+boot validation, while the Undo path validates `previous_checkout`; rebuilding
+the checkout already running does not hide an otherwise safe return target.
+Ordinary Make Live replaces the history with the checkout currently
+running when that checkout validates; otherwise the cutover succeeds without an
+Undo destination. Undo consumes the stored history (the rewritten pointer omits `previous_checkout`) rather than turning the inverse into an
+implicit redo. Legacy pointers containing only `checkout` remain valid and
+simply expose no Undo action.
 
 Written atomically (temp file + `os.replace`) with mode `0o600`. The file is
 **keystone-fenced** (in `_CREW_SECRET_LEAVES`) so agent tools can neither read
@@ -828,9 +1077,13 @@ Reading the definition first would report that stale checkout as live.
 
 ### Request / Response
 
-Request body: `{path, dry_run?}` — `path` is a worktree path (validated against
-the discovered set, never an arbitrary path); `dry_run` (bool, default false)
-returns the plan without writing the pointer.
+Request body: `{path, dry_run?, undo?}` — `path` is a worktree path
+(validated against the discovered set, never an arbitrary path); `dry_run` (bool,
+default false) returns the plan without writing the pointer. `undo` (bool,
+default false) requires `path` to equal the pointer's validated
+`previous_checkout`; that binding is checked again under the Make Live lock, so
+a stale banner cannot reverse a newer cutover. `undo` and `expected_staged` are
+mutually exclusive.
 
 - **dry_run success:** `{ok: true, dry_run: true, plan: {mechanism, pointer_path,
   exec, restart, target, [manual_restart]}}`
@@ -839,6 +1092,9 @@ returns the plan without writing the pointer.
 - **cutover success (staged only):** `{ok: true, cutover: true, staged_only: true,
   target, plan, manual_restart, notice}` — the pointer is written and correct;
   the operator finishes the cutover by restarting the gateway themselves.
+- **Undo success:** the same automatic/staged result shapes; the target becomes
+  the prior checkout and `previous_checkout` is consumed before the restart is
+  scheduled.
 - **refusal:** `{ok: false, code, error}` — `code` is one of the values below.
 
 The handler additionally returns HTTP 400 for a missing/non-string `path` or a
@@ -863,6 +1119,8 @@ The `plan` object describes the cutover mechanism:
 | `pod` | called from inside a pod — a throwaway test instance must never repoint the live gateway |
 | `pod_indeterminate` | pod status could not be resolved (config home unresolvable) — **fail-closed**, never treated as "not a pod" |
 | `already_live` | the target is already the live gateway |
+| `undo_changed` | the requested Undo path no longer equals the pointer's validated previous checkout (stale banner or newer cutover); refresh before retrying |
+| `undo_not_ready` | the requested inverse is still the running checkout, so the original cutover is only staged; use Cancel staged cutover instead |
 | `missing_venv` | the worktree has no `.venv/bin/kirocrew` (Provision it first) |
 | `venv_not_executable` | the worktree's `.venv/bin/kirocrew` exists but is **not executable** (`chmod +x` it or re-Provision) — a non-executable binary would stop the live gateway but could not start the replacement, leaving no gateway running |
 | `missing_dist` | the worktree has no built `src/kiro_crew/static/dist/index.html` (Pull+Build first) — a cutover without a built dist serves a broken dashboard |

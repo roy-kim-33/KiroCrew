@@ -386,6 +386,67 @@ async def _pod_logs(name: str, n: int = 120) -> dict:
     return {"ok": True, "logs": runtime._redact(raw)}
 
 
+async def _pod_status(name: str) -> dict:
+    """One pod's unit state, port and health, as ``kirocrew pod status`` reports it.
+
+    Delegated to the CLI rather than recomposed from ``rt.is_active`` +
+    ``rt.derive_port`` + ``rt.health`` so there is ONE definition of what a pod's
+    status is. A second composition here would drift from the CLI's the first time
+    either side learned a new health verdict (``HEALTH_FOREIGN`` is already one),
+    and an agent comparing the two would be told different things about one pod.
+    """
+    guard = await _pod_checkout_guard(name)
+    if guard:
+        return {"ok": False, "error": guard}
+    await runtime._warm_build_path()
+    rc, stdout, stderr = await runtime._run_cmd(
+        runtime._find_cli() + ["pod", "status", name, "--json"],
+        cwd=repository._repo(),
+        env=_pod_env(),
+        timeout=30,
+    )
+    if rc != 0:
+        return {"ok": False, "error": runtime._redact(stderr or stdout)}
+    try:
+        parsed = json.loads(stdout)
+    except ValueError:
+        return {"ok": False, "error": "pod status returned unparseable JSON"}
+    if not isinstance(parsed, dict):
+        return {"ok": False, "error": "pod status returned an unexpected shape"}
+    return {"ok": True, **parsed}
+
+
+async def _pod_ls() -> dict:
+    """Every pod ACTIVE on this host, not only this repo's.
+
+    Deliberately unscoped: the answer's whole use is collision reasoning (which
+    ports are taken, what is already running), and a list filtered to one repo's
+    worktrees would omit exactly the pod that explains a refusal. Read-only and
+    name/port/health only -- it exposes no other checkout's contents.
+
+    ``repository._repo()`` raises when no main checkout is configured. That is NOT
+    caught here: it is raised on every branch of every pod verb (cwd, ``_pod_env``,
+    and inside ``_pod_checkout_guard``'s discovery chain), so the agent surface
+    catches it once at the handler instead of each helper catching its own branch.
+    """
+    await runtime._warm_build_path()
+    rc, stdout, stderr = await runtime._run_cmd(
+        runtime._find_cli() + ["pod", "ls", "--json"],
+        cwd=repository._repo(),
+        env=_pod_env(),
+        timeout=30,
+    )
+    if rc != 0:
+        return {"ok": False, "error": runtime._redact(stderr or stdout)}
+    try:
+        parsed = json.loads(stdout)
+    except ValueError:
+        return {"ok": False, "error": "pod ls returned unparseable JSON"}
+    if not isinstance(parsed, list):
+        return {"ok": False, "error": "pod ls returned an unexpected shape"}
+    return {"ok": True, "pods": parsed}
+
+
 async def _pod_provision(name: str) -> dict:
     guard = await _pod_checkout_guard(name)
     if guard:
@@ -415,6 +476,12 @@ async def _pod_provision(name: str) -> dict:
             cwd=repository._repo(),
             env=p_env,
             cleanup_paths=[p_cleanup] if p_cleanup else None,
+            # Provisioning builds .venv and the SPA dist INSIDE the worktree
+            # that `du -sm` measures, so a completed (or killed-partway) run
+            # materially changes disk use: drop the disk cache's freshness
+            # stamp at every terminal state so the next /disk poll
+            # re-aggregates instead of serving pre-provision totals.
+            on_finish=fleet_state._disk_invalidate,
         )
         fleet_state._PROVISION_INFLIGHT[name] = rid
     return {"ok": True, "run_id": rid}
@@ -753,10 +820,10 @@ async def _worktree_remove_locked(
     # about working-tree edits. `git worktree remove --force` bypasses git's
     # own dirty check and would irrecoverably destroy uncommitted edits.
     # Contract: NO path from this gate ever passes --force to git:
-    #   - dirty is not False → refuse outright (round 5)
+    #   - dirty is not False → refuse outright
     #   - dirty is False → drop --force so git's own dirty check is the
     #     atomic last line against edits arriving in the check-to-removal
-    #     window (round 6, mirrors the unmerged-clean TOCTOU pattern)
+    #     window (mirrors the unmerged-clean TOCTOU pattern)
     if force and fleet_state._is_pr_merged(pr) and branch:
         dirty = await _dirty_now()
         if dirty is not False:
@@ -1337,6 +1404,11 @@ async def _worktree_remove_locked(
             (verdict_oid or "").strip()[:12] if verdict_oid else "none",
         )
         fleet_state._fleet_forget(name)
+        # A removed checkout materially changes worktree disk use, and this is
+        # the chokepoint every removal path already routes through: drop the
+        # disk cache's freshness stamp so the next /disk poll re-aggregates
+        # instead of serving pre-removal totals for the rest of the TTL.
+        fleet_state._disk_invalidate()
         return {
             "ok": True,
             "removed": True,
@@ -1403,6 +1475,68 @@ def _venv_python(repo: str) -> Path | None:
         if cand.is_file():
             return cand
     return None
+
+
+def _frontend_build_steps(
+    *,
+    npm_bin: str,
+    git_bin: str,
+    repo: str,
+) -> list[tuple[list[str], str, dict, str]]:
+    """The ``npm ci`` and ``npm build + stage`` steps, in order.
+
+    Returns both steps unconditionally. Whether they RUN is decided at run time
+    by the sync runner, which suppresses a step whose label is in its
+    frontend-skip set when the trusted preflight step exits the frontend-skip
+    verdict. That decision is made by the preflight -- the one point that runs
+    after ``fetch`` pinned the incoming ref and before ``merge`` -- so it is made
+    in the only window where "does the incoming ref touch the frontend?" has a
+    correct answer. Deciding it here at assembly time would read the per-PID sync
+    ref before fetch wrote it, so on a long-lived gateway's second sync it would
+    compare against the PRIOR tip and skip a rebuild an incoming frontend change
+    genuinely needed.
+
+    The two steps suppress together because the runner keys on their labels off
+    one preflight verdict, and they must: ``npm ci`` reifies the incoming
+    lockfile and ``npm build + stage`` compiles the source, sharing the one
+    precondition the verdict encodes.
+
+    ``git_bin`` is the sync's trusted-bin absolute git path; it is threaded into
+    ``build_and_stage`` so the read-only build-source fingerprint's git calls use
+    a trusted binary rather than a PATH search.
+    """
+    return [
+        ([npm_bin, "ci", "--prefix", "website"], "strict", runtime._build_env(), "npm ci"),
+        # Build and stage as ONE step, holding the staging lock across both.
+        # `npm run build` empties website/dist, so a peer flow (the dashboard's
+        # own update, pod provisioning) staging concurrently would copy a
+        # partially written tree — and a bundle's lazy chunks are not reachable
+        # from index.html, so no post-hoc inspection detects that reliably.
+        # Covering only the copy is not enough; the holder has to span the build.
+        #
+        # Run with THIS backend's interpreter, not the target checkout's: the
+        # logic is revision-independent, while resolving it from the target would
+        # make the step's very EXISTENCE contingent on the pulled revision
+        # carrying build_and_stage, turning an older target into an ImportError
+        # that fails the whole Pull+Build. The repo to build, npm's resolved
+        # trusted path, and git's trusted path are passed in rather than
+        # re-resolved.
+        (
+            [
+                sys.executable,
+                "-c",
+                "import sys;from kiro_crew.frontend import build_and_stage;"
+                "sys.exit(0 if build_and_stage(sys.argv[1], npm=sys.argv[2], "
+                "git=sys.argv[3]) else 1)",
+                repo,
+                npm_bin,
+                git_bin,
+            ],
+            "strict",
+            runtime._build_env(),
+            "npm build + stage",
+        ),
+    ]
 
 
 #: Trusted loader for the sync-runner snapshot. A FIXED literal — nothing is
@@ -1718,6 +1852,14 @@ async def _sync_start_locked() -> dict:
                     str(repo),
                     "--ref",
                     sync_base_ref,
+                    # Asks this step to exit EXIT_FRONTEND_SKIP (a reserved code
+                    # trusted only from this step) when the incoming ref proves
+                    # the frontend install/build is already present, so the
+                    # runner suppresses the later npm ci and build+stage steps.
+                    # A flag, not a value -- the verdict travels as this step's
+                    # exit code and lives in runner state, never a file another
+                    # same-UID step could forge.
+                    "--emit-frontend-skip",
                 ],
                 "strict",
                 runtime._build_env(),
@@ -1787,37 +1929,18 @@ async def _sync_start_locked() -> dict:
             "edition; the shipped bundle is left in place"
         )
     else:
-        raw_steps += [
-            ([npm_bin, "ci", "--prefix", "website"], "strict", runtime._build_env(), "npm ci"),
-            # Build and stage as ONE step, holding the staging lock across both.
-            # `npm run build` empties website/dist, so a peer flow (the
-            # dashboard's own update, pod provisioning) staging concurrently
-            # would copy a partially written tree — and a bundle's lazy chunks
-            # are not reachable from index.html, so no post-hoc inspection of
-            # the copy detects that reliably. Covering only the copy is not
-            # enough; the holder has to span the build.
-            #
-            # Run with THIS backend's interpreter, not the target checkout's, for
-            # the same reason the staging step does: the logic is
-            # revision-independent, while resolving it from the target would make
-            # the step's very EXISTENCE contingent on the pulled revision
-            # carrying build_and_stage, turning an older target into an
-            # ImportError that fails the whole Pull+Build. The repo to build and
-            # npm's resolved trusted path are passed in rather than re-resolved.
-            (
-                [
-                    sys.executable,
-                    "-c",
-                    "import sys;from kiro_crew.frontend import build_and_stage;"
-                    "sys.exit(0 if build_and_stage(sys.argv[1], npm=sys.argv[2]) else 1)",
-                    repo,
-                    npm_bin,
-                ],
-                "strict",
-                runtime._build_env(),
-                "npm build + stage",
-            ),
-        ]
+        # Append the reinstall AND the rebuild. Whether they RUN is decided at
+        # run time by the sync runner: it suppresses these two labels when the
+        # preflight step (which runs after fetch pinned the incoming ref and
+        # before merge) exits the frontend-skip verdict -- the incoming ref
+        # changed nothing under website/ and node_modules is populated. A
+        # backend-only sync -- the common case, since most syncs move only
+        # Python -- otherwise pays a full `npm ci` (which DELETES node_modules
+        # before reinstalling from an unchanged lockfile) and a full vite build
+        # that reproduces a byte-identical bundle. The decision is made
+        # post-fetch, carried by the preflight's trusted exit code rather than
+        # in-process here where the ref is not yet fetched.
+        raw_steps += _frontend_build_steps(npm_bin=npm_bin, git_bin=git_bin, repo=str(repo))
     cleanups: list[str] = []
     # The preflight's snapshot is removed with the run's other temporaries. It is
     # registered here rather than left behind: a leaked mkdtemp per sync is how
@@ -1928,11 +2051,27 @@ async def _sync_start_locked() -> dict:
         str(npm_preflight.EXIT_TREE_AMBIGUOUS),
         "--exit-restore-failed",
         str(npm_preflight.EXIT_RESTORE_FAILED),
+        "--exit-frontend-skip",
+        str(npm_preflight.EXIT_FRONTEND_SKIP),
+        # The two labels the runner suppresses when the preflight asserts the
+        # frontend-skip verdict. They MATCH the labels _frontend_build_steps
+        # gives those steps; kept literal here rather than derived so the runner
+        # (which imports nothing from kiro_crew) is told exactly what to skip.
+        "--frontend-labels",
+        "npm ci,npm build + stage",
         "--steps-sha256",
         steps_sha256,
     ]
     rid = await runtime._start_run(
-        runtime._SYNC_RUN_LABEL, cmd, env=runtime._build_env(), cleanup_paths=cleanups
+        runtime._SYNC_RUN_LABEL,
+        cmd,
+        env=runtime._build_env(),
+        cleanup_paths=cleanups,
+        # A dependency sync writes pip installs into the repo .venv and
+        # `npm ci` into website/node_modules — both inside trees `du -sm`
+        # measures — so it invalidates the disk cache the same way a
+        # provision run does.
+        on_finish=fleet_state._disk_invalidate,
     )
     _SYNC_RID = rid
     return {"ok": True, "run_id": rid}
@@ -1969,7 +2108,7 @@ async def _rebase_locked(target: dict) -> dict:
     if st is None:
         return {"ok": False, "error": "cannot verify worktree state (git status failed)"}
     if st:
-        # Same fileless refusal the removal path used to give. Name the dirt so
+        # Same fileless refusal the removal path gives. Name the dirt so
         # the user can act on it. The GATE is deliberately unchanged: an
         # untracked file cannot conflict semantically, but it can still block
         # the rebase's checkout when it collides with a path a replayed commit

@@ -1,9 +1,9 @@
 """The per-call ``reasoning_effort`` parameter across every spawn_run layer.
 
-Effort for a subagent used to resolve ONLY server-side
+A subagent's effort otherwise resolves ONLY server-side
 (``agent.role_efforts['subagent']`` -> chat default), so a parent could not
 state the thinking depth its subagents run at without mutating the global
-setting. ``spawn_run`` now takes a batch-wide ``reasoning_effort`` that is
+setting. ``spawn_run`` takes a batch-wide ``reasoning_effort`` that is
 plumbed along the exact path ``model`` takes: schema -> tool body ->
 ``POST /api/spawn`` -> ``SubagentManager.spawn`` -> the ``_run_inner``
 resolution site. Each hop is a place the value can be silently dropped
@@ -228,7 +228,7 @@ class TestUnsupportedModelReport:
 
 class TestVerdictCollapse:
     """Identical per-subagent verdicts collapse into ONE line on wide
-    fan-outs (#6185). ``reasoning_effort`` and ``model`` are batch-wide, so
+    fan-outs. ``reasoning_effort`` and ``model`` are batch-wide, so
     every member of a wide batch usually gets the identical verdict — one
     line per subagent injects N copies of the same text into the calling
     agent's context. Differing verdicts keep their own attributed lines so
@@ -309,9 +309,10 @@ class TestApiSpawnHandler:
         mgr = MagicMock()
         mgr.spawn.return_value = SimpleNamespace(id="a1", done=False, error="")
         mgr.max_concurrent = 4
-        state = SimpleNamespace(subagents=mgr)
+        state = SimpleNamespace(subagents=mgr, conversation_log=MagicMock())
         request = MagicMock()
         request.app = {"state": state}
+        request.headers = {}
 
         async def _json() -> dict:
             return body
@@ -434,6 +435,9 @@ class TestRecordAndRetry:
             include_memory=True,
             include_lessons=True,
             include_project=True,
+            # Reused by the retry alongside the context triple: a retry must not
+            # widen a delegated run to the global store.
+            memory_store="",
             done=True,
             outcome="failed",
         )
@@ -443,6 +447,7 @@ class TestRecordAndRetry:
         state = SimpleNamespace(subagents=mgr)
         request = MagicMock()
         request.app = {"state": state}
+        request.headers = {}
         request.match_info = {"agent_id": "a1"}
         await api_spawn_retry(request)
         assert mgr.spawn.call_args.kwargs["reasoning_effort"] == "xhigh"
@@ -598,7 +603,7 @@ class TestEffortDropReason:
 
 
 class TestNoSpawnSiteDropWarning:
-    """The spawn path no longer emits its own drop warning (#6186): the
+    """The spawn path does not emit its own drop warning: the
     provider factory's effort gate (config/loader.py) is the single warning
     authority, covering spawn, dashboard slot, and cron alike. The tool-result
     verdict (effort_dropped/effort_applied) remains the caller-facing signal;
@@ -709,11 +714,15 @@ class TestApiSpawnEffortDropped:
         mgr = MagicMock()
         mgr.spawn.return_value = SimpleNamespace(id="a1", done=False, error="")
         state = SimpleNamespace(
+            _slots={"1": SimpleNamespace(is_restricted=False, blocks_reads=False)},
+            _restricted_keys=set(),
             subagents=mgr,
             sessions=SimpleNamespace(get_agent=lambda key: parent_agent),
+            conversation_log=SimpleNamespace(get_metadata_status=lambda key: ({}, True)),
         )
         request = MagicMock()
         request.app = {"state": state}
+        request.headers = {}
         request.json = AsyncMock(return_value=body)
         cfg = KiroCrewConfig(agent=AgentConfig(role_models=role_models or {}))
         if crews:
@@ -732,7 +741,9 @@ class TestApiSpawnEffortDropped:
         return _json.loads(resp.body)
 
     def test_auto_resolution_carries_the_verdict(self):
-        data = self._spawn({"task": "x", "reasoning_effort": "high", "parent_session": "d:1"})
+        data = self._spawn(
+            {"task": "x", "reasoning_effort": "high", "parent_session": "dashboard:1"}
+        )
         assert "effort_dropped" in data
         assert "auto" in data["effort_dropped"]
 
@@ -742,20 +753,20 @@ class TestApiSpawnEffortDropped:
                 "task": "x",
                 "model": "sonnet-test-model",
                 "reasoning_effort": "high",
-                "parent_session": "d:1",
+                "parent_session": "dashboard:1",
             }
         )
         assert "effort_dropped" not in data
 
     def test_non_capable_role_pin_carries_the_verdict(self):
         data = self._spawn(
-            {"task": "x", "reasoning_effort": "high", "parent_session": "d:1"},
+            {"task": "x", "reasoning_effort": "high", "parent_session": "dashboard:1"},
             role_models={"subagent": "deepseek-3.2"},
         )
         assert "deepseek-3.2" in data.get("effort_dropped", "")
 
     def test_no_effort_requested_omits_the_key(self):
-        data = self._spawn({"task": "x", "parent_session": "d:1"})
+        data = self._spawn({"task": "x", "parent_session": "dashboard:1"})
         assert "effort_dropped" not in data
         assert data["id"] == "a1"
 
@@ -921,15 +932,22 @@ class TestAppliedLineRendering:
 
         mgr = MagicMock()
         mgr.spawn.return_value = SimpleNamespace(id="a1", done=False, error="")
-        state = SimpleNamespace(subagents=mgr, sessions=SimpleNamespace(get_agent=lambda key: ""))
+        state = SimpleNamespace(
+            _slots={"1": SimpleNamespace(is_restricted=False, blocks_reads=False)},
+            _restricted_keys=set(),
+            subagents=mgr,
+            sessions=SimpleNamespace(get_agent=lambda key: ""),
+            conversation_log=SimpleNamespace(get_metadata_status=lambda key: ({}, True)),
+        )
         request = MagicMock()
         request.app = {"state": state}
+        request.headers = {}
         request.json = AsyncMock(
             return_value={
                 "task": "x",
                 "model": "sonnet-test-model",
                 "reasoning_effort": "high",
-                "parent_session": "d:1",
+                "parent_session": "dashboard:1",
             }
         )
         cfg = KiroCrewConfig(agent=AgentConfig())
@@ -953,11 +971,18 @@ class TestAppliedLineRendering:
 
         mgr = MagicMock()
         mgr.spawn.return_value = SimpleNamespace(id="a1", done=False, error="")
-        state = SimpleNamespace(subagents=mgr, sessions=SimpleNamespace(get_agent=lambda key: ""))
+        state = SimpleNamespace(
+            _slots={"1": SimpleNamespace(is_restricted=False, blocks_reads=False)},
+            _restricted_keys=set(),
+            subagents=mgr,
+            sessions=SimpleNamespace(get_agent=lambda key: ""),
+            conversation_log=SimpleNamespace(get_metadata_status=lambda key: ({}, True)),
+        )
         request = MagicMock()
         request.app = {"state": state}
+        request.headers = {}
         request.json = AsyncMock(
-            return_value={"task": "x", "reasoning_effort": "high", "parent_session": "d:1"}
+            return_value={"task": "x", "reasoning_effort": "high", "parent_session": "dashboard:1"}
         )
         cfg = KiroCrewConfig(agent=AgentConfig())
         with (
@@ -1042,7 +1067,7 @@ class TestSessionChainResolution:
         from kiro_crew.config.loader import KiroCrewAgentConfig
 
         data = harness._spawn(
-            {"task": "x", "reasoning_effort": "high", "parent_session": "d:1"},
+            {"task": "x", "reasoning_effort": "high", "parent_session": "dashboard:1"},
             crews={"parentcrew": KiroCrewAgentConfig(model="sonnet-test-model")},
             parent_agent="parentcrew",
         )
@@ -1064,11 +1089,18 @@ class TestVerdictOffTheEventLoop:
 
         mgr = MagicMock()
         mgr.spawn.return_value = SimpleNamespace(id="a1", done=False, error="")
-        state = SimpleNamespace(subagents=mgr, sessions=SimpleNamespace(get_agent=lambda key: ""))
+        state = SimpleNamespace(
+            _slots={"1": SimpleNamespace(is_restricted=False, blocks_reads=False)},
+            _restricted_keys=set(),
+            subagents=mgr,
+            sessions=SimpleNamespace(get_agent=lambda key: ""),
+            conversation_log=SimpleNamespace(get_metadata_status=lambda key: ({}, True)),
+        )
         request = MagicMock()
         request.app = {"state": state}
+        request.headers = {}
         request.json = AsyncMock(
-            return_value={"task": "x", "reasoning_effort": "high", "parent_session": "d:1"}
+            return_value={"task": "x", "reasoning_effort": "high", "parent_session": "dashboard:1"}
         )
         cfg = KiroCrewConfig(agent=AgentConfig())
         seen: list[object] = []

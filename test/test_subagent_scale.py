@@ -180,6 +180,57 @@ class TestBatchIdentity:
         mgr._queue.clear()
         assert mgr.batch_members_pending("") is False
 
+    def test_wave_has_live_nested_spawns_detects_member_descendants(self):
+        """A wave member that spawned nested work is DONE (its own turn ended),
+        so batch_members_pending is False and the wave-close digest fires — but
+        a child the member spawned is still running. The nested child mints its
+        OWN batch_id and its parent_session_key is the member's session key
+        (``subagent:<member.id>``), so it counts against neither this wave's
+        total nor batch_members_pending. This is the state where the digest
+        must not claim completion, and this method reports True for it.
+
+        The scope is narrow on purpose: an unrelated sibling wave under the SAME
+        grandparent is NOT a child of this wave's members, so this method
+        reports False for it — a sibling wave cannot hold this digest hostage.
+        """
+        mgr = SubagentManager(sessions=_mock_sessions(), ctx_builder=_mock_ctx())
+        # Wave "wv": both direct members finished.
+        m0 = SubagentInfo(id="m0", task="t", batch_id="wv", batch_total=2,
+                          parent_session_key="dashboard:main")
+        m0.done = True
+        m1 = SubagentInfo(id="m1", task="t", batch_id="wv", batch_total=2,
+                          parent_session_key="dashboard:main")
+        m1.done = True
+        # A nested child spawned BY m1 — its own batch, parent is m1's session.
+        nested = SubagentInfo(id="n1", task="nested", batch_id="nestwave",
+                              batch_total=2, parent_session_key="subagent:m1")
+        # An unrelated sibling wave under the SAME grandparent (dashboard:main),
+        # NOT a child of any wv member.
+        sibling = SubagentInfo(id="s1", task="sib", batch_id="sibwave",
+                               batch_total=2, parent_session_key="dashboard:main")
+        mgr._agents = {"m0": m0, "m1": m1, "n1": nested, "s1": sibling}
+
+        # Direct members all done -> the wave would close by the count.
+        assert mgr.batch_members_pending("wv") is False
+        # But a member's nested spawn is still live -> digest cannot claim done.
+        assert mgr.wave_has_live_nested_spawns("wv") is True
+        # The unrelated sibling wave must NOT be attributed to wv (no hostage).
+        assert mgr.wave_has_live_nested_spawns("sibwave") is False
+
+        # A queued (not-yet-registered) nested spawn of a member also counts.
+        mgr._agents = {"m0": m0, "m1": m1}
+        assert mgr.wave_has_live_nested_spawns("wv") is False
+        mgr._queue.append({"task": "queued nested", "batch_id": "nestwave2",
+                           "parent_session_key": "subagent:m0"})
+        assert mgr.wave_has_live_nested_spawns("wv") is True
+        mgr._queue.clear()
+
+        # When the nested child finishes, the method goes False.
+        nested.done = True
+        mgr._agents = {"m0": m0, "m1": m1, "n1": nested}
+        assert mgr.wave_has_live_nested_spawns("wv") is False
+        assert mgr.wave_has_live_nested_spawns("") is False
+
     def test_pending_while_submissions_in_flight(self):
         """A fast-failing first member must NOT finalize the wave while
         sibling POSTs are still in flight (Arbiter item 2): the pending
@@ -204,7 +255,7 @@ class TestBatchIdentity:
     @pytest.mark.asyncio
     async def test_a_drained_rejection_is_announced(self):
         """A drained spawn has no synchronous reader, so a terminal rejection there
-        used to vanish: no completion event, and the caller still believed the run
+        would vanish: no completion event, and the caller still believed the run
         was going (crew left the topic `running` forever). `_announce_rejection`
         gates on batch_id because a DIRECT caller reads the error off the return
         value -- that does not hold for a timer-driven drain.
@@ -753,7 +804,7 @@ def _wire_hold_settlement(orch, slot, mgr):
     The direct-injection branch owes a flushing digest's held ids to the
     turn's CONSUMPTION through the slot's content-keyed delivery ledger and
     settles them through ``SubagentManager.settle_queued_delivery`` — the same
-    machinery the queue drain uses (#2233 via the #4839 ledger). The MagicMock
+    machinery the queue drain uses. The MagicMock
     slot needs a real mini-ledger for that flow to be observable, and the
     mocked manager's settle must hand back a real coroutine or the settlement
     path skips it (the stubbed-manager guard in
@@ -789,6 +840,10 @@ class TestWaveDigest:
                 mock_sm.return_value = mock_sm_inst
                 orch._init_subagents()
                 orch.subagent_mgr = mock_sm_inst
+                # Default: no nested spawns outstanding, so the wave-close
+                # digest takes its normal "run is complete" wording. Tests that
+                # exercise the nested-work path override this explicitly.
+                mock_sm_inst.wave_has_live_nested_spawns = MagicMock(return_value=False)
                 return mock_sm_inst, mock_sm.call_args.kwargs["on_done"]
 
     def _member(self, i: int, total: int, *, error: str = "") -> SubagentInfo:
@@ -866,7 +921,7 @@ class TestWaveDigest:
 
     @pytest.mark.asyncio
     async def test_wave_digest_text_carries_member_model_provenance(self):
-        """Issue #5337: the per-member SERVED model must be visible in the
+        """The per-member SERVED model must be visible in the
         PARENT-READ digest body (built from ok_lines/fail_lines), not only in
         the injected meta dict. Only the served id is printed — never a
         "(requested …)" qualifier, since a raw requested-vs-resolved inequality
@@ -994,10 +1049,105 @@ class TestWaveDigest:
         assert secret not in body
 
     @pytest.mark.asyncio
+    async def test_wave_close_digest_does_not_claim_completion_with_live_nested_spawn(self):
+        """Pins the wave-close digest wording when a wave's direct members all
+        report done (so ``batch_members_pending`` is False and the digest
+        fires) while a member's nested spawn is still running.
+
+        The digest must not assert "This run is complete" / "All results
+        delivered" — that nested spawn has its own uncounted ``batch_id``, so
+        the wave cannot substantiate a whole-run completion. It reports the
+        true direct-member tally and states that the nested work reports
+        separately.
+        """
+        orch = _make_orchestrator()
+        orch.sessions = _mock_sessions()
+        orch.ctx_builder = MagicMock()
+        orch.ctx_builder.hooks = MagicMock()
+        orch.dashboard_state = _mock_dashboard_state()
+        slot = MagicMock()
+        slot.mode = "chat"
+        slot.running = False
+        slot.task = None
+        slot._orch_tracker = None
+        slot._subagent_deliveries_inflight = 0
+        orch.dashboard_state.get_slot = MagicMock(return_value=slot)
+        mgr, on_done = self._capture_on_done(orch)
+        total = 2
+        injected: list[str] = []
+
+        async def _fake_run_chat(_state, _slot, text, *, _directive_user_origin, **_kw):
+            injected.append(text)
+
+        with patch("kiro_crew.slack.gateway._run_chat", side_effect=_fake_run_chat), \
+                patch("kiro_crew.subagent_persistence.mark_delivered"):
+            # Both direct members complete; the count says the wave is done...
+            mgr.batch_members_pending = MagicMock(return_value=False)
+            # ...but a member's nested spawn is still running.
+            mgr.wave_has_live_nested_spawns = MagicMock(return_value=True)
+            await on_done(self._member(0, total))
+            await asyncio.sleep(0)
+            await on_done(self._member(1, total))
+            await asyncio.sleep(0)
+            await _settle(lambda: len(injected) >= 1)
+
+        body = "\n".join(injected)
+        # The digest fired (final chunk delivered)...
+        assert body, "wave-close digest was never injected"
+        # ...but it must NOT overclaim completion of the whole run.
+        assert "This run is complete" not in body
+        assert "All results delivered" not in body
+        # It must still report the true direct-member tally and flag the
+        # outstanding nested work.
+        assert "2 sub-agents finished" in body
+        assert "nested work" in body
+        # wave_has_live_nested_spawns was consulted for THIS wave's batch id.
+        mgr.wave_has_live_nested_spawns.assert_called_with("bigwave")
+
+    @pytest.mark.asyncio
+    async def test_wave_close_digest_claims_completion_when_no_nested_spawn(self):
+        """The honest fix must NOT degrade the common case: with no outstanding
+        nested work the wave-close digest keeps its normal "run is complete /
+        all results delivered" wording."""
+        orch = _make_orchestrator()
+        orch.sessions = _mock_sessions()
+        orch.ctx_builder = MagicMock()
+        orch.ctx_builder.hooks = MagicMock()
+        orch.dashboard_state = _mock_dashboard_state()
+        slot = MagicMock()
+        slot.mode = "chat"
+        slot.running = False
+        slot.task = None
+        slot._orch_tracker = None
+        slot._subagent_deliveries_inflight = 0
+        orch.dashboard_state.get_slot = MagicMock(return_value=slot)
+        mgr, on_done = self._capture_on_done(orch)
+        total = 2
+        injected: list[str] = []
+
+        async def _fake_run_chat(_state, _slot, text, *, _directive_user_origin, **_kw):
+            injected.append(text)
+
+        with patch("kiro_crew.slack.gateway._run_chat", side_effect=_fake_run_chat), \
+                patch("kiro_crew.subagent_persistence.mark_delivered"):
+            mgr.batch_members_pending = MagicMock(return_value=False)
+            mgr.wave_has_live_nested_spawns = MagicMock(return_value=False)
+            await on_done(self._member(0, total))
+            await asyncio.sleep(0)
+            await on_done(self._member(1, total))
+            await asyncio.sleep(0)
+            await _settle(lambda: len(injected) >= 1)
+
+        body = "\n".join(injected)
+        assert "wave finished" in body
+        assert "This run is complete" in body
+        assert "All results delivered" in body
+
+    @pytest.mark.asyncio
     async def test_digest_chunks_inject_in_fifo_order_despite_delayed_dispatch_hop(self):
         """A later digest chunk must never overtake an earlier one whose
         dispatched injection is still inside ``bounded_chat_turn``'s off-loop
-        timeout resolution (issue #3273). The first chunk's hop is held
+        timeout resolution. The first chunk's hop is held
         deterministically: it releases the moment a later chunk's injection
         lands (the overtake this test forbids) or after a bounded deadline
         (the fixed code parks the later chunk behind the live ``slot.task``
@@ -1091,7 +1241,7 @@ class TestWaveDigest:
 
     @pytest.mark.asyncio
     async def test_held_members_marked_delivered_only_at_digest(self):
-        """Restart safety (Arbiter item 1 + GPT round-5 HIGH): held members
+        """Restart safety: held members
         are flagged ``_digest_held`` (the run loop skips its own
         mark_delivered — the result is NOT in the parent's context yet and a
         delivered tombstone would hide it from orphan reconciliation after a
@@ -1101,7 +1251,7 @@ class TestWaveDigest:
         and settlement waits for the route that owns the hand-off: the
         dashboard route below detaches the ids when the injection turn is
         launched and owes them to the turn's CONSUMPTION through the slot's
-        delivery ledger (#2233); for routes whose ``_on_done`` return really
+        delivery ledger; for routes whose ``_on_done`` return really
         is the confirmation it is the run loop, after ``_on_done`` — routing
         included — returns cleanly."""
         orch = _make_orchestrator()
@@ -1126,7 +1276,7 @@ class TestWaveDigest:
 
         async def _consuming_run_chat(_state, _slot, _text, *, _on_consumed=None, **_kw):
             # The model consumed the injected digest — the one condition that
-            # settles this route's holds (#2233).
+            # settles this route's holds.
             if _on_consumed is not None:
                 _on_consumed()
 
@@ -1143,7 +1293,7 @@ class TestWaveDigest:
                 await _settle(lambda: slot.task is None)
             # Both chunks' injection turns must report consumption before their
             # holds can settle — the settle is owed to the turn, not to the
-            # `_on_done` return (#2233).
+            # `_on_done` return.
             await _settle(lambda: len(settled) >= 2)
         # Members 0-8 are held for chunk 1; member 9 (the 10th) flushes it.
         # Members 10 is held for chunk 2; member 11 (wave close) flushes it.
@@ -1158,7 +1308,7 @@ class TestWaveDigest:
         # only (chunk buffers reset between flushes). On THIS route the list is
         # detached when the injection turn is launched and settled through the
         # manager once the turn consumed the digest, so what is asserted is the
-        # hand-off, not a residue left on the member (#2233): the member is
+        # hand-off, not a residue left on the member: the member is
         # left clean and the ids reach the manager exactly once, per chunk.
         assert members[9]._digest_settle_ids == []
         assert members[11]._digest_settle_ids == []
@@ -1204,7 +1354,7 @@ class TestWaveDigest:
 
     @pytest.mark.asyncio
     async def test_holds_settle_only_after_the_injection_turn_confirms(self):
-        """Ownership (#2233): the dashboard route hands off asynchronously, so a
+        """Ownership: the dashboard route hands off asynchronously, so a
         bare ``_on_done`` return is not proof the digest reached the parent.
 
         ``_report_terminal`` settles ``info._digest_settle_ids`` right after
@@ -1221,7 +1371,7 @@ class TestWaveDigest:
         The flushing member's settle ids are DETACHED from ``info`` when the
         injection task is launched — which makes the run loop's settle a no-op
         for this route — and owed to the turn's CONSUMPTION through the slot's
-        delivery ledger, the same debt shape the queue branch records (#2233).
+        delivery ledger, the same debt shape the queue branch records.
         Not even the turn's clean completion settles them: ``_run_chat``
         returns normally on several non-delivery paths (signed-out CLI, dead
         provider, exhausted retries, a first empty response), so only the
@@ -1312,7 +1462,7 @@ class TestWaveDigest:
 
     @pytest.mark.asyncio
     async def test_a_queued_hand_off_is_not_confirmed_until_the_turn_runs(self):
-        """The same root cause one branch up (#2233, First Principles CONCERNS).
+        """The same root cause one branch up.
 
         When the parent slot is busy the digest is appended to ``slot._queue``
         and ``_subagent_done`` returns — so the run loop would settle on that
@@ -1331,7 +1481,7 @@ class TestWaveDigest:
         the flushing member's own) to the drain through the slot's delivery
         ledger, keyed on the announce itself — the run loop's settle is a no-op
         here too, and settlement waits for a turn to actually consume the
-        announce (the #4839 machinery; one debt shape for both routes).
+        announce (one debt shape for both routes).
 
         This test never drains the queue: that IS the process-loss window.
         """
@@ -1396,7 +1546,7 @@ class TestWaveDigest:
 
     @pytest.mark.asyncio
     async def test_an_auth_required_turn_is_not_a_confirmed_hand_off(self):
-        """The third state: the turn ended cleanly and delivered nothing (#2233).
+        """The third state: the turn ended cleanly and delivered nothing.
 
         ``_run_chat`` CATCHES ``AcpAuthRequired`` — a signed-out CLI is
         non-retryable, so it records the outcome on the slot, holds the queue
@@ -1470,7 +1620,7 @@ class TestWaveDigest:
 
     @pytest.mark.asyncio
     async def test_a_failed_injection_turn_leaves_holds_recoverable(self):
-        """The deliberate asymmetry (#2233): an unconfirmed hand-off must leave
+        """The deliberate asymmetry: an unconfirmed hand-off must leave
         holds UNsettled rather than settle them.
 
         A duplicate digest after a restart is visible to the parent and
@@ -1655,7 +1805,7 @@ class TestWaveDigest:
         assert "Batch results" not in injected[0]
 
 
-# ── 4b. Hold deadline (straggler escape hatch, issue #2215) ──────────
+# ── 4b. Hold deadline (straggler escape hatch) ──────────
 
 
 class TestDigestHoldDeadline:
@@ -1698,7 +1848,7 @@ class TestDigestHoldDeadline:
         forced.assert_not_called()
 
     def test_expired_hold_forces_flush(self):
-        """THE BUG (#2215): two members finished, the third is still running, so
+        """THE BUG: two members finished, the third is still running, so
         neither chunk trigger can fire. Once the oldest hold ages past the
         deadline the sweep forces the partial digest out instead of waiting for
         the straggler (up to 30 min for a hang)."""
@@ -1807,7 +1957,7 @@ class TestDigestHoldDeadline:
 
     @pytest.mark.asyncio
     async def test_straggler_wave_delivers_partial_digest_end_to_end(self):
-        """REPRO for #2215, end to end through the real sweep.
+        """REPRO end to end through the real sweep.
 
         A 3-member wave: two members finish, the third keeps running. Neither
         chunk trigger can fire — the COUNT trigger needs 10 pending completions
@@ -1907,7 +2057,7 @@ class TestDigestHoldDeadline:
             assert _directive_user_origin is False
             injected.append(text)
             # The model consumed the flushed digest — the condition that
-            # settles the held siblings on this route (#2233).
+            # settles the held siblings on this route.
             if _on_consumed is not None:
                 _on_consumed()
 
@@ -1971,7 +2121,7 @@ class TestDigestHoldDeadline:
         # routing" means after the model CONSUMED the injected digest, not
         # after `_on_done` returned: the ids left the flushing record when
         # the turn was launched, owed to the turn's consumption through the
-        # slot's delivery ledger (#2233). The forced hold-deadline flush is
+        # slot's delivery ledger. The forced hold-deadline flush is
         # one of the settle callers, so it inherits the same ownership rule
         # without a second code path.
         assert flush._digest_settle_ids == []

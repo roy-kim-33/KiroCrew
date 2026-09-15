@@ -17,6 +17,40 @@ Supports multiple concurrent tasks, interactive tool approval, per-step session 
 
 ## Module Architecture
 
+Private member tasks receive a protected `taskrunner:<task_id>:runtime` binding
+at trusted creation. Planning, steps, review, retry, and failure-lesson sessions
+inherit that binding before provider allocation; editable task records and
+later changes to the originating chat cannot select another store. Private
+history uses the task ID and carries the same protected binding, so restart
+and consolidation retain the member. Failure lessons use the member's vector
+store and a private session. Existing unbound tasks retain Global V1 behavior.
+Missing or corrupt private identity refuses execution instead of widening it.
+
+Gateway-created runtime keys also receive a frozen privacy record under the
+existing sandbox-readonly `member-memory-bindings/session-modes/` tree. This
+contains identity and mode only, not task content. Continuation preparation
+recovers it after restart instead of trusting editable history or the current
+parent slot, and can only tighten it. A committed directory with missing or
+invalid policy refuses; an unknown legacy task key is not stamped persistent.
+Standalone embedders without a policy resolver retain their existing behavior.
+Temporary tasks skip vector preparation and memory context; automatic failure
+learning refuses both temporary and incognito tasks. Restricted child transcript
+metadata mirrors the policy for consolidation, but is not recovery authority.
+
+Internal HTTP callers inherit only their verified session identity. Body fields
+such as `created_by`, `session_key`, or `memory_store` cannot select authority.
+Run routes check the canonical run binding, including display-name resolution;
+internal cancellation uses a canonical ID and cannot follow a colliding name.
+Private file-based start/planning requires inline text instead: the host must not
+read Global or peer transcripts on a member's behalf. Chat-supplied plans consume
+the supplied text and steps, not an arbitrary source transcript. Private task
+results enter a fresh bound chat before any transcript append or provider call.
+Shared planning cancellation remains an owner-dashboard action when private
+boundaries are active. The guard runs on `POST /api/taskrunner/plan/cancel`
+before the shared planning task can be cancelled. Global-only installations
+retain internal cancellation, and the separate refinement endpoint keeps its
+private-member refusal rather than inheriting the cancellation guard.
+
 The task runner is split into an orchestrator plus 4 focused helper modules under `src/kiro_crew/`:
 
 ```
@@ -39,14 +73,56 @@ taskrunner.py        (orchestrator)
 
 ### Workflow substrate attachment
 
-The gateway attaches its singleton `WorkflowService` and `TaskRunner` after both
-are constructed. The dependency is optional so CLI, tests, and headless callers
+The gateway attaches its singleton `WorkflowService` and `TaskRunner` only after
+complete workflow recovery. Both server entrypoints launch this recovery as a
+tracked background task after the listener binds and its credentials are published,
+never from `on_startup` or an awaited pre-bind step. The existing async factory
+retains complete private restoration, off-loop disk reads and eviction, and
+owning-loop handle hydration. Authenticated workflow routes and TaskRunner mutation
+requests receive HTTP 503 until recovery and both attachments succeed; TaskRunner
+status and cancel remain available. The canonical `defer_workflow_attachment()`
+gate also rejects non-HTTP mutations. Initialization failure unpublishes both ports
+and keeps this gate closed, with code `workflow_initialization_failed` and a message
+to restart the gateway; only pending recovery asks callers to retry.
+Shutdown closes admission, cancels and drains initialization, and forbids late
+publication even if the factory returns after cancellation.
+
+The dependency is optional so CLI, tests, and headless callers outside the gateway
 retain the existing TaskRunner behavior when no workflow service is present.
-Workflow publication is best-effort: an unavailable registry cannot fail task
-planning or execution. Every host lifecycle checkpoint — registration, source,
+An async dashboard host first calls `defer_workflow_attachment()` on the shared
+runner before yielding during startup. While deferred, `plan`, `run`,
+`start_background`, `execute_plan`, and `retry_from_task` reject new admission;
+`delete_run`, `update_plan`, and `update_task` also reject while deferred so a
+persisted task cannot be changed without propagating to its restored workflow.
+The shared check raises `WorkflowInitializing` (a `RuntimeError` subtype).
+Dashboard start, plan, retry, execute, delete and update handlers catch that type
+around the actual operation and return an initializing 503 with the stable code
+`workflow_initializing`; unrelated runtime errors retain their existing handling. Chat-to-plan retains an early check before
+allocating its own placeholder or directory and catches the same typed exception.
+The projects API's delete alias applies the same typed 503/code mapping around
+`delete_run`, while preserving its existing not-found and source behavior.
+Status and cancel
+remain available. These checks run before creating or mutating run state, including
+calls from messaging channels
+that retain the gateway's runner reference. Attachment releases that gate;
+explicit attachment of `None` releases standalone fallback. Gateway failure cleanup
+immediately defers again without yielding, so a failed private gateway never opens
+that fallback. Cancellation or slow I/O does not release the gate. Standalone and headless
+callers that never defer attachment retain their existing admission behavior.
+Workflow publication is best-effort once attachment has settled: an absent or
+failed publication service cannot fail standalone planning or execution. Pending
+initialization is not that fallback: admitting even a fresh run would permanently
+omit its workflow identity because attachment does not backfill already-started
+runs. A retryable refusal preserves that evidence without a new reconciliation
+mechanism. Every host lifecycle checkpoint — registration, source,
 rebind, phase/step events, pause, terminal state, and deletion — awaits the workflow
 service's off-loop durable mirror, so a maximum-size YAML plan cannot block the
-gateway event loop while its shared run record is written.
+gateway event loop while its shared run record is written. Registration also awaits
+old terminal-run eviction off-loop, using the same per-run write/delete fence as
+checkpoints. Repeated cancellation drains this work before removing an unreturned
+registration. This changes only the workflow mirror; TaskRunner's hidden committed
+snapshot, public-projection acknowledgment, and finalize-after-task-persistence
+boundaries remain unchanged.
 
 The chat-to-plan dashboard route registers its placeholder project with this
 port before applying steps, and the dashboard delete route delegates to
@@ -202,6 +278,34 @@ dashboard_sources = {"text", "spec", "file", "chat", "dashboard", "mcp", "yaml"}
 | `plan()` API | `"text"`, `"spec"`, `"file"` | ✅ |
 | Cron job | must pass `source="cron"` | ❌ (filtered out) |
 
+### Decomposer Selection
+
+`run()` picks the decomposer from the spec's suffix, not from the caller. A spec whose
+path ends in `.yaml`/`.yml` is decomposed deterministically by `decompose_yaml` for
+every `source`, so a cron- or MCP-started workflow spec produces the same task DAG as
+the same file started from the dashboard. Inline YAML submitted with `source="yaml"` is
+likewise decomposed deterministically. Any other spec is decomposed by the LLM.
+
+Deny-by-default governs the invalid case, and it is keyed on whether anyone is
+watching. When an **unattended** run's `.yaml`/`.yml` spec is not workflow-shaped —
+`source` in `_UNATTENDED_SOURCES` = `{"cron", "mcp"}` — the run fails and is never
+retried through the LLM decomposer. **Attended** sources (`chat`, `dashboard`, and
+unsourced CLI runs) fall back to the LLM decomposer, because an operator is present to
+read the plan and both of those surfaces always supply a source, so a truthiness gate
+would have removed a path that worked before the rule. The SEL `decompose_yaml` `error`
+event is recorded either way.
+
+"Not workflow-shaped" includes a document YAML cannot parse at all. `decompose_yaml`
+raises `ValueError` for every rejected spec, its own shape checks and a `yaml.YAMLError`
+out of `safe_load` alike, and this gate selects on that one class — so a syntax error,
+the most ordinary way a hand-written spec is wrong, takes the same branch as a semantic
+one instead of failing an attended run that would otherwise have been given the LLM
+fallback.
+
+Every `decompose_yaml` audit event carries the run's provenance — `source` and
+`spec_name` in its metadata, and the source as its caller identity (`dashboard` for
+unsourced runs), so a denial is attributed to the surface that started the run.
+
 ### Data Types
 
 Named `TaskStatus`/`Task`/`Project` in `task_models.py`; `StepStatus`/`Step`/`TaskRun`
@@ -305,7 +409,8 @@ Every resolved task in a parallel group is dispatched at once and an
 finished task is refilled immediately (`taskrunner.py`):
 
 ```python
-sem = asyncio.Semaphore(self._max_parallel_steps)
+max_parallel_steps = self._max_parallel_steps  # bound ONCE per execution
+sem = asyncio.Semaphore(max_parallel_steps)
 
 async def _run_bounded(t: Task) -> bool:
     async with sem:
@@ -317,8 +422,9 @@ results = await asyncio.gather(
 )
 ```
 
-The limit is `self._max_parallel_steps`, computed once in `__init__` as
-`min(taskrunner.max_parallel_steps, compute_max_subagents(cfg))`:
+The limit is `self._max_parallel_steps`, computed in `__init__` as
+`min(taskrunner.max_parallel_steps, compute_max_subagents(cfg))` and re-derived
+at every run entry (see *Live config* below):
 
 - `compute_max_subagents` is the **host-safe ceiling** (derived from
   `agent.subagent_auto_max`, clamped to host memory/CPU headroom). It exists to
@@ -329,6 +435,34 @@ The limit is `self._max_parallel_steps`, computed once in `__init__` as
   host-safe maximum. A test that asserts a specific concurrency **must** pin
   `compute_max_subagents`, or it measures the runner's hardware rather than the
   knob — a small CI runner computes 3.
+
+### Live config: `taskrunner.max_parallel_steps` / `taskrunner.workspace_dir`
+
+The gateway constructs one `TaskRunner` from these two fields, but neither is
+boot-only. `_refresh_from_config()` runs at the entry of `run()`, `plan()` and
+`execute_plan()`: it reads `live.snapshot()` (the watcher's last applied config,
+a plain attribute read) and re-applies the clamp above to the parallel cap and
+`_resolve_workspace_dir` (the same sensitive-path validation the constructor
+runs) to the workspace. So a write from any writer takes effect on the NEXT run
+without a restart. Before the watcher has primed there is no snapshot and the
+refresh is skipped -- a `load()` there would parse and validate the file on the
+event loop these entry points run on -- so the constructor's values stand until
+the first run after priming. Three rules keep this predictable:
+
+- **A running execution keeps its values.** `_execute_tasks` binds the cap into a
+  local before its first group and every group of that run uses it; the work dir
+  is bound into `run.work_dir` at entry. A reload adopted by a later run's entry
+  never resizes or re-targets a run already in flight.
+- **Only a MOVED field is adopted.** The runner records the `taskrunner.*` values
+  config held at construction; a field whose value differs from that baseline is
+  taken from config, a field that is unchanged keeps the constructor's argument.
+  An embedder or test that passes an explicit `max_parallel_steps=2` or
+  `workspace_dir=...` is therefore not overridden by a `config.json` that never
+  mentioned them, and writing a field back to its construction-time value
+  restores the constructor's target exactly.
+- **A rejected `workspace_dir` keeps the current target.** The validator's
+  `ValueError` (sensitive / credential path, already SEL-audited) is logged at
+  WARNING and the previous work dir stays in force.
 
 Per-task sessions (`taskrunner:{task_id}:task{N}`) are reset in a `finally`
 block after the gather, so sessions are cleaned up even if `CancelledError`
@@ -486,8 +620,32 @@ Each task runs on an isolated git branch via `git_coord.py`:
 - **State summary**: `git log --oneline` + `git diff --stat` injected into step prompts
 - **Review diff**: `git diff HEAD~1` fed to independent review session
 - **Finalize**: worktree cleaned up on task completion
+- **Resume recovery**: a retry — and a restart of a run that already had a
+  worktree — validates the saved worktree's path, repository,
+  and branch before dispatching more steps. A lost worktree is recreated from
+  its original repository and existing task branch only when a surviving Git
+  pointer positively identifies the stale checkout; an arbitrary replacement
+  directory is left untouched and the retry fails closed. The identified
+  checkout is renamed aside before it is deleted, so the delete can only ever
+  destroy the tree that was validated -- never whatever happens to occupy the
+  path afterwards. Ownership is proved a second time against the renamed tree,
+  because the first proof and the rename are separate moments: anything that
+  arrived in between is put back and the retry fails closed. A set-aside tree
+  that cannot be deleted is logged and left on disk beside the recreated
+  worktree rather than failing the retry.
 
-Git init failure is non-fatal — task continues without git coordination.
+Git init failure on a run's first initialisation is non-fatal — the task
+continues without git coordination. A resumed run (retry or restart of a run
+that already had a worktree) whose worktree is lost and cannot be recreated
+fails closed instead of continuing without git isolation. This governs
+`fresh=True` restarts too: `fresh` resets task results, not git identity, so a
+fresh restart of a run that already owns a task branch resumes that branch
+under the same validate-or-fail-closed contract rather than minting a new
+worktree — recovery keeps every prior step commit reachable, and a run whose
+branch is truly gone fails closed; the escape is planning the task again from
+scratch. A restart is also refused while the previous run's background task is
+still finishing, because the terminal status is persisted before the old
+finalizer removes the worktree.
 
 ## Cycle Detection
 
@@ -653,13 +811,109 @@ only job is to produce a better-written spec from the user's input.
 Left/right split layout: 260px sidebar + detail/compose area.
 
 - **Sidebar** (visible when runs exist): compact project cards with status icon, name, progress bar, cancel/delete buttons. "＋ New Project" button at top.
-- **Compose area** (no project selected): ✨ Compose | 📄 From Spec tabs, shared `AgentSelector`, `ProjectAnimation` shown in empty state
+- **Compose area** (no project selected): ✨ Compose | 📄 From Spec tabs, shared `AgentSelector`
 - **Compose mode**: textarea + "✨ Refine into Spec" + "📋 Plan" buttons, `PlanningBanner` with cancel
 - **From Spec mode**: textarea + file upload (`<input type="file">`) + "▶ Run" + "📋 Plan" buttons
-- **Project detail** (`ProjectDetailPage`): Idea/Tasks tab bar with 🎮 button (right-aligned)
+- **Project detail** (`ProjectDetailPage`): Idea/Tasks tab bar
   - **Idea tab**: read-only spec content + "✏️ Edit in Chat" button
   - **Tasks tab**: DAG/Phased view toggle with `DagView` and `PhasedView` components
-  - **🎮 button**: opens modal with pixel-art office animation (`PixelCanvasWidget` + `PixelCanvas`). 7 character sprites animate based on task status (typing/looking/celebrate). Badge shows active agent count.
 - **Action buttons**: Execute/Chat/Discard (planned), ■ Cancel (running), ↻ Restart/⏰ Schedule (completed/failed)
-- **`SubAgentActivity`**: shown below running projects — live subagent table with status pills (Running/Done/Failed)
 - **WS-driven updates**: `push_refresh("taskrunner")` on every notification, 3s auto-refresh polling
+
+### Private task snapshot storage
+
+The public `runs.json` retains normal V1 rows. A private task contributes only
+its task ID and a private-payload reference there. Once a writer has private
+payloads, the owner-only file under `memory_stores/.task-runs` becomes a version-1
+snapshot with `public` (the complete directory, including V1 rows and private
+references) and `private` (retained private payloads). One fsync-backed atomic
+replace commits both together. Only then does the writer refresh public
+`runs.json`, which is a projection, not a second commit point. Private input,
+source, results, errors and lessons never enter that projection. The hidden path
+is keyed by the owning public registry path, not a caller-supplied store.
+
+A hidden write/replace failure leaves the old complete snapshot. A public
+projection failure after the hidden replace leaves the new complete snapshot
+committed but unacknowledged; the async operation raises a sanitized
+`TaskSnapshotError`, never success. Retrying refreshes both. Restore prefers the
+hidden directory even if the public file is stale, missing or corrupt. Deletion
+and eviction remove membership from that directory in the same atomic replace;
+retained historical payloads are never scanned for discovery. The hidden commit
+continues to carry the directory after its last private task is deleted.
+V1-only registries and legacy list-shaped sidecars keep their public-directory
+format until a private payload is written. Merely loading or retaining an
+unavailable legacy reference does not migrate its sidecar or revive old rows.
+
+The existing sequence/write lock still serializes snapshots. A delayed older
+worker behind a newer failed attempt raises rather than overwriting a possibly
+committed snapshot or claiming success. A later successful snapshot supersedes
+both. Async persistence
+snapshots on the owning loop, writes off-loop, and drains the owned worker before
+propagating cancellation, including repeated cancellation. Admission, edits,
+delete and completion notifications await acknowledged writes. Background/plan
+admission failures run their existing rollback; failed deletion restores the
+in-memory entry so a second delete can retry. Retry admission resolves its bound
+history before resetting results, reserves the canonical run ID against concurrent
+retry/execute starts, and hands off to its background task without another await
+after snapshot acknowledgment. A failed write or cancellation restores every reset
+task field and run status/error/timestamp in place, retaining Project and Task
+identities; the selected agent changes only after acknowledgment. The reservation
+is released on failure, including repeated cancellation after the writer drains.
+This is an in-memory rollback: a public-projection failure can leave the reset
+hidden snapshot committed but unacknowledged. A later successful persist writes
+the restored results; a crash before it can still recover that unacknowledged
+retry, under the cross-resource limits below. Terminal-write failures still stop watchdogs and release background
+task bookkeeping, but do not publish a successful workflow terminal or remove its
+recovery worktree. Plan execution, background runs and retries register a done
+observer that retrieves any finalization exception after bookkeeping drops the
+task and emits a bounded diagnostic through the existing private-task filter.
+Awaiters still receive the original exception;
+cancellation is not logged as failure. A failed completion write still marks the
+run failed and cannot send a completed notification. The synchronous compatibility
+helper alone remains best-effort.
+
+Restore resolves private references only through the hidden original rows and
+surviving protected `taskrunner:<id>:runtime` bindings. Editing a public reference
+cannot replace private content or select another memory store. Missing authority
+refuses hydration and preserves recovery material rather than loading a V1 task.
+Saved task-plan invocations have no spec file, so `save_progress` writes no
+project-visible progress file for those runs.
+An unavailable private run's retained payload cannot be erased by a later public
+update. Without a readable committed directory, restore retains the existing
+public-reference fallback for inspection, but fences snapshot writes for that
+runner instance. Restoring storage access alone cannot make an incomplete
+in-memory directory safe to overwrite the hidden commit; restart to rehydrate it.
+Only malformed authoritative public JSON is renamed
+`.corrupt`; a broken public projection does not quarantine a valid hidden commit.
+A missing binding, missing sidecar or unreadable private snapshot leaves that
+task unavailable and does not prevent other public tasks from restoring.
+Later snapshots carry unavailable references without treating them as replacement
+payloads. If the private sidecar itself cannot be read, saving fails without
+replacing either file; diagnostics contain only the exception type.
+
+This is not a transaction across task snapshots, workflow-run files, filesystem
+workspaces and external effects. A process exit after commit but before reply can
+leave an unacknowledged task; a failed rollback can retain it for owner recovery.
+A public projection may lag until the next successful persist. Durability inherits
+`atomic_write`'s fsync/platform limits; it does not repair deleted hidden files or
+provide cross-process writer coordination. Stop old writers before upgrading:
+legacy writers do not understand the new envelope.
+Structurally invalid hydrated private rows follow the same unavailable path:
+TaskRunner isolates construction and crash recovery per record, publishes only
+fully restored projects, and retains each failed private reference for later
+snapshots. Hydration reports private provenance separately from row contents,
+including when the public marker was removed; it does not duplicate the task
+schema or downgrade a failed private row to V1. A malformed row cannot prevent
+later valid public rows from restoring, and structural errors log only their
+exception type without private values or tracebacks.
+
+### Private task diagnostics
+
+Planning, execution and retry derive a diagnostic scope from protected session
+identity. Their background tasks inherit that scope. TaskRunner, task executor,
+planner, reporter, git coordination and dynamic workflow logs emit only a stable
+opaque task token plus level or exception type while in that scope. Message
+arguments, exception text and tracebacks do not reach shared gateway logs.
+The original task error remains in the hidden task snapshot for owner recovery.
+Public tasks retain their existing diagnostic messages and tracebacks. This
+changes emitted diagnostics, not the sandbox or governance ceiling.
