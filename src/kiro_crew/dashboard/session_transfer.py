@@ -10,6 +10,23 @@ Two halves live here:
 The wire hop between them is an ordinary authenticated dashboard request over
 an Instances tunnel; see [instances.md](../../../docs/system-specs/modules/instances.md) §14.
 
+``session_export`` is the third consumer: it streams the SAME bundle to a file
+so the two machines need not be online at the same time. It adds no format.
+``bundle_version`` stays 2 and the ``source`` record below is additive, because
+:func:`_validate_bundle` refuses an unrecognised version outright while silently
+dropping keys it does not know: a version bump would stop an instance that has
+not updated from receiving anything, where a new optional key costs it nothing.
+Nothing in this module ever requires a field to be present.
+
+**``source`` is recorded, never applied.** It carries what the conversation ran
+under — model, reasoning effort, tool-approval policy, workspace, project, plus
+the export instant and the producing gateway's version — for a HUMAN reading the
+file to judge what they are looking at. No import path reads it, and
+``approval_policy`` in particular is never applied: ``"auto"`` means auto-approve
+every tool, so applying a recorded copy would let a session arrive on another
+machine pre-authorised to run tools without prompting. An imported session always
+lands interactive.
+
 **Two layers travel.** *Layer A* is the visible transcript (the bundle's
 ``messages``) — what the imported tab DISPLAYS. *Layer B* (bundle_version 2) is
 the kiro-cli context window itself (``<sid>.json`` + ``<sid>.jsonl``, stored
@@ -37,7 +54,8 @@ agent *hint* only:
   nothing. The imported session arrives with no project so the user re-picks it.
 * ``model`` is not carried. Accounts differ in entitlement, so a model id that
   the source account is served can fail at runtime on the target; the target
-  resolves its own default instead (see AGENTS.md § Model selection).
+  resolves its own default instead (see
+  docs/system-specs/common/model-selection.md).
 * ``workspace`` is not carried. Workspaces are per-instance memory scopes, and a
   name that matches on both hosts still means two different memories.
 * ``agent`` is carried as a hint and applied ONLY if the target has an agent by
@@ -59,16 +77,20 @@ from typing import Any
 
 from aiohttp import web
 
-from kiro_crew import platform_compat
+from kiro_crew import __version__, platform_compat
 from kiro_crew.agent_discovery import list_agents
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.paths import kiro_sessions_dir
 
-# Layering: this module may import chat_handlers, never the reverse — the only
-# consumer of session_transfer is handlers_instances, which chat_handlers'
-# transitive graph does not reach. If chat_handlers ever needs session_transfer,
-# move the shared collaborators down to chat_persistence first rather than
-# creating the cycle.
+# Layering: chat_handlers' transitive import graph now reaches back into this
+# module (chat_handlers -> remote_adopt -> handlers_instances -> session_transfer),
+# so a MODULE-LEVEL import of chat_handlers here closes an import cycle: whichever
+# of the two loads first hits the other while it is still partially initialised.
+# The two symbols this module needs (``_materialise_slot_from_history`` and
+# ``_redact_history_rows``) are used only inside ``api_chat_slot_import``, so they
+# are imported FUNCTION-LOCALLY at the top of that handler instead. Keep it that
+# way: a module-level import reinstates the cycle. The proper long-term fix is to
+# move the shared collaborators down to chat_persistence, per the note there.
 from kiro_crew.dashboard.chat_persistence import save_slot_off_loop, session_was_deleted
 from kiro_crew.dashboard.chat_utils import (
     _sync_dashboard_slots,
@@ -110,12 +132,6 @@ _MAX_TOTAL_CHARS = 20_000_000
 #: model actually holds, but still bounded: an oversized blob is refused before
 #: anything is written, so a peer cannot make an import exhaust disk or memory.
 _MAX_LAYER_B_CHARS = 40_000_000
-
-#: Yield to the event loop once this many characters of message content have been
-#: processed without a yield. Bounds how long the import can hold the loop, so a
-#: large bundle degrades into "the tab appears a moment later" rather than
-#: starving the liveness heartbeat into a watchdog-triggered gateway exit.
-_YIELD_AFTER_CHARS = 262_144
 
 #: How many times to re-take the transcript snapshot when the periodic flush
 #: lands inside the off-loop read. Small on purpose: the flush is 5s-periodic, so
@@ -267,8 +283,8 @@ def _read_layer_b(sid: str) -> dict[str, Any] | None:
         #
         # This makes the ceiling effectively a BYTE cap where the name says
         # chars. For multibyte text that is strictly tighter -- a 40M-char CJK
-        # log is ~120MB and now degrades to transcript-only where it previously
-        # loaded -- and that is the correct direction for a memory-safety limit:
+        # log is ~120MB, so it degrades to transcript-only where the char cap
+        # alone would load it -- and that is the correct direction for a limit:
         # the ceiling has to bound what is actually allocated, and the fallback
         # is an honest transcript-only copy rather than a crashed gateway. The
         # char check below stays as the semantic cap.
@@ -319,6 +335,80 @@ def _read_layer_b(sid: str) -> dict[str, Any] | None:
 
 def _iso_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def build_source_record(
+    *,
+    model: str = "",
+    reasoning_effort: str = "",
+    approval_policy: str | None = None,
+    workspace: str = "",
+    project: str = "",
+) -> dict[str, Any]:
+    """Assemble the bundle's ``source`` provenance record. Pure — thread-safe.
+
+    **Recorded, never applied.** Every field here describes what the source
+    session ran under, for a reader to look at; no import path reads any of it.
+    ``approval_policy`` is the one that has to be said out loud: ``"auto"`` means
+    auto-approve every tool, so an *applied* copy would let a session arrive on
+    another machine pre-authorised to run tools without prompting — the same
+    class of escalation ``subagent._validate_agent`` refuses when it declines to
+    default an unknown agent name. An installed session always lands interactive.
+
+    **The reader is a person, not a caller.** An export is a user-facing artifact
+    whose whole point is being inspectable, and somebody deciding whether to
+    install a session needs to know what model produced it, at what effort, and
+    above all whether the transcript was produced under auto-approval. Every
+    field here earns its place against that reader; a field that only a future
+    caller would want does NOT go in, which is why ``mode`` and
+    ``autocompact_pct`` are absent — both are re-derived per turn, so they are
+    pointless to apply and there is nothing for a human to do with them either.
+
+    ``origin`` and ``agent`` are NOT repeated here: both already sit at the top
+    level of the bundle, where the importer reads them.
+
+    **A field is omitted rather than written empty.** Absence means "not known",
+    which is a distinct and useful statement, and it is also the format's own
+    compatibility mechanism: a reader asks whether a key is present and
+    well-formed, never whether a version implies it must be there, so every key
+    must be safe to leave out.
+
+    ``approval_policy`` is the exception to that rule, because for it an empty
+    string is a VALUE and not an absence — ``""`` is the interactive policy, the
+    same spelling the session object uses. It is therefore keyed off ``None``
+    (this gateway could not read a policy) rather than off emptiness, so
+    "interactive" and "unknown" stay distinguishable. Collapsing them would make
+    the field's only interesting reading — that a transcript was produced under
+    auto-approval — indistinguishable from a gateway that had nothing to report.
+    """
+    source: dict[str, Any] = {}
+    if model:
+        source["model"] = model
+    if reasoning_effort:
+        source["reasoning_effort"] = reasoning_effort
+    if approval_policy is not None:
+        source["approval_policy"] = approval_policy
+    # ``workspace`` and ``project`` are the only FREE TEXT in this record -- a
+    # workspace name and a checkout path, both of which a user chose. The bundle
+    # is an egress boundary and the same scan already runs over the title and over
+    # assistant content, so it runs here too rather than leaving two unscanned
+    # strings in a document that leaves the host.
+    if workspace:
+        scrubbed, _ = redact_exfiltration_urls(workspace)
+        scrubbed, _ = redact_credentials(scrubbed)
+        source["workspace"] = scrubbed
+    if project:
+        scrubbed, _ = redact_exfiltration_urls(project)
+        scrubbed, _ = redact_credentials(scrubbed)
+        source["project"] = scrubbed
+    source["exported_at"] = _iso_now()
+    # Which code wrote the file, for diagnosis when a key is unexpectedly absent.
+    # NEVER read as a gate: a version number cannot answer that question across
+    # forks, because two forks can stamp the same number on different formats.
+    # Feature detection is what protects a reader; this only explains, after the
+    # fact, why a feature was missing.
+    source["producer"] = f"kirocrew/{__version__}"
+    return source
 
 
 def _rewrite_layer_b_envelope(env: dict[str, Any], new_sid: str, agent: str) -> dict[str, Any]:
@@ -416,15 +506,14 @@ def _write_layer_b_files(layer_b: dict[str, Any], agent: str) -> str | None:
             # The shared helper, which every atomic-write site in the repo is
             # required to use: it allocates the temp file with ``mkstemp`` so
             # concurrent writers cannot collide on a deterministic ``.tmp`` name
-            # (an ENOENT race the previous hand-rolled write here was exposed to),
-            # and it retries the Windows rename window.
+            # (an ENOENT race a hand-rolled write is exposed to), and it retries
+            # the Windows rename window.
             #
             # ``restrict_to_owner=True`` applies the owner-only lockdown to the
             # temp file BEFORE any content reaches it — POSIX mode bits are
-            # meaningless against NTFS ACLs, and the previous post-rename
-            # ``restrict_to_owner`` call left Layer B readable under the
-            # inherited DACL for the whole write window (issue #5285). It
-            # implies 0o600 on POSIX, and the default
+            # meaningless against NTFS ACLs, and locking down only after the
+            # rename leaves Layer B readable under the inherited DACL for the
+            # whole write window. It implies 0o600 on POSIX, and the default
             # ``restrict_on_error="raise"`` keeps this site FAIL CLOSED.
             try:
                 atomic_write(path, text, restrict_to_owner=True)
@@ -505,8 +594,65 @@ def _join_layer_b(sessions: Any, sm_key: str, sid: str) -> bool:
         return False
 
 
+def _snapshot_source_record(
+    state: DashboardState, slot: _ChatSlot, session_key: str
+) -> dict[str, Any]:
+    """Snapshot *slot*'s provenance for the bundle. **MUST run on the event loop.**
+
+    Every value read here lives on the slot or on the live session registry, so
+    the read has to happen where the loop owns them — and in the same breath as
+    the transcript tail, so what the file says the session ran under matches the
+    turns the file carries.
+
+    The tool-approval policy is read from the LIVE session
+    (``SessionManager.get_approval_policy``), which is its only home: it is
+    per-session runtime state with no durable copy anywhere. So a conversation
+    whose session object is gone — evicted, or not yet re-opened after a gateway
+    restart — has no policy to report, and ``has_session`` is what separates that
+    from a session that is live and interactive. The unknown case records nothing
+    rather than guessing ``""``, because guessing would report a transcript
+    produced under auto-approval as an interactive one.
+
+    *session_key* is the caller's PINNED key and is deliberately not recomputed
+    here. The slot's binding can move while the bundle is being assembled — a cron
+    injection rebinds ``linked_session_key`` — and the transcript key was pinned
+    before the pre-bundle flush. Reading the policy off a freshly resolved key
+    would then describe a session the shipped transcript never ran under, and a
+    downloaded file has no way to correct itself later. The values that DO come
+    from the slot (model, effort, workspace, project) are still read per attempt,
+    because those must follow the tail this attempt is shipping.
+    """
+    approval_policy: str | None = None
+    sessions = getattr(state, "sessions", None)
+    if sessions is not None:
+        try:
+            if sessions.has_session(session_key):
+                approval_policy = sessions.get_approval_policy(session_key) or ""
+        except Exception:
+            # Provenance is never worth failing an export for; an unreadable
+            # registry simply means the policy is unknown, which the record can
+            # say by leaving the field out.
+            logger.debug(
+                "session_transfer: could not read the approval policy for slot=%s",
+                slot.key,
+                exc_info=True,
+            )
+    return build_source_record(
+        model=slot.model or "",
+        reasoning_effort=slot.reasoning_effort or "",
+        approval_policy=approval_policy,
+        workspace=slot.workspace or "",
+        project=slot.project or "",
+    )
+
+
 async def build_transfer_bundle_async(
-    state: DashboardState, slot: _ChatSlot, *, origin: str = ""
+    state: DashboardState,
+    slot: _ChatSlot,
+    *,
+    origin: str = "",
+    with_source: bool = False,
+    include_layer_b: bool = True,
 ) -> dict[str, Any]:
     """Serialise *slot*'s visible conversation into a portable bundle, with the
     disk read off the event loop.
@@ -517,12 +663,32 @@ async def build_transfer_bundle_async(
     *origin* is a human label for where the session came from (an instance name
     or ``"local"``); it is recorded for provenance and shown on arrival.
 
+    *with_source* adds the ``source`` provenance record of
+    :func:`build_source_record`. It is OFF by default so the tunnel keeps
+    producing exactly the bundle it produces today: a peer's importer would drop
+    the key harmlessly, but a send is an existing working flow and this feature
+    has no business changing what it puts on the wire. The file export turns it
+    on, because a file outlives the tab it came from and a reader of one has
+    nothing else to tell them what the session ran under.
+
+    *include_layer_b* is the DESTINATION gate on the model's context window, and
+    the one caller that turns it off is the file export. Layer B ships byte-exact
+    and unredacted (see :func:`_read_layer_b`), which is forced rather than
+    chosen — the thinking-block signatures inside it are validated on replay, so
+    redacting and transplanting cannot both hold. What makes byte-exact
+    acceptable is therefore the DESTINATION, not the payload: a tunnel send goes
+    to the operator's own authenticated peer, which stores it 0600. A file has no
+    such destination — it goes to a download, a bucket, a USB stick — so that
+    justification does not carry over, and the export ships Layer A only. The
+    resulting bundle sets ``layer_b_skipped``, so the lost resume fidelity is
+    stated rather than inferred from an absent key.
+
     The un-flushed tail is a ``_disk_window_len`` boundary slice, which is valid
     only because the flush below runs first: the save folds a durable injector's
     ``append_if_absent`` copy into the window and advances the boundary, so the
     counter is honest by the time the tail is snapshotted. A caller that bundled
     WITHOUT flushing could not use this slice — a durable injector
-    (``cron_inject``, ``workflow_inject``, ``crew_chat``) puts the same row into
+    (``cron_inject``, ``workflow_inject``) puts the same row into
     the window and onto disk without a save, so the boundary would start one row
     too early and ship the injection twice. There is deliberately no such
     caller: this is the only builder, and it always flushes.
@@ -599,11 +765,10 @@ async def build_transfer_bundle_async(
     # If that edit's own save failed, disk still holds the previous response and
     # the copy would ship it.
     #
-    # Flushing here is safe now in a way it was not originally: the save advances
-    # ``_disk_window_len`` itself, so afterwards the tail slice is empty and the
-    # bundle comes wholly from disk. (The first version of this code flushed and
-    # then sliced on ``_resumed_count``, which the save does NOT touch — that is
-    # what duplicated the tail.)
+    # Flushing here is safe because the save advances ``_disk_window_len`` itself,
+    # so afterwards the tail slice is empty and the bundle comes wholly from disk.
+    # Slicing on ``_resumed_count`` instead would duplicate the tail: the save
+    # does NOT touch that counter.
     #
     # best_effort=False: a swallowed failure would put us right back to bundling
     # a stale transcript, so an unpersistable source fails the transfer instead.
@@ -677,6 +842,17 @@ async def build_transfer_bundle_async(
         tail = list(slot.messages[boundary_before:])
         title = slot.title if slot._titled else ""
         agent = slot.agent
+        # Snapshotted per attempt alongside the tail, for the same reason: a
+        # retry happens because the slot CHANGED, so a record taken before the
+        # loop could describe a model or a policy the shipped transcript never
+        # ran under.
+        #
+        # The SESSION key is the exception and is passed in pinned. The transcript
+        # key was fixed before the flush, so the session the shipped turns ran on
+        # is already decided; re-resolving it here would let a rebind landing in
+        # the flush await pair this transcript with another session's approval
+        # policy.
+        source = _snapshot_source_record(state, slot, sm_key) if with_source else None
         # Layer B eligibility is decided HERE, per attempt, on the loop and in the
         # same breath as the tail snapshot -- so the transcript and the context we
         # ship always come from one consistent view of the slot. See the note
@@ -684,8 +860,23 @@ async def build_transfer_bundle_async(
         mid_turn = bool(getattr(slot, "running", False)) or bool(
             getattr(slot, "_in_stage_execution", False)
         )
-        if mid_turn:
+        if not include_layer_b:
+            # Refused by DESTINATION, not by state: this bundle is going somewhere
+            # byte-exact unredacted context must not go.
+            #
+            # The sid is still resolved first, and ONLY to answer whether there was
+            # anything to withhold. ``layer_b_skipped`` means "this session HAD
+            # context and it was given up", and the importer appends a
+            # "transcript only" suffix to the tab title on the strength of it. A
+            # session that never opened a kiro-cli context gave up nothing, so
+            # flagging it would label an undegraded copy as degraded -- the
+            # cry-wolf case ``_assemble_bundle`` warns about, on every such
+            # export.
+            layer_b_withheld = bool(_resolve_layer_b_sid(getattr(state, "sessions", None), sm_key))
             layer_b_sid = ""
+        elif mid_turn:
+            layer_b_sid = ""
+            layer_b_withheld = True
             logger.info(
                 "session_transfer: slot=%s has a turn in flight; sending transcript-only "
                 "(Layer B would lag the displayed transcript)",
@@ -693,12 +884,22 @@ async def build_transfer_bundle_async(
             )
         else:
             layer_b_sid = _resolve_layer_b_sid(getattr(state, "sessions", None), sm_key)
+            layer_b_withheld = False
         # Read AND assemble off the loop. Assembly redacts every assistant turn,
         # and the transcript can run to the bundle cap, so those regex scans are
         # far too much CPU to hold the loop with — the same starvation that
         # exits the gateway via LoopStallWatchdog.
         bundle = await asyncio.to_thread(
-            _read_and_assemble, state, key, tail, title, agent, origin, layer_b_sid, mid_turn
+            _read_and_assemble,
+            state,
+            key,
+            tail,
+            title,
+            agent,
+            origin,
+            layer_b_sid,
+            layer_b_withheld,
+            source,
         )
         # Re-check the guards AFTER the await, not only before it. A rewind or a
         # mid-stream flush can land during the threaded read, and the boundary
@@ -765,12 +966,13 @@ def _read_and_assemble(
     origin: str,
     layer_b_sid: str = "",
     layer_b_skipped: bool = False,
+    source: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Read the transcript + Layer B and assemble the bundle. **Runs in a thread.**
 
-    Touches no slot state and no session map — *tail*, *title*, *agent* and
-    *layer_b_sid* are all snapshots the caller took on the event loop — so it is
-    safe off-loop. Only the file reads happen here.
+    Touches no slot state and no session map — *tail*, *title*, *agent*,
+    *layer_b_sid* and *source* are all snapshots the caller took on the event
+    loop — so it is safe off-loop. Only the file reads happen here.
     """
     history = _read_chained_history(state, session_key)
     history.extend(tail)
@@ -783,7 +985,7 @@ def _read_and_assemble(
         # no resumable context behind it. Distinct from ``layer_b_sid == ""``,
         # which means there was never a context to carry.
         layer_b_skipped = True
-    return _assemble_bundle(history, title, agent, origin, layer_b, layer_b_skipped)
+    return _assemble_bundle(history, title, agent, origin, layer_b, layer_b_skipped, source)
 
 
 def _assemble_bundle(
@@ -793,12 +995,17 @@ def _assemble_bundle(
     origin: str,
     layer_b: dict[str, Any] | None = None,
     layer_b_skipped: bool = False,
+    source: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Turn a merged transcript into the wire bundle. Pure — thread-safe.
 
     Kept free of slot access on purpose: the redaction below is regex-heavy over
     up to the whole transcript, so :func:`build_transfer_bundle_async` runs this
     in a thread, and anything touching ``slot`` there would race the event loop.
+
+    *source* is the optional provenance record of :func:`build_source_record`.
+    It is omitted when empty and the tunnel path passes none, so a bundle sent
+    over a tunnel is byte-identical with and without this feature.
     """
     messages: list[dict[str, Any]] = []
     for m in all_messages:
@@ -807,9 +1014,9 @@ def _assemble_bundle(
             continue
         content = m.get("content", "")
         # Redact on the way OUT, not only on the way in. This bundle leaves the
-        # host, so this is an egress boundary: a transcript written before the
-        # redactors existed (or one carried in from a channel) can still hold a
-        # raw credential on disk, and relying on the peer to scrub it would send
+        # host, so this is an egress boundary: a transcript already on disk (or one
+        # carried in from a channel) can still hold a raw credential, and relying
+        # on the peer to scrub it would send
         # the secret across the boundary first and trust the far side to clean up.
         # The importer redacts again — idempotent, and it must not assume a
         # well-behaved sender.
@@ -851,7 +1058,39 @@ def _assemble_bundle(
         # transcript" (something WAS given up, and the receiving tab should say
         # so). Only the sender can tell those apart, so it says which.
         bundle["layer_b_skipped"] = True
+    # Provenance, and only on a path that asked for it. An empty record is left
+    # out entirely rather than written as ``{}``: the whole point of the key is
+    # that a reader probes for it, so an empty object would be a claim to carry
+    # provenance that carries none.
+    if source:
+        bundle["source"] = dict(source)
     return bundle
+
+
+def bundle_rejection_reason(bundle: dict[str, Any]) -> tuple[str, str]:
+    """Why THIS instance's own importer would refuse *bundle*, or ``("", "")``.
+
+    Exists so a producer can refuse to hand over a document its own reader would
+    reject. The bounds live in one place -- :func:`_validate_bundle` -- and this
+    runs that same function rather than restating its limits, because a second
+    copy of "5 000 messages, 20 000 000 chars" is a copy that drifts.
+
+    Returns ``(reason, code)`` from the validator's own coded rejection. The
+    validated payload is deliberately DISCARDED: validation rebuilds a normalised
+    allowlist, so shipping its output would silently drop the optional keys a
+    caller added on purpose. Only the verdict is taken.
+    """
+    _, err = _validate_bundle(bundle)
+    if err is None:
+        return "", ""
+    # ``Response.body`` is typed as bytes-or-Payload; the validator always builds a
+    # JSON response, so narrow rather than assume.
+    raw = err.body if isinstance(err.body, (bytes, bytearray)) else b""
+    try:
+        body = json.loads(raw or b"{}")
+    except Exception:  # pragma: no cover - the validator always writes JSON
+        return "the bundle was refused", "transfer_bundle_invalid"
+    return str(body.get("error", "the bundle was refused")), str(body.get("code", ""))
 
 
 def _reject(reason: str, code: str) -> web.Response:
@@ -1035,6 +1274,14 @@ async def api_chat_slot_import(request: web.Request) -> web.Response:
     imported slot deliberately has no project directory: the user picks one on
     arrival.
     """
+    # Imported function-locally, not at module level: chat_handlers' import graph
+    # reaches back here (see the layering note at the top of this module), so a
+    # module-level import would close an import cycle.
+    from kiro_crew.dashboard.chat_handlers import (
+        _materialise_slot_from_history,
+        _redact_history_rows,
+    )
+
     state: DashboardState = request.app["state"]
     request_app = request.get("app", "")
     caller = request_app or "dashboard"
@@ -1080,15 +1327,59 @@ async def api_chat_slot_import(request: web.Request) -> web.Response:
     # no IO at all.
     agent_hint = bundle["agent"]
     resolved_agent = await asyncio.to_thread(_resolve_agent, agent_hint) if agent_hint else ""
+
+    # Title/origin are redacted here because they feed the marked title and the
+    # audit line; the shared materialiser re-redacts the composed title via
+    # ``_rehydrate_slot_title`` (idempotent). Per-MESSAGE redaction is NOT done
+    # here: the receive-side rows are content-redacted just below, in one
+    # off-loop ``_redact_history_rows`` pass before construction, so a second
+    # pass would double the regex cost over up to _MAX_TOTAL_CHARS of peer
+    # content for no persisted difference. User turns stay verbatim there,
+    # matching fork.
+    source_title = bundle["title"] or "Untitled"
+    source_title, _ = redact_exfiltration_urls(source_title)
+    source_title, _ = redact_credentials(source_title)
+    origin = bundle["origin"]
+    origin, _ = redact_exfiltration_urls(origin)
+    origin, _ = redact_credentials(origin)
+    suffix = f" (from {origin})" if origin else ""
+
+    # Normalise the bundle turns to the row shape the materialiser hydrates from.
+    # Build the receive-side rows (dict construction, no GIL-held regex), then
+    # content-redact them OFF THE LOOP before construction. Redaction at the
+    # transfer bounds (~20M chars) is ~1s of GIL-held regex, so it runs in a
+    # thread where it yields freely and — critically — BEFORE any slot exists, so
+    # a stall here is only a stall, not a window on a half-built slot. The
+    # materialiser is then synchronous and does no content redaction. This is the
+    # importer's own egress-mirroring scrub (defense-in-depth; it must not assume
+    # the sender scrubbed).
+    rows: list[dict] = [
+        {"role": m["role"], "content": m["content"], "ts": m["ts"]} for m in messages
+    ]
+    rows = await asyncio.to_thread(_redact_history_rows, rows)
+
+    # The marked title travels as the persisted title so the shared path restores
+    # it; ``origin`` is NOT set on the metadata snapshot -- that key is the
+    # sending instance's label, not a slot origin tag, and import deliberately
+    # lands untagged (default origin), exactly as before. No folder_id / pinned /
+    # tags travel, so the imported session lands unfiled just as the tunnel
+    # importer always has.
+    meta = {
+        "title": f"{_IMPORT_TITLE_MARKER}{source_title}{suffix}",
+        "agent": resolved_agent,
+    }
+
     # Re-check the cap HERE, with no await between this test and the creation
-    # below. The check at the top of the handler is necessary but not sufficient:
-    # body parsing and agent resolution both await, so N concurrent imports near
-    # the cap all clear that first test before any of them allocates, and all N
-    # are admitted. This second test closes that window because the loop cannot
-    # switch tasks between it and ``get_or_create_slot``.
+    # inside the shared materialiser below. The check at the top of the handler
+    # is necessary but not sufficient: body parsing and agent resolution await,
+    # so N concurrent imports near the cap all clear that first test before any
+    # of them allocates, and all N are admitted.
+    # This second test closes that window because the loop cannot switch tasks
+    # between it and the ``get_or_create_slot`` inside ``_materialise_slot_from_history``.
     #
-    # Distinct from the construction accounting below: that keeps a RETRACTED slot
-    # counted, which is a different window (after creation). Both are needed.
+    # Distinct from the construction accounting the materialiser opens: that keeps
+    # a RETRACTED slot counted, which is a different window (after creation). Both
+    # are needed.
     if state.live_slot_count() >= MAX_LIVE_SLOTS:
         sel().log_api_access(
             caller=caller,
@@ -1105,163 +1396,110 @@ async def api_chat_slot_import(request: web.Request) -> web.Response:
             },
             status=429,
         )
-    new_slot = state.get_or_create_slot(
+
+    # The shared materialiser mints the key (name=None), registers the slot and
+    # holds it under ``begin_slot_construction`` for the duration of hydration,
+    # then hands it back registered and counted. ``serialize_slots`` omits an
+    # under-construction slot, so Layer B, the durable save and the publish all
+    # run below while the slot is hidden from clients (though registered, so a
+    # concurrent same-key lookup still resolves it) -- it is shown only when this
+    # handler ends construction and pushes at its tail.
+    slot = _materialise_slot_from_history(
+        state,
         name=None,
-        agent=resolved_agent,
+        history_key="",
+        meta=meta,
+        all_messages=rows,
         app=request_app,
+        # Every row exists only in memory and is persisted by the save below, so
+        # none is "older on disk": surface all of them and leave _disk_older_count
+        # at 0 rather than claiming a frozen prefix that was never written.
+        window_limit=None,
+        # Import synthesised its metadata; it read no transcript off disk, so the
+        # delete-won disk-identity guard must stay dormant.
+        disk_meta_observed=False,
+        # Silent replay of a bundle onto a slot that stays registered and under
+        # construction throughout its synchronous hydration (it is retracted from
+        # ``_slots`` only afterwards, for the async tail below): broadcasting each
+        # row would push an under-construction slot's peer content to every client
+        # and retire live question cards.
+        broadcast_rows=False,
+        # Bundle rows carry no message id; mint one, or the imported rows land
+        # permanently id-less and drop out of mid-keyed features.
+        mint_missing_mids=True,
     )
-    # UNPUBLISH the slot for the duration of construction.
-    #
-    # ``get_or_create_slot`` registers the slot in ``state._slots`` AND calls
-    # ``push_slots_update()`` before it returns (state.py), so the tab is visible
-    # to every client and reachable by any handler that enumerates ``_slots``
-    # (handlers/core.py, handlers/sessions.py) the moment it exists -- while its
-    # transcript is still empty, its Layer B unjoined and nothing persisted. A
-    # prompt in that window runs against a partial transcript, or cold-starts a
-    # FRESH context that the join written afterwards can never attach to: the
-    # silent context loss this feature exists to prevent, on its own import path.
-    #
-    # Retracting it here makes the slot unreachable until everything is in place;
-    # it is re-registered and published once, at the end. Collision-safe: the key
-    # is minted from ``_slot_counter`` (already advanced), not by scanning
-    # ``_slots``, so a concurrent import cannot be handed the same key while this
-    # one is parked.
-    state._slots.pop(new_slot.key, None)
-    # ...but it still occupies memory, so it stays COUNTED. Retracting without
-    # this made the slot invisible to the cap check above, and the check happens
-    # before creation: with the cap all but reached, concurrent imports each
-    # sampled a count that excluded every other import in flight and were all
-    # waved through. Released in the ``finally`` below -- a leaked key would
-    # inflate the cap for the lifetime of the process, refusing imports forever.
-    state.begin_slot_construction(new_slot.key)
-    state.push_slots_update()
-    # project is left empty on purpose — see the module docstring.
-    source_title = bundle["title"] or "Untitled"
-    source_title, _ = redact_exfiltration_urls(source_title)
-    source_title, _ = redact_credentials(source_title)
-    origin = bundle["origin"]
-    origin, _ = redact_exfiltration_urls(origin)
-    origin, _ = redact_credentials(origin)
-    suffix = f" (from {origin})" if origin else ""
-    new_slot.title = f"{_IMPORT_TITLE_MARKER}{source_title}{suffix}"
-    new_slot._titled = True
+    sm_key = effective_session_key(slot)
+    sessions = getattr(state, "sessions", None)
+    # Retract the slot from ``_slots`` for the async finalization tail below.
+    # The materialiser's hydrate loop is synchronous, but Layer B write/join and
+    # the durable save that follow AWAIT while the slot would otherwise be
+    # registered -- and the raw ``state._slots.get(name)`` acquirers (delete/close,
+    # regenerate, rewind) bypass the ``get_slot``/``get_or_create_slot`` guards, so
+    # a crafted request against the minted key could close, resurrect or truncate
+    # the slot mid-finalization. Popping it closes EVERY such acquirer at once:
+    # the slot is not in ``_slots`` to be found. This is safe here where it was
+    # NOT for resume: import MINTS its key from the monotonic counter and does not
+    # return it until this handler responds, so no concurrent request can target
+    # it -- there is no second caller to mint a duplicate the way a client-supplied
+    # resume key allowed. The slot stays under ``begin_slot_construction`` (the
+    # count is released in the finally) and is re-registered on the success path
+    # below, after finalization lands. Every error path already pops it (a no-op
+    # now) and rolls back the join.
+    state._slots.pop(slot.key, None)
+    # Resume mode, reported back to the sender so a degraded copy is never shown
+    # as a full one. "prefix" is correct for a v1/no-Layer-B bundle: the session
+    # opens on the transcript, which is exactly what was sent.
+    resume_mode = "prefix"
+    layer_b_sid = ""
+    layer_b = bundle.get("layer_b")
 
     try:
-        # Layer B FIRST, before the transcript append loop and the durable save.
-        #
-        # The slot is registered in ``state._slots`` synchronously by
-        # get_or_create_slot above, and handlers enumerate that dict directly
-        # (handlers/core.py, handlers/sessions.py), so the imported session is
-        # reachable by a plain GET from the moment it is created -- before the
-        # awaits below have run. If a prompt lands in that window while the join
-        # is still missing, the turn cold-starts via ``session/new`` with a FRESH
-        # context, and the Layer B written afterwards is bound to nothing: the
-        # exact silent context loss this feature exists to prevent. Landing the
-        # join first shrinks the exposed window to a single thread hop and makes
-        # any prompt inside it resume correctly.
-        #
-        # NOTE: this reorder is why the failure paths below call
-        # ``_forget_layer_b`` -- a rollback now has to undo a join that already
-        # exists, which was not true when materialisation ran last.
-        sessions = getattr(state, "sessions", None)
-        layer_b = bundle.get("layer_b")
-        sm_key = effective_session_key(new_slot)
-        # Resume mode, reported back to the sender so a degraded copy is never
-        # shown as a full one. "prefix" is correct for a v1/no-Layer-B bundle:
-        # the session opens on the transcript, which is exactly what was sent.
-        resume_mode = "prefix"
-        layer_b_sid = ""
         if layer_b:
             # Files in a thread (blocking IO), join on the loop (the live map's
             # whole-file write is unsynchronised against concurrent session
             # starts). See _write_layer_b_files / _join_layer_b.
-            written_sid = await asyncio.to_thread(_write_layer_b_files, layer_b, new_slot.agent)
+            written_sid = await asyncio.to_thread(_write_layer_b_files, layer_b, slot.agent)
             layer_b_sid = written_sid or ""
             resumable = bool(layer_b_sid) and _join_layer_b(sessions, sm_key, layer_b_sid)
             if not resumable:
                 logger.info(
                     "session_transfer: imported %s without Layer B; "
                     "it will resume via the transcript prefix",
-                    new_slot.key,
+                    slot.key,
                 )
                 if layer_b_sid:
-                    # Files landed but the join did not: remove them rather than
-                    # leaving an unreferenced pair for a prune to sweep.
                     await asyncio.to_thread(_unlink_layer_b_files, layer_b_sid)
                     layer_b_sid = ""
             resume_mode = "session_load" if resumable else "prefix"
 
-        # Mark the IMPORTED TAB when it arrived without resumable context.
-        #
-        # The sender's row already reports this, but that row lives in a menu's
-        # component state and is gone the moment the menu closes -- while the
-        # consequence is discovered later, on this machine, by whoever resumes the
-        # work. The tab title is the one surface that persists (it is saved below)
-        # and is present exactly where the loss will be felt, so the truth lives
-        # there too. English here, like the existing "(from X)" suffix: this is
-        # stored transcript metadata written by the backend, not a rendered
-        # string.
-        #
-        # Marked when the sender either SENT context that failed to land here, or
-        # told us it deliberately withheld context it had (``layer_b_skipped``,
-        # set for a mid-turn source). Keying off ``layer_b`` alone suppressed the
-        # marker in that second case -- the sender's row said "transcript only"
-        # while the tab that outlives the row said nothing. Neither fires for a
-        # bundle that simply never had a kiro-cli context (v1 peer, or a session
-        # with none), where a suffix would cry wolf instead of informing.
+        # Mark the IMPORTED TAB when it arrived without resumable context. The
+        # sender's row is gone the moment its menu closes; the tab title is the
+        # one surface that persists and is present where the loss will be felt.
+        # Fires when the sender either SENT context that failed to land or told
+        # us it deliberately withheld context (``layer_b_skipped``, a mid-turn
+        # source); never for a bundle that simply never had a kiro-cli context.
         if resume_mode == "prefix" and (bundle.get("layer_b") or bundle.get("layer_b_skipped")):
-            new_slot.title = f"{new_slot.title} — transcript only"
+            slot.title = f"{slot.title} — transcript only"
 
-        since_yield = 0
-        for m in messages:
-            role = m["role"]
-            content = m["content"]
-            # Assistant content arrives from another instance and lands in a
-            # transcript the dashboard renders and an agent later re-reads as
-            # context, so it goes through the same redaction the fork path
-            # applies. User turns are left verbatim, matching fork: redacting
-            # what the human typed would corrupt their own words.
-            if role != "user":
-                content, _ = redact_exfiltration_urls(content)
-                content, _ = redact_credentials(content)
-            cls = "msg msg-u" if role == "user" else "msg msg-a"
-            new_slot.append(role, content, cls, ts=m["ts"], broadcast=False)
-            # Yield periodically. Redaction is regex-heavy (those regexes hold
-            # the GIL) and a bundle carries up to _MAX_TOTAL_CHARS of PEER-
-            # supplied content, so redacting it in one un-yielded pass starves
-            # the loop heartbeat — and because ``_loop_heartbeat`` pets
-            # LoopStallWatchdog *from a coroutine*, a blocked loop cannot pet
-            # it: the watchdog's exit_after timer fires and _exit()s the
-            # gateway. chat_persistence.restore_open_slots_async hit exactly
-            # this on the same read-and-redact work and fixed it the same way.
-            # Budgeted by CHARS rather than message count because the cost
-            # scales with content size, not with how it is split into turns.
-            since_yield += len(content)
-            if since_yield >= _YIELD_AFTER_CHARS:
-                since_yield = 0
-                # sleep(0) yields to the ready queue with no wall-clock delay.
-                await asyncio.sleep(0)
-        new_slot.drain()
-        # best_effort=False: a swallowed write failure would let us answer 200
-        # while the imported session exists only in memory, so the peer believes
-        # the transfer landed and a restart before the next flush loses it. An
-        # import that cannot be persisted must fail loudly instead.
+        # best_effort=False: a swallowed write failure would answer 200 while the
+        # imported session exists only in memory, so the peer believes the
+        # transfer landed and a restart before the next flush loses it. An import
+        # that cannot be persisted must fail loudly instead.
         try:
-            await save_slot_off_loop(state, new_slot, best_effort=False)
+            await save_slot_off_loop(state, slot, best_effort=False)
         except Exception:
-            # Retryable and the peer's own fault-free case, so give it a coded
-            # answer rather than a bare 500: the source is untouched, so the user
-            # can simply send again.
-            # The slot is already unpublished (retracted right after creation),
-            # so there is no phantom tab to retract here -- just make sure it
-            # cannot be re-registered, and undo the join written above.
-            state._slots.pop(new_slot.key, None)
+            # Retryable, peer at no fault: coded answer, source untouched, resend
+            # is safe. Drop the registered-but-hidden slot and release its
+            # construction count in the finally; it was never shown (the
+            # construction filter hid it), so no broadcast is owed. Undo the join
+            # written above.
+            state._slots.pop(slot.key, None)
             sid = _forget_layer_b_join(sessions, sm_key) or layer_b_sid
             if sid:
                 await asyncio.to_thread(_unlink_layer_b_files, sid)
             logger.warning(
                 "session_transfer: could not persist imported slot=%s; refusing the import",
-                new_slot.key,
+                slot.key,
                 exc_info=True,
             )
             sel().log_api_access(
@@ -1269,7 +1507,7 @@ async def api_chat_slot_import(request: web.Request) -> web.Response:
                 operation="chat.slot_import",
                 outcome="error",
                 source="dashboard",
-                resources=f"to={new_slot.key}",
+                resources=f"to={slot.key}",
                 error="durable save failed",
             )
             return web.json_response(
@@ -1279,34 +1517,28 @@ async def api_chat_slot_import(request: web.Request) -> web.Response:
                 },
                 status=503,
             )
-        new_slot._resumed_count = len(new_slot.messages)
     except asyncio.CancelledError:
-        # ``CancelledError`` is a BaseException, so the ``except Exception`` below
-        # never saw it: a gateway shutdown or a client disconnect after the join
-        # left an orphaned session-map entry plus its files, pointing at a slot
-        # that is never published. Roll back the same state, then re-raise so
-        # cancellation still propagates.
-        #
-        # The unlink runs SYNCHRONOUSLY here rather than through
-        # ``asyncio.to_thread``: awaiting anything inside a cancelled task is not
-        # dependable, and this is two ``unlink`` calls on a teardown path.
-        state._slots.pop(new_slot.key, None)
+        # CancelledError is a BaseException, so ``except Exception`` never sees
+        # it: a shutdown or client disconnect after the join left an orphaned
+        # map entry plus its files. Roll back synchronously (awaiting inside a
+        # cancelled task is not dependable), then re-raise so cancellation
+        # propagates.
+        state._slots.pop(slot.key, None)
         try:
-            _sessions = getattr(state, "sessions", None)
-            sid = _forget_layer_b_join(_sessions, effective_session_key(new_slot))
+            sid = _forget_layer_b_join(sessions, sm_key)
             if sid:
                 _unlink_layer_b_files(sid)
         except Exception:
             logger.debug("session_transfer: cancellation rollback failed", exc_info=True)
         raise
     except Exception:
-        # The slot was never republished (see the retract above), so nothing is
-        # visible to retract -- but the join and its files may exist because
-        # Layer B is materialised before the transcript work.
-        state._slots.pop(new_slot.key, None)
+        # The slot was hidden by the construction filter throughout, so nothing
+        # is visible to retract -- but the join and its files may exist. Undo
+        # them; the finally releases the construction count and the pop drops the
+        # hidden slot.
+        state._slots.pop(slot.key, None)
         try:
-            _sessions = getattr(state, "sessions", None)
-            sid = _forget_layer_b_join(_sessions, effective_session_key(new_slot))
+            sid = _forget_layer_b_join(sessions, sm_key)
             if sid:
                 await asyncio.to_thread(_unlink_layer_b_files, sid)
         except Exception:
@@ -1316,16 +1548,16 @@ async def api_chat_slot_import(request: web.Request) -> web.Response:
             operation="chat.slot_import",
             outcome="error",
             source="dashboard",
-            resources=f"to={new_slot.key}",
+            resources=f"to={slot.key}",
             error="import finalisation failed",
         )
         raise
     finally:
-        # Every exit releases the construction count: the 503 ``return`` above,
-        # the ``raise`` here, and the success path. Ordering is safe -- this runs
-        # before the re-registration below, but nothing between them awaits, so no
-        # other coroutine can observe the slot as neither published nor counted.
-        state.end_slot_construction(new_slot.key)
+        # Every exit releases the construction count the shared materialiser
+        # opened: the 503 return above, the raises here, and the success path.
+        # Runs before the re-registration below, but nothing between them awaits,
+        # so no coroutine can observe the slot as neither published nor counted.
+        state.end_slot_construction(slot.key)
 
     sel().log_api_access(
         caller=caller,
@@ -1333,29 +1565,28 @@ async def api_chat_slot_import(request: web.Request) -> web.Response:
         outcome="allowed",
         source="dashboard",
         resources=(
-            f"to={new_slot.key},messages={len(messages)},"
-            f"origin={origin or 'unknown'},agent={new_slot.agent or 'default'},"
+            f"to={slot.key},messages={len(messages)},"
+            f"origin={origin or 'unknown'},agent={slot.agent or 'default'},"
             f"resume={resume_mode}"
         ),
     )
-    # Everything is in place now -- transcript persisted, Layer B joined -- so
-    # re-register the slot and publish it ONCE. This is the first moment a client
-    # can reach the imported session, which is the point: a prompt from here on
-    # resumes against real context instead of racing construction.
-    state._slots[new_slot.key] = new_slot
+    # Everything is in place -- transcript persisted, Layer B joined. The slot
+    # was RETRACTED from ``_slots`` for the async finalization tail above (so no
+    # raw acquirer could reach it mid-finalization); this re-registers it now that
+    # it is a complete, resumable session. The finally above ended construction,
+    # so this push is the first frame a client sees and it shows a fully
+    # materialised session.
+    state._slots[slot.key] = slot
     _sync_dashboard_slots(state)
     state.push_slots_update()
     return web.json_response(
         {
             "ok": True,
-            "key": new_slot.key,
-            "title": new_slot.title,
+            "key": slot.key,
+            "title": slot.title,
             "messages": len(messages),
             # Resume fidelity, so the SENDER can say "Sent" vs "Sent (transcript
-            # only)" instead of showing the same green row either way. Without
-            # this the feature's own failure mode -- a silently lossy copy -- is
-            # invisible to the person who will walk to the other machine and
-            # expect to keep working.
+            # only)" instead of showing the same green row either way.
             "resume_mode": resume_mode,
         }
     )

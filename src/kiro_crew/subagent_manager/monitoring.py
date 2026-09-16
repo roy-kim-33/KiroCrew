@@ -265,7 +265,7 @@ class OrphanStallMonitor(ManagerComponent):
         learns about the orphan on its next turn. Returns True if delivered.
 
         ``meta`` carries the structured completion facts for the dashboard card
-        (#1792) so the orphan row renders without re-parsing its prose header.
+        so the orphan row renders without re-parsing its prose header.
         """
         if self._manager._on_orphan_notify is None:
             return False
@@ -305,7 +305,7 @@ class OrphanStallMonitor(ManagerComponent):
     def _live_shared_count_impl(self, pid: int | None, agents: "list[SubagentInfo]") -> int:
         """Count live session-shared subagents sharing runtime *pid* (>= 1).
 
-        Used to average the shared AcpRuntime's measured RSS/CPU across the
+        Averages the shared AcpRuntime's measured RSS/CPU across the
         sessions currently running inside it, so each shared subagent is charged
         an empirical per-session share rather than the whole process.
 
@@ -403,10 +403,10 @@ class OrphanStallMonitor(ManagerComponent):
             if not self._manager._conv_registry_rebuilt:
                 # First pass after (re)start: re-seed the conversation TTL
                 # registry from state.json so promoted conversations survive
-                # a gateway restart under sweep ownership (#1114). The flag
+                # a gateway restart under sweep ownership. The flag
                 # is set only on SUCCESS — a failed rebuild retries on the
-                # next sweep instead of silently restoring the pre-#1114
-                # orphaning until the next restart (Arbiter, PR #1246).
+                # next sweep instead of silently leaving those conversations
+                # orphaned until the next restart.
                 try:
                     await self._manager._rebuild_conversation_registry()
                     self._manager._conv_registry_rebuilt = True
@@ -507,11 +507,14 @@ class OrphanStallMonitor(ManagerComponent):
         """True if a subagent is wedged in startup and should be reaped early.
 
         A subagent qualifies only once it has actually entered execution
-        (``_exec_started`` set by ``_run_inner``) yet has launched no runtime
-        (``_pid is None``) and produced no turn (``turns == 0``) within
-        ``_startup_deadline`` seconds. Keying on ``_exec_started`` — not the
-        registration timestamp ``started`` — means an agent merely awaiting
-        spawn approval (never entered ``_run_inner``) is never caught here.
+        (``_exec_started`` set by ``_run_inner``) yet has not begun its first
+        provider stream, launched no runtime (``_pid is None``), and produced
+        no turn (``turns == 0``) within ``_startup_deadline`` seconds. A
+        provider can create its child lazily from ``stream()``, so a missing PID
+        alone is not evidence that startup has not progressed. Keying on
+        ``_exec_started`` — not the registration timestamp ``started`` — means
+        an agent merely awaiting spawn approval (never entered ``_run_inner``)
+        is never caught here.
         """
         exec_started = info._exec_started
         if exec_started is None:
@@ -519,6 +522,7 @@ class OrphanStallMonitor(ManagerComponent):
         return (
             info.turns == 0
             and info._pid is None
+            and info._first_stream_started is None
             and (now - exec_started) > self._manager._startup_deadline
         )
 
@@ -585,7 +589,7 @@ class OrphanStallMonitor(ManagerComponent):
         )
         # The consult awaits, so fresh activity, a final tool result, or the next
         # dispatch can retire this snapshot while the walk is still running. A
-        # verdict about a tool that is no longer in flight must not be applied to
+        # verdict about a tool that is not in flight must not be applied to
         # whatever replaced it: DEAD/STUCK_INPUT skips the two-sweep confirmation,
         # so a stale one would flag an agent that has demonstrably resumed working.
         if info._stall_gen != submitted_gen:

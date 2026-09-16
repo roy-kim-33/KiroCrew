@@ -38,9 +38,10 @@ from kiro_crew.dashboard.chat_utils import (
 )
 from kiro_crew.loop_lock import LoopBoundLock
 from kiro_crew.messaging.identity import channel_inbound_permitted
-from kiro_crew.messaging.renderer import credential_redaction_notice
+from kiro_crew.messaging.renderer import redaction_notice
 from kiro_crew.security import (
     CREDENTIAL_REDACTION_TAGS,
+    EXFILTRATION_REDACTION_TAG_PREFIX,
     redact_and_truncate,
     redact_credentials,
     redact_exfiltration_urls,
@@ -104,20 +105,17 @@ _FENCE_MARKER_RE = re.compile(
     r"-{0,}\s*(?:UNTRUSTED FORWARDED CONTENT|CONTEXT ENTRY)\s+(?:BEGIN|END)\s*-{0,}",
     re.IGNORECASE,
 )
+_FENCE_MARKER_NEUTRALIZED = "[removed embedded fence marker]"
 
 
 def _neutralize_fence_markers(text: str) -> str:
-    """Strip any embedded quarantine/context fence markers from untrusted text.
+    """Neutralize Unicode-normalized forwarded/context fence variants."""
+    # Local import avoids the context -> Slack handler import cycle during
+    # module initialization; interaction handlers run only after startup.
+    from kiro_crew.context import _apply_marker_spans, _marker_spans
 
-    The forwarded body is authored by an arbitrary third party (possibly
-    external via Slack-Connect). If it contains a literal ``--- UNTRUSTED
-    FORWARDED CONTENT END ---`` (or a CONTEXT ENTRY marker), interpolating it
-    between the real fence markers would let the attacker's trailing text break
-    out of the quarantine and land in the trusted first-party region of the
-    prompt. Replace any such marker phrase with a defanged placeholder so the
-    boundary the model relies on cannot be forged from within the content.
-    """
-    return _FENCE_MARKER_RE.sub("[removed embedded fence marker]", text)
+    spans = _marker_spans(text, (_FENCE_MARKER_RE,))
+    return _apply_marker_spans(text, spans, _FENCE_MARKER_NEUTRALIZED)
 
 
 # Module-level orchestrator reference — set by ``init()``.
@@ -326,9 +324,11 @@ async def ack_button(payload: dict, channel: str, msg_ts: str) -> None:
 
 def _get_forward_callback() -> str:
     """Return the configured forward-to-agent callback ID, or empty if disabled."""
-    if not _orch or not _orch._cfg:
+    if not _orch:
         return ""
-    return _orch._cfg.slack.forward_to_agent_callback
+    from kiro_crew.slack.handler import slack_cfg
+
+    return slack_cfg(_orch).slack.forward_to_agent_callback
 
 
 async def _handle_message_shortcut(payload: dict) -> None:
@@ -1047,13 +1047,14 @@ async def _refresh_channels_modal(view_id: str) -> None:
     if not _orch or not _orch.slack:
         return
     from kiro_crew.slack.blocks import channels_modal
+    from kiro_crew.slack.handler import slack_cfg
 
     current_ids = sorted(_orch._tracking_channels)
     channels = [
         {
             "channel_id": cid,
-            "activation": _orch._cfg.channel_config(cid).activation,
-            "agent": _orch._cfg.channel_config(cid).agent,
+            "activation": slack_cfg(_orch).channel_config(cid).activation,
+            "agent": slack_cfg(_orch).channel_config(cid).agent,
         }
         for cid in current_ids
     ]
@@ -1079,9 +1080,12 @@ async def _handle_ch_activation(payload: dict, action: dict) -> None:
 
     await run_config_write(_persist_channel_config, cid, activation=new_mode)
     if _orch:
-        from kiro_crew.config.loader import KiroCrewConfig
+        # In place, never a rebind: ``_orch._cfg`` is the object the handler
+        # module and every dispatcher hold, so rebinding it here would leave
+        # them on the stale one.
+        from kiro_crew.slack.handler import _reload_orch_cfg
 
-        _orch._cfg = KiroCrewConfig.load()
+        _reload_orch_cfg()
     sel().log_api_access(
         caller=caller,
         operation="slack.channel_activation_change",
@@ -1107,9 +1111,12 @@ async def _handle_ch_agent(payload: dict, action: dict) -> None:
 
     await run_config_write(_persist_channel_config, cid, agent=new_agent)
     if _orch:
-        from kiro_crew.config.loader import KiroCrewConfig
+        # In place, never a rebind: ``_orch._cfg`` is the object the handler
+        # module and every dispatcher hold, so rebinding it here would leave
+        # them on the stale one.
+        from kiro_crew.slack.handler import _reload_orch_cfg
 
-        _orch._cfg = KiroCrewConfig.load()
+        _reload_orch_cfg()
     logger.info("Channel %s agent changed to %s", cid, new_agent or "default")
     sel().log_api_access(
         caller=caller,
@@ -3260,18 +3267,22 @@ async def _handle_review_approve(payload: dict, action: dict) -> None:
     await _orch.slack.post_message(channel, draft, thread_ts)
     # Approving a draft posts it publicly to the channel, so this egress carries
     # the same silent-corruption hazard as the streaming reply path: the two lines
-    # above replaced a credential in the draft with a placeholder, and a channel
-    # member who copies the command hits an opaque downstream failure with no hint
-    # the text was rewritten. Count the tags in the redacted draft that actually
-    # shipped and post one best-effort follow-up notice. The notice carries only a
-    # count, never secret bytes, and its failure must not undo the posted draft --
-    # the draft is already public, so raising here would lose the warning and the
-    # approve's remaining teardown too.
+    # above replaced a credential or a suspicious URL in the draft with a
+    # placeholder, and a channel member who copies the command hits an opaque
+    # downstream failure with no hint the text was rewritten. Count the tags in
+    # the redacted draft that actually shipped -- credential tags exactly, the URL
+    # tag by `EXFILTRATION_REDACTION_TAG_PREFIX` prefix since it interpolates the
+    # domain -- and post one best-effort follow-up notice worded by kind (the
+    # remedies differ). The notice carries only counts, never secret bytes or the
+    # redacted domain, and its failure must not undo the posted draft -- the draft
+    # is already public, so raising here would lose the warning and the approve's
+    # remaining teardown too.
     _cred_redactions = sum(draft.count(tag) for tag in CREDENTIAL_REDACTION_TAGS)
-    if _cred_redactions > 0:
+    _url_redactions = draft.count(EXFILTRATION_REDACTION_TAG_PREFIX)
+    if _cred_redactions > 0 or _url_redactions > 0:
         try:
             await _orch.slack.post_message(
-                channel, credential_redaction_notice(_cred_redactions), thread_ts
+                channel, redaction_notice(_cred_redactions, _url_redactions), thread_ts
             )
         except Exception:
             logger.debug("Failed to post review-approve redaction notice", exc_info=True)

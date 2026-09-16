@@ -3,13 +3,14 @@
 
 Why this reduction is sound when the general one is not
 ------------------------------------------------------
-`run_scoped_tests.py` deliberately refuses to narrow WITHIN a surface, and its
-docstring says why: answering "which tests reach this changed module?" needs a
-real import graph, and six review rounds proved a text scan cannot enumerate the
-ways a test can reach a module.
-
-This script does NOT retry that. It answers two questions that are decidable
-without an import graph, and it escalates to the full suite on anything else:
+Answering "which tests reach this changed module?" soundly needs a real import
+graph; six review rounds proved a text scan cannot enumerate the ways a test can
+reach a module. `run_scoped_tests.py` uses that scan anyway, but only as a
+BEST-EFFORT local selection with CI's full run behind it -- it never claims a
+skipped test is safe to skip. This script's verdict is different in kind: CI acts
+on it to skip the full matrix, so it must be SOUND, and it does not retry the
+scan. It answers two questions that are decidable without an import graph, and
+it escalates to the full suite on anything else:
 
     1. Does any OTHER file depend on the test files this diff touched?
     2. Can this diff change the SET of test files, rather than only their contents?
@@ -77,11 +78,20 @@ Usage
 
 Exit codes: 0 eligible / run green, 1 tests failed, 2 usage or environment error,
 3 NOT eligible -- the caller must run the full suite.
+
+Who the caller is
+-----------------
+The caller that acts on exit 3 is CI (`ci.yml` decides the matrix from
+`--targets`), and CI running the full suite is exactly right: that is where the
+full suite belongs. The LOCAL gate does not consume this script's verdict at all --
+`scripts/local-gate.py` and `run_scoped_tests.py` run the change-related set and
+leave the full suite to CI regardless of whether a diff is leaf-only.
 """
 
 from __future__ import annotations
 
 import argparse
+import functools
 import os
 import re
 import subprocess
@@ -97,6 +107,8 @@ sys.path.insert(0, str(REPO_ROOT / "scripts"))
 from run_scoped_tests import (  # noqa: E402  (path set immediately above)
     SelectionUntrustworthy,
     has_broad_impact,
+    pytest_parallel_args,
+    pytest_worker_env,
     resolve_base,
     validated_targets,
 )
@@ -167,6 +179,17 @@ def _iter_python(root: Path) -> list[Path]:
     return out
 
 
+# `importers_of` and `mentions_of` each call `_iter_python` + `_read` on every
+# candidate file, and both are called repeatedly for different name sets in one
+# `classify()` (once per changed-file batch) and dozens of times in `_self_test`
+# (once per stem in its dependency-check loop, and again once per `test/test_*.py`
+# candidate while it hunts for a clean leaf). None of that changes which files
+# exist or what they contain within a single process, so caching by root/path is
+# exact, not an approximation -- the walk and the read are each paid once no
+# matter how many times a caller re-asks the same question.
+_iter_python_cached = functools.lru_cache(maxsize=None)(_iter_python)
+
+
 def _read(path: Path) -> str:
     try:
         return path.read_text(encoding="utf-8", errors="replace")
@@ -174,6 +197,9 @@ def _read(path: Path) -> str:
         # Unreadable input cannot be cleared, and a reduction that silently
         # skipped a file it could not read would be exactly the wrong failure.
         raise SelectionUntrustworthy(f"cannot read {path} while classifying the diff") from None
+
+
+_read_cached = functools.lru_cache(maxsize=None)(_read)
 
 
 def _run_git(argv: list[str]) -> str:
@@ -234,8 +260,8 @@ def importers_of(stems: set[str], root: Path) -> dict[str, str]:
     if not stems:
         return {}
     found: dict[str, str] = {}
-    for path in _iter_python(root):
-        text = _read(path)
+    for path in _iter_python_cached(root):
+        text = _read_cached(path)
         for match in _IMPORT.finditer(text):
             module = (match.group(1) or match.group(2) or "").split(".")[0]
             if module in stems and module != path.stem:
@@ -260,8 +286,8 @@ def mentions_of(stems: set[str], root: Path) -> dict[str, str]:
         return {}
     found: dict[str, str] = {}
     quoted = {stem: (f'"{stem}"', f"'{stem}'") for stem in stems}
-    for path in _iter_python(root):
-        text = _read(path)
+    for path in _iter_python_cached(root):
+        text = _read_cached(path)
         for stem, forms in quoted.items():
             if stem in found or path.stem == stem:
                 continue
@@ -284,7 +310,7 @@ def corpus_gates(root: Path) -> list[str]:
     if not test_dir.is_dir():
         return gates
     for path in sorted(test_dir.glob("test_*.py")):
-        text = _read(path)
+        text = _read_cached(path)
         scans_tree = _SCANS_A_DIR.search(text) and _REACHES_TEST_TREE.search(text)
         if scans_tree or _JOINS_TEST_DIR.search(text):
             gates.append(_rel_posix(path, root))
@@ -388,6 +414,10 @@ def pytest_argv(targets: list[str]) -> list[str]:
         "-m",
         "pytest",
         "-q",
+        # The budgeted `-n auto`, capped through the env `run()` passes: `--run`
+        # is a local convenience on a shared box. CI consumes `--targets` and
+        # drives its own pytest, so this does not change the CI lane.
+        *pytest_parallel_args(),
         "--no-cov",
         "--",
         *validated_targets(targets, REPO_ROOT),
@@ -400,7 +430,7 @@ def run(changed: list[str], gates: list[str], repeat: int) -> int:
         argv = pytest_argv(gates)
         print(f"leaf_test_scope: corpus gates ({len(gates)} file(s), once)", flush=True)
         rc = subprocess.run(
-            argv, cwd=str(REPO_ROOT), check=False
+            argv, cwd=str(REPO_ROOT), env=pytest_worker_env(), check=False
         ).returncode  # noqa: E501  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-tainted-env-args.dangerous-subprocess-use-tainted-env-args
         if rc != 0:
             print(f"leaf_test_scope: FAILED in the corpus gates (rc={rc}).", file=sys.stderr)
@@ -410,7 +440,7 @@ def run(changed: list[str], gates: list[str], repeat: int) -> int:
     for attempt in range(1, repeat + 1):
         print(f"leaf_test_scope: changed files, pass {attempt}/{repeat}", flush=True)
         rc = subprocess.run(
-            argv, cwd=str(REPO_ROOT), check=False
+            argv, cwd=str(REPO_ROOT), env=pytest_worker_env(), check=False
         ).returncode  # noqa: E501  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-tainted-env-args.dangerous-subprocess-use-tainted-env-args
         if rc != 0:
             print(

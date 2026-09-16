@@ -21,7 +21,8 @@ import uuid
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
-from kiro_crew.dashboard.chat_utils import _redact_for_display
+from kiro_crew.dashboard.chat_utils import _redact_for_display, _redact_meta
+from kiro_crew.dashboard.slot_queue_repository import ATTACHMENT_META_KEYS
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -57,8 +58,8 @@ STEER_UNAVAILABLE = "unavailable"
 # A steer can only be injected at a model-inference boundary, so a turn that is
 # streaming text without dispatching a tool may never reach one before it ends
 # (see `AcpSessionHandle.last_steer_monotonic`). That path is `written` followed
-# by `requeued` and never touches `consumed` -- the case the row used to render as
-# a successful injection (#7246).
+# by `requeued` and never touches `consumed`: such a row must not render as a
+# successful injection.
 STEER_STATE_WRITTEN = "written"
 STEER_STATE_CONSUMED = "consumed"
 STEER_STATE_REQUEUED = "requeued"
@@ -136,22 +137,27 @@ def _row_has_delivery_id(slot: Any, delivery_id: str) -> bool:
     return False
 
 
-def _queue_has_delivery_id(slot: Any, delivery_id: str) -> bool:
-    """Whether a QUEUE entry carries *delivery_id* in its meta.
+def _queued_entry_id(slot: Any, delivery_id: str) -> str:
+    """The id of the QUEUE entry carrying *delivery_id* in its meta, or ``""``.
 
-    True exactly when the turn's teardown requeued THIS steer: the requeue moves
-    the id out of `_steer_delivery_ids` and into the new queue entry's meta.
+    Non-empty exactly when the turn's teardown requeued THIS steer: the requeue
+    moves the id out of `_steer_delivery_ids` and into the new queue entry's meta.
 
     Identity rather than content, because a content count cannot tell this steer's
     requeue apart from an unrelated client queueing the same text in the same
     window -- and reading that as "mine was requeued" drops the transcript row for
     a steer the turn actually consumed.
+
+    The entry's OWN id is returned rather than a bool because the ledger records
+    which queue entry the text became, and the only id this coroutine could
+    otherwise reach is the client's `sendId` -- a different namespace, minted by a
+    different party, which no reader could join against the queue.
     """
     for item in slot._queue:
         meta = item.get("meta")
         if isinstance(meta, dict) and meta.get("steer_delivery_id") == delivery_id:
-            return True
-    return False
+            return str(item.get("id") or "")
+    return ""
 
 
 def find_written_steer_row(
@@ -187,7 +193,7 @@ def find_written_steer_row(
     admitted with byte-identical rows -- the same injectivity loss ``steer_settle``
     documents for its own keys. Understating a state is recoverable; claiming the
     wrong message was the one the turn consumed is not. Real identity for a pending
-    steer is the refactor tracked in #4333, not this fix.
+    steer is a separate refactor.
     """
     if message in getattr(slot, "_steer_delivery_ids", {}):
         # Registered but not yet persisted: this steer owns no row, so every
@@ -292,9 +298,9 @@ async def steer_into_running_turn(
         logger.info("identical steer already pending for slot %s; queueing instead", slot.key)
         return STEER_UNAVAILABLE
 
-    # A real identity, not a content match. Every earlier attempt here compared
-    # text, and text cannot survive the transitions: consumed, requeued, drained,
-    # or merged into a larger row all look alike afterwards. The id is keyed by the
+    # A real identity, not a content match: text cannot survive the transitions,
+    # because consumed, requeued, drained, or merged into a larger row all look
+    # alike afterwards. The id is keyed by the
     # message only because the one-per-text guard above makes that key unique, and
     # it is handed to the requeue, which puts it on the queue entry; the drain then
     # unions entry meta onto the row it appends, so the id reaches the row even
@@ -309,8 +315,8 @@ async def steer_into_running_turn(
     # after the drain already wrote the row), so the only common writer is
     # `_requeue_unconsumed_steers`. Normalized value, not the raw argument -- the
     # entry meta is persisted with the queue and reaches the row, so it must clear
-    # the same gate the row stamp does. Absent id stores nothing, which keeps the
-    # requeued entry's meta byte-identical to its pre-#6751 shape.
+    # the same gate the row stamp does. Absent id stores nothing, which leaves the
+    # requeued entry's meta unchanged.
     if send_id:
         slot._steer_send_ids[message] = send_id
     slot._pending_steers.append(message)
@@ -319,6 +325,50 @@ async def steer_into_running_turn(
     except Exception as exc:  # best-effort — the caller falls back to the queue
         logger.warning("steer failed for slot %s: %s", slot.key, exc)
         steered = False
+
+    # The append-only log's record of this steer is NOT written here, and the
+    # delivered case is not written from this coroutine at all. ``steered`` means
+    # the client accepted the write and nothing more: the turn it was written into
+    # may have ended during the await, and a steer left pending is requeued by that
+    # turn's teardown without ever cutting anything. So a `message/steered` written
+    # here would assert into a permanent file that a turn received text it may
+    # never see. That entry belongs to the ``steering_consumed`` echo, which is the
+    # only positive evidence that a turn consumed the steer and the only site that
+    # knows WHICH turn did -- see ``chat_runner._settle_consumed_steers``.
+    def _record_steer_requeued(queue_id: str) -> None:
+        """Record that this steer became a QUEUED message instead of cutting a turn.
+
+        It has to be recorded here because the requeue moves the text straight into
+        the slot queue without passing the append that records ``message/queued``,
+        so nothing else in the system knows it happened. No turn: a queued message
+        belongs to no turn yet, and it names the one it eventually runs as when
+        that turn starts.
+
+        ``queue_id`` is the requeued entry's OWN id, read off the entry this path
+        found. It is the same quantity `queue_for_next_turn` records, so one reader
+        joins both against the queue; the client's `sendId` is a different
+        namespace minted by a different party and would look like a queue id
+        without being one.
+
+        Called from the ONE path that has seen the queue entry, never from one that
+        expects a requeue to happen later. A pending steer can still be discarded
+        by a hard kill before its teardown requeues it, and this entry cannot be
+        taken back.
+        """
+        # Deferred, not module-scope: this module is reached from the gateway boot
+        # path, and AUTOSDE's no-new-work-on-gateway-boot-path rule asks for a
+        # flag-gated subsystem's IMPORT to be gated, not just its use.
+        from kiro_crew import session_ledger_emit
+
+        sid = session_ledger_emit.session_id_of(client)
+        if not sid:
+            return
+        session_ledger_emit.on_message_queued(
+            sid,
+            source="steer",
+            size_bytes=len(message.encode("utf-8", "surrogatepass")),
+            queued_seq=queue_id,
+        )
 
     # ONE reconciliation for every path. The outcome turns on WHERE the text is
     # now, not on `steered`: the RPC returning True only means the client
@@ -340,10 +390,18 @@ async def steer_into_running_turn(
             "steer for slot %s was requeued and drained during the RPC; row already " "persisted",
             slot.key,
         )
+        # No ledger entry: the drain already STARTED a turn with this text, and
+        # that turn recorded its own `message/received`. Writing `message/queued`
+        # now would place the queued fact AFTER the received fact that supersedes
+        # it, which reads as a message queued after it had already run.
         return STEER_REQUEUED
 
     still_registered = bool(slot._pending_steers.count(message))
-    queued = _queue_has_delivery_id(slot, delivery_id)
+    # The requeued entry's own id when the teardown moved our steer, else "". Held
+    # rather than discarded to a bool, because the entry the ledger names has to be
+    # the entry this path actually found.
+    queued_id = _queued_entry_id(slot, delivery_id)
+    queued = bool(queued_id)
     stopped = int(getattr(slot, "_stop_generation", 0) or 0) != stop_gen
 
     if still_registered:
@@ -359,6 +417,13 @@ async def steer_into_running_turn(
         if stopped:
             # Still registered means the teardown has not run yet and will
             # requeue it, so the text still runs — the caller must NOT resend.
+            #
+            # No ledger entry, because "will requeue" is a PREDICTION and this log
+            # records only what is observed: a second stop can hard-kill and
+            # discard the pending steers before the teardown runs, and then a
+            # `message/queued` would permanently claim a queue entry that was
+            # never made. When the requeue does happen the text runs as its own
+            # turn and reaches the log as that turn's `message/received`.
             _log_stop_race(slot, stop_gen, preserved=True)
             return STEER_REQUEUED
         # Delivered and live: fall through to cut the segment and persist the row.
@@ -371,6 +436,7 @@ async def steer_into_running_turn(
         # a row here would duplicate it.
         if stopped:
             _log_stop_race(slot, stop_gen, preserved=True)
+        _record_steer_requeued(queued_id)
         return STEER_REQUEUED
     # Absence alone does not say WHICH consumer took the registration. THREE
     # things remove one: the running turn CONSUMING the steer, the hard-kill
@@ -432,6 +498,13 @@ async def steer_into_running_turn(
     # few lines below, so nothing will read the map entry again and leaving it
     # would hold a full message string for the slot's lifetime.
     slot._steer_send_ids.pop(message, None)
+    # No `message/steered` from here. Reaching this point rules out every requeue
+    # and discard KNOWN SO FAR, which is what entitles this path to persist a
+    # transcript row -- but that row is mutable and starts as `written`, promoted to
+    # `consumed` only when the echo confirms the injection. A ledger entry has no
+    # such state: it would assert consumption this coroutine cannot prove, and a
+    # turn that ends without the echo still requeues the text. The entry is written
+    # by ``chat_runner._settle_consumed_steers`` instead, from the echo itself.
 
     ts = datetime.now(timezone.utc).isoformat()
     # Cut the in-flight text segment at the steer boundary BEFORE persisting the
@@ -456,15 +529,13 @@ async def steer_into_running_turn(
     # RPC: delivered and live, with no consumption echo yet, so `written`.
     #
     # Gone means SOME remover took it during the await, and absence alone does not
-    # say which -- that is the whole difficulty. AT LEAST TWO can: the settle path
-    # promoting an entry a non-empty echo accounted for, and the
-    # `settle_all_on_empty` sweep clearing the pending list on an EMPTY echo, which
-    # is no evidence of consumption at all. After the fact the two removals are
-    # indistinguishable here, so inferring `consumed` from absence persisted a
-    # success badge on a frame that proved nothing -- terminal and never corrected,
-    # which is the exact claim this change exists to stop. An earlier version of
-    # this comment asserted that every other remover had returned above; it had not,
-    # and that sentence is why the bug read as correct.
+    # say which -- that is the whole difficulty. The settle path promotes an entry
+    # a non-empty echo accounted for, and a remover that takes entries WITHOUT
+    # such evidence (an empty-echo sweep, should any caller ever select one) looks
+    # identical here after the fact. So inferring `consumed` from absence would
+    # persist a success badge on a frame that proved nothing -- terminal and never
+    # corrected. Nor have all other removers returned by this point, so their
+    # absence cannot be assumed either.
     #
     # So the state comes from POSITIVE evidence: the settle path records the delivery
     # ids a non-empty echo accounted for, and only a recorded id yields `consumed`.
@@ -498,7 +569,7 @@ async def steer_into_running_turn(
     if send_id:
         # Persist the client correlation id alongside the steer flag: the
         # transcript page is what mergePreservedThinking reads to resolve an
-        # optimistic bubble by id (accepted steer vs raced new turn, #6075).
+        # optimistic bubble by id (accepted steer vs raced new turn).
         meta["sendId"] = send_id
     # Store the sanitized form — raw content must never reach an external
     # surface — so the steer survives a page reload via the dirty-flush cycle.
@@ -534,19 +605,63 @@ def queue_for_next_turn(
     message: str,
     *,
     directive_user_origin: bool = False,
+    send_id: str | None = None,
+    attachments: dict[str, list[str]] | None = None,
 ) -> str:
     """Append *message* to the slot's queue and announce it; return the queue id.
 
     The running turn's teardown drains the queue, so this is how a message
     reaches a busy slot when steering is unavailable or not asked for.
+
+    *send_id* is the client-minted ``meta.sendId`` the plain send path persists
+    on its user row, already passed through ``normalize_send_id`` by the caller.
+    When present it is stamped onto the queue entry's meta: the drain unions
+    every consumed entry's meta onto the row it writes, so this is what gives a
+    QUEUED send's row the same ``meta.sendId`` a dispatched send's row gets --
+    without it the drained row is id-less and a client that sent into a busy
+    slot has no identity to prove its own delivery by (it would have to fall
+    back to text, which a same-text resend or an injection can share). Additive:
+    a send whose POST carried no usable id stores nothing here and the entry
+    meta keeps the exact prior shape.
+
+    *attachments* is the client's ordered attachment lists (``files``, ``dirs``),
+    already reduced to lists of strings by ``attachment_meta``. Same reasoning
+    as the id: a dispatched send persists ``meta.files`` on its row, and the
+    renderer resolves each ``[attached_file N] path`` marker LOSSLESSLY against
+    that list. A queued send's row had no such list, so the renderer fell back
+    to a whitespace-bounded capture of the marker text and a path with a space
+    (``/tmp/My Report.pdf``) came back as ``/tmp/My`` -- an attachment card that
+    opens nothing. Stamping the lists onto the entry rides them onto the row.
     """
     # circular import: session_control imports this module at module level.
     from kiro_crew.dashboard.session_control import containment_meta
 
+    meta: dict[str, Any] = containment_meta(state, slot)
+    if send_id:
+        meta["sendId"] = send_id
+    if attachments:
+        meta.update(attachments)
     qid = slot.queue_append(
         message,
-        meta=containment_meta(state, slot),
+        meta=meta,
         directive_user_origin=directive_user_origin,
+    )
+    # Append-only session ledger. The session id comes off the client the running
+    # turn published on the slot -- a message is only queued because a turn IS
+    # running, so it is there. No turn ordinal: this message belongs to no turn
+    # yet, and it names the one it eventually runs as when that turn starts.
+    # Deferred for the boot-path rule; see the note at the other call site.
+    from kiro_crew import session_ledger_emit
+
+    session_ledger_emit.on_message_queued(
+        session_ledger_emit.session_id_of(getattr(slot, "_acp_client", None)),
+        source=slot.key,
+        # "replace", not strict: a JSON body may carry a lone surrogate, which
+        # strict UTF-8 refuses to encode. The message is ALREADY queued at this
+        # point, so raising here would 500 the request while the queued message
+        # still runs, and the retry would run it twice.
+        size_bytes=len(message.encode("utf-8", "replace")),
+        queued_seq=str(qid),
     )
     state.broadcast_ws(
         "queue_push",
@@ -558,3 +673,36 @@ def queue_for_next_turn(
         },
     )
     return qid
+
+
+def attachment_meta(user_meta: dict | None) -> dict[str, list[str]]:
+    """The attachment lists of a send's ``meta``, reduced to lists of strings.
+
+    Anything that is not a non-empty list of non-empty strings is dropped
+    rather than carried: these lists are indexed by marker number on the
+    render side, so a malformed entry would shift every later marker onto the
+    wrong path. An empty result means "carry nothing", keeping the entry meta
+    in its prior shape for a send without attachments. An entry that does
+    carry them drains alone (``chat_utils.carries_attachments``), so the row
+    the drain writes has exactly one text for the lists to index.
+
+    The paths pass through ``_redact_meta``, the same redaction every persisted
+    row meta gets: a path is user-supplied text and can embed a credential
+    just as a message can, and this list reaches every client of the slot
+    (queue entry, drained row, ``queue_pop`` frame) -- the same places the
+    message text reaches only after ``redact_credentials``.
+    """
+    out: dict[str, list[str]] = {}
+    if not isinstance(user_meta, dict):
+        return out
+    for key in ATTACHMENT_META_KEYS:
+        raw = user_meta.get(key)
+        if not isinstance(raw, list) or not raw:
+            continue
+        if not all(isinstance(p, str) and p for p in raw):
+            continue
+        out[key] = list(raw)
+    if not out:
+        return out
+    redacted = _redact_meta(out)
+    return {k: v for k, v in redacted.items() if isinstance(v, list)}

@@ -24,11 +24,7 @@ from kiro_crew.metrics.events import CONTEXT_COMPACTIONS, emit_counter
 from kiro_crew.metrics.sessions import END_REASON_RECYCLED, record_session_ended
 
 if TYPE_CHECKING:
-    # Type-only: importing providers.base from this leaf at runtime enters the
-    # providers -> acp package -> runtime -> session_pid -> providers cycle.
     from kiro_crew.providers.base import LLMProvider
-else:
-    LLMProvider = Any
 
 
 class CompactCallback(Protocol):
@@ -91,6 +87,8 @@ class _CompactionOwner(Protocol):
 
     def _fold_key(self, key: str) -> str: ...
 
+    def _advance_session_generation(self, key: str) -> int: ...
+
     def _trigger_compaction(
         self, key: str, reason: str, pct: float, provider: LLMProvider
     ) -> str | None: ...
@@ -132,7 +130,7 @@ class _CompactionOwner(Protocol):
 def _compact_unsupported_backend(provider: LLMProvider) -> str | None:
     """Backend id this provider names as unable to serve ``/compact``, else None.
 
-    The same capability #7800 gave the manual entry points, read for the
+    The same capability the manual entry points read, asked for the
     automatic one.  The property is spelled ``manual_`` because the manual
     command was its first consumer, but its ANSWER is a property of the
     BACKEND -- ``ACP_BACKENDS_COMPACT`` membership -- not of the entry point,
@@ -251,24 +249,6 @@ class CompactionCoordinator:
             self._owner._fold_key(key), self._owner._cfg.session.autocompact_pct
         )
 
-    def drop_autocompact_overrides_matching(
-        self, exact_keys: set[str], folded_keys: set[str], fold: Callable[[str], str]
-    ) -> int:
-        """Drop overrides for permanently deleted sessions with NO live session.
-
-        ``destroy()`` clears a live session's override, but a permanent delete
-        of ARCHIVED history has no session to destroy — and channel keys are
-        deterministic, so a recreated session would silently inherit the
-        deleted conversation's threshold. Same fold-matching contract as the
-        session-ledger purge sweep: an override matches when its stored key is
-        in ``exact_keys`` or its ``fold``-ed spelling is in ``folded_keys``.
-        Returns the number of entries dropped.
-        """
-        doomed = [k for k in self.state.pct_overrides if k in exact_keys or fold(k) in folded_keys]
-        for k in doomed:
-            self.state.pct_overrides.pop(k, None)
-        return len(doomed)
-
     def _compaction_gate_decision(self, key: str, provider: LLMProvider, pct: float) -> str | None:
         """Return the first compaction gate decline, in lifecycle order.
 
@@ -281,15 +261,36 @@ class CompactionCoordinator:
         ``/compact`` still has a context meter worth reporting, and declining
         above the threshold check would take the per-turn usage line in
         ``check_context_usage`` with it.  Placing it here also means the only
-        behaviour that changes for such a backend is the one that was broken --
+        behaviour that changes for such a backend is the one that cannot work --
         the dispatch itself -- and it changes before ``_compact_session`` is
         ever scheduled, so no ``compacting`` entry, no background task and no
         ``session.semaphore`` acquisition happens for a compaction that could
-        only have ended in the 300s strand (#7812).
+        only end in the 300s strand.
         """
         baseline = self.state.pending_verdict.get(key)
         if baseline is not None and not self._deps.context_pct_is_unknown(provider):
             del self.state.pending_verdict[key]
+            # Append-only session ledger (flag-gated, fail-soft). The OTHER half
+            # of the emit in ``_settle_compact_cooldown``: a compaction whose
+            # effect was not measurable at the time deferred its verdict to here,
+            # and without this line that compaction would never appear in the
+            # ledger at all. ``pct`` is the first CONFIRMED reading after it, so
+            # it is the honest ``pct_after`` even when it is higher than
+            # ``baseline`` -- a deferred reading includes a later turn's growth,
+            # which makes ``freed_pct`` negative rather than absent. Recording
+            # that beats recording nothing: the entry says a compaction happened
+            # and what was measured, and a reader can see the measurement is not
+            # a clean before/after because the numbers say so.
+            # Deferred, not module-scope: this module is reached from the gateway
+            # boot path, and AUTOSDE's no-new-work-on-gateway-boot-path rule asks
+            # for a flag-gated subsystem's IMPORT to be gated, not just its use.
+            from kiro_crew import session_ledger_emit
+
+            session_ledger_emit.on_compaction_applied(
+                session_ledger_emit.session_id_of(provider),
+                pct_before=baseline,
+                pct_after=pct,
+            )
             # Ignore the escalation result here: a deferred reading includes a
             # later turn's growth and is only safe for cooldown damping.
             self._owner._judge_compact_effect(key, baseline, pct)
@@ -447,6 +448,7 @@ class CompactionCoordinator:
                 popped = None
                 if owner._sessions.get(key) is session:
                     popped = owner._sessions.pop(key, None)
+                    owner._advance_session_generation(key)
                     # Same tick as the pop. Only this branch records: on the
                     # other one the registry already holds a SUCCESSOR under
                     # this key, whose start must stay its own.
@@ -554,6 +556,18 @@ class CompactionCoordinator:
             )
             return False
         self.state.pending_verdict.pop(key, None)
+        # Append-only session ledger (flag-gated, fail-soft). This is the
+        # immediately-confirmed half; a deferred verdict is recorded by
+        # ``_compaction_gate_decision`` when its reading settles, so every
+        # compaction reaches the ledger on exactly one of the two paths.
+        # Deferred for the boot-path rule; see the note at the other call site.
+        from kiro_crew import session_ledger_emit
+
+        session_ledger_emit.on_compaction_applied(
+            session_ledger_emit.session_id_of(provider),
+            pct_before=pct_before,
+            pct_after=pct_after,
+        )
         return self._owner._judge_compact_effect(key, pct_before, pct_after)
 
     def _judge_compact_effect(self, key: str, pct_before: float, pct_after: float) -> bool:

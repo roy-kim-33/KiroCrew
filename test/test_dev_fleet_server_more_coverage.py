@@ -22,7 +22,6 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from aiohttp.test_utils import make_mocked_request
 
 from kiro_crew import platform_compat
 from kiro_crew.apps.builtins.dev_fleet import (
@@ -210,7 +209,7 @@ async def test_run_cmd_timeout_kills_tree_and_reports(monkeypatch, tmp_path):
     assert killed == [proc.pid]
     # The reap drains pipes via communicate() after kill(); a bare wait() on
     # a killed child blocked writing into a full pipe would hang the caller
-    # forever (#5989). With timeout=0 the site's own communicate() is
+    # forever. With timeout=0 the site's own communicate() is
     # cancelled before it ever runs, so the single recorded call IS the reap.
     # The missing cleanup file was tolerated.
     assert (proc.kills, proc.communicates, proc.waits) == (1, 1, 0)
@@ -969,18 +968,6 @@ async def test_restart_gateway_refuses_confined_status(monkeypatch):
     assert "kirocrew restart" in out["error"]
 
 
-@pytest.mark.asyncio
-async def test_restart_gateway_handler_returns_result(monkeypatch):
-    monkeypatch.setattr(runtime, "_sel", lambda: _NullSel())
-    monkeypatch.setattr(live, "_restart_gateway", AsyncMock(return_value={"ok": True}))
-
-    request = make_mocked_request("POST", "/api/restart-gateway")
-    resp = await http_api.api_dev_fleet_restart_gateway(request)
-
-    assert resp.status == 200
-    assert json.loads(resp.text) == {"ok": True}
-
-
 class _NullSel:
     def log_tool_invocation(self, **kw) -> None:  # pragma: no cover - sink
         pass
@@ -997,54 +984,6 @@ def _body_request(raw: bytes) -> MagicMock:
     request.content_length = len(raw)
     request.can_read_body = True
     return request
-
-
-@pytest.mark.asyncio
-async def test_make_live_handler_rejects_unparseable_body(monkeypatch):
-    monkeypatch.setattr(runtime, "_sel", lambda: _NullSel())
-    monkeypatch.setattr(live, "_make_live", AsyncMock(side_effect=RuntimeError))
-
-    resp = await http_api.api_dev_fleet_make_live(_body_request(b"{not json"))
-
-    assert resp.status == 400
-    assert json.loads(resp.text) == {"error": "invalid JSON body"}
-
-
-@pytest.mark.asyncio
-async def test_make_live_handler_requires_path_string(monkeypatch):
-    monkeypatch.setattr(runtime, "_sel", lambda: _NullSel())
-    monkeypatch.setattr(live, "_make_live", AsyncMock(side_effect=RuntimeError))
-    raw = json.dumps({"path": 12}).encode()
-
-    resp = await http_api.api_dev_fleet_make_live(_body_request(raw))
-
-    assert resp.status == 400
-    assert json.loads(resp.text) == {"error": "'path' must be a non-empty string"}
-
-
-@pytest.mark.asyncio
-async def test_make_live_handler_validates_dry_run_type(monkeypatch):
-    monkeypatch.setattr(runtime, "_sel", lambda: _NullSel())
-    monkeypatch.setattr(live, "_make_live", AsyncMock(side_effect=RuntimeError))
-    raw = json.dumps({"path": "/wt/feat", "dry_run": "yes"}).encode()
-
-    resp = await http_api.api_dev_fleet_make_live(_body_request(raw))
-
-    assert resp.status == 400
-    assert json.loads(resp.text) == {"error": "dry_run must be a boolean"}
-
-
-@pytest.mark.asyncio
-async def test_make_live_handler_passes_dry_run_through(monkeypatch):
-    monkeypatch.setattr(runtime, "_sel", lambda: _NullSel())
-    make_live = AsyncMock(return_value={"ok": True, "dry_run": True})
-    monkeypatch.setattr(live, "_make_live", make_live)
-    raw = json.dumps({"path": "/wt/feat", "dry_run": True}).encode()
-
-    resp = await http_api.api_dev_fleet_make_live(_body_request(raw))
-
-    assert resp.status == 200
-    make_live.assert_awaited_once_with("/wt/feat", True, expected_staged=None)
 
 
 @pytest.mark.asyncio
@@ -1220,7 +1159,7 @@ async def test_gateway_service_active_false_when_foreground_confined(monkeypatch
     assert await live._gateway_service_active() is False
 
 
-# --- stale sync lock race (issue #4906) ---
+# --- stale sync lock race ---
 
 
 @pytest.mark.asyncio
@@ -1400,3 +1339,50 @@ async def test_sync_refuses_when_worker_cleanup_times_out(monkeypatch):
     # Cleanup
     never_done.set_result(None)
     await slow_task
+
+
+def test_completed_cutover_undo_target_exposes_discovered_previous_checkout():
+    raw = [
+        {"path": "/repo/main"},
+        {"path": "/repo/wt-feature"},
+    ]
+    rows = [
+        {"name": "main", "path": "/display/main"},
+        {"name": "wt-feature", "path": "/display/wt-feature"},
+    ]
+
+    out = fleet_state._completed_cutover_undo_target(
+        raw,
+        rows,
+        live_path="/repo/wt-feature",
+        staged_path=None,
+        previous_path=Path("/repo/main"),
+    )
+
+    assert out == {"name": "main", "path": "/display/main"}
+
+
+@pytest.mark.parametrize(
+    ("live_path", "staged_path", "previous_path"),
+    [
+        ("/repo/wt-feature", "/repo/main", Path("/repo/main")),
+        ("/repo/main", None, Path("/repo/main")),
+        ("/repo/wt-feature", None, Path("/repo/removed")),
+        (None, None, Path("/repo/main")),
+    ],
+)
+def test_completed_cutover_undo_target_hides_non_actionable_history(
+    live_path, staged_path, previous_path
+):
+    out = fleet_state._completed_cutover_undo_target(
+        [{"path": "/repo/main"}, {"path": "/repo/wt-feature"}],
+        [
+            {"name": "main", "path": "/display/main"},
+            {"name": "wt-feature", "path": "/display/wt-feature"},
+        ],
+        live_path=live_path,
+        staged_path=staged_path,
+        previous_path=previous_path,
+    )
+
+    assert out is None

@@ -43,6 +43,12 @@ def register(app: web.Application) -> None:
     app.router.add_patch("/api/config/kirocrew", handlers.api_kirocrew_config_patch)
     app.router.add_get("/api/config/theme", handlers.api_theme_config)
     app.router.add_put("/api/config/theme", handlers.api_theme_config)
+    # Host-side backup of the renderer's own settings (localStorage), so an
+    # origin or userData change does not read as "the upgrade ate my settings".
+    # Deliberately NOT under /api/config: these keys are client-owned and never
+    # enter config.json. See kiro_crew/ui_prefs.py.
+    app.router.add_get("/api/ui-prefs", handlers.api_ui_prefs)
+    app.router.add_put("/api/ui-prefs", handlers.api_ui_prefs)
     app.router.add_get(
         "/api/onboarding/import/scan",
         handlers.api_onboarding_import_scan,
@@ -89,6 +95,13 @@ def register(app: web.Application) -> None:
     app.router.add_post("/api/connections/test", handlers.api_connections_test)
     app.router.add_post("/api/connections/cancel", handlers.api_connections_cancel)
     app.router.add_post("/api/connections/disconnect", handlers.api_connections_disconnect)
+    app.router.add_get("/api/connections/oauth-clients", handlers.api_connections_oauth_clients)
+    app.router.add_put(
+        "/api/connections/oauth-clients/{slug}", handlers.api_connections_oauth_client_put
+    )
+    app.router.add_delete(
+        "/api/connections/oauth-clients/{slug}", handlers.api_connections_oauth_client_delete
+    )
     # REST-style MCP server registration (App Kit)
     app.router.add_put("/api/mcp/servers/{name}", handlers.api_mcp_server_detail)
     app.router.add_delete("/api/mcp/servers/{name}", handlers.api_mcp_server_detail)
