@@ -7,6 +7,8 @@ import os
 import signal
 import subprocess
 import sys
+import threading
+import time
 from collections import deque
 from collections.abc import Iterator
 from pathlib import Path
@@ -20,7 +22,7 @@ from kiro_crew import platform_compat
 # APIs (os.killpg / os.getpgrp / os.getpgid), POSIX identity/age probes
 # (os.getuid / os.sysconf, /proc, ps), the raw signal.SIGKILL constant, and the
 # POSIX kill path of the orphan sweep (which no-ops on Windows). None of these
-# have a Windows equivalent, so they are skipped on Windows. See issue #2041.
+# have a Windows equivalent, so they are skipped on Windows.
 _POSIX_ONLY = pytest.mark.skipif(
     sys.platform == "win32", reason="POSIX process-management semantics only; see issue #2041"
 )
@@ -119,7 +121,8 @@ class TestTrackUntrack:
     def test_track_child_pids_with_parent(self, pid_file: Path) -> None:
         from kiro_crew.session_pid import _track_child_pids
 
-        _track_child_pids({100: None, 200: None, 300: None}, parent_pid=999)
+        with patch("kiro_crew.session_pid._pid_start_token", return_value=None):
+            _track_child_pids({100: None, 200: None, 300: None}, parent_pid=999)
         lines = pid_file.read_text(encoding="utf-8").strip().splitlines()
         assert set(lines) == {"100:999", "200:999", "300:999"}
 
@@ -127,15 +130,17 @@ class TestTrackUntrack:
         """Duplicate child:parent entries should not be written."""
         from kiro_crew.session_pid import _track_child_pids
 
-        _track_child_pids({100: None, 200: None}, parent_pid=999)
-        _track_child_pids({100: None, 300: None}, parent_pid=999)
+        with patch("kiro_crew.session_pid._pid_start_token", return_value=None):
+            _track_child_pids({100: None, 200: None}, parent_pid=999)
+            _track_child_pids({100: None, 300: None}, parent_pid=999)
         lines = pid_file.read_text(encoding="utf-8").strip().splitlines()
         assert sorted(lines) == ["100:999", "200:999", "300:999"]
 
     def test_untrack_child_pids(self, pid_file: Path) -> None:
         from kiro_crew.session_pid import _track_child_pids, _untrack_child_pids
 
-        _track_child_pids({100: None, 200: None, 300: None}, parent_pid=999)
+        with patch("kiro_crew.session_pid._pid_start_token", return_value=None):
+            _track_child_pids({100: None, 200: None, 300: None}, parent_pid=999)
         _untrack_child_pids({100: None, 300: None})
         lines = pid_file.read_text(encoding="utf-8").strip().splitlines()
         assert lines == ["200:999"]
@@ -145,7 +150,8 @@ class TestTrackUntrack:
         from kiro_crew.session_pid import _track_child_pids, _track_pid, _untrack_child_pids
 
         _track_pid(100)  # bare parent line
-        _track_child_pids({100: None}, parent_pid=999)  # child line with same PID
+        with patch("kiro_crew.session_pid._pid_start_token", return_value=None):
+            _track_child_pids({100: None}, parent_pid=999)  # child line with same PID
         _untrack_child_pids({100: None})
         lines = pid_file.read_text(encoding="utf-8").strip().splitlines()
         assert "100" in lines  # bare line preserved
@@ -207,11 +213,256 @@ class TestCleanupOrphanedMcpServers:
         with (
             patch("kiro_crew.session_pid.platform_compat.pid_exists", side_effect=fake_pid_exists),
             patch("kiro_crew.platform_compat.get_ppid", return_value=5555),
+            patch("kiro_crew.session_pid._accepted_subreaper_pids", return_value={1}),
         ):
             killed = _cleanup_orphaned_mcp_servers()
 
         assert killed == 0
         assert "77777" not in pid_file.read_text(encoding="utf-8")  # stale entry pruned
+
+    def test_orphan_reparented_to_systemd_user_killed(self, pid_file: Path) -> None:
+        """Orphan reparented to a same-uid systemd --user subreaper IS killed.
+
+        Under a ``systemd --user`` gateway a genuine orphan reparents to the
+        user manager process, not pid 1. A guard accepting only
+        ``(1, parent_pid)`` misreads that orphan as PID reuse and prunes it
+        WITHOUT killing -- leaking the runtime where no other reaper can see
+        it. The guard must accept the shared subreaper set instead, gated on
+        the KIROCREW_SPAWNED environ marker as positive identity.
+        """
+        from kiro_crew.session_pid import _cleanup_orphaned_mcp_servers
+
+        systemd_user_pid = 4242  # same-uid systemd --user manager
+        pid_file.write_text("77777:99999\n")  # parent 99999 is dead
+
+        def fake_pid_exists(pid: int) -> bool:
+            return pid == 77777  # child alive, parent dead
+
+        kill_mock = MagicMock()
+        with (
+            patch("kiro_crew.session_pid.platform_compat.pid_exists", side_effect=fake_pid_exists),
+            patch("kiro_crew.session_pid.platform_compat.kill_pid", kill_mock),
+            patch("kiro_crew.platform_compat.get_ppid", return_value=systemd_user_pid),
+            patch(
+                "kiro_crew.session_pid._accepted_subreaper_pids",
+                return_value={1, systemd_user_pid},
+            ),
+            patch("kiro_crew.session_pid._env_has_kirocrew_marker", return_value=True),
+            patch(
+                "kiro_crew.session_pid._tracked_child_has_runtime_identity",
+                return_value=True,
+            ),
+        ):
+            killed = _cleanup_orphaned_mcp_servers()
+
+        assert killed == 1
+        kill_mock.assert_called_once()
+        assert kill_mock.call_args.args[0] == 77777
+        assert "77777" not in pid_file.read_text(encoding="utf-8")
+
+    def test_marked_survivor_without_runtime_identity_not_killed(self, pid_file: Path) -> None:
+        """A marker-carrying intentional survivor is outside the kill authority.
+
+        The KIROCREW_SPAWNED marker is tree-wide: a detached survivor (e.g. a
+        preview server) inherits it, so the systemd arm demands positive
+        runtime argv identity on top of the marker. A tracking entry naming
+        such a PID -- stale or forged -- is pruned without killing.
+        """
+        from kiro_crew.session_pid import _cleanup_orphaned_mcp_servers
+
+        systemd_user_pid = 4242
+        pid_file.write_text("77777:99999\n")
+
+        def fake_pid_exists(pid: int) -> bool:
+            return pid == 77777
+
+        kill_mock = MagicMock()
+        with (
+            patch("kiro_crew.session_pid.platform_compat.pid_exists", side_effect=fake_pid_exists),
+            patch("kiro_crew.session_pid.platform_compat.kill_pid", kill_mock),
+            patch("kiro_crew.platform_compat.get_ppid", return_value=systemd_user_pid),
+            patch(
+                "kiro_crew.session_pid._accepted_subreaper_pids",
+                return_value={1, systemd_user_pid},
+            ),
+            patch("kiro_crew.session_pid._env_has_kirocrew_marker", return_value=True),
+            patch(
+                "kiro_crew.session_pid._tracked_child_has_runtime_identity",
+                return_value=False,
+            ),
+        ):
+            killed = _cleanup_orphaned_mcp_servers()
+
+        assert killed == 0
+        kill_mock.assert_not_called()
+        assert "77777" not in pid_file.read_text(encoding="utf-8")
+
+    def test_systemd_parented_recycled_pid_without_marker_not_killed(self, pid_file: Path) -> None:
+        """Recycled PID now owned by an unrelated systemd --user service survives.
+
+        Under ``systemd --user`` every manager-started service carries the
+        manager's PID as its PPid for its whole life, so PPid membership in
+        the subreaper set alone does not prove the PID is ours. Without the
+        KIROCREW_SPAWNED environ marker the sweep must treat the entry as PID
+        reuse: prune the stale line, never SIGKILL the innocent process.
+        """
+        from kiro_crew.session_pid import _cleanup_orphaned_mcp_servers
+
+        systemd_user_pid = 4242
+        pid_file.write_text("77777:99999\n")  # parent 99999 is dead
+
+        def fake_pid_exists(pid: int) -> bool:
+            return pid == 77777  # PID alive (recycled), parent dead
+
+        kill_mock = MagicMock()
+        with (
+            patch("kiro_crew.session_pid.platform_compat.pid_exists", side_effect=fake_pid_exists),
+            patch("kiro_crew.session_pid.platform_compat.kill_pid", kill_mock),
+            patch("kiro_crew.platform_compat.get_ppid", return_value=systemd_user_pid),
+            patch(
+                "kiro_crew.session_pid._accepted_subreaper_pids",
+                return_value={1, systemd_user_pid},
+            ),
+            patch("kiro_crew.session_pid._env_has_kirocrew_marker", return_value=False),
+        ):
+            killed = _cleanup_orphaned_mcp_servers()
+
+        assert killed == 0
+        kill_mock.assert_not_called()
+        assert "77777" not in pid_file.read_text(encoding="utf-8")  # stale entry pruned
+
+    @pytest.mark.skipif(sys.platform != "linux", reason="/proc scan is Linux-only")
+    def test_accepted_subreaper_pids_detects_same_uid_systemd(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The shared scan finds same-uid systemd processes plus init.
+
+        Exercises the real detection logic against a fake ``/proc`` tree:
+        a same-uid ``systemd`` comm is accepted, a non-systemd comm and a
+        non-numeric entry are not, and pid 1 is always present.
+        """
+        import kiro_crew.session_pid as session_pid_mod
+
+        (tmp_path / "4242").mkdir()
+        (tmp_path / "4242" / "comm").write_text("systemd\n")
+        (tmp_path / "4300").mkdir()
+        (tmp_path / "4300" / "comm").write_text("bash\n")
+        (tmp_path / "4301").mkdir()  # no comm file: skipped, not fatal
+        (tmp_path / "notpid").mkdir()
+
+        real_path = session_pid_mod.Path
+        monkeypatch.setattr(
+            session_pid_mod,
+            "Path",
+            lambda p="": real_path(tmp_path) if str(p) == "/proc" else real_path(p),
+        )
+
+        accepted = session_pid_mod._accepted_subreaper_pids()
+        assert accepted == {1, 4242}
+
+    def test_start_token_match_defers_to_heuristic_and_kills(self, pid_file: Path) -> None:
+        """A matching token does not block the kill; the heuristic authorizes it.
+
+        The token is subtractive evidence only: when it matches, the sweep
+        proceeds to the reparent heuristic (here: orphan reparented to init),
+        which authorizes the kill exactly as it always has.
+        """
+        from kiro_crew.session_pid import _cleanup_orphaned_mcp_servers
+
+        pid_file.write_text("77777:99999:123456\n")  # parent 99999 dead
+
+        def fake_pid_exists(pid: int) -> bool:
+            return pid == 77777
+
+        kill_mock = MagicMock()
+        with (
+            patch("kiro_crew.session_pid.platform_compat.pid_exists", side_effect=fake_pid_exists),
+            patch("kiro_crew.session_pid.platform_compat.kill_pid", kill_mock),
+            patch("kiro_crew.session_pid._pid_start_token", return_value="123456"),
+            patch("kiro_crew.platform_compat.get_ppid", return_value=1),
+        ):
+            killed = _cleanup_orphaned_mcp_servers()
+
+        assert killed == 1
+        kill_mock.assert_called_once()
+        assert "77777" not in pid_file.read_text(encoding="utf-8")
+
+    def test_start_token_match_alone_does_not_authorize_kill(self, pid_file: Path) -> None:
+        """A matching token with a failing heuristic prunes without killing.
+
+        The tracking file is same-uid-writable, so a forged
+        pid:deadparent:token line must not be able to aim the sweep at an
+        arbitrary process: token agreement never grants kill authority that
+        the reparent heuristic would refuse.
+        """
+        from kiro_crew.session_pid import _cleanup_orphaned_mcp_servers
+
+        pid_file.write_text("77777:99999:123456\n")
+
+        def fake_pid_exists(pid: int) -> bool:
+            return pid == 77777
+
+        kill_mock = MagicMock()
+        with (
+            patch("kiro_crew.session_pid.platform_compat.pid_exists", side_effect=fake_pid_exists),
+            patch("kiro_crew.session_pid.platform_compat.kill_pid", kill_mock),
+            patch("kiro_crew.session_pid._pid_start_token", return_value="123456"),
+            patch("kiro_crew.platform_compat.get_ppid", return_value=5555),
+            patch("kiro_crew.session_pid._accepted_subreaper_pids", return_value={1}),
+        ):
+            killed = _cleanup_orphaned_mcp_servers()
+
+        assert killed == 0
+        kill_mock.assert_not_called()
+        assert "77777" not in pid_file.read_text(encoding="utf-8")
+
+    def test_start_token_mismatch_pruned_not_killed(self, pid_file: Path) -> None:
+        """A reused PID fails the start-token check and is pruned, never killed.
+
+        This is per-process identity, checked before the reparent heuristic:
+        even a PID recycled by another process spawned by Kiro Crew (which
+        carries the tree-wide KIROCREW_SPAWNED marker and may be init- or
+        systemd-parented) has a different start identity, so the sweep prunes
+        it without ever reaching the kill arms.
+        """
+        from kiro_crew.session_pid import _cleanup_orphaned_mcp_servers
+
+        pid_file.write_text("77777:99999:123456\n")
+
+        def fake_pid_exists(pid: int) -> bool:
+            return pid == 77777
+
+        kill_mock = MagicMock()
+        with (
+            patch("kiro_crew.session_pid.platform_compat.pid_exists", side_effect=fake_pid_exists),
+            patch("kiro_crew.session_pid.platform_compat.kill_pid", kill_mock),
+            patch(
+                "kiro_crew.session_pid._pid_start_token",
+                return_value="999999",  # different incarnation
+            ),
+            patch("kiro_crew.platform_compat.get_ppid", return_value=1),
+        ):
+            killed = _cleanup_orphaned_mcp_servers()
+
+        assert killed == 0
+        kill_mock.assert_not_called()
+        assert "77777" not in pid_file.read_text(encoding="utf-8")  # stale entry pruned
+
+    def test_track_child_pids_records_start_token(self, pid_file: Path) -> None:
+        """_track_child_pids persists the child's start identity as field 3."""
+        from kiro_crew.session_pid import _track_child_pids
+
+        with patch("kiro_crew.session_pid._pid_start_token", return_value="424242"):
+            _track_child_pids({555: None}, parent_pid=111)
+
+        lines = pid_file.read_text(encoding="utf-8").strip().splitlines()
+        assert lines == ["555:111:424242"]
+
+        # Unreadable identity at track time degrades to the legacy shape.
+        with patch("kiro_crew.session_pid._pid_start_token", return_value=None):
+            _track_child_pids({556: None}, parent_pid=111)
+        lines = pid_file.read_text(encoding="utf-8").strip().splitlines()
+        assert "556:111" in lines
 
     def test_bare_pid_dead_pruned(self, pid_file: Path) -> None:
         """Dead bare PIDs should be pruned from the file."""
@@ -365,6 +616,145 @@ class TestCleanupOrphanedSessions:
         # bad!name still exists (unlink failed gracefully), valid one cleaned up
         assert (tmp_path / "session_pid_bad!name.txt").exists()
         assert not (tmp_path / "session_pid_99999.txt").exists()
+
+    @pytest.mark.skipif(sys.platform != "linux", reason="tids share the pid space on Linux only")
+    def test_pid_file_recycled_as_a_thread_is_deleted(
+        self, tmp_path: Path, session_pid_file: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A mapping whose pid now names a THREAD of a live process is stale.
+
+        Linux draws tids from the pid space and lets you signal one, so such a
+        pid passes ``pid_exists`` and such a mapping would survive forever. A
+        token-bearing mapping is already safe to resolve — ``_pid_recycled``
+        refuses on a start-token mismatch, and a tid's token cannot match — so
+        what is pruned here is the legacy token-less form, which has no recorded
+        token for that guard to compare, plus the accumulation itself.
+
+        Uses a real live thread's native tid rather than a fake ``/proc``, so
+        the test exercises the same kernel behaviour that produced the bug.
+        """
+        from kiro_crew.session_pid import cleanup_orphaned_sessions
+
+        monkeypatch.setattr("kiro_crew.session_pid.config_dir", lambda: tmp_path)
+        session_pid_file.write_text("")
+
+        tid_box: dict[str, int] = {}
+        release = threading.Event()
+        captured = threading.Event()
+
+        def _hold() -> None:
+            tid_box["tid"] = threading.get_native_id()
+            captured.set()
+            release.wait(timeout=30)
+
+        holder = threading.Thread(target=_hold, daemon=True)
+        holder.start()
+        assert captured.wait(timeout=30), "helper thread never reported its tid"
+        tid = tid_box["tid"]
+        assert tid != os.getpid(), "native_id must differ from the group leader"
+
+        try:
+            thread_map = tmp_path / f"session_pid_{tid}.txt"
+            leader_map = tmp_path / f"session_pid_{os.getpid()}.txt"
+            thread_map.write_text("sess-recycled-as-thread")
+            leader_map.write_text("sess-live-leader")
+
+            # NOT patching os.kill: both pids are genuinely signalable here,
+            # which is exactly the condition the old predicate could not split.
+            with patch("kiro_crew.session_pid._cleanup_orphaned_mcp_servers", return_value=0):
+                cleanup_orphaned_sessions()
+
+            assert not thread_map.exists(), "a pid that is only a thread must be pruned"
+            assert leader_map.exists(), "a live thread-group leader must be retained"
+        finally:
+            release.set()
+            holder.join(timeout=30)
+
+    def test_boot_setting_reads_no_proc(
+        self, tmp_path: Path, session_pid_file: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``narrow_with_leaders=False`` must not take the leaders snapshot.
+
+        The gateway boot path passes it so the sweep costs exactly what it cost
+        before this branch: ``no-new-work-on-gateway-boot-path`` names orphan
+        sweeps, so a regression that read the leaders set anyway would put a
+        ``/proc`` scan back on the boot path, where the readiness cost of it is
+        not visible to anyone reading the sweep.
+        """
+        from kiro_crew.session_pid import cleanup_orphaned_sessions
+
+        monkeypatch.setattr("kiro_crew.session_pid.config_dir", lambda: tmp_path)
+        session_pid_file.write_text("")
+
+        def _refuse() -> set[int] | None:
+            raise AssertionError("the boot setting must not read /proc for leaders")
+
+        monkeypatch.setattr(
+            "kiro_crew.session_pid.platform_compat.live_thread_group_leaders", _refuse
+        )
+        with patch("kiro_crew.session_pid._cleanup_orphaned_mcp_servers", return_value=0):
+            cleanup_orphaned_sessions(narrow_with_leaders=False)
+
+    def test_prune_pass_leaves_the_shared_pid_file_alone(
+        self, tmp_path: Path, session_pid_file: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The deferred pass must not rewrite the file the boot sweep owns.
+
+        Deferring the prune past readiness is only sound because this pass touches
+        ``session_pid_<pid>.txt`` mappings and nothing else. If it also rewrote
+        ``kiro_session_pids.txt`` it would race the spawns that append to it once
+        the gateway is serving, and a lost entry is an unkillable orphan.
+        """
+        from kiro_crew.session_pid import _prune_stale_session_pid_files
+
+        monkeypatch.setattr("kiro_crew.session_pid.config_dir", lambda: tmp_path)
+        session_pid_file.write_text("111:222\n")
+        (tmp_path / "session_pid_99999.txt").write_text("sess-dead")
+
+        # The probe is pinned, not assumed: ``pid_max`` is 4194304 here, so 99999
+        # is an ordinary live pid on a host whose counter has passed it, and a live
+        # pid is retained -- which would fail the removal assertion below on a
+        # long-running runner rather than in review. The sibling sweeps above pin
+        # it the same way; ``os.kill`` is what ``platform_compat.pid_exists``
+        # reaches for on POSIX.
+        with patch("os.kill", side_effect=ProcessLookupError):
+            removed = _prune_stale_session_pid_files()
+
+        assert removed == 1
+        assert not (tmp_path / "session_pid_99999.txt").exists()
+        assert session_pid_file.read_text() == "111:222\n"
+
+    def test_stale_snapshot_does_not_delete_a_live_mapping(
+        self, tmp_path: Path, session_pid_file: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A pid recycled after the snapshot keeps the mapping its new owner wrote.
+
+        The leaders snapshot is read once for the whole pass, so a pid that became
+        a live process after it was taken is absent from it while naming a LIVE
+        session whose mapping already sits at that path. Deciding on the snapshot
+        alone unlinks that live mapping, which is a lost session identity, not a
+        tidy-up; the per-pid re-read is what refuses. The shipped call sites do not
+        run this pass beside live sessions, so this is defence in depth rather than
+        load-bearing -- it keeps the guarantee a property of the function instead of
+        of where it happens to be called from.
+        """
+        from kiro_crew.session_pid import _prune_stale_session_pid_files
+
+        monkeypatch.setattr("kiro_crew.session_pid.config_dir", lambda: tmp_path)
+        live = tmp_path / f"session_pid_{os.getpid()}.txt"
+        live.write_text("sess-published-after-the-snapshot")
+
+        # A snapshot from before this process existed: the pid is signalable and
+        # is a real thread-group leader, yet absent from the set.
+        monkeypatch.setattr(
+            "kiro_crew.session_pid.platform_compat.live_thread_group_leaders",
+            lambda: frozenset({1}),
+        )
+
+        removed = _prune_stale_session_pid_files()
+
+        assert removed == 0
+        assert live.exists(), "a live leader absent from a stale snapshot must be retained"
 
 
 class TestResetStateUntracksParentPid:
@@ -761,7 +1151,7 @@ class TestKillOrphanMcps:
         assert killed == 0
 
     def test_skips_recycled_pid_on_reverify(self) -> None:
-        """If cmdline no longer matches at kill time, PID is skipped (TOCTOU)."""
+        """If cmdline stops matching at kill time, the PID is skipped (TOCTOU)."""
         from kiro_crew.session_pid import kill_orphan_mcps
 
         with (
@@ -1075,6 +1465,755 @@ class TestSyncKillProvider:
 
         # Loop stops after the first (SIGTERM) signal raises ProcessLookupError
         assert sigs == [platform_compat.SIGTERM]
+
+
+# A grandchild that ignores SIGTERM, so only a SIGKILL that actually reaches it
+# can end it. ``{setsid}`` is filled with ``os.setsid()`` for the variant that
+# escapes the provider's process group, and with nothing for the variant that
+# stays in it.
+_STUBBORN_GRANDCHILD = (
+    "import os, signal, time\n"
+    "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+    "{setsid}"
+    "time.sleep(300)\n"
+)
+# A provider root: forks one grandchild, then waits. Plain SIGTERM handling, so
+# the root itself dies on the first signal and the test measures what happens to
+# the tree BELOW it.
+_PROVIDER_ROOT = (
+    "import subprocess, sys, time\n"
+    "p = subprocess.Popen([sys.executable, '-c', {src!r}])\n"
+    "print(p.pid, flush=True)\n"
+    "time.sleep(300)\n"
+)
+
+
+@_POSIX_ONLY
+class TestSyncKillProviderTree:
+    """The sync kill must reap the provider's whole tree, not just its root.
+
+    An agent runtime is a tree (sandbox launcher, agent binary, chat subprocess,
+    MCP stub children) whose root is an isolated process-group leader. A
+    pid-scoped signal reaps that root alone and the rest reparents to init,
+    holding hundreds of megabytes with no tracking entry left to find it by.
+    """
+
+    @staticmethod
+    def _provider(pid: int, child_pids: dict | None = None) -> MagicMock:
+        """A provider stand-in whose tracked pid is *pid* (the ACP shape).
+
+        ``_start_time`` carries the pid's REAL start id, the way the ACP layer
+        records it at spawn, because the teardown refuses to signal a root whose
+        recorded identity does not match the live process.
+        """
+        provider = MagicMock(spec=["_client", "_proc", "_active_proc"])
+        provider._client = MagicMock(spec=["_pid", "_child_pids", "_start_time"])
+        provider._client._pid = pid
+        provider._client._child_pids = child_pids if child_pids is not None else {}
+        provider._client._start_time = platform_compat.get_process_start_id(pid)
+        provider._proc = None
+        provider._active_proc = None
+        return provider
+
+    @staticmethod
+    def _spawn_tree(*, escape_group: bool) -> tuple[subprocess.Popen, int]:
+        """Spawn an isolated group leader that forks one stubborn grandchild.
+
+        Returns the root AND its grandchild's pid, which the root reports on
+        stdout. Cleanup then never depends on discovery: a walk that times out
+        would otherwise leave the grandchild's 300-second sleep running, since the
+        caller would have no pid to reap.
+        """
+        grandchild = _STUBBORN_GRANDCHILD.format(setsid="os.setsid()\n" if escape_group else "")
+        proc = subprocess.Popen(
+            [sys.executable, "-c", _PROVIDER_ROOT.format(src=grandchild)],
+            start_new_session=True,  # what the real provider spawn does
+            stdout=subprocess.PIPE,
+        )
+        assert proc.stdout is not None
+        reported = proc.stdout.readline().strip()
+        if not reported:
+            proc.kill()
+            proc.wait(timeout=10)
+            raise AssertionError("provider root never reported its grandchild pid")
+        return proc, int(reported)
+
+    @staticmethod
+    def _await_descendants(pid: int, timeout: float = 10.0) -> list[int]:
+        """Wait for the root's fork to appear; return the descendant pids."""
+        from kiro_crew.acp.client import _get_child_pids
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            found = _get_child_pids(pid)
+            if found:
+                return found
+            time.sleep(0.05)
+        raise AssertionError(f"grandchild of {pid} never appeared")
+
+    @staticmethod
+    def _await_gone(pids: list[int], timeout: float = 10.0) -> list[int]:
+        """Return the pids still alive after waiting up to *timeout*."""
+        deadline = time.monotonic() + timeout
+        alive = list(pids)
+        while alive and time.monotonic() < deadline:
+            alive = [p for p in alive if platform_compat.pid_exists(p)]
+            if alive:
+                time.sleep(0.05)
+        return alive
+
+    @staticmethod
+    def _reap(pids: list[int]) -> None:
+        """Best-effort teardown so no test process survives the run."""
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+            try:
+                os.waitpid(pid, os.WNOHANG)
+            except (ChildProcessError, OSError):
+                pass
+
+    def test_in_group_grandchild_is_reaped(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A SIGTERM-ignoring grandchild inside the group dies with the group.
+
+        A pid-scoped kill reaches the root only; the grandchild ignores SIGTERM
+        and would survive it, so this pins the signal being addressed to the
+        process GROUP.
+        """
+        from kiro_crew.session_pid import _sync_kill_provider
+
+        # The escalation budget is not the behaviour under test; shorten it so
+        # the SIGTERM -> SIGKILL path runs without a multi-second wait.
+        monkeypatch.setattr("kiro_crew.session_pid._PROVIDER_TERM_GRACE_SECONDS", 0.5)
+        root, gc_pid = self._spawn_tree(escape_group=False)
+        grandchildren: list[int] = []
+        try:
+            grandchildren = self._await_descendants(root.pid)
+            # Precondition: the grandchild really is in the root's group, so a
+            # group signal is what covers it.
+            assert os.getpgid(grandchildren[0]) == root.pid
+
+            _sync_kill_provider(self._provider(root.pid))
+
+            assert self._await_gone([root.pid, *grandchildren]) == []
+        finally:
+            self._reap([root.pid, gc_pid, *grandchildren])
+            root.wait(timeout=10)
+
+    def test_setsid_grandchild_is_reaped(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A grandchild that setsid-ed out of the group is still reaped.
+
+        The group signal cannot reach it and it ignores SIGTERM, so the only
+        thing that ends it is the snapshot-driven descendant sweep.
+        """
+        from kiro_crew.session_pid import _sync_kill_provider
+
+        monkeypatch.setattr("kiro_crew.session_pid._PROVIDER_TERM_GRACE_SECONDS", 0.5)
+        root, gc_pid = self._spawn_tree(escape_group=True)
+        grandchildren: list[int] = []
+        try:
+            grandchildren = self._await_descendants(root.pid)
+            escaped = grandchildren[0]
+            # Precondition: it left the group, so killpg provably misses it.
+            deadline = time.monotonic() + 10.0
+            while os.getpgid(escaped) == root.pid and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert os.getpgid(escaped) != root.pid
+
+            _sync_kill_provider(self._provider(root.pid))
+
+            assert self._await_gone([root.pid, *grandchildren]) == []
+        finally:
+            self._reap([root.pid, gc_pid, *grandchildren])
+            root.wait(timeout=10)
+
+    def test_recorded_descendant_outside_the_tree_is_reaped(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A descendant recorded at spawn time is reaped even off the live tree.
+
+        Once a child reparents, a walk from the root cannot find it again. The
+        runtime's own ``_child_pids`` snapshot is the only record that still
+        names it, so the sweep has to read that too.
+        """
+        from kiro_crew.acp.client import _capture_child_records
+        from kiro_crew.session_pid import _sync_kill_provider
+
+        monkeypatch.setattr("kiro_crew.session_pid._PROVIDER_TERM_GRACE_SECONDS", 0.5)
+        root = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(300)"], start_new_session=True
+        )
+        stray = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(300)"], start_new_session=True
+        )
+        try:
+            # Not a descendant of root at all — exactly the reparented case.
+            provider = self._provider(root.pid, child_pids=_capture_child_records([stray.pid]))
+
+            _sync_kill_provider(provider)
+
+            assert self._await_gone([root.pid]) == []
+            # Popen.wait reaps: this stray is a direct child of the TEST process
+            # (a real one hangs off the runtime), so without a wait it lingers as
+            # a zombie and a pid probe still reads it as alive. A negative code
+            # is the signal that ended it.
+            assert stray.wait(timeout=10) < 0
+        finally:
+            self._reap([root.pid, stray.pid])
+            root.wait(timeout=10)
+            stray.wait(timeout=10)
+
+    def test_group_signal_alone_reaps_the_tree(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """With no descendant snapshot, the group signal still reaps the tree.
+
+        Isolates the scope of the signal from the sweep that backs it up: a
+        descendant forked between the snapshot and the kill is in the group and
+        in no record, so the group is the only thing that covers it. An empty
+        snapshot reproduces that state deterministically.
+        """
+        from kiro_crew.session_pid import _sync_kill_provider
+
+        monkeypatch.setattr("kiro_crew.session_pid._PROVIDER_TERM_GRACE_SECONDS", 0.5)
+        monkeypatch.setattr(
+            "kiro_crew.session_pid._provider_descendant_records", lambda provider, pid, **_kw: {}
+        )
+        root, gc_pid = self._spawn_tree(escape_group=False)
+        grandchildren: list[int] = []
+        try:
+            grandchildren = self._await_descendants(root.pid)
+            assert os.getpgid(grandchildren[0]) == root.pid
+
+            _sync_kill_provider(self._provider(root.pid))
+
+            assert self._await_gone([root.pid, *grandchildren]) == []
+        finally:
+            self._reap([root.pid, gc_pid, *grandchildren])
+            root.wait(timeout=10)
+
+    def test_root_zombie_is_held_until_group_signalling_finishes(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No reap may precede the last group signal.
+
+        A zombie owns its pid, and a group leader's pid IS the pgid. Reaping the
+        root during the SIGTERM grace frees that number while the SIGKILL
+        escalation still aims at it, so a pid recycled into a new group leader
+        would take a SIGKILL meant for ours -- unrecoverable, and invisible to
+        the descendant sweep's own recycle guard, which only covers descendants.
+        Signal ordering is the deterministic pin; the race itself is not
+        reproducible on demand.
+        """
+        from kiro_crew import session_pid as sp
+        from kiro_crew.session_pid import _sync_kill_provider
+
+        monkeypatch.setattr("kiro_crew.session_pid._PROVIDER_TERM_GRACE_SECONDS", 0.3)
+
+        events: list[str] = []
+        real_killpg = os.killpg
+        real_reap = sp._reap_provider_root
+
+        def tracking_killpg(pgid: int, sig: int) -> None:
+            events.append(f"killpg:{sig}")
+            real_killpg(pgid, sig)
+
+        def tracking_reap(pid: int, recorded_start: str | None, *, gated: bool) -> None:
+            events.append("reap")
+            real_reap(pid, recorded_start, gated=gated)
+
+        monkeypatch.setattr("kiro_crew.session_pid.os.killpg", tracking_killpg)
+        monkeypatch.setattr("kiro_crew.session_pid._reap_provider_root", tracking_reap)
+
+        # The grandchild ignores SIGTERM and stays in the group, so the tree is
+        # not gone at the deadline and the SIGKILL escalation actually runs.
+        root, gc_pid = self._spawn_tree(escape_group=False)
+        grandchildren: list[int] = []
+        try:
+            grandchildren = self._await_descendants(root.pid)
+
+            _sync_kill_provider(self._provider(root.pid))
+
+            killpg_at = [i for i, e in enumerate(events) if e.startswith("killpg")]
+            assert killpg_at, f"no group signal was sent: {events}"
+            assert "reap" in events, f"the root was never reaped: {events}"
+            assert events.index("reap") > max(
+                killpg_at
+            ), f"the root was reaped before the last group signal: {events}"
+        finally:
+            self._reap([root.pid, gc_pid, *grandchildren])
+            root.wait(timeout=10)
+
+    def test_unverified_root_is_not_signalled_but_records_still_are(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A root whose recorded identity does not match the live pid is spared.
+
+        ``_client._pid`` outlives a failed start, so it can name a process the OS
+        has since handed to someone else. For a group leader that pid IS the pgid,
+        so signalling it unverified would take a stranger's whole tree, and the
+        pid-scoped fallback is the same hazard one process wide -- hence nothing is
+        sent to the root at all. Descendants recorded at spawn are still swept:
+        each is verified on its own identity, which is the check the root lacked.
+        """
+        from kiro_crew.session_pid import _sync_kill_provider
+
+        monkeypatch.setattr("kiro_crew.session_pid._PROVIDER_TERM_GRACE_SECONDS", 0.2)
+        root = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(300)"], start_new_session=True
+        )
+        stray = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(300)"], start_new_session=True
+        )
+        try:
+            provider = self._provider(
+                root.pid,
+                child_pids={stray.pid: (platform_compat.get_process_start_id(stray.pid), None)},
+            )
+            # A start id no live process can hold: the pid is now "not ours".
+            provider._client._start_time = "0.000000"
+
+            _sync_kill_provider(provider)
+
+            assert root.poll() is None, "an unverified root must not be signalled"
+            assert stray.wait(timeout=10) < 0, "a recorded descendant must still be swept"
+        finally:
+            self._reap([root.pid, stray.pid])
+            root.wait(timeout=10)
+            stray.wait(timeout=10)
+
+    def test_group_is_not_signalled_once_no_verified_member_owns_it(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The pgid is re-checked before every signal, not trusted from entry.
+
+        This teardown is not the only reaper: asyncio's own child watcher can
+        collect the leader zombie, which frees the pid that IS the pgid, and under
+        pid-space wraparound a new group leader can take it inside the grace. A
+        group holding no member this code can verify is therefore left alone --
+        signalling it would reap a stranger's tree. Descendants recorded
+        at spawn are still signalled, because each is named and verified on its own.
+        """
+        from kiro_crew.session_pid import _sync_kill_provider
+
+        monkeypatch.setattr("kiro_crew.session_pid._PROVIDER_TERM_GRACE_SECONDS", 0.2)
+        root = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(300)"], start_new_session=True
+        )
+        stray = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(300)"], start_new_session=True
+        )
+        killpg_calls: list[tuple[int, int]] = []
+        real_pgroup_of = platform_compat.pgroup_of
+        seen = {"n": 0}
+
+        def pgroup_of_then_handed_on(probe_pid: int) -> int | None:
+            # First read resolves OUR group, as it does in production; every read
+            # after it reports a different owner, i.e. the group emptied and the
+            # number moved on mid-grace.
+            seen["n"] += 1
+            return real_pgroup_of(probe_pid) if seen["n"] == 1 else 999_999
+
+        monkeypatch.setattr(
+            "kiro_crew.session_pid.os.killpg",
+            lambda pgid, sig: killpg_calls.append((pgid, sig)),
+        )
+        monkeypatch.setattr(
+            "kiro_crew.session_pid.platform_compat.pgroup_of", pgroup_of_then_handed_on
+        )
+        try:
+            provider = self._provider(
+                root.pid,
+                child_pids={stray.pid: (platform_compat.get_process_start_id(stray.pid), None)},
+            )
+
+            _sync_kill_provider(provider)
+
+            assert killpg_calls == [], f"signalled a group nothing verified owns: {killpg_calls}"
+            assert stray.wait(timeout=10) < 0, "a recorded descendant must still be swept"
+        finally:
+            self._reap([root.pid, stray.pid])
+            root.wait(timeout=10)
+            stray.wait(timeout=10)
+
+    def test_windows_tree_kill_is_identity_pinned(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The Windows arm pins the identity across taskkill, and honours a refusal.
+
+        ``taskkill /T /F /PID`` resolves the pid from a SEPARATE process, so a
+        caller that reads the start id and then calls the plain tree kill has
+        released every handle by then: the provider can exit and Windows can hand
+        that pid to something else, whose whole tree taskkill then tears down.
+        ``kill_process_tree_pinned`` holds the verifying query handle open across
+        the terminate -- Windows reserves a pid while any handle to the process
+        object lives -- and returns False instead of killing when it cannot
+        confirm. This runs on POSIX by faking the platform flag, because the
+        branch it pins is unreachable here.
+        """
+        from kiro_crew.session_pid import _sync_kill_provider
+
+        pinned_calls: list[tuple[int, str, int]] = []
+        unpinned_calls: list[tuple[int, int]] = []
+
+        monkeypatch.setattr("kiro_crew.session_pid.platform_compat.IS_WINDOWS", True)
+        monkeypatch.setattr(
+            "kiro_crew.session_pid.platform_compat.kill_process_tree_pinned",
+            lambda pid, expected, sig: (pinned_calls.append((pid, expected, sig)), False)[1],
+        )
+        monkeypatch.setattr(
+            "kiro_crew.session_pid.platform_compat.kill_process_tree",
+            lambda pid, sig: unpinned_calls.append((pid, sig)),
+        )
+
+        provider = self._provider(os.getpid())
+        provider._client._start_time = platform_compat.get_process_start_id(os.getpid())
+
+        _sync_kill_provider(provider)
+
+        assert pinned_calls, "the Windows arm must use the identity-pinned tree kill"
+        assert pinned_calls[0][0] == os.getpid()
+        assert pinned_calls[0][1] == provider._client._start_time
+        # A False return is a refusal to reap: no un-pinned kill may follow it.
+        assert unpinned_calls == [], f"fell back to an unpinned kill: {unpinned_calls}"
+
+    def test_fresh_walk_is_discarded_when_the_root_goes_stale_during_it(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A root verified before the walk can be a different process after it.
+
+        The pid can be reused while the walk runs, so a walk that started on our
+        tree can finish on a replacement's -- and those pids WOULD verify, because
+        their identity is captured here and re-read moments later. Bracketing the
+        walk is what stops a stale verification authorising the sweep: the freshly
+        walked entries are dropped, while the spawn-time snapshot, recorded when
+        the tree was provably ours, is still signalled.
+        """
+        from kiro_crew.session_pid import _sync_kill_provider
+
+        monkeypatch.setattr("kiro_crew.session_pid._PROVIDER_TERM_GRACE_SECONDS", 0.2)
+        root, gc_pid = self._spawn_tree(escape_group=False)
+        stray = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(300)"], start_new_session=True
+        )
+        real_start_id = platform_compat.get_process_start_id
+        self._await_descendants(root.pid)  # the walk has something to find
+        # Built BEFORE the patch: _provider reads the start id itself, and counting
+        # that read would shift the failure onto the PRE-walk check instead.
+        provider = self._provider(
+            root.pid, child_pids={stray.pid: (real_start_id(stray.pid), None)}
+        )
+        root_reads = {"n": 0}
+
+        def start_id_going_stale(probe_pid: int) -> str | None:
+            # Reads 1 (entry gate) and 2 (pre-walk) see our root; read 3 is the
+            # post-walk re-check and sees a value no live process here holds.
+            if probe_pid == root.pid:
+                root_reads["n"] += 1
+                if root_reads["n"] >= 3:
+                    return "0.000000"
+            return real_start_id(probe_pid)
+
+        monkeypatch.setattr(
+            "kiro_crew.session_pid.platform_compat.get_process_start_id", start_id_going_stale
+        )
+        signalled: list[int] = []
+        real_kill_pid = platform_compat.kill_pid
+        monkeypatch.setattr(
+            "kiro_crew.session_pid.platform_compat.kill_pid",
+            lambda p, sig: (signalled.append(p), real_kill_pid(p, sig))[1],
+        )
+        try:
+            _sync_kill_provider(provider)
+
+            # The DECISION is the pin, not a liveness read: a freshly walked pid
+            # must never be handed to a signal, whereas a recorded one must be.
+            assert gc_pid not in signalled, f"a freshly walked pid was signalled: {signalled}"
+            assert stray.pid in signalled, "the spawn-time snapshot must still be swept"
+        finally:
+            self._reap([root.pid, gc_pid, stray.pid])
+            root.wait(timeout=10)
+            stray.wait(timeout=10)
+
+    def test_windows_fallback_kill_keeps_the_identity_pin(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The /T-refused fallback is pinned too, not a plain pid kill.
+
+        A `/T` refusal means the provider may already be exiting, which is exactly
+        when its pid becomes reusable -- so dropping the pin for the fallback would
+        undo the guarantee the pinned tree kill just gave, one process wide.
+        """
+        from kiro_crew.session_pid import _sync_kill_provider
+
+        pinned_pid_calls: list[tuple[int, str, int]] = []
+        plain_pid_calls: list[tuple[int, int]] = []
+
+        def refusing_tree_kill(pid: int, expected: str, sig: int) -> bool:
+            raise OSError("taskkill /T refused")
+
+        monkeypatch.setattr("kiro_crew.session_pid.platform_compat.IS_WINDOWS", True)
+        monkeypatch.setattr(
+            "kiro_crew.session_pid.platform_compat.kill_process_tree_pinned", refusing_tree_kill
+        )
+        monkeypatch.setattr(
+            "kiro_crew.session_pid.platform_compat.kill_pid_pinned",
+            lambda pid, expected, sig: (pinned_pid_calls.append((pid, expected, sig)), True)[1],
+        )
+        monkeypatch.setattr(
+            "kiro_crew.session_pid.platform_compat.kill_pid",
+            lambda pid, sig: plain_pid_calls.append((pid, sig)),
+        )
+
+        provider = self._provider(os.getpid())
+        provider._client._start_time = platform_compat.get_process_start_id(os.getpid())
+
+        _sync_kill_provider(provider)
+
+        assert pinned_pid_calls, "the fallback must use the identity-pinned pid kill"
+        assert pinned_pid_calls[0][1] == provider._client._start_time
+        assert plain_pid_calls == [], f"fell back to an unpinned kill: {plain_pid_calls}"
+
+    def test_walked_pid_is_dropped_when_it_leaves_the_tree_before_capture(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Enumeration and identity capture are separate reads of the process table.
+
+        A descendant can exit in between and its pid be reused, so the id captured
+        would be a stranger's -- and it verifies at signal time, because it was read
+        after the swap. Re-confirming ancestry after the capture drops that pid. The
+        second snapshot is only an intersection filter, so it can shrink the set and
+        never add to it.
+        """
+        from kiro_crew.session_pid import _sync_kill_provider
+
+        monkeypatch.setattr("kiro_crew.session_pid._PROVIDER_TERM_GRACE_SECONDS", 0.2)
+        root = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(300)"], start_new_session=True
+        )
+        bystander = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(300)"], start_new_session=True
+        )
+        provider = self._provider(root.pid)
+        walks = {"n": 0}
+
+        def walk_then_lose_it(probe_pid: int) -> list[int]:
+            # The first walk reports the pid; by the re-confirmation it is gone,
+            # which is what a reuse between the two reads looks like from here.
+            if probe_pid != root.pid:
+                return []
+            walks["n"] += 1
+            return [bystander.pid] if walks["n"] == 1 else []
+
+        monkeypatch.setattr(
+            "kiro_crew.session_pid.platform_compat.process_descendants", walk_then_lose_it
+        )
+        signalled: list[int] = []
+        real_kill_pid = platform_compat.kill_pid
+        monkeypatch.setattr(
+            "kiro_crew.session_pid.platform_compat.kill_pid",
+            lambda p, sig: (signalled.append(p), real_kill_pid(p, sig))[1],
+        )
+        try:
+            _sync_kill_provider(provider)
+
+            assert bystander.pid not in signalled, f"a dropped pid was signalled: {signalled}"
+            assert platform_compat.pid_exists(bystander.pid), "the bystander must survive"
+        finally:
+            self._reap([root.pid, bystander.pid])
+            root.wait(timeout=10)
+            bystander.wait(timeout=10)
+
+    def test_reap_refuses_a_pid_whose_identity_changed(self) -> None:
+        """A wait on a recycled pid consumes an unrelated child's exit status.
+
+        Nothing detects or repairs that loss, so the reaper re-reads the identity
+        instead of trusting the one taken at entry. Uses a real zombie: the status
+        is either still there to collect or it is gone, which is the whole effect.
+        """
+        from kiro_crew import session_pid as sp
+
+        child = subprocess.Popen([sys.executable, "-c", "raise SystemExit(0)"])
+        try:
+            deadline = time.monotonic() + 10
+            while not sp._pid_exited_but_unreaped(child.pid):
+                assert time.monotonic() < deadline, "the child never became a zombie"
+                time.sleep(0.01)
+            # Readable on a zombie: field 22 is set at fork and the /proc entry lives
+            # until the status is collected.
+            recorded = platform_compat.get_process_start_id(child.pid)
+            assert recorded is not None
+            # A zombie still holds its pid, so pid_exists is what separates "status
+            # still there to collect" from "collected". _pid_exited_but_unreaped is
+            # true for a departed pid too, so it cannot tell those apart.
+            assert platform_compat.pid_exists(child.pid)
+
+            sp._reap_provider_root(child.pid, "0.000000", gated=True)
+            assert platform_compat.pid_exists(
+                child.pid
+            ), "the status was consumed despite an identity mismatch"
+
+            sp._reap_provider_root(child.pid, recorded, gated=True)
+            assert not platform_compat.pid_exists(child.pid), "the real zombie must be reaped"
+        finally:
+            # The status is collected above, so let Popen skip its own wait rather
+            # than raise ChildProcessError for a pid outside its ownership.
+            if child.returncode is None:
+                child.returncode = 0
+
+    def test_fresh_walk_is_discarded_when_the_root_goes_stale_across_the_rescan(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The re-scan is bracketed too, because an intersection is not only membership.
+
+        If the ROOT pid is reused by a foreign process while this runs, the re-scan
+        enumerates that stranger's children, so a first-walk pid its child now holds
+        is confirmed by the filter and carries the stranger's captured id -- which the
+        signal-time re-read then agrees with instead of catching.
+        """
+        from kiro_crew.session_pid import _sync_kill_provider
+
+        monkeypatch.setattr("kiro_crew.session_pid._PROVIDER_TERM_GRACE_SECONDS", 0.2)
+        root = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(300)"], start_new_session=True
+        )
+        bystander = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(300)"], start_new_session=True
+        )
+        real_start_id = platform_compat.get_process_start_id
+        provider = self._provider(root.pid)
+        # Both scans report the pid, so the intersection keeps it; only the root
+        # identity going stale across them can reject it.
+        monkeypatch.setattr(
+            "kiro_crew.session_pid.platform_compat.process_descendants",
+            lambda probe: [bystander.pid] if probe == root.pid else [],
+        )
+        root_reads = {"n": 0}
+
+        def start_id_going_stale(probe_pid: int) -> str | None:
+            # Reads 1 (entry), 2 (pre-walk) and 3 (post-walk) hold; read 4 is the
+            # post-re-scan check and sees a value no live process here holds.
+            if probe_pid == root.pid:
+                root_reads["n"] += 1
+                if root_reads["n"] >= 4:
+                    return "0.000000"
+            return real_start_id(probe_pid)
+
+        monkeypatch.setattr(
+            "kiro_crew.session_pid.platform_compat.get_process_start_id", start_id_going_stale
+        )
+        signalled: list[int] = []
+        real_kill_pid = platform_compat.kill_pid
+        monkeypatch.setattr(
+            "kiro_crew.session_pid.platform_compat.kill_pid",
+            lambda p, sig: (signalled.append(p), real_kill_pid(p, sig))[1],
+        )
+        try:
+            _sync_kill_provider(provider)
+
+            assert (
+                bystander.pid not in signalled
+            ), f"a pid confirmed only by a stranger's tree was signalled: {signalled}"
+        finally:
+            self._reap([root.pid, bystander.pid])
+            root.wait(timeout=10)
+            bystander.wait(timeout=10)
+
+    def test_reaped_leader_does_not_suppress_the_group_signal(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Group ownership authorizes killpg, so losing the root must not skip it.
+
+        asyncio's watcher can collect the leader zombie during the grace. If that
+        also cancelled the group escalation, a descendant that forked into the group
+        after the snapshot would be reached by neither the group signal nor the
+        recorded sweep, and would survive the teardown.
+        """
+        from kiro_crew.session_pid import _sync_kill_provider
+
+        monkeypatch.setattr("kiro_crew.session_pid._PROVIDER_TERM_GRACE_SECONDS", 0.2)
+        root, gc_pid = self._spawn_tree(escape_group=False)
+        real_start_id = platform_compat.get_process_start_id
+        self._await_descendants(root.pid)
+        # The grandchild is recorded at spawn, so _pgroup_still_ours can verify it
+        # owns the pgid without consulting the root at all.
+        provider = self._provider(root.pid, child_pids={gc_pid: (real_start_id(gc_pid), None)})
+
+        real_descendants = platform_compat.process_descendants
+        records_built = {"done": False}
+
+        def counting_descendants(probe_pid: int) -> list[int]:
+            found = real_descendants(probe_pid)
+            # Both record-building scans have run by the second call; from here on
+            # the root reads as a stranger, which is what an asyncio reap looks like.
+            if probe_pid == root.pid:
+                records_built["done"] = True
+            return found
+
+        def start_id_after_reap(probe_pid: int) -> str | None:
+            if probe_pid == root.pid and records_built["done"]:
+                return "0.000000"
+            return real_start_id(probe_pid)
+
+        monkeypatch.setattr(
+            "kiro_crew.session_pid.platform_compat.process_descendants", counting_descendants
+        )
+        monkeypatch.setattr(
+            "kiro_crew.session_pid.platform_compat.get_process_start_id", start_id_after_reap
+        )
+        killpg_calls: list[int] = []
+        real_killpg = os.killpg
+
+        def tracking_killpg(pgid: int, sig: int) -> None:
+            killpg_calls.append(sig)
+            real_killpg(pgid, sig)
+
+        monkeypatch.setattr("kiro_crew.session_pid.os.killpg", tracking_killpg)
+        try:
+            _sync_kill_provider(provider)
+
+            assert platform_compat.SIGKILL in killpg_calls, (
+                "the group SIGKILL is suppressed once the leader is reaped: "
+                f"killpg signals seen = {killpg_calls}"
+            )
+        finally:
+            self._reap([root.pid, gc_pid])
+            root.wait(timeout=10)
+
+    def test_recycled_descendant_is_not_signalled(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A recorded pid whose identity does not match the live process is left alone.
+
+        Deny-by-default: a pid recycled to another process inside the teardown
+        window must not be signalled, so a wrong record is skipped rather than
+        used.
+        """
+        from kiro_crew.session_pid import _sync_kill_provider
+
+        monkeypatch.setattr("kiro_crew.session_pid._PROVIDER_TERM_GRACE_SECONDS", 0.5)
+
+        root = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(300)"], start_new_session=True
+        )
+        bystander = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(300)"], start_new_session=True
+        )
+        try:
+            # A record claiming an impossible start time: the live process cannot
+            # match it, so the sweep must refuse to signal that pid.
+            provider = self._provider(root.pid, child_pids={bystander.pid: (1, b"python3")})
+
+            _sync_kill_provider(provider)
+
+            assert self._await_gone([root.pid]) == []
+            # Popen.poll reaps: a signalled direct child of the TEST process
+            # would linger as a zombie that a pid probe still reads as alive, so
+            # an exit status is what proves nothing was sent to it.
+            deadline = time.monotonic() + 1.0
+            while time.monotonic() < deadline:
+                assert bystander.poll() is None, "a pid failing verification was signalled"
+                time.sleep(0.05)
+        finally:
+            self._reap([root.pid, bystander.pid])
+            root.wait(timeout=10)
+            bystander.wait(timeout=10)
 
 
 class TestCleanupOrphanedMcpServersExtra:
@@ -1796,11 +2935,11 @@ class TestSpawnedMarkerInjection:
 
 
 # ── PID-recycle identity guard + cross-platform spawn grace ───────────
-# Regression cover for the quit->reopen race reproduced on macOS 2026-07-29:
-# a stale ``<dead_gw>:<pid>`` entry whose PID had been recycled onto a LIVE
-# kiro-cli was SIGKILL'd by the startup sweep (surfacing to the user as
-# "process exited (rc=None)"), because the file sweep verified only the
-# cmdline and the spawn-grace window was silently Linux-only.
+# The quit->reopen race: a stale ``<dead_gw>:<pid>`` entry whose PID has been
+# recycled onto a LIVE kiro-cli must not be SIGKILL'd by the startup sweep
+# (which would surface to the user as "process exited (rc=None)"). The file
+# sweep must verify more than the cmdline, and the spawn-grace window must not
+# be Linux-only.
 
 
 class TestPidStartTokenIdentityGuard:
@@ -2171,7 +3310,7 @@ class TestSpawnGraceCrossPlatform:
     sys.platform == "win32", reason="POSIX-only: relies on fork/exec + ps for identity"
 )
 class TestSweepSparesLiveProcess:
-    """End-to-end repro of the 2026-07-29 macOS incident with a REAL process.
+    """End-to-end repro with a REAL process that the sweep spares a live kiro-cli.
 
     The mock-based tests above pin the decision logic; this one proves the
     whole sweep leaves an actually-running process alive. The victim is a
@@ -2385,7 +3524,7 @@ class TestPidFileRewriteIsAtomic:
         )
 
 
-# ── Untracked managed-agent runtime orphan (REPORT-ONLY, issue #2930) ──
+# ── Untracked managed-agent runtime orphan (REPORT-ONLY) ──
 
 
 @pytest.fixture()
@@ -2558,7 +3697,7 @@ class TestUntrackedRuntimeReportIntegration:
         reset_untracked_report_dedup: None,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """The regression this fixes: the leak was previously silent.
+        """An untracked runtime leak is reported, not silently dropped.
 
         Every existing reaper declines an untracked runtime, so before this arm
         the sweep produced no candidate AND no diagnostic. The report must
@@ -2719,7 +3858,7 @@ class TestUntrackedRuntimeReportIntegration:
         child entry name processes no reaper terminates through that entry.
         Once such an owner has died and its PID has been recycled into a leaked
         runtime, treating the field as tracked would return the sweep to the
-        exact silence issue #2930 reports.
+        exact silence the report exists to prevent.
         """
         from kiro_crew.session_pid import find_orphan_mcp_candidates
 
@@ -2768,7 +3907,7 @@ class TestUntrackedRuntimeReportIntegration:
         assert [r for r in caplog.records if "4646" in r.getMessage()] == []
 
 
-# ── Orphaned playwright-cli browser daemon sweep (issue #5986) ───────────────
+# ── Orphaned playwright-cli browser daemon sweep ───────────────
 
 #: A realistic NUL-separated cliDaemon argv. playwright-core spawns the daemon
 #: as ``node <...>/entry/cliDaemon.js <sessionName> [flags]`` (see
@@ -2940,6 +4079,71 @@ class TestBrowserDaemonOrphanSweep:
             mock_sys.platform = "linux"
             assert find_orphan_mcp_candidates(active_pids=set()) == []
 
+    @pytest.mark.parametrize(
+        ("start_tokens", "cmdlines", "expected_killed"),
+        [
+            pytest.param(
+                ("daemon-token", "daemon-token"),
+                (_DAEMON_CMDLINE, _DAEMON_CMDLINE),
+                1,
+                id="stable-identity",
+            ),
+            pytest.param(
+                (None, None),
+                (_DAEMON_CMDLINE, _DAEMON_CMDLINE),
+                0,
+                id="identity-unavailable",
+            ),
+            pytest.param(
+                ("daemon-token", "replacement-token"),
+                (_DAEMON_CMDLINE, _DAEMON_CMDLINE),
+                0,
+                id="pid-recycled",
+            ),
+            pytest.param(
+                ("daemon-token", "daemon-token"),
+                (_DAEMON_CMDLINE, b"/usr/bin/sleep\x0030"),
+                0,
+                id="cmdline-changed",
+            ),
+        ],
+    )
+    @_POSIX_ONLY
+    def test_kill_revalidates_browser_daemon_identity(
+        self,
+        start_tokens: tuple[str | None, str | None],
+        cmdlines: tuple[bytes, bytes],
+        expected_killed: int,
+    ) -> None:
+        from kiro_crew.session_pid import kill_orphan_mcps
+
+        with (
+            patch("kiro_crew.session_pid.sys") as mock_sys,
+            patch("os.getpgrp", return_value=1000),
+            patch("os.getpid", return_value=1),
+            patch.object(Path, "read_bytes", side_effect=cmdlines),
+            patch("kiro_crew.session_pid._pid_start_token", side_effect=start_tokens),
+            patch("kiro_crew.session_pid._is_sweepable_orphan_mcp", return_value=False),
+            patch("kiro_crew.session_pid._is_sweepable_orphan_gatewayd", return_value=False),
+            patch("kiro_crew.session_pid._is_sweepable_orphan_work", return_value=False),
+            patch(
+                "kiro_crew.session_pid._is_sweepable_orphan_browser_daemon",
+                return_value=True,
+            ),
+            patch("kiro_crew.session_pid._linux_pid_age", return_value=900.0),
+            patch(
+                "kiro_crew.session_pid._kill_orphan_browser_daemon",
+                return_value=1,
+            ) as mock_kill,
+        ):
+            mock_sys.platform = "linux"
+            assert kill_orphan_mcps([806]) == expected_killed
+
+        if expected_killed:
+            mock_kill.assert_called_once_with(806, _DAEMON_CMDLINE)
+        else:
+            mock_kill.assert_not_called()
+
 
 class TestBrowserSessionOwnerAlive:
     """The ownership probe reads only exec-time environ, never on-disk state."""
@@ -2974,7 +4178,11 @@ class TestBrowserSessionOwnerAlive:
     def test_unreadable_peer_fails_closed_to_alive(self) -> None:
         from kiro_crew import session_pid as sp
 
-        def _boom(pid: int, key: str) -> bytes | None:
+        def _boom(
+            pid: int,
+            key: str,
+            proc_root: Path | None = None,
+        ) -> bytes | None:
             raise PermissionError("inconclusive")
 
         with (
@@ -2993,3 +4201,321 @@ class TestBrowserSessionOwnerAlive:
         with patch.object(sp, "sys") as mock_sys:
             mock_sys.platform = "darwin"
             assert sp._browser_session_owner_alive(900, b"kc-1a2b3c4d") is True
+
+
+class TestBrowserSessionOwnerFakeProc:
+    """The full daemon predicate decides from a fixture-owned proc tree."""
+
+    _SESSION = b"kc-1a2b3c4d"
+    _DAEMON_ENV = b"PLAYWRIGHT_CLI_SESSION=kc-1a2b3c4d\x00" b"KIROCREW_SPAWNED=1\x00"
+
+    @staticmethod
+    def _process(
+        proc_root: Path,
+        pid: int,
+        *,
+        sid: int,
+        cmdline: bytes,
+        environ: bytes | None,
+        cgroup: str = "0::/pod.slice\n",
+    ) -> None:
+        process = proc_root / str(pid)
+        process.mkdir()
+        (process / "stat").write_text(
+            f"{pid} (fixture) S 1 {pid} {sid} 0 0 0 0\n",
+            encoding="utf-8",
+        )
+        (process / "cmdline").write_bytes(cmdline)
+        comm = cmdline.split(b"\x00", 1)[0].rsplit(b"/", 1)[-1].decode()
+        (process / "comm").write_text(comm + "\n", encoding="utf-8")
+        # The plausible-owner cases deliberately sit outside the daemon's
+        # cgroup: name plausibility must keep them before cgroup filtering.
+        if comm == "kiro-cli":
+            cgroup = "0::/agent.slice\n"
+        (process / "cgroup").write_text(cgroup, encoding="utf-8")
+        if environ is None:
+            # read_bytes() raises OSError on every platform without depending
+            # on permission-bit enforcement or the test runner's uid.
+            (process / "environ").mkdir()
+        else:
+            (process / "environ").write_bytes(environ)
+
+    @staticmethod
+    def _linux_fixture(
+        monkeypatch: pytest.MonkeyPatch,
+        sp: object,
+        proc_root: Path,
+    ) -> None:
+        monkeypatch.setattr(sp, "sys", Mock(platform="linux"))
+        monkeypatch.setattr(platform_compat, "sys", Mock(platform="linux"))
+        monkeypatch.setattr(
+            sp.os,
+            "getuid",
+            lambda: proc_root.stat().st_uid,
+            raising=False,
+        )
+
+    def _daemon(self, proc_root: Path) -> None:
+        self._process(
+            proc_root,
+            900,
+            sid=900,
+            cmdline=_DAEMON_CMDLINE,
+            environ=self._DAEMON_ENV,
+        )
+
+    def test_unreadable_sd_pam_stub_does_not_veto_sweep(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        from kiro_crew import session_pid as sp
+
+        proc_root = tmp_path / "proc"
+        proc_root.mkdir()
+        self._daemon(proc_root)
+        self._process(
+            proc_root,
+            901,
+            sid=1,
+            cmdline=b"(sd-pam)\x00",
+            environ=None,
+            cgroup="0::/user.slice\n",
+        )
+        self._linux_fixture(monkeypatch, sp, proc_root)
+
+        with caplog.at_level(logging.DEBUG, logger="kiro_crew.session_pid"):
+            assert sp._is_sweepable_orphan_browser_daemon(
+                900, _DAEMON_CMDLINE, 900.0, proc_root=proc_root
+            )
+
+        messages = [record.getMessage() for record in caplog.records]
+        assert any(
+            "decision=ignore" in message and "reason=different_cgroup_unreadable" in message
+            for message in messages
+        )
+        assert any(
+            "decision=sweep" in message and "reason=no_owner_outside_daemon_tree" in message
+            for message in messages
+        )
+
+    @pytest.mark.parametrize(
+        ("proc_file", "invalid_content"),
+        [
+            ("comm", b"(sd-pam)\xff\n"),
+            ("cgroup", b"0::/user.slice/\xff\n"),
+        ],
+    )
+    def test_non_utf8_proc_metadata_still_reaches_sweep_verdict(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        proc_file: str,
+        invalid_content: bytes,
+    ) -> None:
+        from kiro_crew import session_pid as sp
+
+        proc_root = tmp_path / "proc"
+        proc_root.mkdir()
+        self._daemon(proc_root)
+        self._process(
+            proc_root,
+            901,
+            sid=1,
+            cmdline=b"(sd-pam)\x00",
+            environ=None,
+            cgroup="0::/user.slice\n",
+        )
+        (proc_root / "901" / proc_file).write_bytes(invalid_content)
+        self._linux_fixture(monkeypatch, sp, proc_root)
+
+        with caplog.at_level(logging.DEBUG, logger="kiro_crew.session_pid"):
+            assert sp._is_sweepable_orphan_browser_daemon(
+                900, _DAEMON_CMDLINE, 900.0, proc_root=proc_root
+            )
+
+        messages = [record.getMessage() for record in caplog.records]
+        assert any(
+            "decision=sweep" in message and "reason=no_owner_outside_daemon_tree" in message
+            for message in messages
+        )
+
+    @pytest.mark.parametrize("owner_name", ["kiro-cli", "opencode"])
+    def test_unreadable_plausible_owner_keeps_daemon(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        owner_name: str,
+    ) -> None:
+        from kiro_crew import session_pid as sp
+
+        proc_root = tmp_path / "proc"
+        proc_root.mkdir()
+        self._daemon(proc_root)
+        self._process(
+            proc_root,
+            901,
+            sid=1,
+            cmdline=f"/usr/bin/{owner_name}\x00chat\x00".encode(),
+            environ=None,
+            cgroup="0::/agent.slice\n",
+        )
+        self._linux_fixture(monkeypatch, sp, proc_root)
+
+        assert not sp._is_sweepable_orphan_browser_daemon(
+            900, _DAEMON_CMDLINE, 900.0, proc_root=proc_root
+        )
+
+    def test_live_matching_owner_keeps_daemon(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from kiro_crew import session_pid as sp
+
+        proc_root = tmp_path / "proc"
+        proc_root.mkdir()
+        self._daemon(proc_root)
+        self._process(
+            proc_root,
+            901,
+            sid=1,
+            cmdline=b"/usr/bin/kiro-cli\x00chat\x00",
+            environ=b"PLAYWRIGHT_CLI_SESSION=kc-1a2b3c4d\x00",
+        )
+        self._linux_fixture(monkeypatch, sp, proc_root)
+
+        assert not sp._is_sweepable_orphan_browser_daemon(
+            900, _DAEMON_CMDLINE, 900.0, proc_root=proc_root
+        )
+
+    def test_no_owner_is_sweepable(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from kiro_crew import session_pid as sp
+
+        proc_root = tmp_path / "proc"
+        proc_root.mkdir()
+        self._daemon(proc_root)
+        self._linux_fixture(monkeypatch, sp, proc_root)
+
+        assert sp._is_sweepable_orphan_browser_daemon(
+            900, _DAEMON_CMDLINE, 900.0, proc_root=proc_root
+        )
+
+    def test_daemons_detached_tree_is_not_an_owner(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from kiro_crew import session_pid as sp
+
+        proc_root = tmp_path / "proc"
+        proc_root.mkdir()
+        self._daemon(proc_root)
+        self._process(
+            proc_root,
+            902,
+            sid=900,
+            cmdline=b"/usr/bin/chromium\x00",
+            environ=b"PLAYWRIGHT_CLI_SESSION=kc-1a2b3c4d\x00",
+        )
+        self._linux_fixture(monkeypatch, sp, proc_root)
+
+        assert sp._is_sweepable_orphan_browser_daemon(
+            900, _DAEMON_CMDLINE, 900.0, proc_root=proc_root
+        )
+
+
+class TestAcquiringAPidLockDoesNotTruncateTheLockFile:
+    """A lock file must be opened WRITABLE but never TRUNCATING.
+
+    ``msvcrt.locking`` needs a writable handle, so the fd cannot be opened
+    ``"r"``. But ``"w"`` truncates at open, and on Windows a truncating open of a
+    lock file whose first byte another holder already locked raises a sharing
+    violation instead of waiting — so the contending acquirer crashes with a bare
+    ``OSError`` *before* it reaches ``file_lock``, and the serialisation the lock
+    exists to provide never happens. POSIX ``flock`` tolerates the truncate, which
+    is why the defect is invisible on Linux and reddened only the Windows shards.
+
+    Same defect and same fix as ``work_ledger._open_lock`` and
+    ``dashboard/handlers/mcp.py``'s ``_McpFileLock``, which is already
+    written this way.
+
+    Truncation is the direct, PLATFORM-INDEPENDENT observable, and that is what
+    these assert: seed the lock file with bytes, take and release the lock, and
+    require the bytes to have survived. Under the old ``open(lock_path, "w")``
+    every one of these fails on every platform, so the guard does not depend on
+    running the suite on Windows to have teeth.
+    """
+
+    SEED = b"lock-file-content-that-must-survive"
+
+    def test_session_pid_file_lock_preserves_the_lock_file(self, session_pid_file: Path) -> None:
+        from kiro_crew.session_pid import _session_pid_file_lock, _session_pid_file_path
+
+        lock_path = _session_pid_file_path().with_suffix(".lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path.write_bytes(self.SEED)
+
+        with _session_pid_file_lock():
+            pass
+
+        assert lock_path.read_bytes() == self.SEED
+
+    def test_pid_file_lock_preserves_the_lock_file(self, pid_file: Path) -> None:
+        from kiro_crew.session_pid import _pid_file_lock, _pid_file_path
+
+        lock_path = _pid_file_path().with_suffix(".lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path.write_bytes(self.SEED)
+
+        with _pid_file_lock():
+            pass
+
+        assert lock_path.read_bytes() == self.SEED
+
+    def test_the_periodic_sweep_preserves_the_lock_file(self, session_pid_file: Path) -> None:
+        """The sweep is the site most likely to feel this in production.
+
+        It runs on a timer while ``_track_session_pid`` contends for the same
+        lock, which is exactly the interleaving a truncating open turns into a
+        crash rather than a wait.
+        """
+        from kiro_crew.session_pid import _periodic_pid_sweep, _session_pid_file_path
+
+        path = _session_pid_file_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # The sweep returns early unless the pid file exists, so it must exist
+        # for the lock to be reached at all.
+        path.write_text(f"{os.getpid()}:999999\n", encoding="utf-8")
+        lock_path = path.with_suffix(".lock")
+        lock_path.write_bytes(self.SEED)
+
+        _periodic_pid_sweep(os.getpid(), set())
+
+        assert lock_path.read_bytes() == self.SEED
+
+    def test_the_lock_is_still_actually_acquired(self, pid_file: Path) -> None:
+        """Guard the guard: a non-truncating open that never locks would pass above.
+
+        ``file_lock`` is asked for the lock through the same helper the production
+        path uses, so this fails if the fd stopped being writable — the failure
+        mode a naive ``"r"`` fix would introduce, and the reason ``"r+"`` rather
+        than ``"r"`` is the answer.
+        """
+        from kiro_crew.session_pid import _pid_file_path
+
+        lock_path = _pid_file_path().with_suffix(".lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path.write_bytes(self.SEED)
+
+        lock_path.touch(exist_ok=True)
+        with open(lock_path, "r+") as fd:
+            with platform_compat.file_lock(fd.fileno(), exclusive=True):
+                pass
+        assert lock_path.read_bytes() == self.SEED

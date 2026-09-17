@@ -34,6 +34,7 @@ from kiro_crew.acp.types import (
     EVENT_TOOL_CALL,
     EVENT_TOOL_RESULT,
 )
+from kiro_crew.constants import _STEERING_TAIL_PREFIX_RE
 from kiro_crew.messaging.renderer import (
     COMPACTION,
     DONE,
@@ -52,6 +53,7 @@ from kiro_crew.monitoring.completion import (
 )
 from kiro_crew.security import StreamRedactor, redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
+from kiro_crew.tool_call_title import derive_tool_call_title
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +92,19 @@ _STEER_MARKER_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 _MAX_STEER_MARKER_CHARS = 16_384
+#: Prefix closure of the same grammar :data:`_STEER_MARKER_RE` completes, reused
+#: from ``constants`` rather than respelled: it answers "could this unterminated
+#: tail still become a marker?", which is the question the drain below has to ask
+#: before it holds text back. Sourcing the pattern from the one place the grammar
+#: is written keeps the two probes from drifting apart -- a divergence
+#: ``test_the_two_spellings_of_the_grammar_agree`` pins.
+#:
+#: Recompiled with ``IGNORECASE`` because THIS module's recognizer carries it:
+#: ``constants``' copy is case-sensitive on purpose (it probes the exact
+#: sentinels a detach walk locates), but here a tail judged prose is EMITTED, so
+#: a probe stricter than the recognizer beside it would leak the very frames
+#: ``[steering steer-4a2f: ...]`` is accepted as.
+_STEER_TAIL_PREFIX_RE = re.compile(_STEERING_TAIL_PREFIX_RE.pattern, re.IGNORECASE | re.DOTALL)
 
 # These are KiroCrew-generated status prefixes, not model-authored prose. A
 # legacy dashboard transcript can contain the completed summary as an assistant
@@ -222,7 +237,25 @@ class _SteeringMarkerFilter:
                 if len(self._buffer) > _MAX_STEER_MARKER_CHARS:
                     self._buffer = ""
                     self._dropping_oversized = True
-                elif final:
+                    break
+                if _STEER_TAIL_PREFIX_RE.match(self._buffer) is None:
+                    # Starting with the sentinel is not the same as being a
+                    # marker. This tail cannot become one however the stream
+                    # continues -- the grammar has already diverged -- so it is
+                    # prose, and holding it back would end in deleting it at
+                    # flush. Handed on the same way a CLOSED frame that fails
+                    # `_STEER_MARKER_RE` already is, which is why "[STEERING
+                    # nonsense] tail" survives today and "[STEERING nonsense"
+                    # did not: the only difference between them was a "]" the
+                    # writer happened to type later.
+                    frames.append(("text", self._buffer[0]))
+                    self._buffer = self._buffer[1:]
+                    continue
+                # Still a viable prefix: hold it. At `final` it is a marker the
+                # stream was cut in the middle of, and that is dropped rather
+                # than emitted -- leaking half a control frame to a channel is
+                # the failure this class exists to prevent.
+                if final:
                     self._buffer = ""
                 break
 
@@ -315,7 +348,7 @@ class TurnDriver:
         ignored exactly as before.
     closing_gate:
         Optional synchronous gate invoked immediately before the provider stream
-        starts. Callers use it to reject a lease that shutdown can no longer
+        starts. Callers use it to reject a lease that shutdown cannot
         drain, and may also reject a structured monitor whose conversation
         generation changed. It must not await: the gate, monitor acceptance, and
         the stream's synchronous turn registration are one event-loop span.
@@ -494,11 +527,37 @@ class TurnDriver:
                 _purpose = _redact(getattr(event, "tool_purpose", ""))
                 if event.tool_call_id and _purpose:
                     tool_purposes[str(event.tool_call_id)] = _purpose
+                # The channel's task label is the same argument-derived title
+                # the dashboard row shows (tool_call_title mirrors
+                # website/src/utils/toolCallTitle.ts): `List files in src`
+                # rather than the literal command, `Session send: <target>`
+                # rather than `@server/tool`. When nothing better can be said
+                # it is the raw command cut to ~80 chars; the approval prompt
+                # below still carries the verbatim ``tool_input``.
+                #
+                # Derived from ``tool_input`` ONLY — the transport-redacted
+                # string — never from ``raw_tool_params``: the derivation cuts
+                # and whitespace-collapses argument text, and a credential cut
+                # that way escapes the redactors that run on the finished
+                # title, so unredacted input would leak key-body bytes into a
+                # persisted channel status.
+                _derived = derive_tool_call_title(
+                    title=event.title or "",
+                    kind=getattr(event, "tool_kind", "") or "",
+                    raw_input=getattr(event, "tool_input", "") or "",
+                    is_shell=bool(getattr(event, "is_shell", False)),
+                    tool_name=getattr(event, "tool_name", "") or "",
+                    mcp_server=getattr(event, "mcp_server_name", "") or "",
+                )
                 await self.renderer.dispatch(
                     OutputEvent(
                         kind=TOOL_CALL,
                         tool_call_id=event.tool_call_id,
-                        title=_redact(event.title),
+                        title=_redact(_derived.title or event.title),
+                        # Programmatic identity travels beside the display title
+                        # so a renderer's behaviour rules (Slack's `wait` stream
+                        # rollover) key on the tool, not on derived copy.
+                        tool_name=getattr(event, "tool_name", "") or "",
                         tool_kind=getattr(event, "tool_kind", ""),
                         tool_purpose=_purpose,
                     )

@@ -5,7 +5,17 @@ boundary is enforced by ``scripts/check_agent_sdk_boundary.py`` and
 ``test/test_agent_sdk_boundary.py``, so application code cannot introduce new
 direct dependencies on the backend packages while the rest of the SDK is built.
 
+Which backends this build can serve, and every capability set a harness may
+claim, live in :mod:`kiro_crew.agent_sdk.backends`; the per-session record a
+consumer asks instead of naming a harness is
+:class:`kiro_crew.agent_sdk.capabilities.SessionCapabilities`. Whether a harness's
+tool calls reach the PreToolUse gate is :mod:`kiro_crew.agent_sdk.tool_gate`.
+
 Machine-local backend readiness lives in :mod:`kiro_crew.agent_sdk.backend_install`.
+How a harness signs in -- which store holds its entitlement, and the remedy to
+print when it does not -- is declared once per harness in
+:mod:`kiro_crew.agent_sdk.host_auth`, and the credential floor, the sandbox mask,
+the doctor row and the backend panel all project from that one declaration.
 Promptless structured command batches live in
 :mod:`kiro_crew.agent_sdk.native_commands`; their ACP process lifecycle and
 exception translation stay in the driver, and only plain data crosses upward.
@@ -27,9 +37,12 @@ Layering::
                             |  resolves drivers through a registry
                             v
                      kiro_crew.agent_sdk.drivers.acp
-                                                  the only module INSIDE this
-                                                  package that imports
-                                                  kiro_crew.acp
+                     kiro_crew.agent_sdk.drivers.acp_vocab
+                                                  the only modules INSIDE this
+                                                  package that import
+                                                  kiro_crew.acp: the driver
+                                                  (call-time imports) and the
+                                                  by-value vocabulary it exposes
                             v
                      kiro_crew.acp  (foundation)  wire, dialects, adapters,
                                                   session handles, worker pool
@@ -59,6 +72,32 @@ from kiro_crew.agent_sdk.backend_install import (
     probe_backend,
     probe_backends,
 )
+from kiro_crew.agent_sdk.capabilities import (
+    MODEL_NAMESPACE_ACP,
+    UNKNOWN_BACKEND_CAPABILITIES,
+    SessionCapabilities,
+    capabilities_for,
+    capabilities_of,
+)
+from kiro_crew.agent_sdk.context import (
+    CONTEXT_EVENT_AGENT_CHANGED,
+    CONTEXT_EVENT_CLEAR,
+    CONTEXT_EVENT_COMPACTION,
+    CONTEXT_EVENT_COMPLETED,
+    CONTEXT_EVENT_TEXT,
+    CONTEXT_EVENT_TOOL,
+    ContextPromptProvider,
+    ContextStreamEvent,
+)
+from kiro_crew.agent_sdk.drivers.acp import context_provider_of, finish_suspended_spawn
+from kiro_crew.agent_sdk.host_auth import (
+    UNKNOWN_AGENT_AUTH,
+    AgentAuthDeclaration,
+    AgentInteractiveLogin,
+    declaration_for,
+    entitlement_label,
+    signs_in_separately,
+)
 from kiro_crew.agent_sdk.native_commands import NativeCommandBatch, run_kiro_native_commands
 
 TURN_STOP_REASON_CANCELLED = "cancelled"
@@ -73,7 +112,27 @@ class AgentTurnUsage(Protocol):
 
 
 __all__ = [
+    "ContextPromptProvider",
+    "ContextStreamEvent",
+    "CONTEXT_EVENT_AGENT_CHANGED",
+    "CONTEXT_EVENT_CLEAR",
+    "CONTEXT_EVENT_COMPACTION",
+    "CONTEXT_EVENT_COMPLETED",
+    "CONTEXT_EVENT_TEXT",
+    "CONTEXT_EVENT_TOOL",
+    "context_provider_of",
     "AgentTurnUsage",
+    "MODEL_NAMESPACE_ACP",
+    "SessionCapabilities",
+    "UNKNOWN_BACKEND_CAPABILITIES",
+    "capabilities_for",
+    "capabilities_of",
+    "UNKNOWN_AGENT_AUTH",
+    "AgentAuthDeclaration",
+    "AgentInteractiveLogin",
+    "declaration_for",
+    "entitlement_label",
+    "signs_in_separately",
     "CACHE_TTL_SECONDS",
     "COMPONENT_CLAUDE_ACP_ADAPTER",
     "COMPONENT_CLAUDE_CODE_CLI",
@@ -84,6 +143,7 @@ __all__ = [
     "BackendInstallState",
     "NativeCommandBatch",
     "clear_probe_cache",
+    "finish_suspended_spawn",
     "probe_backend",
     "probe_backends",
     "run_kiro_native_commands",

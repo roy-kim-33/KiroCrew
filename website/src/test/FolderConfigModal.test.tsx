@@ -172,6 +172,39 @@ describe('FolderConfigModal', () => {
     expect(screen.queryByText(/not installed/i)).toBeNull()
   })
 
+  describe('orphan agent notice', () => {
+    // Item 1: a disabled/misconfigured control that does not say why IS the
+    // defect. An orphan selection is round-tripped (Save is NOT blocked — that
+    // would let a folder rename wipe a temporarily-uninstalled agent), so the
+    // notice explains why the SELECTED AGENT will not run and is bound to the
+    // control with aria-describedby so a screen reader reaches it.
+
+    it('shows a field-bound notice while an orphan agent is selected', () => {
+      const f = folder('f1', { name: 'Payments', default_agent: 'retired-agent' })
+      open({ mode: 'edit', folder: f, folders: [f] })
+      const notice = screen.getByTestId('folder-config-agent-notice')
+      expect(notice.textContent).toMatch(/isn.t installed/i)
+      // The reason is programmatically associated with the control, not merely
+      // placed near it: the combobox's aria-describedby names the notice's id.
+      expect(agentTrigger().getAttribute('aria-describedby')).toBe(notice.id)
+    })
+
+    it('does not disable Save for an orphan — the orphan round-trips instead', () => {
+      const f = folder('f1', { name: 'Payments', default_agent: 'retired-agent' })
+      open({ mode: 'edit', folder: f, folders: [f] })
+      // A folder whose agent is temporarily uninstalled must still be renamable.
+      expect((screen.getByTestId('folder-config-submit') as HTMLButtonElement).disabled).toBe(false)
+    })
+
+    it('shows the hint and no notice, unassociated, when the agent is installed', () => {
+      const f = folder('f1', { name: 'Payments', default_agent: 'kirocrew-dev' })
+      open({ mode: 'edit', folder: f, folders: [f] })
+      expect(screen.queryByTestId('folder-config-agent-notice')).toBeNull()
+      expect(agentTrigger().getAttribute('aria-describedby')).toBeNull()
+      expect(screen.getByText(/Pre-selected for new chats/i)).toBeTruthy()
+    })
+  })
+
   it('clearing the agent back to inherit submits an empty string', async () => {
     // SimpleSelect routes '' through an internal sentinel because Radix reserves
     // '' for "no selection". '' is a real instruction here — it restores the
@@ -190,6 +223,28 @@ describe('FolderConfigModal', () => {
     expect(onSubmit).toHaveBeenCalledWith(expect.objectContaining({
       defaultAgent: '', touched: ['defaultAgent'],
     }))
+  })
+
+  it('names the nearest ANCESTOR agent in the inherit row, not the global default', async () => {
+    // `default_agent: ''` inherits from the nearest ancestor that pins one, the
+    // same way `project_dir` does. A row hardcoded to the global default reads
+    // "Inherit (kirocrew)" over a subfolder whose chats will in fact run
+    // kirocrew-dev — the label contradicting the behaviour it describes.
+    const folders = [
+      folder('a', { name: 'Kiro', default_agent: 'kirocrew-dev' }),
+      folder('b', { name: 'Backend', parent_id: 'a' }),
+    ]
+    open({ folders, parentId: 'b', globalDefaultAgent: 'kirocrew' })
+    expect(await openAgents()).toEqual(['Inherit (kirocrew-dev)', 'kirocrew', 'kirocrew-dev'])
+  })
+
+  it('names what clearing WOULD inherit in edit mode, ignoring the folder own pin', async () => {
+    // Clearing removes this folder's own value, so the row must name the parent's
+    // agent — never the value the picker is about to drop.
+    const parent = folder('a', { name: 'Kiro', default_agent: 'kirocrew-dev' })
+    const self = folder('b', { name: 'Backend', parent_id: 'a', default_agent: 'kirocrew' })
+    open({ mode: 'edit', folder: self, folders: [parent, self], globalDefaultAgent: 'kirocrew' })
+    expect(await openAgents()).toEqual(['Inherit (kirocrew-dev)', 'kirocrew', 'kirocrew-dev'])
   })
 
   it('labels the inherited directory as inherited, not as a value', () => {

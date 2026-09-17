@@ -35,7 +35,13 @@ provider cannot be registered while the gate silently keeps comparing three.
 **Each client module is the stable composition façade for its provider.** The
 routes and tests continue to import `github_client`, `gitlab_client` and
 `azure_client`; those modules retain the protocol surface, exception aliases,
-constants and patchable I/O chokepoints. Provider-specific sibling modules keep
+the constants something actually binds, and patchable I/O chokepoints. A mirror
+NOTHING binds is not part of that surface: the sibling that owns the value reads
+its own module global, so a façade copy is never the seam it resembles and
+patching it changes nothing. Binding means the façade's own code, a test that
+asserts on the façade attribute, or a documented cross-surface pointer such as
+`_MEMBER_ASSOC_RANK`, which `website/src/apps/issue-radar/context.tsx` names as
+the anchor the frontend ranking tracks. Provider-specific sibling modules keep
 the implementation boundaries explicit: `*_transport.py` owns URL, environment,
 request and pagination mechanics; `*_normalization.py` converts provider payloads
 into the shared GitHub-shaped records; and `github_queries.py` owns GitHub's
@@ -236,6 +242,28 @@ triage prompt. When the agent concludes it writes its verdict back into the
 item's investigation record — that is what puts a verdict + summary on the
 issue's card instead of leaving it in chat scrollback.
 
+The session opens in the repo's configured **`workspace_path`** (a per-repo,
+local-only triage setting stored in `config.json`, alongside `triage_labels` and
+`notify_on_new_issue`, and normalized by `store._normalize_settings`) so the agent
+sees the repo's real source instead of the gateway's default cwd. The frontend forwards it as the new slot's
+`project` on `createSlot`, which sets the working directory via `chatSlotProject`
+after create. An empty setting passes `null`, leaving the slot on the default cwd
+(the pre-workspace behavior). It is applied only when a FRESH session is opened;
+a resumed slot keeps the working directory it was born with, so changing the
+setting never moves the cwd of a conversation already running — which is why the
+Repo Settings readout says "New Investigate sessions will run in …", not that the
+next click will. The path is stored verbatim and never validated against the
+filesystem — the path resolves on the machine running the gateway (which may be a
+different host than the operator's), and a not-yet-checked-out path is a
+legitimate empty state. Because it is unvalidated, `chatSlotProject` can still
+reject it at slot-create time (missing dir on the gateway host, or a sensitive
+path); `createSlot` then deletes the just-made slot and throws, which reaches
+`openSession`'s `catch` and surfaces in the hook's `error` state — the same
+contract the chat sidebar uses ("Not a directory"). A bad path is deliberately
+NOT swallowed into a default-cwd session: doing so would silently pin the whole
+investigation thread in the wrong directory, recreating the wrong-cwd failure
+this feature removes.
+
 That write goes through the **`issue_radar_record_investigation` MCP tool**, not
 a raw HTTP call. An agent session holds no dashboard credential:
 
@@ -336,6 +364,19 @@ the same lock discipline on its own `.lock` sidecar: every mutation is a merge
 would otherwise lose an update. An analysed issue the model declined to label is
 stored as an EMPTY list, not omitted — otherwise "the next un-analysed slice"
 would return the same unlabelable issues forever.
+
+The connected-repo reader treats a non-object `config.json` as an empty config,
+and filters non-object rows from its `repos` list. A malformed row cannot stop
+the app from listing or updating other connected repositories.
+
+Every cache parser applies the same rule to its own file: a JSON root that parses
+but is not an object is unusable. Readers return a MISS so the route refetches and
+the next write heals the file; write-through patchers skip that individual file
+and continue patching the other caches. Without that, a hand-edited or restored
+cache fails its route or aborts the remaining post-write cache repairs. The
+investigation record is deliberately excluded — it is the only copy of a user's
+findings, so reading a malformed root as "absent" would let the next write replace
+it.
 
 ## Permissions
 
@@ -760,7 +801,7 @@ Two safeguards, both deliberate:
   own `gh search` shares. `_PROBE_COALESCE_SEC` (15s) shares one reading per (repo, kind)
   across every open tab, so a 30s interval costs at most 2 probes/min/kind however many
   tabs are open. Halve the floor and that stops holding. Nothing enforces the
-  relationship across the language boundary, so `issueRadarPolling.test.ts` asserts
+  relationship across the language boundary, so `issueRadarPolling.test.tsx` asserts
   `min(choices) == 2 × 15s`: if the backend constant moves, that test is what says this
   floor must move with it.
 - **`/pulls/search` opts out of BOTH new knobs.** Prefetch does not reach it, and
@@ -797,7 +838,7 @@ space: `gcTime = CACHE_RETENTION_MS` (**30 min**). Four properties:
 
 That is sufficient on its own because the surfaces gate their loading copy on `isLoading`,
 which is false whenever data is present: a remount inside the retention window paints the
-retained rows immediately and any refetch runs behind them. `issueRadarPolling.test.ts`
+retained rows immediately and any refetch runs behind them. `issueRadarPolling.test.tsx`
 pins the retention, its scoping, and the not-pending property.
 
 The lists additionally keep their previous rows on screen while a new key loads, so
@@ -814,7 +855,7 @@ a same-slug repo on another host is correctly a different repo) and returns `und
 across a switch, which renders the honest loading state. The ticked selection is already
 cleared on `scopeKey`, but that effect runs *after* the paint — it closes the window one
 render late rather than never opening it, which is why the placeholder itself is scoped.
-`issueRadarPolling.test.ts` pins both halves.
+`issueRadarPolling.test.tsx` pins both halves.
 
 `add_pr_comment` is a separate function from `add_issue_comment` even though the two
 coincide on GitHub (one number sequence per repo): GitLab numbers issues and merge
@@ -972,7 +1013,7 @@ does not read as the whole repo. Net cost: exactly one extra single-page request
 cold repo-open. `list_open_issues_first_page` is on the `ProviderClient` protocol, so
 GitLab and Azure DevOps each implement the symmetric single-page variant (Azure's is
 one WIQL+hydrate pair capped at `_PAGE_SIZE`, in the same changed-date order as the
-full list) and `test_provider_parity` holds.
+full list) and `apps/builtins/issue_radar/tests/test_gitlab.py::TestClientParity::test_every_module_implements_the_whole_surface` holds.
 
 `GET /pulls?first_page=1` (open state only) is the PR twin, handled by
 `_handle_pulls_first_page` with one added rule: the first page is returned
@@ -991,7 +1032,7 @@ skeleton until the full list lands; the footer shows a `pullsPartial` "loading t
 hint. `list_open_pulls_first_page` is on the `ProviderClient` protocol (GitLab's variant
 is card-complete already, since it inlines `head_pipeline`; Azure's is un-enriched like
 GitHub's, because its check state is a per-PR policy-evaluation call), and
-`test_provider_parity` holds.
+`apps/builtins/issue_radar/tests/test_gitlab.py::TestClientParity::test_every_module_implements_the_whole_surface` holds.
 
 `enrich_pulls` runs its two INDEPENDENT GraphQL families — card summaries and merge
 readiness — **concurrently** on a two-worker `ThreadPoolExecutor` rather than
@@ -1200,9 +1241,15 @@ the list, the filters, the selected item — is untouched.
   check is answered from POSIX ownership (`st_uid` + the group/other write bits)
   or, on Windows, from the object's ACL — see
   `github_runner.check_provider_path_component_windows` and
-  `kiro_crew.windows_acl`. An **elevated** Windows gateway is refused for the same
-  reason a root POSIX one is: its children would be elevated too, which makes the
-  ownership walk vacuous.
+  `kiro_crew.windows_acl`. A **root** POSIX gateway is refused: the sandbox
+  masks the credential homes from the agent's children but leaves the filesystem
+  writable, and a provider child runs unsandboxed with those credentials, so a
+  root agent could overwrite a root-owned `gh` that the ownership walk cannot
+  tell from the operator's install. An **elevated** Windows gateway (the
+  built-in `Administrator` account is always elevated) is not refused: Windows
+  has no OS sandbox here, so the agent's shell already holds the gateway's full
+  token and the refusal would remove the feature without removing any exposure.
+  The ACL walk runs unchanged for it, keyed on the gateway user's SID.
 - **Azure DevOps is POSIX only (macOS/Linux).** `azure_client._az_bin` refuses
   `win32` before it resolves anything, and raises `ProviderCliError` rather than
   `ProviderSetupError` so the connect dialog does not offer an install that would
