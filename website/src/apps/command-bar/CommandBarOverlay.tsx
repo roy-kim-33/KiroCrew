@@ -1,13 +1,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import { createPortal } from 'react-dom'
-import { useQuery } from '@tanstack/react-query'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   ArrowRight,
   Check,
   Clock,
   Command,
   Cog,
+  Folder,
   GitMerge,
   Loader2,
   MessageSquare,
@@ -22,9 +23,14 @@ import {
 } from 'lucide-react'
 
 import { api } from '../../api/client'
+import { commandFolderName, fileSessionInCommandFolder } from './sessionFolder'
+import type { ChatFolderRow } from './sessionFolder'
+import type { ChatFolder } from '../../types'
 import { appNavTargets } from '../../appNav'
 import { useAppDispatch, useAppSelector } from '../../store'
-import { createSlot, setPendingInput, switchSlot } from '../../store/chatSlice'
+import { createSlot, setPendingInput, switchSlot, requestFolderReveal } from '../../store/chatSlice'
+import { orderFoldersWithPaths, FOLDER_PATH_SEP, folderNameText } from '../../utils/folderTree'
+import ErrorNotice from '../../components/ErrorNotice'
 import { Highlighted } from '../../components/commandPalette/Highlighted'
 import { SETTINGS_REGISTRY } from '../../components/commandPalette/settingsRegistry.gen'
 import { localizedSettingLabel } from '../../components/commandPalette/settingsSearchCore'
@@ -84,6 +90,8 @@ function groupLabel(group: RootGroup): string {
       return i18nT('apps.commandBar.group_commands')
     case 'apps':
       return i18nT('apps.commandBar.group_apps')
+    case 'folders':
+      return i18nT('apps.commandBar.group_folders')
     case 'settings':
       return i18nT('apps.commandBar.group_settings')
   }
@@ -104,6 +112,7 @@ function kindLabel(row: { kind: RootRowKind; group: RootGroup; appLabel?: string
   if (row.group === 'attention') return null
   if (row.kind === 'view') return i18nT('apps.commandBar.kind.view')
   if (row.group === 'apps') return i18nT('apps.commandBar.kind.app')
+  if (row.group === 'folders') return i18nT('apps.commandBar.kind.folder')
   if (row.group === 'settings') return i18nT('apps.commandBar.kind.setting')
   const kind = i18nT('apps.commandBar.kind.command')
   // Provenance ahead of the kind for a contributed row. Composed with the separator this
@@ -120,6 +129,8 @@ function groupIcon(group: RootGroup) {
       return <Terminal size={14} className="lucide-inline" />
     case 'apps':
       return <Package size={14} className="lucide-inline" />
+    case 'folders':
+      return <Folder size={14} className="lucide-inline" />
     case 'settings':
       return <Cog size={14} className="lucide-inline" />
   }
@@ -221,6 +232,14 @@ function actionLabel(slot: Slot): string {
       // the next step does not do.
       if (slot.row.kind === 'prompt') return i18nT('apps.commandBar.action_continue')
       if (slot.row.kind === 'navigate') return i18nT('apps.commandBar.action_open')
+      // A folder row is an `invoke` because landing on one is a reveal and not only
+      // a route change, but "Run" is the wrong promise for it: it is the strongest
+      // verb this footer has, reserved for the rows that approve or merge, and on a
+      // folder it invites a reader to double-check before pressing Enter. What the
+      // row does is open a folder, and `action_open` already says that in every
+      // catalog. Keyed on the GROUP rather than the kind because the verb describes
+      // what the row is, not how its handler is wired.
+      if (slot.row.group === 'folders') return i18nT('apps.commandBar.action_open')
       return i18nT('apps.commandBar.action_run')
     case 'result':
       return i18nT('apps.commandBar.action_open_session')
@@ -427,6 +446,23 @@ export default function CommandBarOverlay({
     enabled: false,
   })
 
+  // The folder list is READ the same way and for a sharper reason: `GET
+  // /api/chat/folders` walks the on-disk session list synchronously to count archived
+  // sessions per folder, so fetching it here would pay for a filesystem scan on every
+  // command run to learn what the sidebar's own cache already holds (the WebSocket
+  // seeds this key from the folder tree). A cold cache falls back to one fetch inside
+  // `fileSessionInCommandFolder`.
+  const { data: chatFolders } = useQuery({
+    queryKey: ['chat-folders'],
+    queryFn: () => api.chatFolders(),
+    enabled: false,
+  })
+  // Held in a ref because the filing runs from an async callback, long after the render
+  // that read the cache.
+  const chatFoldersRef = useRef<unknown>(chatFolders)
+  chatFoldersRef.current = chatFolders
+  const queryClient = useQueryClient()
+
   useEffect(() => {
     if (!open) return
     setQuery('')
@@ -536,7 +572,7 @@ export default function CommandBarOverlay({
         // Same activation the sidebar and the recents listing use, so a session
         // opened from here lands exactly where it lands from anywhere else.
         run: async () => {
-          dispatch(switchSlot(slot.key))
+          dispatch(switchSlot({ key: slot.key, announceOnMissing: true }))
           navigate('/chat')
         },
       })
@@ -628,6 +664,51 @@ export default function CommandBarOverlay({
         icon: appIcon(target),
       })
     }
+    // The sidebar's own folders, so typing a folder's name lands on it. Read
+    // cache-only from the same `['chat-folders']` entry the filing code above
+    // reads — the query that owns it is `enabled: false` — so these rows cost the
+    // root nothing and simply do not appear on a cold cache, which is the same
+    // degradation `fileSessionInCommandFolder` already accepts.
+    //
+    // `orderFoldersWithPaths` rather than a local walk: it is the module the
+    // sidebar's own pickers use, so the launcher lists folders in the order the
+    // sidebar draws them and spells an ancestry path the way the server does.
+    // Re-deriving either here would be a second answer to a settled question.
+    for (const { folder, ancestors } of orderFoldersWithPaths(
+      Array.isArray(chatFolders) ? (chatFolders as ChatFolder[]) : [],
+    )) {
+      rows.push({
+        id: `folder:${folder.id}`,
+        title: folderNameText(folder),
+        // The ancestry path, so two folders that share a leaf name are still
+        // distinguishable. Absent for a top-level folder rather than rendered as
+        // an empty breadcrumb.
+        subtitle: ancestors.length ? ancestors.join(FOLDER_PATH_SEP) : undefined,
+        group: 'folders',
+        // `invoke`, not `navigate`: landing on a folder is a route change AND a
+        // store write (the reveal request the sidebar consumes), so it cannot be
+        // expressed as a route alone.
+        kind: 'invoke',
+        // A folder list is the user's own filing, so on an EMPTY query it is a tail
+        // to search, not what the launcher should open on. `idleDemote` makes an
+        // untouched folder lose to any row with one real use while the query is
+        // empty, and `FOLDERS_IDLE_LIMIT` bounds the block regardless -- the same
+        // treatment, for the same reason, as the settings tail.
+        idleDemote: true,
+        icon: <Folder size={14} className="lucide-inline" />,
+        run: async () => {
+          // Store write BEFORE the route change: the request is held in the store
+          // precisely because the sidebar may not be mounted yet, and its consuming
+          // effect runs on mount as well as on change, so an early request is
+          // replayed rather than dropped.
+          dispatch(requestFolderReveal(folder.id))
+          navigate('/chat')
+        },
+        // The path segments as keywords, so "kirocrew oss" reaches a folder whose
+        // own name is neither word. The name itself is already the title.
+        keywords: [...ancestors],
+      })
+    }
     for (const entry of SETTINGS_REGISTRY) {
       rows.push({
         id: `setting:${entry.id}`,
@@ -647,7 +728,7 @@ export default function CommandBarOverlay({
     // the tree without remounting it, which does not recompute a memo. Omitting it
     // would freeze these rows in whichever language the surface first resolved.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [apps, commandById, cycleTheme, dispatch, liveSlots, navigate, resolved, simplifiedToolNames, slotStatusDetail, unreadSlots])
+  }, [apps, chatFolders, commandById, cycleTheme, dispatch, liveSlots, navigate, resolved, simplifiedToolNames, slotStatusDetail, unreadSlots])
 
   // The root ranks from the LIVE query, not the debounced one. Ranking is pure and
   // local, so there is nothing to throttle, and debouncing it would let a fast Enter
@@ -736,6 +817,10 @@ export default function CommandBarOverlay({
       // Whether this seed belongs to a CONTRIBUTED command, decided before the awaits.
       // The Ask row uses this same path and is never in the map, so it is unaffected.
       const contributed = commandByIdRef.current.has(pendingKey)
+      // The folder this session will be filed into, read BEFORE the awaits for the
+      // same reason `contributed` is: the app can be disabled mid-flight, and the
+      // filing below must not depend on the row still being in the map.
+      const folderName = commandFolderName(commandByIdRef.current, pendingKey)
       // Still offered by an enabled app? `owned()` tracks the dialog's own lifetime and
       // cannot see this: the app can be disabled from the Apps page while the session
       // create is still in flight, which leaves the run legitimately owned and the
@@ -748,7 +833,10 @@ export default function CommandBarOverlay({
       // to type into it. Leaning on "create makes the new slot active" is only true at
       // the instant it resolves -- and this callback can resolve long after the user
       // has moved on, at which point the seed lands in whatever they moved to.
-      void dispatch(createSlot({ activate: false }))
+      void dispatch(createSlot({
+        activate: false,
+        ...(contributed ? { memory_mode: 'persistent' } : {}),
+      }))
         .unwrap()
         .then(
           async slot => {
@@ -784,6 +872,27 @@ export default function CommandBarOverlay({
               // force a new one would land the text in a second, different session.
               navigate(autoSend ? '/chat?autoSend=1' : '/chat')
               onClose()
+              // Filed LAST, and deliberately not awaited. A contributed row opens a new
+              // session on every run, so unfiled they bury the reader's own chats and two
+              // commands' runs interleave with nothing between them -- but the text is
+              // already seeded by this point, so a slow, capped or refused folder API can
+              // only cost this session its place in the sidebar. Contributed rows only:
+              // the Ask row carries a sentence the reader wrote and belongs wherever they
+              // are working, not in a folder named after a command.
+              if (contributed && folderName) {
+                void fileSessionInCommandFolder(
+                  slot.key,
+                  folderName,
+                  Array.isArray(chatFoldersRef.current)
+                    ? (chatFoldersRef.current as ChatFolderRow[])
+                    : undefined,
+                  // A folder this run created is not in the cache it just read, and the
+                  // WebSocket push that would seed it is not guaranteed to arrive. Left
+                  // uninvalidated, the sidebar can keep rendering a tree without the new
+                  // folder and the next run reads the same stale list.
+                  () => queryClient.invalidateQueries({ queryKey: ['chat-folders'] }),
+                )
+              }
             } finally {
               // Only the OWNING run may clear the guard. Unconditionally, a stale
               // activation clears a LIVE one's: close and reopen during create A, start
@@ -801,7 +910,7 @@ export default function CommandBarOverlay({
           },
         )
     },
-    [dispatch, navigate, onClose],
+    [dispatch, navigate, onClose, queryClient],
   )
 
   const activateRoot = useCallback(
@@ -1429,12 +1538,11 @@ export default function CommandBarOverlay({
           />
         </div>
 
+        {/* No hand-off: the query typed into the bar above is unsaved — the
+            navigation would close the bar and take it along. */}
         {actionError && (
-          <div
-            role="alert"
-            className="px-3 py-2 text-[12px] text-danger border-t border-border"
-          >
-            {actionError}
+          <div className="px-3 py-2 border-t border-border">
+            <ErrorNotice message={actionError} variant="inline" />
           </div>
         )}
 

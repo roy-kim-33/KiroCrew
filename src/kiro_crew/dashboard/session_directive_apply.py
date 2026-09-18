@@ -32,7 +32,8 @@ Research ownership contracts plus the immutable ``AUTONUDGE_STOP_REASON``
 constant. ``sel`` is a genuine cycle
 (``sel`` -> config -> apps -> dashboard, and chat_runner imports this module
 before it imports sel). The rest (autonudge, autonudge_authz, chat_utils,
-security, chat_handlers) are deferred on purpose: they keep this module cheap to
+security, chat_handlers, chat_persistence, chat_tags, chat_tag_grants) are
+deferred on purpose: they keep this module cheap to
 import from the turn loop's import graph, and they resolve the symbol at CALL
 time so patching the SOURCE module is what tests (and any runtime override)
 actually observe — a module-scope ``from X import name`` would freeze a stale
@@ -54,17 +55,115 @@ from kiro_crew.autonudge import (
     APPROVAL_STALL_REASON,
     AUTONUDGE_STOP_REASON,
     MONITOR_TERMINAL_REASON,
+    is_channel_key,
 )
 from kiro_crew.messaging.link import is_channel_session_key
 from kiro_crew.session_surface import has_dashboard_surface
 
 logger = logging.getLogger(__name__)
 
+QUESTION_CARD_SHOWN_PREFIX = "Question card shown in this session."
+
 # Card directives require a connected dashboard surface. ``set_project`` is
 # admitted by the user-surface provenance gate below, then separately requires
 # the current turn to own the slot it would mutate.
 _DASHBOARD_ONLY_DIRECTIVES = frozenset({"suggest_followup", "ask_question"})
-_USER_SURFACE_DIRECTIVES = frozenset({"set_project", "reset_conversation"})
+_USER_SURFACE_DIRECTIVES = frozenset({"set_project", "reset_conversation", "chat_tag"})
+# Directives whose effect is "this session will be woken later". A refusal of
+# one of these is the failure the caller can least observe: the MCP tool has
+# already answered "requested" over its own pipe by the time this consumer
+# runs, and the model's turn is over -- so a refusal that stays in the log
+# leaves a session that believes it armed a loop and is never woken again.
+_ARMING_DIRECTIVES = frozenset({"monitor_start", "monitor_watch"})
+
+# Transcript row prefix for a refused arm. Fixed text so the frontend and tests
+# can match on it; the authorizer's reason follows the colon.
+ARM_REFUSAL_NOTICE_PREFIX = "⚠️ Automation loop NOT armed: "
+ARM_SUCCESS_NOTICE_PREFIX = "✅ Automation loop armed: "
+
+
+def _surface_arm_refusal(state: Any, slot: Any, kind: str, reason: str) -> None:
+    """Append a ``notice`` row so a refused arm is VISIBLE where the session lives.
+
+    The directive consumer runs AFTER the model received the tool's own
+    non-committal ack ("Monitor loop requested ...", see
+    ``mcp_tools/control.py``), and gateway-off the applier's string cannot
+    replace that ack -- it only overwrites the tool_result row. The one surface
+    that reliably reaches whoever is watching the session (the user, a member
+    thread's reader, the next turn's transcript replay) is a row of its own, so
+    a refusal gets one. Slot-less callers (a channel transport's TurnDriver)
+    have no transcript window; the returned string is their only surface.
+
+    Best-effort: a notice is telemetry about a refusal that has already been
+    audited, so it must never turn a clean denial into an exception.
+    """
+    if slot is None:
+        return
+    try:
+        # Local import: state -> chat_utils -> ... cycles with this module the
+        # same way ``sel`` does (see the module docstring).
+        from kiro_crew.dashboard.state import append_and_surface
+        from kiro_crew.security import redact_credentials, redact_exfiltration_urls
+
+        # The reason interpolates the authorizer's message, which can echo an
+        # LLM-derived value (a target, a slot key), so scrub it like every other
+        # transcript egress before it is persisted or broadcast.
+        text, _ = redact_exfiltration_urls(f"{ARM_REFUSAL_NOTICE_PREFIX}{reason}")
+        text, _ = redact_credentials(text)
+        append_and_surface(state, slot, "notice", text, "msg msg-info")
+    except Exception:
+        logger.debug("arm-refusal notice for %s could not be surfaced", kind, exc_info=True)
+
+
+def _surface_arm_success(state: Any, slot: Any, summary: str) -> None:
+    """Append a ``notice`` row saying the loop IS armed, and how.
+
+    The twin of :func:`_surface_arm_refusal`, for the same reason: the MCP
+    tool's own ack is deliberately non-committal ("requested"), so without a
+    row of its own a successful arm is as invisible as a refused one. Same
+    best-effort contract -- a notice failure never fails the arm.
+    """
+    if slot is None:
+        return
+    try:
+        from kiro_crew.dashboard.state import append_and_surface
+        from kiro_crew.security import redact_credentials, redact_exfiltration_urls
+
+        text, _ = redact_exfiltration_urls(f"{ARM_SUCCESS_NOTICE_PREFIX}{summary}")
+        text, _ = redact_credentials(text)
+        append_and_surface(state, slot, "notice", text, "msg msg-info")
+    except Exception:
+        logger.debug("arm-success notice could not be surfaced", exc_info=True)
+
+
+def _describe_interval(secs: int) -> str:
+    secs = int(secs)
+    if secs % 3600 == 0:
+        hours = secs // 3600
+        return f"{hours} hour" + ("" if hours == 1 else "s")
+    if secs % 60 == 0:
+        minutes = secs // 60
+        return f"{minutes} min"
+    return f"{secs}s"
+
+
+def _describe_next_wake(loop: Any, *, verb: str = "first wake") -> str:
+    """Render the armed record's next deadline as "first wake in ~Ns (HH:MM:SS UTC)".
+
+    Read off the ARMED loop, never off the request: ``next_due_ts`` is what the
+    timer actually arms toward, so this is the one number that cannot disagree
+    with the fire. An unset or unreadable deadline yields "" and the caller
+    omits the clause rather than inventing a time.
+    """
+    try:
+        due = float(getattr(loop, "next_due_ts", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return ""
+    if due <= 0:
+        return ""
+    remaining = max(0, int(round(due - time.time())))
+    stamp = time.strftime("%H:%M:%S UTC", time.gmtime(due))
+    return f"{verb} in ~{remaining}s ({stamp})"
 
 
 def _has_user_surface(session_key: str) -> bool:
@@ -84,8 +183,8 @@ def _audit(session_key: str, kind: str, outcome: str) -> None:
     """Emit a SEL tool-invocation event for one directive application.
 
     AUTOSDE ``backend-security-controls`` requires every tool invocation AND
-    permission decision to emit a SEL event — the effect now runs here (not in
-    the tool body or an HTTP endpoint), so the audit must too. Best-effort: a
+    permission decision to emit a SEL event — the effect runs here (not in the
+    tool body or an HTTP endpoint), so the audit does too. Best-effort: a
     telemetry failure must never break the turn.
     """
     try:
@@ -109,6 +208,8 @@ async def apply_session_directive(
     args: dict[str, Any],
     *,
     producer_is_user_facing: bool = False,
+    producer_is_self_wake: bool = False,
+    producer_is_channel: bool = False,
 ) -> str:
     """Apply directive *kind* with *args* to *slot*/*session_key*; return a
     confirmation string for the model. Fail-soft: any error is returned as a
@@ -159,21 +260,55 @@ async def apply_session_directive(
             f"sub-agents are refused (this turn is {session_key!r}). "
             "Nothing was changed."
         )
+    # SELF-ARM PROVENANCE: which turns count as "the session's own" for the
+    # crew/member rule. Two producers, each named explicitly: a turn a HUMAN
+    # started in this session (the same authenticated-human flag the
+    # set_project / reset_conversation gate uses), and the delivered wake of a
+    # loop bound to this very slot (marked by ``_fire_dashboard_nudge``) -- a
+    # member's loop firing on the member's slot is the member keeping itself
+    # awake, so the re-arm or revision it issues from inside that cycle is its
+    # own act. Everything else -- a cron injection, an app-driven turn, a
+    # sub-agent sharing the slot -- carries neither mark and is refused. This is
+    # NOT the user-surface gate below: ``set_project`` / ``reset_conversation``
+    # stay human-only, a wake must never retarget the slot's project.
+    self_arm_ok = bool(producer_is_user_facing or producer_is_self_wake)
     try:
         if kind == "monitor_start":
-            result = await _monitor_start(state, session_key, args)
+            result = await _monitor_start(
+                state,
+                session_key,
+                args,
+                slot=slot,
+                self_arm_ok=self_arm_ok,
+                producer_is_channel=producer_is_channel,
+            )
         elif kind == "monitor_watch":
-            result = await _monitor_watch(state, session_key, args)
+            result = await _monitor_watch(
+                state,
+                session_key,
+                args,
+                slot=slot,
+                self_arm_ok=self_arm_ok,
+                producer_is_channel=producer_is_channel,
+            )
         elif kind == "monitor_update":
-            result = await _monitor_update(state, session_key, args)
+            result = await _monitor_update(
+                state,
+                session_key,
+                args,
+                self_arm_ok=self_arm_ok,
+                producer_is_channel=producer_is_channel,
+            )
         elif kind == "monitor_stop":
-            result = await _monitor_stop(session_key, args)
+            result = await _monitor_stop(slot, session_key, args)
         elif kind == "autonudge_stop":
             result = await _autonudge_stop(slot, session_key, args)
         elif kind == "set_project":
             result = await _set_project(state, slot, args)
         elif kind == "reset_conversation":
             result = await _reset_conversation(slot, session_key, args)
+        elif kind == "chat_tag":
+            result = await _apply_chat_tag(state, slot, session_key, args)
         elif kind == "suggest_followup":
             result = await _suggest_followup(state, slot, args)
         elif kind == "ask_question":
@@ -189,6 +324,8 @@ async def apply_session_directive(
             kind,
             exc,
         )
+        if kind in _ARMING_DIRECTIVES:
+            _surface_arm_refusal(state, slot, kind, str(exc))
         return str(exc)
     except Exception as exc:  # never propagate into the turn loop
         logger.warning("apply_session_directive(%s) failed", kind, exc_info=True)
@@ -218,9 +355,18 @@ def _structured_binding(session_key: str) -> str | None:
     return structured_monitor_binding_key_for(session_key)
 
 
-async def _monitor_start(state: Any, session_key: str, args: dict[str, Any]) -> str:
+async def _monitor_start(
+    state: Any,
+    session_key: str,
+    args: dict[str, Any],
+    *,
+    slot: Any = None,
+    self_arm_ok: bool = False,
+    producer_is_channel: bool,
+) -> str:
     from kiro_crew.autonudge import get_instance
     from kiro_crew.autonudge_authz import authorize_and_add_nudge
+    from kiro_crew.monitoring.models import MonitorCreationSurface
 
     svc = get_instance()
     # Not-applied paths RAISE so the wrapper audits them as denied — a plain
@@ -238,7 +384,7 @@ async def _monitor_start(state: Any, session_key: str, args: dict[str, Any]) -> 
     # the flag existed must not read as an opt-out.
     raw_gate = args.get("gate")
     gate = True if raw_gate is None else bool(raw_gate)
-    loop, error, _status = await authorize_and_add_nudge(
+    loop, error, status = await authorize_and_add_nudge(
         svc=svc,
         state=state,
         slot_key=binding,
@@ -260,11 +406,26 @@ async def _monitor_start(state: Any, session_key: str, args: dict[str, Any]) -> 
         # STOPPED row: monitor_update's approval-stall refusal names
         # monitor_start as the remedy, so refusing here deadlocks it.
         replace_stopped=True,
+        # SELF-ARM provenance: this consumer applies the directive to the exact
+        # session whose turn produced it (module docstring), so the binding IS
+        # the initiator -- for the two producers ``apply_session_directive``
+        # admits (a human-started turn, or this slot's own loop wake). A cron
+        # injection, a sub-agent sharing the slot or an app-driven turn runs in
+        # the same session without being it, and a loop such a turn armed would
+        # be the outsider's loop wearing the member's key; those pass "".
+        initiator_slot_key=binding if self_arm_ok else "",
+        creation_surface=(
+            MonitorCreationSurface.CHANNEL
+            if producer_is_channel
+            else MonitorCreationSurface.DASHBOARD
+        ),
     )
     if error is not None:
         # The authorizer already audited its own refusal; the wrapper's record
         # for THIS directive must agree (denied), not overwrite it as success.
-        raise _DirectiveDenied(f"Failed to start monitor loop: {error}")
+        # The status rides along so the reader can tell a 409 refusal (mode,
+        # existing automation) from a 404 (session gone) or 503 (audit down).
+        raise _DirectiveDenied(f"Failed to start monitor loop: {error} [status {status}]")
     cap = f", stopping after {max_cycles} cycles" if max_cycles else ", with NO cycle cap"
     if max_runtime_secs:
         cap += f", wall-clock budget {max_runtime_secs}s"
@@ -281,19 +442,41 @@ async def _monitor_start(state: Any, session_key: str, args: dict[str, Any]) -> 
         )
     else:
         cadence = f"the message re-injects every {idle_secs}s"
+    loop_id = str(getattr(loop, "id", "?"))
+    first_wake = _describe_next_wake(loop)
+    _surface_arm_success(
+        state,
+        slot,
+        f"loop {loop_id} · every {_describe_interval(idle_secs)} · "
+        + ("no cycle cap" if not max_cycles else f"{max_cycles}-cycle cap")
+        + (f" · {first_wake}" if first_wake else ""),
+    )
     return (
-        f"Monitor loop {getattr(loop, 'id', '?')} started on this session: {cadence} "
+        f"Monitor loop {loop_id} started on this session: {cadence} "
         f"(user messages defer a due fire "
-        f"to their turn's end without restarting the countdown){cap}. "
-        "End your turn now — the loop wakes you. Call autonudge_stop when the "
+        f"to their turn's end without restarting the countdown){cap}"
+        + (f"; {first_wake}" if first_wake else "")
+        + ". End your turn now — the loop wakes you. Call autonudge_stop when the "
         "exit condition is met."
     )
 
 
-async def _monitor_watch(state: Any, session_key: str, args: dict[str, Any]) -> str:
+async def _monitor_watch(
+    state: Any,
+    session_key: str,
+    args: dict[str, Any],
+    *,
+    slot: Any = None,
+    self_arm_ok: bool = False,
+    producer_is_channel: bool,
+) -> str:
     from kiro_crew.autonudge import get_instance
     from kiro_crew.autonudge_authz import authorize_and_add_nudge
-    from kiro_crew.monitoring.models import MonitorBudgets, MonitorState
+    from kiro_crew.monitoring.models import (
+        MonitorBudgets,
+        MonitorCreationSurface,
+        MonitorState,
+    )
 
     svc = get_instance()
     if svc is None:
@@ -316,7 +499,7 @@ async def _monitor_watch(state: Any, session_key: str, args: dict[str, Any]) -> 
         cadence_secs=int(args["cadence_secs"]),
         wake_instructions=str(args.get("wake_instructions") or ""),
     )
-    loop, error, _status = await authorize_and_add_nudge(
+    loop, error, status = await authorize_and_add_nudge(
         svc=svc,
         state=state,
         slot_key=binding,
@@ -331,19 +514,48 @@ async def _monitor_watch(state: Any, session_key: str, args: dict[str, Any]) -> 
         # inspection must not block this session's next directive arm.
         replace_stopped=True,
         monitor=monitor,
+        # Self-arm provenance, same rule as _monitor_start: human-started turns only.
+        initiator_slot_key=binding if self_arm_ok else "",
+        creation_surface=(
+            MonitorCreationSurface.CHANNEL
+            if producer_is_channel
+            else MonitorCreationSurface.DASHBOARD
+        ),
     )
     if error is not None:
-        raise _DirectiveDenied(f"Failed to start structured monitor: {error}")
+        raise _DirectiveDenied(f"Failed to start structured monitor: {error} [status {status}]")
     if loop is None:
         raise _DirectiveDenied(
             "Failed to start structured monitor: no monitor record was returned."
         )
-    return f"Structured monitor {loop.id} started on this session."
+    first_probe = _describe_next_wake(loop, verb="first probe")
+    _surface_arm_success(
+        state,
+        slot,
+        f"structured monitor {loop.id} on {monitor.target} · every "
+        f"{_describe_interval(monitor.cadence_secs)}"
+        + (f" · {first_probe}" if first_probe else ""),
+    )
+    return f"Structured monitor {loop.id} started on this session" + (
+        f"; {first_probe}." if first_probe else "."
+    )
 
 
-async def _monitor_update(state: Any, session_key: str, args: dict[str, Any]) -> str:
+async def _monitor_update(
+    state: Any,
+    session_key: str,
+    args: dict[str, Any],
+    *,
+    self_arm_ok: bool = False,
+    producer_is_channel: bool = False,
+) -> str:
     from kiro_crew.autonudge import get_instance, is_structured_monitor_loop
-    from kiro_crew.autonudge_authz import authorize_and_update_nudge
+    from kiro_crew.autonudge_authz import (
+        _EXTERNAL_ARM_REFUSED_MODES,
+        authorize_and_update_nudge,
+        external_arm_refusal,
+        is_self_arm,
+    )
 
     svc = get_instance()
     # Not-applied paths raise (audited denied) — see _monitor_start.
@@ -359,7 +571,14 @@ async def _monitor_update(state: Any, session_key: str, args: dict[str, Any]) ->
     if is_structured_monitor_loop(loop):
         if _structured_binding(session_key) != binding:
             raise _DirectiveDenied("monitor_update is not supported from this session type.")
-        return await _structured_monitor_update(state, svc, loop, patch)
+        return await _structured_monitor_update(
+            state,
+            svc,
+            loop,
+            patch,
+            initiator=binding if self_arm_ok else "",
+            producer_is_channel=producer_is_channel,
+        )
     structured_only = sorted(
         set(patch)
         & {
@@ -409,8 +628,8 @@ async def _monitor_update(state: Any, session_key: str, args: dict[str, Any]) ->
     # cycle-count heuristic stays only as a legacy fallback for stores written
     # before the field existed, and the budget side has NO heuristic at all —
     # elapsed time keeps growing after a manual pause, so "budget looks spent"
-    # cannot distinguish a pause from an expiry (GPT review on #2116: a
-    # budget raise must never resume a loop the user paused).
+    # cannot distinguish a pause from an expiry: a budget raise must never
+    # resume a loop the user paused.
     if not getattr(loop, "active", True):
         reason = str(getattr(loop, "stopped_reason", "") or "")
         stopped_at_cap = reason == "cycle_cap" or (
@@ -436,8 +655,8 @@ async def _monitor_update(state: Any, session_key: str, args: dict[str, Any]) ->
         # already merged -- the wasted fresh loop this branch exists to prevent.
         #
         # Expressed ONCE, as a term in the revival decision itself, rather than as a
-        # guard per branch: the notice next door lost this same precedence three
-        # times because each new bound was added ahead of it.
+        # guard per branch: a per-branch guard loses this precedence as soon as a
+        # new bound is added ahead of it.
         monitor = getattr(loop, "monitor", None)
         owed = str(getattr(monitor, "terminal_pending", "") or "") if monitor else ""
         terminal = reason == MONITOR_TERMINAL_REASON or bool(owed)
@@ -494,6 +713,26 @@ async def _monitor_update(state: Any, session_key: str, args: dict[str, Any]) ->
                 + (f" of {current_cap}" if current_cap else ", no cap")
                 + f"). monitor_update will not resume it as a side effect: {bound}."
             )
+    # CREW/MEMBER GATE for the legacy loop, the twin of the one
+    # ``authorize_and_update_monitor`` applies to a structured monitor. The
+    # legacy chokepoint ``authorize_and_update_nudge`` holds an opaque loop id
+    # and no session identity (its REST caller is user-token gated), so the mode
+    # rule has to be applied HERE, where the provenance lives: ``message`` is
+    # the instruction every future wake executes, and before this PR a
+    # crew/member slot could hold no loop at all, so a revision of one is a
+    # NEW surface. Only the session's own turn (``self_arm_ok``) may revise it;
+    # a cron injection, an app-driven turn or a sub-agent sharing the slot is
+    # refused with the same reason the arm path gives. Same predicate as the
+    # arm path (``is_self_arm``) so the two never drift apart. The mode is read
+    # off the live slot; a binding with no live slot has no mode to refuse on
+    # and keeps the pre-existing behaviour (the store's own miss handling).
+    if not is_channel_key(binding):
+        current = (getattr(state, "_slots", None) or {}).get(binding)
+        mode = str(getattr(current, "mode", ""))
+        if mode in _EXTERNAL_ARM_REFUSED_MODES and not is_self_arm(
+            binding, binding if self_arm_ok else ""
+        ):
+            raise _DirectiveDenied(f"Failed to update monitor loop: {external_arm_refusal(mode)}")
     _new_loop, error, _status = await authorize_and_update_nudge(
         svc=svc,
         loop_id=loop.id,
@@ -559,13 +798,24 @@ def _no_loop_message(svc: Any, binding: str) -> str:
     )
 
 
-async def _structured_monitor_update(state: Any, svc: Any, loop: Any, patch: dict[str, Any]) -> str:
+async def _structured_monitor_update(
+    state: Any,
+    svc: Any,
+    loop: Any,
+    patch: dict[str, Any],
+    *,
+    initiator: str = "",
+    producer_is_channel: bool = False,
+) -> str:
     from kiro_crew.autonudge_authz import authorize_and_update_monitor
+    from kiro_crew.dashboard.handlers.source_providers import ensure_gitlab_hosts_loaded
+    from kiro_crew.monitoring.models import MonitorCreationSurface
+    from kiro_crew.monitoring.targets import normalize_pull_request_target
 
     # ``banner`` is a message-loop-only field (a structured monitor shows its
     # objective as the transcript row), so it belongs with the legacy fields the
-    # structured path refuses. Without it here, ``monitor_update`` accepted a
-    # banner into the patch, dropped it, and reported success -- a silent no-op.
+    # structured path refuses. Without it here, ``monitor_update`` would accept a
+    # banner into the patch, drop it, and report success -- a silent no-op.
     legacy_only = sorted(set(patch) & {"message", "max_cycles", "active", "banner"})
     if legacy_only:
         raise _DirectiveDenied(
@@ -577,7 +827,18 @@ async def _structured_monitor_update(state: Any, svc: Any, loop: Any, patch: dic
         raise _DirectiveDenied("No structured monitor on this session to update.")
     structured: dict[str, Any] = {}
     if "target" in patch:
-        structured["target"] = str(patch["target"])
+        try:
+            gitlab_hosts = await ensure_gitlab_hosts_loaded()
+            target = normalize_pull_request_target(
+                monitor_state.kind,
+                str(patch["target"]),
+                gitlab_hosts=tuple(gitlab_hosts),
+            )
+            structured["target"] = target
+            if producer_is_channel and target != monitor_state.target:
+                structured["creation_surface"] = MonitorCreationSurface.CHANNEL
+        except ValueError as exc:
+            raise _DirectiveDenied(str(exc)) from exc
     if "objective" in patch:
         structured["objective"] = str(patch["objective"])
     if "idle_secs" in patch:
@@ -603,6 +864,10 @@ async def _structured_monitor_update(state: Any, svc: Any, loop: Any, patch: dic
         patch=structured,
         source="mcp-directive",
         caller="session-directive",
+        # The SESSION'S OWN binding, handed down by _monitor_update -- never the
+        # loop's key echoed back, which would make the self-arm test trivially
+        # true at this site. The authorizer compares it against the loop's slot.
+        initiator_slot_key=initiator,
     )
     if error is not None:
         raise _DirectiveDenied(f"Failed to update structured monitor: {error}")
@@ -623,36 +888,89 @@ def _structured_stop_reason(args: dict[str, Any]) -> str:
     )
 
 
-async def _monitor_stop(session_key: str, args: dict[str, Any]) -> str:
-    from kiro_crew.autonudge import get_instance, is_structured_monitor_loop
-    from kiro_crew.autonudge_authz import authorize_and_stop_monitor
+async def _stop_resolved_loop(
+    slot: Any, svc: Any, binding: str, loop: Any, args: dict[str, Any]
+) -> str:
+    """Stop the loop bound to this session, whatever shape it holds.
+
+    The single implementation shared by both stop entry points, so the two can
+    never route the same loop differently. Both ``autonudge_stop`` and
+    ``monitor_stop`` resolve the general binding, fetch the loop, and hand it
+    here; the shape test and the routing live in one place.
+
+    Routing is asymmetric because the data model is. A structured monitor goes
+    through ``authorize_and_stop_monitor``, which RETAINS a terminal record for
+    later inspection. A legacy loop has no such record: a research-owned slot is
+    deactivated with a tombstone reason a Research Lab consumer reads, and every
+    other legacy loop is REMOVED, leaving nothing behind. So a stop of a legacy
+    loop cannot be inspected afterward -- there is no stopped-loop record to
+    read, and ``monitor_inspect`` reports it as not armed. Callers that need a
+    retained terminal record must be watching a structured monitor.
+    """
+    from kiro_crew.autonudge import is_structured_monitor_loop
+
+    loop_id = loop.id
+    reason = _structured_stop_reason(args)
+    structured = is_structured_monitor_loop(loop)
+    if structured:
+        from kiro_crew.autonudge_authz import authorize_and_stop_monitor
+
+        _loop, error, _status = await authorize_and_stop_monitor(
+            svc=svc,
+            loop_id=loop_id,
+            session_key=loop.slot_key,
+            source="mcp-directive",
+            caller="session-directive",
+            user_reason=reason,
+        )
+        if error is not None:
+            raise _DirectiveDenied(f"Failed to stop structured monitor: {error}")
+        return (
+            f"Structured monitor {loop_id} stopped and retained for inspection"
+            + (f" (reason: {reason})" if reason else "")
+            + ". No further monitor wakes will fire."
+        )
+    # Research Lab consumes a persisted stop record to distinguish deliberate
+    # completion from unreachable-session cleanup. The canonical name is not
+    # ownership evidence: users may give an ordinary dashboard slot the same
+    # shape, while the slot's persisted app provenance cannot be user-selected.
+    # Ordinary dashboard/channel monitors have no tombstone consumer, so retain
+    # their historical removal behavior instead of leaving a paused loop. The
+    # SESSION'S binding names the slot, not the loop's own slot_key: they are the
+    # same for a bound loop, and the binding is the identity the ownership check
+    # reads.
+    if is_owned_research_slot(binding, str(getattr(slot, "_app", "") or "")):
+        await svc.update(loop_id, active=False, stopped_reason=AUTONUDGE_STOP_REASON)
+    else:
+        await svc.remove(loop_id)
+    return (
+        f"Auto-nudge loop {loop_id} stopped on this session"
+        + (f" (reason: {reason})" if reason else "")
+        + ". No further nudges will fire."
+    )
+
+
+async def _monitor_stop(slot: Any, session_key: str, args: dict[str, Any]) -> str:
+    from kiro_crew.autonudge import get_instance
 
     svc = get_instance()
     if svc is None:
         raise _DirectiveDenied("Monitor was not stopped: auto-nudge is disabled on this host.")
-    binding = _structured_binding(session_key)
+    # The GENERAL binding, so a legacy loop resolves here too. A stop that
+    # answered only for a structured monitor is a no-op on the loop shape most
+    # sessions actually run, and a session that armed a timer loop and called
+    # monitor_stop would believe it ended while it kept firing.
+    binding = _binding(session_key)
     if not binding:
         raise _DirectiveDenied("monitor_stop is not supported from this session type.")
     loop = svc.get_by_slot(binding)
-    if loop is None or not is_structured_monitor_loop(loop):
-        return "No structured monitor to stop on this session."
-    stopped, error, _status = await authorize_and_stop_monitor(
-        svc=svc,
-        loop_id=loop.id,
-        session_key=loop.slot_key,
-        source="mcp-directive",
-        caller="session-directive",
-        user_reason=_structured_stop_reason(args),
-    )
-    if error is not None:
-        raise _DirectiveDenied(f"Failed to stop structured monitor: {error}")
-    if stopped is None:
-        raise _DirectiveDenied("Failed to stop structured monitor: no monitor record was returned.")
-    return f"Structured monitor {stopped.id} stopped and retained for inspection."
+    if not loop:
+        return _no_loop_message(svc, binding)
+    return await _stop_resolved_loop(slot, svc, binding, loop, args)
 
 
 async def _autonudge_stop(slot: Any, session_key: str, args: dict[str, Any]) -> str:
-    from kiro_crew.autonudge import get_instance, is_structured_monitor_loop
+    from kiro_crew.autonudge import get_instance
 
     svc = get_instance()
     # "Nothing to stop" is an IDEMPOTENT success — the goal (no loop running on
@@ -668,36 +986,7 @@ async def _autonudge_stop(slot: Any, session_key: str, args: dict[str, Any]) -> 
     loop = svc.get_by_slot(binding)
     if not loop:
         return _no_loop_message(svc, binding)
-    loop_id = loop.id
-    reason = _structured_stop_reason(args)
-    # Research Lab consumes a persisted stop record to distinguish deliberate
-    # completion from unreachable-session cleanup. The canonical name is not
-    # ownership evidence: users may give an ordinary dashboard slot the same
-    # shape, while the slot's persisted app provenance cannot be user-selected.
-    # Ordinary dashboard/channel monitors have no tombstone consumer, so retain
-    # their historical removal behavior instead of leaving a paused loop.
-    if is_structured_monitor_loop(loop):
-        from kiro_crew.autonudge_authz import authorize_and_stop_monitor
-
-        _loop, error, _status = await authorize_and_stop_monitor(
-            svc=svc,
-            loop_id=loop_id,
-            session_key=loop.slot_key,
-            source="mcp-directive",
-            caller="autonudge-stop-compat",
-            user_reason=_structured_stop_reason(args),
-        )
-        if error is not None:
-            raise _DirectiveDenied(f"Failed to stop structured monitor: {error}")
-    elif is_owned_research_slot(binding, str(getattr(slot, "_app", "") or "")):
-        await svc.update(loop_id, active=False, stopped_reason=AUTONUDGE_STOP_REASON)
-    else:
-        await svc.remove(loop_id)
-    return (
-        f"Auto-nudge loop {loop_id} stopped on this session"
-        + (f" (reason: {reason})" if reason else "")
-        + ". No further nudges will fire."
-    )
+    return await _stop_resolved_loop(slot, svc, binding, loop, args)
 
 
 # ── slot-targeted effects (the dashboard-only pair + set_project) ────────────
@@ -743,7 +1032,7 @@ async def _set_project(state: Any, slot: Any, args: dict[str, Any]) -> str:
         raise _DirectiveDenied("Error: access denied (sensitive path).")
     if not is_dir:
         return f"Error: not a directory: {rp}"
-    # #7392 pre-flight, mirrored from the HTTP project endpoint: this directive
+    # Pre-flight, mirrored from the HTTP project endpoint: this directive
     # is the OTHER user/agent-driven moment of choice that sets slot.project
     # (set_project MCP routes here in-process, never through the endpoint), so
     # without this check the overlap refusal would still land at spawn time,
@@ -802,6 +1091,348 @@ async def _reset_conversation(slot: Any, session_key: str, args: dict[str, Any])
     )
 
 
+async def _apply_chat_tag(state: Any, slot: Any, session_key: str, args: dict[str, Any]) -> str:
+    """Apply a ``chat_tag`` directive to THIS turn's slot.
+
+    Mirrors the ``PUT /api/chat/slots/{slot}/tags`` write sequence
+    (chat_tags.api_chat_slot_tags): hold the tags write lock across
+    resolve→validate→assign→persist, read ``slot.tags`` FRESH inside the lock
+    (a concurrent folder/board edit landing mid-apply is the stale-read bug
+    class), and push a slots update after persisting.
+
+    Enforces the per-tag agent policy (chat_tags.agent_tag_policy). Named
+    refusals surface as the directive's result string: ``tag_policy_denied:<id>``
+    (not agent-writable for the requested op), ``tag_grants_unavailable:<id>``
+    (the grants store is unreadable, gone, or was quarantined this boot and the
+    tag has no row -- a store condition, not a human's reservation) and
+    ``unknown_tag:<id>``. A no-op
+    (the session already carries exactly the requested state/labels) is audited
+    as ``no_op`` but answers with the current tag list ("No change. ...") — the
+    documented READ path.
+    On success the result includes the session's RESULTING tag names — this is
+    also the agent's tag READ path.
+    """
+    from kiro_crew.dashboard.chat_persistence import save_slot_off_loop
+    from kiro_crew.dashboard.chat_tag_grants import has_grant_row, refresh_cache, store_degraded
+    from kiro_crew.dashboard.chat_tags import (
+        _bump_slot_tags_revision,
+        agent_tag_grant,
+        agent_tag_policy,
+        tags_write_lock,
+        validate_folder_tag_ids,
+    )
+
+    # Identity FIRST, before any suspension point: this directive was
+    # authorized against the conversation that produced it, and the grant
+    # refresh below is an await — a concurrent rebind landing inside it must
+    # not let the capture bind the REBOUND transcript, or the in-lock recheck
+    # compares the moved key against itself and passes.
+    from kiro_crew.dashboard.chat_utils import slot_history_key
+
+    authorized_history_key = slot_history_key(slot)
+
+    # Pull the grants store read+parse off the event loop ONCE; the sync
+    # resolutions below then serve from the installed in-memory snapshot
+    # (the resolver is cache-only and touches no filesystem per call). The
+    # full json read must not run on the gateway loop.
+    await asyncio.to_thread(refresh_cache)
+
+    # A refusal the store cannot vouch for is not a human's decision. When the
+    # snapshot is degraded (unreadable, gone, or quarantined this boot) and the
+    # tag has NO row, every store-derived refusal (policy, statusness,
+    # identity) names the store instead: the agent
+    # would otherwise report "human-reserved" for a tag nobody reserved, and
+    # the operator would debug a broken feature from gateway logs.
+    degraded = store_degraded()
+
+    def _store_refusal(code: str, tag_id: str) -> str:
+        if degraded and not has_grant_row(tag_id):
+            return f"Error: tag_grants_unavailable:{tag_id}"
+        return f"Error: {code}:{tag_id}"
+
+    def _policy_refusal(tag_id: str) -> str:
+        return _store_refusal("tag_policy_denied", tag_id)
+
+    set_state = str(args.get("set_state") or "").strip()
+    add_ids = [str(t) for t in (args.get("add") or [])]
+    remove_ids = [str(t) for t in (args.get("remove") or [])]
+
+    def _sel_self_tag(outcome: str, resources: str = "") -> None:
+        try:
+            from kiro_crew.sel import sel
+
+            sel().log_api_access(
+                caller="mcp-directive",
+                operation="chat.self_tag",
+                outcome=outcome,
+                source="mcp-directive",
+                resources=resources,
+            )
+        except Exception:
+            logger.debug("chat_tag SEL api_access audit failed", exc_info=True)
+
+    # Capture the transcript identity of the TURN's slot BEFORE any awaited
+    # work: this directive was authorized against the conversation that
+    # produced it, and a rebind landing while we wait on the tags lock (or
+    # during the persist) must not let the mutation follow the slot to a
+    # different transcript. Mirrors the locked_history_key discipline in the
+    # chat_handlers metadata endpoints. ``authorized_history_key`` was
+    # captured at FUNCTION ENTRY, before the grant-refresh await — capturing
+    # it here would already be past that suspension point.
+
+    async with tags_write_lock(state):
+        # The slot may have been rebound while we awaited the lock: the write
+        # below would target the NEW transcript while this directive's
+        # authorization names the old one. Refuse rather than follow.
+        if slot_history_key(slot) != authorized_history_key:
+            _sel_self_tag("denied", "session_rebound")
+            return "Error: session_rebound"
+        # Live vocabulary, resolved INSIDE the lock. Map lowercased id AND
+        # lowercased display name -> tag dict so requests resolve
+        # case-insensitively by either handle (maintainer audit ask from
+        # Closure guarantee: a user-created status tag has a uuid id, so
+        # name resolution is what keeps it reachable). Names are indexed
+        # first and ids second, so an id always wins a collision — ids are
+        # the authoritative handle.
+        vocab_by_lower: dict[str, dict[str, Any]] = {}
+        for t in state._tags:
+            tname = t.get("name")
+            if isinstance(tname, str) and tname.strip():
+                vocab_by_lower.setdefault(tname.lower(), t)
+        for t in state._tags:
+            tid = t.get("id")
+            if isinstance(tid, str):
+                vocab_by_lower[tid.lower()] = t
+
+        def _resolve(requested: str) -> dict[str, Any] | None:
+            return vocab_by_lower.get(requested.lower())
+
+        def _available() -> str:
+            names = [str(t.get("name") or t.get("id")) for t in state._tags if isinstance(t, dict)]
+            return ", ".join(n for n in names if n)
+
+        # Validate every requested id exists BEFORE any mutation, so a bad id in
+        # a multi-tag call changes nothing.
+        for requested in ([set_state] if set_state else []) + add_ids + remove_ids:
+            if _resolve(requested) is None:
+                _sel_self_tag("denied", requested)
+                return (
+                    f"Error: unknown_tag:{requested}. No tag named '{requested}' "
+                    f"found (case-insensitive, by id or name). "
+                    f"Available: {_available()}"
+                )
+
+        # Workflow-state tags are mutually exclusive, and `set_state` is the only
+        # verb carrying the peer-strip that upholds that invariant. A state id
+        # smuggled through `add` would append WITHOUT stripping peers, persisting
+        # two exclusive states — refuse and teach the boundary instead. Status-
+        # ness here (and at every authorization decision below) is the GRANT
+        # STORE's recorded bit, not the tag dict's own field: tags.json is
+        # agent-writable, so a forged ``status`` must not re-route which verbs
+        # apply or which peers get stripped.
+        for requested in add_ids:
+            if agent_tag_grant(_resolve(requested))[1]:  # type: ignore[arg-type]
+                _sel_self_tag("denied", requested)
+                return f"Error: status_tag_requires_set_state:{requested}"
+
+        # Policy: `add` needs add-only or add-remove; `remove` and the implicit
+        # removal inside `set_state` need add-remove.
+        for requested in add_ids:
+            policy = agent_tag_policy(_resolve(requested))  # type: ignore[arg-type]
+            if policy not in ("add-only", "add-remove"):
+                _sel_self_tag("denied", requested)
+                return _policy_refusal(str(requested))
+        for requested in remove_ids:
+            policy = agent_tag_policy(_resolve(requested))  # type: ignore[arg-type]
+            if policy != "add-remove":
+                _sel_self_tag("denied", requested)
+                return _policy_refusal(str(requested))
+        if set_state:
+            state_tag = _resolve(set_state)
+            # Pre-validation above guarantees every requested id resolves;
+            # narrow explicitly for the type checker.
+            assert state_tag is not None
+            # `set_state` is the workflow-state verb: the requested tag must BE
+            # a workflow state, or the peer-strip below would strip real states
+            # in exchange for a plain label. One store read answers both the
+            # status question and the policy question so the two cannot be
+            # satisfied by different sources.
+            state_policy, state_is_status = agent_tag_grant(state_tag)
+            if not state_is_status:
+                _sel_self_tag("denied", set_state)
+                return _store_refusal("not_a_status_tag", str(set_state))
+            if state_policy != "add-remove":
+                _sel_self_tag("denied", set_state)
+                return _policy_refusal(str(set_state))
+            state_canonical_id = str(state_tag["id"])
+            # `set_state=X, remove=[X]` in one call would add X then remove it,
+            # leaving the session with NO workflow state — the exact outcome
+            # set_state exists to prevent. Refuse the contradictory call.
+            for requested in remove_ids:
+                if _resolve(requested)["id"] == state_canonical_id:  # type: ignore[index]
+                    _sel_self_tag("denied", requested)
+                    return f"Error: set_state_conflicts_with_remove:{state_canonical_id}"
+
+        # FRESH read of the slot's current tags inside the lock.
+        current: list[str] = list(getattr(slot, "tags", None) or [])
+        new_tags: list[str] = list(current)
+
+        def _add(canonical_id: str) -> None:
+            if canonical_id not in new_tags:
+                new_tags.append(canonical_id)
+
+        def _remove(canonical_id: str) -> None:
+            if canonical_id in new_tags:
+                new_tags.remove(canonical_id)
+
+        if set_state:
+            state_id = _resolve(set_state)["id"]  # type: ignore[index]
+            # Mutual exclusivity: strip every OTHER workflow-state tag (any tag
+            # carrying status: True), keyed on the LIVE vocabulary rather than a
+            # hardcoded id list, then add the requested one. A removed peer that
+            # is human-only must NOT be silently stripped — refuse instead.
+            for existing in list(new_tags):
+                et = _resolve(existing)
+                if et is None:
+                    continue
+                et_policy, et_is_status = agent_tag_grant(et)
+                if (
+                    not et_is_status
+                    and et.get("status") is True
+                    and not has_grant_row(str(et["id"]))
+                ):
+                    # The vocabulary calls this tag a workflow state but the
+                    # protected store holds NO row for it (an upgraded install's
+                    # custom status tag, or a tag caught between a revoke and
+                    # its re-mint). Its identity is UNKNOWN, not "non-status":
+                    # treating it as a plain label would leave two exclusive
+                    # states on the session. The vocabulary bit is agent-writable
+                    # and grants nothing here — it is only ever a reason to
+                    # REFUSE. Recovery is one authenticated PATCH with an
+                    # explicit ``status``.
+                    _sel_self_tag("denied", et["id"])
+                    return _store_refusal("status_identity_unprotected", str(et["id"]))
+                if et_is_status and et["id"] != state_id:
+                    if et_policy != "add-remove":
+                        _sel_self_tag("denied", et["id"])
+                        return _policy_refusal(str(et["id"]))
+                    _remove(et["id"])
+            _add(state_id)
+
+        for requested in add_ids:
+            _add(_resolve(requested)["id"])  # type: ignore[index]
+        for requested in remove_ids:
+            _remove(_resolve(requested)["id"])  # type: ignore[index]
+
+        if new_tags == current:
+            # The documented READ path: a no-op change is how a caller asks
+            # for its current tags, so answer with them instead of a bare
+            # error (the doc promises this and the code once
+            # returned "Error: no_op" without the list). Still audited as
+            # no mutation.
+            _sel_self_tag("denied", "no_op")
+            # String ids only: a malformed (e.g. list-valued) ``id`` loaded
+            # from tags.json is unhashable and would raise here; such entries resolve via the ``tid`` fallback instead.
+            name_by_id = {
+                t.get("id"): (t.get("name") or t.get("id"))
+                for t in state._tags
+                if isinstance(t.get("id"), str)
+            }
+            names = [str(name_by_id.get(tid, tid)) for tid in current]
+            shown = ", ".join(names) if names else "(none)"
+            return f"No change. This session currently carries: {shown}."
+
+        # Pin the persist to the transcript captured at TURN ENTRY (before the
+        # lock wait): a slot rebind landing during the awaited save would
+        # otherwise deliver this agent's tag mutation to a conversation it
+        # never touched. On a refused save, roll the in-memory slot back and
+        # mark it dirty so the periodic flush reconverges the durable record
+        # to the (restored) live state.
+        prior_tags = list(current)
+        applied_tags = validate_folder_tag_ids(new_tags, state)
+        slot.tags = applied_tags
+        # Rotate the revision WITH the mutation: the board's PUT is a
+        # compare-and-swap on ``tags_revision``, so a human editing the same
+        # session from base R must see this change as a conflict, not
+        # overwrite it. Same helper, same discipline as the human path.
+        written_tags_revision = _bump_slot_tags_revision(slot)
+        applied = await save_slot_off_loop(
+            state, slot, force=True, expected_history_key=authorized_history_key
+        )
+        if not applied:
+            # A refused pin-save means the slot REBOUND (that is the only
+            # refusal condition), so nothing was committed and the original
+            # transcript on disk is untouched — no reconvergence is owed.
+            # Roll memory back, but do NOT mark the rebound slot dirty: a
+            # dirty flush would persist this memory onto the DIFFERENT
+            # transcript the slot now points at — the same
+            # rebound-slot-marked-dirty leak this module closes elsewhere.
+            # Only while the slot still holds THIS mutation's value: the save
+            # awaited, and a newer concurrent write must not be erased.
+            if slot.tags == applied_tags and slot.tags_revision == written_tags_revision:
+                slot.tags = prior_tags
+                # A fresh revision, not the prior one: a client that adopted
+                # the provisional revision from a broadcast treats the prior
+                # as a known predecessor and would keep the rejected tags.
+                _bump_slot_tags_revision(slot)
+            _sel_self_tag("denied", "session_rebound")
+            return "Error: session_rebound"
+
+        # Live-alias overwrite hazard: a SECOND live slot bound to
+        # the same transcript still holds the pre-update tags in memory, and
+        # its next dirty flush would persist those stale tags over the update
+        # we just committed. Mirror the applied tags onto every live alias
+        # inside this same lock, so any later flush of an alias writes the
+        # same (current) state instead of losing it.
+        #
+        # Convergence-by-flusher: each mirrored alias is ALSO marked dirty, and so is the
+        # requester. Durable reconvergence rides the periodic flusher acting
+        # on correct-memory slots instead of a synchronous re-save racing to
+        # be the last writer — a synchronous re-save adds an await for the
+        # next interleaving to exploit. The
+        # requester's dirty mark covers the single-slot case (no aliases to
+        # reconverge from); a rebound alias cannot leak these tags to a
+        # foreign transcript because every flush save is pinned by the slot's
+        # own live history key. Residual, stated: a queued stale flush that
+        # lands after the pinned commit leaves the DISK stale until the next
+        # periodic flush — bounded, self-healing, and the committed state was
+        # already durably written once by the pin-save above.
+        for other in state._slots.values():
+            if other is slot:
+                continue
+            try:
+                if slot_history_key(other) == authorized_history_key:
+                    other.tags = list(slot.tags)
+                    # The revision travels with the tags: a board edit on the
+                    # alias compares against the same base the requester now
+                    # carries, and a later alias flush persists a matching pair.
+                    other.tags_revision = slot.tags_revision
+                    other._dirty = True
+            except Exception:
+                logger.warning("chat_tag alias tag mirror failed", exc_info=True)
+        try:
+            slot._dirty = True
+        except Exception:
+            logger.debug("chat_tag requester dirty-mark failed", exc_info=True)
+
+    _push(state)
+    _sel_self_tag("allowed", ",".join(slot.tags))
+
+    # Resulting tag NAMES for the model (the READ path). Fall back to ids for
+    # any tag whose vocabulary entry lacks a name. String ids only: a
+    # malformed (e.g. list-valued) ``id`` loaded from tags.json is unhashable
+    # and would raise here AFTER the mutation committed, reporting failure on
+    # a persisted change.
+    name_by_id = {
+        t.get("id"): (t.get("name") or t.get("id"))
+        for t in state._tags
+        if isinstance(t.get("id"), str)
+    }
+    names = [str(name_by_id.get(tid, tid)) for tid in slot.tags]
+    shown = ", ".join(names) if names else "(none)"
+    return f"Board tags updated. This session now carries: {shown}."
+
+
 async def _suggest_followup(state: Any, slot: Any, args: dict[str, Any]) -> str:
     from kiro_crew.dashboard.chat_handlers import _redact_followup_item
 
@@ -849,7 +1480,7 @@ async def _ask_question(state: Any, slot: Any, args: dict[str, Any]) -> str:
             "ask in plain text and end your turn instead."
         )
     return (
-        "Question card shown in this session. End your turn now — the user's "
+        f"{QUESTION_CARD_SHOWN_PREFIX} End your turn now — the user's "
         "answer will arrive as your next message; do not re-ask or guess."
     )
 

@@ -50,7 +50,11 @@ NOT seed a first message: that would be delivery.
 `session_create` also takes an optional `folder` — a folder id or `/`-separated
 human path, resolved with `chat_folder_create`'s `parent` semantics (missing
 segments created, behind the same tree-shaping gate) — and files the slot as
-part of creation (#6118). Filing used to be a second call
+part of creation (#6118). The caller's OWN slot is filed the same way with
+`chat_folder_file_self` (folder tools, same server): it takes no `session`
+argument, resolves the target from the verified caller key, and so can be
+granted where `chat_folder_move_session` is withheld — a conductor files itself
+in the goal's folder and then creates its workers under `<goal>/<agent>`. Filing used to be a second call
 (`chat_folder_move_session`), and the window between the two was a real defect
 path: a folder deleted in between left the session unfiled with the create
 already done. The handler assigns `folder_id` inside the same synchronous window
@@ -73,7 +77,19 @@ Creation copies two different kinds of state, and the split is deliberate.
 boundary; a child left in `default` would be both a boundary crossing and
 unaddressable by its own creator), inherits the caller's agent when none is
 named, takes that workspace's project directory as its cwd, and is attributed to
-the caller via `created_by` so the per-creator slot ceiling is countable.
+the caller via `created_by` so the per-creator slot ceiling is countable. The
+caller's ACP session id is also frozen onto the child at this mint
+(`_created_by_sid`), from the live caller handle, so the child's `session/opened`
+lineage cites the creator that was live when it was made rather than a
+replacement that may take the creator's slot before the child's first turn. The
+id is backend-authored, so it is bounded where it is retained: one past
+`MAX_ACP_SESSION_ID_LEN` (`kiro_crew/validation.py`, the constant every store of a
+backend session id shares) is dropped at mint, never truncated -- the sid
+is optional and absent is a legal record. The mint also sets `_lineage_minted`, the
+in-memory witness that THIS process stamped both fields; neither the witness nor
+the sid is written to the transcript, which an agent's file tools can edit, so a
+metadata edit cannot forge the gateway-authored lineage the fenced crew log
+records (see `crew-log-emitter.md`).
 
 **Approval posture** — the caller's `_trust` and `_trust_reads` transfer, so a
 trusted operator's dispatched worker does not stall on a prompt nobody is
@@ -95,9 +111,9 @@ Two grants are excluded, and the exclusions are load-bearing:
 
 The posture that transfers is the one held at **allocation**, read off the
 re-resolved caller in the synchronous window after the last gate — not the one
-read on entry. Creation suspends three times before the slot exists (project
-directory, config load, folder confirmation), and an operator selecting `normal`
-in any of those windows would otherwise have a revoked posture resurrected by a
+read on entry. Creation awaits project and agent resolution, private-memory
+delegation validation and optional folder confirmation before the slot exists.
+An operator selecting `normal` in any of those windows would otherwise have a revoked posture resurrected by a
 create already in flight. Revoking mid-call yields an untrusted child.
 
 Nothing about trust is persisted at birth. The birth metadata carries
@@ -141,7 +157,7 @@ that is out of bounds is visible after the fact even though nothing happened.
 
 | Refusal | Status | Why |
 |---------|--------|-----|
-| Config switch off (`agent.session_control` explicitly `false`) | 403 | Operator withdrew the capability from every agent at once. Defaults to true — the agent's `kirocrew-dashboard` mount is the grant. **Exception:** a crew-member DM slot (`member-*` caller key) bypasses this switch — see "Member callers" below |
+| Config switch off (`agent.session_control` explicitly `false`) | 403 | Operator withdrew the capability from every agent at once. Defaults to true — the agent's `kirocrew-dashboard` mount is the grant. **Exception:** a crew-member DM slot (`member-*` caller key) bypasses this switch while `agent.member_dispatch` is true (its default) — see "Member callers" below |
 | Caller session cannot be identified | 403 | An unidentifiable caller makes the self-target guard blind |
 | Caller is an unattended session (`workflow-*`) | 403 | A `workflow-<run_id>` slot exists only once its originating tab is gone, so there is no owning session to fence it to. **Exception:** a cron slot (`cron-*` caller key) is admitted and fenced by creator ownership instead — see "Cron callers" below |
 | Caller is itself incognito, temporary, or app-scoped | 403 | Caller-side isolation — the direction the target-side checks cannot see |
@@ -150,13 +166,14 @@ that is out of bounds is visible after the fact even though nothing happened.
 | Caller's own session is no longer open | 403 | Nothing to attribute the operation to |
 | Caller changed workspace while a creation was in flight | 403 | Creation resolves the workspace's project directory off-loop, so it suspends between authorizing the caller and allocating the slot. Both decisions that read the caller's workspace -- the memory boundary the child inherits, and whether the answering agent is bound to that workspace -- are invalidated by a move, and re-deciding the binding here is not available: it needs a config load, which must not run on the event loop |
 | Named agent does not resolve to a configured one | 403 | The resolver falls back to the default agent, which passes the workspace check because it is the caller's own default -- so no boundary is crossed, but the created session would store and advertise a name that is not what answers. `ResolvedBindings.requested_resolved` states that contract for callers that store the requested name. Refused rather than rewritten to the effective agent: nothing exists yet, so a corrected name costs one retry, whereas an existing slot keeps its stored name verbatim so a momentarily stale resolution cannot permanently rebind it |
+| Private caller selects another memory store, or its protected identity is unreadable | 403 | `memory_delegation_denied`; creation checks the canonical caller identity with `require_memory_delegation` before slot allocation or protected child binding. Same-store workers remain allowed; Global callers retain member assignment |
+| Caller changes history key, agent or memory store during creation | 400 | `caller_memory_changed`; the live caller must still match the identity checked before awaited preparation |
 | Target is the caller | 403 | A session controlling itself has no exit |
 | Target is unattended (`cron-*`, `workflow-*`) | 403 | A `workflow-<run_id>` slot is display-only and a cron's turns are driven by a schedule. Not exempted for a cron CALLER: a cron may create and drive its own children, never another job's tab |
 | Target is incognito or temporary | 403 | Never addressable, matching `list_sessions` |
 | Target is app-scoped | 403 | App sessions are the app's, not a peer's |
 | Target is channel-linked (`linked_session_key` set) | 403 | Its conversation is mirrored to Slack/Telegram, so reaching it crosses a surface boundary both ways — and its stop cannot be honoured, because the stop path addresses `dashboard:<slot>` while a linked slot's turns run under its linked key |
 | Target or caller has an outbound channel mirror (`get_mirror_link`) | 403 | The same boundary reached by the other mechanism. `linked_session_key` marks a channel-BORN slot; a dashboard-born slot given a mirror link republishes its turns to a channel just as surely, and the link lives in the session store rather than on the slot, so the slot-side check reads empty on exactly the session that mirrors |
-| Target is a crew-mode session (`mode == "crew"`) | 403 | A crew session's turn lifecycle is not the dashboard's: `/api/chat` routes its input to `state.crew.ingest`, which makes a durable queue entry and fans it out to topic sub-sessions. Refused rather than emulated — a target whose lifecycle differs needs its own handling, not a second copy of the orchestrator's rules |
 | Target is in another workspace | 403 | Workspaces are the memory boundary |
 | Target names no open session | 404 | A mistake, not an authorization failure |
 | Title matches more than one session | 409 | Guessing means acting on the wrong conversation |
@@ -171,8 +188,15 @@ operator configuration. Two rules give it that shape:
 - **The `agent.session_control` switch does not gate a member caller.** Members
   work out of the box — this is the zero-configuration contract, and it is a
   deliberate trade-off: an operator who turned session control off has NOT
-  thereby disabled member dispatch. There is currently no separate switch for
-  it; disabling a member disables its dispatch.
+  thereby disabled member dispatch. The operator ceiling on that bypass is
+  `agent.member_dispatch` (bool, default **true**). Left at its default it
+  reproduces this exactly — the member bypasses the switch. Set to `false`, a
+  member caller stops bypassing and falls back under `agent.session_control`
+  like any ordinary caller, so an operator who withdrew session control can
+  keep member DM threads chat-only without disabling the member itself. The
+  ceiling is read at the switch gate (`member_dispatch_enabled()`) and, like
+  the switch, **fails closed** — an unreadable config withdraws the bypass
+  rather than granting it.
 - **A member caller may only act on sessions it created.** Slot creation records
   `created_by` (the creator's caller key) in the slot's birth metadata; it is
   persisted with the session and rehydrated on restart (both restore paths).
@@ -183,6 +207,79 @@ operator configuration. Two rules give it that shape:
   to member callers unchanged.
 
 Ordinary (non-member) callers are untouched: they still require the switch.
+
+#### The strict-internal surface admits a member DM slot, not any private caller
+
+The five routes sit behind `_require_internal`, which first refuses anything
+without a valid `X-Internal-Secret`, and then — on the authenticated branch —
+runs one private-member gate (`_private_caller_refusal`). That gate resolves the
+caller's private authority ONCE (`internal_memory_scope`) and decides:
+
+- an **owner / Global-V1 caller** (no private scope) falls through to the handler,
+  exactly as the surface behaved before member dispatch existed;
+- a **crew-member DM slot** (a `member-*` session key) is ADMITTED while the
+  surface is reachable for it — `agent.member_dispatch` OR the global
+  `agent.session_control` switch — so its request reaches `session_control.py`
+  where the creator-ownership fence above does the real gating;
+- **every other verified private V2 caller** — an ordinary private member, or a
+  member while BOTH switches are off — keeps the `member_scope_denied` 403;
+- an **unverifiable caller** keeps the `member_session_unverified` 403.
+
+The gate reads the SAME two switches the switch gate does — `member_dispatch` is
+a bypass ON TOP of `session_control`, not a replacement, so a member with
+`member_dispatch` off falls back UNDER the global switch rather than out of a
+surface the operator left open to everyone. Both reads fail closed on an
+unreadable config, so the surface can never open wider than the two switches
+behind it. This gate replaced a blanket refusal that returned `member_scope_denied`
+to every verified V2 caller — which made the member operating model unreachable
+even though `session_control.py` already carried the member fence. The refusal for
+a non-member private caller is unchanged; only the member DM slot's admission is
+new.
+
+#### A member-created worker stays inside its own private memory
+
+Two guards in `create_session` keep a member's dispatch from laundering work out
+of its private store:
+
+- **`require_memory_delegation`** runs before the slot is minted. A workspace is
+  not a memory silo — it can host agents bound to different stores — so a private
+  V2 member could otherwise resolve an agent bound to `default`/global or a peer's
+  store. The guard (the one the private spawn path uses) is a no-op for a caller
+  with no private record and a refusal of any target store that is not the private
+  V2 caller's own; the refusal, and a corrupt/unreadable binding file, both map to
+  the `memory_delegation_denied` 403 rather than an unhandled 500. A 403, not a
+  validation 4xx: the store is a legal name and the request is well formed, so the
+  answer is "you may not delegate there", and the refusal carries a FIXED message
+  with `from None` — the guard reads binding files, so its own text can name one.
+- **The caller's protected record** is read to decide whether the child may
+  inherit private authority, and it is read under the caller's CANONICAL history
+  key. `caller_session_key` arrives as any of three spellings of the same session
+  (canonical key, slot key, transcript stem) while the protected read recognizes
+  only the canonical one, so keying it on the raw argument makes the caller's own
+  authority depend on the spelling it chose — the slot and stem forms read back as
+  unbound. For an authorization input that is a bypass, not a lenient read.
+- **The child's private binding** is written before the slot's birth metadata or
+  broadcast, using the child's effective session key — the key the turn path's
+  `_bind_private_slot_memory` reads. Without it a member's worker cannot take its
+  first turn. A version-read or binding-write failure retracts an idle, empty child
+  and reports `agent_store_mismatch`; cancellation retracts the same way and
+  propagates. Work already running is never orphaned by retraction.
+- **The birth-time pin is fenced to the authorized store.**
+  `_pin_private_agent_assignment` derives the store to pin from the SELECTED
+  AGENT's config entry, which is a different value from the
+  `bindings.memory_store_name` the delegation guard checked. `create_session`
+  therefore passes that authorized store down, and the pin writes nothing when the
+  two disagree — otherwise the guard clears one store and the pin binds another,
+  leaving a session running on private memory its own `slot.memory_store` does not
+  name. The owner's own agent picks pass no authorized store, because there the
+  pick IS the authority.
+
+  An unbound/global caller keeps ordinary creation behavior and gains nothing: its
+  own protected record is untouched. Its child, however, IS bound — to the selected
+  member's own store, the store the guard authorized. Leaving that child unbound
+  while `slot.memory_store` names a V2 store is not the safe reading: the turn path
+  raises `memory_unavailable` on exactly that pair, so the session could never take
+  a turn.
 
 ### The fence propagates to what a fenced caller creates
 
@@ -202,6 +299,14 @@ chain whose middle slot has been closed cannot fail open because no chain is
 walked. A person's own tab and a fork reach `get_or_create_slot` directly and stay
 unattributed, so ordinary human use is unaffected.
 
+The same attribution is the one lineage fact the child's append-only crew log
+records: its `session/opened` carries `parent {slot, sid?}` -- `_created_by` as the
+slot, and `_created_by_sid`, the creator's ACP session id frozen at mint from the
+live caller handle -- but only while the slot carries the in-memory mint witness
+(`_lineage_minted`); the `created_by` restored from transcript metadata after a
+restart serves this fence and never the crew log (see `crew-log-emitter.md`). The
+fence above reads the slot; a fold that builds the tree of sessions reads the crew log.
+
 There is deliberately NO attendance exemption. `_ChatSlot._human_seen` looks like
 the right hatch and is not: it records that a human has EVER driven the slot, is
 monotonic and persisted, and says nothing about who authored the turn running now.
@@ -216,7 +321,11 @@ tool set, mounted **per session** rather than through the on-disk agent
 template: a member DM session's ACP `session/new` **and `session/load`** carry
 the dashboard server as a session-level `mcpServers` entry (built by
 `members.member_dispatch_session_server`, identity via `KIROCREW_SESSION_KEY`
-in the entry's env) — both establishment paths, because `session/load`
+in the entry's env, plus `KIROCREW_BOUND_PORT` — the entry's env is built from
+scratch rather than inherited, and a child left to rediscover the port falls
+through to the run-marker check, which needs an `lsof` view the sandbox's user
+namespace does not have, so a gateway on any non-default port would be dialled
+at the default one) — both establishment paths, because `session/load`
 re-initializes the session's MCP servers, so a resume that skipped the
 injection would strip a member thread of its tools mid-conversation. On the
 KAS backend the wire agent projection additionally grants the server in
@@ -231,16 +340,28 @@ default backend, so a warm hit would skip both the member backend route and
 the mount. The member backend is `agent.member_acp_backend` (default `kas`),
 and requires a wire-capable backend (`ACP_BACKENDS_MEMBER_DISPATCH`: the
 claude seam and KAS); kiro-cli v2 reads its template from disk and exposes no
-per-session channel, so a member session on it runs as plain chat — the tools
-are simply not mounted, never mounted-and-refused. Because the mount is
+per-session channel, so a member session on it runs as plain chat — the
+tools are simply not mounted, never mounted-and-refused. Codex is excluded by a
+scope decision rather than a capability gap: it HAS the per-session mount
+(`providers/mirrors/codex.py`), and its precondition needs no gate of its own —
+`tool_gate.is_enforced` is true for codex because its routing is
+`SESSION_CONFIG`, the one member of `ENFORCED_ROUTINGS`, so
+`_apply_session_permission_routing` refuses the session outright when
+`mode=read-only` cannot be armed. Claude's routing is `SEEDED_SETTINGS`, which
+this core declares and does not enforce, which is why claude must instead OWN
+the `settings.local.json` that decides whether a call asks
+(`_claude_settings_authored`). Mounting session control into a codex DM thread
+is a separate capability and needs its own decision. Because the mount is
 session-scoped, no other session on the same agent template gains the tools,
 preserving the two-part grant for ordinary agents (the switch AND the
 per-agent server assignment).
 
 ### Cron callers: unattended admission, bounded by the same fence
 
-A cron job's own slot (`cron-<job_id>`, minted by
-`inject_cron_result_to_dashboard`) is admitted to the surface even though nobody
+A cron job's own slot (`cron-<job_id>`, minted at run start by
+`ensure_cron_slot` so identity exists while the turn runs — with
+`inject_cron_result_to_dashboard` as the idempotent delivery-time fallback
+creator, #8336) is admitted to the surface even though nobody
 is watching it, so a scheduled run can enumerate work and dispatch a session per
 item. Three refusals had to move for that, and one deliberately did not:
 
@@ -545,11 +666,36 @@ loop runs with nobody at the keyboard and must not block on an approval no one i
 there to give. An operator who wants folder tools without session control names the
 folder tools individually.
 
+`agent.member_dispatch` (bool, default **true**). The operator ceiling on the
+member switch bypass described under "Member callers". At its default a member DM
+caller bypasses `agent.session_control` — the zero-configuration contract, and
+today's behaviour, so installing this key changes nothing until it is set. Set it
+`false` and a member caller stops bypassing: it falls back under
+`agent.session_control` like any ordinary caller, which lets an operator who
+withdrew session control keep member DM threads chat-only without disabling the
+member. Read at the switch gate via `member_dispatch_enabled()`, and **fails
+closed** everywhere it can go wrong. (1) An unreadable config withdraws the member
+bypass (`member_dispatch_enabled()` returns false on a raising read). (2) A config
+that loads but *discarded the `agent` section* (or the whole file) also withdraws
+it: `load()` does not raise on a malformed section — it drops the section and
+falls back to the permissive `member_dispatch=True` default, recording the loss in
+`degraded_sections`, so `member_dispatch_enabled()` returns false when
+`degraded_sections` names `agent` or the whole-config marker `*`, the same
+"could not read it" vs "was never set" distinction `tailnet_identity_unknown` and
+the publish gate draw. (3) At load time a *missing* key defaults to true (today's
+behaviour) while any *present but malformed* value — including a quoted `"false"`,
+a routine operator quoting mistake — coerces to false BEFORE schema validation, so
+a botched opt-out withdraws the bypass rather than silently leaving it on. This is
+a config-level ceiling, not an enterprise `SCOPE_CATALOG` scope: `session_control`
+itself is a plain `agent.*` bool with no catalog entry, and a scope would need a
+new governance enforcement seam rather than a data-only append, so it is left to a
+follow-up.
+
 ## What is deliberately not here
 
 - **No delivery to a target outside the addressable set.** `session_send` writes
   into another session's conversation, but only one the same `authorize_target`
-  guard admits: a channel-linked, channel-mirrored, crew-mode, incognito,
+  guard admits: a channel-linked, channel-mirrored, incognito,
   app-scoped, unattended or cross-workspace target is refused, so the verb cannot
   reach a conversation other people are party to. The residual is the queued arm's
   second authorization moment, recorded above and tracked as #5911.

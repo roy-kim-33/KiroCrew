@@ -31,6 +31,14 @@ vi.mock('../components/settingRef/useConfigSchema', () => ({
   useConfigSchema: () => schemaMock(),
 }))
 
+// The card under the switch is a sentinel: its own behaviour (status query,
+// chooser, sign-out) is pinned in KiroSignInCard.test.tsx, and the real card
+// would need the kas-login API this file does not mock. Unlike the real card it
+// renders unconditionally, so its absence below can only be the tab's gate.
+vi.mock('../pages/developer/KiroSignInCard', () => ({
+  KiroSignInCard: () => <div data-testid="kiro-sign-in-card" />,
+}))
+
 import { AgentBackendTab } from '../pages/developer/AgentBackendTab'
 
 /** A schema map advertising exactly `values` for the backend field. */
@@ -43,7 +51,17 @@ function schemaWith(values: string[] | undefined) {
  * One `GET /api/acp-backends` row, defaulted to the uninteresting answer
  * (selectable and installed) so each test states only the field it is about.
  */
-function probeRow(id: string, over: Partial<{ selectable: boolean; installed: string; missing_components: string[]; install_command: string; restart_required: boolean }> = {}) {
+function probeRow(
+  id: string,
+  over: Partial<{
+    selectable: boolean
+    installed: string
+    missing_components: string[]
+    install_command: string
+    restart_required: boolean
+    auth: { sign_in_remedy: string; signs_in_separately: boolean }
+  }> = {},
+) {
   return {
     id,
     policy_id: id || 'kiro',
@@ -52,22 +70,30 @@ function probeRow(id: string, over: Partial<{ selectable: boolean; installed: st
     missing_components: [],
     install_command: '',
     restart_required: false,
+    // No `auth` by default: an older gateway sends none, so the uninteresting row
+    // is the one that carries no auth object at all.
     ...over,
   }
 }
 
-function wrap() {
+function wrapWithClient() {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
   render(
     <QueryClientProvider client={qc}>
       <AgentBackendTab />
     </QueryClientProvider>,
   )
+  return { qc }
+}
+
+function wrap() {
+  wrapWithClient()
 }
 
 const button = (name: string) => screen.getByRole('button', { name })
 
 beforeEach(() => {
+  localStorage.clear()
   patchConfigMock.mockClear()
   patchConfigMock.mockResolvedValue({})
   kirocrewConfigMock.mockClear()
@@ -132,6 +158,57 @@ describe('AgentBackendTab', () => {
     wrap()
     fireEvent.click(await screen.findByRole('button', { name: 'KAS (kiro-agent)' }))
     await waitFor(() => expect(patchConfigMock).toHaveBeenCalledWith('agent.acp_backend', 'kas'))
+  })
+
+  it('re-clicking the already-selected backend saves nothing and leaves the model list alone', async () => {
+    // The chip group fires onChange for the pressed option as well, and a PATCH
+    // writing the current value would still succeed -- which would reset the
+    // model list and spawn `--list-models` for a backend that never changed.
+    localStorage.setItem('kc.acp.models.v1', JSON.stringify({ ts: Date.now(), models: [{ name: 'auto', description: '' }] }))
+    const { qc } = wrapWithClient()
+    qc.setQueryData(['available-models', 'acp'], [{ name: 'auto' }, { name: 'kiro-model' }])
+    const reset = vi.spyOn(qc, 'resetQueries')
+    fireEvent.click(await screen.findByRole('button', { name: 'Kiro CLI' }))
+    await waitFor(() => expect(button('Kiro CLI')).toHaveAttribute('aria-pressed', 'true'))
+    expect(patchConfigMock).not.toHaveBeenCalled()
+    expect(reset).not.toHaveBeenCalled()
+    expect(qc.getQueryData(['available-models', 'acp'])).toHaveLength(2)
+    expect(localStorage.getItem('kc.acp.models.v1')).not.toBeNull()
+  })
+
+  it('resets the model list and drops its localStorage cache after a switch', async () => {
+    // The picker's list belongs to the OLD backend until something re-asks
+    // `/api/models`, and nothing but a session spawn does -- so without this the
+    // list only changed after a gateway restart. RESET, not invalidate: the old
+    // rows must leave the screen before the refetch lands, or a pick during a
+    // slow `--list-models` spawn writes an id the new backend rejects. The cache
+    // drop keeps a failing first fetch from serving the old backend's ids.
+    localStorage.setItem('kc.acp.models.v1', JSON.stringify({ ts: Date.now(), models: [{ name: 'auto', description: '' }] }))
+    const { qc } = wrapWithClient()
+    qc.setQueryData(['available-models', 'acp'], [{ name: 'auto' }, { name: 'old-backend-model' }])
+    const reset = vi.spyOn(qc, 'resetQueries')
+    fireEvent.click(await screen.findByRole('button', { name: 'KAS (kiro-agent)' }))
+    await waitFor(() => expect(patchConfigMock).toHaveBeenCalledWith('agent.acp_backend', 'kas'))
+    await waitFor(() => expect(reset).toHaveBeenCalledWith({ queryKey: ['available-models'] }))
+    // The old rows are gone the moment the switch saves, not after a refetch.
+    expect(qc.getQueryData(['available-models', 'acp'])).toBeUndefined()
+    expect(localStorage.getItem('kc.acp.models.v1')).toBeNull()
+  })
+
+  it('leaves the model list alone when the save is rejected', async () => {
+    // A refused PATCH means the backend did NOT change; refetching would spawn
+    // `--list-models` for nothing, and dropping the cache would throw away a
+    // list that is still correct.
+    patchConfigMock.mockRejectedValueOnce(new Error('403'))
+    localStorage.setItem('kc.acp.models.v1', JSON.stringify({ ts: Date.now(), models: [{ name: 'auto', description: '' }] }))
+    const { qc } = wrapWithClient()
+    qc.setQueryData(['available-models', 'acp'], [{ name: 'auto' }, { name: 'still-valid-model' }])
+    const reset = vi.spyOn(qc, 'resetQueries')
+    fireEvent.click(await screen.findByRole('button', { name: 'KAS (kiro-agent)' }))
+    await screen.findByText('Could not save the agent backend.')
+    expect(reset).not.toHaveBeenCalled()
+    expect(qc.getQueryData(['available-models', 'acp'])).toHaveLength(2)
+    expect(localStorage.getItem('kc.acp.models.v1')).not.toBeNull()
   })
 
   it('hides a backend the deployment may not select, rather than dimming it', async () => {
@@ -556,6 +633,31 @@ describe('AgentBackendTab', () => {
     expect(screen.getAllByText(/normally asks before it acts/)).toHaveLength(1)
   })
 
+  it('states BOTH the gating caveat and the sign-in remedy on a harness that has both', async () => {
+    // Claude is the one harness carrying two independent facts: its tool gating has a
+    // caveat, and it signs in through its own credential file rather than Crew's
+    // identity store. An earlier revision returned early on the gating line, so the
+    // only harness with two things to say said one of them. They are different facts
+    // with different remedies and neither substitutes for the other.
+    const remedy = 'Claude Code is not signed in. Run `claude` in your terminal.'
+    acpBackendsMock.mockResolvedValue({
+      backends: [
+        probeRow(''),
+        probeRow('kas'),
+        probeRow('claude', {
+          auth: {
+            sign_in_remedy: remedy,
+            signs_in_separately: true,
+          },
+        }),
+      ],
+    })
+    wrap()
+    await waitFor(() => expect(button('Claude Code')).toBeEnabled())
+    expect(screen.getByText(/pre-approved in Claude's own settings/)).toBeInTheDocument()
+    expect(screen.getByText(remedy)).toBeInTheDocument()
+  })
+
   it('drops the caveat with the row when Claude Code is not selectable', async () => {
     schemaMock.mockReturnValue(schemaWith(['', 'kas']))
     wrap()
@@ -563,41 +665,85 @@ describe('AgentBackendTab', () => {
     expect(screen.queryByText(/normally asks before it acts/)).not.toBeInTheDocument()
   })
 
-  it('tells a Codex operator that being installed is not being signed in', async () => {
-    // The gap the install line cannot cover. codex-acp ships its own Codex binary, so
-    // `installed` answers the whole binary question -- and a session with no credential
-    // still dies on the first turn, with nothing on the page having said what was
-    // absent. Both branches of the remedy must be named: Codex's own sign-in, and a
-    // model provider in ~/.codex/config.toml for credentials that come from elsewhere.
+  it('renders the server\'s sign-in remedy verbatim when the harness signs in separately', async () => {
+    // The gap the install line cannot cover: an adapter shipping its own binary makes
+    // `installed` answer the whole binary question, and a session with no credential
+    // still dies on the first turn. The remedy is the SERVER's sentence, rendered as
+    // sent -- no per-harness literal here, and no locale entry to add before a newly
+    // registered harness can say anything.
+    const remedy = 'Codex signs in on its own: finish its sign-in, or name a model provider in ~/.codex/config.toml.'
+    schemaMock.mockReturnValue(schemaWith(['', 'claude', 'kas', 'codex']))
+    acpBackendsMock.mockResolvedValue({
+      backends: [
+        probeRow(''),
+        probeRow('claude'),
+        probeRow('kas'),
+        probeRow('codex', {
+          auth: { sign_in_remedy: remedy, signs_in_separately: true },
+        }),
+      ],
+    })
+    wrap()
+    await waitFor(() => expect(button('codex')).toBeEnabled())
+    expect(screen.getByText(remedy)).toBeInTheDocument()
+  })
+
+  it('says nothing when the harness does not sign in separately', async () => {
+    // A harness authenticating through Crew's own identity store has no separate
+    // sign-in to finish, so telling its reader to go and finish one would be false.
+    // The remedy string may still be present on the row; `signs_in_separately` is
+    // what decides, not its presence.
+    const remedy = 'Finish the harness sign-in before starting a session.'
+    schemaMock.mockReturnValue(schemaWith(['', 'claude', 'kas', 'codex']))
+    acpBackendsMock.mockResolvedValue({
+      backends: [
+        probeRow(''),
+        probeRow('claude'),
+        probeRow('kas'),
+        probeRow('codex', {
+          auth: { sign_in_remedy: remedy, signs_in_separately: false },
+        }),
+      ],
+    })
+    wrap()
+    await waitFor(() => expect(button('codex')).toBeEnabled())
+    expect(screen.queryByText(remedy)).not.toBeInTheDocument()
+  })
+
+  it('renders a row with no auth object at all, and says nothing about signing in', async () => {
+    // A gateway that predates the `auth` field sends none. Absent probe information
+    // is not a verdict, so the row must render normally rather than crashing on the
+    // optional-chain or inventing a caveat.
     schemaMock.mockReturnValue(schemaWith(['', 'claude', 'kas', 'codex']))
     acpBackendsMock.mockResolvedValue({
       backends: [probeRow(''), probeRow('claude'), probeRow('kas'), probeRow('codex')],
     })
     wrap()
     await waitFor(() => expect(button('codex')).toBeEnabled())
-    expect(screen.getByText(/Codex signs in on its own/)).toBeInTheDocument()
-    expect(screen.getByText(/~\/\.codex\/config\.toml/)).toBeInTheDocument()
+    // The row is fully live: reachable, and the click writes the id the wire accepts.
+    fireEvent.click(button('codex'))
+    await waitFor(() => expect(patchConfigMock).toHaveBeenCalledWith('agent.acp_backend', 'codex'))
+    expect(screen.queryByText(/signs in|sign-in/i)).not.toBeInTheDocument()
   })
 
-  it('says the credential is not checked here rather than implying it is', async () => {
-    // The reason this is a standing caveat and not a probe line: the panel does not
-    // read those files, and a `missing` verdict would DISABLE the switch for an
-    // operator who is authenticated by a path the check cannot see. The sentence has
-    // to disclaim the measurement, or the reader takes silence for a green light.
-    schemaMock.mockReturnValue(schemaWith(['', 'codex']))
-    acpBackendsMock.mockResolvedValue({ backends: [probeRow(''), probeRow('codex')] })
+  it('does not put one harness\'s sign-in remedy on the others', async () => {
+    // The caveat is per-row and comes from that row's own payload, so a remedy on
+    // one harness must not leak onto a sibling that did not send one.
+    const remedy = 'Finish the codex sign-in first.'
+    schemaMock.mockReturnValue(schemaWith(['', 'claude', 'kas', 'codex']))
+    acpBackendsMock.mockResolvedValue({
+      backends: [
+        probeRow(''),
+        probeRow('claude'),
+        probeRow('kas'),
+        probeRow('codex', {
+          auth: { sign_in_remedy: remedy, signs_in_separately: true },
+        }),
+      ],
+    })
     wrap()
     await waitFor(() => expect(button('codex')).toBeEnabled())
-    expect(screen.getByText(/Neither is checked here/)).toBeInTheDocument()
-  })
-
-  it('does not put the Codex caveat on the other agents', async () => {
-    // Kiro CLI and KAS authenticate through Crew's own identity store, so telling
-    // their reader to finish a separate sign-in would be false.
-    acpBackendsMock.mockResolvedValue({ backends: [probeRow(''), probeRow('claude'), probeRow('kas')] })
-    wrap()
-    await waitFor(() => expect(button('Kiro CLI')).toBeEnabled())
-    expect(screen.queryByText(/Codex signs in on its own/)).not.toBeInTheDocument()
+    expect(screen.getAllByText(remedy)).toHaveLength(1)
   })
 
   it('states that the set is decided at gateway start', async () => {
@@ -608,5 +754,285 @@ describe('AgentBackendTab', () => {
     wrap()
     await waitFor(() => expect(button('Kiro CLI')).toBeEnabled())
     expect(screen.getByText(/decided when the gateway starts/)).toBeInTheDocument()
+  })
+
+  it('renders the Kiro sign-in card under the switch while KAS is on offer', async () => {
+    // The identity the card stores is consumed by the KAS relay alone, so the
+    // card lives beside the switch that selects KAS -- not on Settings >
+    // Overview, where a sign-in chooser read as a required step to every user.
+    // Offered, not selected: the shipped default is Kiro CLI, and the card must
+    // still be here so the user can sign in BEFORE switching.
+    wrap()
+    await waitFor(() => expect(button('KAS (kiro-agent)')).toBeEnabled())
+    expect(button('Kiro CLI')).toHaveAttribute('aria-pressed', 'true')
+    expect(screen.getByTestId('kiro-sign-in-card')).toBeInTheDocument()
+  })
+
+  it('renders no sign-in card when this deployment cannot select KAS', async () => {
+    // A build or policy that hides the KAS option has nothing for the user to
+    // sign in for; a chooser here would be a sign-in to nothing. The gate reads
+    // the same `visible` set the rows render, so the switch and the card cannot
+    // disagree about whether KAS is offered.
+    schemaMock.mockReturnValue(schemaWith(['', 'claude']))
+    wrap()
+    await waitFor(() => expect(button('Claude Code')).toBeEnabled())
+    expect(screen.queryByRole('button', { name: 'KAS (kiro-agent)' })).toBeNull()
+    expect(screen.queryByTestId('kiro-sign-in-card')).toBeNull()
+  })
+
+  it('keeps the sign-in card while KAS is the saved backend, even if it reads as unselectable', async () => {
+    // `visible` always keeps the saved value so the control has a pressed chip;
+    // the card follows it, so an operator whose sessions still run as the Crew
+    // identity keeps the one place that can sign it out.
+    kirocrewConfigMock.mockResolvedValue({ agent: { acp_backend: 'kas' } })
+    schemaMock.mockReturnValue(schemaWith(['', 'claude']))
+    wrap()
+    await waitFor(() => expect(button('KAS (kiro-agent)')).toHaveAttribute('aria-pressed', 'true'))
+    expect(screen.getByTestId('kiro-sign-in-card')).toBeInTheDocument()
+  })
+})
+
+/**
+ * The capability card.
+ *
+ * The panel renders it and owns none of it. Every line arrives from
+ * `GET /api/acp-backends` as an id the server projected from the core's own
+ * capability memberships, and this file holds the label per id -- so these tests
+ * are about the RENDERING rules, and the meaning of each line is pinned in
+ * `test/test_backend_cards.py`.
+ *
+ * Four rules, and each one is a way the card could mislead:
+ * an unknown id is skipped rather than shown raw; the tool-approval line is never
+ * hidden behind a disclosure; a card the server did not send produces no card at
+ * all; and an agent this BUILD never offers gets a row while one this DEPLOYMENT
+ * denied still does not.
+ */
+describe('AgentBackendTab capability card', () => {
+  /** A card payload shaped like the server's, defaulted to the dull answer. */
+  function card(
+    over: Partial<{
+      capabilities: { id: string; available: boolean }[]
+      security_notes: string[]
+      operator_notes: string[]
+      tool_approval: string
+      offered_by_build: boolean
+    }> = {},
+  ) {
+    return {
+      capabilities: [
+        { id: 'crew_tools', available: true },
+        { id: 'mid_turn_steer', available: false },
+      ],
+      security_notes: [],
+      operator_notes: [],
+      tool_approval: 'agent_spec',
+      offered_by_build: true,
+      ...over,
+    }
+  }
+
+  it('marks each capability available or not, in words as well as in an icon', async () => {
+    // The state has to be TEXT. A mark that differs only by icon shape and colour
+    // is unreadable to a screen reader and to anyone who cannot tell the two
+    // colours apart, so each row carries its verdict as a visually hidden word.
+    acpBackendsMock.mockResolvedValue({ backends: [probeRow('', card()), probeRow('kas', card())] })
+    schemaMock.mockReturnValue(schemaWith(['', 'kas']))
+    wrap()
+    await waitFor(() => expect(button('Kiro CLI')).toBeEnabled())
+
+    const supported = screen.getAllByText('Kiro Crew tools work in the chat')[0]
+    expect(supported.parentElement?.textContent).toContain('Available.')
+    const absent = screen.getAllByText('You can add a message while it works')[0]
+    expect(absent.parentElement?.textContent).toContain('Not available.')
+  })
+
+  it('counts the card in its summary so two agents compare without opening either', async () => {
+    acpBackendsMock.mockResolvedValue({
+      backends: [
+        probeRow('', card()),
+        probeRow(
+          'kas',
+          card({
+            capabilities: [
+              { id: 'crew_tools', available: true },
+              { id: 'mid_turn_steer', available: true },
+            ],
+          }),
+        ),
+      ],
+    })
+    schemaMock.mockReturnValue(schemaWith(['', 'kas']))
+    wrap()
+    await waitFor(() => expect(button('Kiro CLI')).toBeEnabled())
+    expect(screen.getByText('Kiro CLI supports 1 of 2 features')).toBeInTheDocument()
+    expect(screen.getByText('KAS (kiro-agent) supports 2 of 2 features')).toBeInTheDocument()
+  })
+
+  it('skips a capability id this frontend has no label for', async () => {
+    // The opposite of `nameOf`'s fallback, and deliberately: a raw
+    // `some_future_capability` in front of a reader is worse than one line fewer,
+    // whereas a chip with no text at all is worse than a policy id. The count
+    // follows the lines that render, so it cannot advertise a line nobody sees.
+    acpBackendsMock.mockResolvedValue({
+      backends: [
+        probeRow(
+          '',
+          card({
+            capabilities: [
+              { id: 'crew_tools', available: true },
+              { id: 'some_future_capability', available: false },
+            ],
+          }),
+        ),
+      ],
+    })
+    schemaMock.mockReturnValue(schemaWith(['']))
+    wrap()
+    await waitFor(() => expect(button('Kiro CLI')).toBeEnabled())
+    expect(screen.getByText('Kiro Crew tools work in the chat')).toBeInTheDocument()
+    expect(screen.queryByText(/some_future_capability/)).toBeNull()
+    expect(screen.getByText('Kiro CLI supports 1 of 1 features')).toBeInTheDocument()
+  })
+
+  it('states tool approval outside the disclosure, from the mechanism the server named', async () => {
+    // The one security-relevant line on the card and the reason a build-excluded
+    // agent cannot be picked, so it must not need a click. It is also the one
+    // GRADED line: the label comes from the mechanism, not from a boolean.
+    acpBackendsMock.mockResolvedValue({
+      backends: [
+        probeRow('', card()),
+        probeRow('kas', card({ tool_approval: 'seeded_settings' })),
+      ],
+    })
+    schemaMock.mockReturnValue(schemaWith(['', 'kas']))
+    wrap()
+    await waitFor(() => expect(button('Kiro CLI')).toBeEnabled())
+    expect(
+      screen.getByText('Asks before each tool, because Kiro Crew tells it to.'),
+    ).toBeInTheDocument()
+    expect(screen.getByText(/cannot confirm it took effect/)).toBeInTheDocument()
+  })
+
+  it('says nothing about a mechanism this frontend has no label for', async () => {
+    acpBackendsMock.mockResolvedValue({
+      backends: [probeRow('', card({ tool_approval: 'a_future_mechanism' }))],
+    })
+    schemaMock.mockReturnValue(schemaWith(['']))
+    wrap()
+    await waitFor(() => expect(button('Kiro CLI')).toBeEnabled())
+    expect(screen.queryByText(/a_future_mechanism/)).toBeNull()
+  })
+
+  it('states the operator notes the server sent, and only those', async () => {
+    // A note is raised or absent, never raised-and-negated: the server sends the
+    // ids that HOLD, so the panel has no negative form to render.
+    acpBackendsMock.mockResolvedValue({
+      backends: [probeRow('', card({ operator_notes: ['keeps_own_chat_record'] }))],
+    })
+    schemaMock.mockReturnValue(schemaWith(['']))
+    wrap()
+    await waitFor(() => expect(button('Kiro CLI')).toBeEnabled())
+    expect(screen.getByText('Good to know')).toBeInTheDocument()
+    expect(screen.getByText(/keeps its own copy of the chat/)).toBeInTheDocument()
+    expect(screen.queryByText(/home folder moves onto the pod/)).toBeNull()
+  })
+
+  it('states a security note OUTSIDE the disclosure, not inside it', async () => {
+    // "Kiro Crew's sandbox is not confining this child" is as material as how the
+    // harness is made to ask, and both fail OPEN. A reader comparing agents must
+    // not have to open anything to find either, so the security notes render beside
+    // the approval line while the capability list and the where-it-lives notes stay
+    // collapsed. The server decides which notes are which; this asserts the panel
+    // honours the split rather than re-deriving it.
+    acpBackendsMock.mockResolvedValue({
+      backends: [
+        probeRow(
+          '',
+          card({
+            security_notes: ['crew_sandbox_stands_down'],
+            operator_notes: ['keeps_own_chat_record'],
+          }),
+        ),
+      ],
+    })
+    schemaMock.mockReturnValue(schemaWith(['']))
+    wrap()
+    await waitFor(() => expect(button('Kiro CLI')).toBeEnabled())
+
+    const security = screen.getByText(/Has its own sandbox/)
+    expect(security.closest('details')).toBeNull()
+    // The contrast, in the same render: a where-it-lives note IS inside.
+    expect(screen.getByText(/keeps its own copy of the chat/).closest('details')).not.toBeNull()
+  })
+
+  it('renders no card at all when the gateway sent none', async () => {
+    // The same rule as every other absent probe field: absent information is not
+    // a verdict, so the panel says nothing rather than rendering an empty card
+    // that reads as "supports nothing".
+    acpBackendsMock.mockResolvedValue({ backends: [probeRow('')] })
+    schemaMock.mockReturnValue(schemaWith(['']))
+    wrap()
+    await waitFor(() => expect(button('Kiro CLI')).toBeEnabled())
+    expect(screen.queryByText(/supports \d+ of/)).toBeNull()
+    expect(screen.queryByText('Good to know')).toBeNull()
+    expect(screen.getByText('Default. All features supported.')).toBeInTheDocument()
+  })
+
+  it('describes an agent this build never offers, and says it is not offered', async () => {
+    // Known to the core, outside the selectable baseline. It gets a row with no
+    // chip: an operator asking "why can I not pick that?" is asking about a fact
+    // the card already carries, and hiding it answers with silence.
+    acpBackendsMock.mockResolvedValue({
+      backends: [
+        probeRow('', card()),
+        probeRow('deepseek', {
+          selectable: false,
+          ...card({ offered_by_build: false, tool_approval: 'unverified' }),
+        }),
+      ],
+    })
+    schemaMock.mockReturnValue(schemaWith(['']))
+    wrap()
+    await waitFor(() => expect(button('Kiro CLI')).toBeEnabled())
+    expect(screen.getByText('deepseek')).toBeInTheDocument()
+    expect(screen.getByText('This build does not offer this agent.')).toBeInTheDocument()
+    // The reason, from the routing enum rather than from prose written per agent.
+    expect(screen.getByText(/Nothing shows that this agent asks/)).toBeInTheDocument()
+    // Described, never offered: a chip would be a PATCH the wire refuses.
+    expect(screen.queryByRole('button', { name: 'deepseek' })).toBeNull()
+  })
+
+  it('still hides an agent the deployment denied, card or no card', async () => {
+    // The distinction the `offered_by_build` field exists for. A policy denial is
+    // not the reader's to fix and stays hidden; only a BUILD exclusion is
+    // described. Claude here carries a full card and is denied by the schema.
+    acpBackendsMock.mockResolvedValue({
+      backends: [probeRow('', card()), probeRow('claude', card())],
+    })
+    schemaMock.mockReturnValue(schemaWith(['']))
+    wrap()
+    await waitFor(() => expect(button('Kiro CLI')).toBeEnabled())
+    expect(screen.queryByText('Claude Code')).toBeNull()
+    expect(screen.getByText('Kiro CLI supports 1 of 2 features')).toBeInTheDocument()
+  })
+
+  it('offers no sign-in card for an agent it only describes', async () => {
+    // The sign-in gate reads the OFFERED set, not the described one. A KAS row
+    // that exists only to explain itself must not draw a sign-in for an option
+    // nobody can pick.
+    acpBackendsMock.mockResolvedValue({
+      backends: [
+        probeRow('', card()),
+        probeRow('kas', {
+          selectable: false,
+          ...card({ offered_by_build: false, tool_approval: 'unverified' }),
+        }),
+      ],
+    })
+    schemaMock.mockReturnValue(schemaWith(['']))
+    wrap()
+    await waitFor(() => expect(button('Kiro CLI')).toBeEnabled())
+    expect(screen.getByText('This build does not offer this agent.')).toBeInTheDocument()
+    expect(screen.queryByTestId('kiro-sign-in-card')).toBeNull()
   })
 })

@@ -1,12 +1,13 @@
 import { useState, useEffect, useMemo, useRef, useCallback } from 'react'
-import { Zap, FolderOpen, ChevronRight, TriangleAlert, Check } from 'lucide-react'
+import { Zap, FolderOpen, ChevronRight, Check } from 'lucide-react'
 import Modal from './Modal'
+import ErrorNotice from './ErrorNotice'
 import { Input, Btn } from './ui'
 import ProjectPicker from './ProjectPicker'
 import SimpleSelect from './SimpleSelect'
 import { FOLDER_COLOR_PALETTE } from './folderColorCatalog'
 import { useImeGuard } from '../hooks/useImeGuard'
-import { resolveFolderProjectDir } from '../utils/folderAgent'
+import { resolveFolderAgent, resolveFolderProjectDir } from '../utils/folderAgent'
 import { ChatFolder, ChatTag } from '../types'
 import { i18nT } from '../i18n/t'
 
@@ -188,6 +189,18 @@ export default function FolderConfigModal({
     return from ? resolveFolderProjectDir(folders, from) : undefined
   }, [folders, mode, folder?.parent_id, parentId])
 
+  // The default agent inherits the same way, so the empty option has to name the
+  // agent an empty selection would ACTUALLY run: the nearest ancestor that pins
+  // one, and only then the global default. Naming the global default
+  // unconditionally reads "Inherit (kirocrew)" on a subfolder of an
+  // agent-pinned folder whose chats will in fact run that ancestor's agent.
+  const inheritedAgent = useMemo(() => {
+    const from = mode === 'edit' ? folder?.parent_id : parentId
+    return from
+      ? resolveFolderAgent(folders, from, globalDefaultAgent || '')
+      : globalDefaultAgent || undefined
+  }, [folders, mode, folder?.parent_id, parentId, globalDefaultAgent])
+
   const trimmedName = draft.name.trim()
   const canSubmit = trimmedName.length > 0
 
@@ -270,13 +283,10 @@ export default function FolderConfigModal({
         }
       >
         <div className="flex flex-col gap-4">
-          {saveErr && (
-            <div data-testid="folder-config-error" role="alert"
-              className="flex items-start gap-2 text-[11.5px] text-text bg-danger-subtle border border-danger rounded-lg px-3 py-2">
-              <TriangleAlert size={13} className="shrink-0 mt-[1px] text-danger" />
-              <span className="min-w-0 break-words">{saveErr}</span>
-            </div>
-          )}
+          {/* No hand-off: the folder name / color / project dir / default agent /
+              tags form is unsaved — the save that failed is exactly what the
+              draft was about, and the navigation would discard it. */}
+          <ErrorNotice message={saveErr} testId="folder-config-error" />
 
           {/* Read-only destination. Not an input: the entry point already fixed it. */}
           <div data-testid="folder-config-destination" className="flex items-center gap-1.5 flex-wrap text-[11.5px] text-muted bg-bg-accent border border-border rounded-lg px-3 py-2">
@@ -341,7 +351,7 @@ export default function FolderConfigModal({
                     aria-label={i18nT('components.folderConfigModal.set_color_to_name', { name })}
                     aria-pressed={draft.color === value}
                     onClick={() => setDraft(d => ({ ...d, color: value }))}
-                    className={`w-5 h-5 rounded-full cursor-pointer border transition-transform hover:scale-110 ${draft.color === value ? 'ring-1 ring-accent ring-offset-1 ring-offset-bg' : ''}`}
+                    className={`w-5 h-5 rounded-full cursor-pointer border hover:brightness-125 swatch-cue ${draft.color === value ? 'ring-1 ring-accent ring-offset-1 ring-offset-bg' : ''}`}
                     style={{ background: `color-mix(in srgb, ${value} 30%, var(--bg-elevated))`, borderColor: value }}
                   />
                 )
@@ -366,13 +376,20 @@ export default function FolderConfigModal({
             <div className="flex flex-col gap-1.5">
               <span className="text-[11.5px] font-semibold text-muted">{i18nT('components.folderConfigModal.tags')}</span>
               {availableTagsFailed ? (
-                <span data-testid="folder-config-tags-error" className="text-[11px] text-danger">
-                  {i18nT('components.folderConfigModal.tags_error_hint')}
+                <span className="flex items-center gap-1.5 flex-wrap">
+                  {/* No hand-off: the same unsaved folder form (see the save
+                      notice above) — a read failure, but it sits inside it. */}
+                  <ErrorNotice
+                    variant="inline"
+                    className="text-[11px]"
+                    message={i18nT('components.folderConfigModal.tags_error_hint')}
+                    testId="folder-config-tags-error"
+                  />
                   <button
                     type="button"
                     data-testid="folder-config-tags-retry"
                     onClick={onRetryTags}
-                    className="ml-1.5 underline underline-offset-2 text-danger hover:opacity-80"
+                    className="text-[11px] underline underline-offset-2 text-danger hover:opacity-80 bg-transparent border-none p-0 cursor-pointer"
                   >
                     {i18nT('components.folderConfigModal.tags_retry')}
                   </button>
@@ -394,7 +411,7 @@ export default function FolderConfigModal({
                       key={tag.id}
                       htmlFor={`folder-config-tag-input-${tag.id}`}
                       data-testid={`folder-config-tag-${tag.id}`}
-                      className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[11.5px] cursor-pointer transition-transform hover:scale-105 focus-within:ring-2 focus-within:ring-accent focus-within:ring-offset-1 focus-within:ring-offset-bg ${selected ? 'ring-1 ring-accent ring-offset-1 ring-offset-bg' : ''}`}
+                      className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[11.5px] cursor-pointer hover:brightness-110 focus-within:ring-2 focus-within:ring-accent focus-within:ring-offset-1 focus-within:ring-offset-bg ${selected ? 'ring-1 ring-accent ring-offset-1 ring-offset-bg' : ''}`}
                       style={{
                         background: selected
                           ? `color-mix(in srgb, ${tag.color} 30%, var(--bg-elevated))`
@@ -479,15 +496,37 @@ export default function FolderConfigModal({
             </span>
             <SimpleSelect
               aria-label={i18nT('components.folderConfigModal.default_agent')}
+              // Bind the orphan notice to the control so a screen reader reaches
+              // the reason WITH the field, not as text that merely sits near it:
+              // a control whose state has a cause the user cannot hear is the
+              // same defect as a disabled button that never says why. Only while
+              // an orphan is selected — an ordinary selection has nothing to
+              // describe, and a dangling id here would drop the description.
+              aria-describedby={orphanAgent ? 'folder-config-agent-notice' : undefined}
               options={agentOptions}
               optionLabels={agentOptionLabels}
-              clearLabel={globalDefaultAgent
-                ? i18nT('components.folderConfigModal.inherit_named', { agent: globalDefaultAgent })
+              clearLabel={inheritedAgent
+                ? i18nT('components.folderConfigModal.inherit_named', { agent: inheritedAgent })
                 : i18nT('components.folderConfigModal.none')}
               value={draft.defaultAgent}
               onChange={v => setDraft(d => ({ ...d, defaultAgent: v }))}
             />
-            <span className="text-[11px] text-muted-strong">{i18nT('components.folderConfigModal.default_agent_hint')}</span>
+            {orphanAgent ? (
+              // The orphan is round-tripped, not blocked — Save stays enabled so
+              // a rename of the folder never wipes a temporarily-uninstalled
+              // agent (the round-trip guarantee this picker was built on). The
+              // notice therefore explains why the SELECTED AGENT will not run and
+              // names the fix. Its id is what `aria-describedby` above targets.
+              <span
+                id="folder-config-agent-notice"
+                data-testid="folder-config-agent-notice"
+                className="text-[11px] text-warn"
+              >
+                {i18nT('components.folderConfigModal.agent_not_installed_notice')}
+              </span>
+            ) : (
+              <span className="text-[11px] text-muted-strong">{i18nT('components.folderConfigModal.default_agent_hint')}</span>
+            )}
           </div>
         </div>
       </Modal>

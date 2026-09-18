@@ -205,6 +205,7 @@ class CronSDK:
         enabled: bool,
         timezone: str,
         skip_dates: list[str] | None,
+        folder_id: str = "",
     ) -> dict[str, Any]:
         """Build the kwargs common to the sync/async ``CronService.add_job``.
 
@@ -234,6 +235,7 @@ class CronSDK:
             enabled=enabled,
             timezone=timezone or "",
             skip_dates=skip_dates or None,
+            folder_id=folder_id or "",
             created_by=self._owner_prefix,
         )
 
@@ -270,6 +272,11 @@ class CronSDK:
         save, so an unknown zone or a malformed ``YYYY-MM-DD`` raises
         ``ValueError`` at create time instead of silently resolving to UTC when
         the job fires.
+
+        A manifest folder is NOT assignable here: app cron registration goes
+        through :meth:`add_job_if_absent_async`, which is the only method
+        ``bridges`` calls, so a ``folder_id`` on this method would be an
+        untested parameter no caller reaches.
         """
         self._vet_command_script(name, command, script)
         job = _run_sync_mutator(
@@ -311,7 +318,8 @@ class CronSDK:
 
         ``timezone``/``skip_dates`` behave exactly as in :meth:`add_job` --
         validated at the persistence owner and folded into the single locked
-        save, so a job never exists with the wrong calendar settings.
+        save, so a job never exists with the wrong calendar settings. Folder
+        assignment is likewise absent for the reason given there.
         """
         self._vet_command_script(name, command, script)
         job = await self._cron.add_job_async(
@@ -343,6 +351,7 @@ class CronSDK:
         enabled: bool = True,
         timezone: str = "",
         skip_dates: list[str] | None = None,
+        folder_id: str = "",
     ) -> Any:
         """Atomic add-if-absent by job name; returns None when already present.
 
@@ -365,6 +374,7 @@ class CronSDK:
                 command=command, script=script, agent_sequence=agent_sequence,
                 env=env, persistent_session=persistent_session, silent=silent,
                 enabled=enabled, timezone=timezone, skip_dates=skip_dates,
+                folder_id=folder_id,
             ),
         )
         if job is not None:
@@ -427,6 +437,52 @@ class CronSDK:
         )
         logger.info("App %s removed cron job: %s", self._app_name, job_id)
 
+    # ── Enable / disable ──
+
+    def set_enabled(self, job_id: str, enabled: bool) -> bool:
+        """Pause/resume an owned job without replacing its ID or history.
+
+        Synchronous, off-loop only. Ownership is rechecked inside the service's
+        lock against the freshly loaded store, not an SDK cache snapshot.
+        """
+        if type(enabled) is not bool:
+            raise ValueError("enabled must be a boolean")
+        try:
+            result = _run_sync_mutator(
+                self._cron.enable_job,
+                job_id,
+                enabled,
+                expected_owner=self._owner_prefix,
+                _api="set_enabled",
+            )
+        except PermissionError:
+            self._audit_enabled(job_id, "denied")
+            raise
+        self._audit_enabled(job_id, "ok")
+        return result
+
+    async def set_enabled_async(self, job_id: str, enabled: bool) -> bool:
+        """Event-loop-native :meth:`set_enabled`; same ownership and audit rules."""
+        if type(enabled) is not bool:
+            raise ValueError("enabled must be a boolean")
+        try:
+            result = await self._cron.enable_job_async(
+                job_id, enabled, expected_owner=self._owner_prefix
+            )
+        except PermissionError:
+            self._audit_enabled(job_id, "denied")
+            raise
+        self._audit_enabled(job_id, "ok")
+        return result
+
+    def _audit_enabled(self, job_id: str, outcome: str) -> None:
+        sel().log_api_access(
+            caller=f"app:{self._app_name}",
+            operation="cron_set_enabled",
+            outcome=outcome,
+            resources=job_id,
+        )
+
     # ── Update ──
 
     def update_job(self, job_id: str, **kwargs: Any) -> Any:
@@ -437,6 +493,8 @@ class CronSDK:
         Returns the updated CronJob or None.
         """
         self._assert_owned(job_id, "cron_update_job")
+        if "enabled" in kwargs or "user_paused" in kwargs:
+            raise ValueError("Use set_enabled or set_enabled_async to pause/resume a job")
         result = _run_sync_mutator(
             self._cron.update_job, job_id, _api="update_job", **kwargs
         )
@@ -447,6 +505,8 @@ class CronSDK:
         """Event-loop-native :meth:`update_job` (routes through
         ``CronService.update_job_async``)."""
         self._assert_owned(job_id, "cron_update_job")
+        if "enabled" in kwargs or "user_paused" in kwargs:
+            raise ValueError("Use set_enabled or set_enabled_async to pause/resume a job")
         result = await self._cron.update_job_async(job_id, **kwargs)
         self._audit_update(job_id)
         return result

@@ -9,6 +9,11 @@ import {
 } from 'react'
 import { useQuery, useMutation } from '@tanstack/react-query'
 import { api } from '../api/client'
+// Leaf modules, deliberately not `../api/client`: that module is mocked with a
+// bare factory across most of the test corpus, and the replay path below must
+// not depend on exports those mocks never define.
+import { ApiError } from '../api/apiError'
+import { pendingRefresh } from '../api/refreshOnce'
 import { reportSeamCollision } from '../apps/seamCollision'
 import { safeSetItem } from '../utils/safeStorage'
 // Every stylesheet TEXT this hook injects is built there, so the i18n gate does
@@ -129,6 +134,9 @@ export interface ThemeAssets {
   hasOverrides?: boolean
   /** Stock symbol names for the chat loader's existing carousel. */
   loaderIcons?: ThemeLoaderIconName[]
+  /** Pack-supplied raster loader artwork (Level 1): relative asset paths
+   *  (`loader/<file>.png`), cycled by the stock carousel as <img>s. */
+  loaderImages?: string[]
   // L2 assets: overlays, topbar, audio, persona.
   overlays?: ThemeOverlayDecl[]
   topbar?: ThemeTopbar
@@ -166,13 +174,21 @@ function resolveMode(pref: ModePreference): ResolvedMode {
   return pref === 'system' ? getSystemMode() : pref
 }
 
+/**
+ * The `data-theme` value the stylesheet keys a palette on. The default palette
+ * (`emerald`) is spelled as the bare mode — `dark` / `light` — because that is
+ * how `index.css` names its `:root` fallbacks; every other theme, custom ones
+ * included, is `<slug>-<mode>`. Exported so any other renderer of the same
+ * stylesheet (the Storybook preview) resolves the attribute through this one
+ * rule instead of restating it.
+ */
+export function themeDataAttribute(colorTheme: ColorTheme, mode: ResolvedMode): string {
+  return colorTheme === 'emerald' ? mode : `${colorTheme}-${mode}`
+}
+
 function applyTheme(colorTheme: ColorTheme, mode: ResolvedMode, pref: ModePreference) {
   const el = document.documentElement
-  if (colorTheme.startsWith('custom-')) {
-    el.dataset.theme = `${colorTheme}-${mode}`
-  } else {
-    el.dataset.theme = colorTheme === 'emerald' ? mode : `${colorTheme}-${mode}`
-  }
+  el.dataset.theme = themeDataAttribute(colorTheme, mode)
   el.dataset.mode = mode
   // The PREFERENCE, exposed separately from the resolved mode because the two
   // mean different things to the Electron shell. `data-mode` is what to paint;
@@ -600,7 +616,7 @@ function useThemeState(): ThemeContextValue {
   const legacyMigrationStartedRef = useRef(false)
   const [themeBootReady, setThemeBootReady] = useState(false)
 
-  const loadCustomThemes = useCallback(async () => {
+  const loadCustomThemes = useCallback(async (replayed = false): Promise<void> => {
     try {
       const res = await api.themes()
       const themes: ThemeEntry[] = (res.themes || []).map(
@@ -628,8 +644,20 @@ function useThemeState(): ThemeContextValue {
       setCustomThemeDataMap(dataMap)
       setCustomThemesLoaded(true)
       bumpThemeVersion()
-    } catch {
-      // API not available yet — ignore
+    } catch (e) {
+      // `/api/theme/boot` is public and restores a persisted `custom-<slug>`
+      // selection on every load, but `/api/themes` is not: on a cold load with a
+      // lapsed access cookie it answers 403, the client starts a silent refresh
+      // in the background, and this ORIGINAL request still rejects. Every later
+      // request in the app succeeds on the refreshed cookie, so nothing else
+      // notices — but this is a one-shot boot fetch with no poll to bring it
+      // back, and swallowing the rejection left the selected theme's variables,
+      // fonts, and branding unloaded until the user reloaded by hand. Wait for
+      // the refresh that this failure triggered and replay exactly once.
+      if (replayed || !(e instanceof ApiError && e.authRequired)) return // API not available yet — ignore
+      const recovery = pendingRefresh()
+      if (recovery && !(await recovery).ok) return // refresh failed: the banner owns it now
+      await loadCustomThemes(true)
     }
   }, [bumpThemeVersion])
 
@@ -739,9 +767,7 @@ function useThemeState(): ThemeContextValue {
   // `prefers-color-scheme` immediately; Chromium then fires a change event on
   // the media query below if the effective value moved. No-op in a browser.
   useEffect(() => {
-    const bridge = (window as unknown as {
-      electronAPI?: { setThemeMode?: (pref: string) => void }
-    }).electronAPI
+    const bridge = window.electronAPI
     bridge?.setThemeMode?.(mode)
   }, [mode])
 
@@ -749,9 +775,7 @@ function useThemeState(): ThemeContextValue {
   // mode changes. The overlay strip must match the dashboard chrome at all
   // times; sending on `resolved` (not `mode`) handles Auto switching correctly.
   useEffect(() => {
-    const bridge = (window as unknown as {
-      electronAPI?: { setTitleBarOverlayTheme?: (mode: string) => void }
-    }).electronAPI
+    const bridge = window.electronAPI
     bridge?.setTitleBarOverlayTheme?.(resolved)
   }, [resolved])
 
@@ -759,9 +783,7 @@ function useThemeState(): ThemeContextValue {
   // launch's boot splash (loading.html) paints in the user's chosen colour.
   // Reads the computed --accent after paint; a no-op in a plain browser.
   useEffect(() => {
-    const bridge = (window as unknown as {
-      electronAPI?: { setThemeAccent?: (hex: string) => void }
-    }).electronAPI
+    const bridge = window.electronAPI
     if (!bridge?.setThemeAccent) return
     const id = requestAnimationFrame(() => {
       const hex = getComputedStyle(document.documentElement).getPropertyValue('--accent').trim()

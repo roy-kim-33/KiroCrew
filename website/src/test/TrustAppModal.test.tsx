@@ -7,7 +7,7 @@
  * every other enable failure stays a plain error, and Cancel grants nothing.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { render, screen, fireEvent, waitFor } from '@testing-library/react'
+import { render, screen, fireEvent, waitFor, within } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { MemoryRouter, Routes, Route } from 'react-router-dom'
 
@@ -83,7 +83,9 @@ import LibraryPage from '../pages/apps/LibraryPage'
 import AppDetailPage from '../pages/AppDetailPage'
 import {
   isTrustDeniedError,
+  isSessionApprovalConsentRequiredError,
   APP_EXECUTION_DENIED,
+  SESSION_APPROVAL_CONSENT_REQUIRED,
   credentialFreeRepository,
   safeHref,
 } from '../components/appstore/TrustAppModal'
@@ -96,6 +98,11 @@ function apiError(status: number, body: object, message = 'boom') {
 const TRUST_DENIED = () => apiError(403, {
   error: 'App third-party is not trusted to run its own code.',
   code: APP_EXECUTION_DENIED,
+})
+
+const SESSION_APPROVAL_REQUIRED = () => apiError(400, {
+  error: 'session approval consent must be confirmed from a disclosure surface',
+  code: SESSION_APPROVAL_CONSENT_REQUIRED,
 })
 
 /**
@@ -126,6 +133,7 @@ const THIRD_PARTY = {
   enabled: false,
   origin: 'registry',
   updateAvailable: false,
+  manifest: { permissions: { sessionApproval: true } },
 }
 
 function renderPage() {
@@ -200,6 +208,7 @@ beforeEach(() => {
       manifest: {
         name: THIRD_PARTY.name, version: '1.0.0', displayName: THIRD_PARTY.displayName,
         description: THIRD_PARTY.description, author: THIRD_PARTY.author, repo: THIRD_PARTY.repo,
+        permissions: { sessionApproval: true },
       },
     },
   ])
@@ -209,7 +218,7 @@ beforeEach(() => {
   untrustApp.mockResolvedValue({ apps: [], ineffective: [], allowAll: false })
   // Detail-page load: not installed yet, so the registry entry is the source of
   // truth and the page offers Get rather than Enable/Disable.
-  getApp.mockRejectedValue(new Error('not installed'))
+  getApp.mockRejectedValue(apiError(404, { error: 'not installed' }))
   system.mockResolvedValue({ hostname: 'localhost' })
 })
 
@@ -235,7 +244,36 @@ describe('isTrustDeniedError', () => {
   })
 })
 
+describe('isSessionApprovalConsentRequiredError', () => {
+  it('matches only the consent-required code', () => {
+    expect(isSessionApprovalConsentRequiredError(SESSION_APPROVAL_REQUIRED())).toBe(true)
+    expect(isSessionApprovalConsentRequiredError(TRUST_DENIED())).toBe(false)
+    expect(isSessionApprovalConsentRequiredError(new Error(SESSION_APPROVAL_CONSENT_REQUIRED))).toBe(false)
+  })
+})
+
 describe('LibraryPage trust gate', () => {
+  // The consent flow is reached by clicking Enable on a DISABLED third-party
+  // tile, which the Library's default "enabled only" view filters out. This
+  // block is about the trust gate, not the default view, so it opts into the
+  // show-all view (persisted `mc-apps-library-show-all` toggle, '1' = show all)
+  // to render the tile it acts on.
+  beforeEach(() => {
+    localStorage.setItem('mc-apps-library-show-all', '1')
+  })
+  afterEach(() => {
+    localStorage.removeItem('mc-apps-library-show-all')
+  })
+
+  it('routes consent-required enable to the detail disclosure', async () => {
+    enableApp.mockRejectedValue(SESSION_APPROVAL_REQUIRED())
+    renderPage()
+    await clickEnable()
+
+    expect(await screen.findByTestId('detail-route')).toBeTruthy()
+    expect(modalTitle()).toBeNull()
+  })
+
   it('opens the consent modal when enable is refused with app_execution_denied', async () => {
     enableApp.mockRejectedValue(TRUST_DENIED())
     renderPage()
@@ -250,6 +288,18 @@ describe('LibraryPage trust gate', () => {
     expect(screen.getByText(`${K}.capability_python`)).toBeTruthy()
     expect(screen.getByText(`${K}.capability_backend`)).toBeTruthy()
     expect(screen.getByText(`${K}.capability_shell`)).toBeTruthy()
+    // The session-approval grant sits OUTSIDE the three-row ceiling, in plain
+    // words, with the modes listed under their own label.
+    expect(screen.getByText(`${K}.session_approval_heading`)).toBeTruthy()
+    expect(screen.getByText(`${K}.session_approval_desc`)).toBeTruthy()
+    expect(screen.getByText(`${K}.session_approval_modes`)).toBeTruthy()
+    expect(screen.queryByText('sessionApproval')).toBeNull()
+    expect(screen.getByText('components.approvalModePicker.normal_label')).toBeTruthy()
+    expect(screen.getByText('components.approvalModePicker.normal_desc')).toBeTruthy()
+    expect(screen.getByText('components.approvalModePicker.reads_label')).toBeTruthy()
+    expect(screen.getByText('components.approvalModePicker.trust_label (components.approvalModePicker.chat_mode_hint)')).toBeTruthy()
+    // YOLO is process-global and dashboard-only: never offered to an app.
+    expect(screen.queryByText('components.approvalModePicker.yolo_label')).toBeNull()
     expect(screen.getByText(`${K}.source`)).toBeTruthy()
     expect(screen.getByText(THIRD_PARTY.trustRepository)).toBeTruthy()
     expect(screen.queryByText(THIRD_PARTY.repo)).toBeNull()
@@ -348,14 +398,19 @@ describe('LibraryPage trust gate', () => {
 
   it('keeps the modal open and reports inline when the retried enable fails', async () => {
     enableApp.mockRejectedValue(TRUST_DENIED())
+    // The rollback probe must not PROVE absence here (a 404 would), so the
+    // grant stands and the copy points at Settings.
+    getApp.mockRejectedValue(apiError(500, { error: 'gateway exploded' }, 'gateway exploded'))
     renderPage()
     await clickEnable()
     await waitFor(() => expect(modalTitle()).toBeTruthy())
 
     fireEvent.click(confirmBtn())
 
-    await waitFor(() => expect(screen.getByRole('alert').textContent)
-      .toBe(`${K}.failed LaunchDarkly`))
+    // `toContain`, not `toBe`: the failure renders through the shared ErrorNotice,
+    // whose `role="alert"` node also carries the agent hand-off button's label.
+    await waitFor(() => expect(within(screen.getByRole('dialog')).getByRole('alert').textContent)
+      .toContain(`${K}.failed LaunchDarkly`))
     expect(modalTitle()).toBeTruthy()
   })
 
@@ -437,11 +492,14 @@ describe('registry install trust gate', () => {
     installFromRegistryStream.mockResolvedValue(INSTALL_DENIED())
     renderDetailFromGet()
     await waitFor(() => expect(modalTitle()).toBeTruthy())
+    // The page loaded from the registry (the suite's 404 default). From here the
+    // rollback probe must not prove absence, so the grant stands.
+    getApp.mockRejectedValue(apiError(500, { error: 'gateway exploded' }, 'gateway exploded'))
 
     fireEvent.click(confirmBtn())
 
-    await waitFor(() => expect(screen.getByRole('alert').textContent)
-      .toBe(`${K}.failed LaunchDarkly`))
+    await waitFor(() => expect(within(screen.getByRole('dialog')).getByRole('alert').textContent)
+      .toContain(`${K}.failed LaunchDarkly`))
     expect(modalTitle()).toBeTruthy()
   })
 
@@ -461,25 +519,28 @@ describe('registry install trust gate', () => {
     await waitFor(() => expect(untrustApp).toHaveBeenCalledWith(THIRD_PARTY.name))
     // Nothing was left behind, so the copy must say that rather than sending the
     // user to Settings to remove a grant that is already gone.
-    await waitFor(() => expect(screen.getByRole('alert').textContent)
-      .toBe(`${K}.failed_generic LaunchDarkly`))
+    await waitFor(() => expect(within(screen.getByRole('dialog')).getByRole('alert').textContent)
+      .toContain(`${K}.failed_generic LaunchDarkly`))
     expect(modalTitle()).toBeTruthy()
   })
 
   it('KEEPS the grant when absence cannot be proven — only a 404 rolls back', async () => {
     // The other half, and the anti-guess rule. Only a 404 proves the name is
     // unoccupied; a network error or a 500 proves nothing, and revoking on that
-    // would switch off an app that exists and works. The suite default rejects
-    // `getApp` with a plain Error (no status), so this is that branch: the grant
-    // stands and the copy points the user at Settings to review it.
+    // would switch off an app that exists and works. The suite default is a 404
+    // (so the detail page loads from the registry — a non-404 rejection is now
+    // a load FAILURE, not "not installed"); the probe is switched to a 500 once
+    // the page is up, so this is that branch: the grant stands and the copy
+    // points the user at Settings to review it.
     installFromRegistryStream.mockResolvedValue(INSTALL_DENIED())
     renderDetailFromGet()
     await waitFor(() => expect(modalTitle()).toBeTruthy())
+    getApp.mockRejectedValue(apiError(500, { error: 'gateway exploded' }, 'gateway exploded'))
 
     fireEvent.click(confirmBtn())
 
-    await waitFor(() => expect(screen.getByRole('alert').textContent)
-      .toBe(`${K}.failed LaunchDarkly`))
+    await waitFor(() => expect(within(screen.getByRole('dialog')).getByRole('alert').textContent)
+      .toContain(`${K}.failed LaunchDarkly`))
     expect(untrustApp).not.toHaveBeenCalled()
   })
 
@@ -524,8 +585,8 @@ describe('registry install trust gate', () => {
     await waitFor(() => expect(untrustApp).toHaveBeenCalledWith(THIRD_PARTY.name))
     // Nothing was left behind, so the copy says so rather than sending the user to
     // Settings after a grant that is already gone.
-    await waitFor(() => expect(screen.getByRole('alert').textContent)
-      .toBe(`${K}.failed_generic LaunchDarkly`))
+    await waitFor(() => expect(within(screen.getByRole('dialog')).getByRole('alert').textContent)
+      .toContain(`${K}.failed_generic LaunchDarkly`))
   })
 
   it('rolls the grant back when the retried install is ABORTED', async () => {

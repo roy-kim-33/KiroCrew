@@ -1,7 +1,6 @@
 """Identity-resolution topology tests (pre-work for the pid-namespace re-raise).
 
-Background (2026-07-18 incident): the PID-namespace sandbox change (24c320f6,
-reverted; this fork ported then reverted it in ab96394b) broke
+Background: a reverted PID-namespace sandbox change broke
 subagent identity resolution in live deployments while the full unit gate
 stayed green. Session hosts ran inside a PID namespace where
 ``os.getpid()``/``os.getppid()`` return namespace-local pids renumbered from 1,
@@ -163,7 +162,7 @@ def _wire_common(monkeypatch: pytest.MonkeyPatch, topo: ProcessTopology, view: s
     # under test and flip the strict pidns xfails to XPASS.
     monkeypatch.delenv("KIROCREW_HOST_PID", raising=False)
     monkeypatch.setattr("os.getppid", lambda: topo.observed_ppid(MCP_SERVER, view))
-    # Reset the fork's process-lifetime from_env cache: a previously-resolved
+    # Reset the fork's process-lifetime from_env cache: an already-resolved
     # identity from an earlier test (or the host-view run of this test) would
     # otherwise short-circuit the walk and XPASS the strict pidns variants.
     monkeypatch.setattr("kiro_crew.mcp_caller._FROM_ENV_CACHE", None)
@@ -494,7 +493,26 @@ _REGISTERED_CALL_SITES: dict[str, str] = {
         "so in-namespace readers can look the file up directly without a /proc walk"
     ),
     "mcp_gateway/claim.py": "docstring reference to the contract (no code reads)",
-    "session_pid.py": "stale-file cleanup: globs session_pid_*.txt (+ .sig sidecars) for dead processes",
+    "session_pid.py": (
+        "stale-file cleanup: globs session_pid_*.txt (+ .sig sidecars) for dead "
+        "processes, and (age-bounded) session_token_*.sig mappings, whose "
+        "token-hash filenames name no pid to probe"
+    ),
+    "session_token_sig.py": (
+        "SIBLING contract, NOT a session_pid reader: owns the per-SESSION "
+        "token -> session-key mapping (session_token_<sha256(token)>.sig, one "
+        "file holding MAC + body, signed with a subkey derived from the same SEL "
+        "trust root under a DIFFERENT domain label so the two sidecars cannot be "
+        "cross-replayed). It appears in this scan only because it IMPORTS "
+        "session_pid_sig's hardened reader and key loader rather than copying "
+        "them, and because its docstring contrasts the two contracts. It reads "
+        "and writes no session_pid file and does no /proc walk — deliberately: "
+        "a pid names a PROCESS, and one kiro-cli process hosts many ACP "
+        "sessions, so pid-keyed identity answers with the parent for a "
+        "spawn_run subagent. Being pid-FREE is the property that makes it "
+        "namespace-insensitive, so the pid-view parametrization this file "
+        "requires of a new resolution path has nothing to vary"
+    ),
     "mcp_computer.py": (
         "comment reference only (no code reads): the computer-use stdio shim "
         "explains why it resolves identity with mcp_core._resolve_session_key_strict "
@@ -537,7 +555,7 @@ def test_session_pid_call_sites_are_registered() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Reflexive-tool strict-gate ratchet (#5913)
+# Reflexive-tool strict-gate ratchet
 # ---------------------------------------------------------------------------
 # A REFLEXIVE MCP tool is one whose semantics embed "my session": ledger
 # writes, monitor loops, session-scoped control, attributed channel sends. The
@@ -614,8 +632,31 @@ def test_reflexive_tools_route_through_the_strict_gate() -> None:
     )
 
 
+@pytest.mark.parametrize("identified", [True, False])
+def test_memory_recall_uses_the_shared_gate_identity_once(monkeypatch, identified):
+    from kiro_crew import mcp_core
+    from kiro_crew.mcp_tools import learn
+
+    key = "subagent:memory-recall" if identified else ""
+    refusal = "Error: unresolved session. Fixture installation diagnosis."
+    gate = MagicMock(return_value=(key, "" if identified else refusal))
+    gateway = MagicMock(return_value={"store": "member-alice"})
+    monkeypatch.setattr(mcp_core, "require_strict_session_key", gate)
+    monkeypatch.setattr(mcp_core, "_get", gateway)
+
+    result = learn.memory_recall("memory_recall", {"query": "database"})
+
+    gate.assert_called_once_with("Error: memory recall requires an established session")
+    if identified:
+        gateway.assert_called_once_with("/api/memory/recall?q=database", session_key=key)
+        assert "member-alice" in result
+    else:
+        gateway.assert_not_called()
+        assert result == refusal
+
+
 # ---------------------------------------------------------------------------
-# Class-level publisher guard (#232)
+# Class-level publisher guard
 # ---------------------------------------------------------------------------
 # The "missing X-Session-Key" HTTP 400 was a channel-turn *publisher* gap: a
 # surface that runs an agent turn but never publishes the session_pid mapping

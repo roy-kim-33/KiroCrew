@@ -172,11 +172,19 @@ the version selector (channel tags track their channel; version tags pin).
 
 Kiro Crew runs agent commands inside a Linux user-namespace sandbox that
 bind-mounts empty dirs over credential paths (`~/.aws`, `~/.ssh`, etc.) so
-the agent subprocess cannot read gateway credentials. The sandbox requires
-two syscalls — `unshare(CLONE_NEWUSER)` and `unshare(CLONE_NEWNS)` — that
-the **Docker default seccomp profile blocks**. The probe inside the
-container therefore returns `EPERM`, the sandbox marks itself unavailable,
-and agent execution is disabled (fail-closed) until you choose a posture.
+the agent subprocess cannot read gateway credentials. Building it takes three
+syscalls in order — `unshare(CLONE_NEWUSER)`, `unshare(CLONE_NEWNS)`, then a
+`mount(MS_REC|MS_PRIVATE)` on `/` inside the new mount namespace — and two
+different container guards can refuse them. The **Docker default seccomp
+profile blocks the unshares**: the probe inside the container returns
+`EPERM` at the first step, the sandbox marks itself unavailable, and agent
+execution is disabled (fail-closed) until you choose a posture. A runtime's
+**default AppArmor profile blocks the mount** instead (`deny mount`, errno 13
+`EACCES`) while letting both unshares through; the startup probe performs the
+mount too, so that host is reported the same way. Kubernetes applies the
+AppArmor default on AppArmor-enabled nodes and no seccomp profile at all, so
+a Pod is usually the second case — see
+[Kubernetes and AppArmor](#kubernetes-and-apparmor).
 
 ### How the startup probe decides your posture
 
@@ -189,13 +197,39 @@ sandbox and writes one of three postures:
 | No backend ❌ | `KIROCREW_ALLOW_UNSANDBOXED=1` | `sandbox_allow_unsandboxed_exec=true` | Allowed — container is the only boundary |
 | No backend ❌ | _(not set)_ | `sandbox=auto` (default) | **Disabled** (fail-closed) |
 
-The startup log always states which posture was chosen:
+The entrypoint states which posture it seeded on the **first** run — the one where
+`config.json` does not yet exist. Each is emitted as one long line; wrapped here to
+read:
 
 ```
-[entrypoint] sandbox probe: namespace backend available → sandbox=auto
-[entrypoint] sandbox probe: no backend (EPERM) → allow_unsandboxed_exec=true (KIROCREW_ALLOW_UNSANDBOXED consent)
-[entrypoint] sandbox probe: no backend (EPERM) → agent exec DISABLED (set KIROCREW_ALLOW_UNSANDBOXED=1 to enable)
+[entrypoint] First run: inner sandbox backend available — seeded
+/home/kirocrew/.kiro/crew/config.json with agent.sandbox=auto so agent
+subprocesses run namespace-isolated from gateway credentials.
 ```
+
+```
+[entrypoint] First run: NO inner sandbox backend under this runtime's seccomp
+policy; KIROCREW_ALLOW_UNSANDBOXED=1 given — seeded
+/home/kirocrew/.kiro/crew/config.json with sandbox=auto +
+sandbox_allow_unsandboxed_exec=true. Agent subprocesses share the container user
+and can read files owned by the gateway.
+```
+
+```
+[entrypoint] First run: NO inner sandbox backend under this runtime's seccomp
+policy. Seeded /home/kirocrew/.kiro/crew/config.json with sandbox=auto: agent
+command execution is DISABLED (fail-closed) until you choose one of: (a) permit
+user namespaces (--security-opt seccomp=<profile permitting unshare/clone>) and
+restart to get the inner sandbox, or (b) restart with -e
+KIROCREW_ALLOW_UNSANDBOXED=1 to explicitly accept unsandboxed agent execution
+(the container is then the only isolation boundary).
+```
+
+A later run does not repeat the seeding line — the config already carries the
+posture. It prints the standing reminder instead, whenever
+`agent.sandbox_allow_unsandboxed_exec` is absent from `config.json`, naming the two
+ways to let agent commands through. See
+[Check the startup log](docker-troubleshooting.md#check-the-startup-log).
 
 ### Option A — Kiro Crew seccomp profile (recommended)
 
@@ -230,6 +264,80 @@ security_opt:
 
 With this profile the inner sandbox runs normally and credential directories
 are hidden from agent subprocesses inside the container.
+
+**On a host where AppArmor is enabled** (Ubuntu and Debian families; check
+`cat /sys/module/apparmor/parameters/enabled`), the seccomp profile is only
+half the change: Docker also attaches its `docker-default` AppArmor profile,
+whose `deny mount` refuses the launcher's first mount with `EACCES` after both
+unshares succeeded. Add the AppArmor switch alongside the seccomp profile:
+
+```bash
+docker run -d --name kirocrew \
+  -p 127.0.0.1:5476:5476 \
+  -v kirocrew-home:/home/kirocrew \
+  --security-opt apparmor=unconfined \
+  --security-opt seccomp=kirocrew-seccomp.json \
+  ghcr.io/kirodotdev/kirocrew:stable
+```
+
+`apparmor=unconfined` lifts only AppArmor's per-container rules; the seccomp
+profile, dropped capabilities and the non-root user still apply. No `root`
+or `CAP_SYS_ADMIN` is involved — inside the user namespace it creates, the
+launcher already holds the capabilities its own mount namespace needs.
+
+### Kubernetes and AppArmor
+
+A Pod inverts Docker's defaults: Kubernetes applies **no seccomp profile**
+unless one is set (so both unshares succeed), and on AppArmor-enabled nodes
+the container runtime applies its **default AppArmor profile** (so the
+propagation mount is refused). The gateway then reports
+
+```text
+mount(MS_REC|MS_PRIVATE) on / failed with errno 13 (EACCES)
+```
+
+with the remedy token `mount_denied`, and a `kiro-cli` that is installed and
+signed in stays unverified until you choose one of two postures. Neither
+needs a root user or `CAP_SYS_ADMIN`.
+
+**Let the sandbox run** — set the container's AppArmor profile to
+`Unconfined` (Kubernetes 1.30+; earlier versions use the
+`container.apparmor.security.beta.kubernetes.io/<container>: unconfined`
+annotation):
+
+```yaml
+spec:
+  containers:
+    - name: kirocrew
+      securityContext:
+        appArmorProfile:
+          type: Unconfined
+```
+
+If your cluster also enforces `seccompProfile: RuntimeDefault`, that profile
+blocks `unshare`; load `kirocrew-seccomp.json` on the node and reference it
+with `seccompProfile: {type: Localhost, localhostProfile: <path>}`.
+
+**Accept the container as the only boundary** — when the AppArmor profile
+cannot change, make the sandbox's absence clean rather than partial and opt
+in explicitly (Option B's posture):
+
+```yaml
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+```
+
+together with `"agent": {"sandbox_allow_unsandboxed_exec": true}` in the
+container's `config.json` (or `KIROCREW_ALLOW_UNSANDBOXED=1` on first run).
+`RuntimeDefault` makes the very first probe step fail, so the gateway takes
+its documented no-backend path and the opt-in applies to every spawn; the
+`mount_denied` verdict alone already routes there, so the seccomp line is a
+hardening step, not a requirement. In this posture agent subprocesses share
+the container user and can read files owned by the gateway.
+
+An enterprise `sandbox.min_level` policy overrides the opt-in on a governed
+host; such a host runs no agent subprocess until its sandbox works.
 
 ### Option B — Explicit unsandboxed consent
 

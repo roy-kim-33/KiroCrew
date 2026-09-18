@@ -2,7 +2,8 @@
 
 Covers:
   * ``_truncate_snapshot`` — caps content at 200KB.
-  * ``_safe_read_snapshot`` — reads through validate_file_path; rejects sensitive paths.
+  * ``_safe_read_snapshot`` — reads through the descriptor gate; rejects sensitive
+    paths and hardlink/symlink aliases of them.
   * ``_snapshot_write_target`` — captures before-content for write tools only.
   * ``_flush_file_changes`` — dedups, scrubs credentials, attaches to last assistant message
     or creates a synthetic one when the turn aborts before any assistant text.
@@ -14,6 +15,7 @@ touching the live ACP runtime — every test stays in pure-Python land.
 
 from __future__ import annotations
 
+import os
 import shutil
 import tempfile
 from pathlib import Path
@@ -22,6 +24,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from tmpdir_helpers import short_tmp_base
 
+from conftest import requires_symlinks
 from kiro_crew.dashboard.chat_runner import (
     _MAX_SNAPSHOT,
     _flush_file_changes,
@@ -86,14 +89,30 @@ class TestSafeReadSnapshot:
         f.write_text("hello\nworld\n")
         assert _safe_read_snapshot(str(f)) == "hello\nworld\n"
 
-    def test_reads_with_explicit_utf8_encoding(self, tmp_path: Path):
+    def test_reads_utf8_regardless_of_locale(self, tmp_path: Path, monkeypatch):
+        # Git and agent-authored files are UTF-8 whatever the host's preferred
+        # code page says; the read must not consult the locale at all.
         f = tmp_path / "unicode.txt"
         f.write_text("こんにちは", encoding="utf-8")
+        import locale
 
-        with patch.object(Path, "read_text", return_value="こんにちは") as read_text:
-            assert _safe_read_snapshot(str(f)) == "こんにちは"
+        monkeypatch.setattr(locale, "getpreferredencoding", lambda *_a, **_k: "cp1252")
+        assert _safe_read_snapshot(str(f)) == "こんにちは"
 
-        read_text.assert_called_once_with(encoding="utf-8", errors="replace")
+    def test_normalizes_newlines_like_the_text_mode_read_it_replaces(self, tmp_path: Path):
+        # The strReplace "before" is a text-mode read; a CRLF "after" that kept
+        # its \r would diff every unchanged line as modified.
+        f = tmp_path / "crlf.txt"
+        f.write_bytes(b"one\r\ntwo\rthree\r\n")
+        assert _safe_read_snapshot(str(f)) == "one\ntwo\nthree\n"
+
+    def test_reads_through_the_descriptor_gate_not_by_name(self, tmp_path: Path):
+        # The bytes served must come from the descriptor the gate validated, so
+        # a by-name re-open after validation is exactly what must NOT happen.
+        f = tmp_path / "file.txt"
+        f.write_text("hello\n")
+        with patch.object(Path, "read_text", side_effect=AssertionError("re-opened by name")):
+            assert _safe_read_snapshot(str(f)) == "hello\n"
 
     def test_returns_none_for_missing_file(self, tmp_path: Path):
         assert _safe_read_snapshot(str(tmp_path / "ghost")) is None
@@ -111,11 +130,65 @@ class TestSafeReadSnapshot:
         assert _safe_read_snapshot("~/.aws/credentials") is None
         assert _safe_read_snapshot("~/.ssh/id_rsa") is None
 
+    def test_withholds_a_hardlink_alias_of_a_protected_file(self, tmp_path: Path, monkeypatch):
+        """A hardlink alias shares its target's inode but carries its own innocent
+        name: ``realpath`` yields the alias, ``is_symlink()`` is False, and every
+        name-based check passes while the bytes belong to ``~/.aws/credentials``.
+        ``st_nlink`` is the only signal, and only an open descriptor exposes it —
+        so the read has to go through the descriptor gate, not re-open by name.
+        """
+        # Path.home() reads USERPROFILE on Windows and never HOME; pin both.
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
+        from kiro_crew.security import is_sensitive_path
+
+        secret = tmp_path / ".aws" / "credentials"
+        secret.parent.mkdir()
+        secret.write_text("aws_secret_access_key = SHOULD-NOT-APPEAR\n", encoding="utf-8")
+        assert is_sensitive_path(str(secret)), "precondition: the target is protected"
+        assert _safe_read_snapshot(str(secret)) is None, "precondition: the name is refused"
+
+        alias = tmp_path / "project" / "notes.md"
+        alias.parent.mkdir()
+        try:
+            os.link(secret, alias)
+        except (OSError, NotImplementedError) as exc:  # pragma: no cover - host capability
+            pytest.skip(f"filesystem does not support hardlinks: {exc}")
+        if alias.stat().st_nlink < 2:  # pragma: no cover - host capability
+            pytest.skip("filesystem did not create a second link")
+
+        assert _safe_read_snapshot(str(alias)) is None
+
+    @requires_symlinks
+    def test_withholds_a_symlink_to_a_protected_file(self, tmp_path: Path, monkeypatch):
+        # The link is refused at the open (``O_NOFOLLOW`` / no-reparse), before
+        # any name-based resolution could launder it into an innocent path.
+        # Path.home() reads USERPROFILE on Windows and never HOME; pin both.
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
+        secret = tmp_path / ".aws" / "credentials"
+        secret.parent.mkdir()
+        secret.write_text("SHOULD-NOT-APPEAR\n", encoding="utf-8")
+        link = tmp_path / "project" / "notes.md"
+        link.parent.mkdir()
+        link.symlink_to(secret)
+        assert _safe_read_snapshot(str(link)) is None
+
     def test_truncates_large_file(self, tmp_path: Path):
         big = tmp_path / "big.txt"
         big.write_text("x" * (_MAX_SNAPSHOT + 50))
         out = _safe_read_snapshot(str(big))
         assert out is not None
+        assert "(truncated at" in out
+
+    def test_truncates_a_large_multibyte_file_with_the_marker(self, tmp_path: Path):
+        # Four-byte code points: the byte cap must still leave MORE than the
+        # character cap, or a file just over the cap would lose its marker.
+        big = tmp_path / "big.txt"
+        big.write_text("\U0001f600" * (_MAX_SNAPSHOT + 1), encoding="utf-8")
+        out = _safe_read_snapshot(str(big))
+        assert out is not None
+        assert out.startswith("\U0001f600" * _MAX_SNAPSHOT)
         assert "(truncated at" in out
 
     def test_replaces_undecodable_bytes(self, tmp_path: Path):
@@ -284,6 +357,51 @@ class TestFlushFileChanges:
         _flush_file_changes(slot)
         changes = slot.messages[-1]["meta"]["file_changes"]
         assert "AKIAIOSFODNN7EXAMPLE" not in changes[0]["before"]
+
+    def test_an_unchanged_credential_line_is_not_turned_into_a_phantom_diff(
+        self, tmp_path: Path
+    ) -> None:
+        """Redaction must not decide changed-ness.
+
+        Both sides go through the SAME pass, so a line the redactor rewrites is
+        rewritten identically on both — an untouched line stays equal and the UI
+        renders no diff. Redacting one side only (or twice on one side) would
+        render an unchanged docs line as
+        ``- Bearer <value>`` / ``+ [REDACTED: credential]``: a phantom
+        modification, with the real text hidden on the very surface meant to
+        review it.
+        """
+        f = tmp_path / "AGENTS.md"
+        unchanged = '  "headers": { "Authorization": "Bearer lp_dummy_placeholder_value" }\n'
+        f.write_text(unchanged, encoding="utf-8")
+        slot = _make_slot_with_assistant_message()
+        # Same bytes on both sides: the turn touched the file without changing
+        # this line (the reported case is a docs/config example).
+        slot._file_changes = [{"path": str(f), "content": unchanged}]
+        _flush_file_changes(slot)
+        changes = slot.messages[-1]["meta"]["file_changes"]
+        assert (
+            changes[0]["before"] == changes[0]["after"]
+        ), "identical text redacted asymmetrically -> the UI shows a diff on an unchanged line"
+        # The guard is only meaningful because the redactor DID fire here.
+        assert "lp_dummy_placeholder_value" not in changes[0]["after"]
+
+    def test_a_real_change_beside_a_credential_line_still_redacts_both_sides(
+        self, tmp_path: Path
+    ) -> None:
+        """The symmetry guard must not be satisfiable by skipping redaction."""
+        cred = '  "Authorization": "Bearer lp_dummy_placeholder_value"\n'
+        f = tmp_path / "conf.json"
+        f.write_text(cred + "changed-line\n", encoding="utf-8")
+        slot = _make_slot_with_assistant_message()
+        slot._file_changes = [{"path": str(f), "content": cred + "original-line\n"}]
+        _flush_file_changes(slot)
+        changes = slot.messages[-1]["meta"]["file_changes"]
+        assert "lp_dummy_placeholder_value" not in changes[0]["before"]
+        assert "lp_dummy_placeholder_value" not in changes[0]["after"]
+        # The genuine change survives redaction on both sides.
+        assert "original-line" in changes[0]["before"]
+        assert "changed-line" in changes[0]["after"]
 
     def test_synthetic_message_created_when_no_assistant_text(self, short_tmp_dir: Path):
         """User stopped before any assistant chunk: still surface modified files."""
@@ -662,7 +780,7 @@ class TestNoOpPassThrough:
     The dashboard renders an explicit "no changes" caption for them; a
     backend drop would compare post-truncation/post-redaction content and
     silently discard real changes past the snapshot limit or inside
-    redacted spans (PR #920 review finding).
+    redacted spans.
     """
 
     def test_noop_write_is_surfaced(self, short_tmp_dir: Path):
@@ -705,8 +823,8 @@ class TestNoOpPassThrough:
 
     def test_flush_always_resets_accumulator(self, short_tmp_dir: Path):
         """The accumulator is cleared on every flush path, so an all-no-op
-        turn can never leak its entries into a later turn (stale-entry
-        misattribution, PR #920 review finding)."""
+        turn can never leak its entries into a later turn and misattribute a
+        stale entry."""
         d = short_tmp_dir
         f = d / "a.py"
         f.write_text("content_a\n")

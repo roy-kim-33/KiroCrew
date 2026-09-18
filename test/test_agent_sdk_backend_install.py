@@ -32,11 +32,26 @@ import pytest
 
 from kiro_crew.acp_backends import (
     ACP_BACKEND_CLAUDE,
+    ACP_BACKEND_DEEPSEEK,
+    ACP_BACKEND_GOOSE,
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
+    ACP_BACKEND_OPENCODE,
+    ACP_BACKEND_PI,
     ACP_BACKENDS_KNOWN,
+    ACP_BACKENDS_SELF_SERVED_ACP,
 )
+from kiro_crew.agent_sdk import backend_cards
 from kiro_crew.agent_sdk import backend_install as probe
+from kiro_crew.agent_sdk import host_auth
+
+#: The stand-in resolution for a self-served harness that is meant to be present.
+#: One value for all of them: what these cases assert is the VERDICT the probe
+#: derives, and the particular path it derives it from is not part of that.
+_PRESENT = ("/usr/local/bin/harness", "/usr/bin")
+
+#: Its absent counterpart. Named so a case reads as the state it is setting up.
+_ABSENT = (None, "/usr/bin")
 
 
 @pytest.fixture(autouse=True)
@@ -58,8 +73,13 @@ def _stub_resolvers(
     kiro="/usr/local/bin/kiro-cli",
     adapter=(["node", "/n/acp.js"], "/usr/bin"),
     claude_cli="/usr/local/bin/claude",
+    codex=(None, "/usr/bin"),
+    pi_acp=(["node", "/n/pi-acp.js"], "/usr/bin"),
+    pi_cli=("/usr/local/bin/pi", "/usr/bin"),
+    codex_acp=(["node", "/n/codex-acp.js"], "/usr/bin"),
+    self_served=None,
 ):
-    """Patch the three spawn resolvers on the module the driver imports from.
+    """Patch the spawn resolvers on the module the driver imports from.
 
     Patched on ``kiro_crew.acp.client`` -- the DEFINING module -- because the
     driver imports them function-locally at call time, so that is the namespace
@@ -71,6 +91,224 @@ def _stub_resolvers(
     monkeypatch.setattr(client, "_resolve_kiro_bin", lambda **_kw: kiro)
     monkeypatch.setattr(client, "_resolve_claude_acp_bin", lambda: adapter)
     monkeypatch.setattr(client, "_resolve_claude_code_executable", lambda: claude_cli)
+    # pi's two halves: both are installed on the recording host, so a payload
+    # assertion that reached the real resolver would read ``installed`` here and
+    # ``missing`` in CI.
+    monkeypatch.setattr(client, "_resolve_pi_acp_bin", lambda: pi_acp)
+    monkeypatch.setattr(client, "_resolve_pi_bin", lambda: pi_cli)
+    # codex, stubbed for the same reason as the three above and missed when they were
+    # added: the payload assertion below pins its row as ``missing``, so on a host that
+    # HAS the codex adapter installed the real resolver answers ``installed`` and the
+    # test fails for a property of the machine rather than of the code.
+    monkeypatch.setattr(client, "_resolve_codex_acp_bin", lambda: codex_acp)
+    # The self-served harnesses, stubbed through the ONE resolver they share. The
+    # default answers every MEMBER of the launch table rather than naming harnesses,
+    # so onboarding one needs no edit here -- and every member needs an answer for
+    # the same reason pi does: each is installed on some recording host, so a payload
+    # assertion reaching the real resolver would read ``installed`` there and
+    # ``missing`` in CI. The shared cache is cleared too: the resolution consults it
+    # first, and a sibling test may have filled it.
+    answers = {backend: _PRESENT for backend in ACP_BACKENDS_SELF_SERVED_ACP}
+    answers.update(self_served or {})
+    monkeypatch.setattr(client, "_resolve_self_served_bin", lambda backend: answers[backend])
+    monkeypatch.setattr(client, "_self_served_bin_caches", {})
+
+
+# ── The opencode driver seams ──
+
+
+class TestSelfServedDriverSeams:
+    """One harness, one component: the seam answers presence and nothing else.
+
+    Parameterized over every member of ``ACP_BACKEND_LAUNCH`` rather than written per
+    harness, because the seam is one function: a harness of this shape that answered
+    differently would be a defect in the record, not in a function of its own.
+    """
+
+    @pytest.mark.parametrize("backend", sorted(ACP_BACKENDS_SELF_SERVED_ACP))
+    def test_a_resolved_binary_is_a_yes(self, backend, monkeypatch):
+        from kiro_crew.agent_sdk.drivers import acp as driver
+
+        _stub_resolvers(monkeypatch, self_served={backend: _PRESENT})
+        assert driver.self_served_resolves(backend) is True
+
+    @pytest.mark.parametrize("backend", sorted(ACP_BACKENDS_SELF_SERVED_ACP))
+    def test_an_absent_binary_is_a_no(self, backend, monkeypatch):
+        from kiro_crew.agent_sdk.drivers import acp as driver
+
+        _stub_resolvers(monkeypatch, self_served={backend: _ABSENT})
+        assert driver.self_served_resolves(backend) is False
+
+    @pytest.mark.parametrize("backend", sorted(ACP_BACKENDS_SELF_SERVED_ACP))
+    def test_the_install_command_is_the_records_own(self, backend):
+        """Read from the record, so the advice cannot drift from the binary searched for.
+
+        Compared against the record rather than a literal: a literal here would pin
+        the WORDING of operator advice, when the contract is that the two agree.
+        """
+        from kiro_crew.agent_sdk.backends import launch_for
+        from kiro_crew.agent_sdk.drivers import acp as driver
+
+        assert driver.self_served_install_command(backend) == launch_for(backend).install_command
+        assert launch_for(backend).install_command
+
+
+class TestSelfServedCachedNegative:
+    """The cases the adapter seams honour, on the ONE cache these harnesses share.
+
+    An ABSENT key is the "not looked at yet" state the adapters spell with a
+    sentinel, and it must not read as a negative: a probe that answered
+    ``restart_required`` for a harness this process never resolved would tell an
+    operator to restart for nothing.
+    """
+
+    @pytest.mark.parametrize("backend", sorted(ACP_BACKENDS_SELF_SERVED_ACP))
+    def test_an_absent_key_is_not_a_negative(self, backend, monkeypatch):
+        from kiro_crew.acp import client
+        from kiro_crew.agent_sdk.drivers import acp as driver
+
+        monkeypatch.setattr(client, "_self_served_bin_caches", {})
+        assert driver.self_served_cached_negative(backend) is False
+
+    @pytest.mark.parametrize("backend", sorted(ACP_BACKENDS_SELF_SERVED_ACP))
+    def test_a_cached_absence_is_a_negative(self, backend, monkeypatch):
+        from kiro_crew.acp import client
+        from kiro_crew.agent_sdk.drivers import acp as driver
+
+        monkeypatch.setattr(client, "_self_served_bin_caches", {backend: (None, "/usr/bin")})
+        assert driver.self_served_cached_negative(backend) is True
+
+    @pytest.mark.parametrize("backend", sorted(ACP_BACKENDS_SELF_SERVED_ACP))
+    def test_a_cached_path_is_not_a_negative(self, backend, monkeypatch):
+        from kiro_crew.acp import client
+        from kiro_crew.agent_sdk.drivers import acp as driver
+
+        monkeypatch.setattr(
+            client, "_self_served_bin_caches", {backend: ("/opt/harness", "/usr/bin")}
+        )
+        assert driver.self_served_cached_negative(backend) is False
+
+    def test_one_harnesss_absence_is_not_anothers(self, monkeypatch):
+        """The cache is shared, so a miss must stay keyed to the harness that missed."""
+        from kiro_crew.acp import client
+        from kiro_crew.agent_sdk.drivers import acp as driver
+
+        monkeypatch.setattr(
+            client,
+            "_self_served_bin_caches",
+            {ACP_BACKEND_OPENCODE: (None, "/usr/bin")},
+        )
+        assert driver.self_served_cached_negative(ACP_BACKEND_OPENCODE) is True
+        assert driver.self_served_cached_negative(ACP_BACKEND_GOOSE) is False
+        assert driver.self_served_cached_negative(ACP_BACKEND_DEEPSEEK) is False
+
+    def test_an_unparseable_cache_fails_safe(self, monkeypatch):
+        from kiro_crew.acp import client
+        from kiro_crew.agent_sdk.drivers import acp as driver
+
+        monkeypatch.setattr(client, "_self_served_bin_caches", {ACP_BACKEND_OPENCODE: 42})
+        assert driver.self_served_cached_negative(ACP_BACKEND_OPENCODE) is False
+
+    def test_a_non_mapping_cache_fails_safe(self, monkeypatch):
+        from kiro_crew.acp import client
+        from kiro_crew.agent_sdk.drivers import acp as driver
+
+        monkeypatch.setattr(client, "_self_served_bin_caches", 42)
+        assert driver.self_served_cached_negative(ACP_BACKEND_OPENCODE) is False
+
+    @pytest.mark.parametrize("backend", sorted(ACP_BACKENDS_SELF_SERVED_ACP))
+    def test_installed_after_a_cached_miss_reports_restart_required(self, backend, monkeypatch):
+        """The divergence the flag exists for: on disk now, absent in this process."""
+        from kiro_crew.acp import client
+
+        _stub_resolvers(monkeypatch, self_served={backend: _PRESENT})
+        monkeypatch.setattr(client, "_self_served_bin_caches", {backend: (None, "/usr/bin")})
+        state = probe.probe_backend(backend)
+        assert state.installed == probe.INSTALLED
+        assert state.restart_required is True
+
+
+class TestSelfServedVerdicts:
+    """The probe says installed, or names the one thing to install."""
+
+    @pytest.mark.parametrize("backend", sorted(ACP_BACKENDS_SELF_SERVED_ACP))
+    def test_a_resolved_binary_is_installed_and_names_nothing(self, backend, monkeypatch):
+        from kiro_crew.acp import client
+
+        _stub_resolvers(monkeypatch, self_served={backend: _PRESENT})
+        monkeypatch.setattr(client, "_self_served_bin_caches", {})
+        state = probe.probe_backend(backend)
+        assert state.installed == probe.INSTALLED
+        assert state.missing_components == ()
+        assert state.install_command == ""
+        assert state.restart_required is False
+        assert state.policy_id == backend
+
+    @pytest.mark.parametrize("backend", sorted(ACP_BACKENDS_SELF_SERVED_ACP))
+    def test_an_absent_binary_names_the_component_and_the_command(self, backend, monkeypatch):
+        """The component is the harness's own binary, which is what must be installed.
+
+        The live case for reading it from the record rather than restating it: one of
+        these harnesses ships its ACP support as a PLUGIN, so naming the plugin here
+        would send an operator to install something that still would not run.
+        """
+        from kiro_crew.agent_sdk.backends import launch_for
+        from kiro_crew.agent_sdk.drivers import acp as driver
+
+        _stub_resolvers(monkeypatch, self_served={backend: _ABSENT})
+        state = probe.probe_backend(backend)
+        assert state.installed == probe.MISSING
+        assert state.missing_components == (launch_for(backend).binary,)
+        assert state.install_command == driver.self_served_install_command(backend)
+
+
+class TestPiVerdicts:
+    """Two components, one installer: the probe names whichever half is absent."""
+
+    def test_both_resolved_is_installed_and_names_nothing(self, monkeypatch):
+        from kiro_crew.acp import client
+
+        _stub_resolvers(monkeypatch)
+        monkeypatch.setattr(client, "_pi_acp_argv_cache", client._UNRESOLVED)
+        monkeypatch.setattr(client, "_pi_bin_cache", client._UNRESOLVED)
+        state = probe.probe_backend(ACP_BACKEND_PI)
+        assert state.installed == probe.INSTALLED
+        assert state.missing_components == ()
+        assert state.install_command == ""
+        assert state.restart_required is False
+        assert state.policy_id == "pi"
+
+    def test_an_absent_adapter_names_the_adapter(self, monkeypatch):
+        from kiro_crew.agent_sdk.drivers import acp as driver
+
+        _stub_resolvers(monkeypatch, pi_acp=(None, "/usr/bin"))
+        state = probe.probe_backend(ACP_BACKEND_PI)
+        assert state.installed == probe.MISSING
+        assert state.missing_components == (probe.COMPONENT_PI_ACP_ADAPTER,)
+        assert state.install_command == driver.pi_install_command()
+
+    def test_an_absent_agent_names_the_agent(self, monkeypatch):
+        """The half the adapter would spawn, missing on its own: a distinct verdict."""
+        _stub_resolvers(monkeypatch, pi_cli=(None, "/usr/bin"))
+        state = probe.probe_backend(ACP_BACKEND_PI)
+        assert state.installed == probe.MISSING
+        assert state.missing_components == (probe.COMPONENT_PI_CLI,)
+        assert state.install_command.startswith("npm i -g ")
+
+    def test_both_absent_names_both(self, monkeypatch):
+        _stub_resolvers(monkeypatch, pi_acp=(None, "/usr/bin"), pi_cli=(None, "/usr/bin"))
+        state = probe.probe_backend(ACP_BACKEND_PI)
+        assert state.missing_components == (probe.COMPONENT_PI_ACP_ADAPTER, probe.COMPONENT_PI_CLI)
+
+    def test_a_cached_miss_on_either_component_reports_restart_required(self, monkeypatch):
+        from kiro_crew.acp import client
+
+        _stub_resolvers(monkeypatch)
+        monkeypatch.setattr(client, "_pi_acp_argv_cache", (["node", "/n/pi-acp.js"], "/usr/bin"))
+        monkeypatch.setattr(client, "_pi_bin_cache", (None, "/usr/bin"))
+        state = probe.probe_backend(ACP_BACKEND_PI)
+        assert state.installed == probe.INSTALLED
+        assert state.restart_required is True
 
 
 # ── The codex driver seams ──
@@ -562,7 +800,16 @@ class TestEndpointPayloadShape:
     def test_owner_gets_one_row_per_backend_in_the_pinned_shape(self, monkeypatch):
         from kiro_crew.dashboard.handlers import acp_backend_status as handler
 
-        _stub_resolvers(monkeypatch, adapter=(None, "/usr/bin"), claude_cli=None)
+        # codex's resolver is stubbed NOT-FOUND alongside claude's, because the row
+        # assertion below pins it as ``missing``: reaching the real resolver would read
+        # ``installed`` on any host that has the adapter and ``missing`` in CI, so the
+        # test would answer a question about the machine rather than about the payload.
+        _stub_resolvers(
+            monkeypatch,
+            adapter=(None, "/usr/bin"),
+            claude_cli=None,
+            codex_acp=(None, "/usr/bin"),
+        )
         # ``selectable`` is pinned rather than read live: this assertion is about
         # the payload carrying the governance answer, not about what this
         # deployment's policy happens to permit today.
@@ -574,9 +821,22 @@ class TestEndpointPayloadShape:
         assert response.status == 200
 
         rows = json.loads(response.text or "{}")["backends"]
+<<<<<<< HEAD
         # RoyCrew fork adds "opencode" to ACP_BACKENDS_KNOWN; upstream doesn't
         # know about it, so it wasn't in the pinned shape.
         assert [r["policy_id"] for r in rows] == ["claude", "codex", "kas", "kiro", "opencode"]
+=======
+        assert [r["policy_id"] for r in rows] == [
+            "claude",
+            "codex",
+            "deepseek",
+            "goose",
+            "kas",
+            "kiro",
+            "opencode",
+            "pi",
+        ]
+>>>>>>> upstream/main
         for row in rows:
             assert set(row) == {
                 "id",
@@ -586,7 +846,29 @@ class TestEndpointPayloadShape:
                 "missing_components",
                 "install_command",
                 "restart_required",
+                "auth",
+                # The capability card, spread into the row rather than nested:
+                # each of these four is read on its own by the panel. What each
+                # line MEANS is pinned in ``test_backend_cards``; this file pins
+                # that the row carries them.
+                "capabilities",
+                "security_notes",
+                "operator_notes",
+                "tool_approval",
+                "offered_by_build",
             }
+            # Sign-in is the harness's own third fact, so every row carries it --
+            # including a row whose harness this build cannot serve, which is the
+            # one an operator is most likely to be asking about.
+            assert set(row["auth"]) == {"sign_in_remedy", "signs_in_separately"}
+            # Every row carries the WHOLE card, including a harness this build
+            # cannot serve: an operator comparing two harnesses is reading the
+            # same questionnaire for each, and a row short of a line would make
+            # the two incomparable with nothing to say so.
+            assert [entry["id"] for entry in row["capabilities"]] == [
+                spec.id for spec in backend_cards.USER_FACING_LINES
+            ]
+            assert isinstance(row["tool_approval"], str) and row["tool_approval"]
 
         by_policy = {r["policy_id"]: r for r in rows}
         assert by_policy["kiro"] == {
@@ -597,6 +879,20 @@ class TestEndpointPayloadShape:
             "missing_components": [],
             "install_command": "",
             "restart_required": False,
+            # Compared against the declaration rather than a literal copy of the
+            # remedy: the string is rendered verbatim by the panel, so a literal
+            # here would pin the WORDING, and every reword of the operator advice
+            # would read as a wire-contract break.
+            "auth": {
+                "sign_in_remedy": host_auth.declaration_for("").sign_in_remedy,
+                "signs_in_separately": False,
+            },
+            # Compared against the projection for the same reason: the card is
+            # DERIVED from capability membership, so a literal copy here would
+            # pin today's memberships and read a deliberate capability change as
+            # a wire break. What this asserts is that the row carries the
+            # projection unaltered -- the handler adds nothing and drops nothing.
+            **backend_cards.card_payload(ACP_BACKEND_KIRO),
         }
         # Not selectable in this build AND not installed here -- both facts on
         # one row, which is the whole reason the endpoint exists.
@@ -618,6 +914,16 @@ class TestEndpointPayloadShape:
         # ``selectable`` stays False here because this test PINS the live enum to
         # ``["", "kas"]`` above; it asserts the payload shape, not the registry.
         assert by_policy["codex"]["selectable"] is False
+        # opencode's row is the one-component shape. The resolver is stubbed PRESENT
+        # above, so this pins the installed form -- and with it that the row invents
+        # neither a component nor a command when there is nothing to install.
+        assert by_policy["opencode"]["installed"] == "installed"
+        assert by_policy["opencode"]["missing_components"] == []
+        assert by_policy["opencode"]["install_command"] == ""
+        # pi's row is the two-component shape with both resolvers stubbed present.
+        assert by_policy["pi"]["installed"] == "installed"
+        assert by_policy["pi"]["missing_components"] == []
+        assert by_policy["pi"]["install_command"] == ""
 
     def test_an_unknown_row_names_no_components(self, monkeypatch):
         """The three-state rule, enforced at the payload boundary too.

@@ -9,6 +9,18 @@ nothing on the page ever said which component was absent. This module answers
 the third, machine-local question, and is the only one whose answer can change
 without a config write or a new build.
 
+**Installed is not signed in, and this module deliberately probes no credential.**
+Every verdict here is about a FILE resolving; none of it says a harness can
+authenticate. That gap is real -- an installed-and-signed-out harness still dies
+at ``session/new`` -- but the answer does not belong here: reading another
+harness's token is what the credential floor exists to forbid, and a probe that
+did it would be the one reader the floor cannot fence. The sign-in answer is
+declared per harness in :mod:`kiro_crew.agent_sdk.host_auth` and reaches the
+operator as a remedy string the doctor row and the backend panel render
+verbatim. So a caller that wants "can this harness actually run" reads a
+declaration beside this state, and nothing here grows a credential probe or a
+field claiming one ran.
+
 **The resolving itself is the driver's, not this module's.** Everything that has
 to reach the harness -- the binary resolves, the read of the spawn's own
 process-lifetime cache, the remedy's package name -- lives in
@@ -25,19 +37,23 @@ have, and the remedy is a global npm install.
 
 from __future__ import annotations
 
+import functools
 import logging
 import threading
 import time
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Tuple
 
-from kiro_crew.acp_backends import (
+from kiro_crew.agent_sdk.backends import (
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_CODEX,
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
+    ACP_BACKEND_PI,
     ACP_BACKENDS_KNOWN,
+    ACP_BACKENDS_SELF_SERVED_ACP,
     POLICY_ID_BY_BACKEND,
+    launch_for,
 )
 from kiro_crew.agent_sdk.drivers import acp as acp_driver
 
@@ -67,6 +83,15 @@ COMPONENT_CLAUDE_CODE_CLI = "claude"
 #: The codex-acp adapter. ONE component, not two: the adapter ships its own
 #: compatible Codex binary, so there is no second executable Crew resolves.
 COMPONENT_CODEX_ACP_ADAPTER = "codex-acp"
+
+#: The component of a harness that serves ACP from its own binary is that binary, so
+#: it is read from ``ACP_BACKEND_LAUNCH`` rather than named a second time here. ONE
+#: component each, and for those harnesses that is not a simplification: there is no
+#: adapter beside them to be half-installed.
+#: The pi backend's TWO components: the ``pi-acp`` adapter Crew spawns, and the
+#: ``pi`` agent that adapter spawns in turn. Either can be absent on its own.
+COMPONENT_PI_ACP_ADAPTER = "pi-acp"
+COMPONENT_PI_CLI = "pi"
 
 #: How long a verdict is reused. The Claude driver shells out to mise and globs
 #: the filesystem, and the dashboard polls this endpoint, so an uncached probe
@@ -198,6 +223,42 @@ def _probe_claude() -> BackendInstallState:
 #: Backend id → its probe. A registry rather than an ``if`` chain so an id with
 #: no probe is a lookup miss that degrades to ``UNKNOWN``, instead of falling
 #: through to whichever branch happened to be last.
+def _probe_self_served(backend: str) -> BackendInstallState:
+    """One component, named from *backend*'s launch record.
+
+    Every harness in ``ACP_BACKEND_LAUNCH`` has the same install shape, and that is
+    why one function answers for all of them: the binary that would be missing is the
+    binary that serves ACP, so an absent verdict names ONE component and ONE command
+    and there is no half-installed state to distinguish. The two Node adapters and pi
+    each have two components and keep probes of their own.
+
+    The component and the command both come from the record, which is what stops an
+    operator being told to install something that is not what the ladder searches for
+    -- the live case being a harness whose ACP package is a PLUGIN rather than the
+    host that boots it.
+
+    ``restart_required`` is read from the spawn path's own cache, like every sibling:
+    the binary resolves NOW, but this process already cached its absence, so a session
+    started right now still fails until the gateway restarts.
+    """
+    launch = launch_for(backend)
+    policy_id = _policy_id(backend)
+    if acp_driver.self_served_resolves(backend):
+        return BackendInstallState(
+            backend,
+            policy_id,
+            INSTALLED,
+            restart_required=acp_driver.self_served_cached_negative(backend),
+        )
+    return BackendInstallState(
+        backend,
+        policy_id,
+        MISSING,
+        (launch.binary,),
+        acp_driver.self_served_install_command(backend),
+    )
+
+
 def _probe_codex() -> BackendInstallState:
     """The Codex backend needs one component, and names it when it is absent.
 
@@ -228,11 +289,59 @@ def _probe_codex() -> BackendInstallState:
     )
 
 
+def _probe_pi() -> BackendInstallState:
+    """The pi backend needs BOTH components, and names the absent one.
+
+    The claude probe's shape, because the harness has the same split: the adapter
+    is what Crew spawns and the agent is what the adapter spawns, and having one
+    without the other is a distinguishable half-install. Unlike claude, ONE command
+    installs both -- both are npm packages -- so it is suggested whichever half is
+    missing.
+
+    ``restart_required`` reads the spawn path's own caches for the same reason the
+    other probes do: both components resolve once per process and never
+    invalidate, so a fresh "installed" can disagree with what the next spawn does.
+    """
+    adapter_present, pi_present = acp_driver.pi_components_resolve()
+
+    missing: List[str] = []
+    if not adapter_present:
+        missing.append(COMPONENT_PI_ACP_ADAPTER)
+    if not pi_present:
+        missing.append(COMPONENT_PI_CLI)
+
+    policy_id = _policy_id(ACP_BACKEND_PI)
+    if not missing:
+        return BackendInstallState(
+            ACP_BACKEND_PI,
+            policy_id,
+            INSTALLED,
+            restart_required=acp_driver.pi_cached_negative(),
+        )
+    return BackendInstallState(
+        ACP_BACKEND_PI,
+        policy_id,
+        MISSING,
+        tuple(missing),
+        acp_driver.pi_install_command(),
+    )
+
+
 _PROBES: Dict[str, Callable[[], BackendInstallState]] = {
     ACP_BACKEND_KIRO: _probe_kiro,
     ACP_BACKEND_KAS: _probe_kas,
     ACP_BACKEND_CLAUDE: _probe_claude,
     ACP_BACKEND_CODEX: _probe_codex,
+    ACP_BACKEND_PI: _probe_pi,
+    # Every harness that serves ACP from its own binary is probed by the one function
+    # above, bound to its id. Generated from the membership rather than listed, so
+    # onboarding a harness of that shape adds no row here at all -- and a harness with
+    # no row degrades to UNKNOWN rather than to another harness's verdict, which is
+    # what a registry buys over an ``if`` chain.
+    **{
+        backend: functools.partial(_probe_self_served, backend)
+        for backend in sorted(ACP_BACKENDS_SELF_SERVED_ACP)
+    },
 }
 
 
