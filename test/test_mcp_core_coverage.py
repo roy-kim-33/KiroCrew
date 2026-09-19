@@ -1,6 +1,6 @@
 """Coverage tests for ``kiro_crew.mcp_core`` helpers and thin tool bodies.
 
-Focus areas (the largest previously-uncovered blocks):
+Focus areas (the largest coverage gaps):
 
 * the browser-snapshot compressors (``_compress_snapshot_to_outline`` /
   ``_search_snapshot``) and the ``browse_outline`` / ``browse_search`` tools
@@ -186,6 +186,31 @@ class TestHttpErrorBody:
         secret = "AKIA" + "I" * 16
         err = _http_error(400, json.dumps({"error": f"bad key {secret}"}).encode())
         assert secret not in _http_error_body(err)["error"]
+
+    @pytest.mark.parametrize(
+        ("code", "expected"),
+        [
+            ("caller_record_missing", "cron or subagent record no longer exists"),
+            ("unix_peer_unverified", "could not verify this Unix-socket caller"),
+            ("peer_session_mismatch", "bound to a different session"),
+        ],
+    )
+    def test_internal_auth_denial_codes_are_actionable(self, code: str, expected: str):
+        err = _http_error(403, json.dumps({"error": "Forbidden", "code": code}).encode())
+        out = _http_error_body(err)
+        assert expected in out["error"]
+        assert out["error"] != "Forbidden"
+        assert out["code"] == code
+
+    def test_unrelated_error_code_keeps_the_backend_message(self):
+        err = _http_error(
+            403,
+            b'{"error": "Forbidden", "code": "unrelated_auth_denial"}',
+        )
+        assert _http_error_body(err) == {
+            "error": "Forbidden",
+            "code": "unrelated_auth_denial",
+        }
 
 
 @pytest.mark.parametrize("verb", ["_get", "_patch", "_put", "_delete"])
@@ -435,12 +460,18 @@ class TestDoSelectCrew:
     def test_named_crew_returns_resolved_bindings(self, monkeypatch: pytest.MonkeyPatch, tmp_path):
         cfg = _crew_config({"docs": SimpleNamespace(triggers="d", model="opus")}, "main")
         self._patch_cfg(monkeypatch, cfg)
+
+        def resolve(_cfg, _name, *, validate_memory_files=True):
+            assert _cfg is cfg and _name == "docs"
+            assert validate_memory_files is False
+            return SimpleNamespace(
+                kiro_agent="ka", workspace_dir=tmp_path / "ws", memory_store_name="ms"
+            )
+
         monkeypatch.setattr(
             mcp_core,
             "resolve_agent_bindings",
-            lambda _cfg, _name: SimpleNamespace(
-                kiro_agent="ka", workspace_dir=tmp_path / "ws", memory_store_name="ms"
-            ),
+            resolve,
         )
         out = json.loads(_do_select_crew("docs"))
         assert out["crew"] == "docs"
@@ -497,14 +528,14 @@ class TestSpawnRunArgumentHandling:
 
     def test_keep_spawn_advertises_continuability(self):
         with patch.object(mcp_core, "_post", return_value={"id": "ag1"}):
-            out = _call_tool("spawn_run", {"task": "one", "keep": True})
+            out = _call_tool("spawn_run", {"task": "one", "keep": True, "solo_reason": "bulk_data"})
         assert "GUARANTEED continuability" in out
         assert "spawn_release" in out
 
     def test_transport_error_is_reported_as_unknown_acceptance(self):
         err = {"error": "read timeout", "transport_error": True}
         with patch.object(mcp_core, "_post", return_value=err) as m:
-            out = _call_tool("spawn_run", {"task": "one"})
+            out = _call_tool("spawn_run", {"task": "one", "solo_reason": "bulk_data"})
         assert "acceptance status is unknown" in out
         assert "Do not retry automatically" in out
         # A transport failure must NOT be reconciled as a lost wave member.
@@ -570,7 +601,7 @@ class TestSpawnRunArgumentHandling:
     def test_approval_mode_env_is_forwarded(self, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.setenv("KIROCREW_APPROVAL_MODE", "auto")
         with patch.object(mcp_core, "_post", return_value={"id": "ag1"}) as m:
-            _call_tool("spawn_run", {"task": "one"})
+            _call_tool("spawn_run", {"task": "one", "solo_reason": "bulk_data"})
         assert m.call_args[0][1]["approval_mode"] == "auto"
 
 
@@ -665,27 +696,43 @@ class TestWorkflowAuthor:
 
 
 class TestWorkflowRun:
-    def test_refuses_to_start_without_strict_session_identity(self):
+    @pytest.mark.parametrize(
+        "args",
+        [
+            {"workflow": "debug-project"},
+            {"source": "ctx.agent('x')"},
+            {"intent": "debug the project"},
+        ],
+    )
+    def test_refuses_to_start_without_strict_session_identity(self, args):
         with (
             patch.object(mcp_core, "_resolve_session_key_strict", return_value=""),
             patch.object(mcp_core, "_post") as mocked,
         ):
-            out = _call_tool("workflow_run", {"workflow": "debug-project"})
+            # The fixture still offers a lenient identity; it cannot authorize a run.
+            out = _call_tool("workflow_run", args)
 
-        assert "cannot verify caller identity" in out
+        assert "Cannot verify the current workflow caller" in out
+        assert "No workflow action was performed" in out
         mocked.assert_not_called()
 
-    def test_ad_hoc_run_keeps_the_existing_identity_fallback(self):
+    @pytest.mark.parametrize(
+        "args, endpoint",
+        [
+            ({"source": "ctx.agent('x')"}, "/api/workflows/run"),
+            ({"intent": "debug the project"}, "/api/workflows/run_intent"),
+        ],
+    )
+    def test_ad_hoc_run_passes_only_the_verified_identity(self, args, endpoint):
         with (
-            patch.object(mcp_core, "_resolve_session_key_strict", return_value=""),
+            patch.object(
+                mcp_core, "_resolve_session_key_strict", return_value="dashboard:verified"
+            ),
             patch.object(mcp_core, "_post", return_value={"run_id": "r-ad-hoc"}) as mocked,
         ):
-            out = _call_tool("workflow_run", {"source": "ctx.agent('x')"})
+            out = _call_tool("workflow_run", args)
 
-        mocked.assert_called_once_with(
-            "/api/workflows/run",
-            {"source": "ctx.agent('x')"},
-        )
+        mocked.assert_called_once_with(endpoint, args, session_key="dashboard:verified")
         assert "r-ad-hoc" in out
 
     def test_saved_workflow_reference_runs_exact_definition(self):
@@ -768,6 +815,56 @@ class TestWorkflowDefinitionLibrary:
             out = _call_tool("workflow_library_list", {"search": "debugging"})
         assert mocked.call_args[0][0] == "/api/workflows/definitions?q=debugging"
         assert "/workflow debug-project" in out
+
+
+class TestWorkflowReadIdentity:
+    @pytest.mark.parametrize("tool", ["workflow_status", "workflow_result", "workflow_list"])
+    def test_reads_refuse_inherited_identity_without_http(self, tool):
+        with (
+            patch.object(mcp_core, "_resolve_session_key_strict", return_value="") as strict,
+            patch.object(mcp_core, "strict_identity_diagnosis", return_value=""),
+            patch.object(mcp_core, "_get") as get,
+        ):
+            out = _call_tool(tool, {} if tool == "workflow_list" else {"run_id": "r1"})
+        assert "Cannot verify the current workflow caller" in out
+        assert "No workflow action was performed" in out
+        strict.assert_called_once_with()
+        get.assert_not_called()
+
+    @pytest.mark.parametrize("tool", ["workflow_status", "workflow_result", "workflow_list"])
+    @pytest.mark.parametrize("refused", [False, True])
+    def test_reads_forward_exact_verified_identity(self, tool, refused):
+        from kiro_crew.mcp_tools.workflows import HANDLERS
+
+        response = (
+            {"error": "foreign run refused"}
+            if refused
+            else {
+                "run_id": "r1",
+                "status": "finished",
+                "result": "owned result",
+                "runs": [{"run_id": "r1", "status": "finished"}],
+            }
+        )
+        with (
+            patch.object(
+                mcp_core, "_resolve_session_key_strict", return_value="dashboard:verified"
+            ) as strict,
+            patch.object(
+                mcp_core, "_resolve_session_key", side_effect=AssertionError("identity re-resolved")
+            ),
+            patch.object(mcp_core, "_get", return_value=response) as get,
+            patch.object(mcp_core, "sel") as audit,
+        ):
+            out = HANDLERS[tool](tool, {} if tool == "workflow_list" else {"run_id": "r1"})
+        strict.assert_called_once_with()
+        endpoint = "/api/workflows/runs" + ("" if tool == "workflow_list" else "/r1")
+        get.assert_called_once_with(endpoint, session_key="dashboard:verified")
+        assert (
+            audit.return_value.log_tool_invocation.call_args.kwargs["session_key"]
+            == "dashboard:verified"
+        )
+        assert ("foreign run refused" in out) if refused else ("r1" in out)
 
 
 class TestWorkflowStatusAndResult:
@@ -1012,6 +1109,43 @@ class TestRegisterHook:
         assert "hooks.json is corrupted" in out
         assert hook_file.read_text() == "{not json"
 
+    def test_acquiring_the_lock_does_not_truncate_the_lock_file(self):
+        """The lock-file open must be WRITABLE but MUST NOT truncate.
+
+        ``msvcrt.locking`` needs a writable handle, so the fd cannot be opened
+        ``"r"``; but ``"w"`` truncates at open, and on Windows a truncating
+        open of a lock file whose first byte another holder already locked
+        raises a sharing violation instead of waiting — the contending acquirer
+        crashes before it reaches ``flock_exclusive`` and the serialisation the
+        lock exists to provide never happens. POSIX ``flock`` tolerates the
+        truncate, which is why the defect is invisible on Linux.
+
+        The lock file's bytes must survive acquisition. ``hooks.json.lock`` is the SAME file
+        ``webhooks.locked`` guards from another module, so cross-process
+        contention on it is the store's normal state — which is why truncation
+        (the platform-independent observable those PRs pinned) is asserted
+        here: seed the lock file, register a hook, require the bytes survived.
+        """
+        seed = b"lock-file-content-that-must-survive"
+        lock_path = mcp_core.config_dir() / "hooks.json.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path.write_bytes(seed)
+
+        out = _call_tool("register_hook", {"hook_id": "review-bot", "context_summary": "c"})
+
+        assert "Hook registered: review-bot" in out
+        assert lock_path.read_bytes() == seed
+
+    def test_registration_works_when_the_lock_file_is_absent(self):
+        """First registration must create the lock file rather than raise."""
+        lock_path = mcp_core.config_dir() / "hooks.json.lock"
+        assert not lock_path.exists()
+
+        out = _call_tool("register_hook", {"hook_id": "first-run", "context_summary": "c"})
+
+        assert "Hook registered: first-run" in out
+        assert lock_path.exists()
+
 
 class TestReadSlackProfile:
     def test_profile_values_are_redacted_but_id_is_preserved(self):
@@ -1136,7 +1270,13 @@ class TestFileSend:
         src = tmp_path / "creds.txt"
         src.write_text("AKIA" + "P" * 16)
         out = _call_tool("file_send", {"path": str(src)})
-        assert out == "Error: file content contains sensitive data; send aborted"
+        assert out.startswith("Error: file content contains sensitive data; send aborted")
+        # The refusal now names the remedy. A wall that does not say a consented
+        # path exists is the reported complaint, so this
+        # asserts MORE than the previous exact-equality pin, not less -- and it
+        # asserts the never-grantable legs are named as such.
+        assert "/api/file-delivery/consent" in out
+        assert "can never be granted" in out
 
     def test_disallowed_binary_mime_is_refused(self, tmp_path):
         src = tmp_path / "payload.bin"
@@ -1211,8 +1351,14 @@ class TestFileSend:
 
         with patch.object(mcp_core, "_post", side_effect=_post) as m:
             out = _call_tool("file_send", {"path": str(src)})
-        assert out == "File sent: report.txt"
+        # The invariant this test owns: a channel SKIP does not disturb the
+        # Slack leg, which still runs as the fallback.
         assert any(c[0][0] == "/api/slack/upload-file" for c in m.call_args_list)
+        # The skip is also REPORTED. It must not read a bare "File sent:
+        # report.txt", which is indistinguishable from a delivery for a file
+        # that only reached the dashboard (see test_file_send_skip_reason.py).
+        assert out.startswith("File sent: report.txt")
+        assert "no_channel_destination" in out
 
     def test_channel_failure_warns_and_falls_back_to_slack(self, tmp_path, monkeypatch):
         monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: "dashboard:chat-1")
@@ -1298,8 +1444,10 @@ class TestValidateArgs:
             _validate_args("workflow_status", {"run_id": "r1", "junk": "x"})
 
     def test_schemaless_tool_passes_through_untouched(self):
+        # ``memory_recall`` validates its own ``query`` in the handler and has no
+        # entry in MCP_CORE_SCHEMAS, so it exercises the pass-through branch.
         raw = {"anything": 1}
-        assert _validate_args("learn_list", raw) == raw
+        assert _validate_args("memory_recall", raw) == raw
 
     def test_invalid_run_id_pattern_is_rejected(self):
         from kiro_crew.validation import ValidationError

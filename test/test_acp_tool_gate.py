@@ -5,8 +5,9 @@ Two axes that must not be conflated, and each test names which one it is on:
 * **Truth** -- what :func:`routing_verdict` SAYS about a harness. Every harness
   gets an honest verdict, including the ones this core does not enforce.
 * **Enforcement** -- whether a non-ROUTED verdict REFUSES. Scoped to the
-  mechanisms this core implements end to end, which today is ``SESSION_CONFIG``
-  only.
+  mechanisms this core implements end to end: ``SESSION_CONFIG``, which checks the
+  advertised option, and ``VERIFIED_SEEDED_SETTINGS``, which reads back the setting
+  it wrote.
 
 Collapsing them is the failure this file exists to prevent: upgrading an
 unenforced harness to ``ROUTED`` so it stops refusing would make the picker and
@@ -19,15 +20,21 @@ from __future__ import annotations
 
 import os
 import pathlib
+import sys
 
 import pytest
 
 from kiro_crew import acp_tool_gate as gate
+from kiro_crew import platform_compat
 from kiro_crew.acp_backends import (
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_CODEX,
+    ACP_BACKEND_DEEPSEEK,
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
+    ACP_BACKEND_OPENCODE,
+    ACP_BACKEND_PI,
+    ACP_BACKEND_ROUTING,
     Routing,
     permission_config_for,
     routing_for,
@@ -35,6 +42,14 @@ from kiro_crew.acp_backends import (
 from kiro_crew.security import sensitive_home_dirs
 
 AGENT_SPEC_BACKENDS = (ACP_BACKEND_KIRO, ACP_BACKEND_KAS)
+
+#: Production routing table, not a hand-maintained id list: a newly enforced
+#: harness must pick up the Windows copy with its own ``label_for`` name.
+ENFORCED_BACKENDS = tuple(
+    backend for backend, routing in ACP_BACKEND_ROUTING.items() if routing in gate.ENFORCED_ROUTINGS
+)
+
+_GENERIC_SANDBOX_REMEDY = "Set agent.sandbox to 'standard' or 'strict'"
 
 
 # ── Truth: what the verdict says ─────────────────────────────────────────────
@@ -80,14 +95,35 @@ def test_unknown_backend_fails_closed() -> None:
 # ── Enforcement scope ────────────────────────────────────────────────────────
 
 
-def test_only_session_config_is_enforced() -> None:
+def test_only_implemented_mechanisms_are_enforced() -> None:
     """The enforced set is a mechanism list, not a harness allowlist.
 
     Scoping by mechanism is what makes widening it require IMPLEMENTING one; an
-    id-based allowlist could be widened by editing a literal.
+    id-based allowlist could be widened by editing a literal. Every member carries an
+    observation: SESSION_CONFIG checks the advertised option before the first
+    prompt, VERIFIED_SEEDED_SETTINGS reads back the setting it wrote, and
+    VERIFIED_GATE_EXTENSION reads the harness's own command registry back for the
+    gate it loaded. Plain SEEDED_SETTINGS is absent for exactly that reason -- it
+    writes without reading.
     """
-    assert gate.ENFORCED_ROUTINGS == frozenset({Routing.SESSION_CONFIG})
+    assert gate.ENFORCED_ROUTINGS == frozenset(
+        {
+            Routing.SESSION_CONFIG,
+            Routing.VERIFIED_SEEDED_SETTINGS,
+            Routing.VERIFIED_GATE_EXTENSION,
+        }
+    )
     assert gate.is_enforced(ACP_BACKEND_CODEX) is True
+    assert gate.is_enforced(ACP_BACKEND_OPENCODE) is True
+    assert gate.is_enforced(ACP_BACKEND_PI) is True
+    # deepseek is NOT enforced, and it is the case that shows enforcement following the
+    # MECHANISM rather than the harness: it has a permission setting Crew can pin and
+    # read back, and that setting governs model-initiated escalations rather than tool
+    # calls. Its sandbox decides those itself. So its routing is ``UNVERIFIED``, which
+    # is outside the enforced set by construction -- there is no observation to
+    # enforce.
+    assert gate.is_enforced(ACP_BACKEND_DEEPSEEK) is False
+    assert routing_for(ACP_BACKEND_DEEPSEEK) is Routing.UNVERIFIED
     assert gate.is_enforced(ACP_BACKEND_CLAUDE) is False
     for backend in AGENT_SPEC_BACKENDS:
         assert gate.is_enforced(backend) is False
@@ -210,6 +246,52 @@ def test_named_credential_leaves_are_masked(leaf) -> None:
     assert os.path.join(home, *leaf.split("/")) in masked
 
 
+def test_aws_stays_masked_with_only_config_reexposed() -> None:
+    """The cc tier's Bedrock posture, on every platform.
+
+    A codex configured for Bedrock resolves its credentials through
+    ``~/.aws/config`` (``credential_process``). Masking the directory made every
+    session fail at start with ``failed to load AWS credentials``, surfaced as
+    ``Authentication required``. The fix re-exposes exactly that file, the way
+    ``_CC_EXPOSE_FILES`` does for Claude Code, and keeps ``~/.aws/credentials``
+    and ``~/.aws/sso/cache`` hidden. Revert-verified: dropping the expose leaf
+    fails the second assertion; excluding ``.aws`` from the mask fails the first.
+    """
+    masked = set(gate.adapter_hidden_credential_dirs(ACP_BACKEND_CODEX))
+    home = os.path.expanduser("~")
+    assert os.path.join(home, ".aws") in masked, (
+        "the whole-directory hide is what keeps ~/.aws/credentials and the SSO "
+        "cache away from the self-approving child"
+    )
+    hidden = gate.adapter_hidden_credential_dirs(ACP_BACKEND_CODEX)
+    assert gate.adapter_expose_files(ACP_BACKEND_CODEX, hidden) == (
+        os.path.join(home, ".aws", "config"),
+    )
+    assert (
+        ".aws" in sensitive_home_dirs()
+    ), "the agent's own file tools must still be fenced from ~/.aws"
+
+
+def test_every_exposed_leaf_sits_under_a_masked_dir() -> None:
+    """A re-exposure that is not inside the mask is a grant, not a narrowing.
+
+    The Seatbelt builder ignores such a file (nothing to carve it out of), so
+    the auth path would silently fail on macOS; the Linux launcher would copy a
+    file over its own live source. Pin containment at the table.
+    """
+    masked = set(gate.adapter_hidden_credential_dirs(ACP_BACKEND_CODEX))
+    for exposed in gate.adapter_expose_files(
+        ACP_BACKEND_CODEX, gate.adapter_hidden_credential_dirs(ACP_BACKEND_CODEX)
+    ):
+        assert any(exposed.startswith(m + os.sep) for m in masked), exposed
+
+
+@pytest.mark.parametrize("backend", (*AGENT_SPEC_BACKENDS, ACP_BACKEND_CLAUDE))
+def test_unenforced_harness_gets_no_expose_files(backend) -> None:
+    """The first-class path keeps byte-identical sandbox arguments here too."""
+    assert gate.adapter_expose_files(backend, ()) == ()
+
+
 def test_the_harness_keeps_its_own_token_readable() -> None:
     """The adapter must read its own credential to authenticate.
 
@@ -324,22 +406,29 @@ def test_every_enforced_harness_declares_its_own_credential() -> None:
 
 
 def test_every_enforced_harness_reaches_the_spawn_preflight() -> None:
-    """An enforced harness whose spawn arm skips the preflight would start unmasked.
+    """An enforced harness whose spawn path skips the preflight starts unmasked.
 
-    The preflight (refuse-then-mask) is invoked from inside each adapter's OWN arm
-    of ``AcpClient._spawn`` rather than from a gate on the shared path, so the kiro
-    construction path gains no conditional and no awaited step in service of an
-    adapter (harness-parity H13). The cost of that placement is that a new enforced
-    harness needs its own call: forgetting one would spawn it with no mask and no
-    refusal. This pins one preflight call site per enforced harness, so the
-    omission fails here instead of silently shipping an unmasked adapter.
+    The preflight (refuse-then-mask) is invoked from inside each adapter's OWN spawn
+    path rather than from a gate on a shared one, so the kiro construction path
+    gains no conditional and no awaited step in service of an adapter
+    (harness-parity H13). The cost of that placement is that a new enforced harness
+    needs its own call: forgetting one would spawn it with no mask and no refusal.
+
+    An enforced harness reaches its spawn through ONE of two cores, so this counts
+    both. A harness on the shared runtime resolves its own plan in its
+    ``HarnessAdapter``, so its call lives there; a per-session harness has an arm in
+    ``AcpClient._spawn``. Counting only the client core would read a runtime harness
+    as missing its preflight while it has one, and -- worse in the other direction --
+    would let a harness moved onto the runtime lose its call silently, because the
+    arm it was counted by is deleted in the same change that moves it.
     """
     import ast
     import inspect
     import textwrap
 
     from kiro_crew.acp.client import AcpClient
-    from kiro_crew.acp_backends import ACP_BACKEND_ROUTING
+    from kiro_crew.acp.harness import harness_for
+    from kiro_crew.acp_backends import ACP_BACKEND_ROUTING, ACP_BACKENDS_ACP_RUNTIME
 
     enforced = {
         backend
@@ -348,16 +437,51 @@ def test_every_enforced_harness_reaches_the_spawn_preflight() -> None:
     }
     assert enforced, "the gate enforces no mechanism; this ratchet would be vacuous"
 
-    spawn_tree = ast.parse(textwrap.dedent(inspect.getsource(AcpClient._spawn)))
-    call_sites = sum(
-        1
-        for node in ast.walk(spawn_tree)
-        if isinstance(node, ast.Name) and node.id == "_sandbox_preflight"
-    )
-    assert call_sites == len(enforced), (
-        f"{len(enforced)} enforced harness(es) {sorted(enforced)!r} but "
-        f"{call_sites} _sandbox_preflight call site(s) in AcpClient._spawn: every "
-        "enforced harness must invoke the preflight inside its own spawn arm"
+    def _preflight_calls(fn: object) -> int:
+        """References to the preflight, however it is spelled.
+
+        A bare name in the client core; ``client_mod._sandbox_preflight`` on a
+        harness, which reaches it through the module rather than importing it. An
+        ``ast.Name``-only count reads the second as zero and reports a harness that
+        does hold the mask as one that does not.
+        """
+        tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
+        total = 0
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Name) and node.id == "_sandbox_preflight":
+                total += 1
+            elif isinstance(node, ast.Attribute) and node.attr == "_sandbox_preflight":
+                total += 1
+        return total
+
+    on_runtime = {b for b in enforced if b in ACP_BACKENDS_ACP_RUNTIME}
+    on_client = enforced - on_runtime
+    assert on_runtime, "no enforced harness runs on the shared runtime; check the sets"
+    assert on_client, "no enforced harness runs on AcpClient; check the sets"
+
+    # A runtime harness resolves its plan itself, so the call is reachable from its
+    # own spawn seam. Followed one level into the module helper the seam delegates
+    # to, which is where these harnesses put the refuse-then-mask pair.
+    for backend in sorted(on_runtime):
+        adapter = harness_for(backend)
+        module = sys.modules[type(adapter).__module__]
+        calls = _preflight_calls(type(adapter).resolve_spawn)
+        for name in ("resolve_spawn_masks",):
+            helper = getattr(module, name, None)
+            if helper is not None:
+                calls += _preflight_calls(helper)
+        assert calls == 1, (
+            f"enforced harness {backend!r} runs on the shared runtime and reaches "
+            f"_sandbox_preflight {calls} time(s); exactly one is the contract -- zero "
+            "spawns with no mask and no refusal, two enforces twice"
+        )
+
+    # A per-session harness keeps its arm in the client core, one call each.
+    client_calls = _preflight_calls(AcpClient._spawn)
+    assert client_calls == len(on_client), (
+        f"{len(on_client)} enforced harness(es) on AcpClient {sorted(on_client)!r} "
+        f"but {client_calls} _sandbox_preflight call site(s) in AcpClient._spawn: "
+        "every enforced harness must invoke the preflight inside its own spawn arm"
     )
 
 
@@ -393,10 +517,23 @@ def test_mask_still_exposes_the_adapters_own_token() -> None:
     """
     masked = gate.adapter_hidden_credential_dirs(ACP_BACKEND_CODEX)
     own = gate.ADAPTER_OWN_CREDENTIAL_LEAVES[ACP_BACKEND_CODEX][0]
-    basename = own.split("/")[-1]
+    own_tail = os.path.join(*own.split("/"))
     assert not any(
-        entry.endswith(basename) for entry in masked
+        entry.endswith(own_tail) for entry in masked
     ), "the adapter's own OAuth token was masked, which would break its auth"
+    # Matched on the whole leaf, not its final segment: two harnesses name their
+    # token ``auth.json``, so a basename check would report codex's own token
+    # unmasked while it was really seeing a SIBLING harness's token -- and would
+    # equally pass if the exclusion had let codex read that sibling's file.
+    for other, leaves in gate.ADAPTER_OWN_CREDENTIAL_LEAVES.items():
+        if other == ACP_BACKEND_CODEX:
+            continue
+        for leaf in leaves:
+            tail = os.path.join(*leaf.split("/"))
+            assert any(entry.endswith(tail) for entry in masked), (
+                f"{other!r}'s credential store is not denied to the codex child; the "
+                "exclusion must spare only the harness's OWN token"
+            )
 
 
 def test_sandbox_off_refuses_an_enforced_adapter(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -596,3 +733,134 @@ def test_nested_sandbox_passthrough_refuses_an_enforced_adapter(
     monkeypatch.setattr(sandbox, "_macos_sandbox_state", lambda: None)
     with pytest.raises(gate.ToolGateUnroutable):
         gate.enforce_sandbox_floor(ACP_BACKEND_CODEX, "standard")
+
+
+def _pin_no_sandbox_backend(monkeypatch: pytest.MonkeyPatch, *, opted_in: bool = False) -> None:
+    """Pin the probes ``credential_mask_applies`` reads; never the operator config."""
+    from kiro_crew import sandbox
+
+    monkeypatch.setattr(sandbox, "_governance_sandbox_floor", lambda: None)
+    monkeypatch.setattr(sandbox, "detect_backend", lambda **_: "none")
+    monkeypatch.setattr(sandbox, "_inside_kirocrew_sandbox", lambda: False)
+    monkeypatch.setattr(sandbox, "_allow_unsandboxed_exec", lambda: opted_in)
+
+
+def _assert_windows_sandbox_refusal(exc: BaseException, backend: str) -> None:
+    """The Windows copy names this harness and does not recommend a sandbox toggle."""
+    msg = str(exc)
+    assert type(exc) is gate.ToolGateUnroutable
+    assert gate.label_for(backend) in msg
+    assert "native Windows" in msg
+    assert "no supported OS sandbox backend" in msg
+    assert "Kiro CLI" in msg
+    assert "Settings → Agent Backend" in msg
+    assert "new session" in msg
+    assert _GENERIC_SANDBOX_REMEDY not in msg
+    assert "sandbox_allow_unsandboxed_exec" not in msg
+
+
+@pytest.mark.parametrize("mode", ["auto", "standard", "strict", "off"])
+@pytest.mark.parametrize("opted_in", [True, False])
+def test_windows_refuses_opencode_for_every_sandbox_mode(
+    monkeypatch: pytest.MonkeyPatch, mode: str, opted_in: bool
+) -> None:
+    """Native Windows has no Crew sandbox backend, so OpenCode cannot start.
+
+    Changing agent.sandbox cannot create one, and the unsandboxed-exec opt-in is
+    not a recovery path. Revert-verified: the generic refusal recommends
+    standard/strict and fails the copy assertions below.
+    """
+    monkeypatch.setattr(platform_compat, "IS_WINDOWS", True)
+    _pin_no_sandbox_backend(monkeypatch, opted_in=opted_in)
+    with pytest.raises(gate.ToolGateUnroutable) as excinfo:
+        gate.enforce_sandbox_floor(ACP_BACKEND_OPENCODE, mode)
+    _assert_windows_sandbox_refusal(excinfo.value, ACP_BACKEND_OPENCODE)
+    assert "OpenCode" in str(excinfo.value)
+
+
+@pytest.mark.parametrize("backend", ENFORCED_BACKENDS)
+def test_windows_refusal_uses_the_enforced_harness_label(
+    monkeypatch: pytest.MonkeyPatch, backend: str
+) -> None:
+    """Every enforced harness gets its own display name, not the OpenCode example."""
+    monkeypatch.setattr(platform_compat, "IS_WINDOWS", True)
+    _pin_no_sandbox_backend(monkeypatch)
+    with pytest.raises(gate.ToolGateUnroutable) as excinfo:
+        gate.enforce_sandbox_floor(backend, "standard")
+    _assert_windows_sandbox_refusal(excinfo.value, backend)
+
+
+@pytest.mark.parametrize("mode", ["off", "standard"])
+def test_kiro_cli_is_unaffected_on_windows(monkeypatch: pytest.MonkeyPatch, mode: str) -> None:
+    """Platform messaging is reached only after the enforced-harness guard.
+
+    Kiro CLI is not an enforced harness, so a simulated Windows host with
+    sandbox off still starts it. Revert-verified: moving the Windows branch
+    above ``is_enforced`` refuses the first-class path.
+    """
+    monkeypatch.setattr(platform_compat, "IS_WINDOWS", True)
+    _pin_no_sandbox_backend(monkeypatch)
+    gate.enforce_sandbox_floor(ACP_BACKEND_KIRO, mode)
+
+
+def test_windows_still_passes_when_the_mask_applies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Windows copy is refusal text, not a second admission rule.
+
+    A working backend whose governance floor raises ``off`` still starts on a
+    simulated Windows host, matching the non-Windows governed-floor path.
+    """
+    from kiro_crew import sandbox
+
+    monkeypatch.setattr(platform_compat, "IS_WINDOWS", True)
+    monkeypatch.setattr(sandbox, "_governance_sandbox_floor", lambda: "standard")
+    monkeypatch.setattr(sandbox, "_inside_kirocrew_sandbox", lambda: False)
+    monkeypatch.setattr(sandbox, "detect_backend", lambda **_: "namespace")
+    gate.enforce_sandbox_floor(ACP_BACKEND_OPENCODE, "off")
+
+
+@pytest.mark.parametrize("mode,detect", [("off", "namespace"), ("standard", "none")])
+def test_non_windows_keeps_the_generic_sandbox_refusal(
+    monkeypatch: pytest.MonkeyPatch, mode: str, detect: str
+) -> None:
+    """A host that CAN have a backend still gets the set-standard-or-strict remedy."""
+    from kiro_crew import sandbox
+
+    monkeypatch.setattr(platform_compat, "IS_WINDOWS", False)
+    monkeypatch.setattr(sandbox, "_governance_sandbox_floor", lambda: None)
+    monkeypatch.setattr(sandbox, "detect_backend", lambda **_: detect)
+    monkeypatch.setattr(sandbox, "_inside_kirocrew_sandbox", lambda: False)
+    monkeypatch.setattr(sandbox, "_allow_unsandboxed_exec", lambda: False)
+    with pytest.raises(gate.ToolGateUnroutable) as excinfo:
+        gate.enforce_sandbox_floor(ACP_BACKEND_OPENCODE, mode)
+    msg = str(excinfo.value)
+    assert "OpenCode" in msg
+    assert "native Windows" not in msg
+    assert _GENERIC_SANDBOX_REMEDY in msg
+
+
+def test_sandbox_preflight_retains_the_windows_remedy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The spawn-path translation keeps the platform-aware remedy.
+
+    ``acp/client.py::_sandbox_preflight`` wraps ``ToolGateUnroutable`` in
+    ``AcpToolGateUnroutable``. A translation that dropped the message would send
+    the operator back to the generic sandbox advice that cannot succeed on
+    native Windows. Uses the real preflight; does not start a child.
+    """
+    from kiro_crew.acp import client as acp_client
+    from kiro_crew.acp.client import AcpToolGateUnroutable
+
+    monkeypatch.setattr(platform_compat, "IS_WINDOWS", True)
+    _pin_no_sandbox_backend(monkeypatch)
+    with pytest.raises(AcpToolGateUnroutable) as excinfo:
+        acp_client._sandbox_preflight(ACP_BACKEND_OPENCODE, "standard")
+    msg = str(excinfo.value)
+    assert "OpenCode" in msg
+    assert "native Windows" in msg
+    assert "Kiro CLI" in msg
+    assert "Settings → Agent Backend" in msg
+    assert _GENERIC_SANDBOX_REMEDY not in msg
+    assert "sandbox_allow_unsandboxed_exec" not in msg

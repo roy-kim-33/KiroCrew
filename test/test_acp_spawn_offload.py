@@ -25,9 +25,12 @@ including the watchdog heartbeat. These tests pin four contracts:
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -82,11 +85,18 @@ class TestClientSpawnOffLoop:
         # thread identity alone does not name the regressing call site.
         mkdir_stacks: list[str] = []
 
-        def _rec_mkdir(*a, **kw):
+        # ``patch("pathlib.Path.mkdir")`` installs a plain MagicMock, which is not
+        # a descriptor, so the recorder never receives ``self`` and cannot create
+        # anything. autospec hands it the Path; calling through keeps the
+        # directories the spawn prelude promises to create.
+        real_mkdir = Path.mkdir
+
+        def _rec_mkdir(self, *a, **kw):
             t = threading.current_thread()
             mkdir_threads.append(t)
             if t is loop_thread:
                 mkdir_stacks.append("".join(traceback.format_stack()))
+            return real_mkdir(self, *a, **kw)
 
         client = AcpClient(work_dir=tmp_path / "workspace", session_key="k")
 
@@ -144,8 +154,10 @@ class TestClientSpawnOffLoop:
                 "inject_xdist_auto_cap",
                 side_effect=lambda env: xdist_threads.append(threading.current_thread()),
             ),
-            patch(
-                "pathlib.Path.mkdir",
+            patch.object(
+                Path,
+                "mkdir",
+                autospec=True,
                 side_effect=_rec_mkdir,
             ),
         ):
@@ -204,9 +216,7 @@ class TestClientSpawnPidTrackingOffLoop:
             ),
             patch(
                 "kiro_crew.session._track_session_pid",
-                side_effect=lambda pid: session_track_threads.append(
-                    threading.current_thread()
-                ),
+                side_effect=lambda pid: session_track_threads.append(threading.current_thread()),
             ),
             # PID 12345 may be a real host process; an empty scan keeps the
             # early-descendant branch (and its own tracking write) out of
@@ -274,11 +284,20 @@ class TestRuntimeSpawnOffLoop:
             cgroup_threads.append(threading.current_thread())
             return argv
 
-        monkeypatch.setattr(runtime_mod, "_resolve_kiro_bin_for_spawn", resolve_bin)
-        monkeypatch.setattr(runtime_mod, "ensure_agent_materialized", lambda agent: None)
-        monkeypatch.setattr(
-            runtime_mod, "wrap_argv", lambda argv, mode, **kw: (list(argv), None)
-        )
+        # See the note in TestClientSpawnOffLoop: the recorder must receive
+        # ``self`` and call through, or the work dir it claims to observe is
+        # never created and the macOS-only spawn guard stats a missing path.
+        real_mkdir = Path.mkdir
+
+        def _rec_mkdir(self, *a, **kw):
+            mkdir_threads.append(threading.current_thread())
+            return real_mkdir(self, *a, **kw)
+
+        monkeypatch.setattr(client_mod, "_resolve_kiro_bin_for_spawn", resolve_bin)
+        import kiro_crew.agent as agent_mod
+
+        monkeypatch.setattr(agent_mod, "ensure_agent_materialized", lambda agent: None)
+        monkeypatch.setattr(runtime_mod, "wrap_argv", lambda argv, mode, **kw: (list(argv), None))
         monkeypatch.setattr(runtime_mod, "cgroup_scope_argv", _rec_cgroup)
         monkeypatch.setattr(
             runtime_mod,
@@ -294,9 +313,11 @@ class TestRuntimeSpawnOffLoop:
 
         runtime = AcpRuntime(work_dir=tmp_path / "workspace")
         with (
-            patch(
-                "pathlib.Path.mkdir",
-                side_effect=lambda *a, **kw: mkdir_threads.append(threading.current_thread()),
+            patch.object(
+                Path,
+                "mkdir",
+                autospec=True,
+                side_effect=_rec_mkdir,
             ),
             pytest.raises(_StopSpawn),
         ):
@@ -324,9 +345,7 @@ class TestSpawnCancellationSandboxCleanup:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("raise_in", ["cgroup", "env"])
-    async def test_client_spawn_cancel_unlinks_sandbox_file(
-        self, tmp_path, raise_in
-    ) -> None:
+    async def test_client_spawn_cancel_unlinks_sandbox_file(self, tmp_path, raise_in) -> None:
         sandbox_file = self._sandbox_file(tmp_path)
         client = AcpClient(work_dir=tmp_path / "workspace", session_key="k")
 
@@ -372,8 +391,10 @@ class TestSpawnCancellationSandboxCleanup:
         def _krb5(env):
             raise asyncio.CancelledError()
 
-        monkeypatch.setattr(runtime_mod, "_resolve_kiro_bin_for_spawn", resolve_bin)
-        monkeypatch.setattr(runtime_mod, "ensure_agent_materialized", lambda agent: None)
+        monkeypatch.setattr(client_mod, "_resolve_kiro_bin_for_spawn", resolve_bin)
+        import kiro_crew.agent as agent_mod
+
+        monkeypatch.setattr(agent_mod, "ensure_agent_materialized", lambda agent: None)
         monkeypatch.setattr(
             runtime_mod,
             "wrap_argv",
@@ -449,7 +470,7 @@ class TestSpawnFailureCannotLeaveAnUntrackedProcess:
                 "finish_suspended_spawn",
                 side_effect=_raise_if("finish_suspended_spawn"),
             ),
-            patch.object(client_mod, "_get_start_time", return_value=1.0),
+            patch("kiro_crew.platform_compat.get_process_start_id", return_value=1.0),
             patch("kiro_crew.session._track_pid", side_effect=_raise_if("track_pid")),
             patch(
                 "kiro_crew.session._track_session_pid",
@@ -493,7 +514,7 @@ class TestSpawnFailureCannotLeaveAnUntrackedProcess:
                 return_value=mock_proc,
             ),
             patch.object(client_mod, "finish_suspended_spawn"),
-            patch.object(client_mod, "_get_start_time", return_value=1.0),
+            patch("kiro_crew.platform_compat.get_process_start_id", return_value=1.0),
             patch("kiro_crew.session._track_pid"),
             patch(
                 "kiro_crew.session._track_session_pid",
@@ -529,18 +550,193 @@ class TestRuntimeShieldSurvivesAFailedAppend:
         async def resolve_bin(*, environ=None, home=None) -> str:
             return "/usr/bin/kiro-cli"
 
-        monkeypatch.setattr(runtime_mod, "_resolve_kiro_bin_for_spawn", resolve_bin)
-        monkeypatch.setattr(runtime_mod, "ensure_agent_materialized", lambda agent: None)
+        monkeypatch.setattr(client_mod, "_resolve_kiro_bin_for_spawn", resolve_bin)
+        import kiro_crew.agent as agent_mod
+
+        monkeypatch.setattr(agent_mod, "ensure_agent_materialized", lambda agent: None)
         monkeypatch.setattr(runtime_mod, "wrap_argv", lambda argv, mode, **kw: (list(argv), None))
         monkeypatch.setattr(runtime_mod, "cgroup_scope_argv", lambda argv: list(argv))
         monkeypatch.setattr(runtime_mod, "resolve_krb5_ccname", lambda env: None)
         monkeypatch.setattr(runtime_mod, "inject_xdist_auto_cap", lambda env: None)
-        monkeypatch.setattr(runtime_mod, "_get_start_time", lambda pid: 1.0)
+        monkeypatch.setattr("kiro_crew.platform_compat.get_process_start_id", lambda pid: 1.0)
 
         async def fake_spawn(*_a, **_kw):
             return mock_proc
 
         monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_spawn)
+        # Fake processes must never reach native Windows resume/job operations,
+        # scratch owner probes, or browser socket discovery.
+        monkeypatch.setattr(runtime_mod, "finish_suspended_spawn", lambda *a, **kw: None)
+        monkeypatch.setattr(
+            runtime_mod, "agent_scratch", SimpleNamespace(allocate_scratch=lambda _: None)
+        )
+        monkeypatch.setattr(runtime_mod, "browser_session_env", lambda env: {})
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("raise_in", ["finish_suspended_spawn", "initialize", "cancel"])
+    async def test_failed_spawn_unwinds_live_tree_and_tracking(
+        self, tmp_path, monkeypatch, raise_in
+    ) -> None:
+        """Rejected spawns own the whole tree, even before PID tracking exists.
+
+        Keep spawn, JSON-RPC demux, kill, registration and file writes real.
+        Only the subprocess and kernel boundary are simulated. In particular,
+        killing just the root must leave the MCP children visible to assertions.
+        """
+        from kiro_crew import platform_compat, session_pid
+
+        root = 6100
+        # pid -> group: two generations of MCP descendants share the root's
+        # group; another runtime must be left alone by the cleanup.
+        groups = {root: root, root + 1: root, root + 2: root, 6200: 6200}
+        initialized = asyncio.Event()
+        requests = []
+
+        class ReadPipe(asyncio.StreamReader):
+            def __init__(self):
+                super().__init__()
+                self.reading = asyncio.Event()
+
+            async def readuntil(self, separator=b"\n"):
+                self.reading.set()
+                return await super().readuntil(separator)
+
+        class WritePipe:
+            def write(self, data):
+                request = json.loads(data)
+                assert request["method"] == "initialize"
+                requests.append(request)
+                initialized.set()
+
+            async def drain(self):
+                pass
+
+        class Process:
+            pid = root
+            returncode = None
+
+            def __init__(self):
+                self.stdin = WritePipe()
+                self.stdout = ReadPipe()
+                self.stderr = ReadPipe()
+
+            async def wait(self):
+                assert root not in groups, "process wait cannot reap a live root"
+                self.returncode = -platform_compat.SIGTERM
+                return self.returncode
+
+        process = Process()
+        self._patch_prelude(monkeypatch, tmp_path, process)
+
+        def kill_tree(pid, sig):
+            assert pid == root, "cleanup targeted another runtime"
+            assert sig in (platform_compat.SIGTERM, platform_compat.SIGKILL)
+            for member, group in list(groups.items()):
+                if group == pid:
+                    del groups[member]
+
+        # A closed port, not a proxy: no fabricated PID can fall back to host
+        # liveness, native signals, process enumeration or Windows job handles.
+        backend = SimpleNamespace(
+            IS_POSIX=True,
+            CREATE_NEW_PROCESS_GROUP=0,
+            _SUBPROCESS_NO_WINDOW=0,
+            CREATE_SUSPENDED=0,
+            SIGTERM=platform_compat.SIGTERM,
+            SIGKILL=platform_compat.SIGKILL,
+            get_process_start_id=lambda pid: f"start-{pid}" if pid in groups else None,
+            pid_exists=lambda pid: pid in groups,
+            kill_process_tree=kill_tree,
+            file_lock=platform_compat.file_lock,
+            open_lock_file=platform_compat.open_lock_file,
+        )
+        monkeypatch.setattr(runtime_mod, "platform_compat", backend)
+        monkeypatch.setattr(session_pid, "platform_compat", backend)
+        monkeypatch.setattr(session_pid, "config_dir", lambda: tmp_path)
+        monkeypatch.setattr(session_pid, "os", SimpleNamespace(getpid=lambda: 6000))
+        monkeypatch.setattr(session_pid, "_PROTECTED_PIDS", set())
+        paths = [tmp_path / "kiro_pids.txt", tmp_path / "kiro_session_pids.txt"]
+        boom = OSError("resume rejected after process start")
+
+        def reject_resume(*args, **kwargs):
+            assert root in groups
+            assert not any(path.exists() for path in paths)
+            raise boom
+
+        if raise_in == "finish_suspended_spawn":
+            monkeypatch.setattr(runtime_mod, "finish_suspended_spawn", reject_resume)
+
+        runtime = AcpRuntime(work_dir=tmp_path / "workspace", expect_mcp_reports=False)
+        # Join the worker while its kernel and filesystem pins still hold.
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            monkeypatch.setattr(runtime_mod, "subprocess_executor", lambda: pool)
+            task = asyncio.create_task(runtime.spawn())
+            readers = []
+            try:
+                if raise_in != "finish_suspended_spawn":
+                    await asyncio.wait_for(initialized.wait(), 5)
+                    readers = [runtime._reader_task, runtime._stderr_task]
+                    await asyncio.wait_for(
+                        asyncio.gather(
+                            process.stdout.reading.wait(), process.stderr.reading.wait()
+                        ),
+                        5,
+                    )
+                    assert all(reader is not None and not reader.done() for reader in readers)
+                    assert root in session_pid._PROTECTED_PIDS
+                    assert [path.read_text(encoding="utf-8") for path in paths] == [
+                        f"{root}\n",
+                        f"6000:{root}:start-{root}\n",
+                    ], "the handshake must begin with both real PID records present"
+                    assert not task.done()
+                    if raise_in == "cancel":
+                        task.cancel("cancel pending initialize")
+                    else:
+                        process.stdout.feed_data(
+                            json.dumps(
+                                {
+                                    "jsonrpc": "2.0",
+                                    "id": requests[0]["id"],
+                                    "error": {"code": -32603, "message": "initialize rejected"},
+                                }
+                            ).encode()
+                            + b"\n"
+                        )
+                if raise_in == "cancel":
+                    with pytest.raises(asyncio.CancelledError, match="cancel pending initialize"):
+                        await asyncio.wait_for(task, 5)
+                elif raise_in == "initialize":
+                    with pytest.raises(runtime_mod.AcpRuntimeError, match="initialize rejected"):
+                        await asyncio.wait_for(task, 5)
+                else:
+                    with pytest.raises(OSError) as caught:
+                        await asyncio.wait_for(task, 5)
+                    assert caught.value is boom
+                    assert runtime._reader_task is None and runtime._stderr_task is None
+
+                assert root not in groups, "failed spawn leaked its live root"
+                assert (
+                    root + 1 not in groups and root + 2 not in groups
+                ), "failed spawn leaked same-group MCP descendants"
+                assert groups == {6200: 6200}, "cleanup must preserve unrelated runtimes"
+                assert process.returncode is not None, "failed spawn never reaped its process"
+                assert runtime._process is None and runtime._dead
+                assert all(reader.done() for reader in readers), "spawn leaked reader/stderr tasks"
+                assert root not in session_pid._PROTECTED_PIDS, "spawn leaked its sweep shield"
+                assert not runtime._pending_requests, "spawn leaked an initialize waiter"
+                assert all(
+                    not path.exists() or path.read_text(encoding="utf-8") == "" for path in paths
+                )
+            finally:
+                # Also safe under a negative-control mutation of production kill:
+                # settle tasks without invoking that potentially broken cleanup.
+                owned = [task, runtime._reader_task, runtime._stderr_task]
+                for pending in owned:
+                    if pending is not None and not pending.done():
+                        pending.cancel()
+                await asyncio.wait_for(
+                    asyncio.gather(*(t for t in owned if t is not None), return_exceptions=True), 5
+                )
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("raise_in", ["finish_suspended_spawn", "get_start_time"])
@@ -550,7 +746,7 @@ class TestRuntimeShieldSurvivesAFailedAppend:
         """The sibling of the client-side window. ``finish_suspended_spawn``
         documents its own resume failure as FATAL and ``_get_start_time`` can
         raise, and every ``runtime.spawn()`` caller catches only
-        ``AcpRuntimeError`` / ``AcpRuntimeDead`` -- so an ``OSError`` here used to
+        ``AcpRuntimeError`` / ``AcpRuntimeDead`` -- so an ``OSError`` here would
         propagate with a live, unrecorded process behind it."""
         mock_proc = MagicMock()
         mock_proc.pid = 5151
@@ -569,7 +765,8 @@ class TestRuntimeShieldSurvivesAFailedAppend:
             )
         else:
             monkeypatch.setattr(
-                runtime_mod, "_get_start_time", lambda pid: (_ for _ in ()).throw(boom)
+                "kiro_crew.platform_compat.get_process_start_id",
+                lambda pid: (_ for _ in ()).throw(boom),
             )
 
         monkeypatch.setattr(runtime_mod, "register_protected_pid", lambda pid: None)

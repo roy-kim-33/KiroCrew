@@ -58,15 +58,23 @@ def register(app: web.Application) -> None:
         app.router.add_post("/api/update/simulate", handlers.api_update_simulate)
     app.router.add_get("/api/sessions", handlers.api_sessions)
     app.router.add_delete("/api/sessions", handlers.api_sessions_clear)
-    app.router.add_get("/api/sessions/context", handlers.api_sessions_context)
     app.router.add_get("/api/sessions/memory", handlers.api_sessions_memory)
     app.router.add_get("/api/sessions/health", handlers.api_sessions_health)
     app.router.add_get("/api/sessions/usage", handlers.api_sessions_usage)
+    # Durable task queue + capacity view. The literal /summary is registered
+    # before the /{task_id} pattern for the same reason /sessions/search is.
+    app.router.add_get("/api/tasks", handlers.api_tasks_list)
+    app.router.add_get("/api/tasks/summary", handlers.api_tasks_summary)
+    app.router.add_get("/api/tasks/{task_id}", handlers.api_task_detail)
+    app.router.add_post("/api/tasks/{task_id}", handlers.api_task_action)
+    app.router.add_post("/api/tasks/{task_id}/cancel", handlers.api_task_cancel)
     app.router.add_get("/api/usage/kiro", handlers.api_kiro_usage)
     app.router.add_get("/api/usage", handlers.api_usage)
     app.router.add_get("/api/telemetry/startup", handlers.api_telemetry_startup)
     app.router.add_get("/api/telemetry/context-trace", handlers.api_context_trace)
     app.router.add_get("/api/usage/turns", handlers.api_usage_turns)
+    app.router.add_get("/api/wakatime/stats", handlers.api_wakatime_stats)
+    app.router.add_get("/api/wakatime/export", handlers.api_wakatime_export)
     app.router.add_get("/api/telemetry/beacon", handlers.api_beacon_status)
     app.router.add_get("/api/telemetry/collection", handlers.api_collection_status)
     app.router.add_get("/api/tailnet/status", handlers.api_tailnet_status)
@@ -83,6 +91,9 @@ def register(app: web.Application) -> None:
     # NOTE: /search must be registered before /{key} to avoid the path param catching "search"
     app.router.add_get("/api/sessions/search", handlers.api_sessions_search)
     app.router.add_post("/api/sessions/summarize", handlers.api_sessions_summarize)
+    # Two segments, so /{key} (a single segment) cannot catch it — but registered
+    # ahead of /{key} anyway, matching the ordering discipline the note above sets.
+    app.router.add_get("/api/sessions/clearable/count", handlers.api_sessions_clearable_count)
     app.router.add_get("/api/sessions/{key}", handlers.api_session_detail)
     app.router.add_delete("/api/sessions/{key}", handlers.api_session_delete)
     app.router.add_get("/api/logs", handlers.api_logs)
@@ -131,6 +142,24 @@ def register(app: web.Application) -> None:
     app.router.add_get("/api/aws/consent", handlers.api_aws_consent_get)
     app.router.add_post("/api/aws/consent", handlers.api_aws_consent_post)
     app.router.add_delete("/api/aws/consent", handlers.api_aws_consent_delete)
+    # Decision-seam consent (Settings > Developer > Feature Previews). Owner-gated
+    # in the handler and browser-called like the AWS pair above, for the same
+    # reason: it is the operator's out-of-band surface for an egress
+    # authorization the agent must not be able to grant itself.
+    app.router.add_get("/api/decisions/consent", handlers.api_decisions_consent_get)
+    app.router.add_put("/api/decisions/consent", handlers.api_decisions_consent_put)
+    # Flagged-file delivery consent. Owner-gated in the handler; deliberately NOT
+    # on the strict-internal list in server.py, because unlike the file_send legs
+    # its only legitimate caller IS the owner's browser.
+    app.router.add_get("/api/file-delivery/consent", handlers.api_file_delivery_consent_get)
+    app.router.add_post("/api/file-delivery/consent", handlers.api_file_delivery_consent_post)
+    app.router.add_get(
+        "/api/file-delivery/consent/arm", handlers.api_file_delivery_consent_arm_status
+    )
+    app.router.add_post(
+        "/api/file-delivery/consent/approve", handlers.api_file_delivery_consent_approve
+    )
+    app.router.add_delete("/api/file-delivery/consent", handlers.api_file_delivery_consent_delete)
     app.router.add_get("/api/approvals", handlers.api_approvals)
     app.router.add_post("/api/approvals/{id}/{action}", handlers.api_approval_resolve)
 

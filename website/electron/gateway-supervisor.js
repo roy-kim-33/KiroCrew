@@ -45,7 +45,7 @@ const {
   isPortInUse,
 } = require("./gateway-wait");
 const { describeSandboxProfileNeed } = require("./sandbox-profile");
-const { createLivenessMonitor } = require("./gateway-liveness");
+const { createLivenessMonitor, createBackendProbe } = require("./gateway-liveness");
 const {
   chooseRecoveryStrategy,
   classifyAdoptedGateway,
@@ -55,6 +55,8 @@ const {
   snapshotPortPids,
   incumbentSnapshotBlocksRespawn,
   unrecoverableGatewayDialog,
+  shouldReresolveBackend,
+  isStaleBundleSignal,
 } = require("./gateway-recovery");
 const { capturePySpyDump } = require("./pyspy-dump");
 const {
@@ -81,8 +83,24 @@ const {
 const DEFAULT_THEME_ACCENT = "#8E48FF";
 const THEME_ACCENT_RE = /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/;
 const INSTALLING_STATUS = "Finishing installation…";
+const RESTARTING_STATUS = "Restarting Kiro Crew to finish the update…";
 const POLL_INTERVAL_MS = 500;
 const ADOPTED_RECOVERY_WAIT_MS = 30_000;
+// loadFile query that tells loading.html it is being painted by a reconnect
+// path rather than a cold boot, so it can offer its exit control at once
+// (loading.html reads `reconnect=1`). A query, not an IPC send: the splash
+// loads asynchronously and a message sent right after loadFile can be missed.
+const SPLASH_RECONNECT_QUERY = Object.freeze({ reconnect: "1" });
+// loadFile query that tells loading.html it is painted into the main window:
+// the one window whose close hides to tray and keeps the connect loop alive.
+// A connection window is destroyed by close, so the page words its close hint
+// from this flag (loading.html reads `primary=1`; absent means not primary).
+const SPLASH_PRIMARY_QUERY = Object.freeze({ primary: "1" });
+// How long this instance stays alive waiting for a successor copy of the app
+// to prove itself by serving on the gateway port (relaunchViaConfirmedSuccessor):
+// Electron boot plus the successor's own gateway budget, with margin.
+const SUCCESSOR_READY_TIMEOUT_MS = 60_000;
+const SUCCESSOR_POLL_MS = 500;
 const LSOF_CANDIDATES = ["/usr/sbin/lsof", "/usr/bin/lsof"];
 
 /**
@@ -111,6 +129,8 @@ function createGatewaySupervisor({
   cancelPendingTrayHide,
   exitImmersiveModes,
   log,
+  warn,
+  error,
   logPath,
   fsMod = defaultFs,
   osMod = defaultOs,
@@ -119,6 +139,8 @@ function createGatewaySupervisor({
   spawnFn = defaultSpawn,
   execFileFn = defaultExecFile,
   execFileSyncFn = defaultExecFileSync,
+  setTimeoutFn = setTimeout,
+  clearTimeoutFn = clearTimeout,
   processRef = process,
   dirname = __dirname,
 } = {}) {
@@ -138,6 +160,8 @@ function createGatewaySupervisor({
   const IS_WIN = processObj.platform === "win32";
 
   const glog = typeof log === "function" ? log : (() => {});
+  const userWarn = typeof warn === "function" ? warn : glog;
+  const userError = typeof error === "function" ? error : userWarn;
   const gatewayLogPath = typeof logPath === "function" ? logPath : (() => "");
   const mainWindow = () => (typeof getMainWindow === "function" ? getMainWindow() : null);
   const quitting = () => (typeof isQuitting === "function" ? isQuitting() : false);
@@ -169,6 +193,154 @@ function createGatewaySupervisor({
   // Set before updater shutdown begins. It keeps an intentional stop from being
   // read as a wedge and resurrected while the bundle is being replaced.
   let installingUpdate = false;
+  // Re-resolves spent on the current stale-bundle incident (see
+  // shouldReresolveBackend). Reset whenever a fresh gateway is asked for,
+  // whenever one reaches handoff, and whenever a monitored backend answers
+  // again, so each incident gets its own budget.
+  let reresolveAttempts = 0;
+
+  /**
+   * Can app.relaunch() still find something to re-exec? Electron relaunches
+   * this process's own executable (process.execPath; inside the .app bundle on
+   * a packaged macOS build), so the bundle being pruned out from under a
+   * running app is visible as that path no longer existing. A swapped bundle
+   * leaves a new executable at the same path and reads as relaunchable.
+   */
+  function canRelaunchThisApp() {
+    const target = processObj.execPath;
+    if (typeof target !== "string" || !target) return false;
+    try {
+      fs.accessSync(target, fs.constants.X_OK);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Restart the app by starting a fresh copy of it and exiting only once that
+   * copy is demonstrably alive.
+   *
+   * app.relaunch() is not usable here: it returns nothing and only schedules a
+   * re-exec for exit time, so when the bundle is pruned between the probe
+   * above and that re-exec the app exits into nothing and no code is left to
+   * notice. Spawning the successor ourselves lets this process observe it, but
+   * Node's "spawn" event only proves the exec succeeded: a bundle intact
+   * enough to exec and broken enough to crash during initialization would
+   * still take the app down. The handshake is therefore the successor's own
+   * gateway answering on the port: it was silent when this handoff began (the
+   * child that owned it exited or never started), so an answer there means
+   * the successor booted, ran its supervisor, and started a serving backend.
+   * A 503 "starting" counts too: the successor's gateway is bound and only
+   * still restoring sessions.
+   *
+   * Everything short of that is a failure with this instance still alive:
+   * a spawn error (ENOENT on a pruned bundle), the successor exiting before
+   * its gateway answered, or the bounded wait running out. The failure path
+   * kills a successor that is still running so exactly one instance remains,
+   * takes the single-instance lock back so a later manual launch still routes
+   * here, and runs the caller's ordinary failure bookkeeping.
+   *
+   * The liveness monitor is stopped for the duration: were it to fire during
+   * the handoff it would force-stop the port the successor's gateway is
+   * binding. Mid-session the boot splash is put back first, since only it
+   * renders status and the user would otherwise watch the window vanish
+   * unannounced; a failed mid-session handoff then surfaces the failure
+   * dialog itself, the way the monitor's recovery would have.
+   *
+   * @param {() => void} onFailed  the caller's ordinary failure bookkeeping.
+   */
+  function relaunchViaConfirmedSuccessor(onFailed) {
+    const target = processObj.execPath;
+    const args = Array.isArray(processObj.argv) ? processObj.argv.slice(1) : [];
+    const midSession = livenessMonitor !== null;
+    if (livenessMonitor) {
+      livenessMonitor.stop();
+      livenessMonitor = null;
+    }
+    if (midSession) {
+      // Only the boot splash renders status messages; the dashboard has no
+      // listener. Put the splash back so the announcement lands where the
+      // user is looking, without stealing focus from a hidden window.
+      const window = mainWindow();
+      if (window && !window.isDestroyed()) {
+        try {
+          window.webContents.loadFile(path.join(dirname, "loading.html"), {
+            query: splashQuery(window, { accent: currentThemeAccent() }),
+          });
+        } catch { /* window may be tearing down */ }
+      }
+    }
+    sendStatus(RESTARTING_STATUS);
+    app.releaseSingleInstanceLock();
+    let settled = false;
+    let gone = false;
+    let pollTimer = null;
+    let deadlineTimer = null;
+    const clearTimers = () => {
+      if (pollTimer) { clearTimeoutFn(pollTimer); pollTimer = null; }
+      if (deadlineTimer) { clearTimeoutFn(deadlineTimer); deadlineTimer = null; }
+    };
+    const successor = spawn(target, args, { detached: true, stdio: "ignore" });
+
+    const fail = (reason) => {
+      if (settled) return;
+      settled = true;
+      clearTimers();
+      glog(`successor app ${reason} — cannot relaunch; surfacing the failure instead`);
+      if (!gone) {
+        try { successor.kill(); }
+        catch (killError) { glog(`could not stop the unconfirmed successor: ${killError && killError.message}`); }
+      }
+      try {
+        if (!app.requestSingleInstanceLock()) glog("could not re-take the single-instance lock: another instance holds it");
+      } catch (lockError) {
+        glog(`could not re-take the single-instance lock: ${lockError && lockError.message}`);
+      }
+      onFailed();
+      if (!midSession) return;
+      const window = mainWindow();
+      if (!window || window.isDestroyed() || quitting()) return;
+      showLoadingThenConnect(window, BACKEND_URL, { reconnect: true })
+        .catch((error) => glog(`surfacing the failed relaunch failed: ${error && error.message}`));
+    };
+    const confirm = () => {
+      if (settled) return;
+      settled = true;
+      clearTimers();
+      successor.unref();
+      glog(`successor app (pid ${successor.pid}) is serving on :${PORT} — exiting this instance`);
+      app.exit(0);
+    };
+    const poll = async () => {
+      pollTimer = null;
+      if (settled) return;
+      // The splash loads asynchronously and may have missed the first send.
+      sendStatus(RESTARTING_STATUS);
+      const readiness = await fetchGatewayReadiness();
+      if (settled) return;
+      if (readiness === "ready" || readiness === "starting") { confirm(); return; }
+      pollTimer = setTimeoutFn(poll, SUCCESSOR_POLL_MS);
+    };
+
+    successor.once("spawn", () => {
+      if (settled) return;
+      glog(`successor app started (pid ${successor.pid}) — waiting for its gateway to answer on :${PORT}`);
+      deadlineTimer = setTimeoutFn(
+        () => fail(`did not answer on :${PORT} within ${SUCCESSOR_READY_TIMEOUT_MS / 1000}s`),
+        SUCCESSOR_READY_TIMEOUT_MS,
+      );
+      void poll();
+    });
+    successor.once("error", (error) => {
+      gone = true;
+      fail(`failed to start (${error.code || error.message}) from ${target}`);
+    });
+    successor.once("exit", (code, signal) => {
+      gone = true;
+      fail(`exited (code=${code} signal=${signal}) before its gateway answered`);
+    });
+  }
 
   function sendStatus(message) {
     mainWindow()?.webContents?.send("status", message);
@@ -177,6 +349,19 @@ function createGatewaySupervisor({
   function currentThemeAccent() {
     const configured = store.get("themeAccent") || "";
     return THEME_ACCENT_RE.test(configured) ? configured : DEFAULT_THEME_ACCENT;
+  }
+
+  /**
+   * The loadFile query every loading.html painter uses. `primary` is decided
+   * here, from the window being painted, so no painter can mark a connection
+   * window as the main one (see SPLASH_PRIMARY_QUERY).
+   */
+  function splashQuery(window, { reconnect = false, accent = "" } = {}) {
+    const query = {};
+    if (accent) query.accent = accent;
+    if (reconnect) Object.assign(query, SPLASH_RECONNECT_QUERY);
+    if (window === mainWindow()) Object.assign(query, SPLASH_PRIMARY_QUERY);
+    return query;
   }
 
   // NOTE: /api/health carries app identity; /api/status does not.
@@ -442,6 +627,7 @@ function createGatewaySupervisor({
   }
 
   function startGateway() {
+    reresolveAttempts = 0;
     glog(`launch: port=${PORT} home=${KIROCREW_HOME} packaged=${app.isPackaged} resourcesPath=${processObj.resourcesPath || "(none)"} log=${gatewayLogPath()}`);
     sendStatus("Checking if gateway is running…");
     return new Promise((resolve) => {
@@ -513,6 +699,11 @@ function createGatewaySupervisor({
     return path.resolve(dirname, "..");
   }
 
+  // Every call probes the candidate list afresh (findKirocrewBin does live
+  // access() checks), which is what lets a stale-bundle respawn pick up a
+  // backend swapped in at the same path. resourcesPath itself is a launch-time
+  // snapshot and so is every other Electron path API; there is nothing newer to
+  // read.
   function spawnGateway(resolve) {
     // The gateway owns its data root. Create it before deriving the redirected
     // bytecode cache, honoring an explicit KIROCREW_HOME without touching the
@@ -521,7 +712,7 @@ function createGatewaySupervisor({
     try {
       fs.mkdirSync(kirocrewDir, { recursive: true, mode: 0o700 });
     } catch (error) {
-      glog(`WARN failed to create kirocrew dir ${kirocrewDir}: ${error.message}`);
+      userWarn(`WARN failed to create kirocrew dir ${kirocrewDir}: ${error.message}`);
     }
 
     const bin = findKirocrewBin(
@@ -537,7 +728,7 @@ function createGatewaySupervisor({
     let execState = "executable";
     try { fs.accessSync(bin, fs.constants.X_OK); }
     catch (error) { execState = `NOT-EXECUTABLE(${error.code})`; }
-    glog(`no gateway on :${PORT} — spawning bundled backend: bin=${bin} bundled=${bundled} ${execState}`);
+    glog(`no gateway on :${PORT} — spawning bundled backend: bin=${bin} bundled=${bundled} ${execState} staleRetries=${reresolveAttempts}`);
 
     // The Windows installer writes backend-dist incrementally. Refusing an
     // incomplete interpreter is preventive but cannot see package siblings that
@@ -548,7 +739,7 @@ function createGatewaySupervisor({
       const missingParts = findMissingBundleParts(fs, path, backendRoot);
       if (missingParts.length) {
         const errorMessage = describeIncompleteBundle(missingParts);
-        glog(`spawn REFUSED: incomplete bundle at ${backendRoot} — missing: ${missingParts.join(", ")}`);
+        userError(`spawn REFUSED: incomplete bundle at ${backendRoot} — missing: ${missingParts.join(", ")}`);
         gatewayStartFailure = {
           error: errorMessage,
           incompleteBundle: true,
@@ -573,11 +764,11 @@ function createGatewaySupervisor({
         cliBin: bin,
       });
       if (need) {
-        glog(`WARN agent sandbox will fail closed: ${need.reason}`);
-        glog(`HINT run this in a terminal (needs sudo), then restart the app: ${need.command}`);
+        userWarn(`WARN agent sandbox will fail closed: ${need.reason}`);
+        userWarn(`HINT run this in a terminal (needs sudo), then restart the app: ${need.command}`);
       }
     } catch (error) {
-      glog(`WARN sandbox profile check failed: ${error.message}`);
+      userWarn(`WARN sandbox profile check failed: ${error.message}`);
     }
 
     // The explicit --port is the single source of truth. Inheriting
@@ -602,7 +793,7 @@ function createGatewaySupervisor({
     // tracebacks which otherwise disappear on clean recipient machines.
     let childOut = "ignore";
     try { childOut = fs.openSync(gatewayLogPath(), "a"); }
-    catch (error) { glog(`WARN could not open child log fd: ${error.message}`); }
+    catch (error) { userWarn(`WARN could not open child log fd: ${error.message}`); }
     glog(SPAWN_MARKER);
     gatewayStartFailure = null;
 
@@ -617,7 +808,7 @@ function createGatewaySupervisor({
         spawnArgs = ["-s", "-m", "kiro_crew", ...spawnArgs];
       } else {
         const errorMessage = describeIncompleteBundle([]);
-        glog(`spawn REFUSED: bundled interpreter absent at ${pythonExe} — install likely still extracting`);
+        userError(`spawn REFUSED: bundled interpreter absent at ${pythonExe} — install likely still extracting`);
         gatewayStartFailure = {
           error: errorMessage,
           incompleteBundle: true,
@@ -655,23 +846,83 @@ function createGatewaySupervisor({
     // Bind handlers to this child, not the mutable slot. Recovery can replace a
     // child before its late error/exit event arrives; stale events must never
     // orphan the replacement or fabricate a start failure for it.
+    //
+    // Both handlers share one stale-bundle recovery. It returns true when it
+    // took the child's fate over (respawned, or a fresh copy of the app is
+    // being started), so the caller skips its ordinary failure bookkeeping;
+    // `giveUp` is that bookkeeping, for the one case where taking over fails
+    // later (the successor never started). `resolve` may already be settled by
+    // then; a second call is a no-op, which is what a child that dies hours
+    // after boot needs.
+    const recoverStaleBackend = ({ exitCode = null, spawnErrorCode = "", giveUp }) => {
+      // Probe the relaunch target first: when the bundle was swapped in place
+      // the new executable sits at the same path; when it was pruned the path
+      // is gone and exiting would leave the user with no app at all.
+      const relaunchTargetExists = canRelaunchThisApp();
+      const verdict = shouldReresolveBackend({
+        isMac: IS_MAC,
+        bundled,
+        exitCode,
+        spawnErrorCode,
+        attempts: reresolveAttempts,
+        quitting: quitting(),
+        installingUpdate,
+        relaunchTargetExists,
+      });
+      const cause = exitCode === null ? `spawn ${spawnErrorCode}` : `exit ${exitCode}`;
+      if (verdict === "none") {
+        // reresolveAttempts only ever rises on macOS, so a spent budget plus a
+        // stale signal plus a missing executable is exactly the pruned case.
+        if (
+          reresolveAttempts >= 1 && !relaunchTargetExists
+          && isStaleBundleSignal({ exitCode, spawnErrorCode })
+        ) {
+          glog(`stale bundle persists after re-resolve (${cause} on bin=${bin}) but this app's executable is gone (${processObj.execPath || "?"}) — cannot relaunch; surfacing the failure instead`);
+        }
+        return false;
+      }
+      if (verdict === "reresolve") {
+        reresolveAttempts += 1;
+        glog(`stale bundle (${cause} on bin=${bin}) — re-resolving the backend and respawning (attempt ${reresolveAttempts})`);
+        gatewayProcess = null;
+        gatewayStartFailure = null;
+        spawnGateway(resolve);
+        return true;
+      }
+      glog(`stale bundle persists after re-resolve (${cause} on bin=${bin}) — starting a fresh copy of the app from ${processObj.execPath}`);
+      relaunchViaConfirmedSuccessor(giveUp);
+      return true;
+    };
+
     child.on("error", (error) => {
-      glog(`spawn ERROR code=${error.code || "?"} msg=${error.message}`);
+      userError(`spawn ERROR code=${error.code || "?"} msg=${error.message}`);
       if (gatewayProcess !== child) return;
-      gatewayStartFailure = { error: error.message, bundled };
-      sendStatus(`Gateway failed: ${error.message}`);
-      resolve(false);
+      const giveUp = () => {
+        gatewayStartFailure = { error: error.message, bundled };
+        sendStatus(`Gateway failed: ${error.message}`);
+        resolve(false);
+      };
+      if (recoverStaleBackend({ spawnErrorCode: error.code || "", giveUp })) return;
+      giveUp();
     });
     child.on("exit", (code, signal) => {
-      glog(`gateway child exited code=${code} signal=${signal}`);
+      const exitMessage = `gateway child exited code=${code} signal=${signal}`;
+      const currentChild = gatewayProcess === child;
+      const expectedExit = !currentChild || quitting() || installingUpdate;
+      if (expectedExit) glog(exitMessage);
+      else userError(exitMessage);
       // Node's Windows kill maps both signal names to TerminateProcess. The
       // Gatekeeper hint is meaningful only on macOS, never on normal teardown.
-      if (signal === "SIGKILL" && IS_MAC) {
-        glog("HINT: SIGKILL on a freshly-spawned bundled binary almost always means macOS Gatekeeper blocked an unsigned/quarantined nested executable. On the recipient's Mac run: xattr -cr <path to KiroCrew.app>");
+      if (signal === "SIGKILL" && IS_MAC && !expectedExit) {
+        userWarn("HINT: SIGKILL on a freshly-spawned bundled binary almost always means macOS Gatekeeper blocked an unsigned/quarantined nested executable. On the recipient's Mac run: xattr -cr <path to KiroCrew.app>");
       }
-      if (gatewayProcess !== child) return;
-      if (!gatewayStartFailure) gatewayStartFailure = { code, signal, bundled };
-      gatewayProcess = null;
+      if (!currentChild) return;
+      const giveUp = () => {
+        if (!gatewayStartFailure) gatewayStartFailure = { code, signal, bundled };
+        gatewayProcess = null;
+      };
+      if (recoverStaleBackend({ exitCode: code, giveUp })) return;
+      giveUp();
     });
     resolve(true);
   }
@@ -686,7 +937,7 @@ function createGatewaySupervisor({
   async function stopGatewayGracefully({ timeoutMs = 15000 } = {}) {
     const gateway = gatewayProcess;
     if (!gateway || gateway.exitCode !== null) { gatewayProcess = null; return; }
-    console.log("Stopping gateway gracefully...");
+    glog("Stopping gateway gracefully...");
     // Resolve secrets at call time. The gateway accepts only the secret for its
     // current boot; trying every readable candidate prevents a stale copy from
     // forcing the hard-signal path and skipping session/memory/cron flushes.
@@ -772,7 +1023,7 @@ function createGatewaySupervisor({
 
     return new Promise((resolve) => {
       sendStatus("Fetching token from remote dev desktop…");
-      console.log(`SSH token fetch: ssh ${remoteHost} for port ${effectivePort}`);
+      glog(`SSH token fetch: ssh ${remoteHost} for port ${effectivePort}`);
       execFile(
         "/usr/bin/ssh",
         sshArgs,
@@ -802,16 +1053,16 @@ function createGatewaySupervisor({
     });
   }
 
+  // How long the BOOT poll waits for one answer. The poll runs every
+  // POLL_INTERVAL_MS, so a slow answer here only means "poll again" — unlike
+  // the post-handoff liveness probe, whose three misses force-kill the gateway
+  // and which therefore carries its own, wider LIVENESS_PROBE_TIMEOUT_MS.
+  const BOOT_PROBE_TIMEOUT_MS = 2000;
+
   function checkBackend(healthUrl = HEALTH_URL) {
-    return new Promise((resolve, reject) => {
-      const req = http.get(healthUrl, { timeout: 2000 }, (res) => {
-        res.resume();
-        if (res.statusCode < 500) resolve();
-        else reject();
-      });
-      req.on("error", reject);
-      req.on("timeout", () => { req.destroy(); reject(); });
-    });
+    // Same request shape as the liveness probe, built by the same factory so
+    // the two never drift; only the budget differs.
+    return createBackendProbe({ httpMod: http, url: healthUrl, timeoutMs: BOOT_PROBE_TIMEOUT_MS })();
   }
 
   function waitForBackend(targetWindow, healthUrl = HEALTH_URL, { watchSpawn = false } = {}) {
@@ -1063,12 +1314,17 @@ function createGatewaySupervisor({
 
   /** Start or replace the primary own-port post-handoff liveness monitor. */
   function startLivenessMonitor(window) {
+    // A gateway that reached handoff is healthy; a stale-bundle incident that
+    // hits it later starts with a fresh re-resolve budget.
+    reresolveAttempts = 0;
     if (livenessMonitor) {
       livenessMonitor.stop();
       livenessMonitor = null;
     }
     livenessMonitor = createLivenessMonitor({
-      probe: () => checkBackend(HEALTH_URL),
+      // Not checkBackend(): that is the boot poll's 2s probe. The post-handoff
+      // probe has its own, wider budget — see LIVENESS_PROBE_TIMEOUT_MS.
+      probe: createBackendProbe({ httpMod: http, url: HEALTH_URL }),
       isWindowAlive: () => !!window && !window.isDestroyed(),
       onUnresponsive: () => {
         if (livenessMonitor) {
@@ -1079,7 +1335,12 @@ function createGatewaySupervisor({
         recoverWedgedGateway(window)
           .catch((error) => glog(`liveness recovery failed: ${error && error.message}`));
       },
-      onRecovered: () => glog("liveness: backend responsive again (transient blip)"),
+      onRecovered: () => {
+        // A re-resolved backend answering again closes its incident; the next
+        // stale signal is a new one and gets the cheaper in-place re-resolve.
+        reresolveAttempts = 0;
+        glog("liveness: backend responsive again (transient blip)");
+      },
       log: (message) => glog(`liveness: ${message}`),
     });
     livenessMonitor.start();
@@ -1147,7 +1408,7 @@ function createGatewaySupervisor({
 
   async function reconnectExternalGateway(window) {
     const webContents = window.webContents;
-    try { webContents.loadFile(path.join(dirname, "loading.html")); }
+    try { webContents.loadFile(path.join(dirname, "loading.html"), { query: splashQuery(window, { reconnect: true }) }); }
     catch { /* window may be tearing down */ }
     if (!window || window.isDestroyed() || quitting()) return;
     // No reveal here: network/tunnel healing must not re-surface a window the
@@ -1169,7 +1430,7 @@ function createGatewaySupervisor({
 
   async function reconnectOrRespawnAdoptedGateway(window) {
     const webContents = window.webContents;
-    try { webContents.loadFile(path.join(dirname, "loading.html")); }
+    try { webContents.loadFile(path.join(dirname, "loading.html"), { query: splashQuery(window, { reconnect: true }) }); }
     catch { /* window may be tearing down */ }
     if (!window || window.isDestroyed() || quitting()) return;
     sendStatus("Gateway stopped responding — waiting for it to recover…");
@@ -1294,7 +1555,7 @@ function createGatewaySupervisor({
     const healthUrl = `${targetBackendUrl}/api/status`;
     const webContents = window.webContents;
     webContents.loadFile(path.join(dirname, "loading.html"), {
-      query: { accent: currentThemeAccent() },
+      query: splashQuery(window, { reconnect, accent: currentThemeAccent() }),
     });
     // Cold boot and user-clicked retries raise. Autonomous liveness recovery
     // loads into the existing hidden/minimized window without touching focus.

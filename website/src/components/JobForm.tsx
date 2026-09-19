@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
+import { Zap } from 'lucide-react'
 import { api } from '../api/client'
+import { ApiError } from '../api/apiError'
 import { Input, SendBtn } from './ui'
 import { SettingsToggle } from './settings'
 import AgentSelector, { type KiroCrewAgent } from './AgentSelector'
@@ -8,6 +10,7 @@ import SimpleSelect from './SimpleSelect'
 import type { CronJob } from '../types'
 import type { CronPrefill } from '../utils/schedulePresets'
 import { SaveCreateLabel, expandDow } from '../utils/cronUtils'
+import { adviseCronMode } from '../utils/cronModeAdvice'
 
 import { i18nT } from '../i18n/t'
 import { fmtWeekday } from '../i18n/format'
@@ -26,8 +29,14 @@ const CRON_DOW_TO_GRID: Record<number, number> = { 1: 1, 2: 2, 3: 3, 4: 4, 5: 5,
  * greyed-out control asks to be re-enabled; a value does not. Shrink-wrapped
  * so it cannot read as an editable input among the real ones, and the hint
  * says WHY it is fixed, replacing the picker's own hint line. */
-function LockedAgentValue({ name }: { name: string }) {
-  const hint = i18nT('components.jobForm.agent_pinned_hint')
+function LockedAgentValue({ name, member }: { name: string; member?: boolean }) {
+  // The hint names the thing the HOST calls it. A member surface says "member"
+  // throughout, so a hint saying "crew" there made one binding read as two — the
+  // blind reader could not tell whether member, crew and agent were one thing or
+  // three. Same sentence, the noun the reader already has.
+  const hint = i18nT(member
+    ? 'components.jobForm.member_pinned_hint'
+    : 'components.jobForm.agent_pinned_hint')
   return (
     <span className="flex flex-col items-start gap-1">
       <span className="text-[11px] text-muted/70">{hint}</span>
@@ -55,9 +64,9 @@ export function jobKindOf(job?: CronJob): JobKind {
 
 /** Parse a CronJob into initial form state */
 function parseJobDefaults(job?: CronJob) {
-  if (!job) return { name: '', message: '', agent: '', model: '', channel: '', approvalMode: '', silent: false, strictSchedule: false, hideInChat: false, jobKind: 'message' as JobKind, schedMode: 'interval' as const, intVal: 1, intUnit: 'hours' as const, weekDays: [] as number[], weekTime: '09:00', cronExpr: '' }
+  if (!job) return { name: '', message: '', agent: '', model: '', channel: '', approvalMode: '', silent: false, strictSchedule: false, hideInChat: false, minimalContext: false, jobKind: 'message' as JobKind, schedMode: 'interval' as const, intVal: 1, intUnit: 'hours' as const, weekDays: [] as number[], weekTime: '09:00', cronExpr: '' }
   const isInterval = !!(job.every_secs || (job.schedule || '').match(/^every\s+\d+/))
-  const secs = job.every_secs || (() => { const m = (job.schedule || '').match(/^every\s+(\d+)\s*([sh])/); if (!m) return 3600; return m[2] === 'h' ? parseInt(m[1]) * 3600 : parseInt(m[1]) })()
+  const secs = job.every_secs || (() => { const m = (job.schedule || '').match(/^every\s+(\d+)\s*([smh])/); if (!m) return 3600; return parseInt(m[1]) * (m[2] === 'h' ? 3600 : m[2] === 'm' ? 60 : 1) })()
   // Largest unit that divides `secs` EVENLY, not the largest unit that is merely
   // <= `secs`. The magnitude test sent 5400s to 'hours', where Math.round(1.5) is
   // 2, and buildBody re-serialises `intVal * 3600` — so opening a 90-minute job
@@ -102,7 +111,7 @@ function parseJobDefaults(job?: CronJob) {
     weekDays = expandDow(cronParts[4]).map(d => CRON_DOW_TO_GRID[d] || 1)
     weekTime = `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}`
   }
-  return { name: job.name, message: job.message, agent: job.agent || '', model: job.model || '', channel: job.channel || '', approvalMode: job.approval_mode || '', silent: job.silent || false, strictSchedule: job.strict_schedule || false, hideInChat: job.hide_in_chat || false, jobKind: jobKindOf(job), schedMode, intVal, intUnit, weekDays, weekTime, cronExpr: cronRaw }
+  return { name: job.name, message: job.message, agent: job.agent || '', model: job.model || '', channel: job.channel || '', approvalMode: job.approval_mode || '', silent: job.silent || false, strictSchedule: job.strict_schedule || false, hideInChat: job.hide_in_chat || false, minimalContext: job.minimal_context || false, jobKind: jobKindOf(job), schedMode, intVal, intUnit, weekDays, weekTime, cronExpr: cronRaw }
 }
 
 /** Build the API body from form state. Returns null if validation fails (sets error). */
@@ -111,6 +120,7 @@ function buildBody(
   tz: string,
   setError: (e: string) => void,
   isEdit = false,
+  prefill?: CronPrefill,
 ): Record<string, string | number | boolean> | null {
   const isLlmless = f.jobKind === 'script' || f.jobKind === 'command'
   // Script/command crons have no agent message — only the agent/message kind
@@ -127,9 +137,13 @@ function buildBody(
     // Edit mode always sends model so clearing an override ("" = inherit)
     // persists; create mode omits it when empty like other optional fields.
     if (isEdit || f.model) body.model = f.model
-    if (f.approvalMode) body.approval_mode = f.approvalMode
+    if (isEdit || f.approvalMode) body.approval_mode = f.approvalMode
+    // Only the agent kind has an injected context to trim. A script or command
+    // job takes no agent turn, so sending this would store a flag that can
+    // never do anything.
+    body.minimal_context = f.minimalContext
   }
-  if (f.channel) body.channel = f.channel
+  if (isEdit || f.channel) body.channel = f.channel
   body.silent = f.silent
   body.strict_schedule = f.strictSchedule
   body.hide_in_chat = f.hideInChat
@@ -145,6 +159,16 @@ function buildBody(
     if (expr.split(/\s+/).length !== 5) { setError(i18nT('components.jobForm.enter_a_valid_5_field_cron_expression')); return null }
     body.cron = expr
     body.timezone = tz
+  }
+  // Provenance stamp, create-only: the template this job was seeded from, plus
+  // the template's prompt AS IT WAS when picked (the snapshot the Schedule page
+  // compares against the template's current prompt to detect a template change,
+  // independent of any edit the user makes to the Message field below). The
+  // PATCH endpoint does not accept either (provenance is fixed at creation), so
+  // they are never sent on edit.
+  if (!isEdit && prefill?.sourcePreset) {
+    body.source_preset = prefill.sourcePreset
+    body.source_template_prompt = prefill.sourceTemplatePrompt ?? ''
   }
   return body
 }
@@ -168,6 +192,16 @@ interface Props {
    *  that embed the form inside a single crew's own surface, where offering a
    *  crew picker would just be a way to file the job in the wrong place. */
   lockedAgent?: string
+  /** Durable member identity, distinct from its provider template. */
+  memberId?: string
+  /** The host's own noun for the pinned identity: set it where the surface
+   *  says "member" throughout (the Crew Members drawer), so the pinned-value
+   *  hint speaks the reader's noun. Left unset, the hint keeps "crew" — the
+   *  crew editor's own word. Deliberately a HOST flag rather than derived
+   *  from `memberId`: every crew passes `memberId` for identity, so deriving
+   *  flipped the crew editor's wording to "member" for plain agents. */
+  memberNoun?: boolean
+  providerAgent?: string
   onSaved: () => void
   /** Vertical layout for side panel, horizontal for inline create */
   layout?: 'vertical' | 'horizontal'
@@ -177,6 +211,24 @@ interface Props {
   submitRef?: React.MutableRefObject<(() => void) | null>
   /** Called when saving state changes */
   onSavingChange?: (saving: boolean) => void
+  /** A submit that FAILED, reported outward as well as rendered inline. The
+   *  inline error is invisible to a host that has already unmounted this form —
+   *  which is exactly the case worth reporting, since the user was told the save
+   *  might still land and would otherwise never learn what happened.
+   *
+   *  `confirmed` says whether the failure is a VERDICT or an unknown. The server
+   *  answering (any HTTP status) means it decided, so the schedule was not
+   *  created. A request that never got an answer — the connection dropped, the
+   *  tab went offline — proves nothing: the POST may well have been applied, and
+   *  a host that reports "wasn't created" there states as fact something it
+   *  cannot know. Validation refusals do not come through here at all: the form
+   *  is on screen for those, so its own message is the right surface.
+   *
+   *  `jobName` is the name the user typed, so a host reporting the failure away
+   *  from this form can say WHICH schedule it was — a member can have several
+   *  in flight. Always supplied: the name is validated non-empty before the
+   *  request is ever sent. */
+  onSubmitError?: (message: string, confirmed: boolean, jobName?: string) => void
   /** Called when the form's TOUCHED state changes: true once any field has
    *  diverged from its initial value, false when they all match again (or
    *  after a successful create resets them). Hosts that guard destruction
@@ -186,9 +238,11 @@ interface Props {
   onDirtyChange?: (dirty: boolean) => void
 }
 
-export default function JobForm({ job, prefill, agents, defaultAgent, rosterFailure, lockedAgent, onSaved, layout = 'horizontal', externalSubmit, submitRef, onSavingChange, onDirtyChange }: Props) {
+export default function JobForm({ job, prefill, agents, defaultAgent, rosterFailure, lockedAgent, memberId, memberNoun, providerAgent, onSaved, layout = 'horizontal', externalSubmit, submitRef, onSavingChange, onSubmitError, onDirtyChange }: Props) {
   // "" and undefined both mean unlocked, so render and submit share one truth.
-  const locked = lockedAgent || undefined
+  const boundMember = job?.member_id || memberId
+  const privateMember = !!boundMember && boundMember !== 'default'
+  const locked = boundMember || lockedAgent || undefined
   const defaults = parseJobDefaults(job)
   // In create mode (no job), a preset can seed the prompt + schedule fields.
   // Edit mode always reflects the job as-stored and ignores any prefill.
@@ -230,6 +284,7 @@ export default function JobForm({ job, prefill, agents, defaultAgent, rosterFail
   const [silent, setSilent] = useState(init.silent)
   const [strictSchedule, setStrictSchedule] = useState(defaults.strictSchedule)
   const [hideInChat, setHideInChat] = useState(defaults.hideInChat)
+  const [minimalContext, setMinimalContext] = useState(defaults.minimalContext)
   const [schedMode, setSchedMode] = useState(init.schedMode)
   const [intVal, setIntVal] = useState(init.intVal)
   const [intUnit, setIntUnit] = useState(init.intUnit)
@@ -250,6 +305,7 @@ export default function JobForm({ job, prefill, agents, defaultAgent, rosterFail
     channel !== defaults.channel || approvalMode !== defaults.approvalMode ||
     silent !== init.silent || strictSchedule !== defaults.strictSchedule ||
     hideInChat !== defaults.hideInChat || schedMode !== init.schedMode ||
+    minimalContext !== defaults.minimalContext ||
     intVal !== init.intVal || intUnit !== init.intUnit ||
     weekTime !== init.weekTime || cronExpr !== init.cronExpr ||
     weekDays.length !== init.weekDays.length || weekDays.some((d, i) => d !== init.weekDays[i])
@@ -281,6 +337,11 @@ export default function JobForm({ job, prefill, agents, defaultAgent, rosterFail
   const jobKind = defaults.jobKind
   const isLlmless = jobKind === 'script' || jobKind === 'command'
 
+  // Recomputed as the prompt is typed, which is why it is a local regex pass
+  // and not a round trip. Reads minimalContext too, so the hint stops once the
+  // reader has acted on it.
+  const advice = useMemo(() => privateMember ? 'none' : adviseCronMode(msg, minimalContext), [msg, minimalContext, privateMember])
+
   /** Model-override rows as the two parallel arrays `SimpleSelect` takes.
    *
    *  "" (inherit) is the `clearLabel` row rather than an option, so `options`
@@ -297,17 +358,59 @@ export default function JobForm({ job, prefill, agents, defaultAgent, rosterFail
 
   const submit = async () => {
     setError(''); setSaving(true)
-    const f = { name, message: msg, agent: locked ?? agent, model, channel, approvalMode, silent, strictSchedule, hideInChat, jobKind, schedMode, intVal, intUnit, weekDays, weekTime, cronExpr }
-    const body = buildBody(f, tz, setError, !!job)
+    const f = { name, message: msg, agent: locked ?? agent, model, channel, approvalMode, silent, strictSchedule, hideInChat, minimalContext, jobKind, schedMode, intVal, intUnit, weekDays, weekTime, cronExpr }
+    const body = buildBody(f, tz, setError, !!job, job ? undefined : prefill)
     if (!body) { setSaving(false); return }
+    if (privateMember && !isLlmless) {
+      // Keyed on `privateMember`, not on `boundMember`, and BOTH lines depend on
+      // it. The backend refuses `member_id: "default"` as a V1 identity, so the
+      // rule lives here rather than in each host — `CrewWakeSection.tsx` was
+      // spelling `crew === 'default' ? undefined : crew` to avoid it, and this
+      // diff removes that one site rather than adding a second copy of it.
+      // The `agent` override belongs to the same condition: for a real member,
+      // `agent` carries the provider TEMPLATE while `member_id` carries identity,
+      // but the default crew is not a member — overriding its `agent` from
+      // "default" to the template would break the attribution `wakesCrew` reads,
+      // and its schedule would vanish from the pane that created it.
+      body.member_id = boundMember
+      body.agent = providerAgent || job?.agent || ''
+    }
     try {
+      // `confirmed` rides with the message rather than being inferred later: only
+      // here is it still known what the server said. A 4xx is a DECISION about
+      // this request, so the schedule was not created. A 5xx is not: a proxy or
+      // gateway error can be raised before the app ever saw the POST, or after it
+      // applied it and the response was lost. Anything without a status (a dropped
+      // connection, an offline tab) reached no verdict either.
       const res = job
         ? await api.updateCron(job.id, body)
-        : await api.createCron(body).catch((e: Error) => ({ error: e.message }))
-      if (res.error) { setError(res.error); setSaving(false); return }
-      if (!job) { setName(''); setMsg(''); setWeekDays([]); setIntVal(1); setChannel(''); setModel(''); setApprovalMode(''); setSilent(false); setStrictSchedule(false); setHideInChat(false) }
+        : await api.createCron(body).catch((e: unknown) => ({
+          error: e instanceof Error ? e.message : String(e),
+          errorConfirmed: e instanceof ApiError && e.status >= 400 && e.status < 500,
+        }))
+      if (res.error) {
+        setError(res.error)
+        onSubmitError?.(res.error, 'errorConfirmed' in res ? !!res.errorConfirmed : true, f.name)
+        setSaving(false)
+        return
+      }
+      if (!job) { setName(''); setMsg(''); setWeekDays([]); setIntVal(1); setChannel(''); setModel(''); setApprovalMode(''); setSilent(false); setStrictSchedule(false); setHideInChat(false); setMinimalContext(false) }
+      // Cleared BEFORE onSaved, so `onSavingChange` is symmetric: it reports
+      // false on EVERY outcome, not only on failure. An asymmetric version made
+      // the flag a host's problem to unlearn — a host that lifts it out of its
+      // own dialog (to refuse a dismissal mid-save, say) never heard about
+      // success, so one successful save left it stuck saving forever. Ordering
+      // matters: onSaved typically unmounts this form, so a clear after it
+      // would not run.
+      setSaving(false)
       onSaved()
-    } catch { setError(i18nT('components.jobForm.failed_to_save')); setSaving(false) }
+    } catch (e: unknown) {
+      const msg = i18nT('components.jobForm.failed_to_save')
+      // Reached only when the call threw past the inner handler. Same rule as
+      // above: a 4xx is the server deciding, a 5xx or a transport failure is not.
+      const decided = e instanceof ApiError && e.status >= 400 && e.status < 500
+      setError(msg); onSubmitError?.(msg, decided, f.name); setSaving(false)
+    }
   }
 
   const toggleDay = (d: number) => setWeekDays(prev => prev.includes(d) ? prev.filter(x => x !== d) : [...prev, d].sort())
@@ -368,7 +471,7 @@ export default function JobForm({ job, prefill, agents, defaultAgent, rosterFail
           <Input placeholder={i18nT('components.jobForm.job_name')} value={name} onChange={e => setName(e.target.value)} />
           <Input placeholder={i18nT('components.jobForm.message_task')} style={{ flex: 2 }} value={msg} onChange={e => setMsg(e.target.value)} />
           {locked
-            ? <LockedAgentValue name={locked} />
+            ? <LockedAgentValue name={locked} member={memberNoun} />
             : <AgentSelector agents={agents} defaultAgent={defaultAgent} value={agent} onChange={(name) => setAgent(name)} rosterFailure={rosterFailure} modal />}
           <SimpleSelect
             options={modelOptions.values}
@@ -390,6 +493,7 @@ export default function JobForm({ job, prefill, agents, defaultAgent, rosterFail
           <label htmlFor="jobform-silent" className="flex items-center gap-1.5 text-muted text-[13px] cursor-pointer"><input id="jobform-silent" aria-label={i18nT('components.jobForm.silent')} type="checkbox" checked={silent} onChange={e => setSilent(e.target.checked)} /> {i18nT('components.jobForm.silent')}</label>
           <label htmlFor="jobform-strict-schedule" className="flex items-center gap-1.5 text-muted text-[13px] cursor-pointer"><input id="jobform-strict-schedule" aria-label={i18nT('components.jobForm.strict_schedule')} type="checkbox" checked={strictSchedule} onChange={e => setStrictSchedule(e.target.checked)} /> {i18nT('components.jobForm.strict_schedule')}</label>
           <label htmlFor="jobform-hide-in-chat" className="flex items-center gap-1.5 text-muted text-[13px] cursor-pointer"><input id="jobform-hide-in-chat" aria-label={i18nT('components.jobForm.hide_in_chat')} type="checkbox" checked={hideInChat} onChange={e => setHideInChat(e.target.checked)} /> {i18nT('components.jobForm.hide_in_chat')}</label>
+          <label htmlFor="jobform-minimal-context" className="flex items-center gap-1.5 text-muted text-[13px] cursor-pointer"><input id="jobform-minimal-context" aria-label={i18nT('components.jobForm.minimal_context')} type="checkbox" checked={minimalContext} onChange={e => setMinimalContext(e.target.checked)} /> {i18nT('components.jobForm.minimal_context')}</label>
         </div>
       )}
 
@@ -434,7 +538,7 @@ export default function JobForm({ job, prefill, agents, defaultAgent, rosterFail
         <div className="flex flex-col gap-1">
           <span className="text-[12px] text-muted font-medium">{i18nT('components.jobForm.agent')}</span>
           {locked
-            ? <LockedAgentValue name={locked} />
+            ? <LockedAgentValue name={locked} member={memberNoun} />
             : (<>
               <span className="text-[11px] text-muted/70">{i18nT('components.jobForm.which_agent_handles_this_job_leave_default_for_t')}</span>
               <AgentSelector agents={agents} defaultAgent={defaultAgent} value={agent} onChange={(name) => setAgent(name)} rosterFailure={rosterFailure} modal />
@@ -495,6 +599,34 @@ export default function JobForm({ job, prefill, agents, defaultAgent, rosterFail
           checked={hideInChat}
           onChange={setHideInChat}
         />
+        {!isLlmless && (
+          <div className="flex flex-col gap-1">
+            {/* Advice, not a warning, so accent rather than warn. Sits directly
+                above the control it refers to: a hint that names a setting the
+                reader then has to hunt for is a worse hint. */}
+            {advice !== 'none' && (
+              <div
+                className="flex items-start gap-2 px-3 py-2 rounded-lg bg-accent-subtle text-[12.5px] text-accent"
+                role="note"
+                aria-live="polite"
+                data-testid="jobform-mode-advice"
+              >
+                <Zap size={14} className="shrink-0 mt-0.5" aria-hidden="true" />
+                <span>
+                  {advice === 'script'
+                    ? i18nT('components.jobForm.mode_advice_script')
+                    : i18nT('components.jobForm.mode_advice_minimal_context')}
+                </span>
+              </div>
+            )}
+            <SettingsToggle
+              label={i18nT('components.jobForm.minimal_context')}
+              description={i18nT(privateMember ? 'components.jobForm.private_minimal_context_description' : 'components.jobForm.minimal_context_description')}
+              checked={minimalContext}
+              onChange={setMinimalContext}
+            />
+          </div>
+        )}
         {vertical && !externalSubmit && (
           <SendBtn onClick={submit} disabled={saving}>
             <SaveCreateLabel isEdit={!!job} saving={saving} />

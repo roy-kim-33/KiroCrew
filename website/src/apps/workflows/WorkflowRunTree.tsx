@@ -11,19 +11,23 @@
  *     of its agents are still running, ✓ if all finished ok, ✗ if any failed),
  *     title, and agent count.
  *   - under each phase, the AGENTS with per-agent status (spinner / ✓ / ✗),
- *     their `label` (mono), and `last_tool` if present.
+ *     their `label` (mono), `last_tool` if present, and the time the agent took
+ *     once it has finished.
  *   - a narrator log strip (most recent `log` lines) and a budget readout.
  *
  * All LLM-derived strings are sanitized via sanitizeLlmOutput. Pure event-fold
  * logic lives in ./runModel and is unit-tested.
  */
-import { memo, useMemo, useState } from 'react'
+import { memo, useId, useMemo, useState } from 'react'
 import { CheckCircle2, XCircle, Loader2, ChevronRight, Workflow as WorkflowIcon } from 'lucide-react'
+import ErrorNotice from '../../components/ErrorNotice'
 import { sanitizeLlmOutput } from '../../utils/sanitize'
+import { redactSecrets, type ErrorReport } from '../../utils/errorReport'
 import { groupByPhase, latestBudget, type WfEvent } from './runModel'
-
+import { fmtElapsed } from '../../i18n/format'
 import { i18nT } from '../../i18n/t'
 import { useLanguageGeneration } from '../../i18n/useLanguageGeneration'
+
 export interface WorkflowRunTreeProps {
   events: WfEvent[]
   /** Terminal status of the run; drives the per-phase fallback when no agents
@@ -31,8 +35,10 @@ export interface WorkflowRunTreeProps {
   status?: 'running' | 'paused' | 'finished' | 'failed' | 'cancelled'
   /** Final result blob (only meaningful when status === 'finished'). */
   result?: unknown
-  /** Failure message (only meaningful when status === 'failed'). */
+  /** Execution failure or live checkpoint-storage problem. */
   error?: string | null
+  /** Backend classification; absent on legacy snapshots and execution errors. */
+  errorCode?: string | null
   /** Cap on rendered narrator log lines (most recent shown). Default 6. */
   maxLogs?: number
 }
@@ -72,9 +78,24 @@ const WorkflowRunTree = memo(function WorkflowRunTree({
   status,
   result,
   error,
+  errorCode,
   maxLogs = 6,
 }: WorkflowRunTreeProps) {
   useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
+  const noticeId = useId()
+  const checkpointMessage = i18nT('apps.workflows.workflowRunTree.checkpoint_save_failed')
+  const checkpointReport = useMemo<ErrorReport | undefined>(() => {
+    if (status === 'failed' || !error || errorCode !== 'workflow_checkpoint_failed') return undefined
+    return {
+      id: noticeId,
+      at: Date.now(),
+      source: 'system',
+      code: 'workflow_checkpoint_failed',
+      message: checkpointMessage,
+      detail: redactSecrets(sanitizeLlmOutput(error)),
+      route: window.location.pathname,
+    }
+  }, [status, error, errorCode, noticeId, checkpointMessage])
   const phases = useMemo(() => groupByPhase(events), [events])
   const budget = useMemo(() => latestBudget(events), [events])
   const logLines = useMemo(
@@ -156,6 +177,11 @@ const WorkflowRunTree = memo(function WorkflowRunTree({
                       {lastTool && (
                         <span className="text-muted truncate">· {lastTool}</span>
                       )}
+                      {a.elapsed_ms !== undefined && (
+                        <span className="ml-auto text-[10px] text-muted tabular-nums shrink-0">
+                          {fmtElapsed(a.elapsed_ms)}
+                        </span>
+                      )}
                     </li>
                   )
                 })}
@@ -176,30 +202,52 @@ const WorkflowRunTree = memo(function WorkflowRunTree({
         </div>
       )}
 
-      {/* terminal result / failure panel */}
-      {status && status !== 'running' && status !== 'paused' && (
+      {/* terminal result / failure panel. A failed run's `error` is the backend's own
+          report of the failure, so it renders through ErrorNotice — askAgent on: this
+          is a status tree with nothing editable, and the chat composer draft beneath
+          it is persisted per slot, so the hand-off loses nothing (same decision as the
+          collapsed row and progress bar that feed this tree). */}
+      {checkpointReport && (
+        <>
+          <ErrorNotice
+            message={checkpointMessage}
+            report={checkpointReport}
+            askAgent
+            testId="workflow-run-tree-error"
+          />
+          <details className="text-[13px] text-muted" data-testid="workflow-checkpoint-diagnostic">
+            <summary className="cursor-pointer">{i18nT('memoryV2.view_details')}</summary>
+            <pre className="mt-2 whitespace-pre-wrap break-words max-h-40 overflow-auto">{checkpointReport.detail}</pre>
+          </details>
+        </>
+      )}
+      {status !== 'failed' && error && !checkpointReport && (
+        <ErrorNotice message={sanitizeLlmOutput(error).slice(0, 200)} askAgent testId="workflow-run-tree-error" />
+      )}
+      {status === 'failed' && (
+        <ErrorNotice
+          message={i18nT('apps.workflows.workflowRunTree.failed_with_error', {
+            error: sanitizeLlmOutput(error || i18nT('apps.workflows.workflowRunTree.unknown_error')).slice(0, 200),
+          })}
+          askAgent
+          testId="workflow-run-tree-error"
+        />
+      )}
+      {status && status !== 'running' && status !== 'paused' && status !== 'failed' && (
         <div
           className={`text-[12px] rounded p-2 border ${
-            status === 'finished'
-              ? 'border-green-500/30'
-              : status === 'cancelled'
-                ? 'border-border'
-                : 'border-red-500/30 text-red-500'
+            status === 'finished' ? 'border-green-500/30' : 'border-border'
           }`}
         >
           <div className="font-medium mb-1 flex items-center gap-1.5">
             {status === 'finished' ? (
               <CheckCircle2 size={12} className="text-green-500" />
-            ) : status === 'cancelled' ? (
-              <XCircle size={12} />
             ) : (
               <XCircle size={12} />
             )}
             {status === 'finished'
               ? i18nT('apps.workflows.workflowRunTree.result')
-              : status === 'cancelled'
-                ? i18nT('apps.workflows.workflowRunTree.cancelled')
-                : i18nT('apps.workflows.workflowRunTree.failed_with_error', { error: sanitizeLlmOutput(error || i18nT('apps.workflows.workflowRunTree.unknown_error')).slice(0, 200) })}
+              : i18nT('apps.workflows.workflowRunTree.cancelled')}
           </div>
           {status === 'finished' && result !== undefined && (
             <pre className="font-mono text-[11px] whitespace-pre-wrap break-all max-h-40 overflow-auto">

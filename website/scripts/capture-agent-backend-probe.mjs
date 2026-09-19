@@ -29,6 +29,136 @@ mkdirSync(OUT, { recursive: true })
 
 const CLAUDE_INSTALL = 'npm i -g @agentclientprotocol/claude-agent-acp'
 
+/**
+ * `auth`, as GET /api/acp-backends now sends it: one object per harness, projected
+ * from that harness's own `AgentAuthDeclaration` in `agent_sdk/host_auth.py`.
+ *
+ * The panel no longer names a harness. It renders `sign_in_remedy` VERBATIM when
+ * `signs_in_separately` is true, and says nothing otherwise — so these strings are
+ * copied from the declarations rather than paraphrased. A scene carrying reworded
+ * prose would be a screenshot of a sentence the server never emits, which is the
+ * one thing a fixture harness must not do once the wording is server-owned.
+ *
+ * Keyed by `policy_id`, because that is the stable declaration name; the Kiro row's
+ * wire `id` is the empty string.
+ */
+const AUTH = {
+  claude: {
+    sign_in_remedy:
+      'Claude Code is a separate app you sign into yourself — run claude in ' +
+      'your terminal and complete its sign-in. It is not checked here.',
+    signs_in_separately: true,
+  },
+  codex: {
+    sign_in_remedy:
+      'Codex is a separate tool that signs in on its own — complete its ' +
+      'sign-in, or name a model provider in ~/.codex/config.toml ' +
+      '(CODEX_HOME moves that folder). Neither is checked here: the adapter ' +
+      'reads them.',
+    signs_in_separately: true,
+  },
+  // kiro-cli and KAS draw their entitlement from Crew's OWN identity store, so
+  // there is no separate sign-in for an operator to finish and the panel prints
+  // no caveat for them. The remedy string is still present on the row — what
+  // suppresses the line is `signs_in_separately`, not an absent sentence, and a
+  // scene that omitted it would be testing the wrong field.
+  kiro: {
+    sign_in_remedy: 'Run kiro-cli login in your terminal, then start a new chat.',
+    signs_in_separately: false,
+  },
+  kas: {
+    sign_in_remedy: 'Run kiro-cli login in your terminal, then start a new chat.',
+    signs_in_separately: false,
+  },
+}
+
+
+/**
+ * The capability card, as GET /api/acp-backends now sends it per row.
+ *
+ * `CARD_LINES` is the server's own line ORDER (`backend_cards.USER_FACING_LINES`)
+ * and `AVAILABLE` names, per harness, the lines the projection marks available —
+ * copied from what the projection actually emits rather than invented, so a frame
+ * documents a payload the server can genuinely produce. Keyed by `policy_id`, like
+ * `AUTH` above.
+ *
+ * Written as "which lines are available" rather than as thirteen booleans per
+ * harness because that is the form a reader can check against `backend_cards.py`
+ * by eye.
+ */
+const CARD_LINES = [
+  'crew_tools',
+  'member_thread_tools',
+  'member_saved_agent',
+  'private_member_sessions',
+  'side_chat_tools',
+  'subagent_continuation',
+  'mid_turn_steer',
+  'manual_compact',
+  'reasoning_effort',
+  'model_switch',
+  'markdown_agents',
+]
+
+const AVAILABLE = {
+  kiro: [
+    'crew_tools', 'member_saved_agent', 'private_member_sessions', 'side_chat_tools',
+    'subagent_continuation', 'mid_turn_steer', 'manual_compact', 'reasoning_effort',
+    'model_switch',
+  ],
+  kas: [
+    'crew_tools', 'member_thread_tools', 'private_member_sessions', 'mid_turn_steer',
+    'reasoning_effort', 'model_switch', 'markdown_agents',
+  ],
+  claude: [
+    'crew_tools', 'member_thread_tools', 'private_member_sessions', 'manual_compact',
+    'reasoning_effort', 'model_switch',
+  ],
+  codex: ['crew_tools', 'reasoning_effort', 'model_switch'],
+  deepseek: ['crew_tools', 'reasoning_effort', 'model_switch'],
+}
+
+/**
+ * The SECURITY notes each harness raises. The panel renders these OUTSIDE the
+ * disclosure, beside the tool-approval line, so the frames show them with
+ * nothing clicked.
+ */
+const SECURITY = {
+  kiro: ['crew_sandbox_stands_down', 'pod_home_relocated'],
+  kas: ['host_credential_to_child'],
+}
+
+/** The where-it-lives notes each harness raises. Rendered inside the disclosure. */
+const NOTES = {
+  kiro: ['crew_command_channel'],
+  kas: ['crew_command_channel'],
+  claude: ['own_credential_store', 'keeps_own_chat_record', 'harness_model_list'],
+  codex: ['own_credential_store', 'keeps_own_chat_record', 'harness_model_list'],
+  deepseek: ['own_credential_store', 'keeps_own_chat_record', 'harness_model_list'],
+}
+
+/** Each harness's routing mechanism, from `ACP_BACKEND_ROUTING`. */
+const APPROVAL = {
+  kiro: 'agent_spec',
+  kas: 'agent_spec',
+  claude: 'seeded_settings',
+  codex: 'session_config',
+  deepseek: 'unverified',
+}
+
+const card = policy_id => ({
+  capabilities: CARD_LINES.map(id => ({
+    id,
+    available: (AVAILABLE[policy_id] || []).includes(id),
+  })),
+  security_notes: SECURITY[policy_id] || [],
+  operator_notes: NOTES[policy_id] || [],
+  tool_approval: APPROVAL[policy_id] || 'unverified',
+  // deepseek is known and outside the selectable baseline: nothing establishes
+  // that its tool calls reach the host gate, so the build never offers it.
+  offered_by_build: policy_id !== 'deepseek',
+})
+
 /** One row of GET /api/acp-backends. */
 const row = (id, policy_id, over = {}) => ({
   id,
@@ -38,6 +168,8 @@ const row = (id, policy_id, over = {}) => ({
   missing_components: [],
   install_command: '',
   restart_required: false,
+  ...(AUTH[policy_id] ? { auth: AUTH[policy_id] } : {}),
+  ...card(policy_id),
   ...over,
 })
 
@@ -110,13 +242,30 @@ const SCENE_RESTART = {
 }
 
 /**
- * Scene 5 — Codex installed, and the one thing that verdict does not answer. The
+ * Scene 5 — the two facts a harness can carry at once, on the one harness that has
+ * both. Claude's tool gating has a caveat this frontend owns and translates, and
+ * Claude signs in through its own credential file, which the SERVER states. They
+ * are different facts with different remedies, so both lines print; an earlier
+ * revision returned on the first one and the only row with two things to say said
+ * one of them. Kiro and KAS sit beside it with no sign-in line at all, because
+ * their entitlement comes from Crew's identity store.
+ */
+const SCENE_CLAUDE_BOTH = {
+  schemaEnum: ['', 'kas', 'claude'],
+  backends: [row('claude', 'claude'), row('kas', 'kas'), row('', 'kiro')],
+}
+
+/**
+ * Scene 6 — Codex installed, and the one thing that verdict does not answer. The
  * adapter ships its own Codex binary, so `installed` really is the whole install
  * fact; a session can still die on its first turn for want of a credential. The
- * caveat names both branches of the remedy and says outright that neither is
- * checked here, because the panel does not read those files — a `missing` verdict
- * would disable the switch for an operator who is authenticated by a path the
- * check cannot see.
+ * remedy names both branches and says outright that neither is checked here,
+ * because the panel does not read those files — a `missing` verdict would disable
+ * the switch for an operator who is authenticated by a path the check cannot see.
+ *
+ * Codex is also the proof that the panel holds no per-harness literal any more:
+ * this frontend has no translated name for it, so its chip carries the wire
+ * `policy_id`, and its whole caveat is the sentence the server sent.
  */
 const SCENE_CODEX = {
   schemaEnum: ['', 'kas', 'claude', 'codex'],
@@ -129,7 +278,7 @@ const SCENE_CODEX = {
 }
 
 /**
- * Scene 6 — the two lines together on one row: the install line (what to run) above
+ * Scene 7 — the two lines together on one row: the install line (what to run) above
  * the standing caveat (what running it still will not do). Only the first is a
  * measurement, and only the first disables the chip.
  */
@@ -142,6 +291,23 @@ const SCENE_CODEX_MISSING = {
       missing_components: ['codex-acp'],
       install_command: 'npm i -g @agentclientprotocol/codex-acp',
     }),
+    row('kas', 'kas'),
+    row('', 'kiro'),
+  ],
+}
+
+/**
+ * Scene 8 — an agent the BUILD never offers, which is a different state from one a
+ * deployment denied. deepseek is in `ACP_BACKENDS_KNOWN` so a governance rule can
+ * name it, and outside the selectable baseline because nothing establishes that its
+ * tool calls reach the host gate. It gets a described row with no chip, and the
+ * reason is its own tool-approval line rather than prose written for it.
+ */
+const SCENE_NOT_OFFERED = {
+  schemaEnum: ['', 'kas', 'claude'],
+  backends: [
+    row('claude', 'claude'),
+    row('deepseek', 'deepseek', { selectable: false }),
     row('kas', 'kas'),
     row('', 'kiro'),
   ],
@@ -220,13 +386,37 @@ await reloadScene(SCENE_RESTART)
 await page.getByText('must restart', { exact: false }).waitFor({ timeout: 20000 })
 await shoot('agent-backend-restart.png')
 
+// Both Claude lines must be on screen before the shutter, so the frame cannot
+// document a half-rendered row.
+await reloadScene(SCENE_CLAUDE_BOTH)
+await page.getByText("pre-approved in Claude's own settings", { exact: false }).waitFor({ timeout: 20000 })
+await page.getByText('Claude Code is a separate app you sign into yourself', { exact: false }).waitFor({ timeout: 20000 })
+await shoot('agent-backend-claude-both-lines.png')
+
 await reloadScene(SCENE_CODEX)
-await page.getByText('Codex signs in on its own', { exact: false }).waitFor({ timeout: 20000 })
+await page.getByText('Codex is a separate tool that signs in on its own', { exact: false }).waitFor({ timeout: 20000 })
 await shoot('agent-backend-codex-signin.png')
 
 await reloadScene(SCENE_CODEX_MISSING)
 await page.getByText('codex-acp', { exact: false }).waitFor({ timeout: 20000 })
 await shoot('agent-backend-codex-missing.png')
+
+// Scene 5's payload again, this time with the cards CLOSED and then OPEN. The
+// summary count is what a reader compares across rows without opening anything,
+// and the expanded frame is the only place the individual lines and the operator
+// notes can be seen at all.
+await reloadScene(SCENE_CLAUDE_BOTH)
+await page.getByText('Kiro CLI supports 9 of 11 features', { exact: false }).waitFor({ timeout: 20000 })
+await shoot('agent-backend-cards-collapsed.png')
+
+for (const summary of await page.locator('summary').all()) await summary.click()
+await page.getByText('Good to know').first().waitFor({ timeout: 20000 })
+await shoot('agent-backend-cards-open.png')
+
+await reloadScene(SCENE_NOT_OFFERED)
+await page.getByText('This build does not offer this agent.').waitFor({ timeout: 20000 })
+for (const summary of await page.locator('summary').all()) await summary.click()
+await shoot('agent-backend-not-offered.png')
 
 await browser.close()
 srv.close()
@@ -235,4 +425,4 @@ if (errors.length) {
   console.error('console/page errors:\n' + errors.join('\n'))
   process.exit(1)
 }
-console.log(`wrote 6 frames to ${OUT}`)
+console.log(`wrote 10 frames to ${OUT}`)

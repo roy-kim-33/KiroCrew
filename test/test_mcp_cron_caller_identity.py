@@ -1,14 +1,14 @@
 """``kirocrew-cron`` resolves the calling session from the injected caller block.
 
-The server used to read identity from its own process environment. On a pooled
-backend one process serves many sessions, so process environment can only ever
-name one of them -- and gatewayd forwards no session-identifying variable to a
-shared backend at all, so what it actually read there was EMPTY. Every
-session-scoped path then took the empty branch, and those branches disagreed with
-each other: the per-job ownership gate allowed, ``cron_list`` skipped its filter,
-``cron_add`` stored an ownerless row, and only ``cron_remove_all`` refused. Two of
-those are fail-open, which made the ownership gate dead code for exactly the
-callers it exists to separate.
+Identity must come from the injected caller block, not the process environment.
+On a pooled backend one process serves many sessions, so process environment can
+only ever name one of them -- and gatewayd forwards no session-identifying
+variable to a shared backend at all, so reading it there yields EMPTY. A
+session-scoped path that took that empty branch would make the branches disagree:
+the per-job ownership gate would allow, ``cron_list`` would skip its filter,
+``cron_add`` would store an ownerless row, and only ``cron_remove_all`` would
+refuse. Two of those are fail-open, which would make the ownership gate dead code
+for exactly the callers it exists to separate.
 
 What these tests pin, in the order the fix depends on them:
 
@@ -18,7 +18,7 @@ What these tests pin, in the order the fix depends on them:
    environment that happened to agree.
 2. With no block, the environment still resolves, so a non-gateway launch is not
    regressed.
-3. The forgeable source is no longer consulted for an authorization decision.
+3. The forgeable source is not consulted for an authorization decision.
 4. One rule for an unidentifiable caller: writes refuse, and its read scope is
    empty rather than waved through.
 5. A row with no recorded owner is outside every session's scope, for reading and
@@ -214,7 +214,7 @@ def test_a_forged_cli_flag_does_not_widen_the_list(monkeypatch) -> None:
 
 
 def test_a_forged_cli_flag_does_not_sweep_every_sessions_jobs(monkeypatch) -> None:
-    """The destructive one. A forged flag used to delete the whole store."""
+    """The destructive one. A forged flag must not delete the whole store."""
     _as_session("dashboard:alice")
     alice = f"alice-{uuid.uuid4().hex[:8]}"
     _add_job(alice)
@@ -525,7 +525,7 @@ def test_remove_all_never_sweeps_an_ownerless_row() -> None:
 
 
 def test_a_scoped_empty_list_does_not_read_as_an_empty_registry() -> None:
-    """The distinction the whole of #6447 is about.
+    """The distinction this whole file is about.
 
     Bob owns nothing, Alice owns a job. Bob's answer must not be the string a
     caller gets when the registry is genuinely empty, because that reads as
@@ -583,3 +583,97 @@ def test_the_tool_description_warns_that_the_list_is_scoped() -> None:
 
     assert "SCOPED TO THE CALLING SESSION" in desc
     assert "not that none are scheduled" in desc
+
+
+# --- 7: channel-agent confinement ------------------------------------------
+#
+# A channel agent (session key ``channel:<channel_id>:<agent_id>``) is confined
+# to channel posts. cron_add/cron_update let it schedule a durable job that runs
+# as a MORE privileged agent, so both are denied here at MCP dispatch -- keyed on
+# the verified caller identity, because an auto-approved call (cron in the
+# agent's allowedTools) fires no permission event for channel.py's guard to see.
+
+
+def test_channel_agent_cannot_create_cron() -> None:
+    """A channel agent's ``cron_add`` is refused and mints no job."""
+    _as_session("channel:C123:reviewer")
+
+    result = _call_tool_inner(
+        "cron_add",
+        {
+            "name": f"esc-{uuid.uuid4().hex[:8]}",
+            "message": "go",
+            "agent": "kirocrew",
+            "approval_mode": "auto",
+            "every": 60,
+        },
+    )
+
+    assert "not available to channel agents" in result
+    assert CronService(base_dir=mcp_cron.config_dir()).list_jobs(include_disabled=True) == []
+
+
+def test_channel_agent_cannot_update_cron() -> None:
+    """A channel agent's ``cron_update`` is refused before it can re-point an
+    existing job's ``agent_id`` -- and the refusal precedes the ownership check,
+    so it does not even reveal whether the job exists."""
+    _as_session("channel:C123:reviewer")
+
+    result = _call_tool_inner("cron_update", {"job_id": "any-job-id", "agent": "kirocrew"})
+
+    assert "not available to channel agents" in result
+
+
+def test_channel_agent_cron_denied_needs_no_permission_event() -> None:
+    """The denial is at MCP dispatch, not the permission-request event.
+
+    ``_call_tool_inner`` is the dispatch path a call reaches AFTER approval (an
+    auto-approved MCP tool emits no permission event at all), so a refusal here
+    proves the boundary holds even when channel.py's interactive guard never
+    ran. Even with no ``agent`` override -- a plain self-scoped schedule -- the
+    channel agent is contained, matching how ``send_*`` / ``session_*`` are
+    treated (all-or-nothing, not argument-conditional)."""
+    _as_session("channel:C123:reviewer")
+
+    result = _call_tool_inner(
+        "cron_add", {"name": f"self-{uuid.uuid4().hex[:8]}", "message": "remind", "every": 60}
+    )
+
+    assert "not available to channel agents" in result
+
+
+def test_slack_human_session_may_still_schedule_cron() -> None:
+    """Only the ``channel:`` orchestrator-agent namespace is confined.
+
+    A ``slack:``/``discord:`` session is an allow-listed HUMAN participant, not a
+    contained agent, so its own recurring scheduling is the legitimate flow the
+    fix must not break. This is what keeps the denial from being the over-broad
+    'restrict every caller to its own agent' model that would break scheduling
+    for a different crew."""
+    _as_session("slack:1785370133.085469")
+
+    result = _call_tool_inner(
+        "cron_add", {"name": f"human-{uuid.uuid4().hex[:8]}", "message": "go", "every": 120}
+    )
+
+    assert "Added job" in result
+    assert "not available to channel agents" not in result
+
+
+def test_dashboard_session_may_schedule_for_another_crew() -> None:
+    """The dashboard flow the issue is careful to preserve: a chat session
+    scheduling a job that runs as a DIFFERENT crew is allowed -- the confinement
+    keys on the channel-agent namespace, not on the ``agent`` argument."""
+    _as_session("dashboard:owner")
+
+    result = _call_tool_inner(
+        "cron_add",
+        {
+            "name": f"crew-{uuid.uuid4().hex[:8]}",
+            "message": "go",
+            "agent": "kirocrew-conductor",
+            "every": 120,
+        },
+    )
+
+    assert "Added job" in result

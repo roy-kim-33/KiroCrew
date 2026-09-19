@@ -55,11 +55,18 @@ export default function TagManagerList({ mode, selectedIds = [], onToggleTag, cr
   const deleteTagMutation = useMutation({
     mutationFn: (id: string) => api.deleteChatTag(id),
     onSuccess: () => {
-      // Deleting a tag can prune column filters and un-tag slots, so refresh
-      // those caches too (both board views react without a manual reload).
+      // Deleting a tag also prunes column filters, so refresh that cache too
+      // (both board views react without a manual reload).
+      //
+      // The un-tagged SLOT rows are deliberately NOT refreshed from here. Slot
+      // tags live in the Redux dashboard slice, and `api_chat_tag_delete`
+      // strips the id from every slot and then calls `push_slots_update()` on
+      // its one success path -- so the authoritative frame `applySlots` lands
+      // already carries the stripped tags. The third invalidate this handler
+      // used to end with named a plain ['chat-slots'] key, which refreshes
+      // nothing at all: no query is registered on it (#10204).
       queryClient.invalidateQueries({ queryKey: ['chat-tags'] })
       queryClient.invalidateQueries({ queryKey: ['tag-columns'] })
-      queryClient.invalidateQueries({ queryKey: ['chat-slots'] })
     },
   })
 
@@ -180,7 +187,7 @@ export default function TagManagerList({ mode, selectedIds = [], onToggleTag, cr
                       title={i18nT('components.tagManagerList.set_color_to_name', { name: colorName })}
                       aria-label={i18nT('components.tagManagerList.set_color_to_name', { name: colorName })}
                       aria-pressed={t.color === value}
-                      className={`w-4 h-4 rounded-full cursor-pointer border transition-transform hover:scale-110 outline-none focus-visible:ring-2 focus-visible:ring-accent ${t.color === value ? 'ring-1 ring-accent ring-offset-1 ring-offset-bg' : ''}`}
+                      className={`w-4 h-4 rounded-full cursor-pointer border hover:brightness-125 swatch-cue outline-none focus-visible:ring-2 focus-visible:ring-accent ${t.color === value ? 'ring-1 ring-accent ring-offset-1 ring-offset-bg' : ''}`}
                       style={{ background: `color-mix(in srgb, ${value} 30%, var(--bg-elevated))`, borderColor: value }}
                       onClick={() => {
                         updateTagMutation.mutate({ id: t.id, body: { color: value } })

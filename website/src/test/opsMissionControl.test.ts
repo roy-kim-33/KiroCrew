@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { describe, it, expect } from 'vitest'
-import { hasBuiltinComponent, getBuiltinComponent } from '../apps/builtinRegistry'
+import { hasBuiltinComponent, getBuiltinApp } from '../apps/builtinRegistry'
 import { describeSourceHealth, type SourcePollHealth } from '../apps/ops-mission-control/api'
 import EN_CATALOG from '../i18n/locales/en.json'
 
@@ -78,10 +78,11 @@ describe('ops-mission-control builtin registration', () => {
     expect(hasBuiltinComponent(ROUTE)).toBe(true)
   })
 
-  it('resolves to a lazy component', () => {
-    const component = getBuiltinComponent(ROUTE)
-    expect(component).toBeDefined()
-    expect(component).toHaveProperty('$$typeof')
+  it('resolves to a lazy component owned by this app', () => {
+    const entry = getBuiltinApp(ROUTE)
+    expect(entry).toBeDefined()
+    expect(entry!.component).toHaveProperty('$$typeof')
+    expect(entry!.appId).toBe('ops-mission-control')
   })
 
   it('uses a route shape BuiltinAppRoute can actually resolve', () => {
@@ -752,8 +753,9 @@ describe('a provider row cannot paint a control the backend will reject', () => 
 
   it('reports a rejected write outside the block the toggle gates', () => {
     // The error <p> used to live inside `enabled ? …`, so the click that failed most often
-    // failed in complete silence.
-    const errorAt = panel.indexOf('writeError ? (')
+    // failed in complete silence. The rejected write now renders as one ErrorNotice per
+    // mutation; the config write is the first of them.
+    const errorAt = panel.indexOf('configMutation.isError ? (')
     const blockEnd = panel.indexOf('OUTSIDE the block the enable toggle gates')
     expect(blockEnd).toBeGreaterThan(0)
     expect(errorAt).toBeGreaterThan(blockEnd)
@@ -807,8 +809,14 @@ describe('the Board renders the artifact a colleague gets handed', () => {
   })
 
   it('offers a copy control for the postmortem text', () => {
+    // Routed through the shared helper, NOT the bare async Clipboard API. That API
+    // needs a secure context, so on a plain-HTTP dashboard `navigator.clipboard` is
+    // undefined and a bare call copies nothing; the helper's execCommand fallback
+    // still works there. Both directions are asserted, because the bare form is
+    // what this control shipped with and reads as the obvious way to write it.
     expect(page).toMatch(/Copy postmortem/)
-    expect(page).toMatch(/navigator\.clipboard\.writeText\(log\)/)
+    expect(page).toMatch(/copyToClipboard\(log\)/)
+    expect(page).not.toMatch(/navigator\.clipboard/)
   })
 
   it('distinguishes "no artifact" from an empty one', () => {

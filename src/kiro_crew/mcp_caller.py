@@ -13,10 +13,9 @@ each call so it can:
 * Scope per-session state (memory keys, file paths, audit records).
 * Enforce per-session authorization policies.
 
-Previously, the backend read this identity from the ``KIROCREW_SESSION_KEY``
-environment variable baked in at spawn time. That approach is incompatible
-with pooling because one backend would serve many sessions but see only the
-first session's env var.
+A ``KIROCREW_SESSION_KEY`` environment variable baked in at spawn time cannot
+carry this identity under pooling: one backend serves many sessions but sees
+only the first session's env var.
 
 DESIGN
 ------
@@ -59,8 +58,11 @@ This module defines a **namespaced, versioned, typed** protocol extension:
    as an explicit argument. No contextvars, no env reads, no implicit state.
    When the gateway does not inject the extension (non-pooled topology,
    older gateway, legacy clients), a fallback ``CallerContext`` is
-   constructed from the ambient ``KIROCREW_SESSION_KEY`` env var so
-   existing behaviour is preserved.
+   constructed by :meth:`CallerContext.from_env`, which resolves the signed
+   per-session token before the ambient ``KIROCREW_SESSION_KEY`` env var —
+   the env var is what goes stale on a warm-pool rekey and what names the
+   parent for a session-sharing subagent, so it is the last resort rather
+   than the first source.
 
 4. **Forward compatibility** — ``schemaVersion`` lets the extension evolve.
    A v2 schema may add fields; v1 consumers must ignore unknown keys.
@@ -80,6 +82,8 @@ from types import MappingProxyType
 from typing import Any, Mapping
 
 from kiro_crew import platform_compat
+from kiro_crew.member_memory_auth import PROOF_META_KEY
+from kiro_crew.session_token_sig import session_key_from_env_token
 
 # --- Protocol identifiers ---------------------------------------------------
 
@@ -112,7 +116,7 @@ CALLER_SCHEMA_VERSION = 1
 #: to a per-PROCESS namespace, which separates sessions exactly as far as the
 #: 1:1 shim topology makes them separate processes. On a POOLED backend one
 #: process serves N connections, so that fallback collapses every unnamed
-#: co-tenant onto one namespace (#5322).
+#: co-tenant onto one namespace.
 TENANT_META_KEY = "kirocrew.tenant"
 
 #: Schema version of the tenant block. Same additive rule as the caller block.
@@ -123,13 +127,21 @@ TENANT_SCHEMA_VERSION = 1
 #: 64 bits does that for any number of connections a gateway will ever hold.
 _TENANT_NONCE_BYTES = 8
 
-#: Process-lifetime cache of a RESOLVED ``from_env()`` identity. The env var
+#: Process-lifetime cache of a RESOLVED LEGACY ``from_env()`` identity. The env var
 #: and ancestor pidfile chain are immutable once present, so the walk need run
-#: at most once. It no longer forks ``ps`` per ancestor (``_parent_pid``
+#: at most once. The walk does not fork ``ps`` per ancestor (``_parent_pid``
 #: delegates to ``platform_compat.get_ppid``), but it is still a chain of file
 #: reads or syscalls on a hot path. Only a non-empty result is cached, so a
 #: warm-pool session claimed after the first call can still resolve once its
 #: pidfile appears (see ``from_env``).
+#:
+#: LEGACY is the load-bearing word: the protected member binding and the signed
+#: per-session token are both resolved ABOVE this cache and neither is ever stored
+#: in it. A token's mapping is REPUBLISHED on every ``rekey()`` while the token
+#: itself survives one, so the whole mechanism by which a warm-pool claim becomes
+#: visible to an already-running MCP child is that the file is read again. Caching
+#: that answer — or reading the token below a primed cache — makes every call after
+#: the first answer with the session that held the process before the claim.
 _FROM_ENV_CACHE: "CallerContext | None" = None
 
 
@@ -186,9 +198,10 @@ class CallerContext:
     #: observed by peer sessions in a pooled topology — ``frozen=True`` on
     #: the dataclass only blocks attribute *reassignment*, not mutation of
     #: mutable field contents.
-    raw: Mapping[str, Any] = field(
-        default_factory=lambda: MappingProxyType({})
-    )
+    raw: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
+    #: Per-call authority minted by gatewayd from the kernel-attested stub PID.
+    #: Never populated from the environment, cached, or included in diagnostics.
+    member_memory_proof: str = field(default="", repr=False)
 
     @classmethod
     def from_meta(cls, meta: Any) -> "CallerContext | None":
@@ -218,13 +231,15 @@ class CallerContext:
             principal_id=str(block.get("principalId") or ""),
             channel_id=str(block.get("channelId") or ""),
             from_gateway=True,
-            raw=MappingProxyType(dict(block)),
+            raw=MappingProxyType({k: v for k, v in block.items() if k != PROOF_META_KEY}),
+            member_memory_proof=(
+                block[PROOF_META_KEY] if isinstance(block.get(PROOF_META_KEY), str) else ""
+            ),
         )
 
     @classmethod
     def from_env(cls) -> "CallerContext":
-        """Synthesize a context from the ``KIROCREW_SESSION_KEY`` env var, or
-        the warm-pool PID file if env is absent.
+        """Resolve protected member ancestry, then legacy environment/PID identity.
 
         Used when the gateway does not inject the extension — i.e., per-session
         deployments, legacy topology, or a gateway that pre-dates this
@@ -232,16 +247,53 @@ class CallerContext:
         handlers can log or sample this to detect topology regressions.
 
         Fallback order:
-          1. ``KIROCREW_SESSION_KEY`` env var (primary, per-session mode)
-          2. ``config_dir() / session_pid_{parent_pid}.txt`` (warm-pool mode,
+          1. Protected private process ancestry (invalid records stop resolution)
+          2. The signed per-SESSION token on this process's own element
+             (``session_token_sig.session_key_from_env_token``)
+          3. Cached legacy identity or ``KIROCREW_SESSION_KEY`` env var
+          4. ``config_dir() / session_pid_{parent_pid}.txt`` (warm-pool mode,
              where kiro-cli is pre-spawned with no key and rekey()+PID file
              provides the mapping once the session is claimed)
+
+        Sources 3 and 4 are both process-keyed, and that is what source 2 exists to
+        correct. One kiro-cli process hosts N ACP sessions under
+        ``agent.session_sharing``, so the env var, the pidfile and the ancestor walk
+        all answer with the PARENT's session for a ``spawn_run`` subagent's server;
+        and after a warm-pool rekey the env a child was spawned with names the
+        session that held the process BEFORE the claim. The token names one session
+        and its mapping is republished on every rekey, so it is the only source here
+        that is both per-session and current. The identity gatewayd injects per CALL
+        still outranks all of them (:func:`current_caller`), being unable to go
+        stale at all.
 
         When neither source provides a key, returns an empty-key context.
         Downstream code decides whether to reject (pooled backends should)
         or fall through (session-key-agnostic tools).
         """
         global _FROM_ENV_CACHE
+        # Read-only process ancestry is authoritative even if an earlier V1
+        # fallback was cached. An invalid record must not fall through to env
+        # or the writable legacy sidecars, and private rekeys stay observable.
+        from kiro_crew.member_memory_auth import protected_member_session_for_pid
+
+        try:
+            protected = protected_member_session_for_pid(os.getpid())
+        except Exception:
+            protected = ""
+        if protected is not None:
+            return cls(session_key=protected, session_type="protected-pid", from_gateway=False)
+        # The signed token, above the CACHE as well as above the env var. Above the
+        # env var because a rekey makes the env stale; above the cache because this
+        # resolver runs repeatedly in one process — the stub's recaller poll and
+        # every later register — and a memoised legacy answer would hide the
+        # republished mapping that is the only record of the current claim. Not
+        # cached itself, for the same reason.
+        try:
+            from_token = session_key_from_env_token()
+        except Exception:
+            from_token = ""
+        if from_token:
+            return cls(session_key=from_token, session_type="token", from_gateway=False)
         if _FROM_ENV_CACHE is not None:
             return _FROM_ENV_CACHE
         sk = os.environ.get("KIROCREW_SESSION_KEY", "")
@@ -325,7 +377,7 @@ def build_caller_meta(ctx: CallerContext) -> dict[str, Any]:
     Returns a dict suitable for placement at ``params._meta`` in the
     JSON-RPC request.
     """
-    return {
+    meta = {
         CALLER_META_KEY: {
             "schemaVersion": CALLER_SCHEMA_VERSION,
             "sessionKey": ctx.session_key,
@@ -334,6 +386,9 @@ def build_caller_meta(ctx: CallerContext) -> dict[str, Any]:
             "channelId": ctx.channel_id,
         }
     }
+    if ctx.from_gateway and ctx.member_memory_proof:
+        meta[CALLER_META_KEY][PROOF_META_KEY] = ctx.member_memory_proof
+    return meta
 
 
 def new_tenant_nonce() -> str:
@@ -342,8 +397,8 @@ def new_tenant_nonce() -> str:
     Minted by the GATEWAY, never derived from anything the stub sends. A stub
     supplies its own ``stub_uuid`` on the Register frame, so deriving the nonce
     from that value would let one stub choose to land in another unnamed
-    co-tenant's namespace — re-creating #5322's collision deliberately instead of
-    by accident.
+    co-tenant's namespace — re-creating the unnamed-co-tenant collision
+    deliberately instead of by accident.
     """
     return secrets.token_hex(_TENANT_NONCE_BYTES)
 
@@ -416,8 +471,10 @@ _CURRENT_CALLER: ContextVar["CallerContext | None"] = ContextVar(
 def set_current_caller(ctx: "CallerContext | None") -> None:
     """Install (or clear, with ``None``) the current call's verified caller.
 
-    ONLY the stdio dispatch loop may call this — tool code must treat the
-    slot as read-only via :func:`current_caller`.
+    Only a trusted dispatch boundary (stdio or an independently verified
+    internal HTTP request) may call this. Tool implementations must treat the
+    slot as read-only via :func:`current_caller`. HTTP dispatch restores the
+    previous context in a finally block inside its request-scoped worker.
     """
     _CURRENT_CALLER.set(ctx)
 
