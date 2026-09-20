@@ -44,6 +44,14 @@ logger = logging.getLogger(__name__)
 
 _REGISTRY_FILE = Path(__file__).resolve().parent / "model_registry.json"
 
+# Product-side concrete model-id shape used by the lesson writer. The trusted
+# workflow keeps its own literal copy so a PR cannot weaken the gate by changing
+# product code; a test pins the two spellings against silent drift.
+MODEL_ID_LITERAL_PATTERN = (
+    r"(claude-(opus|sonnet|haiku|fable)|"
+    r"opus-[0-9]|sonnet-[0-9]|haiku-[0-9]|fable-[0-9]|gpt-[0-9])"
+)
+
 # Hardcoded last-resort default so a corrupt/missing registry can't brick the
 # claude_code provider. _FALLBACK_CANONICAL is the canonical key default()
 # returns when the registry didn't load. _FALLBACK_PROVIDER_IDS maps every
@@ -260,20 +268,28 @@ _SUPPLEMENTARY_WINDOWS: dict[str, int] = {
 }
 
 
-def _kiro_windows_cache_path() -> Path:
-    """Path to the persisted kiro-window sidecar under the data home.
+def _sidecar_path(name: str) -> Path:
+    """A data-home sidecar path, resolved WITHOUT creating the data home.
 
-    Resolved lazily (not at import) so tests / KIROCREW_HOME overrides are
-    honoured, and so a home-resolution failure never breaks module import.
-    Routes through ``config_dir()`` (deferred import of the stdlib-only
-    ``config.paths`` leaf to avoid a cycle) so it follows the data-home move to
-    ``~/.kiro/crew`` instead of writing to the now-archived legacy ``~/.kirocrew``
-    — where no reader would ever consult it and which would re-create the very
-    directory the migration just archived.
+    ``config_dir()`` is resolve-and-maintain: it ``mkdir``s the home and
+    refreshes the recovery breadcrumb. The import-time loads below only need to
+    know whether a cache file exists, and importing this module must not mutate
+    the host: a test collector imports it before any isolation fixture runs, and
+    a read-only tool must not create ``~/.kiro/crew`` as a side effect of an
+    import. ``peek_data_home()`` resolves the same home ``config_dir()`` would and
+    stops there. The writers need no directory creation of their own:
+    ``atomic_write`` creates the parent. Deferred import of the stdlib-only
+    ``config.paths`` leaf avoids a cycle, and following the data home keeps the
+    sidecars out of the archived legacy ``~/.kirocrew``.
     """
-    from kiro_crew.config.paths import config_dir
+    from kiro_crew.config.paths import peek_data_home
 
-    return config_dir() / "model_windows.json"
+    return peek_data_home() / name
+
+
+def _kiro_windows_cache_path() -> Path:
+    """Path to the persisted kiro-window sidecar under the data home."""
+    return _sidecar_path("model_windows.json")
 
 
 def _load_kiro_windows() -> None:
@@ -368,12 +384,11 @@ def persist_kiro_windows() -> None:
 # ground truth. kiro-cli advertises via ``chat --list-models``; claude-agent-acp
 # advertises its versioned list in the ``session/new`` response
 # (``AcpClient._capture_available_models``). This cache records those advertised
-# provider ids per provider so the consumers that used to read the static
-# ``available_models(provider)`` allowlist can read what the provider served
-# instead — chiefly the claude_code ``settings.local.json`` ``availableModels``
-# seed, which unlocks a model's real window and previously carried only the
-# registry's Anthropic ids (so a served-but-unlisted model, e.g. a new Opus,
-# collapsed to the base window).
+# provider ids per provider so consumers read what the provider served rather
+# than the static ``available_models(provider)`` allowlist — chiefly the
+# claude_code ``settings.local.json`` ``availableModels`` seed, which unlocks a
+# model's real window. Seeding the registry's Anthropic ids alone collapses a
+# served-but-unlisted model, e.g. a new Opus, to the base window.
 #
 # Runtime state, not committed data (like ``_KIRO_WINDOWS`` / session_map). A
 # corrupt/missing cache degrades silently to the registry allowlist and can
@@ -393,15 +408,8 @@ _PROVIDER_ID_PREFIXES: tuple[str, ...] = (
 
 
 def _advertised_models_cache_path() -> Path:
-    """Path to the persisted advertised-model sidecar under the data home.
-
-    Resolved lazily (not at import), for the same reasons as
-    :func:`_kiro_windows_cache_path`: honour ``KIROCREW_HOME`` / test overrides
-    and never let home resolution break module import.
-    """
-    from kiro_crew.config.paths import config_dir
-
-    return config_dir() / "provider_models.json"
+    """Path to the persisted advertised-model sidecar under the data home."""
+    return _sidecar_path("provider_models.json")
 
 
 def _load_advertised_models() -> None:
@@ -501,6 +509,52 @@ def _normalize_advertised_key(provider_id: str) -> str:
     return s.strip("-")
 
 
+def strip_provider_id_prefix(provider_id: str) -> str:
+    """Peel ONE leading inference-profile prefix, returned in WIRE form.
+
+    The wire-spelling counterpart of the prefix strip inside
+    :func:`_normalize_advertised_key`: when a prefixed id
+    (``global.anthropic.claude-opus-4-8[1m]``) is rejected by an adapter whose
+    accepted set carries the bare spelling, the retry candidate is this
+    function's output (``claude-opus-4-8[1m]``). Unchanged when no known
+    prefix matches.
+    """
+    s = provider_id.strip()
+    for pfx in _PROVIDER_ID_PREFIXES:
+        if s.lower().startswith(pfx):
+            return s[len(pfx) :]
+    return s
+
+
+_EFFORT_SUFFIX_RE = re.compile(r"^(?P<base>[^\[\]]+?)\[(?P<suffix>[^\[\]]+)\]$")
+# A bracket suffix naming a CONTEXT WINDOW (``[1m]``, ``[200k]``), not an effort.
+_WINDOW_SUFFIX_RE = re.compile(r"^\d+[mk]?$", re.IGNORECASE)
+
+
+def split_effort_suffix(model_id: str) -> tuple[str, str]:
+    """Split a ``<model>[<effort>]`` id into ``(model, effort)``.
+
+    codex-acp advertises its ``models.availableModels`` as one entry per
+    model x reasoning effort, spelled ``gpt-6-astra[max]`` -- the shape its
+    legacy ``session/set_model`` accepts. Its ``model`` config option, the
+    channel Crew switches models on, accepts only the bare ``gpt-6-astra`` and
+    takes the effort through a separate ``reasoning_effort`` option. This is the
+    seam between the two spellings.
+
+    Returns ``(model_id, "")`` when there is nothing to split: no bracket
+    suffix, or a suffix that names a context WINDOW (``[1m]``) rather than an
+    effort -- that one is part of the model id claude-agent-acp serves and must
+    reach the wire intact.
+    """
+    m = _EFFORT_SUFFIX_RE.match(model_id.strip())
+    if not m:
+        return model_id, ""
+    suffix = m.group("suffix").strip()
+    if not suffix or _WINDOW_SUFFIX_RE.match(suffix):
+        return model_id, ""
+    return m.group("base"), suffix
+
+
 def _is_1m_id(model_id: str) -> bool:
     """True if ``model_id`` names a 1M-window variant (``[1m]`` suffix or a
     standalone ``1m`` token)."""
@@ -538,21 +592,28 @@ def _dedup_window_siblings(ids: Sequence[str]) -> list[str]:
 def seed_available_models(provider: str) -> list[str]:
     """The ``availableModels`` allowlist to seed for ``provider``.
 
-    Provider-first: the ids ``provider`` actually advertised (cached from a live
-    session) when the cache is warm, so the seed reflects what the account is
-    served rather than the static Anthropic-only registry. Falls back to
-    :func:`available_models` on a cold cache (first-ever session, before any
-    ``session/new`` has been captured) — the static registry list, which is then
-    window-deduplicated below just like the warm list.
+    Provider-advertised ONLY: the ids ``provider`` actually served on a real
+    ``session/new`` (cached by :func:`refresh_advertised_models`). A cold cache
+    returns ``[]``, which callers must read as "seed no allowlist at all" —
+    NOT as "fall back to the static registry".
+
+    That fallback must NOT live here: it is actively harmful. The adapter merges
+    ``availableModels`` union+dedup across every settings source, so seeding the
+    hand-maintained registry list POISONS the merge for anything the registry has
+    not caught up on: a model the account is served but the registry never listed
+    (a fresh flagship) contributes no ``[1m]`` id, so the merged list has only
+    base-window spellings and the pick resolves to 200K. Seeding nothing instead
+    leaves the adapter with its own provider-derived list, which already carries
+    the correct versioned ids — the registry is a display/window table, not the
+    authority on what the account can run, and keeping it out of this path is
+    what stops every new model from needing a registry edit per provider.
 
     The result is passed through :func:`_dedup_window_siblings` so a base-window
     id never rides alongside its 1M sibling: seeding both is what lets the adapter
-    collapse a versioned pick (e.g. Opus 4.8 ``[1m]``) back to 200K. Applied to
-    the advertised list too, since a backend can advertise both spellings.
+    collapse a versioned pick (e.g. Opus 4.8 ``[1m]``) back to 200K. A backend can
+    advertise both spellings, so this applies to the advertised list too.
     """
-    cached = advertised_models(provider)
-    base = cached if cached else available_models(provider)
-    return _dedup_window_siblings(base)
+    return _dedup_window_siblings(advertised_models(provider))
 
 
 def resolve_wire_model_id(model_id: str, provider: str) -> str:
@@ -849,6 +910,94 @@ def has_known_window(canonical_or_id: str) -> bool:
     )
 
 
+def catalog_namespaces() -> frozenset[str]:
+    """Every namespace that has a model catalog to answer questions about.
+
+    The union of the STATIC index (the ``providers`` keys in
+    ``model_registry.json``) and the RUNTIME advertised-model cache (one bucket
+    per namespace, filled by :func:`refresh_advertised_models`). Both halves are
+    needed: the static JSON carries only ``acp`` and ``claude_code``, so a
+    harness whose ids the file never lists — codex, opencode, goose, pi,
+    deepseek — is known ONLY through what it advertised on a past session.
+
+    A namespace absent from both has nothing to say about any id, which is a
+    different answer from "does not serve it" and callers must be able to tell
+    the two apart.
+    """
+    return frozenset(_CANONICAL_INDEX) | frozenset(_ADVERTISED_MODELS)
+
+
+def catalog_key(model_id: str) -> str:
+    """One comparison key for a model id, for matching two catalogs' spellings.
+
+    :func:`_normalize_advertised_key` already folds the inference-profile prefix
+    and the window marker; this adds the EFFORT suffix, because effort is a
+    per-request dial rather than part of the model's identity -- a catalog that
+    advertises ``openai.gpt-5.6-sol[low]`` is advertising the same model a pin
+    spells ``openai.gpt-5.6-sol[xhigh]``. Both sides of a comparison must be
+    folded with this same function or the two spellings never meet; a normalizer
+    applied to only one side is the shape of bug it exists to prevent.
+
+    ``""`` for an empty id and for the ``auto`` sentinel: neither names a model.
+    """
+    s = model_id.strip()
+    if not s or s == "auto":
+        return ""
+    base, _effort = split_effort_suffix(s)
+    return _normalize_advertised_key(base or s)
+
+
+def namespace_vocabulary(
+    model_id: str,
+    namespace: str,
+    advertised: "Sequence[str] | None" = None,
+) -> bool:
+    """Whether *model_id* is one of *namespace*'s OWN model ids.
+
+    A vocabulary answer is distinct from entitlement, and the distinction is
+    load-bearing. "Is this id in my vocabulary" decides whether a pin was chosen
+    for some OTHER harness. "Can this account run it" is entitlement, which
+    ``acp.client.model_is_unusable`` owns. An advertised list answers the second
+    directly and the first only positively: a list is what the account may run,
+    so an id missing from it may be unentitled rather than foreign.
+
+    So presence is taken from any source, while ABSENCE is never proof on its own:
+
+    * *advertised* -- the ids this session's harness listed, freshest of the three;
+    * the cross-session advertised cache for *namespace*;
+    * the static index, but ONLY where the id is a genuine id of this namespace.
+
+    The static clause round-trips through :func:`to_provider_id` on purpose. An
+    entry can be an ALIAS that folds onto a different model: ``claude-haiku-4.5``
+    resolves in the ``claude_code`` index, yet its provider id is Sonnet, because
+    that backend serves no Haiku and the alias exists for dropdown dedup. Reading
+    such an alias as vocabulary lets a pin survive into a silent substitution.
+    An id the index does not resolve at all is not vocabulary either, which is
+    what keeps one harness's ids out of another's answer.
+    """
+    wanted = catalog_key(model_id)
+    if not wanted or not namespace:
+        return False
+    if advertised and any(catalog_key(a) == wanted for a in advertised):
+        return True
+    cached = _ADVERTISED_MODELS.get(namespace)
+    if cached and any(catalog_key(a) == wanted for a in cached):
+        return True
+    stripped = model_id.strip()
+    key = _resolve_canonical(stripped, namespace)
+    # A canonical key belongs to its namespace. An alias resolves to a different
+    # key, so it continues to the round-trip and cannot pass as vocabulary.
+    if key == stripped:
+        return True
+    if key is None:
+        base, _effort = split_effort_suffix(stripped)
+        key = _resolve_canonical(base, namespace)
+    if key is None:
+        return False
+    provider_id = _REGISTRY[key].get("providers", {}).get(namespace, "")
+    return bool(provider_id) and catalog_key(provider_id) == wanted
+
+
 def get_entry(canonical_key: str) -> dict[str, Any] | None:
     """Return the registry entry for a canonical key, or None if unknown.
 
@@ -965,11 +1114,11 @@ def canonical_key(name: str) -> str | None:
     (``us.anthropic.…``, ``global.anthropic.…``) -- and returns ``None`` for
     anything the registry does not list. A provider-prefixed id is not itself a
     registry key/alias, so the prefix is peeled and the lookup retried (the "fold
-    a provider/partition prefix" half of #5339). This is the single "which
+    a provider/partition prefix" half of the fold). This is the single "which
     registry model is this id?" fold shared by ``_normalize_model_key``
     (dashboard/handlers/agents.py) and the frontend ``canonicalKey``
     (providers/modelRegistry.ts) -- the peel lives HERE so any backend caller of
-    this documented fold gets both #5339 halves, not just the dashboard handler.
+    this documented fold gets both halves, not just the dashboard handler.
     """
     for provider in ("acp", "claude_code"):
         key = _resolve_canonical(name, provider)
@@ -989,8 +1138,8 @@ def canonicalize_for_provider(stored_model: str, provider: str) -> str:
     ``claude_code``, where the wire/dropdown values are canonical keys.
 
     Single home for the "canonicalize a persisted/advertised model iff it's a
-    claude_code value" rule (previously open-coded with ad-hoc provider gates in
-    usage.py, chat_persistence, and chat_runner). For any other provider the
+    claude_code value" rule, rather than ad-hoc provider gates in usage.py,
+    chat_persistence, and chat_runner. For any other provider the
     value is returned unchanged, so a kiro/acp model that happens to share a
     registry alias spelling is never rewritten. ``from_provider_id`` resolves
     canonical keys, provider ids, AND aliases, so a bare ``opus`` or a

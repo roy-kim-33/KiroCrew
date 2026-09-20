@@ -22,10 +22,11 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import inspect
 import logging
 import sys
 import threading
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Mapping, Optional
 
 from aiohttp import web
 
@@ -36,11 +37,15 @@ from kiro_crew.cloud import source as source_mod
 from kiro_crew.cloud import ssm
 from kiro_crew.cloud.aws import AWSError, CloudActionDenied
 from kiro_crew.cloud.launch_engine import RealLaunchEngine
+from kiro_crew.cloud.login_target import KiroLoginTarget, LoginTargetError, target_from_whoami
 from kiro_crew.dashboard.handlers._shared import _owner_denial_response
+from kiro_crew.dashboard.handlers.sessions import fetch_local_identity
 from kiro_crew.dashboard.handlers.source_providers import (
     is_owner_dashboard_request,
 )
 from kiro_crew.loop_lock import LoopBoundLock
+from kiro_crew.platform.interfaces import BUILTIN_PROVISIONER_ID
+from kiro_crew.sandbox import SandboxCeilingUnsealable
 from kiro_crew.sel import sel
 from kiro_crew.validation import ValidationError
 
@@ -147,9 +152,143 @@ async def _astore(state: "DashboardState") -> lj.LaunchJobStore:
     return store
 
 
-def _engine(state: "DashboardState") -> lj.LaunchEngine:
-    # Tests inject a fake via ``state.cloud_launch_engine``.
-    return getattr(state, "cloud_launch_engine", None) or RealLaunchEngine()
+def _provisioners() -> list:
+    """The deployment's provisioners, from the CPP ``remote_provisioners`` seam.
+
+    ``safe_context_call`` fallback is the built-in descriptor alone: a degraded
+    seam read keeps today's AWS tab working rather than emptying it, which is
+    the fail-safe direction for a listing (nothing here mints or bills). Rows
+    with a blank id or kind are dropped, never shadowed. Synchronous; called via
+    ``_in_executor`` from a handler because context resolution can touch disk.
+    """
+    from kiro_crew.platform.context import current_context, safe_context_call
+    from kiro_crew.platform.defaults import BUILTIN_REMOTE_PROVISIONER
+
+    rows = safe_context_call(
+        lambda: list(current_context().remote_provisioners.provisioners()),
+        fallback_factory=lambda: [BUILTIN_REMOTE_PROVISIONER],
+        log_message="remote_provisioners.provisioners degraded; offering the built-in lane only",
+    )
+    return [r for r in rows if getattr(r, "id", "") and getattr(r, "kind", "")]
+
+
+def _provisioner_dict(p) -> dict:
+    labels = dict(getattr(p, "step_labels", ()) or ())
+    return {
+        "id": p.id,
+        "kind": p.kind,
+        "label": getattr(p, "label", "") or p.id,
+        "posix_only": bool(getattr(p, "posix_only", True)),
+        "steps": [s.to_dict() for s in lj.default_steps(labels)],
+        # Present on every row, empty for a lane with nothing to confirm, so a client reads
+        # one shape rather than branching on whether the key exists.
+        "confirm_before_launch": str(getattr(p, "confirm_before_launch", "") or ""),
+    }
+
+
+class LaunchUnavailable(Exception):
+    """This lane cannot be launched right now, and the reason is the OPERATOR's to act on.
+
+    Distinct from ``KeyError``, which means the id does not exist. This means the id exists and
+    something about the host or the deployment stops it: a configuration reachable under a
+    second name, or a provisioner that cannot receive the confirmation its own row demands.
+    Both were reaching the client as HTTP 500 -- a bug report shape -- for conditions with a
+    remedy the operator can carry out. ``code`` is the machine-readable tag the response
+    carries so a client can branch without parsing prose.
+    """
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+def _call_engine_for(provider, provisioner_id: str, confirmed_recipient: str):
+    """Ask *provider* for an engine, passing the confirmation only if it can receive one.
+
+    The seam's ``engine_for`` takes ``confirmed_recipient`` keyword-only WITH a default, so a
+    provider written against the older signature is still conforming -- and calling it with the
+    keyword raises ``TypeError``, which is not a launch failure any client can act on. The
+    signature decides, rather than a try/except around the call: an exception-driven retry
+    cannot tell a binding error from a ``TypeError`` raised inside the provider's own body, and
+    retrying the latter would run half of it twice.
+
+    A provider that cannot receive the value is called with the id alone, exactly as before the
+    keyword existed. But if its row DECLARED a recipient to confirm, the launch is refused
+    instead: a lane that publishes a credential recipient and then cannot be handed the
+    operator's answer to it is the silent-substitution shape the confirmation exists to remove,
+    and accepting the launch would leave the operator believing they had confirmed something.
+    """
+    accepts = False
+    # Declared once, so the two branches share one type rather than the except branch having
+    # to fit the shape `.parameters` happens to return (a MappingProxyType).
+    params: Mapping[str, inspect.Parameter]
+    try:
+        params = inspect.signature(provider.engine_for).parameters
+    except (TypeError, ValueError):
+        # Not introspectable (a C callable, a wrapper with no signature). Treated as NOT
+        # accepting, which is the conservative direction: the call still works, and a lane
+        # that needs the confirmation is refused below rather than launched without it.
+        params = {}
+    if "confirmed_recipient" in params:
+        accepts = True
+    elif any(q.kind is inspect.Parameter.VAR_KEYWORD for q in params.values()):
+        accepts = True
+
+    if accepts:
+        return provider.engine_for(provisioner_id, confirmed_recipient=confirmed_recipient)
+    if confirmed_recipient:
+        raise LaunchUnavailable(
+            "lane_cannot_confirm",
+            f"provisioner {provisioner_id!r} publishes a credential recipient to confirm, but "
+            "its provider cannot accept the confirmation (its engine_for takes no "
+            "confirmed_recipient). Nothing was launched",
+        )
+    return provider.engine_for(provisioner_id)
+
+
+def _engine(
+    state: "DashboardState",
+    provider_id: str = BUILTIN_PROVISIONER_ID,
+    confirmed_recipient: str = "",
+) -> lj.LaunchEngine:
+    """The engine that drives *provider_id*, from the CPP ``remote_provisioners`` seam.
+
+    Tests inject a fake via ``state.cloud_launch_engine``; that hook outranks the
+    seam so the existing launch-job tests keep exercising the orchestrator
+    without composing a context. Raises ``KeyError`` for an id the provider does
+    not know (the caller answers 400); a degraded seam read falls back to the
+    built-in engine for the built-in id only, never to a guessed engine for an
+    edition's id.
+
+    ``confirmed_recipient`` is the credential recipient the operator confirmed in this
+    request, forwarded to the seam untouched (see
+    ``platform.interfaces.RemoteProvisionerProvider.engine_for``). It is POSITIONAL here
+    rather than keyword-only so ``functools.partial`` in the handler stays one call; the
+    seam takes it keyword-only.
+    """
+    injected = getattr(state, "cloud_launch_engine", None)
+    if injected is not None:
+        return injected
+    from kiro_crew.platform.context import current_context, safe_context_call
+
+    provider = safe_context_call(
+        lambda: current_context().remote_provisioners,
+        fallback_factory=lambda: None,
+        log_message="remote_provisioners seam degraded; only the built-in engine is reachable",
+    )
+    if provider is None:
+        if provider_id != BUILTIN_PROVISIONER_ID:
+            raise KeyError(provider_id)
+        return RealLaunchEngine()
+    try:
+        return _call_engine_for(provider, provider_id, confirmed_recipient)
+    except SandboxCeilingUnsealable as exc:
+        # The strict no-alias refusal on ``cloud.json``, raised where a launch consumes the
+        # file. It is a real refusal and stays, but it describes a HOST setup an operator
+        # chose -- a dotfile manager or a hardlinking backup leaves exactly this shape -- so it
+        # belongs to them to fix, with the file and the remedy named. Uncaught it became a 500,
+        # which reads as "the gateway is broken" for a condition one command clears.
+        raise LaunchUnavailable("config_alias_refused", str(exc)) from exc
 
 
 def _launch_lock(state: "DashboardState") -> LoopBoundLock:
@@ -158,7 +297,7 @@ def _launch_lock(state: "DashboardState") -> LoopBoundLock:
     Without it the guard is check-then-act across an ``await``: two POSTs
     arriving together both see no active job, and each provisions its own
     CloudFormation stack — two billed instances the caller cannot undo.
-    LoopBoundLock, not asyncio.Lock (#4800): the lock is cached on the
+    LoopBoundLock, not asyncio.Lock: the lock is cached on the
     long-lived DashboardState, which outlives any single event loop.
     """
     lock = getattr(state, "cloud_launch_lock", None)
@@ -176,10 +315,17 @@ def _cancels(state: "DashboardState") -> dict:
     return cancels
 
 
-def _start_worker(state: "DashboardState", job: lj.LaunchJob) -> None:
-    """Run the launch on a daemon thread (or inline when ``cloud_launch_sync``)."""
+def _start_worker(
+    state: "DashboardState", job: lj.LaunchJob, engine: Optional[lj.LaunchEngine] = None
+) -> None:
+    """Run the launch on a daemon thread (or inline when ``cloud_launch_sync``).
+
+    ``engine`` is the one already resolved for ``job.provider_id``; resolving it
+    again here would be a second seam read that could disagree with the first.
+    """
     store = _store(state)
-    engine = _engine(state)
+    if engine is None:
+        engine = _engine(state, job.provider_id)
     cancel = threading.Event()
     _cancels(state)[job.id] = cancel
     # Claim the job for this process, so a later reap_orphans() does not mistake
@@ -222,7 +368,11 @@ async def api_cloud_preflight(request: web.Request) -> web.Response:
     plugin_cmd = "" if plugin else await _in_executor(ssm.session_manager_plugin_install_command)
     _audit("preflight", "success")
     return web.json_response(
-        {**reach, "session_manager_plugin": bool(plugin), "session_manager_plugin_command": plugin_cmd}
+        {
+            **reach,
+            "session_manager_plugin": bool(plugin),
+            "session_manager_plugin_command": plugin_cmd,
+        }
     )
 
 
@@ -233,6 +383,79 @@ async def api_cloud_iam_policy(request: web.Request) -> web.Response:
         return denied
     _audit("iam_policy", "success")
     return web.json_response({"policy": iam.policy_json()})
+
+
+async def api_cloud_identity(request: web.Request) -> web.Response:
+    """GET /api/cloud/identity — the launching machine's own Kiro sign-in.
+
+    What the Remote Crew launch form preselects: an Identity Center user gets
+    their organization's start URL as the crew's default sign-in target instead
+    of the Builder ID portal. Owner-only like every cloud route (it names the
+    operator's account type and SSO portal). Reuses the dashboard's existing
+    sandbox-tiered ``kiro-cli whoami --format json`` fetch; the result is a
+    SUGGESTION the form can override — never a credential, and never the
+    launch's authority (that is the validated body of ``POST /api/cloud/launch``).
+
+    ``{"identity": {account_type?, start_url?}, "suggested_target": {...},
+    "discovery": "read"}`` when whoami answered (an empty identity is a real
+    answer: this machine has no sign-in to inherit, and the default target is
+    the suggestion). ``{"identity": null, "suggested_target": null,
+    "discovery": "unknown"}`` when it could not answer -- timed out, failed to
+    start, exited with an error -- and ``{"identity": {...}, "suggested_target":
+    null, "discovery": "unknown"}`` when it named Identity Center without a
+    readable start URL (which organization is unknown), so the form does not
+    present the Builder ID default as though it had been read; the user chooses
+    by hand. The Identity
+    Center REGION is not something whoami reports, so the suggested target
+    carries it empty for the form to complete.
+    """
+    denied = _guard(request, "identity", posix_only=False)
+    if denied is not None:
+        return denied
+
+    identity: dict[str, object] | None
+    try:
+        identity = await fetch_local_identity()
+    except Exception:  # noqa: BLE001 - discovery is advisory
+        logger.debug("cloud identity discovery failed", exc_info=True)
+        identity = None
+    if identity is None:
+        _audit("identity", "success")
+        return web.json_response(
+            {"identity": None, "suggested_target": None, "discovery": "unknown"}
+        )
+    public = {k: v for k, v in identity.items() if k in ("account_type", "start_url")}
+    suggested = target_from_whoami(identity)
+    if suggested is None:
+        # Identity Center, but WHICH organization is not readable: suggesting the
+        # Builder ID default here would be the silent downgrade; the form asks.
+        _audit("identity", "success")
+        return web.json_response(
+            {"identity": public, "suggested_target": None, "discovery": "unknown"}
+        )
+    _audit("identity", "success")
+    return web.json_response(
+        {"identity": public, "suggested_target": suggested.to_dict(), "discovery": "read"}
+    )
+
+
+async def api_cloud_provisioners(request: web.Request) -> web.Response:
+    """GET /api/cloud/provisioners — the lanes the Set-up tab may offer.
+
+    Descriptor-only (``{id, kind, label, posix_only, steps}``): which provisioners
+    exist and how to draw them, never how to run one. The list is presentation:
+    ``POST /api/cloud/launch`` re-resolves the requested id against the same seam
+    before persisting a job. Answers on every platform (``posix_only=False``),
+    like the launch-history routes: the tab needs the list to decide WHICH form
+    to draw, and a provisioner that does not shell to ``aws`` may well run on a
+    Windows gateway; the per-descriptor ``posix_only`` flag carries that answer.
+    """
+    denied = _guard(request, "provisioners", posix_only=False)
+    if denied is not None:
+        return denied
+    rows = await _in_executor(_provisioners)
+    _audit("provisioners", "success")
+    return web.json_response({"provisioners": [_provisioner_dict(p) for p in rows]})
 
 
 async def api_cloud_launch_list(request: web.Request) -> web.Response:
@@ -265,8 +488,23 @@ async def api_cloud_launch_get(request: web.Request) -> web.Response:
 
 
 async def api_cloud_launch_create(request: web.Request) -> web.Response:
-    """POST /api/cloud/launch — start a launch job. Body: {profile, region, size_key}."""
-    denied = _guard(request, "launch_create")
+    """POST /api/cloud/launch — start a launch job.
+
+    Body: ``{provider_id?, profile, region, size_key, login_target?, confirm_recipient?}``.
+    ``confirm_recipient`` is the credential recipient the operator confirmed, required by any
+    lane whose launch delivers a credential to something its own configuration names (the
+    Fargate lane refuses an empty or stale one and names both values); the built-in EC2 lane
+    makes no such choice and ignores it. ``provider_id`` names a
+    row of ``GET /api/cloud/provisioners`` and defaults to the built-in EC2 lane,
+    so a pre-seam client body launches exactly what it always did. ``login_target``
+    is ``{license, start_url, region}`` — the Kiro identity the crew signs in as
+    (``region`` here is the IAM Identity Center region, NOT the EC2 ``region``
+    above); absent means Builder ID. The POSIX gate
+    is per descriptor: the built-in shells to ``bash``/``aws`` and needs one, an
+    edition's provisioner says for itself.
+    """
+    # POSIX is decided below, per provisioner, once the body names one.
+    denied = _guard(request, "launch_create", posix_only=False)
     if denied is not None:
         return denied
     state: "DashboardState" = request.app["state"]
@@ -279,6 +517,75 @@ async def api_cloud_launch_create(request: web.Request) -> web.Response:
             {"error": "body must be an object", "code": "invalid_body"}, status=400
         )
     size_key = str(body.get("size_key") or "").strip()
+    provider_id = str(body.get("provider_id") or BUILTIN_PROVISIONER_ID).strip()
+    # The credential recipient the OPERATOR confirmed for this launch, verbatim. Passed to
+    # the engine and compared there against what the launch would actually deliver to; a
+    # lane that hands out no credential of its own ignores it. Not validated here: this
+    # handler has no way to know what a lane's recipient looks like, and a check that
+    # guessed would be a second rule to keep in step with the engine's.
+    confirm_recipient = str(body.get("confirm_recipient") or "")
+    # The Kiro identity the crew signs in as — validated HERE, at the owner-only
+    # HTTP boundary, before anything is persisted or reaches a remote shell.
+    # An absent block is the Builder ID default (a pre-seam client body launches
+    # exactly what it always did); a present-but-invalid one is a coded 400,
+    # never a silent fall-back to the wrong identity.
+    raw_target = body.get("login_target")
+    if raw_target is not None and not isinstance(raw_target, dict):
+        _audit("launch_create", "denied", error="invalid login target: not an object")
+        return web.json_response(
+            {"error": "login_target must be an object", "code": "invalid_login_target"}, status=400
+        )
+    try:
+        login_target = KiroLoginTarget.from_fields(
+            license=str((raw_target or {}).get("license") or ""),
+            start_url=str((raw_target or {}).get("start_url") or ""),
+            region=str((raw_target or {}).get("region") or ""),
+        )
+    except LoginTargetError as e:
+        _audit("launch_create", "denied", error=f"invalid login target: {e}")
+        return web.json_response({"error": str(e), "code": "invalid_login_target"}, status=400)
+    provisioner = next((p for p in await _in_executor(_provisioners) if p.id == provider_id), None)
+    if provisioner is None:
+        _audit("launch_create", "denied", error=f"unknown provisioner {provider_id!r}")
+        return web.json_response(
+            {
+                "error": f"no provisioner {provider_id!r} on this deployment",
+                "code": "unknown_provisioner",
+            },
+            status=400,
+        )
+    required = str(getattr(provisioner, "confirm_before_launch", "") or "")
+    if required and confirm_recipient != required:
+        # DERIVED from the row this request named, not hard-coded to one lane: a lane that
+        # hands a credential to something its own configuration chooses says so on its
+        # descriptor, and this is the same value `GET /api/cloud/provisioners` publishes. So a
+        # client cannot reach a launch without having read what it must confirm, which is the
+        # difference between the operator judging the recipient and echoing a string back.
+        #
+        # The engine refuses again with what it is ABOUT to launch, which is the check that
+        # cannot be skipped by another caller; this one exists so the refusal arrives before a
+        # job file is persisted, and it names the value so a stale client can correct itself.
+        _audit("launch_create", "denied", error="credential recipient not confirmed")
+        return web.json_response(
+            {
+                "error": (
+                    f"this launch would hand the model credential to {required}; confirm that "
+                    "recipient in the request (confirm_recipient) before launching"
+                ),
+                "code": "recipient_not_confirmed",
+                "confirm_before_launch": required,
+            },
+            status=400,
+        )
+    if provisioner.posix_only and sys.platform.startswith("win"):
+        _audit("launch_create", "denied", error="windows unsupported")
+        return web.json_response(
+            {
+                "error": "cloud provisioning requires a POSIX host (Linux/macOS); use WSL on Windows",
+                "code": "posix_host_required",
+            },
+            status=400,
+        )
     # One launch at a time. Without this a double-click or a retried request
     # creates two jobs with two tags and two CloudFormation stacks — two billed
     # instances, and the client cannot undo that after the fact. The check, the
@@ -298,6 +605,33 @@ async def api_cloud_launch_create(request: web.Request) -> web.Response:
                 },
                 status=409,
             )
+        # Resolve the engine BEFORE the job exists: an id the provider lists but
+        # cannot back must not leave a PENDING job file that a restart then reaps
+        # as "interrupted" for a launch that never started.
+        try:
+            # Off the loop like every other disk-touching call in this handler. The
+            # built-in id resolves without reading anything, but the Fargate id reads
+            # cloud.json through the seam, and a slow disk on that read would stall
+            # the gateway's other requests and its heartbeat behind it -- the reason
+            # the store calls above are wrapped.
+            engine = await _in_executor(
+                functools.partial(_engine, state, provider_id, confirm_recipient)
+            )
+        except KeyError:
+            _audit("launch_create", "denied", error=f"no engine for {provider_id!r}")
+            return web.json_response(
+                {
+                    "error": f"provisioner {provider_id!r} has no launch engine",
+                    "code": "unknown_provisioner",
+                },
+                status=400,
+            )
+        except LaunchUnavailable as exc:
+            # 400, not 500: the id exists and the request is well formed, but the deployment or
+            # the host stops this launch and the message says what to change. A 500 would tell
+            # the operator to file a bug over a symlink they created on purpose.
+            _audit("launch_create", "denied", error=f"{exc.code}: {exc}")
+            return web.json_response({"error": str(exc), "code": exc.code}, status=400)
         try:
             # create() does mkdir + a temp-write + os.replace; keep it off the event
             # loop like every other store call here (see _astore), so a slow disk
@@ -308,6 +642,9 @@ async def api_cloud_launch_create(request: web.Request) -> web.Response:
                     profile=str(body.get("profile", "")),
                     region=str(body.get("region", "")),
                     size_key=size_key,
+                    provider_id=provider_id,
+                    step_labels=dict(provisioner.step_labels or ()),
+                    login_target=login_target,
                 )
             )
         except KeyError as e:  # unknown size
@@ -315,7 +652,7 @@ async def api_cloud_launch_create(request: web.Request) -> web.Response:
             return web.json_response(
                 {"error": str(e).strip("'\""), "code": "invalid_launch_request"}, status=400
             )
-        _start_worker(state, job)
+        _start_worker(state, job, engine)
     _audit("launch_create", "success", request_id=job.id)
     return web.json_response(job.to_dict(), status=202)
 
@@ -474,9 +811,7 @@ async def _mutate_instance(request: web.Request, op: str) -> web.Response:
             # as a no-op, resolves no id, and skips the unregister AGAIN, so the row can
             # never be cleared from this panel. The launch job that created this tag
             # persists its instance id: still server-owned state, never caller input.
-            iid = next(
-                (j.instance_id for j in store.list() if j.tag == tag and j.instance_id), ""
-            )
+            iid = next((j.instance_id for j in store.list() if j.tag == tag and j.instance_id), "")
         # destroy: issue the delete and return; do not block the request on
         # DELETE_COMPLETE (minutes). A later status / the reaper reflects it.
         out = ec2.destroy(tag, profile, region, wait=False)
@@ -497,9 +832,7 @@ async def _mutate_instance(request: web.Request, op: str) -> web.Response:
         # without this arm a malformed tag in the URL path becomes a 500 instead of
         # telling the caller what was wrong with their input.
         _audit(op, "denied", request_id=tag, error=str(e))
-        return web.json_response(
-            {"error": str(e), "code": "invalid_cloud_parameter"}, status=400
-        )
+        return web.json_response({"error": str(e), "code": "invalid_cloud_parameter"}, status=400)
     except CloudActionDenied as e:
         _audit(op, "denied", request_id=tag, error=str(e))
         return web.json_response({"error": str(e), "code": "cloud_action_denied"}, status=403)

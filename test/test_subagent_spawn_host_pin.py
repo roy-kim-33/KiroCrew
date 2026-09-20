@@ -52,8 +52,19 @@ def _spawning_modules() -> tuple[tuple[str, bool], ...]:
     found: list[tuple[str, bool]] = []
     for path in sorted(_TEST_DIR.glob("*.py")):
         try:
-            tree = ast.parse(path.read_text(encoding="utf-8"))
-        except (OSError, SyntaxError, UnicodeDecodeError):
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        # A qualifying module must spell both names textually -- an AST node
+        # named `SubagentManager` or a `.spawn(` call cannot be parsed from
+        # source that lacks those characters -- so this is a necessary, not
+        # sufficient, precondition and skips straight past every file that
+        # cannot possibly match before paying for its parse.
+        if "SubagentManager" not in text or "spawn" not in text:
+            continue
+        try:
+            tree = ast.parse(text)
+        except SyntaxError:
             continue
         names = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
         names |= {a.attr for a in ast.walk(tree) if isinstance(a, ast.Attribute)}
@@ -88,6 +99,10 @@ class TestTheSpawnHostMemoryPinRatchet:
         # not break them -- an inner patch lands on top -- but it would state a
         # precondition the opposite of what they exist to vary.
         "test_admission_gate.py": "drives both guards itself, to refused and to admitted",
+        # A shared fake, not a collected test module: ``ManagerHarness`` pins
+        # both host-memory readings itself for as long as it is open, so every
+        # module that spawns through it is pinned without naming the fixture.
+        "overload_fakes.py": "fake harness pins the host readings itself",
     }
 
     def test_every_spawning_module_is_pinned_or_excluded(self) -> None:
@@ -108,7 +123,7 @@ class TestTheSpawnHostMemoryPinRatchet:
         )
 
     def test_the_exclusion_list_has_not_gone_stale(self) -> None:
-        """An exclusion for a module that no longer spawns hides the next one."""
+        """An exclusion for a module that does not spawn hides the next one."""
         reached = {name for name, _pinned in _spawning_modules()}
         stale = sorted(name for name in self._EXCLUDED if name not in reached)
 

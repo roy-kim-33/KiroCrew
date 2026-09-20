@@ -1,20 +1,22 @@
 import React, { useEffect, useMemo, useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { ShieldCheck, ShieldAlert, Lock, Eye, EyeOff, FileWarning, Terminal, Globe, Fingerprint, KeyRound, ScanLine, Layers, AlertTriangle, CheckCircle2, Circle, Clock, ExternalLink, ChevronRight, ChevronDown, Plus, Trash2, Gavel, Building2, Gauge, ToggleRight, MessageSquare, ListChecks, Boxes, BookOpen, Network, Copy, Check, Package } from 'lucide-react'
-import { useAppSelector } from '../../store'
+import { useAppDispatch, useAppSelector } from '../../store'
+import { setYoloDuration } from '../../store/dashboardSlice'
 import { SettingsSubNav } from '../../components/SettingsSubNav'
 import { useImeGuard } from '../../hooks/useImeGuard'
 import { Badge, Btn, Input, Toggle, Checkbox } from '../../components/ui'
 import { SettingsSection, SettingsCard, SettingsToggle } from '../../components/settings'
 import Modal from '../../components/Modal'
 import InfoTip from '../../components/InfoTip'
-import { api, ApiError, type DeniedCommandsData, type DeniedCommandRule, type DeniedUserRule, type GovernanceDistributionData, type GovernancePolicyData, type GovernanceScope, type GovernanceScopeDetail, type SecurityPostureData, type TailnetStatusData, type TrustedAppsData } from '../../api/client'
+import { api, ApiError, type DeniedCommandsData, type DeniedCommandRule, type DeniedUserRule, type ArmedFileDeliveryConsent, type FileDeliveryConsentStatus, type GovernanceDistributionData, type GovernancePolicyData, type GovernanceScope, type GovernanceScopeDetail, type SecurityPostureData, type TailnetStatusData, type TrustedAppsData } from '../../api/client'
 import { PostureDisclosureRow, CODE_BASE as POSTURE_CODE_BASE } from './PostureDisclosure'
 import { MobileLoginCard } from './MobileLoginCard'
 
 import { i18nT } from '../../i18n/t'
-import { fmtDateFields, fmtDuration, fmtList, fmtTime, fmtTimeNumeric, fmtUnit, toDate, compareText } from '../../i18n/format'
+import { fmtDateFields, fmtDateTime, fmtDuration, fmtList, fmtTime, fmtTimeNumeric, fmtUnit, toDate, compareText } from '../../i18n/format'
 import ErrorNotice from '../../components/ErrorNotice'
+import { copyToClipboard } from '../../utils/clipboard'
 /* ── Security feature registry ──
  *
  * Qualitative layer descriptions ONLY. Every control whose posture is a COUNT
@@ -222,7 +224,7 @@ function categoryLabel(category: string): string {
 }
 
 /** A single built-in denied-command rule row (Card A). */
-function BuiltinDenyRow({ rule, dimmed, onToggle }: { rule: DeniedCommandRule; dimmed: boolean; onToggle: (next: boolean) => void }) {
+function BuiltinDenyRow({ rule, dimmed, onToggle, error, errorHandoff }: { rule: DeniedCommandRule; dimmed: boolean; onToggle: (next: boolean) => void; error?: string; errorHandoff?: boolean }) {
   const [open, setOpen] = useState(false)
   const Chevron = open ? ChevronDown : ChevronRight
   return (
@@ -266,6 +268,12 @@ function BuiltinDenyRow({ rule, dimmed, onToggle }: { rule: DeniedCommandRule; d
           </span>
         )}
       </div>
+      {/* The rejected write for THIS row, beside the switch that snapped back —
+          a banner at the top of a long rule list is off-screen from the toggle
+          that was pressed. `errorHandoff` is decided by the section, which knows
+          whether Card B's add-pattern draft (panel-shell state the navigation
+          would discard) is empty. No hand-off otherwise: the deny-pattern draft. */}
+      <ErrorNotice variant="inline" className="mt-1 ml-6" message={error} askAgent={!!errorHandoff} testId={error ? `denied-rule-error-${rule.id}` : undefined} />
       {open && (
         <>
           {rule.source === 'edition' && (
@@ -298,6 +306,8 @@ function CategoryGroup({
   disableAll,
   onRuleToggle,
   collapsible = true,
+  rowError,
+  errorHandoff,
 }: {
   category: string
   rules: DeniedCommandRule[]
@@ -310,6 +320,9 @@ function CategoryGroup({
    *  chevron would be a control that visibly does nothing. Render a plain
    *  header instead of an inert button. */
   collapsible?: boolean
+  /** The one rejected rule write, if any, keyed to the row it belongs to. */
+  rowError?: { id: string; message: string } | null
+  errorHandoff?: boolean
 }) {
   const Chevron = open ? ChevronDown : ChevronRight
   const counted = allRules ?? rules
@@ -361,6 +374,8 @@ function CategoryGroup({
               rule={rule}
               dimmed={disableAll && !isRuleLocked(rule)}
               onToggle={next => onRuleToggle(rule, next)}
+              error={rowError?.id === rule.id ? rowError.message : undefined}
+              errorHandoff={errorHandoff}
             />
           ))}
         </div>
@@ -370,25 +385,31 @@ function CategoryGroup({
 }
 
 /** A single user-authored denied-command row (Card B). */
-function CustomDenyRow({ rule, onToggle, onDelete }: { rule: DeniedUserRule; onToggle: (next: boolean) => void; onDelete: () => void }) {
+function CustomDenyRow({ rule, onToggle, onDelete, error, errorHandoff }: { rule: DeniedUserRule; onToggle: (next: boolean) => void; onDelete: () => void; error?: string; errorHandoff?: boolean }) {
   return (
-    <div className="flex items-center gap-2.5 py-2">
-      <div className="flex-1 min-w-0">
-        <code className="block overflow-x-auto text-[12px] font-mono text-text whitespace-pre-wrap break-all">{rule.pattern}</code>
-        {/* The note is what the agent is shown when this rule fires, so surface it
-            next to the pattern it explains rather than hiding it behind an edit
-            affordance that does not exist (rules are create-only). */}
-        {rule.note ? <p className="mt-0.5 text-[11px] text-muted whitespace-pre-wrap break-words">{rule.note}</p> : null}
+    <div className="py-2">
+      <div className="flex items-center gap-2.5">
+        <div className="flex-1 min-w-0">
+          <code className="block overflow-x-auto text-[12px] font-mono text-text whitespace-pre-wrap break-all">{rule.pattern}</code>
+          {/* The note is what the agent is shown when this rule fires, so surface it
+              next to the pattern it explains rather than hiding it behind an edit
+              affordance that does not exist (rules are create-only). */}
+          {rule.note ? <p className="mt-0.5 text-[11px] text-muted whitespace-pre-wrap break-words">{rule.note}</p> : null}
+        </div>
+        <Toggle checked={rule.enabled} onChange={onToggle} label={rule.pattern} />
+        <button
+          type="button"
+          className="shrink-0 text-muted hover:text-danger transition-colors bg-transparent border-none cursor-pointer p-1"
+          onClick={onDelete}
+          aria-label={i18nT('pages.settings.securityPanel.delete_pattern', { name: rule.pattern })}
+        >
+          <Trash2 size={14} />
+        </button>
       </div>
-      <Toggle checked={rule.enabled} onChange={onToggle} label={rule.pattern} />
-      <button
-        type="button"
-        className="shrink-0 text-muted hover:text-danger transition-colors bg-transparent border-none cursor-pointer p-1"
-        onClick={onDelete}
-        aria-label={i18nT('pages.settings.securityPanel.delete_pattern', { name: rule.pattern })}
-      >
-        <Trash2 size={14} />
-      </button>
+      {/* The rejected toggle/delete for THIS row, beside the controls that
+          caused it. `errorHandoff` is the section's call on whether the
+          add-pattern draft below is empty (No hand-off otherwise: that draft). */}
+      <ErrorNotice variant="inline" className="mt-1" message={error} askAgent={!!errorHandoff} testId={error ? `denied-rule-error-${rule.id}` : undefined} />
     </div>
   )
 }
@@ -449,12 +470,20 @@ function AddDenyInput({ value, onChange, note, onNoteChange, onAdd, busy, submit
           maxLength={200}
         />
       </div>
-      {/* Invalid-regex feedback on the input the user is still typing — a form
-          hint, not a failure to diagnose, so no agent hand-off. `submitError`
-          carries a SERVER rejection (e.g. a note carrying the refusal prefix):
-          without it the 400 is silent, the list does not change, and Add looks
-          like it did nothing. Local hint wins — it is about what is on screen. */}
-      <ErrorNotice message={error || submitError} className="mt-1.5" />
+      {/* Two surfaces, because they have two sources. `error` is invalid-regex
+          feedback on the input the user is still typing — a form hint, not a
+          failure to diagnose, so it stays plain text. `submitError` carries a
+          SERVER rejection (e.g. a note carrying the refusal prefix): without it
+          the 400 is silent, the list does not change, and Add looks like it did
+          nothing. Local hint wins — it is about what is on screen. */}
+      {error ? (
+        <p className="text-[12px] text-danger mt-1.5 mb-0" data-testid="deny-pattern-hint">{error}</p>
+      ) : (
+        /* No hand-off: the pattern (`value`) and note (`note`) the user typed are
+           kept on a rejected add so they can be corrected — the navigation would
+           discard both. */
+        <ErrorNotice message={submitError} className="mt-1.5" />
+      )}
     </div>
   )
 }
@@ -660,6 +689,7 @@ const SCOPE_PLANE: Record<string, GovPlaneKey> = {
   'network.egress': 'io',
   channels: 'channels',
   approval_mode: 'modes',
+  approval_modes: 'modes',
   'sandbox.min_level': 'modes',
 }
 
@@ -732,15 +762,23 @@ type YoloDurationKey = (typeof YOLO_DURATION_KEYS)[number]
  *  (agent.dangerouslySkipPermissions) — that stays config-file-only. */
 function YoloDurationCard() {
   const qc = useQueryClient()
+  const dispatch = useAppDispatch()
   const status = useAppSelector(s => s.dashboard.status)
   const untilShutdownPermitted = status?.yolo_until_shutdown_permitted ?? true
-  const { data } = useQuery<KirocrewCfgShape>({ queryKey: ['kirocrewConfig'], queryFn: api.kirocrewConfig })
+  const { data, isError: cfgError } = useQuery<KirocrewCfgShape>({ queryKey: ['kirocrewConfig'], queryFn: api.kirocrewConfig })
   const configured = data?.agent?.yolo_duration
   const current: YoloDurationKey =
     YOLO_DURATION_KEYS.find(k => k === configured) ?? '6h'
   const save = useMutation({
-    mutationFn: (v: string) => api.patchConfig('agent.yolo_duration', v),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['kirocrewConfig'] }),
+    mutationFn: (v: YoloDurationKey) => api.patchConfig('agent.yolo_duration', v),
+    onSuccess: (_data, saved) => {
+      qc.invalidateQueries({ queryKey: ['kirocrewConfig'] })
+      // The approval-mode picker reads the duration from `dashboard.status`,
+      // which only the HTTP status reply carries (the WebSocket push omits it).
+      // Record the save in the store, or the picker keeps naming the duration
+      // from page load until a reload while the gateway already grants this one.
+      dispatch(setYoloDuration(saved))
+    },
   })
 
   // Live "when does this end" line, so a no-expiry grant is never mistaken for
@@ -807,8 +845,301 @@ function YoloDurationCard() {
         })}
       </div>
       <div className="text-[11px] text-muted mt-2">{i18nT('pages.settings.securityPanel.yolo_duration_next_activation_note')}</div>
+      {/* Picker-only card, nothing to lose on either: the read failure means the
+          highlighted option is the '6h' default rather than what is stored; the
+          save failure means the click did not persist. */}
+      {cfgError && (
+        <ErrorNotice variant="inline" className="mt-1.5" message={i18nT('pages.settings.securityPanel.yolo_duration_load_failed')} askAgent />
+      )}
       {save.isError && (
-        <div className="text-[12px] text-danger mt-1.5">{i18nT('pages.settings.securityPanel.failed_to_save_yolo_duration')}</div>
+        <ErrorNotice variant="inline" className="mt-1.5" message={i18nT('pages.settings.securityPanel.failed_to_save_yolo_duration')} askAgent />
+      )}
+    </SettingsCard>
+  )
+}
+
+/* ── Flagged-file delivery consent ──────────────────────────────────────────
+ *
+ * A VIEW over the grant the `/api/file-delivery/consent` endpoints already own.
+ * It introduces no consent scope of its own and writes nothing directly: the
+ * record sits on the sandbox-sealed keystone floor and the owner-gated handler
+ * is its only writer, so this card can ask for exactly the two transitions the
+ * endpoints already expose (record, withdraw) and earns the same refusal any
+ * other caller would if it is not the owner. Routing through the endpoints
+ * rather than writing settings is the point: duplicated authorization logic is
+ * how two copies drift until one of them is the permissive one.
+ *
+ * WHY THE CACHED READ IS NOT THE AUTHORITY. An external dashboard app can reach
+ * the host QueryClient and rewrite any key (#8394), so a cached "confirmed" is
+ * not evidence that delivery is confirmed. Nothing is decided here — every
+ * delivery gate re-reads the store server-side — and after a write this card
+ * INVALIDATES rather than asserting the new state into the cache, so what it
+ * shows always came from a fresh owner-gated GET rather than from something it
+ * told itself.
+ *
+ * The rows and the excluded legs are both rendered FROM the response, never from
+ * a local list, so this card cannot offer a class the backend would refuse. The
+ * exclusion is STATED rather than omitted: an absent control reads as an
+ * oversight, while a named one reads as the decision it is.
+ */
+function FileDeliveryConsentCard() {
+  const qc = useQueryClient()
+  const { data, isLoading, isError } = useQuery<FileDeliveryConsentStatus>({
+    queryKey: ['file-delivery-consent'],
+    queryFn: api.fileDeliveryConsent,
+  })
+  // The armed request (if any): after Allow delivery is clicked, the grant is
+  // NOT recorded here. The browser gets back only this nonce-free view naming
+  // the host command that finishes it, so an agent-driven browser cannot
+  // self-grant. Polled while armed so the "expires in" countdown and the flip to
+  // confirmed both surface without a manual refresh.
+  const armed = useQuery<ArmedFileDeliveryConsent>({
+    queryKey: ['file-delivery-consent-arm'],
+    queryFn: api.fileDeliveryConsentArmStatus,
+    refetchInterval: q => (q.state.data?.armed ? 5000 : false),
+  })
+  const invalidate = () => {
+    void qc.invalidateQueries({ queryKey: ['file-delivery-consent'] })
+    void qc.invalidateQueries({ queryKey: ['file-delivery-consent-arm'] })
+  }
+  // Arming replaces the previous request, so it is safe to re-arm; on success we
+  // refetch both the arm status (to show the command) and the grant (in case an
+  // approve already landed).
+  const arm = useMutation({
+    mutationFn: (destinationClass: string) => api.armFileDeliveryConsent(destinationClass),
+    onSuccess: invalidate,
+  })
+  const withdraw = useMutation({
+    mutationFn: (destinationClass: string) => api.revokeFileDeliveryConsent(destinationClass),
+    onSuccess: invalidate,
+  })
+
+  // An unreadable state renders NO state, and `isError` is the whole test for
+  // that -- NOT `data === undefined`. react-query RETAINS the last good `data`
+  // when a refetch rejects, so after a write that succeeded and a re-read that
+  // did not, `data` still describes the state from BEFORE the write: it would
+  // render "Not confirmed" for a grant that is now live. That is the reassuring
+  // direction of wrong, and the dangerous one, because it tells the owner there
+  // is nothing to withdraw. Everything displayed therefore comes from `view`,
+  // which is empty while the read is in error, so the two failure paths (first
+  // read failed, refetch failed) are identical on screen and the failure notice
+  // below is the only thing that renders.
+  const view = isError ? undefined : data
+  const armedView = armed.isError ? undefined : armed.data
+
+  // Copy affordance for the host command (item: parity with BrowserPanel /
+  // AboutPanel, which pair a host command with a Copy button because a mistype
+  // inside the step-up window silently fails approval). Acknowledge only on
+  // resolution; a false "Copied" is worse than none.
+  const [cmdCopied, setCmdCopied] = useState(false)
+  const [cmdCopyFailed, setCmdCopyFailed] = useState(false)
+  useEffect(() => {
+    if (!cmdCopied) return
+    const id = window.setTimeout(() => setCmdCopied(false), 1500)
+    return () => window.clearTimeout(id)
+  }, [cmdCopied])
+  // Whether a request has been armed at least once this mount, so an armed box
+  // that later disappears (expiry/consume) leaves a trace instead of a silent
+  // unmount that reads as a dead button.
+  const [wasArmed, setWasArmed] = useState(false)
+  const anyArmed = !!armedView?.armed
+  useEffect(() => {
+    if (anyArmed) {
+      setWasArmed(true)
+      return
+    }
+    if (wasArmed) {
+      // Host approval or expiry ends arm polling. Re-read the grant before
+      // rendering the terminal state, or a completed approval looks expired.
+      void qc.invalidateQueries({ queryKey: ['file-delivery-consent'] })
+    }
+  }, [anyArmed, qc, wasArmed])
+
+  const excluded = view?.never_grantable ?? []
+  const busy = isLoading || arm.isPending || withdraw.isPending
+
+  return (
+    <SettingsCard>
+      <div className="text-[13px] font-semibold text-text">{i18nT('pages.settings.securityPanel.file_delivery_title')}</div>
+      <div className="text-[12px] text-muted mt-0.5 mb-2 leading-relaxed">{i18nT('pages.settings.securityPanel.file_delivery_desc')}</div>
+
+      {/* One row per GRANTABLE class, from the response. The backend returns
+          exactly one today; iterating means a second class needs no change here
+          and — the reason that matters — that this card can never render a
+          control for a class the backend did not name. */}
+      <div className="flex flex-col gap-1.5">
+        {(view?.grantable ?? []).map(destinationClass => {
+          const held = view?.grants?.[destinationClass] ?? null
+          const isArmedForThis = !!armedView?.armed && armedView.destination_class === destinationClass
+          return (
+            <div
+              key={destinationClass}
+              data-testid={`file-delivery-row-${destinationClass}`}
+              className="flex flex-col gap-1.5 border border-border rounded-md px-3 py-2"
+            >
+              <div className="flex items-start gap-2">
+                <div className="flex-1 min-w-0">
+                  <div className="text-[12px] text-text flex items-center gap-1.5 flex-wrap">
+                    {/* The label is the server's, falling back to the raw id: a
+                        class the backend added without a label still renders as
+                        itself rather than as an empty row. */}
+                    <span>{view?.labels?.[destinationClass] ?? destinationClass}</span>
+                    {held
+                      ? <Badge variant="ok">{i18nT('pages.settings.securityPanel.file_delivery_state_confirmed')}</Badge>
+                      : isArmedForThis
+                        ? <Badge variant="muted">{i18nT('pages.settings.securityPanel.file_delivery_state_armed')}</Badge>
+                        : <Badge variant="muted">{i18nT('pages.settings.securityPanel.file_delivery_state_not_confirmed')}</Badge>}
+                  </div>
+                  {/* Plain-language destination helper at the point of consent:
+                      the label alone ("this computer and your dashboard Files
+                      view") still leaves a first-time reader unsure WHAT that
+                      means, so name it in words they can picture. */}
+                  <div className="text-[11px] text-muted mt-0.5 leading-relaxed">
+                    {i18nT('pages.settings.securityPanel.file_delivery_destination_help')}
+                  </div>
+                  {held && (
+                    <div className="text-[11px] text-muted mt-0.5">
+                      {i18nT('pages.settings.securityPanel.file_delivery_since', { time: fmtDateTime(held.granted_at) })}
+                    </div>
+                  )}
+                </div>
+                {held
+                  ? (
+                    <Btn disabled={busy} onClick={() => withdraw.mutate(destinationClass)}>
+                      {i18nT('pages.settings.securityPanel.file_delivery_withdraw')}
+                    </Btn>
+                  )
+                  : isArmedForThis
+                    ? (
+                      // Armed: the next action is running the host command, not
+                      // clicking again. A disabled secondary CTA labelled
+                      // "Waiting..." stops the identical purple button from
+                      // reading as a dead no-op on a re-click (a re-arm is
+                      // invisible otherwise).
+                      <Btn disabled aria-disabled="true">
+                        {i18nT('pages.settings.securityPanel.file_delivery_waiting')}
+                      </Btn>
+                    )
+                    : (
+                      <Btn primary disabled={busy} onClick={() => arm.mutate(destinationClass)}>
+                        {i18nT('pages.settings.securityPanel.file_delivery_confirm')}
+                      </Btn>
+                    )}
+              </div>
+
+              {/* Resting state, before any click: the primary button reads
+                  "Allow delivery", which a blind reader takes as an immediate,
+                  irreversible grant. It is neither — the click only ARMS a
+                  reversible two-step request that delivers nothing until the
+                  host command runs. Say so at the point of consent. */}
+              {!held && !isArmedForThis && (
+                <div className="text-[11px] text-muted mt-0.5 leading-relaxed">
+                  {i18nT('pages.settings.securityPanel.file_delivery_confirm_help')}
+                </div>
+              )}
+
+              {/* Armed but not yet approved: the grant is deliberately NOT
+                  recorded by the click. Show the exact host command that
+                  finishes it, because that step-up is what stops an
+                  agent-driven browser from self-granting. */}
+              {!held && isArmedForThis && (
+                <div
+                  data-testid={`file-delivery-armed-${destinationClass}`}
+                  className="rounded-md border border-border bg-bg-hover px-2.5 py-2 mt-0.5"
+                >
+                  <div className="text-[11px] text-text leading-relaxed">
+                    {i18nT('pages.settings.securityPanel.file_delivery_armed_help')}
+                  </div>
+                  <div className="flex items-center gap-2 mt-1 flex-wrap">
+                    <code className="flex-1 min-w-0 truncate text-[11px] font-mono text-text bg-bg rounded px-2 py-1 select-all" title={armedView?.approve_command || 'kirocrew file-delivery approve'}>
+                      {armedView?.approve_command || 'kirocrew file-delivery approve'}
+                    </code>
+                    <Btn
+                      // Acknowledge only on RESOLUTION: copyToClipboard guards a
+                      // missing Clipboard API and falls back to execCommand, so a
+                      // plain-HTTP dashboard still copies; a false "Copied" would
+                      // let the owner paste stale text into a 10-minute window.
+                      onClick={() => {
+                        setCmdCopyFailed(false)
+                        copyToClipboard(armedView?.approve_command || 'kirocrew file-delivery approve').then(
+                          ok => { if (ok) setCmdCopied(true); else setCmdCopyFailed(true) },
+                          () => { setCmdCopied(false); setCmdCopyFailed(true) },
+                        )
+                      }}
+                      aria-label={i18nT('pages.settings.securityPanel.file_delivery_copy_command')}
+                    >
+                      {cmdCopied ? <Check size={12} /> : <Copy size={12} />}
+                      {cmdCopied
+                        ? i18nT('pages.settings.securityPanel.file_delivery_copied')
+                        : i18nT('pages.settings.securityPanel.file_delivery_copy')}
+                    </Btn>
+                  </div>
+                  {cmdCopyFailed && (
+                    <ErrorNotice
+                      variant="inline"
+                      className="mt-1.5"
+                      message={i18nT('pages.settings.securityPanel.file_delivery_copy_failed')}
+                      askAgent
+                      onDismiss={() => setCmdCopyFailed(false)}
+                    />
+                  )}
+                  {typeof armedView?.expires_in === 'number' && (
+                    <div className="text-[11px] text-muted mt-1">
+                      {i18nT('pages.settings.securityPanel.file_delivery_armed_expires', {
+                        // Human duration in LONG form ("about 10 minutes", not
+                        // "10 min"): the step-up deadline is safety-relevant, so
+                        // it must not read as an abbreviation. Rounded to the
+                        // nearest minute since the TTL is coarse.
+                        duration: fmtDuration(
+                          [[Math.max(1, Math.round(armedView.expires_in / 60)), 'minute']],
+                          { unitDisplay: 'long' },
+                        ),
+                      })}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          )
+        })}
+      </div>
+
+      {/* A request armed earlier this session has vanished (expired or
+          consumed) and left no recorded grant: say so, rather than letting the
+          command box silently unmount — which reads as the step-up having
+          worked when it may simply have timed out. */}
+      {wasArmed && !anyArmed && (view?.grantable ?? []).every(c => !(view?.grants?.[c])) && (
+        <p className="text-[11px] text-muted mt-2 leading-relaxed">
+          {i18nT('pages.settings.securityPanel.file_delivery_armed_expired')}
+        </p>
+      )}
+
+      {/* Mirrors the tailnet card's `pinned` shape: a Lock plus one read-only
+          sentence, because these legs are not merely unset — they can never be
+          granted, and the upload gate they route through does not read the
+          consent store at all. */}
+      {excluded.length > 0 && (
+        <p className="text-[12px] text-muted mt-2 leading-relaxed flex items-start gap-1">
+          <Lock size={12} className="shrink-0 mt-[3px]" aria-hidden="true" />
+          <span>{i18nT('pages.settings.securityPanel.file_delivery_never_grantable')}</span>
+        </p>
+      )}
+
+      {/* Read and write failures are reported separately: a failed read means the
+          state shown is unknown rather than unconfirmed, while a failed write
+          means the click did not persist. */}
+      {isError && (
+        <ErrorNotice variant="inline" className="mt-1.5" message={i18nT('pages.settings.securityPanel.file_delivery_load_failed')} askAgent />
+      )}
+      {(arm.isError || withdraw.isError) && (
+        <ErrorNotice variant="inline" className="mt-1.5" message={i18nT('pages.settings.securityPanel.file_delivery_save_failed')} askAgent />
+      )}
+      {/* A failed arm-status read must SAY so rather than silently dropping the
+          command panel: without this, an armed request whose status GET fails
+          leaves the owner with no way to see how to finish approval, and no
+          explanation. Surfaced like the sibling read/write errors above. */}
+      {armed.isError && (
+        <ErrorNotice variant="inline" className="mt-1.5" message={i18nT('pages.settings.securityPanel.file_delivery_arm_status_failed')} askAgent />
       )}
     </SettingsCard>
   )
@@ -880,6 +1211,9 @@ function TailnetOriginCard() {
     onSuccess: () => qc.invalidateQueries({ queryKey: ['tailnet-status'] }),
   })
   const [copied, setCopied] = useState(false)
+  // Separate from `!copied`: idle and failed both read as not-copied, but only
+  // the failure needs a notice (same split as MobileLoginCard).
+  const [copyFailed, setCopyFailed] = useState(false)
 
   useEffect(() => {
     if (!copied) return
@@ -898,10 +1232,13 @@ function TailnetOriginCard() {
           <span className="text-[13px] font-semibold text-text">{i18nT('pages.settings.securityPanel.tailnet_title')}</span>
           <span className="text-[12px] text-muted shrink-0">{i18nT('pages.settings.securityPanel.third_party_apps_state_unknown')}</span>
         </div>
-        <div className="text-[12px] text-warn mt-1 flex items-start gap-1.5 leading-relaxed">
-          <AlertTriangle size={13} className="shrink-0 mt-0.5" />
-          <span>{i18nT('pages.settings.securityPanel.tailnet_unavailable')}</span>
-        </div>
+        {/* Read failure on a switch-only card → hand-off on. */}
+        <ErrorNotice
+          variant="inline"
+          className="mt-1"
+          message={i18nT('pages.settings.securityPanel.tailnet_unavailable')}
+          askAgent
+        />
       </SettingsCard>
     )
   }
@@ -990,7 +1327,14 @@ function TailnetOriginCard() {
               // false "Copied" is worse than no feedback: the user pastes stale
               // content believing this one is on the clipboard.
               onClick={() => {
-                navigator.clipboard?.writeText(data.origin).then(() => setCopied(true), () => setCopied(false))
+                setCopyFailed(false)
+                // The shared helper guards a missing Clipboard API and falls back
+                // to `execCommand`, resolving `false` (never rejecting) when both
+                // fail — so a plain-HTTP dashboard still copies where a direct
+                // `navigator.clipboard.writeText` would not exist at all.
+                copyToClipboard(data.origin).then(ok => {
+                  if (ok) setCopied(true); else setCopyFailed(true)
+                })
               }}
               aria-label={i18nT('pages.settings.securityPanel.tailnet_copy_origin')}
             >
@@ -1055,8 +1399,19 @@ function TailnetOriginCard() {
         </div>
       )}
 
+      {/* Switch-only card: nothing to lose on either notice. The origin is
+          `select-all` above, so a failed copy still has a manual path. */}
+      {copyFailed && (
+        <ErrorNotice
+          variant="inline"
+          className="mt-1.5"
+          message={i18nT('pages.settings.securityPanel.tailnet_copy_failed')}
+          askAgent
+          onDismiss={() => setCopyFailed(false)}
+        />
+      )}
       {save.isError && (
-        <div className="text-[12px] text-danger mt-1.5">{i18nT('pages.settings.securityPanel.third_party_apps_save_failed')}</div>
+        <ErrorNotice variant="inline" className="mt-1.5" message={i18nT('pages.settings.securityPanel.third_party_apps_save_failed')} askAgent />
       )}
     </SettingsCard>
   )
@@ -1187,6 +1542,24 @@ function PolicyDistributionBlock({ posture, pending }: { posture: GovernanceDist
           <Badge variant="warn"><AlertTriangle size={11} className="lucide-inline" /> {i18nT('pages.settings.securityPanel.distribution_error_misconfigured')}</Badge>
         )}
       </div>
+      {/* The chips above are the job's status glyphs; the two outcomes that mean
+          the LAST REFRESH FAILED (a rejected or unreachable source) and a
+          declaration the pins cannot parse are failures of a background job —
+          the rule's `last_error` case — so they also render through
+          ErrorNotice. Read-only block, nothing to lose → hand-off on. Literal
+          keys per outcome, not a computed one, so the key gate can see them. */}
+      {(status === 'rejected' || status === 'unreachable' || errorCode === 'misconfigured') && (
+        <ErrorNotice
+          variant="inline"
+          className="mt-1.5"
+          message={errorCode === 'misconfigured'
+            ? i18nT('pages.settings.securityPanel.distribution_error_misconfigured_detail')
+            : status === 'rejected'
+              ? i18nT('pages.settings.securityPanel.distribution_refresh_rejected_detail')
+              : i18nT('pages.settings.securityPanel.distribution_refresh_unreachable_detail')}
+          askAgent
+        />
+      )}
       {pending && (
         <div className="text-[12px] text-warn mt-1.5 flex items-start gap-1.5 leading-relaxed">
           <AlertTriangle size={13} className="lucide-inline shrink-0 mt-0.5" />
@@ -1302,10 +1675,13 @@ function GovernancePolicyViewer() {
         {isLoading ? (
           <div className="text-[12px] text-muted py-2">{i18nT('pages.settings.securityPanel.loading_governance_policy')}</div>
         ) : unavailable ? (
-          <div className="flex items-start gap-2.5 py-2 mt-1">
-            <AlertTriangle size={14} className="lucide-inline text-warn shrink-0 mt-0.5" />
-            <span className="text-[12px] text-muted leading-relaxed">{i18nT('pages.settings.securityPanel.governance_status_is_temporarily_unavailable_enf')}</span>
-          </div>
+          // A failed read or the backend's fail-safe snapshot. Read-only viewer,
+          // nothing to lose → hand-off on.
+          <ErrorNotice
+            className="mt-1"
+            message={i18nT('pages.settings.securityPanel.governance_status_is_temporarily_unavailable_enf')}
+            askAgent
+          />
         ) : /* `!distributionConfigured` is a load-bearing term, not a tidy-up. A host
               pointed at a central ceiling whose first fetch has not landed reports
               `has_policy: false` and `profile: null`, so without it this arm renders a
@@ -1507,12 +1883,12 @@ function PostureSection() {
             {i18nT('pages.settings.securityPanel.click_any_control_to_see_exactly_what_it_covers')}
           </div>
           {postureError ? (
-            <div className="flex items-start gap-2.5 py-2">
-              <AlertTriangle size={14} className="lucide-inline text-warn shrink-0 mt-0.5" />
-              <span className="text-[12px] text-muted leading-relaxed">
-                {i18nT('pages.settings.securityPanel.security_posture_detail_is_temporarily_unavailab')}
-              </span>
-            </div>
+            // Read failure on a read-only status list → hand-off on.
+            <ErrorNotice
+              className="my-1"
+              message={i18nT('pages.settings.securityPanel.security_posture_detail_is_temporarily_unavailab')}
+              askAgent
+            />
           ) : postureLoading ? (
             <div className="text-[12px] text-muted py-2">{i18nT('pages.settings.securityPanel.loading_security_posture')}</div>
           ) : (
@@ -1582,7 +1958,16 @@ function PostureSection() {
  */
 function DeniedCommandsSection({ draft, onDraftChange, noteDraft, onNoteDraftChange }: { draft: string; onDraftChange: (next: string) => void; noteDraft: string; onNoteDraftChange: (next: string) => void }) {
   const qc = useQueryClient()
-  const { data: dc } = useQuery<DeniedCommandsData>({ queryKey: ['denied-commands'], queryFn: api.deniedCommands })
+  const { data: dc, isError: dcError } = useQuery<DeniedCommandsData>({ queryKey: ['denied-commands'], queryFn: api.deniedCommands })
+  // One surface for the four rule writes below, keyed to the row (or the
+  // disable-all switch) whose write was rejected so it renders BESIDE that
+  // control — a long rule list puts a top-of-card banner off-screen from the
+  // toggle that snapped back. Each used to fail silently (the 409 reason on a
+  // pinned rule was invalidated away; the others had no onError at all).
+  const [ruleError, setRuleError] = useState<{ id: string; message: string } | null>(null)
+  // The disable-all switch is not a row, so its rejection has its own slot
+  // rather than a sentinel id in `ruleError`.
+  const [disableAllError, setDisableAllError] = useState('')
 
   const [confirm, setConfirm] = useState<ConfirmTarget | null>(null)
   const [ack, setAck] = useState(false)
@@ -1601,15 +1986,22 @@ function DeniedCommandsSection({ draft, onDraftChange, noteDraft, onNoteDraftCha
 
   const toggleBuiltin = useMutation({
     mutationFn: (v: { id: string; enabled: boolean }) => api.toggleBuiltinDeniedCommand(v.id, v.enabled),
+    onMutate: () => setRuleError(null),
     onSuccess: applySnapshot,
     // A rejected toggle (409 on a pinned or floor-enforced rule — reachable
     // from a stale cached bundle) must repaint the true locked state instead
-    // of leaving the optimistic-looking switch position on screen.
-    onError: () => qc.invalidateQueries({ queryKey: ['denied-commands'] }),
+    // of leaving the optimistic-looking switch position on screen — AND say
+    // why, or the snap-back reads as a switch that never moved.
+    onError: (err: unknown, v) => {
+      setRuleError({ id: v.id, message: trustFailureMessage(err) })
+      qc.invalidateQueries({ queryKey: ['denied-commands'] })
+    },
   })
   const setDisableAll = useMutation({
     mutationFn: (value: boolean) => api.setDeniedCommandsDisableAll(value),
+    onMutate: () => { setRuleError(null); setDisableAllError('') },
     onSuccess: applySnapshot,
+    onError: (err: unknown) => setDisableAllError(trustFailureMessage(err)),
   })
   const addUser = useMutation({
     mutationFn: ({ pattern, note }: { pattern: string; note: string }) =>
@@ -1637,11 +2029,15 @@ function DeniedCommandsSection({ draft, onDraftChange, noteDraft, onNoteDraftCha
   })
   const toggleUser = useMutation({
     mutationFn: (v: { id: string; enabled: boolean }) => api.toggleUserDeniedCommand(v.id, v.enabled),
+    onMutate: () => setRuleError(null),
     onSuccess: applySnapshot,
+    onError: (err: unknown, v) => setRuleError({ id: v.id, message: trustFailureMessage(err) }),
   })
   const deleteUser = useMutation({
     mutationFn: (id: string) => api.deleteUserDeniedCommand(id),
+    onMutate: () => setRuleError(null),
     onSuccess: applySnapshot,
+    onError: (err: unknown, id) => setRuleError({ id, message: trustFailureMessage(err) }),
   })
 
   const grouped = useMemo(() => {
@@ -1705,8 +2101,62 @@ function DeniedCommandsSection({ draft, onDraftChange, noteDraft, onNoteDraftCha
     ? i18nT('pages.settings.securityPanel.disabling_all_built_in_denies_removes_kirocrew_s')
     : i18nT('pages.settings.securityPanel.disabling_weakens_protection', { name: confirm.description })
 
+  // The one askAgent decision for every notice in this section: the add-pattern
+  // form's `draft` / `noteDraft` live in the panel shell and the hand-off
+  // navigation would discard them, so the button is offered only while both
+  // are empty.
+  const errorHandoff = !draft.trim() && !noteDraft.trim()
+
+  // Whether the row that owns `ruleError` is on screen right now. A write can be
+  // rejected after the user has typed a filter that drops the row, or folded its
+  // category — the row-level notice then has nowhere to render, so the section
+  // falls back to a top-level notice for exactly that case (and only that case,
+  // so a visible row never shows its failure twice).
+  const ruleErrorRowVisible = (() => {
+    if (!ruleError) return true
+    for (const [category, rules] of Object.entries(visibleGroups)) {
+      if (rules.some(r => r.id === ruleError.id)) return filtering || expandedCats.has(category)
+    }
+    return visibleUserRules.some(r => r.id === ruleError.id)
+  })()
+
   return (
     <SettingsSection title={i18nT('pages.settings.securityPanel.denied_commands')}>
+      {/* askAgent is gated on the add form: `draft` / `noteDraft` (the custom
+          pattern and note, held by the panel shell) are unsaved input, so the
+          hand-off is offered only while both are empty. No hand-off otherwise:
+          the deny-pattern draft. A failed list read must not render as empty
+          groups. Rejected rule writes render beside their own row (see
+          `rowError` below), not here. */}
+      {dcError && (
+        <ErrorNotice
+          className="mb-3"
+          message={i18nT('pages.settings.securityPanel.denied_commands_load_failed')}
+          askAgent={errorHandoff}
+        />
+      )}
+      {/* Fallback for a rejected rule write whose row is filtered out or folded
+          away (see `ruleErrorRowVisible`): the failure still needs a surface. */}
+      {ruleError && !ruleErrorRowVisible && (
+        <ErrorNotice
+          className="mb-3"
+          message={ruleError.message}
+          onDismiss={() => setRuleError(null)}
+          askAgent={errorHandoff}
+          testId="denied-rule-error-hidden-row"
+        />
+      )}
+      {/* The tier's REACH, above BOTH cards: these rules read the command line
+        * a tool call carries and not the body of a program that line runs, so an
+        * operator reading either the built-in list or their own patterns as a
+        * fence over-trusts it. Card B is where a pattern is authored, so the note
+        * cannot live inside Card A. Same disclosure as the "What this tier cannot
+        * see" section of `src/kiro_crew/docs/blocked-commands.md`, which is where
+        * the closure mechanism (the OS-level sandbox) is explained. */}
+      <div className="text-[12px] text-muted mb-2 leading-relaxed" data-testid="denied-indirection-limit">
+        {i18nT('pages.settings.securityPanel.rules_read_the_command_line_not_the_program_body')}
+      </div>
+
       {/* Card A — Built-in denies */}
       <SettingsCard>
         {/* data-setting-label: deep-link anchor for the manual registry entry
@@ -1733,6 +2183,15 @@ function DeniedCommandsSection({ draft, onDraftChange, noteDraft, onNoteDraftCha
             <Toggle checked={disableAll} onChange={onDisableAllToggle} disabled={!dc} label={i18nT('pages.settings.securityPanel.disable_all_built_in_denies')} />
           </span>
         </div>
+        {/* The rejected disable-all write, beside its own switch. */}
+        <ErrorNotice
+          variant="inline"
+          className="mb-1"
+          message={disableAllError}
+          onDismiss={() => setDisableAllError('')}
+          askAgent={errorHandoff}
+          testId={disableAllError ? 'denied-disable-all-error' : undefined}
+        />
 
         <div className="text-[12px] text-muted mt-1 mb-2 leading-relaxed">
           {i18nT('pages.settings.securityPanel.disabling_a_rule_that_overlaps_an_always_on_cont')}
@@ -1805,6 +2264,8 @@ function DeniedCommandsSection({ draft, onDraftChange, noteDraft, onNoteDraftCha
                   disableAll={disableAll}
                   onRuleToggle={onBuiltinToggle}
                   collapsible={!filtering}
+                  rowError={ruleError}
+                  errorHandoff={errorHandoff}
                 />
               ))}
             </div>
@@ -1831,6 +2292,8 @@ function DeniedCommandsSection({ draft, onDraftChange, noteDraft, onNoteDraftCha
                 rule={rule}
                 onToggle={next => toggleUser.mutate({ id: rule.id, enabled: next })}
                 onDelete={() => deleteUser.mutate(rule.id)}
+                error={ruleError?.id === rule.id ? ruleError.message : undefined}
+                errorHandoff={errorHandoff}
               />
             ))}
           </div>
@@ -2002,10 +2465,13 @@ function ThirdPartyAppsCard() {
             assert a state we could not read. A still-loading read keeps the
             disabled switch, since it resolves on its own. */}
         {taUnavailable ? (
-          <div className="flex items-start gap-1.5 text-[12px] text-warn py-1.5 leading-relaxed">
-            <AlertTriangle size={13} className="shrink-0 mt-0.5" />
-            <span>{i18nT('pages.settings.securityPanel.third_party_apps_unavailable')}</span>
-          </div>
+          // Read failure on a switch-only card → hand-off on.
+          <ErrorNotice
+            variant="inline"
+            className="py-1.5"
+            message={i18nT('pages.settings.securityPanel.third_party_apps_unavailable')}
+            askAgent
+          />
         ) : (
           <SettingsToggle
             label={i18nT('pages.settings.securityPanel.trustedApps.allow_all_label')}
@@ -2105,13 +2571,15 @@ function ThirdPartyAppsCard() {
           </div>
         )}
 
+        {/* A refused trust change (409 codes via trustFailureMessage). The card
+            holds toggles and revoke buttons only — nothing to lose → hand-off on. */}
         {trustError && (
-          <div className="flex items-start gap-2.5 mt-2 rounded-md bg-bg-elevated border border-danger px-3 py-2">
-            <AlertTriangle size={14} className="lucide-inline text-danger shrink-0 mt-0.5" />
-            <span className="text-[12px] text-text leading-relaxed">
-              {i18nT('pages.settings.securityPanel.trustedApps.change_failed', { detail: trustError })}
-            </span>
-          </div>
+          <ErrorNotice
+            className="mt-2"
+            message={i18nT('pages.settings.securityPanel.trustedApps.change_failed', { detail: trustError })}
+            askAgent
+            onDismiss={() => setTrustError(null)}
+          />
         )}
         {revokeDisabledApp && (
           <div className="flex items-start gap-2.5 mt-2 rounded-md bg-bg-elevated border border-border px-3 py-2">
@@ -2211,7 +2679,7 @@ function DocsSection() {
  * The rail states which is which before any row is read, and the two large
  * tables (137 rules, ~20 governed scopes) get a pane instead of a fold.
  */
-type SecuritySectionKey = 'posture' | 'approval' | 'rules' | 'tailnet' | 'apps' | 'layers' | 'governance' | 'docs'
+type SecuritySectionKey = 'posture' | 'approval' | 'rules' | 'tailnet' | 'apps' | 'delivery' | 'layers' | 'governance' | 'docs'
 type SecuritySectionGroup = 'status' | 'yours' | 'enforced' | 'reference'
 
 interface SecuritySectionDef {
@@ -2237,6 +2705,7 @@ export const SECTION_LABEL_KEY: Record<SecuritySectionKey, string> = {
   rules: 'pages.settings.securityPanel.denied_commands',
   tailnet: 'pages.settings.securityPanel.tailnet_section',
   apps: 'pages.settings.securityPanel.third_party_apps_section',
+  delivery: 'pages.settings.securityPanel.file_delivery_section',
   layers: 'pages.settings.securityPanel.defense_in_depth_architecture',
   governance: 'pages.settings.securityPanel.governance_policy',
   docs: 'pages.settings.securityPanel.documentation',
@@ -2258,6 +2727,7 @@ const SECURITY_SECTIONS: readonly SecuritySectionDef[] = [
   { key: 'rules', icon: <Terminal size={15} />, group: 'yours' },
   { key: 'tailnet', icon: <Network size={15} />, group: 'yours' },
   { key: 'apps', icon: <Boxes size={15} />, group: 'yours' },
+  { key: 'delivery', icon: <FileWarning size={15} />, group: 'yours' },
   { key: 'layers', icon: <Layers size={15} />, group: 'enforced' },
   { key: 'governance', icon: <Gavel size={15} />, group: 'enforced' },
   { key: 'docs', icon: <BookOpen size={15} />, group: 'reference' },
@@ -2313,6 +2783,12 @@ export function SecurityPanel({ basePath }: { basePath?: string } = {}) {
 
   // Rail summaries. Both reads are shared cache entries with the sections that
   // own them, so the rail adds no extra request.
+  // Deliberately NOT an error surface: on a failed read the summaries below
+  // return nothing (a blank rail line, never a fake value), and the failure
+  // itself is reported through ErrorNotice by the card that owns each read —
+  // YoloDurationCard for `cfgError`, TailnetOriginCard for `tailnetError`,
+  // DeniedCommandsSection for the denied-commands list. A second notice in a
+  // 192px rail would repeat the card's message without room to act on it.
   const status = useAppSelector(s => s.dashboard.status)
   const { data: dc } = useQuery<DeniedCommandsData>({ queryKey: ['denied-commands'], queryFn: api.deniedCommands })
   const { data: cfg, isError: cfgError } = useQuery<KirocrewCfgShape>({ queryKey: ['kirocrewConfig'], queryFn: api.kirocrewConfig })
@@ -2322,6 +2798,20 @@ export function SecurityPanel({ basePath }: { basePath?: string } = {}) {
     queryFn: api.tailnetStatus,
     staleTime: 300_000,
   })
+
+  // NO rail summary for the flagged-file-delivery row, deliberately, and this is a
+  // gate decision rather than a design preference. `SettingsSubNav` renders a
+  // label and a summary as two adjacent catalog keys, which the render-time i18n
+  // gate counts as one `fragment/multi-unit` finding per site
+  // (SettingsSubNav.tsx:241 and :264). The YOLO and third-party-apps rows already
+  // carry exactly that finding on this surface, and `[vs-base]` fails on ANY
+  // per-surface increase against a goal of zero -- so giving this row a summary
+  // adds four findings to a surface that is trying to reach none. The state is one
+  // click away in the card, which shows it prominently. The real remedy is the one
+  // the gate prints ("merge the adjacent catalog keys into one key with {{vars}}"),
+  // and it belongs to `SettingsSubNav` for every panel at once rather than to this
+  // row: doing it here alone would also break SECTION_LABEL_KEY's rule that a rail
+  // label REUSES its section's heading key.
 
   const summaryFor = (key: SecuritySectionKey): string | undefined => {
     switch (key) {
@@ -2423,6 +2913,11 @@ export function SecurityPanel({ basePath }: { basePath?: string } = {}) {
             {key === 'apps' && (
               <SettingsSection title={i18nT('pages.settings.securityPanel.third_party_apps_section')}>
                 <ThirdPartyAppsCard />
+              </SettingsSection>
+            )}
+            {key === 'delivery' && (
+              <SettingsSection title={i18nT('pages.settings.securityPanel.file_delivery_section')}>
+                <FileDeliveryConsentCard />
               </SettingsSection>
             )}
             {key === 'layers' && <LayersSection />}

@@ -78,8 +78,22 @@ def _install_policy(monkeypatch, doc: dict | None) -> None:
     monkeypatch.setattr(pc, "current_context", lambda: _Ctx())
 
 
+#: Every governed scope ``GET /api/dashboard/config`` resolves, in the order the
+#: handler evaluates them. Named in full so the assertions below stay ENDPOINT-WIDE:
+#: filtering to one scope would discard the property that makes them a ratchet — a
+#: third probe added to this read without an audit row must fail here, and it cannot
+#: if the helper drops every row it does not recognise.
+_ENDPOINT_SCOPES = (_SCOPE, "capabilities.decisions")
+
+
 def _governance_rows(fake: MagicMock) -> list[dict]:
+    """EVERY row the endpoint wrote, unfiltered."""
     return [c[1] for c in fake.log_governance_decision.call_args_list]
+
+
+def _rows_for(fake: MagicMock, scope: str) -> list[dict]:
+    """One scope's rows, for a claim that is about that scope alone."""
+    return [r for r in _governance_rows(fake) if r.get("scope") == scope]
 
 
 # ── The catalog row ───────────────────────────────────────────────────────
@@ -191,7 +205,7 @@ class TestProbe:
 
         monkeypatch.setattr(social_share, "vet_and_audit", _boom)
         assert social_share.is_share_denied() is True
-        rows = _governance_rows(fake_sel)
+        rows = _rows_for(fake_sel, _SCOPE)
         assert len(rows) == 1
         assert rows[0]["scope"] == _SCOPE
         assert rows[0]["outcome"] == "denied"
@@ -253,18 +267,29 @@ class TestDashboardConfigEndpoint:
                 assert (await (await client.get("/api/dashboard/config")).json())[
                     "social_share_enabled"
                 ] is False
+            # ENDPOINT-WIDE first: every row this read wrote belongs to a scope this
+            # endpoint is known to resolve, and each resolved one wrote exactly one
+            # row per request. A probe added without an audit row fails the count; a
+            # probe added WITH one fails the scope set until it is named above.
             rows = _governance_rows(fake_sel)
-            assert [r["outcome"] for r in rows] == ["denied", "denied"]
-            assert {r["scope"] for r in rows} == {_SCOPE}
-            assert {r["tool_name"] for r in rows} == {social_share.AUDIT_TOOL}
+            assert {r["scope"] for r in rows} == set(_ENDPOINT_SCOPES)
+            assert len(rows) == 2 * len(_ENDPOINT_SCOPES)
             assert {r["session_key"] for r in rows} == {"dashboard:ui"}
+            # Then this scope's own trail.
+            share_rows = _rows_for(fake_sel, _SCOPE)
+            assert [r["outcome"] for r in share_rows] == ["denied", "denied"]
+            assert {r["tool_name"] for r in share_rows} == {social_share.AUDIT_TOOL}
 
             _install_policy(monkeypatch, None)
             assert (await (await client.get("/api/dashboard/config")).json())[
                 "social_share_enabled"
             ] is True
-            rows = _governance_rows(fake_sel)
-            assert [r["outcome"] for r in rows] == ["denied", "denied", "allowed"]
+            assert len(_governance_rows(fake_sel)) == 3 * len(_ENDPOINT_SCOPES)
+            assert [r["outcome"] for r in _rows_for(fake_sel, _SCOPE)] == [
+                "denied",
+                "denied",
+                "allowed",
+            ]
 
     @pytest.mark.asyncio
     async def test_round_tripped_field_does_not_reject_an_unrelated_save(
@@ -304,3 +329,140 @@ class TestGovernanceGenerationFrame:
             )
         )
         assert frame["governanceGeneration"] == 7
+
+    # ── the profile layer has to reach this frame too ─────────────────
+
+    @staticmethod
+    def _bind_profiles(tmp_path, monkeypatch):
+        """Redirect the profile store at a tmp dir via the seam its own module
+        docstring names (``_PROFILES_DIR``). No real config or state path is read
+        or written: ``config_dir()`` is never consulted once this is set."""
+        from kiro_crew.platform import governance_profiles as gp
+
+        profiles = tmp_path / "profiles"
+        profiles.mkdir()
+        monkeypatch.setattr(gp, "_PROFILES_DIR", profiles)
+        gp.reset_store()
+
+        def write(*, enabled: bool) -> None:
+            (profiles / "dash.json").write_text(
+                json.dumps(
+                    {
+                        "name": "dash",
+                        "bind": {"type": "surface", "id": "dashboard"},
+                        "capabilities": {"social_share": {"enabled": enabled}},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+        return gp, write
+
+    def test_a_profile_edit_moves_the_generation_the_frame_carries(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """A profile-layer tightening is enforced on the next decision, but would
+        otherwise leave the dashboard's cached answer standing, because the frame's generation
+        tracked ceiling installs only. If the value the frame carries does not move,
+        ``useWebSocket`` never invalidates ``['dashboardConfig']`` and the UI keeps
+        offering an entry policy has withdrawn."""
+        gp, write = self._bind_profiles(tmp_path, monkeypatch)
+        try:
+            write(enabled=True)
+            # PRIME FIRST, then take the baseline. Reading the baseline off an
+            # unprimed store would let the first-load bump supply the difference
+            # this test is about: mutation-checked, and without this ordering the
+            # test passes even when the reload stops bumping the counter.
+            permitted_before = gp.governance_permits(
+                _SCOPE, "", session_key="dashboard:ui"
+            ).permitted
+            before = gp.governance_answer_generation()
+
+            write(enabled=False)
+            # What the watcher does, except it offloads this to a thread because it
+            # walks the profiles directory.
+            gp.poll_profiles_fresh()
+            after = gp.governance_answer_generation()
+            permitted_after = gp.governance_permits(
+                _SCOPE, "", session_key="dashboard:ui"
+            ).permitted
+
+            # Control first: if ENFORCEMENT did not observe the edit either, this
+            # test is not measuring the notification gap and its pass means nothing.
+            assert (permitted_before, permitted_after) == (True, False), (
+                "fixture did not actually change the governance answer, so the "
+                "generation assertion below would be vacuous"
+            )
+            assert after != before, (
+                "the profile layer recomposed and enforcement observed it, but the "
+                "generation the slots frame carries did not move, so no client "
+                "invalidates its cached dashboardConfig"
+            )
+        finally:
+            gp.reset_store()
+
+    def test_the_generation_is_stable_while_no_profile_changes(self, tmp_path, monkeypatch) -> None:
+        """The counter must stay an OUTPUT of the profile store and never become an
+        input to its own freshness key. If it were folded into ``_ceiling_token()``,
+        every read would look like a change: ``_ensure_fresh`` computes its
+        fingerprint BEFORE reloading, so it would commit a pre-bump value and then
+        reload on every single access — on the event loop, which the synchronous
+        PreToolUse gate reaches. Repeated reads with nothing edited must be equal."""
+        gp, write = self._bind_profiles(tmp_path, monkeypatch)
+        try:
+            write(enabled=True)
+            gp.poll_profiles_fresh()
+            first = gp.governance_answer_generation()
+            gp.poll_profiles_fresh()
+            second = gp.governance_answer_generation()
+            gp.poll_profiles_fresh()
+            third = gp.governance_answer_generation()
+            assert first == second == third, (
+                f"generation moved with nothing edited ({first} -> {second} -> "
+                f"{third}): the profile counter is feeding its own fingerprint"
+            )
+        finally:
+            gp.reset_store()
+
+    def test_reading_the_generation_never_touches_the_filesystem(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """The token read runs on the event loop, from the synchronous slots
+        broadcast. AUTOSDE's ``no-blocking-call-on-event-loop`` names filesystem
+        walks as the prohibited class, so the directory re-stat belongs in
+        ``poll_profiles_fresh`` (which the watcher offloads to a thread) and must not
+        creep back into the read.
+
+        Detects by COUNTING calls, not by raising. ``poll_profiles_fresh`` catches
+        ``Exception`` by design, so an injected exception is swallowed and the test
+        passes with the walk reintroduced -- mutation-checked, and that is exactly
+        how the first version of this test was vacuous."""
+        gp, write = self._bind_profiles(tmp_path, monkeypatch)
+        try:
+            write(enabled=True)
+            gp.poll_profiles_fresh()
+            baseline = gp.governance_answer_generation()
+
+            real = gp._dir_fingerprint
+            calls: list[object] = []
+
+            def _spy(directory):
+                calls.append(directory)
+                return real(directory)
+
+            monkeypatch.setattr(gp, "_dir_fingerprint", _spy)
+
+            # Control: the spy must be capable of recording, or a count of zero
+            # below would prove nothing about the read.
+            gp.poll_profiles_fresh()
+            assert len(calls) >= 1, "spy never fired; it cannot evidence a zero count"
+
+            calls.clear()
+            assert gp.governance_answer_generation() == baseline
+            assert calls == [], (
+                f"governance_answer_generation walked the filesystem "
+                f"({len(calls)} _dir_fingerprint call(s)); that walk belongs in "
+                f"poll_profiles_fresh, off the event loop"
+            )
+        finally:
+            gp.reset_store()

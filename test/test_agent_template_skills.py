@@ -3,8 +3,7 @@
 Three layers, matching the three holes this feature closes:
 
 * READ — ``agent_discovery`` derives an agent's skills from its ``skill://``
-  resources (previously only ``builder-mcp --skill-name-filter`` was parsed, so
-  every ordinary agent reported zero skills).
+  resources.
 * WRITE — ``_shared.apply_skill_mapping`` turns catalog keys into ``skill://``
   resources without disturbing ``file://`` steering globs or hand-authored URIs.
 * RUNTIME — ``SkillsLoader.get_context(only=…)`` and the ``build_session_context``
@@ -69,9 +68,7 @@ def fake_home(tmp_path, monkeypatch):
     # ``_KIRO_AGENTS_DIR`` is computed at import time from the real home, so the
     # Path.home patch alone does not redirect the default-argument lookups that
     # agent_skill_globs / list_agents use.
-    monkeypatch.setattr(
-        "kiro_crew.agent_discovery._KIRO_AGENTS_DIR", tmp_path / ".kiro" / "agents"
-    )
+    monkeypatch.setattr("kiro_crew.agent_discovery._KIRO_AGENTS_DIR", tmp_path / ".kiro" / "agents")
     return tmp_path
 
 
@@ -160,9 +157,9 @@ class TestExtractSkills:
 
 class TestExpandSkillUri:
     def test_home_relative(self, fake_home):
-        assert expand_skill_uri(
-            "skill://~/.kiro/skills/foo/SKILL.md", fake_home / "a.json"
-        ) == str(fake_home / ".kiro/skills/foo/SKILL.md")
+        assert expand_skill_uri("skill://~/.kiro/skills/foo/SKILL.md", fake_home / "a.json") == str(
+            fake_home / ".kiro/skills/foo/SKILL.md"
+        )
 
     def test_absolute(self, tmp_path):
         assert (
@@ -402,9 +399,7 @@ class TestApplySkillMapping:
         agent = _agents_dir(fake_home) / "a.json"
         data: dict = {}
 
-        applied, _ = apply_skill_mapping(
-            data, agent, state, ["kiro-user/one", "kiro-user/one"]
-        )
+        applied, _ = apply_skill_mapping(data, agent, state, ["kiro-user/one", "kiro-user/one"])
 
         assert applied == ["kiro-user/one"]
         assert data["resources"] == ["skill://~/.kiro/skills/one/SKILL.md"]
@@ -501,7 +496,7 @@ class _FakeRequest:
         self.app = {"state": state}
         self.query: dict[str, str] = {}
         # api_agent_detail reads X-Session-Key via _read_session_key(request)
-        # to scope the skill catalog to the requesting slot (#2457).
+        # to scope the skill catalog to the requesting slot.
         self.headers: dict[str, str] = {}
 
     async def json(self):
@@ -562,9 +557,8 @@ class TestSessionContextGate:
         )
 
     def test_mapped_custom_agent_gets_its_skills_on_cc(self, fake_home):
-        """Previously a custom agent got NO skills at all. With a mapping it now
-        gets exactly the mapped set on the CC backend (which does not read agent
-        ``resources``)."""
+        """A custom agent with a mapping gets exactly the mapped set on the CC
+        backend (which does not read agent ``resources``)."""
         skills_root = fake_home / "skills"
         _make_skill(skills_root, "alpha")
         _make_skill(skills_root, "beta")
@@ -662,7 +656,7 @@ class TestSessionContextGate:
         )
         assert "[Skills:]" not in ctx
 
-    def test_unmapped_kirocrew_still_gets_everything(self, fake_home):
+    def test_unmapped_kirocrew_gets_short_discovery(self, fake_home):
         skills_root = fake_home / "skills"
         _make_skill(skills_root, "alpha")
         _make_skill(skills_root, "beta")
@@ -671,4 +665,5 @@ class TestSessionContextGate:
         ctx = self._builder(fake_home, skills_root).build_session_context(
             agent="kirocrew", provider_type="claude_code"
         )
+        assert "skill_search(query)" in ctx
         assert "alpha" in ctx and "beta" in ctx

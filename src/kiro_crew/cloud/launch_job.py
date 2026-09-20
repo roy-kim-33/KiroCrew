@@ -23,6 +23,7 @@ tested against a fake — no AWS calls in tests.
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import os
@@ -32,12 +33,14 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Protocol
+from typing import List, Mapping, Optional, Protocol
 
 from kiro_crew import platform_compat
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.cloud import sizes
+from kiro_crew.cloud.login_target import KiroLoginTarget, LoginTargetError
 from kiro_crew.config.loader import config_dir
+from kiro_crew.platform.interfaces import BUILTIN_PROVISIONER_ID
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +75,17 @@ _STEP_LABELS: tuple = (
     (STEP_SIGNIN, "Sign in to Kiro"),
     (STEP_CONNECT, "Connect"),
 )
+
+
+def _resource_noun(job: "LaunchJob") -> str:
+    """What a launch created, for the user-facing rollback and reap messages.
+
+    The built-in lane creates a CloudFormation stack and the messages have always
+    said so; a provisioner from the ``remote_provisioners`` seam creates whatever
+    it creates (a DevSpace, a task), and calling that an "EC2 stack" would send the
+    user to the wrong console to clean it up.
+    """
+    return "EC2 stack" if job.provider_id == BUILTIN_PROVISIONER_ID else "instance"
 
 
 class LaunchCancelled(Exception):
@@ -123,8 +137,17 @@ class LaunchStep:
         )
 
 
-def _default_steps() -> list:
-    return [LaunchStep(key=k, label=lbl) for k, lbl in _STEP_LABELS]
+def default_steps(step_labels: Optional[Mapping[str, str]] = None) -> list:
+    """The four fixed steps, with a provisioner's label overrides applied.
+
+    The KEYS are the orchestration contract (``run_launch`` and the two rollback
+    paths branch on them), so a provisioner may rename a step but not add or
+    drop one. An override for an unknown key is ignored rather than raised: the
+    descriptor is edition-supplied and a typo there must not make every launch
+    fail before its first step.
+    """
+    labels = dict(step_labels or {})
+    return [LaunchStep(key=k, label=labels.get(k) or lbl) for k, lbl in _STEP_LABELS]
 
 
 @dataclass
@@ -137,13 +160,22 @@ class LaunchJob:
     size_key: str
     tag: str = ""
     status: str = PENDING
-    steps: list = field(default_factory=_default_steps)
+    steps: list = field(default_factory=default_steps)
     instance_id: str = ""
     signin: Optional[SigninPrompt] = None
     signin_detected: bool = False
     error: str = ""
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
+    # Which remote-instance provisioner drives this job (the CPP
+    # ``remote_provisioners`` seam). A job file written before the seam existed
+    # carries no key and loads as the built-in, which is what it was.
+    provider_id: str = BUILTIN_PROVISIONER_ID
+    # The Kiro identity the crew must sign in as. Persisted with the job so a
+    # gateway restart while the device code is pending resumes the SAME sign-in
+    # rather than a Builder ID one; a job file written before the field existed
+    # loads as the default target, which is what it was. Never a credential.
+    login_target: KiroLoginTarget = field(default_factory=KiroLoginTarget)
 
     @property
     def terminal(self) -> bool:
@@ -158,6 +190,7 @@ class LaunchJob:
     def to_dict(self) -> dict:
         return {
             "id": self.id,
+            "provider_id": self.provider_id,
             "profile": self.profile,
             "region": self.region,
             "size_key": self.size_key,
@@ -170,6 +203,7 @@ class LaunchJob:
             "error": self.error,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
+            "login_target": self.login_target.to_dict(),
         }
 
     @classmethod
@@ -178,24 +212,38 @@ class LaunchJob:
         steps = (
             [LaunchStep.from_dict(s) for s in steps_raw]
             if isinstance(steps_raw, list) and steps_raw
-            else _default_steps()
+            else default_steps()
         )
         signin_raw = d.get("signin")
         signin = SigninPrompt.from_dict(signin_raw) if isinstance(signin_raw, dict) else None
+        status = str(d.get("status", PENDING))
+        error = str(d.get("error", ""))
+        try:
+            login_target = KiroLoginTarget.from_dict(d.get("login_target"))
+        except LoginTargetError as exc:
+            # The job named an identity this release cannot read. Resuming
+            # it would sign the crew in as the default identity instead -- the
+            # silent downgrade the target exists to prevent -- so the job fails
+            # here, visibly, and a terminal job is never resumed.
+            login_target = KiroLoginTarget()
+            status = FAILED
+            error = f"persisted Kiro identity target is unreadable: {exc}"
         return cls(
             id=str(d.get("id", "")),
             profile=str(d.get("profile", "")),
             region=str(d.get("region", "")),
             size_key=str(d.get("size_key", "")),
             tag=str(d.get("tag", "")),
-            status=str(d.get("status", PENDING)),
+            status=status,
             steps=steps,
             instance_id=str(d.get("instance_id", "")),
             signin=signin,
             signin_detected=bool(d.get("signin_detected", False)),
-            error=str(d.get("error", "")),
+            error=error,
             created_at=float(d.get("created_at", time.time())),
             updated_at=float(d.get("updated_at", time.time())),
+            provider_id=str(d.get("provider_id") or BUILTIN_PROVISIONER_ID),
+            login_target=login_target,
         )
 
 
@@ -261,10 +309,39 @@ class LaunchJobStore:
             raise ValueError(f"invalid job id {job_id!r}")
         return self._root / f"{job_id}.json"
 
-    def create(self, *, profile: str, region: str, size_key: str) -> LaunchJob:
-        """Build + persist a fresh PENDING job. Validates the size key up front."""
-        sizes.get_tier(size_key)  # raises KeyError with the valid set if unknown
-        job = LaunchJob(id=_new_job_id(), profile=profile, region=region, size_key=size_key)
+    def create(
+        self,
+        *,
+        profile: str,
+        region: str,
+        size_key: str,
+        provider_id: str = BUILTIN_PROVISIONER_ID,
+        step_labels: Optional[Mapping[str, str]] = None,
+        login_target: Optional[KiroLoginTarget] = None,
+    ) -> LaunchJob:
+        """Build + persist a fresh PENDING job.
+
+        The size key is validated up front ONLY for the built-in EC2 provisioner:
+        ``sizes.py`` is the EC2 instance-type ladder, and another provisioner's
+        ``size_key`` is that provisioner's own shape vocabulary (a DevSpace
+        instance type, a Fargate cpu/memory pair), which its engine validates in
+        ``provision``. Rejecting it here against the EC2 table would refuse every
+        non-EC2 launch.
+
+        ``login_target`` is the Kiro identity the crew signs in as; ``None`` is
+        the default (Builder ID) target, exactly the pre-field behaviour.
+        """
+        if provider_id == BUILTIN_PROVISIONER_ID:
+            sizes.get_tier(size_key)  # raises KeyError with the valid set if unknown
+        job = LaunchJob(
+            id=_new_job_id(),
+            profile=profile,
+            region=region,
+            size_key=size_key,
+            provider_id=provider_id,
+            steps=default_steps(step_labels),
+            login_target=login_target or KiroLoginTarget(),
+        )
         # Claim ownership BEFORE the file exists. `reap_orphans` spares only jobs this
         # process owns, and it runs off the event loop: a reap already in flight can
         # list the job dir at any moment. Adopting in the worker instead leaves a
@@ -376,7 +453,7 @@ class LaunchJobStore:
             job.status = FAILED
             job.error = (
                 "Interrupted — Kiro Crew restarted while this setup was running. "
-                "The EC2 stack may still exist; check your crews before retrying."
+                f"The {_resource_noun(job)} may still exist; check your crews before retrying."
             )
             job.signin = None
             self.save(job)
@@ -405,6 +482,10 @@ class SigninHandle(Protocol):
     url: str
     code: str
     ports: list
+    #: A VERIFIED refusal (e.g. the instance already holds a session for a
+    #: different identity than the pinned target); empty when the sign-in
+    #: started normally. Read with ``getattr`` so older handles still conform.
+    error: str
 
     def wait(self, cancel: threading.Event) -> bool: ...
     def close(self) -> None: ...
@@ -415,9 +496,111 @@ class LaunchEngine(Protocol):
 
     def preflight(self, profile: str, region: str) -> None: ...
     def provision(self, *, tag: str, size_key: str, profile: str, region: str) -> str: ...
-    def begin_signin(self, *, instance_id: str, profile: str, region: str) -> SigninHandle: ...
+
+    def begin_signin(
+        self,
+        *,
+        instance_id: str,
+        profile: str,
+        region: str,
+        login_target: "KiroLoginTarget | None" = None,
+    ) -> SigninHandle: ...
     def register(self, *, instance_id: str, tag: str, profile: str, region: str) -> None: ...
     def teardown(self, *, tag: str, profile: str, region: str) -> bool: ...
+
+
+def _begin_signin_with_target(engine: "LaunchEngine", job: "LaunchJob") -> SigninHandle:
+    """Call ``engine.begin_signin`` with the job's login target, versioned.
+
+    ``login_target`` is a NEW keyword on the engine contract. The built-in
+    engine takes it; a downstream provisioner written against the older
+    three-argument shape does not, and must keep working for the default
+    (Builder ID) target it always implemented. But when the job carries a
+    NON-default target and the engine cannot receive it, silently calling the
+    old shape would sign the crew in as the wrong identity — the exact defect
+    this field exists to close — so that combination fails loud instead.
+
+    The compatibility decision is :func:`_check_signin_target_supported`, which
+    the runner applies at PREFLIGHT — before anything is provisioned or billed.
+    By the time this is called the combination is known to be valid, so the
+    ``RuntimeError`` below is a programming-error guard, never a runtime path.
+    """
+    if _engine_accepts_login_target(engine):
+        return engine.begin_signin(
+            instance_id=job.instance_id,
+            profile=job.profile,
+            region=job.region,
+            login_target=job.login_target,
+        )
+    if not job.login_target.is_default:
+        raise RuntimeError(_target_unsupported_message(engine, job))
+    return engine.begin_signin(instance_id=job.instance_id, profile=job.profile, region=job.region)
+
+
+def _engine_accepts_login_target(engine: "LaunchEngine") -> bool:
+    try:
+        return "login_target" in inspect.signature(engine.begin_signin).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def _target_unsupported_message(engine: "LaunchEngine", job: "LaunchJob") -> str:
+    return (
+        f"provisioner {job.provider_id!r} cannot sign in as {job.login_target.describe()}: "
+        "its LaunchEngine.begin_signin does not accept login_target. Launch with the "
+        "default Builder ID identity, or use a provisioner that supports Identity Center."
+    )
+
+
+def _engine_login_target_refusal(engine: "LaunchEngine", target: "KiroLoginTarget") -> str:
+    """The engine's own reason it cannot sign in as ``target``, or ``""``.
+
+    Accepting the ``login_target`` keyword says an engine can RECEIVE a target,
+    not that it can honour every one: a Fargate task is credentialed by the API
+    key its container starts with and has no sign-in at all, so an Identity
+    Center target has nothing to act on there. An engine that knows this about
+    itself declares it through an optional ``login_target_refusal(target)``
+    method returning a non-empty reason; the built-in EC2 engine, which honours
+    every target, has none. Optional so that a downstream engine written before
+    this hook keeps its keyword-based contract unchanged.
+    """
+    probe = getattr(engine, "login_target_refusal", None)
+    if probe is None:
+        return ""
+    try:
+        return str(probe(target) or "")
+    except Exception:  # pragma: no cover - defensive; a broken probe must not hide the launch
+        logger.warning(
+            "login_target_refusal probe failed; treating target as accepted", exc_info=True
+        )
+        return ""
+
+
+def _check_signin_target_supported(engine: "LaunchEngine", job: "LaunchJob") -> None:
+    """Refuse, at preflight, a non-default target the engine cannot honour.
+
+    Provisioning bills an instance the moment it succeeds; discovering only at
+    the sign-in step that the engine cannot honour the requested identity would
+    strand that instance — provisioned, running, unregistered, and outside
+    every teardown arm (which fire only on a provision-step failure). Deciding
+    here means the job fails before any resource exists.
+
+    Two engine shapes fail here. One written against the three-keyword
+    ``begin_signin`` cannot receive a target at all. One that receives the
+    keyword but declares, through ``login_target_refusal``, that this target has
+    nothing to act on (see :func:`_engine_login_target_refusal`) is refused with
+    its own reason.
+    """
+    if job.login_target.is_default:
+        return
+    if not _engine_accepts_login_target(engine):
+        raise RuntimeError(_target_unsupported_message(engine, job))
+    reason = _engine_login_target_refusal(engine, job.login_target)
+    if reason:
+        raise RuntimeError(
+            f"provisioner {job.provider_id!r} cannot sign in as "
+            f"{job.login_target.describe()}: {reason}"
+        )
 
 
 def _rollback_cancelled_stack(
@@ -447,7 +630,7 @@ def _rollback_cancelled_stack(
         confirmed = engine.teardown(tag=job.tag, profile=job.profile, region=job.region)
     except Exception as exc:  # noqa: BLE001 - reported on the job, never propagated
         job.error = (
-            f"Cancelled, but the EC2 stack {job.tag} could not be removed "
+            f"Cancelled, but the {_resource_noun(job)} {job.tag} could not be removed "
             f"automatically ({str(exc)[:200]}). Delete it from your crews — or with "
             "the CLI — so it stops billing."
         )
@@ -457,7 +640,7 @@ def _rollback_cancelled_stack(
         step.detail = f"Removed {job.tag} after cancellation."
         return
     job.error = (
-        f"Cancelled, and the delete of EC2 stack {job.tag} was requested but did NOT "
+        f"Cancelled, and the delete of {_resource_noun(job)} {job.tag} was requested but did NOT "
         "confirm (it may be DELETE_FAILED). Check your crews — it may still be running "
         "and billing."
     )
@@ -487,17 +670,17 @@ def _rollback_failed_provision(
         confirmed = engine.teardown(tag=job.tag, profile=job.profile, region=job.region)
     except Exception as exc:  # noqa: BLE001 - reported on the job, never propagated
         job.error = (
-            f"{base} The EC2 stack {job.tag} could not be removed automatically "
+            f"{base} The {_resource_noun(job)} {job.tag} could not be removed automatically "
             f"({str(exc)[:150]}). Delete it from your crews — or with the CLI — so it "
             "stops billing."
         )
         logger.warning("Could not roll back stack %s after provision failure: %s", job.tag, exc)
         return
     if confirmed:
-        job.error = f"{base} The EC2 stack {job.tag} was removed so it stops billing."
+        job.error = f"{base} The {_resource_noun(job)} {job.tag} was removed so it stops billing."
         return
     job.error = (
-        f"{base} The delete of EC2 stack {job.tag} was requested but did NOT confirm "
+        f"{base} The delete of {_resource_noun(job)} {job.tag} was requested but did NOT confirm "
         "(it may be DELETE_FAILED). Check your crews — it may still be running and billing."
     )
     logger.warning("Rollback of %s after provision failure did not confirm", job.tag)
@@ -544,9 +727,12 @@ def run_launch(
     store.save(job)
 
     try:
-        # 1) Preflight
+        # 1) Preflight — includes the identity/engine compatibility check, so a
+        #    target the engine cannot honour fails HERE, before any resource is
+        #    provisioned or billed (a sign-in-step refusal would strand it).
         _check_cancel()
         s = _activate(STEP_PREFLIGHT)
+        _check_signin_target_supported(engine, job)
         engine.preflight(job.profile, job.region)
         s.state = STEP_DONE
         store.save(job)
@@ -564,11 +750,20 @@ def run_launch(
         # 3) Sign in to Kiro (device code exposed as state while awaiting)
         _check_cancel()
         s = _activate(STEP_SIGNIN)
-        handle = engine.begin_signin(
-            instance_id=job.instance_id, profile=job.profile, region=job.region
-        )
+        handle = _begin_signin_with_target(engine, job)
+        # A sign-in that was REFUSED (verified identity mismatch on a reused
+        # instance) is recorded here and raised only after register(): failing
+        # before registration would strand a provisioned, billing instance that
+        # never appears in the crew list, and the recovery the message names
+        # (``cloud logout`` on the instance) needs the crew to be visible.
+        signin_error = str(getattr(handle, "error", "") or "")
         try:
-            if handle.already_logged_in:
+            if signin_error:
+                job.signin_detected = False
+                s.state = STEP_FAILED
+                s.detail = signin_error
+                store.save(job)
+            elif handle.already_logged_in:
                 job.signin_detected = True
                 s.state = STEP_DONE
                 s.detail = "Already signed in."
@@ -617,6 +812,15 @@ def run_launch(
         )
         s.state = STEP_DONE
         store.save(job)
+
+        if signin_error:
+            # Registered (visible, recoverable) but NOT done: the crew is running
+            # under an identity the launch did not ask for, and only an explicit
+            # logout on the instance fixes that. DONE here would report success.
+            job.error = signin_error[:400]
+            job.status = FAILED
+            store.save(job)
+            return job
 
         job.status = DONE
         store.save(job)

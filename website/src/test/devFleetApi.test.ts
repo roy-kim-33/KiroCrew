@@ -39,10 +39,19 @@ describe('devFleetApi error shape', () => {
   })
 
   it('falls back to the raw text when the body is not JSON', async () => {
+    mockResponse('upstream refused the connection', 502)
+    const err = await failureOf(api.get('/fleet'))
+    expect(err.status).toBe(502)
+    expect(err.message).toBe('upstream refused the connection')
+  })
+
+  it('shows HTTP <status> for an edge HTML error page rather than its markup', async () => {
     mockResponse('<html>502 Bad Gateway</html>', 502)
     const err = await failureOf(api.get('/fleet'))
     expect(err.status).toBe(502)
-    expect(err.message).toContain('502 Bad Gateway')
+    expect(err.message).toBe('HTTP 502')
+    // The page itself stays readable for diagnostics.
+    expect(err.body).toContain('502 Bad Gateway')
   })
 
   it('falls back to the status when the body is empty', async () => {
@@ -54,5 +63,30 @@ describe('devFleetApi error shape', () => {
   it('returns the parsed body on success', async () => {
     mockResponse(JSON.stringify({ ok: true, run_id: 'run-1' }), 200)
     await expect(api.post('/sync', {})).resolves.toEqual({ ok: true, run_id: 'run-1' })
+  })
+})
+
+describe('devFleetApi namespaces', () => {
+  // The live-target cutover and the gateway restart are served by the GATEWAY
+  // process, not the sandboxed backend: the pointer they touch is masked from
+  // that backend and everything it spawns. `postGateway` must therefore aim at
+  // `/api/apps/dev-fleet/...` while everything else keeps the reverse-proxied
+  // `/apps/dev-fleet/api/...`. A regression here would put the request back on
+  // a route the backend no longer serves (404) -- or, worse, one it should not.
+  it('postGateway targets the in-gateway namespace', async () => {
+    const spy = vi.spyOn(globalThis, 'fetch').mockImplementation(() =>
+      Promise.resolve(new Response('{"ok":true}', { status: 200 })),
+    )
+    await api.postGateway('/make-live', { path: '/wt' })
+    await api.postGateway('/restart-gateway', {})
+    const urls = spy.mock.calls.map((c) => (typeof c[0] === 'string' ? c[0] : (c[0] as Request).url))
+    expect(urls).toEqual(['/api/apps/dev-fleet/make-live', '/api/apps/dev-fleet/restart-gateway'])
+    expect(api.GATEWAY_BASE).toBe('/api/apps/dev-fleet')
+  })
+
+  it('post keeps the reverse-proxied backend namespace', async () => {
+    const spy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response('{"ok":true}', { status: 200 }))
+    await api.post('/sync', {})
+    expect(spy.mock.calls[0][0]).toBe('/apps/dev-fleet/api/sync')
   })
 })

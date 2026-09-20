@@ -7,7 +7,7 @@ import { basenamePatchHeaders } from '../utils/diffUtils'
 import { PierrePatch } from '../pierre'
 import { PIERRE_COMPACT_HEADER_CSS, PIERRE_WRAP_NO_HSCROLL_CSS, PIERRE_SEPARATOR_BG_CSS } from '../pierre/config'
 import { HOVER_NONE_ACTIONS_ROW_CLS } from '../utils/touchActions'
-import { usePersistedBool } from '../hooks/usePersistedBool'
+import { useDiffSplit } from '../hooks/useDiffSplit'
 import { usePlainDiff } from '../hooks/usePlainDiff'
 
 import { i18nT } from '../i18n/t'
@@ -98,7 +98,7 @@ export default memo(function DiffBlock({ code, complete, onFileOpen, pathHint, s
   // Shares the app-wide `mc-diff-split` preference with the side panel and
   // markdown panel (#6024): the choice made on any diff surface sticks and
   // seeds the next block, instead of every fence resetting to unified.
-  const [sideBySide, setSideBySide] = usePersistedBool('mc-diff-split', true)
+  const [sideBySide, setSideBySide] = useDiffSplit()
   // Plain-diff preference (Settings → Display). PierrePatch honours it on its
   // own; this block reads it too because the controls below are injected into
   // PIERRE's file header, which the plain render does not draw — so without a
@@ -191,7 +191,7 @@ export default memo(function DiffBlock({ code, complete, onFileOpen, pathHint, s
     [sideBySide],
   )
 
-  const copy = () => { copyToClipboard(code); setCopied(true); setTimeout(() => setCopied(false), 1500) }
+  const copy = async () => { if (await copyToClipboard(code)) { setCopied(true); setTimeout(() => setCopied(false), 1500) } }
 
   // Patch-level controls, slotted into Pierre's header metadata area (light
   // DOM, so outer-tree styling and the group-hover reveal both apply).
@@ -252,7 +252,7 @@ export default memo(function DiffBlock({ code, complete, onFileOpen, pathHint, s
         {onFold && (
           <button
             type="button"
-            className="group/fold absolute left-0 top-0 w-8 h-8 z-0 flex items-center justify-center bg-transparent border-none cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/50 rounded-tl-xl"
+            className="group/fold absolute left-0 top-0 w-8 h-8 z-0 flex items-center justify-center bg-transparent border-none cursor-pointer focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-accent/50 rounded-tl-xl"
             data-diff-toggle
             onClick={onFold}
             aria-label={i18nT('pages.chat.toolCallLine.aria_hide_diff')}

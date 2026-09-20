@@ -312,25 +312,36 @@ safeguards:
   rewritten to relative form so the installed copy does not depend on your
   source directory.
 - **Build-input and VCS directories are excluded** at any depth: `node_modules`,
-  `.git`, `__pycache__`, `.venv`. Serve your UI from a committed `ui/dist/`
-  bundle; nothing needed at runtime may live under those names.
+  `.git`, `__pycache__`, `.venv`, and the gateway's own `.kirocrew-deps`
+  provisioning output (plus its transient staging/prior siblings). Serve your
+  UI from a committed `ui/dist/` bundle; nothing needed at runtime may live
+  under those names.
 
 `data/` is preserved across updates and, by default, across uninstall.
 
 ### Third-party executable code is off by default
 
 Code shipped inside the Kiro Crew package (a built-in app) is exempt, but every
-other app's **executable** surfaces refuse to run unless the operator sets
-`agent.apps_allow_third_party` to the JSON boolean `true` in `config.json`. That
-covers registry installs and their install scripts, `detectInstalled`, backend
-processes, in-gateway Python hooks, lifecycle scripts, and `openCommand`. Only
-the literal `true` admits: absence, a malformed value, and an unreadable config
-all deny, and the env is not consulted, so an app cannot widen the boundary from
-its own process.
+other app's **executable** surfaces refuse to run unless the operator turns
+third-party execution on in Settings → Security → Trusted apps, which sets
+`agent.apps_allow_third_party` to the JSON boolean `true`. That covers registry
+installs and their install scripts, `detectInstalled`, backend processes,
+in-gateway Python hooks, lifecycle scripts, and `openCommand`. Only the literal
+`true` admits: absence, a malformed value, and an unreadable config all deny, and
+the env is not consulted, so an app cannot widen the boundary from its own
+process.
+
+Point users at that surface rather than at `config.json`. Turning the setting off
+has to STOP the code it was admitting, and the dashboard endpoint behind Settings
+is what sequences that — it stops each app while trust still stands, so
+`on_shutdown` hooks can run, and it reports anything it could not stop. A file
+edit gets the same revocation, but only once the liveness watch notices, and an
+app's shutdown hook can no longer load by then. See
+`docs/architecture/app-platform-trust-model.md` for the full contract.
 
 Non-executable resources (agents, skills, MCP server declarations, cron
 definitions, UI bundles) are unaffected. If your app needs any executable
-surface, say so in your README: a user who has not flipped the setting will see
+surface, say so in your README: a user who has not turned the setting on will see
 `app_execution_denied` rather than a working install.
 
 Repository layout:
@@ -488,7 +499,9 @@ The store's Install button (`POST /api/apps/registry/install`, or the SSE varian
    app; 60s timeout) and run a detected build: `npm install` plus `npm run build`
    when `package.json` declares a build script, or `pip install .` /
    `pip install -r requirements.txt` for a Python source tree. A missing
-   toolchain is a logged skip, not a failure. **An official-catalog entry does
+   `npm` is a logged skip, and so is a gateway interpreter with no `pip`
+   module; when pip is present the step runs on the gateway's own interpreter
+   and a failed run fails the install. **An official-catalog entry does
    not clone a branch**: it fetches exactly the commit the published catalog
    pins and hard-fails on any mismatch, never reuses a pre-existing checkout
    (the old one is set aside and restored if the install fails), and clones

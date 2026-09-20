@@ -56,7 +56,7 @@ import urllib.parse
 from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Any
 
-from kiro_crew.constants import split_trailing_protocol_suffix
+from kiro_crew.constants import split_trailing_protocol_suffix, strip_control_comments
 from kiro_crew.discord.client import (
     DISCORD_MAX_FILE_BYTES,
     DISCORD_MAX_FILES_PER_MESSAGE,
@@ -174,8 +174,24 @@ _BUTTON_LABEL_CHARS = 80
 
 # kiro-cli's inline "[STEERING steer-<id>: …]" steer-ack marker (see the
 # Telegram renderer for the full rationale — Discord likewise has no parser).
-_STEER_MARKER_RE = re.compile(r"\[STEERING\b[^\]\r\n]*\]", re.IGNORECASE)
-_STEER_SUMMARY_RE = re.compile(r"\[STEERING\s+steer-[0-9a-f]+\s*:\s*([^\]\r\n]*)\]", re.IGNORECASE)
+#
+# The frame is recognised by its GRAMMAR, and that is where the summary is
+# allowed to contain newlines: ``messaging.driver._STEER_MARKER_RE`` reads the
+# same frame with ``re.DOTALL``, ``constants._STEERING_TAIL_PREFIX_RE`` closes
+# that grammar's prefix with ``re.DOTALL`` too, and the dashboard's own parser
+# (``website/src/app-sdk/protocol/steering.ts``) spells the summary
+# ``[\s\S]*?``. kiro-cli's rephrase is free to wrap, so a class that stopped at
+# the first line end left a real marker unrecognised. ``]`` is the terminator
+# this grammar actually has.
+#
+# Requiring ``steer-<id>`` rather than a bare ``[STEERING`` is the ruling
+# ``messaging.driver`` already applies: opening with the sentinel is not being a
+# marker, so prose that merely mentions it stays visible now that the class no
+# longer stops at a line end. The id class matches driver's, and is the SAME in
+# both patterns, because the summary is matched at the offset the marker pattern
+# chose -- a narrower id class there would silently drop the summary.
+_STEER_MARKER_RE = re.compile(r"\[STEERING\s+steer-[0-9a-f-]+(?:\s*:[^\]]*)?\]", re.IGNORECASE)
+_STEER_SUMMARY_RE = re.compile(r"\[STEERING\s+steer-[0-9a-f-]+\s*:\s*([^\]]*)\]", re.IGNORECASE)
 
 
 def _extract_options(text: str) -> tuple[str, list[str]]:
@@ -676,7 +692,12 @@ class DiscordRenderer(Renderer):
         Extracting once from the canonical buffer ensures only an actual model
         directive becomes controls; generated display text remains content.
         """
-        body, options = _extract_options("".join(self._buf))
+        body, options = _extract_options(strip_control_comments("".join(self._buf)))
+        # Trailing control-tag lines are protocol too, and a message that
+        # carries both puts one of them last -- so strip on both sides of the
+        # trailer. Complete tags only: the seal is the end of the stream, and a
+        # partial tail there is the assistant's own prose.
+        body = strip_control_comments(body)
         self._buf = [body]
         self._delivery_text = None
         return options
@@ -697,7 +718,7 @@ class DiscordRenderer(Renderer):
         # Protocol is recognized only in canonical output. A delivery transform
         # may create marker-shaped text, but that remains ordinary content.
         opts = self._take_canonical_options()
-        # This segment is terminal, so a trailing table can no longer grow.
+        # This segment is terminal, so a trailing table cannot grow.
         await self._convert_tables(final=True)
         await self._rotate_on_length()
         body_text, opts = apply_options_cap(self._segment_text(), opts, self.capabilities)
@@ -837,8 +858,13 @@ class DiscordRenderer(Renderer):
         visible = self._segment_text()
         canonical = _strip_steering("".join(self._buf))
         canonical_body, _ = _extract_options(canonical)
+        # Same rule for a control-tag line still arriving (``<!-- keep-vis``):
+        # hidden from the live frame like a partial ``[OPTIONS``, and only when
+        # the canonical source owns it.
+        canonical_body = strip_control_comments(canonical_body, hide_partial=True)
         if canonical_body != canonical:
             body, _ = _extract_options(visible)
+            body = strip_control_comments(body, hide_partial=True)
         else:
             body = visible
         if self._uploads_enabled() and self._segment_uploads_safe:
@@ -1082,7 +1108,7 @@ class DiscordRenderer(Renderer):
             return
         self._thinking_posted = True
         # Redact BEFORE the preview cut: trimming first can leave a fragment the
-        # credential matchers no longer recognise.
+        # credential matchers do not recognise.
         body = _redact_transformed(reasoning)
         if len(body) > _THINKING_PREVIEW_CHARS:
             body = body[:_THINKING_PREVIEW_CHARS].rstrip() + "…"
