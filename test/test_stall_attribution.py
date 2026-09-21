@@ -15,7 +15,15 @@ import time
 from pathlib import Path
 
 import pytest
-from stall_dump_helpers import CHAT_STACK, CRON_STACK, IDLE_WORKER, SLACK_STACK, write_dump
+from stall_dump_helpers import (
+    CHAT_STACK,
+    CRON_STACK,
+    DISPATCH_STACK,
+    IDLE_WORKER,
+    PROMPT_LOOP_STACK,
+    SLACK_STACK,
+    write_dump,
+)
 
 from kiro_crew import cron_inflight, stall_attribution
 from kiro_crew.dashboard import crash_dump_store
@@ -26,6 +34,12 @@ from kiro_crew.stall_attribution import (
     describe,
     parse_frames,
 )
+
+# One xdist worker for the whole module: every test here derives from ONE module-cached
+# scan of src/ (rglob + ast.parse, ~30s). Under `--dist loadgroup` an unmarked module is
+# spread across workers and each worker re-pays that scan -- measured at 5 workers x 40-75s
+# per full run for this file alone. Grouping keeps the cache single-copy per run.
+pytestmark = pytest.mark.xdist_group(name="tree_scan_test_stall_attribution")
 
 #: A ``def`` or ``async def`` at any indentation: the names the rule table may cite.
 _DEF_RE = re.compile(r"^\s*(?:async\s+)?def\s+(\w+)\s*\(", re.MULTILINE)
@@ -155,7 +169,7 @@ class TestSurface:
         frames = parse_frames(CRON_STACK)
         assert frames[0].func == "is_sensitive_bash_command"
         assert frames[0].line == 7969
-        assert frames[0].short == "security.py:7969 is_sensitive_bash_command"
+        assert frames[0].short == "__init__.py:7969 is_sensitive_bash_command"
         assert len(frames) == len(CRON_STACK)
 
     def test_cron_wins_over_the_slack_gateway_module_it_passes_through(self) -> None:
@@ -166,6 +180,28 @@ class TestSurface:
     def test_dashboard_chat_and_slack(self) -> None:
         assert classify_surface(parse_frames(CHAT_STACK)) == "dashboard chat"
         assert classify_surface(parse_frames(SLACK_STACK)) == "slack"
+
+    def test_session_event_dispatch_named_instead_of_unknown(self) -> None:
+        """The per-turn event drain is a named surface.
+
+        Its outer frames are ``dashboard/state.py``, which matches no rule of
+        its own, so the drain's own entry is the only thing that keeps a dump
+        wedged in this loop out of "unknown" -- where the doctor can say
+        nothing about it."""
+        assert classify_surface(parse_frames(DISPATCH_STACK)) == "event dispatch (read-loop drain)"
+
+    def test_both_read_loops_share_the_one_surface(self) -> None:
+        # Same defect class, two transports (shared runtime vs dedicated
+        # process). One label, so a dump is attributed whichever loop wedged.
+        assert classify_surface(parse_frames(PROMPT_LOOP_STACK)) == (
+            "event dispatch (read-loop drain)"
+        )
+
+    def test_an_entry_point_further_out_still_names_the_surface(self) -> None:
+        # The drain rule must not shadow a real surface: the walk is bottom-up,
+        # so a chat turn whose stack happens to pass through the drain is still
+        # attributed to the turn that started it.
+        assert classify_surface(parse_frames(DISPATCH_STACK[:1] + CHAT_STACK)) == "dashboard chat"
 
     def test_unknown_when_no_crew_frame(self) -> None:
         assert classify_surface(parse_frames(IDLE_WORKER)) == "unknown"
@@ -195,7 +231,10 @@ class TestSurface:
             for func in funcs:
                 assert func in defs, f"{label}: no function named {func!r} in kiro_crew"
         for gate in stall_attribution._GATE_FILES:
-            assert (pkg / gate.removeprefix("/kiro_crew/")).is_file(), gate
+            # ``exists`` rather than ``is_file``: a gate entry names a module file or
+            # a package directory whose submodules all count, the same shape the
+            # surface fragments above are checked with.
+            assert (pkg / gate.removeprefix("/kiro_crew/")).exists(), gate
 
 
 class TestAttribution:
@@ -308,7 +347,7 @@ class TestAttribution:
         lines = describe(a)
         assert (
             lines[0]
-            == "stuck in the tool permission gate (security.py:7969 is_sensitive_bash_command)"
+            == "stuck in the tool permission gate (__init__.py:7969 is_sensitive_bash_command)"
         )
         assert "was executing cron job 'twb-refresh' (caeb441a)" in lines[1]
         assert lines[2] == "recommended: kirocrew cron pause caeb441a"
@@ -398,7 +437,7 @@ class TestAttribution:
         now = time.time()
         hostile = "\x1b[2Kok\rALL CLEAR 刷新"
         stack = [
-            '  File "/opt/venv/lib/python3.12/site-packages/kiro_crew/security.py\x07", '
+            '  File "/opt/venv/lib/python3.12/site-packages/kiro_crew/security/__init__.py\x07", '
             "line 1 in is_sensitive_bash_command",
         ] + CRON_STACK
         dump = write_dump(tmp_path / "dumps", 4_000_030, stack, mtime=now)
@@ -406,7 +445,7 @@ class TestAttribution:
         text = "\n".join(describe(attribute_dump(dump, tmp_path)))
         assert "\x1b" not in text and "\r" not in text and "\x07" not in text
         assert "\\x1b[2Kok\\rALL CLEAR 刷新" in text
-        assert "security.py\\x07:1" in text
+        assert "__init__.py\\x07:1" in text
 
     def test_record_is_kept_within_what_its_reader_accepts(
         self, tmp_path: Path, dead_pids: set[int]

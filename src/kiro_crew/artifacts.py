@@ -51,6 +51,7 @@ from typing import List as _List
 from kiro_crew import hooks
 from kiro_crew.artifact_source import is_verifiable_root
 from kiro_crew.config.loader import KiroCrewConfig, config_dir
+from kiro_crew.constants import ARTIFACT_MAX_CONTENT_BYTES
 from kiro_crew.deploy.webapp_types import (  # noqa: F401 — re-export for API compatibility
     WebAppArchitecture,
     WebAppCost,
@@ -63,6 +64,7 @@ from kiro_crew.deploy.webapp_types import (  # noqa: F401 — re-export for API 
 from kiro_crew.metrics.events import ARTIFACTS_CREATED, emit_counter
 from kiro_crew.publish_provider import DEFAULT_PROVIDER
 from kiro_crew.security import is_sensitive_path
+from kiro_crew.slugs import slug_hash_fallback
 
 logger = logging.getLogger(__name__)
 
@@ -78,10 +80,11 @@ MAX_VERSIONS = 50
 #: HTML reports, CSVs) routinely exceed 1 MiB — at 1 MiB clone/pull would
 #: silently fail on exactly the shared-HTML artifacts bidirectional sync
 #: targets. 25 MiB is large enough to bring those down locally while still
-#: refusing truly unbounded content. Keep in lockstep with
-#: ``validation.ARTIFACT_CONTENT_MAX`` (the MCP tool-arg cap) so a save's limit
-#: doesn't depend on its entry path — guarded by a regression test.
-MAX_CONTENT_BYTES = 26_214_400  # 25 MiB
+#: refusing truly unbounded content. Owned by
+#: ``constants.ARTIFACT_MAX_CONTENT_BYTES`` (a leaf) so
+#: ``validation.ARTIFACT_CONTENT_MAX`` -- the MCP tool-arg cap -- reads the same
+#: name without importing this module; re-exported here for the store's callers.
+MAX_CONTENT_BYTES = ARTIFACT_MAX_CONTENT_BYTES
 
 #: Maximum length of human-readable name / description fields.
 MAX_NAME_LEN = 200
@@ -194,6 +197,16 @@ class ArtifactValidationError(ArtifactError):
     """Raised when a field fails validation (slug, tag, kind, content, etc.)."""
 
 
+class ArtifactStillPublishedError(ArtifactError):
+    """Raised by ``delete(refuse_if_published=True)`` when the artifact is published.
+
+    The artifact's publication record is the only handle able to withdraw a copy that
+    may still be served, so a caller destroying artifacts in bulk uses this to be told
+    "not this one" instead of silently erasing that handle. Distinct from the base
+    error so such a caller can separate "refused, and correctly" from a real failure.
+    """
+
+
 # ── Data model ────────────────────────────────────────────────────────────────
 
 
@@ -253,13 +266,27 @@ class ArtifactPublication:
     last_pushed_sha256: str = ""  # concurrency guard for the next version push
     last_synced_kirocrew_version: int = 0
     #: Wrapper envelope revision at the time of the last push — compared against
-    #: ``publish_sync.WRAPPER_REVISION`` to detect wrapper-only staleness (#3373).
+    #: ``publish_sync.WRAPPER_REVISION`` to detect wrapper-only staleness.
     wrapper_revision: int = 0
     # Maps str(kirocrew_version) -> remote_version_number.
     version_map: dict[str, int] = field(default_factory=dict)
     published_at: str = ""
     published_by: str = ""  # gateway owner alias (ownerAlias from the remote store)
     last_error: str = ""  # conflict / sync-failure surfaced to the UI
+    #: A non-error status line for a publish that SUCCEEDED but whose link is
+    #: not usable yet (e.g. CloudFront still rolling out the first deploy). This
+    #: is NOT an error — it must never be written to ``last_error``, which every
+    #: consumer reads as failure (renders the publish red and withholds the URL).
+    notice: str = ""
+    #: Machine-readable discriminator for :attr:`notice`, so the frontend can
+    #: select per-case copy instead of printing one fixed "still rolling out"
+    #: string for every notice. Exactly one of ``"rolling_out"`` /
+    #: ``"distribution_disabled"`` / ``"unknown"``, or ``""`` when there is no
+    #: notice. Always moves with :attr:`notice`: it is set from the publish
+    #: result's ``notice_code`` and cleared wherever ``notice`` is cleared.
+    #: Additive + defaulted, so a legacy meta.json with no ``notice_code`` loads
+    #: as empty (no migration).
+    notice_code: str = ""
     #: sha256 of the LIVE (CRDT) remote body as of the last sync (publish / push
     #: / pull / clone / overwrite). A live CRDT provider canonicalizes markdown on write, so
     #: drift is detected remote-vs-remote against this hash — snapshot_seq bumps
@@ -537,7 +564,8 @@ def _now_iso() -> str:
 def slugify(name: str) -> str:
     """Normalize a free-form name into a URL-safe slug.
 
-    Falls back to ``"artifact"`` if the input contains no slug-safe characters.
+    Falls back to ``artifact-<hash of the input>`` if the input contains no
+    slug-safe characters, so distinct non-ASCII names derive distinct slugs.
     Truncated to 80 characters.
     """
     if not isinstance(name, str):
@@ -549,8 +577,8 @@ def slugify(name: str) -> str:
     text = _SLUG_NORMALIZE_RE.sub("-", text)
     text = text.strip("-")
     if not text:
-        return "artifact"
-    return text[:80].rstrip("-") or "artifact"
+        return slug_hash_fallback(name, "artifact")
+    return text[:80].rstrip("-") or slug_hash_fallback(name, "artifact")
 
 
 def _validate_slug(slug: str) -> str:
@@ -686,9 +714,7 @@ def is_document_path(path: str) -> bool:
 # are lost -- and every consumer surfaces this as a soft warning, never a
 # rejection.
 _HARDCODED_COLOR_RE = re.compile(
-    r"[:=(\s\"']#(?:[0-9a-fA-F]{3,4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})\b"
-    r"|\brgba?\("
-    r"|\bhsla?\(",
+    r"[:=(\s\"']#(?:[0-9a-fA-F]{3,4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})\b" r"|\brgba?\(" r"|\bhsla?\(",
     re.IGNORECASE,
 )
 
@@ -822,7 +848,7 @@ def _strip_session_scope(key: str) -> str:
     """
     prefix = "dashboard:"
     if key.startswith(prefix):
-        return key[len(prefix):]
+        return key[len(prefix) :]
     from kiro_crew.history import _safe_key
     from kiro_crew.messaging.link import is_channel_session_key
 
@@ -1302,9 +1328,7 @@ class ArtifactStore:
         if not data:
             raise ArtifactValidationError("image bytes are empty")
         if len(data) > MAX_CONTENT_BYTES:
-            raise ArtifactValidationError(
-                f"image exceeds {MAX_CONTENT_BYTES} bytes ({len(data)})"
-            )
+            raise ArtifactValidationError(f"image exceeds {MAX_CONTENT_BYTES} bytes ({len(data)})")
         name = _validate_name(name)
         source = _validate_source(source)
         description = _validate_description(description)
@@ -1689,9 +1713,7 @@ class ArtifactStore:
             # worse than reading through one, so the same fd-pinned gate the
             # read side uses applies here: O_NOFOLLOW open first, then hardlink
             # / regular-file / real-path / sensitive checks on that descriptor.
-            if not hooks.safe_write_file_nolink(
-                str(p), content, within_root=str(containing)
-            ):
+            if not hooks.safe_write_file_nolink(str(p), content, within_root=str(containing)):
                 logger.warning(
                     "source_path %r refused by the descriptor-pinned write gate", source_path
                 )
@@ -2069,12 +2091,9 @@ class ArtifactStore:
         candidates = [art for art in self.list() if self._is_sweepable_auto_widget(art)]
         if len(candidates) <= keep:
             return 0
-        # ``list()`` sorts by ``updated_at`` alone, which is not a total order:
-        # two widgets registered in the same microsecond tie-break by directory
-        # scan order, making WHICH of them gets deleted nondeterministic. Re-sort
-        # on ``(updated_at, slug)`` so the kept/dropped boundary is stable and
-        # testable. Kept local to the sweep — ``list()``'s ordering is shared with
-        # the library UI and is not this change's to redefine.
+        # ``list()`` already sorts on ``(updated_at, slug)``, so the kept/dropped
+        # boundary is stable. Re-sorting here is belt-and-braces: this sweep DELETES,
+        # so it must not inherit an ordering assumption from a caller-supplied list.
         candidates.sort(key=lambda a: (a.updated_at, a.slug), reverse=True)
         # Newest-first, so everything past `keep` is the oldest tail.
         deleted = 0
@@ -2213,13 +2232,42 @@ class ArtifactStore:
         art.updated_at = _now_iso()
         self._write_meta(art)
 
-    def delete(self, slug: str) -> None:
-        """Permanently delete an artifact and all of its versions."""
+    def delete(self, slug: str, *, refuse_if_published: bool = False) -> None:
+        """Permanently delete an artifact and all of its versions.
+
+        ``refuse_if_published`` raises :class:`ArtifactStillPublishedError` instead of
+        deleting when the artifact holds a publication record. It defaults to False to
+        keep callers that never publish unchanged, but BOTH delete paths that can reach a
+        published artifact now pass it.
+
+        The flag only means anything to a caller that has already cleared the record for
+        the copy it withdrew. Once that is done, a record found here can only be a
+        publication that landed AFTER the withdrawal, so refusing protects a live copy
+        instead of rejecting an ordinary delete. Both callers are built that way: the
+        folder cascade clears per artifact in its withdrawal pass, and the single-artifact
+        handler clears immediately after its withdrawal is confirmed. A caller that
+        withdrew but did NOT clear would be refused on every published artifact, which is
+        why the flag is off by default rather than always on.
+
+        The check runs inside the same lock as the removal, so unlike a pre-pass it
+        cannot be overtaken by a publish landing after the decision and before the
+        delete -- which is the whole reason the flag is here rather than at the caller.
+        """
         slug = _validate_slug(slug)
         with self._lock:
             adir = self._artifact_dir(slug)
             if not adir.exists():
                 raise ArtifactNotFoundError(f"artifact not found: {slug}")
+            if refuse_if_published:
+                # Deliberately re-read under the lock rather than trusting anything the
+                # caller passed in. `_load_meta` does not take this lock (meta reads are
+                # unlocked by design), so this cannot deadlock.
+                if self._load_meta(slug).publication is not None:
+                    raise ArtifactStillPublishedError(
+                        f"artifact {slug} is still published; withdraw the published "
+                        "copy before deleting it, or its record -- the only handle able "
+                        "to take that copy down -- is lost with it"
+                    )
             self._rmtree(adir)
             logger.info("artifact deleted: slug=%s", slug)
         self._fire_change("delete", slug)
@@ -2374,7 +2422,14 @@ class ArtifactStore:
             if pinned is not None and bool(art.pinned) is not pinned:
                 continue
             results.append(art)
-        results.sort(key=lambda a: a.updated_at, reverse=True)
+        # ``updated_at`` alone is not a total order: it is microsecond ISO, so two
+        # artifacts written inside one microsecond carry the identical stamp, and a
+        # stable sort then leaves the tie to directory scan order -- "newest first"
+        # becomes whatever the filesystem enumerated first, which differs per
+        # platform. Windows CI failed ``test_artifacts_handlers`` on exactly that.
+        # ``slug`` makes the order total, and every caller (the library UI, the MCP
+        # list tool, the pruning sweep) gets the same answer on every host.
+        results.sort(key=lambda a: (a.updated_at, a.slug), reverse=True)
         return results
 
     def migrate_kinds(self, *, apply: bool = False) -> _List[dict[str, Any]]:
@@ -3423,6 +3478,8 @@ class ArtifactStore:
             published_at=str(raw_pub.get("published_at") or ""),
             published_by=str(raw_pub.get("published_by") or ""),
             last_error=str(raw_pub.get("last_error") or ""),
+            notice=str(raw_pub.get("notice") or ""),
+            notice_code=str(raw_pub.get("notice_code") or ""),
             last_synced_remote_hash=str(raw_pub.get("last_synced_remote_hash") or ""),
         )
 
@@ -3617,8 +3674,8 @@ class ArtifactFolderStore:
         #: over different JSON paths cannot alias each other's folder ids. In
         #: memory on purpose -- in-flight tasks die with the process, so the
         #: epoch has nothing to survive a restart for. Entries are dropped on
-        #: a confirmed folder delete. Ported from the chat-folder guard
-        #: ``_CHAT_FOLDER_ICON_EPOCHS`` (issue #7991).
+        #: a confirmed folder delete. Mirrors the chat-folder guard
+        #: ``_CHAT_FOLDER_ICON_EPOCHS``.
         self._icon_epochs: dict[str, int] = {}
         self._load()
 
@@ -3754,6 +3811,17 @@ class ArtifactFolderStore:
             return False
         with self._lock:
             return folder_id in self._by_id()
+
+    def subtree_ids(self, folder_id: str) -> set[str]:
+        """Public view of the subtree rooted at ``folder_id`` (inclusive).
+
+        Exists so a caller that must act on a cascade's artifacts BEFORE the cascade
+        runs -- withdrawing their published copies, which this store cannot do because
+        the withdrawal is async and lives a layer up -- can enumerate them without
+        reaching into a private method.
+        """
+        with self._lock:
+            return self._subtree_ids(folder_id)
 
     def create(self, name: str, parent_id: str = "", color: str = "") -> dict[str, Any]:
         """Create a folder under ``parent_id`` (``""`` = root)."""
@@ -4045,26 +4113,54 @@ class ArtifactFolderStore:
         # Phase 2: artifacts. ``affected_ids`` is the subtree for cascade, or
         # just the single folder for the safe path.
         #
-        # Race window (accepted): Phase 2 runs OUTSIDE the folder lock (the
-        # artifact store has its own independent lock, and holding both would
-        # invite ordering deadlocks). Between Phase 1 removing the folder and
-        # this scan re-parenting/deleting its artifacts, a concurrent
-        # ``ArtifactStore.set_folder()`` could file an artifact into the
-        # just-deleted folder id. Such an artifact simply ends up with a
-        # dangling ``folder_id``, which every reader already tolerates by
+        # Race window: Phase 2 runs OUTSIDE the folder lock (the artifact store
+        # has its own independent lock, and holding both would invite ordering
+        # deadlocks). Between Phase 1 removing the folder and this scan, a
+        # concurrent ``ArtifactStore.set_folder()`` can file an artifact into
+        # the just-deleted folder id.
+        #
+        # On the RE-PARENT path that stays harmless: such an artifact ends up
+        # with a dangling ``folder_id``, which every reader already tolerates by
         # degrading it to Unfiled (see ``list(folder=)`` and the tree view's
-        # dangling-id handling). Acceptable for a single-user local tool; not
-        # worth cross-lock coordination.
+        # dangling-id handling).
+        #
+        # On the CASCADE path it is NOT harmless, because the consequence is
+        # destruction rather than a stale field. The caller withdraws every
+        # published copy in the subtree before calling here and clears each
+        # record it withdrew, so an artifact still holding a publication at this
+        # point is exactly one that arrived after that preflight -- its copy was
+        # never withdrawn, and destroying it would erase the only handle able to
+        # take that copy down.
+        #
+        # The refusal is asked of `delete` itself rather than checked here: a
+        # check in this loop is a check-then-act over a snapshot, so a publish
+        # landing between it and the delete would still be destroyed. Inside
+        # `delete` the check shares the lock with the removal, which is what
+        # makes it hold. Phase 1 has already committed the folder-tree change and
+        # cannot be rolled back here, so a kept artifact survives with a dangling
+        # ``folder_id`` and degrades to Unfiled -- the outcome this path already
+        # tolerates, and a recoverable one: the owner restores access to the
+        # destination, withdraws the copy, and deletes it deliberately. Note that
+        # unpublishing is NOT a second route out of this state -- it refuses on an
+        # unreachable destination for the same reason this delete did.
         deleted_slugs: _List[str] = []
         reparented_slugs: _List[str] = []
+        kept_published_slugs: _List[str] = []
         for art in artifact_store.list():
             fid = getattr(art, "folder_id", "") or ""
             if fid not in affected_ids:
                 continue
             if delete_contents:
                 try:
-                    artifact_store.delete(art.slug)
+                    artifact_store.delete(art.slug, refuse_if_published=True)
                     deleted_slugs.append(art.slug)
+                except ArtifactStillPublishedError:
+                    kept_published_slugs.append(art.slug)
+                    logger.warning(
+                        "cascade kept %s: still published, so destroying it would "
+                        "strand a public copy with no withdrawal handle",
+                        art.slug,
+                    )
                 except ArtifactError as exc:  # pragma: no cover — best-effort
                     logger.warning("cascade delete failed for %s: %s", art.slug, exc)
             else:
@@ -4080,6 +4176,7 @@ class ArtifactFolderStore:
         return {
             "deleted_folder_ids": sorted(affected_ids),
             "deleted_artifact_slugs": deleted_slugs,
+            "kept_published_artifact_slugs": kept_published_slugs,
             "reparented_artifact_slugs": reparented_slugs,
             "reparented_to": parent,
             "delete_contents": delete_contents,

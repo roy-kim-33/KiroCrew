@@ -4,10 +4,14 @@ import { shallowEqual } from 'react-redux'
 import { useAppSelector, useAppDispatch } from '../../store'
 import { clearFocusToolCallId, mcpAppKey } from '../../store/chatSlice'
 import { useSimplifiedToolNames } from '../../hooks/useSimplifiedToolNames'
+import ToolRiskBadge from './ToolRiskBadge'
+import { readToolRiskRecord, toolRiskFieldOf } from './toolRiskRecord'
 import { useLanguage } from '../../i18n/LanguageProvider'
-import { DERIVE_LABEL_THRESHOLD_CHARS, deriveShellSummary, pickToolLabel } from '../../utils/toolLabel'
-import { LoaderCircle, CircleSlash, CircleAlert, CircleDot, Lock, PanelRight } from 'lucide-react'
+import { deriveShellSummary, pickToolLabel } from '../../utils/toolLabel'
+import { deriveToolCallTitle, relDisplayPath } from '../../utils/toolCallTitle'
+import { LoaderCircle, CircleSlash, CircleAlert, CircleDot, Lock, PanelRight, ChevronDown } from 'lucide-react'
 import { PanelRightSolid } from '../../components/icons/panels'
+import ErrorNotice from '../../components/ErrorNotice'
 import { motion, AnimatePresence, useReducedMotion } from 'framer-motion'
 import type { ChatMessage } from '../../types'
 import { ToolDetails } from './ToolDetails'
@@ -80,6 +84,21 @@ export function resetOpenedDiffCards(): void {
 const SLIDE_DURATION = 0.22
 const SLIDE_EASE = [0.4, 0, 0.2, 1] as const
 
+// ── Shell elapsed line threshold ──
+// The "Running · Ns" line under a shell pill exists so a reader can tell that a
+// LONG command is still going. Most shell calls (a grep, a git show) return well
+// under a second, and a line under every one of them is noise: the elapsed clock
+// only ticks once a second, so a call that finishes before its first tick reads
+// a meaningless "0s". The line therefore waits until the command has run this
+// many seconds before it appears, and is removed the moment the command ends.
+//
+// This is also what keeps the transcript steady above a bottom-pinned reader: a
+// status line that appears and then collapses moves everything above it by its
+// own height, once per tool boundary. Short calls now add no line and remove
+// none, so that step only ever happens at the end of a command that genuinely
+// ran long — not at every tool boundary of a working turn.
+const SHELL_ACTIVITY_MIN_SECS = 10
+
 // ── Collapsed label clamp ──
 // A tool title is whatever the transport hands us, and for a shell call that is
 // the WHOLE command — an inline heredoc or a chained one-liner is routinely
@@ -146,10 +165,18 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
    *  the ease. Defaults to false so hosts without a heat signal keep the
    *  animations unconditionally. */
   transcriptHot?: boolean }) {
-  useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
+  // memo() bails out of the provider-level repaint; subscribe directly. The
+  // generation is also a dependency of the derived-title memo below, whose
+  // `i18nT` output would otherwise stay in the previous locale after a switch.
+  const langGen = useLanguageGeneration()
   const dispatch = useAppDispatch()
   const label = message.content.replace(/^🔧\s*/, '')
   const toolCallId = message.meta?.tool_call_id as string | undefined
+  // Jev's risk annotation for this call, validated at the read. The raw field is
+  // returned off the message unchanged (`toolRiskFieldOf`), so the memo's
+  // dependency is stable across renders and this row pays one validation per
+  // record rather than one per repaint. `null` on every ordinary row.
+  const riskRecord = useMemo(() => readToolRiskRecord(toolRiskFieldOf(message)), [message])
   const simplified = useSimplifiedToolNames()
   const uiLang = useLanguage().resolved
 
@@ -166,7 +193,7 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
   // expansion as well as completion status for the icon. All transcript scans go
   // through the shared per-slot index (see toolRowIndex.ts): built once per
   // (messages, toolLog) identity change, O(1) per row per dispatch.
-  const { effectiveId, isDone: logIsDone, isRejected, isAutoDenied, autoDenyReason, purpose, input, output, auto, ts, executionStartedAt, hasEntry, isShell, toolKind, toolName, fromLog } = useAppSelector(s => {
+  const { effectiveId, isDone: logIsDone, isRejected, isAutoDenied, autoDenyReason, purpose, input, output, auto, ts, executionStartedAt, hasEntry, isShell, toolKind, toolName, trustedToolName, mcpServer, fromLog } = useAppSelector(s => {
     // Slot-aware: for a non-active slot (split-view pane) read that slot's
     // per-slot tool log / messages / running state; `slot` undefined or equal to
     // the active slot → active-slot globals.
@@ -228,6 +255,10 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
         // the label is simplified/localized for humans, so gating behaviour on
         // it would break under `useSimplifiedToolNames` or a translated UI.
         toolName: e.text || '',
+        // Trusted identity from the transport's `_meta.kiro`, when it sent one;
+        // '' otherwise, and the title derivation falls back to parsing the title.
+        trustedToolName: e.tool_name || '',
+        mcpServer: e.mcp_server || '',
         fromLog: true,
       }
     }
@@ -262,6 +293,10 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
       // Historical rows have no log entry; the message content is the only
       // carrier. Harmless either way — a replayed wait is never in flight.
       toolName: message.content.replace(/^🔧\s*/, ''),
+      // Persisted by _tool_meta (chat_runner.py) since the title-derivation
+      // change; rows written before it read '' and derive from the title.
+      trustedToolName: (message.meta?.tool_name as string | undefined) || '',
+      mcpServer: (message.meta?.mcp_server as string | undefined) || '',
       // No live tool-log entry backs this row. `isDone` above is a REPLAY
       // default, not an observation, so anything that needs real liveness must
       // consult server state instead of trusting it (see the wait countdown).
@@ -289,20 +324,10 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
   // Shell commands do not expose a reliable total, so their live indicator is
   // deliberately indeterminate. The existing tool output remains the source
   // of truth; this status only makes an in-flight command visible while its
-  // details panel is collapsed after approval.
-  //
-  // STICKY within the turn: the row APPEARS when the tool starts but does
-  // not collapse when it finishes -- it freezes into the elapsed total and
-  // is reclaimed with the whole turn's collapse. Collapsing per-completion
-  // pulsed ~26px above a bottom-pinned reader at every tool boundary of a
-  // working turn (the tool-rhythm 'bounces in place while I just watch'
-  // report: text streaming was stable, tool execution bounced), because
-  // the closing height ease moves the pinned viewport down and back up
-  // once per tool. Within-turn transcript height is now monotonic here.
-  const shellActivityShownRef = useRef(false)
+  // details panel is collapsed after approval. Whether the line is actually
+  // SHOWN is decided below, once the elapsed clock is known — see
+  // SHELL_ACTIVITY_MIN_SECS.
   const liveShellActivity = isShell && turnRunning && !hasPendingPerm
-  if (liveShellActivity) shellActivityShownRef.current = true
-  const showShellActivity = liveShellActivity || (isShell && shellActivityShownRef.current)
 
   // ── `wait` countdown ──
   // Matched to this pill by tool NAME, not by id: the wait_id is minted inside
@@ -366,6 +391,9 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
   // is not overwritten by the pre-approval ts.
   const approvalResolvedRef = useRef(false)
   const [endingWait, setEndingWait] = useState(false)
+  // The refused End-wait press. Previously the button only rolled back to its
+  // idle label, so a transport failure looked like a press that did nothing.
+  const [endWaitError, setEndWaitError] = useState<string | null>(null)
 
   // Re-arm the button for a NEW sleep. Left latched otherwise: after a
   // successful request the row lives on for up to one poll interval, and a
@@ -376,16 +404,20 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
     if (id !== endedWaitIdRef.current) {
       endedWaitIdRef.current = id
       setEndingWait(false)
+      setEndWaitError(null)
     }
   }, [waitState?.wait_id])
 
   const endWaitNow = useCallback(() => {
     if (!waitSlotKey || !waitState || endingWait) return
     setEndingWait(true)
+    setEndWaitError(null)
     void api.endWait(waitSlotKey, waitState.wait_id).catch(() => {
-      // Roll back so a transport failure is retryable. A 409 also lands here,
-      // and re-enabling is still right: the countdown it referred to is gone.
+      // Roll back so a transport failure is retryable, and say so. A 409 also
+      // lands here, and re-enabling is still right: the countdown it referred
+      // to is gone — the row leaves on the next poll and takes the notice.
       setEndingWait(false)
+      setEndWaitError(i18nT('pages.chat.toolCallLine.end_wait_failed'))
     })
   }, [waitSlotKey, waitState, endingWait])
 
@@ -432,6 +464,13 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
     [[Math.floor(elapsedSeconds / 60), 'minute'], [elapsedSeconds % 60, 'second']],
     { dropZero: true },
   )
+  // Live only, and only once the command has run long enough to be worth a
+  // line. The clock is anchored to the tool's own start (execution_started_at,
+  // then the log ts), so a row that mounts mid-command — the virtualizer
+  // re-mounting a scrolled-back row, a reload — shows the line at once when
+  // the command is already past the threshold rather than waiting another
+  // ten ticks.
+  const showShellActivity = liveShellActivity && elapsedSeconds >= SHELL_ACTIVITY_MIN_SECS
 
   // Remaining time on the sleeping wait. Ceil so the label reads "1s" for the
   // final fractional second instead of flashing "0s" while the tool is still
@@ -564,7 +603,6 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
   const [cardFolded, setCardFolded] = useState(
     () => !(toolCallId && openedDiffCards.has(toolCallId)),
   )
-  const diffTogglePendingFocus = useRef(false)
   const toggleCardFolded = useCallback(() => {
     setCardFolded(prev => {
       const next = !prev
@@ -574,32 +612,24 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
       }
       return next
     })
-    // The two halves of the toggle unmount each other, so the activated
-    // control disappears and focus would fall to <body>. Hand focus to the
-    // counterpart once it mounts — both carry data-diff-toggle.
-    diffTogglePendingFocus.current = true
   }, [toolCallId])
-  useEffect(() => {
-    if (!diffTogglePendingFocus.current) return
-    diffTogglePendingFocus.current = false
-    const el = containerRef.current?.querySelector<HTMLElement>('[data-diff-toggle]')
-    el?.focus()
-  }, [cardFolded])
   const cardStats = useMemo(
     () => (diffView?.mode === 'card' ? countDiffStats(diffView.code) : null),
     [diffView],
   )
   const showCard = diffView?.mode === 'card' && !cardFolded
-  // The chip is the one-line handle for COMPACT states only: the folded
-  // card's re-open handle, and the summary / pathname rows. An OPEN card
-  // shows no chip — DiffBlock's own header row already carries the file
-  // icon, basename and ±counts, and its fold control lives there (onFold),
-  // so the facts never render twice.
+  // The chip is the one-line handle for every diff presentation and it STAYS
+  // MOUNTED while the card is open: the same chip that opened the patch is
+  // the one that closes it, so the reader never has to find a second control
+  // (the card's own header gets no fold handle — one toggle, one place — and
+  // the chip's `aria-expanded` names the state). An earlier design swapped the
+  // chip for a chevron in the card header; that chevron sat under Pierre's
+  // header in paint order and a card, once opened, could not be closed. The
+  // filename and ±counts do render twice while open — the price of a control
+  // that does not move out from under the pointer.
   const chipView: { path: string | null; added: number; removed: number; truncated: boolean; opensCard: boolean } | null =
     diffView?.mode === 'card'
-      ? (cardFolded
-        ? { path: extractDiffHeaderPath(diffView.code)?.path ?? filePath, added: cardStats?.added ?? 0, removed: cardStats?.removed ?? 0, truncated: false, opensCard: true }
-        : null)
+      ? { path: extractDiffHeaderPath(diffView.code)?.path ?? filePath, added: cardStats?.added ?? 0, removed: cardStats?.removed ?? 0, truncated: false, opensCard: true }
       : diffView?.mode === 'summary'
         ? { ...diffView, opensCard: false }
         : null
@@ -608,6 +638,13 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
   // fetch for server state). Gives request dedup across pills touching the same
   // file and stale-while-revalidate caching so re-renders don't re-probe —
   // replacing the manual AbortController + onFileOpenRef + setFileExists dance.
+  //
+  // The query's error is deliberately NOT read: this gates an affordance (the
+  // Open-file pill), it is not something the person asked for. A refused probe
+  // collapses to `fileExists = false` on purpose — the pill is simply not
+  // offered, which is the same outcome as the file not being there, and a
+  // failed-probe notice on every tool row would be noise about a link nobody
+  // clicked. Opening the file itself reports its own failure when pressed.
   const { data: fileExists = false } = useQuery({
     queryKey: ['tool-pill-file-exists', filePath],
     queryFn: async ({ signal }) => {
@@ -649,14 +686,50 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
     .filter(Boolean)
     .join('\n')
 
+  // The language-neutral, argument-derived title for this call — `List files
+  // in src` for `ls -la src`, `Session send: <target>` for an MCP call, kiro-cli's
+  // own `Reading a.rs:1-20` when nothing better can be said. Live and replayed
+  // rows share this one function, so a replayed shell row whose title degraded
+  // to the bare `shell` is recomputed from its persisted `input.command`. The
+  // verbatim command / incoming title survives as `rawTitle` for the tooltip
+  // and the expanded header's tool chip.
+  // The slot's project directory, so native-tool titles show paths relative
+  // to it (`Read src/a.ts`, not the absolute path). Reads THIS row's slot —
+  // a split-view pane must not borrow the active session's tree.
+  const projectDir = useAppSelector(s => {
+    const key = slot ?? s.chat.activeSlot
+    return key ? (s.dashboard.slots.find(sl => sl.key === key)?.project || undefined) : undefined
+  })
+
+  const derived = useMemo(() => {
+    void langGen // the localized title is a function of the catalog generation too
+    return deriveToolCallTitle({
+      title: label,
+      kind: toolKind,
+      rawInput: input,
+      isShell,
+      toolName: trustedToolName,
+      mcpServer,
+      cwd: projectDir,
+    })
+  }, [label, toolKind, input, isShell, trustedToolName, mcpServer, projectDir, langGen])
+
   // Purpose is the agent's prose label (simplified mode). Guard it against the
   // active UI language so a purpose written in another language (e.g. a Chinese
   // label persisted before the user switched to English) falls back to the
-  // language-neutral raw tool label instead of showing foreign-script text.
+  // language-neutral derived title instead of showing foreign-script text.
+  //
+  // With `simplifiedToolNames` OFF the user opted into the verbatim command on
+  // the row, so the raw title stays the label whenever it says anything; the
+  // derived title steps in only where the transport's title was already useless
+  // (the replayed `shell` stub, KAS's fixed `Run Command`, an empty title).
+  // That rule lives in `pickToolLabel`, shared with the approval bar and the
+  // session status line, so every surface agrees by construction.
   const toolLabel = pickToolLabel({
     simplified,
     purpose: purpose || (message.meta?.purpose as string | undefined),
     rawLabel: label,
+    derivedTitle: derived.title,
     uiLang,
   })
 
@@ -665,30 +738,48 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
   // purpose mode where the label is prose and no path is otherwise shown. The
   // full path stays in the button tooltip and the expanded details.
   const basename = useMemo(() => (filePath ? (filePath.split('/').pop() || filePath) : null), [filePath])
-  // When the chip is shown, strip the now-redundant raw path out of the visible
-  // label. Raw mode `Read /a/b/c.ts` → `Read`; purpose-mode prose contains no
-  // path substring → unchanged. Falls back to the full label if stripping
-  // would leave it empty (label was nothing but the path).
+  // When the chip is shown, strip the now-redundant path out of the visible
+  // label. A derived `Read src/a.ts` → `Read` (the title carries the display
+  // path, the chip the basename); purpose-mode prose contains no path substring
+  // → unchanged. Falls back to the full label if stripping would leave it empty
+  // (label was nothing but the path).
   const displayLabel = useMemo(() => {
     if (!showFileOpen || !filePath) return toolLabel
-    const stripped = toolLabel.split(filePath).join('').replace(/\s+/g, ' ').trim()
-    return stripped || toolLabel
-  }, [showFileOpen, filePath, toolLabel])
-  // A purpose-less shell call's label is the raw command. The collapsed row's
-  // `truncate` (LABEL_COLLAPSED_CLASS) already bounds how much of it is
-  // visible, but a clipped wall of quoting says nothing — in simplified mode a
-  // flood-length shell label is substituted with a derived command digest
-  // (binaries + redirect target), so the visible line is meaningful. Short
-  // labels pass through untouched, and raw mode always shows the exact command.
-  const pillLabelText = useMemo(() => {
-    if (!simplified) return displayLabel
-    if (displayLabel.length <= DERIVE_LABEL_THRESHOLD_CHARS && !displayLabel.includes('\n')) {
-      return displayLabel
+    for (const candidate of [filePath, relDisplayPath(filePath, projectDir)]) {
+      if (candidate && toolLabel.includes(candidate)) {
+        const stripped = toolLabel.split(candidate).join('').replace(/\s+/g, ' ').trim()
+        if (stripped) return stripped
+      }
     }
-    return deriveShellSummary(displayLabel, { bareCommand: isShell }) ?? displayLabel
-  }, [displayLabel, simplified, isShell])
-  // Hover reveals the verbatim command whenever the pill shows a substitute.
-  const pillLabelTitle = pillLabelText === displayLabel ? undefined : displayLabel
+    return toolLabel
+  }, [showFileOpen, filePath, toolLabel, projectDir])
+  // Simplified mode, shell command the classifier refused (`$VAR`, redirects,
+  // heredocs, loops) and no purpose to show. The command digest — the binaries
+  // it runs plus the first redirect target (`ls, grep → out.txt`) — says more
+  // than the raw prefix cut at 80 chars when it names TWO OR MORE things; a
+  // lone binary (`wc` for `for f in …; do wc -l "$f"; done`) says less than the
+  // command itself, so that case keeps the raw first line. Raw mode never
+  // digests: that mode asked for the exact command.
+  const pillLabelText = useMemo(() => {
+    // `derived.kind` is the shell signal here: a historical row has no
+    // `is_shell` on its log entry, but the derivation read the same title.
+    if (!simplified || derived.derived || derived.kind !== 'execute') return displayLabel
+    if (displayLabel !== derived.title) return displayLabel // the purpose is showing
+    const digest = deriveShellSummary(derived.rawTitle, { bareCommand: true })
+    return digest && (digest.includes(', ') || digest.includes(' → ')) ? digest : displayLabel
+  }, [displayLabel, simplified, derived])
+  // Hover reveals the verbatim command / incoming title whenever the pill shows
+  // a substitute for it — a derived title, a digest, or the purpose.
+  const pillLabelTitle = pillLabelText === derived.rawTitle ? undefined : (derived.rawTitle || undefined)
+  // A shell row the classifier left verbatim (`$VAR`, redirects, loops) sits
+  // among prose titles; setting it in the code face says "this is the exact
+  // command" instead of leaving the reader to guess why one row reads
+  // differently. `font-mono` pins Tailwind's `var(--mono)` on purpose here —
+  // the label IS code — where the prose labels around it must not (see the
+  // note on the pill wrapper below).
+  const pillLabelIsVerbatimCommand =
+    derived.kind === 'execute' && !derived.derived && pillLabelText === derived.title && Boolean(derived.rawTitle)
+  const pillLabelFaceClass = pillLabelIsVerbatimCommand ? 'font-mono text-[0.92em]' : ''
   // Both running and pending-approval pills shimmer — the highlight color
   // tracks the status so pending shimmers warn-yellow (matching the approval
   // bar) and running shimmers accent.
@@ -842,7 +933,7 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
           writes. The file-path chip below keeps mono, where it is earned. */}
       <button
         ref={pillButtonRef}
-        className={`inline-flex ${ROW_PILL_BUTTON_CLASS} focus-visible:ring-2 focus-visible:ring-accent/50 focus-visible:outline-none ${hasPendingPerm ? 'cursor-default' : 'cursor-pointer hover:brightness-110'}`}
+        className={`inline-flex ${ROW_PILL_BUTTON_CLASS} focus-visible:ring-2 focus-visible:ring-accent/50 focus-visible:outline-hidden ${hasPendingPerm ? 'cursor-default' : 'cursor-pointer hover:brightness-110'}`}
         aria-expanded={effectivelyExpanded}
         title={pillLabelTitle}
         aria-label={hasPendingPerm
@@ -860,7 +951,7 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
         {isShimmering ? (
           <motion.span
             data-testid="tool-pill-label"
-            className={`${labelWrapClass} min-w-0 leading-5 bg-clip-text`}
+            className={`${labelWrapClass} ${pillLabelFaceClass} min-w-0 leading-5 bg-clip-text`}
             style={{
               backgroundImage: `linear-gradient(90deg, ${shimmerBase} 0%, ${shimmerBase} 40%, ${shimmerHighlight} 50%, ${shimmerBase} 60%, ${shimmerBase} 100%)`,
               backgroundSize: '300% 100%',
@@ -871,7 +962,7 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
             transition={{ duration: 2.4, repeat: Infinity, ease: 'linear' }}
           >{pillLabelText}</motion.span>
         ) : (
-          <span data-testid="tool-pill-label" className={`${labelWrapClass} min-w-0 leading-5 text-muted hover:text-text transition-colors`}>{pillLabelText}</span>
+          <span data-testid="tool-pill-label" className={`${labelWrapClass} ${pillLabelFaceClass} min-w-0 leading-5 text-muted hover:text-text transition-colors`}>{pillLabelText}</span>
         )}
       </button>
 
@@ -893,7 +984,7 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
           the wrapper's 4px before. */}
       {showFileOpen && filePath && (
         <button
-          className="pi-morph shrink-0 inline-flex items-center gap-1 ms-2 px-1.5 py-0.5 rounded font-mono text-[12px] leading-5 bg-bg-hover text-muted hover:text-accent hover:bg-accent/10 cursor-pointer transition-colors focus-visible:ring-2 focus-visible:ring-accent/50 focus-visible:outline-none"
+          className="pi-morph shrink-0 inline-flex items-center gap-1 ms-2 px-1.5 py-0.5 rounded font-mono text-[12px] leading-5 bg-bg-hover text-muted hover:text-accent hover:bg-accent/10 cursor-pointer transition-colors focus-visible:ring-2 focus-visible:ring-accent/50 focus-visible:outline-hidden"
           style={{ marginTop: '1px' }}
           onClick={(e) => { e.stopPropagation(); onFileOpen!(filePath) }}
           title={i18nT('pages.chat.toolCallLine.open_in_side_panel', { path: filePath })}
@@ -906,7 +997,10 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
       </div>
 
       {/* Diff chip: the one-line handle for every diff presentation. For a
-          promoted card it folds/unfolds the card below; for a summary /
+          promoted card it folds/unfolds the card below and stays put while the
+          card is open (open look: filled background, full-strength text, and
+          the trailing chevron turned up — colour alone did not read as a
+          state); for a summary /
           pathname row it expands the details panel. Full path in the native
           tooltip — the visible basename alone cannot tell two same-named
           files apart. Truncated transports prefix counts with ≥ (lower
@@ -917,7 +1011,7 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
       {chipView && (
         <button
           type="button"
-          className="mt-1 ml-3 inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md border border-border bg-bg-elevated text-[12px] leading-5 text-muted hover:text-text hover:border-border-strong cursor-pointer transition-colors focus-visible:ring-2 focus-visible:ring-accent/50 focus-visible:outline-none"
+          className={`mt-1 ml-3 inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md border text-[12px] leading-5 hover:text-text hover:border-border-strong cursor-pointer transition-colors focus-visible:ring-2 focus-visible:ring-accent/50 focus-visible:outline-hidden ${chipView.opensCard && showCard ? 'text-text border-border-strong bg-bg-hover' : 'text-muted border-border bg-bg-elevated'}`}
           title={chipView.path ?? undefined}
           aria-expanded={chipView.opensCard ? showCard : effectivelyExpanded}
           data-diff-toggle={chipView.opensCard ? true : undefined}
@@ -938,17 +1032,24 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
           {chipView.truncated && (
             <span className="text-warn">· {i18nT('pages.chat.toolCallLine.diff_truncated')}</span>
           )}
+          {/* Card chips only: the disclosure cue. Down = a card can open below;
+              up = it is open and this same chip closes it. The summary chip
+              expands the details panel, whose own pill already carries that
+              cue. */}
+          {chipView.opensCard && (
+            <ChevronDown size={12} aria-hidden className={`shrink-0 transition-transform ${showCard ? 'rotate-180' : ''}`} />
+          )}
         </button>
       )}
-      {/* Diff card: the full inline diff, foldable via the chip above. A
-          sibling of the pill (not inside the expanded panel) — the primary
-          display of the change; the details panel keeps the raw copy. The
-          wrapper is a pointer-only event fence (role="presentation"): clicks
-          inside the card must never toggle a surrounding TurnBlock /
-          collapsed-group wrapper. */}
+      {/* Diff card: the full inline diff, folded by the chip above — no
+          `onFold`, the chip is the card's only toggle. A sibling of the pill
+          (not inside the expanded panel) — the primary display of the change;
+          the details panel keeps the raw copy. The wrapper is a pointer-only
+          event fence (role="presentation"): clicks inside the card must never
+          toggle a surrounding TurnBlock / collapsed-group wrapper. */}
       {showCard && diffView?.mode === 'card' && (
         <div className="mt-1.5" role="presentation" onClick={e => e.stopPropagation()}>
-          <DiffBlock code={diffView.code} complete onFileOpen={onFileOpen} onFold={toggleCardFolded} />
+          <DiffBlock code={diffView.code} complete onFileOpen={onFileOpen} />
         </div>
       )}
 
@@ -960,7 +1061,7 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
         <div className="ml-5 mt-1 text-[12px] leading-5 text-muted" data-testid="shell-activity">
           <span className="sr-only" aria-live="polite">{i18nT('pages.chat.activityViewer.running')}</span>
           <span aria-hidden="true" className="tabular-nums font-mono">
-            {liveShellActivity ? `${i18nT('pages.chat.activityViewer.running')} · ${elapsedLabel}` : elapsedLabel}
+            {i18nT('pages.chat.activityViewer.running')} · {elapsedLabel}
           </span>
         </div>
       </StatusRow>
@@ -994,8 +1095,20 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
               ? i18nT('pages.chat.toolCallLine.wait_ending')
               : i18nT('pages.chat.toolCallLine.wait_end_now')}
           </button>
+          {/* askAgent on: a transcript row holds no draft of its own, the
+              composer draft is persisted per slot, and an in-chat hand-off
+              opens a fresh slot rather than navigating away. */}
+          <ErrorNotice variant="inline" message={endWaitError} askAgent testId="wait-end-error" />
         </div>
       </StatusRow>
+
+      {/* Jev's risk annotation for this call, when the seam answered for it. A
+          SIBLING of the pill, drawn above the details panel: it describes the
+          call rather than its output, and it must be readable without expanding
+          anything. Absent on every ordinary row — `readToolRiskRecord` returns
+          null for a missing, unreadable or `safe` record — so a transcript
+          without the seam is byte-identical. */}
+      {riskRecord && <ToolRiskBadge record={riskRecord} />}
 
       <AnimatePresence initial={false}>
         {effectivelyExpanded && (
@@ -1007,7 +1120,7 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
             transition={{ duration: 0.35, ease: [0.4, 0.0, 0.2, 1] /* Material standard */ }}
             style={{ overflow: 'hidden' }}
           >
-            <ToolDetails purpose={purpose} pillLabel={toolLabel} toolName={label} input={input} output={isAutoDenied ? denyOutput : output} auto={auto} pending={hasPendingPerm} ts={ts} hasEntry={hasEntry} fmtTime={fmtTime} barColor={barStyle} layoutId={`tool-detail-${effectiveId || toolCallId || fallbackId}`} flush />
+            <ToolDetails purpose={purpose} pillLabel={toolLabel} toolName={derived.rawTitle || label} input={input} output={isAutoDenied ? denyOutput : output} auto={auto} pending={hasPendingPerm} ts={ts} hasEntry={hasEntry} fmtTime={fmtTime} barColor={barStyle} layoutId={`tool-detail-${effectiveId || toolCallId || fallbackId}`} flush />
           </motion.div>
         )}
       </AnimatePresence>
@@ -1026,7 +1139,7 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
           <button
             type="button"
             onClick={() => { if (toolCallId) onOpenApp?.(toolCallId) }}
-            className="mt-1.5 flex items-center gap-2 px-1.5 py-0.5 -ml-1.5 rounded text-[12px] leading-5 text-muted hover:text-text hover:bg-bg-hover bg-transparent border-none cursor-pointer transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent"
+            className="mt-1.5 flex items-center gap-2 px-1.5 py-0.5 -ml-1.5 rounded text-[12px] leading-5 text-muted hover:text-text hover:bg-bg-hover bg-transparent border-none cursor-pointer transition-colors focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-accent"
           >
             <PanelRight size={13} aria-hidden />
             <span>{i18nT('pages.chat.toolCallLine.opened_in_the_side_panel')}</span>

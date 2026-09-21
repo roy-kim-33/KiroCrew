@@ -2,10 +2,12 @@ import { memo, useEffect, useMemo, useRef, useState } from 'react'
 import { Download, Eye, Image as ImageIcon, ImageOff, RotateCw } from 'lucide-react'
 import { useTheme } from '../hooks/useTheme'
 import { useSandboxDoc } from '../hooks/useSandboxDoc'
+import { useSilentLoadWatch } from '../hooks/useSilentLoadWatch'
 import { useScrollMemory } from '../hooks/useScrollMemory'
 import { useCommentBridge, type IframeSelection } from '../hooks/useCommentBridge'
 import { InlineCommentOverlay } from './InlineCommentOverlay'
 import { Btn } from './ui'
+import ErrorNotice from './ErrorNotice'
 import { sanitizeCssValue } from '../lib/cssSanitize'
 import { THEME_VAR_NAMES, buildSrcdoc } from '../lib/widgetSrcdoc'
 import {
@@ -303,6 +305,15 @@ export const ArtifactBodyIframe = memo(function ArtifactBodyIframe({
   // See hooks/useSandboxDoc.ts for why each rule
   // exists.
   const { url: blobUrl, failed, pending, retry } = useSandboxDoc(srcdoc)
+  // ArtifactBody has always carried `docSilent`, but it covers a DIFFERENT
+  // silent condition: a frame that loaded and then never reported its height
+  // (its timer arms only once `loadedUrlRef.current === blobUrl`, i.e. after
+  // `load` has fired). The case where `load` NEVER fires — the mint succeeded
+  // but the document never loaded at all — leaves that timer un-armed and
+  // `everLoaded` false, so the frame stays invisible with no notice. That is
+  // the same never-load trap the three sibling frames had, so ArtifactBody
+  // uses the same shared watch for it rather than a fourth private timer.
+  const { silent: loadSilent, onLoaded: onFrameLoaded } = useSilentLoadWatch(blobUrl)
   // A new document starts the observation over. Declared before the arming
   // effect below so a url change clears the previous document's verdict in the
   // same commit that re-arms.
@@ -368,7 +379,7 @@ export const ArtifactBodyIframe = memo(function ArtifactBodyIframe({
           for the user (bring the artifact back), not as a "retry" of an error
           they may not have had. `failed` wins when both are set: a known failed
           mint is the more specific diagnosis. */}
-      {(failed || docSilent) && (
+      {(failed || docSilent || loadSilent) && (
         <div
           className={
             blobUrl
@@ -382,13 +393,25 @@ export const ArtifactBodyIframe = memo(function ArtifactBodyIframe({
               is in flight it carries the existing "Rendering…" string so a
               screen-reader user who pressed the action hears that something
               happened — the visual disabled state alone is silent to AT. */}
-          <span role="status" className="min-w-0">
-            {i18nT(pending
-              ? 'components.artifactBody.rendering'
-              : failed
-                ? 'components.artifactBody.could_not_render'
+          {failed && !pending ? (
+            // The mint request itself was rejected — a read failure with nothing
+            // in this subtree to lose, so the hand-off is on. `docSilent` is a
+            // status about a frame that did not report, not a failure, and keeps
+            // the live-region status text below.
+            <ErrorNotice
+              variant="inline"
+              askAgent
+              testId="artifact-body-mint-error"
+              className="min-w-0"
+              message={i18nT('components.artifactBody.could_not_render')}
+            />
+          ) : (
+            <span role="status" className="min-w-0">
+              {i18nT(pending
+                ? 'components.artifactBody.rendering'
                 : 'components.artifactBody.no_longer_showing')}
-          </span>
+            </span>
+          )}
           {/* The click is acknowledged by DISABLING the button, never by
               clearing `docSilent`: a re-mint can resolve with the same url
               string (a React no-op — no new `load`, so nothing would ever
@@ -439,9 +462,16 @@ export const ArtifactBodyIframe = memo(function ArtifactBodyIframe({
               setDocSilent(false)
               setLoadNonce(n => n + 1)
               setEverLoaded(true)
+              onFrameLoaded()
               onIframeLoad?.()
             }}
             sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox"
+            // NO clipboard-write delegation here, deliberately. These frames host
+            // agent-generated HTML whose scripts run on load, so a delegated
+            // permission would let one overwrite the user's clipboard with no Copy
+            // action at all. Copying still works: lib/widgetSrcdoc.ts injects an
+            // execCommand fallback that a real button press satisfies and a
+            // gesture-less on-load script does not.
             className="w-full border-none bg-card"
             style={{
               ...(heightStyle ?? { height: frameHeight }),
@@ -519,9 +549,13 @@ export const ArtifactBodyImage = memo(function ArtifactBodyImage({
         {failed ? (
           <div className="flex flex-col items-center gap-2 text-center">
             <ImageOff size={24} className="text-muted" aria-hidden="true" />
-            <span className="text-sm text-muted">
-              {i18nT('components.artifactBody.image_could_not_be_loaded')}
-            </span>
+            {/* Read failure of a stored image; the viewer holds no draft, so the hand-off is on. */}
+            <ErrorNotice
+              variant="inline"
+              askAgent
+              testId="artifact-body-image-error"
+              message={i18nT('components.artifactBody.image_could_not_be_loaded')}
+            />
           </div>
         ) : (
           // eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions -- onError is an image-load lifecycle handler (degrade to the "could not be loaded" notice), not a user interaction; there is nothing here for a keyboard to reach

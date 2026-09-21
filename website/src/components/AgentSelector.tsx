@@ -7,6 +7,7 @@ import { useProvider } from '../providers'
 import { isTouchDevice } from '../utils/isTouchDevice'
 import { Input, Btn } from './ui'
 import { SourceBadge } from './SourceBadge'
+import ErrorNotice from './ErrorNotice'
 
 import { i18nT } from '../i18n/t'
 export interface KiroCrewAgent {
@@ -31,6 +32,13 @@ export interface KiroCrewAgent {
   /** Per-crew avatar override, verbatim from the backend. `{}`/absent means
    *  the face is derived from the crew name; interpreted by ghostTraitsFrom. */
   avatar?: unknown
+  /** The execution-choice namespace this row came from (`/api/agents/catalog`).
+   *  Absent on rows read from the member-management roster, which lists
+   *  members only. A member and a template can share a `name`, so a consumer
+   *  that offers both must key on (selection_kind, name), never on the name. */
+  selection_kind?: 'member' | 'template'
+  /** `global` or `project`; only catalog rows carry it. */
+  scope?: string
 }
 
 interface Props {
@@ -321,7 +329,13 @@ export default function AgentSelector({ agents, defaultAgent, value, onChange, m
             would make the list announce a control it cannot select. */}
         {rosterFailed && (
           <div className="px-3 py-2 border-t border-border flex items-center justify-between gap-2">
-            <span className="text-[12px] text-danger">{i18nT('components.agentSelector.roster_load_failed')}</span>
+            {/* Picker pop-up holds no draft (a filter string only), so the hand-off loses nothing. */}
+            <ErrorNotice
+              variant="inline"
+              askAgent
+              testId="agent-selector-roster-error"
+              message={i18nT('components.agentSelector.roster_load_failed')}
+            />
             <Btn
               onClick={rosterFailed.onReload}
               disabled={rosterFailed.reloading}
