@@ -6,6 +6,7 @@ import { fmtCurrency, fmtDateFields, fmtNumber, fmtPercent } from '../i18n/forma
 import { i18nT } from '../i18n/t'
 import { safeGetItem, safeSetItem } from '../utils/safeStorage'
 import Clickable from './Clickable'
+import ErrorNotice from './ErrorNotice'
 import Modal from './Modal'
 
 // The usage view model is owned by `api/client.ts` next to the wire payload it
@@ -15,13 +16,16 @@ export type { KiroBonusCreditGrant, KiroCreditUsage }
 /**
  * What the modal can be handed: a reading, `null` while the gateway's usage
  * cache warms, `'none'` when the account has no credit plan, `'failed'` when
- * the fetch itself failed with nothing cached, or `'api-key'` when the account
+ * the fetch itself failed with nothing cached, `'api-key'` when the account
  * authenticates with an API key (usage needs an SSO/OIDC token that auth type
- * never has, so the state is terminal by construction). `null` is the ONLY
+ * never has, so the state is terminal by construction), or `'scrape-disabled'`
+ * when the free usage API returned no plan and the billed `/usage` text scrape
+ * is opted out (terminal until the user enables
+ * `dashboard.usage_text_scrape_enabled`). `null` is the ONLY
  * value that means "still loading" — the others have nothing more to wait for,
  * so spinning on them would repeat the defect this distinction exists to remove.
  */
-export type KiroAccountUsage = KiroCreditUsage | null | 'none' | 'failed' | 'api-key'
+export type KiroAccountUsage = KiroCreditUsage | null | 'none' | 'failed' | 'api-key' | 'scrape-disabled' | 'signin-required'
 
 /** True only for an actual reading, so the sentinels cannot reach a field access. */
 const isUsageReading = (usage: KiroAccountUsage): usage is KiroCreditUsage =>
@@ -196,7 +200,7 @@ function AccountIdentity({ usage }: { usage: KiroAccountUsage }) {
               {email && (
                 <Clickable
                   onClick={toggleEmailVisibility}
-                  className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full border border-border text-muted transition-colors hover:border-accent/35 hover:bg-accent/10 hover:text-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+                  className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full border border-border text-muted transition-colors hover:border-accent/35 hover:bg-accent/10 hover:text-accent focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-accent"
                   aria-label={i18nT(emailHidden ? 'components.kiroAccountModal.show_email' : 'components.kiroAccountModal.hide_email')}
                   title={i18nT(emailHidden ? 'components.kiroAccountModal.show_email' : 'components.kiroAccountModal.hide_email')}
                 >
@@ -226,18 +230,35 @@ function UsageSkeleton() {
   )
 }
 
-function CreditUsage({ usage }: { usage: KiroAccountUsage }) {
+function CreditUsage({ usage, onClose }: { usage: KiroAccountUsage; onClose: () => void }) {
   // Only a cache that has not warmed yet is still loading. A failed fetch and an
   // account with no plan both have nothing pending, so they get the static
   // notice rather than a skeleton that never resolves.
   if (usage === null) return <UsageSkeleton />
+  // An expired sign-in is the one unreadable state the user can act on, so it
+  // takes the shared error surface and its agent hand-off. That hand-off opens
+  // the chat this overlay sits over, so the modal closes with it — a hand-off
+  // the user cannot see reads as a dead button. The remaining states report a
+  // configuration the account is in rather than a failure to recover from, so
+  // they stay on the passive notice.
+  if (usage === 'signin-required') {
+    return (
+      <ErrorNotice
+        message={i18nT('components.kiroAccountModal.credit_usage_signin_required')}
+        askAgent
+        onHandoff={onClose}
+      />
+    )
+  }
   if (!isUsageReading(usage)) {
     return (
       <div className="flex items-center gap-2 rounded-lg border border-border bg-bg-elevated/40 p-3.5 text-[13px] text-muted">
         <AlertCircle className="lucide-inline shrink-0" />{' '}
         {i18nT(usage === 'api-key'
           ? 'components.kiroAccountModal.credit_usage_api_key_auth'
-          : 'components.kiroAccountModal.credit_usage_unavailable')}
+          : usage === 'scrape-disabled'
+            ? 'components.kiroAccountModal.credit_usage_scrape_disabled'
+            : 'components.kiroAccountModal.credit_usage_unavailable')}
       </div>
     )
   }
@@ -314,7 +335,7 @@ export default function KiroAccountModal({ open, onClose, usage }: KiroAccountMo
     >
       <div className="flex flex-col gap-4">
         <AccountIdentity usage={usage} />
-        <CreditUsage usage={usage} />
+        <CreditUsage usage={usage} onClose={onClose} />
         <a
           href={KIRO_ACCOUNT_URL}
           target="_blank"

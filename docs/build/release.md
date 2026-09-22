@@ -18,7 +18,7 @@ macOS signing mechanics and notary-credential rotation live in
 |---------|---------|---------------|
 | `nightly` | `nightly.yml`: cron `0 6 * * *` (06:00 UTC) plus manual dispatch, from `main` HEAD | `<base>-nightly.<YYYYMMDD>t<HHMMSS>` |
 | `insider` | `release.yml`: push of a prerelease tag (`v0.2.0-rc.1`) | `<x.y.z>-rc.N` |
-| `stable` | `release.yml`: push of a bare semver tag (`v0.2.0`) on a recorded candidate's commit; the run verifies and promotes that candidate's exact bytes, never rebuilding | Release identity `<x.y.z>`; artifacts retain the selected candidate's embedded `<x.y.z>rcN` version |
+| `stable` | `release.yml`: push of a bare semver tag (`v0.2.0`) on the cleared candidate's commit; the run REBUILDS from that commit under the bare version. Byte-for-byte republication of the candidate's artifacts happens only when `vars.STABLE_PROMOTE_BYTES` names that exact base | `<x.y.z>`; under `STABLE_PROMOTE_BYTES` the republished artifacts retain the candidate's embedded `<x.y.z>rcN` version |
 
 The channel name is a literal path segment everywhere (`cli/insider/...`,
 `feed/insider/...`, the `:insider` image tag), so there is no name-to-prefix
@@ -197,10 +197,15 @@ there is no build step at stable-tag time to add it.
    stamped in, so the shipped wheel is `kirocrew-X.Y.Z-py3-none-any.whl` and
    `kirocrew --version` prints `X.Y.Z`. Expect the full build time, not a
    pointer move. `Create GitHub Release` runs (the `if:` fix) and renders
-   GitHub's own contributor block — **do not hand-write a contributors list in
-   the body** (that duplicated the native block on v0.3.0). Verify: stable feed
-   carries the bare `X.Y.Z`, the wheel filename has no `rc`, About shows
-   `X.Y.Z`, CHANGELOG shows no draft heading.
+   GitHub's own contributor block, so the body must not carry a second one —
+   see "What the release body must not contain" below, because the body is
+   ASSEMBLED, not written, and the duplicate arrives on its own. The page appears
+   as a **draft** and becomes public only once `record-stable-promotion` has
+   written `stable-publication.json` onto it, so a release still drafted means a
+   required lane failed -- read that job, not the page. Verify: the release is
+   published and carries the marker asset, stable feed carries the bare `X.Y.Z`,
+   the wheel filename has no `rc`, About shows `X.Y.Z`, CHANGELOG shows no draft
+   heading.
 
    To ship the candidate's exact bytes instead — the only mode where stable runs
    the identical binary that was validated — set `vars.STABLE_PROMOTE_BYTES` to
@@ -221,7 +226,7 @@ concurrency group, and their version derivation.
 | `release.yml` | trigger (`push` on `v*` tags) | Derives version + channel + wheel version from the tag. A prerelease tag builds, publishes to insider, and records the immutable promotion bundle; a bare tag verifies that same-commit bundle and promotes the exact files/OCI digest to stable without building. Then creates the GitHub Release. `concurrency: release-publish` with `cancel-in-progress: false` (queued). |
 | `dependency-vulnerability.yml` | reusable gate | `scripts/check_npm_audit.py`. On a release every build job needs it; on a nightly every **publish** job needs it and no build job does, so a slow registry delays publication rather than failing the build. |
 | `build-wheel.yml` | reusable build | Stamps the PEP 440 version into `pyproject.toml` and `__init__.py`, stamps the distribution channel, builds the frontend and stages it into the package, then `python -m build`. Uploads artifact `cli-wheel` (wheel + sdist). Credential-free. |
-| `build-desktop.yml` | reusable build | Matrix `macos-15` (universal macOS app) and `ubuntu-22.04` / `ubuntu-22.04-arm` (AppImage + deb + rpm) via `packaging/build-desktop.sh`, then a `smoke-linux-packages` job that installs the deb and rpm in Ubuntu 24.04 and Amazon Linux 2023 containers. Deliberately credential-free (`contents: read` only, pinned by `test_workflow_permissions.py`), so it builds **unsigned** and hands the `.app` downstream. |
+| `build-desktop.yml` | reusable build | Matrix `macos-15` (universal macOS app) and `ubuntu-22.04` / `ubuntu-22.04-arm` (AppImage + deb + rpm) via `packaging/build-desktop.sh`, then a `smoke-linux-packages` job that installs the deb and rpm in Ubuntu 24.04 and Amazon Linux 2023 containers. Deliberately credential-free (`contents: read` only, pinned by `test_workflow_permissions.py`), so it builds **unsigned** and hands the `.app` downstream. `nightly.yml` passes `soft_fail_arm64: true`, which marks the arm64 leg alone `continue-on-error` so a failed arm64 build cannot skip the x64 publishers; the smoke never carries it, so a package that will not install still holds both arches. |
 | `build-windows.yml` | reusable build | `windows-latest`, an NSIS `Setup.exe`. Separate from `build-desktop.yml` because Authenticode signing has to happen *inside* the build (the installer compresses its own already-signed executable), so this job holds an AWS Signer identity and `build-desktop.yml` can stay credential-free. Callers pass `soft_fail: true`, so a Windows failure cannot skip the mac/Linux lanes. |
 | `publish-cli.yml` | reusable publish | Wheel + `SHA256SUMS` + KMS-signed `cli-manifest.json` to `cli/<channel>/<version>/`, the same signed manifest to `feed/<channel>/latest-cli.json`, and a PEP 503 index under `feed/<channel>/simple/`. |
 | `publish-linux.yml` | reusable publish | One Linux artifact to `desktop/<channel>/<version>/`, its channel file under `<feed prefix>/latest-linux[-arm64].yml`, then the `latest/` alias. Invoked ONCE PER (ARCH, FORMAT) PAIR — `arch: x64\|arm64` × `format: appimage\|deb\|rpm`, six callers — each with its own keys and feed, so no two ever share one. |
@@ -346,9 +351,86 @@ trailer). The unsigned electron-builder zip and DMG are inter-job handoffs and
 never become release assets. Windows `Setup.exe` is not attached. The release is
 marked `prerelease` when the channel is insider, and notes are generated.
 
-`github-release` is the one job that needs `contents: write`, and it is the only
-job that has it: the signing jobs hold AWS credentials but never
-`contents: write`. `test_workflow_permissions.py` pins that split.
+`github-release` and `record-stable-promotion` are the two jobs that need
+`contents: write`, and they are the only ones that have it: the signing jobs hold
+AWS credentials but never `contents: write`.
+`test_workflow_permissions.py` pins that split.
+
+**The release page is the publication boundary.** Every publish lane gates on
+`stable-gate`, which is a pre-flight (the version is documented in
+`CHANGELOG.md`; for a promotion, bytes insiders actually received), so the lanes
+then publish independently of one another. `github-release` therefore waits on
+the complete required set -- `publish-cli`, all six Linux format/arch lanes,
+`publish-docker` and `sign-and-notarize` -- rather than on macOS alone, so a
+version cannot become publicly visible while a required lane failed. It is the
+same set `record-promotion` requires, and
+`test_release_promotion_contract.py::test_the_promotion_record_and_the_release_page_require_the_same_lanes`
+keeps the two from drifting into two different definitions of "published".
+
+What this does and does not buy: nothing in the workflow can un-publish an OCI
+tag or an npm version, so the boundary withholds the **announcement**, not the
+bytes. A partial run leaves the already-published lanes in place and no release
+page; a rerun after the failing lane is fixed reaches `github-release` again with
+the same immutable artifacts, which is what makes the retry deterministic rather
+than a second, differently-composed release. `build-windows` stays outside the
+condition on purpose -- it is waited on so the installer artifact exists, but its
+result is soft-failed and must not gate the page.
+
+**A stable page is created as a draft, and `record-stable-promotion` completes
+it.** `github-release` is itself a publishing lane: it creates the release and
+uploads every asset in one action call, so a page published on create is visible
+from its first asset onward, and an upload that dies halfway leaves a live release
+offering some platforms and silently missing others. On the stable channel it
+therefore starts the page as a draft, and one further job -- gated on the same
+required lane set plus `github-release` itself -- writes the completion marker and
+then flips the draft visible, in that order. Insider is unchanged: those pages are
+prereleases, and `record-promotion` is already the record the promotion path
+consumes.
+
+**Nothing in this workflow writes to a release the public can already see.** That
+one rule is what the draft mechanism reduces to, and it is stronger than the
+individual failures that produced it: `draft: true` on an update withdrew a live
+page, a swallowed API error made a live page look absent, a rerun re-uploaded over
+bytes a marker already certified, and an interrupted re-upload left a mixed asset
+set visible on a public page. None of those can be undone by a later run.
+
+So a stable page is only ever **created**, as a draft, and only while the public
+cannot see one. A probe step reads the release's own state and answers `create`
+(absent or still a draft) or `skip` (already published, marked or not); the upload
+action carries `if: steps.page.outputs.action == 'create'`, which is why `draft` is
+a constant on the create path rather than a decision. A rerun of a finished stable
+release therefore touches nothing remote. Only gh's own "release not found" reads
+as absent -- any other API error fails the step, because a run that publishes
+nothing is recoverable and a wrong guess is a write to a live page.
+
+The marker is `stable-publication.json`, attached to the release it certifies. A
+release asset rather than a workflow artifact, because an artifact expires and
+"did this version publish completely?" outlives any retention window. It carries
+the tag, the version and base version, `promote_mode`, the OCI digest, the source
+commit and run id, and the required lane set -- so a complete publication is
+checkable rather than inferred from green job bubbles. If any required lane
+failed, the draft stays unpublished and no marker exists; there is no state where
+one is present without the other.
+
+Reruns reconcile against the release's own state, not against a record of what
+the run did -- and the question asked is whether the **marker** is on the release,
+not whether the page is visible, because those can disagree. A draft carries a
+"Publish release" button, so a half-populated page can be made public by hand, and
+releases published before this job existed are public with nothing certifying them
+either. Reading visibility alone would call both states complete and leave them
+uncertified forever. So: published **and** marked is a no-op that
+logs a notice; still drafted completes normally; and published-but-unmarked
+**fails the job**, because marking it would certify an asset set the run never
+uploaded and rebuilding it would rewrite a page users can already see. The error
+names the two ways out: delete the release page (keeping the tag) and re-run the
+tag, or accept the version as one published before the marker existed.
+
+Do not publish a stable draft by hand. It announces a release no marker certifies,
+and it is the state that failure exists to surface rather than repair.
+
+Windows is carved out here exactly as it is on the page -- absent from both
+`needs` and the condition, since a soft-failed result reports `success` regardless
+and this job downloads no artifacts to race.
 
 ### There is no PyPI publish
 
@@ -544,6 +626,16 @@ KMS key, never on Apple or CDSigner, so a macOS signing failure cannot block a
 CLI release. The same independence holds for `publish-linux.yml` (needs only
 `build-desktop`) and `publish-docker.yml` (needs only the wheel).
 
+Per-ARCH independence is narrower than that, and only the nightly lane has it.
+`build-desktop`'s caller job aggregates all three build legs, so its result
+cannot say which one failed. `nightly.yml` therefore passes
+`soft_fail_arm64: true`: a failed arm64 build leaves the x64 publishers running
+on their own artifact, and the arm64 publishers go red on their missing one
+rather than skipping. `release.yml` keeps the coupling, because its run records
+the stable promotion candidate and all three arm64 Linux roles are REQUIRED in
+`scripts/release_promotion.py` -- an x64-only publish there burns immutable keys
+for a version that can never be promoted (tracked in #1030).
+
 `SHA256SUMS` sits beside the wheel for legacy tooling, but it is only a
 corruption check. Authenticity comes from a canonical JSON artifact manifest
 signed with a non-exportable RSA KMS key:
@@ -554,7 +646,7 @@ signed with a non-exportable RSA KMS key:
   "channel": "insider",
   "key_id": "sha256:<SubjectPublicKeyInfo DER digest>",
   "pub_date": "2026-07-18T06:15:00Z",
-  "python_requires": ">=3.10",
+  "python_requires": ">=3.12",
   "schema": "kirocrew-cli-artifact-manifest-v1",
   "sha256": "<wheel digest>",
   "signature": "<base64 RSA signature over canonical JSON without this field>",
@@ -593,6 +685,15 @@ still succeeds.
 Key provisioning, the `kms:GetPublicKey` + `kms:Sign` grant, and the rotation
 procedure (dual-trust, never an in-place swap, because schema v1 pins exactly
 one key) are in [../../packaging/signing/README.md](../../packaging/signing/README.md).
+
+**The pinned key has three consumers, not two.** `cli.sh` and the gateway's
+update-feed reader verify `cli-manifest.json` against it, and the gateway's
+feature-video manifest (`src/kiro_crew/platform/feed_trust.py`, schema
+`kirocrew-feature-videos/1`) verifies against the same key. A rotation therefore
+moves `cli.sh`, the feed publisher and the feature-video manifest publisher
+together, and every hosted manifest a release still reads back (this release,
+this minor's `.0`, and the `.0` of up to three earlier minors) must be re-signed
+under the new key, or those installs lose their clips until the next publish.
 
 `publish-installer.yml` mechanically enforces the rollout order rather than
 trusting it. It publishes only from `main` (checked explicitly, because
@@ -1010,6 +1111,115 @@ For the desktop swap itself, `ota-test.yml` is the end-to-end proof; run it on
 demand after a change to the updater. It validates the swap mechanism, not
 Gatekeeper acceptance, since it signs with a throwaway identity.
 
+### After a stable release: check the version the user actually sees
+
+The recipe above proves the bytes are live. It does not prove they are labelled
+correctly, and that is where every stable release so far has gone wrong — each
+time one layer further out than the last:
+
+| Release | Bytes | What was wrong anyway |
+|---|---|---|
+| v0.3.0 | correct | fed the RC's own `0.3.0-insider.13` stamp, so stable clients read as insider |
+| v0.4.0 | correct | source files were re-stamped bare, but the shipped wheel was still `0.4.0rc14` |
+| v0.5.0 | correct | wheel and feeds finally bare — the GitHub Release page had no Windows asset |
+
+So the failure mode is not "the release did not happen". It is "the release
+happened and advertises the wrong thing", which no lane fails on. Check the
+label surfaces explicitly:
+
+```bash
+CH=stable; V=0.5.0            # the version you just tagged
+PTR=https://updates.crew.kiro.dev
+BYTES=https://download.crew.kiro.dev
+
+# 1. Every feed advertises the BARE version -- no rc/insider suffix anywhere.
+for f in latest-cli.json latest-mac.yml latest-linux.yml latest-linux-arm64.yml latest.yml; do
+  printf '%-22s ' "$f"
+  curl -fsS "$PTR/feed/$CH/$f" | grep -oE "\"?version\"?:? *\"?[0-9][^\",]*" | head -1
+done
+
+# 2. The wheel's EMBEDDED version, not just its filename. This is what
+#    `pip show` and `kirocrew --version` print, and a promotion cannot change it.
+curl -fsS "$PTR/feed/$CH/latest-cli.json" > /tmp/feed.json
+python3 - <<'PY'
+import hashlib, io, json, re, urllib.request, zipfile
+d = json.load(open("/tmp/feed.json"))
+raw = urllib.request.urlopen(d["wheel_url"], timeout=120).read()
+assert hashlib.sha256(raw).hexdigest() == d["sha256"], "wheel does not match the feed digest"
+z = zipfile.ZipFile(io.BytesIO(raw))
+meta = next(n for n in z.namelist() if n.endswith(".dist-info/METADATA"))
+print("filename:", d["wheel_url"].rsplit("/", 1)[-1])
+print("METADATA Version:", re.search(r"^Version: (.+)$", z.read(meta).decode(), re.M).group(1))
+PY
+
+# 3. The GitHub Release page carries every platform, with no RC-stamped asset.
+gh api "repos/kirodotdev/KiroCrew/releases/tags/v$V" --jq '.assets[].name' | sort
+gh api "repos/kirodotdev/KiroCrew/releases/tags/v$V" --jq '.assets[].name' \
+  | grep -Ei 'rc[0-9]|insider' && echo 'STALE RC ASSET' || echo 'no rc-stamped asset'
+```
+
+What each check is really for:
+
+- **The feeds** are what a running client reads, so a suffix here is what makes a
+  stable install describe itself as a prerelease. All five must agree.
+- **The embedded wheel version** is the one surface a byte-reuse promotion can
+  never fix, which is why stable rebuilds by default. Verify it from the wheel
+  itself: a clean filename around RC-stamped metadata is exactly the v0.4.0
+  shape.
+- **The release page** is assembled by an extension allowlist, so a platform is
+  omitted silently rather than loudly. Compare the asset list against the
+  publish lanes that ran; `test_release_promotion_contract.py` pins the two
+  together, but a lane added without a matching extension still deserves a look
+  here. macOS and Windows are the two the allowlist does NOT cover: each has two
+  possible producers in a promotion run — the promoted bundle and a fresh
+  build — so each is taken from an explicit path, and exactly one asset per
+  platform should appear. Two Windows installers, or one whose name carries a
+  version other than the tag's, means the page is offering a rebuild the
+  promotion was supposed to replace.
+
+A discrepancy is NOT recoverable in place — published keys are immutable and the
+feed is already advertising the wrong label. The remedy is the next version
+forward, so it is worth spending the five minutes on these three checks while
+the run is still fresh.
+
+### What the release body must not contain
+
+The body is **assembled, not written**, and that is why the same three defects
+keep reaching the page. `github-release` passes the extracted CHANGELOG section
+as `body_path` AND sets `generate_release_notes: true`, and
+`softprops/action-gh-release` **pre-pends** the body to the generated notes
+rather than replacing them — so the published body is always
+`CHANGELOG section + whatever GitHub generates`. Nobody has to write a mistake
+for one to appear.
+
+- **No commit list.** `generate_release_notes: true` appends a
+  `## What's Changed` line per commit since the previous tag. On v0.5.0 that was
+  **746 lines for 922 commits** — 65% of the body, and it pushed the whole thing
+  to 125,219 characters, past GitHub's 125,000-character ceiling, so the body was
+  published TRUNCATED mid-word. The page already links "N commits to main since
+  this release", and the reader-facing summary is the CHANGELOG section. Strip it.
+- **No contributors list.** The page renders GitHub's own contributor block from
+  the tag range, natively, whatever the body says. The CHANGELOG section is
+  *required* to end with `### Contributors` (it ships inside the wheel and feeds
+  the dashboard's Releases page, where no such block exists) — so copying that
+  section into the body duplicates the list immediately above GitHub's own. This
+  duplicated on v0.3.0 and again on v0.5.0; the rule is about the BODY, and it
+  does not relax the CHANGELOG's requirement.
+- **No hard-wrapped paragraphs.** GitHub renders issue / PR / release bodies with
+  GFM line breaks ON, so a newline inside a paragraph becomes a real `<br>`.
+  CHANGELOG prose is wrapped at ~76 columns, and copied in verbatim it renders as
+  a fixed-width column with a wide empty gutter down the right of the page — the
+  "big blank area" reported on v0.5.0. The identical text looks correct in
+  `CHANGELOG.md` because a rendered *file* does not enable that option. Join each
+  paragraph and each list item onto one line and let the browser reflow;
+  headings, list nesting, code fences and tables are unaffected.
+
+Trimming the body after the fact is safe and is the normal remedy: release notes
+are prose on the GitHub page, editable independently of the tag, the CHANGELOG,
+and the published bytes. Editing them changes nothing a client downloads and does
+not touch the immutable CDN keys. What is NOT editable is the CHANGELOG section
+itself once shipped.
+
 ## Recovery: roll forward
 
 **There is no rollback.** The recovery path for a bad release is to cut a new
@@ -1042,7 +1252,7 @@ Practical consequences when something goes wrong mid-release:
 Every release lands a `## [X.Y.Z] - YYYY-MM-DD` section in `CHANGELOG.md`
 through a normal PR, alongside any version bump. The section format (ordering,
 tone, the three-sentence budget per subsection) is specified once in
-[AGENTS.md](../../AGENTS.md) → "Release Changelog". The dashboard reads the
+[changelog.md](changelog.md). The dashboard reads the
 changelog from `KIROCREW_PROJECT_DIR/CHANGELOG.md` for source installs and from
 the bundled copy inside the package for wheel installs.
 

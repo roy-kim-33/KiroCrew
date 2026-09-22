@@ -180,7 +180,7 @@ with a driver. `KIROCREW_SESSION_KEY` reaches a child only from a launcher that
 already knows which session it is spawning for — the ACP spawn path
 (`acp/client.py`) and the script-cron launcher (`cron_script.py`, which spawns one
 process per job under `cron:<job id>`) — and `KIROCREW_HOST_PID` only from the Linux
-sandbox launcher (`sandbox.py:666`). A GUI-launched kiro-cli has no such launcher
+sandbox launcher (`sandbox.main`, which exports it before re-exec). A GUI-launched kiro-cli has no such launcher
 above it, so it carries neither. An earlier revision refused in the shim on the
 reasoning that an unproven key is indistinguishable from an unattended surface —
 with the unattended rule gone, that left the feature returning *"the calling
@@ -227,6 +227,23 @@ via `seed.py`, so it must not promise a separation the serving daemon may not
 implement. A stub that reconnects gets a fresh nonce and therefore a
 fresh namespace: its earlier snapshots become unreachable, which surfaces as "call
 `computer_get_state` first" rather than as an action against a stale tree.
+
+**The placeholder is never declared as `X-Session-Key`.** The header is an identity
+claim: on the AF_UNIX leg `token_auth._verify_unix_peer` resolves the peer pid's
+`session_pid_<pid>` ancestry and denies `403 peer_session_mismatch` when the recovered
+key differs from the declared one, which is the same-uid impersonation case that check
+exists to close. A placeholder names no session, so it can never equal a recovered key,
+and declaring it made every Computer Use call from a dashboard-launched kiro-cli fail
+with a bare `Error: Forbidden` on macOS, where the ancestry file always resolves
+(#9841; `kirocrew computer apps` worked because the CLI never takes that leg). The
+shim therefore decides by the key's own prefix (`mcp_computer._declares_identity`):
+a strictly-resolved key is declared in the header and kernel-verified as before; an
+`unresolved:` key is carried in the body only, and the request has no `X-Session-Key`,
+which the gate already treats as "nothing session-scoped is claimed, nothing to
+verify". Nothing in `_verify_unix_peer` changes; a real key declared by the wrong
+process is still denied. The body placeholder still scopes the `SnapshotIndex`
+namespace and the audit line. Pinned by
+`test_mcp_computer.py::TestUnresolvedKeysAreNeverDeclared`.
 
 The prefix is deliberate: this is a namespace separator, not attribution, and an audit
 reader must not mistake a pid — or a nonce — for a resolved identity. And it is a
@@ -2454,9 +2471,8 @@ computer use.
   `0o700` temp dir the agent can reach with `fs_read` — the same posture browse
   already ships. Computer use widens WHAT can be in frame (any window, not one
   browser tab). Mitigations: per-window capture only (never full-screen),
-  whole-window suppression when any node is secure, ring-trim to 200, and the
-  existing `cleanup-temp-screenshots.yml`. This design does not widen the posture
-  and does not claim to close it.
+  whole-window suppression when any node is secure, and ring-trim to 200. This
+  design does not widen the posture and does not claim to close it.
 - **"No screenshots" is not "no disclosure."** The accessibility tree itself
   leaked real paths, window titles and bundle ids in live probes, and a document
   path inside an `AXTitle` is not a credential so redaction will not catch it.

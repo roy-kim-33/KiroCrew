@@ -1,4 +1,4 @@
-"""The ``mcp`` config section that carries ``extra_path_dirs`` (issue #5083).
+"""The ``mcp`` config section that carries ``extra_path_dirs``.
 
 Separate from ``mcp_gateway``, which configures the sharing broker: these
 settings govern how MCP servers are FOUND and launched, so they apply with the
@@ -13,8 +13,16 @@ from __future__ import annotations
 import json
 import os
 
+import pytest
+
+from conftest import host_abs
 from kiro_crew.config import loader as L
 from kiro_crew.config.loader import KiroCrewConfig, McpConfig
+
+#: The published directory must survive ``augmented_path``'s ``os.path.isabs``
+#: filter, and from Python 3.13 ``ntpath.isabs("/opt/pixi/bin")`` is False (no
+#: drive) -- so the fixture is spelled absolutely for the running host.
+_PIXI_BIN = host_abs("opt", "pixi", "bin")
 
 
 def _load_from(tmp_path, monkeypatch, data: dict) -> KiroCrewConfig:
@@ -71,17 +79,17 @@ def test_load_publishes_the_setting_to_the_search_path(tmp_path, monkeypatch):
     import kiro_crew.env as env_mod
 
     monkeypatch.setattr(env_mod, "_config_path_dirs", ())
-    _load_from(tmp_path, monkeypatch, {"mcp": {"extra_path_dirs": ["/opt/pixi/bin"]}})
-    assert "/opt/pixi/bin" in env_mod.mcp_search_path("").split(os.pathsep)
+    _load_from(tmp_path, monkeypatch, {"mcp": {"extra_path_dirs": [_PIXI_BIN]}})
+    assert _PIXI_BIN in env_mod.mcp_search_path("").split(os.pathsep)
 
 
 def test_load_republishes_so_a_removed_setting_clears(tmp_path, monkeypatch):
     import kiro_crew.env as env_mod
 
     monkeypatch.setattr(env_mod, "_config_path_dirs", ())
-    _load_from(tmp_path, monkeypatch, {"mcp": {"extra_path_dirs": ["/opt/pixi/bin"]}})
+    _load_from(tmp_path, monkeypatch, {"mcp": {"extra_path_dirs": [_PIXI_BIN]}})
     _load_from(tmp_path, monkeypatch, {"mcp": {"extra_path_dirs": []}})
-    assert "/opt/pixi/bin" not in env_mod.mcp_search_path("").split(os.pathsep)
+    assert _PIXI_BIN not in env_mod.mcp_search_path("").split(os.pathsep)
 
 
 def test_defaults_path_also_clears_a_stale_snapshot(tmp_path, monkeypatch):
@@ -94,8 +102,8 @@ def test_defaults_path_also_clears_a_stale_snapshot(tmp_path, monkeypatch):
     import kiro_crew.env as env_mod
 
     monkeypatch.setattr(env_mod, "_config_path_dirs", ())
-    _load_from(tmp_path, monkeypatch, {"mcp": {"extra_path_dirs": ["/opt/pixi/bin"]}})
-    assert "/opt/pixi/bin" in env_mod.mcp_search_path("").split(os.pathsep)
+    _load_from(tmp_path, monkeypatch, {"mcp": {"extra_path_dirs": [_PIXI_BIN]}})
+    assert _PIXI_BIN in env_mod.mcp_search_path("").split(os.pathsep)
 
     # Now point the loader at a home with no config files at all.
     empty = tmp_path / "empty"
@@ -104,7 +112,7 @@ def test_defaults_path_also_clears_a_stale_snapshot(tmp_path, monkeypatch):
     monkeypatch.setattr(L, "config_dir", lambda: empty)
     monkeypatch.setattr(L, "config_local_path", lambda: empty / "config.local.json")
     KiroCrewConfig.load()
-    assert "/opt/pixi/bin" not in env_mod.mcp_search_path("").split(os.pathsep)
+    assert _PIXI_BIN not in env_mod.mcp_search_path("").split(os.pathsep)
 
 
 def test_section_is_in_the_schema_registry():
@@ -129,3 +137,52 @@ def test_distinct_from_mcp_gateway():
     broker's own section."""
     assert not hasattr(KiroCrewConfig().mcp_gateway, "extra_path_dirs")
     assert isinstance(KiroCrewConfig().mcp, McpConfig)
+
+
+def test_the_setting_is_restart_marked():
+    """The contribution is not live for every consumer, and the mark is how the UI
+    says so.
+
+    A resolution caller (the MCP probe, the agent-config resolver, the rewriter)
+    reads the published snapshot on every call, so an edit reaches it at once. The
+    broker daemon instead receives the contribution as a process PATH baked when
+    ``manager._spawn_once`` spawns it, and every pooled backend inherits that
+    PATH; a gateway that ADOPTS a surviving daemon never applies a new one, since
+    the adoption gates compare the target-stem map and the code fingerprint and
+    neither sees a PATH. That is the "hot for one consumer and boot-only for the
+    others" case ``config.live._refuse_restart_marked`` names, and it is the same
+    mark every baked-at-spawn broker field carries.
+    """
+    from kiro_crew.config.schema import requires_restart
+
+    assert requires_restart("mcp.extra_path_dirs")
+
+
+def test_a_config_applier_on_the_setting_is_refused():
+    """The mark is enforced, not decorative.
+
+    Without this the field could gain an applier that refreshes the resolution
+    snapshot while every already-spawned daemon and backend keeps the old PATH --
+    a field the UI calls boot-only and the watcher treats as hot.
+    """
+    from kiro_crew.config.live import ConfigWatch
+
+    w = ConfigWatch()
+    with pytest.raises(ValueError, match="restart-marked"):
+        w.subscribe("mcp.extra_path_dirs", callback=lambda c: None, name="bad")
+    with pytest.raises(ValueError, match="restart-marked"):
+        w.bind("mcp.extra_path_dirs", lambda v: None)
+    assert list(w.subscriptions()) == []
+
+
+def test_the_help_states_the_spawned_process_effect():
+    """An operator reading only "search path" would expect a resolution-only
+    effect and no restart, which is why a wrapper script's bare-name ``exec``
+    kept exiting rc=127 after the setting was pointed at the right folder."""
+    from kiro_crew.config import schema
+
+    entry = next(e for e in schema.SCHEMA_REGISTRY if e.path == "mcp.extra_path_dirs")
+    help_text = entry.help.lower()
+    assert "path of the broker daemon" in help_text
+    assert "pooled mcp backend" in help_text
+    assert "when it starts" in help_text

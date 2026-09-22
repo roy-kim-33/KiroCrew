@@ -234,11 +234,12 @@ endpoints it recognizes by exact `(host, path)`. That recognized set is
 code-owned — read its current contents from
 `security._OAUTH_AUTHORIZATION_ENDPOINTS`; it covers the Connections launch
 providers' MCP authorization servers plus the classic web-OAuth hosts.
-**Miro is not in it**, so its real consent URL — which routinely exceeds the
-query-length heuristic — fails closed. The chat banner that reports the
-rejection (`dashboard/chat_runner.py`) names the remedy inline, because the fix
-is agent-fenced with no dashboard writer and that banner is the only place a
-user learns it exists.
+**Miro is in it** (`mcp.miro.com` + `/authorize`), so the public Miro MCP
+server needs no entry of your own; a host outside that set whose consent URL
+exceeds the query-length heuristic fails closed instead. The chat banner that
+reports the rejection (`dashboard/chat_runner.py`) names the remedy inline,
+because the fix is agent-fenced with no dashboard writer and that banner is the
+only place a user learns it exists.
 
 The remedy is the operator keystone **`oauth_endpoints.json`**, which extends
 the recognized set without weakening the gate. Create or edit it in the Kiro
@@ -303,12 +304,16 @@ static bearer token directly on the server config:
 { "url": "https://mcp.example.com/", "headers": { "Authorization": "Bearer ${TOKEN}" } }
 ```
 
-This **bypasses OAuth entirely**: the probe reads and sends the header on the
-handshake (`mcp_discovery.py`), so no browser flow happens. The failure modes
-differ accordingly — a `401` on an entry that **carries** a static
-`Authorization` header stays a hard `error` (a supplied credential was
-rejected), whereas a `401` on an entry with **no** static header is the
-`needs_auth` / "Sign-in required" path described above.
+This **bypasses OAuth entirely**: the probe resolves any `${VAR}`/`${env:VAR}`
+reference in the header value (the same credential-filtered expansion the
+gateway applies to declared env — an unresolved reference stays literal) and
+sends the result on the handshake (`mcp_discovery.py`), so no browser flow
+happens. The failure modes differ accordingly — a `401` on an entry whose sent
+`Authorization` header carried a real, resolved credential stays a hard `error`
+(a supplied credential was rejected), whereas a `401` on an entry with **no**
+static header — or one whose reference did not resolve, because a missing or
+credential-filtered variable supplies nothing — is the `needs_auth` /
+"Sign-in required" path described above.
 
 For an OAuth server, an optional internal `scopes` list maps to the wire
 `oauthScopes` field (`mcp_utils._wire_scopes`). It is all-or-nothing: the field
@@ -324,19 +329,28 @@ and `scopes` (see
 [../reference/kiro-cli/mcp/oauth-token-storage.md](../reference/kiro-cli/mcp/oauth-token-storage.md),
 "`.registration.json`").
 
-**Only a public `clientId` is configurable, and there is no confidential-client
-option.** To skip DCR against a provider that pre-registers clients, set
-`clientId` on the entry: Kiro Crew maps it to the wire field `oauth.clientId`
-(`mcp_utils.kiro_oauth_wire_entry`, and `kiro_entry_client_id` reads it in
-either spelling). That is the whole supported OAuth surface alongside `scopes` —
-there is **no `clientSecret` and no `redirectUri`** on an MCP server entry.
-Do not invent them: kiro-cli **ignores unknown keys silently**, so a secret
-written there buys you nothing, does not make a confidential-client flow work,
-and leaves a real credential sitting in plaintext in a file the agent itself can
-read — the same exposure that rules out putting a bearer token in `headers`
-([../architecture/design-notes/mcp-oauth-ownership.md](../architecture/design-notes/mcp-oauth-ownership.md),
-"Path B"). A provider that cannot accept a public PKCE client is not
-configurable here.
+**Three OAuth fields are configurable on a remote entry, and the dashboard API
+exposes only the public one.** To skip DCR against a provider that pre-registers
+clients, set `clientId` on the entry: Kiro Crew maps it to the wire field
+`oauth.clientId` (`mcp_utils.kiro_oauth_wire_entry`, and `kiro_entry_client_id`
+reads it in either spelling). kiro-cli's `oauth` block also accepts
+`clientSecret` — when it is present alongside `clientId`, DCR is skipped and
+the secret is presented at the token endpoint (a **confidential** client) — and
+`redirectUri`, which pins the loopback listener's host (`127.0.0.1` or
+`localhost`), port and path so it matches a redirect URI registered in a vendor
+console. Neither of those two is settable through `POST /api/mcp/custom`, and
+you should not hand-write them into a custom entry either: a secret written
+there sits in plaintext in a file the agent can read, with nothing owning its
+lifecycle. The supported path for a confidential pre-registered client is a
+**Connections registry provider** with `auth.mode: "preregistered"` — the
+operator enters the client under **Settings → OAuth Apps**, the secret goes to
+the encrypted vault, and Kiro Crew writes all three fields into the emitted
+spec itself (see
+[../system-specs/modules/connections.md](../system-specs/modules/connections.md),
+"Pre-registered OAuth clients", and the runbooks under
+[oauth-app-registration/](oauth-app-registration/README.md)). A provider that is
+not in the registry and cannot accept a public PKCE client is not configurable
+here.
 
 ## Tools register only in a fresh session
 

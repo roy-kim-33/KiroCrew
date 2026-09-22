@@ -1,13 +1,21 @@
 {
+<<<<<<< HEAD
   "name": "roycrew",
   "version": "0.7.0-roycrew.1",
   "description": "RoyCrew — AI agent desktop app (fork of Kiro Crew)",
   "homepage": "https://github.com/roy-kim-33/KiroCrew",
   "desktopName": "roycrew.desktop",
+=======
+  "name": "kirocrew-desktop",
+  "version": "0.8.0",
+  "description": "Kiro Crew \u2014 AI agent desktop app",
+  "homepage": "https://github.com/kirodotdev/KiroCrew",
+  "desktopName": "kirocrew-desktop.desktop",
+>>>>>>> upstream/main
   "main": "main.js",
   "scripts": {
     "start": "electron .",
-    "test": "node --test test/*.test.js mochi/test/*.test.js crew-companion/test/*.test.js",
+    "test": "node --require ./test/_preload.cjs --test test/*.test.js mochi/test/*.test.js crew-companion/test/*.test.js",
     "postinstall": "node scripts/patch-nsis-template.js",
     "dist": "electron-builder",
     "dist:mac": "electron-builder --mac",
@@ -24,11 +32,19 @@
   },
   "overrides": {
     "fast-uri": "3.1.7",
-    "js-yaml": "4.3.1"
+    "js-yaml": "4.3.2"
   },
   "build": {
+<<<<<<< HEAD
     "appId": "com.roykim.roycrew",
     "productName": "RoyCrew",
+=======
+    "appId": "com.amazon.kiro.crew",
+    "productName": "KiroCrew",
+    "toolsets": {
+      "appimage": "1.0.3"
+    },
+>>>>>>> upstream/main
     "mac": {
       "category": "public.app-category.developer-tools",
       "icon": "icon.icns",
@@ -173,23 +189,30 @@
       "renderer-recovery.js",
       "hang-recovery.js",
       "native-logging.js",
+      "crash-collector.js",
       "disable-gpu.js",
+      "gpu-crash-fallback.js",
+      "early-boot-guard.js",
       "memory-watch-log.js",
       "frame-load-log.js",
+      "pane-asset-journal.js",
       "cage-trace.js",
       "pyspy-dump.js",
       "perf-metrics.js",
       "host-config.js",
+      "open-path.js",
       "store-rename.js",
       "remote-token.js",
       "token-acquire.js",
       "token-retry.js",
+      "capture-trust.js",
       "display-media.js",
       "focus-chrome.js",
       "permission-handler.js",
       "browser-view.js",
       "browser-control.js",
       "browser-ops.js",
+      "browser-annotate.js",
       "browser-agent-channel.js",
       "external-scheme.js",
       "validation.js",
@@ -219,7 +242,8 @@
       "icon.png",
       "icon-nightly.png",
       "trayTemplate.png",
-      "trayTemplate@2x.png"
+      "trayTemplate@2x.png",
+      "EXTERNALLY-MANAGED"
     ],
     "extraResources": [
       {

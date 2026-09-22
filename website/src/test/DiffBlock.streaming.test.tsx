@@ -34,7 +34,11 @@ const fullPatch = `--- /home/user/example/src/greet.py
  *  PatchImpl actually mounts and parses before being torn down. */
 async function warmPierre() {
   const { unmount } = render(<DiffBlock code={fullPatch} complete />)
-  await screen.findByTitle('Copy patch')
+  // The lazy `import('./PierreImpl')` chunk (src/pierre/index.tsx) races the
+  // default findBy timeout (1000ms) under a loaded, concurrent run -- widen
+  // it rather than assume the dynamic import always resolves within 1s
+  // (same class as touchHoverActions.test.tsx).
+  await screen.findByTitle('Copy patch', {}, { timeout: 5000 })
   unmount()
 }
 
@@ -48,7 +52,7 @@ describe('DiffBlock streaming', () => {
     for (let end = 1; end <= fullPatch.length; end += 7) {
       const partial = fullPatch.slice(0, end)
       const { unmount } = render(
-        <DiffBlock code={partial} complete={false} streaming />,
+        <DiffBlock code={partial} complete={false} />,
       )
       await flush()
       unmount()

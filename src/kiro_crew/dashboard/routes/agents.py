@@ -1,4 +1,5 @@
-"""Route registration for workspaces, agents, agent CRUD, edition capability agents.
+"""Route registration for workspaces, agents, agent CRUD, edition capability agents,
+the crew roster, and the shared appearance library.
 
 One contiguous slice of the dashboard's route table, kept in its original
 order. aiohttp resolves routes in REGISTRATION order, and several routes here
@@ -12,6 +13,8 @@ from __future__ import annotations
 from aiohttp import web
 
 from kiro_crew.dashboard import handlers
+from kiro_crew.dashboard.handlers import agent_templates
+from kiro_crew.dashboard.handlers.agent_catalog import api_agent_catalog
 
 
 def register(app: web.Application) -> None:
@@ -22,7 +25,11 @@ def register(app: web.Application) -> None:
     app.router.add_put("/api/workspaces/{name}", handlers.api_workspaces_update)
     app.router.add_delete("/api/workspaces/{name}", handlers.api_workspaces_delete)
     # Agents
+    app.router.add_get("/api/agents/catalog", api_agent_catalog)
     app.router.add_get("/api/agents/installed", handlers.api_agents_installed)
+    # The templates tab: roster with editability + references, create, delete.
+    app.router.add_get("/api/agents/templates", agent_templates.api_agent_templates)
+    app.router.add_post("/api/agents/templates", agent_templates.api_agent_template_create)
     app.router.add_get("/api/models", handlers.api_models)
     app.router.add_get("/api/effort-levels", handlers.api_effort_levels)
     # Fork: self-hosted claude_code / opencode custom router probe + status.
@@ -31,7 +38,15 @@ def register(app: web.Application) -> None:
     app.router.add_get("/api/slash-commands", handlers.api_slash_commands)
     app.router.add_get("/api/agents/detail/{name}", handlers.api_agent_detail)
     app.router.add_patch("/api/agents/detail/{name}", handlers.api_agent_detail)
-    app.router.add_delete("/api/agents/detail/{name}", handlers.api_agent_detail)
+    app.router.add_delete("/api/agents/detail/{name}", agent_templates.api_agent_template_delete)
+    app.router.add_post("/api/agents/detail/{name}/fork", handlers.api_agent_fork)
+    app.router.add_post("/api/agents/detail/{name}/publish", handlers.api_agent_publish)
+    app.router.add_post("/api/agents/detail/{name}/reset", handlers.api_agent_reset)
+    from kiro_crew.dashboard.handlers.agent_capabilities import api_member_capabilities
+
+    app.router.add_get("/api/agents/{name}/capabilities", api_member_capabilities)
+    app.router.add_post("/api/agents/{name}/capabilities/preview", api_member_capabilities)
+    app.router.add_put("/api/agents/{name}/capabilities", api_member_capabilities)
     # Kiro Crew Agent CRUD
     app.router.add_get("/api/agents", handlers.api_kirocrew_agents)
     app.router.add_get("/api/agents/resolved-model", handlers.api_kirocrew_agent_resolved_model)
@@ -56,3 +71,20 @@ def register(app: web.Application) -> None:
     app.router.add_get("/api/members", handlers.api_members)
     app.router.add_post("/api/members/{slug}/thread", handlers.api_member_thread)
     app.router.add_get("/api/members/{slug}/activity", handlers.api_member_activity)
+    app.router.add_get("/api/members/{slug}/rules", handlers.api_member_rules_get)
+    app.router.add_put("/api/members/{slug}/rules", handlers.api_member_rules_put)
+
+    # Crew appearance library: the dashboard's own pack store, separate from
+    # Crew Companion's. On the dashboard router so a crew's face renders while
+    # that app is disabled or absent.
+    #
+    # Literals before the {id} pattern: aiohttp resolves in registration order,
+    # so `/api/appearances/import` registered after `/api/appearances/{id}`
+    # would be swallowed by it.
+    app.router.add_get("/api/appearances", handlers.api_appearances_list)
+    app.router.add_post("/api/appearances/import", handlers.api_appearances_import)
+    app.router.add_post("/api/appearances/petdex/fetch", handlers.api_appearances_petdex_fetch)
+    app.router.add_get("/api/appearances/{id}", handlers.api_appearance_detail)
+    app.router.add_delete("/api/appearances/{id}", handlers.api_appearance_delete)
+    app.router.add_get("/api/appearances/{id}/slot/{slot}", handlers.api_appearance_slot)
+    app.router.add_get("/api/appearances/{id}/sound/{state}", handlers.api_appearance_sound)

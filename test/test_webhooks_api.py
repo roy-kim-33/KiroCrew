@@ -8,6 +8,7 @@ of a call that never became a run.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import time
 from pathlib import Path
@@ -237,6 +238,67 @@ class TestTokenEndpoints:
         )
         assert unknown.status == 400
         assert (await _payload(unknown))["code"] == "destination_agent_unavailable"
+
+    @pytest.mark.asyncio
+    async def test_pin_commits_under_the_agents_spec_lock_and_reverifies(self, wired, monkeypatch):
+        """The template delete unlinks a spec while holding ``agents_spec_lock``
+        and counts webhook pins first; a mint or re-pin must therefore commit
+        under that lock and re-check the agent THERE, or a token can validate
+        against a file the delete is about to remove. Here the agent vanishes
+        between the loop-side pre-check and the locked commit: nothing is
+        minted, and a re-pin leaves the stored pin alone."""
+        names = [{"kirocrew", "code-reviewer", "oncall"}]
+        monkeypatch.setattr(H, "_installed_agent_names", lambda: names[-1])
+        held: list[bool] = []
+        vanish: list[str] = ["code-reviewer"]  # what a concurrent delete removes, once
+        real_lock = H.agents_spec_lock
+
+        @contextlib.contextmanager
+        def _spy_lock(agents_dir):
+            with real_lock(agents_dir):
+                held.append(True)
+                if vanish:  # the delete landed while we waited for the lock
+                    names.append(names[-1] - {vanish.pop()})
+                yield
+
+        monkeypatch.setattr(H, "agents_spec_lock", _spy_lock)
+        gone = await H.api_webhook_token_create(
+            _req("POST", "/api/webhooks/tokens", {"label": "Review Bot", "agent": "code-reviewer"})
+        )
+        assert gone.status == 400
+        assert (await _payload(gone))["code"] == "destination_agent_unavailable"
+        assert held == [True]
+        assert webhooks.token_store().count() == 0
+
+        # A re-pin walks the same path; a change that leaves the pin alone does not.
+        minted = await _payload(
+            await H.api_webhook_token_create(
+                _req("POST", "/api/webhooks/tokens", {"label": "Pager", "agent": "oncall"})
+            )
+        )
+        token_id = minted["entry"]["id"]
+        held.clear()
+        relabel = await H.api_webhook_token_update(
+            _req(
+                "PATCH",
+                f"/api/webhooks/tokens/{token_id}",
+                {"label": "Pager 2"},
+                match_info={"token_id": token_id},
+            )
+        )
+        assert relabel.status == 200 and held == []
+        vanish.append("oncall")
+        repin = await H.api_webhook_token_update(
+            _req(
+                "PATCH",
+                f"/api/webhooks/tokens/{token_id}",
+                {"agent": "oncall"},
+                match_info={"token_id": token_id},
+            )
+        )
+        assert repin.status == 400 and held == [True]
+        assert (await _payload(repin))["code"] == "destination_agent_unavailable"
+        assert webhooks.token_store().entry_for(token_id)["agent"] == "oncall"
 
     @pytest.mark.asyncio
     async def test_create_rejects_bad_label(self, wired):
@@ -550,8 +612,8 @@ class TestEveryStoreTouchingHandlerIsGuarded:
     """A store failure must never reach the client as a 500.
 
     Reads refuse rather than reporting an empty file, and the shared hooks.json
-    write refuses rather than erasing the webhook contexts beside it. Those
-    refusals were being guarded one handler per review round, so this pins the
+    write refuses rather than erasing the webhook contexts beside it. Guarding
+    these refusals one handler at a time misses new handlers, so this pins the
     CLASS instead of the instances: every handler that touches a store is wrapped.
     """
 
@@ -577,7 +639,7 @@ class TestEveryStoreTouchingHandlerIsGuarded:
 
         Checked by reading the source rather than by exercising each route, so the
         assertion covers handlers this suite has no fixture for. Without it the
-        next handler added would repeat the same review round.
+        next handler added could reintroduce the bug unnoticed.
         """
         import inspect
         import re
@@ -693,19 +755,24 @@ class TestOneTurnPerSessionKey:
                 sign_with=secret,
             )
 
+        # The waits below are hang guards, not timing assertions: the test
+        # proves ORDER (the claim lands before the capacity await), and a loaded
+        # Windows runner has taken longer than a second to schedule the first
+        # request's coroutine as far as acquire().
+        bound = 10
         first = asyncio.create_task(H.api_hooks_agent(request("first")))
-        await asyncio.wait_for(semaphore.entered.wait(), timeout=1)
+        await asyncio.wait_for(semaphore.entered.wait(), timeout=bound)
 
         # The first request is paused inside acquire(). The claim must already
         # be visible, so the second request finishes with session_busy instead
         # of joining it at the capacity await.
-        second = await asyncio.wait_for(H.api_hooks_agent(request("second")), timeout=1)
+        second = await asyncio.wait_for(H.api_hooks_agent(request("second")), timeout=bound)
         assert second.status == 409
         assert (await _payload(second))["code"] == "session_busy"
         assert semaphore.acquire_calls == 1
 
         semaphore.allow.set()
-        accepted = await asyncio.wait_for(first, timeout=1)
+        accepted = await asyncio.wait_for(first, timeout=bound)
         assert accepted.status == 200
         await asyncio.sleep(0)
         run.assert_awaited_once()
@@ -763,9 +830,9 @@ class TestOneTurnPerSessionKey:
 class TestDeliveryIsRecordedAfterItHappens:
     """Run history must name only destinations that actually received the result.
 
-    `delivered` used to be derived from intent (`deliver and result_text`) and the
-    record was written before delivery was attempted. Slack failures are caught
-    and logged, so a run whose DM failed was still stored as delivered to Slack —
+    Deriving `delivered` from intent (`deliver and result_text`) and writing the
+    record before delivery is attempted is wrong: Slack failures are caught
+    and logged, so a run whose DM fails would still be stored as delivered to Slack —
     and the run history is the only place an operator can check.
     """
 
@@ -960,7 +1027,7 @@ class TestRunHistoryRedaction:
 class TestUnreadableStoreResponses:
     """A store that cannot be parsed must produce named errors, not 500s.
 
-    Store reads refuse rather than reporting an empty file (which previously let
+    Store reads refuse rather than reporting an empty file (which would otherwise let
     a single corrupt byte destroy every credential). That refusal is a raised
     exception, so every request path that touches a store needs to answer with
     something meaningful instead of letting it become an unhandled 500.
@@ -1374,8 +1441,8 @@ class TestRejectionPathsAreRecorded:
     async def test_wrong_field_types_are_400_not_500(self, wired, payload, expected):
         """An authenticated caller's bad types must not become a server error.
 
-        ``{"message": 1}`` used to reach ``.strip()`` on an int, and a non-string
-        ``sessionKey`` reached ``.startswith()`` — both raise inside the handler
+        ``{"message": 1}`` can reach ``.strip()`` on an int, and a non-string
+        ``sessionKey`` reaches ``.startswith()`` — both raise inside the handler
         and surface as HTTP 500 on a request that authenticated correctly.
         """
         raw, _secret, _entry = webhooks.token_store().create("CI runner", False)

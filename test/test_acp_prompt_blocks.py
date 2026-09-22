@@ -308,7 +308,7 @@ class TestUncProbeGate:
 
     def test_attacker_host_is_refused(self, monkeypatch, tmp_path):
         monkeypatch.setattr(
-            "kiro_crew.config.paths.data_home", lambda: tmp_path / "home"
+            "kiro_crew.config.paths.peek_data_home", lambda: tmp_path / "home"
         )
         assert hooks.unc_probe_allowed(r"\\evil\share\x.png") is False
         assert hooks.unc_probe_allowed("//evil/share/x.png") is False
@@ -316,7 +316,7 @@ class TestUncProbeGate:
     def test_unc_under_a_unc_data_home_is_allowed(self, monkeypatch):
         """Roaming profile: the data home ITSELF is a UNC share."""
         monkeypatch.setattr(
-            "kiro_crew.config.paths.data_home",
+            "kiro_crew.config.paths.peek_data_home",
             lambda: Path(r"\\fileserver\home\me\.kiro\crew"),
         )
         allowed = hooks.unc_probe_allowed(
@@ -334,13 +334,13 @@ class TestUncProbeGate:
 
     def test_sibling_share_on_same_server_is_refused(self, monkeypatch):
         monkeypatch.setattr(
-            "kiro_crew.config.paths.data_home",
+            "kiro_crew.config.paths.peek_data_home",
             lambda: Path(r"\\fileserver\home\me\.kiro\crew"),
         )
         if os.name == "nt":
             assert hooks.unc_probe_allowed(r"\\fileserver\other\x.png") is False
 
-    # --- kiro agents dir as a trusted UNC root (#6721) ----------------------
+    # --- kiro agents dir as a trusted UNC root ----------------------
     #
     # Forward-slash UNC spellings are used for every assertion that must hold
     # on the Linux CI box: ``normcase``/``normpath`` leave a ``//host/share``
@@ -352,11 +352,11 @@ class TestUncProbeGate:
 
     def _patch_roots(self, monkeypatch, tmp_path, agents_dir):
         """Local data home + the given agents dir, isolating the new root."""
-        monkeypatch.setattr("kiro_crew.config.paths.data_home", lambda: tmp_path / "home")
+        monkeypatch.setattr("kiro_crew.config.paths.peek_data_home", lambda: tmp_path / "home")
         monkeypatch.setattr("kiro_crew.config.paths.kiro_agents_dir", lambda: agents_dir)
 
     def test_unc_kiro_agents_dir_is_allowed(self, monkeypatch, tmp_path):
-        """Headline #6721: on a roaming-profile (UNC) home, a spec under the
+        """On a roaming-profile (UNC) home, a spec under the
         kiro agents dir passes the gate. The data home is patched LOCAL so the
         admission can only come from the new agents root."""
         self._patch_roots(monkeypatch, tmp_path, Path(self._UNC_KIRO_HOME + "/agents"))
@@ -401,14 +401,14 @@ class TestUncProbeGate:
 
         monkeypatch.setattr("kiro_crew.config.paths.kiro_agents_dir", boom)
         monkeypatch.setattr(
-            "kiro_crew.config.paths.data_home",
+            "kiro_crew.config.paths.peek_data_home",
             lambda: Path("//fileserver/home/me/.kiro/crew"),
         )
         assert hooks.unc_probe_allowed("//fileserver/home/me/.kiro/crew/uploads/x.png") is True
         assert hooks.unc_probe_allowed("//evil/share/x.png") is False
 
     def test_agents_root_is_resolved_once_per_configuration(self, monkeypatch, tmp_path):
-        """Review finding (#6728 round 2): ``kiro_agents_dir()`` resolves
+        """``kiro_agents_dir()`` resolves
         ``KIRO_HOME`` (``Path.resolve()`` -- filesystem I/O, SMB on a UNC
         override), so the gate must NOT consult it per check. The root is
         memoized on the raw ``KIRO_HOME`` + accessor identity; repeated gate
@@ -419,10 +419,36 @@ class TestUncProbeGate:
             calls.append(1)
             return Path(self._UNC_KIRO_HOME + "/agents")
 
-        monkeypatch.setattr("kiro_crew.config.paths.data_home", lambda: tmp_path / "home")
+        monkeypatch.setattr("kiro_crew.config.paths.peek_data_home", lambda: tmp_path / "home")
         monkeypatch.setattr("kiro_crew.config.paths.kiro_agents_dir", counting_agents_dir)
         assert hooks.unc_probe_allowed(self._UNC_KIRO_HOME + "/agents/foo.json") is True
         assert hooks.unc_probe_allowed(self._UNC_KIRO_HOME + "/agents/bar.json") is True
+        assert hooks.unc_probe_allowed("//evil/share/x.png") is False
+        assert len(calls) == 1
+
+    def test_data_home_is_resolved_once_per_configuration(self, monkeypatch, tmp_path):
+        """The data home is the OTHER resolving root, and it needs the same memo.
+
+        ``data_home()`` is cheap only on its default-home branch. With
+        ``KIROCREW_HOME`` set it calls ``_valid_override_home()`` first, on
+        every call, which does ``Path(override).expanduser().resolve()`` --
+        and a roaming profile is precisely when that override names a share, so
+        the per-check cost is an SMB round-trip. ``config_dir()``'s own memo
+        does not cover it: that memo sits behind the predicate.
+
+        Same contract as the agents root above, asserted the same way: the
+        accessor is consulted once per configuration, not once per check.
+        """
+        calls: list[int] = []
+
+        def counting_data_home():
+            calls.append(1)
+            return Path(self._UNC_KIRO_HOME + "/crew")
+
+        monkeypatch.setattr("kiro_crew.config.paths.peek_data_home", counting_data_home)
+        monkeypatch.setattr("kiro_crew.config.paths.kiro_agents_dir", lambda: tmp_path / "agents")
+        assert hooks.unc_probe_allowed(self._UNC_KIRO_HOME + "/crew/uploads/a.png") is True
+        assert hooks.unc_probe_allowed(self._UNC_KIRO_HOME + "/crew/uploads/b.png") is True
         assert hooks.unc_probe_allowed("//evil/share/x.png") is False
         assert len(calls) == 1
 
@@ -436,7 +462,7 @@ class TestUncProbeGate:
             calls.append(1)
             raise RuntimeError("no usable home")
 
-        monkeypatch.setattr("kiro_crew.config.paths.data_home", lambda: tmp_path / "home")
+        monkeypatch.setattr("kiro_crew.config.paths.peek_data_home", lambda: tmp_path / "home")
         monkeypatch.setattr("kiro_crew.config.paths.kiro_agents_dir", boom)
         assert hooks.unc_probe_allowed("//evil/share/x.png") is False
         assert hooks.unc_probe_allowed("//evil/share/y.png") is False
@@ -495,7 +521,7 @@ class TestUncProbeGate:
         "the outbound SMB probe the gate exists to prevent",
     )
     def test_read_agent_spec_under_unc_agents_dir(self, monkeypatch, tmp_path):
-        """End-to-end #6721 symptom: a spec under a UNC-shaped kiro agents dir
+        """A spec under a UNC-shaped kiro agents dir
         parses instead of silently reading as absent (``None``).
 
         Windows-resolver simulation, stated per the task spec: hooks' view of
@@ -526,6 +552,11 @@ class TestUncProbeGate:
 
         self._patch_roots(monkeypatch, tmp_path, Path(unc_agents))
         monkeypatch.setattr(hooks, "os", self._NtOs())
+        # The real Windows descriptor witness keeps this as a UNC path. Linux's
+        # /proc witness canonicalizes the openable ``//tmp`` stand-in to
+        # ``/tmp``; model the Windows result so this cross-platform fixture
+        # exercises the intended validated-path/opened-path equality.
+        monkeypatch.setattr(hooks, "_fd_real_path", lambda _fd: unc_spec)
         assert _read_agent_spec(_WindowsResolvedPath()) == {"name": "foo", "model": "m1"}
 
     def test_untrusted_unc_text_is_never_stat_probed_on_windows(self, monkeypatch):
@@ -820,7 +851,7 @@ class TestImageEncodedBudget:
 
 
 class TestSummarizePromptStructure:
-    """Content-free outbound-request STRUCTURE diagnostics (issue #6022).
+    """Content-free outbound-request STRUCTURE diagnostics.
 
     The summary lets an operator tell a stale/invalid model id apart from a
     structurally malformed payload the next time a turn is rejected as
@@ -891,7 +922,7 @@ class TestSummarizePromptStructure:
         assert out["total_bytes"] > 0
 
     def test_summary_contains_no_message_content(self):
-        """The #6022 hard requirement: a content sentinel placed in a block's
+        """A content sentinel placed in a block's
         text must not appear anywhere in repr() of the summary."""
         sentinel = "SENTINEL_SECRET_TOKEN_ghp_deadbeef"
         blocks = [
@@ -978,7 +1009,7 @@ class TestLinkedAncestorGate:
     """On Windows, a candidate beneath a linked ANCESTOR must be refused
     BEFORE the first filesystem probe -- ``is_file()`` resolves every
     ancestor, so the probe itself would traverse the link and open the SMB
-    connection the lexical UNC screen exists to prevent (#5962).
+    connection the lexical UNC screen exists to prevent.
 
     NOTE: under the module-local os patch, ``_PATH_RE`` keeps the grammar
     chosen at import time, so candidates here stay host-native; the Windows

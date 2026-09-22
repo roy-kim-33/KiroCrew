@@ -204,6 +204,17 @@ def _az_env(
     passthrough["AZURE_CORE_COLLECT_TELEMETRY"] = "0"
     passthrough["AZURE_CORE_NO_COLOR"] = "1"
     passthrough["NO_COLOR"] = "1"
+    # The other half of the caller's ``encoding="utf-8"``. Naming the codec on the
+    # parent side says how the bytes are READ; it cannot change what the child
+    # WRITES. ``az`` is a Python program, and a Python child writing to a PIPE
+    # encodes its stdout with ``locale.getpreferredencoding(False)`` -- the ANSI
+    # code page on Windows -- unless ``PYTHONIOENCODING`` says otherwise. That
+    # key is not on ``minimal_env``'s safe list, so the child would otherwise
+    # inherit nothing and fall back to the code page: a work-item title outside
+    # it comes back as a ``?`` az itself substituted, which no parent-side codec
+    # can recover. Pinning it here makes both ends agree by construction, and an
+    # operator's own hostile value cannot reach the child either.
+    passthrough["PYTHONIOENCODING"] = "utf-8"
     return minimal_env(**passthrough)
 
 
@@ -235,6 +246,20 @@ def _is_forbidden(tail: str) -> bool:
     return "403" in low or "forbidden" in low or "does not have permission" in low
 
 
+#: Paths :func:`_body_file` created, so a launcher-argument check can tell a path THIS
+#: module generated from a value a caller influenced. The distinction is load-bearing: a
+#: temp path's spelling belongs to the HOST, not to this code — a Windows 8.3 short name
+#: contributes ``~`` (``C:\Users\RUNNER~1\...`` on a CI runner), and a ``TMPDIR`` under
+#: ``Program Files (x86)`` would contribute parentheses. Deriving a character allowlist
+#: that covers every host's temp-path spelling is not possible, so a generated path is
+#: checked for characters that are actually hostile instead of for membership of the set a
+#: composed argv element can legitimately contain.
+#:
+#: An unregistered path falls through to the strict allowlist and is REFUSED, so failing
+#: to register one makes the check stricter rather than weaker.
+_GENERATED_BODY_PATHS: set[str] = set()
+
+
 def _body_file(body: object) -> str:
     """Write a request body to a unique 0600 file; the caller must unlink it."""
     fd, path = tempfile.mkstemp(prefix="kirocrew-az-", suffix=".json")
@@ -244,6 +269,7 @@ def _body_file(body: object) -> str:
     except Exception:
         os.unlink(path)
         raise
+    _GENERATED_BODY_PATHS.add(path)
     return path
 
 

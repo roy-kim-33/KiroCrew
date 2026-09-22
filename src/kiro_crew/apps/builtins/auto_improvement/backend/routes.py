@@ -95,17 +95,9 @@ _CONFIG_WRITABLE = frozenset(
         # watchers only at repositories whose PR comments they would be willing to execute.
         # Same opt-in shape as `watcherAutoStart`. Raised by the GPT review.
         "watcherAcceptEgressRisk",
-        # Opt-in: acknowledge that the LOOP's authoring agent runs without this app's own
-        # strict credential masking. Default OFF, fail-closed. The subprocess path spawns
-        # through `sandboxed_spawn_argv(mode="strict")` + `strip_credential_env`, which hides
-        # `~/.aws`/`~/.gnupg`/`gh` stores; the PROVIDER path drives a Kiro Crew session
-        # instead, so isolation is whatever the gateway's `sandbox` setting gives — and only
-        # 'cc'/'strict' profiles hide credential directories from the agent. On a gateway
-        # with default 'auto'/'standard' (which exposes .aws/.ssh for workflow use), a
-        # repository instruction reaching the agent's auto-approved Bash could read those
-        # stores and exfiltrate. `runner._build_runner` therefore runs OFFLINE unless the
-        # sandbox is 'cc'/'strict' or this flag is set. Same one-time-consent shape as
-        # `watcherAcceptEgressRisk`. Raised by the GPT review.
+        # Explicit consent for unattended repository execution when the gateway's
+        # effective sandbox is below strict and credential stores remain visible.
+        # Default OFF. The runner checks this before creating member assignments.
         "acceptUnsandboxedAgentRisk",
         # Run budget. Safe to expose: these only ever SHRINK or grow how much work
         # one run does; none of them can retarget the repository or relax a gate.
@@ -359,12 +351,12 @@ async def _handle_setup_clone(request: web.Request) -> web.StreamResponse:
     def _clone() -> tuple[dict, str]:
         return clone_setup.setup_safe_clone(url, store.scratch_path())
 
-    # `result` is a PARAMETER, not a closure read. It used to be a free variable of this
-    # handler, which broke the moment clone+persist moved inside `_clone_and_persist` to take
-    # the lock: that inner function binds its own local `result`, so the outer cell stayed
-    # empty and every successful setup raised `NameError` (a 500, with the clone on disk and
-    # config.json never written — the app could not be set up at all). Passing it explicitly
-    # makes the dependency visible instead of scope-dependent. Raised by the Opus 5 review.
+    # `result` is a PARAMETER, not a closure read. clone+persist live inside
+    # `_clone_and_persist` so they hold the lock, and that inner function binds its own local
+    # `result` — read as a free variable of this handler, the outer cell stays empty and every
+    # successful setup raises `NameError` (a 500, with the clone on disk and config.json never
+    # written, so the app cannot be set up at all). Passing it explicitly makes the dependency
+    # visible instead of scope-dependent.
     def _persist(result: dict) -> dict[str, Any]:
         current = store.read_json(store.config_path(), {}) or {}
         retargeted = str(current.get("target_url") or "") != url
@@ -634,7 +626,7 @@ async def _handle_finding_detail(request: web.Request) -> web.StreamResponse:
             "status": latest.get("status") or "",
             "note": latest.get("note") or "",
             "ts": latest.get("ts"),
-            # The ledger's field is historically named ``cr``; expose it as ``pr``
+            # The ledger's field is named ``cr``; expose it as ``pr``
             # so the UI speaks one vocabulary, and keep the raw key readable.
             "pr": latest.get("pr") or latest.get("cr") or "",
             "history": history,
@@ -801,7 +793,7 @@ async def _handle_draft_pr(request: web.Request) -> web.StreamResponse:
         try:
             isolated = clone_setup._repository_is_isolated(Path(clone))
         except clone_setup.IsolationProbeError as exc:
-            # Sandbox failure, not an isolation verdict — name it (#8151).
+            # Sandbox failure, not an isolation verdict — name it as such.
             return {"ok": False, "error": str(exc)}
         if not isolated:
             return {"ok": False, "error": "repository isolation check failed — re-run setup"}
@@ -1390,7 +1382,7 @@ async def _handle_run_start(_request: web.Request) -> web.StreamResponse:
         # Before the generic clause: this subclasses RuntimeError, but it is a
         # sandbox-launcher failure, not a config/state conflict — a distinct
         # `code` so a UI branching on it does not render the misleading
-        # push-isolation guidance (#8151). The message is the actionable part.
+        # push-isolation guidance. The message is the actionable part.
         return web.json_response(
             {"code": "sandbox_launcher_failed", "error": str(exc)}, status=409
         )
@@ -1476,6 +1468,9 @@ def register_routes(app: web.Application) -> None:
         try:
 
             pr_watchers.attach_loop(asyncio.get_running_loop())
+            from .crew import attach_gateway
+
+            attach_gateway(_app.get("state"))
         except Exception:  # pragma: no cover - never break gateway startup
             logger.warning("%s: could not bind the watcher loop", store.APP_NAME, exc_info=True)
 
