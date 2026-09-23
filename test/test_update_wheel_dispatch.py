@@ -1,4 +1,4 @@
-"""Tests for the CLI ``kirocrew update`` wheel-install dispatch (issue #1871).
+"""Tests for the CLI ``kirocrew update`` wheel-install dispatch.
 
 Covers:
 - Install layout detection (git, wheel, externally managed)
@@ -9,6 +9,7 @@ Covers:
 from __future__ import annotations
 
 import json
+import os
 import subprocess  # noqa: F401 -- used via monkeypatch.setattr
 from unittest.mock import MagicMock, patch
 
@@ -26,6 +27,63 @@ def _init_repo(path) -> None:
     )
 
 
+def _pin_probe_git(monkeypatch, tmp_path):
+    """Resolve the worktree probe's git to a fake under ``tmp_path``.
+
+    ``update_capability._git_toplevel`` finds git through ``trusted_system_bin``
+    (fixed system directories, never PATH) and asks ``rev-parse --show-toplevel``
+    about the install root. Left alone, that is the HOST's git running from the
+    test process -- and on a host that keeps git outside those directories the
+    probe silently degrades to the on-disk fallback, so which branch a test
+    exercised depended on the machine. The fake answers the one question the
+    probe asks the way git does: the ``-C`` root itself when it carries ``.git``,
+    exit 128 otherwise. Every argv it sees is appended to ``git-calls.log``
+    beside it. The probe's own reading of real repositories is covered in
+    ``test_update_capability.py``; here the install shape is a precondition.
+    """
+    bin_dir = tmp_path / "fake-bin"
+    bin_dir.mkdir()
+    log = bin_dir / "git-calls.log"
+    if os.name == "nt":
+        fake = bin_dir / "git.cmd"
+        fake.write_text(
+            "@echo off\r\n"
+            f'echo %* >> "{log}"\r\n'
+            ":loop\r\n"
+            'if "%~1"=="" goto miss\r\n'
+            'if "%~1"=="-C" (\r\n'
+            '  if exist "%~2\\.git" (echo %~2& exit /b 0)\r\n'
+            "  goto miss\r\n"
+            ")\r\n"
+            "shift\r\n"
+            "goto loop\r\n"
+            ":miss\r\n"
+            "echo fatal: not a git repository 1>&2\r\n"
+            "exit /b 128\r\n",
+            encoding="utf-8",
+        )
+    else:
+        fake = bin_dir / "git"
+        fake.write_text(
+            "#!/bin/sh\n"
+            f'printf \'%s\\n\' "$*" >> "{log}"\n'
+            "root=\n"
+            'while [ "$#" -gt 0 ]; do\n'
+            '  if [ "$1" = "-C" ]; then root=$2; shift; fi\n'
+            "  shift\n"
+            "done\n"
+            'if [ -n "$root" ] && [ -e "$root/.git" ]; then printf \'%s\\n\' "$root"; exit 0; fi\n'
+            "echo 'fatal: not a git repository' >&2\n"
+            "exit 128\n",
+            encoding="utf-8",
+        )
+        fake.chmod(0o755)
+    monkeypatch.setattr(
+        "kiro_crew.platform.update_capability.trusted_system_bin", lambda _name: str(fake)
+    )
+    return fake
+
+
 class TestDetectInstallLayout:
     """Tests for platform/update_layout.detect_install_layout."""
 
@@ -33,6 +91,7 @@ class TestDetectInstallLayout:
         proj = tmp_path / "project"
         proj.mkdir()
         _init_repo(proj)
+        _pin_probe_git(monkeypatch, tmp_path)
         monkeypatch.setenv("KIROCREW_PROJECT_DIR", str(proj))
         monkeypatch.setattr(
             "kiro_crew.platform.update_capability.running_from_checkout",
@@ -78,6 +137,7 @@ class TestDetectInstallLayout:
         proj = tmp_path / "project"
         proj.mkdir()
         _init_repo(proj)
+        _pin_probe_git(monkeypatch, tmp_path)
         monkeypatch.setenv("KIROCREW_PROJECT_DIR", str(proj))
         monkeypatch.setattr(
             "kiro_crew.platform.update_capability.running_from_checkout",
@@ -143,7 +203,7 @@ class TestReleaseChannel:
     from the async update check, and ``config_dir`` is resolve-AND-maintain (it
     refreshes the recovery breadcrumb and re-runs a leftover-archive sweep that can
     ``shutil.rmtree``), so calling it there put a destructive sweep on the event
-    loop -- issue #1057. ``test_no_config_dir_in_async.py`` guards the production
+    loop. ``test_no_config_dir_in_async.py`` guards the production
     side; patch whichever name that module actually uses.
     """
 
@@ -507,6 +567,9 @@ class TestUpdateDivergenceGuard:
                     result.stdout = f"{proj}\n"
                 elif "--abbrev-ref" in args:
                     result.stdout = "main\n"
+                elif "--verify" in args:
+                    # The upstream pin every later judgment and the reset name.
+                    result.stdout = "0123456789abcdef0123456789abcdef01234567\n"
                 elif "diff" in args:
                     # Non-zero: the upstream has new commits, so the update
                     # proceeds past the up-to-date early return.
@@ -524,6 +587,16 @@ class TestUpdateDivergenceGuard:
                         result.stdout = counts
                 elif "status" in args:
                     result.stdout = porcelain
+                elif "show" in args:
+                    # The pre-reset interpreter-floor gate reads pyproject /
+                    # setup.cfg out of the fetched commit, capturing BYTES like
+                    # the real call. Answer "no such path" in git's own words
+                    # (the gate distinguishes an absent path from a failed
+                    # read by them) so the gate does not fire: the divergence
+                    # guard is what these tests are about.
+                    result.returncode = 128
+                    result.stdout = b""
+                    result.stderr = b"fatal: path 'pyproject.toml' does not exist in 'origin/main'"
             return result
 
         monkeypatch.setattr("subprocess.run", fake_run)

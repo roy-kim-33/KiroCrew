@@ -26,6 +26,7 @@ if TYPE_CHECKING:
     from kiro_crew.slack.outbound import PostedOptions
 
 from kiro_crew.context_blocks import attributable_user_chars
+from kiro_crew.dashboard.slot_queue_repository import ATTACHMENT_META_KEYS
 from kiro_crew.dashboard.state import (
     BUSY_RECOVERY_PREFIX,
     COMPACTION_RECOVERY_PREFIX,
@@ -35,6 +36,7 @@ from kiro_crew.dashboard.state import (
     MANUAL_RESUME_RECOVERY_PREFIX,
     POSTTOKEN_RECOVERY_PREFIX,
     PROMISE_ONLY_RECOVERY_PREFIX,
+    REFUSAL_FALLBACK_RECOVERY_PREFIX,
     SUBAGENT_COMPLETION_PREFIXES,
     DashboardState,
     _ChatSlot,
@@ -43,7 +45,7 @@ from kiro_crew.dashboard.state import (
     parse_cls_meta,
 )
 from kiro_crew.history import transcript_sort_key
-from kiro_crew.hooks import safe_read_file
+from kiro_crew.hooks import _HOST_READ_ONLY_BUILTIN_TOOLS, safe_read_file
 from kiro_crew.messaging.link import canonical_key, is_channel_session_key
 from kiro_crew.quick_prompts import QUICK_PROMPTS
 from kiro_crew.security import (
@@ -67,6 +69,24 @@ from kiro_crew.validation import (
 )
 
 logger = logging.getLogger(__name__)
+
+#: The generation every chat_chunk of this process carries (see chunk_generation).
+_CHUNK_GENERATION: str = uuid.uuid4().hex[:8]
+
+
+def chunk_generation() -> str:
+    """The ``gen`` stamped on every chat_chunk frame and window row this process
+    emits: one random value per gateway process.
+
+    Chunk ``seq`` numbers are a per-slot counter that continues across turns,
+    so a client's replay floor -- the newest seq its transcript holds -- orders
+    every later chunk above it. The counter lives in memory and restarts with
+    the gateway, so a floor from before a restart could sit above the new
+    process's early seqs; the client compares ``gen`` first and replaces its
+    floor when the generation changes, instead of dropping those chunks as
+    replays. Not a secret and not an identity: it only says "same process".
+    """
+    return _CHUNK_GENERATION
 
 
 async def run_config_write(fn, /, *args, **kwargs):
@@ -125,6 +145,34 @@ async def run_config_write(fn, /, *args, **kwargs):
         if cancelled:
             raise asyncio.CancelledError
         return result
+
+
+async def drained_to_thread(fn, /, *args):
+    """``asyncio.to_thread`` that a cancellation cannot abandon mid-mutation.
+
+    A plain ``await to_thread(...)`` raises ``CancelledError`` at the await
+    while the worker THREAD keeps running — a handler that then performs
+    cleanup (releasing a lock, removing a staging directory) races its own
+    still-running worker. Shielding the task keeps the await alive until the
+    worker actually finishes, then re-raises the cancellation, so control only
+    ever returns with no mutation in flight. Shared by the agents handler's
+    config writers and the files handler's workspace-copy staging.
+    """
+    task = asyncio.ensure_future(asyncio.to_thread(fn, *args))
+    cancelled: asyncio.CancelledError | None = None
+    while True:
+        try:
+            result = await asyncio.shield(task)
+            break
+        except asyncio.CancelledError as exc:
+            if task.cancelled():
+                raise
+            # OUR await was cancelled, not the worker: remember it, keep
+            # draining the still-running thread.
+            cancelled = exc
+    if cancelled is not None:
+        raise cancelled
+    return result
 
 
 # Per-turn compaction-failure backoff. See
@@ -213,7 +261,7 @@ def _build_stream_chunk(msg: dict, *, include_row_meta: bool = False) -> str:
     SSE / OpenAI-compat stream keeps its "only permission rows carry meta"
     contract; the RELAY drain turns it on, because a relay reader (``_apply_row``)
     rebuilds the local row from this record and would otherwise lose that tool
-    correlation permanently on a local refresh (GPT #7693).
+    correlation permanently on a local refresh.
     """
     try:
         meta = parse_cls_meta(msg.get("cls", "")) if msg.get("role") == "permission" else None
@@ -226,12 +274,11 @@ def _build_stream_chunk(msg: dict, *, include_row_meta: bool = False) -> str:
             meta = row_meta
     if meta:
         meta = _redact_deep(meta)
-    content = msg.get("content", "")
-    if isinstance(content, str):
-        content, _ = redact_exfiltration_urls(content)
-        content, _ = redact_credentials(content)
-    else:
-        content = _redact_deep(content)
+    # One shared guard for content: redact recursively and hold the
+    # wire-string shape (see redact_display_content). This stream has no
+    # user-content carve-out — it redacts every role, same as its previous
+    # inline redactor pair.
+    content = redact_display_content(msg.get("content", ""))
     cls_val = msg.get("cls", "")
     if isinstance(cls_val, str):
         cls_val, _ = redact_exfiltration_urls(cls_val)
@@ -308,8 +355,10 @@ _SLASH_COMMANDS = frozenset(
 # GET /api/slash-commands suggestion payload, so every surface hides them at
 # once — advertising a command that only yields a warning teaches a gesture
 # that does not work.
+# /todos was removed because the KiroACP harness does not implement it and
+# rejects it with an "unknown variant" error.
 _BLOCKED_SLASH_COMMANDS = frozenset(
-    {"/quit", "/exit", "/q", "/chat", "/paste", "/reply", "/editor", "/tangent"}
+    {"/quit", "/exit", "/q", "/chat", "/paste", "/reply", "/editor", "/tangent", "/todos"}
 )
 
 # Single source of truth for slash-command descriptions surfaced by the
@@ -411,6 +460,28 @@ def is_harness_slash_command(first_word: str, *, cc_provider: bool) -> bool:
     return first_word.lower() not in QUICK_PROMPTS
 
 
+def _tool_identity_fields(event: "LLMEvent") -> dict[str, str]:
+    """``tool_name`` / ``mcp_server`` for a tool_call frame, present only when known.
+
+    Read from the trusted ``_meta.kiro`` identity the dispatcher extracted, never
+    from the title. Omitted rather than sent empty so a consumer merging a
+    refinement field-by-field keeps what the initial frame supplied, and so a
+    frame from a backend that sends no ``_meta`` carries nothing to misread. The
+    dashboard's title derivation treats both as optional and falls back to
+    parsing the title, so an absent pair never breaks a row.
+    """
+    out: dict[str, str] = {}
+    name = getattr(event, "tool_name", "")
+    server = getattr(event, "mcp_server_name", "")
+    # Only a real string is an identity; any other value (an event shape that
+    # lacks the attribute, a stand-in object) is treated as unknown.
+    if isinstance(name, str) and name:
+        out["tool_name"] = _redact_tool_field(name, limit=200)
+    if isinstance(server, str) and server:
+        out["mcp_server"] = _redact_tool_field(server, limit=200)
+    return out
+
+
 def _broadcast_auto_tool(state: DashboardState, slot: _ChatSlot, event: "LLMEvent") -> str:
     """Broadcast an auto-approved tool call via WS with redacted title. Returns redacted title."""
     title, _ = redact_exfiltration_urls(event.title)
@@ -429,6 +500,7 @@ def _broadcast_auto_tool(state: DashboardState, slot: _ChatSlot, event: "LLMEven
             "tool_call_id": tcid,
             "purpose": _redact_tool_field(event.tool_purpose, limit=_MAX_TOOL_PURPOSE),
             "input_preview": _redact_tool_field(event.tool_input),
+            **_tool_identity_fields(event),
         },
     )
     return title
@@ -543,7 +615,7 @@ def _emit_agent_assignment(slot_key: str, agent: str, outcome: str = "applied") 
     )
 
 
-def _validate_tool_name(tool_name: str, *, is_shell: bool = False) -> str:
+def _validate_tool_name(tool_name: str, *, is_shell: bool = False, canonical_name: str = "") -> str:
     """Validate and sanitize tool display names for hook matching.
 
     ``is_shell`` is the provider-agnostic signal (set at the provider boundary)
@@ -552,11 +624,22 @@ def _validate_tool_name(tool_name: str, *, is_shell: bool = False) -> str:
     on this flag rather than a hardcoded set of provider tool_kind literals
     (e.g. "execute"/"Bash") stops the cap from silently re-breaking long shell
     commands on every engine migration or tool rename.
+
+    ``canonical_name`` is the adapter-authored tool identity that travelled
+    beside the title (``AcpEvent.tool_name``, read from the harness's own
+    ``_meta`` channel, never from the title or the model's ``description``).
+    The length cap protects the case where the title IS the only identity a
+    hook can match on; when a canonical identity is present the title is
+    content (a ``read`` title embeds the paths it reads, exactly as a shell
+    title embeds its command line), so the cap is skipped for it as it is for
+    ``is_shell``. Sanitisation and the empty check apply regardless: only the
+    length predicate is relaxed. A backend that publishes no identity leaves
+    ``canonical_name`` empty and keeps the loud refusal.
     """
     sanitized = sanitize_string(tool_name)
     if not sanitized:
         raise ValueError("Tool name cannot be empty")
-    if not is_shell and len(sanitized) > MAX_TOOL_NAME_LEN:
+    if not is_shell and not canonical_name and len(sanitized) > MAX_TOOL_NAME_LEN:
         raise ValueError(f"Tool name exceeds max length {MAX_TOOL_NAME_LEN}")
     return sanitized
 
@@ -691,6 +774,24 @@ def slot_history_key(slot: _ChatSlot) -> str:
     return _history_key_for(slot.key)
 
 
+def session_key_for(slot_key: str, linked_session_key: str = "") -> str:
+    """:func:`effective_session_key`'s rule, for a slot that does not exist yet.
+
+    The restore paths build slots FROM disk, so a step that has to address the
+    session before the build has only the slot NAME and the persisted
+    ``linked_session_key`` from the transcript's metadata. This is the same
+    relationship :func:`slot_transcript_key` has to the slot's FILE -- except that
+    one resolves the file and cannot recover the session key at all, so it is the
+    wrong fallback here and a channel-born slot would be addressed as a
+    ``dashboard:`` session that does not exist.
+
+    :func:`effective_session_key` delegates to this rather than repeating it: a
+    second spelling of the rule would drift, and a restore asking with a key the
+    live path never uses matches nothing and fails in SILENCE.
+    """
+    return linked_session_key or _history_key_for(slot_key)
+
+
 def effective_session_key(slot: _ChatSlot) -> str:
     """The session key for *slot* — the session its turns run on.
 
@@ -705,13 +806,14 @@ def effective_session_key(slot: _ChatSlot) -> str:
     turns run on, mirroring its links. For the slot's TRANSCRIPT use
     :func:`slot_history_key`, which resolves the unbound-channel-slot case onto
     the file the read paths actually use. Reserve :func:`_history_key_for` for
-    the cases that genuinely start from a slot key with no slot in hand.
+    the cases that genuinely start from a slot key with no slot in hand, and
+    :func:`session_key_for` for the ones that have no slot YET.
     """
-    return getattr(slot, "linked_session_key", "") or _history_key_for(slot.key)
+    return session_key_for(slot.key, getattr(slot, "linked_session_key", "") or "")
 
 
 def subagents_attached(
-    state: DashboardState, slot: _ChatSlot, session_key: str, operation: str
+    state: DashboardState, slot: _ChatSlot | None, session_key: str, operation: str
 ) -> bool:
     """Whether sub-agent children are attached to *session_key*.
 
@@ -719,6 +821,10 @@ def subagents_attached(
     would discard a child's work. Every such caller shares THIS predicate: a
     second copy is how the probes diverge, and both callers must fail toward
     keeping a child's work.
+
+    *slot* may be ``None`` when no tab displays the session: the in-flight
+    delivery probe then reads as 0 (``getattr`` on ``None`` returns its
+    default) and the two registry probes still decide.
 
     Three probes, none optional:
 
@@ -733,8 +839,20 @@ def subagents_attached(
       with no children, and mistaking the two is exactly the hazard this guard
       exists to prevent.
 
+    The queued probe fails closed in TWO layers, because a raise is not how the
+    common failure arrives: an unreadable task store is absorbed one layer down
+    and answers ``taskq_bridge.UNKNOWN_PENDING`` rather than 0, so the ``except``
+    below is what covers a probe that raises for any OTHER reason — a registry
+    double without the count, an attribute gone. Neither layer may answer 0 for a
+    queue nobody could read.
+
     A state with no ``subagents`` registry answers False — there is no runtime
     for a child to be attached to.
+
+    SYNCHRONOUS variant, for a caller with no event loop under it. The queued
+    probe counts rows that live only in the task store, so it takes the SQLite
+    connection: a caller ON the gateway loop takes
+    :func:`subagents_attached_async` instead.
     """
     subs = getattr(state, "subagents", None)
     if subs is None:
@@ -748,8 +866,132 @@ def subagents_attached(
             # An unreadable queue is unknown children, not zero children.
             logger.debug("%s: queued-depth probe failed", operation, exc_info=True)
             queued = 1
+    return _attached_verdict(running, queued, slot)
+
+
+async def subagents_attached_async(
+    state: DashboardState, slot: _ChatSlot | None, session_key: str, operation: str
+) -> bool:
+    """:func:`subagents_attached` for a caller on the event loop.
+
+    The same three probes with the same fail-closed rules; only WHERE the
+    queued half runs differs. ``_queued_depth`` counts this parent's rows that
+    live only in the store, so it takes the connection — and the store's writer
+    thread holds that connection's lock across ``BEGIN IMMEDIATE``'s busy wait,
+    so taking it here would stall every session's turn and the watchdog
+    heartbeat behind one teardown probe. ``queued_count_for_async`` is the same
+    count with the read on the writer thread.
+
+    A manager double without the async sibling is asked synchronously — it
+    models the pre-queue manager and has no store to block on — which is the
+    probe ``slack.gateway._subagent_queued_count`` and
+    ``handlers.messaging._spawn_on_loop`` already make.
+    """
+    subs = getattr(state, "subagents", None)
+    if subs is None:
+        return False
+    running = subs.running_agents_for(session_key)
+    queued = 0
+    if running is not None:
+        try:
+            queued = await _queued_depth_off_loop(subs, session_key)
+        except Exception:
+            # An unreadable queue is unknown children, not zero children.
+            logger.debug("%s: queued-depth probe failed", operation, exc_info=True)
+            queued = 1
+    return _attached_verdict(running, queued, slot)
+
+
+async def _queued_depth_off_loop(subs: Any, session_key: str) -> int:
+    """This parent's queued-spawn count with its store half off the loop."""
+    import inspect
+
+    entry = getattr(subs, "queued_count_for_async", None)
+    if inspect.iscoroutinefunction(entry):
+        return int(await entry(session_key))
+    return int(subs._queued_depth(session_key))
+
+
+def _attached_verdict(running: Any, queued: int, slot: _ChatSlot | None) -> bool:
+    """The verdict both entry points return, so the two cannot drift.
+
+    *slot* may be ``None``: ``getattr`` on ``None`` reads the in-flight
+    delivery probe as 0 and the two registry probes still decide.
+    """
     inflight = getattr(slot, "_subagent_deliveries_inflight", 0)
     return bool(running is None or running or queued or inflight)
+
+
+async def chat_done_payload(
+    state: DashboardState, slot: _ChatSlot, *, continuing: bool = False
+) -> dict[str, Any]:
+    """Describe whether a turn boundary actually hands the floor to the user.
+
+    Slot snapshots are coalesced, so a sound decision cannot use stale
+    child/plan state from the browser when this frame arrives. Read the same
+    attached-child guard that protects session teardown, including queued spawns
+    and results still being delivered. This is a notification hint only; it never
+    changes dispatch, transcript finalization, or the slot's running state.
+
+    A coroutine for one reason: that guard's queued half reads the task store,
+    and every caller here is a turn-boundary frame on the gateway loop, so the
+    read belongs on the store's writer thread
+    (:func:`subagents_attached_async`).
+    """
+    # Avoid a circular import: autonudge's slot lookup imports dashboard.state.
+    from kiro_crew.autonudge import get_instance
+
+    try:
+        service = get_instance()
+        loop = service.get_by_slot(slot.key) if service is not None else None
+        workflows = getattr(state, "workflow_service", None)
+        continuing = bool(
+            continuing
+            or slot._in_stage_execution
+            or slot._pending_synthesis
+            or (slot.queue_depth and not slot._last_turn_auth_required)
+            or await subagents_attached_async(
+                state, slot, effective_session_key(slot), "completion_sound"
+            )
+            or (
+                workflows is not None
+                and workflows.registry.has_pending_work_for(effective_session_key(slot))
+            )
+            or (loop is not None and loop.active)
+        )
+    except Exception:
+        # Unknown activity must not announce a finished conversation, but a
+        # notification failure must never prevent the terminal frame itself.
+        logger.warning("Completion activity unavailable for slot %s", slot.key, exc_info=True)
+        continuing = True
+    return {
+        "slot": slot.key,
+        "continuing": continuing,
+        "needs_input": bool(slot._question_pending),
+    }
+
+
+def wire_session_subagent_probe(state: DashboardState) -> None:
+    """Hand ``SessionManager`` the sub-agent probe its RSS ceiling consults.
+
+    The manager cannot see the dashboard's sub-agent registry or slots, so the
+    predicate is built here, over :func:`subagents_attached_async`, and
+    installed via ``set_subagent_probe``. The slot is resolved through
+    :func:`dashboard_slot_key` (the same mapping the recycle notice uses); a
+    session with no open tab passes ``None``, which the predicate accepts.
+
+    A COROUTINE predicate: the RSS sweep that consults it runs on the gateway
+    loop, and the queued half of the guard reads the task store. The manager
+    accepts either shape and awaits an awaitable answer, so a sync probe (a
+    test double, a build with no queue) still works.
+    """
+
+    async def _probe(session_key: str) -> bool:
+        slot_key = dashboard_slot_key(session_key)
+        slot = state.get_slot(slot_key) if slot_key else None
+        return await subagents_attached_async(state, slot, session_key, "rss_recycle")
+
+    state.sessions.set_subagent_probe(_probe)
 
 
 def slack_options_slot(state: DashboardState, session_key: str) -> _ChatSlot | None:
@@ -797,6 +1039,32 @@ def slack_options_slot(state: DashboardState, session_key: str) -> _ChatSlot | N
     except Exception:
         logger.debug("Slack OPTIONS slot lookup failed", exc_info=True)
         return None
+
+
+def reject_if_slot_under_construction(
+    state: DashboardState, slot: _ChatSlot
+) -> web.Response | None:
+    """A 409 for a mutating handler that reached a slot under construction.
+
+    Defense-in-depth over the construction mark. The primary protection for the
+    import path is that it RETRACTS the slot from ``_slots`` across its async
+    Layer B write/join and durable save (see ``api_chat_slot_import``), so a raw
+    ``state._slots.get(name)`` acquirer finds nothing during that tail. This check
+    is the belt-and-braces layer: it refuses any mutating handler (regenerate,
+    variant-switch, edit-resend, rewind) that resolves a slot still marked under
+    construction, keyed on ``_slots_under_construction`` rather than registration,
+    so it holds regardless of whether a given construction path retracts. Refused
+    the same way ``slot.running`` is. The hydrate loop itself is synchronous, so
+    there is no in-loop window; this guards the async finalization tail.
+
+    Returns a response to return as-is, or ``None`` to proceed.
+    """
+    if slot.key in getattr(state, "_slots_under_construction", ()):
+        return web.json_response(
+            {"error": "slot is being restored", "code": "slot_under_construction"},
+            status=409,
+        )
+    return None
 
 
 def slack_options_linked_slot(state: DashboardState | None, thread_ts: str) -> _ChatSlot | None:
@@ -912,9 +1180,9 @@ def options_records(state: DashboardState | None, session_key: str) -> tuple[Pos
 
     The store is keyed by SESSION KEY, on ``DashboardState``, not held on the
     slot. A plain Slack thread frequently has no dashboard slot, and a slot-held
-    record was simply dropped for those sessions — so nothing tracked the control,
-    no later turn could expire it, and the stale click this whole lifecycle exists
-    to prevent stayed possible (#1694). Keying by session key makes the slotless
+    record is simply dropped for those sessions — nothing then tracks the control,
+    no later turn can expire it, and the stale click this whole lifecycle exists
+    to prevent stays possible. Keying by session key makes the slotless
     case ordinary instead of special, and it cannot go stale when a slot appears
     or disappears mid-conversation.
     """
@@ -940,10 +1208,9 @@ def set_options_records(
     harmful here: evicting a record for a control that is still clickable means no
     later turn can retire it, which is precisely the untracked control this whole
     lifecycle exists to eliminate — so a bound would reintroduce the defect at
-    scale, silently, on the busiest instances. The footprint is also no worse than
-    what it replaced: records used to hang off ``_ChatSlot``, and slots are
-    themselves unbounded in number, so this holds strictly fewer entries (only
-    conversations with a live unanswered question) than the store it came from.
+    scale, silently, on the busiest instances. The footprint is small regardless:
+    an entry exists only for a conversation with a live unanswered question, which
+    is strictly fewer than the (itself unbounded) number of slots.
     """
     if state is None or not session_key:
         return
@@ -972,7 +1239,7 @@ def remember_slack_options(
 
     A no-op when there is no control or no dashboard state. Note there is NO
     slot requirement: the store is keyed by session key precisely so a plain
-    Slack thread without a slot still gets its control tracked (#1694).
+    Slack thread without a slot still gets its control tracked.
     """
     if posted is None or state is None or not session_key:
         return
@@ -1420,14 +1687,14 @@ def _sync_dashboard_slots(state: "DashboardState") -> None:
 
 
 def _redact_value(v):  # type: ignore[no-untyped-def]
-    """Recursively redact any value (str, dict, list, or passthrough)."""
+    """Recursively redact any value (str, dict, list/tuple, or passthrough)."""
     if isinstance(v, str):
         v, _ = redact_exfiltration_urls(v)
         v, _ = redact_credentials(v)
         return v
     if isinstance(v, dict):
         return _redact_meta(v)
-    if isinstance(v, list):
+    if isinstance(v, (list, tuple)):
         # Snapshot for the same reason as _redact_meta — the flush thread reads
         # containers the event loop is still appending to.
         return [_redact_value(i) for i in list(v)]
@@ -1497,6 +1764,66 @@ def _redact_for_display(text: str) -> str:
     text, _ = redact_exfiltration_urls(text)
     text, _ = redact_credentials(text)
     return text
+
+
+def redact_display_content(content: Any) -> str:
+    """Redact a message row's ``content`` for display, tolerating structured shapes.
+
+    The display-time content boundary — :func:`_prepare_messages` on the HTTP
+    history path and ``state._broadcast_chat_message`` on the live SSE path —
+    must neither skip a structured (list/dict) non-user value nor feed it to
+    the regex redactors, which accept only ``str`` and raise ``TypeError`` on
+    anything else. No current writer produces non-string content, but a
+    pre-rule, legacy, or hand-edited transcript row can — exactly the class of
+    row read-side redaction exists for. Both sites route through this ONE
+    helper; do not add another copy of the guard.
+
+    Delegates to :func:`_redact_value`, the same recursive walker the meta
+    redaction uses: ``str`` leaves get ``redact_exfiltration_urls`` then
+    ``redact_credentials`` (the order the existing sites apply), dict VALUES
+    are recursed, and list/tuple elements are recursed into a new list. The
+    result is then passed through :func:`serialize_wire_content`, so a
+    non-string value leaves as JSON text — and that text gets one final
+    redaction pass: the recursive walker does not rewrite dict KEYS in place
+    (two distinct keys redacting to the same string would collapse into one
+    entry), but on the serialized wire string a key is plain content, so the
+    text pass closes the key channel with no entry loss. Never mutates the
+    input (rows are shared by reference and ``dict(m)`` is shallow) and
+    never raises for JSON-shaped input.
+    """
+    redacted = _redact_value(content)
+    if isinstance(redacted, str):
+        return redacted
+    wire = serialize_wire_content(redacted)
+    wire, _ = redact_exfiltration_urls(wire)
+    wire, _ = redact_credentials(wire)
+    return wire
+
+
+def serialize_wire_content(content: Any) -> str:
+    """Wire-shape half of the display boundary: a row's ``content`` leaves as text.
+
+    ``str`` passes through unchanged; ``None`` — the absent-content shape a
+    legacy or hand-edited row can carry — becomes the empty string (its
+    display rendering; JSON "null" would put literal text in the chat); any
+    other value — container or scalar — is serialized to JSON text. Every
+    frontend consumer treats ``content`` as a string (``matchAll`` /
+    ``startsWith`` / ``replace`` / ``includes``), so any non-string on the
+    wire, ``None`` included, crashes the chat render.
+
+    No redaction happens here. The two display-boundary invariants have
+    different scopes — redaction is role-scoped (non-user only) while the
+    wire-string shape covers EVERY row, user rows and falsy values
+    included — so they are held separately: :func:`redact_display_content`
+    composes both for the redacted rows, and emission sites call this one
+    directly for the rows the redaction gate exempts. ``default=str`` keeps
+    it total for stray non-JSON leaves.
+    """
+    if isinstance(content, str):
+        return content
+    if content is None:
+        return ""
+    return json.dumps(content, ensure_ascii=False, default=str)
 
 
 def _remove_queued_by_id(messages: list[dict], queue_id: str) -> bool:
@@ -1626,18 +1953,18 @@ _SYNTHETIC_RECOVERY_MSGS = (
 
 # High-confidence "I will do it right now" endings. Kept deliberately NARROW: a
 # broad natural-language detector risks false positives, duplicate writes, and
-# continuation loops (see #2686 fix direction), so this matches only a terminal
-# first-person commitment to an IMMEDIATE action, with an explicit now/right-away
-# marker. "I'll explain that now: ..." is NOT caught, because the detector also
-# requires that the promise be the LAST thing in the text (nothing substantive
-# follows it) — an announcement followed by the actual content is a normal answer.
+# continuation loops, so this matches only a terminal first-person commitment to
+# an IMMEDIATE action, with an explicit now/right-away marker. "I'll explain that
+# now: ..." is NOT caught, because the detector also requires that the promise be
+# the LAST thing in the text (nothing substantive follows it) — an announcement
+# followed by the actual content is a normal answer.
 # The immediacy markers are deliberately RESTRICTIVE: only true "right now"
-# adverbs. `next` and `go ahead and` were removed after the #2696 AI review found
-# they matched "I'll do that next week" and permission-seeking closers — `next`
-# is a sequencer, not an immediacy signal. The bare `going to` alternative was
-# also removed (#2696 GPT round): with no first-person subject it matched
-# third-person statements like "The deployment is going to start now", firing an
-# unrelated continuation. Only the subject-bound `i'm going to` form remains.
+# adverbs. `next` and `go ahead and` are excluded because they match "I'll do
+# that next week" and permission-seeking closers — `next` is a sequencer, not an
+# immediacy signal. A bare `going to` alternative is excluded too: with no
+# first-person subject it matches third-person statements like "The deployment is
+# going to start now", firing an unrelated continuation. Only the subject-bound
+# `i'm going to` form is accepted.
 _PROMISE_NOW_RE = re.compile(
     r"\b(?:i(?:'|’)?ll|i\s+will|let\s+me|i(?:'|’)?m\s+going\s+to)\b"
     r"[^.!?\n]*?"
@@ -1648,8 +1975,8 @@ _PROMISE_NOW_RE = re.compile(
 # A trailing sentence that is ONLY a promise (no colon-introduced content, no
 # code fence, no list) — used to confirm the promise is terminal, not a preamble.
 _PROMISE_HAS_FOLLOWING_CONTENT_RE = re.compile(r":\s*\S|```|\n\s*[-*\d]")
-# Permission-seeking / no-action closers that a naive immediacy match misfires on
-# (found by the #2696 AI review). These are the OPPOSITE of a promise-to-act: the
+# Permission-seeking / no-action closers that a naive immediacy match misfires
+# on. These are the OPPOSITE of a promise-to-act: the
 # turn is correctly yielding to the user or explicitly declining to act. If any
 # appears in the final segment, it is never a promise-only turn. "let me know ...
 # now"/"...next" reads as immediate to the regex but is a hand-off; "for now" /
@@ -1669,28 +1996,26 @@ _NO_ACTION_CLOSER_RE = re.compile(
 # no-action list does not cover these because they contain both a real
 # commitment ("I'll ... now") and a conditional opener; auto-continuing them
 # dispatches an unattended action the user was still being asked to approve.
-# Found by the #2696 UX review. Bias, like the negation gate, is toward reject
-# on ambiguous conditionals — a false reject just lands the turn normally
-# (pre-fix behaviour, safe); a false accept executes a possibly-irreversible
-# side effect (push, merge, delete) without consent.
+# Bias, like the negation gate, is toward reject on ambiguous conditionals — a
+# false reject just lands the turn normally (safe); a false accept executes a
+# possibly-irreversible side effect (push, merge, delete) without consent.
 _APPROVAL_GATED_RE = re.compile(
     # ANY conditional `if` opener, not just specific pronouns: "If CI passes, I'll
     # delete it now" is as gated as "If you approve ...". Bias toward reject is
-    # safe here (a false reject just lands normally); the #2696 GPT round widened
-    # this from the pronoun list after "If CI passes ..." slipped through.
+    # safe here (a false reject just lands normally); a pronoun-only list lets
+    # "If CI passes ..." slip through.
     r"\bif\b" r"|\bjust\s+say\s+the\s+word\b" r"|\bwant\s+me\s+to\b" r"|\bshall\s+i\b"
     # Consent DEFERRAL: the action is gated on the user's approval/confirmation,
     # even when the sentence reads as "I'll ... now" ("I'll wait for your approval
-    # before I delete it right now"). The earlier list only caught "with your
-    # approval" and missed the far more common "wait for / for / pending your
-    # approval", "your go-ahead/sign-off/confirmation", "before you approve", and
-    # "you to confirm" forms — auto-continuing any of them dispatches an action the
-    # model explicitly said it would hold for consent (#2696 GPT round, blocking).
-    # The forms are kept PRECISE (a possessive consent-noun, or a deferral verb
-    # bound to you/your) rather than bare "pending"/"await"/"before you", so a
-    # genuine promise like "merge the pending PR now" is not falsely rejected —
-    # closing the consent CLASS without the over-broad reject the design review
-    # warned about. Reject-bias is still safe (a false reject just lands).
+    # before I delete it right now"). "with your approval" is not the only form:
+    # "wait for / for / pending your approval", "your go-ahead/sign-off/
+    # confirmation", "before you approve" and "you to confirm" are far more common,
+    # and auto-continuing any of them dispatches an action the model explicitly
+    # said it would hold for consent. The forms are kept PRECISE (a possessive
+    # consent-noun, or a deferral verb bound to you/your) rather than bare
+    # "pending"/"await"/"before you", so a genuine promise like "merge the pending
+    # PR now" is not falsely rejected — that closes the consent CLASS without an
+    # over-broad reject. Reject-bias is still safe (a false reject just lands).
     r"|\byour\s+(?:approval|go[-\s]?ahead|sign[-\s]?off|confirmation|permission|ok(?:ay)?|blessing)\b"
     r"|\bwait(?:ing)?\s+for\s+(?:you|your|approval|confirmation|sign[-\s]?off|permission|the\s+go[-\s]?ahead)\b"
     r"|\bbefore\s+you\s+(?:approve|confirm|decide|sign\s+off|review|say|weigh\s+in|ok(?:ay)?)\b"
@@ -1703,13 +2028,13 @@ _APPROVAL_GATED_RE = re.compile(
     # Remaining subordinating-conditional conjunctions ("Unless you object, I'll
     # merge now", "Assuming you're fine, I'll push now"). The risky ones are bound
     # to a following pronoun/complementizer so a benign adjective ("the provided
-    # config", "the given file") is NOT falsely rejected (#2696 GPT/design rounds).
+    # config", "the given file") is NOT falsely rejected.
     r"|\bunless\b"
     r"|\bassuming\s+(?:you|that|we|it|the|your)\b"
     r"|\bprovided\s+(?:that|you)\b"
     r"|\bgiven\s+(?:that|you)\b"
     r"|\b(?:as|so)\s+long\s+as\b",
-    # NOTE (residual risk, #2696 design review): this is a deny-list, and the
+    # NOTE (residual risk): this is a deny-list, and the
     # DANGEROUS direction for the consent class is the false ACCEPT (auto-continuing
     # an action the user was still being asked to approve), which enumeration cannot
     # fully close — a novel conditional phrasing will always slip through. Two
@@ -1727,11 +2052,11 @@ _APPROVAL_GATED_RE = re.compile(
 )
 # A NEGATED commitment before the immediacy marker ("I'm not going to open the PR
 # now", "I won't do that now", "I can't right now") is the OPPOSITE of a promise
-# to act, but the bare `going to`/`i'll` alternatives above still match it (found
-# by the #2696 GPT review). Reject when a negated-commitment form is followed,
-# within the same sentence, by an immediacy marker. Bias is deliberately toward
-# REJECTING on ambiguous negation: a false reject just lands the turn normally
-# (pre-fix behaviour, safe), whereas a false accept injects an unwanted action.
+# to act, but the bare `going to`/`i'll` alternatives above still match it.
+# Reject when a negated-commitment form is followed, within the same sentence, by
+# an immediacy marker. Bias is deliberately toward REJECTING on ambiguous
+# negation: a false reject just lands the turn normally (safe), whereas a false
+# accept injects an unwanted action.
 _NEGATED_PROMISE_RE = re.compile(
     r"\b(?:not\s+going\s+to|never\s+going\s+to|won(?:'|’)?t|will\s+not"
     r"|i(?:'|’)?ll\s+not|can(?:'|’)?t|cannot|not\s+able\s+to|unable\s+to"
@@ -1745,10 +2070,31 @@ _NEGATED_PROMISE_RE = re.compile(
 # scoped to that SAME sentence, not `.search()` the whole segment — otherwise an
 # everyday `if`/`when`/`after`/`let me know`/negation in an EARLIER sentence
 # ("When you asked about X, I fixed it. I'll open the PR now.") vetoes a genuine
-# terminal promise, landing the exact #2686 symptom unrecovered (asymmetric-scope
-# false negative, #2696 design review). Splitting on sentence + newline boundaries
+# terminal promise, leaving the promise-only turn unrecovered (an
+# asymmetric-scope false negative). Splitting on sentence + newline boundaries
 # keeps the reject-bias but only where the promise can actually be.
 _SENTENCE_BOUNDARY_RE = re.compile(r"[.!?\n]+")
+
+# A status update can be accurate while a turn is streaming and become false as
+# soon as that turn returns control. This detector is deliberately notice-only:
+# unlike the promise-only recovery above, it may run after tools with side
+# effects, so its caller must never replay the turn automatically. Requiring a
+# first-person claim at the start of a sentence excludes third-person status
+# reports such as "the subagent is still working" or "the monitor will continue"
+# that really can outlive this turn. A first-person claim that the main agent is
+# running or checking one remains foreground work and is intentionally matched.
+_UNFINISHED_PROGRESS_RE = re.compile(
+    r"(?:^|[.!?\n]\s*)(?P<claim>(?:next[,:]?\s+)?"
+    r"(?:"
+    r"(?:i(?:'|’)?m|i\s+am)\s+(?:still\s+)?"
+    r"(?:continuing\s+(?:with|to)|proceeding\s+(?:with|to)|working\s+(?:on|through)"
+    r"|running\b|checking\b|validating\b|testing\b|building\b|reviewing\b"
+    r"|preparing\b|investigating\b)"
+    r"|i(?:'|’)?ll\s+(?:keep|continue)\s+"
+    r"(?:working|running|checking|validating|testing|building|reviewing|preparing|investigating)\b"
+    r"))",
+    re.IGNORECASE,
+)
 
 
 def _terminal_sentence(text: str) -> str:
@@ -1757,6 +2103,25 @@ def _terminal_sentence(text: str) -> str:
     multi-sentence closer cannot veto a promise that sits only at the end."""
     parts = [p.strip() for p in _SENTENCE_BOUNDARY_RE.split(text) if p.strip()]
     return parts[-1] if parts else text
+
+
+def has_unfinished_progress_claim(final_segment_text: str) -> bool:
+    """Return whether a completed turn's final sentence says foreground work continues.
+
+    The caller supplies only text emitted after the last tool boundary. A match
+    is diagnostic, not permission to re-run anything: earlier tools may already
+    have produced side effects. Only the terminal sentence can describe work as
+    still running when control returns; an earlier progress update followed by a
+    completed-status sentence is not an unfinished claim. A colon followed by
+    content is likewise a lead-in fulfilled by the same response.
+    """
+    text = (final_segment_text or "").strip()
+    terminal = _terminal_sentence(text)
+    match = _UNFINISHED_PROGRESS_RE.search(terminal)
+    if match is None:
+        return False
+    claim = terminal[match.start("claim") :]
+    return not bool(re.search(r":\s*\S", claim))
 
 
 def is_promise_only_terminal(final_segment_text: str) -> bool:
@@ -1917,9 +2282,9 @@ _LEAKED_INVOKE_BODY_RE = re.compile(r"<(?:[A-Za-z][\w.-]*:)?(?:parameter\b|/invo
 
 def has_leaked_tool_call(text: str) -> bool:
     """True when *text* contains a tool invocation emitted as PROSE — an
-    unquoted invoke-block open tag with a parameter or close tag (issue #6112:
-    the model writes the call into the text channel instead of executing it,
-    the turn ends with zero tool calls, and the session silently stalls).
+    unquoted invoke-block open tag with a parameter or close tag: the model
+    writes the call into the text channel instead of executing it, the turn ends
+    with zero tool calls, and the session silently stalls.
 
     Quoted syntax is excluded structurally: fenced code blocks and inline code
     spans are stripped before the scan, so a pasted bug report or an explained
@@ -1952,7 +2317,7 @@ def should_notice_leaked_tool_call(
     turn_tool_calls: int = 0,
     in_stage_execution: bool = False,
 ) -> bool:
-    """Decide whether to surface the leaked-tool-call NOTICE (issue #6112).
+    """Decide whether to surface the leaked-tool-call NOTICE.
 
     The defect: the model emits an invoke block into its TEXT channel instead
     of executing it (observed when the target is a deferred MCP tool whose
@@ -1971,7 +2336,7 @@ def should_notice_leaked_tool_call(
     an unfenced block the model merely reproduces. So the turn is marked
     un-landed and the user gets a visible card naming what happened; nothing
     is queued and nothing can execute. An unattended loop loses one cycle and
-    retries on its own schedule — visibly, which is the half of #6112 this
+    retries on its own schedule — visibly, which is the half of the defect this
     layer can fix honestly.
 
     Gates: the turn ended NORMALLY (cancel/refusal/error paths own their own
@@ -2059,6 +2424,81 @@ def should_notice_mixed_turn_leak(
     if prompt_depth != 0:
         return False
     return has_leaked_tool_call(final_segment_text)
+
+
+def should_notice_compaction_dropped_leak(
+    *,
+    dropped_leak: bool,
+    leak_already_noticed: bool,
+    stop_reason: str,
+    end_turn_reason: str,
+    prompt_depth: int,
+    is_cancelled: bool,
+    refusal_reasons: list,
+) -> bool:
+    """Decide whether to surface a notice for a leak the COMPACTION BOUNDARY ate.
+
+    The shape neither sibling can see. A real (non-synthesized) mid-turn
+    compaction terminal is a segment boundary, so the runner resets
+    ``assistant_text`` there: text streamed before the summarization belongs to
+    the window that was just summarized and must not carry into the segment
+    flushed afterwards. That reset is correct for the text path and wrong for
+    this one — the leak scan reads the accumulator AT TURN END, so a leak that
+    streamed before the boundary is gone by the time either
+    :func:`should_notice_leaked_tool_call` or
+    :func:`should_notice_mixed_turn_leak` runs, and both decline on an empty
+    segment.
+
+    The leak still reached the user: chunks stream to the wire as they arrive,
+    so the raw invoke block was on screen before the boundary wiped the
+    accumulator. Nothing persisted it (the boundary does not flush) and nothing
+    explained it, so the turn shows raw machine syntax, runs no tool, and
+    carries no account of either — the silent pass-through this predicate
+    closes.
+
+    The turn then usually takes the post-compaction continuation arm, which
+    fires precisely BECAUSE the segment is blank
+    (:func:`should_continue_after_compaction`). So the user sees the leaked XML
+    followed by "continuing automatically", with no statement that a tool call
+    was written as prose instead of run.
+
+    Takes the FACT, not the text: at turn end the text is already gone, which is
+    the defect. The boundary is the only place it exists, so the scan
+    (:func:`has_leaked_tool_call`) runs there and only the boolean travels.
+
+    NOTICE-ONLY, and more strictly so than its siblings. It does not un-land the
+    turn and sets no flag any recovery arm reads, so it never competes with the
+    continuation the compaction path injects — a leaked block must not be
+    re-issued by this layer under any of the three auto-approval routes
+    (:func:`should_notice_leaked_tool_call` documents why). It therefore needs
+    no ``turn_tool_calls`` gate: that gate exists to protect UN-LANDING, and
+    there is nothing here to un-land. It needs no ``in_stage_execution`` gate
+    either, for the reason its mixed-turn sibling does not: a notice changes no
+    turn result the orchestrator's stage loop reads.
+
+    Owning no outcome is also why the caller evaluates this OUTSIDE the
+    ``if``/``elif`` chain its siblings sit in. Every arm of that chain owns the
+    turn's outcome, and two of them are RECOVERIES (the L1 infrastructure retry
+    and the promise-only guard); a turn can both drop a leak at its boundary and
+    need one of those, and the gates below exclude neither shape. An exclusive
+    slot would therefore starve the recovery, so the card is evaluated
+    independently and the turn keeps whatever outcome its own arm gave it.
+    ``leak_already_noticed`` — not the ordering — is what keeps one turn to one
+    leak card: the caller sets it on whichever sibling already carded.
+
+    Gates are the turn-shape ones only: the boundary recorded a leak, no sibling
+    has carded this turn, the turn ended NORMALLY, was not cancelled, carried no
+    tool refusals (those paths own their own reporting), and is top-level.
+    """
+    if not dropped_leak:
+        return False
+    if leak_already_noticed:
+        return False
+    if is_cancelled or refusal_reasons:
+        return False
+    if stop_reason != end_turn_reason:
+        return False
+    return prompt_depth == 0
 
 
 #: Normalised, CLOSED stop-reason vocabulary for the empty-turn diagnostic. The
@@ -2220,6 +2660,97 @@ def classify_empty_turn(activity: EmptyTurnActivity) -> str:
     return EMPTY_CAUSE_OTHER
 
 
+# A current-turn blocker the model can only have invented.  Kiro Crew receives
+# real tool failures through a refusal/error/result frame; a normal end_turn that
+# follows a successful read/search call carries no runtime signal that tools were
+# disabled.  Match the complete terminal response, not just its prefix: otherwise
+# untrusted content could append an action and mint a synthetic action turn.
+_FALSE_CURRENT_TOOL_BLOCKER_RE = re.compile(
+    r"^\s*(?:"
+    r"i(?:'|’)m blocked from further tool execution in the resumed session: "
+    r"the screenshot delivery tools are no longer callable here\."
+    r"|i(?:'|’)m proceeding, but this turn(?:'|’)s tool budget was exhausted "
+    r"immediately after loading the workflow\. "
+    r"No publish or deployment has happened yet\."
+    r")\s*$",
+    re.IGNORECASE,
+)
+_FALSE_CURRENT_TOOL_BLOCKER_NEAR_MISS_RE = re.compile(
+    r"^\s*i(?:'|’)?m\b"
+    r"(?=[^\n]*(?:tool|read|search|fetch))"
+    r"(?=[^\n]*(?:block|unavail|inaccess|no\s+longer|budget|exhaust))"
+    r"[^\n]+$",
+    re.IGNORECASE,
+)
+# Replay additionally admits two first-party discovery tools whose contracts are
+# read-only but which are not auto-approval candidates. Keep the shared host
+# builtins sourced from the approval gate so those identities cannot drift.
+_READ_ONLY_PREPARATION_TOOLS = _HOST_READ_ONLY_BUILTIN_TOOLS | frozenset(
+    {"introspect", "tool_search"}
+)
+
+
+def is_false_current_tool_blocker(final_segment_text: str) -> bool:
+    """Whether the assistant falsely claims THIS turn lost tool execution.
+
+    This is deliberately narrower than a generic ``budget`` search.  A model may
+    legitimately explain a subagent cap or quote an earlier failure; only a
+    first-person claim about the live turn is actionable here.
+    """
+    return bool(_FALSE_CURRENT_TOOL_BLOCKER_RE.search(final_segment_text or ""))
+
+
+def is_false_current_tool_blocker_near_miss(final_segment_text: str) -> bool:
+    """Whether blocker-adjacent text missed the replay grammar.
+
+    Diagnostic only: this predicate never grants replay authority. It lets the
+    runner count wording drift without logging model text or widening the two
+    incident statements accepted by :func:`is_false_current_tool_blocker`.
+    """
+    text = final_segment_text or ""
+    return not is_false_current_tool_blocker(text) and bool(
+        _FALSE_CURRENT_TOOL_BLOCKER_NEAR_MISS_RE.search(text)
+    )
+
+
+def tool_calls_are_read_only_preparation(
+    turn_tool_calls: int,
+    turn_tool_identities: tuple[tuple[str, str, str, bool], ...],
+    successful_tool_call_ids: frozenset[str],
+    *,
+    builtin_identity_trusted: bool,
+) -> bool:
+    """True when every dispatch is a proven successful read-only builtin.
+
+    Each identity is ``(tool_call_id, mcp_server_name, tool_name,
+    tool_identity_trusted)``. The caller must positively prove the serving
+    backend is Kiro, and every name must carry extractor provenance rather than
+    merely being non-empty. MCP tools are excluded even when their names look
+    read-only; their schemas are not owned by this host. Missing provenance,
+    duplicate ids, absent identity, an unknown builtin, an incomplete/failed
+    result, or any count mismatch fails closed.
+    """
+    if not builtin_identity_trusted:
+        return False
+    if turn_tool_calls <= 0 or len(turn_tool_identities) != turn_tool_calls:
+        return False
+    call_ids: list[str] = []
+    for call_id, server_name, tool_name, identity_trusted in turn_tool_identities:
+        if not all(isinstance(value, str) for value in (call_id, server_name, tool_name)):
+            return False
+        if (
+            not call_id
+            or server_name
+            or identity_trusted is not True
+            or tool_name not in _READ_ONLY_PREPARATION_TOOLS
+        ):
+            return False
+        call_ids.append(call_id)
+    if len(set(call_ids)) != len(call_ids):
+        return False
+    return frozenset(call_ids) == successful_tool_call_ids
+
+
 def should_recover_promise_only(
     *,
     stop_reason: str,
@@ -2231,64 +2762,69 @@ def should_recover_promise_only(
     is_cancelled: bool,
     refusal_reasons: list,
     turn_tool_calls: int = 0,
+    turn_tool_identities: tuple[tuple[str, str, str, bool], ...] = (),
+    successful_tool_call_ids: frozenset[str] = frozenset(),
+    builtin_identity_trusted: bool = False,
+    directive_user_origin: bool = False,
     in_stage_execution: bool = False,
     stop_in_progress: bool = False,
     stop_generation_unchanged: bool = True,
     queue_empty: bool = True,
     no_pending_steers: bool = True,
 ) -> bool:
-    """Decide whether to inject ONE promise-only continuation.
+    """Decide whether to inject ONE unacted-turn continuation.
 
-    All must hold (each guards a failure mode the #2686 fix direction names):
+    All must hold (each guards a distinct failure mode):
       * NO Stop is in progress (``stop_in_progress`` is the runner's
         ``_should_suppress_requeue``). A soft Stop pressed while the promise
         streamed can lose the cancel race and arrive here as a normal
         ``end_turn``; re-queueing then would dispatch the very action the user
         tried to stop. Every sibling recovery path gates on this, so this one
-        must too (#2696 GPT review, blocking);
+        must too;
       * NO Stop was pressed at ANY point during this turn
         (``stop_generation_unchanged``: the monotonic ``slot._stop_generation``
         snapshotted at turn start still matches). A Stop that pressed AND
         resolved back to idle during the turn is invisible to ``stop_in_progress``
-        but the user still cancelled; do not re-dispatch the announced action
-        (#2696 GPT review round 2, blocking);
+        but the user still cancelled; do not re-dispatch the announced action;
       * NO user follow-up is queued (``queue_empty``). ``queue_insert(0, ...)``
         would jump the continuation ahead of a user-typed "don't do that" or
         clarifying message; the user's queued input must process FIRST — respect
-        it by falling through to a normal landing instead of overriding it
-        (#2696 GPT review round 2, blocking);
+        it by falling through to a normal landing instead of overriding it;
       * NO mid-turn steer is pending (``no_pending_steers``). A steer lands in
         ``slot._pending_steers``, a SEPARATE channel from ``_queue``; it is only
         degraded into a queue card in ``_run_chat``'s ``finally``, which runs
         AFTER this guard. So a "don't delete" steer is invisible to
         ``queue_empty`` here, and firing recovery would schedule the announced
         action despite the just-arrived revocation. Abort when any user input
-        exists, in either channel (#2696 GPT review round 3, blocking);
+        exists, in either channel;
       * the turn ended NORMALLY (``end_turn``), not cancelled/refused/errored —
         those have their own paths and must stay unchanged;
       * it produced visible output (a promise IS visible output) and is not the
         empty-response case (that path owns ``not produced_visible_output``);
-      * the turn made NO tool calls (``turn_tool_calls == 0``). The segment-buffer
-        reset at each tool boundary was the ORIGINAL "never replay an executed
-        action" proxy, but it is not airtight: a turn that completed a side-
-        effecting tool (e.g. ``send_message``) and then emitted trailing
-        promise-shaped text ("I'll send that now") would still match the detector,
-        and the continuation would REISSUE the completed action (duplicate external
-        message). The promise-only bug is by definition a turn that announced an
-        action and made NO tool call, so requiring a zero tool-call count closes the
-        replay hole directly. A turn that ran a read then promised a further action
-        is excluded too — a false negative, which is the safe direction (#2696 GPT
-        review, blocking);
-      * the final segment is a terminal promise-to-act
-        (:func:`is_promise_only_terminal`). Because the runner resets its segment
-        buffer at every tool boundary, ``final_segment_text`` is exactly the text
-        AFTER the last tool call — so a turn that executed a tool and then
-        summarised has a summary here, not a promise; the ``turn_tool_calls`` gate
-        above is the airtight backstop for the same guarantee;
+      * ordinary promise-only recovery still requires ZERO tool calls. A second,
+        narrower shape may contain calls only when every dispatch has a unique id,
+        the runner positively identified the serving backend as Kiro, the provider
+        supplied a canonical non-MCP builtin identity carrying explicit extractor
+        provenance, that identity is one of the fixed read/search/fetch tools,
+        and a final
+        ``status=completed`` result arrived for exactly the same id set. Display
+        ``tool_kind`` and name non-emptiness are never authorization evidence.
+        Unknown/MCP/missing/untrusted identity,
+        duplicate ids, incomplete or failed calls, and every count/status mismatch
+        fail closed. The tool-bearing shape also requires
+        ``directive_user_origin``: the runner replays the authenticated user's
+        exact message, never the model-authored blocker or an announced action.
+        This lets a skill read or deferred-tool search retry without replaying a
+        completed mutation or minting authority from fetched content;
+      * the final segment is either a terminal promise-to-act
+        (:func:`is_promise_only_terminal`) on a zero-call turn, or the narrowly
+        full-matched false current-tool blocker above after read-only preparation.
+        Because the runner resets its segment buffer at every tool boundary,
+        ``final_segment_text`` is exactly the text AFTER the last tool call;
       * this is NOT a stage-execution turn (``in_stage_execution``). A turn run by
         the orchestrator's stage loop must not spawn async recovery: the loop
         records the stage complete and advances before the continuation finishes,
-        corrupting stage attribution (#2696 GPT review, blocking);
+        corrupting stage attribution;
       * this is a top-level turn (``prompt_depth == 0``) and the one-shot budget
         is unspent (``promise_only_retries < 1``) — bounded to a single attempt,
         never a loop.
@@ -2296,7 +2832,7 @@ def should_recover_promise_only(
 
     Language scope: the terminal-promise detector (``is_promise_only_terminal``)
     matches English commitment/immediacy tokens only; a non-English promise-only
-    turn falls through and lands normally (pre-fix behaviour). Failure bias is
+    turn falls through and lands normally. Failure bias is
     safe (false negative, not false positive)."""
     if stop_in_progress or not stop_generation_unchanged or not queue_empty:
         return False
@@ -2304,7 +2840,14 @@ def should_recover_promise_only(
         return False
     if is_cancelled or refusal_reasons:
         return False
-    if turn_tool_calls != 0:
+    if turn_tool_calls != 0 and not tool_calls_are_read_only_preparation(
+        turn_tool_calls,
+        turn_tool_identities,
+        successful_tool_call_ids,
+        builtin_identity_trusted=builtin_identity_trusted,
+    ):
+        return False
+    if turn_tool_calls and not directive_user_origin:
         return False
     if in_stage_execution:
         return False
@@ -2314,6 +2857,8 @@ def should_recover_promise_only(
         return False
     if prompt_depth != 0 or promise_only_retries >= 1:
         return False
+    if turn_tool_calls:
+        return is_false_current_tool_blocker(final_segment_text)
     return is_promise_only_terminal(final_segment_text)
 
 
@@ -2447,6 +2992,33 @@ _MANUAL_CONTINUE_MSG = (
     "request is genuinely complete, say so in one line instead of inventing "
     "further work."
 )
+# Injected INSTEAD of the user's message when a content-filter refusal landed
+# after the turn had already dispatched tool calls and agent.refusal_fallback_model
+# names a different model (chat_runner._refusal_fallback_retry). Replaying the
+# message would run those tool calls a second time, so the session -- moved to
+# the fallback model -- is asked to carry on from the completed work, which is
+# what a person gets by pressing Continue. The nudge goes to the SAME harness
+# session the refused turn ran on (the retention every Continue relies on), and
+# Kiro Crew itself never re-sends the message once a tool ran. Unlike
+# ``_MANUAL_RESUME_MSG`` it offers no restart clause: it is sent only when the
+# turn dispatched a tool, so "nothing was done yet" is never true of it, and a
+# model that cannot see the partial turn (a session that did not keep it) is
+# told to stop rather than start over -- failing safe instead of re-running the
+# writes.
+#
+# Deliberately silent about the content filter and the model swap: the FALLBACK
+# model reads this body, and telling it the request was just declined primes it
+# to decline too. The user learns both from the retry notice card beside it.
+# Not in ``_SYNTHETIC_RECOVERY_MSGS``: the retry turn is recognized by its queue
+# id, not by text, and the turn-start re-arm already skips recovery-kind entries.
+_REFUSAL_FALLBACK_RESUME_MSG = (
+    f"{REFUSAL_FALLBACK_RECOVERY_PREFIX}\n"
+    "The previous turn ended before it finished. Look at the conversation above, "
+    "work out what was already completed, and finish the user's most recent "
+    "request from there. Do NOT re-run steps or tools that already completed "
+    "successfully. If the completed work is not visible in the conversation "
+    "above, do NOT start the request over — say so and stop."
+)
 
 
 class ResetCause(str, Enum):
@@ -2526,9 +3098,54 @@ def is_system_injection(content: str) -> bool:
 #: Structural queue-entry kind for runner-injected recovery instructions.
 SYNTHETIC_RECOVERY_KIND = "synthetic_recovery"
 
+#: Structural kind for a false-tool-blocker retry whose TEXT is the authenticated
+#: user's original request.  It is recovery orchestration (so it breaks merges and
+#: can be purged), but its ``RecoveryPayload.ORIGINAL`` remains user-authored.
+FALSE_TOOL_BLOCKER_REPLAY_KIND = "false_tool_blocker_replay"
+
 #: Row-level kind for the `error` notice appended when a recovery has ALREADY
 #: been queued, so the frontend can tell a pending retry from a terminal failure.
 TRANSIENT_RETRY_KIND = "transient_retry"
+
+#: ``meta["notice"]`` on the three `error` rows the transient-5xx ladder appends
+#: (chat_runner ``acp_error_is_transient`` branches). The row's CONTENT is the
+#: English fallback below, read verbatim by non-dashboard consumers (channel
+#: mirrors, SSE, an older frontend); the dashboard ignores it and renders
+#: localized copy keyed on this token instead
+#: (``website/src/pages/chat/transientNotice.ts``). A structured token rather
+#: than prose-matching so the wording can change on either side without the
+#: other silently falling back to raw English -- the drift class
+#: ``test_recovery_marker_parity.py`` exists for. Both sides are still
+#: hand-synced (no shared schema), so ``test_transient_notice_parity.py`` pins
+#: these values against the frontend table.
+TRANSIENT_NOTICE_META_KEY = "notice"
+TRANSIENT_NOTICE_RETRYING = "transient_retrying"
+TRANSIENT_NOTICE_RESUMING = "transient_resuming"
+TRANSIENT_NOTICE_GIVE_UP = "transient_give_up"
+
+#: English fallback text for the rows above. Plain language on purpose: the
+#: failure is an upstream model-backend 5xx the gateway is already retrying
+#: against, and neither "backend" nor "hiccup" tells a reader that.
+TRANSIENT_RETRYING_TEXT = "⟳ Connection unstable — retrying…"
+TRANSIENT_RESUMING_TEXT = "⟳ Connection unstable — resuming…"
+TRANSIENT_GIVE_UP_TEXT = "⟳ Connection unstable — please try again."
+
+#: Row-level kind for the terminal `error` row a prompt-time MODEL ENTITLEMENT
+#: rejection produces ("Your account does not have access to model 'X'"), so
+#: the frontend can offer the fix (open the model picker / change the default
+#: under Settings -> Chat) instead of a Continue button that re-runs the same
+#: rejection. No recovery is queued for this kind: a retry cannot earn an
+#: entitlement.
+MODEL_UNENTITLED_KIND = "model_unentitled"
+
+#: Row-level kind for the terminal `error` row an ``AcpAuthRequired`` turn
+#: produces (the agent process reported it is not signed in). Like
+#: MODEL_UNENTITLED_KIND, no recovery is queued -- a retry hits the same wall --
+#: and the frontend uses the kind to offer the fix that does end it: a deep link
+#: to the dashboard's Kiro sign-in card (Developer > Agent Backend), where the
+#: user signs in to Kiro Crew's own identity again. The prose stays as the
+#: backend formatted it.
+AUTH_REQUIRED_KIND = "auth_required"
 
 #: Structural queue-entry kinds for system injections.  Classification by kind
 #: tag — set at enqueue time — is unforgeable: a user typing the same prefix
@@ -2536,32 +3153,49 @@ TRANSIENT_RETRY_KIND = "transient_retry"
 SUBAGENT_COMPLETION_KIND = "subagent_completion"
 CRON_NOTIFICATION_KIND = "cron_notification"
 
+#: Queue-entry kinds whose turns must settle before an Autopilot stage advances.
+STAGE_DELIVERY_KINDS = frozenset((SUBAGENT_COMPLETION_KIND, SYNTHETIC_RECOVERY_KIND))
+
+
+def owned_stage_delivery_entry(boundary: Any, entries: list[dict]) -> dict | None:
+    """Return the first stage-delivery entry owned by *boundary* (S1)."""
+    return next(
+        (
+            entry
+            for entry in entries
+            if entry.get("kind") in STAGE_DELIVERY_KINDS and boundary.owns_entry(entry)
+        ),
+        None,
+    )
+
+
 #: All system-injection kinds (for set-membership checks).
-_SYSTEM_INJECTION_KINDS = frozenset(
-    (SUBAGENT_COMPLETION_KIND, CRON_NOTIFICATION_KIND, SYNTHETIC_RECOVERY_KIND)
+_SYSTEM_INJECTION_KINDS = STAGE_DELIVERY_KINDS | frozenset(
+    (CRON_NOTIFICATION_KIND, FALSE_TOOL_BLOCKER_REPLAY_KIND)
 )
 
 
 def is_synthetic_recovery_item(item: dict) -> bool:
-    """True when a queue ENTRY is a runner-injected synthetic recovery
-    instruction (post-transient CONTINUE / empty-response nudge).
+    """True when a queue ENTRY is runner-injected recovery orchestration.
 
-    Classification is structural — the ``kind`` tag set at ``queue_insert``
-    time — never content equality: metadata survives any queue transformation
-    (merge, prefixing, truncation) and cannot collide with a user pasting the
-    transcript-visible recovery text verbatim (which must classify as a plain
-    user message)."""
-    return item.get("kind") == SYNTHETIC_RECOVERY_KIND
+    The false-tool-blocker replay carries the authenticated user's own text, but
+    its distinct kind still identifies the runner-owned retry for queue ordering
+    and late-cancellation purge. Payload provenance remains a separate question.
+    """
+    return item.get("kind") in (
+        SYNTHETIC_RECOVERY_KIND,
+        FALSE_TOOL_BLOCKER_REPLAY_KIND,
+    )
 
 
 class RecoveryPayload(str, Enum):
     """Whether a recovery entry's TEXT is runner-authored or the user's own words.
 
     ``build_recovery_requeue`` already draws this line — a continuation once the
-    turn emitted output, the original request before that — but both re-queue
-    under ``SYNTHETIC_RECOVERY_KIND``, because both must render as an inject row
-    rather than a second user bubble. The kind therefore cannot also answer
-    whether the text may be mirrored to a linked thread as user speech.
+    turn emitted output, the original request before that. Most re-queue under
+    ``SYNTHETIC_RECOVERY_KIND``; false-tool-blocker user replays use their own
+    purgeable kind. Neither kind can answer whether text may be mirrored to a
+    linked thread as user speech, so payload remains the authority classifier.
 
     ``str`` mixin (not ``StrEnum``) for Py3.10 compat, matching ``ResetCause``.
     """
@@ -2615,12 +3249,34 @@ def is_system_injection_item(item: dict) -> bool:
     return False
 
 
+def carries_attachments(item: dict) -> bool:
+    """Whether a queue entry's meta names attachment lists (``files``/``dirs``).
+
+    Such an entry drains ALONE. Its text indexes those lists by marker number
+    (``[attached_file 1]`` is ``files[0]``), and a merged row has one meta for
+    several texts: whichever entry's list won, every other entry's markers
+    would resolve against it -- an attachment card that opens a DIFFERENT
+    file, not merely a truncated path. The renumbering a correct merge would
+    need is not worth building for a message shape the merge feature was never
+    about.
+    """
+    meta = item.get("meta")
+    if not isinstance(meta, dict):
+        return False
+    return any(isinstance(meta.get(k), list) and meta.get(k) for k in ATTACHMENT_META_KEYS)
+
+
 def _dequeue_next_message(slot, merge_enabled: bool) -> tuple:
-    """Drain the queue: merge non-cron messages or pop the first one."""
+    """Drain the queue: merge non-cron messages or pop the first one.
+
+    A merge run stops at a system injection and at an attachment-bearing entry
+    (see :func:`carries_attachments`); an attachment-bearing entry at the head
+    of the queue pops alone.
+    """
     if merge_enabled and len(slot._queue) > 1:
         to_merge: list[dict] = []
         for item in list(slot._queue):
-            if is_system_injection_item(item):
+            if is_system_injection_item(item) or carries_attachments(item):
                 break
             to_merge.append(item)
         if len(to_merge) > 1:
@@ -2631,8 +3287,13 @@ def _dequeue_next_message(slot, merge_enabled: bool) -> tuple:
     return item["content"], [item]
 
 
-def _dequeue_next_system_message(slot, *, exclude_cron: bool = False) -> tuple:
-    """Pop the first queued sub-agent-completion or cron injection, leaving
+def _dequeue_next_system_message(
+    slot,
+    *,
+    exclude_cron: bool = False,
+    preferred_id: str = "",
+) -> tuple:
+    """Pop a preferred queued system injection, or the first one, leaving
     plain user messages queued.
 
     Implements the (always-on) queue-during-subagents behavior: while background
@@ -2646,14 +3307,27 @@ def _dequeue_next_system_message(slot, *, exclude_cron: bool = False) -> tuple:
     runs each stage as its own ``_run_chat`` whose tail-drain fires while
     ``_in_stage_execution`` is still set; without this a cron notification
     queued during the plan is pulled BETWEEN stages and starts a turn that
-    scatters the plan's output. Sub-agent completions and synthetic recovery
-    still flow (a stage may legitimately spawn sub-agents or re-queue a
-    continuation) -- only the external cron injection waits for the plan to end.
+    scatters the plan. Sub-agent completions and synthetic recovery still flow
+    (a stage may legitimately spawn sub-agents or re-queue a continuation) --
+    only the external cron injection waits for the plan to end.
+
+    ``preferred_id`` is selected by the stage boundary's single owner predicate.
+    It changes queue order only for that owned row; this helper never re-decides
+    ownership.
     """
+
+    def _eligible(item: dict) -> bool:
+        return is_system_injection_item(item) and not (
+            exclude_cron and item.get("kind") == CRON_NOTIFICATION_KIND
+        )
+
+    if preferred_id:
+        for i, item in enumerate(slot._queue):
+            if item.get("id") == preferred_id and _eligible(item):
+                popped = slot.queue_pop(i)
+                return popped["content"], [popped]
     for i, item in enumerate(slot._queue):
-        if is_system_injection_item(item):
-            if exclude_cron and item.get("kind") == CRON_NOTIFICATION_KIND:
-                continue
+        if _eligible(item):
             popped = slot.queue_pop(i)
             return popped["content"], [popped]
     return None, []
@@ -2687,7 +3361,17 @@ def _collapse_wire_rows(messages: list[dict]) -> list[dict]:
         # One join across the run, not a new string per delta: a long reply is
         # hundreds of deltas, and pairwise concatenation copies the text
         # accumulated so far every time, which is quadratic in the reply size.
-        return {**run[0], "content": "".join(m.get("content", "") for m in run)}
+        merged = {**run[0], "content": "".join(m.get("content", "") for m in run)}
+        # The fold stands for every delta in the run, so it carries the run's
+        # NEWEST seq: that is the floor a client seeds its replay guard from,
+        # and the first delta's seq would let every later one be applied twice.
+        # Older rows carry no seq (legacy window); then the fold carries none.
+        seqs = [m["seq"] for m in run if isinstance(m.get("seq"), int)]
+        if seqs:
+            merged["seq"] = max(seqs)
+        else:
+            merged.pop("seq", None)
+        return merged
 
     out: list[dict] = []
     run: list[dict] = []
@@ -2889,9 +3573,21 @@ def _prepare_messages(messages: list[dict], running: bool, *, live_child: str) -
         if role == "chunk":
             text = m.get("content", "")
             if text:
-                text, _ = redact_exfiltration_urls(text)
-                text, _ = redact_credentials(text)
-                out.append({"role": "streaming", "content": text, "cls": "msg msg-a"})
+                text = redact_display_content(text)
+                row: dict[str, Any] = {"role": "streaming", "content": text, "cls": "msg msg-a"}
+                # The newest chunk seq folded into this row (see
+                # _collapse_wire_rows). The client seeds its replay guard from
+                # it, so a live frame that races this snapshot and carries a
+                # seq at or below it is dropped instead of appended twice.
+                # Omitted when the window rows carry none: a client treats a
+                # missing seq as "apply as before".
+                if isinstance(m.get("seq"), int):
+                    row["seq"] = m["seq"]
+                    # The process that numbered it, so a client can tell a
+                    # floor from before a gateway restart apart (chunk_generation).
+                    if isinstance(m.get("gen"), str):
+                        row["gen"] = m["gen"]
+                out.append(row)
             continue
         text = m.get("content", "")
         # Gate is `!= "user"`, NOT `not in ("user", "system")`. This is the
@@ -2903,22 +3599,25 @@ def _prepare_messages(messages: list[dict], running: bool, *, live_child: str) -
         # would emit raw stored bytes.
         # User-authored content stays raw: the user typed it and is the only
         # one who sees it back.
+        # Content may be structured (a legacy or hand-edited row):
+        # redact_display_content recurses into it rather than raising.
         if role != "user" and text:
-            text, _ = redact_exfiltration_urls(text)
-            text, _ = redact_credentials(text)
-            m = {**m, "content": text}
+            m = {**m, "content": redact_display_content(text)}
+        else:
+            # The wire-string invariant covers EVERY row, not just the
+            # redacted ones: a structured user row or a falsy container
+            # serializes to text (without redaction) instead of shipping a
+            # raw container the client render chokes on.
+            wire = serialize_wire_content(text)
+            if wire is not text:
+                m = {**m, "content": wire}
         msg_out = dict(m)
         if msg_out.get("variants"):
             # Snapshot for the same reason as _redact_meta — this runs in a
             # worker thread (slot-detail render offload) while the event
             # loop may still be appending variants to the live list.
             msg_out["variants"] = [
-                {
-                    **v,
-                    "content": redact_credentials(
-                        redact_exfiltration_urls(v.get("content", ""))[0]
-                    )[0],
-                }
+                {**v, "content": redact_display_content(v.get("content", ""))}
                 for v in list(msg_out["variants"])
                 if isinstance(v, dict)
             ]

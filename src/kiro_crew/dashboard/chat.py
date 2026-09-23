@@ -30,9 +30,14 @@ from kiro_crew.config.loader import (  # noqa: F401
     config_dir,
     resolve_agent_bindings,
 )
+from kiro_crew.dashboard.chat_folder_scaffold import (  # noqa: F401
+    api_chat_folders_scaffold,
+    api_chat_folders_scan,
+)
 from kiro_crew.dashboard.chat_folders import (  # noqa: F401
     api_chat_folder_create,
     api_chat_folder_delete,
+    api_chat_folder_reorder,
     api_chat_folder_update,
     api_chat_folders,
     api_chat_slot_folder,
@@ -87,7 +92,6 @@ from kiro_crew.dashboard.chat_nav import (  # noqa: F401
 )
 from kiro_crew.dashboard.chat_orchestrator import (  # noqa: F401
     _build_stage_context,
-    _capture_stage_result,
     _previous_result_paths,
     _stage_loop,
     api_chat_plan_action,
@@ -122,11 +126,9 @@ from kiro_crew.dashboard.chat_runner import (  # noqa: F401
     _run_chat,
 )
 from kiro_crew.dashboard.chat_slack import (  # noqa: F401
-    api_chat_slot_handoff,
     api_chat_slot_slack_link,
     api_chat_slot_slack_pause,
     api_chat_slot_slack_unlink,
-    api_handoff_channels,
     api_slack_channels,
 )
 from kiro_crew.dashboard.chat_tags import (  # noqa: F401
@@ -177,6 +179,7 @@ from kiro_crew.dashboard.chat_utils import (  # noqa: F401
 from kiro_crew.dashboard.chat_voice import (  # noqa: F401
     api_voice_config,
     api_voice_synthesize,
+    api_voice_system_voices,
     api_voice_voices,
 )
 from kiro_crew.security import is_sensitive_path  # noqa: F401

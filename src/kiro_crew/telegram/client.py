@@ -616,6 +616,12 @@ class TelegramClient:
         # transitions to persistently-failing or recovers. Set by the gateway
         # to keep the settings status badge truthful after startup.
         self.on_status: Callable[[bool, str], None] | None = None
+        #: Optional teardown callback: called once from :meth:`close`, best-effort.
+        #: The gateway sets it to unregister the dispatcher's spawn-approval
+        #: delivery hook so the host gate stops routing to a channel that is going
+        #: away (the registration is process-global; see
+        #: ``messaging/spawn_approval_delivery.py``).
+        self.on_close: Callable[[], None] | None = None
         #: Last health state reported through on_status (None = never
         #: reported). The gateway seeds this with the startup getMe outcome so
         #: transitions are relative to the boot state.
@@ -717,6 +723,14 @@ class TelegramClient:
     async def close(self) -> None:
         """Gracefully shut down."""
         self._closed = True
+        # Retire any process-global registration this channel holds (the
+        # spawn-approval delivery hook) BEFORE tearing the transport down, so the
+        # host spawn gate stops routing to a dispatcher that is going away.
+        if self.on_close is not None:
+            try:
+                self.on_close()
+            except Exception:
+                logger.debug("Telegram on_close callback failed", exc_info=True)
         # Best-effort flush of buffered albums BEFORE cancelling the polling
         # task. This is NOT a delivery guarantee -- see _flush_all_albums: the
         # handler it spawns races SessionManager._closing and may be refused,
@@ -943,7 +957,7 @@ class TelegramClient:
     ) -> bool:
         """Edit ONLY a message's inline keyboard, leaving its text intact.
 
-        Used to retire an ``[OPTIONS:]`` keyboard after a choice is tapped
+        Retires an ``[OPTIONS:]`` keyboard after a choice is tapped
         without clobbering the answer text that carried it. Pass
         ``{"inline_keyboard": []}`` to remove the buttons.
         """
@@ -1238,7 +1252,7 @@ class TelegramClient:
 
         Telegram REPLACES the whole default-scope menu on each call, so the full
         list must be sent every time — that is also what retires a command the
-        bot no longer serves. An empty list is refused rather than sent, because
+        bot does not serve. An empty list is refused rather than sent, because
         Telegram would read it as "this bot has no commands" and wipe the menu.
         """
         if not commands:
@@ -1520,7 +1534,7 @@ class TelegramClient:
         # _spawn_handler only creates a task, so acking at this point would advance
         # the cursor past an album whose turn has not run. The handler resolves them
         # as a unit in its finally, because replaying half an album would deliver the
-        # same photos again under a caption that no longer matches.
+        # same photos again under a caption that does not match.
         self._spawn_handler(merged, tuple(pending))
 
     def _flush_all_albums(self) -> None:

@@ -10,33 +10,48 @@ The pod lifecycle, packaged scenarios, diagnostic commands, and pod-e2e harness
 are on `main` today:
 
 - `kirocrew pod scenarios [--json]`
-- `kirocrew pod up/down/ls/status/logs/prune`
+- `kirocrew pod up/down/ls/status/logs/prune/api`
 - `src/kiro_crew/apps/builtins/dev_fleet/skills/pod-e2e/scripts/pod-e2e.sh`
 
-`kirocrew pod api` is not on `main` yet. It arrives with PR #8218. This guide is
-sequenced after #8218: do not merge it first, and update recipes 1 and 3 in the
-same review round if #8218's interface changes. Recipes that use `pod api`
-deliberately fail their preflight until that command is installed:
+`kirocrew pod api` prints a stable JSON object with `name`, `method`, `path`,
+`status`, `ok`, and `body`. It permits `GET` and `HEAD` by default; `POST`,
+`PUT`, `PATCH`, and `DELETE` require `--allow-write`. It mints the selected
+pod's dashboard token internally, so do not add a `token` query parameter. If an
+older installed CLI lacks the verb, update that installation before using these
+recipes:
 
 ```bash
 kirocrew pod --help | grep -qw api || {
-  echo "This recipe requires kirocrew pod api from PR #8218" >&2
+  echo "This recipe requires a current Kiro Crew installation with pod api" >&2
   exit 1
 }
 ```
 
-`pod api` prints a stable JSON object with `name`, `method`, `path`, `status`,
-`ok`, and `body`. It permits `GET` and `HEAD` by default; `POST`, `PUT`, `PATCH`,
-and `DELETE` require `--allow-write`. It mints the selected pod's dashboard token
-internally, so do not add a `token` query parameter.
+The packaged scenarios are the agent's **native seeding vocabulary**:
+`kirocrew pod scenarios` prints each name plus its description, and that listing
+— not this guide — is the authoritative inventory. Use the smallest scenario
+that establishes the state under test. The fixture job names asserted below are
+owned by [`minimal/crons.json`](../../src/kiro_crew/tests_fixtures/minimal/crons.json).
 
-Only three packaged scenarios exist: `empty`, `minimal`, and `rich`.
-`kirocrew pod scenarios` prints each name plus its description. Use the smallest
-one that establishes the state under test. The fixture job names asserted below
-are owned by [`minimal/crons.json`](../../src/kiro_crew/tests_fixtures/minimal/crons.json).
-Ten specialized payloads remain deferred until a verification recipe
-demonstrates that one is needed; do not invent a fourth scenario in a feature
-branch.
+A new scenario earns its place with two things in one PR: a **named debugging or
+verification use case** in its `fixture.yaml` description (the state it pins and
+why an agent would seed it), and a **proving test** that pins the fixture's
+design point so drift turns a build red. A checked-in recipe is not a
+precondition: scenarios exist precisely so agents can seed known states natively
+at debug time instead of designing fixtures on the spot.
+
+Some states are not reachable by authoring a few more rows, and those are the
+ones worth a scenario. History paging is the worked example: the slot-detail
+fast path answers `has_more=false` unless a session has size-rotated `archive/`
+segments, and rotation only happens once a transcript outgrows a 10 MiB budget,
+so every scenario built from a handful of messages leaves "load earlier"
+structurally unreachable. Seed `sessions-long-history` for anything on that
+seam - it ships one pinned session whose oldest 60 rows sit below a real
+rotation boundary, so the initial slot load answers `has_more=true` with a
+cursor that pages into the archive. Its archive segment is real
+`ConversationLog` rotation output rather than authored bytes; regenerate it by
+driving the writer as its `fixture.yaml` describes, and do not hand-edit the
+JSONL.
 
 ## Find the verification surface without searching the repository
 
@@ -63,7 +78,7 @@ PATH_TO_ASSERT=/api/crons
 
 kirocrew pod scenarios
 kirocrew pod --help | grep -qw api || {
-  echo "This recipe requires kirocrew pod api from PR #8218" >&2
+  echo "This recipe requires a current Kiro Crew installation with pod api" >&2
   exit 1
 }
 
@@ -118,7 +133,7 @@ printf '%s\n' "$HANDLE" | jq -e '
   .status == "up" and (.base_url | startswith("http://127.0.0.1:"))
 ' >/dev/null
 
-bash "$HARNESS" "$WT" --fe-only --no-suppress-first-run
+bash "$HARNESS" "$WT" --no-suppress-first-run
 
 jq -se '
   any(.[]; .phase == "smoke" and .status == "pass") and
@@ -137,6 +152,61 @@ Playwright assertion and screenshot described by the pod-e2e skill. Inspect the
 resulting image before using it as PR evidence; a green verdict with a stale or
 unrelated frame is not proof.
 
+### Desktop-shell surfaces: the menu, its captions, the window chrome
+
+The recipe above photographs the web app. Electron draws the application menu,
+the menu popups and the native frame outside any web page, so neither a pod nor
+the browser-only `website/scripts/capture-*.mjs` scripts can reach them. Use
+`website/scripts/capture-electron-shell.mjs` for those: it launches real Electron
+through Playwright's `_electron` driver and grabs an X screen, so the menu
+frame lands in the picture.
+
+```bash
+npm ci --prefix website/electron        # once: installs the Electron binary
+node website/scripts/capture-electron-shell.mjs
+```
+
+`npm ci` fetches the binary in its postinstall, but an npm that gates lifecycle
+scripts (npm 12 does by default) installs the package without it. The harness then
+refuses at start and prints the one command that repairs it, which is also the
+command to run up front if lifecycle scripts are off where you work:
+
+```bash
+node website/electron/node_modules/electron/install.js
+```
+
+No `xvfb-run` and no `DISPLAY`: the harness starts its own Xvfb, lets Xvfb bind a
+free display number and report it back, and ignores an exported `DISPLAY`. That is
+deliberate and there is no flag to change it, because a grab has to take a whole
+screen - a menu popup is its own window - so the screen it takes must be one that
+holds nothing else. With no Xvfb binary on `PATH` (or `XVFB_BIN`) the run refuses
+rather than shooting on whatever display is there. The screen size is the harness's
+own, and each written file is cropped to the harness window's rectangle, so no
+pixel from anything else can reach it.
+
+It writes `electron-shell-window.png` and `electron-shell-menu-<id>.png` under
+`OUT_DIR`. Two runs on an unchanged tree produce byte-identical files, so a diff
+of the pair reports only what the change did.
+
+The shot is evidence rather than decoration because the script does not build the
+menu it photographs. It reads the menu back out of the running app and refuses to
+take any picture unless the caption the caller declared is the caption the app
+actually holds, which is what `--expect-item`, `--expect-accelerator` and
+`--expect-register-accelerator` declare. `website/src/test/electronShellEvidence.test.ts`
+covers that refusal.
+
+Two limits are worth knowing before it is quoted as proof. Window decorations
+belong to the window manager and the harness's Xvfb runs none, so the window is
+undecorated there - the menu bar is Electron's own and is always present.
+And macOS's menu bar belongs to the system: `--platform=darwin` renders the macOS
+menu template in a popup, which shows the items and which of them carry a chord,
+but the modifier names are drawn by the Linux toolkit (`CmdOrCtrl` prints as
+`Ctrl`).
+
+The harness is not wired into any CI lane. It needs an Xvfb binary and an Electron
+binary that the `website` install does not fetch, and none of its capture-script
+siblings run in CI either.
+
 ## Recipe 3: drive an agent inside the pod
 
 The existing routes and payloads are:
@@ -153,18 +223,17 @@ The create response returns the new session key as `body.target`. Send returns
 `body.started`; read returns `body.running`, `body.next_since`, and
 `body.messages`.
 
-**This recipe is not executable through PR #8218 as currently implemented.**
+**This recipe is not executable through `pod api` as currently implemented.**
 The session-control routes require a validated `X-Internal-Secret` and identify
-the caller from `X-Session-Key`. PR #8218's `pod api` sends only a dashboard
-query token and has no caller-session option. A live probe returns HTTP 403 with
+the caller from `X-Session-Key`. `pod api` sends a dashboard query token and has
+no caller-session option. A live probe returns HTTP 403 with
 `code: internal_secret_required`; even adding internal authentication alone
 would leave create without a caller workspace. Do not claim that an agent was
 driven through `pod api` until both requirements have a supported interface.
 
 The intended trace below records the exact routes and bodies, but the first
-request is expected to fail under the current #8218 implementation. It is kept
-here as the acceptance trace for closing that compatibility gap, not as a green
-recipe:
+request is expected to fail under the current implementation. It is kept here as
+the acceptance trace for closing that compatibility gap, not as a green recipe:
 
 ```bash
 set -euo pipefail
@@ -247,3 +316,63 @@ kirocrew pod prune
 Use `kirocrew pod prune --all` only when every reported orphan should be
 removed regardless of age. Reclamation is destructive to the isolated pod home,
 so keep a fresh crash home until its logs and sessions are no longer needed.
+
+## Recipe 5: the scenario phase
+
+The recipes above prove one worktree by hand. The scenario phase is the same
+proof, automated: `test/e2e/scenarios/` boots ONE pod through the verbs used
+above and drives five user-visible flows against it.
+
+| Scenario | What it proves |
+|---|---|
+| `test_settings_save.py` | A setting written through the API survives a gateway restart. |
+| `test_cron_fire.py` | A cron created through the API fires and records a run. |
+| `test_subagent_spawn.py` | One agent turn completes, with its tool call, against the packaged fake ACP backend. |
+| `test_service_install_dry_run.py` | The rendered host service definition captures `KIROCREW_PORT` and never the pod's throwaway home. |
+| `test_wheel_install.py` | The built wheel installs into a clean venv and `kirocrew --version` plus `kirocrew doctor` answer. |
+
+Run the phase from the worktree you are proving:
+
+```bash
+KIROCREW_E2E_SCENARIOS=1 \
+  .venv/bin/python -m pytest -v -p no:cacheprovider -o addopts= \
+  -n0 --timeout=600 test/e2e/scenarios/
+```
+
+Add `KIROCREW_E2E_REQUIRE=1` when you need a verdict rather than a
+best-effort run: it turns every precondition skip into a failure, so a missing
+venv, an unbuilt SPA bundle or a host with no pod backend cannot read as a pass.
+That is the setting the nightly job uses. Each file also runs alone, so
+`pytest ... test/e2e/scenarios/test_cron_fire.py` is a valid single check.
+
+Three preconditions, all of them the same ones the recipes above need. The
+worktree must have `.venv/bin/kirocrew`, because a pod boots the CHECKOUT's own
+binary and the suite refuses to fall back to the host's installed build. It must
+have a built `src/kiro_crew/static/dist`. And the host must be able to run pods
+at all, which the suite asks through the pod's own `runtime.require_backend()`
+rather than testing the platform itself.
+
+The suite runs on a hermetic pod plane (its own roots, unit prefix and port
+band), so it can never touch or reclaim your real pods. Its plane root is chosen
+SHORT deliberately: a pod's private dashboard socket lives at
+`<pod home>/dashboard-<port>.sock`, and a path over the AF_UNIX limit makes the
+gateway fall back to TCP-only, after which every `kirocrew pod api` call refuses
+correctly and permanently while the pod still answers health.
+
+CI runs this phase nightly on Linux and macOS. See
+[../ci/e2e-gate.md](../ci/e2e-gate.md) for that job.
+
+## Restarting a harness-owned gateway
+
+`spawn_feature_gateway` handles expose `restart()`. It shuts down only the
+process tree owned by that live harness context, refuses if teardown cannot be
+confirmed, then returns a new handle for a new gateway process using the same
+isolated data and agent-spec homes. It does not reseed configuration or replace
+memory bindings. The context manager cleans up the final process and home;
+a handle used after context exit cannot restart anything.
+
+The private workflow E2E uses this operation to reload the original run and
+replay a subtree after a real process restart. That scenario still requires
+actual namespace support and cannot substitute mocked proof or ownership checks.
+The separate gateway restart smoke checks process supervision and V1 replay;
+it is not private-memory isolation evidence.

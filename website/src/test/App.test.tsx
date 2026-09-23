@@ -4,9 +4,10 @@ import { MOBILE_BREAKPOINT } from '../hooks/useIsMobile'
 import { join } from 'node:path'
 import { render, screen, act, fireEvent, waitFor, within } from '@testing-library/react'
 import { renderWithProviders, createTestStore } from './helpers'
-import App from '../App'
-import { sseConnected, sseDisconnected } from '../store/dashboardSlice'
+import App, { NavBadge } from '../App'
+import { sseConnected, sseDisconnected, markSlotUnread } from '../store/dashboardSlice'
 import { openActivityPanel, sseSubagentQueued } from '../store/chatSlice'
+import { SHORTCUTS_ENABLED_KEY } from '../hooks/useKeyboardShortcuts'
 import SegmentedControl from '../components/SegmentedControl'
 import { ApiError } from '../api/client'
 import { safeSetItem } from '../utils/safeStorage'
@@ -51,7 +52,6 @@ function topbarTracks(): { sides: string[]; search: string } {
 // Mock all page components to isolate routing
 vi.mock('../pages/ChatPage', () => ({ default: () => <div data-testid="chat-page">ChatPage</div> }))
 vi.mock('../pages/SystemPage', () => ({ default: () => <div data-testid="system-page">SystemPage</div> }))
-vi.mock('../pages/AgentsPage', () => ({ default: () => <div data-testid="agents-page">AgentsPage</div> }))
 vi.mock('../pages/ProjectsPage', () => ({ default: () => <div data-testid="projects-page">ProjectsPage</div> }))
 vi.mock('../pages/LogsPage', () => ({ default: () => <div data-testid="logs-page">LogsPage</div> }))
 vi.mock('../pages/KiroCrewAgentsPage', () => ({ default: () => <div data-testid="mc-agents-page">MCAgentsPage</div> }))
@@ -261,7 +261,12 @@ describe('App routing', () => {
       // still shown rather than skipped along with it.
       renderWithProviders(<App />, { route: '/chat' })
 
-      const dialog = await screen.findByRole('dialog', { name: 'Privacy' })
+      // Privacy mounts only at the end of a real async chain: the import
+      // chapter's scan query resolves, an effect fires its auto-complete
+      // mutation (`api.onboardingImportState`), and `onSuccess` flips the
+      // parent's state. findBy*'s 1000ms default polls that whole chain and
+      // loses under load, so the wait names the boundary and gives it room.
+      const dialog = await screen.findByRole('dialog', { name: 'Privacy' }, { timeout: 5000 })
       expect(within(dialog).getByText('Anonymous daily heartbeat')).toBeInTheDocument()
       // Mandatory: no way past it but forward.
       expect(within(dialog).queryByRole('button', { name: /skip/i })).not.toBeInTheDocument()
@@ -286,8 +291,9 @@ describe('App routing', () => {
       const api = await freshFirstRun()
       renderWithProviders(<App />, { route: '/chat' })
 
-      // Chapter 1 (nothing to import) → Privacy → Customize.
-      const dialog = await screen.findByRole('dialog', { name: 'Privacy' })
+      // Chapter 1 (nothing to import) → Privacy → Customize. Same
+      // auto-complete mutation chain as above sits in front of this dialog.
+      const dialog = await screen.findByRole('dialog', { name: 'Privacy' }, { timeout: 5000 })
       fireEvent.click(within(dialog).getByRole('button', { name: 'Continue' }))
       expect(await screen.findByText('Pick your look')).toBeInTheDocument()
 
@@ -744,6 +750,92 @@ describe('App routing', () => {
     act(() => { store.dispatch(sseSubagentQueued({ slot: 'background', queued: 2 })) })
 
     expect(await screen.findByLabelText('2 subagents in flight')).toBeInTheDocument()
+    // In flow beside the unread badge and the shortcut hint, not `absolute
+    // right-8` layered over them — see the overlap regression test below.
+    expect((await screen.findByLabelText('2 subagents in flight')).className).not.toContain('absolute')
+  })
+
+  it('keeps the expanded unread badge and the row shortcut hint out of each others space', async () => {
+    // Regression: the badge was `absolute right-2`, i.e. OUT of the row's flex
+    // line, while the shortcut hint is an in-flow span at the row's right edge —
+    // so on a Sessions row with one unread the badge painted ON TOP of the chord
+    // and the row advertised a keystroke you could not read.
+    //
+    // Pinned two ways, because either assertion alone still passes against the
+    // bug: the badge must be IN FLOW (an absolute badge overlaps a sibling at any
+    // count width, and jsdom computes no layout so a geometry check would be
+    // vacuous here), AND it must follow the chord in the same flex line, so the
+    // fix is not "the chord is the thing pushed off the right edge instead".
+    localStorage.removeItem('mc-nav')
+    localStorage.removeItem(SHORTCUTS_ENABLED_KEY)
+    const store = createTestStore()
+
+    renderWithProviders(<App />, { route: '/chat', store })
+
+    // The chord's presence is the precondition: with shortcuts off there is
+    // nothing for the badge to cover and the rest of this would pass vacuously.
+    const chord = await screen.findByTestId('nav-shortcut-chat')
+    // Seed the unread AFTER the mount slot fetch settles — `fetchSlots.fulfilled`
+    // drains unread keys naming no live slot, so seeding earlier would race it.
+    await waitFor(() => expect(store.getState().dashboard.slotsLoaded).toBe(true))
+    act(() => { store.dispatch(markSlotUnread({ slot: 'background', ts: '2026-01-01T00:00:05Z' })) })
+
+    const badge = await screen.findByLabelText('1 unread conversations')
+    expect(badge.className).not.toContain('absolute')
+    expect(badge.parentElement).toBe(chord.parentElement)
+    expect(chord.compareDocumentPosition(badge) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+  })
+
+  it('keeps an app rows run-state mark in the same flex line as its count pill', async () => {
+    // The count pill moving into the row's line is only a class closure if every
+    // right-edge mark moves with it. This one is the sibling that was left: an app
+    // row renders BOTH this mark and an `appBadges`-driven pill, so while the mark
+    // stayed at a fixed 32px offset a 2-3 digit pill grew left underneath it and
+    // reproduced the original bug one component over. Rendering `NavBadge`
+    // directly rather than staging an installed app keeps the assertion on the
+    // composition, which is where the property lives.
+    const store = createTestStore()
+
+    renderWithProviders(
+      // `NavBadge` strips the `app-` prefix before reading `appBadges`.
+      <NavBadge navId="app-demo" collapsed={false} appBadges={{ demo: 999 }} runState="running" />,
+      { store }
+    )
+
+    const mark = await screen.findByLabelText('A scheduled job of this app is running')
+    const pill = await screen.findByLabelText('999 updates')
+    expect(mark.className).not.toContain('absolute')
+    // Same flex line as the pill, so the two cannot intersect at any digit count.
+    expect(mark.parentElement).toBe(pill.parentElement)
+  })
+
+  it('names what each right-edge count is counting, for sighted users too', async () => {
+    // The two indicators are now reliably CO-VISIBLE (that is the point of the
+    // fix above), so a bare "1" pill beside a bare bot glyph and "2" has to be
+    // tellable apart without a screen reader. Both carry the label as `title`.
+    //
+    // The title is the label ALONE, deliberately: the labels are plural phrases,
+    // so reusing the aria string would render a visible "1 unread conversations"
+    // at count 1. The count is already in the pill, so the title does not repeat
+    // it — asserted below, or the grammar defect returns the moment someone
+    // "helpfully" switches these back to ariaLabel.
+    localStorage.removeItem('mc-nav')
+    const store = createTestStore()
+
+    renderWithProviders(<App />, { route: '/chat', store })
+
+    await waitFor(() => expect(store.getState().dashboard.slotsLoaded).toBe(true))
+    act(() => { store.dispatch(markSlotUnread({ slot: 'background', ts: '2026-01-01T00:00:05Z' })) })
+    act(() => { store.dispatch(sseSubagentQueued({ slot: 'background', queued: 2 })) })
+
+    const badge = await screen.findByLabelText('1 unread conversations')
+    const activity = await screen.findByLabelText('2 subagents in flight')
+    expect(badge).toHaveAttribute('title', 'unread conversations')
+    expect(activity).toHaveAttribute('title', 'subagents in flight')
+    // Count 1 against a plural phrase is the case that reads wrong, so pin that
+    // the title carries no digit rather than only pinning the happy string.
+    expect(badge.getAttribute('title')).not.toMatch(/\d/)
+    expect(activity.getAttribute('title')).not.toMatch(/\d/)
   })
 
   it('surfaces the collapsed hover label on keyboard focus and is Enter-activatable', async () => {
@@ -1326,10 +1418,14 @@ describe('App routing', () => {
         // cannot leave it queued for a later, unrelated message.
         { source: 'feature-request', maxAge: 60 },
       )
+      // sendTurn's dashboard wire passes (message, slot, agent, signal, memoryMode, steer).
       expect(api.sendChat).toHaveBeenCalledWith(
         'I’d like to request a feature!',
         'feature-slot',
         expect.any(String),
+        expect.any(AbortSignal),
+        undefined,
+        undefined,
       )
     })
     expect(api.sendChat).not.toHaveBeenCalledWith(
@@ -1343,7 +1439,9 @@ describe('App routing', () => {
     renderWithProviders(<App />, { route: '/chat' })
     // Connection is a colored dot in the unified readout capsule ("Offline"
     // text was removed -- the capsule's red tint is the disconnected signal).
-    expect(screen.getByLabelText('Gateway offline')).toBeInTheDocument()
+    // The dot's accessible name carries the cause; with no auth banner up it
+    // is the reconnecting variant (see #9692).
+    expect(screen.getByLabelText(/Gateway offline/i)).toBeInTheDocument()
   })
 
   it('keeps theme controls available from Settings', () => {
@@ -1435,7 +1533,12 @@ describe('TopbarMetrics widget', () => {
     sysMock.mockResolvedValueOnce({ mem_used_gb: 4.0, mem_total_gb: 0, cpu_pct: 25.0, disk_total_gb: 0, disk_free_gb: 0 } as never)
     localStorage.setItem('mc-topbar-metrics', '1')
     renderWithProviders(<App />, { route: '/chat' })
-    expect(await screen.findByText(/MEM —/)).toBeInTheDocument()
+    // The capsule paints `MEM —` / `DSK —` BEFORE the first frame lands too (the
+    // loading placeholder reuses the loaded branch's "no valid reading" glyph),
+    // so a dash is not proof the frame arrived. `CPU 25%` only exists in the
+    // loaded branch: wait for that, then read the dashes off the same frame.
+    expect(await screen.findByText(/CPU 25%/)).toBeInTheDocument()
+    expect(screen.getByText(/MEM —/)).toBeInTheDocument()
     expect(screen.getByText(/DSK —/)).toBeInTheDocument()
     sysMock.mockResolvedValue({ mem_used_gb: 4.0, mem_total_gb: 16.0, cpu_pct: 25.0, disk_total_gb: 100.0, disk_free_gb: 60.0 } as never)
     localStorage.removeItem('mc-topbar-metrics')
@@ -1454,10 +1557,12 @@ describe('TopbarMetrics widget', () => {
     sysMock.mockResolvedValueOnce({ mem_total_gb: 16.0, cpu_pct: 25.0, disk_total_gb: 100.0, disk_free_gb: 60.0 } as never)
     localStorage.setItem('mc-topbar-metrics', '1')
     renderWithProviders(<App />, { route: '/chat' })
-    expect(await screen.findByText(/MEM —/)).toBeInTheDocument()
+    // Same ordering as above: `MEM —` is also the pre-frame placeholder, so the
+    // wait has to be on a reading only the loaded frame can produce.
+    expect(await screen.findByText(/CPU 25%/)).toBeInTheDocument()
+    expect(screen.getByText(/MEM —/)).toBeInTheDocument()
     // The rest of the same frame still renders — one absent probe must not
     // blank the whole capsule, let alone unmount the app.
-    expect(screen.getByText(/CPU 25%/)).toBeInTheDocument()
     expect(screen.getByText(/DSK 40%/)).toBeInTheDocument()
     sysMock.mockResolvedValue({ mem_used_gb: 4.0, mem_total_gb: 16.0, cpu_pct: 25.0, disk_total_gb: 100.0, disk_free_gb: 60.0 } as never)
     localStorage.removeItem('mc-topbar-metrics')

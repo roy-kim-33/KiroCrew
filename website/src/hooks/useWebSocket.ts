@@ -2,24 +2,45 @@ import { useEffect, useRef, useCallback } from 'react'
 import { useQueryClient, type QueryClient } from '@tanstack/react-query'
 import { isArtifactEditing } from '../utils/artifactEditGuard'
 import { isReconcileNote } from '../lib/noteContract'
+import { approvalNotificationBody } from '../lib/approvalNotificationBody'
 import { useAppDispatch, useAppSelector } from '../store'
 import { store } from '../store'
-import { sseStatus, sseYolo, sseConnected, sseDisconnected, sseSlots, sseTodoUpdate, sseMcpReportUpdate, setChannelTrusted, sseSlotTitle, triggerRefresh, fetchSlots, markSlotUnread, setUpdateProgress, sseSubagentStatus, sseSubagentText, touchSlotActivity, patchSlotSourceLinks, type SubagentDetail } from '../store/dashboardSlice'
+import { sseStatus, sseYolo, sseConnected, sseDisconnected, sseSlots, sseTodoUpdate, sseMcpReportUpdate, setChannelTrusted, sseSlotTitle, triggerRefresh, fetchSlots, markSlotUnread, remoteSlotRead, setUpdateProgress, sseSubagentStatus, sseSubagentText, touchSlotActivity, patchSlotSourceLinks, type SubagentDetail } from '../store/dashboardSlice'
 import { addNotification, ackNotificationByTs, unackNotificationByTs, removeNotificationByTs, clearAllNotifications, fetchNotifications, markBootNotificationsFetched } from '../store/notificationsSlice'
-import { dispatchMcNotification, TURN_DONE_KIND, APPROVAL_KIND, shouldChimeOnTurnDone } from './notificationEvent'
+import { dispatchMcNotification, dispatchLiveNotification, TURN_DONE_KIND, APPROVAL_KIND, shouldChimeOnTurnDone } from './notificationEvent'
+import { shouldNotifyOnChatComplete } from './chatCompleteNotify'
+import { isChatPath } from './notificationBanner'
 import { emitThemeSound } from './themeSound'
 import { streamingFlushHoldMs } from '../lib/streamHold'
+import { registerPendingChunkDrain } from '../lib/pendingChunkDrain'
+import { bindSlotReadSender, emitSlotRead, flushSlotRead } from '../lib/slotReadRelay'
+import { getViewedThreadSlot } from '../lib/viewedThread'
+import { VoicePcmPlayer, voiceBoundary, createVoiceRequestId } from '../lib/voicePlayback'
+import { reportVoiceFailure } from '../lib/voiceFailure'
 import {
-  fetchHistory, missedChunkMarker, sseChatMessage, sseChatMessageUpdate, sseChatMessagePatchByTs, sseThinkingChunk, refreshSlot, warmSlotCache, sseContextUsage, clearMessages, clearSlotCache, setVoicePlaying, setVoiceAudio, resolveByApprovalId, clearSubagentsForSnapshot, sseSubagentPending, sseSubagentSpawn, sseSubagentQueued, sseSubagentTool, sseSubagentStalled, sseSubagentRetrying, sseSubagentDone, sseSubagentSnapshot, sseSubagentBatchUpdate, sseSubagentBatchChunks, sseToolActivity, sseToolResult, sseActivityEvent, sseSideResult, sseWorkflowEvent, setSlotStatusDetail, removeQueuedMessage, appendQueuedMessage, cancelQueuedMessage, editQueuedMessage, reorderQueuedMessages, appendSlotMessage, setQuestionCard, resolveQuestionCard, setFollowupCard, setFolderSuggestion, sseMcpAppRender, setGoalLoops, sseGoalLoop, sseSideQueue, reconcileWorkflowRuns
+  fetchHistory, sseChatMessage, sseChatMessageUpdate, sseChatMessagePatchByTs, sseThinkingChunk, refreshSlot, warmSlotCache, sseContextUsage, clearMessages, clearSlotCache, setVoicePlaying, setVoiceAudio, resolveByApprovalId, clearSubagentsForSnapshot, sseSubagentPending, sseSubagentSpawn, sseSubagentQueued, sseSubagentTool, sseSubagentStalled, sseSubagentRetrying, sseSubagentDone, sseSubagentSnapshot, sseSubagentBatchUpdate, sseSubagentBatchChunks, sseToolActivity, sseToolResult, sseActivityEvent, sseSideResult, sseWorkflowEvent, setSlotStatusDetail, removeQueuedMessage, appendQueuedMessage, cancelQueuedMessage, editQueuedMessage, reorderQueuedMessages, appendSlotMessage, setQuestionCard, resolveQuestionCard, setFollowupCard, setFolderSuggestion, sseMcpAppRender, setAutomations, sseAutomation, removeAutomation, sseSideQueue, reconcileWorkflowRuns,
 } from '../store/chatSlice'
+import { selectSidebarSubagentCounts, selectSidebarWorkflowActive, selectSidebarAutomationRunningKeys } from '../store/chatSlice'
+import { normalizeRunSessionKey } from '../apps/workflows/runModel'
 import { anchorForSlot, loadLayout, sessionSlots } from './splitLayoutStore'
 import { TAB_ID } from '../api/tabId'
 import { api } from '../api/client'
+import { AUTONUDGE_LOOPS_QUERY_KEY } from '../components/autoNudgeLoop'
+import { forgetUnobservedMemberThreads } from '../api/membersQuery'
+import { observedPaneSlots } from '../api/slotMessagesQuery'
+import { MEMBERS_ROSTER_QUERY_KEY } from '../api/membersQuery'
+import { memberProjectionStore } from '../state/memberProjectionStore'
 import { sanitizeLlmOutput } from '../utils/sanitize'
+import { deriveToolCallTitle } from '../utils/toolCallTitle'
 import { applyStatusDelta, parseStatusDelta } from '../utils/pullRequestStatusDelta'
 import { slotChangeUrls } from '../utils/pullRequestLinks'
 import type { StatusData, ChatMessage, ChatSlot, ChatFolder, Notification, PullRequestStatusBatch, TodoList, McpSessionReport } from '../types'
 import { i18nT } from '../i18n/t'
+import {
+  dashboardAutomationSlotKey,
+  isFullLegacyAutomationRecord,
+  normalizeAutomationRecord,
+} from '../monitoring/automation'
 
 type LogCallback = ((data: { level: string; msg: string }) => void) | null
 
@@ -28,7 +49,44 @@ type LogCallback = ((data: { level: string; msg: string }) => void) | null
  *  is a correctness backstop for a lost terminal frame rather than the progress
  *  channel (that is the live event stream), and the tick makes no request at all
  *  while no row is running. */
+/** True when this window is rendering the active slot's transcript: the chat
+ *  routes (the root path serves ChatPage too) plus the popout and embed chat
+ *  frames. Passive read relays (arrival, completion, tab reveal) must check
+ *  this: `chat.activeSlot` is RETAINED across navigation, so on Settings or
+ *  any other route "slot === activeSlot" says nothing about what the user can
+ *  see, and relaying there would erase sibling windows' badges for messages
+ *  nobody displayed. Passive relays must ALSO require document.hasFocus():
+ *  Page Visibility reports occluded or unfocused windows as "visible"
+ *  (Firefox tracks no occlusion; side-by-side windows always report
+ *  visible), so a window parked behind other apps would otherwise mark
+ *  every arrival read within ~1s — unseen work looking read, the inverse
+ *  of the stale-badge defect. Deliberate gestures (switchSlot,
+ *  mark-as-read) need no gate — they only occur on surfaces that show the
+ *  slot, under real focus. */
+const isChatSurfaceVisible = (): boolean =>
+  typeof window !== 'undefined' && isChatPath(window.location.pathname)
+/** True when *slot* is the thread this window is displaying: the chat
+ *  surfaces' `chat.activeSlot`, or the thread a non-chat surface (the Crew
+ *  Members page) registered in `viewedThread`. The unread-marker's gate: a
+ *  message landing in a thread the user is watching is not unread. Without
+ *  the second source every message in an open member thread was flagged and
+ *  then cleared by the page's read effect one render later -- a badge that
+ *  lit and vanished on the parent dashboard's crew tab for each message. */
+const isSlotOnScreen = (slot: string): boolean =>
+  slot === store.getState().chat.activeSlot || slot === getViewedThreadSlot()
+/** The read-relay twin of `isSlotOnScreen`: true when THIS window is rendering
+ *  *slot* on a surface the user can see -- a chat route showing the active
+ *  slot, or the registered viewed thread (registration already implies a
+ *  visible, focused window). Used by the passive relays beside the focus
+ *  gate: a message the marker declined to flag because the user was watching
+ *  it arrive must still be relayed as read, or a sibling window's badge for
+ *  it stays lit -- and `chat_done` moves no `last_ts`, so nothing else on the
+ *  Members page would ever relay that completion. */
+const isSlotRenderedVisibly = (slot: string): boolean =>
+  isChatSurfaceVisible() || slot === getViewedThreadSlot()
 const WORKFLOW_HEAL_MS = 15000
+const LEGACY_AUTOMATION_SEED_QUERY_KEY = ['automation-seed', 'legacy'] as const
+const STRUCTURED_AUTOMATION_SEED_QUERY_KEY = ['automation-seed', 'structured'] as const
 
 type VoiceProgress = {
   slot: string
@@ -59,10 +117,23 @@ function invalidateRefreshQueries(qc: QueryClient): void {
   qc.invalidateQueries({ queryKey: ['sessions-usage'] })
   qc.invalidateQueries({ queryKey: ['agents-installed'] })
   qc.invalidateQueries({ queryKey: ['mcp-tools'] })
+  // Prefix match on purpose: the Crew Members roster lives under this key
+  // (api/membersQuery.ts) and refreshes with the registry.
   qc.invalidateQueries({ queryKey: ['kirocrew-agents'] })
   qc.invalidateQueries({ queryKey: ['default-agent'] })
   qc.invalidateQueries({ queryKey: ['workspaces'] })
   qc.invalidateQueries({ queryKey: ['kirocrewConfig'] })
+  // Prefix match on purpose: covers the filtered library list
+  // (['artifacts', {tag, kind}]) and the tag-options read
+  // (['artifacts', 'all-tags']) in one shot. The `artifact_update` frame
+  // already heals these on live mutations; this covers the server's generic
+  // refresh broadcast so an errored or stale list recovers without a reload
+  // (#10867).
+  qc.invalidateQueries({ queryKey: ['artifacts'] })
+  // The folder list fails alongside it under the same trigger (an
+  // auth-expired window 403s every endpoint) and renders `?? []` the same
+  // way — heal both or the library recovers half-empty (#10867).
+  qc.invalidateQueries({ queryKey: ['artifact-folders'] })
 }
 
 /** Single multiplexed WebSocket replacing all SSE + polling connections. */
@@ -95,6 +166,21 @@ export function resolvedSince(log: Map<string, number>, watermark: number): stri
   const out: string[] = []
   for (const [askId, seq] of log) if (seq > watermark) out.push(askId)
   return out
+}
+
+/** Record an identity in a bounded monotonic log without shifting watermark meaning. */
+function recordInBoundedLog(
+  log: Map<string, number>,
+  sequence: { current: number },
+  id: string,
+): void {
+  if (!id) return
+  log.set(id, ++sequence.current)
+  if (log.size > 200) {
+    // Drop the oldest entries; a reconcile only ever consults recent ones.
+    const oldest = [...log.entries()].sort((a, b) => a[1] - b[1]).slice(0, log.size - 200)
+    for (const [retiredId] of oldest) log.delete(retiredId)
+  }
 }
 
 /** sessionStorage key latched when an in-app update reaches its `restarting`
@@ -221,11 +307,38 @@ export function emitSlotFocused(slot: string | null): void {
   sendSlotFocusedImpl(slot)
 }
 
+/** One buffered chunk: its text (gap marker included) and the seq it carried,
+ *  kept apart so the reducer can hold each part against the slot's replay
+ *  floor and drop exactly the chunks a snapshot already covers. */
+type ChunkPart = { seq: number | undefined; text: string }
+type ChunkBufEntry = { parts: ChunkPart[]; lastSeq: number | undefined; gen: string | undefined; thinking: string; chars: number }
+const newChunkBufEntry = (): ChunkBufEntry => {
+  return { parts: [], lastSeq: undefined, gen: undefined, thinking: '', chars: 0 }
+}
+const bufferedText = (entry: ChunkBufEntry): string => entry.parts.map((p) => p.text).join('')
+
+/** Buffered chars (content + thinking) per slot above which the chunk buffer
+ *  is flushed synchronously instead of waiting for the next animation frame.
+ *  requestAnimationFrame is suspended while the window is hidden, so a
+ *  backgrounded renderer streaming a long turn would otherwise buffer the
+ *  entire turn. The subagent buffer (bufferSubagentChunk) flushes at this
+ *  same 50 KB threshold for the same reason. */
+const CHUNK_BUF_FLUSH_CHARS = 50_000
+
 export function useWebSocket() {
   const dispatch = useAppDispatch()
   const queryClient = useQueryClient()
   const wsRef = useRef<WebSocket | null>(null)
   const closingRef = useRef(false)  // true when cleanup intentionally closes WS
+  // Only coordinator-registry approvals enter this map. Chat-runner permission
+  // rows can share an id, so registry provenance is required before a
+  // reconnect reconcile may retire a client-injected row.
+  const coordinatorApprovalsRef = useRef<Map<string, string>>(new Map())
+  // Coordinator ids retired by live frames, keyed by monotonic sequence.
+  // Reconnect snapshots consult this log so an authority response cannot
+  // revive an entry retired while that response was in flight.
+  const retiredApprovalIdsRef = useRef<Map<string, number>>(new Map())
+  const retiredApprovalSeqRef = useRef(0)
   /* Resolutions observed on the wire, ask_id -> monotonic sequence. Needed
      because a `question_card_resolved` can name a card this client never held
      (it exists only inside an in-flight rehydration snapshot), so the dispatch
@@ -237,14 +350,7 @@ export function useWebSocket() {
    *  `card_id`, in one map because the snapshot add side asks the same question
    *  of both: "was this retired while my request was in flight?" */
   const recordRetiredId = useCallback((retiredId: string) => {
-    if (!retiredId) return
-    const log = resolvedAskIdsRef.current
-    log.set(retiredId, ++resolvedSeqRef.current)
-    if (log.size > 200) {
-      // Drop the oldest entries; a reconcile only ever consults recent ones.
-      const oldest = [...log.entries()].sort((a, b) => a[1] - b[1]).slice(0, log.size - 200)
-      for (const [id] of oldest) log.delete(id)
-    }
+    recordInBoundedLog(resolvedAskIdsRef.current, resolvedSeqRef, retiredId)
   }, [])
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout>>()  // pending reconnect timer
   const logCbRef = useRef<LogCallback>(null)
@@ -267,6 +373,10 @@ export function useWebSocket() {
   const lastSlotsArrayRef = useRef<ChatSlot[] | null>(null)
   const voiceQueueRef = useRef<string[]>([])
   const voicePlayingRef = useRef(false)
+  const pcmPlayerRef = useRef<VoicePcmPlayer | null>(null)
+  const voiceEpochRef = useRef(0)
+  const voiceRequestsRef = useRef(new Map<string, string>())
+  const pendingVoiceRef = useRef<{ slot: string; text: string; request_id: string } | null>(null)
   const activeAudioRef = useRef<HTMLAudioElement | null>(null)
   const autoSpeakRef = useRef(false)
   // Speech offsets belong to one concrete message. A segment for another slot
@@ -284,7 +394,14 @@ export function useWebSocket() {
   // so both content types share one flush cycle and one lifecycle (reconnect
   // clear, chat_done delete, unmount cancel); the flush dispatches thinking
   // before content, matching a turn's thought-then-answer arrival order.
-  const chunkBufRef = useRef<Map<string, { content: string; lastSeq: number | undefined; thinking: string }>>(new Map())
+  const chunkBufRef = useRef<Map<string, ChunkBufEntry>>(new Map())
+  // A fresh entry (first frame of a turn, or the first after a reconnect cleared
+  // the buffer) starts with no seq. The buffer's lastSeq is about WS delivery
+  // only: a repeated delivery of the same seq and a forward gap between two
+  // deliveries. The snapshot replay floor (`lastChunkSeq`) is the reducer's;
+  // each flush hands it the buffered parts with their seqs and the reducer drops
+  // the ones a snapshot already holds. The hook has no view of that floor and
+  // needs none.
   const chunkFlushScheduledRef = useRef(false)
   const chunkRafRef = useRef<number | null>(null)
   const chunkTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -307,8 +424,19 @@ export function useWebSocket() {
 
   const stopVoice = useCallback(() => {
     voiceMutedRef.current = true
+    voiceEpochRef.current++
+    for (const [requestId, slot] of voiceRequestsRef.current) {
+      void api.voiceCancel?.(slot, requestId).catch(() => {})
+    }
+    voiceRequestsRef.current.clear()
+    pendingVoiceRef.current = null
+    synthChainRef.current = Promise.resolve()
+    pcmPlayerRef.current?.stop()
     if (activeAudioRef.current) {
+      activeAudioRef.current.onended = null
+      activeAudioRef.current.onerror = null
       activeAudioRef.current.pause()
+      URL.revokeObjectURL(activeAudioRef.current.src)
       activeAudioRef.current = null
     }
     voiceQueueRef.current.forEach(u => URL.revokeObjectURL(u))
@@ -317,6 +445,19 @@ export function useWebSocket() {
     dispatch(setVoicePlaying(false))
   }, [dispatch])
 
+  const getPcmPlayer = useCallback(() => {
+    pcmPlayerRef.current ??= new VoicePcmPlayer(
+      playing => dispatch(setVoicePlaying(playing)),
+      code => {
+        reportVoiceFailure({ slot: store.getState().chat.activeSlot, code })
+        // A playback failure affects the stream, not just one 200 ms chunk.
+        // Cancel synthesis so later chunks cannot repeatedly raise the same error.
+        stopVoice()
+      },
+    )
+    return pcmPlayerRef.current
+  }, [dispatch, stopVoice])
+
   const voiceProgressFor = useCallback((slot: string, message: ChatMessage): VoiceProgress | null => {
     const messageId = voiceMessageId(message)
     if (!messageId) return null
@@ -324,26 +465,46 @@ export function useWebSocket() {
     if (!current || current.slot !== slot || current.messageId !== messageId) {
       const next = { slot, messageId, spokenLen: 0 }
       voiceProgressRef.current = next
-      voiceMutedRef.current = false
       return next
     }
     return current
   }, [])
 
   const enqueueVoiceSynthesis = useCallback((slot: string, text: string) => {
-    synthChainRef.current = synthChainRef.current
-      .then(() => api.voiceSynthesize(slot, text))
-      .catch(() => {})
+    // The first sentence starts immediately. While it synthesizes, combine
+    // completed sentences into the next request to amortize local model startup.
+    const pending = pendingVoiceRef.current
+    if (pending?.slot === slot && pending.text.length + text.length < 4000) {
+      pending.text += '\n' + text
+      return
+    }
+    const epoch = voiceEpochRef.current
+    const request_id = createVoiceRequestId()
+    const request = { slot, text, request_id }
+    pendingVoiceRef.current = request
+    voiceRequestsRef.current.set(request_id, slot)
+    synthChainRef.current = synthChainRef.current.then(async () => {
+      if (pendingVoiceRef.current === request) pendingVoiceRef.current = null
+      if (epoch !== voiceEpochRef.current || voiceMutedRef.current) return
+      try {
+        await api.voiceSynthesize(slot, request.text, { request_id })
+      } catch {
+        if (!voiceRequestsRef.current.delete(request_id)) return
+        if (epoch === voiceEpochRef.current && slot === store.getState().chat.activeSlot) {
+          reportVoiceFailure({ slot, request_id, code: 'voice_synthesis_failed' })
+        }
+      }
+    })
   }, [])
 
   const flushVoiceTail = useCallback((slot: string, message: ChatMessage) => {
     const progress = voiceProgressFor(slot, message)
     if (!progress) return
     const remaining = message.content.slice(progress.spokenLen).trim()
-    // Mark the whole message consumed even when its tail is below the speech
-    // floor, so a later completion event cannot reconsider or repeat it.
+    // Mark the whole message consumed so a later completion event cannot
+    // reconsider or repeat a tail already queued for speech.
     progress.spokenLen = message.content.length
-    if (remaining.length >= 10) enqueueVoiceSynthesis(slot, remaining)
+    if (remaining) enqueueVoiceSynthesis(slot, remaining)
   }, [enqueueVoiceSynthesis, voiceProgressFor])
 
   const playNextVoiceChunk = useCallback(() => {
@@ -352,91 +513,324 @@ export function useWebSocket() {
     const url = voiceQueueRef.current.shift()!
     const audio = new Audio(url)
     activeAudioRef.current = audio
-    audio.onended = () => {
+    const finished = () => {
       URL.revokeObjectURL(url)
+      if (activeAudioRef.current !== audio) return
       activeAudioRef.current = null
       voicePlayingRef.current = false
-      if (voiceQueueRef.current.length > 0) {
-        playNextVoiceChunk()
-      } else {
-        dispatch(setVoicePlaying(false))
-      }
+      audio.onended = null
+      audio.onerror = null
+      if (voiceQueueRef.current.length) playNextVoiceChunk()
+      else dispatch(setVoicePlaying(false))
     }
+    audio.onended = finished
     audio.onerror = () => {
-      URL.revokeObjectURL(url)
-      activeAudioRef.current = null
-      voicePlayingRef.current = false
-      playNextVoiceChunk()
+      if (activeAudioRef.current !== audio) return
+      reportVoiceFailure({ slot: store.getState().chat.activeSlot, code: 'voice_playback_failed' })
+      stopVoice()
     }
-    audio.play().catch(() => {
-      URL.revokeObjectURL(url)
-      activeAudioRef.current = null
-      voicePlayingRef.current = false
-      playNextVoiceChunk()
+    audio.play().catch(error => {
+      if (activeAudioRef.current !== audio) return
+      reportVoiceFailure({
+        slot: store.getState().chat.activeSlot,
+        code: error?.name === 'NotAllowedError' ? 'voice_playback_blocked' : 'voice_playback_failed',
+      })
+      stopVoice()
     })
-  }, [dispatch])
+  }, [dispatch, stopVoice])
 
-  /** Bumped by every `autonudge_state` frame. A seed captures this before its
-   *  fetch and discards the response if a frame landed while it was in flight:
-   *  the seed's full-replace would otherwise resurrect a loop whose `removed`
-   *  frame we had already applied, and because frames fire only on CHANGE
-   *  nothing would ever correct it — leaving a phantom "Loop N/M" that
-   *  suppresses that row's unread dot until the next reconnect. */
-  const goalLoopGenRef = useRef(0)
+  /** Reconnects share one in-flight snapshot and its original watermark;
+   * live frames supersede a snapshot only for their own slot. Per-slot
+   * generations also retain removed-frame tombstones, so stale REST data cannot
+   * resurrect a record without dropping unaffected snapshot rows. */
+  const automationSeedGenRef = useRef(0)
+  const automationLiveGenRef = useRef(new Map<string, number>())
+  const automationSeedInFlightRef = useRef<Promise<void> | null>(null)
+  const automationSeedQueuedRef = useRef(false)
 
-  /** Cold-seed the sidebar's goal-loop map. `autonudge_state` only fires on
-   *  change, so a loop armed before this client connected would show no progress
-   *  until its next cycle fired — which can be minutes. Runs on first connect
-   *  and on every reconnect. Silent on failure and on the feature being
-   *  disabled (the endpoint answers `{enabled:false, loops:[]}`). */
-  const seedGoalLoops = useCallback(() => {
-    const gen = goalLoopGenRef.current
-    // Fully best-effort, including SYNCHRONOUS failure. This runs early in the
-    // connect handler, ahead of notification sync and the subagent subscribe, so
-    // an exception escaping here would silently strand those — a cosmetic seed
-    // must never be able to do that.
-    try {
-      api.autonudgeList()
-        .then(res => {
-          // A live frame superseded this snapshot — it is now stale, so drop it
-          // rather than replacing fresher state with older state.
-          if (goalLoopGenRef.current !== gen) return
-          dispatch(setGoalLoops((res?.loops || []).map(loop => ({
-            slot: loop.slot_key,
-            active: loop.active === true,
-            cycle_count: Number(loop.cycle_count) || 0,
-            max_cycles: Number(loop.max_cycles) || 0,
-          }))))
+  /** Cold-seed the authoritative automation collection. `autonudge_state` only
+   *  fires on change, so a record armed before this client connected would be
+   *  absent until its next transition. Runs on first connect and reconnect. */
+  const seedAutomations = useCallback(() => {
+    // React Query coalesces equal in-flight fetches. Reuse the matching
+    // orchestration too, or a reconnect would capture a newer watermark for an
+    // older response and could resurrect a live tombstone. A reconnect still
+    // queues one fresh snapshot because the shared request may predate changes
+    // made while the socket was disconnected.
+    if (automationSeedInFlightRef.current) {
+      automationSeedQueuedRef.current = true
+      return
+    }
+    const startSeed = () => {
+      automationSeedQueuedRef.current = false
+      const seedGen = ++automationSeedGenRef.current
+      const liveAtStart = new Map(automationLiveGenRef.current)
+      const cacheUpdatesAtStart = new Map<string, number>()
+      for (const [queryKey] of queryClient.getQueriesData<
+        ReturnType<typeof normalizeAutomationRecord>
+      >({ queryKey: ['session-automation'] })) {
+        if (queryKey.length === 2 && typeof queryKey[1] === 'string') {
+          const slotKey = dashboardAutomationSlotKey(queryKey[1])
+          cacheUpdatesAtStart.set(
+            slotKey,
+            queryClient.getQueryState(queryKey)?.dataUpdateCount ?? 0,
+          )
+        }
+      }
+      // Fully best-effort, including SYNCHRONOUS failure. This runs early in the
+      // connect handler, ahead of notification sync and the subagent subscribe, so
+      // an exception escaping here would silently strand those — a cosmetic seed
+      // must never be able to do that.
+      let legacy: Promise<{ loops?: unknown[] }>
+      let structured: Promise<{ monitors?: unknown[] }>
+      let legacyStarted = true
+      let structuredStarted = true
+      try {
+        legacy = queryClient.fetchQuery({
+          queryKey: LEGACY_AUTOMATION_SEED_QUERY_KEY,
+          queryFn: api.autonudgeList,
+          staleTime: 0,
+          retry: false,
+        })
+      } catch {
+        legacyStarted = false
+        legacy = Promise.resolve({ loops: [] })
+      }
+      try {
+        structured = queryClient.fetchQuery({
+          queryKey: STRUCTURED_AUTOMATION_SEED_QUERY_KEY,
+          queryFn: api.monitorsList,
+          staleTime: 0,
+          retry: false,
+        })
+      } catch {
+        structuredStarted = false
+        structured = Promise.resolve({ monitors: [] })
+      }
+      let seed: Promise<void>
+      seed = Promise.allSettled([legacy, structured])
+        .then(([legacyResult, monitorResult]) => {
+          // Do not publish a snapshot known to predate a reconnect. The queued
+          // iteration starts from a new watermark after this request settles.
+          if (automationSeedQueuedRef.current) return
+          // A later reconnect supersedes this whole seed. Live frames are
+          // reconciled per slot below so unrelated snapshot rows still land.
+          if (automationSeedGenRef.current !== seedGen) return
+          const legacyComplete = legacyStarted && legacyResult.status === 'fulfilled'
+          const structuredComplete = structuredStarted && monitorResult.status === 'fulfilled'
+          const legacyRecords = legacyStarted && legacyResult.status === 'fulfilled'
+            ? (legacyResult.value.loops ?? []).filter(isFullLegacyAutomationRecord)
+                .map(normalizeAutomationRecord)
+                .filter(record => record?.kind === 'legacy_goal_loop')
+            : []
+          const structuredSnapshotRecords = structuredStarted && monitorResult.status === 'fulfilled'
+            ? (monitorResult.value.monitors ?? []).map(normalizeAutomationRecord)
+                .filter(record => record?.kind === 'structured_monitor')
+            : []
+          const stillFresh = (record: NonNullable<ReturnType<typeof normalizeAutomationRecord>>) =>
+            (automationLiveGenRef.current.get(record.slotKey) ?? 0)
+              === (liveAtStart.get(record.slotKey) ?? 0)
+          const protectedSlotSet = new Set([...automationLiveGenRef.current]
+            .filter(([slot, generation]) => generation !== (liveAtStart.get(slot) ?? 0))
+            .map(([slot]) => slot))
+          for (const [queryKey] of queryClient.getQueriesData<
+            ReturnType<typeof normalizeAutomationRecord>
+          >({ queryKey: ['session-automation'] })) {
+            if (queryKey.length !== 2 || typeof queryKey[1] !== 'string') continue
+            const slotKey = dashboardAutomationSlotKey(queryKey[1])
+            const cachedUpdates = queryClient.getQueryState(queryKey)?.dataUpdateCount
+            if (cachedUpdates !== cacheUpdatesAtStart.get(slotKey)) {
+              protectedSlotSet.add(slotKey)
+            }
+          }
+          const protectedSlots = [...protectedSlotSet]
+          const records = [...legacyRecords, ...structuredSnapshotRecords.filter(record => record.active)]
+            .filter(record => stillFresh(record) && !protectedSlotSet.has(record.slotKey))
+          const terminalRecords = new Map(structuredSnapshotRecords
+            .filter(record => !record.active && stillFresh(record)
+              && !protectedSlotSet.has(record.slotKey))
+            .map(record => [record.slotKey, record]))
+          // Terminal monitors refresh existing per-slot evidence without growing
+          // the global Redux collection or creating unvisited detail queries.
+          const presentSlots = new Set([
+            ...records.map(record => record.slotKey),
+            ...structuredSnapshotRecords
+              .filter(record => stillFresh(record) && !protectedSlotSet.has(record.slotKey))
+              .map(record => record.slotKey),
+          ])
+          for (const [queryKey, cached] of queryClient.getQueriesData<
+            ReturnType<typeof normalizeAutomationRecord>
+          >({ queryKey: ['session-automation'] })) {
+            if (queryKey.length !== 2 || typeof queryKey[1] !== 'string') continue
+            const slotKey = dashboardAutomationSlotKey(queryKey[1])
+            if (protectedSlotSet.has(slotKey)) continue
+            // A mutation or focused REST refetch may populate this per-slot
+            // cache while the reconnect snapshot is still in flight. Only an
+            // entry known to predate the seed can be absent authoritatively.
+            const cachedUpdates = queryClient.getQueryState(queryKey)?.dataUpdateCount
+            if (cachedUpdates !== cacheUpdatesAtStart.get(slotKey)) continue
+            const terminal = terminalRecords.get(slotKey)
+            if (terminal) {
+              queryClient.setQueryData(queryKey, terminal)
+            }
+            if (!cached || presentSlots.has(slotKey)) continue
+            const complete = cached.kind === 'legacy_goal_loop'
+              ? legacyComplete
+              : structuredComplete
+            if (complete) queryClient.setQueryData(queryKey, null)
+          }
+          dispatch(setAutomations({
+            records,
+            legacyComplete,
+            structuredComplete,
+            protectedSlots,
+          }))
         })
         .catch(() => {})
-    } catch { /* seed is cosmetic — never break the connect path */ }
-  }, [dispatch])
+        .finally(() => {
+          if (automationSeedInFlightRef.current === seed) {
+            automationSeedInFlightRef.current = null
+            if (automationSeedQueuedRef.current) startSeed()
+          }
+        })
+      automationSeedInFlightRef.current = seed
+    }
+    startSeed()
+  }, [dispatch, queryClient])
+
+  const retireApproval = useCallback((
+    id: string,
+    slot: string | undefined,
+    approved: boolean,
+    decision?: string,
+    slotlessResolution = false,
+  ) => {
+    if (!id) return
+    const coordinatorSlot = coordinatorApprovalsRef.current.get(id)
+    const targetSlot = slot || undefined
+    const chatState = store.getState().chat
+    const targetMessages = targetSlot === chatState.activeSlot
+      ? chatState.messages
+      : targetSlot && Object.prototype.hasOwnProperty.call(chatState.slotMessages, targetSlot)
+        ? chatState.slotMessages[targetSlot] ?? []
+        : []
+    // Settled rows no longer compete for a resolution. A still-pending unmarked
+    // row is a chat-runner collision, so the frame cannot safely claim the
+    // coordinator registry even when its id and slot match the provenance map.
+    const pendingMatches = targetMessages.filter(message =>
+      message.role === 'permission'
+      && message.meta?.approval_id === id
+      && !message.meta?.resolved)
+    const ownsCoordinatorEntry = coordinatorApprovalsRef.current.has(id)
+      && (slotlessResolution || slot === coordinatorSlot)
+      && pendingMatches.some(message => message.meta?.registry === 'coordinator')
+      && !pendingMatches.some(message => message.meta?.registry == null)
+    queryClient.invalidateQueries({ queryKey: ['global-approvals'] })
+    if (ownsCoordinatorEntry) {
+      const items = store.getState().notifications.items
+      const match = items.find((n: Notification) => n.approval_id === id)
+      if (match) dispatch(removeNotificationByTs(match.ts))
+    }
+    const displayDecision = decision === 'expired' ? 'stale' : decision
+    dispatch(resolveByApprovalId({
+      id,
+      slot: targetSlot,
+      decision: displayDecision ?? (approved ? 'approved' : 'rejected'),
+      ...(ownsCoordinatorEntry ? { registry: 'coordinator' } : {}),
+    }))
+    // A stale retirement carries no outcome: the approval may have been
+    // answered either way where this client could not see it (another window,
+    // a channel, or auto-approve). An explicit expiry is known to be denied,
+    // but keeps the stale chat vocabulary while terminating a spawn card.
+    const outcomeKnown = decision !== 'stale'
+    // Resolve only in the slot that raised the card. Guessing activeSlot here
+    // writes subagent spawn/done entries into an unrelated conversation.
+    const resolvedType = id.startsWith('spawn:') ? 'spawn' : 'chat'
+    if (targetSlot) {
+      const chatState = store.getState().chat
+      const log = targetSlot === chatState.activeSlot
+        ? chatState.toolLog
+        : chatState.slotActivity[targetSlot]?.toolLog ?? []
+      const hasMatchingApproval = log.some(e => e.approval_id === id && e.type === 'approval')
+      if (hasMatchingApproval || resolvedType === 'spawn') {
+        dispatch(sseActivityEvent({
+          slot: targetSlot,
+          kind: 'approval_resolved',
+          text: '',
+          approval_id: id,
+          approval_type: resolvedType,
+        }))
+      }
+      if (id.startsWith('spawn:') && outcomeKnown) {
+        const agentId = id.replace('spawn:', '')
+        if (approved) {
+          dispatch(sseSubagentSpawn({ slot: targetSlot, id: agentId, task: '', agent: '' }))
+        } else {
+          // The spawn card renders this value verbatim under its error label,
+          // so both denials have to arrive as a sentence: the raw `expired` or
+          // `rejected` token read as a subagent crash when it was a decision.
+          dispatch(sseSubagentDone({
+            slot: targetSlot,
+            id: agentId,
+            elapsed: 0,
+            error: decision === 'expired'
+              ? i18nT('hooks.useWebSocket.approval_wait_expired')
+              : i18nT('hooks.useWebSocket.approval_rejected'),
+          }))
+        }
+      }
+    }
+    recordInBoundedLog(retiredApprovalIdsRef.current, retiredApprovalSeqRef, id)
+    if (ownsCoordinatorEntry) {
+      coordinatorApprovalsRef.current.delete(id)
+    }
+  }, [dispatch, queryClient])
 
   const syncPendingApprovals = useCallback(async () => {
     try {
+      // Only approvals held before this authority read may be retired from its
+      // answer. A live frame can inject another approval while the read is in
+      // flight, and that approval is outside this snapshot's ordering boundary.
+      const before = new Map(coordinatorApprovalsRef.current)
+      const retiredSeen = retiredApprovalSeqRef.current
       const approvals = await api.approvals()
+      const retiredDuringFetch = new Set(resolvedSince(retiredApprovalIdsRef.current, retiredSeen))
+      const pendingIds = new Set(approvals.map(a => a.id))
+      for (const [id, slot] of before) {
+        if (!pendingIds.has(id)) retireApproval(id, slot, false, 'stale')
+      }
       const existing = store.getState().notifications.items
+      const currentChat = store.getState().chat
       for (const a of approvals) {
+        if (retiredDuringFetch.has(a.id)) continue
+        const slot = a.slot || ''
+        const slotMessages = slot === currentChat.activeSlot
+          ? currentChat.messages
+          : slot && Object.prototype.hasOwnProperty.call(currentChat.slotMessages, slot)
+            ? currentChat.slotMessages[slot] ?? []
+            : []
         if (existing.some((n: Notification) => n.approval_id === a.id)) continue
+        if (slotMessages.some(message =>
+          message.role === 'permission' && message.meta?.approval_id === a.id)) continue
+        coordinatorApprovalsRef.current.set(a.id, slot)
         dispatch(addNotification({
           kind: 'approval',
           title: i18nT('hooks.useWebSocket.tool_approval', { name: a.tool || i18nT('hooks.useWebSocket.unknown') }),
-          body: `**Source:** ${a.source || 'agent'}\n\n${a.tool_input || ''}`.trim(),
+          body: approvalNotificationBody(a.source, a.tool_input),
           ts: String(a.ts || Date.now() / 1000),
           approval_id: a.id,
         } as Notification))
-        const slot = a.slot || ''
         if (slot) {
           dispatch(sseChatMessage({
             slot, role: 'permission',
             content: `[${a.source || 'agent'}] ${a.tool || 'Unknown'}`,
             ts: String(a.ts || Date.now() / 1000),
-            meta: { tool_input: a.tool_input || '', approval_id: a.id, source: a.source, ...(a.tool_call_id ? { tool_call_id: a.tool_call_id } : {}) },
+            meta: { tool_input: a.tool_input || '', approval_id: a.id, source: a.source, registry: 'coordinator', ...(a.tool_call_id ? { tool_call_id: a.tool_call_id } : {}) },
           }))
         }
       }
     } catch { /* ignore */ }
-  }, [dispatch])
+  }, [dispatch, retireApproval])
 
   /** Reconcile question cards against the server's pending set.
    *  `question_card` and `question_card_resolved` are one-shot broadcasts, so a
@@ -588,15 +982,21 @@ export function useWebSocket() {
     const activeSlot = store.getState().chat.activeSlot
     let dispatchedActive = false
     for (const [slot, entry] of buf) {
+      // Everything buffered for this slot lands below, so the overflow counter
+      // restarts here regardless of which branches dispatch.
+      entry.chars = 0
       // Thinking first: within a turn the reasoning stream precedes the answer
       // stream, so a frame holding both must land them in that order.
       if (entry.thinking) {
         dispatch(sseThinkingChunk({ slot, content: entry.thinking }))
         entry.thinking = ''
       }
-      if (!entry.content) continue
-      dispatch(sseChatMessage({ slot, role: 'chunk', content: entry.content, seq: entry.lastSeq, batched: true }))
-      entry.content = ''
+      // The reducer holds each part against the slot's replay floor and drops
+      // what a snapshot already holds; the hook only batches.
+      const text = bufferedText(entry)
+      if (!text) continue
+      dispatch(sseChatMessage({ slot, role: 'chunk', content: text, seq: entry.lastSeq, gen: entry.gen, batched: true, parts: entry.parts }))
+      entry.parts = []
       if (slot === activeSlot) dispatchedActive = true
     }
     // Auto-speak the active slot's newly-streamed sentences once per flush,
@@ -608,23 +1008,24 @@ export function useWebSocket() {
       if (streaming) {
         const progress = voiceProgressFor(activeSlot, streaming)
         if (!progress) return
+        if (voiceMutedRef.current) return
         const full = streaming.content
-        let lastBound = -1
-        const re = /[.!?](?:\s|$)/g
-        let match
-        while ((match = re.exec(full)) !== null) {
-          if (match.index + 1 > progress.spokenLen) lastBound = match.index + 1
-        }
+        const lastBound = voiceBoundary(full, progress.spokenLen)
         if (lastBound > progress.spokenLen) {
           const newText = full.slice(progress.spokenLen, lastBound).trim()
-          if (newText.length >= 10) {
-            progress.spokenLen = lastBound
-            enqueueVoiceSynthesis(activeSlot, newText)
-          }
+          progress.spokenLen = lastBound
+          if (newText) enqueueVoiceSynthesis(activeSlot, newText)
         }
       }
     }
   }, [dispatch, enqueueVoiceSynthesis, voiceProgressFor])
+
+  // Expose the synchronous flush to steer initiators (ChatPage / ChatPane):
+  // an optimistic steer card dispatched while a chunk is still in this
+  // buffer would land ABOVE text that belongs before it (see
+  // lib/pendingChunkDrain.ts). Identity-guarded unregister, so a StrictMode
+  // double-mount cannot strip the live registration.
+  useEffect(() => registerPendingChunkDrain(flushChunks), [flushChunks])
 
   const scheduleChunkFlush = useCallback(() => {
     if (chunkFlushScheduledRef.current) return
@@ -644,13 +1045,15 @@ export function useWebSocket() {
    *  CONTENT may be discarded — refreshSlot recovers it from the server — but
    *  reasoning is client-only (the backend never persists it), so anything
    *  still buffered when the buffer is cleared (reconnect) or the hook unmounts
-   *  would be permanently lost. A hidden tab makes that window unbounded:
+   *  would be permanently lost. A hidden tab widens that window:
    *  requestAnimationFrame is suspended there, so the scheduled flush never
-   *  runs while thinking keeps accumulating. */
+   *  runs; the overflow flush (CHUNK_BUF_FLUSH_CHARS) bounds how much can sit
+   *  here meanwhile, and this salvages the sub-threshold remainder. */
   const flushBufferedThinking = useCallback(() => {
     for (const [slot, entry] of chunkBufRef.current) {
       if (entry.thinking) {
         dispatch(sseThinkingChunk({ slot, content: entry.thinking }))
+        entry.chars -= entry.thinking.length
         entry.thinking = ''
       }
     }
@@ -838,6 +1241,7 @@ export function useWebSocket() {
         // Invalidate every slot's summary (the key is per-slot and we cannot
         // know which ones moved); react-query only refetches the observed ones.
         queryClient.invalidateQueries({ queryKey: ['session-summary'] })
+<<<<<<< HEAD
         // Same one-shot problem, config's version: a provider/backend switch
         // (made by another tab or the desktop app) pushes `sessions_restarting`,
         // which is the ONLY thing that refreshes `kirocrewConfig` and
@@ -848,6 +1252,29 @@ export function useWebSocket() {
         invalidateRefreshQueries(queryClient)
         queryClient.invalidateQueries({ queryKey: ['available-models'] })
         seedGoalLoops()
+=======
+        // Same one-shot problem for the artifact library: `artifact_update`
+        // frames pushed while the socket was down were never delivered, and a
+        // list query that ERRORED during the gap (gateway restart 403s /
+        // connection refused) holds no data at all. Invalidate the whole
+        // ['artifacts'] prefix (filtered list + all-tags) so a recovered
+        // window heals without a manual hard refresh (#10867). The folder
+        // list errors under the same trigger — heal it too, or the library
+        // comes back with its folders missing.
+        queryClient.invalidateQueries({ queryKey: ['artifacts'] })
+        queryClient.invalidateQueries({ queryKey: ['artifact-folders'] })
+        // A dropped socket is the one client-visible sign the gateway may have
+        // restarted — and a restart drops an unmessaged member slot while its
+        // binding survives. The Crew Members page mounts a cached thread key
+        // straight away on a return visit (api/membersQuery.ts), so a key
+        // confirmed BEFORE the drop is no longer known-mountable: forget the
+        // ones nobody is looking at, so the next open waits for the thread
+        // endpoint's answer again; the mounted one is re-confirmed by the page
+        // itself on this same reconnect (and must NOT be cleared here — it
+        // holds the pane, and the draft typed into it).
+        forgetUnobservedMemberThreads(queryClient)
+        seedAutomations()
+>>>>>>> upstream/main
         dispatch(fetchNotifications()).then(() => syncPendingApprovals())
       syncPendingQuestions()
         // Same one-shot problem, different stream: a run that ENDED while the
@@ -872,11 +1299,15 @@ export function useWebSocket() {
         // split nothing is dispatched. The catch keeps a corrupt persisted
         // layout from aborting the rest of reconnect setup (resubscribes and
         // focus re-announce below).
+        const warmed = new Set<string>()
         if (active) {
           try {
             const liveKeys = new Set(store.getState().dashboard.slots.map(s => s.key))
             for (const member of new Set(sessionSlots(loadLayout(anchorForSlot(active))))) {
-              if (member !== active && liveKeys.has(member)) dispatch(warmSlotCache(member))
+              if (member !== active && liveKeys.has(member)) {
+                warmed.add(member)
+                dispatch(warmSlotCache(member))
+              }
             }
           } catch (err) {
             // This catch deliberately swallows so a corrupt persisted layout cannot
@@ -886,6 +1317,26 @@ export function useWebSocket() {
             // eslint-disable-next-line no-console -- only trace of a skipped re-hydration
             console.warn('reconnect split-pane warm skipped', err)
           }
+        }
+        // A mounted ChatPane whose slot is NEITHER the active slot NOR one of
+        // its split members — the Crew Members DM thread is the standing case:
+        // its `member-<slug>` slot never becomes the Redux active slot and no
+        // persisted split names it — is covered by neither branch above. The
+        // same fire-and-forget frames it lives on (tool_result, a later
+        // tool_call, the final _done) are lost across the drop, and the pane's
+        // own hydrate query is one-shot (staleTime Infinity), so without this
+        // warm the pane keeps rendering the tool-call row it held when the
+        // socket died — for good, until a remount. The observed hydrate queries
+        // are the registry of on-screen panes (api/slotMessagesQuery.ts): warm
+        // each once through the same sanctioned path, which reconciles the rows
+        // to the server's canonical transcript, idles the run indicator only
+        // when the server says the turn ended, and raises the chunk replay
+        // floor when it is still live. The active slot is skipped here and
+        // again inside the thunk.
+        for (const slot of observedPaneSlots(queryClient)) {
+          if (slot === active || warmed.has(slot)) continue
+          warmed.add(slot)
+          dispatch(warmSlotCache(slot))
         }
         // Eagerly subscribe to subagent events so chunks arrive even when
         // Activity Panel isn't open — final result still comes via done event.
@@ -900,7 +1351,7 @@ export function useWebSocket() {
       }
       wasConnectedRef.current = true
       dispatch(sseConnected())
-      seedGoalLoops()
+      seedAutomations()
       // FIRST connect only: App's mount effect already dispatched fetchSlots,
       // and this handler fires strictly after it, so repeating it here is a
       // redundant round-trip at the worst possible moment. The reconnect branch
@@ -1186,6 +1637,31 @@ export function useWebSocket() {
             if (!n.silenced && n.priority !== 'passive') {
               dispatchMcNotification(n.kind)
             }
+            // The in-app banner hears LIVE arrivals only. A reconnect catch-up
+            // replays every frame missed while the socket was down, and those
+            // notes are already in the bell (the reconnect refetch lands them);
+            // bannering them would re-announce history as news — the same
+            // suppression the turn-done chime applies via `reconnectingRef`.
+            // The boot snapshot never reaches here at all (it arrives through
+            // `fetchNotifications`, not this frame), so mount replay is
+            // excluded by construction.
+            if (!reconnectingRef.current) dispatchLiveNotification(n)
+            break
+          }
+          case 'panel_published': {
+            // A crew replaced its webview. The drawer's query sets no finite
+            // staleTime (the client's default is Infinity, freshness by push), so
+            // without this the operator kept looking at the first snapshot read
+            // when the drawer opened -- and the "23m ago" chip froze with it.
+            //
+            // Invalidated by SLUG PREFIX, so it reaches the ['member-panel', slug,
+            // member] key without the frame having to carry the crew's name. The
+            // frame is slug-only on purpose: the ownership digest must not reach a
+            // client, and the refetch re-asks the server, which re-checks ownership.
+            const slug = String((data as { slug?: unknown }).slug || '')
+            if (slug) {
+              queryClient.invalidateQueries({ queryKey: ['member-panel', slug] })
+            }
             break
           }
           case 'notification_ack':
@@ -1201,29 +1677,45 @@ export function useWebSocket() {
             break
           case 'approval': {
             queryClient.invalidateQueries({ queryKey: ['global-approvals'] })
+            if (typeof data.id === 'string') {
+              coordinatorApprovalsRef.current.set(
+                data.id,
+                typeof data.slot === 'string' ? data.slot : '',
+              )
+            }
             // Approval-blocked chime: the agent is stuck until the user acts.
             // Suppressed during reconnect catch-up (same policy as turn-done).
             if (!reconnectingRef.current) {
               dispatchMcNotification(APPROVAL_KIND)
             }
-            // Browser notification when tab not focused (permission must be granted via UI interaction elsewhere)
-            if (typeof Notification !== 'undefined' && document.hidden && Notification.permission === 'granted') {
-              // Android Chrome throws "Illegal constructor" for page-context
-              // Notification; an uncaught throw here kills the whole message
-              // handler, so the native toast is best-effort.
-              try {
-                new Notification(i18nT('hooks.useWebSocket.approval_required'), { body: data.tool || i18nT('hooks.useWebSocket.a_task_needs_your_decision'), tag: 'kirocrew-approval' })
-              } catch {
-                /* unsupported platform */
-              }
-            }
-            dispatch(addNotification({
+            // No OS toast here. The addNotification below is what reaches the
+            // OS: useNativeNotification watches the unacked count and posts ONE
+            // toast per new note, tagged with its approval_id, only while the
+            // user is away from the window. A second constructor on this path
+            // carried a different tag, so the OS showed two banners for one
+            // approval.
+            //
+            // The owning slot rides on the note so the in-app banner's
+            // `targetsCurrentView` gate can tell "this chat is on screen" (the
+            // inline permission card below already shows it there) from "the
+            // user is on another surface" (the banner is the interrupt).
+            const approvalSlot = typeof data.slot === 'string' && data.slot ? data.slot : ''
+            const approvalNote = {
               kind: 'approval',
               title: i18nT('hooks.useWebSocket.tool_approval', { name: data.tool || i18nT('hooks.useWebSocket.unknown') }),
-              body: `**Source:** ${data.source || 'agent'}\n\n${data.tool_input || ''}\n\n${data.tool_purpose || ''}`.trim(),
+              body: approvalNotificationBody(data.source, data.tool_input, data.tool_purpose),
               ts: String(data.ts || Date.now() / 1000),
               approval_id: data.id,
-            } as Notification))
+              ...(approvalSlot ? { slot: approvalSlot } : {}),
+            } as Notification
+            dispatch(addNotification(approvalNote))
+            // The in-app banner hears LIVE arrivals only, same as the
+            // `notification` frame above: a reconnect catch-up replays
+            // approvals the bell already holds. While the window is focused
+            // this banner is the visible interrupt for a blocking approval
+            // (the OS toast stays quiet for a focused window); away from the
+            // window the toast takes over and `shouldBannerNote` skips it.
+            if (!reconnectingRef.current) dispatchLiveNotification(approvalNote)
             // Inject inline in the OWNING chat only. An approval with no
             // explicit slot has no owning conversation (an unowned cron /
             // taskrunner command): falling back to activeSlot planted the card
@@ -1232,14 +1724,14 @@ export function useWebSocket() {
             // 404'd as soon as the short background window elapsed. Unowned
             // approvals live on the global surface (notification feed) only —
             // the addNotification above already delivered it there.
-            const targetSlot = data.slot || ''
+            const targetSlot = approvalSlot
             if (targetSlot) {
               dispatch(sseChatMessage({
                 slot: targetSlot,
                 role: 'permission',
                 content: `[${data.source || 'agent'}] ${data.tool || 'Unknown'}`,
                 ts: String(data.ts || Date.now() / 1000),
-                meta: { tool_input: data.tool_input || '', approval_id: data.id, source: data.source, ...(data.tool_call_id ? { tool_call_id: data.tool_call_id } : {}) },
+                meta: { tool_input: data.tool_input || '', approval_id: data.id, source: data.source, registry: 'coordinator', ...(data.tool_call_id ? { tool_call_id: data.tool_call_id } : {}) },
               }))
               // For spawn approvals, create a pending subagent entry instead of a toolLog approval.
               // Require an explicit slot from the event: falling back to activeSlot would
@@ -1258,34 +1750,14 @@ export function useWebSocket() {
             break
           }
           case 'approval_resolved': {
-            queryClient.invalidateQueries({ queryKey: ['global-approvals'] })
-            const items = store.getState().notifications.items
-            const match = items.find((n: Notification) => n.approval_id === data.id)
-            if (match) dispatch(removeNotificationByTs(match.ts))
-            dispatch(resolveByApprovalId({ id: data.id, decision: data.approved ? 'approved' : 'rejected' }))
-            // Resolve only in the slot that raised the card. Guessing
-            // activeSlot here mirrored the raise-path leak: it wrote
-            // subagent spawn/done entries into an unrelated conversation.
-            const targetSlot = data.slot || ''
-            const resolvedType = typeof data.id === 'string' && data.id.startsWith('spawn:') ? 'spawn' : 'chat'
-            if (targetSlot) {
-              const chatState = store.getState().chat
-              const log = targetSlot === chatState.activeSlot
-                ? chatState.toolLog
-                : chatState.slotActivity[targetSlot]?.toolLog ?? []
-              const hasMatchingApproval = log.some(e => e.approval_id === data.id && e.type === 'approval')
-              if (hasMatchingApproval || resolvedType === 'spawn') {
-                dispatch(sseActivityEvent({ slot: targetSlot, kind: 'approval_resolved', text: '', approval_id: data.id, approval_type: resolvedType }))
-              }
-              if (typeof data.id === 'string' && data.id.startsWith('spawn:')) {
-                const agentId = data.id.replace('spawn:', '')
-                if (data.approved) {
-                  dispatch(sseSubagentSpawn({ slot: targetSlot, id: agentId, task: '', agent: '' }))
-                } else {
-                  dispatch(sseSubagentDone({ slot: targetSlot, id: agentId, elapsed: 0, error: 'rejected' }))
-                }
-              }
-            }
+            const id = typeof data.id === 'string' ? data.id : ''
+            const frameSlot = typeof data.slot === 'string' ? data.slot : undefined
+            const targetSlot = frameSlot ?? coordinatorApprovalsRef.current.get(id)
+            // A decided frame carries no decision: approved/rejected derives
+            // from `approved`. An explicit expiry is a known auto-denial, but
+            // retireApproval keeps its chat-row display token as `stale`.
+            const decision = data.decision === 'expired' ? 'expired' : undefined
+            retireApproval(id, targetSlot, !!data.approved, decision, frameSlot === undefined)
             break
           }
           case 'refresh': {
@@ -1315,6 +1787,40 @@ export function useWebSocket() {
             dispatch(fetchSlots())
             break
           }
+          case 'member_projection': {
+            // One member's projected value moved. The server wraps every
+            // broadcast as { type, data }, so the fields ride under `data`.
+            // Apply only a well-formed frame: the store's higher-seq-wins drops
+            // a stale or replayed seq, but a missing slug/key/seq is a malformed
+            // frame that must not touch the store at all.
+            const pf = (data ?? {}) as { slug?: unknown; key?: unknown; seq?: unknown; value?: unknown }
+            if (typeof pf.slug === 'string' && pf.slug && typeof pf.key === 'string' && pf.key && typeof pf.seq === 'number') {
+              memberProjectionStore.apply(pf.slug, pf.key, pf.value, pf.seq)
+            }
+            break
+          }
+          case 'members_subscribed': {
+            // Sent once per connection before any member_projection frame: the
+            // server's authoritative lastSeq per slug. Truncate held rows that
+            // ran ahead of it (a torn tail rolled back after a restart).
+            const seqs = ((data ?? {}) as { lastSeqs?: unknown }).lastSeqs
+            if (seqs && typeof seqs === 'object') {
+              const dropped = memberProjectionStore.truncateAll(
+                seqs as { [slug: string]: number },
+              )
+              if (dropped) {
+                // A drop is correct but incomplete: the row above the server's seq
+                // recorded something that did not happen, and removing it leaves the
+                // card with no value where the truth is whatever the server holds at
+                // its own seq. The store is a cache and cannot produce that, so the
+                // roster is refetched -- its rows carry each slug's baseline, and
+                // seeding is higher-seq-wins, so this restores the authoritative
+                // value without overwriting anything newer that arrives meanwhile.
+                queryClient.invalidateQueries({ queryKey: MEMBERS_ROSTER_QUERY_KEY })
+              }
+            }
+            break
+          }
           case 'chat_message':
             flushChunks()
             dispatch(sseChatMessage(data))
@@ -1331,7 +1837,25 @@ export function useWebSocket() {
                 data.role === 'user' || data.role === 'inject',
               )
             }
-            if (data.slot && data.slot !== store.getState().chat.activeSlot && !reconnectingRef.current) dispatch(markSlotUnread(data.slot))
+            if (data.slot && !isSlotOnScreen(data.slot) && !reconnectingRef.current) dispatch(markSlotUnread({ slot: data.slot, ts: data.ts || undefined }))
+            // The message landed in THIS window's active slot while the tab is
+            // visible: the user is watching it arrive, so the fresh bubble the
+            // other windows just lit for it is already read — relay that, with
+            // this message's ts as the read watermark (receivers keep badges
+            // lit by anything newer). A hidden window isn't reading: relay
+            // nothing — the visibilitychange handler relays the active slot's
+            // read on reveal, watermarked at its post-flush last_ts, which
+            // covers every arrival buffered while hidden. No per-arrival state
+            // is kept, so a later timestamp-less frame cannot regress the
+            // reveal watermark. Reconnect catch-up replays aren't reads either
+            // (mirrors the markSlotUnread suppression above).
+            else if (data.slot && !reconnectingRef.current && !document.hidden && document.hasFocus() && isSlotRenderedVisibly(data.slot)) {
+              // Watermark = this message's own server ts, else the slot's
+              // last_ts (also server-minted); never client time — windows
+              // minting their own clocks disagree about the same message.
+              const arrivalTs = data.ts || store.getState().dashboard.slots?.find(s => s.key === data.slot)?.last_ts
+              emitSlotRead(data.slot, arrivalTs)
+            }
             // Theme audio: an agent reply arriving is the `message-received`
             // trigger (no-op unless an L2 theme with that manifest sound is
             // active + unmuted). User/tool messages don't chime.
@@ -1339,9 +1863,13 @@ export function useWebSocket() {
             // A note breadcrumb starts no turn, so no chat_done arrives to undo either
             // effect: cutting speech would strand it and a thinking status would never clear.
             const isPassiveNote = data.role === 'inject' && isReconcileNote(data.cls)
-            if (!isPassiveNote && (data.role === 'user' || data.role === 'inject' || data.role === 'subagent')) { stopVoice(); voiceProgressRef.current = null; synthChainRef.current = Promise.resolve() }
+            if (!isPassiveNote && data.slot === store.getState().chat.activeSlot && (data.role === 'user' || data.role === 'inject' || data.role === 'subagent')) {
+              stopVoice()
+              voiceMutedRef.current = false
+              voiceProgressRef.current = null
+            }
             if (!isPassiveNote && data.slot && (data.role === 'user' || data.role === 'inject' || data.role === 'subagent')) {
-              dispatch(setSlotStatusDetail({ slot: data.slot, kind: 'thinking', text: 'Thinking…', ts: Date.now() }))
+              dispatch(setSlotStatusDetail({ slot: data.slot, kind: 'thinking', ts: Date.now() }))
             }
             break
           case 'chat_message_update':
@@ -1374,6 +1902,11 @@ export function useWebSocket() {
             // target slot's transcript. Uses appendSlotMessage so the bubble
             // appears whether or not the slot is currently active (background
             // tabs). Persisted server-side — survives page reload.
+            // Drain the per-frame chunk buffer FIRST: a pre-steer chunk still
+            // pending here means the reducer's finalize-on-steer would find no
+            // streaming row to freeze, so that text would later flush BELOW
+            // this card and post-steer chunks would append to the same row.
+            flushChunks()
             // `sendId` (present when the initiating client minted one) rides
             // into the meta so the reconcile in appendSlotMessage can match the
             // optimistic bubble by id instead of by content (#6075).
@@ -1389,9 +1922,12 @@ export function useWebSocket() {
             // which is keyed on `mid`, resolves this row -- without it that patch
             // matches nothing and the state never moves until a reload.
             const steerMid = (data as { mid?: unknown }).mid
+            const steerMeta = (data as { meta?: unknown }).meta
+            const steerFiles = steerMeta && typeof steerMeta === 'object' ? (steerMeta as { files?: unknown }).files : undefined
+            const steerDirs = steerMeta && typeof steerMeta === 'object' ? (steerMeta as { dirs?: unknown }).dirs : undefined
             dispatch(appendSlotMessage({
               slot: (data as { slot?: string }).slot || store.getState().chat.activeSlot || '',
-              message: { role: 'user', content: (data as { content?: string }).content || '', cls: 'msg msg-u', meta: { steer: true, ...(typeof steerSid === 'string' && steerSid ? { sendId: steerSid } : {}), ...(typeof steerState === 'string' && steerState ? { steerState } : {}), ...(typeof steerMid === 'string' && steerMid ? { mid: steerMid } : {}) }, ts: (data as { ts?: string }).ts },
+              message: { role: 'user', content: (data as { content?: string }).content || '', cls: 'msg msg-u', meta: { steer: true, ...(typeof steerSid === 'string' && steerSid ? { sendId: steerSid } : {}), ...(typeof steerState === 'string' && steerState ? { steerState } : {}), ...(typeof steerMid === 'string' && steerMid ? { mid: steerMid } : {}), ...(Array.isArray(steerFiles) ? { files: steerFiles } : {}), ...(Array.isArray(steerDirs) ? { dirs: steerDirs } : {}) }, ts: (data as { ts?: string }).ts },
             }))
             // Steering is the other way to type into a busy session, so it
             // settles the rank exactly like a queued send. The server appends a
@@ -1431,18 +1967,37 @@ export function useWebSocket() {
             if (cs) {
               const buf = chunkBufRef.current
               let entry = buf.get(cs)
-              if (!entry) { entry = { content: '', lastSeq: undefined, thinking: '' }; buf.set(cs, entry) }
-              // Cross-chunk gap detection via the shared missedChunkMarker,
-              // single-sourced with the reducer so the two copies can't drift.
-              if (entry.lastSeq !== undefined && data.seq !== undefined) {
-                entry.content += missedChunkMarker(entry.lastSeq, data.seq)
+              if (!entry) { entry = newChunkBufEntry(); buf.set(cs, entry) }
+              // Idempotency guard: drop a repeated WS delivery (seq <= lastSeq).
+              // WS delivery is at-least-once (reconnect replay, retry re-stream), so a
+              // chunk can arrive twice. The reducer's gap markers only flag FORWARD
+              // gaps (curSeq - prevSeq - 1 > 0), so a repeat would slip through and its
+              // content be appended a second time with no marker — the silent
+              // mid-stream "stutter".
+              // chat_done deletes the buffer entry; seqs are the slot's and never
+              // restart, so a later turn's chunks are never suppressed. This guard is about WS
+              // delivery only; a chunk a slot SNAPSHOT already holds is dropped
+              // by the reducer, which owns that floor and receives every part's
+              // seq at flush.
+              if (entry.lastSeq !== undefined && data.seq !== undefined && data.seq <= entry.lastSeq) {
+                break
               }
-              entry.content += data.content ?? ''
+              // No gap marker here: the reducer derives markers from the seqs
+              // of the parts it keeps, after filtering against the snapshot
+              // floor, so a gap the snapshot filled in is not flagged.
+              const chunkText = data.content ?? ''
+              entry.parts.push({ seq: data.seq, text: chunkText })
+              entry.chars += chunkText.length
               if (data.seq !== undefined) entry.lastSeq = data.seq
+              // The gateway generation that numbered the seqs (see floorForGen).
+              if (typeof data.gen === 'string') entry.gen = data.gen
               if (store.getState().chat.slotStatusDetail[cs]?.kind !== 'streaming') {
-                dispatch(setSlotStatusDetail({ slot: cs, kind: 'streaming', text: 'Streaming', ts: Date.now() }))
+                dispatch(setSlotStatusDetail({ slot: cs, kind: 'streaming', ts: Date.now() }))
               }
-              scheduleChunkFlush()
+              // A hidden window never runs the scheduled frame; past the
+              // threshold, drain now so the buffer cannot hold a whole turn.
+              if (entry.chars > CHUNK_BUF_FLUSH_CHARS) flushChunks()
+              else scheduleChunkFlush()
             }
             break
           }
@@ -1451,7 +2006,7 @@ export function useWebSocket() {
             // panel from this event, and a reducer that throws on a malformed
             // payload must not also cost the panel its only signal.
             window.dispatchEvent(new CustomEvent('kirocrew-tool-call', { detail: data }))
-            dispatch(sseToolActivity({ ...data as { slot: string; tool: string; kind: string; purpose: string; input_preview: string; is_shell?: boolean }, auto: (data as Record<string, unknown>).auto === true, tool_call_id: (data as Record<string, unknown>).tool_call_id as string | undefined, is_update: (data as Record<string, unknown>).is_update === true, is_shell: (data as Record<string, unknown>).is_shell === true }))
+            dispatch(sseToolActivity({ ...data as { slot: string; tool: string; kind: string; purpose: string; input_preview: string; is_shell?: boolean; tool_name?: string; mcp_server?: string }, auto: (data as Record<string, unknown>).auto === true, tool_call_id: (data as Record<string, unknown>).tool_call_id as string | undefined, is_update: (data as Record<string, unknown>).is_update === true, is_shell: (data as Record<string, unknown>).is_shell === true }))
             if (data.slot) {
               // A refinement (`is_update`) carries only the fields it refines,
               // so merge it into the live status the way sseToolActivity merges
@@ -1464,17 +2019,38 @@ export function useWebSocket() {
               // tools run in parallel a refinement of one cannot inherit a
               // sibling's purpose.
               //
-              // `text` holds the PURPOSE ALONE and stays empty when the agent
+              // `purpose` holds the PURPOSE ALONE and stays empty when the agent
               // supplied none — the fallback to the tool title belongs to
               // toolStatusLabel, which owns the label rule. Storing the title
-              // in `text` instead would make the two indistinguishable here,
+              // in `purpose` instead would make the two indistinguishable here,
               // and a purpose-less call would then pin the initial stub title
               // ("Terminal") for the whole call instead of advancing to the
               // refined command.
+              //
+              // `toolName` stays the RAW title, and `derivedTitle` carries the
+              // argument-derived one (see utils/toolCallTitle) — a shell call's
+              // `List files in src`, an MCP call's `Session send: …`. The label
+              // rule that picks between them per the raw-titles preference lives
+              // in toolStatusLabel, so this frame handler only stores the parts.
               const tcid = (data as Record<string, unknown>).tool_call_id as string | undefined
               const isUpdate = (data as Record<string, unknown>).is_update === true
               const purpose = sanitizeLlmOutput((data as Record<string, unknown>).purpose as string || '')
+              const frame = data as Record<string, unknown>
               const toolName = sanitizeLlmOutput(data.tool || '')
+              const derivedInfo = deriveToolCallTitle({
+                title: (data.tool as string) || '',
+                kind: (frame.kind as string) || '',
+                rawInput: frame.input_preview,
+                isShell: frame.is_shell === true,
+                toolName: (frame.tool_name as string) || '',
+                mcpServer: (frame.mcp_server as string) || '',
+              })
+              // A template's language-neutral action is stored and rendered at read
+              // time (toolStatusLabel), so a language switch re-renders the status
+              // line; only the backend's own description (R0.0), transport text that
+              // is not localized, is stored as a string.
+              const derivedAction = derivedInfo.action
+              const derivedTitle = derivedInfo.derived && !derivedAction ? sanitizeLlmOutput(derivedInfo.title) : ''
               const prev = store.getState().chat.slotStatusDetail[data.slot]
               const mergeInto = isUpdate && tcid && prev?.kind === 'tool' && prev.toolCallId === tcid
                 ? prev
@@ -1482,8 +2058,14 @@ export function useWebSocket() {
               dispatch(setSlotStatusDetail({
                 slot: data.slot,
                 kind: 'tool',
-                text: purpose || mergeInto?.text || '',
+                purpose: purpose || mergeInto?.purpose || '',
                 toolName: toolName || mergeInto?.toolName || '',
+                derivedTitle: derivedTitle || mergeInto?.derivedTitle || '',
+                ...(derivedAction
+                  ? { derivedAction, derivedMore: derivedInfo.more || 0 }
+                  : mergeInto?.derivedAction
+                    ? { derivedAction: mergeInto.derivedAction, derivedMore: mergeInto.derivedMore || 0 }
+                    : {}),
                 ...(tcid ? { toolCallId: tcid } : {}),
                 ts: Date.now(),
               }))
@@ -1500,13 +2082,19 @@ export function useWebSocket() {
             // tool_call_id; ToolCallLine mounts an McpAppFrame below the row.
             dispatch(sseMcpAppRender(data as Parameters<typeof sseMcpAppRender>[0]))
             break
-          case 'question_card':
-            // `fresh` marks a LIVE ask delivery: even if its payload repeats
-            // the identical question, it must get its own delivery identity
-            // (cardId) — unlike the reconnect re-sync above, which re-dispatches
-            // a still-pending card and must keep the existing entry.
+          case 'question_card': {
+            const previous = store.getState().chat.pendingQuestions?.[data.slot]
+            // `fresh` marks a live delivery and preserves the card's existing
+            // identity/rehydration contract. Audio deduplicates by server id.
             dispatch(setQuestionCard({ ...(data as Parameters<typeof setQuestionCard>[0]), fresh: true }))
+            const current = store.getState().chat.pendingQuestions?.[data.slot]
+            const id = data.ask_id || data.card_id
+            if (current?.slot === data.slot && !reconnectingRef.current
+                && (!id || identityOf(previous) !== id)) {
+              dispatchMcNotification(APPROVAL_KIND)
+            }
             break
+          }
           case 'question_card_resolved': {
             const ask = data as { ask_id?: string; card_id?: string }
             // Recorded independently of local state: a resolution can arrive for
@@ -1539,6 +2127,18 @@ export function useWebSocket() {
                 items,
                 ...(typeof raw.ts === 'number' ? { ts: raw.ts } : {}),
               }))
+            }
+            break
+          }
+          case 'slot_read': {
+            // Another window read this slot (relayed via the gateway): retire
+            // the bubble here too, honoring the read watermark — a badge lit
+            // by a message NEWER than what the reader saw stays lit, and a
+            // manual mark-as-unread is never cleared remotely. remoteSlotRead
+            // (never the emitter) so a relayed read can't echo back out.
+            const r = data as { slot?: string; read_ts?: string }
+            if (typeof r.slot === 'string' && r.slot) {
+              dispatch(remoteSlotRead({ slot: r.slot, readTs: typeof r.read_ts === 'string' && r.read_ts ? r.read_ts : undefined }))
             }
             break
           }
@@ -1721,9 +2321,13 @@ export function useWebSocket() {
             if (thinkSlot && thinkText) {
               const buf = chunkBufRef.current
               let entry = buf.get(thinkSlot)
-              if (!entry) { entry = { content: '', lastSeq: undefined, thinking: '' }; buf.set(thinkSlot, entry) }
+              if (!entry) { entry = newChunkBufEntry(); buf.set(thinkSlot, entry) }
               entry.thinking += thinkText
-              scheduleChunkFlush()
+              entry.chars += thinkText.length
+              // Same hidden-window guard as chat_chunk; reasoning streams are
+              // the long ones, so this branch is the one that usually trips it.
+              if (entry.chars > CHUNK_BUF_FLUSH_CHARS) flushChunks()
+              else scheduleChunkFlush()
             }
             // Dispatch the status detail only on a genuine kind TRANSITION into
             // 'thinking'. Guarding merely on `!== 'streaming'` would not
@@ -1737,7 +2341,7 @@ export function useWebSocket() {
             // made explicit.
             const detailKind = data.slot ? store.getState().chat.slotStatusDetail[data.slot]?.kind : undefined
             if (data.slot && detailKind !== 'streaming' && detailKind !== 'thinking') {
-              dispatch(setSlotStatusDetail({ slot: data.slot, kind: 'thinking', text: 'Thinking…', ts: Date.now() }))
+              dispatch(setSlotStatusDetail({ slot: data.slot, kind: 'thinking', ts: Date.now() }))
             }
             break
           }
@@ -1753,13 +2357,16 @@ export function useWebSocket() {
           }
           case 'chat_status':
             if (data.slot && data.status) {
-              dispatch(setSlotStatusDetail({ slot: data.slot, kind: 'thinking', text: data.status, ts: Date.now() }))
+              dispatch(setSlotStatusDetail({ slot: data.slot, kind: 'thinking', label: data.status, ts: Date.now() }))
             }
             break
           case 'chat_variant_switch':
             if (data.slot) dispatch(refreshSlot(data.slot))
             break
-          case 'chat_done':
+          case 'chat_done': {
+            let completionNeedsAttention = false
+            let completionNeedsInput = false
+            let questionPending = false
             flushChunks()
             if (data.slot) chunkBufRef.current.delete(data.slot)
             // Consume the tail while the streaming row still carries the same
@@ -1771,25 +2378,81 @@ export function useWebSocket() {
               if (last) flushVoiceTail(data.slot, last)
             }
             dispatch(sseChatMessage({ ...data, role: '_done' }))
-            // Turn-complete chime: sound-only (no feed entry, no toast).
-            // Plays on every real turn completion — active or background
-            // chat — and never during reconnect catch-up replay.
-            // Preset/volume/mute resolve in useNotificationSound via the
-            // 'turn' category.
-            if (shouldChimeOnTurnDone({
+            // Keep transcript finalization independent from attention: a parent
+            // can finish a turn while its children or workflow still owe work.
+            // A frame's activity hint wins over coalesced snapshots; older
+            // frames fall back to the existing per-session activity selectors.
+            if (data.slot) {
+              const soundState = store.getState()
+              const soundSlot = soundState.dashboard.slots.find(s => s.key === data.slot)
+              const workflows = selectSidebarWorkflowActive(soundState)
+              const workflowActive = !!(
+                workflows[normalizeRunSessionKey(data.slot)]
+                || (soundSlot?.linked_session_key && workflows[normalizeRunSessionKey(soundSlot.linked_session_key)])
+              )
+              const continuing = data.continuing ?? !!(
+                workflowActive
+                || selectSidebarSubagentCounts(soundState)[data.slot]
+                || soundSlot?.subagents_running
+                || soundSlot?.orchestrating
+                || (soundSlot?.queue_depth ?? 0) > 0
+                || selectSidebarAutomationRunningKeys(soundState).includes(dashboardAutomationSlotKey(data.slot))
+              )
+              questionPending = !!soundState.chat.pendingQuestions?.[data.slot]
+              // An authoritative frame hint (explicit question, manual Go) or a
+              // live question card both mean the conversation paused for the
+              // user rather than finished; the toast wording reads this too.
+              completionNeedsInput = data.needs_input === true || questionPending
+              completionNeedsAttention = shouldChimeOnTurnDone({
+                slot: data.slot,
+                reconnecting: reconnectingRef.current,
+                continuing,
+                needsInput: completionNeedsInput,
+              })
+              // A live question card already requested audio. Keep its named
+              // desktop toast eligible, but do not request a second chime.
+              if (completionNeedsAttention && !questionPending) dispatchMcNotification(TURN_DONE_KIND)
+            }
+            // Native notifications can carry an OS sound too, so they share
+            // the attention gate before applying the opt-in and away checks.
+            if (completionNeedsAttention && shouldNotifyOnChatComplete({
               slot: data.slot,
               reconnecting: reconnectingRef.current,
             })) {
-              dispatchMcNotification(TURN_DONE_KIND)
+              const doneSlot = data.slot as string
+              const doneTitle = store.getState().dashboard.slots
+                .find(s => s.key === doneSlot)?.title || doneSlot
+              // A toast that reads "Response ready" while the agent is waiting
+              // on the user misdescribes the handoff; two literal keys keep the
+              // reference statically checkable (see check-i18n-keys.mjs).
+              const doneBody = completionNeedsInput
+                ? i18nT('hooks.useWebSocket.waiting_for_input')
+                : i18nT('hooks.useWebSocket.response_ready')
+              // Android Chrome throws "Illegal constructor" for page-context
+              // Notification; an uncaught throw here kills the whole message
+              // handler, so the native toast is best-effort (same as approval).
+              try {
+                new Notification(doneTitle, { body: doneBody, tag: `kirocrew-chat-done:${doneSlot}`, silent: questionPending })
+              } catch {
+                /* unsupported platform */
+              }
             }
-            if (data.slot && data.slot !== store.getState().chat.activeSlot && !reconnectingRef.current) {
-              dispatch(markSlotUnread(data.slot))
+            if (data.slot && !isSlotOnScreen(data.slot) && !reconnectingRef.current) {
+              dispatch(markSlotUnread({ slot: data.slot, ts: (data as { ts?: string }).ts || undefined }))
               // #2: warm the per-slot cache so switching to this background
               // session renders the finished answer instantly (no on-switch fetch).
               dispatch(warmSlotCache(data.slot))
             }
+            // Turn finished in this window's active slot: same visible-only
+            // read-relay as the chat_message arrival branch above (a hidden
+            // window relays on reveal instead).
+            else if (data.slot && !reconnectingRef.current && !document.hidden && document.hasFocus() && isSlotRenderedVisibly(data.slot)) {
+              // Same actual-timestamp rule as the chat_message branch above.
+              const doneTs = (data as { ts?: string }).ts || store.getState().dashboard.slots?.find(s => s.key === data.slot)?.last_ts
+              emitSlotRead(data.slot, doneTs)
+            }
             if (data.slot) {
-              dispatch(setSlotStatusDetail({ slot: data.slot, kind: 'idle', text: 'Ready', ts: Date.now() }))
+              dispatch(setSlotStatusDetail({ slot: data.slot, kind: 'idle', ts: Date.now() }))
             }
             if (data.slot) dispatch(refreshSlot(data.slot))
             if (data.slot) {
@@ -1838,55 +2501,86 @@ export function useWebSocket() {
               api.voiceConfig().then(c => { autoSpeakRef.current = !!c.autoSpeak }).catch(() => {})
             }
             break
+          }
           case 'autonudge_state': {
-            // Broadcast for ChatPage to refresh its autonudge loop state.
-            window.dispatchEvent(new CustomEvent('autonudge_state', { detail: data }))
-            // Mirror into the store as well, so the sidebar can show progress on
-            // EVERY looping row instead of only the active slot (ChatPage's
-            // listener filters to `activeSlot`). The service emits one event per
-            // fired cycle, which is what makes the cycle counter tick live.
+            // One transport path feeds the authoritative collection consumed by
+            // both the sidebar and active-slot detail surface.
             const nudge = data as unknown as {
               event?: string
               slot?: string
-              loop?: { active?: boolean; cycle_count?: number; max_cycles?: number }
+              loop?: Record<string, unknown>
             }
             if (nudge.slot) {
+              const slot = dashboardAutomationSlotKey(nudge.slot)
+              if (nudge.event === 'removed') {
+                // A failed refetch must not leave the detail query able to
+                // resurrect a record the live stream authoritatively removed.
+                queryClient.setQueryData(['session-automation', slot], null)
+                // The removal is authoritative for the current frame, but a
+                // refresh still catches a successor created concurrently.
+                queryClient.invalidateQueries({ queryKey: ['session-automation', slot] })
+              }
               // Bump BEFORE dispatching so an in-flight seed is invalidated even
               // if its .then() runs immediately after this frame is handled.
-              goalLoopGenRef.current++
-              dispatch(sseGoalLoop({
-                slot: nudge.slot,
-                // `removed` still carries the loop object (the gateway observer
-                // only fires when `loop is not None`), and its `active` flag is
-                // whatever it was at removal — so the event name, not the flag,
-                // decides a removal.
-                active: nudge.event !== 'removed' && nudge.loop?.active === true,
-                cycle_count: Number(nudge.loop?.cycle_count) || 0,
-                max_cycles: Number(nudge.loop?.max_cycles) || 0,
-              }))
+              automationLiveGenRef.current.set(
+                slot,
+                (automationLiveGenRef.current.get(slot) ?? 0) + 1,
+              )
+              if (nudge.event === 'removed') {
+                dispatch(removeAutomation(slot))
+                queryClient.invalidateQueries({ queryKey: AUTONUDGE_LOOPS_QUERY_KEY })
+                break
+              }
+              const record = normalizeAutomationRecord(nudge)
+              if (record) {
+                // The live projection is already authoritative and normalized;
+                // cache it directly instead of issuing one REST request for
+                // every probe frame.
+                queryClient.setQueryData(['session-automation', slot], record)
+                dispatch(sseAutomation(record))
+              }
             }
+            // Readers of the FULL registry (the Crew Members drawer's patrol
+            // block needs stopped_reason, next_due_ts and banner, none of which
+            // ride this frame) re-read it in place rather than merging a partial
+            // payload — one seed path, not a third copy of the merge.
+            queryClient.invalidateQueries({ queryKey: AUTONUDGE_LOOPS_QUERY_KEY })
             break
           }
           case 'voice_chunk': {
-            if (voiceMutedRef.current) break
-            if (data.slot !== store.getState().chat.activeSlot) break
-            // Queue and play audio chunks as they arrive
-            const { audio: b64, audioMime } = data as { audio: string; audioMime?: string }
+            if (voiceMutedRef.current || data.slot !== store.getState().chat.activeSlot) break
+            const { audio: b64, audioMime, request_id } = data as { audio: string; audioMime?: string; request_id?: string }
+            if (!request_id || voiceRequestsRef.current.get(request_id) !== data.slot) break
             if (b64) {
               try {
                 const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0))
-                const blob = new Blob([bytes], { type: audioMime === 'audio/wav' ? 'audio/wav' : 'audio/mpeg' })
-                const url = URL.createObjectURL(blob)
-                voiceQueueRef.current.push(url)
-                dispatch(setVoicePlaying(true))
-                playNextVoiceChunk()
-              } catch { /* malformed base64 */ }
+                if (audioMime === 'audio/wav' && typeof AudioContext !== 'undefined') {
+                  getPcmPlayer().enqueue(bytes.buffer)
+                } else {
+                  const blob = new Blob([bytes], { type: audioMime === 'audio/wav' ? 'audio/wav' : 'audio/mpeg' })
+                  const url = URL.createObjectURL(blob)
+                  voiceQueueRef.current.push(url)
+                  dispatch(setVoicePlaying(true))
+                  playNextVoiceChunk()
+                }
+              } catch {
+                reportVoiceFailure({ slot: data.slot, request_id, code: 'voice_playback_failed' })
+              }
             }
             break
           }
           case 'voice_complete': {
-            const b64 = (data as { audio: string }).audio
+            const { audio: b64, request_id } = data as { audio?: string; request_id?: string }
+            if (voiceMutedRef.current || data.slot !== store.getState().chat.activeSlot) break
+            if (!request_id || !voiceRequestsRef.current.delete(request_id)) break
             if (b64) dispatch(setVoiceAudio(b64))
+            break
+          }
+          case 'voice_error': {
+            const { request_id, code } = data as { request_id?: string; code?: string }
+            if (!request_id || !voiceRequestsRef.current.delete(request_id)) break
+            if (voiceMutedRef.current || data.slot !== store.getState().chat.activeSlot || code === 'voice_cancelled') break
+            reportVoiceFailure({ slot: data.slot, request_id, code: code || 'voice_synthesis_failed' })
             break
           }
           case 'log':
@@ -2002,13 +2696,21 @@ export function useWebSocket() {
       wsRef.current = null
 
       if (closingRef.current) return
+      if (voiceRequestsRef.current.size || voicePlayingRef.current || store.getState().chat.voicePlaying) {
+        reportVoiceFailure({
+          slot: store.getState().chat.activeSlot, code: 'voice_playback_failed',
+        })
+        // Audio frames have no reconnect replay. Retrying the connection cannot
+        // recover the missing samples, so release the pending stream explicitly.
+        stopVoice()
+      }
       const delay = reconnectRef.current
       reconnectRef.current = Math.min(delay * 2, 10000)
       reconnectTimerRef.current = setTimeout(connect, delay)
     }
 
     ws.onerror = () => { /* onclose will fire */ }
-  }, [dispatch, flushChunks, flushBufferedThinking, scheduleChunkFlush, bufferSlotActivity, bufferSubagentChunk, flushSubagentChunks, playNextVoiceChunk, flushVoiceTail, queryClient, stopVoice, syncPendingApprovals, syncPendingQuestions, syncWorkflowRuns, seedGoalLoops, recordRetiredId])
+  }, [dispatch, flushChunks, flushBufferedThinking, scheduleChunkFlush, bufferSlotActivity, bufferSubagentChunk, flushSubagentChunks, playNextVoiceChunk, flushVoiceTail, queryClient, stopVoice, getPcmPlayer, syncPendingApprovals, syncPendingQuestions, syncWorkflowRuns, seedAutomations, recordRetiredId, retireApproval])
 
   /**
    * Force an immediate reconnect: cancels any pending backoff timer, closes
@@ -2044,12 +2746,33 @@ export function useWebSocket() {
   useEffect(() => {
     closingRef.current = false  // reset for StrictMode re-mount
     connect()
-    const onVoiceStop = () => stopVoice()
+    const onVoiceStop = () => {
+      stopVoice()
+      if (autoSpeakRef.current && typeof AudioContext !== 'undefined') getPcmPlayer().unlock()
+    }
+    const onVoiceStart = (event: Event) => {
+      const { slot, request_id } = (event as CustomEvent<{ slot: string; request_id: string }>).detail
+      voiceRequestsRef.current.set(request_id, slot)
+      if (slot === store.getState().chat.activeSlot) {
+        voiceMutedRef.current = false
+        if (typeof AudioContext !== 'undefined') getPcmPlayer().unlock()
+      }
+    }
+    const onVoiceFailed = (event: Event) => {
+      const detail = (event as CustomEvent<{ slot: string; request_id: string; code: string }>).detail
+      if (!voiceRequestsRef.current.delete(detail.request_id)) return
+      if (!voiceMutedRef.current && detail.slot === store.getState().chat.activeSlot) {
+        reportVoiceFailure(detail)
+      }
+    }
     const onVoiceConfigChanged = (e: Event) => {
       const detail = (e as CustomEvent).detail
       autoSpeakRef.current = !!detail?.autoSpeak
+      if (!autoSpeakRef.current) stopVoice()
     }
     window.addEventListener('voice-stop', onVoiceStop)
+    window.addEventListener('voice-synthesis-start', onVoiceStart)
+    window.addEventListener('voice-synthesis-failed', onVoiceFailed)
     window.addEventListener('voice-config-changed', onVoiceConfigChanged)
     // Slot-focus intent signal (resume prefetch). One shared sender for
     // every focus source — Redux activeSlot changes (sidebar, keyboard,
@@ -2062,20 +2785,63 @@ export function useWebSocket() {
       ws.send(JSON.stringify({ type: 'slot_focused', slot }))
     }
     sendSlotFocusedImpl = sendFocus
-    let lastFocusSent: string | null = null
+    // Read-relay sender rides the same socket with the same best-effort
+    // contract; slotReadRelay owns the per-slot throttle and the watermark.
+    bindSlotReadSender((slot: string, readTs?: string) => {
+      const ws = wsRef.current
+      if (!ws || ws.readyState !== WebSocket.OPEN) return
+      ws.send(JSON.stringify(readTs ? { type: 'slot_read', slot, read_ts: readTs } : { type: 'slot_read', slot }))
+    })
+    let lastFocusSent: string | null = store.getState().chat.activeSlot
     const unsubFocus = store.subscribe(() => {
       const active = store.getState().chat.activeSlot
       if (active === lastFocusSent) return  // store.subscribe fires on EVERY action
+      // The outgoing slot stops being visible-active NOW: flush its pending
+      // trailing read-relay so the timer can't fire after a newer message
+      // re-badges the slot and wipe a bubble nobody read.
+      if (lastFocusSent) flushSlotRead(lastFocusSent)
       lastFocusSent = active
+      stopVoice()
+      voiceMutedRef.current = false
+      voiceProgressRef.current = null
       sendFocus(active)
     })
     const onVisibility = () => {
       // Hidden → blur (cancels a pending prefetch server-side); visible →
       // re-announce the active slot even if unchanged, since the server may
       // have expired the previous prefetch while the tab was away.
+      if (document.hidden) {
+        // Going hidden: no pending trailing read-relay may outlive visibility
+        // (a newer message could re-badge the slot before the timer fired).
+        flushSlotRead()
+      }
       sendFocus(document.hidden ? null : store.getState().chat.activeSlot)
+      if (!document.hidden) {
+        // Returning to the tab IS the read of whatever the active slot shows.
+        // Flush buffered recency bumps first — rAF doesn't fire in hidden
+        // tabs, so arrivals from the hidden stretch are still buffered — then
+        // relay the active slot's read at its post-flush last_ts (server-
+        // minted, monotonic in the reducer). Receivers keep badges lit by
+        // anything newer (readCovers), so an idle reveal clears nothing it
+        // shouldn't. Dropped during reconnect catch-up, mirroring the
+        // arrival branches.
+        flushSlotActivity()
+        const active = store.getState().chat.activeSlot
+        if (active && !reconnectingRef.current && document.hasFocus() && isChatSurfaceVisible()) {
+          emitSlotRead(active, store.getState().dashboard.slots?.find(s => s.key === active)?.last_ts)
+        }
+      }
     }
     document.addEventListener('visibilitychange', onVisibility)
+    // Also on window focus: the passive-relay gate requires hasFocus(), and
+    // a focus-only change (window occluded -> foreground) fires NO
+    // visibilitychange — without this listener the relay suppressed while
+    // unfocused never re-fires and sibling badges stay stale until the next
+    // gesture. onVisibility's hidden branch is unreachable here (a focused
+    // document is never hidden), so the focus path re-announces the slot,
+    // flushes buffered activity, and relays the read under the same
+    // visible+focused gate.
+    window.addEventListener('focus', onVisibility)
     return () => {
       closingRef.current = true
       clearTimeout(reconnectTimerRef.current)
@@ -2092,13 +2858,19 @@ export function useWebSocket() {
       flushBufferedThinking()
       wsRef.current?.close()
       wsRef.current = null
+      stopVoice()
+      pcmPlayerRef.current?.close()
+      pcmPlayerRef.current = null
       window.removeEventListener('voice-stop', onVoiceStop)
+      window.removeEventListener('voice-synthesis-start', onVoiceStart)
+      window.removeEventListener('voice-synthesis-failed', onVoiceFailed)
       window.removeEventListener('voice-config-changed', onVoiceConfigChanged)
       document.removeEventListener('visibilitychange', onVisibility)
+      window.removeEventListener('focus', onVisibility)
       unsubFocus()
       sendSlotFocusedImpl = () => {}
     }
-  }, [connect, stopVoice, flushSlotActivity, flushSubagentChunks, flushBufferedThinking])
+  }, [connect, stopVoice, getPcmPlayer, flushSlotActivity, flushSubagentChunks, flushBufferedThinking])
 
   /** Subscribe to log events — call with callback on mount, null on unmount. */
   const subscribeLogs = useCallback((cb: LogCallback) => {

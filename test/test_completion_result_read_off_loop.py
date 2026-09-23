@@ -34,12 +34,22 @@ def _isolate_config_dir(tmp_path, monkeypatch):
         monkeypatch.setattr(f"kiro_crew.dashboard.{module}.config_dir", lambda: tmp_path)
 
 
+class _StageManager:
+    def running_agents_for(self, _parent: str) -> list[dict]:
+        return []
+
+    async def has_pending_work_for_async(self, _parent: str) -> bool:
+        return False
+
+    async def wait_for_parent_reports(self, _parent: str, _owner: str = "") -> bool:
+        return False
+
+
 def _make_state():
     state = MagicMock()
     state.broadcast_ws = MagicMock()
     state.push_slots_update = MagicMock()
-    state.subagents = MagicMock()
-    state.subagents.running_agents_for = MagicMock(return_value=[])
+    state.subagents = _StageManager()
     return state
 
 
@@ -56,13 +66,16 @@ def _make_slot(titles):
 def _stage_texts(monkeypatch, texts):
     """Make each stage's captured result file hold ``texts[stage_num - 1]``.
 
-    The real ``_capture_stage_result`` harvests assistant messages appended by
-    ``_run_chat``, which is mocked here; giving the mock a per-stage body is what
-    puts distinguishable content on disk for the completion read to find.
+    The real capture harvests assistant messages appended by ``_run_chat``, which
+    is mocked here; giving the mock a per-stage body is what puts distinguishable
+    content on disk for the completion read to find.
     """
     stage_box = {"n": 0}
 
     async def _mock_run_chat(state, slot, message, **kwargs):
+        callback = kwargs.get("_on_consumed")
+        if callable(callback):
+            callback(True)
         idx = stage_box["n"]
         stage_box["n"] += 1
         if idx < len(texts):
@@ -74,9 +87,7 @@ def _stage_texts(monkeypatch, texts):
 def _completion_message(slot):
     """The single '✅ All N stages complete.' summary the loop emits."""
     matches = [
-        m.get("content", "")
-        for m in slot.messages
-        if m.get("content", "").startswith("✅ All ")
+        m.get("content", "") for m in slot.messages if m.get("content", "").startswith("✅ All ")
     ]
     assert len(matches) == 1, f"expected exactly one completion summary, got {len(matches)}"
     return matches[0]
@@ -126,10 +137,12 @@ async def test_completion_result_read_runs_off_the_loop_thread(monkeypatch):
 
     assert paths_read, (
         "no stage result was read at plan completion -- this test no longer "
-        "exercises the completion read and would pass vacuously")
+        "exercises the completion read and would pass vacuously"
+    )
     assert threading.get_ident() not in seen_threads, (
         "a completed stage result was read on the event-loop thread; the "
-        "filesystem work must be handed to asyncio.to_thread")
+        "filesystem work must be handed to asyncio.to_thread"
+    )
     # The summary really is built from what was read off disk, so the assertion
     # above covers the read that produces the user-visible text.
     assert "alpha done" in _completion_message(slot)
@@ -192,9 +205,32 @@ async def test_completion_summary_truncates_the_excerpt_at_120_chars(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_completion_summary_falls_back_to_done_for_blank_result(monkeypatch):
-    """Preservation: an empty result file yields '— done', not a crash."""
-    slot = await _run_plan(monkeypatch, ["First"], [""])
+async def test_completion_summary_falls_back_to_done_for_blank_result(monkeypatch, tmp_path):
+    """Preservation: an empty result FILE yields '— done', not a crash.
+
+    The blank file is produced by the write half to isolate the excerpt fallback
+    from stage-turn behavior. A stage now advances when its turn returns without
+    raising, including when it captured no assistant text.
+    """
+    from kiro_crew.dashboard import chat_orchestrator
+    from kiro_crew.dashboard.chat import _stage_loop
+
+    state = _make_state()
+    slot = _make_slot(["First"])
+    _stage_texts(monkeypatch, ["alpha done"])
+
+    real_write = chat_orchestrator._write_stage_result
+
+    def _write_then_blank(slot_key, stage_num, raw_parts):
+        path = real_write(slot_key, stage_num, raw_parts)
+        (tmp_path / "sessions" / slot_key / f"stage_{stage_num}_result.md").write_text(
+            "", encoding="utf-8"
+        )
+        return path
+
+    monkeypatch.setattr(chat_orchestrator, "_write_stage_result", _write_then_blank)
+
+    await _stage_loop(state, slot, auto_run=True)
 
     assert _completion_message(slot).splitlines()[1] == "  Stage 1: First — done"
 
@@ -211,18 +247,20 @@ async def test_completion_summary_survives_a_deleted_result_file(monkeypatch, tm
     slot = _make_slot(["First", "Second"])
     _stage_texts(monkeypatch, ["alpha done", "beta done"])
 
-    real_capture = None
+    real_write = None
 
-    def _capture_then_delete_stage_1(s, stage_num):
-        path = real_capture(s, stage_num)
+    # Wraps the WRITE half of the capture (the loop hands it to a worker); the
+    # message walk stays on the loop and is a separate function.
+    def _write_then_delete_stage_1(slot_key, stage_num, raw_parts):
+        path = real_write(slot_key, stage_num, raw_parts)
         if stage_num == 1:
-            (tmp_path / "sessions" / s.key / "stage_1_result.md").unlink()
+            (tmp_path / "sessions" / slot_key / "stage_1_result.md").unlink()
         return path
 
     from kiro_crew.dashboard import chat_orchestrator
 
-    real_capture = chat_orchestrator._capture_stage_result
-    monkeypatch.setattr(chat_orchestrator, "_capture_stage_result", _capture_then_delete_stage_1)
+    real_write = chat_orchestrator._write_stage_result
+    monkeypatch.setattr(chat_orchestrator, "_write_stage_result", _write_then_delete_stage_1)
 
     await _stage_loop(state, slot, auto_run=True)
 
@@ -248,10 +286,10 @@ async def test_no_worker_hop_when_no_stage_results_were_captured(monkeypatch):
     from kiro_crew.dashboard import chat_orchestrator
     from kiro_crew.dashboard.chat import _stage_loop
 
-    def _capture_fails(s, stage_num):
+    def _write_fails(slot_key, stage_num, raw_parts):
         raise OSError("disk full")
 
-    monkeypatch.setattr(chat_orchestrator, "_capture_stage_result", _capture_fails)
+    monkeypatch.setattr(chat_orchestrator, "_write_stage_result", _write_fails)
 
     hops: list[object] = []
     real_to_thread = asyncio.to_thread

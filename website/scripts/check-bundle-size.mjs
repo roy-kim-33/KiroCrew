@@ -17,7 +17,7 @@
 // byte-for-byte unaffected -- CI runs the analyze build and then this script.
 import path from 'path'
 import { pathToFileURL } from 'url'
-import { checkChunkBudgets, formatBytes, loadBundleSummary } from './lib/bundleReport.mjs'
+import { checkChunkBudgets, failGate, formatBytes, loadSummaryOrExit } from './lib/bundleReport.mjs'
 
 const KB = 1024
 
@@ -47,6 +47,7 @@ export const CHUNK_BUDGETS = {
   // recent catalog increments included in this measurement; Dev Fleet's
   // per-pod system readout then adds its own strings across the same 12
   // catalogs on top of that baseline. The Drive gallery's keys across 13
+<<<<<<< HEAD
   // catalogs ride inside the headroom that measurement already left, so this
   // branch does not move the ceiling.
   // Fork: RoyCrew carries what upstream does plus its own provider/vision
@@ -55,6 +56,58 @@ export const CHUNK_BUDGETS = {
   // lazy-loading note), so fork keys land in this chunk by design rather than
   // by accident. Same ~5% headroom over measured as upstream's own entries.
   all: 10990 * KB, // measured 10456 KB (upstream measured 9985 KB + ~471 KB fork overhead)
+=======
+  // catalogs and this stack's structured-monitor, session-mode, and
+  // source-provider additions ride inside the headroom that measurement already
+  // left, so this stack does not move the ceiling.
+  // Re-measured 2026-09-06: main @ 3a6478967 alone builds the chunk at
+  // 10,700,930 B (10450 KB) against the 10490 KB ceiling -- 0.4% headroom, so
+  // any feature PR shipping a normal set of keys across the 13 catalogs fails
+  // the gate on its merge ref (first seen on the Create Folders From Project
+  // takeover, 13 catalogs x 52 lines, ~55 KB). Same recurrence as the `t` and
+  // `App` entries below: a ceiling that drifted to <1% headroom fails on
+  // routine string growth rather than on the new library it exists to catch.
+  // Re-measured 2026-09-10: main @ b165ba1be alone builds the chunk at
+  // 11,302,007 B (11037 KB) against the 10975 KB ceiling -- 62 KB OVER, so
+  // main's own gate is red and every PR rebased onto it inherits the failure.
+  // Attribution is measured, not assumed: the two feature PRs merged back to
+  // back at 17:53-17:54 (#9810 browser element annotations, +423 catalog lines
+  // across 13 languages; #9812 file-viewer type-first annotator, +107 lines)
+  // ship only translated product copy into this chunk -- it still holds the
+  // same 14 modules (13 catalogs plus the entry), no library reached it, and
+  // no lazy import() boundary can move a catalog string out of `all`. Same
+  // recurrence, same remedy: back to the 5% convention.
+  // Memory V2 adds the private-memory panels' strings (member memory, records
+  // editor, store picker/card, carve, backups, retired) across all 13 catalogs
+  // on top of that: with them the chunk builds at 11,332,186 B (11067 KB), so
+  // the 5% headroom is taken over that measurement rather than main's.
+  // Re-measured 2026-09-16: main @ a9c1cb253d alone builds the chunk at
+  // 11,880,309 B (11602.8 KB) against the 11620 KB ceiling -- 17.2 KB left, or
+  // 0.15% headroom. Same recurrence as every note above: the ceiling drifted to
+  // under 1% on accumulated catalog copy, so it now fails on the next feature
+  // PR's ordinary strings rather than on the new library or surface it exists to
+  // catch. Attribution measured, not assumed: this branch adds 61 catalog lines
+  // x 13 languages for the tasks-capacity panel (49,821 B, 48.7 KB) and no
+  // module -- the chunk still holds the same 13 catalogs plus the entry, and no
+  // lazy import() boundary can move a catalog string out of `all`, which is why
+  // shrinking is not an option here. Back to the 5% convention over the
+  // measurement that includes this branch (11,930,130 B).
+  // Re-measured 2026-09-21: the 5.1% headroom is spent and main's tip alone
+  // builds the chunk at 12,548,680 B (12254.6 KB) against the 12240 KB ceiling --
+  // 14.6 KB OVER, so the gate had begun failing on the merge ref of every open
+  // PR. Same recurrence as both notes above, and the third time it has landed
+  // this way. Attribution measured, not assumed: the branch that surfaced it
+  // (fix/fork-lane-claude-install-egress) changes six files under `.github/`,
+  // one under `docs/` and one under `test/` and NOTHING under `website/`, so the
+  // tree it built is main's tip verbatim; two unrelated fork PRs whose diffs are
+  // Python-only failed the same gate in the same window, and the measured size
+  // rose monotonically across those three runs (12,525.22 -> 12,541.08 ->
+  // 12,548.68 kB) while main merged, independent of any of their diffs. Still no
+  // module: the chunk holds the same 13 catalogs plus the entry, so shrinking
+  // remains unavailable for the reason stated above. Back to the 5% convention
+  // over that measurement.
+  all: 12870 * KB, // measured 12254.6 KB on main @ 34fe0de33e 2026-09-21 (5.0% headroom)
+>>>>>>> upstream/main
 
   // The i18n RUNTIME — the i18next singleton, `initI18n`, the English catalog —
   // named after `src/i18n/t.ts`. Held separately from `all` above because
@@ -62,6 +115,7 @@ export const CHUNK_BUDGETS = {
   // `t()` no longer pull the other twelve catalogs in behind them. Sized for the
   // English catalog plus headroom; a jump here means a non-English catalog, or a
   // library, reached the runtime module.
+<<<<<<< HEAD
   // Re-measured 2026-09-04 upstream at 740 KB, with 5% headroom, after main
   // drifted to EXACTLY its own ceiling and began failing the gate on the merge
   // ref of every open PR. Attribution was measured, not assumed: the growth is
@@ -72,6 +126,72 @@ export const CHUNK_BUDGETS = {
   // land here by that same note, not by a library leaking in. Upstream's 777
   // ceiling is sized for its own 740 measurement and does not fit this tree.
   t: 801 * KB, // measured 763.5 KiB post-merge (781,830 B), 5% headroom
+=======
+  // Re-measured 2026-09-04 at 740 KB, and the 702 KB note above was ~38 KB
+  // stale, which is the same recurrence it describes: main drifted to EXACTLY
+  // 740.00 KB (757,764 B, 4 B over its own ceiling), so the gate began failing
+  // on the merge ref of every open PR rather than on the new library or surface
+  // it exists to catch. Attribution was measured, not assumed -- the branch that
+  // tripped it first builds a BYTE-IDENTICAL `t` chunk to its own base
+  // (`t-BLZeayKy.js`, 755,868 B on both), and main's tip alone, with none of that
+  // branch's code, reproduces the 4-byte failure with the same content hash. So
+  // the growth is main's accumulated English strings, and headroom is what was
+  // actually missing. 5% headroom, matching the `all` entry's convention above,
+  // so the next English string does not re-trip this for the third time.
+  // Re-measured 2026-09-08: main @ 9af9543b0 alone builds the chunk at
+  // 795,127 B (776.5 KB) against the 777 KB ceiling -- 0.07% headroom, the
+  // same drift again (~36 KB of English strings in four days). A feature PR
+  // adding ~40 keys (#8307) trips it on its merge ref while main's own gate
+  // stays green, so the ceiling moves back to the 5% convention.
+  // Two catalog surfaces stack on this chunk after the merge: the
+  // structured-monitor dashboard (57 English keys) and the managed-credentials
+  // surface (25 English keys plus setup / irreversibility guidance). Both are
+  // ordinary translated product copy, not a library reaching the runtime. The
+  // merged analyze build measures the chunk at 807,525 B (788.6 KB); keep
+  // roughly 5% headroom (matching the `all` entry's convention above) over that
+  // combined measurement so expected catalog growth does not block descendants.
+  // Re-measured 2026-09-13 on the reviewed member capability inheritance
+  // branch rebased onto main @ f382f0a70: the analyze build emits the chunk at
+  // 839,943 B (820.3 KB) against the 819 KB ceiling -- 1,287 B over. The
+  // growth is English catalog copy only: the feature's 96 keys
+  // (`crewCapabilities` / `crewCapabilityEditing`, ~4.7 KB) plus 15 upstream
+  // keys that landed on main after the branch's previous rebase. The chunk
+  // report counts 12 modules; this PR adds no dependency. This is the
+  // documented catalog-growth drift again: the previous ceiling
+  // was set at 3.7% over its own measurement, below the 5% convention, and
+  // ordinary catalog growth since then used that margin up. Back to the 5%
+  // convention over the measured size.
+  // Re-measured 2026-09-19 on this channel-folder backfill branch rebased onto
+  // main @ 1c7f963706: main's catalogs ALONE build the chunk at 881,305 B
+  // (860.6 KB) against the 861 KB ceiling -- 359 B left, or 0.04% headroom. With
+  // this feature's copy it builds at 882,910 B (862.2 KB), 1.2 KB over.
+  // Attribution is measured, not assumed: reverting ONLY the 14 files under
+  // `website/src/i18n/` to the base and rebuilding drops the chunk to the
+  // 881,305 B above, so the delta this branch owns is 1,605 B -- its 18 keys of
+  // product copy across 13 catalogs plus the generated `en-XA` pseudo-locale,
+  // which roughly doubles the byte cost of every string. The report still counts
+  // 12 modules and this branch adds no dependency, and no lazy `import()`
+  // boundary can move a catalog string out of this chunk (same as the `all`
+  // entry's note above). This is the documented drift for the fourth time: a
+  // ceiling left at 0.04% headroom fails on the next feature's ordinary strings
+  // rather than on the new library it exists to catch. Back to the 5% convention
+  // over the measured size.
+  // Re-measured on this branch: with the base catalogs restored and only this
+  // branch's other code present, the chunk builds at 926,128 B (904.4 KB), which
+  // is 592 B under the 905 KB ceiling -- 0.06% headroom. The judge row's nine
+  // keys across the twelve shipped catalogs, plus the generated `en-XA`
+  // pseudo-locale that roughly doubles each string's byte cost, add 1,456 B on
+  // top, so the build lands at 927,584 B (905.8 KB) -- 607 B over the old 905 KB
+  // ceiling. Attribution is measured, not assumed: reverting ONLY the files under
+  // `website/src/i18n/` to the base and rebuilding produces the 926,128 B above,
+  // and this branch adds no dependency to the chunk. No lazy `import()` boundary
+  // can move a catalog string out of it, same as the `all` entry's note. This is
+  // the drift the notes above already describe: a ceiling left under a tenth of a
+  // percent of headroom fails on the next feature's ordinary strings rather than
+  // on the new library it exists to catch. Back to the 5% convention over the
+  // measured size.
+  t: 951 * KB, // measured 905.8 KB on this branch (~5% headroom)
+>>>>>>> upstream/main
 
   // Pierre editor implementation (PR #4072 replaced Monaco, whose
   // 'editor.api2' chunk this entry set used to carry) -- the code-editor
@@ -96,12 +216,58 @@ export const CHUNK_BUDGETS = {
   // of every open PR rather than on a new library or surface — the same
   // recurrence the `t` entry above documents. Attribution was measured, not
   // assumed: main's tip alone, with no PR code, reproduces the failure.
-  // 5% headroom, matching the `all` and `t` entries' convention, so ordinary
-  // first-party growth does not re-trip this within days.
-  App: 3360 * KB, // measured 3201 KB on main @ 701f8f981 (~5% headroom)
+  // Re-measured 2026-09-08: four days of ordinary first-party growth took main
+  // @ 6ae74179d to 3,440,273 B (3360 KB) against the 3360 KB ceiling -- 367 B
+  // of headroom, so a PR adding ONE module to the app core (#9437, +1.7 KB)
+  // fails the gate on its merge ref while main itself still passes by a hair.
+  // Same recurrence, same remedy: 5% headroom, matching the `all` and `t`
+  // entries' convention, so ordinary first-party growth does not re-trip this
+  // within days.
+  // The managed-credentials UI and its setup / irreversible-delete states take
+  // the merge result to 3,445,107 B (3364.4 KB). Preserve the documented margin
+  // at that current measurement; a library-class regression still exceeds this
+  // ceiling by hundreds of kilobytes.
+  // Re-measured 2026-09-21 against main @ 20261b7633, whose tip alone -- no PR
+  // code in the tree -- builds this chunk at 3,619,504 B and so exceeds the
+  // 3533 KB (3,617,792 B) ceiling by 1,712 B on its own. The margin the lines
+  // above describe is therefore already spent: the gate fails on the merge ref
+  // of every open PR, which is exactly the recurrence the `all` and `t` entries
+  // document, and attribution here was measured rather than assumed (pristine
+  // main built in its own worktree, then this branch on top of it).
+  // The compaction shadow-scoring surface (the keep line, its record reader and
+  // one settings switch) adds 2,761 B of first-party code on top of that, for a
+  // merge result of 3,622,265 B. The ceiling moves to cover both parts --
+  // main's 1,712 B of drift and this surface's 2,761 B -- rounded up to this
+  // table's whole-KB unit: 3538 KB, which leaves 647 B of headroom. It is NOT
+  // restored to the ~5% margin the lines above prescribe, because that is a
+  // re-measure of main's growth rather than a cost this surface incurs; at 647 B
+  // the next app-core addition trips this entry again.
+  // Re-measured 2026-09-21 after rebasing onto main @ 17c96c7ab0, which had itself
+  // re-baselined this entry to 3538 KB for the compaction shadow-scoring surface
+  // (that measurement and its reasoning are the paragraph above; both notes are kept
+  // because the two surfaces are independent and the ceiling has to cover both).
+  // Attribution measured, not assumed: main's tip alone builds this chunk at
+  // 3,622,265 B per the note above, and this branch on top of it builds 3,624,314 B
+  // (3539.4 KB). So main's 3538 KB (3,622,912 B) is 1,402 B SHORT of the merge ref of
+  // this PR, which is why the entry moves again rather than being left alone.
+  // This branch's own cost is the difference, 2,049 B -- and that is the SAME 2,049 B
+  // measured against the previous base (main @ feed35446c at 3,616,146 B, this branch
+  // at 3,618,195 B), so the attribution is confirmed by two independent bases rather
+  // than by one build. It is not a library or a lazy-loadable surface: the member
+  // projection store, its hook and the roster/drawer wiring are first-party app-core
+  // code with no lazy boundary available, the same shape the notes above document.
+  // Back to the ~5% convention over the measurement that includes this branch,
+  // matching the `all` and `t` entries.
+  // The memory-recall strip, its own record reader and the card's second switch
+  // add a further 5,492 B on top of that. A tree carrying all three surfaces
+  // measures 3,641,334 B, which is what the ceiling below is set against. It
+  // covers every part -- main's drift and each surface's own cost -- with the ~5%
+  // margin the lines above prescribe, so ordinary first-party growth does not
+  // re-trip this entry within days.
+  App: 3714 * KB, // measured 3,641,334 B with all three surfaces (4.25% headroom)
 
   // Markdown/math/syntax rendering stack (katex, highlight.js, remark/rehype)
-  // -- one deliberate `manualChunks` bucket, see vite.config.ts.
+  // -- one deliberate `codeSplitting` group, see vite.config.ts.
   'vendor-markdown': 712 * KB, // measured 678 KB
 
   // Mermaid's own prebuilt internal chunk; the name comes from mermaid's build,
@@ -140,7 +306,7 @@ export const CHUNK_BUDGETS = {
   'chunk-K2UTITRG': 550 * KB, // measured 522 KB (excalidraw 0.18.1 font-subsetting internals)
 
   // Graph/network visualization stack (vis-network, sigma, graphology,
-  // cytoscape) -- one deliberate `manualChunks` bucket, see vite.config.ts.
+  // cytoscape) -- one deliberate `codeSplitting` group, see vite.config.ts.
   'vendor-graph': 606 * KB, // measured 577 KB
 
   // The SPA entry chunk: router, providers, and the eager page skeleton.
@@ -149,29 +315,14 @@ export const CHUNK_BUDGETS = {
 
 const REPORT_PATH = path.resolve('dist', 'bundle-report.json')
 
-function fail(message, code = 1) {
-  process.stderr.write(`${message}\n`)
-  process.exit(code)
-}
-
-// Exit-code mapping for this gate: 2 = report missing, 3 = report malformed or
-// unsupported version, 4 = report valid but lists no chunks. The contract itself
-// (existence/shape/version) lives in the shared loadBundleSummary; 4 is checked
-// here rather than there because an empty report is legitimate for
+// This gate's own exit code, beyond the 2 (missing) / 3 (malformed) that
+// loadSummaryOrExit owns: 4 = report valid but lists no chunks. That one is
+// checked here rather than there because an empty report is legitimate for
 // bundle-report.mjs, which simply has nothing to render.
-function loadSummary(file) {
-  const { summary, error } = loadBundleSummary(file, {
-    hint:
-      'Run `vite build --mode analyze` first -- a plain `npm run build` deliberately ' +
-      'does not write one, so the normal build stays unaffected.',
-  })
-  if (error) fail(error.message, error.code === 'missing' ? 2 : 3)
-  return summary
-}
 
 export function main(argv = process.argv.slice(2)) {
   const reportPath = argv[0] ? path.resolve(argv[0]) : REPORT_PATH
-  const summary = loadSummary(reportPath)
+  const summary = loadSummaryOrExit(reportPath)
   const { breaches, unusedBudgets, checkedCount } = checkChunkBudgets(summary, {
     budgets: CHUNK_BUDGETS,
     defaultBudget: DEFAULT_BUDGET_BYTES,
@@ -185,7 +336,7 @@ export function main(argv = process.argv.slice(2)) {
   // unused-budget warnings, so the actionable line is not buried under one
   // warning per allowlist entry (11 of them today).
   if (checkedCount === 0) {
-    fail(
+    failGate(
       `no chunks in ${reportPath} -- the gate measured nothing, so it cannot ` +
         'certify anything. Re-run `vite build --mode analyze` and check it ' +
         'emitted a bundle.',
@@ -216,9 +367,9 @@ export function main(argv = process.argv.slice(2)) {
         `by ${formatBytes(b.overage)} (chunk '${b.logicalName}')\n`
     )
   }
-  fail(
+  failGate(
     `${breaches.length} chunk(s) over budget. Either shrink the chunk (prefer a lazy ` +
-      'import() boundary or a manualChunks split -- see website/vite.config.ts), or, if the ' +
+      'import() boundary or a codeSplitting group -- see website/vite.config.ts), or, if the ' +
       'growth is genuinely irreducible, add/adjust its entry in CHUNK_BUDGETS in ' +
       'scripts/check-bundle-size.mjs with a comment saying why, and justify it in the PR.'
   )

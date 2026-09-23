@@ -16,6 +16,8 @@ git, npm, or pip. All filesystem work happens under ``tmp_path`` with
 from __future__ import annotations
 
 import asyncio
+import importlib.machinery
+import importlib.util
 import json
 import os
 import sys
@@ -48,6 +50,34 @@ def cache_dir(tmp_path, monkeypatch):
     cache.mkdir(parents=True)
     monkeypatch.setattr(registry, "_manifest_cache_dir", lambda: cache)
     return cache
+
+
+@pytest.fixture()
+def pip_importable(monkeypatch):
+    """Pin the gateway interpreter as one that HAS a ``pip`` module.
+
+    ``_run_app_build`` decides whether to plan a Python build by probing
+    ``importlib.util.find_spec("pip")`` on the RUNNING interpreter. That reads
+    the host's own packaging, not the fixture tree: a venv created by ``uv`` or
+    ``--without-pip`` has no ``pip`` module, so the branch soft-skips and every
+    "the pip command is planned" assertion fails there while passing on a
+    stdlib venv. Tests asserting the planned command take this fixture; the
+    soft-skip contract is pinned separately with the opposite answer.
+    """
+    import site
+
+    from kiro_crew import platform_compat
+
+    monkeypatch.setattr(site, "ENABLE_USER_SITE", False)
+    monkeypatch.setattr(platform_compat, "is_bundled_interpreter", lambda: False)
+    real_find_spec = importlib.util.find_spec
+
+    def _with_pip(name, *args, **kwargs):
+        if name == "pip":
+            return importlib.machinery.ModuleSpec("pip", loader=None)
+        return real_find_spec(name, *args, **kwargs)
+
+    monkeypatch.setattr(registry.importlib.util, "find_spec", _with_pip)
 
 
 class _FakeProc:
@@ -529,35 +559,94 @@ class TestEditionRegistryRows:
 
 
 class TestManifestCache:
+    _DEMO = {"name": "demo", "repo": "https://github.com/o/demo.git", "branch": "main"}
+
     def test_missing_cache_reads_none(self, cache_dir):
-        assert registry._read_manifest_cache("nope") is None
+        assert registry._read_manifest_cache({"name": "nope"}) is None
 
     def test_round_trip(self, cache_dir):
-        registry._write_manifest_cache("demo", {"name": "demo", "version": "1.0.0"})
-        assert registry._read_manifest_cache("demo") == {"name": "demo", "version": "1.0.0"}
+        registry._write_manifest_cache(self._DEMO, {"name": "demo", "version": "1.0.0"})
+        assert registry._read_manifest_cache(self._DEMO) == {"name": "demo", "version": "1.0.0"}
 
     def test_stale_cache_reads_none(self, cache_dir):
-        registry._write_manifest_cache("demo", {"name": "demo"})
-        path = registry._manifest_cache_path("demo")
+        registry._write_manifest_cache(self._DEMO, {"name": "demo"})
+        path = registry._manifest_cache_path(self._DEMO)
         past = time.time() - registry._MANIFEST_CACHE_TTL - 3600
         os.utime(path, (past, past))
-        assert registry._read_manifest_cache("demo") is None
+        assert registry._read_manifest_cache(self._DEMO) is None
 
     def test_corrupt_cache_reads_none(self, cache_dir):
-        registry._manifest_cache_path("demo").write_text("not json", encoding="utf-8")
-        assert registry._read_manifest_cache("demo") is None
+        path = registry._manifest_cache_path(self._DEMO)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("not json", encoding="utf-8")
+        assert registry._read_manifest_cache(self._DEMO) is None
 
     def test_write_failure_is_swallowed(self, cache_dir, monkeypatch):
         def _boom(path, data):
             raise OSError("disk full")
 
         monkeypatch.setattr(registry, "atomic_write", _boom)
-        registry._write_manifest_cache("demo", {"name": "demo"})  # must not raise
-        assert registry._read_manifest_cache("demo") is None
+        registry._write_manifest_cache(self._DEMO, {"name": "demo"})  # must not raise
+        assert registry._read_manifest_cache(self._DEMO) is None
 
     def test_traversing_name_is_confined_to_the_cache_dir(self, cache_dir):
-        path = registry._manifest_cache_path("../../escape")
-        assert cache_dir.resolve() == path.parent.resolve()
+        path = registry._manifest_cache_path({"name": "../../escape"})
+        assert path.parent == cache_dir / registry._MANIFEST_SOURCE_SUBDIR
+        assert cache_dir.resolve() in path.resolve().parents
+
+    def test_branch_change_is_a_cache_miss(self, cache_dir):
+        # The cache identity folds the effective branch in, so flipping the
+        # configured branch can never reuse metadata resolved from another one.
+        main_row = {"name": "demo", "repo": "https://github.com/o/demo.git", "branch": "main"}
+        dev_row = {"name": "demo", "repo": "https://github.com/o/demo.git", "branch": "dev"}
+        assert registry._manifest_cache_path(main_row) != registry._manifest_cache_path(dev_row)
+        registry._write_manifest_cache(main_row, {"name": "demo", "version": "1.0.0"})
+        assert registry._read_manifest_cache(dev_row) is None
+        assert registry._read_manifest_cache(main_row) is not None
+
+    def test_same_name_different_repos_do_not_share_cache(self, cache_dir):
+        one = {"name": "demo", "repo": "https://github.com/one/demo.git", "branch": "main"}
+        two = {"name": "demo", "repo": "https://github.com/two/demo.git", "branch": "main"}
+        assert registry._manifest_cache_path(one) != registry._manifest_cache_path(two)
+        registry._write_manifest_cache(one, {"name": "demo", "description": "repo one"})
+        assert registry._read_manifest_cache(two) is None
+
+    def test_subdirectory_and_commit_pin_scope_the_identity(self, cache_dir):
+        base = {"name": "demo", "repo": "https://github.com/o/demo.git", "branch": "main"}
+        subdir = dict(base, subdirectory="apps/demo")
+        pinned = dict(base, commit="a" * 40)
+        paths = {
+            registry._manifest_cache_path(base),
+            registry._manifest_cache_path(subdir),
+            registry._manifest_cache_path(pinned),
+        }
+        assert len(paths) == 3
+
+    def test_branch_change_is_a_miss_even_under_an_unchanged_pin(self, cache_dir):
+        # Non-catalog pins are data fidelity, not what the listing fetch
+        # resolves — the fetch follows the BRANCH. A ref that kept only the
+        # commit would hold the cache path fixed across an operator's branch
+        # change, serving another branch's metadata for every pinned row.
+        pin = "a" * 40
+        main_row = {
+            "name": "demo",
+            "repo": "https://github.com/o/demo.git",
+            "branch": "main",
+            "commit": pin,
+        }
+        dev_row = dict(main_row, branch="dev")
+        assert registry._manifest_cache_path(main_row) != registry._manifest_cache_path(dev_row)
+        registry._write_manifest_cache(main_row, {"name": "demo", "version": "1.0.0"})
+        assert registry._read_manifest_cache(dev_row) is None
+
+    def test_credential_in_url_never_reaches_the_cache_identity(self, cache_dir):
+        # Normalization strips userinfo, so the same repo with and without an
+        # embedded credential is ONE cache identity and the secret is not in
+        # the file name.
+        plain = {"name": "demo", "gitUrl": "https://git.example.com/o/demo.git"}
+        credentialed = {"name": "demo", "gitUrl": "https://user:secret@git.example.com/o/demo.git"}
+        assert registry._manifest_cache_path(plain) == registry._manifest_cache_path(credentialed)
+        assert "secret" not in registry._manifest_cache_path(credentialed).name
 
     def test_external_cache_write_failure_is_swallowed(self, cache_dir, monkeypatch):
         def _boom(path, data):
@@ -583,12 +672,14 @@ class TestSafeCacheStem:
 
 
 class TestExpireCacheFile:
+    _DEMO = {"name": "demo", "repo": "https://github.com/o/demo.git", "branch": "main"}
+
     def test_backdates_instead_of_unlinking(self, cache_dir):
-        registry._write_manifest_cache("demo", {"name": "demo"})
-        path = registry._manifest_cache_path("demo")
+        registry._write_manifest_cache(self._DEMO, {"name": "demo"})
+        path = registry._manifest_cache_path(self._DEMO)
         registry._expire_cache_file(path)
         assert path.is_file()  # data survives as stale fallback
-        assert registry._read_manifest_cache("demo") is None
+        assert registry._read_manifest_cache(self._DEMO) is None
 
     def test_missing_file_is_a_no_op(self, cache_dir):
         registry._expire_cache_file(cache_dir / "absent.json")
@@ -601,13 +692,79 @@ class TestExpireCacheFile:
         assert outside.stat().st_mtime == before
 
     def test_utime_failure_is_swallowed(self, cache_dir, monkeypatch):
-        registry._write_manifest_cache("demo", {"name": "demo"})
+        registry._write_manifest_cache(self._DEMO, {"name": "demo"})
 
         def _boom(path, times):
             raise OSError("read-only fs")
 
         monkeypatch.setattr(registry.os, "utime", _boom)
-        registry._expire_cache_file(registry._manifest_cache_path("demo"))
+        registry._expire_cache_file(registry._manifest_cache_path(self._DEMO))
+
+
+class TestManifestCacheGc:
+    _DEMO = {"name": "demo", "repo": "https://github.com/o/demo.git", "branch": "main"}
+
+    def _age(self, path, extra=0):
+        past = (
+            time.time()
+            - max(registry._MANIFEST_CACHE_TTL, registry._EXTERNAL_REGISTRY_CACHE_TTL)
+            - registry._MANIFEST_CACHE_GC_GRACE
+            - 3600
+            - extra
+        )
+        os.utime(path, (past, past))
+
+    def test_write_reclaims_orphans_past_every_ttl_plus_grace(self, cache_dir):
+        # A coordinate change orphans the old file (no reader derives its path
+        # again); once it is older than every TTL plus the grace window, the
+        # next write sweeps it, so churned coordinates cannot grow the dir
+        # without bound.
+        old_row = dict(self._DEMO, branch="dead-branch")
+        registry._write_manifest_cache(old_row, {"name": "demo"})
+        orphan = registry._manifest_cache_path(old_row)
+        self._age(orphan)
+        registry._write_manifest_cache(self._DEMO, {"name": "demo"})
+        assert not orphan.exists()
+        assert registry._manifest_cache_path(self._DEMO).is_file()
+
+    def test_fresh_and_recently_expired_files_survive(self, cache_dir):
+        registry._write_manifest_cache(self._DEMO, {"name": "demo"})
+        kept = registry._manifest_cache_path(self._DEMO)
+        # A file _expire_cache_file just backdated is expired but NOT yet
+        # GC-eligible: expiry preserves it on purpose.
+        registry._expire_cache_file(kept)
+        other = dict(self._DEMO, name="other")
+        registry._write_manifest_cache(other, {"name": "other"})
+        assert kept.is_file()
+
+    def test_registry_index_caches_are_never_swept(self, cache_dir):
+        index_file = cache_dir / "_registry_acme.json"
+        index_file.write_text("[]", encoding="utf-8")
+        self._age(index_file)
+        registry._write_manifest_cache(self._DEMO, {"name": "demo"})
+        assert index_file.is_file()
+
+    def test_a_registry_prefixed_app_name_cannot_escape_the_gc(self, cache_dir):
+        # _safe_cache_stem returns plain names byte-identical, so an external
+        # index can name an app `_registry_evil`. The GC boundary is the
+        # by-source subdirectory, not a name prefix, so such a file is
+        # reclaimed like any other manifest instead of accumulating forever.
+        evil = {"name": "_registry_evil", "repo": "https://github.com/o/x.git", "branch": "main"}
+        registry._write_manifest_cache(evil, {"name": "_registry_evil"})
+        orphan = registry._manifest_cache_path(evil)
+        assert orphan.parent.name == registry._MANIFEST_SOURCE_SUBDIR
+        self._age(orphan)
+        registry._write_manifest_cache(self._DEMO, {"name": "demo"})
+        assert not orphan.exists()
+
+    def test_gc_errors_are_swallowed(self, cache_dir, monkeypatch):
+        registry._write_manifest_cache(self._DEMO, {"name": "demo"})
+
+        def _boom(self_path):
+            raise OSError("no listdir for you")
+
+        monkeypatch.setattr(registry.Path, "iterdir", _boom)
+        registry._write_manifest_cache(self._DEMO, {"name": "demo"})  # must not raise
 
 
 # ---------------------------------------------------------------------------
@@ -863,7 +1020,7 @@ class TestResolveManifest:
     @pytest.mark.asyncio
     async def test_cached_manifest_short_circuits_the_fetch(self, monkeypatch):
         monkeypatch.setattr(
-            registry, "_read_manifest_cache", lambda name: {"description": "cached"}
+            registry, "_read_manifest_cache", lambda entry: {"description": "cached"}
         )
 
         async def _never(*a, **k):
@@ -877,13 +1034,13 @@ class TestResolveManifest:
 
     @pytest.mark.asyncio
     async def test_fetched_manifest_is_cached_and_merged(self, monkeypatch):
-        monkeypatch.setattr(registry, "_read_manifest_cache", lambda name: None)
+        monkeypatch.setattr(registry, "_read_manifest_cache", lambda entry: None)
         monkeypatch.setattr(registry, "_is_owner_designated_repo", lambda entry: False)
         written: list[tuple[str, dict]] = []
         monkeypatch.setattr(
             registry,
             "_write_manifest_cache",
-            lambda name, data: written.append((name, data)),
+            lambda entry, data: written.append((entry["name"], data)),
         )
 
         async def _fetch(*a, **k):
@@ -898,7 +1055,7 @@ class TestResolveManifest:
 
     @pytest.mark.asyncio
     async def test_unavailable_manifest_leaves_a_minimal_row(self, monkeypatch):
-        monkeypatch.setattr(registry, "_read_manifest_cache", lambda name: None)
+        monkeypatch.setattr(registry, "_read_manifest_cache", lambda entry: None)
         monkeypatch.setattr(registry, "_is_owner_designated_repo", lambda entry: False)
 
         async def _fetch(*a, **k):
@@ -907,6 +1064,61 @@ class TestResolveManifest:
         monkeypatch.setattr(registry, "_fetch_app_manifest", _fetch)
         entry = {"name": "demo", "gitUrl": "https://github.com/o/demo.git"}
         assert await registry._resolve_manifest(entry) == entry
+
+    @pytest.mark.asyncio
+    async def test_failed_fetch_never_attaches_another_sources_manifest(
+        self, cache_dir, monkeypatch
+    ):
+        # A manifest cached for branch `main` must not be attached to the same
+        # app configured for branch `dev` when the dev fetch fails: the row
+        # comes back minimal, never wearing another branch's metadata.
+        main_row = {"name": "demo", "gitUrl": "https://github.com/o/demo.git", "branch": "main"}
+        registry._write_manifest_cache(main_row, {"description": "from main", "version": "9.9.9"})
+        monkeypatch.setattr(registry, "_owner_designated_repo_target", lambda entry: "")
+
+        async def _fetch(*a, **k):
+            return None
+
+        monkeypatch.setattr(registry, "_fetch_app_manifest", _fetch)
+        dev_row = {"name": "demo", "gitUrl": "https://github.com/o/demo.git", "branch": "dev"}
+        got = await registry._resolve_manifest(dict(dev_row))
+        assert "description" not in got
+        assert got.get("version") is None
+
+    @pytest.mark.asyncio
+    async def test_refresh_expiry_updates_available_version_for_not_installed_app(
+        self, cache_dir, monkeypatch
+    ):
+        # After the refresh path expires the coordinates' cache, the next
+        # listing resolve refetches and surfaces the NEW available version;
+        # install-status enrichment keeps the row not-installed.
+        row = {"name": "demo", "gitUrl": "https://github.com/o/demo.git", "branch": "main"}
+        registry._write_manifest_cache(row, {"version": "1.0.0"})
+        registry._expire_cache_file(registry._manifest_cache_path(row))
+        monkeypatch.setattr(registry, "_owner_designated_repo_target", lambda entry: "")
+
+        async def _fetch(*a, **k):
+            return {"version": "2.0.0"}
+
+        monkeypatch.setattr(registry, "_fetch_app_manifest", _fetch)
+        got = await registry._resolve_manifest(dict(row))
+        assert got["version"] == "2.0.0"
+        enriched = registry._enrich_with_install_status([got], installed_map={})
+        assert enriched[0]["installed"] is False
+        assert "installedVersion" not in enriched[0]
+
+    @pytest.mark.asyncio
+    async def test_installed_and_available_versions_stay_distinct(self, cache_dir, monkeypatch):
+        row = {"name": "demo", "gitUrl": "https://github.com/o/demo.git", "branch": "main"}
+        registry._write_manifest_cache(row, {"version": "2.0.0"})
+        got = await registry._resolve_manifest(dict(row))
+        assert got["version"] == "2.0.0"
+        enriched = registry._enrich_with_install_status(
+            [got], installed_map={"demo": {"version": "1.0.0", "enabled": True}}
+        )
+        assert enriched[0]["installedVersion"] == "1.0.0"
+        assert enriched[0]["version"] == "2.0.0"
+        assert enriched[0]["updateAvailable"] is True
 
 
 class TestMergeManifest:
@@ -1172,7 +1384,7 @@ class TestCandidateResolution:
     ):
         # `_registry_app_candidates` consults the official catalog with a fresh
         # uncached HTTPS fetch, and DROPS every candidate when that lookup
-        # fails (#4236); pin "catalog reachable, app absent" so the assertion
+        # fails; pin "catalog reachable, app absent" so the assertion
         # exercises the bundled + external span deterministically.
         monkeypatch.setattr(
             "kiro_crew.apps.official_catalog.inventory_for_install",
@@ -1183,9 +1395,10 @@ class TestCandidateResolution:
             "_load_registry_file",
             lambda: [{"name": "demo", "gitUrl": "https://github.com/core/demo.git"}, "junk"],
         )
-        _config_with(monkeypatch, [_reg("mine", "https://gitea.internal/idx.git")])
+        reg = _reg("mine", "https://gitea.internal/idx.git")
+        _config_with(monkeypatch, [reg])
         registry._write_external_registry_cache(
-            "mine",
+            registry._external_registry_cache_identity(reg),
             [
                 {"name": "demo", "gitUrl": "https://gitea.internal/other/demo.git"},
                 {"name": "unrelated"},
@@ -1320,9 +1533,11 @@ class TestRepoLookups:
 
     def test_external_repo_is_resolved_from_the_sync_cache(self, monkeypatch, cache_dir):
         monkeypatch.setattr(registry, "_load_registry_file", list)
-        _config_with(monkeypatch, [_reg("mine", "https://gitea.internal/idx.git")])
+        reg = _reg("mine", "https://gitea.internal/idx.git")
+        _config_with(monkeypatch, [reg])
         registry._write_external_registry_cache(
-            "mine", [{"name": "demo", "repo": "ext/demo", "branch": "trunk"}]
+            registry._external_registry_cache_identity(reg),
+            [{"name": "demo", "repo": "ext/demo", "branch": "trunk"}],
         )
         assert registry.get_registry_app_by_repo("ext/demo")["branch"] == "trunk"
 
@@ -1345,11 +1560,196 @@ class TestRepoLookups:
         monkeypatch.setattr(
             registry, "_load_registry_file", lambda: [{"name": "a", "repo": "core/a"}]
         )
-        _config_with(monkeypatch, [_reg("mine", "https://gitea.internal/idx.git")])
+        reg = _reg("mine", "https://gitea.internal/idx.git")
+        _config_with(monkeypatch, [reg])
         registry._write_external_registry_cache(
-            "mine", [{"name": "b", "repo": "ext/b"}, {"name": "c"}]
+            registry._external_registry_cache_identity(reg),
+            [{"name": "b", "repo": "ext/b"}, {"name": "c"}],
         )
         assert registry.known_registry_repos() == {"core/a", "ext/b"}
+
+
+class TestExternalRegistryCacheIdentity:
+    """The index cache key is provenance (name|repo|branch), not display name."""
+
+    def test_repointing_repo_or_branch_changes_the_identity(self):
+        base = _reg("mine", "https://gitea.internal/idx.git", branch="main")
+        other_repo = _reg("mine", "https://gitea.internal/other.git", branch="main")
+        other_branch = _reg("mine", "https://gitea.internal/idx.git", branch="dev")
+        identities = {
+            registry._external_registry_cache_identity(base),
+            registry._external_registry_cache_identity(other_repo),
+            registry._external_registry_cache_identity(other_branch),
+        }
+        assert len(identities) == 3
+
+    def test_repointed_registry_stops_serving_the_old_index(self, monkeypatch, cache_dir):
+        # The ignore_ttl stale-fallback readers must MISS after a repoint —
+        # serving the old repository's index under the same display name is
+        # the defect this PR exists to close.
+        monkeypatch.setattr(registry, "_load_registry_file", list)
+        old = _reg("mine", "https://gitea.internal/old.git")
+        registry._write_external_registry_cache(
+            registry._external_registry_cache_identity(old),
+            [{"name": "demo", "repo": "old/demo"}],
+        )
+        _config_with(monkeypatch, [_reg("mine", "https://gitea.internal/new.git")])
+        assert registry.get_registry_app_by_repo("old/demo") is None
+        assert registry.known_registry_repos() == set()
+
+    def test_absent_none_and_empty_branch_share_one_identity(self):
+        # Duck-typed registry objects may not carry ``branch`` at all
+        # (regression: AttributeError from _registry_app_candidates). Absent,
+        # None, and "" all mean "default branch" and must agree — and must
+        # never collide with a real branch.
+        no_branch = SimpleNamespace(name="mine", repo="https://gitea.internal/idx.git")
+        ids = {
+            registry._external_registry_cache_identity(no_branch),
+            registry._external_registry_cache_identity(
+                _reg("mine", "https://gitea.internal/idx.git", branch="")
+            ),
+            registry._external_registry_cache_identity(
+                _reg("mine", "https://gitea.internal/idx.git", branch=None)
+            ),
+        }
+        assert len(ids) == 1
+        real = registry._external_registry_cache_identity(
+            _reg("mine", "https://gitea.internal/idx.git", branch="main")
+        )
+        assert real not in ids
+
+    def test_owner_count_reader_agrees_with_the_writer(self, monkeypatch, cache_dir):
+        # Regression: _repo_key_owner_count read the cache under the display
+        # name while every writer had moved to the coordinate identity, so an
+        # external source always counted 0 and the single-owner credential
+        # grant was silently disabled.
+        from kiro_crew.apps.routes import _repo_key_owner_count
+
+        monkeypatch.setattr(registry, "_load_registry_file", list)
+        reg = _reg("mine", "https://gitea.internal/idx.git")
+        _config_with(monkeypatch, [reg])
+        registry._write_external_registry_cache(
+            registry._external_registry_cache_identity(reg),
+            [{"name": "demo", "repo": "ext/demo"}],
+        )
+        assert _repo_key_owner_count("ext/demo") == 1
+
+    @pytest.mark.asyncio
+    async def test_fetch_reclaims_the_pre_identity_cache_file(self, monkeypatch, cache_dir):
+        # An upgrade orphans the name-keyed file (no reader derives that path
+        # any more); the first successful fetch reclaims it.
+        reg = _reg("mine", "https://gitea.internal/idx.git")
+        legacy_path = registry._external_registry_cache_path("mine")
+        registry._write_external_registry_cache("mine", [{"name": "demo"}])
+        assert legacy_path.is_file()
+
+        async def _fake_fetch(repo, branch):
+            return [{"name": "demo"}]
+
+        monkeypatch.setattr(registry, "_fetch_external_registry_index", _fake_fetch)
+        entries = await registry._fetch_and_cache_external_registry(reg)
+        assert entries is not None
+        assert not legacy_path.is_file()
+        assert registry._read_external_registry_cache(
+            registry._external_registry_cache_identity(reg), ignore_ttl=True
+        )
+
+    @pytest.mark.asyncio
+    async def test_failed_fetch_still_reclaims_legacy_files(self, monkeypatch, cache_dir):
+        # The legacy name-keyed file can embed URL userinfo in its FILENAME
+        # (raw form, written by an older release). It must be reclaimed even
+        # when the registry is unreachable — cleanup gated on fetch success
+        # would keep a credential-bearing artifact around indefinitely. The
+        # name's slug exceeds the current 120-char cap and the expected paths
+        # are constructed INLINE with the historical (uncapped) recipe, so a
+        # cleanup that switches to the capped derivation misses these files
+        # and fails this test.
+        import re as _re
+        from hashlib import sha256 as _sha256
+
+        secret = "LegacyFileSecret"
+        raw_name = (
+            f"https://user:{secret}@git.example.com/"
+            + "/".join(["deeply-nested-group"] * 8)
+            + "/org/apps.git"
+        )
+        reg = _reg(raw_name, raw_name)
+
+        def _historical_path(name: str):
+            slug = _re.sub(r"[^A-Za-z0-9_\-]+", "-", name).strip("-")
+            digest = _sha256(name.encode("utf-8")).hexdigest()[:8]
+            return cache_dir / f"_registry_{slug}-{digest}.json"
+
+        raw_path = _historical_path(raw_name)
+        sanitized_path = _historical_path(
+            registry._credential_free_external_registry_value(raw_name)
+        )
+        assert len(raw_path.name) > 140  # over the cap: only the uncapped derivation finds it
+        for p in {raw_path, sanitized_path}:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text("[]", encoding="utf-8")
+        assert secret in raw_path.name
+
+        async def _fail_fetch(repo, branch):
+            return None
+
+        monkeypatch.setattr(registry, "_fetch_external_registry_index", _fail_fetch)
+        assert await registry._fetch_and_cache_external_registry(reg) is None
+        assert not raw_path.is_file()
+        assert not sanitized_path.is_file()
+
+    def test_long_identity_still_yields_a_writable_path(self, cache_dir):
+        # An URL-derived name repeats much of the repo URL inside the
+        # identity, so an over-long identity must not push the cache filename
+        # past the filesystem's ~255-byte component limit (a too-long name
+        # makes every write fail with ENAMETOOLONG and silently disables the
+        # stale-fallback).
+        long_repo = "https://gitlab.example.com/" + "/".join(["group"] * 40) + "/idx.git"
+        reg = _reg(long_repo, long_repo, branch="a-rather-long-branch-name")
+        identity = registry._external_registry_cache_identity(reg)
+        path = registry._external_registry_cache_path(identity)
+        assert len(path.name.encode("utf-8")) <= 255
+        registry._write_external_registry_cache(identity, [{"name": "demo"}])
+        assert registry._read_external_registry_cache(identity, ignore_ttl=True) == [
+            {"name": "demo"}
+        ]
+
+    def test_truncated_slugs_do_not_collide(self, cache_dir):
+        # Identity lives in the digest, not the readable prefix: two long
+        # identities sharing their first 120 slug characters still map to
+        # distinct cache files.
+        prefix = "https://gitlab.example.com/" + "x" * 200
+        a = registry._external_registry_cache_path(f"{prefix}/one|{prefix}/one|main")
+        b = registry._external_registry_cache_path(f"{prefix}/two|{prefix}/two|main")
+        assert a != b
+
+    def test_capped_identity_resists_a_32_bit_digest_collision(self, cache_dir):
+        # These branch values collide under the historical eight-hex digest.
+        # Because the long readable prefix is capped before the branch, the
+        # old current-path recipe mapped both identities to the same file and
+        # a repoint could serve the former branch's stale index.
+        from hashlib import sha256
+
+        long_repo = "https://gitlab.example.com/" + "/".join(["group"] * 40) + "/idx.git"
+        old_identity = registry._external_registry_cache_identity(
+            _reg(long_repo, long_repo, branch="b57262")
+        )
+        new_identity = registry._external_registry_cache_identity(
+            _reg(long_repo, long_repo, branch="b166188")
+        )
+        assert (
+            sha256(old_identity.encode("utf-8")).hexdigest()[:8]
+            == sha256(new_identity.encode("utf-8")).hexdigest()[:8]
+        )
+
+        old_path = registry._external_registry_cache_path(old_identity)
+        new_path = registry._external_registry_cache_path(new_identity)
+        assert old_path != new_path
+        assert len(old_path.name.encode("utf-8")) <= 255
+        assert len(new_path.name.encode("utf-8")) <= 255
+
+        registry._write_external_registry_cache(old_identity, [{"name": "old-app"}])
+        assert registry._read_external_registry_cache(new_identity, ignore_ttl=True) is None
 
 
 class TestSourceStrings:
@@ -1806,36 +2206,44 @@ class TestRunAppBuild:
         assert spawned == [["/usr/bin/npm", "install"]]
 
     @pytest.mark.asyncio
-    async def test_requirements_only_uses_the_requirements_file(self, tmp_path, monkeypatch):
+    async def test_requirements_only_uses_the_requirements_file(
+        self, tmp_path, monkeypatch, pip_importable
+    ):
         (tmp_path / "requirements.txt").write_text("pytest\n", encoding="utf-8")
         spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
         assert await registry._run_app_build(tmp_path, "demo", []) == {"ok": True}
-        assert spawned == [[sys.executable, "-m", "pip", "install", "-r", "requirements.txt"]]
+        assert spawned == [[sys.executable, "-s", "-m", "pip", "install", "-r", "requirements.txt"]]
 
     @pytest.mark.asyncio
-    async def test_pyproject_installs_the_project(self, tmp_path, monkeypatch):
+    async def test_pyproject_installs_the_project(
+        self, tmp_path, monkeypatch, pip_importable
+    ):
         (tmp_path / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
         (tmp_path / "requirements.txt").write_text("pytest\n", encoding="utf-8")
         spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
         assert await registry._run_app_build(tmp_path, "demo", []) == {"ok": True}
-        assert spawned == [[sys.executable, "-m", "pip", "install", "."]]
+        assert spawned == [[sys.executable, "-s", "-m", "pip", "install", "."]]
 
     @pytest.mark.asyncio
-    async def test_setup_py_installs_the_project(self, tmp_path, monkeypatch):
+    async def test_setup_py_installs_the_project(
+        self, tmp_path, monkeypatch, pip_importable
+    ):
         (tmp_path / "setup.py").write_text("from setuptools import setup\n", encoding="utf-8")
         spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
         assert await registry._run_app_build(tmp_path, "demo", []) == {"ok": True}
-        assert spawned == [[sys.executable, "-m", "pip", "install", "."]]
+        assert spawned == [[sys.executable, "-s", "-m", "pip", "install", "."]]
 
     @pytest.mark.asyncio
-    async def test_missing_path_pip_does_not_skip_the_python_build(self, tmp_path, monkeypatch):
+    async def test_missing_path_pip_does_not_skip_the_python_build(
+        self, tmp_path, monkeypatch, pip_importable
+    ):
         """The Python build runs via ``sys.executable -m pip`` — the gateway's own
         interpreter — so a host with no pip anywhere on PATH must still build."""
         (tmp_path / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
         monkeypatch.setattr(registry.shutil, "which", lambda name: None)
         spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
         assert await registry._run_app_build(tmp_path, "demo", []) == {"ok": True}
-        assert spawned == [[sys.executable, "-m", "pip", "install", "."]]
+        assert spawned == [[sys.executable, "-s", "-m", "pip", "install", "."]]
 
     @pytest.mark.asyncio
     async def test_desktop_bundled_interpreter_never_runs_pip(self, tmp_path, monkeypatch):

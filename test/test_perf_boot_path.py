@@ -37,6 +37,35 @@ from kiro_crew.slack.gateway import GatewayOrchestrator
 _SRC = str(Path(kiro_crew.__file__).resolve().parents[1])
 
 
+@pytest.fixture(autouse=True)
+def _close_knowledge_stores(monkeypatch):
+    """Close the SQLite connection each ``KnowledgeStore`` opened on this thread.
+
+    ``KnowledgeStore`` opens a per-thread SQLite connection (three descriptors
+    in WAL) on first ``db`` access and never closes it without an explicit
+    call; the scan tests here would otherwise leave the test-thread connection
+    open until GC. Track every instance and release it at teardown.
+    """
+    from kiro_crew.knowledge import store as _store_mod
+
+    created = []
+    orig_init = _store_mod.KnowledgeStore.__init__
+
+    def _tracking_init(self, *args, **kwargs):
+        orig_init(self, *args, **kwargs)
+        created.append(self)
+
+    monkeypatch.setattr(_store_mod.KnowledgeStore, "__init__", _tracking_init)
+    try:
+        yield
+    finally:
+        for store in created:
+            try:
+                store.close()
+            except Exception:
+                pass
+
+
 def _probe(snippet: str) -> dict:
     """Run *snippet* in a clean interpreter, returning the JSON it prints.
 
@@ -75,20 +104,27 @@ class TestGatewayUpdateCheckIsBackgrounded:
 
     def test_update_check_is_not_awaited_inline(self) -> None:
         src = inspect.getsource(GatewayOrchestrator.run)
-        assert "await self._check_for_updates()" not in src, (
-            "the boot update check must not be inline-awaited — it blocks the "
-            "boot for up to ~70s on a stalled network"
+        assert "await self._run_update_checks()" not in src, (
+            "the update coordinator must not be inline-awaited — its first "
+            "network cycle can block boot for up to ~70s"
         )
-        assert "asyncio.create_task(self._check_for_updates())" in src
+        assert "asyncio.create_task(self._run_update_checks())" in src
 
     def test_signal_handlers_installed_before_update_check(self) -> None:
         src = inspect.getsource(GatewayOrchestrator.run)
-        handlers_at = src.index("loop.add_signal_handler(sig, _on_signal)")
-        check_at = src.index("asyncio.create_task(self._check_for_updates())")
+        handlers_at = src.index("self._install_shutdown_signal_handlers()")
+        preparation_at = src.index("await self._wait_for_memory_preparation()")
+        check_at = src.index("asyncio.create_task(self._run_update_checks())")
+        assert (
+            handlers_at < preparation_at
+        ), "SIGINT/SIGTERM handlers must be installed before waiting for memory preparation"
         assert handlers_at < check_at, (
             "SIGINT/SIGTERM handlers must be installed before the update check "
             "starts, or an early Ctrl-C is ignored"
         )
+        handlers_src = inspect.getsource(GatewayOrchestrator._install_shutdown_signal_handlers)
+        assert "for sig in (signal.SIGINT, signal.SIGTERM):" in handlers_src
+        assert "loop.add_signal_handler(sig, _on_signal)" in handlers_src
 
     def test_update_check_task_is_tracked_and_cancelled(self) -> None:
         run_src = inspect.getsource(GatewayOrchestrator.run)
@@ -98,6 +134,7 @@ class TestGatewayUpdateCheckIsBackgrounded:
         )
         shutdown_src = inspect.getsource(GatewayOrchestrator._shutdown)
         assert "self._update_check_task.cancel()" in shutdown_src
+        assert "_cancel_update_check()" in shutdown_src
 
 
 # ── Telemetry: no OTel SDK import while telemetry is off ───────────────────
@@ -614,3 +651,33 @@ class TestOptionalMcpServersAreNotImportedByTheCli:
             "default-disabled server costs gateway boot nothing"
         )
         assert got["computer"] is False
+
+
+# ── Gateway boot: the panel subsystem stays off the boot chain ──────────────
+
+
+class TestPanelSubsystemIsNotLoadedAtBoot:
+    """``dashboard/handlers/members.py`` is imported while the gateway boots, and
+    the panel subsystem is optional: a host that never assigns a panel would pay
+    for loading it before the socket is bound. Its one consumer imports it inside
+    the function, so the module must stay out of ``sys.modules``."""
+
+    def test_handlers_import_does_not_load_agent_panel(self) -> None:
+        result = _probe(
+            "import json, sys\n"
+            "import kiro_crew.dashboard.handlers  # noqa: F401\n"
+            "print(json.dumps({\n"
+            "    'panel': 'kiro_crew.agent_panel' in sys.modules,\n"
+            "    'members': 'kiro_crew.dashboard.handlers.members' in sys.modules,\n"
+            "}))\n"
+        )
+        # Pin the assumption the guard rests on: the boot chain really does pull
+        # the members handlers in. If that stops holding, this pin goes green for
+        # the wrong reason, so it must fail instead.
+        assert result["members"] is True, (
+            "the members handlers are no longer on the boot import chain; "
+            "move this pin to whatever imports agent_panel now"
+        )
+        assert result["panel"] is False, (
+            "importing the dashboard handlers must not load kiro_crew.agent_panel"
+        )

@@ -1,6 +1,6 @@
 """Post-exec spawn shim: resource limits without forking the threaded gateway.
 
-The defect these guard against (issue #935): passing ``preexec_fn`` makes CPython
+The defect these guard against: passing ``preexec_fn`` makes CPython
 ``fork()`` the multi-GB, ~118-thread gateway and run Python bytecode in the child
 before ``exec``. A lock another thread held at fork time is unreleasable there, so
 the child can wedge before exec -- and then
@@ -32,6 +32,7 @@ from kiro_crew import _spawn_exec_shim as shim
 from kiro_crew import sandbox
 from kiro_crew.sandbox import (
     RLIMIT_PROFILE_BUILD,
+    RLIMIT_PROFILE_EXTRACTOR,
     RLIMIT_PROFILE_NONE,
     RLIMIT_PROFILE_SESSION_HOST,
     RLIMIT_PROFILE_TOOL,
@@ -234,6 +235,28 @@ class TestSpawnShimArgv:
         build = [a for a in spawn_shim_argv(RLIMIT_PROFILE_BUILD) if a.startswith("--rlimits=")]
         assert tool != build
         assert f"RLIMIT_NOFILE:{sandbox._BUILD_NOFILE_CEILING}" in build[0]
+
+    def test_extractor_profile_is_a_fixed_memory_and_cpu_ceiling(self):
+        # The document-parser child: RLIMIT_AS on by DEFAULT (the tool profile
+        # leaves it to ``max_memory_mb``, default 0), a CPU cap, the OOM bias --
+        # and no dependence on the operator's ``resource_limits`` block.
+        prefix = spawn_shim_argv(RLIMIT_PROFILE_EXTRACTOR)
+        [spec] = [a for a in prefix if a.startswith("--rlimits=")]
+        assert f"RLIMIT_AS:{sandbox._EXTRACTOR_MAX_AS_BYTES}" in spec
+        assert f"RLIMIT_CPU:{sandbox._EXTRACTOR_MAX_CPU_SECS}" in spec
+        assert f"RLIMIT_NOFILE:{sandbox._EXTRACTOR_MAX_NOFILE}" in spec
+        assert sandbox._EXTRACTOR_MAX_AS_BYTES == 1024 * 1024 * 1024
+        assert "--oom-bias" in prefix
+        tool = [a for a in spawn_shim_argv(RLIMIT_PROFILE_TOOL) if a.startswith("--rlimits=")]
+        assert "RLIMIT_AS:" not in tool[0]
+
+    def test_extractor_fallback_preexec_applies_the_same_ceiling(self, monkeypatch):
+        # The shim-less path carries the same numbers, so a truncated install
+        # does not silently drop the one bound this profile exists for.
+        monkeypatch.setattr(sandbox, "_EXTRACTOR_PREEXEC", sandbox._UNSET)
+        preexec = sandbox._preexec_for_profile(RLIMIT_PROFILE_EXTRACTOR)
+        assert preexec is not None
+        assert preexec is sandbox.extractor_resource_limit_preexec()
 
     def test_policy_free_profile_skips_the_interpreter_hop(self):
         # Nothing to do post-exec: no reason to pay an exec + startup.
@@ -790,9 +813,9 @@ class TestDescriptorPinnedWorkingDirectory:
     async def test_child_still_starts_when_the_name_is_gone_after_the_bind(self, tmp_path):
         """The pinned descriptor must be the ONLY thing that decides the cwd.
 
-        Popen chdirs to ``cwd`` before exec'ing the shim, so a pathname that stopped
-        naming a directory after the bind used to fail the spawn outright -- the
-        descriptor was never reached.
+        Popen chdirs to ``cwd`` before exec'ing the shim, so a pathname that stops
+        naming a directory after the bind would fail the spawn outright -- the
+        descriptor never reached.
         """
         real = tmp_path / "real"
         real.mkdir()

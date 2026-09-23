@@ -246,7 +246,7 @@ class TestTemplate:
         assert "arn:aws:s3:::${SourceBucket}/${SourceKey}" not in text
 
     def test_boundary_is_referenced_by_param_not_created_per_launch(self):
-        # The permissions boundary must NO LONGER be an in-template
+        # The permissions boundary must not be an in-template
         # AWS::IAM::ManagedPolicy created per launch (that was the self-authorship
         # hole). Instead the InstanceRole references the pre-created shared
         # boundary via the PermissionsBoundaryArn parameter.
@@ -297,7 +297,7 @@ class TestTemplate:
         assert block and "{1,51}" in block.group(0), "StackTag AllowedPattern must cap at {1,51}"
         assert "{1,63}" not in block.group(0)
         # The CLI cap it mirrors:
-        assert ec2._TAG_RE.pattern == r"^[a-zA-Z0-9-]{1,51}$"
+        assert ec2._TAG_RE.pattern == r"^[a-zA-Z0-9-]{1,51}\Z"
 
     def test_bootstrap_verifies_kiro_cli_before_success(self):
         # The install step tolerates a nonzero exit; the template must then

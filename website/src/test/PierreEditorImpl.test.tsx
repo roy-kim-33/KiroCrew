@@ -68,6 +68,13 @@ const pierre = vi.hoisted(() => {
     FakeEditor,
     factory: { current: null as null | ((o: Record<string, unknown>) => FakeEditor) },
     surfaces: [] as { kind: 'file' | 'diff'; props: Record<string, unknown> }[],
+    poolState: {
+      current: { phase: 'ready', generation: 1, pool: {} } as {
+        phase: 'ready' | 'recovering' | 'starting' | 'cooldown' | 'unavailable'
+        generation: number
+        pool?: object
+      },
+    },
   }
 })
 
@@ -108,7 +115,20 @@ vi.mock('@pierre/diffs/react', async () => {
   }
 })
 
-import { PierreEditorImpl, type PierreEditorHandle } from '../pierre/PierreEditorImpl'
+vi.mock('../pierre/PierreImpl', async () => {
+  const { activeWorkerPool, contentCacheKey } = await vi.importActual<typeof import('../pierre/PierreImpl')>('../pierre/PierreImpl')
+  return {
+    activeWorkerPool,
+    contentCacheKey,
+    PierreShell: ({ children, generation }: { children?: ReactNode; generation: number }) => (
+      <div key={generation}>{children}</div>
+    ),
+    usePierreWorkerPool: () => pierre.poolState.current,
+    useRegisterEditorSurface: () => {},
+  }
+})
+
+import { PierreEditorImpl, type EditorMarker, type PierreEditorHandle } from '../pierre/PierreEditorImpl'
 import { contentCacheKey } from '../pierre/PierreImpl'
 
 const FILE: FileContents = {
@@ -172,6 +192,7 @@ beforeEach(() => {
   pierre.surfaces.length = 0
   pierre.editors.length = 0
   pierre.factory.current = null
+  pierre.poolState.current = { phase: 'ready', generation: 1, pool: {} }
   document.documentElement.removeAttribute('data-theme')
 })
 
@@ -181,8 +202,31 @@ describe('PierreEditorImpl surface selection', () => {
 
     expect(lastSurface().kind).toBe('file')
     expect(view.getByTestId('pierre-file')).toBeInTheDocument()
-    expect(lastSurface().props.file).toBe(FILE)
+    // The seam re-derives the cacheKey from live contents (Pierre's line-cache
+    // contract), so the surface carries the same name/contents with a
+    // content-derived key rather than the caller's raw object.
+    const rendered = lastSurface().props.file as FileContents
+    expect(rendered.name).toBe(FILE.name)
+    expect(rendered.contents).toBe(FILE.contents)
+    expect(rendered.cacheKey).toBe(contentCacheKey(FILE.name, FILE.contents))
     expect(lastSurface().props.edit).toBe(true)
+  })
+
+  it('degrades an oversized live diff to the same editable file surface', () => {
+    const contents = Array.from(
+      { length: 401 },
+      (_, i) => `export const generated${i} = ${i}`,
+    ).join('\n')
+    const oversized = { ...FILE, contents, cacheKey: 'a.ts:oversized' }
+    const { view } = mount({ file: oversized, diffBase: contents.replaceAll(' = ', ' = old') })
+
+    expect(lastSurface().kind).toBe('file')
+    expect(view.getByTestId('pierre-file')).toBeInTheDocument()
+    const degraded = lastSurface().props.file as FileContents
+    expect(degraded.contents).toBe(oversized.contents)
+    expect(degraded.cacheKey).toBe(contentCacheKey(oversized.name, oversized.contents))
+    expect(lastSurface().props.edit).toBe(true)
+    expect(lastSurface().props.editorOptions).toBeTruthy()
   })
 
   it('renders the live-diff surface with a null baseline for a brand-new file', () => {
@@ -193,7 +237,9 @@ describe('PierreEditorImpl surface selection', () => {
     expect(lastSurface().kind).toBe('diff')
     expect(view.getByTestId('pierre-diff')).toBeInTheDocument()
     expect(lastSurface().props.oldFile).toBeNull()
-    expect(lastSurface().props.newFile).toBe(FILE)
+    const newFile = lastSurface().props.newFile as FileContents
+    expect(newFile.contents).toBe(FILE.contents)
+    expect(newFile.cacheKey).toBe(contentCacheKey(FILE.name, FILE.contents))
   })
 
   it('keys the baseline on its own contents, not the filename', () => {
@@ -288,6 +334,205 @@ describe('PierreEditorImpl surface selection', () => {
     expect(pierre.surfaces.length).toBeGreaterThan(2)
     expect(lastSurface().props.editorOptions).toBe(first)
   })
+
+  it('keeps active Pierre file props stable for ref-backed callers', () => {
+    mount()
+    const surfaceCount = pierre.surfaces.length
+    const renderedFile = lastSurface().props.file
+    const editor = attachEditor()
+    const announceChange = editor.options.onChange as (file: FileContents) => void
+
+    act(() => announceChange({ ...FILE, contents: 'const localOnly = true\n' }))
+
+    expect(pierre.surfaces).toHaveLength(surfaceCount)
+    expect(lastSurface().props.file).toBe(renderedFile)
+  })
+})
+
+describe('PierreEditorImpl cacheKey contract', () => {
+  // Pierre's `isLineCacheForFile` trusts `file.cacheKey` alone and never
+  // re-reads `contents`, so a caller that keeps a STABLE key across keystrokes
+  // (to hold the editing session and caret) would leave a grown buffer reusing a
+  // stale N-row highlight array — `processFileResult` then indexes past it and
+  // throws "Line doesnt exist" on Return. The seam owns that contract so every
+  // caller (CodeEditor, PapyrusEditor, any future one) is correct at once.
+  const seedFile = (contents: string): FileContents => ({
+    name: 'main.tex',
+    contents,
+    cacheKey: 'papyrus:main.tex:0', // a FROZEN session key, as callers now hand
+  })
+
+  it('derives a content-tracking cacheKey when the buffer grows a line', () => {
+    const { rerender } = mount({ file: seedFile('a\nb\nc\n') })
+    const before = (lastSurface().props.file as FileContents).cacheKey
+
+    // The caller hands the SAME frozen session key but longer contents (a new
+    // line typed). The pre-fix seam passed that frozen key straight to Pierre.
+    rerender({ file: seedFile('a\nb\nc\nd\n') })
+    const after = (lastSurface().props.file as FileContents).cacheKey
+
+    expect(after).not.toBe(before)
+    expect(after).toBe(contentCacheKey('main.tex', 'a\nb\nc\nd\n'))
+  })
+
+  it('moves the cacheKey on an in-line edit that keeps the line count', () => {
+    const { rerender } = mount({ file: seedFile('a\nb\nc\n') })
+    const before = (lastSurface().props.file as FileContents).cacheKey
+
+    rerender({ file: seedFile('a\nbb\nc\n') })
+    expect((lastSurface().props.file as FileContents).cacheKey).not.toBe(before)
+  })
+
+  it('never hands Pierre the caller’s frozen session key', () => {
+    mount({ file: seedFile('a\nb\nc\n') })
+    // The frozen key defines the React remount identity / caret session; it must
+    // NOT be what Pierre keys its line cache on.
+    expect((lastSurface().props.file as FileContents).cacheKey).not.toBe('papyrus:main.tex:0')
+  })
+})
+
+
+  it('preserves the latest in-memory draft across worker recovery and later edits', () => {
+    const mounted = mount()
+    const editor = attachEditor()
+    const announceChange = editor.options.onChange as (file: FileContents) => void
+
+    act(() => announceChange({ ...FILE, contents: 'const unsaved = true\n' }))
+    pierre.poolState.current = { phase: 'recovering', generation: 1 }
+    mounted.rerender()
+    expect(mounted.view.container).toHaveTextContent('const unsaved = true')
+
+    pierre.poolState.current = { phase: 'ready', generation: 2, pool: {} }
+    mounted.rerender()
+    const remountedFile = lastSurface().props.file as FileContents
+    expect(remountedFile.contents).toBe('const unsaved = true\n')
+
+    // Typing in the replacement editor must not rewrite Pierre's `file` input
+    // on every keystroke (the buffer owns the text mid-edit, as on main) …
+    const replacement = attachEditor()
+    const announceReplacementChange = replacement.options.onChange as (file: FileContents) => void
+    act(() => announceReplacementChange({ ...FILE, contents: 'const afterRecovery = true\n' }))
+    mounted.rerender()
+    expect(lastSurface().props.file).toBe(remountedFile)
+
+    // … yet a second failure still carries those edits into the fallback and
+    // back into the next generation.
+    pierre.poolState.current = { phase: 'recovering', generation: 2 }
+    mounted.rerender()
+    expect(mounted.view.getByRole('textbox')).toHaveValue('const afterRecovery = true\n')
+    pierre.poolState.current = { phase: 'ready', generation: 3, pool: {} }
+    mounted.rerender()
+    expect((lastSurface().props.file as FileContents).contents).toBe('const afterRecovery = true\n')
+  })
+
+  it('renders Pierre on the main thread when the environment has no Worker API', () => {
+    pierre.poolState.current = { phase: 'unsupported', generation: 0 }
+    const mounted = mount()
+    expect(mounted.view.queryByRole('textbox')).toBeNull()
+    expect(mounted.view.queryByRole('alert')).toBeNull()
+    expect(lastSurface().kind).toBe('file')
+  })
+
+
+it('keeps the app-owned recovery editor editable without main-thread highlighting', () => {
+  const mounted = mount()
+  pierre.poolState.current = { phase: 'recovering', generation: 1 }
+  mounted.rerender()
+
+  const fallback = mounted.view.getByRole('textbox', { name: FILE.name })
+  fireEvent.change(fallback, { target: { value: 'const firstRecoveryEdit = true\n' } })
+  expect(fallback).toHaveValue('const firstRecoveryEdit = true\n')
+  fireEvent.change(fallback, { target: { value: 'const secondRecoveryEdit = true\n' } })
+  expect(fallback).toHaveValue('const secondRecoveryEdit = true\n')
+  expect(mounted.onChange).toHaveBeenLastCalledWith('const secondRecoveryEdit = true\n')
+
+  pierre.poolState.current = { phase: 'ready', generation: 2, pool: {} }
+  mounted.rerender()
+  expect((lastSurface().props.file as FileContents).contents).toBe('const secondRecoveryEdit = true\n')
+})
+it('keeps long recovery text vertically scrollable', () => {
+  const mounted = mount({ file: { ...FILE, contents: Array.from({ length: 200 }, (_, i) => `line ${i}`).join('\n') } })
+  pierre.poolState.current = { phase: 'recovering', generation: 1 }
+  mounted.rerender()
+
+  const fallback = mounted.view.container.querySelector('.pierre-editor-fallback')
+  expect(fallback).not.toBeNull()
+  expect(fallback?.className).toContain('h-full')
+  expect(fallback?.className).toContain('overflow-auto')
+})
+
+it('transfers focus through recovery and back to the replacement editor', () => {
+  const mounted = mount()
+  const surface = mounted.view.getByTestId('pierre-file')
+  surface.tabIndex = 0
+  surface.focus()
+  expect(surface).toHaveFocus()
+
+  pierre.poolState.current = { phase: 'recovering', generation: 1 }
+  mounted.rerender()
+  const fallback = mounted.view.getByRole('textbox', { name: FILE.name }) as HTMLTextAreaElement
+  expect(fallback).toHaveFocus()
+  fallback.setSelectionRange(6, 11, 'forward')
+
+  pierre.poolState.current = { phase: 'ready', generation: 2, pool: {} }
+  mounted.rerender()
+  const replacement = attachEditor()
+  expect(replacement.of('focus')).toHaveLength(1)
+  expect(replacement.of('setSelections')).toContainEqual({
+    method: 'setSelections',
+    args: [[{
+      start: { line: 0, character: 6 },
+      end: { line: 0, character: 11 },
+      direction: 'forward',
+    }]],
+  })
+})
+
+it('does not steal focus when the user leaves the recovery editor', () => {
+  const mounted = mount()
+  const surface = mounted.view.getByTestId('pierre-file')
+  surface.tabIndex = 0
+  surface.focus()
+
+  pierre.poolState.current = { phase: 'recovering', generation: 1 }
+  mounted.rerender()
+  expect(mounted.view.getByRole('textbox', { name: FILE.name })).toHaveFocus()
+
+  const other = document.createElement('button')
+  document.body.append(other)
+  other.focus()
+  expect(other).toHaveFocus()
+
+  pierre.poolState.current = { phase: 'ready', generation: 2, pool: {} }
+  mounted.rerender()
+  const replacement = attachEditor()
+  expect(replacement.of('focus')).toHaveLength(0)
+  other.remove()
+})
+
+it('explains temporary recovery and terminal reload guidance in the UI', () => {
+  const mounted = mount()
+  pierre.poolState.current = { phase: 'recovering', generation: 1 }
+  mounted.rerender()
+  // Recovery originates in a worker failure, so it goes through ErrorNotice
+  // (errors-use-error-notice); only the cold start is a quiet status line.
+  expect(mounted.view.queryByRole('status')).toBeNull()
+  expect(mounted.view.getByRole('alert')).toHaveTextContent('Syntax highlighting is restarting. Editing remains available.')
+
+  pierre.poolState.current = { phase: 'unavailable', generation: 2 }
+  mounted.rerender()
+  expect(mounted.view.getByRole('alert')).toHaveTextContent('Syntax highlighting is unavailable. Save or copy your draft, then reload to restore syntax highlighting; editing remains available.')
+  expect(mounted.view.queryByRole('button', { name: 'Reload' })).toBeNull()
+  expect(mounted.view.queryByRole('button', { name: 'Ask the agent' })).toBeNull()
+})
+
+it('mounts Pierre optimistically while the first generation initializes', () => {
+  pierre.poolState.current = { phase: 'starting', generation: 1, pool: {} }
+  const mounted = mount()
+
+  expect(mounted.view.getByTestId('pierre-file')).toBeInTheDocument()
+  expect(mounted.view.queryByRole('status')).toBeNull()
+  expect(mounted.view.queryByRole('textbox', { name: FILE.name })).toBeNull()
 })
 
 describe('PierreEditorImpl marker mapping', () => {
@@ -337,6 +582,50 @@ describe('PierreEditorImpl marker mapping', () => {
     expect(sent[1].args[0]).toEqual([])
   })
 
+
+
+  it('applies diagnostics when a cold-starting pool first becomes ready', () => {
+    const markers: EditorMarker[] = [{ severity: 'warning', message: 'cold start', line: 1 }]
+    pierre.poolState.current = { phase: 'starting', generation: 1 }
+    const mounted = mount({ markers })
+    expect(mounted.view.container.textContent).toContain(FILE.contents.trim())
+    expect(mounted.view.getByRole('status')).toHaveTextContent('Syntax highlighting is starting. Editing remains available.')
+
+    pierre.poolState.current = { phase: 'ready', generation: 1, pool: {} }
+    mounted.rerender()
+    const editor = attachEditor()
+    expect(editor.of('setMarkers')).toHaveLength(1)
+    expect(editor.of('setMarkers')[0].args[0]).toEqual([
+      {
+        severity: 'warning',
+        message: 'cold start',
+        start: { line: 0, character: 0 },
+        end: { line: 0, character: Number.MAX_SAFE_INTEGER },
+      },
+    ])
+  })
+  it('reapplies unchanged diagnostics after the worker generation remounts', () => {
+    const markers: EditorMarker[] = [{ severity: 'error', message: 'still broken', line: 2 }]
+    const mounted = mount({ markers })
+    const firstEditor = attachEditor()
+
+    pierre.poolState.current = { phase: 'recovering', generation: 1 }
+    mounted.rerender()
+    pierre.poolState.current = { phase: 'ready', generation: 2, pool: {} }
+    mounted.rerender()
+    const replacementEditor = attachEditor()
+
+    expect(replacementEditor).not.toBe(firstEditor)
+    expect(replacementEditor.of('setMarkers')).toHaveLength(1)
+    expect(replacementEditor.of('setMarkers')[0].args[0]).toEqual([
+      {
+        severity: 'error',
+        message: 'still broken',
+        start: { line: 1, character: 0 },
+        end: { line: 1, character: Number.MAX_SAFE_INTEGER },
+      },
+    ])
+  })
   it('never touches the marker gutter while the prop is absent', () => {
     // A surface with no diagnostics contract must not wipe markers some other
     // owner set; `undefined` and `[]` are different requests.

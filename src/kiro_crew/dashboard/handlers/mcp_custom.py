@@ -281,8 +281,8 @@ def _load_kirocrew_config_strict() -> dict | None:
     is malformed or unreadable.  The batch-add path must refuse to write
     in the None case: the lenient ``_load_json_or_empty`` coerces a broken
     file to ``{}``, and the subsequent atomic write would then silently
-    replace EVERY previously configured server with just the new batch
-    while reporting success.
+    replace EVERY configured server with just the new batch while reporting
+    success.
     """
     try:
         text = _mcp._kirocrew_mcp_json().read_text(encoding="utf-8")
@@ -319,6 +319,15 @@ async def api_mcp_custom_add(request: web.Request) -> web.Response:
     Validates EVERY entry before writing ANY (no partial adds), and
     refuses to clobber existing servers (409 listing the conflicts).
     """
+    # Body-scope import, like the sibling gates in this package
+    # (``connections.py``, ``mcp_apps.py``, ``files.py``): ``source_providers``
+    # reaches back into sibling handler modules, so importing the helper at
+    # module scope from here would close a cycle.
+    from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+
+    denied = await require_owner_dashboard_request(request, "mcp_custom_add")
+    if denied is not None:
+        return denied
     try:
         body = await request.json()
     except Exception:
@@ -353,7 +362,7 @@ async def api_mcp_custom_add(request: web.Request) -> web.Response:
     async with _get_mcp_lock():
         # Load once, strictly: a malformed existing file must fail the
         # request, never be coerced to {} and overwritten (that would
-        # destroy every previously configured server "successfully").
+        # destroy every configured server "successfully").
         data = _load_kirocrew_config_strict()
         if data is None:
             sel().log_api_access(
@@ -457,6 +466,15 @@ async def api_mcp_custom_update(request: web.Request) -> web.Response:
     for management on a shared surface.  A FRESH add carries no tolerated
     keys, so a pasted block naming it is still rejected outright.
     """
+    # Body-scope import, like the sibling gates in this package
+    # (``connections.py``, ``mcp_apps.py``, ``files.py``): ``source_providers``
+    # reaches back into sibling handler modules, so importing the helper at
+    # module scope from here would close a cycle.
+    from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+
+    denied = await require_owner_dashboard_request(request, "mcp_custom_update")
+    if denied is not None:
+        return denied
     name = request.match_info.get("name", "")
     if not _is_valid_mcp_name(name):
         return web.json_response({"error": f"invalid server name '{name[:64]}'"}, status=400)

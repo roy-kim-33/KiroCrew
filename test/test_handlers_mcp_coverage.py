@@ -26,7 +26,9 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from aiohttp import web
 from body_stream_helpers import BodyStreamPayload
+from dashboard_owner_helpers import owner_claims
 
+from conftest import host_abs
 from kiro_crew.dashboard.handlers import mcp as mcp_mod
 from kiro_crew.mcp_discovery import McpServerInfo
 
@@ -61,12 +63,21 @@ def _request(
     req.query = query or {}
     req.match_info = match_info or {}
     req.method = method
-    req.get = lambda key, default=None: default
-    return req
+    # Every mutating handler in handlers/mcp.py is owner-gated
+    # (``handlers._shared.require_owner_dashboard_request``), so the double has to
+    # carry the claims the token-auth middleware publishes or each test lands on
+    # the gate instead of its own subject.
+    return owner_claims(req)
 
 
 class _State:
-    """Stand-in for DashboardState's background-task registry."""
+    """Stand-in for DashboardState's background-task registry.
+
+    ``owner_id`` is ``""`` -- the standalone-local shape, where the owner gate on
+    these routes accepts the signed local bootstrap subject ``owner_claims`` sets.
+    """
+
+    owner_id = ""
 
     def __init__(self) -> None:
         self._background_tasks: set[asyncio.Task] = set()
@@ -75,7 +86,7 @@ class _State:
 def _effective_stubs(section: dict[str, Any]) -> list[str]:
     """The stub set IN EFFECT for a saved ``mcp_gateway`` section.
 
-    The toggle handler no longer rewrites ``stub_servers``: that key is the roster
+    The toggle handler does not rewrite ``stub_servers``: that key is the roster
     a distribution ships and keeps growing, and a click is recorded as a decision
     in ``stub_overrides`` over it. What the operator sees stubbed is the two
     resolved together, so that -- not either key alone -- is what a test about
@@ -683,10 +694,14 @@ class TestServerDetail:
         registered PATH fragment must be emitted complete. See env.emit_env."""
         import os
 
-        monkeypatch.setenv("PATH", "/usr/bin")
+        # Spelled for the host (conftest.host_abs): declared entries pass through
+        # the ``os.path.isabs`` filter in env._spec_path_entries, and from Python
+        # 3.13 a bare ``/opt/shims`` is not absolute under ntpath (no drive).
+        shims, usr_bin = host_abs("opt", "shims"), host_abs("usr", "bin")
+        monkeypatch.setenv("PATH", usr_bin)
         resp = await mcp_mod.api_mcp_server_detail(
             _request(
-                {"command": "node", "env": {"PATH": "/opt/shims", "K": "v"}},
+                {"command": "node", "env": {"PATH": shims, "K": "v"}},
                 match_info={"name": "srv"},
                 method="PUT",
             )
@@ -694,8 +709,8 @@ class TestServerDetail:
         assert resp.status == 200
         written = _read_global(sandbox)["srv"]["env"]
         entries = written["PATH"].split(os.pathsep)
-        assert entries[0] == "/opt/shims", "caller-authored entries stay first"
-        assert "/usr/bin" in entries, "inherited PATH must survive the override"
+        assert entries[0] == shims, "caller-authored entries stay first"
+        assert usr_bin in entries, "inherited PATH must survive the override"
         assert written["K"] == "v"
 
 
@@ -1113,7 +1128,7 @@ class TestFreezeStubServersOrdering:
         mcp_mod._freeze_stub_servers(section)
         assert section["stub_servers"] == ["x-mcp"]
 
-        # After the freeze, `enabled` no longer speaks for the stub set at all.
+        # After the freeze, `enabled` does not speak for the stub set at all.
         section["enabled"] = False
         mcp_mod._freeze_stub_servers(section)
         assert section["stub_servers"] == ["x-mcp"]

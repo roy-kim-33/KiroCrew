@@ -45,7 +45,7 @@ class TestCronExprMatching:
         assert not cron_expr_matches("*/5 * * * *", dt2)
 
     def test_range(self) -> None:
-        # 2026-02-16 is Monday, 2026-02-15 is Sunday
+        # Feb 16 is Monday, Feb 15 is Sunday
         dt_mon = datetime(2026, 2, 16, 9, 0, tzinfo=timezone.utc)  # Monday
         assert cron_expr_matches("0 9 * * 1-5", dt_mon)  # cron: 1=Mon..5=Fri
         dt_sun = datetime(2026, 2, 15, 9, 0, tzinfo=timezone.utc)  # Sunday
@@ -282,7 +282,7 @@ class TestCronService:
 
     @staticmethod
     def _keeper_record() -> dict:
-        """One real, loadable job record, used to prove survival on disk."""
+        """One real, loadable job record that proves survival on disk."""
         return {
             "id": "j-keep",
             "name": "keep-me",
@@ -871,10 +871,9 @@ class TestJobCompletionRearmsTimer:
     async def test_completed_job_replaces_a_longer_sleeping_timer_task(
         self, tmp_path: Path
     ) -> None:
-        """Regression for the reported bug: before this fix, nothing called
-        _arm_timer() on job completion, so a job that became due again
-        sooner than the CURRENTLY armed (long) sleep had to wait out that
-        stale wake -- up to _TIMER_POLL_SECS late. Simulates that exact
+        """_arm_timer() must run on job completion, or a job that becomes due
+        again sooner than the CURRENTLY armed (long) sleep waits out that stale
+        wake -- up to _TIMER_POLL_SECS late. Simulates that exact
         situation: a timer task already sleeping for a long time is armed
         when the job finishes; completion must cancel it and arm a fresh,
         shorter one instead of leaving the stale one in place."""
@@ -906,6 +905,152 @@ class TestJobCompletionRearmsTimer:
         svc._timer_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await svc._timer_task
+
+
+class TestRunJobIsolatedPreambleFailure:
+    """A run that dies BEFORE its try/finally must still release its markers.
+
+    The timer path adds the job to ``_executing`` and stores the task in
+    ``_running_tasks`` with no awaiter, so the only cleanup those two ever get
+    is ``_run_job_isolated``'s own ``finally``. Bookkeeping claimed ahead of the
+    ``try`` -- the start stamps, the fire counter, the jitter -- is outside that
+    protection: an exception there leaves both maps populated, the due-scan
+    skips the job and the manual-run endpoint refuses it with 409 "job is
+    already running", until the reaper sweep, the run route or ``cancel()``
+    meets the finished task and drops the leftovers. The run itself must not
+    leave them.
+    """
+
+    @pytest.mark.asyncio
+    async def test_preamble_failure_releases_the_running_markers(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        svc = CronService(base_dir=tmp_path)
+        job = CronJob(
+            id="j1", name="watch", message="go",
+            schedule=CronSchedule(kind="every", every_secs=60),
+        )
+        svc._jobs = [job]
+        svc._save()
+
+        def _boom(*_args: object, **_kwargs: object) -> None:
+            raise RuntimeError("fire counter raised ahead of the try")
+
+        # The fire counter is the first call in the preamble that leaves the
+        # module; make it raise so the run ends before its try is entered.
+        monkeypatch.setattr("kiro_crew.cron.emit_counter", _boom)
+
+        # Exactly what _on_timer leaves for the task: the claim, then no awaiter.
+        svc._executing.add(job.id)
+        svc._job_run_meta[job.id] = (time.time(), "scheduled")
+        task = asyncio.create_task(svc._run_job_isolated(job))
+        svc._running_tasks[job.id] = task
+        with pytest.raises(RuntimeError, match="fire counter raised ahead of the try"):
+            await task
+
+        assert job.id not in svc._executing, (
+            "a run that raised in its preamble left the job in _executing; "
+            "every manual run of it is now refused with 409"
+        )
+        assert job.id not in svc._running_tasks, (
+            "a run that raised in its preamble left its finished task in _running_tasks"
+        )
+        assert job.id not in svc._job_start_times
+        assert job.id not in svc._job_start_monotonic
+        assert job.id not in svc._job_jitter
+        assert job.id not in svc._job_run_meta
+
+    @pytest.mark.asyncio
+    async def test_fire_counter_still_counts_once_before_the_jitter_sleep(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Moving the preamble under the try must not move the counter: one
+        emit per execution, before the jitter sleep, with the same attrs."""
+        svc = CronService(base_dir=tmp_path)
+        job = CronJob(
+            id="j1", name="watch", message="go",
+            schedule=CronSchedule(kind="every", every_secs=60),
+        )
+        svc._jobs = [job]
+        svc._save()
+        emitted: list[tuple[str, dict[str, object]]] = []
+        order: list[str] = []
+        monkeypatch.setattr(
+            "kiro_crew.cron.emit_counter",
+            lambda name, attrs: (emitted.append((name, dict(attrs))), order.append("counter")),
+        )
+        monkeypatch.setattr(svc, "_compute_jitter", lambda _job: (order.append("jitter"), 0.0)[1])
+
+        svc._job_run_meta[job.id] = (time.time(), "scheduled")
+        with patch.object(svc, "_execute_with_timeout", return_value=None):
+            await svc._run_job_isolated(job)
+
+        assert emitted == [("kirocrew.cron.fires", {"kind": "agent", "trigger": "scheduled"})]
+        assert order == ["counter", "jitter"]
+
+
+class TestCancelAgainstFinishedTask:
+    """``cancel()`` must not act on a run whose task has already finished.
+
+    ``cancel()`` gates on ``_executing`` alone, the marker a finished task can
+    leave standing. Trusting it against a ``done()`` task kills nothing, answers
+    True, writes a "Cancelled by user after Ns" history row for a run that
+    ended long ago, and -- because only the runner's ``finally`` discards
+    ``_cancelled_jobs``, and that ``finally`` never runs for the finished task
+    -- leaves that marker set, so the job's NEXT real run is treated as
+    cancelled: its result is neither merged to the store nor recorded. The
+    guard must ask ``discard_finished_run`` first, release the leftovers, and
+    answer "not running" honestly.
+    """
+
+    @pytest.mark.asyncio
+    async def test_cancel_against_a_finished_task_releases_it_and_answers_not_running(
+        self, tmp_path: Path
+    ) -> None:
+        svc = CronService(base_dir=tmp_path)
+        job = CronJob(
+            id="j1", name="watch", message="go",
+            schedule=CronSchedule(kind="every", every_secs=60),
+        )
+        job.last_status = "ok"
+        svc._jobs = [job]
+        svc._save()
+
+        async def _died_before_cleanup() -> None:
+            raise RuntimeError("run ended without reaching its finally")
+
+        # What a run leaves behind when its task ends ahead of the try/finally.
+        stale = asyncio.get_running_loop().create_task(_died_before_cleanup())
+        await asyncio.gather(stale, return_exceptions=True)
+        assert stale.done()
+        svc._running_tasks[job.id] = stale
+        svc._executing.add(job.id)
+        svc._job_start_times[job.id] = time.time() - 3600
+        svc._job_start_monotonic[job.id] = time.monotonic() - 3600
+        svc._job_jitter[job.id] = 0.0
+        svc._job_run_meta[job.id] = (time.time() - 3600, "scheduled")
+
+        with patch("kiro_crew.sel.sel"):
+            cancelled = await svc.cancel(job.id)
+
+        assert job.id not in svc._cancelled_jobs, (
+            "cancel() against a finished task left _cancelled_jobs set; the job's "
+            "next real run will be treated as cancelled and its result dropped"
+        )
+        assert cancelled is False, "cancel() reported a cancellation with nothing running"
+        # The leftovers are released, so the next Run and the next due-scan see
+        # the job idle...
+        assert job.id not in svc._executing
+        assert job.id not in svc._running_tasks
+        assert job.id not in svc._job_start_times
+        assert job.id not in svc._job_start_monotonic
+        assert job.id not in svc._job_jitter
+        assert job.id not in svc._job_run_meta
+        # ...and nothing was recorded for a run that had already ended.
+        runs, total = await svc._history.get_job_history(job.id)
+        assert total == 0, f"a cancellation was recorded for a finished run: {runs}"
+        assert job.last_status == "ok"
+        assert not job.last_error
 
 
 class TestArmTimerDuringOnTimer:
@@ -1035,22 +1180,32 @@ class TestFormatSchedule:
         assert "PDT" in result or "PST" in result
         assert "3:00 AM" in result
 
-    def test_every_secs(self) -> None:
+    @pytest.mark.parametrize(
+        ("every_secs", "expected"),
+        [
+            (60, "every 1m"),
+            (90, "every 90s"),
+            (300, "every 5m"),
+            (3599, "every 3599s"),
+            (3600, "every 1h"),
+            (3601, "every 3601s"),
+            (3660, "every 61m"),
+            (5400, "every 90m"),
+            (5401, "every 5401s"),
+            (7200, "every 2h"),
+            (9000, "every 150m"),
+        ],
+    )
+    def test_every_preserves_interval(self, every_secs: int, expected: str) -> None:
         from kiro_crew.cron import CronSchedule, format_schedule
 
-        s = CronSchedule(kind="every", every_secs=300)
-        assert format_schedule(s) == "every 300s"
-
-    def test_every_hours(self) -> None:
-        from kiro_crew.cron import CronSchedule, format_schedule
-
-        s = CronSchedule(kind="every", every_secs=7200)
-        assert format_schedule(s) == "every 2h"
+        s = CronSchedule(kind="every", every_secs=every_secs)
+        assert format_schedule(s) == expected
 
     def test_at_timestamp_today(self, monkeypatch, _utc_tz) -> None:
         from kiro_crew.cron import CronSchedule, format_schedule
 
-        # Mock "now" to 2026-04-10, job at 3PM same day
+        # Mock "now" to Apr 10, job at 3PM same day
         fake_now = datetime(2026, 4, 10, 12, 0, tzinfo=timezone.utc)
         # Mock only covers now() and fromtimestamp() — extend if format_schedule evolves.
         monkeypatch.setattr("kiro_crew.cron.datetime", type("D", (datetime,), {
@@ -1065,7 +1220,7 @@ class TestFormatSchedule:
     def test_at_timestamp_future_date(self, monkeypatch, _utc_tz) -> None:
         from kiro_crew.cron import CronSchedule, format_schedule
 
-        # Mock "now" to 2026-04-10, job on Apr 17
+        # Mock "now" to Apr 10, job on Apr 17
         fake_now = datetime(2026, 4, 10, 12, 0, tzinfo=timezone.utc)
         # Mock only covers now() and fromtimestamp() — extend if format_schedule evolves.
         monkeypatch.setattr("kiro_crew.cron.datetime", type("D", (datetime,), {
@@ -1425,7 +1580,7 @@ class TestTimezoneScheduling:
     def test_is_due_spring_forward_skipped_hour(self) -> None:
         """During spring forward, a job targeting the skipped hour still fires.
 
-        2025-03-09: Toronto clocks jump 2:00 AM EST -> 3:00 AM EDT at 07:00 UTC,
+        On the spring-forward day, Toronto clocks jump 2:00 AM EST -> 3:00 AM EDT at 07:00 UTC,
         so the wall-clock 2:30 AM never occurs. The invariant we care about is
         that the daily job is NOT silently lost for the day: it still fires, in
         the resumed hour, and never before the jump. We assert that invariant
