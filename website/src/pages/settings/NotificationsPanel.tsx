@@ -1,17 +1,29 @@
 import { useEffect, useState } from 'react'
-import { Lock, MonitorCog, Blocks } from 'lucide-react'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { Lock, MonitorCog, Blocks, Check } from 'lucide-react'
 import { SettingsSection, SettingsCard, SettingsToggle, SettingsSelect } from '../../components/settings'
 import { Select, SelectTrigger, SelectValue, SelectContent, SelectItem } from '../../components/ui/select'
 import { Toggle } from '../../components/ui'
+import ErrorNotice from '../../components/ErrorNotice'
 import { api } from '../../api/client'
 import type { NotificationChannel } from '../../types'
 import {
-  SOUND_PRESETS, type SoundPreset, type SoundCategory,
-  loadSoundSettings, saveSoundSettings, playPreset,
+  SOUND_PRESETS, type SoundPreset, type SoundCategory, type SoundSettings,
+  loadSoundSettings, saveSoundSettings, playPreset, presetForKind,
 } from '../../hooks/useNotificationSound'
+import { loadChatCompleteNotify, saveChatCompleteNotify } from '../../hooks/chatCompleteNotify'
+import { loadBannerEnabled, saveBannerEnabled } from '../../hooks/notificationBanner'
+import { useNotificationPermission } from '../../hooks/useNotificationPermission'
 
 import { i18nT } from '../../i18n/t'
 const PRESET_OPTIONS: SoundPreset[] = ['none', ...SOUND_PRESETS]
+
+/** localStorage key the sound settings persist under. Mirrors the private
+ *  `STORAGE_KEY` in useNotificationSound.ts; kept as a local literal because
+ *  the hook module does not export it and this change is scoped to this file.
+ *  Used only to FILTER cross-window `storage` events — the actual read goes
+ *  through `loadSoundSettings()` so validation/clamping is reused. */
+const SOUND_STORAGE_KEY = 'mc-notification-sound'
 
 /**
  * Catalog KEY for each sound preset's display label.
@@ -105,38 +117,55 @@ function channelLabel(c: NotificationChannel): string {
   return c.channel.startsWith(`${c.source}.`) ? c.channel.slice(c.source.length + 1) : c.channel
 }
 
+type ChannelsData = { channels?: NotificationChannel[] }
+type ChannelPatch = { muted?: boolean; priority?: string | null }
+const CHANNELS_KEY = ['notification-channels'] as const
+
 /** Per-channel notification settings: mute + priority override,
  *  grouped by source (System first, then apps). Protected channels render
  *  locked. Channels with stored settings but no live registration (app
  *  disabled) stay visible so mutes remain editable. */
 function ChannelsSection() {
-  const [channels, setChannels] = useState<NotificationChannel[] | null>(null)
-  const [error, setError] = useState<string | null>(null)
+  const qc = useQueryClient()
+  const channelsQuery = useQuery<ChannelsData>({
+    queryKey: CHANNELS_KEY,
+    queryFn: api.notificationChannels,
+  })
+  const channels = channelsQuery.data?.channels
 
-  useEffect(() => {
-    let cancelled = false
-    api.notificationChannels()
-      .then((d: { channels?: NotificationChannel[] }) => { if (!cancelled) setChannels(d.channels || []) })
-      .catch(() => { if (!cancelled) setError(i18nT('pages.settings.notificationsPanel.failed_to_load_channels')) })
-    return () => { cancelled = true }
-  }, [])
+  const patchMut = useMutation({
+    mutationFn: ({ channel, settings }: { channel: string; settings: ChannelPatch }) =>
+      api.updateNotificationChannelSettings(channel, settings),
+    // Optimistic update; the PUT is authoritative — a failure rolls the cache
+    // back to the snapshot and the refetch below re-syncs with the server.
+    onMutate: ({ channel, settings }) => {
+      const snap = qc.getQueryData<ChannelsData>(CHANNELS_KEY)
+      qc.setQueryData<ChannelsData>(CHANNELS_KEY, prev => prev && {
+        ...prev,
+        channels: prev.channels?.map(c => {
+          if (c.channel !== channel) return c
+          const next = { ...c.settings }
+          if (settings.muted !== undefined) { if (settings.muted) next.muted = true; else delete next.muted }
+          if ('priority' in settings) { if (settings.priority) next.priority = settings.priority; else delete next.priority }
+          return { ...c, settings: next }
+        }),
+      })
+      return { snap }
+    },
+    onError: (_err, _vars, ctx) => { if (ctx?.snap) qc.setQueryData(CHANNELS_KEY, ctx.snap) },
+    onSettled: () => qc.invalidateQueries({ queryKey: CHANNELS_KEY }),
+  })
+  const patch = (channel: string, settings: ChannelPatch) => patchMut.mutate({ channel, settings })
 
-  const patch = (channel: string, settings: { muted?: boolean; priority?: string | null }) => {
-    // Optimistic update; the PUT is authoritative and a failure reloads.
-    setChannels(prev => prev?.map(c => {
-      if (c.channel !== channel) return c
-      const next = { ...c.settings }
-      if (settings.muted !== undefined) { if (settings.muted) next.muted = true; else delete next.muted }
-      if ('priority' in settings) { if (settings.priority) next.priority = settings.priority; else delete next.priority }
-      return { ...c, settings: next }
-    }) ?? null)
-    api.updateNotificationChannelSettings(channel, settings).catch(() => {
-      api.notificationChannels().then((d: { channels?: NotificationChannel[] }) => setChannels(d.channels || [])).catch(() => {})
-    })
+  if (channelsQuery.isError) {
+    return (
+      <SettingsSection title={i18nT('pages.settings.notificationsPanel.sources')}>
+        {/* askAgent on: a failed list load — the page holds no draft. */}
+        <ErrorNotice message={i18nT('pages.settings.notificationsPanel.failed_to_load_channels')} askAgent />
+      </SettingsSection>
+    )
   }
-
-  if (error) return <SettingsSection title={i18nT('pages.settings.notificationsPanel.sources')}><div className="text-[12px] text-muted">{error}</div></SettingsSection>
-  if (channels === null || channels.length === 0) return null
+  if (channels === undefined || channels.length === 0) return null
 
   const sources = Array.from(new Set(channels.map(c => c.source)))
     .sort((a, b) => (a === 'system' ? -1 : b === 'system' ? 1 : a.localeCompare(b)))
@@ -144,6 +173,16 @@ function ChannelsSection() {
   return (
     <SettingsSection title={i18nT('pages.settings.notificationsPanel.sources')}>
       <div className="text-[12px] text-muted -mt-1 mb-2" data-setting-label={i18nT('pages.settings.notificationsPanel.sources')}>{i18nT('pages.settings.notificationsPanel.mute_notification_sources_or_override_their_prio')}</div>
+      {/* askAgent on: mute/priority are toggle-only and the optimistic value was
+          already rolled back to the persisted one, so nothing is left to lose. */}
+      {patchMut.isError && (
+        <ErrorNotice
+          className="mb-2"
+          message={i18nT('pages.settings.notificationsPanel.failed_to_save_channel_setting')}
+          onDismiss={() => patchMut.reset()}
+          askAgent
+        />
+      )}
       {sources.map((source, i) => (
         <SettingsCard key={source} index={i}>
           <div className="flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-[.05em] text-muted pb-1 border-b border-border">
@@ -210,23 +249,102 @@ function ChannelsSection() {
   )
 }
 
+/**
+ * The OS-notification permission as one settings row. Three states, one
+ * action: `default` offers the button (the click is the browser's required
+ * user gesture), `granted` confirms, `denied` says where the browser keeps the
+ * switch — this page cannot flip it, so it offers no button that would fail.
+ * Unmounted entirely where the platform has no `Notification` at all, and in
+ * an embedded instance pane, whose banners the hub window posts on its behalf
+ * (`readNotificationPermission` reports `unsupported` there).
+ */
+function SystemNotificationsRow() {
+  const { permission, request } = useNotificationPermission()
+  if (permission === 'unsupported') return null
+  const label = i18nT('pages.settings.notificationsPanel.system_notifications')
+  return (
+    <div data-setting-label={label} data-testid="system-notifications-row" className="flex items-center justify-between gap-4 py-1.5">
+      <div className="flex-1 min-w-0">
+        <div className="text-[13px] font-semibold text-text">{label}</div>
+        <div className="text-[12px] text-muted mt-0.5">
+          {permission === 'denied'
+            ? i18nT('pages.settings.notificationsPanel.system_notifications_blocked')
+            : i18nT('pages.settings.notificationsPanel.system_notifications_description')}
+        </div>
+      </div>
+      {permission === 'granted' && (
+        <span className="flex items-center gap-1 text-[12px] text-muted shrink-0"><Check className="lucide-inline text-ok" /> {i18nT('pages.settings.notificationsPanel.system_notifications_allowed')}</span>
+      )}
+      {permission === 'default' && (
+        <button type="button" className={TEST_BTN_CLASS} onClick={() => { void request() }}>
+          {i18nT('pages.settings.notificationsPanel.allow_system_notifications')}
+        </button>
+      )}
+    </div>
+  )
+}
+
 export function NotificationsPanel() {
   const [settings, setSettings] = useState(() => loadSoundSettings())
+  const [notifyChatComplete, setNotifyChatComplete] = useState(() => loadChatCompleteNotify())
+  const [bannerEnabled, setBannerEnabled] = useState(() => loadBannerEnabled())
 
-  const update = (partial: Partial<typeof settings>) => {
-    const next = { ...settings, ...partial }
-    setSettings(next)
-    saveSoundSettings(next)
+  // Cross-window sync: a settings write in ANOTHER tab (or the running session's
+  // own useNotificationSound reacting to one) fires a DOM `storage` event here.
+  // The same-window MC_SOUND_SETTINGS_CHANGED_EVENT never crosses tabs, so this
+  // is the only way an open panel learns another window changed the sound
+  // config. Reload through loadSoundSettings() (reusing its validation/clamping
+  // and its adopt-DEFAULTS-on-clear behaviour where e.newValue is null) rather
+  // than parsing e.newValue by hand.
+  useEffect(() => {
+    const onStorage = (e: StorageEvent) => {
+      // Ignore writes to a different storageArea (e.g. sessionStorage in a
+      // same-origin iframe). Guarded because a locked-down storageArea getter
+      // can throw; on that failure fall through to the key filter alone.
+      try {
+        if (e.storageArea && e.storageArea !== localStorage) return
+      } catch {
+        /* locked-down storage: fall through to the key filter alone */
+      }
+      // key === null is a whole-store clear() and must be honoured; otherwise
+      // only our key matters.
+      if (e.key !== null && e.key !== SOUND_STORAGE_KEY) return
+      setSettings(loadSoundSettings())
+    }
+    window.addEventListener('storage', onStorage)
+    return () => window.removeEventListener('storage', onStorage)
+  }, [])
+
+  // Every write derives its next value from a FRESH persisted snapshot, not from
+  // the `settings` React state, which can be stale relative to localStorage: a
+  // cross-window write or the mutator function may have advanced a field the
+  // panel's last render never saw. Merging `partial` onto the freshly loaded
+  // snapshot means a local edit to one field can never silently clobber a newer
+  // persisted value in another field.
+  const applyUpdate = (mutate: (current: SoundSettings) => SoundSettings): void => {
+    const next = mutate(loadSoundSettings())
+    // Persist first; adopt into local state only if the write landed. On a
+    // quota-dropped save, saveSoundSettings returns false and does NOT fire the
+    // settings-changed event — so we keep the previous local state, leaving the
+    // UI showing the persisted truth rather than a value that vanishes on
+    // reload.
+    if (saveSoundSettings(next)) setSettings(next)
+  }
+
+  const update = (partial: Partial<SoundSettings>) => {
+    applyUpdate(current => ({ ...current, ...partial }))
   }
 
   const setCategoryPreset = (cat: SoundCategory, preset: SoundPreset) => {
-    update({ perCategory: { ...settings.perCategory, [cat]: preset } })
+    applyUpdate(current => ({ ...current, perCategory: { ...current.perCategory, [cat]: preset } }))
   }
 
   const clearCategoryOverride = (cat: SoundCategory) => {
-    const { [cat]: _drop, ...rest } = settings.perCategory
-    void _drop
-    update({ perCategory: rest })
+    applyUpdate(current => {
+      const { [cat]: _drop, ...rest } = current.perCategory
+      void _drop
+      return { ...current, perCategory: rest }
+    })
   }
 
   const fallback = settings.perCategory.all ?? 'chime'
@@ -240,8 +358,32 @@ export function NotificationsPanel() {
           relative to element mount, so the static cards would wait
           sources.length steps on nothing while the fetch is still in flight. */}
       <ChannelsSection />
-      <SettingsSection title={i18nT('pages.settings.notificationsPanel.sound')}>
+      <SettingsSection title={i18nT('pages.settings.notificationsPanel.desktop_alerts')}>
         <SettingsCard>
+          <SystemNotificationsRow />
+          {/* Adopted into local state only when the write lands, so the switch
+              never shows a value that vanishes on reload. */}
+          <SettingsToggle
+            label={i18nT('pages.settings.notificationsPanel.show_banner_for_new_notifications')}
+            description={i18nT('pages.settings.notificationsPanel.show_banner_for_new_notifications_description')}
+            checked={bannerEnabled}
+            onChange={v => { if (saveBannerEnabled(v)) setBannerEnabled(v) }}
+          />
+          {/* Writing through `saveChatCompleteNotify` rather than `safeSetItem`
+              is what makes the toggle work at all: enabling it is a user
+              gesture the OS permission prompt accepts, alongside the explicit
+              "Allow" row above. */}
+          <SettingsToggle
+            label={i18nT('pages.settings.notificationsPanel.notify_when_a_background_chat_finishes')}
+            description={i18nT('pages.settings.notificationsPanel.notify_when_a_background_chat_finishes_description')}
+            checked={notifyChatComplete}
+            onChange={v => { setNotifyChatComplete(v); saveChatCompleteNotify(v) }}
+          />
+        </SettingsCard>
+      </SettingsSection>
+
+      <SettingsSection title={i18nT('pages.settings.notificationsPanel.sound')}>
+        <SettingsCard index={1}>
           <SettingsToggle
             label={i18nT('pages.settings.notificationsPanel.play_sound_on_new_notifications')}
             checked={settings.enabled}
@@ -289,12 +431,17 @@ export function NotificationsPanel() {
       </SettingsSection>
 
       <SettingsSection title={i18nT('pages.settings.notificationsPanel.per_category_sounds')}>
-        <SettingsCard index={1}>
+        <SettingsCard index={2}>
           {CATEGORY_ROWS.map(cat => {
             const hasOverride = cat !== 'all' && settings.perCategory[cat] !== undefined
+            // Preview EXACTLY what runtime would play: presetForKind applies the
+            // built-in category default (approval -> pulse) and the global
+            // all='none' silence rule. A naive `perCategory[cat] ?? fallback`
+            // diverged from playback for approval (showed the fallback, played
+            // pulse). 'all' has no kind, so it previews the fallback directly.
             const effective: SoundPreset = cat === 'all'
               ? fallback
-              : (settings.perCategory[cat] ?? fallback)
+              : presetForKind(cat, settings)
             const selectValue: string = cat === 'all'
               ? fallback
               : (hasOverride ? (settings.perCategory[cat] as SoundPreset) : DEFAULT_SENTINEL)

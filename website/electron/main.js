@@ -33,7 +33,9 @@ const { seedRenamedStore } = require("./store-rename");
 const { resolveHome, secretCandidates } = require("./home-dir");
 const { identityFamily } = require("./instance-guard");
 const { initNativeLogging } = require("./native-logging");
+const { armCrashCollector, collectCrashReports } = require("./crash-collector");
 const { initGpuPolicy } = require("./disable-gpu");
+const { initGpuCrashFallback } = require("./gpu-crash-fallback");
 const { cancelPendingTrayHide } = require("./hide-to-tray");
 const { exitImmersiveModes } = require("./blocking-prompt");
 const { createMetricsRecorder } = require("./perf-metrics");
@@ -61,12 +63,27 @@ function reopenCrewCompanionAfterUpdate() {
 const { createGatewaySupervisor } = require("./gateway-supervisor");
 const { createWindowLifecycle } = require("./window-lifecycle");
 const { createIpcRegistrar } = require("./ipc-registrar");
+const { installEarlyBootGuard } = require("./early-boot-guard");
+
+// Everything from here to `app.whenReady()` runs synchronously at module load,
+// before Chromium is ready and before any window, tray, or crash reporter
+// exists. The guard turns a throw anywhere in that span into a log entry, a
+// native error box, and exit(1) instead of a silent process death. `glog` and
+// `gatewayLogPath` are function declarations further down; they hoist, so the
+// guard can call them when it fires. The ready handler releases it once the
+// post-ready safety net below can take over.
+const releaseEarlyBootGuard = installEarlyBootGuard({
+  app,
+  dialog,
+  glog,
+  logPath: gatewayLogPath,
+});
 
 // Carry settings across the npm name rename before electron-store opens the
 // destination. Construction writes defaults, after which the seed could no
 // longer distinguish a first launch from an existing store.
 seedRenamedStore(app.getPath("userData"), {
-  log: (message) => console.log("store migration: " + message),
+  log: (message) => glog("store migration: " + message),
 });
 
 const store = new Store({
@@ -83,6 +100,9 @@ const store = new Store({
     autoDownloadUpdates: true,
     runLocalGateway: true,
     linuxFrameless: null,
+    // Written by gpu-crash-fallback.js when the GPU process dies at startup;
+    // read before Chromium initializes on the next launch.
+    gpuSoftwareFallback: null,
   },
 });
 
@@ -119,7 +139,7 @@ function resolvePort() {
     }
     const remotePort = remoteHostPort(store);
     if (remotePort) {
-      console.log(
+      glog(
         "Local gateway is off; targeting the configured remote crew on port " + remotePort,
       );
       return remotePort;
@@ -129,7 +149,7 @@ function resolvePort() {
   }
 
   if (configuredPort) return configuredPort;
-  console.debug("No usable dashboard.url port in the data home, falling back to 5476");
+  glog("No usable dashboard.url port in the data home, falling back to 5476");
   return 5476;
 }
 
@@ -137,7 +157,7 @@ const PORT = resolvePort();
 const BACKEND_URL = "http://localhost:" + PORT;
 
 if (migrateRemoteHostConfig(store, PORT)) {
-  console.log("Migrated legacy remoteHost to remoteHosts[" + PORT + "]");
+  glog("Migrated legacy remoteHost to remoteHosts[" + PORT + "]");
 }
 
 app.name = identityFamily(app.getVersion()) === "nightly"
@@ -172,10 +192,23 @@ function glog(line) {
   const entry = "[" + new Date().toISOString() + "] " + line + "\n";
   try {
     fs.appendFileSync(gatewayLogPath(), entry);
-  } catch {
-    // Never let logging break launch or recovery.
+  } catch (error) {
+    // Preserve the diagnostic when the file sink itself is unavailable.
+    console.error(
+      "[gateway-launch] " + line + " (log write failed: "
+        + (error && error.message ? error.message : error) + ")",
+    );
   }
-  console.log("[gateway-launch] " + line);
+}
+
+function gwarn(line) {
+  glog(line);
+  console.warn("[gateway-launch] " + line);
+}
+
+function gerror(line) {
+  glog(line);
+  console.error("[gateway-launch] " + line);
 }
 
 function readInternalSecret() {
@@ -196,6 +229,55 @@ let isQuitting = false;
 let desktopMetricsRecorder = null;
 let windows = null;
 
+let crashScan = null;
+// Separate from `crashScan` so a scan that failed is not retried on every call:
+// the failure is a broken path or a missing directory, not a transient.
+let crashScanDone = false;
+
+/**
+ * Scan for crash artifacts once per app session, on first demand.
+ *
+ * LAZY on purpose, unlike `initNativeLogging` above. Native logging has to be
+ * armed before Chromium initializes, but this only READS what a previous run
+ * left behind — and it reads files, on the launch immediately after a crash,
+ * which is the launch a user is already watching impatiently. Nothing needs the
+ * answer until the dashboard's crash notice asks for it, so it costs nothing
+ * until then and nothing at all on a run where the dashboard never opens.
+ */
+function scanCrashArtifacts() {
+  if (crashScanDone) return crashScan;
+  crashScanDone = true;
+  try {
+    crashScan = collectCrashReports({
+      logsDir: path.dirname(gatewayLogPath()),
+      crashDumpsDir: app.getPath("crashDumps"),
+      // macOS only. `.ips` reports are the ONLY channel that captures a
+      // main-process abort the Crashpad handler did not survive to write, so
+      // they are worth a second directory here. Linux and Windows have no
+      // equivalent user-readable per-app report directory, and passing "" makes
+      // the collector skip the scan rather than guess at a path.
+      diagnosticReportsDir: process.platform === "darwin"
+        ? path.join(app.getPath("home"), "Library", "Logs", "DiagnosticReports")
+        : "",
+      appName: app.getName(),
+      // BOTH names, because they are different strings and neither derives from
+      // the other: `electron/package.json` sets `executableName` to
+      // `kirocrew-desktop` (and the nightly channel overrides it again), while
+      // `getName()` is `Kiro Crew`. Off darwin a minidump is our only crash
+      // channel, so recognising the executable name is what makes Linux work.
+      execName: path.basename(process.execPath),
+      fs,
+      log: glog,
+    });
+  } catch (e) {
+    // A diagnostic that breaks the launch it exists to explain is worse than no
+    // diagnostic. `getPath`/`getName` are the only calls here that can throw.
+    glog("crash scan unavailable: " + (e && e.message));
+    crashScan = null;
+  }
+  return crashScan;
+}
+
 const requestQuit = () => {
   // Window close handlers consult this synchronously. Set it before app.quit()
   // so a real quit can never be misread as a hide-to-tray request.
@@ -208,6 +290,35 @@ const requestQuit = () => {
 if (!app.requestSingleInstanceLock()) {
   app.exit(0);
 } else {
+  // Record the moment this build became able to collect crashes, BEFORE the
+  // crash reporter can produce one. The scan below is lazy — it runs when the
+  // dashboard first asks — and the first scan has to distinguish artifacts that
+  // predate this feature (which are history, and are marked seen without being
+  // read) from ones this build produced. Deciding that at scan time answers the
+  // wrong question: an app that crashes before the dashboard ever opens would
+  // have its dump written off as pre-existing on the next launch, which is
+  // exactly the crash worth reporting. This writes only the cutoff, does not
+  // read any artifact, and is idempotent — a second launch keeps the first
+  // stamp — so it is cheap enough to sit on the boot path.
+  //
+  // THE ORDER OF THESE TWO CALLS IS LOAD-BEARING. This must precede
+  // `initNativeLogging`, because that is what calls `crashReporter.start()` and
+  // so what makes Crashpad able to write a dump at all. Stamping afterwards
+  // leaves a window — short, but covering precisely the startup crashes this
+  // feature is most needed for — in which a dump exists with no cutoff on
+  // record. The next launch then stamps a cutoff LATER than that dump's mtime,
+  // the first scan reads it as history, and it is marked seen without ever being
+  // surfaced: the crash is silently lost, which is the one outcome this whole
+  // feature exists to prevent. Do not reorder for tidiness. Arming first is also
+  // free: `armCrashCollector` uses nothing `initNativeLogging` sets up, neither
+  // call creates `logsDir`, and the state write fails soft (logs and returns
+  // null) rather than throwing.
+  armCrashCollector({
+    logsDir: path.dirname(gatewayLogPath()),
+    fs,
+    log: glog,
+  });
+
   initNativeLogging({
     logsDir: path.dirname(gatewayLogPath()),
     appendSwitch: (name, value) => app.commandLine.appendSwitch(name, value),
@@ -224,6 +335,20 @@ if (!app.requestSingleInstanceLock()) {
     appendSwitch: (name) => app.commandLine.appendSwitch(name),
     env: process.env,
     argv: process.argv,
+    log: glog,
+  });
+
+  // Same timing constraint as the opt-in above: a persisted software-rendering
+  // decision has to reach Chromium before it initializes. Also arms the
+  // `child-process-gone` listener that makes that decision, so a GPU process
+  // that dies before the dashboard loads relaunches the app once in software
+  // mode instead of letting Chromium abort it with no window and no log.
+  initGpuCrashFallback({
+    app,
+    store,
+    backendUrl: BACKEND_URL,
+    isQuitting: () => isQuitting,
+    requestQuit,
     log: glog,
   });
 
@@ -253,6 +378,8 @@ const gateway = createGatewaySupervisor({
   cancelPendingTrayHide,
   exitImmersiveModes,
   log: glog,
+  warn: gwarn,
+  error: gerror,
   logPath: gatewayLogPath,
 });
 
@@ -280,6 +407,7 @@ const ipcRegistrar = createIpcRegistrar({
   glog,
   closeCrewCompanionForUpdate,
   reopenCrewCompanionAfterUpdate,
+  crashScan: scanCrashArtifacts,
 });
 
 /**
@@ -370,20 +498,24 @@ async function fetchMochiGatewayAuth(backendUrl = BACKEND_URL) {
 // bounded renderer/gateway recovery paths can still run.
 process.on("uncaughtException", (error) => {
   try {
-    glog("uncaughtException: " + (error && error.stack ? error.stack : error));
+    gerror("uncaughtException: " + (error && error.stack ? error.stack : error));
   } catch {
     // Logging must never throw from the safety net.
   }
 });
 process.on("unhandledRejection", (reason) => {
   try {
-    glog("unhandledRejection: " + (reason && reason.stack ? reason.stack : reason));
+    gerror("unhandledRejection: " + (reason && reason.stack ? reason.stack : reason));
   } catch {
     // Same last-resort rule as uncaughtException.
   }
 });
 
 app.whenReady().then(async () => {
+  // The crash reporter and the keep-alive safety net above are armed; from
+  // here on an exception is recovered, not fatal.
+  releaseEarlyBootGuard();
+
   const frameDecision = windows.platform.linuxFrameDecision;
   if (frameDecision) {
     glog(

@@ -97,6 +97,14 @@ def channel_namespace_of(key: str) -> str:
 #: Non-channel session-key prefixes that still deserve their own telemetry label.
 #: Kept in sync with the prefixes ``SessionManager`` mints; anything absent here
 #: folds into ``"other"`` so an unrecognised key can never mint a metric series.
+#:
+#: ADDING A NAMESPACE: this tuple bounds telemetry label cardinality and nothing more,
+#: so being absent from it is not a bug on its own — ``wf-unpooled``, ``wf-worker`` and
+#: ``wf-scope`` are all live session keys that are not listed here. But a namespace whose
+#: transcripts reach disk also needs classifying at
+#: ``dashboard/handlers/sessions.py::_MACHINE_NAMESPACES``, which decides whether the
+#: Older-sessions pane presents it as a conversation. Unclassified means VISIBLE there,
+#: so a new machine namespace silently repopulates that pane until it is added.
 _TELEMETRY_LOCAL_PREFIXES: tuple[tuple[str, str], ...] = (
     ("dashboard", "dashboard"),
     ("cron", "cron"),
@@ -104,6 +112,10 @@ _TELEMETRY_LOCAL_PREFIXES: tuple[tuple[str, str], ...] = (
     ("taskrunner", "taskrunner"),
     ("secretary", "secretary"),
     ("side", "side"),
+    # A reply thread on a crewmate chat message (``dashboard/chat_threads.py``),
+    # keyed ``thread:<slot>:<mid>``. Its own label, as ``side`` has, so thread
+    # turns never fold into ``other``.
+    ("thread", "thread"),
     ("wf-pool", "workflow_pool"),
     ("wf-author", "workflow_author"),
     # A workflow STAGE's own session (``wf:<run_id>:<n>``, built by
@@ -149,10 +161,14 @@ TELEMETRY_CHANNELS: frozenset[str] = frozenset(
 
 
 def telemetry_channel_of(key: str | None) -> str:
-    """Classify *key* into a bounded metric label for the conversation source.
+    """Classify *key* into the bounded canonical conversation-source label.
 
     Answers "who paid this cost" for latency instruments, which otherwise record
-    a duration with no way to group it by where the conversation came from.
+    a duration with no way to group it by where the conversation came from. The
+    same closed classification is also a behavioral dispatch contract for callers
+    that need to distinguish dashboard, channel, and non-interactive sessions;
+    reclassifying a key shape is therefore an application behavior change, not a
+    metrics-only refactor, and must preserve the pinned surface tests below.
 
     Returns a member of :data:`TELEMETRY_CHANNELS`: a transport namespace
     (``telegram``, ``slack``, …) for channel keys, a local label
@@ -388,6 +404,32 @@ DM_SCOPE_UNIFIED = "unified"
 #: stays separate; ``unified`` opts into one shared bucket per agent.
 DEFAULT_DM_SCOPE = DM_SCOPE_PER_CHANNEL_PEER
 
+
+def split_dm_session_key(key: str) -> tuple[str, int] | None:
+    """Return ``(bucket, generation)`` for a canonical DM session key.
+
+    The strict RFC parser owns normal channel keys. ``dm_scope=unified`` uses
+    the shorter ``unified:{agent}[:genN]`` shape, so this helper recognizes only
+    that one named exception. Keeping both shapes beside the key builder avoids
+    copying generation grammar into picker or persistence code.
+    """
+    parsed = parse_session_key(key)
+    if parsed is not None:
+        return parsed.bucket, parsed.gen
+
+    segments = key.split(":")
+    if len(segments) == 2 and segments[0] == DM_SCOPE_UNIFIED and segments[1]:
+        return key, 0
+    if (
+        len(segments) == 3
+        and segments[0] == DM_SCOPE_UNIFIED
+        and segments[1]
+        and (match := _GEN_SUFFIX_RE.match(segments[2])) is not None
+    ):
+        return ":".join(segments[:2]), int(match.group(1))
+    return None
+
+
 #: ``direct`` (1:1 DM) is the baseline; ``forum`` keys a Telegram supergroup
 #: forum Topic ``(chat_id, thread_id)`` to its own session (Slack-thread style).
 CHAT_TYPE_DIRECT = "direct"
@@ -459,7 +501,7 @@ def legacy_dashboard_mirror_key(channel_session_key: str) -> str:
     key itself, so that key is where its mirror binding belongs and where the
     turn path reads it back. Bindings created before that unification live on
     ``"dashboard:" + history._safe_key(channel_session_key)`` — the runtime key
-    of the derived slot that used to own the conversation.
+    of the derived slot that owned the conversation under the earlier scheme.
 
     Retained for compat only: reads and clears fall back to this spelling
     (``SessionMap._mirror_key``) so a link a user set earlier still resolves,

@@ -21,6 +21,38 @@ from kiro_crew.cli_doctor import _doctor
 from kiro_crew.cli_server import _update
 
 
+def _add_job_kwargs(**overrides):
+    """The FULL kwarg set ``kirocrew cron add`` hands to ``CronService.add_job``.
+
+    Every create field rides in the ONE locked ``add_job`` call -- there is no
+    second unlocked ``_save()`` after it -- so a test that pins the call pins
+    the whole set. Defaults here are an agent job on ``--every`` with nothing
+    else given; a test overrides the fields its flags change.
+    """
+    kwargs = dict(
+        every_secs=None,
+        cron_expr=None,
+        at_ts=None,
+        delete_after_run=False,
+        channel=None,
+        approval_mode="",
+        agent_id="",
+        model="",
+        silent=False,
+        timezone="",
+        hide_in_chat=False,
+        folder_id="",
+        command="",
+        script="",
+        persistent_session=True,
+        minimal_context=False,
+        timeout=0,
+        timeout_secs=0,
+    )
+    kwargs.update(overrides)
+    return kwargs
+
+
 async def _noop_probe_server(server):
     """Default probe stub for tests that call ``_doctor()`` but aren't
     specifically exercising the MCP handshake. Marks the target healthy
@@ -146,12 +178,29 @@ class TestDoctor:
 
         monkeypatch.setattr(_doc.sandbox, "detect_backend", lambda config_mode="auto": "namespace")
 
-    def test_doctor_with_kiro(self, tmp_path):
+    @pytest.fixture(autouse=True)
+    def _restore_path(self, monkeypatch):
+        """Put ``PATH`` back after each doctor run.
+
+        The doctor's media section calls ``transcribe.ensure_ffmpeg_in_path()``,
+        which PREPENDS a candidate ffmpeg directory to the process ``PATH`` when
+        the host has one there -- a permanent mutation of the worker's environment
+        that every later test on that worker then inherits (observed as a PATH
+        change leaking out of the first doctor test in a full run). Recording the
+        value through monkeypatch restores it at teardown whatever the doctor did.
+        """
+        monkeypatch.setenv("PATH", os.environ.get("PATH", ""))
+
+    def test_doctor_with_kiro(self, tmp_path, monkeypatch):
+        import kiro_crew.cli_doctor as _doc
+
         agent_file = tmp_path / "kirocrew.json"
         # A minimally healthy agent config so doctor walks the whole MCP
         # section cleanly and doesn't exit on "missing from mcpServers".
         _healthy_agent_file(agent_file)
         mock_run = MagicMock(returncode=0, stdout="kiro-cli 1.0.0", stderr="")
+        # Left unpatched this mutates the process PATH for every later test.
+        monkeypatch.setattr(_doc, "ensure_ffmpeg_in_path", lambda: None)
         with (
             patch(
                 "kiro_crew.cli_doctor.shutil.which",
@@ -237,7 +286,7 @@ class TestDoctor:
         both arms byte-for-byte — including the note mark's trailing pad
         space, which keeps the report columns aligned — AND that the twin
         report lines can never disagree, so a one-arm edit to either site
-        fails here (issue #5096)."""
+        fails here."""
         import kiro_crew.cli_doctor as _doc
 
         agent_file = tmp_path / "kirocrew.json"
@@ -283,10 +332,13 @@ class TestDoctor:
         assert f"  engine:      {expected_mark} no recogniser here" in out
         assert f"  ffmpeg:      {expected_mark} not found" in out
 
-    def test_doctor_reports_platform_boot_error_without_crashing(self, tmp_path, capsys):
+    def test_doctor_reports_platform_boot_error_without_crashing(
+        self, tmp_path, capsys, monkeypatch
+    ):
         """A PlatformCompositionError from boot must be REPORTED by the doctor,
         not crash it — the doctor is the tool that diagnoses a broken setup, so
         it has to survive the very failure it explains."""
+        import kiro_crew.cli_doctor as _doc
         from kiro_crew.platform import PlatformCompositionError
 
         agent_file = tmp_path / "kirocrew.json"
@@ -295,6 +347,8 @@ class TestDoctor:
         boot_err = PlatformCompositionError(
             "profile=amazon resolved no companion; set KIROCREW_PROFILE=standalone"
         )
+        # Left unpatched this mutates the process PATH for every later test.
+        monkeypatch.setattr(_doc, "ensure_ffmpeg_in_path", lambda: None)
         with (
             patch(
                 "kiro_crew.cli_doctor.shutil.which",
@@ -617,9 +671,7 @@ class TestCronCli:
             mock_svc.add_job.assert_called_once_with(
                 name="ops",
                 message="check",
-                every_secs=300,
-                channel="C0AP77JJSN6",
-                approval_mode="",
+                **_add_job_kwargs(every_secs=300, channel="C0AP77JJSN6"),
             )
 
     def test_cron_add_with_cron_expr_and_channel(self, tmp_path):
@@ -651,10 +703,41 @@ class TestCronCli:
             mock_svc.add_job.assert_called_once_with(
                 name="daily",
                 message="brief",
-                cron_expr="0 9 * * 1-5",
-                channel="C0APAPQ5GSY",
-                approval_mode="",
+                **_add_job_kwargs(cron_expr="0 9 * * 1-5", channel="C0APAPQ5GSY"),
             )
+
+    @pytest.mark.parametrize(
+        "name, cron_expr, every, expected",
+        [
+            ("bad dow", "0 9 * * 8", None, "Error: Invalid cron expression: 0 9 * * 8"),
+            ("n" * 501, None, 60, "Error: name exceeds max length 500"),
+        ],
+        ids=["cron_expr branch", "every branch"],
+    )
+    def test_cron_add_refuses_invalid_input(
+        self, name, cron_expr, every, expected, tmp_path, monkeypatch, capsys
+    ):
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "home"))
+        args = argparse.Namespace(
+            cron_action="add",
+            name=name,
+            message="m",
+            every=every,
+            cron_expr=cron_expr,
+            channel=None,
+            approval_mode="",
+            agent="",
+            silent=False,
+            folder="",
+        )
+
+        with pytest.raises(SystemExit) as exit_info:
+            _cron(args)
+
+        err = capsys.readouterr().err
+        assert exit_info.value.code == 1
+        assert err.splitlines()[-1] == expected
+        assert "Traceback" not in err
 
     def test_cron_add_with_approval_mode(self, tmp_path):
         with (
@@ -685,16 +768,14 @@ class TestCronCli:
             mock_svc.add_job.assert_called_once_with(
                 name="auto-job",
                 message="run unattended",
-                every_secs=600,
-                channel=None,
-                approval_mode="auto",
+                **_add_job_kwargs(every_secs=600, approval_mode="auto"),
             )
             mock_sel.return_value.log_api_access.assert_called_once_with(
                 caller="cli",
                 operation="cron.add",
                 outcome="allowed",
                 source="cli",
-                resources="job_id=ghi approval_mode=auto agent=default silent=False",
+                resources="job_id=ghi kind=agent approval_mode=auto agent=default silent=False",
             )
 
     def test_cron_add_with_silent(self):
@@ -723,16 +804,14 @@ class TestCronCli:
                 silent=True,
             )
             _cron(args)
+            # silent rides in the ONE locked add_job call -- never a
+            # post-create mutation followed by a second, unlocked _save().
             mock_svc.add_job.assert_called_once_with(
                 name="quiet-job",
                 message="shh",
-                every_secs=300,
-                channel=None,
-                approval_mode="",
+                **_add_job_kwargs(every_secs=300, silent=True),
             )
-            # silent is set via post-create mutation, mirroring agent_id
-            assert mock_job.silent is True
-            mock_svc._save.assert_called_once()
+            mock_svc._save.assert_not_called()
 
     def test_cron_update_approval_mode(self, tmp_path):
         with (
@@ -860,15 +939,14 @@ class TestCronCli:
                 agent="customer360-code-agent",
             )
             _cron(args)
+            # agent_id rides in the ONE locked add_job call; the old
+            # mutate-then-unlocked-_save() second write is gone.
             mock_svc.add_job.assert_called_once_with(
                 name="c360",
                 message="check pipeline",
-                every_secs=600,
-                channel=None,
-                approval_mode="",
+                **_add_job_kwargs(every_secs=600, agent_id="customer360-code-agent"),
             )
-            assert mock_job.agent_id == "customer360-code-agent"
-            mock_svc._save.assert_called_once()
+            mock_svc._save.assert_not_called()
             # Audit log includes agent (permission-relevant: picks
             # which sandboxed subprocess executes the job).
             mock_sel.return_value.log_api_access.assert_called_once_with(
@@ -876,7 +954,10 @@ class TestCronCli:
                 operation="cron.add",
                 outcome="allowed",
                 source="cli",
-                resources="job_id=ag1 approval_mode=default agent=customer360-code-agent silent=False",
+                resources=(
+                    "job_id=ag1 kind=agent approval_mode=default "
+                    "agent=customer360-code-agent silent=False"
+                ),
             )
 
     def test_cron_add_with_agent_cron_expr(self, tmp_path):
@@ -904,12 +985,9 @@ class TestCronCli:
             mock_svc.add_job.assert_called_once_with(
                 name="briefing",
                 message="run briefing",
-                cron_expr="0 9 * * 1-5",
-                channel=None,
-                approval_mode="",
+                **_add_job_kwargs(cron_expr="0 9 * * 1-5", agent_id="ea-briefing"),
             )
-            assert mock_job.agent_id == "ea-briefing"
-            mock_svc._save.assert_called_once()
+            mock_svc._save.assert_not_called()
 
     def test_cron_add_without_agent_does_not_save(self, tmp_path):
         """Empty/omitted --agent leaves job.agent_id untouched, no extra _save."""
@@ -954,7 +1032,7 @@ class TestCronCli:
                 agent="   ",
             )
             _cron(args)
-            assert mock_job.agent_id == ""
+            assert mock_svc.add_job.call_args.kwargs["agent_id"] == ""
             mock_svc._save.assert_not_called()
 
     def test_cron_update_with_agent(self, tmp_path):
@@ -1918,10 +1996,10 @@ class TestIsKirocrewProcess:
             assert _is_kirocrew_process(1234) is True
 
     def test_returns_true_for_module_gateway_form(self):
-        """Regression: the real service launch form
-        ``python -m kiro_crew gateway`` must be recognized. Previously the
-        matcher only accepted the dotted ``kiro_crew.gateway`` form, so
-        ``kirocrew stop`` no-op'd on service installs.
+        """The real service launch form
+        ``python -m kiro_crew gateway`` must be recognized. The
+        matcher must accept the dotted ``kiro_crew.gateway`` form too, or
+        ``kirocrew stop`` no-op's on service installs.
 
         Patched through the cross-platform ``process_command_line`` seam (the
         Windows port routes _is_kirocrew_process through platform_compat rather
@@ -2050,6 +2128,98 @@ class TestArgsLookLikeKirocrew:
         assert _args_look_like_kirocrew("python -m kiro_crew GATEWAY") is False
 
 
+class TestComposedEditionGatewayModule:
+    """A composed edition's gateway boots from the COMPANION's module.
+
+    Its launcher execs ``-m <companion module>`` so the composition root is
+    entered rather than the core CLI. Keying the classifier on the literal
+    ``kiro_crew`` made ``kirocrew stop`` / ``restart`` drop the one listening pid
+    and report "No Kiro Crew gateway currently running on port <p>" on every such
+    install — the port lookup found the gateway, the classifier rejected it, and
+    the graceful-API / lock-owner fallbacks never ran because they are reached
+    only when the port lookup itself comes back empty.
+    """
+
+    # The real argv observed on a composed install, verbatim.
+    COMPOSED_ARGV = (
+        "/opt/kirocrew/backend-dist/kirocrew-backend-arm64/bin/python3.12 "
+        "-s -m kirocrew_companion gateway --no-open --port 5476"
+    )
+
+    @staticmethod
+    def _entry_point(value):
+        class _EP:
+            def __init__(self, v):
+                self.value = v
+
+        return _EP(value)
+
+    @pytest.fixture(autouse=True)
+    def _clear_cache(self):
+        from kiro_crew.port_resolution import _gateway_module_roots
+
+        _gateway_module_roots.cache_clear()
+        yield
+        _gateway_module_roots.cache_clear()
+
+    def test_composed_module_matches_when_companion_installed(self, monkeypatch):
+        from kiro_crew.cli_server import _args_look_like_kirocrew
+        from kiro_crew.platform import discovery
+
+        monkeypatch.setattr(
+            discovery,
+            "plugin_entry_points",
+            lambda: [self._entry_point("kirocrew_companion.compose:build_context")],
+        )
+        assert _args_look_like_kirocrew(self.COMPOSED_ARGV) is True
+
+    def test_composed_module_rejected_without_the_companion(self, monkeypatch):
+        """Precision is preserved: the widening comes from the INSTALLED entry
+        points, so a standalone host still refuses to signal that process."""
+        from kiro_crew.cli_server import _args_look_like_kirocrew
+        from kiro_crew.platform import discovery
+
+        monkeypatch.setattr(discovery, "plugin_entry_points", lambda: [])
+        assert _args_look_like_kirocrew(self.COMPOSED_ARGV) is False
+
+    def test_core_module_still_matches_with_a_companion_installed(self, monkeypatch):
+        from kiro_crew.cli_server import _args_look_like_kirocrew
+        from kiro_crew.platform import discovery
+
+        monkeypatch.setattr(
+            discovery,
+            "plugin_entry_points",
+            lambda: [self._entry_point("kirocrew_companion.compose:build_context")],
+        )
+        assert _args_look_like_kirocrew("python3 -m kiro_crew gateway") is True
+
+    def test_companion_module_without_a_server_subcommand_is_refused(self, monkeypatch):
+        """The subcommand gate still applies to the widened module set — a
+        companion task-runner process must never be SIGTERMed by ``stop``."""
+        from kiro_crew.cli_server import _args_look_like_kirocrew
+        from kiro_crew.platform import discovery
+
+        monkeypatch.setattr(
+            discovery,
+            "plugin_entry_points",
+            lambda: [self._entry_point("kirocrew_companion.compose:build_context")],
+        )
+        assert _args_look_like_kirocrew("python -m kirocrew_companion run /tmp/spec.md") is False
+
+    def test_discovery_failure_leaves_the_core_module_matching(self, monkeypatch):
+        """Entry-point discovery is best-effort: a raising probe must degrade to
+        the core module rather than making ``stop`` blind everywhere."""
+        from kiro_crew.cli_server import _args_look_like_kirocrew
+        from kiro_crew.platform import discovery
+
+        def _boom():
+            raise RuntimeError("metadata unreadable")
+
+        monkeypatch.setattr(discovery, "plugin_entry_points", _boom)
+        assert _args_look_like_kirocrew("python3 -m kiro_crew gateway") is True
+        assert _args_look_like_kirocrew(self.COMPOSED_ARGV) is False
+
+
 class TestStop:
     """Tests for _stop CLI function."""
 
@@ -2163,14 +2333,62 @@ class TestStop:
         assert "reason=lsof_not_found" in resources
 
     def test_no_kirocrew_process(self, capsys):
-        # A listener exists but its cmdline isn't a kirocrew gateway → refuse to kill.
+        # A listener exists but its cmdline isn't a kirocrew gateway → refuse to kill,
+        # but name the pid so the operator can see what holds the port.
         from kiro_crew.cli_server import _stop
 
-        with self._mock_sel(), self._ports([1234]), self._cmdline("nginx: worker"):
+        with (
+            self._mock_sel(),
+            self._ports([1234]),
+            self._cmdline("nginx: worker"),
+            self._endpoint(False),
+        ):
             with pytest.raises(SystemExit) as exc:
                 _stop(5476)
             assert exc.value.code == 1
-        assert "No Kiro Crew gateway" in capsys.readouterr().out
+        out = capsys.readouterr().out
+        assert "1234" in out
+        assert "not recognised" in out
+        assert "(nginx:)" in out
+
+    def test_unrecognised_listener_names_a_quoted_executable_basename(self, capsys):
+        # A quoted executable path is one token; the message must carry its
+        # basename, not the fragment before the first space.
+        from kiro_crew.cli_server import _stop
+
+        quoted = '"/opt/some tool/bin/otherd" --port 5476'
+        with (
+            self._mock_sel(),
+            self._ports([4321]),
+            self._cmdline(quoted),
+            self._endpoint(False),
+        ):
+            with pytest.raises(SystemExit):
+                _stop(5476)
+        out = capsys.readouterr().out
+        assert "(otherd)" in out
+        assert "/opt/some" not in out
+
+    def test_unrecognised_listener_name_cannot_drive_the_terminal(self, capsys):
+        # argv[0] is chosen by whoever holds the port: escape sequences, OSC
+        # title changes and BEL must be stripped before the name is echoed, and
+        # the name is capped so it cannot flood the line.
+        from kiro_crew.cli_server import _MAX_ECHOED_NAME_LEN, _stop, _terminal_safe_name
+
+        hostile = "/tmp/\x1b[31mred\x1b[0m\x1b]0;owned\x07" + "x" * 200
+        with (
+            self._mock_sel(),
+            self._ports([4321]),
+            self._cmdline(f"'{hostile}' --port 5476"),
+            self._endpoint(False),
+        ):
+            with pytest.raises(SystemExit):
+                _stop(5476)
+        out = capsys.readouterr().out
+        assert "\x1b" not in out and "\x07" not in out
+        assert "[31mred[0m]0;owned" in out  # printable residue only, no ESC/BEL
+        assert len(out.split("(", 1)[1].split(")", 1)[0]) <= _MAX_ECHOED_NAME_LEN
+        assert _terminal_safe_name("\x1b\x07\u200b") == ""
 
     def test_successful_stop(self, capsys):
         from kiro_crew.cli_server import _stop
@@ -2281,6 +2499,197 @@ class TestStop:
         # (which exits 1 here because no listener is found on 8089).
         assert "No Kiro Crew gateway" in capsys.readouterr().out
 
+    # ---- a listener argv cannot name: the desktop-app spawn shape -----------
+
+    #: The app spawns a bare interpreter inside the toolbox payload, which no
+    #: ``_args_look_like_kirocrew`` pattern matches.
+    APP_ARGV = (
+        "/Applications/KiroCrew.app/Contents/Resources/backend-dist/"
+        "kirocrew-backend-arm64/bin/python3.12 /Applications/KiroCrew.app/"
+        "Contents/Resources/backend-dist/kirocrew-backend-arm64/serve.py"
+    )
+
+    def _kill_patch(self):
+        """Patch the signal call the running OS takes, and return it."""
+        if sys.platform == "win32":
+            return patch(
+                "kiro_crew.cli_server.platform_compat.kill_process_tree", return_value=True
+            )
+        return patch("os.kill")
+
+    def _endpoint(self, answers):
+        """Whether the process on the port answers the authenticated shutdown."""
+        return patch("kiro_crew.cli_server._request_gateway_shutdown", return_value=answers)
+
+    def _proven(self, pids):
+        """Which pids the identity proof vouches for as this port's gateway."""
+        return patch("kiro_crew.cli_server._verified_loopback_gateway_pids", return_value=pids)
+
+    @staticmethod
+    def _identity_inputs(
+        *, record=(50519, "tok"), live_token="tok", loopback=(50519,), uid=1000, posix=True
+    ):
+        """Every input the identity proof reads, each independently settable."""
+        return [
+            patch("kiro_crew.cli_server.platform_compat.IS_POSIX", posix),
+            patch("kiro_crew.cli_server.run_marker.read_pid_record_path", return_value=record),
+            patch("kiro_crew.cli_server.run_marker.pid_start_token", return_value=live_token),
+            patch("kiro_crew.cli_server.platform_compat.find_port_listeners", return_value=[]),
+            patch(
+                "kiro_crew.cli_server.platform_compat.loopback_owner_pids",
+                return_value=list(loopback),
+            ),
+            patch("kiro_crew.cli_server.platform_compat.process_owner_uid", return_value=uid),
+            patch("kiro_crew.cli_server.os.getuid", create=True, return_value=1000),
+        ]
+
+    def _proof(self, **kwargs):
+        """Run the identity proof with *kwargs* overriding one input at a time."""
+        from kiro_crew.cli_server import _verified_loopback_gateway_pids
+
+        with contextlib.ExitStack() as stack:
+            for ctx in self._identity_inputs(**kwargs):
+                stack.enter_context(ctx)
+            return _verified_loopback_gateway_pids(5476)
+
+    def test_the_identity_proof_vouches_for_the_recorded_loopback_gateway(self):
+        """All four parts line up: the recorded pid is who answers, and it is ours."""
+        assert self._proof() == [50519]
+
+    def test_the_identity_proof_refuses_a_squatter_on_loopback(self):
+        """Our gateway bound elsewhere, someone else holding loopback.
+
+        The recorded pid is not who a ``127.0.0.1`` request would reach, so the
+        secret is not handed to whoever is.
+        """
+        assert self._proof(loopback=(99999,)) == []
+
+    def test_the_identity_proof_refuses_a_recycled_pid(self):
+        """A pid left behind by a crash and reused cannot inherit the claim."""
+        assert self._proof(live_token="different") == []
+        assert self._proof(record=(50519, "")) == []
+
+    def test_the_identity_proof_refuses_a_process_owned_by_someone_else(self):
+        """Pid recycling into another account's process is what the uid closes."""
+        assert self._proof(uid=4242) == []
+
+    def test_the_identity_proof_refuses_without_a_record_or_off_posix(self):
+        """No recorded identity, and no platform to prove it on, both deny."""
+        assert self._proof(record=None) == []
+        assert self._proof(posix=False) == []
+
+    def test_argv_declines_the_app_spawn_shape(self):
+        """The premise of the tests below, asserted rather than assumed."""
+        from kiro_crew.cli_server import _args_look_like_kirocrew
+
+        assert _args_look_like_kirocrew(self.APP_ARGV) is False
+
+    def test_an_argv_declined_listener_is_asked_to_stop_itself(self, capsys):
+        """A gateway argv cannot name is still reachable as a gateway.
+
+        The desktop app spawns a bare interpreter, which the argv patterns
+        decline. Identity comes from the gateway instead: it is asked to stop
+        ITSELF over one loopback request carrying this generation's secret, which
+        it publishes at startup whatever its command line reads. Nothing is
+        signalled, so no pid is guessed.
+        """
+        from kiro_crew.cli_server import _stop
+
+        mock_sel = MagicMock()
+        with (
+            patch("kiro_crew.cli_server.sel", return_value=mock_sel),
+            self._ports([50519]),
+            self._cmdline(self.APP_ARGV),
+            self._proven([50519]),
+            self._endpoint(True),
+            self._kill_patch() as mock_kill,
+        ):
+            _stop(5476)
+        out = capsys.readouterr().out
+        assert "graceful shutdown" in out
+        assert "not recognised" not in out
+        mock_kill.assert_not_called()
+        reasons = [c.kwargs["resources"] for c in mock_sel.log_api_access.call_args_list]
+        assert any("reason=argv_declined_listener" in r and "via=api" in r for r in reasons)
+
+    def test_a_listener_that_does_not_answer_is_still_refused(self, capsys):
+        """The control: only a process that proves itself is stopped.
+
+        Nothing answers the authenticated request -- no secret, or a stranger on
+        the port -- so the existing refusal stands, exit 1, and no pid is
+        signalled. Being unrecognised is not by itself permission to act.
+        """
+        from kiro_crew.cli_server import _stop
+
+        mock_sel = MagicMock()
+        with (
+            patch("kiro_crew.cli_server.sel", return_value=mock_sel),
+            self._ports([50519]),
+            self._cmdline(self.APP_ARGV),
+            self._proven([50519]),
+            self._endpoint(False),
+            self._kill_patch() as mock_kill,
+        ):
+            with pytest.raises(SystemExit) as exc:
+                _stop(5476)
+            assert exc.value.code == 1
+        assert "not recognised" in capsys.readouterr().out
+        mock_kill.assert_not_called()
+        reasons = [c.kwargs["resources"] for c in mock_sel.log_api_access.call_args_list]
+        assert any("reason=unrecognized_listener" in r for r in reasons)
+        assert not any("reason=argv_declined_listener" in r for r in reasons)
+
+    def test_an_unproven_responder_is_never_sent_the_secret(self, capsys):
+        """No identity, no request -- the refusal comes first.
+
+        The request carries the per-generation secret, which mints owner tokens,
+        so a listener the proof cannot vouch for must not receive it. The stop
+        refuses exactly as it does for any other unrecognised listener.
+        """
+        from kiro_crew.cli_server import _stop
+
+        mock_sel = MagicMock()
+        with (
+            patch("kiro_crew.cli_server.sel", return_value=mock_sel),
+            self._ports([50519]),
+            self._cmdline(self.APP_ARGV),
+            self._proven([]),
+            patch("kiro_crew.cli_server._request_gateway_shutdown") as mock_request,
+            self._kill_patch() as mock_kill,
+        ):
+            with pytest.raises(SystemExit) as exc:
+                _stop(5476)
+            assert exc.value.code == 1
+        mock_request.assert_not_called()
+        assert "not recognised" in capsys.readouterr().out
+        mock_kill.assert_not_called()
+        reasons = [c.kwargs["resources"] for c in mock_sel.log_api_access.call_args_list]
+        assert any("reason=unrecognized_listener" in r for r in reasons)
+
+    def test_a_recognised_listener_is_not_asked_over_the_endpoint(self, capsys):
+        """The endpoint is the fallback, never a substitute for the usual path.
+
+        A listener the argv check DOES classify keeps the ordinary SIGTERM, and
+        the request is not made at all -- otherwise every stop would depend on an
+        HTTP round trip the pid path never needed.
+        """
+        from kiro_crew.cli_server import _stop
+
+        with (
+            self._mock_sel(),
+            self._ports([1234]),
+            self._cmdline("python3 -m kiro_crew gateway"),
+            patch("time.sleep"),
+            patch("kiro_crew.cli_server.platform_compat.pid_exists", return_value=False),
+            patch("kiro_crew.cli_server._stop_mcp_gateway_daemon"),
+            patch("kiro_crew.cli_server._request_gateway_shutdown") as mock_endpoint,
+            self._kill_patch(),
+        ):
+            _stop(5476)
+        mock_endpoint.assert_not_called()
+        out = capsys.readouterr().out
+        assert "SIGTERM" in out or "Terminated" in out
+
 
 class TestWaitForPidsExit:
     """Tests for the bounded ``_wait_for_pids_exit`` helper."""
@@ -2379,6 +2788,17 @@ class TestRestart:
     def _mock_sel(self):
         return patch("kiro_crew.cli_server.sel", return_value=MagicMock())
 
+    def _lock_file(self, tmp_path, *, mode=0o600):
+        """A real ``gateway.lock`` in a patched config dir (see ``TestStop``)."""
+        path = tmp_path / "gateway.lock"
+        path.write_text("50519\n")
+        path.chmod(mode)
+        return patch("kiro_crew.cli_server.config_dir", return_value=tmp_path)
+
+    def _lock_private(self, answer):
+        """Pin the lock-permission seam (see ``TestStop._lock_private``)."""
+        return patch("kiro_crew.cli_server._lock_file_is_account_private", return_value=answer)
+
     def test_service_active_restarts_via_controller(self, capsys):
         from kiro_crew.cli_server import _restart
 
@@ -2473,6 +2893,273 @@ class TestRestart:
             cli_server._restart(None)
         mock_spawn.assert_called_once()
 
+    @contextlib.contextmanager
+    def _probe_missed_gateway(self, holder_pid: int, *, kirocrew: bool):
+        """Patches for the tool-present path where the port probe finds nothing
+        and no gateway answers the authenticated shutdown, yet gateway.lock is
+        held by the live ``holder_pid``. Every way the command could signal a
+        pid is recorded so the tests can assert that none was used."""
+        from kiro_crew.gateway_lock import LockHolder
+
+        with (
+            patch(
+                "kiro_crew.cli_server.service_controller.restart_service",
+                return_value=False,
+            ),
+            patch(
+                "kiro_crew.cli_server.platform_compat.find_listening_pids",
+                return_value=[],
+            ),
+            patch("kiro_crew.cli_server.platform_compat.IS_WINDOWS", False),
+            patch("kiro_crew.cli_server._report_authenticated_shutdown", return_value=False),
+            patch(
+                "kiro_crew.cli_server.lock_holder",
+                return_value=LockHolder(pid=holder_pid, alive=True, source="flock_owner"),
+            ),
+            patch("kiro_crew.cli_server._is_kirocrew_process", return_value=kirocrew),
+            patch("kiro_crew.cli_server.os.kill") as mock_kill,
+            patch("kiro_crew.cli_server.platform_compat.kill_process_tree") as mock_tree,
+            patch("kiro_crew.cli_server._stop_mcp_gateway_daemon") as mock_daemon,
+            patch("kiro_crew.cli_server._wait_for_pids_exit") as mock_wait,
+            patch("kiro_crew.cli_server._spawn_detached_gateway") as mock_spawn,
+        ):
+            yield {
+                "kill": mock_kill,
+                "tree": mock_tree,
+                "daemon": mock_daemon,
+                "wait": mock_wait,
+                "spawn": mock_spawn,
+            }
+
+    def test_lock_holder_alive_kirocrew_refuses_to_restart_and_names_the_pid(self, capsys):
+        """The split-brain this fixes: the port probe finds nothing (a
+        unix-socket-only gateway, or a blind spot) but gateway.lock is held by
+        a live Kiro Crew pid. Restart must not report "nothing running" and
+        must not spawn a replacement the lock would refuse -- and it must not
+        signal through the lock either: a gateway neither the port nor the
+        API could reach is refused and NAMED, with the manual command, so the
+        operator stops it by hand and retries."""
+        from kiro_crew.cli_server import _restart
+
+        mock_sel = MagicMock()
+        with (
+            patch("kiro_crew.cli_server.sel", return_value=mock_sel),
+            self._probe_missed_gateway(4242, kirocrew=True) as mocks,
+        ):
+            with pytest.raises(SystemExit) as exc:
+                _restart(None)
+        assert exc.value.code == 1
+        mocks["kill"].assert_not_called()
+        mocks["tree"].assert_not_called()
+        mocks["daemon"].assert_not_called()
+        mocks["wait"].assert_not_called()
+        mocks["spawn"].assert_not_called()
+        out = capsys.readouterr().out
+        assert "gateway.lock" in out
+        assert "pid 4242" in out
+        assert "kill -TERM 4242" in out
+        assert "Not starting a replacement" in out
+        mock_sel.log_api_access.assert_called_once()
+        audit = mock_sel.log_api_access.call_args.kwargs
+        assert audit["operation"] == "gateway_restart"
+        assert audit["outcome"] == "denied"
+        assert "pids=[4242]" in audit["resources"]
+        assert "reason=lock_holder_kirocrew" in audit["resources"]
+
+    def test_lock_holder_alive_but_foreign_refuses_without_stopping_it(self, capsys):
+        """A live holder that is not a Kiro Crew process must never be signaled
+        -- refuse with the same wording ``kirocrew gateway`` would give for this
+        holder, audited as denied, rather than silently spawning a competitor
+        the lock refuses."""
+        from kiro_crew.cli_server import _restart
+
+        mock_sel = MagicMock()
+        with (
+            patch("kiro_crew.cli_server.sel", return_value=mock_sel),
+            self._probe_missed_gateway(99, kirocrew=False) as mocks,
+        ):
+            with pytest.raises(SystemExit) as exc:
+                _restart(None)
+        assert exc.value.code == 1
+        mocks["kill"].assert_not_called()
+        mocks["tree"].assert_not_called()
+        mocks["spawn"].assert_not_called()
+        out = capsys.readouterr().out
+        assert "does not look like a Kiro Crew gateway" in out
+        assert "kill -TERM 99" in out
+        mock_sel.log_api_access.assert_called_once()
+        audit = mock_sel.log_api_access.call_args.kwargs
+        assert audit["operation"] == "gateway_restart"
+        assert audit["outcome"] == "denied"
+        assert "reason=lock_holder_foreign" in audit["resources"]
+
+    @contextlib.contextmanager
+    def _tool_absent_acked_shutdown(
+        self, holder_pid: int, lock_probe_error=None, *, acknowledged: bool = True
+    ):
+        """Patches for the port-tool-absent path with an acknowledged shutdown.
+
+        ``find_listening_pids`` is blind (tool missing), so ``_restart`` enters
+        ``_stop`` with an EMPTY incumbent list; ``_stop`` gets the gateway to
+        acknowledge a graceful shutdown over the API and returns without naming
+        a pid. The lock still names the exiting gateway as ``holder_pid`` --
+        unless ``lock_probe_error`` is given, in which case the probe raises it.
+        ``acknowledged=False`` drives the same entry with NO gateway answering
+        the API, so ``_stop`` reaches the lock holder instead.
+        """
+        from kiro_crew.gateway_lock import LockHolder
+
+        holder_kwargs = (
+            {"side_effect": lock_probe_error}
+            if lock_probe_error is not None
+            else {"return_value": LockHolder(pid=holder_pid, alive=True, source="flock_owner")}
+        )
+        with (
+            patch(
+                "kiro_crew.cli_server.service_controller.restart_service",
+                return_value=False,
+            ),
+            patch(
+                "kiro_crew.cli_server.platform_compat.listening_pid_tool_available",
+                return_value=False,
+            ),
+            patch(
+                "kiro_crew.cli_server.platform_compat.find_listening_pids",
+                return_value=[],
+            ),
+            patch("kiro_crew.cli_server.platform_compat.IS_WINDOWS", False),
+            patch("kiro_crew.cli_server.service_controller.stop_service", return_value=False),
+            patch(
+                "kiro_crew.cli_server._report_authenticated_shutdown",
+                return_value=acknowledged,
+            ),
+            patch("kiro_crew.cli_server.lock_holder", **holder_kwargs),
+            patch("kiro_crew.cli_server._is_kirocrew_process", return_value=True),
+        ):
+            yield
+
+    def test_tool_absent_unacked_shutdown_live_holder_refuses_to_restart(self, capsys):
+        """Port tool absent, no gateway answers the API, yet the lock is held by
+        a live Kiro Crew pid: ``_stop`` refuses (its exit is swallowed, as for
+        "nothing running") and restart must NOT read that as a free lock --
+        it re-reads the holder, refuses too, waits on nothing and spawns
+        nothing. Both refusals are audited under their own operation."""
+        from kiro_crew.cli_server import _restart
+
+        mock_sel = MagicMock()
+        with (
+            patch("kiro_crew.cli_server.sel", return_value=mock_sel),
+            self._tool_absent_acked_shutdown(4242, acknowledged=False),
+            patch("kiro_crew.cli_server.os.kill") as mock_kill,
+            patch("kiro_crew.cli_server._wait_for_pids_exit") as mock_wait,
+            patch("kiro_crew.cli_server._spawn_detached_gateway") as mock_spawn,
+        ):
+            with pytest.raises(SystemExit) as exc:
+                _restart(None)
+        assert exc.value.code == 1
+        mock_kill.assert_not_called()
+        mock_wait.assert_not_called()
+        mock_spawn.assert_not_called()
+        out = capsys.readouterr().out
+        assert "kill -TERM 4242" in out
+        assert "Not starting a replacement" in out
+        audits = [c.kwargs for c in mock_sel.log_api_access.call_args_list]
+        assert [(a["operation"], a["outcome"]) for a in audits] == [
+            ("gateway_stop", "denied"),
+            ("gateway_restart", "denied"),
+        ]
+        assert all("reason=lock_holder_kirocrew" in a["resources"] for a in audits)
+
+    def test_tool_absent_acked_shutdown_waits_for_lock_holder_before_spawning(self):
+        """Port tool absent + graceful shutdown acknowledged: the port lookup
+        names no incumbent, so without the lock-holder resolution the wait is
+        on an empty list and the replacement spawns while the exiting gateway
+        still owns gateway.lock -- it loses the race and NO gateway remains.
+        The spawn must happen only after the lock holder's pid is gone."""
+        from kiro_crew.cli_server import _restart
+
+        order: list[str] = []
+
+        def _wait(pids, timeout):
+            order.append(f"wait:{pids}")
+            return []
+
+        from kiro_crew.gateway_lock import LockHolder
+
+        def _probe(_home):
+            # The holder is named before the wait; once it has exited, the
+            # pre-spawn re-probe finds the lock free.
+            order.append("probe")
+            if "wait:[4242]" in order:
+                return LockHolder(pid=None, alive=False, source="none")
+            return LockHolder(pid=4242, alive=True, source="flock_owner")
+
+        with (
+            self._mock_sel(),
+            self._tool_absent_acked_shutdown(4242),
+            patch("kiro_crew.cli_server.lock_holder", side_effect=_probe),
+            patch("kiro_crew.cli_server._wait_for_pids_exit", side_effect=_wait),
+            patch(
+                "kiro_crew.cli_server._spawn_detached_gateway",
+                side_effect=lambda port: (order.append("spawn"), self._fake_proc(4321))[1],
+            ),
+        ):
+            _restart(None)
+        assert order == ["probe", "wait:[4242]", "probe", "spawn"]
+
+    def test_tool_absent_acked_shutdown_holder_still_alive_refuses_to_spawn(self, capsys):
+        """Same entry, holder never exits within the wait: refuse with the same
+        'still running' message the port-lookup path prints, non-zero exit, no
+        spawn -- a replacement the lock would refuse is worse than none."""
+        from kiro_crew.cli_server import _restart
+
+        mock_sel = MagicMock()
+        with (
+            patch("kiro_crew.cli_server.sel", return_value=mock_sel),
+            self._tool_absent_acked_shutdown(4242),
+            patch("kiro_crew.cli_server._wait_for_pids_exit", return_value=[4242]) as mock_wait,
+            patch("kiro_crew.cli_server._spawn_detached_gateway") as mock_spawn,
+        ):
+            with pytest.raises(SystemExit) as exc:
+                _restart(None)
+        assert exc.value.code == 1
+        mock_wait.assert_called_once()
+        assert mock_wait.call_args.args[0] == [4242]
+        mock_spawn.assert_not_called()
+        out = capsys.readouterr().out
+        assert "Gateway (pid 4242) did not exit within" in out
+        assert "Not starting a replacement" in out
+        audit = mock_sel.log_api_access.call_args.kwargs
+        assert audit["outcome"] == "denied"
+        assert "reason=incumbent_still_running" in audit["resources"]
+
+    def test_tool_absent_indeterminate_lock_refuses_to_spawn(self, capsys):
+        """Port tool absent and the lock probe cannot say who holds the lock:
+        neither signal a guessed pid nor spawn a replacement the lock may
+        refuse -- print the existing indeterminate message and exit 1."""
+        from kiro_crew.cli_server import _restart
+        from kiro_crew.gateway_lock import LockProbeError
+
+        with (
+            self._mock_sel(),
+            self._tool_absent_acked_shutdown(
+                4242,
+                lock_probe_error=LockProbeError(
+                    Path("/nowhere/gateway.lock"), OSError("probe failed")
+                ),
+            ),
+            patch("kiro_crew.cli_server._wait_for_pids_exit") as mock_wait,
+            patch("kiro_crew.cli_server._spawn_detached_gateway") as mock_spawn,
+        ):
+            with pytest.raises(SystemExit) as exc:
+                _restart(None)
+        assert exc.value.code == 1
+        mock_wait.assert_not_called()
+        mock_spawn.assert_not_called()
+        out = capsys.readouterr().out
+        assert "could not determine whether a gateway holds the lock" in out
+        assert "not starting a replacement" in out
+
     def test_no_service_no_running_gateway_spawns_fresh(self, capsys):
         # Restart should be tolerant of a crashed gateway: if the user runs
         # ``kirocrew restart`` after the gateway died, they should still
@@ -2515,6 +3202,12 @@ class TestRestart:
                 "kiro_crew.cli_server.platform_compat.find_listening_pids",
                 return_value=[1234],
             ),
+            # A RUNNING gateway, per this test's name: argv classifies it, so it
+            # is the incumbent by that route and the endpoint path is not
+            # involved. The wait is stubbed so the assertion never depends on
+            # whether pid 1234 happens to exist on the host.
+            patch("kiro_crew.cli_server._is_kirocrew_process", return_value=True),
+            patch("kiro_crew.cli_server._wait_for_pids_exit", return_value=[]),
             patch("kiro_crew.cli_server._stop") as mock_stop,
             patch(
                 "kiro_crew.cli_server._spawn_detached_gateway",
@@ -2643,7 +3336,14 @@ class TestRestart:
 
         ``find_listening_pids`` reports whatever holds the port. Blocking on a
         foreign process would make restart hang for the full timeout and then
-        refuse, so the wait set is filtered by ``_is_kirocrew_process``.
+        refuse, so nothing is waited on and the spawn proceeds to fail on its own
+        bind.
+
+        The stub raises ``SystemExit`` because that is what ``_stop`` does with a
+        listener nothing identifies: the argv check declines it, the
+        authenticated shutdown gets no answer, and it exits 1 on the
+        ``unrecognized_listener`` refusal. A stub that returned normally would
+        model a stop that neither stopped nor refused.
         """
         from kiro_crew import cli_server
 
@@ -2658,7 +3358,7 @@ class TestRestart:
                 return_value=[1234],
             ),
             patch("kiro_crew.cli_server._is_kirocrew_process", return_value=False),
-            patch("kiro_crew.cli_server._stop") as mock_stop,
+            patch("kiro_crew.cli_server._stop", side_effect=SystemExit(1)) as mock_stop,
             patch("kiro_crew.cli_server._pid_exited", return_value=False) as mock_exited,
             patch("kiro_crew.cli_server._print_token_url"),
             patch(
@@ -2848,10 +3548,12 @@ class TestRestart:
         assert spawned.is_absolute()
         assert spawned.resolve() == own.resolve()
 
-    def test_spawn_detached_gateway_falls_back_to_python_m(self, tmp_path, monkeypatch):
+    def test_spawn_detached_gateway_falls_back_to_python_m(
+        self, tmp_path, monkeypatch, nonbundled_python_without_user_site
+    ):
         # Dev/Brazil-workspace installs may not have ``kirocrew`` on
-        # PATH globally. Fall back to ``python -m kiro_crew`` so the
-        # command works regardless of install layout.
+        # PATH globally. Fall back to ``python -s -m kiro_crew`` so the
+        # command works regardless of install layout without loading user site.
         from kiro_crew.cli_server import _spawn_detached_gateway
 
         monkeypatch.setattr("kiro_crew.cli_server.config_dir", lambda: tmp_path)
@@ -2864,7 +3566,7 @@ class TestRestart:
         argv = mock_popen.call_args.args[0]
         # First arg is sys.executable (path to current Python). Just check
         # the invocation form, not the absolute path.
-        assert argv[1:] == ["-m", "kiro_crew", "gateway"]
+        assert argv[1:] == ["-s", "-m", "kiro_crew", "gateway"]
 
     def test_explicit_port_bypasses_service_short_circuit(self, capsys):
         # When cli_port is not None, bypass systemd: the service unit is not
@@ -2893,6 +3595,54 @@ class TestRestart:
         # And we should have fallen through to the spawn path.
         mock_spawn.assert_called_once()
         assert "Started detached gateway" in capsys.readouterr().out
+
+    def test_restart_waits_for_the_listener_that_acknowledged(self, capsys):
+        """Restart must outwait the gateway that accepted the shutdown.
+
+        The app-spawned listener fails the argv check, so it is no incumbent by
+        that route -- yet it is the process that must release the port before a
+        replacement can bind, and it is still exiting. Who to wait for is
+        answered by who is listening, so the enumerated pid is used and the
+        replacement spawns only after it is gone.
+        """
+        from kiro_crew.cli_server import _restart
+
+        app_argv = (
+            "/Applications/KiroCrew.app/Contents/Resources/backend-dist/"
+            "kirocrew-backend-arm64/bin/python3.12 /Applications/KiroCrew.app/"
+            "Contents/Resources/backend-dist/kirocrew-backend-arm64/serve.py"
+        )
+        with (
+            self._mock_sel(),
+            patch(
+                "kiro_crew.cli_server.platform_compat.find_listening_pids",
+                return_value=[50519],
+            ),
+            patch(
+                "kiro_crew.cli_server.platform_compat.process_command_line",
+                return_value=app_argv,
+            ),
+            patch(
+                "kiro_crew.cli_server._verified_loopback_gateway_pids",
+                return_value=[50519],
+            ),
+            patch("kiro_crew.cli_server._request_gateway_shutdown", return_value=True),
+            patch("kiro_crew.cli_server.platform_compat.IS_WINDOWS", False),
+            patch("kiro_crew.cli_server.os.kill") as mock_kill,
+            patch("kiro_crew.cli_server._refuse_if_lock_held"),
+            patch("kiro_crew.cli_server._wait_for_pids_exit", return_value=[]) as mock_wait,
+            patch("kiro_crew.cli_server.run_marker.read_pid", return_value=None),
+            patch(
+                "kiro_crew.cli_server._spawn_detached_gateway",
+                return_value=self._fake_proc(60815),
+            ) as mock_spawn,
+        ):
+            _restart(5476)
+        # Nothing is signalled: the gateway shut itself down.
+        mock_kill.assert_not_called()
+        assert mock_wait.call_args.args[0] == [50519]
+        mock_spawn.assert_called_once()
+        assert "does not look like a Kiro Crew gateway" not in capsys.readouterr().out
 
 
 class TestRestartReadinessVerdict:
@@ -3515,7 +4265,7 @@ class TestDoctorStaleProjectDir:
                 _doctor()
         out = capsys.readouterr().out
         assert "stale" in out
-        assert "project dir: ⚠️  not set" not in out  # should NOT show fallback message
+        assert "source dir:  ⚠️  not set" not in out  # should NOT show fallback message
 
 
 class TestDoctorMcpTools:
@@ -3833,7 +4583,7 @@ class TestDoctorMcpTools:
 
 
 class TestDoctorMcpSpecGate:
-    """Doctor's MCP checks consult the same ``spec_gate`` emission does (#6548).
+    """Doctor's MCP checks consult the same ``spec_gate`` emission does.
 
     Spec emission (``agent.build_agent_config`` / ``_refresh_dynamic_fields``)
     deliberately omits — and retracts — the ``mcpServers`` entry of a managed
@@ -3890,7 +4640,7 @@ class TestDoctorMcpSpecGate:
     def test_gate_closed_absent_entry_is_informational_not_an_issue(self, tmp_path, capsys):
         """Gate closed + entry absent = the healthy state on this host.
 
-        The exact #6548 report: no hard error, no ``issues`` entry (so doctor
+        The reported state: no hard error, no ``issues`` entry (so doctor
         exits 0), no auto-mount of the ref, and the line says WHY the server is
         absent rather than looking like a silent skip.
         """
@@ -4302,7 +5052,10 @@ class TestDoctorStt:
         )
 
         assert "ffmpeg:      ❌ not found" in out
-        assert "drop a static ffmpeg build into ~/.local/bin" in out
+        # The wiring assertion: doctor must print the module constant the
+        # resolvable-hint tests hold against the resolver's candidate list, so
+        # nobody can inline a literal back into the _os_fix_hint call.
+        assert _doc._FFMPEG_LINUX_HINT in out
         assert "reinstall Kiro Crew" not in out
         assert "❌ Fix these issues: " in out
         assert "ffmpeg" in out.split("❌ Fix these issues: ", 1)[1]
@@ -4460,7 +5213,17 @@ class TestConfigDirOverride:
         (config_home / "project_dir").write_text(str(proj) + "\n")
 
         monkeypatch.setattr("kiro_crew.cli.config_dir", lambda: config_home)
-        monkeypatch.chdir(tmp_path)  # CWD has no project markers
+        # "CWD has no project markers" has to be pinned, not assumed of tmp_path:
+        # the walk climbs every ancestor, and a temp root under a checkout (a
+        # developer's `TMPDIR=./tmp`) puts the real `skills/` + `src/kiro_crew`
+        # above it. The seam the walk reads is `Path.cwd()`, so it answers a
+        # fabricated, marker-free location; the path is never created because
+        # `resolve()` is lexical for a missing path and nothing here opens it.
+        monkeypatch.setattr(
+            Path,
+            "cwd",
+            classmethod(lambda cls: cls("/kc-detect-project-dir-has-no-markers/cwd")),
+        )
 
         from kiro_crew.cli import _detect_project_dir
 
@@ -4729,10 +5492,10 @@ class TestSetupChannelGating:
 class TestSpawnCliAuth:
     """``kirocrew spawn`` attaches X-Internal-Secret on every gateway call.
 
-    Regression coverage for the CLI helpers in ``cli_commands.py``
-    used to open ``/api/spawn`` without the per-session IPC secret, which
-    caused 403 ``"gateway not running"`` errors when ``dashboard.url`` was
-    set to a non-loopback host (token_auth_middleware then required either
+    The CLI helpers in ``cli_commands.py`` attach the per-session IPC secret
+    on every ``/api/spawn`` call. Without it the call gets a 403, which
+    reads ``"gateway not running"`` when ``dashboard.url`` is
+    a non-loopback host (token_auth_middleware then requires either
     a session cookie or the secret header on every request).
     """
 
@@ -4945,7 +5708,7 @@ class TestMcpBuiltinDispatch:
         # Patch the registry the CLI reads when building subparsers and dispatching.
         monkeypatch.setattr(cli_mod, "_BUILTIN_NAMES", [builtin_name])
         # The verb is only registered (and dispatched) when the builtin's
-        # mcp_server module resolves (#5901) — make the synthetic one resolve.
+        # mcp_server module resolves — make the synthetic one resolve.
         monkeypatch.setattr(cli_mod, "_builtin_mcp_server_available", lambda _name: True)
         mock_module = MagicMock()
 
@@ -5400,8 +6163,8 @@ class TestWaitGatewayReady:
     def test_child_that_exits_during_the_last_probe_is_reported_as_died(self):
         """Exiting on the final probe must not be reported as "still running".
 
-        Otherwise the operator is sent looking for a live process that no longer
-        exists, with no exit status to explain it.
+        Otherwise the operator is sent looking for a process that is already gone,
+        with no exit status to explain it.
         """
         import types
 
@@ -5773,7 +6536,7 @@ class TestInstallPidfdChildWatcher:
         from kiro_crew.cli import _install_child_watcher
 
         monkeypatch.setattr("kiro_crew.cli.sys.platform", "linux")
-        # Regression for the 2026-07-10 gateway startup kill: a uv-managed /
+        # The gateway startup kill scenario: a uv-managed /
         # Clang-built CPython 3.12 whose build omits the os.pidfd_open wrapper
         # (present on the system python, absent in the venv interpreter). The
         # probe raises AttributeError, not OSError -- the old code caught it and
@@ -6010,7 +6773,7 @@ class TestTokenCommand:
     # `_token`'s stdout is regex-parsed by the remote-mint path
     # (kiro_crew.instances.token_mint.mint_remote_token) over SSH. Error prose on
     # stdout both breaks the Unix convention and hides the reason from a caller
-    # that captures stderr — which is how a failed remote mint used to surface as
+    # that captures stderr — which is how a failed remote mint surfaces as
     # a bare "<no stderr>".
 
     def _stub_token_env(self, tmp_path, monkeypatch, *, secret: bool = True) -> None:
@@ -6405,13 +7168,16 @@ class TestChatPermissionRequest:
     async def test_a_benign_title_cannot_hide_a_sensitive_command(self, monkeypatch, capsys):
         """The gate judges what executes, not what the model called it.
 
-        ``title`` for a shell tool is an LLM-authored description, so a
-        credential read labelled "List project files" is the bypass that keying
+        ``title`` for a shell tool is an LLM-authored description, so an IMDS
+        credential fetch labelled "List project files" is the bypass that keying
         on the title alone would let through. The user is never even asked.
         """
         provider, sels, reads = await self._drive(
             monkeypatch,
-            event=self._event(title="List project files", command="cat ~/.ssh/id_rsa"),
+            event=self._event(
+                title="List project files",
+                command="curl http://169.254.169.254/latest/meta-data/",
+            ),
             answer="a",  # the user WOULD have allowed it
         )
         assert provider.calls == [("reject", 7, False)]
@@ -6419,13 +7185,13 @@ class TestChatPermissionRequest:
         # A stable code, not the gate's reason: the reason names the very path
         # being protected, and an audit record must not restate it.
         assert sels[0]["error"] == "hook_deny"
-        assert ".ssh" not in json.dumps(sels[0])
+        assert "169.254.169.254" not in json.dumps(sels[0])
         # The reason still reaches the terminal, and it has to be the REAL one:
         # `is_shell` with no command also denies, via the gate's deny-by-default
         # backstop, so "it was denied" would pass just as well when the command
         # is never forwarded at all.
         err = capsys.readouterr().err
-        assert "sensitive credential path" in err
+        assert "IMDS endpoint" in err
         assert "could not be verified" not in err
 
     @pytest.mark.asyncio
@@ -6825,8 +7591,8 @@ class TestChatPermissionRequest:
 
     @pytest.mark.asyncio
     async def test_the_prompt_and_the_gate_share_one_set_of_path_spellings(self, monkeypatch):
-        """A ``filePath`` target used to be DISPLAYED as though it had been vetted
-        while the keystone never read that key. Both sides now resolve through
+        """A ``filePath`` target must not be DISPLAYED as though vetted while the
+        keystone never reads that key. Both sides resolve through
         ``hooks.target_paths``, so the parity is structural rather than asserted in
         a comment -- and a sensitive value under any spelling is refused by the
         gate before a human is ever asked.
@@ -7488,6 +8254,129 @@ class TestChatPermissionRequest:
         assert sels[0]["error"] == "unverified_shell"
 
     @pytest.mark.asyncio
+    async def test_kindless_mcp_tool_reaches_the_prompt_instead_of_auto_denying(self, monkeypatch):
+        """A backend that omits `kind` on an MCP tool_call must not cost the user
+        the tool. The frame's `_meta.kiro` transport identity earns the
+        _unverifiable_shell escape -- WITHOUT minting a shell classification, so
+        the low-fidelity gates elsewhere keep treating the title as unverified --
+        and the request reaches the normal approval prompt.
+
+        Drives the shared-runtime parser rather than hand-building the event: the
+        auto-deny came from the cache write being skipped, which an event built
+        with trusted identity fields would hide.
+        """
+        from kiro_crew.acp._dispatch import _build_tool_call_event, build_permission_event
+        from kiro_crew.acp.types import JsonRpcMessage
+
+        shell_cache: dict[str, bool] = {}
+        raw_cache: dict[str, dict] = {}
+        server_cache: dict[str, str] = {}
+        name_cache: dict[str, str] = {}
+        _build_tool_call_event(
+            {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "tc-kindless",
+                "title": "Asking the knowledge service",
+                "rawInput": {"question": "why"},
+                "_meta": {"kiro": {"mcpServerName": "kb", "toolName": "ask"}},
+            },
+            None,
+            shell_cache=shell_cache,
+            raw_params_cache=raw_cache,
+            mcp_server_name_cache=server_cache,
+            tool_name_cache=name_cache,
+        )
+        event, _ = build_permission_event(
+            JsonRpcMessage(
+                id="req-kindless",
+                method="session/request_permission",
+                params={
+                    "toolCall": {
+                        "toolCallId": "tc-kindless",
+                        "title": "Asking the knowledge service",
+                    },
+                    "options": [
+                        {"optionId": "allow", "name": "Allow once", "kind": "allow_once"},
+                        {"optionId": "reject", "name": "Deny", "kind": "reject_once"},
+                    ],
+                },
+            ),
+            shell_cache=shell_cache,
+            raw_params_cache=raw_cache,
+            mcp_server_name_cache=server_cache,
+            tool_name_cache=name_cache,
+        )
+
+        assert event.shell_classified is False  # no classification was minted
+        assert event.is_shell is False
+        assert event.mcp_identity_trusted is True  # the escape's actual carrier
+        provider, sels, reads = await self._drive(monkeypatch, event=event, answer="a")
+        assert provider.calls == [("approve", "req-kindless", False)]
+        assert reads["n"] == 1
+        assert [s["outcome"] for s in sels] == ["allowed"]
+
+    @pytest.mark.asyncio
+    async def test_low_fidelity_child_without_identity_is_rejected_not_prompted(
+        self, monkeypatch, capsys
+    ):
+        """The admission boundary of the child-fidelity opt-in: a child event
+        whose params never reached the cache AND whose MCP identity is
+        unverified must be rejected before any prompt. The prompt for such an
+        event would carry only the agent-authored title -- for an edit, no Path
+        line -- so approval would consent to an undisclosed write."""
+        from kiro_crew.acp.types import EVENT_PERMISSION_REQUEST, AcpEvent
+
+        event = AcpEvent(
+            kind=EVENT_PERMISSION_REQUEST,
+            request_id=9,
+            title="Tidying up the notes file",
+            sub_session_id="child-a",
+            tool_kind="edit",
+            is_shell=False,
+            shell_classified=False,
+            raw_params_trusted=False,
+            options=[{"id": "allow", "label": "Allow Once"}],
+        )
+        assert event.child_low_fidelity is True
+        assert event.child_mcp_identity_trusted is False
+        provider, sels, reads = await self._drive(monkeypatch, event=event, answer="a")
+        assert provider.calls == [("reject", 9, False)]
+        assert reads["n"] == 0  # the human was never asked
+        assert sels[0]["error"] == "child_unverified_context"
+        assert "without verifiable security context" in capsys.readouterr().err
+
+    @pytest.mark.asyncio
+    async def test_identity_trusted_low_fidelity_child_still_reaches_the_prompt(
+        self, monkeypatch, capsys
+    ):
+        """The one admission through that boundary: a child MCP call whose
+        `_meta.kiro` identity survived the cache is presented -- the prompt
+        shows the non-forgeable server/tool pair, the same args-blind consent
+        contract the dashboard's interactive card provides."""
+        from kiro_crew.acp.types import EVENT_PERMISSION_REQUEST, AcpEvent
+
+        event = AcpEvent(
+            kind=EVENT_PERMISSION_REQUEST,
+            request_id=10,
+            title="Asking the knowledge service",
+            sub_session_id="child-a",
+            tool_kind="fetch",
+            is_shell=False,
+            shell_classified=False,
+            raw_params_trusted=False,
+            mcp_server_name="kb",
+            tool_name="ask",
+            mcp_identity_trusted=True,
+            options=[{"id": "allow", "label": "Allow Once"}],
+        )
+        assert event.child_low_fidelity is True
+        assert event.child_mcp_identity_trusted is True
+        provider, sels, reads = await self._drive(monkeypatch, event=event, answer="a")
+        assert provider.calls == [("approve", 10, False)]
+        assert reads["n"] == 1
+        assert "MCP tool: kb / ask" in capsys.readouterr().out
+
+    @pytest.mark.asyncio
     async def test_ordinary_title_and_command_display_unchanged(self, monkeypatch, capsys):
         # The control-stripping must not disturb ordinary text: this is the
         # control for the three cases above.
@@ -7760,9 +8649,14 @@ class TestChatProviderShutdown:
         def __init__(self):
             self.started = 0
             self.shutdowns = 0
+            self.child_fidelity_aware = False
+            self.fidelity_aware_at_start: bool | None = None
 
         async def start(self):
             self.started += 1
+            # Record the flag as start() sees it: the opt-in must precede the
+            # backend spawn, or an early child permission frame races the gate.
+            self.fidelity_aware_at_start = self.child_fidelity_aware
 
         async def shutdown(self):
             self.shutdowns += 1
@@ -7812,6 +8706,25 @@ class TestChatProviderShutdown:
         with pytest.raises(RuntimeError, match="backend died"):
             await cli_chat._chat("hello", None)
         assert provider.shutdowns == 1
+
+    @pytest.mark.asyncio
+    async def test_chat_opts_into_the_child_fidelity_contract_before_start(self, monkeypatch):
+        """The CLI implements the low-fidelity child downgrade (hook gate ->
+        _unverifiable_shell fail-close -> trusted-fields-only human prompt), so
+        _chat must opt in -- and BEFORE start(), or an early child permission
+        frame races the handle's fail-close gate and is rejected as
+        `child_low_fidelity_unaware_consumer`, the auto-deny this fix ends."""
+        import kiro_crew.cli_chat as cli_chat
+
+        provider = self._FakeProvider()
+        self._patch(monkeypatch, provider)
+
+        async def done(*a, **k):
+            return None
+
+        monkeypatch.setattr(cli_chat, "_send_and_print", done)
+        await cli_chat._chat("hello", None)
+        assert provider.fidelity_aware_at_start is True
 
     @pytest.mark.asyncio
     async def test_shutdown_runs_exactly_once_on_the_normal_path(self, monkeypatch):

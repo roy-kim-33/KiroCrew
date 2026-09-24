@@ -174,14 +174,23 @@ describe('ArtifactsPage — card previews per kind', () => {
     const arts = [mkArtifact('app-config', { kind: 'json' })]
     seed({ artifacts: arts, full: { content: '{"a":1,"b":[2]}' } })
     renderWithProviders(<ArtifactsPage />)
-    await waitFor(() => expect(screen.getByText(/"a": 1/)).toBeInTheDocument())
+    // Same boundary as the unparseable-JSON case below: the pretty-printed text
+    // appears only once the ['artifact', slug] query resolves and ContentThumb
+    // re-renders with `full.content`, which outlasted the default 1000ms poll
+    // under load in one of four full runs.
+    await waitFor(() => expect(screen.getByText(/"a": 1/)).toBeInTheDocument(), { timeout: 5000 })
   })
 
   it('keeps unparseable JSON as its raw text instead of blanking the preview', async () => {
     const arts = [mkArtifact('broken-config', { kind: 'json' })]
     seed({ artifacts: arts, full: { content: '{not json at all' } })
     renderWithProviders(<ArtifactsPage />)
-    await waitFor(() => expect(screen.getByText('{not json at all')).toBeInTheDocument())
+    // The raw text only appears once the ['artifact', slug] query resolves and
+    // ContentThumb re-renders with `full.content` — the same async boundary as
+    // the React.lazy chunk case in testing.md, just a data fetch instead of a
+    // module import. Under load that resolution can outlast the default 1000ms
+    // `waitFor` poll, so name the boundary explicitly with a longer timeout.
+    await waitFor(() => expect(screen.getByText('{not json at all')).toBeInTheDocument(), { timeout: 5000 })
   })
 
   it('renders a placeholder rather than an empty preview for blank content', async () => {
@@ -730,6 +739,27 @@ describe('ArtifactsPage — folder tree table', () => {
     expect(screen.getByText('/ws/research/FINDINGS.md')).toBeInTheDocument()
     expect(screen.getByText('markdown')).toBeInTheDocument()
     expect(screen.getByLabelText('Star document')).toBeInTheDocument()
+  })
+
+  it('gives session documents their own labelled lane, not the Unfiled one', async () => {
+    seed({
+      // Filed, so the tree renders a collapsed folder and NOTHING is unfiled:
+      // the lane below reads "Unfiled · 0" while a doc row follows it.
+      artifacts: [mkArtifact('filed-one', { folder_id: 'ops' })],
+      folders: [mkFolder('ops', 'Ops', { item_count: 1 })],
+      docs: [mkDoc('/ws/research/FINDINGS.md', 'FINDINGS.md')],
+    })
+    renderWithProviders(<ArtifactsPage />)
+    await waitFor(() => expect(screen.getByText('FINDINGS.md')).toBeInTheDocument())
+
+    const unfiledRow = screen.getByText(/Unfiled ·\s*0/).closest('tr')
+    const docsLane = screen.getByText(/From your chats ·\s*1/).closest('tr')
+    const docRow = screen.getByText('FINDINGS.md').closest('tr')
+    // The doc is announced by its own count, and is no longer the row the
+    // Unfiled lane appears to introduce.
+    expect(unfiledRow?.nextElementSibling).toBe(docsLane)
+    expect(unfiledRow?.nextElementSibling).not.toBe(docRow)
+    expect(docsLane?.nextElementSibling).toBe(docRow)
   })
 
   it('types a .rst session document as text, not markdown', async () => {

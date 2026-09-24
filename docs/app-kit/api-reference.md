@@ -1,6 +1,6 @@
-# API Reference — KiroCrew Gateway API & Client
+# API Reference — Kiro Crew Gateway API & Client
 
-Reference for the KiroCrew Gateway HTTP and WebSocket APIs, and how apps consume
+Reference for the Kiro Crew Gateway HTTP and WebSocket APIs, and how apps consume
 them.
 
 How you talk to the Gateway depends on where your code runs:
@@ -10,19 +10,27 @@ How you talk to the Gateway depends on where your code runs:
   the dashboard host provides it at runtime through its import map (the bare
   specifier `@kirocrew/app-sdk` resolves to the host's vendored copy via
   `window.__kirocrew_modules`). See
-  [getting-started.md](getting-started.md) and the [App SDK Hooks](#app-sdk-hooks)
+  [getting-started.md](getting-started.md) and the [App SDK Hooks](#app-sdk-hooks-dashboard-ui)
   section below.
 - **Python apps / external CLI tools / services** — use the standalone
-  `kirocrew-client` package (`pip install kirocrew-client`). It is async
-  (`aiohttp`) and has no dependency on the KiroCrew main package. See the
-  [Python Client](#python-client) section.
+  `kirocrew-client` package, carried in this repository under
+  `packages/kirocrew-client-py/`. It is async (`aiohttp`) and has no dependency on
+  the Kiro Crew main package, but it is not published to PyPI — use it from a source
+  checkout. See the [Python Client](#python-client) section.
 - **Node.js / Electron apps** — call the Gateway REST/WS endpoints directly via
-  `fetch()` / a WebSocket. The full endpoint list is in
+  `fetch()` / a WebSocket. Selected endpoint paths are in
   [Gateway REST API Endpoints](#gateway-rest-api-endpoints).
 
-There is no published TypeScript gateway-client npm package. The `kirocrew-client`
-method names below describe the canonical Gateway API surface — the same
-endpoints any client (including raw `fetch`) talks to.
+There is no published TypeScript gateway-client npm package, and none is planned
+here — the camelCase names used throughout the sections below are **labels for
+Gateway endpoints**, not callable methods. Read them as endpoint identifiers.
+The `@kirocrew/app-sdk` hooks are real and callable — see the next section; they
+resolve from the host import map. The `kirocrew-client` Python package is **not
+published**: it lives in this repository under `packages/kirocrew-client-py/`, is
+outside the installed distribution, and has no release on PyPI, so `pip install
+kirocrew-client` does not work. Use it from a source checkout, or call the
+endpoints directly with `fetch` or `aiohttp`. Its method list is in
+[Python Client](#python-client).
 
 ## App SDK Hooks (dashboard UI)
 
@@ -39,11 +47,85 @@ function MyPage() {
 }
 ```
 
-`useAppApi()` returns a client whose methods (`get`, `post`, `put`, `patch`,
-`del`) call the Gateway endpoints listed below, scoped to the `permissions.api`
-paths your `app.json` declares. The host injects auth automatically.
+`useAppApi()` returns a client whose methods (`raw`, `request`, `get`, `post`,
+`put`, `patch`, `del`) call the Gateway endpoints listed below, scoped to the
+`permissions.api` paths your `app.json` declares. JSON methods parse a JSON
+response; an empty successful response returns `undefined`.
+
+- `raw(path, init?)` returns a successful `Response` without consuming its body.
+  Use it for binary downloads, text or streamed responses and response headers.
+  Non-success responses still throw `AppApiError`. Supply an `AbortSignal` for
+  long-lived streams and abort or cancel the reader when the component unmounts;
+  the method does not implement EventSource reconnect or SSE parsing.
+
+- `request<T>(path, init?)` accepts `RequestInit`, including raw bodies such as
+  `FormData`, headers and an abort signal. It does not set a content type for you.
+- `get<T>(path, init?)` and `del<T>(path, init?)` fix the HTTP method.
+- `post<T>(path, body?, init?)`, `put<T>(path, body?, init?)` and
+  `patch<T>(path, body?, init?)` serialize the body argument as JSON. Their method
+  and body arguments take precedence over `init.method` and `init.body`. Headers
+  are merged with a default `Content-Type: application/json` unless you specify
+  another media type.
+
+The host owns `X-Session-Key`: chat surfaces use their bound session and routed
+app pages use the core dashboard-page identity, `dashboard:ui`. A host-provided
+key overrides a caller-supplied one. If a host has no binding, supplying that
+header is rejected before a request is sent; callers of this scoped client
+cannot choose a session. This is a frontend guardrail, not isolation from other
+JavaScript in the dashboard document; backend authorization remains authoritative.
+The path check applies to the initial URL. Browser redirect behavior remains
+controlled by `RequestInit.redirect` (default `follow`); use `redirect: 'error'`
+when the call must not follow redirects. Redirect targets are not rechecked by
+this client.
+
+HTTP failures remain `Error` objects with the message `API <status>: <body>` and
+now also carry `name: 'AppApiError'`, numeric `status` and string `body`. Import
+`AppApiError` as a **type**, not a runtime constructor. The body is unparsed, so
+parse it only when the endpoint promises JSON (for example, a conflict response).
+Network, abort and successful-response JSON parsing failures retain their original
+error types. Stale-owner reauthentication signaling still runs before an HTTP
+failure is thrown.
+
+The path matcher uses the backend's declared-pattern semantics: `/api/example`
+matches itself and slash-delimited children; `/api/example/*` also includes the
+base path; `/api/example*` includes any string prefix match. Blank entries match
+nothing, surrounding whitespace is stripped, and request paths are normalized
+before matching. A bare trailing slash is literal, not shorthand for `/*`.
+
+An explicit authentication-expiry response (`403`, `X-Auth-Required: true`)
+notifies the dashboard's existing recovery handler. It does not turn ordinary
+permission denials into refresh attempts or automatically replay writes.
 
 For the full hook list see [getting-started.md](getting-started.md#app-sdk-hooks).
+
+## Embedded Chat
+
+`ChatEmbed` mounts Kiro Crew's native transcript and compact composer for an
+existing session. The required `slotKey` selects the session. Existing props such
+as `agent`, `placeholder`, `frameless`, `startAtBottom`, `onSend`, and
+`aboveComposer` keep their current contracts.
+
+```tsx
+import { ChatEmbed } from '@kirocrew/app-sdk'
+
+<ChatEmbed slotKey="coder-abc123" />
+```
+
+The composer accepts multiple lines. `Enter` sends the draft, `Shift+Enter`
+inserts a line break, and an Enter used to commit an input method editor (IME)
+candidate does not send. The box grows with the draft up to 240 pixels, then
+keeps its height and scrolls vertically.
+
+A host that boxes the embed at a fixed height passes `composerMaxHeight` (in
+pixels) to lower that cap, so a long draft cannot take most of the box from the
+transcript. The resting (empty) size of the composer is unchanged; only the cap
+moves. Omitted, the 240-pixel default applies.
+
+```tsx
+<div style={{ height: 420 }}>
+  <ChatEmbed slotKey="coder-abc123" composerMaxHeight={160} />
+</div>
+```
 
 ## Native Chat Panel
 
@@ -262,40 +344,47 @@ that genuinely needs live app state is supplied by the host as an entry.
 
 ## Gateway API Surface
 
-The sections below document the canonical Gateway API surface as exposed by the
-`kirocrew-client` Python package (see the [Python Client](#python-client)
-section for the constructor and full method list). Method names are also a
-convenient way to refer to each endpoint — the same endpoints any client
-(including raw `fetch`) talks to.
+The sections below name the Gateway API surface. A name here is an **endpoint
+label**, not a guarantee that a client method exists for it: the source-only
+`kirocrew-client` Python package covers part of this surface, and
+[Python Client](#python-client) marks which part. For anything it does not
+implement, call the endpoint directly — the paths are in
+[Gateway REST API Endpoints](#gateway-rest-api-endpoints).
 
-When `app_name` is set and no explicit auth is provided, the client auto-reads
-the app secret from `~/.kiro/crew/apps/{name}/.app_secret` and exchanges it
-for a short-lived token via `POST /api/apps/{name}/token`.
+The `Returns` column describes the response shape. It is not a TypeScript type:
+no TypeScript client ships, so `SlotInfo`, `GatewayStatus`, `SystemInfo` and
+their siblings are response-shape names rather than importable types.
+
+When `app_name` is set and no explicit auth is provided, the Python client reads
+the app secret from `~/.kiro/crew/apps/{name}/.app_secret`. For a remote Gateway,
+call `await client.authenticate()` before the first request; the context manager
+does not exchange the secret automatically. The same exchange refreshes a token
+after a 401/403 response.
 
 ### Authentication
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `authenticate()` | `Promise<boolean>` | Exchange app secret for token (auto-called if appName set) |
-| `setToken(token)` | `void` | Manually set auth token on both HTTP and WS clients |
+| `authenticate()` | `boolean` | Exchange the app secret for a token; call explicitly before the first remote request |
+| `setToken(token)` | `void` | Conceptual token assignment; the Python client accepts `token=` in its constructor |
 
 ### Connection
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `ping()` | `Promise<boolean>` | Check if Gateway is reachable |
-| `getStatus()` | `Promise<GatewayStatus>` | Gateway health (version, uptime, slots, provider) |
-| `getSystemInfo()` | `Promise<SystemInfo>` | CPU, memory, disk metrics |
+| `ping()` | `boolean` | Check if Gateway is reachable |
+| `getStatus()` | `GatewayStatus` | Gateway health (version, uptime, slots, provider) |
+| `getSystemInfo()` | `SystemInfo` | CPU, memory, disk metrics |
 
 ### Chat Slots
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `createSlot(name, agent?)` | `Promise<SlotInfo>` | Create a new chat session |
-| `listSlots()` | `Promise<SlotInfo[]>` | List all active sessions |
-| `deleteSlot(slotId)` | `Promise<void>` | Remove a session |
-| `getSlotHistory(slotId, limit?)` | `Promise<{messages, total}>` | Get slot message history |
-| `sendMessage(slotId, message)` | `Promise<void>` | Send a message (validates length, auto-flushes pending context) |
+| `createSlot(name, agent?)` | `SlotInfo` | Create a new chat session |
+| `listSlots()` | `SlotInfo[]` | List all active sessions |
+| `deleteSlot(slotId)` | `—` (no body) | Remove a session |
+| `getSlotHistory(slotId, limit?)` | `{messages, total}` | Get slot message history |
+| `sendMessage(slotId, message)` | `—` (no body) | Send a message (validates length, auto-flushes pending context) |
 
 ### WebSocket Events
 
@@ -323,21 +412,21 @@ WebSocket event types: `chat_chunk`, `chat_done`, `chat_message`, `chat_error`,
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `spawn(task, agent?)` | `Promise<string>` | Spawn a background subagent |
-| `spawnMany(tasks, agents?)` | `Promise<string[]>` | Spawn multiple subagents in parallel |
-| `listSubagents()` | `Promise<SubagentInfo[]>` | List all subagents |
-| `getSubagentStatus(id)` | `Promise<SubagentResult>` | Get subagent output |
+| `spawn(task, agent?)` | `string` | Spawn a background subagent |
+| `spawnMany(tasks, agents?)` | `string[]` | Spawn multiple subagents in parallel |
+| `listSubagents()` | `SubagentInfo[]` | List all subagents |
+| `getSubagentStatus(id)` | `SubagentResult` | Get subagent output |
 
 ### Cron Jobs
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `addCron(name, options)` | `Promise<CronJob>` | Create a scheduled job |
-| `listCrons()` | `Promise<CronJob[]>` | List all cron jobs |
-| `updateCron(id, options)` | `Promise<CronJob>` | Update a cron job |
-| `removeCron(id)` | `Promise<void>` | Delete a cron job |
-| `pauseCron(id)` | `Promise<void>` | Pause without deleting |
-| `resumeCron(id)` | `Promise<void>` | Resume a paused job |
+| `addCron(name, options)` | `CronJob` | Create a scheduled job |
+| `listCrons()` | `CronJob[]` | List all cron jobs |
+| `updateCron(id, options)` | `CronJob` | Update a cron job |
+| `removeCron(id)` | `—` (no body) | Delete a cron job |
+| `pauseCron(id)` | `—` (no body) | Pause without deleting |
+| `resumeCron(id)` | `—` (no body) | Resume a paused job |
 
 #### Watching something without paying for a model call (`kiro_crew.irq`)
 
@@ -357,7 +446,7 @@ Schedule a **script** cron instead and build it on `kiro_crew.irq`, the
 interrupt controller. The script runs in a subprocess with no model call at
 all; a quiet tick is free. Only an unexpected observation raises a wake, and the
 wake is delivered into the session that armed the cron as a real agent turn.
-Full design: `docs/system-specs/features/agent-interrupt-controller.md`.
+Full design: `docs/system-specs/modules/agent-interrupt-controller.md`.
 
 You write the two things that are your domain knowledge — what to poll, and
 what counts as an anomaly — and the module owns masking (so one condition wakes
@@ -392,8 +481,8 @@ class DeployProbe(Probe):
             ])
         obs = []
         if status.rolled_back:
-            # Nothing improves by waiting -> NMI bypasses coalescing.
-            obs.append(Observation("rollback", Severity.NMI,
+            # Nothing improves by waiting -> IMMEDIATE bypasses coalescing.
+            obs.append(Observation("rollback", Severity.IMMEDIATE,
                                    f"{self.env} rolled back."))
         for stage in status.failed_stages:
             obs.append(Observation(f"stage:{stage}", Severity.WAKE,
@@ -418,8 +507,8 @@ Rules:
   It is the only place a verdict is raised.
 - A failed observation returns `Tick(fetch_ok=False)`, never an empty `Tick` —
   an empty tick reads as "nothing is wrong".
-- Use `Severity.NMI` only for what genuinely cannot improve by waiting. Using
-  it to mean "important" defeats coalescing.
+- Use `Severity.IMMEDIATE` only for what genuinely cannot improve by waiting.
+  Using it to mean "important" defeats coalescing.
 - Supply an `epoch` when the subject has an identity token. Without one there
   are no resets, so a re-triggered subject inherits the previous run's masks.
 - Filter out conditions the operator already knows about (a check red on the
@@ -433,48 +522,125 @@ Rules:
   cron interval of latency, because a window cannot open and fire within the
   same tick.
 
+### Content Scrubbing (`ctx.scrub`)
+
+Before your app sends content anywhere off the machine — an external document
+store, a ticket, a wiki — run it through `ctx.scrub`. It applies the same
+credential and exfiltration-URL redaction the gateway applies on its own
+boundaries, by reference rather than by copy, so a pattern tightened in a later
+release reaches your app with the wheel.
+
+```python
+result = ctx.scrub.outbound(body)          # may raise; see below
+if result.redacted:
+    ctx.logger.info("scrub removed %d credential(s), %d url(s)",
+                    result.credentials_removed, result.urls_removed)
+publish(result.text)          # only the scrubbed text may leave
+```
+
+`outbound(text) -> ScrubResult` carries `text`, `credentials_removed`,
+`urls_removed` and `redacted`.
+
+You get **counts, not descriptions**, and there is deliberately no way to learn
+which value was removed. That is not an omission to be filled in later: the
+gateway's internal exfiltration warning includes the offending domain and the
+start of the query string, so handing those through would move a secret out of
+your published text and into your logs. Report the fact — "we removed something
+before sending" — rather than rewriting the user's content silently.
+
+Use `redacted` rather than comparing against the original. It can be `True` with
+both counts at zero: on a host running an edition companion, extra patterns apply
+that the base counts do not include. It is never `False` when something was
+removed.
+
+**`outbound` can raise, and you must not swallow it.** On a host whose companion
+fails to compose, it propagates rather than quietly falling back to weaker
+redaction. Abandon the publish when that happens — publishing unredacted is worse
+than not publishing.
+
+`outbound` is the only method, on purpose: neither single pass is exposed alone,
+because an app that wants half a redaction wants something this seam should not
+make easy.
+
+`ctx.scrub` needs **no permission** and is always present: it only removes data, so
+there is nothing to withhold and no `None` branch that could become a silent
+no-redaction path. **Do not copy these patterns into your app** — a set that drifts
+from the gateway's is a control that looks present and is not.
+
+### Audit Events (`ctx.audit`)
+
+When your app acts on the user's behalf against something outside the machine,
+record the decision in the same append-only security event log the gateway's own
+decisions land in — otherwise "who changed what, and what was refused" is
+answerable for the gateway and unanswerable for your half of the same operation.
+
+```python
+ctx.audit.record("publish", "success", resources=doc_id)
+ctx.audit.record("publish", "denied", resources=doc_id, error="no edit access")
+```
+
+`record(operation, outcome, *, resources="", error="")` **never raises** — an audit
+sink that is unwritable must not fail the user's publish.
+
+`outcome` is a short verb you choose (`success`, `denied`, `error`, `completed`, …).
+It is not checked against a vocabulary — a spelling of your own is kept, because
+rewriting it would record something other than what happened. It is redacted and
+length-clipped like `resources` and `error`, so a credential that reaches it by
+accident is not written; that is a no-op for any real outcome value. This log is
+append-only and readable over `/api/sel/events`, so nothing put in it can be taken
+back — don't route free-form remote output through these fields.
+
+There is no `caller=` argument. Attribution is minted from your app name
+(`app:<name>`, the same tag `ctx.cron` uses for ownership), so there is no
+parameter to pass the wrong value into. It is **cooperative, not unforgeable**: hook
+code runs inside the gateway process and can construct another app's SDK or reach
+the log directly, so treat `app:<name>` as "which app said this", not as proof.
+`operation` is namespaced the same way, so two apps cannot collide on a bare
+`"publish"`. No permission gates it: an app cannot obtain anything with it, only
+state what it did.
+
 ### Lessons
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `addLesson(rule, category, scope?)` | `Promise<void>` | Save a learned rule |
-| `listLessons()` | `Promise<Lesson[]>` | List all lessons |
-| `removeLesson(query)` | `Promise<void>` | Remove matching lessons |
+| `addLesson(rule, category, scope?)` | `—` (no body) | Save a learned rule |
+| `listLessons()` | `Lesson[]` | List all lessons |
+| `removeLesson(query)` | `—` (no body) | Remove matching lessons |
 
 ### Notifications
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `sendNotification(text, options?)` | `Promise<void>` | Send via Slack or dashboard |
-| `listNotifications()` | `Promise<{notifications}>` | List notifications |
-| `ackNotifications()` | `Promise<void>` | Acknowledge all notifications |
+| `sendNotification(text, options?)` | `—` (no body) | Send via Slack or dashboard |
+| `listNotifications()` | `{notifications}` | List notifications |
+| `ackNotifications()` | `—` (no body) | Acknowledge all notifications |
 
 ### Approvals
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `approveAction(slotId, taskId)` | `Promise<void>` | Approve a pending tool action |
-| `rejectAction(slotId, taskId)` | `Promise<void>` | Reject a pending tool action |
-| `resolveApproval(approvalId, approved)` | `Promise<void>` | Resolve an approval by ID |
-| `getApprovalMode()` | `Promise<'auto'\|'interactive'>` | Get current approval mode |
-| `setApprovalMode(mode)` | `Promise<void>` | Set approval mode |
+| `approveAction(slotId, taskId)` | `—` (no body) | Approve a pending tool action |
+| `rejectAction(slotId, taskId)` | `—` (no body) | Reject a pending tool action |
+| `resolveApproval(approvalId, approved)` | `—` (no body) | Resolve an approval by ID |
+| `getApprovalMode()` | `'auto'` \| `'interactive'` | Get current approval mode |
+| `setApprovalMode(mode)` | `—` (no body) | Set approval mode |
 
 ### Models
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `listModels()` | `Promise<ModelInfo[]>` | List available LLM models |
-| `setSlotModel(slotId, model)` | `Promise<void>` | Set model for a slot |
+| `listModels()` | `ModelInfo[]` | List available LLM models |
+| `setSlotModel(slotId, model)` | `—` (no body) | Set model for a slot |
 
 ### MCP Servers
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `listMcpServers()` | `Promise<McpServerInfo[]>` | List registered MCP servers |
-| `registerMcpServer(def)` | `Promise<void>` | Register an MCP server (requires name + command) |
-| `removeMcpServer(name)` | `Promise<void>` | Remove an MCP server |
-| `registerAppMcp(name, entry)` | `Promise<void>` | Write MCP entry to `~/.kiro/crew/mcp.json` (Node.js only) |
-| `unregisterAppMcp(name)` | `Promise<void>` | Remove MCP entry from `~/.kiro/crew/mcp.json` (Node.js only) |
+| `listMcpServers()` | `McpServerInfo[]` | List registered MCP servers |
+| `registerMcpServer(def)` | `—` (no body) | Register an MCP server (requires name + command) |
+| `removeMcpServer(name)` | `—` (no body) | Remove an MCP server |
+| `registerAppMcp(name, entry)` | `—` (no body) | Write MCP entry to `~/.kiro/crew/mcp.json` (Node.js only) |
+| `unregisterAppMcp(name)` | `—` (no body) | Remove MCP entry from `~/.kiro/crew/mcp.json` (Node.js only) |
 
 ### Agent & Skill Installation (Node.js only)
 
@@ -489,30 +655,30 @@ Rules:
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `dispatchAgent(agent, prompt)` | `Promise<TaskResult>` | Run agent synchronously |
-| `dispatchAgentAsync(agent, prompt)` | `Promise<string>` | Run agent in background |
-| `getTaskResult(taskId)` | `Promise<TaskResult>` | Poll task status |
+| `dispatchAgent(agent, prompt)` | `TaskResult` | Run agent synchronously |
+| `dispatchAgentAsync(agent, prompt)` | `string` | Run agent in background |
+| `getTaskResult(taskId)` | `TaskResult` | Poll task status |
 
 ### Gateway Config
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `getGatewayConfig(key)` | `Promise<Record<string, unknown>>` | Read gateway config section |
-| `setGatewayConfig(key, value)` | `Promise<void>` | Write gateway config section |
+| `getGatewayConfig(key)` | a JSON object | Read gateway config section |
+| `setGatewayConfig(key, value)` | `—` (no body) | Write gateway config section |
 
 ### App Storage
 
 | Method | Returns | Description |
 |--------|---------|-------------|
 | `getAppDataDir()` | `string` | App-scoped data directory path |
-| `getAppConfig()` | `Promise<Record<string, unknown>>` | Read app config via REST |
-| `setAppConfig(config)` | `Promise<void>` | Write app config via REST |
+| `getAppConfig()` | a JSON object | Read app config via REST |
+| `setAppConfig(config)` | `—` (no body) | Write app config via REST |
 
 ### Memory
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `memorySearch(query, topK?)` | `Promise<MemoryResult[]>` | Semantic memory search |
+| `memorySearch(query, topK?)` | `MemoryResult[]` | Semantic memory search |
 
 ### Context Injection
 
@@ -520,8 +686,8 @@ Silent background context for LLM — content appears in the next user-initiated
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `injectContext(slotId, content, options?)` | `Promise<void>` | Inject context (null slotId = buffer locally) |
-| `flushPendingContext(slotId)` | `Promise<void>` | Flush buffered entries to a slot |
+| `injectContext(slotId, content, options?)` | `—` (no body) | Inject context (null slotId = buffer locally) |
+| `flushPendingContext(slotId)` | `—` (no body) | Flush buffered entries to a slot |
 | `setDefaultSlot(slotId)` | `void` | Auto-flush pending context on sendMessage |
 | `pendingContextCount` | `number` | Number of buffered context entries |
 
@@ -545,24 +711,31 @@ Body: `{ content, source?, maxAge?, ephemeral? }`. A note always does both write
 
 Returns `{ ok, appended, visibleDeferred, deliveryConditional, contextSkipped, pending }`. When the source's per-source context cap is full the request is **not** rejected: the visible line is still written and `contextSkipped` is true, because the cap protects the context queue rather than the transcript. If a turn is already running the note is held until that turn ends -- `appended` is false and `visibleDeferred` is true -- so that it lands on the next turn rather than the one it was written during. Ordering is preserved, and `deliveryConditional` is true whenever a note is held -- because a hold is delivered only if the slot still routes to the SAME session when the turn ends. An unbound slot can acquire a foreign binding while the note waits (a cron result or workflow injection claims an empty `linked_session_key` with no running gate), and both the transcript path and the next turn's session resolve that binding at flush time rather than at the POST. When that happens BOTH halves of the note are dropped rather than retargeted, because writing them would surface content authorized for one conversation inside another; the drop is recorded in the security-event log. So a 200 with `visibleDeferred: true` promises ordering against the running turn, not that the note will certainly be written. `pending` counts held entries as well as queued ones.
 
-**A 200 means "accepted for this gateway lifetime", not durable delivery.** Both halves of a note live in memory only -- the held visible line and the queued context, the latter exactly as `/context`'s queue has always behaved -- so a gateway restart between the acknowledgement and the next turn drops them. A caller that needs a note to survive a restart must re-post it; `visibleDeferred: true` promises ordering against the running turn, not persistence.
+**A 200 for a held note is a durable acknowledgement — for a slot that has a durable identity.** The hold is persisted verbatim (both halves, the silent context included) into the slot's own session metadata *before* the 200 is returned, replayed into the hold by both slot-restore paths after a gateway restart, and retired by the save that commits the delivered rows -- so a note accepted with `visibleDeferred: true` survives a restart and is delivered, unaltered, on the first turn after it. Two edges keep the original gateway-lifetime meaning instead: a memory-only deployment (no conversation log at all), and a slot that has never been persisted (no metadata line to attach the hold to -- such a tab does not itself survive a restart, so there is no restored slot the note could outlive). Do **not** re-post a held note after a restart; the restored hold delivers it, and a re-post would put the same line in the transcript twice. Three boundary refusals protect that promise: a note posted during a running turn is capped at 4,000 characters (`413`, code `deferred_note_too_large` -- shorten it or wait for the turn to end), a slot whose durable hold is full answers `429 deferred_notes_full` until its rows are saved, and a slot that is rebound to another session while the hold is persisting answers the endpoint's uniform `404` -- the note was neither delivered nor made durable (a note the turn-end flush drops at that same rebind seam takes this `404` too; the 200 stands only when the note observably exists in a delivered row or the durable hold). The one retry-the-same-request signal is a `503` with code `deferred_note_persist_failed`, which means the durable write itself failed and the note was **not** accepted. The queued context of an *immediate* (non-held) note still behaves exactly as `/context`'s queue always has -- in memory, for this gateway lifetime. Note the retention consequence of durability: a HELD note's context half -- the trusted-caller channel, which is deliberately not redacted -- now lives on disk in the session metadata until delivery or retirement, where an immediate note's context only ever lived in memory.
 
 ### Proxy Authentication (Server-side)
 
-Verify that an incoming request was signed by the KiroCrew gateway reverse proxy. Use in app backends to authenticate proxied requests.
+Verify that an incoming request was signed by the Kiro Crew Gateway reverse proxy.
+Use these main-package helpers in Python app backends:
 
 | Function | Returns | Description |
 |----------|---------|-------------|
-| `verifyProxyRequest(req, appName, opts?)` | `boolean` | Verify HMAC signature on any Node.js request object |
-
-Options: `{ secret?: string, maxAgeSecs?: number }`
+| `raw_request_target(request)` | `str` | Preserve the raw percent-encoded path and query that the Gateway signed |
+| `proxy_secret()` | `str` | Read the injected `KIROCREW_PROXY_SECRET`, or an empty string |
+| `verify_proxy_request(header, *, method, target, body, secret=None, now=None)` | `bool` | Verify the body-bound HMAC and fixed ±60-second freshness window; fail closed on malformed input |
 
 ---
 
 ## Python Client
 
-Standalone async client using `aiohttp` — `pip install kirocrew-client`. Covers
-the full Gateway API surface documented above.
+Standalone async client using `aiohttp`, carried in this repository under
+`packages/kirocrew-client-py/`. It is not published to PyPI or included in the
+main wheel. Install it from a source checkout; it covers part of the Gateway API
+surface documented above.
+
+```bash
+python -m pip install -e /path/to/KiroCrew/packages/kirocrew-client-py
+```
 
 ```python
 from kirocrew_client import KiroCrewClient
@@ -578,7 +751,7 @@ async with KiroCrewClient(app_name="my-app") as mc:
 KiroCrewClient(
     base_url="",              # default: http://localhost:{KIROCREW_PORT or 5476}
     token="",                 # optional for localhost
-    app_name="",              # for app-scoped storage & auto-auth
+    app_name="",              # app-scoped storage and secret lookup
     timeout=30,               # request timeout seconds
     max_retries=3,            # retry count
     retry_base_delay=1.0,     # base delay for backoff
@@ -587,10 +760,23 @@ KiroCrewClient(
 )
 ```
 
+For a remote Gateway, pass `token=...` or call `await client.authenticate()`
+after entering the context. Local loopback requests need no token. Setting
+`app_name` alone only locates the app secret; it does not authenticate during
+`__aenter__`.
+
 ### Method Reference
 
-Method names use `snake_case` per Python convention. The left column is the
-canonical API-surface name used in the sections above:
+The left column is the endpoint label used in the sections above; the right
+column is the shipped Python method, in `snake_case` per Python convention.
+
+Rows marked *not implemented* are Gateway endpoints the shipped Python client
+does not wrap yet. Call those endpoints directly with `aiohttp` (or any HTTP
+client) using the paths in
+[Gateway REST API Endpoints](#gateway-rest-api-endpoints). The client also ships
+no WebSocket surface, so the `connect` / `disconnect` / `on*` handlers in
+[WebSocket Events](#websocket-events) are endpoint documentation for a raw
+WebSocket connection rather than client methods.
 
 | API surface | Python |
 |-----------|--------|
@@ -600,42 +786,42 @@ canonical API-surface name used in the sections above:
 | `createSlot(name, agent?)` | `create_slot(name, agent="")` |
 | `listSlots()` | `list_slots()` |
 | `deleteSlot(id)` | `delete_slot(id)` |
-| `getSlotHistory(id, limit?)` | `get_slot_history(id, limit=50)` |
+| `getSlotHistory(id, limit?)` | *not implemented — call the endpoint* |
 | `sendMessage(id, msg)` | `send_message(id, msg)` |
 | `spawn(task, agent?)` | `spawn(task, agent="")` |
 | `spawnMany(tasks, agents?)` | `spawn_many(tasks, agents=None)` |
-| `listSubagents()` | `list_subagents()` |
+| `listSubagents()` | *client wrapper expects a bare list, but `GET /api/spawn` returns `{agents}`; call it directly and read `agents`* |
 | `getSubagentStatus(id)` | `get_subagent_status(id)` |
 | `addCron(name, opts)` | `add_cron(name, **opts)` |
-| `listCrons()` | `list_crons()` |
-| `updateCron(id, opts)` | `update_cron(id, **opts)` |
+| `listCrons()` | *client wrapper expects a bare list, but `GET /api/crons` returns `{jobs, server_tz}`; call it directly and read `jobs`* |
+| `updateCron(id, opts)` | *client wrapper currently uses `PUT`, but the Gateway route is `PATCH`; call `PATCH /api/crons/{id}` directly* |
 | `removeCron(id)` | `remove_cron(id)` |
 | `pauseCron(id)` | `pause_cron(id)` |
 | `resumeCron(id)` | `resume_cron(id)` |
 | `addLesson(rule, cat, scope?)` | `add_lesson(rule, cat, scope="")` |
-| `listLessons()` | `list_lessons()` |
+| `listLessons()` | *client wrapper expects a bare list, but `GET /api/lessons` returns `{lessons, total, ...}`; call it directly and read `lessons`* |
 | `removeLesson(query)` | `remove_lesson(query)` |
 | `sendNotification(text, opts?)` | `send_notification(text, **opts)` |
-| `listNotifications()` | `list_notifications()` |
-| `ackNotifications()` | `ack_notifications()` |
-| `approveAction(slot, task)` | `approve_action(slot, task)` |
-| `rejectAction(slot, task)` | `reject_action(slot, task)` |
-| `resolveApproval(id, ok)` | `resolve_approval(id, ok)` |
-| `getApprovalMode()` | `get_approval_mode()` |
-| `setApprovalMode(mode)` | `set_approval_mode(mode)` |
-| `listModels()` | `list_models()` |
-| `setSlotModel(slot, model)` | `set_slot_model(slot, model)` |
-| `getGatewayConfig(key)` | `get_gateway_config(key)` |
-| `setGatewayConfig(key, val)` | `set_gateway_config(key, val)` |
-| `listMcpServers()` | `list_mcp_servers()` |
+| `listNotifications()` | *not implemented — call the endpoint* |
+| `ackNotifications()` | *not implemented — call the endpoint* |
+| `approveAction(slot, task)` | *not implemented — call the endpoint* |
+| `rejectAction(slot, task)` | *not implemented — call the endpoint* |
+| `resolveApproval(id, ok)` | *not implemented — call the endpoint* |
+| `getApprovalMode()` | *not implemented — call the endpoint* |
+| `setApprovalMode(mode)` | *not implemented — call the endpoint* |
+| `listModels()` | *not implemented — call the endpoint* |
+| `setSlotModel(slot, model)` | *not implemented — call the endpoint* |
+| `getGatewayConfig(key)` | *not implemented — call the endpoint* |
+| `setGatewayConfig(key, val)` | *not implemented — call the endpoint* |
+| `listMcpServers()` | *client wrapper currently calls an unregistered path; call `GET /api/mcp` directly* |
 | `registerMcpServer(def)` | `register_mcp_server(name, cmd, args?, env?)` |
 | `removeMcpServer(name)` | `remove_mcp_server(name)` |
-| `registerAppMcp(name, entry)` | `register_app_mcp(name, *, url?, cmd?, ...)` |
-| `unregisterAppMcp(name)` | `unregister_app_mcp(name)` |
-| `installAgentConfig(name, cfg)` | `install_agent_config(name, cfg)` |
-| `removeAgentConfig(name)` | `remove_agent_config(name)` |
-| `installSkill(name, dir)` | `install_skill(name, dir)` |
-| `removeSkill(name)` | `remove_skill(name)` |
+| `registerAppMcp(name, entry)` | *not implemented — call the endpoint* |
+| `unregisterAppMcp(name)` | *not implemented — call the endpoint* |
+| `installAgentConfig(name, cfg)` | *not implemented — call the endpoint* |
+| `removeAgentConfig(name)` | *not implemented — call the endpoint* |
+| `installSkill(name, dir)` | *not implemented — call the endpoint* |
+| `removeSkill(name)` | *not implemented — call the endpoint* |
 | `dispatchAgent(agent, prompt)` | `dispatch_agent(agent, prompt)` |
 | `dispatchAgentAsync(agent, prompt)` | `dispatch_agent_async(agent, prompt)` |
 | `getTaskResult(id)` | `get_task_result(id)` |
@@ -647,55 +833,11 @@ canonical API-surface name used in the sections above:
 | `flushPendingContext(slot)` | `flush_pending_context(slot)` |
 | `setDefaultSlot(slot)` | `set_default_slot(slot)` |
 
-**Proxy Authentication (standalone functions):**
-
-| API surface | Python |
-|-----------|--------|
-| `verifyProxyRequest(req, appName, opts?)` | `verify_proxy_request(request, app_name, *, secret?, max_age_secs?)` |
-| — | `verify_proxy_request_raw(header, method, path, app_name, ...)` |
-
----
-
-## AppManifest
-
-Validate and serialize app.json manifests, via the `kirocrew-client` package.
-
-```python
-from kirocrew_client import AppManifest
-
-m = AppManifest.from_dict({"name": "my-app", "version": "1.0.0", ...})
-errors = m.validate()   # list[str] — empty if valid
-data = m.to_dict()
-```
-
-## AppLifecycle
-
-Manage app installation via the Gateway REST API.
-
-```python
-from kirocrew_client import KiroCrewClient, AppLifecycle
-
-async with KiroCrewClient() as mc:
-    lifecycle = AppLifecycle(mc)
-    await lifecycle.install("/path/to/my-app")
-    await lifecycle.enable("my-app")
-    await lifecycle.disable("my-app")
-    await lifecycle.uninstall("my-app")
-    apps = await lifecycle.list()
-```
-
-## GatewayManager
-
-Manage the KiroCrew Gateway process (start, stop, health check).
-
-```python
-from kirocrew_client import GatewayManager
-
-gm = GatewayManager(port=5476)
-await gm.start()
-healthy = await gm.is_healthy()
-await gm.stop()
-```
+The standalone package exports only `KiroCrewClient`, `KiroCrewError`, and
+`ErrorCode`. It does not export `AppManifest`, `AppLifecycle`, `GatewayManager`,
+proxy-auth helpers, or a WebSocket client. Validate manifests through the main
+package's install path, manage the Gateway with the `kirocrew` CLI, and use
+`kiro_crew.apps.proxy_auth` only from a backend that can import the main package.
 
 ---
 
@@ -713,7 +855,7 @@ All `kirocrew-client` errors are `KiroCrewError` instances with `code`,
 | `RATE_LIMITED` | 429 response | Yes (Retry-After or backoff) |
 | `SERVER_ERROR` | 5xx response | Yes (exponential backoff) |
 | `NETWORK_ERROR` | Timeout or connection failure | Yes (exponential backoff) |
-| `WS_DISCONNECTED` | WebSocket not connected | No |
+| `WS_DISCONNECTED` | Reserved enum value; the current client has no WebSocket surface and does not emit it | No |
 
 ```python
 from kirocrew_client import KiroCrewError
@@ -728,8 +870,30 @@ except KiroCrewError as e:
 
 ## Gateway REST API Endpoints
 
-The `useAppApi()` hook and the `kirocrew-client` package wrap these Gateway
-endpoints. Apps can also call them directly via `fetch()`.
+The `useAppApi()` hook can call declared paths, while the source-only Python
+client wraps the subset named below. These API routes require the appropriate
+dashboard, app, or internal credential; a bare `curl` request is not authenticated.
+
+### Core endpoints used by the Python client
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/status` | Gateway status and connectivity check |
+| GET | `/api/system` | System metrics |
+| GET/POST | `/api/chat/slots` | List or create chat slots |
+| GET/DELETE | `/api/chat/slots/{slot}` | Read slot detail/history or delete a slot |
+| POST | `/api/chat` | Send a chat turn |
+| GET/POST | `/api/spawn` | List or start subagents |
+| GET | `/api/spawn/{agent_id}` | Read subagent status |
+| GET/POST | `/api/crons` | List or create cron jobs |
+| PATCH/DELETE | `/api/crons/{job_id}` | Update or delete a cron job |
+| POST | `/api/crons/{job_id}/enable` | Pause or resume a cron job |
+| GET/POST/DELETE | `/api/lessons` | List, add, or remove lessons |
+| POST | `/api/send-message` | Send a notification/message |
+| GET | `/api/mcp` | List MCP server configuration |
+| PUT/DELETE | `/api/mcp/servers/{name}` | Register or remove an MCP server |
+| GET | `/api/memory/episodic/search` | Search memory |
+| POST | `/api/chat/slots/{slot}/context` | Inject silent context |
 
 ### App Management
 
@@ -741,6 +905,7 @@ endpoints. Apps can also call them directly via `fetch()`.
 | POST | `/api/apps/install` | Install from local path |
 | POST | `/api/apps/register` | Register a self-managed app |
 | POST | `/api/apps/registry/install` | Install from registry |
+| POST | `/api/apps/registry/install-stream` | Install from registry with an SSE progress stream |
 | GET | `/api/apps/{name}` | Get app details |
 | GET | `/api/apps/{name}/manifest` | Get app manifest |
 | GET/PUT | `/api/apps/{name}/config` | Read/write app config |
@@ -762,22 +927,84 @@ app secret as the key, where `sha256(body)` is the hex SHA-256 digest of the raw
 tampered body invalidates the signature. Backends verify with a constant-time comparison and
 reject requests whose timestamp is not within ±60s of now.
 
-Python app backends verify this with `kirocrew-client`:
+A Python app backend whose environment can import `kiro_crew` (the built-in app backends run as child processes and still import it) verifies this with the gateway's own helper:
 
 ```python
-from kirocrew_client import verify_proxy_request
-if not verify_proxy_request(request, 'my-app'): return Response(status=401)
+from kiro_crew.apps.proxy_auth import raw_request_target, verify_proxy_request
+
+body = await request.read()
+if not verify_proxy_request(
+    request.headers.get('X-KiroCrew-Proxy', ''),
+    method=request.method,
+    target=raw_request_target(request),
+    body=body,
+):
+    return Response(status=401)
 ```
+
+Every argument after the header value is keyword-only. Pass the target through
+`raw_request_target`: the gateway signs the request-target exactly as it went on
+the wire, and rebuilding it from a decoded path diverges from the signed bytes as
+soon as a query parameter carries a space or a non-ASCII character.
+
+A backend that cannot import `kiro_crew` (a different language, or a Python
+environment without the package) computes the HMAC itself, exactly as the Node.js
+paragraph below describes.
 
 Node.js app backends can verify the signature directly: compute
 `HMAC-SHA256(timestamp:method:/api/path[?query]:sha256(body), app_secret)` and compare against
 the value in the `X-KiroCrew-Proxy` header (constant-time), rejecting stale timestamps.
 
-> **Breaking change (body-bound signature):** `verify_proxy_request` /
-> `verify_proxy_request_raw` in the `kirocrew-client` package MUST be regenerated in lockstep
-> to bind `sha256(body)` while keeping the constant-time compare and ±60s freshness. A gateway
-> that signs body-bound HMACs will fail verification against any deployed old verifier, so the
-> client release must ship together with this change.
+> **Body-bound signature:** every verifier must bind `sha256(body)` while keeping the
+> constant-time compare and the ±60s freshness window. A gateway that signs body-bound
+> HMACs fails verification against any verifier that omits the body hash, so a
+> backend that implements the HMAC itself has to be updated in lockstep with the gateway.
+
+### Backend Environment Variables
+
+The gateway spawns each `backend.entryPoint` app as a sandboxed child and injects a fixed,
+generic set of environment variables. No app-specific variables are ever injected.
+
+| Variable | Always set | Meaning |
+|---|---|---|
+| `PORT` | yes | The loopback port your backend must bind (`127.0.0.1:$PORT`). |
+| `KIROCREW_APP_NAME` | yes | This app's installed name. |
+| `KIROCREW_HOME` | yes | The gateway's resolved data home, so the backend reads the same app tree. |
+| `KIROCREW_GATEWAY_ORIGIN` | only with bound-port evidence | The gateway's own origin, `http://<bound host>:<bound port>`, for calling back to the gateway (for example `POST /api/notifications/push`). It is set ONLY from the address the gateway ACTUALLY bound: its exported `KIROCREW_BOUND_PORT` (required to be numeric and in `1..65535`), with the host `127.0.0.1` for loopback and wildcard binds and `[::1]` for an IPv6-loopback bind. A gateway bound to one specific interface omits the variable entirely: backend callbacks carry no `Origin` header, which the gateway's CSRF barrier trusts only from a loopback peer, so a specific-interface origin would have every mutating callback refused. It is never your app's `PORT`, an inherited `KIROCREW_PORT`, a config value, a default, or a request-derived value, so a child can never be pointed at a sibling gateway. Without loopback bound-address evidence the variable is omitted entirely (see below). |
+| `KIROCREW_PROXY_SECRET` | only if a secret exists | The per-app secret used to verify the `X-KiroCrew-Proxy` header (see above). |
+| `KIROCREW_GATEWAY_ORIGIN_PROOF` | only if a secret exists and the origin is set | `HMAC-SHA256(app_secret, KIROCREW_GATEWAY_ORIGIN)`, hex. Recompute it with your secret to confirm the injected origin was minted by this gateway, rather than an inherited or spoofed env value. Omitted whenever the origin is omitted (nothing to prove) or no secret exists (nothing to key it with). |
+
+Security and lifecycle:
+
+- The per-app secret lives on disk at `<KIROCREW_HOME>/apps/<name>/.app_secret`, written
+  owner-only `0600` (owner-only DACL on Windows) by the gateway.
+- If no `.app_secret` exists, the gateway injects neither the secret nor anything derived from
+  it (including the proof); a secret-less backend is otherwise unchanged.
+- `KIROCREW_GATEWAY_ORIGIN` is fail-closed: it is present only when the gateway has real
+  evidence of the port it bound. A gateway that has not exported a valid `KIROCREW_BOUND_PORT`
+  hands the backend no origin, so a backend that needs a callback base stays dormant rather
+  than trusting a guessed address.
+- The origin and its proof are recomputed on every spawn, so a gateway restarted on a
+  different bound port hands the backend the current origin. That freshness guarantee is
+  scoped to SPAWNED instances: an externally managed backend the gateway ADOPTS (already
+  healthy on its port) keeps the environment of the generation that started it, so its
+  origin can be stale. A backend that keeps a long-lived callback base should treat
+  persistent push failures as a stale origin and restart to pick up the current one.
+- The proof is a SPAWN-TIME attestation, not a liveness or freshness signal: it says the
+  origin value in your environment was planted by a gateway holding your `.app_secret`
+  when your process started. Because the secret persists across gateway generations, a
+  stale origin (the adopted case above) still carries a valid proof — verifying the proof
+  tells you the origin was not planted by a secret-less spawner, and nothing about whether
+  that gateway is still the one serving. Do not use it as origin-trust for a long-lived
+  process; use the push-failure/restart guidance above for that.
+
+Using the origin for notifications:
+
+An entryPoint backend that declares `notifications.channels` in `app.json` pushes with
+`POST {KIROCREW_GATEWAY_ORIGIN}/api/notifications/push`, authenticating with its app secret
+(see App Notifications). Verify `KIROCREW_GATEWAY_ORIGIN_PROOF` before you trust the origin as
+your callback base. If `KIROCREW_GATEWAY_ORIGIN` is unset the gateway did not publish a
+bound-port origin, so the backend has no callback base and should not push.
 
 ## App Dev Mode (live reload)
 

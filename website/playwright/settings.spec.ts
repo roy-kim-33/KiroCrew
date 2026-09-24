@@ -32,12 +32,17 @@ test.describe('Settings Page', () => {
     await expect(page.getByRole('button', { name: 'Overview', exact: true })).toBeVisible()
     await expect(page.getByRole('button', { name: 'Display', exact: true })).toBeVisible()
     await expect(page.getByRole('button', { name: 'Chat', exact: true })).toBeVisible()
+<<<<<<< HEAD
     await expect(page.getByRole('button', { name: 'Remote Instances', exact: true })).toBeVisible()
     // Not `exact`: while an update is available SettingsPage puts a presence
     // dot inside this button, and its `aria-label` joins the button's
     // accessible name ("About Update available"). An exact match then finds
     // nothing, so this went red purely on whether an update happened to exist.
     await expect(page.getByRole('button', { name: /^About\b/ })).toBeVisible()
+=======
+    await expect(page.getByRole('button', { name: 'Remote Crew', exact: true })).toBeVisible()
+    await expect(page.getByRole('button', { name: 'About', exact: true })).toBeVisible()
+>>>>>>> upstream/main
   })
 
   test('defaults to the overview tab at the bare /settings path', async ({ page }) => {
@@ -143,7 +148,7 @@ test.describe('Settings Page', () => {
   test('/instances redirects to /settings/instances', async ({ page }) => {
     await page.goto('/instances', { waitUntil: 'domcontentloaded' })
     await page.waitForURL('**/settings/instances', { timeout: 10000 })
-    // Remote Instances panel should render — check for the tab being active
-    await expect(page.getByRole('button', { name: 'Remote Instances', exact: true })).toBeVisible({ timeout: 5000 })
+    // Remote Crew panel should render — check for the tab being active
+    await expect(page.getByRole('button', { name: 'Remote Crew', exact: true })).toBeVisible({ timeout: 5000 })
   })
 })

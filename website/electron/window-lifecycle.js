@@ -6,9 +6,13 @@ const path = require("path");
 const { createTokenRetryHandler, dashboardRetryPath } = require("./token-retry");
 const { createRendererRecovery } = require("./renderer-recovery");
 const { createHangRecovery } = require("./hang-recovery");
-const { armSplashHistoryClear } = require("./splash-history");
-const { hideToTray, cancelPendingTrayHide } = require("./hide-to-tray");
+const { armSplashHistoryClear, fileShellPageBasename } = require("./splash-history");
+const { hideToTray, cancelPendingTrayHide, shouldKeepAppHidden } = require("./hide-to-tray");
 const { attachHtmlFullScreen } = require("./html-fullscreen");
+const {
+  watchFullScreenTransitions,
+  repairStalledFullScreenExit,
+} = require("./fullscreen-transition-watch");
 const { createDisplayMediaHandler } = require("./display-media");
 const { applyFocusModeChrome } = require("./focus-chrome");
 const {
@@ -20,6 +24,7 @@ const { resolveThemeSource } = require("./native-theme");
 const { sanitizeWindowState, captureWindowState } = require("./window-state");
 const { clampZoomFactor, stepZoomFactor } = require("./zoom");
 const { createBrowserViewManager, isUntrustedContents } = require("./browser-view");
+const { registerCaptureSurface, createCaptureTrust } = require("./capture-trust");
 const {
   canAgentControl,
   isLoopbackUrl,
@@ -28,10 +33,12 @@ const {
   OWNER,
 } = require("./browser-control");
 const { createBrowserOps } = require("./browser-ops");
+const { runAnnotateOp } = require("./browser-annotate");
 const { createAgentCommandChannel } = require("./browser-agent-channel");
 const { attachContextMenu } = require("./context-menu");
 const { validateRemoteSettings } = require("./validation");
 const { getRemoteHostConfig, setRemoteHostConfig } = require("./host-config");
+const { openPathHardened } = require("./open-path");
 const { DEFAULT_REMOTE_BIN, DEFAULT_REMOTE_PATH } = require("./remote-token");
 const { identityFamily } = require("./instance-guard");
 const { decideLinuxFrame, applyWindowControl } = require("./linux-frame");
@@ -45,6 +52,7 @@ const {
   OVERLAY_BACKGROUND: WINDOWS_TITLEBAR_BACKGROUND,
 } = require("./windows-titlebar");
 const { attachFrameLoadLogging } = require("./frame-load-log");
+const { attachPaneAssetJournal } = require("./pane-asset-journal");
 const { createMemoryWatchLog } = require("./memory-watch-log");
 const { createCageTrace } = require("./cage-trace");
 const { profilingEnabled } = require("./perf-metrics");
@@ -142,6 +150,11 @@ function createWindowLifecycle(options) {
   let micDialogOpen = false;
   let sessionSecurityConfigured = false;
   let appMenu = null;
+  // The fullscreen-transition watch for the current main window. Its `pending()`
+  // is what keeps a close-to-tray exit from abandoning a transition AppKit is
+  // still animating, which is the cause of the orphan overlay rather than a
+  // symptom of it.
+  let fullScreenWatch = null;
 
   // The primary window owns both the cheap memory trajectory and the bounded
   // process-wide cage trace. Keeping record, crash flush, and quit stop behind
@@ -467,6 +480,11 @@ function createWindowLifecycle(options) {
     };
     win._mcGetCustomName = () => customName;
     win._mcBackendUrl = windowBackendUrl;
+    // The dashboard SPA is a capture surface (the chat composer's snip and the
+    // web-preview crop). Registered against the gateway origin THIS window was
+    // opened on, so a secondary window pointed at a remote gateway is bound to
+    // its own origin and never to a sibling's.
+    registerCaptureSurface(view.webContents, windowBackendUrl);
     win._mcView = view;
 
     // One native browser view/control plane per dashboard panel. The renderer
@@ -493,6 +511,15 @@ function createWindowLifecycle(options) {
           },
         }),
         getContentBounds: () => win.getContentBounds(),
+        // Keyboard focus belongs to exactly one child view of the BaseWindow.
+        // When the embedded page holds it as its view is hidden or released,
+        // the dashboard view takes it back — otherwise every text input in the
+        // dashboard stays deaf while pointer events keep working.
+        focusHost: () => {
+          if (!win.isDestroyed() && !view.webContents.isDestroyed()) {
+            view.webContents.focus();
+          }
+        },
         addView: (child) => win.contentView.addChildView(child),
         removeView: (child) => win.contentView.removeChildView(child),
         // Chrome the embedded page needs but the module must not import Electron
@@ -821,6 +848,13 @@ function createWindowLifecycle(options) {
     // Native themeSource is process-global, so a focused connection window must
     // refresh it from its own dashboard before native chrome is painted.
     win.on("focus", () => syncNativeTheme(view, win));
+    // On re-activation the platform re-resolves which child view receives
+    // keystrokes and may pick a hidden browser view again; each panel heals
+    // that by handing focus back to the dashboard view (see browser-view.js
+    // header note 3). A visible or unfocused panel is left alone.
+    win.on("focus", () => {
+      for (const entry of browserPanels.values()) entry.manager.reclaimFocus();
+    });
 
     // Same-origin windows remain in-app. Cross-origin web URLs and the audited
     // custom-scheme allowlist go to the OS; every other target fails closed.
@@ -930,6 +964,63 @@ function createWindowLifecycle(options) {
     mainWindow.on("enter-full-screen", persist);
     mainWindow.on("leave-full-screen", persist);
 
+    // Journal the terminal events so a stalled transition is legible in
+    // gateway-launch.log; until this existed a frozen fullscreen exit left no
+    // evidence anywhere. The watch below is the only detector the main process
+    // has for that stall (fullscreen-transition-watch.js explains why), and its
+    // repair is the only thing that clears the AppKit overlay short of a quit.
+    mainWindow.on("enter-full-screen", () => {
+      glog(`fullscreen: entered bounds=${JSON.stringify(mainWindow.getBounds())}`);
+    });
+    mainWindow.on("leave-full-screen", () => {
+      glog(`fullscreen: left bounds=${JSON.stringify(mainWindow.getBounds())}`);
+    });
+    fullScreenWatch = watchFullScreenTransitions(mainWindow, {
+      isMac: IS_MAC,
+      onStall: ({ target, fullScreen, visible, elapsedMs }) => {
+        glog(
+          `fullscreen: ${target ? "enter" : "exit"} transition did not complete` +
+            ` after ${elapsedMs}ms (isFullScreen=${fullScreen} visible=${visible})`,
+        );
+        if (target) return; // an unfinished ENTER has no known overlay to clear
+        const outcome = repairStalledFullScreenExit({
+          app,
+          win: mainWindow,
+          isMac: IS_MAC,
+          keepHidden: () => shouldKeepAppHidden(mainWindow),
+        });
+        glog(
+          `fullscreen: stalled exit repair hidden=${outcome.hidden}` +
+            ` unhideScheduled=${outcome.unhideScheduled}`,
+        );
+      },
+      onArm: ({ target }) => {
+        glog(`fullscreen: ${target ? "enter" : "exit"} transition started`);
+      },
+      // A transition abandoned mid-animation orphans its overlay just as a stall
+      // does, and its replacement fires normally so nothing else notices. The
+      // close path no longer causes this (hide-to-tray serialises its exit), but
+      // a user toggling fullscreen twice inside one animation still can, and
+      // AppKit gives no way to reach the overlay other than this repair.
+      onAbort: ({ target, fullScreen, visible, elapsedMs }) => {
+        const keepHiddenNow = shouldKeepAppHidden(mainWindow);
+        glog(
+          `fullscreen: ${target ? "enter" : "exit"} transition abandoned after ${elapsedMs}ms` +
+            ` (isFullScreen=${fullScreen} visible=${visible} pendingTrayHide=${keepHiddenNow})`,
+        );
+        const outcome = repairStalledFullScreenExit({
+          app,
+          win: mainWindow,
+          isMac: IS_MAC,
+          keepHidden: () => shouldKeepAppHidden(mainWindow),
+        });
+        glog(
+          `fullscreen: abandoned transition repair hidden=${outcome.hidden}` +
+            ` unhideScheduled=${outcome.unhideScheduled}`,
+        );
+      },
+    });
+
     // A 403 means the gateway secret may have rotated. Re-enter through the
     // same local-then-remote token order used at boot.
     const onNavigate = createTokenRetryHandler(async () => {
@@ -957,6 +1048,11 @@ function createWindowLifecycle(options) {
     // enough on its own, because a pane can navigate the top-level window to a
     // remote document and inherit that position.
     attachFrameLoadLogging(mainWindow.webContents, glog, backendUrl);
+    // The pane's module graph is the one load stage no renderer-side line can
+    // report: a stalled hashed-chunk fetch leaves the entry module unevaluated,
+    // so nothing of ours runs in that frame to say so. The main process sees the
+    // request either way. See pane-asset-journal.js.
+    attachPaneAssetJournal(mainWindow.webContents.session, glog, backendUrl);
 
     const rendererRecovery = createRendererRecovery({
       isQuitting,
@@ -1036,9 +1132,25 @@ function createWindowLifecycle(options) {
     mainWindow.on("close", (event) => {
       if (!isQuitting()) {
         event.preventDefault();
-        // macOS must leave its native fullscreen Space before hiding or the
-        // Space becomes an orphaned black surface.
-        hideToTray(mainWindow);
+        // macOS must leave its native fullscreen Space before hiding or the Space
+        // becomes an orphaned black surface, and the hide that follows is an
+        // app-level one: AppKit may have left a full-display overlay on screen
+        // that only `app.hide()` can reach (see hide-to-tray.js).
+        glog(`close: hiding to tray (fullScreen=${mainWindow.isFullScreen()})`);
+        hideToTray(mainWindow, {
+          log: glog,
+          // isFullScreen() already reports the target while AppKit is still
+          // exiting. Carry the watch target so the helper attaches to that exit
+          // instead of issuing another toggle or treating the window as stable.
+          transitionTarget: fullScreenWatch ? fullScreenWatch.pending() : null,
+          // The exit must not be issued while AppKit is still animating; the watch
+          // is what knows how long the window has been still. Its terminal-exit
+          // clock also covers AppKit's final order-in after pending() clears.
+          quietFor: () => (fullScreenWatch ? fullScreenWatch.quietFor() : Infinity),
+          exitSettlingFor: () => (
+            fullScreenWatch ? fullScreenWatch.exitSettlingFor() : Infinity
+          ),
+        });
         return;
       }
       if (saveTimer) {
@@ -1051,9 +1163,24 @@ function createWindowLifecycle(options) {
     return mainWindow;
   }
 
+  // A tray hide out of fullscreen hides the whole APP (hide-to-tray.js explains
+  // why: it is the only call that also orders out AppKit's abandoned overlay).
+  // A hidden app ignores `win.show()`, so every user-intent show has to unhide
+  // the app first. Harmless when the app was never hidden, and macOS-only
+  // because `app.hide()` is.
+  function unhideApp() {
+    if (!IS_MAC || typeof app.show !== "function") return;
+    try {
+      app.show();
+    } catch {
+      /* best effort — the window show below is what the user asked for */
+    }
+  }
+
   function showMainWindow({ focus = false } = {}) {
     if (!mainWindow || mainWindow.isDestroyed()) return false;
     cancelPendingTrayHide(mainWindow);
+    unhideApp();
     if (mainWindow.isMinimized()) mainWindow.restore();
     mainWindow.show();
     if (focus) mainWindow.focus();
@@ -1065,14 +1192,14 @@ function createWindowLifecycle(options) {
     // An activate racing a fullscreen-exit hide must win before isVisible is
     // consulted, otherwise the deferred handler hides the window afterwards.
     cancelPendingTrayHide(mainWindow);
+    unhideApp();
     if (!mainWindow.isVisible()) mainWindow.show();
     return true;
   }
 
   function createTray() {
     const showFromTray = () => {
-      cancelPendingTrayHide(mainWindow);
-      mainWindow?.show();
+      showMainWindow({ focus: true });
     };
     const nightly = identityFamily(app.getVersion()) === "nightly";
     const iconFile = nightly && fs.existsSync(path.join(__dirname, "icon-nightly.png"))
@@ -1100,7 +1227,7 @@ function createWindowLifecycle(options) {
       { type: "separator" },
       { label: "New Connection Window…", click: () => openNewConnectionWindow() },
       { type: "separator" },
-      { label: "Open Config File", click: () => shell.openPath(store.path) },
+      { label: "Open Config File", click: () => openPathHardened(shell, store.path) },
       { type: "separator" },
       { label: "Quit", click: requestQuit },
     ]));
@@ -1300,6 +1427,7 @@ function createWindowLifecycle(options) {
     // The tray reaches this during a deferred fullscreen hide; showing a modal
     // is user intent and must cancel that pending hide first.
     cancelPendingTrayHide(mainWindow);
+    unhideApp();
     mainWindow.show();
 
     const css = await getModalCSS();
@@ -1493,9 +1621,15 @@ function createWindowLifecycle(options) {
     if (sessionSecurityConfigured) return;
 
     // Screen capture has its own handler. Prefer the native system picker when
-    // available and fall back to desktopCapturer elsewhere.
+    // available and fall back to desktopCapturer elsewhere. WHO may be granted a
+    // screen is decided by identity in capture-trust.js: a registered surface,
+    // its own main frame, still on its registered origin. Without this dep the
+    // handler denies everything, so the wiring is not optional.
     session.defaultSession.setDisplayMediaRequestHandler(
       createDisplayMediaHandler({
+        isTrustedRequest: createCaptureTrust({
+          fromFrame: (frame) => webContents.fromFrame(frame),
+        }),
         getSources: () => desktopCapturer.getSources({
           types: ["screen", "window"],
         }),
@@ -1505,7 +1639,18 @@ function createWindowLifecycle(options) {
             : "granted"
         ),
         onPermissionNeeded: (reason) => {
-          if (reason === "denied") showScreenPermissionDialog();
+          if (reason === "denied") return showScreenPermissionDialog();
+          // No dialog for a trust refusal: an embedded pane or a browsed page
+          // asked, and nothing the user can change in System Settings would
+          // make that grantable. One breadcrumb instead, for the same reason
+          // permission-handler.js logs its denials -- a silent refusal is
+          // indistinguishable from an OS one when someone has to diagnose it.
+          if (reason === "untrusted-frame") {
+            // eslint-disable-next-line no-console -- see the note above
+            console.warn(
+              "[display-media] DENY capture: requester is not a registered capture surface",
+            );
+          }
         },
       }),
       { useSystemPicker: true },
@@ -1586,6 +1731,7 @@ function createWindowLifecycle(options) {
     const win = focusedDashboardWindow();
     if (!win) return;
     cancelPendingTrayHide(win);
+    unhideApp();
     if (win.isMinimized()) win.restore();
     win.show();
     win.focus();
@@ -1613,7 +1759,11 @@ function createWindowLifecycle(options) {
 
   function zoomMenuItem(apply) {
     return () => {
-      const wc = webContents.getFocusedWebContents();
+      // Match the sibling reload/devtools handlers: a BaseWindow has no
+      // top-level webContents, so getFocusedWebContents() returns null here and
+      // zoom would silently no-op. focusedDashboardWebContents() reaches the
+      // dashboard view nested in the contentView.
+      const wc = focusedDashboardWebContents();
       if (!wc) return;
       apply(wc);
       // Chromium applies zoom per-origin, so same-origin sibling windows move
@@ -1656,7 +1806,7 @@ function createWindowLifecycle(options) {
       renameCurrentWindow: () => renameCurrentWindow(),
       promptRemoteHost: () => promptRemoteHost(),
       refreshToken: () => refreshToken(),
-      openConfigFile: () => shell.openPath(store.path),
+      openConfigFile: () => openPathHardened(shell, store.path),
     }));
     // Fork: the native menu bar is macOS-only. On Windows and Linux the window
     // is frameless with a titleBarOverlay (caption buttons) and the dashboard's
@@ -1720,10 +1870,43 @@ function createWindowLifecycle(options) {
     applyFocusModeChrome(win, visible, { positionTrafficLights });
   }
 
-  function handleWindowControl(sender, action) {
-    if (!LINUX_FRAMELESS) return;
+  function handleWindowControl(sender, action, senderFrame) {
     const win = windowForWebContents(sender);
-    if (win) applyWindowControl(win, action);
+    if (!win) return;
+    if (LINUX_FRAMELESS) {
+      applyWindowControl(win, action);
+      return;
+    }
+    // Off Linux the OS draws the captions, so this channel stays closed to the
+    // dashboard. The one admission is `close` from the splash (loading.html):
+    // it is painted into this window with no chrome of its own, and on macOS
+    // the window may have no reachable close control at that moment -- native
+    // fullscreen hides the traffic lights, and focus mode hides them in
+    // windowed mode with nothing left to restore them once the dashboard
+    // document is gone. `close` runs the window's own close handler, which
+    // hides to tray and leaves fullscreen first, exactly like the native
+    // button. Admission uses the immutable URL of the top-level frame that sent
+    // the IPC; the WebContents current URL may change before this handler runs.
+    // The page is named by exactly one literal: the splash is the only shell
+    // page that carries a close control. The token prompt is a transient shell
+    // page for history pruning (splash-history.js) but sends nothing on this
+    // channel, so it gets no admission on it. fileShellPageBasename yields ""
+    // for anything that is not a file: URL, so a dashboard route that merely
+    // mentions loading.html never matches, and junk fails closed.
+    if (
+      action !== "close"
+      || fileShellPageBasename(sendingMainFrameUrl(sender, senderFrame)) !== "loading.html"
+    ) return;
+    applyWindowControl(win, "close");
+  }
+
+  function sendingMainFrameUrl(sender, senderFrame) {
+    try {
+      if (!senderFrame || senderFrame !== sender?.mainFrame) return "";
+      return typeof senderFrame.url === "string" ? senderFrame.url : "";
+    } catch {
+      return ""; // missing, malformed, or torn down: fail closed
+    }
   }
 
   function setThemeMode(pref) {
@@ -1864,6 +2047,83 @@ function createWindowLifecycle(options) {
     return dispatchBrowserOp(panel, op, args);
   }
 
+  // Human-initiated element annotation on the page the user is looking at.
+  // Served through executeJavaScript/capturePage, never the agent control
+  // plane: it needs no CDP owner and Browser Mode may be off. Closed op set.
+  // Native pointer input seen by the browser view, per WebContents. The
+  // annotate focus hand-back keys off THIS (a signal the page cannot forge),
+  // never off the page-controlled poll reply alone. WebContents 'input-event'
+  // is a documented Electron event, present in the pinned v43 line, whose
+  // InputEvent.type covers mouseDown/mouseUp:
+  // https://www.electronjs.org/docs/latest/api/web-contents#event-input-event
+  const annotateInputArmed = new WeakSet();
+  const ANNOTATE_FOCUS_WINDOW_MS = 2000;
+  function focusAnnotateSender(panel) {
+    try {
+      const s = panel.annotateSender;
+      if (s && !s.isDestroyed()) s.focus();
+    } catch {
+      // Focus is a courtesy; the editor still works after a click.
+    }
+  }
+  function armAnnotateInput(panel, wc) {
+    if (!wc || annotateInputArmed.has(wc)) return;
+    annotateInputArmed.add(wc);
+    try {
+      wc.on("input-event", (_e, input) => {
+        if (!input || (input.type !== "mouseDown" && input.type !== "mouseUp")) return;
+        panel.lastNativeInput = Date.now();
+        // While picking, the mouse-up that completes a pick hands focus back
+        // to the panel RIGHT HERE -- on the native input path, before the
+        // ~150 ms poll that reports the pick -- so a note typed immediately
+        // after the click lands in the panel's editor, never in the page.
+        // Nothing the page can do triggers this: it is real input, and the
+        // picking flag is written only from this process's own op results.
+        if (input.type === "mouseUp" && panel.annotatePicking) focusAnnotateSender(panel);
+      });
+    } catch {
+      // No native input feed: the hand-back simply never fires.
+    }
+  }
+  async function browserAnnotate(sender, panelId, op, args) {
+    const panel = panelForSender(sender, panelId, { create: false });
+    if (!panel) return { ok: false, code: "no_view", error: "no native browser panel" };
+    const wc = panel.manager.getWebContents();
+    if (op === "start") { panel.annotateSender = sender; armAnnotateInput(panel, wc); }
+    const res = await runAnnotateOp(wc, op, args);
+    // Pick-mode flag for the native input path above -- from this process's
+    // own view of the ops (start/stop/teardown) and the sanitized poll reply.
+    if (res && res.ok) {
+      if (op === "start") panel.annotatePicking = true;
+      else if (op === "stop" || op === "teardown") panel.annotatePicking = false;
+      else if (op === "poll" && typeof res.picking === "boolean") panel.annotatePicking = res.picking;
+    } else if (res && !res.ok && (res.code === "no_overlay" || res.code === "no_view")) {
+      panel.annotatePicking = false;
+    }
+    // The click that picked an element (or a marker) landed in the native
+    // view, so keyboard focus is there. The note is typed in the PANEL -- hand
+    // focus back to the dashboard renderer so its editor can take it without
+    // a second click. Poll-only, one-shot (the flags are cleared on read).
+    // The page owns the reply, so it is never enough on its own: the id must
+    // name a pick the sanitizer kept AND a real mouse press must have reached
+    // the view (Electron's input-event, which page script cannot synthesize)
+    // within the last two seconds; that press is then consumed. A hostile
+    // page re-reporting `picked` every poll moves focus zero times, while
+    // EVERY real pick -- however quick the previous one -- gets focus back,
+    // so the next keystrokes land in the panel's editor, never in the page.
+    if (op === "poll" && res && res.ok && (res.picked !== undefined || res.edit !== undefined)) {
+      const id = res.picked !== undefined ? res.picked : res.edit;
+      const known = Array.isArray(res.items) && res.items.some((it) => it && it.id === id);
+      const now = Date.now();
+      const native = panel.lastNativeInput && now - panel.lastNativeInput <= ANNOTATE_FOCUS_WINDOW_MS;
+      if (known && native) {
+        panel.lastNativeInput = 0;
+        focusAnnotateSender(panel);
+      }
+    }
+    return res;
+  }
+
   function recordMemorySample(sender, payload) {
     if (!mainWindow || mainWindow.isDestroyed()) return;
     if (sender !== mainWindow.webContents) return;
@@ -1945,6 +2205,7 @@ function createWindowLifecycle(options) {
       setControlOwner: browserSetControlOwner,
       getControl: browserGetControl,
       control: browserControl,
+      annotate: browserAnnotate,
     },
     security: {
       configureSession: configureSessionSecurity,

@@ -1,144 +1,29 @@
 # Passing secrets to MCP servers
 
 MCP servers often need API keys, database passwords, or other secrets at
-runtime.  Kiro Crew deliberately keeps secrets **out** of
-`~/.kiro/mcp.json` (which is versioned and may be shared across machines).
+runtime. Their specs can live in `~/.kiro/crew/mcp.json` (Kiro Crew scope) or
+`~/.kiro/settings/mcp.json` (Kiro global scope), and either file may be shared or
+copied with an agent configuration. Plain `env` values in those files are not
+protected, so use vault references instead.
 
-> **Security note:** Both routes below are **interim workarounds** pending
-> the encrypted vault (planned — see
-> [issue tracker](https://github.com/kirodotdev/KiroCrew/issues/2351)).
-> They deliver the secret to the MCP server subprocess, but a
-> prompt-injected agent running in the same process tree can observe
-> environment variables that the sandbox does not explicitly scrub.  Use
-> these only when you accept that risk; the vault will close this gap by
-> resolving secrets at spawn time without exposing them to the agent.
+> **Use the encrypted vault.** It is the supported route: a secret is stored
+> encrypted on disk and resolved into the bound MCP server's environment alone,
+> never the agent's. Service-level environment files and root-owned wrappers do
+> not provide that same per-server boundary; the section below explains why.
 
 ---
 
-## Route 1: systemd service unit `EnvironmentFile=`
+## The encrypted vault
 
-If you run Kiro Crew as a systemd service (see
-[remote-and-mobile.md](remote-and-mobile.md)), point the unit at a
-protected secrets file:
-
-```ini
-# /etc/systemd/system/kirocrew.service.d/secrets.conf
-[Service]
-EnvironmentFile=/etc/kirocrew/secrets.env
-```
-
-Create the secrets file with owner-only access:
-
-```bash
-sudo install -m 600 /dev/null /etc/kirocrew/secrets.env
-# Use an editor or redirect from a non-history source to avoid
-# leaving the token in shell history:
-sudo sh -c 'read -rp "Secret: " val && printf "MY_MCP_SECRET=%s\n" "$val" >> /etc/kirocrew/secrets.env'
-```
-
-Then reload and restart:
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl restart kirocrew
-```
-
-The variables are visible to the gateway process and its MCP server
-children.  The file itself (`/etc/kirocrew/secrets.env`) is owned by root
-with mode `0600`, so the agent cannot read it via filesystem access.
-
-**Required:** after adding a secret, you **must** also add its key name to
-`_AGENT_DENIED_ENV_KEYS` in `src/kiro_crew/sandbox.py` to prevent the
-agent subprocess from inheriting it.  Without this step, the variable
-propagates through `AcpClient._spawn()` and a prompt-injected agent can
-read it from its own environment.
-
-> The encrypted vault (PR 1+) will eliminate this manual step — secrets
-> resolved via `secret://` are injected only into the bound MCP server's
-> env, never the agent's.
-
----
-
-## Route 2: per-server shell wrapper with a root-owned secrets file
-
-Source a dedicated secrets file in the server's `command` array using a
-shell wrapper.  The file **must** be owned by root with mode `0600` so
-the agent (running as your user) cannot read it:
-
-```jsonc
-// ~/.kiro/mcp.json
-{
-  "mcpServers": {
-    "my-server": {
-      "command": "sh",
-      "args": [
-        "-c",
-        "set -a; . /etc/kirocrew/mcp-secrets.env; set +a; exec my-mcp-server --stdio"
-      ]
-    }
-  }
-}
-```
-
-**How it works:**
-
-| Fragment | Purpose |
-|---|---|
-| `set -a` | Auto-export every variable assigned after this point. |
-| `. /etc/kirocrew/mcp-secrets.env` | Source secrets from a root-owned file. |
-| `set +a` | Stop auto-exporting (keeps the child env minimal). |
-| `exec …` | Replace the shell with the actual server process. |
-
-Create the secrets file with root ownership:
-
-```bash
-sudo install -m 600 /dev/null /etc/kirocrew/mcp-secrets.env
-sudo sh -c 'read -rp "Secret: " val && printf "MY_MCP_SECRET=%s\n" "$val" >> /etc/kirocrew/mcp-secrets.env'
-```
-
-The gateway process (running as root under systemd) can read the file.
-Agent subprocesses are spawned as a non-root user (`User=` in the service
-unit), so they cannot read the root-owned file.
-
-> **Important:** the systemd unit **must** set `User=<your-user>` for the
-> agent subprocess isolation to hold.  Running the entire gateway as root
-> without dropping privileges would give the agent root access too.
-
-> **Agent exposure caveat:** the MCP server receives the variable via its
-> process environment; the agent shares that process tree and can observe
-> the variable unless it is scrubbed by the sandbox.  This route protects
-> the **file** from agent reads but not the **runtime value** from agent
-> environment inspection.
-
----
-
-## What NOT to do
-
-- **Do not** put secrets as plain string values inside `mcp.json` — the
-  file has no access controls beyond POSIX permissions and is easy to
-  accidentally commit or share.
-- **Do not** add custom keys to `~/.kiro/crew/.env` expecting them to be
-  agent-isolated — the gateway loads them and propagates them to all child
-  processes including the agent.  A warning is logged, but the key still
-  reaches the process tree.  Use the vault once available.
-- **Do not** store MCP secrets in user-readable paths — a file at
-  `~/.kiro/crew/mcp-secrets.env` or `~/.kiro/.env` is accessible to the
-  agent via filesystem reads.  Use root-owned paths (`/etc/kirocrew/`)
-  or wait for the encrypted vault.
-
----
-
-## The encrypted vault (recommended)
-
-The interim routes above deliver a secret to an MCP server's process
-environment, where an agent sharing that process tree can observe it.  The
-encrypted vault closes that gap: secrets are stored encrypted on disk under
-`.vault` in the data home, and a `secret://NAME` reference in an MCP server's
-env is resolved to the real value only at spawn time, injected into that
+A service-level environment value enters the gateway before any MCP server is
+selected. The encrypted vault avoids that gap: secrets are stored encrypted on
+disk under `.vault` in the data home, and a `secret://NAME` reference in an MCP
+server's env is resolved to the real value only at spawn time, injected into that
 server's environment alone — never the agent's.
 
 Store a secret through the dashboard **Settings → Secrets** tab, then reference
-it from `mcp.json`:
+it from `~/.kiro/crew/mcp.json` (or from the global
+`~/.kiro/settings/mcp.json`):
 
 ```jsonc
 {
@@ -154,6 +39,33 @@ it from `mcp.json`:
 At spawn the gateway resolves `secret://MY_MCP_SECRET` from the vault.  If the
 named secret does not exist, the server fails to start rather than launching
 with a missing credential.
+
+### Managed secrets in Settings
+
+`GET /api/secrets` returns every stored name plus a `managed` catalog. A managed
+entry contains `name` and a stable machine-readable `kind`; per-host entries
+also include the normalized non-secret `host` so the dashboard can identify the
+row. Secret values remain write-only and configured state is derived from membership in the
+response's existing `names` list. If managed integration configuration cannot
+be read, stored names are still returned and `managed_error` is `true`; the
+dashboard surfaces that non-fatal warning instead of misrepresenting the empty
+catalog as “no managed integrations enabled.”
+`WAKATIME_API_KEY` is advertised only when `config.wakatime.enabled` is true,
+matching the client-construction gate. With exactly one raw configured Jira
+entry whose normalized host is non-empty, the global `JIRA_API_TOKEN` slot is
+advertised.
+With multiple entries, only each normalized host's exact `JIRA_TOKEN_<HEX>` slot
+is advertised; duplicate normalized hosts produce one display row but still
+count as multiple runtime entries, so they never accidentally enable the global
+fallback. For a single host, an already-stored per-host token remains visible
+because the runtime gives it precedence.
+
+The catalog is deliberately based on **actual vault consumers**, not the broader
+set of credential names accepted from `.env`. Most channel credentials still
+read literal environment/config values, so storing a same-named vault entry does
+not make those channels consume it. An unrecognized vault name remains listed
+and fully manageable; it is never hidden or reclassified merely because it looks
+credential-like.
 
 ### Migrating existing plaintext secrets
 
@@ -197,3 +109,43 @@ host it also accepts the global `JIRA_API_TOKEN` vault secret.  If neither vault
 entry exists it uses the same `.env` value it always has, so existing setups
 keep working without change — run `kirocrew secrets import --apply` to move the
 Jira token into the vault when you are ready.
+
+---
+
+## Why service-level environment variables are not an MCP-only fallback
+
+The built-in Linux service reads `/etc/kirocrew/kirocrew.env`, but every value in
+that file enters the gateway process first. An unknown credential key then
+reaches the agent unless the source build adds it to `_AGENT_DENIED_ENV_KEYS`.
+Adding it to that scrub list is not a portable MCP delivery mechanism either: a
+server launched as a direct descendant of the agent loses the variable with its
+parent, while the optional pooled MCP topology has a different trusted-side
+environment path. The result depends on topology instead of the server spec.
+
+A root-owned per-server wrapper does not solve this. The built-in service runs
+the entire gateway as the invoking `User=` / `Group=`; it does not start as root
+and drop privileges only for agent subprocesses. A wrapper launched by the
+gateway cannot read a root-owned mode-`0600` file, while making that file readable
+by the service user also makes it readable by the agent running as the same user.
+Running the gateway as root would instead give the agent and every gateway child
+root privileges.
+
+Use `secret://` for per-server injection. It behaves the same in supported MCP
+topologies and resolves the value only on the trusted side of the server spawn.
+
+---
+
+## What NOT to do
+
+- **Do not** put secrets as plain string values inside
+  `~/.kiro/crew/mcp.json` or `~/.kiro/settings/mcp.json` — either file is easy
+  to copy or share with an agent configuration.
+- **Do not** add custom keys to `~/.kiro/crew/.env` expecting them to be
+  agent-isolated — the gateway loads them and propagates them to all child
+  processes including the agent. A warning is logged, but the key still reaches
+  the process tree. Use the vault instead.
+- **Do not** store MCP secrets in user-readable paths — a file at
+  `~/.kiro/crew/mcp-secrets.env` or `~/.kiro/.env` is accessible to the agent
+  via filesystem reads. A root-owned service environment file does not fix the
+  runtime boundary: its values enter the gateway before server selection. Use
+  the vault.

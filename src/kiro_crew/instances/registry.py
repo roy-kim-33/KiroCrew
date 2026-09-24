@@ -9,7 +9,7 @@ and is never stored here.
 Two persisted hints support lazy reconnect on gateway restart:
 
 * per-instance ``was_connected`` — whether the instance had an open tunnel when
-  it was last touched, used to render "disconnected — click to reconnect".
+  it was last touched; renders "disconnected — click to reconnect".
 * top-level ``last_active_id`` — the single instance to auto-revive on startup
   (startup opens *no* other tunnels, avoiding a stale-credential ssh herd).
 
@@ -25,8 +25,11 @@ Security notes (standard practices):
   rename) so a crash mid-write can't corrupt the registry.
 
 The registry reads-then-writes the file on every mutation rather than caching an
-in-memory copy, so a live gateway and an out-of-band ``kirocrew`` CLI edit don't
-clobber each other's changes between operations.
+in-memory copy, and holds a lock keyed by the registry's path across that pair,
+so two registry objects in one gateway don't clobber each other's changes. An
+out-of-band ``kirocrew`` CLI edit is a separate process and so is outside that
+lock: it always reads a complete file, but a mutation it interleaves with the
+gateway's can still be lost.
 """
 
 from __future__ import annotations
@@ -42,6 +45,8 @@ from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.loader import _DEFAULT_PORT, config_dir
 from kiro_crew.instances.constants import TTL_PATTERN
 from kiro_crew.instances.validation import _AWS_PROFILE_RE as _validation_aws_profile_re
+from kiro_crew.instances.validation import split_ecs_target, ssm_target_matches
+from kiro_crew.slugs import slug_hash_fallback
 
 logger = logging.getLogger(__name__)
 
@@ -61,10 +66,15 @@ _ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}\Z")
 _SSH_HOST_RE = re.compile(r"^[A-Za-z0-9._@\-]{1,255}\Z")
 _REMOTE_BIN_RE = re.compile(r"^[A-Za-z0-9._/~\- ]{0,512}\Z")
 
-# ssm_target: an EC2 instance id (i-<17 hex>) or an SSM managed-instance id
-# (mi-<17 hex>); early reject only, mirroring the ssh_host guard above — the
+# ssm_target: an EC2 instance id (i-<hex>), an SSM managed-instance id
+# (mi-<hex>), or an ECS task target (ecs:<cluster>_<taskId>_<runtimeId>) for the
+# Fargate lane; early reject only, mirroring the ssh_host guard above — the
 # authoritative validation lives with the tunnel manager (validation.py).
-_SSM_TARGET_RE = re.compile(r"^(i|mi)-[a-f0-9]{8,17}\Z")
+#
+# The shape is NOT re-spelled here. A per-module copy of the same security charset
+# lets one lane be widened while the other goes on refusing the value, so the
+# decision lives in validation.ssm_target_matches and is imported, the same seam
+# _AWS_PROFILE_RE uses below.
 # aws_profile: named profile in ~/.aws/config; conservative charset, no shell
 # metacharacters ('+' is legal: IAM entity names permit it, and SSO-derived
 # profiles use "<account>+<permission-set>"). Single source of truth lives in
@@ -91,11 +101,9 @@ _DEFAULT_SSM_RUN_AS = "ec2-user"
 # re-export seam, giving the value a name that says what it means HERE (the
 # REMOTE's port, not ours).
 #
-# It was previously 7777 -- an earlier default dashboard port -- which left the
-# Add form pre-filling a port no stock remote listens on (#1972). Correcting it
-# was only safe once the local forward stopped mirroring this value: while it
-# mirrored, filling in the port a stock remote actually binds landed the user on
-# a guaranteed local-port collision.
+# The local forward does not mirror this value: mirroring would pre-fill the port
+# a stock remote actually binds and land the user on a guaranteed local-port
+# collision.
 DEFAULT_REMOTE_PORT = _DEFAULT_PORT
 _DEFAULT_TTL = "20h"
 
@@ -103,8 +111,15 @@ _DEFAULT_TTL = "20h"
 # (ssh -N -L); "ssm" tunnels over AWS Systems Manager Session Manager
 # (aws ssm start-session --document-name AWS-StartPortForwardingSession),
 # needing no inbound SSH port and no SSH key — only IAM + the SSM agent.
-CONNECTION_METHODS: tuple[str, ...] = ("ssh", "ssm")
+# "fargate" is the same SSM port-forward aimed at an ECS task
+# (``ssm_target`` = ``ecs:<cluster>_<task-id>_<runtime-id>``) whose only listener
+# is the crew container's turn API: no dashboard, no token to mint, and nothing
+# to run ``kirocrew`` on, so the tunnel manager forwards and does nothing else.
+CONNECTION_METHODS: tuple[str, ...] = ("ssh", "ssm", "fargate")
 _DEFAULT_CONNECTION_METHOD = "ssh"
+# The methods whose forwarder is ``aws ssm start-session``; they share the
+# ``ssm_target`` / ``aws_profile`` / ``aws_region`` coordinates.
+SSM_TRANSPORT_METHODS: frozenset[str] = frozenset({"ssm", "fargate"})
 
 # ``local_port == 0`` is the sentinel for "not yet allocated" — the port
 # allocator (Stage 3) assigns a real port at connect time.
@@ -137,7 +152,7 @@ def _slugify(name: str) -> str:
     """Derive a slug-like id from a human name (lowercase, hyphen-separated)."""
     slug = re.sub(r"[^a-z0-9]+", "-", name.strip().lower()).strip("-")
     slug = slug[:63]
-    return slug or "instance"
+    return slug or slug_hash_fallback(name, "instance")
 
 
 def validate_ttl(ttl: str) -> None:
@@ -167,7 +182,9 @@ class Instance:
     ``connection_method`` selects the transport: ``"ssh"`` (default, uses
     ``ssh_host``/``remote_bin``) or ``"ssm"`` (uses ``ssm_target`` — an EC2/SSM
     managed-instance id — plus optional ``aws_profile``/``aws_region``; no SSH
-    key or inbound port needed). Both methods share ``remote_port``/``ttl``.
+    key or inbound port needed). ``"fargate"`` is the SSM forward aimed at an ECS
+    task target; it has no dashboard, so no token is ever minted for it. All
+    methods share ``remote_port``/``ttl``.
     """
 
     id: str
@@ -177,11 +194,12 @@ class Instance:
     local_port: int = _UNALLOCATED_PORT
     ttl: str = _DEFAULT_TTL
     remote_bin: str = ""
-    # "ssh" (default) or "ssm" — see CONNECTION_METHODS.
+    # "ssh" (default), "ssm" or "fargate" -- see CONNECTION_METHODS.
     connection_method: str = _DEFAULT_CONNECTION_METHOD
-    # SSM-only fields. ssm_target is an EC2 instance id (i-...) or SSM managed
-    # instance id (mi-...); aws_profile/aws_region are optional (empty = use the
-    # default credential chain / region).
+    # SSM-transport fields. ssm_target is an EC2 instance id (i-...) or SSM
+    # managed instance id (mi-...) for "ssm", an ECS task target (ecs:...) for
+    # "fargate"; aws_profile/aws_region are optional (empty = use the default
+    # credential chain / region).
     ssm_target: str = ""
     aws_profile: str = ""
     aws_region: str = ""
@@ -190,6 +208,9 @@ class Instance:
     # launcher-provisioned AL2023 user; set "ubuntu" (or whoever runs the remote
     # gateway) on other AMIs, otherwise the tunnel comes up but the mint fails.
     ssm_run_as: str = _DEFAULT_SSM_RUN_AS
+    # Provisioner that created this crew, when known. Empty means the machine
+    # was added directly or predates source tracking.
+    provisioner_id: str = ""
     # Sticky "connection intent" — the source of truth for whether a tab should
     # exist for this instance. Set True when a tunnel is opened and cleared ONLY
     # on an explicit user disconnect; deliberately LEFT TRUE across gateway
@@ -203,7 +224,7 @@ class Instance:
     # unknown). Persisted so a forwarder orphaned by a gateway hard-kill can be
     # reclaimed by its OWN identity — pid + start time + exact argv — never by
     # matching the process table, which cannot distinguish our child from an
-    # operator's own forward (#1972). Either half missing means the identity
+    # operator's own forward. Either half missing means the identity
     # cannot be confirmed and no reclaim happens (fail closed).
     forwarder_pid: int = _NO_FORWARDER_PID
     forwarder_start: str = ""
@@ -232,21 +253,48 @@ class Instance:
                 raise InvalidInstanceError(
                     f"invalid ssh_host {self.ssh_host!r}: must match {_SSH_HOST_RE.pattern}"
                 )
+        elif self.connection_method == "fargate":
+            # The same splitter connect_fargate reads the target with, so a
+            # target this arm stores is one that lane can open.
+            #
+            # Checked UNSTRIPPED, and what reaches here is user input, not a
+            # stored record: handlers_instances passes
+            # ``str(body.get("ssm_target", ""))`` straight into this constructor,
+            # and ``validate_ssm_target`` (the layer that strips) runs later, at
+            # connect time. An ECS target is 90-plus characters copied out of the
+            # AWS console, where a trailing space or newline rides along far more
+            # often than it does with ``i-0abc``; the splitter refuses such a
+            # paste rather than storing it. That fails closed, which is why the
+            # behaviour is left alone, but a reader should know it is the paste
+            # that lands on it.
+            if not self.ssm_target or split_ecs_target(self.ssm_target) is None:
+                raise InvalidInstanceError(
+                    f"invalid ssm_target {self.ssm_target!r}: a fargate instance needs "
+                    f"an ECS task target (ecs:<cluster>_<task-id>_<runtime-id>)"
+                )
+            self._validate_aws_coordinates()
         else:  # ssm
-            if not self.ssm_target or not _SSM_TARGET_RE.match(self.ssm_target):
+            # ``ssm_target_matches`` admits the ECS task shape too (it is the
+            # shared SSM-transport charset), but an ECS task has no SSM agent to
+            # run ``kirocrew token`` on, so a record filed here would forward and
+            # then fail at the mint. Refuse it and name the arm that stores it.
+            if split_ecs_target(self.ssm_target) is not None:
+                raise InvalidInstanceError(
+                    f"invalid ssm_target {self.ssm_target!r}: an ECS task target belongs "
+                    f"to the fargate connection method, not ssm"
+                )
+            # Checked UNSTRIPPED: what reaches here is the request body's
+            # ``ssm_target`` as typed, and ``validate_ssm_target`` (the layer that
+            # strips) runs later, at connect time. A pasted ``i-``/``mi-`` id with
+            # a trailing space or newline is refused here rather than stored.
+            if not self.ssm_target or not ssm_target_matches(self.ssm_target):
                 # No regex in the message — it reaches the Settings form verbatim.
                 raise InvalidInstanceError(
                     f"invalid ssm_target {self.ssm_target!r}: must be an EC2/SSM "
                     f"managed-instance id (i-... or mi-...) followed by 8 to 17 "
                     f"hex digits"
                 )
-            if self.aws_profile and not _AWS_PROFILE_RE.match(self.aws_profile):
-                raise InvalidInstanceError(
-                    f"invalid aws_profile {self.aws_profile!r} "
-                    f"(allowed: letters, digits, '.', '_', '+', '-')"
-                )
-            if self.aws_region and not _AWS_REGION_RE.match(self.aws_region):
-                raise InvalidInstanceError(f"invalid aws_region {self.aws_region!r}")
+            self._validate_aws_coordinates()
             if not _SSM_RUN_AS_RE.match(self.ssm_run_as):
                 raise InvalidInstanceError(
                     f"invalid ssm_run_as {self.ssm_run_as!r}: must be a Unix "
@@ -264,6 +312,10 @@ class Instance:
                     f"invalid {label} {port!r}: must be an int in "
                     f"[{lo}, 65535]" + (" (0 = unallocated)" if allow_zero else "")
                 )
+        if not isinstance(self.provisioner_id, str):
+            raise InvalidInstanceError(
+                f"invalid provisioner_id {self.provisioner_id!r}: must be a string"
+            )
         if not isinstance(self.forwarder_pid, int) or self.forwarder_pid < 0:
             raise InvalidInstanceError(
                 f"invalid forwarder_pid {self.forwarder_pid!r}: must be an int "
@@ -280,6 +332,16 @@ class Instance:
                 f"string ('' = unsigned)"
             )
 
+    def _validate_aws_coordinates(self) -> None:
+        """Reject a malformed ``aws_profile`` / ``aws_region`` (empty = default)."""
+        if self.aws_profile and not _AWS_PROFILE_RE.match(self.aws_profile):
+            raise InvalidInstanceError(
+                f"invalid aws_profile {self.aws_profile!r} "
+                f"(allowed: letters, digits, '.', '_', '+', '-')"
+            )
+        if self.aws_region and not _AWS_REGION_RE.match(self.aws_region):
+            raise InvalidInstanceError(f"invalid aws_region {self.aws_region!r}")
+
     def to_dict(self) -> dict:
         """Serialize to the JSON shape stored in ``instances.json``."""
         return {
@@ -295,6 +357,7 @@ class Instance:
             "aws_profile": self.aws_profile,
             "aws_region": self.aws_region,
             "ssm_run_as": self.ssm_run_as,
+            "provisioner_id": self.provisioner_id,
             "was_connected": self.was_connected,
             "forwarder_pid": self.forwarder_pid,
             "forwarder_start": self.forwarder_start,
@@ -331,6 +394,7 @@ class Instance:
             # by an older build has no key, and one written with an explicit
             # empty string would fail validation — both mean "use the default".
             ssm_run_as=str(data.get("ssm_run_as", "") or _DEFAULT_SSM_RUN_AS),
+            provisioner_id=str(data.get("provisioner_id", "") or ""),
             was_connected=bool(data.get("was_connected", False)),
             # max(): a hand-edited negative pid normalizes to the sentinel
             # rather than poisoning every later update() with a validate error
@@ -349,6 +413,37 @@ class _RegistryDoc:
     last_active_id: str = ""
 
 
+_PATH_LOCKS: dict[str, threading.RLock] = {}
+_PATH_LOCKS_GUARD = threading.Lock()
+
+
+def _lock_for(path: Path) -> threading.RLock:
+    """Return the one lock every registry object over *path* shares.
+
+    A lock owned by a registry object serialises only that object's own callers.
+    Callers build a registry per request -- :mod:`kiro_crew.cloud.connect`, the
+    instances handlers and the dashboard server each construct their own -- so
+    two objects over the same file would interleave a read with the other's
+    write and drop a record. Keying by resolved path gives them one lock, which
+    is what makes the read-modify-write in each mutation atomic.
+
+    Locks are kept for the life of the process and never evicted: a lock is the
+    thing a writer may be holding right now, so dropping one would hand the next
+    caller a fresh lock and reopen the window. The table holds one entry per
+    distinct registry file, which is one in a gateway.
+    """
+    try:
+        key = str(path.resolve())
+    except OSError:
+        key = str(path.absolute())
+    with _PATH_LOCKS_GUARD:
+        lock = _PATH_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _PATH_LOCKS[key] = lock
+        return lock
+
+
 def _find(doc: _RegistryDoc, instance_id: str) -> Instance | None:
     """Return the record in *doc* with *instance_id*, or ``None`` if absent.
 
@@ -362,11 +457,18 @@ def _find(doc: _RegistryDoc, instance_id: str) -> Instance | None:
 
 
 class InstancesRegistry:
-    """CRUD over ``instances.json`` with atomic writes and a process lock.
+    """CRUD over ``instances.json`` with atomic writes and a per-file lock.
 
     Every mutation re-reads the file, applies the change, validates, and writes
-    atomically, so concurrent writers (a live gateway autosave and a CLI edit)
-    never silently clobber one another between a read and a write.
+    atomically while holding the lock shared by all registry objects over that
+    file, so threads in one process -- a launch registering its instance, a
+    dashboard edit, the server's own reads -- cannot interleave a read with a
+    write and drop one another's records.
+
+    That lock spans threads, not processes. A separate process writing the same
+    file serialises only on :func:`atomic_write`'s rename, which keeps the file
+    readable at all times but leaves a read-modify-write pair non-atomic across
+    processes.
     """
 
     def __init__(self, path: Path | None = None) -> None:
@@ -375,7 +477,7 @@ class InstancesRegistry:
         else:
             base = _DEFAULT_DIR if _DEFAULT_DIR is not None else config_dir()
             self._path = base / _FILENAME
-        self._lock = threading.RLock()
+        self._lock = _lock_for(self._path)
 
     @property
     def path(self) -> Path:
@@ -453,6 +555,7 @@ class InstancesRegistry:
         aws_profile: str = "",
         aws_region: str = "",
         ssm_run_as: str = _DEFAULT_SSM_RUN_AS,
+        provisioner_id: str = "",
         instance_id: str | None = None,
     ) -> Instance:
         """Add a new instance and return it.
@@ -461,8 +564,8 @@ class InstancesRegistry:
         to disambiguate collisions. Raises :class:`DuplicateInstanceError` if an
         explicit id already exists, or :class:`InvalidInstanceError` on bad input.
 
-        *connection_method* selects the transport ("ssh" or "ssm"); the fields
-        required depend on it — see :meth:`Instance.validate`.
+        *connection_method* selects the transport ("ssh", "ssm" or "fargate"); the
+        fields required depend on it -- see :meth:`Instance.validate`.
         """
         with self._lock:
             doc = self._read()
@@ -493,6 +596,7 @@ class InstancesRegistry:
                 aws_profile=aws_profile,
                 aws_region=aws_region,
                 ssm_run_as=ssm_run_as or _DEFAULT_SSM_RUN_AS,
+                provisioner_id=provisioner_id,
                 was_connected=False,
             )
             inst.validate()
@@ -514,7 +618,7 @@ class InstancesRegistry:
 
         Accepts any of: ``name``, ``ssh_host``, ``remote_port``, ``local_port``,
         ``ttl``, ``remote_bin``, ``connection_method``, ``ssm_target``,
-        ``ssm_run_as``,
+        ``ssm_run_as``, ``provisioner_id``,
         ``aws_profile``, ``aws_region``, ``was_connected``, ``forwarder_pid``,
         ``forwarder_start``, ``forwarder_sig``.
         The ``id`` is
@@ -534,6 +638,7 @@ class InstancesRegistry:
             "connection_method",
             "ssm_target",
             "ssm_run_as",
+            "provisioner_id",
             "aws_profile",
             "aws_region",
             "was_connected",

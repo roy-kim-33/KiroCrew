@@ -85,6 +85,9 @@ _TOKEN_CACHE_TTL = 120  # 2 min
 # See the _SESSIONS_DIR note above: resolved per call, ``None`` = live home.
 _TOKEN_USAGE_DIR: Path | None = None
 _TOKEN_HISTORY_DAYS = 30
+#: Window (in days) the Session Activity card and its Daily History table cover.
+#: The per-day credits column reads the same window so the two line up.
+_SESSIONS_HISTORY_DAYS = 30
 
 
 def _token_usage_dir() -> Path:
@@ -109,13 +112,24 @@ def _shards_in_window(days: int) -> list[Path]:
     The directory listing is cheap (≤31 entries) and we filter by filename
     rather than statting each file, so this stays well under a millisecond
     even on years-old installs.
+
+    A directory that exists but cannot be listed (a permission change, a
+    roaming or network home that is briefly unreachable) yields the same empty
+    window as a missing one: every reader of the shards treats an unreadable
+    shard as "no rows", and the directory is held to the same rule, so a
+    transient listing failure costs one refresh rather than the whole request.
     """
     paths: list[Path] = []
     shard_dir = _token_usage_dir()
     if not shard_dir.exists():
         return paths
     cutoff_date = (datetime.now().astimezone() - timedelta(days=days)).date()
-    for p in shard_dir.iterdir():
+    try:
+        entries = list(shard_dir.iterdir())
+    except OSError as exc:
+        logger.warning("usage: cannot list the per-turn usage shard directory: %s", exc)
+        return paths
+    for p in entries:
         if not p.is_file() or p.suffix != ".jsonl":
             continue
         try:
@@ -233,6 +247,61 @@ def slot_spend(days: int = SPEND_WINDOW_DAYS) -> dict[str, dict[str, float]]:
     return out
 
 
+def daily_credits(days: int = _SESSIONS_HISTORY_DAYS) -> dict[str, float]:
+    """Credits spent per LOCAL calendar day over the last *days*.
+
+    ``{"YYYY-MM-DD": credits}`` for every day that has at least one counted
+    row. Rows are admitted by the same three tests :func:`slot_spend` applies
+    (a ``tokens`` row, inside the per-row epoch cutoff, with a finite numeric
+    ``credits``) and keyed by :func:`_parse_row_day`, the local day the shard
+    partition itself uses. There is deliberately NO slot filter: every turn the
+    backend billed counts, background slots included, so a day's figure is the
+    day's whole spend rather than only its conversations.
+
+    Numeric hygiene: ``credits`` is coerced through ``float`` before the finite
+    test, because ``math.isfinite`` on an int wider than a double raises rather
+    than answers, and a row whose addition would push a day's total past the
+    finite range is dropped so the payload can never carry ``Infinity``.
+    """
+    cutoff = time.time() - (days * 86400)
+    out: dict[str, float] = {}
+    for path in _shards_in_window(days):
+        try:
+            with path.open("rb") as fh:
+                for line in bounded_records(fh, path, label="usage"):
+                    try:
+                        obj = json.loads(line)
+                    except ValueError:
+                        continue
+                    if not isinstance(obj, dict) or obj.get("_type") != "tokens":
+                        continue
+                    ts_raw = obj.get("ts")
+                    ts_epoch = _parse_row_ts(str(ts_raw or ""))
+                    if ts_epoch is None or ts_epoch < cutoff:
+                        continue
+                    credits = obj.get("credits")
+                    if isinstance(credits, bool) or not isinstance(credits, (int, float)):
+                        continue
+                    try:
+                        value = float(credits)
+                    except OverflowError:
+                        continue
+                    if not math.isfinite(value):
+                        continue
+                    day = _parse_row_day(ts_raw)
+                    if day is None:
+                        continue
+                    total = out.get(day, 0.0) + value
+                    if not math.isfinite(total):
+                        continue
+                    out[day] = total
+        except (OSError, UnicodeDecodeError):
+            # Same policy as every other shard reader here: a corrupt or
+            # unreadable shard costs its own rows, not the whole window.
+            continue
+    return out
+
+
 # A payload backstop, not a top-N: the panel lists sessions for the user to
 # browse, sort and group, so cutting it to the "hottest" few hid most of them
 # behind a number they could not reach. Measured over a 7d window this is 260
@@ -316,8 +385,8 @@ _BACKGROUND_CHANNELS = frozenset(
 #: The one category that can be opened from the dashboard. Kept separate from
 #: the category list because "is a session" and "has a route" are different
 #: questions — a Telegram thread is a first-class session with nowhere for a
-#: dashboard link to go, which is exactly the bug the old "titled -> link it"
-#: rule shipped.
+#: dashboard link to go, which is exactly what a "titled -> link it" rule gets
+#: wrong.
 NAVIGABLE_CATEGORY = "dashboard"
 
 
@@ -1463,10 +1532,10 @@ async def persist_token_record_async(
     turn's usage (``kirocrew.turn.tokens`` and whichever of
     ``kirocrew.turn.credits`` / ``kirocrew.turn.cost_usd`` the backend billed in)
     — and this is the only place that does. Being the one call every dispatch
-    surface already makes once per turn is exactly why: the emit used to live in
-    ``chat_runner`` beside the dashboard turn loop, so cron, heartbeat, memory
+    surface already makes once per turn is exactly why: an emit sited in
+    ``chat_runner`` beside the dashboard turn loop leaves cron, heartbeat, memory
     consolidation, subagents, task-runner steps, workflow stages and every
-    messaging channel were absent from turn latency and fault rate entirely — and
+    messaging channel absent from turn latency and fault rate entirely — and
     absent does not read as absent, it reads as healthy. See
     :mod:`kiro_crew.metrics.turns`.
 
@@ -1786,10 +1855,8 @@ def _parse_token_history() -> dict[str, Any]:
 def _parse_sessions() -> dict:
     """Parse local kiro session files for usage analytics."""
     sessions_dir = _sessions_dir()
-    if not sessions_dir.exists():
-        return {"error": "No sessions directory"}
 
-    cutoff = time.time() - (30 * 86400)
+    cutoff = time.time() - (_SESSIONS_HISTORY_DAYS * 86400)
     daily: Counter = Counter()
     daily_msgs: Counter = Counter()
     daily_tools: Counter = Counter()
@@ -1797,17 +1864,34 @@ def _parse_sessions() -> dict:
     total_msgs = 0
     total_tools = 0
     all_time_sessions = 0
+    # Count of transcripts that did NOT load for any reason (validator refusal,
+    # stat failure, read failure) -- surfaced so the page can say the totals are
+    # incomplete instead of rendering a silent under-count. The name matches the
+    # payload/frontend contract; it is the did-not-load total.
     refused_transcripts = 0
     now_dt = datetime.now()
     today_str = now_dt.strftime("%Y-%m-%d")
 
+    # Set when the directory could not be read at all. Carried ALONGSIDE the
+    # statistics rather than instead of them: every consumer of this payload
+    # reads the period keys unconditionally, so an error-only object is not a
+    # degraded answer, it is a differently-shaped one.
+    read_error: dict[str, str] = {}
     try:
         entries = list(sessions_dir.iterdir())
+    except FileNotFoundError:
+        # First-run homes have no transcript directory yet; use the same
+        # complete zero statistics as an existing, empty directory.
+        entries = []
     except OSError as exc:
-        # The OSError carries a filesystem path; keep it server-side and return
-        # a generic message (the ``error`` field is rendered verbatim in the UI).
+        # The OSError carries a filesystem path; keep it server-side and report a
+        # generic message (the ``error`` field is rendered verbatim in the UI).
         logger.warning("usage: cannot read sessions directory: %s", exc)
-        return {"error": "cannot read sessions directory", "code": "sessions_dir_unreadable"}
+        entries = []
+        read_error = {
+            "error": "cannot read sessions directory",
+            "code": "sessions_dir_unreadable",
+        }
 
     for f in entries:
         if f.suffix != ".jsonl":
@@ -1815,21 +1899,26 @@ def _parse_sessions() -> dict:
         # Validate path through hooks.py (resolves symlinks, checks sensitive)
         resolved_str = validate_file_path(str(f))
         if resolved_str is None:
-            # Counted, not swallowed (#6733): a refusal here is indistinguishable
+            # Counted, not swallowed: a refusal here is indistinguishable
             # from an idle account in the rendered numbers, and on a
             # roaming-profile (UNC) home EVERY transcript lands in this branch --
             # so the page reports a confident zero with nothing anywhere to say
             # why. Aggregated after the loop rather than logged per file, because
             # that failure mode refuses all of them. Admitting the transcript dir
             # to the UNC gate -- which is what would make the count correct
-            # rather than merely explained -- is deferred to #8079; it needs a
-            # resolution that refuses links atomically first.
+            # rather than merely explained -- is deferred; it needs a resolution
+            # that refuses links atomically first.
             refused_transcripts += 1
             continue
         resolved = Path(resolved_str)
         try:
             mtime = resolved.stat().st_mtime
         except OSError:
+            # A transcript that validated but cannot be stat'd did not load, so
+            # it is dropped from the counts exactly like a refusal. Count
+            # it in the same total: the warning's absence promises complete data,
+            # so every did-not-load branch must feed it, not just the UNC refusal.
+            refused_transcripts += 1
             continue
         all_time_sessions += 1
         if mtime < cutoff:
@@ -1855,6 +1944,10 @@ def _parse_sessions() -> dict:
                     elif kind == "ToolResults":
                         tools += 1
         except (OSError, UnicodeDecodeError):
+            # Same as the stat branch above: a transcript that could not be read
+            # did not load, so it counts toward the incomplete-data warning
+            # rather than vanishing from the totals.
+            refused_transcripts += 1
             continue
 
         if day is None:
@@ -1870,17 +1963,23 @@ def _parse_sessions() -> dict:
     if refused_transcripts:
         # Server-side only: %s of a Path is a filesystem path, which the
         # returned payload deliberately never carries (see the iterdir handler
-        # above).
+        # above). Counts every did-not-load branch (validator refusal, stat
+        # failure, read failure), not just the UNC refusal.
         logger.warning(
-            "usage: %d transcript(s) refused by path validation in %s; "
+            "usage: %d transcript(s) could not be loaded in %s; "
             "the reported session counts exclude them",
             refused_transcripts,
             sessions_dir,
         )
 
-    # Build daily history sorted by date
-    all_days = sorted(set(daily.keys()))
-    history = []
+    # Build daily history sorted by date. Credits come from the per-turn usage
+    # shards, not the transcripts, so a day can carry spend without a transcript
+    # (a background slot, a refused file): such a day still gets a row, with
+    # zero sessions, so that spend is shown rather than dropped. Counter lookups
+    # on those days read 0 without inserting a key.
+    credits_by_day = daily_credits(_SESSIONS_HISTORY_DAYS)
+    all_days = sorted(set(daily.keys()) | set(credits_by_day.keys()))
+    history: list[dict[str, Any]] = []
     for d in all_days:
         history.append(
             {
@@ -1888,6 +1987,7 @@ def _parse_sessions() -> dict:
                 "sessions": daily[d],
                 "messages": daily_msgs[d],
                 "tool_calls": daily_tools[d],
+                "credits": round(credits_by_day.get(d, 0.0), 2),
             }
         )
 
@@ -1922,6 +2022,18 @@ def _parse_sessions() -> dict:
         },
         "avg_msgs_per_session": round(total_msgs / max(total_sessions, 1), 1),
         "avg_tools_per_session": round(total_tools / max(total_sessions, 1), 1),
+        # How many transcripts the path validator refused. Carried in
+        # the payload -- not just the server log -- so the page can say the
+        # count is incomplete instead of rendering a confident zero. On a
+        # roaming-profile (UNC) home this is every transcript, so a zero
+        # session count with a positive refusal count is the exact silent
+        # failure this field makes visible.
+        "refused_transcripts": refused_transcripts,
+        # Present only when the directory read itself failed. ``api_kiro_usage``
+        # keys its no-cache decision on this, and the zeros above are then a
+        # SHAPE, not a measurement -- which is why the message has to travel with
+        # them rather than replace them.
+        **read_error,
     }
 
 

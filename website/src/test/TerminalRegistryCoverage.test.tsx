@@ -25,9 +25,12 @@ import {
   useTerminalEnabled,
   useTerminalTitle,
   getTerminalCwd,
+  getTerminalShell,
+  getTerminalFenceShells,
   registerTerminalWs,
   unregisterTerminalWs,
   getTerminalWs,
+  getTerminalInputWs,
   onTerminalReady,
   sendToTerminalSession,
   sendRawToTerminalSession,
@@ -185,6 +188,68 @@ describe('terminalRegistry', () => {
     })
   })
 
+  describe('getTerminalShell', () => {
+    it('records the shell the backend reports in its ready frame', () => {
+      const id = session('shell-report')
+      ensureTerminalConnection(id, new FakeTerm().asTerminal(), new FakeFit().asFitAddon())
+      const ws = WS_INSTANCES[0]
+
+      expect(getTerminalShell(id)).toBeUndefined()
+      act(() => { ws.simulateJson({ type: 'ready', shell: '/usr/bin/fish' }) })
+      expect(getTerminalShell(id)).toBe('/usr/bin/fish')
+    })
+
+    it('stays unknown when the ready frame reports no shell', () => {
+      const id = session('shell-absent')
+      ensureTerminalConnection(id, new FakeTerm().asTerminal(), new FakeFit().asFitAddon())
+      const ws = WS_INSTANCES[0]
+
+      act(() => { ws.simulateJson({ type: 'ready' }) })
+      expect(getTerminalShell(id)).toBeUndefined()
+    })
+
+    it('has the shell recorded before ready listeners run', () => {
+      const id = session('shell-order')
+      ensureTerminalConnection(id, new FakeTerm().asTerminal(), new FakeFit().asFitAddon())
+      const ws = WS_INSTANCES[0]
+
+      // Run-in-terminal reads the shell from inside its ready callback, so a
+      // shell recorded after the drain would arrive too late to be used.
+      let seenFromListener: string | undefined = 'listener did not run'
+      onTerminalReady(id, () => { seenFromListener = getTerminalShell(id) })
+      act(() => { ws.simulateJson({ type: 'ready', shell: '/usr/bin/zsh' }) })
+      expect(seenFromListener).toBe('/usr/bin/zsh')
+    })
+
+    it('records the fence-shell paths the backend resolved', () => {
+      const id = session('fence-shells')
+      ensureTerminalConnection(id, new FakeTerm().asTerminal(), new FakeFit().asFitAddon())
+      const ws = WS_INSTANCES[0]
+
+      expect(getTerminalFenceShells(id)).toEqual({})
+      act(() => {
+        ws.simulateJson({
+          type: 'ready',
+          shell: '/usr/bin/bash',
+          fence_shells: { bash: '/usr/bin/bash', fish: '/usr/bin/fish' },
+        })
+      })
+      expect(getTerminalFenceShells(id)).toEqual({
+        bash: '/usr/bin/bash',
+        fish: '/usr/bin/fish',
+      })
+    })
+
+    it('reports no fence shells when the ready frame carries none', () => {
+      const id = session('fence-shells-absent')
+      ensureTerminalConnection(id, new FakeTerm().asTerminal(), new FakeFit().asFitAddon())
+      const ws = WS_INSTANCES[0]
+
+      act(() => { ws.simulateJson({ type: 'ready', shell: '/usr/bin/bash' }) })
+      expect(getTerminalFenceShells(id)).toEqual({})
+    })
+  })
+
   describe('onTerminalReady', () => {
     it('runs the callback immediately when the socket is already open', () => {
       const id = session('ready-now')
@@ -249,6 +314,74 @@ describe('terminalRegistry', () => {
       ws.send.mockImplementation(() => { throw new Error('socket gone') })
       expect(sendToTerminalSession(id, 'ls')).toBe(false)
       expect(sendRawToTerminalSession(id, 'ls')).toBe(false)
+    })
+  })
+
+  /**
+   * The two input tiers, and the session state that separates them (#7657).
+   *
+   * A login profile that ASSIGNS `PROMPT_COMMAND` replaces the hook the `ready`
+   * frame rides on, so that frame never arrives: the socket is open, the shell
+   * is usable, and the execution barrier stays shut for the life of the session.
+   * Typing must keep working there -- `term.onData` already writes hand-typed
+   * keystrokes to the same socket -- while newline-terminated dispatch must not.
+   */
+  describe('input tiers on a session with no ready frame', () => {
+    /** Open socket, no `ready` frame: the clobbered-hook state. */
+    function openUnreadySession(sessionId: string): MockWebSocket {
+      ensureTerminalConnection(
+        sessionId, new FakeTerm().asTerminal(), new FakeFit().asFitAddon(),
+      )
+      const ws = WS_INSTANCES[WS_INSTANCES.length - 1]
+      ws.simulateOpen()
+      return ws
+    }
+
+    it('types an accepted completion into a session that never went ready', () => {
+      const id = session('unready-typing')
+      const ws = openUnreadySession(id)
+      // Precondition, or this proves nothing: the barrier is genuinely shut, so
+      // the session is in the clobbered state rather than simply ready.
+      expect(getTerminalWs(id)).toBeNull()
+
+      expect(getTerminalInputWs(id)).not.toBeNull()
+      expect(sendRawToTerminalSession(id, '/loc')).toBe(true)
+      expect(decode(ws)).toBe('/loc')
+    })
+
+    it('keeps newline-terminated dispatch waiting on that same session', () => {
+      const id = session('unready-execution')
+      const ws = openUnreadySession(id)
+      const waiter = vi.fn()
+      onTerminalReady(id, waiter)
+
+      expect(sendToTerminalSession(id, 'ls')).toBe(false)
+      expect(waiter).not.toHaveBeenCalled()
+      expect(ws.send).not.toHaveBeenCalled()
+    })
+
+    it('refuses to type a payload that would submit a line', () => {
+      const id = session('no-submit')
+      const ws = openSocket(id)
+      // A directory entry may legally hold a newline (`touch $'evil\nrm -rf x'`).
+      // The typing tier is allowed to run before `ready` only because it cannot
+      // execute anything, so a newline or carriage return is refused here even
+      // on a ready session.
+      expect(sendRawToTerminalSession(id, 'evil\nrm -rf x')).toBe(false)
+      expect(sendRawToTerminalSession(id, 'evil\rrm -rf x')).toBe(false)
+      expect(sendRawToTerminalSession(id, '\n')).toBe(false)
+      expect(ws.send).not.toHaveBeenCalled()
+    })
+
+    it('does not type into a socket that has not finished dialing', () => {
+      const id = session('dialing')
+      ensureTerminalConnection(id, new FakeTerm().asTerminal(), new FakeFit().asFitAddon())
+      const ws = WS_INSTANCES[WS_INSTANCES.length - 1]
+
+      expect(ws.readyState).toBe(MockWebSocket.CONNECTING)
+      expect(getTerminalInputWs(id)).toBeNull()
+      expect(sendRawToTerminalSession(id, '/loc')).toBe(false)
+      expect(ws.send).not.toHaveBeenCalled()
     })
   })
 
@@ -489,6 +622,84 @@ describe('terminalRegistry', () => {
         vi.advanceTimersByTime(60_000)
       }
       expect(WS_INSTANCES).toHaveLength(10)
+    })
+  })
+
+  describe('displacement by a newer window', () => {
+    // The server closes a displaced socket on purpose after one
+    // `{type:'error', code:'displaced'}` frame. Redialing would take the PTY
+    // straight back from the window that just claimed it, so the session parks.
+    it('parks as disconnected without a redial when the server reports displacement', () => {
+      const id = session('displaced-park')
+      vi.useFakeTimers()
+      ensureTerminalConnection(id, new FakeTerm().asTerminal(), new FakeFit().asFitAddon())
+      const { result } = renderHook(() => useTerminalConnStatus(id))
+      const ws = WS_INSTANCES[0]
+      act(() => { ws.simulateOpen(); ws.simulateJson({ type: 'ready' }) })
+      expect(result.current).toBe('connected')
+
+      act(() => {
+        ws.simulateJson({ type: 'error', code: 'displaced', message: 'Another connection owns this terminal session' })
+        ws.simulateClose()
+      })
+      expect(result.current).toBe('disconnected')
+      act(() => { vi.advanceTimersByTime(120_000) })
+      expect(WS_INSTANCES).toHaveLength(1)
+      expect(getTerminalWs(id)).toBeNull()
+    })
+
+    it('ignores online and visibility revives while displaced', () => {
+      const id = session('displaced-revive')
+      vi.useFakeTimers()
+      ensureTerminalConnection(id, new FakeTerm().asTerminal(), new FakeFit().asFitAddon())
+      const ws = WS_INSTANCES[0]
+      ws.simulateOpen()
+      ws.simulateJson({ type: 'error', code: 'displaced' })
+      ws.simulateClose()
+
+      window.dispatchEvent(new Event('online'))
+      Object.defineProperty(document, 'visibilityState', { value: 'visible', configurable: true })
+      document.dispatchEvent(new Event('visibilitychange'))
+      vi.advanceTimersByTime(60_000)
+      expect(WS_INSTANCES).toHaveLength(1)
+    })
+
+    it('lets a manual Reconnect take the terminal back and clears the parked state', () => {
+      const id = session('displaced-manual')
+      vi.useFakeTimers()
+      ensureTerminalConnection(id, new FakeTerm().asTerminal(), new FakeFit().asFitAddon())
+      const { result } = renderHook(() => useTerminalConnStatus(id))
+      const ws = WS_INSTANCES[0]
+      act(() => {
+        ws.simulateOpen()
+        ws.simulateJson({ type: 'error', code: 'displaced' })
+        ws.simulateClose()
+      })
+      expect(result.current).toBe('disconnected')
+
+      act(() => { retryTerminalConnection(id) })
+      expect(WS_INSTANCES).toHaveLength(2)
+      act(() => { WS_INSTANCES[1].simulateOpen() })
+      expect(result.current).toBe('connected')
+
+      // An ordinary drop afterwards redials normally again: the parked state
+      // did not outlive the manual retry.
+      act(() => { WS_INSTANCES[1].simulateClose() })
+      expect(result.current).toBe('reconnecting')
+      act(() => { vi.advanceTimersByTime(1000) })
+      expect(WS_INSTANCES).toHaveLength(3)
+    })
+
+    it('treats an error frame without the displaced code as an ordinary drop', () => {
+      const id = session('displaced-other-error')
+      vi.useFakeTimers()
+      ensureTerminalConnection(id, new FakeTerm().asTerminal(), new FakeFit().asFitAddon())
+      const ws = WS_INSTANCES[0]
+      ws.simulateOpen()
+      ws.simulateJson({ type: 'error', message: 'Terminal reconnect failed' })
+      ws.simulateClose()
+      vi.advanceTimersByTime(1000)
+      expect(WS_INSTANCES).toHaveLength(2)
     })
   })
 

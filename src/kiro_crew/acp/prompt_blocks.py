@@ -31,15 +31,28 @@ import io
 import json
 import logging
 import os
-import re
 from pathlib import Path
 
 from kiro_crew.hooks import is_unc_shape, safe_read_file_bytes, unc_probe_allowed
 
+# The path grammar and the history scrubber live in the LEAF module
+# kiro_crew.image_refs for the same reason the Pillow machinery lives in
+# kiro_crew.imaging: kiro_crew.context needs the scrubber and the
+# agent-sdk-boundary gate forbids application code from importing
+# kiro_crew.acp. The pattern names are re-exported because this module and
+# its tests are where they have always been read from.
+from kiro_crew.image_refs import (  # noqa: F401 -- re-exported, see comment
+    _PATH_RE,
+    _POSIX_PATH_RE,
+    _WINDOWS_PATH_RE,
+    STRIPPED_IMAGE_MARKER,
+    strip_image_refs,
+)
+
 # The budget constants and Pillow machinery live in the LEAF module
 # kiro_crew.imaging (shared with the gateway's tool-result rewrite, which must
 # not import the ACP package). The two constants are re-exported because this
-# module is where the prompt path's callers and tests historically found them.
+# module is where the prompt path's callers and tests import them from.
 from kiro_crew.imaging import (  # noqa: F401 -- constants re-exported, see comment
     MAX_IMAGE_B64_BYTES,
     MAX_IMAGE_EDGE_PX,
@@ -67,6 +80,7 @@ IMAGE_MEDIA_TYPES: dict[str, str] = {
 #: a file that passed ingestion is not silently dropped here.
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 
+<<<<<<< HEAD
 #: Formats every major vision provider accepts natively. Anything outside this
 #: set (AVIF, HEIC, TIFF, ICO, …) has to be transcoded to PNG before it is
 #: inlined, or the backend returns 400 "Could not process image". Mirrors the
@@ -215,6 +229,8 @@ _WINDOWS_PATH_RE = re.compile(
 
 _PATH_RE = _WINDOWS_PATH_RE if os.name == "nt" else _POSIX_PATH_RE
 
+=======
+>>>>>>> upstream/main
 
 def build_prompt_blocks(
     message: str,
@@ -397,8 +413,8 @@ def summarize_prompt_structure(blocks: object) -> dict:
       than a size describing a payload the counts claim is empty.
 
     This summary is deliberately safe to log: it carries no content and
-    therefore cannot leak credentials or user data. That is a hard requirement
-    (issue #6022) -- the kiro-cli data dir is fenced precisely because it holds
+    therefore cannot leak credentials or user data. That is a hard
+    requirement -- the kiro-cli data dir is fenced precisely because it holds
     SSO tokens, so the outbound-request diagnostics must expose counts, types,
     and sizes ONLY, never the bytes themselves.
 

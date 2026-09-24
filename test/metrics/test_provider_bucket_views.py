@@ -1,12 +1,12 @@
 """Guards for the per-instrument histogram bucket Views.
 
-Context: bucket boundaries used to be ONE shared array applied through a single
-catch-all ``View(instrument_type=Histogram)``. Its top bound was 60s, sized for
-session startup, so the first ``kirocrew.turn.duration`` sample ever recorded
-(227589ms) fell into the +Inf overflow bucket and the aggregator reported
+One shared boundary array applied through a single catch-all
+``View(instrument_type=Histogram)`` cannot serve every instrument: a 60s top
+bound sized for session startup sends a 227589ms ``kirocrew.turn.duration``
+sample into the +Inf overflow bucket, and the aggregator then reports
 ``p50 == p90 == 60000`` — a ceiling artifact rendered as a real latency.
 
-The fix replaces the catch-all with one View per instrument. That makes two
+One View per instrument replaces that catch-all. That makes two
 properties load-bearing, and both are asserted here:
 
 1. **Completeness.** With no catch-all, an instrument missing from
@@ -18,8 +18,10 @@ properties load-bearing, and both are asserted here:
    twice under one metric name. ``test_no_duplicate_streams_per_instrument``
    pins that.
 """
+
 import ast
 import re
+from functools import lru_cache
 from pathlib import Path
 
 import pytest
@@ -37,13 +39,19 @@ from kiro_crew.metrics.provider import (
     histogram_bounds,
 )
 
+# One xdist worker for the whole module: every test here derives from ONE module-cached
+# scan of src/ (rglob + ast.parse, ~30s). Under `--dist loadgroup` an unmarked module is
+# spread across workers and each worker re-pays that scan -- measured at 5 workers x 40-75s
+# per full run for this file alone. Grouping keeps the cache single-copy per run.
+pytestmark = pytest.mark.xdist_group(name="tree_scan_test_provider_bucket_views")
 _SRC = Path(provider_mod.__file__).resolve().parent.parent
 # Histogram instrument names are the `.duration` metrics (all ms); counters
 # end in `.count` / `.acquire` / `.action` / `.outcome` and carry no bounds.
 _NAME_RE = re.compile(r'"(kirocrew\.[a-z0-9_.]*\.duration)"')
 
 
-def _source_histogram_names() -> set[str]:
+@lru_cache(maxsize=1)
+def _source_histogram_names() -> frozenset[str]:
     found: set[str] = set()
     for path in _SRC.rglob("*.py"):
         try:
@@ -51,9 +59,10 @@ def _source_histogram_names() -> set[str]:
         except (OSError, UnicodeDecodeError):
             continue
         found.update(_NAME_RE.findall(text))
-    return found
+    return frozenset(found)
 
 
+@lru_cache(maxsize=1)
 def _emitted_histogram_units() -> dict[str, set[str]]:
     """Instrument name -> the set of ``unit=`` values its emit calls pass.
 
@@ -111,7 +120,54 @@ def _emitted_histogram_units() -> dict[str, set[str]]:
 
 
 def _emitted_histogram_names() -> set[str]:
-    return set(_emitted_histogram_units())
+    return set(_emitted_histogram_units().keys())
+
+
+@lru_cache(maxsize=1)
+def _sampler_histogram_names() -> frozenset[str]:
+    """Instruments passed to ``kiro_crew.metrics.events.emit_histogram``.
+
+    The sampler-cadence series (loop lag, queue depth, recovery duration) are
+    recorded through that helper with a constant imported from ``events.py``,
+    so neither scan above sees them: the name scan wants a ``.duration`` suffix
+    and the call scan resolves only same-file constants of a ``histogram`` call.
+    This resolves the first argument against ``events.py``'s module-level string
+    constants so a registered sampler histogram counts as live.
+    """
+    events_path = _SRC / "metrics" / "events.py"
+    consts: dict[str, str] = {}
+    for node in ast.parse(events_path.read_text(encoding="utf-8")).body:
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        target = node.targets[0]
+        if isinstance(target, ast.Name) and isinstance(node.value, ast.Constant):
+            if isinstance(node.value.value, str):
+                consts[target.id] = node.value.value
+    found: set[str] = set()
+    for path in _SRC.rglob("*.py"):
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        if "emit_histogram(" not in text:
+            continue
+        try:
+            tree = ast.parse(text)
+        except SyntaxError:
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or not node.args:
+                continue
+            fn = node.func
+            fname = fn.attr if isinstance(fn, ast.Attribute) else getattr(fn, "id", "")
+            if fname != "emit_histogram":
+                continue
+            first = node.args[0]
+            if isinstance(first, ast.Constant) and isinstance(first.value, str):
+                found.add(first.value)
+            elif isinstance(first, ast.Name) and first.id in consts:
+                found.add(consts[first.id])
+    return frozenset(found)
 
 
 class TestCompleteness:
@@ -131,14 +187,28 @@ class TestCompleteness:
             "map with boundaries covering its real range."
         )
 
+    def test_sampler_millisecond_histograms_have_bounds(self):
+        """The sampler scan must find the loop-lag instrument, and every
+        millisecond instrument it finds must be in the ms map; dropping the
+        ``kirocrew.loop.lag_ms`` entry fails here, not only in the stale check.
+        The sampler's non-millisecond series (queue depth, wait and recovery
+        seconds) predate this map and are outside it."""
+        names = _sampler_histogram_names()
+        assert "kirocrew.loop.lag_ms" in names
+        ms_names = {name for name in names if name.endswith("_ms")}
+        missing = sorted(ms_names - set(_HISTOGRAM_BUCKETS_MS))
+        assert not missing, f"sampler millisecond histograms without bounds: {missing}"
+
     def test_no_stale_map_entries(self):
         """A name dropped from the source should not linger in the map.
 
-        Checked against the union of both scans: the ms map legitimately holds
-        millisecond histograms whose names do not end in ``.duration`` (the embed
-        pair), which the name scan alone cannot see.
+        Checked against the union of all three scans: the ms map legitimately
+        holds millisecond histograms whose names do not end in ``.duration`` (the
+        embed pair), which the name scan alone cannot see, and sampler
+        histograms recorded through ``events.emit_histogram`` (loop lag), which
+        neither of the other two scans resolves.
         """
-        live = _source_histogram_names() | _emitted_histogram_names()
+        live = _source_histogram_names() | _emitted_histogram_names() | _sampler_histogram_names()
         stale = sorted(set(_HISTOGRAM_BUCKETS_MS) - live)
         assert not stale, f"map entries with no emitting call site: {stale}"
 
@@ -199,8 +269,7 @@ class TestNonDurationHistograms:
         """
         units = _emitted_histogram_units()
         wrong = sorted(
-            name for name in _HISTOGRAM_BUCKETS_MS
-            if name in units and units[name] != {"ms"}
+            name for name in _HISTOGRAM_BUCKETS_MS if name in units and units[name] != {"ms"}
         )
         assert not wrong, (
             f"non-millisecond instruments in the ms map: {wrong}. The dashboard "
@@ -209,10 +278,7 @@ class TestNonDurationHistograms:
 
     def test_by_unit_map_holds_no_millisecond_instruments(self):
         units = _emitted_histogram_units()
-        wrong = sorted(
-            name for name in _HISTOGRAM_BUCKETS_BY_UNIT
-            if units.get(name) == {"ms"}
-        )
+        wrong = sorted(name for name in _HISTOGRAM_BUCKETS_BY_UNIT if units.get(name) == {"ms"})
         assert not wrong, f"millisecond instruments belong in the ms map: {wrong}"
 
     def test_one_instrument_never_carries_two_units(self):
@@ -228,8 +294,7 @@ class TestNonDurationHistograms:
         # boundary that a percentile can only report as a floor.
         for observed in (6.76, 53.3, 155.1):
             assert any(
-                lo < observed <= hi
-                for lo, hi in zip(_CREDIT_BUCKETS, _CREDIT_BUCKETS[1:])
+                lo < observed <= hi for lo, hi in zip(_CREDIT_BUCKETS, _CREDIT_BUCKETS[1:])
             ), observed
 
     def test_usd_bounds_span_sub_cent_to_tens_of_dollars(self):
@@ -244,8 +309,23 @@ class TestNonDurationHistograms:
         population lands in the first two buckets, so the reported p50 could only
         ever be 0 or 5.
         """
-        otel_default = [0.0, 5.0, 10.0, 25.0, 50.0, 75.0, 100.0, 250.0, 500.0, 750.0,
-                        1000.0, 2500.0, 5000.0, 7500.0, 10000.0]
+        otel_default = [
+            0.0,
+            5.0,
+            10.0,
+            25.0,
+            50.0,
+            75.0,
+            100.0,
+            250.0,
+            500.0,
+            750.0,
+            1000.0,
+            2500.0,
+            5000.0,
+            7500.0,
+            10000.0,
+        ]
         below_five = sum(1 for b in _CREDIT_BUCKETS if b <= 5.0)
         assert below_five >= 7, "the credit array must resolve the sub-5 decade"
         assert sum(1 for b in otel_default if 0 < b <= 5.0) == 1
@@ -295,8 +375,25 @@ class TestMixedBoundaryGenerations:
     """
 
     OLD_SHARED_BOUNDS = [
-        1, 5, 10, 25, 50, 100, 250, 500, 1000, 2000, 3000,
-        5000, 7500, 10000, 15000, 20000, 30000, 45000, 60000,
+        1,
+        5,
+        10,
+        25,
+        50,
+        100,
+        250,
+        500,
+        1000,
+        2000,
+        3000,
+        5000,
+        7500,
+        10000,
+        15000,
+        20000,
+        30000,
+        45000,
+        60000,
     ]
 
     def _dp(self, bounds, landed_index, count=1, total=None, ns=None):
@@ -323,8 +420,7 @@ class TestMixedBoundaryGenerations:
     def test_legacy_overflow_point_cannot_fabricate_a_one_hour_p90(self):
         h = _Hist()
         # Pre-change: a 227589ms turn, recorded as old-bounds +Inf overflow.
-        h.add(self._dp(self.OLD_SHARED_BOUNDS, len(self.OLD_SHARED_BOUNDS),
-                       count=1, total=227589))
+        h.add(self._dp(self.OLD_SHARED_BOUNDS, len(self.OLD_SHARED_BOUNDS), count=1, total=227589))
         # Post-change: three ordinary ~30s turns under the new bounds.
         for _ in range(3):
             h.add(self._dp(_TURN_BUCKETS_MS, 5, count=1, total=30000))
@@ -339,8 +435,8 @@ class TestMixedBoundaryGenerations:
 
     def test_generations_do_not_cross_contaminate_buckets(self):
         h = _Hist()
-        h.add(self._dp(self.OLD_SHARED_BOUNDS, 11, count=5))   # 5 old samples
-        h.add(self._dp(_TURN_BUCKETS_MS, 2, count=9))           # 9 new samples
+        h.add(self._dp(self.OLD_SHARED_BOUNDS, 11, count=5))  # 5 old samples
+        h.add(self._dp(_TURN_BUCKETS_MS, 2, count=9))  # 9 new samples
         assert h.bounds == list(_TURN_BUCKETS_MS)
         assert sum(h.buckets) == 9, "old-generation counts bled into new buckets"
 
@@ -354,8 +450,15 @@ class TestMixedBoundaryGenerations:
         """
         h = _Hist()
         for _ in range(5):
-            h.add(self._dp(self.OLD_SHARED_BOUNDS, len(self.OLD_SHARED_BOUNDS),
-                           count=1, total=227589, ns=1_000))
+            h.add(
+                self._dp(
+                    self.OLD_SHARED_BOUNDS,
+                    len(self.OLD_SHARED_BOUNDS),
+                    count=1,
+                    total=227589,
+                    ns=1_000,
+                )
+            )
         h.add(self._dp(_TURN_BUCKETS_MS, 2, count=1, total=5000, ns=2_000))
 
         assert h.bounds == list(_TURN_BUCKETS_MS), "stale generation kept winning"
@@ -463,9 +566,7 @@ class TestViewWiring:
     def test_long_turn_does_not_land_in_the_overflow_bucket(self):
         """The regression: 227589ms must fall inside an explicit bucket."""
         mp, reader = self._provider()
-        mp.get_meter("t").create_histogram(
-            "kirocrew.turn.duration", unit="ms"
-        ).record(227589)
+        mp.get_meter("t").create_histogram("kirocrew.turn.duration", unit="ms").record(227589)
 
         (dp,) = self._points(reader, "kirocrew.turn.duration")
         counts = list(dp.bucket_counts)
@@ -481,9 +582,7 @@ class TestViewWiring:
         mp, reader = self._provider()
         meter = mp.get_meter("t")
         meter.create_histogram("kirocrew.turn.duration", unit="ms").record(5000)
-        meter.create_histogram(
-            "kirocrew.session.startup.duration", unit="ms"
-        ).record(4400)
+        meter.create_histogram("kirocrew.session.startup.duration", unit="ms").record(4400)
 
         assert len(self._points(reader, "kirocrew.turn.duration")) == 1
         assert len(self._points(reader, "kirocrew.session.startup.duration")) == 1
@@ -492,9 +591,7 @@ class TestViewWiring:
         mp, reader = self._provider()
         meter = mp.get_meter("t")
         meter.create_histogram("kirocrew.turn.duration", unit="ms").record(60000)
-        meter.create_histogram(
-            "kirocrew.mcp.backend.acquire.duration", unit="ms"
-        ).record(1)
+        meter.create_histogram("kirocrew.mcp.backend.acquire.duration", unit="ms").record(1)
 
         (turn,) = self._points(reader, "kirocrew.turn.duration")
         (fast,) = self._points(reader, "kirocrew.mcp.backend.acquire.duration")
@@ -528,16 +625,14 @@ class TestAggregatorReadsRealPercentiles:
     def test_turn_percentiles_are_no_longer_pinned_to_the_ceiling(self):
         from kiro_crew.dashboard.handlers.telemetry import _pct_from_buckets
 
-        # Same sample, old vs new boundaries.
-        old_bounds = _STARTUP_BUCKETS_MS  # what every histogram used to get
+        # The same sample read against the startup boundaries and the turn ones.
+        old_bounds = _STARTUP_BUCKETS_MS  # the catch-all's shared array
         old_counts = [0] * len(old_bounds) + [1]  # 227589ms -> overflow
         assert _pct_from_buckets(old_counts, old_bounds, 0.50) == 60000.0
         assert _pct_from_buckets(old_counts, old_bounds, 0.90) == 60000.0
 
         new_bounds = _TURN_BUCKETS_MS
-        landed = next(
-            i for i, b in enumerate(new_bounds) if b >= 227589
-        )
+        landed = next(i for i, b in enumerate(new_bounds) if b >= 227589)
         new_counts = [0] * (len(new_bounds) + 1)
         new_counts[landed] = 1
         p50 = _pct_from_buckets(new_counts, new_bounds, 0.50)

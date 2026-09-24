@@ -78,7 +78,7 @@ manifest being trusted is not the one being widened.
 Gating the broad scopes through the install-time consent path
 (``apps/admission.py``) is tracked separately.
 
-## Dashboard users (empty app claim) are unaffected — full event stream as before.
+## Dashboard users (empty app claim) are unaffected — they get the full stream.
 """
 
 from __future__ import annotations
@@ -205,6 +205,8 @@ _SLOT_SCOPED_EVENTS = frozenset({
     "chat_segment", "chat_append", "chat_message_update", "chat_variant_switch",
     # Side-conversation channel (``broadcast_side_result``); carries ``slot``.
     "chat.side_result",
+    # Reply-thread channel (``broadcast_thread_reply``); carries ``slot``.
+    "chat.thread_reply",
     "heartbeat", "context_usage",
     # Tool / queue
     "tool_call", "tool_result",
@@ -230,6 +232,7 @@ _SLOT_SCOPED_EVENTS = frozenset({
     "subagent_spawn", "subagent_done", "subagent_tool", "subagent_chunk",
     "subagent_snapshot", "subagent_status", "subagent_queued",
     "subagent_stalled", "subagent_retrying", "subagent_recovering",
+    "subagent_waiting", "subagent_resumed",
     "subagent_injection_failed",
     # Slack-gateway driven, slot-scoped
     "autonudge_state", "batch_finished", "spawn_batch_started",
@@ -241,6 +244,7 @@ _SUBAGENT_EVENTS = frozenset({
     "subagent_spawn", "subagent_done", "subagent_tool", "subagent_chunk",
     "subagent_snapshot", "subagent_status", "subagent_queued",
     "subagent_stalled", "subagent_retrying", "subagent_recovering",
+    "subagent_waiting", "subagent_resumed",
     "subagent_injection_failed",
 })
 
@@ -262,6 +266,22 @@ _SUBAGENT_BATCH_ITEM_KEY = {
     "subagent_batch_update": "updates",
     "subagent_batch_chunks": "chunks",
 }
+
+# ---------------------------------------------------------------------------
+# Owner-only event types: the dashboard USER receives them (dashboard-user
+# tokens bypass this gate entirely), but an app token never does. The
+# per-member event log's frames belong here — they carry the operator's crew
+# roster/activity/patrol state, which is not an app's business (the same
+# posture the whole ``handlers/members.py`` surface takes: app tokens are
+# denied outright). Classified here rather than left to the unknown-event
+# floor so the denial is INTENTIONAL and audited with its own reason instead
+# of reading as a misconfiguration, and so a future literal broadcast of one
+# of these names cannot silently start reaching app tokens.
+_OWNER_ONLY_EVENTS = frozenset({
+    "member_projection",   # types.WS_MEMBER_PROJECTION
+    "members_subscribed",  # types.WS_MEMBERS_SUBSCRIBED
+})
+
 
 # ---------------------------------------------------------------------------
 # Global event type → required declaration mapping
@@ -354,6 +374,13 @@ _GLOBAL_EVENT_DECLARATIONS: dict[str, str] = {
     # shape (per-event opt-in), and it is the one declaration that exists in
     # the tree today (the workflows app), so the name must not change.
     "workflow_run_event": "workflow_run_event",
+    # Metadata only ({slug}) and no slot -- but the slug NAMES a crew, which is
+    # the same reason `skills.pending_changed` above takes an explicit
+    # declaration rather than riding Tier 0: an app has no business learning the
+    # roster from a refresh ping. The frame deliberately carries nothing else
+    # (the ownership digest is withheld), and a client that acts on it re-reads
+    # through the panel route, which re-applies the ownership check.
+    "panel_published": "panels",
     # Privileged
     "log": "log",
     "browser_event": "browser",
@@ -433,6 +460,7 @@ def build_allowed_event_set(events_declared: list[str]) -> frozenset[str]:
 # Core filter: is this event allowed for this app token?
 # ---------------------------------------------------------------------------
 
+
 def ws_event_allowed(
     event_type: str,
     data: dict[str, Any],
@@ -498,6 +526,14 @@ def _decide_ws_event(
     # does not reach them.
     if app_events_revoked(app):
         _audit_deny(app, event_type, "app_disabled")
+        return False
+
+    # Owner-only surfaces: the per-member event-log frames are the operator's
+    # crew state, never an app's. A dashboard user already bypassed this gate;
+    # an app token is denied with an explicit reason (not the unknown-event
+    # floor) so the decision reads as intentional in the audit trail.
+    if event_type in _OWNER_ONLY_EVENTS:
+        _audit_deny(app, event_type, "owner_only")
         return False
 
     # ``slots`` is a full slot-list re-push.  The event itself is always
@@ -615,7 +651,7 @@ def _decide_ws_event(
     # System-sourced notifications (source == "system" or source == "") are
     # gateway-internal sends (send_message MCP tool, heartbeat, cron fallback).
     # They carry no ``source_app`` because they flow through state.notify(),
-    # which pre-dates per-app channels. They need their OWN declaration
+    # which has no per-app channel. They need their OWN declaration
     # (``notification:system``): that stream is user content, not the app's
     # own, so folding it into ``notification`` would make a single declaration
     # a broad grant -- the shape this module exists to remove.
@@ -678,8 +714,8 @@ def _slot_visible(
 
     # slots:user — user-initiated slots
     # slots:user — user-initiated slots only.  ``getattr`` defaults to ``""``
-    # (a sentinel that matches NO scope declaration) so a pre-migration slot
-    # or a race condition that leaves ``_origin`` unset remains INVISIBLE
+    # (a sentinel that matches NO scope declaration) so a slot with no recorded
+    # origin, or a race that leaves ``_origin`` unset, remains INVISIBLE
     # rather than being silently classified as USER.  Deny-by-default (CWE-269).
     if getattr(slot, "_origin", "") == SlotOrigin.USER and "slots:user" in allowed_events:
         return True
@@ -1012,9 +1048,9 @@ def app_events_revoked(app: str) -> bool:
     A COLD miss reports NOT revoked (and schedules the refresh) for the same
     reason the declaration cache falls back to the connect snapshot: reporting
     "revoked" for an unknown app would blank every app's own slots on the first
-    broadcast after a gateway restart. One refresh interval of the pre-existing
-    behaviour is the conservative side here; the socket was authenticated against
-    the same file at connect.
+    broadcast after a gateway restart. One refresh interval of unrevoked
+    visibility is the conservative side here; the socket was authenticated
+    against the same file at connect.
     """
     cached = _declared_cache.get(app)
     if cached is None:
