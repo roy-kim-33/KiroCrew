@@ -7,6 +7,7 @@ from unittest.mock import MagicMock
 import pytest
 from aiohttp import web
 from body_stream_helpers import attach_body
+from dashboard_owner_helpers import owner_claims
 
 from kiro_crew.platform.interfaces import McpScope
 
@@ -31,10 +32,14 @@ def _make_request(body: dict) -> MagicMock:
     """
     state = MagicMock()
     state._background_tasks = set()
+    # ``POST /api/mcp/apply`` is owner-gated
+    # (``handlers._shared.require_owner_dashboard_request``): ``owner_id == ""``
+    # plus the signed local bootstrap subject is the standalone-local owner shape.
+    state.owner_id = ""
     request = MagicMock(spec=web.Request)
     request.app = {"state": state}
     attach_body(request, body)
-    return request
+    return owner_claims(request)
 
 
 # ---------------------------------------------------------------------------
@@ -205,7 +210,7 @@ class TestApplyEndpoint:
         assert "slack-mcp" in mc["mcpServers"]
         assert mc["mcpServers"]["slack-mcp"].get("disabled") is not True
 
-        # Kiro global should no longer have slack-mcp
+        # Kiro global does not have slack-mcp
         k = json.loads(kiro_path.read_text(encoding="utf-8"))
         assert "slack-mcp" not in k["mcpServers"]
 
@@ -529,9 +534,12 @@ def _make_stub_request(body: dict) -> MagicMock:
     state = SimpleNamespace(_mcp_gateway_apply_stub=None)
     request = MagicMock(spec=web.Request)
     request.app = {"state": state}
-    request.get = MagicMock(return_value="dashboard")
     attach_body(request, body)
-    return request
+    # ``POST /api/mcp-gateway/servers/stub`` is owner-gated
+    # (``handlers._shared.require_owner_dashboard_request``). ``state`` declares no
+    # ``owner_id``, which the predicate reads as the standalone-local shape, so the
+    # signed local bootstrap subject ``owner_claims`` installs IS the owner here.
+    return owner_claims(request)
 
 
 class TestApplyBodyCeiling:
@@ -1021,7 +1029,7 @@ class TestUninstallCrashWindowCleanup:
 
         remaining = json.loads(kiro_path.read_text(encoding="utf-8"))["mcpServers"]
         # Both were REQUESTED uninstalls the loop never reached → the sweep purges
-        # both by request (it no longer depends on the companion result being
+        # both by request (it does not depend on the companion result being
         # recorded, which cancellation could race). 'done's package was removed;
         # 'pending's may or may not have been — either way, removing config is the
         # user's intent and errs benign.

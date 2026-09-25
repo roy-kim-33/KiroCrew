@@ -17,8 +17,8 @@ challenging.
 Because the process is held while nothing claims it as a session, its PID is
 registered with the orphan-sweep protection set for exactly that span. Without
 it the periodic sweep reaps the mint once it ages past the spawn grace, which
-takes the verifier and the listener with it and leaves a published URL that can
-no longer be redeemed.
+takes the verifier and the listener with it and leaves a published URL that
+cannot be redeemed.
 
 INVARIANT: no filesystem operation in this module executes on the event loop.
 
@@ -66,7 +66,10 @@ from kiro_crew.connections.tool_test import _classify as _classify_tool_inventor
 from kiro_crew.loop_lock import LoopBoundLock
 from kiro_crew.mcp_grant import grant_fingerprint, grant_observed
 from kiro_crew.mcp_utils import mcp_server_alias
-from kiro_crew.security import oauth_url_contains_credential
+from kiro_crew.security import (
+    oauth_url_contains_credential,
+    sanitized_oauth_endpoint_display,
+)
 from kiro_crew.sel import sel
 from kiro_crew.session_pid import register_protected_pid, unregister_protected_pid
 
@@ -103,6 +106,13 @@ class MintState(TypedDict, total=False):
     state: str  # minting | waiting | granted | failed | expired
     oauth_url: str
     reason: str
+    # Copy-ready "host/path" of the authorization URL the credential gate
+    # refused; set only beside reason == "mint_url_rejected", and only when
+    # security.sanitized_oauth_endpoint_display could produce a string the
+    # oauth_endpoints.json loader would accept. It rides the card view and the
+    # mint-state payload ONLY: the log and audit lines stay slug-only, so no
+    # URL-derived text reaches a logger sink.
+    rejected_endpoint: str
     started: float
     token: str  # row identity; see _new_mint_token
     client: Any
@@ -371,7 +381,7 @@ def _write_mint_agent_spec(slug: str) -> tuple[str, str]:
     """
     agents_dir = _agent.kiro_agents_dir_path()
     alias = mcp_server_alias(slug)
-    # Hardened reader (#6736). A REFUSED main spec (oversize, sensitive symlink,
+    # Hardened reader. A REFUSED main spec (oversize, sensitive symlink,
     # non-object) must NOT reach the main-agent fallback: that fallback spawns
     # ``kiro-cli --agent kirocrew``, and the child would reload the very file the
     # gateway just refused to read -- uncapped and unguarded. Raising instead
@@ -543,7 +553,7 @@ async def _mint_watcher(
     the disproven pair is still on disk and a bare ``grant_observed`` would see it
     on the FIRST tick, five seconds in, flip the row to ``granted`` and dispose the
     process holding the PKCE verifier and the loopback listener. That is the very
-    lie this flow exists to prevent, plus a consent URL that can no longer be
+    lie this flow exists to prevent, plus a consent URL that cannot be
     redeemed. ``require_proof`` is carried SEPARATELY from ``baseline`` on purpose:
     an unreadable capture stat yields no baseline, and inferring "no disproof" from
     that absence is what let the resurrection path reopen.
@@ -638,7 +648,7 @@ async def cancel_mint(slug: str, token: str | None = None) -> bool:
 
     ``token`` fences a stale tab. The table is keyed by slug, so a sibling tab
     connecting the same provider REPLACES the row; a cancel carrying the caller's
-    own row token refuses to dispose a row that is no longer theirs. A cancel
+    own row token refuses to dispose a row that is not theirs. A cancel
     with no token disposes whatever row is current -- a caller that never held a
     token cannot distinguish rows, so its intent is only "cancel this provider".
 
@@ -917,14 +927,28 @@ async def start_oauth_mint(
             if attempt + 1 < _MINT_URL_REJECTION_ATTEMPTS:
                 continue
 
+            # Named on the CARD, never in the log: without the host+path the
+            # user cannot know what to write into oauth_endpoints.json, so the
+            # failure reads as unfixable. The display helper owns the
+            # copy-ready contract: None for a host-borne credential, userinfo,
+            # a redacted or capped component, a shape the extension loader would
+            # refuse, or a rejection the allowlist could not clear anyway (fixed
+            # credential, fragment, path params, http, explicit port) -- so the
+            # card falls back to its unnamed message rather than show a remedy
+            # that cannot work. Same thread hop as the gate: the counterfactual
+            # re-runs it, and it can stat the operator's endpoint file.
+            rejected_endpoint = await asyncio.to_thread(sanitized_oauth_endpoint_display, oauth_url)
             async with _mints_lock:
                 if _mints.get(slug, {}).get("token") == my_token:
-                    _mints[slug] = {
+                    failed: MintState = {
                         "state": "failed",
                         "reason": "mint_url_rejected",
                         "started": time.monotonic(),
                         "token": my_token,
                     }
+                    if rejected_endpoint is not None:
+                        failed["rejected_endpoint"] = rejected_endpoint
+                    _mints[slug] = failed
             await asyncio.to_thread(_log_mint_outcome, slug, "error", "reason=mint_url_rejected")
             return
 
@@ -1072,8 +1096,8 @@ def _agent_spec_entry_missing(slug: str) -> bool:
     through ``asyncio.to_thread``.
     """
     agents_dir = _agent.kiro_agents_dir_path()
-    # Hardened reader (#6736): a refused main spec reads as absent, so the entry
-    # counts as missing -- the same degrade-as-absent direction as before.
+    # Hardened reader: a refused main spec reads as absent, so the entry
+    # counts as missing -- the same degrade-as-absent direction.
     spec = (
         _read_agent_spec(
             agents_dir / AGENT_FILENAME,
@@ -1139,4 +1163,8 @@ def pending_mint_for(slug: str) -> MintState | None:
         view["oauth_url"] = entry["oauth_url"]
     if entry.get("reason"):
         view["reason"] = entry["reason"]
+    if entry.get("rejected_endpoint"):
+        # Rides only beside reason == "mint_url_rejected"; see the field's note
+        # on MintState for why this channel and not the logger.
+        view["rejected_endpoint"] = entry["rejected_endpoint"]
     return view

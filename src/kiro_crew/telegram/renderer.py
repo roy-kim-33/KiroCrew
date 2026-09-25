@@ -37,7 +37,11 @@ import secrets
 import time
 from typing import TYPE_CHECKING, Any
 
-from kiro_crew.constants import split_trailing_protocol_suffix
+from kiro_crew.constants import (
+    DENY_CAUSE_APPROVAL_TIMEOUT,
+    split_trailing_protocol_suffix,
+    strip_control_comments,
+)
 from kiro_crew.messaging.approval import APPROVAL_TIMEOUT_S
 from kiro_crew.messaging.display_safety import redact_for_display
 from kiro_crew.messaging.outbound_files import (
@@ -52,7 +56,9 @@ from kiro_crew.messaging.renderer import (
     Renderer,
     _default_redactor,
     apply_options_cap,
+    count_redaction_tags,
     new_approval_nonce,
+    redaction_notice,
     session_provenance_tag,
     split_options_trailer,
 )
@@ -194,7 +200,7 @@ def _utf16_len(text: str) -> int:
     astral character (emoji, most notably) costs 2 against Telegram's 4096
     while costing 1 against ``len``. The entity machinery in
     ``telegram/client.py`` already measures in these units; message budgets
-    here historically did not.
+    here measure the same way.
     """
     return len(text) + sum(1 for ch in text if ord(ch) > 0xFFFF)
 
@@ -828,6 +834,8 @@ class TelegramApprovalDecider:
 
     def __init__(self, *, session_key: str) -> None:
         self._session_key = session_key
+        #: Why the LAST call denied -- see ``messaging.driver.ApprovalDecider``.
+        self.last_deny_cause = ""
 
     @staticmethod
     def key(session_key: str, request_id: str | int) -> str:
@@ -838,18 +846,33 @@ class TelegramApprovalDecider:
         """Record the nonce for the buttons the renderer is about to post."""
         cls._NONCES[key] = nonce
 
+    @classmethod
+    def retire(cls, key: str) -> None:
+        """Drop an armed nonce whose prompt never went out (idempotent).
+
+        ``__call__`` retires the nonce with the prompt it waited on, but a caller
+        that ARMS then fails to post (a spawn-approval prompt Telegram rejected)
+        has no wait to run that ``finally`` — without this the stale nonce would
+        outlive the prompt that never existed.
+        """
+        cls._NONCES.pop(key, None)
+
     async def __call__(self, event: Any) -> bool:
+        self.last_deny_cause = ""
         k = self.key(self._session_key, getattr(event, "request_id", ""))
         fut: "asyncio.Future[bool]" = asyncio.get_running_loop().create_future()
         TelegramApprovalDecider._REGISTRY[k] = fut
         try:
             return bool(await asyncio.wait_for(fut, _APPROVAL_TIMEOUT_S))
         except asyncio.TimeoutError:
+            # Recorded for the driver, which steers the cause into the turn
+            # before it rejects, so the model hears "expired" not "denied".
+            self.last_deny_cause = DENY_CAUSE_APPROVAL_TIMEOUT
             return False  # deny-by-default on timeout
         finally:
             TelegramApprovalDecider._REGISTRY.pop(k, None)
             # Retire the nonce with the prompt, so a button for a request id the
-            # provider later reuses cannot match a nonce that is no longer live.
+            # provider later reuses cannot match a nonce that is not live.
             TelegramApprovalDecider._NONCES.pop(k, None)
 
     @classmethod
@@ -880,7 +903,7 @@ class TelegramApprovalDecider:
         Asked BEFORE a side effect that a press should only be able to cause
         while its prompt is still live. The registry is empty after a gateway
         restart, so every approval button still sitting in a chat's scrollback
-        would otherwise take effect against a session that no longer exists.
+        would otherwise take effect against a session that does not exist.
 
         *nonce* is checked when supplied, so a caller asking "may this PRESS act"
         gets the prompt-identity answer rather than the weaker key-identity one.
@@ -960,6 +983,12 @@ class TelegramRenderer(Renderer):
         self._shown = ""
         self._last_edit = 0.0
         self._seal_count = 0  # rotations so far == index into _steer_texts for chips
+        # Redaction placeholders in text that actually LANDED, tallied per
+        # delivered frame's final form (live edits supersede each other, so
+        # only sealed segments and the posted reasoning count). Feeds the
+        # post-answer notice at on_done.
+        self._redacted_creds = 0
+        self._redacted_urls = 0
         # Chip pending from the last rotation, NOT yet in _buf. It materializes
         # (prepends to the segment) only when real post-steer text arrives — so
         # an end-of-stream marker (no continuation text) never posts a chip-only
@@ -1103,10 +1132,13 @@ class TelegramRenderer(Renderer):
         await self._rotate_on_length()
         # A trailing [OPTIONS:] block belongs to the visible PRE-STEER answer,
         # but the steering marker sits after it in the raw buffer, so the
-        # end-of-buffer anchor no longer sees it. Extract it here -- BEFORE the
+        # end-of-buffer anchor cannot see it. Extract it here -- BEFORE the
         # seal -- so the choices ship as a keyboard on the sealed message instead of
         # being frozen as literal protocol text the user cannot act on.
-        body_raw, opts = _extract_options("".join(self._buf))
+        body_raw, opts = _extract_options(strip_control_comments("".join(self._buf)))
+        # Trailing control-tag lines are protocol on either side of the trailer;
+        # complete tags only -- a partial tail at the seal is prose.
+        body_raw = strip_control_comments(body_raw)
         body_raw, opts = apply_options_cap(body_raw, opts, self.capabilities)
         self._buf = [body_raw]
         # apply_options_cap may EXPAND the body (numbered overflow lines), and
@@ -1322,6 +1354,8 @@ class TelegramRenderer(Renderer):
         # partial) from live frames — it is an internal directive, extracted
         # into the inline keyboard at finalization.
         seg, _ = _extract_options(self._segment_text())
+        # A control-tag line still arriving is held off the frame the same way.
+        seg = strip_control_comments(seg, hide_partial=True)
         body = await self._safe_body(seg)
         stall = self._stall_mark()
         # The tool footer wins: it names what is happening, which is strictly
@@ -1521,11 +1555,11 @@ class TelegramRenderer(Renderer):
         restored = _display_safe(
             "\n".join(f"![{item.alt or 'image'}]({item.path})" for item in files)
         )
-        # One truncated bubble used to keep only what fit under the cap — with
-        # several failed images the LATER references vanished silently. And the
-        # cap itself was measured in code points while Telegram counts UTF-16
-        # units, so emoji-dense alt text passed the slice and bounced at the
-        # API. Chunk the redacted whole by UTF-16 budget instead (redaction
+        # A single truncated bubble keeps only what fits under the cap, so with
+        # several failed images the LATER references vanish silently. Measuring
+        # the cap in code points also mismatches Telegram's UTF-16 count, so
+        # emoji-dense alt text passes the slice and then bounces at the API.
+        # Chunk the redacted whole by UTF-16 budget instead (redaction
         # first, so the scanner saw the contiguous text; a chunk is a pure
         # substring of it). Header rides the first bubble only.
         header = "⚠️ Couldn't upload:\n"
@@ -1650,6 +1684,7 @@ class TelegramRenderer(Renderer):
                         reply_to_message_id=self._consume_reply_to(),
                     )
                     if mid is not None:
+                        self._tally_redactions(text)
                         if self._stream_mid is not None:
                             # The rich message now carries this segment; drop the
                             # superseded plaintext bubble so the user sees one message.
@@ -1688,6 +1723,7 @@ class TelegramRenderer(Renderer):
                             reply_markup=keyboard,
                         )
                     if ok:
+                        self._tally_redactions(text)
                         return
                     # Both edits failed — the live message is gone (e.g. the user
                     # deleted it mid-turn). Fall through and SEND the final content so
@@ -1703,12 +1739,14 @@ class TelegramRenderer(Renderer):
                     reply_to_message_id=self._consume_reply_to(),
                 )
                 if mid is None:
-                    await self._client.send_message(
+                    mid = await self._client.send_message(
                         self._chat_id,
                         _strip_md(text),
                         reply_markup=keyboard,
                         message_thread_id=self._thread_id,
                     )
+                if mid is not None:
+                    self._tally_redactions(text)
 
             finally:
                 # Retire the live message: this segment is final, so nothing
@@ -1809,6 +1847,7 @@ class TelegramRenderer(Renderer):
                 message_thread_id=self._thread_id,
                 disable_notification=True,
             )
+            self._tally_redactions(inner)
         except Exception:
             logger.debug("Telegram: thinking post failed", exc_info=True)
 
@@ -1934,7 +1973,10 @@ class TelegramRenderer(Renderer):
         # Extract the trailing [OPTIONS:] BEFORE length rotation: if the body
         # overflows, rotation would otherwise seal the options text into an
         # earlier message and the keyboard would never attach.
-        body_raw, opts = _extract_options("".join(self._buf))
+        body_raw, opts = _extract_options(strip_control_comments("".join(self._buf)))
+        # Trailing control-tag lines are protocol on either side of the trailer;
+        # complete tags only -- a partial tail at the seal is prose.
+        body_raw = strip_control_comments(body_raw)
         body_raw, opts = apply_options_cap(body_raw, opts, self.capabilities)
         self._buf = [body_raw]
         keyboard = build_inline_keyboard(opts, self._session_key) if opts else None
@@ -1956,6 +1998,7 @@ class TelegramRenderer(Renderer):
             # the user — attach it to the placeholder instead of dropping it.
             if self._seal_count > 0 and keyboard is None:
                 await self._post_thinking()
+                await self._maybe_send_redaction_notice()
                 return
             placeholder = "…" if ok else (self._failure_reason or _GENERIC_ERROR_TEXT)
             if self._stream_mid is not None:
@@ -1973,10 +2016,12 @@ class TelegramRenderer(Renderer):
                     message_thread_id=self._thread_id,
                 )
             await self._post_thinking()
+            await self._maybe_send_redaction_notice()
             return
         await self._seal_current(keyboard=keyboard, footer=self._turn_footer())
         # After the answer, so the answer is what the push notification previews.
         await self._post_thinking()
+        await self._maybe_send_redaction_notice()
 
     def _limit(self) -> int:
         """Budget for PLAINTEXT frames (live typewriter edits), in source chars.
@@ -2086,6 +2131,35 @@ class TelegramRenderer(Renderer):
             t = _neutralize_md(self._steer_texts[i])
             return f"> {t}" if t else None
         return None
+
+    def _tally_redactions(self, text: str) -> None:
+        """Record the redaction placeholders in one LANDED frame's final text."""
+        cred_count, url_count = count_redaction_tags(text)
+        self._redacted_creds += cred_count
+        self._redacted_urls += url_count
+
+    async def _maybe_send_redaction_notice(self) -> None:
+        """One best-effort notice for the whole turn, after its answer landed.
+
+        Best-effort by the shared contract: the answer is already out, so a
+        failed notice send is logged, never raised — losing the notice is a
+        degraded warning, failing the turn would discard a delivered reply.
+        Threaded like the answer so the notice lands under the reply it
+        describes rather than in the chat root.
+        """
+        if not (self._redacted_creds or self._redacted_urls):
+            return
+        try:
+            await self._client.send_message(
+                self._chat_id,
+                redaction_notice(self._redacted_creds, self._redacted_urls),
+                message_thread_id=self._thread_id,
+            )
+        except Exception:
+            logger.warning(
+                "telegram: could not deliver the redaction notice (answer already sent)",
+                exc_info=True,
+            )
 
     async def close(self, failure_reason: str | None = None) -> None:
         """Idempotent teardown: stop the typing indicator and finalize the turn

@@ -58,7 +58,9 @@ being a formality. There is deliberately no operation that adds one.
 from __future__ import annotations
 
 import argparse
+import importlib.metadata
 import importlib.util
+import os
 import re
 import subprocess
 import sys
@@ -71,6 +73,7 @@ DEFAULT_TARGETS = ("src", "test")
 # contributor's black defaults differ. Matches ci.yml and AGENTS.md.
 TARGET_VERSION = "py310"
 WOULD_REFORMAT = re.compile(r"^would reformat (.+)$")
+BLACK_PIN = re.compile(r"""^\s*["']black==([^"'\s]+)["']""", re.MULTILINE)
 HEADER = """\
 # Files that are not black-clean yet. The gate requires every OTHER file to be
 # clean, so this list can only shrink.
@@ -89,11 +92,17 @@ def _unformatted(targets: tuple[str, ...]) -> set[str]:
     existing = [name for name in targets if (ROOT / name).exists()]
     if not existing:
         raise SystemExit(f"none of the targets {targets} exist under {ROOT}")
+    # Hosted CI retains its native command and worker selection. Fleet and local
+    # checks use recycling for the measured compiled-Black retention failure.
+    launcher = (
+        ["-m", "black"]
+        if os.environ.get("RUNNER_ENVIRONMENT") == "github-hosted"
+        else [str(Path(__file__).with_name("bounded_black.py"))]
+    )
     proc = subprocess.run(
         [
             sys.executable,
-            "-m",
-            "black",
+            *launcher,
             "--check",
             "--target-version",
             TARGET_VERSION,
@@ -109,7 +118,8 @@ def _unformatted(targets: tuple[str, ...]) -> set[str]:
     # former is a verdict; the latter must not read as "everything is clean".
     if proc.returncode not in (0, 1):
         sys.stderr.write(proc.stderr)
-        raise SystemExit(f"black failed with exit code {proc.returncode}")
+        sys.stderr.write(f"black failed with exit code {proc.returncode}\n")
+        raise SystemExit(123)
     found: set[str] = set()
     for line in proc.stderr.splitlines():
         match = WOULD_REFORMAT.match(line.strip())
@@ -139,6 +149,24 @@ def _unformatted(targets: tuple[str, ...]) -> set[str]:
             "looks like, and acting on it would erase the baseline."
         )
     return found
+
+
+def _require_pinned_black() -> None:
+    """Refuse a prune unless the running black is the pin: a prune revokes a file's exemption."""
+    pyproject = ROOT / "pyproject.toml"
+    match = BLACK_PIN.search(pyproject.read_text(encoding="utf-8"))
+    if match is None:
+        raise SystemExit(f"no black== pin found in {pyproject}")
+    pinned = match.group(1)
+    try:
+        installed = importlib.metadata.version("black")
+    except importlib.metadata.PackageNotFoundError:
+        installed = "(not installed)"
+    if installed != pinned:
+        raise SystemExit(
+            f"refusing to prune: black {installed} is running, not the pinned "
+            f"{pinned}; pip install 'black=={pinned}'"
+        )
 
 
 def _load_scope():
@@ -188,6 +216,9 @@ def main(argv: list[str] | None = None) -> int:
         help="prune entries that are now clean or gone; never adds a path",
     )
     args = parser.parse_args(argv)
+
+    if args.update_baseline:
+        _require_pinned_black()
 
     unformatted = _unformatted(DEFAULT_TARGETS)
 

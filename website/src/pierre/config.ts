@@ -50,6 +50,29 @@ export const PIERRE_COMPACT_HEADER_CSS = `
 [data-change-icon]{width:13px;height:13px}
 `
 
+/** The chat file-row header look, shared by the two places that draw it.
+ *
+ *  `FileChangeChips` injects these into Pierre's shadow header through
+ *  `unsafeCSS` (`ROW_CSS_BASE` in components/fileChangeChipsCss.ts), and the
+ *  light-DOM header rows the oversized pair draws for itself — its plain
+ *  fallback and its opted-in line-by-line state (`PlainFilePairHeader`) — apply
+ *  the same values inline, because a shadow-scoped stylesheet cannot reach
+ *  them. One source for the numbers, so a card's header reads the same
+ *  whether Pierre or this code draws it, and an oversized row's header cannot
+ *  drift from the within-budget row above it.
+ *
+ *  Background: half-way between the chat canvas and --bg-elevated — the full
+ *  elevated tone reads as prominently as the composer and pulls the eye to the
+ *  header instead of the change it labels. Metadata group: a fixed width so the
+ *  diffstat indicator starts at the SAME x on every row (the counts are 1–3
+ *  digits wide and Pierre omits a count span entirely when its side is zero,
+ *  so an unfixed group narrows on an additions-only file); sized for two 4ch
+ *  counts, the 46px indicator and the gaps between them. */
+export const DIFF_HEADER_BG_CSS = 'color-mix(in srgb,var(--bg-elevated) 50%,var(--bg))'
+export const DIFF_HEADER_PADDING_INLINE_PX = 10
+export const DIFF_HEADER_COUNT_MIN_WIDTH_CH = 4
+export const DIFF_HEADER_META_W_PX = 124
+
 /** Gives every collapsed-region separator the separator tint.
  *
  *  Pierre applies `--diffs-bg-separator` only to its `metadata`, `line-info-basic`
@@ -104,6 +127,29 @@ export const PIERRE_EDIT_CARET_ALIGN_CSS = `
  *  how many files tokenize concurrently — four covers a chat message or PR
  *  with several diffs open at once without spawning the library's default 8. */
 export const PIERRE_WORKER_POOL_SIZE = 4
+/** File-pair inputs above either limit bypass Pierre before its lazy chunk loads.
+ * `MultiFileDiff` builds a raw diff synchronously on the renderer thread before
+ * workers or row virtualization can help. Benchmarks of Pierre 1.3.5 put 400
+ * fully changed lines at ~20 ms on a normal host, leaving headroom under a
+ * 100 ms long-task budget at 4x CPU slowdown; 1,000 lines already takes ~120 ms
+ * before React rendering or highlighting. The UTF-16 code-unit ceiling is cheap
+ * enough to run while editing and bounds unusually wide JavaScript strings. */
+export const PIERRE_FILE_PAIR_MAX_LINES_PER_SIDE = 400
+export const PIERRE_FILE_PAIR_MAX_TOTAL_CODE_UNITS = 128 * 1024
+
+/** Worker bootstrap loads WASM, themes, and languages and gets a wider budget
+ * than ordinary render requests so a slow cold host does not exhaust recovery. */
+export const PIERRE_WORKER_INITIALIZATION_TIMEOUT_MS = 120_000
+
+/** A worker receives one render request at a time. If it has not answered within
+ * this window, recycle the complete manager so sibling requests cannot queue. */
+export const PIERRE_WORKER_REQUEST_TIMEOUT_MS = 30_000
+
+/** Short retries cover transient crashes; repeated failures open a cooldown. */
+export const PIERRE_WORKER_RETRY_DELAYS_MS = [250, 1_000] as const
+export const PIERRE_WORKER_COOLDOWN_MS = 30_000
+export const PIERRE_WORKER_STABLE_AFTER_MS = 60_000
+
 /** Which regex engine the highlight workers tokenize with.
  *
  *  Pierre defaults to `shiki-js`, which runs TextMate grammar patterns through

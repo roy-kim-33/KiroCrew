@@ -7,7 +7,11 @@ import logging
 import os
 import re
 
+<<<<<<< HEAD
 __version__ = "0.7.0-roycrew.1"
+=======
+__version__ = "0.8.0"
+>>>>>>> upstream/main
 
 # A distribution that repackages one core release as several builds of its own
 # (an enterprise bundle vending ``0.6.0.10``, ``0.6.0.11``, ... of the same

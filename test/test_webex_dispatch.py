@@ -8,9 +8,11 @@ from types import SimpleNamespace
 from unittest import mock
 
 import pytest
+from _hot_reload_helpers import prime_live_sections
 
 from kiro_crew.acp.types import EVENT_COMPLETE, EVENT_TEXT_CHUNK, AcpEvent
 from kiro_crew.messaging.link import ChannelLink
+from kiro_crew.messaging.queue_drain import tag_entry
 from kiro_crew.session_allocation import SessionClosingError
 from kiro_crew.webex import cards
 from kiro_crew.webex import transport_dispatch as webex_dispatch
@@ -102,6 +104,7 @@ class FakeSessions:
         # dispatch the way the real gate does after close_all.
         self.closing = False
         self.begin_turns = 0
+        self.reserved_generations: set[str] = set()
 
     async def get_or_create(self, key, *, agent, channel_id):
         self.last_agent = agent
@@ -143,8 +146,22 @@ class FakeSessions:
     def is_busy(self, key) -> bool:
         return getattr(self, "_busy", False)
 
+    def reserve_generation(self, session_key: str) -> None:
+        self.reserved_generations.add(session_key)
+
+    async def aflush(self) -> None:
+        return None
+
     def max_generation(self, bucket: str) -> int:
-        return -1
+        prefix = f"{bucket}:gen"
+        return max(
+            (
+                int(key[len(prefix) :])
+                for key in self.reserved_generations
+                if key.startswith(prefix) and key[len(prefix) :].isdigit()
+            ),
+            default=-1,
+        )
 
     # -- mid-turn queue (drive_turn's drain + /stop) --
     def enqueue(self, key, ts, text, *, force=False, **kw) -> bool:
@@ -156,7 +173,7 @@ class FakeSessions:
     def dequeue(self, key):
         return self.queued.pop(0) if self.queued else None
 
-    def clear_queue(self, key) -> None:
+    def clear_queue(self, key, owned_by=None) -> None:
         self.cleared.append(key)
         self.queued.clear()
 
@@ -242,12 +259,24 @@ class FakeConvLog:
     def __init__(self) -> None:
         self.appended: list[tuple[str, str, str]] = []
         self.titles: dict[str, str] = {}
+        self.metadata: dict[str, dict] = {}
 
     def append(self, key, role, text, agent=None, mid=None) -> None:
         self.appended.append((key, role, text))
 
     def set_title(self, key, title) -> None:
         self.titles[key] = title
+
+    def update_metadata_if(self, key: str, fields: dict, guard) -> bool:
+        if not guard(self.metadata.get(key, {})):
+            return False
+        self.metadata.setdefault(key, {}).update(fields)
+        rows = getattr(self, "_rows", None)
+        if isinstance(rows, list):
+            from kiro_crew.history import transcript_stem
+
+            rows.insert(0, {"key": transcript_stem(key), **fields})
+        return True
 
 
 def _cfg(default_agent: str = "", approval_mode: str = "interactive"):
@@ -271,11 +300,25 @@ def _cfg(default_agent: str = "", approval_mode: str = "interactive"):
     )
 
 
+def _prime_live(cfg) -> None:
+    """Publish *cfg*'s ``webex`` and ``messaging`` fields as the live snapshot.
+
+    The dispatcher reads those two sections at POINT OF USE from the config
+    watcher rather than from the ``cfg=`` copy it was constructed with, so a
+    test that varies one of them has to put the value where the turn actually
+    looks for it. Call it again after mutating ``d.cfg`` mid-test -- the snapshot
+    is a copy, not a view.
+    """
+    prime_live_sections(cfg, "webex", "messaging")
+
+
 def _dispatcher(sessions, ctx, client, *, conv_log=None, agent=None, cfg=None):
+    cfg = cfg or _cfg()
+    _prime_live(cfg)
     d = WebexDispatcher(
         sessions=sessions,
         ctx_builder=ctx,
-        cfg=cfg or _cfg(),
+        cfg=cfg,
         agent=agent,
         conv_log=conv_log,
         approval_mode="interactive",
@@ -308,6 +351,34 @@ def _inbound(text: str = "hello", email: str = _EMAIL) -> WebexInbound:
     return WebexInbound(person_email=email, room_id="ROOM", text=text, room_type="direct")
 
 
+def _entry(
+    ts: str,
+    text: str,
+    *,
+    room: str = "ROOM",
+    parent: str = "",
+    email: str = _EMAIL,
+    room_type: str = "direct",
+    **extra: object,
+) -> tuple[str, str, dict]:
+    """A queue entry recorded the way THIS channel's producer records one.
+
+    Built through the real ``tag_entry`` rather than by spelling the neutral key, so a
+    test cannot drift from the contract the drain reads. An entry missing the tag is a
+    FOREIGN entry to every drain, which is the point of the field -- so a fixture that
+    left it out would be testing the set-aside path while claiming to test the answer
+    path.
+    """
+    kwargs: dict = {
+        "webex_room_id": room,
+        "webex_parent_id": parent,
+        "webex_person_email": email,
+        "webex_room_type": room_type,
+        **extra,
+    }
+    return (ts, text, tag_entry(kwargs, "webex", ""))
+
+
 # ------------------------------------------------------------------
 # Tests: full turn
 # ------------------------------------------------------------------
@@ -336,8 +407,8 @@ def _deny_webex_profile(monkeypatch, tmp_path):
 class TestTurn:
     @pytest.mark.asyncio
     async def test_channels_deny_drops_inbound_message(self, tmp_path, monkeypatch) -> None:
-        # HIGH (GPT round-4 #2): a channels DENY must stop handle_message from
-        # driving a turn. Regression-locks the Webex inbound chokepoint.
+        # A channels DENY must stop handle_message from driving a turn. This
+        # locks the Webex inbound chokepoint.
         from kiro_crew.platform import governance_profiles as gp
 
         _deny_webex_profile(monkeypatch, tmp_path)
@@ -430,7 +501,7 @@ class TestTurn:
     @pytest.mark.asyncio
     async def test_hard_threshold_declines_silently_on_auto_managed_backend(self) -> None:
         # No /compact to dispatch and no notice: the backend compacts on its
-        # own as context fills (#8156).
+        # own as context fills.
         provider = FakeProvider(
             [AcpEvent(kind=EVENT_TEXT_CHUNK, text="answer"), AcpEvent(kind=EVENT_COMPLETE)]
         )
@@ -447,7 +518,7 @@ class TestTurn:
     @pytest.mark.asyncio
     async def test_soft_nudge_suppressed_on_auto_managed_backend(self) -> None:
         # The nudge advises /compact, which this backend refuses — it compacts
-        # on its own, so there is nothing for the user to act on (#8156).
+        # on its own, so there is nothing for the user to act on.
         provider = FakeProvider(
             [AcpEvent(kind=EVENT_TEXT_CHUNK, text="answer"), AcpEvent(kind=EVENT_COMPLETE)]
         )
@@ -509,7 +580,7 @@ class TestCommands:
     @pytest.mark.asyncio
     async def test_compact_declined_on_auto_managed_backend(self) -> None:
         # A backend that cannot serve /compact gets the informational reply and
-        # compact() is NEVER dispatched (#8156).
+        # compact() is NEVER dispatched.
         provider = FakeProvider([])
         provider.manual_compact_unsupported_backend = "kas"
         sessions = FakeSessions(provider)
@@ -1104,7 +1175,7 @@ class TestApprovals:
 
     @pytest.mark.asyncio
     async def test_a_reply_that_lost_the_race_is_told_the_prompt_expired(self) -> None:
-        """Reporting "Approved" for a prompt that is no longer pending would tell
+        """Reporting "Approved" for a prompt that is not pending would tell
         the user a tool ran when it did not.
 
         And the report is deliberately NEUTRAL rather than "denied": an unmatched
@@ -1261,32 +1332,32 @@ class TestQueueAndDrain:
         sessions = FakeSessions(provider)
         client = FakeClient()
         d = _dispatcher(sessions, FakeCtx(), client)
-        sessions.queued = [("1", "first", {}), ("2", "second", {})]
+        sessions.queued = [_entry("1", "first"), _entry("2", "second")]
         prompts: list[str] = []
 
         async def _capture(turn, *, sessions, ctx_builder):
             prompts.append(turn.user_text)
 
         with mock.patch("kiro_crew.webex.transport_dispatch.drive_turn", _capture):
-            await d._drain_queue(_inbound("x"), d._session_key(_EMAIL))
+            await d._drain_queue(d._session_key(_EMAIL), _inbound("x"))
 
         assert prompts == ["first\n\nsecond"]
 
     @pytest.mark.asyncio
     async def test_the_drain_defers_past_the_collapse_cap_in_order(self) -> None:
-        # Once one message no longer fits, it AND everything behind it are
+        # Once one message does not fit, it AND everything behind it are
         # deferred, so queue order stays exact rather than being reordered.
         provider = FakeProvider([AcpEvent(kind=EVENT_COMPLETE)])
         sessions = FakeSessions(provider)
         d = _dispatcher(sessions, FakeCtx(), FakeClient())
-        sessions.queued = [(str(i), f"m{i}", {}) for i in range(_MAX_COLLAPSE + 2)]
+        sessions.queued = [_entry(str(i), f"m{i}") for i in range(_MAX_COLLAPSE + 2)]
         prompts: list[str] = []
 
         async def _capture(turn, *, sessions, ctx_builder):
             prompts.append(turn.user_text)
 
         with mock.patch("kiro_crew.webex.transport_dispatch.drive_turn", _capture):
-            await d._drain_queue(_inbound("x"), d._session_key(_EMAIL))
+            await d._drain_queue(d._session_key(_EMAIL), _inbound("x"))
 
         expected_first = "\n\n".join(f"m{i}" for i in range(_MAX_COLLAPSE))
         assert prompts[0] == expected_first
@@ -1306,9 +1377,9 @@ class TestQueueAndDrain:
         sessions = FakeSessions(provider)
         d = _dispatcher(sessions, FakeCtx(), FakeClient())
         sessions.queued = [
-            ("1", "a-one", {"webex_room_id": "ROOM_A", "webex_person_email": "a@example.com"}),
-            ("2", "a-two", {"webex_room_id": "ROOM_A", "webex_person_email": "a@example.com"}),
-            ("3", "b-one", {"webex_room_id": "ROOM_B", "webex_person_email": "b@example.com"}),
+            _entry("1", "a-one", room="ROOM_A", email="a@example.com"),
+            _entry("2", "a-two", room="ROOM_A", email="a@example.com"),
+            _entry("3", "b-one", room="ROOM_B", email="b@example.com"),
         ]
         turns: list[tuple[str, str]] = []
 
@@ -1316,7 +1387,7 @@ class TestQueueAndDrain:
             turns.append((turn.user_text, turn.conversation_id))
 
         with mock.patch("kiro_crew.webex.transport_dispatch.drive_turn", _capture):
-            await d._drain_queue(_inbound("x"), d._session_key(_EMAIL))
+            await d._drain_queue(d._session_key(_EMAIL), _inbound("x"))
 
         # A's two collapse together; B's is a separate turn, never merged into A's.
         assert turns[0][0] == "a-one\n\na-two"
@@ -1336,9 +1407,9 @@ class TestQueueAndDrain:
         sessions = FakeSessions(provider)
         d = _dispatcher(sessions, FakeCtx(), FakeClient())
         sessions.queued = [
-            ("1", "t-a", {"webex_room_id": "ROOM", "webex_parent_id": "THREAD_A"}),
-            ("2", "t-a2", {"webex_room_id": "ROOM", "webex_parent_id": "THREAD_A"}),
-            ("3", "t-b", {"webex_room_id": "ROOM", "webex_parent_id": "THREAD_B"}),
+            _entry("1", "t-a", parent="THREAD_A"),
+            _entry("2", "t-a2", parent="THREAD_A"),
+            _entry("3", "t-b", parent="THREAD_B"),
         ]
         turns: list[str] = []
 
@@ -1346,7 +1417,7 @@ class TestQueueAndDrain:
             turns.append(turn.user_text)
 
         with mock.patch("kiro_crew.webex.transport_dispatch.drive_turn", _capture):
-            await d._drain_queue(_inbound("x"), d._session_key(_EMAIL))
+            await d._drain_queue(d._session_key(_EMAIL), _inbound("x"))
 
         assert turns[0] == "t-a\n\nt-a2"
         assert turns[1] == "t-b"
@@ -1356,7 +1427,7 @@ class TestQueueAndDrain:
         sessions = FakeSessions(FakeProvider([]))
         d = _dispatcher(sessions, FakeCtx(), FakeClient())
 
-        await d._drain_queue(_inbound("x"), d._session_key(_EMAIL))
+        await d._drain_queue(d._session_key(_EMAIL), _inbound("x"))
 
         assert sessions.successes == []
 
@@ -1573,7 +1644,7 @@ class TestDashboardLink:
 
         assert gen.call_args.kwargs["ttl_seconds"] == 7200
         # The WHOLE token, not a prefix: a redacted link would still contain
-        # "token=" and the failure is that it no longer authenticates.
+        # "token=" and the failure is that it does not authenticate.
         assert f"token={self.TOKEN}" in d.client.sent[-1][1]
         op = sel_mock.return_value.log_api_access.call_args.kwargs
         assert op["operation"] == "webex.dashboard_token"
@@ -1676,7 +1747,7 @@ class TestDrainIsFlat:
         provider = FakeProvider([AcpEvent(kind=EVENT_COMPLETE)])
         sessions = FakeSessions(provider)
         d = _dispatcher(sessions, FakeCtx(), FakeClient())
-        sessions.queued = [(str(i), f"m{i}", {}) for i in range(_MAX_COLLAPSE + 2)]
+        sessions.queued = [_entry(str(i), f"m{i}") for i in range(_MAX_COLLAPSE + 2)]
         depth = {"now": 0, "max": 0}
         real_drain = d._drain_queue
 
@@ -1690,7 +1761,7 @@ class TestDrainIsFlat:
 
         with mock.patch.object(d, "_drain_queue", _counting):
             with mock.patch("kiro_crew.webex.transport_dispatch.drive_turn", _noop_turn):
-                await d._drain_queue(_inbound("x"), d._session_key(_EMAIL))
+                await d._drain_queue(d._session_key(_EMAIL), _inbound("x"))
 
         assert depth["max"] == 1, "the drain re-entered itself"
         assert sessions.queued == []  # everything still drained
@@ -1758,7 +1829,7 @@ class TestOptionsCardPress:
 
         It is published by a renderer that is gone by the time the press arrives —
         the card is the LAST thing a turn sends — so the store has to outlive the
-        turn or every press answers "no longer current".
+        turn or every press gets the stale-card reply.
         """
         provider = FakeProvider([AcpEvent(kind=EVENT_COMPLETE)])
         sessions = FakeSessions(provider)
@@ -2295,6 +2366,18 @@ class TestSessionsCommand:
         assert "newer" in body and "first" in body
 
     @pytest.mark.asyncio
+    async def test_repeated_new_does_not_materialize_empty_history_rows(self) -> None:
+        log = FakeListingLog([])
+        sessions = FakeSessions(FakeProvider([]))
+        d = _dispatcher(sessions, FakeCtx(), FakeClient(), conv_log=log)
+
+        await d.handle_message(_inbound("/new"))
+        await d.handle_message(_inbound("/new"))
+
+        assert log.list_sessions() == []
+        assert len(sessions.reserved_generations) == 2
+
+    @pytest.mark.asyncio
     async def test_another_users_conversations_are_not_listed(self) -> None:
         """A title is the opening words of a message.
 
@@ -2593,14 +2676,14 @@ class TestMidTurnAttachments:
         """
         sessions = FakeSessions(FakeProvider([]))
         d = _dispatcher(sessions, FakeCtx(), FakeClient())
-        sessions.queued = [("1", "and this", {"webex_file_urls": ["QUEUED-URL"]})]
+        sessions.queued = [_entry("1", "and this", webex_file_urls=["QUEUED-URL"])]
         seen: list = []
 
         async def _replay(self, inbound, *, interpret_commands=True, drain=True):
             seen.append((inbound.text, inbound.file_urls))
 
         with mock.patch.object(type(d), "handle_message", _replay):
-            await d._drain_queue(_with_files("first", ("OPENING-URL",)), "KEY")
+            await d._drain_queue("KEY", _with_files("first", ("OPENING-URL",)))
 
         assert seen == [("and this", ("QUEUED-URL",))]
 
@@ -2615,7 +2698,7 @@ class TestMidTurnAttachments:
         sessions = FakeSessions(FakeProvider([]))
         d = _dispatcher(sessions, FakeCtx(), FakeClient())
         sessions.queued = [
-            (str(i), f"m{i}", {"webex_file_urls": [f"U{i}"]}) for i in range(_MAX_COLLAPSE + 1)
+            _entry(str(i), f"m{i}", webex_file_urls=[f"U{i}"]) for i in range(_MAX_COLLAPSE + 1)
         ]
         seen: list = []
 
@@ -2623,12 +2706,306 @@ class TestMidTurnAttachments:
             seen.append(inbound.file_urls)
 
         with mock.patch.object(type(d), "handle_message", _replay):
-            await d._drain_queue(_inbound("first"), "KEY")
+            await d._drain_queue("KEY", _inbound("first"))
 
         # Two iterations: the capped burst, then the one deferred entry — which
         # still carries the file it was queued with.
         assert len(seen[0]) == _MAX_COLLAPSE
         assert seen[1] == (f"U{_MAX_COLLAPSE}",)
+
+    @pytest.mark.asyncio
+    async def test_two_space_members_do_not_answer_under_one_identity(self) -> None:
+        """A group space puts several senders on ONE queue, so the key must name them.
+
+        ``_route_of`` maps a space to ``space:{room_id}`` and ``_session_key`` takes that
+        route, so every allow-listed member of one space shares a session key and a queue
+        under ANY ``dm_scope`` -- this needs no unified setting. Keying the collapse on
+        room and thread alone merges two members' mid-turn text into one turn, and the
+        replay stamps the FIRST entry's email, so the second member's words run and are
+        audited as the first member. Delivery into the shared space still looks right,
+        which is what makes the misattribution the half that lasts.
+        """
+        sessions = FakeSessions(FakeProvider([]))
+        d = _dispatcher(sessions, FakeCtx(), FakeClient())
+        sessions.queued = [
+            _entry("1", "mine", room="SPACE", email="a@example.com", room_type="group"),
+            _entry("2", "theirs", room="SPACE", email="b@example.com", room_type="group"),
+        ]
+        seen: list[tuple[str, str]] = []
+
+        async def _replay(self, inbound, *, interpret_commands=True, drain=True):
+            seen.append((inbound.person_email, inbound.text))
+
+        with mock.patch.object(type(d), "handle_message", _replay):
+            await d._drain_queue("KEY", _inbound("opener"))
+
+        assert seen == [
+            ("a@example.com", "mine"),
+            ("b@example.com", "theirs"),
+        ], "one turn per sender, each under its own identity"
+
+    @pytest.mark.asyncio
+    async def test_a_room_that_speaks_again_does_not_jump_the_room_before_it(self) -> None:
+        """Matching the room is not enough: the entry must also be reached before a defer.
+
+        A/B/A on one queue. Testing only ``item_convo == place.convo`` per entry lets the
+        second A rejoin A's turn, so A's later message is answered BEFORE a B that
+        arrived first. Whoever is in room B watches their turn lose its place to someone
+        who spoke after them, which is the ordering this queue exists to keep exact.
+        """
+        sessions = FakeSessions(FakeProvider([]))
+        d = _dispatcher(sessions, FakeCtx(), FakeClient())
+        sessions.queued = [
+            _entry("1", "a1"),
+            _entry("2", "b1", room="ROOM2", email="other@example.com"),
+            _entry("3", "a2"),
+        ]
+        seen: list[tuple[str, str]] = []
+
+        async def _replay(self, inbound, *, interpret_commands=True, drain=True):
+            seen.append((inbound.room_id, inbound.text))
+
+        with mock.patch.object(type(d), "handle_message", _replay):
+            await d._drain_queue("KEY", _inbound("opener"))
+
+        assert seen == [
+            ("ROOM", "a1"),
+            ("ROOM2", "b1"),
+            ("ROOM", "a2"),
+        ], "each room answered in arrival order, and A's second message did not jump B"
+
+
+class TestWebexSharesTheQueueWithOtherTransports:
+    """This channel is not alone on its queue, and a foreign entry must not be answered.
+
+    Every DM dispatcher is handed the orchestrator's single ``SessionManager``, and under
+    ``dm_scope = "unified"`` ``build_dm_session_key`` drops the CHANNEL from the bucket, so
+    a Webex room and a Telegram DM to one agent resolve to one session key and one queue.
+    Ownership is therefore decided before any ``webex_`` field is read. Reading
+    ``webex_room_id`` with a DEFAULT instead would yield ``""`` for a foreign entry, and
+    that empty string -- being the first entry read -- would become THE room for the whole
+    turn: another transport's text answered into an empty room under an empty identity, and
+    consumed off the queue while doing it.
+    """
+
+    @staticmethod
+    def _foreign(text: str = "from telegram") -> tuple[str, str, dict]:
+        """A queue entry as the TELEGRAM producer records one, built by that producer."""
+        from kiro_crew.telegram.transport_dispatch import _origin_kwargs as tg_kwargs
+        from kiro_crew.telegram.transport_dispatch import _QueuedOrigin as TgOrigin
+
+        origin = TgOrigin(user_id="7", chat_id="70", thread_id="", chat_type="private", username="")
+        return ("t0", text, tg_kwargs(origin))
+
+    @pytest.mark.asyncio
+    async def test_the_producer_tags_its_entries_and_records_the_room_type(self) -> None:
+        """The tag names the owner to wake; the room type decides the replay's session key.
+
+        ``_route_of`` reads ``room_type`` to choose between a person and a space, so an
+        entry that did not carry it could only be replayed onto the OPENER's routing --
+        a different session key whenever the two differ.
+        """
+        from kiro_crew.messaging.queue_drain import entry_channel
+
+        sessions = FakeSessions(FakeProvider([]))
+        sessions._busy = True
+        d = _dispatcher(sessions, FakeCtx(), FakeClient())
+
+        assert await d._enqueue_with_receipt("KEY", "held", _inbound("held"))
+
+        _ts, _text, kwargs = sessions.queued[0]
+        assert entry_channel(kwargs) == "webex"
+        assert kwargs["webex_room_type"] == "direct"
+
+    @pytest.mark.asyncio
+    async def test_a_foreign_entry_is_never_answered_and_never_consumed(self) -> None:
+        """The misdelivery fix. The entry stays queued for the channel that owns it."""
+        sessions = FakeSessions(FakeProvider([]))
+        d = _dispatcher(sessions, FakeCtx(), FakeClient())
+        sessions.queued = [self._foreign()]
+        seen: list = []
+
+        async def _replay(self, inbound, *, interpret_commands=True, drain=True):
+            seen.append((inbound.text, inbound.room_id, inbound.person_email))
+
+        with mock.patch.object(type(d), "handle_message", _replay):
+            await d._drain_queue("KEY", _inbound("opener"))
+
+        assert seen == [], "answering it here is the defect; it holds no Webex address"
+        assert [t for _ts, t, _kw in sessions.queued] == ["from telegram"], "and it is kept"
+
+    @pytest.mark.asyncio
+    async def test_a_foreign_entry_does_not_strand_this_channels_own_message(self) -> None:
+        """Set aside WITHOUT deferring the rest, so our queue is not blocked behind theirs.
+
+        Their entry is first, and a drain that stopped at it would leave our own accepted
+        message unanswered until that other transport spoke again.
+        """
+        sessions = FakeSessions(FakeProvider([]))
+        d = _dispatcher(sessions, FakeCtx(), FakeClient())
+        sessions.queued = [self._foreign(), _entry("1", "mine", room="ROOM_MINE")]
+        seen: list = []
+
+        async def _replay(self, inbound, *, interpret_commands=True, drain=True):
+            seen.append((inbound.text, inbound.room_id))
+
+        with mock.patch.object(type(d), "handle_message", _replay):
+            await d._drain_queue("KEY", _inbound("opener"))
+
+        assert seen == [("mine", "ROOM_MINE")], "ours answers, in ITS OWN room"
+        assert [t for _ts, t, _kw in sessions.queued] == ["from telegram"]
+
+    @pytest.mark.asyncio
+    async def test_the_drain_is_registered_and_answers_with_no_opening_envelope(self) -> None:
+        """A peer wakes this drain with the session key alone.
+
+        There is no inbound then -- the finished turn belonged to another transport -- so
+        every addressing field comes from the queued entry's own recorded place.
+        """
+        from kiro_crew.messaging import queue_drain
+
+        sessions = FakeSessions(FakeProvider([]))
+        d = _dispatcher(sessions, FakeCtx(), FakeClient())
+        sessions.queued = [_entry("1", "answer me", room="ROOM_SOLO", email="solo@example.com")]
+        seen: list = []
+
+        async def _replay(self, inbound, *, interpret_commands=True, drain=True):
+            seen.append((inbound.text, inbound.room_id, inbound.person_email, inbound.room_type))
+
+        assert queue_drain._DRAINS.get("webex") is not None, "a peer must be able to wake it"
+        with mock.patch.object(type(d), "handle_message", _replay):
+            await queue_drain._DRAINS["webex"]("KEY")
+
+        assert seen == [("answer me", "ROOM_SOLO", "solo@example.com", "direct")]
+
+    @pytest.mark.asyncio
+    async def test_the_receipt_is_flipped_in_the_room_that_holds_its_bubble(self) -> None:
+        """The bubble belongs to whoever queued first, not to whoever opened the turn.
+
+        ``edit_receipt`` carries the room id, so editing under the opener's address reaches
+        a different room, where that message id does not exist.
+        """
+        sessions = FakeSessions(FakeProvider([]))
+        client = FakeClient()
+        d = _dispatcher(sessions, FakeCtx(), client)
+        sessions._busy = True
+        queuer = WebexInbound(
+            person_email="q@example.com", room_id="ROOM_QUEUER", text="held", room_type="direct"
+        )
+
+        assert await d._enqueue_with_receipt("KEY", "held", queuer)
+        sessions._busy = False
+
+        async def _replay(self, inbound, *, interpret_commands=True, drain=True):
+            return None
+
+        with mock.patch.object(type(d), "handle_message", _replay):
+            await d._drain_queue("KEY", _inbound("opener"))
+
+        flips = [room for (_mid, room, body) in client.edits if "answering" in body.lower()]
+        assert flips == ["ROOM_QUEUER"], "the opener's room would be the wrong room"
+
+    @pytest.mark.asyncio
+    async def test_the_drain_wakes_the_owner_of_an_entry_it_set_aside(self) -> None:
+        """Setting it aside is only half the fix: something must come back for it.
+
+        The entry was already accepted and receipted, and a drain runs only from the tail of
+        its OWN channel's turn -- so without the wake that message waits for its owner to
+        finish some unrelated turn, and forever if that user goes quiet there.
+        """
+        from kiro_crew.messaging import queue_drain
+
+        sessions = FakeSessions(FakeProvider([]))
+        d = _dispatcher(sessions, FakeCtx(), FakeClient())
+        sessions.queued = [_entry("1", "mine"), self._foreign()]
+        woken: list[str] = []
+
+        async def _peer(session_key: str) -> None:
+            woken.append(session_key)
+
+        queue_drain.register_drain("telegram", _peer)
+
+        async def _replay(self, inbound, *, interpret_commands=True, drain=True):
+            return None
+
+        with mock.patch.object(type(d), "handle_message", _replay):
+            await d._drain_queue("KEY", _inbound("opener"))
+
+        assert woken == ["KEY"], "the channel that owns the set-aside entry must be woken"
+
+    def test_an_owned_entry_with_no_room_is_a_producer_bug_not_an_empty_reply(self) -> None:
+        """An empty room on an entry claiming THIS channel raises instead of addressing "".
+
+        Answering into ``""`` is the silent misdelivery this whole contract exists to stop,
+        so the loud failure is the correct outcome. Both producers are in the module, and
+        the queue is an in-process list on a live session, so there is no lenient case.
+        """
+        from kiro_crew.messaging.queue_drain import tag_entry
+
+        entry = tag_entry(
+            {
+                "webex_room_id": "",
+                "webex_parent_id": "",
+                "webex_person_email": "a@example.com",
+                "webex_room_type": "direct",
+            },
+            "webex",
+            "",
+        )
+
+        with pytest.raises(KeyError) as caught:
+            webex_dispatch._queued_place(entry)
+        assert "webex_room_id" in str(caught.value), "the error must name what is missing"
+
+    @pytest.mark.asyncio
+    async def test_the_receipt_counts_only_the_answered_rooms_own_deferrals(self) -> None:
+        """A foreign entry is not this room's deferred message."""
+        sessions = FakeSessions(FakeProvider([]))
+        d = _dispatcher(sessions, FakeCtx(), FakeClient())
+        sessions.queued = [_entry("1", "mine"), self._foreign()]
+        deferred: list[int] = []
+
+        async def _flip(session_key, surface, answered, n=0):
+            deferred.append(n)
+
+        async def _replay(self, inbound, *, interpret_commands=True, drain=True):
+            return None
+
+        with mock.patch.object(d._queue, "flip_answering_locked", _flip):
+            with mock.patch.object(type(d), "handle_message", _replay):
+                await d._drain_queue("KEY", _inbound("opener"))
+
+        assert deferred == [0], "their entry is set aside, but it is not THIS room's deferral"
+
+    @pytest.mark.asyncio
+    async def test_the_count_also_excludes_another_webex_rooms_entry(self) -> None:
+        """A foreign entry is excluded because it carries no place this channel can read.
+
+        Another Webex room is the harder case: the entry is owned, its room is readable,
+        and it is still not this room's deferral. It drains as its own turn in its own
+        room, so counting it here promises this room a follow-up it is not owed.
+        """
+        sessions = FakeSessions(FakeProvider([]))
+        d = _dispatcher(sessions, FakeCtx(), FakeClient())
+        sessions.queued = [
+            _entry("1", "mine"),
+            _entry("2", "theirs", room="ROOM2", email="other@example.com"),
+        ]
+        deferred: list[int] = []
+
+        async def _flip(session_key, surface, answered, n=0):
+            deferred.append(n)
+
+        async def _replay(self, inbound, *, interpret_commands=True, drain=True):
+            return None
+
+        with mock.patch.object(d._queue, "flip_answering_locked", _flip):
+            with mock.patch.object(type(d), "handle_message", _replay):
+                await d._drain_queue("KEY", _inbound("opener"))
+
+        # The pump loops, so the other room's entry drains as its own turn. Each receipt
+        # reports zero, because neither room has a message of its own left waiting.
+        assert deferred == [0, 0], "owned, readable, and still not the other room's deferral"
 
 
 class TestGovernanceOnPresses:

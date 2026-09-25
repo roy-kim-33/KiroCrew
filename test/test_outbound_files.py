@@ -29,14 +29,16 @@ from kiro_crew.messaging.outbound_files import (
     REASON_SENSITIVE,
     REASON_SYMLINK,
     REASON_UNREADABLE,
-    REMOTE_PREFIXES,
     ExtractLimits,
     OutboundFile,
     Rejection,
     extract_local_refs,
     extract_local_refs_off_loop,
+    is_remote_destination,
+    iter_local_refs,
     local_destination,
     md_destination,
+    protected_ref_spans,
     strip_url_syntax,
     unescape_md,
 )
@@ -201,9 +203,174 @@ class TestDestinationForms:
         """One normalizer, so the two directions cannot disagree on a path."""
         assert image_artifacts.strip_url_syntax is strip_url_syntax
         assert image_artifacts.local_destination is local_destination
-        assert image_artifacts.REMOTE_PREFIXES is REMOTE_PREFIXES
+        # The PREDICATE, not the prefix tuple: `//` reads as a protocol-relative
+        # URL or as a UNC path depending on the host and the path, and a second
+        # copy of that decision is how one direction starts treating a
+        # destination the other calls local as remote.
+        assert image_artifacts.is_remote_destination is is_remote_destination
         assert strip_url_syntax("file:///tmp/a.png?v=2#top") == "/tmp/a.png"
         assert local_destination("./rel.png") is None
+
+
+class TestStripUrlSyntaxExtendedLengthPath:
+    r"""A Windows extended-length path (``\\?\...``) survives
+    ``strip_url_syntax`` intact.
+
+    ``os.readlink`` returns a symlink target in this form. Its ``?`` belongs to
+    the ``\\?\`` prefix, not to a query string, so the query/fragment split does
+    not run on it and the full path reaches the UNC gate. See
+    ``hooks.validate_file_path`` for the same fold.
+    """
+
+    _LOCAL = "\\\\?\\C:\\Users\\me\\pic.png"  # \\?\C:\Users\me\pic.png
+    _LOCAL_LOWER = "\\\\?\\c:\\users\\me\\pic.png"  # \\?\c:\users\me\pic.png
+    _SHARE = "\\\\?\\UNC\\server\\share\\x.png"  # \\?\UNC\server\share\x.png
+    _DEVICE = "\\\\.\\PhysicalDrive0"  # \\.\PhysicalDrive0
+    _OBJNS = "\\\\?\\GLOBALROOT\\Device\\HarddiskVolume1\\x.png"
+
+    def test_query_and_fragment_stripping_still_works(self) -> None:
+        """The load-bearing behaviour is preserved: a URL-shaped destination
+        still loses its query and fragment (this is why the split exists)."""
+        assert strip_url_syntax("file:///tmp/a.png?v=2#top") == "/tmp/a.png"
+        assert strip_url_syntax("/tmp/a.png#frag") == "/tmp/a.png"
+        assert strip_url_syntax("C:/x/y.png?a=1") == "C:/x/y.png"
+
+    def test_extended_length_local_path_survives_the_strip(self) -> None:
+        """An extended-length local path is returned whole, not split at ``?``."""
+        assert strip_url_syntax(self._LOCAL) == self._LOCAL
+        assert strip_url_syntax(self._LOCAL_LOWER) == self._LOCAL_LOWER
+
+    def test_extended_length_share_form_survives_and_stays_refused(self) -> None:
+        r"""SECURITY: the ``\\?\UNC\...`` share form and the other extended
+        namespaces are returned whole AND remain UNC-shaped, so the UNC gate
+        refuses them. Asserted directly, because a strip that mangled them into a
+        non-share shape would let a share reach the filesystem.
+        """
+        from kiro_crew.hooks import is_unc_shape
+
+        for raw in (self._SHARE, self._DEVICE, self._OBJNS):
+            assert strip_url_syntax(raw) == raw, f"strip mangled {raw!r}"
+            assert is_unc_shape(strip_url_syntax(raw)) is True, f"share form slipped: {raw!r}"
+
+    def test_local_destination_refuses_the_share_form_end_to_end(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """End-to-end on a simulated Windows host: the surviving share form is
+        refused by ``local_destination`` (no ``Path`` is constructed for it)."""
+        from kiro_crew.messaging import outbound_files as module
+
+        monkeypatch.setattr(module, "os", type("OS", (), {"name": "nt"})(), raising=False)
+        monkeypatch.setattr(module, "unc_probe_allowed", lambda raw: False, raising=False)
+        monkeypatch.setattr(
+            module, "Path", lambda raw: pytest.fail(f"path constructed for share: {raw}")
+        )
+        assert module.local_destination(self._SHARE) is None
+
+
+class TestUncDestinationIsNotARemoteUrl:
+    r"""``//host/share/...`` is a UNC path on Windows, not a protocol-relative URL.
+
+    A markdown destination cannot carry the backslash spelling of one: a
+    CommonMark parser drops a backslash before ASCII punctuation, so
+    ``chat_attachments._posix_separators`` writes a stored Windows destination
+    with forward slashes. On a roaming profile, where the data home is itself a
+    share, that produces ``//fileserver/home/me/.kiro/crew/...`` -- a string the
+    bare ``//`` prefix test read as remote, so the scan returned nothing for a
+    file this gateway had written itself.
+
+    Every spelling here is forward-slash and ``peek_data_home`` is patched, for the
+    reason the UNC-gate tests already give: ``normcase``/``normpath`` leave
+    ``//host/...`` intact on POSIX, so the purely lexical gate answers the same on
+    the Linux CI box as on Windows. The real ``unc_probe_allowed`` is used rather
+    than a stub, because the whole claim is that the allowlist already in place is
+    what separates the two readings.
+    """
+
+    _UNC_HOME = "//fileserver/home/me/.kiro/crew"
+    _STORED = f"{_UNC_HOME}/sessions/chat-1.attachments/{'0' * 16}-shot.png"
+
+    @pytest.fixture
+    def windows_with_a_unc_data_home(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from kiro_crew.messaging import outbound_files as module
+
+        monkeypatch.setattr(module, "os", type("OS", (), {"name": "nt"})(), raising=False)
+        monkeypatch.setattr("kiro_crew.config.paths.peek_data_home", lambda: Path(self._UNC_HOME))
+
+    def test_a_stored_unc_attachment_is_a_local_reference(
+        self, windows_with_a_unc_data_home: None
+    ) -> None:
+        assert is_remote_destination(self._STORED) is False
+        assert [ref.dest for ref in iter_local_refs(f"![s]({self._STORED})")] == [self._STORED]
+
+    def test_a_share_outside_the_gateways_own_directories_stays_remote(
+        self, windows_with_a_unc_data_home: None
+    ) -> None:
+        """The reclassification borrows the filesystem gate's allowlist, so an
+        attacker-chosen host is refused here exactly as it is there -- no new SMB
+        probe is reachable through a destination this admits."""
+        assert is_remote_destination("//evil/share/x.png") is True
+        assert iter_local_refs("![s](//evil/share/x.png)") == []
+        assert is_remote_destination("//fileserver/other/x.png") is True
+
+    def test_a_url_is_still_remote_on_windows(self, windows_with_a_unc_data_home: None) -> None:
+        for dest in (
+            "https://example.com/x.png",
+            "http://example.com/x.png",
+            "HTTPS://Example.com/x.png",
+            "data:image/png;base64,AAAA",
+        ):
+            assert is_remote_destination(dest) is True
+
+    def test_posix_keeps_every_double_slash_destination_remote(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A UNC path does not exist on POSIX, so ``//`` there can only be a URL."""
+        from kiro_crew.messaging import outbound_files as module
+
+        monkeypatch.setattr(module, "os", type("OS", (), {"name": "posix"})(), raising=False)
+        monkeypatch.setattr("kiro_crew.config.paths.peek_data_home", lambda: Path(self._UNC_HOME))
+        assert is_remote_destination(self._STORED) is True
+        assert iter_local_refs(f"![s]({self._STORED})") == []
+
+    def test_an_ordinary_path_never_reaches_the_unc_question(self) -> None:
+        assert is_remote_destination("/tmp/a.png") is False
+        assert is_remote_destination(r"C:\Users\me\a.png") is False
+
+    def test_the_inline_classifier_resolves_no_home_per_call(
+        self, windows_with_a_unc_data_home: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The scan must stay free of home resolution, because it runs ON the loop.
+
+        ``telegram.renderer._rotate_on_length`` calls ``protected_ref_spans``
+        INLINE rather than through ``asyncio.to_thread``, and says why: the scan
+        costs 7-15 us/KB, against a 145-650 us thread hop. That trade is only
+        sound while the scan is pure string work. Routing it through
+        ``unc_probe_allowed`` put the data-home accessor in it, and with
+        ``KIROCREW_HOME`` set that accessor resolves the override on every call
+        -- an SMB round-trip on the very roaming profile this feature targets.
+
+        Asserted on CALLS to the accessor, not on elapsed time: a timing
+        assertion would be a flake, and the contract being defended is
+        structural. Red before the memo: one accessor call per classification.
+        """
+        calls: list[int] = []
+        real_home = Path(self._UNC_HOME)
+
+        def counting_data_home() -> Path:
+            calls.append(1)
+            return real_home
+
+        monkeypatch.setattr("kiro_crew.config.paths.peek_data_home", counting_data_home)
+        text = f"![shot]({self._STORED})"
+        # Prime whatever this configuration is allowed to resolve once, so the
+        # count below is per-call cost rather than first-touch cost.
+        assert protected_ref_spans(text)
+        calls.clear()
+
+        for _ in range(5):
+            assert protected_ref_spans(text)
+
+        assert calls == []
 
 
 class TestOutboundSecurity:
@@ -703,7 +870,7 @@ class TestLinkedAncestorGate:
     """On Windows, a destination beneath a linked ANCESTOR must be refused
     BEFORE ``is_symlink()`` -- that leaf probe is an lstat that resolves every
     ancestor, so the probe itself would traverse the link and open the SMB
-    connection the lexical UNC screen exists to prevent (#5962)."""
+    connection the lexical UNC screen exists to prevent."""
 
     def _windows(self, monkeypatch: pytest.MonkeyPatch) -> None:
         import types

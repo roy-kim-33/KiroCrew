@@ -2,8 +2,8 @@
 
 Telegram and Discord grew this subsystem independently and kept ~560 duplicated
 lines of it. The channel-neutral half now lives in
-``messaging/queue_receipt.py``; these tests pin the behaviour that used to be
-asserted twice (once per channel, in two files that could drift) and add the
+``messaging/queue_receipt.py``; these tests pin that channel-neutral behaviour
+once, and add the
 mechanism that stops a third channel from starting a third copy.
 """
 
@@ -167,7 +167,9 @@ class TestRatchet:
             names = {
                 node.attr
                 for node in ast.walk(tree)
-                if isinstance(node, ast.Attribute) and node.attr in {
+                if isinstance(node, ast.Attribute)
+                and node.attr
+                in {
                     "_queue_receipts",
                     "_receipt_lock",
                 }
@@ -185,6 +187,4 @@ class TestRatchet:
             src = path.read_text(encoding="utf-8")
             if "_enqueue_with_receipt" in src and "ReceiptQueue" not in src:
                 missing.append(path.parent.name)
-        assert not missing, (
-            f"{missing} implement a mid-turn queue without the shared ReceiptQueue"
-        )
+        assert not missing, f"{missing} implement a mid-turn queue without the shared ReceiptQueue"

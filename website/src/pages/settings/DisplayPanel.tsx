@@ -6,8 +6,7 @@ import type { FontFamily } from '../../hooks/useZoom'
 import { useTheme } from '../../hooks/useTheme'
 import type { ColorTheme } from '../../hooks/useTheme'
 import { useUIMode } from '../../hooks/useUIMode'
-import { SettingsSection, SettingsCard, SettingsSelect, SettingsStepper, SettingsButtonGroup, SettingsToggle, SettingsInput, SettingsCombobox } from '../../components/settings'
-import { usePlainDiff } from '../../hooks/usePlainDiff'
+import { SettingsSection, SettingsCard, SettingsSelect, SettingsStepper, SettingsButtonGroup, SettingsInput, SettingsCombobox, SettingsToggle } from '../../components/settings'
 import SimpleSelect from '../../components/SimpleSelect'
 import { Input } from '../../components/ui'
 import { useThemeEditor, ThemeEditorPanel } from '../../components/themeEditor'
@@ -77,11 +76,27 @@ export function DisplayPanel() {
   const { zoom, zoomSupported, zoomIn, zoomOut, reset, family, setFontFamily } = useZoomCtx()
   // Shortcut label for the zoom hint/description: ⌘ on macOS, Ctrl elsewhere.
   const modKey = /mac/i.test(navigator.platform) ? '⌘' : 'Ctrl'
-  const { preference, setTheme, colorTheme, setColorTheme, allThemes, loadCustomThemes, themeSwitching, overridesDropReport } = useTheme()
+  const {
+    preference,
+    setTheme,
+    colorTheme,
+    setColorTheme,
+    allThemes,
+    loadCustomThemes,
+    themeSwitching,
+    overridesDropReport,
+    installedThemeLoadFailed,
+  } = useTheme()
+  // The load-error notice is shown only for a pack that is actually unstyled.
+  // `installedThemeLoadFailed` is derived in the provider from the selection,
+  // the catalog and the detail map, so a failed reload whose last good detail
+  // is still in the map (render-cache seed or carry-forward) is false: the
+  // theme stays on screen and no notice contradicts it. The copy names the way
+  // out that exists for this pack: an installed pack can be reinstalled, an
+  // editor-created one can only be edited or swapped.
+  const showThemeLoadError = installedThemeLoadFailed
+  const isInstalledTheme = allThemes.find((t) => t.value === colorTheme)?.installed === true
   const { uiMode, setUIMode } = useUIMode()
-  // Browser-local like the theme and terminal font above: the toggle below has no
-  // `configKey` because nothing about it reaches the server config.
-  const [plainDiff, setPlainDiff] = usePlainDiff()
   const editor = useThemeEditor()
   const termFont = useTerminalFont()
   // Probed families become picker rows previewed in their own family, so the
@@ -147,7 +162,12 @@ export function DisplayPanel() {
   // Recency-tint count is persisted server-side (dashboard.recent_tint_count) via the shared
   // kirocrewConfig query, so the choice follows the user across browsers/restarts.
   const qc = useQueryClient()
-  type KirocrewCfg = { dashboard?: { recent_tint_count?: number; terminal?: { shell?: string } } }
+  type KirocrewCfg = {
+    dashboard?: {
+      recent_tint_count?: number
+      terminal?: { shell?: string; completion?: { enabled?: boolean } }
+    }
+  }
   const mcQ = useQuery<KirocrewCfg>({
     queryKey: ['kirocrewConfig'],
     queryFn: () => api.kirocrewConfig(),
@@ -163,12 +183,21 @@ export function DisplayPanel() {
   const overlay = useOptimisticConfigPaths(qc)
   const recentTintCount = clampTintCount(mcQ.data?.dashboard?.recent_tint_count)
   const shownTintCount = overlay.shown('dashboard.recent_tint_count', recentTintCount)
+  // A failed tint save used to roll the stepper back and refetch with no
+  // message — the number simply snapped back, which reads as a stuck control.
+  // Same shape as the shell field's `onFailure` below: one line of local error
+  // state. It is cleared by `onSupersede` when the NEXT save starts — not on
+  // success, because a success callback is not token-guarded here: an older
+  // save resolving after a newer one failed would wipe the newer failure.
+  const [tintError, setTintError] = useState<string | null>(null)
   const tintMut = useMutation(overlay.mutationOpts<number>({
     queryKey: ['kirocrewConfig'],
     mutationFn: (value: number) => api.patchConfig('dashboard.recent_tint_count', value),
     path: () => 'dashboard.recent_tint_count',
     displayValue: v => v,
     applyToCache: (cached, value) => setConfigPathValue(cached as KirocrewCfg, 'dashboard.recent_tint_count', value),
+    onFailure: () => setTintError(i18nT('pages.settings.displayPanel.recent_tint_save_failed')),
+    onSupersede: () => setTintError(null),
   }))
   // Steps are computed from the SHOWN count so rapid clicks stack on the
   // in-flight value instead of re-incrementing a stale server value.
@@ -223,6 +252,28 @@ export function DisplayPanel() {
     }
     shellMut.mutate(value)
   }
+
+  // The Terminal tab's completion popup (dashboard.terminal.completion.enabled).
+  // Server-side like the shell, because the gate lives in the completion
+  // route: with it off the gateway answers every listing request with nothing,
+  // so the popup never opens and no menu can steal a key. Default on; only a
+  // literal `false` reads as off — the same rule the backend applies, so a
+  // hand-edited `"false"` string cannot show as off here while the popup keeps
+  // appearing. Same per-path overlay as the shell field, so a slow save
+  // cannot roll back an in-flight sibling.
+  const serverCompletion = mcQ.data?.dashboard?.terminal?.completion?.enabled !== false
+  const shownCompletion = overlay.shown('dashboard.terminal.completion.enabled', serverCompletion)
+  const [completionError, setCompletionError] = useState<string | null>(null)
+  const completionMut = useMutation(overlay.mutationOpts<boolean>({
+    queryKey: ['kirocrewConfig'],
+    mutationFn: (value: boolean) => api.patchConfig('dashboard.terminal.completion.enabled', value),
+    path: () => 'dashboard.terminal.completion.enabled',
+    displayValue: v => v,
+    applyToCache: (cached, value) =>
+      setConfigPathValue(cached as KirocrewCfg, 'dashboard.terminal.completion.enabled', value),
+    onFailure: () => setCompletionError(i18nT('pages.settings.displayPanel.terminal_completion_save_failed')),
+    onSupersede: () => setCompletionError(null),
+  }))
 
   // ── Install theme (Level 0) from a local folder or a GitHub repo ──
   const [installType, setInstallType] = useState<'github' | 'local'>('github')
@@ -289,27 +340,19 @@ export function DisplayPanel() {
           />
           {/* A failed write means the choice is browser-local only, and the next
               load will silently revert it to the server's value. Say so rather
-              than letting the user discover it on reload. */}
-          {langSyncFailed && (
-            <span className="text-[12px] text-danger" role="status" aria-live="polite">
-              {i18nT('settings.display.language.sync_failed')}
-            </span>
-          )}
+              than letting the user discover it on reload. No hand-off: the
+              `shellDraft` and `installValue` fields further down this panel are
+              unsaved local state, and the navigation unmounts the panel. */}
+          <ErrorNotice
+            variant="inline"
+            message={langSyncFailed ? i18nT('settings.display.language.sync_failed') : null}
+          />
           <SettingsButtonGroup label={i18nT('pages.settings.displayPanel.interface')} description={i18nT('pages.settings.displayPanel.chat_bubbles_or_cli_style_line_by_line_output')} value={uiMode}
             options={[
               { value: 'chat', label: 'Chat' },
               { value: 'cli', label: 'CLI' },
             ]}
             onChange={v => setUIMode(v as 'chat' | 'cli')} />
-          {/* Phrased as "plain diffs ON" rather than "highlighting OFF" so the
-              switch position matches the stored value — no inverted checkbox.
-              Browser-local, hence no `configKey`. */}
-          <SettingsToggle
-            label={i18nT('settings.display.plainDiff.label')}
-            description={i18nT('settings.display.plainDiff.description')}
-            checked={plainDiff}
-            onChange={setPlainDiff}
-          />
         </SettingsCard>
       </SettingsSection>
 
@@ -406,7 +449,32 @@ export function DisplayPanel() {
             configKey="dashboard.terminal.shell"
             aria-label={i18nT('pages.settings.displayPanel.terminal_shell')}
           />
+          {/* No hand-off: shellDraft (terminal shell path) is uncommitted —
+              a rejected path stays in the field for the user to fix, and the
+              hand-off would navigate away from it. */}
           <ErrorNotice message={shellError} variant="inline" />
+          <SettingsToggle
+            label={i18nT('pages.settings.displayPanel.terminal_completion')}
+            description={i18nT('pages.settings.displayPanel.terminal_completion_desc')}
+            checked={shownCompletion}
+            onChange={v => completionMut.mutate(v)}
+            disabled={!mcQ.isSuccess}
+            configKey="dashboard.terminal.completion.enabled"
+          />
+          {/* No hand-off: the toggle itself has no draft (it saves on click),
+              but `shellDraft` above and `installValue` further down this panel
+              are unsaved local state, and the hand-off's navigation unmounts
+              the whole panel with them. Same rule as the language notice. */}
+          <ErrorNotice message={completionError} variant="inline" />
+          {/* The shell field and the recency-tint stepper are both disabled
+              while this query is not successful. A failed read used to leave
+              them greyed out with no reason on screen. No hand-off: the theme
+              `installValue` field on this panel is unaffected by the query and
+              may hold a half-typed source the navigation would discard. */}
+          <ErrorNotice
+            variant="inline"
+            message={mcQ.isError ? i18nT('pages.settings.displayPanel.config_load_failed') : null}
+          />
         </SettingsCard>
       </SettingsSection>
 
@@ -426,6 +494,25 @@ export function DisplayPanel() {
               never be attributed to the wrong pack. */}
           {overridesDropReport && colorTheme === `custom-${overridesDropReport.slug}` && (
             <ThemeDroppedRulesNotice report={overridesDropReport} />
+          )}
+          {/* The active custom theme's detail fetch failed AND no last good
+              detail is in the map, so its variables and branding are not on
+              screen: say so and name the way out instead of leaving the picker
+              showing a theme that is not applied. `installedThemeLoadFailed` is
+              derived by the provider (listed pack, detail absent from the map),
+              so a failed reload with the render-cache seed still applied keeps
+              the screen themed and gets no notice. Two copies: an installed pack
+              can be reinstalled; an editor-created pack has no install source,
+              so it is told to edit or pick another. The flag is the provider's
+              trigger only; the rejection is never shown. No hand-off:
+              the `shellDraft` and `installValue` fields further down this panel
+              are unsaved local state, and the navigation unmounts the panel. */}
+          {showThemeLoadError && (
+            <ErrorNotice
+              message={isInstalledTheme
+                ? i18nT('pages.settings.displayPanel.installed_theme_could_not_be_loaded')
+                : i18nT('pages.settings.displayPanel.custom_theme_could_not_be_loaded')}
+            />
           )}
           <SettingsButtonGroup label={i18nT('pages.settings.displayPanel.mode')} description={i18nT('pages.settings.displayPanel.light_or_dark_appearance_for_the_dashboard')} value={preference}
             options={[
@@ -488,6 +575,9 @@ export function DisplayPanel() {
                 {installBusy ? (installPhase === 'applying' ? i18nT('pages.settings.displayPanel.applying') : i18nT('pages.settings.displayPanel.fetching')) : i18nT('pages.settings.displayPanel.install')}
               </button>
             </div>
+            {/* No hand-off: installValue (the GitHub URL / local path just typed)
+                is still in the field on failure — the user corrects it in place,
+                and navigating to the chat would discard it. */}
             <ErrorNotice message={installError} variant="inline" />
           </div>
         </SettingsCard>
@@ -550,14 +640,18 @@ export function DisplayPanel() {
             onReset={() => setTintCount(RECENT_TINT_COUNT)}
             disabled={!mcQ.isSuccess}
           />
+          {/* Outside the stepper row so the row's own value/buttons stay the
+              only things inside it. No hand-off: `shellDraft` and `installValue`
+              share this panel and the navigation would unmount them. */}
+          <ErrorNotice message={tintError} variant="inline" />
           {/* Color swatches use raw buttons — circular color dots don't fit SettingsButtonGroup's text-button pattern */}
           <div className="flex flex-col gap-1.5 py-1.5" data-setting-label={i18nT('pages.settings.displayPanel.default_for_new_sessions')}>
             <span className="text-[13px] font-semibold text-text">{i18nT('pages.settings.displayPanel.default_for_new_sessions')}</span>
             <div className="text-[12px] text-muted">{i18nT('pages.settings.displayPanel.none_auto_cycle_or_pick_a_fixed_color')}</div>
             <div className="flex flex-wrap items-center gap-1.5">
-              <button type="button" aria-label={i18nT('pages.settings.displayPanel.no_color')} aria-pressed={defaultColor === null} className={`w-7 h-7 rounded-full border-2 cursor-pointer transition-transform hover:scale-110 ${defaultColor === null ? 'border-accent scale-110' : 'border-border'}`} style={{ background: 'var(--bg-accent)', backgroundImage: 'linear-gradient(135deg, transparent 45%, var(--danger) 45%, var(--danger) 55%, transparent 55%)' }} onClick={() => dispatch(setSessionDefaultColor(null))} title={i18nT('pages.settings.displayPanel.no_color')} />
+              <button type="button" aria-label={i18nT('pages.settings.displayPanel.no_color')} aria-pressed={defaultColor === null} className={`w-7 h-7 rounded-full border-2 cursor-pointer transition-transform hover:brightness-125 swatch-cue ${defaultColor === null ? 'border-accent scale-110' : 'border-border'}`} style={{ background: 'var(--bg-accent)', backgroundImage: 'linear-gradient(135deg, transparent 45%, var(--danger) 45%, var(--danger) 55%, transparent 55%)' }} onClick={() => dispatch(setSessionDefaultColor(null))} title={i18nT('pages.settings.displayPanel.no_color')} />
               {colors.map((c, i) => (
-                <button type="button" key={i} aria-label={i18nT('pages.settings.displayPanel.color', { n: i + 1 })} aria-pressed={defaultColor === i} className={`w-7 h-7 rounded-full border-2 cursor-pointer transition-transform hover:scale-110 ${defaultColor === i ? 'border-accent scale-110' : 'border-border'}`} style={{ background: `linear-gradient(135deg, color-mix(in srgb, ${c} ${boost.activePct[i]}%, var(--bg-accent)) 50%, color-mix(in srgb, ${c} ${boost.idlePct[i]}%, var(--bg-accent)) 50%)` }} onClick={() => dispatch(setSessionDefaultColor(i))} title={i18nT('pages.settings.displayPanel.color', { n: i + 1 })} />
+                <button type="button" key={i} aria-label={i18nT('pages.settings.displayPanel.color', { n: i + 1 })} aria-pressed={defaultColor === i} className={`w-7 h-7 rounded-full border-2 cursor-pointer transition-transform hover:brightness-125 swatch-cue ${defaultColor === i ? 'border-accent scale-110' : 'border-border'}`} style={{ background: `linear-gradient(135deg, color-mix(in srgb, ${c} ${boost.activePct[i]}%, var(--bg-accent)) 50%, color-mix(in srgb, ${c} ${boost.idlePct[i]}%, var(--bg-accent)) 50%)` }} onClick={() => dispatch(setSessionDefaultColor(i))} title={i18nT('pages.settings.displayPanel.color', { n: i + 1 })} />
               ))}
               <button type="button" className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-[13px] font-medium cursor-pointer border transition-all ${defaultColor === 'auto' ? 'bg-accent-subtle text-accent border-accent' : 'bg-transparent text-muted border-border hover:border-border-strong hover:text-text'}`} onClick={() => dispatch(setSessionDefaultColor('auto'))}>{i18nT('pages.settings.displayPanel.auto')}</button>
             </div>

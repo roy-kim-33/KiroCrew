@@ -89,9 +89,52 @@ test("win/linux: File menu is first with Settings… and quit", () => {
   assert.strictEqual(template[0].label, "File");
   const [settings, sep, quit] = template[0].submenu;
   assert.strictEqual(settings.label, "Settings…");
-  assert.strictEqual(settings.accelerator, "CmdOrCtrl+,");
   assert.strictEqual(sep.type, "separator");
   assert.strictEqual(quit.role, "quit");
+});
+
+// Regression pin for #9824: on Windows/Linux, Ctrl is the comma key for
+// Chinese/Japanese IMEs, so a REGISTERED Settings accelerator on Ctrl+, eats the
+// comma before the IME sees it and CJK users cannot type one at all. The bare
+// `accelerator === undefined` this replaces was a PROXY for "nothing is
+// registered"; these two invariants assert that property directly, so a caption
+// that helps the user is allowed while the hazard stays impossible. Off macOS the
+// caption may carry no Ctrl-class modifier in ANY spelling (checked by rule, so a
+// spelling nobody listed still fails), and a caption that is present must be
+// display-only. `registerAccelerator` is a Linux/Windows option, so an
+// unregistered caption cannot eat a keystroke on the platforms this pin covers,
+// while still telling the user where the chord went.
+// A prose comment saying so is exactly the guarantee that failed once already
+// (#9555 swept the in-page binding to Ctrl+, over #783's deliberate Alt+,); this
+// test is the guarantee. macOS keeps Cmd+, — a mac comma is not a Ctrl chord, so
+// it is unaffected. src/lib/shortcutRegistry.ts owns the chord itself; the
+// caption asserted here must keep matching the Alt+, it resolves off macOS.
+const CTRL_CLASS_MODIFIER = /(^|\+)(CmdOrCtrl|CommandOrControl|Ctrl|Control|Cmd|Command)(\+|$)/;
+
+test("win/linux: Settings… shows Alt+, display-only, no Ctrl chord (CJK IME comma, #9824)", () => {
+  const { deps } = makeDeps({ isMac: false });
+  const settings = findItem(buildMenuTemplate(deps), (i) => i.label === "Settings…");
+  assert.ok(settings, "Settings… present off macOS");
+  assert.strictEqual(settings.accelerator, "Alt+,", "caption is the in-page chord");
+  assert.doesNotMatch(
+    settings.accelerator,
+    CTRL_CLASS_MODIFIER,
+    "no Ctrl-class modifier off macOS, in any spelling",
+  );
+  assert.strictEqual(
+    settings.registerAccelerator,
+    false,
+    "displayed only — the menu must claim no key off macOS",
+  );
+});
+
+test("mac: Settings… keeps the Cmd+, accelerator (a mac comma is not a Ctrl chord)", () => {
+  const { deps } = makeDeps({ isMac: true });
+  const settings = findItem(buildMenuTemplate(deps), (i) => i.label === "Settings…");
+  assert.strictEqual(settings.accelerator, "CmdOrCtrl+,");
+  // registerAccelerator is a Linux/Windows option; leaving it unset keeps the
+  // macOS accelerator a real binding rather than a caption.
+  assert.strictEqual(settings.registerAccelerator, undefined);
 });
 
 test("win/linux: Help menu is last with About", () => {
@@ -127,6 +170,26 @@ test("win/linux: New Window stays macOS-only", () => {
   );
 });
 
+test("win/linux: Window menu is written out with Close on Ctrl+Shift+W", () => {
+  // The stock `windowMenu` role puts Close on Ctrl+W, which the renderer uses for
+  // "close session"; the window close takes the VS Code / Chrome chord instead.
+  const { deps } = makeDeps({ isMac: false });
+  const win = buildMenuTemplate(deps).find((i) => i.id === "window-menu");
+  assert.strictEqual(win.label, "Window");
+  assert.strictEqual(win.role, undefined);
+  assert.deepStrictEqual(
+    win.submenu.map((i) => i.role),
+    ["minimize", "zoom", "close"],
+  );
+  assert.strictEqual(win.submenu[2].accelerator, "Ctrl+Shift+W");
+});
+
+test("mac: Window menu keeps the stock role (no Close entry, so Cmd+W reaches the page)", () => {
+  const { deps } = makeDeps({ isMac: true });
+  const win = buildMenuTemplate(deps).find((i) => i.id === "window-menu");
+  assert.strictEqual(win.role, "windowMenu");
+});
+
 // ── shared structure (both platforms) ──
 
 for (const isMac of [true, false]) {
@@ -135,9 +198,29 @@ for (const isMac of [true, false]) {
   test(`${os}: Edit, View, Connection, Window menus survive the extraction`, () => {
     const { deps } = makeDeps({ isMac });
     const labels = topLabels(buildMenuTemplate(deps));
-    for (const expected of ["editMenu", "View", "Connection", "windowMenu"]) {
+    // macOS keeps the stock role; Windows/Linux write the Window menu out (see
+    // the Ctrl+W test below), so it surfaces by label there.
+    for (const expected of ["editMenu", "View", "Connection", isMac ? "windowMenu" : "Window"]) {
       assert.ok(labels.includes(expected), `${expected} present`);
     }
+  });
+
+  // Cmd/Ctrl+N is "new session" and Cmd/Ctrl+W "close session" in the renderer
+  // (src/lib/shortcutRegistry.ts, #4608). A menu accelerator on either would take
+  // the keystroke before the page saw it, so the menu must leave both unclaimed.
+  test(`${os}: no menu item claims CmdOrCtrl+N or CmdOrCtrl+W`, () => {
+    const { deps } = makeDeps({ isMac });
+    const template = buildMenuTemplate(deps);
+    for (const acc of ["CmdOrCtrl+N", "Cmd+N", "Ctrl+N", "CmdOrCtrl+W", "Cmd+W", "Ctrl+W"]) {
+      assert.strictEqual(findItem(template, (i) => i.accelerator === acc), null, `${acc} unclaimed`);
+    }
+  });
+
+  test(`${os}: New Connection Window… moved to CmdOrCtrl+Alt+N`, () => {
+    const { deps } = makeDeps({ isMac });
+    const item = findItem(buildMenuTemplate(deps), (i) => i.label === "New Connection Window…");
+    assert.ok(item, "New Connection Window… present");
+    assert.strictEqual(item.accelerator, "CmdOrCtrl+Alt+N");
   });
 
   test(`${os}: devtools item keeps its id and starts hidden`, () => {

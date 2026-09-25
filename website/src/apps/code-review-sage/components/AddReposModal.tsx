@@ -22,6 +22,7 @@ import {
 import { useCallback, useMemo, useRef, useState, type ReactNode } from 'react'
 
 import Clickable from '../../../components/Clickable'
+import ErrorNotice from '../../../components/ErrorNotice'
 
 import EmptyState from '../components/EmptyState'
 import ListSkeleton from '../components/ListSkeleton'
@@ -169,7 +170,7 @@ export default function AddReposModal({ onClose }: { onClose: () => void }) {
         * semantics. `absolute` (not `fixed`) scopes the blur to the app area. */}
       <div className="absolute inset-0 z-50 flex items-center justify-center p-4">
         <Clickable
-          className="absolute inset-0 bg-bg/50 backdrop-blur-sm"
+          className="absolute inset-0 bg-bg/50 backdrop-blur-xs"
           onClick={requestClose}
           aria-label={i18nT('apps.codeReviewSage.components.addReposModal.close_add_repos_dialog')}
         />
@@ -183,7 +184,7 @@ export default function AddReposModal({ onClose }: { onClose: () => void }) {
           animate={{ opacity: 1, y: 0, scale: 1 }}
           exit={{ opacity: 0, y: 8, scale: 0.98 }}
           transition={{ duration: 0.18, ease: 'easeOut' }}
-          className="relative w-[680px] max-w-full h-[620px] max-h-full border border-border rounded-[14px] bg-card flex flex-col shadow-2xl outline-none overflow-hidden"
+          className="relative w-[680px] max-w-full h-[620px] max-h-full border border-border rounded-[14px] bg-card flex flex-col shadow-2xl outline-hidden overflow-hidden"
           onKeyDown={(e) => e.stopPropagation()}
         >
           <header className="px-4 md:px-6 pt-5 pb-4 border-b border-border flex-shrink-0">
@@ -216,7 +217,7 @@ export default function AddReposModal({ onClose }: { onClose: () => void }) {
                   {...ime.bindEnter({ onEnter: submitManual })}
                   aria-label={i18nT('apps.codeReviewSage.components.addReposModal.repository_or_pull_request_url_or_owner_repo')}
                   placeholder={i18nT('apps.codeReviewSage.components.addReposModal.owner_repo_a_repo_url_or_paste_a_pull_request_li')}
-                  className="flex-1 min-w-0 bg-transparent border-0 py-2 text-[13px] font-mono text-text outline-none"
+                  className="flex-1 min-w-0 bg-transparent border-0 py-2 text-[13px] font-mono text-text outline-hidden"
                 />
               </div>
               <button
@@ -237,7 +238,7 @@ export default function AddReposModal({ onClose }: { onClose: () => void }) {
                   onChange={(e) => setQuery(e.target.value)}
                   aria-label={i18nT('apps.codeReviewSage.components.addReposModal.filter_your_repos')}
                   placeholder={i18nT('apps.codeReviewSage.components.addReposModal.filter_your_repos')}
-                  className="flex-1 min-w-0 bg-transparent border-0 py-1.5 text-[13px] text-text outline-none"
+                  className="flex-1 min-w-0 bg-transparent border-0 py-1.5 text-[13px] text-text outline-hidden"
                 />
               </div>
               <button
@@ -258,8 +259,10 @@ export default function AddReposModal({ onClose }: { onClose: () => void }) {
 
           <div className="flex-1 min-h-0 overflow-y-auto scrollbar-none px-4 md:px-6 pb-5 flex flex-col gap-2.5">
             {setupRequired && <GhNotice message={recent?.error ?? mine?.error} />}
+            {/* No hand-off: the manual repo-URL input below is unsaved — the
+                navigation would take what was typed with the modal. */}
             {err && !setupRequired && (
-              <div className="text-[12.5px] text-danger">{err.message}</div>
+              <ErrorNotice message={err.message} variant="inline" />
             )}
 
             {loading && !setupRequired && (

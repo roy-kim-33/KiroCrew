@@ -179,7 +179,7 @@ class TestConfigSaveKeepsMeta:
 
 
 class TestRefreshConfigMetaStamp:
-    """Upgrade-staleness repair for the stamp (#3102).
+    """Upgrade-staleness repair for the stamp.
 
     The stamp is only written as a side effect of a config write, so an
     upgrade that never touches ``config.json`` leaves ``lastTouchedVersion``
@@ -280,7 +280,9 @@ class TestRefreshConfigMetaStamp:
         assert "asyncio.to_thread(refresh_config_meta_stamp)" in src
         assert "await refresh_config_meta_stamp" not in src
         assert "_stamp_task = asyncio.create_task(" in src
-        assert src.index("await _start_site(") < src.index(
+        # "await site.start()" is start_dashboard's serving step (the
+        # pre-reserved socket handed to SockSite); the refresh must follow it.
+        assert src.index("await site.start()") < src.index(
             "asyncio.to_thread(refresh_config_meta_stamp)"
         )
 
@@ -288,7 +290,7 @@ class TestRefreshConfigMetaStamp:
 class TestDashboardNeverSurfacesThePersistedMarker:
     """The version the dashboard reports is the running build's, not the stamp.
 
-    Issue #3102's reporter found ``lastTouchedVersion: 0.1.3`` in their config
+    A reporter found ``lastTouchedVersion: 0.1.3`` in their config
     and reasonably suspected it fed the Settings header. It does not — every
     status producer reports ``kiro_crew.__version__`` — and this locks that
     in: wiring the persisted marker into any dashboard module fails here.

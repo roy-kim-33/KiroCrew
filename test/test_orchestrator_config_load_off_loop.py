@@ -51,16 +51,21 @@ def _state() -> MagicMock:
     state.push_slots_update = MagicMock()
     state.subagents = MagicMock()
     state.subagents.running_agents_for = MagicMock(return_value=[])
+    state.subagents.has_pending_work_for_async = AsyncMock(return_value=False)
+    state.subagents.wait_for_parent_reports = AsyncMock(return_value=False)
     return state
 
 
 def _slot(key: str = "cfg-load-slot") -> _ChatSlot:
     slot = _ChatSlot(key, mode="orchestrator")
     slot._auto_run = False
-    # `_plan_stage_count` is derived from the titles, not settable. An empty plan
-    # drives tracker initialisation — the branch under test — and then leaves the
-    # stage loop with nothing to execute, so no model turn is involved.
-    slot._stage_titles = []
+    # `_plan_stage_count` is derived from the titles, not settable. ONE stage is
+    # the cheapest plan that still reaches tracker initialisation — the branch
+    # under test. An empty plan does not: the loop refuses a plan whose
+    # stages are not in memory (a restart erased them) before it builds anything,
+    # so an empty-plan fixture would leave every assertion here vacuous. The
+    # single stage's model turn is stubbed out in `_init_tracker`.
+    slot._stage_titles = ["Collect the evidence"]
     slot._orch_tracker = None
     return slot
 
@@ -131,9 +136,21 @@ async def _wait_for_config_gate(task: asyncio.Task[Any], entered: asyncio.Event)
     await entry_task
 
 
-async def _init_tracker(slot: _ChatSlot) -> None:
+async def _init_tracker(slot: _ChatSlot, monkeypatch: Any) -> None:
+    """One real stage-loop entry with only the model turn stubbed out.
+
+    Everything these tests are about — the plan-shape gate, the tracker
+    construction, the config load and the value it lands on the tracker — is the
+    production code path. Replacing ``_run_chat`` stops the single stage the
+    fixture carries from wanting a provider, and nothing else.
+    """
     from kiro_crew.dashboard.chat import _stage_loop
 
+    async def _no_turn(_state: Any, _slot: Any, _context: str, **_kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr("kiro_crew.dashboard.chat_orchestrator._run_chat", _no_turn)
+    monkeypatch.setattr("kiro_crew.dashboard.chat_orchestrator.sel", MagicMock())
     await _stage_loop(_state(), slot, auto_run=False)
 
 
@@ -144,7 +161,7 @@ async def test_config_load_runs_off_the_loop_thread(monkeypatch: Any) -> None:
     _record_config_loads(monkeypatch, threads)
 
     slot = _slot()
-    await _init_tracker(slot)
+    await _init_tracker(slot, monkeypatch)
 
     assert threads, (
         "the orchestrator never loaded config -- this test no longer exercises "
@@ -164,7 +181,7 @@ async def test_configured_timeout_reaches_the_tracker(monkeypatch: Any) -> None:
     _record_config_loads(monkeypatch, threads)
 
     slot = _slot()
-    await _init_tracker(slot)
+    await _init_tracker(slot, monkeypatch)
 
     assert slot._orch_tracker is not None
     assert slot._orch_tracker.stage_timeout_seconds == 42
@@ -183,7 +200,7 @@ async def test_zero_timeout_is_preserved_rather_than_defaulted(monkeypatch: Any)
     _record_config_loads(monkeypatch, threads)
 
     slot = _slot()
-    await _init_tracker(slot)
+    await _init_tracker(slot, monkeypatch)
 
     assert slot._orch_tracker is not None
     assert slot._orch_tracker.stage_timeout_seconds == 0
@@ -196,7 +213,7 @@ async def test_loader_failure_falls_back_to_the_default_timeout(monkeypatch: Any
     _record_config_loads(monkeypatch, threads, raises=True)
 
     slot = _slot()
-    await _init_tracker(slot)
+    await _init_tracker(slot, monkeypatch)
 
     assert threads, "the failing loader was never reached"
     assert slot._orch_tracker is not None
@@ -214,7 +231,7 @@ async def test_existing_tracker_does_not_reload_config(monkeypatch: Any) -> None
     slot = _slot()
     existing = OrchestrationTracker(stage_timeout_seconds=77)
     slot._orch_tracker = existing
-    await _init_tracker(slot)
+    await _init_tracker(slot, monkeypatch)
 
     assert threads == [], "a slot that already has a tracker must not load config"
     assert slot._orch_tracker is existing
@@ -312,7 +329,14 @@ async def test_plan_cancel_during_the_config_load_does_not_start_the_plan(
     turns: list[str] = []
 
     async def _fake_run_chat(_state: Any, _slot: Any, context: str, **_kwargs: Any) -> None:
+        callback = _kwargs.get("_on_consumed")
+        if callable(callback):
+            callback(True)
         turns.append(context)
+        # The assistant row a real turn leaves behind: a stage that captures
+        # nothing is a FAILED stage now, so a fixture without it models the
+        # empty-stage pause rather than a stage that ran.
+        _slot.append("assistant", "stage output", "msg msg-a")
 
     monkeypatch.setattr("kiro_crew.dashboard.chat_orchestrator._run_chat", _fake_run_chat)
 
@@ -380,7 +404,14 @@ async def test_a_plan_started_after_a_cancel_still_runs(monkeypatch: Any) -> Non
     turns: list[str] = []
 
     async def _fake_run_chat(_state: Any, _slot: Any, context: str, **_kwargs: Any) -> None:
+        callback = _kwargs.get("_on_consumed")
+        if callable(callback):
+            callback(True)
         turns.append(context)
+        # The assistant row a real turn leaves behind: a stage that captures
+        # nothing is a FAILED stage now, so a fixture without it models the
+        # empty-stage pause rather than a stage that ran.
+        _slot.append("assistant", "stage output", "msg msg-a")
 
     monkeypatch.setattr("kiro_crew.dashboard.chat_orchestrator._run_chat", _fake_run_chat)
 
@@ -427,7 +458,14 @@ async def test_stop_during_the_config_load_does_not_start_the_plan(monkeypatch: 
     turns: list[str] = []
 
     async def _fake_run_chat(_state: Any, _slot: Any, context: str, **_kwargs: Any) -> None:
+        callback = _kwargs.get("_on_consumed")
+        if callable(callback):
+            callback(True)
         turns.append(context)
+        # The assistant row a real turn leaves behind: a stage that captures
+        # nothing is a FAILED stage now, so a fixture without it models the
+        # empty-stage pause rather than a stage that ran.
+        _slot.append("assistant", "stage output", "msg msg-a")
 
     monkeypatch.setattr("kiro_crew.dashboard.chat_orchestrator._run_chat", _fake_run_chat)
 
@@ -499,7 +537,14 @@ async def test_a_message_queued_during_the_config_load_is_still_handed_off(
     turns: list[str] = []
 
     async def _fake_run_chat(_state: Any, _slot: Any, context: str, **_kwargs: Any) -> None:
+        callback = _kwargs.get("_on_consumed")
+        if callable(callback):
+            callback(True)
         turns.append(context)
+        # The assistant row a real turn leaves behind: a stage that captures
+        # nothing is a FAILED stage now, so a fixture without it models the
+        # empty-stage pause rather than a stage that ran.
+        _slot.append("assistant", "stage output", "msg msg-a")
 
     monkeypatch.setattr("kiro_crew.dashboard.chat_orchestrator._run_chat", _fake_run_chat)
 
@@ -592,7 +637,14 @@ async def test_a_round_recorded_during_the_config_load_cannot_skip_a_stage(
     turns: list[str] = []
 
     async def _fake_run_chat(_state: Any, _slot: Any, context: str, **_kwargs: Any) -> None:
+        callback = _kwargs.get("_on_consumed")
+        if callable(callback):
+            callback(True)
         turns.append(context)
+        # The assistant row a real turn leaves behind: a stage that captures
+        # nothing is a FAILED stage now, so a fixture without it models the
+        # empty-stage pause rather than a stage that ran.
+        _slot.append("assistant", "stage output", "msg msg-a")
 
     monkeypatch.setattr("kiro_crew.dashboard.chat_orchestrator._run_chat", _fake_run_chat)
 
@@ -632,9 +684,10 @@ async def test_a_round_recorded_before_loop_entry_does_skip_a_stage(
 
     A tracker that already carries a round at loop ENTRY makes ``start_idx``
     non-zero and stage 1 is skipped. That is the resume path: ``_orch_tracker``
-    is already set, so nothing is published, ``_bootstrapping`` is False and no
-    config load runs at all. Keeping this here is what stops the test above from
-    reading as "record_round does nothing".
+    is already set, so nothing is published, and because that tracker already
+    carries its budgets (``budgets_unset`` is False) no config load runs at all.
+    Keeping this here is what stops the test above from reading as "record_round
+    does nothing".
     """
     threads: list[int] = []
     _record_config_loads(monkeypatch, threads)
@@ -643,7 +696,14 @@ async def test_a_round_recorded_before_loop_entry_does_skip_a_stage(
     turns: list[str] = []
 
     async def _fake_run_chat(_state: Any, _slot: Any, context: str, **_kwargs: Any) -> None:
+        callback = _kwargs.get("_on_consumed")
+        if callable(callback):
+            callback(True)
         turns.append(context)
+        # The assistant row a real turn leaves behind: a stage that captures
+        # nothing is a FAILED stage now, so a fixture without it models the
+        # empty-stage pause rather than a stage that ran.
+        _slot.append("assistant", "stage output", "msg msg-a")
 
     monkeypatch.setattr("kiro_crew.dashboard.chat_orchestrator._run_chat", _fake_run_chat)
 
@@ -654,7 +714,12 @@ async def test_a_round_recorded_before_loop_entry_does_skip_a_stage(
     slot._auto_run = True
     state = _stop_capable_state(slot)
 
-    resumed = OrchestrationTracker()
+    # Budgets passed explicitly, because that is what an in-process resume
+    # actually holds: the FIRST loop entry loaded them onto this same object, so
+    # entry two owes nothing. A tracker built with no budgets at all is the
+    # restart-resume shape instead, and it does owe one load -- see
+    # test_plan_duration_watchdog's restored-tracker case.
+    resumed = OrchestrationTracker(stage_timeout_seconds=1800)
     resumed.record_round(resumed.current_stage)
     slot._orch_tracker = resumed
 

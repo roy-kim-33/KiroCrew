@@ -2,6 +2,8 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { acquireMicStream, humanizeMicError, createLevelMeter, setPreferredMicId, activeDeviceId } from './mic'
 import type { AudioSample } from './mic'
 import { streamErrorMessage } from '../lib/sttProviders'
+import type { SttModelProgress } from '../lib/sttProviders'
+import { joinTranscript } from '../lib/dictationText'
 import { i18nT } from '../i18n/t'
 
 /**
@@ -20,6 +22,33 @@ const STOP_FRAME = JSON.stringify({ type: 'stop' })
 
 /** `status.stage` reported while model weights are still being fetched. */
 const STAGE_DOWNLOADING = 'downloading'
+/** `status.stage` reported while fetched weights are being loaded into memory. */
+const STAGE_PREPARING = 'preparing'
+const READY_TIMEOUT_MS = 60000
+/**
+ * Fallback budget for the retained audio's wait once the backend has ANNOUNCED
+ * that it is fetching or loading the model, used only when the announcement
+ * carries no `prepare_timeout_ms` of its own.
+ *
+ * A cold local model is minutes of work — a multi-hundred-megabyte fetch, a digest
+ * check, then a GPU-pipeline compile — and the mic is already released by the time
+ * this budget starts, so waiting costs the user nothing but the wait. The silent
+ * socket keeps the short budget: nothing has said anyone is working, so a longer
+ * wait there is just a slower way to report a dead backend.
+ *
+ * A number chosen HERE can only be wrong, because the wait belongs to the other
+ * side: too short abandons a load the backend is still running and discards the
+ * utterance, which is the whole defect. So a backend that states its ceiling is
+ * believed instead, and this covers the older ones that do not.
+ */
+const PREPARE_TIMEOUT_FALLBACK_MS = 300000
+// Older gateways omit their finalization budget. Give their default five-minute
+// native decode ceiling a little transport/cleanup headroom.
+const DEFAULT_FINAL_TIMEOUT_MS = 315000
+const MAX_TIMER_DELAY_MS = 2147483647
+// 16 kHz mono Int16: retain a preparation window of speech before auto-stopping.
+const MAX_BUFFERED_BYTES = (READY_TIMEOUT_MS / 1000) * 16000 * 2
+const WORKLET_FLUSH_TIMEOUT_MS = 500
 
 export const streamingSupported =
   typeof window !== 'undefined' &&
@@ -33,6 +62,8 @@ export const streamingSupported =
 interface Opts {
   onPartial: (text: string) => void
   onFinal: (text: string) => void
+  /** Capture ended and finals may still arrive, including an automatic buffer stop. */
+  onCaptureStop?: () => void
   onError?: (msg: string) => void
   /** Live input level in [0,1] for the recording meter. */
   onLevel?: (v: number) => void
@@ -44,21 +75,25 @@ interface Opts {
   /** Fired when the backend semantic endpointer judges the utterance complete. */
   onEndpoint?: () => void
   /**
-   * Byte progress of a one-time model download the session is waiting on, or
-   * `null` once the recogniser is ready.
+   * What the recogniser is doing while this session waits for it — byte progress
+   * of a one-time model download, or a load with no bytes to report — and `null`
+   * once the recogniser is ready.
    *
    * The local recogniser fetches its weights on first use, and that is between
    * 78 MB and 1.6 GB. Without this the user holds the mic against a session that
    * looks identical to a hang, which is the worst possible first run, so the
-   * backend reports byte progress and the recording surface shows it.
+   * backend reports its stage and the recording surface shows it.
    */
-  onDownload?: (progress: { done: number; total: number } | null) => void
+  onDownload?: (progress: SttModelProgress | null) => void
   /** Unthrottled per-frame audio features for canvas consumers (see mic.ts). */
   sampleRef?: { current: AudioSample }
 }
 
-export function useStreamingStt ({ onPartial, onFinal, onError, onLevel, onDevice, onEndpoint, onDownload, sampleRef }: Opts) {
+export function useStreamingStt ({ onPartial, onFinal, onCaptureStop, onError, onLevel, onDevice, onEndpoint, onDownload, sampleRef }: Opts) {
   const [recording, setRecording] = useState(false)
+  const [draining, setDraining] = useState(false)
+  const flushCaptureRef = useRef<(() => void) | null>(null)
+  const captureStoppedRef = useRef(false)
   const wsRef = useRef<WebSocket | null>(null)
   const ctxRef = useRef<AudioContext | null>(null)
   const streamRef = useRef<MediaStream | null>(null)
@@ -87,6 +122,20 @@ export function useStreamingStt ({ onPartial, onFinal, onError, onLevel, onDevic
   // silence -- which is the normal case for a short push-to-talk tap, not an
   // edge case.
   const readyRef = useRef(false)
+  // True once a `status` frame has said the model is being fetched or loaded.
+  //
+  // It is the only thing that distinguishes the two waits stop() can land in. A
+  // socket that has said nothing may be dead, so it keeps the short budget; a
+  // backend that announced a cold load is working, and the retained audio waits
+  // for it. Without the frame both waits look the same from here, and one budget
+  // has to serve a dead socket and a five-minute load at once.
+  const prepareAnnouncedRef = useRef(false)
+  // The budget the ANNOUNCING backend stated for its own preparation, mirroring
+  // what `ready` does with `final_timeout_ms`. Holds the fallback until a frame
+  // states one, so a backend that announces preparation without a ceiling is
+  // treated exactly as before.
+  const prepareTimeoutRef = useRef(PREPARE_TIMEOUT_FALLBACK_MS)
+  const finalTimeoutRef = useRef(DEFAULT_FINAL_TIMEOUT_MS)
   const pendingStopRef = useRef(false)
   const pendingStopTimerRef = useRef<number | null>(null)
   // Keep callback refs fresh so the long-lived WS handlers (`ws.onmessage`
@@ -94,11 +143,13 @@ export function useStreamingStt ({ onPartial, onFinal, onError, onLevel, onDevic
   // not the versions captured when `start()` was invoked.
   const onPartialRef = useRef(onPartial)
   const onFinalRef = useRef(onFinal)
+  const onCaptureStopRef = useRef(onCaptureStop)
   const onErrorRef = useRef(onError)
   const onLevelRef = useRef(onLevel)
   const onDeviceRef = useRef(onDevice)
   onPartialRef.current = onPartial
   onFinalRef.current = onFinal
+  onCaptureStopRef.current = onCaptureStop
   onErrorRef.current = onError
   onLevelRef.current = onLevel
   onDeviceRef.current = onDevice
@@ -107,7 +158,14 @@ export function useStreamingStt ({ onPartial, onFinal, onError, onLevel, onDevic
   const onDownloadRef = useRef(onDownload)
   onDownloadRef.current = onDownload
 
-  const cleanup = useCallback(() => {
+  const endCaptureOnce = useCallback((notify = true) => {
+    if (captureStoppedRef.current) return
+    captureStoppedRef.current = true
+    if (notify) onCaptureStopRef.current?.()
+  }, [])
+
+  const cleanup = useCallback((notifyCaptureStop = true) => {
+    endCaptureOnce(notifyCaptureStop)
     try { levelStopRef.current?.() } catch { /* ignore */ }
     levelStopRef.current = null
     // Clear the download line on every teardown, including a cancel and the
@@ -119,7 +177,14 @@ export function useStreamingStt ({ onPartial, onFinal, onError, onLevel, onDevic
       pendingStopTimerRef.current = null
     }
     readyRef.current = false
+    prepareAnnouncedRef.current = false
+    prepareTimeoutRef.current = PREPARE_TIMEOUT_FALLBACK_MS
     pendingStopRef.current = false
+    flushCaptureRef.current = null
+    try { sourceRef.current?.disconnect() } catch { /* already detached */ }
+    if (workletRef.current) workletRef.current.port.onmessage = null
+    sourceRef.current = null
+    workletRef.current = null
     try { wsRef.current?.close() } catch { /* ignore */ }
     wsRef.current = null
     try { streamRef.current?.getTracks().forEach(t => t.stop()) } catch { /* ignore */ }
@@ -129,30 +194,84 @@ export function useStreamingStt ({ onPartial, onFinal, onError, onLevel, onDevic
     onLevelRef.current?.(0)
     onDeviceRef.current?.('', '')
     setRecording(false)
-  }, [])
+    setDraining(false)
+  }, [endCaptureOnce])
 
-  useEffect(() => () => { cleanup() }, [cleanup])
+  useEffect(() => () => { cleanup(false) }, [cleanup])
 
   /** Send the stop frame and hand the socket to the backend to drain. */
   const commitStop = useCallback((ws: WebSocket) => {
     try { ws.send(STOP_FRAME) } catch { /* ignore */ }
-    // Do NOT call ws.close() here — let the backend flush any in-flight
-    // finals from Transcribe and close the socket itself. Our onclose
-    // handler joins finalsRef and fires onFinal. If the backend hangs,
-    // force-cleanup after 8s so the UI never gets stuck. Must exceed
-    // the backend's 3s handler-drain timeout + a safety margin for
-    // end_stream() and network RTT.
-    window.setTimeout(() => {
-      if (wsRef.current === ws) {
-        try { ws.close() } catch { /* ignore */ }
-        cleanup()
-      }
-    }, 8000)
+    if (pendingStopTimerRef.current !== null) clearTimeout(pendingStopTimerRef.current)
+    // Capture has stopped; a slow CPU may still need time for the final decode.
+    pendingStopTimerRef.current = window.setTimeout(() => {
+      if (wsRef.current !== ws) return
+      onErrorRef.current?.(i18nT('hooks.useStreamingStt.stt_connection_lost'))
+      cleanup()
+    }, finalTimeoutRef.current)
   }, [cleanup])
 
+  /**
+   * Arm (or re-arm) the wait for `ready` that a released utterance sits in.
+   *
+   * Re-armable on purpose, because a budget counted from the release bounds the
+   * WORK and the only thing this side can actually judge is SILENCE. A cold
+   * model's fetch has no upper bound worth naming -- the weights run to 1.6 GB
+   * and the link is whatever the user has -- so any fixed figure is wrong for
+   * someone, and being wrong here means discarding a recording the backend was
+   * still about to transcribe. Each frame that says work is under way is proof
+   * the far side is alive, so it buys the wait another full budget, and the
+   * timer only fires once nothing has been heard for one whole budget.
+   *
+   * The message names the stage for the same reason: a socket that announced a
+   * load and then went quiet did not "lose the connection", and reporting it as
+   * one sends the user to their network for a model that is still loading.
+   */
+  const armPreReadyWait = useCallback((ws: WebSocket) => {
+    if (pendingStopTimerRef.current !== null) clearTimeout(pendingStopTimerRef.current)
+    const announced = prepareAnnouncedRef.current
+    pendingStopTimerRef.current = window.setTimeout(() => {
+      if (wsRef.current !== ws) return
+      onErrorRef.current?.(i18nT(
+        announced
+          ? 'hooks.useStreamingStt.stt_model_still_loading'
+          : 'hooks.useStreamingStt.stt_connection_lost',
+      ))
+      cleanup()
+    }, announced ? prepareTimeoutRef.current : READY_TIMEOUT_MS)
+  }, [cleanup])
+
+  const stop = useCallback(() => {
+    if (captureStoppedRef.current) return
+    endCaptureOnce()
+    switchGenRef.current++
+    try { levelStopRef.current?.() } catch { /* ignore */ }
+    levelStopRef.current = null
+    try { streamRef.current?.getTracks().forEach(t => t.stop()) } catch { /* ignore */ }
+    streamRef.current = null
+    onLevelRef.current?.(0)
+    setRecording(false)
+    const ws = wsRef.current
+    if (!ws || (ws.readyState !== WebSocket.OPEN && ws.readyState !== WebSocket.CONNECTING) || !flushCaptureRef.current) { cleanup(); return }
+    setDraining(true)
+    // Keep the port until its final short frame arrives; its acknowledgment
+    // commits stop after every captured byte.
+    flushCaptureRef.current?.()
+    if (!readyRef.current && pendingStopTimerRef.current === null) {
+      // The mic tracks are already stopped above, so this budget holds only the
+      // socket and the retained PCM. Nothing is being recorded while it runs.
+      armPreReadyWait(ws)
+    }
+  }, [cleanup, endCaptureOnce, armPreReadyWait])
+
   const start = useCallback(async () => {
-    if (!streamingSupported || wsRef.current) return
+    if (!streamingSupported || wsRef.current) return false
     finalsRef.current = []
+    finalTimeoutRef.current = DEFAULT_FINAL_TIMEOUT_MS
+    prepareAnnouncedRef.current = false
+    prepareTimeoutRef.current = PREPARE_TIMEOUT_FALLBACK_MS
+    captureStoppedRef.current = false
+    setDraining(false)
     // Claim this start()'s session token BEFORE getUserMedia. A restart during
     // the (async) acquire immediately replaces sessionRef.current, so a stale
     // socket's onclose can detect supersession via `sessionRef.current !== session`
@@ -166,14 +285,14 @@ export function useStreamingStt ({ onPartial, onFinal, onError, onLevel, onDevic
       stream = await acquireMicStream()
     } catch (e) {
       // Only the still-current start surfaces the error; a superseded one is moot.
-      if (sessionRef.current === session) onErrorRef.current?.(humanizeMicError(e))
-      return
+      if (sessionRef.current === session && !session.cancelled) onErrorRef.current?.(humanizeMicError(e))
+      return false
     }
     // Superseded or cancelled DURING the acquire — don't build a live socket for a
     // session the user already restarted or cancelled. Release the mic and bail.
     if (sessionRef.current !== session || session.cancelled) {
       stream.getTracks().forEach(t => t.stop())
-      return
+      return false
     }
     streamRef.current = stream
     onDeviceRef.current?.(stream.getAudioTracks()[0]?.label || '', activeDeviceId(stream))
@@ -193,54 +312,103 @@ export function useStreamingStt ({ onPartial, onFinal, onError, onLevel, onDevic
       resolveReady = resolve
       rejectReady = reject
     })
+    // Setup may fail before the audio module finishes loading.
+    void readyPromise.catch(() => {})
 
     let lastPartial = ''
+    let reportedError = false
     ws.onmessage = ev => {
-      if (typeof ev.data !== 'string') return
+      if (typeof ev.data !== 'string' || session.cancelled || sessionRef.current !== session || wsRef.current !== ws) return
       try {
         const msg = JSON.parse(ev.data)
         // `ready` also clears any download line: it is the one frame guaranteed
         // to follow preparation, so the progress cannot be left on screen by a
         // backend that reports no closing `status`.
-        if (msg.type === 'ready') { onDownloadRef.current?.(null); resolveReady() }
+        if (msg.type === 'ready') {
+          // Finalization can include waiting behind a decode already in flight.
+          // The server owns that budget; preparation latency is a separate limit.
+          const timeout = msg.final_timeout_ms
+          if (typeof timeout === 'number' && Number.isFinite(timeout) && timeout > 0 && timeout <= MAX_TIMER_DELAY_MS) {
+            finalTimeoutRef.current = timeout
+          }
+          onDownloadRef.current?.(null)
+          prepareAnnouncedRef.current = false
+          prepareTimeoutRef.current = PREPARE_TIMEOUT_FALLBACK_MS
+          resolveReady()
+        }
         else if (msg.type === 'partial') {
           const text = msg.text || ''
           lastPartial = text
           // Transcribe partials cover only the current unstable utterance;
           // emit accumulated finals + current partial so the UI grows
           // monotonically instead of flickering between utterances.
-          const prefix = finalsRef.current.join(' ')
-          onPartialRef.current(prefix ? `${prefix} ${text}`.trim() : text)
+          onPartialRef.current(joinTranscript([...finalsRef.current, text]))
         }
         else if (msg.type === 'final') {
           if (msg.text) finalsRef.current.push(msg.text)
           lastPartial = ''  // this partial has been finalized by Transcribe
           // Re-emit so UI reflects the new committed segment even if no
           // follow-up partial arrives (e.g. user stops mid-silence).
-          onPartialRef.current(finalsRef.current.join(' '))
+          onPartialRef.current(joinTranscript(finalsRef.current))
         } else if (msg.type === 'error') {
           // Keyed off `code`, not `message`: the backend's message is advisory
           // English and this UI renders in 12 languages. It reaches a state of its
           // own in the consumer, which is what keeps the `onclose` below -- where a
           // failed session has no finals to deliver -- from clearing the one
           // explanation the user got.
+          reportedError = true
           onErrorRef.current?.(
             streamErrorMessage(String(msg.code || ''), String(msg.message || '')) ||
             i18nT('hooks.useStreamingStt.stt_error'),
           )
           rejectReady(new Error(msg.message || 'stt error'))
+          // Fatal frames end capture immediately; a native decoder may take
+          // time to abort before the server's close reaches the browser.
+          cleanup()
         } else if (msg.type === 'endpoint') {
           // Backend semantic endpointer judged the utterance complete.
           // The composer already holds the streamed transcript (via onPartial),
           // so the caller can submit directly.
           if (msg.complete) onEndpointRef.current?.()
         } else if (msg.type === 'status') {
-          // Preparation progress, ahead of `ready`. The only stage with anything
-          // to show is the weight download; every other stage is instant, so it
-          // clears the line rather than adding a message nobody can act on.
+          // Preparation progress, ahead of `ready`. Two stages say work is under
+          // way -- the weight fetch, which has bytes, and the load that follows
+          // it, which has none -- and both are shown, because this line is all
+          // the user has while there is no transcript yet. Both also mark the
+          // session as preparing, so a release during either one waits for the
+          // model instead of for a socket nobody has heard from.
+          const preparing = msg.stage === STAGE_DOWNLOADING || msg.stage === STAGE_PREPARING
+          if (preparing) prepareAnnouncedRef.current = true
+          // The announcing backend owns this ceiling, so take the figure it
+          // sends rather than assuming one, exactly as `ready` takes
+          // `final_timeout_ms`. Range-checked: a malformed or absent figure
+          // leaves the fallback alone instead of arming a timer that either
+          // fires at once or never fires at all.
+          const prepareMs = msg.prepare_timeout_ms
+          if (
+            preparing
+            && typeof prepareMs === 'number'
+            && Number.isFinite(prepareMs)
+            && prepareMs > 0
+            && prepareMs <= MAX_TIMER_DELAY_MS
+          ) {
+            prepareTimeoutRef.current = prepareMs
+          }
+          // A frame saying work is under way is proof the far side is alive, so
+          // an already-released utterance gets its full budget again from here.
+          // Without this the deadline is counted from the release and expires
+          // mid-fetch on a slow link however large the figure is, which is the
+          // discarded-recording defect again at a later minute.
+          if (preparing && !readyRef.current && pendingStopTimerRef.current !== null) {
+            armPreReadyWait(ws)
+          }
           onDownloadRef.current?.(
-            msg.stage === STAGE_DOWNLOADING
-              ? { done: Number(msg.downloaded_bytes) || 0, total: Number(msg.total_bytes) || 0 }
+            preparing
+              ? {
+                  done: Number(msg.downloaded_bytes) || 0,
+                  total: Number(msg.total_bytes) || 0,
+                  stage: msg.stage === STAGE_PREPARING ? 'preparing' : 'downloading',
+                }
               : null,
           )
         }
@@ -264,167 +432,126 @@ export function useStreamingStt ({ onPartial, onFinal, onError, onLevel, onDevic
       // the timeout-hang fallback below still delivers.
       const superseded = sessionRef.current !== session
       if (session.cancelled || superseded) { if (isCurrent) cleanup(); return }
-      // Prefer Transcribe's finals. If none arrived (user stopped before
-      // Transcribe finalized), fall back to the last partial so the
-      // user's words aren't lost.
-      const combined = finalsRef.current.length
-        ? finalsRef.current.join(' ').trim()
-        : lastPartial.trim()
+      // Finals commit earlier utterances; a last partial belongs to the next
+      // unfinished utterance and must survive an interrupted connection too.
+      const combined = joinTranscript([...finalsRef.current, lastPartial])
+      if (!captureStoppedRef.current && !reportedError) {
+        onErrorRef.current?.(i18nT('hooks.useStreamingStt.stt_connection_lost'))
+      }
       if (combined) onFinalRef.current(combined)
       else onPartialRef.current('')  // clear any dangling partial when nothing transcribed
       if (isCurrent) cleanup()
     }
 
-    // Wait only for the WS handshake here — we start the audio graph
-    // *before* the server's `ready` and buffer PCM locally so the user
-    // can speak immediately. Starting Transcribe server-side takes
-    // ~2-3s cold (credential fetch + SigV4 handshake).
-    try {
-      await new Promise<void>((resolve, reject) => {
-        ws.onerror = () => {
-          onErrorRef.current?.(i18nT('hooks.useStreamingStt.stt_connection_error'))
-          reject(new Error('ws open failed'))
-        }
-        ws.onopen = () => resolve()
-      })
-    } catch {
-      cleanup()
-      return
+    // Capture while the socket connects; readiness buffering preserves the
+    // opening word even on a slow handshake.
+    ws.onerror = () => {
+      if (session.cancelled || sessionRef.current !== session || reportedError) return
+      reportedError = true
+      onErrorRef.current?.(i18nT('hooks.useStreamingStt.stt_connection_error'))
+      rejectReady(new Error('ws connection failed'))
     }
-    // Reassign onerror so mid-session transport failures surface to the
-    // user — the promise-reject handler above is dead once resolved.
-    ws.onerror = () => { onErrorRef.current?.(i18nT('hooks.useStreamingStt.stt_connection_lost')) }
 
     const ctx = new AudioContext()
     ctxRef.current = ctx
     try {
       await ctx.audioWorklet.addModule('/pcm-worklet.js')
     } catch {
-      onErrorRef.current?.(i18nT('hooks.useStreamingStt.audio_worklet_unavailable'))
-      cleanup()
-      return
+      if (sessionRef.current === session && !session.cancelled) {
+        onErrorRef.current?.(i18nT('hooks.useStreamingStt.audio_worklet_unavailable'))
+        cleanup()
+      }
+      return false
     }
+    if (session.cancelled || sessionRef.current !== session || wsRef.current !== ws) {
+      void ctx.close()
+      return false
+    }
+    try {
+      if (ctx.state === 'suspended') await ctx.resume()
+    } catch {
+      if (sessionRef.current === session) {
+        onErrorRef.current?.(i18nT('hooks.useStreamingStt.audio_worklet_unavailable'))
+        cleanup()
+      }
+      return false
+    }
+    if (session.cancelled || sessionRef.current !== session || wsRef.current !== ws) return false
     const source = ctx.createMediaStreamSource(stream)
     const node = new AudioWorkletNode(ctx, 'pcm-worklet')
     sourceRef.current = source
     workletRef.current = node
-    // PCM routing: buffer until the server is ready, then flush and switch to live
-    // send. The cap bounds memory so a `ready` that never arrives cannot grow it
-    // without limit, and the FIFO drop keeps the user's most RECENT speech when the
-    // cap is hit.
-    //
-    // Sized for the slowest READINESS, not for one provider's connect time. At 8s
-    // this was calibrated for Transcribe's ~2-3s spin-up, and the local recogniser
-    // goes straight through it: a cold resident load compiles a GPU pipeline
-    // (measured 7.4s) after verifying the weights' digest (up to ~4s for the largest
-    // model), so the first press after a gateway start silently lost the opening
-    // seconds of the sentence — the OLDEST frames, which is the half the user said
-    // first, and nothing in the UI said so. 16 kHz mono Int16 is 32 KB/s, so 40s of
-    // headroom costs 1.25 MB of ArrayBuffers.
-    //
-    // Deliberately NOT sized against the server's own 1800s prepare ceiling: that
-    // covers a multi-hundred-megabyte model DOWNLOAD, which the client is told about
-    // with a `downloading` status and would not expect the user to talk through.
-    const MAX_BUFFERED_SECS = 40
-    const MAX_BUFFERED_BYTES = MAX_BUFFERED_SECS * 32 * 1024
+    // Preserve the complete opening while the recognizer prepares. At the
+    // preparation-window limit, stop capture and drain the retained audio rather
+    // than rotating the buffer and silently discarding the user's first words.
+    // The server inbox admits this ready-time burst plus the worklet's short tail.
     let ready = false
     let bufferedBytes = 0
     const buffer: ArrayBuffer[] = []
+    let captureFlushed = false
+    let flushTimer: ReturnType<typeof setTimeout> | null = null
+    const finishCapture = () => {
+      if (captureFlushed) return
+      captureFlushed = true
+      if (flushTimer !== null) clearTimeout(flushTimer)
+      node.port.onmessage = null
+      if (sessionRef.current !== session || session.cancelled || wsRef.current !== ws) return
+      if (ready && ws.readyState === WebSocket.OPEN) commitStop(ws)
+      else pendingStopRef.current = true
+    }
+    flushCaptureRef.current = () => {
+      // Disconnect first: room audio after release must not enter the tail flush.
+      sourceRef.current?.disconnect()
+      if (typeof node.port.postMessage === 'function') {
+        flushTimer = setTimeout(finishCapture, WORKLET_FLUSH_TIMEOUT_MS)
+        node.port.postMessage({ type: 'flush' })
+      } else finishCapture()
+    }
     node.port.onmessage = e => {
+      if (e.data?.type === 'flushed') { finishCapture(); return }
+      if (captureFlushed || session.cancelled || sessionRef.current !== session) return
       const chunk = e.data as ArrayBuffer
+      if (!(chunk instanceof ArrayBuffer)) return
       if (ready) {
         if (ws.readyState === WebSocket.OPEN) {
           try { ws.send(chunk) } catch { /* ignore CLOSING state */ }
         }
-        return
+        return false
       }
       buffer.push(chunk)
       bufferedBytes += chunk.byteLength
-      while (bufferedBytes > MAX_BUFFERED_BYTES && buffer.length > 1) {
-        const dropped = buffer.shift()!
-        bufferedBytes -= dropped.byteLength
-      }
+      if (bufferedBytes >= MAX_BUFFERED_BYTES && !captureStoppedRef.current) stop()
     }
     source.connect(node)
-    // Worklet output is never heard — do NOT connect node to destination.
+    // The processor writes no output samples (silence). Connecting that silent
+    // output keeps the graph pulled on browsers that suspend unconnected nodes.
+    node.connect(ctx.destination)
     setRecording(true)
 
-    // Now wait for the server's ready signal and flush the buffer.
-    try {
-      await readyPromise
-    } catch {
-      // cleanup() was already called by onclose (or will be), and
-      // setRecording(false) happens there.
-      return
-    }
-    if (ws.readyState === WebSocket.OPEN) {
-      for (const chunk of buffer) {
-        try { ws.send(chunk) } catch { break }
-      }
-    }
-    buffer.length = 0
-    bufferedBytes = 0
-    ready = true
-    readyRef.current = true
-    // The user may already have released the key while we were waiting. The
-    // buffered speech has just gone out, so NOW the stop frame is safe to send:
-    // the Transcribe stream ends after the audio rather than before it.
-    if (pendingStopRef.current) {
-      pendingStopRef.current = false
-      if (pendingStopTimerRef.current !== null) {
-        clearTimeout(pendingStopTimerRef.current)
-        pendingStopTimerRef.current = null
-      }
-      if (ws.readyState === WebSocket.OPEN) commitStop(ws)
-      else cleanup()
-    }
-  }, [cleanup, commitStop, sampleRef])
-
-  const stop = useCallback(() => {
-    const ws = wsRef.current
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      if (!readyRef.current) {
-        // Pre-`ready`: the speech is still in start()'s local buffer, so
-        // sending stop NOW would end the Transcribe stream before a single
-        // frame of it had been sent. Record the intent instead; the flush in
-        // start() commits it the moment `ready` lands.
-        pendingStopRef.current = true
-        // Deferring the FRAME must not defer the END OF CAPTURE. The worklet
-        // handler appends to the same buffer while `ready` is false, so leaving
-        // it attached would keep recording the room after the user let go and
-        // ship all of it on flush -- extra words in the transcript, and audio
-        // captured after release sent to the transcriber. Freeze the buffer at
-        // release: detach the handler, stop the level meter, and release the
-        // mic. The socket and the already-buffered PCM deliberately survive,
-        // because they are what the flush still has to send.
-        try {
-          if (workletRef.current) workletRef.current.port.onmessage = null
-        } catch { /* ignore */ }
-        try { levelStopRef.current?.() } catch { /* ignore */ }
-        levelStopRef.current = null
-        onLevelRef.current?.(0)
-        try { streamRef.current?.getTracks().forEach(t => t.stop()) } catch { /* ignore */ }
-        // Ceiling, because a `ready` that never arrives would otherwise leave
-        // the mic hot forever. 8s matches the buffer cap: past that point the
-        // oldest audio is already being dropped FIFO, so waiting longer cannot
-        // preserve a whole utterance anyway.
-        if (pendingStopTimerRef.current === null) {
-          pendingStopTimerRef.current = window.setTimeout(() => {
-            pendingStopTimerRef.current = null
-            if (wsRef.current === ws && pendingStopRef.current) {
-              pendingStopRef.current = false
-              cleanup()
-            }
-          }, 8000)
+    // Startup ends when capture starts; preparation and final decoding have
+    // their own states so the composer owns the mic while the model loads.
+    void readyPromise.then(() => {
+      if (session.cancelled || sessionRef.current !== session || wsRef.current !== ws) return false
+      if (ws.readyState === WebSocket.OPEN) {
+        for (const chunk of buffer) {
+          try { ws.send(chunk) } catch { break }
         }
-        return
       }
-      commitStop(ws)
-    } else {
-      // WS never opened or already closing — cleanup directly.
-      cleanup()
-    }
-  }, [cleanup, commitStop])
+      buffer.length = 0
+      bufferedBytes = 0
+      ready = true
+      readyRef.current = true
+      if (pendingStopRef.current) {
+        pendingStopRef.current = false
+        if (pendingStopTimerRef.current !== null) clearTimeout(pendingStopTimerRef.current)
+        pendingStopTimerRef.current = null
+        if (ws.readyState === WebSocket.OPEN) commitStop(ws)
+        else cleanup()
+      }
+    }).catch(() => { /* onclose delivers the transcript and owns teardown */ })
+    return true
+  }, [cleanup, commitStop, sampleRef, stop, armPreReadyWait])
+
 
   /**
    * Swap the capture device WITHOUT ending the transcription session.
@@ -514,7 +641,7 @@ export function useStreamingStt ({ onPartial, onFinal, onError, onLevel, onDevic
 
   // Immediate discard (Esc). Unlike stop(), does NOT drain: tears down the
   // socket, mic tracks and AudioContext right away so capture ends the instant
-  // the user cancels — no 8s graceful-drain window keeping the mic live. Marks
+  // the user cancels — no graceful-drain window. Marks
   // the current session cancelled so the resulting onclose delivers no final;
   // onclose still runs (settling any pending startup promise so the caller is
   // never wedged), it just discards.
@@ -528,8 +655,8 @@ export function useStreamingStt ({ onPartial, onFinal, onError, onLevel, onDevic
     // attached so it still settles readyPromise (no startup wedge).
     const ws = wsRef.current
     if (ws) ws.onmessage = null
-    cleanup()
+    cleanup(false)
   }, [cleanup])
 
-  return { recording, start, stop, switchDevice, cancel }
+  return { recording, draining, start, stop, switchDevice, cancel }
 }

@@ -5,10 +5,10 @@
 ``DELETE /api/aws/consent?service=<id>``  withdraw it
 
 This handler is the operator's own out-of-band control surface, and being the
-only writer (with the ``kirocrew aws-consent`` CLI) is what makes "the agent
-cannot consent to spending the operator's money" true: the grant lives on the
-keystone floor, which the agent can neither read nor write, and this handler
-opens that path directly rather than through the agent tool gate.
+only writer of the grant is what makes "the agent cannot consent to spending the
+operator's money" true: the grant lives on the keystone floor, which the agent
+can neither read nor write, and this handler opens that path directly rather than
+through the agent tool gate. There is no CLI verb that records a grant.
 
 The GET is deliberately the side that performs the ``sts:GetCallerIdentity``
 probe. It is free, non-mutating, and it is the whole point of the surface --
@@ -18,7 +18,10 @@ account and the profile now resolves to another, the probe revokes the stale
 grant here, so the next synthesis refuses and the operator is asked again.
 
 Blocking work is offloaded. The keystone read/write touches the filesystem and
-the identity probe spawns the AWS CLI, so neither may run on the event loop.
+the identity probe spawns the AWS CLI, so neither may run on the event loop. Nor
+may the refusal audit: its security-event-log write also initialises the log on
+first use, so a large or corrupt tail would make one refused request stall the
+requests behind it and the heartbeat.
 """
 
 from __future__ import annotations
@@ -47,7 +50,7 @@ _CODE_STALE_CONFIRMATION = "aws_consent_stale_confirmation"
 _CODE_OWNER_REQUIRED = "dashboard_owner_required"
 
 
-def _deny_non_owner(request: web.Request, operation: str) -> web.Response | None:
+async def _deny_non_owner(request: web.Request, operation: str) -> web.Response | None:
     """Refuse anyone but the dashboard OWNER on every consent endpoint.
 
     Confirming a charge spends the owner's money, so it is an owner action --
@@ -67,7 +70,6 @@ def _deny_non_owner(request: web.Request, operation: str) -> web.Response | None
     subject), so it is reused rather than re-derived -- the same reason
     ``ask_question`` and ``mcp_apps`` reuse it. Reads are refused too: the GET
     names the account id and caller ARN that a keystone read is fenced from.
-    Both findings came from review.
     """
     if is_owner_dashboard_request(request):
         return None
@@ -78,8 +80,15 @@ def _deny_non_owner(request: web.Request, operation: str) -> web.Response | None
         operation,
         request.get("app"),
     )
-    aws_consent.audit_decision(
-        "*", outcome="denied", detail=f"{operation}: non-owner caller refused"
+    # Off the event loop. ``audit_decision`` writes the security event log, and
+    # the first write on a fresh gateway also initialises it, so a large or
+    # corrupt log tail would make one refused request stall the requests behind
+    # it and the heartbeat. Same offload the file-delivery consent refusals use.
+    await asyncio.to_thread(
+        aws_consent.audit_decision,
+        "*",
+        outcome="denied",
+        detail=f"{operation}: non-owner caller refused",
     )
     # Deny decision made above; only the response label changes for a signed
     # pre-owner bootstrap subject (see stale_owner_session_response).
@@ -106,16 +115,50 @@ async def _effective_target(service: str) -> tuple[str, str]:
         return _vc.aws_profile, _vc.region
 
     if service in (aws_consent.SERVICE_S3, aws_consent.SERVICE_COST_EXPLORER):
-        # AWS Control's paid services run against the deploy profile registry's
-        # default entry — the same resolution the engine will use for the call
-        # itself, so the confirmation names the account that would really bill.
-        # No registered profile resolves to the empty profile (the CLI default
-        # chain), which the card labels explicitly rather than hiding.
+        # AWS Control's paid services run against a HEALTHY key of the account
+        # the deploy profile registry's default entry names, chosen by
+        # ``accounts._pick_profile`` — the same resolution the engine uses for
+        # the call itself, so the confirmation names the key that would really
+        # bill. That resolver also owns the degraded answer (name the registry
+        # default so the card can say why nothing is authorizable) and the
+        # redaction both branches need, which is why this handler reads the
+        # registry through it rather than beside it.
+        #
+        # Reading the registry default DIRECTLY is not equivalent, though it
+        # looks it: the operation filters to healthy keys and prefers the
+        # default only AMONG those. A default key that does not resolve would
+        # bind the card to a key with no account while every operation runs fine
+        # under the account's healthy sibling — and since ``Confirm and enable``
+        # requires a resolved account, that state cannot be confirmed at all: a
+        # working account with no way to grant it consent. Going through the one
+        # policy function is what keeps the card and the call from drifting.
+        #
+        # Cost: that resolution reads the app's account snapshot, which probes
+        # every registered key when cold. It is amortized rather than added --
+        # the snapshot is five-minute cached and the only surface rendering these
+        # two cards loads it first anyway -- and paying it is the point, since
+        # health is exactly what a registry-only read cannot see.
+        from kiro_crew.apps.builtins.aws_control.backend import accounts as aws_accounts
         from kiro_crew.deploy import profiles as deploy_profiles
 
-        resolved = await asyncio.to_thread(deploy_profiles.resolve_profile, "")
+        try:
+            resolved = await aws_accounts.resolve_consent_target()
+        except Exception:
+            # That resolution probes the whole registry through the AWS CLI. A
+            # failure there must not take the consent surface down with it, so
+            # it degrades to the empty profile below.
+            logger.warning(
+                "could not resolve a key for %s; naming the provider default chain",
+                service,
+                exc_info=True,
+            )
+            resolved = None
         if resolved is not None:
             return resolved
+        # No registered profile resolves to the empty profile (the CLI default
+        # chain), which the card labels explicitly rather than hiding. Both
+        # values here are constants, so nothing agent-authored reaches the
+        # response on this branch.
         return "", deploy_profiles.DEFAULT_REGION
 
     from kiro_crew.config.loader import KiroCrewConfig
@@ -130,7 +173,7 @@ def _grant_payload(grant: aws_consent.Grant | None) -> dict[str, object] | None:
 
 async def api_aws_consent_get(request: web.Request) -> web.Response:
     """GET /api/aws/consent — what this service would bill, and its consent."""
-    denied = _deny_non_owner(request, "aws_consent.read")
+    denied = await _deny_non_owner(request, "aws_consent.read")
     if denied:
         return denied
     service = _requested_service(request)
@@ -186,7 +229,7 @@ async def api_aws_consent_post(request: web.Request) -> web.Response:
     name the account it is confirming is not informed consent, so it is not
     recorded and the feature stays refused.
     """
-    denied = _deny_non_owner(request, "aws_consent.grant")
+    denied = await _deny_non_owner(request, "aws_consent.grant")
     if denied:
         return denied
 
@@ -266,7 +309,7 @@ async def api_aws_consent_post(request: web.Request) -> web.Response:
 
 async def api_aws_consent_delete(request: web.Request) -> web.Response:
     """DELETE /api/aws/consent — withdraw a recorded confirmation."""
-    denied = _deny_non_owner(request, "aws_consent.revoke")
+    denied = await _deny_non_owner(request, "aws_consent.revoke")
     if denied:
         return denied
     service = _requested_service(request)

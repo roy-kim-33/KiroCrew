@@ -14,7 +14,7 @@ genuinely GitHub knowledge: how to observe a PR, and what counts as an anomaly.
 
 Wake reasons:
 
-- ``conflict``   -- the PR became CONFLICTING/DIRTY. Classified NMI so it
+- ``conflict``   -- the PR became CONFLICTING/DIRTY. Classified IMMEDIATE so it
                     bypasses the coalescing window: a dirty PR dispatches no
                     checks, so ``pending`` never drains and waiting observes
                     nothing at all.
@@ -71,6 +71,7 @@ from kiro_crew.irq import (
     DEFAULT_REALERT_SECS,
     Observation,
     Probe,
+    ResetsOn,
     Severity,
     Tick,
     sanitize_label,
@@ -80,6 +81,62 @@ from kiro_crew.irq import (
 _AUDIT_CALLER = "core:babysit-pr-watch"
 
 _GH_TIMEOUT_SECS = 25
+
+#: Every observation key this probe can emit that WAKES the owning session,
+#: paired with the plain-language name a user-facing text gives it.
+#:
+#: A gated loop's cost promise is only honest while the texts that state it
+#: name exactly this set, so the texts render from here rather than spelling
+#: the set out themselves, and ``test_pr_watch_wake_sources_match_the_``
+#: ``observations_the_probe_builds`` asserts these keys plus
+#: :data:`TERMINAL_SOURCES` are the ones the module's ``Observation`` calls
+#: actually construct. Adding or gating a source therefore fails that test
+#: until one of these maps names it, instead of leaving the texts stale.
+WAKE_SOURCES: tuple[tuple[str, str], ...] = (
+    ("conflict", "a merge conflict"),
+    ("red", "a newly failing check (not one the branch already inherited)"),
+    ("ready", "every check settled green (unless that source is turned off)"),
+    ("comment", "a new comment"),
+    ("review", "a new submitted review"),
+)
+
+#: Observation keys that END the watch rather than waking it.
+#:
+#: Severity.TERMINAL, so naming these among the wake sources would promise a
+#: delivery that never arrives -- the watch is gone by then.
+TERMINAL_SOURCES: tuple[tuple[str, str], ...] = (
+    ("merged", "a merge"),
+    ("closed", "a close"),
+)
+
+
+def _joined(names: list[str]) -> str:
+    """Comma-separate the members, so a member may not carry a comma itself.
+
+    ``test_no_source_name_carries_a_comma`` holds that, because a member with
+    an internal comma renders as two list items and the second one has no
+    referent a reader can resolve.
+    """
+    if len(names) == 1:
+        return names[0]
+    if len(names) == 2:
+        return f"{names[0]} or {names[1]}"
+    return ", ".join(names[:-1]) + f", or {names[-1]}"
+
+
+def wake_set_phrase() -> str:
+    """The wake set as one clause, for a user-facing text.
+
+    Callers own the sentence around it; this owns only the membership, which
+    is the part that goes stale when the probe grows a source.
+    """
+    return _joined([name for _key, name in WAKE_SOURCES])
+
+
+def terminal_set_phrase() -> str:
+    """The watch-ending set as one clause, for a user-facing text."""
+    return _joined([name for _key, name in TERMINAL_SOURCES])
+
 
 #: The one host a watch message may pin. Not a configuration point: a subject
 #: inferred from a public GitHub URL pins this so a bare ``owner/name`` slug
@@ -106,12 +163,12 @@ _PINNABLE_HOST = "github.com"
 #: MUST stay below the kernel's ``realert_secs``: the kernel drops sticky dedupe
 #: keys once they pass that window, and what stops a dropped key from being
 #: re-reported is this filter having aged the signal out first. Asserted below
-#: rather than merely documented -- three doc comments claiming an invariant that
-#: nothing checked is what let it drift this far.
+#: rather than merely documented, because a doc comment claiming an invariant
+#: nothing checks does not hold it.
 #:
-#: A constant rather than a cron parameter: as a parameter it had no caller, and
-#: its only distinct capability was misconfiguring the watch into re-waking for
-#: the same comment every re-alert window.
+#: A constant rather than a cron parameter: as a parameter it has no caller, and
+#: its only distinct capability would be misconfiguring the watch into re-waking
+#: for the same comment every re-alert window.
 DEFAULT_COMMENT_HORIZON_SECS = 5 * 3600.0
 
 assert DEFAULT_COMMENT_HORIZON_SECS < DEFAULT_REALERT_SECS, (
@@ -125,11 +182,15 @@ _FAILING = {"FAILURE", "ERROR", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE
 _PASSING = {"SUCCESS", "NEUTRAL", "SKIPPED"}
 #: Noise, not signal (see module docstring).
 _NOISE = {"CANCELLED", "STALE"}
+#: Not settled yet; the empty string is a row carrying neither a conclusion nor a
+#: state.
+_PENDING = {"PENDING", "EXPECTED", "QUEUED", "IN_PROGRESS", ""}
 
 #: Wake-a-brain conservativeness order, used ONLY when timestamps cannot
-#: arbitrate duplicate rows (a queued rerun has no startedAt yet): a row that
-#: says "something may be wrong or unfinished" must not lose to an older
-#: "all good" row just because it has no clock value.
+#: arbitrate duplicate rows (a queued rerun has no startedAt yet, and a
+#: StatusContext never has one): a row that says "something may be wrong or
+#: unfinished" must not lose to an "all good" row just because that row has a
+#: clock value and this one does not.
 _CONSERVATIVE = {"failing": 3, "pending": 2, "passing": 1, "noise": 0}
 
 _WAKE_TAIL = (
@@ -159,7 +220,7 @@ def _bucket(item: dict) -> tuple[str, str]:
         return name, "passing"
     if conclusion in _NOISE:
         return name, "noise"
-    if conclusion in ("PENDING", "EXPECTED", "QUEUED", "IN_PROGRESS", ""):
+    if conclusion in _PENDING:
         return name, "pending"
     # Unknown vocabulary: err on the side of waking a brain to look at it.
     return name, "failing"
@@ -183,7 +244,13 @@ def _collapse(rollup: list) -> list[tuple[str, str, str]]:
     ``(workflowName, name)`` and keep the NEWEST row by ``startedAt`` --
     recency is the correct arbiter in both directions, since a rerun-green
     supersedes a stale red and a rerun-red supersedes a stale green.
-    ISO-8601 timestamps order lexically; a missing ``startedAt`` sorts oldest.
+    ISO-8601 timestamps order lexically, so a plain string compare picks the
+    newer row. When EITHER row has no ``startedAt`` recency cannot arbitrate at
+    all, and the more conservative bucket wins instead -- see ``_CONSERVATIVE``.
+    A dateless failing row therefore beats a dated passing one, which is the
+    point: a row may be undated because it is a just-queued rerun or because it
+    is a StatusContext, which carries ``createdAt`` and no start time at all --
+    so silence about when it began is never evidence that it is stale.
     """
     per_key: dict[tuple[str, str], tuple[str, str]] = {}
     for item in rollup:
@@ -202,7 +269,8 @@ def _collapse(rollup: list) -> list[tuple[str, str, str]]:
             details = str(item.get("detailsUrl") or "")
             if details:
                 parsed = urlparse(details)
-                segment = parsed.path.strip("/").split("/", 1)[0] if parsed.path.strip("/") else ""
+                path = parsed.path.strip("/")
+                segment = path.split("/", 1)[0] if path else ""
                 workflow = sanitize_label(
                     f"{parsed.netloc}/{segment}" if segment else parsed.netloc
                 )
@@ -211,10 +279,12 @@ def _collapse(rollup: list) -> list[tuple[str, str, str]]:
         prev = per_key.get(key)
         if prev is None:
             per_key[key] = (started, bucket)
-        elif started and prev[0]:
-            if started >= prev[0]:
+            continue
+        prev_started, prev_bucket = prev
+        if started and prev_started:
+            if started >= prev_started:
                 per_key[key] = (started, bucket)
-        elif _CONSERVATIVE[bucket] > _CONSERVATIVE[prev[1]]:
+        elif _CONSERVATIVE[bucket] > _CONSERVATIVE[prev_bucket]:
             per_key[key] = (started, bucket)
 
     # Workflow-qualified display identity: "workflow / name" when the two
@@ -291,6 +361,7 @@ class PrWatchProbe(Probe):
 
     repo: str
     pr: int
+    host: str
     known_reds: set[str]
     wake_on_green: bool
     note: str
@@ -351,10 +422,6 @@ class PrWatchProbe(Probe):
         # against bool explicitly and refuse everything else -- a nonsense flag
         # is a permanently-invalid config, terminal (ValueError -> Done) like
         # every other malformed field here.
-        #
-        # This arrived on main as #7665 while this branch was moving the probe
-        # out of the skill script; it is ported here rather than dropped,
-        # because this module now owns the parsing it was written against.
         raw_wake = params.get("wake_on_green", True)
         if not isinstance(raw_wake, bool):
             raise ValueError("pr_watch wake_on_green must be true or false")
@@ -384,10 +451,10 @@ class PrWatchProbe(Probe):
     def _conversation(self, data: dict) -> list[Observation]:
         """Observations for things said about the PR rather than run on it.
 
-        These carry ``epoch_scoped=False``: a comment belongs to the pull
+        These carry ``resets_on=ResetsOn.NEVER``: a comment belongs to the pull
         request, not to the commit under review, so it must survive the epoch
-        reset a force-push triggers. Left epoch scoped, pushing a fix five
-        minutes after a reviewer commented would replay that comment.
+        reset a force-push triggers. Scoped to the revision instead, pushing a fix
+        five minutes after a reviewer commented would replay that comment.
 
         The brief names WHO and WHEN and never quotes the body. That boundary is
         the whole point of the split: the probe is the detector, so it reports
@@ -429,7 +496,7 @@ class PrWatchProbe(Probe):
                         "arrived. Read it and reply -- a reviewer verdict can "
                         "sit in a comment body while its check reports success.",
                     ),
-                    epoch_scoped=False,
+                    resets_on=ResetsOn.NEVER,
                 )
             )
 
@@ -452,7 +519,7 @@ class PrWatchProbe(Probe):
                         f"{item.get('submittedAt')}. Read it and disposition "
                         "every point before calling the PR ready.",
                     ),
-                    epoch_scoped=False,
+                    resets_on=ResetsOn.NEVER,
                 )
             )
 
@@ -508,7 +575,7 @@ class PrWatchProbe(Probe):
             observations.append(
                 Observation(
                     "conflict",
-                    Severity.NMI,
+                    Severity.IMMEDIATE,
                     self._brief(
                         head,
                         "merge conflict",
@@ -611,9 +678,9 @@ class PrWatchProbe(Probe):
 
         Both describe the delivery, not any one signal: the note is what this
         watch was armed for, and the tail tells the woken agent what to do with
-        a wake in general. Emitting them per observation is what made a
-        well-coalesced wake expensive -- six observations meant six copies, 56%
-        of the delivered bytes on a measured real wake.
+        a wake in general. Emitting them per observation instead costs one copy
+        per observation, which on a well-coalesced wake of half a dozen is most
+        of the delivered bytes.
         """
         lines = []
         if self.note:
@@ -627,8 +694,9 @@ class PrWatchProbe(Probe):
         # than rendered empty.
         #
         # This describes ONE observation and nothing else. The note and the
-        # standing instructions moved to wake_suffix(), because the kernel joins
-        # N of these into one body and anything per-observation is paid N times.
+        # standing instructions live in wake_suffix() instead, because the kernel
+        # joins N of these into one body and anything per-observation is paid N
+        # times.
         subject = f"{self.repo}#{self.pr}"
         if head:
             subject += f" (head {head[:9]})"

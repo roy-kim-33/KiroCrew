@@ -37,6 +37,9 @@ export default [
       // Test files assert on visible English by design.
       'src/**/*.test.{ts,tsx}',
       'src/test/**',
+      // Storybook fixtures are development-only renders of a primitive with
+      // sample copy; nothing in them reaches a user. Same category as tests.
+      'src/**/*.stories.{ts,tsx}',
       // MODEL-FACING PROMPTS, by naming convention. A `*.prompt.ts` module may
       // contain ONLY the text of a message sent to an agent — no UI copy — so the
       // suffix IS the boundary and its sibling module stays fully covered. Same
@@ -60,6 +63,21 @@ export default [
       // the module may contain ONLY paint data, so the filename IS the
       // boundary and its consumer (FolderGlyph.tsx) stays fully covered.
       'src/components/folderColorPaint.ts',
+      // The MCP App (SEP-1865) host theme token map: every string is a CSS custom
+      // property name (`--bg`), a protocol variable key (`--color-text-primary`), a
+      // CSS value (`400`, `9999px`) or the `color-mix()` wash template that derives
+      // the info fill from `--info`. None is read as words — the module's whole
+      // output is a Record of stylesheet declarations handed to an app iframe, and
+      // translating any of it would break the paint it exists to perform. Same
+      // named-boundary idiom as `folderColorPaint.ts` above, and the same
+      // color-mix-over-theme-variables category.
+      //
+      // Stated as a false-negative class, per this file's convention: user-visible
+      // copy added here will not be reported. Verified copy-free rather than
+      // assumed — it imports neither `i18nT` nor `useTranslation`, has no render
+      // path (no JSX, no DOM writes), and its consumer `McpAppFrame.tsx` — which
+      // does carry copy — stays fully covered.
+      'src/lib/mcpAppTheme.ts',
       // Pierre's shared render configuration: injected stylesheet text
       // (`unsafeCSS` templates of selectors, lengths and `var(--…)` references),
       // theme ids the library matches on, and an extension→grammar map. None of
@@ -96,6 +114,18 @@ export default [
       // filename IS the boundary and its consumer (SettingRef.tsx) stays fully
       // covered by the gate.
       'src/components/settingRef/envShellCommands.ts',
+      // Shell-command classifier behind the tool-call titles (a port of Codex's
+      // `parse_command.rs`): every string is CLI syntax the parser matches on —
+      // command names (`rg`, `sed`), option flags (`--max-count`), marker
+      // substrings (`os.walk`) — never user-visible copy; translating one would
+      // break the parser. Same named-boundary idiom as `envShellCommands.ts`
+      // above: the module may contain ONLY parser data, and every title a person
+      // reads is rendered by its consumer `toolCallTitle.ts` through `i18nT`,
+      // which stays fully covered.
+      //
+      // Stated as a false-negative class, per this file's convention: copy added
+      // to this module will not be reported. Keep it syntax-only.
+      'src/utils/shellCommandParse.ts',
       // Generated and data-only.
       'src/i18n/locales/**',
       // Generated sources: the copy's real home is the panel that declares the
@@ -381,6 +411,10 @@ export default [
               // surrounding sentence (`Enter <name> here`), which the anchors reject.
               String.raw`^<[a-z]+>$`,
 
+              // Exact capability-retention wire sentinel, never input copy.
+              // Translating it would turn a retained credential into a new value.
+              String.raw`^\[REDACTED\]$`,
+
               // The same sentinel standing in for a URL QUERY, e.g. `?token=<redacted>`
               // and `?<query>` — the two values `safePaneUrl` substitutes for a query it
               // will not journal. Deliberately a separate entry from the bare sentinel
@@ -459,6 +493,34 @@ export default [
               // merely containing such a token alongside a plain word still
               // fails, because every token must match end to end.
               String.raw`^\[@(?:media|supports)\([^)\s]*\)\]:[^\s]+(?:\s+\[@(?:media|supports)\([^)\s]*\)\]:[^\s]+)*$`,
+              // Tailwind DESCENDANT-VARIANT clusters, e.g. the flush icon-cell row
+              // shared by the message footers in utils/touchActions.ts:
+              // `gap-x-0 [&_button]:h-7 [&>button:first-child]:-ms-[7px] [@media(hover:none)]:[&_button]:h-8`.
+              // Neither shape above covers these: the general class shape forbids
+              // `&`, `>` and `_`, which are what a descendant selector is made of,
+              // and the `@`-variant shape requires EVERY token to open with `[@`,
+              // while this cluster mixes plain utilities (`gap-x-0`) with `[&…]:`
+              // and `[@media(…)]:` tokens. Such constants live at module level
+              // under ALL-CAPS names, so `i18n-strict` looks inside them.
+              //
+              // Deliberately NARROWER than "allow & and > anywhere", on two axes:
+              // (a) the first lookahead rejects any two ADJACENT bare lowercase
+              // words — the prose shape (`copy failed [&_x]:hidden`) that would
+              // otherwise ride in on a single variant token; a class cluster never
+              // has two adjacent bare words, every utility next to a bare
+              // `flex`/`isolate` carries a hyphen, digit, colon or bracket.
+              // (b) the second lookahead requires at least one token that OPENS
+              // with a `[&…]:` descendant variant — copy never opens a word with
+              // `[&` — and `&`, `>`, `_` and `,` are admitted ONLY inside a bracket
+              // group that itself opens with `&` or `@media(`/`@supports(`; outside
+              // them the char class is the general class shape's (plain `[7px]`
+              // arbitrary values included).
+              //
+              // Known false negative, stated: a SINGLE bare word plus variant
+              // tokens (`saved [&_button]:p-0`) is missed — the same single-word
+              // residue the general class shape already accepts, caught by the
+              // en-XA render gate instead.
+              String.raw`^(?!.*(?:^|\s)[a-z]+\s+[a-z]+(?:\s|$))(?=(?:^|.*\s)\[&[^\]\s]*\]:)(?:[\s\-a-z0-9:/().%#\[\]]|\[(?:&|@(?:media|supports)\()[^\]\s]*\])+$`,
               // Tailwind ARBITRARY-VALUE clusters whose bracketed value carries a
               // comma or underscore, e.g. the notification glass surfaces in
               // components/notifications/NotificationFeed.tsx:
@@ -620,6 +682,14 @@ export default [
               // the moment a label contains a colon, which several already do
               // ("Missing:", "Preset name:").
               '^cc:[A-Za-z0-9:._-]+$',
+              // An ECS Exec target example used as a form placeholder, e.g.
+              // `ecs:my-cluster_taskid_runtimeid`: a module-level ALL-CAPS constant,
+              // which is where `i18n-strict` looks inside, and the camelCase
+              // pattern cannot reach it because it forbids the colon.
+              //
+              // Anchored on the `ecs:` prefix, no spaces, and no second colon (the
+              // target shape has exactly one), so prose cannot match.
+              '^ecs:[A-Za-z0-9_.-]+$',
               '^[\\w.-]+/[\\w./-]*$',
               // EVERY PATTERN IN THIS FILE IS MATCHED FULL-STRING, so a prefix
               // pattern MUST spell out its own tail. `eslint-plugin-i18next` compiles
@@ -666,6 +736,16 @@ export default [
               // The autolink href template's substitution placeholder, consumed by
               // `expand()`; a translated token would stop every match expanding.
               String.raw`^\{match\}$`,
+              // The goal loop's kill-switch placeholder, `{{STOP_FILE}}`. The
+              // server replaces it with the loop's stop-sentinel path when each
+              // nudge is sent (`render_nudge_message`), so the spelling is a wire
+              // contract with the backend, not copy: a translated token would
+              // reach the server unrecognised and the loop would ship an
+              // instruction with no off switch. EXACT, not a `{{ALL_CAPS}}` shape,
+              // for the reason stated on `{match}` above -- a shape would start
+              // releasing any interpolation placeholder the moment one was held
+              // in an ALL-CAPS constant.
+              String.raw`^\{\{STOP_FILE\}\}$`,
               // A FILE-PICKER `accept` EXTENSION LIST, e.g.
               // `,.txt,.md,.json,.har,.yaml` — the comma-joined dot-extension
               // string handed to `<input type="file" accept=…>`. These live at
@@ -747,7 +827,17 @@ export default [
               // Key CAP names and modifier glyphs. These name physical keys, which the
               // catalog's own translator context says are left as printed on the keyboard
               // (see `components.shortcutsModal.k`, `components.commandPalette.tab`).
-              '[⌘⇧⌥⌃]+[A-Za-z0-9]?$', '(?:Ctrl|Cmd|Alt|Win|Opt|Shift|Esc|Tab|Enter|Del)$',
+              //
+              // `Meta` and `Control` are the WAI-ARIA modifier vocabulary, which is what
+              // an `aria-keyshortcuts` value is spelled in — the same kind of machine
+              // grammar as the OS accelerator entry directly above, just parsed by
+              // assistive tech instead of by the OS. They are needed BARE, unlike the
+              // accelerator pattern, because that one requires a `+<key>` suffix and the
+              // ARIA value is assembled a modifier at a time (see
+              // `hooks/useNavShortcutHint.ts`). Anchored to the whole value like every
+              // sibling here, so a sentence merely containing the word "Control" is still
+              // reported — only the bare token is exempt.
+              '[⌘⇧⌥⌃]+[A-Za-z0-9]?$', '(?:Ctrl|Cmd|Alt|Win|Opt|Shift|Esc|Tab|Enter|Del|Meta|Control)$',
               // A TEMPLATE LITERAL is validated one QUASI at a time (the rule reports
               // the whole template if ANY quasi fails), so the fragments BETWEEN
               // interpolations need shapes of their own. `data:${mime};base64,${b64}`
@@ -790,7 +880,7 @@ export default [
               // per-channel settings panels. Enumerated and whole-value-anchored,
               // so a sentence merely mentioning a channel is still reported —
               // only the bare name is exempt.
-              '^(Slack|Discord|Telegram|Teams|Webex|WeCom|WeChat|WhatsApp)$',
+              '^(Slack|Discord|Telegram|Teams|Webex|WeCom|WeChat|WhatsApp|iMessage|Feishu)$',
               // The code-forge product brands, in the do-not-translate glossary for
               // the same reason and enforced there by `glossary.test.ts`: "GitLab" is
               // "GitLab" in every language, and a localized spelling would name a
@@ -889,8 +979,16 @@ export default [
               // A CALLEE exemption, not a whole-file one, for the reason the ones
               // above give -- and the name is deliberately long and specific rather
               // than a generic `warnSkip`, so a future helper elsewhere cannot
-              // inherit this by accident. One definition exists today, in
-              // `src/apps/command-bar/contributedCommands.ts`, which renders nothing.
+              // inherit this by accident. TWO definitions exist today:
+              // `src/apps/command-bar/contributedCommands.ts`, which renders nothing,
+              // and `src/apps/fileMenuContributions.tsx`, the same shim for a refused
+              // `contributes.fileMenuItems` row. The second REUSES this name rather
+              // than adding a second global exemption for a differently-named shim:
+              // one entry covering both keeps the released surface the same size,
+              // where two would widen it for no gain. Note the file-scope caveat
+              // still holds for the second one -- `fileMenuContributions.tsx` does
+              // render real rows (a contributed row's app-owned `label`, straight to
+              // JSX), which is exactly why the exemption stays on the callee.
               '^warnContributionSkipped$',
               // `scrollInspector.ts`'s diagnostic sink. `devLog(tag, detail)` writes a
               // fixed-format line into a developer overlay -- `STORE.save 9020
@@ -1082,6 +1180,14 @@ export default [
               // for — `aliases` moves _total 1842 -> 1840 and changes no other file's
               // entry, so it hands nothing back.
               'aliases',
+              // `namespace: 'KiroCrewComposer'` — Lexical's editor-instance
+              // identifier (`createEditor({ namespace })`), used to tag devtools
+              // and error frames and matched by value; never rendered. Same
+              // lookup-key class as `key`/`navId` above. Measured under the
+              // `aliases` standard: one occurrence in the tree (the new
+              // LexicalComposerInput.tsx), zero baseline entries touched, so the
+              // exemption hands back no other file's debt.
+              'namespace',
               // `error` on a VALIDATION RESULT object (`{ ok: false, error }`) — the
               // same class as `errors.push` in `callees` above, and exempt for the same
               // reason. A user-facing failure message belongs in a toast or a rendered
@@ -1106,6 +1212,28 @@ export default [
           },
         },
       ],
+    },
+  },
+
+  // A URL-path-segment table: the core-owned first segments under
+  // `/api/apps/<app>/`, mirroring `CORE_APP_ROUTE_SEGMENTS` in `apps/manifest.py`.
+  // Route segments are a contract with the router, never copy — a translated
+  // `uninstall` does not localize anything, it silently un-reserves a core route and
+  // lets an app's manifest claim it.
+  //
+  // Scoped to this one file, and the file exists to be scopeable. A global
+  // `words.exclude` shape cannot express it: the values are bare lowercase words
+  // (`open`, `update`, `config`, `enable`), so the whole-value-anchored entry that
+  // would release them would equally release a button labelled exactly "Open". And
+  // releasing their previous home, `apps/fileMenuContributions.tsx`, would release the
+  // app-actions label and every other string in a module that DOES render copy. The
+  // set also sits under an ALL-CAPS declarator, so `eslint.i18n.strict.config.js`
+  // recovers it and `[added-lines]` charges the whole array on any edit to it.
+  // Keep `coreAppRoutes.ts` route segments only.
+  {
+    files: ['src/apps/coreAppRoutes.ts'],
+    rules: {
+      'i18next/no-literal-string': 'off',
     },
   },
 
@@ -1192,6 +1320,36 @@ export default [
     },
   },
 
+  // STORAGE FORMAT ONLY: the view-state record's own serialization. Every literal
+  // in this module is compared or written BY VALUE and none is ever rendered --
+  // the four outcome tags (`absent`, `restored`, `revision-mismatch`,
+  // `unreadable`) and two action tags (`write`, `remove`) are discriminants the
+  // caller switches on, the key is `kc:app:<appId>:view:<name>` built from the
+  // host-minted appId, and the flagged line is JSON SYNTAX:
+  // `{"revision":…,"state":…}`.
+  //
+  // That line cannot earn a narrower exemption, which is why this is file-scoped.
+  // It is RETURNED rather than passed, so no callee exemption reaches it; an
+  // inline disable cannot work either, because the two gates register the rule
+  // under different names (`i18next/…` here, `i18n-strict/…` in the strict
+  // config) and naming both makes each run fail on the one it does not know.
+  // Rewriting it to avoid the literal is worse on every branch: the state half
+  // arrives pre-serialized from `canonicalState` to guarantee a stable byte form,
+  // so nesting it through `JSON.stringify` would need a parse round-trip that
+  // defeats the canonicalisation the stored-record tests assert, and an array
+  // `join` would trade one flagged literal for four.
+  //
+  // Scoped to this one file, and verified copy-free: the module holds no
+  // sentence-shaped string except one developer diagnostic, which is already
+  // exempt through the call it is passed to. Copy added here later belongs in the
+  // catalog, not under this exemption.
+  {
+    files: ['src/app-sdk/viewState.ts'],
+    rules: {
+      'i18next/no-literal-string': 'off',
+    },
+  },
+
   // PROTOCOL VALUES ONLY: the server's own action names, provider merge-state enums,
   // and the literals a user must TYPE to arm an irreversible action. Every string in
   // that module is compared by value against something outside the dashboard, so
@@ -1207,6 +1365,26 @@ export default [
   // `object-properties: next` exclusion above refuses. See the module's own header.
   {
     files: ['src/apps/issue-radar/lib/wireValues.ts'],
+    rules: {
+      'i18next/no-literal-string': 'off',
+    },
+  },
+
+  // DURABLE SERVER-MATCHED VALUE ONLY, same category as `wireValues.ts` above: the
+  // one string in this module is a folder NAME the server stores and this code then
+  // finds again by that name on a later run. Translating it forks a second folder the
+  // moment the reader switches language and strands every session already filed under
+  // the old name, so the value has to be language-independent for the same reason a
+  // protocol value does.
+  //
+  // Scoped to this one file, and the module's own header says to keep it copy-free:
+  // a shape rule cannot express "the identifier a folder is looked up by, but only in
+  // this module", and the alternative tried first — assembling the name at runtime
+  // from lowercase tokens so the scanner could not see it — was worse. That opens a
+  // third suppression channel this config does not count, which is exactly what
+  // centralizing suppression here exists to prevent.
+  {
+    files: ['src/apps/command-bar/sessionFolder.ts'],
     rules: {
       'i18next/no-literal-string': 'off',
     },
@@ -1271,6 +1449,17 @@ export default [
   // submission rather than localize it. See the module's own header.
   {
     files: ['src/components/sessionPulseWireValues.ts'],
+    rules: {
+      'i18next/no-literal-string': 'off',
+    },
+  },
+
+  // HOOK EVENT NAMES ONLY: matched BY VALUE against the backend's event
+  // allowlist, and rendered verbatim on the hook's own row, so a translated one is
+  // rejected on save and disagrees with its row. Extracted so the page keeps its
+  // gate. See the module's own header.
+  {
+    files: ['src/pages/hookEventWireValues.ts'],
     rules: {
       'i18next/no-literal-string': 'off',
     },

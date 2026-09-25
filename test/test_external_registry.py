@@ -18,6 +18,7 @@ import pytest
 from kiro_crew.apps.registry import (
     _EXTERNAL_REGISTRY_CACHE_TTL,
     _clone_sandbox_mode,
+    _external_registry_cache_identity,
     _external_registry_cache_path,
     _external_registry_repos,
     _fetch_external_registry_index,
@@ -74,7 +75,7 @@ def _catalog_absent(monkeypatch):
 
     This module is about SEED and EXTERNAL-registry resolution; the official
     catalog is upstream of both in ``_resolve_registry_row``, and its real
-    lookup performs a fresh uncached HTTPS fetch on every call (#4236).
+    lookup performs a fresh uncached HTTPS fetch on every call.
     Before the suite-wide network guard these tests silently depended on the
     runner's live network being up. A test that wants a different catalog
     answer overrides this by monkeypatching the same seam itself.
@@ -407,13 +408,14 @@ async def test_unnamed_credentialed_registry_cache_hit_and_stale_rows_are_public
     raw_registry = f"https://user:{secret}@git.example.com/org/apps.git"
     public_registry = "https://git.example.com/org/apps.git"
     mock_reg = SimpleNamespace(name="", repo=raw_registry, branch="main", trust="index")
+    cache_key = _external_registry_cache_identity(mock_reg)
     _write_external_registry_cache(
-        raw_registry,
+        cache_key,
         [{"name": "private-app", "repo": public_registry, "branch": "main"}],
     )
     if stale:
         old = time.time() - 7200
-        os.utime(_external_registry_cache_path(raw_registry), (old, old))
+        os.utime(_external_registry_cache_path(cache_key), (old, old))
         monkeypatch.setattr(
             reg,
             "_fetch_and_cache_external_registry",
@@ -441,7 +443,7 @@ async def test_url_shaped_registry_name_is_credential_free_in_cached_rows(cache_
         trust="index",
     )
     _write_external_registry_cache(
-        raw_name,
+        _external_registry_cache_identity(mock_reg),
         [{"name": "private-app", "repo": mock_reg.repo, "branch": "main"}],
     )
     monkeypatch.setattr(reg, "_effective_registries", lambda: [mock_reg])
@@ -569,12 +571,12 @@ class TestLoadExternalRegistries:
     @pytest.mark.asyncio
     async def test_returns_cached_entries(self, cache_dir, monkeypatch):
         entries = [{"name": "cached-app", "repo": "R", "branch": "mainline"}]
-        _write_external_registry_cache("myorg", entries)
 
         mock_reg = MagicMock()
         mock_reg.name = "myorg"
         mock_reg.repo = "MyOrgRepo"
         mock_reg.branch = "mainline"
+        _write_external_registry_cache(_external_registry_cache_identity(mock_reg), entries)
 
         mock_config = MagicMock()
         mock_config.registries = [mock_reg]
@@ -591,12 +593,12 @@ class TestLoadExternalRegistries:
     @pytest.mark.asyncio
     async def test_tags_entries_with_registry_name(self, cache_dir, monkeypatch):
         entries = [{"name": "app1"}, {"name": "app2"}]
-        _write_external_registry_cache("identity", entries)
 
         mock_reg = MagicMock()
         mock_reg.name = "identity"
         mock_reg.repo = "IdentityApps"
         mock_reg.branch = "mainline"
+        _write_external_registry_cache(_external_registry_cache_identity(mock_reg), entries)
 
         mock_config = MagicMock()
         mock_config.registries = [mock_reg]
@@ -606,6 +608,7 @@ class TestLoadExternalRegistries:
         )
 
         result = await _load_external_registries()
+        assert len(result) == 2
         assert all(e["_registry"] == "identity" for e in result)
 
 
@@ -619,13 +622,13 @@ class TestGetRegistryAppExternal:
         entries = [
             {"name": "ext-app", "repo": "ExtRepo", "branch": "mainline"},
         ]
-        _write_external_registry_cache("myorg", entries)
 
         # Mock config to have one registry
         mock_reg = MagicMock()
         mock_reg.name = "myorg"
         mock_reg.repo = "MyOrgRepo"
         mock_reg.branch = "mainline"
+        _write_external_registry_cache(_external_registry_cache_identity(mock_reg), entries)
 
         mock_config = MagicMock()
         mock_config.registries = [mock_reg]
@@ -696,12 +699,12 @@ class TestGetRegistryAppByRepoExternal:
         # configured branch for external-registry apps, not silently use "main"
         # (which 403s the icon for repos pinned to another branch).
         entries = [{"name": "ext-app", "repo": "ExtRepo", "branch": "release"}]
-        _write_external_registry_cache("myorg", entries)
 
         mock_reg = MagicMock()
         mock_reg.name = "myorg"
         mock_reg.repo = "MyOrgRepo"
         mock_reg.branch = "release"
+        _write_external_registry_cache(_external_registry_cache_identity(mock_reg), entries)
         mock_config = MagicMock()
         mock_config.registries = [mock_reg]
 
@@ -849,13 +852,14 @@ class TestKnownRegistryRepos:
 
     def test_unions_external_registry_app_repos(self, cache_dir, monkeypatch):
         # External registry "PCN" lists app pcn-radar whose repo is PCNRadar.
-        _write_external_registry_cache(
-            "PCN", [{"name": "pcn-radar", "repo": "PCNRadar", "branch": "mainline"}]
-        )
         mock_reg = MagicMock()
         mock_reg.name = "PCN"
         mock_reg.repo = "PCNAppRegistry"
         mock_reg.branch = "mainline"
+        _write_external_registry_cache(
+            _external_registry_cache_identity(mock_reg),
+            [{"name": "pcn-radar", "repo": "PCNRadar", "branch": "mainline"}],
+        )
         mock_config = MagicMock()
         mock_config.registries = [mock_reg]
         monkeypatch.setattr(
@@ -873,14 +877,16 @@ class TestKnownRegistryRepos:
     def test_trusts_stale_cache_via_ignore_ttl(self, cache_dir, monkeypatch):
         # Age the cache past the 1h TTL; ignore_ttl must still trust the repo
         # so icons don't 403 between list_registry refreshes.
-        _write_external_registry_cache(
-            "PCN", [{"name": "pcn-radar", "repo": "PCNRadar", "branch": "mainline"}]
-        )
-        stale = time.time() - 7200
-        os.utime(_external_registry_cache_path("PCN"), (stale, stale))
         mock_reg = MagicMock()
         mock_reg.name = "PCN"
         mock_reg.repo = "PCNAppRegistry"
+        mock_reg.branch = "mainline"
+        cache_key = _external_registry_cache_identity(mock_reg)
+        _write_external_registry_cache(
+            cache_key, [{"name": "pcn-radar", "repo": "PCNRadar", "branch": "mainline"}]
+        )
+        stale = time.time() - 7200
+        os.utime(_external_registry_cache_path(cache_key), (stale, stale))
         mock_config = MagicMock()
         mock_config.registries = [mock_reg]
         monkeypatch.setattr(
@@ -917,12 +923,14 @@ class TestKnownRegistryRepos:
 
 class TestExternalRegistryRepos:
     def test_returns_external_repos_only(self, cache_dir, monkeypatch):
-        _write_external_registry_cache(
-            "PCN", [{"name": "pcn-radar", "repo": "PCNRadar", "branch": "mainline"}]
-        )
         mock_reg = MagicMock()
         mock_reg.name = "PCN"
         mock_reg.repo = "PCNAppRegistry"
+        mock_reg.branch = "mainline"
+        _write_external_registry_cache(
+            _external_registry_cache_identity(mock_reg),
+            [{"name": "pcn-radar", "repo": "PCNRadar", "branch": "mainline"}],
+        )
         mock_config = MagicMock()
         mock_config.registries = [mock_reg]
         monkeypatch.setattr(
@@ -947,7 +955,7 @@ class TestExternalRegistryRepos:
 
 # ---------------------------------------------------------------------------
 # install_from_registry admission — the signed manifest is now passed to the
-# gate (fetched read-only BEFORE clone), so require_signature no longer denies
+# gate (fetched read-only BEFORE clone), so require_signature does not deny
 # every registry install of a correctly-signed app.
 # ---------------------------------------------------------------------------
 
@@ -1106,18 +1114,19 @@ class TestRefreshRegistries:
     async def test_success_swaps_cache_and_expires_manifests(self, cache_dir, monkeypatch):
         # Seed a stale index cache for registry "acme" listing one app, plus
         # that app's manifest cache.
-        _write_external_registry_cache(
-            "acme", [{"name": "cool-app", "repo": "R", "branch": "main"}]
-        )
-        manifest_path = _manifest_cache_path("cool-app")
-        manifest_path.parent.mkdir(parents=True, exist_ok=True)
-        manifest_path.write_text('{"name": "cool-app"}', encoding="utf-8")
-        index_path = _external_registry_cache_path("acme")
-
         mock_reg = MagicMock()
         mock_reg.name = "acme"
         mock_reg.repo = "https://github.com/acme/apps"
         mock_reg.branch = "main"
+        cache_key = _external_registry_cache_identity(mock_reg)
+        _write_external_registry_cache(
+            cache_key, [{"name": "cool-app", "repo": "R", "branch": "main"}]
+        )
+        manifest_path = _manifest_cache_path({"name": "cool-app", "repo": "R", "branch": "main"})
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        manifest_path.write_text('{"name": "cool-app"}', encoding="utf-8")
+        index_path = _external_registry_cache_path(cache_key)
+
         mock_config = MagicMock()
         mock_config.registries = [mock_reg]
         monkeypatch.setattr(
@@ -1153,15 +1162,16 @@ class TestRefreshRegistries:
     @pytest.mark.asyncio
     async def test_fetch_failure_preserves_stale_and_reports_failed(self, cache_dir, monkeypatch):
         # Seed a stale index cache; the refetch will fail.
-        _write_external_registry_cache(
-            "acme", [{"name": "cool-app", "repo": "R", "branch": "main"}]
-        )
-        index_path = _external_registry_cache_path("acme")
-
         mock_reg = MagicMock()
         mock_reg.name = "acme"
         mock_reg.repo = "https://github.com/acme/apps"
         mock_reg.branch = "main"
+        cache_key = _external_registry_cache_identity(mock_reg)
+        _write_external_registry_cache(
+            cache_key, [{"name": "cool-app", "repo": "R", "branch": "main"}]
+        )
+        index_path = _external_registry_cache_path(cache_key)
+
         mock_config = MagicMock()
         mock_config.registries = [mock_reg]
         monkeypatch.setattr(
@@ -1183,7 +1193,7 @@ class TestRefreshRegistries:
         # The prior cache is PRESERVED (not dropped) so apps don't vanish, and
         # the failure is surfaced instead of being reported as a sync.
         assert index_path.is_file()
-        assert _read_external_registry_cache("acme", ignore_ttl=True) == [
+        assert _read_external_registry_cache(cache_key, ignore_ttl=True) == [
             {"name": "cool-app", "repo": "R", "branch": "main"}
         ]
         assert result["ok"] is False
@@ -1273,7 +1283,9 @@ class TestRefreshRegistries:
         assert result["ok"] is True
         assert result["refreshed"] == ["acme"]
         # Only the well-formed object entry was cached.
-        cached = _read_external_registry_cache("acme", ignore_ttl=True)
+        cached = _read_external_registry_cache(
+            _external_registry_cache_identity(mock_reg), ignore_ttl=True
+        )
         assert cached == [
             {
                 "name": "good",
@@ -1323,7 +1335,9 @@ class TestRefreshRegistries:
         result = await refresh_registries()
 
         assert result["ok"] is True
-        cached = _read_external_registry_cache("acme", ignore_ttl=True)
+        cached = _read_external_registry_cache(
+            _external_registry_cache_identity(mock_reg), ignore_ttl=True
+        )
         # Only the single kebab-case-valid entry survived; every unsafe name
         # was dropped before it could be cached or listed.
         assert [e["name"] for e in cached] == ["good-app"]
@@ -1362,8 +1376,22 @@ class TestRefreshRegistries:
 
         cache_root = _reg._manifest_cache_dir().resolve()
         for hostile in ("../../config", "../../../etc/passwd", "a/b/c", "..%2F..%2Fconfig"):
-            resolved = _manifest_cache_path(hostile).resolve()
+            resolved = _manifest_cache_path({"name": hostile}).resolve()
             assert cache_root in resolved.parents, f"{hostile!r} escaped to {resolved}"
+
+    def test_manifest_cache_identity_is_scoped_to_source_coordinates(self, cache_dir):
+        # main vs dev of the same repo, and same-name apps from two different
+        # repos, must each get a DISTINCT cache identity: a name-only key
+        # would let a dev listing reuse main's cached metadata.
+        base = {"name": "cool-app", "repo": "https://github.com/acme/apps", "branch": "main"}
+        dev = dict(base, branch="dev")
+        other_repo = dict(base, repo="https://github.com/rival/apps")
+        paths = {
+            _manifest_cache_path(base),
+            _manifest_cache_path(dev),
+            _manifest_cache_path(other_repo),
+        }
+        assert len(paths) == 3
 
     def test_safe_cache_stem_preserves_plain_names(self):
         # Plain names stay byte-identical (no hash suffix) so caches persist.
@@ -1376,14 +1404,14 @@ class TestRefreshRegistries:
 
 
 # ---------------------------------------------------------------------------
-# Clone-URL resolution for the blob proxy is no longer a standalone resolver.
+# Clone-URL resolution for the blob proxy is not a standalone resolver.
 # ``handle_blob_proxy`` resolves the clone URL once (from the decided entry via
 # ``_entry_git_url`` for a bundled entry, or by an inline in-memory URL-form
 # check on the already-validated ``repo`` for the no-entry external/federated
 # branch) and threads it into ``_fetch_git_blob``; there is no
 # ``routes._registry_git_url`` helper to unit-test in isolation.  The URL-form /
-# no-bundled-entry resolution boundary this section used to cover is now
-# exercised through the handler in test_apps_routes_coverage.py.
+# no-bundled-entry resolution boundary is exercised through the handler in
+# test_apps_routes_coverage.py, not in this section.
 # ---------------------------------------------------------------------------
 
 
@@ -2023,7 +2051,7 @@ class TestSameRepoCredentialCarveOut:
 
 
 # ---------------------------------------------------------------------------
-# Operator-configured registry branch overrides per-app declarations (#3330)
+# Operator-configured registry branch overrides per-app declarations
 # ---------------------------------------------------------------------------
 
 
@@ -2052,7 +2080,9 @@ class TestConfiguredBranchOverride:
             entries = await reg._fetch_and_cache_external_registry(_Reg())
         assert entries[0]["branch"] == "develop"
         # The cached copy carries the override too — install reads the cache.
-        cached = reg._read_external_registry_cache("acme", ignore_ttl=True)
+        cached = reg._read_external_registry_cache(
+            reg._external_registry_cache_identity(_Reg()), ignore_ttl=True
+        )
         assert cached[0]["branch"] == "develop"
         # The divergence is logged, naming both branches and the entry.
         divergence_logs = [r for r in caplog.records if "declares branch" in r.getMessage()]
@@ -2170,8 +2200,11 @@ class TestConfiguredBranchOverride:
 
         import kiro_crew.apps.registry as reg
 
+        configured_reg = SimpleNamespace(
+            name="acme", repo="https://github.com/acme/apps", branch="develop"
+        )
         reg._write_external_registry_cache(
-            "acme",
+            reg._external_registry_cache_identity(configured_reg),
             [
                 {
                     "name": "legacy-app",
@@ -2183,9 +2216,7 @@ class TestConfiguredBranchOverride:
             ],
         )
         mock_config = MagicMock()
-        mock_config.registries = [
-            SimpleNamespace(name="acme", repo="https://github.com/acme/apps", branch="develop")
-        ]
+        mock_config.registries = [configured_reg]
         monkeypatch.setattr(
             "kiro_crew.apps.registry._load_registry_file",
             lambda: [],
@@ -2339,7 +2370,7 @@ def _real_argv(captured_argv):
 
     ``create_subprocess_limited`` runs commands through the post-exec shim
     (``python -I -S -c <shim> --rlimits=… -- <real argv>``), so a captured
-    spawn no longer starts with the command itself. Return the argv after the
+    spawn does not start with the command itself. Return the argv after the
     ``--`` separator, with argv[0] reduced to its basename (git resolves to an
     absolute path, and to ``git.EXE`` on Windows).
     """
@@ -3181,9 +3212,9 @@ class TestOriginMismatchDeleteOrder:
 class TestUnreadableOriginAbort:
     """Regression: unreadable origin must NOT enter destructive move-aside path.
 
-    GPT 5.6 finding: a checkout with a corrupt .git/config or missing remote
-    previously entered the move-aside → re-clone → delete path, permanently
-    losing local edits even though the checkout might be the right repo.
+    A checkout with a corrupt .git/config or missing remote enters the
+    move-aside → re-clone → delete path, permanently losing local edits even
+    though the checkout might be the right repo.
     """
 
     @pytest.mark.asyncio
@@ -3860,6 +3891,7 @@ class TestInstallScriptFailurePreservesStaleCheckout:
             name = "testapp"
             message = "installed"
             error = None
+            notice = ""
 
         with (
             patch(
@@ -3893,6 +3925,67 @@ class TestInstallScriptFailurePreservesStaleCheckout:
             pkg_dir / "replacement.txt"
         ).exists(), "a durable success must keep the tree it installed"
         assert stale_dir.exists(), "the old checkout is retained beside it, not restored"
+
+    @pytest.mark.asyncio
+    async def test_self_managed_install_propagates_reconsent_notice(self, tmp_path):
+        from kiro_crew.apps.registry import install_from_registry
+
+        pkg_dir = tmp_path / "testapp"
+        pkg_dir.mkdir()
+        (pkg_dir / "app.json").write_text(
+            json.dumps(
+                {
+                    "name": "testapp",
+                    "version": "1.0.0",
+                    "resources": "app",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        async def _fake_clone_build(git_url, app_name, log_lines, branch="main", **kwargs):
+            return {"ok": True, "pkg_dir": pkg_dir}
+
+        registration = SimpleNamespace(
+            ok=True,
+            notice="session_approval_reconsent",
+        )
+        with (
+            patch(
+                "kiro_crew.apps.registry.get_registry_app",
+                return_value={
+                    "repo": "https://example.com/app.git",
+                    "branch": "main",
+                    "resources": "app",
+                },
+            ),
+            patch(
+                "kiro_crew.apps.registry._entry_git_url",
+                return_value="https://example.com/app.git",
+            ),
+            patch("kiro_crew.apps.registry._clone_build_app", new=_fake_clone_build),
+            patch("kiro_crew.apps.registry.app_admission_denied", return_value=None),
+            patch("kiro_crew.apps.registry.app_execution_denied", return_value=None),
+            patch(
+                "kiro_crew.apps.registry._fetch_app_manifest",
+                new=AsyncMock(return_value=None),
+            ),
+            patch(
+                "kiro_crew.apps.manager.register_external_app",
+                return_value=registration,
+            ),
+            patch("kiro_crew.apps.registry.set_app_provenance"),
+            patch("kiro_crew.apps.registry.is_clone_host_trusted", return_value=True),
+            patch(
+                "kiro_crew.apps.registry._sweep_stale_checkouts",
+                new=AsyncMock(),
+            ),
+            patch("kiro_crew.apps.registry.sel"),
+        ):
+            result = await install_from_registry("testapp")
+
+        assert result["ok"] is True
+        assert result["notice"] == "session_approval_reconsent"
 
     @pytest.mark.asyncio
     async def test_stale_not_cleaned_when_install_from_registry_fails(self, tmp_path):
@@ -5042,10 +5135,9 @@ class TestAdmissionGatePreBuildRestoreFromRespectsRestorableStale:
 class TestSuccessPathRetainsStaleCheckout:
     """Regression: install success must NOT delete moved-aside checkouts.
 
-    GPT 5.6 round 6 finding: a successful source replacement permanently
-    deletes the .stale-* dir, losing user's local edits even when the
-    install SUCCEEDED.  After the fix, the stale dir is retained and its
-    path is surfaced in the install log.
+    A successful source replacement must not permanently delete the .stale-*
+    dir and lose the user's local edits when the install SUCCEEDED; the stale
+    dir is retained and its path is surfaced in the install log.
     """
 
     @pytest.mark.asyncio
@@ -5131,8 +5223,7 @@ class TestRetainedAtReportingSkipsRestorableStale:
     restores it after `_report_retained_stale_checkouts` runs, so naming its
     (now-deleted) `.stale-*` path in the log is misleading recovery guidance.
 
-    Opus 4.8 finding (round 3), converged on by Design Review and First
-    Principles: a branch-mismatch move-aside is the SAME repository as the
+    A branch-mismatch move-aside is the SAME repository as the
     active checkout (origin already verified identical), so it is marked
     restorable and the `finally` puts it back on a post-build failure. An
     origin-mismatch move-aside is a DIFFERENT repository and is never
@@ -6059,7 +6150,8 @@ class TestCloneFailureDiagnostics:
         assert err["ok"] is False
         # Bare honest failure with NO credential-posture hint (the clone kept the
         # ambient identity, so the hint would be wrong). The body still carries
-        # the machine-readable `code` (AGENTS.md non-2xx invariant) — a bare slug
+        # the machine-readable `code` (the non-2xx invariant in
+        # docs/system-specs/common/code-style.md) — a bare slug
         # `git_clone_failed`, distinct from the credential-posture
         # `git_clone_failed_no_credentials`; the `error` sentence stays bare.
         assert err["error"] == "git clone failed"
@@ -6375,7 +6467,7 @@ class TestOriginMismatchLogsBeforeMoveAside:
 
 
 class TestInstallFailureReportsStaleCheckout:
-    """Regression (GPT 5.6 round 2): every non-ok exit AFTER a successful
+    """Every non-ok exit AFTER a successful
     clone+build that carries ``_pending_stale_cleanup`` must report the
     retained checkout path — never strand a .stale-* silently.
     """
@@ -6711,7 +6803,7 @@ class TestInstallFailureReportsStaleCheckout:
 
 
 class TestRefusalExitsReportRetainedStale:
-    """Regression (GPT 5.6 round 8): a refusal that leaves a non-restorable
+    """A refusal that leaves a non-restorable
     (origin-mismatch) checkout moved aside must REPORT the retained ``.stale-*``
     path, not strand it silently until the age-based sweep deletes it.
 
@@ -6939,7 +7031,7 @@ class TestRefusalExitsReportRetainedStale:
 
 
 class TestCloneBuildStampsPendingOnRefusal:
-    """Regression (GPT 5.6 round 8): ``_clone_build_app`` must stamp
+    """``_clone_build_app`` must stamp
     ``_pending_stale_cleanup`` onto a REFUSAL dict, not only the ok path — the
     single-exit invariant that keeps a new exit from silently dropping the
     move-aside state the caller's reporter needs.
@@ -7008,7 +7100,7 @@ class TestCloneBuildStampsPendingOnRefusal:
 
 
 class TestCloneBuildExceptionPathReportsRetainedStale:
-    """Regression (GPT 5.6 round 9, registry.py:~4005): when ``_clone_build_app``
+    """When ``_clone_build_app``
     raises AFTER an origin-mismatch move-aside, its ``except BaseException``
     handler must NAME each retained non-restorable ``.stale-*`` path (the same
     "Previous checkout retained at:" wording the finally-owned reporter uses)
@@ -7146,8 +7238,7 @@ class TestCloneBuildExceptionPathReportsRetainedStale:
 
 
 class TestProvenanceRaiseAfterDurableSuccessReportsRetainedStale:
-    """Regression (GPT 5.6 round 9, registry.py:~5418 / the consolidated
-    finally-owned reporter): a durable-success install whose provenance write
+    """A durable-success install whose provenance write
     then RAISES must still NAME the retained restorable stale in the outcome log
     and leave it on disk (never restored — the install durably succeeded).
 
@@ -7230,7 +7321,7 @@ class TestProvenanceRaiseAfterDurableSuccessReportsRetainedStale:
 
 
 class TestFinallyOwnedReporterIsTheSoleSite:
-    """Grep-pin (Design + First Principles round 9): retained-stale reporting is
+    """Grep-pin: retained-stale reporting is
     owned by exactly ONE site — the ``finally`` of ``install_from_registry``,
     with ``filter_restorable=not durable_success``. The 12 per-exit calls this
     consolidation deleted were the scattered-per-exit stranding class; a new exit
@@ -7256,10 +7347,10 @@ class TestFinallyOwnedReporterIsTheSoleSite:
 
 
 class TestRefusalOutcomeCarriesNoInternalTransactionKeys:
-    """Regression (GPT 5.6 round 10, registry.py:~4925): a build-refusal exit
+    """A build-refusal exit
     does ``outcome = {**build_result}``, so the internal move-aside bookkeeping
     keys ``_pending_stale_cleanup`` / ``_restorable_stale`` (each ``list[Path]``)
-    used to ride out of ``install_from_registry`` on the returned dict. ``Path``
+    would ride out of ``install_from_registry`` on the returned dict. ``Path``
     is not JSON-serializable, so the API/SSE layer raised ``TypeError`` when it
     serialized the refusal.
 
@@ -7931,7 +8022,7 @@ class TestBuildFailureRestoreRespectsRestorableStale:
         assert "previous checkout restored" in joined, (
             "a restored aside keeps the existing restore log line"
         )
-        # A restored aside is dropped from pending_cleanup (no longer retained).
+        # A restored aside is dropped from pending_cleanup (not retained).
         assert stale_dir not in (result.get("_pending_stale_cleanup") or [])
 
     @pytest.mark.asyncio
@@ -7991,7 +8082,7 @@ class TestMoveAsideUndoFailureReportsRetainedPath:
     rather than left for the age-based sweep to delete an unreported recovery
     copy.
 
-    Round 14 moved the mtime refresh BEFORE the rename (so the moved-aside dir
+    The mtime refresh happens BEFORE the rename (so the moved-aside dir
     never appears under its sweepable name with a stale clock), which means a
     ``utime`` failure now fails closed while ``dest`` is still at its original
     path — there is no rename to undo, nothing is stranded, and the honest
@@ -8071,7 +8162,7 @@ class TestMoveAsideUndoFailureReportsRetainedPath:
 
 
 # ---------------------------------------------------------------------------
-# Clone-failure diagnostics honesty (PR 4939 follow-up).
+# Clone-failure diagnostics honesty.
 #   Finding 1: the index-originated credential-posture hint must only fire when
 #   git's output is auth-shaped (or ambiguously so); a DNS blip or typo'd
 #   branch must NOT be told to restructure repositories, and no raw
@@ -8195,8 +8286,9 @@ class TestIndexOriginatedCloneFailureHintIsGated:
         # non-2xx-body-carries-code: the bare fallback is the only failure shape
         # on this path that once returned no `code`; a machine keys on `code`
         # while the frontend renders `error` verbatim, so the slug must be
-        # present even when no failure class is recognized (AGENTS.md non-2xx
-        # invariant). Regression pin: this assertion fails at the pre-fix tree.
+        # present even when no failure class is recognized (the non-2xx invariant
+        # in docs/system-specs/common/code-style.md). Regression pin: this
+        # assertion fails at the pre-fix tree.
         assert result["code"] == "git_clone_failed"
 
     @pytest.mark.asyncio

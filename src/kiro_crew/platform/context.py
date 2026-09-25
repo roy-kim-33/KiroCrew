@@ -18,6 +18,7 @@ See ``docs/system-specs/modules/platform-context.md``.
 from __future__ import annotations
 
 import logging
+import re
 import threading
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Optional, Tuple, TypeVar
@@ -39,6 +40,7 @@ if TYPE_CHECKING:  # avoid import cycles — config.loader imports heavy modules
         EmbeddingSource,
         ExternalAccessPolicy,
         FeatureApp,
+        GatewayLifecycleProvider,
         IdentityProvider,
         ImportSourceProvider,
         JailProvider,
@@ -49,6 +51,7 @@ if TYPE_CHECKING:  # avoid import cycles — config.loader imports heavy modules
         PromptSourceProvider,
         ProviderRegistry,
         PublishRegistry,
+        RemoteProvisionerProvider,
         SandboxPolicy,
         SkillDiscoveryProvider,
         SlackEnterpriseGate,
@@ -282,6 +285,7 @@ class PlatformContext:
     # is [RESERVED] — see RESERVED_METHODS.
     agent_runtime: "AgentRuntime"
     agent_executable: "AgentExecutableResolver"
+    gateway_lifecycle: "GatewayLifecycleProvider"
     sandbox: "SandboxPolicy"
     credentials: "CredentialPolicy"
     security: "PolicyAuthority"
@@ -322,6 +326,10 @@ class PlatformContext:
     dashboard: "DashboardContributor"
     jail: "JailProvider"
     mobile_connect: "MobileConnectProvider"
+    # Remote-instance provisioners the Set-up tab offers (the built-in EC2 lane
+    # plus whatever the edition adds), each backed by a ``LaunchEngine`` the
+    # core's launch job drives. v1 addition (no CONTRACT_VERSION bump).
+    remote_provisioners: "RemoteProvisionerProvider"
 
     # ── bundled feature apps ──
     feature_apps: "Tuple[FeatureApp, ...]"  # [RESERVED] — see RESERVED_SLOTS
@@ -402,13 +410,139 @@ _ACTIVE: Optional[PlatformContext] = None
 _GOVERNANCE_GENERATION = 0
 _GENERATION_LOCK = threading.Lock()
 
+# Callbacks run on every DECLARED install of ``_ACTIVE`` (every one except the silent
+# lazy default -- see ``register_ceiling_install_hook``), so a consumer that must
+# re-derive something from the new ceiling is PUSHED the change instead of polling.
+#
+# The alternative — every consumer re-reading governance behind a TTL cache — was
+# tried for the ``approval_modes`` YOLO verdict and is what this registry replaces:
+# a cache needs a freshness key, a three-state "not resolved under this ceiling yet"
+# verdict, and an off-loop refresh, and each of those carries its own window in
+# which a stale answer is served. An install is a discrete event, so a consumer told
+# about it holds an answer that is either current or does not exist.
+#
+# A registry rather than a direct import because the consumers sit ABOVE this module
+# (``safety_override`` already imports from here), so calling into them by name would
+# be a cycle. Each registers itself at its own import.
+_CEILING_INSTALL_HOOKS: "list[Callable[[Optional[PlatformContext]], None]]" = []
+# Run BEFORE ``_ACTIVE`` is reassigned, so a consumer can invalidate what it derived
+# from the OUTGOING ceiling while the incoming one is not yet visible.
+#
+# Publishing first and invalidating after leaves a window whose width is a full
+# governance resolution: the new ceiling is live, the derived answer still belongs to
+# the retired one, and a concurrent authorization read is decided by the stale answer.
+# For an authorization consumer that window is a bypass, so invalidation cannot be the
+# second half of the install -- it has to be the first.
+_CEILING_INVALIDATE_HOOKS: "list[Callable[[], None]]" = []
+_HOOKS_LOCK = threading.Lock()
 
-def _install(ctx: Optional[PlatformContext]) -> None:
-    """Assign ``_ACTIVE`` and bump the generation.  The single writer."""
+
+def register_ceiling_install_hook(cb: "Callable[[Optional[PlatformContext]], None]") -> None:
+    """Call ``cb(ctx)`` after every DECLARED install of the active context.
+
+    ``ctx`` is the context just installed, or ``None`` for :func:`reset_context` —
+    a hook that caches something ceiling-derived should treat ``None`` as "there is
+    no ceiling to derive from" rather than as a ceiling that permits everything.
+
+    "Declared" excludes ONE install: the lazy default :func:`current_context` composes
+    when nothing was installed. That one is reached from inside a governance read (the
+    profile store resolves the active context to build its freshness key), so a hook
+    that reads governance would call back into a store that is mid-load and be handed
+    its fail-closed "not loaded" answer -- a verdict about nothing. It also needs no
+    hook: a consumer cannot be holding anything derived from a ceiling before the first
+    derivation happens, and that first derivation is what triggers the lazy install.
+
+    Idempotent per callable, so a module imported twice under different names does
+    not get its hook run twice. Registration does NOT replay the install that may
+    already have happened: a hook that needs to cope with being registered late must
+    say so itself (see ``safety_override.yolo_policy_permits``), because resolving
+    governance from inside an import is how import cycles are born.
+    """
+    with _HOOKS_LOCK:
+        if cb not in _CEILING_INSTALL_HOOKS:
+            _CEILING_INSTALL_HOOKS.append(cb)
+
+
+def register_ceiling_invalidate_hook(cb: "Callable[[], None]") -> None:
+    """Call ``cb()`` just BEFORE a declared install replaces the active context.
+
+    For a consumer whose derived value is an AUTHORIZATION answer. ``cb`` must make
+    that value fail closed and must do no I/O and take no lock a reader might hold:
+    it runs on the install path, ahead of the new ceiling becoming visible, and the
+    matching install hook writes the real answer immediately afterwards. It is told
+    nothing about the incoming ceiling on purpose -- its only job is to stop serving
+    the outgoing one.
+
+    Paired with :func:`register_ceiling_install_hook` and skipped on exactly the same
+    one install (the lazy default), so a consumer registering both is masked and
+    re-resolved as a unit.
+    """
+    with _HOOKS_LOCK:
+        if cb not in _CEILING_INVALIDATE_HOOKS:
+            _CEILING_INVALIDATE_HOOKS.append(cb)
+
+
+def _notify_ceiling_invalidating() -> None:
+    """Run the pre-publication invalidate hooks. Never raises.
+
+    A hook that raises must not stop the install, and it cannot leave a consumer
+    fail-OPEN either: the hooks here only ever withdraw a derived permission, so a
+    failure at worst leaves the previous answer in place -- which is the same state
+    publishing-then-invalidating had, and the install hook still corrects it.
+    """
+    with _HOOKS_LOCK:
+        hooks = list(_CEILING_INVALIDATE_HOOKS)
+    for cb in hooks:
+        try:
+            cb()
+        except Exception:
+            _logger.debug("ceiling invalidate hook %r failed", cb, exc_info=True)
+
+
+def _notify_ceiling_installed(ctx: Optional[PlatformContext]) -> None:
+    """Run the install hooks. Called with NO lock held, and never raises.
+
+    Outside ``_GENERATION_LOCK`` deliberately: a hook resolves governance, which
+    reads :func:`governance_generation` through ``ProfileStore``'s freshness key —
+    and that takes the same non-reentrant lock, so calling a hook while holding it
+    deadlocks the install. A hook that raises must not take the install down with
+    it either: the context IS installed by the time these run, so a failed hook
+    leaves a stale derived value, not a half-installed ceiling.
+    """
+    with _HOOKS_LOCK:
+        hooks = list(_CEILING_INSTALL_HOOKS)
+    for cb in hooks:
+        try:
+            cb(ctx)
+        except Exception:
+            _logger.debug("ceiling install hook %r failed", cb, exc_info=True)
+
+
+def _install(ctx: Optional[PlatformContext], *, notify: bool = True) -> None:
+    """Assign ``_ACTIVE``, bump the generation, then push to the hooks.
+
+    The single writer of ``_ACTIVE``, which is what makes the hooks complete: every
+    declared install -- boot, ``policy_distribution.apply_ceiling``, the test reset --
+    goes through here, so no install site can forget to announce itself.
+
+    Three phases, and the ORDER is the point. Invalidation runs first, so no consumer
+    serves an answer derived from the outgoing ceiling once the incoming one is live;
+    then the context is published; then the install hooks resolve the real answer
+    against it. Publishing before invalidating leaves a governance-resolution-wide
+    window in which the new ceiling is in force and the old answer is still being
+    handed out -- for an authorization answer, a bypass.
+
+    ``notify=False`` is for the lazy default alone; see
+    :func:`register_ceiling_install_hook` for why that one install is silent.
+    """
     global _ACTIVE, _GOVERNANCE_GENERATION
+    if notify:
+        _notify_ceiling_invalidating()
     with _GENERATION_LOCK:
         _ACTIVE = ctx
         _GOVERNANCE_GENERATION += 1
+    if notify:
+        _notify_ceiling_installed(ctx)
 
 
 def governance_generation() -> int:
@@ -466,7 +600,7 @@ def set_context(ctx: PlatformContext) -> None:
 # must contain the phrase ``no-context answer`` so the justification is greppable
 # and cannot dodge the question it exists to answer.
 PEEK_CALLERS: "dict[str, str]" = {
-    "security.py::_exempt_exact_hosts": (
+    "security/exfil.py::_exempt_exact_hosts": (
         "no-context answer is the empty exempt-host set, which means MORE "
         "redaction: every host runs the base64-blob / query-length heuristics. "
         "The lookup can only ever RELAX those heuristics, never the hard-"
@@ -564,8 +698,12 @@ def current_context() -> PlatformContext:
                 "open-source defaults (fail-closed). Boot did not run or failed "
                 "to compose the companion."
             )
+        # Silent: this runs INSIDE a governance read (the profile store resolves the
+        # active context for its freshness key), so notifying here would re-enter a
+        # store that is mid-load. Nothing needs it -- see
+        # ``register_ceiling_install_hook``.
         ctx = build_default_context(cfg, profile=PROFILE_STANDALONE)
-        _install(ctx)
+        _install(ctx, notify=False)
         # Return the value just built rather than re-reading the global: the read
         # would need a narrowing cast, and another thread could have installed a
         # different context between the install and the read.
@@ -738,6 +876,106 @@ def redact_via_context(text: str) -> str:
         from kiro_crew.security import redact as _security_redact
 
         return _security_redact(text)
+
+
+#: Wide-encoding projections :func:`binary_content_is_flagged` scans beside its
+#: ``latin-1`` pass, each as ``(pattern, offset, stride)``.
+#:
+#: A credential written as UTF-16 or UTF-32 inside an allow-listed container --
+#: an ID3v2 UTF-16 tag in ``audio/mpeg``, a UTF-16BE string in
+#: ``application/pdf`` -- carries NUL bytes between its characters, so a
+#: single-byte projection reads ``K\x00E\x00Y`` and no detector matches. Each
+#: pattern finds a run of printable ASCII at one encoding's spacing and the
+#: stride lifts those characters back out; both byte orders and both widths are
+#: covered, and a run at any alignment falls inside one of them.
+#:
+#: Matching a RUN, rather than striding the whole buffer, is what keeps this from
+#: handing the detectors a second stream of high-entropy bytes: random binary
+#: almost never holds a long alternating-NUL sequence, so a media file with no
+#: wide text in it contributes nothing to scan and pays only the search.
+_WIDE_PROJECTIONS: Tuple[Tuple["re.Pattern[bytes]", int, int], ...] = (
+    (re.compile(rb"(?:[\x09\x0a\x0d\x20-\x7e]\x00){8,}"), 0, 2),
+    (re.compile(rb"(?:\x00[\x09\x0a\x0d\x20-\x7e]){8,}"), 1, 2),
+    (re.compile(rb"(?:[\x09\x0a\x0d\x20-\x7e]\x00\x00\x00){8,}"), 0, 4),
+    (re.compile(rb"(?:\x00\x00\x00[\x09\x0a\x0d\x20-\x7e]){8,}"), 3, 4),
+)
+
+
+def wide_content_is_flagged(raw: bytes) -> bool:
+    """Whether *raw* carries credential material written at UTF-16/UTF-32 spacing.
+
+    Every file-delivery gate runs this over every buffer it decides on, and it is
+    deliberately behind neither a UTF-8 decode failure nor a MIME check. Both
+    conditions are unsound gates for it: NUL-interleaved ASCII is itself valid
+    UTF-8, so a buffer holding ``K\\x00E\\x00Y`` decodes cleanly and takes the
+    text branch, where the detectors match contiguous ASCII and so match nothing;
+    and a file needs no media extension to hold wide text, so a MIME allow-list
+    does not bound which buffers can carry it.
+
+    Cheap on a buffer that holds no wide text: :data:`_WIDE_PROJECTIONS` searches
+    for a RUN of printable ASCII at each encoding's spacing, and with no run found
+    this returns before any detector runs. Ordinary text and ordinary media both
+    take that path. Searching for runs rather than striding the whole buffer is
+    also what keeps the detectors from being handed a second stream of
+    high-entropy bytes, which would widen the false-positive surface.
+
+    Synchronous, like :func:`binary_content_is_flagged`: an async gate calls it
+    through ``asyncio.to_thread`` rather than on the event loop.
+    """
+    lifted = [
+        match.group()[offset::stride]
+        for pattern, offset, stride in _WIDE_PROJECTIONS
+        for match in pattern.finditer(raw)
+    ]
+    if not lifted:
+        return False
+    wide = b"\n".join(lifted).decode("latin-1")
+    return redact_via_context(wide) != wide
+
+
+def binary_content_is_flagged(raw: bytes) -> bool:
+    """Whether non-UTF-8 *raw* carries credential material the scanner finds.
+
+    The ONE binary-content scan for every file-delivery gate. A credential can
+    sit inside an allow-listed media type -- base64 key material in a PDF, an
+    exported token in image metadata -- and a UTF-8 decode raises before the text
+    pass ever runs, so those bytes need a pass of their own. ``latin-1`` is the
+    decode used because it is total: every byte maps to a code point, so no input
+    can escape the scan by failing to decode.
+
+    Totality is not enough on its own, because a single-byte projection reads a
+    wide-encoded credential as characters separated by NUL and matches nothing.
+    :func:`wide_content_is_flagged` covers that, and every gate calls it on its
+    text branch too: a buffer whose bytes ARE valid UTF-8 never reaches here, and
+    NUL-interleaved ASCII is valid UTF-8, so the wide pass cannot live behind this
+    function's decode-failure entry condition alone.
+
+    Four gates guard the ``file_send`` delivery path -- the MCP tool before any
+    byte is copied, ``POST /api/outbox/notify``, ``GET /api/outbox/{filename}``,
+    and the ``_gate_upload_file`` shared by the Slack and channel upload legs. All
+    four must agree on what counts as flagged content, for two different reasons.
+    The three owner-facing gates each read the one durable grant
+    :mod:`kiro_crew.file_delivery_consent` records, so a disagreement among them
+    turns that grant into "delivered, card rendered, download refused". The upload
+    legs read no grant at all and refuse regardless, so a disagreement there
+    splits one file's verdict across two delivery legs instead. Agreement is why
+    this lives here as one function rather than as the same three lines written
+    out four times.
+
+    Routed through :func:`redact_via_context`, so a loaded companion's extra
+    credential regexes apply here exactly as they do on the text path. What a
+    gate DOES with a positive answer is the gate's own decision, and differs:
+    the owner-facing three honour the owner's recorded grant, the upload legs
+    refuse unconditionally.
+
+    Synchronous, and deliberately: the scan is CPU work over up to the 50 MB read
+    cap, so an async gate must call it through ``asyncio.to_thread`` rather than
+    on the event loop.
+    """
+    text = raw.decode("latin-1")
+    if redact_via_context(text) != text:
+        return True
+    return wide_content_is_flagged(raw)
 
 
 #: Substituted for a log line's text when redaction could not be composed. Names

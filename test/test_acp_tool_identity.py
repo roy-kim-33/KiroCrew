@@ -22,6 +22,7 @@ The ``_meta.kiro`` fixture shape mirrors ``test_todo_list_surface.py``.
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -88,6 +89,7 @@ class TestBuildToolCallEventIdentity:
         assert event.kind == EVENT_TOOL_CALL
         assert event.tool_name == "monitor_start"
         assert event.mcp_server_name == "kirocrew-core"
+        assert event.tool_identity_trusted is True
         # This builder populates the identity pair exclusively from _meta.kiro
         # (non-model-authored), so it earns the explicit provenance flag.
         assert event.mcp_identity_trusted is True
@@ -114,6 +116,7 @@ class TestBuildToolCallEventIdentity:
         event = _build_tool_call_event(shell_update, None)
         assert event.tool_name == ""
         assert event.mcp_server_name == ""
+        assert event.tool_identity_trusted is False
         # No _meta.kiro → nothing was populated, so no provenance is asserted.
         assert event.mcp_identity_trusted is False
         # is_shell must still be derived from the kind (unrelated to identity).
@@ -161,6 +164,7 @@ class TestClientToolCallEventIdentityProvenance:
         assert event is not None
         assert event.tool_name == "monitor_start"
         assert event.mcp_server_name == "kirocrew-core"
+        assert event.tool_identity_trusted is True
         assert event.mcp_identity_trusted is True
         # Counterfactual: a frame with no _meta.kiro populates nothing, so the
         # builder asserts no provenance.
@@ -180,6 +184,7 @@ class TestClientToolCallEventIdentityProvenance:
         assert event_no_meta is not None
         assert event_no_meta.tool_name == ""
         assert event_no_meta.mcp_server_name == ""
+        assert event_no_meta.tool_identity_trusted is False
         assert event_no_meta.mcp_identity_trusted is False
 
 
@@ -213,8 +218,9 @@ async def _drive(
     monkeypatch,
     *,
     directive_user_origin: bool = True,
+    applied_result: str | None = "[applied]",
 ):
-    """Stream *events* through _run_chat; return the apply_session_directive spy."""
+    """Stream *events* through _run_chat; optionally stub the directive applier."""
     from kiro_crew.dashboard import chat_runner
 
     async def _stream(_msg):
@@ -228,8 +234,10 @@ async def _drive(
     client.client = None
     state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
 
-    spy = AsyncMock(return_value="[applied]")
-    monkeypatch.setattr(chat_runner, "apply_session_directive", spy)
+    spy = None
+    if applied_result is not None:
+        spy = AsyncMock(return_value=applied_result)
+        monkeypatch.setattr(chat_runner, "apply_session_directive", spy)
 
     await chat_runner._run_chat(
         state,
@@ -292,9 +300,7 @@ class TestProviderConversionPreservesIdentity:
         )
         out = AcpProvider._to_llm_event(src)
         dropped = [
-            f.name
-            for f in dataclasses.fields(src)
-            if getattr(src, f.name) != getattr(out, f.name)
+            f.name for f in dataclasses.fields(src) if getattr(src, f.name) != getattr(out, f.name)
         ]
         assert not dropped, f"_to_llm_event dropped fields: {dropped}"
 
@@ -339,9 +345,71 @@ class TestChatRunnerDirectiveSeam:
         assert call.kwargs["producer_is_user_facing"] is True
 
     @pytest.mark.asyncio
-    async def test_automation_provenance_reaches_directive_applier(
-        self, tmp_path, monkeypatch
-    ):
+    async def test_successful_question_card_ends_turn_without_recovery(self, tmp_path, monkeypatch):
+        """A delivered non-blocking question card is the turn's terminal output.
+
+        The tool explicitly tells the model to end with no assistant text. Treating
+        that shape like a generic tool-only turn injects a continuation, which asks
+        the model to finish the same request and can post the same card repeatedly.
+        """
+        from kiro_crew.dashboard import chat_runner
+
+        state = _stub_state(tmp_path)
+        state.post_question_card = AsyncMock(return_value=1)
+        slot = state.get_or_create_slot("question-terminal")
+        slot._titled = True
+        questions = [
+            {
+                "question": "Choose one",
+                "options": [{"label": "Option A"}, {"label": "Option B"}],
+            }
+        ]
+        marker = session_directive.encode(
+            "ask_question", {"questions": questions}, "Question card requested."
+        )
+        events = [
+            AcpEvent(
+                kind=EVENT_TOOL_CALL,
+                tool_call_id="tc-question",
+                title="Ask the user",
+                tool_name="ask_question",
+                mcp_server_name="kirocrew-core",
+            ),
+            AcpEvent(
+                kind=EVENT_TOOL_RESULT,
+                tool_call_id="tc-question",
+                tool_output=marker,
+                tool_final=True,
+            ),
+            AcpEvent(kind=EVENT_COMPLETE),
+        ]
+        queue_calls = []
+        queue_insert = type(slot).queue_insert
+
+        def _record_queue(self_slot, *args, **kwargs):
+            queue_calls.append((args, kwargs))
+            return queue_insert(self_slot, *args, **kwargs)
+
+        monkeypatch.setattr(type(slot), "queue_insert", _record_queue)
+        monkeypatch.setattr(chat_runner, "_start_next_queued_turn", AsyncMock(return_value=False))
+
+        try:
+            await _drive(state, slot, events, monkeypatch, applied_result=None)
+        finally:
+            tasks = list(state._background_tasks)
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+        state.post_question_card.assert_awaited_once_with(slot.key, questions)
+        assert queue_calls == [], "a terminal question card queued a recovery turn"
+        assert slot._empty_response_retries == 0
+        notices = [m for m in slot.messages if m.get("role") == "notice"]
+        assert not any("continu" in m.get("content", "").lower() for m in notices)
+
+    @pytest.mark.asyncio
+    async def test_automation_provenance_reaches_directive_applier(self, tmp_path, monkeypatch):
         """The turn producer survives destination-key normalization, so a cron
         turn targeting a user slot remains structurally distinguishable."""
         state = _stub_state(tmp_path)
@@ -378,9 +446,7 @@ class TestChatRunnerDirectiveSeam:
         assert spy.call_args.kwargs["producer_is_user_facing"] is False
 
     @pytest.mark.asyncio
-    async def test_queued_automation_provenance_reaches_next_turn(
-        self, tmp_path, monkeypatch
-    ):
+    async def test_queued_automation_provenance_reaches_next_turn(self, tmp_path, monkeypatch):
         """A busy app-owned request cannot become user-origin when its queue
         entry is drained after the destination slot becomes idle."""
         from kiro_crew.dashboard import chat_runner
@@ -452,9 +518,7 @@ class TestChatRunnerDirectiveSeam:
                 mcp_server_name="kirocrew-core",
             ),
             # Same tool_call_id delivered twice — the duplicate frame.
-            AcpEvent(
-                kind=EVENT_TOOL_RESULT, tool_call_id="tc-dup", tool_output=marker
-            ),
+            AcpEvent(kind=EVENT_TOOL_RESULT, tool_call_id="tc-dup", tool_output=marker),
             AcpEvent(
                 kind=EVENT_TOOL_RESULT,
                 tool_call_id="tc-dup",
@@ -611,7 +675,7 @@ class TestChatRunnerDirectiveSeam:
         self, tmp_path, monkeypatch, caplog
     ):
         """A directive tool's ARGUMENT rejection must not fire the lost-marker
-        WARNING (#8635). The tool's result is produced by really calling it, so
+        WARNING. The tool's result is produced by really calling it, so
         the test cannot drift from what the tool actually returns; the rejection
         happens in the dispatch wrapper ahead of the handler, which is why the
         refusal tag is applied at the server's outermost return.
