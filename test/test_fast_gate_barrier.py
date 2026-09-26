@@ -1,6 +1,6 @@
 """The Fast Gate barrier: what `await-fast-gate` must guarantee for the split to be safe.
 
-The eleven cheap blocking gates live in ``.github/workflows/fast-gate.yml`` so that
+The cheap blocking gates live in ``.github/workflows/fast-gate.yml`` so that
 two consumers can key on them before the expensive work starts: ci.yml's heavy jobs
 wait through ``await-fast-gate``, and the five fork reviewers trigger on the
 workflow's completion. A ``needs:`` edge cannot cross a workflow file, so that
@@ -42,18 +42,22 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 _CI = _REPO_ROOT / ".github" / "workflows" / "ci.yml"
 _FAST_GATE = _REPO_ROOT / ".github" / "workflows" / "fast-gate.yml"
 
-# The eleven gates the split moved. Named explicitly rather than derived from the
-# file, so a gate silently DROPPED during a future edit fails here.
+# The gates the split moved. Named explicitly rather than derived from the
+# file, so a gate silently DROPPED during a future edit fails here. scrub-lint is
+# gone: its replacement is the internal-content-scan check, which runs in its own
+# workflow because it needs OIDC and a private ruleset, not a repo script.
 _GATE_JOBS = (
-    "scrub-lint",
     "vendor-manifest",
     "brand-lint",
+    "comment-history-lint",
     "focus-cue-lint",
     "feature-map-lint",
     "changelog-history",
+    "decision-ledger-history",
     "builtin-skill-scope",
     "loop-bound-locks",
     "testpaths-coverage",
+    "cwd-relative-repo-reads",
     "harness-parity",
     "docs-lint",
 )
@@ -115,7 +119,7 @@ def barrier_step(ci: dict) -> dict:
 
 
 class TestTheGatesLiveInTheGateWorkflow:
-    def test_all_eleven_gates_are_in_fast_gate_and_none_left_in_ci(
+    def test_all_gates_are_in_fast_gate_and_none_left_in_ci(
         self, ci: dict, fast_gate: dict
     ) -> None:
         missing = [job for job in _GATE_JOBS if job not in fast_gate["jobs"]]
@@ -125,7 +129,7 @@ class TestTheGatesLiveInTheGateWorkflow:
         strays = [job for job in _GATE_JOBS if job in ci["jobs"]]
         assert not strays, f"gate job(s) back in ci.yml, racing the matrix again: {strays}"
 
-    @pytest.mark.parametrize("job", _GATE_JOBS)
+    @pytest.mark.parametrize("job", tuple(_workflow(_FAST_GATE)["jobs"]))
     def test_every_gate_is_unconditional(self, fast_gate: dict, job: str) -> None:
         # A `needs:` lets a failed sibling skip it and an `if:` lets a diff shape
         # dodge it. These gates are cheap precisely so that neither is needed.
@@ -143,6 +147,74 @@ class TestTheGatesLiveInTheGateWorkflow:
             "on this workflow), and a NARROWER one leaves await-fast-gate waiting for "
             "a run that never starts."
         )
+
+
+class TestFastGatePythonRuntime:
+    @staticmethod
+    def _assert_runtime(spec: dict) -> None:
+        steps = spec["steps"]
+        setups = [
+            i
+            for i, step in enumerate(steps)
+            if step.get("uses", "").startswith("actions/setup-python@")
+        ]
+        assert len(setups) == 1, "expected exactly one Python setup"
+        index = setups[0]
+        setup = steps[index]
+        assert setup["uses"] == (
+            "actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97"
+        ), "Python setup must use the pinned action"
+        assert setup.get("with", {}).get("python-version") == "3.12", "expected Python 3.12"
+        assert "if" not in setup, "Python setup must be unconditional"
+        assert "continue-on-error" not in setup, "Python setup must be blocking"
+        assert "continue-on-error" not in spec, "the runtime failure must fail the job"
+        assert index > 0 and steps[index - 1].get("uses", "").startswith(
+            "actions/checkout@"
+        ), "Python setup must follow checkout"
+        runs = [i for i, step in enumerate(steps) if "run" in step]
+        assert runs and index < min(runs), "Python setup must precede every run step"
+
+    @pytest.mark.parametrize("job", tuple(_workflow(_FAST_GATE)["jobs"]))
+    def test_every_actual_job_sets_up_python_before_running(self, fast_gate: dict, job: str):
+        self._assert_runtime(fast_gate["jobs"][job])
+
+    @pytest.mark.parametrize(
+        "defect",
+        [
+            "missing",
+            "duplicate",
+            "old-version",
+            "unpinned",
+            "late",
+            "conditional",
+            "soft-step",
+            "soft-job",
+        ],
+    )
+    def test_runtime_contract_rejects_broken_setup(self, defect: str) -> None:
+        # Fresh workflow data keeps each mutation independent of the module fixture.
+        spec = _workflow(_FAST_GATE)["jobs"]["memory-store-seam"]
+        self._assert_runtime(spec)
+        steps = spec["steps"]
+        setup = steps[1]
+        if defect == "missing":
+            steps.pop(1)
+        elif defect == "duplicate":
+            steps.insert(2, dict(setup))
+        elif defect == "old-version":
+            setup["with"]["python-version"] = "3.11"
+        elif defect == "unpinned":
+            setup["uses"] = "actions/setup-python@v7"
+        elif defect == "late":
+            steps.append(steps.pop(1))
+        elif defect == "conditional":
+            setup["if"] = "runner.environment == 'github-hosted'"
+        elif defect == "soft-step":
+            setup["continue-on-error"] = True
+        else:
+            spec["continue-on-error"] = True
+        with pytest.raises(AssertionError):
+            self._assert_runtime(spec)
 
 
 class TestTheBarrierIdentifiesTheRightRun:
@@ -417,3 +489,107 @@ class TestTheSelectorBehavesOnRealPayloadShapes:
         # The caller treats null as "keep waiting", so a jq error here would turn a
         # transient empty page into a hard failure on the first poll.
         assert self._select(barrier_step["run"], payload) is None
+
+
+class TestTheConclusionArmsBehaveOnRealConclusions:
+    """The assertions above pin the case statement's TEXT. This one runs it.
+
+    ``action_required`` is what GitHub reports for a fork run that is still awaiting
+    maintainer approval, and it arrives with ``status=completed``. An arm order or a
+    glob that swallowed it back into the terminal ``*)`` branch would put the matrix
+    back at the mercy of which of the two pending runs a maintainer approves first,
+    so the extracted arms are executed rather than only read.
+    """
+
+    _POLLING = "__barrier_would_poll_again__"
+    _STATUS = "__barrier_status__="
+
+    @staticmethod
+    def _case(script: str) -> str:
+        start = script.find('case "$conclusion" in')
+        assert start != -1, "could not locate the conclusion case statement"
+        end = script.find("esac", start)
+        assert end != -1, "the conclusion case statement lost its esac"
+        return script[start : end + len("esac")]
+
+    def _exec(self, script: str, conclusion: str, cwd: Path) -> subprocess.CompletedProcess[str]:
+        if shutil.which("sh") is None:  # pragma: no cover - CI images ship sh
+            pytest.skip("no POSIX shell available")
+        program = (
+            "set -eu\n"
+            'conclusion="$1"\n'
+            'url="https://github.com/x/actions/runs/1"\n'
+            # The raw API value at this point in the loop, so a rename is visible.
+            'status="completed"\n'
+            f"{self._case(script)}\n"
+            # Reached only when no arm exited: the loop falls through to its
+            # TOTAL_BUDGET check and sleeps for another poll. $status is what the
+            # budget-spent message below the case interpolates, so it is reported
+            # too rather than inspected as source text.
+            f'printf "%s\\n" "{self._POLLING}"\n'
+            f'printf "{self._STATUS}%s\\n" "$status"\n'
+        )
+        return subprocess.run(
+            ["sh", "-c", program, "sh", conclusion],
+            capture_output=True,
+            # The program is shell text sliced out of ci.yml at runtime, so a
+            # future arm could carry a relative-path write. Spawning in the
+            # checkout would leave that file behind; tmp_path cannot.
+            cwd=cwd,
+            **UTF8_TEXT,
+        )
+
+    def _status_after(self, script: str, conclusion: str, cwd: Path) -> str:
+        proc = self._exec(script, conclusion, cwd)
+        assert proc.returncode == 0, proc.stderr
+        line = [ln for ln in proc.stdout.splitlines() if ln.startswith(self._STATUS)]
+        assert len(line) == 1, f"the case did not report a single $status: {proc.stdout!r}"
+        return line[0][len(self._STATUS) :]
+
+    def test_a_pending_fork_approval_keeps_polling_rather_than_failing(
+        self, barrier_step: dict, tmp_path: Path
+    ) -> None:
+        proc = self._exec(barrier_step["run"], "action_required", tmp_path)
+        assert proc.returncode == 0, proc.stderr
+        assert self._POLLING in proc.stdout, (
+            "action_required left the case with a non-zero exit instead of falling "
+            "through to the TOTAL_BUDGET check, so a fork PR still loses its whole "
+            "matrix to whichever of the two pending runs is approved first"
+        )
+        assert "::error::" not in proc.stdout
+
+    def test_a_pending_fork_approval_names_the_state_it_waits_on(
+        self, barrier_step: dict, tmp_path: Path
+    ) -> None:
+        # The fail-closed message below the case interpolates $status, whose raw API
+        # value here is "completed": left alone it reports a completed run as still
+        # waiting and names no pending approval for the reader to act on. Asserted on
+        # the value the shell actually leaves behind, not on the arm's source text,
+        # so re-assigning the same "completed" back cannot satisfy it.
+        status = self._status_after(barrier_step["run"], "action_required", tmp_path)
+        assert status != "completed", (
+            "the action_required arm no longer renames $status, so the budget-spent "
+            "error reads \"still 'completed'\" about a run nobody has judged"
+        )
+        assert "approval" in status.lower(), (
+            "the renamed state does not name the pending approval, which is the one "
+            f"thing the reader has to act on: {status!r}"
+        )
+
+    def test_success_still_releases_the_matrix(self, barrier_step: dict, tmp_path: Path) -> None:
+        proc = self._exec(barrier_step["run"], "success", tmp_path)
+        assert proc.returncode == 0, proc.stderr
+        assert self._POLLING not in proc.stdout, "success no longer leaves the loop"
+
+    @pytest.mark.parametrize(
+        "conclusion",
+        ["failure", "cancelled", "timed_out", "startup_failure", "neutral", "skipped"],
+    )
+    def test_every_other_conclusion_is_still_terminal(
+        self, barrier_step: dict, conclusion: str, tmp_path: Path
+    ) -> None:
+        proc = self._exec(barrier_step["run"], conclusion, tmp_path)
+        assert proc.returncode == 1, f"{conclusion} stopped failing closed"
+        assert "::error::" in proc.stdout
+        assert self._POLLING not in proc.stdout
+        assert self._STATUS not in proc.stdout

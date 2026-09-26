@@ -8,6 +8,7 @@ POSIX-only tests are marked as such because the branches they exercise
 """
 
 import asyncio
+import gc
 import json
 import logging
 import os
@@ -16,12 +17,14 @@ import stat
 import sys
 import types
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 import kiro_crew.acp.client as acp_client
 from kiro_crew import model_registry as mr
+from kiro_crew.acp._dispatch import UNSERIALISABLE_SIBLING_VALUE
 from kiro_crew.acp.client import (
     AcpAuthRequired,
     AcpClient,
@@ -267,27 +270,37 @@ class TestDrainOversizeLine:
 
 @_POSIX_ONLY
 class TestResolveSshAuthSock:
-    def test_live_socket_is_kept(self, short_sock_dir):
-        sock_path = short_sock_dir / "live.sock"
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as srv:
-            srv.bind(str(sock_path))
+    # ``_resolve_ssh_auth_sock`` only ``stat``s the paths it is handed, so the
+    # sockets can live under ``tmp_path`` at any length. Only ``bind()`` is
+    # capped by ``sun_path`` (~104 bytes on macOS, 108 on Linux), and that cap
+    # applies to the string passed to bind, not to where the file lands -- so
+    # bind through a RELATIVE name with the CWD pinned to ``tmp_path`` and hand
+    # production the absolute path. Nothing is written outside the sandbox.
+
+    @staticmethod
+    def _bind_under(tmp_path, monkeypatch, name: str) -> socket.socket:
+        monkeypatch.chdir(tmp_path)
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            s.bind(name)
+        except OSError:
+            s.close()
+            raise
+        # The bound endpoint landed under tmp_path, not under a host root.
+        assert stat.S_ISSOCK(os.stat(tmp_path / name).st_mode)
+        return s
+
+    def test_live_socket_is_kept(self, tmp_path, monkeypatch):
+        sock_path = tmp_path / "live.sock"
+        with self._bind_under(tmp_path, monkeypatch, "live.sock"):
             env = {"SSH_AUTH_SOCK": str(sock_path)}
             _resolve_ssh_auth_sock(env)
         assert env["SSH_AUTH_SOCK"] == str(sock_path)
 
-    def test_stale_pointer_is_repaired_to_newest_socket(
-        self, tmp_path, short_sock_dir, monkeypatch
-    ):
-        # Bound endpoints must live under a short root (sun_path cap); the
-        # "gone.sock" pointer below never binds, so it can stay on tmp_path.
-        old, new = short_sock_dir / "agent.1", short_sock_dir / "agent.2"
-        socks = []
-        for path in (old, new):
-            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            s.bind(str(path))
-            socks.append(s)
+    def test_stale_pointer_is_repaired_to_newest_socket(self, tmp_path, monkeypatch):
+        old, new = tmp_path / "agent.1", tmp_path / "agent.2"
+        socks = [self._bind_under(tmp_path, monkeypatch, path.name) for path in (old, new)]
         try:
-            assert stat.S_ISSOCK(os.stat(old).st_mode)
             os.utime(old, (1_000_000, 1_000_000))
             os.utime(new, (2_000_000, 2_000_000))
             monkeypatch.setattr(
@@ -313,7 +326,10 @@ class TestResolveSshAuthSock:
         monkeypatch.setattr(acp_client, "glob", types.SimpleNamespace(glob=_fake_glob))
         env: dict[str, str] = {}
         _resolve_ssh_auth_sock(env)
-        assert seen == ["/tmp/com.apple.launchd.*/Listeners"]
+        assert seen == [
+            "/tmp/com.apple.launchd.*/Listeners",
+            "/var/run/com.apple.launchd.*/Listeners",
+        ]
         assert "SSH_AUTH_SOCK" not in env
 
     def test_windows_is_a_noop(self, monkeypatch):
@@ -410,6 +426,7 @@ class TestClientAccessors:
         client._process = _live_process()
         assert client.is_process_alive() is True
         assert client.exit_code is None
+<<<<<<< HEAD
         # A live process alone is NOT an unfinished turn: _turn_done starts SET,
         # so a client that has never run a turn reports none in flight. (Before
         # that fix, has_active_turn() read true for any freshly spawned slot and
@@ -417,6 +434,13 @@ class TestClientAccessors:
         assert client.has_unfinished_turn() is False
 
         client._turn_done.clear()  # a turn is now genuinely in flight
+=======
+        # Idle == done: a live process with no prompt sent is NOT an unfinished
+        # turn (see test_acp_turn_done_idle_init). A turn begins when the prompt
+        # entry clear()s the Event.
+        assert client.has_unfinished_turn() is False
+        client._turn_done.clear()
+>>>>>>> upstream/main
         assert client.has_unfinished_turn() is True  # turn not done + process alive
 
         client._process.returncode = 3
@@ -444,7 +468,7 @@ class TestClientAccessors:
 
         assert client._session_key == "new"
         assert client._channel_id == "C-new"
-        # Stale context must not be handed to the new chat (#2932).
+        # Stale context must not be handed to the new chat.
         assert client.last_prompt_stats.context_pct == 0.0
         assert client.last_prompt_stats.context_used_tokens == 0
         assert client.last_prompt_stats.context_window_tokens == 0
@@ -604,7 +628,8 @@ class TestResetPaths:
         # The exception was retrieved, so asyncio will not report it at GC.
         assert done.exception() is not None
 
-    def test_reset_state_unlinks_claude_settings_and_survives_pipe_errors(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_teardown_unlinks_claude_settings_and_survives_pipe_errors(self, tmp_path):
         client = _client(
             tmp_path, acp_backend=ACP_BACKEND_CLAUDE, permission_mode="bypassPermissions"
         )
@@ -621,6 +646,10 @@ class TestResetPaths:
         client._pid = None
         client._child_pids = {}
 
+        # The pair every real caller runs: the seed's removal is a disk operation
+        # (revoke the durable grant, then unlink) so it lives in the async discard,
+        # while _reset_state stays synchronous and drops the in-memory claim.
+        await client._discard_claude_settings_seed()
         client._reset_state()
 
         assert not stale.exists()  # bypassPermissions must not persist a crash
@@ -690,9 +719,9 @@ class TestEnsureReady:
         """A gate refusal is a configuration fact, so a respawn re-reads it.
 
         ``AcpToolGateUnroutable`` documents itself Non-retryable, but it subclasses
-        ``AcpError``, so the generic transport ladder used to retry it: attempt 0
-        tore the child down, respawned, hit the identical refusal, and only then
-        raised. That is one wasted spawn plus teardown, and it spends the reconnect
+        ``AcpError``, so the generic transport ladder would retry it: attempt 0
+        tears the child down, respawns, hits the identical refusal, and only then
+        raises. That is one wasted spawn plus teardown, and it spends the reconnect
         budget the distinct type exists to protect.
 
         Revert-verified: dropping the dedicated handler makes both counters 2.
@@ -748,6 +777,47 @@ class TestEnsureReady:
 
         with pytest.raises(AcpToolGateUnroutable, match="no sandbox backend"):
             acp_client._sandbox_preflight("codex", "standard")
+
+    @pytest.mark.asyncio
+    async def test_sandbox_preflight_is_bounded_on_a_stalled_disk(self, monkeypatch):
+        """A preflight that never returns must not hold the spawn open.
+
+        The mask half canonicalizes the home and override roots on disk, and on a
+        stalled mount that wait has no end of its own; nothing else on the spawn
+        path bounds it (``ensure_ready`` times the handshake AFTER the spawn). The
+        deadline turns that into a retryable ``AcpError`` naming the slow disk, and
+        the adapter is not started without its mask.
+
+        Revert-verified: dropping the ``wait_for`` makes this test hang on the
+        stalled worker instead of raising.
+        """
+        import threading
+
+        monkeypatch.setattr(acp_client, "_SANDBOX_PREFLIGHT_TIMEOUT", 0.05)
+        release = threading.Event()
+
+        def _stalled(backend, mode):
+            release.wait(5.0)
+            return ()
+
+        try:
+            with pytest.raises(AcpError, match="did not finish within 0 s"):
+                await acp_client._run_preflight_bounded(_stalled, "codex", "standard")
+        finally:
+            release.set()  # let the worker thread go; the test must not leak it
+
+    @pytest.mark.asyncio
+    async def test_sandbox_preflight_within_budget_returns_the_mask(self):
+        calls = []
+
+        def _quick(backend, mode):
+            calls.append((backend, mode))
+            return ("/home/u/.aws",)
+
+        assert await acp_client._run_preflight_bounded(_quick, "codex", "standard") == (
+            "/home/u/.aws",
+        )
+        assert calls == [("codex", "standard")]
 
     @pytest.mark.asyncio
     async def test_shutdown_kills_and_resets(self, tmp_path):
@@ -1683,6 +1753,7 @@ class TestAdvertisedModelCacheWiring:
         client._write_claude_local_settings()
         assert self._read_seed(tmp_path)["availableModels"] == served
 
+<<<<<<< HEAD
     def test_cold_cache_seeds_no_allowlist_on_the_native_lane(self, tmp_path, monkeypatch):
         """RoyCrew fork: upstream falls back to the static registry here; this
         fork writes NOTHING instead.
@@ -1699,10 +1770,23 @@ class TestAdvertisedModelCacheWiring:
         adapter advertise the account's real models, and the first capture warms
         the cache the test above covers.
         """
+=======
+    def test_cold_cache_seeds_no_model_keys_at_all(self, tmp_path, monkeypatch):
+        # No static-registry fallback: a guessed allowlist poisons the adapter's
+        # union+dedup merge for any model the registry has not caught up on, so an
+        # unseeded file (adapter falls back to its own provider list) beats a stale
+        # one. The post-capture re-seed fills both keys in.
+>>>>>>> upstream/main
         monkeypatch.setattr(mr, "_ADVERTISED_MODELS", {})
-        client = _client(tmp_path, acp_backend=ACP_BACKEND_CLAUDE)
+        client = _client(tmp_path, acp_backend=ACP_BACKEND_CLAUDE, model="claude-opus-5")
         client._write_claude_local_settings()
+<<<<<<< HEAD
         assert "availableModels" not in self._read_seed(tmp_path)
+=======
+        seed = self._read_seed(tmp_path)
+        assert "availableModels" not in seed
+        assert "model" not in seed
+>>>>>>> upstream/main
 
     def test_claude_capture_feeds_and_flags_the_cache(self, tmp_path, monkeypatch):
         monkeypatch.setattr(mr, "_ADVERTISED_MODELS", {})
@@ -1771,3 +1855,339 @@ class TestAdvertisedModelCacheWiring:
         await client.set_model("gpt-5-codex")
         assert client._model == "gpt-5-codex"  # sent verbatim, no fold
         assert not (tmp_path / ".claude" / "settings.local.json").exists()
+
+
+# ── Encoder and decoder refusal on the client's dispatch-path frames ──
+
+
+def _too_deep_to_encode(**dumps_kwargs: Any) -> Any:
+    """The shallowest nesting THIS interpreter's encoder refuses for *dumps_kwargs*.
+
+    The depth is probed rather than hard-coded because the two encoders have
+    different ceilings and both move between interpreter versions: ``indent=2``
+    runs the pure-Python encoder, which spends several frames per level, and a
+    ``default=str`` call runs the C one. A hard-coded depth can be encodable on
+    another interpreter, and the test then passes having refused nothing.
+
+    Every caller holds the cyclic collector off for the whole test, probe and
+    call under test alike; see ``no_cyclic_gc_at_the_recursion_limit``.
+    """
+    depth = 1000
+    while depth <= 262144:
+        payload: Any = {"leaf": "deep"}
+        for _ in range(depth):
+            payload = {"nested": payload}
+        try:
+            json.dumps(payload, **dumps_kwargs)
+        except RecursionError:
+            return payload
+        depth *= 2
+    raise AssertionError("no nesting up to 2**18 is refused by json.dumps")
+
+
+def _nested_json_text(payload: Any) -> str:
+    """Serialise a probe payload to JSON text WITHOUT ``json.dumps``.
+
+    The JSONL sites need this: the encoder is what refuses the payload, so the
+    fixture cannot use it to write the file the reader parses.
+    """
+    depth = 0
+    node = payload
+    while isinstance(node, dict) and "nested" in node:
+        depth += 1
+        node = node["nested"]
+    return '{"nested": ' * depth + json.dumps(node) + "}" * depth
+
+
+def _too_deep_to_decode() -> str:
+    """JSON text nested past THIS interpreter's DECODER ceiling.
+
+    Probed for the same reason as the encoder depth, and a separate probe because
+    the decoder's ceiling is the higher of the two: text the encoder refuses is
+    still ordinary input to ``json.loads``.
+    """
+    depth = 1000
+    while depth <= 262144:
+        text = "[" * depth + "]" * depth
+        try:
+            json.loads(text)
+        except RecursionError:
+            return text
+        depth *= 2
+    raise AssertionError("no nesting up to 2**18 is refused by json.loads")
+
+
+class TestClientEncodeRefusalDegrades:
+    """Every backend-shaped frame the JSON codec refuses costs ONE frame's
+    detail, never the agent turn and never a whole batch of tool results.
+
+    ``RecursionError`` subclasses ``RuntimeError``, so an unguarded
+    ``json.dumps`` does not catch it and neither does an
+    ``except (TypeError, ValueError)`` arm or an ``except json.JSONDecodeError``
+    arm. The agent backend chooses the shape of every ``rawInput`` /
+    ``rawOutput`` these sites serialise, so a payload past the codec's ceiling is
+    always reachable: unguarded, the raise escapes frame rendering and aborts the
+    whole turn. Same refusal posture as the ``_dispatch`` encodes, and the
+    placeholder is visible in the transcript on purpose, so the user can see that
+    detail is missing.
+    """
+
+    @pytest.fixture
+    def no_cyclic_gc_at_the_recursion_limit(self):
+        """Keep the cyclic collector out of the frames next to the recursion limit.
+
+        Every test in this class drives real code to ``RecursionError`` on
+        purpose, so its innermost frames have no headroom left. A gen0 sweep that
+        lands there -- the allocation counter decides where, not the test -- runs
+        the finalizers of whatever cyclic garbage the worker is carrying. A
+        pending Task leaked by another test reports itself through
+        ``logger.error`` on ``__del__``; at that depth the report itself raises
+        ``RecursionError``, the interpreter hands the escaped exception to
+        ``sys.unraisablehook``, and pytest's hook overflows in the same place,
+        surfacing as ``RuntimeError: Failed to process unraisable exception``
+        against THIS test on any platform.
+
+        Collect once at depth zero so inherited garbage pays its finalizers where
+        there is stack for it, then hold the collector off for the whole test:
+        the deep walk happens twice, once in the depth probe and once in the call
+        under test, and only the second one is the product code. Reference
+        counting still frees the walk's own dicts; cycles wait for teardown.
+        Spelled as ``test_mcp_preflight`` spells it, per
+        ``docs/system-specs/common/testing-conventions.md``.
+        """
+        gc.collect()
+        was_enabled = gc.isenabled()
+        gc.disable()
+        try:
+            yield
+        finally:
+            if was_enabled:
+                gc.enable()
+            gc.collect()
+
+    def test_tool_call_input_degrades(self, tmp_path, no_cyclic_gc_at_the_recursion_limit):
+        client = _client(tmp_path)
+        msg = _notify(
+            "session/update",
+            {
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "deep-call",
+                    "kind": "other",
+                    "title": "Reading a pathological payload",
+                    "rawInput": _too_deep_to_encode(indent=2),
+                }
+            },
+        )
+
+        event = client._extract_tool_event(msg)
+
+        assert event is not None and event.kind == EVENT_TOOL_CALL
+        assert event.tool_input == UNSERIALISABLE_SIBLING_VALUE
+
+    def test_shell_command_of_a_refused_tool_call_fails_closed(
+        self, tmp_path, no_cyclic_gc_at_the_recursion_limit
+    ):
+        """Rendering the frame is not the only encode the turn depends on.
+
+        A ``use_aws``-shaped ``rawInput`` reaches ``AcpEvent.shell_command``,
+        which the hook gate and the skill-read note both read while the turn is
+        still running, and that property encodes ``parameters`` itself. Guarding
+        only the extractor moves the raise one frame later instead of removing
+        it, so the guarantee is pinned end to end here.
+
+        The refusal denies rather than degrades: the parameters tail is the only
+        place a smuggled command appears, so a synthesized command without it
+        would be scanned as though it were complete. ``None`` routes the call to
+        the unconditional deny-by-default arm in ``HookManager.on_tool_call``
+        (``is_shell and not command``).
+        """
+        client = _client(tmp_path)
+        msg = _notify(
+            "session/update",
+            {
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "deep-use-aws",
+                    "kind": "execute",
+                    "title": "Deleting an object",
+                    "rawInput": {
+                        "service_name": "s3api",
+                        "operation_name": "delete-object",
+                        "parameters": _too_deep_to_encode(sort_keys=True),
+                    },
+                }
+            },
+        )
+
+        event = client._extract_tool_event(msg)
+
+        assert event is not None and event.is_shell is True
+        # The frame itself still renders, so the turn survives.
+        assert event.tool_input == UNSERIALISABLE_SIBLING_VALUE
+        # And the gate gets no command it could mistake for the whole call.
+        assert event.shell_command is None
+        # A parameters dict that encodes is unaffected: same frame, real bytes.
+        shallow = dict(event.raw_tool_params or {})
+        shallow["parameters"] = {"bucket": "b", "key": "k"}
+        event.raw_tool_params = shallow
+        assert event.shell_command == ('aws s3api delete-object {"bucket": "b", "key": "k"}')
+
+    def test_json_envelope_output_degrades(self, tmp_path, no_cyclic_gc_at_the_recursion_limit):
+        client = _client(tmp_path)
+        msg = _notify(
+            "session/update",
+            {
+                "update": {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "deep-json",
+                    "status": "completed",
+                    "rawOutput": {"items": [{"Json": _too_deep_to_encode(default=str)}]},
+                }
+            },
+        )
+
+        event = client._extract_tool_call_update(msg)
+
+        assert event is not None and event.kind == EVENT_TOOL_RESULT
+        assert event.tool_output == UNSERIALISABLE_SIBLING_VALUE
+
+    def test_raw_output_passthrough_degrades(self, tmp_path, no_cyclic_gc_at_the_recursion_limit):
+        # No ``items`` key: the unstructured passthrough branch, which serialises
+        # the whole ``rawOutput`` object.
+        client = _client(tmp_path)
+        msg = _notify(
+            "session/update",
+            {
+                "update": {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "deep-passthrough",
+                    "status": "completed",
+                    "rawOutput": _too_deep_to_encode(default=str),
+                }
+            },
+        )
+
+        event = client._extract_tool_call_update(msg)
+
+        assert event is not None and event.kind == EVENT_TOOL_RESULT
+        assert event.tool_output == UNSERIALISABLE_SIBLING_VALUE
+
+    def test_refinement_input_degrades(self, tmp_path, no_cyclic_gc_at_the_recursion_limit):
+        # The refinement input is the site whose own arm catches
+        # ``(TypeError, ValueError)``, which this class of refusal walks straight
+        # through, so the helper is what has to carry it.
+        client = _client(tmp_path)
+        msg = _notify(
+            "session/update",
+            {
+                "update": {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "deep-refine",
+                    "title": "grep",
+                    "rawInput": _too_deep_to_encode(indent=2),
+                }
+            },
+        )
+
+        event = client._extract_tool_call_refinement(msg)
+
+        assert event is not None and event.kind == EVENT_TOOL_CALL_UPDATE
+        assert event.tool_input == UNSERIALISABLE_SIBLING_VALUE
+
+    def test_jsonl_json_result_degrades(
+        self, tmp_path, monkeypatch, no_cyclic_gc_at_the_recursion_limit
+    ):
+        monkeypatch.setattr(acp_client, "kiro_sessions_dir", lambda: tmp_path)
+        deep_text = _nested_json_text(_too_deep_to_encode(indent=2))
+        # The decoder has to accept what the encoder refuses, or the fixture
+        # never reaches the site under test.
+        assert isinstance(json.loads(deep_text), dict)
+        line = (
+            '{"kind": "ToolResults", "data": {"content": [{"kind": "toolResult",'
+            ' "data": {"toolUseId": "t-deep", "content": [{"kind": "json",'
+            ' "data": ' + deep_text + "}]}}]}}\n"
+        )
+        (tmp_path / "sid.jsonl").write_text(line, encoding="utf-8", newline="\n")
+        client = _client(tmp_path)
+        client._session_id = "sid"
+
+        results = client._read_new_tool_results_sync()
+
+        assert [(r.tool_call_id, r.tool_output) for r in results] == [
+            ("t-deep", UNSERIALISABLE_SIBLING_VALUE)
+        ]
+
+    def test_jsonl_batch_keeps_the_sibling_and_its_4000_char_bound(
+        self, tmp_path, monkeypatch, no_cyclic_gc_at_the_recursion_limit
+    ):
+        """One refused frame costs that frame, and the per-part bound holds.
+
+        The guard wraps the encode, so the ``[:4000]`` cut still applies to what
+        the encode returns. Driven as a BATCH because that is where the cost of
+        an unguarded refusal lands: it reaches the method's catch-all arm, which
+        takes this result and every later one in the same read with it, while the
+        file offset has already advanced past them.
+
+        The bound is asserted as the behaviour that is there, not as the
+        behaviour that is right: this reader takes its cut before anything
+        redacts, which is its own defect class and its own change.
+        """
+        monkeypatch.setattr(acp_client, "kiro_sessions_dir", lambda: tmp_path)
+        wide = {f"key{i:04d}": "v" * 32 for i in range(200)}
+        assert len(json.dumps(wide, indent=2)) > 4000
+        deep_text = _nested_json_text(_too_deep_to_encode(indent=2))
+        line = (
+            '{"kind": "ToolResults", "data": {"content": ['
+            '{"kind": "toolResult", "data": {"toolUseId": "t-deep",'
+            ' "content": [{"kind": "json", "data": ' + deep_text + "}]}},"
+            '{"kind": "toolResult", "data": {"toolUseId": "t-wide",'
+            ' "content": [{"kind": "json", "data": ' + json.dumps(wide) + "}]}}"
+            "]}}\n"
+        )
+        (tmp_path / "sid.jsonl").write_text(line, encoding="utf-8", newline="\n")
+        client = _client(tmp_path)
+        client._session_id = "sid"
+
+        results = client._read_new_tool_results_sync()
+
+        assert [r.tool_call_id for r in results] == ["t-deep", "t-wide"]
+        assert results[0].tool_output == UNSERIALISABLE_SIBLING_VALUE
+        assert results[1].tool_output == json.dumps(wide, indent=2)[:4000]
+        assert len(results[1].tool_output) == 4000
+
+    def test_jsonl_undecodable_line_costs_only_that_line(
+        self, tmp_path, monkeypatch, no_cyclic_gc_at_the_recursion_limit
+    ):
+        """The decode half of the same read carries the same refusal class.
+
+        ``json.loads`` is guarded by ``json.JSONDecodeError``, a ``ValueError``,
+        which this class is not: a line past the decoder's ceiling that reaches
+        the method's catch-all arm takes every LATER line's results with it,
+        because the saved file offset has already moved past the bad line.
+        """
+        monkeypatch.setattr(acp_client, "kiro_sessions_dir", lambda: tmp_path)
+        good = json.dumps(
+            {
+                "kind": "ToolResults",
+                "data": {
+                    "content": [
+                        {
+                            "kind": "toolResult",
+                            "data": {
+                                "toolUseId": "t-after",
+                                "content": [{"kind": "text", "data": "SURVIVES"}],
+                            },
+                        }
+                    ]
+                },
+            }
+        )
+        body = _too_deep_to_decode() + "\n" + good + "\n"
+        (tmp_path / "sid.jsonl").write_text(body, encoding="utf-8", newline="\n")
+        client = _client(tmp_path)
+        client._session_id = "sid"
+
+        results = client._read_new_tool_results_sync()
+
+        assert [(r.tool_call_id, r.tool_output) for r in results] == [("t-after", "SURVIVES")]

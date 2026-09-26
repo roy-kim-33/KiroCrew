@@ -4,6 +4,7 @@ import ToolInputPreview from './ToolInputPreview'
 import TrustDropdown from './TrustDropdown'
 import ErrorNotice from './ErrorNotice'
 import { ApiError } from '../api/client'
+import { isTerminalApprovalRefusal } from '../api/apiError'
 
 import { i18nT } from '../i18n/t'
 export default function ApprovalCard({ title, toolInput, showButtons, showTrust = true, hasCommand = true, trustAllLabelKey, onApprove }: {
@@ -32,24 +33,16 @@ export default function ApprovalCard({ title, toolInput, showButtons, showTrust 
   // "Trusted"/"Approved" on a failed POST. An ApiError carries the server's
   // own verdict, so its copy asserts the decision was not recorded; a
   // response-less transport failure proves only that no response arrived, so
-  // it hedges with "may not have been recorded". A refusal is TERMINAL only
-  // when the approval itself is gone: 404 (channel/agent gone) or the
-  // endpoint's own "no pending approval" 400 (expired / already decided) —
-  // matched exactly because the dashboard ships with its gateway, and a copy
-  // drift merely degrades to the retryable path. Other 400s (e.g. an action
-  // the endpoint rejects) leave a LIVE approval the user can still decide
-  // another way, and auth expiry (403) / transport failures are retryable,
-  // so those roll back to the buttons.
+  // it hedges with "may not have been recorded". `isTerminalApprovalRefusal`
+  // decides which refusals keep their buttons (#11180).
   const handle = (d: string, pattern?: string) => {
     setFailure(null)
     setDecided(d)
     Promise.resolve(onApprove(d, pattern)).catch((err: unknown) => {
       setDecided(null)
       const refusal = err instanceof ApiError ? err : null
-      const gone = !!refusal && !refusal.authRequired
-        && (refusal.status === 404 || (refusal.status === 400 && refusal.message === 'no pending approval'))
       setFailure({
-        terminal: gone,
+        terminal: isTerminalApprovalRefusal(err),
         message: refusal && refusal.message ? refusal.message : '',
         attempted: d,
       })
@@ -92,14 +85,22 @@ export default function ApprovalCard({ title, toolInput, showButtons, showTrust 
       }
       {toolInput && <ToolInputPreview toolInput={toolInput} threshold={200} />}
       {showButtons && !decided && !failure?.terminal && (
-        <div ref={buttonsRef} className="mt-1.5 flex gap-1.5 flex-wrap">
+        // Grouped so a screen reader announces approve / trust / reject as one
+        // decision cluster rather than three loose buttons; operators batch-
+        // approve, so the controls must read as a set (Req 2.5, WCAG AA). The
+        // buttons carry visible text, so their accessible name comes from that
+        // text — a redundant aria-label would only override it, so only the
+        // otherwise-unnamed group gets an explicit label.
+        <div ref={buttonsRef} role="group" aria-label={i18nT('components.approvalCard.actions_group')} className="mt-1.5 flex gap-1.5 flex-wrap">
           <button className={btnClass} onClick={() => handle('approved')}><CheckCircle className="lucide-inline" /> {i18nT('components.approvalCard.approve')}</button>
           {showTrust && <TrustDropdown fullCommand={hasCommand ? normalized : ''} baseCommand={baseCmd} isShell={hasCommand && isShell} hasCommand={hasCommand} trustAllLabelKey={trustAllLabelKey} className={btnClass} onAction={(action, pattern) => handle(action, pattern)} />}
           <button className={btnClass + ' hover:!text-danger hover:!border-danger'} onClick={() => handle('rejected')}><Ban className="lucide-inline" /> {i18nT('components.approvalCard.reject')}</button>
         </div>
       )}
       {failure !== null && (
-        <ErrorNotice variant="inline" className="mt-1.5" message={failure.terminal
+        // The card holds no draft: the pending buttons are not user input and the
+        // failed decision is retryable, so the hand-off loses nothing.
+        <ErrorNotice variant="inline" className="mt-1.5" askAgent testId="approval-card-failure" message={failure.terminal
           ? i18nT('components.approvalCard.approval_no_longer_pending')
           : failure.message
             ? i18nT('components.approvalCard.decision_not_recorded_error', { error: failure.message })

@@ -481,8 +481,8 @@ async def api_channel_approve_agent(request: web.Request) -> web.Response:
             # equality; the base tier stores one shlex-derived binary name,
             # refused outright for compound / quoted / env-prefixed /
             # unparseable commands. No pattern language, no derived
-            # sub-patterns — every derivation scheme reviewed on this
-            # surface widened scope beyond what the card displayed.
+            # sub-patterns: a derived pattern widens scope beyond what the
+            # card displayed.
             cmd = agent._pending_approval_command
             if not cmd:
                 return _deny_trust_grant(
@@ -645,12 +645,16 @@ async def api_channel_clear_context(request: web.Request) -> web.Response:
             )
             return web.json_response({"error": "agent not found"}, status=404)
         if agent.session_key:
-            await state.sessions.reset(agent.session_key)
+            # ``ends_conversation``: the user asked this agent to forget the
+            # conversation, so its sub-agent runs have nothing left to report into. The
+            # default is the recycle, which is what the wedged-session and watchdog
+            # resets in `channel.py` want; this route is the opposite intent.
+            await state.sessions.reset(agent.session_key, ends_conversation=True)
             cleared.append(agent.role or agent.id)
     else:
         for agent in ch.members.values():
             if agent.session_key:
-                await state.sessions.reset(agent.session_key)
+                await state.sessions.reset(agent.session_key, ends_conversation=True)
                 cleared.append(agent.role or agent.id)
         ch.messages.clear()
         ch._msg_index.clear()

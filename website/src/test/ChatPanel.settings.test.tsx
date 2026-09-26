@@ -1,3 +1,4 @@
+import { MemoryRouter } from 'react-router-dom'
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, screen, fireEvent, waitFor } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
@@ -30,14 +31,29 @@ vi.mock('../api/client', () => ({
     updateSttConfig: () => Promise.resolve({}),
     tipsStatus: tipsStatusMock,
     tipsFeedback: tipsFeedbackMock,
+    // The panel reads the feature-video cache on mount. Downloads OFF here, so
+    // the readout renders its policy line and no button -- these files measure
+    // other settings, and a live control would put a stray button in their reach.
+    featureVideoStatus: () => Promise.resolve({
+      enabled: true, download_enabled: false, release: 'r1',
+      cached: 0, total: 0, downloading: null,
+    }),
+    featureVideoFetchAll: () => Promise.resolve({ ok: true }),
   },
 }))
 
 import { ChatPanel } from '../pages/settings/ChatPanel'
 
-function wrap(ui: React.ReactElement) {
+import { Provider } from 'react-redux'
+
+// ChatPanel reads the active slot from redux to name the session on its
+// feature-video calls, so these renders need a store. A FRESH one per file,
+// not the app singleton: a shared store would carry `activeSlot` across suites.
+import { createTestStore } from './helpers'
+
+function wrap(ui: React.ReactElement, sub = 'transcript') {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-  return render(<QueryClientProvider client={qc}>{ui}</QueryClientProvider>)
+  return render(<MemoryRouter initialEntries={[`/settings?tab=chat&sub=${sub}`]}><Provider store={createTestStore()}><QueryClientProvider client={qc}>{ui}</QueryClientProvider></Provider></MemoryRouter>)
 }
 
 describe('ChatPanel settings – Feature Tips toggle', () => {
@@ -48,13 +64,13 @@ describe('ChatPanel settings – Feature Tips toggle', () => {
   })
 
   it('renders the toggle reflecting server state (enabled, not opted out)', async () => {
-    wrap(<ChatPanel />)
+    wrap(<ChatPanel />, 'discovery')
     expect(await screen.findByText('Feature Tips')).toBeInTheDocument()
     await waitFor(() => expect(tipsStatusMock).toHaveBeenCalled())
   })
 
   it('fires optout when toggled off', async () => {
-    wrap(<ChatPanel />)
+    wrap(<ChatPanel />, 'discovery')
     const label = await screen.findByText('Feature Tips')
     await waitFor(() => expect(tipsStatusMock).toHaveBeenCalled())
     fireEvent.click(label)
@@ -63,7 +79,7 @@ describe('ChatPanel settings – Feature Tips toggle', () => {
 
   it('fires optin when toggled back on from opted-out state', async () => {
     tipsStatusMock.mockImplementation(() => Promise.resolve({ enabled_config: true, opted_out: true }))
-    wrap(<ChatPanel />)
+    wrap(<ChatPanel />, 'discovery')
     const label = await screen.findByText('Feature Tips')
     await waitFor(() => expect(tipsStatusMock).toHaveBeenCalled())
     fireEvent.click(label)
@@ -72,7 +88,7 @@ describe('ChatPanel settings – Feature Tips toggle', () => {
 
   it('renders disabled with config hint when tips_enabled=false at config level', async () => {
     tipsStatusMock.mockImplementation(() => Promise.resolve({ enabled_config: false, opted_out: false }))
-    wrap(<ChatPanel />)
+    wrap(<ChatPanel />, 'discovery')
     expect(await screen.findByText(/Disabled by instance config/)).toBeInTheDocument()
     fireEvent.click(screen.getByText('Feature Tips'))
     // Disabled toggle must not fire feedback
@@ -83,7 +99,7 @@ describe('ChatPanel settings – Feature Tips toggle', () => {
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
     // Simulate a tip cached by a running Chat view before the user opts out
     qc.setQueryData(['tips-next'], { tip: { id: 'stale', title: 'Stale' }, glow: true })
-    render(<QueryClientProvider client={qc}><ChatPanel /></QueryClientProvider>)
+    render(<MemoryRouter initialEntries={['/settings?tab=chat&sub=discovery']}><Provider store={createTestStore()}><QueryClientProvider client={qc}><ChatPanel /></QueryClientProvider></Provider></MemoryRouter>)
     const label = await screen.findByText('Feature Tips')
     await waitFor(() => expect(tipsStatusMock).toHaveBeenCalled())
     fireEvent.click(label)
@@ -99,20 +115,20 @@ describe('ChatPanel settings – Subagents section', () => {
   })
 
   it('renders the Subagents section with both completion_keep fields', () => {
-    wrap(<ChatPanel />)
+    wrap(<ChatPanel />, 'advanced')
     expect(screen.getByText('Subagents')).toBeInTheDocument()
     expect(screen.getByText('Completion Event Truncation')).toBeInTheDocument()
     expect(screen.getByText('Completion Event Characters')).toBeInTheDocument()
   })
 
   it('seeds the completion-keep-chars input from the server config', async () => {
-    wrap(<ChatPanel />)
+    wrap(<ChatPanel />, 'advanced')
     const input = await screen.findByLabelText('Completion event characters') as HTMLInputElement
     await waitFor(() => expect(input.value).toBe('3000'))
   })
 
   it('PATCHes agent.completion_keep_chars on blur with a valid integer', async () => {
-    wrap(<ChatPanel />)
+    wrap(<ChatPanel />, 'advanced')
     const input = await screen.findByLabelText('Completion event characters') as HTMLInputElement
     await waitFor(() => expect(input.value).toBe('3000'))
     fireEvent.change(input, { target: { value: '5000' } })
@@ -123,7 +139,7 @@ describe('ChatPanel settings – Subagents section', () => {
   })
 
   it('reverts and does NOT PATCH when the value is out of range', async () => {
-    wrap(<ChatPanel />)
+    wrap(<ChatPanel />, 'advanced')
     const input = await screen.findByLabelText('Completion event characters') as HTMLInputElement
     await waitFor(() => expect(input.value).toBe('3000'))
     fireEvent.change(input, { target: { value: '999999999' } })

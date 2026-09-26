@@ -46,13 +46,12 @@ HOST_ARCH="$(uname -m)"
 
 # Beacon provenance for the artifact this run produces, derived from the
 # electron-builder target rather than the host: mac.target is dmg, linux.target
-# is AppImage + deb + rpm (website/electron/package.json). Reading the host OS instead
-# would be wrong on Linux, where the same machine also builds wheels.
-# Windows ships an NSIS installer, which has no KNOWN_DISTRIBUTIONS value yet;
-# "source" is the honest answer until "nsis" is added on both sides.
+# is AppImage + deb + rpm, win.target is nsis (website/electron/package.json).
+# Reading the host OS instead would be wrong on Linux, where the same machine
+# also builds wheels.
 case "$OS" in
   darwin)  KC_DISTRIBUTION="dmg" ;;
-  windows) KC_DISTRIBUTION="source" ;;
+  windows) KC_DISTRIBUTION="nsis" ;;
   *)       KC_DISTRIBUTION="appimage" ;;
 esac
 
@@ -488,7 +487,13 @@ while [ -h "$SOURCE" ]; do
   [ "${SOURCE:0:1}" != "/" ] && SOURCE="$DIR/$SOURCE"
 done
 DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
-exec "$DIR/python3.12" -s -m kiro_crew "$@"
+# -P keeps the caller's working directory OFF sys.path. `-m` otherwise puts the
+# cwd first, ahead of the standard library, so a `~/concurrent/`, `~/json/` or
+# any other stdlib-named directory in the directory kirocrew is run from (the
+# home directory, for a service unit) is imported instead of the real module and
+# fails later with an unrelated-looking TypeError. -s does not cover this: it
+# removes the user site, not the launch entry.
+exec "$DIR/python3.12" -s -P -m kiro_crew "$@"
 LAUNCH
   chmod +x "$out/bin/kirocrew"
 
@@ -506,8 +511,13 @@ LAUNCH
   fi
 
   # Self-containment gate: the full import chain must resolve with no user-site.
+  # Bare `--version` is a pre-dispatch fast-path that skips `kiro_crew.cli`'s
+  # heavy imports, so it cannot prove the chain alone: the import probe below
+  # restores the gate's meaning.
   log "Verifying self-containment ($(basename "$out"))…"
-  PYTHONNOUSERSITE=1 "$out/bin/python3.12" -m kiro_crew --version >/dev/null \
+  PYTHONNOUSERSITE=1 "$out/bin/python3.12" -s -P -m kiro_crew --version >/dev/null \
+    || { echo "ERROR: bundled backend is NOT self-contained (missing dep under PYTHONNOUSERSITE=1)" >&2; exit 1; }
+  PYTHONNOUSERSITE=1 "$out/bin/python3.12" -c 'import kiro_crew.cli' \
     || { echo "ERROR: bundled backend is NOT self-contained (missing dep under PYTHONNOUSERSITE=1)" >&2; exit 1; }
 
   # Prune to shrink the bundle.
@@ -659,11 +669,15 @@ build_backend_windows() {
 
   # Relocatable launcher shim: %~dp0 is the .cmd's own directory (bin\),
   # so the interpreter resolves relative to the bundle wherever it lands.
+  # -P for the same reason as the POSIX launcher above: keep the caller's cwd
+  # off sys.path so a stdlib-named directory there cannot shadow the stdlib.
   mkdir -p "$out/bin"
-  printf '@echo off\r\n"%%~dp0..\\python.exe" -s -m kiro_crew %%*\r\n' > "$out/bin/kirocrew.cmd"
+  printf '@echo off\r\n"%%~dp0..\\python.exe" -s -P -m kiro_crew %%*\r\n' > "$out/bin/kirocrew.cmd"
 
   log "Verifying self-containment ($(basename "$out"))…"
-  PYTHONNOUSERSITE=1 "$out/python.exe" -s -m kiro_crew --version >/dev/null \
+  PYTHONNOUSERSITE=1 "$out/python.exe" -s -P -m kiro_crew --version >/dev/null \
+    || { echo "ERROR: bundled backend is NOT self-contained (missing dep under PYTHONNOUSERSITE=1)" >&2; exit 1; }
+  PYTHONNOUSERSITE=1 "$out/python.exe" -s -c 'import kiro_crew.cli' \
     || { echo "ERROR: bundled backend is NOT self-contained (missing dep under PYTHONNOUSERSITE=1)" >&2; exit 1; }
 
   log "Pruning bundle ($(basename "$out"))…"
@@ -684,10 +698,17 @@ build_backend_windows() {
   # After pruning, so it validates what actually ships.
   stdlib_probe_gate "$out"
 
-  # Trace the real gateway import after the final prune and ship checked-hash
-  # pycs for exactly that closure. Windows can consume these beside the source
-  # without invalidating an Authenticode signature, avoiding the first launch's
-  # thousand-file cache write while keeping unrelated modules out of the bundle.
+  # Trace the real gateway import after the final prune and ship hash-based
+  # (UNCHECKED) pycs for exactly that closure. Windows can consume these beside
+  # the source without invalidating an Authenticode signature, avoiding the first
+  # launch's thousand-file cache write while keeping unrelated modules out of the
+  # bundle. Unchecked, not checked, and the difference is load-bearing: a
+  # checked-hash pyc makes the loader read and hash each .py in ADDITION to the
+  # .pyc, which measured 43.55 MB and 1639 extra cold file opens per boot -- a
+  # median 12.5 s on a cold file cache. Both hash modes ignore mtime, which is
+  # the property this needs; only the re-read is dropped. The posix tree above
+  # stays checked-hash: it is a different mechanism (whole tree, codesigned) and
+  # does not show the symptom.
   log "Precompiling Windows gateway startup modules ($(basename "$out"))…"
   env PYTHONDONTWRITEBYTECODE=1 PYTHONNOUSERSITE=1 PYTHONPATH= \
     "$out/python.exe" -s "$ROOT/packaging/precompile_windows.py" \
@@ -803,9 +824,73 @@ else
   fi
 fi
 
+# A leftover staged marker from an earlier interrupted build is removed on
+# EVERY run, before any early exit: step 3b re-stages it when asked. This sits
+# ahead of the SKIP_ELECTRON return so a backend-only build cannot leave a
+# stale declaration behind for a hand-run electron-builder to pack.
+rm -f "$ELECTRON_DIR/EXTERNALLY-MANAGED"
+
 if [ "${SKIP_ELECTRON:-0}" = "1" ]; then
   log "SKIP_ELECTRON=1 — backend(s) ready under $ELECTRON_DIR/backend-dist/"
   exit 0
+fi
+
+# --- 3b. Baked EXTERNALLY-MANAGED marker (optional) --------------------------
+# An edition whose installs are owned by an external package manager (a Toolbox,
+# a corporate installer) declares that at BUILD time by naming its marker here.
+# The file is copied to $ELECTRON_DIR/EXTERNALLY-MANAGED, which package.json's
+# `files` list packs INTO app.asar next to main.js -- so the running app reads
+# it as its own code, on every platform, with no ownership probe (see
+# readExternallyManaged in website/electron/auto-update.js). A marker dropped
+# beside the app after the build (`<resources>/EXTERNALLY-MANAGED`) is the
+# repackager affordance and stays gated on file provenance; that gate refuses
+# every user-owned install and can never pass on Windows, which is why an
+# edition bakes instead of dropping.
+#
+# The copy is validated as the JSON object the reader accepts -- string fields
+# only, under the reader's 8 KiB read cap -- and the build FAILS on anything
+# else: the reader treats a malformed marker as "managed, nothing to run", so a
+# typo here would silently ship an app that can neither self-update nor be
+# updated from its About panel. Unset, nothing is staged: the unconditional
+# cleanup above (ahead of the SKIP_ELECTRON exit) already removed any leftover
+# from a previous local build, so a stale declaration cannot ride along.
+if [ -n "${KIROCREW_MANAGED_INSTALL_MARKER:-}" ]; then
+  MARKER_SRC="$KIROCREW_MANAGED_INSTALL_MARKER"
+  test -f "$MARKER_SRC" || { echo "❌ KIROCREW_MANAGED_INSTALL_MARKER does not name a file: $MARKER_SRC" >&2; exit 1; }
+  node -e '
+    const fs = require("fs");
+    const [src] = process.argv.slice(1);
+    const buf = fs.readFileSync(src);
+    if (buf.length > 8192) { console.error(`marker is ${buf.length} bytes; the reader caps at 8192`); process.exit(1); }
+    let parsed;
+    try { parsed = JSON.parse(buf.toString("utf8")); } catch (e) { console.error(`marker is not JSON: ${e.message}`); process.exit(1); }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) { console.error("marker must be a JSON object"); process.exit(1); }
+    const allowed = ["managedBy", "updateCommand", "checkCommand"];
+    // The reader TRIMS each field and slices it to a cap (auto-update.js:
+    // MANAGED_BY_MAX_CHARS / UPDATE_COMMAND_MAX_CHARS / CHECK_COMMAND_MAX_CHARS).
+    // Validate the value the reader will actually see: a whitespace-only
+    // command would trim to nothing and turn the marker bare, and an over-cap
+    // one would be truncated into a DIFFERENT command. Both are refused here.
+    const caps = { managedBy: 128, updateCommand: 512, checkCommand: 512 };
+    for (const k of Object.keys(parsed)) {
+      if (!allowed.includes(k)) { console.error(`marker has unknown field "${k}" (allowed: ${allowed.join(", ")})`); process.exit(1); }
+      if (typeof parsed[k] !== "string") { console.error(`marker field "${k}" must be a string`); process.exit(1); }
+      if (parsed[k].trim() !== parsed[k]) { console.error(`marker field "${k}" has leading/trailing whitespace the reader would trim`); process.exit(1); }
+      if (parsed[k].length > caps[k]) { console.error(`marker field "${k}" is ${parsed[k].length} chars; the reader caps at ${caps[k]} and would truncate the command`); process.exit(1); }
+    }
+    if (!parsed.updateCommand) { console.error("marker has no updateCommand: it would disable updates without offering any"); process.exit(1); }
+  ' "$MARKER_SRC" || { echo "❌ KIROCREW_MANAGED_INSTALL_MARKER rejected: $MARKER_SRC" >&2; exit 1; }
+  # Staged for THIS build only: electron-builder packs it below, and the copy
+  # must not outlive the run -- a later build of a different edition from the
+  # same tree (or a hand-run electron-builder) would otherwise pack the previous
+  # edition's commands. The unconditional rm above covers the next
+  # build-desktop.sh run; this covers every other exit path. The trap is armed
+  # BEFORE the copy so there is no instant at which the file exists without
+  # its cleanup -- an interrupt between the two would leave a stale marker for
+  # a hand-run `npm run dist` to pack.
+  trap 'rm -f "$ELECTRON_DIR/EXTERNALLY-MANAGED"' EXIT
+  cp "$MARKER_SRC" "$ELECTRON_DIR/EXTERNALLY-MANAGED"
+  log "Baking EXTERNALLY-MANAGED marker into the app from $MARKER_SRC"
 fi
 
 # --- 4. Package the desktop app with electron-builder -----------------------

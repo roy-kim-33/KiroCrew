@@ -131,6 +131,17 @@ describe('LinkedSurfacesSection', () => {
       expect(await screen.findByText(L('disconnect_from', { label: 'Discord' }))).toBeInTheDocument()
     })
 
+    it.each([
+      ['imessage', 'iMessage'],
+      ['feishu', 'Feishu'],
+    ])('renders the %s brand instead of the target label', async (channel, brand) => {
+      mount({ links: [link({ channel, label: 'zzq-personal-target' })] })
+      expect(
+        await screen.findByRole('button', { name: L('disconnect_from', { label: brand }) }),
+      ).toBeInTheDocument()
+      expect(screen.queryByText(L('disconnect_from', { label: 'zzq-personal-target' }))).not.toBeInTheDocument()
+    })
+
     it('an unrecognised channel type falls back to the link label', async () => {
       mount({ links: [link({ channel: 'zzq-exotic', label: 'zzq-exotic-label' })] })
       expect(
@@ -183,6 +194,12 @@ describe('LinkedSurfacesSection', () => {
       await waitFor(() => expect(notifications(store)).toEqual([
         `error:${L('disconnect_failed', { label: 'Discord', reason: 'zzq-pause-broke' })}`,
       ]))
+      // The notification is the durable record; the failure ALSO renders in
+      // place under the row (a toast-only report of a write that did not
+      // persist is the shape errors-use-error-notice forbids).
+      const inPlace = screen.getByTestId('linked-surfaces-error-discord')
+      expect(inPlace).toHaveAttribute('role', 'alert')
+      expect(inPlace).toHaveTextContent('zzq-pause-broke')
       expect(slotOf(store).links?.[0].paused).toBeUndefined()
     })
 

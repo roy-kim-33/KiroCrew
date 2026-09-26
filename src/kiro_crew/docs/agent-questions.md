@@ -22,8 +22,7 @@ Use `ask_question` when a dashboard user needs to choose or supply an answer bef
       ],
       "multiSelect": false
     }
-  ],
-  "timeout_secs": 300
+  ]
 }
 ```
 
@@ -36,7 +35,7 @@ Use `ask_question` when a dashboard user needs to choose or supply an answer bef
 | `options[].label` | Required text; truncated to 200 characters. |
 | `options[].description` | Optional text; truncated to 500 characters. |
 | `multiSelect` | Optional boolean; false by default. |
-| `timeout_secs` | Optional integer validated from 15 through 540. The current stateless directive does not carry this value to the card, so it does not create a wait or timeout result. |
+| `timeout_secs` | Optional integer validated from 15 through 540, accepted for compatibility but never read, so the tool's inputSchema does not advertise it. The current stateless directive does not carry this value to the card, so it does not create a wait or timeout result. |
 
 Malformed nested questions and options are skipped; the request fails when no valid question remains. Duplicate normalized question text or option labels are rejected. The frontend limits a typed custom answer to 2,000 characters.
 
@@ -62,40 +61,17 @@ For a single-select question, selecting a different option replaces the previous
 
 Every question must have an answer before Submit becomes available. The card emits answers keyed by question text; the stateless wrapper sends the answer values as newline-separated message text. Dismiss removes the stateless card and its `needs_input` status without sending an answer.
 
-Only one stateless card is retained per slot; a later card replaces the earlier one. A live user or nudge message retires an unanswered stateless card. Reloads and websocket reconnects reconcile pending cards with `GET /api/ask-question/pending`.
+Only one stateless card is retained per slot; a later card replaces the earlier one. A live user message retires an unanswered stateless card; an auto-nudge cycle does not, because it wakes the same agent in the same conversation and the answer still reaches it. Anything else needs the card's own Dismiss control. Reloads and websocket reconnects reconcile pending cards with `GET /api/ask-question/pending`.
 
-## Blocking HTTP API
+## Two delivery paths for a card answer
 
-The MCP `ask_question` tool does not call this API: it returns a stateless, non-blocking session directive. `POST /api/ask-question` remains a separate blocking round trip for owner callers and returns only after the card is answered, dismissed, cancelled, or timed out.
+A no-`ask_id` question card can be answered on two paths, chosen by whether the slot's turn is live when Submit is pressed:
 
-All four endpoints call `_deny_app_token` and `_deny_non_owner` before reading their bodies. App tokens receive `403 {"error": "app token not permitted for this endpoint", "code": "app_token_forbidden"}`; non-owners receive a `403` owner-only denial.
+- **Non-blocking `ask_question` card.** This tool ends the agent's turn before the card appears, so the turn is idle when the user answers. The answer starts an ordinary next turn, carrying full context. This is the path the flow above describes.
+- **Native `AskUserQuestion` card.** kiro-cli raises this card while its own turn is still running and waiting on the answer. Submitting it therefore *steers* the answer into that live turn (the same `steer: true` delivery the mid-turn split send uses), so the waiting turn consumes it instead of the answer queuing behind the very turn that asked for it. If the turn has already ended by the time the user answers (the card outlived it), there is nothing to steer into and the answer falls back to starting an ordinary next turn, exactly like the non-blocking card.
 
-### `POST /api/ask-question`
+Both the main chat and the split panes key this decision on the shared `selectComposerBusy` slot-turn-live rule, so the two surfaces cannot drift. Because the card clears on Submit and a steer into a busy slot shows no optimistic bubble, a steer whose delivery is not confirmed (a transport failure or a late receipt) hands the answer back to the composer with a delivery-unconfirmed notice rather than dropping it.
 
-Request body: `{session_key, questions: [...], timeout_secs?}`. `session_key` must resolve to an existing slot; `questions` uses the same validator as the tool; `timeout_secs`, when supplied, must be an integer and is bounded by the blocking wait.
-
-Success responses are `200 {"status": "answered", "ask_id", "answers"}` or `200 {"status": "timeout", "ask_id"}`. Invalid JSON, a non-object body, a missing `session_key`, invalid questions, a non-integer timeout, or duplicate keys after redaction return `400`; an unknown or unrenderable slot returns `404`.
-
-### `GET /api/ask-question/pending`
-
-Returns `200` with an array of cards that can be rehydrated after a reload or websocket reconnect. A blocking card has `{ask_id, slot, questions, ts}`; a stateless card has `{card_id, slot, questions, ts}`. Empty or status-only records are omitted.
-
-`ask_id` identifies a parked blocking wait and is answered through the endpoint below. A stateless `card_id` has no blocked caller: its answer is the next ordinary user message, and its status is retired through the dismiss endpoint or that message.
-
-### `POST /api/ask-question/dismiss`
-
-Request body: `{slot, card_id}`. This endpoint retires only a stateless card's `needs_input` record and returns `200 {"ok": true}`.
-
-Invalid JSON, a non-object body, or missing `slot` or `card_id` returns `400`; an unknown, stale, or blocking card record returns `404`. It cannot dismiss a blocking `ask_id` card.
-
-### `POST /api/ask-question/{ask_id}/answer`
-
-Request body: `{answers: {question: answer}}`, or `{dismissed: true}` to resolve the blocking wait without an answer. Successful resolution returns `200 {"ok": true}`.
-
-Invalid JSON, a non-object body, missing or empty answers, more than four answers, or overlong question keys or answer values return `400`; an already answered, expired, or unknown `ask_id` returns `404`.
-
-## Blocking lifecycle
-
-A blocking card is registered under its `ask_id` until its wait exits. Answering, dismissing, timing out, or cancellation retires that record and broadcasts its resolution.
-
-Stopping, interrupting, or deleting a slot unblocks its pending blocking questions. Session reset uses the same unblock path, so a blocking wait cannot outlive the session that issued it.
+The blocking `POST /api/ask-question` round trip is a separate owner-only HTTP
+path that no agent tool uses; its endpoint contract is a contributor reference
+rather than part of using the feature.

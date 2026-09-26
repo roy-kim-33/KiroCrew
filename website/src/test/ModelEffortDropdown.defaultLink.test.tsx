@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from 'vitest'
 import { render, screen, fireEvent } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
@@ -8,14 +9,8 @@ import ModelEffortDropdown from '../components/ModelEffortDropdown'
 import chatReducer from '../store/chatSlice'
 import dashboardReducer from '../store/dashboardSlice'
 import notificationsReducer from '../store/notificationsSlice'
-import { api } from '../api/client'
 import { SETTINGS_DEFAULT_MODEL_ID } from '../hooks/useSettingHighlight'
 import { SETTINGS_REGISTRY } from '../components/commandPalette/settingsRegistry.gen'
-
-// The nested ReasoningEffortDropdown persists slider picks over the wire
-// (#5120); none of these tests touch the slider, but the stub keeps an
-// accidental future interaction from hitting a real fetch.
-vi.spyOn(api, 'chatSlotReasoningEffort').mockResolvedValue({ ok: true } as never)
 
 /**
  * The in-session model picker carries two footer rows: an in-place "set as
@@ -37,23 +32,102 @@ const baseProps = {
   filter: '',
   setFilter: vi.fn(),
   onClose: vi.fn(),
-  hasEffort: false,
-  slot: 'dashboard:1',
-  currentEffort: '',
   onListKeyDown: vi.fn(),
 }
 
 function wrap(ui: React.ReactElement) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-  // The nested ReasoningEffortDropdown persists picks into the slot store
-  // (#5120), so the tree needs the redux context even where a test never
-  // touches the effort footer. A per-render store (not the app singleton)
-  // keeps one test's persist from leaking into the next.
+  // A per-render store keeps picker state from leaking between cases.
   const store = configureStore({
     reducer: { dashboard: dashboardReducer, chat: chatReducer, notifications: notificationsReducer },
   })
   return render(<Provider store={store}><QueryClientProvider client={qc}>{ui}</QueryClientProvider></Provider>)
 }
+
+describe('ModelEffortDropdown — visible models shortcut', () => {
+  it('reports a visibility-config read failure and retries in place', () => {
+    const onRetryModelVisibility = vi.fn()
+    wrap(
+      <ModelEffortDropdown
+        {...baseProps}
+        modelVisibilityError
+        onRetryModelVisibility={onRetryModelVisibility}
+      />,
+    )
+    expect(screen.getByRole('alert')).toHaveTextContent('Failed to load dashboard config.')
+    expect(screen.queryByRole('button', { name: 'Ask the agent' })).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
+    expect(onRetryModelVisibility).toHaveBeenCalledOnce()
+  })
+
+  it('reports a failed remote roster read and retries in place', () => {
+    // A remote-bound session whose peer capability request errored: without
+    // this surface the picker's only signal is the empty list's "No matches",
+    // which claims the crew has no models rather than that the read failed.
+    const onRetryModels = vi.fn()
+    wrap(<ModelEffortDropdown {...baseProps} models={[]} modelsFailed onRetryModels={onRetryModels} />)
+    expect(screen.getByRole('alert')).toHaveTextContent("Couldn't load the remote crew's models.")
+    // No hand-off next to the composer: navigating away could discard a draft.
+    expect(screen.queryByRole('button', { name: 'Ask the agent' })).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
+    expect(onRetryModels).toHaveBeenCalledOnce()
+  })
+
+  it('disables the Retry button while the in-place retry is in flight', () => {
+    // `failed` stays true for the whole refetch round trip, so without this
+    // the button looks dead: nothing on screen acknowledges the click.
+    wrap(
+      <ModelEffortDropdown
+        {...baseProps}
+        models={[]}
+        modelsFailed
+        retryingModels
+        onRetryModels={vi.fn()}
+      />,
+    )
+    expect(screen.getByRole('button', { name: 'Retry' })).toBeDisabled()
+  })
+
+  it('is optional and opens management below the model list', () => {
+    const onManageModels = vi.fn()
+    wrap(<ModelEffortDropdown {...baseProps} onManageModels={onManageModels} />)
+    const button = screen.getByRole('button', { name: 'Manage visible models' })
+    expect(screen.getByRole('listbox').compareDocumentPosition(button) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    fireEvent.click(button)
+    expect(onManageModels).toHaveBeenCalledTimes(1)
+    expect(SETTINGS_REGISTRY.some(entry => entry.configKey === 'dashboard.model_picker_hidden_models')).toBe(true)
+  })
+
+  it('stays absent after its caller marks configuration complete', () => {
+    wrap(<ModelEffortDropdown {...baseProps} />)
+    expect(screen.queryByRole('button', { name: 'Manage visible models' })).not.toBeInTheDocument()
+  })
+
+  it('moves from model search into management in keyboard order', async () => {
+    const onListKeyDown = vi.fn()
+    wrap(
+      <ModelEffortDropdown
+        {...baseProps}
+        onManageModels={vi.fn()}
+        onListKeyDown={onListKeyDown}
+      />,
+    )
+    const user = userEvent.setup()
+    const input = screen.getByPlaceholderText('Type to filter…')
+    const manage = screen.getByRole('button', { name: 'Manage visible models' })
+    input.focus()
+    await user.tab()
+    expect(manage).toHaveFocus()
+    const options = screen.getAllByRole('option')
+    const last = options[options.length - 1]
+    last.focus()
+    fireEvent.keyDown(last, { key: 'ArrowDown' })
+    expect(manage).toHaveFocus()
+    fireEvent.keyDown(manage, { key: 'ArrowUp' })
+    expect(last).toHaveFocus()
+    expect(onListKeyDown).not.toHaveBeenCalled()
+  })
+})
 
 describe('ModelEffortDropdown — global fallback link', () => {
   it('is absent when the call site passes no handler', () => {
@@ -69,11 +143,6 @@ describe('ModelEffortDropdown — global fallback link', () => {
     expect(onSetDefault).toHaveBeenCalledTimes(1)
   })
 
-  it('coexists with the reasoning-effort footer', () => {
-    wrap(<ModelEffortDropdown {...baseProps} hasEffort onSetDefault={vi.fn()} />)
-    expect(screen.getByText('Reasoning')).toBeInTheDocument()
-    expect(screen.getByText(/Global default for new sessions/)).toBeInTheDocument()
-  })
 })
 
 describe('ModelEffortDropdown — per-agent default row', () => {
@@ -118,44 +187,46 @@ describe('ModelEffortDropdown — per-agent default row', () => {
     expect(onPinToAgent).not.toHaveBeenCalled()
   })
 
-  it('coexists with both other footer rows', () => {
+  it('coexists with the global default footer row', () => {
     wrap(
       <ModelEffortDropdown
         {...baseProps}
-        hasEffort
         agentName="oncall"
         onPinToAgent={vi.fn()}
         onSetDefault={vi.fn()}
       />
     )
-    expect(screen.getByText('Reasoning')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Set as default model for oncall' })).toBeInTheDocument()
     expect(screen.getByText(/Global default for new sessions/)).toBeInTheDocument()
   })
 })
 
-describe('ModelEffortDropdown — effort footer value', () => {
-  // The footer summarises what a turn WILL run at: a slot with no override
-  // inherits the configured default, so showing a bare "Default" there hid the
-  // real level (as on a freshly created session). Scoped to
-  // the footer row — the drill-in effort page is always mounted (off-screen)
-  // and renders its own copy of the label.
-  const footer = () => screen.getByRole('button', { name: /^Reasoning/ })
-
-  it('shows the configured default when the slot carries no override', () => {
-    wrap(<ModelEffortDropdown {...baseProps} hasEffort currentEffort="" defaultEffort="high" />)
-    expect(footer()).toHaveTextContent('High')
+describe('ModelEffortDropdown — bounded model list', () => {
+  it('caps the picker to the viewport and leaves the model list as the flexible scroller', () => {
+    const innerHeight = window.innerHeight
+    Object.defineProperty(window, 'innerHeight', { configurable: true, value: 320 })
+    try {
+      wrap(
+        <ModelEffortDropdown
+          {...baseProps}
+          anchorRect={{ ...baseProps.anchorRect, top: 300 } as DOMRect}
+          models={Array.from({ length: 20 }, (_, index) => ({ name: `model-${index}` }))}
+          onManageModels={vi.fn()}
+          onSetDefault={vi.fn()}
+        />,
+      )
+      expect(screen.getByRole('dialog')).toHaveStyle({ maxHeight: '288px' })
+      expect(screen.getByRole('dialog')).toHaveClass('flex', 'flex-col', 'overflow-hidden')
+      expect(screen.getByRole('listbox')).toHaveClass('min-h-0', 'flex-1', 'overflow-y-auto')
+    } finally {
+      Object.defineProperty(window, 'innerHeight', { configurable: true, value: innerHeight })
+    }
   })
 
-  it('shows the per-slot override when one is set', () => {
-    wrap(<ModelEffortDropdown {...baseProps} hasEffort currentEffort="low" defaultEffort="high" />)
-    expect(footer()).toHaveTextContent('Low')
-    expect(footer()).not.toHaveTextContent('High')
-  })
-
-  it('falls back to "Default" when neither is set', () => {
-    wrap(<ModelEffortDropdown {...baseProps} hasEffort currentEffort="" defaultEffort="" />)
-    expect(footer()).toHaveTextContent('Default')
+  it('contains only model selection and management controls', () => {
+    wrap(<ModelEffortDropdown {...baseProps} />)
+    expect(screen.getByPlaceholderText('Type to filter…')).toBeInTheDocument()
+    expect(screen.queryByRole('slider')).not.toBeInTheDocument()
   })
 })
 

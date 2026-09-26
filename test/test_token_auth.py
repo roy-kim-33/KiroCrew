@@ -185,7 +185,7 @@ def test_try_consume_returns_true_once_then_false() -> None:
 
 
 def test_expired_token_rejected() -> None:
-    """Token link window (5 min) expires — URL no longer valid."""
+    """Token link window (5 min) expires — the URL stops being valid."""
     with patch("kiro_crew.dashboard.token_auth.time") as mock_time:
         mock_time.time.return_value = 1000.0
         token = generate_token("user6", ttl_seconds=3600)
@@ -335,7 +335,7 @@ async def test_cookie_set_on_query_param_auth() -> None:
 
 @pytest.mark.asyncio
 async def test_embed_parent_port_claim_survives_session_exchange() -> None:
-    """PR #118 follow-up: the connect link token carries an embed_parent_port
+    """The connect link token carries an embed_parent_port
     claim, but token_auth_middleware exchanges the link token for a fresh
     session cookie (CWE-613, never reuse the URL token). That exchange MUST
     carry the claim across, or the cookie the framed document actually presents
@@ -358,7 +358,7 @@ async def test_embed_parent_port_claim_survives_session_exchange() -> None:
     # And the middleware stashed the validated parent port on the request BEFORE
     # revoking the link nonce, so the first ?token= framed document's header
     # (server._extra_frame_ancestors) sees it even though the link token is now
-    # revoked (PR #129 follow-up — the first-hit blank-pane fix).
+    # revoked — the first-hit blank-pane fix.
     req.__setitem__.assert_any_call("embed_parent_port", "5476")
 
 
@@ -471,6 +471,58 @@ async def test_valid_query_token_still_wins_over_cookie() -> None:
     resp = await mw(req, _ok_handler)
     assert resp.status == 200
     assert resp.cookies.get("mc_token_5476") is not None
+
+
+# -- Which credential authenticated, published for the in-banner re-auth --------
+#
+# Both cases below carry the SAME user on the query token and on the cookie, and
+# both answer 200. That is deliberate: the identity is identical either way, so
+# comparing ``user_id`` across the exchange cannot tell them apart, and neither
+# can the status. Only the middleware's own record of which credential it
+# validated separates them.
+
+
+@pytest.mark.asyncio
+async def test_valid_query_token_for_the_same_user_reports_the_token_authenticated() -> None:
+    """A valid ``?token=`` authenticates even when the cookie beside it is also
+    valid and names the same user, so the published bit is True and a fresh
+    session cookie is minted -- the two facts are one decision."""
+    mw = token_auth_middleware()
+    fresh = generate_token("sameuser", ttl_seconds=300)
+    cookie = generate_token("sameuser", ttl_seconds=3600)
+    bind_token_ip(cookie, "127.0.0.1")
+    mark_consumed(cookie)
+
+    req = _make_request(query={"token": fresh}, cookies={"mc_token_5476": cookie})
+    resp = await mw(req, _ok_handler)
+
+    assert resp.status == 200
+    req.__setitem__.assert_any_call("auth_from_query_token", True)
+    assert resp.cookies.get("mc_token_5476") is not None
+
+
+@pytest.mark.asyncio
+async def test_invalid_query_token_with_valid_cookie_reports_the_cookie_authenticated() -> None:
+    """The invalid query token is replaced by the cookie, so the request is
+    authenticated and answers 200 while the presented token was NOT accepted.
+    The published bit is False, which is what stops a caller exchanging a pasted
+    token from reading this 200 as its own token working."""
+    mw = token_auth_middleware()
+    with patch("kiro_crew.dashboard.token_auth.time") as mock_time:
+        mock_time.time.return_value = 1000.0
+        stale = generate_token("sameuser2", ttl_seconds=300)
+    cookie = generate_token("sameuser2", ttl_seconds=3600)
+    bind_token_ip(cookie, "127.0.0.1")
+    mark_consumed(cookie)
+
+    req = _make_request(query={"token": stale}, cookies={"mc_token_5476": cookie})
+    resp = await mw(req, _ok_handler)
+
+    assert resp.status == 200
+    req.__setitem__.assert_any_call("auth_from_query_token", False)
+    # No exchange happened, so no fresh cookie -- the same condition, seen from
+    # the side a browser cannot read.
+    assert "mc_token_5476" not in resp.cookies
 
 
 @pytest.mark.asyncio
@@ -657,6 +709,29 @@ def test_cli_local_secret_endpoints_are_in_bypass_exact() -> None:
     assert not missing, f"CLI local-secret endpoints missing from _BYPASS_EXACT: {missing}"
 
 
+# -- Property 8a-bis: every browser-view relay route form bypasses the gate --
+#
+# The relay authenticates with the capability token in the PATH (its iframe is
+# an opaque-origin sandbox that carries no cookies), and answers a UNIFORM 404
+# for tokenless and wrong-token requests alike. Both registered route forms
+# must therefore reach the handler: the tokened form via the /browser-view/
+# prefix entry, and the bare form via its own _BYPASS_EXACT entry — without
+# the latter, the middleware 403s the bare path and hands an unauthenticated
+# prober a response that stands out from the uniform 404s.
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/browser-view", "/browser-view/", "/browser-view/tok/x.html"])
+async def test_browser_view_relay_routes_bypass_auth(path: str) -> None:
+    mw = token_auth_middleware()
+    req = _make_request(path=path)  # no token, no cookie
+    resp = await mw(req, _ok_handler)
+    assert resp.status == 200, (
+        f"{path} was denied by the auth middleware; the relay handler must "
+        f"answer every route form itself (uniform 404 without a valid token)."
+    )
+
+
 # -- Property 8b: /api/apps/* still requires auth (security boundary) --
 
 
@@ -770,7 +845,7 @@ async def test_bare_app_path_is_spa_shell_request(path: str, method: str) -> Non
     refresh (which issues a direct GET to the gateway) returns index.html
     rather than 404.
 
-    Regression for: GET /apps/code-review-sage on refresh returned 404 because
+    Without the shell fallback, GET /apps/code-review-sage on refresh returns 404 because
     SPA_FALLBACK_EXCLUDED_PREFIXES included '/apps/' wholesale, causing the
     spa_fallback middleware to re-raise HTTPNotFound instead of serving shell.
     """
@@ -782,7 +857,6 @@ async def test_bare_app_path_is_spa_shell_request(path: str, method: str) -> Non
     ), f"{method} {path} should be a SPA shell request (browser refresh must work)"
 
 
-@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "path",
     [
@@ -824,7 +898,7 @@ def test_apps_router_subpaths_are_spa_shell(path: str, method: str) -> None:
     """React Router owns /apps/detail/{name} and /apps/migrate/{name} (App.tsx).
     Neither has a server-side route, so both must get the SPA shell.
 
-    Regression for: _APPS_SPA_EXCLUDED_RE matched any /apps/{seg}/ path, so it
+    If _APPS_SPA_EXCLUDED_RE matched any /apps/{seg}/ path, it would
     read "detail" and "migrate" as the app name and excluded these from the
     shell. Pasting /apps/detail/task-runner into the address bar (or refreshing
     on it) returned 404; the routes worked only via in-app navigation.
@@ -884,7 +958,7 @@ def test_app_assets_paths_are_not_spa_shell(path: str) -> None:
     letting the <img onError> fallback run) instead of being answered with
     index.html.
 
-    Regression for: recently added colorful builtin icons / hero images did not
+    Without the exclusion, the colorful builtin icons / hero images would not
     render because /app-assets/ had no static route AND was not in
     SPA_FALLBACK_EXCLUDED_PREFIXES, so the SVG requests were served index.html
     (HTML) and every <img> tripped its placeholder fallback.
@@ -898,7 +972,7 @@ def test_app_assets_paths_are_not_spa_shell(path: str) -> None:
     ), f"GET {path} should NOT be a SPA shell request (static brand asset)"
 
 
-# -- Property 9: Loopback no longer bypasses auth (port-forward fix) --
+# -- Property 9: Loopback does not bypass auth (port-forward fix) --
 
 
 @pytest.mark.asyncio
@@ -1237,7 +1311,7 @@ def test_revoke_all_sessions_kills_established_cookie() -> None:
 def test_signing_secret_persisted_across_loads(tmp_path, monkeypatch) -> None:
     """Regression: the HMAC signing secret must persist across processes.
 
-    Previously _SECRET was os.urandom(32) per import, so every restart rotated
+    A per-import ``os.urandom(32)`` _SECRET would rotate
     the key and invalidated all outstanding tokens/cookies ("invalid
     signature"). The secret is now loaded-or-created from a 0600 key file.
     """
@@ -1262,7 +1336,7 @@ def test_signing_secret_persisted_across_loads(tmp_path, monkeypatch) -> None:
 
 
 def test_signing_secret_concurrent_first_init_converges(tmp_path, monkeypatch) -> None:
-    """Regression (PR #338 / GPT 5.6 HIGH): concurrent first-time inits MUST
+    """Concurrent first-time inits MUST
     converge on a single signing key.
 
     ``warm_auth_singletons()`` primes the signing secret BEFORE the gateway
@@ -1469,8 +1543,15 @@ def test_signing_secret_transient_publish_failure_never_creates_the_destination(
         "a transient publish failure created the destination anyway — a kill in "
         "that write window persists the 0-byte key this fix removes"
     )
-    # Nothing of ours is left in the config dir either.
-    assert list(tmp_path.iterdir()) == []
+    # No copy of ours is left either. The staging directory itself is expected --
+    # the publish creates it before staging and it is masked and fenced -- so what
+    # must be empty is the directory, not the data home.
+    assert [p.name for p in tmp_path.iterdir()] == [
+        ts._AUTH_STORE_STAGING_LEAF
+    ], "a failed publish left something other than the staging directory behind"
+    assert (
+        list((tmp_path / ts._AUTH_STORE_STAGING_LEAF).iterdir()) == []
+    ), "a staged copy of the signing key survived a failed publish"
 
 
 def test_signing_secret_persists_on_a_filesystem_without_hard_links(tmp_path, monkeypatch) -> None:
@@ -1567,8 +1648,8 @@ def test_signing_secret_failed_dir_sync_keeps_a_recoverable_name(tmp_path, monke
     So a genuine sync failure keeps the staging name as a recoverable second
     reference, and still returns the key that is on disk rather than degrading to
     an ephemeral secret (which would diverge from the persisted key). The kept
-    leftover is safe precisely because it ends in ``.tmp`` and so stays behind the
-    keystone fence.
+    leftover is safe precisely because it sits inside the masked, fenced staging
+    directory.
     """
     import errno as _errno
 
@@ -1579,7 +1660,7 @@ def test_signing_secret_failed_dir_sync_keeps_a_recoverable_name(tmp_path, monke
     def _failing_sync(path, **kwargs):  # type: ignore[no-untyped-def]
         # best_effort would swallow this; strict must let it surface here.
         assert not kwargs.get("best_effort"), (
-            "the publish must sync the directory STRICTLY — best_effort hides the "
+            "the publish must sync the directory STRICTLY -- best_effort hides the "
             "very EIO that makes dropping the second name unsafe"
         )
         raise OSError(_errno.EIO, "simulated: device refused the directory sync")
@@ -1591,11 +1672,18 @@ def test_signing_secret_failed_dir_sync_keeps_a_recoverable_name(tmp_path, monke
     key_file = tmp_path / ts._SECRET_KEY_FILE
     assert key_file.exists(), "the key was not published"
     assert key_file.read_bytes() == secret, (
-        "returned an ephemeral secret while a valid key sits on disk — the "
+        "returned an ephemeral secret while a valid key sits on disk -- the "
         "divergence the exclusive publish exists to prevent"
     )
 
-    leftovers = [p for p in tmp_path.iterdir() if p.name != ts._SECRET_KEY_FILE]
+    # The recoverable second name lives in the staging directory, not beside the
+    # key: the data-home root is sandbox-visible, so a leftover there would be a
+    # readable copy of the signing key.
+    staging = tmp_path / ts._AUTH_STORE_STAGING_LEAF
+    assert sorted(p.name for p in tmp_path.iterdir()) == sorted(
+        [ts._SECRET_KEY_FILE, ts._AUTH_STORE_STAGING_LEAF]
+    ), "a copy of the signing key was left loose in the data-home root"
+    leftovers = list(staging.iterdir())
     assert len(leftovers) == 1, (
         "a failed directory sync must keep exactly one recoverable second name, "
         f"found {[p.name for p in leftovers]}"
@@ -1606,10 +1694,20 @@ def test_signing_secret_failed_dir_sync_keeps_a_recoverable_name(tmp_path, monke
         "the kept name is a separate inode, so it is a second COPY of the signing "
         "key rather than a second name for it"
     )
-    # And it is still fenced, which is what makes keeping it acceptable.
+    # And it is still fenced, which is what makes keeping it acceptable. Asserted
+    # where the staging directory REALLY sits: the fence resolves its targets from
+    # the real crew-home prefixes, so a tmp_path candidate would prove nothing.
     from kiro_crew import security
 
-    assert kept.name.endswith(security._KEYSTONE_ARTIFACT_SUFFIXES)
+    targets = security._home_dir_targets(
+        tuple(d for d in security.sensitive_home_dirs() if d.endswith(ts._AUTH_STORE_STAGING_LEAF))
+    )
+    assert targets, "the fence resolved no staging directory, so nothing is protected"
+    for target in sorted(targets):
+        assert security.is_sensitive_path(os.path.join(target, kept.name)), (
+            f"a leftover {kept.name!r} in {target} would not be fenced -- it holds a "
+            "full copy of the signing key and agent tools could read it"
+        )
 
 
 def test_signing_secret_staging_file_is_covered_by_the_keystone_fence(
@@ -1617,20 +1715,29 @@ def test_signing_secret_staging_file_is_covered_by_the_keystone_fence(
 ) -> None:
     """A leftover staging file must be fenced exactly like the key it copies.
 
-    The staging sibling holds the FULL signing key until the publish link lands,
-    and a kill between that link and the cleanup unlink leaves it on disk. The
-    keystone fence in ``security.py`` protects a publish artifact by SHAPE — a
-    direct child of a keystone leaf's own directory whose name ends in one of
-    ``_KEYSTONE_ARTIFACT_SUFFIXES`` — so a staging name outside those suffixes
-    leaves a readable copy of the key for an agent tool to fetch and forge tokens
-    with.
+    The staged file holds the FULL signing key until the publish link lands, and a
+    kill between that link and the cleanup unlink leaves it on disk. It is
+    protected by living inside ``_AUTH_STORE_STAGING_LEAF``, which
+    ``security.paths`` fences as a whole DIRECTORY -- so every name inside it is
+    covered, present and future.
 
-    Asserted against the real predicate rather than against the literal suffix, so
-    the coupling survives a rename on either side. The name is tested in the
-    directory the key actually lives in: the fence resolves its parent set from
-    the real crew-home prefixes, so pointing ``KIROCREW_HOME`` at a temp dir would
-    move the key without moving the fence and prove nothing.
+    Two things are asserted, because either alone can be true while the key is
+    exposed. First, the publish really does stage INSIDE that directory: a temp
+    beside the key would sit in the data-home root, which is sandbox-visible and
+    same-uid writable, and no suffix rule makes that unreachable to a spawned
+    shell. Second, the fence really does cover that path -- asserted where the
+    directory REALLY sits, since the fence resolves its targets from the real
+    crew-home prefixes and a ``tmp_path`` candidate would prove nothing.
+
+    The no-suffix control is the point of the third assertion: the fence must
+    cover a name that ends in no keystone suffix at all. That is what
+    distinguishes the directory entry now doing the work from the old
+    ``_KEYSTONE_ARTIFACT_SUFFIXES`` shape rule, which reached only a direct child
+    of a keystone leaf's own directory and stopped applying when the temp moved
+    down one level.
     """
+    from pathlib import Path
+
     from kiro_crew import security
     from kiro_crew.dashboard import token_secret as ts
 
@@ -1647,45 +1754,387 @@ def test_signing_secret_staging_file_is_covered_by_the_keystone_fence(
     monkeypatch.undo()
 
     assert captured, "the publish never linked, so no staging name was observed"
-    staged_name = os.path.basename(captured[0])
-    assert staged_name.endswith(
-        security._KEYSTONE_ARTIFACT_SUFFIXES
-    ), f"staging name {staged_name!r} is outside the keystone artifact suffixes"
+    staged = Path(captured[0])
+    assert staged.parent == tmp_path / ts._AUTH_STORE_STAGING_LEAF, (
+        f"the key was staged at {staged} instead of inside "
+        f"{ts._AUTH_STORE_STAGING_LEAF!r}; a temp in the data-home root is visible "
+        "in every agent sandbox and link(2)-able while the write is in flight"
+    )
 
-    # Now ask the fence about that same name where the key really sits.
-    parents = security._home_dir_targets(security._KEYSTONE_ARTIFACT_PARENTS)
-    assert parents, "the fence resolved no keystone artifact parents"
-    for parent in sorted(parents):
-        candidate = os.path.join(parent, staged_name)
-        assert security._is_keystone_publish_artifact(candidate), (
-            f"a leftover {staged_name!r} in {parent} would not be fenced — it "
+    targets = security._home_dir_targets(
+        tuple(d for d in security.sensitive_home_dirs() if d.endswith(ts._AUTH_STORE_STAGING_LEAF))
+    )
+    assert targets, "the fence resolved no staging directory, so nothing is protected"
+    for target in sorted(targets):
+        assert security.is_sensitive_path(os.path.join(target, staged.name)), (
+            f"a leftover {staged.name!r} in {target} would not be fenced -- it "
             "holds a full copy of the signing key and agent tools could read it"
+        )
+        # Control: coverage must not depend on the filename's suffix.
+        assert security.is_sensitive_path(os.path.join(target, "leftover-with-no-suffix")), (
+            f"{target} is fenced only for suffixed names, so the protection is still "
+            "the old shape rule rather than the directory entry"
         )
 
 
 def test_signing_secret_publish_leaves_no_staging_file_behind(tmp_path, monkeypatch) -> None:
-    """The staging sibling is this process's private file and must not survive.
+    """The staged file is this process's private file and must not survive.
 
     A leftover staging file is inert (the key is published under its own name)
-    but it holds a full copy of the signing secret, so the config directory must
-    contain exactly the key file after a successful publish -- and after a
-    publish this process LOST to a sibling, where its candidate is dropped
-    rather than installed.
+    but it holds a full copy of the signing secret, so after a successful publish
+    the staging directory must be EMPTY -- and equally after a publish this
+    process LOST to a sibling, where its candidate is dropped rather than
+    installed.
+
+    The staging DIRECTORY itself is expected to remain: it is masked, fenced and
+    precreated by the sandbox materialiser, so it is a fixture of the data home
+    rather than an artifact of one write. What must not remain is a file in it.
     """
     from kiro_crew.dashboard import token_secret as ts
 
     monkeypatch.setattr("kiro_crew.config.loader.config_dir", lambda: tmp_path)
     key_file = tmp_path / ts._SECRET_KEY_FILE
+    staging = tmp_path / ts._AUTH_STORE_STAGING_LEAF
+
+    expected_home = sorted([ts._SECRET_KEY_FILE, ts._AUTH_STORE_STAGING_LEAF])
 
     secret = ts._load_or_create_secret()
     assert key_file.read_bytes() == secret
-    assert [p.name for p in tmp_path.iterdir()] == [ts._SECRET_KEY_FILE]
+    assert sorted(p.name for p in tmp_path.iterdir()) == expected_home
+    assert [
+        p.name for p in staging.iterdir()
+    ] == [], "a staged file survived the publish; it holds a full copy of the signing key"
 
     # Now the losing path: a key already exists, so a second loader must read it
     # and leave nothing of its own candidate behind.
     again = ts._load_or_create_secret()
     assert again == secret, "second loader diverged from the persisted key"
-    assert [p.name for p in tmp_path.iterdir()] == [ts._SECRET_KEY_FILE]
+    assert sorted(p.name for p in tmp_path.iterdir()) == expected_home
+    assert [p.name for p in staging.iterdir()] == [], "the losing loader left its candidate staged"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory modes only")
+def test_signing_secret_survives_a_staging_dir_mode_it_cannot_narrow(tmp_path, monkeypatch) -> None:
+    """A staging directory whose mode will not narrow must not block the key.
+
+    A group- or world-accessible staging directory is worth closing, because
+    another local account can then list the publish temps' names, so the
+    validator chmods it. What it must not do is REFUSE when the chmod does not
+    stick, because the filesystems where it cannot stick are whole classes rather
+    than broken hosts: CIFS applies its mount-wide ``dir_mode`` and disregards
+    chmod, and vfat/exFAT carry no POSIX mode at all.
+
+    The validator runs BEFORE the creation loop's retry budget, so a raise there
+    escapes to the outer handler, which degrades to an ephemeral secret and
+    writes nothing. On such a host no boot would ever persist a signing key, so
+    every restart would invalidate every dashboard session. A read bit leaks temp
+    NAMES and grants no substitution, so it is the side of the boundary that
+    warns. A group- or world-WRITE bit is refused instead, and
+    ``test_signing_secret_refuses_a_group_writable_staging_dir`` pins that half.
+
+    The load-bearing assertion is therefore that the key reached disk. The
+    warning is asserted too, so the weaker outcome is at least not silent.
+    """
+    from kiro_crew.dashboard import token_secret as ts
+
+    monkeypatch.setattr("kiro_crew.config.loader.config_dir", lambda: tmp_path)
+    staging = tmp_path / ts._AUTH_STORE_STAGING_LEAF
+    staging.mkdir(parents=True, exist_ok=True)
+    os.chmod(staging, 0o755)  # nosemgrep: python.lang.security.audit.insecure-file-permissions.insecure-file-permissions -- the wide mode IS this test's input: 0o755 carries no group/world WRITE bit, which is the boundary the validator warns on rather than refuses. lockdown-ok: a tmp_path directory, not a published artifact.  # noqa: E501  # fmt: skip
+
+    templates: list[str] = []
+    monkeypatch.setattr(ts.logger, "warning", lambda msg, *a, **kw: templates.append(str(msg)))
+    # A filesystem that rejects the call outright, as vfat and exFAT do. The
+    # payload write tolerates this already: both call sites pass
+    # restrict_on_error="warn" for the same reason.
+    monkeypatch.setattr(os, "chmod", _refusing_chmod)
+
+    secret = ts._load_or_create_secret()
+
+    key_file = tmp_path / ts._SECRET_KEY_FILE
+    assert key_file.exists(), (
+        "a staging directory whose mode could not be narrowed stopped the signing key "
+        "from being persisted at all; on such a filesystem every restart would "
+        "invalidate every dashboard session"
+    )
+    assert key_file.read_bytes() == secret, "the returned secret is not the persisted one"
+    assert any("could not be narrowed" in t for t in templates), (
+        "the un-narrowable wide mode was accepted silently; it lets other local "
+        "accounts list the publish temps' names, so it must be reported"
+    )
+
+
+def _refusing_chmod(*_args, **_kwargs) -> None:
+    """A ``chmod`` that the filesystem rejects, as vfat and exFAT do."""
+    raise OSError(errno.EPERM, "filesystem does not support changing modes")
+
+
+def test_signing_secret_staging_dir_is_locked_to_its_owner_on_both_platforms(
+    tmp_path, monkeypatch
+) -> None:
+    """The lockdown must run on Windows too, where no mode test can see the ACL.
+
+    All three POSIX checks are mode-based, so a Windows staging directory a foreign
+    principal can write would pass unexamined and that principal could replace a staged
+    file between the write and the publish link. The directory-shaped helper is what
+    expresses owner-only on both platforms, so the assertion is that it is CALLED.
+    """
+    from kiro_crew.dashboard import token_secret as ts
+
+    called: list[str] = []
+    monkeypatch.setattr(
+        ts.platform_compat, "restrict_dir_to_owner", lambda p: called.append(str(p))
+    )
+
+    staging = tmp_path / ts._AUTH_STORE_STAGING_LEAF
+    assert ts.auth_store_staging_dir(tmp_path) == staging
+    assert called == [str(staging)], (
+        "the staging directory was not locked to its owner; on Windows that is the only "
+        "check there is, since every mode test is POSIX-gated"
+    )
+
+
+def test_signing_secret_staging_dir_refuses_when_windows_lockdown_fails(
+    tmp_path, monkeypatch
+) -> None:
+    """On Windows a lockdown that fails is a refusal, because nothing else can judge it.
+
+    On POSIX the mode split below it can see what survived and separates substitution from
+    a name leak. On Windows there is no such reading, so failing to lock is the whole
+    signal and it fails closed.
+    """
+    from kiro_crew.dashboard import token_secret as ts
+
+    def _refusing_lockdown(_path):
+        raise OSError(errno.EPERM, "cannot write the DACL")
+
+    monkeypatch.setattr(ts.platform_compat, "restrict_dir_to_owner", _refusing_lockdown)
+    monkeypatch.setattr(ts.os, "name", "nt")
+
+    with pytest.raises(OSError) as caught:
+        ts.auth_store_staging_dir(tmp_path)
+    assert caught.value.errno == errno.EPERM
+    assert "locked to its owner" in str(
+        caught.value
+    ), "the refusal must say what could not be done, or an operator cannot act on it"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory modes only")
+def test_signing_secret_refuses_a_group_writable_staging_dir(tmp_path, monkeypatch) -> None:
+    """A group- or world-WRITABLE staging directory must be refused, not narrowed-and-warned.
+
+    A read bit only lets another local account list the publish temps' names. A WRITE bit
+    lets it replace the staged file between the payload write and the publish ``os.link``,
+    which installs a signing key of its choosing as the one signing every dashboard token,
+    with nothing downstream able to notice.
+
+    So the refusal is the assertion. What it must NOT do is publish in place instead: that
+    writer creates the destination empty and fills it afterwards, so it would trade a
+    one-``chmod`` misconfiguration for a zero-byte signing key on a host that was publishing
+    atomically. The refusal degrades to an ephemeral secret for this process and leaves the
+    stored file exactly as it was -- which for a first-ever publish means no file at all, and
+    for an upgraded host means yesterday's key still validates yesterday's sessions.
+    ``test_signing_secret_persists_in_place_when_the_home_cannot_stage_at_all`` pins the other
+    side: a home that genuinely cannot stage DOES reach the in-place writer, because there the
+    alternative is no persisted key on any boot.
+    """
+    from kiro_crew.dashboard import token_secret as ts
+
+    monkeypatch.setattr("kiro_crew.config.loader.config_dir", lambda: tmp_path)
+    staging = tmp_path / ts._AUTH_STORE_STAGING_LEAF
+    staging.mkdir(parents=True, exist_ok=True)
+    os.chmod(staging, 0o777)  # nosemgrep: python.lang.security.audit.insecure-file-permissions.insecure-file-permissions -- the world-writable mode IS this test's input, and refusing it is what is under test. lockdown-ok: a tmp_path directory, not a published artifact.  # noqa: E501  # fmt: skip
+    monkeypatch.setattr(os, "chmod", _refusing_chmod)
+
+    with pytest.raises(ts.AuthStoreStagingRefused) as caught:
+        ts.auth_store_staging_dir(tmp_path)
+    assert caught.value.errno == errno.EPERM
+    assert "WRITABLE" in str(caught.value), (
+        "the refusal must say which bit it refused on, or an operator cannot tell it from "
+        "the read-bit case that only warns"
+    )
+
+    key_file = tmp_path / ts._SECRET_KEY_FILE
+    assert not key_file.exists(), "the fixture already had a key, so nothing below discriminates"
+
+    secret = ts._load_or_create_secret()
+
+    assert not key_file.exists(), (
+        "the refusal published a key in place anyway; that writer creates the destination "
+        "empty and fills it afterwards, so a kill in that window leaves a zero-byte signing "
+        "key -- bought against a misconfiguration one chmod fixes"
+    )
+    assert len(secret) >= ts._MIN_KEY_BYTES, (
+        "no usable secret was returned at all; the refusal degrades to an ephemeral secret "
+        "for this process, it does not fail the gateway"
+    )
+
+    stored = b"p" * ts._MIN_KEY_BYTES
+    key_file.write_bytes(stored)
+    assert ts._load_or_create_secret() == stored, (
+        "an upgraded host's stored key was not used; the staging refusal is about publishing "
+        "a NEW key, not about reading the current one"
+    )
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory modes only")
+def test_signing_secret_persists_in_place_when_the_home_cannot_stage_at_all(
+    tmp_path, monkeypatch
+) -> None:
+    """A home that cannot stage still gets a persisted key, which is the other direction.
+
+    A non-directory occupying the staging name is not a substitution risk, it is an obstruction
+    -- and the in-place writer needs no staging directory, so refusing to use it here would mean
+    no boot ever persists a key and every restart invalidates every session. This is why the
+    permission refusal carries its own exception type rather than being told apart by errno at
+    the call site.
+    """
+    from kiro_crew.dashboard import token_secret as ts
+
+    monkeypatch.setattr("kiro_crew.config.loader.config_dir", lambda: tmp_path)
+    blocker = tmp_path / ts._AUTH_STORE_STAGING_LEAF
+    blocker.write_text("not a directory\n", encoding="utf-8")
+
+    with pytest.raises(OSError) as caught:
+        ts.auth_store_staging_dir(tmp_path)
+    assert caught.value.errno == errno.ENOTDIR
+    assert not isinstance(caught.value, ts.AuthStoreStagingRefused), (
+        "an unusable home was raised as a permission refusal, which would degrade the key to "
+        "an ephemeral secret on every boot instead of persisting one"
+    )
+
+    secret = ts._load_or_create_secret()
+    key_file = tmp_path / ts._SECRET_KEY_FILE
+    assert key_file.exists(), (
+        "a home that cannot stage stopped the signing key from being persisted at all, "
+        "although the in-place writer needs no staging directory"
+    )
+    assert key_file.read_bytes() == secret, "the returned secret is not the persisted one"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory modes only")
+def test_signing_secret_readable_staging_dir_is_not_refused(tmp_path, monkeypatch) -> None:
+    """The read-bit side of the same boundary stays a warning, so the mount class still works.
+
+    ``dir_mode=0755`` is the CIFS/vfat default rather than a hostile setting, and it grants
+    no substitution. Refusing it would fail the publish on an ordinary mount.
+    """
+    from kiro_crew.dashboard import token_secret as ts
+
+    monkeypatch.setattr("kiro_crew.config.loader.config_dir", lambda: tmp_path)
+    staging = tmp_path / ts._AUTH_STORE_STAGING_LEAF
+    staging.mkdir(parents=True, exist_ok=True)
+    os.chmod(staging, 0o755)  # nosemgrep: python.lang.security.audit.insecure-file-permissions.insecure-file-permissions -- the read-only-wide mode IS this test's input. lockdown-ok: a tmp_path directory, not a published artifact.  # noqa: E501  # fmt: skip
+    monkeypatch.setattr(os, "chmod", _refusing_chmod)
+
+    assert ts.auth_store_staging_dir(tmp_path) == staging, (
+        "a group-readable staging directory was refused; only a WRITE bit permits the "
+        "substitution the refusal exists to stop"
+    )
+
+
+def test_signing_secret_a_recovered_staging_failure_does_NOT_unlock_the_in_place_create(
+    tmp_path, monkeypatch
+) -> None:
+    """The in-place path is for a home that cannot stage, not one that faltered once.
+
+    ``_create_key_in_place`` creates the destination EMPTY and writes afterwards, so it
+    carries the truncation window the staging publish exists to remove: a termination in that
+    gap leaves a short key at the real name and poisons every later boot. The surrounding
+    policy admits it only where the alternative is no persisted key at all -- a filesystem
+    that genuinely cannot hard-link.
+
+    A staging lookup that fails once and then succeeds is not that filesystem. If its flag
+    still speaks for the loop, any home that recovered gets the truncation window handed to
+    it, so a LATER link failure that should have degraded to an ephemeral secret instead
+    writes the real name.
+    """
+    from kiro_crew.dashboard import token_secret as ts
+
+    monkeypatch.setattr("kiro_crew.config.loader.config_dir", lambda: tmp_path)
+
+    real_staging = ts.auth_store_staging_dir
+    staging_calls: list[int] = []
+
+    def _fail_once(home):  # type: ignore[no-untyped-def]
+        staging_calls.append(1)
+        if len(staging_calls) == 1:
+            raise OSError(errno.EAGAIN, "staging directory briefly unavailable")
+        return real_staging(home)
+
+    def _link_always_fails(*_a, **_k):  # type: ignore[no-untyped-def]
+        # NOT one of _LINK_UNSUPPORTED_ERRNOS: EPERM and friends say the filesystem cannot
+        # link at all, which unlocks the in-place path on its own merits and would hide the
+        # thing under test. EBUSY is the transient class, so the only route left to the
+        # in-place create is a staging flag that outlived its failure.
+        raise OSError(errno.EBUSY, "link target busy")
+
+    in_place_calls: list[int] = []
+    real_in_place = ts._create_key_in_place
+
+    def _counting_in_place(key_path):  # type: ignore[no-untyped-def]
+        in_place_calls.append(1)
+        return real_in_place(key_path)
+
+    monkeypatch.setattr(ts, "auth_store_staging_dir", _fail_once)
+    monkeypatch.setattr(ts, "_create_key_in_place", _counting_in_place)
+    monkeypatch.setattr(ts.os, "link", _link_always_fails)
+
+    ts._load_or_create_secret()
+
+    assert len(staging_calls) >= 2, (
+        "staging never recovered, so this test is measuring the link-less case instead of the "
+        "recovered one"
+    )
+    assert in_place_calls == [], (
+        "a staging failure that had already recovered still unlocked the in-place create, so "
+        "a home that merely faltered once is handed the truncation window the staging publish "
+        "exists to remove"
+    )
+
+
+def test_signing_secret_retries_a_transient_staging_dir_failure(tmp_path, monkeypatch) -> None:
+    """A staging-directory failure must be retried, not escape the budget.
+
+    ``auth_store_staging_dir`` is resolved INSIDE the creation loop. It can fail
+    for reasons that pass on the next attempt -- a sibling gateway creating the
+    same directory, a Windows sharing violation, a mount briefly unavailable --
+    and the loop already absorbs exactly that class of failure for the payload
+    write and for the publish link.
+
+    Resolved outside the loop it is a single point of failure: the OSError
+    escapes, reaches the function's outer handler, and that handler degrades to
+    an EPHEMERAL secret having written nothing. One transient miss at boot then
+    costs the host its persisted signing key, which is why the discriminating
+    assertion is that the key is on disk after a first-attempt failure.
+    """
+    from kiro_crew.dashboard import token_secret as ts
+
+    monkeypatch.setattr("kiro_crew.config.loader.config_dir", lambda: tmp_path)
+
+    real = ts.auth_store_staging_dir
+    calls: list[int] = []
+
+    def _fail_once(home):  # type: ignore[no-untyped-def]
+        calls.append(1)
+        if len(calls) == 1:
+            raise OSError(errno.EAGAIN, "staging directory briefly unavailable")
+        return real(home)
+
+    monkeypatch.setattr(ts, "auth_store_staging_dir", _fail_once)
+
+    secret = ts._load_or_create_secret()
+
+    assert len(calls) >= 2, (
+        "the staging-directory failure was never retried, so it is not inside the "
+        "creation loop's retry budget"
+    )
+    key_file = tmp_path / ts._SECRET_KEY_FILE
+    assert key_file.exists(), (
+        "a transient staging-directory failure escaped the retry budget and left no "
+        "persisted key, so the gateway would sign with an ephemeral secret"
+    )
+    assert key_file.read_bytes() == secret, "the returned secret is not the persisted one"
 
 
 def test_signing_secret_binary_write_survives_windows_text_mode(tmp_path, monkeypatch) -> None:
@@ -1693,7 +2142,7 @@ def test_signing_secret_binary_write_survives_windows_text_mode(tmp_path, monkey
 
     On Windows ``os.open()`` defaults to TEXT mode, so the ``os.write()`` that
     persists the random key translates every ``0x0A`` ('\\n') byte to
-    ``0x0D 0x0A`` ('\\r\\n'). The on-disk key then grows and no longer equals
+    ``0x0D 0x0A`` ('\\r\\n'). The on-disk key then grows and does not equal
     the creator's in-memory bytes (nor a sibling's read) — silent auth
     divergence, and the root cause of the flaky Windows failures in
     ``test_signing_secret_{concurrent_first_init_converges,create_contention_retries_not_ephemeral,write_failure_cleans_up_incomplete_file}``.
@@ -1727,7 +2176,7 @@ def test_signing_secret_binary_write_survives_windows_text_mode(tmp_path, monkey
 
 
 def test_signing_secret_existing_file_never_overwritten(tmp_path, monkeypatch) -> None:
-    """Regression (PR #338): warming must never overwrite or truncate an
+    """Warming must never overwrite or truncate an
     existing key file.
 
     A pre-existing valid key is read verbatim across repeated warms (multiple
@@ -1755,12 +2204,11 @@ def test_signing_secret_existing_file_never_overwritten(tmp_path, monkeypatch) -
 
 
 def test_signing_secret_write_failure_cleans_up_incomplete_file(tmp_path, monkeypatch) -> None:
-    """Regression (PR #338 / GPT 5.6 HIGH): a write failure DURING exclusive
+    """A write failure DURING exclusive
     creation must NOT leave a poisoned short key file behind.
 
     A creator that writes 32 bytes and fails partway (ENOSPC, quota) must leave
-    NOTHING short or empty where the key belongs. Previously the incomplete file
-    was left on disk: every future boot's fast-path read saw < 32 bytes, the
+    NOTHING short or empty where the key belongs. An incomplete file left on disk makes every future boot's fast-path read see < 32 bytes, the
     create then hit FileExistsError, the bounded retry budget exhausted, and the
     gateway fell back to a FRESH ephemeral key on EVERY restart (tokens die on
     each restart; concurrent gateways cannot validate one another) until a human
@@ -1807,7 +2255,7 @@ def test_signing_secret_write_failure_cleans_up_incomplete_file(tmp_path, monkey
     #     left behind to poison future boots.
     assert not key_file.exists(), "incomplete key file was left on disk (poisoned)"
 
-    # Restore a working write and prove the path is no longer poisoned: the
+    # Restore a working write and prove the path is not poisoned: the
     # next init must create a full, durable, owner-only key and return it.
     monkeypatch.setattr(os, "write", real_write)
     secret2 = ts._load_or_create_secret()
@@ -1873,7 +2321,7 @@ def test_signing_secret_incomplete_file_not_deleted_if_replaced(tmp_path, monkey
 
 def test_evict_expired_removes_old_entries() -> None:
     """Verify evict_expired removes expired IP bindings, consumed tokens, and nonces."""
-    from kiro_crew.dashboard.token_auth import _state
+    from kiro_crew.dashboard.token_auth import _state, _token_pin_key
 
     # Generate a token and bind IP / mark consumed
     token = generate_token("evict_user")
@@ -1889,7 +2337,8 @@ def test_evict_expired_removes_old_entries() -> None:
 
     # Verify expired entries were removed
     with _state._lock:
-        assert token not in _state._peer_bindings, "expired IP binding should be evicted"
+        pin_key = _token_pin_key(token)
+        assert pin_key not in _state._peer_bindings, "expired pin should be evicted"
         assert token not in _state._consumed, "expired consumed token should be evicted"
         assert "expired_nonce" not in _state._nonces, "expired nonce should be evicted"
 
@@ -2048,7 +2497,7 @@ def test_no_get_route_outside_shell_exclusions() -> None:
 
     Note: /apps/ routes are validated against _APPS_SPA_EXCLUDED_RE (which
     requires a sub-path after {name}/), NOT against SPA_FALLBACK_EXCLUDED_PREFIXES
-    (which no longer contains "/apps/" since that entry was dead code after
+    (which does not contain "/apps/"; that entry is dead code given
     _is_spa_shell_request gained its own /apps/ early-return branch).
     (Reads source rather than importing server.py to avoid heavy import side effects.)
     """
@@ -2668,12 +3117,12 @@ def test_app_owns_path_boundaries() -> None:
     # /api/app-store/refresh, a namespace no app name can collide with. The
     # reserved-segment carve-out below: even under the /api/apps/registry/refresh
     # spelling (never a registered route — this pins the boundary, not a live
-    # endpoint) the name no longer owns the path, so relocating a shared route
-    # under /api/apps/ can no longer silently hand it to a same-named app.
+    # endpoint) the name does not own the path, so relocating a shared route
+    # under /api/apps/ cannot silently hand it to a same-named app.
     assert not _app_owns_path("registry", "/api/app-store/refresh")
     assert not _app_owns_path("registry", "/api/apps/registry/refresh")
 
-    # Reserved-segment carve-out (issue #7111, sibling of #6206): the literal
+    # Reserved-segment carve-out: the literal
     # first-segment routes under /api/apps/ (registry, registries, blob, install,
     # register) are SHARED routes registered before the /api/apps/{name}
     # catch-all. An app that names itself after one of them must NOT implicitly
@@ -2703,7 +3152,7 @@ def test_app_owns_path_boundaries() -> None:
 
 
 def test_reserved_app_path_segments_stay_in_sync() -> None:
-    """Issue #7111 drift guard: RESERVED_APP_PATH_SEGMENTS is defined
+    """Drift guard: RESERVED_APP_PATH_SEGMENTS is defined
     INDEPENDENTLY in dashboard.token_auth and apps.manifest (duplicated rather
     than shared to avoid a manifest <-> token_auth import cycle). Both sets, plus
     the literal /api/apps/<segment> route table in apps.routes.setup_routes, are
@@ -2738,7 +3187,7 @@ async def test_app_token_denied_on_unscoped_endpoint(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_app_token_named_registries_denied_on_refresh(monkeypatch) -> None:
-    """Issue #7111: an app token named 'registries' must NOT reach the shared
+    """An app token named 'registries' must NOT reach the shared
     POST /api/apps/registries/refresh (which triggers outbound git fetches of
     every configured registry). With _app_api_allowlist forced empty, the only
     way a grant could happen is the _app_owns_path carve-out failing — so a 403
@@ -3044,7 +3493,7 @@ async def test_index_serves_guidance_when_bundle_missing(tmp_path, monkeypatch) 
     assert "someminted.token.value" not in body
 
 
-# -- index() SPA shell caching (issue #5087) -----------------------------------
+# -- index() SPA shell caching -----------------------------------
 
 
 @pytest.mark.asyncio
@@ -3053,8 +3502,8 @@ async def test_index_caches_html_and_rerereads_only_on_rebuild(tmp_path, monkeyp
     an UNCHANGED file read disk once; a rebuild (mtime change) is picked up on
     the next request WITHOUT a restart.
 
-    Regression test for #5087 (unnecessary per-request read of a static bundle)
-    AND for the review finding that a process-lifetime cache would pin a
+    Two things are pinned: no unnecessary per-request read of a static bundle,
+    and no process-lifetime cache that would pin a
     pre-rebuild shell after a Vite rebuild rewrote the hashed asset refs.
     """
     import kiro_crew.dashboard.handlers.core as core
@@ -3272,7 +3721,7 @@ def test_warm_auth_singletons_primes_both_off_loop(monkeypatch) -> None:
 
     Both lazily do blocking file I/O on first use (read/create
     token_signing.key + read the nonce denylist; on Windows also the owner-only
-    DACL). They are NO LONGER warmed synchronously in
+    DACL). They are not warmed synchronously in
     the token_auth_middleware() factory, because that factory runs on the loop
     via the async start_dashboard()/start_api_server(). The async startup paths
     await this helper instead, so the first auth op hits warm singletons with
@@ -3349,7 +3798,7 @@ def test_start_paths_warm_auth_singletons_off_loop() -> None:
 
 
 def test_ambiguous_app_and_window_names_cannot_collide(tmp_path) -> None:
-    """The pair that used to collide now yields two distinct routes.
+    """A name pair that could collide now yields two distinct routes.
 
     The old scheme served these flat at ``/<app>-<window>.html``, which is
     ambiguous the moment either name contains a hyphen: app ``foo`` + window
@@ -3439,7 +3888,7 @@ def test_app_window_entries_register_route_and_exclusion(tmp_path) -> None:
         ta._APP_WINDOW_EXCLUDED_PATHS = prior
 
 
-# -- Identity-pinned sessions (RFC Phase 3, issue #1762) --
+# -- Identity-pinned sessions (RFC Phase 3) --
 #
 # Middleware-level behaviour of the peer-keyed pin: the tailnet branch is new,
 # the ip: branch must be byte-for-byte the pre-peer behaviour. Whois is mocked
@@ -3503,7 +3952,7 @@ async def test_verified_peer_session_pins_to_identity_key(_tailnet_env) -> None:
     assert resp.status == 200
     cookie = resp.cookies.get("mc_token_5476")
     assert cookie is not None
-    key, _exp, proxied = _ta._state._peer_bindings[cookie.value]
+    key, _exp, proxied = _ta._state._peer_bindings[_ta._token_pin_key(cookie.value)]
     assert key == "ts:node:you@example.com|phone.tail.ts.net"
     assert proxied is False
     from kiro_crew.dashboard.token_auth import proxied_pin_observed
@@ -3610,7 +4059,7 @@ async def test_xff_injection_from_non_loopback_peer_gets_ip_pin(_tailnet_env) ->
     resp = await mw(_peer_request(remote="203.0.113.7", query={"token": token}), _ok_handler)
     assert resp.status == 200
     cookie = resp.cookies.get("mc_token_5476")
-    assert _ta._state._peer_bindings[cookie.value][0] == "ip:203.0.113.7"
+    assert _ta._state._peer_bindings[_ta._token_pin_key(cookie.value)][0] == "ip:203.0.113.7"
     whois.assert_not_called()
 
 
@@ -3626,7 +4075,7 @@ async def test_daemon_failure_degrades_to_token_ip_path(_tailnet_env) -> None:
     resp = await mw(_peer_request(query={"token": token}), _ok_handler)
     assert resp.status == 200
     cookie = resp.cookies.get("mc_token_5476")
-    key, _exp, proxied = _ta._state._peer_bindings[cookie.value]
+    key, _exp, proxied = _ta._state._peer_bindings[_ta._token_pin_key(cookie.value)]
     assert key == "ip:127.0.0.1"
     assert proxied is True  # same-host proxy pin — posture reports SHARED
 
@@ -3662,7 +4111,7 @@ async def test_require_peer_link_exchanges_for_verified_allowed_peer(_tailnet_en
     assert _ta.requires_verified_peer_unverified(cookie.value) is True
     expected = "ts:node:you@example.com|phone.tail.ts.net"
     assert required_peer_key_unverified(cookie.value) == expected
-    assert _ta._state._peer_bindings[cookie.value][0] == expected
+    assert _ta._state._peer_bindings[_ta._token_pin_key(cookie.value)][0] == expected
     refresh = resp.cookies.get(refresh_cookie_name("5476"))
     assert refresh is not None
     assert refresh_token_peer_key(refresh.value) == expected
@@ -3681,7 +4130,7 @@ async def test_non_tailscale_tunnel_behaviour_is_unchanged(_tailnet_env) -> None
     resp = await mw(_peer_request(query={"token": token}), _ok_handler)
     assert resp.status == 200
     cookie = resp.cookies.get("mc_token_5476")
-    key, _exp, proxied = _ta._state._peer_bindings[cookie.value]
+    key, _exp, proxied = _ta._state._peer_bindings[_ta._token_pin_key(cookie.value)]
     assert key == "ip:127.0.0.1"
     assert proxied is True
     assert proxied_pin_observed() is True
@@ -3805,7 +4254,7 @@ async def test_restart_first_use_repins_verified_peer_cookie(_tailnet_env) -> No
     # No bind_token_peer call: simulates the post-restart unbound state.
     resp = await mw(_peer_request(cookies={"mc_token_5476": token}), _ok_handler)
     assert resp.status == 200
-    key, _exp, _proxied = _ta._state._peer_bindings[token]
+    key, _exp, _proxied = _ta._state._peer_bindings[_ta._token_pin_key(token)]
     assert key == "ts:node:you@example.com|phone.tail.ts.net"
     # Same cookie replayed from a different node (different tailnet address,
     # so the whois cache cannot serve the first node's answer) is rejected.
@@ -3833,7 +4282,7 @@ async def test_restart_require_peer_cookie_refuses_unverified_first_use(
     resp = await mw(_peer_request(cookies={"mc_token_5476": token}), _ok_handler)
     assert resp.status == 403
     assert b"tailnet identity unverified" in resp.body
-    assert token not in _ta._state._peer_bindings
+    assert not _ta._state.has_binding(token)
 
 
 @pytest.mark.asyncio
@@ -3855,14 +4304,14 @@ async def test_restart_signed_require_peer_cookie_rehydrates_only_for_original_d
         register_nonce=False,
     )
 
-    assert token not in _ta._state._peer_bindings
+    assert not _ta._state.has_binding(token)
     response = await mw(_peer_request(cookies={"mc_token_5476": token}), _ok_handler)
     assert response.status == 200
-    assert _ta._state._peer_bindings[token][0] == expected
+    assert _ta._state._peer_bindings[_ta._token_pin_key(token)][0] == expected
 
     # Simulate another restart, then let a different but still allowlisted node
     # arrive first.  It cannot claim the empty in-memory map.
-    _ta._state._peer_bindings.pop(token, None)
+    _ta._state._peer_bindings.pop(_ta._token_pin_key(token), None)
     set_whois(_whois_payload(node="other-node.tail.ts.net"))
     replay = await mw(
         _peer_request(forwarded="100.64.0.6", cookies={"mc_token_5476": token}),
@@ -3870,7 +4319,7 @@ async def test_restart_signed_require_peer_cookie_rehydrates_only_for_original_d
     )
     assert replay.status == 403
     assert b"device identity mismatch" in replay.body
-    assert token not in _ta._state._peer_bindings
+    assert not _ta._state.has_binding(token)
 
 
 @pytest.mark.asyncio
@@ -3888,7 +4337,7 @@ async def test_restart_legacy_claimless_require_peer_cookie_cannot_claim_device(
     response = await mw(_peer_request(cookies={"mc_token_5476": token}), _ok_handler)
     assert response.status == 403
     assert b"tailnet session device binding missing" in response.body
-    assert token not in _ta._state._peer_bindings
+    assert not _ta._state.has_binding(token)
 
 
 @pytest.mark.asyncio
@@ -3910,7 +4359,7 @@ async def test_claimless_require_peer_link_cannot_enroll_on_mixed_internal_path(
     assert response.status == 403
     assert b"tailnet session device binding missing" in response.body
     assert not response.cookies
-    assert token not in _ta._state._peer_bindings
+    assert not _ta._state.has_binding(token)
 
 
 @pytest.mark.asyncio
@@ -3932,7 +4381,7 @@ async def test_signed_login_scope_survives_operator_pin_scope_change(_tailnet_en
     )
     response = await mw(_peer_request(cookies={"mc_token_5476": token}), _ok_handler)
     assert response.status == 200
-    assert _ta._state._peer_bindings[token][0] == expected
+    assert _ta._state._peer_bindings[_ta._token_pin_key(token)][0] == expected
 
 
 @pytest.mark.asyncio
@@ -3953,7 +4402,10 @@ async def test_restart_repin_covers_internal_mixed_paths(_tailnet_env) -> None:
     req.path = "/api/spawn"
     resp = await mw(req, _ok_handler)
     assert resp.status == 200
-    assert _ta._state._peer_bindings[token][0] == "ts:node:you@example.com|phone.tail.ts.net"
+    assert (
+        _ta._state._peer_bindings[_ta._token_pin_key(token)][0]
+        == "ts:node:you@example.com|phone.tail.ts.net"
+    )
     set_whois(_whois_payload(node="other-node.tail.ts.net"))
     req2 = _peer_request(forwarded="100.64.0.6", cookies={"mc_token_5476": token})
     req2.path = "/api/spawn"
@@ -3976,7 +4428,7 @@ async def test_restart_unbound_cookie_without_peer_keeps_todays_semantics(
     mark_consumed(token)
     resp = await mw(_make_request(cookies={"mc_token_5476": token}), _ok_handler)
     assert resp.status == 200
-    assert token not in _ta._state._peer_bindings
+    assert not _ta._state.has_binding(token)
 
 
 def test_app_token_path_allowed_implicit_ws():
@@ -4071,3 +4523,67 @@ async def test_no_refresh_link_expires_a_refresh_cookie_the_browser_already_had(
     # Present in the response, but as an EXPIRY (max-age=0) — not left alone.
     assert stale in resp.cookies
     assert int(resp.cookies[stale]["max-age"]) == 0
+
+
+# -- A non-ASCII credential is a wrong credential, never a crash --
+#
+# hmac.compare_digest raises TypeError on a str holding a non-ASCII character.
+# "\udcff" is what a raw non-UTF-8 header byte decodes to; "\ud800" is any lone surrogate.
+
+_NON_ASCII = ["é", "\udcff", "\ud800"]
+
+
+@pytest.mark.parametrize("bad", _NON_ASCII)
+def test_non_ascii_signature_is_invalid_not_a_crash(bad: str) -> None:
+    payload = generate_token("user-na").split(".", 1)[0]
+    assert validate_token(f"{payload}.{bad}") == (False, "", "invalid signature")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad", _NON_ASCII)
+async def test_non_ascii_query_token_denied_like_a_forged_one(bad: str) -> None:
+    payload = generate_token("user-na").split(".", 1)[0]
+    mw = token_auth_middleware()
+    forged = await mw(_make_request(path="/", query={"token": f"{payload}.AAAA"}), _ok_handler)
+    resp = await mw(_make_request(path="/", query={"token": f"{payload}.{bad}"}), _ok_handler)
+    assert forged.status in (401, 403)
+    assert resp.status == forged.status
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad", _NON_ASCII)
+async def test_non_ascii_internal_secret_denied_loopback(bad: str) -> None:
+    mw = token_auth_middleware(internal_paths=frozenset({"/api/spawn"}), internal_secret="real")
+    req = _make_request(path="/api/spawn", headers={"X-Internal-Secret": bad})
+    resp = await mw(req, _ok_handler)
+    assert resp.status == 403
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad", _NON_ASCII)
+async def test_non_ascii_internal_secret_denied_non_loopback_mixed(bad: str) -> None:
+    token = generate_token("testuser", ttl_seconds=300)
+    bind_token_ip(token, "10.0.0.1")
+    mark_consumed(token)
+    mw = token_auth_middleware(
+        mixed_internal_paths=frozenset({"/api/spawn"}), internal_secret="real"
+    )
+    req = _make_request(
+        path="/api/spawn",
+        remote="10.0.0.1",
+        headers={"X-Internal-Secret": bad},
+        cookies={"mc_token_5476": token},
+    )
+    resp = await mw(req, _ok_handler)
+    assert resp.status == 403
+
+
+@pytest.mark.parametrize("bad", _NON_ASCII)
+def test_non_ascii_app_secret_is_rejected(bad: str, tmp_path) -> None:
+    from kiro_crew.dashboard.token_auth import validate_app_secret
+
+    app_dir = tmp_path / "apps" / "demo"
+    app_dir.mkdir(parents=True)
+    (app_dir / ".app_secret").write_text("real", encoding="utf-8")
+    assert validate_app_secret("demo", "real") is True
+    assert validate_app_secret("demo", bad) is False

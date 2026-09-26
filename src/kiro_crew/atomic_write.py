@@ -86,9 +86,13 @@ _CARRIED_INFORMATIONAL_XATTR_PREFIXES = ("user.",)
 
 #: Whether this platform exposes the xattr syscalls an ACL carry needs at all.
 #:
-#: Windows has none of them, and typeshed guards all three behind
+#: CPython exposes all three on Linux only. Windows has none of them, macOS has
+#: ``openat`` but none of them either (its ACLs live behind ``acl_get_file``,
+#: not the Linux xattr API), and typeshed guards all three behind
 #: ``sys.platform == "linux"``, so every use is a ``hasattr`` probe rather than a
-#: direct call.
+#: direct call. This flag gates only what an ACL carry can READ — a pinned
+#: caller still gets a descriptor from :func:`open_access_control_source`
+#: regardless, because the MODE carry needs one (see that function's contract).
 ACCESS_CONTROL_XATTRS_SUPPORTED = all(
     hasattr(os, name) for name in ("listxattr", "getxattr", "setxattr")
 )
@@ -495,7 +499,7 @@ def fsync_dir(path: Path | str, *, best_effort: bool = False) -> None:
         )
 
 
-def read_bytes_with_retry(path: Path | str) -> bytes:
+def read_bytes_with_retry(path: Path | str, *, max_bytes: int | None = None) -> bytes:
     """``Path.read_bytes()``, retrying the Windows sharing-violation window.
 
     The read-side twin of :func:`replace_with_retry`, and the same OS fact seen
@@ -526,11 +530,17 @@ def read_bytes_with_retry(path: Path | str) -> bytes:
     The final attempt sits OUTSIDE the loop for the same reason it does in
     :func:`replace_with_retry`: with it inside, a budget of 0 would fall out
     having read nothing and return ``None`` to a caller expecting bytes.
+
+    ``max_bytes`` bounds the allocation, not the file: at most that many bytes
+    are read and returned, so a caller enforcing a size cap passes ``cap + 1``
+    and refuses the document when the result is longer than ``cap`` -- without
+    first allocating whatever an oversized file at the path happens to hold.
+    ``None`` (the default) reads the whole file.
     """
     target = Path(path)
     for attempt in range(_REPLACE_MAX_ATTEMPTS - 1):
         try:
-            return target.read_bytes()
+            return _read_bytes(target, max_bytes)
         except PermissionError:
             if not platform_compat.IS_WINDOWS:
                 raise
@@ -548,7 +558,15 @@ def read_bytes_with_retry(path: Path | str) -> bytes:
                 _REPLACE_MAX_ATTEMPTS,
             )
             time.sleep(_REPLACE_BACKOFF_SECONDS)
-    return target.read_bytes()
+    return _read_bytes(target, max_bytes)
+
+
+def _read_bytes(target: Path, max_bytes: int | None) -> bytes:
+    """One read attempt: whole file, or the first ``max_bytes`` bytes of it."""
+    if max_bytes is None:
+        return target.read_bytes()
+    with target.open("rb") as handle:
+        return handle.read(max_bytes)
 
 
 def _resolved_or_none(path: Path) -> Path | None:
@@ -649,6 +667,56 @@ def _link_trust_anchor(parent: Path) -> tuple[Path, tuple[str, ...]] | None:
     return None
 
 
+def refuse_linked_parent(path: Path | str) -> None:
+    """Public form of the planted-link refusal, for out-of-band stagers.
+
+    ``atomic_write(restrict_to_owner=True)`` applies this automatically, and
+    that chokepoint is where the guard normally lives. A secret writer that
+    must stage its temp OUTSIDE the target's parent (md-notebook's masked
+    top-level staging directory) cannot route through ``atomic_write`` itself, so it
+    calls this on the same paths its ``mkdir``/``mkstemp``/``replace`` will
+    walk — BEFORE the mkdirs, which follow a planted link and would build the
+    tree under its target. Raises ``OSError`` on refusal, like the private
+    form.
+    """
+    _refuse_linked_parent(Path(path))
+
+
+def anchored_parent(parent: Path | str) -> str | None:
+    """Return *parent* with its trust anchor RESOLVED and the names below it LEXICAL.
+
+    For a caller that pins the chain with one ``O_NOFOLLOW`` ``openat`` per
+    component (:func:`pinned_fs.pin_parent`). That walk needs a path whose
+    components it can open by name, and the obvious way to get one --
+    ``Path(parent).resolve()`` -- defeats it: resolving follows a link planted
+    below the anchor, so the walk is handed the link's TARGET and pins that
+    directory faithfully, ``O_NOFOLLOW`` and all. Keeping those names lexical is
+    what makes such a component fail its own open instead.
+
+    The split is :func:`_link_trust_anchor`'s, so the policy for where "a link
+    here is not ours" starts has one home. At or above the anchor a link is the
+    operator's layout -- a symlinked ``$HOME``, a data home on another disk --
+    and resolving there is both required and safe; below it every directory is
+    one Kiro Crew created itself.
+
+    ``None`` when *parent* is outside every owned root, or the anchor cannot be
+    resolved. There is no trusted place to start the walk in either case, so the
+    caller chooses what to do rather than being handed a path that looks
+    anchored. A clean chain gives exactly what ``resolve()`` gives, because
+    :func:`refuse_linked_parent` passing means the lexical names and the resolved
+    ones name the same directories; the two answers part company only when a
+    component is a link, which is the case worth refusing.
+    """
+    split = _link_trust_anchor(Path(parent))
+    if split is None:
+        return None
+    anchor, names = split
+    anchor_resolved = _resolved_or_none(anchor)
+    if anchor_resolved is None:
+        return None
+    return str(anchor_resolved.joinpath(*names))
+
+
 def _refuse_linked_parent(path: Path) -> None:
     """Refuse to write a secret whose parent chain passes through a link.
 
@@ -658,9 +726,8 @@ def _refuse_linked_parent(path: Path) -> None:
     trust anchor — silently redirects the whole write: the secret lands under
     whatever the link points at, outside the sensitive-path fence that is the
     only real boundary against a same-UID reader, and the caller sees success.
-    Issue #4381 is the class report; a per-caller check was rejected there as
-    whack-a-mole, so the refusal lives in the one helper every secret write
-    already goes through.
+    A per-caller check is whack-a-mole, so the refusal lives in the one helper
+    every secret write already goes through.
 
     Two checks, because neither alone is sufficient:
 
@@ -832,8 +899,8 @@ def atomic_write(
     *content* may be ``str`` (written UTF-8 encoded in text mode) or ``bytes``
     (written verbatim in binary mode). Binary mode exists for callers whose
     payload is not text at all — a compiled helper binary, an archive — which
-    previously had to hand-roll the temp-write-and-rename and so silently
-    missed the Windows rename retry above.
+    would otherwise hand-roll the temp-write-and-rename and silently miss the
+    Windows rename retry above.
 
     *mode* sets explicit permissions (e.g. ``0o600`` for secrets).
     ``None`` (default) applies umask-based permissions (matching ``open()``).
@@ -858,8 +925,7 @@ def atomic_write(
     explicit *mode* alongside it is a caller bug, and narrowing it silently
     would hide that. It further implies :func:`_refuse_linked_parent`: a secret
     writer must never follow a link, because a pre-planted parent symlink or
-    junction redirects the whole write to a location the caller never named
-    (issue #4381).
+    junction redirects the whole write to a location the caller never named.
 
     *restrict_on_error* selects what happens when that lockdown fails, and only
     means anything alongside ``restrict_to_owner=True``. The default ``"raise"``

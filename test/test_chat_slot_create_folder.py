@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from aiohttp import web
@@ -30,7 +30,11 @@ from aiohttp.test_utils import TestClient, TestServer
 from chat_test_helpers import _make_ready_kiro_prerequisite
 
 from kiro_crew.dashboard.chat_utils import slot_history_key
-from kiro_crew.dashboard.state import _SLOTS_BROADCAST_INTERVAL_S, DashboardState
+from kiro_crew.dashboard.state import (
+    _DEFERRED_SLOTS_FLUSH_DELAY_S,
+    _SLOTS_BROADCAST_INTERVAL_S,
+    DashboardState,
+)
 from kiro_crew.history import ConversationLog
 
 FOLDER_ID = "f-design"
@@ -40,7 +44,7 @@ def _raise_on_slots(payload):
     """A ``_broadcast`` double that fails the way the evidenced defect does.
 
     The exception TYPE is incidental — ``json.dumps`` on a non-serializable slot
-    value is the shape #6522 hit — so these tests pin the ordering instead: any
+    value is one such shape — so these tests pin the ordering instead: any
     raise out of the flush must not unwind past the durable write.
     """
     if payload.get("_type") == "slots":
@@ -161,17 +165,271 @@ class TestCreateInFolder:
             )
 
     @pytest.mark.asyncio
-    async def test_create_without_folder_still_emits_one_broadcast(self, tmp_path):
-        """Guard the ordinary path: coalescing must not drop the announcement."""
+    async def test_create_without_folder_defers_one_complete_broadcast(
+        self, tmp_path, monkeypatch
+    ):
+        """The ordinary response wins the race with its full-list announcement."""
         state = _make_state(tmp_path)
         seen = _record_broadcasts(state)
+        scheduled: list[tuple[float, object, tuple[object, ...]]] = []
+        loop = asyncio.get_running_loop()
+        real_call_later = loop.call_later
+        armed_timer = MagicMock()
+        state._slots_broadcast_timer = armed_timer
+
+        def capture_deferred_flush(delay, callback, *args, **kwargs):
+            if callback == state._deferred_slots_flush:
+                scheduled.append((delay, callback, args))
+                return MagicMock()
+            return real_call_later(delay, callback, *args, **kwargs)
+
+        monkeypatch.setattr(loop, "call_later", capture_deferred_flush)
         async with TestClient(TestServer(_make_app(state))) as client:
             resp = await client.post("/api/chat/slots", json={"name": "s1"})
             assert resp.status == 200
             assert (await resp.json())["folder_id"] == ""
 
+        # The response completed without serializing every open slot, and the old
+        # trailing timer cannot publish during the fixed handoff delay.
+        assert seen == []
+        armed_timer.cancel.assert_called_once_with()
+        assert state._slots_broadcast_timer is None
+        assert len(scheduled) == 1
+        delay, callback, args = scheduled.pop()
+        assert delay == pytest.approx(_DEFERRED_SLOTS_FLUSH_DELAY_S)
+        assert args == ("create slot 's1'", 1)
+
+        # Other windows still receive exactly one complete snapshot immediately after.
+        callback(*args)
+        assert scheduled == []
         assert len(seen) == 1
         assert any(s["key"] == "s1" for s in seen[0])
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("memory_mode", ["incognito", "temporary"])
+    async def test_private_memory_create_publishes_synchronously(
+        self, tmp_path, monkeypatch, memory_mode
+    ):
+        state = _make_state(tmp_path)
+        seen = _record_broadcasts(state)
+        scheduled: list[tuple[float, object, tuple[object, ...]]] = []
+        loop = asyncio.get_running_loop()
+        real_call_later = loop.call_later
+
+        def capture_deferred_flush(delay, callback, *args, **kwargs):
+            if callback == state._deferred_slots_flush:
+                scheduled.append((delay, callback, args))
+                return MagicMock()
+            return real_call_later(delay, callback, *args, **kwargs)
+
+        monkeypatch.setattr(loop, "call_later", capture_deferred_flush)
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.post(
+                "/api/chat/slots",
+                json={"name": "private", "memory_mode": memory_mode},
+            )
+            assert resp.status == 200
+            assert (await resp.json())["memory_mode"] == memory_mode
+
+        assert scheduled == []
+        assert len(seen) == 1
+        assert any(s["key"] == "private" for s in seen[0])
+
+    @pytest.mark.asyncio
+    async def test_unknown_create_field_publishes_synchronously(
+        self, tmp_path, monkeypatch
+    ):
+        state = _make_state(tmp_path)
+        seen = _record_broadcasts(state)
+        scheduled: list[tuple[float, object, tuple[object, ...]]] = []
+        loop = asyncio.get_running_loop()
+        real_call_later = loop.call_later
+
+        def capture_deferred_flush(delay, callback, *args, **kwargs):
+            if callback == state._deferred_slots_flush:
+                scheduled.append((delay, callback, args))
+                return MagicMock()
+            return real_call_later(delay, callback, *args, **kwargs)
+
+        monkeypatch.setattr(loop, "call_later", capture_deferred_flush)
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.post(
+                "/api/chat/slots",
+                json={"name": "future", "future_metadata": "present"},
+            )
+            assert resp.status == 200
+
+        assert scheduled == []
+        assert len(seen) == 1
+        assert any(s["key"] == "future" for s in seen[0])
+
+    @pytest.mark.asyncio
+    async def test_deferred_flush_waits_for_active_persistence_suspension(
+        self, tmp_path, monkeypatch
+    ):
+        """A delayed plain-create callback cannot cross a metadata save barrier."""
+        state = _make_state(tmp_path)
+        broadcasts: list[str] = []
+        persistence = {"durable": False}
+
+        def broadcast_after_persistence():
+            broadcasts.append("published")
+            assert persistence["durable"], "published before the slot mutation was durable"
+
+        monkeypatch.setattr(state, "_do_slots_broadcast", broadcast_after_persistence)
+
+        with state.suspend_slots_push():
+            assert state._slots_push_pending is False
+
+            state._deferred_slots_flush("create slot 'plain-create'", 1)
+
+            assert broadcasts == []
+            assert state._slots_push_pending is True
+            persistence["durable"] = True
+
+        assert broadcasts == ["published"]
+        assert state._slots_push_pending is False
+
+    @pytest.mark.asyncio
+    async def test_overlapping_suspension_disables_outer_deferral(
+        self, tmp_path, monkeypatch
+    ):
+        state = _make_state(tmp_path)
+        seen = _record_broadcasts(state)
+        scheduled: list[tuple[float, object, tuple[object, ...]]] = []
+        loop = asyncio.get_running_loop()
+        real_call_later = loop.call_later
+
+        def capture_deferred_flush(delay, callback, *args, **kwargs):
+            if callback == state._deferred_slots_flush:
+                scheduled.append((delay, callback, args))
+                return MagicMock()
+            return real_call_later(delay, callback, *args, **kwargs)
+
+        monkeypatch.setattr(loop, "call_later", capture_deferred_flush)
+
+        with state.suspend_slots_push() as defer_flush:
+            state.get_or_create_slot("overlap")
+            defer_flush("create slot 'overlap'")
+            with pytest.raises(LookupError, match="inner failed"):
+                with state.suspend_slots_push():
+                    raise LookupError("inner failed")
+
+        assert scheduled == []
+        assert len(seen) == 1
+        assert any(s["key"] == "overlap" for s in seen[0])
+        assert state._slots_push_overlapped is False
+
+    @pytest.mark.asyncio
+    async def test_successful_deferred_flush_starts_coalescing_window(
+        self, tmp_path, monkeypatch
+    ):
+        state = _make_state(tmp_path)
+        broadcasts: list[str] = []
+        scheduled: list[tuple[float, object, tuple[object, ...]]] = []
+        loop = asyncio.get_running_loop()
+        armed_timer = MagicMock()
+        trailing_timer = MagicMock()
+        state._slots_broadcast_timer = armed_timer
+
+        monkeypatch.setattr(
+            state, "_do_slots_broadcast", lambda: broadcasts.append("published")
+        )
+        monkeypatch.setattr("kiro_crew.dashboard.state.time.monotonic", lambda: 100.0)
+
+        def capture_callback(delay, callback, *args, **kwargs):
+            scheduled.append((delay, callback, args))
+            return trailing_timer
+
+        monkeypatch.setattr(loop, "call_later", capture_callback)
+
+        state._deferred_slots_flush("create slot 's1'", 1)
+        assert broadcasts == ["published"]
+        assert state._slots_broadcast_last == 100.0
+        armed_timer.cancel.assert_called_once_with()
+        assert state._slots_broadcast_timer is None
+
+        state.push_slots_update()
+
+        assert broadcasts == ["published"]
+        assert len(scheduled) == 1
+        assert state._slots_broadcast_timer is trailing_timer
+        delay, callback, args = scheduled[0]
+        assert delay == pytest.approx(_SLOTS_BROADCAST_INTERVAL_S)
+        assert callback == state._trailing_slots_flush
+        assert args == ()
+
+    @pytest.mark.asyncio
+    async def test_defer_then_body_error_flushes_synchronously_and_propagates(
+        self, tmp_path, monkeypatch
+    ):
+        """An in-flight body error must disable deferral while unwinding."""
+        state = _make_state(tmp_path)
+        seen = _record_broadcasts(state)
+        scheduled = []
+        loop = asyncio.get_running_loop()
+        real_call_later = loop.call_later
+
+        def capture_deferred_flush(delay, callback, *args, **kwargs):
+            if callback == state._deferred_slots_flush:
+                scheduled.append((delay, callback, args))
+                return MagicMock()
+            return real_call_later(delay, callback, *args, **kwargs)
+
+        monkeypatch.setattr(loop, "call_later", capture_deferred_flush)
+
+        with pytest.raises(LookupError, match="body failed"):
+            with state.suspend_slots_push() as defer_flush:
+                state.get_or_create_slot("s1")
+                defer_flush("create slot 's1'")
+                raise LookupError("body failed")
+
+        assert scheduled == []
+        assert len(seen) == 1
+        assert any(s["key"] == "s1" for s in seen[0])
+
+    @pytest.mark.asyncio
+    async def test_failed_deferred_publication_logs_and_retries_once(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        state = _make_state(tmp_path)
+        attempts = 0
+        scheduled: list[tuple[float, object, tuple[object, ...]]] = []
+        loop = asyncio.get_running_loop()
+        real_call_later = loop.call_later
+
+        def fail_broadcast():
+            nonlocal attempts
+            attempts += 1
+            raise TypeError("not serializable")
+
+        def capture_retry(delay, callback, *args, **kwargs):
+            if callback == state._deferred_slots_flush:
+                scheduled.append((delay, callback, args))
+                return MagicMock()
+            return real_call_later(delay, callback, *args, **kwargs)
+
+        monkeypatch.setattr(state, "_do_slots_broadcast", fail_broadcast)
+        monkeypatch.setattr(loop, "call_later", capture_retry)
+        caplog.set_level("ERROR", logger="kiro_crew.dashboard.state")
+
+        state._deferred_slots_flush("create slot 's1'", 1)
+        assert attempts == 1
+        assert len(scheduled) == 1
+        delay, callback, args = scheduled.pop()
+        assert delay == pytest.approx(_SLOTS_BROADCAST_INTERVAL_S)
+        assert args == ("create slot 's1'", 0)
+
+        callback(*args)
+        assert attempts == 2
+        assert scheduled == []
+        failures = [
+            record
+            for record in caplog.records
+            if "Deferred slots publication failed" in record.message
+        ]
+        assert len(failures) == 2
+        assert all("create slot 's1'" in record.message for record in failures)
 
     @pytest.mark.asyncio
     async def test_refiling_an_existing_slot_name_is_broadcast(self, tmp_path):
@@ -315,7 +573,7 @@ class TestCreateAppIsolation:
 
 
 class TestFolderTagInheritance:
-    """Folder tags copied onto NEW chats filed into the folder (issue #5419).
+    """Folder tags copied onto NEW chats filed into the folder.
 
     Creation-only: re-opening an existing session inside the folder must not
     re-stamp tags, and moving an existing session into a tagged folder via the
@@ -352,14 +610,30 @@ class TestFolderTagInheritance:
     @pytest.mark.asyncio
     async def test_new_slot_in_folder_inherits_the_folders_tags(self, tmp_path):
         """(c) A genuinely new chat filed into a tagged folder copies its tags."""
+        from kiro_crew.dashboard.state import _ChatSlot
+
         state = self._tagged_state(tmp_path, ["t1", "t2"])
-        async with TestClient(TestServer(_make_app(state))) as client:
-            resp = await client.post(
-                "/api/chat/slots", json={"name": "fresh", "folder_id": FOLDER_ID}
-            )
-            assert resp.status == 200
-            assert sorted((await resp.json())["tags"]) == ["t1", "t2"]
+        birth_revisions: list[str] = []
+        original_init = _ChatSlot.__init__
+
+        def _recording_init(self, *args, **kwargs):
+            original_init(self, *args, **kwargs)
+            birth_revisions.append(self.tags_revision)
+
+        with patch.object(_ChatSlot, "__init__", _recording_init):
+            async with TestClient(TestServer(_make_app(state))) as client:
+                resp = await client.post(
+                    "/api/chat/slots", json={"name": "fresh", "folder_id": FOLDER_ID}
+                )
+                assert resp.status == 200
+                assert sorted((await resp.json())["tags"]) == ["t1", "t2"]
         assert sorted(state._slots["fresh"].tags) == ["t1", "t2"]
+        # "tags changed => revision changed": the inherited list must not ship
+        # under the newborn's birth revision, which a slots GET racing the
+        # awaited folder read may already have snapshotted with an empty list.
+        assert birth_revisions
+        assert state._slots["fresh"].tags_revision not in birth_revisions
+        assert state._slots["fresh"].tags_revision > max(birth_revisions)
 
     @pytest.mark.asyncio
     async def test_new_slot_without_folder_inherits_nothing(self, tmp_path):
@@ -431,7 +705,7 @@ class TestFolderTagInheritance:
 
     @pytest.mark.asyncio
     async def test_stale_folder_tag_id_is_not_copied_onto_the_slot(self, tmp_path):
-        """A folder id that no longer exists in the vocabulary is dropped, not stamped."""
+        """A folder id absent from the vocabulary is dropped, not stamped."""
         state = _make_state(tmp_path)
         state._folders[0]["tags"] = ["gone", "t1"]
         # Only t1 is a live tag; "gone" was deleted from the vocabulary.
@@ -505,7 +779,7 @@ class TestDurableWriteOrdering:
 
         # The failure still reaches the caller: this is an ordering fix, not a
         # swallow. Whether an already-committed create should answer 500 at all
-        # is the half of #6532 that was declined, and folding it in here would
+        # is a separate, declined question, and folding it in here would
         # resurrect it.
         assert resp.status == 500
         # But the acknowledged mutation is on disk. Outside the suspension, the

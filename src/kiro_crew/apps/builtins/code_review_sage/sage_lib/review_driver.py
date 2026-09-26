@@ -523,7 +523,7 @@ def build_post_task(change_link: str) -> str:
     )
     # FAIL CLOSED on host resolution — the host decides which GitHub instance
     # every `gh api` call in this prompt targets. `_confirmed_host` raises when
-    # the link names a host that no longer revalidates (a GHE host removed from
+    # the link names a host that does not revalidate (a GHE host removed from
     # `github_hosts` mid-run, an unreadable config); producing a prompt then
     # would let every call default to PUBLIC github.com and post an internal
     # enterprise draft onto a public same-slug PR. The raise is converted to a
@@ -825,7 +825,7 @@ def post_recorded(change_id: str, link: str, *, dispatch, root: Path | None = No
         return {"post_ok": False, "post_error": staged, "posted_comments": 0,
                 "design_comment_posted": False, "pending": len(pending),
                 "expected_units": 0, "posted_keys": list(already)}
-    # The prompt builder FAILS CLOSED when the link's host no longer revalidates
+    # The prompt builder FAILS CLOSED when the link's host does not revalidate
     # (see build_post_task): a prompt built with an unconfirmed host would let
     # its `gh api` calls default to public github.com and land this draft on a
     # public same-slug PR. Surface that as a per-change post failure — the
@@ -915,8 +915,8 @@ def post_recorded(change_id: str, link: str, *, dispatch, root: Path | None = No
             spawn.get("error", "")
             or ("" if confirmed else
                 "the posted draft could not be confirmed on the pull request")),
-        # Authoritative once confirmed: `after["posted_comments"]` was replaced with
-        # the payload's own unit count above, so this no longer echoes the poster.
+        # Authoritative once confirmed: `after["posted_comments"]` holds the payload's
+        # own unit count from above, so this does not echo the poster.
         "posted_comments": int(after.get("posted_comments", 0) or 0),
         "design_comment_posted": bool(after.get("design_comment_posted")),
         "pending": len(pending),
@@ -1010,6 +1010,16 @@ def _draft_confirmed(link: str, payload: dict) -> str:
             return ""    # some other sage draft, not the one just sent
         if str(rev.get("commit_id") or "") != expected_commit:
             return ""    # right text, wrong revision -> anchored to other code
+        # The pull request's (head, base) is pinned BEFORE the comments are
+        # read, so a pending comment's position is only ever mapped through a
+        # diff read under the same pair (see `_diff_positions`). A failed read
+        # leaves nothing pinned, which only matters, and then refuses, when a
+        # comment needs its position mapped.
+        try:
+            pinned: tuple[str, str] | None = _pull_revisions(
+                host, owner, repo, number)
+        except Exception:
+            pinned = None
         try:
             comments = discovery.run_gh_json(
                 f"repos/{owner}/{repo}/pulls/{number}/reviews/{rid}/comments",
@@ -1017,20 +1027,122 @@ def _draft_confirmed(link: str, payload: dict) -> str:
         except Exception:
             return ""
         want = sorted(
-            (str(c.get("path") or ""), int(c.get("line") or 0),
-             _confirm_text(c.get("body")))
+            (str(c.get("path") or ""), _confirm_text(c.get("body")),
+             int(c.get("line") or 0))
             for c in (payload.get("comments") or []))
-        # `line` reads null on a comment GitHub considers outdated, where the
-        # position survives as `original_line`. Accepting that fallback avoids a
-        # false negative without loosening identity: path, body and the review's
-        # commit still have to match.
-        got = sorted(
-            (str(c.get("path") or ""),
-             int(c.get("line") or c.get("original_line") or 0),
-             _confirm_text(c.get("body")))
-            for c in comments)
-        return str(rid) if want == got else ""
+        # GitHub resolves `line` and `side` only when a review is submitted;
+        # every inline comment of a PENDING review reads null for both and
+        # carries only a diff `position`, and an outdated comment keeps its
+        # anchor in `original_line`. An unresolved line is therefore checked
+        # through the position instead: the pull request's diff says which
+        # position the payload's (path, line) occupies, and the comment has to
+        # sit there. Path, body, comment count and the review's commit still
+        # have to match, so a stale draft with the same words on other lines
+        # stays unconfirmed either way.
+        #
+        # Each comment is resolved to a line BEFORE the two sides are
+        # compared, never paired by sort order: pending comments sharing a
+        # (path, body) carry no line to sort on, so a positional zip would
+        # pair them in whatever order GitHub returned them and could hold a
+        # correct draft against the wrong payload line. The position is
+        # mapped back to its line through the diff, and the sorted lists then
+        # compare as multisets of (path, body, line).
+        comments = list(comments or [])
+        if len(want) != len(comments):
+            return ""
+        lines_at: dict[str, dict[int, int]] | None = None
+        got = []
+        for c in comments:
+            path = str(c.get("path") or "")
+            line = _resolved_line(c)
+            if line is None:
+                if lines_at is None:
+                    positions = _diff_positions(host, owner, repo, number,
+                                                expected_commit, pinned)
+                    if positions is None:
+                        return ""    # diff unreadable or for another head/base -> unprovable
+                    lines_at = {p: {pos: ln for ln, pos in m.items()}
+                                for p, m in positions.items()}
+                pos = c.get("position")
+                line = None if pos is None else lines_at.get(path, {}).get(int(pos))
+                if line is None:
+                    return ""    # no position, or one the diff cannot place
+            got.append((path, _confirm_text(c.get("body")), line))
+        return str(rid) if want == sorted(got) else ""
     return ""
+
+
+def _resolved_line(comment: dict) -> int | None:
+    """The line GitHub has resolved for a review comment, or None while the
+    review is PENDING and only the diff position exists."""
+    for key in ("line", "original_line"):
+        value = comment.get(key)
+        if value is not None:
+            return int(value)
+    return None
+
+
+def _pull_revisions(host, owner: str, repo: str,
+                    number: str | int) -> tuple[str, str]:
+    """The pull request's current (head sha, base sha); "" for either one
+    GitHub did not report."""
+    pulls = discovery.run_gh_json(
+        f"repos/{owner}/{repo}/pulls/{number}", host=host)
+    pull = pulls[0] if pulls else {}
+    return (str((pull.get("head") or {}).get("sha") or ""),
+            str((pull.get("base") or {}).get("sha") or ""))
+
+
+def _diff_positions(host, owner: str, repo: str, number: str | int,
+                    commit: str, pinned: tuple[str, str] | None,
+                    ) -> dict[str, dict[int, int]] | None:
+    """Map each changed file to {new-file line: diff position} for the pull
+    request at `commit`, or None when that diff cannot be read.
+
+    A review comment's `position` counts lines down from the file's first `@@`
+    header, through later hunk headers and unchanged lines alike, which is the
+    layout of the `patch` field on `GET /pulls/{n}/files`. That endpoint serves
+    the diff between the pull request's CURRENT base and CURRENT head, so
+    either side moving changes which line a position names. `pinned` is the
+    (head, base) the caller read before reading the review's comments; the map
+    is refused unless that head is `commit`, both shas were reported, and the
+    pull request still reads as the same pair after the files read. A push
+    that lands while a draft is being posted, or a base retarget with the head
+    unchanged, during or between those reads would otherwise place the
+    payload's lines in a diff the draft was never anchored to. A file whose
+    patch is withheld (binary, or too large) maps to nothing, so a comment on
+    it cannot be confirmed by position.
+    """
+    if pinned is None or pinned[0] != commit or not pinned[1]:
+        return None
+    try:
+        files = discovery.run_gh_json(
+            f"repos/{owner}/{repo}/pulls/{number}/files", jq=".[]",
+            paginate=True, host=host)
+        if _pull_revisions(host, owner, repo, number) != pinned:
+            return None
+    except Exception:
+        return None
+    return {str(f.get("filename") or ""): _patch_positions(str(f.get("patch") or ""))
+            for f in files}
+
+
+def _patch_positions(patch: str) -> dict[int, int]:
+    """{new-file line: diff position} for one file's unified diff."""
+    positions: dict[int, int] = {}
+    new_line = 0
+    for position, text in enumerate(patch.split("\n")):
+        if text.startswith("@@"):
+            match = re.search(r"\+(\d+)", text)
+            new_line = int(match.group(1)) if match else 0
+            continue
+        if text.startswith("\\"):
+            continue        # "\ No newline at end of file"
+        if text.startswith("-"):
+            continue
+        positions[new_line] = position
+        new_line += 1
+    return positions
 
 
 def run_review(changes: list[str], *, dispatch=None, archiver=_default_archiver,
@@ -1042,7 +1154,7 @@ def run_review(changes: list[str], *, dispatch=None, archiver=_default_archiver,
     Phase-2 deep-review task for every usable verdict (PASS / CONCERNS / BLOCK).
     Each task is dispatched to the reusable worker pool (``dispatch``) and the
     call returns when that task's session finishes its turn. The driver reads
-    the gate verdict; a BLOCK no longer skips Phase 2 (it only informs the ship
+    the gate verdict; a BLOCK does not skip Phase 2 (it only informs the ship
     decision), then builds the Focus Report. Returns a deterministic summary.
 
     ``dispatch`` is an injected ``(task, timeout) -> {ok, output, error}`` callable
@@ -1205,7 +1317,7 @@ def run_review(changes: list[str], *, dispatch=None, archiver=_default_archiver,
         # someone else's findings on this pull request. If the slot cannot be cleared, skip
         # adoption rather than trust it.
         # Build the prompt BEFORE staking the shared slot: the builder FAILS
-        # CLOSED (raises) when the link's host no longer revalidates against
+        # CLOSED (raises) when the link's host does not revalidate against
         # `allowed_hosts()`, and a fetch instruction with an unconfirmed host
         # would route the worker at public github.com — reviewing (and later
         # posting about) a same-slug public PR instead of the intended one.
@@ -1406,7 +1518,7 @@ def run_review(changes: list[str], *, dispatch=None, archiver=_default_archiver,
         #
         # The report is written to the run's own dir FIRST and kept there
         # regardless of whether the artifact archive succeeds — the in-app report
-        # view reads that file, so a failed archive no longer means "no report".
+        # view reads that file, so a failed archive does not mean "no report".
         try:
             rep = report.generate(root, run_id=run_id)
             summary["report"] = rep["index"]

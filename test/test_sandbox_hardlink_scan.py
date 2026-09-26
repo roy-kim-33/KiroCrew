@@ -24,6 +24,7 @@ from pathlib import Path
 
 import pytest
 
+import kiro_crew.sandbox as sandbox_mod
 from kiro_crew.sandbox import _build_launcher_script
 
 _BLOCK_START = "_protected_inodes = set()"
@@ -40,6 +41,18 @@ _SLICE_LANDMARKS = (
 )
 
 
+@pytest.fixture(autouse=True)
+def _no_host_ssh_probe(monkeypatch):
+    """``_build_launcher_script`` asks the HOST's ``ssh -V`` for accept-new support.
+
+    Every test here executes the scan block lifted from the generated launcher; none
+    is about that probe, and a real ssh spawned from the test process is a host
+    dependency the launcher text must not vary with. Pinned at the module seam
+    ``_build_launcher_script`` reads, so no binary runs.
+    """
+    monkeypatch.setattr(sandbox_mod, "_ssh_supports_accept_new", lambda: True)
+
+
 def _scan_source() -> str:
     """The Step 7 scan, lifted verbatim out of the generated launcher.
 
@@ -53,7 +66,7 @@ def _scan_source() -> str:
     block = textwrap.dedent(script[start:end])
     # Pin what the slice must contain, so an edit that moves either marker and
     # shrinks the block fails HERE rather than leaving every assertion below
-    # vacuously green against a fragment that no longer holds the gate.
+    # vacuously green against a fragment that does not hold the gate.
     missing = [landmark for landmark in _SLICE_LANDMARKS if landmark not in block]
     assert not missing, f"the extracted scan block is missing {missing}"
     return block

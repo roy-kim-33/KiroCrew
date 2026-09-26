@@ -86,7 +86,7 @@ def _read_cursor() -> set[str]:
     data-loss bug (see ``aws_control/backend/backup._read_state_for_update`` and
     its precedents), because the rewrite publishes the empty base over state it
     never read. Here the write is a UNION — ``_write_cursor(cursor | newly)`` —
-    so an empty base drops previously recorded ids from the cursor while
+    so an empty base drops already-recorded ids from the cursor while
     deleting nothing the cursor points at: the next import re-checks the
     dropped ids and the store's case-insensitive 80-char-prefix dedupe
     (:meth:`write_episodic`'s text-hash check, strictly broader than exact
@@ -224,7 +224,13 @@ def _importance(entry: LedgerEntry) -> float:
     return min(1.0, score)
 
 
-def search_similar(store: Any, query: str, *, limit: int = 5) -> list[dict]:
+def search_similar(
+    store: Any,
+    query: str,
+    *,
+    limit: int = 5,
+    query_embedding: list[float] | None = None,
+) -> list[dict]:
     """Ledger-derived memories similar to ``query``, most relevant first.
 
     Tag-filtered to ``SOURCE_TAG`` so an ops investigation searching for a failure does
@@ -239,6 +245,7 @@ def search_similar(store: Any, query: str, *, limit: int = 5) -> list[dict]:
     try:
         return list(
             store.search_episodic(
+                query_embedding=query_embedding,
                 query_text=query,
                 limit=limit,
                 tag_filter=[SOURCE_TAG],

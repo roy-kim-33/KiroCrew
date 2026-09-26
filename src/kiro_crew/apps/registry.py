@@ -27,10 +27,12 @@ minimal environment that excludes process secrets.
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import json
 import logging
 import os
 import platform as _platform
+import posixpath
 import re
 import shutil
 import sys
@@ -58,6 +60,7 @@ from kiro_crew.apps.manager import list_apps as list_installed_apps
 from kiro_crew.apps.manager import (
     registry_source_repository,
     set_app_provenance,
+    shipped_builtin_names,
     update_app,
 )
 from kiro_crew.apps.manifest import (
@@ -69,6 +72,9 @@ from kiro_crew.apps.manifest import (
 from kiro_crew.sandbox import (
     cgroup_scope_argv,
     create_subprocess_limited,
+    sandboxed_spawn_argv,
+    sandboxed_spawn_argv_async,
+    scrub_env,
     wrap_argv,
     wrap_argv_async,
 )
@@ -327,12 +333,113 @@ def anonymous_git_env(**extra: str) -> dict[str, str]:
     return env
 
 
+#: Env names a ``detectInstalled`` probe may receive. Deliberately an explicit
+# KEEP set rather than ``_SAFE_ENV_KEYS`` minus a few names: that allowlist serves
+# operator-initiated spawns -- installs, app backends, lifecycle scripts -- so it
+# carries toolchain configuration an operator may legitimately have loaded with a
+# secret (``MAVEN_OPTS`` with a ``-D`` password, ``GRADLE_USER_HOME`` pointing at a
+# credential store, a ``PYTHONPATH``/``NODE_PATH`` tree that lets a probe import
+# code). Subtracting each such name as it is noticed leaves the next one in, and a
+# probe is the one spawn here whose command text is untrusted, so the axis is
+# closed instead: only location hints a ``command -v`` / ``test -x`` style check
+# needs to run, plus the Windows names a process needs to start at all (a child
+# without ``SystemRoot`` dies before ``main()``). A probe that genuinely needs a
+# toolchain variable reads it from the app's own config, not from the operator's
+# shell.
+_DETECT_PROBE_ENV_KEYS = frozenset(
+    {
+        "HOME",
+        "PATH",
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "TERM",
+        "TMPDIR",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        # Windows equivalents, spelled as in `_SAFE_ENV_KEYS`.
+        "COMSPEC",
+        "PATHEXT",
+        "ProgramFiles",
+        "PROGRAMFILES",
+        "SystemRoot",
+        "TEMP",
+        "TMP",
+        "USERPROFILE",
+        "WINDIR",
+        # Set BY `anonymous_git_env`, not copied from the operator: the git
+        # suppression that keeps a credential helper from firing must survive the
+        # filter below, or dropping it would undo that suppression.
+        "GIT_TERMINAL_PROMPT",
+        "GIT_CONFIG_NOSYSTEM",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_SSH_COMMAND",
+    }
+)
+
+
+def _detect_probe_env() -> dict[str, str]:
+    """Environment for a ``/bin/sh -c <detectInstalled>`` probe.
+
+    A probe's command string is NOT operator-authored: it comes from an
+    app-registry manifest, which is untrusted content, and the listing path runs it
+    automatically at browse time. So a probe gets the credential-free treatment an
+    index-originated clone gets (:func:`anonymous_git_env`), narrowed further to
+    :data:`_DETECT_PROBE_ENV_KEYS`.
+
+    What that closes, in the order the layers apply: :func:`anonymous_git_env`
+    drops the agent socket and any ``GIT_SSH``/``GIT_SSH_COMMAND`` override, so
+    manifest code cannot authenticate through the operator's keys; it disables
+    system and global git config, so a configured credential helper -- macOS ships
+    ``osxkeychain`` in its system config, and the ``cache`` helper's socket is
+    reachable through an allowlisted ``XDG_CACHE_HOME`` -- never fires for a
+    manifest-chosen remote; and it turns prompting off, so a probe fails rather
+    than asking the operator for a password. :func:`scrub_env` removes the
+    credential-bearing prefixes. The keep set then leaves only location hints, so a
+    toolchain variable carrying a secret has no route in.
+
+    All of this matters on one host shape: the sandbox launcher strips the socket
+    in every mode, so these names only ever survive where no launcher runs --
+    Windows, and a POSIX host with no sandbox backend plus
+    ``agent.sandbox_allow_unsandboxed_exec``. ``PATH`` and ``HOME`` are kept, so a
+    detect command still resolves programs and still reads its own per-user config.
+    """
+    scrubbed = scrub_env(anonymous_git_env())
+    return {k: v for k, v in scrubbed.items() if _is_probe_env_key(k)}
+
+
+def _is_probe_env_key(key: str) -> bool:
+    """Whether *key* may reach a probe, honoring Windows' case-insensitive env.
+
+    Same matching convention as :func:`_is_safe_env_key` -- exact on POSIX,
+    case-folded on Windows -- so a literal membership test cannot silently drop
+    ``SystemRoot`` there.
+    """
+    return platform_compat.env_key_allowed(key, _DETECT_PROBE_ENV_KEYS)
+
+
 # Manifest cache: fetched app.json files from repos
 def _manifest_cache_dir() -> Path:
     return config_dir() / "cache" / "app-manifests"
 
 
 _MANIFEST_CACHE_TTL = 86400  # 24 hours
+
+#: Subdirectory of :func:`_manifest_cache_dir` holding the source-keyed
+#: manifest files. Registry INDEX caches live at the dir root; keeping the
+#: manifest files in a subdirectory separates the two by something an external
+#: index cannot spell in an app name (``_safe_cache_stem`` returns plain names
+#: byte-identical, so a name-prefix convention would be imitable — an app
+#: literally named ``_registry_x`` must not be able to place its manifest
+#: outside the garbage collector's reach).
+_MANIFEST_SOURCE_SUBDIR = "by-source"
+
+#: How far past its TTL a cache file's mtime is pushed by
+#: :func:`_expire_cache_file`. The GC grace below is derived from this so
+#: expiry (which deliberately preserves the file) and reclamation (which
+#: deletes it) can never collide however this slack changes.
+_CACHE_EXPIRY_BACKDATE_SLACK = 3600
 
 # ---------------------------------------------------------------------------
 # Registry loading
@@ -371,23 +478,37 @@ _TRUST_INDEX = "index"
 _TRUST_OWNER = "owner"
 _REGISTRY_TRUST_TIERS: frozenset[str] = frozenset({_TRUST_INDEX, _TRUST_OWNER})
 
+#: Review tiers an ``ExternalRegistryConfig.review`` value may name.
+#
+# This says how thoroughly a registry's LISTINGS were reviewed before being
+# published, which is a statement to the user — not a security control. ``trust``
+# alone selects the credential posture for cloning, so a ``curated`` registry at
+# the ``index`` tier still clones credential-free and a ``community`` one at the
+# ``owner`` tier still clones with this machine's git identity. Keeping the two
+# axes separate is deliberate: collapsing them would make "we read the listings"
+# silently hand out credentials.
+#
+# ``""`` is the default and means the registry makes no claim, so a build that
+# never sets the field renders exactly as it did before it existed. An
+# unrecognised value degrades to ``""`` rather than dropping the row: the field is
+# display metadata, and the list it lands in feeds index fetch, the trusted-host
+# allowlist and install, so a typo must not be able to take a registry offline.
+_REVIEW_UNSET = ""
+_REVIEW_CURATED = "curated"
+_REVIEW_COMMUNITY = "community"
+_REGISTRY_REVIEW_TIERS: frozenset[str] = frozenset(
+    {_REVIEW_UNSET, _REVIEW_CURATED, _REVIEW_COMMUNITY}
+)
+
 
 def _registry_identity_key(name_or_repo: str) -> str:
-    """The key two registries collide on: the cache file they would share.
+    """Canonical comparison key for a registry's public identifier.
 
-    Not the raw name. A registry's index cache is a FILE, and the file is what is
-    actually contended — so the collision rule has to be derived from the path, not
-    from the string. Two consequences that the raw name misses:
-
-    * On a case-insensitive filesystem (Windows, default macOS) ``Official`` and
-      ``official`` are one file, so they collide there and not on Linux. Folding
-      case makes the answer the same everywhere: a configuration that would corrupt
-      on one platform is refused on all of them, rather than working until someone
-      runs it on a laptop.
-    * ``_external_registry_cache_path`` slugifies and hash-disambiguates a name
-      carrying unusual characters, so the mapping from name to file is not the
-      identity function. Asking the path keeps this rule correct if that
-      derivation ever changes.
+    Registry names are normalized to their filename-safe cache-path form, then
+    case-folded so ``Official`` and ``official`` cannot be treated as separate
+    names on Linux but as one name on default macOS or Windows filesystems. This key governs build-pinned/config name ownership;
+    it is NOT the live index-cache identity, which additionally includes the
+    normalized repository and branch.
     """
     return _external_registry_cache_path(name_or_repo).name.casefold()
 
@@ -450,6 +571,12 @@ def _pinned_registries() -> list[Any]:
     sees one attribute shape. A malformed row is dropped with a warning rather
     than raised on: this list feeds security gates
     (:func:`is_clone_host_trusted`), and those must keep answering.
+
+    ``label`` and ``review`` are display metadata carried through unchanged. An
+    unrecognised ``review`` value degrades to ``""`` (no claim) and is logged;
+    it never drops the row, because a display field must not be able to remove a
+    registry from install and the security gates — see
+    :data:`_REGISTRY_REVIEW_TIERS`.
     """
     try:
         edition_rows = current_context().apps_loader.default_registries()
@@ -499,20 +626,49 @@ def _pinned_registries() -> list[Any]:
         name = row.get("name")
         branch = row.get("branch")
         trust = row.get("trust")
+        label = row.get("label")
+        raw_review = row.get("review")
+        review = raw_review.strip() if isinstance(raw_review, str) else _REVIEW_UNSET
+        # An unknown review tier DEGRADES to "no claim"; it does not drop the row.
+        # `review` is display metadata, and this list feeds index fetch, the
+        # trusted-host allowlist and install — so dropping the row would let a
+        # typo, or a tier a future core adds that this one does not know, take a
+        # whole registry offline: its apps vanish from the store, its installs
+        # fail, and its host leaves the clone-trust set. A display field must not
+        # be able to do that.
+        #
+        # Degrading is not the "falsely reassuring" outcome it first looks like:
+        # `""` is NO claim, which is exactly what a build that never set the field
+        # renders, so a mistyped `community` shows an unbadged row rather than a
+        # trusted-looking one. Logged at error level so the misconfiguration is
+        # visible to whoever shipped it instead of being silently normalised.
+        if review not in _REGISTRY_REVIEW_TIERS:
+            logger.error(
+                "Registry %r declares an unknown review tier %r (known: %s) — "
+                "showing it with no review claim.",
+                name,
+                review,
+                ", ".join(repr(t) for t in sorted(_REGISTRY_REVIEW_TIERS)),
+            )
+            review = _REVIEW_UNSET
         pinned.append(
             ExternalRegistryConfig(
                 name=name.strip() if isinstance(name, str) else "",
                 repo=repo,
                 branch=branch if isinstance(branch, str) and branch else "main",
+                # Display only, so an absent or non-string label is simply empty
+                # and the id is shown instead. It is never substituted INTO
+                # `name`: the id is what cache paths and every installed app's
+                # `_registry` tag are keyed by.
+                label=label.strip() if isinstance(label, str) else "",
+                review=review,
                 trust=trust if isinstance(trust, str) and trust else _TRUST_INDEX,
             )
         )
-    # Two pinned rows sharing an effective key would fetch into the SAME
-    # name-keyed cache file, so each refresh would overwrite the other and later
-    # reads would list — and install — entries from whichever repository wrote
-    # last. Drop ALL rows for a duplicated key rather than keeping the first: an
-    # edition shipping two registries under one name has a bug, and picking a
-    # winner would hide it behind intermittently wrong app listings.
+    # Two pinned rows sharing one public identifier are an edition bug. Their
+    # live caches are source-coordinate keyed, but every returned app still
+    # carries the same ``_registry`` attribution and trust lookup key. Drop ALL
+    # duplicated rows rather than picking a winner and hiding the ambiguity.
     counts: dict[str, int] = {}
     for reg in pinned:
         key = _registry_identity_key(reg.name or reg.repo)
@@ -521,8 +677,8 @@ def _pinned_registries() -> list[Any]:
     if duplicated:
         for key in sorted(duplicated):
             logger.error(
-                "Ignoring %d edition registries that would share the index cache file %r — "
-                "they would overwrite each other's entries.",
+                "Ignoring %d edition registries that share public identifier %r — "
+                "their app attribution and trust lookup would be ambiguous.",
                 counts[key],
                 key,
             )
@@ -541,21 +697,17 @@ def _effective_registries() -> list[Any]:
     some of those would surface an app the install path then refuses — the
     half-implemented-mechanism failure mode.
 
-    Merge rule: an **edition default wins** on a ``name`` collision, and when the
-    two rows name DIFFERENT repositories **neither is served**. The second half is
-    not fastidiousness: the on-disk index cache is keyed by registry NAME, so the
-    displaced row's cache would be read under the winning row's identity and every
-    reader stamps ``_registry`` from the registry it asked for — apps the pinned
-    repository does not list, attributed to it and installable under it. Refusing
-    the ambiguous name makes that a visible, diagnosable state instead. The
-    credential path is separately safe (``_owner_tier_confirmed`` re-reads the
-    real index), so this is about provenance, not escalation.
+    Merge rule: an **edition default wins** when an operator row has the same
+    public ``name``, repo, and branch. When the source coordinates differ,
+    **neither is served**. Their index caches are isolated by full source
+    identity, but both rows still claim one public ``_registry`` attribution
+    and trust lookup key: silently choosing either would hide the other
+    claimant and make the control-plane owner of that name ambiguous. Refusing
+    both makes the conflict visible and keeps build-owned trust/review metadata
+    from being associated with an operator's different source.
 
-    Same name AND same repo is not a conflict — the pinned row simply supersedes
-    an operator row that already agreed with it, and the shared cache is correct.
-
-    Operators can add registries freely; they just cannot silently repoint one the
-    edition pinned. ``PUT /api/apps/registries`` refuses to create such a
+    Operators can add registries freely; they just cannot silently repoint one
+    the edition pinned. ``PUT /api/apps/registries`` refuses to create such a
     collision, so the case that survives here is a ``config.json`` that already
     used the name before the build pinned it.
 
@@ -595,8 +747,8 @@ def _effective_registries() -> list[Any]:
             contested.add(key)
             logger.warning(
                 "Registry name %r is claimed by this build (%s@%s) and by your config (%s@%s); "
-                "serving neither until the names differ, because the index cache is keyed "
-                "by name and would otherwise be read under the wrong registry's identity.",
+                "serving neither until the names differ, because their public app attribution "
+                "and trust lookup identity would otherwise be ambiguous.",
                 key,
                 _redact_url_userinfo(rival.repo),
                 rival.branch,
@@ -1278,16 +1430,77 @@ def _safe_cache_stem(name: str) -> str:
     return f"{slug}-{digest}"
 
 
-def _manifest_cache_path(name: str) -> Path:
-    # Sanitize the name so a hostile/traversal entry name from an external
-    # registry can never resolve outside the manifest cache dir (read, write,
-    # AND delete all go through here, so they stay mutually consistent).
-    return _manifest_cache_dir() / f"{_safe_cache_stem(name)}.json"
+def _manifest_source_coordinates(entry: dict[str, Any]) -> tuple[str, str, str, str]:
+    """The full source coordinates a cached manifest's identity is scoped to.
+
+    Returns ``(origin, ref, subdirectory, name)`` where *origin* is the
+    normalized, credential-free clone URL (:func:`_normalize_git_target`
+    strips userinfo, so a token in a configured URL never reaches a cache
+    file name or key material), *ref* is the effective ref — always the
+    configured branch, plus the pinned commit when the row carries one — and
+    *subdirectory*/*name* are the entry's remaining coordinates.
+
+    The branch is folded in even when a commit is present: the listing fetch
+    resolves non-catalog rows by BRANCH (their pins are data fidelity, not
+    authorization), so a ref that kept only the commit would hold the cache
+    path fixed across an operator's branch change — the exact reuse this
+    identity exists to rule out. The pin is folded in as well so a
+    republished pin is a miss rather than a stale hit.
+
+    Every value an external index controls degrades to a safe default when it
+    is not a string: the coordinates feed a cache KEY, so a malformed value
+    must produce a distinct-but-harmless identity, never a crash.
+    """
+    name = entry.get("name", "")
+    if not isinstance(name, str):
+        name = ""
+    git_url = _entry_git_url(entry)
+    origin = _normalize_git_target(git_url) if git_url else ""
+    commit = entry.get("commit")
+    branch = entry.get("branch", "main")
+    if not isinstance(branch, str) or not branch:
+        branch = "main"
+    ref = f"branch:{branch}"
+    if isinstance(commit, str) and commit:
+        ref = f"{ref}|commit:{commit}"
+    subdirectory = entry.get("subdirectory", "")
+    if not isinstance(subdirectory, str):
+        subdirectory = ""
+    return origin, ref, subdirectory, name
 
 
-def _read_manifest_cache(name: str) -> dict[str, Any] | None:
-    """Read cached app.json for a registry app. Returns None if missing or stale."""
-    path = _manifest_cache_path(name)
+def _manifest_cache_path(entry: dict[str, Any]) -> Path:
+    """Cache file for *entry*'s fetched ``app.json``, keyed on SOURCE IDENTITY.
+
+    The stem sanitizes the name so a hostile/traversal entry name from an
+    external registry can never resolve outside the manifest cache dir (read,
+    write, AND expiry all go through here, so they stay mutually consistent).
+    The digest folds the full source coordinates — normalized credential-free
+    origin, effective branch/pinned commit, repository subdirectory, and app
+    name — into the identity, so changing the configured branch is a cache
+    MISS by construction and two same-name apps from different repositories
+    can never share (or poison) each other's cached metadata. Name-keyed
+    caching could not establish provenance: a listing configured for branch
+    ``dev`` happily reused a manifest resolved earlier from ``main``.
+    """
+    origin, ref, subdirectory, name = _manifest_source_coordinates(entry)
+    # json.dumps gives each coordinate an escaped, delimited slot, so a value
+    # containing a would-be separator can never make two different coordinate
+    # tuples serialize to the same key material.
+    material = json.dumps([origin, ref, subdirectory, name])
+    digest = sha256(material.encode("utf-8")).hexdigest()[:16]
+    return _manifest_cache_dir() / _MANIFEST_SOURCE_SUBDIR / f"{_safe_cache_stem(name)}-{digest}.json"
+
+
+def _read_manifest_cache(entry: dict[str, Any]) -> dict[str, Any] | None:
+    """Read cached app.json for a registry entry's exact source coordinates.
+
+    Returns None if missing or stale — and, because the path is derived from
+    the entry's full source identity, also None whenever the branch, pinned
+    commit, repository, or subdirectory differ from what was cached, so a
+    failed fetch can never silently fall back to another source's manifest.
+    """
+    path = _manifest_cache_path(entry)
     if not path.is_file():
         return None
     try:
@@ -1299,16 +1512,63 @@ def _read_manifest_cache(name: str) -> dict[str, Any] | None:
         return None
 
 
-def _write_manifest_cache(name: str, data: dict[str, Any]) -> None:
-    """Write app.json to the manifest cache (atomic)."""
-    _manifest_cache_dir().mkdir(parents=True, exist_ok=True)
+#: Extra age beyond the largest TTL before a cache file is reclaimed. Derived
+#: from the expiry backdate slack so a file :func:`_expire_cache_file` just
+#: backdated (whose whole point is surviving its expiry) is never GC-eligible
+#: in the same breath, whatever value the slack takes.
+_MANIFEST_CACHE_GC_GRACE = _CACHE_EXPIRY_BACKDATE_SLACK + 2 * 86400
+
+
+def _gc_manifest_cache_dir() -> None:
+    """Best-effort reclamation of manifest cache files nothing can read anymore.
+
+    Coordinate-keyed cache files are orphaned whenever a row's branch, pin,
+    repository, or subdirectory changes: the new coordinates write a NEW file
+    and no reader ever derives the old path again. An untrusted index that
+    churns its coordinates every refresh would otherwise grow the cache dir
+    without bound. Reclaim is age-based and read-invisible: only files older
+    than every TTL plus a grace window are removed, and ``_read_manifest_cache``
+    already answers ``None`` for anything past ``_MANIFEST_CACHE_TTL`` (there
+    is no ``ignore_ttl`` read of a manifest file), so deleting them changes no
+    read result. Only the ``by-source/`` subdirectory is scanned: registry
+    index caches live at the cache-dir ROOT, so the boundary between "GC may
+    reclaim" and "GC never touches" is structural — an index cannot spell a
+    directory into an app name, where a name-prefix convention (skip
+    ``_registry_*``) would be imitable and hand a hostile index files the
+    sweep never reclaims. Runs on the write path because writes are the only
+    way the directory grows, which bounds it by construction.
+    """
+    cutoff = (
+        time.time()
+        - max(_MANIFEST_CACHE_TTL, _EXTERNAL_REGISTRY_CACHE_TTL)
+        - _MANIFEST_CACHE_GC_GRACE
+    )
+    try:
+        entries = list((_manifest_cache_dir() / _MANIFEST_SOURCE_SUBDIR).iterdir())
+    except OSError:
+        return
+    for path in entries:
+        if not path.name.endswith(".json"):
+            continue
+        try:
+            if path.stat().st_mtime < cutoff:
+                path.unlink()
+        except OSError:
+            continue
+
+
+def _write_manifest_cache(entry: dict[str, Any], data: dict[str, Any]) -> None:
+    """Write app.json to the manifest cache (atomic), keyed on source identity."""
+    path = _manifest_cache_path(entry)
+    path.parent.mkdir(parents=True, exist_ok=True)
     try:
         atomic_write(
-            _manifest_cache_path(name),
+            path,
             json.dumps(data, indent=2) + "\n",
         )
     except OSError as exc:
-        logger.warning("Failed to cache manifest for %s: %s", name, exc)
+        logger.warning("Failed to cache manifest for %s: %s", entry.get("name", ""), exc)
+    _gc_manifest_cache_dir()
 
 
 def _is_safe_registry_subdir(subdir: Any) -> bool:
@@ -1419,8 +1679,7 @@ async def _fetch_app_manifest(
         # was placed, never what it now holds. This manifest is what the admission and
         # platform gates read, so a local edit bypasses `installMode`/`os`
         # restrictions and gets the tree built server-side. It is the same reason a
-        # pinned install never reuses an existing checkout; the rule belongs here too,
-        # and previously stopped one caller short of this one.
+        # pinned install never reuses an existing checkout; the rule belongs here too.
         #
         # The cost is a shallow single-commit fetch per pinned listing, which the
         # pinned branch below already performs.
@@ -2167,8 +2426,9 @@ async def _resolve_manifest(entry: dict[str, Any]) -> dict[str, Any]:
     if not git_url:
         return entry
 
-    # Try cache first
-    cached = await asyncio.to_thread(_read_manifest_cache, name)
+    # Try cache first — keyed on the entry's full source coordinates, so a
+    # row configured for another branch/repo/subdirectory can never answer.
+    cached = await asyncio.to_thread(_read_manifest_cache, entry)
     if cached:
         return _merge_manifest(entry, cached)
 
@@ -2186,10 +2446,13 @@ async def _resolve_manifest(entry: dict[str, Any]) -> dict[str, Any]:
         owner_designated=bool(owner_target),
     )
     if manifest:
-        await asyncio.to_thread(_write_manifest_cache, name, manifest)
+        await asyncio.to_thread(_write_manifest_cache, entry, manifest)
         return _merge_manifest(entry, manifest)
 
-    # No manifest available — return entry as-is (minimal info)
+    # No manifest available — return entry as-is (minimal info). The failed
+    # fetch attaches NOTHING: the source-scoped cache read above already
+    # missed, and there is deliberately no name-only fallback that could
+    # attach a manifest cached for another branch or repository.
     logger.info("Could not fetch app.json for %s — showing minimal info", name)
     return entry
 
@@ -2249,18 +2512,55 @@ _REGISTRY_ROW_KEYS: frozenset[str] = frozenset(
 )
 
 
+def _store_asset_path(subdirectory: Any, asset_path: Any) -> Any:
+    """Repo-root-relative path of a store-card asset declared in ``app.json``.
+
+    The manifest is read from ``_contained_join(clone_dir, subdirectory)``, so
+    every art path it declares (``iconPath``, ``heroImage*``, ``screenshots*``)
+    is relative to that directory -- while ``/api/apps/blob`` resolves ``path``
+    against the repo root. This is the store-card reader's join; the field
+    itself keeps its meaning, because the installed-app reader
+    (``handle_app_art_file``) resolves the same value against the install
+    directory, where the subdirectory has already been stripped by the install.
+
+    Containment is preserved rather than re-derived: a ``subdirectory`` the
+    lexical gate :func:`_is_safe_registry_subdir` rejects (absolute, ``..``,
+    backslash) is NOT joined, so the join never manufactures a traversing path
+    -- such entries are dropped before listing anyway, and the bare path here
+    is exactly what the store built before. Empty or ``.`` means the repo root
+    (unchanged), an absolute path or URL is left untouched, and the join is a
+    plain posix join with no normalisation, so a ``..`` inside the asset path
+    still reaches the blob route's own rejection unchanged.
+    """
+    if not asset_path or not isinstance(asset_path, str) or not isinstance(subdirectory, str):
+        return asset_path
+    subdir = subdirectory.rstrip("/")
+    if subdir in ("", "."):
+        return asset_path
+    if not _is_safe_registry_subdir(subdir):
+        return asset_path
+    if asset_path.startswith("/") or "://" in asset_path:
+        return asset_path
+    return posixpath.join(subdir, asset_path)
+
+
 def _merge_manifest(entry: dict[str, Any], manifest: dict[str, Any]) -> dict[str, Any]:
     """Merge app.json fields into a registry entry.
 
     Registry-only fields (``_REGISTRY_ROW_KEYS``) are preserved from the entry.
     Everything else comes from app.json, with the blob proxy URL pattern
-    applied to image paths.
+    applied to image paths -- each joined under the entry's ``subdirectory``
+    first (:func:`_store_asset_path`), the directory the manifest was read from.
     """
     raw_repo = entry.get("repo", "")
     repo = _strip_git_target_userinfo(raw_repo) if isinstance(raw_repo, str) else ""
     result = {k: v for k, v in entry.items() if k in _REGISTRY_ROW_KEYS}
     if isinstance(result.get("repo"), str):
         result["repo"] = _strip_git_target_userinfo(result["repo"])
+    subdirectory = entry.get("subdirectory", "")
+
+    def _blob_url(asset_path: str) -> str:
+        return f"/api/apps/blob?repo={repo}&path={_store_asset_path(subdirectory, asset_path)}"
 
     # Top-level display fields from app.json
     for key in (
@@ -2300,7 +2600,9 @@ def _merge_manifest(entry: dict[str, Any], manifest: dict[str, Any]) -> dict[str
     if "platform" in manifest:
         result["platform"] = manifest["platform"]
 
-    # Icon — convert repo-relative path to blob proxy URL.
+    # Icon — convert a manifest-relative path to a blob proxy URL, joined under
+    # the entry's ``subdirectory`` (the directory app.json was read from) so the
+    # blob path names the file where it actually lives in the repo.
     #
     # Only ``iconPath`` (repo-relative) is honoured, never a manifest-declared
     # ``iconUrl``: an index-fetched manifest is untrusted content, and copying an
@@ -2310,13 +2612,13 @@ def _merge_manifest(entry: dict[str, Any], manifest: dict[str, Any]) -> dict[str
     # trusted-host gate.
     icon_path = manifest.get("iconPath", "")
     if icon_path and repo:
-        result["iconUrl"] = f"/api/apps/blob?repo={repo}&path={icon_path}"
+        result["iconUrl"] = _blob_url(icon_path)
     # Dark-appearance variant. Raster icons have fixed bytes, so an app that
     # must read well on both backgrounds ships two files; first-party
     # ``/app-assets/`` SVGs are inlined and repaint from theme tokens instead.
     icon_path_dark = manifest.get("iconPathDark", "")
     if icon_path_dark and repo:
-        result["iconUrlDark"] = f"/api/apps/blob?repo={repo}&path={icon_path_dark}"
+        result["iconUrlDark"] = _blob_url(icon_path_dark)
     # Lucide fallback icon from manifest extra fields
     if manifest.get("icon"):
         result["icon"] = manifest["icon"]
@@ -2324,31 +2626,29 @@ def _merge_manifest(entry: dict[str, Any], manifest: dict[str, Any]) -> dict[str
     # Screenshots — convert repo-relative paths to blob proxy URLs
     screenshots = manifest.get("screenshots", [])
     if screenshots and repo:
-        result["screenshots"] = [f"/api/apps/blob?repo={repo}&path={p}" for p in screenshots]
+        result["screenshots"] = [_blob_url(p) for p in screenshots]
 
     # Screenshots dark — convert repo-relative paths to blob proxy URLs
     screenshots_dark = manifest.get("screenshotsDark", [])
     if screenshots_dark and repo:
-        result["screenshotsDark"] = [
-            f"/api/apps/blob?repo={repo}&path={p}" for p in screenshots_dark
-        ]
+        result["screenshotsDark"] = [_blob_url(p) for p in screenshots_dark]
 
     # Hero images — convert repo-relative paths to blob proxy URLs
     hero = manifest.get("heroImage", "")
     if hero and repo:
-        result["heroImage"] = f"/api/apps/blob?repo={repo}&path={hero}"
+        result["heroImage"] = _blob_url(hero)
     hero_dark = manifest.get("heroImageDark", "")
     if hero_dark and repo:
-        result["heroImageDark"] = f"/api/apps/blob?repo={repo}&path={hero_dark}"
+        result["heroImageDark"] = _blob_url(hero_dark)
     # Detail-page hero images (wide banner ratio) — convert repo-relative paths
     # to blob proxy URLs. The detail page prefers these over the (near-square)
     # Browse-card hero so the wide banner isn't cropped.
     hero_detail = manifest.get("heroImageDetail", "")
     if hero_detail and repo:
-        result["heroImageDetail"] = f"/api/apps/blob?repo={repo}&path={hero_detail}"
+        result["heroImageDetail"] = _blob_url(hero_detail)
     hero_detail_dark = manifest.get("heroImageDetailDark", "")
     if hero_detail_dark and repo:
-        result["heroImageDetailDark"] = f"/api/apps/blob?repo={repo}&path={hero_detail_dark}"
+        result["heroImageDetailDark"] = _blob_url(hero_detail_dark)
 
     return result
 
@@ -2692,25 +2992,64 @@ def _credential_free_external_registry_entries(
     return [_credential_free_external_registry_value(entry) for entry in entries]
 
 
-def _external_registry_cache_path_for_identity(name: str) -> Path:
+def _external_registry_cache_identity(reg: Any) -> str:
+    """Stable cache identity for one configured registry source.
 
-    # Pure-safe names keep the historical byte-identical path (no hash suffix)
-    # so existing caches stay valid. Names carrying disallowed characters (e.g.
-    # URL-derived registry names) are slugified AND disambiguated with a short
-    # stable hash of the ORIGINAL name, so two distinct such names can never
-    # clobber the same ``_registry_<name>.json`` cache file.
+    A display name is not provenance: operators may repoint the same name to a
+    different repository or branch. Include the normalized credential-free
+    source coordinates so stale-fallback readers cannot answer from the old
+    source after that change.
+
+    ``branch`` is read defensively: registry objects reaching this helper are
+    duck-typed and may not carry the attribute at all. An absent branch, a
+    ``None`` branch, and an empty-string branch all mean "the source's default
+    branch" and share one identity component (the empty string), which can
+    never collide with a real branch because a configured branch is always a
+    non-empty string.
+    """
+    name = _public_registry_name(reg)
+    repo = _normalize_git_target(reg.repo)
+    branch = str(getattr(reg, "branch", "") or "")
+    return f"{name}|{repo}|{branch}"
+
+
+def _external_registry_cache_path_for_identity(name: str, *, slug_cap: int | None = None) -> Path:
+
+    # Pure-safe names map to the historical byte-identical path (no hash
+    # suffix). A coordinate identity from _external_registry_cache_identity
+    # always contains "|", so live index caches always take the slug+digest
+    # form; the byte-identical branch remains load-bearing for LEGACY path
+    # computation (_legacy_external_registry_cache_path and the name-keyed
+    # cleanup need to derive exactly the file an older release wrote). Names
+    # carrying disallowed characters are slugified AND disambiguated with a
+    # stable hash of the ORIGINAL name.
+    #
+    # ``slug_cap`` bounds the human-readable prefix for CURRENT identity
+    # paths (an URL-derived name repeats much of the repo URL, and an
+    # over-long filename makes every cache write fail with ENAMETOOLONG,
+    # silently disabling the stale-fallback). A capped prefix uses the FULL
+    # SHA-256 digest so truncation cannot reduce collision resistance. The
+    # DEFAULT is uncapped and keeps the historical eight-hex digest: that is
+    # the byte-identical derivation every previous release used, and legacy
+    # cleanup must keep deriving exactly those paths — changing its digest or
+    # capping its slug would miss an existing legacy artifact.
     if re.match(r"^[A-Za-z0-9_\-]+$", name):
         safe = name
     else:
         slug = re.sub(r"[^A-Za-z0-9_\-]+", "-", name).strip("-") or "registry"
-        digest = sha256(name.encode("utf-8")).hexdigest()[:8]
+        full_digest = sha256(name.encode("utf-8")).hexdigest()
+        if slug_cap is not None:
+            slug = slug[:slug_cap].strip("-") or "registry"
+            digest = full_digest
+        else:
+            digest = full_digest[:8]
         safe = f"{slug}-{digest}"
     return _manifest_cache_dir() / f"_registry_{safe}.json"
 
 
 def _external_registry_cache_path(name: str) -> Path:
     safe_name = _credential_free_external_registry_value(name)
-    return _external_registry_cache_path_for_identity(safe_name)
+    return _external_registry_cache_path_for_identity(safe_name, slug_cap=120)
 
 
 def _legacy_external_registry_cache_path(name: str) -> Path:
@@ -2728,6 +3067,36 @@ def _remove_legacy_credential_registry_cache(name: str) -> None:
         legacy_path.unlink(missing_ok=True)
     except OSError:
         logger.warning("Failed to remove a legacy credential-bearing registry cache")
+
+
+def _remove_legacy_name_keyed_registry_cache(reg: Any) -> None:
+    """Best-effort removal of caches written under the pre-identity key.
+
+    Before the cache identity included source coordinates, the index cache
+    was keyed on ``reg.name or reg.repo`` alone. No reader derives that path
+    any more, so the file is reclaimed here rather than left behind — in BOTH
+    filename forms: the sanitized one a recent release wrote, and the raw one
+    an older release wrote, whose filename can embed URL userinfo when the
+    display name is a credential-bearing URL. Runs before the fetch so the
+    credential-bearing artifact is removed even when the registry is
+    unreachable. Both derivations are deliberately UNCAPPED
+    (``slug_cap=None``): previous releases wrote uncapped slugs, and a capped
+    derivation would miss any legacy file whose slug ran past the cap.
+    """
+    legacy_name = str(getattr(reg, "name", "") or "") or reg.repo
+    current_path = _external_registry_cache_path(_external_registry_cache_identity(reg))
+    for legacy_path in (
+        _external_registry_cache_path_for_identity(
+            _credential_free_external_registry_value(legacy_name)
+        ),
+        _legacy_external_registry_cache_path(legacy_name),
+    ):
+        if legacy_path == current_path:
+            continue
+        try:
+            legacy_path.unlink(missing_ok=True)
+        except OSError:
+            logger.warning("Failed to remove a legacy name-keyed registry cache")
 
 
 def _read_external_registry_cache(
@@ -3068,8 +3437,12 @@ async def _fetch_and_cache_external_registry(reg) -> list[dict[str, Any]] | None
     """
     # An unnamed legacy registry used its raw URL as the old cache identity,
     # which exposed HTTP userinfo in the filename. Remove that exact artifact
-    # even when this is a fresh fetch with no preceding cache read.
+    # even when this is a fresh fetch with no preceding cache read — and the
+    # pre-identity name-keyed caches with it (both filename forms), so a
+    # credential-bearing artifact is reclaimed even when the fetch below
+    # fails. No reader derives any of these paths any more.
     _remove_legacy_credential_registry_cache(reg.repo)
+    _remove_legacy_name_keyed_registry_cache(reg)
     public_registry_repo = _strip_git_target_userinfo(reg.repo)
     name = _public_registry_name(reg)
     entries = await _fetch_external_registry_index(reg.repo, reg.branch)
@@ -3129,7 +3502,7 @@ async def _fetch_and_cache_external_registry(reg) -> list[dict[str, Any]] | None
         entry.setdefault("repo", public_registry_repo)
         entry["_registry"] = name
     _apply_configured_branch(entries, reg, warn=True)
-    await asyncio.to_thread(_write_external_registry_cache, name, entries)
+    await asyncio.to_thread(_write_external_registry_cache, _external_registry_cache_identity(reg), entries)
     return entries
 
 
@@ -3147,7 +3520,7 @@ async def _load_external_registries() -> list[dict[str, Any]]:
     all_entries: list[dict[str, Any]] = []
 
     async def _load_one(reg) -> list[dict[str, Any]]:
-        cache_name = reg.name or reg.repo
+        cache_name = _external_registry_cache_identity(reg)
         public_name = _public_registry_name(reg)
 
         # Try cache first
@@ -3221,7 +3594,11 @@ def _expire_cache_file(path: Path) -> None:
         if cache_dir not in resolved.parents:
             logger.warning("Refusing to expire cache file outside cache dir: %s", path)
             return
-        past = time.time() - max(_MANIFEST_CACHE_TTL, _EXTERNAL_REGISTRY_CACHE_TTL) - 3600
+        past = (
+            time.time()
+            - max(_MANIFEST_CACHE_TTL, _EXTERNAL_REGISTRY_CACHE_TTL)
+            - _CACHE_EXPIRY_BACKDATE_SLACK
+        )
         os.utime(resolved, (past, past))
     except FileNotFoundError:
         pass
@@ -3268,7 +3645,7 @@ async def refresh_registries(repo: str | None = None) -> dict[str, Any]:
     failed: list[str] = []
     results: list[dict[str, Any]] = []
     for reg in registries:
-        name = reg.name or reg.repo
+        name = _external_registry_cache_identity(reg)
         display_name = _public_registry_name(reg)
         # Read the (possibly stale) prior index up front so we know which
         # per-app manifest caches this registry contributed, even if the
@@ -3282,13 +3659,19 @@ async def refresh_registries(repo: str | None = None) -> dict[str, Any]:
             continue
         # Expire per-app manifest caches so fresh display info is refetched
         # lazily on the next read (mtime expiry preserves the stale fallback).
-        manifest_names: set[str] = set()
+        # Both the prior and the fresh index rows contribute: the cache path is
+        # derived from each row's FULL source coordinates, so a row whose
+        # branch/repo changed in the new index expires the old coordinates'
+        # cache (via the prior row) as well as priming a miss for the new ones.
+        expire_paths: set[Path] = set()
         for e in (prior or []) + entries:
+            if not isinstance(e, dict):
+                continue
             entry_name = e.get("name")
             if isinstance(entry_name, str) and entry_name:
-                manifest_names.add(entry_name)
-        for entry_name in manifest_names:
-            await asyncio.to_thread(_expire_cache_file, _manifest_cache_path(entry_name))
+                expire_paths.add(_manifest_cache_path(e))
+        for cache_path in expire_paths:
+            await asyncio.to_thread(_expire_cache_file, cache_path)
         refreshed.append(display_name)
         results.append({"name": display_name, "ok": True})
 
@@ -3344,14 +3727,34 @@ async def _detect_installed_probe(
         try:
 
             base_cmd = ["/bin/sh", "-c", detect_cmd]
-            sandboxed_cmd, _cleanup = await wrap_argv_async(
-                base_cmd, mode="strict", _prepare=wrap_argv
+            # Through the single sandboxed-spawn chokepoint, not a hand-rolled
+            # wrap + cgroup pair: it applies the strict launcher, the credential
+            # scrub and the cgroup DoS ceiling, AND it forwards the systemd bus
+            # locators that the ceiling's own `systemd-run --user` wrapper needs
+            # to reach the user bus, dropping them again with an `env -u` shim
+            # inside the scope so the probe itself never sees a live bus address.
+            # A caller-built env that omits those locators makes `systemd-run`
+            # exit 1 before the command runs, which with DEVNULL stderr reads as
+            # "not installed" for every app on a cgroup-delegated host.
+            #
+            # `_detect_probe_env` is the credential-free base it scrubs on top of:
+            # no agent socket, no git credential helper, no prompt, no toolchain
+            # variable. The command string comes from a registry manifest, which
+            # is untrusted content, and `strict` mode's own scrub only runs when
+            # the launcher does -- not on Windows, and not on a host with no
+            # sandbox backend plus agent.sandbox_allow_unsandboxed_exec -- so the
+            # env handed over here is the only control left on those hosts.
+            sandboxed_cmd, probe_env, _cleanup = await sandboxed_spawn_argv_async(
+                base_cmd,
+                mode="strict",
+                env=_detect_probe_env(),
+                _prepare=sandboxed_spawn_argv,
             )
-            sandboxed_cmd = cgroup_scope_argv(sandboxed_cmd)  # cgroup DoS ceiling
             proc = await create_subprocess_limited(
                 *sandboxed_cmd,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
+                env=probe_env,
                 start_new_session=platform_compat.IS_POSIX,
                 creationflags=platform_compat.CREATE_NEW_PROCESS_GROUP,
             )
@@ -3512,8 +3915,8 @@ async def list_registry() -> list[dict[str, Any]]:
 
     # Probe the seed/catalog rows, then append external registries at the single
     # shared merge site. Reserving every seed/catalog name means an external row
-    # can only ADD a name none of them claim — the precedence the inline dedup
-    # here used to enforce.
+    # can only ADD a name none of them claim, which is the precedence this merge
+    # site enforces.
     detected = await _detect_installed_probe(entries, installed_map)
     entries, external_detected = await _append_external_registry_apps(
         entries, {e.get("name") for e in entries}, installed_map
@@ -3536,8 +3939,8 @@ async def list_registry() -> list[dict[str, Any]]:
     #
     # Annotate from the SAME fresh entries the inventory came from, never the cache.
     #
-    # Round 11 stopped the agent-writable cache from INTRODUCING a row; this stops it
-    # from REWRITING one. `annotate` overlays `displayName` and `description`, which
+    # Blocking the agent-writable cache from INTRODUCING a row is not enough; this
+    # stops it from REWRITING one. `annotate` overlays `displayName` and `description`, which
     # are exactly what the consent modal renders, and it only skips rows carrying
     # `_registry` -- so a poisoned cache entry could re-label a freshly fetched
     # first-party row and the name-scoped grant would then execute the real app under
@@ -3625,6 +4028,8 @@ async def list_catalog_apps() -> list[dict[str, Any]]:
     snapshotted before the ``git``-installability filter below drops a
     not-yet-installable ``git`` row, so an external row can never shadow a name
     install resolves by (which would point install-by-name at the wrong repo).
+    A ``builtin`` row naming a builtin this build cannot register is dropped the
+    same way, and keeps its reservation the same way.
     """
     # Off the event loop: the first call after a cache expiry does network I/O.
     rows = await asyncio.to_thread(official_catalog.list_catalog_rows)
@@ -3664,6 +4069,15 @@ async def list_catalog_apps() -> list[dict[str, Any]]:
         for row in rows
         if row.get("source", {}).get("type") != "git" or row.get("name") in installable_names
     ]
+    # A `builtin` row is only installable when this build ships that builtin, so a
+    # catalog ahead of this gateway would otherwise render an Install that cannot work.
+    if any(row.get("source", {}).get("type") == "builtin" for row in rows):
+        shipped = await asyncio.to_thread(shipped_builtin_names)
+        rows = [
+            row
+            for row in rows
+            if row.get("source", {}).get("type") != "builtin" or row.get("name") in shipped
+        ]
 
     # Catalog display rows intentionally carry no clone URL. Resolve the
     # consent target from the same install coordinates name-only install uses:
@@ -3862,7 +4276,7 @@ def _external_registry_row(name: str) -> dict[str, Any] | None:
     attached here at the lookup boundary so a stale cache cannot omit it.
     """
     for reg in _effective_registries():
-        cache_name = reg.name or reg.repo
+        cache_name = _external_registry_cache_identity(reg)
         public_name = _public_registry_name(reg)
         cached = _read_external_registry_cache(cache_name, ignore_ttl=True)
         if cached:
@@ -3936,7 +4350,7 @@ def _registry_app_candidates(name: str) -> list[dict[str, Any]]:
         # this is its sibling and must refuse the same way.
         return []
     for reg in _effective_registries():
-        cached = _read_external_registry_cache(reg.name or reg.repo, ignore_ttl=True)
+        cached = _read_external_registry_cache(_external_registry_cache_identity(reg), ignore_ttl=True)
         for entry in cached or []:
             if isinstance(entry, dict) and entry.get("name") == name:
                 _apply_configured_branch([entry], reg)
@@ -4011,7 +4425,7 @@ def _external_registry_app_by_repo(repo: str) -> dict[str, Any] | None:
     blob-proxy worker. Fails open to ``None``."""
     try:
         for reg in _effective_registries():
-            cached = _read_external_registry_cache(reg.name or reg.repo, ignore_ttl=True)
+            cached = _read_external_registry_cache(_external_registry_cache_identity(reg), ignore_ttl=True)
             for entry in cached or []:
                 if (
                     isinstance(entry, dict)
@@ -4060,7 +4474,7 @@ def _external_registry_repos() -> set[str]:
     repos: set[str] = set()
     try:
         for reg in _effective_registries():
-            cached = _read_external_registry_cache(reg.name or reg.repo, ignore_ttl=True)
+            cached = _read_external_registry_cache(_external_registry_cache_identity(reg), ignore_ttl=True)
             for entry in cached or []:
                 if (
                     isinstance(entry, dict)
@@ -5230,7 +5644,7 @@ async def _git_clone_or_pull(
                         "manually and retry the install."
                     ),
                 }
-            # Fall through: `dest` no longer exists, so the pinned fetch below
+            # Fall through: `dest` is gone, so the pinned fetch below
             # creates it fresh inside the try/finally that owns restoration.
         else:
             # Already cloned from the verified origin AND branch (or the branch
@@ -5743,8 +6157,8 @@ async def _unpoison_rejected_checkout(
         # is best-effort and must never mask the refusal it follows.
         logger.debug("post-rejection rollback failed for %s: %s", app_name, exc)
     if _contained_join(pkg_dir, manifest_relpath) is None:
-        # manifest_relpath (the FULL path, e.g. "sub/app.json") no longer
-        # resolves inside pkg_dir RIGHT NOW — some callers reach this point
+        # manifest_relpath (the FULL path, e.g. "sub/app.json") does not
+        # resolve inside pkg_dir RIGHT NOW — some callers reach this point
         # after a build step or onInstall script ran with write access to the
         # checkout, so a containment check the caller made earlier cannot be
         # trusted here. Checking only `subdirectory` (the directory, and only
@@ -5955,14 +6369,13 @@ async def _clone_build_app_locked(
 
     # Build in the directory that actually HOLDS the package, not the clone root.
     #
-    # A monorepo registry entry declares `subdirectory`, and historically it was
-    # joined only AFTER this build ran — so `_run_app_build` looked for
-    # pyproject.toml/package.json at the clone root, found none, logged "No build
-    # step detected — using source as-is", and returned ok=True having installed
-    # nothing. The app's own pyproject.toml was never seen. A silent success is
-    # the worst shape for this: `setup.onInstall` does get `cwd=app_source`, so
-    # an app could paper over it with a script, which is exactly how a bug like
-    # this stays hidden.
+    # A monorepo registry entry declares `subdirectory`, and joining it only AFTER
+    # this build ran would leave `_run_app_build` looking for
+    # pyproject.toml/package.json at the clone root, finding none, logging "No build
+    # step detected — using source as-is", and returning ok=True having installed
+    # nothing — the app's own pyproject.toml never seen. A silent success is the
+    # worst shape for this: `setup.onInstall` does get `cwd=app_source`, so an app
+    # could paper over it with a script, which is how such a break stays hidden.
     #
     # `app_source` is already the containment-checked join of `subdirectory`
     # under the clone root (the identity gate above fails closed on an escaping
@@ -6035,7 +6448,7 @@ async def _clone_build_app_locked(
                         f"{stale_path}"
                     )
         # Drop the checkouts actually put back from the caller-owned pending
-        # list: a restored checkout is no longer a retained `.stale-*` sibling,
+        # list: a restored checkout is not a retained `.stale-*` sibling,
         # so `_clone_build_app`'s single-exit stamp must not carry it and the
         # caller's `_report_retained_stale_checkouts` must not name it. A rename
         # that FAILED above stays in the list so it is still reported stranded.
@@ -6130,13 +6543,25 @@ async def _run_app_build(
                     "signed application bundle and cannot install packages"
                 ),
             }
-        pip_cmd = [sys.executable, "-m", "pip"]
-        if (build_dir / "requirements.txt").is_file() and not (
-            (build_dir / "pyproject.toml").is_file() or (build_dir / "setup.py").is_file()
-        ):
-            build_cmds.append([*pip_cmd, "install", "-r", "requirements.txt"])
+        # A missing `pip` module is a soft skip, exactly like a missing npm
+        # (see the docstring). `sys.executable` is the gateway interpreter, and a
+        # venv created with `--without-pip` — or any minimal runtime — has no `pip`
+        # module: running `-m pip` against it exits non-zero and would abort the
+        # whole registry install. Probe with `find_spec` on THIS interpreter (no
+        # subprocess: it is the interpreter that would run the build) and skip when
+        # pip is absent, so an app that needs no Python build still installs cleanly.
+        if importlib.util.find_spec("pip") is None:
+            log_lines.append(
+                "pip not available in the gateway interpreter — skipping Python build step"
+            )
         else:
-            build_cmds.append([*pip_cmd, "install", "."])
+            pip_cmd = platform_compat.isolated_python_argv("-m", "pip")
+            if (build_dir / "requirements.txt").is_file() and not (
+                (build_dir / "pyproject.toml").is_file() or (build_dir / "setup.py").is_file()
+            ):
+                build_cmds.append([*pip_cmd, "install", "-r", "requirements.txt"])
+            else:
+                build_cmds.append([*pip_cmd, "install", "."])
 
     if not build_cmds:
         log_lines.append("No build step detected — using source as-is")
@@ -6213,14 +6638,13 @@ def _report_retained_stale_checkouts(
       exception path is still named instead of being silently swept.
 
     Both routes funnel the wording through here precisely so they can never
-    drift: the reporter used to be hand-replicated across every exit with a
+    drift: hand-replicating the reporter across every exit, with a
     ``filter_restorable`` flag manually mirrored to ``durable_success`` at each
-    one, which is the scattered-per-exit stranding class the caller's
-    move-aside bookkeeping exists to avoid — a new exit could forget the call
-    or pass the wrong flag and silently strand or double-report a checkout.
-    Every normal exit now reaches the single ``finally`` call and derives the
-    flag once; the only other caller is the exception path that no ``finally``
-    return can cover.
+    one, is the scattered-per-exit stranding class the caller's move-aside
+    bookkeeping exists to avoid — a new exit could forget the call or pass the
+    wrong flag and silently strand or double-report a checkout. Every normal
+    exit reaches the single ``finally`` call and derives the flag once; the only
+    other caller is the exception path that no ``finally`` return can cover.
 
     ``_pending_stale_cleanup`` collects every move-aside regardless of
     reason, but ``_restorable_stale`` (a subset) is put back by the
@@ -6558,7 +6982,7 @@ async def install_from_registry(
 
     # NOTE: the provenance signer is computed LATER, from the identity-checked
     # CLONED manifest — not from this pre-clone prefetch. An update can pull a
-    # commit whose manifest is no longer signed (or signed by someone else);
+    # commit whose manifest is not signed (or is signed by someone else);
     # provenance must record the artifact actually installed, not the preview.
 
     # Platform compatibility check — if the app requires a specific OS and
@@ -6632,14 +7056,34 @@ async def install_from_registry(
         try:
 
             base_cmd = ["/bin/sh", "-c", detect_cmd]
-            sandboxed_cmd, _cleanup = await wrap_argv_async(
-                base_cmd, mode="strict", _prepare=wrap_argv
+            # Through the single sandboxed-spawn chokepoint, not a hand-rolled
+            # wrap + cgroup pair: it applies the strict launcher, the credential
+            # scrub and the cgroup DoS ceiling, AND it forwards the systemd bus
+            # locators that the ceiling's own `systemd-run --user` wrapper needs
+            # to reach the user bus, dropping them again with an `env -u` shim
+            # inside the scope so the probe itself never sees a live bus address.
+            # A caller-built env that omits those locators makes `systemd-run`
+            # exit 1 before the command runs, which with DEVNULL stderr reads as
+            # "not installed" for every app on a cgroup-delegated host.
+            #
+            # `_detect_probe_env` is the credential-free base it scrubs on top of:
+            # no agent socket, no git credential helper, no prompt, no toolchain
+            # variable. The command string comes from a registry manifest, which
+            # is untrusted content, and `strict` mode's own scrub only runs when
+            # the launcher does -- not on Windows, and not on a host with no
+            # sandbox backend plus agent.sandbox_allow_unsandboxed_exec -- so the
+            # env handed over here is the only control left on those hosts.
+            sandboxed_cmd, probe_env, _cleanup = await sandboxed_spawn_argv_async(
+                base_cmd,
+                mode="strict",
+                env=_detect_probe_env(),
+                _prepare=sandboxed_spawn_argv,
             )
-            sandboxed_cmd = cgroup_scope_argv(sandboxed_cmd)  # cgroup DoS ceiling
             proc = await create_subprocess_limited(
                 *sandboxed_cmd,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
+                env=probe_env,
                 start_new_session=platform_compat.IS_POSIX,
                 creationflags=platform_compat.CREATE_NEW_PROCESS_GROUP,
             )
@@ -6817,8 +7261,8 @@ async def install_from_registry(
 
         # ADMISSION GATE, third pass — the post-build manifest is what
         # install_app/update_app will actually register, and a build step can
-        # rewrite app.json; a manifest that no longer satisfies the admission
-        # policy (e.g. signature required and now absent) must not install.
+        # rewrite app.json; a manifest that does not satisfy the admission
+        # policy (e.g. signature required but absent) must not install.
         denied = app_admission_denied(
             name,
             manifest=AppManifest.from_dict(manifest_data),
@@ -7125,7 +7569,7 @@ async def install_from_registry(
             # filter_restorable=False and names the genuinely-retained restorable
             # stale rather than letting it sit unlogged until the sweep.
             if official_entry:
-                install_receipt.dispatch(
+                await install_receipt.dispatch_async(
                     name,
                     official=True,
                     kind=(
@@ -7140,6 +7584,9 @@ async def install_from_registry(
                     "(self-managed)"
                 ),
             }
+            notice = getattr(reg_result, "notice", "")
+            if isinstance(notice, str) and notice:
+                outcome["notice"] = notice
             return outcome
 
         # Kirocrew-managed: copy to ~/.kiro/crew/apps/ and register resources
@@ -7194,7 +7641,7 @@ async def install_from_registry(
             # = False — so the restorable stale is reported, not stranded.
             if official_entry:
                 # Detached best-effort telemetry runs only after durable success.
-                install_receipt.dispatch(
+                await install_receipt.dispatch_async(
                     name,
                     official=True,
                     kind=(
@@ -7211,6 +7658,10 @@ async def install_from_registry(
             "message": result.message,
             "error": result.error,
         }
+        if result.notice:
+            # e.g. ``session_approval_reconsent``: the app was left disabled on
+            # purpose and the routes must neither start it nor report plain success.
+            outcome["notice"] = result.notice
         return outcome
 
     except Exception as exc:
@@ -7297,7 +7748,7 @@ async def install_from_registry(
             # never off `outcome`), so removing them here deprives no consumer.
             # Two of them -- `_pending_stale_cleanup` and `_restorable_stale` --
             # are `list[Path]`, which is not JSON-serializable, so a build
-            # refusal that spreads `{**build_result}` into `outcome` used to make
+            # refusal that spreads `{**build_result}` into `outcome` would make
             # the API/SSE layer raise `TypeError` when it serialized the refusal.
             # Scrubbing the CLASS (every `_`-prefixed key) rather than those two
             # names closes it at the single seam: `_checkout_preexisted`,

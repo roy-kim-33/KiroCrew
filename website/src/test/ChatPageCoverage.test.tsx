@@ -31,16 +31,22 @@
  * is faked: grouping, the render dispatch and the handlers run for real.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, act, waitFor, fireEvent } from '@testing-library/react'
+import { render, screen, act, waitFor, fireEvent, within } from '@testing-library/react'
 import type { ReactNode } from 'react'
+import { flushSync } from 'react-dom'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { Provider } from 'react-redux'
-import { MemoryRouter, Routes, Route } from 'react-router-dom'
+import { MemoryRouter, Routes, Route, useLocation } from 'react-router-dom'
 import { createTestStore } from './helpers'
 import { ApiError } from '../api/client'
+import { loadDrafts } from '../utils/chatDrafts'
 import { ThemeProvider } from '../hooks/useTheme'
 import type { RootState } from '../store'
+import { sseConnected, sseDisconnected } from '../store/dashboardSlice'
+import { createSlot, sseAutomation } from '../store/chatSlice'
 import type { ChatMessage } from '../types'
+import { structuredMonitorLoop } from './monitorFixtures'
+import { normalizeAutomationRecord, type AutomationRecord } from '../monitoring/automation'
 
 // --- Prop recorders for the two panels whose callbacks are under test --------
 
@@ -70,7 +76,15 @@ interface UserMessageProps {
 let userMsgProps: UserMessageProps | null = null
 
 interface ChatInputProps {
+  value?: string
+  onChange?: (v: string) => void
+  onFileSelect?: (path: string, kind: 'file' | 'dir', token?: string) => void
   onAgentClick?: (rect: DOMRect) => void
+  onModelClick?: (rect: DOMRect) => void
+  automation?: { kind?: string } | null
+  automationCreationReady?: boolean
+  automationSnapshotFailed?: boolean
+  onAutomationChange?: (automation: AutomationRecord | null) => void
 }
 let chatInputProps: ChatInputProps | null = null
 
@@ -84,6 +98,12 @@ interface DefaultAgentRowProps {
 }
 let agentDropdownProps: AgentDropdownListProps | null = null
 let defaultAgentRowProps: DefaultAgentRowProps | null = null
+
+interface ModelEffortDropdownProps {
+  onSetDefault: () => void
+  onManageModels?: () => void
+}
+let modelDropdownProps: ModelEffortDropdownProps | null = null
 
 vi.mock('../components/QueueStack', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../components/QueueStack')>()
@@ -133,6 +153,9 @@ vi.mock('../components/AgentDropdownList', () => ({
   DefaultAgentRow: (props: DefaultAgentRowProps) => { defaultAgentRowProps = props; return null },
 }))
 vi.mock('../components/ModelDropdownList', () => ({ default: () => null }))
+vi.mock('../components/ModelEffortDropdown', () => ({
+  default: (props: ModelEffortDropdownProps) => { modelDropdownProps = props; return null },
+}))
 vi.mock('../components/InfoTip', () => ({ default: () => null }))
 vi.mock('../components/SegmentedControl', () => ({ default: () => null }))
 vi.mock('../components/ChatInput', () => ({
@@ -274,6 +297,13 @@ interface RenderOpts {
   url?: string
 }
 
+/** Where a deep link out of the page landed — ChatPage renders nothing
+ *  there, so the probe is the only witness. */
+function RouteProbe() {
+  const loc = useLocation()
+  return <span data-testid="route-probe">{loc.pathname + loc.search}</span>
+}
+
 /** Renders ChatPage, then pushes `messages` into the active slot.
  *
  *  The messages are dispatched AFTER mount rather than preloaded: ChatPage's
@@ -322,6 +352,7 @@ function renderChatPage(messages: ChatMessage[], opts: RenderOpts = {}) {
           <MemoryRouter initialEntries={['/chat/chat-1']}>
             <Routes>
               <Route path="/chat/:slug?" element={<ChatPage mode="" />} />
+              <Route path="*" element={<RouteProbe />} />
             </Routes>
           </MemoryRouter>
         </ThemeProvider>
@@ -331,7 +362,7 @@ function renderChatPage(messages: ChatMessage[], opts: RenderOpts = {}) {
   if (messages.length) {
     act(() => { store.dispatch({ type: 'chat/replaceMessages', payload: messages }) })
   }
-  return { store }
+  return { store, qc }
 }
 
 /** All text currently on screen — ChatPage spans several sibling roots. */
@@ -350,6 +381,7 @@ beforeEach(() => {
   chatInputProps = null
   agentDropdownProps = null
   defaultAgentRowProps = null
+  modelDropdownProps = null
   sessionStorage.clear()
   setItemSpy.mockClear()
   window.history.replaceState({}, '', '/chat')
@@ -365,6 +397,171 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.useRealTimers()
+})
+
+describe('ChatPage active-slot automation hydration', () => {
+  it('surfaces a failed snapshot and keeps bounded creation guarded', async () => {
+    apiMocks.autonudgeForSlot = vi.fn().mockResolvedValue({ enabled: true, loop: null })
+    apiMocks.monitorForSlot = vi.fn().mockRejectedValue(new Error('owner unavailable'))
+
+    renderChatPage([])
+
+    await waitFor(() => expect(chatInputProps?.automationSnapshotFailed).toBe(true))
+    expect(chatInputProps?.automationCreationReady).toBe(false)
+  })
+
+  it('hydrates a structured monitor alongside its reduced compatibility row', async () => {
+    const monitor = structuredMonitorLoop()
+    const {
+      message: _withheldMessage,
+      monitor: _withheldMonitor,
+      ...reducedMonitor
+    } = monitor
+    apiMocks.autonudgeForSlot = vi.fn().mockResolvedValue({
+      enabled: true,
+      loop: reducedMonitor,
+    })
+    apiMocks.monitorForSlot = vi.fn().mockResolvedValue({ enabled: true, monitor })
+
+    renderChatPage([])
+
+    await waitFor(() => {
+      expect(chatInputProps?.automation).toMatchObject({
+        kind: 'structured_monitor',
+        id: monitor.id,
+      })
+    })
+    expect(chatInputProps?.automationSnapshotFailed).toBe(false)
+  })
+
+  it('caches a non-null mutation result before updating the store', async () => {
+    const next = normalizeAutomationRecord(structuredMonitorLoop({ probe_count: 2 }))!
+    apiMocks.autonudgeForSlot = vi.fn().mockResolvedValue({ enabled: true, loop: null })
+    apiMocks.monitorForSlot = vi.fn().mockResolvedValue({ enabled: true, monitor: null })
+    const { qc, store } = renderChatPage([])
+    await waitFor(() => expect(chatInputProps?.automationCreationReady).toBe(true))
+
+    act(() => { chatInputProps?.onAutomationChange?.(next) })
+
+    expect(qc.getQueryData(['session-automation', 'chat-1'])).toEqual(next)
+    expect(store.getState().chat.automations['chat-1']).toEqual(next)
+  })
+
+  it('forgets the cached legacy snapshot after a successful stop', async () => {
+    const loop = {
+      id: 'legacy-1', slot_key: 'chat-1', message: 'Keep going', idle_secs: 60,
+      max_cycles: 24, cycle_count: 7, active: true, last_fire_ts: 123,
+    }
+    apiMocks.autonudgeForSlot = vi.fn().mockResolvedValue({ enabled: true, loop })
+    apiMocks.monitorForSlot = vi.fn().mockResolvedValue({ enabled: true, monitor: null })
+
+    const { qc } = renderChatPage([])
+    await waitFor(() => {
+      expect(chatInputProps?.automation).toMatchObject({ kind: 'legacy_goal_loop' })
+    })
+
+    act(() => { chatInputProps?.onAutomationChange?.(null) })
+
+    expect(qc.getQueryData(['session-automation', 'chat-1'])).toBeNull()
+    await waitFor(() => expect(chatInputProps?.automation).toBeNull())
+  })
+
+  it('blocks creation until REST discovers a monitor without a websocket frame', async () => {
+    let resolveLegacy!: (value: { enabled: boolean; loop: unknown }) => void
+    let resolveMonitor!: (value: { enabled: boolean; monitor: unknown }) => void
+    apiMocks.autonudgeForSlot = vi.fn().mockReturnValue(new Promise(resolve => {
+      resolveLegacy = resolve
+    }))
+    apiMocks.monitorForSlot = vi.fn().mockReturnValue(new Promise(resolve => {
+      resolveMonitor = resolve
+    }))
+
+    renderChatPage([])
+    await waitFor(() => expect(chatInputProps?.automationCreationReady).toBe(false))
+    expect(apiMocks.autonudgeForSlot).toHaveBeenCalledWith('chat-1')
+    expect(apiMocks.monitorForSlot).toHaveBeenCalledWith('chat-1')
+
+    const loop = structuredMonitorLoop()
+    act(() => {
+      resolveLegacy({ enabled: true, loop })
+      resolveMonitor({ enabled: true, monitor: loop })
+    })
+    await waitFor(() => {
+      expect(chatInputProps?.automation).toMatchObject({ kind: 'structured_monitor' })
+      expect(chatInputProps?.automationCreationReady).toBe(true)
+    })
+  })
+
+  it('keeps a disconnected REST snapshot query-local', async () => {
+    const freshLoop = structuredMonitorLoop({ active: false, stopped_reason: 'user_stop' })
+    const fresh = normalizeAutomationRecord(freshLoop)!
+    apiMocks.autonudgeForSlot = vi.fn().mockResolvedValue({ enabled: true, loop: null })
+    apiMocks.monitorForSlot = vi.fn().mockResolvedValue({ enabled: true, monitor: freshLoop })
+
+    const { store } = renderChatPage([])
+
+    await waitFor(() => {
+      expect(chatInputProps?.automation).toEqual(fresh)
+    })
+    expect(store.getState().chat.automations?.['chat-1']).toBeUndefined()
+  })
+
+  it('does not replace a live frame with cached data during or after a failed refetch', async () => {
+    const cachedLoop = structuredMonitorLoop({ probe_count: 1 })
+    const live = normalizeAutomationRecord(structuredMonitorLoop({ probe_count: 2 }))!
+    apiMocks.autonudgeForSlot = vi.fn().mockResolvedValue({ enabled: true, loop: null })
+    apiMocks.monitorForSlot = vi.fn().mockResolvedValue({ enabled: true, monitor: cachedLoop })
+
+    const { store, qc } = renderChatPage([])
+    act(() => { store.dispatch(sseConnected()) })
+    await waitFor(() => expect(qc.getQueryData(['session-automation', 'chat-1'])).toBeTruthy())
+    act(() => { store.dispatch(sseAutomation(live)) })
+
+    let rejectMonitor!: (reason: Error) => void
+    apiMocks.autonudgeForSlot = vi.fn().mockResolvedValue({ enabled: true, loop: null })
+    apiMocks.monitorForSlot = vi.fn().mockReturnValue(new Promise((_resolve, reject) => {
+      rejectMonitor = reject
+    }))
+    const refetch = qc.refetchQueries({ queryKey: ['session-automation', 'chat-1'] })
+    await waitFor(() => {
+      expect(qc.getQueryState(['session-automation', 'chat-1'])?.fetchStatus).toBe('fetching')
+    })
+
+    act(() => { store.dispatch(sseDisconnected()) })
+    expect(store.getState().chat.automations['chat-1']).toEqual(live)
+
+    act(() => { rejectMonitor(new Error('offline')) })
+    await refetch
+    await waitFor(() => {
+      expect(qc.getQueryState(['session-automation', 'chat-1'])?.fetchStatus).toBe('idle')
+    })
+    expect(store.getState().chat.automations['chat-1']).toEqual(live)
+  })
+
+  it('does not delete a live monitor when an older REST absence settles after disconnect', async () => {
+    let resolveLegacy!: (value: { enabled: boolean; loop: null }) => void
+    let resolveMonitor!: (value: { enabled: boolean; monitor: null }) => void
+    apiMocks.autonudgeForSlot = vi.fn().mockReturnValue(new Promise(resolve => {
+      resolveLegacy = resolve
+    }))
+    apiMocks.monitorForSlot = vi.fn().mockReturnValue(new Promise(resolve => {
+      resolveMonitor = resolve
+    }))
+    const live = normalizeAutomationRecord(structuredMonitorLoop({ probe_count: 2 }))!
+
+    const { store } = renderChatPage([])
+    act(() => {
+      store.dispatch(sseConnected())
+      store.dispatch(sseAutomation(live))
+      store.dispatch(sseDisconnected())
+      resolveLegacy({ enabled: true, loop: null })
+      resolveMonitor({ enabled: true, monitor: null })
+    })
+
+    await waitFor(() => expect(chatInputProps?.automationCreationReady).toBe(true))
+    expect(store.getState().chat.automations['chat-1']).toEqual(live)
+    expect(chatInputProps?.automation).toEqual(live)
+  })
 })
 
 describe('ChatPage agent-switch failure feedback', () => {
@@ -429,6 +626,35 @@ describe('ChatPage default-agent footer row', () => {
     expect(defaultAgentRowProps!.agentName).toBe('kirocrew')
     act(() => { defaultAgentRowProps!.onSetDefault() })
     await waitFor(() => expect(setDefault).toHaveBeenCalledWith('kirocrew'))
+  })
+})
+
+describe('ChatPage model picker deep links', () => {
+  // Settings → Chat is a SubNav rail: a link that names no page opens the
+  // first one (Transcript), where neither model control lives and the
+  // highlight never resolves. Both affordances must name the Models page.
+  async function openModelPicker() {
+    await waitFor(() => expect(chatInputProps?.onModelClick).toBeTypeOf('function'))
+    act(() => { chatInputProps!.onModelClick!({ left: 40, top: 80 } as DOMRect) })
+    await waitFor(() => expect(modelDropdownProps).not.toBeNull())
+  }
+
+  it('"Set as default" lands on Settings → Chat → Models with the default-model highlight', async () => {
+    renderChatPage([])
+    await openModelPicker()
+    act(() => { modelDropdownProps!.onSetDefault() })
+    await waitFor(() => expect(screen.getByTestId('route-probe').textContent)
+      .toBe('/settings/chat/models?highlight=chat.default-model'))
+  })
+
+  it('"Manage models" lands on Settings → Chat → Models with the hidden-models highlight', async () => {
+    apiMocks.dashboardConfig = vi.fn().mockResolvedValue({ model_picker_configured: false })
+    renderChatPage([])
+    await openModelPicker()
+    await waitFor(() => expect(modelDropdownProps?.onManageModels).toBeTypeOf('function'))
+    act(() => { modelDropdownProps!.onManageModels!() })
+    await waitFor(() => expect(screen.getByTestId('route-probe').textContent)
+      .toBe('/settings/chat/models?highlight=key%3Adashboard.model_picker_hidden_models'))
   })
 })
 
@@ -770,7 +996,7 @@ describe('ChatPage pinned-messages panel', () => {
     expect(await screen.findByText(UNAVAILABLE)).toBeInTheDocument()
   })
 
-  it('surfaces an unpin failure and auto-dismisses the notice', async () => {
+  it('surfaces an unpin failure that stays until dismissed', async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true })
     pinsRemoveMock.mockRejectedValue(new Error('nope'))
     await openPins([msg('user', 'pinned', { ts: 'u1', meta: { mid: 'm-1' } })])
@@ -778,7 +1004,13 @@ describe('ChatPage pinned-messages panel', () => {
     act(() => pinsProps!.onUnpin('pin-1'))
     expect(await screen.findByText('Could not unpin the message. Try again.')).toBeInTheDocument()
 
+    // A failure is not a status line: the 8-second timer that clears "not in
+    // this history" must leave it alone.
     await act(async () => { vi.advanceTimersByTime(8100) })
+    const notice = screen.getByTestId('pin-error')
+    expect(notice).toHaveTextContent('Could not unpin the message. Try again.')
+
+    fireEvent.click(within(notice).getByRole('button', { name: 'Dismiss' }))
     await waitFor(() =>
       expect(screen.queryByText('Could not unpin the message. Try again.')).not.toBeInTheDocument(),
     )
@@ -900,6 +1132,53 @@ describe('ChatPage URL prompt hand-off', () => {
 
     await waitFor(() => expect(apiMocks.slackLink).toHaveBeenCalledWith('chat-9', 'C123', '1700.5'))
     expect(prefillWrites().at(-1)).toMatchObject({ slotKey: 'chat-9', prompt: 'look into this' })
+  })
+
+  it('keeps text typed during the token create in the old session instead of losing it to the prompt', async () => {
+    const token = tokenFor({ prompt: 'look into this', channel: 'C123', thread_ts: '1700.5' })
+    let resolveCreate: (v: { key: string; title: string }) => void = () => {}
+    apiMocks.createChatSlot = vi.fn().mockImplementation(() => new Promise(r => { resolveCreate = r }))
+    renderChatPage([], { url: `/chat?token=${token}` })
+
+    await waitFor(() => expect(apiMocks.createChatSlot).toHaveBeenCalled())
+    act(() => { chatInputProps?.onChange?.('typed during the link') })
+    await act(async () => { resolveCreate({ key: 'chat-9', title: 'chat-9' }) })
+
+    await waitFor(() => expect(apiMocks.slackLink).toHaveBeenCalledWith('chat-9', 'C123', '1700.5'))
+    await waitFor(() => expect(chatInputProps?.value).toBe('look into this'))
+    // The token flow writes its own prompt, so the typed text is not carried;
+    // it stays as the old session's draft instead of vanishing.
+    await waitFor(() => expect(loadDrafts()['chat-1']).toBe('typed during the link'))
+  })
+
+  it('a file staged in the same batch as the create resolving keeps its caption in the old session', async () => {
+    // Earlier tests leave a prefill hand-off (sessionStorage) and staged drafts
+    // (localStorage) behind; either would change what this activation carries.
+    sessionStorage.clear()
+    localStorage.clear()
+    apiMocks.createChatSlot = vi.fn().mockImplementation(() => new Promise(() => {}))
+    const { store } = renderChatPage([])
+    await waitFor(() => expect(chatInputProps).not.toBeNull())
+
+    act(() => { void store.dispatch(createSlot(undefined)) })
+    const requestId = store.getState().chat.foregroundCreateId
+    expect(requestId).toBeTruthy()
+    act(() => { chatInputProps?.onChange?.('caption for the file') })
+    // The file and the create's activation commit in ONE React batch, so the
+    // carry decision must read the render-current staged files, not a ref that
+    // an effect declared later has not synced yet.
+    act(() => { flushSync(() => {
+      chatInputProps?.onFileSelect?.('/work/notes.txt', 'file')
+      store.dispatch({
+        type: createSlot.fulfilled.type,
+        payload: { key: 'chat-77', title: 'chat-77' },
+        meta: { arg: undefined, requestId, requestStatus: 'fulfilled', originActiveSlot: 'chat-1', activate: true },
+      })
+    }) })
+
+    await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-77'))
+    expect(chatInputProps?.value).toBe('')
+    await waitFor(() => expect(loadDrafts()['chat-1']).toBe('caption for the file'))
   })
 
   it('ignores a token whose payload carries no prompt, but still strips it', async () => {

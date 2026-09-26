@@ -30,7 +30,10 @@ import { api, ApiError, type InstanceView } from '../api/client'
 import { useAppSelector } from '../store'
 import { type WarmConn } from '../store/instancesSlice'
 import { isEmbeddedPane } from '../lib/embedded'
+import { hasDashboardPane } from '../utils/remoteCrew'
 import { useSelectInstance } from '../hooks/useSelectInstance'
+import ErrorNotice from './ErrorNotice'
+import { errMessage } from '../utils/thunkError'
 import { safeSetItem } from '../utils/safeStorage'
 import {
   DropdownMenu,
@@ -46,9 +49,11 @@ import { i18nT } from '../i18n/t'
 import { fmtDuration as fmtDurationParts, fmtUnit, fmtNumber } from '../i18n/format'
 /**
  * Crews that get a switcher entry: sticky connect intent (`was_connected`,
- * cleared only on an explicit disconnect) OR currently connected OR warm.
+ * cleared only on an explicit disconnect) OR currently connected OR warm --
+ * and only crews with a dashboard to switch to (`hasDashboardPane`): a
+ * fargate crew's card carries its turn URL instead of a pane.
  * Exported as the single source of truth so App.tsx can decide whether the bar
- * is visible WITHOUT duplicating the rule — the bar's visibility drives the
+ * is visible WITHOUT duplicating the rule -- the bar's visibility drives the
  * macOS traffic-light clearance (when shown, the bar is the topmost strip the
  * native lights sit over, so the clearance moves off the header onto the bar).
  */
@@ -57,7 +62,7 @@ export function visibleInstanceTabs(
   warm: Record<string, WarmConn>,
 ): InstanceView[] {
   return instances.filter(
-    i => i.was_connected || i.status?.state === 'connected' || !!warm[i.id],
+    i => hasDashboardPane(i) && (i.was_connected || i.status?.state === 'connected' || !!warm[i.id]),
   )
 }
 
@@ -1117,8 +1122,13 @@ export default function InstanceTabBar({
   if (embedded) return <EmbeddedInstanceTabBar variant={variant} />
 
   // Single-crew experience is unchanged: no bar until a remote crew is
-  // connected or remembered.
-  if (disabled || tabInstances.length === 0) return null
+  // connected or remembered — unless the list itself could not be read, in
+  // which case the bar exists to say so (an empty bar and a failed read used to
+  // look identical).
+  const listFailure = !disabled && instancesQuery.error
+    ? (errMessage(instancesQuery.error) || i18nT('components.instanceTabBar.instances_load_failed'))
+    : null
+  if (disabled || (tabInstances.length === 0 && !listFailure)) return null
 
   // Right-aligned tunnel-status cluster: the ACTIVE remote pane's connection
   // state + countdown to the next token auto-refresh. On the Local tab there is
@@ -1166,10 +1176,30 @@ export default function InstanceTabBar({
     >
       <div className={`flex items-center gap-1 min-w-0 ${variant === 'strip' ? 'flex-1' : ''}`}>
         <Switcher entries={entries} activeId={activeId} onSelect={onSelect} />
+        {/* Only a 403 (feature gated) used to be interpreted; every other
+            listInstances failure was dropped and the bar simply showed no
+            crews. askAgent on: the bar holds no draft. */}
+        {/* Clamped on the message, not `truncate` on the root: the notice root is
+            a flex container, where text-overflow is inert and nowrap only blocks the break. */}
+        {listFailure && (
+          <ErrorNotice
+            variant="inline"
+            className="ml-2 min-w-0 max-w-[320px]"
+            messageClassName="line-clamp-1"
+            message={listFailure}
+            askAgent
+            testId="instance-tab-bar-list-error"
+          />
+        )}
       </div>
       {variant === 'strip' && activeInst && (
-        <div className="flex items-center gap-1.5 shrink-0 pl-2 pr-1" title={tunnelTitle}>
+        <div className="flex items-center gap-1.5 shrink-0 pl-2 pr-1 min-w-0" title={tunnelTitle}>
           <span className={`w-2 h-2 rounded-full ${tunnelDotCls}`} aria-hidden />
+          {/* Status indicator only, by design: the backend's tunnel error text
+              is rendered as the ErrorNotice in InstancesViewport's error panel,
+              which this strip sits on top of whenever the active tunnel is down.
+              Repeating it here would show the same failure twice on one screen;
+              the tooltip keeps it reachable when the panel is not up. */}
           <span className="text-[11px] text-[var(--muted)] hidden sm:inline">{tunnelLabel}</span>
         </div>
       )}

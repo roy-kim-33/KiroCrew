@@ -29,6 +29,7 @@ vi.mock('../api/client', () => ({
     artifacts: vi.fn().mockResolvedValue({ artifacts: [] }),
     createArtifact: vi.fn().mockResolvedValue({ slug: 'new-slug', version: 1 }),
     setArtifactPinned: vi.fn().mockResolvedValue({}),
+    workflowRuns: vi.fn().mockResolvedValue({ runs: [] }),
   },
 }))
 
@@ -54,6 +55,7 @@ import { openActivityToTab, selectSubagent } from '../store/chatSlice'
 import { __resetPanelTabs } from '../hooks/usePanelTabs'
 import type { SubagentActivity, ToolActivity, Artifact } from '../types'
 import type { ExtractedLink } from '../utils/extractChatLinks'
+import { i18nT } from '../i18n/t'
 
 const SLOT = 'test-slot'
 
@@ -123,9 +125,12 @@ function storeTracking(agent: SubagentActivity) {
   })
 }
 
-/** A fetch stub that answers the two endpoints this component reaches for. */
+/** A fetch stub that answers the two endpoints this component reaches for.
+ *  The workflow-runs list goes through the api client now (so a non-OK
+ *  response rejects), so the stub feeds `api.workflowRuns` the same `runs`. */
 function stubFetch(opts: { runs?: unknown[]; fileText?: string; fileOk?: boolean } = {}) {
   const { runs = [], fileText = 'file body', fileOk = true } = opts
+  vi.mocked(api.workflowRuns).mockResolvedValue({ runs } as Awaited<ReturnType<typeof api.workflowRuns>>)
   const impl = vi.fn().mockImplementation((input: RequestInfo | URL) => {
     const url = String(input)
     if (url.includes('/api/workflows/runs')) {
@@ -206,7 +211,10 @@ describe('ActivityViewer — subagent transcript loading', () => {
     fireEvent.click(cardHeader(container))
     fireEvent.click(screen.getByRole('button', { name: 'Load output from disk' }))
 
-    const retry = await screen.findByRole('button', { name: 'Failed — click to retry' })
+    // The failure is a notice with the agent hand-off; the retry is its own
+    // button beside it, no longer folded into the error text.
+    expect(await screen.findByRole('alert')).toHaveTextContent("Couldn't load the output")
+    const retry = screen.getByRole('button', { name: 'Retry' })
     vi.mocked(api.spawnStatus).mockResolvedValue({ result: 'second time lucky' })
     fireEvent.click(retry)
 
@@ -297,6 +305,51 @@ describe('ActivityViewer — subagent card controls', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Approve' }))
 
     await waitFor(() => expect(store.getState().chat.subagents.p1?.approving).toBe(false))
+  })
+
+  it('withdraws the buttons and names a terminal refusal (#11180)', async () => {
+    // Duck-typed 404 (api/apiError.ts): the mocked client is not ApiError.
+    vi.mocked(api.resolveApproval).mockRejectedValue(Object.assign(new Error('not found or expired'), { status: 404 }))
+    const pending = mkAgent('p1', { status: 'pending', approval_id: 'ap-1' })
+    renderPanel(
+      <ActivityViewer {...baseProps} view="subagents" subagents={{ p1: pending }} />,
+      storeTracking(pending),
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Approve' }))
+
+    await waitFor(() => {
+      expect(screen.queryByRole('button', { name: 'Approve' })).not.toBeInTheDocument()
+    })
+    expect(screen.queryByRole('button', { name: 'Reject' })).not.toBeInTheDocument()
+    expect(screen.getByRole('alert')).toHaveTextContent(
+      i18nT('components.approvalCard.approval_no_longer_pending'),
+    )
+  })
+
+  it('re-offers the buttons when the pane gets a NEW approval id (#11180)', async () => {
+    // Duck-typed 404 (api/apiError.ts): the mocked client is not ApiError.
+    vi.mocked(api.resolveApproval).mockRejectedValue(Object.assign(new Error('not found or expired'), { status: 404 }))
+    const pending = mkAgent('p1', { status: 'pending', approval_id: 'ap-1' })
+    const { rerender } = renderPanel(
+      <ActivityViewer {...baseProps} view="subagents" subagents={{ p1: pending }} />,
+      storeTracking(pending),
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Approve' }))
+    await waitFor(() => {
+      expect(screen.queryByRole('button', { name: 'Approve' })).not.toBeInTheDocument()
+    })
+
+    // Same sub-agent id, so the pane stays mounted and keeps its state; the
+    // backend has issued it a fresh approval, which IS decidable.
+    rerender(
+      <ActivityViewer
+        {...baseProps}
+        view="subagents"
+        subagents={{ p1: { ...pending, approval_id: 'ap-2' } }}
+      />,
+    )
+    expect(screen.getByRole('button', { name: 'Approve' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Reject' })).toBeInTheDocument()
   })
 
   it('does nothing for a pending agent with no approval id', () => {
@@ -474,6 +527,21 @@ describe('ActivityViewer — spawn approval entries', () => {
 
     await waitFor(() => expect(screen.getByText('Approval Needed')).toBeInTheDocument())
     expect(screen.getByRole('button', { name: /Reject/ })).toBeInTheDocument()
+  })
+
+  it('withdraws the buttons and names a terminal refusal (#11180)', async () => {
+    // Duck-typed 404 (api/apiError.ts): the mocked client is not ApiError.
+    vi.mocked(api.resolveApproval).mockRejectedValue(Object.assign(new Error('not found or expired'), { status: 404 }))
+    renderPanel(<ActivityViewer {...baseProps} view="subagents" toolLog={[pending]} />)
+    fireEvent.click(screen.getByRole('button', { name: /Approve/ }))
+
+    await waitFor(() => {
+      expect(screen.queryByRole('button', { name: /Approve/ })).not.toBeInTheDocument()
+    })
+    expect(screen.queryByRole('button', { name: /Reject/ })).not.toBeInTheDocument()
+    expect(screen.getByRole('alert')).toHaveTextContent(
+      i18nT('components.approvalCard.approval_no_longer_pending'),
+    )
   })
 
   it('offers only Approve / Reject and never reports a trust grant (#5400)', async () => {
