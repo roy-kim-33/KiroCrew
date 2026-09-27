@@ -17,29 +17,41 @@ import type { CSSProperties, ReactElement, ReactNode } from 'react'
 
 export type StatusEntry = { path: string; status: string }
 
+/** The subset of `FileTreeVisibleRow` the wrapper's expansion snapshot reads. */
+export type VisibleRow = { kind: 'directory' | 'file'; path: string; isExpanded: boolean }
+
+/** The subset of `FileTreeResetBehaviorOptions` the wrapper passes. */
+export type ResetOptions = { initialExpandedPaths?: readonly string[] }
+
 type Handle = {
   getPath: () => string
   isDirectory: () => boolean
   select: () => void
   deselect: () => void
   expand?: () => void
+  isExpanded?: () => boolean
 }
 
 export function createFakeModel(options: Record<string, unknown>) {
   const files: string[] = []
   const dirs = new Set<string>()
   const selected = new Set<string>()
+  const expanded = new Set<string>()
   const listeners = new Set<() => void>()
   let focused: string | null = null
+  let visibleRows: VisibleRow[] = []
 
   const calls = {
     resetPaths: [] as string[][],
+    /** Options argument of each `resetPaths` call, index-aligned with `resetPaths`. */
+    resetPathsOptions: [] as Array<ResetOptions | undefined>,
     gitStatus: [] as StatusEntry[][],
     search: [] as Array<string | null>,
     focusPath: [] as string[],
     select: [] as string[],
     deselect: [] as string[],
     expand: [] as string[],
+    compositionRenders: 0,
     unsubscribes: 0,
   }
 
@@ -59,23 +71,30 @@ export function createFakeModel(options: Record<string, unknown>) {
         selected.delete(path)
       },
     }
-    // Only directory handles carry `expand`; the wrapper feature-detects it.
-    return isDir ? { ...base, expand: () => calls.expand.push(path) } : base
+    // Only directory handles carry `expand`/`isExpanded`; the wrapper feature-detects them.
+    return isDir ? { ...base, expand: () => calls.expand.push(path), isExpanded: () => expanded.has(path) } : base
   }
 
   return {
     /** Options `useFileTree` was created with — the wrapper's prop mapping. */
     options,
     calls,
-    resetPaths(next: readonly string[]) {
+    resetPaths(next: readonly string[], options?: ResetOptions) {
       calls.resetPaths.push([...next])
-      files.splice(0, files.length, ...next)
+      calls.resetPathsOptions.push(options)
+      files.splice(0, files.length, ...next.filter(path => !path.endsWith('/')))
       dirs.clear()
       for (const p of next) {
-        const segments = p.split('/')
+        const explicitDirectory = p.endsWith('/')
+        const normalized = explicitDirectory ? p.slice(0, -1) : p
+        if (!normalized) continue
+        if (explicitDirectory) dirs.add(normalized)
+        const segments = normalized.split('/')
         for (let i = 1; i < segments.length; i++) dirs.add(segments.slice(0, i).join('/'))
       }
     },
+    getComposition: () => options.composition,
+    setComposition() { calls.compositionRenders++ },
     setGitStatus(entries: readonly StatusEntry[] = []) {
       calls.gitStatus.push([...entries])
     },
@@ -87,6 +106,8 @@ export function createFakeModel(options: Record<string, unknown>) {
       focused = path
     },
     getFocusedItem: () => (focused && known(focused) ? handle(focused) : null),
+    getVisibleCount: () => visibleRows.length,
+    getVisibleRows: (start: number, end: number) => visibleRows.slice(start, end),
     getSelectedPaths: () => [...selected],
     getItem: (path: string) => (known(path) ? handle(path) : null),
     subscribe(listener: () => void) {
@@ -96,12 +117,23 @@ export function createFakeModel(options: Record<string, unknown>) {
         calls.unsubscribes++
       }
     },
+    /** Drive the model as the tree would after the user expands/collapses
+     *  directories: install the visible row window and notify subscribers. */
+    simulateVisibleRows(rows: VisibleRow[]) {
+      visibleRows = rows
+      for (const listener of listeners) listener()
+    },
     /** Drive the model as the tree would after a user selects rows. */
     simulateSelection(focusedPath: string | null, selection: string[] = focusedPath ? [focusedPath] : []) {
       focused = focusedPath
       selected.clear()
       for (const p of selection) selected.add(p)
       for (const listener of listeners) listener()
+    },
+    /** Install the directories whose handles answer `isExpanded()` with true. */
+    simulateExpanded(paths: readonly string[]) {
+      expanded.clear()
+      for (const p of paths) expanded.add(p)
     },
     subscriberCount: () => listeners.size,
   }

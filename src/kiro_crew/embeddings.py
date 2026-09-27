@@ -29,8 +29,10 @@ from __future__ import annotations
 import abc
 import asyncio
 import ctypes
+import ctypes.util
 import functools
 import hashlib
+import heapq
 import importlib.util
 import json
 import logging
@@ -39,34 +41,87 @@ import os
 import platform
 import queue
 import shutil
-import ssl
+import struct
 import sys
 import threading
 import time
 import types
-import urllib.error
 import urllib.parse
-import urllib.request
+from collections import OrderedDict
+from contextlib import AbstractContextManager
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, NamedTuple, Protocol
+from typing import Any, BinaryIO, Callable, NamedTuple, Protocol
 
-from kiro_crew._ssl_compat import _ssl_context_has_ca_trust
+from kiro_crew import asset_downloader
 from kiro_crew.config.loader import config_path
 from kiro_crew.config.paths import config_dir
+from kiro_crew.cpu_affinity import affinity_cpu_count
 from kiro_crew.metrics.provider import get_recorder
 from kiro_crew.security import is_sensitive_path
 
 logger = logging.getLogger(__name__)
 
 
+@dataclass
+class EmbeddingWork:
+    """A caller's monotonic deadline and cancellation, carried into native jobs.
+
+    Queued inference is cancellable. A running native call retains its executor
+    worker and admission until completion because native inference cannot stop.
+    """
+
+    deadline: float
+    cancelled: threading.Event = field(default_factory=threading.Event)
+    priority: int = 2
+
+    def expired(self) -> bool:
+        return self.cancelled.is_set() or time.monotonic() >= self.deadline
+
+
+embedding_work: ContextVar[EmbeddingWork | None] = ContextVar("embedding_work", default=None)
+_EMBED_WAIT_SECS = 30.0
+
+
 class _ReconcilableStore(Protocol):
-    """Structural type for a vector store, so this module needs no import of it."""
+    """Structural type for a vector store, so this module needs no import of it.
+
+    The read-only probe and the non-clearing reconcile need only these two.
+    """
 
     def recorded_embedding_space(self) -> "str | None": ...
 
     def reconcile_embedding_space(
-        self, signature: str, *, clear_when_unknown: bool = False
+        self,
+        signature: str,
+        *,
+        clear_when_unknown: bool = False,
+        force: bool = False,
+        rebuild_generation: str = "",
     ) -> int: ...
+
+    def recorded_rebuild_generation(self) -> str: ...
+
+
+class _AlignableStore(_ReconcilableStore, Protocol):
+    """A store whose width, signature and space generation alignment may rewrite.
+
+    Every member is required: alignment runs under the store's own lock so it
+    cannot race concurrent writers, and a store that lacks one of these fails
+    at the attribute access rather than aligning unlocked.
+    """
+
+    _embedding_dim: int
+
+    @property
+    def _db_lock(self) -> AbstractContextManager[Any]: ...
+
+    def set_embedding_dim(self, dim: int) -> bool: ...
+
+    def begin_space_change(self) -> None: ...
+
+    def _write_meta(self, key: str, value: str) -> None: ...
 
 
 # ── Model constants ──
@@ -90,8 +145,50 @@ _REJECTED_MODEL_SENTINEL = ".rejected-custom-model.invalid"
 
 # ── Runtime constants ──
 
-# Qwen3-Embedding requires last-token pooling (LLAMA_POOLING_TYPE_LAST).
+# Qwen3-Embedding requires last-token pooling (LLAMA_POOLING_TYPE_LAST). Every
+# model, custom encoders included, is loaded with this value passed explicitly,
+# so the runtime never reads a GGUF's own pooling_type key; honouring a declared
+# key is tracked separately. On BERT-family files measured last-token vectors
+# rank paraphrases above unrelated pairs as well as mean-pooled ones do (see the
+# embedding section of docs/system-specs/modules/memory-skills-hooks.md).
 _POOLING_TYPE_LAST = 3
+# Architectures the vendored llama.cpp runs WITHOUT a KV cache (the `res =
+# nullptr` cases of llama_model::create_memory in src/llama-model.cpp, plus the
+# t5encoder encoder-only path). llama_decode() routes them through encode(),
+# which aborts unless one physical micro-batch holds every input token, whatever
+# the GGUF says about causality. Keep this list a verbatim mirror of that switch
+# whenever the vendored runtime is bumped: test/test_encoder_architecture_mirror.py
+# requires every name here to be spelled by every vendored libllama binary, so a
+# removed or renamed architecture fails the test unless its name is the suffix
+# of another listed name (`bert` inside `modern-bert`: GNU ld tail-merges the
+# strings, so only the terminating NUL can be required and the longer name still
+# satisfies the check), while an ADDED cache-less architecture is invisible to it
+# and must be re-mirrored by hand (see the bump procedure in _vendor/README.md).
+# Membership decides only the micro-batch shape (see _model_context_policy);
+# pooling is _POOLING_TYPE_LAST for every file.
+# Non-causal models that DO keep a KV cache (llama-embed, or any decoder family
+# re-tagged bidirectional) are not named here: they declare
+# `<architecture>.attention.causal = false` and _model_context_policy() reads
+# that key directly.
+_ENCODER_ARCHITECTURES = frozenset(
+    {
+        "bert",
+        "dream",
+        "eurobert",
+        "gemma-embedding",
+        "jina-bert-v2",
+        "jina-bert-v3",
+        "llada",
+        "llada-moe",
+        "modern-bert",
+        "neo-bert",
+        "nomic-bert",
+        "nomic-bert-moe",
+        "rnd1",
+        "t5encoder",
+        "wavtokenizer-dec",
+    }
+)
 # Context window for the embedding pass. Episodic memories are capped at
 # 2000 chars and knowledge chunks are bounded by the chunker (~512 tokens +
 # overlap, ≈5.8k chars max), so 2048 tokens covers both. Kept deliberately
@@ -100,7 +197,9 @@ _POOLING_TYPE_LAST = 3
 # kirocrew-core MCP server — the GGUF weights themselves are mmap'd and
 # physically shared, the KV buffers are not). The logical batch still covers
 # the complete input for last-token pooling; llama.cpp may split that work into
-# smaller physical micro-batches without changing the resulting vector.
+# smaller physical micro-batches without changing the resulting vector. This is
+# the ceiling: a model trained for fewer positions is sized to its own count
+# instead (see _model_context_policy).
 _N_CTX = 2048
 # Physical decode micro-batch. Keeping this below the logical batch bounds the
 # compute scratch arena without reducing the accepted context. Qwen3's
@@ -110,8 +209,10 @@ _N_UBATCH = 512
 # Safety truncation (chars) before inference, sized under _N_CTX at a
 # conservative ~4 chars/token so a clipped input always fits the context
 # window. Only pathological un-chunked blobs exceed this; mirrors the
-# knowledge embedder's content-budget backstop. Inputs that still exceed
-# n_ctx after clipping (dense CJK/code) fail the embed call and return None.
+# knowledge embedder's content-budget backstop. An input that still exceeds
+# the logical batch after clipping (dense CJK/code, or a model sized below
+# _N_CTX) is cut to its first n_batch tokens by the vendored binding's
+# create_embedding() -> embed(truncate=True) path.
 _MAX_EMBED_CHARS = 6_000
 _LLM_LOAD_RETRY_SECS = 300.0  # re-attempt a failed model load after this long
 # How long close() waits for the inference thread to finish its current job and
@@ -124,9 +225,13 @@ _INFER_STOP_TIMEOUT_SECS = 30.0
 # 16-core host EVERY embed, even an 8-character one, fanned out across all 16
 # cores and measured ~4.5 cores sustained inside the gateway. A 0.6B model over
 # short text does not need that, and oversubscribing the box makes the pool both
-# suffer and cause contention. Pinned low here, overridable via
-# memory.embedding_threads.
+# suffer and cause contention. Pinned to the established four-thread default
+# here, overridable via memory.embedding_threads.
 _DEFAULT_EMBED_THREADS = 4
+# One shared model and worker serve every store within this queue budget.
+_MAX_PENDING_EMBEDS = 8
+_INTERACTIVE_QUEUE_RESERVE = 2
+_MAX_EMBED_BATCH_TEXTS = 8
 # Bulk corpus loops (the post-migration re-embed sweep above all) run for as long
 # as the corpus takes: measured 429 ms/row at 4 threads on ~500-character rows,
 # so a 3,000-row migrated memory is ~21 minutes at a SUSTAINED 3.7 cores. That is
@@ -182,6 +287,14 @@ PRIORITY_BULK = 2  # corpus loops: backfill, migration, ingestion, consolidation
 # Shutdown outranks everything so close() is not stuck behind a queued sweep.
 _PRIORITY_SENTINEL = -1
 
+
+def _work_for_priority(priority: int) -> EmbeddingWork:
+    """Only explicit deadlines expire bulk work waiting on the shared duty cycle."""
+    return embedding_work.get() or EmbeddingWork(
+        math.inf if priority >= PRIORITY_BULK else time.monotonic() + _EMBED_WAIT_SECS
+    )
+
+
 # ── Download constants ──
 
 _DOWNLOAD_MAX_ATTEMPTS = 6  # background startup task (long backoff, may span hours)
@@ -215,8 +328,9 @@ _MODEL_PATH_ENV = "KIROCREW_EMBED_MODEL_PATH"
 _DEFAULT_MODEL_URL = "https://d3j0sthz5doyui.cloudfront.net/models/qwen3-embedding-0.6b.gguf"
 _HTTP_TIMEOUT_SECS = 1800  # 610MB at >=340KB/s; slower links retry with backoff
 _HTTP_CHUNK_BYTES = 1 << 20
-# Written by the HTTP downloader every ~16MB so the status endpoint can report
-# byte-level progress; the dashboard renders a determinate progress bar from it.
+# Reported by the shared transfer engine every ~16MB so the status endpoint can
+# report byte-level progress; the dashboard renders a determinate progress bar
+# from it.
 _PROGRESS_EVERY_BYTES = 16 << 20
 
 # ── Vendored runtime loading ──
@@ -384,6 +498,64 @@ def _linux_x86_64_cpu_flags(
     return frozenset.intersection(*per_cpu)
 
 
+def _macos_x86_64_missing_cpu_flags() -> list[str] | None:
+    """Return CPU features required by the bundled macOS x86_64 llama.cpp runtime
+    that are absent on this host, or None if the feature list cannot be read.
+
+    Uses ``sysctlbyname`` to query ``machdep.cpu.features`` and
+    ``machdep.cpu.leaf7_features`` (the latter carries AVX2, BMI1/2, FMA).
+    Falls back to ``None`` (fail-closed) if the sysctl call fails.
+    """
+
+    libc_name = ctypes.util.find_library("c")
+    if libc_name is None:
+        return None
+    try:
+        libc = ctypes.CDLL(libc_name)
+    except OSError:
+        return None
+
+    def _sysctl_str(name: str) -> str:
+        # Two-call pattern: first call with NULL buffer to get required size.
+        # Avoids a fixed-size buffer that could truncate long feature strings.
+        size = ctypes.c_size_t(0)
+        libc.sysctlbyname(name.encode(), None, ctypes.byref(size), None, 0)
+        if size.value == 0:
+            return ""
+        buf = ctypes.create_string_buffer(size.value)
+        ret = libc.sysctlbyname(name.encode(), buf, ctypes.byref(size), None, 0)
+        if ret != 0:
+            return ""
+        return buf.value.decode("ascii", errors="replace").lower()
+
+    features = _sysctl_str("machdep.cpu.features")
+    leaf7 = _sysctl_str("machdep.cpu.leaf7_features")
+    if not features and not leaf7:
+        return None
+
+    # Normalise: macOS reports "AVX1.0" for AVX, "AVX2.0" for AVX2
+    combined = (features + " " + leaf7).lower()
+    combined = combined.replace("avx1.0", "avx").replace("avx2.0", "avx2")
+    present = set(combined.split())
+
+    # Map Linux flag names to what macOS sysctl reports
+    _MACOS_FLAG_MAP = {
+        "avx": "avx",
+        "avx2": "avx2",
+        "fma": "fma",
+        "bmi2": "bmi2",
+        "f16c": "f16c",
+        "sse3": "sse3",
+        "ssse3": "ssse3",
+    }
+    missing = sorted(
+        linux_name
+        for linux_name, macos_name in _MACOS_FLAG_MAP.items()
+        if macos_name not in present and linux_name in _LINUX_X86_64_REQUIRED_CPU_FLAGS
+    )
+    return missing if missing else []
+
+
 def verify_vendored_libs(root: Path | None = None) -> dict[str, list[str]]:
     """Report vendored native libs that :data:`_REQUIRED_VENDORED_LIBS` expects but are absent.
 
@@ -548,6 +720,30 @@ def _load_llama_class():
                     _LIB_PATH_ENV,
                 )
                 return None
+        if libs_dirname == "macos_x86_64":
+            _macos_flags = _macos_x86_64_missing_cpu_flags()
+            if _macos_flags is None:
+                logger.warning(
+                    "Cannot verify CPU compatibility for the bundled macOS x86_64 "
+                    "llama.cpp runtime. Refusing the native runtime because an "
+                    "unsupported instruction would terminate the gateway with SIGILL; "
+                    "memory falls back to keyword search. Set %s to use an "
+                    "operator-provided runtime.",
+                    _LIB_PATH_ENV,
+                )
+                return None
+            if _macos_flags is not None and _macos_flags:
+                logger.warning(
+                    "Bundled macOS x86_64 llama.cpp runtime requires CPU features "
+                    "%s; this host is missing %s. Refusing the native runtime because "
+                    "it would terminate the gateway with SIGILL; memory falls back to "
+                    "keyword search. Set %s to use a compatible operator-provided "
+                    "runtime.",
+                    ", ".join(sorted(_LINUX_X86_64_REQUIRED_CPU_FLAGS)),
+                    ", ".join(_macos_flags),
+                    _LIB_PATH_ENV,
+                )
+                return None
     # setdefault so an operator-provided override (e.g. a GPU build) wins.
     os.environ.setdefault(_LIB_PATH_ENV, str(libs_dir))
     _install_diskcache_stub()
@@ -562,6 +758,218 @@ def _load_llama_class():
     except Exception:
         logger.warning("Vendored llama-cpp-python failed to import", exc_info=True)
         return None
+
+
+# ── GGUF embedding metadata ──
+
+_GGUF_SCALAR_BYTES = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}
+_GGUF_TYPE_UINT32 = 4
+_GGUF_TYPE_INT32 = 5
+_GGUF_TYPE_BOOL = 7
+_GGUF_TYPE_STRING = 8
+_GGUF_TYPE_ARRAY = 9
+_GGUF_MAX_METADATA_ITEMS = 100_000
+_GGUF_MAX_ARRAY_ITEMS = 2_000_000
+_GGUF_MAX_DECODED_STRING_BYTES = 1_000_000
+_GGUF_CAUSAL_SUFFIX = ".attention.causal"
+# `<architecture>.context_length`: the position count the model was trained
+# with, which llama.cpp reads into ``hparams.n_ctx_train``. For an encoder with
+# learned absolute positions it is also the row count of the position table.
+_GGUF_CONTEXT_LENGTH_SUFFIX = ".context_length"
+
+
+class _GGUFEmbeddingMetadata(NamedTuple):
+    """The KV-header fields that decide a model's llama.cpp context parameters."""
+
+    architecture: str | None
+    causal: bool | None
+    context_length: int | None
+
+
+def _read_gguf_embedding_metadata(path: Path) -> _GGUFEmbeddingMetadata:
+    """Read the architecture and its optional causal and context-length keys.
+
+    All three come from the GGUF KV header. The causal flag is the
+    ``<architecture>.attention.causal`` boolean that llama.cpp reads for every
+    architecture into ``hparams.causal_attn`` (default true when absent); the
+    context length is the ``<architecture>.context_length`` integer it reads
+    into ``hparams.n_ctx_train``. The file's ``pooling_type`` key is not read:
+    every model is loaded with ``_POOLING_TYPE_LAST`` passed explicitly.
+
+    The header is walked with plain bounded reads, never a mapping: a mapping's
+    length is fixed when it is built, so a GGUF truncated in place while its
+    header is parsed turns the next access past the new end into a SIGBUS the
+    gateway process cannot catch. A read that comes up short is a ValueError
+    instead, which _model_context_policy turns into the decoder sizes.
+    """
+    with path.open("rb") as source:
+        return _parse_gguf_embedding_metadata(source, os.fstat(source.fileno()).st_size)
+
+
+def _parse_gguf_embedding_metadata(source: BinaryIO, file_size: int) -> _GGUFEmbeddingMetadata:
+    """Parse the KV header from ``source``, a binary stream positioned at its start.
+
+    ``file_size`` is the byte count the file had when it was opened; it bounds
+    every field the header declares. The parser reads only what it inspects --
+    fixed-width fields, keys and captured strings, each at most
+    _GGUF_MAX_DECODED_STRING_BYTES -- with one ``read()`` per field, and seeks
+    past every value it does not need, so no byte beyond the caps is read. A
+    field reaching past ``file_size``, or a read returning fewer bytes than
+    asked (the file shrank under the parse), is ``truncated GGUF header``.
+    """
+    offset = 0
+
+    def _claim(size: int) -> None:
+        nonlocal offset
+        if size > file_size - offset:
+            raise ValueError("truncated GGUF header")
+        offset += size
+
+    def _read_exact(size: int) -> bytes:
+        _claim(size)
+        chunk = source.read(size)
+        if len(chunk) != size:
+            raise ValueError("truncated GGUF header")
+        return chunk
+
+    def _skip(size: int) -> None:
+        _claim(size)
+        source.seek(size, os.SEEK_CUR)
+
+    def _unpack(fmt: str) -> int:
+        return int(struct.unpack(fmt, _read_exact(struct.calcsize(fmt)))[0])
+
+    def _read_string() -> str:
+        length = _unpack("<Q")
+        if length > _GGUF_MAX_DECODED_STRING_BYTES:
+            raise ValueError("oversized GGUF metadata string")
+        return _read_exact(length).decode("utf-8")
+
+    def _skip_string() -> None:
+        _skip(_unpack("<Q"))
+
+    def _read_value(value_type: int, *, capture: bool) -> object | None:
+        if value_type == _GGUF_TYPE_STRING:
+            if capture:
+                return _read_string()
+            _skip_string()
+            return None
+        if value_type == _GGUF_TYPE_ARRAY:
+            element_type = _unpack("<I")
+            count = _unpack("<Q")
+            if count > _GGUF_MAX_ARRAY_ITEMS:
+                raise ValueError("oversized GGUF metadata array")
+            if element_type == _GGUF_TYPE_STRING:
+                for _ in range(count):
+                    _skip_string()
+                return None
+            element_size = _GGUF_SCALAR_BYTES.get(element_type)
+            if element_size is None:
+                raise ValueError(f"unsupported GGUF array type {element_type}")
+            _skip(element_size * count)
+            return None
+        value_size = _GGUF_SCALAR_BYTES.get(value_type)
+        if value_size is None:
+            raise ValueError(f"unsupported GGUF metadata type {value_type}")
+        if capture and value_type == _GGUF_TYPE_UINT32:
+            return _unpack("<I")
+        if capture and value_type == _GGUF_TYPE_INT32:
+            return _unpack("<i")
+        if capture and value_type == _GGUF_TYPE_BOOL:
+            return _unpack("<B") != 0
+        _skip(value_size)
+        return None
+
+    if _read_exact(4) != b"GGUF":
+        raise ValueError("invalid GGUF magic")
+    version = _unpack("<I")
+    if version not in {2, 3}:
+        raise ValueError(f"unsupported GGUF version {version}")
+    _unpack("<Q")  # tensor count; only the following KV section is needed
+    metadata_count = _unpack("<Q")
+    if metadata_count > _GGUF_MAX_METADATA_ITEMS:
+        raise ValueError("oversized GGUF metadata table")
+
+    architecture: str | None = None
+    causal_by_architecture: dict[str, bool] = {}
+    context_length_by_architecture: dict[str, int] = {}
+    for _ in range(metadata_count):
+        key = _read_string()
+        capture = (
+            key == "general.architecture"
+            or key.endswith(_GGUF_CAUSAL_SUFFIX)
+            or key.endswith(_GGUF_CONTEXT_LENGTH_SUFFIX)
+        )
+        value = _read_value(_unpack("<I"), capture=capture)
+        if key == "general.architecture" and isinstance(value, str):
+            architecture = value.strip().lower()
+        elif key.endswith(_GGUF_CAUSAL_SUFFIX) and isinstance(value, bool):
+            causal_by_architecture[key[: -len(_GGUF_CAUSAL_SUFFIX)].lower()] = value
+        elif (
+            key.endswith(_GGUF_CONTEXT_LENGTH_SUFFIX)
+            and isinstance(value, int)
+            and not isinstance(value, bool)
+            and value > 0
+        ):
+            context_length_by_architecture[key[: -len(_GGUF_CONTEXT_LENGTH_SUFFIX)].lower()] = value
+    return _GGUFEmbeddingMetadata(
+        architecture,
+        causal_by_architecture.get(architecture or ""),
+        context_length_by_architecture.get(architecture or ""),
+    )
+
+
+class _ContextPolicy(NamedTuple):
+    """The llama.cpp context sizes chosen for one GGUF before it loads."""
+
+    n_ctx: int
+    n_batch: int
+    n_ubatch: int
+
+
+# What a decoder (causal) file trained for at least _N_CTX positions gets, the
+# bundled Qwen model included, and the fallback when a header cannot be read.
+# Kept as one constant so that path stays byte-for-byte the shipped one.
+_DECODER_CONTEXT_POLICY = _ContextPolicy(_N_CTX, _N_CTX, _N_UBATCH)
+
+
+def _model_context_policy(path: Path) -> _ContextPolicy:
+    """Choose context sizes before llama.cpp constructs the native context."""
+    try:
+        metadata = _read_gguf_embedding_metadata(path)
+    except (OSError, OverflowError, UnicodeError, ValueError, struct.error):
+        logger.warning(
+            "Could not read GGUF metadata for %s; using the default context sizes.",
+            path.name,
+        )
+        return _DECODER_CONTEXT_POLICY
+
+    # Every file's context and logical batch are clamped to the trained
+    # position count its GGUF declares. A model with learned absolute positions
+    # indexes a position table with n_ctx_train rows -- encoder families, but
+    # causal gpt2 and starcoder as well -- and llama.cpp aborts the process
+    # (`GGML_ASSERT(i01 >= 0 && i01 < ne01)` in ggml's get_rows) when a token
+    # sits past its end, whatever the model's causality. With n_batch equal to
+    # that count, the vendored binding's create_embedding() -> embed(truncate=True)
+    # keeps the first n_batch tokens of a longer input instead (pinned by
+    # test_vendored_embed_truncates_to_the_logical_batch_by_default); _load_model
+    # states that rule once per model. A file trained for _N_CTX positions or
+    # more (the bundled Qwen model declares 32,768) keeps the ceiling.
+    window = _N_CTX
+    if metadata.context_length is not None:
+        window = min(_N_CTX, metadata.context_length)
+
+    # Two llama.cpp paths abort unless one physical micro-batch holds every
+    # token: encode(), which every cache-less architecture is routed through,
+    # and decode() for a model whose GGUF declares `.attention.causal = false`.
+    # Absent that key the runtime defaults to causal attention, so a model
+    # outside the cache-less set (llama-embed included) stays on the decoder path.
+    non_causal = metadata.causal is False or metadata.architecture in _ENCODER_ARCHITECTURES
+    if non_causal:
+        return _ContextPolicy(window, window, window)
+    # Decoder models keep the lower-RSS micro-batch, which llama.cpp requires
+    # to stay within the logical batch.
+    return _ContextPolicy(window, window, min(_N_UBATCH, window))
 
 
 # ── Model paths ──
@@ -601,14 +1009,50 @@ def _embed_threads() -> int:
 
     Read from the RAW ``memory`` config section for the same reason the rest of
     this module does: the download thread and the backend factory must not pull
-    in the full config dataclass import graph. Clamped to ``[1, cpu_count]`` so a
-    typo cannot hand llama.cpp a zero, a negative, or a count far above the
-    machine's cores.
+    in the full config dataclass import graph.
+
+    The count comes from :func:`kiro_crew.cpu_affinity.affinity_cpu_count`, not
+    ``os.cpu_count``: under a CPU-set restriction (``--cpuset-cpus``, ``taskset``)
+    the latter reports the host's cores, so the cap below would compute from 64 on
+    a 2-core allowance and answer four threads where two is the whole allowance.
+
+    An operator value OTHER than the declared :data:`_DEFAULT_EMBED_THREADS` is
+    honoured up to that count. Default policy caps the default one core BELOW it
+    instead, so a 2-vCPU host keeps a core for the event loop rather than handing
+    llama.cpp the whole box. It is a ceiling on the default, not a replacement
+    for it: a 16-core host still answers 4.
+
+    A raw value EQUAL to the default is default policy, not operator intent.
+    ``MemoryConfig.embedding_threads`` is a dataclass field defaulting to 4 and
+    ``KiroCrewConfig.save()`` publishes every field, so a fresh install's
+    ``config.json`` carries a 4 nobody typed; reading that as a choice would
+    hand the whole box to exactly the hosts this cap protects. The cost is that
+    4 cannot be pinned where the process may use 4 or fewer CPUs -- any other
+    number can.
     """
     raw = _read_memory_config().get("embedding_threads")
-    if isinstance(raw, bool) or not isinstance(raw, int) or raw <= 0:
-        raw = _DEFAULT_EMBED_THREADS
-    return max(1, min(raw, os.cpu_count() or _DEFAULT_EMBED_THREADS))
+    cores = affinity_cpu_count()
+    requested = raw if isinstance(raw, int) and not isinstance(raw, bool) and raw > 0 else 0
+    if requested and requested != _DEFAULT_EMBED_THREADS:
+        return max(1, min(requested, cores or _DEFAULT_EMBED_THREADS))
+    if cores is None:
+        return _DEFAULT_EMBED_THREADS
+    return max(1, min(_DEFAULT_EMBED_THREADS, cores - 1))
+
+
+def _free_llama(llm: object) -> None:
+    """Release a constructed model the loader will not publish.
+
+    Best effort: a model that will never be published must not keep its
+    ~700MB mapped, and a failure to free it must not propagate out of the
+    loader.
+    """
+    closer = getattr(llm, "close", None)
+    if callable(closer):
+        try:
+            closer()
+        except Exception:  # noqa: BLE001 - freeing must not propagate
+            logger.debug("Freeing abandoned model failed", exc_info=True)
 
 
 def bulk_embed_threads() -> int:
@@ -618,15 +1062,15 @@ def bulk_embed_threads() -> int:
     waiting on bulk work and a single thread is what keeps it off the fans. An
     explicit 0 means "inherit :func:`_embed_threads`", which is how a deployment
     opts back into the interactive pool for its sweeps. A value above the
-    interactive count is honoured (a server that wants the sweep done fast is a
-    legitimate choice) but still clamped to the machine's cores.
+    interactive count is honoured but still clamped to the CPUs this process
+    may run on, the same count :func:`_embed_threads` reads.
     """
     raw = _read_memory_config().get("embedding_bulk_threads")
     if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
         raw = _DEFAULT_BULK_THREADS
     elif raw == 0:
         return _embed_threads()
-    return max(1, min(raw, os.cpu_count() or _DEFAULT_EMBED_THREADS))
+    return max(1, min(raw, affinity_cpu_count() or _DEFAULT_EMBED_THREADS))
 
 
 def bulk_duty_cycle() -> float:
@@ -674,10 +1118,11 @@ def bulk_pace_delay(elapsed: float) -> float:
     long as it worked. Returns 0.0 when pacing is off, and never returns more
     than :data:`_MAX_BULK_PACE_SLEEP`.
 
-    Callers sleep in their OWN thread and hold no model lock while doing so, so
-    an interactive embed arriving mid-pause is served at full speed rather than
-    waiting out the pause. That is why this returns a delay for the caller to
-    honour instead of sleeping inside the shared inference worker.
+    Corpus callers sleep without a model lock. The shared inference worker also
+    applies this delay between bulk jobs, with an interruptible wait so an
+    interactive query can wake it immediately. Independent stores therefore
+    share one duty cycle rather than keeping the worker busy during each other's
+    pauses.
     """
     if elapsed <= 0:
         return 0.0
@@ -767,26 +1212,134 @@ class CustomModelSpec(NamedTuple):
     model_id: str
     dim: int
     error: str
+    error_code: str = ""
 
 
-def _custom_model_id(path: Path, configured: str) -> str:
-    """Stable vector-space identifier for a custom model.
+class _ModelIdentityUnverified(OSError):
+    """The model needs off-loop weight verification before it can be served."""
 
-    An explicit ``memory.embed_model_id`` always wins. Otherwise it is derived
-    from the file's name and byte size, which is free to compute and changes
-    when a genuinely different model is dropped in. It deliberately does NOT
-    hash the file: a sha256 over ~600MB on every boot buys almost nothing here.
-    The tradeoff is that swapping in a different model of IDENTICAL byte size
-    will not be detected — set ``memory.embed_model_id`` explicitly if you do
-    that.
-    """
-    if configured:
-        return configured
+
+LEGACY_EMBEDDING_WARNING = (
+    "These memory vectors were built before the model file that produced them was recorded. "
+    "If you have changed the model file since, reapply it in Memory settings (Embedding Model) "
+    "to rebuild them."
+)
+
+_model_verification_lock = threading.Lock()
+_model_identity_lock = threading.Lock()
+_model_verification_thread: threading.Thread | None = None
+
+
+def legacy_embedding_ids(value: object) -> list[str]:
+    """Accept compatibility labels only when the whole value is a list of strings."""
+    return (
+        value if isinstance(value, list) and all(isinstance(label, str) for label in value) else []
+    )
+
+
+def _verify_custom_model(path: Path, configured: str, recorded_stamp: object, config: Path) -> str:
+    """Verify and persist only the configuration and file generation inspected."""
+    from kiro_crew.config.loader import ConfigReadError, update_config_locked
+
+    with _model_identity_lock:
+        if _is_sensitive_model_path(path):
+            raise OSError("custom model path is protected")
+        stamp = _model_file_stamp(path)
+        model_id = _custom_model_id(path, configured, recorded_stamp=recorded_stamp)
+        if recorded_stamp == list(stamp) and model_id == configured:
+            return model_id
+
+        inherited = False
+
+        def update(data: dict) -> dict | None:
+            nonlocal inherited
+            memory = data.get("memory", {})
+            if (
+                isinstance(memory, dict)
+                and Path(str(memory.get("embed_model_path", "") or "").strip()).expanduser() == path
+                and str(memory.get("embed_model_id", "") or "").strip() == configured
+                and _model_file_stamp(path) == stamp
+            ):
+                if not memory.get("embed_model_stamp") and ":sha256:" not in configured:
+                    labels = {f"custom:{path.name}:{stamp[2]}"}
+                    if configured:
+                        labels.add(configured)
+                    memory["embed_model_legacy_ids"] = sorted(labels)
+                    inherited = True
+                elif memory.get("embed_model_id") != model_id:
+                    memory.pop("embed_model_legacy_ids", None)
+                memory["embed_model_id"] = model_id
+                memory["embed_model_stamp"] = list(stamp)
+                return data
+            return None
+
+        try:
+            update_config_locked(config, mutate=update)
+        except ConfigReadError as exc:
+            raise OSError(
+                "custom model identity could not be persisted: unreadable config"
+            ) from exc
+        if inherited:
+            logger.warning(LEGACY_EMBEDDING_WARNING)
+        return model_id
+
+
+def _start_model_verification(path: Path, configured: str, recorded_stamp: object) -> None:
+    """Keep one off-loop verification worker; later polls retry a changed file."""
+    global _model_verification_thread
+    config = config_path()
+    with _model_verification_lock:
+        if _model_verification_thread is not None and _model_verification_thread.is_alive():
+            return
+
+        def verify() -> None:
+            try:
+                _verify_custom_model(path, configured, recorded_stamp, config)
+            except Exception:
+                logger.warning("Custom model identity verification failed", exc_info=True)
+
+        _model_verification_thread = threading.Thread(
+            target=verify, name="kc-model-verify", daemon=True
+        )
+        _model_verification_thread.start()
+
+
+@functools.lru_cache(maxsize=8)
+def _model_content_digest(path: Path, stamp: tuple[int, ...]) -> str:
+    """Reuse the digest until file identity, size or write timestamps change."""
     try:
-        size = path.stat().st_size
-    except OSError:
-        size = 0
-    return f"custom:{path.name}:{size}"
+        asyncio.get_running_loop()
+    except RuntimeError:
+        pass
+    else:
+        raise _ModelIdentityUnverified(
+            "custom model identity is unverified; verification is running"
+        )
+    digest = _sha256_file(path)
+    if _model_file_stamp(path) != stamp:
+        raise OSError("embedding model changed while computing its identity")
+    return digest
+
+
+def _model_file_stamp(path: Path) -> tuple[int, ...]:
+    stat = path.stat()
+    return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+
+
+def _custom_model_id(path: Path, configured: str, *, recorded_stamp: object = None) -> str:
+    """Reuse a verified file stamp; never hash model weights on the event loop."""
+    stamp = _model_file_stamp(path)
+    _label, separator, recorded_digest = configured.rpartition(":sha256:")
+    if (
+        recorded_stamp == list(stamp)
+        and separator
+        and len(recorded_digest) == 64
+        and all(char in "0123456789abcdef" for char in recorded_digest)
+    ):
+        return configured
+    digest = _model_content_digest(path, stamp)
+    label = configured.split(":sha256:", 1)[0] if configured else "custom"
+    return f"{label}:sha256:{digest}"
 
 
 def _is_sensitive_model_path(path: Path) -> bool:
@@ -907,9 +1460,11 @@ def build_gated_bundled() -> LlamaCppEmbedder:
     # custom path — so omitting it would load the custom model here and label it
     # with the bundled model_id, stamping custom vectors as bundled and keeping
     # them across restarts.
-    return LlamaCppEmbedder(
+    backend = LlamaCppEmbedder(
         model_path=default_model_path(), dim=_DEFAULT_DIM, model_id=_MODEL_ID, serving=False
     )
+    backend._uses_bundled_identity = True
+    return backend
 
 
 def activate_shared_embedder() -> bool:
@@ -963,7 +1518,7 @@ def install_shared_embedder(embedder: EmbeddingBackend) -> None:
     reporting not-ready, which is exactly what the UI should show.
     """
     global _shared_embedder
-    with _shared_embedder_lock:
+    with _embedding_alignment_lock, _shared_embedder_lock:
         outgoing = _shared_embedder
         _shared_embedder = embedder
     if outgoing is not None and outgoing is not embedder:
@@ -995,9 +1550,34 @@ def resolve_custom_model() -> "CustomModelSpec | None":
         dim = raw_dim
     configured_id = str(memory_cfg.get("embed_model_id", "") or "").strip()
 
-    path, error, _code = validate_custom_model_path(raw, origin)
+    path, error, code = validate_custom_model_path(raw, origin)
+    model_id = "custom:unavailable"
+    if not error:
+        try:
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                model_id = _verify_custom_model(
+                    path, configured_id, memory_cfg.get("embed_model_stamp"), config_path()
+                )
+            else:
+                model_id = _custom_model_id(
+                    path, configured_id, recorded_stamp=memory_cfg.get("embed_model_stamp")
+                )
+                if _model_identity_lock.locked():
+                    raise _ModelIdentityUnverified(
+                        "custom model identity is unverified; verification is running"
+                    )
+        except _ModelIdentityUnverified as exc:
+            model_id = "custom:unverified"
+            error = str(exc)
+            code = "model_identity_unverified"
+            _start_model_verification(path, configured_id, memory_cfg.get("embed_model_stamp"))
+        except OSError as exc:
+            error = f"{origin} could not be read: {exc}"
+            code = "model_verification_failed"
     _log_custom_model_error(error)
-    return CustomModelSpec(path, _custom_model_id(path, configured_id), dim, error)
+    return CustomModelSpec(path, model_id, dim, error, code)
 
 
 # Last error reported by resolve_custom_model(), so a persistent misconfiguration
@@ -1053,9 +1633,11 @@ def embedding_space_signature(model_id: str, dim: int) -> str:
 
     Single source of truth so vector memory and the knowledge library cannot
     disagree about whether stored vectors are still valid. The knowledge
-    library folds this model identity into its own per-item signature (which
+    library hashes this value into its own per-item signature (which
     additionally covers its content budget); vector memory compares it against
-    the signature the database was last embedded under.
+    the signature the database was last embedded under. Because the KB's
+    identity is DERIVED from this one rather than assembled beside it, any input
+    added here necessarily reaches both consumers.
     """
     return hashlib.sha256(f"{model_id}|{dim}".encode()).hexdigest()[:16]
 
@@ -1088,6 +1670,14 @@ def active_embedding_space_signature() -> str:
     return embedding_space_signature(backend.model_id, backend.dim)
 
 
+def embedding_rebuild_generation(memory: dict | None = None) -> str:
+    """Return the managed request identity; absence leaves upgrades untouched."""
+    value = (memory if memory is not None else _read_memory_config()).get(
+        "embed_rebuild_generation", ""
+    )
+    return value if isinstance(value, str) else ""
+
+
 def store_embedding_space_is_stale(store: "_ReconcilableStore") -> bool:
     """True when *store*'s vectors were NOT produced by the active backend.
 
@@ -1096,6 +1686,9 @@ def store_embedding_space_is_stale(store: "_ReconcilableStore") -> bool:
     treated as the bundled model's, which is provable: nothing else could have
     written those vectors before space tracking existed.
     """
+    generation = embedding_rebuild_generation()
+    if generation and store.recorded_rebuild_generation() != generation:
+        return True
     recorded = store.recorded_embedding_space() or default_embedding_space_signature()
     return recorded != active_embedding_space_signature()
 
@@ -1170,7 +1763,7 @@ def reembed_progress() -> ReembedProgress:
     return _reembed_progress
 
 
-def reconcile_store_embedding_space(store: "_ReconcilableStore") -> int:
+def reconcile_store_embedding_space(store: "_AlignableStore") -> int:
     """Reconcile *store* against the active embedding space. Returns rows invalidated.
 
     THE single chokepoint for destructive reconciliation. Startup paths that
@@ -1196,17 +1789,85 @@ def reconcile_store_embedding_space(store: "_ReconcilableStore") -> int:
     the affected rows stay keyword-searchable until the gateway's sweep refills
     them.
     """
-    active = active_embedding_space_signature()
-    if active != default_embedding_space_signature() and not get_shared_embedder().is_ready():
-        logger.info(
-            "Skipping embedding-space reconciliation: the active backend is not "
-            "ready, so clearing stored vectors would leave nothing able to "
-            "re-embed them"
-        )
+    backend = get_shared_embedder()
+    active = embedding_space_signature(backend.model_id, backend.dim)
+    if active == default_embedding_space_signature() and not backend.is_ready():
+        return store.reconcile_embedding_space(active, clear_when_unknown=False)
+    return align_store_embedding_space(store)
+
+
+_embedding_alignment_lock = threading.RLock()
+
+
+def align_store_embedding_space(store: "_AlignableStore") -> int:
+    """Align a store against one ready backend without racing its replacement."""
+    with _embedding_alignment_lock:
+        return _align_store_embedding_space(store)
+
+
+def _align_store_embedding_space(store: "_AlignableStore") -> int:
+    """Align width and signature from ONE ready backend, including late opens.
+
+    A gated candidate may align stores only after its identity and width are
+    persisted. No model load or inference happens while holding a store lock.
+    """
+    backend = get_shared_embedder()
+    dim = backend.dim
+    if isinstance(dim, bool) or not isinstance(dim, int) or not 0 < dim <= 65_536:
         return 0
-    return store.reconcile_embedding_space(
-        active, clear_when_unknown=active != default_embedding_space_signature()
-    )
+    active = embedding_space_signature(backend.model_id, dim)
+    if not backend.is_ready():
+        return 0
+    # The store's lock is shared with readers and generation-guarded writers.
+    with store._db_lock:
+        memory = _read_memory_config()
+        if isinstance(backend, LlamaCppEmbedder) and not backend._serving:
+            configured_id = (
+                memory.get("embed_model_id") if memory.get("embed_model_path") else _MODEL_ID
+            )
+            if backend.model_id != configured_id or dim != memory.get(
+                "embedding_dim", _DEFAULT_DIM
+            ):
+                return 0
+        generation = embedding_rebuild_generation(memory)
+        if generation and store.recorded_rebuild_generation() != generation:
+            # Do not let an outgoing loaded backend acknowledge the request for
+            # its replacement, including a same-width change in another writer.
+            configured_id = (
+                memory.get("embed_model_id") if memory.get("embed_model_path") else _MODEL_ID
+            )
+            if backend.model_id != configured_id or dim != memory.get(
+                "embedding_dim", _DEFAULT_DIM
+            ):
+                return 0
+            store.set_embedding_dim(dim)
+            return store.reconcile_embedding_space(
+                active, clear_when_unknown=True, rebuild_generation=generation
+            )
+        legacy_ids = legacy_embedding_ids(memory.get("embed_model_legacy_ids"))
+        if (
+            legacy_ids
+            and isinstance(backend, LlamaCppEmbedder)
+            and backend.model_path == Path(str(memory.get("embed_model_path", ""))).expanduser()
+            and backend.model_id == memory.get("embed_model_id")
+            and store._embedding_dim == dim
+            and store.recorded_embedding_space()
+            in {embedding_space_signature(label, dim) for label in legacy_ids}
+        ):
+            try:
+                stamp_matches = list(_model_file_stamp(backend.model_path)) == memory.get(
+                    "embed_model_stamp"
+                )
+            except OSError:
+                stamp_matches = False
+            if stamp_matches:
+                store._write_meta("embedding_space_sig", active)
+                return 0
+        if store.set_embedding_dim(dim) or store.recorded_embedding_space() not in (None, active):
+            store.begin_space_change()
+        return store.reconcile_embedding_space(
+            active, clear_when_unknown=active != default_embedding_space_signature()
+        )
 
 
 # ── Embedding backend interface ──
@@ -1228,8 +1889,9 @@ class EmbeddingBackend(abc.ABC):
     - ``model_id`` + ``dim`` identify the vector space. Vectors produced under
       a different ``model_id`` or ``dim`` are incomparable — a swap requires
       re-embedding stored vectors (the knowledge library's sig-gated rebuild
-      keys off :func:`kiro_crew.knowledge.embedder.embed_signature`, which
-      folds ``model_id`` in; vector memory re-embeds via ``migrate``).
+      keys off :func:`kiro_crew.knowledge.embedder.embed_signature`, which is
+      built on :func:`embedding_space_signature` and so folds BOTH in; vector
+      memory re-embeds via ``migrate``).
     - Implementations must be thread-safe (callers invoke from worker threads).
     """
 
@@ -1272,9 +1934,10 @@ class EmbeddingBackend(abc.ABC):
 class _InferJob:
     """One ``create_embedding`` call handed to the embedder's worker thread."""
 
-    __slots__ = ("llm", "texts", "result", "error", "done", "started")
+    __slots__ = ("llm", "texts", "result", "error", "done", "started", "work")
 
-    def __init__(self, llm: object, texts: "list[str]") -> None:
+    def __init__(self, llm: object, texts: "list[str]", priority: int = PRIORITY_NORMAL) -> None:
+        self.work = _work_for_priority(priority)
         self.llm = llm
         self.texts = texts
         self.result: object | None = None
@@ -1316,6 +1979,9 @@ class LlamaCppEmbedder(EmbeddingBackend):
         self._model_path = model_path or active_model_path()
         self._dim = dim
         self._model_id = model_id
+        # Only the bundled factory paths set this. A custom model may declare
+        # the same id and width without containing the same weights.
+        self._uses_bundled_identity = False
         self._llm: object | None = None
         # Gate: a candidate installed by a model change LOADS but serves nobody
         # until activate(). Returning None from embed* is the ABC's documented
@@ -1335,7 +2001,11 @@ class LlamaCppEmbedder(EmbeddingBackend):
         # increasing tiebreaker, which makes the ordering stable — equal
         # priorities stay FIFO — and also means the heap never has to compare two
         # _InferJob objects, which are not orderable.
-        self._jobs: "queue.PriorityQueue[tuple[int, int, _InferJob | None]]" = queue.PriorityQueue()
+        self._jobs: "queue.PriorityQueue[tuple[int, int, _InferJob | None]]" = queue.PriorityQueue(
+            maxsize=_MAX_PENDING_EMBEDS + 1  # the extra slot is reserved for shutdown
+        )
+        self._jobs_changed = threading.Event()
+        self._bulk_ready_at = 0.0
         self._seq = 0
         self._seq_lock = threading.Lock()
         # Thread count currently programmed into the loaded context, and whether
@@ -1450,20 +2120,46 @@ class LlamaCppEmbedder(EmbeddingBackend):
         try:
             started = time.monotonic()
             threads = _embed_threads()
+            # Stamped BEFORE the header read and re-checked once the constructor
+            # returns: the policy reads the GGUF header and llama.cpp then opens
+            # the path a second time, so a file replaced in between would get a
+            # context sized from the previous header (decoder sizes on an
+            # encoder are the >512-token abort the policy exists to prevent).
+            stamp = _model_file_stamp(self._model_path)
+            policy = _model_context_policy(self._model_path)
+            if policy.n_ctx < _N_CTX:
+                # Once per model load, not per embed call: the binding truncates
+                # silently, so this is the only place the rule is stated.
+                logger.warning(
+                    "GGUF %s was trained for %d positions; its embedding context is "
+                    "sized to %d tokens and a longer input is truncated to its first "
+                    "%d tokens before embedding.",
+                    self._model_path.name,
+                    policy.n_ctx,
+                    policy.n_ctx,
+                    policy.n_ctx,
+                )
             llm = llama_cls(
                 model_path=str(self._model_path),
                 embedding=True,
+                # Passed for every file, so the runtime never falls back to the
+                # GGUF's own pooling_type key.
                 pooling_type=_POOLING_TYPE_LAST,
-                n_ctx=_N_CTX,
                 # n_batch == n_ctx so the logical batch always covers the whole
-                # input in one go, which last-token pooling needs. This used to
-                # also size a ~1.24 GB per-token logits buffer in the vendored
-                # constructor; that buffer is now skipped entirely in embedding
-                # mode (see the `n_score_rows` divergence comment in
-                # src/kiro_crew/_vendor/llama_cpp/llama.py, issue #6827), so
-                # n_batch no longer trades memory against input length.
-                n_batch=_N_CTX,
-                n_ubatch=_N_UBATCH,
+                # input in one go, which last-token pooling needs. In embedding mode
+                # the vendored constructor skips the ~1.24 GB per-token logits
+                # buffer this would otherwise size (see the `n_score_rows`
+                # divergence comment in src/kiro_crew/_vendor/llama_cpp/llama.py),
+                # so n_batch does not trade memory against input length. Both are
+                # clamped to the trained position count the GGUF declares, at
+                # most 2,048 (see _model_context_policy). Decoder models keep the
+                # lower-RSS 512-token micro-batch, bounded by that batch; non-causal
+                # models (cache-less encoder architectures, or a GGUF declaring
+                # `.attention.causal = false`) need one physical micro-batch to
+                # hold every token, so all three coincide.
+                n_ctx=policy.n_ctx,
+                n_batch=policy.n_batch,
+                n_ubatch=policy.n_ubatch,
                 # Both pools are pinned. Embedding is prompt processing, so the
                 # BATCH pool is the one that actually runs, but leaving the
                 # generation pool at llama.cpp's cpu//2 default would still size
@@ -1472,6 +2168,27 @@ class LlamaCppEmbedder(EmbeddingBackend):
                 n_threads_batch=threads,
                 verbose=False,
             )
+            try:
+                unchanged = _model_file_stamp(self._model_path) == stamp
+            except OSError:
+                unchanged = False
+            if not unchanged:
+                # The mapped weights are not the file the header came from.
+                # Same shape as the dim refusal below: never publish, mark the
+                # load failed, and let the cooldown retry size from the header
+                # that is on disk by then. (_model_content_digest guards its
+                # sha256 the same way.)
+                _free_llama(llm)
+                logger.warning(
+                    "Embedding model %s changed on disk while it was being loaded; "
+                    "discarding the context sized from its previous header. The load "
+                    "is retried in %.0f s.",
+                    self._model_path.name,
+                    _LLM_LOAD_RETRY_SECS,
+                )
+                self._load_failed_at = time.monotonic()
+                self._llm = None
+                return
             # Validate the model's REAL output width against the configured dim
             # before publishing it. Without this a custom model whose dim does
             # not match memory.embedding_dim loads fine and then every embed
@@ -1526,12 +2243,7 @@ class LlamaCppEmbedder(EmbeddingBackend):
                 # rolled-back model change). Publishing now would put a ~700MB
                 # model back into an embedder nobody holds a reference to except
                 # a stale consumer. Drop it instead.
-                closer = getattr(llm, "close", None)
-                if callable(closer):
-                    try:
-                        closer()
-                    except Exception:  # noqa: BLE001 - freeing must not propagate
-                        logger.debug("Freeing abandoned model failed", exc_info=True)
+                _free_llama(llm)
                 return
             # A fresh context carries llama.cpp's load-time thread count, so the
             # count the worker last programmed no longer describes it. Clear the
@@ -1566,6 +2278,28 @@ class LlamaCppEmbedder(EmbeddingBackend):
             logger.debug("Could not probe embedding dim", exc_info=True)
             return None
 
+    def _next_infer_job(
+        self, jobs: "queue.PriorityQueue[tuple[int, int, _InferJob | None]]"
+    ) -> "tuple[int, int, _InferJob | None]":
+        """Apply one shared bulk duty cycle, interruptible by interactive work."""
+        while True:
+            self._jobs_changed.clear()
+            delay = None
+            with self._dispatch_lock:
+                # Peek under PriorityQueue's mutex; only this owned worker removes
+                # jobs, and dispatch/close serialize every producer with this lock.
+                with jobs.mutex:
+                    head = jobs.queue[0] if jobs.queue else None
+                if head is not None:
+                    if head[2] is not None and head[0] >= PRIORITY_BULK:
+                        delay = max(0.0, self._bulk_ready_at - time.monotonic())
+                    if not delay:
+                        return jobs.get_nowait()
+            # A later interactive call or the shutdown sentinel wakes the worker
+            # immediately. Bulk loops cannot bypass the shared cooldown by each
+            # sleeping independently on another store's thread.
+            self._jobs_changed.wait(delay)
+
     def _infer_loop(self, jobs: "queue.PriorityQueue[tuple[int, int, _InferJob | None]]") -> None:
         """Worker body: run queued ``create_embedding`` calls, one at a time.
 
@@ -1587,7 +2321,7 @@ class LlamaCppEmbedder(EmbeddingBackend):
         strictly no more concurrent than a single caller holding it was.
         """
         while True:
-            prio, _seq, job = jobs.get()
+            prio, _seq, job = self._next_infer_job(jobs)
             if job is None:
                 # close() has already dropped the model. Anything queued behind
                 # the sentinel would otherwise wait on job.done forever, since
@@ -1596,12 +2330,19 @@ class LlamaCppEmbedder(EmbeddingBackend):
                 return
             try:
                 with self._lock:
+                    if job.work.expired():
+                        job.error = TimeoutError("embedding work expired before inference")
+                        continue
                     self._apply_thread_class(job.llm, prio)
                     job.started = time.monotonic()
                     job.result = job.llm.create_embedding(job.texts)  # type: ignore[attr-defined]
             except BaseException as exc:  # noqa: BLE001 - relayed to the caller verbatim
                 job.error = exc
             finally:
+                if prio >= PRIORITY_BULK and job.started:
+                    self._bulk_ready_at = time.monotonic() + bulk_pace_delay(
+                        time.monotonic() - job.started
+                    )
                 job.done.set()
 
     def _apply_thread_class(self, llm: object, priority: int) -> None:
@@ -1670,11 +2411,11 @@ class LlamaCppEmbedder(EmbeddingBackend):
 
         The caller does NOT hold ``_lock`` — the worker takes it around the
         actual inference — so several callers can have work queued at once and
-        *priority* decides who the single model serves next. The wait is
-        unbounded, matching the previous inline call: a wedged native inference
-        blocked the caller then too.
+        *priority* decides who the single model serves next. Pending work is
+        bounded; overload returns an unavailable embedding so the stored row can
+        remain pending and retrieval can use its lexical path.
         """
-        job = _InferJob(llm, texts)
+        job = _InferJob(llm, texts, priority)
         with self._dispatch_lock:
             # Retirement check, worker selection/spawn and the enqueue are ONE
             # atomic step. Split, they lose two ways: two callers racing an
@@ -1695,7 +2436,7 @@ class LlamaCppEmbedder(EmbeddingBackend):
                 # New worker, new queue. A straggler left behind by a timed-out
                 # close() join keeps draining its OWN queue, so it can neither
                 # consume this worker's jobs nor eat this worker's future sentinel.
-                self._jobs = queue.PriorityQueue()
+                self._jobs = queue.PriorityQueue(maxsize=_MAX_PENDING_EMBEDS + 1)
                 thread = threading.Thread(
                     target=self._infer_loop,
                     args=(self._jobs,),
@@ -1704,11 +2445,44 @@ class LlamaCppEmbedder(EmbeddingBackend):
                 )
                 self._infer_thread = thread
                 thread.start()
+            priority = min(priority, job.work.priority)
+            capacity = _MAX_PENDING_EMBEDS
+            if priority >= PRIORITY_NORMAL:
+                capacity -= _INTERACTIVE_QUEUE_RESERVE
+            if self._jobs.qsize() >= capacity:
+                job.error = RuntimeError("embedding queue is busy; retry deferred work later")
+                job.done.set()
+                return job
+            if job.work.expired():
+                job.error = TimeoutError("embedding work expired before admission")
+                job.done.set()
+                return job
             self._jobs.put((priority, self._next_seq(), job))
-        # Wait OUTSIDE the lock: the wait is unbounded, and holding the dispatch
-        # lock across it would serialize every submitter behind this one job.
-        job.done.wait()
+            self._jobs_changed.set()
+        while not job.done.wait(0.05):
+            if job.work.expired():
+                with self._dispatch_lock, self._jobs.mutex:
+                    for index, entry in enumerate(self._jobs.queue):
+                        if entry[2] is job:
+                            self._jobs.queue.pop(index)
+                            heapq.heapify(self._jobs.queue)
+                            job.error = TimeoutError("embedding work expired in queue")
+                            job.done.set()
+                            self._jobs_changed.set()
+                            break
+                # A claimed native call is not interruptible. Keep this worker
+                # and its admission slot until the native owner finishes it.
         return job
+
+    def promote_pending(self, work: EmbeddingWork, priority: int) -> None:
+        """Upgrade an identical queued bulk request when a human starts waiting."""
+        with self._dispatch_lock, self._jobs.mutex:
+            work.priority = min(work.priority, priority)
+            for index, (old, seq, job) in enumerate(self._jobs.queue):
+                if job is not None and job.work is work and old > priority:
+                    self._jobs.queue[index] = (priority, seq, job)
+            heapq.heapify(self._jobs.queue)
+            self._jobs_changed.set()
 
     def _create_embedding(
         self, llm: object, texts: "list[str]", priority: int = PRIORITY_NORMAL
@@ -1736,6 +2510,16 @@ class LlamaCppEmbedder(EmbeddingBackend):
         """
         if not texts or not any(t.strip() for t in texts):
             return None
+        if len(texts) > _MAX_EMBED_BATCH_TEXTS:
+            result = []
+            for start in range(0, len(texts), _MAX_EMBED_BATCH_TEXTS):
+                batch = self.embed_batch(
+                    texts[start : start + _MAX_EMBED_BATCH_TEXTS], priority=priority
+                )
+                if batch is None:
+                    return None
+                result.extend(batch)
+            return result
         if self._closed or not self._serving:
             # Closed: terminal, never reload. Not serving: a candidate mid-swap,
             # whose vectors would be in a space the store has not reconciled to.
@@ -1835,13 +2619,14 @@ class LlamaCppEmbedder(EmbeddingBackend):
                 thread, self._infer_thread = self._infer_thread, None
                 # Retire the queue at the same time as the thread, so a late caller
                 # cannot enqueue onto a queue that is shutting down.
-                jobs, self._jobs = self._jobs, queue.PriorityQueue()
+                jobs, self._jobs = self._jobs, queue.PriorityQueue(maxsize=_MAX_PENDING_EMBEDS + 1)
                 if thread is not None and thread.is_alive():
                     # The sentinel outranks queued work, so a large sweep already
                     # in the queue cannot delay shutdown. The worker fails
                     # anything still queued on its way out (_drain_orphans)
                     # rather than leaving a caller waiting on job.done.
                     jobs.put((_PRIORITY_SENTINEL, self._next_seq(), None))
+                    self._jobs_changed.set()
         # Join OUTSIDE _lock. The WORKER now holds _lock around inference, so
         # joining while holding it would deadlock against a job that was dequeued
         # just before the sentinel until the timeout expired.
@@ -1880,7 +2665,9 @@ def default_embedding_backend() -> EmbeddingBackend:
     """
     spec = resolve_custom_model()
     if spec is None:
-        return LlamaCppEmbedder()
+        backend = LlamaCppEmbedder()
+        backend._uses_bundled_identity = True
+        return backend
     # A broken custom path is still honoured as "custom": the embedder will not
     # load, embeddings stay unavailable, and memory degrades to keyword search.
     # Falling back to the bundled model here would silently swap the vector
@@ -1916,15 +2703,72 @@ def get_shared_embedder() -> EmbeddingBackend:
     """
     global _shared_embedder
     with _shared_embedder_lock:
+        if _shared_embedder is not None:
+            return _shared_embedder
+        if _backend_factory is not None:
+            _shared_embedder = _backend_factory()
+            return _shared_embedder
+    # The default constructor does not load native weights. Verification may
+    # read them on a worker, so it must not hold the lock needed by loop readers.
+    candidate = default_embedding_backend()
+    with _shared_embedder_lock:
         if _shared_embedder is None:
-            _shared_embedder = (_backend_factory or default_embedding_backend)()
+            if candidate.model_id == "custom:unverified":
+                return candidate
+            _shared_embedder = candidate
         return _shared_embedder
+
+
+def peek_ready_shared_embedder() -> EmbeddingBackend | None:
+    """Return an existing ready backend without constructing or warming one."""
+    with _shared_embedder_lock:
+        backend = _shared_embedder
+    if backend is None or not backend.is_ready():
+        return None
+    return backend
+
+
+def peek_shared_embedding_identity() -> tuple[str | None, str]:
+    """Snapshot declared identity without constructing or loading a backend.
+
+    This does not inspect model files, infer, check readiness or prove model
+    equivalence. Custom/registered backends remain qualified as such even when
+    they declare the bundled id and width. Metadata getters are the backend's
+    existing constructor-time identity contract.
+    """
+    with _shared_embedder_lock:
+        backend = _shared_embedder
+        registered = _backend_factory is not None
+    source = "custom_or_registered" if registered else "unknown"
+    if backend is None:
+        return None, source
+    source = (
+        "bundled"
+        if not registered
+        and type(backend) is LlamaCppEmbedder
+        and getattr(backend, "_uses_bundled_identity", False)
+        else "custom_or_registered"
+    )
+    try:
+        model_id, dim = backend.model_id, backend.dim
+    except Exception:
+        return None, source
+    if (
+        not isinstance(model_id, str)
+        or not model_id
+        or len(model_id) > 512
+        or isinstance(dim, bool)
+        or not isinstance(dim, int)
+        or not 0 < dim <= 65_536
+    ):
+        return None, source
+    return embedding_space_signature(model_id, dim), source
 
 
 def reset_shared_embedder() -> None:
     """Drop the singleton (tests, disable-embeddings, KIROCREW_HOME changes)."""
     global _shared_embedder
-    with _shared_embedder_lock:
+    with _embedding_alignment_lock, _shared_embedder_lock:
         if _shared_embedder is not None:
             _retire_backend(_shared_embedder)
         _shared_embedder = None
@@ -1961,36 +2805,10 @@ async def _run_download_on_daemon_thread(fn: "Callable[[], tuple[bool, str]]") -
     return result[0]
 
 
-_SSL_CA_PATHS = (
-    "/etc/pki/tls/certs/ca-bundle.crt",  # AL2, RHEL, CentOS
-    "/etc/ssl/certs/ca-certificates.crt",  # Debian/Ubuntu
-    "/etc/ssl/cert.pem",  # macOS, Alpine
-    "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",  # Fedora
-)
-
-
-def _make_ssl_context() -> ssl.SSLContext:
-    """Create an SSL context that finds system CA certs on all supported platforms.
-
-    Bundled Python runtimes (like the desktop backend's interpreter) may not ship
-    their own CA bundle and rely on ``ssl.SSLContext.load_default_certs()`` which
-    calls OpenSSL's defaults — those can miss when the compiled-in cert path
-    doesn't match the host OS (common on AL2 with cross-compiled Python).
-    """
-    ctx = ssl.create_default_context()
-    try:
-        ctx.load_default_certs()
-        if _ssl_context_has_ca_trust(ctx):
-            return ctx
-    except ssl.SSLError:
-        pass
-    # Fallback: try well-known system CA bundle paths
-    for path in _SSL_CA_PATHS:
-        if os.path.isfile(path):
-            ctx.load_verify_locations(cafile=path)
-            return ctx
-    # Last resort: honor SSL_CERT_FILE / SSL_CERT_DIR env if set
-    return ctx
+def _operator_env_model_url() -> str:
+    """The ``KIROCREW_EMBED_MODEL_URL`` override if set and https, else ``""``."""
+    env_url = os.environ.get(_MODEL_URL_ENV, "").strip()
+    return env_url if env_url.lower().startswith("https://") else ""
 
 
 def _resolve_model_url() -> str:
@@ -2031,6 +2849,11 @@ def redact_model_url(url: str) -> str:
     A private-mirror override may carry credentials in userinfo or a signed
     query string (e.g. presigned URLs). Only scheme + host + path are ever
     logged or printed; the full URL is used exclusively for the request.
+
+    Deliberately NOT :func:`asset_downloader.redact_url`, which drops the path
+    too: ``kirocrew doctor`` prints this to tell the operator WHICH model file
+    resolved, and the model url's path is the operator's own override or the
+    shipped default — never a value a remote party chose.
     """
     try:
         parts = urllib.parse.urlsplit(url)
@@ -2183,60 +3006,59 @@ class ModelDownloadManager:
         return self._download_via_https()
 
     def _download_via_https(self) -> tuple[bool, str]:
-        """Download the GGUF from the CDN via plain HTTPS with progress reporting."""
+        """Download the GGUF from the CDN through the shared transfer engine.
+
+        Everything about the transfer — streamed sha256, atomic install, the
+        wording of each failure — is :mod:`kiro_crew.asset_downloader`'s. What
+        stays here is the part that is about the MODEL: which url to resolve, the
+        sha and size pins, and turning byte counts into the ``status`` dict the
+        dashboard renders a progress bar from.
+
+        ``resume=False``: the staging name carries this process's pid so a
+        gateway and a one-shot CLI can never interleave writes into a shared
+        partial, and a resumable transfer needs the opposite (one stable name).
+        For a 610MB one-shot pull that a caller already retries for hours,
+        restarting is the simpler correct behaviour.
+        """
         url = _resolve_model_url()
-        self._target.parent.mkdir(parents=True, exist_ok=True)
-        staging = self._target.parent / f".{self._target.name}.http.{os.getpid()}.tmp"
-        try:
-            logger.info("Downloading embedding model from %s", redact_model_url(url))
-            req = urllib.request.Request(url, method="GET")
-            ctx = _make_ssl_context()
-            # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected -- _resolve_model_url enforces https:// and the payload is sha256-pinned
-            with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT_SECS, context=ctx) as resp:
-                total = int(resp.headers.get("Content-Length", 0))
-                downloaded = 0
-                h = hashlib.sha256()
-                with staging.open("wb") as out:
-                    while True:
-                        chunk = resp.read(_HTTP_CHUNK_BYTES)
-                        if not chunk:
-                            break
-                        out.write(chunk)
-                        h.update(chunk)
-                        downloaded += len(chunk)
-                        if downloaded % _PROGRESS_EVERY_BYTES < _HTTP_CHUNK_BYTES:
-                            self.status = {
-                                "step": "downloading",
-                                "error": "",
-                                "attempt": self.status.get("attempt", 0),
-                                "bytes_downloaded": downloaded,
-                                "bytes_total": total,
-                            }
-            # Verify inline (we computed sha256 while streaming).
+        # Only the OPERATOR's env override may redirect across https hosts: it
+        # names their own mirror, and the common mirror shapes hop to a storage
+        # host. The config knob is agent-writable and the CDN default is not
+        # ours to trust, so both keep the host pin. The sha256 pin decides
+        # what is installed either way.
+        operator_mirror = url == _operator_env_model_url()
+
+        def _progress(done: int, total: int) -> None:
+            self.status = {
+                "step": "downloading",
+                "error": "",
+                "attempt": self.status.get("attempt", 0),
+                "bytes_downloaded": done,
+                "bytes_total": total,
+            }
+
+        def _verifying() -> None:
             self.status = {
                 "step": "verifying",
                 "error": "",
                 "attempt": self.status.get("attempt", 0),
             }
-            digest = h.hexdigest()
-            if digest != _GGUF_SHA256:
-                staging.unlink(missing_ok=True)
-                return False, (
-                    f"sha256 mismatch: got {digest[:16]}…, "
-                    f"expected {_GGUF_SHA256[:16]}… (corrupt download)"
-                )
-            if staging.stat().st_size < _GGUF_MIN_BYTES:
-                staging.unlink(missing_ok=True)
-                return False, f"downloaded file too small ({staging.stat().st_size} bytes)"
-            self._install_file(staging, copy=False)
-            return True, ""
-        except (urllib.error.URLError, OSError, TimeoutError) as exc:
-            staging.unlink(missing_ok=True)
-            return False, f"HTTPS download failed: {exc}"
-        except Exception as exc:
-            staging.unlink(missing_ok=True)
-            logger.warning("HTTPS model download failed", exc_info=True)
-            return False, f"HTTPS download failed: {exc}"
+
+        return asset_downloader.download_to(
+            self._target,
+            url,
+            sha256=_GGUF_SHA256,
+            min_bytes=_GGUF_MIN_BYTES,
+            resume=False,
+            staging=self._target.parent / f".{self._target.name}.http.{os.getpid()}.tmp",
+            timeout_secs=_HTTP_TIMEOUT_SECS,
+            chunk_bytes=_HTTP_CHUNK_BYTES,
+            progress_every_bytes=_PROGRESS_EVERY_BYTES,
+            on_progress=_progress,
+            on_verifying=_verifying,
+            allow_cross_host_redirects=operator_mirror,
+            label="embedding model",
+        )
 
 
 def _sha256_file(path: Path) -> str:
@@ -2307,61 +3129,92 @@ def start_background_model_download() -> "asyncio.Task[bool] | None":
 _EMBED_CACHE_MAX = 128
 
 
-class _EmbedFailed(Exception):
-    """Raised to prevent lru_cache from caching failed embedding attempts."""
+_sync_embed_cache: "OrderedDict[tuple[str, str], tuple[float, ...]]" = OrderedDict()
+_sync_embed_cache_lock = threading.Lock()
+_sync_embed_cache_backend: EmbeddingBackend | None = None
+# Stripes guard only in-flight bookkeeping, never inference or another waiter.
+_sync_embed_stripes = tuple(threading.Lock() for _ in range(16))
+
+
+@dataclass
+class _EmbedFlight:
+    work: EmbeddingWork
+    done: threading.Event = field(default_factory=threading.Event)
+    vector: list[float] | None = None
+
+
+_sync_embed_flights: dict[tuple[int, str], _EmbedFlight] = {}
+
+
+def _shared_sync_embed(
+    text: str, *, priority: int = PRIORITY_NORMAL, backend: EmbeddingBackend | None = None
+) -> list[float] | None:
+    global _sync_embed_cache_backend
+    text = text[:_MAX_EMBED_CHARS]
+    backend = backend if backend is not None else get_shared_embedder()
+    key = (backend.model_id, text)
+    flight_key = (id(backend), text)
+    work = _work_for_priority(priority)
+    if work.expired():
+        return None
+    stripe = _sync_embed_stripes[hash(flight_key) % len(_sync_embed_stripes)]
+    with stripe, _sync_embed_cache_lock:
+        if _sync_embed_cache_backend is not backend:
+            _sync_embed_cache.clear()
+            _sync_embed_cache_backend = backend
+        cached = _sync_embed_cache.get(key)
+        if cached is not None:
+            _sync_embed_cache.move_to_end(key)
+            return list(cached)
+        flight = _sync_embed_flights.get(flight_key)
+        owner = flight is None
+        if flight is None:
+            if len(_sync_embed_flights) >= _EMBED_CACHE_MAX:
+                return None
+            flight = _EmbedFlight(work)
+            _sync_embed_flights[flight_key] = flight
+    if not owner:
+        promote = getattr(backend, "promote_pending", None)
+        if callable(promote):
+            promote(flight.work, priority)
+        while not flight.done.wait(0.05):
+            if work.expired():
+                return None
+        return list(flight.vector) if flight.vector is not None and not work.expired() else None
+    token = embedding_work.set(work)
+    try:
+        vector = backend.embed(text, priority=priority)
+        if vector is None:
+            return None
+        # A vector the native call did return is correct whatever the owner's
+        # deadline; publish and cache it so a waiter with a longer budget, and
+        # the next caller, do not pay for the same inference again. Only the
+        # owner's own return value honours the owner's deadline.
+        flight.vector = list(vector)
+        with _sync_embed_cache_lock:
+            if _sync_embed_cache_backend is backend:
+                _sync_embed_cache[key] = tuple(vector)
+                _sync_embed_cache.move_to_end(key)
+                while len(_sync_embed_cache) > _EMBED_CACHE_MAX:
+                    _sync_embed_cache.popitem(last=False)
+        return None if work.expired() else list(vector)
+    finally:
+        embedding_work.reset(token)
+        with stripe, _sync_embed_cache_lock:
+            _sync_embed_flights.pop(flight_key, None)
+            flight.done.set()
+
+
+_shared_sync_embed.accepts_priority = True  # type: ignore[attr-defined]
 
 
 def make_sync_embed_fn() -> Callable[[str], "list[float] | None"]:
     """Return a sync callable ``(str) -> list[float] | None`` over the shared embedder.
 
-    Successful results are cached via ``functools.lru_cache`` keyed by input
-    text AND the producing backend's ``model_id`` — after a backend swap
-    (:func:`register_embedding_backend` + :func:`reset_shared_embedder`) the
-    old model's cached vectors can never be served for the new model, which
-    would silently mix incomparable vector spaces. Bounded to
-    ``_EMBED_CACHE_MAX`` entries (see constant for size math). Failures
-    (None) are not cached so a still-downloading model is retried. Embedding
-    never blocks on the model load (kicked in the background); callers get
-    ``None`` until the model is resident.
+    All stores and callers share ONE bounded cache and inference backend.
+    Concurrent identical texts are coalesced; failures are never cached, so a
+    missing model or saturated queue can be retried. Backend replacement clears
+    the cache even when the new backend advertises the same model id.
     """
 
-    # Priority travels OUT OF BAND rather than as a cached argument: adding it to
-    # the lru_cache key would re-embed the same text once per priority, losing the
-    # reuse that currently lets episodic recall ride on the lessons embed of the
-    # identical query. Thread-local is safe because embed() blocks on the calling
-    # thread — the hand-off to kc-embed-infer happens inside it.
-    _call_priority = threading.local()
-
-    @functools.lru_cache(maxsize=_EMBED_CACHE_MAX)
-    def _cached_embed(text: str, model_id: str) -> tuple[float, ...]:
-        del model_id  # cache-key only — routes stale entries away after a backend swap
-        info = _cached_embed.cache_info()
-        if info.misses % 20 == 0:
-            logger.info(
-                "Embedding cache: hits=%d misses=%d size=%d/%d",
-                info.hits,
-                info.misses,
-                info.currsize,
-                info.maxsize,
-            )
-        vec = get_shared_embedder().embed(
-            text, priority=getattr(_call_priority, "value", PRIORITY_NORMAL)
-        )
-        if vec is None:
-            raise _EmbedFailed
-        return tuple(vec)
-
-    def _embed(text: str, *, priority: int = PRIORITY_NORMAL) -> list[float] | None:
-        _call_priority.value = priority
-        try:
-            return list(_cached_embed(text, get_shared_embedder().model_id))
-        except _EmbedFailed:
-            return None
-        finally:
-            _call_priority.value = PRIORITY_NORMAL
-
-    # Explicit capability flag rather than a TypeError probe: a TypeError raised
-    # from INSIDE a custom embed_fn must not be misread as "does not take a
-    # priority", which would silently downgrade every call to the default.
-    _embed.accepts_priority = True  # type: ignore[attr-defined]
-    return _embed
+    return _shared_sync_embed

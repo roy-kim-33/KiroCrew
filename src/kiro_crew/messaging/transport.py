@@ -7,8 +7,16 @@ and cycle-free.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any
+
+#: The ``configured_targets()`` prefix every transport gives a DIRECT (1:1)
+#: conversation: ``user:<identity>``. A ``thread:`` or room target is a different
+#: audience and is never the owner's DM. Spelled once, here, because two readers
+#: infer "the owner" from it (:func:`sole_direct_target`'s callers) and a second
+#: spelling would let them disagree about which targets are direct at all.
+DM_TARGET_PREFIX = "user:"
 
 
 @dataclass(frozen=True)
@@ -28,6 +36,33 @@ class ConfiguredChannelTarget:
             "available": self.available,
             "unavailable_reason": self.unavailable_reason,
         }
+
+
+def sole_direct_target(targets: Iterable[Any]) -> str:
+    """The ONE available direct target id among *targets*, or ``""``.
+
+    The single rule by which a channel NAMES its owner. No channel carries an
+    owner field the way Slack's ``owner_id`` does, and an allow-list is a list of
+    people permitted to talk to the agent rather than a claim that any of them is
+    the operator — so an owner can only be inferred, and this refuses to infer one
+    from an ambiguous list: a target is returned only when the channel advertises
+    exactly one available ``user:`` target. Unavailable targets (WeCom may only
+    reply to an inbound message) and thread or room targets (a wider audience than
+    a DM) are not candidates.
+
+    Shared by the proactive owner DM (``send_message``'s channel ``session``) and
+    by session control's owner-DM audience predicate, so the two cannot disagree
+    about who the owner of a channel is. Reads only the neutral target shape, so a
+    caller may hand it a transport's live ``configured_targets()`` list or any
+    duck-typed equivalent.
+    """
+    direct = [
+        str(getattr(target, "target_id", "") or "")
+        for target in targets
+        if str(getattr(target, "target_id", "") or "").startswith(DM_TARGET_PREFIX)
+        and getattr(target, "available", False)
+    ]
+    return direct[0] if len(direct) == 1 else ""
 
 
 @dataclass
@@ -60,12 +95,14 @@ class TransportCapabilities:
       dashboard marks the binding as an INBOUND resume target
       (``accepts_inbound``), and therefore whether the slot row reports
       ``direction: both``. Only a transport whose inbound path actually resolves
-      the mirror binding may declare it: Discord's dispatcher looks the
-      conversation up (``DiscordSessionResume.resumed_session``), while Telegram
-      and the rest derive a session key from the route alone and never consult
-      the binding. Declaring it where it is not honoured makes the dashboard
-      promise a two-way link whose replies silently start a separate session —
-      which is exactly what this flag exists to prevent. Slack is out of scope
+      the mirror binding may declare it: Discord and Telegram both resolve the
+      conversation through their channel-specific session-resume adapters. The
+      remaining transports derive a session key from the route alone and never
+      consult the binding. Declaring it where it is not honoured makes the
+      dashboard promise a two-way link whose replies silently start a separate
+      session — which is exactly what this flag exists to prevent. The dashboard
+      then calls ``may_resume_from`` on the resolved target, so a capable transport
+      may still narrow inbound ownership per conversation. Slack is out of scope
       here: it routes inbound through its own ``_thread_to_session`` index and
       never sets the marker.
 
@@ -77,7 +114,12 @@ class TransportCapabilities:
       list in the body. Channels declaring 0 render no widget and route the
       WHOLE list through ``messaging.renderer.render_options_as_text``, which is
       the same helper with zero widget slots, so every choice arrives as a
-      numbered line rather than being deleted with the trailer.
+      numbered line rather than being deleted with the trailer. WhatsApp is the
+      one zero-widget channel that does NOT do this: its renderer strips a
+      complete trailer (``whatsapp/turn_renderer.py::_strip_options``) and the
+      choices are lost. Do not read a 0 here as a promise that the list survives
+      -- ``test_options_cap_contract.py`` drives the four channels that honour it,
+      and WhatsApp is deliberately absent from that set.
 
     * ``rich_blocks`` — gates whether a renderer attaches a native widget at
       all. Webex reads it before building an Adaptive Card, for both the
@@ -345,9 +387,19 @@ class MessagingTransport(ABC):
         requires every transport under ``src/kiro_crew/<channel>/`` to override
         this and make its own decision explicit, so a channel cannot inherit
         permission silently. Override it and return False for a conversation
-        whose principal is no longer on the roster.
+        whose principal is not on the roster.
         """
         return True
+
+    def may_resume_from(self, conversation_id: str, thread_id: str | None = None) -> bool:
+        """Whether this exact target may drive a dashboard session inbound.
+
+        The capability says the transport has a correct resolver; this hook applies
+        target- and roster-specific ownership policy after target resolution. The
+        default follows the capability. A transport with a stricter owner model
+        overrides synchronously and in memory, matching :meth:`may_send_to`.
+        """
+        return bool(self.capabilities.supports_session_resume)
 
     # -- Inbound adapter ----------------------------------------------------
     @abstractmethod

@@ -1,6 +1,6 @@
 import { useEffect } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
-import { Bell, Code, Fingerprint, Globe, History, Import, Info, Keyboard, KeyRound, Link2, MessageSquare, Mic, Palette, PanelsTopLeft, Server, ShieldCheck, Sparkles, SquareMousePointer, Webhook } from 'lucide-react'
+import { Bell, Code, Fingerprint, Globe, History, Import, Info, Keyboard, KeyRound, Link2, MessageSquare, Mic, Palette, PanelsTopLeft, Plug, Server, ShieldCheck, Sparkles, SquareMousePointer, Webhook } from 'lucide-react'
 import { useAppSelector } from '../store'
 import SidePanelLayout from '../components/SidePanelLayout'
 import { SUBNAV_PARAM, SUBNAV_LEGACY_PARAMS, deleteSubSelection, toPathSegment, parsePathSegments } from '../components/subNavParams'
@@ -25,6 +25,7 @@ import { ComputerUsePanel } from './settings/ComputerUsePanel'
 import { WebhooksPanel } from './settings/WebhooksPanel'
 import { PrivacyPanel } from './settings/PrivacyPanel'
 import { SecretsPanel } from './settings/SecretsPanel'
+import { ConnectionsPanel } from './settings/ConnectionsPanel'
 import SettingsSearch from './settings/SettingsSearch'
 
 import { i18nT } from '../i18n/t'
@@ -52,7 +53,7 @@ function buildTabs() {
   return [
     { key: 'overview', label: i18nT('settings.tabs.overview.label'), icon: <PanelsTopLeft size={16} />, description: i18nT('settings.tabs.overview.description') },
     { key: 'imports', label: i18nT('settings.tabs.imports.label'), icon: <Import size={16} />, description: i18nT('settings.tabs.imports.description') },
-    { key: 'chat', label: i18nT('settings.tabs.chat.label'), icon: <MessageSquare size={16} />, group: GROUP_PREFERENCES, description: i18nT('settings.tabs.chat.description') },
+    { key: 'chat', label: i18nT('settings.tabs.chat.label'), icon: <MessageSquare size={16} />, group: GROUP_PREFERENCES, description: i18nT('settings.tabs.chat.description'), hostsSubNav: true },
     { key: 'display', label: i18nT('settings.tabs.display.label'), icon: <Palette size={16} />, group: GROUP_PREFERENCES, description: i18nT('settings.tabs.display.description') },
     { key: 'voice', label: i18nT('settings.tabs.voice.label'), icon: <Mic size={16} />, group: GROUP_PREFERENCES, description: i18nT('settings.tabs.voice.description') },
     { key: 'notifications', label: i18nT('settings.tabs.notifications.label'), icon: <Bell size={16} />, group: GROUP_PREFERENCES, description: i18nT('settings.tabs.notifications.description') },
@@ -65,6 +66,7 @@ function buildTabs() {
     { key: 'instances', label: i18nT('settings.tabs.instances.label'), icon: <Server size={16} />, group: GROUP_SYSTEM, description: i18nT('settings.tabs.instances.description') },
     { key: 'privacy', label: i18nT('privacyDisclosure.settingsLabel'), icon: <Fingerprint className="lucide-inline" />, group: GROUP_SYSTEM, description: i18nT('privacyDisclosure.settingsDescription') },
     { key: 'security', label: i18nT('settings.tabs.security.label'), icon: <ShieldCheck size={16} />, group: GROUP_SYSTEM, description: i18nT('settings.tabs.security.description'), hostsSubNav: true },
+    { key: 'connections', label: i18nT('settings.tabs.connections.label'), icon: <Plug size={16} />, group: GROUP_SYSTEM, description: i18nT('settings.tabs.connections.description') },
     { key: 'secrets', label: i18nT('settings.tabs.secrets.label'), icon: <KeyRound size={16} />, group: GROUP_SYSTEM, description: i18nT('settings.tabs.secrets.description') },
     { key: 'developer', label: i18nT('settings.tabs.developer.label'), icon: <Code size={16} />, group: GROUP_SYSTEM, description: i18nT('settings.tabs.developer.description') },
     // The trailing divider fences off the entries that are not settings at all.
@@ -177,8 +179,8 @@ export default function SettingsPage() {
     navigate({ pathname: target, search: rest ? `?${rest}` : '' }, { replace: true })
   }, [search, pathname, navigate])
 
-  // An embedded instance pane can't manage remote instances (single-level by
-  // design) — hide the Instances tab so a pane can't connect onward.
+  // An embedded instance pane can't manage remote crews (single-level by
+  // design) — hide the Remote Crew tab so a pane can't connect onward.
   const embedded = isEmbeddedPane()
   // Update nudge: dot on the About entry while an update is available. Two
   // independent sources, because they cover different installs: the Electron
@@ -196,29 +198,40 @@ export default function SettingsPage() {
   // through `getAdvertisedSurfaces()`, but this tab is the surface's only
   // advertised home (it is `hiddenFromNav`), so the gate has to be applied here
   // or an unreleased page would be listed for everyone. The hook, rather than a
-  // bare `readPreviewFlag`, so toggling it in Developer > Feature Previews updates this
+  // bare `readPreviewFlag`, so toggling it in Settings > Developer > Feature Previews updates this
   // rail without a reload.
   const webhooksPreview = usePreviewFlag(PREVIEW_WEBHOOKS)
   const allTabs = buildTabs().filter(t => t.key !== 'webhooks' || webhooksPreview)
   const baseTabs = embedded ? allTabs.filter(t => t.key !== 'instances') : allTabs
   const tabs = updateAvailable ? baseTabs.map(t => (t.key === 'about' ? { ...t, dot: true } : t)) : baseTabs
 
+  const memorySelection = new URLSearchParams(search)
+  const memberMemoryView = pathname.replace(/\/$/, '') === '/settings/overview'
+    && memorySelection.get('view') === 'memory' && !!memorySelection.get('store')
+    && memorySelection.get('store') !== 'default'
+
   return (
     <SidePanelLayout
       title={i18nT('pages.settingsPage.settings')}
       tabs={tabs}
+      paneOwnsHeader={memberMemoryView}
       basePath={SETTINGS_BASE_PATH}
       headerRightDock="bottom-float"
       // Keyed apart from the main window: an embedded pane has a different tab
       // roster (no Instances), so the two must not restore each other's tab.
       rememberKey={embedded ? 'settings-embedded' : 'settings'}
+      // Desktop: search lives at the top of the sidebar rail (navTop), pinned
+      // while the tab list scrolls. Mobile: the same field is the floating
+      // bottom capsule (headerRight + bottom-float). Only one mounts per
+      // viewport, so passing both is not a double render.
+      navTop={<SettingsSearch />}
       headerRight={<SettingsSearch />}
       footer={<span className="text-[12px] text-muted">{i18nT('pages.settingsPage.kirocrew_v')}{version}</span>}
     >
       {tab => <>
         {tab === 'overview' && <OverviewPanel />}
         {tab === 'imports' && <ImportPanel />}
-        {tab === 'chat' && <ChatPanel />}
+        {tab === 'chat' && <ChatPanel basePath={SETTINGS_BASE_PATH} />}
         {tab === 'display' && <DisplayPanel />}
         {tab === 'voice' && <VoicePanel />}
         {tab === 'notifications' && <NotificationsPanel />}
@@ -231,6 +244,7 @@ export default function SettingsPage() {
         {tab === 'instances' && !embedded && <RemoteCrewPanel />}
         {tab === 'privacy' && <PrivacyPanel />}
         {tab === 'security' && <SecurityPanel basePath={SETTINGS_BASE_PATH} />}
+        {tab === 'connections' && <ConnectionsPanel />}
         {tab === 'secrets' && <SecretsPanel />}
         {tab === 'developer' && <DeveloperPanel />}
         {tab === 'releases' && <ReleasesPanel />}

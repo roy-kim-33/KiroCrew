@@ -37,7 +37,7 @@ vi.mock('../api/client', () => ({
   api: {
     taskRunnerStatus: vi.fn(),
     kirocrewAgents: vi.fn(),
-    syncKirocrewAgents: vi.fn().mockResolvedValue({}),
+    agentCatalog: vi.fn(),
     planTask: vi.fn(),
     cancelPlan: vi.fn(),
     executePlan: vi.fn(),
@@ -57,7 +57,7 @@ vi.mock('../api/client', () => ({
 
 const mkRun = (overrides: Partial<ProjectRun> = {}): ProjectRun => ({
   task_id: 'run-1', name: 'Existing', running: false, status: 'completed' as RunStatus,
-  steps: 2, completed: 1, failed: 0, skipped: 0, current_step: 1,
+  tasks: 2, completed: 1, failed: 0, skipped: 0, current_task: 1,
   spec: '', spec_name: '', error: '', tokens_used: 0, replan_count: 0,
   task_details: [], started_at: 0, finished_at: 0,
   work_dir: '', branch_name: '', spec_content: 'spec body', lessons_learned: [],
@@ -70,6 +70,7 @@ const mkRun = (overrides: Partial<ProjectRun> = {}): ProjectRun => ({
 function resetApi(runs: ProjectRun[] = []) {
   vi.mocked(api.taskRunnerStatus).mockResolvedValue({ running: false, available: true, runs })
   vi.mocked(api.kirocrewAgents).mockResolvedValue({ agents: [], default_agent: '' })
+  vi.mocked(api.agentCatalog).mockResolvedValue({ agents: [], default_agent: '' })
   vi.mocked(api.refineStatus).mockResolvedValue({ status: 'idle', text: '', error: '' })
   vi.mocked(api.planTask).mockResolvedValue({ ok: true, task_id: 'plan-1' })
   vi.mocked(api.cancelPlan).mockResolvedValue({ ok: true })
@@ -237,6 +238,8 @@ describe('ProjectsPage — refine round trip', () => {
     renderWithProviders(<ProjectsPage />)
     expect(await screen.findByRole('button', { name: 'Refine into Spec' })).toBeInTheDocument()
     expect(screen.queryByText('Refining…')).not.toBeInTheDocument()
+    // …and says why, rather than leaving the row silently un-refined.
+    expect(await screen.findByTestId('projects-refine-error')).toHaveTextContent('refine endpoint down')
   })
 })
 
@@ -265,6 +268,8 @@ describe('ProjectsPage — planning lifecycle', () => {
     fireEvent.change(screen.getByPlaceholderText('Describe your task...'), { target: { value: 'x' } })
     fireEvent.click(screen.getByRole('button', { name: 'Plan' }))
     expect(await screen.findByText('decomposer refused')).toBeInTheDocument()
+    // Rendered through the shared notice (role="alert"), not a bare red div.
+    expect(screen.getByTestId('projects-plan-error')).toHaveAttribute('role', 'alert')
   })
 
   it('shows a generic error when planTask reports failure with no message', async () => {
@@ -581,6 +586,8 @@ describe('ProjectsPage — header actions by run status', () => {
     fireEvent.click(within(header).getByRole('button', { name: 'Chat' }))
     await waitFor(() => expect(api.taskRunToChat).toHaveBeenCalledTimes(1))
     expect(screen.getByTestId('project-detail')).toBeInTheDocument()
+    // A run that was not moved is a failed action, and it says so in-page.
+    expect(await screen.findByTestId('projects-action-error')).toBeInTheDocument()
   })
 
   it('schedules a completed run as a daily cron job', async () => {

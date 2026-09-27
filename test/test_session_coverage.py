@@ -75,6 +75,10 @@ def _stub_provider(**attrs):
     base = {
         "shutdown": AsyncMock(),
         "context_usage_pct": lambda: 0.0,
+        # Declared LLMProvider capability (H14), read directly by the companion
+        # runtime kwargs mirror; the base class answers None and so does this double.
+        "tool_search_settings": None,
+        "work_scratch_dir": None,
     }
     base.update(attrs)
     return SimpleNamespace(**base)
@@ -672,11 +676,22 @@ class TestExpireIdle:
     @pytest.mark.asyncio
     async def test_an_idle_session_is_reset_not_removed(self, mgr) -> None:
         """reset() preserves the session-map entry so the next open can
-        session/load the transcript back."""
-        _register(mgr, "dashboard:1", last_used=0.0)
+        session/load the transcript back.
+
+        Expiry recycles a process and the conversation survives on disk, which is
+        exactly what ``reset`` means -- and why it is the verb here rather than
+        ``remove``. Asserting the WHOLE call keeps a later edit from reaching for an
+        ending verb, which would take the session's in-flight sub-agent runs with it.
+        The call is pinned to the entry the sweep scanned: the sub-agent probe
+        suspends before the reset, so a replacement under the same key must not be
+        reset on its verdict.
+        """
+        sess = _register(mgr, "dashboard:1", last_used=0.0)
         with patch.object(mgr, "reset", AsyncMock(return_value=True)) as reset:
             await mgr._expire_idle(1)
-        reset.assert_awaited_once_with("dashboard:1", skip_if_busy=True)
+        reset.assert_awaited_once_with(
+            "dashboard:1", expect_session=sess, skip_if_busy=True, skip_if_injecting=True
+        )
 
     @pytest.mark.asyncio
     async def test_an_orphaned_dashboard_session_ignores_the_clock(self, mgr) -> None:

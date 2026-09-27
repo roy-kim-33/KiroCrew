@@ -22,15 +22,23 @@ from typing import TYPE_CHECKING, Any
 
 from kiro_crew.acp.types import STOP_REASON_END_TURN
 from kiro_crew.config.loader import KiroCrewConfig
-from kiro_crew.dashboard.chat_utils import slot_history_key
-from kiro_crew.history import is_incognito_transcript
+from kiro_crew.dashboard.chat_utils import (
+    apply_pending_slot_memory_mode,
+    effective_session_key,
+    slot_history_key,
+)
+from kiro_crew.history import (
+    TranscriptBusy,
+    TranscriptWithheld,
+    is_incognito_transcript,
+)
 from kiro_crew.llm_helpers import _extract_json_of_type, run_bg_oneliner
 from kiro_crew.session_summary import (
     count_user_turns,
     extract_turns,
     last_activity_ts,
     normalize_payload,
-    render_input,
+    render_bounded_input,
 )
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -155,7 +163,8 @@ def _should_summarize(
     and the regeneration cadence -- because an explicit click already carries the
     consent they stand in for. It lifts none of the others: ``disabled`` is the
     feature's off switch, ``in_flight`` prevents two passes racing the same
-    sidecar, ``memory_mode`` protects a transcript that must not outlive itself,
+    sidecar, ``memory_mode`` keeps a derived artifact off a conversation that
+    learns nothing from itself,
     ``running`` keeps a turn that is still streaming from being cached as if it    had finished, and ``too_few_turns`` still holds because a two-message session
     has no intent structure to find and spending a model call to discover that is
     the waste this gate exists to prevent.
@@ -164,9 +173,9 @@ def _should_summarize(
         return "disabled"
     if getattr(slot, "_summary_in_flight", False) and not holding_guard:
         return "in_flight"
-    # An incognito/temporary session forbids deriving durable artifacts: its
-    # transcript is discarded, so persisting a summary to the .intents sidecar
-    # would leave conversation content on disk after the conversation is gone.
+    # An incognito/temporary session keeps its transcript for the user's own
+    # History but derives nothing from it: a persisted summary is exactly the
+    # kind of model-produced artifact of the conversation the mode withholds.
     if is_incognito_transcript(getattr(slot, "memory_mode", "")):
         return "memory_mode"
     # A turn IN FLIGHT has no boundary worth summarizing, and `force` cannot tell
@@ -213,9 +222,9 @@ def _parse_reply(text: str) -> object:
     """Pull a JSON object out of a model reply, tolerating fences and prose.
 
     Delegates to the shared ``llm_helpers._extract_json_of_type`` scanner
-    (fence markers are just prose to it), so a stray brace in the prose no
-    longer corrupts the extracted span the way the old outermost
-    ``find('{') .. rfind('}')`` slice did. Returns None when nothing parses —
+    (fence markers are just prose to it), so a stray brace in the prose does not
+    corrupt the extracted span the way an outermost
+    ``find('{') .. rfind('}')`` slice would. Returns None when nothing parses —
     the caller then keeps the previous cached summary — or when two DIFFERENT
     payload-shaped dicts make the choice ambiguous (the shared contract
     refuses to guess)."""
@@ -268,12 +277,12 @@ async def generate_session_summary(
         return False
 
     # Take the in-flight guard HERE -- immediately after the gate that reads it,
-    # and before every remaining await. On-demand generation gave this function a
-    # concurrent, user-driven entry point: two clicks from two clients (or a click
-    # racing a turn-end pass) both awaited the flush/mtime/read before either set
-    # the marker, so both passed the `in_flight` gate and both spent a model call.
-    # The signature guard made that safe but not free -- it prevents the second
-    # write, after the tokens are already gone.
+    # and before every remaining await. On-demand generation is a concurrent,
+    # user-driven entry point: setting the marker any later lets two clicks from
+    # two clients (or a click racing a turn-end pass) both await the
+    # flush/mtime/read, both pass the `in_flight` gate and both spend a model
+    # call. The signature guard makes that safe but not free -- it prevents only
+    # the second write, after the tokens are already gone.
     slot._summary_in_flight = True
     try:
         return await _generate_locked(state, slot, cfg, key, log, force=force)
@@ -316,6 +325,9 @@ async def _generate_locked(
     # left the slot dirty would just be re-saved by the loop moments later,
     # moving the mtime again and refusing the payload regardless.
     await asyncio.to_thread(state.flush_slot_now, slot)
+    # The flush may have folded the line's mode stricter than the slot's own;
+    # let the slot follow before the row read so the live gates agree with it.
+    apply_pending_slot_memory_mode(state, slot)
 
     # Capture the cache signature BEFORE reading the transcript. The signature
     # must be at least as old as the snapshot it stamps: any append landing
@@ -339,9 +351,21 @@ async def _generate_locked(
     # (chat_persistence caps the restore), so summarizing the in-memory tail of
     # a long session would regenerate from a truncated view and overwrite the
     # sidecar -- earlier intents would silently vanish from the panel. Disk is
-    # the same source the history endpoint serves, and extract_turns bounds
-    # what the model actually reads.
-    records = await asyncio.to_thread(log.read_messages_chained, key)
+    # the same source the history endpoint serves. render_bounded_input caps
+    # the total and keeps the first user turns that fit, then the newest ones.
+    #
+    # Through the DERIVATION seam, not the plain read: the rows come from disk,
+    # so the file's own privacy contract gates them, not only the live slot's
+    # mode the first pass checked -- another writer (a second gateway on this
+    # data home, a same-key hand-over, a subagent or cron appending) may have
+    # tightened the line while this slot still reads persistent in memory. The
+    # seam validates the line and reads the rows under one lock hold and raises
+    # instead of yielding rows a restricted (or unreadable) line governs.
+    try:
+        records = await asyncio.to_thread(log.derive_messages_chained, key)
+    except TranscriptWithheld:
+        logger.debug("Session summary skipped for %s: memory_mode (on-disk line)", key)
+        return False
     turns = extract_turns(
         records,
         assistant_excerpt_chars=cfg.session_summary.assistant_excerpt_chars,
@@ -366,13 +390,19 @@ async def _generate_locked(
         slot._summary_turn_mark = user_turns
         return False
 
-    prompt = _PROMPT + render_input(turns)
+    prompt = _PROMPT + render_bounded_input(turns)
     model = cfg.agent.resolve_model(_SUMMARY_ROLE)
     text = await run_bg_oneliner(
         state.sessions,
         prompt,
         model=model,
         sel_source="session_summary",
+        # Charged to the session being summarized, not to the shared background
+        # session that ran the call. ``effective_session_key`` rather than the
+        # transcript key above: this addresses the SESSION, and a channel-born
+        # slot's session lives under the channel's own key.
+        crew_log_kind="summary",
+        crew_log_session_key=effective_session_key(slot),
     )
     payload = normalize_payload(
         _parse_reply(text),
@@ -404,7 +434,29 @@ async def _generate_locked(
     payload["generated_at"] = time.time()
     payload["user_turns"] = user_turns
     payload["last_activity"] = last_activity_ts(turns)
-    stored = await asyncio.to_thread(log.set_cached_intent_summary, key, payload, sig, generation)
+
+    def _publish_if_derivation_is_allowed() -> bool:
+        # The model call has already returned: never hold a transcript lock
+        # across model latency. The publication seam keeps the privacy line
+        # stable through the guarded sidecar write.
+        with log.publication_hold(key):
+            return log.set_cached_intent_summary(key, payload, sig, generation)
+
+    try:
+        stored = await asyncio.to_thread(_publish_if_derivation_is_allowed)
+    except TranscriptBusy:
+        logger.debug(
+            "Discarding session summary for %s: the transcript was busy during " "summarisation",
+            key,
+        )
+        return False
+    except TranscriptWithheld:
+        logger.debug(
+            "Discarding session summary for %s: the transcript became restricted "
+            "during summarisation",
+            key,
+        )
+        return False
     if not stored:
         # The transcript was deleted or changed while the model call was in
         # flight; the write was refused so a permanent delete stays deleted.

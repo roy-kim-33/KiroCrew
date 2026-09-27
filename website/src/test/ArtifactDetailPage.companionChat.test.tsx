@@ -124,7 +124,7 @@ describe('ArtifactDetailPage companion chat', () => {
     // would append onto an archived session's history file.
     expect(call[0]).toBeUndefined()
     expect(call[5]).toBe('Artifact: CR Queue')
-    expect(call[7]).toBe('cr-queue')
+    expect(call[6]).toBe('cr-queue')
   })
 
   it('becomes interactive off the create response alone (optimistic bind)', async () => {
@@ -307,6 +307,20 @@ describe('ArtifactDetailPage companion chat', () => {
     await waitFor(() => expect(order).toEqual(['delete', 'create']))
     // Optimistic prune, or the resolver keeps picking the archived slot.
     expect(store.getState().dashboard.slots.some(s => s.key === 'chat-bound')).toBe(false)
+  })
+
+  it('holds the archived row out of a straggler frame that predates the pop (#11255)', async () => {
+    const store = createTestStore()
+    seedSlots(store, [mkSlot({ key: 'chat-bound', artifact: 'cr-queue' })])
+    renderPage(false, store)
+    await waitForLoaded()
+    fireEvent.click(screen.getByLabelText('Toggle agent chat'))
+    await waitFor(() => expect(screen.getByTestId('chat-page')).toBeInTheDocument())
+    fireEvent.click(screen.getByLabelText('New chat'))
+    await waitFor(() => expect(vi.mocked(api).createChatSlot).toHaveBeenCalledTimes(1))
+    expect(store.getState().dashboard.closingSlots['chat-bound']).toBeDefined()
+    seedSlots(store, [mkSlot({ key: 'chat-bound', artifact: 'cr-queue' }), mkSlot({ key: 'slot-new', artifact: 'cr-queue' })])
+    expect(store.getState().dashboard.slots.map(s => s.key)).toEqual(['slot-new'])
   })
 
   it('archives EVERY slot bound to the slug, not just the resolved winner', async () => {

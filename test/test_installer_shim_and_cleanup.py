@@ -22,7 +22,7 @@ Property A — the packaged launcher must resolve
 Defect B — stale predecessor MCP entries
     ``clean_stale_managed_mcp()`` only removes ``kirocrew-*`` entries unless an
     edition registers a superseded agent through the import-source seam — those
-    entries point at a runtime that no longer exists and are purgeable by the
+    entries point at a runtime that does not exist and are purgeable by the
     edition that replaced them.
 
 Both tests FAIL against the pre-fix code, proving they catch the real bug.
@@ -91,6 +91,23 @@ def _clean_context():
     """Reset the platform context after every test so registrations don't leak."""
     yield
     reset_context()
+
+
+@pytest.fixture(autouse=True)
+def _repository_boundary_at_tmp_path(tmp_path: Path) -> None:
+    """Pin the nearest repository marker for everything built under ``tmp_path``.
+
+    ``_in_linked_git_worktree`` walks up from its target to the NEAREST ``.git``
+    and answers on that marker alone, so a fixture's verdict depends on what sits
+    above ``tmp_path`` unless the fixture carries a marker of its own. pytest's
+    temp root is not guaranteed to be outside a repository: a developer's
+    ``TMPDIR=./tmp`` or the hygiene sweep's pinned scratch puts it INSIDE a
+    linked worktree, where every "no repository here" target read as a worktree
+    and every shim was declined. An ordinary-clone marker (a ``.git`` DIRECTORY)
+    at ``tmp_path`` makes the walk stop at the fixture: targets below it answer on
+    the markers the test wrote, or on this one when it wrote none.
+    """
+    (tmp_path / ".git").mkdir(exist_ok=True)
 
 
 # --------------------------------------------------------------------------
@@ -164,13 +181,12 @@ def test_resolver_finds_the_bundled_launcher(tmp_path, monkeypatch):
     resolved = agent._resolve_kirocrew_bin()
 
     assert resolved == str(launcher), (
-        "bundled app must resolve to its own launcher, not bare 'kirocrew' "
-        f"(got {resolved!r})"
+        "bundled app must resolve to its own launcher, not bare 'kirocrew' " f"(got {resolved!r})"
     )
 
 
 # --------------------------------------------------------------------------
-# Defect A — managed servers survive (no longer dropped)
+# Defect A — managed servers survive (not dropped)
 # --------------------------------------------------------------------------
 def test_managed_servers_survive_in_the_desktop_bundle(tmp_path, monkeypatch):
     """build_agent_config() must give kirocrew-core/kirocrew-cron an absolute,
@@ -321,6 +337,21 @@ def test_first_run_delivers_shim_and_purge(tmp_path, monkeypatch):
     assert "ai-community-slack-mcp" in remaining
     # one-time marker written
     assert marker.exists()
+
+
+def test_first_run_removes_a_generated_conductor_skill(tmp_path, monkeypatch):
+    exe = _fake_bundle_launcher(tmp_path)
+    _sandbox_first_run(tmp_path, monkeypatch, exe)
+    skills_root = tmp_path / "skills"
+    monkeypatch.setattr("kiro_crew.skills.skills_dir", lambda: skills_root)
+    skill = skills_root / "conductor" / "SKILL.md"
+    skill.parent.mkdir(parents=True)
+    fixture = Path(__file__).parent / "fixtures" / "retired_conductor_skill" / "select-crew-v2.md"
+    skill.write_bytes(fixture.read_bytes())
+
+    agent.run_first_run_setup()
+
+    assert not skill.parent.exists()
 
 
 def test_first_run_purge_is_one_time(tmp_path, monkeypatch):
@@ -519,7 +550,9 @@ def test_ensure_shim_noop_when_already_on_path(tmp_path, monkeypatch):
 # `git worktree remove` deletes the tree's .venv with it, so a shim pointing
 # there dangles and `kirocrew` breaks machine-wide, not just in that tree.
 # --------------------------------------------------------------------------
-def _checkout_with_kirocrew(root: Path, *, linked_worktree: bool, bare_parent: bool = False) -> Path:
+def _checkout_with_kirocrew(
+    root: Path, *, linked_worktree: bool, bare_parent: bool = False
+) -> Path:
     """Build a fake checkout at *root* whose venv holds a `kirocrew` entrypoint.
 
     ``linked_worktree`` chooses the repository marker: a ``.git`` FILE with a
@@ -533,9 +566,7 @@ def _checkout_with_kirocrew(root: Path, *, linked_worktree: bool, bare_parent: b
     binary.write_text("#!/bin/sh\nexit 0\n")
     binary.chmod(0o755)
     if linked_worktree:
-        git_dir = (
-            f"{root.parent}/myrepo.git" if bare_parent else f"{root.parent}/main/.git"
-        )
+        git_dir = f"{root.parent}/myrepo.git" if bare_parent else f"{root.parent}/main/.git"
         (root / ".git").write_text(f"gitdir: {git_dir}/worktrees/{root.name}\n")
     else:
         (root / ".git").mkdir()
@@ -556,7 +587,8 @@ def test_in_linked_git_worktree_distinguishes_marker_kind(tmp_path):
 
     assert agent._in_linked_git_worktree(wt) is True
     assert agent._in_linked_git_worktree(clone) is False
-    # Not a repository at all — nothing to decline.
+    # No marker of its own: the walk answers on the ordinary-clone boundary the
+    # module fixture pins at tmp_path, so there is nothing to decline.
     assert agent._in_linked_git_worktree(tmp_path / "nowhere" / "bin" / "kirocrew") is False
 
 
@@ -564,9 +596,7 @@ def test_in_linked_git_worktree_matches_a_bare_repo_pointer(tmp_path):
     """A bare repo's git dir IS the repo dir, so its worktree pointer carries no
     `.git` component (`/…/myrepo.git/worktrees/<name>`). Matching on `/.git/`
     would miss it and reopen the bypass."""
-    wt = _checkout_with_kirocrew(
-        tmp_path / "wt-from-bare", linked_worktree=True, bare_parent=True
-    )
+    wt = _checkout_with_kirocrew(tmp_path / "wt-from-bare", linked_worktree=True, bare_parent=True)
     pointer = (tmp_path / "wt-from-bare" / ".git").read_text()
     assert "/.git/worktrees/" not in pointer, "fixture must reproduce the bare shape"
 
@@ -678,6 +708,15 @@ def test_clean_stale_malformed_json_untouched(tmp_path, monkeypatch):
     assert p.read_text(encoding="utf-8") == "{ not valid json "  # left untouched
 
 
+def test_clean_stale_non_object_json_untouched(tmp_path, monkeypatch):
+    p = tmp_path / "mcp.json"
+    p.write_text("[]", encoding="utf-8")
+    monkeypatch.setattr(mcp_cleanup, "_KIRO_MCP_JSON", p)
+
+    assert mcp_cleanup.clean_stale_managed_mcp() == []
+    assert p.read_text(encoding="utf-8") == "[]"
+
+
 def test_clean_stale_no_stale_leaves_file_untouched(tmp_path, monkeypatch):
     p = tmp_path / "mcp.json"
     content = json.dumps(
@@ -764,6 +803,44 @@ def test_rebuild_purge_drops_proxy_entry_even_when_marker_exists(tmp_path):
     assert "@playwright-mcp" not in config["tools"]
     assert "@playwright-mcp" not in config["allowedTools"]
     assert "@user-server" in config["tools"]
+
+
+def test_rebuild_purge_strips_the_per_tool_spelling_and_duplicates(tmp_path):
+    """The purge strips EVERY ref the deleted server owns, once and all.
+
+    ``@playwright-mcp/browser_navigate`` is a grant on the same server, and
+    ``allowedTools`` never reaches the PreToolUse gate, so a per-tool entry
+    surviving the purge is a live auto-approval on the deleted proxy's name. A
+    duplicated ref must go too. ``@playwright-mcpx`` shares the prefix without
+    the ``/`` boundary and belongs to another server, so it keeps its refs --
+    the control proving the removal is bounded to this server's spellings.
+    """
+    config: dict = {
+        "mcpServers": {
+            "playwright-mcp": {
+                "command": "kirocrew",
+                "args": ["mcp-playwright-proxy"],
+            },
+            "playwright-mcpx": {"command": "npx", "args": ["some-tool"]},
+        },
+        "tools": [
+            "@playwright-mcp",
+            "@playwright-mcp/browser_navigate",
+            "@playwright-mcp/browser_navigate",
+            "@playwright-mcpx",
+        ],
+        "allowedTools": [
+            "@playwright-mcp/browser_navigate",
+            "@playwright-mcp/browser_navigate",
+            "@playwright-mcpx",
+            "@playwright-mcpx/keep",
+        ],
+    }
+    removed = mcp_cleanup.purge_deleted_proxy_from_config(config)
+
+    assert removed == ["playwright-mcp"]
+    assert config["tools"] == ["@playwright-mcpx"]
+    assert config["allowedTools"] == ["@playwright-mcpx", "@playwright-mcpx/keep"]
 
 
 def test_rebuild_purge_leaves_operator_playwright_server_untouched():
@@ -1038,7 +1115,7 @@ def test_gateway_start_replaces_launcher_whose_interpreter_vanished(tmp_path, mo
     """The launcher file exists but its venv was reaped: dead, so replaceable.
 
     This is the shape that made the live host's `kirocrew` fail -- a readable,
-    executable console script whose interpreter no longer exists.
+    executable console script whose interpreter does not exist.
     """
     exe = _fake_bundle_launcher(tmp_path)
     _simulate_bundled_app_honest(monkeypatch, tmp_path, exe)

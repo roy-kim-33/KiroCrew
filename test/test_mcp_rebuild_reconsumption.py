@@ -1,4 +1,4 @@
-"""#4955: a rebuild must not consume its own previous output.
+"""A rebuild must not consume its own previous output.
 
 The agent spec is this rebuild's output AND one of its inputs. The resolved
 absolute ``command`` in it is computed, not authored, so reading it back as the
@@ -24,7 +24,25 @@ import pytest
 from mcp_merge_helpers import bundled_defaults as _bundled_defaults
 from mcp_merge_helpers import run_install_mcp_merge as _run_install_mcp_merge
 
+from kiro_crew.kiro_cli import SPEC_PERMISSIONS_MIN_VERSION
 from kiro_crew.mcp_provenance import DERIVED_KEY
+
+
+@pytest.fixture(autouse=True)
+def _pinned_kiro_cli_version(monkeypatch):
+    """Pin the kiro-cli release the spec ``permissions`` gate believes is installed.
+
+    Every rebuild here ends in ``_write_derived_permissions``, which reads
+    ``installed_kiro_cli_version`` function-locally from ``kiro_crew.kiro_cli``:
+    one real ``kiro-cli --version`` spawn per binary identity, process-cached, so
+    whichever test in the worker rebuilds first pays it against the HOST's install
+    with the checkout as the child's cwd. Pinned to the floor release, as
+    ``test_agent.py`` and the generated-writer suites pin it.
+    """
+    monkeypatch.setattr(
+        "kiro_crew.kiro_cli.installed_kiro_cli_version",
+        lambda: SPEC_PERMISSIONS_MIN_VERSION,
+    )
 
 
 def _emitted(tmp_path: Path, cfg_dir: Path, kiro_servers: dict, **kw) -> dict:
@@ -129,7 +147,7 @@ class TestAnAgentOnlyCommandIsReDerived:
         )
         assert first["s"]["command"] == str(target)
 
-        # "srv" no longer resolves; the emitted absolute path still exists.
+        # "srv" does not resolve; the emitted absolute path still exists.
         second = _emitted(tmp_path, cfg_dir, {}, which_side_effect=lambda c, **kw: None)
         assert "s" in second, "the server was dropped, and this file was its only copy"
         assert second["s"]["command"] == str(target)
@@ -262,7 +280,7 @@ class TestUserEditsAreNotOverwritten:
     """Provenance must protect a hand edit, not undo it."""
 
     def test_a_hand_edited_command_is_left_alone(self, tmp_path: Path, monkeypatch) -> None:
-        """If the stored value is no longer ours, the user owns it.
+        """If the stored value is not ours, the user owns it.
 
         Same rule the entry-level marker applies: an entry we cannot prove we wrote
         is never rewritten. At field level the proof is that the stored value is

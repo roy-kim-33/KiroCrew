@@ -91,6 +91,16 @@ describe('ErrorBoundary', () => {
     expect(screen.queryByText('Something went wrong')).not.toBeInTheDocument()
   })
 
+  it('a function fallback receives the caught error', () => {
+    // For a custom fallback that mounts AskAgentButton itself: the button keys
+    // its journal lookup on the error's message, which a static node cannot see.
+    render(
+      <ErrorBoundary fallback={error => <div>zzq-custom|{error.message}</div>}><Boom shouldThrow /></ErrorBoundary>,
+    )
+    expect(screen.getByText('zzq-custom|zzq-render-broke')).toBeInTheDocument()
+    expect(screen.queryByText('Something went wrong')).not.toBeInTheDocument()
+  })
+
   it('the route fallback offers Ask-the-agent plus a recovering Try Again', () => {
     const { rerender } = render(<ErrorBoundary><Boom shouldThrow /></ErrorBoundary>)
     expect(screen.getByText('zzq-ask|zzq-render-broke')).toBeInTheDocument()
@@ -144,5 +154,18 @@ describe('ErrorBoundary', () => {
     }
     render(<ErrorBoundary><Nameless /></ErrorBoundary>)
     expect(vi.mocked(recordError).mock.calls[0][0]).toMatchObject({ message: 'ZzqNamedError' })
+  })
+
+  it('retryOnly suppresses the Ask-the-agent hand-off but keeps Try Again', () => {
+    // Inside an editor holding unsaved state (the crew sheet's template pane),
+    // the hand-off is a hard navigation that discards the draft — retryOnly is
+    // the contract that a contained crash cannot turn into data loss.
+    const { rerender } = render(
+      <ErrorBoundary retryOnly><Boom shouldThrow /></ErrorBoundary>,
+    )
+    expect(screen.queryByRole('button', { name: 'Ask the agent' })).not.toBeInTheDocument()
+    rerender(<ErrorBoundary retryOnly><Boom shouldThrow={false} /></ErrorBoundary>)
+    fireEvent.click(screen.getByRole('button', { name: 'Try Again' }))
+    expect(screen.getByText('zzq-recovered')).toBeInTheDocument()
   })
 })

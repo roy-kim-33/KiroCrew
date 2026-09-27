@@ -1,7 +1,7 @@
 """Name-grant verification on every surface that honours a name-based grant.
 
 The check refuses to honour a name-based shell auto-approve when a program
-name in the command no longer resolves to the program it appears to name
+name in the command does not resolve to the program it appears to name
 (a PATH-shadowing shim, an agent-writable tree, an unwitnessed file). It was
 originally wired into the dashboard chat loop only; these tests pin that the
 task runner, subagents, the channel turn driver, and the native Slack handler
@@ -37,6 +37,7 @@ from kiro_crew.acp.types import (
     AcpEvent,
 )
 from kiro_crew.context import ContextBuilder
+from kiro_crew.execution_context import execution_for_store
 from kiro_crew.hooks import TOOL_AUTO_APPROVE, HookManager, ToolHookResult
 from kiro_crew.messaging import (
     APPROVAL_INTERACTIVE,
@@ -49,6 +50,34 @@ from kiro_crew.providers.base import LLMEvent
 from kiro_crew.task_models import Project, Task
 
 _REFUSAL = name_grant.Refusal(name_grant.SHADOWED, "head resolves to a shadowing file")
+
+
+@pytest.fixture(autouse=True)
+def _close_subagent_managers(monkeypatch):
+    """Close every ``SubagentManager`` built in a test.
+
+    Construction opens the durable task queue (a SQLite connection and its
+    writer thread); nothing in these unit tests closes it, so each manager
+    leaked those descriptors. Track every instance and release it at teardown.
+    """
+    import kiro_crew.subagent as _subagent_mod
+
+    created = []
+    orig_init = _subagent_mod.SubagentManager.__init__
+
+    def _tracking_init(self, *args, **kwargs):
+        orig_init(self, *args, **kwargs)
+        created.append(self)
+
+    monkeypatch.setattr(_subagent_mod.SubagentManager, "__init__", _tracking_init)
+    try:
+        yield
+    finally:
+        for mgr in created:
+            try:
+                mgr.close()
+            except Exception:
+                pass
 
 
 def _stub_verdict(monkeypatch, refusal):
@@ -332,6 +361,8 @@ class TestSubagentSurface:
         sessions = MagicMock()
         sessions.get_or_create = AsyncMock(return_value=(provider, True, False))
         sessions.get_approval_policy = MagicMock(return_value="")
+        sessions.get_agent = MagicMock(return_value="")
+        sessions.get_agent_selection = MagicMock(return_value=("template", ""))
         sessions.release_subagent_runtime = AsyncMock()
 
         ctx = MagicMock()
@@ -339,7 +370,13 @@ class TestSubagentSurface:
         ctx.hooks.on_tool_call = MagicMock(return_value=ToolHookResult(action=TOOL_AUTO_APPROVE))
 
         manager = SubagentManager(sessions=sessions, ctx_builder=ctx, default_turn_limit=1)
-        info = SubagentInfo(id="ng01", task="t", parent_session_key="dashboard:default")
+        info = SubagentInfo(
+            execution_context=execution_for_store(""),
+            id="ng01",
+            task="t",
+            parent_session_key="dashboard:default",
+        )
+        manager._log_spawned(info)
         manager._agents["ng01"] = info
         return manager, info, provider
 
@@ -578,7 +615,7 @@ class TestTurnDriverSurface:
 
 class TestSpawnRungEventIdentity:
     """The ``auto_approve_subagent_spawn`` rung keys on canonical event
-    identity, never the model-authored title (issue #6506).
+    identity, never the model-authored title.
 
     Pinned through the real ``build_auto_approve`` predicate on the shared
     driver honour point, using this file's event doubles. Both directions per

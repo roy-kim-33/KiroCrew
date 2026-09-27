@@ -17,6 +17,7 @@ import pytest
 
 from conftest import requires_symlinks
 from kiro_crew.acp import liveness
+from kiro_crew.acp._dispatch import _dumps_degraded, _redact
 from kiro_crew.acp.liveness import (
     CHILD_EXIT_GRACE_SECS,
     EVIDENCE_ESTABLISHED_FLAT,
@@ -28,6 +29,7 @@ from kiro_crew.acp.liveness import (
     LivenessOracle,
     ToolCallState,
     consult_offloaded,
+    match_fragment,
 )
 
 
@@ -205,7 +207,121 @@ def test_no_matching_child_is_unknown(tmp_path):
     assert "no matching" in evidence
 
 
-# ── The never-matched fork: absent child vs unrecognized live child (#4840) ──
+# ── Command matching against the cached JSON rendering ──
+#
+# The dispatch layer caches a dict tool input as its indented JSON rendering,
+# redacted, and that string is what ``ToolCallState.command`` carries. The child
+# runs the command TEXT (``bash -c <command>``), so a match key taken from the
+# rendering must be taken from the decoded ``command`` value: in the rendering a
+# newline is the two characters ``\n``, and a fragment cut at the backslash
+# begins with a stray ``n`` that no real cmdline contains.
+
+_MULTI_LINE_LONGEST_LAST = (
+    "echo start\n"
+    "for i in $(seq 1 20); do sleep 15; done; echo this-line-is-longer-than-the-first-one-on-purpose"
+)
+_MULTI_LINE_LONGEST_FIRST = (
+    "echo this-first-line-is-deliberately-the-longest-one-here\n"
+    "for i in $(seq 1 20); do sleep 15; done"
+)
+_SINGLE_LINE = (
+    "for i in $(seq 1 20); do sleep 15; done; echo this-line-is-longer-than-the-first-one-on-purpose"
+)
+
+
+def _cached_shell_input(command: str) -> str:
+    """*command* exactly as the dispatch layer caches it for the oracle."""
+    return _redact(_dumps_degraded({"command": command, "summary": "probe"}, indent=2))
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        pytest.param(
+            _MULTI_LINE_LONGEST_LAST,
+            "for i in $(seq 1 20); do sleep 15; done; echo this-line-is-longer-than-the-first-one-on-purpose",
+            id="multi-line-longest-line-not-first",
+        ),
+        pytest.param(
+            _MULTI_LINE_LONGEST_FIRST,
+            "echo this-first-line-is-deliberately-the-longest-one-here",
+            id="multi-line-longest-line-first",
+        ),
+        pytest.param(_SINGLE_LINE, _SINGLE_LINE, id="single-line"),
+    ],
+)
+def test_match_fragment_is_a_line_of_the_decoded_command(command, expected):
+    """The fragment is a verbatim line of the command, whichever line is longest.
+
+    Every fragment must be a substring of the child's real cmdline, which
+    carries the command text with its newlines intact.
+    """
+    fragment = match_fragment(_cached_shell_input(command))
+
+    assert fragment == expected
+    assert fragment in "bash -c " + command
+
+
+def test_redaction_marker_inside_the_rendering_still_splits_the_fragment():
+    """A redacted span never reaches the fragment: the child's cmdline holds the
+    real bytes, so the key is taken from the text on either side of the marker."""
+    cached = (
+        '{\n  "command": "curl -H \\"Authorization: [REDACTED: credential]\\" '
+        'https://example.invalid/results; sleep 300",\n  "summary": "probe"\n}'
+    )
+    child = 'bash -c curl -H "Authorization: Bearer real-token-value" https://example.invalid/results; sleep 300'
+
+    fragment = match_fragment(cached)
+
+    assert fragment == "https://example.invalid/results; sleep 300"
+    assert fragment in child
+
+
+def test_argv_list_command_keeps_the_rendering_wide_split():
+    """A ``command`` that is not a string (an argv array) has no text to decode,
+    so the rendering itself is fragmented, as for any plain-text input."""
+    cached = _dumps_degraded(
+        {"command": ["bash", "-lc", "long-build release > build.log 2>&1"]}, indent=2
+    )
+
+    assert match_fragment(cached) == "long-build release > build.log 2>&1"
+
+
+def test_multi_line_command_cached_as_json_matches_its_live_shell_child(tmp_path):
+    """End to end: a running multi-line command whose longest line is not its
+    first is WORKING, not ``no matching shell child``."""
+    clock = _Clock()
+    fake = FakeProc(tmp_path / "proc")
+    fake.add_pid(100, children=[200], cmdline="kiro-cli acp")
+    fake.add_pid(200, cmdline="bash -c " + _MULTI_LINE_LONGEST_LAST)
+    oracle = _oracle(fake, clock)
+    tool = _shell_tool(_cached_shell_input(_MULTI_LINE_LONGEST_LAST), clock)
+
+    verdict, evidence = oracle.check_tool(100, tool)
+
+    assert verdict == VERDICT_WORKING, evidence
+    assert "200" in evidence
+
+
+def test_a_lookalike_sharing_only_the_program_name_is_not_bound(tmp_path):
+    """Decoding serves the fragment key alone. The program-name key stays cut
+    from the rendering, where it reads nothing, so a JSON-rendered input never
+    binds a sibling's child of the same interpreter: under a shared runtime that
+    child's exit would read as this command's death and cancel a healthy turn."""
+    clock = _Clock()
+    fake = FakeProc(tmp_path / "proc")
+    fake.add_pid(100, children=[200], cmdline="kiro-cli acp")
+    fake.add_pid(200, cmdline="python3 -m pytest test/test_other_thing.py -n0")
+    oracle = _oracle(fake, clock)
+    tool = _shell_tool(_cached_shell_input("python3 tools/update_index.py --rebuild --quiet"), clock)
+
+    verdict, evidence = oracle.check_tool(100, tool)
+
+    assert verdict == VERDICT_UNKNOWN
+    assert evidence == "no matching shell child", evidence
+
+
+# ── The never-matched fork: absent child vs unrecognized live child ──
 
 # Dating a process against its dispatch needs the platform tick rate, which does
 # not exist off Linux (Windows has no os.sysconf, and no /proc for the oracle to
@@ -265,7 +381,7 @@ def test_tick_rate_lookup_survives_a_platform_without_sysconf(monkeypatch):
 
 @_needs_tick_rate
 def test_absent_shell_child_is_tagged_when_every_descendant_predates_dispatch(tmp_path):
-    """#4840: the sub-second command whose result frame was lost.
+    """The sub-second command whose result frame was lost.
 
     The oracle's first look happens at check_after_secs, by which time an ``ls |
     grep | wc`` child is long gone — it is never observed alive, so the
@@ -784,7 +900,7 @@ def test_model_wait_flat_with_established_socket_is_unknown_tagged(tmp_path):
     assert evidence.startswith(EVIDENCE_ESTABLISHED_FLAT)
 
 
-# ── Portable model-wait fallback (no procfs) — issue #8520 ───────────────────
+# ── Portable model-wait fallback (no procfs) ───────────────────
 #
 # macOS and Windows have no ``/proc``, so the tree walk reads NO counter at all
 # and the verdict was "unknown: no readable counters" — which the AcpClient's
@@ -1027,3 +1143,96 @@ async def test_consult_offloaded_consumes_a_failed_priors_exception():
         assert prior.exception() is not None
     finally:
         pool.shutdown(wait=True)
+
+
+# ── Platform degradation: no procfs and no tree backend (Windows) ────────────
+
+
+def _no_backend_oracle(tmp_path, clock: _Clock, monkeypatch) -> LivenessOracle:
+    """An oracle on a host with neither ``/proc`` nor libproc.
+
+    ``select_darwin_backend`` reads ``sys.platform`` at call time, so pinning it
+    to ``win32`` with an absent proc_root yields the Windows shape on any host.
+    """
+    monkeypatch.setattr(liveness.sys, "platform", "win32")
+    return LivenessOracle(str(tmp_path / "no-proc"), now=clock, sample_min_secs=1.0)
+
+
+def test_shell_tool_without_a_tree_backend_is_unknown_tagged_platform_limited(
+    tmp_path, monkeypatch
+):
+    """No tree at all: the shell verdict is UNKNOWN and SAYS why, so the caller's
+    budget — not "alive, therefore forever" and not a guessed DEAD — bounds it."""
+    clock = _Clock()
+    oracle = _no_backend_oracle(tmp_path, clock, monkeypatch)
+    tool = _shell_tool("long-build release", clock)
+
+    verdict, evidence = oracle.check_tool(4242, tool)
+    assert verdict == VERDICT_UNKNOWN
+    assert evidence.startswith(liveness.EVIDENCE_PLATFORM_LIMITED)
+    assert "no process-tree backend" in evidence
+    # Stable across ticks: nothing can ever be matched or dated here.
+    clock.advance(600.0)
+    verdict, evidence = oracle.check_tool(4242, tool)
+    assert verdict == VERDICT_UNKNOWN
+    assert evidence.startswith(liveness.EVIDENCE_PLATFORM_LIMITED)
+
+
+def test_mcp_tool_without_a_tree_backend_is_unknown_tagged_platform_limited(
+    tmp_path, monkeypatch
+):
+    clock = _Clock()
+    oracle = _no_backend_oracle(tmp_path, clock, monkeypatch)
+    tool = ToolCallState(
+        title="kirocrew-core___spawn_run",
+        command='{"task": "x"}',
+        dispatch_ts=clock.t,
+        dispatch_boot_ts=clock.t,
+        is_shell=False,
+        tool_name="spawn_run",
+    )
+
+    verdict, evidence = oracle.check_tool(4242, tool)
+    assert verdict == VERDICT_UNKNOWN
+    assert evidence.startswith(liveness.EVIDENCE_PLATFORM_LIMITED)
+    assert "mcp subtree unobservable" in evidence
+
+
+def test_wait_tool_contract_holds_without_a_tree_backend(tmp_path, monkeypatch):
+    """The declared-duration contract needs no process evidence, so the wait
+    tool is WORKING on every platform for its declared span."""
+    clock = _Clock()
+    oracle = _no_backend_oracle(tmp_path, clock, monkeypatch)
+    tool = ToolCallState(
+        title="kirocrew-core___wait",
+        command='{"seconds": 300}',
+        dispatch_ts=clock.t,
+        is_shell=False,
+    )
+    assert oracle.check_tool(4242, tool)[0] == VERDICT_WORKING
+
+
+def test_model_wait_without_a_tree_backend_never_reads_dead(tmp_path, monkeypatch):
+    """The portable probe can only forgive silence: no counter is never proof of
+    death, and the caller reaps on UNKNOWN anyway."""
+    clock = _Clock()
+    oracle = _no_backend_oracle(tmp_path, clock, monkeypatch)
+    monkeypatch.setattr(liveness.platform_compat, "proc_cpu_nanos_for_pid", lambda pid: None)
+    verdict, _ = oracle.check_model_wait(4242)
+    assert verdict == VERDICT_UNKNOWN
+    clock.advance(30.0)
+    verdict, _ = oracle.check_model_wait(4242)
+    assert verdict == VERDICT_UNKNOWN
+
+
+def test_a_readable_proc_tree_is_never_platform_limited(tmp_path):
+    """The tag is exclusively for hosts with no tree: on ``/proc`` an unmatched
+    shell keeps its existing evidence strings."""
+    clock = _Clock()
+    fake = FakeProc(tmp_path / "proc")
+    fake.add_pid(100, children=[])
+    oracle = _oracle(fake, clock)
+    tool = _shell_tool("long-build release", clock)
+    verdict, evidence = oracle.check_tool(100, tool)
+    assert verdict == VERDICT_UNKNOWN
+    assert not evidence.startswith(liveness.EVIDENCE_PLATFORM_LIMITED)

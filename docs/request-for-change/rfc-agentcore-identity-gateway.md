@@ -1,10 +1,10 @@
 ---
 title: AgentCore Identity and Gateway — Crew agent identity and token vending
-status: draft
+status: partial
 author: kyle
 created: 2026-08-27
-last-audited: 2026-08-27
-audited-at: 152c00e99
+last-audited: 2026-09-22
+audited-at: 80bd0a81f
 doc-pr:
 implementation-prs: []
 tracking-issues: []
@@ -13,6 +13,11 @@ superseded-by: []
 ---
 
 # RFC: AgentCore Identity and Gateway — Crew agent identity and token vending
+
+Status: partial. The AWS-free `AgentIdentityProvider` CPP slot, public no-op,
+policy validators, and default-off `capabilities.agentcore` governance row are
+on main. The AWS adapter, IAM document helpers, Gateway session attachment,
+consent flow, and Settings surfaces are not present at `80bd0a81f`.
 
 ## Summary
 
@@ -40,7 +45,7 @@ This is the **identity and credential** plane. It is not the sandbox /
 execution plane in the sibling AgentCore sandboxes design.
 
 **Implementation plan:**
-[`../superpowers/plans/2026-08-27-agentcore-identity-gateway.md`](../superpowers/plans/2026-08-27-agentcore-identity-gateway.md)
+[`plans/2026-08-27-agentcore-identity-gateway.md`](plans/2026-08-27-agentcore-identity-gateway.md)
 
 ## Motivation
 

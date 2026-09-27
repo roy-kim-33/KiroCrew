@@ -90,6 +90,32 @@ class TestFileLockNonBlocking:
         job = svc.add_job(name="j", message="m", every_secs=60)
         assert svc.get_job(job.id) is not None
 
+    def test_file_lock_open_does_not_truncate(self, tmp_path: Path) -> None:
+        """``_file_lock`` must open the lock file WITHOUT truncating it.
+
+        A truncating open (``"w"``) empties the lock file before the
+        ``try_acquire_lock`` spin ever runs. On Windows a truncating open of a
+        file whose first byte another holder has under ``msvcrt.locking``
+        raises a sharing violation (``PermissionError``) at ``open()`` time, so
+        a contending acquirer crashes instead of spinning until release; POSIX
+        ``flock`` tolerates it, hiding the defect on Linux. Seeding the file
+        and asserting the bytes survive a real acquire/release cycle fails on
+        EVERY platform if a truncating open comes back (same class as
+        ``work_ledger._open_lock``).
+
+        The seeded bytes are checked only AFTER release: ``msvcrt.locking`` is
+        a mandatory lock on byte 0, so reading the file while the lock is held
+        would itself raise ``PermissionError`` on Windows.
+        """
+        svc = CronService(base_dir=tmp_path)
+        svc._dir.mkdir(parents=True, exist_ok=True)
+        lock = svc._dir / ".crons.lock"
+        seed = b"seeded-lock-bytes"
+        lock.write_bytes(seed)
+        with svc._file_lock(timeout=1.0):
+            pass
+        assert lock.read_bytes() == seed, "lock file truncated at open()"
+
 
 # ── Bug 2: unlocked read paths racing the remove worker ──
 
@@ -137,7 +163,7 @@ class TestReadPathsLocked:
     def test_reads_never_block_even_while_store_lock_held(self, tmp_path: Path) -> None:
         """Cache-only reads return promptly even while the store lock is held.
 
-        The read paths no longer touch the lock at all, so a mutator holding
+        The read paths do not touch the lock at all, so a mutator holding
         the store lock from a separate open description can never delay or
         block a read.
         """
@@ -253,7 +279,7 @@ class TestReadPathsLocked:
         assert all(t != loop_thread for t in sync_threads), (
             "the tick's _sync() must run in a worker thread, never on the event loop"
         )
-        assert not svc._executing and not svc._running_tasks, "premise: nothing due"
+        assert not svc._claims, "premise: nothing due"
 
         svc._running = False
         if svc._timer_task and not svc._timer_task.done():
@@ -950,12 +976,11 @@ class TestMergeResultOffLoop:
 
         tick_task = asyncio.create_task(ticker())
         try:
-            svc._executing.add(job.id)
-            svc._job_run_meta[job.id] = (time.time(), "scheduled")
+            claim = svc._claim_run(job.id, "scheduled")
             # The merge will raise CronStoreBusy inside to_thread (contended);
             # _run_job_isolated swallows it (best-effort) and completes without
             # ever parking the loop.
-            await svc._run_job_isolated(job)
+            await svc._run_job_isolated(job, claim)
             # Sampled before the ticker is stopped: counting ticks that ran after
             # the merge returned would hold even for a merge that parked the loop.
             ticks_during_merge = ticks
@@ -981,9 +1006,8 @@ class TestMergeResultOffLoop:
 
         svc._on_job = on_job
         job = svc.add_job(name="j", message="m", every_secs=60)
-        svc._executing.add(job.id)
-        svc._job_run_meta[job.id] = (time.time(), "scheduled")
-        await svc._run_job_isolated(job)
+        claim = svc._claim_run(job.id, "scheduled")
+        await svc._run_job_isolated(job, claim)
 
         # A fresh service reading the same store sees the persisted last_run_ts.
         reloaded = CronService(base_dir=tmp_path)
@@ -1044,11 +1068,10 @@ class TestDeferredRemoval:
             assert not svc._pending_removals
             assert CronService(base_dir=tmp_path).get_job(job.id) is None
             # Never re-fired: no run task spawned, nothing marked executing.
-            assert job.id not in svc._executing
-            assert job.id not in svc._running_tasks
+            assert job.id not in svc._claims
         finally:
             svc._running = False
-            for t in list(svc._running_tasks.values()):
+            for t in [c.task for c in svc._claims.values() if c.task is not None]:
                 t.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await t
@@ -1073,10 +1096,10 @@ class TestDeferredRemoval:
         try:
             await svc._on_timer()
             assert svc.get_job(job.id) is None
-            assert job.id not in svc._executing
+            assert job.id not in svc._claims
         finally:
             svc._running = False
-            for t in list(svc._running_tasks.values()):
+            for t in [c.task for c in svc._claims.values() if c.task is not None]:
                 t.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await t
@@ -1171,9 +1194,8 @@ class TestTerminalStateMergeLocked:
         assert {j.id for j in svc._jobs} == {running.id}, "premise: snapshot is stale"
 
         # Reap the running job.
-        svc._executing.add(running.id)
-        svc._job_run_meta[running.id] = (time.time(), "scheduled")
-        await svc._force_reap(running.id, 5.0, 1)
+        claim = svc._claim_run(running.id, "scheduled")
+        await svc._force_reap(running.id, 5.0, 1, claim=claim)
 
         # A fresh reader must see BOTH jobs; the reap recorded its error state.
         reloaded = CronService(base_dir=tmp_path)
@@ -1197,8 +1219,7 @@ class TestTerminalStateMergeLocked:
             added = other.add_job(name="added-by-worker", message="m", every_secs=60)
             assert {j.id for j in svc._jobs} == {running.id}
 
-            svc._executing.add(running.id)
-            svc._job_run_meta[running.id] = (time.time(), "scheduled")
+            svc._claim_run(running.id, "scheduled")
             ok = await svc.cancel(running.id)
             assert ok is True
 
@@ -1253,11 +1274,10 @@ class TestTerminalStateMergeLocked:
 
         tick_task = asyncio.create_task(ticker())
         try:
-            svc._executing.add(job.id)
-            svc._job_run_meta[job.id] = (time.time(), "scheduled")
+            claim = svc._claim_run(job.id, "scheduled")
             # The merge raises CronStoreBusy inside to_thread (store contended);
             # _force_reap swallows it (best-effort) and never parks the loop.
-            await svc._force_reap(job.id, 5.0, 1)
+            await svc._force_reap(job.id, 5.0, 1, claim=claim)
             # Sampled before the ticker is stopped: counting ticks that ran after
             # the reap returned would hold even for a reap that parked the loop.
             ticks_during_merge = ticks

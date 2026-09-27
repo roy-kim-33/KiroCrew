@@ -1,7 +1,9 @@
 import { useState } from 'react'
 import QuestionCard from './QuestionCard'
+import ErrorNotice from './ErrorNotice'
+import { i18nT } from '../i18n/t'
 import { useAppDispatch, useAppSelector } from '../store'
-import { clearQuestionCard, pendingQuestionFor, resolveQuestionCard, retireStatelessQuestion, setQuestionDraft } from '../store/chatSlice'
+import { clearQuestionCard, pendingQuestionFor, resolveQuestionCard, setQuestionDraft } from '../store/chatSlice'
 import { api, ApiError } from '../api/client'
 
 interface PendingQuestionCardProps {
@@ -52,6 +54,17 @@ export default function PendingQuestionCard({ slotKey, onFallbackSend, onDirectS
      against the current ask makes a new card self-clearing, and also stops a
      stale in-flight response from locking it. */
   const [busyFor, setBusyFor] = useState<string | null>(null)
+  // Why the last answer / dismiss did NOT land, for the retryable branches
+  // below. They used to keep the card with no message at all, so a user whose
+  // answer had silently failed saw the same card and did not know to retry.
+  // Like `busyFor`, this component stays mounted across cards, so the notice
+  // is reset whenever a request starts and dismissed with the card it names.
+  //
+  // Keyed by the identity of the request that FAILED (the same `lockKey` the
+  // busy guard uses), and rendered only while that identity is still the card
+  // on screen: a request for card A that rejects after card B has replaced it
+  // in the slot must not paint A's failure under B.
+  const [failure, setFailure] = useState<{ id: string; message: string } | null>(null)
   if (!pending) return null
 
   const cardSlot = pending.slot
@@ -75,6 +88,8 @@ export default function PendingQuestionCard({ slotKey, onFallbackSend, onDirectS
   const resolve = (answers: Record<string, string> | undefined) => {
     if (!askId || busy) return
     setBusyFor(askId)
+    setFailure(null)
+    const failureId = lockKey
     api
       .answerQuestion(askId, answers)
       .then(() => clearThisCard())
@@ -93,7 +108,8 @@ export default function PendingQuestionCard({ slotKey, onFallbackSend, onDirectS
         // Anything else (offline, 5xx, tunnel throttle) is retryable and the
         // agent is almost certainly STILL blocked. Keep the card so the user can
         // retry: clearing it would strand the tool call and start a second turn
-        // it could never join.
+        // it could never join — and SAY so, or the retry never happens.
+        setFailure({ id: failureId, message: i18nT('components.pendingQuestionCard.answer_failed') })
       })
       // Released on EVERY path, success included. The success path clears the
       // card, but this component stays mounted in a grid pane, so a lock left
@@ -117,26 +133,25 @@ export default function PendingQuestionCard({ slotKey, onFallbackSend, onDirectS
    *  later message happens to retire it. And clearing by slot afterwards is the
    *  mirror-image bug: a newer card can arrive while the request is in flight, and
    *  a slot-wide delete would take that card off screen while its own status stays
-   *  pending. Both halves are identity-guarded — `serverCardId` names the record
-   *  the server retires, `cardId` names the delivery this component is showing.
+   *  pending. Both halves are guarded by the same identity — `serverCardId`, the
+   *  server's name for the record it retires and for the card this component is
+   *  showing.
    *
-   *  A card with no server identity (an older payload, or a fixture) is cleared
-   *  locally without a request: there is no record this dismissal could name, and
-   *  a slot-only clear is exactly what the identity check exists to prevent. */
+   *  A card with no server identity (a fixture) is cleared locally without a
+   *  request: there is no record this dismissal could name, and a slot-only
+   *  clear is exactly what the identity check exists to prevent. */
   const dismissStateless = () => {
     if (busy) return
     const serverCardId = pending.serverCardId
-    const deliveryId = pending.cardId
     if (!serverCardId) {
       clearThisCard()
       return
     }
-    /** Retire THIS delivery, never whatever currently occupies the slot. */
-    const retireThisDelivery = () => {
-      if (deliveryId) dispatch(retireStatelessQuestion({ slot: cardSlot, expected: deliveryId }))
-      else clearThisCard()
-    }
+    /** Retire THIS card, never whatever currently occupies the slot. */
+    const retireThisDelivery = () => dispatch(clearQuestionCard({ slot: cardSlot, card_id: serverCardId }))
     setBusyFor(lockKey)
+    setFailure(null)
+    const failureId = lockKey
     api
       .dismissQuestionCard(cardSlot, serverCardId)
       .then(retireThisDelivery)
@@ -144,9 +159,10 @@ export default function PendingQuestionCard({ slotKey, onFallbackSend, onDirectS
         // 404 means the server holds no such record — already retired by a
         // message, by a newer card, or by a restart. The card on screen is stale,
         // so take it away.
-        if (err instanceof ApiError && err.status === 404) retireThisDelivery()
+        if (err instanceof ApiError && err.status === 404) { retireThisDelivery(); return }
         // Anything else is retryable: keep the card, and with it the only control
-        // that can retire the status.
+        // that can retire the status — and say why it is still here.
+        setFailure({ id: failureId, message: i18nT('components.pendingQuestionCard.dismiss_failed') })
       })
       .finally(() => {
         setBusyFor((current) => (current === lockKey ? null : current))
@@ -154,6 +170,7 @@ export default function PendingQuestionCard({ slotKey, onFallbackSend, onDirectS
   }
 
   return (
+    <>
     <QuestionCard
       // Remount per ask: QuestionCard holds the selections and custom-answer
       // text in its own state, so without a fresh key the next question in this
@@ -183,5 +200,15 @@ export default function PendingQuestionCard({ slotKey, onFallbackSend, onDirectS
         resolve(answers)
       }}
     />
+    {/* No hand-off: the card above holds the selected answers and the custom
+        answer text, which the failed request did not deliver — the navigation
+        would discard them. Retry is the card's own Submit / Dismiss. */}
+    <ErrorNotice
+      className="mt-2"
+      message={failure && failure.id === lockKey ? failure.message : null}
+      onDismiss={() => setFailure(null)}
+      testId="pending-question-error"
+    />
+    </>
   )
 }

@@ -15,9 +15,11 @@ path when speech-to-text cannot produce words live here as
 table, so the transcriber and the ingestion adapter share one vocabulary.
 
 Behaviour:
-- returns an ``(image_paths, text_blocks)`` contract that ``events.py`` and the
-  busy-message queue consume directly
-- images land in temp files the caller must delete
+- returns an ``(attachment_paths, text_blocks)`` contract that ``events.py`` and
+  the busy-message queue consume directly
+- images and opaque files land in temp files the caller must delete
+- opaque files are preserved byte-for-byte with path and metadata, but are not
+  automatically parsed or executed
 - text and documents are redacted, then truncated, then wrapped in
   ``[File: …]`` / ``[Document: …]`` markers
 - size is re-checked AFTER download, so an absent or dishonest Slack ``size``
@@ -67,6 +69,7 @@ _LIMITS = IngestLimits(
     max_image_bytes=10 * 1024 * 1024,
     max_text_bytes=512 * 1024,
     max_document_bytes=20 * 1024 * 1024,
+    max_opaque_bytes=50 * 1024 * 1024,
     max_text_inject=50 * 1024,
 )
 
@@ -75,6 +78,7 @@ _LIMITS = IngestLimits(
 _MAX_IMAGE_BYTES = _LIMITS.max_image_bytes
 _MAX_TEXT_BYTES = _LIMITS.max_text_bytes
 _MAX_DOC_BYTES = _LIMITS.max_document_bytes
+_MAX_OPAQUE_BYTES = _LIMITS.max_opaque_bytes
 _MAX_TEXT_INJECT = _LIMITS.max_text_inject
 
 #: Mimetype prefixes Slack uses for voice memos. ``video/webm`` is NOT a
@@ -97,6 +101,16 @@ _safe_suffix = safe_suffix
 #: successful send, so a dropped memo looks to them like an ignored message.
 VOICE_MEMO_UNAVAILABLE = "[Audio attachment — transcription is unavailable]"
 VOICE_MEMO_FAILED = "[Audio attachment — transcription failed]"
+
+#: What the model is told when a voice memo was refused BEFORE transcription:
+#: over the batch duration cap, or the duration probe could not verify it.
+#: Pinned here beside the failure notes above for the same reason they are —
+#: byte-identical to the notes ``transcribe_audio_attachments`` emits for the
+#: other channels (pinned both ways by ``test_slack_backports.py``), not
+#: copies left to drift. ``slack/events.py`` consumes both; ``TOO_LONG`` is a
+#: template whose ``{minutes}`` the consumer fills from the active cap.
+VOICE_MEMO_TOO_LONG = "[Audio attachment — exceeds the {minutes}-minute transcription limit]"
+VOICE_MEMO_DURATION_UNVERIFIED = "[Audio attachment — duration could not be verified]"
 
 
 def is_voice_memo(file: dict) -> bool:
@@ -283,8 +297,8 @@ async def process_slack_files(
     """Process non-audio file attachments from a Slack message.
 
     Returns:
-        (image_paths, text_blocks) — local paths for images (caller
-        must clean up) and text strings ready for prompt injection.
+        (attachment_paths, text_blocks) — local paths for images and opaque
+        files (caller must clean up), plus prompt-ready text and metadata.
     """
     if not orch.slack:
         return [], []
@@ -306,5 +320,6 @@ async def process_slack_files(
     )
 
     # Rejection notes ride along as prompt text, matching the previous behaviour
-    # of inlining "unsupported type" / "too large" notes for the model to see.
-    return result.image_paths, [*result.text_blocks, *result.rejections]
+    # of inlining size and validation failures for the model to see.
+    paths = [*result.image_paths, *result.file_paths]
+    return paths, [*result.text_blocks, *result.rejections]

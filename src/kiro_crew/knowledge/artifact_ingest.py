@@ -32,7 +32,7 @@ parallel watcher):
   never runs -- the gap becomes permanent and silent. So the pass runs on EVERY
   :meth:`ArtifactKnowledgeSync.start` and is driven by state comparison instead:
   ingest what the store has and ``artifact_item_state`` lacks or disagrees with,
-  remove state for artifacts that no longer exist. Converged is the common case
+  remove state for artifacts absent from the store. Converged is the common case
   and costs no extraction calls, because :func:`ingest_artifact` already skips
   unchanged content.
 
@@ -60,7 +60,7 @@ from kiro_crew.security import (
 )
 from kiro_crew.sel import sel
 
-from .ingestion import DUPLICATE_JOB_STATUS, IngestionPipeline
+from .ingestion import DUPLICATE_JOB_STATUS, IngestionPipeline, run_to_completion
 from .store import KnowledgeStore
 
 logger = logging.getLogger(__name__)
@@ -249,6 +249,48 @@ def _write_state_row(
     )
 
 
+def _write_ownership_if_intact(
+    kstore: KnowledgeStore,
+    source_id: str,
+    slug: str,
+    content_hash: str,
+    item_ids: list[str],
+    name: str,
+    kind: str | None = None,
+) -> bool:
+    """Name ``item_ids`` as the slug's active group, but only while they all exist.
+
+    For a retry after the plain ownership write failed. The dedup sweep may have
+    collapsed this group in the meantime; it can only record that on a row that
+    already named the ids, and a winner deletion may since have revived the row.
+    Either way the row now holds a verdict this write must not replace, so a
+    missing id means: write nothing. The next reconcile re-ingests the artifact.
+
+    ``BEGIN IMMEDIATE`` waits for the writer lock instead of failing on it, and
+    holds it across the check and the write. Returns ``True`` when written.
+    """
+    kstore.db.execute("BEGIN IMMEDIATE")
+    try:
+        # Bounded by chunker.MAX_CHUNKS_PER_FILE, like surviving_group_in_txn.
+        placeholders = ",".join("?" for _ in item_ids)
+        found = kstore.db.execute(
+            f"SELECT COUNT(*) FROM items WHERE id IN ({placeholders}) "  # noqa: S608
+            "AND source_id = ?", (*item_ids, source_id)).fetchone()[0] if item_ids else 0
+        intact = found == len(set(item_ids))
+        if intact:
+            _write_state_row(kstore, source_id, slug, content_hash, item_ids, name,
+                             status="active", kind=kind)
+        kstore.db.execute("COMMIT")
+    except BaseException:
+        kstore.db.execute("ROLLBACK")
+        raise
+    if not intact:
+        logger.warning(
+            "artifact %s lost committed items to a concurrent dedup; leaving its "
+            "state row as the sweep left it", slug)
+    return intact
+
+
 def refresh_artifact_name(
     kstore: KnowledgeStore, source_id: str, slug: str, name: str
 ) -> bool:
@@ -372,7 +414,12 @@ async def ingest_artifact(
         # group rather than returning early and leaving obsolete chunks live.
         # Offloaded: remove_artifact -> delete_items_batch -> store._load_graph
         # is a graph rebuild inside a SQLite transaction, never loop-safe work.
-        prev_hash, old_item_ids = _get_state(kstore, source_id, slug)
+        # _get_state is a synchronous kstore.db read; run it off the loop too,
+        # or a contended knowledge DB busy-waits the whole loop (watchdog
+        # heartbeat included) for the connection's busy timeout.
+        prev_hash, old_item_ids = await asyncio.to_thread(
+            _get_state, kstore, source_id, slug
+        )
         if old_item_ids or prev_hash:
             await asyncio.to_thread(remove_artifact, kstore, source_id, slug)
         return None
@@ -383,7 +430,13 @@ async def ingest_artifact(
     title = _redact_for_ingest(art.name)
 
     content_hash = hashlib.sha256(text.encode()).hexdigest()
-    prev_hash, old_item_ids = _get_state(kstore, source_id, slug)
+    # Synchronous kstore.db read on the gateway loop: offload it so a contended
+    # knowledge DB cannot busy-wait the loop (watchdog heartbeat included) past
+    # the stall deadline. Mirrors the art_store.get / remove_artifact offloads
+    # in this same coroutine.
+    prev_hash, old_item_ids = await asyncio.to_thread(
+        _get_state, kstore, source_id, slug
+    )
     if prev_hash == content_hash and old_item_ids:
         # Unchanged since last ingest AND still holding its items -- cheap no-op
         # (per-slug short-circuit). A row with an empty group was left by a refused
@@ -392,8 +445,11 @@ async def ingest_artifact(
         return None
 
     # Same rule as the folder path: a row that owned nothing holds a claim for its
-    # previous content, and this artifact has changed.
-    kstore.release_stale_claim(source_id, prev_hash, content_hash, old_item_ids)
+    # previous content, and this artifact has changed. Offloaded: it takes the
+    # write lock through the knowledge connection.
+    await asyncio.to_thread(
+        kstore.release_stale_claim, source_id, prev_hash, content_hash, old_item_ids
+    )
 
     ext = _KIND_EXT.get(art.kind)
     if ext is None:
@@ -431,6 +487,15 @@ async def ingest_artifact(
             _set_state(kstore, source_id, slug, content_hash, new_ids, title,
                        kind=art.kind)
             ownership_persisted = True
+            return
+        except Exception:
+            logger.warning(
+                "could not persist artifact ownership for %s inside the commit "
+                "callback; retrying under the writer lock", slug, exc_info=True)
+        try:
+            _write_ownership_if_intact(kstore, source_id, slug, content_hash,
+                                       list(new_ids), title, kind=art.kind)
+            ownership_persisted = True
         except Exception:
             logger.warning(
                 "could not persist artifact ownership for %s inside the commit "
@@ -459,6 +524,12 @@ async def ingest_artifact(
             original_name=f"{title}{ext}",
             source_id=source_id,
             old_item_ids=old_item_ids,
+            # Automated artifact synchronization, not a user's one-shot import, so
+            # it is exempt from the explicit-import chunk budget (like the folder
+            # watcher path). Counting it would let an exhausted budget make this
+            # upsert raise -- leaving the old chunks searchable and dropping the
+            # sync event, a worse outcome than the cost the budget prevents.
+            count_toward_import_budget=False,
             # Fires inside the finalize hop, only on the fully-committed branch
             # -- the same branch that reports status 'completed' below -- and
             # persists the ownership row there (see _record_ownership).
@@ -477,30 +548,25 @@ async def ingest_artifact(
             except OSError:
                 pass
 
-    status = (pipeline.get_job_status(job_id) or {}).get("status") if job_id else None
-    if status == DUPLICATE_JOB_STATUS:
-        # The gate refused the write and recorded the terminal state through the
-        # ``on_duplicate`` finalizer above, so there is nothing left to write here.
-        return job_id
+    def _settle() -> str | None:
+        # The status read and the fallback write are ONE worker unit: off the
+        # loop (get_job_status blocks under busy_timeout), and drained once
+        # entered, so no cancellation lands between the read and the write.
+        status = (pipeline.get_job_status(job_id) or {}).get("status") if job_id else None
+        if status == "completed" and not ownership_persisted:
+            # Only for a hop write that failed and was swallowed as fail-safe.
+            # Guarded, never a blind restore: a concurrent dedup sweep may have
+            # collapsed the group since, and its verdict must stand.
+            _write_ownership_if_intact(kstore, source_id, slug, content_hash,
+                                       list(committed_ids), title, kind=art.kind)
+        return status
+
+    status = await run_to_completion(_settle)
     if status != "completed":
-        # Partial/failed ingest: ingest_file kept the old group and rolled back
-        # the new items. Leave the recorded state untouched so the next event
-        # retries from the prior good group.
+        # DUPLICATE_JOB_STATUS: the gate recorded the terminal state through
+        # ``on_duplicate``. Anything else is a partial/failed ingest that kept the
+        # old group, so the recorded state stays for the next event to retry.
         return job_id
-    if not ownership_persisted:
-        # Fallback ONLY for a hop write that failed and was swallowed as
-        # fail-safe. Never an unconditional re-write: the awaits between the
-        # finalize hop and here (temp-file cleanup, job-status read) are windows
-        # where a concurrent dedup sweep may legitimately rewrite this slug's
-        # state row (collapse the group, mark it deduped), and blindly restoring
-        # the captured ids would resurrect an 'active' row over that result --
-        # unchanged ingests would then short-circuit against stale ids forever.
-        # Offloaded: the plausible reason the hop write failed is writer-lock
-        # contention, and retrying the same blocking SQLite write (busy_timeout
-        # up to 10s) on the event loop would stall the gateway loop.
-        await asyncio.to_thread(
-            _set_state, kstore, source_id, slug, content_hash,
-            list(committed_ids), title, kind=art.kind)
     sel().log_tool_invocation(
         session_key="gateway",
         agent="knowledge-artifacts",
@@ -825,7 +891,10 @@ async def reconcile_artifacts(
             # start, because the deduped state row holds an empty group and the
             # per-slug short-circuit requires one -- so counting it would let a
             # budget's worth of duplicates starve every other artifact forever.
-            status = (pipeline.get_job_status(job_id) or {}).get("status")
+            # Offloaded: the status read takes the knowledge connection.
+            status = (await asyncio.to_thread(pipeline.get_job_status, job_id) or {}).get(
+                "status"
+            )
             if status == DUPLICATE_JOB_STATUS:
                 continue
             ingested += 1
@@ -888,7 +957,9 @@ class ArtifactKnowledgeSync:
     async def _handle(self, action: str, slug: str) -> None:
         async with self._lock:
             if action == "delete":
-                src = self.kstore.get_source_by_uri(ARTIFACT_SOURCE_URI)
+                src = await asyncio.to_thread(
+                    self.kstore.get_source_by_uri, ARTIFACT_SOURCE_URI
+                )
                 if src:
                     # Same reasoning as the eligibility path below: a batch delete
                     # plus a graph reload is not loop-safe work.
@@ -898,15 +969,21 @@ class ArtifactKnowledgeSync:
                 # Metadata-only rename: refresh the stored display name (the
                 # Sources-UI group label) without re-ingesting. No-op if the
                 # artifact isn't tracked (ineligible kind / not yet ingested).
-                src = self.kstore.get_source_by_uri(ARTIFACT_SOURCE_URI)
+                src = await asyncio.to_thread(
+                    self.kstore.get_source_by_uri, ARTIFACT_SOURCE_URI
+                )
                 if not src:
                     return
                 try:
                     art = await asyncio.to_thread(self.art_store.get, slug)
                 except ArtifactNotFoundError:
                     return
-                if refresh_artifact_name(
-                    self.kstore, src["id"], slug, _redact_for_ingest(art.name)
+                if await asyncio.to_thread(
+                    refresh_artifact_name,
+                    self.kstore,
+                    src["id"],
+                    slug,
+                    _redact_for_ingest(art.name),
                 ):
                     sel().log_tool_invocation(
                         session_key="gateway",
@@ -916,13 +993,15 @@ class ArtifactKnowledgeSync:
                         resources=str({"slug": slug}),
                     )
                 return
-            source_id, _ = ensure_artifact_source(self.kstore)
+            source_id, _ = await asyncio.to_thread(
+                ensure_artifact_source, self.kstore
+            )
             # An upsert can arrive because the artifact's KIND changed, and kind
             # is what decides eligibility. ``ingest_artifact`` early-returns on an
             # ineligible kind, so re-ingesting alone would leave the chunks from
             # the previous kind searchable -- markdown ingested, switched to svg,
             # obsolete prose still answering queries. Reconcile that here: an
-            # artifact that is no longer eligible is removed rather than skipped.
+            # artifact that is not eligible is removed rather than skipped.
             try:
                 art = await asyncio.to_thread(self.art_store.get, slug)
             except ArtifactNotFoundError:
@@ -954,8 +1033,15 @@ class ArtifactKnowledgeSync:
         the row outlives the feature being switched off, so gating on creation
         leaves an opt-in unable to repair the drift from that window. See the
         module docstring.
+
+        The get-or-create runs in a worker thread: this coroutine runs on the
+        gateway loop at every start, and a contended knowledge DB would
+        otherwise busy-wait the whole loop (watchdog heartbeat included) for
+        the connection's busy timeout.
         """
-        source_id, created = ensure_artifact_source(self.kstore)
+        source_id, created = await asyncio.to_thread(
+            ensure_artifact_source, self.kstore
+        )
         logger.info(
             "artifact KB sync started: source=%s created=%s kinds=%s",
             source_id,

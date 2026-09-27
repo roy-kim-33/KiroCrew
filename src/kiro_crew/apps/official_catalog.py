@@ -21,9 +21,9 @@ instead of degrading silently:
   list non-empty is REFUSED outright and the client falls back to the seed. A
   withdrawn app must never be rendered because we skipped the mechanism that
   withdraws it.
-- **Display-only inventory.** ``list_catalog_rows`` maps the published list's
-  DISPLAY fields (identity, name, summary, version, tags, author, asset refs)
-  into storefront rows. It emits no clone coordinates and no ``origin``, because
+- **Storefront-only inventory.** ``list_catalog_rows`` maps the published list's
+  display fields and the explicit session approval disclosure into storefront
+  rows. It emits no clone coordinates and no ``origin``, because
   the catalog is trusted only as far as TLS, and a non-builtin row never mints
   the verified badge. Install coordinates come from ``inventory``, materialised
   ONLY from a fresh fetch (``fetch_inventory_entries``) and never from the cache,
@@ -164,10 +164,10 @@ def _open_catalog(req: urllib.request.Request) -> Any:
 
     A named function rather than an inline `urlopen`, because tests must be able
     to intercept the network at a place that cannot drift: patching
-    `urllib.request.urlopen` used to work here, and when this function started
-    using an opener instead, those tests silently stopped intercepting anything
-    and began making real requests to the live CDN. A seam that belongs to this
-    module cannot be bypassed by changing how this module calls out.
+    `urllib.request.urlopen` does not survive this module switching to an opener:
+    such tests silently stop intercepting anything and make real requests to the
+    live CDN. A seam that belongs to this module cannot be bypassed by changing
+    how this module calls out.
 
     The opener is built per call: an opener is mutable shared state, and one
     built at import time is something any other import can reach in and
@@ -303,13 +303,40 @@ def _resolve_ref(ref: Any) -> str:
     return OFFICIAL_CATALOG_BASE + ref
 
 
+def _resolve_ref_list(refs: Any) -> list[str]:
+    """Resolve a published LIST of asset refs, dropping every unusable one.
+
+    For ``screenshotRefs``. Each member goes through :func:`_resolve_ref`, so a
+    member that is the wrong type, carries a scheme, or tries to traverse is
+    dropped -- the same rule the scalar refs already enforce, applied per entry.
+
+    The absent case and the unreadable case are kept DISTINCT, which is the
+    whole reason this returns a list and the caller sets the field on a truthy
+    result. A non-``list`` input (absent, or a hostile non-list type) answers
+    ``[]``, and a list whose every member is unusable also answers ``[]`` -- so
+    the caller leaves the field UNSET in both, and "no screenshots" never
+    renders as a present-but-empty gallery. A dropped member is a swallowed
+    miss on purpose: the alternative is emitting a ref this client already knows
+    a browser cannot load, which is the guaranteed-404 ``<img>`` this module
+    exists to avoid. Order is preserved for the members that survive; a catalog
+    screenshot list is not index-paired with anything, so dropping one shifts
+    only its own position.
+
+    ``list`` specifically, not any iterable: a bare ``str`` is iterable and
+    would resolve one ref per character.
+    """
+    if not isinstance(refs, list):
+        return []
+    return [resolved for ref in refs if (resolved := _resolve_ref(ref))]
+
+
 def _curated_str(value: Any) -> str:
     """A curated display string, or ``""`` for anything that is not one.
 
     Every field below arrives from a document fetched over the network, so its
     TYPE is as untrusted as its content. A wrong type is not hypothetical
-    tidiness: ``{"tags": 5}`` used to reach ``list(5)`` and turn one malformed
-    entry into an HTTP 500 for the whole store, and a non-string
+    tidiness: unguarded, ``{"tags": 5}`` reaches ``list(5)`` and turns one
+    malformed entry into an HTTP 500 for the whole store, and a non-string
     ``displayName`` reaches the browser to be sorted and lowercased there.
     Returning ``""`` collapses both into the falsy case the callers already
     handle, so a bad field degrades that field and nothing else.
@@ -326,6 +353,16 @@ def _curated_tags(value: Any) -> list[str]:
     if not isinstance(value, list):
         return []
     return [t for t in value if isinstance(t, str)]
+
+
+def _session_approval_manifest(entry: dict[str, Any]) -> dict[str, Any] | None:
+    """Project the explicit session approval grant for pre-install disclosure."""
+    permissions = entry.get("permissions")
+    if not isinstance(permissions, dict):
+        return None
+    if permissions.get("sessionApproval") is not True:
+        return None
+    return {"permissions": {"sessionApproval": True}}
 
 
 #: The largest integer JavaScript can represent exactly (2**53 - 1). A star
@@ -422,8 +459,8 @@ def inventory(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
     This is what makes the catalog the SHELF rather than a decoration on one:
     :func:`annotate` can only change a row that already exists, so an app the
-    catalog lists but the bundled seed does not was previously unlistable and
-    therefore uninstallable -- adding one required shipping a release.
+    catalog lists but the bundled seed does not would otherwise be unlistable and
+    therefore uninstallable -- adding one would require shipping a release.
 
     ``builtin`` entries produce nothing here on purpose. Their code ships in the
     wheel and is discovered from disk; a row for code this client does not have
@@ -498,6 +535,8 @@ def inventory(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
             row["description"] = summary
         if tags := _curated_tags(entry.get("tags")):
             row["tags"] = tags
+        if manifest := _session_approval_manifest(entry):
+            row["manifest"] = manifest
         # `author` is deliberately NOT set here even though the catalog states one.
         # `list_registry` snapshots `_index_author = entry["author"]`
         # unconditionally, and `_apply_trust_fields` derives the first-party
@@ -511,6 +550,10 @@ def inventory(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
             row["iconUrlDark"] = dark
         if hero := _resolve_ref(entry.get("heroRef")):
             row["heroImage"] = hero
+        if hero_detail := _resolve_ref(entry.get("heroDetailRef")):
+            row["heroImageDetail"] = hero_detail
+        if shots := _resolve_ref_list(entry.get("screenshotRefs")):
+            row["screenshots"] = shots
         if (stars := _curated_stars(entry)) is not None:
             row["stargazersCount"] = stars
         seen.add(name)
@@ -687,6 +730,8 @@ def annotate(rows: list[dict[str, Any]], entries: list[dict[str, Any]]) -> None:
             row["description"] = summary
         if tags := _curated_tags(entry.get("tags")):
             row["tags"] = tags
+        if manifest := _session_approval_manifest(entry):
+            row["manifest"] = manifest
         author = entry.get("author")
         if isinstance(author, dict) and (name := _curated_str(author.get("name"))):
             row["author"] = name
@@ -696,6 +741,10 @@ def annotate(rows: list[dict[str, Any]], entries: list[dict[str, Any]]) -> None:
             row["iconUrlDark"] = dark
         if hero := _resolve_ref(entry.get("heroRef")):
             row["heroImage"] = hero
+        if hero_detail := _resolve_ref(entry.get("heroDetailRef")):
+            row["heroImageDetail"] = hero_detail
+        if shots := _resolve_ref_list(entry.get("screenshotRefs")):
+            row["screenshots"] = shots
         # ``stargazersCount`` is deliberately NOT overlaid here. This function
         # matches rows by NAME, and a same-name SEED row can pin a DIFFERENT
         # repository than the catalog entry (seed collisions keep the pin by
@@ -711,10 +760,10 @@ def list_catalog_rows() -> list[dict[str, Any]]:
 
     This is the JSON-only storefront path: the published document IS the list,
     so its curated display fields ARE the copy the store renders, and there is
-    no per-app ``app.json`` to prefer over them. Rows carry identity and display
-    fields ONLY — no clone coordinates and no ``origin`` — because the catalog
-    is trusted only as far as TLS, so it must not supply install coordinates or
-    a first-party provenance claim. Install status and trust are stamped later by
+    no per-app ``app.json`` to prefer over them. Rows carry identity, display
+    fields, and the explicit session approval disclosure. They carry no clone
+    coordinates and no ``origin`` because the catalog is trusted only as far as
+    TLS, so it must not supply install coordinates or a first-party claim. Install status and trust are stamped later by
     ``registry.py`` from the installed app, never from this document.
 
     Returns ``[]`` when the catalog is unavailable, which is the caller's signal
@@ -737,6 +786,8 @@ def list_catalog_rows() -> list[dict[str, Any]]:
             row["version"] = version
         if tags := _curated_tags(entry.get("tags")):
             row["tags"] = tags
+        if manifest := _session_approval_manifest(entry):
+            row["manifest"] = manifest
         author = entry.get("author")
         if isinstance(author, dict) and (author_name := _curated_str(author.get("name"))):
             row["author"] = author_name
@@ -746,6 +797,10 @@ def list_catalog_rows() -> list[dict[str, Any]]:
             row["iconUrlDark"] = dark
         if hero := _resolve_ref(entry.get("heroRef")):
             row["heroImage"] = hero
+        if hero_detail := _resolve_ref(entry.get("heroDetailRef")):
+            row["heroImageDetail"] = hero_detail
+        if shots := _resolve_ref_list(entry.get("screenshotRefs")):
+            row["screenshots"] = shots
         source = entry.get("source")
         if isinstance(source, dict):
             # The source TYPE is a display marker (builtin vs git), not install

@@ -86,6 +86,7 @@ class FakeSessions:
         # dispatch the way the real gate does after close_all.
         self.closing = False
         self.begin_turns = 0
+        self.reserved_generations: list[str] = []
 
     @contextlib.contextmanager
     def batched_save(self):
@@ -157,6 +158,12 @@ class FakeSessions:
 
     def is_busy(self, key) -> bool:
         return getattr(self, "_busy", False)
+
+    def reserve_generation(self, session_key: str) -> None:
+        self.reserved_generations.append(session_key)
+
+    async def aflush(self) -> None:
+        return None
 
     def max_generation(self, bucket: str) -> int:
         return -1
@@ -240,7 +247,7 @@ class FakeConvLog:
 def _cfg(default_agent: str = "", approval_mode: str = "interactive"):
     return SimpleNamespace(
         agent=SimpleNamespace(default_agent=default_agent, approval_mode=approval_mode),
-        wecom=SimpleNamespace(hard_threshold_pct=95.0, soft_threshold_pct=80.0),
+        wecom=SimpleNamespace(hard_threshold_pct=95.0, soft_threshold_pct=80.0, allowed_users=[]),
         messaging=SimpleNamespace(
             dm_scope="per-channel-peer",
             idle_reset_minutes=0,
@@ -296,8 +303,8 @@ def _deny_wecom_profile(monkeypatch, tmp_path):
 class TestTurn:
     @pytest.mark.asyncio
     async def test_channels_deny_drops_inbound_message(self, tmp_path, monkeypatch) -> None:
-        # HIGH (GPT round-4 #2): a channels DENY must stop handle_message from
-        # driving a turn. Regression-locks the WeCom inbound chokepoint.
+        # A channels DENY must stop handle_message from driving a turn. This
+        # locks the WeCom inbound chokepoint.
         from kiro_crew.platform import governance_profiles as gp
 
         _deny_wecom_profile(monkeypatch, tmp_path)
@@ -396,6 +403,7 @@ class TestCommands:
 
         assert client.said == ["✅ 已开始新对话"]
         assert d._conv.current_gen("Wei") == 1  # generation bumped
+        assert sessions.reserved_generations == [d._session_key("Wei")]
         assert sessions.successes == []  # no LLM turn
 
     @pytest.mark.asyncio
@@ -416,7 +424,7 @@ class TestCommands:
     @pytest.mark.asyncio
     async def test_compact_declined_on_auto_managed_backend(self) -> None:
         # A backend that cannot serve /compact gets the informational reply and
-        # compact() is NEVER dispatched (#8156).
+        # compact() is NEVER dispatched.
         provider = FakeProvider([])
         provider.manual_compact_unsupported_backend = "kas"
         sessions = FakeSessions(provider)
@@ -446,7 +454,7 @@ class TestCommands:
     @pytest.mark.asyncio
     async def test_hard_threshold_declines_silently_on_auto_managed_backend(self) -> None:
         # No /compact to dispatch and no notice: the backend compacts on its
-        # own as context fills (#8156).
+        # own as context fills.
         provider = FakeProvider(
             [AcpEvent(kind=EVENT_TEXT_CHUNK, text="answer"), AcpEvent(kind=EVENT_COMPLETE)]
         )
@@ -463,7 +471,7 @@ class TestCommands:
     @pytest.mark.asyncio
     async def test_soft_nudge_suppressed_on_auto_managed_backend(self) -> None:
         # The nudge advises /compact, which this backend refuses — it compacts
-        # on its own, so there is nothing for the user to act on (#8156).
+        # on its own, so there is nothing for the user to act on.
         provider = FakeProvider(
             [AcpEvent(kind=EVENT_TEXT_CHUNK, text="answer"), AcpEvent(kind=EVENT_COMPLETE)]
         )
@@ -503,9 +511,8 @@ class TestCommands:
     @pytest.mark.asyncio
     @pytest.mark.asyncio
     async def test_link_binds_the_dashboard_mirror(self) -> None:
-        # /link used to be refused outright, on the belief that WeCom could never
-        # push. aibot_send_msg makes the mirror deliverable, so the command now
-        # does what it says.
+        # /link binds the dashboard mirror: aibot_send_msg makes the mirror
+        # deliverable, so the command is not refused as undeliverable.
         client = FakeClient()
         sessions = FakeSessions(FakeProvider([]))
         d = _dispatcher(sessions, FakeCtx(), client)
@@ -718,3 +725,48 @@ class TestWeComMidTurn:
         assert not any("合并" in content for content in client.said)
         assert any("重发" in content for content in client.said)
         assert sessions.successes == []
+
+
+class TestWeComDisplayName:
+    """``_display_name`` resolves the ``[CURRENT USER]`` label from the allow-list."""
+
+    @staticmethod
+    def _cfg_with_users(users):
+        cfg = _cfg()
+        cfg.wecom.allowed_users = users
+        return cfg
+
+    def test_resolves_name_from_allowed_users(self) -> None:
+        cfg = self._cfg_with_users(
+            [{"userid": "ZhuQiang", "name": "朱强"}, {"userid": "chrishe", "name": "小碗"}]
+        )
+        d = _dispatcher(FakeSessions(FakeProvider([])), FakeCtx(), FakeClient(), cfg=cfg)
+        assert d._display_name("ZhuQiang") == "朱强"
+        assert d._display_name("chrishe") == "小碗"
+
+    def test_falls_back_to_userid_when_unknown(self) -> None:
+        cfg = self._cfg_with_users([{"userid": "ZhuQiang", "name": "朱强"}])
+        d = _dispatcher(FakeSessions(FakeProvider([])), FakeCtx(), FakeClient(), cfg=cfg)
+        # Not in the allow-list -> the raw userid, never an empty label.
+        assert d._display_name("stranger") == "stranger"
+
+    def test_falls_back_to_userid_when_name_missing(self) -> None:
+        cfg = self._cfg_with_users([{"userid": "NoName"}])
+        d = _dispatcher(FakeSessions(FakeProvider([])), FakeCtx(), FakeClient(), cfg=cfg)
+        # No name on the entry -> the raw userid, never an empty label.
+        assert d._display_name("NoName") == "NoName"
+
+    def test_falls_back_to_userid_when_name_not_a_string(self) -> None:
+        # YAML ``name: 123`` loads as an int; the loader type-checks only
+        # ``userid``, so a non-string name reaches here. It must NOT be returned
+        # (it would crash [CURRENT USER] marker scrubbing, which assumes str) --
+        # fall back to the userid instead.
+        cfg = self._cfg_with_users([{"userid": "IntName", "name": 123}])
+        d = _dispatcher(FakeSessions(FakeProvider([])), FakeCtx(), FakeClient(), cfg=cfg)
+        assert d._display_name("IntName") == "IntName"
+
+    def test_falls_back_to_userid_when_name_is_empty_string(self) -> None:
+        cfg = self._cfg_with_users([{"userid": "Blank", "name": ""}])
+        d = _dispatcher(FakeSessions(FakeProvider([])), FakeCtx(), FakeClient(), cfg=cfg)
+        # Empty string is not a usable label -> the raw userid.
+        assert d._display_name("Blank") == "Blank"
