@@ -62,6 +62,7 @@ class TestCiWiring:
         scope = gate._load_scope()
         assert callable(scope.changed_paths)
         assert callable(scope.added_lines)
+        assert callable(scope.merged_in_parents)
 
     def test_code_style_doc_names_every_enforced_phrase(self) -> None:
         # The doc's DO-NOT list IS the rule set. A pattern the doc does not name
@@ -260,6 +261,43 @@ class TestVerdicts:
         )
         assert new == ["src/x.py"]
 
+    def test_unbaselined_count_within_the_merge_allowance_is_not_a_new_offender(self) -> None:
+        # A sync PR's merged-in parent already carried this many markers for an
+        # otherwise-unbaselined file: the allowance, not the (absent) baseline,
+        # is what the count is judged against.
+        found = [(1, "a"), (2, "b"), (3, "c")]
+        new, grown, on_added, shrunk = gate._verdicts(
+            {"src/x.py": found}, {}, {"src/x.py"}, None, {"src/x.py": 3}
+        )
+        assert not new and not grown and not on_added and not shrunk
+
+    def test_unbaselined_count_over_the_merge_allowance_is_still_a_new_offender(self) -> None:
+        found = [(1, "a"), (2, "b"), (3, "c"), (4, "d")]
+        new, grown, on_added, shrunk = gate._verdicts(
+            {"src/x.py": found}, {}, {"src/x.py"}, None, {"src/x.py": 3}
+        )
+        assert new == ["src/x.py"]
+
+    def test_a_marker_on_an_added_line_fails_despite_the_merge_allowance(self) -> None:
+        # The negative control: a fork marker written ON TOP of a merge sits on
+        # an added line, so it fails even though the level count is within the
+        # raised allowance -- the allowance cannot smuggle a genuinely new
+        # marker past the gate.
+        found = [(1, "a"), (2, "b"), (3, "c"), (4, "d"), (5, "e")]
+        new, grown, on_added, shrunk = gate._verdicts(
+            {"src/x.py": found}, {"src/x.py": 2}, {"src/x.py"}, {"src/x.py": {5}}, {"src/x.py": 5}
+        )
+        assert not new and not grown and not shrunk
+        assert on_added == {"src/x.py": [(5, "e")]}
+
+    def test_shrunk_ignores_the_merge_allowance_and_uses_the_real_baseline(self) -> None:
+        found = [(1, "a"), (2, "b"), (3, "c"), (4, "d")]
+        new, grown, on_added, shrunk = gate._verdicts(
+            {"src/x.py": found}, {"src/x.py": 5}, {"src/x.py"}, None, {"src/x.py": 9}
+        )
+        assert shrunk == ["src/x.py"]
+        assert not new and not grown and not on_added
+
 
 class TestGrownWording:
     """The grown-count message must accuse only a diff that adds marker lines."""
@@ -311,6 +349,9 @@ class TestGrownWording:
 
             def added_lines(self, label: str) -> dict[str, set[int]]:
                 return {"src/x.py": {90}}
+
+            def merged_in_parents(self, label: str) -> list[str]:
+                return []
 
         monkeypatch.setattr(gate, "_scan", lambda targets: {"src/x.py": [(1, "a"), (2, "b")]})
         monkeypatch.setattr(gate, "_load_scope", lambda: Scope())

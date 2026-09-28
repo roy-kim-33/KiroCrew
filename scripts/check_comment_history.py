@@ -64,6 +64,7 @@ import importlib.util
 import io
 import json
 import re
+import subprocess
 import tokenize
 from pathlib import Path
 
@@ -321,13 +322,21 @@ def _verdicts(
     baseline: dict[str, int],
     changed: set[str] | None,
     added: dict[str, set[int]] | None,
+    allowance: dict[str, int] | None = None,
 ) -> tuple[list[str], list[str], dict[str, list[tuple[int, str]]], list[str]]:
     """(new_offenders, grown, added_line_offenders, shrunk) under the ratchet.
 
     ``changed`` None means scope was undeterminable: judge the whole tree.
     ``added`` None means added-line info was unavailable: skip only that rule.
+    ``allowance`` is the merge-aware per-file count a sync PR's merged-in
+    parent(s) already carried (see ``_merge_allowance``); new-offender and
+    grown compare against ``max(baseline, allowance)`` so a line a PR only
+    IMPORTED is not judged as new or growth. Shrunk stays against the real
+    baseline: an allowance was never raised, so it must not license skipping
+    a lower.
     """
     current = {rel: len(found) for rel, found in violations.items()}
+    allowance = allowance or {}
 
     def in_scope(rel: str) -> bool:
         return changed is None or rel in changed
@@ -338,11 +347,12 @@ def _verdicts(
     shrunk: list[str] = []
     for rel, count in sorted(current.items()):
         recorded = baseline.get(rel)
+        effective = max(recorded or 0, allowance.get(rel, 0))
         if recorded is None:
-            if in_scope(rel):
+            if in_scope(rel) and count > effective:
                 new_offenders.append(rel)
         elif in_scope(rel):
-            if count > recorded:
+            if count > effective:
                 grown.append(rel)
             elif added is not None:
                 on_added = [item for item in violations[rel] if item[0] in added.get(rel, set())]
@@ -392,6 +402,47 @@ def _grown_error(
     )
 
 
+def _merge_allowance(
+    violations: dict[str, list[tuple[int, str]]],
+    changed: set[str] | None,
+    parents: list[str],
+) -> dict[str, int]:
+    """Per-file count already carried by the merge's non-first parent(s).
+
+    ``max`` over every parent in ``parents`` (git's own count, run through the
+    real detector at ``git show P:rel``) -- the file's count at the PR's own
+    base is irrelevant, only what a merged-in upstream side already had. A
+    missing path, or a source that fails to tokenize/parse at ``P``, counts 0:
+    the strict direction, never invented allowance for a file that does not
+    explain its own count. Scoped to files that already have violations AND
+    are in this change's ``changed`` set -- a few dozen ``git show`` calls,
+    never a whole-tree re-scan.
+    """
+    allowance: dict[str, int] = {}
+    candidates = set(violations) if changed is None else set(violations) & changed
+    for rel in candidates:
+        best = 0
+        for parent in parents:
+            proc = subprocess.run(
+                ["git", "show", f"{parent}:{rel}"],
+                cwd=ROOT,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            if proc.returncode != 0:
+                continue  # not present at this parent: 0 is the strict answer
+            try:
+                count = len(violations_in_source(proc.stdout))
+            except (SyntaxError, tokenize.TokenError):
+                count = 0
+            best = max(best, count)
+        if best:
+            allowance[rel] = best
+    return allowance
+
+
 def run_gate(baseline_path: Path, write: bool) -> int:
     # Baseline first, before the several-thousand-file scan: an absent baseline is
     # a refusal in BOTH modes, and paying for the scan to reach it would make the
@@ -418,8 +469,23 @@ def run_gate(baseline_path: Path, write: bool) -> int:
     print("" if changed is None else f" ({len(changed)} changed file(s))")
     added = scope.added_lines(scope_label) if changed is not None else None
 
+    # A sync PR carries a first-parent-chain merge of an upstream ref, whose
+    # lines a plain diff cannot tell from this PR's own. `parents` names that
+    # merge's OTHER parent(s); non-empty only for that shape, so an ordinary PR
+    # takes the exact path above -- `added_lines` never sees `minus_parents`,
+    # never mind receiving an empty tuple that would be a no-op anyway.
+    parents = (scope.merged_in_parents(scope_label) or []) if changed is not None else []
+    allowance: dict[str, int] = {}
+    if parents:
+        print(
+            "comment-history gate: merge-aware, excluding lines imported by "
+            f"{', '.join(parents)}"
+        )
+        added = scope.added_lines(scope_label, minus_parents=parents)
+        allowance = _merge_allowance(violations, changed, parents)
+
     new_offenders, grown, added_line_offenders, shrunk = _verdicts(
-        violations, baseline, changed, added
+        violations, baseline, changed, added, allowance
     )
 
     for rel in new_offenders:
@@ -432,7 +498,8 @@ def run_gate(baseline_path: Path, write: bool) -> int:
         )
         _report(rel, violations[rel])
     for rel in grown:
-        print(_grown_error(rel, baseline[rel], current[rel], violations[rel], added))
+        effective = max(baseline[rel], allowance.get(rel, 0))
+        print(_grown_error(rel, effective, current[rel], violations[rel], added))
         _report(rel, violations[rel])
     for rel, found in added_line_offenders.items():
         print(
@@ -532,6 +599,43 @@ def _self_test() -> int:
     interior = '"""Head.\n\nTail: previously it blocked.\n"""\n'
     if violations_in_source(interior) != [(3, "previously")]:
         failures.append("a docstring marker must report the line it sits on")
+
+    # Merge-aware allowance: a sync PR's merged-in parent already carried some
+    # of a file's count, so new-offender/grown compare against
+    # max(baseline, allowance) instead of the real baseline alone.
+    three = [(1, "a"), (2, "b"), (3, "c")]
+    new, grown, on_added, shrunk = _verdicts(
+        {"src/x.py": three}, {}, {"src/x.py"}, None, {"src/x.py": 3}
+    )
+    if new or grown or on_added or shrunk:
+        failures.append("(a) count within allowance must not be a new offender")
+    new, grown, on_added, shrunk = _verdicts(
+        {"src/x.py": three + [(4, "d")]}, {}, {"src/x.py"}, None, {"src/x.py": 3}
+    )
+    if new != ["src/x.py"]:
+        failures.append("(b) count over allowance must still be a new offender")
+    # The negative control: a fork marker written ON TOP of a merge sits on an
+    # added line, so it fails even though the level count is within the raised
+    # allowance -- proving the merge-aware allowance cannot be used to smuggle
+    # a genuinely new marker past the gate.
+    five = [(1, "a"), (2, "b"), (3, "c"), (4, "d"), (5, "e")]
+    new, grown, on_added, shrunk = _verdicts(
+        {"src/x.py": five}, {"src/x.py": 2}, {"src/x.py"}, {"src/x.py": {5}}, {"src/x.py": 5}
+    )
+    if new or grown or shrunk or on_added != {"src/x.py": [(5, "e")]}:
+        failures.append("(c) a marker on an added line must fail despite the allowance")
+    # Shrunk stays against the REAL baseline: an allowance was never raised, so
+    # it must not license skipping a lower.
+    new, grown, on_added, shrunk = _verdicts(
+        {"src/x.py": three + [(4, "d")]},
+        {"src/x.py": 5},
+        {"src/x.py"},
+        None,
+        {"src/x.py": 9},
+    )
+    if shrunk != ["src/x.py"] or new or grown or on_added:
+        failures.append("(d) shrunk must ignore the allowance and use the real baseline")
+
     for failure in failures:
         print(f"::error::self-test: {failure}")
     if failures:

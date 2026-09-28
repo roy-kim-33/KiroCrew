@@ -312,7 +312,7 @@ describe('formatting follows the app language', () => {
     expect(hostLocaleCalls('x.ts', head)).toHaveLength(2)
   })
 
-  it('[added-lines] no host-locale call sits on a line this branch wrote', () => {
+  it('[added-lines] no host-locale call sits on a line this branch wrote', { timeout: 120_000 }, () => {
     const scope = diffScope()
     if (scope === null) {
       // The sibling `.mjs` gates print this. A test that returns silently is a gate
@@ -334,7 +334,13 @@ describe('formatting follows the app language', () => {
     expect(offenders, `${FIX}\n\nThere is no ceiling to raise for these — the line is yours.`).toEqual([])
   })
 
-  it('[vs-base] no file this branch touched gained a host-locale call', () => {
+  // Timeout raised from the 15s default because this gate's cost scales with the
+  // SIZE OF THE DIFF, not with the repo: it shells out to `git diff` against the
+  // base and re-reads every file that changed. An ordinary PR finishes in well
+  // under a second; an upstream-sync merge touching a few thousand files does not,
+  // and a timeout here reports as a red gate that never actually evaluated its
+  // assertion — the failure mode that is worse than either verdict.
+  it('[vs-base] no file this branch touched gained a host-locale call', { timeout: 120_000 }, () => {
     const scope = diffScope()
     if (scope === null) {
       // The sibling `.mjs` gates print this. A test that returns silently is a gate

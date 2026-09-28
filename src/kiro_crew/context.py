@@ -17,9 +17,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from kiro_crew import model_registry
-from kiro_crew.acp.types import ACP_BACKEND_CLAUDE
 from kiro_crew.agent import _prompt_path
 from kiro_crew.agent_discovery import agent_skill_globs
+from kiro_crew.agent_sdk.backends import ACP_BACKEND_CLAUDE
 from kiro_crew.agent_sdk.provider_identity import is_claude_code
 from kiro_crew.config.loader import KiroCrewConfig, workspace_dir_for
 from kiro_crew.config.paths import kiro_agents_dir
@@ -2088,7 +2088,9 @@ class ContextBuilder:
             # (see harness-parity notes in acp/types.py), so provider alone is
             # never "claude_code" here — the actual backend choice (kiro-cli vs
             # the fork's claude-agent-acp seam) lives in acp_backend instead.
-            self._bot_name = "Kiro Crew" if cfg.agent.acp_backend == ACP_BACKEND_CLAUDE else "Kiro"  # brand-ok
+            self._bot_name = (
+                "Kiro Crew" if cfg.agent.acp_backend == ACP_BACKEND_CLAUDE else "Kiro"
+            )  # brand-ok
         # Register default memory in the workspace cache
         _memory_stores["default"] = self.memory
 

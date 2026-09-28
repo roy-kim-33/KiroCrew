@@ -561,7 +561,7 @@ def _resolve_fence_shells(launched: str) -> dict[str, str]:
         # hand a snippet to, and the ownership test below has no Windows
         # equivalent -- report nothing rather than approximate it.
         return {}
-    uid = os.geteuid()
+    uid = os.geteuid()  # posix-only: unreachable on Windows, see the return above
     if _agent_can_rewrite(trusted_dir, uid):
         return {}
     found: dict[str, str] = {}

@@ -3226,9 +3226,8 @@ _ROUTER_RAW_MODEL_IDS: dict[str, tuple[str, ...]] = {
         "grok-4.5",
     ),
     "ol": (
-        # Full ollama-cloud (/v1) catalog. The plain and kimi/glm entries were
-        # previously hidden (operator preference); they are now exposed so the
-        # picker can select any ollama model.
+        # Full ollama-cloud (/v1) catalog, including the plain and kimi/glm
+        # entries, so the picker can select any ollama model.
         "nemotron-3-ultra",
         "deepseek-v4-flash:preview",
         "minimax-m2.7",
@@ -3376,7 +3375,7 @@ def prefixed_router_model_id(model_id: str, owned_by: str = "") -> str | None:
 # fast. Overridable per install via agent.vision_fallback_model.
 _DEFAULT_VISION_FALLBACK_MODEL = "cmc/mimo-v2.5"
 # Default text-only router MODELS whose upstream rejects image content (400).
-# Verified per model against the live upstreams (2026-08-07):
+# Verified per model against the live upstreams:
 #   - oc/deepseek-v4-flash (opencode-go) -> 400 "unknown variant image_url"
 #   - ol/deepseek-v4-flash:0731 (ollama-cloud) -> 400 "does not support image input"
 #   - oc/mimo-v2.5 (opencode-go) -> 200 WITH image (vision-capable, NOT listed)
@@ -3595,7 +3594,9 @@ class AcpClient:
             self._extra_env = extra_env or {}
         logger.debug(
             "acp client init: backend=%r model=%r model_via_env=%s base_url=%s",
-            self._acp_backend, model, self._model_via_env,
+            self._acp_backend,
+            model,
+            self._model_via_env,
             (extra_env or {}).get("ANTHROPIC_BASE_URL", ""),
         )
         # Claude backend permission mode (Auto-mode / permission-UI parity).
@@ -3936,9 +3937,7 @@ class AcpClient:
         stall the ACP session.
         """
         home = os.path.expanduser("~")
-        cfg_dir = os.path.join(
-            home, ".config", "roycrew", "opencode-home", ".config", "opencode"
-        )
+        cfg_dir = os.path.join(home, ".config", "roycrew", "opencode-home", ".config", "opencode")
         os.makedirs(cfg_dir, exist_ok=True)
         path = os.path.join(cfg_dir, "opencode.json")
         base_url = (self._extra_env or {}).get("ANTHROPIC_BASE_URL", "")
@@ -5083,9 +5082,14 @@ class AcpClient:
             # all, so requiring "select" put the picker back to empty -- the exact
             # bug this path exists to fix (test_router_auto_and_catalog.py::
             # test_config_options_are_read_when_the_session_advertises_no_models).
-            if isinstance(opt, dict) and opt.get("id") == "model" and opt.get("type") in (
-                None,
-                "select",
+            if (
+                isinstance(opt, dict)
+                and opt.get("id") == "model"
+                and opt.get("type")
+                in (
+                    None,
+                    "select",
+                )
             ):
                 # Fork: the option carries either a flat ``options`` list or GROUPED
                 # entries that each hold their own ``options``. The adapter flattens
@@ -5977,7 +5981,9 @@ class AcpClient:
             # OpenCode see ONLY our config, with zero user plugins or MCP.
             isolated_home = os.path.join(
                 os.path.expanduser("~"),
-                ".config", "roycrew", "opencode-home",
+                ".config",
+                "roycrew",
+                "opencode-home",
             )
             env["HOME"] = isolated_home
         logger.debug(
@@ -6738,7 +6744,9 @@ class AcpClient:
             new_params["_meta"] = {"claudeCode": {"options": cc_opts}}
             logger.debug(
                 "claude session/new _meta options: %r (model=%r via_env=%s)",
-                cc_opts, self._model, getattr(self, "_model_via_env", False),
+                cc_opts,
+                self._model,
+                getattr(self, "_model_via_env", False),
             )
 
         # The roster this session put ON THE WIRE. Distinct from the agent spec
@@ -9041,11 +9049,10 @@ class AcpClient:
                 # the true window, so prefer it over the SDK's fallback — a
                 # 200K reading for a 1M model makes the context meter lie
                 # ("96K / 200K") and can force premature compaction.
-                resolved = getattr(self, "_resolved_model_id", None) or getattr(self, "_model", None) or ""
-                if (
-                    size <= 200_000
-                    and model_registry.has_known_window(resolved)
-                ):
+                resolved = (
+                    getattr(self, "_resolved_model_id", None) or getattr(self, "_model", None) or ""
+                )
+                if size <= 200_000 and model_registry.has_known_window(resolved):
                     reg_win = model_registry.model_window(resolved)
                     if reg_win and reg_win > size:
                         size = int(reg_win)

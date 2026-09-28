@@ -35,6 +35,7 @@ from urllib.parse import urlsplit as _urlsplit  # noqa: F401 - compatibility fac
 # so new resolution helpers are reached through the module, not re-exported.
 import kiro_crew.config.resolution as _resolution
 from kiro_crew import __version__, model_registry, platform_compat, windows_acl
+from kiro_crew.agent_sdk.backends import ACP_BACKEND_CLAUDE, ACP_BACKEND_OPENCODE
 from kiro_crew.agent_sdk.capabilities import MODEL_NAMESPACE_ACP, capabilities_for
 
 # Leaf module (stdlib + platform_compat only) — no import cycle with config.
@@ -2840,9 +2841,7 @@ class KiroCrewConfig:
                 provider_api_format=agent_data.get("provider_api_format", ""),
                 model_whitelist=list(agent_data.get("model_whitelist") or []),
                 image_redirect=agent_data.get("image_redirect", "subagent"),
-                vision_fallback_model=agent_data.get(
-                    "vision_fallback_model", "cmc/mimo-v2.5"
-                ),
+                vision_fallback_model=agent_data.get("vision_fallback_model", "cmc/mimo-v2.5"),
                 vision_providers=list(agent_data.get("vision_providers") or []),
                 text_only_models=list(
                     agent_data.get(
@@ -4274,13 +4273,6 @@ class KiroCrewConfig:
         # (claude-opus-5[1m]), which the router rejects. Fall back to the
         # configured model. Runs before the empty-model return because ""
         # is one of the sentinels this covers.
-        # Local import, matching the factory below: acp.types pulls in the ACP
-        # stack, and this module must stay importable on its own
-        # (test_acp_backend_kas.py::test_config_loader_imports_alone). The merge
-        # that brought upstream's capability lookup here dropped the fork's
-        # module-level import, which made this a NameError on every claude call.
-        from kiro_crew.acp.types import ACP_BACKEND_CLAUDE
-
         if (
             self.agent.acp_backend == ACP_BACKEND_CLAUDE
             and (self.agent.provider_base_url or "").strip()
@@ -4486,11 +4478,6 @@ class KiroCrewConfig:
         the kiro-cli backend. The factory accepts an optional ``session_key`` to
         create a per-session subdirectory under ``workspace_root()``.
         """
-        # Local, like the sibling imports below: kiro_crew.acp.types is itself
-        # dependency-free, but importing it pulls kiro_crew.acp's package
-        # __init__, and this module must stay importable alone
-        # (test_acp_backend_kas.py::test_config_loader_imports_alone).
-        from kiro_crew.acp.types import ACP_BACKEND_CLAUDE, ACP_BACKEND_OPENCODE
         from kiro_crew.providers.acp import (
             AcpProvider,  # circular: acp -> client -> session -> config.loader
         )

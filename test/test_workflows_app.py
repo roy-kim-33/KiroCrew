@@ -269,7 +269,11 @@ def test_main_boots_platform_before_binding_server(monkeypatch) -> None:
 
     monkeypatch.setattr(server, "boot_platform", _boot)
     monkeypatch.setattr(server.KiroCrewConfig, "load", classmethod(lambda cls: SimpleNamespace()))
-    monkeypatch.setattr(server, "ThreadingHTTPServer", _FakeServer)
+    # `main()` constructs `_Server`, a subclass bound to the real
+    # ThreadingHTTPServer at import time — so replacing the base name here is a
+    # no-op and the test binds a REAL socket and calls the REAL serve_forever(),
+    # which never returns. Patch the name main() actually resolves.
+    monkeypatch.setattr(server, "_Server", _FakeServer)
 
     assert server.main() is None
     assert calls == ["boot", "bind", "serve"]

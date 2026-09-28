@@ -36,6 +36,7 @@ import os
 import re
 import subprocess
 from pathlib import Path
+from typing import Sequence
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -161,35 +162,11 @@ def changed_paths() -> tuple[set[str] | None, str]:
     return None, "undeterminable (judging the whole tree)"
 
 
-def added_lines(scope_label: str) -> dict[str, set[int]] | None:
-    """Repo-relative path -> line numbers this change ADDED, or None.
-
-    Uses the diff endpoints named by ``changed_paths``' label, so the added set
-    and the changed-file set always describe the same diff. An unknown label (or
-    a failing git) degrades to None -- the added-line rule is then skipped
-    rather than guessed, and a caller's count rules still apply.
-    """
-    if scope_label == "merge HEAD^1..HEAD":
-        args = ["diff", "--unified=0", "HEAD^1", "HEAD"]
-    elif scope_label == "merge parents":
-        args = ["diff", "--unified=0", "HEAD^1", "HEAD^2"]
-    elif scope_label.endswith("...HEAD"):
-        args = ["diff", "--unified=0", scope_label]
-    else:
-        return None
-    proc = subprocess.run(
-        ["git", "--no-pager", *args],
-        cwd=ROOT,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
-    if proc.returncode != 0:
-        return None
+def _parse_added(diff_out: str) -> dict[str, set[int]]:
+    """``+++ b/`` / hunk-header parsing shared by every whole-diff caller here."""
     added: dict[str, set[int]] = {}
     current: str | None = None
-    for line in proc.stdout.splitlines():
+    for line in diff_out.splitlines():
         if line.startswith("+++ b/"):
             current = line[6:]
         elif line.startswith("+++ "):
@@ -201,6 +178,124 @@ def added_lines(scope_label: str) -> dict[str, set[int]] | None:
                 count = int(match.group(2)) if match.group(2) is not None else 1
                 added.setdefault(current, set()).update(range(start, start + count))
     return added
+
+
+def _diff(*args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", "--no-pager", "diff", *args],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+
+
+def _pr_range(scope_label: str) -> str | None:
+    """The PR's own commit range, from a ``changed_paths`` label.
+
+    ``merged_in_parents`` and ``added_lines``' ``minus_parents`` both need this:
+    the two-dot form ``rev-list``/``diff`` expect, not the label's own spelling.
+    A three-dot label is converted from ``A...B`` to ``A..B`` -- ``rev-list
+    A...B`` is a symmetric difference, and the merge side-parents live only on
+    the ``HEAD`` side of it.
+    """
+    if scope_label in ("merge HEAD^1..HEAD", "merge parents"):
+        return "HEAD^1..HEAD^2"
+    if scope_label.endswith("...HEAD"):
+        return f"{scope_label[: -len('...HEAD')]}..HEAD"
+    return None
+
+
+def merged_in_parents(scope_label: str) -> list[str] | None:
+    """The non-first parents merged into R, the PR's own commit range.
+
+    A sync PR carries a first-parent-chain merge of an upstream ref; upstream's
+    lines then look "added" to a plain diff even though the PR never wrote
+    them. This is the merge's OTHER parent(s) -- the "S" set from the merge-aware
+    scope design -- so a caller can tell an inherited line from one this PR
+    actually authored.
+
+    ``--first-parent`` limits the walk to R's own first-parent chain, so a
+    merge inside the PR range is found, but not one of upstream's OWN internal
+    merges reachable only through a non-first parent -- pulling those in would
+    leak allowance from an older upstream-internal parent (observed: two fork
+    files wrongly went green through one). Each qualifying merge line contributes
+    its fields ``[2:]`` (git's ``--parents`` output is
+    ``<commit> <parent1> <parent2> ...``) -- never field ``[1]``, the first
+    parent, even when that first parent is itself a commit inside R (a fork
+    commit made before the sync merge): exempting it would weaken the gate for
+    the exact lines it exists to catch.
+
+    ``[]`` for a whole-tree/unrecognised label and when R holds no merge.
+    ``None`` only when git itself fails, so a caller can fall back to its own
+    strict, unfiltered behavior rather than treat "no parents" and "unknown" the
+    same way.
+    """
+    pr_range = _pr_range(scope_label)
+    if pr_range is None:
+        return []
+    code, out = _git("rev-list", "--merges", "--first-parent", "--parents", pr_range)
+    if code != 0:
+        return None
+    parents: list[str] = []
+    for line in out.splitlines():
+        fields = line.split()
+        if len(fields) > 2:
+            parents.extend(fields[2:])
+    return parents
+
+
+def added_lines(
+    scope_label: str, *, minus_parents: Sequence[str] = ()
+) -> dict[str, set[int]] | None:
+    """Repo-relative path -> line numbers this change ADDED, or None.
+
+    Uses the diff endpoints named by ``changed_paths``' label, so the added set
+    and the changed-file set always describe the same diff. An unknown label (or
+    a failing git) degrades to None -- the added-line rule is then skipped
+    rather than guessed, and a caller's count rules still apply.
+
+    ``minus_parents`` (default ``()``, the plain callers' path -- byte-identical
+    to the pre-existing behavior) names commits to treat as already-merged-in:
+    a line only survives when it is ALSO added in ``git diff -M P <post>`` for
+    EVERY ``P``, where ``<post>`` is the same post-image ``scope_label`` already
+    diffs to (``HEAD^2`` for ``"merge parents"``, else ``HEAD``). A line already
+    present in some ``P`` shows as unchanged context against that ``P``, so it
+    drops out of the intersection; a line genuinely new to this change is absent
+    from every ``P`` and survives. ``-M`` exempts a line the fork only moved
+    (renamed a file upstream also has), for free, via git's own move detection.
+    If a ``P`` diff fails outright, the untouched, unfiltered set is returned --
+    today's strict answer, never a permissive guess.
+    """
+    if scope_label == "merge HEAD^1..HEAD":
+        proc = _diff("--unified=0", "HEAD^1", "HEAD")
+        post = "HEAD"
+    elif scope_label == "merge parents":
+        proc = _diff("--unified=0", "HEAD^1", "HEAD^2")
+        post = "HEAD^2"
+    elif scope_label.endswith("...HEAD"):
+        proc = _diff("--unified=0", scope_label)
+        post = "HEAD"
+    else:
+        return None
+    if proc.returncode != 0:
+        return None
+    added = _parse_added(proc.stdout)
+    if not minus_parents:
+        return added
+    filtered = added
+    for parent in minus_parents:
+        proc = _diff("-M", "--unified=0", "--no-color", parent, post)
+        if proc.returncode != 0:
+            return added
+        added_vs_parent = _parse_added(proc.stdout)
+        filtered = {
+            rel: kept
+            for rel, lines in filtered.items()
+            if (kept := lines & added_vs_parent.get(rel, set()))
+        }
+    return filtered
 
 
 # ---------------------------------------------------------------------------

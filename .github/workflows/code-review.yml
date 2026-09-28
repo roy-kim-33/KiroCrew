@@ -396,6 +396,15 @@ jobs:
       # rebuild, a formatting sweep) can stay separable from the change it
       # accompanies instead of being squashed into it. Anything beyond that
       # is review-round noise and must be squashed before pushing.
+      #
+      # The count walks FIRST parents only. A merge of the upstream repo into
+      # this fork carries every upstream commit since the last sync, and a
+      # plain `rev-list --count` attributes all of them to the PR. The only way
+      # to pass that is flattening the merge into one ordinary commit, which
+      # makes git forget upstream's history was ever merged, so the next sync
+      # re-conflicts on every file it touched. On the first-parent line a
+      # merge is one commit, same as any other, and non-merge PRs count the
+      # same as before.
       - name: Enforce commit count
         env:
           # base.sha (not the merge-base): rev-list is a commit-range query, so
@@ -405,7 +414,7 @@ jobs:
           HEAD: ${{ github.event.pull_request.head.sha }}
           MAX_COMMITS: "2"
         run: |
-          COMMIT_COUNT=$(git rev-list --count "$BASE".."$HEAD")
+          COMMIT_COUNT=$(git rev-list --count --first-parent "$BASE".."$HEAD")
           if [ "$COMMIT_COUNT" -lt 1 ] || [ "$COMMIT_COUNT" -gt "$MAX_COMMITS" ]; then
             echo "::error::PR must contain 1 or $MAX_COMMITS commits (has $COMMIT_COUNT). Squash before pushing:"
             echo ""

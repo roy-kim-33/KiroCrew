@@ -1,7 +1,7 @@
 """Tests for the claude_code model list assembled by /api/models.
 
 The live backend's advertised set is authoritative and used VERBATIM --
-``_advertised_cc_models`` no longer remaps a modelId through the model
+``_advertised_cc_models`` does not remap a modelId through the model
 registry's canonical keys. That remap conflated Claude Code's own short
 config-option aliases (``opus``, ``sonnet``) with Bedrock-flavored canonical
 keys meant for a different id shape (kiro-cli/acp's own
@@ -86,12 +86,10 @@ class TestAdvertisedCcModels:
         # reach the picker as-is, NOT folded onto a registry canonical key
         # ("opus-4.8-1m") -- that key is a Bedrock-shaped id shape this session
         # never advertises, and selecting the remapped row is rejected by the
-        # adapter (verified live). The registry entry that used to own this
-        # alias is untouched -- this only asserts the picker no longer
-        # detours through it.
-        prov = _FakeProvider(
-            [{"modelId": "opus", "name": "Opus", "description": "Opus 5 · ..."}]
-        )
+        # adapter (verified live). The registry entry that owns this alias
+        # elsewhere is untouched -- this only asserts the picker does not
+        # detour through it.
+        prov = _FakeProvider([{"modelId": "opus", "name": "Opus", "description": "Opus 5 · ..."}])
         out = _advertised_cc_models(_request_with_providers({"s": prov}))
         assert out[0]["model_name"] == "opus"
 
@@ -340,10 +338,11 @@ class TestCcModelsResponseRace:
     """Both reported bugs traced back to one race: switching backend/preset
     invalidates the model-list query the instant the config PATCH resolves,
     well before any session has (re)spawned against the new backend and
-    captured its real catalog. `_cc_models_response` used to have no fallback
-    for that window other than a generic, cross-provider static whitelist --
-    wrong for whichever router is actually configured, and actively
-    misleading on the native lane, which the whitelist was never built for.
+    captured its real catalog. `_cc_models_response` falls back to the lane's
+    last-advertised rows for that window rather than a generic, cross-provider
+    static allowlist -- wrong for whichever router is actually configured, and
+    actively misleading on the native lane, which the allowlist was never
+    built for.
     """
 
     @pytest.fixture(autouse=True)
@@ -435,7 +434,9 @@ class TestCcModelsResponseRace:
         not selectable on native."""
         prov = _FakeProvider([{"modelId": "oc/kimi-k3", "name": "K3", "description": ""}])
         _cc_router_config(monkeypatch, base_url="http://localhost:20128")
-        served = json.loads(_run_async(_cc_models_response(_request_with_providers({"s": prov}))).text)
+        served = json.loads(
+            _run_async(_cc_models_response(_request_with_providers({"s": prov}))).text
+        )
         assert {r["model_id"] for r in served} == {"oc/kimi-k3"}
 
         # Base URL cleared (-> native lane) and no session yet: the router's

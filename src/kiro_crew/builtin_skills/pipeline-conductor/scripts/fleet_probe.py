@@ -795,6 +795,7 @@ _SHELL_OPTS_WITH_OPERAND = frozenset({"-o", "+o", "-O", "+O", "--rcfile", "--ini
 #: an operator can look at and dismiss, while a missing one hides a real unbounded
 #: run for the whole session.
 _TRUSTED_PROGRAM_DIRS = frozenset(
+    # posix-only: resolves /proc/<pid>/exe, so it only runs where these are the dirs
     {"/bin", "/sbin", "/usr/bin", "/usr/sbin", "/usr/local/bin", "/usr/local/sbin"}
 )
 

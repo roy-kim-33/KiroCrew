@@ -25,8 +25,8 @@ from aiohttp.client_exceptions import ClientConnectionResetError
 from kiro_crew import members as members_mod
 from kiro_crew import model_registry
 from kiro_crew.acp.client import AcpModelUnavailable
-from kiro_crew.acp.types import ACP_BACKEND_CLAUDE
 from kiro_crew.agent_discovery import cached_project_agent_names, warm_project_agent_names
+from kiro_crew.agent_sdk.backends import ACP_BACKEND_CLAUDE
 from kiro_crew.agent_sdk.capabilities import MODEL_NAMESPACE_ACP, capabilities_of
 from kiro_crew.config.loader import (
     AUTOCOMPACT_PCT_MAX,

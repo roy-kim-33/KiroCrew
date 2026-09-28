@@ -93,6 +93,11 @@ PR — run `python3 scripts/check_comment_history.py --write-baseline`, which on
 ever lowers and prunes. It refuses when the baseline is absent, so deleting the
 file cannot amnesty the tree; restore it from git instead.
 
+A merge inside the change (an upstream sync) scopes "added" to lines absent from
+the merge's other parent(s), and allows per-file counts up to that parent's —
+a synced-in upstream line is not this change's to answer for, but a line this
+change adds on top of the sync still is.
+
 ## The lint pitfalls
 
 The blocking gates are black (baselined), the subprocess-encoding gate (baselined), the comment-history gate (baselined), isort, flake8 and mypy. Run them before

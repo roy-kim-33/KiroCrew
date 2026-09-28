@@ -50,7 +50,7 @@ def _model_is_text_only_for_session(cfg: Any, model: str | None) -> bool:
     if not model:
         return False
     try:
-        from kiro_crew.acp.vision import decide_image_input_mode
+        from kiro_crew.agent_sdk.drivers.acp import decide_image_input_mode
 
         return (
             decide_image_input_mode(

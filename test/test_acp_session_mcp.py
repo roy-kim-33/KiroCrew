@@ -1042,9 +1042,7 @@ class TestLocalSettingsSeed:
         assert client._clear_stale_wildcard(fifo) is False
         assert stat.S_ISFIFO(fifo.stat(follow_symlinks=False).st_mode)
 
-    @pytest.mark.skipif(
-        not hasattr(os, "O_NOFOLLOW"), reason="O_NOFOLLOW is POSIX-only"
-    )
+    @pytest.mark.skipif(not hasattr(os, "O_NOFOLLOW"), reason="O_NOFOLLOW is POSIX-only")
     def test_clearing_a_stale_wildcard_never_follows_a_symlink(self, tmp_path):
         """O_NOFOLLOW: a link pointing at a real wildcard file is refused, and the
         target it points at is left untouched.

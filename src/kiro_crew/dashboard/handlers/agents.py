@@ -20,7 +20,6 @@ from aiohttp import BodyPartReader, web
 
 from kiro_crew import agent_state, model_registry
 from kiro_crew.acp.client import advertised_model_ids, model_is_unusable
-from kiro_crew.acp.types import ACP_BACKEND_CLAUDE, ACP_BACKEND_OPENCODE
 from kiro_crew.acp_backends import selectable_backend_values
 from kiro_crew.agent import (
     AGENT_FILENAME,
@@ -39,6 +38,7 @@ from kiro_crew.agent_discovery import (
     spec_model,
     spec_str,
 )
+from kiro_crew.agent_sdk.backends import ACP_BACKEND_CLAUDE, ACP_BACKEND_OPENCODE
 from kiro_crew.agent_sdk.capabilities import capabilities_of
 from kiro_crew.agent_sdk.drivers.acp import resolve_pin_spelling
 from kiro_crew.apps.bridges import _mcp_lock as _agent_file_lock
@@ -2069,7 +2069,7 @@ _NATIVE_VISION_FAMILY_PREFIXES = frozenset({"cmc", "oc", "ol", "cx", "ag"})
 
 def _model_supports_vision(model_id: str) -> bool | None:
     """Reported vision capability for a model id, or None when unknown."""
-    from kiro_crew.acp.vision import decide_image_input_mode  # noqa: F811
+    from kiro_crew.agent_sdk.drivers.acp import decide_image_input_mode  # noqa: F811
 
     try:
         from kiro_crew.model_registry import model_supports_vision  # noqa: F811
@@ -2084,7 +2084,7 @@ def _model_supports_vision(model_id: str) -> bool | None:
     # Thread the text-only denylist so oc/deepseek-v4-flash and
     # ol/deepseek-v4-flash:0731 report as text, matching the ACP redirect gate.
     try:
-        from kiro_crew.acp.client import _DEFAULT_TEXT_ONLY_MODELS  # noqa: F811
+        from kiro_crew.agent_sdk.drivers.acp import _DEFAULT_TEXT_ONLY_MODELS  # noqa: F811
         from kiro_crew.config.loader import KiroCrewConfig as _KC  # noqa: F811
 
         try:
@@ -2094,7 +2094,9 @@ def _model_supports_vision(model_id: str) -> bool | None:
             text_only = None
         if text_only is None:
             text_only = tuple(_DEFAULT_TEXT_ONLY_MODELS)
-        mode = decide_image_input_mode(model_id, image_input_mode="auto", text_only_models=text_only)
+        mode = decide_image_input_mode(
+            model_id, image_input_mode="auto", text_only_models=text_only
+        )
         if mode != "auto":
             return mode == "native"
     except Exception:
@@ -2107,8 +2109,8 @@ def _cc_model_row(model_id: str, description: str = "") -> dict:
 
     ``context_window_tokens`` comes from the central resolver (kiro-list cache >
     static registry > supplementary map > ``[1m]`` heuristic), never a hardcoded
-    literal — the fork previously pinned every router model at 200k, which made
-    a 1M model (e.g. ``ocg/deepseek-v4-flash``) read as 200K in the picker. The
+    literal — a hardcoded 200k would misreport a 1M model (e.g.
+    ``ocg/deepseek-v4-flash``) as 200K in the picker. The
     frontend learns this value into ``LIVE_WINDOWS``, so the composer's context
     meter follows it too. Unknown ids resolve to the 1M reference rather than a
     silent 200k.
@@ -2197,7 +2199,7 @@ async def _opencode_models_response(request: web.Request) -> web.Response:
     if cfg.agent.model_whitelist:
         rows = [r for r in rows if r["model_id"] in cfg.agent.model_whitelist]
     if not rows:
-        from kiro_crew.acp.client import AcpClient  # noqa: F811
+        from kiro_crew.agent_sdk.drivers.acp import AcpClient  # noqa: F811
 
         rows = [_cc_model_row(mid) for mid in sorted(AcpClient.router_model_whitelist())]
     return web.json_response(rows)
@@ -2226,9 +2228,7 @@ async def _live_router_cc_models(base_url: str, api_key: str) -> list[dict]:
 
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as session:
-            async with session.get(
-                f"{base_url}/v1/models", headers={"x-api-key": api_key}
-            ) as resp:
+            async with session.get(f"{base_url}/v1/models", headers={"x-api-key": api_key}) as resp:
                 if resp.status != 200:
                     return []
                 data = await resp.json()
@@ -2274,7 +2274,7 @@ async def _cc_models_response(request: web.Request) -> web.Response:
     empty result (the picker's existing "still loading" state) beats
     confidently showing 94 models that namespace-mismatch this account.
     """
-    from kiro_crew.acp.client import AcpClient  # noqa: F811
+    from kiro_crew.agent_sdk.drivers.acp import AcpClient  # noqa: F811
 
     cfg = KiroCrewConfig.load()
     base_url = (cfg.agent.provider_base_url or "").rstrip("/")
@@ -3915,7 +3915,9 @@ async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
         if "model" in body:
             # Validated before the write, reusing the config loaded just above so
             # this costs no extra read.
-            model_reason = _model_pin_rejected(pending_model, request, getattr(cfg.agent, "acp_backend", ""))
+            model_reason = _model_pin_rejected(
+                pending_model, request, getattr(cfg.agent, "acp_backend", "")
+            )
             if model_reason:
                 return web.json_response(
                     {"error": model_reason, "code": "invalid_model"}, status=400
@@ -4755,7 +4757,7 @@ async def api_provider_status(request: web.Request) -> web.Response:
     required binary installed.  Returns ``{opencode: bool, claude_code: bool}``
     so the frontend can warn users who select a backend without the binary.
     """
-    from kiro_crew.acp.client import _resolve_claude_acp_bin, _resolve_opencode_bin
+    from kiro_crew.agent_sdk.drivers.acp import _resolve_claude_acp_bin, _resolve_opencode_bin
 
     opencode_ok = _resolve_opencode_bin() is not None
     # claude-agent-acp resolution can be slow (npm glob); run off the loop.
