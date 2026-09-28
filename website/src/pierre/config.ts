@@ -12,6 +12,8 @@
  */
 import type { BaseCodeOptions, BaseDiffOptions, HunkSeparators, ThemesType, ThemeTypes } from '@pierre/diffs'
 
+import { STATE_ROW_ICON } from './treeStateRows'
+
 /** Diff options as our surfaces use them: the deprecated `custom` hunk
  *  separator (a function renderer) is excluded so the shape stays assignable
  *  to Pierre's component-level `FileDiffOptions`. */
@@ -49,6 +51,29 @@ export const PIERRE_COMPACT_HEADER_CSS = `
 [data-diffs-header]{--diffs-gap-block:6px;font-size:12px;line-height:18px}
 [data-change-icon]{width:13px;height:13px}
 `
+
+/** The chat file-row header look, shared by the two places that draw it.
+ *
+ *  `FileChangeChips` injects these into Pierre's shadow header through
+ *  `unsafeCSS` (`ROW_CSS_BASE` in components/fileChangeChipsCss.ts), and the
+ *  light-DOM header rows the oversized pair draws for itself — its plain
+ *  fallback and its opted-in line-by-line state (`PlainFilePairHeader`) — apply
+ *  the same values inline, because a shadow-scoped stylesheet cannot reach
+ *  them. One source for the numbers, so a card's header reads the same
+ *  whether Pierre or this code draws it, and an oversized row's header cannot
+ *  drift from the within-budget row above it.
+ *
+ *  Background: half-way between the chat canvas and --bg-elevated — the full
+ *  elevated tone reads as prominently as the composer and pulls the eye to the
+ *  header instead of the change it labels. Metadata group: a fixed width so the
+ *  diffstat indicator starts at the SAME x on every row (the counts are 1–3
+ *  digits wide and Pierre omits a count span entirely when its side is zero,
+ *  so an unfixed group narrows on an additions-only file); sized for two 4ch
+ *  counts, the 46px indicator and the gaps between them. */
+export const DIFF_HEADER_BG_CSS = 'color-mix(in srgb,var(--bg-elevated) 50%,var(--bg))'
+export const DIFF_HEADER_PADDING_INLINE_PX = 10
+export const DIFF_HEADER_COUNT_MIN_WIDTH_CH = 4
+export const DIFF_HEADER_META_W_PX = 124
 
 /** Gives every collapsed-region separator the separator tint.
  *
@@ -94,6 +119,36 @@ export const PIERRE_EDIT_CARET_ALIGN_CSS = `
 [data-code]{padding-top:0}
 `
 
+/** Styles the workspace tree's STATE rows -- the one row the tree puts under a
+ *  childless expanded folder (see `./treeStateRows`). Pierre has no slot for
+ *  such a row, so the tree feeds each one to the model as a synthetic child
+ *  whose basename is the label followed by `STATE_ROW_MARKER`. This sheet does
+ *  NOT select by that marker: a real file can end in U+200B as well (an agent
+ *  wrote it, a clone brought it), and a sheet keyed on the path would paint it
+ *  inert. It selects by the decoration the wrapper's `renderRowDecoration`
+ *  emits for a planned row only (`STATE_ROW_ICON`, an `<svg data-icon-name>`
+ *  with no symbol behind it) -- the same plan its selection and context-menu
+ *  guards consult -- and never by the label, which follows the active language
+ *  while this sheet is fixed at model construction. It makes the row read as a
+ *  status line rather than a file: muted text, no file glyph (the lane stays,
+ *  so the label keeps the child indentation), and no pointer response -- no
+ *  hover wash, no click, no "..." menu affordance. Keyboard focus still
+ *  reaches the row like any treeitem; the wrapper's selection guard keeps
+ *  Enter from opening it. Applied through `unsafeCSS` (`@layer unsafe`,
+ *  outranking the library's `@layer base`).
+ *
+ *  Deliberately NOT italic: Pierre paints a label as two `overflow: hidden`
+ *  spans around its middle-truncation point, and an oblique glyph's overhang is
+ *  clipped at each span's edge -- "file" rendered as "tile" in the capture. */
+const STATE_ROW_ICON_SVG = `[data-item-section="decoration"] [data-icon-name="${STATE_ROW_ICON}"]`
+const STATE_ROW = `[data-type="item"]:has(${STATE_ROW_ICON_SVG})`
+export const PIERRE_TREE_STATE_ROW_CSS = `
+${STATE_ROW}{pointer-events:none;color:var(--trees-fg-muted)}
+${STATE_ROW} [data-item-section="icon"]{visibility:hidden}
+${STATE_ROW} [data-item-section="action"]{display:none}
+${STATE_ROW_ICON_SVG}{display:none}
+`
+
 /** Highlighting worker pool size. Each worker is spawned eagerly at pool
  *  init and loads its own copy of the highlighter bundle plus the WASM regex
  *  engine, so the whole pool is one up-front cost — which is why the pool is
@@ -104,6 +159,29 @@ export const PIERRE_EDIT_CARET_ALIGN_CSS = `
  *  how many files tokenize concurrently — four covers a chat message or PR
  *  with several diffs open at once without spawning the library's default 8. */
 export const PIERRE_WORKER_POOL_SIZE = 4
+/** File-pair inputs above either limit bypass Pierre before its lazy chunk loads.
+ * `MultiFileDiff` builds a raw diff synchronously on the renderer thread before
+ * workers or row virtualization can help. Benchmarks of Pierre 1.3.5 put 400
+ * fully changed lines at ~20 ms on a normal host, leaving headroom under a
+ * 100 ms long-task budget at 4x CPU slowdown; 1,000 lines already takes ~120 ms
+ * before React rendering or highlighting. The UTF-16 code-unit ceiling is cheap
+ * enough to run while editing and bounds unusually wide JavaScript strings. */
+export const PIERRE_FILE_PAIR_MAX_LINES_PER_SIDE = 400
+export const PIERRE_FILE_PAIR_MAX_TOTAL_CODE_UNITS = 128 * 1024
+
+/** Worker bootstrap loads WASM, themes, and languages and gets a wider budget
+ * than ordinary render requests so a slow cold host does not exhaust recovery. */
+export const PIERRE_WORKER_INITIALIZATION_TIMEOUT_MS = 120_000
+
+/** A worker receives one render request at a time. If it has not answered within
+ * this window, recycle the complete manager so sibling requests cannot queue. */
+export const PIERRE_WORKER_REQUEST_TIMEOUT_MS = 30_000
+
+/** Short retries cover transient crashes; repeated failures open a cooldown. */
+export const PIERRE_WORKER_RETRY_DELAYS_MS = [250, 1_000] as const
+export const PIERRE_WORKER_COOLDOWN_MS = 30_000
+export const PIERRE_WORKER_STABLE_AFTER_MS = 60_000
+
 /** Which regex engine the highlight workers tokenize with.
  *
  *  Pierre defaults to `shiki-js`, which runs TextMate grammar patterns through

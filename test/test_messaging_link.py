@@ -26,6 +26,7 @@ from kiro_crew.messaging.link import (
     legacy_dashboard_mirror_key,
     rebind_conversation_location,
     should_rotate_generation,
+    split_dm_session_key,
 )
 from kiro_crew.session_map import ConversationOwnershipConflict
 
@@ -70,6 +71,19 @@ class TestBuildDmSessionKey:
             == "unified:a:gen3"
         )
 
+    def test_split_standard_and_unified_generations(self) -> None:
+        assert split_dm_session_key("telegram:a:direct:1:gen3") == (
+            "telegram:a:direct:1",
+            3,
+        )
+        assert split_dm_session_key("unified:a:gen4") == ("unified:a", 4)
+        assert split_dm_session_key("unified:a") == ("unified:a", 0)
+
+    def test_split_rejects_noncanonical_unified_shapes(self) -> None:
+        assert split_dm_session_key("unified") is None
+        assert split_dm_session_key("unified::gen2") is None
+        assert split_dm_session_key("unified:a:extra:gen2") is None
+
     def test_unknown_scope_falls_back_to_per_channel_peer(self) -> None:
         assert build_dm_session_key(
             "telegram", "a", "1", dm_scope="bogus"
@@ -82,7 +96,7 @@ class TestBuildDmSessionKey:
         )
 
     def test_unified_scopes_only_direct_dms_not_forum(self) -> None:
-        # SECURITY (issue #211, PR #219 Codex HIGH): dm_scope=unified must NOT
+        # SECURITY: dm_scope=unified must NOT
         # collapse a forum Topic into the shared DM bucket — that would leak
         # private DM content into a group Topic (and vice versa). A forum route
         # keeps its FULL bucket regardless of dm_scope.
@@ -224,19 +238,37 @@ class TestBindOriginMirror:
         assert bind_origin_mirror(sess, key="k", location=_HERE) is False
         assert sess.mirror_links["k"] == chosen
 
-    def test_the_unrouted_slack_placeholder_does_not_block_the_bind(self) -> None:
-        """``set_channel`` writes the namespaced bucket into ``slack_channel_id``.
-
-        ``get_mirror_link`` synthesizes a Slack link from that field whenever no
-        explicit mirror row exists, so the first turn of every new channel session
-        reads one back. An empty thread is Slack's own clear sentinel and never
-        enters the reverse index, so nothing can be delivered through it — it is
-        bookkeeping, not a binding.
+    def test_the_first_turns_bucket_row_does_not_block_the_bind(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """``set_channel`` writes the namespaced bucket into ``slack_channel_id``
+        with no thread, so every new channel session carries that row on its first
+        turn. It is not a binding: an empty thread is Slack's own clear sentinel and
+        never enters the reverse index, so nothing can be delivered through it. The
+        STORE reads it as no mirror -- ``SessionMap.get_mirror_link`` never
+        synthesizes a Slack mirror without a thread -- so this reader carries no
+        copy of that rule and sees ``None``. A Slack binding that names a thread is
+        deliberate and is left alone like any other.
         """
+        from kiro_crew.session_map import SessionMap
+
+        monkeypatch.setattr("kiro_crew.session_map.config_dir", lambda: tmp_path)
+        store = SessionMap()
         sess = _Sessions()
-        sess.mirror_links["k"] = ChannelLink("slack", channel_id="discord:c1")
-        assert bind_origin_mirror(sess, key="k", location=_HERE) is True
-        assert sess.mirror_links["k"] == _HERE
+        sess.get_mirror_link = store.get_mirror_link  # type: ignore[method-assign]
+        sess.set_mirror_link = store.set_mirror_link  # type: ignore[method-assign]
+        key = "discord:kirocrew:direct:u1"
+        store.set_slack_link(key, "", "discord:u1")
+        assert store.get_mirror_link(key) is None
+        assert bind_origin_mirror(sess, key=key, location=_HERE) is True
+        assert store.get_mirror_link(key) == _HERE
+
+        threaded = "discord:kirocrew:direct:u2"
+        store.set_slack_link(threaded, "1786300000.000100", "C0OPS")
+        assert bind_origin_mirror(sess, key=threaded, location=_HERE) is False
+        assert store.get_mirror_link(threaded) == ChannelLink(
+            "slack", channel_id="C0OPS", thread_id="1786300000.000100"
+        )
 
     def test_a_unified_bucket_is_never_bound(self) -> None:
         """``dm_scope="unified"`` collapses every user's DMs into one bucket.

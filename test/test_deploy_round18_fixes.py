@@ -1,4 +1,4 @@
-"""Tests for deploy Round 18 fixes.
+"""Tests for a batch of deploy fixes.
 
 F1: profiles GET redacts `default` and `available` names.
 F2: deploy snapshots strip .git before scan/upload (both scripts).
@@ -78,9 +78,15 @@ class TestF3OACNameVerification:
 
 class TestF4MCPResponseRedaction:
     def test_all_textual_paths_redacted(self):
-        assert "_deploy_redact(str(d['error']))" in MCP_DEPLOY
+        assert '_deploy_redact(str(d["error"]))' in MCP_DEPLOY
         assert '_deploy_redact(str(d.get("findings", "")))' in MCP_DEPLOY
         assert "_deploy_redact(str(d.get('scan', 'clean')))" in MCP_DEPLOY
+        # The error payload was split into a plain banner sentence plus a
+        # technical `details` string and a runnable `remediation` command. Both
+        # new fields are relayed to the LLM, so both are textual paths that must
+        # go through the same redaction.
+        assert '_deploy_redact(str(d.get("details", "")))' in MCP_DEPLOY
+        assert '_deploy_redact(str(d.get("remediation", "")))' in MCP_DEPLOY
 
 
 class TestF5PendingIdentityBinding:

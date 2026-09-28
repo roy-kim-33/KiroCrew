@@ -2,8 +2,34 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any
+
+
+def resolved_row_identity(slot: Any) -> str:
+    """The identity the sidebar renders this slot under.
+
+    A purely local session is its own key. A remote-bound one -- minted through
+    ``create_peer_slot`` or adopted from a peer row -- is ``<instance_id>:<peer_key>``,
+    the same identity the peer row carries before anything is bound to it.
+
+    That equality is the whole point. The sidebar keys rows on this value (React
+    key, ``layoutId``, ``data-session-row``, the hover-hold seats), so a binding
+    that preserves it re-renders ONE row where a fresh key would mount a second
+    element beside the row the user clicked and leave the browser to notice they
+    are the same conversation.
+
+    The invariant that buys, and the trap in it: for a remote-bound session this
+    identity is NOT the local slot key, and never becomes it. Read ``key`` when you
+    need the local slot -- switching sessions, loading a transcript, addressing the
+    slot on the wire. Splitting this string to recover that key yields the PEER's
+    key, which is routable only inside a request sent back through that instance.
+    """
+    instance_id = getattr(slot, "instance_id", "") or ""
+    remote_slot = getattr(slot, "remote_slot", "") or ""
+    if getattr(slot, "is_remote", False) and instance_id and remote_slot:
+        return f"{instance_id}:{remote_slot}"
+    return str(getattr(slot, "key", "") or "")
 
 
 class SlotProjection:
@@ -118,8 +144,17 @@ class SlotProjection:
         resolve_effective_agent: Callable[[str, str | None], str],
         budget_source_links: Callable[[list[dict]], list[dict]],
         project_source_links: Callable[[list[dict], bool], list[dict]],
+        coordinator_pending: Sequence[dict] = (),
     ) -> dict:
-        """Serialize the ordered public slot summary without owning slot state."""
+        """Serialize the ordered public slot summary without owning slot state.
+
+        ``coordinator_pending`` is the list of live ``ApprovalCoordinator``
+        records whose ``slot`` is this slot -- a sub-agent spawn gate or a tool
+        approval raised inside a running sub-agent. Their futures live on the
+        state-level registry, not on ``slot._approval_futures``, so without this
+        input the slot reads as idle while its owner is parked on an approval.
+        Oldest first; the projection reads only the first one for the card.
+        """
         last_ts = slot.messages[-1].get("ts", "") if slot.messages else ""
         last_msg = ""
         has_options = False
@@ -160,9 +195,10 @@ class SlotProjection:
             if found_conv and last_msg and last_activity_ts:
                 break
 
-        pending_approval = any(not future.done() for future in slot._approval_futures.values())
+        slot_pending = any(not future.done() for future in slot._approval_futures.values())
+        pending_approval = slot_pending or bool(coordinator_pending)
         last_turn_ts = last_ts
-        if slot.running:
+        if slot.turn_running:
             prompt_ts = next(
                 (
                     message.get("ts") or ""
@@ -177,17 +213,20 @@ class SlotProjection:
                 last_turn_ts = latest_transcript_ts(prompt_ts, queued_ts) or queued_ts
 
         waiting_for_input = (
-            not slot.running
+            not slot.turn_running
             and not has_options
             and not pending_approval
             and bool(slot.messages)
             and last_conv_role == "assistant"
         )
         needs_input = bool(slot._question_pending)
-        interrupted = not slot.running and is_turn_interrupted(slot.messages)
+        interrupted = not slot.turn_running and is_turn_interrupted(slot.messages)
 
         pending_approval_info: dict[str, str] | None = None
-        if pending_approval:
+        if slot_pending:
+            # The transcript row is consulted only for a SLOT-registry future:
+            # a coordinator approval writes no row, and a stale unresolved row
+            # from an earlier turn must not describe it.
             for message in reversed(slot.messages):
                 if message.get("role") != "permission":
                     continue
@@ -201,21 +240,47 @@ class SlotProjection:
                     "request_id": redact(meta.get("approval_id", meta.get("request_id", ""))),
                 }
                 break
+        if pending_approval_info is None and coordinator_pending:
+            # No unresolved permission row supplied the card: the pending
+            # approval is a coordinator one, whose record never reaches the
+            # transcript. Its fields were redacted at registration; the redact
+            # here keeps this branch on the same wire contract as the row above.
+            record = coordinator_pending[0]
+            approval_id = str(record.get("id") or "")
+            pending_approval_info = {
+                "tool": redact(str(record.get("tool") or "")),
+                "tool_input": redact(str(record.get("tool_input") or "")),
+                "tool_kind": "spawn" if approval_id.startswith("spawn:") else "",
+                "request_id": redact(approval_id),
+            }
 
         return {
             "key": slot.key,
             "title": redact(slot.display_title),
             "agent": slot.agent,
+            "agent_kind": getattr(slot, "agent_kind", ""),
             "effective_agent": resolve_effective_agent(slot.agent, slot.project or None),
             "model": slot.model,
+            # Whether this session's turns ask Jev which model tier to run on
+            # (the picker's "Auto (Jev)" entry). Shipped on every slot, not only
+            # the routed ones, so the picker branches on a field that is always
+            # present: an absent key and "the owner picked a model by hand" would
+            # otherwise be the same reading, and a stale client would show a
+            # routed session as pinned.
+            "jev_route": bool(getattr(slot, "jev_route", False)),
             # The backend's own withhold verdict for `model`: true = the account
             # cannot run the pin (this session is on the backend default), false
             # = it can, null = not known yet. Carried so the frontend reads the
             # answer instead of inferring it from whether the pin appears in
             # `GET /api/models` -- a list every unrelated filter (deprecation,
-            # curation) narrows, which silently turned those filters into
-            # entitlement signals (#1819). DISPLAY only; never a write source.
+            # curation) narrows, which would silently turn those filters into
+            # entitlement signals. DISPLAY only; never a write source.
             "model_withheld": slot.model_withheld,
+            # The model the live session actually resolved to, so a slot that
+            # inherits (no pin, or a withheld one) can be NAMED rather than
+            # shown as "auto". "" = not known. DISPLAY only, like the verdict
+            # above: never a write source.
+            "served_model": slot.served_model,
             "reasoning_effort": slot.reasoning_effort,
             "mode": slot.mode,
             "surface": slot.mode,
@@ -225,15 +290,26 @@ class SlotProjection:
             # ones) so the frontend can branch on a field that is always
             # present: an absent key and "runs locally" would be the same
             # reading, and a stale client would then render a peer session as
-            # local. The binding's third field, `remote_slot`, is deliberately
-            # NOT projected: it is the PEER's slot key, meaningful only inside a
-            # request routed back through that instance, and no browser code has
-            # any use for it — these two carry every branch the frontend makes.
+            # local. The binding's third field, `remote_slot`, is still NOT
+            # projected: it is the PEER's slot key, routable only inside a
+            # request sent back through that instance, and shipping a routable
+            # peer key to a browser buys nothing.
+            #
+            # What the browser does need from it is the row's IDENTITY, so that
+            # is projected instead, already resolved. A remote-bound session --
+            # minted through `create_peer_slot` or adopted from a peer row --
+            # identifies as `<instance_id>:<peer_key>`, which is exactly the
+            # identity the peer row carried before it was bound. Same identity
+            # before and after means the sidebar re-renders ONE row rather than
+            # replacing the row the user clicked with a sibling, and it means a
+            # log line, a `data-session-row` selector and a trace all stay
+            # continuous across the adopt instead of splitting in two.
             "executor": slot.executor,
             "instance_id": slot.instance_id,
+            "row_identity": resolved_row_identity(slot),
             "artifact": slot._artifact,
             "messages": len(slot.messages),
-            "running": slot.running,
+            "running": slot.turn_running,
             "orchestrating": slot._in_stage_execution,
             "queue_depth": slot.queue_depth,
             "stopping": slot._stopping,
@@ -272,6 +348,7 @@ class SlotProjection:
             "folder_id": slot.folder_id,
             "pinned": slot.pinned,
             "tags": list(slot.tags),
+            "tags_revision": getattr(slot, "tags_revision", ""),
             "color_index": slot.color_index,
             "color_hex": slot.color_hex,
             "color_theme": slot.color_theme,

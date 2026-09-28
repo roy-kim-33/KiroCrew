@@ -33,11 +33,11 @@ from __future__ import annotations
 # removes that class of misconfiguration rather than asking anyone to keep two
 # numbers in sync by hand.
 #
-# REGISTERED, not connected, which is what this used to count. A live count races
-# tunnel startup: a crew that finished connecting a moment after the dashboard
-# polled fell outside the cap and had its pane evicted. Exactly one crew looked
-# broken, and which one depended on connection order -- so it moved on every
-# restart and read as a random failure rather than as a cap.
+# REGISTERED, not connected. Counting connected (a live count) races
+# tunnel startup: a crew that finishes connecting a moment after the dashboard
+# polls falls outside the cap and has its pane evicted. Exactly one crew looks
+# broken, and which one depends on connection order -- so it moves on every
+# restart and reads as a random failure rather than as a cap.
 WARM_SET_CAP_AUTO: int = 0
 DEFAULT_WARM_SET_CAP: int = WARM_SET_CAP_AUTO
 
@@ -50,14 +50,16 @@ DEFAULT_WARM_SET_CAP: int = WARM_SET_CAP_AUTO
 # clamped by this: an operator who names a number has made the budget decision
 # themselves, including a number larger than this.
 #
-# 8 is a judgement, not a measurement: comfortably above the 5 this default used
-# to be (so no install gets a tighter warm set than it had), and still in the
-# range a single renderer has been seen to carry. The per-pane cost that bounds
+# 10 is a product target, not a measurement: it is the fleet size the Remote
+# Crew surface is designed around, raised from 8 without removing the resource
+# bound. Ten warm panes has not been measured on a single renderer; the number
+# an install can actually carry is still the operator's call via an explicit
+# cap. The per-pane cost that bounds
 # it is CPU and worker threads rather than heap -- each pane is a full SPA with
 # its own polling and WebSocket, and a pane the user opens a diff in spawns its
 # own highlighter worker pool (see website/src/main.tsx on why those are no
 # longer spawned eagerly).
-WARM_SET_CAP_AUTO_CEILING: int = 8
+WARM_SET_CAP_AUTO_CEILING: int = 10
 
 # First local loopback port handed out for an SSH ``-L`` forward. The port
 # allocator increments from here, skipping ports already in use and ports the
@@ -168,6 +170,48 @@ MINT_TIMEOUT_CEILING_SECS: float = 120.0
 # TTL, before the 20h cap. 0.8 = refresh at 80% elapsed.
 DEFAULT_TOKEN_REFRESH_FRACTION: float = 0.8
 
+# Ceiling on the lifetime of a credential minted for ANOTHER gateway's pane (the
+# hub-lending mint). A crew's own row TTL governs this gateway's own pane and is
+# left alone; only the lent credential is capped, and the cap is taken as a
+# MINIMUM against the row so a row already shorter stays shorter.
+#
+# It is a ceiling on an EXPOSURE WINDOW rather than a tuning knob. A lent port is
+# held by this gateway for the life of the lease, and a socket cannot outlive the
+# process holding it: a gateway exit releases every hold while the credential
+# naming that port stays valid, because the credential was issued by the remote
+# crew and nothing here can invalidate it. So the window between this gateway
+# exiting and the credential dying IS one of these TTLs, and its length is the
+# only part of that window this gateway gets to choose.
+#
+# 30m rather than something smaller because the refresh loop re-mints at
+# DEFAULT_TOKEN_REFRESH_FRACTION of the lifetime, which leaves 20% of it as the
+# margin a re-mint has to complete in. At 30m that margin is 360s, against a
+# worst case of MINT_TIMEOUT_CEILING_SECS + 15 for a chained mint and
+# DEFAULT_SSM_MINT_TIMEOUT_SECS for an SSM one -- so the slowest mint in the tree
+# finishes inside it with room over. A cap low enough to eat that margin would
+# expire the token mid-mint and the hub's pane would reload on every cycle.
+LENT_HOP_TTL_CAP: str = "30m"
+
+# The retained-field bounds for the hop-lease map, which `a-bound-bounds-every-field-it-
+# retains` requires of every field the registry keeps. Both are enforced twice: at
+# ADMISSION in `lend_hop`, which refuses rather than trims because a refused mint is a
+# credential never issued, and at LOAD, which cannot refuse (a foreign or corrupted write
+# is already on disk) and so clamps instead.
+#
+# 64 live leases through one gateway. A lease exists only while a chained credential
+# against that port is valid, so this bounds concurrently-chained crews, not crews: the
+# warm-set cap is a single digit and nobody chains 64 crews behind one parent. Startup
+# binds one listening socket per non-in-use lease, so this is also the ceiling on that
+# descriptor burst.
+HOP_LEASE_MAX: int = 64
+
+# Must equal ``ttl_to_seconds(LENT_HOP_TTL_CAP)``; pinned by a test rather than computed
+# here, because `ttl_to_seconds` lives in ``token_mint`` and the registry must not import
+# it (the registry is below the mint in the dependency order). A stored deadline further
+# out than this cannot have come from this gateway's writer, which already clamps to the
+# cap, so clamping at load bounds what a foreign write can reserve.
+HOP_LEASE_DEADLINE_CAP_SECS: int = 30 * 60
+
 # Timeout (secs) for the loopback liveness probe that validates a *stored* token
 # before the API hands it to the browser on (re)connect. A stored token can go
 # stale while the tunnel stays CONNECTED (a failed self-heal re-mint, or a remote
@@ -240,17 +284,38 @@ DEFAULT_SEARCH_PROXY_TIMEOUT_SECS: float = 6.0
 SEARCH_REPLY_MAX_BYTES: int = 4 * 1024 * 1024
 
 # Timeout (secs) for one peer capability read over an already-open tunnel (GET
-# the peer's /api/version, /api/agents, /api/models, /api/effort-levels or
-# /api/workspaces — no SSH spawn). Larger than the token probe (2s) because the
-# peer does real work for some of these (the model list can round-trip to its
-# own provider), and kept as short as that work allows because a capability read
-# blocks a chat header from rendering: a user watching an empty model picker is
-# better served by a fast "peer did not answer" than by a long wait. It is the
-# one peer budget ABOVE the federated-search timeout (6s), which fans out reads
-# that a partial result set can absorb; a missing capability read has no partial
-# form — the picker is simply empty — so it is the one worth waiting out.
-# The reads run concurrently, so this is the worst-case latency for the set.
+# the peer's /api/version, /api/agents, /api/effort-levels or /api/workspaces —
+# no SSH spawn; /api/models carries its own larger budget below). Larger than
+# the token probe (2s) because the peer does real work for some of these, and
+# kept as short as that work allows because a capability read blocks a chat
+# header from rendering: a user watching an empty picker is better served by a
+# fast "peer did not answer" than by a long wait. It sits above the
+# federated-search timeout (6s), which fans out reads that a partial result set
+# can absorb; a missing capability read has no partial form — the picker is
+# simply empty — so it is the one worth waiting out.
+# The reads run concurrently, so the slowest budget in the set is the
+# worst-case latency for the whole aggregated reply.
 DEFAULT_CAPABILITY_PROXY_TIMEOUT_SECS: float = 8.0
+
+# Timeout (secs) for the peer's /api/models capability read specifically. The
+# other four reads answer from state the peer already holds, but the model list
+# is the one read whose COLD path runs real subprocess work on the peer: up to
+# 5s of sandbox-backend detection (_SANDBOX_BACKEND_PROBE_TIMEOUT_SECS in
+# sandbox.py) plus up to 10s of `kiro-cli chat --list-models`
+# (_LIST_MODELS_SUBPROCESS_TIMEOUT_SECS in dashboard/handlers/agents.py), plus
+# up to 3s of entitlement revalidation
+# (_READ_PATH_PROBE_DEADLINE_SECS in acp/session_handle.py, bounding the
+# read-path probe before the picker narrows) before the first reply is cached,
+# ~18s worst case end to end (5 + 10 + 3 < 20). Each term is a named production
+# bound, and the proxy test sums those names.
+# Budgeting it at the shared 8s guarantees the cold read is killed by this side
+# while the peer's own bounded work is still running, and the aggregator then
+# reports `capability_unreachable` for a peer that is healthy — the model
+# picker of every fresh remote-bound chat opens empty. 20s clears the
+# peer's worst case with margin without turning a genuinely dead tunnel into a
+# minute-long hang; the reads run concurrently, so the four cheap reads still
+# settle at 8s and only the model list waits this long.
+DEFAULT_MODELS_CAPABILITY_PROXY_TIMEOUT_SECS: float = 20.0
 
 # Byte ceiling for one peer capability reply, enforced BEFORE JSON decoding for
 # the same reason as the search cap above. Sized for the largest honest payload
@@ -258,6 +323,50 @@ DEFAULT_CAPABILITY_PROXY_TIMEOUT_SECS: float = 8.0
 # tens of KiB each even on a heavily-configured gateway, so 2 MiB only ever
 # bites on a hostile or broken peer.
 CAPABILITY_REPLY_MAX_BYTES: int = 2 * 1024 * 1024
+
+# Timeout (secs) for asking a parent crew to mint a token for a crew chained
+# behind it. The parent answers by running `kirocrew token` over ITS OWN hop to
+# that crew, so the budget has to cover the parent's whole remote mint plus the
+# round trip through the hub's forward to the parent -- which is why it is not
+# the 8s capability budget, whose reads answer from state the peer already holds.
+# It sits ABOVE the widest mint the parent can arm. Not above SSM's DEFAULT alone:
+# `mint_timeout_secs` is operator-settable up to MINT_TIMEOUT_CEILING_SECS, so the
+# ceiling plus relay margin is the only bound that holds for every configuration.
+# That ordering is the point: the parent's own timeout fires first, so a slow crew
+# is reported as a mint failure carrying the parent's reason rather than as an
+# unreachable parent. The budget spans the WHOLE call including its single retry,
+# not each attempt, so the worst case here is what a caller holding a lock waits for.
+DEFAULT_CHAINED_MINT_TIMEOUT_SECS: float = MINT_TIMEOUT_CEILING_SECS + 15.0
+
+# Byte ceiling for one chained-mint reply, enforced BEFORE JSON decoding. The
+# honest payload is one token and one port -- a few hundred bytes -- so 64 KiB is
+# already orders of magnitude of slack and only ever bites on a hostile or broken
+# parent. Far tighter than the capability cap above because, unlike a roster, this
+# reply has no list in it whose length depends on how the parent is configured.
+CHAINED_MINT_REPLY_MAX_BYTES: int = 64 * 1024
+
+# Byte ceiling for one peer's live-slots reply, enforced BEFORE JSON decoding for
+# the same reason as the two caps above. The peer answers with a full slot
+# projection per OPEN session — a few KiB each — so even a gateway holding a
+# hundred open sessions lands well under 1 MiB; 4 MiB only ever bites on a
+# hostile or broken peer.
+#
+# Its OWN constant rather than borrowing CAPABILITY_REPLY_MAX_BYTES, and 4 MiB
+# rather than that cap's 2 MiB, because the two bound different payload SHAPES —
+# which is the same split that already separates the two caps above. A capability
+# reply is fixed-shape: one agent roster, one model list, sized by how the peer is
+# configured and not by how much it is being used. This reply and the federated
+# search one are UNBOUNDED-CARDINALITY lists — N open sessions, N search hits —
+# whose honest size scales with a peer's workload, so they carry the looser bound
+# and the search cap's 4 MiB is the precedent this follows.
+#
+# Sharing one constant across endpoints that differ that way is the actual hazard:
+# each of these comments records the specific honest payload its number was sized
+# against, and one symbol cannot hold three such rationales. A later change
+# raising the capability cap for a grown model list would silently loosen this
+# read too, and tightening this one after a memory incident would break the model
+# picker — neither of which the changing author would see.
+PEER_SLOTS_REPLY_MAX_BYTES: int = 4 * 1024 * 1024
 
 
 # Accepted shape for a dashboard-token lifetime: a positive integer of at most

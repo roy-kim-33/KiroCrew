@@ -177,7 +177,7 @@ appends every other JSON line verbatim (`history_projection.py`,
 `TranscriptReadProjection`).
 
 One thing to *not* do: leave the new role out of `_QUESTION_RETIRING_ROLES`
-(`dashboard/state.py:2063`, currently `{user, nudge}`, mirrored by the frontend's
+(`dashboard/state.py`, currently `{user}`, mirrored by the frontend's
 `QUESTION_RETIRING_ROLES`). A marker must not retire a pending question card.
 Default behaviour is already correct; this is a note against a well-meaning later
 edit.
@@ -588,7 +588,7 @@ this section.
 
 **Have the agent print `---` in its message.** This already draws a rule today:
 `MarkdownRenderer` maps a markdown thematic break to `<hr>`
-(`website/src/components/MarkdownRenderer.tsx:984`), so an assistant message
+(the `hr` entry of `ELEMENT_OVERRIDES` in `website/src/components/markdown/elements.tsx`), so an assistant message
 containing `---` renders a horizontal line with no new code at all. It is the
 cheapest thing that produces the *pixels*, and it is worth saying why it is not
 the feature. The rule is inside one message's content, so there is no row to

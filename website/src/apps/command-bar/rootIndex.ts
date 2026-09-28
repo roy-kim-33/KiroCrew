@@ -42,15 +42,33 @@ export type RootRowKind =
   | 'prompt'
 
 /**
- * The groups the root is allowed to show, in display order.
+ * The groups the root is allowed to show, in the order the IDLE page displays them.
+ *
+ * It is the display order only while the query is empty. A typed query ranks every
+ * row on its match across all groups, so these blocks are the shape of the page
+ * nobody has typed into — see `rankRootRows`.
  *
  * `attention` leads and is usually EMPTY. It holds the sessions that owe the user
  * something — one waiting on an approval, one holding a question — which is the
  * most time-sensitive object this product has and the only kind of row a launcher
  * over a static app catalogue cannot produce. It is built from the store the
  * dashboard already keeps live, so leading with it costs the root no request.
+ *
+ * `recent` follows it: the handful of sessions the reader was last in. The most
+ * common reason this surface is opened at all is "get me back to what I was
+ * doing", and that answer is already in the same live store — so it is a row to
+ * press, not a search to run. It is capped small on purpose (see the caller): a
+ * switch list stops being one the moment it becomes an index, and the full corpus
+ * is one `view` row below it.
+ *
+ * There is deliberately no `folders` group: the sidebar's folders are a CORPUS, and
+ * a corpus is reached here the way sessions are — one `view` row under `commands`
+ * that the reader enters. Flattening the folder list into this index made the same
+ * collection behave unlike every other corpus the surface holds, and cost it two
+ * mechanisms (an idle demotion and a group cap) to keep tens of the user's own
+ * folders from filling a page they had not typed into.
  */
-export const ROOT_GROUPS = ['attention', 'commands', 'apps', 'settings'] as const
+export const ROOT_GROUPS = ['attention', 'recent', 'commands', 'apps', 'settings'] as const
 
 export type RootGroup = (typeof ROOT_GROUPS)[number]
 
@@ -247,12 +265,17 @@ function bestFieldMatch(query: string, row: RootRow): FieldMatch | null {
  * An empty query keeps every row and orders by frecency alone, so the bar opens
  * on "what you actually use" instead of an alphabetical inventory.
  *
- * Rows come back in GROUP order — commands, apps, quicklinks, settings — with
- * match quality ordering rows inside a group. Group order is a product decision
- * about what a launcher leads with, so it must not be at the mercy of whichever
- * row happens to score highest: ranking alone put six settings toggles above the
- * commands on an empty query, because every score was 0 and the tie broke
- * alphabetically.
+ * On an EMPTY query rows come back in GROUP order — attention, recent, commands,
+ * apps, settings — with match quality ordering rows inside a group. Group order is
+ * a product decision about what a launcher leads with on the page nobody typed
+ * into, so it must not be at the mercy of whichever row happens to score highest:
+ * ranking alone put six settings toggles above the commands on an empty query,
+ * because every score was 0 and the tie broke alphabetically.
+ *
+ * On a NON-EMPTY query rows come back in SCORE order across every group, because
+ * the reader has said what they want and the best match is the answer. The row's
+ * own group is still on screen — the renderer labels each row with its kind — so
+ * ranking across groups loses the reader nothing.
  */
 export function rankRootRows(
   rows: readonly RootRow[],
@@ -262,9 +285,21 @@ export function rankRootRows(
 ): RankedRow[] {
   const q = query.trim()
   const ranked: RankedRow[] = []
+  // Source position of each row, captured before ranking. An idle-ordered group
+  // (recent) keeps the order its caller supplied, and a stable sort needs a real
+  // key to hold that order in place of the alphabet.
+  const sourceOrder = new Map<string, number>()
+  rows.forEach((row, index) => sourceOrder.set(row.id, index))
   for (const row of rows) {
     const boost = frecencyScore(usage[row.id], now) * FRECENCY_WEIGHT
     if (!q) {
+      // A group whose idle order is a FACT (recency) declines the frecency boost, so
+      // neither the boost nor the alphabet can reshuffle an order these rows already
+      // carry; source order stands in the tiebreak below.
+      if (row.group === 'recent') {
+        ranked.push({ ...row, score: 0, indices: [], matchField: 'title' })
+        continue
+      }
       // Demotion is subtracted rather than applied as a sort key so a row the user
       // DOES use can still climb: frecency is a positive boost, so habit eventually
       // outweighs the penalty instead of being permanently capped under it.
@@ -283,9 +318,24 @@ export function rankRootRows(
       matchedKeyword: hit.matchedKeyword,
     })
   }
-  // Titles are display copy, so the tiebreak orders them in the APP's language
-  // rather than the browser's.
-  ranked.sort((a, b) => b.score - a.score || compareText(a.title, b.title))
+  // Group order sits between score and the tiebreak so the tiebreak only ever
+  // compares rows already in the SAME group. That is required, not cosmetic: the two
+  // tiebreak keys differ by group — an idle-ordered group orders by source position,
+  // every other by title — and mixing them across groups is not a consistent order.
+  // Score still leads, so a used row outranks an unused one regardless of group; on
+  // an empty query the regroup below restores block order for the display.
+  ranked.sort((a, b) => {
+    if (a.score !== b.score) return b.score - a.score
+    const byGroup = groupOrder(a.group) - groupOrder(b.group)
+    if (byGroup !== 0) return byGroup
+    // Same group. An idle-ordered group keeps the order its caller supplied, but only
+    // while the query is empty: a query ranks every row on its match, so the idle
+    // order must not decide there.
+    if (!q && a.group === 'recent') {
+      return (sourceOrder.get(a.id) ?? 0) - (sourceOrder.get(b.id) ?? 0)
+    }
+    return compareText(a.title, b.title)
+  })
 
   // Group caps are applied AFTER ranking so a row only loses its place to a
   // better row in its own group, never to the order the sources were listed in.
@@ -298,6 +348,14 @@ export function rankRootRows(
     perGroup.set(row.group, seen + 1)
     capped.push(row)
   }
+  // A QUERY is ranked; only the IDLE page is filed into blocks. Group order answers
+  // "what does a launcher open on", which is a question about the page the user has
+  // not typed into — applying it to a query result as well makes the group the
+  // FIRST sort key, so the best-matching row loses its place to any row from an
+  // earlier group that merely survived as a subsequence. Typing `dev fle` scored
+  // the "Dev Fleet" app 216 and the contributed command "Approve and merge all
+  // PRs" 60 (a subtitle hit), and showed the command above the app.
+  if (q) return capped
   // Stable within-group order is already established above, so a stable sort by
   // group alone yields group blocks with their ranking intact.
   return capped.sort((a, b) => groupOrder(a.group) - groupOrder(b.group))

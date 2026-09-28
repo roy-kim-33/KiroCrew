@@ -23,12 +23,13 @@ import threading
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import DEFAULT, AsyncMock, MagicMock, patch
 
 import pytest
 from aiohttp import web
 
 import kiro_crew.dashboard.handlers.memory as mem_mod
+from kiro_crew.embeddings import CustomModelSpec
 
 _MOD = "kiro_crew.dashboard.handlers.memory"
 
@@ -61,11 +62,21 @@ def _make_state(
     if vector_store is not None:
         mem.vector_store = vector_store
     state = MagicMock()
+    # This fixture represents a readable, unbound Global V1 session.
+    state.conversation_log.get_metadata_status.return_value = ({}, True)
     state.context_builder = MagicMock(memory=mem)
     state.consolidator = consolidator
     state._slots = {}
     state._restricted_keys = set(restricted_keys or ())
     return state
+
+
+#: The statically-trusted dashboard key ``_recognize_session`` admits without a live
+#: slot. Defaulted here so a test whose subject is not authorization does not restate
+#: it: the refusal directions are asserted per route, positively, in
+#: ``TestMemoryMutationSessionGate``, which is where that vigilance belongs. A test
+#: that wants an unrecognized caller passes ``session_key=""`` explicitly.
+_TRUSTED_SESSION_KEY = "dashboard:ui"
 
 
 def _make_request(
@@ -75,7 +86,7 @@ def _make_request(
     json_body: Any = None,
     query: dict[str, str] | None = None,
     match_info: dict[str, str] | None = None,
-    session_key: str = "",
+    session_key: str = _TRUSTED_SESSION_KEY,
     body_present: bool | None = None,
 ) -> Any:
     req = MagicMock()
@@ -96,7 +107,22 @@ def _make_request(
         req.can_read_body = True
     else:
         req.json = AsyncMock(return_value=json_body)
+    _as_owner(req, state)
     return req
+
+
+def _as_owner(req: Any, state: Any) -> None:
+    """Give a mock request the dashboard owner's claims, leaving every other key as-is.
+
+    The durable-memory writes are owner-gated, so the dashboard-user request these
+    tests model carries ``app == ""`` and the owner's subject: ``state.owner_id``
+    when one is configured, else the signed local bootstrap subject.
+    """
+    owner = str(getattr(state, "owner_id", "") or "") or "local-app"
+    claims = {"app": "", "user": owner}
+    req.__contains__.side_effect = lambda key: key in claims
+    req.__getitem__.side_effect = lambda key: claims[key] if key in claims else DEFAULT
+    req.get.side_effect = lambda key, *default: claims[key] if key in claims else DEFAULT
 
 
 def _store(**attrs: Any) -> Any:
@@ -113,6 +139,7 @@ def _store(**attrs: Any) -> Any:
     store.memory_stats.return_value = {"semantic_count": 0}
     store.get_rejection_stats.return_value = {}
     store.get_context_preview.return_value = {"semantic": ""}
+    store.read_counters.return_value = {"rows_read": 0}
     store.get_semantic_context.return_value = ""
     store.get_episodic_context.return_value = ""
     store.import_memory.return_value = {"semantic": 0, "episodic": 0}
@@ -150,30 +177,36 @@ class TestPreferencesProjectsHistory:
         state = _make_state(memory=mem)
         resp = await mem_mod.api_memory_preferences(_make_request(state))
         assert resp.status == 200
-        assert _body(resp) == {"content": "- dark mode"}
+        assert _body(resp) == {"content": "- dark mode", "content_redacted": False}
 
     @pytest.mark.asyncio
     async def test_preferences_put_writes_content(self) -> None:
         mem = MagicMock()
+        mem.read_preferences.return_value = "- before"
+        mem.write_preferences.return_value = True
         state = _make_state(memory=mem)
-        req = _make_request(state, method="PUT", json_body={"content": "- new"})
+        req = _make_request(
+            state, method="PUT", json_body={"content": "- new"}, session_key="dashboard:ui"
+        )
         resp = await mem_mod.api_memory_preferences(req)
         assert _body(resp) == {"ok": True}
-        mem.write_preferences.assert_called_once_with("- new")
+        mem.write_preferences.assert_called_once_with("- new", expected_baseline="- before")
 
     @pytest.mark.asyncio
     async def test_preferences_put_defaults_missing_content_to_empty(self) -> None:
         mem = MagicMock()
+        mem.read_preferences.return_value = "- before"
+        mem.write_preferences.return_value = True
         state = _make_state(memory=mem)
-        req = _make_request(state, method="PUT", json_body={})
+        req = _make_request(state, method="PUT", json_body={}, session_key="dashboard:ui")
         assert (await mem_mod.api_memory_preferences(req)).status == 200
-        mem.write_preferences.assert_called_once_with("")
+        mem.write_preferences.assert_called_once_with("", expected_baseline="- before")
 
     @pytest.mark.asyncio
     async def test_preferences_put_rejects_invalid_json(self) -> None:
         mem = MagicMock()
         state = _make_state(memory=mem)
-        req = _make_request(state, method="PUT", json_body=_BadJSON())
+        req = _make_request(state, method="PUT", json_body=_BadJSON(), session_key="dashboard:ui")
         resp = await mem_mod.api_memory_preferences(req)
         assert resp.status == 400
         assert _body(resp) == {"error": "invalid JSON", "code": "invalid_json"}
@@ -188,11 +221,14 @@ class TestPreferencesProjectsHistory:
         loop_thread = threading.get_ident()
         write_threads: list[int] = []
         mem = MagicMock()
-        mem.write_preferences.side_effect = lambda _c: write_threads.append(
-            threading.get_ident()
+        mem.read_preferences.return_value = "before"
+        mem.write_preferences.side_effect = lambda _c, **_kw: (
+            write_threads.append(threading.get_ident()) or True
         )
         state = _make_state(memory=mem)
-        req = _make_request(state, method="PUT", json_body={"content": "- new"})
+        req = _make_request(
+            state, method="PUT", json_body={"content": "- new"}, session_key="dashboard:ui"
+        )
         resp = await mem_mod.api_memory_preferences(req)
         assert resp.status == 200
         assert write_threads and write_threads[0] != loop_thread
@@ -204,11 +240,14 @@ class TestPreferencesProjectsHistory:
         loop_thread = threading.get_ident()
         write_threads: list[int] = []
         mem = MagicMock()
-        mem.write_projects.side_effect = lambda _c: write_threads.append(
-            threading.get_ident()
+        mem.read_projects.return_value = "before"
+        mem.write_projects.side_effect = lambda _c, **_kw: (
+            write_threads.append(threading.get_ident()) or True
         )
         state = _make_state(memory=mem)
-        req = _make_request(state, method="PUT", json_body={"content": "## P"})
+        req = _make_request(
+            state, method="PUT", json_body={"content": "## P"}, session_key="dashboard:ui"
+        )
         resp = await mem_mod.api_memory_projects(req)
         assert resp.status == 200
         assert write_threads and write_threads[0] != loop_thread
@@ -219,21 +258,25 @@ class TestPreferencesProjectsHistory:
         mem.read_projects.return_value = "## Proj"
         state = _make_state(memory=mem)
         resp = await mem_mod.api_memory_projects(_make_request(state))
-        assert _body(resp) == {"content": "## Proj"}
+        assert _body(resp) == {"content": "## Proj", "content_redacted": False}
 
     @pytest.mark.asyncio
     async def test_projects_put_writes_content(self) -> None:
         mem = MagicMock()
+        mem.read_projects.return_value = "## Before"
+        mem.write_projects.return_value = True
         state = _make_state(memory=mem)
-        req = _make_request(state, method="PUT", json_body={"content": "## New"})
+        req = _make_request(
+            state, method="PUT", json_body={"content": "## New"}, session_key="dashboard:ui"
+        )
         assert (await mem_mod.api_memory_projects(req)).status == 200
-        mem.write_projects.assert_called_once_with("## New")
+        mem.write_projects.assert_called_once_with("## New", expected_baseline="## Before")
 
     @pytest.mark.asyncio
     async def test_projects_put_rejects_invalid_json(self) -> None:
         mem = MagicMock()
         state = _make_state(memory=mem)
-        req = _make_request(state, method="PUT", json_body=_BadJSON())
+        req = _make_request(state, method="PUT", json_body=_BadJSON(), session_key="dashboard:ui")
         resp = await mem_mod.api_memory_projects(req)
         assert resp.status == 400
         mem.write_projects.assert_not_called()
@@ -241,24 +284,33 @@ class TestPreferencesProjectsHistory:
     @pytest.mark.asyncio
     async def test_history_get_returns_recent(self) -> None:
         mem = MagicMock()
-        mem.read_recent_history.return_value = "# 2026-01-01"
+        mem.read_editable_history.return_value = "# 2026-01-01"
         state = _make_state(memory=mem)
         resp = await mem_mod.api_memory_history(_make_request(state))
-        assert _body(resp) == {"content": "# 2026-01-01"}
+        assert _body(resp) == {"content": "# 2026-01-01", "content_redacted": False}
 
     @pytest.mark.asyncio
     async def test_history_put_writes_today_file_creating_parents(self, tmp_path: Path) -> None:
         target = tmp_path / "history" / "2026-01-01.md"
         mem = MagicMock()
         mem._today_history_file.return_value = target
-        # The handler must route through the store's atomic, symlink-safe
-        # writer — a raw write_text would follow a planted dated symlink and
-        # tear under concurrent PUTs.
-        mem._atomic_write_text.side_effect = lambda p, c: p.write_text(c, encoding="utf-8")
+        # The handler routes through the store's lock-owning, atomic writer.
+        mem.read_editable_history.return_value = "before"
+        mem.write_today_history.side_effect = lambda c, **_kw: (
+            target.parent.mkdir(parents=True, exist_ok=True),
+            target.write_text(c, encoding="utf-8"),
+            True,
+        )[-1]
         state = _make_state(memory=mem)
-        req = _make_request(state, method="PUT", json_body={"content": "entry"})
+        req = _make_request(
+            state, method="PUT", json_body={"content": "entry"}, session_key="dashboard:ui"
+        )
         assert (await mem_mod.api_memory_history(req)).status == 200
-        mem._atomic_write_text.assert_called_once_with(target, "entry")
+        mem.write_today_history.assert_called_once_with(
+            "entry",
+            expected_baseline="before",
+            validate_current=mem_mod._require_editable_memory_document,
+        )
         assert target.read_text(encoding="utf-8") == "entry"
 
     @pytest.mark.asyncio
@@ -266,10 +318,109 @@ class TestPreferencesProjectsHistory:
         mem = MagicMock()
         mem._today_history_file.return_value = tmp_path / "h.md"
         state = _make_state(memory=mem)
-        req = _make_request(state, method="PUT", json_body=_BadJSON())
+        req = _make_request(state, method="PUT", json_body=_BadJSON(), session_key="dashboard:ui")
         resp = await mem_mod.api_memory_history(req)
         assert resp.status == 400
         assert not (tmp_path / "h.md").exists()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("content", [None, False, 42, 1.5, [], {}])
+    async def test_history_put_rejects_non_string_without_changing_history(
+        self, tmp_path: Path, content: Any
+    ) -> None:
+        target = tmp_path / "history.md"
+        target.write_text("existing history", encoding="utf-8")
+        mem = MagicMock()
+        mem._today_history_file.return_value = target
+        state = _make_state(memory=mem)
+        request = _make_request(state, method="PUT", json_body={"content": content})
+
+        response = await mem_mod.api_memory_history(request)
+
+        assert response.status == 400
+        assert _body(response)["code"] == "invalid_memory_content"
+        mem._today_history_file.assert_not_called()
+        mem._atomic_write_text.assert_not_called()
+        assert target.read_text(encoding="utf-8") == "existing history"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "handler,reader",
+        [
+            ("api_memory_preferences", "read_preferences"),
+            ("api_memory_projects", "read_projects"),
+            ("api_memory_history", "read_editable_history"),
+        ],
+    )
+    async def test_document_get_redacts_sensitive_content_without_writing(
+        self, handler: str, reader: str
+    ) -> None:
+        raw = f"keep this {_CRED} unchanged"
+        mem = MagicMock()
+        getattr(mem, reader).return_value = raw
+
+        response = await getattr(mem_mod, handler)(_make_request(_make_state(memory=mem)))
+
+        body = _body(response)
+        assert response.status == 200
+        assert body["content_redacted"] is True
+        assert _CRED not in body["content"]
+        getattr(mem, reader).assert_called_once_with()
+        mem.write_preferences.assert_not_called()
+        mem.write_projects.assert_not_called()
+        mem.write_today_history.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "handler,reader,writer",
+        [
+            ("api_memory_preferences", "read_preferences", "write_preferences"),
+            ("api_memory_projects", "read_projects", "write_projects"),
+            ("api_memory_history", "read_editable_history", "write_today_history"),
+        ],
+    )
+    async def test_document_put_refuses_to_overwrite_hidden_sensitive_content(
+        self, handler: str, reader: str, writer: str
+    ) -> None:
+        mem = MagicMock()
+        getattr(mem, reader).return_value = f"keep {_CRED} exactly"
+        request = _make_request(
+            _make_state(memory=mem), method="PUT", json_body={"content": "unrelated edit"}
+        )
+
+        response = await getattr(mem_mod, handler)(request)
+
+        assert response.status == 409
+        assert _body(response)["code"] == "memory_document_redacted"
+        getattr(mem, writer).assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "handler,reader,writer",
+        [
+            ("api_memory_preferences", "read_preferences", "write_preferences"),
+            ("api_memory_projects", "read_projects", "write_projects"),
+            ("api_memory_history", "read_editable_history", "write_today_history"),
+        ],
+    )
+    async def test_document_put_reports_a_concurrent_change_without_replacing_it(
+        self, handler: str, reader: str, writer: str
+    ) -> None:
+        mem = MagicMock()
+        getattr(mem, reader).return_value = "clean baseline"
+        getattr(mem, writer).return_value = False
+        request = _make_request(
+            _make_state(memory=mem), method="PUT", json_body={"content": "owner edit"}
+        )
+
+        response = await getattr(mem_mod, handler)(request)
+
+        assert response.status == 409
+        assert _body(response)["code"] == "memory_document_changed"
+        expected = {"expected_baseline": "clean baseline"}
+        if handler == "api_memory_history":
+            expected["validate_current"] = mem_mod._require_editable_memory_document
+        getattr(mem, writer).assert_called_once_with("owner edit", **expected)
 
 
 # ---------------------------------------------------------------------------
@@ -363,9 +514,9 @@ class TestRunConfigWriteCancellation:
             "the config lock was handed to the next writer while the twice-cancelled "
             "one's worker was still writing: %r" % (seen,)
         )
-        assert seen.index("worker-end") < seen.index("second-ran"), (
-            "the second writer entered before the worker finished: %r" % (seen,)
-        )
+        assert seen.index("worker-end") < seen.index(
+            "second-ran"
+        ), "the second writer entered before the worker finished: %r" % (seen,)
         assert cancelled, "the cancellation must propagate, not be swallowed"
 
     def test_an_uncancelled_call_returns_the_worker_result(self):
@@ -471,17 +622,19 @@ class TestMemorySettings:
 
     @pytest.mark.asyncio
     async def test_put_applies_to_running_consolidator(self, tmp_path: Path) -> None:
+        # The route pushes the reloaded config through the same ``reconfigure``
+        # seam the config watcher uses, so the answer is in force when it returns.
         cfg_path = tmp_path / "config.json"
         consolidator = MagicMock()
         state = _make_state(consolidator=consolidator)
         req = _make_request(state, method="PUT", json_body={"history_idle_hours": 3})
+        reloaded = _cfg(idle=3.0, migrated=True)
         with (
-            patch(f"{_MOD}.KiroCrewConfig.load", return_value=_cfg(idle=3.0, migrated=True)),
+            patch(f"{_MOD}.KiroCrewConfig.load", return_value=reloaded),
             patch(f"{_MOD}.config_path", return_value=cfg_path),
         ):
             assert (await mem_mod.api_memory_settings(req)).status == 200
-        assert consolidator._history_idle_secs == 3.0 * 3600
-        assert consolidator._migrated is True
+        consolidator.reconfigure.assert_called_once_with(reloaded)
 
 
 # ---------------------------------------------------------------------------
@@ -529,9 +682,10 @@ class TestRedactAndStoreResolution:
 
 
 # ---------------------------------------------------------------------------
-# _get_vector_store_async (#5221) — the standalone fallback's ``init()`` must
-# never run on the event loop (VectorMemoryStore's caller contract: the
-# Windows path shells out to icacls and would freeze the loop for seconds).
+# _get_vector_store_async — the standalone fallback's ``init()`` must
+# never run on the event loop (VectorMemoryStore's caller contract: init is
+# blocking file IO whose Windows DACL writes can block on a network volume
+# round-trip and would freeze the loop).
 # ---------------------------------------------------------------------------
 
 
@@ -614,7 +768,7 @@ class TestGetVectorStoreAsync:
     @pytest.mark.asyncio
     async def test_concurrent_first_calls_init_once(self, monkeypatch) -> None:
         """Single-flight: the lock restores the serialization the sync call
-        sites used to get for free from the event loop."""
+        sites get for free from the event loop."""
         import kiro_crew.vector_memory as vm_mod
 
         init_calls: list[threading.Thread] = []
@@ -724,18 +878,14 @@ class TestSemanticEndpoints:
     @pytest.mark.asyncio
     async def test_write_rejects_invalid_json(self) -> None:
         state = _make_state(vector_store=_store())
-        req = _make_request(
-            state, method="PUT", json_body=_BadJSON(), session_key="dashboard:ui"
-        )
+        req = _make_request(state, method="PUT", json_body=_BadJSON(), session_key="dashboard:ui")
         assert (await mem_mod.api_memory_semantic_write(req)).status == 400
 
     @pytest.mark.asyncio
     async def test_write_requires_key_and_value(self) -> None:
         state = _make_state(vector_store=_store())
         for body in ({"value": "v"}, {"key": "k"}, {}):
-            req = _make_request(
-                state, method="PUT", json_body=body, session_key="dashboard:ui"
-            )
+            req = _make_request(state, method="PUT", json_body=body, session_key="dashboard:ui")
             resp = await mem_mod.api_memory_semantic_write(req)
             assert resp.status == 400
             assert _body(resp)["error"] == "key and value required"
@@ -991,7 +1141,11 @@ class TestStatsMigrateImport:
             patch(f"{_MOD}.make_sync_embed_fn", return_value=lambda t: [1.0]),
             patch(f"{_MOD}.config_path", return_value=tmp_path / "config.json"),
         ):
-            body = _body(await mem_mod.api_memory_migrate(_make_request(state)))
+            body = _body(
+                await mem_mod.api_memory_migrate(
+                    _make_request(state, method="POST", session_key="dashboard:ui")
+                )
+            )
         assert body == {"semantic": 0, "episodic": 0}
         # Nothing migrated -> migrated flag untouched, embed_fn restored.
         assert store.embed_fn is _prev
@@ -1008,7 +1162,11 @@ class TestStatsMigrateImport:
             patch(f"{_MOD}.make_sync_embed_fn", return_value=lambda t: [1.0]),
             patch(f"{_MOD}.config_path", return_value=cfg_path),
         ):
-            body = _body(await mem_mod.api_memory_migrate(_make_request(state)))
+            body = _body(
+                await mem_mod.api_memory_migrate(
+                    _make_request(state, method="POST", session_key="dashboard:ui")
+                )
+            )
         assert body["semantic"] == 3
         assert json.loads(cfg_path.read_text(encoding="utf-8"))["memory"]["migrated"] is True
         assert consolidator._migrated is True
@@ -1027,7 +1185,7 @@ class TestStatsMigrateImport:
     async def test_import_rejects_invalid_json(self) -> None:
         store = _store()
         state = _make_state(vector_store=store)
-        req = _make_request(state, method="POST", json_body=_BadJSON())
+        req = _make_request(state, method="POST", json_body=_BadJSON(), session_key="dashboard:ui")
         assert (await mem_mod.api_memory_import(req)).status == 400
         store.import_memory.assert_not_called()
 
@@ -1036,7 +1194,12 @@ class TestStatsMigrateImport:
         store = _store()
         store.import_memory.return_value = {"semantic": 2, "episodic": 1}
         state = _make_state(vector_store=store)
-        req = _make_request(state, method="POST", json_body={"semantic": [{"key": "k"}]})
+        req = _make_request(
+            state,
+            method="POST",
+            json_body={"semantic": [{"key": "k"}]},
+            session_key="dashboard:ui",
+        )
         assert _body(await mem_mod.api_memory_import(req)) == {"semantic": 2, "episodic": 1}
 
 
@@ -1077,13 +1240,103 @@ class TestContextPreviewAndObservability:
         store.memory_stats.return_value = {"semantic_count": 1}
         store.get_rejection_stats.return_value = {"allowlist_reject": 2}
         store.get_context_preview.return_value = {"semantic": "s"}
+        store.read_counters.return_value = {"semantic_full_scans": 3}
         state = _make_state(vector_store=store)
         req = _make_request(state, query={"q": "q" * 900})
         body = _body(await mem_mod.api_memory_observability(req))
         assert body["stats"] == {"semantic_count": 1}
         assert body["rejections"] == {"allowlist_reject": 2}
         assert body["context_preview"] == {"semantic": "s"}
+        assert body["reads"] == {"semantic_full_scans": 3}
         assert len(store.get_context_preview.call_args.kwargs["query_text"]) == 500
+
+    @pytest.mark.asyncio
+    async def test_observability_reads_the_counters_after_the_preview(self) -> None:
+        """Ordering is the contract: `reads` must include THIS request's scans.
+
+        The preview is what reaches the full-read branch, so counters resolved
+        before it would under-report by exactly the scan the caller is probing
+        for. Own-suite coverage of the real numbers lives in
+        ``test_memory_read_counters.py``; here only the order is pinned.
+        """
+        calls: list[str] = []
+        store = _store()
+        store.get_context_preview.side_effect = lambda **_: calls.append("preview") or {}
+        store.read_counters.side_effect = lambda: calls.append("reads") or {}
+        state = _make_state(vector_store=store)
+        await mem_mod.api_memory_observability(_make_request(state, query={"q": "tea"}))
+        assert calls == ["preview", "reads"]
+
+    @pytest.mark.asyncio
+    async def test_preview_reads_the_selected_legacy_named_store(self) -> None:
+        global_store = _store(algorithm_version="v1")
+        global_store.get_semantic_context.return_value = "Global tea preference"
+        named_store = _store(algorithm_version="v1")
+        named_store.get_semantic_context.return_value = "[Semantic]\nTeam tea preference"
+        named_store.get_episodic_context.return_value = "Team tea discussion"
+        state = _make_state(vector_store=global_store)
+        req = _make_request(state, query={"store": "crew", "q": "tea"})
+        with (
+            patch(f"{_MOD}.resolve_requested_memory_store", AsyncMock(return_value=("crew", None))),
+            patch(
+                f"{_MOD}.vector_memory_for_store", AsyncMock(return_value=named_store)
+            ) as acquire,
+        ):
+            response = await mem_mod.api_memory_context_preview(req)
+        assert response.status == 200
+        assert _body(response) == {
+            "semantic_context": "[Semantic]\nTeam tea preference",
+            "episodic_context": "Team tea discussion",
+        }
+        acquire.assert_awaited_once_with(state, "crew")
+        global_store.get_semantic_context.assert_not_called()
+        global_store.get_episodic_context.assert_not_called()
+        named_store.get_episodic_context.assert_called_once_with(query_text="tea")
+
+    @pytest.mark.asyncio
+    async def test_observability_reads_the_selected_legacy_named_store(self) -> None:
+        global_store = _store(algorithm_version="v1")
+        global_store.memory_stats.return_value = {"semantic_count": 999}
+        named_store = _store(algorithm_version="v1")
+        named_store.memory_stats.return_value = {"semantic_count": 1}
+        named_store.get_context_preview.return_value = {"semantic": "Team tea preference"}
+        state = _make_state(vector_store=global_store)
+        req = _make_request(state, query={"store": "crew", "q": "tea"})
+        with (
+            patch(f"{_MOD}.resolve_requested_memory_store", AsyncMock(return_value=("crew", None))),
+            patch(
+                f"{_MOD}.vector_memory_for_store", AsyncMock(return_value=named_store)
+            ) as acquire,
+        ):
+            response = await mem_mod.api_memory_observability(req)
+        assert response.status == 200
+        body = _body(response)
+        assert body["stats"] == {"semantic_count": 1}
+        assert body["context_preview"] == {"semantic": "Team tea preference"}
+        acquire.assert_awaited_once_with(state, "crew")
+        global_store.memory_stats.assert_not_called()
+        global_store.get_context_preview.assert_not_called()
+        named_store.get_context_preview.assert_called_once_with(query_text="tea")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "handler", [mem_mod.api_memory_context_preview, mem_mod.api_memory_observability]
+    )
+    async def test_selected_store_refusal_does_not_acquire_any_vectors(self, handler) -> None:
+        state = _make_state(vector_store=_store(algorithm_version="v1"))
+        req = _make_request(state, query={"store": "crew"})
+        refusal = web.json_response(
+            {"error": "Owner access required", "code": "owner_only"}, status=403
+        )
+        with (
+            patch(f"{_MOD}.resolve_requested_memory_store", AsyncMock(return_value=("", refusal))),
+            patch(f"{_MOD}.vector_memory_for_store", AsyncMock()) as acquire,
+            patch(f"{_MOD}._get_vector_store_async", AsyncMock()) as global_acquire,
+        ):
+            response = await handler(req)
+        assert response is refusal
+        acquire.assert_not_awaited()
+        global_acquire.assert_not_awaited()
 
 
 class TestPromote:
@@ -1093,18 +1346,18 @@ class TestPromote:
         # still run the default promotion -- that is what allow_absent buys.
         store = _store(promote_episodic_patterns=MagicMock(return_value=2))
         state = _make_state(vector_store=store)
-        req = _make_request(state, method="POST")
+        req = _make_request(state, method="POST", session_key="dashboard:ui")
         assert _body(await mem_mod.api_memory_promote(req)) == {"ok": True, "promoted": 2}
         store.promote_episodic_patterns.assert_called_once_with(5, 0.75)
 
     @pytest.mark.asyncio
     async def test_malformed_body_is_400_not_silent_defaults(self) -> None:
         # A body that is PRESENT but unparseable is a client mistake, not an
-        # absent body: answering 200-with-defaults ran a different promotion
-        # than the caller asked for and told them nothing (issue #5587).
+        # absent body: answering 200-with-defaults would run a different
+        # promotion than the caller asked for and tell them nothing.
         store = _store(promote_episodic_patterns=MagicMock(return_value=2))
         state = _make_state(vector_store=store)
-        req = _make_request(state, method="POST", json_body=_BadJSON())
+        req = _make_request(state, method="POST", json_body=_BadJSON(), session_key="dashboard:ui")
         resp = await mem_mod.api_memory_promote(req)
         assert resp.status == 400
         assert _body(resp)["code"] == "invalid_json"
@@ -1117,7 +1370,7 @@ class TestPromote:
         store = _store(promote_episodic_patterns=MagicMock(return_value=2))
         state = _make_state(vector_store=store)
         for payload in ([], "str", 5):
-            req = _make_request(state, method="POST", json_body=payload)
+            req = _make_request(state, method="POST", json_body=payload, session_key="dashboard:ui")
             resp = await mem_mod.api_memory_promote(req)
             assert resp.status == 400, payload
             assert _body(resp)["code"] == "body_not_object", payload
@@ -1127,7 +1380,12 @@ class TestPromote:
     async def test_explicit_thresholds_are_forwarded(self) -> None:
         store = _store(promote_episodic_patterns=MagicMock(return_value=0))
         state = _make_state(vector_store=store)
-        req = _make_request(state, method="POST", json_body={"min_count": 3, "min_sim": 0.9})
+        req = _make_request(
+            state,
+            method="POST",
+            json_body={"min_count": 3, "min_sim": 0.9},
+            session_key="dashboard:ui",
+        )
         assert (await mem_mod.api_memory_promote(req)).status == 200
         store.promote_episodic_patterns.assert_called_once_with(3, 0.9)
 
@@ -1135,11 +1393,309 @@ class TestPromote:
     async def test_non_numeric_thresholds_are_400(self) -> None:
         store = _store()
         state = _make_state(vector_store=store)
-        req = _make_request(state, method="POST", json_body={"min_count": "five"})
+        req = _make_request(
+            state, method="POST", json_body={"min_count": "five"}, session_key="dashboard:ui"
+        )
         resp = await mem_mod.api_memory_promote(req)
         assert resp.status == 400
         assert "min_count/min_sim" in _body(resp)["error"]
         store.promote_episodic_patterns.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# the memory-mutation session gate, on every route that carries it
+# ---------------------------------------------------------------------------
+
+
+def _mutating_cases() -> list[tuple[str, str, str, Any, str]]:
+    """(id, handler name, HTTP method, body, name of the store/memory mutator).
+
+    Every route here mutates durable memory, so each one runs the same two-step
+    gate: session recognition first, then the restricted-mode check. The mutator
+    name is what the assertions use to prove the refusal happened BEFORE any write.
+    """
+    return [
+        ("preferences", "api_memory_preferences", "PUT", {"content": "x"}, "write_preferences"),
+        ("projects", "api_memory_projects", "PUT", {"content": "x"}, "write_projects"),
+        ("history", "api_memory_history", "PUT", {"content": "x"}, "write_today_history"),
+        ("migrate", "api_memory_migrate", "POST", None, "migrate_from_markdown"),
+        ("import", "api_memory_import", "POST", {"semantic": []}, "import_memory"),
+        ("promote", "api_memory_promote", "POST", None, "promote_episodic_patterns"),
+    ]
+
+
+_MARKDOWN_ROUTES = {"preferences", "projects", "history"}
+
+
+def _gate_fixture(case_id: str, mutator: str, *, restricted: bool) -> tuple[Any, Any]:
+    """A state plus the mock whose *mutator* must never be called."""
+    if case_id in _MARKDOWN_ROUTES:
+        target = MagicMock()
+        state = _make_state(
+            memory=target,
+            vector_store=_store(),
+            restricted_keys={"dashboard:ghost"} if restricted else None,
+        )
+    else:
+        target = _store()
+        state = _make_state(
+            vector_store=target,
+            restricted_keys={"dashboard:ghost"} if restricted else None,
+        )
+    return state, getattr(target, mutator)
+
+
+class TestMemoryMutationSessionGate:
+    """Each mutating memory route refuses an unrecognised or restricted session.
+
+    The two halves are separate controls and neither substitutes for the other:
+    ``_is_restricted_session`` answers False for a key it has never seen, so
+    without the recognition probe a forged ``X-Session-Key`` walked straight into
+    a durable write (and, on promote, into an episodic tombstone).
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "case_id,handler,method,body,mutator", _mutating_cases(), ids=lambda v: v
+    )
+    async def test_missing_session_key_is_refused(
+        self, case_id: str, handler: str, method: str, body: Any, mutator: str
+    ) -> None:
+        state, blocked = _gate_fixture(case_id, mutator, restricted=False)
+        # Explicitly empty: the helper defaults to the trusted key, so a caller with
+        # no header at all is the thing this case has to state rather than inherit.
+        req = _make_request(state, method=method, json_body=body, session_key="")
+        resp = await getattr(mem_mod, handler)(req)
+        assert resp.status == 400
+        assert _body(resp)["code"] == "missing_session_key"
+        blocked.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "case_id,handler,method,body,mutator", _mutating_cases(), ids=lambda v: v
+    )
+    async def test_unrecognized_session_is_refused(
+        self, case_id: str, handler: str, method: str, body: Any, mutator: str
+    ) -> None:
+        # No slot, no restricted-key entry, no transcript on disk (KIROCREW_HOME is
+        # pinned per test), so the recognition probe finds nothing to accept.
+        state, blocked = _gate_fixture(case_id, mutator, restricted=False)
+        req = _make_request(state, method=method, json_body=body, session_key="dashboard:forged")
+        resp = await getattr(mem_mod, handler)(req)
+        assert resp.status == 400
+        assert _body(resp)["code"] == "unknown_session"
+        blocked.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "case_id,handler,method,body,mutator", _mutating_cases(), ids=lambda v: v
+    )
+    async def test_restricted_session_is_refused(
+        self, case_id: str, handler: str, method: str, body: Any, mutator: str
+    ) -> None:
+        state, blocked = _gate_fixture(case_id, mutator, restricted=True)
+        req = _make_request(state, method=method, json_body=body, session_key="dashboard:ghost")
+        resp = await getattr(mem_mod, handler)(req)
+        assert resp.status == 403
+        assert _body(resp)["code"] == "restricted_session"
+        blocked.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "case_id,handler,method,body,mutator", _mutating_cases(), ids=lambda v: v
+    )
+    async def test_a_denial_is_audited(
+        self,
+        case_id: str,
+        handler: str,
+        method: str,
+        body: Any,
+        mutator: str,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A refusal is an authorization decision, so it lands in the SEL log."""
+        log = MagicMock()
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.handlers.sel", lambda: SimpleNamespace(log_api_access=log)
+        )
+        state, _blocked = _gate_fixture(case_id, mutator, restricted=True)
+        req = _make_request(state, method=method, json_body=body, session_key="dashboard:ghost")
+        assert (await getattr(mem_mod, handler)(req)).status == 403
+        denials = [c.kwargs for c in log.call_args_list if c.kwargs.get("outcome") == "denied"]
+        assert denials, log.call_args_list
+        assert denials[-1]["resources"] == "restricted_session_block"
+        assert denials[-1]["caller"] == "dashboard:ghost"
+        assert denials[-1]["source"] == "dashboard"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "session_key,status,code",
+        [
+            ("", 400, "missing_session_key"),
+            ("dashboard:forged", 400, "unknown_session"),
+            ("dashboard:ghost", 403, "restricted_session"),
+        ],
+        ids=["missing", "unrecognized", "restricted"],
+    )
+    async def test_the_settings_put_is_gated(
+        self, session_key: str, status: int, code: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The settings PUT carries the same gate, because it writes ``migrated``.
+
+        That is the identical install-wide flag ``/api/memory/migrate`` flips, so a
+        caller refused on one route must not reach it through the other. Its mutator
+        is a config write rather than a store method, which is why it is asserted
+        here instead of through the shared route table.
+        """
+        writer = MagicMock()
+        monkeypatch.setattr(mem_mod, "run_config_write", writer)
+        state = _make_state(restricted_keys={"dashboard:ghost"})
+        req = _make_request(
+            state, method="PUT", json_body={"migrated": True}, session_key=session_key
+        )
+        with patch(f"{_MOD}.KiroCrewConfig.load", return_value=_cfg()):
+            resp = await mem_mod.api_memory_settings(req)
+        assert resp.status == status
+        assert _body(resp)["code"] == code
+        writer.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "case_id,handler",
+        [
+            ("preferences", "api_memory_preferences"),
+            ("projects", "api_memory_projects"),
+            ("history", "api_memory_history"),
+        ],
+    )
+    async def test_the_markdown_get_stays_ungated(self, case_id: str, handler: str) -> None:
+        """Only the PUT is a write. Gating the read would break the Memory tab for
+        every session the gate cannot recognise, and this PR changes no read path."""
+        mem = MagicMock()
+        mem.read_preferences.return_value = ""
+        mem.read_projects.return_value = ""
+        mem.read_editable_history.return_value = ""
+        state = _make_state(memory=mem)
+        resp = await getattr(mem_mod, handler)(_make_request(state))
+        assert resp.status == 200
+        assert _body(resp) == {"content": "", "content_redacted": False}
+
+
+@pytest.mark.asyncio
+class TestSubagentMemorySessionRecognition:
+    @pytest.mark.parametrize(
+        "run_id", ["", "../worker", r"..\worker", ".worker", "C:worker", "worker:stream", "a\x00b"]
+    )
+    async def test_invalid_subagent_ids_cannot_reach_the_filesystem(self, monkeypatch, run_id):
+        from kiro_crew.dashboard.handlers.cron import _recognize_session
+        from kiro_crew.history import is_incognito_transcript
+
+        # Model an existing target at every spelling: rejection must come from
+        # key validation, not from an absent file (including Windows ADS paths).
+        exists = MagicMock(return_value=True)
+        with monkeypatch.context() as patched:
+            patched.setattr(Path, "exists", exists)
+            refusal = await _recognize_session(
+                _make_state(),
+                f"subagent:{run_id}",
+                "test.memory",
+                blocks_persisted_mode=is_incognito_transcript,
+            )
+
+        assert refusal is not None
+        assert refusal.status == 400
+        assert _body(refusal)["code"] == "unknown_session"
+        exists.assert_not_called()
+
+    async def test_subagent_history_cannot_replace_a_live_allocation(self, tmp_path, monkeypatch):
+        from kiro_crew.dashboard.handlers.cron import _recognize_session
+        from kiro_crew.history import ConversationLog, is_incognito_transcript
+
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+        log = ConversationLog(base_dir=tmp_path / "sessions")
+        await asyncio.to_thread(
+            log.update_metadata, "subagent:worker-a", {"memory_store": "default"}
+        )
+
+        refusal = await _recognize_session(
+            _make_state(),
+            "subagent:worker-a",
+            "test.memory",
+            blocks_persisted_mode=is_incognito_transcript,
+        )
+
+        assert refusal is not None
+        assert refusal.status == 400
+        assert _body(refusal)["code"] == "unknown_session"
+
+    @pytest.mark.parametrize(
+        "collision", ["live-slot", "restricted-key", "bare", "dashboard", "cron"]
+    )
+    async def test_a_subagent_cannot_borrow_another_sessions_identity(
+        self, tmp_path, monkeypatch, collision
+    ):
+        from kiro_crew.dashboard.handlers.cron import _recognize_session
+        from kiro_crew.history import ConversationLog, is_incognito_transcript
+
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+        state = _make_state()
+        if collision == "live-slot":
+            state._slots["worker-a"] = SimpleNamespace(memory_mode="persistent")
+        elif collision == "restricted-key":
+            state._restricted_keys.add("subagent:worker-a")
+        else:
+            key = "worker-a" if collision == "bare" else f"{collision}:worker-a"
+            log = ConversationLog(base_dir=tmp_path / "sessions")
+            await asyncio.to_thread(log.update_metadata, key, {"memory_mode": "persistent"})
+
+        refusal = await _recognize_session(
+            state,
+            "subagent:worker-a",
+            "test.memory",
+            blocks_persisted_mode=is_incognito_transcript,
+        )
+
+        assert refusal is not None
+        assert refusal.status == 400
+        assert _body(refusal)["code"] == "unknown_session"
+
+    @pytest.mark.parametrize(
+        "metadata",
+        [
+            {"_type": "metadata", "memory_mode": "persistent"},
+            {"_type": "metadata", "memory_mode": "incognito"},
+            {"_type": "metadata", "memory_mode": "temporary"},
+            {"_type": "metadata", "memory_mode": "unknown"},
+            {"_type": "metadata", "memory_mode": []},
+            {"role": "user", "content": "not metadata"},
+        ],
+    )
+    async def test_subagent_history_mode_cannot_replace_a_live_allocation(
+        self, tmp_path, monkeypatch, metadata
+    ):
+        from kiro_crew.dashboard.handlers.cron import _recognize_session
+        from kiro_crew.history import is_incognito_transcript
+
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+        sessions = tmp_path / "sessions"
+        sessions.mkdir()
+        (sessions / "subagent_worker-a.jsonl").write_text(
+            json.dumps(metadata) + "\n", encoding="utf-8"
+        )
+        # Neither a saved mode nor a colliding slot can make this child live.
+        state = _make_state()
+        state._slots["worker-a"] = SimpleNamespace(memory_mode="persistent")
+
+        refusal = await _recognize_session(
+            state,
+            "subagent:worker-a",
+            "test.memory",
+            blocks_persisted_mode=is_incognito_transcript,
+        )
+
+        assert refusal is not None
+        assert refusal.status == 400
+        assert _body(refusal)["code"] == "unknown_session"
 
 
 # ---------------------------------------------------------------------------
@@ -1165,9 +1721,49 @@ class TestConsolidate:
         assert (await mem_mod.api_memory_consolidate(req)).status == 403
 
     @pytest.mark.asyncio
+    async def test_unrecognized_session_key_cannot_bill_a_consolidation(self) -> None:
+        """A forged key must not reach the dispatch, which spends an LLM turn.
+
+        ``_is_restricted_session`` answers False for a key it has never seen, so
+        the restricted-mode check alone lets an unknown caller trigger a billed
+        consolidation against a session it does not own. The recognition probe
+        in front of it is what refuses.
+        """
+        cons = _consolidator()
+        state = _make_state(consolidator=cons)
+        req = _make_request(
+            state, method="POST", json_body={"key": "s1"}, session_key="dashboard:forged"
+        )
+        # Patched in ``cron``, whose globals ``_recognize_session`` reads.
+        with patch(
+            "kiro_crew.dashboard.handlers.cron._probe_persisted_session",
+            return_value=(False, None),
+        ):
+            resp = await mem_mod.api_memory_consolidate(req)
+        assert resp.status == 400
+        assert _body(resp)["code"] == "unknown_session"
+        cons._consolidate.assert_not_called()
+        assert not cons._tasks
+
+    @pytest.mark.asyncio
+    async def test_missing_session_key_header_is_refused(self) -> None:
+        """No X-Session-Key at all is refused with a machine-readable code."""
+        cons = _consolidator()
+        state = _make_state(consolidator=cons)
+        # Explicitly empty: the helper defaults to the trusted key, so "no header at
+        # all" is what this case has to state rather than inherit.
+        req = _make_request(state, method="POST", json_body={"key": "s1"}, session_key="")
+        resp = await mem_mod.api_memory_consolidate(req)
+        assert resp.status == 400
+        assert _body(resp)["code"] == "missing_session_key"
+        cons._consolidate.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_503_without_consolidator(self) -> None:
         state = _make_state(consolidator=None)
-        req = _make_request(state, method="POST", json_body={"key": "s1"})
+        req = _make_request(
+            state, method="POST", json_body={"key": "s1"}, session_key="dashboard:ui"
+        )
         resp = await mem_mod.api_memory_consolidate(req)
         assert resp.status == 503
         assert _body(resp) == {"error": "consolidator not available"}
@@ -1175,38 +1771,260 @@ class TestConsolidate:
     @pytest.mark.asyncio
     async def test_rejects_invalid_json(self) -> None:
         state = _make_state(consolidator=_consolidator())
-        req = _make_request(state, method="POST", json_body=_BadJSON())
+        req = _make_request(state, method="POST", json_body=_BadJSON(), session_key="dashboard:ui")
         assert (await mem_mod.api_memory_consolidate(req)).status == 400
 
     @pytest.mark.asyncio
     async def test_requires_non_blank_session_key(self) -> None:
         state = _make_state(consolidator=_consolidator())
-        req = _make_request(state, method="POST", json_body={"key": "   "})
+        req = _make_request(
+            state, method="POST", json_body={"key": "   "}, session_key="dashboard:ui"
+        )
         resp = await mem_mod.api_memory_consolidate(req)
         assert resp.status == 400
         assert _body(resp) == {"error": "session key required"}
 
     @pytest.mark.asyncio
     async def test_already_running_is_409(self) -> None:
+        from kiro_crew.history import ConversationLog
+
         cons = _consolidator()
         cons._running.add("s1")
         state = _make_state(consolidator=cons)
-        req = _make_request(state, method="POST", json_body={"key": "s1"})
+        state.conversation_log = ConversationLog()
+        req = _make_request(
+            state, method="POST", json_body={"key": "s1"}, session_key="dashboard:ui"
+        )
         resp = await mem_mod.api_memory_consolidate(req)
         assert resp.status == 409
         cons._consolidate.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_schedules_background_consolidation(self) -> None:
+        from kiro_crew.history import ConversationLog
+
         cons = _consolidator()
         state = _make_state(consolidator=cons)
-        req = _make_request(state, method="POST", json_body={"key": "s1", "include_history": False})
+        state.conversation_log = ConversationLog()
+        req = _make_request(
+            state,
+            method="POST",
+            json_body={"key": "s1", "include_history": False},
+            session_key="dashboard:ui",
+        )
         assert _body(await mem_mod.api_memory_consolidate(req)) == {"ok": True, "key": "s1"}
         assert "s1" in cons._running
         # Drain the spawned task so nothing is left pending at loop teardown.
         for task in list(cons._tasks):
             await task
         cons._consolidate.assert_awaited_once_with("s1", False)
+
+    # -- the target's memory mode, not only the caller's ---------------------------
+    #
+    # ``_memory_write_gate`` tests the CALLER (X-Session-Key). The body's ``key``
+    # names the TARGET, and a persistent caller consolidating a temporary or
+    # incognito session would persist memory for a conversation documented to
+    # leave no durable trace. These pin the target-side refusal in front of every
+    # piece of consolidation work: no running claim, no task, no dispatch.
+
+    @staticmethod
+    def _live_slot(memory_mode: str) -> Any:
+        """The three slot fields the live mode resolver reads."""
+        return SimpleNamespace(
+            memory_mode=memory_mode,
+            is_restricted=memory_mode != "persistent",
+            blocks_reads=memory_mode == "temporary",
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("mode", ["temporary", "incognito"])
+    async def test_private_live_target_is_refused_before_any_work(self, mode: str) -> None:
+        """A persistent caller naming a live temporary/incognito slot gets a coded 403.
+
+        A handler that tests only the caller answers ``200 {"ok": true}`` here and
+        dispatches ``_consolidate`` for the private key.
+        """
+        from kiro_crew.history import ConversationLog
+
+        cons = _consolidator()
+        state = _make_state(consolidator=cons, restricted_keys={f"dashboard:{mode[:3]}1"})
+        state.conversation_log = ConversationLog()
+        state._slots[f"{mode[:3]}1"] = self._live_slot(mode)
+        req = _make_request(
+            state,
+            method="POST",
+            json_body={"key": f"dashboard:{mode[:3]}1", "include_history": False},
+            session_key="dashboard:ui",
+        )
+        with patch("kiro_crew.dashboard.handlers.memory._sel") as sel:
+            resp = await mem_mod.api_memory_consolidate(req)
+        assert resp.status == 403
+        body = _body(resp)
+        assert body["code"] == "restricted_target_session"
+        assert mode in body["error"]
+        # The mode as a field: the Memory tab names it in its skipped tally
+        # ("1 skipped: incognito session") without parsing the sentence.
+        assert body["mode"] == mode
+        # Refused before the running claim: nothing to release, nothing scheduled.
+        cons._consolidate.assert_not_called()
+        assert not cons._running
+        assert not cons._tasks
+        sel().log_api_access.assert_called_once_with(
+            caller="dashboard:ui",
+            operation="memory.consolidate",
+            outcome="denied",
+            source="dashboard",
+            resources=f"restricted_target_session:{mode}",
+        )
+
+    @pytest.mark.asyncio
+    async def test_private_persisted_target_is_refused_by_its_header(self) -> None:
+        """A closed incognito transcript named by its file stem is refused too.
+
+        "Consolidate all" hands the endpoint ``list_sessions`` stems, which have no
+        live slot; the mode then comes from the transcript's own ``memory_mode``.
+        """
+        from kiro_crew.config.paths import config_dir
+        from kiro_crew.history import ConversationLog, allow_on_loop_persist
+
+        log = ConversationLog(base_dir=config_dir() / "sessions")
+        log.init()
+        with allow_on_loop_persist():
+            log.append("dashboard:ghost-13077", "user", "keep this off the record")
+            log.update_metadata("dashboard:ghost-13077", {"memory_mode": "incognito"})
+        cons = _consolidator()
+        state = _make_state(consolidator=cons)
+        state.conversation_log = log
+        req = _make_request(
+            state,
+            method="POST",
+            json_body={"key": "dashboard_ghost-13077", "include_history": True},
+            session_key="dashboard:ui",
+        )
+        resp = await mem_mod.api_memory_consolidate(req)
+        assert resp.status == 403
+        assert _body(resp)["code"] == "restricted_target_session"
+        cons._consolidate.assert_not_called()
+        assert not cons._running
+
+    @pytest.mark.asyncio
+    async def test_private_channel_thread_named_by_its_stem_is_refused(self) -> None:
+        """A Slack thread flagged ``!incognito`` is refused when named by its stem.
+
+        ``list_sessions`` hands out the filename stem (``slack_<ts>``) while the
+        thread's durable flag lives under the live key (``slack:<ts>``) in the
+        session map and its transcript header carries no ``memory_mode`` at all,
+        so a handler that resolves the raw stem reads the thread as persistent.
+        The flag is seeded in a real ``SessionMap`` and the process-local privacy
+        trackers start empty, so the stem has to be unfolded by the map and the
+        flag hydrated from disk -- the path a gateway restart leaves behind.
+        """
+        from kiro_crew.history import ConversationLog
+        from kiro_crew.messaging import privacy_mode
+        from kiro_crew.session_map import SessionMap
+
+        live_key = "slack:1785861252.833429"
+        stem = "slack_1785861252.833429"
+        sm = SessionMap()
+        sm.set_flag(live_key, "incognito", True)
+        sm.flush()
+        privacy_mode.reset()
+        assert sm.channel_key_for_stem(stem) == live_key, "premise: the map unfolds the stem"
+        assert privacy_mode.is_incognito(live_key) is False, "premise: trackers start empty"
+        cons = _consolidator()
+        state = _make_state(consolidator=cons)
+        state.conversation_log = ConversationLog()
+        state.sessions = SimpleNamespace(
+            _session_map=sm, channel_key_for_stem=sm.channel_key_for_stem
+        )
+        try:
+            req = _make_request(
+                state,
+                method="POST",
+                json_body={"key": stem, "include_history": True},
+                session_key="dashboard:ui",
+            )
+            resp = await mem_mod.api_memory_consolidate(req)
+        finally:
+            privacy_mode.reset()
+        assert resp.status == 403
+        assert _body(resp)["code"] == "restricted_target_session"
+        assert "incognito" in _body(resp)["error"]
+        cons._consolidate.assert_not_called()
+        assert not cons._running
+
+    @pytest.mark.asyncio
+    async def test_persistent_live_target_still_dispatches(self) -> None:
+        """Pin: a target that positively resolves as persistent is untouched."""
+        from kiro_crew.history import ConversationLog
+
+        cons = _consolidator()
+        state = _make_state(consolidator=cons)
+        state.conversation_log = ConversationLog()
+        state._slots["p1"] = self._live_slot("persistent")
+        req = _make_request(
+            state,
+            method="POST",
+            json_body={"key": "dashboard:p1", "include_history": False},
+            session_key="dashboard:ui",
+        )
+        assert _body(await mem_mod.api_memory_consolidate(req)) == {
+            "ok": True,
+            "key": "dashboard:p1",
+        }
+        for task in list(cons._tasks):
+            await task
+        cons._consolidate.assert_awaited_once_with("dashboard:p1", False)
+
+    @pytest.mark.asyncio
+    async def test_private_channel_stem_the_map_cannot_unfold_is_refused_by_its_header(
+        self,
+    ) -> None:
+        """A channel stem with no session-map entry is refused from its header.
+
+        The live resolution answers ``persistent`` for every channel key the map
+        does not flag, without probing the transcript; a stem whose entry the map
+        does not hold would therefore dispatch and answer ``200 {"ok": true}``
+        for a pass ``_consolidate`` refuses on the header -- and the Memory tab
+        would count it as summarized. The header is the modifier's own record, so
+        the route probes it too.
+        """
+        from kiro_crew.config.paths import config_dir
+        from kiro_crew.history import ConversationLog, allow_on_loop_persist
+        from kiro_crew.messaging import privacy_mode
+        from kiro_crew.session_map import SessionMap
+
+        live_key = "slack:1785861252.833429"
+        stem = "slack_1785861252.833429"
+        log = ConversationLog(base_dir=config_dir() / "sessions")
+        log.init()
+        with allow_on_loop_persist():
+            log.append(live_key, "user", "keep this off the record")
+            log.update_metadata(live_key, {"memory_mode": "incognito"})
+        sm = SessionMap()  # holds nothing for this thread
+        assert sm.channel_key_for_stem(stem) == "", "premise: the map cannot unfold the stem"
+        privacy_mode.reset()
+        cons = _consolidator()
+        state = _make_state(consolidator=cons)
+        state.conversation_log = log
+        state.sessions = SimpleNamespace(
+            _session_map=sm, channel_key_for_stem=sm.channel_key_for_stem
+        )
+        try:
+            req = _make_request(
+                state,
+                method="POST",
+                json_body={"key": stem, "include_history": True},
+                session_key="dashboard:ui",
+            )
+            resp = await mem_mod.api_memory_consolidate(req)
+        finally:
+            privacy_mode.reset()
+        assert resp.status == 403
+        assert _body(resp)["code"] == "restricted_target_session"
+        assert "incognito" in _body(resp)["error"]
+        cons._consolidate.assert_not_called()
+        assert not cons._running
 
 
 # ---------------------------------------------------------------------------
@@ -1253,7 +2071,7 @@ class TestEmbeddingModelEndpoint:
             resp = await mem_mod.api_memory_embedding_model(req)
             assert resp.status == 400
             # The shared guard distinguishes "unparseable" from "parsed, wrong
-            # shape"; this handler used to answer invalid_json for both.
+            # shape"; this handler must not answer invalid_json for both.
             assert _body(resp)["code"] == "body_not_object"
 
     @pytest.mark.asyncio
@@ -1331,7 +2149,7 @@ class TestEmbeddingModelEndpoint:
 
     @pytest.mark.asyncio
     async def test_apply_armed_during_store_await_is_409_and_arms_nothing(self) -> None:
-        """The awaited store acquisition can yield to the loop (#5221), so a
+        """The awaited store acquisition can yield to the loop, so a
         concurrent apply may arm between the single-flight gate and
         ``begin_apply()`` — the post-await re-check must refuse it."""
         state = _make_state()
@@ -1388,7 +2206,7 @@ class TestEmbeddingStatusCustomModel:
     @pytest.mark.asyncio
     async def test_healthy_custom_model_reports_done_and_no_retry(self) -> None:
         model_path = Path("/models/custom.gguf")
-        custom = SimpleNamespace(error="", path=model_path)
+        custom = CustomModelSpec(model_path, "custom.gguf", 768, "")
         a, b, c, d = self._patches(custom, model_present=True)
         with a, b, c, d:
             body = _body(await mem_mod.api_memory_embedding_status(_make_request(_make_state())))
@@ -1404,7 +2222,7 @@ class TestEmbeddingStatusCustomModel:
 
     @pytest.mark.asyncio
     async def test_broken_custom_model_reports_error_without_retry(self) -> None:
-        custom = SimpleNamespace(error="unreadable", path=Path("/models/custom.gguf"))
+        custom = CustomModelSpec(Path("/models/custom.gguf"), "custom.gguf", 768, "unreadable")
         a, b, c, d = self._patches(custom, model_present=False)
         with a, b, c, d:
             body = _body(await mem_mod.api_memory_embedding_status(_make_request(_make_state())))
@@ -1415,7 +2233,7 @@ class TestEmbeddingStatusCustomModel:
     @pytest.mark.asyncio
     async def test_missing_custom_file_reports_error_naming_the_path(self) -> None:
         model_path = Path("/models/custom.gguf")
-        custom = SimpleNamespace(error="", path=model_path)
+        custom = CustomModelSpec(model_path, "custom.gguf", 768, "")
         a, b, c, d = self._patches(custom, model_present=False)
         with a, b, c, d:
             body = _body(await mem_mod.api_memory_embedding_status(_make_request(_make_state())))
@@ -1432,18 +2250,20 @@ class TestEmbeddingStatusCustomModel:
 class TestWriteEmbedModelConfig:
     @pytest.mark.asyncio
     async def test_writes_path_and_dim_preserving_other_sections(self, tmp_path: Path) -> None:
+        model = tmp_path / "new.gguf"
+        model.write_bytes(b"model weights")
         cfg_path = tmp_path / "config.json"
         cfg_path.write_text(
             json.dumps({"agent": {"provider": "acp"}, "memory": {"embed_model_id": "old"}}),
             encoding="utf-8",
         )
         with patch(f"{_MOD}.config_path", return_value=cfg_path):
-            await mem_mod._write_embed_model_config("/m/new.gguf", 1024)
+            await mem_mod._write_embed_model_config(str(model), 1024)
         data = json.loads(cfg_path.read_text(encoding="utf-8"))
-        assert data["memory"]["embed_model_path"] == "/m/new.gguf"
+        assert data["memory"]["embed_model_path"] == str(model)
         assert data["memory"]["embedding_dim"] == 1024
-        # The pinned id must be dropped so it is re-derived from the new file.
-        assert "embed_model_id" not in data["memory"]
+        assert data["memory"]["embed_model_id"] == mem_mod._custom_model_id(model, "")
+        assert data["memory"]["embed_model_id"] != "old"
         assert data["agent"]["provider"] == "acp"
 
     @pytest.mark.asyncio
@@ -1461,19 +2281,23 @@ class TestWriteEmbedModelConfig:
 
     @pytest.mark.asyncio
     async def test_missing_config_is_created(self, tmp_path: Path) -> None:
+        model = tmp_path / "new.gguf"
+        model.write_bytes(b"model weights")
         cfg_path = tmp_path / "config.json"
         with patch(f"{_MOD}.config_path", return_value=cfg_path):
-            await mem_mod._write_embed_model_config("/m/new.gguf", 512)
+            await mem_mod._write_embed_model_config(str(model), 512)
         data = json.loads(cfg_path.read_text(encoding="utf-8"))
         assert data["memory"]["embedding_dim"] == 512
 
     @pytest.mark.asyncio
     async def test_unparseable_config_raises_and_is_left_intact(self, tmp_path: Path) -> None:
+        model = tmp_path / "new.gguf"
+        model.write_bytes(b"model weights")
         cfg_path = tmp_path / "config.json"
         cfg_path.write_text("{ broken", encoding="utf-8")
         with patch(f"{_MOD}.config_path", return_value=cfg_path):
             with pytest.raises(ValueError, match="could not be parsed"):
-                await mem_mod._write_embed_model_config("/m/new.gguf", 512)
+                await mem_mod._write_embed_model_config(str(model), 512)
         assert cfg_path.read_text(encoding="utf-8") == "{ broken"
 
 
@@ -1524,7 +2348,7 @@ class TestEnsurePipEdgeCases:
         proc.kill.assert_called_once()
         # The critical pin: the reap drains pipes via a SECOND communicate();
         # a bare wait() on a killed child blocked writing into a full stderr
-        # pipe would hang the handler forever (#5989).
+        # pipe would hang the handler forever.
         assert proc.communicate.call_count == 2
         proc.wait.assert_not_awaited()
 
@@ -1694,7 +2518,14 @@ def _apply_store(previous_dim: int = 512, retargeted: bool = True) -> Any:
     store._embedding_dim = previous_dim
     store.set_embedding_dim.return_value = retargeted
     store.recorded_embedding_space.return_value = "sig"
-    store.backfill_missing_embeddings.return_value = 7
+    store.recorded_rebuild_generation.return_value = "test-request"
+    store.embedding_repair_state.return_value = (False, 7)
+
+    def backfill(**kwargs: Any) -> int:
+        store.embedding_repair_state.return_value = (False, 0)
+        return 7
+
+    store.backfill_missing_embeddings.side_effect = backfill
     return store
 
 
@@ -1724,7 +2555,8 @@ class _ApplyHarness:
         self.install = MagicMock()
         self.candidate = MagicMock()
         self.bundled = MagicMock()
-        self.write = AsyncMock(side_effect=write_error)
+        self.rollback = AsyncMock(return_value=None)
+        self.write = AsyncMock(side_effect=write_error, return_value=(self.rollback, False))
         self._recorded = recorded
         self._validate = validate
         self._reconcile_error = reconcile_error
@@ -1752,8 +2584,11 @@ class _ApplyHarness:
             )
         )
         enter(patch(f"{_MOD}.active_embedding_space_signature", return_value="sig"))
+        enter(patch(f"{_MOD}.embedding_rebuild_generation", return_value="test-request"))
+        enter(patch(f"{_MOD}.validated_cached_vector_stores", return_value=()))
         enter(patch(f"{_MOD}.embedding_backend_serving", return_value=self._serving))
         enter(patch(f"{_MOD}._write_embed_model_config", self.write))
+        enter(patch(f"{_MOD}._read_memory_config", return_value={"embed_model_id": "m"}))
         return self
 
     def __exit__(self, *exc: Any) -> None:
@@ -1792,6 +2627,20 @@ class TestApplyEmbeddingModelWorker:
         h.activate.assert_called_once()
         h.prog.finish.assert_called_once_with(7)
         store.backfill_missing_embeddings.assert_called_once()
+        h.prog.begin_run.assert_called_once_with(7)
+        h.prog.advance.assert_called_once_with(7, 7)
+
+    @pytest.mark.asyncio
+    async def test_unhandled_rebuild_request_refuses_activation(self) -> None:
+        store = _apply_store()
+        store.recorded_rebuild_generation.return_value = "previous-request"
+        with _ApplyHarness() as h:
+            await _run_apply(store, "")
+        h.activate.assert_not_called()
+        store.backfill_missing_embeddings.assert_not_called()
+        h.rollback.assert_awaited_once()
+        h.reset.assert_called_once()
+        assert "could not be removed" in h.prog.fail.call_args[0][0]
 
     @pytest.mark.asyncio
     async def test_load_failure_drops_the_candidate_and_fails(self) -> None:
@@ -1820,7 +2669,8 @@ class TestApplyEmbeddingModelWorker:
         # Width restored to the model being restored, not left on the new one.
         assert store.set_embedding_dim.call_args_list[-1][0][0] == 512
         assert "could not be removed" in h.prog.fail.call_args[0][0]
-        h.write.assert_not_called()
+        h.write.assert_awaited_once_with("", 1024)
+        h.rollback.assert_awaited_once()
         h.activate.assert_not_called()
 
     @pytest.mark.asyncio
@@ -1829,7 +2679,9 @@ class TestApplyEmbeddingModelWorker:
         with _ApplyHarness(write_error=ValueError("config.json could not be parsed")) as h:
             await _run_apply(store, "")
         h.reset.assert_called_once()
-        assert store.set_embedding_dim.call_args_list[-1][0][0] == 512
+        store.set_embedding_dim.assert_not_called()
+        store.backfill_missing_embeddings.assert_not_called()
+        h.rollback.assert_not_awaited()
         h.prog.fail.assert_called_once_with("config.json could not be parsed")
         h.activate.assert_not_called()
 
@@ -1892,8 +2744,7 @@ class TestConfigWritesRunOffTheEventLoop:
     Reading ``config.json``, parsing it, and writing it back through
     ``write_config_atomically`` (a tmp-file write plus a rename, which can
     fsync) is all synchronous file I/O. Inline it stalls every other session for
-    its duration -- the class the repo has been closing site by site (#4118,
-    #3803, #4550).
+    its duration -- the class the repo has been closing site by site.
 
     The load-bearing property is not merely "off the loop" but **the whole
     transaction on ONE worker**. Offloading only the read would put a suspension
@@ -1998,12 +2849,14 @@ class TestConfigWritesRunOffTheEventLoop:
         import threading
 
         seen, cfg = self._instrument(monkeypatch, tmp_path)
+        model = tmp_path / "e5.gguf"
+        model.write_bytes(b"model weights")
 
-        await mem_mod._write_embed_model_config("/models/e5.gguf", 768)
+        await mem_mod._write_embed_model_config(str(model), 768)
 
         self._assert_one_worker(seen, threading.get_ident())
         on_disk = json.loads(cfg.read_text(encoding="utf-8"))
-        assert on_disk["memory"]["embed_model_path"] == "/models/e5.gguf"
+        assert on_disk["memory"]["embed_model_path"] == str(model)
         assert on_disk["memory"]["embedding_dim"] == 768
         assert on_disk["existing"] == "kept"
 
@@ -2046,9 +2899,11 @@ class TestConfigWritesRunOffTheEventLoop:
         self, monkeypatch, tmp_path: Path
     ) -> None:
         seen, cfg = self._instrument(monkeypatch, tmp_path, initial="{oops")
+        model = tmp_path / "e5.gguf"
+        model.write_bytes(b"model weights")
 
         with pytest.raises(ValueError, match="could not be parsed"):
-            await mem_mod._write_embed_model_config("/models/e5.gguf", 768)
+            await mem_mod._write_embed_model_config(str(model), 768)
 
         assert seen["write"] == []
         assert cfg.read_text(encoding="utf-8") == "{oops"
@@ -2125,9 +2980,9 @@ class TestConfigWritesRunOffTheEventLoop:
             await first
         await asyncio.wait_for(second, timeout=10)
 
-        assert order.index("worker-end") < order.index("second-ran"), (
-            "the second writer entered before the first worker finished: %r" % (order,)
-        )
+        assert order.index("worker-end") < order.index(
+            "second-ran"
+        ), "the second writer entered before the first worker finished: %r" % (order,)
         assert first.cancelled(), "the cancellation must be re-raised, never swallowed"
 
     @pytest.mark.asyncio
@@ -2153,14 +3008,15 @@ class TestConfigWritesRunOffTheEventLoop:
         req = _make_request(state, method="PUT", json_body={})
         resp = await mem_mod.api_memory_settings(req)
 
-        assert resp.status == 200, (
-            "an empty body against a non-object memory section stopped being a "
-            "no-op: %r" % (resp.body,)
+        assert (
+            resp.status == 200
+        ), "an empty body against a non-object memory section stopped being a " "no-op: %r" % (
+            resp.body,
         )
         assert seen["write"] == [], "a no-op PUT rewrote the config"
-        assert json.loads(cfg.read_text(encoding="utf-8")) == {"memory": []}, (
-            "the malformed section was rewritten"
-        )
+        assert json.loads(cfg.read_text(encoding="utf-8")) == {
+            "memory": []
+        }, "the malformed section was rewritten"
 
 
 class TestNonObjectBodiesAcrossConvertedHandlers:
@@ -2169,7 +3025,7 @@ class TestNonObjectBodiesAcrossConvertedHandlers:
     ``[]`` / ``"s"`` / ``5`` / ``true`` / ``null`` are all VALID JSON, so
     ``request.json()`` returns them and the ``.get()`` each handler performs
     next raised ``AttributeError`` from OUTSIDE the parse ``try`` -- a 500 for
-    what is really malformed client input (issue #5587). Enumerated rather than
+    what is really malformed client input. Enumerated rather than
     written one test per handler so a handler that loses the guard fails by
     construction; the agents.py half of the same invariant lives in
     ``test_json_object_body_guard.py``.

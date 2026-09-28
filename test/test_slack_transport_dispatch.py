@@ -17,15 +17,22 @@ from __future__ import annotations
 import asyncio
 import importlib
 import sys
+from collections import OrderedDict
 from pathlib import Path
+from unittest.mock import AsyncMock
+
+import pytest
 
 from kiro_crew.acp.types import (
     EVENT_COMPLETE,
     EVENT_PERMISSION_REQUEST,
     EVENT_TEXT_CHUNK,
+    STOP_REASON_CANCELLED,
     STOP_REASON_END_TURN,
 )
 from kiro_crew.messaging.link import canonical_key
+from kiro_crew.session import BACKGROUND_KEY
+from kiro_crew.slack import handler as slack_handler
 from kiro_crew.slack import transport_dispatch
 
 # Reuse the golden module's fakes without triggering the stdlib 'test' collision.
@@ -70,7 +77,11 @@ class _CapturingSessions(FakeSessions):
 def _run_transport(monkeypatch, thread_agent=None, agent_override=None):
     # Empty configured default -> exercises the canonical-agent fallback.
     monkeypatch.setattr(transport_dispatch, "_get_default_agent", lambda: "")
-    monkeypatch.setattr(transport_dispatch, "_hydrate_thread_overrides", lambda *a, **k: None)
+    monkeypatch.setattr(
+        transport_dispatch,
+        "_hydrate_thread_overrides",
+        AsyncMock(return_value=None),
+    )
     monkeypatch.setattr(transport_dispatch, "_hydrate_conv_flags", lambda *a, **k: None)
 
     thread_map: dict = {}
@@ -131,7 +142,7 @@ class TestTransportAgentResolution:
         assert sessions.agents == ["kirocrew-research"]
 
     def test_channels_deny_drops_transport_message_before_session(self, monkeypatch, tmp_path):
-        # HIGH (GPT round-8): a channels policy that denies slack must stop
+        # A channels policy that denies slack must stop
         # handle_message_transport BEFORE it acquires a session — removing the gate
         # would let a denied transport message start a turn. Regression-locks the
         # transport call site (distinct from the native handle_message gate).
@@ -160,6 +171,46 @@ class TestTransportAgentResolution:
             ), "denied slack transport message must not acquire a session"
         finally:
             gp.reset_store()
+
+
+class TestTransportAdmissionSpool:
+    def test_session_closing_spools_the_unopened_slack_turn(self, monkeypatch):
+        from kiro_crew.session_allocation import SessionClosingError
+
+        async def reject_turn(*_args, **_kwargs):
+            raise SessionClosingError("automatic update owns admission")
+
+        spool = AsyncMock()
+        monkeypatch.setattr(_CapturingSessions, "get_or_create", reject_turn)
+        monkeypatch.setattr(transport_dispatch, "spool_refused_turn", spool)
+        monkeypatch.setattr(transport_dispatch, "_is_slack_restricted", lambda _key: False)
+
+        sessions = _run_transport(monkeypatch)
+
+        spool.assert_awaited_once()
+        assert spool.await_args.kwargs["channel_type"] == "slack"
+        route = spool.await_args.kwargs["route"]
+        assert route.conversation_id == "C1"
+        assert route.text == "hello"
+        assert route.user_id == "U_OWNER"
+        assert route.thread_id == _MSG_TS
+        assert route.message_id == _MSG_TS
+        assert sessions.agents == []
+
+    def test_session_closing_does_not_spool_restricted_slack_turn(self, monkeypatch):
+        from kiro_crew.session_allocation import SessionClosingError
+
+        async def reject_turn(*_args, **_kwargs):
+            raise SessionClosingError("automatic update owns admission")
+
+        spool = AsyncMock()
+        monkeypatch.setattr(_CapturingSessions, "get_or_create", reject_turn)
+        monkeypatch.setattr(transport_dispatch, "spool_refused_turn", spool)
+        monkeypatch.setattr(transport_dispatch, "_is_slack_restricted", lambda _key: True)
+
+        _run_transport(monkeypatch)
+
+        spool.assert_not_awaited()
 
 
 class TestTransportBookkeepingIsolation:
@@ -191,7 +242,11 @@ class TestTransportBookkeepingIsolation:
 
         monkeypatch.setattr(transport_dispatch, "sel", _sel_factory)
         monkeypatch.setattr(transport_dispatch, "_get_default_agent", lambda: "kirocrew")
-        monkeypatch.setattr(transport_dispatch, "_hydrate_thread_overrides", lambda *a, **k: None)
+        monkeypatch.setattr(
+            transport_dispatch,
+            "_hydrate_thread_overrides",
+            AsyncMock(return_value=None),
+        )
         monkeypatch.setattr(transport_dispatch, "_hydrate_conv_flags", lambda *a, **k: None)
         monkeypatch.setattr(transport_dispatch, "_thread_agents", {})
 
@@ -264,7 +319,11 @@ def _run_transport_text(
     through to the normal LLM turn.
     """
     monkeypatch.setattr(transport_dispatch, "_get_default_agent", lambda: "kirocrew")
-    monkeypatch.setattr(transport_dispatch, "_hydrate_thread_overrides", lambda *a, **k: None)
+    monkeypatch.setattr(
+        transport_dispatch,
+        "_hydrate_thread_overrides",
+        AsyncMock(return_value=None),
+    )
     monkeypatch.setattr(transport_dispatch, "_hydrate_conv_flags", lambda *a, **k: None)
     monkeypatch.setattr(transport_dispatch, "_thread_agents", {})
 
@@ -298,6 +357,25 @@ def _run_transport_text(
 
 def _posts(slack):
     return [kw["text"] for (m, kw) in slack.transcript if m == "post_message"]
+
+
+def test_member_memory_refusal_redacts_before_posting(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from kiro_crew.memory_stores import UnknownMemoryStore
+
+    private_path = "/home/alice/.kiro/crew/memory_stores/member-one/memory.db"
+    credential = "AKIAIOSFODNN7EXAMPLE"
+    failure = UnknownMemoryStore(f"memory_unavailable: cannot open {private_path}; {credential}")
+    monkeypatch.setattr(
+        transport_dispatch, "session_store_for_turn", AsyncMock(side_effect=failure)
+    )
+    slack, sessions = _run_transport_text(monkeypatch, "hello there")
+    posted = "\n".join(_posts(slack))
+    assert "memory_unavailable:" in posted
+    assert private_path not in posted and "alice" not in posted
+    assert credential not in posted
+    assert sessions.agents == []
 
 
 class TestTransportKeywordCommands:
@@ -412,7 +490,11 @@ class TestTransportPrivacyModifiers:
                 return text, {}
 
         monkeypatch.setattr(transport_dispatch, "_get_default_agent", lambda: "kirocrew")
-        monkeypatch.setattr(transport_dispatch, "_hydrate_thread_overrides", lambda *a, **k: None)
+        monkeypatch.setattr(
+            transport_dispatch,
+            "_hydrate_thread_overrides",
+            AsyncMock(return_value=None),
+        )
         monkeypatch.setattr(transport_dispatch, "_hydrate_conv_flags", lambda *a, **k: None)
         monkeypatch.setattr(transport_dispatch, "_thread_agents", {})
 
@@ -456,7 +538,11 @@ class TestTransportReactionsEnabled:
 
     def _run(self, monkeypatch, reactions_enabled):
         monkeypatch.setattr(transport_dispatch, "_get_default_agent", lambda: "kirocrew")
-        monkeypatch.setattr(transport_dispatch, "_hydrate_thread_overrides", lambda *a, **k: None)
+        monkeypatch.setattr(
+            transport_dispatch,
+            "_hydrate_thread_overrides",
+            AsyncMock(return_value=None),
+        )
         monkeypatch.setattr(transport_dispatch, "_hydrate_conv_flags", lambda *a, **k: None)
         monkeypatch.setattr(transport_dispatch, "_thread_agents", {})
         slack = RecordingSlackClient()
@@ -525,7 +611,11 @@ class _CapturingCtxBuilder:
 class TestTransportNativeParity:
     def _prep(self, monkeypatch):
         monkeypatch.setattr(transport_dispatch, "_get_default_agent", lambda: "kirocrew")
-        monkeypatch.setattr(transport_dispatch, "_hydrate_thread_overrides", lambda *a, **k: None)
+        monkeypatch.setattr(
+            transport_dispatch,
+            "_hydrate_thread_overrides",
+            AsyncMock(return_value=None),
+        )
         monkeypatch.setattr(transport_dispatch, "_hydrate_conv_flags", lambda *a, **k: None)
         monkeypatch.setattr(transport_dispatch, "_thread_agents", {})
 
@@ -606,6 +696,130 @@ class TestTransportNativeParity:
         assert cb.captured.get("user_display_name") == "Alice"
 
 
+def _arm_reinjection(sessions) -> dict:
+    """Give the session stand-in the real manager's one-shot flag surface."""
+    ledger: dict = {"consumed": [], "marks": 0, "armed": True}
+
+    def _consume(key):
+        ledger["consumed"].append(key)
+        was = ledger["armed"]
+        ledger["armed"] = False
+        return was
+
+    def _mark(key):
+        ledger["marks"] += 1
+        ledger["armed"] = True
+
+    sessions.consume_needs_reinjection = _consume
+    sessions.mark_needs_reinjection = _mark
+    return ledger
+
+
+class TestTransportCompactionReinjection:
+    """The transport turn loop is its own copy, so it must consume the flag itself.
+
+    ``session_compaction`` marks ``needs_reinjection`` after an in-place compaction
+    dropped the session-start context. A turn loop that does not read it runs
+    every turn after ``/compact`` without the skills index or the response-preferences
+    block.
+    """
+
+    def _prep(self, monkeypatch):
+        monkeypatch.setattr(transport_dispatch, "_get_default_agent", lambda: "kirocrew")
+        monkeypatch.setattr(
+            transport_dispatch,
+            "_hydrate_thread_overrides",
+            AsyncMock(return_value=None),
+        )
+        monkeypatch.setattr(transport_dispatch, "_hydrate_conv_flags", lambda *a, **k: None)
+        monkeypatch.setattr(transport_dispatch, "_thread_agents", {})
+
+    def _run(self, sessions, cb):
+        asyncio.run(
+            transport_dispatch.handle_message_transport(
+                slack=RecordingSlackClient(),
+                sessions=sessions,
+                channel="C1",
+                text="hi",
+                thread_ts=None,
+                msg_ts=_MSG_TS,
+                user_id="U_OWNER",
+                context_builder=cb,
+                conversation_log=None,
+            )
+        )
+
+    def _provider(self):
+        return ScriptedProvider(
+            [
+                make_event(EVENT_TEXT_CHUNK, text="hi"),
+                make_event(EVENT_COMPLETE, stop_reason=STOP_REASON_END_TURN),
+            ]
+        )
+
+    def test_a_compacted_session_forwards_the_flag_to_build_message(self, monkeypatch):
+        self._prep(monkeypatch)
+        cb = _CapturingCtxBuilder()
+        sessions = _CapturingSessions(self._provider())
+        ledger = _arm_reinjection(sessions)
+        self._run(sessions, cb)
+        assert ledger["consumed"] == [canonical_key(_MSG_TS)]
+        assert cb.captured.get("needs_reinjection") is True
+        # Landed: consumed exactly once, and NOT put back.
+        assert ledger["marks"] == 0 and ledger["armed"] is False
+
+    def test_a_session_stand_in_without_the_flag_gets_the_false_default(self, monkeypatch):
+        self._prep(monkeypatch)
+        cb = _CapturingCtxBuilder()
+        sessions = _CapturingSessions(self._provider())
+        assert not hasattr(sessions, "consume_needs_reinjection")
+        self._run(sessions, cb)
+        assert cb.captured.get("needs_reinjection") is False
+
+    def test_a_cancelled_consuming_turn_puts_the_flag_back(self, monkeypatch):
+        # A /stop completes the turn normally with stop_reason "cancelled", and
+        # the backend drops that turn from its transcript -- the re-injected
+        # context goes with it, so the flag must come back like a raised turn.
+        self._prep(monkeypatch)
+        cb = _CapturingCtxBuilder()
+        sessions = _CapturingSessions(
+            ScriptedProvider([make_event(EVENT_COMPLETE, stop_reason=STOP_REASON_CANCELLED)])
+        )
+        ledger = _arm_reinjection(sessions)
+        self._run(sessions, cb)
+        assert cb.captured.get("needs_reinjection") is True
+        assert ledger["marks"] == 1 and ledger["armed"] is True
+
+    def test_a_failed_consuming_turn_puts_the_flag_back(self, monkeypatch):
+        # The flag is cleared BEFORE build_message; a driver fault on that very
+        # turn discards the prompt carrying the re-injected context. Without the
+        # re-arm the session runs without it until the NEXT compaction -- the
+        # contract the dashboard runner keeps in its finally, applied here.
+        self._prep(monkeypatch)
+
+        class _DyingDriver:
+            def __init__(self, *a, **k):
+                pass
+
+            async def run(self, message):
+                raise RuntimeError("backend died before streaming")
+
+        monkeypatch.setattr(transport_dispatch, "TurnDriver", _DyingDriver)
+        cb = _CapturingCtxBuilder()
+        sessions = _CapturingSessions(self._provider())
+        ledger = _arm_reinjection(sessions)
+        failures: list = []
+
+        async def _record_failure(key):
+            failures.append(key)
+
+        sessions.record_failure = _record_failure
+        self._run(sessions, cb)
+        assert cb.captured.get("needs_reinjection") is True
+        assert failures == [canonical_key(_MSG_TS)]
+        assert ledger["marks"] == 1 and ledger["armed"] is True
+
+
 class TestTransportTemporaryBlocksMemoryReads:
     """``!temporary`` must block memory READS on the DEFAULT transport path.
 
@@ -620,7 +834,11 @@ class TestTransportTemporaryBlocksMemoryReads:
 
     def _prep(self, monkeypatch):
         monkeypatch.setattr(transport_dispatch, "_get_default_agent", lambda: "kirocrew")
-        monkeypatch.setattr(transport_dispatch, "_hydrate_thread_overrides", lambda *a, **k: None)
+        monkeypatch.setattr(
+            transport_dispatch,
+            "_hydrate_thread_overrides",
+            AsyncMock(return_value=None),
+        )
         monkeypatch.setattr(transport_dispatch, "_hydrate_conv_flags", lambda *a, **k: None)
         monkeypatch.setattr(transport_dispatch, "_thread_agents", {})
 
@@ -724,7 +942,11 @@ class TestTransportToolGateWiring:
         from kiro_crew.hooks import HookResult, ToolHookResult
 
         monkeypatch.setattr(transport_dispatch, "_get_default_agent", lambda: "kirocrew")
-        monkeypatch.setattr(transport_dispatch, "_hydrate_thread_overrides", lambda *a, **k: None)
+        monkeypatch.setattr(
+            transport_dispatch,
+            "_hydrate_thread_overrides",
+            AsyncMock(return_value=None),
+        )
         monkeypatch.setattr(transport_dispatch, "_hydrate_conv_flags", lambda *a, **k: None)
         monkeypatch.setattr(transport_dispatch, "_thread_agents", {})
 
@@ -801,7 +1023,11 @@ class TestHydrationBeforeHook:
             _handler._thread_incognito[session_key] = None
 
         monkeypatch.setattr(transport_dispatch, "_hydrate_conv_flags", _fake_hydrate)
-        monkeypatch.setattr(transport_dispatch, "_hydrate_thread_overrides", lambda *a, **k: None)
+        monkeypatch.setattr(
+            transport_dispatch,
+            "_hydrate_thread_overrides",
+            AsyncMock(return_value=None),
+        )
 
         saved: list = []
 
@@ -862,7 +1088,11 @@ class TestConversationLogAgentMetadata:
         from kiro_crew.history import ConversationLog
 
         monkeypatch.setattr(transport_dispatch, "_get_default_agent", lambda: "sales-agent")
-        monkeypatch.setattr(transport_dispatch, "_hydrate_thread_overrides", lambda *a, **k: None)
+        monkeypatch.setattr(
+            transport_dispatch,
+            "_hydrate_thread_overrides",
+            AsyncMock(return_value=None),
+        )
         monkeypatch.setattr(transport_dispatch, "_hydrate_conv_flags", lambda *a, **k: None)
         monkeypatch.setattr(transport_dispatch, "_thread_agents", {})
 
@@ -906,7 +1136,11 @@ class TestConversationLogAgentMetadata:
         from kiro_crew.history import ConversationLog
 
         monkeypatch.setattr(transport_dispatch, "_get_default_agent", lambda: "sales-agent")
-        monkeypatch.setattr(transport_dispatch, "_hydrate_thread_overrides", lambda *a, **k: None)
+        monkeypatch.setattr(
+            transport_dispatch,
+            "_hydrate_thread_overrides",
+            AsyncMock(return_value=None),
+        )
         monkeypatch.setattr(transport_dispatch, "_hydrate_conv_flags", lambda *a, **k: None)
         monkeypatch.setattr(transport_dispatch, "_thread_agents", {})
 
@@ -963,7 +1197,11 @@ class TestConversationLogAgentMetadata:
         from kiro_crew.hooks import HookResult
 
         monkeypatch.setattr(transport_dispatch, "_get_default_agent", lambda: "sales-agent")
-        monkeypatch.setattr(transport_dispatch, "_hydrate_thread_overrides", lambda *a, **k: None)
+        monkeypatch.setattr(
+            transport_dispatch,
+            "_hydrate_thread_overrides",
+            AsyncMock(return_value=None),
+        )
         monkeypatch.setattr(transport_dispatch, "_hydrate_conv_flags", lambda *a, **k: None)
         monkeypatch.setattr(transport_dispatch, "_thread_agents", {})
 
@@ -1047,7 +1285,11 @@ class _TitleSessions(_CapturingSessions):
 def _run_transport_titling(monkeypatch, *, restricted=False, conversation_log=None):
     """Drive one successful transport turn and drain the fire-and-forget tasks."""
     monkeypatch.setattr(transport_dispatch, "_get_default_agent", lambda: "kirocrew")
-    monkeypatch.setattr(transport_dispatch, "_hydrate_thread_overrides", lambda *a, **k: None)
+    monkeypatch.setattr(
+        transport_dispatch,
+        "_hydrate_thread_overrides",
+        AsyncMock(return_value=None),
+    )
     monkeypatch.setattr(transport_dispatch, "_hydrate_conv_flags", lambda *a, **k: None)
     monkeypatch.setattr(transport_dispatch, "_thread_agents", {})
     monkeypatch.setattr(transport_dispatch, "_is_slack_restricted", lambda _key: restricted)
@@ -1163,7 +1405,11 @@ class TestTransportAutoTitle:
                 calls["failure"] += 1
 
         monkeypatch.setattr(transport_dispatch, "_get_default_agent", lambda: "kirocrew")
-        monkeypatch.setattr(transport_dispatch, "_hydrate_thread_overrides", lambda *a, **k: None)
+        monkeypatch.setattr(
+            transport_dispatch,
+            "_hydrate_thread_overrides",
+            AsyncMock(return_value=None),
+        )
         monkeypatch.setattr(transport_dispatch, "_hydrate_conv_flags", lambda *a, **k: None)
         monkeypatch.setattr(transport_dispatch, "_thread_agents", {})
 
@@ -1198,7 +1444,7 @@ class TestTransportAutoTitle:
 
 
 class TestTransportTrustedBotErrorSuppression:
-    """Echo-loop guard parity with native handle_message (issue #6638).
+    """Echo-loop guard parity with native handle_message.
 
     A failed turn on a trusted-bot message must NOT post the transport error
     reply: in a mutual-mesh setup the reply is itself a bot-authored event the
@@ -1207,7 +1453,11 @@ class TestTransportTrustedBotErrorSuppression:
 
     def _run_failing_turn(self, monkeypatch, *, from_trusted_bot: bool):
         monkeypatch.setattr(transport_dispatch, "_get_default_agent", lambda: "")
-        monkeypatch.setattr(transport_dispatch, "_hydrate_thread_overrides", lambda *a, **k: None)
+        monkeypatch.setattr(
+            transport_dispatch,
+            "_hydrate_thread_overrides",
+            AsyncMock(return_value=None),
+        )
         monkeypatch.setattr(transport_dispatch, "_hydrate_conv_flags", lambda *a, **k: None)
         monkeypatch.setattr(transport_dispatch, "_thread_agents", {})
 
@@ -1259,12 +1509,12 @@ class TestTransportTrustedBotErrorSuppression:
 class TestTransportPartialProgressRescue:
     """A turn killed mid-flight must persist what the model already produced.
 
-    Before this, the user row was durable but partial assistant output lived
-    only in the renderer, so every retry re-read a transcript that ended at the
-    question and started over. Observed 2026-09-02: a ~28-minute transient
-    backend outage burned five consecutive attempts on one Slack thread, each
-    re-deriving the same ticket ids before dying again, with the session file
-    still 625 bytes at the end of it.
+    Without this, the user row is durable but partial assistant output lives
+    only in the renderer, so every retry re-reads a transcript that ends at the
+    question and starts over. A transient backend outage can then burn several
+    consecutive attempts on one Slack thread, each re-deriving the same ticket
+    ids before dying again, with the session file never growing past the user
+    row.
     """
 
     def _run_dying_turn(
@@ -1280,7 +1530,11 @@ class TestTransportPartialProgressRescue:
         from kiro_crew.history import ConversationLog
 
         monkeypatch.setattr(transport_dispatch, "_get_default_agent", lambda: "sales-agent")
-        monkeypatch.setattr(transport_dispatch, "_hydrate_thread_overrides", lambda *a, **k: None)
+        monkeypatch.setattr(
+            transport_dispatch,
+            "_hydrate_thread_overrides",
+            AsyncMock(return_value=None),
+        )
         monkeypatch.setattr(transport_dispatch, "_hydrate_conv_flags", lambda *a, **k: None)
         monkeypatch.setattr(transport_dispatch, "_thread_agents", {})
 
@@ -1495,3 +1749,305 @@ class TestTransportPartialProgressRescue:
         assistant = [r for r in rows if r.get("role") == "assistant"]
         assert len(assistant) == 1
         assert assistant[0].get("source_user") == "U_OWNER"
+
+
+class _LinkCapturingSessions(FakeSessions):
+    """FakeSessions that records acquired session keys and Slack link writes."""
+
+    def __init__(self, provider):
+        super().__init__(provider)
+        self.keys: list = []
+        self.links: list = []
+        # Who the thread index says owns this thread; None = unclaimed.
+        self.thread_owner: str | None = None
+
+    def get_session_for_thread(self, thread_ts):
+        return self.thread_owner
+
+    async def get_or_create(self, session_key, agent=None, channel_id=None):
+        self.keys.append(session_key)
+        return await super().get_or_create(session_key, agent=agent, channel_id=channel_id)
+
+    @property
+    def turn_keys(self) -> list:
+        """The keys real TURNS ran under.
+
+        The auto-title that follows a successful turn acquires the shared
+        ``BACKGROUND_KEY`` session to name the conversation. That is not a
+        routing decision this feature has any say over, so it is excluded here
+        rather than pinned into every assertion below.
+        """
+        return [k for k in self.keys if k != BACKGROUND_KEY]
+
+    def set_slack_link(self, key, thread_ts, channel_id):
+        # Deliberately NOT delegating to super(): the base fake stores links in a
+        # dict under this same attribute, so with the list used here a real link
+        # write raised TypeError and the assertions below failed for the wrong
+        # reason instead of showing the offending link.
+        self.links.append((key, thread_ts, channel_id))
+
+
+class TestFlatDmSessionKey:
+    """``slack.dm_single_session``: one session per 1:1 DM, replies at channel root."""
+
+    _DM = "D0AP0870FFH"
+
+    def test_disabled_keeps_the_per_message_key(self):
+        assert transport_dispatch.flat_dm_session_key(self._DM, None, enabled=False) is None
+
+    def test_top_level_dm_keys_by_channel(self):
+        assert (
+            transport_dispatch.flat_dm_session_key(self._DM, None, enabled=True)
+            == f"slack:{self._DM}"
+        )
+
+    def test_a_threaded_reply_in_a_dm_keys_by_channel_too(self):
+        # In a 1:1 DM a thread is a layout habit, not a new topic: splitting it
+        # off would leave the branch without the conversation it replies to.
+        assert (
+            transport_dispatch.flat_dm_session_key(self._DM, "1700000000.000001", enabled=True)
+            == f"slack:{self._DM}"
+        )
+
+    def test_a_group_channel_never_collapses(self):
+        assert transport_dispatch.flat_dm_session_key("C1", None, enabled=True) is None
+
+    def test_a_group_dm_never_collapses(self):
+        # An mpim is shared with other people, so it may not become one session.
+        assert transport_dispatch.flat_dm_session_key("G1", None, enabled=True) is None
+
+
+class TestFlatDmTransportWiring:
+    def _prep(self, monkeypatch):
+        monkeypatch.setattr(transport_dispatch, "_get_default_agent", lambda: "kirocrew")
+        monkeypatch.setattr(
+            transport_dispatch, "_hydrate_thread_overrides", AsyncMock(return_value=None)
+        )
+        monkeypatch.setattr(transport_dispatch, "_hydrate_conv_flags", lambda *a, **k: None)
+        monkeypatch.setattr(transport_dispatch, "_thread_agents", {})
+
+    def _provider(self):
+        return ScriptedProvider(
+            [
+                make_event(EVENT_TEXT_CHUNK, text="hi"),
+                make_event(EVENT_COMPLETE, stop_reason=STOP_REASON_END_TURN),
+            ]
+        )
+
+    def _run(self, monkeypatch, *, channel, thread_ts, enabled, text="do it"):
+        self._prep(monkeypatch)
+        slack = RecordingSlackClient()
+        sessions = _LinkCapturingSessions(self._provider())
+        asyncio.run(
+            transport_dispatch.handle_message_transport(
+                slack=slack,
+                sessions=sessions,
+                channel=channel,
+                text=text,
+                thread_ts=thread_ts,
+                msg_ts=_MSG_TS,
+                user_id="U_OWNER",
+                context_builder=None,
+                conversation_log=None,
+                dm_single_session=enabled,
+            )
+        )
+        return slack, sessions
+
+    def test_dm_key_unchanged_when_disabled(self, monkeypatch):
+        # HARD INVARIANT: off by default, the DM key is byte-for-byte unchanged.
+        _slack, sessions = self._run(
+            monkeypatch, channel="D0AP0870FFH", thread_ts=None, enabled=False
+        )
+        assert sessions.turn_keys == [canonical_key(_MSG_TS)]
+
+    def test_enabled_runs_the_turn_under_the_channel_key(self, monkeypatch):
+        _slack, sessions = self._run(
+            monkeypatch, channel="D0AP0870FFH", thread_ts=None, enabled=True
+        )
+        assert sessions.turn_keys == ["slack:D0AP0870FFH"]
+
+    def test_enabled_posts_at_channel_root(self, monkeypatch):
+        slack, _sessions = self._run(
+            monkeypatch, channel="D0AP0870FFH", thread_ts=None, enabled=True
+        )
+        posted = [kw for m, kw in slack.transcript if m in ("post_message", "post_blocks")]
+        assert posted, "the turn posted nothing"
+        # Flat means no thread: a thread_ts here would bury the reply in a thread.
+        assert all(kw["thread_ts"] is None for kw in posted)
+
+    def test_enabled_does_not_claim_a_thread(self, monkeypatch):
+        # The session is keyed by the channel, so linking it to this message's ts
+        # would hand the dashboard mirror a thread to post into while the
+        # conversation itself is flat.
+        _slack, sessions = self._run(
+            monkeypatch, channel="D0AP0870FFH", thread_ts=None, enabled=True
+        )
+        assert sessions.links == []
+
+    def test_a_threaded_dm_reply_joins_the_same_session(self, monkeypatch):
+        _slack, sessions = self._run(
+            monkeypatch, channel="D0AP0870FFH", thread_ts="1700000000.000001", enabled=True
+        )
+        assert sessions.turn_keys == ["slack:D0AP0870FFH"]
+
+    def test_a_threaded_dm_reply_still_answers_inside_its_thread(self, monkeypatch):
+        # The session merged; the layout did not. Answering at channel root would
+        # strand the reply away from the question it answers.
+        thread_ts = "1700000000.000001"
+        slack, _sessions = self._run(
+            monkeypatch, channel="D0AP0870FFH", thread_ts=thread_ts, enabled=True
+        )
+        posted = [kw for m, kw in slack.transcript if m in ("post_message", "post_blocks")]
+        assert posted, "the turn posted nothing"
+        assert all(kw["thread_ts"] == thread_ts for kw in posted)
+
+    def test_a_threaded_dm_reply_claims_no_thread(self, monkeypatch):
+        # Several threads would each overwrite the session's scalar
+        # slack_thread_ts, so the dashboard mirror would follow whichever spoke
+        # last. Routing needs no claim: the flat key is derived from the channel.
+        _slack, sessions = self._run(
+            monkeypatch, channel="D0AP0870FFH", thread_ts="1700000000.000001", enabled=True
+        )
+        assert sessions.links == []
+
+    def test_a_group_channel_is_unaffected_when_enabled(self, monkeypatch):
+        _slack, sessions = self._run(monkeypatch, channel="C1", thread_ts=None, enabled=True)
+        assert sessions.turn_keys == [canonical_key(_MSG_TS)]
+
+    def test_a_thread_claimed_before_the_flag_does_not_split_the_dm(self, monkeypatch):
+        # A thread claimed by its own per-thread session (the shape this feature
+        # replaces, e.g. from before the flag was on) must not pull the turn back
+        # out of the merged conversation.
+        self._prep(monkeypatch)
+        thread_ts = "1700000000.000001"
+        slack = RecordingSlackClient()
+        sessions = _LinkCapturingSessions(self._provider())
+        sessions.thread_owner = canonical_key(thread_ts)
+        asyncio.run(
+            transport_dispatch.handle_message_transport(
+                slack=slack,
+                sessions=sessions,
+                channel="D0AP0870FFH",
+                text="do it",
+                thread_ts=thread_ts,
+                msg_ts=_MSG_TS,
+                user_id="U_OWNER",
+                context_builder=None,
+                conversation_log=None,
+                dm_single_session=True,
+            )
+        )
+        assert sessions.turn_keys == ["slack:D0AP0870FFH"]
+
+    def test_a_dashboard_linked_thread_still_wins(self, monkeypatch):
+        # Link-to-Dashboard is a real binding to somewhere else, not the shape
+        # this feature replaces, so it keeps ownership of its thread.
+        self._prep(monkeypatch)
+        thread_ts = "1700000000.000001"
+        slack = RecordingSlackClient()
+        sessions = _LinkCapturingSessions(self._provider())
+        sessions.thread_owner = "chat-7-1700000000"
+        asyncio.run(
+            transport_dispatch.handle_message_transport(
+                slack=slack,
+                sessions=sessions,
+                channel="D0AP0870FFH",
+                text="do it",
+                thread_ts=thread_ts,
+                msg_ts=_MSG_TS,
+                user_id="U_OWNER",
+                context_builder=None,
+                conversation_log=None,
+                dm_single_session=True,
+            )
+        )
+        assert sessions.turn_keys == ["chat-7-1700000000"]
+
+    def _clear_modifier_state(self, monkeypatch):
+        # Both modifiers are idempotent through module-level LRUs keyed by
+        # session_key, so a second test reusing the same DM would short-circuit
+        # before reaching the code under test.
+        monkeypatch.setattr(slack_handler, "_thread_temporary", OrderedDict())
+        monkeypatch.setattr(slack_handler, "_thread_incognito", OrderedDict())
+
+    @pytest.mark.parametrize("token", ["!incognito", "!temporary"])
+    def test_a_privacy_modifier_in_a_flat_dm_claims_no_thread(self, monkeypatch, token):
+        # The modifiers call set_slack_link themselves. Reached with this
+        # message's ts they bind the channel-keyed session to a thread, which
+        # reroutes later threaded replies into the flat session and hands the
+        # dashboard mirror a thread to post into -- the exact claim the
+        # self-link guard refuses for a flat DM.
+        self._clear_modifier_state(monkeypatch)
+        _slack, sessions = self._run(
+            monkeypatch,
+            channel="D0AP0870FFH",
+            thread_ts=None,
+            enabled=True,
+            text=f"{token} do it",
+        )
+        assert sessions.turn_keys == ["slack:D0AP0870FFH"]
+        assert sessions.links == []
+
+    @pytest.mark.parametrize("token", ["!incognito", "!temporary"])
+    def test_a_privacy_modifier_in_a_flat_dm_confirms_at_channel_root(self, monkeypatch, token):
+        self._clear_modifier_state(monkeypatch)
+        slack, _sessions = self._run(
+            monkeypatch,
+            channel="D0AP0870FFH",
+            thread_ts=None,
+            enabled=True,
+            text=f"{token} do it",
+        )
+        posted = [kw for m, kw in slack.transcript if m in ("post_message", "post_blocks")]
+        assert posted, "the turn posted nothing"
+        # Includes the modifier's own confirmation: a flat DM has no thread, and
+        # thread_ts="" would be forwarded to Slack verbatim rather than omitted.
+        assert all(kw["thread_ts"] is None for kw in posted)
+
+    @pytest.mark.parametrize("token", ["!incognito", "!temporary"])
+    def test_a_privacy_modifier_in_a_dm_thread_claims_no_thread_either(self, monkeypatch, token):
+        # The modifiers call set_slack_link themselves, so the flat session would
+        # get bound to whichever thread last carried a modifier.
+        self._clear_modifier_state(monkeypatch)
+        _slack, sessions = self._run(
+            monkeypatch,
+            channel="D0AP0870FFH",
+            thread_ts="1700000000.000001",
+            enabled=True,
+            text=f"{token} do it",
+        )
+        assert sessions.turn_keys == ["slack:D0AP0870FFH"]
+        assert sessions.links == []
+
+    @pytest.mark.parametrize("token", ["!incognito", "!temporary"])
+    def test_a_privacy_modifier_in_a_dm_thread_confirms_in_that_thread(self, monkeypatch, token):
+        self._clear_modifier_state(monkeypatch)
+        thread_ts = "1700000000.000001"
+        slack, _sessions = self._run(
+            monkeypatch,
+            channel="D0AP0870FFH",
+            thread_ts=thread_ts,
+            enabled=True,
+            text=f"{token} do it",
+        )
+        posted = [kw for m, kw in slack.transcript if m in ("post_message", "post_blocks")]
+        assert posted, "the turn posted nothing"
+        # Includes the modifier's own confirmation: not linking a thread must not
+        # cost us answering in it.
+        assert all(kw["thread_ts"] == thread_ts for kw in posted)
+
+    @pytest.mark.parametrize("token", ["!incognito", "!temporary"])
+    def test_a_privacy_modifier_claims_the_thread_when_the_flag_is_off(self, monkeypatch, token):
+        # Preserved behaviour: a thread-scoped session registers its thread so
+        # follow-ups pass the mention/observe in_active_thread gate.
+        self._clear_modifier_state(monkeypatch)
+        thread_ts = "1700000000.000001"
+        _slack, sessions = self._run(
+            monkeypatch,
+            channel="D0AP0870FFH",
+            thread_ts=thread_ts,
+            enabled=False,
+            text=f"{token} do it",
+        )
+        assert (canonical_key(thread_ts), thread_ts, "D0AP0870FFH") in sessions.links

@@ -3,7 +3,7 @@
 Two families, one module, so one test file. ``/stop``, ``/yolo`` and the
 dashboard-link TTL vocabulary existed as near-verbatim copies in three dispatchers;
 the ``spawn`` / ``cron`` / ``task run`` keyword replies existed only inside
-``slack/handler.py``. These tests pin the behaviour that used to be asserted per
+``slack/handler.py``. These tests pin the behaviour once asserted per
 channel (where the copies could drift), the CONTRACT the hoist has to preserve --
 the ``None`` sentinel meaning "not this command, keep routing", the retryable busy
 answer, and the redaction every reply owes an external surface -- and the two
@@ -48,13 +48,20 @@ from kiro_crew.messaging.commands import (
     task_arg_reply,
     task_command_reply,
 )
+from kiro_crew.messaging.queue_drain import owner_token
 from kiro_crew.messaging.queue_receipt import ReceiptQueue, receipt_text
 
 
 class _Surface:
-    """A receipt surface with its address already bound (what a channel supplies)."""
+    """A receipt surface with its address already bound (what a channel supplies).
+
+    ``address_key`` is part of that binding: the registry compares it to decide whether
+    a caller writes to the bubble's own conversation, so a fake without one addresses
+    nothing and every write is withheld.
+    """
 
     label = "fake"
+    address_key = "fake\x00chat"
 
     def __init__(self) -> None:
         self.sent: list[str] = []
@@ -100,10 +107,16 @@ class _Sessions:
     def get_provider(self, key: str) -> Any:
         return self._provider
 
-    def clear_queue(self, key: str) -> None:
+    def clear_queue(self, key: str, owned_by: Any = None) -> None:
         self.cleared.append(key)
         if self._queue is not None:
             self.locked_during_clear.append(self._queue.lock.locked())
+
+
+#: One caller's own principal, the token a channel builds for whoever typed the command.
+#: The helper below tags the receipt line with it AND stops under it, which is the live
+#: arrangement: an owner that matches nothing on the queue would clear nothing.
+_CALLER = owner_token("fake", ("u1", "c1"))
 
 
 def _stop(sessions: _Sessions, queue: ReceiptQueue, surface: _Surface) -> str:
@@ -111,8 +124,8 @@ def _stop(sessions: _Sessions, queue: ReceiptQueue, surface: _Surface) -> str:
         # A live receipt so the finalize has a bubble to flip, exactly as a
         # mid-turn burst would have left one.
         async with queue.lock:
-            await queue.create_or_grow_locked("s", surface, "what time is it")
-        return await stop_running_turn(sessions, "s", queue=queue, surface=surface)
+            await queue.create_or_grow_locked("s", surface, "what time is it", _CALLER)
+        return await stop_running_turn(sessions, "s", queue=queue, surface=surface, owner=_CALLER)
 
     return asyncio.run(go())
 
@@ -171,6 +184,30 @@ class TestStopRunningTurn:
         assert _stop(sessions, queue, surface) == STOP_REPLY_IDLE
         assert provider.calls == [{"wait_ack_timeout": 0}]
         assert sessions.cleared == ["s"], "the queue must be cleared either way"
+
+    def test_the_stop_is_recorded_on_the_manager_before_the_busy_check(self) -> None:
+        """A turn between its abandoned attempt and its replay has no live
+        session and reads as idle here; recording the Stop FIRST is what lets
+        the replay see it and stay dropped. ``note_stop`` is probed, so the
+        narrow doubles above (which lack it) keep working."""
+
+        class _Recording(_Sessions):
+            def __init__(self) -> None:
+                super().__init__(busy=False)
+                self.noted: list[str] = []
+
+            def is_busy(self, key: str) -> bool:
+                assert self.noted == ["s"], "recorded before the busy check"
+                return False
+
+            def note_stop(self, key: str) -> bool:
+                self.noted.append(key)
+                return True
+
+        queue, surface = ReceiptQueue(), _Surface()
+        sessions = _Recording()
+        assert _stop(sessions, queue, surface) == STOP_REPLY_IDLE
+        assert sessions.noted == ["s"]
 
 
 def _reset_grant() -> Any:
@@ -469,8 +506,74 @@ class TestLayering:
                 offenders.append(f"{path.name}:{node.lineno} -> {module}")
         assert not offenders, offenders
 
+    #: The services the module docstring keeps duck-typed: each reaches
+    #: ``kiro_crew.slack`` transitively, so a RUNTIME import of either -- at any
+    #: nesting depth -- is the ``messaging -> slack`` edge in disguise. Typing-only
+    #: imports under ``if TYPE_CHECKING:`` are the sanctioned way to name them.
+    _DUCK_TYPED_SERVICES = ("kiro_crew.subagent", "kiro_crew.taskrunner")
+
+    def test_the_duck_typed_services_are_never_imported_at_runtime(self) -> None:
+        """A deferred in-function import is still an edge: the channel ``spawn``
+        reply once reached for ``kiro_crew.subagent`` inside its function body to
+        read the queued-reason kinds, which is why those live in the leaf module
+        ``kiro_crew.subagent_wait_reasons`` instead."""
+        pkg = Path(commands.__file__).resolve().parent
+        offenders: list[str] = []
+        for path in sorted(pkg.glob("*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            typing_only: set[int] = set()
+            for node in ast.walk(tree):
+                if (
+                    isinstance(node, ast.If)
+                    and isinstance(node.test, ast.Name)
+                    and node.test.id == "TYPE_CHECKING"
+                ):
+                    for inner in ast.walk(node):
+                        typing_only.add(id(inner))
+            for node in ast.walk(tree):
+                if id(node) in typing_only:
+                    continue
+                if isinstance(node, ast.ImportFrom):
+                    modules = [node.module or ""]
+                elif isinstance(node, ast.Import):
+                    modules = [a.name for a in node.names]
+                else:
+                    continue
+                for module in modules:
+                    if any(
+                        module == svc or module.startswith(svc + ".")
+                        for svc in self._DUCK_TYPED_SERVICES
+                    ):
+                        offenders.append(f"{path.name}:{node.lineno} -> {module}")
+        assert not offenders, offenders
+
+    def test_the_wait_reason_kinds_come_from_a_leaf_module(self) -> None:
+        """The module the channel reply reads the kinds from imports nothing from
+        ``kiro_crew`` itself, so reading it can never grow into the edge above;
+        and it agrees with what ``kiro_crew.subagent`` re-exports."""
+        import importlib
+
+        leaf = importlib.import_module("kiro_crew.subagent_wait_reasons")
+        tree = ast.parse(Path(leaf.__file__).read_text(encoding="utf-8"))
+        edges = [
+            (node.module or "")
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom) and (node.module or "").startswith("kiro_crew")
+        ] + [
+            a.name
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Import)
+            for a in node.names
+            if a.name.startswith("kiro_crew")
+        ]
+        assert edges == [], edges
+        from kiro_crew import subagent as sub
+
+        assert sub.DEFERRED_QUEUED_REASONS is leaf.DEFERRED_QUEUED_REASONS
+        assert leaf.QUEUED_REASON_CONCURRENCY_LIMIT not in leaf.DEFERRED_QUEUED_REASONS
+
     def test_the_allowed_edge_list_has_no_stale_entries(self) -> None:
-        """An exception that no longer exists must be deleted, not left to rot.
+        """An exception that does not exist must be deleted, not left to rot.
 
         Without this the list only ever grows, and a stale entry silently
         pre-authorizes an edge a future change might reintroduce for a different
@@ -518,8 +621,9 @@ class TestNotThisCommand:
     """``None`` is the sentinel that keeps normal routing going."""
 
     @pytest.mark.parametrize("text", ["", "hello", "spawnish thing", "  ", "bgone"])
-    def test_spawn_declines_text_that_is_not_a_spawn(self, text: str) -> None:
-        assert spawn_command_reply(text, MagicMock()) is None
+    @pytest.mark.asyncio
+    async def test_spawn_declines_text_that_is_not_a_spawn(self, text: str) -> None:
+        assert await spawn_command_reply(text, MagicMock()) is None
 
     @pytest.mark.parametrize("text", ["", "cron", "crond list", "not cron list"])
     @pytest.mark.asyncio
@@ -537,50 +641,72 @@ class TestNotThisCommand:
 
 
 class TestSpawn:
-    def test_both_prefixes_reach_the_same_spawn(self) -> None:
+    @pytest.mark.asyncio
+    async def test_both_prefixes_reach_the_same_spawn(self) -> None:
         manager = MagicMock(max_concurrent=2)
         manager.spawn.return_value = SimpleNamespace(id="z9")
         for text in ("spawn do it", "bg do it", "SPAWN do it"):
             manager.spawn.reset_mock()
-            assert "z9" in (spawn_command_reply(text, manager) or "")
+            assert "z9" in (await spawn_command_reply(text, manager) or "")
             assert manager.spawn.call_args.args[0] == "do it"
 
-    def test_the_parsed_form_is_public_for_a_prefixed_command_grammar(self) -> None:
+    @pytest.mark.asyncio
+    async def test_the_parsed_form_is_public_for_a_prefixed_command_grammar(self) -> None:
         # A channel whose own grammar carries the prefix (/spawn, !spawn) has the
         # argument already; it must not have to rebuild "spawn " + arg.
         manager = MagicMock(max_concurrent=2)
         manager.spawn.return_value = SimpleNamespace(id="q1")
-        assert "q1" in (spawn_task_reply("do it", manager) or "")
+        assert "q1" in (await spawn_task_reply("do it", manager) or "")
 
-    def test_an_empty_argument_declines(self) -> None:
-        assert spawn_task_reply("", MagicMock()) is None
-        assert spawn_command_reply("spawn    ", MagicMock()) is None
+    @pytest.mark.asyncio
+    async def test_a_manager_with_spawn_async_is_never_spawned_on_the_loop(self) -> None:
+        """The store write a spawn performs must not run on the gateway loop.
+
+        A real ``SubagentManager`` exposes ``spawn_async``, which writes the
+        durable row on the task store's writer thread; the sync ``spawn`` takes
+        ``BEGIN IMMEDIATE`` on the calling thread.
+        """
+        manager = MagicMock(max_concurrent=2)
+        manager.spawn_async = AsyncMock(return_value=SimpleNamespace(id="a9"))
+        assert "a9" in (await spawn_task_reply("do it", manager, "slack:C1:1") or "")
+        manager.spawn.assert_not_called()
+        assert manager.spawn_async.await_args.kwargs["parent_session_key"] == "slack:C1:1"
+
+    @pytest.mark.asyncio
+    async def test_an_empty_argument_declines(self) -> None:
+        assert await spawn_task_reply("", MagicMock()) is None
+        assert await spawn_command_reply("spawn    ", MagicMock()) is None
 
     @pytest.mark.parametrize("verb", ["list", "status", "LIST"])
-    def test_the_list_verbs_report_an_empty_roster(self, verb: str) -> None:
-        assert spawn_task_reply(verb, MagicMock(running=[])) == "No subagents running."
+    @pytest.mark.asyncio
+    async def test_the_list_verbs_report_an_empty_roster(self, verb: str) -> None:
+        assert await spawn_task_reply(verb, MagicMock(running=[])) == "No subagents running."
 
-    def test_a_running_subagent_is_listed_with_its_elapsed_time(self) -> None:
+    @pytest.mark.asyncio
+    async def test_a_running_subagent_is_listed_with_its_elapsed_time(self) -> None:
         agent = SimpleNamespace(id="a7", started=time.time() - 5, task="reindex the corpus")
-        out = spawn_task_reply("list", MagicMock(running=[agent])) or ""
+        out = await spawn_task_reply("list", MagicMock(running=[agent])) or ""
         assert "a7" in out and "reindex the corpus" in out
 
-    def test_capacity_is_reported_with_the_limit_that_was_reached(self) -> None:
+    @pytest.mark.asyncio
+    async def test_capacity_is_reported_with_the_limit_that_was_reached(self) -> None:
         manager = MagicMock(max_concurrent=3)
         manager.spawn.return_value = None
-        assert "capacity reached (3)" in (spawn_task_reply("work", manager) or "")
+        assert "capacity reached (3)" in (await spawn_task_reply("work", manager) or "")
 
-    def test_the_echoed_task_is_redacted(self) -> None:
+    @pytest.mark.asyncio
+    async def test_the_echoed_task_is_redacted(self) -> None:
         # The echo goes to an external surface and into the persisted log, and the
         # task is free-form text a user typed or an LLM proposed.
         manager = MagicMock(max_concurrent=2)
         manager.spawn.return_value = SimpleNamespace(id="r1")
-        out = spawn_task_reply(f"push with {_AWS_KEY}", manager) or ""
+        out = await spawn_task_reply(f"push with {_AWS_KEY}", manager) or ""
         assert _AWS_KEY not in out
 
-    def test_a_listed_task_is_redacted(self) -> None:
+    @pytest.mark.asyncio
+    async def test_a_listed_task_is_redacted(self) -> None:
         agent = SimpleNamespace(id="a1", started=time.time(), task=f"key {_AWS_KEY}")
-        out = spawn_task_reply("list", MagicMock(running=[agent])) or ""
+        out = await spawn_task_reply("list", MagicMock(running=[agent])) or ""
         assert _AWS_KEY not in out
 
 
@@ -1040,7 +1166,8 @@ class TestListsHostState:
         assert commands.normalize_task_arg("running the tests") == "running the tests"
         assert commands.normalize_task_arg("run") == ""
 
-    def test_the_spawn_listing_really_does_ignore_the_session(self) -> None:
+    @pytest.mark.asyncio
+    async def test_the_spawn_listing_really_does_ignore_the_session(self) -> None:
         """The premise, asserted rather than assumed.
 
         The gate exists because `spawn list` renders every subagent on the box. If it
@@ -1052,12 +1179,12 @@ class TestListsHostState:
             SimpleNamespace(id="a2", started=0.0, task="somebody elses"),
         ]
         manager = SimpleNamespace(running=agents, max_concurrent=4)
-        out = commands.spawn_task_reply("list", manager, "telegram:kirocrew:direct:7")
+        out = await commands.spawn_task_reply("list", manager, "telegram:kirocrew:direct:7")
         assert out is not None
         assert "mine" in out and "somebody elses" in out
 
 
-# ── the manual-/compact capability gate (#8156) ───────────────────────────────
+# ── the manual-/compact capability gate ───────────────────────────────
 
 
 class TestCompactUnsupportedBackend:
@@ -1089,3 +1216,22 @@ class TestCompactUnsupportedBackend:
         assert "automatically" in reply
         # Informational, never an error.
         assert "❌" not in reply and "⚠️" not in reply
+
+
+@pytest.mark.asyncio
+async def test_spawn_memory_refusal_does_not_announce_or_start_work(monkeypatch):
+    from kiro_crew.memory_stores import UnknownMemoryStore
+
+    manager = SimpleNamespace(spawn_async=AsyncMock())
+    loop_thread = threading.get_ident()
+
+    def refuse(log, key):
+        assert threading.get_ident() != loop_thread
+        assert key == "slack:C123:456.789"
+        raise UnknownMemoryStore("Private memory binding is unavailable")
+
+    monkeypatch.setattr("kiro_crew.context.store_of_session", refuse)
+    result = await spawn_task_reply("do work", manager, "slack:C123:456.789")
+    assert "Private memory binding is unavailable" in result
+    assert "Spawned" not in result
+    manager.spawn_async.assert_not_awaited()

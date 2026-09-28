@@ -23,6 +23,9 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from kiro_crew._sqlite_compat import sqlite3
 from kiro_crew.dashboard.handlers import knowledge as kh
+from kiro_crew.embeddings import PRIORITY_NORMAL
+from kiro_crew.knowledge.embedder import embedder_signature
+from kiro_crew.knowledge.ingestion import IngestionPipeline
 from kiro_crew.knowledge.store import KnowledgeStore
 
 MODULE = "kiro_crew.dashboard.handlers.knowledge"
@@ -32,28 +35,33 @@ MODULE = "kiro_crew.dashboard.handlers.knowledge"
 def store(tmp_path):
     s = KnowledgeStore(str(tmp_path / "kb.db"))
     yield s
-    s.close()
+    s._close_all_for_tests()
 
 
 class _FakeEmbedder:
     """Minimal stand-in for InProcessEmbedder (real model never loaded)."""
 
     def __init__(self, *, available=True, vec=(0.1, 0.2, 0.3, 0.4),
-                 model="fake-embed:1"):
+                 model="fake-embed:1", dim=4):
         self.model = model
+        # Width is part of the vector-space identity embed_signature hashes, so a
+        # stand-in has to declare one just as InProcessEmbedder does.
+        self.dim = dim
         self.content_budget = 2000
         self._available = available
         self._vec = list(vec)
         self.embed_calls: list[str] = []
+        self.priorities: list[int] = []
 
     async def is_available_async(self) -> bool:
         return self._available
 
-    def embed_for_item(self, title, summary, content):
+    def embed_for_item(self, title, summary, content, *, priority=PRIORITY_NORMAL):
         self.embed_calls.append(title or "")
+        self.priorities.append(priority)
         return list(self._vec) if self._vec else None
 
-    def embed(self, text):
+    def embed(self, text, *, priority=PRIORITY_NORMAL):
         return list(self._vec) if self._vec else None
 
 
@@ -647,7 +655,7 @@ class TestImportBundle:
 
     @pytest.mark.asyncio
     async def test_corrupt_json_column_is_a_clean_400(self, store, monkeypatch):
-        # The store's writer-side invariant (issue #5559) rejects this value
+        # The store's writer-side invariant rejects this value
         # AT THE STORE: a lone-surrogate escape passes json.loads (so it gets
         # through the handler's pre-redaction shape validator) but cannot be
         # UTF-8-encoded at SQLite bind time. The handler surfaces the store's
@@ -708,7 +716,7 @@ class TestImportBundle:
                     await export_client.get(f"/api/knowledge/items/{item_id}/export")
                 ).json()
         finally:
-            source_store.close()
+            source_store._close_all_for_tests()
 
         async with _client(_make_app(store)) as client:
             resp = await client.post("/api/knowledge/import", json=bundle)
@@ -719,8 +727,16 @@ class TestImportBundle:
 
     @pytest.mark.asyncio
     async def test_bundle_violating_foreign_keys_is_400_not_500(self, store):
-        bundle = {"source_locations": [
-            {"id": "sl1", "item_id": "missing-item", "source_id": "missing-source"}]}
+        # The source IS declared, so the store resolves the reference and the row
+        # reaches the insert; its ITEM is what no bundle carries, which is the
+        # foreign key this arm exists for. An undeclared source is refused earlier,
+        # by the store's own typed rejection, and is covered separately.
+        bundle = {
+            "sources": [{"id": "s1", "name": "A", "source_type": "local_file",
+                         "uri": "/a.md", "created_at": "2024-01-01T00:00:00"}],
+            "source_locations": [
+                {"id": "sl1", "item_id": "missing-item", "source_id": "s1"}],
+        }
         async with _client(_make_app(store)) as client:
             resp = await client.post("/api/knowledge/import", json=bundle)
             assert resp.status == 400
@@ -990,8 +1006,15 @@ class TestImportBundle:
         # raw driver/exception text must never reach the client -- on either
         # the 400 arm (e2e via a real FK violation) or the 500 arm (covered
         # above).  Server-side logs keep the detail instead.
-        bundle = {"source_locations": [
-            {"id": "sl1", "item_id": "missing-item", "source_id": "missing-source"}]}
+        # The source is declared so the reference resolves and the row reaches the
+        # insert; the missing ITEM is what trips the foreign key, which is the arm
+        # whose driver text must not escape.
+        bundle = {
+            "sources": [{"id": "s1", "name": "A", "source_type": "local_file",
+                         "uri": "/a.md", "created_at": "2024-01-01T00:00:00"}],
+            "source_locations": [
+                {"id": "sl1", "item_id": "missing-item", "source_id": "s1"}],
+        }
         async with _client(_make_app(store)) as client:
             resp = await client.post("/api/knowledge/import", json=bundle)
             assert resp.status == 400
@@ -999,6 +1022,68 @@ class TestImportBundle:
         assert body["error"] == "malformed bundle"
         assert "FOREIGN KEY" not in body["error"]
         assert "constraint" not in body["error"].lower()
+
+    @pytest.mark.asyncio
+    async def test_the_withheld_account_is_redacted_in_the_response(self, store):
+        """A document key is BUNDLE-authored text on an HTTP path. `slug` is exempt
+        from the inbound redaction loop on purpose -- it lands in a PRIMARY KEY and has
+        to be the real text -- and it carries no length bound, so the account naming it
+        is where bundle text would otherwise reach a reader unfiltered."""
+        bundle = {
+            "sources": [{"id": "s1", "name": "Auto-added", "source_type": "agent",
+                         "uri": "agent://", "created_at": "2024-01-01T00:00:00"}],
+            "agent_item_state": [{
+                "source_id": "s1",
+                "slug": "doc-AKIAIOSFODNN7EXAMPLE",
+                "content_hash": "h",
+                "item_ids": json.dumps(["absent-AKIAIOSFODNN7EXAMPLE"]),
+                "updated_at": "2024-01-01T00:00:00",
+                "name": "N",
+            }],
+        }
+        async with _client(_make_app(store)) as client:
+            resp = await client.post("/api/knowledge/import", json=bundle)
+            assert resp.status == 200
+            result = await resp.json()
+
+        named = [w for w in result["withheld"]
+                 if w.get("reason") == "ownership_row_names_absent_items"]
+        assert named, f"fixture must produce a withheld entry: {result['withheld']}"
+        assert "AKIAIOSFODNN7EXAMPLE" not in json.dumps(result), (
+            "bundle-authored credential text reached the import response"
+        )
+        assert "REDACTED" in named[0]["key"]
+        assert "REDACTED" in named[0]["items"]
+
+    @pytest.mark.asyncio
+    async def test_the_stored_document_key_stays_byte_exact(self, store):
+        """The control on the other side: redaction belongs to the RESPONSE. The store
+        matches this key against a PRIMARY KEY, so a redacted one would not find its own
+        document."""
+        slug = "doc-AKIAIOSFODNN7EXAMPLE"
+        bundle = {
+            "sources": [{"id": "s1", "name": "Auto-added", "source_type": "agent",
+                         "uri": "agent://", "created_at": "2024-01-01T00:00:00"}],
+            "items": [{"id": "i1", "title": "T", "content": "body",
+                       "item_type": "document", "source_id": "s1"}],
+            "agent_item_state": [{
+                "source_id": "s1",
+                "slug": slug,
+                "content_hash": "h",
+                "item_ids": json.dumps(["i1"]),
+                "updated_at": "2024-01-01T00:00:00",
+                "name": "N",
+            }],
+        }
+        async with _client(_make_app(store)) as client:
+            resp = await client.post("/api/knowledge/import", json=bundle)
+            assert resp.status == 200
+            result = await resp.json()
+
+        assert result["ownership_rows_imported"] == 1
+        assert result["withheld"] == []
+        row = store.db.execute("SELECT slug FROM agent_item_state").fetchone()
+        assert row["slug"] == slug, "the stored key was redacted; it must stay byte-exact"
 
 
 # ----------------------------------------------------------------- embeddings
@@ -1022,6 +1107,21 @@ class TestGetEmbeddingStatus:
         assert data["enabled"] is True
         assert data["available"] is True
         assert (data["total_items"], data["embedded_items"]) == (2, 1)
+
+    @pytest.mark.asyncio
+    async def test_status_takes_no_db_connection_on_the_loop(self, store, monkeypatch):
+        """The dashboard polls this endpoint while open; the COUNTs must run
+        in a worker thread. On the loop, a contended knowledge DB busy-waits
+        every task (watchdog heartbeat included) for the connection's whole
+        busy timeout. Strict mode turns an on-loop take into a raise,
+        which aiohttp surfaces as a 500."""
+        await asyncio.to_thread(store.add_item, "a", "body", "note")
+        monkeypatch.setenv("KIROCREW_STRICT_ON_LOOP_STORE", "1")
+        async with _client(_make_app(store)) as client:
+            resp = await client.get("/api/knowledge/embedding/status")
+            assert resp.status == 200
+            data = await resp.json()
+        assert (data["total_items"], data["embedded_items"]) == (1, 0)
 
 
 class TestRebuildEmbeddingsJob:
@@ -1281,8 +1381,9 @@ class TestSearchForContext:
         async def _direct(fn, *args, **kwargs):
             return fn(*args, **kwargs)
 
-        def _retriever(_store, embedder=None):
+        def _retriever(_store, embedder=None, *, embed_sig=None):
             seen["embedder"] = embedder
+            seen["embed_sig"] = embed_sig
             return MagicMock(search=MagicMock(return_value=[]))
 
         monkeypatch.setattr(f"{MODULE}.run_in_embed_pool", _direct)
@@ -1292,6 +1393,9 @@ class TestSearchForContext:
             assert (await client.get("/api/knowledge/search-for-context",
                                      params={"q": "z"})).status == 200
         assert seen["embedder"] == emb.embed
+        # Wiring the embedder without its signature would leave the vector leg
+        # scoring items from any space, which is the defect the pair closes.
+        assert seen["embed_sig"] == embedder_signature(emb)
 
     @pytest.mark.asyncio
     async def test_unavailable_embedder_is_not_wired(self, store, monkeypatch, tmp_path):
@@ -1301,8 +1405,9 @@ class TestSearchForContext:
         async def _direct(fn, *args, **kwargs):
             return fn(*args, **kwargs)
 
-        def _retriever(_store, embedder=None):
+        def _retriever(_store, embedder=None, *, embed_sig=None):
             seen["embedder"] = embedder
+            seen["embed_sig"] = embed_sig
             return MagicMock(search=MagicMock(return_value=[]))
 
         monkeypatch.setattr(f"{MODULE}.run_in_embed_pool", _direct)
@@ -1312,6 +1417,7 @@ class TestSearchForContext:
             assert (await client.get("/api/knowledge/search-for-context",
                                      params={"q": "z"})).status == 200
         assert seen["embedder"] is None
+        assert seen["embed_sig"] is None
 
 
 # ------------------------------------------------------------ agent document
@@ -1449,6 +1555,33 @@ class TestIngestText:
             assert (await resp.json())["error"] == "internal server error"
         assert not Path(pipeline.ingest_file.await_args.args[0]).exists()
 
+    @pytest.mark.asyncio
+    async def test_the_gate_is_held_from_the_lookup_through_the_ingest(self, store, monkeypatch):
+        """The body read is an await between the source lookup and the ingest,
+        and the handler holds the store's ingestion gate across it: a
+        maintenance window cannot open while the body is in flight, and can
+        once the request has answered."""
+        sid = store.add_source("s", "web", "https://example.com")
+        store.update_source(sid, sync_status="error")
+        pipeline = IngestionPipeline.__new__(IngestionPipeline)
+        pipeline.store = store
+        pipeline.ingest_file = AsyncMock(return_value="job-9")
+        seen: list[bool] = []
+
+        async def _body_read(request, max_bytes=None):
+            with store.maintenance_window(timeout=0.05) as quiescent:
+                seen.append(quiescent)
+            return {"text": "hello"}, None
+
+        monkeypatch.setattr(kh, "read_bounded_json", _body_read)
+        async with _client(_make_app(store, pipeline=pipeline)) as client:
+            resp = await client.post(f"/api/knowledge/sources/{sid}/ingest-text",
+                                     json={"text": "hello"})
+            assert resp.status == 200
+        assert seen == [False], "the maintenance window opened during the body read"
+        with store.maintenance_window(timeout=0.05) as quiescent:
+            assert quiescent is True, "the gate stayed held after the request answered"
+
 
 # --------------------------------------------------- source delete / agent sync
 
@@ -1525,7 +1658,10 @@ class TestSyncSourceAgentBranch:
         sid = store.add_source("s", "web", "", properties={"url": "https://e.test/a"})
         seen = {}
 
-        async def _fake_sync(source_id, url, name, st, pipeline, pool):
+        async def _fake_sync(source_id, url, name, st, pipeline, pool, *, claim_settled=None):
+            # The handler holds the ingestion gate until the task reports its claim.
+            if claim_settled is not None:
+                claim_settled.set()
             seen["url"] = url
 
         monkeypatch.setattr(f"{MODULE}._background_agent_sync", _fake_sync)
@@ -1559,7 +1695,10 @@ class TestSyncSourceAgentBranch:
         sid = store.add_source("s", "web", "https://e.test/a")
         ran = asyncio.Event()
 
-        async def _fake_sync(source_id, url, name, st, pipeline, pool):
+        async def _fake_sync(source_id, url, name, st, pipeline, pool, *, claim_settled=None):
+            # The handler holds the ingestion gate until the task reports its claim.
+            if claim_settled is not None:
+                claim_settled.set()
             ran.set()
 
         monkeypatch.setattr(f"{MODULE}._background_agent_sync", _fake_sync)
@@ -1815,7 +1954,7 @@ _NON_OBJECT_BODIES = ([1, 2], 7)
 
 class TestJsonObjectBodyGuard:
     """Every ``request.json()`` site answers 400, not 500, on a body that is
-    valid JSON but not an object -- and the two previously-unguarded sites
+    valid JSON but not an object -- and two further sites
     (files/retry, files/skip) now answer 400 on invalid JSON too."""
 
     @pytest.mark.asyncio
@@ -1858,8 +1997,8 @@ class TestJsonObjectBodyGuard:
     @pytest.mark.asyncio
     @pytest.mark.parametrize("endpoint", ["retry", "skip"])
     async def test_file_state_invalid_json_is_400_not_500(self, store, endpoint):
-        # These two sites previously had no try/except at all: a malformed
-        # body escaped as a raw JSONDecodeError and surfaced as a 500.
+        # Without a try/except these two sites would let a malformed
+        # body escape as a raw JSONDecodeError and surface as a 500.
         sid = store.add_source("s", "local_folder", "/tmp/x")
         async with _client(_guard_app(store)) as client:
             resp = await client.post(
@@ -1923,7 +2062,7 @@ class TestJsonObjectBodyGuard:
 
     @pytest.mark.asyncio
     async def test_invalid_json_yields_code_at_every_site(self, store, monkeypatch):
-        # At the previously-guarded sites the parse-failure path's entire
+        # At the already-guarded sites the parse-failure path's entire
         # change is the machine-readable ``code`` field -- pin it everywhere.
         monkeypatch.setattr(f"{MODULE}.KiroCrewConfig.load", staticmethod(_cfg))
         item_id = store.add_item("a", "body", "note")

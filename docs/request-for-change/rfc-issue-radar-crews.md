@@ -1,11 +1,11 @@
 ---
 title: Issue Radar Crews — autonomous issue workers with a public claim ledger
-status: draft
+status: partial
 revision: v1
 author: kirocrew agent session, directed by diwm
 created: 2026-08-08
-last-audited: 2026-08-08
-audited-at: f2aa4c8bb
+last-audited: 2026-09-22
+audited-at: 80bd0a81f
 doc-pr:
 implementation-prs: []
 tracking-issues: []
@@ -14,9 +14,16 @@ superseded-by: []
 ---
 # RFC: Issue Radar Crews — autonomous issue workers with a public claim ledger
 
-Status: draft. Nothing in this document exists on main. Every code reference below
-was read at `5adec8c58` and re-verified unchanged at `f2aa4c8bb`, the commit
-implementation starts from.
+Status: partial — the crew ledger and its agent surface are implemented in
+`src/kiro_crew/apps/builtins/issue_radar/backend/crew_runtime.py`,
+`src/kiro_crew/apps/builtins/issue_radar/backend/crew_store.py`,
+`src/kiro_crew/apps/builtins/issue_radar/backend/crew_routes.py`, and the Issue
+Radar Crews UI under `website/src/apps/issue-radar/`; the two agent ledger tools
+live in `src/kiro_crew/mcp_tools/apps.py`. This audit did not re-classify every
+later phase of the RFC. The body below remains the historical
+design record and differs from the shipped implementation where later safety
+work superseded a mechanism (for example, a scoped `SafetyOverride` replaces
+`slot._trust`).
 
 **Disambiguation.** "Crews" already names two other things in this repository: the
 agent-template roster at `/capabilities` → Crews (`website/src/pages/KiroCrewAgentsPage.tsx`),
@@ -96,7 +103,7 @@ per-crew page therefore shows *phase and next step*, not a velocity number.
 | Workspace | one git worktree per issue |
 
 The closest existing precedent is `auto_research`
-(`src/kiro_crew/apps/builtins/auto_research/handlers.py:974-1040`): an app-owned
+(`src/kiro_crew/apps/builtins/auto_research/campaign/agent_mode.py`): an app-owned
 dashboard slot, an autonudge loop, per-slot trust, a STOP sentinel, and a TTL
 watchdog. That launch sequence is the one to copy.
 
@@ -432,7 +439,8 @@ issue as needing a human, live on the app's existing Settings page.
 Registration is two files: `lib/types.ts` (`MainView`, `ExpandedSection`) and the
 `Workspace.tsx` branch.
 
-Evidence: `.github/screenshots/issue-radar-crews/` — the crew list, the crew page,
+Evidence: attached to the PR description as GitHub `user-attachments` (see the PR
+template's Screenshots section) — the crew list, the crew page,
 the create dialog and the protocol settings in both themes, plus a recording
 walking the flow end to end. Captured from the real built SPA by
 `website/scripts/capture-crews.mjs` and `record-crews.mjs`, which share their
@@ -611,5 +619,5 @@ Everything quantitative in this document, and where it came from.
 | Agent cold-start concurrency | 4 | `session.py:748` |
 | Terminal session cap (contrast) | 12 | `handlers/terminal.py:53` |
 | Idle cleanup threshold | 3 days | `chat_handlers.py:1941` |
-| `auto_research` trust TTL | 24h | `auto_research/handlers.py:126` |
+| `auto_research` trust TTL | 24h | `auto_research/campaign/watchdog.py` |
 | Repository labels | 34 total; `crew: ` is the crew-writable set | `gh label list` |

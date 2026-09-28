@@ -3,8 +3,8 @@
 The model picker loads its list once via React Query and caches the result. A
 successful (HTTP 200) empty list is cached as "there are zero models" and only a
 manual page refresh re-fires the request. The common trigger was a slow cold
-`kiro-cli --list-models` spawn: on timeout / spawn failure the handler used to
-return `[]` with HTTP 200, so the picker rendered empty until refresh.
+`kiro-cli --list-models` spawn: on timeout / spawn failure, returning
+`[]` with HTTP 200 leaves the picker rendered empty until refresh.
 
 These tests pin the fix: every DEGRADED branch (binary unresolved, timeout,
 unexpected exception) must return HTTP 503 so the frontend's fetch helper throws
@@ -87,6 +87,8 @@ class _FakeProc:
         self._stdout = stdout
         self._stderr = stderr
         self.returncode = returncode
+        # Above every platform's pid_max: a timeout's group kill can reach no one.
+        self.pid = 99_999_999_999
 
     def kill(self):  # noqa: D401 - matches Process API
         pass
@@ -122,7 +124,8 @@ def test_list_models_timeout_returns_503(tmp_path):
     ):
         resp = _run(agents.api_models(_kiro_request(tmp_path)))
     assert resp.status == 503
-    assert "error" in _body(resp)
+    # The timeout branch itself answered, not the generic exception handler.
+    assert _body(resp) == {"error": "model list timed out"}
 
 
 def test_list_models_nonzero_exit_returns_503(tmp_path):
@@ -327,6 +330,61 @@ def test_structured_context_window_seeds_central_authority(tmp_path):
     assert resp.status == 200
     # The non-registry GPT window is now resolvable through the central authority.
     assert mr.model_window("gpt-5.6-terra") == 272000
+
+
+def test_catalog_warms_the_acp_advertised_cache_unfiltered(tmp_path, monkeypatch):
+    # The same --list-models rows that seed the window authority also warm the
+    # ``acp`` advertised-model cache, kiro's VOCABULARY, so model_scope can tell
+    # a pin chosen for another harness from a native one before any session
+    # exists. Fed from the UNFILTERED catalog: a deprecated row is still a kiro
+    # id, and a vocabulary that omitted it would make a native pin read as
+    # foreign. Both spellings of a row are collected, like refresh_kiro_windows.
+    import kiro_crew.model_registry as mr
+    from kiro_crew.dashboard import chat_utils
+
+    monkeypatch.setattr(mr, "_ADVERTISED_MODELS", {})
+    monkeypatch.setattr(chat_utils, "_DEPRECATED_MODEL_MAP", {"claude-sonnet-4": "claude-sonnet-4.6"})
+    persisted: list[str] = []
+    monkeypatch.setattr(mr, "persist_advertised_models", lambda: persisted.append("acp"))
+    payload = json.dumps(
+        {
+            "models": [
+                {"model_name": "auto", "model_id": "auto", "context_window_tokens": 200000},
+                {
+                    "model_name": "claude-opus-4.8",
+                    "model_id": "claude-opus-4.8",
+                    "context_window_tokens": 1000000,
+                },
+                {"model_name": "claude-sonnet-4", "model_id": "sonnet-4-id", "context_window_tokens": 200000},
+            ]
+        }
+    ).encode()
+    with patch.object(agents.KiroCrewConfig, "load", return_value=_kiro_cfg()), patch(
+        "kiro_crew.acp.client._resolve_kiro_bin_for_spawn", return_value="/usr/bin/kiro-cli"
+    ), patch("kiro_crew.acp.client._resolve_ssh_auth_sock", lambda env: None), patch(
+        "kiro_crew.env.augmented_path", lambda p: p
+    ), patch(
+        "kiro_crew.dashboard.handlers.agents.wrap_argv", _stub_wrap_argv
+    ), patch(
+        "kiro_crew.dashboard.handlers.agents.cgroup_scope_argv", lambda argv: argv
+    ), patch(
+        "kiro_crew.sandbox.resource_limit_preexec", lambda: None
+    ), patch.object(
+        agents.asyncio, "create_subprocess_exec", return_value=_FakeProc(payload)
+    ):
+        resp = _run(agents.api_models(_kiro_request(tmp_path)))
+    assert resp.status == 200
+    # The response still drops the deprecated row...
+    assert [m["model_name"] for m in _body(resp)] == ["auto", "claude-opus-4.8"]
+    # ...while the vocabulary keeps it, under both of its spellings.
+    assert mr.advertised_models("acp") == [
+        "auto",
+        "claude-opus-4.8",
+        "sonnet-4-id",
+        "claude-sonnet-4",
+    ]
+    # The disk persist was offloaded (through the executor), not skipped.
+    assert persisted == ["acp"]
 
 
 # ---------------------------------------------------------------------------

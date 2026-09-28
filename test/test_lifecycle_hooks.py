@@ -217,6 +217,9 @@ class TestShellBeforePython:
             request = MagicMock()
             request.match_info = {"name": "test-app"}
             request.app = {"state": MagicMock()}
+            request.can_read_body = False
+            # No app identity: the enable route refuses app tokens outright.
+            request.get = lambda key, default=None: default
 
             await handle_enable_app(request)
 
@@ -255,7 +258,7 @@ class TestLifecycleDispatcherEdgeCases:
 
 
 # ---------------------------------------------------------------------------
-# Per-hook timeout at the dispatch boundary (issue #5443)
+# Per-hook timeout at the dispatch boundary
 # ---------------------------------------------------------------------------
 
 
@@ -432,7 +435,7 @@ class TestLifecycleHookTimeout:
 
         dispatcher = LifecycleDispatcher()
         monkeypatch.setattr(dispatcher, "_resolve_hook", lambda *_a, **_k: hangs)
-        ctx = dispatcher._build_context(self._app_info("hang-app"))
+        ctx = dispatcher._build_context(self._app_info("hang-app"), phase="startup")
 
         ok = await dispatcher._invoke("hang-app", "backend.hooks:on_startup", ctx, phase="startup")
 
@@ -474,7 +477,7 @@ class TestLifecycleHookTimeout:
 
         dispatcher = LifecycleDispatcher()
         monkeypatch.setattr(dispatcher, "_resolve_hook", lambda *_a, **_k: waits_for_release)
-        ctx = dispatcher._build_context(self._app_info("cleanup-app"))
+        ctx = dispatcher._build_context(self._app_info("cleanup-app"), phase="startup")
 
         ok = await dispatcher._invoke(
             "cleanup-app", "backend.hooks:on_startup", ctx, phase="startup"
@@ -513,8 +516,8 @@ class TestLifecycleHookTimeout:
 
         dispatcher = LifecycleDispatcher()
         monkeypatch.setattr(dispatcher, "_resolve_hook", lambda *_a, **_k: retained)
-        first_ctx = dispatcher._build_context(self._app_info("retry-app"))
-        retry_ctx = dispatcher._build_context(self._app_info("retry-app"))
+        first_ctx = dispatcher._build_context(self._app_info("retry-app"), phase="startup")
+        retry_ctx = dispatcher._build_context(self._app_info("retry-app"), phase="startup")
 
         try:
             assert await dispatcher._invoke(
@@ -566,7 +569,7 @@ class TestLifecycleHookTimeout:
 
         dispatcher = LifecycleDispatcher()
         monkeypatch.setattr(dispatcher, "_resolve_hook", lambda *_a, **_k: waits_on_worker)
-        ctx = dispatcher._build_context(self._app_info("thread-app"))
+        ctx = dispatcher._build_context(self._app_info("thread-app"), phase="startup")
 
         try:
             ok = await dispatcher._invoke(
@@ -623,7 +626,7 @@ class TestLifecycleHookTimeout:
         monkeypatch.setattr(
             dispatcher, "_resolve_hook", lambda *_a, **_k: self_cancelling_hook
         )
-        ctx = dispatcher._build_context(self._app_info(app_name))
+        ctx = dispatcher._build_context(self._app_info(app_name), phase="startup")
 
         try:
             assert await dispatcher._invoke(
@@ -670,7 +673,7 @@ class TestLifecycleHookTimeout:
         monkeypatch.setattr(
             dispatcher, "_resolve_hook", lambda *_a, **_k: waits_on_worker
         )
-        ctx = dispatcher._build_context(self._app_info(app_name))
+        ctx = dispatcher._build_context(self._app_info(app_name), phase="startup")
         invoke_task = asyncio.create_task(
             dispatcher._invoke(
                 app_name, "backend.hooks:on_startup", ctx, phase="startup"
@@ -730,7 +733,7 @@ class TestLifecycleHookTimeout:
         monkeypatch.setattr(
             dispatcher, "_resolve_hook", lambda *_a, **_k: self_cancelling_hook
         )
-        ctx = dispatcher._build_context(self._app_info(app_name))
+        ctx = dispatcher._build_context(self._app_info(app_name), phase="startup")
 
         try:
             assert await dispatcher._invoke(
@@ -780,7 +783,7 @@ class TestLifecycleHookTimeout:
 
         dispatcher = LifecycleDispatcher()
         monkeypatch.setattr(dispatcher, "_resolve_hook", lambda *_a, **_k: waits_for_release)
-        ctx = dispatcher._build_context(self._app_info("stubborn-app"))
+        ctx = dispatcher._build_context(self._app_info("stubborn-app"), phase="startup")
 
         ok = await asyncio.wait_for(
             dispatcher._invoke(
@@ -827,7 +830,7 @@ class TestLifecycleHookTimeout:
 
         dispatcher = LifecycleDispatcher()
         monkeypatch.setattr(dispatcher, "_resolve_hook", lambda *_a, **_k: shutdown_hook)
-        ctx = dispatcher._build_context(self._app_info("shutdown-app"))
+        ctx = dispatcher._build_context(self._app_info("shutdown-app"), phase="shutdown")
         invocation = asyncio.create_task(
             dispatcher._invoke(
                 "shutdown-app", "backend.hooks:on_shutdown", ctx, phase="shutdown"
@@ -953,7 +956,7 @@ class TestLifecycleHookTimeout:
 
         dispatcher = LifecycleDispatcher()
         monkeypatch.setattr(dispatcher, "_resolve_hook", lambda *_a, **_k: sync_hook)
-        ctx = dispatcher._build_context(self._app_info("sync-app"))
+        ctx = dispatcher._build_context(self._app_info("sync-app"), phase="startup")
 
         ok = await dispatcher._invoke("sync-app", "backend.hooks:on_startup", ctx, phase="startup")
 
@@ -975,7 +978,7 @@ class TestLifecycleHookTimeout:
 
         dispatcher = LifecycleDispatcher()
         monkeypatch.setattr(dispatcher, "_resolve_hook", lambda *_a, **_k: quick_hook)
-        ctx = dispatcher._build_context(self._app_info("quick-app"))
+        ctx = dispatcher._build_context(self._app_info("quick-app"), phase="startup")
 
         ok = await dispatcher._invoke(
             "quick-app", "backend.hooks:on_startup", ctx, phase="startup"
@@ -1047,7 +1050,7 @@ class TestLifecycleHookTimeout:
 
         dispatcher = LifecycleDispatcher()
         monkeypatch.setattr(dispatcher, "_resolve_hook", lambda *_a, **_k: hangs)
-        ctx = dispatcher._build_context(self._app_info("sel-app"))
+        ctx = dispatcher._build_context(self._app_info("sel-app"), phase="startup")
 
         await dispatcher._invoke("sel-app", "backend.hooks:on_startup", ctx, phase="startup")
 
@@ -1314,7 +1317,7 @@ class TestGatewayShutdownBackendSweep:
 
 
 # ---------------------------------------------------------------------------
-# Shutdown resolves the LOADED code, not disk (issue #7880 reconciler teardown)
+# Shutdown resolves the LOADED code, not disk (reconciler teardown)
 # ---------------------------------------------------------------------------
 
 

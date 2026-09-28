@@ -36,6 +36,24 @@ export interface HostTab {
   /** Live tunnel state driving the per-tab dot: connected|connecting|error|disconnected. */
   state?: string
   unread: number
+  /** How many crews this one is reached THROUGH (0 = directly). The parent works
+   *  the tree out from its own registry, which a pane cannot see, so the shape is
+   *  relayed rather than re-derived. Absent from an older parent's model, which the
+   *  bar renders as the flat list it always was. */
+  depth?: number
+  /** False when an ancestor's hop is down, so this crew greys out with it. */
+  reachable?: boolean
+  /** `parent \u203a child` for the flat chip surfaces; absent at depth 0. */
+  pathName?: string
+  /** The path's PARENT segment alone, so a chip can squeeze that half and keep the
+   *  crew's own name whole. Absent at depth 0, and absent from an older parent's
+   *  model, which falls back to the joined string. */
+  pathParent?: string
+  /** The nearest ANCESTOR that is actually down, so an unreachable row states the
+   *  real cause instead of its immediate hop -- at depth 2 that hop is typically
+   *  connected and merely unreachable itself, so naming it would be false. Absent
+   *  when the chain is healthy, and absent from an older parent's model. */
+  brokenAt?: string
 }
 
 /** The embedded pane's OWN tunnel status, used by its readout capsule (item 1). */
@@ -55,6 +73,10 @@ export interface HostModel {
   /** True when the parent is a macOS Electron window not in fullscreen, so the
    *  embedded header must inset its content clear of the native traffic lights. */
   macInset: boolean
+  /** True when the parent is a Windows Electron frameless window, so the
+   *  embedded header must inset its RIGHT side clear of the native caption
+   *  buttons (the transparent titleBarOverlay's min/max/close cluster). */
+  winInset: boolean
   /** The parent window's focus mode, relayed so the pane hides its own chrome to
    *  match instead of landing fully-framed inside a focused window. `null` means
    *  the host SENT NO OPINION — an older host whose model predates the field —

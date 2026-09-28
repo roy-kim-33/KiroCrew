@@ -186,6 +186,16 @@ def _request(
 _BAD_JSON = object()
 
 
+def _owner_request(method: str = "POST") -> web.Request:
+    """A mocked request carrying the dashboard owner's claims, for owner-gated routes."""
+    app = web.Application()
+    app["state"] = mock.MagicMock(owner_id="owner-subject")
+    request = make_mocked_request(method, "/api/apps/auto-improvement/deps/install", app=app)
+    request["app"] = ""
+    request["user"] = "owner-subject"
+    return request
+
+
 def _json_of(response: web.StreamResponse) -> dict[str, Any]:
     assert isinstance(response, web.Response)
     assert isinstance(response.body, (bytes, bytearray))
@@ -1603,7 +1613,7 @@ class TestReadOnlySurface:
 
     async def test_a_successful_install_is_a_200(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(deps, "install_deps", lambda: {"ok": True, "installed": ["ruff"]})
-        response = await routes._handle_deps_install(_request("POST"))
+        response = await routes._handle_deps_install(_owner_request())
         assert response.status == 200
         assert _json_of(response)["installed"] == ["ruff"]
 
@@ -1612,7 +1622,7 @@ class TestReadOnlySurface:
     ) -> None:
         monkeypatch.setattr(deps, "install_deps", lambda: {"ok": False, "error": "pip SECRET"})
         monkeypatch.setattr(routes, "redact", lambda text: text.replace("SECRET", "***"))
-        response = await routes._handle_deps_install(_request("POST"))
+        response = await routes._handle_deps_install(_owner_request())
         assert response.status == 500
         payload = _json_of(response)
         assert payload["code"] == "operation_failed"
@@ -1682,7 +1692,7 @@ class TestRunEngine:
     ) -> None:
         """A crashed isolation probe is a sandbox failure, not a state conflict:
         a UI branching on `code` must not render the push-isolation guidance
-        for it (#8151). It subclasses RuntimeError, so without the dedicated
+        for it. It subclasses RuntimeError, so without the dedicated
         clause it would fall into `session_conflict`."""
         supervisor.start_raises = clone_setup.IsolationProbeError(
             "ModuleNotFoundError: No module named 'platform'"

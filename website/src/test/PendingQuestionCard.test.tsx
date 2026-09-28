@@ -68,10 +68,10 @@ const withCard = (askId?: string) =>
           slot: 'chat-1',
           ...(askId
             ? { ask_id: askId }
-            // A stateless card carries BOTH identities: the server's record id
-            // (what the dismiss route retires) and this delivery's own id (what
-            // the store's identity-guarded retire compares against).
-            : { serverCardId: 'card-1', cardId: 'delivery-1' }),
+            // A stateless card carries the server's record id: what the dismiss
+            // route retires, and what the store's identity-guarded clear
+            // compares against.
+            : { serverCardId: 'card-1' }),
           questions: QUESTIONS,
         },
       },
@@ -221,6 +221,8 @@ describe('PendingQuestionCard — round 6 findings', () => {
     // …and the control is usable again for a retry.
     const dismiss = screen.getByLabelText('Dismiss question without answering') as HTMLButtonElement
     await waitFor(() => expect(dismiss.disabled).toBe(false))
+    // …and the card SAYS why it is still here, or the retry never happens.
+    expect(screen.getByTestId('pending-question-error')).toHaveAttribute('role', 'alert')
   })
 
   it('drops a legacy card when the server says there is no such record (404)', async () => {
@@ -247,13 +249,12 @@ describe('PendingQuestionCard — round 6 findings', () => {
     renderCard(store)
 
     fireEvent.click(screen.getByLabelText('Dismiss question without answering'))
-    // Card B arrives before A's dismissal lands: a live broadcast, so `fresh`.
+    // Card B arrives before A's dismissal lands: a new server identity.
     act(() => {
       store.dispatch(setQuestionCard({
         slot: 'chat-1',
         card_id: 'card-2',
         questions: [{ question: 'Which region?', options: [{ label: 'us-east-1' }] }],
-        fresh: true,
       }) as never)
     })
     release({ ok: true })
@@ -407,8 +408,9 @@ describe('PendingQuestionCard — ask_id round-trip', () => {
     submit()
 
     // The agent is still blocked, so the card must survive and no second turn
-    // may start.
-    await waitFor(() => expect(onFallbackSend).not.toHaveBeenCalled())
+    // may start — and the failure is named in place so the user knows to retry.
+    expect(await screen.findByTestId('pending-question-error')).toHaveAttribute('role', 'alert')
+    expect(onFallbackSend).not.toHaveBeenCalled()
     expect(pendingOf(store)).toBeDefined()
   })
 
@@ -474,6 +476,8 @@ describe('QuestionCard — every question must be answered', () => {
     pick('Carve-out')
     expect(button.disabled).toBe(true)
 
+    // Answering Q1 folds it and opens Q2, so its options are in the DOM without
+    // the user having to go looking for them.
     pick('staging')
     expect(button.disabled).toBe(false)
   })

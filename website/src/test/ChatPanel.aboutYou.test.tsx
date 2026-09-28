@@ -1,3 +1,4 @@
+import { MemoryRouter } from 'react-router-dom'
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 // Radix Select renders a portalled listbox that jsdom cannot open; the repo's
 // test double (used by SettingsSelect.test.tsx) makes the role picker driveable.
@@ -32,10 +33,25 @@ vi.mock('../api/client', () => ({
     updateSttConfig: () => Promise.resolve({}),
     tipsStatus: () => Promise.resolve({ enabled_config: true, opted_out: false }),
     tipsFeedback: () => Promise.resolve({ ok: true }),
+    // The panel reads the feature-video cache on mount. Downloads OFF here, so
+    // the readout renders its policy line and no button -- these files measure
+    // other settings, and a live control would put a stray button in their reach.
+    featureVideoStatus: () => Promise.resolve({
+      enabled: true, download_enabled: false, release: 'r1',
+      cached: 0, total: 0, downloading: null,
+    }),
+    featureVideoFetchAll: () => Promise.resolve({ ok: true }),
   },
 }))
 
 import { ChatPanel } from '../pages/settings/ChatPanel'
+
+import { Provider } from 'react-redux'
+
+// ChatPanel reads the active slot from redux to name the session on its
+// feature-video calls, so these renders need a store. A FRESH one per file,
+// not the app singleton: a shared store would carry `activeSlot` across suites.
+import { createTestStore } from './helpers'
 
 const BASE_CFG = {
   agent: { completion_keep: 'head', completion_keep_chars: 3000, model: 'auto', reasoning_effort: '' },
@@ -45,9 +61,9 @@ function seed(dashboard: Record<string, string>) {
   kirocrewConfigMock.mockImplementation(() => Promise.resolve({ ...BASE_CFG, dashboard }))
 }
 
-function wrap(ui: React.ReactElement) {
+function wrap(ui: React.ReactElement, sub = 'aboutyou') {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-  return render(<QueryClientProvider client={qc}>{ui}</QueryClientProvider>)
+  return render(<MemoryRouter initialEntries={[`/settings?tab=chat&sub=${sub}`]}><Provider store={createTestStore()}><QueryClientProvider client={qc}>{ui}</QueryClientProvider></Provider></MemoryRouter>)
 }
 
 describe('ChatPanel → About You custom role', () => {

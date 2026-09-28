@@ -1,8 +1,7 @@
-# KiroCrew Desktop (Electron)
+# Kiro Crew Desktop (Electron)
 
-Desktop shell for the Kiro Crew web dashboard on macOS, Linux, and Windows
-(Windows is in preview — see the build note below). It automatically starts
-`kirocrew gateway` and connects to `localhost:5476`.
+Desktop shell for the Kiro Crew web dashboard on macOS, Linux, and Windows. It
+automatically starts `kirocrew gateway` and connects to `localhost:5476`.
 
 ## Quick Start
 
@@ -38,6 +37,39 @@ through the read-only `kiro-cli whoami` probe. Candidate selection is
 fail-closed: a broken higher-priority Kiro CLI is shown as needing repair and is
 not skipped in favor of a later candidate. Remote tunnel sessions check the
 remote gateway host.
+
+## Main-process owners
+
+`main.js` is the composition root. Between them, `main.js` and `ipc-registrar.js`
+require four lifecycle facades (the updater is composed from `ipc-registrar.js`),
+and each facade composes cohesive owners under `runtime/<area>/`:
+
+| Facade (what `main.js` and `ipc-registrar.js` require) | Runtime owners it composes | What stays in the facade |
+|---|---|---|
+| `gateway-supervisor.js` (`createGatewaySupervisor`) | `runtime/gateway/launch-preflight.js` (backend binary, bundle completeness, project dir, sandbox-profile advice, launchd `PATH`, relaunch target) · `port-holders.js` (lsof/ps/netstat probes, trusted Windows gateway commands, incumbent snapshot and exit wait, force-stop) · `family-takeover.js` (quitting the other release family's app) · `token-sources.js` (the local-secret mint and the SSH token fetch) · `remote-crew-prompt.js` (the Add / Edit Remote Crew form) | All gateway state (child, ownership, start failure, liveness monitor, update handoff), the spawn site and its environment, every port occupancy and identity decision, the connect flow, the failure dialog, liveness recovery and shutdown |
+| `window-lifecycle.js` (`createWindowLifecycle`) | `runtime/window/chrome.js` (traffic lights, title-bar overlay, native theme, zoom, focus-mode chrome) · `prompts.js` (New Connection Window port prompt, Rename Window) · `session-security.js` (session permission policy, microphone and screen-recording recovery dialogs) · `linux-captions.js` (frameless Linux caption controls) · `browser-panels.js` (per-window native browser panels and their agent command channel) | Window creation and state restore, the drag band, fullscreen handling, close-to-tray and every show path, the tray, the remote-host prompt, the menu, window-control admission, and the browser IPC routing |
+| `auto-update.js` (`initAutoUpdate` and 15 policy exports) | `runtime/update/state-reporter.js` (channel, lane pair, lifecycle pushes, replayable info) · `feed-lane.js` (electron-updater discovery, download, staged install) · `managed-lane.js` (the marker-driven check and apply commands) | Channel and feed policy (`KNOWN_CHANNELS`, `channelHasLane`, `channelForVersion`, `buildFeedBase`, `manualDownloadUrl`), the update-policy flags, the `EXTERNALLY-MANAGED` marker reader and its caps, the narrowed marker-command `PATH`, the install-shape probes, and the gates that choose a lane |
+| `crash-collector.js` (`armCrashCollector`, `collectCrashReports`, `crashNoticeSummary`) | `runtime/crash/ownership.js` · `artifact-parsers.js` · `candidates.js` · `persistence.js` · `scan.js` | The export surface and `crashNoticeSummary`, the one renderer-facing view |
+
+Three rules keep this layout safe to change:
+
+- Consumers require only the facades. Their export names, factory options,
+  returned object shapes and module-scope constants are the contract. Many tests
+  also read source text, so a pinned construct moves only together with its pin,
+  and the pin reads the file that defines it: the facade for most, a runtime
+  owner for a few (the managed lane's pinned shell, the browser panels' view
+  wiring).
+- A runtime owner never requires Electron, the facade, or `fs`/`os`/`path`/
+  `http`/`child_process` where its facade injects them, and never resolves a
+  path from its own `__dirname`: the Electron directory (`loading.html`, the
+  preload, icons, the baked marker) is always the facade's.
+- Every file is listed individually in `package.json` `build.files` and
+  required with a double-quoted, extensionless, file-explicit path
+  (`require("./runtime/gateway/port-holders")`, `require("../../gateway-stop")`).
+  `test/shell-contract.test.js` fails on a required file missing from the
+  allowlist, and `test/packaging.test.js` on a single-quoted or template-literal
+  relative require, which the scans cannot read, or on an owner no facade
+  composes.
 
 ## Install as macOS App
 
@@ -101,14 +133,21 @@ Notes:
   and copies only the small root remainder; per-machine installs keep the
   upstream copy path so files inherit the Program Files ACL. Cross-volume or
   occupied destinations also retain the upstream copy-and-retry fallback. The
-  Windows backend ships checked-hash
+  Windows backend ships hash-based (unchecked)
   bytecode for the measured gateway import closure, so first launch consumes
   build-time caches rather than generating thousands of files under Defender.
+  Unchecked rather than checked so the loader does not also re-read and re-hash
+  every `.py` it imports, which cost a median 12.5 s per cold boot; macOS's
+  whole-tree caches stay checked-hash.
 - The native welcome/finish sidebar and the header used on intermediate pages
   carry the Kiro Crew logo and ghost artwork. The standard NSIS controls and
   localized instructions remain native. Page boundaries use a short Win32
   alpha-blended cross-fade that follows the system client-area animation setting;
   extraction itself stays on the native progress page without timer-driven art.
+- A fresh install's native Finish page discloses that the default Kiro agent
+  needs a separately installed and authenticated Kiro CLI, names `kiro-cli
+  login`, and links to <https://kiro.dev/cli/>. It never runs either step.
+  Auto-updates skip the Finish page and keep their existing automatic relaunch.
 
 See `../../docs/guides/windows-install.md` for the CI-built installer and the
 current Windows support status.
@@ -124,9 +163,8 @@ APP_DIR=$([ "$(uname -m)" = "arm64" ] && echo "dist/mac-arm64" || echo "dist/mac
 sudo rm -rf /Applications/KiroCrew.app
 sudo cp -R "$APP_DIR/KiroCrew.app" /Applications/KiroCrew.app
 
-# Restart the gateway (if using Launch Agent)
-launchctl stop dev.kirocrew.gateway
-launchctl start dev.kirocrew.gateway
+# Restart the gateway (service-aware)
+kirocrew restart
 ```
 
 ## Uninstall
@@ -135,9 +173,8 @@ launchctl start dev.kirocrew.gateway
 # Remove the desktop app
 sudo rm -rf /Applications/KiroCrew.app
 
-# Remove the Launch Agent (if configured from main README)
-launchctl unload ~/Library/LaunchAgents/dev.kirocrew.gateway.plist 2>/dev/null
-rm -f ~/Library/LaunchAgents/dev.kirocrew.gateway.plist
+# Stop and remove the managed gateway service, if installed
+kirocrew service uninstall
 ```
 
 ## Remote Tunnel Mode (Headless CDE)
@@ -186,8 +223,9 @@ each launch to get a fresh JWT — no manual paste required.
 ### Token flow (per tab)
 
 ```
-1. Try local ~/.kiro/crew/.local_secret → /api/token/local on the tab's port
-   (with a temporary ~/.kirocrew read fallback during one-time migration)
+1. Read `$KIROCREW_HOME/.local_secret` when a valid override is set; otherwise read
+   `~/.kiro/crew/.local_secret`, then call `/api/token/local` on the tab's port.
+   Only the authoritative home is read; there is no legacy-directory fallback.
 2. If remote host configured for this port:
    SSH: export PATH=<remotePath> KIROCREW_PORT=<port>; <bin> token
 3. Fallback: show manual token prompt
@@ -210,8 +248,9 @@ automatically. Names are stored in `remoteHosts[port].defaultName`.
 
 ### Config file
 
-Settings are persisted via `electron-store` in
-`~/Library/Application Support/KiroCrew/config.json`:
+Settings are persisted via `electron-store`. On macOS the file is
+`~/Library/Application Support/KiroCrew/config.json`; on Linux and Windows, use
+**Open Config File** to reveal the platform-specific application-data path:
 
 ```json
 {
@@ -238,7 +277,7 @@ Open via **Tab menu → Open Config File** or tray menu.
 | "kirocrew binary not found in any of …" | Install Kiro Crew through a [supported install path](../../docs/guides/install.md#install-paths), or set a custom path |
 | "command not found: kiro-cli" | Set Remote PATH to include `~/.toolbox/bin` (default does this) |
 | "command not found: dirname" | Remote PATH missing `/usr/bin` — reset to default or add it |
-| Token fetched but 403 | Gateway may need restart — `ssh host systemctl --user restart kirocrew` |
+| Token fetched but 403 | Restart the remote gateway — `ssh host kirocrew restart` |
 | Wrong tab refreshed | Focus the target tab first (use Tab menu, not tray) |
 
 ## Notes
@@ -248,6 +287,16 @@ Open via **Tab menu → Open Config File** or tray menu.
   gateway and authentication origin, but does not copy the current session,
   project, draft, or context.
 - Closing the window hides to tray — right-click the tray icon or Cmd+Q to quit
+- **GPU rendering.** Hardware acceleration is on by default.
+  `KIROCREW_DISABLE_GPU=1` or `--disable-gpu` turns it off for a launch
+  (`disable-gpu.js`). On Windows, if the GPU process dies before the dashboard
+  has loaded, the app relaunches itself once with software rendering
+  (`--in-process-gpu --use-angle=swiftshader`, never `--no-sandbox`) and keeps
+  that setting for the current app version under `gpuSoftwareFallback` in
+  `config.json`; a new version tries hardware rendering again once
+  (`gpu-crash-fallback.js`). The software-mode boot drops the opt-in's
+  `--disable-software-rasterizer` so `KIROCREW_DISABLE_GPU=1` cannot veto
+  SwiftShader. Remove the key to retry hardware rendering sooner.
 - External links open in your default browser
 - Desktop leaves the child `PATH` unchanged; the gateway-side prerequisite
   service independently probes Kiro CLI's supported user-local, Homebrew,

@@ -430,9 +430,7 @@ def _reload_live_hooks(request: web.Request, denied_state: dict) -> None:
     replaced from *denied_state* (the keystone file's new content). Best-effort:
     a missing context builder (e.g. in a unit test harness) is a no-op.
     """
-    import dataclasses
-
-    from kiro_crew.hooks import HooksConfig
+    from kiro_crew.hooks import HooksConfig, splice_denied_commands
 
     try:
         state = request.app["state"]
@@ -440,22 +438,13 @@ def _reload_live_hooks(request: web.Request, denied_state: dict) -> None:
         manager = getattr(builder, "hooks", None)
         if manager is None:
             return
-        # Reparse ONLY the opt-out fields from the keystone state and splice them
-        # onto the live config so the flat hook keys (auto_replies, transforms,
-        # auto_approve_tools, …) are not lost.
-        parsed = HooksConfig.from_dict({"denied_commands": denied_state})
+        # Splice ONLY the opt-out fields from the keystone state onto the live config
+        # so the flat hook keys (auto_replies, transforms, auto_approve_tools, …) are
+        # not lost. Same helper the config.json hooks reload uses from the other
+        # side, so neither write reverts the other's half.
         current = getattr(manager, "_config", None)
-        if isinstance(current, HooksConfig):
-            manager.reload(
-                dataclasses.replace(
-                    current,
-                    denied_commands_disabled_ids=parsed.denied_commands_disabled_ids,
-                    denied_commands_disable_all=parsed.denied_commands_disable_all,
-                    denied_commands_user_added=parsed.denied_commands_user_added,
-                )
-            )
-        else:
-            manager.reload(parsed)
+        base = current if isinstance(current, HooksConfig) else HooksConfig()
+        manager.reload(splice_denied_commands(base, denied_state))
     except Exception:
         logger.warning(
             "failed to hot-reload HookManager after denied-commands change", exc_info=True
@@ -503,6 +492,16 @@ async def api_denied_command_builtin_toggle(request: web.Request) -> web.Respons
     )
 
     op = "security.denied_commands.builtin_toggle"
+
+    # Body-scope import, like the sibling gates in this package
+    # (``connections.py``, ``mcp_apps.py``, ``files.py``): ``source_providers``
+    # reaches back into sibling handler modules, so importing the helper at
+    # module scope from here would close a cycle.
+    from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+
+    denied = await require_owner_dashboard_request(request, op)
+    if denied is not None:
+        return denied
     rule_id = request.match_info["id"]
     try:
         body = await request.json()
@@ -571,6 +570,16 @@ async def api_denied_command_builtin_toggle(request: web.Request) -> web.Respons
 async def api_denied_commands_disable_all(request: web.Request) -> web.Response:
     """PATCH /api/security/denied-commands/disable-all — {value: bool}."""
     op = "security.denied_commands.disable_all"
+
+    # Body-scope import, like the sibling gates in this package
+    # (``connections.py``, ``mcp_apps.py``, ``files.py``): ``source_providers``
+    # reaches back into sibling handler modules, so importing the helper at
+    # module scope from here would close a cycle.
+    from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+
+    denied = await require_owner_dashboard_request(request, op)
+    if denied is not None:
+        return denied
     try:
         body = await request.json()
     except Exception:
@@ -600,6 +609,16 @@ async def api_denied_commands_disable_all(request: web.Request) -> web.Response:
 async def api_denied_command_user_add(request: web.Request) -> web.Response:
     """POST /api/security/denied-commands/user — {pattern: str, note?: str}."""
     op = "security.denied_commands.user_add"
+
+    # Body-scope import, like the sibling gates in this package
+    # (``connections.py``, ``mcp_apps.py``, ``files.py``): ``source_providers``
+    # reaches back into sibling handler modules, so importing the helper at
+    # module scope from here would close a cycle.
+    from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+
+    denied = await require_owner_dashboard_request(request, op)
+    if denied is not None:
+        return denied
     try:
         body = await request.json()
     except Exception:
@@ -728,6 +747,16 @@ async def api_denied_command_user_add(request: web.Request) -> web.Response:
 async def api_denied_command_user_toggle(request: web.Request) -> web.Response:
     """PATCH /api/security/denied-commands/user/{id} — {enabled: bool}."""
     op = "security.denied_commands.user_toggle"
+
+    # Body-scope import, like the sibling gates in this package
+    # (``connections.py``, ``mcp_apps.py``, ``files.py``): ``source_providers``
+    # reaches back into sibling handler modules, so importing the helper at
+    # module scope from here would close a cycle.
+    from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+
+    denied = await require_owner_dashboard_request(request, op)
+    if denied is not None:
+        return denied
     rule_id = request.match_info["id"]
     try:
         body = await request.json()
@@ -765,6 +794,16 @@ async def api_denied_command_user_toggle(request: web.Request) -> web.Response:
 async def api_denied_command_user_delete(request: web.Request) -> web.Response:
     """DELETE /api/security/denied-commands/user/{id}."""
     op = "security.denied_commands.user_delete"
+
+    # Body-scope import, like the sibling gates in this package
+    # (``connections.py``, ``mcp_apps.py``, ``files.py``): ``source_providers``
+    # reaches back into sibling handler modules, so importing the helper at
+    # module scope from here would close a cycle.
+    from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+
+    denied = await require_owner_dashboard_request(request, op)
+    if denied is not None:
+        return denied
     rule_id = request.match_info["id"]
 
     if rule_id not in await _user_rule_ids_async():
@@ -1125,6 +1164,16 @@ async def api_trusted_app_grant(request: web.Request) -> web.Response:
     not caller-supplied.
     """
     op = "security.trusted_apps.grant"
+
+    # Body-scope import, like the sibling gates in this package
+    # (``connections.py``, ``mcp_apps.py``, ``files.py``): ``source_providers``
+    # reaches back into sibling handler modules, so importing the helper at
+    # module scope from here would close a cycle.
+    from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+
+    denied = await require_owner_dashboard_request(request, op)
+    if denied is not None:
+        return denied
     name = request.match_info["name"]
 
     if not APP_NAME_RE.fullmatch(name):
@@ -1401,6 +1450,16 @@ async def api_trusted_app_revoke(request: web.Request) -> web.Response:
     including a first-party one, without holding any grant over it.
     """
     op = "security.trusted_apps.revoke"
+
+    # Body-scope import, like the sibling gates in this package
+    # (``connections.py``, ``mcp_apps.py``, ``files.py``): ``source_providers``
+    # reaches back into sibling handler modules, so importing the helper at
+    # module scope from here would close a cycle.
+    from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+
+    denied = await require_owner_dashboard_request(request, op)
+    if denied is not None:
+        return denied
     name = request.match_info["name"]
 
     # Teardown runs BEFORE the grant is dropped, and the whole thing sits under the
@@ -1564,6 +1623,16 @@ async def api_trusted_apps_allow_all(request: web.Request) -> web.Response:
     gate then reads as deny — a settings surface that lies about its own state.
     """
     op = "security.trusted_apps.allow_all"
+
+    # Body-scope import, like the sibling gates in this package
+    # (``connections.py``, ``mcp_apps.py``, ``files.py``): ``source_providers``
+    # reaches back into sibling handler modules, so importing the helper at
+    # module scope from here would close a cycle.
+    from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+
+    denied = await require_owner_dashboard_request(request, op)
+    if denied is not None:
+        return denied
     try:
         body = await request.json()
     except Exception:
@@ -1781,14 +1850,13 @@ async def _stop_apps_running_on_blanket_trust(
         # the apps whose recorded state was least trustworthy from the sweep that
         # exists to stop them.
         #
-        # Builtin exemption comes from `builtin_app_names()` ALONE. The candidate
-        # query used to also skip `origin == "builtin"`, but `origin` is a field of
-        # the app's own `installed.json` record — writable by any app trusted to run
-        # code — so a trusted app could stamp itself first-party and walk out of the
-        # sweep that exists to stop it. `builtin_app_names()` cannot be forged: it
-        # requires a SHIPPED `app.json` to declare the name, and its own contract is
-        # that `installed.json` is consulted only to REMOVE trust, never to widen
-        # it. Reading `origin` here inverted exactly that rule.
+        # Builtin exemption comes from `builtin_app_names()` ALONE, never from
+        # `origin == "builtin"`: `origin` is a field of the app's own
+        # `installed.json` record — writable by any app trusted to run code — so a
+        # trusted app could stamp itself first-party and walk out of the sweep that
+        # exists to stop it. `builtin_app_names()` cannot be forged: it requires a
+        # SHIPPED `app.json` to declare the name, and its own contract is that
+        # `installed.json` is consulted only to REMOVE trust, never to widen it.
         granted = set(build_trusted_apps_snapshot()["apps"])
         builtins = builtin_app_names()
         return [
@@ -1879,8 +1947,8 @@ def _serialize_ruleset(value: object) -> dict:
         return {
             "mode": "intersect",
             "components": [
-                _serialize_ruleset(value.ceiling),
-                _serialize_ruleset(value.profile),
+                _serialize_ruleset(value.outer),
+                _serialize_ruleset(value.inner),
             ],
         }
     return {}

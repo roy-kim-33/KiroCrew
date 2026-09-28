@@ -13,8 +13,20 @@ from typing import Any
 import pytest
 from aiohttp import web
 
+from kiro_crew import platform_compat
 from kiro_crew.apps.builtins.design_critique import register_routes
 from kiro_crew.apps.builtins.design_critique.backend import routes
+
+if platform_compat.IS_WINDOWS:
+    import _winapi
+
+    # Resolved at runtime, not as a typed attribute: typeshed guards CreateJunction
+    # behind sys.platform == "win32", so a direct reference is an attr-defined error
+    # when mypy checks this in-package test file on Linux. Same shape as
+    # platform_compat's own `getattr(os.path, "isjunction", None)`.
+    _create_junction = getattr(_winapi, "CreateJunction", None)
+else:  # pragma: no cover - junctions exist on Windows only
+    _create_junction = None
 
 
 def test_register_routes_mounts_the_three_endpoints() -> None:
@@ -272,6 +284,27 @@ def _bump(path: Path, seconds: float = 10.0) -> None:
     # a changed mtime timing-dependent.
     stamp = os.stat(path).st_mtime + seconds
     os.utime(path, (stamp, stamp))
+
+
+def _pin_capture_clock(monkeypatch, build: Path, offset_seconds: int = 1) -> None:
+    from types import SimpleNamespace
+
+    stamp_ns = 1_700_000_000_000_000_000
+    for path in [*build.rglob("*"), build]:
+        os.utime(path, ns=(stamp_ns, stamp_ns))
+    token = routes._served_signature(build)
+    assert token is not None
+    assert token.newest_mtime_ns == stamp_ns
+    # Only this module's capture clock moves; file and directory stats stay real.
+    monkeypatch.setattr(
+        routes,
+        "time",
+        SimpleNamespace(
+            time=time.time,
+            monotonic_ns=time.monotonic_ns,
+            time_ns=lambda: stamp_ns + offset_seconds * 1_000_000_000,
+        ),
+    )
 
 
 def _reset_probe_cache(monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -1185,6 +1218,64 @@ def test_served_signature_ignores_what_the_server_will_not_serve(tmp_path) -> No
     assert behind is not None and behind.digest == sig.digest
 
 
+def _make_dir_link(link: Path, target: Path) -> None:
+    # A directory SYMLINK needs SeCreateSymbolicLinkPrivilege on Windows (WinError
+    # 1314 unelevated), which is why the test above can only skip there. A junction
+    # needs no privilege and is the reparse point a real build tree would carry, so
+    # the Windows half of this contract stays exercised instead of being skipped.
+    #
+    # A junction, never "a junction OR a symlink": os.symlink SUCCEEDS on a runner
+    # with Developer Mode on, and a symlink is the shape os.path.islink already
+    # refused. Degrading to it would turn the Windows red-before green for the
+    # wrong reason.
+    if platform_compat.IS_WINDOWS:
+        assert _create_junction is not None, "_winapi.CreateJunction missing on Windows"
+        _create_junction(str(target), str(link))
+        return
+    link.symlink_to(target, target_is_directory=True)
+
+
+def test_served_signature_refuses_a_junctioned_directory(tmp_path) -> None:
+    # capture-build.mjs's Dirent test reports a junction as a symbolic link, so it
+    # walks nothing behind one and the preview server serves nothing from it. The
+    # token has to agree, and `os.path.islink` cannot make it agree: it calls a
+    # junction a plain directory, so the walk descended and signed bytes that are
+    # not served. Windows is the only platform with junctions and the only one where
+    # the symlink test above can be skipped for want of a privilege.
+    build = tmp_path / "dist"
+    _build_tree(build)
+    sig = routes._served_signature(build)
+    assert sig is not None
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "extra.js").write_text("x", encoding="utf-8")
+    _make_dir_link(build / "vendor", outside)
+
+    # Guard the guard: on Windows the link must really be the shape `os.path.islink`
+    # misreads. Without this the test could pass on a plain directory and prove
+    # nothing about the fix.
+    if platform_compat.IS_WINDOWS:
+        assert not os.path.islink(build / "vendor")
+        assert os.path.isdir(build / "vendor")
+    assert platform_compat.is_link_or_junction(build / "vendor")
+
+    # Only the DIGEST can hold still across the link's creation: that writes a new
+    # entry into dist/, and newest_mtime_ns reads directory mtimes on purpose.
+    linked = routes._served_signature(build)
+    assert linked is not None and linked.digest == sig.digest
+
+    # A change BEHIND the link moves neither field. Rewriting a file leaves its
+    # parent directory's mtime alone, so newest_mtime_ns is pinned exactly here —
+    # it feeds the discover-time mid-capture check, which an unserved tree must not
+    # be able to trip.
+    (outside / "extra.js").write_text("changed-and-longer", encoding="utf-8")
+    _bump(outside / "extra.js")
+    behind = routes._served_signature(build)
+    assert behind is not None and behind.digest == sig.digest
+    assert behind.newest_mtime_ns == linked.newest_mtime_ns
+
+
 def test_probe_build_dir_rejects_a_path_outside_the_project(tmp_path) -> None:
     # A manifest path is only ever stat()ed, but a token taken over an unrelated
     # tree would stand still and permit reuse of a stale PNG for the whole TTL.
@@ -1220,7 +1311,7 @@ def test_sweep_purges_probe_cache_entry_when_dir_swept(monkeypatch, tmp_path) ->
     probe_dir.mkdir()
     os.utime(probe_dir, (aged, aged))
     # A cache entry pointing at the soon-to-be-swept dir must be purged too, so the
-    # cache never hands /render a path for a directory that no longer exists.
+    # cache never hands /render a path for a directory that does not exist.
     routes._probe_put(
         "clone-old",
         routes._probe_claim("clone-old"),
@@ -1751,9 +1842,10 @@ async def test_render_staleness_mismatch_recaptures_all(monkeypatch, tmp_path) -
 
 
 @pytest.mark.asyncio
-async def test_discover_from_dir_retains_probe_and_caches(monkeypatch, tmp_path) -> None:  # type: ignore[no-untyped-def]
+@pytest.mark.parametrize("capture_offset", [1, 0, -1], ids=["older-build", "equal", "future-build"])
+async def test_discover_from_dir_retains_probe_and_caches(monkeypatch, tmp_path, capture_offset) -> None:  # type: ignore[no-untyped-def]
     # A probe that produced a usable screen must RETAIN its dir and cache the
-    # route->PNG map keyed by the handle.
+    # route->PNG map keyed by the handle when the build predates capture.
     monkeypatch.setattr(routes, "_node", lambda: "/usr/bin/node")
     monkeypatch.setattr(routes, "_uploads_dir", lambda: tmp_path)
     _reset_probe_cache(monkeypatch)
@@ -1761,6 +1853,7 @@ async def test_discover_from_dir_retains_probe_and_caches(monkeypatch, tmp_path)
     build = proj / "dist"
     build.mkdir(parents=True)
     (build / "index.html").write_text("<html></html>", encoding="utf-8")
+    _pin_capture_clock(monkeypatch, build, capture_offset)
 
     async def fake_run(cmd, timeout, env=None):  # type: ignore[no-untyped-def]
         if any("discover-routes" in c for c in cmd):
@@ -1785,6 +1878,10 @@ async def test_discover_from_dir_retains_probe_and_caches(monkeypatch, tmp_path)
     out = await routes._discover_from_dir(proj, handle="clone-keep")
     assert out["handle"] == "clone-keep"
     rec = routes._probe_get("clone-keep")
+    if capture_offset <= 0:
+        assert rec is None
+        assert not any(p.name.startswith("dc-probe-") for p in tmp_path.iterdir())
+        return
     assert rec is not None
     assert "/" in rec["routes"]
     # The token is recorded over the build output, so /render compares the bytes the
@@ -1989,6 +2086,7 @@ async def test_discover_does_not_cache_when_a_file_is_deleted_mid_capture(monkey
     (build / "assets").mkdir(parents=True)
     (build / "index.html").write_text("<html></html>", encoding="utf-8")
     (build / "assets" / "legacy.js").write_text("old", encoding="utf-8")
+    _pin_capture_clock(monkeypatch, build)
 
     async def fake_run(cmd, timeout, env=None):  # type: ignore[no-untyped-def]
         if any("discover-routes" in c for c in cmd):
@@ -2004,7 +2102,13 @@ async def test_discover_does_not_cache_when_a_file_is_deleted_mid_capture(monkey
             json.dumps(
                 {
                     "buildDir": str(build),
-                    "screens": [{"route": "/", "path": os.path.join(out_dir, "home.png")}],
+                    "screens": [
+                        {
+                            "route": "/",
+                            "path": os.path.join(out_dir, "home.png"),
+                            "fullPageCoverage": True,
+                        }
+                    ],
                 }
             ),
             "",
@@ -2030,6 +2134,7 @@ async def test_discover_does_not_cache_when_a_build_lands_mid_capture(monkeypatc
     build = proj / "dist"
     build.mkdir(parents=True)
     (build / "index.html").write_text("<html>v1</html>", encoding="utf-8")
+    _pin_capture_clock(monkeypatch, build)
 
     async def fake_run(cmd, timeout, env=None):  # type: ignore[no-untyped-def]
         if any("discover-routes" in c for c in cmd):
@@ -2045,7 +2150,13 @@ async def test_discover_does_not_cache_when_a_build_lands_mid_capture(monkeypatc
             json.dumps(
                 {
                     "buildDir": str(build),
-                    "screens": [{"route": "/", "path": os.path.join(out_dir, "home.png")}],
+                    "screens": [
+                        {
+                            "route": "/",
+                            "path": os.path.join(out_dir, "home.png"),
+                            "fullPageCoverage": True,
+                        }
+                    ],
                 }
             ),
             "",
@@ -2061,7 +2172,8 @@ async def test_discover_does_not_cache_when_a_build_lands_mid_capture(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_discover_does_not_cache_a_gated_screen(monkeypatch, tmp_path) -> None:  # type: ignore[no-untyped-def]
+@pytest.mark.parametrize("capture_offset", [1, 0, -1], ids=["older-build", "equal", "future-build"])
+async def test_discover_does_not_cache_a_gated_screen(monkeypatch, tmp_path, capture_offset) -> None:  # type: ignore[no-untyped-def]
     # A screen captured under a login / consent overlay must NOT be cached for reuse.
     # /render raises its gate warning from the capture it runs, and a fully-covered
     # render runs no capture — so reusing a gate screenshot would show the critic the
@@ -2075,6 +2187,7 @@ async def test_discover_does_not_cache_a_gated_screen(monkeypatch, tmp_path) -> 
     build = proj / "dist"
     build.mkdir(parents=True)
     (build / "index.html").write_text("<html></html>", encoding="utf-8")
+    _pin_capture_clock(monkeypatch, build, capture_offset)
 
     async def fake_run(cmd, timeout, env=None):  # type: ignore[no-untyped-def]
         if any("discover-routes" in c for c in cmd):
@@ -2113,6 +2226,10 @@ async def test_discover_does_not_cache_a_gated_screen(monkeypatch, tmp_path) -> 
     # Discovery still reports BOTH routes as seeable — the gated one did render.
     assert {s["ref"]: s["canSee"] for s in out["screens"]} == {"/": True, "/app": True}
     rec = routes._probe_get("clone-gated")
+    if capture_offset <= 0:
+        assert rec is None
+        assert not any(p.name.startswith("dc-probe-") for p in tmp_path.iterdir())
+        return
     assert rec is not None
     # ...but only the clean route is offered for reuse.
     assert list(rec["routes"]) == ["/"]
@@ -2120,7 +2237,8 @@ async def test_discover_does_not_cache_a_gated_screen(monkeypatch, tmp_path) -> 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("flag", [False, None])
-async def test_discover_does_not_cache_a_screen_taller_than_the_viewport(monkeypatch, tmp_path, flag) -> None:  # type: ignore[no-untyped-def]
+@pytest.mark.parametrize("capture_offset", [1, 0, -1], ids=["older-build", "equal", "future-build"])
+async def test_discover_does_not_cache_a_screen_taller_than_the_viewport(monkeypatch, tmp_path, flag, capture_offset) -> None:  # type: ignore[no-untyped-def]
     # The probe captures WITHOUT --full and /render captures WITH it, so a probe PNG of
     # a page taller than the viewport holds strictly less than the render it would
     # replace. Reuse is therefore confined to screens capture-build.mjs certified as
@@ -2134,6 +2252,7 @@ async def test_discover_does_not_cache_a_screen_taller_than_the_viewport(monkeyp
     build = proj / "dist"
     build.mkdir(parents=True)
     (build / "index.html").write_text("<html></html>", encoding="utf-8")
+    _pin_capture_clock(monkeypatch, build, capture_offset)
 
     async def fake_run(cmd, timeout, env=None):  # type: ignore[no-untyped-def]
         if any("discover-routes" in c for c in cmd):
@@ -2173,6 +2292,10 @@ async def test_discover_does_not_cache_a_screen_taller_than_the_viewport(monkeyp
     # reusability is withheld.
     assert {s["ref"]: s["canSee"] for s in out["screens"]} == {"/": True, "/tall": True}
     rec = routes._probe_get("clone-tall")
+    if capture_offset <= 0:
+        assert rec is None
+        assert not any(p.name.startswith("dc-probe-") for p in tmp_path.iterdir())
+        return
     assert rec is not None
     assert list(rec["routes"]) == ["/"]
 

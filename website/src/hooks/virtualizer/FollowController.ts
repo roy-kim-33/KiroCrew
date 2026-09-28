@@ -46,6 +46,14 @@ export const DEFAULT_BOTTOM_THRESHOLD = 100
  */
 export const SELF_SCROLL_EPSILON = 2
 
+// After a genuine user scroll, suppress ResizeObserver-driven auto-pins for
+// this long. Streaming/widget growth that should "follow" happens while the
+// user is stationary at the bottom; a re-measuring widget that fires mid-fling
+// must NOT yank the user (which also unmounts the rows they were scrolling
+// through, leaving a blank flash). Explicit pins (slot entry, scrollToBottom,
+// append) bypass this — only the RO follow path is gated.
+export const SCROLL_SETTLE_MS = 150
+
 /**
  * "At the bottom" tolerance (px) for deciding whether an auto-pin still has
  * work to do. A flat 0.5 is UNDER one device pixel at fractional device-pixel
@@ -90,6 +98,27 @@ export function computeAtBottom(geom: ScrollGeom, threshold: number): boolean {
 }
 
 /**
+ * Is the scroller laid out at ZERO height -- a backgrounded mobile tab, a
+ * `display:none` pane, a not-yet-sized column?
+ *
+ * No reader can be moving in a box with no height, yet the geometry of one
+ * reads like a reader who is: `distanceFromBottom` is the whole transcript and
+ * `bottomTarget` is `scrollHeight` itself. Fed to evaluateAutoPin that either
+ * releases follow for a reader who is not on screen or writes a scrollTop the
+ * browser clamps the moment the box comes back -- and the clamp then reads as
+ * a user scroll. ONE predicate, asked by BOTH automatic-pin sites (the
+ * post-paint pinAuto and the pre-paint height-sync re-pin): a private copy at
+ * one site is how the idle rule came to cover one half and not the other.
+ *
+ * Deliberately geometry-only. `document.hidden` is NOT part of it: a desktop
+ * tab keeps its full layout while hidden, and its follower is pinned there
+ * exactly as before.
+ */
+export function scrollerCollapsed(el: { clientHeight: number }): boolean {
+  return el.clientHeight === 0
+}
+
+/**
  * Recognise a `scroll` event caused by our own programmatic write rather than
  * by the user. `lastWriteTop < 0` means "we have not written this session", so
  * any scroll is treated as the user's.
@@ -103,25 +132,6 @@ export function isSelfScroll(
 }
 
 /**
- * Is a height-sync anchor captured at `capturedScrollTop` still usable now that
- * the scroller reads `liveScrollTop`?
- *
- * A viewport-relative capture consumed after the viewport MOVED corrects the
- * reader's own scrolling rather than the repricing it was taken for (measured
- * as a 2706px teleport on the phone rig during a cold-cache walk). scrollTop is
- * the exact discriminator: a reprice ABOVE the viewport changes where rows sit,
- * never scrollTop. So unchanged ⇒ the whole delta belongs to the reprice and is
- * safe to correct HOWEVER LATE it lands; changed ⇒ something else moved the
- * viewport (a finger, iOS momentum — which keeps moving with no further hard
- * input, so an input-timestamp gate misses it — or Chromium's native anchoring,
- * which already absorbed the shift, making the correction a no-op anyway).
- *
- * Wall-clock age was the first approximation and failed on the wrong side at
- * the worst moment: a turn ending is the busiest the main thread gets, so the
- * consumer runs late, a STILL reader's anchor was dropped, and they paid the
- * entire reprice as one displacement.
- */
-/**
  * How far a reader must be moved to stay put when a row ABOVE them is repriced.
  *
  * The height INDEX learns a mounted row's real height only when the debounced
@@ -132,11 +142,20 @@ export function isSelfScroll(
  * observer already knows the row and both heights, so the correction belongs in
  * that same fire.
  *
- * Only a row that lay ENTIRELY above the fold BEFORE the change counts, and
- * `prevHeight` is what decides that: a row straddling the top edge grows
- * downward from its own top, so what the reader sees is the row they are looking
- * at expanding — usually because they opened it — and holding their scroll
- * position there would fight the expansion instead of hiding it.
+ * A row that lies entirely above the fold always counts. A row that STRADDLES
+ * the top edge counts too when it is being REPRICED (an estimate replaced by a
+ * measurement, a disclosure opened): every pixel of that change lands above the
+ * fold and shoves the reader by it. It does NOT count when the change is
+ * APPENDED at the row's bottom -- the streaming row growing by a token. Those
+ * pixels arrive BELOW the reader's eye line, nothing they can see moves, and
+ * the row's top edge above the fold stays exactly where it was. Compensating
+ * that walks the reader down the message by one token's height per tick,
+ * arriving on screen as the text they are reading sliding UP and out from
+ * under them -- reported as "can't read the middle of a long reply while it
+ * streams" (kirodotdev/KiroCrew#10810). The scroll inspector showed the
+ * signature directly: `WRITE abovefold` firing +27/+54px per tick with
+ * `Δtop == Δh`, while the same reader parked at the message's HEAD (row top
+ * inside the fold) held perfectly.
  *
  * The sign is kept: a SHRINK above the fold pulls content up by the same rule.
  */
@@ -147,19 +166,32 @@ export function repriceAboveFoldDelta(input: {
   newHeight: number
   /** Viewport-relative top of the scroll container. */
   foldTop: number
+  /**
+   * True when the row's height change is appended at its BOTTOM (the
+   * actively-streaming row, or the row still in its post-stream settle grace).
+   * A straddling row growing this way moves nothing the reader can see.
+   */
+  appendsAtBottom?: boolean
 }): number {
-  // The test is on the row's TOP, not its whole box. A reprice does not move a
-  // row's top -- it moves its BOTTOM, and with it everything below, so a row
-  // that STRADDLES the top edge displaces the reader by the full change just
-  // like one entirely above it. Measured on the device and reproduced in
-  // Chromium with `overflow-anchor: none`: four of the five drift steps in a
-  // twelve-step walk were straddling rows shrinking 12-24px each, and excluding
-  // them is what left the reader displaced.
-  //
-  // A row whose top is at or below the fold is still excluded: it grows and
-  // shrinks downward, away from everything already on screen, and its own top --
-  // the reader's eye line on it -- does not move.
+  // A row whose top is at or below the fold is excluded: it grows and shrinks
+  // downward, away from everything already on screen, and its own top -- the
+  // reader's eye line on it -- does not move.
   if (input.rowTop >= input.foldTop) return 0
+  // Entirely above the fold: the whole change is above the reader whatever
+  // its cause, and moves them by exactly that.
+  const rowBottom = input.rowTop + input.prevHeight
+  if (rowBottom <= input.foldTop) return input.newHeight - input.prevHeight
+  // STRADDLING. A reprice does not move a row's top -- it moves its BOTTOM,
+  // and with it everything below, so a repriced straddler displaces the reader
+  // by the full change just like one entirely above it. Measured on the device
+  // and reproduced in Chromium with `overflow-anchor: none`: four of the five
+  // drift steps in a twelve-step walk were straddling rows shrinking 12-24px
+  // each, and excluding them is what left the reader displaced.
+  //
+  // Appended growth is the one case where that reasoning inverts: the new
+  // pixels are at the bottom, below the fold, and the visible part of the row
+  // is unchanged. See the docstring for what compensating it does.
+  if (input.appendsAtBottom) return 0
   return input.newHeight - input.prevHeight
 }
 
@@ -203,6 +235,94 @@ export function geometryCommitDeferred(input: {
   return input.now - lastMotion <= input.settleMs
 }
 
+/**
+ * Whether an automatic pin must yield right now.
+ *
+ * The base rule is a fixed window from the last hardware input: a reader whose
+ * gesture is in flight outranks any correction. That window alone is too short
+ * for a height change the input CAUSED. Opening a disclosure with many lines
+ * (a tool's error output, "Worked through N steps") renders and re-measures in
+ * a cascade that outlives the window, so the tail of the cascade escaped the
+ * gate and pinned — the expanded content the user opened was dragged past the
+ * viewport top, felt as bounce, and only for the long ones.
+ *
+ * So suppression is extended by the CASCADE, not the clock: each resize that
+ * arrives while suppressed pushes the deadline out again. Streaming growth is
+ * unaffected because no hardware input precedes it, so nothing is ever armed.
+ */
+export function pinSuppressedNow(
+  now: number,
+  lastHardInputAt: number,
+  cascadeUntil: number,
+  settleMs: number,
+): boolean {
+  return now - lastHardInputAt < settleMs || now < cascadeUntil
+}
+
+/**
+ * Whether a prepend SHIFT COMPENSATION may write the scroll position.
+ *
+ * Those corrections keep the reader visually still when rows are inserted above
+ * them, by adding the inserted height to `scrollTop`. That is only meaningful
+ * when the reader's position is what it was before the insert -- so it must
+ * stand down for every OTHER owner of the position:
+ *
+ * The one owner it stands down for is `stick`: follow-the-tail is pinning to the
+ * bottom on its own schedule, so compensating would fight it.
+ *
+ * The second is `settleMeasuring`, and the wording is load-bearing. These
+ * compensations and the restore's settle do the SAME job -- hold a row where it
+ * was -- from different reference points, so while the settle is correcting they
+ * fight it: captured on a phone inside one decisecond as
+ *
+ *   abovefold 49760->49632 / settle 49632->49760 / abovefold 49760->52142 /
+ *   resize 52142->50321 / growth 50321->50021
+ *
+ * five writes, each undoing part of the last, netting +261px the reader sees as
+ * the position sliding after it had landed.
+ *
+ * But it must NOT read "a restore is in flight". Standing down for the whole
+ * restore window was tried and was worse: a settle that cannot see its anchor row
+ * (`SETTLE.x no-node`) corrects nothing while still holding its gate, so blanking
+ * these too left EVERY prepend in that window uncompensated -- which walked the
+ * reader up a page per landing, pulled the top sentinel into view, and reopened
+ * the older-history door. History loading itself, one page at a time.
+ *
+ * So the condition is whether the settle is actually doing the job, not whether it
+ * is nominally in charge. Exactly one mechanism corrects at a time, and when the
+ * settle goes blind these take over rather than everyone standing down.
+ *
+ * Extracted rather than left as three inline conditions because the rule is one
+ * decision and has to read like one.
+ */
+export function shiftCompensationAllowed(input: {
+  stick: boolean
+  /** Is the restore's settle loop ACTIVELY correcting -- gate up AND able to see
+   *  its anchor row? Not merely "a restore is in flight". */
+  settleMeasuring: boolean
+}): boolean {
+  return !input.stick && !input.settleMeasuring
+}
+
+/**
+ * Is a height-sync anchor captured at `capturedScrollTop` still usable now that
+ * the scroller reads `liveScrollTop`?
+ *
+ * A viewport-relative capture consumed after the viewport MOVED corrects the
+ * reader's own scrolling rather than the repricing it was taken for (measured
+ * as a 2706px teleport on the phone rig during a cold-cache walk). scrollTop is
+ * the exact discriminator: a reprice ABOVE the viewport changes where rows sit,
+ * never scrollTop. So unchanged ⇒ the whole delta belongs to the reprice and is
+ * safe to correct HOWEVER LATE it lands; changed ⇒ something else moved the
+ * viewport (a finger, iOS momentum — which keeps moving with no further hard
+ * input, so an input-timestamp gate misses it — or Chromium's native anchoring,
+ * which already absorbed the shift, making the correction a no-op anyway).
+ *
+ * Wall-clock age was the first approximation and failed on the wrong side at
+ * the worst moment: a turn ending is the busiest the main thread gets, so the
+ * consumer runs late, a STILL reader's anchor was dropped, and they paid the
+ * entire reprice as one displacement.
+ */
 export function heightAnchorStillUsable(
   capturedScrollTop: number,
   liveScrollTop: number,
@@ -226,11 +346,21 @@ export const FOLLOW_REENGAGE_PX = 16
  * Direction-aware `stick` decision for a *user-initiated* scroll (self-scrolls
  * filtered out by the caller via `isSelfScroll`):
  *
- *   1. At the true bottom (within the DPR-aware epsilon) → follow. This also
- *      absorbs the layout engine's clamp: a mid-stream content SHRINK drops
- *      scrollTop (which reads as an upward move) but lands exactly at the new
- *      bottom — releasing there froze streaming follow for the rest of the
- *      turn.
+ *   1. At the true bottom (within the DPR-aware epsilon) → follow, PROVIDED
+ *      follow was already armed. This absorbs the layout engine's clamp: a
+ *      mid-stream content SHRINK drops scrollTop (which reads as an upward
+ *      move) but lands exactly at the new bottom — releasing there froze
+ *      streaming follow for the rest of the turn. Two exceptions, both meaning
+ *      "this landing is not the engine carrying a follower":
+ *        - a non-downward landing under a confirmed UPWARD user input inside
+ *          the settle window (`upwardInputWithinSettle`): that shrink
+ *          coincided with the reader's own scroll-up, so it belongs to the
+ *          user and releases follow. A downward or directionless input keeps
+ *          the clamp absorbed.
+ *        - follow already RELEASED (`stick === false`) and the reader did not
+ *          move DOWN to get here: the content below them collapsed and the
+ *          engine clamped them flush. Arriving at the bottom is not asking for
+ *          it, and re-arming hands the rest of the turn to the pin.
  *   2. Any other upward move → release, regardless of distance from the
  *      bottom. The scroll position now belongs to the user; only returning to
  *      the bottom (3) re-engages.
@@ -264,6 +394,29 @@ export function resolveUserScrollStick(args: {
    *  shrink moves `scrollHeight`, not `clientHeight` — so the two are
    *  distinguishable, and this is the delta that tells them apart. */
   viewportGrowth?: number
+  /** A hardware user input whose own direction was UPWARD (wheel up / upward
+   *  key / upward touch drag) landed within the scroll-settle window before
+   *  this scroll event.
+   *
+   *  The bottom-epsilon branch below treats a scroll landing within
+   *  `atBottomEpsilon` of the true bottom as the layout engine's clamp and
+   *  keeps `stick` as it was. But a genuine user scroll-UP that happens to
+   *  coincide with a mid-turn content shrink terminates within epsilon of the
+   *  NEW bottom too, so it wears the same signature — and keeping `stick` armed
+   *  there pins the reader back to the end on the next streaming resize. The
+   *  intent listeners stamp the input's direction BEFORE its scroll event
+   *  dispatches, so a fresh UPWARD stamp is proof the reader scrolled up: a
+   *  non-downward landing at the bottom under it is the reader, not the
+   *  engine, and releases follow.
+   *
+   *  The direction requirement is load-bearing: a wheel-DOWN at the bottom is
+   *  an ordinary input during streaming, and a content-shrink clamp landing
+   *  inside its settle window must NOT release follow — the reader asked to
+   *  stay at the end. Directionless inputs (a scrollbar grab, a first touch
+   *  move) are treated the same conservative way: only confirmed upward
+   *  intent disables the clamp guard. A genuine clamp carries no upward
+   *  input, so it still keeps `stick`. */
+  upwardInputWithinSettle?: boolean
 }): boolean {
   const { stick, followOutput, scrollTop, prevScrollTop, geom } = args
   if (!followOutput) return false
@@ -276,7 +429,42 @@ export function resolveUserScrollStick(args: {
   // closes is refused their re-engagement.
   const clampedByViewport =
     (args.viewportGrowth ?? 0) > atBottomEpsilon() && scrollTop <= prevScrollTop + atBottomEpsilon()
-  if (dist <= atBottomEpsilon()) return clampedByViewport ? stick : true
+  if (dist <= atBottomEpsilon()) {
+    // A clamp only ever lowers scrollTop, so a downward move here is the user's
+    // own and re-engages. A non-downward landing at the bottom is ambiguous
+    // between the engine's clamp and a user scroll-up that coincided with a
+    // content shrink -- and an UPWARD hard input within the settle window is
+    // the evidence the reader scrolled up, so the landing belongs to them:
+    // release. Direction-blind or downward input keeps the clamp guard.
+    const movedDown = prevScrollTop >= 0 && scrollTop > prevScrollTop + atBottomEpsilon()
+    if (args.upwardInputWithinSettle && !movedDown) return false
+    if (clampedByViewport) return stick
+    // ARRIVING at the bottom is not the same as ASKING for it. Rule 1 exists to
+    // carry a reader who was ALREADY following across a mid-stream content
+    // shrink, and that reader is `stick === true` by construction: the shrink's
+    // own scroll event is the first thing that could have released them. So a
+    // reader whose follow is already RELEASED reaches this branch for a
+    // different reason -- the content below them collapsed far enough to drop
+    // the maximum scrollTop under where they sat, and the engine clamped them
+    // flush with no finger anywhere near the screen.
+    //
+    // Re-arming there hands the rest of the turn to the pin: every later token
+    // drags the reader along, which is the phone report of scrolling up to read
+    // and being taken to the end seconds later. It is the exact defect rule 3
+    // already refuses inside FOLLOW_REENGAGE_PX ("the band arrives at a STILL
+    // reader"), and a clamp lands at distance ~0 rather than inside that band,
+    // so it slipped past that fix through here. A phone is where it bites: the
+    // narrow column prices unmeasured rows far under their real wrapped height,
+    // so the collapse is large enough to clamp rather than merely nudge.
+    //
+    // The old reading was "at the true bottom there is nothing below to be
+    // yanked to" -- true for that one instant, and false for every token after
+    // it. `movedDown` is the discriminator the same way it is in rule 3: a
+    // clamp only ever LOWERS scrollTop, so a reader who moved DOWN to get here
+    // came on their own and re-engages.
+    if (!stick) return movedDown
+    return true
+  }
   if (prevScrollTop < 0) return dist <= FOLLOW_REENGAGE_PX
   if (scrollTop < prevScrollTop - 0.5) return false
   // Re-engagement requires a genuine DOWNWARD move, not merely a non-upward
@@ -363,14 +551,46 @@ export function evaluateAutoPin(args: {
    *  gives: skipping leaves follow armed, so the next growth yanks the reader
    *  from wherever the restore just put them. */
   restoreGate?: boolean
+  /** Has hardware input -- wheel / touch / pointer / a scrolling key -- reached
+   *  the scroller since we last placed the reader at the bottom?
+   *
+   *  False means the reader has done nothing, so a gap that opened while they
+   *  rest on our last write was opened by content -- a row settling from its
+   *  estimate, a code-block stand-in swapping for the highlighted block, the
+   *  top spacer repricing -- and is a gap WE owe them, not one they chose.
+   *
+   *  The idle rule below cannot tell those apart from distance alone, and it
+   *  errs toward release, which was invisible wherever the browser's native
+   *  scroll anchoring quietly carried the reader through the growth. WebKit has
+   *  no scroll anchoring at all, so on an iPhone every entry into an idle
+   *  session paid the whole post-pin reprice as a displacement and then had
+   *  follow released on top of it: the transcript opened a viewport or more
+   *  above the end with nothing streaming to bring it back.
+   *
+   *  Defaults to `true` = assume the reader may have moved, which is the
+   *  release-leaning legacy behaviour for a caller that has no input signal. */
+  readerMovedSinceWrite?: boolean
 }): AutoPinResult {
   const { stick, geom, lastWriteTop } = args
   const epsilon = args.epsilon ?? SELF_SCROLL_EPSILON
   const viewportShrink = Math.max(0, args.viewportShrink ?? 0)
   const runActive = args.runActive ?? true
+  const readerMovedSinceWrite = args.readerMovedSinceWrite ?? true
   const target = bottomTarget(geom)
   if (args.restoreGate) return { pin: false, stick: false, target }
   if (!stick) return { pin: false, stick: false, target }
+  // The reader is resting exactly where we last put them and has given no input
+  // since, so any gap is content settling under them -- carry them back, live
+  // turn or not. Both conditions are load-bearing. Position alone would read our
+  // own write as consent for a reader who wheeled up and happened to stop on it;
+  // input alone would drag back a programmatic reveal -- a search hit, a pinned
+  // prompt, find-in-page -- whose scroll event has not dispatched yet when a
+  // height commit lands, since none of those touch the scroller's input
+  // listeners. A reveal moves scrollTop off our write; a reprice does not.
+  const restingOnOurWrite = lastWriteTop >= 0 && Math.abs(geom.scrollTop - lastWriteTop) <= epsilon
+  if (!readerMovedSinceWrite && restingOnOurWrite) {
+    return { pin: distanceFromBottom(geom) > atBottomEpsilon(), stick: true, target }
+  }
   // Idle: release rather than merely skip the pin. Skipping would leave follow
   // armed, so the next turn to start would yank this reader to the bottom from
   // wherever they had settled — the same defect one event later.
@@ -379,14 +599,14 @@ export function evaluateAutoPin(args: {
   // opposite answers: a reader who scrolled up should be released, while a
   // reader the CONTENT moved away from should be carried back.
   if (!runActive && distanceFromBottom(geom) > atBottomEpsilon()) {
-    // Released, and deliberately WITHOUT an exception for "the reader is resting on
-    // our own last write". Reading our own write as consent is an automatic action
-    // authorizing itself: the tempting case -- a late tail image or a spacer reprice
-    // pushing the bottom away from a reader who never moved -- is indistinguishable
-    // from the case this rule exists for, and treating it as follow is what sprang a
-    // parked reader down to content they had not asked to see. With nothing running
-    // there is no output to follow, so the honest outcome is to leave them where they
-    // are and let a real downward gesture, or the next turn, re-arm this.
+    // Released. The question this branch cannot answer from geometry -- did the
+    // reader open this gap, or did the content -- is answered ABOVE by
+    // `readerMovedSinceWrite`: reaching here means input or an unexplained
+    // scroll has been seen since our last positioning, so a reader who is now
+    // above the bottom while nothing runs is one who left it. Reading our own
+    // last write as consent would be an automatic action authorizing itself;
+    // the only evidence that the reader never moved is the absence of input,
+    // and that is what the branch above requires.
     return { pin: false, stick: false, target }
   }
   // Release only on a genuine user scroll-UP: scrollTop dropped below our last

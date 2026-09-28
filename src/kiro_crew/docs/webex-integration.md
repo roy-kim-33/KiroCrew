@@ -8,13 +8,13 @@ Webex needs no public URL and no webhooks: Kiro Crew registers a device with
 Webex and receives messages over an outbound WebSocket, so it works from
 behind a firewall or NAT. Replies finish as one or more messages split at the 7,000 UTF-8-byte transport cap, with a live status placeholder ("🤔 Thinking…" → "🔧 Running: …") while the agent works.
 
-## The easy way: just ask Kiro Crew
+## The easy way: use Settings
 
-You don't have to edit anything by hand. In any Kiro Crew session — the
-dashboard, Slack, or the CLI — say something like *"set up the Webex
-channel."* Kiro Crew walks you through creating the bot, then writes the token
-and your email into `~/.kiro/crew/.env` and `config.json` and restarts the
-gateway for you. You just hand it the bot token when it asks.
+Open **Settings → Messaging Channels → Webex**. Paste the bot token and add your Webex
+email there; the panel validates the token, stores the credential in
+`~/.kiro/crew/.env`, and writes the non-secret channel settings to `config.json`.
+Restart when the panel asks. Because the bot token is a credential, do not paste
+it into a chat message.
 
 Prefer to wire it up yourself? The manual steps are below.
 
@@ -80,7 +80,7 @@ and `/sessions` there lists the space's history rather than yours.
 
 | Command | What it does |
 |---|---|
-| `/new` | Start a fresh conversation (new session) |
+| `/new` | Start a fresh, restart-safe conversation; its first turn adds it to `/sessions` |
 | `/compact` | Compress the conversation context |
 | `/model` | List the models this account can use, and pick one |
 | `/sessions` | List this conversation's earlier sessions |
@@ -129,7 +129,7 @@ render. Anything that is not an answer is treated as an ordinary mid-turn
 message, so you can redirect the agent instead of answering. An unanswered prompt
 is **denied** after five minutes.
 
-## Security model
+## Access control
 
 - **Deny-by-default** — an empty `allowed_emails` list rejects everyone.
   Anyone in an org can message a Webex bot, so add only your own email(s).
@@ -163,7 +163,7 @@ is **denied** after five minutes.
   ceiling and the deny-list all run ahead of auto-approval, so a hard deny still
   wins.
 
-## Configuration reference
+## Settings reference
 
 | Setting | Default | What it does |
 |---|---|---|
@@ -195,6 +195,7 @@ delivered it); a reply refusal with nothing in the log but a
 
 ## Related docs
 
+- [Channel capabilities](channel-capabilities.md): the ten-channel matrix — streaming, buttons, uploads, reply length, approval timeout
 - [Slack Integration](slack-integration.md)
 - [Telegram Integration](telegram-integration.md)
 - [WeCom Integration](wecom-integration.md)

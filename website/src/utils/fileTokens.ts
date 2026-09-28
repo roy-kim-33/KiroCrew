@@ -202,6 +202,36 @@ export function findUnreferencedAttachments(text: string, orderedFiles: string[]
   return orderedFiles.filter(p => !IMG_EXT.test(p) && !referenced.has(p))
 }
 
+/**
+ * Image companion to findUnreferencedAttachments, applied to the CONTENT rather
+ * than returned as a list: every image on `meta.files` that the text never
+ * shows is re-emitted as a producer-form `![image](dest)` line ahead of it, so
+ * the bubble renders the picture the way a main-chat send always has.
+ *
+ * Exists for rows already on disk. Until ChatPane adopted prepareSendPayload
+ * it shipped the typed text verbatim and parked every attachment — images
+ * included — on `meta.files`, a shape the renderer reads for FILE cards only
+ * (resolveFileSegment drops image tokens on the promise that images arrive as
+ * markdown). Those member-DM and split-pane rows carry no such markdown, so
+ * their screenshots rendered as nothing. A main-chat row is untouched: its
+ * `meta.files` never holds an image (prepareSendPayload keeps `filePaths`
+ * image-free), and a row whose markdown already names the path is left alone,
+ * so a healed row and a freshly sent one draw identically.
+ */
+export function restoreUnreferencedImages(content: string, meta?: Record<string, unknown>): string {
+  const files = Array.isArray(meta?.files) ? (meta.files as unknown[]).filter((p): p is string => typeof p === 'string') : []
+  // "Named" means the path is an actual markdown DESTINATION -- `](dest)` --
+  // in either the raw or the mdImageDest-wrapped spelling. A bare substring
+  // test would let a caption that merely mentions the path in prose
+  // ("compare with /tmp/a.png") suppress the restore, and the picture would
+  // stay missing on exactly the row this exists to heal.
+  const named = (p: string) => [p, mdImageDest(p)].some(d => content.includes(`](${d})`))
+  const missing = files.filter(p => IMG_EXT.test(p) && !named(p))
+  if (!missing.length) return content
+  const imgMd = missing.map(p => `![image](${mdImageDest(p)})`).join('\n')
+  return [imgMd, content].filter(Boolean).join('\n\n')
+}
+
 /** Walk path segments to find the shortest @suffix present in text. */
 export function buildRelMap(paths: string[], text: string): Map<string, string> {
   const map = new Map<string, string>()
@@ -478,12 +508,20 @@ export interface RestoredComposerState {
  * would re-serialize as an appended token and reorder the user's words
  * around the attachment.
  *
- * Lossless inversion of EVERY shape needs attachment metadata on queue
- * entries — a backend schema change tracked in #5594 — after which this
- * parser can retire to legacy-entry duty.
+ * `files` is the entry's own ORDERED non-image attachment list when the
+ * server echoed one (slot-detail `queue[]` item or `queue_push` frame),
+ * the same list `[attached_file N]` indexes on a user row: marker N names
+ * `files[N-1]`. With it the own-line claim needs no shape rule — the marker
+ * line is matched by EXACT text, so a spaced bare-upload path
+ * (`/tmp/My Report.pdf`) is claimed whole, the shape the wire text alone
+ * could never prove. Inline (@-mention) markers and `[attached_dir N]`
+ * markers stay verbatim either way: their composer spelling is the `@rel`
+ * the user typed, which neither the wire text nor the list records. An
+ * entry without a list (a legacy entry, an older gateway) takes the shape
+ * rules above unchanged. The round-trip arbiter gates both paths.
  */
-export function restoreQueuedContent(content: string): RestoredComposerState {
-  const files: string[] = []
+export function restoreQueuedContent(content: string, files?: readonly string[]): RestoredComposerState {
+  const staged: string[] = []
   let text = content
 
   // Image lines are claimed ONLY as the producer's leading block, and only
@@ -497,18 +535,29 @@ export function restoreQueuedContent(content: string): RestoredComposerState {
     const lines = block[0].replace(/\n+$/, '').split('\n')
     const paths = lines.map((l) => mdImageDestToPath(IMG_LINE_RE.exec(l)?.[1] ?? ''))
     if (paths.every((p) => IMG_EXT.test(p) && RESTORABLE_PATH_RE.test(p))) {
-      files.push(...paths)
+      staged.push(...paths)
       text = content.slice(block[0].length)
     }
   }
 
   const claims: Array<{ path: string; matched: string }> = []
-  const claimedN = new Set<number>()
-  for (const m of text.matchAll(/^\[attached_file (\d+)\][^\S\n]+(\S+)[ \t]*$/gm)) {
-    const n = parseInt(m[1], 10)
-    if (n < 1 || claimedN.has(n) || !RESTORABLE_PATH_RE.test(m[2]) || IMG_EXT.test(m[2])) continue
-    claimedN.add(n)
-    claims.push({ path: m[2], matched: m[0] })
+  if (files?.length) {
+    // The list names each marker's exact path, so the claim is the exact
+    // own-line token `[attached_file N] files[N-1]` — whitespace in the path
+    // included. A marker the list does not account for is not claimed.
+    files.forEach((path, i) => {
+      const line = `[attached_file ${i + 1}] ${path}`
+      const esc = line.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      if (new RegExp(`^${esc}[ \\t]*$`, 'm').test(text)) claims.push({ path, matched: line })
+    })
+  } else {
+    const claimedN = new Set<number>()
+    for (const m of text.matchAll(/^\[attached_file (\d+)\][^\S\n]+(\S+)[ \t]*$/gm)) {
+      const n = parseInt(m[1], 10)
+      if (n < 1 || claimedN.has(n) || !RESTORABLE_PATH_RE.test(m[2]) || IMG_EXT.test(m[2])) continue
+      claimedN.add(n)
+      claims.push({ path: m[2], matched: m[0] })
+    }
   }
   for (const c of claims) {
     const esc = c.matched.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
@@ -518,7 +567,7 @@ export function restoreQueuedContent(content: string): RestoredComposerState {
     // instead). Consuming the separator here is what lets the surrounding
     // user text survive byte-exact, leading/trailing whitespace included.
     text = text.replace(new RegExp(`^${esc}\\n|\\n?${esc}$`, 'm'), '')
-    files.push(c.path)
+    staged.push(c.path)
   }
 
   // FINAL ARBITER — the definition of lossless, applied literally: a claim
@@ -530,7 +579,7 @@ export function restoreQueuedContent(content: string): RestoredComposerState {
   // user's words around the attachment; an index that cannot renumber
   // identically; any residue the removals left. Anything that fails the
   // round trip stays fully verbatim — never worse than the base behaviour.
-  const dedupedFiles = [...new Set(files)]
+  const dedupedFiles = [...new Set(staged)]
   if (dedupedFiles.length && prepareSendPayload(text, dedupedFiles).txt !== content) {
     return { text: content, files: [] }
   }

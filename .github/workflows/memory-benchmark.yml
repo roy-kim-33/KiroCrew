@@ -106,7 +106,7 @@ jobs:
         with:
           python-version: "3.12"
 
-      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           enable-cache: true
           cache-dependency-glob: |
@@ -213,7 +213,7 @@ jobs:
     # `always()` so a single failed arm still yields a comparison for the arm
     # that succeeded; the steps below tolerate a missing file.
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest  # schedule/workflow_dispatch (and workflow_call inherited from a schedule caller) has no live collaborator actor for the AWS webhook allowlist to check -- stays on ubuntu-latest.
     timeout-minutes: 15
     permissions:
       contents: write
@@ -226,7 +226,7 @@ jobs:
         with:
           python-version: "3.12"
 
-      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           enable-cache: true
           cache-dependency-glob: |
@@ -237,7 +237,7 @@ jobs:
         run: uv pip install --system -e ".[voice]" --group dev
 
       - name: Download the arm reports
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: memory-benchmark-*
           merge-multiple: true

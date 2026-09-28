@@ -72,6 +72,22 @@ describe('MobileConnectModal', () => {
     expect(mocks.tailnetMobileQr).toHaveBeenCalledTimes(1)
   })
 
+  it('shows the QR at its natural size so the browser never blurs its modules', async () => {
+    // A fixed 176px box squeezes a code of about 80 modules to roughly 2px a
+    // module, with smoothing, which is too small and soft for a phone camera.
+    mocks.tailnetMobileQr.mockResolvedValue({
+      url: 'https://host/?token=live',
+      image: 'data:image/png;base64,x',
+    })
+    mount(['tailnet_qr'])
+    fireEvent.click(await screen.findByText('Show QR code'))
+    const img = await screen.findByAltText('QR code for mobile access')
+    expect(img).not.toHaveAttribute('width')
+    expect(img).not.toHaveAttribute('height')
+    expect(img.className).toContain('[image-rendering:pixelated]')
+    expect(img.className).toContain('max-w-full')
+  })
+
   it('not-ready tailnet routes to setup instead of offering a mint', async () => {
     mocks.tailnetMobile.mockResolvedValue({ step: 'publish' })
     mount(['tailnet_qr'])
@@ -143,6 +159,34 @@ describe('MobileConnectModal', () => {
     mount(['login_link'])
     fireEvent.click(screen.getByText('Create sign-in link'))
     await screen.findByText(/Could not create a link/)
+  })
+
+  it('tells a restricted session to switch sessions instead of retrying', async () => {
+    mocks.mobileLoginLink.mockRejectedValue(
+      Object.assign(new Error('restricted session'), {
+        body: JSON.stringify({ code: 'restricted_session' }),
+      }),
+    )
+    mount(['login_link'])
+    fireEvent.click(screen.getByText('Create sign-in link'))
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent(
+      'Incognito and temporary sessions cannot create sign-in links. Switch to persistent mode to create one.',
+    )
+    expect(alert).not.toHaveTextContent('Try again')
+  })
+
+  it('tells an expired session to sign in again instead of retrying', async () => {
+    mocks.mobileLoginLink.mockRejectedValue(
+      Object.assign(new Error('caller session expired'), {
+        body: JSON.stringify({ code: 'caller_session_expired' }),
+      }),
+    )
+    mount(['login_link'])
+    fireEvent.click(screen.getByText('Create sign-in link'))
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent('Your session has expired. Sign in again, then create the link.')
+    expect(alert).not.toHaveTextContent('Try again')
   })
 
   it('Copy link confirms with a transient tick', async () => {
