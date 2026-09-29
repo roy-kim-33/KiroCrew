@@ -20,7 +20,9 @@ import type {
   WorkflowRunSummary,
 } from '../types'
 import type { RemoteCrewCapabilities } from '../hooks/useRemoteCapabilities'
+import type { AutoNudgeListResponse } from '../components/autoNudgeLoop'
 import { ApiError, friendlyErrText } from './apiError'
+import { SESSION_CONTROL_STATUS_PATH_RE } from '../lib/sessionControlStatusPath'
 import { refreshOnce, __resetRefreshOnceForTests } from './refreshOnce'
 import {
   STALE_OWNER_SESSION_CODE,
@@ -29,6 +31,7 @@ import {
 } from './staleOwnerSignal'
 import { beginArtifactWrite, endArtifactWrite } from '../lib/artifactWrites'
 import { withDeadline } from '../lib/withDeadline'
+import { createVoiceRequestId } from '../lib/voicePlayback'
 
 /** Deadline for `api.skills`. Measured on one host inside twenty minutes: 0.62s
  *  healthy, then 9.76s, 41.41s, 168.71s for a byte-identical payload. 15s clears
@@ -1572,7 +1575,13 @@ const projectHeader = (projectKey?: string): HeadersInit | undefined =>
 
 const get = (url: string, sessionKey?: string, signal?: AbortSignal) =>
   fetch(url, { headers: { ...(sessionKey ? { 'X-Session-Key': sessionKey } : _sk) }, ...(signal ? { signal } : {}) })
-const post = (url: string, body?: object, sessionKey?: string, extra?: HeadersInit) =>
+const post = (
+  url: string,
+  body?: object,
+  sessionKey?: string,
+  extra?: HeadersInit,
+  redirect?: RequestRedirect,
+) =>
   trackArtifactWrite(url, fetch(url, {
     method: 'POST',
     // sessionKey overrides the shared `dashboard:ui` placeholder with the REAL
@@ -1582,6 +1591,11 @@ const post = (url: string, body?: object, sessionKey?: string, extra?: HeadersIn
     // of a specific chat slot must pass it.
     // `extra` carries a per-call precondition header (a view the server must
     // still agree with) without every caller re-implementing the header merge.
+    // `redirect` is for a caller whose URL is not core's to choose: a validated
+    // target that answers 3xx would otherwise be followed automatically, and the
+    // check that approved the FIRST url never sees the second. Defaulted so no
+    // existing caller changes behaviour.
+    ...(redirect ? { redirect } : {}),
     headers: { 'Content-Type': 'application/json', ...(sessionKey ? { 'X-Session-Key': sessionKey } : _sk), ...extra },
     body: body ? JSON.stringify(body) : undefined,
   }))
@@ -2131,6 +2145,12 @@ export interface MemberRosterRow {
   workspace?: string
   memory_store?: string
   model?: string
+  /** Crew origin, NORMALIZED by the server to exactly 'kirocrew' (created in
+   *  the crew manager), 'builtin', or 'package' (agent-sync-installed; the
+   *  legacy 'aim' spelling and any unknown value collapse to this). */
+  source?: 'kirocrew' | 'builtin' | 'package' | string
+  /** User's favourite mark; toggled via PUT /api/agents/{name}. */
+  starred?: boolean
   [extra: string]: unknown
 }
 
@@ -2143,6 +2163,55 @@ export interface MemberActivityEntry {
   ts: number
   via: 'chat' | 'select_crew' | string
   project?: string
+}
+
+/** WakaTime coding-stats payload (GET /api/wakatime/stats). When the
+ *  integration is off the endpoint returns { configured: false } instead. */
+export type WakaTimeStatsEntry = { name: string; total_seconds: number }
+export type WakaTimeStats = {
+  configured: boolean
+  range?: string
+  stats?: {
+    total_seconds?: number
+    daily_average?: number
+    languages?: WakaTimeStatsEntry[]
+    projects?: WakaTimeStatsEntry[]
+  }
+}
+
+/** One feature-intro clip, as GET /api/feature-videos/next reports it.
+ *  `src`/`poster` are SAME-ORIGIN relative paths under
+ *  `/app-assets/feature-videos/` — the backend names the asset it shipped, so
+ *  the modal never composes a URL and cannot be pointed at a third-party host
+ *  by a config value. */
+export interface FeatureVideo {
+  id: string
+  /** Which dashboard feature the clip introduces — the per-feature key the
+   *  backend dedupes on, so a verdict survives the clip being re-cut under a
+   *  new id. */
+  feature: string
+  title: string
+  description: string
+  src: string
+  poster: string
+  duration_s: number
+  /** Docs FILENAME, as the backend's catalog stores it (`"feature-tips.md"`) --
+   *  not a URL, and unlike `tipsNext` no resolved `doc_link` ships beside it.
+   *  Resolve it with `tipDocHref` from `utils/docsLink`, which validates the
+   *  filename shape and returns the public docs URL. */
+  doc?: string
+}
+
+/** GET /api/feature-videos/next.
+ *
+ *  `video: null` is the steady state, not an error — it is what the endpoint
+ *  returns once every clip has been seen or dismissed, which for most launches
+ *  is always. `enabled` is the operator kill switch, reported separately so a
+ *  disabled install still answers 200 rather than making the client read a
+ *  failure as a policy. */
+export interface FeatureVideoNext {
+  video: FeatureVideo | null
+  enabled: boolean
 }
 
 export const api = {
@@ -2181,6 +2250,37 @@ export const api = {
    *  every row (the endpoint's app-ownership filter applies to app callers). */
   usageTurns: (slot: string) =>
     fetch('/api/usage/turns?slot=' + encodeURIComponent(slot)).then(j),
+  /** WakaTime coding stats for a named range. Returns { configured: false }
+   *  when the integration is off; a 502 body carries { code: 'upstream_unavailable' }. */
+  wakatimeStats: (range: string) =>
+    fetch('/api/wakatime/stats?range=' + encodeURIComponent(range)).then(j) as Promise<WakaTimeStats>,
+  /** Download URL for the billable-hours export. The browser navigates to it so
+   *  the CSV/JSON arrives via the endpoint's own Content-Disposition. */
+  wakatimeExportUrl: (start: string, end: string, format: 'csv' | 'json') =>
+    `/api/wakatime/export?start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}&format=${format}`,
+  /** Download the export as a file. Fetches rather than navigating, so an
+   *  upstream 502 raises here (surfaced through ErrorNotice) instead of
+   *  replacing the dashboard with the raw error body. The saved filename comes
+   *  from the endpoint's own sanitized Content-Disposition. */
+  wakatimeExportDownload: async (start: string, end: string, format: 'csv' | 'json') => {
+    const r = await get(api.wakatimeExportUrl(start, end, format))
+    if (!r.ok) {
+      const t = await r.text()
+      throw new ApiError(r.status, t || `HTTP ${r.status}`)
+    }
+    const blob = await r.blob()
+    const cd = r.headers.get('Content-Disposition') || ''
+    const m = /filename\*?=(?:UTF-8'')?"?([^";]+)"?/.exec(cd)
+    const filename = (m && decodeURIComponent(m[1])) || `wakatime-hours-${start}-to-${end}.${format}`
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = filename
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+    URL.revokeObjectURL(url)
+  },
   /** Intent summary for the chat summary panel.
    *
    *  Read-only: it never triggers generation. Summaries are produced at turn end
@@ -2347,10 +2447,13 @@ export const api = {
   removeInstance: (id: string) => del('/api/instances/' + encodeURIComponent(id)).then(j),
   instanceStatus: (id: string, diagnose = false) =>
     get('/api/instances/' + encodeURIComponent(id) + '/status' + (diagnose ? '?diagnose=1' : '')).then(j) as Promise<InstanceTunnelStatus>,
-  connectInstance: (id: string) =>
-    post('/api/instances/' + encodeURIComponent(id) + '/connect').then(j) as Promise<
-      InstanceTunnelStatus & { token?: string }
-    >,
+  connectInstance: (id: string, opts?: { rebuild?: boolean; onlyIfConnected?: boolean }) =>
+    post(
+      '/api/instances/' +
+        encodeURIComponent(id) +
+        '/connect' +
+        (opts?.rebuild ? '?rebuild=1' : opts?.onlyIfConnected ? '?only_if_connected=1' : ''),
+    ).then(j) as Promise<InstanceTunnelStatus & { token?: string }>,
   refreshInstanceToken: (id: string) =>
     post('/api/instances/' + encodeURIComponent(id) + '/refresh-token').then(j) as Promise<
       InstanceTunnelStatus & { token?: string }
@@ -2979,9 +3082,12 @@ export const api = {
   /** Top contributors to an app's source repo (GitHub only). Owner-gated. */
   appContributors: (url: string, refresh = false) => post('/api/source/contributors', { url, refresh }).then(j) as Promise<{ contributors: AppContributor[] }>,
   chatSlots: () => fetch('/api/chat/slots').then(j),
-  /** All goal loops across sessions. Returns `{enabled:false, loops:[]}` when
-   *  the auto-nudge feature flag is off, so callers need no flag check. */
-  autonudgeList: (): Promise<{ enabled: boolean; loops: { slot_key: string; active?: boolean; cycle_count?: number; max_cycles?: number }[] }> =>
+  /** All goal loops across sessions — every record the service holds, ACTIVE
+   *  OR STOPPED (a stopped loop keeps `active: false` + `stopped_reason`, which
+   *  is how a surface can say WHY a patrol went quiet). Returns
+   *  `{enabled:false, loops:[]}` when the auto-nudge feature flag is off, so
+   *  callers need no flag check. */
+  autonudgeList: (): Promise<AutoNudgeListResponse> =>
     fetch('/api/autonudge').then(j),
   /** Every pull request / issue link a session carries — the unbudgeted read
    *  behind the sidebar's expandable "+N" overflow chip. The slots payload caps
@@ -3367,6 +3473,24 @@ export const api = {
   themes: () => fetch('/api/themes').then(j),
   // Dashboard config
   dashboardConfig: () => fetch('/api/dashboard/config').then(j),
+  // Feature intro videos (startup). This GET carries METADATA only — the clip
+  // itself is fetched by the <video> element, and only after the modal opens,
+  // so a launch that shows nothing costs one small JSON round trip.
+  //
+  // `sessionKey` MUST carry the active slot's key (`dashboard:<slot>`). Both routes
+  // call the server's `_is_restricted_session`, and that guard treats the shared
+  // `dashboard:ui` default as NOT restricted (`_shared.py:1668`) -- so omitting the
+  // key makes the server's own incognito/temporary check unreachable, and the only
+  // thing left standing between a session that keeps nothing and a PERMANENT verdict
+  // is the dashboard's client-side gate. Same cooperative-honesty contract as
+  // `mobileLoginLink` above.
+  featureVideoNext: (sessionKey?: string) =>
+    get('/api/feature-videos/next', sessionKey).then(j) as Promise<FeatureVideoNext>,
+  /** Permanent per-video verdict, not a snooze: `seen` retires the clip on
+   *  completion or an explicit acknowledgement, `dismissed` retires it on a
+   *  close, and the backend never offers that video again after either. */
+  featureVideoFeedback: (id: string, status: 'seen' | 'dismissed', sessionKey?: string) =>
+    post('/api/feature-videos/feedback', { id, status }, sessionKey).then(j) as Promise<{ ok: true }>,
   updateDashboardConfig: (body: object) => put('/api/dashboard/config', body).then(j),
   createTheme: (body: object) => post('/api/themes', body).then(j),
   installTheme: (source: { type: 'local'; path: string } | { type: 'github'; url: string }) =>
@@ -3391,6 +3515,7 @@ export const api = {
   voiceConfig: () => fetch('/api/voice/config').then(j),
   updateVoiceConfig: (body: object) => put('/api/voice/config', body).then(j),
   voiceVoices: () => fetch('/api/voice/voices').then(j),
+  voiceSystemVoices: () => fetch('/api/voice/system-voices').then(j),
   // Paid-AWS-service consent (Amazon Polly for TTS, Amazon Transcribe for STT).
   // The GET reports what would be billed AND performs the identity probe, so it
   // is the call that surfaces the account before the operator agrees to it.
@@ -3407,8 +3532,17 @@ export const api = {
     }).then(j) as Promise<{ ok?: boolean; error?: string; code?: string; identityDetail?: string }>,
   revokeAwsConsent: (service: string) =>
     del('/api/aws/consent?service=' + encodeURIComponent(service)).then(j) as Promise<{ ok?: boolean; removed?: boolean }>,
-  voiceSynthesize: (slot: string, text: string, opts?: { voice?: string; engine?: string; rate?: string; pitch?: string }) =>
-    post('/api/voice/synthesize', { slot, text, ...opts }).then(j),
+  voiceSynthesize: (slot: string, text: string, opts?: { voice?: string; engine?: string; rate?: string; pitch?: string; request_id?: string }) => {
+    const request_id = opts?.request_id || createVoiceRequestId()
+    window.dispatchEvent(new CustomEvent('voice-synthesis-start', { detail: { slot, request_id } }))
+    return post('/api/voice/synthesize', { slot, text, ...opts, request_id }).then(j).catch(error => {
+      const code = error instanceof ApiError ? parseErrorCode(error.body) : undefined
+      window.dispatchEvent(new CustomEvent('voice-synthesis-failed', { detail: { slot, request_id, code: code || 'voice_synthesis_failed' } }))
+      throw error
+    })
+  },
+  voiceCancel: (slot: string, request_id: string) =>
+    post('/api/voice/cancel', { slot, request_id }).then(j),
 
   // Channels
   channelsList: () => fetch('/api/channels').then(j),
@@ -3676,6 +3810,16 @@ export const api = {
   updateArtifactSharing: (slug: string, body: { visibility: 'PRIVATE' | 'SHARED' | 'PUBLIC'; shared_with?: string[] }) =>
     patch(`/api/artifacts/${encodeURIComponent(slug)}/sharing`, body).then(j),
   unpublishArtifact: (slug: string) => del(`/api/artifacts/${encodeURIComponent(slug)}/publish`).then(j),
+  /** Re-check a published artifact's destination and clear a notice that no longer holds.
+   *
+   *  A publish notice ("still rolling out", "delivery network disabled") is recorded once,
+   *  at publish time, and the ordinary happy path never revisits it -- so a link that has
+   *  since finished rolling out kept an amber "still rolling out" banner forever. This asks
+   *  the destination again and clears `notice` / `notice_code` only when the condition has
+   *  actually cleared; it is deliberately user-triggered rather than a timer, because the
+   *  answer costs a call to the destination. */
+  reprobeArtifactNotice: (slug: string) =>
+    post(`/api/artifacts/${encodeURIComponent(slug)}/publish/reprobe-notice`, {}).then(j),
   /** Stash model-authored HTML and get back a URL a sandboxed iframe can load.
    *
    *  Artifact and widget frames cannot use a `blob:` URL: some WebKit-based
@@ -3783,6 +3927,50 @@ export const api = {
   // Auto-research
   researchValidate: (body: object) => post("/api/apps/auto-research/validate", body).then(j),
   researchGrillExpand: (body: object) => post("/api/apps/auto-research/grill/expand", body).then(j),
+  /**
+   * GET an app's declared per-session status route.
+   *
+   * Routed through `get()` + `j()` rather than a bare `fetch`, so this call
+   * carries the X-Session-Key gate and runs `checkSessionExpired` like every
+   * other app call. `statusPath` is validated by the caller against the same
+   * allowlist the backend applies at install time.
+   *
+   * `processBacked` selects the prefix, because an app's backend is served at
+   * one of TWO places and picking the wrong one is a silent permanent failure
+   * rather than a visible error: in-gateway hook routes are registered under
+   * `/api/apps/<app>/`, while an app running its own backend PROCESS is
+   * reverse-proxied at `/apps/<app>/api/`. Calling the hook prefix for a
+   * process-backed app answers 502 ("no reachable backend"), which the chip
+   * renders as a permanently stateless control with nothing saying why.
+   */
+  appSessionStatus: (
+    appName: string,
+    statusPath: string,
+    params: Record<string, string>,
+    processBacked = false,
+  ) => {
+    // Defensive: the boundary is enforced here rather than deferred to every
+    // call site. statusPath comes from a third-party app manifest and is
+    // interpolated into the path, so a caller that forgets to sanitize it must
+    // not be able to reach /api/apps/<app>/../other-app/... . This is the
+    // client-side backstop for the same allowlist the backend applies at
+    // install time — callers still validate too, this is not the only check.
+    if (!SESSION_CONTROL_STATUS_PATH_RE.test(statusPath)) {
+      // A machine code, not UI copy: this throw is a programmer-error backstop for
+      // a manifest that got past the caller's own check, so it never renders and
+      // must not become a translated string. The comment above is the explanation;
+      // the code is what a caller can match on.
+      throw new ApiError(400, 'invalidAppStatusPath')
+    }
+    const qs = new URLSearchParams(params).toString()
+    // Both prefixes are built HERE from the app name rather than read from the
+    // manifest, so the only app-authored value interpolated into the URL is the
+    // `statusPath` already validated above.
+    const base = processBacked
+      ? '/apps/' + encodeURIComponent(appName) + '/api/'
+      : '/api/apps/' + encodeURIComponent(appName) + '/'
+    return get(base + statusPath + (qs ? '?' + qs : '')).then(j)
+  },
   researchCampaigns: () => get("/api/apps/auto-research/campaigns").then(j),
   researchCampaign: (id: string) => get("/api/apps/auto-research/campaigns/" + id).then(j),
   researchCreate: (body: object) => post("/api/apps/auto-research/campaigns", body).then(j),
@@ -3797,8 +3985,61 @@ export const api = {
   researchReport: (id: string) => get("/api/apps/auto-research/campaigns/" + id + "/report").then(j),
   researchDelete: (id: string) => del("/api/apps/auto-research/campaigns/" + id).then(j),
 
+  // Activate a file-menu row an installed app contributed. The declarations ride on
+  // `GET /api/apps` (see `fileMenuContributions.ts`) rather than an endpoint of their
+  // own, so only the dispatch lives here: core POSTs the file's path to the row's own
+  // endpoint and never imports app code.
+  //
+  // `sessionKey` is the OWNING SLOT (`dashboard:<slot>`), supplied by the shared
+  // dispatcher. It rides the header rather than the body because the server's
+  // restricted-session gate reads the header, and the body is the app-facing contract
+  // documented in the manifest reference.
+  //
+  // `redirect: 'error'` is what makes the endpoint allowlist mean anything. The URL is
+  // the APP's to choose, and it is validated once, before the request; `fetch` follows a
+  // 3xx by default, and a 307 preserves the method, the body AND this header, so an
+  // approved endpoint answering `307 /api/apps/<victim>/disable` would have the reader's
+  // own session disable another app on a row they merely clicked. Refusing to follow
+  // keeps the checked url the only url.
+  invokeFileMenuItem: async (
+    item: { id: string; endpoint: string },
+    ctx: FileMenuContext,
+    sessionKey?: string,
+  ) => {
+    const r = await post(item.endpoint, { item_id: item.id, ...ctx }, sessionKey, undefined, 'error')
+    checkSessionExpired(r)
+    if (r.ok) { removeAuthBanner(); return r.json() }
+    const errText = await r.text()
+    throw new ApiError(r.status, errText || `HTTP ${r.status}`)
+  },
+
   artifactTeardown: (slug: string) => post(`/api/deploy/teardown/${slug}`, { confirm: true }).then(j),
   publishProviders: () => get('/api/publish-providers').then(j) as Promise<{ providers: AppPublishProvider[] }>,
+  /** Publish through a CORE-registry destination, resolved by its registry name.
+   *  Separate from `publishToProvider` on purpose: that one routes at an app's declared
+   *  endpoint and falls back to `/api/deploy/deploy`, which is per-artifact deploy
+   *  infrastructure -- a different destination, not a different spelling of this one. */
+  publishArtifactToCoreProvider: async (slug: string, providerName: string) => {
+    const r = await post(`/api/artifacts/${encodeURIComponent(slug)}/publish`, {
+      visibility: 'PUBLIC',
+      shared_with: [],
+      provider: providerName,
+    })
+    checkSessionExpired(r)
+    if (r.ok) { removeAuthBanner(); return r.json() }
+    if (r.status === 409) { return r.json() }
+    // Parse before surfacing. The body is JSON, so returning its raw text put
+    // `{"error": "No AWS account is registered yet..."}` verbatim in the error line --
+    // the provider's carefully worded remedy delivered wrapped in syntax.
+    const text = await r.text()
+    try {
+      const parsed = JSON.parse(text)
+      const msg = typeof parsed?.error === 'string' ? parsed.error : text
+      return { error: msg }
+    } catch {
+      return { error: text }
+    }
+  },
   publishToProvider: async (slug: string, providerId: string, provider?: AppPublishProvider, ttlHours?: number) => {
     // Route to the provider's declared endpoint with the payload shape
     // that _do_deploy expects (site_id + artifact_slug). ttl_hours is sent on
@@ -3830,4 +4071,23 @@ export interface AppPublishProvider {
   configured: boolean
   setupRoute: string
   endpoint: string
+}
+
+/** The surfaces a contributed file-menu row can appear on. */
+export type FileMenuSurface = 'file-overflow' | 'tree-context' | 'folder-row'
+
+/**
+ * What core POSTs to a row's endpoint when it is activated.
+ *
+ * The PATH only — deliberately never file CONTENT. A contributed row is declared in a
+ * manifest and needs no permission to exist, so shipping the bytes with the activation
+ * would hand any app that declares one the contents of whatever file the reader clicked,
+ * with no install-time declaration and no consent step. An app that needs the bytes reads
+ * them through a route its own `permissions` cover.
+ */
+export interface FileMenuContext {
+  surface: FileMenuSurface
+  path: string
+  kind?: 'file' | 'dir'
+  root?: string
 }

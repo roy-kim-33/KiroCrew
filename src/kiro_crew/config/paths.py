@@ -341,6 +341,24 @@ def data_home() -> Path:
     return config_dir()
 
 
+def peek_data_home() -> Path:
+    """Where the data home IS, without creating or maintaining it.
+
+    :func:`config_dir` and :func:`data_home` both create the home on first
+    resolution (and refresh the recovery breadcrumb). A caller that only wants
+    to know whether a file *would* be there -- an import-time cache load, a
+    read-only inspector -- must not turn "import the package" into "mkdir
+    ``~/.kiro/crew``": a test collector imports before any isolation runs, and a
+    tool that reports state should not create it. Applies the SAME override
+    predicate :func:`config_dir` gates on, so a valid ``KIROCREW_HOME`` and the
+    default home agree between reader and writer, and reads nothing else.
+    """
+    override = _valid_override_home()
+    if override is not None:
+        return override
+    return _resolve_default_home()
+
+
 def ensure_data_home() -> Path:
     """Eagerly resolve and create the data home — call BEFORE the loop.
 
@@ -544,6 +562,16 @@ def kiro_home() -> Path:
     return p
 
 
+#: Test/tooling redirect for :func:`kiro_sessions_dir`, consulted on every call
+#: (``None`` = resolve from the environment). Same shape as
+#: :data:`_agents_dir_override` and for the same reason: several modules bind
+#: ``kiro_sessions_dir`` by name (``from ... import kiro_sessions_dir``), which
+#: copies the function OBJECT, so patching this module's attribute would never
+#: reach them. A value read inside the function BODY does, because a function's
+#: globals are always its defining module's.
+_sessions_dir_override: Callable[[], Path] | None = None
+
+
 def kiro_sessions_dir() -> Path:
     """Where kiro-cli stores its chat transcripts: ``<kiro home>/sessions/cli``.
 
@@ -553,8 +581,65 @@ def kiro_sessions_dir() -> Path:
     transcripts from the machine-wide path loses session resume and has its
     mappings pruned. Routing both through the resolver keeps writer and reader in
     agreement.
+
+    Honours :data:`_sessions_dir_override` when one is installed, the same lever
+    :func:`kiro_agents_dir` offers for the agent-spec home — this is the third
+    ``~/.kiro`` axis (agents, transcripts, and the data home ``KIROCREW_HOME``
+    already covers) and it needs its own hook because it is resolved lazily
+    (``kiro_home()`` -> ``$KIRO_HOME`` or ``Path.home()/.kiro``) at every call, so
+    neither ``KIROCREW_HOME`` nor an import-time path pin can reach it.
     """
+    if _sessions_dir_override is not None:
+        return _sessions_dir_override()
     return kiro_home() / "sessions" / "cli"
+
+
+def kiro_oauth_cache_home() -> Path:
+    """The OS-level home whose ``.aws/sso/cache`` kiro-cli's MCP OAuth grant pairs
+    resolve under, honoring a ``KIROCREW_OS_HOME`` override.
+
+    kiro-cli derives its MCP OAuth artifact directory from the process's real
+    ``$HOME`` (``mcp_grant.kiro_oauth_cache_dir()`` calls :func:`Path.home` by
+    default) -- unlike the agent-specs/sessions tree above, there is no
+    documented kiro-cli env var that relocates just this one subtree.
+    ``KIRO_HOME`` does not help either: it moves agents/prompts/skills/sessions,
+    not ``~/.aws``, which sits outside ``~/.kiro`` entirely.
+
+    ``KIROCREW_OS_HOME`` is therefore an override owned by Kiro Crew, consulted by
+    :func:`kiro_crew.mcp_grant.kiro_oauth_cache_dir` and set by
+    :func:`kiro_crew.pod.runtime.build_pod_env` to a pod-owned directory. Setting
+    it repoints where every ``mcp_grant`` caller (mint, status, disconnect,
+    mcp_discovery's remote probe) STATS and unlinks grant artifacts -- it does
+    NOT by itself repoint kiro-cli's own writes, which follow the CHILD
+    process's ``$HOME``. The two must be set together: the ACP spawn path
+    remaps a pod-spawned kiro-cli child's ``HOME`` to this same directory (see
+    ``acp/client.py`` and ``acp/runtime.py``), so kiro-cli's OWN writes and
+    every ``mcp_grant`` reader agree on one location -- the same "one resolver,
+    both sides read it" shape :func:`kiro_home` uses for agent specs.
+
+    Honoured ONLY when ``KIROCREW_POD`` is exactly ``"1"``, which is the same
+    gate the write side (``acp.client._apply_pod_home_remap``) applies. Reads and
+    writes must turn on together: an override honoured here but not there would
+    repoint grant READS while kiro-cli kept WRITING under the real home,
+    recreating precisely the read/write split this resolver exists to close.
+    ``build_pod_env`` is the only writer of either variable and sets both, so the
+    paired gate costs nothing and removes the asymmetry.
+
+    Rejects the same unsafe targets as :func:`kiro_home` (a filesystem/drive
+    root, or a known POSIX system directory), degrading to :func:`Path.home` so
+    a malformed override cannot scatter OAuth artifacts across ``/`` or
+    ``/usr``.
+    """
+    if os.environ.get("KIROCREW_POD") != "1":
+        return Path.home()
+    override = os.environ.get("KIROCREW_OS_HOME")
+    if not override:
+        return Path.home()
+    p = Path(override).expanduser().resolve()
+    if _is_unsafe_home(p):
+        logger.warning("KIROCREW_OS_HOME=%s is a system directory, ignoring", override)
+        return Path.home()
+    return p
 
 
 def isolated_agents_dir(data_home: Path) -> Path:

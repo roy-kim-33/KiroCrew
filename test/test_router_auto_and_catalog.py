@@ -174,9 +174,7 @@ class TestNativeModelPicker:
 
     def test_router_lane_keeps_the_window_unlock(self, tmp_path, monkeypatch):
         monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
-        data = self._settings_after_seed(
-            tmp_path, {"ANTHROPIC_BASE_URL": "http://localhost:20128"}
-        )
+        data = self._settings_after_seed(tmp_path, {"ANTHROPIC_BASE_URL": "http://localhost:20128"})
         assert data["availableModels"] == ["*"]
 
     def test_a_wildcard_left_by_an_earlier_session_is_cleared(self, tmp_path, monkeypatch):
@@ -191,11 +189,20 @@ class TestNativeModelPicker:
         data = self._settings_after_seed(tmp_path, {}, seed={"availableModels": ["opus"]})
         assert data["availableModels"] == ["opus"]
 
-    def test_config_options_are_read_when_the_session_advertises_no_models(self):
+    def test_config_options_are_read_when_the_session_advertises_no_models(self, tmp_path):
         """The native session/new response carries no `models` block at all --
         the choices live in `configOptions`, and returning early there is what
-        left the picker empty."""
-        models = c.AcpClient._models_from_config_options(
+        left the picker empty.
+
+        Upstream turned this into an INSTANCE method returning a ``models``
+        ENVELOPE (it is capability-gated on
+        ``resolves_model_from_advertised_list``), so the call shape changed. The
+        behaviour under test is the same, and the two fork-specific properties it
+        pins still hold: the ``model`` option is accepted with NO ``type`` key
+        (the native lane advertises none), and the "mode" option is ignored.
+        """
+        cl = c.AcpClient(work_dir=str(tmp_path), acp_backend=c.ACP_BACKEND_CLAUDE, model="")
+        envelope = cl._models_from_config_options(
             {
                 "configOptions": [
                     {"id": "mode", "options": [{"value": "plan", "name": "Plan"}]},
@@ -210,4 +217,5 @@ class TestNativeModelPicker:
                 ]
             }
         )
-        assert [m["modelId"] for m in models] == ["opus", "haiku"]
+        assert [m["modelId"] for m in envelope["availableModels"]] == ["opus", "haiku"]
+        assert envelope["currentModelId"] == "default"

@@ -37,6 +37,9 @@ export default [
       // Test files assert on visible English by design.
       'src/**/*.test.{ts,tsx}',
       'src/test/**',
+      // Storybook fixtures are development-only renders of a primitive with
+      // sample copy; nothing in them reaches a user. Same category as tests.
+      'src/**/*.stories.{ts,tsx}',
       // MODEL-FACING PROMPTS, by naming convention. A `*.prompt.ts` module may
       // contain ONLY the text of a message sent to an agent — no UI copy — so the
       // suffix IS the boundary and its sibling module stays fully covered. Same
@@ -747,7 +750,17 @@ export default [
               // Key CAP names and modifier glyphs. These name physical keys, which the
               // catalog's own translator context says are left as printed on the keyboard
               // (see `components.shortcutsModal.k`, `components.commandPalette.tab`).
-              '[⌘⇧⌥⌃]+[A-Za-z0-9]?$', '(?:Ctrl|Cmd|Alt|Win|Opt|Shift|Esc|Tab|Enter|Del)$',
+              //
+              // `Meta` and `Control` are the WAI-ARIA modifier vocabulary, which is what
+              // an `aria-keyshortcuts` value is spelled in — the same kind of machine
+              // grammar as the OS accelerator entry directly above, just parsed by
+              // assistive tech instead of by the OS. They are needed BARE, unlike the
+              // accelerator pattern, because that one requires a `+<key>` suffix and the
+              // ARIA value is assembled a modifier at a time (see
+              // `hooks/useNavShortcutHint.ts`). Anchored to the whole value like every
+              // sibling here, so a sentence merely containing the word "Control" is still
+              // reported — only the bare token is exempt.
+              '[⌘⇧⌥⌃]+[A-Za-z0-9]?$', '(?:Ctrl|Cmd|Alt|Win|Opt|Shift|Esc|Tab|Enter|Del|Meta|Control)$',
               // A TEMPLATE LITERAL is validated one QUASI at a time (the rule reports
               // the whole template if ANY quasi fails), so the fragments BETWEEN
               // interpolations need shapes of their own. `data:${mime};base64,${b64}`
@@ -889,8 +902,16 @@ export default [
               // A CALLEE exemption, not a whole-file one, for the reason the ones
               // above give -- and the name is deliberately long and specific rather
               // than a generic `warnSkip`, so a future helper elsewhere cannot
-              // inherit this by accident. One definition exists today, in
-              // `src/apps/command-bar/contributedCommands.ts`, which renders nothing.
+              // inherit this by accident. TWO definitions exist today:
+              // `src/apps/command-bar/contributedCommands.ts`, which renders nothing,
+              // and `src/apps/fileMenuContributions.tsx`, the same shim for a refused
+              // `contributes.fileMenuItems` row. The second REUSES this name rather
+              // than adding a second global exemption for a differently-named shim:
+              // one entry covering both keeps the released surface the same size,
+              // where two would widen it for no gain. Note the file-scope caveat
+              // still holds for the second one -- `fileMenuContributions.tsx` does
+              // render real rows (a contributed row's app-owned `label`, straight to
+              // JSX), which is exactly why the exemption stays on the callee.
               '^warnContributionSkipped$',
               // `scrollInspector.ts`'s diagnostic sink. `devLog(tag, detail)` writes a
               // fixed-format line into a developer overlay -- `STORE.save 9020
@@ -1082,6 +1103,14 @@ export default [
               // for — `aliases` moves _total 1842 -> 1840 and changes no other file's
               // entry, so it hands nothing back.
               'aliases',
+              // `namespace: 'KiroCrewComposer'` — Lexical's editor-instance
+              // identifier (`createEditor({ namespace })`), used to tag devtools
+              // and error frames and matched by value; never rendered. Same
+              // lookup-key class as `key`/`navId` above. Measured under the
+              // `aliases` standard: one occurrence in the tree (the new
+              // LexicalComposerInput.tsx), zero baseline entries touched, so the
+              // exemption hands back no other file's debt.
+              'namespace',
               // `error` on a VALIDATION RESULT object (`{ ok: false, error }`) — the
               // same class as `errors.push` in `callees` above, and exempt for the same
               // reason. A user-facing failure message belongs in a toast or a rendered
@@ -1106,6 +1135,28 @@ export default [
           },
         },
       ],
+    },
+  },
+
+  // A URL-path-segment table: the core-owned first segments under
+  // `/api/apps/<app>/`, mirroring `CORE_APP_ROUTE_SEGMENTS` in `apps/manifest.py`.
+  // Route segments are a contract with the router, never copy — a translated
+  // `uninstall` does not localize anything, it silently un-reserves a core route and
+  // lets an app's manifest claim it.
+  //
+  // Scoped to this one file, and the file exists to be scopeable. A global
+  // `words.exclude` shape cannot express it: the values are bare lowercase words
+  // (`open`, `update`, `config`, `enable`), so the whole-value-anchored entry that
+  // would release them would equally release a button labelled exactly "Open". And
+  // releasing their previous home, `apps/fileMenuContributions.tsx`, would release the
+  // app-actions label and every other string in a module that DOES render copy. The
+  // set also sits under an ALL-CAPS declarator, so `eslint.i18n.strict.config.js`
+  // recovers it and `[added-lines]` charges the whole array on any edit to it.
+  // Keep `coreAppRoutes.ts` route segments only.
+  {
+    files: ['src/apps/coreAppRoutes.ts'],
+    rules: {
+      'i18next/no-literal-string': 'off',
     },
   },
 

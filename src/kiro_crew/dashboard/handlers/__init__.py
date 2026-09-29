@@ -91,6 +91,16 @@ from kiro_crew.dashboard.handlers.agents import (  # noqa: E402, F401
     api_slash_commands,
 )
 
+# ── Crew appearance library (handlers/appearances.py) ──
+from kiro_crew.dashboard.handlers.appearances import (  # noqa: E402, F401
+    api_appearance_delete,
+    api_appearance_detail,
+    api_appearance_slot,
+    api_appearances_import,
+    api_appearances_list,
+    api_appearances_petdex_fetch,
+)
+
 # ── Connections OAuth relay (handlers/connections.py) ──
 from kiro_crew.dashboard.handlers.connections import (  # noqa: E402, F401
     api_connections_cancel,
@@ -229,6 +239,8 @@ from kiro_crew.dashboard.handlers.mcp_apps import (  # noqa: E402, F401
 # ── Crew Members (handlers/members.py) ──
 from kiro_crew.dashboard.handlers.members import (  # noqa: E402, F401
     api_member_activity,
+    api_member_rules_get,
+    api_member_rules_put,
     api_member_thread,
     api_members,
 )
@@ -385,6 +397,7 @@ from kiro_crew.dashboard.handlers.sessions import (  # noqa: E402, F401
     api_session_tool_policy,
     api_sessions,
     api_sessions_clear,
+    api_sessions_clearable_count,
     api_sessions_context,
     api_sessions_health,
     api_sessions_memory,
@@ -483,6 +496,11 @@ from kiro_crew.dashboard.handlers.themes import (  # noqa: E402, F401
     api_themes_install,
 )
 
+# ── Browser UI preference backup (extracted to handlers/ui_prefs.py) ──
+from kiro_crew.dashboard.handlers.ui_prefs import (  # noqa: E402, F401
+    api_ui_prefs,
+)
+
 # ── Updates & Logs (extracted to handlers/updates.py) ──
 # NOTE: api_stream passes update_available= to status_snapshot (see updates.py)
 from kiro_crew.dashboard.handlers.updates import (  # noqa: E402, F401
@@ -516,6 +534,10 @@ from kiro_crew.dashboard.handlers.usage import (  # noqa: E402, F401
     api_kiro_usage,
     api_usage,
 )
+from kiro_crew.dashboard.handlers.wakatime import (  # noqa: E402, F401
+    api_wakatime_export,
+    api_wakatime_stats,
+)
 
 # ── Themes: validation/parsing core (extracted to theme_validate.py) ──
 from kiro_crew.dashboard.theme_validate import (  # noqa: E402, F401
@@ -526,6 +548,15 @@ from kiro_crew.dashboard.theme_validate import (  # noqa: E402, F401
     _strip_to_allowed_vars,
     _validate_theme_data,
 )
+
+# ── Conductor work ledger (handlers/work_ledger.py) ──
+# DELIBERATELY NOT IMPORTED HERE. ``kirocrew-work`` is an opt-in MCP server, so its
+# four handlers are an optional subsystem, and an eager import would put them on the
+# gateway boot path — which ``no-new-work-on-gateway-boot-path`` clause 5 forbids
+# ("gate the import, not just the handler"). ``server._deferred_work_ledger`` binds
+# the routes at boot and imports the module on the first request instead, exactly as
+# ``_deferred_session_control`` does for the feature-flagged session-control routes.
+
 
 # ── Prompts & Skills (extracted to handlers/prompts.py) ──
 
@@ -611,9 +642,9 @@ def _prompt_dir_entry(path: Path, root_real: Path, src: str) -> dict[str, Any] |
       the scoped read already refuses a hardlinked prompt outright, so a listing
       that offered one would advertise a file its own scope will not serve.
     * An unreadable file is NOT refused. It keeps its entry with an empty
-      description, exactly as before — a bad mode or a transient I/O error must
-      surface as the read path's own error, not as a prompt silently vanishing
-      from the user's library.
+      description: a bad mode or a transient I/O error must surface as the read
+      path's own error, not as a prompt silently vanishing from the user's
+      library.
     * The stem must satisfy ``_plain_stem_ok``, the single predicate create, the
       scoped read and both write verbs already address a prompt by. A stem it
       rejects is one every other verb on this API answers ``invalid_name`` for, so
@@ -875,6 +906,14 @@ from kiro_crew.dashboard.handlers.core import (  # noqa: E402, F401
     index,
     logo,
     pwa_file,
+)
+
+# Flagged-file delivery consent — owner-gated, and the ONLY writer of
+# ``file_delivery_consent.json``. No CLI counterpart, deliberately.
+from kiro_crew.dashboard.handlers.file_delivery_consent import (  # noqa: E402, F401
+    api_file_delivery_consent_delete,
+    api_file_delivery_consent_get,
+    api_file_delivery_consent_post,
 )
 from kiro_crew.dashboard.handlers.notifications_push import (  # noqa: E402, F401
     api_push_notification,

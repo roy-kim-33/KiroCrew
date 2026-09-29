@@ -1,11 +1,14 @@
 import { api } from '../../api/client'
 import { confirmedDelivered, readSendReceipt, SendReceiptBody } from '../../utils/sendDelivery'
 
-/** Stop waiting on a send's response. Reaching this bound means the request
- *  was received and only the reply is late: the turn is running and its output
- *  arrives over the WebSocket, not through this promise. It is NOT a failure
- *  signal, which is why the receipt below gives it its own status instead of
- *  folding it into the error shapes. */
+/** Stop waiting on a send's response. Reaching this bound says only that no
+ *  receipt arrived in time: usually the request was received and the reply is
+ *  late (the turn is running and its output arrives over the WebSocket, not
+ *  through this promise), but a POST that never reached the gateway looks the
+ *  same from here. Delivery is INDETERMINATE -- not a failure signal and not a
+ *  delivery receipt -- which is why the receipt below gives it its own status
+ *  (`response-late`) instead of folding it into either the accepted or the
+ *  error shapes. */
 export const SEND_ABORT_MS = 10_000
 
 /**
@@ -39,8 +42,16 @@ export const SEND_ABORT_MS = 10_000
  *                        optimistic row pending to avoid a duplicate, while a
  *                        caller that has already destroyed the only visible
  *                        copy may choose to recover it.
- * - `transport-error` -- the fetch itself rejected (offline, DNS, CORS). The
- *                        send never left, so restore-and-report is safe.
+ * - `transport-error` -- the fetch itself rejected without a response. Usually
+ *                        the request never left (offline, DNS, CORS), but a
+ *                        connection reset AFTER the server took the POST rejects
+ *                        the same way, so delivery is INDETERMINATE -- the
+ *                        request may have started a turn. What to do is
+ *                        call-site policy: a composer restores the text and
+ *                        reports (a visible duplicate beats a silent loss); a
+ *                        caller whose retry would destroy or duplicate work
+ *                        (a seeder deleting its slot) must not treat this as
+ *                        proof that nothing ran.
  */
 export type SendReceiptStatus =
   | 'dispatched'
@@ -68,6 +79,15 @@ export interface SendTurnOptions {
   message: string
   slot?: string
   meta?: Record<string, unknown>
+  /** "Act on this now": inject into the running turn instead of queueing
+   *  behind it (or, on an idle slot, skip the hold that parks a message behind
+   *  still-running sub-agents). A flag of THIS endpoint -- `/api/chat` reads
+   *  it -- not a new receipt shape: a steer comes back `dispatched`, `queued`
+   *  (demoted) or refused like any send, with `body.steered` saying which. */
+  steer?: boolean
+  /** The active colour theme, so a widget the turn renders inherits it. Sent
+   *  only by surfaces that own a theme (ChatPage); embeds and panes omit it. */
+  colorTheme?: string
 }
 
 /**
@@ -90,9 +110,10 @@ export async function sendTurn(opts: SendTurnOptions): Promise<SendReceipt> {
     const r = await api.sendChat(
       opts.message,
       opts.slot,
-      undefined,
+      opts.colorTheme,
       controller.signal,
       opts.meta,
+      opts.steer,
     )
     const { body, outcome } = await readSendReceipt(r)
     if (outcome === 'refused') return { status: 'refused', body, reason: typeof body.error === 'string' ? body.error : undefined }

@@ -1014,6 +1014,63 @@ class TestDirLinkShims:
         assert os.readlink(str(link)) == str(target)
 
 
+class TestPinDirectory:
+    """``pin_directory``: hold a directory so a child written by PATH stays put.
+
+    Every platform: the open refuses anything that is not a real directory.
+    Windows only: the held handle blocks rename/delete -- the property the
+    caller relies on when a same-UID watcher could otherwise swap the directory
+    for a junction between a check and a child process's open.
+    """
+
+    def test_a_real_directory_pins_and_releases(self, tmp_path):
+        target = tmp_path / "dir"
+        target.mkdir()
+        fd = pc.pin_directory(target)
+        try:
+            assert fd >= 0
+            assert stat.S_ISDIR(os.fstat(fd).st_mode)
+        finally:
+            os.close(fd)
+        # Released: the directory is ordinary again.
+        target.rename(tmp_path / "moved")
+
+    def test_a_file_at_the_name_is_refused(self, tmp_path):
+        regular = tmp_path / "f.txt"
+        regular.write_text("x")
+        with pytest.raises(NotADirectoryError):
+            pc.pin_directory(regular)
+
+    def test_a_link_at_the_name_is_refused_not_followed(self, tmp_path):
+        # A watcher's whole move is to put a link where the directory was; the
+        # pin must fail on it rather than pin the link's TARGET in its place.
+        target = tmp_path / "target"
+        target.mkdir()
+        link = tmp_path / "link"
+        pc.symlink_or_junction(target, link)
+        with pytest.raises(OSError):
+            pc.pin_directory(link)
+
+    @pytest.mark.skipif(not pc.IS_WINDOWS, reason="a held handle blocks rename only on Windows")
+    def test_a_pinned_directory_cannot_be_renamed_or_removed(self, tmp_path):
+        # The pin is on the DIRECTORY: its children can still be removed (the
+        # caller holds its own file open for that), but the directory itself
+        # can be neither renamed nor deleted until the handle is released.
+        target = tmp_path / "dir"
+        target.mkdir()
+        fd = pc.pin_directory(target)
+        try:
+            with pytest.raises(OSError):
+                target.rename(tmp_path / "swapped")
+            with pytest.raises(OSError):
+                target.rmdir()
+            assert target.is_dir()
+        finally:
+            os.close(fd)
+        target.rename(tmp_path / "swapped")
+        assert (tmp_path / "swapped").is_dir()
+
+
 # ---------------------------------------------------------------------------
 # POSIX-branch coverage for the new platform_compat helpers. The
 # tests below deliberately exercise the ``if IS_POSIX:`` / Linux ``/proc`` paths
@@ -4328,3 +4385,183 @@ class TestKillAndReap:
         with pytest.raises(asyncio.CancelledError):
             await task
         assert events == ["killed", "reap-started", "reaped"]
+
+
+class TestPublishDirNoreplace:
+    """#4767 round 9: workspace installs must never replace a raced empty
+    destination -- POSIX os.rename silently replaces an empty directory, so
+    the publish goes through the no-replace rename primitive."""
+
+    def test_publishes_into_absent_destination(self, tmp_path):
+        src = tmp_path / ".ws.staging-abc"
+        src.mkdir()
+        (src / "f.txt").write_text("x", encoding="utf-8")
+        dst = tmp_path / "ws"
+        pc.publish_dir_noreplace(src, dst)
+        assert (dst / "f.txt").read_text(encoding="utf-8") == "x"
+        assert not src.exists()
+
+    def test_refuses_an_existing_empty_destination(self, tmp_path):
+        """The exact race: an EMPTY directory at the destination survives."""
+        src = tmp_path / ".ws.staging-abc"
+        src.mkdir()
+        (src / "f.txt").write_text("x", encoding="utf-8")
+        dst = tmp_path / "ws"
+        dst.mkdir()  # a racer's just-created empty dir
+        before = dst.stat().st_ino
+        with pytest.raises((FileExistsError, OSError)):
+            pc.publish_dir_noreplace(src, dst)
+        assert dst.stat().st_ino == before, "the racer's directory was replaced"
+        assert src.exists(), "the staged tree was consumed by a refused publish"
+
+    def test_refuses_non_sibling_paths(self, tmp_path):
+        src = tmp_path / "a" / ".ws.staging-abc"
+        src.mkdir(parents=True)
+        dst = tmp_path / "b" / "ws"
+        (tmp_path / "b").mkdir()
+        if pc.IS_WINDOWS:
+            pytest.skip("sibling contract is POSIX-only (Windows uses os.rename)")
+        with pytest.raises(ValueError):
+            pc.publish_dir_noreplace(src, dst)
+
+    def test_fallback_without_renameat2_publishes_and_still_refuses_occupied(
+        self, tmp_path, monkeypatch
+    ):
+        """#4767 round 10: a host without renameat2 (glibc < 2.28, NFS/FUSE)
+        must not crash with NotImplementedError -- the mkdir-claim fallback
+        publishes into an absent destination and still refuses an existing
+        one, preserving the no-replace guarantee for creation races."""
+        if pc.IS_WINDOWS:
+            pytest.skip("fallback is POSIX-only (Windows os.rename never replaces)")
+
+        def _unsupported(*args, **kwargs):
+            raise NotImplementedError("filesystem lacks atomic no-replace rename")
+
+        monkeypatch.setattr(pc, "rename_noreplace", _unsupported)
+
+        # Publishes into an absent destination.
+        src = tmp_path / ".ws.staging-abc"
+        src.mkdir()
+        (src / "f.txt").write_text("x", encoding="utf-8")
+        dst = tmp_path / "ws"
+        pc.publish_dir_noreplace(src, dst)
+        assert (dst / "f.txt").read_text(encoding="utf-8") == "x"
+        assert not src.exists()
+
+        # Refuses an existing EMPTY destination; nothing is consumed.
+        src2 = tmp_path / ".ws2.staging-abc"
+        src2.mkdir()
+        dst2 = tmp_path / "ws2"
+        dst2.mkdir()  # a racer's just-created empty dir
+        before = dst2.stat().st_ino
+        with pytest.raises(FileExistsError):
+            pc.publish_dir_noreplace(src2, dst2)
+        assert dst2.stat().st_ino == before, "the racer's directory was replaced"
+        assert src2.exists(), "the staged tree was consumed by a refused publish"
+
+    def test_fallback_rename_failure_drops_the_claim(self, tmp_path, monkeypatch):
+        """#4767 round 11: when the fallback's rename fails, the empty mkdir
+        claim is removed so a retry is not permanently blocked, and the
+        staged tree is not consumed."""
+        if pc.IS_WINDOWS:
+            pytest.skip("fallback is POSIX-only")
+
+        def _unsupported(*args, **kwargs):
+            raise NotImplementedError("filesystem lacks atomic no-replace rename")
+
+        monkeypatch.setattr(pc, "rename_noreplace", _unsupported)
+
+        real_rename = os.rename
+
+        def _failing_rename(src, dst, **kwargs):
+            raise OSError(errno.EXDEV, "simulated cross-device rename failure")
+
+        src = tmp_path / ".ws.staging-abc"
+        src.mkdir()
+        (src / "f.txt").write_text("x", encoding="utf-8")
+        dst = tmp_path / "ws"
+        monkeypatch.setattr(os, "rename", _failing_rename)
+        try:
+            with pytest.raises(OSError):
+                pc.publish_dir_noreplace(src, dst)
+        finally:
+            monkeypatch.setattr(os, "rename", real_rename)
+        assert not dst.exists(), (
+            "the failed fallback left an orphaned empty claim that would "
+            "permanently block retries"
+        )
+        assert (src / "f.txt").exists(), "the staged tree was consumed by a failed publish"
+
+
+class TestOpenLockFile:
+    """GH-9248: acquiring a lock must not truncate the file it locks."""
+
+    def test_preserves_existing_content(self, tmp_path):
+        # The defect shape: open(path, "w") truncates BEFORE the lock is
+        # held, so a contending process can observe an empty lock file
+        # mid-acquire. The helper must open the file without touching its
+        # bytes. Content is read while the fd is OPEN but not LOCKED, and
+        # again after release — on Windows msvcrt region locks are
+        # MANDATORY, so a read while the lock is held answers EACCES and
+        # would test the platform's locking semantics instead of the
+        # helper's non-truncation property.
+        lock = tmp_path / "x.lock"
+        lock.write_text("holder-pid 1234")
+        from kiro_crew.platform_compat import file_lock, open_lock_file
+
+        with open_lock_file(lock) as fd:
+            assert isinstance(fd, int)
+            assert lock.read_text() == "holder-pid 1234"  # open did not truncate
+            with file_lock(fd, exclusive=True):
+                pass  # lockable with content present
+        assert lock.read_text() == "holder-pid 1234"  # intact after release
+
+    def test_creates_missing_file_and_is_lockable(self, tmp_path):
+        lock = tmp_path / "sub" / "y.lock"
+        lock.parent.mkdir(parents=True)
+        from kiro_crew.platform_compat import flock_exclusive, open_lock_file
+
+        with open_lock_file(lock) as fd:
+            with flock_exclusive(fd):
+                pass
+        assert lock.exists()
+        assert lock.read_bytes() == b""
+
+    def test_no_lock_site_opens_truncating(self):
+        # CONTRACT (the work-ledger fix's test shape, applied fleet-wide): grep the source
+        # tree for a truncating open whose descriptor is handed to a
+        # file_lock-family acquire within the next two lines. Every site was
+        # converted to open_lock_file in this change; a new offender fails
+        # here with its file and line.
+        import kiro_crew
+
+        src_root = os.path.dirname(os.path.abspath(kiro_crew.__file__))
+        # deploy/pending.py and deploy/profiles.py are owned by an in-flight
+        # deploy-locks fix; drop the exemptions once it merges — the scan
+        # will then enforce those sites too.
+        exempt = {
+            os.path.join(src_root, "deploy", "pending.py"),
+            os.path.join(src_root, "deploy", "profiles.py"),
+        }
+        offenders = []
+        open_w = re.compile(r"""\bopen\([^)]*["']wb?["']\)""")
+        acquire = re.compile(r"\b(file_lock|flock_exclusive|acquire_lock)\(\s*\w+\.fileno\(\)")
+        for dirpath, _dirnames, filenames in os.walk(src_root):
+            for name in filenames:
+                if not name.endswith(".py"):
+                    continue
+                path = os.path.join(dirpath, name)
+                if path in exempt:
+                    continue
+                with open(path, encoding="utf-8", errors="replace") as fh:
+                    lines = fh.readlines()
+                for i, line in enumerate(lines):
+                    if not open_w.search(line):
+                        continue
+                    window = "".join(lines[i + 1 : i + 3])
+                    if acquire.search(window):
+                        offenders.append(f"{path}:{i + 1}")
+        assert not offenders, (
+            "lock files opened truncating before the acquire (GH-9248); "
+            "use platform_compat.open_lock_file: " + ", ".join(offenders)
+        )

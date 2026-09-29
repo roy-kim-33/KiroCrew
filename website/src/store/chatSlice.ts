@@ -7,6 +7,7 @@ import { resolveDefaultColor } from '../utils/sessionColors'
 import { isChatPageSurface } from '../utils/channelOrigin'
 import { isSystemNoticeKind } from '../lib/systemNotice'
 import { isStopEvent } from '../lib/stopEvent'
+import { isNoteRow } from '../lib/noteContract'
 import { normalizeRunSessionKey } from '../apps/workflows/runModel'
 import { gcSessionStorage } from '../utils/storageGc'
 import type { RootState } from './index'
@@ -895,6 +896,21 @@ interface ChatState {
    *  list, which must. */
   slotsSnapshotSeen: boolean
   stopPressedAt: Record<string, number | null>
+  /** Per-slot count of turn STARTS this tab has seen: a non-steer user frame,
+   *  an inject row (cron / continue / auto-nudge), a local send, the active
+   *  slot's server snapshot flipping to running, and the FIRST busy frame
+   *  (chunk / tool / compacting) after idle. That last one matters: a user
+   *  row typed in another dashboard tab is not broadcast (state.py skips
+   *  `role == "user"` unless a channel replays it), so a background pane can
+   *  see a new turn only as its chunks — without counting them, a settlement
+   *  about the previous turn would idle the new one unchallenged. A frame of
+   *  a turn already counted does not bump (the slot is no longer idle).
+   *  Captured before a `/stop` request and, by `ChatPane`, on every render in
+   *  which the snapshot reports running, then checked by
+   *  `settleStopNotRunning` and the background branch of
+   *  `syncSlotRunningFromServer`, so an answer or snapshot that was true for
+   *  THAT turn cannot idle a NEWER one (#9547, GPT rounds 2 and 7). */
+  runEpoch: Record<string, number>
   /** Pending ask_question cards keyed by slot. Keyed (rather than a single
    *  card) so concurrent ask_question calls from two slots cannot evict each
    *  other — the losing agent would block until its timeout. */
@@ -1017,6 +1033,7 @@ const initialState: ChatState = {
   followups: {},
   folderSuggestions: {},
   stopPressedAt: {},
+  runEpoch: {},
   pendingTurnSlot: null,
 }
 
@@ -1039,6 +1056,14 @@ function syncOriginRun(state: ChatState, slot: string, runState: SlotState): voi
   const o = state.slotSwitchOrigin
   if (!o || safeKey(o.key) !== safeKey(slot)) return
   o.run = { state: runState, running: runState !== 'idle', stopping: runState === 'stopping' }
+}
+
+/** Count one turn START for `slot` (see `ChatState.runEpoch`). */
+function bumpRunEpoch(state: ChatState, slot: string | null): void {
+  if (!slot || isUnsafeKey(slot)) return
+  if (!state.runEpoch) state.runEpoch = {}
+  const k = safeKey(slot)
+  state.runEpoch[k] = (state.runEpoch[k] ?? 0) + 1
 }
 
 /** Load a slot's cached activity-panel state (or the empty defaults) into the
@@ -1091,6 +1116,14 @@ function applyNonActiveFrame(
     return
   }
   if (role === 'chunk') {
+    // Idempotency guard (direct/non-batched path): drop a replayed chunk so a
+    // redelivered seq is not appended twice. Batched frames are pre-deduped by
+    // the WS flush buffer (see useWebSocket), matching the missedChunkMarker
+    // `!batched` gating below.
+    if (!batched && seq !== undefined && run.lastChunkSeq !== undefined && seq <= run.lastChunkSeq) {
+      return
+    }
+    if (run.state === 'idle') bumpRunEpoch(state, slot)
     run.state = 'streaming'
     syncOriginRun(state, slot, 'streaming')
     // Drop only the EMPTY thinking placeholder (mirror the active
@@ -1142,7 +1175,7 @@ function applyNonActiveFrame(
     }
     return
   }
-  if (role === 'compacting') { run.state = 'compacting'; syncOriginRun(state, slot, 'compacting'); return }
+  if (role === 'compacting') { if (run.state === 'idle') bumpRunEpoch(state, slot); run.state = 'compacting'; syncOriginRun(state, slot, 'compacting'); return }
   // Permission rows carry request_id/tool_input inside `cls` (JSON); lift it
   // here — BEFORE the guard — so the identity comparison sees the same
   // `tool_call_id` the stored row has.
@@ -1163,7 +1196,14 @@ function applyNonActiveFrame(
   // placed after the redelivery guard so a replayed frame cannot clear a
   // live card (see dropStaleStatelessQuestion).
   dropStaleStatelessQuestion(state, slot, role)
+  // An inject row (cron, continue, auto-nudge) starts a turn like a user
+  // message does — count it (see `ChatState.runEpoch`). A `/note` is also an
+  // inject row but is PASSIVE: it starts no turn, so counting it would make a
+  // Stop settlement captured a moment earlier read as stale and leave the pane
+  // falsely busy (GPT round 10).
+  if (role === 'inject' && !isNoteRow({ cls, meta })) bumpRunEpoch(state, slot)
   if (role === 'tool') {
+    if (run.state === 'idle') bumpRunEpoch(state, slot)
     run.state = 'tool_running'
     syncOriginRun(state, slot, 'tool_running')
     let insertIdx = msgs.length
@@ -1192,6 +1232,7 @@ function applyNonActiveFrame(
     // A steered message does not start a new turn — skip the "stale permissions"
     // cleanup so the approval bar remains visible and answerable (#1667).
     if (!meta?.steer) {
+      bumpRunEpoch(state, slot)
       sa.toolLog = []
       for (const m of msgs) {
         if (m.role === 'permission' && !m.meta?.resolved) { if (m.meta) m.meta.resolved = 'rejected'; else m.meta = { resolved: 'rejected' } }
@@ -1224,6 +1265,10 @@ export const selectSlotMessages = (state: RootState, slot: string): ChatMessage[
   slot === state.chat.activeSlot ? state.chat.messages : (state.chat.slotMessages[slot] ?? EMPTY_MESSAGES)
 export const selectSlotStreamState = (state: RootState, slot: string): SlotState =>
   slot === state.chat.activeSlot ? state.chat.slotState : (state.chat.slotRun[slot]?.state ?? 'idle')
+/** The turn-start count for `slot` (see `ChatState.runEpoch`): the identity a
+ *  settlement captures so a late answer about one turn cannot idle the next. */
+export const selectSlotRunEpoch = (state: RootState, slot: string): number =>
+  state.chat.runEpoch?.[safeKey(slot)] ?? 0
 
 const EMPTY_TOOLLOG: ToolActivity[] = []
 /** Per-slot tool log, falling back to the global active mirror. */
@@ -3029,24 +3074,53 @@ export const loadOlderMessages = createAsyncThunk(
   },
 )
 
-export const requestStop = createAsyncThunk(
+/** Shape of the `/stop` reply this thunk reads. `info` is set only on the
+ *  backend's no-op branch (`not running` / `stop already in progress`); a real
+ *  stop answers a bare `{ok: true}`. */
+type StopReply = { ok?: boolean; info?: string; already_stopping?: boolean; error?: string; code?: string } | null | undefined
+
+/** A Stop press's failure, for the host that rendered the button: `null` when
+ *  the request landed (a real stop, an in-flight cancel, a settled no-op, or a
+ *  debounced repeat), otherwise the error message the host must SHOW (#9547
+ *  round 2): a swallowed failure is indistinguishable from the dead Stop
+ *  button this fix exists to remove. */
+export type StopFailure = { error: string } | null
+
+export const requestStop = createAsyncThunk<StopFailure, { slotId: string; force: boolean }>(
   'chat/requestStop',
-  async ({ slotId, force }: { slotId: string; force: boolean }, { getState, dispatch }) => {
+  async ({ slotId, force }, { getState, dispatch }) => {
     const state = (getState() as { chat: ChatState }).chat
     if (!force) {
       const lastPress = state.stopPressedAt[slotId] ?? 0
-      if (Date.now() - lastPress < SOFT_STOP_DEBOUNCE_MS) return
+      if (Date.now() - lastPress < SOFT_STOP_DEBOUNCE_MS) return null
     }
+    // The turn this press is about. A `not running` answer that lands after a
+    // NEWER turn started on the slot must not idle that turn.
+    const epoch = state.runEpoch?.[safeKey(slotId)] ?? 0
     dispatch(chatSlice.actions.setStopPressedAt({ slotId, ts: Date.now() }))
+    let reply: StopReply
     try {
-      if (force) {
-        await api.stopChatSlotForce(slotId)
-      } else {
-        await api.stopChatSlot(slotId)
-      }
-    } catch {
+      reply = (force ? await api.stopChatSlotForce(slotId) : await api.stopChatSlot(slotId)) as StopReply
+    } catch (e) {
       dispatch(chatSlice.actions.setStopPressedAt({ slotId, ts: 0 }))
+      return { error: e instanceof Error ? e.message : String(e) }
     }
+    // A 2xx can still carry a refusal — a peer-bound slot whose crew could
+    // not be reached answers `{ok: false, error, code}` — and `j()` only
+    // throws on non-2xx. That is a failed stop the host must show too.
+    if (reply && reply.ok === false) {
+      dispatch(chatSlice.actions.setStopPressedAt({ slotId, ts: 0 }))
+      return { error: reply.error || reply.code || 'stop refused' }
+    }
+    // The backend found no turn on the slot. Its answer is authoritative and
+    // the client's busy view is what was wrong, so settle it — otherwise the
+    // Stop button stays, every press repeats this no-op, and the user reads
+    // it as "Stop does not work" (#9547). `already_stopping` is the other
+    // no-op (a cancel already in flight) and changes nothing here.
+    if (reply?.info === 'not running' && !reply.already_stopping) {
+      dispatch(chatSlice.actions.settleStopNotRunning({ slot: slotId, epoch }))
+    }
+    return null
   },
 )
 
@@ -3874,7 +3948,8 @@ const chatSlice = createSlice({
      *  already broadcast a `queue_push` — including the turn teardown, which is
      *  why the requeued arm does not re-broadcast. That card owns the text, so
      *  the bubble is REMOVED or the same message renders twice. A receipt with
-     *  neither flag raced `chat_done` onto a new turn: only the flag drops.
+     *  neither flag raced `chat_done` onto a new turn: only the flag drops. No
+     *  receipt in time: the caller takes the `queued` (drop) arm -- see below.
      *
      *  Both modes need the bubble still `optimistic` — once an echo or
      *  `confirmOptimisticSend` cleared that, the server owns the row. Scans BOTH
@@ -3889,6 +3964,12 @@ const chatSlice = createSlice({
           const m = msgs[i]
           if (m.role !== 'user' || m.meta?.sendId !== sendId) continue
           if (!m.meta?.steer || !m.meta?.optimistic) return true
+          // The drop arm. Also taken for a steer whose receipt never came (the
+          // transport's deadline aborted the POST and the text went back to the
+          // composer): a bubble left standing would read as delivered, and a
+          // late `steer_push` echo that does arrive re-creates the row from the
+          // server's copy (reconcileOptimisticEcho appends when no row carries
+          // the sendId).
           if (outcome === 'queued') { msgs.splice(i, 1); return true }
           const meta = { ...(m.meta || {}) }
           delete meta.steer
@@ -3974,16 +4055,62 @@ const chatSlice = createSlice({
     startLocalTurn(state, action: PayloadAction<string>) {
       const slot = action.payload
       state.pendingTurnSlot = slot
+      bumpRunEpoch(state, slot)
       if (slot === state.activeSlot) state.slotRunning = true
+    },
+    /** The inverse of `startLocalTurn` for a send that did NOT start a turn
+     *  (refused, or never left). Slot-keyed like its counterpart: only the slot
+     *  the send was for loses its pending mark, and only when that slot is the
+     *  active one does the visible footer change -- a failure that lands after
+     *  the user switched to a RUNNING session must not clear that session's
+     *  running state (which `setSlotRunning(false)` would). */
+    endLocalTurn(state, action: PayloadAction<string>) {
+      const slot = action.payload
+      if (state.pendingTurnSlot === slot) state.pendingTurnSlot = null
+      if (slot === state.activeSlot) state.slotRunning = false
     },
     /** Reconcile the active slot's running state from a WS slots broadcast.
      *  running=true is always trusted (also catches Slack/cron-initiated turns);
      *  running=false is ignored while a local turn is pending confirmation, since
      *  the snapshot may predate the send. Turn end is owned by _done/refreshSlot. */
-    syncSlotRunningFromServer(state, action: PayloadAction<{ slot: string; running: boolean; stopping: boolean }>) {
-      const { slot, running, stopping } = action.payload
-      if (slot !== state.activeSlot) return
+    syncSlotRunningFromServer(state, action: PayloadAction<{ slot: string; running: boolean; stopping: boolean; epoch?: number }>) {
+      const { slot, running, stopping, epoch } = action.payload
+      if (slot !== state.activeSlot) {
+        // A BACKGROUND slot (a member DM thread, a split pane) keeps its run
+        // state in `slotRun`, written only by ordered live frames (chunk /
+        // tool -> busy, _done -> idle). Nothing else ever idled it: a `_done`
+        // that never reached this tab — a turn that died with the gateway, a
+        // frame lost across a socket drop — left the pane busy for good, so
+        // its composer kept offering a Stop button for a turn the backend had
+        // long finished, and every press came back `not running` (#9547).
+        // The slots snapshot IS the server's answer, so take the idle
+        // direction from it. Only that direction: the running direction stays
+        // with the live frames (see warmSlotCache.fulfilled for why a snapshot
+        // may not promote a pane to busy).
+        if (isUnsafeKey(slot)) return
+        if (running) return
+        // The snapshot answered about the turn the caller OBSERVED running.
+        // A turn that started since — its first live frame bumped the epoch —
+        // is not that turn, and idling it here would finalize its streaming
+        // row mid-reply and split it (GPT round 7). Same guard as
+        // `settleStopNotRunning`.
+        if (epoch !== undefined && (state.runEpoch?.[safeKey(slot)] ?? 0) !== epoch) return
+        // Optional: tests and older persisted shapes preload a partial state.
+        const run = state.slotRun?.[safeKey(slot)]
+        if (!run || run.state === 'idle') return
+        // `stopping` is ignored on purpose: a slot that is not running has
+        // nothing left to stop, whatever flag the cancel left behind.
+        run.state = 'idle'
+        run.lastChunkSeq = undefined
+        syncOriginRun(state, slot, 'idle')
+        // The `_done` this settlement stands in for would also have finalized
+        // the trailing streaming row; a reply left as `streaming` hides its
+        // final-only rendering and actions (GPT round 3).
+        finalizeTrailingStreaming(state.slotMessages?.[safeKey(slot)] ?? [])
+        return
+      }
       if (running) {
+        if (!state.slotRunning) bumpRunEpoch(state, slot)
         state.slotRunning = true
         state.slotStopping = stopping
         state.pendingTurnSlot = null
@@ -3995,6 +4122,43 @@ const chatSlice = createSlice({
       // prior turn can't falsely show a "stopping" state on the new turn.
     },
     setSlotStopping(state, action: PayloadAction<boolean>) { state.slotStopping = action.payload },
+    /** The backend answered a Stop press with `not running`: nothing is in
+     *  flight on that slot, so whatever made this tab think otherwise is
+     *  stale. Settle the client's own view to match, on whichever path holds
+     *  it (the active mirror or a background slot's `slotRun`), so the
+     *  composer stops offering a Stop button that can never do anything and
+     *  the press has a visible result (#9547). */
+    settleStopNotRunning(state, action: PayloadAction<{ slot: string; epoch?: number }>) {
+      const { slot, epoch } = action.payload
+      if (isUnsafeKey(slot)) return
+      // A turn that STARTED after the press was made is not the one the
+      // backend answered about: a delayed reply must not idle it.
+      if (epoch !== undefined && (state.runEpoch?.[safeKey(slot)] ?? 0) !== epoch) return
+      if (slot === state.activeSlot) {
+        // A send still awaiting its first frame owns this slot's running state:
+        // the backend answered "not running" because the turn had not been
+        // registered yet, not because it is gone. Settling here would reopen
+        // the composer mid-send and invite a duplicate turn; the same guard
+        // syncSlotRunningFromServer applies to a stale snapshot applies to this
+        // answer. startLocalTurn/endLocalTurn and the first live frame own the
+        // mark's lifecycle.
+        if (state.pendingTurnSlot === slot) return
+        state.slotRunning = false
+        state.slotStopping = false
+        state.slotState = 'idle'
+        state.lastChunkSeq = undefined
+        finalizeTrailingStreaming(state.messages)
+        return
+      }
+      const run = state.slotRun?.[safeKey(slot)]
+      if (!run || run.state === 'idle') return
+      run.state = 'idle'
+      run.lastChunkSeq = undefined
+      syncOriginRun(state, slot, 'idle')
+      // Stand-in for the `_done` that never came: finalize the trailing
+      // streaming row as that frame would have (GPT round 3).
+      finalizeTrailingStreaming(state.slotMessages?.[safeKey(slot)] ?? [])
+    },
     setStopPressedAt(state, action: PayloadAction<{ slotId: string; ts: number }>) {
       if (isUnsafeKey(action.payload.slotId)) return
       state.stopPressedAt[safeKey(action.payload.slotId)] = action.payload.ts
@@ -4997,6 +5161,14 @@ const chatSlice = createSlice({
       }
       // WS chunk — accumulate into streaming message, preserve rawText
       if (role === 'chunk') {
+        // Idempotency guard (direct/non-batched path): drop a replayed chunk so a
+        // redelivered seq is not appended twice. Batched frames are pre-deduped by
+        // the WS flush buffer (see useWebSocket), matching the missedChunkMarker
+        // `!batched` gating below.
+        if (!batched && seq !== undefined && state.lastChunkSeq !== undefined && seq <= state.lastChunkSeq) {
+          return
+        }
+        if (state.slotState === 'idle') bumpRunEpoch(state, slot)
         state.slotState = 'streaming'
         state._wsChunkedDuringFetch = true
         // Drop only the empty "Thinking…" placeholder; keep content-bearing
@@ -5055,6 +5227,7 @@ const chatSlice = createSlice({
       // Compacting — block input, show footer indicator (no visible message)
       if (role === 'compacting') {
         if (action.payload.slot && action.payload.slot !== state.activeSlot) return
+        if (state.slotState === 'idle') bumpRunEpoch(state, slot)
         state.slotState = 'compacting'
         state.slotRunning = true
         return
@@ -5090,8 +5263,12 @@ const chatSlice = createSlice({
       // placed after the redelivery guard so a replayed frame cannot clear a
       // live card (see dropStaleStatelessQuestion).
       dropStaleStatelessQuestion(state, slot, role)
+      // An inject row starts a turn like a user message does (see runEpoch);
+      // a passive `/note` does not (GPT round 10).
+      if (role === 'inject' && !isNoteRow({ cls, meta })) bumpRunEpoch(state, slot)
       // Tool call — update state, insert before streaming message
       if (role === 'tool') {
+        if (state.slotState === 'idle') bumpRunEpoch(state, slot)
         state.slotState = 'tool_running'
         // Insert tool before any trailing streaming message so
         // chat_segment can still find and finalize it with redacted text.
@@ -5127,6 +5304,7 @@ const chatSlice = createSlice({
         // A steered message does not start a new turn — skip the "stale permissions"
         // cleanup so the approval bar remains visible and answerable (#1667).
         if (!meta?.steer) {
+          bumpRunEpoch(state, slot)
           state.toolLog = []
           // Auto-resolve any stale permissions from previous turn so they don't block the new turn
           for (const m of state.messages) {
@@ -5185,9 +5363,14 @@ const chatSlice = createSlice({
       const cached = state.slotMessages[slot]
       if (cached) apply(cached)
     },
-    /** Remove the first queued message matching content and append a user bubble at the end. */
-    removeQueuedMessage(state, action: PayloadAction<{ slot: string; content: string; queue_id?: string }>) {
-      const { slot, content, queue_id } = action.payload
+    /** Remove the first queued message matching content and append a user bubble at the end.
+     *  The frame's `meta` (the entry's attachment lists, `files` / `dirs`) rides
+     *  onto the rebuilt row: no `chat_message` echo follows for a user row, so
+     *  this rebuild IS the row until the next reload, and without the lists the
+     *  renderer resolves `[attached_file N]` markers by whitespace -- a spaced
+     *  path (`/tmp/My Report.pdf`) truncates to `/tmp/My`. */
+    removeQueuedMessage(state, action: PayloadAction<{ slot: string; content: string; queue_id?: string; meta?: Record<string, unknown> }>) {
+      const { slot, content, queue_id, meta } = action.payload
       const msgs = slot === state.activeSlot ? state.messages : state.slotMessages[slot]
       if (!msgs) return
       const idx = queue_id
@@ -5196,7 +5379,7 @@ const chatSlice = createSlice({
       if (idx >= 0) {
         const ts = msgs[idx].ts
         msgs.splice(idx, 1)
-        msgs.push({ role: 'user', content, cls: 'msg msg-u', ts })
+        msgs.push({ role: 'user', content, cls: 'msg msg-u', ts, ...(meta && Object.keys(meta).length ? { meta } : {}) })
         // Deliberately NO card retirement here. Three review rounds each found
         // a different way this path could retire the wrong card (system queue
         // items hydrated as indistinguishable rows; duplicate rows from the
@@ -6050,7 +6233,7 @@ const chatSlice = createSlice({
 
 export const {
   setActiveSlot, clearSlotState, setPendingInput, setAgentSwitchNotice, clearUnresumableResume, setQuestionCard, retireStatelessQuestion, clearQuestionCard, setQuestionDraft, resolveQuestionCard, setFollowupCard, clearFollowupCard, dismissFollowupItem, setFolderSuggestion, clearFolderSuggestion, ageFolderSuggestion, appendMessage, appendSlotMessage, updateStreamingMessage, finalizeAssistant,
-  removeThinking, confirmOptimisticSend, resolveOptimisticSteer, removeByApprovalId, resolveByApprovalId, clearPendingPermissions, setSlotRunning, setSlotStopping, startLocalTurn, syncSlotRunningFromServer, setSlotState, setSlotStatusDetail, setStopPressedAt, clearMessages, clearSlotCache, truncateAfterIndex, replaceMessages, hydrateSlotMessages, sseChatMessage, sseChatMessageUpdate, sseChatMessagePatchByTs, sseThinkingChunk, removeQueuedMessage, appendQueuedMessage, cancelQueuedMessage, editQueuedMessage, reorderQueuedMessages,
+  removeThinking, confirmOptimisticSend, resolveOptimisticSteer, removeByApprovalId, resolveByApprovalId, clearPendingPermissions, setSlotRunning, setSlotStopping, settleStopNotRunning, startLocalTurn, endLocalTurn, syncSlotRunningFromServer, setSlotState, setSlotStatusDetail, setStopPressedAt, clearMessages, clearSlotCache, truncateAfterIndex, replaceMessages, hydrateSlotMessages, sseChatMessage, sseChatMessageUpdate, sseChatMessagePatchByTs, sseThinkingChunk, removeQueuedMessage, appendQueuedMessage, cancelQueuedMessage, editQueuedMessage, reorderQueuedMessages,
   sseContextUsage, setVoicePlaying, setVoiceAudio,
   toggleActivity, openActivityToTab, openActivityPanel, openActivityToTool, clearFocusToolCallId, requestSlotReveal, clearSlotReveal, clearSubagentsForSnapshot, sseSubagentPending, markSubagentApproving, sseSubagentSpawn, sseSubagentTool, sseSubagentStalled, sseSubagentRetrying, sseSubagentDone, sseSubagentQueued,
   sseSubagentBatchUpdate, sseSubagentBatchChunks, selectSubagent, clearTerminalSubagents,

@@ -74,6 +74,31 @@ jobs:
           # merely NAMES `shell=True` to explain why it is avoided must not be
           # flagged -- validated against commit 1d78b24e3, which did exactly
           # that). Without this filter the gate fires on its own documentation.
+          # Honour an explicit, REASONED waiver BEFORE prose is stripped below,
+          # because one of its two forms IS a whole-line comment.
+          #
+          # The matchers further down are textual, so they cannot see that a
+          # POSIX primitive already sits behind an `IS_WINDOWS` early return, or
+          # that a literal names the system bin dirs a procfs-only probe
+          # compares against. Both are already what the finding tells an author
+          # to do, so the gate fires on code that is correct, and the only
+          # alternative it ships is the `posix-only-approved` LABEL -- which
+          # exempts the ENTIRE pull request and leaves nothing behind in the
+          # tree. A marker states its reason where the next reader is, survives
+          # in the diff, and leaves every other line in the same file gated.
+          #
+          # Two forms, because a long reason does not always fit beside the code
+          # it explains: trailing (`code  # posix-only: why`) waives that line,
+          # and a whole-line `# posix-only: why` waives the line beneath it.
+          # A bare marker buys nothing -- the reason after the colon must be
+          # non-empty.
+          added="$(printf '%s\n' "$added" | awk '
+            /^\+[[:space:]]*#[[:space:]]*posix-only:[[:space:]]*[^[:space:]]/ { skip = 1; next }
+            /#[[:space:]]*posix-only:[[:space:]]*[^[:space:]]/                { next }
+            skip                                                             { skip = 0; next }
+                                                                             { print }
+          ' || true)"
+
           added="$(printf '%s\n' "$added" | grep -vE '^\+[[:space:]]*#' | grep -vF '``' || true)"
 
           if [ -z "$added" ]; then

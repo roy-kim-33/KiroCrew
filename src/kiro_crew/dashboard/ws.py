@@ -16,7 +16,11 @@ from kiro_crew import shutdown_event
 from kiro_crew.dashboard.chat_utils import effective_session_key, subagent_event_slot
 from kiro_crew.dashboard.handlers.updates import status_update_fields
 from kiro_crew.dashboard.origin import check_origin
-from kiro_crew.dashboard.state import DashboardState, _safe_folder_tree
+from kiro_crew.dashboard.state import (
+    DashboardState,
+    _safe_folder_tree,
+    _slots_serialization_note,
+)
 from kiro_crew.dashboard.ws_event_scope import (
     _audit_allow,
     _audit_deny,
@@ -154,8 +158,8 @@ def _status_frame(
     to suppress that, and the two keys are then overwritten with the true
     cached values — which are ``None`` (rendered as a loading skeleton) until
     the first successful refresh. The overwrite half is load-bearing: without
-    it the sentinel 0 ships as an authoritative count, which is the false-zero
-    #7204 fixes. Module-level (not a closure) so a test can pin exactly that.
+    it the sentinel 0 ships as an authoritative count — a false zero. Module-level
+    (not a closure) so a test can pin exactly that.
     """
     return {
         **state.status_snapshot(
@@ -201,15 +205,15 @@ def _subagent_replay_has_owner(frame: object) -> bool:
 def build_subagent_snapshot(a: Any, *, now: float | None = None) -> dict:
     """Build the ``subagent_snapshot`` replay frame's ``data`` for one agent.
 
-    Extracted from the reconnect handler so the frame's CONTENTS can be
-    asserted directly — the handler around it needs a live aiohttp WS, which is
-    why the omission this fixes went unnoticed.
+    Separate from the reconnect handler so the frame's CONTENTS can be asserted
+    directly — the handler around it needs a live aiohttp WS, so a missing field
+    there is easy to miss.
 
     ``idle_secs`` is the span that justifies the stall badge. The live
-    ``subagent_stalled`` event carries it; this replay frame did not, so ANY
-    reconnect during an active stall degraded the row to the plain
-    "no activity" wording that was only ever meant for a gateway too old to
-    send the field (#3929).
+    ``subagent_stalled`` event carries it and this replay frame must too:
+    without it ANY reconnect during an active stall degrades the row to the
+    plain "no activity" wording, which is only meant for a gateway too old to
+    send the field.
 
     It is computed at replay time rather than replaying the original transition
     value: by reconnect the agent has usually been idle longer than it was when
@@ -295,9 +299,9 @@ async def _load_status_counts(
     the same total ``/api/status`` and the SSE updates path report via
     ``status_snapshot``'s default (those two callers still compute it inline
     on the loop; only this path offloads). Counting only ``lessons.load_all()``
-    here made the pusher's cached value override the correct default with the
-    JSONL-only half, so the Overview card showed 0 on hosts whose lessons
-    live in the vector store (issue #7204).
+    here would let the pusher's cached value override the correct default with
+    the JSONL-only half, so the Overview card would show 0 on hosts whose
+    lessons live in the vector store.
 
     Each count is guarded INDEPENDENTLY: on failure that component falls back
     to its ``fallback`` half while the other keeps its fresh value — the
@@ -309,7 +313,7 @@ async def _load_status_counts(
     ``None`` means UNKNOWN, never 0: the pusher seeds its cache with ``None``
     so a component that has never refreshed successfully is published as
     ``null`` (the dashboard renders a loading skeleton) instead of an
-    authoritative-looking 0 — the exact false-zero #7204 fixes. ``error``
+    authoritative-looking 0. ``error``
     joins each failed component's exception TYPE name (``None`` on full
     success) so the operator-visible warning can name the cause without
     leaking store paths (``str(OSError)`` embeds its filename); it never
@@ -537,7 +541,10 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
         schedule_check_refresh,
         schedule_visibility_refresh,
     )
-    from kiro_crew.platform.context import governance_generation
+    from kiro_crew.platform.governance_profiles import (
+        governance_answer_generation,
+        poll_profiles_fresh,
+    )
 
     owner_request = is_owner_dashboard_request(request)
     ws = web.WebSocketResponse(heartbeat=30)
@@ -608,12 +615,19 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
 
     # Push current slots immediately so sidebar populates without waiting.
     # App tokens get only the slots their manifest scope allows.
-    # Read the ceiling generation ONCE here and seed both the initial frame and
-    # the refresh loop's baseline from it. Two independent reads would leave a
+    # Read the governance-answer generation ONCE here and seed both the initial frame
+    # and the refresh loop's baseline from it. Two independent reads would leave a
     # gap: a ceiling swapped between them is already the loop's baseline, so the
     # loop never pushes, while the client still holds the number the frame sent —
     # the change would be missed until an unrelated slot mutation.
-    initial_ceiling_generation = governance_generation()
+    #
+    # This token covers the PROFILE layer as well as the ceiling. Watching the
+    # ceiling counter alone would leave an operator's tightening of a capability in
+    # a local profile file enforced on the next decision but never invalidating the
+    # dashboard's cached answer, so the UI would keep offering a withdrawn entry
+    # until the 30s staleness window. The local is named for the answer, not the
+    # ceiling, because it is not ceiling-only.
+    initial_answer_generation = governance_answer_generation()
     try:
         is_dashboard_user = ws.get("_is_dashboard_user", False)
         all_slots = state.serialize_slots(
@@ -640,7 +654,7 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
         # Seed the folder tree on the CONNECT-TIME push (dashboard users only) —
         # this is the frame that populates the sidebar on a cold page load, so it
         # is where the client must receive `folders` to group sessions on the
-        # first paint (issue #4127). The broadcast path (_do_slots_broadcast) also
+        # first paint. The broadcast path (_do_slots_broadcast) also
         # carries it for live folder create/rename/move, but on an idle-gateway
         # load no broadcast fires before GET /api/chat/folders resolves, so
         # without this the ungrouped→regrouped flicker survives. App tokens are
@@ -662,17 +676,30 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
             # initial push writes to the socket directly -- so record it here
             # or it goes unrecorded entirely.
             _audit_grant_quietly(ws_app, "slots_yolo")
-        await ws.send_json(
-            {
-                "type": "slots",
-                "data": slots_data,
-                **envelope_extras,
-                # Seed the client's generation baseline so a later change is
-                # detectable as a change rather than as a first sighting.
-                "gitlabHostsGeneration": gitlab_hosts_generation(),
-                "governanceGeneration": initial_ceiling_generation,
-            }
-        )
+        snapshot_frame = {
+            "type": "slots",
+            "data": slots_data,
+            **envelope_extras,
+            # Seed the client's generation baseline so a later change is
+            # detectable as a change rather than as a first sighting.
+            "gitlabHostsGeneration": gitlab_hosts_generation(),
+            "governanceGeneration": initial_answer_generation,
+        }
+        # Same offender diagnostic as the slots broadcast.
+        # ``send_json`` is ``send_str(dumps(data))``, so dumping here is
+        # byte-identical on the healthy path. This whole connect block sits
+        # under ``except Exception: pass``, so a note alone would vanish with
+        # the swallowed exception — log the failure too: a client whose
+        # snapshot dies here shows an empty sidebar with zero evidence
+        # otherwise. The exception still propagates (and is swallowed)
+        # exactly as before.
+        try:
+            snapshot_payload = json.dumps(snapshot_frame)
+        except (TypeError, ValueError) as exc:
+            exc.add_note(_slots_serialization_note(slots_data, path="ws-connect-snapshot"))
+            logger.warning("slots connect snapshot failed to serialize", exc_info=True)
+            raise
+        await ws.send_str(snapshot_payload)
         if owner_request or is_dashboard_user:
             # Issue links carry no check status — skip them so the scheduler
             # never hands an issue URL to the pull-request-only chip fetch.
@@ -688,7 +715,7 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
                 # must trigger NEITHER — otherwise a non-owner would cause
                 # authenticated provider reads (status content AND repo
                 # visibility metadata) on repos it has no right to drive traffic
-                # for (GPT #6789). Only the OWNER's connection refreshes the
+                # for. Only the OWNER's connection refreshes the
                 # caches; a non-owner is READ-ONLY against them. The owner is the
                 # dashboard operator and is effectively always connected, so its
                 # driver classifies each repo's visibility and fetches public
@@ -709,14 +736,14 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
         # Seeded from the value the initial slots frame carried, not a fresh read:
         # the client's baseline IS that value, so a swap since then must register
         # here as a change or the two sides disagree with no push to reconcile.
-        ceiling_generation = initial_ceiling_generation
+        answer_generation = initial_answer_generation
         try:
             while not ws.closed and not shutdown_event.is_set():
                 # Gateway-wide cache: one store touch per TTL across ALL
                 # sockets; this call returns the shared cache immediately
                 # unless it is the one that refreshes it. Counts are None
                 # (published as null → loading skeleton) until the first
-                # successful refresh — never an authoritative false 0 (#7204).
+                # successful refresh — never an authoritative false 0.
                 _cached_crons, _cached_lessons = await _refresh_status_counts(state)
                 data = _status_frame(state, crons=_cached_crons, lessons=_cached_lessons)
                 if not ws.get("_is_dashboard_user", False):
@@ -755,8 +782,18 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
                 # connection may do, and spends no credentials.
                 if ws.get("_is_dashboard_user", False):
                     try:
-                        if governance_generation() != ceiling_generation:
-                            ceiling_generation = governance_generation()
+                        # The profile half of this token needs the profiles directory
+                        # re-stat'd, and ``_dir_fingerprint`` is an ``iterdir`` plus a
+                        # ``stat`` per file — a synchronous filesystem walk, which is
+                        # what AUTOSDE's ``no-blocking-call-on-event-loop`` prohibits
+                        # here. Offloaded, so a slow or large profile store delays
+                        # this socket's own tick instead of stalling chat turns and
+                        # heartbeats for every session on the loop. The token read
+                        # itself is two locked integer reads and stays inline.
+                        await asyncio.to_thread(poll_profiles_fresh)
+                        current = governance_answer_generation()
+                        if current != answer_generation:
+                            answer_generation = current
                             state.push_slots_update()
                     except Exception:
                         logger.warning("governance watch tick failed; continuing", exc_info=True)
@@ -810,7 +847,7 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
                     # for every repo the owner's slots reference; non-owner
                     # viewers render the resulting cached public-repo status
                     # read-only via is_repo_public. No non-owner-driven
-                    # credentialed provider read (GPT #6789).
+                    # credentialed provider read.
                     schedule_visibility_refresh(urls, state.push_slots_update)
                     schedule_check_refresh(urls, state.push_slots_update)
                 refresh_round += 1
@@ -821,7 +858,7 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
 
     # Run the refresh driver ONLY for the owner connection: both the status and
     # the visibility refresh call the operator's `gh`/`glab` credentials, so a
-    # non-owner must never drive them (GPT #6789). The owner is the dashboard
+    # non-owner must never drive them. The owner is the dashboard
     # operator and is effectively always connected, so its driver keeps the
     # check + visibility caches warm for every repo its slots reference; a
     # non-owner dashboard connection renders the resulting cached PUBLIC-repo

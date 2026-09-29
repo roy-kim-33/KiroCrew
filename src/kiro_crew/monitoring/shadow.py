@@ -3,20 +3,25 @@
 from __future__ import annotations
 
 import asyncio
-import math
 from collections.abc import Awaitable, Callable, Mapping
 from copy import deepcopy
 from dataclasses import fields
 from typing import Protocol
 
-from kiro_crew.monitoring.decision import decide_monitor, monitor_budget_reason
+from kiro_crew.monitoring.decision import (
+    decide_monitor,
+    monitor_budget_reason,
+    terminal_decision_for_outcome,
+)
 from kiro_crew.monitoring.github_pull_request import GitHubPullRequestProbeResult
 from kiro_crew.monitoring.models import (
     MonitorDecision,
     MonitorObservationStatus,
     MonitorOutcome,
     MonitorState,
+    MonitorVerdict,
     ProviderErrorKind,
+    is_finite_non_negative_number,
 )
 
 ShadowStatePersistence = Callable[[MonitorState], Awaitable[None]]
@@ -44,26 +49,24 @@ async def run_shadow_probe(
     *,
     now: float,
     wake_delivery: bool = False,
-) -> MonitorDecision:
-    """Probe and persist one decision without acquiring a delivery capability."""
+) -> MonitorVerdict:
+    """Probe and persist one decision without acquiring a delivery capability.
+
+    A verdict returned before the probe runs carries no entries: refusing a
+    monitor for a recorded outcome or a spent budget observes nothing.
+    """
     if wake_delivery:
         raise ShadowWakeDeliveryRefused("wake delivery is unavailable in shadow mode")
     if state.kind != "github_pull_request" or state.objective != "review_ready":
         raise ValueError("shadow mode supports only github_pull_request review_ready")
-    if isinstance(now, bool) or not isinstance(now, (int, float)) or now < 0:
-        raise ValueError("now must be a finite non-negative number")
-    try:
-        now_is_finite = math.isfinite(now)
-    except OverflowError as exc:
-        raise ValueError("now must be a finite non-negative number") from exc
-    if not now_is_finite:
+    if not is_finite_non_negative_number(now):
         raise ValueError("now must be a finite non-negative number")
     if not callable(persist):
         raise ValueError("persist must be callable")
 
-    terminal = _decision_for_outcome(state.outcome)
+    terminal = terminal_decision_for_outcome(state.outcome)
     if terminal is not None:
-        return terminal
+        return MonitorVerdict(decision=terminal)
     budget_reason = monitor_budget_reason(state, now=now)
     if budget_reason:
         staged = deepcopy(state)
@@ -73,7 +76,7 @@ async def run_shadow_probe(
         staged.stopped_at = now
         staged.next_probe_at = 0.0
         await _persist_and_publish(state, staged, persist)
-        return MonitorDecision.STOP_BUDGET
+        return MonitorVerdict(decision=MonitorDecision.STOP_BUDGET)
 
     result = await asyncio.to_thread(
         provider.probe,
@@ -81,7 +84,8 @@ async def run_shadow_probe(
         previous_observation=deepcopy(state.last_observation),
     )
     staged = deepcopy(state)
-    decision = decide_monitor(staged, result.observation, now=now)
+    verdict = decide_monitor(staged, result.observation, now=now)
+    decision = verdict.decision
     staged.probe_count += 1
     staged.last_probe_at = now
     staged.last_decision = decision
@@ -110,7 +114,7 @@ async def run_shadow_probe(
     else:
         staged.next_probe_at = now + staged.cadence_secs
     await _persist_and_publish(state, staged, persist)
-    return decision
+    return verdict
 
 
 async def _persist_and_publish(
@@ -135,13 +139,3 @@ def _terminal_outcome(
     if provider_error is ProviderErrorKind.NOT_FOUND:
         return MonitorOutcome.TARGET_UNAVAILABLE
     return MonitorOutcome.BLOCKED
-
-
-def _decision_for_outcome(outcome: MonitorOutcome | None) -> MonitorDecision | None:
-    if outcome is MonitorOutcome.SUCCESS:
-        return MonitorDecision.STOP_SUCCESS
-    if outcome is MonitorOutcome.BUDGET:
-        return MonitorDecision.STOP_BUDGET
-    if outcome is not None:
-        return MonitorDecision.STOP_BLOCKED
-    return None

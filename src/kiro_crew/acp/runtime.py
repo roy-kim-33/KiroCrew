@@ -41,12 +41,15 @@ from kiro_crew.acp._dispatch import reject_option_id as _reject_option_id
 from kiro_crew.acp._dispatch import (
     set_mode_params,
 )
+from kiro_crew.acp._frame_record import record_frame
 from kiro_crew.acp.client import (
     OversizeLineUnrecoverable,
+    _apply_pod_home_remap,
     _drain_oversize_line,
     _get_start_time,
     _KiroExecutableTrustError,
     _resolve_kiro_bin_for_spawn,
+    apply_pod_bundle_spawn,
     finish_suspended_spawn,
     is_auth_failure_output,
     kiro_cli_not_found_message,
@@ -55,7 +58,16 @@ from kiro_crew.acp.kas_agents import (
     KasAgentTranslationError,
     build_kas_custom_agents,
 )
-from kiro_crew.acp.kas_transport import build_kas_argv
+from kiro_crew.acp.kas_host_auth import (
+    HostAuthCallbackError,
+    answer_get_access_token,
+    vault_holds_identity_off_loop,
+)
+from kiro_crew.acp.kas_transport import (
+    KAS_AUTH_CALLBACK_ERROR_CODE,
+    METHOD_KAS_AUTH_GET_ACCESS_TOKEN,
+    build_kas_argv,
+)
 from kiro_crew.acp.session_handle import (
     AcpRequestTimeout,
     AcpRuntimeDead,
@@ -68,8 +80,10 @@ from kiro_crew.acp.session_handle import (
 from kiro_crew.acp.types import (
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
+    ACP_BACKENDS_HOST_AUTH_CALLBACK,
     ACP_BACKENDS_INTERNAL_SANDBOX,
     ACP_BACKENDS_KIRO_IDENTITY_STORE,
+    ACP_BACKENDS_POD_HOME_REMAP,
     ACP_CLIENT_CAPABILITIES,
     KAS_CLIENT_CAPABILITIES,
     METHOD_KAS_SESSION_DELETE,
@@ -265,9 +279,7 @@ def _sanitize_progress_name(name: str) -> str:
     """
     scrubbed, _ = redact_exfiltration_urls(name)
     scrubbed, _ = redact_credentials(scrubbed)
-    return _strip_unprintable(" ".join(scrubbed.split()))[
-        :_MCP_PROGRESS_NAME_LEN_CAP
-    ]
+    return _strip_unprintable(" ".join(scrubbed.split()))[:_MCP_PROGRESS_NAME_LEN_CAP]
 
 
 def _capped_names(names: list[str]) -> str:
@@ -719,6 +731,16 @@ class AcpRuntime:
         # later sessions inherit the claiming crew, not the pool's spawn state.
         self._crew_agent = crew_agent
         self._acp_backend = acp_backend
+        # Whether THIS process was spawned with Crew as the engine's auth owner
+        # (relay started without ``--auth-method cli`` because the Crew vault
+        # held an identity at spawn). Decided once in _resolve_spawn_argv and
+        # read by the reader loop: a credential callback is answered from the
+        # vault only on a process that was spawned expecting it.
+        self._kas_host_auth = False
+        # First answered credential callback per runtime is logged at INFO as a
+        # positive "the engine is drawing its credential from Crew" signal; later
+        # ones (the engine refreshes ahead of expiry) drop to DEBUG.
+        self._kas_host_auth_logged = False
         if model is not None:
             if not MODEL_ID_RE.match(model):
                 raise ValueError(
@@ -1116,7 +1138,20 @@ class AcpRuntime:
             kas_bin = await _resolve_kiro_bin_for_spawn(environ=spawn_environ, home=spawn_home)
             if not kas_bin:
                 raise AcpRuntimeError(await self._kiro_cli_missing(spawn_environ, spawn_home))
-            return build_kas_argv(kas_bin)
+            # Auth owner: Crew when its own vault holds a signed-in identity,
+            # kiro-cli otherwise. Decided per spawn so a sign-in or sign-out in
+            # the dashboard takes effect on the next process, and remembered on
+            # the instance so the reader loop answers the engine's credential
+            # callback only on a process that was started expecting Crew to.
+            # The probe reads the vault (file IO) off the loop and never raises.
+            self._kas_host_auth = await vault_holds_identity_off_loop()
+            if self._kas_host_auth:
+                logger.info(
+                    "KAS auth owner=crew — Crew vault holds an identity; relay spawned "
+                    "without --auth-method cli (agent=%s)",
+                    self._agent or "<none>",
+                )
+            return build_kas_argv(kas_bin, host_auth=self._kas_host_auth)
 
         kiro_bin = await _resolve_kiro_bin_for_spawn(environ=spawn_environ, home=spawn_home)
         if not kiro_bin:
@@ -1218,11 +1253,20 @@ class AcpRuntime:
         # have Crew's seatbelt skipped in favour of an internal sandbox that never
         # starts. KAS is a Node process with no internal sandbox, so it takes
         # Crew's seatbelt directly, and so does every harness added later.
+        #
+        # Inside a pod apply_pod_bundle_spawn answers both questions instead, from
+        # the single reason recorded on that function: the pod HOME remap breaks
+        # the toolbox shim's own sandbox, so the child runs the bundle binary the
+        # shim itself falls back to and Crew's launcher wraps it. Off-loop because
+        # the resolution stats the candidate path.
+        argv, delegate_internal_sandbox = await asyncio.to_thread(
+            apply_pod_bundle_spawn, argv, backend=self._acp_backend
+        )
         argv, self._sandbox_cleanup = await wrap_argv_async(
             argv,
             mode=self._sandbox_mode,
             strip_python_env=True,
-            is_kiro_cli=self._acp_backend in ACP_BACKENDS_INTERNAL_SANDBOX,
+            is_kiro_cli=delegate_internal_sandbox,
             _prepare=wrap_argv,
         )
         # cgroup v2 scope (OUTERMOST): bound this agent + all its MCP-server /
@@ -1262,10 +1306,13 @@ class AcpRuntime:
             # KIRO_API_KEY is kiro-cli's own MODEL credential for its v2
             # agent loop, so only the kiro backend is handed it. KAS takes the
             # strip branch even though its process is now a kiro-cli (the ACP
-            # relay): the v3 engine authenticates from kiro-cli's OIDC store via
-            # --auth-method cli and never reads this variable, so injecting it
-            # would widen credential exposure for a consumer that does not
-            # exist. Unchanged from when KAS was a bare Node process.
+            # relay): the v3 engine authenticates either from kiro-cli's OIDC
+            # store (--auth-method cli) or from Crew's vault over the
+            # _kiro/auth/getAccessToken callback, and in BOTH shapes this
+            # variable must be absent — the engine gives an API key in its
+            # environment precedence over the callback, so leaving it set would
+            # silently override the credential the operator signed in with.
+            # Unchanged from when KAS was a bare Node process.
             if self._acp_backend == ACP_BACKEND_KIRO:
                 inject_kiro_cli_api_key(env)
             else:
@@ -1278,6 +1325,16 @@ class AcpRuntime:
         # credential-pointer/API-key resolution so no resolver can reintroduce a
         # denied variable; KIRO_API_KEY itself is intentionally not denied.
         env = scrub_agent_subprocess_env(env)
+        # Pod-scoped kiro-cli children write their OWN MCP OAuth grants,
+        # confined to the pod's tree instead of the real host's -- see
+        # acp.client._apply_pod_home_remap's docstring. No-op outside a pod and
+        # for every harness outside ACP_BACKENDS_POD_HOME_REMAP, which is its
+        # own membership set rather than a reuse of the internal-sandbox one:
+        # "carries its own OS sandbox" and "relocating HOME moves its
+        # credential store" are different questions (harness-parity H6).
+        env = _apply_pod_home_remap(
+            env, pod_home_remap=self._acp_backend in ACP_BACKENDS_POD_HOME_REMAP
+        )
         # Positive-identity marker for the orphan sweep: kiro-cli and every MCP
         # server it spawns inherit this, so escaped launcher trees (``npx
         # @playwright/mcp`` -> node) are identifiable as ours.
@@ -1294,11 +1351,7 @@ class AcpRuntime:
         env.update(browser_env)
         if browser_env:
             lifecycle_env = {**os.environ, **browser_env}
-            env.update(
-                await self._to_thread_guarding_sandbox(
-                    browser_socket_env, lifecycle_env
-                )
-            )
+            env.update(await self._to_thread_guarding_sandbox(browser_socket_env, lifecycle_env))
         # Per-process scratch containment: the agent's temp AND its
         # prompt-guided work products land in an owned directory instead of
         # the shared system temp dir. Allocated off-loop (mkdir + config read)
@@ -1688,6 +1741,7 @@ class AcpRuntime:
         runtime dead resolves every pending wait instead of leaving the remote
         requester unanswered indefinitely.
         """
+
         def _deny() -> bool:
             """Refuse admission, recording the decision first.
 
@@ -1806,9 +1860,7 @@ class AcpRuntime:
         # Bound the redaction input (backend-controlled) BEFORE the regex
         # passes, generously above the display cap so a clipped secret
         # cannot straddle the boundary the display truncation makes.
-        title = (
-            redact_text(str(raw_title)[:4096])[:120] if raw_title else "<unknown>"
-        )
+        title = redact_text(str(raw_title)[:4096])[:120] if raw_title else "<unknown>"
         logger.warning(
             "auto-rejected permission request id=%s for session %s "
             "(tool: %s, reason: %s): no surface on this client can answer it "
@@ -2079,6 +2131,16 @@ class AcpRuntime:
                     logger.debug("non-object JSON stdout line: %s", line[:200])
                     continue
 
+                # Opt-in raw-frame recording for the replay corpus. A no-op
+                # unless KIROCREW_ACP_RECORD_FRAMES names a directory: it
+                # returns before awaiting anything, so an ordinary run pays one
+                # env lookup. When it IS set the frame is queued for the
+                # recorder's own writer thread rather than written here,
+                # because a filesystem syscall on this loop stalls every
+                # multiplexed session. It never raises -- see
+                # kiro_crew.acp._frame_record.
+                await record_frame(self._acp_backend, data, len(line))
+
                 msg = JsonRpcMessage.from_dict(data)
 
                 # Route responses
@@ -2131,13 +2193,41 @@ class AcpRuntime:
                     continue
 
                 # Inbound server→client REQUEST (method + id, no result/error).
-                # Crew answers no connection-level request of its own: the KAS
-                # engine's credential callback (_kiro/auth/getAccessToken) is
-                # served by kiro-cli's relay, not by this host (see
-                # :mod:`kiro_crew.acp.kas_transport`). A request that still
-                # arrives without a sessionId is therefore unroutable and is
-                # answered -32601 by _answer_ownerless_request below, rather
-                # than being left to hang.
+                # The one connection-level request Crew answers itself is the
+                # KAS engine's credential callback (_kiro/auth/getAccessToken),
+                # and only on a process spawned with Crew as the auth owner
+                # (see _resolve_spawn_argv / kas_transport.build_kas_argv). It
+                # carries no sessionId — the first one arrives before
+                # session/new has even returned — so it is handled here, OFF
+                # this loop: resolving and possibly refreshing a token must not
+                # block stdout demux for every other multiplexed session. On a
+                # cli-owned spawn the frame never arrives; on any other backend
+                # it falls through to the -32601 ownerless answer below rather
+                # than ever being paid with a credential (membership in
+                # ACP_BACKENDS_HOST_AUTH_CALLBACK is the authorization).
+                if (
+                    msg.id is not None
+                    and msg.result is None
+                    and msg.error is None
+                    and msg.is_method(METHOD_KAS_AUTH_GET_ACCESS_TOKEN)
+                    and self._kas_host_auth
+                    and self._acp_backend in ACP_BACKENDS_HOST_AUTH_CALLBACK
+                ):
+                    # Same bounded progress-or-dead admission as permission
+                    # answers: this is a request, so the counted-drop path that
+                    # is valid for notifications is not — and it shares the one
+                    # answer-task set so the combined total stays under the real
+                    # resource ceiling.
+                    if not await self._wait_for_answer_capacity(msg, request_kind="KAS auth"):
+                        continue
+                    _auth_task = asyncio.ensure_future(self._answer_get_access_token(msg.id))
+                    self._answer_tasks.add(_auth_task)
+                    _auth_task.add_done_callback(self._answer_tasks.discard)
+                    continue
+                # Any other request that arrives without a sessionId is
+                # unroutable and is answered -32601 by
+                # _answer_ownerless_request below, rather than being left to
+                # hang.
 
                 # Route notifications by sessionId
                 session_id = (msg.params or {}).get("sessionId")
@@ -2195,9 +2285,7 @@ class AcpRuntime:
                         # prompt's drain, so a background child's request
                         # would sit unanswered — the original hang with extra
                         # steps. Answer it fail-closed NOW instead.
-                        _owner_turn_active = (
-                            self._subagent_owner in self._turn_active_sessions
-                        )
+                        _owner_turn_active = self._subagent_owner in self._turn_active_sessions
                         if (
                             msg.id is not None
                             and msg.is_method(METHOD_REQUEST_PERMISSION)
@@ -2231,12 +2319,8 @@ class AcpRuntime:
                             # request that is neither routed nor answered
                             # leaves its crew waiting on a prompt nobody can
                             # see.
-                            if msg.id is not None and msg.is_method(
-                                METHOD_REQUEST_PERMISSION
-                            ):
-                                emit_counter(
-                                    CHILD_PERMISSION_ROUTED, {"surface": "runtime"}
-                                )
+                            if msg.id is not None and msg.is_method(METHOD_REQUEST_PERMISSION):
+                                emit_counter(CHILD_PERMISSION_ROUTED, {"surface": "runtime"})
                             await next(iter(self._session_queues.values())).put(msg)
                     elif msg.id is not None and msg.is_method(METHOD_REQUEST_PERMISSION):
                         # Unannounced or ambiguous: nobody on this client can
@@ -2289,9 +2373,7 @@ class AcpRuntime:
                     if len(self._answer_tasks) >= self._max_answer_tasks:
                         self._note_dropped_frame(_DROP_NO_SESSION, msg.method)
                         continue
-                    _t = asyncio.ensure_future(
-                        self._answer_ownerless_request(msg.id, msg.method)
-                    )
+                    _t = asyncio.ensure_future(self._answer_ownerless_request(msg.id, msg.method))
                     self._answer_tasks.add(_t)
                     _t.add_done_callback(self._answer_tasks.discard)
                     continue
@@ -2330,9 +2412,51 @@ class AcpRuntime:
             # accounted for instead of vanishing with the task.
             self._flush_dropped_frames()
 
-    async def _answer_ownerless_request(
-        self, request_id: int | str, method: str
-    ) -> None:
+    async def _answer_get_access_token(self, request_id: int | str) -> None:
+        """Answer the engine's ``_kiro/auth/getAccessToken`` from Crew's vault.
+
+        Runs OFF the reader loop. The response is built by
+        :func:`kiro_crew.acp.kas_host_auth.answer_get_access_token` (resolve,
+        refresh under the cross-process lock, refresh token withheld) and
+        handed straight to the engine — never cached here, never logged. On any
+        failure the engine is sent a JSON-RPC error, which it treats as an
+        expired credential and turns into its sign-in prompt, rather than being
+        left to hang on the callback. Only reached for a process spawned with
+        Crew as auth owner (the reader-loop guard); the INFO line is the positive
+        "engine is drawing its credential from Crew" signal, logged once per
+        runtime and only AFTER a response was actually written, so a callback
+        that failed never counts as served.
+        """
+        try:
+            result = await answer_get_access_token()
+        except HostAuthCallbackError as exc:
+            # str(exc) is token-free by construction (see kas_host_auth).
+            logger.warning("KAS auth callback failed: %s", exc)
+            try:
+                await self.send_error(request_id, KAS_AUTH_CALLBACK_ERROR_CODE, str(exc))
+            except AcpRuntimeDead:
+                pass
+            return
+        try:
+            await self.send_response(request_id, result)
+        except AcpRuntimeDead:
+            # Process gone before the answer could be written; nothing to do.
+            return
+        if not self._kas_host_auth_logged:
+            self._kas_host_auth_logged = True
+            logger.info(
+                "KAS auth callback served from Crew vault — agent=%s (PID %s)",
+                self._agent or "<none>",
+                self._pid,
+            )
+        else:
+            logger.debug(
+                "KAS auth callback served from Crew vault — agent=%s (PID %s)",
+                self._agent or "<none>",
+                self._pid,
+            )
+
+    async def _answer_ownerless_request(self, request_id: int | str, method: str) -> None:
         """Answer a server→client request that names no session with -32601.
 
         Runs OFF the reader loop (same shape as the KAS auth callback) so a
@@ -2347,9 +2471,7 @@ class AcpRuntime:
             request_id,
         )
         try:
-            await self.send_error(
-                request_id, _JSONRPC_METHOD_NOT_FOUND, "Method not found"
-            )
+            await self.send_error(request_id, _JSONRPC_METHOD_NOT_FOUND, "Method not found")
         except AcpRuntimeDead:
             pass
 
@@ -2666,9 +2788,7 @@ class AcpRuntime:
                 # dashboard banner applies before it lands in an exception.
                 err, _ = redact_exfiltration_urls(str(params.get("error") or ""))
                 err, _ = redact_credentials(err)
-                err = _strip_unprintable(" ".join(err.split()))[
-                    :_MCP_PROGRESS_ERROR_CAP
-                ]
+                err = _strip_unprintable(" ".join(err.split()))[:_MCP_PROGRESS_ERROR_CAP]
                 if name not in failed:
                     failed.append(name)
                 if err:
@@ -2686,9 +2806,7 @@ class AcpRuntime:
             # len(reported) can exceed the denominator -- "2/1 reported". The
             # out-of-roster servers still appear by name in the failed and
             # awaiting-authorization buckets, where naming them is the point.
-            parts.append(
-                f"{len(reported & set(roster))}/{len(roster)} MCP server(s) reported"
-            )
+            parts.append(f"{len(reported & set(roster))}/{len(roster)} MCP server(s) reported")
             silent = [n for n in roster if n not in reported]
             if silent:
                 parts.append(f"no report from {_capped_names(silent)}")
@@ -2799,8 +2917,7 @@ class AcpRuntime:
                     # server twice (the injection still wins) rather than
                     # withholding one that nothing else will supply.
                     logger.debug(
-                        "stubbed-server lookup failed for %r; projecting every "
-                        "declared server",
+                        "stubbed-server lookup failed for %r; projecting every " "declared server",
                         agent,
                         exc_info=True,
                     )
@@ -2829,9 +2946,7 @@ class AcpRuntime:
                 # Fail loud: continuing would create a session on KAS's own default
                 # mode, which for a restricted agent means running a BROADER agent
                 # than the caller asked for.
-                raise AcpRuntimeError(
-                    f"cannot project agent {agent!r} onto KAS: {exc}"
-                ) from exc
+                raise AcpRuntimeError(f"cannot project agent {agent!r} onto KAS: {exc}") from exc
         return None
 
     async def _session_start_budget(self) -> float:
@@ -2845,9 +2960,7 @@ class AcpRuntime:
         snapshot semantics as ``watchdog.*`` in session_handle.py).
         """
         if self._session_start_timeout is None:
-            self._session_start_timeout = await asyncio.to_thread(
-                _resolve_session_start_timeout
-            )
+            self._session_start_timeout = await asyncio.to_thread(_resolve_session_start_timeout)
         return self._session_start_timeout
 
     async def create_session(
@@ -2893,9 +3006,9 @@ class AcpRuntime:
             if member_entry is not None:
                 # Session-level entries outrank same-named spec entries, so drop
                 # any stub for the same server rather than registering it twice.
-                mcp_servers = [
-                    e for e in mcp_servers if e.get("name") != member_entry["name"]
-                ] + [member_entry]
+                mcp_servers = [e for e in mcp_servers if e.get("name") != member_entry["name"]] + [
+                    member_entry
+                ]
             else:
                 logger.warning(
                     "member session %s: dashboard server unresolved — the DM "
@@ -2924,9 +3037,7 @@ class AcpRuntime:
         self._session_inits_in_flight += 1
         session_id = ""
         try:
-            resp = await self._send_and_await(
-                METHOD_SESSION_NEW, params, timeout=budget
-            )
+            resp = await self._send_and_await(METHOD_SESSION_NEW, params, timeout=budget)
             session_id = str(resp.get("sessionId") or "")
             if not session_id:
                 raise AcpRuntimeError(f"session/new did not return sessionId: {resp}")
@@ -2959,6 +3070,10 @@ class AcpRuntime:
 
         # Populate state from session/new response (configOptions, available models)
         handle.store_session_config(resp)
+        # Both halves of that snapshot are now known, which is what makes the
+        # served-default check answerable: the model the backend picked for
+        # this session can be one the account's partition does not serve.
+        await handle.ensure_served_default()
         # The roster this session put on the wire. Set BEFORE drain_init so the
         # report can be read as "of the N we sent, these reported" rather than
         # as a bare list of names.
@@ -2999,9 +3114,19 @@ class AcpRuntime:
             # "no report" for the rest of the session.
             staged_before_switch = handle.queued_frame_count()
             try:
+                # set_mode is a handshake request: switching to an agent boots
+                # THAT agent's MCP servers (see the mode_switched comment below),
+                # the same server (re-)initialization that gives session/new and
+                # session/load their 90s budget. A switched-to server pending
+                # OAuth holds the response for its full 30s wait, so the generic
+                # _REQUEST_TIMEOUT turns set_mode into the SAME race the
+                # session-start floor exists to prevent (see _SESSION_NEW_TIMEOUT
+                # and #9185). `budget` is already resolved for the session/new
+                # above, so reuse it rather than re-reading config.
                 await self._send_and_await(
                     METHOD_SET_MODE,
                     set_mode_params(session_id, mode_agent),
+                    timeout=budget,
                 )
             except Exception:
                 await self.terminate_session(session_id)
@@ -3071,9 +3196,7 @@ class AcpRuntime:
                 return list(self._entitlement_probe_result)
             if not self._initialized or self._dead or self._process is None:
                 return []
-            params = build_session_new_params(
-                await self._session_work_dir(), mcp_servers=[]
-            )
+            params = build_session_new_params(await self._session_work_dir(), mcp_servers=[])
             session_id = ""
             self._session_inits_in_flight += 1
             try:
@@ -3154,9 +3277,9 @@ class AcpRuntime:
                 member_dispatch_session_server, member_session_key
             )
             if member_entry is not None:
-                mcp_servers = [
-                    e for e in mcp_servers if e.get("name") != member_entry["name"]
-                ] + [member_entry]
+                mcp_servers = [e for e in mcp_servers if e.get("name") != member_entry["name"]] + [
+                    member_entry
+                ]
             else:
                 logger.warning(
                     "member session %s: dashboard server unresolved on resume — "
@@ -3212,16 +3335,12 @@ class AcpRuntime:
             # staging in _reader_loop, closed by _finish_session_init; see
             # docs/system-specs/modules/acp-client.md "loading a session
             # triggers MCP re-initialization") — so it gets the same budget.
-            resp = await self._send_and_await(
-                METHOD_SESSION_LOAD, load_params, timeout=budget
-            )
+            resp = await self._send_and_await(METHOD_SESSION_LOAD, load_params, timeout=budget)
 
             # A genuine resume echoes "modes" in the response (same signal AcpClient
             # keys on). Anything else means load did not actually restore state.
             if "modes" not in resp:
-                raise AcpRuntimeError(
-                    f"session/load did not resume session {resume_sid}: {resp}"
-                )
+                raise AcpRuntimeError(f"session/load did not resume session {resume_sid}: {resp}")
             loaded_session_id = resume_sid
         except AcpRequestTimeout as exc:
             # Read the staged MCP reports before the finally below clears them.
@@ -3253,6 +3372,11 @@ class AcpRuntime:
             crew_agent=_crew,
         )
         handle.store_session_config(resp)
+        # session/load echoes ``currentModelId`` exactly like session/new, and a
+        # session persisted before the account's served list changed can come
+        # back on a default the account does not serve — so the resumed session gets
+        # the same served-default check as a fresh one.
+        await handle.ensure_served_default()
         # session/load re-initializes this session's servers, so the resumed
         # session gets its own report against the roster load re-declared.
         handle.mcp_session_report().begin_session(mcp_servers)
@@ -3271,9 +3395,15 @@ class AcpRuntime:
             # out, the only moment "queued" and "pre-switch" mean the same thing.
             staged_before_switch = handle.queued_frame_count()
             try:
+                # Same as create_session: set_mode on the resume path boots the
+                # switched-to agent's MCP servers, so it shares session/load's
+                # 90s budget rather than the generic _REQUEST_TIMEOUT that the
+                # backend's own 30s OAuth wait would race (#9185). `budget` is
+                # the session-start budget already resolved above.
                 await self._send_and_await(
                     METHOD_SET_MODE,
                     set_mode_params(resume_sid, agent),
+                    timeout=budget,
                 )
             except Exception:
                 await self.terminate_session(resume_sid)

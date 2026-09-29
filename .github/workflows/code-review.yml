@@ -155,7 +155,7 @@ jobs:
           # among them, in _CREW_SECRET_LEAVES) under every crew-home prefix
           # (_CREW_HOME_PREFIXES). Assert the leaf is in that list; the governance
           # boot tuple carries the resolved ".kiro/crew/denied_commands.json".
-          if ! grep -q '"denied_commands.json"' src/kiro_crew/security.py; then
+          if ! grep -qr '"denied_commands.json"' src/kiro_crew/security/; then
             echo "::error::denied_commands.json must be in security._SENSITIVE_HOME_DIRS (via _CREW_SECRET_LEAVES; agent must not read/write its own deny ceiling)"
             exit 1
           fi
@@ -179,7 +179,8 @@ jobs:
           echo "::group::model-selection — no hardcoded model id as a default/fallback"
           # A hardcoded model id fails at runtime for accounts not entitled to it
           # (free-tier gets a subset). Use the "auto" sentinel or
-          # agent.role_models.<role> (see AGENTS.md → Model selection).
+          # agent.role_models.<role> (see
+          # docs/system-specs/common/model-selection.md).
           # model_registry.py IS the id source-of-truth (excluded); the CC-seam
           # fallback (_BACKGROUND_CC_MODEL) and *_FALLBACK_* maps are the one
           # documented exception. tests live outside src/kiro_crew.
@@ -187,7 +188,7 @@ jobs:
                ':(exclude)src/kiro_crew/model_registry.py' \
              | grep -nP "^\+.*(=|\":)\s*[\"'](claude-(opus|sonnet|haiku|fable)|opus-[0-9]|sonnet-[0-9]|haiku-[0-9]|fable-[0-9]|gpt-[0-9])" \
              | grep -vP "_BACKGROUND_CC_MODEL|_FALLBACK_"; then
-            echo "::error::Do not hardcode a model id as a default/fallback. Use \"auto\" or agent.role_models.<role> (see AGENTS.md → Model selection)."
+            echo "::error::Do not hardcode a model id as a default/fallback. Use \"auto\" or agent.role_models.<role> (see docs/system-specs/common/model-selection.md)."
             exit 1
           fi
           echo "::endgroup::"
@@ -395,6 +396,15 @@ jobs:
       # rebuild, a formatting sweep) can stay separable from the change it
       # accompanies instead of being squashed into it. Anything beyond that
       # is review-round noise and must be squashed before pushing.
+      #
+      # The count walks FIRST parents only. A merge of the upstream repo into
+      # this fork carries every upstream commit since the last sync, and a
+      # plain `rev-list --count` attributes all of them to the PR. The only way
+      # to pass that is flattening the merge into one ordinary commit, which
+      # makes git forget upstream's history was ever merged, so the next sync
+      # re-conflicts on every file it touched. On the first-parent line a
+      # merge is one commit, same as any other, and non-merge PRs count the
+      # same as before.
       - name: Enforce commit count
         env:
           # base.sha (not the merge-base): rev-list is a commit-range query, so
@@ -404,7 +414,7 @@ jobs:
           HEAD: ${{ github.event.pull_request.head.sha }}
           MAX_COMMITS: "2"
         run: |
-          COMMIT_COUNT=$(git rev-list --count "$BASE".."$HEAD")
+          COMMIT_COUNT=$(git rev-list --count --first-parent "$BASE".."$HEAD")
           if [ "$COMMIT_COUNT" -lt 1 ] || [ "$COMMIT_COUNT" -gt "$MAX_COMMITS" ]; then
             echo "::error::PR must contain 1 or $MAX_COMMITS commits (has $COMMIT_COUNT). Squash before pushing:"
             echo ""

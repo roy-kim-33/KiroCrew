@@ -364,6 +364,25 @@ def _os_fix_hint(mac: str, linux: str, windows: str | None = None) -> str:
     return linux
 
 
+# The Linux arm of the missing-ffmpeg fix, a module constant so the test can hold
+# it against the resolver's real search set. An earlier version told the user to
+# drop a static build into ``~/.local/bin``, which ``transcribe._find_ffmpeg``
+# deliberately never searches (``_ffmpeg_candidate_dirs`` documents removing it:
+# a generic user-writable PATH dir would let agent-written code run as the
+# gateway), so a user who followed the advice still ended at "not found" (#8897).
+# Name only remedies that actually resolve: the dashboard's decoder download
+# installs into the digest-verified store ``_find_ffmpeg`` checks last and needs
+# no PATH reasoning (the working fix on distros with no packaged ffmpeg, e.g.
+# AL2023 — pinned artifacts exist for x86_64 and aarch64, the Linux ISAs the
+# desktop matrix ships; on any other ISA the fetch is refused and the second
+# clause is the remedy), and ``/usr/local/bin`` is both a real
+# ``_FFMPEG_CANDIDATE_DIRS`` entry and the conventional manual-install prefix.
+_FFMPEG_LINUX_HINT = (
+    "download the audio decoder from the dashboard (Settings → Speech-to-Text), "
+    "or install ffmpeg into /usr/local/bin"
+)
+
+
 # kiro-cli is the DEFAULT agent backend; the claude-agent-acp binary below belongs
 # to Claude Code, which is also selectable. Doctor reports it as an optional
 # backend, and the verdict comes from ``agent_sdk.probe_backend`` so doctor and the
@@ -1189,7 +1208,50 @@ def _doctor_trust_root() -> None:
 #: and the authorization-subject ones (session control, ``chat_folder_*``).
 #: Mirrors ``mcp_core._STRICT_IDENTITY_SERVERS``; ``kirocrew-dashboard`` is
 #: opt-in per agent, so it is reported only when an agent actually references it.
-_STRICT_IDENTITY_SERVERS = ("kirocrew-core", "kirocrew-dashboard")
+_STRICT_IDENTITY_SERVERS = ("kirocrew-core", "kirocrew-dashboard", "kirocrew-work")
+
+
+def _doctor_mcp_gateway_daemon(issues: list[str]) -> None:
+    """Report the MCP gateway daemon's code revision next to this one.
+
+    The daemon pools MCP backends across sessions and is a separate process
+    from the gateway. One that outlived a code change keeps handing out
+    backends built from the old checkout, and the symptom is remote from the
+    cause: a directive tool reports success while the gateway logs
+    ``not_derivable``. This line puts the two revisions side by side and names
+    the command that replaces the daemon. A mismatch IS an issue: nothing about
+    it is a valid configuration choice.
+    """
+    try:
+        from kiro_crew.code_fingerprint import code_fingerprint
+        from kiro_crew.mcp_gateway.daemon_control import describe_daemon
+
+        info = describe_daemon()
+    except Exception:
+        return
+    if info is None:
+        print("  mcp gateway daemon: ⏹ not running (pooling off, or no session has started one)")
+        return
+    mine = code_fingerprint()
+    owner = (
+        "no owner recorded"
+        if info.owner_pid <= 0
+        else f"owner pid {info.owner_pid} {'alive' if info.owner_alive else 'GONE'}"
+    )
+    if info.fingerprint == mine:
+        print(f"  mcp gateway daemon: ✅ pid {info.pid}, same code as this install ({owner})")
+        return
+    theirs = info.fingerprint or "unknown (pre-fingerprint build)"
+    print(
+        f"  mcp gateway daemon: ❌ pid {info.pid} runs code {theirs}; this install is {mine} ({owner})"
+    )
+    _print_wrapped(
+        "The daemon outlived a code change and its pooled MCP servers speak the "
+        "old revision's wire shapes (session directives, app calls). Run "
+        "`kirocrew restart`, which stops the daemon along with the gateway so the "
+        "replacement spawns its own."
+    )
+    issues.append("MCP gateway daemon runs a different code revision than this install")
 
 
 def _doctor_strict_identity(cfg: KiroCrewConfig) -> None:
@@ -2354,7 +2416,30 @@ def _report_kas_backend(issues: list[str]) -> None:
         issues.append("KAS backend selected but kiro-cli is not installed")
         return
 
-    print(f"  relay:       ✅ {' '.join(build_kas_argv(binary))}")
+    # Same decision the runtime makes at spawn: Crew owns auth when its own
+    # vault holds an identity, kiro-cli otherwise. Reported so the operator sees
+    # which credential the next KAS process will actually draw on. Deferred
+    # import: this module is on the dashboard's boot path and kiro_crew.auth
+    # brings the cryptography wheel with it (see kas_host_auth's module doc).
+    from kiro_crew.auth.bridge import describe_vault_identity, vault_holds_identity
+
+    host_auth = vault_holds_identity()
+    print(f"  relay:       ✅ {' '.join(build_kas_argv(binary, host_auth=host_auth))}")
+    print(
+        "  auth owner:  "
+        + (
+            "Kiro Crew vault (signed in through Kiro Crew)"
+            if host_auth
+            else "kiro-cli credential store (--auth-method cli)"
+        )
+    )
+    # The fields the owner decision reads, so a vault that will fail its first
+    # callback (expired, nothing to renew it) is visible here rather than as a
+    # broken spawn. Printed whenever something is stored, including the case the
+    # probe rejected -- that is exactly the one worth seeing.
+    identity_line = describe_vault_identity()
+    if identity_line:
+        print(f"  crew vault:  {identity_line}")
     help_text = _kas_relay_help(binary)
     if help_text is None:
         # The probe itself failed, so nothing is known either way. Advisory: a
@@ -3015,6 +3100,7 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
     _doctor_path_launcher()
     _doctor_trust_root()
     _doctor_strict_identity(cfg)
+    _doctor_mcp_gateway_daemon(issues)
 
     # ── Credentials (AWS / credential-vending MCP) ──
     # After identity, before the agent-facing sections: this is the answer to
@@ -3274,8 +3360,7 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
                 "               Fix: "
                 + _os_fix_hint(
                     "brew install ffmpeg",
-                    "drop a static ffmpeg build into ~/.local/bin "
-                    "(not in AL2023 repos; Kiro Crew auto-detects it)",
+                    _FFMPEG_LINUX_HINT,
                     windows="winget install Gyan.FFmpeg",
                 )
             )

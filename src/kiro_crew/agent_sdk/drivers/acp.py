@@ -36,6 +36,29 @@ sandbox posture at their defining modules.
 
 from __future__ import annotations
 
+import importlib
+from typing import Any
+
+# Fork seam (claude-code / 9router lanes): ACP names the fork's dashboard and
+# session code reach through the SDK surface. Resolved on each lookup, so the
+# importer gets ACP's own object (identity, not a copy), a patch at the defining
+# module is seen, and nothing loads kiro_crew.acp at this module's import time.
+_ACP_REEXPORTS = {
+    "AcpClient": "kiro_crew.acp.client",
+    "_DEFAULT_TEXT_ONLY_MODELS": "kiro_crew.acp.client",
+    "_resolve_claude_acp_bin": "kiro_crew.acp.client",
+    "_resolve_opencode_bin": "kiro_crew.acp.client",
+    "decide_image_input_mode": "kiro_crew.acp.vision",
+}
+
+
+def __getattr__(name: str) -> Any:
+    module = _ACP_REEXPORTS.get(name)
+    if module is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    return getattr(importlib.import_module(module), name)
+
+
 __all__ = [
     "claude_adapter_cached_negative",
     "claude_adapter_install_command",

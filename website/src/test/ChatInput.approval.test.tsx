@@ -284,7 +284,12 @@ describe('ChatInput approval flow', () => {
   it('shows tool input preview in expanded approval bar', async () => {
     const store = createTestStore(stateWithApproval())
     renderWithProviders(<ChatInput {...defaultProps} />, { store })
-    await waitFor(() => expect(screen.getByText(/command/)).toBeInTheDocument())
+    // The preview lives in the approval GHOST, which mounts only after the
+    // 150ms settle guard (`ghostSettled`, a real setTimeout that lets the in-chat
+    // pill register first) and then through an AnimatePresence mount -- a chain
+    // that ran past the 1000ms default under load in one of four full runs. A
+    // named ceiling for that chain, not a longer guess (website/docs/testing.md).
+    await waitFor(() => expect(screen.getByText(/command/)).toBeInTheDocument(), { timeout: 5000 })
   })
 
   it('uses approvalFullCommand for TrustDropdown', () => {
@@ -403,8 +408,11 @@ describe('ChatInput orphaned approval (404)', () => {
     renderWithProviders(<ChatInput {...defaultProps} />, { store })
     fireEvent.click(screen.getByText('Allow once'))
     await waitFor(() => {
-      expect(screen.getByRole('status')).toBeInTheDocument()
+      // A rejected decision submit is an error surface (ErrorNotice, role=alert),
+      // distinct from the role=status copy an EXPIRED approval gets above.
+      expect(screen.getByTestId('approval-decision-error')).toBeInTheDocument()
     })
+    expect(screen.getByTestId('approval-decision-error')).toHaveAttribute('role', 'alert')
     // A transient server error is not evidence the approval is gone — the
     // buttons must remain live rather than dismissing a still-valid request.
     expect(screen.getByText('Allow once')).toBeInTheDocument()

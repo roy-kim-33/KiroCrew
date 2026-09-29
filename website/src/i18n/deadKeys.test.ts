@@ -42,7 +42,7 @@ import pluralKeys from './pluralKeys.json'
 // its own version of are unreferenced in this tree, and this scanner cannot
 // resolve the `as const` key maps in the code-review-sage app. Lower it when
 // keys are genuinely removed; never raise it to make a red run green.
-const BASELINE = 206
+const BASELINE = 204
 
 const SRC = join(__dirname, '..')
 const PLURAL_SUFFIX = /_(zero|one|two|few|many|other)$/

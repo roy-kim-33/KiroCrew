@@ -9,14 +9,13 @@ kept a literal copy of the selectable-backend list, and these tests stood in for
 code owner. They no longer can. The set is a REGISTRY an edition extends at boot
 (``register_selectable_backend``), which no import-time literal can see. So what is
 pinned now is that each surface RESOLVES the set at request time from the one
-owner, ``acp_backends``, rather than carrying its own answer.
+owner, ``agent_sdk.backends``, rather than carrying its own answer.
 """
 
 from typing import Any, Dict, List
 
 import pytest
 
-from kiro_crew import acp_backends
 from kiro_crew.acp_backends import (
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_CODEX,
@@ -24,6 +23,7 @@ from kiro_crew.acp_backends import (
     ACP_BACKEND_KIRO,
     ACP_BACKEND_OPENCODE,
 )
+from kiro_crew.agent_sdk import backends as acp_backends
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.dashboard.handlers.agents import _supply_live_enum
 from kiro_crew.dashboard.handlers.core import _EDITABLE_CONFIG
@@ -41,6 +41,10 @@ def restore_registry():
 
     BOTH sets, because ``register_selectable_backend`` writes both: restoring only
     ``_selectable`` would leak a widened baseline into every later test in the run.
+
+    Reached through ``agent_sdk.backends``, the module that DEFINES the pair. The
+    ``kiro_crew.acp_backends`` shim re-exports the public names only: a second
+    binding to a mutable set is how two views of one registry start disagreeing.
     """
     baseline_before = set(acp_backends._baseline)
     before = set(acp_backends._selectable)
@@ -148,10 +152,9 @@ def test_baseline_ships_every_known_backend():
 
     ``NOT_SHIPPED_SELECTABLE`` is where that reason goes. It is an explicit list
     rather than a relaxed assertion so a plain ``baseline != known`` still fails:
-    an id may sit outside the baseline only by being named there. Codex is the
-    only member — its spawn path is complete, but ``backend_install.py`` has no
-    probe for the adapter, so the switch would render with nothing to say about a
-    session that failed to start.
+    an id may sit outside the baseline only by being named there. It is empty
+    today — every known id is offered, so a switch that renders always has an
+    install probe behind it to explain a session that failed to start.
     """
     # RoyCrew fork: also ships ACP_BACKEND_OPENCODE (see acp_backends.py) --
     # upstream doesn't know about this backend.

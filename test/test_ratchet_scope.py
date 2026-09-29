@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -90,22 +91,36 @@ def _commit_file(repo: Path, name: str, message: str) -> None:
     _git(repo, "commit", "-m", message)
 
 
-def _repo_with_diverged_feature(tmp_path: Path) -> Path:
-    """One base repo both shapes start from.
+def _build_repo_with_diverged_feature(repo: Path) -> None:
+    """Populate ``repo`` with the one base shape every test in this module starts
+    from.
 
     ``main`` gains ``mainline.txt`` AFTER ``feature`` branches off with its own
     ``feature.py``, so the two sides of every merge below differ and a wrong
     parent choice shows up in the returned path set, not just the label.
     """
-    repo = tmp_path / "repo"
-    repo.mkdir()
     _git(repo, "init", "-b", "main", ".")
     _commit_file(repo, "base.txt", "base")
     _git(repo, "checkout", "-b", "feature")
     _commit_file(repo, "feature.py", "the change under judgment")
     _git(repo, "checkout", "main")
     _commit_file(repo, "mainline.txt", "someone else's change, landed after the branch point")
-    return repo
+
+
+@pytest.fixture(scope="session")
+def _repo_template(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Build the diverged-feature repo once per session; ``repo`` copies it per test.
+
+    Six git subprocesses (~2-3s) were previously paid on every one of the 23
+    tests in this module. Session scope is safe here because the template is
+    never handed to a test, only copied from via ``shutil.copytree`` -- so a
+    test that adds a commit, merges, or moves a branch cannot reach another's
+    copy.
+    """
+    template = tmp_path_factory.mktemp("ratchet-scope-seed") / "repo"
+    template.mkdir()
+    _build_repo_with_diverged_feature(template)
+    return template
 
 
 def _set_origin_main(repo: Path) -> None:
@@ -115,7 +130,7 @@ def _set_origin_main(repo: Path) -> None:
 
 
 @pytest.fixture()
-def repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+def repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _repo_template: Path) -> Path:
     # The fixture's own git calls build a scrubbed env per call, but the
     # RESOLVER under test runs git with the ambient process environment: an
     # exported GIT_DIR (pytest run from a git hook, `git rebase --exec`,
@@ -125,8 +140,59 @@ def repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     # builder strips.
     for var in _GIT_LOCATION_VARS:
         monkeypatch.delenv(var, raising=False)
-    fixture_repo = _repo_with_diverged_feature(tmp_path)
+    fixture_repo = tmp_path / "repo"
+    shutil.copytree(_repo_template, fixture_repo)
+    # A copied checkout reads as "unstaged changes" on Windows (fresh inode/ctime
+    # invalidate the index stat cache); nothing in the template is uncommitted, so
+    # this changes no content and only re-stats the index.
+    _git(fixture_repo, "reset", "--hard", "HEAD")
     # The module runs git with cwd=ROOT; retarget it at the synthetic repo.
+    monkeypatch.setattr(scope, "ROOT", fixture_repo)
+    return fixture_repo
+
+
+def _build_merge_aware_repo(repo: Path) -> None:
+    """The repo ``TestMergeAwareScope`` builds every case from.
+
+    ``up`` is an upstream branch that adds ``u.py`` with a comment-history
+    marker of its own. ``feature`` branches off main, commits its OWN work
+    first (``own.py``) -- so the merge's first parent is itself inside the PR
+    range, pinning that only NON-first parents are ever excluded -- then
+    merges ``up`` in, then adds one more fork-authored marker line to the
+    just-merged ``u.py``. That last commit is the shape a sync PR's own
+    follow-up commit takes: a line that must stay judged even though it sits
+    in a file a merge just touched.
+    """
+    _git(repo, "init", "-b", "main", ".")
+    _commit_file(repo, "a.py", "root")
+    _git(repo, "checkout", "-b", "up")
+    (repo / "u.py").write_text("# previously X\nvalue = 1\n", encoding="utf-8")
+    _git(repo, "add", "u.py")
+    _git(repo, "commit", "-m", "upstream: add u.py")
+    _git(repo, "checkout", "main")
+    _git(repo, "checkout", "-b", "feature")
+    _commit_file(repo, "own.py", "fork's own pre-merge commit")
+    _git(repo, "merge", "--no-ff", "-m", "sync up into feature", "up")
+    (repo / "u.py").write_text("# previously X\nvalue = 1\n# used to Y\n", encoding="utf-8")
+    _git(repo, "add", "u.py")
+    _git(repo, "commit", "-m", "feature: add a marker on top of the merge")
+
+
+@pytest.fixture(scope="session")
+def _merge_repo_template(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    template = tmp_path_factory.mktemp("merge-aware-seed") / "repo"
+    template.mkdir()
+    _build_merge_aware_repo(template)
+    return template
+
+
+@pytest.fixture()
+def merge_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _merge_repo_template: Path) -> Path:
+    for var in _GIT_LOCATION_VARS:
+        monkeypatch.delenv(var, raising=False)
+    fixture_repo = tmp_path / "merge-repo"
+    shutil.copytree(_merge_repo_template, fixture_repo)
+    _git(fixture_repo, "reset", "--hard", "HEAD")
     monkeypatch.setattr(scope, "ROOT", fixture_repo)
     return fixture_repo
 
@@ -427,3 +493,145 @@ def test_env_base_gates_delegate_to_the_shared_plumbing() -> None:
         source = (ROOT / "scripts" / name).read_text(encoding="utf-8")
         assert "ratchet_scope.py" in source, f"{name} no longer uses the shared plumbing"
         assert r"\+(\d+)(?:,(\d+))?" not in source, f"{name} grew a private hunk parser back"
+
+
+class TestMergeAwareScope:
+    """``merged_in_parents`` and ``added_lines(..., minus_parents=...)``.
+
+    A sync PR carries a first-parent-chain merge of an upstream ref; a plain
+    diff cannot tell upstream's own lines from this PR's. ``merged_in_parents``
+    names the merge's non-first parent(s) (the "S" set), and ``minus_parents``
+    is how a caller excludes lines already present there -- see
+    ``_build_merge_aware_repo`` for the fixture every case below shares.
+    """
+
+    def test_three_dot_shape_finds_the_merged_in_parent(self, merge_repo: Path) -> None:
+        up_sha = _git(merge_repo, "rev-parse", "up")
+        _set_origin_main(merge_repo)
+
+        paths, label = scope.changed_paths()
+        assert label == "origin/main...HEAD"
+        assert scope.merged_in_parents(label) == [up_sha]
+
+        added = scope.added_lines(label, minus_parents=[up_sha])
+        assert 3 in added.get("u.py", set())  # the fork's own marker line
+        assert 1 not in added.get("u.py", set())  # the imported marker line
+
+    def test_ci_merge_ref_shape_gives_the_same_answer(self, merge_repo: Path) -> None:
+        # GitHub's pull_request merge ref: this repo's `feature` merged INTO
+        # main, so the base tip is the first parent and origin/main reaches it.
+        up_sha = _git(merge_repo, "rev-parse", "up")
+        _set_origin_main(merge_repo)
+        _git(merge_repo, "checkout", "--detach", "main")
+        _git(merge_repo, "merge", "--no-ff", "-m", "pull_request merge ref", "feature")
+
+        paths, label = scope.changed_paths()
+        assert label == "merge HEAD^1..HEAD"
+        assert scope.merged_in_parents(label) == [up_sha]
+
+        added = scope.added_lines(label, minus_parents=[up_sha])
+        assert 3 in added.get("u.py", set())
+        assert 1 not in added.get("u.py", set())
+
+    def test_merge_parents_label_gives_the_same_answer(self, merge_repo: Path) -> None:
+        # The "merge parents" label diffs HEAD^1..HEAD^2 directly instead of
+        # through the synthetic merge commit, so its post-image is HEAD^2, not
+        # HEAD -- pinned here since the two labels compute `post` differently.
+        up_sha = _git(merge_repo, "rev-parse", "up")
+        _set_origin_main(merge_repo)
+        _git(merge_repo, "checkout", "--detach", "main")
+        _git(merge_repo, "merge", "--no-ff", "-m", "pull_request merge ref", "feature")
+
+        assert scope.merged_in_parents("merge parents") == [up_sha]
+        added = scope.added_lines("merge parents", minus_parents=[up_sha])
+        assert 3 in added.get("u.py", set())
+        assert 1 not in added.get("u.py", set())
+
+    def test_non_merge_pr_has_no_merged_in_parents(self, repo: Path) -> None:
+        # `repo`'s own base shape (feature off main, no merge at all): nothing
+        # to exclude, and an empty exclusion list changes nothing.
+        _set_origin_main(repo)
+        _git(repo, "checkout", "feature")
+
+        paths, label = scope.changed_paths()
+        assert scope.merged_in_parents(label) == []
+        assert scope.added_lines(label, minus_parents=[]) == scope.added_lines(label)
+
+    def test_a_fork_commit_before_the_merge_is_still_added(self, merge_repo: Path) -> None:
+        # `own.py` is committed on `feature` BEFORE the merge, so it sits in
+        # the merge's FIRST parent -- which must never be treated as
+        # already-merged-in, even though it is itself inside the PR range.
+        # Exempting it would weaken the gate for exactly the lines it exists
+        # to catch.
+        up_sha = _git(merge_repo, "rev-parse", "up")
+        _set_origin_main(merge_repo)
+
+        paths, label = scope.changed_paths()
+        added = scope.added_lines(label, minus_parents=[up_sha])
+        assert 1 in added.get("own.py", set())
+
+    def test_an_unresolvable_parent_sha_returns_the_unfiltered_set(self, merge_repo: Path) -> None:
+        # The strict direction: a `P` diff that cannot be run must never be
+        # read as "nothing to exclude" -- that would silently widen scope.
+        _set_origin_main(merge_repo)
+        paths, label = scope.changed_paths()
+
+        unfiltered = scope.added_lines(label)
+        filtered = scope.added_lines(label, minus_parents=["0" * 40])
+
+        assert filtered == unfiltered
+        assert 1 in filtered.get("u.py", set())  # the imported line is NOT excluded
+
+    def test_whole_tree_label_has_no_merged_in_parents(
+        self, merge_repo: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _set_origin_main(merge_repo)
+        monkeypatch.setenv(scope.WHOLE_TREE_ENV, "1")
+        _, label = scope.changed_paths()
+
+        assert scope.merged_in_parents(label) == []
+
+    def test_a_conflict_resolution_line_authored_in_the_merge_commit_is_still_added(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A line written INSIDE the merge commit itself (resolving a conflict)
+        # is absent from both the merged-in parent and the base, so it must
+        # stay judged: the exclusion is positional (git's own diff), never a
+        # content-set heuristic that could mistake "absent from P" for
+        # "authored by P".
+        for var in _GIT_LOCATION_VARS:
+            monkeypatch.delenv(var, raising=False)
+        conflict_repo = tmp_path / "conflict"
+        conflict_repo.mkdir()
+        _git(conflict_repo, "init", "-b", "main", ".")
+        _commit_file(conflict_repo, "a.py", "root")
+        _git(conflict_repo, "checkout", "-b", "up")
+        (conflict_repo / "shared.py").write_text("first\nupstream\n", encoding="utf-8")
+        _git(conflict_repo, "add", "shared.py")
+        _git(conflict_repo, "commit", "-m", "upstream: shared.py")
+        _git(conflict_repo, "checkout", "main")
+        _git(conflict_repo, "checkout", "-b", "feature")
+        (conflict_repo / "shared.py").write_text("first\nfork\n", encoding="utf-8")
+        _git(conflict_repo, "add", "shared.py")
+        _git(conflict_repo, "commit", "-m", "feature: shared.py")
+        merge = subprocess.run(
+            ["git", "merge", "--no-ff", "-m", "sync", "up"],
+            cwd=conflict_repo,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            env=_fixture_git_env(),
+        )
+        assert merge.returncode != 0, "the fixture must actually conflict"
+        (conflict_repo / "shared.py").write_text("first\nresolved\n", encoding="utf-8")
+        _git(conflict_repo, "add", "shared.py")
+        _git(conflict_repo, "commit", "--no-edit")
+
+        monkeypatch.setattr(scope, "ROOT", conflict_repo)
+        up_sha = _git(conflict_repo, "rev-parse", "up")
+        _set_origin_main(conflict_repo)
+
+        paths, label = scope.changed_paths()
+        assert scope.merged_in_parents(label) == [up_sha]
+        added = scope.added_lines(label, minus_parents=[up_sha])
+        assert 2 in added.get("shared.py", set())

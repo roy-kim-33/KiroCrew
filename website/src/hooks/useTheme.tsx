@@ -166,13 +166,21 @@ function resolveMode(pref: ModePreference): ResolvedMode {
   return pref === 'system' ? getSystemMode() : pref
 }
 
+/**
+ * The `data-theme` value the stylesheet keys a palette on. The default palette
+ * (`emerald`) is spelled as the bare mode — `dark` / `light` — because that is
+ * how `index.css` names its `:root` fallbacks; every other theme, custom ones
+ * included, is `<slug>-<mode>`. Exported so any other renderer of the same
+ * stylesheet (the Storybook preview) resolves the attribute through this one
+ * rule instead of restating it.
+ */
+export function themeDataAttribute(colorTheme: ColorTheme, mode: ResolvedMode): string {
+  return colorTheme === 'emerald' ? mode : `${colorTheme}-${mode}`
+}
+
 function applyTheme(colorTheme: ColorTheme, mode: ResolvedMode, pref: ModePreference) {
   const el = document.documentElement
-  if (colorTheme.startsWith('custom-')) {
-    el.dataset.theme = `${colorTheme}-${mode}`
-  } else {
-    el.dataset.theme = colorTheme === 'emerald' ? mode : `${colorTheme}-${mode}`
-  }
+  el.dataset.theme = themeDataAttribute(colorTheme, mode)
   el.dataset.mode = mode
   // The PREFERENCE, exposed separately from the resolved mode because the two
   // mean different things to the Electron shell. `data-mode` is what to paint;
@@ -739,9 +747,7 @@ function useThemeState(): ThemeContextValue {
   // `prefers-color-scheme` immediately; Chromium then fires a change event on
   // the media query below if the effective value moved. No-op in a browser.
   useEffect(() => {
-    const bridge = (window as unknown as {
-      electronAPI?: { setThemeMode?: (pref: string) => void }
-    }).electronAPI
+    const bridge = window.electronAPI
     bridge?.setThemeMode?.(mode)
   }, [mode])
 
@@ -749,9 +755,7 @@ function useThemeState(): ThemeContextValue {
   // mode changes. The overlay strip must match the dashboard chrome at all
   // times; sending on `resolved` (not `mode`) handles Auto switching correctly.
   useEffect(() => {
-    const bridge = (window as unknown as {
-      electronAPI?: { setTitleBarOverlayTheme?: (mode: string) => void }
-    }).electronAPI
+    const bridge = window.electronAPI
     bridge?.setTitleBarOverlayTheme?.(resolved)
   }, [resolved])
 
@@ -759,9 +763,7 @@ function useThemeState(): ThemeContextValue {
   // launch's boot splash (loading.html) paints in the user's chosen colour.
   // Reads the computed --accent after paint; a no-op in a plain browser.
   useEffect(() => {
-    const bridge = (window as unknown as {
-      electronAPI?: { setThemeAccent?: (hex: string) => void }
-    }).electronAPI
+    const bridge = window.electronAPI
     if (!bridge?.setThemeAccent) return
     const id = requestAnimationFrame(() => {
       const hex = getComputedStyle(document.documentElement).getPropertyValue('--accent').trim()

@@ -43,6 +43,12 @@ def register(app: web.Application) -> None:
     app.router.add_patch("/api/config/kirocrew", handlers.api_kirocrew_config_patch)
     app.router.add_get("/api/config/theme", handlers.api_theme_config)
     app.router.add_put("/api/config/theme", handlers.api_theme_config)
+    # Host-side backup of the renderer's own settings (localStorage), so an
+    # origin or userData change does not read as "the upgrade ate my settings".
+    # Deliberately NOT under /api/config: these keys are client-owned and never
+    # enter config.json. See kiro_crew/ui_prefs.py.
+    app.router.add_get("/api/ui-prefs", handlers.api_ui_prefs)
+    app.router.add_put("/api/ui-prefs", handlers.api_ui_prefs)
     app.router.add_get(
         "/api/onboarding/import/scan",
         handlers.api_onboarding_import_scan,
@@ -98,9 +104,7 @@ def register(app: web.Application) -> None:
     app.router.add_get("/api/mcp-gateway/metrics", handlers.api_mcp_gateway_metrics)
     app.router.add_get("/api/mcp-gateway/servers", handlers.api_mcp_gateway_servers)
     app.router.add_post("/api/mcp-gateway/servers/stub", handlers.api_mcp_gateway_set_stub)
-    app.router.add_post(
-        "/api/mcp-gateway/servers/poolable", handlers.api_mcp_gateway_set_poolable
-    )
+    app.router.add_post("/api/mcp-gateway/servers/poolable", handlers.api_mcp_gateway_set_poolable)
     app.router.add_post("/api/mcp-gateway/resolve-refresh", handlers.api_mcp_resolve_refresh)
     # AIM integration
     app.router.add_get("/api/capability/mcp", handlers.api_capability_mcp_list)

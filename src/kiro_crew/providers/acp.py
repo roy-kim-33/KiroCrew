@@ -46,6 +46,7 @@ from kiro_crew.acp.types import (
 )
 from kiro_crew.acp_backends import POLICY_ID_BY_BACKEND
 from kiro_crew.agent_sdk.backend_identity import is_claude_backend_name
+from kiro_crew.agent_sdk.capabilities import SessionCapabilities, capabilities_for
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.paths import kiro_sessions_dir
 from kiro_crew.constants import COMPACT_WAIT_TIMEOUT_SECS
@@ -488,6 +489,25 @@ class AcpProvider(LLMProvider):
         here because only this class knows where its own backend string lives.
         """
         return is_claude_backend_name(self._client.backend)
+
+    @property
+    def capabilities(self) -> SessionCapabilities:
+        """What the backend serving this session can DO -- ask this, not who it is.
+
+        The one attribute application code reads to branch on backend behaviour.
+        Every ``is_*_backend`` property beside it names an IDENTITY, and an
+        identity branch hands each new harness whichever arm the old comparison
+        happened to leave behind (harness-parity H6). Those properties stay for
+        the call sites inside this package and for the migration still in front of
+        this one; a consumer outside the boundary reads this instead, and
+        ``test_agent_sdk_capabilities`` pins that the six that already moved do
+        not go back.
+
+        Rebuilt per read rather than cached in ``__init__``: each field is a set
+        membership or a dict lookup over four ids, and an edition can register a
+        backend after this provider was constructed.
+        """
+        return capabilities_for(self._client.backend)
 
     @property
     def is_codex_backend(self) -> bool:
@@ -1382,10 +1402,12 @@ class AcpProvider(LLMProvider):
             text=e.text,
             tool_call_id=e.tool_call_id,
             title=e.title,
+            wire_title=e.wire_title,
             tool_kind=e.tool_kind,
             tool_purpose=e.tool_purpose,
             context_usage_pct=e.context_usage_pct,
             stop_reason=e.stop_reason,
+            refusal=e.refusal,
             synthetic_completion=e.synthetic_completion,
             request_id=e.request_id,
             options=e.options,

@@ -32,8 +32,10 @@ from kiro_crew.acp import kas_wire
 from kiro_crew.acp._dispatch import (
     build_permission_event,
     classify_notification,
+    error_is_refusal_terminal,
     parse_metadata,
     parse_prompt_token_usage,
+    parse_refusal,
     parse_session_update,
     parse_text_chunk,
     parse_usage_cost,
@@ -55,6 +57,7 @@ from kiro_crew.acp.client import (
     compaction_failure_is_transient,
     format_command_result,
     parse_slash_command,
+    pick_served_default,
     prompt_timeout_for_ceiling,
     resolve_usable_model,
 )
@@ -70,6 +73,7 @@ from kiro_crew.acp.liveness import (
     _consume_future_exception,
     boottime_now,
     consult_offloaded,
+    steady_now,
 )
 from kiro_crew.acp.mcp_session_report import McpSessionReport
 from kiro_crew.acp.prompt_blocks import build_prompt_blocks, summarize_prompt_structure
@@ -120,6 +124,7 @@ from kiro_crew.config.paths import kiro_sessions_dir
 from kiro_crew.constants import COMPACT_WAIT_TIMEOUT_SECS
 from kiro_crew.executors import subprocess_executor
 from kiro_crew.metrics.events import CHILD_PERMISSION_DENIED, emit_counter
+from kiro_crew.platform.context import redact_log_via_context
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
 
@@ -140,10 +145,10 @@ class WatchdogSettings:
     :data:`_TURN_CEILING_WINDOW_FRACTION` for the enforced headroom."""
 
     check_after_secs: float = 60.0
-    stale_window_secs: float = 300.0
-    tool_stall_suspect_secs: float = 3600.0
-    tool_stall_hard_cap_secs: float = 3600.0
-    model_silent_probe_secs: float = 900.0
+    stale_window_secs: float = 600.0
+    tool_stall_suspect_secs: float = 5400.0
+    tool_stall_hard_cap_secs: float = 7200.0
+    model_silent_probe_secs: float = 1800.0
     wellness_sample_secs: float = 3.0
     # Whether a per-agent watchdog_tool_stall_* override was applied to this
     # snapshot. Telemetry-only (the kirocrew.watchdog.action attr): a BOOLEAN,
@@ -428,7 +433,23 @@ class AcpRequestTimeout(AcpRuntimeError):
     the request was waiting on can attach that context before it reaches the
     user. Subclasses the base so existing ``except AcpRuntimeError`` handlers
     keep catching it.
+
+    ``transient = True`` is the retry-eligibility verdict read structurally by
+    ``llm_helpers.acp_error_is_transient`` (via ``getattr(exc, "transient",
+    None)``), the same channel ``AcpError.transient`` uses. Every request that
+    can time out here is a control-plane one — ``_send_and_await`` serves only
+    ``initialize`` / ``session/new`` / ``session/load`` / ``set_mode`` / teardown,
+    never the prompt stream (that path raises ``AcpTimeoutError``). A timeout on
+    any of those means the runtime was slow to answer a handshake, not that the
+    work failed: no prompt was dispatched, so nothing was attempted to fail. A
+    cold-start stall is transient host weather, so the retry layer should try
+    again rather than count it. Carrying the verdict on the type — instead of a
+    ``"timed out"`` string added to ``_TRANSIENT_MARKERS`` — decides eligibility
+    by exception type rather than by message wording, so a reword of the timeout
+    message cannot flip retryability.
     """
+
+    transient = True
 
 
 class AcpRuntimeProtocol(Protocol):
@@ -633,6 +654,10 @@ class AcpSessionHandle:
         # raw_tool_params for the governance keystone (sensitive-path /
         # write-protected-config) checks. Mirrors AcpClient's _tool_call_params.
         self._tool_call_raw_params: dict[str, dict] = {}
+        # toolCallId -> path named by the tool_call's diff content block, so the
+        # permission event can carry diff_path for the edit gate when the
+        # params themselves carry no path key. Same lifecycle as the caches above.
+        self._tool_call_diff_path: dict[str, str] = {}
         # toolCallId -> trusted MCP server name (_meta.kiro.mcpServerName) cached
         # from the tool_call notification so the later permission_request event
         # can carry mcp_server_name (empty on the permission payload). This is
@@ -949,6 +974,7 @@ class AcpSessionHandle:
         self._tool_call_input_redacted.clear()
         self._tool_call_is_shell.clear()
         self._tool_call_raw_params.clear()
+        self._tool_call_diff_path.clear()
         self._tool_call_mcp_server.clear()
         self._tool_call_tool_name.clear()
         self._permission_options.clear()
@@ -1896,6 +1922,53 @@ class AcpSessionHandle:
         elif isinstance(models, list):
             self._available_models = parse_advertised_models({"availableModels": models})
 
+    async def ensure_served_default(self) -> None:
+        """Move an inheriting pooled session off a backend default it cannot run.
+
+        The pooled twin of ``AcpClient._ensure_served_default``.
+        ``store_session_config`` records ``session/new``'s ``currentModelId``
+        as the session's resolved model without judging it against the list the
+        same response advertised. A partition does not have to serve the model
+        its backend defaults to — an account whose region omits ``"auto"`` can
+        be handed ``"auto"`` at birth — and then every prompt on this session
+        dies with "your account does not have access to model 'auto'".
+
+        Only the kiro backend: its advertised ids are exactly the ids
+        ``session/set_model`` accepts, so "absent from the advertised list"
+        genuinely means unusable there.
+
+        Routed through :meth:`set_model` rather than a second wire call, so the
+        KAS-vs-``session/set_model`` verb choice and the window/meter rebase
+        stay in one place; the id handed to it is already an advertised one, so
+        its own ``resolve_usable_model`` passes it straight through.
+
+        ``_model`` is restored afterwards. That field is the session's INTENT
+        (``""``/``"auto"`` mean "inherit"), and it is what the warm-pool
+        re-apply and the slot backfill read: left as the fallback id, a fresh
+        pooled session would be pinned to whichever model happened to be first
+        on the list, and an unpinned slot would stop following the default.
+        Only ``_resolved_model_id`` — what the session actually runs — changes.
+        """
+        if self._runtime.acp_backend == ACP_BACKEND_KIRO:
+            unserved = self._resolved_model_id or ""
+            fallback = pick_served_default(unserved, self._advertised_model_ids())
+            if not fallback:
+                return
+            _unserved_log = redact_log_via_context(str(unserved))
+            logger.warning(
+                "ACP backend default %s is not in this account's served list (advertised: %s); "
+                "switching session %s to %s",
+                _unserved_log,
+                ", ".join(self._advertised_model_ids()),
+                self._session_id,
+                fallback,
+            )
+            intent = self._model
+            try:
+                await self.set_model(fallback)
+            finally:
+                self._model = intent
+
     @staticmethod
     def _normalize_models(advertised: list[Any]) -> list[dict[str, str]]:
         """Normalize advertised models to ``{modelId, name, description}`` with
@@ -2309,7 +2382,7 @@ class AcpSessionHandle:
                             self._log_working_deferral(_tool_idle, evidence, timeout)
                             continue
                         # UNKNOWN acts at the suspect window. The suspect
-                        # default (1h) is BUILD-scale forbearance — an LLM-shaped
+                        # default (90 min) is BUILD-scale forbearance — an LLM-shaped
                         # stall (flat subtree whose only live evidence is an
                         # established backend socket: a model turn riding inside
                         # a tool, e.g. kiro-cli use_subagent) narrows to the
@@ -2432,9 +2505,9 @@ class AcpSessionHandle:
                         # user"), and an unacked cancel confirms the wedge via the
                         # unresponsive-cancel branch at the loop top.
                         # ``window`` = "extended" when the established_flat
-                        # model-wait probe window (model_silent_probe_secs, 900s)
+                        # model-wait probe window (model_silent_probe_secs, 1800s)
                         # governed the decision instead of the ordinary stale
-                        # window (stale_window_secs, 300s). The established_flat
+                        # window (stale_window_secs, 600s). The established_flat
                         # case is an EXTENSION for model-wait (silence of a
                         # non-streamed think), not a narrowing as on the tool
                         # branch — emitting "extended" lets dashboards distinguish
@@ -2479,6 +2552,21 @@ class AcpSessionHandle:
                 # Turn-complete response
                 if msg.is_response_for(req_id):
                     if msg.error:
+                        if error_is_refusal_terminal(msg.error, self.last_prompt_stats.refusal):
+                            # A content-filter refusal whose terminal is the
+                            # bare ``-32603 Internal error``: the reason already
+                            # arrived on metadata, so this is the refusal's own
+                            # terminal, not a backend fault. Raising would lose
+                            # the reason to the unknown-shape formatter and hand
+                            # a deterministic decline to the retry ladder.
+                            reason, _refusal = self.last_prompt_stats.terminal_refusal("")
+                            self._last_stop_reason = reason
+                            self._tool_dispatched = False
+                            self._turn_done.set()
+                            yield AcpEvent(kind=EVENT_COMPLETE, stop_reason=reason,
+                                           refusal=_refusal,
+                                           usage=self.last_prompt_stats.to_turn_usage())
+                            return
                         # Same as _wait_for_response: route through the shared
                         # raise helper so a mid-turn failure surfaces actionable
                         # prose instead of the raw JSON-RPC dict, keeps its
@@ -2535,10 +2623,12 @@ class AcpSessionHandle:
                                     yield AcpEvent(
                                         kind=EVENT_AGENT_SWITCHED, text=name
                                     )
+                    reason, _refusal = self.last_prompt_stats.terminal_refusal(reason)
                     self._last_stop_reason = reason
                     self._tool_dispatched = False
                     self._turn_done.set()
                     yield AcpEvent(kind=EVENT_COMPLETE, stop_reason=reason,
+                                   refusal=_refusal,
                                    usage=self.last_prompt_stats.to_turn_usage())
                     return
                 if msg.method is None and msg.id is not None:
@@ -2933,7 +3023,7 @@ class AcpSessionHandle:
         "standard" (default), "narrowed" (a tool-branch tag reduces the
         build-scale suspect window — established_flat to the model-silent budget,
         shell_child_absent to the ordinary silence window), or "extended"
-        (model-wait established_flat extends the 300s stale window to the
+        (model-wait established_flat extends the 600s stale window to the
         model-silent probe window for a non-streamed server-side think).
         ``agent_override`` is the per-agent-override BOOLEAN from the settings
         snapshot — deliberately NOT the agent name (per-agent joins happen via
@@ -3041,6 +3131,14 @@ class AcpSessionHandle:
             self.last_prompt_stats.note_pct_reported()
             self._backfill_context_window(pct_f)
         self.last_prompt_stats.credits += credits
+        # Every handle on the shared runtime is kiro-cli or KAS -- both members
+        # of ACP_BACKENDS_STRUCTURED_REFUSAL (ACP_BACKENDS_ACP_RUNTIME is a
+        # subset of it, pinned by test_harness_parity) -- so the refusal
+        # envelope is read unconditionally here. Folded onto the terminal by
+        # ``terminal_refusal``; a frame without the envelope leaves it alone.
+        _refusal = parse_refusal(params)
+        if _refusal is not None:
+            self.last_prompt_stats.refusal = _refusal
 
     def _backfill_context_window(self, pct: float) -> None:
         """Derive window/used tokens from a percentage-only reading.
@@ -3303,6 +3401,7 @@ class AcpSessionHandle:
             tool_input_redacted_cache=self._tool_call_input_redacted,
             shell_cache=self._tool_call_is_shell,
             raw_params_cache=self._tool_call_raw_params,
+            diff_path_cache=self._tool_call_diff_path,
             mcp_server_name_cache=self._tool_call_mcp_server,
             tool_name_cache=self._tool_call_tool_name,
             # ORIGIN-BOUND provenance: cache entries are keyed by the
@@ -3615,6 +3714,7 @@ class AcpSessionHandle:
                 tool_input_redacted_cache=self._tool_call_input_redacted,
                 shell_cache=self._tool_call_is_shell,
                 raw_params_cache=self._tool_call_raw_params,
+                diff_path_cache=self._tool_call_diff_path,
                 mcp_server_name_cache=self._tool_call_mcp_server,
                 tool_name_cache=self._tool_call_tool_name,
                 cache_scope=frame_sid,
@@ -3730,6 +3830,7 @@ class AcpSessionHandle:
                         tool_input_redacted_cache=self._tool_call_input_redacted,
                         shell_cache=self._tool_call_is_shell,
                         raw_params_cache=self._tool_call_raw_params,
+                        diff_path_cache=self._tool_call_diff_path,
                         mcp_server_name_cache=self._tool_call_mcp_server,
                         tool_name_cache=self._tool_call_tool_name,
                         cache_scope=self._session_id,
@@ -3752,6 +3853,7 @@ class AcpSessionHandle:
             tool_input_redacted_cache=self._tool_call_input_redacted,
             shell_cache=self._tool_call_is_shell,
             raw_params_cache=self._tool_call_raw_params,
+            diff_path_cache=self._tool_call_diff_path,
             mcp_server_name_cache=self._tool_call_mcp_server,
             tool_name_cache=self._tool_call_tool_name,
             cache_scope=self._session_id,
@@ -3778,6 +3880,7 @@ class AcpSessionHandle:
                     command=ev.tool_input,
                     dispatch_ts=time.monotonic(),
                     dispatch_boot_ts=boottime_now(),
+                    dispatch_steady_ts=steady_now(),
                     dispatch_parked_secs=self._parked_total,
                     is_shell=ev.is_shell,
                     tool_name=ev.tool_name,
