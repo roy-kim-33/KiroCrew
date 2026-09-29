@@ -9,7 +9,9 @@ import MarkdownRenderer from './MarkdownRenderer'
 
 import { i18nT } from '../i18n/t'
 import { SettingsLink } from './SettingsLink'
+import { Glass } from './Glass'
 
+<<<<<<< HEAD
 // Tip docs live in the repo at src/kiro_crew/docs/ (same base the Security and
 // Discord settings panels link to).
 const DOCS_BASE = 'https://github.com/roy-kim-33/KiroCrew/blob/main/src/kiro_crew/docs'
@@ -21,6 +23,12 @@ export function tipDocHref(doc: string | undefined): string | null {
   if (!doc || !DOC_FILENAME_RE.test(doc)) return null
   return `${DOCS_BASE}/${doc}`
 }
+=======
+// The resolver lives in `utils/docsLink`: a pure function must not live behind a
+// component module, or importing it drags this file's router and markdown
+// dependencies along with it.
+import { tipDocHref } from '../utils/docsLink'
+>>>>>>> upstream/main
 
 // Optional one-click action button on a tip. A single 'route' kind for now:
 // navigate to an internal dashboard path (an exact settings tab/control via
@@ -117,16 +125,21 @@ export function TipCard({ tip, onDismiss }: TipCardProps) {
 
   return (
     <motion.div
-      data-testid="tip-card"
-      className="w-full flex items-start gap-2.5 px-4 py-2 rounded-md text-xs shadow-lg"
-      style={{
-        background: 'color-mix(in srgb, var(--accent) 6%, var(--bg-elevated))',
-        border: '1px solid color-mix(in srgb, var(--accent) 12%, transparent)',
-      }}
+      className="w-full"
       initial={{ y: 6, opacity: 0 }}
       animate={{ y: 0, opacity: 1 }}
       exit={{ y: 4, opacity: 0 }}
       transition={{ duration: 0.25, ease: [0.2, 0.8, 0.2, 1] }}
+    >
+    {/* Glass card (components/Glass.tsx, chip variant — the composer's own
+        primitive): the accent is mixed into the glass tint (`glass-accent`),
+        and `.glass-shadow` gives it the same offset-free depth as the composer
+        it is attached to. The motion wrapper above only moves it in. */}
+    <Glass
+      variant="chip"
+      radius={6}
+      data-testid="tip-card"
+      className="glass-accent glass-shadow w-full flex items-start gap-2.5 px-4 py-2 rounded-md text-xs"
       role="complementary"
       aria-label={i18nT('components.tipCard.feature_tip')}
       title={tooltipText}
@@ -188,10 +201,11 @@ export function TipCard({ tip, onDismiss }: TipCardProps) {
             >
               {i18nT('components.tipCard.turn_off_tips')}
             </button>
-            {/* The Feature Tips toggle lives in Settings → Chat. No `highlight`
-                yet: that toggle has no setting anchor to flash. */}
+            {/* The Feature Tips toggle lives in Settings → Chat → Discovery. No
+                `highlight` yet: that toggle has no setting anchor to flash. */}
             <SettingsLink
               tab="chat"
+              sub="discovery"
               className="inline-flex items-center rounded p-0.5 transition-colors hover:bg-[var(--bg-hover)]"
               style={{ color: 'var(--muted)' }}
               aria-label={i18nT('components.tipCard.tip_settings')}
@@ -213,6 +227,7 @@ export function TipCard({ tip, onDismiss }: TipCardProps) {
           <X size={12} style={{ color: 'var(--muted)' }} />
         </button>
       </div>
+    </Glass>
     </motion.div>
   )
 }

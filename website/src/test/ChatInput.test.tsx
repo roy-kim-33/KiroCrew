@@ -339,12 +339,12 @@ describe('ChatInput', () => {
   describe('prefill hint', () => {
     it('shows prefill hint when enabled', () => {
       renderWithProviders(<ChatInput {...defaultProps} prefillHint />)
-      expect(screen.getByText(/Plan pre-filled/)).toBeInTheDocument()
+      expect(screen.getByText(/Prompt pre-filled/)).toBeInTheDocument()
     })
 
     it('does not show prefill hint by default', () => {
       renderWithProviders(<ChatInput {...defaultProps} />)
-      expect(screen.queryByText(/Plan pre-filled/)).not.toBeInTheDocument()
+      expect(screen.queryByText(/Prompt pre-filled/)).not.toBeInTheDocument()
     })
   })
 
@@ -378,6 +378,29 @@ describe('ChatInput', () => {
     it('disables the + menu button when uploading', () => {
       renderWithProviders(<ChatInput {...defaultProps} isMac onUploadFiles={vi.fn()} onScreenshot={vi.fn()} uploading />)
       expect(screen.getByTitle('Add files & options')).toBeDisabled()
+    })
+
+    /* #5744: while an upload is in flight every attach entry point is
+     * disabled, so without this control the only way out of a slow transfer
+     * is reloading the page. */
+    it('offers a cancel control only while uploading', () => {
+      const { unmount } = renderWithProviders(<ChatInput {...defaultProps} onUploadFiles={vi.fn()} onCancelUpload={vi.fn()} />)
+      expect(screen.queryByRole('button', { name: 'Cancel upload' })).not.toBeInTheDocument()
+      unmount()
+      renderWithProviders(<ChatInput {...defaultProps} onUploadFiles={vi.fn()} onCancelUpload={vi.fn()} uploading />)
+      expect(screen.getByRole('button', { name: 'Cancel upload' })).toBeInTheDocument()
+    })
+
+    it('renders no cancel control when the host passes no onCancelUpload', () => {
+      renderWithProviders(<ChatInput {...defaultProps} onUploadFiles={vi.fn()} uploading />)
+      expect(screen.queryByRole('button', { name: 'Cancel upload' })).not.toBeInTheDocument()
+    })
+
+    it('calls onCancelUpload when the cancel control is pressed', () => {
+      const onCancelUpload = vi.fn()
+      renderWithProviders(<ChatInput {...defaultProps} onUploadFiles={vi.fn()} onCancelUpload={onCancelUpload} uploading />)
+      fireEvent.click(screen.getByRole('button', { name: 'Cancel upload' }))
+      expect(onCancelUpload).toHaveBeenCalledTimes(1)
     })
   })
 
@@ -483,6 +506,61 @@ describe('ChatInput', () => {
       instrument(ta, { initialScrollTop: 0, scrollHeight: 100, clientHeight: 140 })
       fireEvent.input(ta)
       expect(ta.scrollTop).toBe(0)
+    })
+
+    // The snap is for a caret the user placed. A value the PARENT set -- an error
+    // hand-off's report seeded into a fresh session, a slot's draft restore -- is
+    // not that, and the same focused + caret-at-end + overflowing state yanked
+    // the view to the last line of the seed, hiding the sentence that says what
+    // broke. The caret is not at risk there: it only moves on a real edit, and a
+    // real edit arrives through the `input` event above.
+    it('does not snap for a parent-driven value change (a seeded prompt is read from its first line)', () => {
+      const seed = 'This error just came up.\n\n```error-report\n- Route: /apps/x\n- Request: /api/apps/x -> HTTP 500\n- Message: boom\n```'
+      const { rerender } = renderWithProviders(<ChatInput {...defaultProps} value="" />)
+      const ta = screen.getByLabelText('Message input') as HTMLTextAreaElement
+      setActive(ta)
+      instrument(ta, { initialScrollTop: 0, scrollHeight: 352, clientHeight: 140 })
+      // Programmatic value set: the browser leaves the caret at the end.
+      ta.setSelectionRange(seed.length, seed.length)
+      rerender(<ChatInput {...defaultProps} value={seed} prefillHint />)
+      expect(ta.scrollTop).toBe(0)
+    })
+
+    // The other half of the rule: a re-measure at an UNCHANGED value (the hint
+    // expiring after the user typed, which drops the cap from 320 to 140) is a
+    // viewport change under a caret the user placed, so the caret is followed --
+    // otherwise the line they just typed would be below the fold.
+    it('follows the caret when the cap shrinks under an unchanged value', () => {
+      const value = 'a\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl'
+      const { rerender } = renderWithProviders(<ChatInput {...defaultProps} value={value} prefillHint />)
+      const ta = screen.getByLabelText('Message input') as HTMLTextAreaElement
+      ta.setSelectionRange(value.length, value.length)
+      setActive(ta)
+      instrument(ta, { initialScrollTop: 0, scrollHeight: 289, clientHeight: 140 })
+      rerender(<ChatInput {...defaultProps} value={value} />)
+      expect(ta.scrollTop).toBe(289)
+    })
+
+    it('resets the scroll offset when a seed replaces the box, so it starts at its first line', () => {
+      const value = 'a\nb\nc\nd\ne\nf\ng\nh'
+      const { rerender } = renderWithProviders(<ChatInput {...defaultProps} value={value} />)
+      const ta = screen.getByLabelText('Message input') as HTMLTextAreaElement
+      // The box was scrolled for the previous text; the seed swaps the value under it.
+      instrument(ta, { initialScrollTop: 120, scrollHeight: 352, clientHeight: 140 })
+      rerender(<ChatInput {...defaultProps} value={'This error just came up.\n\n```error-report\n- Message: boom\n```'} prefillHint />)
+      expect(ta.scrollTop).toBe(0)
+    })
+
+    it('keeps the scroll offset when the seed was appended to the draft the user was writing', () => {
+      // The widget send path joins its text onto the trimmed draft and raises
+      // the same hint; the appended tail is the new text, so the offset the user
+      // had is the right one and a jump to the top would hide what just arrived.
+      const draft = 'a\nb\nc\nd\ne\nf\ng\nh  '
+      const { rerender } = renderWithProviders(<ChatInput {...defaultProps} value={draft} />)
+      const ta = screen.getByLabelText('Message input') as HTMLTextAreaElement
+      instrument(ta, { initialScrollTop: 120, scrollHeight: 352, clientHeight: 320 })
+      rerender(<ChatInput {...defaultProps} value={`${draft.trimEnd()}\nwidget text`} prefillHint />)
+      expect(ta.scrollTop).toBe(120)
     })
   })
 
@@ -773,12 +851,11 @@ describe('ChatInput', () => {
   // ── Reasoning effort merged into model button ──
   describe('reasoning effort button', () => {
     it('renders for acp provider', () => {
-      const onClick = vi.fn()
       renderWithProviders(
         <ChatInput {...defaultProps}
           providerId="acp"
           reasoningEffort="high"
-          onReasoningEffortClick={onClick}
+          hasEffort
           modelName="claude-opus-4.7"
           onModelClick={vi.fn()}
         />
@@ -791,7 +868,7 @@ describe('ChatInput', () => {
         <ChatInput {...defaultProps}
           providerId="acp"
           reasoningEffort=""
-          onReasoningEffortClick={vi.fn()}
+          hasEffort
           modelName="claude-opus-4.7"
           onModelClick={vi.fn()}
         />
@@ -799,12 +876,12 @@ describe('ChatInput', () => {
       expect(screen.getByText('Default')).toBeInTheDocument()
     })
 
-    it('shown when onReasoningEffortClick provided regardless of providerId', () => {
+    it('shown when hasEffort is set regardless of providerId', () => {
       renderWithProviders(
         <ChatInput {...defaultProps}
           providerId="acp"
           reasoningEffort="high"
-          onReasoningEffortClick={vi.fn()}
+          hasEffort
           modelName="claude-opus-4.7"
           onModelClick={vi.fn()}
         />
@@ -812,33 +889,73 @@ describe('ChatInput', () => {
       expect(screen.getByText('High')).toBeInTheDocument()
     })
 
-    it('hidden when handler missing even on supported provider', () => {
+    it('hidden when hasEffort is unset even on supported provider', () => {
       renderWithProviders(
         <ChatInput {...defaultProps} providerId="acp" reasoningEffort="high" modelName="claude-opus-4.7" onModelClick={vi.fn()} />
       )
       expect(screen.queryByText('High')).not.toBeInTheDocument()
     })
 
-    it('shown when providerId is undefined but callback provided', () => {
+    it('shown when providerId is undefined but hasEffort is set', () => {
       renderWithProviders(
-        <ChatInput {...defaultProps} reasoningEffort="high" onReasoningEffortClick={vi.fn()} modelName="claude-opus-4.7" onModelClick={vi.fn()} />
+        <ChatInput {...defaultProps} reasoningEffort="high" hasEffort modelName="claude-opus-4.7" onModelClick={vi.fn()} />
       )
       expect(screen.getByText('High')).toBeInTheDocument()
     })
+
+    // Model + effort are ONE control (docs/decisions/2026-06-14): the effort
+    // level rides inside the model chip and is edited inside the model
+    // picker. The composer never grows a second, standalone effort button.
+    it.each(['claude-opus-4.7', 'gpt-6-sol', 'global.anthropic.claude-opus-4-8[1m]'])(
+      'never renders a standalone effort button for %s', modelName => {
+        renderWithProviders(
+          <ChatInput {...defaultProps}
+            providerId="acp"
+            reasoningEffort="high"
+            hasEffort
+            modelName={modelName}
+            onModelClick={vi.fn()}
+          />
+        )
+        expect(screen.queryByTestId('composer-effort-chip')).toBeNull()
+        expect(screen.queryByRole('button', { name: 'Reasoning effort' })).toBeNull()
+        expect(screen.getByTestId('composer-model-chip')).toHaveTextContent('High')
+      },
+    )
 
     it('disabled while running', () => {
       renderWithProviders(
         <ChatInput {...defaultProps}
           providerId="acp"
           reasoningEffort="medium"
-          onReasoningEffortClick={vi.fn()}
+          hasEffort
           modelName="claude-opus-4.7"
           onModelClick={vi.fn()}
           isRunning
         />
       )
-      const btn = screen.getByTitle('Stop the current response to switch model')
+      // The chip still shows the level while running, so the title (the only
+      // readout on a narrow shelf) and the accessible name keep carrying it.
+      const btn = screen.getByTitle('Stop the current response to switch model · Reasoning effort: Medium')
       expect(btn).toBeDisabled()
+      expect(btn).toHaveAccessibleName('Stop the current response to switch model · Reasoning effort: Medium')
+    })
+
+    it('carries the effort level on the routed chip too', () => {
+      renderWithProviders(
+        <ChatInput {...defaultProps}
+          providerId="acp"
+          reasoningEffort="high"
+          hasEffort
+          modelName="auto"
+          modelIsJevRouted
+          onModelClick={vi.fn()}
+        />
+      )
+      const chip = screen.getByTestId('composer-model-chip')
+      expect(chip).toHaveTextContent('High')
+      expect(chip).toHaveAccessibleName(/ · Reasoning effort: High$/)
+      expect(chip).toHaveAttribute('title', chip.getAttribute('aria-label'))
     })
 
     it('invokes onModelClick with click rect', () => {
@@ -847,12 +964,12 @@ describe('ChatInput', () => {
         <ChatInput {...defaultProps}
           providerId="acp"
           reasoningEffort="low"
-          onReasoningEffortClick={vi.fn()}
+          hasEffort
           modelName="claude-opus-4.7"
           onModelClick={onModelClick}
         />
       )
-      fireEvent.click(screen.getByTitle('Model: claude-opus-4.7'))
+      fireEvent.click(screen.getByTitle('Model: claude-opus-4.7 · Reasoning effort: Low'))
       expect(onModelClick).toHaveBeenCalledOnce()
       // First arg should be a DOMRect-like object
       expect(onModelClick.mock.calls[0][0]).toBeTruthy()
@@ -1190,7 +1307,10 @@ describe('ChatInput', () => {
   describe('Quick Send', () => {
     it('passes quickSend to FollowUpBar when options present', () => {
       renderWithProviders(<ChatInput {...defaultProps} followUpOptions={['A', 'B']} followUpPicked={new Set()} onFollowUpSelect={vi.fn()} quickSend={true} />)
-      expect(screen.getAllByTitle(/Click to send instantly/).length).toBeGreaterThan(0)
+      // The instant-send hint now lives in the hover tooltip, not a title attribute.
+      fireEvent.focus(screen.getByRole('button', { name: 'A' }))
+      expect(screen.getByRole('tooltip').textContent).toMatch(/Click to send instantly/)
+      fireEvent.blur(screen.getByRole('button', { name: 'A' }))
     })
 
     it('fires onFollowUpSelect with MouseEvent on option click', () => {
@@ -1295,14 +1415,15 @@ describe('ChatInput', () => {
   })
 
   describe('split send button while running (steer default)', () => {
-    const runningProps = () => ({
+    const runningProps = (overrides: Record<string, unknown> = {}) => ({
       ...defaultProps,
       value: 'more',
       isRunning: true,
       canSteer: true,
       onStop: vi.fn(),
       onSend: vi.fn(),
-      onSteer: vi.fn(),
+      onSteer: vi.fn() as (() => void) | undefined,
+      ...overrides,
     })
 
     it('renders Steer as the default main action with a dropdown caret', () => {
@@ -1325,6 +1446,65 @@ describe('ChatInput', () => {
       fireEvent.keyDown(screen.getByLabelText('Message input'), { key: 'Enter' })
       expect(p.onSteer).toHaveBeenCalledTimes(1)
       expect(p.onSend).not.toHaveBeenCalled()
+    })
+
+    // ⌘↩ / Ctrl+Enter while the split is showing performs the OTHER action for
+    // that one send (#4608, the Claude Code / Codex gesture).
+    it('Ctrl+Enter queues (onSend) while running in steer mode — the one-off flip', () => {
+      const p = runningProps()
+      renderWithProviders(<ChatInput {...p} />)
+      fireEvent.keyDown(screen.getByLabelText('Message input'), { key: 'Enter', ctrlKey: true })
+      expect(p.onSend).toHaveBeenCalledTimes(1)
+      expect(p.onSteer).not.toHaveBeenCalled()
+      // The flip is one-shot: the next plain Enter is back to the split's mode.
+      fireEvent.keyDown(screen.getByLabelText('Message input'), { key: 'Enter' })
+      expect(p.onSteer).toHaveBeenCalledTimes(1)
+    })
+
+    it('Ctrl+Enter steers while running in queue mode', () => {
+      safeSetItem('mc-busy-send-mode:no-slot', 'queue')
+      const p = runningProps()
+      renderWithProviders(<ChatInput {...p} />)
+      fireEvent.keyDown(screen.getByLabelText('Message input'), { key: 'Enter', metaKey: true })
+      expect(p.onSteer).toHaveBeenCalledTimes(1)
+      expect(p.onSend).not.toHaveBeenCalled()
+    })
+
+    it('Ctrl+Enter is a plain send when the composer is idle (unchanged behaviour)', () => {
+      const p = runningProps({ isRunning: false })
+      renderWithProviders(<ChatInput {...p} />)
+      fireEvent.keyDown(screen.getByLabelText('Message input'), { key: 'Enter', ctrlKey: true })
+      expect(p.onSend).toHaveBeenCalledTimes(1)
+      expect(p.onSteer).not.toHaveBeenCalled()
+    })
+
+    it('Ctrl+Enter cannot steer a slot with no steer path — it queues like Enter', () => {
+      const p = runningProps({ canSteer: false, onSteer: undefined })
+      renderWithProviders(<ChatInput {...p} />)
+      fireEvent.keyDown(screen.getByLabelText('Message input'), { key: 'Enter', ctrlKey: true })
+      expect(p.onSend).toHaveBeenCalledTimes(1)
+    })
+
+    it('in ctrl-enter send mode the modified Enter is the send key, not a flip', () => {
+      const p = runningProps({ sendOnEnter: 'ctrl-enter' as const })
+      renderWithProviders(<ChatInput {...p} />)
+      fireEvent.keyDown(screen.getByLabelText('Message input'), { key: 'Enter', ctrlKey: true })
+      expect(p.onSteer).toHaveBeenCalledTimes(1) // split mode (steer), no flip
+      expect(p.onSend).not.toHaveBeenCalled()
+    })
+
+    it('clicking the split main button never flips (a MouseEvent is not `true`)', () => {
+      const p = runningProps()
+      renderWithProviders(<ChatInput {...p} />)
+      fireEvent.click(screen.getByTestId('busy-send-button'))
+      expect(p.onSteer).toHaveBeenCalledTimes(1)
+      expect(p.onSend).not.toHaveBeenCalled()
+    })
+
+    it('the split menu names the flip chord', () => {
+      renderWithProviders(<ChatInput {...runningProps()} />)
+      fireEvent.click(screen.getByTestId('busy-send-caret'))
+      expect(screen.getByText(/queues this message instead/)).toBeInTheDocument()
     })
 
     it('dropdown switches to Queue — main button and Enter then queue, choice persists', () => {
@@ -1386,6 +1566,96 @@ describe('ChatInput', () => {
       fireEvent.keyDown(screen.getByLabelText('Message input'), { key: 'Enter' })
       expect(p.onSend).toHaveBeenCalledTimes(1)
       expect(p.onSteer).not.toHaveBeenCalled()
+    })
+  })
+
+  /* busyMode="steer-only": the surface has no queue concept (a member DM
+   * thread is a conversation with one named peer). While busy the composer
+   * keeps the PLAIN send button and every send steers. The main chat and
+   * split view never pass it, so the default stays the split button.
+   * Mutation checks: drop `steerOnly ||` from steerActive -> the persisted-
+   * queue test goes RED; drop the steer-only render branch -> the "no
+   * split" tests go RED. */
+  describe('busyMode="steer-only" while running', () => {
+    const steerOnlyProps = () => ({
+      ...defaultProps,
+      value: 'more',
+      isRunning: true,
+      canSteer: true,
+      busyMode: 'steer-only' as const,
+      onStop: vi.fn(),
+      onSend: vi.fn(),
+      onSteer: vi.fn(),
+    })
+
+    it('renders the plain send button — no split button, no caret, no mode picker', () => {
+      renderWithProviders(<ChatInput {...steerOnlyProps()} />)
+      const send = screen.getByTestId('steer-only-send')
+      expect(send).toHaveAttribute('aria-label', 'Send')
+      expect(send).not.toBeDisabled()
+      expect(screen.queryByTestId('busy-send-button')).not.toBeInTheDocument()
+      expect(screen.queryByTestId('busy-send-caret')).not.toBeInTheDocument()
+      expect(screen.queryByRole('button', { name: 'Queue message' })).not.toBeInTheDocument()
+      expect(screen.queryByRole('button', { name: 'Send options' })).not.toBeInTheDocument()
+    })
+
+    it('click steers (onSteer), never onSend', () => {
+      const p = steerOnlyProps()
+      renderWithProviders(<ChatInput {...p} />)
+      fireEvent.click(screen.getByTestId('steer-only-send'))
+      expect(p.onSteer).toHaveBeenCalledTimes(1)
+      expect(p.onSend).not.toHaveBeenCalled()
+    })
+
+    it('Enter steers', () => {
+      const p = steerOnlyProps()
+      renderWithProviders(<ChatInput {...p} />)
+      fireEvent.keyDown(screen.getByLabelText('Message input'), { key: 'Enter' })
+      expect(p.onSteer).toHaveBeenCalledTimes(1)
+      expect(p.onSend).not.toHaveBeenCalled()
+    })
+
+    it('ignores a persisted Queue preference — there is no Queue on this surface', () => {
+      safeSetItem('mc-busy-send-mode', 'queue')
+      const p = steerOnlyProps()
+      renderWithProviders(<ChatInput {...p} />)
+      expect(screen.getByTestId('steer-only-send')).toHaveAttribute('aria-label', 'Send')
+      fireEvent.keyDown(screen.getByLabelText('Message input'), { key: 'Enter' })
+      expect(p.onSteer).toHaveBeenCalledTimes(1)
+      expect(p.onSend).not.toHaveBeenCalled()
+    })
+
+    it('still falls back to onSend while stopping (soft_pending) — stop state wins', () => {
+      const p = { ...steerOnlyProps(), stopState: 'soft_pending' as const }
+      renderWithProviders(<ChatInput {...p} />)
+      fireEvent.keyDown(screen.getByLabelText('Message input'), { key: 'Enter' })
+      expect(p.onSend).toHaveBeenCalledTimes(1)
+      expect(p.onSteer).not.toHaveBeenCalled()
+    })
+
+    it('idle composer sends normally (onSend) regardless of busyMode', () => {
+      const p = { ...steerOnlyProps(), isRunning: false }
+      renderWithProviders(<ChatInput {...p} />)
+      fireEvent.click(screen.getByLabelText('Send'))
+      expect(p.onSend).toHaveBeenCalledTimes(1)
+      expect(p.onSteer).not.toHaveBeenCalled()
+      expect(screen.queryByTestId('steer-only-send')).not.toBeInTheDocument()
+    })
+
+    it('without a steer path it degrades to the queue button like the split mode does', () => {
+      const p = { ...steerOnlyProps(), canSteer: false, onSteer: undefined }
+      renderWithProviders(<ChatInput {...p} />)
+      expect(screen.queryByTestId('steer-only-send')).not.toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'Queue message' })).toBeInTheDocument()
+    })
+
+    it('the default busyMode is the split button (main chat unchanged)', () => {
+      // An explicit `undefined` resolves to the prop default exactly as an
+      // omitted prop does — this is what ChatPage and split view pass.
+      renderWithProviders(<ChatInput {...steerOnlyProps()} busyMode={undefined} />)
+      expect(screen.getByTestId('busy-send-button')).toBeInTheDocument()
+      expect(screen.getByTestId('busy-send-caret')).toBeInTheDocument()
+      expect(screen.queryByTestId('steer-only-send')).not.toBeInTheDocument()
     })
   })
 
@@ -1769,5 +2039,22 @@ describe('ChatInput composer paste-token expand', () => {
     ta.setSelectionRange(2, 2)
     fireEvent.click(ta, { detail: 2 })
     expect(ta.value).toBe(block.content) // expanded inline
+  })
+})
+
+describe('ChatInput — busy split menu hint is mode-gated', () => {
+  const props = (overrides: Record<string, unknown> = {}) => ({
+    value: 'more', onChange: vi.fn(), isRunning: true, canSteer: true, onStop: vi.fn(), onSend: vi.fn(), onSteer: vi.fn(), ...overrides,
+  })
+  it('names the concrete flip for the current mode in `enter` send mode', () => {
+    safeSetItem('mc-busy-send-mode:no-slot', 'queue')
+    renderWithProviders(<ChatInput {...props()} />)
+    fireEvent.click(screen.getByTestId('busy-send-caret'))
+    expect(screen.getByText(/steers with this message instead/)).toBeInTheDocument()
+  })
+  it('shows no flip hint in ctrl-enter mode, where the chord is the send key', () => {
+    renderWithProviders(<ChatInput {...props({ sendOnEnter: 'ctrl-enter' })} />)
+    fireEvent.click(screen.getByTestId('busy-send-caret'))
+    expect(screen.queryByText(/this message instead/)).not.toBeInTheDocument()
   })
 })

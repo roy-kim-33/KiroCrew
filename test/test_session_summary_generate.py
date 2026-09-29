@@ -8,17 +8,20 @@ the trap wiring rather than any model behavior.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
+import logging
 
 import pytest
 from chat_test_helpers import move_transcript_past
 
+from kiro_crew import history as history_mod
 from kiro_crew.config.loader import KiroCrewConfig, SessionSummaryConfig
 from kiro_crew.dashboard import chat_summary
 from kiro_crew.dashboard.chat_persistence import _save_slot_to_history
 from kiro_crew.dashboard.chat_utils import slot_history_key
 from kiro_crew.dashboard.state import _ChatSlot
-from kiro_crew.history import ConversationLog
+from kiro_crew.history import ConversationLog, HistoryLockTimeout
 from kiro_crew.session_summary import (
     count_user_turns,
     count_user_turns_in_records,
@@ -26,7 +29,7 @@ from kiro_crew.session_summary import (
 )
 
 
-def _make_slot(messages=None, memory_mode="default"):
+def _make_slot(messages=None, memory_mode="persistent"):
     """A real _ChatSlot: the generator resolves its transcript key, which a
     stand-in object cannot answer for."""
     slot = _ChatSlot("s1")
@@ -172,6 +175,85 @@ class TestGating:
         assert called == []
         assert state.conversation_log.get_cached_intent_summary(state.hkey) is None
 
+    @pytest.mark.parametrize("line_mode", ["incognito", "temporary", "Incognito"])
+    async def test_a_restricted_on_disk_line_refuses_a_slot_that_still_reads_persistent(
+        self, env, monkeypatch, line_mode
+    ):
+        """The rows come from DISK, so the file's own contract gates them.
+
+        Another writer -- a second gateway on this data home, a same-key
+        hand-over, a subagent appending -- can tighten the line while this slot
+        still reads persistent in memory. The slot gate passes; the file must not.
+        """
+        state, slot = env
+        assert slot.memory_mode == "persistent"
+        state.conversation_log.update_metadata(state.hkey, {"memory_mode": line_mode})
+        called = []
+        _stub_llm(monkeypatch, _GOOD_REPLY, called)
+        assert await chat_summary.generate_session_summary(state, slot, cfg=_cfg()) is False
+        assert called == []
+        assert state.conversation_log.get_cached_intent_summary(state.hkey) is None
+
+    async def test_a_line_tightened_during_the_transcript_read_is_refused(self, env, monkeypatch):
+        """The gate is asked again AFTER the read, so a tightening in between is caught."""
+        state, slot = env
+        log = state.conversation_log
+        real_locked_stems = type(log).locked_stems
+        fired = {"done": False}
+
+        def _tighten_then_lock(self, stems):
+            # The tightening writer takes the transcript locks the seam holds, so
+            # it lands before the seam's hold (modelled here) or after -- never
+            # inside. Landing first, it is what the seam's own check sees. The
+            # chained seam locks the whole chain through ``locked_stems``.
+            if not fired["done"]:
+                fired["done"] = True
+                with history_mod.allow_on_loop_persist():
+                    self.update_metadata(state.hkey, {"memory_mode": "incognito"})
+            return real_locked_stems(self, stems)
+
+        monkeypatch.setattr(type(log), "locked_stems", _tighten_then_lock)
+        called = []
+        _stub_llm(monkeypatch, _GOOD_REPLY, called)
+        assert await chat_summary.generate_session_summary(state, slot, cfg=_cfg()) is False
+        assert called == []
+        assert log.get_cached_intent_summary(state.hkey) is None
+
+    async def test_an_unreadable_on_disk_line_refuses(self, env, monkeypatch):
+        """Fail closed: a reader that cannot see the contract does not act on the rows."""
+        state, slot = env
+        log = state.conversation_log
+        monkeypatch.setattr(log, "get_metadata_status", lambda _key: ({}, False))
+        called = []
+        _stub_llm(monkeypatch, _GOOD_REPLY, called)
+        assert await chat_summary.generate_session_summary(state, slot, cfg=_cfg()) is False
+        assert called == []
+
+    async def test_a_line_tightened_during_the_model_call_refuses_publication(
+        self, env, monkeypatch, caplog
+    ):
+        state, slot = env
+        log = state.conversation_log
+        sidecar = log._intent_summary_cache_path(state.hkey)
+        model_called: list[str] = []
+
+        async def tighten_then_reply(*_args, **_kwargs):
+            model_called.append("yes")
+            await asyncio.to_thread(log.update_metadata, state.hkey, {"memory_mode": "incognito"})
+            return _GOOD_REPLY
+
+        monkeypatch.setattr(chat_summary, "run_bg_oneliner", tighten_then_reply)
+        with caplog.at_level(logging.DEBUG, logger=chat_summary.__name__):
+            stored = await chat_summary.generate_session_summary(state, slot, cfg=_cfg())
+
+        assert stored is False
+        assert model_called == ["yes"]
+        assert not sidecar.exists()
+        assert (
+            f"Discarding session summary for {state.hkey}: the transcript became "
+            "restricted during summarisation" in caplog.text
+        )
+
     async def test_an_unclean_stop_reason_skips(self, env, monkeypatch):
         """A turn cut short by a timeout or stall did not really finish."""
         state, slot = env
@@ -193,14 +275,12 @@ class TestGating:
         assert await chat_summary.generate_session_summary(state, slot, cfg=_cfg()) is False
         assert called == []
 
-    async def test_summarizes_the_full_disk_transcript_not_the_memory_tail(
-        self, env, monkeypatch
-    ):
+    async def test_summarizes_the_full_disk_transcript_not_the_memory_tail(self, env, monkeypatch):
         """A restored slot keeps only the most recent messages in memory;
         generation must read the full transcript from disk or earlier intents
         vanish from the regenerated summary."""
         state, slot = env
-        # Disk carries an early request the in-memory tail no longer holds.
+        # Disk carries an early request the in-memory tail does not hold.
         slot.messages = [{"role": "user", "content": "request 2"}]
         prompts: list[str] = []
 
@@ -293,16 +373,14 @@ class TestGating:
         assert await chat_summary.generate_session_summary(state, slot, cfg=_cfg()) is True
         assert log.get_cached_intent_summary(state.hkey) is not None
 
-    async def test_an_append_during_the_transcript_read_refuses_the_write(
-        self, env, monkeypatch
-    ):
+    async def test_an_append_during_the_transcript_read_refuses_the_write(self, env, monkeypatch):
         """The signature is captured BEFORE the transcript read, so a message
         landing during the read advances the mtime past the captured sig and
         the write guard refuses the payload -- an incomplete summary must never
         be stored and served as fresh."""
         state, slot = env
         log = state.conversation_log
-        real_read = log.read_messages_chained
+        real_read = log._read_messages
         # Production captures the signature at generation start; the racing
         # append below must provably land PAST it, not merely after it in time.
         pre_read_sig = log.session_mtime(state.hkey)
@@ -311,13 +389,39 @@ class TestGating:
             records = real_read(key)
             # A concurrent turn appends while generation is reading.
             log.append(key, "user", "landed mid-read")
-            move_transcript_past(log, key, pre_read_sig)  # don't rely on the OS tick (#2981)
+            move_transcript_past(log, key, pre_read_sig)  # don't rely on the OS tick
             return records
 
-        monkeypatch.setattr(log, "read_messages_chained", racing_read)
+        monkeypatch.setattr(log, "_read_messages", racing_read)
         _stub_llm(monkeypatch, _GOOD_REPLY)
         assert await chat_summary.generate_session_summary(state, slot, cfg=_cfg()) is False
         assert log.get_cached_intent_summary(state.hkey) is None
+
+    async def test_a_lock_timeout_at_publication_refuses_the_write(self, env, monkeypatch, caplog):
+        state, slot = env
+        log = state.conversation_log
+        real_locked_stems = type(log).locked_stems
+        calls = {"n": 0}
+
+        @contextlib.contextmanager
+        def _timeout_on_publish(self, stems):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise HistoryLockTimeout("publication lock held")
+            with real_locked_stems(self, stems):
+                yield
+
+        monkeypatch.setattr(type(log), "locked_stems", _timeout_on_publish)
+        _stub_llm(monkeypatch, _GOOD_REPLY)
+
+        with caplog.at_level(logging.DEBUG, logger=chat_summary.__name__):
+            stored = await chat_summary.generate_session_summary(state, slot, cfg=_cfg())
+
+        assert stored is False
+        assert calls["n"] == 2
+        assert "the transcript was busy during summarisation" in caplog.text
+        assert log.get_cached_intent_summary(state.hkey) is None
+        assert not log._intent_summary_cache_path(state.hkey).exists()
 
     async def test_a_turn_starting_during_the_model_call_refuses_the_forced_write(
         self, env, monkeypatch
@@ -329,7 +433,7 @@ class TestGating:
         This is the longest unguarded window in a pass (a model call runs for tens
         of seconds while no lock is held), and it is the one a reader assumes the
         `running` check covers. It does not: the signature captured at generation
-        start no longer matches once the racing turn's message is on disk, so
+        start does not match once the racing turn's message is on disk, so
         `set_cached_intent_summary` refuses the payload instead of publishing a
         summary that predates the turn under a current signature. The guard is
         strictly stronger than re-checking `slot.running` would be, because it
@@ -414,7 +518,7 @@ class TestGating:
 
         On-demand generation is what makes this reachable: two clicks from two
         clients (or a click racing a turn-end pass) are concurrent callers of a
-        function that previously set its marker only after four awaits. The
+        function that sets its marker only after four awaits. The
         signature guard made the outcome safe but not free -- the second pass had
         already paid for a model call by the time its write was refused.
         """
@@ -517,7 +621,7 @@ class TestCaching:
         log = state.conversation_log
         sig = log.session_mtime(state.hkey)  # what pass 1 stamped the sidecar with
         log.append(state.hkey, "user", "another")
-        move_transcript_past(log, state.hkey, sig)  # don't rely on the OS tick (#2981)
+        move_transcript_past(log, state.hkey, sig)  # don't rely on the OS tick
         slot._summary_turn_mark = 0
         assert await chat_summary.generate_session_summary(state, slot, cfg=_cfg()) is True
         assert len(called) == 2
@@ -596,7 +700,7 @@ class TestReplyParsing:
         reply = (
             "Using the {title, ranges} shape as asked:\n"
             f"{_GOOD_REPLY}\n"
-            'Emit {} if the transcript is empty.'
+            "Emit {} if the transcript is empty."
         )
         parsed = chat_summary._parse_reply(reply)
         assert isinstance(parsed, dict)
@@ -680,7 +784,7 @@ class _GateSlot:
         *,
         stop="end_turn",
         in_flight=False,
-        memory_mode="default",
+        memory_mode="persistent",
         mark=0,
         running=False,
     ):
@@ -919,6 +1023,27 @@ class TestForcedGeneration:
         # The guard belongs to the pass that took it; a refused caller must not
         # clear it on the way out.
         assert slot._summary_in_flight is True
+
+    async def test_a_flush_that_tightens_the_line_refuses_before_the_model(self, env, monkeypatch):
+        state, slot = env
+        state._slots = {slot.key: slot}
+        state._restricted_keys = set()
+        await asyncio.to_thread(
+            state.conversation_log.update_metadata,
+            state.hkey,
+            {"memory_mode": "incognito"},
+        )
+        slot.messages = list(slot.messages) + [
+            {"role": "assistant", "content": "a reply on the restricted line"}
+        ]
+        slot._dirty = True
+        called = []
+        _stub_llm(monkeypatch, _GOOD_REPLY, called)
+
+        assert await chat_summary.generate_session_summary(state, slot, cfg=_cfg()) is False
+        assert slot.memory_mode == "incognito"
+        assert "dashboard:s1" in state._restricted_keys
+        assert called == []
 
     async def test_force_does_not_override_incognito(self, env, monkeypatch):
         """An incognito transcript is discarded, so a forced summary would leave

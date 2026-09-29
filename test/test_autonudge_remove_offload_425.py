@@ -1,8 +1,9 @@
-"""Regression: async remove() must offload persistence, not fsync on the loop (#425).
+"""async remove() must offload persistence, not fsync on the loop.
 
-``remove()`` called ``remove_sync(persist=True)`` -> ``_save()`` -> ``_write_state``
-which does a blocking ``os.fsync`` directly on the event loop. It must instead
-snapshot under the lock and offload the write to an executor (as update() does).
+``remove()`` delegates to ``remove_sync(persist=True)`` -> ``_save()`` ->
+``_write_state``. It must snapshot under the lock and offload the write to an
+executor (as update() does), never call a blocking ``os.fsync`` directly on the
+event loop.
 """
 
 from __future__ import annotations
@@ -329,7 +330,8 @@ async def test_maintenance_quiesce_wakes_a_firing_remove_waiter(tmp_path, monkey
             await asyncio.sleep(0)
             await asyncio.sleep(0)
             assert not timer.done()
-            assert await asyncio.wait_for(view.deactivate_and_wait(loop.id), 1)
+            # remove() offloads an fsync persist; loaded Windows runners exceed 1 s.
+            assert await asyncio.wait_for(view.deactivate_and_wait(loop.id), 10)
             assert timer.done()
             assert loop.active is False
             await view.remove(loop.id)

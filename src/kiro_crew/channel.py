@@ -18,13 +18,15 @@ import re
 import shlex
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any
 
-from kiro_crew import name_grant
+from kiro_crew import name_grant, permission_floor
 from kiro_crew.atomic_write import atomic_write
+from kiro_crew.config import live
 from kiro_crew.config.paths import config_dir
+from kiro_crew.llm_helpers import is_prompt_busy
 from kiro_crew.trust_patterns import extract_bash_command
 
 logger = logging.getLogger(__name__)
@@ -32,11 +34,81 @@ logger = logging.getLogger(__name__)
 _MAX_AGENTS = 3
 _MAX_CHANNELS = 1
 _MAX_MESSAGES = 200
+# One bound for EVERY string an approval message retains: the prose input,
+# the card title, and each ``meta`` value. ``_MAX_MESSAGES`` caps the ring by
+# count; this caps what each retained entry can weigh, so a model-authored
+# command cannot grow the persisted channel without bound. A title that would
+# not fit is REFUSED, never cut: the title is the one place the channel reader
+# sees the whole command, and a cut title beside a live Approve button is an
+# approval of a suffix nobody read. The refusal notice is itself bounded.
+_APPROVAL_FIELD_MAX_CHARS = 500
+# The card title of a grantable shell command is this prefix plus the command;
+# the exact tier sends the title back (minus the prefix) as its consent proof.
+_APPROVAL_SHELL_TITLE_PREFIX = "Running: "
 _MAX_A2A_EXCHANGES = 3
 
 # Max time an agent blocks on its inbox before re-checking its stop condition,
 # guaranteeing subscribe() can never park indefinitely.
 _INBOX_POLL_SECS = 1.0
+
+# The dispatch verbs: a channel agent may not START work that outlives its own
+# confined turn.  Every verb here creates or drives an execution context the
+# channel agent does not itself occupy, and that context is NOT confined -- a
+# spawned descendant's session key is ``subagent:<id>``, so a containment check
+# keyed on a ``channel:`` identity does not recognise the descendant, and the
+# descendant holds the full default toolset including every name in the list
+# below.  The verbs are therefore refused at the channel agent's OWN hop, where
+# its ``channel:`` identity is the one thing already verified.
+#
+# Per verb: ``spawn_run`` and ``spawn_sub_agents`` create a descendant outright;
+# ``spawn_continue`` dispatches a fresh task into an existing run's
+# conversation; ``spawn_steer`` injects text a running descendant executes as
+# part of its turn; ``workflow_run`` and ``workflow_rerun_subtree`` run an
+# orchestration of agents, and ``workflow_author`` exists only to feed them;
+# ``task_run`` starts the autonomous task runner; ``register_hook`` opens a
+# dedicated agent session an external POST drives later; ``pod_up`` boots a
+# whole preview gateway as its own host process on its own port, which keeps
+# serving after the turn that started it has ended.
+#
+# The observe-and-tear-down verbs are deliberately ABSENT, and their absence is
+# the qualifier this invariant needs rather than an omission: ``spawn_list``,
+# ``spawn_status``, ``spawn_release``, ``workflow_status``, ``workflow_result``,
+# ``workflow_list``, ``workflow_cancel``, ``workflow_library_list``,
+# ``pod_ls``, ``pod_status`` and ``pod_down`` read or
+# end a context that already exists and start no turn.  ``spawn_status`` returns
+# a retained transcript, so how widely that read is scoped is a question about
+# read scope and not about this boundary.
+CHANNEL_AGENT_BLOCKED_DISPATCH_TOOLS: tuple[str, ...] = (
+    "spawn_run",
+    "spawn_sub_agents",
+    "spawn_continue",
+    "spawn_steer",
+    "workflow_run",
+    "workflow_author",
+    "workflow_rerun_subtree",
+    "task_run",
+    "register_hook",
+    "pod_up",
+)
+
+# One tool on the same boundary cannot be held by NAME.  ``ops_mission_control_api``
+# is a passthrough: one tool carrying a whole API surface, most of which reads.
+# ``POST /rotation/arm`` is the operation that starts work outliving the turn --
+# it arms the app's crons, which then fire unattended once the confined turn has
+# ended -- so the deny is keyed on the operation and the tool's read surface stays
+# reachable.  Method and path are the two fields that identify an operation; the
+# tool's own schema admits nothing but an exact member of its allowlist in
+# either, so an operation named here cannot be reached under a second spelling.
+#
+# Enforced at MCP dispatch alone, unlike the name list, which is also matched at
+# the permission-request event: that matcher reads the rendered title, where an
+# operation does not appear.  Containment still holds, because the dispatch guard
+# is what refuses the call -- approving the prompt only means the refusal arrives
+# one step later, and the interactive guard's job is to beat an AUTO-approval,
+# which the dispatch guard beats as well.
+CHANNEL_AGENT_BLOCKED_DISPATCH_OPERATIONS: dict[str, tuple[tuple[str, str], ...]] = {
+    "ops_mission_control_api": (("POST", "/rotation/arm"),),
+}
 
 # Direct-to-user messaging tools a channel agent may never invoke — channel
 # agents communicate exclusively through channel posts.  send_notification
@@ -55,6 +127,8 @@ _INBOX_POLL_SECS = 1.0
 # only cancels and read only exfiltrates, but send delivers text that the target
 # session RUNS as a turn — so external channel content would execute inside a
 # private dashboard conversation.
+# The dispatch verbs above are appended rather than respelled here, so the
+# interactive guard and the MCP-dispatch guard read ONE list.
 # Matched against the rendered
 # permission-request text/title via _blocked_tool_named() (boundary-aware,
 # not naive substring — "Editing send_notification.py" must NOT match).
@@ -62,11 +136,48 @@ CHANNEL_AGENT_BLOCKED_TOOLS: tuple[str, ...] = (
     "send_message",
     "send_notification",
     "session_stop",
+    # Changing a session's model decides what the user's next turn there runs
+    # on and spends; same containment reason as stop.
+    "session_set_model",
     "session_send",
     "session_read_message",
+    # The fan-out verb, blocked for the reason `session_send` is and then some: one
+    # call reaches every session the caller created, so a channel agent acting on
+    # words from a thread other people are in would relay them into the user's
+    # whole worker fleet at once.
+    "session_broadcast",
+    # The roster verb. It returns other sessions' keys and TITLES, so a channel
+    # agent calling it puts the names of the user's private work in front of
+    # whoever is in that thread -- the same exfiltration `session_read_message` is
+    # blocked for, one step shallower.
+    "session_status",
     "session_create",
+    "session_fork",
     "session_close",
-)
+    # The tree verbs, blocked on the containment reason the rest share: a channel
+    # agent acts on words from a thread other people are in, and these two rearrange
+    # what the person sees in their sidebar -- an adoption takes a session and its
+    # whole subtree under another one.
+    "session_adopt",
+    "session_release",
+    # Pinning belongs with the tree verbs: it moves another session to or from
+    # the top of the person's sidebar, and a channel agent names that session
+    # from thread text other people wrote. This entry covers the permission
+    # prompt; the chat_session_pin handler in mcp_dashboard.py refuses a
+    # ``channel:`` caller at dispatch, which is what holds for auto-approval.
+    "chat_session_pin",
+    # The four work-ledger tools, blocked for the same containment reason and not
+    # for a new one: a channel agent has no dispatch relationship, so it is
+    # neither a conductor nor a bound worker and has no business holding one.
+    # Reading a brief would pull a private dispatch's acceptance bar into a
+    # channel other humans can see, and a report or a record would write into a
+    # conductor's own decision record from outside it.
+    "work_brief",
+    "work_report",
+    "work_ledger_read",
+    "work_ledger_record",
+    "work_ledger_rebuild",
+) + CHANNEL_AGENT_BLOCKED_DISPATCH_TOOLS
 
 # Boundary-aware matcher: the tool name must stand alone in the rendered
 # title — not embedded in a filename/path/identifier ("send_notification.py",
@@ -80,6 +191,25 @@ _BLOCKED_TOOL_RE = re.compile(
     + r")(?![\w.\-/])"
 )
 _MCP_SEPARATOR_RE = re.compile(r"_{2,}")
+# A THIRD qualified spelling: opencode joins server and tool with a SINGLE
+# underscore ("kirocrew-core_send_message", measured on 1.18.30), which the run
+# of 2+ above leaves untouched — and a lone "_" before the tool name is a word
+# character, so the boundary lookbehind then refuses the match and the whole
+# containment list read as absent on that harness. Keyed on Crew's OWN
+# server-name shape rather than on "one underscore", because a bare single
+# underscore also unblocks "do_send_message" and every other identifier that
+# merely ends in a blocked name. Applied AFTER the run normalization, so
+# "mcp__kirocrew-core__send_message" is already spaced out and does not come
+# back here as "mcp _send_message" with the boundary re-broken. Recognising one
+# name too many can only ever BLOCK more, which is the safe direction for a
+# containment list — unlike the grant in ``session_directive``, which is why
+# that one matches the server name exactly.
+# Left boundary is the same class ``_BLOCKED_TOOL_RE`` uses, NOT ``\b``: ``\b``
+# treats ``/`` and ``.`` as boundaries, so a rendered PATH
+# ("cat /tmp/kirocrew-core_send_message") normalized to " send_message" and
+# over-blocked -- the same filename-versus-tool confusion the negative cases
+# in ``test_channel_blocked_tools.py`` exist to catch.
+_CREW_MCP_SERVER_PREFIX_RE = re.compile(r"(?<![\w.\-/])kirocrew-[A-Za-z0-9-]+_")
 
 
 def _shell_base_binary(cmd: str) -> str | None:
@@ -172,7 +302,8 @@ def _match_trusted_channel_command(cmd: str, agent: "ChannelAgent") -> str | Non
 
 def _blocked_tool_named(rendered: str) -> bool:
     """True when a blocked messaging tool is named (as a tool) in *rendered*."""
-    return bool(_BLOCKED_TOOL_RE.search(_MCP_SEPARATOR_RE.sub(" ", rendered)))
+    normalized = _CREW_MCP_SERVER_PREFIX_RE.sub(" ", _MCP_SEPARATOR_RE.sub(" ", rendered))
+    return bool(_BLOCKED_TOOL_RE.search(normalized))
 
 
 class ListenMode(Enum):
@@ -205,6 +336,16 @@ class ChannelMessage:
     thread_id: str | None = None  # parent message ID (None = top-level)
     reply_to: str | None = None  # agent ID of parent message sender
     reply_count: int = 0  # thread reply count (top-level only)
+    # Structured facts beside the prose, for renderers that make decisions
+    # from the message rather than display it. An approval carries the
+    # server's own verdict on which trust tiers it can record (see the
+    # approval post in ``_stream_task``), so the card is gated by server fact
+    # instead of a client regex over ``content``. Flat string values only,
+    # mirroring chat's ``perm_meta``; every value is already display-redacted.
+    # ``None`` for every other message and for messages persisted before the
+    # field existed -- their prose is unchanged, so a renderer that ignores
+    # ``meta`` (Slack mirrors, older dashboards) shows exactly what it did.
+    meta: dict[str, str] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -218,6 +359,7 @@ class ChannelMessage:
             "thread_id": self.thread_id,
             "reply_to": self.reply_to,
             "reply_count": self.reply_count,
+            "meta": self.meta,
         }
 
 
@@ -352,6 +494,19 @@ class Channel:
         self._save()
         return True
 
+    def _evict_oldest(self) -> None:
+        """Drop the oldest message and clear the stored thread pair on every reply to it.
+
+        A reply left pointing at an evicted parent reaches neither dashboard view: the
+        transcript renders only top-level messages, and the thread panel needs the parent.
+        """
+        removed = self.messages.pop(0)
+        self._msg_index.pop(removed.id, None)
+        for retained in self.messages:
+            if retained.thread_id == removed.id:
+                retained.thread_id = None
+                retained.reply_to = None
+
     async def post(
         self,
         from_id: str,
@@ -360,6 +515,7 @@ class Channel:
         mention: str | list[str] | None = None,
         msg_type: str = "progress",
         thread_id: str | None = None,
+        meta: dict[str, str] | None = None,
     ) -> ChannelMessage:
         # Normalize mentions to a set
         mentions: set[str] = set()
@@ -376,6 +532,8 @@ class Channel:
             if parent:
                 reply_to = parent.from_id
                 parent.reply_count += 1
+            else:
+                thread_id = None
 
         msg = ChannelMessage(
             id=uuid.uuid4().hex[:8],
@@ -386,16 +544,28 @@ class Channel:
             msg_type=msg_type,
             thread_id=thread_id,
             reply_to=reply_to,
+            meta=meta,
         )
         self.messages.append(msg)
         self._msg_index[msg.id] = msg
+        orphaned_reply_to: str | None = None
         if len(self.messages) > _MAX_MESSAGES:
-            removed = self.messages.pop(0)
-            self._msg_index.pop(removed.id, None)
+            self._evict_oldest()
+            if thread_id is not None and msg.thread_id is None:
+                orphaned_reply_to = reply_to
+            # This append's own parent can be the message just evicted, so re-read the
+            # pair: routing below must follow what was persisted, not the pre-eviction locals.
+            thread_id = msg.thread_id
+            reply_to = msg.reply_to
 
         # Human message resets A2A exchange budget — agents get fresh rounds
         if from_id == "human":
             self.exchange_counts.clear()
+
+        # Inboxes receive a snapshot. A later append's rolloff clears the stored pair in
+        # place, and a consumer still holding the live object would root its turn on fields
+        # that changed after it was queued.
+        queued = replace(msg)
 
         for agent in self.members.values():
             if agent.id == from_id or agent.state in ("done", "failed"):
@@ -407,7 +577,14 @@ class Channel:
 
             # Thread routing: default listener = parent sender
             if thread_id and reply_to == agent.id and not mentions:
-                await agent.inbox.put(msg)
+                await agent.inbox.put(queued)
+                continue
+
+            # This append's own rolloff evicted the parent, so no thread branch matches an
+            # agent's reply. It still belongs to the sender it was answering; a human's
+            # falls through to the top-level orchestrator branch below instead.
+            if not is_human and orphaned_reply_to == agent.id and not mentions:
+                await agent.inbox.put(queued)
                 continue
 
             # Thread fallback: if reply_to doesn't match any agent (e.g. system message),
@@ -419,12 +596,12 @@ class Channel:
                 and agent.is_orchestrator
                 and reply_to not in self.members
             ):
-                await agent.inbox.put(msg)
+                await agent.inbox.put(queued)
                 continue
 
             # Orchestrator gets all top-level human messages (no @mention needed)
             if is_human and not mentions and not thread_id and agent.is_orchestrator:
-                await agent.inbox.put(msg)
+                await agent.inbox.put(queued)
                 continue
 
             # Everyone else: strict @mention only
@@ -444,7 +621,7 @@ class Channel:
                     continue
                 self.exchange_counts[pair] = self.exchange_counts.get(pair, 0) + 1
 
-            await agent.inbox.put(msg)
+            await agent.inbox.put(queued)
 
         # Dead agent bounce
         for mid in mentions:
@@ -461,8 +638,7 @@ class Channel:
                 self.messages.append(bounce)
                 self._msg_index[bounce.id] = bounce
                 if len(self.messages) > _MAX_MESSAGES:
-                    removed = self.messages.pop(0)
-                    self._msg_index.pop(removed.id, None)
+                    self._evict_oldest()
                 self._broadcast(
                     "channel_message", {"channel_id": self.id, "message": bounce.to_dict()}
                 )
@@ -565,6 +741,7 @@ class Channel:
                 thread_id=md.get("thread_id"),
                 reply_to=md.get("reply_to"),
                 reply_count=md.get("reply_count", 0),
+                meta=md.get("meta"),
             )
             ch.messages.append(msg)
             ch._msg_index[msg.id] = msg
@@ -589,12 +766,29 @@ class ChannelManager:
         self._broadcast_fn = broadcast_fn
         self._max_channels = max_channels
         self._max_agents = max_agents
+        # The two caps follow config live; the binder holds this object weakly.
+        self._config_subs = (
+            live.bind("agent.max_channels", self.set_max_channels),
+            live.bind("agent.max_channel_agents", self.set_max_agents),
+        )
         # Resolve the channels dir lazily in __init__ (not as a class attr) so
         # merely importing this module never triggers config_dir() and its
         # one-time data-home migration as an import side effect — that must fire
         # only at the single chosen point (ensure_data_home() in the CLI prologue).
         self._CHANNELS_DIR = channels_dir or str(config_dir() / "channels")
         self._load_all()
+
+    def set_max_channels(self, value: int) -> None:
+        """Adopt a new ``agent.max_channels`` cap for channels created from now on.
+
+        Existing channels above a lowered cap stay open; the cap gates creation
+        only, exactly as the constructor value did.
+        """
+        self._max_channels = max(1, int(value))
+
+    def set_max_agents(self, value: int) -> None:
+        """Adopt a new ``agent.max_channel_agents`` cap for members added from now on."""
+        self._max_agents = max(1, int(value))
 
     def _save_channel(self, channel: Channel) -> None:
         """Persist channel state to disk.
@@ -718,6 +912,9 @@ async def run_channel_agent(
             agent=agent.agent_name or None,
             approval_policy=agent.approval_policy.value,
         )
+        # This lease is released only when the member dies, so a busy probe reading the
+        # lease would refuse a clear on this channel for the member's whole life.
+        sessions.mark_lifecycle_lease(agent.session_key)
 
         agent.state = "listening"
         channel._broadcast(
@@ -747,6 +944,9 @@ async def run_channel_agent(
 
         async for msg in channel.subscribe(agent.id):
             agent.state = "working"
+            # Declared BEFORE the setup below, which runs while the provider still reports no
+            # active turn -- a clear arriving in that window would tear this session down.
+            sessions.set_lifecycle_turn_active(agent.session_key, True)
             channel._broadcast(
                 "channel_agent_status",
                 {"channel_id": channel.id, "agent_id": agent.id, "state": "working"},
@@ -774,9 +974,53 @@ async def run_channel_agent(
             )
             orch_toplevel = agent.is_orchestrator and (is_toplevel_human or is_agent_report_back)
             tid = None if orch_toplevel else (msg.thread_id or msg.id)
-            await _stream_task(agent, channel, client, prompt, thread_id=tid, is_yolo=is_yolo)
+            if sessions.get_provider(agent.session_key) is not client:
+                # IDENTITY, not presence: a clear-context discard pops this key and shuts the
+                # cached provider down, and a later claim can re-register a DIFFERENT one under it.
+                replacement = await _reacquire_cleared_session(sessions, agent)
+                if replacement is None:
+                    await channel.post(
+                        agent.id,
+                        "❌ This agent's session could not be re-acquired after its context "
+                        "was cleared. Wake it to try again.",
+                        from_role=agent.role,
+                        msg_type="system",
+                        thread_id=tid,
+                    )
+                    agent.state = "failed"
+                    break
+                client = replacement
+            busy = await _stream_task(
+                agent, channel, client, prompt, thread_id=tid, is_yolo=is_yolo
+            )
+            if busy:
+                # This loop owns the SessionManager, so it is the only place that
+                # can clear a wedge: replace the session and replay the message
+                # once on a cold one, then rebind the now-dead client.
+                replacement = await _recover_busy_agent(
+                    agent, channel, sessions, prompt, thread_id=tid, is_yolo=is_yolo
+                )
+                if replacement is None:
+                    # Report the dead end EXACTLY ONCE and stop consuming the
+                    # inbox. Re-running the reset on every later message would
+                    # spam the channel — strictly worse than the wedge itself.
+                    # ``api_channel_wake_agent`` is the restart affordance, and
+                    # it cold-starts because _recover_busy_agent tore the
+                    # abandoned replacement out of the session registry.
+                    await channel.post(
+                        agent.id,
+                        "❌ This agent's session is stuck and could not be recovered. "
+                        "Clear its context or wake it to try again.",
+                        from_role=agent.role,
+                        msg_type="system",
+                        thread_id=tid,
+                    )
+                    agent.state = "failed"
+                    break
+                client = replacement
 
             agent.state = "listening"
+            sessions.set_lifecycle_turn_active(agent.session_key, False)
             channel._broadcast(
                 "channel_agent_status",
                 {
@@ -790,6 +1034,9 @@ async def run_channel_agent(
         logger.exception("Channel agent %s (%s) failed", agent.id, agent.role)
         agent.state = "failed"
     finally:
+        # Backstop: a turn left declared would refuse every later clear on this key, which is
+        # the permanent refusal this change exists to remove.
+        sessions.set_lifecycle_turn_active(agent.session_key, False)
         if agent.state not in ("done", "failed"):
             agent.state = "done"
         channel._broadcast(
@@ -800,6 +1047,125 @@ async def run_channel_agent(
         logger.info("Channel agent %s (%s) finished: %s", agent.id, agent.role, agent.state)
 
 
+async def _reacquire_cleared_session(sessions: Any, agent: ChannelAgent) -> Any:
+    """Take a fresh lease after this member's session was discarded from under it.
+
+    A clear-context discard pops the registry entry and shuts the provider down, and the
+    provider this member cached at spawn is that same object -- so without this the member
+    streams a dead one for every later message and only a restart recovers it. No reset is
+    owed first, unlike :func:`_reset_busy_session`: the key is already cold, and the single
+    ``release`` in the listening lifecycle resolves the key at call time, so it balances
+    against the replacement.
+    """
+    try:
+        client, _is_new, _resumed = await sessions.get_or_create(
+            agent.session_key,
+            agent=agent.agent_name or None,
+            approval_policy=agent.approval_policy.value,
+        )
+    except Exception:
+        logger.exception("Failed to re-acquire session %s after a clear", agent.session_key)
+        return None
+    sessions.mark_lifecycle_lease(agent.session_key)
+    # Both markers, not just the lease: this runs mid-turn, and the fresh session defaults to
+    # no turn -- so a clear in the setup that follows would tear it down unprotected.
+    sessions.set_lifecycle_turn_active(agent.session_key, True)
+    return client
+
+
+async def _reset_busy_session(sessions: Any, agent: ChannelAgent) -> Any | None:
+    """Replace *agent*'s wedged session and return a lease on a cold one.
+
+    ``SessionManager.reset`` pops the registry entry and never awaits its
+    semaphore, so resetting while ``run_channel_agent`` still holds the permit
+    cannot deadlock; ``get_or_create`` then builds a fresh entry with a free
+    semaphore, and the single ``release(key)`` in that loop's ``finally``
+    resolves the key at call time, so it balances against the replacement. The
+    orphaned permit dies with the discarded session.
+
+    ``expect_session`` makes the swap a compare-and-swap: a concurrent
+    ``clear-context`` reset (``api_channel_clear_context``) may already have
+    replaced or removed the occupant, and neither outcome may be torn down
+    here. A guarded reset that declines is not a failure — it leaves the key
+    cold, which is exactly what the re-acquire below needs. Returns ``None``
+    only when the replacement lease cannot be obtained.
+    """
+    try:
+        await sessions.reset(
+            agent.session_key,
+            expect_session=sessions._sessions.get(agent.session_key),
+        )
+    except Exception:
+        logger.exception("Failed to reset wedged session %s", agent.session_key)
+        return None
+    try:
+        client, _is_new, _resumed = await sessions.get_or_create(
+            agent.session_key,
+            agent=agent.agent_name or None,
+            approval_policy=agent.approval_policy.value,
+        )
+    except Exception:
+        logger.exception("Failed to re-acquire session %s after reset", agent.session_key)
+        return None
+    # The listening loop holds THIS lease for the rest of its life too, so it carries the
+    # same marker as the original: unmarked, a recovered member refuses a clear forever.
+    sessions.mark_lifecycle_lease(agent.session_key)
+    # And the turn: the replay below runs on this session, so it needs the same protection
+    # the original had before the wedge.
+    sessions.set_lifecycle_turn_active(agent.session_key, True)
+    return client
+
+
+async def _recover_busy_agent(
+    agent: ChannelAgent,
+    channel: Channel,
+    sessions: Any,  # SessionManager
+    message: str,
+    thread_id: str | None = None,
+    is_yolo: Any = None,  # callable returning bool
+) -> Any | None:
+    """Replace a prompt-busy session and replay *message* once on a cold one.
+
+    Returns the replacement client, or ``None`` when the agent cannot be used
+    again: the replacement lease was unobtainable, or the wedge survived it. In
+    that second case the replacement is torn back down here
+    rather than left behind — ``channel:``-keyed sessions are exempt from both
+    reapers (``session_cleanup._rss_threshold_check`` and ``_expire_idle`` skip
+    any key starting with ``session._CHANNEL_PREFIX``), so an abandoned one
+    leaks until the channel closes, and ``api_channel_wake_agent`` would
+    otherwise re-acquire that same wedged session straight out of the registry
+    and re-wedge instantly.
+    """
+    logger.warning(
+        "Channel agent %s (%s) session is prompt-busy — replacing it",
+        agent.id,
+        agent.role,
+    )
+    client = await _reset_busy_session(sessions, agent)
+    if client is None:
+        return None
+    still_busy = await _stream_task(
+        agent, channel, client, message, thread_id=thread_id, is_yolo=is_yolo
+    )
+    if not still_busy:
+        return client
+    logger.error(
+        "Channel agent %s (%s) still prompt-busy after a session reset",
+        agent.id,
+        agent.role,
+    )
+    try:
+        await sessions.reset(
+            agent.session_key,
+            expect_session=sessions._sessions.get(agent.session_key),
+        )
+    except Exception:
+        logger.exception(
+            "Failed to tear down the abandoned replacement session %s", agent.session_key
+        )
+    return None
+
+
 async def _stream_task(
     agent: ChannelAgent,
     channel: Channel,
@@ -807,8 +1173,13 @@ async def _stream_task(
     message: str,
     thread_id: str | None = None,
     is_yolo: Any = None,  # callable returning bool
-) -> None:
-    """Stream an LLM task, posting output as channel messages."""
+) -> bool:
+    """Stream an LLM task, posting output as channel messages.
+
+    Returns True when the provider reported a prompt-busy wedge, which only the
+    caller can clear (it owns the ``SessionManager``); False on success and on
+    every other error, which a session reset cannot fix.
+    """
     from kiro_crew.providers.base import (
         EVENT_COMPLETE,
         EVENT_PERMISSION_REQUEST,
@@ -855,25 +1226,71 @@ async def _stream_task(
                         session_key=agent.session_key,
                         agent=agent.agent_name,
                         source="channel",
-                        tool_name=event.text,
+                        tool_name=event.text or event.title or "",
                         outcome="rejected_blocked_tool",
+                    )
+                    await client.reject_tool(event.request_id)
+                    continue
+                # The PreToolUse gate outranks every approval tier below: YOLO,
+                # channel trust, a command grant and the human card all sit
+                # behind it, as session trust does on every other surface.
+                # Asked with this agent's session and name so its governance
+                # profile applies; any deny refuses. This is the channel's own
+                # (counted) gate decision; the transport's approve_tool runs the
+                # identity-free security floor again, uncounted.
+                _gate_reason = await asyncio.to_thread(
+                    permission_floor.refusal_for,
+                    event,
+                    session_key=agent.session_key,
+                    agent=agent.agent_name,
+                    security_only=False,
+                )
+                if _gate_reason is not None:
+                    sel().log_tool_invocation(
+                        session_key=agent.session_key,
+                        agent=agent.agent_name,
+                        source="channel",
+                        # Permission events populate ``title``; ``text`` is empty.
+                        tool_name=event.text or event.title,
+                        outcome="rejected_hook_deny",
+                        metadata={"reason": _gate_reason},
                     )
                     await client.reject_tool(event.request_id)
                     continue
                 # YOLO mode (global) or channel trust — auto-approve
                 if (is_yolo and is_yolo()) or channel.trusted:
+                    approval_outcome = (
+                        "auto_approved_yolo"
+                        if (is_yolo and is_yolo())
+                        else "auto_approved_channel_trust"
+                    )
+                    # Audit BEFORE the wire call: approve_tool can raise, and a
+                    # decision that reached the transport must not vanish from
+                    # the SEL when it does. The definitive row follows below.
                     sel().log_tool_invocation(
                         session_key=agent.session_key,
                         agent=agent.agent_name,
                         source="channel",
-                        tool_name=event.text,
-                        outcome=(
-                            "auto_approved_yolo"
-                            if (is_yolo and is_yolo())
-                            else "auto_approved_channel_trust"
-                        ),
+                        tool_name=event.text or event.title or "",
+                        outcome=permission_floor.OUTCOME_PENDING_APPROVAL,
                     )
-                    await client.approve_tool(event.request_id)
+                    approval_sent = await client.approve_tool(event.request_id)
+                    if approval_sent is False:
+                        sel().log_tool_invocation(
+                            session_key=agent.session_key,
+                            agent=agent.agent_name,
+                            source="channel",
+                            tool_name=event.text or event.title or "",
+                            outcome=permission_floor.OUTCOME_REJECTED_TRANSPORT_FLOOR,
+                        )
+                    else:
+                        sel().log_tool_invocation(
+                            session_key=agent.session_key,
+                            agent=agent.agent_name,
+                            source="channel",
+                            tool_name=event.text or event.title or "",
+                            outcome=approval_outcome,
+                        )
                     continue
                 # Per-command trust grants (trust_command / trust_base) — agent-
                 # scoped patterns granted via the approve endpoint. Security:
@@ -908,15 +1325,34 @@ async def _stream_task(
                         # tier still auto-approves.
                         _ng_refusal = await name_grant.refusal_for_command_off_loop(_cmd)
                         if _ng_refusal is None:
+                            # Audit BEFORE the wire call (approve_tool can raise);
+                            # the definitive row follows below.
                             sel().log_tool_invocation(
                                 session_key=agent.session_key,
                                 agent=agent.agent_name,
                                 source="channel",
                                 tool_name=event.text or event.title or "",
-                                outcome="auto_approved_trusted_pattern",
+                                outcome=permission_floor.OUTCOME_PENDING_APPROVAL,
                                 metadata={"pattern": matched},
                             )
-                            await client.approve_tool(event.request_id)
+                            approval_sent = await client.approve_tool(event.request_id)
+                            if approval_sent is False:
+                                sel().log_tool_invocation(
+                                    session_key=agent.session_key,
+                                    agent=agent.agent_name,
+                                    source="channel",
+                                    tool_name=event.text or event.title or "",
+                                    outcome=permission_floor.OUTCOME_REJECTED_TRANSPORT_FLOOR,
+                                )
+                            else:
+                                sel().log_tool_invocation(
+                                    session_key=agent.session_key,
+                                    agent=agent.agent_name,
+                                    source="channel",
+                                    tool_name=event.text or event.title or "",
+                                    outcome="auto_approved_trusted_pattern",
+                                    metadata={"pattern": matched},
+                                )
                             continue
                         name_grant.log_decline(
                             source="channel",
@@ -934,7 +1370,7 @@ async def _stream_task(
                 # tool_input is model-authored and size-unbounded, so the
                 # full-text pass runs off-loop (no-blocking-call-on-event-loop).
                 sanitized_input = await asyncio.to_thread(
-                    redact_and_truncate, event.tool_input, 500
+                    redact_and_truncate, event.tool_input, _APPROVAL_FIELD_MAX_CHARS
                 )
                 # The card's tool name. For a shell tool prefer the CANONICAL
                 # command (from ``tool_input``) over the display title: kiro's
@@ -964,15 +1400,65 @@ async def _stream_task(
                     # command-scoped tiers are available. Keep an ungrantable
                     # redacted command visible, but do not give it that marker
                     # or the card would offer decisions the server must refuse.
+                    #
+                    # The other marker names what is missing and promises
+                    # nothing about scope. It must not say "allow once": the
+                    # blanket channel grant needs no command scope, so ``Trust
+                    # all tools in this channel`` renders beside this label and
+                    # the endpoint records it. A card telling the reader it can
+                    # only be allowed once, while carrying a control that trusts
+                    # the whole channel, is worse than a card that says nothing.
+                    #
+                    # It also must not say the text is HIDDEN, because the text
+                    # is right there beside the marker: what the reader cannot
+                    # have is proof that those characters are the ones that run,
+                    # since two commands differing only in a credential redact
+                    # to the same string. "Exact text unverified" is the fact,
+                    # and it stays out of implementation vocabulary: channel
+                    # readers are not all engineers, so it names neither bytes
+                    # nor redaction.
                     _card_name = (
-                        f"Running: {_safe_cmd}"
+                        f"{_APPROVAL_SHELL_TITLE_PREFIX}{_safe_cmd}"
                         if _command_grantable
-                        else f"Shell command (allow once): {_safe_cmd}"
+                        else f"Shell command (exact text unverified): {_safe_cmd}"
                     )
                 else:
                     _card_name = event.text or event.title or ""
-                sanitized_name, _ = redact_credentials(_card_name)
-                sanitized_name, _ = redact_exfiltration_urls(sanitized_name)
+                sanitized_name, _ = redact_exfiltration_urls(_card_name)
+                sanitized_name, _ = redact_credentials(sanitized_name)
+                if len(sanitized_name) > _APPROVAL_FIELD_MAX_CHARS:
+                    # Fail closed. Cutting the title would put a live Approve
+                    # button beside a command the reader cannot read in full
+                    # (the provider would run the whole thing); retaining it
+                    # whole would let one model-authored command grow the
+                    # persisted channel past the bound every other retained
+                    # field obeys. Neither is a decision a channel reader can
+                    # make, so the request is refused here and the notice says
+                    # why, in the reader's terms, with the bounded excerpt the
+                    # card would have shown. The agent sees an ordinary
+                    # rejection and can split the command.
+                    sel().log_tool_invocation(
+                        session_key=agent.session_key,
+                        agent=agent.agent_name,
+                        source="channel",
+                        tool_name=event.text,
+                        outcome="rejected_over_bound_title",
+                    )
+                    _what = "command" if _cmd else "request"
+                    await channel.post(
+                        agent.id,
+                        f"\u26d4 Approval refused: this {_what} is {len(_card_name)} characters and "
+                        f"a channel approval can show at most {_APPROVAL_FIELD_MAX_CHARS}. "
+                        "Nothing was run. A request the reader cannot read in full is not "
+                        "approved here; the agent can split it into shorter steps. "
+                        f"First {len(sanitized_input)} characters of the input:\n"
+                        f"```\n{sanitized_input}\n```",
+                        from_role=agent.role,
+                        msg_type="system",
+                        thread_id=thread_id,
+                    )
+                    await client.reject_tool(event.request_id)
+                    continue
                 loop = asyncio.get_running_loop()
                 # Bind-target for a per-command trust decision on THIS
                 # approval: the canonical shell command ("" for non-shell
@@ -984,6 +1470,27 @@ async def _stream_task(
                 approval_future = loop.create_future()
                 agent._pending_approval_command = _cmd if _command_grantable else ""
                 agent._approval_future = approval_future
+                # The card's structured facts, beside the unchanged prose. The
+                # server is the only side that can refuse a per-command tier
+                # (``handlers_channel.approve``), so it states here which
+                # tiers THIS approval can record: ``command_grantable`` gates
+                # both per-command tiers (a non-shell tool has no command to
+                # grant), ``base_derivable`` the base tier alone,
+                # and ``base_command`` is the very binary the endpoint would
+                # grant -- a compound ``cat f | wc -l`` has none, where a
+                # first-token guess would have offered ``cat``. Values are the
+                # already-redacted display strings, each within
+                # ``_APPROVAL_FIELD_MAX_CHARS`` (the title was refused above if
+                # it would not fit, and the base is one token of that title);
+                # the raw command never leaves this scope.
+                _base_binary = _shell_base_binary(_cmd) if _command_grantable else None
+                approval_meta: dict[str, str] = {
+                    "tool_title": sanitized_name,
+                    "tool_input": sanitized_input,
+                    "command_grantable": "1" if _command_grantable else "",
+                    "base_derivable": "1" if _base_binary else "",
+                    "base_command": _base_binary or "",
+                }
                 try:
                     # Posting and waiting are one ownership scope. If the post
                     # itself fails, neither the Future nor its command authority
@@ -994,6 +1501,7 @@ async def _stream_task(
                         from_role=agent.role,
                         msg_type="approval",
                         thread_id=thread_id,
+                        meta=approval_meta,
                     )
                     decision = await asyncio.wait_for(approval_future, timeout=3600)
                 except asyncio.TimeoutError:
@@ -1006,14 +1514,6 @@ async def _stream_task(
                 if decision not in ("approved", "rejected", "trust"):
                     decision = "rejected"
 
-                sel().log_tool_invocation(
-                    session_key=agent.session_key,
-                    agent=agent.agent_name,
-                    source="channel",
-                    tool_name=event.text,
-                    outcome=decision,
-                )
-
                 if decision in ("approved", "trust") and _is_shell and _cmd:
                     # A human read this exact command and said yes: record the
                     # identity of the file behind each program name (same
@@ -1024,17 +1524,63 @@ async def _stream_task(
                     # and get the replacement pinned. Runs off-loop (stats +
                     # digests files).
                     await asyncio.to_thread(name_grant.pin_human_approval, _cmd)
+                if decision in ("approved", "trust"):
+                    # Audit BEFORE the wire call (approve_tool can raise); the
+                    # definitive row follows below. A rejection is audited once.
+                    sel().log_tool_invocation(
+                        session_key=agent.session_key,
+                        agent=agent.agent_name,
+                        source="channel",
+                        tool_name=event.text or event.title or "",
+                        outcome=permission_floor.OUTCOME_PENDING_APPROVAL,
+                        metadata={"human_decision": decision},
+                    )
                 if decision == "trust":
                     channel.trusted = True
-                    await client.approve_tool(event.request_id)
+                    approval_sent = await client.approve_tool(event.request_id)
                 elif decision == "approved":
-                    await client.approve_tool(event.request_id)
+                    approval_sent = await client.approve_tool(event.request_id)
                 else:
+                    # A rejection is audited once, BEFORE the wire call:
+                    # reject_tool can raise when the ACP child is gone, and
+                    # the human's "no" must reach the log either way.
+                    sel().log_tool_invocation(
+                        session_key=agent.session_key,
+                        agent=agent.agent_name,
+                        source="channel",
+                        tool_name=event.text or event.title or "",
+                        outcome=decision,
+                    )
                     await client.reject_tool(event.request_id)
+                    continue
+                if approval_sent is False:
+                    sel().log_tool_invocation(
+                        session_key=agent.session_key,
+                        agent=agent.agent_name,
+                        source="channel",
+                        tool_name=event.text or event.title or "",
+                        outcome=permission_floor.OUTCOME_REJECTED_TRANSPORT_FLOOR,
+                        metadata={"human_decision": decision},
+                    )
+                else:
+                    sel().log_tool_invocation(
+                        session_key=agent.session_key,
+                        agent=agent.agent_name,
+                        source="channel",
+                        tool_name=event.text or event.title or "",
+                        outcome=decision,
+                    )
 
             elif event.kind == EVENT_COMPLETE:
                 break
-    except Exception:
+    except Exception as exc:
+        if is_prompt_busy(exc):
+            # No card here: a card is a dead end. The backend still holds an
+            # in-flight prompt, so every later message on this session is
+            # rejected identically until the session is replaced — and only the
+            # caller can do that. Report the wedge upward instead.
+            logger.warning("Prompt busy for channel agent %s (%s): %s", agent.id, agent.role, exc)
+            return True
         logger.exception("LLM stream error for agent %s (%s)", agent.id, agent.role)
         await channel.post(
             agent.id,
@@ -1043,11 +1589,11 @@ async def _stream_task(
             msg_type="system",
             thread_id=thread_id,
         )
-        return
+        return False
 
     full_text = "".join(chunks).strip()
     if not full_text:
-        return
+        return False
     # Sanitize LLM output before posting
     full_text, _ = redact_exfiltration_urls(full_text)
     full_text, _ = redact_credentials(full_text)
@@ -1063,3 +1609,4 @@ async def _stream_task(
         thread_id=thread_id,
         mention=mention_ids or None,
     )
+    return False

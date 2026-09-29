@@ -17,17 +17,19 @@ import logging
 import math
 import os
 import re
+import stat
 import threading
 import time as _time
 import uuid
-from collections.abc import Callable, Container, Iterator, Sequence
+from collections.abc import Callable, Container, Iterable, Iterator, Sequence
 from collections.abc import Set as AbstractSet
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal, overload
 
 from kiro_crew import platform_compat
-from kiro_crew.atomic_write import atomic_write
+from kiro_crew.atomic_write import atomic_write, atomic_write_at
+from kiro_crew.chat_attachments import persist_inline_images, same_text_modulo_images
 from kiro_crew.config.loader import KiroCrewConfig, config_dir
 from kiro_crew.executors import run_in_embed_pool  # noqa: F401 - facade re-export
 from kiro_crew.frontmatter import (  # noqa: F401 - facade re-exports
@@ -41,6 +43,7 @@ from kiro_crew.history_cache import (
     _FileChangeCacheEntry,
     _LRUCache,
     _SearchTextCache,
+    _TranscriptRowIndexEntry,
 )
 from kiro_crew.history_consolidation import (  # noqa: F401 - facade re-exports
     _CONSOLIDATION_BACKOFF_BASE_SECS,
@@ -66,8 +69,13 @@ from kiro_crew.history_consolidation import (  # noqa: F401 - facade re-exports
     _strip_code_fence,
     _strip_skill_frontmatter,
 )
-from kiro_crew.history_projection import (
+from kiro_crew.history_projection import (  # noqa: F401 - facade re-exports
+    METADATA_LINE_CORRUPT,
+    METADATA_LINE_READABLE,
+    METADATA_LINE_TRANSIENT,
+    ChainRevision,
     SessionMetadataProjection,
+    TranscriptPage,
     TranscriptReadProjection,
 )
 from kiro_crew.history_rewrite import HistoryRewriteCoordinator
@@ -118,8 +126,11 @@ from kiro_crew.llm_helpers import (  # noqa: F401 - facade re-exports
     stream_and_collect,
     stream_and_collect_json,
 )
-from kiro_crew.messaging.link import canonical_key, legacy_key
-from kiro_crew.preview_text import strip_markdown_preview  # noqa: F401 - facade re-export
+from kiro_crew.messaging.link import canonical_key, is_legacy_slack_key, legacy_key
+from kiro_crew.preview_text import (  # noqa: F401 - facade re-export
+    PREVIEW_MAX_CHARS,
+    strip_markdown_preview,
+)
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel  # noqa: F401 - facade re-export
 from kiro_crew.skills import (  # noqa: F401 - facade re-export
@@ -178,6 +189,16 @@ SLOT_OWNED_META_KEYS: frozenset[str] = frozenset(
         "autocompact_pct",
         "mode",
         "workspace",
+        # Slot-owned so ABSENCE can retract it. A crew rebound from a named
+        # memory store back to the default writes no key at all, and an unowned
+        # key is carried forward forever by ``carry_unowned_metadata`` -- so the
+        # rebind would be un-erasable and the session would keep consolidating
+        # into the silo it left.
+        "memory_store",
+        # The namespace the agent was picked in. Slot-owned for the same reason
+        # as memory_store: a name-only pick after a template pick writes no key,
+        # and an unowned key would carry the stale "template" forward forever.
+        "agent_kind",
         "project",
         # Remote-execution binding: owned by the slot, so clearing it in memory
         # clears it on disk. Left unowned, a rebind or an unbind would be undone
@@ -191,9 +212,30 @@ SLOT_OWNED_META_KEYS: frozenset[str] = frozenset(
         # written at relay start is carried forward past a clean completion, so
         # every later restart would append a false "interrupted" row.
         "relay_in_flight",
+        # Local-turn crash marker: the generation of the turn ``_run_chat``
+        # admitted, written before provider dispatch and omitted once the turn
+        # reaches teardown. Owned for the same reason as ``relay_in_flight``:
+        # absence IS the clear, so a carried-forward value would flag every
+        # later restart as interrupted after one clean completion.
+        "turn_in_flight_generation",
+        # The row that opened that turn (role, content, cls, ts, meta), carried
+        # with the generation so a restart inside the periodic flush window
+        # can put the prompt back before flagging the interruption. Cleared by
+        # omission alongside the generation.
+        "turn_in_flight_prompt",
         "folder_id",
         "app",
         "artifact",
+        # Durable copy of the slot's held /note lines. Owned, not
+        # monotonic: the hold is written while notes are held and must be
+        # CLEARED by absence once the flush delivers them — carried forward
+        # instead, a restart would re-deliver a note the user already saw.
+        "deferred_notes",
+        # Durable copy of the queued user prompts. Owned, not monotonic: the
+        # value is written while prompts wait and must be CLEARED by absence
+        # once the drain consumes them — carried forward instead, a restart
+        # would hand back a prompt whose turn already ran.
+        "queued_prompts",
         "pinned",
         "color_index",
         "color_hex",
@@ -252,7 +294,10 @@ ROWS_ONLY_OWNED_META_KEYS: frozenset[str] = frozenset({"_type", "created_at", "l
 # and its background-refresh budget: read back beside another slot's title they
 # either unlock the refresh on a name a user typed by hand or lock a generated name
 # out of refresh permanently. They travel WITH the title, so they are deferred with
-# it.
+# it. ``title_low_signal`` is the same shape — the early-refresh eligibility of
+# THIS slot's title — so a popped slot's stale flag carried over a live
+# replacement's would wrongly suppress or re-arm the replacement's turn-one
+# refresh after restart. It defers with the title too.
 #
 # ``created_by`` and ``origin`` are the same shape and the highest-consequence
 # instance of it, because what they describe is AUTHORIZATION rather than
@@ -275,7 +320,7 @@ ROWS_ONLY_OWNED_META_KEYS: frozenset[str] = frozenset({"_type", "created_at", "l
 # disagree about them in a way that outlives the pair.
 ROWS_ONLY_DEFERRED_META_KEYS: frozenset[str] = (
     SLOT_OWNED_META_KEYS - ROWS_ONLY_OWNED_META_KEYS
-) | frozenset({"title_origin", "title_refresh_mark", "created_by", "origin"})
+) | frozenset({"title_origin", "title_refresh_mark", "title_low_signal", "created_by", "origin"})
 
 
 def carry_unowned_metadata(
@@ -353,6 +398,14 @@ _SESSION_KEEP_LINES = 200
 # don't.
 _FLOCK_ACQUIRE_TIMEOUT_S = 10.0
 _FLOCK_POLL_INTERVAL_S = 0.05
+
+
+class ThreadStoreUnreadable(ValueError):
+    """A reply-thread sidecar holds bytes that are not a thread map.
+
+    Raised by :meth:`ConversationLog.read_threads` instead of reading the file
+    as empty, so a writer never replaces damaged data with an empty map.
+    """
 
 
 class HistoryLockTimeout(TimeoutError):
@@ -781,11 +834,89 @@ def is_incognito_transcript(memory_mode: object) -> bool:
     return str(memory_mode or "").lower() in INCOGNITO_MEMORY_MODES
 
 
+def transcript_privacy_mode(memory_mode: object) -> str:
+    """The private mode a transcript header records, normalized, or ``""``.
+
+    The companion of :func:`is_incognito_transcript` for a caller that needs
+    the MODE rather than the yes/no: the same ``str()`` + ``lower()``
+    normalization and the same membership test, so the two cannot disagree
+    about which headers are private; ``""`` for a header that records no mode
+    or a value the set does not hold (whitespace is not stripped here either --
+    a header no reader recognizes is one the stamps below may REPAIR with a
+    recognized mode, which stripping would prevent). Every reader that compares
+    or reports a header's mode goes through this rather than the raw string: a
+    header is not bound by the API's validation (a hand edit, a foreign writer),
+    and a raw ``Temporary`` handed to a strictness compare reads as UNKNOWN --
+    weaker than any recognized mode -- so the tighten-only stamps would rewrite
+    it as ``incognito``, a tightening lost, and the consolidator would report
+    the mode as spelled rather than as the mode it is.
+    """
+    normalized = str(memory_mode or "").lower()
+    return normalized if normalized in INCOGNITO_MEMORY_MODES else ""
+
+
+class TranscriptWithheld(RuntimeError):
+    """A derivation read met a restricted (or unreadable) line under the transcript lock.
+
+    Raised by the ONE seam every reader that DERIVES from a transcript goes
+    through -- :meth:`ConversationLog.derive_messages`,
+    :meth:`ConversationLog.derive_messages_chained`,
+    :meth:`ConversationLog.derive_recent`,
+    :meth:`ConversationLog.publication_hold`, and
+    :meth:`ConversationLog.snapshot_for_consolidation` with
+    ``withhold_restricted=True`` -- when the metadata line says the session is
+    incognito or temporary, or cannot be read at all. The line and the rows are
+    read under the same lock hold, so what the caller gets can never be rows a
+    restricted line already governed. Nothing wrong has happened to the session:
+    it is simply one nothing may be learned from, so callers treat this as a
+    refusal (skip, 400, ``_CONSOLIDATION_REFUSED``), never as a failure.
+    """
+
+
+class TranscriptBusy(TranscriptWithheld):
+    """The derivation seam could not take the transcript lock in time.
+
+    The seam validates the line and reads the rows under ``_locked``, which is a
+    patient, cross-process acquire with a ceiling (:class:`HistoryLockTimeout`).
+    A reader that cannot obtain the lock cannot vouch for the contract, so it gets
+    no rows -- the same fail-closed answer as a restricted line, and a subclass so
+    every skip/continue that handles :class:`TranscriptWithheld` already handles
+    it. Kept distinct so a caller that answers a person can say "busy, retry"
+    (the export's retryable 503) instead of "private".
+    """
+
+
+def transcript_withholds_derivation(log: "ConversationLog", key: str) -> bool:
+    """True when *key*'s ON-DISK line forbids deriving anything from the transcript.
+
+    The metadata line's ``memory_mode`` is the file's privacy contract: every
+    reader that learns from the file gates on it, and any writer -- this process,
+    another gateway on the same data home, a subagent or cron appending to the
+    session -- may only ever tighten it. A reader that reads the ROWS from disk
+    but gates on a LIVE slot's mode (the session summary, the export) can
+    therefore lag the file: the line says restricted, the slot it kept in memory
+    still says persistent, and the private rows go to a model or a file. Such a
+    reader asks this predicate about the file it is about to read, and again
+    about the file it just read, so a tightening that lands between the two is
+    caught as well.
+
+    Fails CLOSED: a line that cannot be read answers ``True``, because a reader
+    that cannot see the contract has no business acting on the rows. An absent
+    file (no line yet) is not a refusal -- there is nothing on disk to protect.
+    """
+    metadata, readable = log.get_metadata_status(key)
+    if not readable:
+        return True
+    return is_incognito_transcript(metadata.get("memory_mode"))
+
+
 # The fields that record where a message came from: the session key it arrived
 # on (``source_thread``, e.g. ``slack:1785861252.833429``) and the platform user
 # who sent it (``source_user``). Written by :meth:`ConversationLog.append`, read
 # by :meth:`ConversationLog.get_source_threads` for cross-session citation and
 # by SEL attribution.
+
+
 PROVENANCE_FIELDS = ("source_thread", "source_user")
 
 
@@ -814,6 +945,11 @@ def _safe_mtime(path: Path) -> float | None:
         return path.stat().st_mtime
     except OSError:
         return None
+
+
+def _cache_identity(stat: os.stat_result) -> tuple[int, int, int]:
+    """Return a cache stamp that survives an mtime-preserving rewrite."""
+    return (stat.st_mtime_ns, stat.st_ctime_ns, stat.st_ino)
 
 
 def _restore_mtime(path: Path, prev_mtime: float | None) -> None:
@@ -917,6 +1053,13 @@ def _cleanup_old_archives(retention_days: int | None = None, base: Path | None =
     When *retention_days* is None, the value is resolved from config
     (``session.archive_retention_days``).  A negative value disables cleanup
     entirely — the user manages archive deletion manually.
+
+    The same pass expires closed SESSION CREW LOGS, on the same setting and inside
+    the same throttle (:func:`kiro_crew.crew_log.store.sweep_expired`). One switch
+    governs both because a session's message bodies live in its crew log now: a
+    build that expired the transcript archive while the crew log it points into grew
+    forever would keep the larger half of the same history indefinitely, and a
+    second setting for it would be a second thing to find and turn off.
     """
     global _last_cleanup
 
@@ -941,20 +1084,53 @@ def _cleanup_old_archives(retention_days: int | None = None, base: Path | None =
     if retention_days < 0:
         return 0  # cleanup disabled
     adir = _archive_dir(base)
-    if not adir.exists():
-        return 0
     cutoff = now - retention_days * 86400
     removed = 0
-    for p in adir.glob("*.jsonl"):
-        try:
-            if p.stat().st_mtime < cutoff:
-                p.unlink()
-                removed += 1
-        except OSError:
-            pass
+    # An absent archive directory is not a reason to skip the crew log half: a
+    # session can hold a crew log long before anything of its transcript is
+    # archived, so returning here would leave that half uncollected until the
+    # first archive ever written.
+    if adir.exists():
+        for p in adir.glob("*.jsonl"):
+            try:
+                if p.stat().st_mtime < cutoff:
+                    p.unlink()
+                    removed += 1
+            except OSError:
+                pass
     if removed:
         logger.info("Cleaned %d expired archive files (>%dd)", removed, retention_days)
+    _cleanup_expired_crew_logs(retention_days, now)
     return removed
+
+
+def _cleanup_expired_crew_logs(retention_days: int, now: float) -> None:
+    """Expire closed the sessions' logs, best-effort, never at the transcript's cost.
+
+    Off the event loop, which is what makes the added filesystem work safe rather
+    than merely cheap: the only caller is ``_cleanup_old_archives``, reached from
+    ``_archive_lines`` on the rotation path, and that path runs in the dashboard's
+    flush executor thread (see ``chat_persistence``, which documents
+    ``_save_slot_to_history`` running there) or on the shutdown save. The sweep
+    reads a header and a bounded tail per closed unit, inside the hourly throttle
+    the archive cleanup already has, so the cost is once an hour in a worker rather
+    than per delete on the loop.
+
+    Imported lazily and swallowed on failure for one reason each. Lazily because
+    this module is imported on every startup while the crew log store is only
+    reachable behind ``KIROCREW_CREW_LOG``, and a launch with the flag off
+    should not pay for the import. Swallowed because the caller is on the
+    transcript ARCHIVE path: a crew log tree that cannot be swept is a disk-space
+    problem, and letting it raise here would turn that into a failure to archive
+    the transcript, which loses history rather than retaining too much of it. The
+    sweep logs its own counts.
+    """
+    try:
+        from kiro_crew.crew_log.store import sweep_expired
+
+        sweep_expired(retention_days, now=now)
+    except Exception:
+        logger.debug("The session's log retention sweep failed", exc_info=True)
 
 
 def transcript_sort_key(ts: str) -> tuple[int, float]:
@@ -1011,7 +1187,7 @@ def metadata_now_iso() -> str:
     offset, so a reader (the browser, or a merge running on another host) has no
     way to know which timezone produced it -- the dashboard then renders it
     verbatim, showing a Slack/channel session's creation time in UTC instead of
-    the viewer's local zone (issue #1948). Resolving to an absolute instant with
+    the viewer's local zone. Resolving to an absolute instant with
     ``astimezone()`` records the offset, matching the message-row convention in
     :func:`monotonic_transcript_ts` so both the metadata line and the rows below
     it speak the same, unambiguous format.
@@ -1024,7 +1200,7 @@ def mint_row_mid() -> str:
 
     The ONE place the ``meta.mid`` format is spelled. ``_ChatSlot.append`` mints
     the id for a row that enters a dashboard window, and the dashboard
-    dual-writers (``cron_inject``, ``workflow_inject``, ``crew_chat``) read it back
+    dual-writers (``cron_inject``, ``workflow_inject``) read it back
     off that append to stamp their durable copy (``row_mid``). A writer with no
     slot to mint from -- a channel dispatcher persisting a turn it ran on its own
     session -- has to mint the id itself, and it must produce the SAME shape,
@@ -1096,6 +1272,106 @@ def _safe_key(key: str) -> str:
     return re.sub(r"[^\w\-.]", "_", key)
 
 
+#: Directory beside the transcripts holding one reply-thread sidecar per
+#: session (``dashboard/chat_threads.py``). The ONE spelling of the location:
+#: :meth:`ConversationLog.threads_sidecar_path` and Session Storage's
+#: "what files is this session made of" both derive it from here, so a
+#: reclaim can never leave a session's replies behind in the live store.
+THREADS_DIR_NAME = ".threads"
+THREADS_SIDECAR_SUFFIX = ".json"
+
+
+#: The reply-row schema the thread sidecar holds; :meth:`ConversationLog.read_threads`
+#: keeps these keys and no other.
+THREAD_REPLY_FIELDS: tuple[str, ...] = ("id", "role", "content", "ts")
+
+#: What :meth:`ConversationLog.read_threads` RETAINS of a sidecar, whatever the
+#: file holds. The writer (``dashboard/chat_threads.py``) never exceeds these --
+#: it clips an answer at 64 000 characters plus a marker and admits 500 replies
+#: per thread, 5 000 per sidecar -- so a sidecar it wrote is read back whole;
+#: a larger one (another writer under the data home) is cut to the same shape
+#: at the point of retention, never carried into memory as written.
+THREAD_REPLY_CONTENT_MAX_CHARS = 65_536
+#: A thread key is a row id as :func:`mint_row_mid` spells it, and nothing else:
+#: the summary route returns the keys as they are, so a key is never allowed a
+#: shape that could carry prose.
+THREAD_MID_RE = re.compile(r"^m-[0-9a-f]{16}$")
+THREADS_MAX_REPLIES_PER_THREAD = 500
+THREADS_MAX_REPLIES_PER_SIDECAR = 5_000
+#: The sidecar FILE's ceiling, checked on its size before a byte of it is read
+#: and on the document before it is written, so the row bounds above cannot be
+#: reached through a file that is already too large to parse. The writer
+#: answers ``sidecar_full`` at it, exactly as at the row cap; the reader
+#: refuses a bigger file (or one that is not a regular file) as unreadable.
+THREADS_SIDECAR_MAX_BYTES = 64 * 1024 * 1024
+#: The writer's own spellings of a reply's metadata: ``id`` is a uuid4 hex, ``ts``
+#: an ISO-8601 instant (or empty), ``role`` one of the two speakers. A row whose
+#: metadata is anything else is not a reply the store wrote and is dropped at the
+#: read, so those fields reach the dashboard only in shapes that cannot carry
+#: prose -- ``content`` is the one free-text field, and it is redacted on the
+#: way out.
+THREAD_REPLY_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+_THREAD_REPLY_TS_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})?$"
+)
+_THREAD_REPLY_ROLES = frozenset({"user", "assistant"})
+
+
+def _thread_reply_row(raw: dict) -> dict[str, Any] | None:
+    """*raw* reduced to :data:`THREAD_REPLY_FIELDS`, or ``None`` when a field is
+    missing, not a string, or -- for ``id``, ``role`` and ``ts`` -- not in the
+    shape the writer produces. ``content`` is the only free-text field; it is
+    cut at :data:`THREAD_REPLY_CONTENT_MAX_CHARS`."""
+    row: dict[str, Any] = {}
+    for key in THREAD_REPLY_FIELDS:
+        value = raw.get(key, "" if key == "ts" else None)
+        if not isinstance(value, str):
+            return None
+        row[key] = value
+    if not THREAD_REPLY_ID_RE.match(row["id"]) or row["role"] not in _THREAD_REPLY_ROLES:
+        return None
+    if row["ts"] and not _THREAD_REPLY_TS_RE.match(row["ts"]):
+        return None
+    row["content"] = row["content"][:THREAD_REPLY_CONTENT_MAX_CHARS]
+    return row
+
+
+def _write_thread_sidecar(path: Path, document: str) -> None:
+    """Replace the sidecar at *path* without following a link anywhere in it.
+
+    The ``.threads`` directory is code-created beside the transcripts; a LINK at
+    that name (planted under the data home) would carry the write outside the
+    session store, so the directory is refused unless it is a real directory,
+    and on POSIX it is then pinned by descriptor and the leaf replaced relative
+    to it (:func:`atomic_write_at`, ``O_NOFOLLOW`` on the temporary), so neither
+    a swapped parent nor a link at the leaf can redirect the bytes. Windows has
+    no descriptor-relative rename; there the directory check is the guard, as
+    Session Storage's opener degrades.
+    """
+    parent = path.parent
+    parent.mkdir(parents=True, exist_ok=True)
+    if platform_compat.is_link_or_junction(parent) or not stat.S_ISDIR(os.lstat(parent).st_mode):
+        raise ThreadStoreUnreadable(f"thread sidecar directory is not a directory: {parent}")
+    if not platform_compat.IS_POSIX:
+        if os.path.islink(path):
+            raise ThreadStoreUnreadable(f"thread sidecar is a link: {path}")
+        atomic_write(path, document)
+        return
+    dir_fd = os.open(
+        parent,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        atomic_write_at(dir_fd, path.name, document)
+    finally:
+        os.close(dir_fd)
+
+
+def threads_sidecar_for_stem(sessions_dir: Path, stem: str) -> Path:
+    """The reply-thread sidecar of the transcript ``<sessions_dir>/<stem>.jsonl``."""
+    return sessions_dir / THREADS_DIR_NAME / f"{stem}{THREADS_SIDECAR_SUFFIX}"
+
+
 def transcript_stem(key: str) -> str:
     """The canonical filename stem *key*'s transcript and archive segments share.
 
@@ -1160,6 +1436,24 @@ def transcript_stems(key: str) -> tuple[str, ...]:
         if legacy not in stems:
             stems.append(legacy)
     return tuple(stems)
+
+
+def transcript_lock_stems(key: str) -> tuple[str, ...]:
+    """Canonical and bare physical lock stems for either Slack spelling.
+
+    Unlike :func:`transcript_stems`, which preserves the caller's exact path
+    identity for ownership decisions, this helper is deliberately symmetric:
+    ``slack:<ts>``, ``slack_<ts>``, and bare ``<ts>`` all lock the same two
+    sidecars. Non-Slack keys have one lock stem.
+    """
+    bare = legacy_key(canonical_key(key))
+    if bare is None and key.startswith("slack_"):
+        candidate = key[len("slack_") :]
+        if is_legacy_slack_key(candidate):
+            bare = candidate
+    if bare is None:
+        return (_safe_key(key),)
+    return (_safe_key(f"slack:{bare}"), _safe_key(bare))
 
 
 def _redact_at_write_boundary(role: str, content: str) -> str:
@@ -1278,14 +1572,11 @@ class ConversationLog:
     _flock_epochs: dict[str, int] = {}
 
     # Per-key invalidation generation, bumped by ``_invalidate_cache`` BEFORE
-    # it drops entries. The mtime guard alone cannot protect a cache FILL:
-    # housekeeping rewrites (compaction / rotation / metadata edits /
-    # mark_consolidated) restore the pre-write mtime via ``_restore_mtime``,
-    # so a fill that stats the file before such a rewrite and publishes after
-    # its invalidation would park pre-rewrite data under an mtime the file
-    # still has — undetectable for the life of the process. Fill paths
+    # it drops entries. The cache identity catches the normal atomic rewrite
+    # even when housekeeping restores its pre-write mtime, but it cannot by
+    # itself prove that a fill stayed write-free while it ran. Fill paths
     # snapshot the generation before their stat and publish only while it is
-    # unmoved (``_publish_if_current`` for the mtime-keyed memos; the unlocked
+    # unmoved (``_publish_if_current`` for the identity-keyed memos; the unlocked
     # ``_msg_cache`` fallback in ``_read_messages`` checks it inline alongside
     # the flock-hold witness), discarding the fill otherwise. Class-level for
     # the same reason
@@ -1314,16 +1605,18 @@ class ConversationLog:
         cache_max: int = _TRANSCRIPT_CACHE_MAX,
     ):
         self._dir = base_dir or _sessions_dir()
-        # Bounded, mtime-keyed LRU caches (key → (mtime, payload)). Bounded so
+        # Bounded identity-keyed LRU caches. Bounded so
         # a long-lived gateway touching thousands of sessions cannot grow the
         # parsed-transcript working set without limit. Eviction is
         # least-recently-used and deterministic; writes invalidate per-key via
         # _invalidate_cache so a stale entry can never outlive a file change.
-        self._msg_cache: _LRUCache[tuple[float, int, list[dict]]] = _LRUCache(cache_max)
-        #: ``(mtime, gen, meta)`` — like the search memos, entries record the
+        self._msg_cache: _LRUCache[tuple[tuple[int, int, int], int, list[dict]]] = _LRUCache(
+            cache_max
+        )
+        #: ``(identity, gen, meta)`` — like the search memos, entries record the
         #: invalidation generation and a warm hit requires both fields to
-        #: match, so a preserved-mtime metadata edit through another
-        #: instance (whose pops cannot reach this cache) still unhits.
+        #: match, so a same-process metadata edit through another instance
+        #: (whose pops cannot reach this cache) still unhits.
         #:
         #: Sized by ``_METADATA_CACHE_MAX``, NOT ``cache_max``: this memo holds one
         #: parsed first line per session rather than a transcript window, and
@@ -1332,31 +1625,39 @@ class ConversationLog:
         #: already use to decline that knob. Deliberately not overridable: a test
         #: that needs a small bound assigns ``_meta_cache`` directly rather than
         #: adding a constructor parameter no product caller uses.
-        self._meta_cache: _LRUCache[tuple[float, int, dict]] = _LRUCache(_METADATA_CACHE_MAX)
-        #: Bounded, mtime-keyed LRU of formatted ``recent()`` windows keyed by
+        self._meta_cache: _LRUCache[tuple[tuple[int, int, int], int, dict]] = _LRUCache(
+            _METADATA_CACHE_MAX
+        )
+        #: Bounded identity-keyed LRU of formatted ``recent()`` windows keyed by
         #: (key, max_messages, roles). The tail-read fast path intentionally
         #: never warms ``_msg_cache`` (it returns a partial view), so a session
         #: accessed *only* via ``recent()`` — the hot per-turn context path —
         #: would otherwise re-open and re-parse the file tail on every single
-        #: call. This memoizes the formatted window; the stored mtime guards
-        #: staleness (an append bumps the file mtime, so the entry is
-        #: recomputed on the next call). Own ``_LRUCache`` → own internal lock.
-        self._recent_cache: _LRUCache[tuple[float, list[dict]]] = _LRUCache(cache_max)
+        #: call. This memoizes the formatted window; the stored identity guards
+        #: staleness even when a housekeeping write preserves mtime. Own
+        #: ``_LRUCache`` → own internal lock.
+        self._recent_cache: _LRUCache[tuple[tuple[int, int, int], int, list[dict]]] = _LRUCache(
+            cache_max
+        )
         #: Bounded memo of lightweight message projections containing only
         #: ``ts`` and ``meta.file_changes``. The Artifacts "All" view scans
         #: every session, so routing it through ``_msg_cache`` retains the full
         #: parsed transcript corpus. The file stamp includes inode and size in
         #: addition to nanosecond mtime so rotations and atomic rewrites miss.
         self._file_change_cache: _LRUCache[_FileChangeCacheEntry] = _LRUCache(cache_max)
-        #: Bounded memo of ``(mtime, gen, doc_chars, casefolded_blob)`` per
+        #: Sparse row-to-byte indexes for paginated transcript reads. Entries
+        #: contain offsets and counts only, never message content, so a bounded
+        #: page does not retain the complete parsed transcript in memory.
+        self._page_index_cache: _LRUCache[_TranscriptRowIndexEntry] = _LRUCache(cache_max)
+        #: Bounded memo of ``(identity, gen, doc_chars, casefolded_blob)`` per
         #: session, consumed only by :meth:`search_sessions`. ``gen`` is the
         #: invalidation generation (:meth:`_cache_gen`) the entry was folded
-        #: under; a hit requires BOTH the mtime and the generation to match,
+        #: under; a hit requires BOTH the cache identity and generation to match,
         #: because ``_invalidate_cache``'s pops reach only their own
-        #: instance's caches while a preserved-mtime rewrite can be performed
-        #: through a different ``ConversationLog`` instance over the same
-        #: directory — the generation bump is what unhits such an entry where
-        #: the instance-local pop cannot.
+        #: instance's caches while a rewrite can be performed through a
+        #: different ``ConversationLog`` instance over the same directory —
+        #: the generation bump is what unhits such an entry where the
+        #: instance-local pop cannot.
         #:
         #: Folding is the dominant cost of a search: the substring count itself
         #: is cheap, but ``str.casefold`` over a whole corpus is not, and it
@@ -1371,10 +1672,10 @@ class ConversationLog:
         #: order; :class:`_SearchTextCache` keeps that guarantee by refusing
         #: admission instead of evicting, so the sessions that fit stay cached
         #: and the bound is now a real memory ceiling rather than a proxy for one.
-        self._folded_cache: _SearchTextCache[tuple[float, int, int, str]] = _SearchTextCache(
-            _SEARCH_FOLD_BUDGET_BYTES, lambda v: v[3].__sizeof__(), "fold"
+        self._folded_cache: _SearchTextCache[tuple[tuple[int, int, int], int, int, str]] = (
+            _SearchTextCache(_SEARCH_FOLD_BUDGET_BYTES, lambda v: v[3].__sizeof__(), "fold")
         )
-        #: session key → (mtime, gen, raw message texts) for snippet extraction.
+        #: session key → (identity, gen, raw message texts) for snippet extraction.
         #:
         #: The fold above answers "does this session match"; this answers "show me
         #: the line". Without it every returned row re-opened its file and
@@ -1391,10 +1692,12 @@ class ConversationLog:
         #: same generation field as ``_folded_cache`` above, for the same
         #: cross-instance reason: both memos are derived from the messages, so
         #: they go stale at exactly the same moment.
-        self._snippet_cache: _SearchTextCache[tuple[float, int, list[str]]] = _SearchTextCache(
-            _SEARCH_SNIPPET_BUDGET_BYTES,
-            lambda v: v[2].__sizeof__() + sum(t.__sizeof__() for t in v[2]),
-            "snippet",
+        self._snippet_cache: _SearchTextCache[tuple[tuple[int, int, int], int, list[str]]] = (
+            _SearchTextCache(
+                _SEARCH_SNIPPET_BUDGET_BYTES,
+                lambda v: v[2].__sizeof__() + sum(t.__sizeof__() for t in v[2]),
+                "snippet",
+            )
         )
         #: tab_id → [session keys] chain index. ``None`` means "stale, rebuild
         #: on next chained read"; a dict is an authoritative snapshot. Rebuilt
@@ -1446,10 +1749,15 @@ class ConversationLog:
             safe_key=lambda key: _safe_key(key),
             registry_owner=ConversationLog,
         )
+
         self._catalog_projection = SessionCatalogProjection(self)
         self._read_projection = TranscriptReadProjection(self)
         self._metadata_projection = SessionMetadataProjection(self)
         self._rewrite_coordinator = HistoryRewriteCoordinator(self)
+
+    @staticmethod
+    def _cache_identity(stat: os.stat_result) -> tuple[int, int, int]:
+        return _cache_identity(stat)
 
     def _file_lock(self, key: str) -> threading.RLock:
         """Return the process-wide reentrant lock guarding *key*'s session file.
@@ -1519,14 +1827,32 @@ class ConversationLog:
         fut.add_done_callback(lambda f: f.exception())
 
     @contextlib.contextmanager
-    def _locked(self, key: str) -> Iterator[None]:
-        """Hold BOTH the in-process RLock and a cross-process advisory flock.
+    def locked_stems(self, stems: Iterable[str]) -> Iterator[None]:
+        """Hold exact physical transcript stems in deterministic order."""
+        with contextlib.ExitStack() as locks:
+            for stem in sorted(set(stems)):
+                locks.enter_context(self._locked_stem(stem))
+            yield
 
-        Serializes create/append/rotate/rewrite/metadata mutations of a single
-        session file against every other writer — threads in this process (via
-        the RLock) *and* other processes such as subagents, crons, and the CLI
-        (via the ``flock`` on the sidecar lock file). Reentrant: a nested
-        ``_locked`` for the same key on the same thread reuses the held fd.
+    @contextlib.contextmanager
+    def _locked(self, key: str) -> Iterator[None]:
+        """Hold every physical lock that can represent one transcript.
+
+        Slack's canonical, sanitized, and pre-migration bare spellings all map
+        to one sorted lock set. Target-path resolution must happen inside this
+        context so a waiter cannot publish a filename choice made before a
+        concurrent restore.
+        """
+        with self.locked_stems(transcript_lock_stems(key)):
+            yield
+
+    @contextlib.contextmanager
+    def _locked_stem(self, key: str) -> Iterator[None]:
+        """Hold the in-process and cross-process locks for one physical stem.
+
+        Callers use :meth:`_locked`, which acquires every stable alias stem in
+        deterministic order. This primitive stays separate so that alias locking
+        never resolves a target path before all sidecars are held.
         """
         # Fail loud (strict) or diagnose (production) if a mutation reached the
         # lock ON the event loop — the un-offloaded-call-site guard (see
@@ -1628,13 +1954,13 @@ class ConversationLog:
                     # Depth hit 0. ``platform_compat.release_lock`` (flock
                     # LOCK_UN) and ``os.close`` are both ``blocking: true``
                     # syscalls, so run them off the event loop — a wedged
-                    # descriptor must never freeze chat/WS/heartbeat (the
-                    # finding this addresses). We DO NOT pop the state here:
+                    # descriptor must never freeze chat/WS/heartbeat. We DO NOT
+                    # pop the state here:
                     # the entry stays alive with ``held``=1 so a sequential
                     # same-key re-acquire before the release runs reuses the
-                    # still-held flock instead of ``flock``-ing a fresh fd (the
-                    # regression that spuriously raised HistoryLockTimeout under
-                    # executor load). The deferred release re-checks depth and
+                    # still-held flock instead of ``flock``-ing a fresh fd, which
+                    # would spuriously raise HistoryLockTimeout under executor
+                    # load. The deferred release re-checks depth and
                     # its own fd under the guard, so a reuse cancels it.
                     self._schedule_flock_release(key, lock_key, state[0])
 
@@ -1729,6 +2055,47 @@ class ConversationLog:
         """Return True if a conversation log file exists for *key*."""
         return self._path(key).exists()
 
+    def has_messages(self, key: str) -> bool:
+        """Return True if *key*'s transcript holds at least one message row.
+
+        A transcript file is created by the first METADATA write -- a title,
+        an agent pick, a model pick -- long before any message is exchanged,
+        so :meth:`has_log` answers "does a file exist", not "was anything
+        said". Callers deciding whether a conversation already carries
+        context before selecting a member need the second question:
+        a metadata-only file is an empty conversation.
+
+        An absent file is empty, but a file that exists and cannot be
+        read raises ``OSError`` rather than reading as empty, and a record that
+        cannot be delivered intact or is not valid JSON counts as content --
+        unverifiable history is still history. The forgiving tail readers are
+        not used here for that reason.
+        """
+        from kiro_crew.jsonl_util import UnreadableRecord, strict_records
+
+        path = self._path(key)
+        with self._locked(key):
+            try:
+                handle = open(path, "rb")
+            except FileNotFoundError:
+                return False
+            with handle:
+                try:
+                    for record in strict_records(handle, path):
+                        line = record.strip()
+                        if not line:
+                            continue
+                        try:
+                            data = json.loads(line)
+                        except ValueError:
+                            return True
+                        if isinstance(data, dict) and data.get("_type") == "metadata":
+                            continue
+                        return True
+                except UnreadableRecord:
+                    return True
+        return False
+
     def session_mtime(self, key: str) -> float | None:
         """Return the session file's mtime, or None if it can't be stat'd.
 
@@ -1797,6 +2164,201 @@ class ConversationLog:
                 }
             ),
         )
+
+    def threads_sidecar_path(self, key: str) -> Path:
+        """Sidecar path for a session's reply threads (``dashboard/chat_threads.py``).
+
+        A third sidecar beside the summary caches, for the same reason each of
+        those is its own file: the thread store has its own writer (a reply
+        landing) and no mtime contract with the transcript -- a reply must
+        survive every later append to the main chat, so it is never invalidated
+        by the session file's signature. Public because the thread store lives
+        outside this module; the transcript delete removes it with the others,
+        and Session Storage moves it with the transcript on reclaim.
+        """
+        return threads_sidecar_for_stem(self._dir, _safe_key(key))
+
+    def read_threads(self, key: str) -> dict[str, list[dict[str, Any]]]:
+        """The reply-thread map of *key*'s sidecar (``{mid: [reply, ...]}``).
+
+        A missing sidecar reads as empty. Unreadable bytes -- torn JSON, a wrong
+        shape -- raise :class:`ThreadStoreUnreadable` instead of reading as empty,
+        because the one caller that writes would otherwise replace the damaged
+        file with an empty map and lose every reply it held. Rows and threads of
+        the wrong shape are dropped individually; only the document as a whole
+        refuses. Each retained row is NORMALIZED to the reply schema -- ``id``,
+        ``role``, ``content``, ``ts``, all strings -- and nothing else: the file
+        sits beside the transcript under the data home, so a field an agent or
+        an older writer put there must never reach the dashboard through the
+        detail response's spread. A row missing ``id``, ``role`` or ``content``
+        is dropped, as is one whose ``id``, ``role`` or ``ts`` is not in the
+        writer's own shape (uuid hex, one of the two speakers, ISO-8601), so
+        only ``content`` can carry prose and it is redacted at the boundary.
+        The content is cut at :data:`THREAD_REPLY_CONTENT_MAX_CHARS`, a thread
+        keeps its NEWEST :data:`THREADS_MAX_REPLIES_PER_THREAD` rows (a key left
+        with none is dropped, so keys alone cannot grow the map)
+        and the map stops at :data:`THREADS_MAX_REPLIES_PER_SIDECAR` rows in file
+        order, so what the file holds never decides what the gateway holds --
+        and the file is opened ONCE, without following a link, and sized on
+        that descriptor before it is read: over :data:`THREADS_SIDECAR_MAX_BYTES`,
+        or not a regular file, is refused, and the read is bounded to the ceiling
+        so a file swapped under the open cannot grow past it either.
+        """
+        path = self.threads_sidecar_path(key)
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        if not nofollow and os.path.islink(path):
+            # Windows has no O_NOFOLLOW: a link at the name is refused by a
+            # pre-check instead (degraded, as Session Storage's opener degrades;
+            # creating a link there needs a privilege this model does not hand out).
+            raise ThreadStoreUnreadable(f"thread sidecar is a link: {path}")
+        flags = os.O_RDONLY | nofollow | getattr(os, "O_CLOEXEC", 0)
+        try:
+            fd = os.open(path, flags)
+        except FileNotFoundError:
+            return {}
+        except OSError as exc:
+            # ELOOP for a link at the name, EACCES, ENOTDIR: all "not this store".
+            raise ThreadStoreUnreadable(f"thread sidecar unreadable: {path}") from exc
+        try:
+            with os.fdopen(fd, "rb") as fh:
+                info = os.fstat(fh.fileno())
+                if not stat.S_ISREG(info.st_mode):
+                    raise ThreadStoreUnreadable(f"thread sidecar is not a regular file: {path}")
+                if info.st_size > THREADS_SIDECAR_MAX_BYTES:
+                    raise ThreadStoreUnreadable(
+                        f"thread sidecar over {THREADS_SIDECAR_MAX_BYTES} bytes: {path}"
+                    )
+                data = fh.read(THREADS_SIDECAR_MAX_BYTES + 1)
+        except OSError as exc:
+            raise ThreadStoreUnreadable(f"thread sidecar unreadable: {path}") from exc
+        if len(data) > THREADS_SIDECAR_MAX_BYTES:
+            raise ThreadStoreUnreadable(
+                f"thread sidecar over {THREADS_SIDECAR_MAX_BYTES} bytes: {path}"
+            )
+        try:
+            raw = json.loads(data.decode("utf-8"))
+        except (ValueError, RecursionError) as exc:
+            # A document nested past the interpreter's depth is as unreadable as
+            # one that does not parse: refused, never a 500.
+            raise ThreadStoreUnreadable(f"thread sidecar unreadable: {path}") from exc
+        threads = raw.get("threads") if isinstance(raw, dict) else None
+        if not isinstance(threads, dict):
+            raise ThreadStoreUnreadable(f"thread sidecar has no threads map: {path}")
+        out: dict[str, list[dict[str, Any]]] = {}
+        budget = THREADS_MAX_REPLIES_PER_SIDECAR
+        for mid, replies in threads.items():
+            if budget <= 0:
+                break
+            if not isinstance(mid, str) or not THREAD_MID_RE.match(mid):
+                continue
+            if not isinstance(replies, list):
+                continue
+            rows = [_thread_reply_row(r) for r in replies if isinstance(r, dict)]
+            kept = [r for r in rows if r is not None][-THREADS_MAX_REPLIES_PER_THREAD:]
+            kept = kept[: min(len(kept), budget)]
+            if not kept:
+                # A key with no rows is not a thread; retaining it would let a
+                # map of empty lists grow past the row budget by keys alone.
+                continue
+            budget -= len(kept)
+            out[mid] = kept
+        return out
+
+    def thread_transcript_identity(self, key: str) -> str | None:
+        """The transcript's ``created_at`` metadata, or ``None`` when absent.
+
+        The identity :meth:`append_thread_reply` checks a reply against; read at
+        admission, before any await, and handed back at the write.
+        """
+        created = self.get_metadata(key).get("created_at")
+        return created if isinstance(created, str) and created else None
+
+    def append_thread_reply(
+        self,
+        key: str,
+        mid: str,
+        reply: dict[str, Any],
+        *,
+        max_replies: int,
+        max_total: int,
+        expected_created_at: str | None = None,
+    ) -> str:
+        """Append *reply* to the thread on *mid* in *key*'s sidecar.
+
+        Returns ``"ok"``, ``"duplicate"`` (the thread already holds a reply with
+        this ``id`` -- a client re-sending a reply whose acceptance it never saw;
+        nothing is written), ``"full"`` (the thread already holds *max_replies*),
+        ``"sidecar_full"`` (the sidecar already holds *max_total* replies across
+        every thread, or the document with this reply would pass
+        :data:`THREADS_SIDECAR_MAX_BYTES` -- the whole-file bounds, since the
+        panel reads the file whole and a per-thread cap alone leaves it
+        unbounded in the number of threads), ``"missing"`` (no transcript for *key*), or ``"replaced"``
+        (the transcript is not the one the reply was admitted against), or
+        ``"unflushed"`` (the transcript holds no row with ``meta.mid == mid``).
+        Every check runs under the lock so nothing can change between it and
+        the write. The identity is the metadata line's ``created_at`` -- minted
+        when a transcript is created, carried through verbatim by a rewrite --
+        so a member chat deleted and recreated under its deterministic key
+        while a turn was in flight is told apart from the chat the reply
+        belongs to, exactly as ``chat_persistence`` tells "deleted and
+        recreated" apart. Callers capture it with
+        :meth:`thread_transcript_identity` at admission and pass it back here.
+        The parent's ``meta.mid`` must ALWAYS be on disk: a thread is durable
+        only through the row it hangs off, and a parent that exists only in the
+        slot's memory window (a reply the slot has not flushed yet) would leave
+        the thread unreachable if the process died before the flush -- so such
+        a reply is refused as ``"unflushed"`` and the caller says "try again in
+        a moment". The same check is what tells a replacement apart for a
+        legacy transcript with no ``created_at`` (a replacement never carries
+        the old chat's message ids). The read-modify-write runs
+        under :meth:`_locked` -- the same lock
+        :meth:`delete_session` unlinks the sidecar under -- and refuses when the
+        transcript is gone, for the reason :meth:`set_cached_intent_summary`
+        gives: a turn holds no lock while its model call is in flight, and an
+        unconditional write landing after a delete would recreate the sidecar
+        and resurrect a conversation the user was told is gone. Raises
+        :class:`ThreadStoreUnreadable` on a damaged sidecar (never overwritten)
+        and :class:`HistoryLockTimeout` when the lock cannot be taken. Blocking;
+        callers run it off the event loop.
+        """
+        with self._locked(key):
+            if not self._path(key).exists():
+                return "missing"
+            if expected_created_at is not None:
+                current = self.thread_transcript_identity(key)
+                if current is not None and current != expected_created_at:
+                    return "replaced"
+            if not self._transcript_holds_mid(key, mid):
+                return "replaced" if expected_created_at is None else "unflushed"
+            threads = self.read_threads(key)
+            if sum(len(r) for r in threads.values()) >= max_total:
+                return "sidecar_full"
+            replies = threads.setdefault(mid, [])
+            if any(r.get("id") == reply.get("id") for r in replies):
+                return "duplicate"
+            if len(replies) >= max_replies:
+                return "full"
+            replies.append(reply)
+            document = json.dumps({"version": 1, "threads": threads})
+            if len(document.encode("utf-8")) > THREADS_SIDECAR_MAX_BYTES:
+                return "sidecar_full"
+            _write_thread_sidecar(self.threads_sidecar_path(key), document)
+            return "ok"
+
+    def _transcript_holds_mid(self, key: str, mid: str) -> bool:
+        """Whether *key*'s transcript on disk has a row with ``meta.mid == mid``.
+
+        Read through the chained projection, the same corpus the thread routes
+        look a parent up in. Called under :meth:`_locked` by
+        :meth:`append_thread_reply`; the projection takes only its own in-process
+        index lock, so this is the read-inside-the-lock pattern the metadata
+        rewrites already use.
+        """
+        for row in self.read_messages_chained(key):
+            meta = row.get("meta") if isinstance(row, dict) else None
+            if isinstance(meta, dict) and meta.get("mid") == mid:
+                return True
+        return False
 
     def _intent_summary_cache_path(self, key: str) -> Path:
         """Sidecar path for a session's cached intent-structured summary.
@@ -1907,6 +2469,36 @@ class ConversationLog:
             logger.warning("set_cached_intent_summary: lock timeout, not writing key=%s", key)
             return False
 
+    def _persist_inline_attachments(self, key: str, role: str, content: str) -> str:
+        """*content* with the images it references copied into session storage.
+
+        The write boundary for inline images, mirroring
+        :func:`_redact_at_write_boundary`: this is where a message's text becomes
+        a durable row, so it is where a referenced image has to stop being a path
+        into someone else's temp directory. The agent scratch dir the picture
+        usually lives in is reclaimed when the agent process dies, so without
+        this the transcript keeps the reference long after the bytes are gone.
+        See :mod:`kiro_crew.chat_attachments` for the copy contract.
+
+        Gated on ``role != "user"``, the same gate the redaction boundary uses:
+        an inline image is something the agent produced, and a path the user
+        typed names a file of their own that this must not duplicate.
+
+        MUST be called under ``_locked(key)``. ``delete_session`` reclaims the
+        attachments directory under that same lock, so a copy made outside it can
+        be deleted between the copy and the append -- persisting a row that names
+        a file already gone, which is the exact defect this exists to remove. The
+        lock therefore costs one bounded file copy inside the critical section;
+        the dashboard slot save already holds it across a whole-transcript
+        read-modify-write, so this is in family. What one call can do is bounded
+        per message by :mod:`kiro_crew.chat_attachments`, so the section cannot be
+        held for an unbounded time.
+        """
+        if role == "user" or "![" not in content:
+            return content
+        path = self._path(key)
+        return persist_inline_images(content, sessions_dir=path.parent, stem=path.stem)
+
     def append(
         self,
         key: str,
@@ -1945,13 +2537,18 @@ class ConversationLog:
         correct agent later.  (Has no effect if the file already exists;
         use :meth:`update_metadata` to change the agent after creation.)
         """
-        path = self._path(key)
         # Serialize the create-if-missing + append + rotate against concurrent
         # rewrites (compaction / consolidation) so no write is lost and readers
-        # never observe a torn file. ``_locked`` also takes a cross-process
-        # advisory flock so a subagent / cron / CLI writing the SAME session
-        # file in another process can't interleave and lose this append.
+        # never observe a torn file. ``_locked`` also takes every stable
+        # cross-process alias lock so a subagent / cron / CLI writing the same
+        # logical session in another process cannot interleave or split its
+        # canonical and pre-migration files.
         with self._locked(key):
+            # Inside the lock, so a concurrent ``delete_session`` cannot reclaim
+            # the attachment between the copy and this row naming it. Idempotent,
+            # so the re-entrant call from ``append_if_absent`` is a no-op.
+            content = self._persist_inline_attachments(key, role, content)
+            path = self._path(key)
             created_with_tab_id = False
             created_now = False
             if not path.exists():
@@ -1982,7 +2579,7 @@ class ConversationLog:
                 # created provably holds no rows yet, so it is not consulted.
                 #
                 # ``astimezone()`` resolves the clock to an absolute instant
-                # before it is stored. This used to record a bare local wall
+                # before it is stored. A bare local wall
                 # clock, which repeats for an hour when daylight saving ends and
                 # cannot be ordered against the offset-aware rows the dashboard
                 # writes into this same file.
@@ -2060,16 +2657,30 @@ class ConversationLog:
         What counts as "already persisted" depends on whether the caller holds
         an identity. Without *mid*, any row with the same ``(role, content)``
         does — body equality is all an id-less writer can check. WITH *mid*,
-        only a body-equal row carrying the SAME ``meta.mid`` does: that row is
-        this very message, landed by the slot save or an earlier attempt of
-        this write. A body-equal row under another id (or none) is a DIFFERENT
-        occurrence that happens to repeat the text — an id-carrying twin of an
-        earlier injection, or a pre-id legacy row — and skipping on it would
-        drop THIS occurrence's only durable copy: the in-memory window is lost
-        on restart, so nothing would replay the newer message.
+        a same-role row carrying the SAME ``meta.mid`` AND a corroborating
+        body does: equal, or equal modulo preserved images
+        (:func:`same_text_modulo_images`). That row is this very message,
+        landed by the slot save or an earlier attempt of this write. The
+        image allowance is there because the slot save rewrites an inline
+        image to its stored copy, and if the agent's scratch file is gone by
+        the time this append runs, the rewrite here fails open to the
+        original path — strict body equality would miss the row and append a
+        duplicate under the same id naming a dead file. The corroboration
+        itself stays required because ``meta.mid`` is caller-suppliable, so a
+        bare id equality could pair two genuinely distinct messages. A
+        body-equal row under another id (or none) is a DIFFERENT occurrence
+        that happens to repeat the text — an id-carrying twin of an earlier
+        injection, or a pre-id legacy row — and skipping on it would drop
+        THIS occurrence's only durable copy: the in-memory window is lost on
+        restart, so nothing would replay the newer message.
         """
         supplied_mid = mid if isinstance(mid, str) and mid else None
         with self._locked(key):
+            # Rewritten HERE, not left to ``append``: the id-less comparison
+            # below is against what is already on disk, which carries
+            # rewritten paths. Comparing the original text would never match
+            # a persisted row and would append this message a second time.
+            content = self._persist_inline_attachments(key, role, content)
             if self._path(key).exists():
                 # Compare against the form ``append`` actually stores: the
                 # write boundary redacts non-user content, so matching on the
@@ -2077,12 +2688,27 @@ class ConversationLog:
                 # that contained a credential and would append it twice.
                 persisted = _redact_at_write_boundary(role, content)
                 for m in self._read_messages(key):
-                    if m.get("role") != role or m.get("content") != persisted:
+                    if m.get("role") != role:
                         continue
+                    on_disk = m.get("content")
                     if supplied_mid is None:
-                        return False
+                        if on_disk == persisted:
+                            return False
+                        continue
                     m_meta = m.get("meta")
-                    if isinstance(m_meta, dict) and m_meta.get("mid") == supplied_mid:
+                    if not (isinstance(m_meta, dict) and m_meta.get("mid") == supplied_mid):
+                        continue
+                    # Same id: corroborate by body, allowing for the other
+                    # writer having preserved an image this one could not.
+                    if on_disk == persisted or (
+                        isinstance(on_disk, str)
+                        and same_text_modulo_images(
+                            on_disk,
+                            persisted,
+                            sessions_dir=self._path(key).parent,
+                            stem=self._path(key).stem,
+                        )
+                    ):
                         return False
             # Reentrant: ``append`` re-enters ``_locked`` for the same key on
             # this thread (RLock + refcounted flock), so the write stays inside
@@ -2152,8 +2778,189 @@ class ConversationLog:
         """
         return int(self._read_metadata(key).get("rotation_generation", 0) or 0)
 
-    def snapshot_for_consolidation(self, key: str) -> tuple[list[dict], int, int]:
+    # ------------------------------------------------------------------ #
+    # The derivation seam: the ONE place a reader that LEARNS from a transcript
+    # (a summary, an export or transfer bundle, a suggestions prompt, an MCP
+    # history tool, the consolidator, skill detection -- anything that hands rows
+    # to a model, a peer, a file or memory) obtains its rows.
+    #
+    # The metadata line's ``memory_mode`` is the file's privacy contract and a
+    # ratchet any writer may tighten; a reader that checked the line and then
+    # read the rows in a separate step, or that trusted a live slot's mode, could
+    # be handed rows a restricted line already governs (a same-key hand-over
+    # landing a closed restricted tab's rows; a second gateway on the same data
+    # home tightening the line). Here the line is validated and the rows are read
+    # under one ``_locked`` hold, so the two cannot disagree, and a restricted or
+    # unreadable line raises :class:`TranscriptWithheld` instead of yielding rows.
+    #
+    # The plain reads (``read_messages``, ``read_messages_chained``, ``recent``)
+    # stay for transcript PLUMBING -- resuming a tab, saving, rendering the
+    # History browser, migrating a file -- which must see a restricted transcript
+    # (that is the point of keeping it). ``test_transcript_derivation_seam.py``
+    # enumerates every plain-read call site in the tree, so a new consumer cannot
+    # be written against the raw reads without naming itself there as plumbing.
+    # Callers hold no loop: ``_locked`` is a blocking, cross-process acquire.
+    # ------------------------------------------------------------------ #
+
+    @contextlib.contextmanager
+    def derivation_hold(self, stems: Iterable[str]) -> Iterator[None]:
+        """Hold *stems* for a derivation read; a lock timeout is a refusal.
+
+        ``locked_stems`` raises :class:`HistoryLockTimeout` when a holder (this
+        session's own save, a cron append, a second gateway) outlasts the acquire
+        ceiling. For a deriving reader that is not an error to surface as a
+        500 or a failed tool: it is "cannot vouch for the contract right now",
+        answered as :class:`TranscriptBusy` so the caller's best-effort skip
+        holds and a person-facing caller can say retry.
+        """
+        try:
+            with self.locked_stems(stems):
+                yield
+        except HistoryLockTimeout as exc:
+            raise TranscriptBusy(f"transcript lock not acquired in time: {exc}") from exc
+
+    @contextlib.contextmanager
+    def publication_hold(
+        self, key: str, *, expected_keys: Sequence[str] | None = None
+    ) -> Iterator[None]:
+        """Hold and re-validate *key* for one transcript-derived publication.
+
+        The chained transcript locks stay held through exactly one durable write
+        or synchronous response commit. When *expected_keys* is supplied, it is
+        the chain whose rows produced the pending publication. Any membership
+        change is retryable because the pending output does not describe the
+        current chain. A restricted line raises :class:`TranscriptWithheld`; a
+        lock timeout, unreadable line, or changed chain raises
+        :class:`TranscriptBusy`. Callers must enter this off the event loop and
+        must never keep the hold across a model call or an ``await``.
+        """
+        keys = list(expected_keys) if expected_keys is not None else self.chained_keys(key)
+        keys = keys or [key]
+        stems = {stem for chained in keys for stem in transcript_lock_stems(chained)}
+        with self.derivation_hold(stems):
+            settled_chain = self.chained_keys(key)
+            settled = settled_chain or [key]
+            if set(settled) != set(keys):
+                raise TranscriptBusy(
+                    f"transcript chain for {key!r} changed while it was being locked"
+                )
+            for chained in settled:
+                self._withhold_if_restricted(chained)
+            yield
+
+    def _withhold_if_restricted(self, key: str) -> None:
+        """Raise :class:`TranscriptWithheld` unless *key*'s line permits derivation.
+
+        Called INSIDE ``_locked(key)`` so the verdict describes the same file
+        state the caller's row read sees. An absent file (no line yet) is not a
+        refusal. A line that cannot be READ is refused too, but as
+        :class:`TranscriptBusy`: nothing about the session's privacy was measured,
+        so a handler that maps the two must not tell the user the chat is
+        incognito -- it is a transient failure to retry, like a lock timeout, and
+        the subclass keeps every best-effort ``except TranscriptWithheld`` skip
+        failing closed exactly as before.
+        """
+        metadata, readable = self.get_metadata_status(key)
+        if not readable:
+            raise TranscriptBusy(
+                f"transcript {key!r} could not be read; nothing is derived from it"
+            )
+        if is_incognito_transcript(metadata.get("memory_mode")):
+            raise TranscriptWithheld(
+                f"transcript {key!r} is restricted; nothing is derived from it"
+            )
+
+    def derive_messages(self, key: str) -> list[dict]:
+        """Rows for a reader that derives from them; refused for a restricted line.
+
+        The guarded twin of :meth:`read_messages` (same rows, same shared cache
+        object -- callers must not mutate), read under the transcript lock after
+        the line has been validated in the same hold.
+        """
+        with self.derivation_hold(transcript_lock_stems(key)):
+            self._withhold_if_restricted(key)
+            return self.read_messages(key)
+
+    def chained_keys(self, key: str) -> list[str]:
+        """Every transcript key :meth:`read_messages_chained` concatenates for *key*."""
+        return self._read_projection.chained_keys(key)
+
+    def derive_messages_chained(self, key: str) -> list[dict]:
+        """Guarded twin of :meth:`read_messages_chained` (see :meth:`derive_messages`)."""
+        rows, _keys = self.derive_messages_chained_with_keys(key)
+        return rows
+
+    def derive_messages_chained_with_keys(self, key: str) -> tuple[list[dict], tuple[str, ...]]:
+        """Return guarded chained rows and the exact chain validated with them.
+
+        A chained read concatenates EVERY transcript sharing the tab id -- a legacy
+        tab's earlier files as well as the requested key -- so the contract that
+        governs the result is the strictest line among them, not the requested
+        key's alone: a sibling tightened to ``temporary`` would otherwise ride out
+        under a persistent sibling's line. Every chained transcript is locked (one
+        deterministic lock set, no partial holds) and validated before a single
+        row is read. The chain is resolved once more inside the hold, and only that
+        validated settled set is read; a member joining afterwards is never pulled
+        in by a third resolution outside the lock set. The returned keys let an
+        egress publication compare its pending bundle with this same settled set.
+        A member that joined between the resolve and the hold is unlocked and
+        unvalidated, so the read is refused -- as :class:`TranscriptBusy`, the
+        same answer :meth:`publication_hold` gives a changed chain: nothing about
+        the session's privacy was measured, so a person-facing caller says retry
+        rather than private.
+        """
+        keys = self.chained_keys(key) or [key]
+        stems = {stem for chained in keys for stem in transcript_lock_stems(chained)}
+        with self.derivation_hold(stems):
+            settled_chain = self.chained_keys(key)
+            settled = settled_chain or [key]
+            if set(settled) - set(keys):
+                # The chain grew between the resolve and the hold: its new member
+                # is not locked, so refuse rather than read it unvalidated. A
+                # membership change is "cannot vouch right now", not a privacy
+                # verdict, so it is the retryable refusal.
+                raise TranscriptBusy(
+                    f"transcript chain for {key!r} changed while it was being locked"
+                )
+            for chained in settled:
+                self._withhold_if_restricted(chained)
+            validated_keys = tuple(settled)
+            if not settled_chain:
+                # Preserve read_messages_chained's shared-cache identity when the
+                # index knows no chain for this key.
+                return self._read_messages(key), validated_keys
+            rows: list[dict] = []
+            for chained in settled:
+                rows.extend(self._read_messages(chained))
+            return rows or self._read_messages(key), validated_keys
+
+    def derive_recent(
+        self,
+        key: str,
+        max_messages: int = 20,
+        roles: AbstractSet[str] | None = None,
+    ) -> list[dict]:
+        """Guarded twin of :meth:`recent` (see :meth:`derive_messages`)."""
+        with self.derivation_hold(transcript_lock_stems(key)):
+            self._withhold_if_restricted(key)
+            return self.recent(key, max_messages, roles)
+
+    def snapshot_for_consolidation(
+        self, key: str, *, withhold_restricted: bool = False
+    ) -> tuple[list[dict], int, int]:
         """Atomically snapshot ``(unconsolidated_messages, total, generation)``.
+
+        With ``withhold_restricted=True`` the metadata line's ``memory_mode`` is
+        read under the SAME lock hold and validated with the rows: an incognito or
+        temporary line -- or one that cannot be read -- raises
+        :class:`TranscriptWithheld` instead of returning rows (the derivation
+        seam, see :meth:`derive_messages`). The
+        consolidator's own privacy check reads the line before this snapshot, and
+        a writer can tighten it in between (a same-key hand-over landing a
+        restricted tab's rows under a line that was persistent a moment ago);
+        rows and contract taken in one hold cannot disagree, so nothing the
+        consolidator sends to a model or writes to memory is ever rows a
+        restricted line already governed.
 
         The consolidator needs the unconsolidated tail, the total message count
         (the absolute offset it later passes to :meth:`mark_consolidated`), and
@@ -2173,7 +2980,14 @@ class ConversationLog:
         a fresh slice (never the shared ``_read_messages`` cache object), so the
         caller may treat it as owned.
         """
-        with self._locked(key):
+        hold = (
+            self.derivation_hold(transcript_lock_stems(key))
+            if withhold_restricted
+            else self._locked(key)
+        )
+        with hold:
+            if withhold_restricted:
+                self._withhold_if_restricted(key)
             messages = self._read_messages(key)
             meta = self._read_metadata(key)
             offset = meta.get("last_consolidated", 0)
@@ -2221,10 +3035,11 @@ class ConversationLog:
         them from memory/history extraction). When neither trips, the offset is
         applied as-is.
         """
-        path = self._path(key)
-        # Serialize behind the cross-process lock and re-read under it so a
-        # concurrent append (in this or another process) is never lost.
+        # Serialize behind the cross-process lock and resolve/re-read under it so
+        # a concurrent append or restore cannot redirect this key after its path
+        # was chosen.
         with self._locked(key):
+            path = self._path(key)
             if not path.exists():
                 return
             prev_mtime = _safe_mtime(path)
@@ -2316,10 +3131,9 @@ class ConversationLog:
             # to the top of list_sessions on every gateway restart.
             _restore_mtime(path, prev_mtime)
             # Invalidate while still holding the lock. Outside it there is a
-            # window where the file is already rewritten with its mtime
-            # restored but the generation has not moved, so a concurrent fold /
-            # snippet / metadata read passes both the mtime and the generation
-            # guard and memoizes pre-rewrite data. Every other preserved-mtime
+            # window where the file is already rewritten but the generation has
+            # not moved, so a concurrent fold / snippet / metadata read could
+            # publish before the local invalidation. Every other preserved-mtime
             # writer already invalidates inside its locked section;
             # _invalidate_cache is pure in-memory work, so this adds no I/O
             # under the cross-process flock.
@@ -2363,11 +3177,10 @@ class ConversationLog:
         Read UNCACHED. The accounting is cross-process (a gateway sweep, the CLI,
         a subagent all record failures for the same session), and every writer of
         these fields restores the file's pre-write mtime so housekeeping does not
-        reorder ``list_sessions``. The metadata cache is keyed on mtime, so a warm
-        entry survives another process's write byte-for-byte and would serve a
-        stale attempt count — bypassing the backoff on the read path and, on the
-        read-increment-write path, overwriting the other process's durable count
-        with a lower one. Dropping the entry first costs one first-line read.
+        reorder ``list_sessions``. The metadata cache identity detects the normal
+        atomic rewrite, but this accounting path deliberately reads uncached: a
+        second process can update its durable count between a warm read and the
+        following increment. Dropping the entry first costs one first-line read.
 
         Metadata is caller-supplied JSON, so every conversion is defensive:
         ``1e309`` parses to ``inf`` and ``int(inf)`` raises ``OverflowError``
@@ -2633,8 +3446,13 @@ class ConversationLog:
     def _prune_search_memos(self, live_keys: set[str]) -> None:
         self._catalog_projection._prune_search_memos(live_keys)
 
-    def _build_folded(self, key: str, mtime: float, gen: int) -> tuple[int, str] | None:
-        return self._catalog_projection._build_folded(key, mtime, gen)
+    def _build_folded(
+        self,
+        key: str,
+        identity: tuple[int, int, int],
+        gen: int,
+    ) -> tuple[int, str] | None:
+        return self._catalog_projection._build_folded(key, identity, gen)
 
     def _iter_message_texts(self, key: str) -> Iterator[str]:
         return self._catalog_projection._iter_message_texts(key)
@@ -2681,6 +3499,21 @@ class ConversationLog:
         """See ``HistoryReadProjection.chain_mid_rotation``."""
         return self._read_projection.chain_mid_rotation(key)
 
+    def read_messages_chained_page(
+        self,
+        key: str,
+        *,
+        limit: int,
+        before: int | None = None,
+        expected_revision: ChainRevision | None = None,
+    ) -> TranscriptPage:
+        return self._read_projection.read_messages_chained_page(
+            key,
+            limit=limit,
+            before=before,
+            expected_revision=expected_revision,
+        )
+
     def _rebuild_tab_id_index(self) -> None:
         self._read_projection._rebuild_tab_id_index()
 
@@ -2701,6 +3534,36 @@ class ConversationLog:
             return self._metadata_projection.delete_session(key, skip_pinned=True)
         return self._metadata_projection.delete_session(key, skip_pinned=False)
 
+    def delete_memory_consolidation_session(self, key: str, expected_store: str) -> bool:
+        """Delete every artifact of one retired generated consolidation turn."""
+        from kiro_crew.member_memory_auth import (
+            read_private_session_store,
+            require_memory_consolidation_session_key,
+        )
+
+        require_memory_consolidation_session_key(key, expected_store)
+        binding = read_private_session_store(key)
+        if binding is not None and binding != expected_store:
+            raise ValueError("The transient session belongs to another memory store")
+        path = self._path(key)
+        existed = path.exists()
+        deleted = self.delete_session(key)
+        if existed and not deleted:
+            raise OSError(f"Could not delete transient consolidation session {key!r}")
+
+        removed = bool(deleted)
+        archive_dir = _archive_dir(self._dir)
+        stem = _safe_key(key) + ARCHIVE_SEGMENT_DELIMITER
+        if archive_dir.exists():
+            for archived in archive_dir.glob(f"{stem}*.jsonl"):
+                archived.unlink()
+                removed = True
+        lock_path = self._lock_path(key)
+        if lock_path.exists():
+            lock_path.unlink()
+            removed = True
+        return removed
+
     def set_title(self, key: str, title: str) -> None:
         self._metadata_projection.set_title(key, title)
 
@@ -2712,8 +3575,17 @@ class ConversationLog:
         key: str,
         fields: dict,
         guard: Callable[[dict], bool],
+        *,
+        require_existing: bool = False,
+        after_commit_under_lock: Callable[[], None] | None = None,
     ) -> bool:
-        return self._metadata_projection.update_metadata_if(key, fields, guard)
+        return self._metadata_projection.update_metadata_if(
+            key,
+            fields,
+            guard,
+            require_existing=require_existing,
+            after_commit_under_lock=after_commit_under_lock,
+        )
 
     def _update_metadata_locked(self, key: str, fields: dict) -> None:
         self._metadata_projection._update_metadata_locked(key, fields)
@@ -2839,13 +3711,16 @@ class ConversationLog:
     #: paying a full-file parse on large sessions.
     _PREVIEW_TAIL_BYTES = 16_384
     #: Max characters returned in a last-message preview.
-    _PREVIEW_MAX_CHARS = 120
+    _PREVIEW_MAX_CHARS = PREVIEW_MAX_CHARS
 
     def last_message_preview(self, key: str, sanitize=None) -> str:
         return self._read_projection.last_message_preview(key, sanitize=sanitize)
 
-    def last_message_info(self, key: str, sanitize=None) -> tuple[str, float]:
+    def last_message_info(self, key: str, sanitize=None) -> tuple[str, float, bool]:
         return self._read_projection.last_message_info(key, sanitize=sanitize)
+
+    def last_speech_info(self, key: str, sanitize=None) -> tuple[str, float, bool, bool]:
+        return self._read_projection.last_speech_info(key, sanitize=sanitize)
 
     @staticmethod
     def _content_text(content: object) -> str:
@@ -2857,6 +3732,9 @@ class ConversationLog:
     def get_metadata_status(self, key: str) -> tuple[dict, bool]:
         return self._read_projection.get_metadata_status(key)
 
+    def metadata_line_state(self, key: str) -> str:
+        return self._read_projection.metadata_line_state(key)
+
     def _pause_for_transient_retry(self) -> None:
         self._read_projection._pause_for_transient_retry()
 
@@ -2865,6 +3743,9 @@ class ConversationLog:
 
     def _read_metadata_status(self, key: str) -> tuple[dict, bool]:
         return self._read_projection._read_metadata_status(key)
+
+    def _read_metadata_state(self, key: str) -> tuple[dict, str]:
+        return self._read_projection._read_metadata_state(key)
 
     def sliding_window(self, key: str, keep_recent: int = 5) -> tuple[list[dict], list[dict]]:
         return self._read_projection.sliding_window(key, keep_recent)

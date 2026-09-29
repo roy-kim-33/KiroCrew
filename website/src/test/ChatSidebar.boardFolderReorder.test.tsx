@@ -99,6 +99,10 @@ function renderSidebar(foldersOverride: ChatFolder[] = folders) {
   qc.setQueryData(['chat-tags'], tags)
   qc.setQueryData(['tag-columns'], columns)
   qc.setQueryData(['chat-folders'], foldersOverride)
+  // The settings body the shell holds from boot: with it on hand the folder
+  // sort mode is known (Custom), and the rows offer their drag -- before the
+  // first read the sidebar offers no folder drag at all, by design.
+  qc.setQueryData(['kirocrewConfig'], { dashboard: {} })
   return render(
     <QueryClientProvider client={qc}>
       <Provider store={store}>
@@ -184,5 +188,37 @@ describe('board view: folder reorder wiring', () => {
     const rendered = [...container.querySelectorAll('[data-col-folder-sortable]')]
       .map(el => el.getAttribute('data-col-folder-sortable'))
     expect(rendered).toEqual([FOLDER_A, FOLDER_B])
+  })
+})
+
+describe('board view: nested subfolders draw in stored order', () => {
+  // The surface the UX lane found unevidenced: `renderColumnFolder` sorts
+  // `childFolders` with `bySidebarOrder`, so a board column must show the same
+  // sequence the list sidebar does — and the same one `chat_folder_tree`
+  // reports, which is where an agent reads the gap it names in before/after.
+  const PARENT = 'folder-parent'
+  const CHILD_Z = 'folder-child-z'
+  const CHILD_A = 'folder-child-a'
+
+  // Stored order is the REVERSE of alphabetical, so a name-only sort fails here.
+  const nested: ChatFolder[] = [
+    { id: PARENT, name: 'Parent', order: 0 },
+    { id: CHILD_Z, name: 'Zulu', parent_id: PARENT, order: 0 },
+    { id: CHILD_A, name: 'Alpha', parent_id: PARENT, order: 1 },
+  ]
+
+  it('draws Zulu above Alpha because order says so, not the name', () => {
+    mocks.chatFolders.mockResolvedValue(nested)
+    const { container } = renderSidebar(nested)
+    const ids = [...container.querySelectorAll('[data-col-folder-sortable]')]
+      .map(el => el.getAttribute('data-col-folder-sortable'))
+    // The parent is the sortable root; children render inside it.
+    expect(ids).toContain(PARENT)
+    const html = container.innerHTML
+    const posZulu = html.indexOf('Zulu')
+    const posAlpha = html.indexOf('Alpha')
+    expect(posZulu).toBeGreaterThan(-1)
+    expect(posAlpha).toBeGreaterThan(-1)
+    expect(posZulu).toBeLessThan(posAlpha)
   })
 })

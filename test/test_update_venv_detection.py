@@ -3,14 +3,29 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import subprocess
 import sys
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import DEFAULT, AsyncMock, MagicMock
 
 import pytest
 from aiohttp import web
 
 from kiro_crew.dashboard.state import DashboardState
+
+
+def _as_owner(req: MagicMock) -> None:
+    """Give a mock request the dashboard owner's claims, leaving every other key as-is.
+
+    ``POST /api/update`` is owner-gated, so the dashboard-user request these tests
+    model carries ``app == ""`` and the owner's subject: ``state.owner_id`` when
+    one is configured, else the signed local bootstrap subject.
+    """
+    owner = str(getattr(req.app["state"], "owner_id", "") or "") or "local-app"
+    claims = {"app": "", "user": owner}
+    req.__contains__.side_effect = lambda key: key in claims
+    req.__getitem__.side_effect = lambda key: claims[key] if key in claims else DEFAULT
+    req.get.side_effect = lambda key, *default: claims[key] if key in claims else DEFAULT
 
 
 def _init_repo(path) -> None:
@@ -22,6 +37,63 @@ def _init_repo(path) -> None:
     subprocess.run(
         ["git", "init", "-q"], cwd=str(path), check=True, capture_output=True, timeout=30
     )
+
+
+def _pin_probe_git(monkeypatch, tmp_path):
+    """Resolve the worktree probe's git to a fake under ``tmp_path``.
+
+    ``update_capability._git_toplevel`` finds git through ``trusted_system_bin``
+    (fixed system directories, never PATH) and asks ``rev-parse --show-toplevel``
+    about the install root. Left alone, that is the HOST's git running from the
+    test process -- and on a host that keeps git outside those directories the
+    probe silently degrades to the on-disk fallback, so which branch a test
+    exercised depended on the machine. The fake answers the one question the
+    probe asks the way git does: the ``-C`` root itself when it carries ``.git``,
+    exit 128 otherwise. Every argv it sees is appended to ``git-calls.log``
+    beside it. The probe's own reading of real repositories is covered in
+    ``test_update_capability.py``; here the install shape is a precondition.
+    """
+    bin_dir = tmp_path / "fake-bin"
+    bin_dir.mkdir()
+    log = bin_dir / "git-calls.log"
+    if os.name == "nt":
+        fake = bin_dir / "git.cmd"
+        fake.write_text(
+            "@echo off\r\n"
+            f'echo %* >> "{log}"\r\n'
+            ":loop\r\n"
+            'if "%~1"=="" goto miss\r\n'
+            'if "%~1"=="-C" (\r\n'
+            '  if exist "%~2\\.git" (echo %~2& exit /b 0)\r\n'
+            "  goto miss\r\n"
+            ")\r\n"
+            "shift\r\n"
+            "goto loop\r\n"
+            ":miss\r\n"
+            "echo fatal: not a git repository 1>&2\r\n"
+            "exit /b 128\r\n",
+            encoding="utf-8",
+        )
+    else:
+        fake = bin_dir / "git"
+        fake.write_text(
+            "#!/bin/sh\n"
+            f'printf \'%s\\n\' "$*" >> "{log}"\n'
+            "root=\n"
+            'while [ "$#" -gt 0 ]; do\n'
+            '  if [ "$1" = "-C" ]; then root=$2; shift; fi\n'
+            "  shift\n"
+            "done\n"
+            'if [ -n "$root" ] && [ -e "$root/.git" ]; then printf \'%s\\n\' "$root"; exit 0; fi\n'
+            "echo 'fatal: not a git repository' >&2\n"
+            "exit 128\n",
+            encoding="utf-8",
+        )
+        fake.chmod(0o755)
+    monkeypatch.setattr(
+        "kiro_crew.platform.update_capability.trusted_system_bin", lambda _name: str(fake)
+    )
+    return fake
 
 
 def _make_state(monkeypatch, tmp_path) -> DashboardState:
@@ -58,7 +130,7 @@ def _track_errors(state):
 class TestVenvPipInstall:
     """Tests for the _venv_pip_install helper.
 
-    The helper no longer spawns pip itself — it hands the install to
+    The helper does not spawn pip itself — it hands the install to
     ``dep_sync.sync_or_reinstall``, which picks an editable reinstall or a
     dependency-only sync depending on whether the console script can be
     rewritten. These stub that one seam, so they assert what this endpoint owns:
@@ -334,6 +406,7 @@ class TestApiUpdateApplyVenvDispatch:
         self, monkeypatch, tmp_path
     ) -> None:
         proj = _make_pip_proj(tmp_path)
+        _pin_probe_git(monkeypatch, tmp_path)
         monkeypatch.setenv("KIROCREW_PROJECT_DIR", str(proj))
         monkeypatch.setattr(
             "kiro_crew.platform.update_capability.running_from_checkout",
@@ -348,7 +421,10 @@ class TestApiUpdateApplyVenvDispatch:
             pip_called.append(True)
             return True
 
-        async def fake_restart(s):
+        async def fake_restart(s, *, resolver):
+            from kiro_crew.platform.wheel_engine import respawn_executable
+
+            assert resolver is respawn_executable
             restart_called.append(True)
 
         monkeypatch.setattr(
@@ -361,11 +437,16 @@ class TestApiUpdateApplyVenvDispatch:
         # Stub git pull so it succeeds.
         async def fake_exec(*args, **kwargs):
             proc = MagicMock()
-            # The apply guard fails CLOSED on an unparseable rev-list count, so
-            # the universal success stub must answer that one call with a real
-            # fast-forwardable distance for the dispatch under test to be
-            # reachable at all.
-            out = b"0\t1\n" if "rev-list" in args else b""
+            # The apply guard fails CLOSED on an unparseable rev-list count and
+            # on an empty upstream pin, so the universal success stub must
+            # answer those two calls with a real fast-forwardable distance and
+            # a real OID for the dispatch under test to be reachable at all.
+            if "rev-list" in args:
+                out = b"0\t1\n"
+            elif "rev-parse" in args:
+                out = b"0123456789abcdef0123456789abcdef01234567\n"
+            else:
+                out = b""
             proc.communicate = AsyncMock(return_value=(out, b""))
             proc.returncode = 0
             return proc
@@ -379,6 +460,7 @@ class TestApiUpdateApplyVenvDispatch:
         app["state"] = state
         request = MagicMock()
         request.app = app
+        _as_owner(request)
 
         resp = await api_update_apply(request)
         assert resp.status == 200
@@ -394,6 +476,7 @@ class TestApiUpdateApplyVenvDispatch:
         self, monkeypatch, tmp_path
     ) -> None:
         proj = _make_pip_proj(tmp_path)
+        _pin_probe_git(monkeypatch, tmp_path)
         monkeypatch.setenv("KIROCREW_PROJECT_DIR", str(proj))
         monkeypatch.setattr(
             "kiro_crew.platform.update_capability.running_from_checkout",
@@ -418,11 +501,16 @@ class TestApiUpdateApplyVenvDispatch:
 
         async def fake_exec(*args, **kwargs):
             proc = MagicMock()
-            # The apply guard fails CLOSED on an unparseable rev-list count, so
-            # the universal success stub must answer that one call with a real
-            # fast-forwardable distance for the dispatch under test to be
-            # reachable at all.
-            out = b"0\t1\n" if "rev-list" in args else b""
+            # The apply guard fails CLOSED on an unparseable rev-list count and
+            # on an empty upstream pin, so the universal success stub must
+            # answer those two calls with a real fast-forwardable distance and
+            # a real OID for the dispatch under test to be reachable at all.
+            if "rev-list" in args:
+                out = b"0\t1\n"
+            elif "rev-parse" in args:
+                out = b"0123456789abcdef0123456789abcdef01234567\n"
+            else:
+                out = b""
             proc.communicate = AsyncMock(return_value=(out, b""))
             proc.returncode = 0
             return proc
@@ -436,6 +524,7 @@ class TestApiUpdateApplyVenvDispatch:
         app["state"] = state
         request = MagicMock()
         request.app = app
+        _as_owner(request)
 
         resp = await api_update_apply(request)
         assert resp.status == 200

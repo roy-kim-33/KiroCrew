@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { screen, waitFor } from '@testing-library/react'
+import { act, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import type { ComponentType } from 'react'
 import ArtifactsPage from '../pages/ArtifactsPage'
@@ -109,6 +109,35 @@ describe('ArtifactsPage remote-browse gating', () => {
     expect(vi.mocked(api).browseRemoteArtifacts).toHaveBeenCalledWith('companion', { scope: 'mine' })
   })
 
+  it('renders NO section for a discovery-capable provider whose tooling is absent', async () => {
+    // available: false means the provider's tooling is not installed here, so
+    // every browse it could make fails. Its only possible rendering is an error
+    // card, and nothing inside the section installs anything.
+    vi.mocked(api).getArtifactPublishProviders = vi.fn().mockResolvedValue({
+      providers: [mkProvider('companion', { available: false })],
+      kind: 'widget',
+    })
+    const browse = vi.fn()
+    vi.mocked(api).browseRemoteArtifacts = browse
+    renderWithProviders(<ArtifactsPage />)
+    await waitFor(() => expect(screen.getByText('local a')).toBeInTheDocument())
+    expect(screen.queryByText('On Companion Provider')).not.toBeInTheDocument()
+    expect(browse).not.toHaveBeenCalled()
+  })
+
+  it('renders the section for an installed provider (available: true)', async () => {
+    // The filter must key on the explicit false, not on truthiness: an
+    // available provider is exactly the case the section exists for.
+    vi.mocked(api).getArtifactPublishProviders = vi.fn().mockResolvedValue({
+      providers: [mkProvider('companion', { available: true })],
+      kind: 'widget',
+    })
+    vi.mocked(api).browseRemoteArtifacts = vi.fn().mockResolvedValue({ artifacts: [mkRemote('ext-9')] })
+    renderWithProviders(<ArtifactsPage />)
+    await waitFor(() => expect(screen.getByText('On Companion Provider')).toBeInTheDocument())
+    expect(screen.getByText('Remote ext-9')).toBeInTheDocument()
+  })
+
   it('dedups rows that already exist locally (local_slug set)', async () => {
     vi.mocked(api).getArtifactPublishProviders = vi.fn().mockResolvedValue({
       providers: [mkProvider('companion')],
@@ -122,15 +151,34 @@ describe('ArtifactsPage remote-browse gating', () => {
     expect(screen.queryByText('Remote ext-1')).not.toBeInTheDocument()
   })
 
-  it('hides the remote section entirely when the provider browse errors', async () => {
+  it('keeps a remote browse failure bounded and actionable', async () => {
     vi.mocked(api).getArtifactPublishProviders = vi.fn().mockResolvedValue({
       providers: [mkProvider('companion')],
       kind: 'widget',
     })
-    vi.mocked(api).browseRemoteArtifacts = vi.fn().mockRejectedValue(new Error('remote down'))
+    let rejectBrowse!: (error: Error) => void
+    vi.mocked(api).browseRemoteArtifacts = vi.fn().mockReturnValue(
+      new Promise((_resolve, reject) => { rejectBrowse = reject }),
+    )
     renderWithProviders(<ArtifactsPage />)
-    await waitFor(() => expect(screen.getByText('local a')).toBeInTheDocument())
+    await waitFor(() => expect(vi.mocked(api).browseRemoteArtifacts).toHaveBeenCalledTimes(1))
+    await act(async () => { rejectBrowse(new Error('remote down')) })
+
+    const notice = await screen.findByTestId('remote-browse-error-companion')
+    const row = notice.parentElement
+    expect(screen.getByText('local a')).toBeInTheDocument()
+    expect(notice).toHaveTextContent('Companion Provider')
+    expect(notice).toHaveTextContent('remote down')
+    expect(notice.querySelector('.line-clamp-2')).toBeInTheDocument()
+    expect(row?.className).toContain('max-w-lg')
+    // The clamped tail rides ErrorNotice's own truncation affordance, on the
+    // message span -- not a row-level `title` that also fires over Retry.
+    expect(row).not.toHaveAttribute('title')
+    expect(notice.querySelector('.line-clamp-2')).toHaveAttribute('title', 'remote down')
     expect(screen.queryByText('On Companion Provider')).not.toBeInTheDocument()
+
+    await userEvent.click(within(row as HTMLElement).getByRole('button', { name: 'Retry' }))
+    await waitFor(() => expect(vi.mocked(api).browseRemoteArtifacts).toHaveBeenCalledTimes(2))
   })
 
   it('full-text search keeps the filter input focused and mounted across keystrokes', async () => {

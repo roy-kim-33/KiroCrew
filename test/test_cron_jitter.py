@@ -81,63 +81,65 @@ class TestComputeJitterEveryJobs:
 
 
 class TestComputeJitterCronExpr:
-    def test_sub_hourly_slash_minute_returns_zero(self):
-        """*/5 * * * * (every 5 min) gets no jitter."""
-        job = _job(CronSchedule(kind="cron", cron_expr="*/5 * * * *"))
-        assert CronService._compute_jitter(job) == 0.0
+    @pytest.mark.parametrize(
+        "cron_expr",
+        [
+            "* * * * *",
+            "*/5 * * * *",
+            "0,30 * * * *",
+            "0-30 * * * *",
+            "0-30/5 * * * *",
+            "1,15-20 * * * *",
+        ],
+    )
+    def test_parsed_sub_hourly_minute_fields_return_zero(self, cron_expr):
+        """Every parsed minute field with multiple fires per hour gets no jitter."""
+        job = _job(CronSchedule(kind="cron", cron_expr=cron_expr))
 
-    def test_sub_hourly_comma_minute_returns_zero(self):
-        """0,30 * * * * (every 30 min) gets no jitter."""
-        job = _job(CronSchedule(kind="cron", cron_expr="0,30 * * * *"))
-        assert CronService._compute_jitter(job) == 0.0
+        with patch("kiro_crew.cron.random.uniform") as mock_rand:
+            result = CronService._compute_jitter(job)
 
-    @patch("kiro_crew.cron.random.uniform", return_value=700.0)
-    def test_hourly_wildcard_returns_hourly_jitter(self, mock_rand):
-        """0 * * * * (every hour) gets hourly jitter."""
-        job = _job(CronSchedule(kind="cron", cron_expr="0 * * * *"))
-        result = CronService._compute_jitter(job)
-        mock_rand.assert_called_once_with(0, _JITTER_HOURLY_MAX)
-        assert result == 700.0
+        assert result == 0.0
+        mock_rand.assert_not_called()
 
-    @patch("kiro_crew.cron.random.uniform", return_value=500.0)
-    def test_every_2_hours_returns_hourly_jitter(self, mock_rand):
-        """0 */2 * * * gets hourly jitter (not daily)."""
-        job = _job(CronSchedule(kind="cron", cron_expr="0 */2 * * *"))
-        result = CronService._compute_jitter(job)
-        mock_rand.assert_called_once_with(0, _JITTER_HOURLY_MAX)
-        assert result == 500.0
+    @pytest.mark.parametrize(
+        ("cron_expr", "jitter_max"),
+        [
+            ("0 * * * *", _JITTER_HOURLY_MAX),
+            ("0 */2 * * *", _JITTER_HOURLY_MAX),
+            ("0 1,13 * * *", _JITTER_HOURLY_MAX),
+            ("0 3 * * *", _JITTER_DAILY_MAX),
+            ("0 9 * * 1-5", _JITTER_DAILY_MAX),
+            ("30 15 * * *", _JITTER_DAILY_MAX),
+        ],
+    )
+    def test_single_minute_keeps_existing_jitter_band(self, cron_expr, jitter_max):
+        """A single parsed minute keeps the existing hour-field band selection."""
+        job = _job(CronSchedule(kind="cron", cron_expr=cron_expr))
 
-    @patch("kiro_crew.cron.random.uniform", return_value=800.0)
-    def test_twice_daily_comma_hours_returns_hourly_jitter(self, mock_rand):
-        """0 1,13 * * * (twice daily) gets hourly jitter."""
-        job = _job(CronSchedule(kind="cron", cron_expr="0 1,13 * * *"))
-        result = CronService._compute_jitter(job)
-        mock_rand.assert_called_once_with(0, _JITTER_HOURLY_MAX)
-        assert result == 800.0
+        with patch("kiro_crew.cron.random.uniform", return_value=123.0) as mock_rand:
+            result = CronService._compute_jitter(job)
 
-    @patch("kiro_crew.cron.random.uniform", return_value=4000.0)
-    def test_daily_single_hour_returns_daily_jitter(self, mock_rand):
-        """0 3 * * * (daily at 3am) gets daily jitter."""
-        job = _job(CronSchedule(kind="cron", cron_expr="0 3 * * *"))
-        result = CronService._compute_jitter(job)
-        mock_rand.assert_called_once_with(0, _JITTER_DAILY_MAX)
-        assert result == 4000.0
+        assert result == 123.0
+        mock_rand.assert_called_once_with(0, jitter_max)
 
-    @patch("kiro_crew.cron.random.uniform", return_value=5500.0)
-    def test_weekly_single_hour_returns_daily_jitter(self, mock_rand):
-        """0 9 * * 1-5 (weekdays at 9am) gets daily jitter."""
-        job = _job(CronSchedule(kind="cron", cron_expr="0 9 * * 1-5"))
-        result = CronService._compute_jitter(job)
-        mock_rand.assert_called_once_with(0, _JITTER_DAILY_MAX)
-        assert result == 5500.0
+    def test_minute_range_next_run_is_not_displaced_by_jitter(self):
+        """The next 0-30 run stays on its parsed minute instead of drifting."""
+        from datetime import datetime, timezone
 
-    @patch("kiro_crew.cron.random.uniform", return_value=300.0)
-    def test_daily_two_digit_hour_returns_daily_jitter(self, mock_rand):
-        """30 15 * * * (daily at 3:30pm) gets daily jitter."""
-        job = _job(CronSchedule(kind="cron", cron_expr="30 15 * * *"))
-        result = CronService._compute_jitter(job)
-        mock_rand.assert_called_once_with(0, _JITTER_DAILY_MAX)
-        assert result == 300.0
+        from kiro_crew.cron import compute_next_run_ts
+
+        frozen_now = datetime(2026, 9, 15, 12, 0, tzinfo=timezone.utc).timestamp()
+        expected_next = datetime(2026, 9, 15, 12, 1, tzinfo=timezone.utc).timestamp()
+        job = _job(CronSchedule(kind="cron", cron_expr="0-30 * * * *"))
+        job.timezone = "UTC"
+
+        with patch("kiro_crew.cron.random.uniform", return_value=_JITTER_HOURLY_MAX):
+            next_run = compute_next_run_ts(job, now=frozen_now)
+            jitter = CronService._compute_jitter(job)
+
+        assert next_run is not None
+        assert next_run + jitter == expected_next
 
 
 class TestComputeJitterBounds:
@@ -178,7 +180,7 @@ class TestDriftPrevention:
         before = time.time()
         # Patch jitter to a known value so we can verify drift prevention
         with patch.object(CronService, "_compute_jitter", return_value=0.1):
-            await svc._run_job_isolated(job)
+            await svc._run_job_isolated(job, svc._claim_run(job.id, "scheduled"))
         after = time.time()
 
         # last_run_ts should be ~before (scheduled time), not after+jitter
@@ -204,7 +206,7 @@ class TestDriftPrevention:
         svc._on_job = None
 
         with patch.object(CronService, "_compute_jitter", return_value=0.0):
-            await svc._run_job_isolated(job)
+            await svc._run_job_isolated(job, svc._claim_run(job.id, "scheduled"))
 
         # Cron jobs set last_run_ts in _execute (post-execution)
         assert job.last_run_ts is not None
@@ -230,20 +232,21 @@ class TestReaperJitterAllowance:
         """Job running for less than timeout+jitter should NOT be reaped."""
         import time as time_mod
 
-        from kiro_crew.cron import _JOB_TIMEOUT_SECS
+        from kiro_crew.cron import _JOB_TIMEOUT_SECS, _RunClaim
 
         svc = CronService()
         svc._sessions = None
         # Job started 100s ago with 1200s jitter — well within threshold
-        svc._job_start_times["j1"] = time_mod.time() - 100
-        svc._job_jitter["j1"] = 1200.0
+        claim = svc._claims["j1"] = _RunClaim(
+            trigger="scheduled", claimed_at=time_mod.time() - 100, jitter=1200.0
+        )
 
         # Run one reaper sweep
         await svc._reaper_loop_once() if hasattr(svc, "_reaper_loop_once") else None
         # Since there's no _reaper_loop_once, test the threshold logic directly
         now = time_mod.time()
-        elapsed = now - svc._job_start_times["j1"]
-        jitter_allowance = svc._job_jitter.get("j1", 0.0)
+        elapsed = now - claim.claimed_at
+        jitter_allowance = claim.jitter or 0.0
         assert elapsed <= _JOB_TIMEOUT_SECS + jitter_allowance
 
     @pytest.mark.asyncio
@@ -251,17 +254,20 @@ class TestReaperJitterAllowance:
         """Job running longer than timeout+jitter should be reaped."""
         import time as time_mod
 
-        from kiro_crew.cron import _JOB_TIMEOUT_SECS
+        from kiro_crew.cron import _JOB_TIMEOUT_SECS, _RunClaim
 
         svc = CronService()
         svc._sessions = None
         # Job started (timeout + jitter + 100)s ago — exceeds threshold
         jitter = 1200.0
-        svc._job_start_times["j2"] = time_mod.time() - (_JOB_TIMEOUT_SECS + jitter + 100)
-        svc._job_jitter["j2"] = jitter
+        claim = svc._claims["j2"] = _RunClaim(
+            trigger="scheduled",
+            claimed_at=time_mod.time() - (_JOB_TIMEOUT_SECS + jitter + 100),
+            jitter=jitter,
+        )
 
         now = time_mod.time()
-        elapsed = now - svc._job_start_times["j2"]
-        jitter_allowance = svc._job_jitter.get("j2", 0.0)
+        elapsed = now - claim.claimed_at
+        jitter_allowance = claim.jitter or 0.0
         # This job EXCEEDS the threshold — reaper would kill it
         assert elapsed > _JOB_TIMEOUT_SECS + jitter_allowance

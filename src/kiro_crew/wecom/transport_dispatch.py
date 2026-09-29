@@ -30,17 +30,26 @@ import logging
 import time
 from typing import TYPE_CHECKING, Any
 
+from kiro_crew.config import live
+from kiro_crew.config.sections import _normalize_threshold_pair
 from kiro_crew.history import mint_row_mid
 from kiro_crew.messaging.attachments import append_attachment_context
 from kiro_crew.messaging.attachments import cleanup as cleanup_attachments
-from kiro_crew.messaging.commands import compact_unsupported_backend
+from kiro_crew.messaging.commands import (
+    compact_unsupported_backend,
+    compact_unsupported_reply_zh,
+    note_user_stop,
+)
+from kiro_crew.messaging.conversation import reserve_new_generation
 from kiro_crew.messaging.dispatch import (
     ChannelTurn,
+    admit_inbound_callback,
     build_directive_consumer,
     drive_turn,
     inbound_permitted,
 )
 from kiro_crew.messaging.driver import APPROVAL_INTERACTIVE
+from kiro_crew.messaging.inbound_spool import InboundRoute
 from kiro_crew.messaging.link import (
     DM_SCOPE_UNIFIED,
     UNBIND_REASON_ORIGIN_REBIND,
@@ -71,8 +80,10 @@ if TYPE_CHECKING:
     from kiro_crew.history import ConversationLog
     from kiro_crew.session import SessionManager
     from kiro_crew.wecom.client import WeComClient, WeComInbound
+    from kiro_crew.wecom.transport import WeComTransport
 
 logger = logging.getLogger(__name__)
+
 
 # Canonical kiro-cli agent fallback so WeCom sessions load kirocrew-core
 # (spawn_run etc.) instead of kiro-cli's bare built-in default when neither an
@@ -109,7 +120,44 @@ class WeComDispatcher:
         self.conv_log = conv_log
         self.approval_mode = approval_mode
         self.client: "WeComClient | None" = None
+        # Set by maybe_start_wecom after construction (same construction-cycle
+        # reason as ``client``); the config applier pushes reloaded
+        # authorization fields at it.
+        self.transport: "WeComTransport | None" = None
         self._conv = ConversationState(seed_fn=self._seed_gen)
+        # Held on self: the watcher holds the owner WEAKLY, so a subscription
+        # dropped here would be collected and the applier would silently stop
+        # firing.
+        self._config_sub = live.watch_section(
+            self, "wecom", "messaging", target="transport", name="WeComDispatcher"
+        )
+
+    # ── Live config ────────────────────────────────────────────────────────
+
+    def _live_cfg(self) -> "KiroCrewConfig":
+        """The config in force NOW, for a per-turn read.
+
+        The watcher's snapshot when it is armed, else a fingerprint-cached
+        ``load()`` (two stats on a hit), else the boot copy. Falling back to
+        ``self.cfg`` rather than raising keeps a turn running when the config
+        file is momentarily unreadable -- a threshold or a rotation window is
+        not an authorization decision, and the boot value is the one the
+        operator last had in force.
+        """
+        return live.current(self.cfg, log_prefix="wecom")
+
+    def _thresholds(self) -> tuple[int, int]:
+        """``(soft, hard)`` context thresholds from the live config.
+
+        Re-runs the loader's own pair normalization, because reading the two
+        fields live without it can leave ``soft > hard`` and make the soft nudge
+        unreachable -- ``_maybe_notice`` tests ``pct >= hard`` first.
+        """
+        section = self._live_cfg().wecom
+        return _normalize_threshold_pair(
+            int(getattr(section, "soft_threshold_pct", 80)),
+            int(getattr(section, "hard_threshold_pct", 95)),
+        )
 
     # ── Turn dispatch (transport's dispatch callback) ──────────────────────
 
@@ -123,6 +171,21 @@ class WeComDispatcher:
             return
         userid = inbound.userid
         text = inbound.text
+        original_text = text
+        original_attachments = len(inbound.attachments)
+        inbound_route = InboundRoute(
+            conversation_id=userid,
+            text=original_text,
+            user_id=userid,
+            message_id=inbound.msgid or inbound.req_id,
+            attachments_dropped=original_attachments,
+        )
+        if not await admit_inbound_callback(
+            self.sessions,
+            channel_type="wecom",
+            route=inbound_route,
+        ):
+            return
         logger.info("WeCom inbound from %s: %d chars", userid, len(text or ""))
 
         # ── Command intercept (no LLM session needed) ──
@@ -139,7 +202,15 @@ class WeComDispatcher:
         cmd = None if has_media else parse_command(text)
         if cmd == "new":
             self._conv.bump_gen(userid)
-            await self.client.say(inbound, "✅ 已开始新对话")
+            saved = await reserve_new_generation(
+                self.sessions,
+                self._session_key(userid),
+                channel_type="WeCom",
+            )
+            message = "✅ 已开始新对话"
+            if not saved:
+                message += "\n⚠️ 新对话无法保存，重启后可能恢复到上一段对话。"
+            await self.client.say(inbound, message)
             return
         if cmd == "compact":
             self._conv.clear_awaiting(userid)
@@ -198,11 +269,12 @@ class WeComDispatcher:
             return
         text = prompt_text
 
+        messaging = self._live_cfg().messaging
         self._conv.maybe_rotate(
             userid,
             time.time(),
-            idle_minutes=self.cfg.messaging.idle_reset_minutes,
-            daily_reset_hour=self.cfg.messaging.daily_reset_hour,
+            idle_minutes=messaging.idle_reset_minutes,
+            daily_reset_hour=messaging.daily_reset_hour,
         )
         session_key = self._session_key(userid)
         conversation_id = f"wecom:{userid}"
@@ -250,6 +322,7 @@ class WeComDispatcher:
                 ChannelTurn(
                     channel_type="wecom",
                     session_key=session_key,
+                    inbound_route=inbound_route,
                     # Session-directive consumer: monitor_start / autonudge_stop /
                     # ... return a marker TurnDriver decodes; apply it against THIS
                     # turn's session key (dashboard-only directives stay refused
@@ -274,6 +347,7 @@ class WeComDispatcher:
                     notice=lambda sk, provider: self._maybe_notice(inbound, sk, provider),
                     audit_caller=f"wecom:{userid}",
                     after_persist=_surface_new_session,
+                    user_display_name=self._display_name(userid),
                 ),
                 sessions=self.sessions,
                 ctx_builder=self.ctx_builder,
@@ -348,6 +422,26 @@ class WeComDispatcher:
     def _resolve_agent(self) -> str:
         return self.agent or self.cfg.agent.default_agent or _DEFAULT_KIROCREW_AGENT
 
+    def _display_name(self, userid: str) -> str:
+        """Sender's name from ``wecom.allowed_users``, else the raw userid.
+
+        WeCom's inbound frame carries only an opaque userid, so resolve the
+        operator-set name for ``[CURRENT USER]``, mirroring Slack's name fallback.
+        """
+        for u in getattr(self.cfg.wecom, "allowed_users", []):
+            if u.get("userid") == userid:
+                # Return the operator-set name ONLY when it is a non-empty
+                # string. A truthy non-string (e.g. YAML ``name: 123`` coerced
+                # to int) would otherwise flow into ``[CURRENT USER]`` marker
+                # scrubbing, which assumes ``str`` and raises — crashing every
+                # turn for that user. The loader type-checks ``userid`` but not
+                # ``name``, so guard it here.
+                name = u.get("name")
+                if isinstance(name, str) and name:
+                    return name
+                return userid
+        return userid
+
     def _session_key(self, userid: str) -> str:
         gen = self._conv.current_gen(userid)
         return build_dm_session_key(
@@ -355,7 +449,7 @@ class WeComDispatcher:
             self._resolve_agent(),
             userid,
             gen=gen,
-            dm_scope=self.cfg.messaging.dm_scope,
+            dm_scope=str(self.cfg.messaging.dm_scope),
         )
 
     def _seed_gen(self, userid: str) -> int:
@@ -364,7 +458,7 @@ class WeComDispatcher:
             channel="wecom",
             agent=self._resolve_agent(),
             user_id=userid,
-            dm_scope=self.cfg.messaging.dm_scope,
+            dm_scope=str(self.cfg.messaging.dm_scope),
         )
 
     def _persist_turn(
@@ -422,15 +516,16 @@ class WeComDispatcher:
         """
         userid = inbound.userid
         pct = self.sessions.check_context_usage(session_key, provider)
-        if pct >= self.cfg.wecom.soft_threshold_pct:
-            # Capability gate (#8156): no forced compaction to run and the
+        soft, hard = self._thresholds()
+        if pct >= soft:
+            # Capability gate: no forced compaction to run and the
             # soft nudge's /compact advice cannot work — the backend compacts
             # on its own as context fills.
             unsupported = compact_unsupported_backend(provider)
             if unsupported:
                 logger.debug("WeCom: context notice skipped — %s compacts itself", unsupported)
                 return
-        if pct >= self.cfg.wecom.hard_threshold_pct:
+        if pct >= hard:
             self._conv.clear_awaiting(userid)
             try:
                 await provider.compact()
@@ -438,7 +533,7 @@ class WeComDispatcher:
                 await self._notice_bubble(inbound, "🗜️ 上下文接近上限，已自动压缩。")
             except Exception:
                 logger.debug("WeCom hard-threshold compaction failed", exc_info=True)
-        elif pct >= self.cfg.wecom.soft_threshold_pct and not self._conv.is_awaiting(userid):
+        elif pct >= soft and not self._conv.is_awaiting(userid):
             self._conv.set_awaiting(userid)
             await self._notice_bubble(
                 inbound,
@@ -608,6 +703,10 @@ class WeComDispatcher:
         """
         assert self.client is not None
         session_key = self._session_key(inbound.userid)
+        # Recorded before the busy check, so a Stop landing while the session is
+        # between an abandoned attempt and its replay still counts (see
+        # ``note_user_stop``).
+        note_user_stop(self.sessions, session_key)
         if not self.sessions.is_busy(session_key):
             await self.client.say(inbound, "ℹ️ 当前没有正在生成的回复。")
             return
@@ -643,7 +742,7 @@ class WeComDispatcher:
             if provider is None:
                 await self.client.say(inbound, "ℹ️ 当前没有可压缩的对话。")
                 return
-            # Capability gate (#8156, mirroring the dashboard's #7800 gate): a
+            # Capability gate, mirroring the dashboard's compact gate: a
             # backend that cannot serve a manual /compact treats the prompt as
             # ordinary text and never answers, so dispatching would strand the
             # unbounded wait below. Informational (this surface speaks Chinese;
@@ -652,7 +751,10 @@ class WeComDispatcher:
             unsupported = compact_unsupported_backend(provider)
             if unsupported:
                 logger.debug("WeCom: manual /compact declined — %s compacts itself", unsupported)
-                await self.client.say(inbound, "ℹ️ 当前后端会自动压缩上下文，无需手动 /compact。")
+                await self.client.say(
+                    inbound,
+                    compact_unsupported_reply_zh(unsupported),
+                )
                 return
             await provider.compact()
             await provider.wait_for_compaction()

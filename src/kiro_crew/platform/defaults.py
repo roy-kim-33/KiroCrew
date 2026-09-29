@@ -11,15 +11,18 @@ The Amazon companion subclasses or replaces these in its composition root.
 
 from __future__ import annotations
 
+import dataclasses
 import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
 if TYPE_CHECKING:
+    from kiro_crew.publish_provider import PublishProvider
     from kiro_crew.platform.interfaces import (
         ImportSource,
         InboundToken,
         McpScope,
+        MemoryRoots,
         SessionPrincipal,
         WorkloadIdentity,
     )
@@ -29,10 +32,12 @@ if TYPE_CHECKING:
 
 from kiro_crew import security, sso_status
 from kiro_crew.platform.interfaces import (
+    BUILTIN_PROVISIONER_ID,
     CapabilityResult,
     InterceptDecision,
     MobileConnectMethod,
     OtlpDestination,
+    RemoteProvisioner,
 )
 
 # ``agent``, ``sandbox``, ``embeddings``, ``apps.registry`` and ``slack.enterprise``
@@ -68,15 +73,60 @@ class DefaultProviderRegistry:
 
 
 class DefaultPublishRegistry:
-    """Registers no publish provider — the public edition has no artifact-publish
-    destination.  The ``publish_provider`` registry stays empty, so
-    ``get_provider`` raises ``PublishUnavailableError`` (→ 503) and
-    ``list_providers`` returns ``[]`` (dashboard shows "publishing unavailable")
-    with no core branching.  A companion registers its concrete providers here
-    via the ``publish_provider.register_provider`` side effect — the structural
-    twin of ``DefaultProviderRegistry.register_acp_backends``."""
+    """Registers the personal cloud drive as an OPT-IN publish destination.
+
+    The seam itself stays destination-agnostic: this registry is the ONLY place the
+    public edition names a concrete provider, and ``publish_sync`` reaches it through
+    the neutral ``publish_provider`` registry, so a companion edition that registers a
+    different destination never loads this code.  The structural twin of
+    ``DefaultProviderRegistry.register_acp_backends``.
+
+    The drive registers under its OWN key, not ``DEFAULT_PROVIDER``, so it is available
+    and selectable without being the edition's default: ``publish_sync`` resolves an
+    unnamed destination through the default key, which stays unregistered here, so a
+    publish that names nothing still gets a 503.  What holds the default back is a
+    cross-store contract for whether a publication exists, which is being built
+    separately -- see ``personal_drive.PERSONAL_DRIVE_PROVIDER``.  Whether a publish is
+    PERMITTED remains the orthogonal decision of the governance ceiling
+    (``capabilities.publish``) and the operator's ``publish.allowed_destinations``
+    narrowing knob; this seam only decides who implements the transfer.
+    """
+
+    #: The key the drive registers under, spelled here so bootstrap does not have to
+    #: import the provider module to learn it. It is deliberately duplicated rather than
+    #: imported, and `test_boot_does_not_import_the_publish_stack` pins that this literal
+    #: still equals `personal_drive.PERSONAL_DRIVE_PROVIDER`, so the copy cannot drift.
+    _PERSONAL_DRIVE_KEY = "personal-drive"
 
     def register_publish_providers(self) -> None:
+        """Register the drive's FACTORY without importing the provider module.
+
+        `no-new-work-on-gateway-boot-path`: this runs inside platform bootstrap, before
+        the socket is bound, so anything imported here is added to every gateway's
+        time-to-ready. Importing the provider eagerly costs ~0.5s of cumulative import
+        (it reaches the deploy engine's profile registry, the artifact store and the
+        validation stack), for a destination most installs never select -- the drive is
+        opt-in, so a publish that does not name it never touches this code at all.
+
+        The registry is already factory-based and instantiates lazily, so only the IMPORT
+        needed moving: it now happens on first selection, inside the closure. The import
+        also has to stay deferred for the original reason, which is unchanged -- the
+        provider reaches config-resolving code that installs this very platform context.
+        """
+        from kiro_crew.publish_provider import register_provider
+
+        def _build() -> PublishProvider:
+            from kiro_crew.publish import personal_drive
+
+            return personal_drive.PersonalDriveProvider()
+
+        register_provider(self._PERSONAL_DRIVE_KEY, _build)
+
+
+class DefaultGatewayLifecycleProvider:
+    """Keep the core's interpreter and managed-venv restart resolution."""
+
+    def restart_launcher(self) -> str | None:
         return None
 
 
@@ -354,7 +404,7 @@ class DefaultCapabilityManager:
     async def uninstall_mcp(self, server_id: str) -> "CapabilityResult":
         return CapabilityResult(ok=False, message="capability manager not available")
 
-    async def registry(self) -> List[Dict[str, Any]]:
+    async def registry(self, query: Optional[str] = None) -> List[Dict[str, Any]]:
         return []
 
     async def list_skills(self) -> List[Dict[str, Any]]:
@@ -443,7 +493,9 @@ class DefaultAppsLoader:
     def default_registries(self) -> List[Dict[str, Any]]:
         # The public edition pins no external registry: the only registries are
         # the ones the operator typed into config.registries. A companion returns
-        # its organisation's official registry.
+        # its organisation's official registry, optionally with the display-only
+        # `label` (a human name shown instead of the `name` id) and `review`
+        # (`""` / `"curated"` / `"community"`, which badge the dashboard shows).
         return []
 
 
@@ -529,6 +581,25 @@ class DefaultTelemetryProvider:
         )
 
 
+class DefaultMemoryFilesProvider:
+    """Local-disk memory files — today's behaviour, unchanged.
+
+    Every store gets a :class:`~kiro_crew.memory_files.LocalMemoryFiles`, which is
+    the gate/reader/writer code lifted out of ``MemoryStore`` without alteration,
+    so the public edition reads and writes memory with the same syscalls in the
+    same order as before this seam existed.
+
+    The import is deferred: ``memory_files`` pulls in ``hooks``, ``pinned_fs`` and
+    ``memory_startup``, and this module is imported at boot by every edition
+    including ones that never touch memory.
+    """
+
+    def files_for(self, roots: "MemoryRoots") -> Any:
+        from kiro_crew.memory_files import LocalMemoryFiles
+
+        return LocalMemoryFiles(roots)
+
+
 class DefaultKnowledgeProvider:
     """No extra connectors — the public edition ships only the built-in set."""
 
@@ -551,6 +622,12 @@ class DefaultDashboardContributor:
     def sso_login_handler(self) -> Optional[Callable[..., Any]]:
         # None → the dashboard keeps its built-in /api/sso-login stub handler.
         return None
+
+    def mixed_internal_api_paths(self) -> "frozenset[str]":
+        # The public edition mounts no routes, so it has none to make reachable
+        # by an internal loopback caller. Empty keeps the middleware's admitted
+        # set byte-identical to the core's own.
+        return frozenset()
 
     def on_user_message(self, app: Any, message: str) -> None:
         # The public edition observes no chat messages. A companion uses this to
@@ -602,3 +679,180 @@ class DefaultMobileConnectProvider:
             MobileConnectMethod(id="tailnet_qr", kind="tailnet_qr"),
             MobileConnectMethod(id="login_link", kind="login_link"),
         ]
+
+
+#: The descriptor the public build ships. Module-level so the handler's
+#: degraded-seam fallback and the Default adapter cannot drift apart.
+BUILTIN_REMOTE_PROVISIONER = RemoteProvisioner(
+    id=BUILTIN_PROVISIONER_ID,
+    kind=BUILTIN_PROVISIONER_ID,
+    label="AWS EC2 in your own account",
+    posix_only=True,
+)
+
+#: The id a launch request names as ``provider_id`` for the Fargate lane.
+FARGATE_PROVISIONER_ID = "aws_fargate"
+
+#: The Fargate descriptor. ``kind`` equals the id, so the dashboard looks for a
+#: renderer registered under that kind and skips the row when none is, rather than
+#: handing the EC2 form a lane that takes no instance type.
+FARGATE_REMOTE_PROVISIONER = RemoteProvisioner(
+    id=FARGATE_PROVISIONER_ID,
+    kind=FARGATE_PROVISIONER_ID,
+    label="AWS Fargate in your own account",
+    posix_only=True,
+)
+
+
+class DefaultRemoteProvisionerProvider:
+    """The provisioners the core ships: EC2 always, Fargate when it is configured.
+
+    ``provisioners()`` always returns the ``aws_ec2`` descriptor and ``engine_for``
+    hands out ``RealLaunchEngine`` for it, so the stock Set-up tab and its launch
+    path are unchanged. A companion still replaces this whole object via
+    ``dataclasses.replace(ctx, remote_provisioners=...)`` to add a lane of its own
+    (or withdraw the AWS one on a fleet whose users have no AWS account).
+
+    **The Fargate lane is offered only when ``cloud.json`` configures it, and that
+    is deliberate.** ``FargateLaunchEngine`` refuses to guess a placement, an image
+    or a secret ARN -- an unnamed subnet is the same class of error as deleting a
+    task on a guess -- so a lane offered without those fields is a lane that
+    rejects every launch made through it, spending an operator's attention at
+    launch time on a mistake that was visible when they saved the file.
+    ``FargateConfig`` is the judge: complete means the lane exists, anything else
+    means it does not.
+
+    Registering it does NOT put a row in the Set-up selector on its own.
+    ``RemoteProvisioner.kind`` names a frontend form and the dashboard skips a kind
+    it cannot draw; no ``registerRemoteProvisionerRenderer`` claims this kind today,
+    so the lane is reachable through the API and absent from the selector until one
+    does -- absent rather than broken, which is what that skip exists for.
+
+    Every cloud import here is DEFERRED, and not only for weight.
+    ``kiro_crew.cloud`` reaches ``kiro_crew.sandbox``, which imports
+    ``kiro_crew.platform.current_context``, so a module-level import raises
+    ``ImportError: cannot import name 'current_context' from partially initialized
+    module`` -- this module is loaded during ``platform`` init. Measured after
+    bootstrap, ``kiro_crew.cloud.config`` alone is 105 ms and 122 modules against a
+    126 ms init, so deferring is also what keeps a lane most deployments have not
+    configured from doubling startup.
+    """
+
+    def provisioners(self) -> List[RemoteProvisioner]:
+        rows = [BUILTIN_REMOTE_PROVISIONER]
+        config = self._fargate_config()
+        if config is not None:
+            # The row carries the resolved credential recipient, so the operator READS it
+            # where they choose the lane instead of discovering it in a refusal. This is the
+            # display half of the confirmation: without it "confirm the recipient" is a
+            # copy-paste of a string the operator never had a chance to judge.
+            rows.append(
+                dataclasses.replace(
+                    FARGATE_REMOTE_PROVISIONER,
+                    confirm_before_launch=config.credential_recipient(),
+                )
+            )
+        return rows
+
+    def engine_for(self, provisioner_id: str, *, confirmed_recipient: str = "") -> Any:
+        if provisioner_id == BUILTIN_PROVISIONER_ID:
+            # circular import: ``cloud.launch_engine`` reaches this module through its own
+            # graph, so a module-scope import here closes the loop. Deferring also keeps
+            # platform init off the cloud module graph entirely.
+            from kiro_crew.cloud.launch_engine import RealLaunchEngine
+
+            # No credential recipient to confirm: this lane creates an instance from a
+            # CloudFormation template shipped with the product, and nothing in
+            # ``cloud.json`` chooses what receives a credential. A value passed for it
+            # is ignored rather than refused, so a caller may confirm uniformly.
+            return RealLaunchEngine()
+        if provisioner_id != FARGATE_PROVISIONER_ID:
+            raise KeyError(provisioner_id)
+        config = self._fargate_config()
+        if config is None:
+            # The same KeyError an unknown id raises. A caller naming an
+            # unconfigured lane and one naming a nonexistent lane are in the same
+            # position -- there is no engine -- and a second failure mode would ask
+            # every caller to learn a distinction that changes nothing they can do.
+            raise KeyError(provisioner_id)
+        # circular import: each of these reaches ``kiro_crew.platform.defaults`` through its
+        # own module graph, so a module-scope import here closes the loop -- importing any one
+        # of them alone already pulls this module in. Deferring is also what keeps platform
+        # init light, per the class note above.
+        from kiro_crew.cloud.fargate.identity import SecretRef
+        from kiro_crew.cloud.fargate.runtask import Placement
+        from kiro_crew.cloud.fargate_engine import FargateLaunchEngine, FargateLaunchSpec
+        from kiro_crew.sandbox import require_unaliased_cloud_config
+
+        # The strict no-alias refusal lives HERE, at the point the saved block becomes a
+        # launch, and not on the universal spawn path. An alias on this file lets a write
+        # reach the inode by a name no seal covers, and the field it would reach chooses the
+        # container the model credential is delivered to -- so the launch is refused. On the
+        # spawn path the same refusal refused every sandboxed spawn on a host whose files
+        # legitimately carry a second name (stow, chezmoi, `rsync --link-dest`), which is the
+        # whole box for one lane's exposure.
+        require_unaliased_cloud_config()
+
+        return FargateLaunchEngine(
+            FargateLaunchSpec(
+                placement=Placement(
+                    cluster=config.cluster,
+                    subnets=tuple(config.subnets),
+                    security_groups=tuple(config.security_groups),
+                    assign_public_ip=config.assign_public_ip,
+                ),
+                image=config.image,
+                secrets=tuple(SecretRef(name=name, arn=arn) for name, arn in config.secrets),
+                cpu_architecture=config.cpu_architecture,
+                # Carried through UNCHECKED and UNRESOLVED. This is the operator's
+                # confirmation, so it must reach the engine as they gave it: comparing it
+                # here, against the same read of ``cloud.json`` that built the spec, would
+                # be the file confirming itself. ``provision`` resolves the recipient from
+                # the spec and compares, and it refuses an empty value.
+                confirmed_recipient=confirmed_recipient,
+                # The operator's own trust-boundary claim, read from the block they
+                # wrote. It is the only field here that loosens a posture, and it is
+                # read rather than asked for at launch because the statement it makes --
+                # these are the operator's own crews, and they bear the risk of what
+                # those crews read -- is a property of the lane, not of one launch.
+                # Absent means not claimed, so a lane that says nothing keeps the
+                # container's sandboxed-only refusal.
+                internal_only=config.internal_only,
+            ),
+            # What bounds the task's cost. Passed rather than left to default, which is
+            # the whole point: the engine defaults to six hours, and until this argument
+            # existed that default was reachable only by editing Python -- so a task the
+            # RFC itself says may run for hours was stopped by its owner's next launch
+            # with no operator-reachable way to ask for longer.
+            #
+            # ``config`` is complete here (``_fargate_config`` yields only complete
+            # blocks), and ``is_complete`` already called this same method, so the numbers
+            # are ones ``TaskBounds`` accepts and this cannot raise. A block that omits
+            # the key produces exactly the engine's own defaults, so the lane's
+            # behaviour is unchanged for every operator who does not set it. The
+            # population cap has no key at all and always stays the engine's.
+            bounds=config.task_bounds(),
+        )
+
+    @staticmethod
+    def _fargate_config() -> Any:
+        """The configured Fargate block, or ``None``. A read failure is ``None``.
+
+        Read PER CALL, so an operator who edits ``cloud.json`` gets the new answer
+        from the next request rather than the next gateway restart, and a lane
+        removed from the file leaves the selector for the same reason.
+
+        A failure returns ``None`` rather than raising because this runs while the
+        selector is being built: raising would take the whole provisioner list down
+        over one malformed block and hide the ``aws_ec2`` lane too, turning one
+        lane's misconfiguration into a Set-up tab that shows nothing.
+        """
+        try:
+            # circular import: ``cloud.config`` reaches this module through its own graph, so a
+            # module-scope import here closes the loop; the class note above carries the
+            # measured startup cost that makes deferring worth it on its own.
+            from kiro_crew.cloud.config import CloudConfig
+
+            return CloudConfig.load().fargate_config()
+        except Exception:  # noqa: BLE001 - a config read must not break the selector
+            return None

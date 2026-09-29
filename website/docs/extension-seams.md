@@ -9,12 +9,16 @@ The backend has the sibling mechanism, Composed Platform Providers: see
 [`docs/system-specs/modules/platform-context.md`](../../docs/system-specs/modules/platform-context.md).
 The two are independent. Nothing here reads `CONTRACT_VERSION`.
 
-## The fourteen registry seams
+## The fifteen registry seams
 
 Each entry is one registrar the edition may call, paired with the reader the core
-already calls. `src/extensions.ts` names exactly these fourteen in its header.
+already calls. `src/extensions.ts` names exactly these fifteen in its header.
 `src/test/extensionSeams.test.tsx` exercises each one except the source-provider
 seam, which has its own suite in `src/test/sourceProviderSeam.test.ts`.
+
+File/tree/folder menu rows are **not** a composition-root seam: an installed app
+declares them in its manifest under `contributes.fileMenuItems[]` and core
+POSTs the file context to the app's endpoint — see the App Kit publishing guide.
 
 | Seam | Module | Registrar to reader |
 |------|--------|---------------------|
@@ -31,17 +35,18 @@ seam, which has its own suite in `src/test/sourceProviderSeam.test.ts`.
 | Non-app route prefixes | `components/MigrationCheck.tsx` | `registerNonAppPrefix()`, read by `MigrationCheck` |
 | Source providers (Changes panel + sidebar chips) | `utils/pullRequestLinks.ts` | `registerSourceProvider()` to `sourceProviderDescriptor()` |
 | Phone-connection method renderers | `components/mobileConnectRenderers.tsx` | `registerMobileConnectRenderer()` to `getMobileConnectRenderers()` / `canRenderMobileConnectKind()` |
+| Remote-instance provisioner forms | `components/remoteProvisionerRenderers.tsx` | `registerRemoteProvisionerRenderer()` to `getRemoteProvisionerRenderer()` / `canRenderRemoteProvisionerKind()` |
 | Bare-token autolink rules | `utils/autolinkRules.ts` | `registerAutolinkRules()` to `getAutolinkRules()` |
 
-Plus one **exported-transport** seam for edition-owned API methods. It is not a
-registry; see "API methods" below.
+Plus one **exported-transport** seam for edition-owned API methods and one
+**data-module** seam for syntax-highlighting languages. Neither is a registry; see
+"API methods" and "Highlighting languages" below.
 
 Other `register*()` functions in `src/` (built-in surfaces, command-palette
-providers, tool pills, terminal sockets, highlight.js languages) are core-internal
-wiring, not edition seams. Only the fourteen above are called from the composition
-root.
+providers, tool pills, terminal sockets) are core-internal wiring, not edition
+seams. Only the fifteen above are called from the composition root.
 
-Thirteen of the fourteen are **additive** — the edition contributes a surface. The
+Fourteen of the fifteen are **additive** — the edition contributes a surface. The
 remaining one is **subtractive**: `suppressOverviewBuiltin()` removes a built-in
 Overview surface for a distribution whose environment makes it permanently
 inapplicable, which no additive seam can express. It is named `suppress*` rather
@@ -64,7 +69,7 @@ the stock build's no-op property. Core registrations belong in the seed maps
 - the **edition's own** `$KIROCREW_EDITION_DIR/extensions.tsx` (or `.ts`) when that
   env var points at an edition repo, so the edition injects its `register*()`
   calls and component imports by build config, compiled through the same
-  vite/rollup pass, without shadowing or overlaying any core file. That
+  Vite/Rolldown pass, without shadowing or overlaying any core file. That
   copy-and-shadow erosion is what the seams exist to eliminate.
 
 Resolution is eager, so a misconfigured `KIROCREW_EDITION_DIR` (set but with no
@@ -84,8 +89,9 @@ one-way door. With the opt-in as the gate, every pipeline (release, publish, and
 the backend `setup.py` to `build-frontend.sh` path) is protected **by default**: a
 stray or inherited `KIROCREW_EDITION_DIR` fails the build instead of silently
 compiling edition sources into a public artifact. Only the edition's own build
-script sets the opt-in. Forgetting it fails safe (stock), and there is no guard
-variable a release job must remember to set. Never set
+script sets the opt-in. Forgetting it fails safe before any artifact is emitted;
+the build never falls back to stock. There is no guard variable a release job must
+remember to set. Never set
 `KIROCREW_ALLOW_EDITION=1` in a release or publish job.
 
 An edition-mode build also prints a loud self-identifying warning naming the
@@ -224,11 +230,11 @@ must stay deduplicated or hooks bind to a second React.
 
 ### Typecheck the edition, or ship ReferenceErrors
 
-The core's `tsc -b` covers `website/src` only (`tsconfig.app.json` has
+The core's `tsc -p tsconfig.app.json` covers `website/src` only (`tsconfig.app.json` has
 `"include": ["src"]`), so the edition's sources are outside every typecheck the
 core runs. The bundler does not fill the gap: TypeScript is erased, and a free
 identifier — a typo like `registerThemee` — compiles into the bundle as an
-assumed **global**. The build succeeds, `tsc -b` stays green, and the app
+assumed **global**. The build succeeds, the type check stays green, and the app
 throws `ReferenceError` at module load. Because the composition root runs
 before `App` mounts, that is a blank page, not a broken widget.
 
@@ -243,7 +249,13 @@ will never run it for you:
     "noEmit": true,
     // Without vite/client, every `import.meta.env` the edition touches
     // (directly or via a core module it imports) is a TS2339 false positive.
-    "types": ["vite/client"]
+    "types": ["vite/client"],
+    // The core's tsconfig sets an incremental cache, and an inherited
+    // `tsBuildInfoFile` resolves against the file that DECLARED it -- so
+    // without this override the edition writes its cache into
+    // `../KiroCrew/website/tsconfig.app.tsbuildinfo`, the core's own file,
+    // and the two programs invalidate each other on every run.
+    "tsBuildInfoFile": "./tsconfig.tsbuildinfo"
   },
   "include": ["."]
 }
@@ -278,6 +290,31 @@ already-registered one) is resolved core-wins, and `reportSeamCollision`:
 - **degrades safe in production** (warn and ignore), so a shipped app never
   white-screens over a duplicate.
 
+Degrading safe is not the same as degrading **silently**, and closing that gap is
+not this module's job. An edition compiles its own bundle, so the dev/test throw
+never runs over its registrations: the first anyone hears of a refused one is a
+`console.warn` in a shipped app, which is how one edition shipped ten builtin
+pages that all clicked straight through to chat with no signal a user could see.
+The refusal is still not thrown at registration — that runs before `App` mounts,
+so a throw takes the whole dashboard down over one bad entry, which is worse than
+the entry being missing.
+
+**Remembering a refusal belongs to the seam that has somewhere to show it.**
+Today that is the builtin-page seam alone, because a refused route is a URL the
+user can still navigate to and find nothing at, so `builtinRegistry.ts` keeps its
+own `Map` of reasons and `builtinRefusalReason(route)` as the reader; nothing
+about it is in `seamCollision.ts`, which stays the shared fail-loud/degrade-safe
+policy and nothing more. Every other rejection leaves the core's own surface
+rendered rather than a blank the user can address — a rejected theme is absent
+from the picker, a rejected autolink rule leaves a token unlinked, a rejected
+renderer's row is filtered out before it can open an empty dialog — so a store
+there would be a generalisation with one consumer. A **duplicate** is not
+recorded either, at any seam: the key still resolves to the winning registration,
+so there is no empty space to explain and a record would only describe a
+registration that lost a race. A seam that later grows a user-reachable hole can
+keep its own record next to the miss path that reads it, which is where this one
+lives.
+
 The subtractive seam is deliberately **exempt**. `suppressOverviewBuiltin()` is a
 set, and a repeat is not a conflict: two owners cannot share one render slot, but
 two parties that both want a surface gone agree. So re-entrant registration (HMR,
@@ -291,10 +328,66 @@ an error.
 top-level path segment, `/^\/[A-Za-z0-9][A-Za-z0-9._~-]*$/`. `BuiltinAppRoute`
 resolves the catch-all `/:builtinApp` from one path parameter and matches only
 `location.pathname`, never the query or hash. So a multi-segment (`/reports/daily`),
-query (`/reports?daily`), hash (`/reports#x`), whitespace, or `.`/`..` route would
-register but never resolve, and navigation would redirect to chat. The mandatory
-alphanumeric first character is what excludes `.` and `..`. A non-conforming route
-routes through `reportSeamCollision`.
+query (`/reports?daily`), hash (`/reports#x`), dot-segment (`/../reports`),
+whitespace, or `.`/`..` route could
+never resolve as written. The mandatory alphanumeric first character is what
+excludes `.` and `..`. A non-conforming route routes through
+`reportSeamCollision`, as does an entry whose `appId` is missing or outside
+`[a-z0-9-]`.
+
+Both refusals are **recorded**, under the leading segment the router would have
+asked for rather than the string the entry was registered with — `/reports` for all
+four spellings above. That difference is the whole point: nothing can ask for
+`/reports/daily`, so a reason filed under it would be unreadable and the route
+would still vanish into chat. The record is written BEFORE `reportSeamCollision`,
+whose dev/test branch throws, so a dev/test run leaves the same record a
+production run leaves; and the first refusal for a key wins, since a second report
+describes a retry rather than the reason the key is empty. A route with no leading
+`/` is the one case that gets no synthesised key: no URL produces that spelling, so
+there is no empty page to explain, and inventing one would let a refusal for
+`reports` answer for the different key `/reports`.
+
+`BuiltinAppRoute` splits its miss path on that record. A path nobody registered is
+a typo or a stale link and still redirects to chat; a path whose registration was
+REFUSED renders instead, through the route's own `ErrorBoundary` so the failure is
+journaled to `recordError` and the RUM `react_error` event. What it renders is an
+explicit `fallback`, not the boundary's default card, for three reasons specific to
+a refusal: the default card's **"Try Again" cannot succeed** (the refusal is
+decided once at startup and immutable for the page load, so clearing the boundary
+re-throws the same reason), it **names no page** (nothing in the sidebar is active
+on a refused route, so the route goes in the heading), and it shows **only the
+registration diagnostic** — charsets and storage keys, addressed to whoever built
+the bundle. So a plain sentence leads, the diagnostic is kept below it under a
+label saying who it is for, and the only action offered is the agent hand-off,
+which carries that diagnostic into a chat that can act on it. What that hand-off
+does is stated in the page rather than in the button's `title`: a tooltip reaches
+neither keyboard nor touch, and on a page with one affordance a reader who cannot
+tell a context-carrying hand-off from a plain new chat is guessing at the only
+thing left to try. Supplying a
+`fallback` changes what RENDERS, never what is journaled: `componentDidCatch` runs
+either way, which is why the refusal is still thrown rather than rendered directly.
+
+Deriving that key is **normalisation plus percent-decoding, not string slicing**.
+The route is first run through `URL`, the normaliser the browser itself applies
+before the router sees anything: that cuts the query and hash on a LITERAL `?`/`#`
+and removes dot segments in every spelling, so `/../reports`, `/./reports` and
+`/%2e%2e/reports` are all asked for as `/reports`. Then the two passes
+react-router performs on what survives, worth mirroring exactly, because `%` is
+outside the route pattern and so every escaped route is refused — the class the
+record exists for. `decodePath` decodes every segment of the pathname under ONE
+try/catch, then `matchPath` turns `%2F` back into `/` on the captured parameter.
+So `/reports%2Ddaily` is asked for as `/reports-daily`, `/reports%2Fdaily`
+as `/reports/daily` — a `/` that stays INSIDE the one parameter, so the key is read
+to its end rather than cut there — and a double-encoded `%252F` resolves all the way
+to `/`. Three consequences a plain `decodeURIComponent` would get wrong: an encoded
+`%3F`/`%23` is still in the pathname and decodes inside the parameter, which is why
+the cut is on a literal one; one malformed escape anywhere leaves the
+WHOLE pathname undecoded, so `/x%2Dy/z%ZZ` keeps its `%2D`; and the decode cannot be
+allowed to throw, which would abandon every entry after the offending one in the
+same batch. Two spellings get no local key at all: a route with no leading `/`
+(above), and an **authority-relative** one — `//host/path`, plus the `/\host/path`
+and tab-smuggled forms the URL parser treats identically — which opens with a `/`
+but addresses another origin, where this build has no empty page to explain.
 
 **Panel shortcuts.** `registerPanelShortcut({ code, path, label })` identifies the
 chord solely by `KeyboardEvent.code`, and the displayed key is derived from that
@@ -498,6 +591,37 @@ through `capabilities.mobile_connect` before the dialog sees a kind, and each mi
 endpoint re-runs that decision (`mint_denied_reason`), so a renderer for a denied or
 unoffered method draws nothing.
 
+**Remote-instance provisioner forms.**
+`registerRemoteProvisionerRenderer({ kind, component })` supplies the launch form
+that Settings → Remote Crew → "Set up a new one" draws for one provisioner
+the backend offers. It keys on `kind`, not `id`, for the same reason as the seam
+above: `id` is what `POST /api/cloud/launch` names in `provider_id` (an id the
+server does not offer is refused with `unknown_provisioner`), while `kind` exists
+to name the renderer — so two rows may share one kind, and a form that needs its
+own row reads the `provisioner` prop it is handed. A blank kind, a duplicate, or
+the **built-in** kind (`aws_ec2`) routes through `reportSeamCollision`: that one
+is drawn by the panel's own prerequisites card and launch form, so registering
+over it would silently redirect a launch into a different AWS account while the
+core still believes it owns the form.
+
+**The server's list decides what exists, not this registry.**
+`GET /api/cloud/provisioners` returns the rows a deployment offers, and the setup
+tab filters them through `canRenderRemoteProvisionerKind()` — so a registered
+kind the gateway does not list draws nothing, and a listed kind nothing can draw
+is never offered. When more than one renderable row survives, the tab shows a
+selector above the form (the choice persists in `mc-cloud-provisioner`); with a
+single row, or while the query is loading, failed, or empty, the tab renders the
+built-in EC2 form exactly as it did before this seam existed. The registered form
+is mounted in its own `ErrorBoundary`, and the launch-progress card and status
+notice stay core-owned below whichever form shows, so a launch already in flight
+survives a throwing renderer.
+
+It **cannot skip a check**: the backend `LaunchEngine` runs its own preflight on
+every launch whatever the form collected, and a `posix_only` provisioner on a
+Windows gateway is refused server-side (400 `posix_host_required`) rather than
+hidden client-side. An edition's own provisioner enforces its own authorization
+in its backend, not here.
+
 **Bare-token autolink rules.**
 `registerAutolinkRules([{ id, pattern, href }])` teaches the markdown renderer that
 a bare token is an address. GFM already autolinks anything carrying a scheme; what
@@ -562,8 +686,8 @@ composition benefit.
 
 So `api/apiTransport.ts` **exports** the blessed `apiTransport`, the same
 `get`/`post`/`put`/`del`/`patch` plus `j`/`jNullable` the core methods use
-(`client.ts` installs them via `installApiTransport` at its module load). An
-edition builds its OWN fully-typed API module on it:
+(`client.ts` defines them and installs them via `installApiTransport` at its
+module load). An edition builds its OWN fully-typed API module on it:
 
 ```ts
 import { apiTransport as t } from '../api/apiTransport'
@@ -589,5 +713,50 @@ Each `apiTransport` method is a stable wrapper that resolves the installed helpe
 at call time, so an edition may import and even destructure it at module init
 without an ordering hazard against `extensions.ts`.
 
+The core's own methods sit on the same helpers. They are defined by domain in
+`api/client/*.ts`, one module per product area (chat, memory, security, …), each
+a `create*Endpoints` factory that `client.ts` hands the transport it owns
+(`ClientTransport`, `api/client/transport.ts`): the five helpers, the three
+parsers, the shared `X-Session-Key` header, and the session-expiry hooks a
+method that reads its own response calls. The third parser
+(`jInstancesDisabled`) is core-only and deliberately absent from `ApiTransport`
+above: it opts one specific benign denial on one core route out of the error
+journal, which is not an edition's decision to make. None of them imports a
+runtime value
+from `client.ts` (the telemetry module takes the Kiro usage types defined there
+as types only), so the transport and its recovery keep one definition.
+`client.ts` spreads their
+segments into the one `api` object, in its original key order, and re-exports
+their wire types. That split is core-internal: the seam is still
+`apiTransport`, and an edition never imports a domain module.
+
 Trust boundary: the transport carries the session key. It is for the edition
 composition root, **never** for app or plugin-contributed frontend code.
+
+## Highlighting languages: a data module, not a registrar
+
+An edition adds a syntax-highlighting language with
+`$KIROCREW_EDITION_DIR/languages.ts`, whose default export is a
+`HighlightLanguageContribution[]` (`utils/highlightLanguages.ts`): an `id`, optional
+fence `aliases` and file `extensions`, and an `hljs` grammar, a `textmate` loader,
+or both. `editionLanguagesPlugin` in `vite.config.ts` resolves
+`virtual:kirocrew-edition-languages` to that file when the edition seam is armed,
+and to an empty list otherwise, for the main bundle and the worker bundles.
+
+It is a data module rather than a `register*()` call because a highlight.js grammar
+is a function: it cannot be posted to the highlight Web Worker, and the worker never
+imports the composition root. Keep the module worker-safe (no React, no DOM), and
+load TextMate grammars with a dynamic `import()` so they stay out of the worker.
+
+The export is untrusted data. `validateHighlightLanguages` copies it into a plain
+array and copies each entry's known fields into a fresh object, checking their
+runtime types; an entry or array that throws while being read counts as malformed.
+Every refusal goes through `reportSeamCollision`, so a malformed module can drop a
+language but cannot stop the dashboard from mounting.
+
+Core wins every collision, and **each consumer owns its conflict table**:
+`registerHljsLanguages` checks the highlight.js set, and
+`registerEditionShikiLanguages` checks Pierre's grammar names, extension tokens and
+reserved `text` / `ansi` ids. A new consumer of `HIGHLIGHT_LANGUAGES` must check
+its own core table the same way; `validateHighlightLanguages` only rejects entries
+that are malformed or collide with each other.

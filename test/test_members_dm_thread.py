@@ -15,7 +15,9 @@ Covers spec task 2 of the Crew Members page:
 
 from __future__ import annotations
 
+import asyncio
 import json
+import os
 import threading
 import time
 from types import SimpleNamespace
@@ -26,17 +28,22 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 from chat_test_helpers import _make_state
 
-from kiro_crew.config.loader import KiroCrewAgentConfig
+from kiro_crew.config.loader import KiroCrewAgentConfig, KiroCrewConfig
 from kiro_crew.dashboard.chat_handlers import _history_key_for
 from kiro_crew.members import (
     DM_SLOT_MODE,
+    MEMBER_BRIEFING_MAX_CHARS,
     MemberSlugError,
     dm_binding_path,
     member_dir,
     member_slot_key,
+    members_root,
     read_dm_binding,
+    record_activity,
+    slug_for_name,
     write_dm_binding,
 )
+from kiro_crew.validation import normalize_unicode
 
 CREW = "code-reviewer"
 OTHER = "other-agent"
@@ -44,8 +51,12 @@ OTHER = "other-agent"
 
 def _fake_config(names, default=CREW):
     return SimpleNamespace(
-        agents={name: KiroCrewAgentConfig(kiro_agent=name) for name in names},
+        agents={name: KiroCrewAgentConfig(kiro_agent="kirocrew") for name in names},
         default_agent=default,
+        memory_stores={},
+        workspaces={"default": SimpleNamespace(dir="workspace")},
+        default_workspace="default",
+        degraded_sections=frozenset(),
     )
 
 
@@ -137,6 +148,7 @@ class TestDmBinding:
 def _make_members_app(state) -> web.Application:
     from kiro_crew.dashboard.handlers.members import (
         api_member_activity,
+        api_member_briefing,
         api_member_thread,
         api_members,
     )
@@ -150,7 +162,9 @@ def _make_members_app(state) -> web.Application:
         # configured; set only when a test has not already chosen a caller, so
         # the non-owner and app-token cases can still pick their own.
         if "user" not in request:
-            request["user"] = "local-app"
+            # ``X-Test-User`` names a NON-owner caller (the dashboard_owner_helpers
+            # convention); absent, the caller is the standalone-local owner.
+            request["user"] = request.headers.get("X-Test-User", "local-app")
         return await handler(request)
 
     app = web.Application(middlewares=[_auth])
@@ -158,6 +172,7 @@ def _make_members_app(state) -> web.Application:
     app.router.add_get("/api/members", api_members)
     app.router.add_post("/api/members/{slug}/thread", api_member_thread)
     app.router.add_get("/api/members/{slug}/activity", api_member_activity)
+    app.router.add_get("/api/members/{slug}/briefing", api_member_briefing)
     return app
 
 
@@ -169,6 +184,33 @@ def _patched_config(names, default=CREW):
 
 
 class TestMemberRoutes:
+    @pytest.mark.asyncio
+    async def test_roster_reuses_config_loaded_off_loop(self, tmp_path, monkeypatch):
+        from kiro_crew.config.loader import KiroCrewConfig
+        from kiro_crew.platform import build_default_context, reset_context, set_context
+
+        cfg = _fake_config([CREW, OTHER])
+        loop_thread = threading.get_ident()
+        loads = []
+
+        def load():
+            loads.append(threading.get_ident())
+            return cfg
+
+        monkeypatch.setattr(KiroCrewConfig, "load", load)
+        state = _make_state(tmp_path)
+        set_context(build_default_context(cfg))
+        loads.clear()
+        try:
+            async with TestClient(TestServer(_make_members_app(state))) as client:
+                response = await client.get("/api/members")
+                assert response.status == 200
+                assert len((await response.json())["members"]) == 2
+        finally:
+            reset_context()
+        assert loads and loop_thread not in loads
+        assert len(loads) == 1
+
     @pytest.mark.asyncio
     async def test_roster_lists_global_crews_with_slugs(self, tmp_path):
         state = _make_state(tmp_path)
@@ -191,6 +233,122 @@ class TestMemberRoutes:
         assert rows[CREW]["avatar"] == {}
         # Unbound members have never talked: last activity reads as 0.
         assert rows[CREW]["last_active_ts"] == 0.0
+
+    @pytest.mark.asyncio
+    async def test_roster_hides_a_credential_shaped_legacy_name(self, tmp_path):
+        from kiro_crew.external_text import external_text_requires_redaction
+
+        name = "crew password=shortvalue"
+        assert external_text_requires_redaction(name)
+        state = _make_state(tmp_path)
+        with _patched_config([name], default=name):
+            async with TestClient(TestServer(_make_members_app(state))) as client:
+                response = await client.get("/api/members")
+                assert response.status == 200
+                assert (await response.json())["members"] == []
+
+    def test_shared_redactor_applies_a_companion_policy_on_top_of_the_baseline(self):
+        import dataclasses
+
+        from kiro_crew import security
+        from kiro_crew.external_text import (
+            external_text_requires_redaction,
+            redact_external_text,
+        )
+        from kiro_crew.platform import (
+            PROFILE_ENTERPRISE,
+            build_default_context,
+            reset_context,
+            set_context,
+        )
+
+        companion_shape = "SSO-COOKIE"
+        baseline_shape = "AKIAIOSFODNN7EXAMPLE"
+
+        class _Policy:
+            def redact(self, text: str) -> str:
+                return security.redact(text).replace(companion_shape, "[REDACTED-SSO]")
+
+        set_context(
+            dataclasses.replace(
+                build_default_context(KiroCrewConfig(), profile=PROFILE_ENTERPRISE),
+                credentials=_Policy(),
+            )
+        )
+        try:
+            assert external_text_requires_redaction(f"crew {companion_shape}")
+            out = redact_external_text(f"crew {companion_shape} {baseline_shape} token=abc")
+        finally:
+            reset_context()
+        assert companion_shape not in out
+        assert baseline_shape not in out
+        assert out.endswith("token=[REDACTED]")
+
+    @pytest.mark.asyncio
+    async def test_free_form_name_round_trips_roster_thread_and_activity(self, tmp_path):
+        name = "dr. eggbot"
+        state = _make_state(tmp_path)
+        from kiro_crew.members import record_activity
+
+        cfg = _fake_config([name], default=name)
+        assert record_activity(name, "dashboard_chat-1", "persistent", via="chat")
+        with patch("kiro_crew.dashboard.handlers.members.KiroCrewConfig.load", return_value=cfg):
+            async with TestClient(TestServer(_make_members_app(state))) as client:
+                roster_response = await client.get("/api/members")
+                assert roster_response.status == 200
+                roster = await roster_response.json()
+                assert [(row["name"], row["slug"]) for row in roster["members"]] == [
+                    ("dr. eggbot", "dr-eggbot")
+                ]
+
+                thread_response = await client.post("/api/members/dr-eggbot/thread")
+                assert thread_response.status == 200
+                assert await thread_response.json() == {
+                    "slot_key": "member-dr-eggbot",
+                    "slug": "dr-eggbot",
+                    "member": "dr. eggbot",
+                }
+
+                activity_response = await client.get(
+                    "/api/members/dr-eggbot/activity", params={"member": name}
+                )
+                assert activity_response.status == 200
+                activity = await activity_response.json()
+                assert activity["member"] == "dr. eggbot"
+                assert len(activity["entries"]) == 1
+
+        assert read_dm_binding("dr-eggbot")["member"] == "dr. eggbot"
+        assert state._slots["member-dr-eggbot"].agent == "dr. eggbot"
+
+    @pytest.mark.asyncio
+    async def test_nfd_legacy_member_survives_roster_and_thread_open(self, tmp_path):
+        name = "Cafe\u0301"
+        assert normalize_unicode(name) != name
+        state = _make_state(tmp_path)
+        cfg = _fake_config([name], default=name)
+        assert record_activity(name, "dashboard_chat-1", "persistent", via="chat")
+        with patch("kiro_crew.dashboard.handlers.members.KiroCrewConfig.load", return_value=cfg):
+            async with TestClient(TestServer(_make_members_app(state))) as client:
+                roster_response = await client.get("/api/members")
+                assert roster_response.status == 200
+                roster = await roster_response.json()
+                assert [(row["name"], row["slug"]) for row in roster["members"]] == [(name, "cafe")]
+
+                thread_response = await client.post("/api/members/cafe/thread")
+                assert thread_response.status == 200
+                body = await thread_response.json()
+                assert body == {"slot_key": "member-cafe", "slug": "cafe", "member": name}
+
+                activity_response = await client.get(
+                    "/api/members/cafe/activity", params={"member": name}
+                )
+                assert activity_response.status == 200
+                activity = await activity_response.json()
+                assert activity["member"] == name
+                assert len(activity["entries"]) == 1
+
+        assert read_dm_binding("cafe")["member"] == name
+        assert state._slots["member-cafe"].agent == name
 
     @pytest.mark.asyncio
     async def test_roster_reports_last_activity_from_the_dm_transcript(self, tmp_path):
@@ -217,6 +375,51 @@ class TestMemberRoutes:
         # A member with no transcript stays at 0 — sorted last, never an error.
         assert rows["Docs_Writer"]["last_active_ts"] == 0.0
         assert rows["Docs_Writer"]["last_message"] == ""
+        # No stop card in either thread, so the flag is absent (omitted when
+        # false — see below) on both rows.
+        assert "last_message_stopped" not in rows[CREW]
+        assert "last_message_stopped" not in rows["Docs_Writer"]
+
+    @pytest.mark.asyncio
+    async def test_roster_flags_a_thread_whose_newest_event_is_a_stop(self, tmp_path):
+        """A just-stopped thread carries last_message_stopped=True on the wire.
+
+        The preview is the last CONVERSATIONAL line (the stop card's JSON is
+        skipped), but that line reads as ongoing work on a thread the user has
+        stopped. So the row also carries a locale-independent boolean the
+        locale-aware client turns into a "Stopped" chip — never the word
+        "Stopped" from here, where the client's locale is unknown. The flag is
+        OMITTED (not False) when the newest event is not a stop, so the common
+        row stays byte-for-byte what it is without it; a later real message
+        leaves it absent.
+        """
+        state = _make_state(tmp_path)
+        write_dm_binding(CREW, member=CREW, slot_key=member_slot_key(CREW))
+        key = f"dashboard:{member_slot_key(CREW)}"
+        state.conversation_log.append(key, "assistant", "Running the analysis now.")
+        stop_payload = json.dumps({"kind": "stop_event", "id": "s1", "state": "stopped"})
+        state.conversation_log.append(key, "system", stop_payload, cls=stop_payload)
+        with _patched_config([CREW]):
+            async with TestClient(TestServer(_make_members_app(state))) as client:
+                resp = await client.get("/api/members")
+                assert resp.status == 200
+                data = await resp.json()
+        row = {r["name"]: r for r in data["members"]}[CREW]
+        # Preview is the conversational line, not the stop JSON…
+        assert row["last_message"] == "Running the analysis now."
+        # …and the flag says the newest event is a stop, so the chip renders.
+        assert row["last_message_stopped"] is True
+
+        # The member speaks again: the newest real row is now that message, the
+        # flag clears to absent, and the chip comes down.
+        state.conversation_log.append(key, "user", "actually, hold on")
+        with _patched_config([CREW]):
+            async with TestClient(TestServer(_make_members_app(state))) as client:
+                resp = await client.get("/api/members")
+                data = await resp.json()
+        row = {r["name"]: r for r in data["members"]}[CREW]
+        assert row["last_message"] == "actually, hold on"
+        assert "last_message_stopped" not in row
 
     @pytest.mark.asyncio
     async def test_roster_preview_redacts_before_truncation(self, tmp_path):
@@ -240,6 +443,21 @@ class TestMemberRoutes:
         preview = {r["name"]: r for r in data["members"]}[CREW]["last_message"]
         # Neither the full token nor any partial prefix of it survives.
         assert "AKIA" not in preview
+
+    @pytest.mark.asyncio
+    async def test_roster_preview_uses_shared_external_text_redaction(self, tmp_path):
+        state = _make_state(tmp_path)
+        write_dm_binding(CREW, member=CREW, slot_key=member_slot_key(CREW))
+        key = f"dashboard:{member_slot_key(CREW)}"
+        state.conversation_log.append(key, "assistant", "password=shortvalue")
+        with _patched_config([CREW]):
+            async with TestClient(TestServer(_make_members_app(state))) as client:
+                response = await client.get("/api/members")
+                assert response.status == 200
+                data = await response.json()
+
+        preview = {row["name"]: row for row in data["members"]}[CREW]["last_message"]
+        assert preview == "password=[REDACTED]"
 
     @pytest.mark.asyncio
     async def test_roster_orders_by_message_ts_not_file_mtime(self, tmp_path, monkeypatch):
@@ -286,9 +504,9 @@ class TestMemberRoutes:
         state.conversation_log.append(old_key, "user", "older message")
         state.conversation_log.append(new_key, "user", "newer message")
         # Touch the OLDER thread's file so its mtime is the newest of the two.
-        # Deliberately the REAL clock (2026-09-xx+), far ahead of the fake
-        # message timestamps (fixed 2026-07-25): the mtime-vs-ts contrast is
-        # the point of this test — do not "align" the two clocks.
+        # Deliberately the REAL clock, far ahead of the fixed fake message
+        # timestamps: the mtime-vs-ts contrast is the point of this test — do
+        # not "align" the two clocks.
         old_path = state.conversation_log._path(old_key)
         now = time.time() + 60
         os.utime(old_path, (now, now))
@@ -320,6 +538,100 @@ class TestMemberRoutes:
         slot = state._slots["member-code-reviewer"]
         assert slot.agent == CREW
         assert slot.mode == DM_SLOT_MODE
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("private", [False, True])
+    @pytest.mark.parametrize("workspace", ["team-a", "missing"])
+    async def test_thread_create_honors_member_workspace_and_project(
+        self, tmp_path, monkeypatch, private, workspace
+    ):
+        """A new member DM uses the configured workspace for cwd and project guides."""
+
+        from kiro_crew.config.loader import KiroCrewConfig
+        from kiro_crew.config.sections import WorkspaceConfig
+        from kiro_crew.memory_stores import provision_member_memory
+
+        team_dir = tmp_path / "team-a-workspace"
+        team_dir.mkdir()
+        cfg = KiroCrewConfig.load()
+        cfg.agents[CREW] = KiroCrewAgentConfig(kiro_agent=CREW, workspace=workspace)
+        cfg.workspaces["team-a"] = WorkspaceConfig(dir=str(team_dir))
+        cfg.default_workspace = "team-a"
+        if private:
+            pass  # Member routing does not depend on OS isolation.
+            await asyncio.to_thread(provision_member_memory, cfg, CREW)
+        await asyncio.to_thread(cfg.save)
+        state = _make_state(tmp_path)
+        frames = []
+        monkeypatch.setattr(state, "_slots_broadcast_lock", None)
+        monkeypatch.setattr(
+            state,
+            "_do_slots_broadcast",
+            lambda: frames.append(
+                [(slot.workspace, slot.project) for slot in state._slots.values()]
+            ),
+        )
+        async with TestClient(TestServer(_make_members_app(state))) as client:
+            resp = await client.post(f"/api/members/{CREW}/thread")
+            assert resp.status == 200, await resp.text()
+            data = await resp.json()
+        slot = state._slots[data["slot_key"]]
+        assert slot.workspace == "team-a"
+        assert slot.project == str(team_dir.resolve())
+        assert frames and frames[0] == [("team-a", str(team_dir.resolve()))]
+        if private:
+            assert slot.memory_store == cfg.agents[CREW].memory_store
+
+    @pytest.mark.asyncio
+    async def test_workspace_resolution_does_not_overwrite_a_concurrent_opener(self, tmp_path):
+        state = _make_state(tmp_path)
+        entered, release = threading.Event(), threading.Event()
+
+        def resolve(workspace):
+            entered.set()
+            assert release.wait(timeout=5)
+            return str(tmp_path / "resolved")
+
+        with (
+            _patched_config([CREW]),
+            patch("kiro_crew.dashboard.handlers.members.default_project_dir", resolve),
+        ):
+            async with TestClient(TestServer(_make_members_app(state))) as client:
+                pending = asyncio.create_task(client.post(f"/api/members/{CREW}/thread"))
+                try:
+                    assert await asyncio.to_thread(entered.wait, 5)
+                    slot = state.get_or_create_slot(
+                        member_slot_key(CREW), agent=CREW, mode=DM_SLOT_MODE, workspace="chosen"
+                    )
+                    slot.project = str(tmp_path / "chosen")
+                finally:
+                    release.set()
+                    response = await asyncio.wait_for(pending, timeout=5)
+                assert response.status == 200
+        assert state._slots[member_slot_key(CREW)] is slot
+        assert slot.project == str(tmp_path / "chosen")
+        assert slot.workspace == "chosen"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("project", ["", "chosen-project"])
+    async def test_reopening_live_member_preserves_explicit_project(self, tmp_path, project):
+        state = _make_state(tmp_path)
+        slot = state.get_or_create_slot(
+            member_slot_key(CREW), agent=CREW, mode=DM_SLOT_MODE, workspace="chosen"
+        )
+        slot.project = project
+        with (
+            _patched_config([CREW]),
+            patch(
+                "kiro_crew.dashboard.handlers.members.default_project_dir",
+                side_effect=AssertionError("existing project was re-resolved"),
+            ),
+        ):
+            async with TestClient(TestServer(_make_members_app(state))) as client:
+                response = await client.post(f"/api/members/{CREW}/thread")
+                assert response.status == 200
+        assert slot.workspace == "chosen"
+        assert slot.project == project
 
     @pytest.mark.asyncio
     async def test_thread_reopen_rehydrates_dormant_history(self, tmp_path):
@@ -421,6 +733,26 @@ class TestMemberRoutes:
         assert [r["name"] for r in bound_rows] == ["Review_Agent"]
 
     @pytest.mark.asyncio
+    async def test_colliding_slug_honors_a_binding_naming_the_later_crew(self, tmp_path):
+        """A corroborated binding OUTRANKS config order, it does not tie it.
+
+        Binding the second of two colliding names is the only case where the
+        bound member and the config-order fallback differ, so it is the only
+        case that can observe which of the two the handler picks. Every other
+        binding in this suite names the sole owner, where both answers agree.
+        """
+        state = _make_state(tmp_path)
+        write_dm_binding(
+            "review-agent", member="review-agent", slot_key=member_slot_key("review-agent")
+        )
+        with _patched_config(["Review_Agent", "review-agent"], default="Review_Agent"):
+            async with TestClient(TestServer(_make_members_app(state))) as client:
+                opened = await (await client.post("/api/members/review-agent/thread")).json()
+        # Config order answers Review_Agent; the binding answers review-agent.
+        assert opened["member"] == "review-agent"
+        assert read_dm_binding("review-agent")["member"] == "review-agent"
+
+    @pytest.mark.asyncio
     async def test_app_tokens_are_denied(self, tmp_path):
         state = _make_state(tmp_path)
 
@@ -436,6 +768,11 @@ class TestMemberRoutes:
                 assert (await client.get("/api/members")).status == 404
                 assert (await client.post("/api/members/code-reviewer/thread")).status == 404
                 assert (await client.get("/api/members/code-reviewer/activity")).status == 404
+                briefing = await client.get(
+                    "/api/members/code-reviewer/briefing", params={"member": CREW}
+                )
+                assert briefing.status == 404
+                assert (await briefing.json()) == {"error": "not found", "code": "not_found"}
         assert not state._slots
 
     @pytest.mark.asyncio
@@ -480,6 +817,81 @@ class TestPinEnforcement:
         assert slot.agent == CREW
 
     @pytest.mark.asyncio
+    async def test_agent_switch_endpoint_allows_free_form_same_name(self, tmp_path):
+        from chat_test_helpers import _make_app_with_agent_routes
+
+        name = "dr. eggbot"
+        state = _make_state(tmp_path)
+        slot = _member_slot(state, key="member-dr-eggbot", agent=name)
+        cfg = KiroCrewConfig()
+        cfg.agents = {name: KiroCrewAgentConfig(kiro_agent="kirocrew")}
+        cfg.default_agent = name
+        with patch("kiro_crew.config.loader.KiroCrewConfig.load", return_value=cfg):
+            async with TestClient(TestServer(_make_app_with_agent_routes(state))) as client:
+                resp = await client.post(f"/api/chat/slots/{slot.key}/agent", json={"agent": name})
+                assert resp.status == 200, await resp.text()
+        assert slot.agent == name
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("name", ["AKIAIOSFODNN7EXAMPLE", "crew password=shortvalue"])
+    async def test_agent_switch_refuses_a_non_dispatchable_stored_pin(self, tmp_path, name):
+        from chat_test_helpers import _make_app_with_agent_routes
+
+        state = _make_state(tmp_path)
+        slot = _member_slot(state, key="member-legacy-credential", agent=name)
+        async with TestClient(TestServer(_make_app_with_agent_routes(state))) as client:
+            response = await client.post(f"/api/chat/slots/{slot.key}/agent", json={"agent": name})
+            assert response.status == 409
+            body = await response.json()
+
+        assert body["code"] == "member_pin_mismatch"
+        assert slot.agent == name
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("live", [False, True])
+    async def test_app_send_hides_free_form_member_slot_existence(self, tmp_path, live):
+        from chat_test_helpers import _make_app
+
+        state = _make_state(tmp_path)
+        if live:
+            _member_slot(state, key="member-dr-eggbot", agent="dr. eggbot")
+
+        @web.middleware
+        async def _as_app(request, handler):
+            request["app"] = "some-app"
+            return await handler(request)
+
+        app = _make_app(state)
+        app.middlewares.insert(0, _as_app)
+        async with TestClient(TestServer(app)) as client:
+            response = await client.post(
+                "/api/chat",
+                json={
+                    "slot": "member-dr-eggbot",
+                    "agent": "dr. eggbot",
+                    "message": "hello",
+                },
+            )
+            assert response.status == 404
+            assert await response.json() == {"error": "not found", "code": "slot_not_found"}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("requested", [None, "dr. otherbot"])
+    async def test_agent_switch_rejects_invalid_or_nonmatching_free_form_name(
+        self, tmp_path, requested
+    ):
+        from chat_test_helpers import _make_app_with_agent_routes
+
+        state = _make_state(tmp_path)
+        slot = _member_slot(state, key="member-dr-eggbot", agent="dr. eggbot")
+        async with TestClient(TestServer(_make_app_with_agent_routes(state))) as client:
+            response = await client.post(
+                f"/api/chat/slots/{slot.key}/agent", json={"agent": requested}
+            )
+            assert response.status == 400
+        assert slot.agent == "dr. eggbot"
+
+    @pytest.mark.asyncio
     async def test_send_path_refuses_member_agent_mismatch(self, tmp_path):
         from chat_test_helpers import _make_app
 
@@ -521,6 +933,133 @@ class TestPinEnforcement:
         assert slot.agent == CREW
 
     @pytest.mark.asyncio
+    async def test_send_path_allows_matching_free_form_member(self, tmp_path):
+        from chat_test_helpers import _make_app
+
+        name = "dr. eggbot"
+        state = _make_state(tmp_path)
+        slot = _member_slot(state, key="member-dr-eggbot", agent=name)
+        cfg = _fake_config([name], default=name)
+        with patch("kiro_crew.dashboard.handlers.members.KiroCrewConfig.load", return_value=cfg):
+            async with TestClient(TestServer(_make_app(state))) as client:
+                resp = await client.post(
+                    "/api/chat", json={"slot": slot.key, "agent": name, "message": ""}
+                )
+                assert resp.status == 400
+                body = await resp.json()
+                assert body == {"error": "message is required", "code": "message_required"}
+        assert slot.agent == name
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("name", ["AKIAIOSFODNN7EXAMPLE", "crew password=shortvalue"])
+    async def test_send_path_refuses_a_redaction_requiring_stored_member_pin(self, tmp_path, name):
+        from chat_test_helpers import _make_app
+
+        state = _make_state(tmp_path)
+        slot = _member_slot(state, key="member-legacy-credential", agent=name)
+        cfg = _fake_config([name], default=name)
+        with patch("kiro_crew.dashboard.handlers.members.KiroCrewConfig.load", return_value=cfg):
+            async with TestClient(TestServer(_make_app(state))) as client:
+                for body in (
+                    {"slot": slot.key, "agent": name, "message": ""},
+                    {"slot": slot.key, "message": ""},
+                ):
+                    response = await client.post("/api/chat", json=body)
+                    assert response.status == 409
+                    assert (await response.json())["code"] == "member_pin_mismatch"
+        assert slot.agent == name
+
+    @pytest.mark.asyncio
+    async def test_runner_refuses_a_redaction_requiring_stored_member_pin(self, tmp_path, caplog):
+        from kiro_crew.dashboard.chat_runner import _run_chat
+        from kiro_crew.eventlog.service import get_service
+
+        name = "crew password=shortvalue"
+        credential = "".join(["AKIA", "IOSFODNN7", "EXAMPLE"])
+        slot_key = f"member-{credential}"
+        state = _make_state(tmp_path)
+        state.broadcast_ws = MagicMock()
+        state.sessions.get_or_create = AsyncMock(
+            side_effect=AssertionError("provider acquisition must not run")
+        )
+        state.context_builder = MagicMock()
+        state.context_builder.build_message = MagicMock(
+            side_effect=AssertionError("context construction must not run")
+        )
+        slot = state.get_or_create_slot(slot_key, agent=name, mode=DM_SLOT_MODE)
+        get_service().ensure("legacy-credential", name)
+        slot.append("user", "hello", "msg msg-u")
+        autonudge = MagicMock()
+
+        with (
+            patch("kiro_crew.autonudge.get_instance", return_value=autonudge),
+            caplog.at_level("WARNING", logger="kiro_crew.dashboard.chat_runner"),
+        ):
+            await _run_chat(state, slot, "hello")
+
+        errors = [message for message in slot.messages if message["role"] == "error"]
+        assert len(errors) == 1
+        assert name not in errors[0]["content"]
+        logs = "\n".join(caplog.messages)
+        assert credential not in logs
+        assert "[REDACTED" in logs
+        assert slot.messages[-1]["role"] == "done"
+        assert any(call.args[0] == "chat_done" for call in state.broadcast_ws.call_args_list)
+        assert not any(message["role"] == "assistant" for message in slot.messages)
+        autonudge.notify_turn_complete.assert_called_once()
+        assert autonudge.notify_turn_complete.call_args.args == (slot.key,)
+        state.sessions.get_or_create.assert_not_called()
+        state.context_builder.build_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_runner_refuses_a_non_dispatchable_default_member_on_an_ordinary_slot(
+        self, tmp_path, caplog
+    ):
+        from kiro_crew.dashboard.chat_runner import _run_chat
+
+        name = "crew password=shortvalue"
+        credential = "".join(["AKIA", "IOSFODNN7", "EXAMPLE"])
+        slot_key = f"chat-{credential}"
+        state = _make_state(tmp_path)
+        state.broadcast_ws = MagicMock()
+        state.sessions.get_or_create = AsyncMock(
+            side_effect=AssertionError("provider acquisition must not run")
+        )
+        state.context_builder = MagicMock()
+        state.context_builder.build_message = MagicMock(
+            side_effect=AssertionError("context construction must not run")
+        )
+        slot = state.get_or_create_slot(slot_key)
+        slot.append("user", "hello", "msg msg-u")
+        cfg = KiroCrewConfig()
+        cfg.agents = {name: KiroCrewAgentConfig(kiro_agent="kirocrew")}
+        cfg.default_agent = name
+        autonudge = MagicMock()
+
+        with (
+            patch("kiro_crew.dashboard.chat_runner.KiroCrewConfig.load", return_value=cfg),
+            patch("kiro_crew.autonudge.get_instance", return_value=autonudge),
+            caplog.at_level("WARNING", logger="kiro_crew.dashboard.chat_runner"),
+        ):
+            await _run_chat(state, slot, "hello")
+
+        errors = [message for message in slot.messages if message["role"] == "error"]
+        assert len(errors) == 1
+        assert (
+            errors[0]["content"]
+            == "This thread's crew name cannot be dispatched. Rename or recreate the Crew Member."
+        )
+        logs = "\n".join(caplog.messages)
+        assert credential not in logs
+        assert "[REDACTED" in logs
+        assert slot.messages[-1]["role"] == "done"
+        assert any(call.args[0] == "chat_done" for call in state.broadcast_ws.call_args_list)
+        autonudge.notify_turn_complete.assert_called_once()
+        assert autonudge.notify_turn_complete.call_args.args == (slot.key,)
+        state.sessions.get_or_create.assert_not_called()
+        state.context_builder.build_message.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_send_path_fails_closed_on_binding_drift(self, tmp_path):
         """A live member slot whose binding vanished must refuse the send.
 
@@ -555,7 +1094,7 @@ class TestPinEnforcement:
 
         state = _make_state(tmp_path)
         slot = _member_slot(state)
-        # Registry no longer contains CREW — only an unrelated crew.
+        # Registry holds only an unrelated crew, not CREW.
         with _patched_config([OTHER]):
             async with TestClient(TestServer(_make_app(state))) as client:
                 resp = await client.post("/api/chat", json={"slot": slot.key, "message": ""})
@@ -563,10 +1102,31 @@ class TestPinEnforcement:
                 assert (await resp.json())["code"] == "member_pin_mismatch"
         assert slot.agent == CREW
 
-    def _runner_harness(self, tmp_path, *, mode):
+    def _runner_harness(self, tmp_path, monkeypatch, *, mode, private=True, switch_to=OTHER):
+        from kiro_crew.config.loader import KiroCrewConfig
         from kiro_crew.dashboard.chat_runner import _run_chat
+        from kiro_crew.memory_stores import provision_member_memory
 
-        state = _make_state(tmp_path)
+        cfg = KiroCrewConfig.load()
+        cfg.agents[CREW] = KiroCrewAgentConfig(kiro_agent="kirocrew")
+        provision_member_memory(cfg, CREW)
+        cfg.save()
+        # No real provider or embedding process runs in this stream harness.
+        # Keep private ownership and the protected session binding real.
+        monkeypatch.setattr("kiro_crew.dashboard.chat_runner.title_then_refresh", AsyncMock())
+        monkeypatch.setattr("kiro_crew.dashboard.chat_runner.generate_session_summary", AsyncMock())
+        monkeypatch.setattr(
+            "kiro_crew.config.loader._materialized_kiro_agent",
+            lambda name, project_dir=None: name if name == switch_to else "",
+        )
+        context = SimpleNamespace(
+            ensure_store=AsyncMock(return_value=object()),
+            build_message=lambda text, *args, **kwargs: (text, None),
+            conversation_log=None,
+            hooks=SimpleNamespace(auto_approve_subagent_tools=False),
+        )
+
+        state = _make_state(tmp_path, context_builder=context)
         state.sessions.get_or_create = AsyncMock(return_value=(MagicMock(), False, False))
         state.sessions.release = MagicMock()
         state.sessions.reset = AsyncMock()
@@ -581,7 +1141,14 @@ class TestPinEnforcement:
         # Ordinary-mode control runs on an ordinary key: the constructor's
         # member-* reservation (correctly) refuses a bare member key.
         slot_key = "member-code-reviewer" if mode == DM_SLOT_MODE else "chat-1-100"
-        slot = state.get_or_create_slot(slot_key, agent=CREW, mode=mode)
+        agent = CREW if private else "default"
+        slot = state.get_or_create_slot(slot_key, agent=agent, mode=mode)
+        if private:
+            # The turn only confirms a grant an owner-gated route wrote; the
+            # harness stands in for that route.
+            from kiro_crew.member_memory_auth import bind_private_session_store
+
+            bind_private_session_store(f"dashboard:{slot_key}", cfg.agents[CREW].memory_store)
         slot.append("user", "hello", "msg msg-u")
 
         client = state.sessions.get_or_create.return_value[0]
@@ -595,7 +1162,7 @@ class TestPinEnforcement:
         )
 
         async def _stream(msg):
-            yield LLMEvent(kind=EVENT_AGENT_SWITCHED, text=OTHER)
+            yield LLMEvent(kind=EVENT_AGENT_SWITCHED, text=switch_to)
             # Anything after the switch executes as the FOREIGN agent — the
             # veto must stop consumption here, so this text must never land.
             yield LLMEvent(kind=EVENT_TEXT_CHUNK, text="foreign agent output after switch")
@@ -606,10 +1173,17 @@ class TestPinEnforcement:
         return state, slot, _run_chat
 
     @pytest.mark.asyncio
-    async def test_mid_turn_agent_switch_is_vetoed_on_member_threads(self, tmp_path):
-        state, slot, _run_chat = self._runner_harness(tmp_path, mode=DM_SLOT_MODE)
+    @pytest.mark.parametrize("mode", [DM_SLOT_MODE, ""], ids=["member-dm", "ordinary-v2"])
+    @pytest.mark.parametrize("switch_to", [OTHER, CREW], ids=["other-agent", "alias-collision"])
+    async def test_mid_turn_agent_switch_is_vetoed_on_member_threads(
+        self, tmp_path, monkeypatch, mode, switch_to
+    ):
+        state, slot, _run_chat = self._runner_harness(
+            tmp_path, monkeypatch, mode=mode, switch_to=switch_to
+        )
 
         await _run_chat(state, slot, "test message")
+        await asyncio.gather(*state._background_tasks)
 
         # The pin held: agent unchanged, no switch advertised to the UI.
         assert slot.agent == CREW
@@ -644,15 +1218,17 @@ class TestPinEnforcement:
         )
 
     @pytest.mark.asyncio
-    async def test_mid_turn_agent_switch_still_lands_on_ordinary_slots(self, tmp_path):
+    async def test_mid_turn_agent_switch_still_lands_on_ordinary_slots(self, tmp_path, monkeypatch):
         """Control for the veto: the same event MOVES a non-member slot.
 
         Proves the event path executes in this harness, so the member test
         above passes because of the veto, not because the event never ran.
         """
-        state, slot, _run_chat = self._runner_harness(tmp_path, mode="")
+        state, slot, _run_chat = self._runner_harness(tmp_path, monkeypatch, mode="", private=False)
+        assert slot.agent == "default"
 
         await _run_chat(state, slot, "test message")
+        await asyncio.gather(*state._background_tasks)
 
         assert slot.agent == OTHER
         switch_broadcasts = [
@@ -963,7 +1539,207 @@ class TestRegistryMovedUnderBinding:
         assert read_dm_binding(CREW) is None
 
 
+class TestFreeFormMemberOnOrdinarySlot:
+    """A configured free-form member is a valid agent CHOICE, not only a pin.
+
+    The catalog lists ``dr. eggbot`` and the agent cycle sends its bare name to
+    an ordinary slot; the choice guards must admit it. Anything off-grammar
+    that is NOT a configured, dispatchable member stays refused.
+    """
+
+    NAME = "dr. eggbot"
+
+    @pytest.mark.asyncio
+    async def test_agent_switch_admits_a_configured_free_form_member(self, tmp_path):
+        from chat_test_helpers import _make_app_with_agent_routes
+
+        state = _make_state(tmp_path)
+        slot = state.get_or_create_slot("ordinary", agent="kirocrew")
+        cfg = KiroCrewConfig()
+        cfg.agents = {self.NAME: KiroCrewAgentConfig(kiro_agent="kirocrew")}
+        cfg.default_agent = self.NAME
+        with patch("kiro_crew.config.loader.KiroCrewConfig.load", return_value=cfg):
+            async with TestClient(TestServer(_make_app_with_agent_routes(state))) as client:
+                resp = await client.post(
+                    f"/api/chat/slots/{slot.key}/agent", json={"agent": self.NAME}
+                )
+                assert resp.status == 200, await resp.text()
+        assert slot.agent == self.NAME
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("configured", "requested"),
+        [
+            # Off-grammar and not a member: never a template, refused.
+            (["dr. eggbot"], "dr. otherbot"),
+            # A configured off-grammar member whose stored name requires redaction.
+            (["crew password=shortvalue"], "crew password=shortvalue"),
+        ],
+    )
+    async def test_agent_switch_still_refuses_off_grammar_non_members(
+        self, tmp_path, configured, requested
+    ):
+        from chat_test_helpers import _make_app_with_agent_routes
+
+        state = _make_state(tmp_path)
+        slot = state.get_or_create_slot("ordinary", agent="kirocrew")
+        cfg = _fake_config(configured, default=configured[0])
+        with patch("kiro_crew.config.loader.KiroCrewConfig.load", return_value=cfg):
+            async with TestClient(TestServer(_make_app_with_agent_routes(state))) as client:
+                resp = await client.post(
+                    f"/api/chat/slots/{slot.key}/agent", json={"agent": requested}
+                )
+                assert resp.status == 400
+                assert (await resp.json()) == {"error": "invalid agent name"}
+        assert slot.agent == "kirocrew"
+
+    @pytest.mark.asyncio
+    async def test_agent_switch_admits_a_published_dotted_template(self, tmp_path):
+        """The template grammar (``TEMPLATE_NAME_RE``) admits ``reviewer.v2``; the
+        choice guards must not hold a template to the stricter member-slot grammar.
+        Reaching a non-400 answer proves the name guard fell through."""
+        from chat_test_helpers import _make_app_with_agent_routes
+
+        state = _make_state(tmp_path)
+        slot = state.get_or_create_slot("ordinary", agent="kirocrew")
+        async with TestClient(TestServer(_make_app_with_agent_routes(state))) as client:
+            resp = await client.post(
+                f"/api/chat/slots/{slot.key}/agent", json={"agent": "reviewer.v2"}
+            )
+            assert resp.status != 400 or (await resp.json()) != {"error": "invalid agent name"}
+            bad = await client.post(
+                f"/api/chat/slots/{slot.key}/agent", json={"agent": "reviewer.v2."}
+            )
+            assert bad.status == 400
+            assert await bad.json() == {"error": "invalid agent name"}
+
+    @pytest.mark.asyncio
+    async def test_send_path_admits_a_configured_free_form_member(self, tmp_path):
+        """Reaching the message-required 400 proves the name guard fell through."""
+        from chat_test_helpers import _make_app
+
+        state = _make_state(tmp_path)
+        # An ORDINARY slot already running the member: the post-switch state.
+        slot = state.get_or_create_slot("ordinary", agent=self.NAME)
+        assert slot.mode != DM_SLOT_MODE
+        cfg = _fake_config([self.NAME], default=self.NAME)
+        with patch("kiro_crew.config.loader.KiroCrewConfig.load", return_value=cfg):
+            async with TestClient(TestServer(_make_app(state))) as client:
+                resp = await client.post(
+                    "/api/chat", json={"slot": slot.key, "agent": self.NAME, "message": ""}
+                )
+                assert resp.status == 400, await resp.text()
+                assert await resp.json() == {
+                    "error": "message is required",
+                    "code": "message_required",
+                }
+                bad = await client.post(
+                    "/api/chat", json={"slot": slot.key, "agent": "dr. otherbot", "message": ""}
+                )
+                assert bad.status == 400
+                assert await bad.json() == {"error": "invalid agent name"}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("configured", "model", "admitted"),
+        [(["dr. eggbot"], "dr. eggbot", True), (["dr. eggbot"], "dr. otherbot", False)],
+    )
+    async def test_completions_admit_only_a_configured_free_form_member(
+        self, configured, model, admitted
+    ):
+        from kiro_crew.dashboard.openai_compat import api_completions
+        from kiro_crew.kiro_prerequisite import KiroPrerequisiteService
+
+        class _Ready(KiroPrerequisiteService):
+            async def session_ready(self) -> bool:  # pragma: no cover - trivial
+                return True
+
+            async def verified_ready(self, *, max_age_secs: float) -> bool:
+                del max_age_secs
+                return True
+
+        state = MagicMock()
+        state._slots = {}
+        request = MagicMock()
+        request.json = AsyncMock(
+            return_value={"model": model, "messages": [{"role": "user", "content": "hi"}]}
+        )
+        request.app = {"state": state, "kiro_prerequisite_service": object.__new__(_Ready)}
+        request.get = MagicMock(side_effect=lambda key, default="": default)
+
+        class _PastTheGuard(Exception):
+            """Raised by ``_make_id``, the first statement after the name guard."""
+
+        cfg = _fake_config(configured, default=configured[0])
+        with (
+            patch("kiro_crew.config.loader.KiroCrewConfig.load", return_value=cfg),
+            patch("kiro_crew.dashboard.openai_compat._make_id", side_effect=_PastTheGuard),
+        ):
+            if admitted:
+                with pytest.raises(_PastTheGuard):
+                    await api_completions(request)
+            else:
+                response = await api_completions(request)
+                assert response.status == 400
+                body = json.loads(response.body)
+                assert body["error"]["message"] == "invalid model/agent name"
+        state.get_or_create_slot.assert_not_called()
+
+
 class TestOpenAiCompatPin:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("live", [False, True])
+    @pytest.mark.parametrize(
+        ("slot_id", "model"),
+        [
+            ("member-dr-eggbot", "dr. eggbot"),
+            (member_slot_key("dr-eggbot", "private-store"), "kirocrew"),
+        ],
+    )
+    async def test_app_completion_hides_member_slot_existence(self, live, slot_id, model):
+        from kiro_crew.dashboard.openai_compat import api_completions
+        from kiro_crew.kiro_prerequisite import KiroPrerequisiteService
+
+        class _Ready(KiroPrerequisiteService):
+            async def session_ready(self) -> bool:
+                return True
+
+            async def verified_ready(self, *, max_age_secs: float) -> bool:
+                del max_age_secs
+                return True
+
+        state = MagicMock()
+        state._slots = {}
+        if live:
+            slot = MagicMock()
+            slot.key = slot_id
+            slot.agent = model
+            slot.mode = DM_SLOT_MODE
+            state._slots[slot_id] = slot
+
+        request = MagicMock()
+        request.json = AsyncMock(
+            return_value={
+                "model": model,
+                "id": slot_id,
+                "messages": [{"role": "user", "content": "hello"}],
+            }
+        )
+        request.app = {
+            "state": state,
+            "kiro_prerequisite_service": object.__new__(_Ready),
+        }
+        request.get = MagicMock(
+            side_effect=lambda key, default="": "some-app" if key == "app" else default
+        )
+
+        response = await api_completions(request)
+        assert response.status == 404
+        assert json.loads(response.body) == {
+            "error": {"message": "not found", "type": "invalid_request_error"},
+            "code": "not_found",
+        }
+
     @pytest.mark.asyncio
     async def test_completions_refuses_member_agent_mismatch(self):
         """The OpenAI-compat per-request agent write honors the pin."""
@@ -1015,8 +1791,58 @@ class TestOpenAiCompatPin:
         assert slot.agent == CREW
 
     @pytest.mark.asyncio
-    async def test_completions_fail_closed_on_binding_drift(self):
-        """The OpenAI-compat send also refuses when the binding vanished.
+    @pytest.mark.parametrize("name", ["AKIAIOSFODNN7EXAMPLE", "crew password=shortvalue"])
+    async def test_completion_refuses_a_redaction_requiring_stored_member_pin(self, name):
+        import asyncio as _asyncio
+
+        from kiro_crew.dashboard.openai_compat import api_completions
+        from kiro_crew.kiro_prerequisite import KiroPrerequisiteService
+
+        class _Ready(KiroPrerequisiteService):
+            async def session_ready(self) -> bool:
+                return True
+
+            async def verified_ready(self, *, max_age_secs: float) -> bool:
+                del max_age_secs
+                return True
+
+        slot = MagicMock()
+        slot.key = "member-legacy-credential"
+        slot.agent = name
+        slot.mode = DM_SLOT_MODE
+        slot.task = None
+        slot.event = _asyncio.Event()
+        slot.drain = MagicMock(return_value=[])
+        state = MagicMock()
+        state.get_or_create_slot = MagicMock(return_value=slot)
+        state._slots = {slot.key: slot}
+        state._background_tasks = set()
+
+        request = MagicMock()
+        request.json = AsyncMock(
+            return_value={
+                "model": name,
+                "id": slot.key,
+                "messages": [{"role": "user", "content": "hi"}],
+            }
+        )
+        request.app = {
+            "state": state,
+            "kiro_prerequisite_service": object.__new__(_Ready),
+        }
+        request.get = MagicMock(side_effect=lambda key, default="": default)
+
+        cfg = _fake_config([name], default=name)
+        with patch("kiro_crew.dashboard.openai_compat.KiroCrewConfig.load", return_value=cfg):
+            response = await api_completions(request)
+        assert response.status == 409
+        body = json.loads(response.body)
+        assert body["error"]["code"] == "member_pin_mismatch"
+        assert body["code"] == "member_pin_mismatch"
+
+    @pytest.mark.asyncio
+    async def test_free_form_completion_reaches_binding_drift_guard(self):
+        """A deleted or corrupt dm.json must refuse before dispatch.
 
         Mirrors the chat_send binding-drift guard: a deleted/corrupt dm.json
         must not let a completion dispatch on the live member slot and
@@ -1037,9 +1863,10 @@ class TestOpenAiCompatPin:
                 del max_age_secs
                 return True
 
+        name = "dr. eggbot"
         slot = MagicMock()
-        slot.key = member_slot_key(CREW)
-        slot.agent = CREW
+        slot.key = member_slot_key("dr-eggbot", "member-dr-eggbot-generation")
+        slot.agent = name
         slot.mode = DM_SLOT_MODE
         slot.task = None
         slot.event = _asyncio.Event()
@@ -1052,8 +1879,8 @@ class TestOpenAiCompatPin:
         request = MagicMock()
         request.json = AsyncMock(
             return_value={
-                "model": CREW,  # model maps to agent: matching passes the pin, reaches drift checks
-                "id": slot.key,  # "id" (not "slot") is how existing slots are addressed here
+                "model": name,
+                "id": slot.key,
                 "messages": [{"role": "user", "content": "hi"}],
             }
         )
@@ -1063,7 +1890,8 @@ class TestOpenAiCompatPin:
         }
         request.get = MagicMock(side_effect=lambda k, d="": d)
 
-        with _patched_config([CREW]):
+        cfg = _fake_config([name], default=name)
+        with patch("kiro_crew.dashboard.handlers.members.KiroCrewConfig.load", return_value=cfg):
             resp = await api_completions(request)
         assert resp.status == 409
         body = json.loads(resp.body)
@@ -1087,6 +1915,22 @@ class TestRegistryDriftWithoutLiveSlot:
         # Same-slug names (collisions, renames) still read back.
         write_dm_binding(CREW, member="Code.Reviewer", slot_key=member_slot_key(CREW))
         assert read_dm_binding(CREW)["member"] == "Code.Reviewer"
+
+    @pytest.mark.asyncio
+    async def test_invalid_bound_name_returns_coded_conflict(self, tmp_path):
+        state = _make_state(tmp_path)
+        invalid_name = "unsafe\nmember"
+        slug = "unsafe-member"
+        binding = write_dm_binding(slug, member=invalid_name, slot_key=member_slot_key(slug))
+        binding["member_id"] = ""
+        dm_binding_path(slug).write_text(json.dumps(binding), encoding="utf-8")
+        with _patched_config([invalid_name], default=invalid_name):
+            async with TestClient(TestServer(_make_members_app(state))) as client:
+                response = await client.post(f"/api/members/{slug}/thread")
+                assert response.status == 409
+                assert (await response.json())["code"] == "member_pin_mismatch"
+        assert member_slot_key(slug) not in state._slots
+        assert read_dm_binding(slug)["member"] == invalid_name
 
     @pytest.mark.asyncio
     async def test_drifted_binding_fails_closed_even_with_no_live_slot(self, tmp_path):
@@ -1206,6 +2050,40 @@ class TestPersistenceRestoreGate:
         # Ordinary keys are not member restores at all.
         assert _member_restore_identity("chat-1-1") is None
 
+    def test_non_dispatchable_member_identity_is_skipped(self):
+        from kiro_crew.dashboard.chat_persistence import (
+            _SKIP_MEMBER_RESTORE,
+            _member_restore_identity,
+        )
+
+        name = "crew password=shortvalue"
+        slug = slug_for_name(name)
+        key = member_slot_key(slug)
+        write_dm_binding(slug, member=name, slot_key=key)
+
+        assert _member_restore_identity(key) is _SKIP_MEMBER_RESTORE
+
+    def test_skipped_restore_warning_does_not_log_a_credential_shaped_slot(self, caplog):
+        import logging
+
+        from kiro_crew.dashboard.chat_persistence import (
+            _SKIP_MEMBER_RESTORE,
+            _member_restore_identity,
+        )
+
+        name = "xoxb-000000000000-abcdefghijkl"
+        slug = slug_for_name(name)
+        key = member_slot_key(slug)
+        write_dm_binding(slug, member=name, slot_key=key)
+
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.dashboard.chat_persistence"):
+            assert _member_restore_identity(key) is _SKIP_MEMBER_RESTORE
+
+        messages = [record.getMessage() for record in caplog.records]
+        assert any("no dispatchable dm binding" in message for message in messages)
+        assert not any(name in message for message in messages)
+        assert not any(slug in message for message in messages)
+
     def test_member_key_without_binding_is_skipped_not_published(self):
         """No binding -> the restore skips the slot instead of publishing it.
 
@@ -1224,9 +2102,9 @@ class TestPersistenceRestoreGate:
     def test_open_slot_restore_round_trips_a_bound_member_thread(self, tmp_path):
         """End to end: a bound member thread survives a restart pinned.
 
-        This is the invariant round 3's constructor reservation accidentally
-        broke (a bare member key was refused before the binding was consulted);
-        the binding-first resolution is what re-admits the legitimate restore.
+        A constructor reservation that refuses a bare member key before the
+        binding is consulted breaks this; binding-first resolution is what
+        admits the legitimate restore.
         """
         from kiro_crew.dashboard.chat_persistence import _rehydrate_slot_from_history
 
@@ -1309,6 +2187,94 @@ class TestCentralReservation:
         assert slot.agent == CREW
         assert slot.mode == DM_SLOT_MODE
 
+    @pytest.mark.asyncio
+    async def test_resume_refuses_a_non_dispatchable_member_binding(self, tmp_path):
+        from chat_test_helpers import _make_app
+
+        state = _make_state(tmp_path)
+        name = "crew password=shortvalue"
+        slug = slug_for_name(name)
+        slot_key = member_slot_key(slug)
+        write_dm_binding(slug, member=name, slot_key=slot_key)
+        history_key = f"dashboard:{slot_key}"
+        state.conversation_log.append(history_key, "user", "hello")
+        state.conversation_log.update_metadata(
+            history_key,
+            {
+                "agent": name,
+                "mode": DM_SLOT_MODE,
+                "closed": True,
+                "closed_at": time.time() - 60,
+            },
+        )
+
+        async with TestClient(TestServer(_make_app(state))) as client:
+            response = await client.post(
+                f"/api/chat/slots/{slot_key}/resume", json={"key": history_key}
+            )
+            assert response.status == 409
+            body = await response.json()
+
+        assert body["code"] == "member_pin_mismatch"
+        assert slot_key not in state._slots
+        metadata = state.conversation_log.get_metadata(history_key)
+        assert metadata["closed"] is True
+        assert "closed_at" in metadata
+
+    @pytest.mark.asyncio
+    async def test_resume_refuses_a_live_non_dispatchable_member_slot(self, tmp_path):
+        from chat_test_helpers import _make_app
+
+        state = _make_state(tmp_path)
+        name = "crew password=shortvalue"
+        slug = slug_for_name(name)
+        slot = _member_slot(state, key=member_slot_key(slug), agent=name)
+        history_key = f"dashboard:{slot.key}"
+
+        async with TestClient(TestServer(_make_app(state))) as client:
+            response = await client.post(
+                "/api/chat/slots/ordinary-alias/resume", json={"key": history_key}
+            )
+            assert response.status == 409
+            body = await response.json()
+
+        assert body["code"] == "member_pin_mismatch"
+        assert state._slots[slot.key] is slot
+
+    @pytest.mark.asyncio
+    async def test_resume_rechecks_member_dispatchability_after_binding_await(
+        self, tmp_path, monkeypatch
+    ):
+        from chat_test_helpers import _make_app
+
+        state = _make_state(tmp_path)
+        slot_key = member_slot_key("dr-eggbot")
+        history_key = f"dashboard:{slot_key}"
+        state.conversation_log.append(history_key, "user", "hello")
+        state.conversation_log.update_metadata(
+            history_key, {"agent": "dr. eggbot", "mode": DM_SLOT_MODE}
+        )
+        binding_reads = iter(
+            [
+                {"member": "dr. eggbot"},
+                {"member": "crew password=shortvalue"},
+            ]
+        )
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_handlers.members_mod.read_dm_binding_for_slot",
+            lambda _slot_key: next(binding_reads),
+        )
+
+        async with TestClient(TestServer(_make_app(state))) as client:
+            response = await client.post(
+                f"/api/chat/slots/{slot_key}/resume", json={"key": history_key}
+            )
+            assert response.status == 409
+            body = await response.json()
+
+        assert body["code"] == "member_pin_mismatch"
+        assert slot_key not in state._slots
+
 
 class TestOrphanedHistory:
     @pytest.mark.asyncio
@@ -1380,6 +2346,94 @@ class TestMemberActivityRoute:
         assert set(data["entries"][0]) == {"ts", "via", "project"}
 
     @pytest.mark.asyncio
+    async def test_the_read_never_asks_the_log_for_every_event(self, tmp_path):
+        """The allocation happens INSIDE `history`, so the caller must bound the ask.
+
+        With `limit=None` and a log past `MAX_RETAINED_EVENTS`, `history` builds every
+        event in the lifetime file into a list and reverses it before the caller sees
+        anything -- so no amount of care in this handler bounds it. The member log has
+        no rotation, so outgrowing the retained tail is ordinary ageing, and the
+        response it feeds shows `_ACTIVITY_LIMIT` rows.
+
+        The test above (1001 buried envelopes) proves paging still FINDS the records.
+        This one pins the reason paging exists: every ask carries a limit.
+        """
+        state = _make_state(tmp_path)
+        from unittest import mock
+
+        from kiro_crew.eventlog import service as svc_mod
+        from kiro_crew.eventlog import types as _types
+        from kiro_crew.members import record_activity, slug_for_name
+
+        assert record_activity(CREW, "dashboard_chat-1", "persistent", project="/repo", via="chat")
+        svc = svc_mod.get_service()
+        slug = slug_for_name(CREW)
+        for i in range(1001):
+            svc.append(slug, _types.MEMBER_MESSAGE, {"text": f"m{i}"})
+
+        asks: list[object] = []
+        real_history = type(svc).history
+
+        def _recording_history(self, slug_in, *, before=None, limit=None):
+            asks.append(limit)
+            return real_history(self, slug_in, before=before, limit=limit)
+
+        with _patched_config([CREW]):
+            with mock.patch.object(type(svc), "history", _recording_history):
+                async with TestClient(TestServer(_make_members_app(state))) as client:
+                    resp = await client.get(
+                        "/api/members/code-reviewer/activity", params={"member": CREW}
+                    )
+                    assert resp.status == 200
+                    data = await resp.json()
+
+        assert asks, "the endpoint did not read the log at all"
+        assert None not in asks, (
+            "the activity read asked for the whole log (limit=None); `history` then "
+            f"materialises the entire lifetime file before returning. asks={asks}"
+        )
+        assert all(
+            isinstance(a, int) and 0 < a <= 1000 for a in asks
+        ), f"an ask was not a small bounded page: {asks}"
+        # Still correct: the buried record is found despite the bounded asks.
+        assert len(asks) > 1, "1001 envelopes should have needed more than one page"
+        assert [e["project"] for e in data["entries"]] == ["/repo"]
+
+    @pytest.mark.asyncio
+    async def test_activity_survives_more_than_a_thousand_later_events(self, tmp_path):
+        """The cap applies to this member's ACTIVITY, not to a slice of the log.
+
+        One log carries config, binding, rules, message, slot and patrol events
+        beside activity records, and a colliding slug's log carries another exact
+        name's records too. Reading a fixed slice of the newest envelopes and
+        filtering afterwards therefore drops activity the drawer promises to show:
+        a member with a busy message history loses their whole timeline even though
+        the records are still in the log. The filter runs before any cap.
+        """
+        state = _make_state(tmp_path)
+        from kiro_crew.eventlog import types as _types
+        from kiro_crew.eventlog.service import get_service
+        from kiro_crew.members import record_activity, slug_for_name
+
+        assert record_activity(CREW, "dashboard_chat-1", "persistent", project="/repo", via="chat")
+        # Bury it behind more envelopes than the former read window held.
+        svc = get_service()
+        slug = slug_for_name(CREW)
+        for i in range(1001):
+            svc.append(slug, _types.MEMBER_MESSAGE, {"text": f"m{i}"})
+
+        with _patched_config([CREW]):
+            async with TestClient(TestServer(_make_members_app(state))) as client:
+                resp = await client.get(
+                    "/api/members/code-reviewer/activity", params={"member": CREW}
+                )
+                assert resp.status == 200
+                data = await resp.json()
+        assert len(data["entries"]) == 1, f"activity was cut off by the envelope read: {data}"
+        assert data["entries"][0]["project"] == "/repo"
+        assert data["capped"] is False
+
+    @pytest.mark.asyncio
     async def test_colliding_slugs_do_not_mix_histories(self, tmp_path):
         """Two names sharing a slug share a log file, never a timeline.
 
@@ -1417,10 +2471,6 @@ class TestMemberActivityRoute:
                 resp = await client.get("/api/members/code-reviewer/activity")
                 assert resp.status == 400
                 assert (await resp.json())["code"] == "missing_member"
-                bad = await client.get(
-                    "/api/members/code-reviewer/activity", params={"member": "no spaces!"}
-                )
-                assert bad.status == 400
 
     @pytest.mark.asyncio
     async def test_empty_log_and_invalid_slug(self, tmp_path):
@@ -1447,6 +2497,9 @@ class TestMemberActivityRoute:
 
         assert record_activity(CREW, "dashboard_chat-1", "persistent", via="chat")
         path = member_dir("code-reviewer") / ACTIVITY_FILE_NAME
+        # Only the LEGACY file lives in the member directory now -- the log moved
+        # under the fenced crew-log tree -- so nothing has created it yet.
+        path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "a", encoding="utf-8") as fh:
             fh.write(f'\n{{"ts": "not-a-date", "member": "{CREW}", "via": "chat"}}\n')
             fh.write(f'\n{{"ts": 1735689600, "member": "{CREW}", "via": "chat"}}\n')
@@ -1506,10 +2559,356 @@ class TestMemberActivityRoute:
         assert len(data["entries"]) == handler_mod._ACTIVITY_LIMIT
 
 
-class TestDenialAuditOffload:
-    """Deny-path SEL audits are direct enqueues since the startup warm (#8608).
+# The briefing read fails CLOSED on platforms without O_NOFOLLOW (Windows) --
+# see read_member_briefing. Tests asserting briefing CONTENT through the
+# endpoint are therefore POSIX-only; the fail-closed flag itself is what the
+# response's ``supported`` field carries on every platform.
+_requires_nofollow = pytest.mark.skipif(
+    not hasattr(os, "O_NOFOLLOW"),
+    reason="briefing reads fail closed without O_NOFOLLOW",
+)
 
-    The per-site ``asyncio.to_thread`` wrappers existed because a fresh
+
+class TestMemberBriefingEndpoint:
+    """GET /api/members/{slug}/briefing — the panel's read-only Notes tab feed."""
+
+    @staticmethod
+    def _write_briefing(text: str):
+        from kiro_crew.members import member_briefing_path
+
+        path = member_briefing_path("code-reviewer")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    @_requires_nofollow
+    @pytest.mark.asyncio
+    async def test_written_briefing_is_returned_with_its_mtime_and_path(self, tmp_path):
+        state = _make_state(tmp_path)
+        path = self._write_briefing("This week: crash-tagged issues first.\n")
+        with _patched_config([CREW]):
+            async with TestClient(TestServer(_make_members_app(state))) as client:
+                resp = await client.get(
+                    "/api/members/code-reviewer/briefing", params={"member": CREW}
+                )
+                assert resp.status == 200
+                data = await resp.json()
+        assert data["slug"] == "code-reviewer"
+        assert data["member"] == CREW
+        assert data["supported"] is True
+        assert data["text"] == "This week: crash-tagged issues first."
+        assert isinstance(data["updated_ts"], float)
+        assert abs(data["updated_ts"] - path.stat().st_mtime) < 5
+        # The response's field allowlist, pinned exactly: no file pointer --
+        # the panel offers no editor for an agent-written file.
+        assert set(data) == {
+            "slug",
+            "member",
+            "supported",
+            "text",
+            "updated_ts",
+            "redacted",
+            "truncated",
+        }
+        assert data["redacted"] is False
+        assert data["truncated"] is False
+
+    @pytest.mark.asyncio
+    async def test_no_briefing_yet_is_empty_not_404(self, tmp_path):
+        """A fresh crewmate has no notes; that is the normal state, not an error."""
+        state = _make_state(tmp_path)
+        with _patched_config([CREW]):
+            async with TestClient(TestServer(_make_members_app(state))) as client:
+                resp = await client.get(
+                    "/api/members/code-reviewer/briefing", params={"member": CREW}
+                )
+                assert resp.status == 200
+                data = await resp.json()
+        assert data["text"] == ""
+        assert data["updated_ts"] is None
+        # No file, no pointer: an Edit on a "not on disk" placeholder could later
+        # save that stale buffer over notes the crewmate wrote in the meantime.
+
+    @pytest.mark.asyncio
+    async def test_unsupported_platform_fails_closed_for_text_and_stamp_alike(
+        self, tmp_path, monkeypatch
+    ):
+        """Where the read fails closed (no O_NOFOLLOW), the stamp must too.
+
+        A response that says ``supported: false`` with an empty text but a real
+        ``updated_ts`` would let the panel date notes it just said it cannot
+        read; the two fields travel together.
+        """
+        state = _make_state(tmp_path)
+        self._write_briefing("Notes the platform cannot read safely.\n")
+        # Both the handler (module attribute) and the mtime helper (module global)
+        # resolve the gate through kiro_crew.members at call time.
+        monkeypatch.setattr("kiro_crew.members.member_briefing_supported", lambda: False)
+        with _patched_config([CREW]):
+            async with TestClient(TestServer(_make_members_app(state))) as client:
+                resp = await client.get(
+                    "/api/members/code-reviewer/briefing", params={"member": CREW}
+                )
+                assert resp.status == 200
+                data = await resp.json()
+        assert data["supported"] is False
+        assert data["text"] == ""
+        assert data["updated_ts"] is None
+
+    @_requires_nofollow
+    @pytest.mark.asyncio
+    async def test_symlinked_member_dir_never_reads_a_peer(self, tmp_path):
+        """A ``members/<slug>`` swapped for a symlink to a peer's directory is
+        refused by the pinned read: the text reads as no notes and the stamp is
+        ``null``, never the peer's file dated as this crewmate's."""
+
+        state = _make_state(tmp_path)
+        peer = members_root() / "peer"
+        peer.mkdir(parents=True)
+        (peer / "briefing.md").write_text("The peer's private notes.\n", encoding="utf-8")
+        link = members_root() / "code-reviewer"
+        link.symlink_to(peer, target_is_directory=True)
+        with _patched_config([CREW]):
+            async with TestClient(TestServer(_make_members_app(state))) as client:
+                resp = await client.get(
+                    "/api/members/code-reviewer/briefing", params={"member": CREW}
+                )
+                assert resp.status == 200
+                data = await resp.json()
+        assert data["text"] == ""
+        assert data["updated_ts"] is None
+        # The refused read yields no pointer at all -- least of all the peer's.
+
+    @pytest.mark.asyncio
+    async def test_colliding_slug_is_refused_not_shown_as_either_crewmates_notes(self, tmp_path):
+        """One briefing file per slug; two names on it belong to neither.
+
+        Rendering the shared file as one member's notes -- with an Edit that
+        saves over it -- would let the two crewmates overwrite each other, so
+        the read is refused for BOTH names with a coded 409.
+        """
+        state = _make_state(tmp_path)
+        self._write_briefing("Whose notes are these?\n")
+        other = "Code_Reviewer"  # distinct exact name, same derived slug
+        with _patched_config([CREW, other]):
+            async with TestClient(TestServer(_make_members_app(state))) as client:
+                for name in (CREW, other):
+                    resp = await client.get(
+                        "/api/members/code-reviewer/briefing", params={"member": name}
+                    )
+                    assert resp.status == 409
+                    assert (await resp.json())["code"] == "briefing_slug_ambiguous"
+
+    @pytest.mark.asyncio
+    async def test_member_must_derive_the_slug_and_exist(self, tmp_path):
+        state = _make_state(tmp_path)
+        with _patched_config([CREW, OTHER]):
+            async with TestClient(TestServer(_make_members_app(state))) as client:
+                mismatch = await client.get(
+                    "/api/members/code-reviewer/briefing", params={"member": OTHER}
+                )
+                assert mismatch.status == 400
+                assert (await mismatch.json())["code"] == "member_slug_mismatch"
+                gone = await client.get(
+                    "/api/members/nobody-here/briefing", params={"member": "nobody-here"}
+                )
+                assert gone.status == 404
+                assert (await gone.json())["code"] == "member_not_found"
+
+    @pytest.mark.asyncio
+    async def test_non_owner_dashboard_caller_is_refused_before_any_read(self, tmp_path):
+        """The briefing is the owner's to read, like the rules.
+
+        Any allowed Slack user can mint a dashboard session (``!dashboard``),
+        so the app-caller guard alone would hand a non-owner colleague the
+        crewmate's private notes. The owner gate answers first, so the refusal
+        costs no file IO -- the briefing on disk is never opened.
+        """
+        state = _make_state(tmp_path)
+        self._write_briefing("Owner-only working notes.\n")
+        with _patched_config([CREW]):
+            async with TestClient(TestServer(_make_members_app(state))) as client:
+                with patch(
+                    "kiro_crew.members.read_member_briefing_bounded",
+                    side_effect=AssertionError("read must not run for a non-owner"),
+                ):
+                    resp = await client.get(
+                        "/api/members/code-reviewer/briefing",
+                        params={"member": CREW},
+                        headers={"X-Test-User": "colleague"},
+                    )
+                assert resp.status == 403
+                assert (await resp.json())["code"] == "owner_only"
+
+    @pytest.mark.asyncio
+    async def test_invalid_slug_is_refused_before_any_file_io(self, tmp_path):
+        state = _make_state(tmp_path)
+        with _patched_config([CREW]):
+            async with TestClient(TestServer(_make_members_app(state))) as client:
+                bad = await client.get("/api/members/Bad_Slug!/briefing", params={"member": CREW})
+                assert bad.status == 400
+                assert (await bad.json())["code"] == "invalid_member_slug"
+
+    @pytest.mark.asyncio
+    async def test_member_param_is_required(self, tmp_path):
+        """The slug is lossy; the exact name is what the frontend keys its cache by."""
+        state = _make_state(tmp_path)
+        with _patched_config([CREW]):
+            async with TestClient(TestServer(_make_members_app(state))) as client:
+                resp = await client.get("/api/members/code-reviewer/briefing")
+                assert resp.status == 400
+                assert (await resp.json())["code"] == "missing_member"
+                # A name the display-name rule refuses (a tab) is "no member",
+                # not a mismatch; spaces alone are display text and pass.
+                bad = await client.get(
+                    "/api/members/code-reviewer/briefing", params={"member": "no\ttabs"}
+                )
+                assert bad.status == 400
+                assert (await bad.json())["code"] == "missing_member"
+
+    @pytest.mark.asyncio
+    async def test_app_tokens_are_denied_like_every_member_surface(self, tmp_path):
+        state = _make_state(tmp_path)
+        self._write_briefing("secret plans")
+
+        @web.middleware
+        async def _as_app(request: web.Request, handler):
+            request["app"] = "some-app"
+            return await handler(request)
+
+        app = _make_members_app(state)
+        app.middlewares.insert(0, _as_app)
+        with _patched_config([CREW]):
+            async with TestClient(TestServer(app)) as client:
+                resp = await client.get(
+                    "/api/members/code-reviewer/briefing", params={"member": CREW}
+                )
+                assert resp.status == 404
+                assert (await resp.json()) == {"error": "not found", "code": "not_found"}
+
+    @_requires_nofollow
+    @pytest.mark.asyncio
+    async def test_credentials_in_the_briefing_are_redacted_at_the_boundary(self, tmp_path):
+        """The briefing is an AGENT-written file; a token the crewmate pasted
+        into its own notes must not reach the browser verbatim."""
+        state = _make_state(tmp_path)
+        self._write_briefing("Deploy key for staging: AKIAIOSFODNN7EXAMPLE — rotate monthly.")
+        with _patched_config([CREW]):
+            async with TestClient(TestServer(_make_members_app(state))) as client:
+                resp = await client.get(
+                    "/api/members/code-reviewer/briefing", params={"member": CREW}
+                )
+                assert resp.status == 200
+                data = await resp.json()
+        assert "AKIAIOSFODNN7EXAMPLE" not in data["text"]
+        assert "rotate monthly" in data["text"]
+        # The flag is what lets the panel withhold Edit: the viewer's Save would
+        # otherwise write this redacted text over the original.
+        assert data["redacted"] is True
+
+    @_requires_nofollow
+    @pytest.mark.asyncio
+    async def test_secret_straddling_the_cap_never_leaks_its_prefix(self, tmp_path):
+        """The redaction runs over the bounded buffer BEFORE the character
+        cap: a token the cap would split in two is matched whole and
+        replaced, so no plaintext prefix crosses the wire, and the cut then
+        drops the trailing split word so nothing ends mid-token."""
+        state = _make_state(tmp_path)
+        lead = "word " * ((MEMBER_BRIEFING_MAX_CHARS - 10) // 5)  # ends 10 chars short
+        self._write_briefing(lead + "AKIAIOSFODNN7EXAMPLE rest of the line\n" + "tail\n" * 40)
+        with _patched_config([CREW]):
+            async with TestClient(TestServer(_make_members_app(state))) as client:
+                resp = await client.get(
+                    "/api/members/code-reviewer/briefing", params={"member": CREW}
+                )
+                assert resp.status == 200
+                data = await resp.json()
+        assert "AKIA" not in data["text"]
+        assert "briefing truncated" in data["text"]
+        assert data["redacted"] is True
+        assert data["truncated"] is True
+        # The shown text never ends in the first half of a word.
+        shown = data["text"].split("\n[... briefing truncated")[0]
+        assert shown == shown.rstrip() and not shown.endswith("wor")
+
+    @_requires_nofollow
+    @pytest.mark.asyncio
+    async def test_secret_past_the_read_bound_is_reported_as_truncated(self, tmp_path):
+        """A token past the bounded read is never seen, so ``redacted`` stays
+        false for it -- while the file viewer reads (and redacts) the whole
+        file and its Save would write the redacted tail back. ``truncated``
+        is the flag that lets the panel withhold Edit for that file too."""
+        state = _make_state(tmp_path)
+        self._write_briefing(
+            "y" * (MEMBER_BRIEFING_MAX_CHARS * 8) + "\nDeploy key: AKIAIOSFODNN7EXAMPLE\n"
+        )
+        with _patched_config([CREW]):
+            async with TestClient(TestServer(_make_members_app(state))) as client:
+                resp = await client.get(
+                    "/api/members/code-reviewer/briefing", params={"member": CREW}
+                )
+                assert resp.status == 200
+                data = await resp.json()
+        assert "AKIA" not in data["text"]
+        assert "briefing truncated" in data["text"]
+        assert data["redacted"] is False
+        assert data["truncated"] is True
+
+    @_requires_nofollow
+    @pytest.mark.asyncio
+    async def test_redaction_that_shrinks_below_the_cap_shows_the_whole_briefing(self, tmp_path):
+        """The cap is judged on the REDACTED length: a briefing that only ran
+        past the cap before its placeholders shrank it is shown whole -- no
+        marker, no word dropped, ``truncated`` false."""
+        state = _make_state(tmp_path)
+        lead = "word " * ((MEMBER_BRIEFING_MAX_CHARS - 400) // 5)
+        # Ten 60-char keys (~610 chars) push the raw text past the cap; each
+        # collapses to a 22-char placeholder, so the redacted text fits.
+        keys = " ".join("ghp_" + ("A" * 56) for _ in range(10))
+        self._write_briefing(lead + keys + " last\n")
+        with _patched_config([CREW]):
+            async with TestClient(TestServer(_make_members_app(state))) as client:
+                resp = await client.get(
+                    "/api/members/code-reviewer/briefing", params={"member": CREW}
+                )
+                assert resp.status == 200
+                data = await resp.json()
+        assert "ghp_" not in data["text"]
+        assert data["text"].endswith("last")
+        assert "briefing truncated" not in data["text"]
+        assert data["redacted"] is True
+        assert data["truncated"] is False
+
+    @pytest.mark.asyncio
+    async def test_successful_read_leaves_an_allowed_audit_row(self, tmp_path, monkeypatch):
+        """WHO read a crewmate's private notes matters as much as who was
+        refused (the rules read's posture): a denied-only trail cannot answer
+        "was this boundary disclosed"."""
+        state = _make_state(tmp_path)
+        self._write_briefing("Owner-only working notes.\n")
+        record: dict = {}
+
+        class _RecordingSel:
+            def log_api_access(self, **kwargs):
+                record["kwargs"] = kwargs
+
+        monkeypatch.setattr("kiro_crew.dashboard.handlers.sel", lambda: _RecordingSel())
+        with _patched_config([CREW]):
+            async with TestClient(TestServer(_make_members_app(state))) as client:
+                resp = await client.get(
+                    "/api/members/code-reviewer/briefing", params={"member": CREW}
+                )
+                assert resp.status == 200
+        assert record["kwargs"]["operation"] == "members.briefing.read"
+        assert record["kwargs"]["outcome"] == "allowed"
+        assert record["kwargs"]["source"] == "dashboard"
+        assert record["kwargs"]["resources"] == "slug=code-reviewer"
+
+
+class TestDenialAuditOffload:
+    """Deny-path SEL audits are direct enqueues, because startup warms SEL.
+
+    A per-site ``asyncio.to_thread`` wrapper would only be needed if a fresh
     gateway's first ``_sel()`` touch performed synchronous filesystem
     initialization (HMAC key load/create, chain-head read). That first touch
     now happens once at gateway startup (``sel.warm_sel_singleton``, awaited
@@ -1573,8 +2972,8 @@ class TestDenialAuditOffload:
         assert not state._slots
 
     def test_no_members_sel_audit_is_offloaded(self):
-        """AST guard (inverted from #8523 by #8608): no ``log_api_access``
-        call in members.py hides inside an ``asyncio.to_thread`` lambda.
+        """AST guard: no ``log_api_access`` call in members.py hides inside an
+        ``asyncio.to_thread`` lambda.
 
         The startup warm makes a post-init ``log_api_access`` a non-blocking
         enqueue, so a per-site thread hop is pure overhead — an extra
@@ -1615,3 +3014,550 @@ class TestDenialAuditOffload:
             "warmed at startup (sel.warm_sel_singleton), so a non-critical audit "
             "is a direct enqueue (#8608)"
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("conflict", ["linked", "store"])
+async def test_private_thread_conflict_names_its_actual_cause(tmp_path, monkeypatch, conflict):
+
+    from kiro_crew.config.loader import KiroCrewConfig
+    from kiro_crew.memory_stores import provision_member_memory
+
+    pass  # Member routing does not depend on OS isolation.
+
+    def configure():
+        cfg = KiroCrewConfig.load()
+        cfg.agents[CREW] = KiroCrewAgentConfig(kiro_agent=CREW)
+        provision_member_memory(cfg, CREW)
+        cfg.save()
+
+    await asyncio.to_thread(configure)
+    state = _make_state(tmp_path)
+    finished = asyncio.Event()
+    task = None
+    try:
+        async with TestClient(TestServer(_make_members_app(state))) as client:
+            opened = await client.post(f"/api/members/{CREW}/thread")
+            assert opened.status == 200, await opened.text()
+            slot = state._slots[(await opened.json())["slot_key"]]
+            if conflict == "linked":
+                slot.linked_session_key = "slack:other-session"
+            else:
+                task = asyncio.create_task(finished.wait())
+                slot._task = task
+                slot.memory_store = ""
+            response = await client.post(f"/api/members/{CREW}/thread")
+            assert response.status == 409
+            body = await response.json()
+            assert body["code"] == "member_slot_conflict"
+            expected = (
+                "the member thread is linked to another session"
+                if conflict == "linked"
+                else "the member thread has a different member memory assignment"
+            )
+            assert body["error"] == expected
+            assert "running" not in body["error"]
+    finally:
+        finished.set()
+        if task is not None:
+            await asyncio.wait_for(task, 5)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "running, fault",
+    [
+        (False, ""),
+        (True, ""),
+        (True, "linked"),
+        (True, "memory"),
+        (True, "assignment_missing"),
+        (True, "assignment_other"),
+        (True, "binding_missing"),
+        (True, "binding_other_slot"),
+        (True, "race_replaced"),
+        (True, "race_linked"),
+        (True, "race_agent"),
+        (True, "race_mode"),
+        (True, "race_memory"),
+    ],
+)
+async def test_reopen_bound_private_thread_preserves_active_turn(
+    tmp_path, monkeypatch, running, fault
+):
+    """Opening the same pinned DM must not interrupt or reassign its active turn."""
+    from kiro_crew.config.loader import KiroCrewConfig
+    from kiro_crew.member_memory_auth import read_private_session_store
+    from kiro_crew.memory_stores import provision_member_memory
+
+    cfg = KiroCrewConfig.load()
+    cfg.agents[CREW] = KiroCrewAgentConfig(kiro_agent=CREW)
+    await asyncio.to_thread(provision_member_memory, cfg, CREW)
+    await asyncio.to_thread(cfg.save)
+    state = _make_state(tmp_path)
+    async with TestClient(TestServer(_make_members_app(state))) as client:
+        first = await client.post(f"/api/members/{CREW}/thread")
+        assert first.status == 200, await first.text()
+        opened = await first.json()
+        slot = state._slots[opened["slot_key"]]
+        session_key = f"dashboard:{slot.key}"
+        assigned = await asyncio.to_thread(read_private_session_store, session_key)
+        assert assigned == cfg.agents[CREW].memory_store
+        binding = await asyncio.to_thread(read_dm_binding, CREW)
+        release = asyncio.Event()
+        task = asyncio.create_task(release.wait()) if running else None
+        slot.task = task
+        if fault == "linked":
+            slot.linked_session_key = "dashboard:other-session"
+        elif fault == "memory":
+            slot.memory_store = "member-other"
+        loop = asyncio.get_running_loop()
+        raced = threading.Event()
+
+        def change_identity():
+            if fault == "race_replaced":
+                from kiro_crew.dashboard.state import _ChatSlot
+
+                state._slots[slot.key] = _ChatSlot(slot.key, agent=CREW, mode=DM_SLOT_MODE)
+            elif fault == "race_linked":
+                slot.linked_session_key = "dashboard:other-session"
+            elif fault == "race_agent":
+                slot.agent = OTHER
+            elif fault == "race_mode":
+                slot.mode = ""
+            elif fault == "race_memory":
+                slot.memory_store = "member-other"
+            raced.set()
+
+        def read_assignment(key):
+            if key == session_key:
+                if fault == "assignment_missing":
+                    return None
+                if fault == "assignment_other":
+                    return "member-other"
+                if fault.startswith("race_"):
+                    loop.call_soon_threadsafe(change_identity)
+                    assert raced.wait(timeout=5)
+            return read_private_session_store(key)
+
+        monkeypatch.setattr(
+            "kiro_crew.member_memory_auth.read_private_session_store", read_assignment
+        )
+        if fault in {"binding_missing", "binding_other_slot"}:
+            reported_binding = (
+                None if fault == "binding_missing" else dict(binding, slot_key="member-other")
+            )
+            monkeypatch.setattr("kiro_crew.members.read_dm_binding", lambda slug: reported_binding)
+        if running:
+            slot._memory_assignment_from_history = False
+        assignment_flag = slot._memory_assignment_from_history
+        pin = AsyncMock(side_effect=AssertionError("running thread was re-pinned"))
+        if running:
+            monkeypatch.setattr("kiro_crew.dashboard.handlers.members.pin_private_agent_store", pin)
+        try:
+            reopened = await client.post(f"/api/members/{CREW}/thread")
+            body = await reopened.json()
+            assert (state._slots[slot.key] is slot) is (fault != "race_replaced")
+            assert slot.task is task
+            assert slot.running is running
+            expected_store = "member-other" if fault in {"memory", "race_memory"} else assigned
+            assert slot.memory_store == expected_store
+            assert await asyncio.to_thread(read_dm_binding, CREW) == binding
+            assert await asyncio.to_thread(read_private_session_store, session_key) == assigned
+            if running:
+                pin.assert_not_awaited()
+                assert slot._memory_assignment_from_history == assignment_flag
+            if fault:
+                assert reopened.status == 409, body
+                assert body["code"] == "member_slot_conflict"
+                if fault.startswith("race_"):
+                    assert raced.is_set()
+            else:
+                assert reopened.status == 200, body
+                assert body == opened
+        finally:
+            release.set()
+            if task is not None:
+                await task
+            slot.task = None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "member_deleted",
+        "member_recreated",
+        "config_lock_order",
+        "store_rebound",
+        "store_missing",
+        "store_version",
+        "store_owner",
+        "store_shared",
+        "binding_missing",
+        "binding_member",
+        "binding_malformed",
+        "manifest_owner",
+        "manifest_missing",
+        "config_malformed",
+    ],
+)
+async def test_running_private_thread_refuses_ownership_changed_during_read(
+    tmp_path, monkeypatch, fault
+):
+    """A completed owner change must invalidate an in-flight, read-only reopen."""
+    from kiro_crew.config.loader import KiroCrewConfig
+    from kiro_crew.dashboard.handlers import agents
+    from kiro_crew.member_memory_auth import read_private_session_store
+    from kiro_crew.memory_stores import memory_stores_root, provision_member_memory
+
+    cfg = KiroCrewConfig.load()
+    cfg.agents[CREW] = KiroCrewAgentConfig(kiro_agent=CREW)
+    store = await asyncio.to_thread(provision_member_memory, cfg, CREW)
+    await asyncio.to_thread(cfg.save)
+    state = _make_state(tmp_path)
+    app = _make_members_app(state)
+    app.router.add_delete("/api/agents/{name}", agents.api_kirocrew_agent_delete)
+    monkeypatch.setattr(agents, "_refresh_session_defaults", AsyncMock())
+    async with TestClient(TestServer(app)) as client:
+        first = await client.post(f"/api/members/{CREW}/thread")
+        assert first.status == 200, await first.text()
+        slot = state._slots[(await first.json())["slot_key"]]
+        session_key = f"dashboard:{slot.key}"
+        entered = asyncio.Event()
+        resume = threading.Event()
+        release_turn = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        task = asyncio.create_task(release_turn.wait())
+        slot.task = task
+        slot._memory_assignment_from_history = False
+        reopen = None
+        config_lock = agents._get_config_lock()
+        config_requested = asyncio.Event()
+
+        def observed_config_lock():
+            config_requested.set()
+            assert not slot._lock.locked(), "reopen inverted config/slot lock order"
+            return config_lock
+
+        if fault == "config_lock_order":
+            monkeypatch.setattr(agents, "_get_config_lock", observed_config_lock)
+
+        def paused_read(key):
+            assigned = read_private_session_store(key)
+            if key == session_key:
+                loop.call_soon_threadsafe(entered.set)
+                assert resume.wait(timeout=5), "reopen read was not released"
+            return assigned
+
+        def change_ownership():
+            current = KiroCrewConfig.load()
+            if fault == "config_lock_order":
+                del current.agents[CREW]
+            elif fault == "store_rebound":
+                current.agents[CREW].memory_store = "default"
+            elif fault == "store_missing":
+                del current.memory_stores[store]
+            elif fault == "store_version":
+                current.memory_stores[store].memory_version = 1
+            elif fault == "store_owner":
+                current.memory_stores[store].owner_member = OTHER
+            elif fault == "store_shared":
+                current.agents[OTHER] = KiroCrewAgentConfig(memory_store=store)
+            elif fault == "binding_missing":
+                dm_binding_path(CREW).unlink()
+            elif fault == "binding_member":
+                path = dm_binding_path(CREW)
+                row = json.loads(path.read_text(encoding="utf-8"))
+                row["member"] = OTHER
+                row["member_id"] = OTHER
+                path.write_text(json.dumps(row), encoding="utf-8")
+            elif fault == "binding_malformed":
+                dm_binding_path(CREW).write_text("{invalid", encoding="utf-8")
+            elif fault == "manifest_owner":
+                # The store's owner identity lives in the SQLite
+                # ``member_database`` row, not a JSON manifest: flip the stored
+                # member_id so the reopen's identity read mismatches its
+                # declaration.
+                from kiro_crew.memory_stores import MEMORY_DB_FILE
+                from kiro_crew.vector_memory import sqlite3
+
+                database = memory_stores_root() / store / MEMORY_DB_FILE
+                connection = sqlite3.connect(database)
+                try:
+                    connection.execute(
+                        "UPDATE member_database SET member_id=? WHERE singleton=1", (OTHER,)
+                    )
+                    connection.commit()
+                finally:
+                    connection.close()
+            elif fault == "manifest_missing":
+                from kiro_crew.memory_stores import MEMORY_DB_FILE
+
+                (memory_stores_root() / store / MEMORY_DB_FILE).unlink()
+            elif fault == "config_malformed":
+                from kiro_crew.config.loader import config_path
+
+                config_path().write_text("{invalid", encoding="utf-8")
+                return
+            current.save()
+
+        monkeypatch.setattr("kiro_crew.member_memory_auth.read_private_session_store", paused_read)
+        pin = AsyncMock(side_effect=AssertionError("running thread was re-pinned"))
+        monkeypatch.setattr("kiro_crew.dashboard.handlers.members.pin_private_agent_store", pin)
+        try:
+            reopen = asyncio.create_task(client.post(f"/api/members/{CREW}/thread"))
+            await asyncio.wait_for(entered.wait(), timeout=5)
+            if fault in {"member_deleted", "member_recreated"}:
+                deleted = await asyncio.wait_for(client.delete(f"/api/agents/{CREW}"), timeout=5)
+                assert deleted.status == 200, await deleted.text()
+                current = await asyncio.to_thread(KiroCrewConfig.load)
+                assert CREW not in current.agents
+                if fault == "member_recreated":
+                    current.agents[CREW] = KiroCrewAgentConfig(kiro_agent=CREW)
+                    replacement = await asyncio.to_thread(provision_member_memory, current, CREW)
+                    assert replacement != store
+                    await asyncio.to_thread(current.save)
+            elif fault == "config_lock_order":
+                async with config_lock:
+                    resume.set()
+                    await asyncio.wait_for(config_requested.wait(), timeout=5)
+                    # A config writer must still be able to take the slot lock.
+                    await asyncio.wait_for(slot._lock.acquire(), timeout=5)
+                    try:
+                        await asyncio.to_thread(change_ownership)
+                    finally:
+                        slot._lock.release()
+            else:
+                await asyncio.to_thread(change_ownership)
+            binding_after_change = await asyncio.to_thread(read_dm_binding, CREW)
+            resume.set()
+            response = await asyncio.wait_for(reopen, timeout=5)
+            body = await response.json()
+            assert state._slots[slot.key] is slot
+            assert slot.task is task and slot.running
+            assert slot.agent == CREW and slot.mode == DM_SLOT_MODE
+            assert slot.memory_store == store
+            assert not slot._memory_assignment_from_history
+            pin.assert_not_awaited()
+            assert await asyncio.to_thread(read_private_session_store, session_key) == store
+            assert await asyncio.to_thread(read_dm_binding, CREW) == binding_after_change
+            assert response.status == 409, body
+            assert body["code"] == "member_slot_conflict"
+        finally:
+            resume.set()
+            release_turn.set()
+            if reopen is not None:
+                await asyncio.wait_for(asyncio.gather(reopen, return_exceptions=True), timeout=5)
+            await asyncio.wait_for(task, timeout=5)
+            slot.task = None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "initial_running, final_running, fault",
+    [
+        (False, True, ""),
+        (False, True, "member_deleted"),
+        (False, True, "member_recreated"),
+        (False, True, "store_rebound"),
+        (False, False, ""),
+        (True, False, ""),
+    ],
+)
+async def test_private_thread_reopen_rechecks_running_after_slot_lock(
+    tmp_path, monkeypatch, initial_running, final_running, fault
+):
+    """A queued idle opener cannot reuse an unchecked running identity."""
+    from kiro_crew.config.loader import KiroCrewConfig
+    from kiro_crew.dashboard.handlers import agents, members
+    from kiro_crew.member_memory_auth import read_private_session_store
+    from kiro_crew.memory_stores import provision_member_memory
+
+    cfg = KiroCrewConfig.load()
+    cfg.agents[CREW] = KiroCrewAgentConfig(kiro_agent=CREW)
+    store = await asyncio.to_thread(provision_member_memory, cfg, CREW)
+    await asyncio.to_thread(cfg.save)
+    state = _make_state(tmp_path)
+    app = _make_members_app(state)
+    app.router.add_delete("/api/agents/{name}", agents.api_kirocrew_agent_delete)
+    monkeypatch.setattr(agents, "_refresh_session_defaults", AsyncMock())
+    async with TestClient(TestServer(app)) as client:
+        first = await client.post(f"/api/members/{CREW}/thread")
+        assert first.status == 200, await first.text()
+        opened = await first.json()
+        slot = state._slots[opened["slot_key"]]
+        session_key = f"dashboard:{slot.key}"
+        waiting = asyncio.Event()
+        release_turn = asyncio.Event()
+
+        class ObservedLock(asyncio.Lock):
+            async def acquire(self):
+                if self.locked():
+                    waiting.set()
+                return await super().acquire()
+
+        monkeypatch.setattr(slot, "_lock", ObservedLock())
+        task = asyncio.create_task(release_turn.wait()) if initial_running else None
+        slot.task = task
+        slot._memory_assignment_from_history = False
+        pin = AsyncMock(wraps=members.pin_private_agent_store)
+        monkeypatch.setattr(members, "pin_private_agent_store", pin)
+        reopen = None
+        try:
+            async with slot._lock:
+                assert slot.running is initial_running
+                reopen = asyncio.create_task(client.post(f"/api/members/{CREW}/thread"))
+                await asyncio.wait_for(waiting.wait(), timeout=5)
+                assert not reopen.done(), "opener did not wait for the held slot lock"
+                if final_running:
+                    task = asyncio.create_task(release_turn.wait())
+                    slot.task = task
+                elif task is not None:
+                    release_turn.set()
+                    await asyncio.wait_for(task, timeout=5)
+                assert slot.running is final_running
+                if fault in {"member_deleted", "member_recreated"}:
+                    deleted = await asyncio.wait_for(
+                        client.delete(f"/api/agents/{CREW}"), timeout=5
+                    )
+                    assert deleted.status == 200, await deleted.text()
+                    current = await asyncio.to_thread(KiroCrewConfig.load)
+                    assert CREW not in current.agents
+                    if fault == "member_recreated":
+                        current.agents[CREW] = KiroCrewAgentConfig(kiro_agent=CREW)
+                        replacement = await asyncio.to_thread(
+                            provision_member_memory, current, CREW
+                        )
+                        assert replacement != store
+                        await asyncio.to_thread(current.save)
+                elif fault == "store_rebound":
+                    current = await asyncio.to_thread(KiroCrewConfig.load)
+                    current.agents[CREW].memory_store = "default"
+                    await asyncio.to_thread(current.save)
+                binding_after_change = await asyncio.to_thread(read_dm_binding, CREW)
+            response = await asyncio.wait_for(reopen, timeout=5)
+            body = await response.json()
+            assert state._slots[slot.key] is slot
+            assert slot.task is task and slot.running is final_running
+            assert slot.agent == CREW and slot.mode == DM_SLOT_MODE
+            assert slot.memory_store == store
+            assert await asyncio.to_thread(read_private_session_store, session_key) == store
+            assert await asyncio.to_thread(read_dm_binding, CREW) == binding_after_change
+            if initial_running or final_running:
+                pin.assert_not_awaited()
+                assert not slot._memory_assignment_from_history
+            else:
+                pin.assert_awaited_once()
+            if final_running and fault:
+                assert response.status == 409, body
+                assert body["code"] == "member_slot_conflict"
+                assert not task.done() and not task.cancelled()
+            elif final_running:
+                # The turn started during the lock wait and ownership is
+                # unchanged, so the re-dispatch into the running path validates
+                # it and returns the live thread. A conflict here would be one
+                # the caller could only clear by retrying the same request.
+                assert response.status == 200, body
+                assert body == opened
+                assert not task.done() and not task.cancelled()
+            else:
+                assert response.status == 200, body
+                assert body == opened
+        finally:
+            release_turn.set()
+            if reopen is not None:
+                await asyncio.wait_for(asyncio.gather(reopen, return_exceptions=True), timeout=5)
+            if task is not None:
+                await asyncio.wait_for(task, timeout=5)
+            slot.task = None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault", ["", "store_rebound"])
+async def test_private_thread_reopen_rechecks_running_after_assignment(
+    tmp_path, monkeypatch, fault
+):
+    """A turn starting DURING the pin must not be answered by the assignment path.
+
+    ``slot._lock`` does not exclude turn dispatch -- ``api_chat`` reads
+    ``slot.running`` and publishes ``slot.task`` without taking it -- so the
+    window this covers is the ``await`` on the namespaced assignment, not the
+    wait for the lock that
+    :func:`test_private_thread_reopen_rechecks_running_after_slot_lock` covers.
+    The route must notice the turn afterwards and answer through the read-only
+    reopen path, which revalidates CURRENT ownership: with the member's store
+    repointed in that same window, the assignment path's identity-only snapshot
+    would publish and return 200 instead.
+    """
+    from kiro_crew.config.loader import KiroCrewConfig
+    from kiro_crew.dashboard.handlers import agents, members
+    from kiro_crew.member_memory_auth import read_private_session_store
+    from kiro_crew.memory_stores import provision_member_memory
+
+    cfg = KiroCrewConfig.load()
+    cfg.agents[CREW] = KiroCrewAgentConfig(kiro_agent=CREW)
+    store = await asyncio.to_thread(provision_member_memory, cfg, CREW)
+    await asyncio.to_thread(cfg.save)
+    state = _make_state(tmp_path)
+    app = _make_members_app(state)
+    monkeypatch.setattr(agents, "_refresh_session_defaults", AsyncMock())
+    async with TestClient(TestServer(app)) as client:
+        first = await client.post(f"/api/members/{CREW}/thread")
+        assert first.status == 200, await first.text()
+        opened = await first.json()
+        slot = state._slots[opened["slot_key"]]
+        session_key = f"dashboard:{slot.key}"
+        pinned = asyncio.Event()
+        release_pin = asyncio.Event()
+        real_pin = members.pin_private_agent_store
+
+        async def gated_pin(*args, **kwargs):
+            # Publish first, THEN hold: the window under test opens after the
+            # assignment has been made and before the route acts on it.
+            result = await real_pin(*args, **kwargs)
+            pinned.set()
+            await release_pin.wait()
+            return result
+
+        monkeypatch.setattr(members, "pin_private_agent_store", gated_pin)
+        slot.task = None
+        slot.memory_store = store
+        turn = None
+        reopen = None
+        try:
+            assert not slot.running
+            reopen = asyncio.create_task(client.post(f"/api/members/{CREW}/thread"))
+            await asyncio.wait_for(pinned.wait(), timeout=5)
+            assert not reopen.done(), "opener did not reach the gated assignment"
+            # The turn dispatch this route cannot lock out.
+            turn = asyncio.create_task(release_pin.wait())
+            slot.task = turn
+            assert slot.running
+            if fault == "store_rebound":
+                current = await asyncio.to_thread(KiroCrewConfig.load)
+                current.agents[CREW].memory_store = "default"
+                await asyncio.to_thread(current.save)
+            binding_after_change = await asyncio.to_thread(read_dm_binding, CREW)
+            release_pin.set()
+            response = await asyncio.wait_for(reopen, timeout=5)
+            body = await response.json()
+            assert state._slots[slot.key] is slot
+            assert slot.task is turn
+            assert slot.agent == CREW and slot.mode == DM_SLOT_MODE
+            assert slot.memory_store == store
+            assert await asyncio.to_thread(read_private_session_store, session_key) == store
+            assert await asyncio.to_thread(read_dm_binding, CREW) == binding_after_change
+            if fault:
+                assert response.status == 409, body
+                assert body["code"] == "member_slot_conflict"
+            else:
+                assert response.status == 200, body
+                assert body == opened
+        finally:
+            release_pin.set()
+            if reopen is not None:
+                await asyncio.wait_for(asyncio.gather(reopen, return_exceptions=True), timeout=5)
+            if turn is not None:
+                await asyncio.wait_for(turn, timeout=5)
+            slot.task = None

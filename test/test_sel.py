@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import hashlib
+import hmac
 import inspect
 import json
 import os
@@ -124,7 +126,7 @@ def _fill_until_over_cap(log: SecurityEventLog, *, deadline: float, start: int) 
     can itself enter the rotation window and rotate, resetting the live log to
     nearly empty. Both are harness properties, not defects, so the over-the-cap
     precondition is established by topping up in small batches rather than
-    asserted after one fixed fill (#5017). Bounded by *deadline* and by
+    asserted after one fixed fill. Bounded by *deadline* and by
     ``_POLL_ITERATION_CAP``; the diagnostic reports the pending-queue depth so
     a wedged writer is distinguishable from a rotation problem.
 
@@ -244,6 +246,35 @@ class TestEventLogging:
         data = json.loads(sel_file.read_text(encoding="utf-8").strip())
         assert data["event_type"] == "api_access"
         assert data["source"] == "dashboard"
+
+    def test_log_api_access_redacts_and_clips_outcome(self, log, sel_dir):
+        """``outcome`` is scrubbed like ``resources``/``error``, not forwarded raw.
+
+        It reads as a constrained vocabulary, and is one for in-tree callers, but
+        an installed app reaches this helper through ``ctx.audit`` -- so the value
+        can be caller text. This log is append-only and served over
+        ``/api/sel/events``, so a credential landing here cannot be taken back.
+        """
+        log.log_api_access(
+            caller="app:doc-store",
+            operation="doc-store.publish",
+            outcome="failed for AKIAIOSFODNN7EXAMPLE " + "x" * 900,
+        )
+        sel_file = sel_dir / "security_events.jsonl"
+        data = json.loads(sel_file.read_text(encoding="utf-8").strip())
+        assert "AKIAIOSFODNN7EXAMPLE" not in data["outcome"]
+        assert len(data["outcome"]) <= 500
+
+    @pytest.mark.parametrize(
+        "outcome", ["ok", "allowed", "denied", "completed", "rejected", "failed"]
+    )
+    def test_log_api_access_leaves_a_real_outcome_unaltered(self, log, sel_dir, outcome):
+        # The scrub above must be the identity function on every spelling in-tree
+        # code writes, or it would rewrite the meaning of existing audit rows.
+        log.log_api_access(caller="token:abc", operation="GET /api/x", outcome=outcome)
+        sel_file = sel_dir / "security_events.jsonl"
+        data = json.loads(sel_file.read_text(encoding="utf-8").strip())
+        assert data["outcome"] == outcome
 
     def test_resources_truncated(self, log, sel_dir):
         long_resource = "x" * 1000
@@ -556,12 +587,15 @@ log.flush()
     def test_appends_survive_when_the_trust_dir_is_uncreatable(self, tmp_path):
         """A legacy install that cannot create trust/ must keep auditing.
 
-        When the key loader falls back to the deny-list-protected legacy key
-        (read-only config dir, uncreatable trust dir), the chain lock must
-        follow it there — locking the legacy key file itself — instead of
-        retrying the mkdir on every append, which would drop every best-effort
-        audit and deny every critical action on an install that is otherwise
-        signing fine.
+        The sidecar's directory is uncreatable here, so the chain lock falls
+        back to the deny-list-protected legacy key file instead of failing every
+        acquire, which would drop every best-effort audit and deny every
+        critical action on an install that is otherwise signing fine. What
+        admits the fallback is that this process RESOLVED its key at the legacy
+        location, an install-wide fact settled once at init -- not the legacy
+        file's mere existence, which the audited agent can arrange on a healthy
+        install (see
+        ``test_a_planted_legacy_key_does_not_arm_the_fallback_on_a_healthy_install``).
         """
         legacy = tmp_path / kiro_crew_sel._HMAC_KEY_FILE
         # Windows' CRT text mode treats a trailing 0x1A as DOS EOF. Keep this
@@ -580,6 +614,10 @@ log.flush()
         with patch.object(Path, "mkdir", uncreatable_trust):
             log = SecurityEventLog(base_dir=tmp_path, sync=True)
             assert log._hmac_key_file == legacy, "precondition: fallback not taken"
+            assert log._chain_lock_target() == (legacy, False, None), (
+                "the fallback must lock the existing legacy key, never create it, "
+                "and carry no directory pin (its parent is the operator's log dir)"
+            )
             log.log(_make_event(event_id="legacy-lock-crit"), critical=True)
             log.log(_make_event(event_id="legacy-lock-soft"))
 
@@ -590,18 +628,228 @@ log.flush()
         # The key bytes are untouched: the lock fd is never written through.
         assert legacy.read_bytes() == log._hmac_key
 
-    def test_fresh_sidecar_is_primed_for_byte_range_locking(self, tmp_path):
-        """A fresh sidecar must not be empty after its first use.
+    def test_lock_path_does_not_vary_with_the_keys_migration_state(self, tmp_path):
+        """Two processes on one log directory must lock the SAME inode.
 
-        Windows locks a byte RANGE (msvcrt.locking on byte 0), so an empty
-        sidecar has nothing to lock -- best-effort audits would vanish and
-        critical actions would be denied on every fresh Windows install. Same
-        priming the rotation lock already does for itself.
+        The key's location differs BETWEEN processes mid-migration: one whose
+        migration failed keeps signing from the legacy path while a sibling that
+        completed it reads the relocated one. A lock path derived from the key
+        hands those two writers locks on different inodes, and both then append
+        to one log unserialized -- the chain fork this serialization exists to
+        prevent. The sidecar's path is a function of the log directory alone, so
+        both states yield one value.
         """
         log = SecurityEventLog(base_dir=tmp_path, sync=True)
-        log.log(_make_event(event_id="prime-1"))
+        migrated = tmp_path / kiro_crew_sel._TRUST_SUBDIR / kiro_crew_sel._HMAC_KEY_FILE
+        legacy = tmp_path / kiro_crew_sel._HMAC_KEY_FILE
         sidecar = tmp_path / kiro_crew_sel._TRUST_SUBDIR / kiro_crew_sel._SEL_LOCK_FILE
-        assert sidecar.stat().st_size >= 1, "sidecar left empty; unlockable on Windows"
+
+        log._hmac_key_file = migrated
+        as_migrated = log._chain_lock_path()
+        log._hmac_key_file = legacy
+        as_legacy = log._chain_lock_path()
+
+        assert (
+            as_migrated == as_legacy
+        ), "the chain lock path diverges between two processes on one log dir"
+        assert as_legacy == sidecar
+        assert as_legacy != legacy, "the lock is taken on the HMAC key itself"
+
+    def test_the_fallback_never_creates_a_file_at_the_legacy_key_path(self, tmp_path):
+        """No acquire may leave a 0-byte file where the HMAC key belongs.
+
+        That artifact is what destroys the key: the migration block promotes a
+        legacy file over the destination, so a 0-byte one created here replaces
+        the key that signed every existing record, and the minimum-length check
+        then fails init on every later boot. With the sidecar's directory gone
+        and no legacy key to fall back to, the acquire must fail instead of
+        creating one.
+        """
+        log = SecurityEventLog(base_dir=tmp_path, sync=True)
+        log.log(_make_event(event_id="nocreate-1"))
+        legacy = tmp_path / kiro_crew_sel._HMAC_KEY_FILE
+        trust = tmp_path / kiro_crew_sel._TRUST_SUBDIR
+        assert not legacy.exists(), "precondition: the key migrated out of the log dir"
+
+        real_mkdir = Path.mkdir
+
+        def uncreatable_trust(self, *args, **kwargs):
+            if self == trust:
+                raise PermissionError("read-only config dir")
+            return real_mkdir(self, *args, **kwargs)
+
+        with patch.object(Path, "mkdir", uncreatable_trust):
+            with pytest.raises(OSError):
+                log._chain_lock_target()
+
+        assert not legacy.exists(), "an empty file was created at the legacy key path"
+
+    def test_a_planted_legacy_key_does_not_arm_the_fallback_on_a_healthy_install(
+        self, tmp_path
+    ):
+        """The agent must not be able to CREATE the condition that switches targets.
+
+        ``sel_hmac.key`` is a sandbox read-write leaf (``sandbox.py``'s
+        ``_CREW_SANDBOX_VISIBLE_LEAVES``, alongside ``trust``), so the audited
+        agent can drop a file at the legacy key path on an install whose trust
+        dir is perfectly healthy -- and the lock path never reads its bytes, so
+        any content is enough. Were the fallback gated on that file EXISTING, the
+        agent could arm it at will and then refuse one writer's acquire, leaving
+        that writer on the legacy key while its sibling held the sidecar: two
+        flocks on two inodes, a permanently forked chain, and
+        ``verify_integrity`` reporting honest later records as tampered.
+
+        This process signs from ``trust/``, so the refusal must fail CLOSED.
+        """
+        log = SecurityEventLog(base_dir=tmp_path, sync=True)
+        log.log(_make_event(event_id="planted-1"))
+        legacy = tmp_path / kiro_crew_sel._HMAC_KEY_FILE
+        trust = tmp_path / kiro_crew_sel._TRUST_SUBDIR
+        assert log._hmac_key_file == trust / kiro_crew_sel._HMAC_KEY_FILE, (
+            "precondition: this process signs from the trust dir"
+        )
+
+        # The agent plants a long-enough file at the legacy key path.
+        legacy.write_bytes(b"p" * 64)
+
+        real_mkdir = Path.mkdir
+
+        def uncreatable_trust(self, *args, **kwargs):
+            if self == trust:
+                raise PermissionError("agent-triggered refusal")
+            return real_mkdir(self, *args, **kwargs)
+
+        with patch.object(Path, "mkdir", uncreatable_trust):
+            with pytest.raises(OSError):
+                log._chain_lock_target()
+
+        # The planted file was neither locked nor rewritten.
+        assert legacy.read_bytes() == b"p" * 64
+
+    def test_a_mid_acquire_directory_swap_fails_closed_instead_of_switching_targets(
+        self, tmp_path
+    ):
+        """A per-acquire refusal may never select a different lock target.
+
+        The two screens before the pin are properties of the filesystem, so
+        every writer on the install reads them alike. ``_pin_lock_dir`` is the
+        opposite by construction: it raises exactly when it catches ``trust``
+        being REPLACED mid-acquire, which the audited agent triggers at will and
+        which can therefore be true for one writer and false for the next.
+        Routing it into the legacy fallback would hand those two writers
+        different inodes on a healthy install -- the fork this serialization
+        exists to prevent -- so a detected swap has one safe answer: fail.
+
+        Pinned here with a legacy key present AND this process signing from it,
+        the most permissive state the fallback has, to show the pin's refusal is
+        not admitted by either condition.
+        """
+        legacy = tmp_path / kiro_crew_sel._HMAC_KEY_FILE
+        legacy.write_bytes(b"k" * 64)
+        trust = tmp_path / kiro_crew_sel._TRUST_SUBDIR
+
+        real_mkdir = Path.mkdir
+
+        def uncreatable_trust(self, *args, **kwargs):
+            if self == trust:
+                raise PermissionError("read-only config dir")
+            return real_mkdir(self, *args, **kwargs)
+
+        with patch.object(Path, "mkdir", uncreatable_trust):
+            log = SecurityEventLog(base_dir=tmp_path, sync=True)
+        assert log._hmac_key_file == legacy, "precondition: signing at the legacy path"
+        # The static screens now pass, so only the pin can refuse.
+        healthy_path, _, healthy_fd = log._chain_lock_target()
+        if healthy_fd is not None:
+            os.close(healthy_fd)
+        assert healthy_path == trust / kiro_crew_sel._SEL_LOCK_FILE, (
+            "precondition: the healthy path is reached once trust/ is creatable"
+        )
+
+        def swapped(_path):
+            raise OSError("directory is not the directory its name points at")
+
+        with patch.object(sel_mod, "_pin_lock_dir", swapped):
+            with pytest.raises(OSError):
+                log._chain_lock_target()
+
+        assert legacy.read_bytes() == b"k" * 64, "the legacy key was locked or rewritten"
+
+    def test_a_byte_range_lock_excludes_on_a_zero_length_file(self, tmp_path):
+        """The premise the empty lock sidecar rests on.
+
+        The chain-lock sidecar is never written through, so it can be zero
+        length when a writer locks it. A byte-range lock must still cover byte 0
+        of an empty file and exclude a second descriptor; if a platform ever
+        stops honouring that, SEL writers would silently stop serializing, so it
+        is asserted here rather than assumed.
+        """
+        lock_path = tmp_path / "empty.lock"
+        holder = os.open(lock_path, os.O_CREAT | os.O_RDWR | getattr(os, "O_BINARY", 0), 0o600)
+        contender = os.open(lock_path, os.O_RDWR | getattr(os, "O_BINARY", 0))
+        try:
+            assert os.fstat(holder).st_size == 0, "precondition: the file is empty"
+            assert platform_compat.try_acquire_lock(holder, exclusive=True)
+            assert not platform_compat.try_acquire_lock(contender, exclusive=True)
+            platform_compat.release_lock(holder)
+        finally:
+            os.close(contender)
+            os.close(holder)
+
+    def test_the_chain_lock_sidecar_is_never_written_through(self, tmp_path):
+        """No byte reaches the sidecar, so no write can race an acquire.
+
+        A Windows byte-range lock is mandatory: while a writer holds byte 0, any
+        other descriptor writing that byte gets ``EACCES``. A sidecar write on
+        the way to the lock therefore fails against a sibling that acquired
+        first, and ``_flush_batch`` turns that into a dropped audit record.
+        """
+        log = SecurityEventLog(base_dir=tmp_path, sync=True)
+        log.log(_make_event(event_id="sidecar-1"))
+        log.log(_make_event(event_id="sidecar-2"))
+        sidecar = tmp_path / kiro_crew_sel._TRUST_SUBDIR / kiro_crew_sel._SEL_LOCK_FILE
+        assert sidecar.exists(), "precondition: the chain lock was taken on the sidecar"
+        assert sidecar.stat().st_size == 0, "a byte was written on the way to the lock"
+
+    def test_a_foreign_sidecar_holder_does_not_cost_a_best_effort_event(self, tmp_path):
+        """A writer that must WAIT for the sidecar still lands its record.
+
+        The sidecar already exists and is empty (its creator took the lock
+        without writing it), and another holder has byte 0. A writer arriving
+        now must wait for the lock and then append, not fail on the way to it.
+        """
+        log = SecurityEventLog(base_dir=tmp_path, sync=True)
+        sidecar = tmp_path / kiro_crew_sel._TRUST_SUBDIR / kiro_crew_sel._SEL_LOCK_FILE
+        sidecar.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        holder = os.open(sidecar, os.O_CREAT | os.O_RDWR | getattr(os, "O_BINARY", 0), 0o600)
+        release = threading.Event()
+        logged = threading.Event()
+        try:
+            assert os.fstat(holder).st_size == 0, "precondition: the sidecar is empty"
+            assert platform_compat.try_acquire_lock(holder, exclusive=True)
+
+            def _write():
+                log.log(_make_event(event_id="waited-for-the-lock"))
+                logged.set()
+
+            writer = threading.Thread(target=_write)
+            writer.start()
+            # Give the writer time to reach the lock and block on it. On the
+            # unfixed code it instead fails on the sidecar write and returns at
+            # once, which is what this wait distinguishes.
+            early = logged.wait(timeout=0.5)
+            release.set()
+            platform_compat.release_lock(holder)
+            writer.join(timeout=30)
+            assert not writer.is_alive(), "the writer never finished"
+        finally:
+            release.set()
+            os.close(holder)
+        body = log._path.read_text(encoding="utf-8") if log._path.exists() else ""
+        assert "waited-for-the-lock" in body, (
+            "the record was dropped while another descriptor held the sidecar "
+            f"(writer returned before the lock was released: {early})"
+        )
 
     @pytest.mark.asyncio
     async def test_loop_critical_audit_does_not_wait_for_a_blocked_writer_drain(self):
@@ -1152,13 +1400,19 @@ class TestInferSource:
     @pytest.mark.parametrize("key,expected", [
         ("dashboard:slot0", "dashboard"),
         ("dashboard:slot5", "dashboard"),
+        # The side chat's isolated session (`side:<slot>`) IS a dashboard
+        # surface: a dashboard-bound governance profile must bind it. Before
+        # this branch the key fell through to the "slack" fallback and a
+        # dashboard-scoped profile skipped every side turn.
+        ("side:slot0", "dashboard"),
+        ("side:dashboard:slot0", "dashboard"),
         ("cron:job123", "cron"),
         ("subagent:abc", "subagent"),
         ("taskrunner:spec1", "taskrunner"),
         ("_bg", "background"),
         ("cli_chat", "cli"),
-        # Namespaced messaging channels are attributed to their transport (#815),
-        # matching context._runtime_display_name's set (#979) — via ``{ns}:`` …
+        # Namespaced messaging channels are attributed to their transport,
+        # matching context._runtime_display_name's set — via ``{ns}:`` …
         ("discord:123:kirocrew", "discord"),
         ("telegram:456", "telegram"),
         ("wecom:c1", "wecom"),
@@ -1266,7 +1520,8 @@ class TestHmacKeyManagementExtras:
         """A restrict_to_owner failure must not crash SecurityEventLog init.
 
         The chmod test above only exercises the POSIX arm of
-        ``restrict_to_owner``; on Windows it runs icacls instead, so this
+        ``restrict_to_owner``; on Windows it applies an owner-only DACL
+        in-process instead, so this
         variant injects the failure at ``restrict_to_owner`` itself — the seam
         ``atomic_write`` calls on every platform — pinning that
         ``restrict_on_error="warn"`` keeps key creation fail-soft.
@@ -1286,9 +1541,9 @@ class TestHmacKeyManagementExtras:
         locked down yet.
 
         atomic_write(restrict_to_owner=True) applies the lockdown to the TEMP
-        file before the key bytes reach it (the previous post-rename lockdown
-        left a brand-new key readable under the inherited DACL on Windows for
-        the write window, issue #5285). Asserted by measuring the file's SIZE
+        file before the key bytes reach it (a post-rename lockdown would leave a
+        brand-new key readable under the inherited DACL on Windows for the write
+        window). Asserted by measuring the file's SIZE
         at lockdown time — zero means no key byte existed yet.
         """
         from kiro_crew import platform_compat
@@ -1781,7 +2036,7 @@ class TestCriticalWrite:
 # Audit-chain hardening regression tests (Track B):
 #   1. HMAC key length validation (reject empty/short keys — hard fail)
 #   2. HMAC key permission re-enforcement on load
-#   3. _read_last_hash no longer resets the chain to genesis on a corrupt
+#   3. _read_last_hash does not reset the chain to genesis on a corrupt
 #      trailing line when prior complete records exist
 # ─────────────────────────────────────────────────────────────────────────
 
@@ -1936,7 +2191,7 @@ class TestCorruptTailNewlineBoundary:
     """A record appended after recovering past an UNTERMINATED corrupt tail
     must start on a fresh line — never glued onto the truncated fragment.
 
-    Regression for the silent-void bug: _read_last_hash() recovers the right
+    The silent-void hazard: _read_last_hash() recovers the right
     prev_hash, but if the writer O_APPENDs directly onto a tail line with no
     trailing newline, the new record fuses into that fragment as one
     unparseable line — so the event, though correctly chained, is orphaned
@@ -2166,6 +2421,190 @@ class TestHmacKeyTrustDirMigration:
         assert not (tmp_path / "sel_hmac.key").exists()
         assert any("replaced by the legacy" in r.message for r in caplog.records)
 
+    def test_short_legacy_file_does_not_destroy_a_usable_migrated_key(
+        self, tmp_path: Path
+    ) -> None:
+        """A 0-byte legacy file must not replace the key that signed the chain.
+
+        A mixed-binary upgrade window produces exactly this pair: a writer that
+        derives its chain lock from the key location opens the legacy path with
+        ``O_CREAT`` and leaves a 0-byte file behind once a sibling has relocated
+        the real key. Promoting that file destroys the only copy of the signing
+        key, and the minimum-length check then fails init on every later boot, so
+        the loss is unrecoverable rather than merely wrong.
+
+        Refusing is what makes that unrecoverable outcome impossible: BOTH files
+        survive byte-for-byte, so the operator's recovery (remove the stub) is
+        always available, and the chain still verifies afterwards.
+        """
+        log1 = SecurityEventLog(base_dir=tmp_path, sync=True)
+        log1.log_tool_invocation(session_key="s1", tool_name="t1", tool_kind="tool", outcome="ok")
+        real_key = log1._hmac_key
+        assert len(real_key) >= 32, "precondition: the migrated key is usable"
+        # The artifact an old writer leaves at the legacy path: created, never written.
+        (tmp_path / "sel_hmac.key").write_bytes(b"")
+        self._reset()
+
+        with pytest.raises(RuntimeError, match="too short to be a key"):
+            SecurityEventLog(base_dir=tmp_path, sync=True)
+
+        assert (
+            tmp_path / "trust" / "sel_hmac.key"
+        ).read_bytes() == real_key, "the 0-byte legacy file was promoted over the real key"
+        assert (tmp_path / "sel_hmac.key").read_bytes() == b"", "the legacy stub was rewritten"
+
+        # The operator's recovery: remove the stub the old writer left behind.
+        (tmp_path / "sel_hmac.key").unlink()
+        self._reset()
+        log3 = SecurityEventLog(base_dir=tmp_path, sync=True)
+        assert log3._hmac_key == real_key
+        assert log3.verify_integrity() == (1, 1), "the pre-existing chain no longer verifies"
+
+    def test_planted_destination_key_is_not_adopted_over_a_short_legacy_key(
+        self, tmp_path: Path
+    ) -> None:
+        """Length is not trust: a destination key of the right size is refused.
+
+        The pairing is producible by the audited agent itself -- ``trust`` and
+        ``sel_hmac.key`` are both sandbox read-write leaves -- so truncating the
+        legacy key below the minimum and planting a long-enough destination is an
+        ordinary capability, not an extreme combination. Adopting the destination
+        on its size alone would sign every later SEL and session-identity MAC
+        with bytes the attacker chose, with no recovery path.
+        """
+        log1 = SecurityEventLog(base_dir=tmp_path, sync=True)
+        log1.log_tool_invocation(session_key="s1", tool_name="t1", tool_kind="tool", outcome="ok")
+        real_key = log1._hmac_key
+        self._reset()
+
+        # What the agent can do: truncate the legacy anchor, plant a key it knows.
+        (tmp_path / "sel_hmac.key").write_bytes(b"short")
+        planted = b"p" * 64
+        assert planted != real_key
+        (tmp_path / "trust" / "sel_hmac.key").write_bytes(planted)
+
+        with pytest.raises(RuntimeError, match="refusing to adopt"):
+            SecurityEventLog(base_dir=tmp_path, sync=True)
+
+    def test_a_forged_audit_row_cannot_authenticate_a_planted_key(self, tmp_path: Path) -> None:
+        """The refusal must not be resolvable by evidence the agent can write.
+
+        Every file that could vouch for the destination key -- the key itself,
+        the legacy key, ``security_events.jsonl`` and ``security_events.d`` -- is
+        a sandbox read-WRITE leaf for the audited agent, so a check against any
+        of them authenticates the attacker's own evidence. This is the shape that
+        makes the audit log the worst possible anchor: the planted key signs a
+        row the agent appended, so a log-anchored proof gate would ADOPT it.
+        """
+        log1 = SecurityEventLog(base_dir=tmp_path, sync=True)
+        log1.log_tool_invocation(session_key="s1", tool_name="t1", tool_kind="tool", outcome="ok")
+        self._reset()
+
+        planted = b"p" * 64
+        (tmp_path / "sel_hmac.key").write_bytes(b"short")
+        (tmp_path / "trust" / "sel_hmac.key").write_bytes(planted)
+
+        # A row whose entry_hash IS an HMAC under the planted key, appended as the
+        # newest record -- exactly what a log-anchored gate would accept as proof.
+        forged = {"event_id": "forged", "timestamp": "2026-01-01T00:00:00Z"}
+        payload = json.dumps(forged, sort_keys=True).encode()
+        forged["entry_hash"] = hmac.new(planted, payload, hashlib.sha256).hexdigest()
+        with (tmp_path / "security_events.jsonl").open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(forged) + "\n")
+
+        with pytest.raises(RuntimeError, match="refusing to adopt"):
+            SecurityEventLog(base_dir=tmp_path, sync=True)
+        assert (
+            tmp_path / "trust" / "sel_hmac.key"
+        ).read_bytes() == planted, "precondition: the planted key was left in place, not consumed"
+
+    def test_short_legacy_key_with_an_empty_log_fails_closed(self, tmp_path: Path) -> None:
+        """The refusal does not depend on there being history to weigh.
+
+        A fresh directory holding only the ambiguous pair is refused for the same
+        single reason as one with a full chain, so no branch of this decision can
+        be unlocked by controlling how much the log contains.
+        """
+        (tmp_path / "sel_hmac.key").write_bytes(b"")
+        (tmp_path / "trust").mkdir()
+        (tmp_path / "trust" / "sel_hmac.key").write_bytes(b"p" * 64)
+
+        with pytest.raises(RuntimeError, match="refusing to adopt"):
+            SecurityEventLog(base_dir=tmp_path, sync=True)
+
+    @pytest.mark.skipif(
+        not sel_mod._PIN_BY_FD_SUPPORTED, reason="platform has no directory descriptors"
+    )
+    def test_chain_lock_sidecar_is_opened_inside_the_pinned_directory(
+        self, tmp_path: Path
+    ) -> None:
+        """A ``trust`` replaced after the screen must not move the sidecar.
+
+        The by-name screen and the sidecar's open are separate syscalls, and
+        ``trust`` is a read-write leaf for the audited agent, so it can swap the
+        directory in that window: both writers' screens then pass while their
+        opens land in different directories, and two flocks on two inodes is the
+        forked chain the lock exists to prevent. With the open resolved relative
+        to the pinned descriptor, the swap cannot redirect it -- the sidecar
+        appears under the inode that was screened, not under the new name.
+        """
+        log = SecurityEventLog(base_dir=tmp_path, sync=True)
+        trust = tmp_path / "trust"
+        pinned_identity = (trust.stat().st_dev, trust.stat().st_ino)
+        (trust / sel_mod._SEL_LOCK_FILE).unlink(missing_ok=True)
+
+        real_open = os.open
+        swapped: list[Path] = []
+
+        def swapping_open(path, flags, *args, **kwargs):
+            # Fire once, at the sidecar's own dir-relative open: the pin is
+            # already taken, so this is exactly the window the finding named.
+            if kwargs.get("dir_fd") is not None and path == sel_mod._SEL_LOCK_FILE and not swapped:
+                moved = tmp_path / "trust-pinned"
+                trust.rename(moved)
+                decoy = tmp_path / "trust"
+                decoy.mkdir()
+                swapped.append(moved)
+            return real_open(path, flags, *args, **kwargs)
+
+        with patch.object(os, "open", swapping_open):
+            with log._chain_lock():
+                pass
+
+        assert swapped, "the swap never fired; the sidecar was not opened dir-relative"
+        moved = swapped[0]
+        assert (moved.stat().st_dev, moved.stat().st_ino) == pinned_identity
+        assert (
+            moved / sel_mod._SEL_LOCK_FILE
+        ).exists(), "the sidecar did not land in the pinned directory"
+        assert not (
+            tmp_path / "trust" / sel_mod._SEL_LOCK_FILE
+        ).exists(), "the swapped-in decoy captured the sidecar"
+
+    @pytest.mark.skipif(
+        not sel_mod._PIN_BY_FD_SUPPORTED, reason="platform has no directory descriptors"
+    )
+    def test_lock_dir_pin_refuses_a_directory_swapped_under_its_name(
+        self, tmp_path: Path
+    ) -> None:
+        """The pin's identity check is what makes the flag degradation safe."""
+        real_dir = tmp_path / "trust"
+        real_dir.mkdir()
+        other = tmp_path / "other"
+        other.mkdir()
+        real_lstat = os.lstat
+
+        def swapped_lstat(path, *args, **kwargs):
+            # Stands in for a swap landing between the open and the identity
+            # read: the name now reports a DIFFERENT real directory.
+            if Path(path) == real_dir:
+                return real_lstat(other)
+            return real_lstat(path, *args, **kwargs)
+
+        with patch.object(os, "lstat", swapped_lstat):
+            with pytest.raises(OSError, match="not the directory its name points at"):
+                sel_mod._pin_lock_dir(real_dir)
+
     @pytest.mark.skipif(os.name == "nt", reason="POSIX symlink semantics")
     def test_linked_trust_dir_is_removed_not_followed(self, tmp_path: Path) -> None:
         """A ``trust`` symlink planted before the upgrade must be removed
@@ -2310,6 +2749,118 @@ class TestHmacKeyTrustDirMigration:
         # Nothing was ever written through the planted link.
         assert list(target.iterdir()) == []
 
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX symlink semantics")
+    def test_unremovable_planted_link_never_hosts_the_chain_lock(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The APPEND path must not create the lock sidecar through the link.
+
+        ``test_unremovable_planted_link_falls_back_to_legacy`` covers init only,
+        and the chain lock is taken on the first APPEND, so a clean target there
+        says nothing about the lock. ``Path.mkdir``'s ``exist_ok`` check is
+        ``is_dir()``, which follows the planted link and reports the agent's
+        directory as usable, so the ``FileExistsError`` is swallowed and without
+        a parent-link refusal the sidecar is created inside storage the audited
+        agent controls -- where it can be unlinked and recreated between two
+        writers' acquires, giving them flocks on different inodes and forking
+        the hash chain permanently.
+        """
+        legacy_key = b"l" * 32
+        (tmp_path / "sel_hmac.key").write_bytes(legacy_key)
+        target = tmp_path / "agent-readable"
+        target.mkdir()
+        (tmp_path / "trust").symlink_to(target)
+
+        def _deny_unlink(path):
+            raise PermissionError(30, "Read-only file system", str(path))
+
+        monkeypatch.setattr(
+            "kiro_crew.platform_compat.unlink_link_or_junction", _deny_unlink
+        )
+        log = SecurityEventLog(base_dir=tmp_path, sync=True)
+        assert log._hmac_key == legacy_key
+
+        # The lock falls back to the deny-list-protected legacy key, and must
+        # NOT be allowed to create it (a 0-byte key would be promoted over the
+        # real one by the migration block).
+        assert log._chain_lock_target() == (tmp_path / "sel_hmac.key", False, None)
+
+        log.log_tool_invocation(
+            session_key="dashboard:slot1",
+            tool_name="execute_bash",
+            tool_kind="shell",
+            outcome="approved",
+            resources="ls -la",
+        )
+
+        # The append landed...
+        assert (tmp_path / "security_events.jsonl").read_text(
+            encoding="utf-8"
+        ).strip()
+        # ...and still nothing was created through the planted link.
+        assert list(target.iterdir()) == []
+        # The legacy key was locked, never rewritten.
+        assert (tmp_path / "sel_hmac.key").read_bytes() == legacy_key
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX symlink semantics")
+    def test_symlinked_data_home_still_takes_the_real_chain_lock(
+        self, tmp_path: Path
+    ) -> None:
+        """An OPERATOR's symlink ABOVE the log dir is layout, not an attack.
+
+        The refusal exists because the audited agent can plant a link at
+        ``trust`` itself, which is the one component below the log directory it
+        can write. Everything ABOVE the log directory is the operator's own
+        layout -- a home reached through a symlink, a crew dir moved to another
+        volume -- and the agent cannot plant any of it. Screening those
+        ancestors buys no protection and costs the whole log: the refusal routes
+        into the legacy-key fallback, and on an install with no legacy key it
+        re-raises, so every best-effort audit is dropped and every critical
+        operation is denied on a perfectly healthy install. This is not
+        hypothetical -- a home directory that is itself a symlink is a normal
+        layout on shared build hosts.
+
+        ``_load_or_create_hmac_key`` screens this same ``trust`` directory with
+        ``is_link_or_junction`` alone, so leaf-only is also the parity this
+        sidecar's protection is asserted against.
+        """
+        # The operator's layout: the data home is reached through a symlink.
+        real = tmp_path / "real"
+        real.mkdir()
+        (tmp_path / "link").symlink_to(real)
+        base_dir = tmp_path / "link" / "crew"
+        base_dir.mkdir()
+
+        trust_dir = base_dir / sel_mod._TRUST_SUBDIR
+        assert platform_compat.first_linked_ancestor(trust_dir)
+        assert not platform_compat.is_link_or_junction(trust_dir)
+
+        log = SecurityEventLog(base_dir=base_dir, sync=True)
+
+        # The real sidecar is used -- not the legacy-key fallback, and no raise.
+        lock_path, may_create, lock_dir_fd = log._chain_lock_target()
+        assert (lock_path, may_create) == (
+            trust_dir / sel_mod._SEL_LOCK_FILE,
+            True,
+        )
+        if lock_dir_fd is not None:
+            os.close(lock_dir_fd)
+
+        log.log_tool_invocation(
+            session_key="dashboard:slot1",
+            tool_name="execute_bash",
+            tool_kind="shell",
+            outcome="approved",
+            resources="ls -la",
+        )
+
+        # The append landed and the sidecar is a real file in a real directory.
+        assert (base_dir / "security_events.jsonl").read_text(
+            encoding="utf-8"
+        ).strip()
+        assert lock_path.is_file()
+        assert not platform_compat.is_link_or_junction(lock_path.parent)
+
     def test_migrated_short_key_still_hard_fails(self, tmp_path: Path) -> None:
         """Validation applies to the migrated file exactly as to a fresh one."""
         (tmp_path / "sel_hmac.key").write_bytes(b"x" * 8)
@@ -2321,7 +2872,7 @@ class TestHmacKeyTrustDirMigration:
     ) -> None:
         """The recovery path for the dependent protocol: SEL caches the
         validated bytes at init, so they stay available when the file behind the
-        frozen resolved path no longer loads."""
+        frozen resolved path fails to load."""
         from kiro_crew.sel import _sel_hmac_key_bytes
 
         log = SecurityEventLog(base_dir=tmp_path, sync=True)
@@ -2381,7 +2932,7 @@ class TestHmacKeyTrustDirMigration:
 
         Reachable because SEL is now constructed from worker threads (the
         middleware deny audits offload via ``asyncio.to_thread``), where the
-        event loop no longer serializes callers for free.
+        event loop does not serialize callers for free.
         """
         self._reset()
         calls: list[int] = []
@@ -2418,7 +2969,7 @@ class TestHmacKeyTrustDirMigration:
 
 
 class TestTrustRootPathReResolution:
-    """``sel_hmac_key_path()`` re-resolves per call (#2588).
+    """``sel_hmac_key_path()`` re-resolves per call.
 
     ``_hmac_key_file`` is decided once at init, and a failed legacy migration
     leaves it on the legacy location; a sibling process that later completes the
@@ -2437,8 +2988,8 @@ class TestTrustRootPathReResolution:
         assert sel_mod.sel_hmac_key_path() == tmp_path / "trust" / "sel_hmac.key"
 
     def test_relocation_to_the_trust_dir_is_followed(self, tmp_path: Path) -> None:
-        """The #2539 shape: this process kept the legacy path after a failed
-        migration, then a sibling process completed it."""
+        """One process keeps the legacy path after a failed migration, then a
+        sibling process completes it."""
         log = SecurityEventLog(base_dir=tmp_path, sync=True)
         canonical = tmp_path / "trust" / "sel_hmac.key"
         # Pin the instance to the legacy location the way a failed migration does.
@@ -2477,9 +3028,8 @@ class TestTrustRootPathReResolution:
         assert sel_mod.sel_hmac_key_path() == tmp_path / "sel_hmac.key"
 
     def test_re_resolution_never_moves_what_the_chain_signs_with(self, tmp_path: Path) -> None:
-        """The reason item 1 of #2588 was deferred does not apply: the accessor
-        returns a PATH the signing and verification code never reads, so a
-        relocation cannot orphan records already chained."""
+        """The accessor returns a PATH the signing and verification code never
+        reads, so a relocation cannot orphan records already chained."""
         log = SecurityEventLog(base_dir=tmp_path, sync=True)
         log.log_tool_invocation(
             session_key="s1", tool_name="t1", tool_kind="tool", outcome="ok"
@@ -2518,7 +3068,7 @@ class TestTrustRootPathReResolution:
 
 
 class TestSizeRotation:
-    """The log is closed at a size cap and retained as N segments (issue #4843).
+    """The log is closed at a size cap and retained as N segments.
 
     Before this, ``security_events.jsonl`` was a single file with no cap: a
     long-running install measured 4.09 GB, which made the only sanctioned reader
@@ -2895,6 +3445,18 @@ class TestRotationIsSerializedAcrossProcesses:
         total, valid = log.verify_integrity()
         assert total == valid, "the lock file was verified as an audit segment"
 
+    def test_the_rotation_lock_is_never_written_through(self, sel_dir, small_segments):
+        """Same contract as the chain-lock sidecar, at the rotation mutex.
+
+        A Windows byte-range lock is mandatory, so a byte written on the way to
+        the lock fails with ``EACCES`` against a sibling that acquired first —
+        which declines a rotation over a lock that is working.
+        """
+        log = SecurityEventLog(base_dir=sel_dir, sync=True)
+        _fill(log, 600)
+        lock = sel_dir / "security_events.d" / ".rotate.lock"
+        assert lock.stat().st_size == 0, "a byte was written on the way to the lock"
+
     def test_a_planted_lock_link_is_not_opened_through(self, sel_dir, small_segments):
         """Opening the mutex CREATES and chmods it, so a link must not be followed."""
         log = SecurityEventLog(base_dir=sel_dir, sync=True)
@@ -2963,18 +3525,18 @@ class TestRotationIsSerializedAcrossProcesses:
 
 
 class TestSegmentDirIsPinnedOnRead:
-    """The segment DIRECTORY is pinned for the duration of a read (#4999).
+    """The segment DIRECTORY is pinned for the duration of a read.
 
-    #4998 validated the descriptor of each file the readers open, which closes
-    the FINAL path component; the directory itself was still walked BY NAME.
-    A ``security_events.d`` replaced with a link (planted before this release,
-    or swapped while a read is in flight) therefore redirected enumeration —
+    Validating the descriptor of each file the readers open closes the FINAL
+    path component, but the directory itself could still be walked BY NAME.
+    A ``security_events.d`` replaced with a link (planted ahead of time,
+    or swapped while a read is in flight) would redirect enumeration —
     and every per-file open — into another tree, whose segment-shaped REGULAR
     files pass every per-file check, because they are regular files. The read
-    paths now pin the directory itself first and refuse a linked one, so a
+    paths pin the directory itself first and refuse a linked one, so a
     swapped dir fails closed instead of feeding another tree's files to
     ``recent()`` / ``verify_integrity()``. The rotation-time repair
-    (``_ensure_segment_dir``) remains the write-side guard, and the live log
+    (``_ensure_segment_dir``) is the write-side guard, and the live log
     is unchanged: its writer follows an operator's symlink, so its readers
     must too.
     """
@@ -2984,7 +3546,7 @@ class TestSegmentDirIsPinnedOnRead:
 
         The observable is ``verify_integrity()``'s totals: without the pin, the
         decoy's unsigned lines inflate ``total`` while ``valid`` stays flat —
-        the false tamper alarm of #4999 — so ``total == valid`` here is exactly
+        the false tamper alarm — so ``total == valid`` here is exactly
         the property that must hold. Built with ``symlink_or_junction`` so the
         same attack runs on Windows junctions, which need no elevation.
         """
@@ -3013,7 +3575,7 @@ class TestSegmentDirIsPinnedOnRead:
         )
         assert total == len(live_lines), "records beyond the live log were counted"
         # The swap is itself tampering, so the detailed result must not call
-        # this run verifiable over the live log alone (#5051 review).
+        # this run verifiable over the live log alone.
         result = log.verify_integrity(detailed=True)
         assert result.history_verifiable is False
         assert "refused" in result.reason
@@ -3079,7 +3641,7 @@ class TestSegmentDirIsPinnedOnRead:
 
         Fresh-install silence belongs to the directory that was NEVER there;
         one that was seen by lstat and then disappears before the open
-        cannot be used to let the rotated history read as unverifiable-but-
+        cannot make the rotated history read as unverifiable-but-
         absent.
         """
         log = SecurityEventLog(base_dir=sel_dir, sync=True)
@@ -3124,7 +3686,7 @@ class TestSegmentDirIsPinnedOnRead:
         self, sel_dir, small_segments, monkeypatch
     ):
         """A directory replaced mid-run leaves totals from the pinned tree,
-        but the tree on disk no longer is it — the detail must say so."""
+        but the tree on disk is not that tree — the detail must say so."""
         log = SecurityEventLog(base_dir=sel_dir, sync=True)
         _fill(log, 200)
         assert log._segments_oldest_first(), "precondition: rotation happened"
@@ -3621,7 +4183,7 @@ class TestCriticalWritesDoNotRotateInline:
         which tests ran earlier on this worker: at ``_SEGMENT_KEEP`` segments a
         successful rotation adds one and the sweep deletes the oldest in the same
         breath, leaving the COUNT flat -- a real rotation that a count comparison
-        calls "never rotated" (#5017). The sequence only ever rises
+        calls "never rotated". The sequence only ever rises
         (``_next_segment_path`` continues from the highest segment still on
         disk, precisely so retention cannot make it go backwards), so it
         observes the rotation no matter what the sweep did.
@@ -3869,7 +4431,7 @@ class TestOnlyTheWriterThreadRotates:
         log = SecurityEventLog(sync=False)
         # Get the log over the cap first, through a path that is allowed to
         # rotate. Topped up rather than asserted after one fixed fill: the same
-        # two harness properties that broke the rotation test (#5017) -- a
+        # two harness properties that broke the rotation test -- a
         # bounded flush() and a mid-fill batch-boundary rotation -- can leave
         # the live log below the cap here too.
         _fill(log, 200)
@@ -4489,7 +5051,7 @@ class TestTimeWindowRead:
 
     A count alone could not express "the last two hours": on a busy log 6000
     entries reached 15 minutes back, so a two-hour question meant pulling ~90k
-    entries and filtering client-side (issue #4843).
+    entries and filtering client-side.
     """
 
     def test_since_and_until_bound_the_window(self, sel_dir):
@@ -4861,3 +5423,47 @@ class TestMetadataRedaction:
         assert self.AKIA_TOKEN not in raw
         assert self.AKIA_TOKEN[:10] not in raw
         assert len(json.loads(raw.strip())["resources"]) <= _MAX_ARG_LEN
+
+
+class TestControlCharacterSerialization:
+    """A control character in an audited value is escaped, never written raw.
+
+    Audited values include caller-supplied ones -- a requested file path, for
+    instance -- and the record is read back in a terminal (`kirocrew logs`). A
+    raw ESC or 8-bit CSI byte in the file would be EXECUTED as a terminal escape
+    rather than displayed: screen clears, forged output, hidden lines. The record
+    is JSON, so json.dumps escapes those bytes, and this pins that property
+    rather than leaving it an incidental consequence of the format.
+    """
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            "/tmp/(a\x1b[2Jb)",  # ESC: clear-screen
+            "/tmp/a\x9bb",  # 8-bit CSI
+            "/tmp/a\x85b",  # NEL
+            "/tmp/a\rforged: line",  # CR: overwrite the rendered line
+            "/tmp/a\nforged: line",  # LF: forge a whole record
+        ],
+    )
+    def test_a_control_character_is_escaped_in_the_written_record(
+        self, log, sel_dir, payload
+    ):
+        log.log_tool_invocation(
+            session_key="dashboard",
+            tool_name="file_read",
+            outcome="denied",
+            resources=payload,
+        )
+        written = (sel_dir / "security_events.jsonl").read_bytes()
+        # Exactly one record: an embedded LF in the value did not forge a second.
+        lines = written.splitlines()
+        assert len(lines) == 1
+        # The RECORD carries no control character for a terminal to act on.
+        # splitlines has already removed the line terminator, which is the log's
+        # own framing and is \r\n on Windows -- not part of the audited value.
+        record = lines[0].decode("utf-8")
+        assert not any(ch <= "\x1f" or "\x7f" <= ch <= "\x9f" for ch in record)
+        # The value is present and round-trips intact, so escaping is not dropping
+        # information -- it is only making it inert.
+        assert json.loads(record)["resources"] == payload

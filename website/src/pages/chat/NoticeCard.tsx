@@ -56,11 +56,15 @@ function srSeverity(tone: NoticeTone): string {
  * while the glyph is 1em of the fixed 13px type, so a px constant would drift
  * under a non-16px root font-size.
  */
-export default memo(function NoticeCard({ content }: { content: string }) {
+export default memo(function NoticeCard({ content, tone: toneOverride }: { content: string; tone?: NoticeTone }) {
   // Language-generation subscription: this memo() boundary renders i18nT()
   // strings, so a language switch must invalidate it.
   useLanguageGeneration()
-  const { tone, text } = parseNotice(content)
+  const parsed = parseNotice(content)
+  // A caller that already localized `content` (transientNotice.ts) has no emoji
+  // to parse a tone from, so it names the severity directly.
+  const tone = toneOverride ?? parsed.tone
+  const text = parsed.text
   const Icon = tone === 'blocked' ? Ban : tone === 'warn' ? TriangleAlert : Info
   const severity = srSeverity(tone)
   return (
@@ -77,7 +81,11 @@ export default memo(function NoticeCard({ content }: { content: string }) {
           }`}
           aria-hidden="true"
         />
-        <span className="min-w-0 break-words">
+        {/* `whitespace-pre-line` keeps a multi-line notice (a Slack thread's first
+            message, recorded above the reply) on its own lines instead of folding
+            it into one paragraph. It collapses runs of spaces like the default,
+            so a single-line notice renders identically. */}
+        <span className="min-w-0 break-words whitespace-pre-line" data-testid="notice-card-text">
           {severity && <span className="sr-only">{severity} </span>}
           {text}
         </span>

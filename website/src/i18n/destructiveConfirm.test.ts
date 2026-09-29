@@ -173,6 +173,8 @@ export const QUOTED_OPERAND_CONFIRM_KEYS = [
   'apps.awsControl.console.delete_confirm', // filename operand, quoted per locale
   'apps.awsControl.console.folder_delete_confirm', // folder-name operand, quoted per locale #4821
   'apps.awsControl.console.library_remove_confirm', // artifact-name operand, quoted per locale #6987
+  'apps.awsControl.page.remove_account_confirm', // account-name operand, quoted per locale
+  'apps.awsControl.page.forget_key_confirm', // key-name operand, quoted per locale
   'apps.codeReviewSage.components.learningRail.confirm_delete', // quoted since #4653
   'apps.crewCompanion.gallery.deleteConfirm', // ASCII quotes → locale pair #4821
   'apps.mdNotebook.row.deleteTitle', // already quoted; pin + fr NNBSP fix #5725
@@ -184,6 +186,12 @@ export const QUOTED_OPERAND_CONFIRM_KEYS = [
   'apps.papyrus.workspace.co_author_conflict_discard_confirm', // #4676
   'apps.papyrus.workspace.delete_file_confirm', // quoted by #4677
   'autoImprovement.commitConfirm', // bare {{branch}} #4821
+  // Template-pane confirms interpolate template names AND the changed-field
+  // list; both are user-facing prose, so all operands carry the glyph pair.
+  'components.agentTemplateDetail.reset_confirm_body',
+  'components.agentTemplateDetail.reset_confirm_title',
+  'components.agentTemplateDetail.switch_confirm_body',
+  'components.agentTemplateDetail.switch_confirm_title',
   // The code-execution grant's title AND body. #5725 quoted only the title, which left
   // the scope sentence one line under it reading as prose about every app (#6016).
   'components.appstore.trustAppModal.failed', // bare {{app}} #6016
@@ -192,6 +200,7 @@ export const QUOTED_OPERAND_CONFIRM_KEYS = [
   'components.appstore.trustAppModal.on_cancel', // bare {{app}} #6016
   'components.appstore.trustAppModal.scope', // bare {{app}} #6016
   'components.appstore.trustAppModal.title', // bare {{app}} on the code-execution grant #5725
+  'pages.appDetailPage.session_approval_confirm_title', // bare {{name}} on the chat-control grant #11192
   'components.artifactFolderDeleteDialog.delete_folder', // already quoted; pin #5725
   'pages.artifactDeployPage.destroy_confirm',
   'pages.artifactDeployPage.recall_confirm',
@@ -203,6 +212,7 @@ export const QUOTED_OPERAND_CONFIRM_KEYS = [
   'pages.devFleetPage.make_name_live', // ASCII quotes → locale pair #5725
   'pages.devFleetPage.rebase_name', // ASCII quotes → locale pair #5725
   'pages.devFleetPage.remove_name', // ASCII quotes → locale pair #5725
+  'pages.overview.agentTemplatesTab.delete_confirm', // quoted in all catalogs at introduction (#12481)
   'pages.overview.promptsTab.delete_confirm', // quoted in all catalogs at introduction (#4634)
   'pages.overview.skillsTab.delete_confirm',
   'pages.overview.skillsTab.dismiss_confirm',
@@ -210,6 +220,10 @@ export const QUOTED_OPERAND_CONFIRM_KEYS = [
   'pages.schedulePage.cronFolders.confirm_delete_folder',
   'pages.schedulePage.delete_named_job', // ASCII quotes → locale pair #5725
   'pages.settings.remoteCrewPanel.confirm_delete_of', // was fully bare #4821
+  'pages.settings.remoteCrewPanel.confirm_cancel_remove', // instance operand on the armed cancel, quoted per locale
+  'settings.secrets.delete_confirm',
+  'settings.secrets.delete_managed_confirm',
+  'pages.overview.kiroCrewCfgTab.type_workspace_name_to_confirm', // quoted in all catalogs at introduction
   'pages.settings.securityPanel.trustedApps.revoke_confirm_title',
   'pages.settings.securityPanel.trustedApps.revoke_confirm_body',
 ]
@@ -250,6 +264,22 @@ export const EXEMPT_CONFIRM_PLACEHOLDER_NAMES = new Set([
  * kind-word form and record that decision.
  */
 export const CONFIRM_OPERAND_KEY_EXEMPTIONS: Record<string, string> = {
+  'components.redaction.link_open_confirm_title':
+    'the {{host}} operand is a hostname the blocked-link record already passed through a '
+    + 'strict host shape (letters, digits, dots, hyphens, underscores, or a bracketed IPv6 '
+    + 'literal), so it cannot carry a space or a quote that would blur where it ends',
+  'components.redaction.link_allow_confirm_title':
+    'the {{host}} operand is a hostname validated by the same strict host shape as '
+    + 'link_open_confirm_title, so it cannot carry a space or a quote',
+  'components.redaction.link_open_confirm_body':
+    'the {{chars}} operand is a non-negative integer character count, never user text',
+  'components.awsConsentGate.confirmed_on':
+    'not a confirmation prompt: a past-tense receipt fragment whose only operand is a '
+    + 'machine-formatted date from fmtDate, never user-supplied text',
+  'pages.membersPage.create_unconfirmed':
+    'not a confirmation prompt: a non-interactive outcome notice stating whether the named '
+    + 'crewmate was created; it offers no destructive action and the name identifies the '
+    + 'uncertain result that the user must check in the roster',
   'apps.awsControl.console.library_remove_confirm_slug':
     'the {{folder}} operand is an S3 key prefix rendered inside a <folder> tag as a '
     + 'monospace <code> chip, so the tag already delimits it and glyph quotes would '
@@ -257,10 +287,17 @@ export const CONFIRM_OPERAND_KEY_EXEMPTIONS: Record<string, string> = {
   'apps.mochi.approval.inline_ask':
     'the {{tool}} operand renders as a styled <code> chip via renderAroundTool, '
     + 'so glyph quotes would double-decorate it (#5725)',
-  'pages.agentsPage.delete_the_template_named_confirm':
-    'kind word "template" sits next to the operand (#4657)',
   'pages.kiroCrewAgentsPage.delete_crew_named_confirm':
     'kind word "crew" sits next to the operand (#4657)',
+  'apps.awsControl.console.backup_restore_foreign_confirm':
+    'the {{install}} operand is the first 8 hex characters of an install id this app '
+    + 'mints itself (uuid4, never user-supplied text), and it already sits inside '
+    + 'parentheses after the words "another install" -- so the risk glyph quotes exist '
+    + 'to close, a crafted operand blending into the sentence, cannot arise here (#9554)',
+  'pages.settings.connectionsPanel.remove_confirm':
+    'the {{provider}} operand is a Connections registry display name (GitHub, Asana), '
+    + 'a fixed vendor brand never typed by a user, and the kind words "OAuth app" sit '
+    + 'next to it -- a brand name in glyph quotes would read as a user-supplied label',
 }
 
 function placeholdersIn(value: string): string[] {

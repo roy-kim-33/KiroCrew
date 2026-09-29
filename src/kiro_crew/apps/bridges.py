@@ -18,19 +18,26 @@ import os
 import re
 import shutil
 import sys
-from contextlib import contextmanager
+import zipfile
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterator, Optional
+from typing import Any, Container, Iterable, Iterator, Optional
 from urllib.parse import urlparse, urlunparse
 
 from kiro_crew import platform_compat
+from kiro_crew.apps import deps_boot as _deps_boot_module
 from kiro_crew.apps.cron_sdk import CronSDK
 from kiro_crew.apps.execution import (
     app_execution_denied,
     shipped_builtin_app_root,
 )
-from kiro_crew.apps.interpreter import resolve_app_python, venv_provided_command
+from kiro_crew.apps.interpreter import (
+    app_deps_dir,
+    path_command_is_abi_matched,
+    resolve_app_python,
+    venv_provided_command,
+)
 from kiro_crew.apps.manager import (
     app_data_dir,
     app_dir,
@@ -38,7 +45,11 @@ from kiro_crew.apps.manager import (
     get_app_manifest,
     list_apps,
 )
-from kiro_crew.apps.manifest import AppManifest
+from kiro_crew.apps.manifest import (
+    AppManifest,
+    has_stdio_mcp_server,
+    is_module_style_entry_point,
+)
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.loader import (
     config_dir,
@@ -46,12 +57,22 @@ from kiro_crew.config.loader import (
     schedule_materialized_agents_refresh,
 )
 from kiro_crew.config.paths import kiro_agents_dir
-from kiro_crew.cron import CronStoreBusy, CronStoreUnreadable
+from kiro_crew.cron import CronStoreBusy, CronStoreUnreadable, lookup_cron_folder_id
 from kiro_crew.cron_script import resolve_script_path
 from kiro_crew.env import emit_env
 from kiro_crew.executors import maintenance_executor
+from kiro_crew.gateway_lock import GatewayLock, GatewayLockError
+from kiro_crew.history import ConversationLog
 from kiro_crew.platform.governance import may_skip_gate_now, strip_ungoverned_auto_approve
+from kiro_crew.security import is_sensitive_path
 from kiro_crew.sel import sel
+from kiro_crew.session_map import SUPPRESS_REPLAY_FLAG, SessionMap
+from kiro_crew.zip_vet import ZipInventoryRejected, vet_zip_inventory
+
+#: Absolute path of the stdlib-only launch shim, for interpreters whose
+#: flags (-S/-E/-I) make the ``-m kiro_crew.apps.deps_boot`` spelling
+#: unimportable.
+_DEPS_BOOT_PATH = Path(os.path.abspath(_deps_boot_module.__file__))
 
 logger = logging.getLogger(__name__)
 
@@ -60,8 +81,8 @@ logger = logging.getLogger(__name__)
 # Resolved per call, never captured at import: an import-time binding freezes
 # the data home and defeats pod isolation, the lazy legacy-home migration and
 # test isolation. The name below is an opt-in override (None = live home) so
-# existing monkeypatch call sites keep working. See config.md "Data Home" and
-# issue #874; dashboard/handlers/usage.py is the reference implementation.
+# existing monkeypatch call sites keep working. See config.md "Data Home";
+# dashboard/handlers/usage.py is the reference implementation.
 KIRO_AGENTS_DIR: Path | None = None
 
 
@@ -297,9 +318,24 @@ def _apply_agent_prompt(
     return merged
 
 
-def _strip_ungoverned_auto_approve(servers: dict[str, Any]) -> dict[str, Any]:
-    """Drop a ceiling-governed ``autoApprove`` from a server map (see governance)."""
-    return dict(strip_ungoverned_auto_approve(servers))
+def _strip_ungoverned_auto_approve(
+    servers: dict[str, Any],
+    *,
+    third_party: Container[str] = (),
+    honour_owner_written: bool = True,
+) -> dict[str, Any]:
+    """Drop a ceiling-governed ``autoApprove`` from a server map (see governance).
+
+    ``third_party`` names the keys THIS app chose in a map that also holds the
+    owner's; ``honour_owner_written=False`` is for a map that is entirely an app's.
+    """
+    return dict(
+        strip_ungoverned_auto_approve(
+            servers,
+            third_party=third_party,
+            honour_owner_written=honour_owner_written,
+        )
+    )
 
 
 def _may_auto_approve(ref: str) -> bool:
@@ -418,7 +454,7 @@ def _apply_agent_mcp_policy(
             continue
         merged = {**base, **spec}
         merged.pop("neutralized", None)
-        merged.pop("disabled", None)  # a grant un-disables a previously denied server
+        merged.pop("disabled", None)  # a grant un-disables a denied server
         # `mountOnly` (set by a policy for a built-in grant) means: mount the
         # server so the tool is visible, but keep it OFF allowedTools no matter
         # what the ceiling says, so every call routes through the approval gate
@@ -542,8 +578,17 @@ def _pin_host_cli_command(app_name: str, cfg: dict[str, Any]) -> dict[str, Any]:
     existing = env.get("PYTHONPATH", "")
     env["PYTHONPATH"] = f"{pkg_parent}{os.pathsep}{existing}" if existing else pkg_parent
     env.setdefault("KIROCREW_HOME", str(app_dir(app_name).parent.parent))
-    cfg["command"] = sys.executable
-    cfg["args"] = ["-s", "-m", "kiro_crew", *list(cfg.get("args") or [])]
+    # ``-P``: the MCP host spawns this server with a cwd Kiro Crew does not
+    # choose; keeping it off sys.path is the same guarantee the launchers give.
+    argv = platform_compat.isolated_python_argv(
+        "-P",
+        "-m",
+        "kiro_crew",
+        *list(cfg.get("args") or []),
+        force_isolation=True,
+    )
+    cfg["command"] = argv[0]
+    cfg["args"] = argv[1:]
     cfg["env"] = env
     return cfg
 
@@ -612,7 +657,9 @@ def _materialize_managed_refs(agent_data: dict[str, Any]) -> None:
     from kiro_crew.agent import _MANAGED_MCP_SERVERS
 
     refs = {
-        t[1:] for t in agent_data.get("tools") or [] if isinstance(t, str) and t.startswith("@")
+        t[1:].split("/", 1)[0]
+        for t in agent_data.get("tools") or []
+        if isinstance(t, str) and t.startswith("@")
     }
     servers = agent_data.get("mcpServers") or {}
     for name, managed in _MANAGED_MCP_SERVERS.items():
@@ -665,11 +712,7 @@ def _unresolvable_tool_refs(agent_data: dict[str, Any]) -> list[str]:
         # exists for exactly the specs (mochi's) that set this flag.
         return [f"{entry} (server {server!r})" for entry, server in candidates]
     ambient = set(_global_mcp_specs())
-    return [
-        f"{entry} (server {server!r})"
-        for entry, server in candidates
-        if server not in ambient
-    ]
+    return [f"{entry} (server {server!r})" for entry, server in candidates if server not in ambient]
 
 
 #: Keys the framework OWNS in a materialized app agent config: each is derived
@@ -761,6 +804,8 @@ def _preserve_user_agent_edits(
     if kept:
         logger.info("Preserved user edits in %s: %s", name, ", ".join(sorted(kept)))
     return merged
+
+
 #: Placeholder syntax an agent template uses for a path only known at runtime.
 #:
 #: A shipped builtin's agent config is read from the immutable package root
@@ -924,7 +969,7 @@ def _register_agents(
     dispatchable: set[str] = set()
     # Held across the whole materialization, not just the writes: each agent COPIES the
     # ambient server spec, so a read taken before a health scrub and a write landing
-    # after it would leave the agent naming a server that no longer exists. The read and
+    # after it would leave the agent naming a server that does not exist. The read and
     # the write have to be inside the same critical section as the transition they race.
     #
     # Kept INLINE rather than delegated to a helper: the governed-auto-approve strip
@@ -1033,9 +1078,22 @@ def _register_agents(
                 # on-disk entry — filtering each of those separately is how earlier
                 # rounds kept leaving one open. The host agent's writer does the same
                 # thing at the same position (see agent.install_agent).
+                #
+                # This map is an APP's, so it declines the owner-written opt-in
+                # outright instead of naming the app's keys. Naming them is an
+                # enumeration that goes stale: the manifest's servers, the shipped
+                # agent spec's own un-namespaced keys and the per-agent policy's
+                # `servers` keys were each found only after the previous one was
+                # covered, and a policy IS app-controlled state that may carry
+                # `autoApprove` (a shipped builtin already writes one). Nothing here
+                # is the owner stating a preference about their own tools, so the
+                # verbs a spec DECLARES still survive and everything else routes
+                # through the approval gate.
                 _servers = merged.get("mcpServers")
                 if isinstance(_servers, dict):
-                    merged["mcpServers"] = _strip_ungoverned_auto_approve(_servers)
+                    merged["mcpServers"] = _strip_ungoverned_auto_approve(
+                        _servers, honour_owner_written=False
+                    )
                 # The map above is FINAL — every source of servers has been merged —
                 # so this is the one point a dangling `@` grant is decidable. Warn,
                 # never reject: kiro-cli just skips the ref, so the agent works
@@ -1071,14 +1129,13 @@ def _register_agents(
             # would be answered by the wrong agent.
             publish_materialized_agents(dispatchable)
         # Reconcile the whole directory UNCONDITIONALLY, even when this call wrote
-        # nothing: a re-registration whose manifest no longer declares an agent (or
+        # nothing: a re-registration whose manifest does not declare an agent (or
         # that follows a prune) leaves the removed name in the snapshot, and only a
         # rescan drops it. A name that is dispatchable in memory but gone from disk is
-        # the same invisible mismatch as the bug this change fixes — kiro-cli cannot
-        # load it and falls back to its own default. `_register_agents` runs ON the
-        # loop for the dashboard enable/update handlers (see the prune note in
-        # `register_app`), so the scan goes to an executor rather than walking every
-        # agent file inline.
+        # an invisible mismatch — kiro-cli cannot load it and falls back to its own
+        # default. `_register_agents` runs ON the loop for the dashboard enable/update
+        # handlers (see the prune note in `register_app`), so the scan goes to an
+        # executor rather than walking every agent file inline.
         schedule_materialized_agents_refresh()
 
         return registered
@@ -1222,12 +1279,11 @@ def _deregister_skills(app_name: str) -> int:
     Removes **only what registration created** — the symlinks, and the directory
     itself once it holds nothing else. It must NOT ``rmtree`` unconditionally: when a
     PACKAGED builtin skill shares the app's name, ``skills/<app_name>/`` is that
-    skill's real directory, not an app-owned link farm. Blowing it away deleted a
+    skill's real directory, not an app-owned link farm. Blowing it away deletes a
     shipped skill and every SOP under it, leaving the app's cron prompts pointing at
-    files that no longer existed — silently, since a missing skill file is not an
-    error anywhere. Hit for real by ops-mission-control, whose skill ships under
-    ``builtin_skills/`` because a builtin app's own directory is never copied into
-    the data home.
+    missing files — silently, since a missing skill file is not an error anywhere.
+    Real case: ops-mission-control, whose skill ships under ``builtin_skills/``
+    because a builtin app's own directory is never copied into the data home.
     """
     skills_root = _skills_dir()
     app_skills_dir = skills_root / app_name
@@ -1249,10 +1305,7 @@ def _deregister_skills(app_name: str) -> int:
                 # is_link_or_junction: a junction (non-admin Windows) is not a
                 # symlink, and unlink_link_or_junction removes the link, never
                 # the target it points at.
-                if (
-                    platform_compat.is_link_or_junction(flat_link)
-                    and flat_link.resolve() == target
-                ):
+                if platform_compat.is_link_or_junction(flat_link) and flat_link.resolve() == target:
                     platform_compat.unlink_link_or_junction(flat_link)
                 platform_compat.unlink_link_or_junction(item)
         # Only prune the directory if registration is all that was ever in it.
@@ -1336,7 +1389,7 @@ def reconcile_app_skills(app_name: str) -> list[str]:
     # _register_skills is already idempotent (overwrites existing symlinks)
     registered = _register_skills(app_name, manifest, app_root)
 
-    # Clean stale links: skills present as symlinks but no longer in manifest
+    # Clean stale links: skills present as symlinks but absent from the manifest
     skills_root = _skills_dir()
     app_skills_dir = skills_root / app_name
     if app_skills_dir.is_dir():
@@ -1405,6 +1458,7 @@ def _cron_defs_from_manifest(
                 "enabled": cron.enabled,
                 "timezone": cron.timezone,
                 "skip_dates": cron.skip_dates,
+                "folder": cron.folder,
             }
         )
         registered.append(namespaced)
@@ -1587,6 +1641,26 @@ async def register_app_crons_with_service(app_name: str, cron_service: Any) -> l
                 )
                 continue
         try:
+            # Resolve the manifest's folder NAME against existing Schedule-page
+            # folders (read-only: cron_folders.json is dashboard-owned and
+            # rewritten wholesale by its state, so creating from here could be
+            # silently clobbered). An unresolved folder degrades to ungrouped
+            # with a logged warning rather than failing the app's enable — the
+            # job matters more than its grouping, and the next enable re-files
+            # it once the folder exists.
+            folder_id = ""
+            folder_ref = d.get("folder") or ""
+            if folder_ref:
+                # Off-loop: the lookup reads and JSON-parses cron_folders.json,
+                # and this coroutine is awaited on the gateway loop (app enable,
+                # gateway startup), so a large or slow-to-read file would stall
+                # every request and the heartbeat with it.
+                found = await asyncio.to_thread(lookup_cron_folder_id, folder_ref)
+                folder_id = found.folder_id
+                if found.error:
+                    logger.warning(
+                        "App %s: cron %r registered ungrouped: %s", app_name, name, found.error
+                    )
             # Atomic add-if-absent: the name check and the append happen under
             # one store lock (fresh _sync first), so a CLI enable racing the
             # gateway's own registration cannot persist duplicate jobs. The
@@ -1611,6 +1685,7 @@ async def register_app_crons_with_service(app_name: str, cron_service: Any) -> l
                 # second write after the job already exists.
                 timezone=d.get("timezone") or "",
                 skip_dates=d.get("skip_dates") or None,
+                folder_id=folder_id,
             )
             if job is None:
                 # Lost the race (or already present): another registrar
@@ -1649,29 +1724,25 @@ async def register_app_crons_with_service(app_name: str, cron_service: Any) -> l
     return newly_registered
 
 
-async def deregister_app_crons_from_service(app_name: str, cron_service: Any) -> int:
-    """Remove app-owned cron jobs from the running CronService.
+async def deregister_app_crons_reporting_failures(app_name: str, cron_service: Any) -> int:
+    """Remove app-owned cron jobs, reporting EVERY failure to the caller.
 
-    Mirrors :func:`register_app_crons_with_service`. Uses :class:`CronSDK`,
-    which only removes jobs tagged ``created_by="app:{app_name}"`` — other
-    apps' jobs are unaffected.
+    Same removal as :func:`deregister_app_crons_from_service`, which wraps this
+    and is what most callers want. The difference is the disposition of an
+    unexpected failure, and it exists because ``0`` is otherwise ambiguous: it is
+    the honest answer for an app that owned nothing, and it is also what a write
+    that never reached disk looks like from outside. A caller about to do
+    something irreversible has to tell those apart, because the second case
+    leaves still-ENABLED rows on disk that keep firing against an app directory
+    that is gone.
 
-    ASYNC: awaits ``CronSDK.remove_all_async``, which removes all owned jobs in
-    ONE atomic ``CronService.remove_jobs_by_owner`` transaction (owned set
-    selected against the in-lock reloaded on-disk state, store-lock spin
-    offloaded to a worker thread) — all-or-nothing, never a partial removal that
-    orphans still-ENABLED app jobs, and never a cache-only snapshot that could
-    miss a cross-process creation. Awaitable directly on the gateway loop.
+    The rows cannot be re-counted to settle it either. A failing ``_save()``
+    leaves the removed rows filtered out of the in-memory job list and only a
+    reload restores them, so a post-hoc ``list_jobs`` reports the removal that
+    did not persist.
 
-    Idempotent — safe to call when no jobs are registered (returns ``0``).
-    Returns the number of jobs removed.
-
-    Propagates :class:`CronStoreBusy` and :class:`CronStoreUnreadable`
-    (re-raised) so a cleanup that could not complete is REPORTED to the
-    disable/uninstall caller as a failure rather than masked as a successful ``0``
-    while owned jobs stay enabled and keep executing. The two are siblings, not
-    subclasses, so each needs naming: an unreadable store degrades to an empty job
-    list, which is indistinguishable HERE from an app that owned nothing.
+    Returns the number of jobs removed. ``0`` from this function means the app
+    owned no jobs, and nothing else.
     """
     if cron_service is None:
         return 0
@@ -1707,6 +1778,46 @@ async def deregister_app_crons_from_service(app_name: str, cron_service: Any) ->
             resources=app_name,
             error=str(exc),
         )
+        raise
+
+
+async def deregister_app_crons_from_service(app_name: str, cron_service: Any) -> int:
+    """Remove app-owned cron jobs from the running CronService.
+
+    Mirrors :func:`register_app_crons_with_service`. Uses :class:`CronSDK`,
+    which only removes jobs tagged ``created_by="app:{app_name}"`` — other
+    apps' jobs are unaffected.
+
+    ASYNC: awaits ``CronSDK.remove_all_async``, which removes all owned jobs in
+    ONE atomic ``CronService.remove_jobs_by_owner`` transaction (owned set
+    selected against the in-lock reloaded on-disk state, store-lock spin
+    offloaded to a worker thread) — all-or-nothing, never a partial removal that
+    orphans still-ENABLED app jobs, and never a cache-only snapshot that could
+    miss a cross-process creation. Awaitable directly on the gateway loop.
+
+    Idempotent — safe to call when no jobs are registered (returns ``0``).
+    Returns the number of jobs removed.
+
+    Propagates :class:`CronStoreBusy` and :class:`CronStoreUnreadable`
+    (re-raised) so a cleanup that could not complete is REPORTED to the
+    disable/uninstall caller as a failure rather than masked as a successful ``0``
+    while owned jobs stay enabled and keep executing. The two are siblings, not
+    subclasses, so each needs naming: an unreadable store degrades to an empty job
+    list, which is indistinguishable HERE from an app that owned nothing.
+
+    An UNEXPECTED failure is reported as ``0``, which a caller must not read as
+    "the app owned nothing" — the logging and the audit entry above are where that
+    case is visible. A caller that has to tell the two apart, because what it does
+    next cannot be undone, calls
+    :func:`deregister_app_crons_reporting_failures` instead.
+    """
+    try:
+        return await deregister_app_crons_reporting_failures(app_name, cron_service)
+    except (CronStoreBusy, CronStoreUnreadable):
+        raise
+    except Exception:
+        # Logged and audited by the call above; this frame only chooses the
+        # disposition its own callers are written against.
         return 0
 
 
@@ -1842,18 +1953,78 @@ def _mcp_lock(*, exclusive: bool = True, target: Optional[Path] = None) -> Itera
     WHICH file's sidecar to lock (default: KiroCrew's own agent config); pass the
     legacy shared ``mcp.json`` so its read-modify-write serializes against any
     other writer of THAT file, which sits under a different sidecar.
+
+    Both failure modes are REPORTED here before they propagate, mirroring
+    :func:`kiro_crew.agent.agents_spec_lock` — this sidecar's neighbour in
+    ``~/.kiro/agents`` — because the callers that catch this treat it as
+    best-effort work at a level no operator reads:
+    :func:`registered_app_mcp_servers` returns ``{}`` on ANY exception and logs
+    nothing at all, and the boot path reaches here through
+    ``agent._install_worker_agent``, whose failure is caught at
+    ``logger.debug``. Without a report at a visible level a gateway that skipped
+    its agent-config write reads in the log exactly like one that completed it,
+    which is the silence reported in GH-11474. An unwritable lock path (a
+    read-only ``~/.kiro/agents`` mount) refuses when the sidecar is opened,
+    BEFORE any lock is attempted; ``platform_compat.file_lock`` bounds the
+    acquire itself, so neither failure mode can present as a hang.
     """
     base = target if target is not None else _mcp_json_path()
     lock_path = base.with_suffix(".lock")
-    base.parent.mkdir(parents=True, exist_ok=True)
-    lock_path.touch(exist_ok=True)
-    # "r+" (not "r"): Windows msvcrt.locking requires write access on the fd —
-    # a read-only handle fails with EACCES and platform_compat.file_lock
-    # swallows it (best-effort), silently degrading this to a no-op and letting
-    # concurrent writers race the atomic mcp.json rename.
-    with open(lock_path, "r+") as lf:
-        with platform_compat.file_lock(lf.fileno(), exclusive=exclusive):
-            yield
+    with ExitStack() as stack:
+        try:
+            base.parent.mkdir(parents=True, exist_ok=True)
+            # ONE create-or-open syscall instead of touch() + open("r+"): it
+            # never truncates, it keeps the fd WRITABLE — Windows
+            # msvcrt.locking fails EACCES on a read-only handle, which
+            # file_lock would swallow, silently degrading this to a no-op and
+            # letting concurrent writers race the atomic mcp.json rename — and
+            # it leaves the unwritable-path refusal ONE place to be reported
+            # from rather than two. See platform_compat.open_lock_file.
+            fd = stack.enter_context(platform_compat.open_lock_file(lock_path))
+        except OSError as exc:
+            # Naming the path AND the errno is the point: "Read-only file
+            # system" on this specific path is what tells the operator what to
+            # change, and it is not something retrying can recover.
+            #
+            # The KIRO_HOME remedy is true only for the DEFAULT sidecar. An
+            # explicit ``target`` -- the legacy shared ``mcp.json`` -- resolves
+            # from a fixed ``Path.home()`` that ignores KIRO_HOME, so moving it
+            # cannot move that lock, and printing the remedy there would send an
+            # operator to a setting that changes nothing. Naming the config the
+            # lock guards is what stays true for both.
+            remedy = (
+                " Point KIRO_HOME at a writable directory if the filesystem is read-only."
+                if target is None
+                else ""
+            )
+            logger.warning(
+                "cannot open the mcp config lock %s (%s) -- writes to %s cannot be "
+                "serialized, so this update is being skipped.%s",
+                lock_path,
+                exc.strerror or exc,
+                base,
+                remedy,
+            )
+            raise
+        # ``enter_context`` rather than a ``with`` around the yield, so the
+        # ``except`` below covers the ACQUIRE ALONE. A caller-body OSError (an
+        # atomic mcp.json write hitting ENOSPC, a legacy scrub hitting EACCES)
+        # reaches the same handler if the yield sits inside it, and would then
+        # be logged as a lock problem — sending an operator after a stuck holder
+        # while the real fault is the disk or the permission.
+        try:
+            stack.enter_context(platform_compat.file_lock(fd, exclusive=exclusive))
+        except OSError as exc:
+            # A stuck holder calls for a DIFFERENT operator action (find the
+            # process still holding it) than an unwritable path, so this must
+            # not carry the same remedy as above. No BlockingIOError case: this
+            # acquire is always a WAITING one, so a refusal here is the bounded
+            # ceiling and never a caller's own "do not wait" choice. A future
+            # caller that wants ``wait=False`` has to separate the two, the way
+            # ``agent.agents_spec_lock`` does.
+            logger.warning("agent-config lock %s: %s", lock_path, exc)
+            raise
+        yield
 
 
 def _read_mcp_json_unlocked(*, strict: bool = False) -> dict[str, Any]:
@@ -1962,9 +2133,10 @@ def _live_port_for(app_name: str, live_port: int | None) -> int | None:
 
 
 #: Bare python launchers an app manifest may name. Each is substituted with a resolved
-#: absolute interpreter — the app's own venv python when it exists (the interpreter its
-#: dependencies were installed against), else the RUNNING interpreter, which is the only
-#: one guaranteed to import ``kiro_crew``.
+#: absolute interpreter - the RUNNING interpreter when the gateway provisioned the app's
+#: deps dir (its wheels are ABI-bound to that interpreter), else the app's own venv
+#: python when a version-matched one exists, else the RUNNING interpreter, which is the
+#: only one guaranteed to import ``kiro_crew``.
 _BARE_PYTHON = frozenset({"python", "python3", "py"})
 
 
@@ -1981,24 +2153,159 @@ def resolve_stdio_command(cfg: dict, app_root: Path | None = None) -> dict:
     entry for exactly that reason; this is the same decision for app manifests.
 
     With ``app_root``, the resolution matches what the app's BACKEND launcher already does
-    (see :mod:`kiro_crew.apps.interpreter`): prefer the app's own venv interpreter — that is
-    where its ``requirements.txt`` was installed, so anything else risks starting the server
-    under an interpreter missing the app's dependencies — else fall back to the gateway's
-    ``sys.executable``. The two spawn paths share one policy on purpose; a second divergent
-    copy is the defect this shape removes.
+    (see :mod:`kiro_crew.apps.interpreter`): the gateway's ``sys.executable`` whenever the
+    gateway has provisioned the app's deps dir (``pip install --target`` - those wheels are
+    ABI-bound to that interpreter), else the app's own venv interpreter when a
+    version-matched one exists, else ``sys.executable`` - and expose the provisioned deps
+    dir through ``PYTHONPATH`` exactly as the backend spawn env does, EXCEPT to a server
+    launching a ``kiro_crew`` module, which must never see an app-supplied ``kiro_crew``
+    copy. The two spawn paths share one policy on purpose; a second divergent copy is the
+    defect this shape removes.
 
-    The rewrite rule, precisely: only a BARE name (no path separator) is ever touched, and
-    then only when it is a known python launcher OR the app's venv provides that exact
-    binary (a venv console script — invisible to PATH because the venv is never activated).
-    An absolute path, a command carrying a path, or a bare PATH dependency the venv does not
-    provide (``node``, ``npx``, ``docker``) was chosen deliberately and is left untouched, as
-    is an HTTP entry (no ``command``). Getting this predicate wrong breaks working apps, so
-    the boundary is pinned by tests on both sides.
+    The rewrite rule, precisely: a BARE name (no path separator) is touched when it is a
+    known python launcher OR the app's venv or deps dir provides that exact binary (a pip
+    console script - invisible to PATH because neither layout is ever activated). ONE
+    path-carrying shape is also rewritten: an absolute script whose shebang names an
+    ABI-matched interpreter, which is relaunched through deps_boot under that interpreter
+    so its provisioned deps resolve. Every other path-carrying command, a bare PATH
+    dependency the app does not provide (``node``, ``npx``, ``docker``), and an HTTP entry
+    (no ``command``) was chosen deliberately and is left untouched. Getting this predicate
+    wrong breaks working apps, so the boundary is pinned by tests on both sides.
     """
     command = cfg.get("command")
     if not isinstance(command, str):
         return cfg
     name = command.strip()
+
+    _launcher_injected_pythonpath = False
+
+    def _isolate_selected_python() -> None:
+        args = list(cfg.get("args") or [])
+        force_isolation = _launcher_injected_pythonpath or str(_DEPS_BOOT_PATH) in args
+        argv = platform_compat.isolated_python_argv(
+            *args,
+            executable=str(cfg["command"]),
+            force_isolation=force_isolation,
+        )
+        cfg["command"] = argv[0]
+        cfg["args"] = argv[1:]
+
+    # Bound on every path: the shim arms below consult it even when the
+    # deps-exposure block does not run (e.g. a gateway-module server).
+    _deps_stamp_ok = False
+    if app_root is not None and not _targets_gateway_module(cfg):
+        # Expose the provisioned deps dir the same way the backend spawn env
+        # does: a --target install carries no interpreter, so PYTHONPATH is the
+        # only bridge - a deps-provided console script's shebang is
+        # sys.executable and imports its own package from here, and a
+        # python-launcher server imports the app's requirements from here.
+        # Prepended so the app's pinned requirements win over a manifest's own
+        # PYTHONPATH. Inert for non-Python commands, and skipped entirely when
+        # the app has no provisioned deps dir. Runs BEFORE the path-command
+        # early return below: a path-based command (./bin/server,
+        # .venv/bin/python) keeps its spelling - with ONE exception, an
+        # absolute script whose shebang names an ABI-matched interpreter,
+        # which is relaunched through deps_boot under that interpreter - and
+        # it still needs the app's provisioned deps on import. NEVER injected into a server that
+        # launches a kiro_crew module: an app that pip-pins its own kiro_crew
+        # copy would otherwise shadow the gateway's code with a foreign
+        # version on the gateway's own interpreter - the same reason
+        # _targets_gateway_module pins sys.executable below. Registration can
+        # precede the first backend spawn (which provisions the dir), so the
+        # path is emitted whenever provisioning is EXPECTED (the app ships a
+        # requirements.txt) even before the dir exists: a missing PYTHONPATH
+        # entry is inert to Python. And ONLY while the requirements.txt is
+        # still declared: an update that removes it must not leave a stale
+        # preserved tree injecting removed dependency code.
+        # ABI gate for PATH-carrying commands: the deps tree is built by the
+        # GATEWAY's pip, so its wheels are ABI-bound to the gateway's
+        # interpreter. Bare names are safe (their resolution below is the
+        # gateway interpreter, a version-probed venv python, or a
+        # deps/venv-provided script whose shebang is one of those two), but
+        # a path-pinned command is arbitrary - a manifest naming a foreign
+        # python (3.11 against 3.12-built wheels) would import mismatched
+        # binary wheels and die. A path command gets the deps PYTHONPATH
+        # only on a POSITIVE match: it resolves to the gateway interpreter
+        # itself, or to the app venv's python when that venv passed the
+        # version probe. Everything else keeps its env untouched - exactly
+        # the pre-deps status quo for that server.
+        deps_dir = app_deps_dir(app_root)
+        _carries_path = bool(
+            os.sep in name
+            or (os.altsep is not None and os.altsep in name)
+            or os.path.splitdrive(name)[0]
+        )
+        _abi_matched_path = _carries_path and path_command_is_abi_matched(app_root, name)
+        # Deferred import (bridges cannot import backend at module load).
+        from kiro_crew.apps.backend import _deps_tree_stamp_current
+
+        # Stamp gate, same as the spawn path: a failed reprovision after a
+        # Python upgrade leaves an old-ABI tree on disk, and injecting it
+        # here would kill the MCP server at import instead of letting it
+        # start without deps and surface the provisioning error.
+        _deps_stamp_ok = (app_root / "requirements.txt").is_file() and _deps_tree_stamp_current(
+            app_root, app_root / "requirements.txt"
+        )
+        # A PATH command that is not itself an interpreter can still be a
+        # PYTHON SCRIPT: an app shipping an absolute-path launcher whose
+        # shebang names an ABI-matched interpreter (the gateway executable
+        # or the probed venv python) imports its provisioned deps exactly
+        # like a bare-python launch - refusing it strands the server with
+        # ModuleNotFoundError. Verified through the shebang, not the name.
+        _abi_shebang_interp = ""
+        if _carries_path and not _abi_matched_path and _deps_stamp_ok and os.path.isabs(name):
+            _cand_interp = _python_shebang_interpreter(name)
+            if _cand_interp and path_command_is_abi_matched(app_root, _cand_interp):
+                _abi_shebang_interp = _cand_interp
+        if _deps_stamp_ok and (not _carries_path or _abi_matched_path or _abi_shebang_interp):
+            env = dict(cfg.get("env") or {})
+            existing = env.get("PYTHONPATH", "")
+            env["PYTHONPATH"] = f"{deps_dir}{os.pathsep}{existing}" if existing else str(deps_dir)
+            cfg["env"] = env
+            # Positive provenance: manifest-authored PYTHONPATH never sets this bit.
+            _launcher_injected_pythonpath = True
+        if _abi_shebang_interp and _deps_stamp_ok:
+            # Launch through deps_boot (same shape as the deps-dir console
+            # script arm): the verified shebang interpreter runs the shim,
+            # the script becomes the shim's target, so .pth processing and
+            # editable installs work. Shim XOR PYTHONPATH, as everywhere.
+            cfg["command"] = _abi_shebang_interp
+            cfg["args"] = [
+                str(_DEPS_BOOT_PATH),
+                str(app_deps_dir(app_root)),
+                name,
+                *(cfg.get("args") or []),
+            ]
+            _strip_deps_pythonpath(cfg, app_deps_dir(app_root))
+            logger.debug(
+                "stdio MCP path command %r: ABI-matched shebang %s - shimmed via deps_boot",
+                name,
+                _abi_shebang_interp,
+            )
+            _isolate_selected_python()
+            return cfg
+        if _abi_matched_path and _deps_stamp_ok:
+            # An ABI-MATCHED path python (the gateway executable by path, or
+            # the probed app venv python) is still a python launch: raw
+            # PYTHONPATH would skip .pth hooks and an editable dependency
+            # dies at import. Same shim walk as the bare-python branch - the
+            # command itself is deliberately never rewritten.
+            _args = _normalize_attached_m(list(cfg.get("args") or []))
+            _ti = _py_target_index(_args)
+            if _ti is not None:
+                # ALWAYS the absolute-path spelling here: an ABI-matched
+                # path python can be the app's own venv interpreter, which
+                # has no system-site-packages and cannot import kiro_crew -
+                # `-m kiro_crew.apps.deps_boot` would die at launch. The
+                # stdlib-only shim by path runs under ANY interpreter (the
+                # same reasoning the isolation-flag arm relies on).
+                cfg["args"] = [
+                    *_args[:_ti],
+                    str(_DEPS_BOOT_PATH),
+                    str(deps_dir),
+                    *_args[_ti:],
+                ]
+                _strip_deps_pythonpath(cfg, deps_dir)
     if (
         not name
         or os.sep in name
@@ -2007,7 +2314,13 @@ def resolve_stdio_command(cfg: dict, app_root: Path | None = None) -> dict:
     ):
         # Carries a path (or, on Windows, a drive qualifier like ``D:foo``,
         # which pathlib would treat as a new anchor and silently discard the
-        # venv prefix in the join below) — deliberate, never rewritten.
+        # venv prefix in the join below) — deliberate, never rewritten. An
+        # interpreter path keeps that exact executable but still receives the
+        # shared user-site isolation flag.
+        if name == sys.executable or (
+            app_root is not None and path_command_is_abi_matched(app_root, name)
+        ):
+            _isolate_selected_python()
         return cfg
     # ``python.exe`` / ``python3.exe`` are ordinary Windows spellings of the
     # same launchers; normalise the suffix so they get the interpreter policy
@@ -2027,19 +2340,240 @@ def resolve_stdio_command(cfg: dict, app_root: Path | None = None) -> dict:
             cfg["command"] = sys.executable
         else:
             cfg["command"] = resolve_app_python(app_root)
+            # Provisioned-deps launch shim (same reasoning as the backend
+            # spawn): PYTHONPATH never processes .pth files, so a python
+            # launcher with provisioned (or expected) deps routes through
+            # deps_boot, which site.addsitedir()s the deps dir first. Only
+            # when the resolved interpreter is the GATEWAY's own (deps pin
+            # sys.executable; the shim is gateway code and must not be
+            # imported by a foreign interpreter). Interpreter options are
+            # WALKED, not guessed: the shim triple is inserted at the target
+            # token (script, -m, -c, or the operand after --), so `-u
+            # server.py` keeps -u consumed by the interpreter and server.py
+            # shimmed; attached -mMODULE/-cCODE spellings are normalized
+            # first. A shape with no resolvable target falls back to the
+            # PYTHONPATH transport.
+            _args = _normalize_attached_m(list(cfg.get("args") or []))
+            if (
+                app_root is not None
+                and cfg["command"] == sys.executable
+                # Stamp-gated like every deps exposure: shimming routes the
+                # server through the deps tree, and a stale-ABI tree must
+                # not be selected any more than it may be PYTHONPATH-injected.
+                and _deps_stamp_ok
+            ):
+                _ti = _py_target_index(_args)
+                if _ti is not None:
+                    # ALWAYS the absolute-path spelling: MCP servers start
+                    # under the SESSION's cwd (an untrusted project), and a
+                    # project shipping kiro_crew/apps/deps_boot.py would
+                    # shadow the -m spelling through sys.path[0] - project
+                    # code running as the "shim". The stdlib-only path
+                    # spelling has no import to shadow, and it is also what
+                    # -S/-E/-I (which kill -m outright) require.
+                    cfg["args"] = [
+                        *_args[:_ti],
+                        str(_DEPS_BOOT_PATH),
+                        str(app_deps_dir(app_root)),
+                        *_args[_ti:],
+                    ]
+                    _strip_deps_pythonpath(cfg, app_deps_dir(app_root))
             # The one remaining silent-death path: a script-entry server that
             # imports gateway-env packages flips to the venv interpreter the
             # moment a venv materialises and dies on import with no warning
             # (the rewritten path exists). Make the chosen interpreter
             # greppable so that diagnosis starts from a log line.
-            logger.debug(
-                "stdio MCP command %r resolved to interpreter %s", name, cfg["command"]
-            )
+            logger.debug("stdio MCP command %r resolved to interpreter %s", name, cfg["command"])
     elif app_root is not None:
         venv_cmd = venv_provided_command(app_root, name)
         if venv_cmd is not None:
             cfg["command"] = venv_cmd
+            deps_dir = app_deps_dir(app_root)
+            _shim_script = venv_cmd
+            if venv_cmd.lower().endswith(".exe"):
+                # pip's WINDOWS launcher: a native .exe with no shebang. The
+                # classic launcher pair ships a companion `<name>-script.py`
+                # beside it - that companion is the python entry and shims
+                # like any other script. An embedded-script .exe (no
+                # companion) stays a direct launch: it re-execs python
+                # itself and cannot be runpy'd.
+                _companion = Path(venv_cmd).with_name(Path(venv_cmd).stem + "-script.py")
+                if _companion.is_file():
+                    _shim_script = str(_companion)
+                elif zipfile.is_zipfile(venv_cmd) and _zip_has_main(venv_cmd):
+                    # EMBEDDED launcher (no companion): the console script
+                    # rides inside the exe as an appended ZIP with a
+                    # __main__.py stub; deps_boot's exe arm extracts and
+                    # dispatches that stub after addsitedir. A ZIP-bearing
+                    # exe WITHOUT the stub (a self-extractor, an installer,
+                    # any PE with an appended archive) is not a launcher --
+                    # wrapping it would make deps_boot's archive read raise
+                    # and the server fail to start, so it falls through to
+                    # the direct-launch arm below.
+                    _shim_script = venv_cmd
+                else:
+                    # A native exe a wheel shipped as data - not a launcher
+                    # at all; shimming it would hand a binary to the ZIP
+                    # reader. Direct launch, exactly as before the shim.
+                    _shim_script = ""
+            elif not _has_python_shebang(venv_cmd):
+                _shim_script = ""
+            if deps_dir in Path(venv_cmd).parents and _deps_stamp_ok and _shim_script:
+                # A deps-dir console script is pip-generated - a Python
+                # script whose shebang is the gateway interpreter, a Windows
+                # launcher pair, or an embedded-ZIP exe. Run direct, its
+                # editable/.pth-dependent imports die (PYTHONPATH never
+                # processes .pth), so route it through deps_boot: script and
+                # companion forms as script targets, embedded exes through
+                # the shim's exe arm. Only artifacts that ARE python-backed
+                # (shebang sniff / launcher shapes) - a package can ship
+                # arbitrary bin artifacts, and runpy on a shell script would
+                # break a working launch. Shim XOR PYTHONPATH, as
+                # everywhere.
+                cfg["command"] = sys.executable
+                # absolute-path spelling for the same session-cwd shadowing
+                # reason as the bare-python branch
+                cfg["args"] = [
+                    str(_DEPS_BOOT_PATH),
+                    str(deps_dir),
+                    _shim_script,
+                    *(cfg.get("args") or []),
+                ]
+                _strip_deps_pythonpath(cfg, deps_dir)
+    if base in _BARE_PYTHON or cfg.get("command") == sys.executable:
+        _isolate_selected_python()
     return cfg
+
+
+def _strip_deps_pythonpath(cfg: dict, deps_dir: Path) -> None:
+    """Drop the deps dir from a shimmed server's PYTHONPATH, in place.
+
+    Shim XOR PYTHONPATH: ``-m kiro_crew.apps.deps_boot`` resolves kiro_crew
+    through sys.path, so a deps-provided kiro_crew copy on PYTHONPATH would
+    SHADOW the gateway's shim - app code running as the "shim" on the
+    gateway's own interpreter. addsitedir supplies the deps only after the
+    trusted shim has imported; a manifest's own PYTHONPATH entries pass
+    through untouched.
+    """
+    env = dict(cfg.get("env") or {})
+    parts = [p for p in env.get("PYTHONPATH", "").split(os.pathsep) if p and p != str(deps_dir)]
+    if parts:
+        env["PYTHONPATH"] = os.pathsep.join(parts)
+    else:
+        env.pop("PYTHONPATH", None)
+    if env:
+        cfg["env"] = env
+    else:
+        cfg.pop("env", None)
+
+
+def _zip_has_main(path: str) -> bool:
+    """True when *path* is a ZIP whose archive carries a ``__main__.py``.
+
+    That member is what makes a ZIP-bearing executable a Python launcher
+    deps_boot's exe arm can dispatch; without it the wrap is guaranteed to
+    fail at start. Any read error reads as "not a launcher". Reads are
+    gated on the sensitive-path check like every other content sniff here.
+    """
+    if is_sensitive_path(path):
+        return False
+    try:
+        # Vet the declared inventory BEFORE constructing ZipFile: the
+        # central directory is app-controlled and ZipFile loads it whole
+        # into the gateway's memory - a crafted launcher-shaped exe must
+        # exhaust a cap, not the gateway. Real console-script launchers
+        # carry a handful of members.
+        try:
+            vet_zip_inventory(path, max_members=2048)
+        except ZipInventoryRejected:
+            return False
+        with zipfile.ZipFile(path) as zf:
+            return "__main__.py" in zf.namelist()
+    except (OSError, zipfile.BadZipFile, RuntimeError):
+        return False
+
+
+def _python_shebang_interpreter(script: str) -> str | None:
+    """The ABSOLUTE interpreter path a script's shebang names, or None.
+
+    Only the bare direct spelling (``#!/abs/path/to/python``, no arguments)
+    is returned. An ``env`` form resolves through PATH at spawn time and
+    cannot be ABI-verified ahead of it. A shebang that carries arguments
+    (``#!<python> -I``) is never a rewrite candidate: the kernel passes
+    everything after the interpreter as ONE token with its own splitting
+    rules, and flags like ``-I``/``-E``/``-s`` set the interpreter's
+    isolation posture - a rewrite that drops or re-splits them silently
+    weakens the isolation the script asked for, where the kernel's own
+    shebang launch keeps every flag exactly as written. Such scripts stay
+    on the direct launch.
+
+    The read is gated: ``script`` is a manifest-author-controlled absolute
+    path, and the gateway must not open a protected location outside the
+    sandbox on an app's say-so - the same sensitive-path gate every other
+    file-access surface consults. Any refusal or read failure reads as
+    None - the launch stays exactly what it was.
+    """
+    if is_sensitive_path(script):
+        return None
+    try:
+        with open(script, "rb") as fh:
+            head = fh.read(512)
+    except OSError:
+        return None
+    first = head.split(b"\n", 1)[0]
+    if not first.startswith(b"#!"):
+        return None
+    try:
+        parts = first[2:].decode("utf-8", "strict").strip().split()
+    except UnicodeDecodeError:
+        return None
+    if len(parts) != 1:
+        return None
+    interp = parts[0]
+    if os.path.basename(interp) == "env" or not os.path.isabs(interp):
+        return None
+    return interp
+
+
+def _has_python_shebang(script: str) -> bool:
+    """True when ``script`` opens with a ``#!`` line naming a python.
+
+    pip-generated console scripts do (their shebang is the interpreter that
+    ran pip); native binaries and foreign-language scripts do not. Any read
+    failure reads as "not python" and the launch falls back to direct
+    execution. The read carries the same sensitive-path gate as every
+    shebang sniff: the callers pass app-dir-confined paths today, and the
+    gate keeps that true against any future caller handing this a
+    manifest-verbatim path.
+    """
+    if is_sensitive_path(script):
+        return False
+    try:
+        with open(script, "rb") as fh:
+            head = fh.read(512)
+    except OSError:
+        return False
+    lines = head.split(b"\n")
+    first = lines[0]
+    if not first.startswith(b"#!"):
+        return False
+    if b"python" in first.lower():
+        return True
+    # pip (distlib) emits a shell TRAMPOLINE when the interpreter path is
+    # too long or contains spaces: a /bin/sh shebang whose SECOND line is
+    # exactly the polyglot re-exec - a triple-quote-fenced `exec <python>
+    # "$0" "$@"`. Match that structure, not token presence: a dependency's
+    # ordinary shell wrapper that merely MENTIONS python somewhere must not
+    # be handed to runpy as python source.
+    if b"sh" not in first or len(lines) < 2:
+        return False
+    second = lines[1]
+    q3 = b"\x27\x27\x27"  # three single quotes
+    return (
+        second.startswith(q3 + b"exec\x27 ")
+        and b'"$0" "$@"' in second
+        and b"python" in second.lower()
+    )
 
 
 #: CPython interpreter options that consume the NEXT argv element as their
@@ -2048,6 +2582,90 @@ def resolve_stdio_command(cfg: dict, app_root: Path | None = None) -> dict:
 #: -Xdev). Kept as an explicit table so the scanner's skip logic is checkable
 #: against `python --help` rather than inferred per finding.
 _PY_OPTS_WITH_SEPARATE_VALUE = frozenset({"-X", "-W", "--check-hash-based-pycs"})
+
+
+def _normalize_attached_m(args: list) -> list:
+    """Split attached ``-mMODULE`` / ``-cCODE`` spellings into separate form.
+
+    CPython treats ``-mserver`` and ``-m server`` identically (same for
+    ``-c``); the shim walker only takes over the separate forms, so the
+    attached spellings would silently fall back to the PYTHONPATH transport
+    and skip ``.pth`` processing. Walks the same option-prefix branch table;
+    returns the args unchanged when there is nothing to normalize.
+    """
+    out: list = []
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if not isinstance(arg, str):
+            return args
+        if arg in ("-m", "-c") or not arg.startswith("-"):
+            return [*out, *args[i:]]
+        if arg == "--":
+            # `python -- server.py` is `python server.py` whenever the
+            # operand does not itself start with a dash - drop the
+            # separator so the walker shims the script. An operand that DOES
+            # start with a dash needs the `--` and stays unshimmable.
+            if (
+                i + 1 < len(args)
+                and isinstance(args[i + 1], str)
+                and not args[i + 1].startswith("-")
+            ):
+                return [*out, *args[i + 1 :]]
+            return [*out, *args[i:]]
+        if arg.startswith(("-m", "-c")) and len(arg) > 2:
+            return [*out, arg[:2], arg[2:], *args[i + 1 :]]
+        out.append(arg)
+        if arg in _PY_OPTS_WITH_SEPARATE_VALUE:
+            if i + 1 < len(args):
+                out.append(args[i + 1])
+            i += 2
+            continue
+        i += 1
+    return out
+
+
+def _py_target_index(args: list) -> int | None:
+    """Index of the first token CPython treats as the LAUNCH TARGET.
+
+    Walks the interpreter-option prefix with the same branch table as
+    :func:`_targets_gateway_module`, returning the index of the script
+    operand or a separate ``-m`` - the insertion point for the deps_boot
+    shim triple, so interpreter options stay consumed by the interpreter.
+    Separate ``-m`` and ``-c`` ARE targets (deps_boot has arms for both),
+    and attached spellings are split by the normalizer before this walk.
+    ``None`` only for shapes with no resolvable target (a surviving ``--``
+    guarding a dash-led operand, non-string tokens, or an option prefix
+    with no target): those keep the PYTHONPATH transport.
+    """
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if not isinstance(arg, str):
+            return None
+        if arg in ("-m", "-c"):
+            return i if i + 1 < len(args) else None
+        if arg == "--" or (arg.startswith(("-m", "-c")) and len(arg) > 2):
+            # A surviving `--` means the normalizer could not remove it (the
+            # operand starts with a dash): inserting the shim after `--`
+            # would be read as a FILENAME, not an option - unshimmable.
+            return None
+        if arg == "-x" or (arg.startswith("-") and not arg.startswith("--") and "x" in arg[1:]):
+            # -x tells CPython to SKIP THE FIRST LINE of the script it
+            # launches. Inserting the shim makes deps_boot that script, and
+            # its first line opens the module docstring - the interpreter
+            # dies with SyntaxError. The flag is legacy (non-Python first
+            # lines) and cannot be honored through a shim: unshimmable, the
+            # PYTHONPATH transport keeps serving. Clustered spellings
+            # (-xu) are caught too - a missed one would be the same crash.
+            return None
+        if not arg.startswith("-"):
+            return i
+        if arg in _PY_OPTS_WITH_SEPARATE_VALUE:
+            i += 2
+            continue
+        i += 1
+    return None
 
 
 def _targets_gateway_module(cfg: dict) -> bool:
@@ -2165,6 +2783,68 @@ def _schedule_unresolvable_warning(app_name: str, server_name: str, cfg: dict) -
     )
 
 
+def _maybe_provision_backendless_deps(app_name: str, manifest: "AppManifest") -> None:
+    """Provision requirements.txt for an app whose backend spawn never runs pip.
+
+    That covers an app with NO backend entry point, and also an ADOPTED
+    file-entry backend (an externally-managed instance the gateway never
+    spawns, so the spawn-path provisioning never fires for it).
+
+    Provisioning normally runs in the backend spawn - but an app can ship
+    only stdio MCP servers, and with no backend start nothing else ever runs
+    pip: the shim/PYTHONPATH transports the resolution below emits would
+    reference a forever-empty deps tree and the server would die on its
+    first import. Stamp-gated (repeat registrations with unchanged
+    requirements do no network work), and gated on the backend entry point
+    being ABSENT: when one exists, the backend spawn owns provisioning - a
+    module-style builtin entry point in particular must never have an
+    app-dir requirements.txt provisioned (trust boundary; see
+    provision_app_deps). Failure is logged by the provisioner and
+    registration proceeds: the spawn-time import error points back at the
+    provisioning log line, matching the backend spawn's own behavior.
+    """
+    # Provenance gate, not a manifest gate: a shipped BUILTIN's trust story
+    # is the same one the backend spawn's entry gate enforces - builtin code
+    # is trusted package code, its declared dependencies live in the
+    # package's own pyproject, and an agent-planted requirements.txt in the
+    # (writable) app dir must never have pip execute its build hooks under
+    # the gateway without the third-party grant. shipped_builtin_app_root is
+    # the authoritative provenance check (immutable package composition, not
+    # mutable installed.json fields).
+    if shipped_builtin_app_root(app_name) is not None:
+        return
+    root = app_dir(app_name)
+    entry_point = manifest.backend.entryPoint
+    if entry_point:
+        # Registration provisions for FILE-entry apps too, not only
+        # backend-less ones: a healthy fixed-port backend gets ADOPTED
+        # (never spawned this session), so the spawn-path provisioning
+        # never ran and a dependency-backed stdio server would reference an
+        # empty deps tree. The stamp gate and the per-app flock make the
+        # overlap with a real spawn cheap and safe. A MODULE-style entry
+        # (trusted package code, the backend spawn's own trust gate) still
+        # never provisions app-dir requirements -- decided by the same
+        # shared predicate the backend spawn and the install-time desktop
+        # gate answer from.
+        if is_module_style_entry_point(entry_point, root):
+            return
+    if not os.path.lexists(root / "requirements.txt"):
+        # True ABSENCE only: is_file() would also answer False for a
+        # DANGLING requirements.txt symlink, silently skipping the
+        # provisioner - a present-but-unreadable entry must fall through to
+        # provision_app_deps, whose failure epilogue surfaces it (ERROR log
+        # + SEL event) instead of this fast path eating it.
+        return
+    if not has_stdio_mcp_server(manifest):
+        return
+    # Deferred import: bridges is imported during backend's boot path, so it
+    # cannot import backend at module load (same pattern as the other
+    # backend imports in this module).
+    from kiro_crew.apps.backend import provision_app_deps
+
+    provision_app_deps(app_name, root)
+
+
 def _register_mcp_servers(
     app_name: str, manifest: AppManifest, live_port: int | None = None
 ) -> list[str]:
@@ -2195,6 +2875,7 @@ def _register_mcp_servers(
     if not manifest.mcpServers:
         return []
     resolved_port = _live_port_for(app_name, live_port)
+    _maybe_provision_backendless_deps(app_name, manifest)
     registered: list[str] = []
     skipped: list[str] = []
     # Reconcile guard OUTSIDE _mcp_lock: that order is fixed everywhere, so a health
@@ -2242,7 +2923,17 @@ def _register_mcp_servers(
         # the ceiling's denial, the same second route the agent-config writers
         # already close. Strip a governed grant here too; the tools stay, they
         # just go through the gate. Idempotent and a no-op on an ungoverned host.
-        mcp_data["mcpServers"] = dict(strip_ungoverned_auto_approve(servers))
+        # This app's own entries are named explicitly rather than left to the
+        # name-shape test: the rest of this map is the owner's own file, whose
+        # `autoApprove` the opt-in exists to honour, so the two cannot share one
+        # verdict. Every key carrying this app's prefix counts, including a stale
+        # one from an earlier registration.
+        mcp_data["mcpServers"] = dict(
+            strip_ungoverned_auto_approve(
+                servers,
+                third_party={k for k in servers if k.startswith(f"{app_name}:")},
+            )
+        )
         _write_mcp_json_unlocked(mcp_data)
     logger.info(
         "Registered %d MCP server(s) for app %s (live_port=%s); skipped %d HTTP server(s) "
@@ -2322,9 +3013,7 @@ def reregister_app_mcp_servers(
     return registered
 
 
-def scrub_backend_mcp_url(
-    app_name: str, unreconciled: list[str] | None = None
-) -> list[str]:
+def scrub_backend_mcp_url(app_name: str, unreconciled: list[str] | None = None) -> list[str]:
     """Remove an app's backend-dependent MCP entry, keeping the servers that need no port.
 
     Registering with no live port is the existing path for this: it pops each HTTP entry
@@ -2369,7 +3058,8 @@ def scrub_backend_mcp_url(
                 "could not be read. Its materialized agents are KEPT and may still name "
                 "the removed server until a refresh with a readable manifest rewrites "
                 "them.",
-                removed, app_name,
+                removed,
+                app_name,
             )
         return []
     # `_register_mcp_servers` directly, NOT `reregister_app_mcp_servers`: the latter also
@@ -2649,9 +3339,7 @@ def register_app(app_name: str) -> RegistrationResult:
     return result
 
 
-def refresh_app_agents(
-    app_name: str, io_failures: list[str] | None = None
-) -> list[str]:
+def refresh_app_agents(app_name: str, io_failures: list[str] | None = None) -> list[str]:
     """Re-materialize just this app's agent configs.
 
     Called when something the agent config is derived from changes (the app's MCP reach
@@ -2684,11 +3372,11 @@ def refresh_app_agents(
 def reconcile_enabled_app_resources() -> dict[str, int]:
     """Re-register resources for every ENABLED gateway-managed app.
 
-    Called once at gateway startup.  Registration used to happen ONLY in the
-    enable path, so an app that gained agents/skills in a later version never
-    registered them for a user who had already enabled it — silently, because a
-    missing resource only logs a warning.  Reconciling at boot makes the on-disk
-    state a function of the current manifests instead of of install history.
+    Called once at gateway startup.  Registering ONLY in the enable path would
+    leave an app that gains agents/skills in a later version unregistered for a
+    user who has already enabled it — silently, because a missing resource only
+    logs a warning.  Reconciling at boot makes the on-disk state a function of
+    the current manifests rather than of install history.
 
     Idempotent: agent configs are rewritten from their template, skills/crons/MCP
     registration already overwrite in place.  Apps with ``resources="app"`` are
@@ -2759,10 +3447,195 @@ def reconcile_enabled_app_resources() -> dict[str, int]:
     return counts
 
 
+def app_conversation_keys(app_name: str, *, mapped_keys: Iterable[str] | None = None) -> list[str]:
+    """Session keys that still hold a resume pointer and belong to *app_name*.
+
+    A slot key an app chooses is often DETERMINISTIC — one slot per object it tracks,
+    named after that object — so the next slot created under that name is the same
+    key, and ``session.py``'s ``resume_sid = self._session_map.get(key)`` hands it the
+    previous conversation. That is correct while the app is installed: it is how a
+    long-lived per-object conversation keeps what it has learned about that object.
+    It stops being correct once the app is gone: reinstall it, open the same object,
+    and the first turn resumes a conversation from the previous installation — a
+    transcript from code that is gone.
+
+    Ownership is read from the record that already outlives the tab: every save
+    writes ``app`` into the conversation's metadata line, and closing a tab is a
+    save. Live ``_ChatSlot._app`` cannot answer here (the CLI path has no gateway,
+    and a closed slot is gone from a running one), and ``open_slots.json`` cannot
+    either — it tracks tabs to REOPEN, so a closed slot leaves it while the resume
+    pointer deliberately stays. A closed app slot is the mainline state before an
+    uninstall, so sourcing ownership from open tabs would miss the common case.
+
+    Scoped to keys that still have a sid, which makes this index exactly as wide as
+    the problem: a pointer exists only if a conversation was started, and starting
+    one writes the metadata line this reads.
+
+    **Which keys to look at is the caller's answer, not this function's, whenever
+    the caller owns a live map.** A detached ``SessionMap`` reads the file, and the
+    file lags a running gateway's map by whatever that map has not flushed, so a
+    detached enumeration can omit a key whose pointer already exists — and the
+    in-gateway caller then clears through the live map, leaving the pointer it
+    could not see behind for a reinstall to resume. So that caller passes
+    *mapped_keys* from its own manager (``mapped_session_keys() | session_keys()``,
+    the second covering an allocation still in flight), and the detached read is
+    reserved for the CLI path, which holds the gateway lock and therefore knows no
+    live map exists. Reading detached is sound only because nothing here writes —
+    the class's rule 3 forbids a detached WRITE.
+
+    Returns keys sorted for stable logs. Never raises: an uninstall the user asked
+    for does not fail over bookkeeping.
+    """
+    if not app_name:
+        return []
+    try:
+        log = ConversationLog()
+        candidates = SessionMap().mapped_sids_by_key() if mapped_keys is None else set(mapped_keys)
+        owned: list[str] = []
+        unreadable: list[str] = []
+        for key in candidates:
+            meta, readable = log.get_metadata_status(key)
+            if meta.get("app") == app_name:
+                owned.append(key)
+            elif not readable:
+                # A record that could not be READ is not a record that says "not this
+                # app", and the two are the same value here — ``{}``. Reported rather
+                # than guessed either way: claiming it would sweep up a conversation
+                # this app may not own, which is worse than the pointer it leaves, and
+                # dropping it in silence hides the one case where the answer is
+                # unknown. Not raised, because an uninstall the user asked for does
+                # not fail over bookkeeping.
+                unreadable.append(key)
+        if unreadable:
+            logger.warning(
+                "could not read the ownership record of %d conversation(s) while "
+                "resolving %r's keys, so their resume pointers are left in place: %s",
+                len(unreadable),
+                app_name,
+                ", ".join(sorted(unreadable)[:10]),
+            )
+        return sorted(owned)
+    except Exception:  # noqa: BLE001 — bookkeeping must not fail an uninstall
+        logger.warning("resolving %r's conversation keys failed", app_name, exc_info=True)
+        return []
+
+
+@dataclass(frozen=True)
+class SessionPointerCleanup:
+    """What a CLI-path pointer clear actually did.
+
+    ``dropped == 0`` alone cannot be reported to an operator: it is "this app owned
+    nothing", "a gateway owns the map, so nothing was attempted", and "the write
+    itself failed", and those need different messages — the first is complete, the
+    other two leave a pointer a reinstall will resume. ``declined`` and ``failed``
+    are what separate them.
+
+    ``failed`` covers the case the clear could not PERSIST: the sid clear and the
+    suppression flag are both mutations of a file that has to be written, so an
+    ENOSPC or a permission error leaves the pointer on disk while the count says
+    nothing was owned. Reported rather than raised — the uninstall itself already
+    succeeded, and bookkeeping must not fail it — but not reported as clean either.
+    """
+
+    dropped: int = 0
+    declined: bool = False
+    failed: bool = False
+
+
+def discard_app_session_pointers(app_name: str) -> SessionPointerCleanup:
+    """Drop the resume pointer of every conversation this app owned. CLI PATH ONLY.
+
+    Called by the UNINSTALL paths only, and deliberately NOT from
+    :func:`deregister_app`: that runs on **disable** too (the CLI's disable action,
+    the disable route, and the enable/update reconcile), and disable is how an app
+    is routinely restarted — App Store Sync is a disable/enable pair. Clearing
+    pointers there would discard the accumulated context of every long-lived
+    conversation the app owns, on every sync.
+
+    ``clear_sid``, not ``delete``: the entry also carries the Slack thread/channel
+    linkage and the reverse index built from it, so dropping the whole row would
+    silently unlink a mirrored session. The cleared value is stashed as
+    ``discarded_sid``, so this is diagnosable and reversible by hand — the native
+    conversation itself is untouched on disk.
+
+    **Holds the gateway lock across the whole scan and write, and that is the
+    mechanism, not a courtesy.** This writes through a throwaway ``SessionMap``,
+    which is only sound when no other instance holds the file: a running gateway
+    keeps a long-lived map whose ``_data`` loaded at startup and whose every write
+    rewrites the whole file from that snapshot, so two writers do not merge — the
+    loser's rows vanish. Writing anyway would both fail to drop the pointer (the
+    live map's next write restores it) and drop whatever that map recorded since
+    this process read, costing an unrelated session its sid or its channel link.
+    Merely *asking* whether a gateway is up cannot establish that: a gateway
+    starting between the question and the write lands in exactly the case the
+    question was meant to exclude. Taking the same lock the gateway takes makes the
+    exclusion real in both directions — while we hold it no gateway can start, and
+    if one is already up we cannot take it and decline instead. Doing nothing is
+    the pre-existing behaviour; corrupting a stranger's session is not.
+
+    The cost is stated rather than hidden: a gateway attempting to start inside this
+    window is refused as it would be by any other holder. The window is one scan
+    plus one write, and the alternative is losing another session's row.
+
+    The in-gateway route does not come through here at all — it clears through the
+    live map, inside the app lifecycle lock.
+
+    Returns what it did, not just how much: a declined clear leaves a pointer behind
+    and the caller has to be able to say so.
+    """
+    try:
+        with GatewayLock(config_dir()):
+            keys = app_conversation_keys(app_name)
+            if not keys:
+                return SessionPointerCleanup()
+            smap = SessionMap()
+            # ``clear_sid`` reports whether it dropped anything, so the count is
+            # conversations orphaned by THIS uninstall rather than keys looked at.
+            # The suppression flag goes on every owned key regardless: dropping the
+            # sid stops the NATIVE resume only, and the transcript stays on disk, so
+            # without it the next installation's first turn under this key gets the
+            # removed app's history injected as replay. A key whose pointer was
+            # already gone still has a transcript, so it still needs the flag.
+            cleared = 0
+            for key in keys:
+                if smap.clear_sid(key):
+                    cleared += 1
+                smap.set_flag(key, SUPPRESS_REPLAY_FLAG, True)
+            # Durable BEFORE the lock is released. Off-loop writes are inline today,
+            # so this is belt and braces — but the ordering is the invariant, not a
+            # property inherited from being off the loop, which a later refactor
+            # could change without noticing this depends on it.
+            smap.flush()
+    except GatewayLockError:
+        logger.info(
+            "Left %s's conversation pointers in place: a gateway owns session_map.json "
+            "and a second writer would drop rows it has not flushed yet",
+            app_name,
+        )
+        return SessionPointerCleanup(declined=True)
+    except Exception:  # noqa: BLE001 — bookkeeping must not fail an uninstall
+        logger.warning("session pointer cleanup for %r failed", app_name, exc_info=True)
+        # ``failed``, never the default: the scan and the write are both in this
+        # block, so an ENOSPC or permission error on ``flush`` lands here with the
+        # pointer still on disk. Returning the default would tell the caller the app
+        # owned nothing, and the caller prints a success tick on that.
+        return SessionPointerCleanup(failed=True)
+    if cleared:
+        logger.info(
+            "Dropped %d resume pointer(s) for %s so a reinstall starts fresh",
+            cleared,
+            app_name,
+        )
+    return SessionPointerCleanup(dropped=cleared)
+
+
 def deregister_app(app_name: str) -> RegistrationResult:
     """Deregister all resources for an app.
 
     Removes symlinks and cron manifests.  Does not remove the app directory.
+
+    Does NOT touch session resume pointers — see
+    :func:`discard_app_session_pointers` for why that belongs to uninstall alone.
     """
     result = RegistrationResult()
 
@@ -2790,5 +3663,10 @@ def deregister_app(app_name: str) -> RegistrationResult:
     except Exception as exc:
         result.errors.append(f"MCP server deregistration failed: {exc}")
 
+    # No worker re-derive here, deliberately. This file is one of SIX writers of
+    # `kirocrew.json` under two different file locks, so a re-derive per writer leaks
+    # one hole per writer nobody named. `agent.require_fresh_derived_spec` refuses a
+    # stale mirror on the SPAWN path instead, which covers every writer including the
+    # ones this module does not own -- and cannot lose the race a post-write hook can.
     logger.info("Deregistered app %s", app_name)
     return result

@@ -10,6 +10,7 @@ turn + interaction routing (transport_dispatch.py). Mirrors test_telegram.py.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import threading
 import time
@@ -21,6 +22,7 @@ from unittest import mock
 import pytest
 
 import kiro_crew.discord.transport_dispatch as td_mod
+from conftest import CREDENTIAL_STRADDLE_SHAPES, assert_rejected_without_backtracking
 from kiro_crew import session_directive
 from kiro_crew.acp.types import (
     EVENT_COMPACTION_STATUS,
@@ -33,6 +35,7 @@ from kiro_crew.acp.types import (
 )
 from kiro_crew.autonudge import AutoNudgeService
 from kiro_crew.config import KiroCrewConfig
+from kiro_crew.discord import renderer as discord_renderer
 from kiro_crew.discord.attachments import process_discord_attachments
 from kiro_crew.discord.client import (
     _INTENT_DIRECT_MESSAGES,
@@ -54,7 +57,9 @@ from kiro_crew.discord.commands import (
 from kiro_crew.discord.renderer import (
     DiscordApprovalDecider,
     DiscordRenderer,
+    _delivered_form,
     _extract_options,
+    _redact_all,
     _strip_steering,
     build_option_components,
     session_provenance_tag,
@@ -65,10 +70,16 @@ from kiro_crew.discord.transport import (
     DiscordTransport,
 )
 from kiro_crew.discord.transport_dispatch import (
+    _NOT_A_SENDER,
     _STEER_ACK_EMOJI,
     DiscordDispatcher,
+    _origin_kwargs,
+    _queued_origin,
+    _QueuedOrigin,
 )
+from kiro_crew.messaging import driver as messaging_driver
 from kiro_crew.messaging.attachments import cleanup
+from kiro_crew.messaging.display_safety import canonicalize_display, severs_a_credential
 from kiro_crew.messaging.link import (
     UNBIND_REASON_UNSPECIFIED,
     ChannelLink,
@@ -160,10 +171,20 @@ class FakeClient(MultipartFake):
     def __init__(self) -> None:
         self.sent: list[tuple[str, Any]] = []
         self.edits: list[tuple[str, str, Any]] = []
+        #: channel_id per send_message / edit_message call (parallel to `sent` / `edits`).
+        #: Which CHANNEL an outbound call addressed is otherwise invisible here, and it
+        #: is the whole question for a queue shared by two people: a receipt edited
+        #: under the wrong channel's address reaches a channel that message id does not
+        #: exist in.
+        self.send_channels: list[str] = []
+        self.edit_channels: list[str] = []
         self.component_edits: list[tuple[str, Any]] = []
         self.acked: list[str] = []
+        self.acked_destinations: list[str] = []
+        self.dm_pairings: dict[str, str] = {}
         #: (interaction_id, text, ephemeral) per interaction callback response.
         self.responses: list[tuple[str, str, bool]] = []
+        self.response_destinations: list[str] = []
         self.reactions: list[tuple[str, str]] = []
         self.thread_channels: set[str] = set()
         self.created_threads: list[tuple[str, str, str]] = []
@@ -202,6 +223,7 @@ class FakeClient(MultipartFake):
         await asyncio.sleep(0)  # yield like a real network await (exposes races)
         self._mid += 1
         self.sent.append((text, components))
+        self.send_channels.append(channel_id)
         if self.fail_sends:
             return None
         return str(self._mid)
@@ -215,6 +237,7 @@ class FakeClient(MultipartFake):
         components: Any = None,
     ) -> bool:
         self.edits.append((message_id, text, components))
+        self.edit_channels.append(channel_id)
         return self.edit_ok
 
     async def edit_message_components(
@@ -223,8 +246,11 @@ class FakeClient(MultipartFake):
         self.component_edits.append((message_id, components))
         return True
 
-    async def ack_component_interaction(self, interaction_id: str, interaction_token: str) -> None:
+    async def ack_component_interaction(
+        self, interaction_id: str, interaction_token: str, *, destination: str = ""
+    ) -> None:
         self.acked.append(interaction_id)
+        self.acked_destinations.append(destination)
 
     async def respond_interaction(
         self,
@@ -234,12 +260,17 @@ class FakeClient(MultipartFake):
         *,
         ephemeral: bool = True,
         components: Any = None,
+        destination: str = "",
     ) -> bool:
         self.responses.append((interaction_id, text, ephemeral))
+        self.response_destinations.append(destination)
         return True
 
     async def add_reaction(self, channel_id: str, message_id: str, emoji: str) -> None:
         self.reactions.append((message_id, emoji))
+
+    def remember_dm_recipient(self, channel_id: str, user_id: str) -> None:
+        self.dm_pairings[channel_id] = user_id
 
     async def create_dm_channel(self, user_id: str) -> str:
         return f"dm-{user_id}"
@@ -363,6 +394,10 @@ class FakeSessions:
         self.origin_links: dict[str, Any] = {}
         self.inbound_mirror_keys: set[str] = set()
         self.mirror_opt_outs: set[str] = set()
+        #: Per key, what ``get_or_create`` captured as the superseded store.
+        self.allocation_predecessors: dict[str, str] = {}
+        #: Per key, the model ``get_or_create`` was asked for (the boundary's stamp).
+        self.requested_models: dict[str, str] = {}
         # Batch bookkeeping, mirroring the real SessionManager: the unlink path
         # wraps its three clears in one batch, and a double without the context
         # manager would make that path unreachable from these tests. Each entry is
@@ -392,10 +427,27 @@ class FakeSessions:
         self.last_model = model
         if self.raise_on_get:
             raise RuntimeError("cold-start failed")
+        # The real boundary captures the store this allocation supersedes INSIDE
+        # its registration's critical section (``SessionAllocationService
+        # .allocation_predecessor``); the double mirrors that contract by reading
+        # its own mapping stand-in at the moment it "allocates", when a test has
+        # attached one.
+        reader = getattr(self, "mapped_sid", None)
+        if callable(reader):
+            self.allocation_predecessors[key] = str(reader(key) or "")
+        # The real boundary stamps the model the allocation SELECTED on the session
+        # (``requested_model``); the double records the argument it was handed.
+        self.requested_models[key] = str(model or "")
         # Recorded so a test can assert the dispatcher handed THIS provider on,
         # rather than merely handing on something.
         self.last_provider = FakeProvider()
         return self.last_provider, True, False
+
+    def allocation_predecessor(self, key: str) -> str:
+        return self.allocation_predecessors.get(key, "")
+
+    def allocation_requested_model(self, key: str) -> str:
+        return self.requested_models.get(key, "")
 
     def begin_turn(self, key: str) -> None:
         """The real manager's synchronous pre-dispatch closing gate."""
@@ -517,7 +569,7 @@ class FakeSessions:
     def dequeue(self, key: str) -> Any:
         return self.queued.pop(0) if self.queued else None
 
-    def clear_queue(self, key: str) -> None:
+    def clear_queue(self, key: str, owned_by: Any = None) -> None:
         self.queued.clear()
 
     def has_session(self, key: str) -> bool:
@@ -568,6 +620,82 @@ def _cfg(soft: int = 80, default_agent: str = "", dm_scope: str = "per-channel-p
     )
 
 
+def _prime_live(cfg: Any) -> None:
+    """Publish *cfg*'s ``discord`` and ``messaging`` fields as the live snapshot.
+
+    The dispatcher reads those two sections at POINT OF USE from the config
+    watcher rather than from the ``cfg=`` copy it was constructed with, so a
+    test that varies one of them has to put the value where the turn actually
+    looks for it. Every field the test's SimpleNamespace carries is copied onto
+    a real ``KiroCrewConfig``, so the production readers see real sections and
+    the loader's own defaults fill the rest.
+
+    Call it again after mutating ``d.cfg`` mid-test -- the snapshot is a copy,
+    not a view.
+    """
+    import dataclasses
+
+    from kiro_crew.config import live
+    from kiro_crew.config.loader import KiroCrewConfig
+
+    base = KiroCrewConfig()
+    sections = {}
+    for name in ("discord", "messaging"):
+        section = getattr(cfg, name, None)
+        if section is None:
+            continue
+        overrides = {
+            f.name: getattr(section, f.name)
+            for f in dataclasses.fields(getattr(base, name))
+            if hasattr(section, f.name)
+        }
+        sections[name] = dataclasses.replace(getattr(base, name), **overrides)
+    live.reset_for_tests()
+    live.watch().prime(dataclasses.replace(base, **sections))
+
+
+@pytest.fixture(autouse=True)
+def _drop_live_config_snapshot():
+    """Leave no primed config snapshot behind for the next test.
+
+    ``_prime_live`` (and ``_dispatcher``, which calls it) publishes into the
+    process-global config watcher, so without this the last test to prime would
+    set the live config for every test after it in the same worker.
+    """
+    yield
+    from kiro_crew.config import live
+
+    live.reset_for_tests()
+
+
+@contextlib.contextmanager
+def _live_discord(**discord_kw: Any):
+    """Put ``discord.*`` overrides in force for the body, then restore.
+
+    For a field the dispatcher reads per TURN off the live snapshot rather than
+    off its boot copy: the override has to be visible where the turn looks, and
+    it has to be a real section so every other live read in the same turn still
+    resolves.
+    """
+    import dataclasses
+
+    from kiro_crew.config import live
+    from kiro_crew.config.loader import KiroCrewConfig
+
+    previous = live.snapshot()
+    base = previous if previous is not None else KiroCrewConfig()
+    live.reset_for_tests()
+    try:
+        live.watch().prime(
+            dataclasses.replace(base, discord=dataclasses.replace(base.discord, **discord_kw))
+        )
+        yield
+    finally:
+        live.reset_for_tests()
+        if previous is not None:
+            live.watch().prime(previous)
+
+
 def _inbound_with_id(text: str, *, message_id: str, **kw: Any) -> InboundMessage:
     """An inbound message carrying Discord's raw message id, which is what the
     steer-ack reaction and the phase ladder both key on."""
@@ -607,10 +735,12 @@ def _dispatcher(
     dm_scope: str = "per-channel-peer",
 ) -> tuple[DiscordDispatcher, FakeClient, FakeSessions]:
     sess = FakeSessions(raise_on_get=raise_on_get)
+    cfg = _cfg(default_agent=default_agent, dm_scope=dm_scope)
+    _prime_live(cfg)
     d = DiscordDispatcher(
         sessions=sess,  # type: ignore[arg-type]
         ctx_builder=FakeCtx(),  # type: ignore[arg-type]
-        cfg=_cfg(default_agent=default_agent, dm_scope=dm_scope),
+        cfg=cfg,
         allowed_user_ids=allowed,
         allowed_thread_ids=allowed_threads,
         agent=None,
@@ -622,6 +752,26 @@ def _dispatcher(
 
 
 # ── commands.py ──────────────────────────────────────────────────────────
+
+
+def _dc_origin(user: str = "u1", channel: str = "c1", *, thread: str = "") -> _QueuedOrigin:
+    """One queued message's origin: who sent it, and where its reply goes.
+
+    Defaults are user ``u1`` in channel ``c1``, the DM these tests use throughout.
+    """
+    return _QueuedOrigin(user_id=user, channel_id=channel, thread_id=thread)
+
+
+def _origin(*a: Any, **kw: Any) -> dict[str, str]:
+    """:func:`_dc_origin` as queue-entry kwargs, spelled by the PRODUCTION writer.
+
+    A queue entry carries who sent it and where its reply goes, because the drain
+    replays it under that envelope rather than under the turn that opened the queue.
+    Built through ``_origin_kwargs`` rather than by spelling the storage keys, so
+    renaming one moves this fixture with it instead of leaving it green against a
+    shape production does not write.
+    """
+    return _origin_kwargs(_dc_origin(*a, **kw))
 
 
 class TestParseCommand:
@@ -705,7 +855,7 @@ _FENCE_SHAPES = [
     "```py\n" + _ORACLE_CODE * 20 + "```\n\n```sh\nls\n" + _ORACLE_CODE * 20,  # two fences
     "````md\n" + _ORACLE_CODE * 20 + "```\n" + _ORACLE_CODE * 20 + "\n\n\n",  # ws tail
     # Blank code lines INSIDE a fence with more code after them -- the shape the
-    # remainder used to delete, swept at every limit so the cut lands on each
+    # remainder would delete, swept at every limit so the cut lands on each
     # newline of the run in turn.
     "```py\n" + _ORACLE_CODE * 20 + "\n\n" + _ORACLE_CODE * 20,
     "```py\n" + (_ORACLE_CODE + "\n\n\n") * 12,  # 4-newline runs throughout
@@ -757,14 +907,14 @@ class TestRotationSplitting:
         r._buf = [source]
         offloads: list[tuple[Any, tuple[Any, ...], dict[str, Any]]] = []
 
-        def _capture(text: str, limit: int) -> list[str]:
-            return [text]
+        def _capture(text: str, limit: int) -> tuple[list[str], bool]:
+            return [text], False
 
         async def _offload(func: Any, /, *args: Any, **kwargs: Any) -> Any:
             offloads.append((func, args, kwargs))
             return func(*args, **kwargs)
 
-        monkeypatch.setattr(renderer_module, "split_markdown_safe", _capture)
+        monkeypatch.setattr(renderer_module, "split_markdown_safe_with_tier", _capture)
         monkeypatch.setattr(renderer_module.asyncio, "to_thread", _offload)
 
         await r._rotate_on_length()
@@ -772,6 +922,14 @@ class TestRotationSplitting:
         assert offloads == [
             (renderer_module.protected_ref_spans, (source,), {}),
             (_capture, (source, 100), {}),
+            # The rotation grades the pair the splitter never sees -- the sealed
+            # chunks plus the tail it retains -- and that read is over
+            # attacker-influenced text, so it is offloaded like the two above it.
+            (
+                renderer_module.severs_a_credential,
+                ([source], renderer_module._redact_all, renderer_module._delivered_form),
+                {},
+            ),
         ]
 
     @pytest.mark.asyncio
@@ -786,7 +944,7 @@ class TestRotationSplitting:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         # Nothing appended and nothing to undo, including for the shapes the
-        # deleted tail-closer strip used to have to reason about.
+        # deleted tail-closer strip would have to reason about.
         for text in ["```py\nx = 1\n", "type ``` here", "plain prose"]:
             assert await self._rotate(monkeypatch, text, 1900) == ([], text)
 
@@ -829,6 +987,301 @@ class TestRotationSplitting:
         assert tail.startswith("```py\n")  # the authored opener, not a bare ```
         assert not tail.rstrip().endswith("```")
         assert src.endswith(tail[len("```py\n") :])  # the tail IS the source's own tail
+
+    @pytest.mark.asyncio
+    async def test_a_seal_ending_in_escape_degrades_uploads(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Escape opener UNMATCHED across the seam: the sealed prefix ends in an
+        odd backslash run, so a marker on the live tail's first line is escaped
+        (literal) in the full text but real when the tail is scanned alone.
+
+        The seam-aware classifier asks the extraction reader at the tail's own
+        resume point: the two readings disagree, so the rotation fails closed.
+        Left un-degraded, the semantic seal would upload a source-literal file.
+        """
+        r, _ = self._renderer(monkeypatch, 60)
+        # Cut lands right after a lone backslash; the tail opens with markup the
+        # backslash escapes in the full text.
+        r._buf = ["y" * 59 + "\\" + "![c](/tmp/c.png) tail"]
+        await r._rotate_on_length()
+        assert r._segment_uploads_safe is False
+
+    @pytest.mark.asyncio
+    async def test_an_escaped_trailing_space_is_not_escape_debt(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Escape opener MATCHED (spent) at the seam: a backslash escaping a real
+        trailing space straddles nothing the tail resumes.
+
+        The extraction reader judges both readings the same, so the classifier
+        sees no flip and uploads stay eligible. A whole-head escape count on the
+        rstripped sealed chunk would have faked debt here; consulting the reader
+        at the tail's resume point does not.
+        """
+        r, _ = self._renderer(monkeypatch, 60)
+        assert r._segment_uploads_safe is True
+        r._buf = ["x" * 58 + "\\ short tail here"]
+        await r._rotate_on_length()
+        assert r._segment_uploads_safe is True
+
+    @pytest.mark.asyncio
+    async def test_a_clean_seal_keeps_uploads_eligible(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A seam with no open literalness context of any kind is neutral: both
+        readings agree, so uploads stay eligible."""
+        r, _ = self._renderer(monkeypatch, 60)
+        assert r._segment_uploads_safe is True
+        r._buf = ["x" * 58 + " short tail here"]
+        await r._rotate_on_length()
+        assert r._segment_uploads_safe is True
+
+    @pytest.mark.asyncio
+    async def test_a_backtick_balanced_within_the_seam_block_is_not_debt(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A backtick BALANCED within the seam's own blank-line block is not
+        debt: the block closes its inline-code span before the seam, so the
+        prefix opens nothing the tail inherits.
+
+        Check 1 masks the seam's own block with the reader's segmentation. A
+        block whose backticks pair leaves no surviving opener, so uploads stay
+        eligible -- degrading here would only cost a genuinely-real image later.
+        """
+        r, _ = self._renderer(monkeypatch, 60)
+        assert r._segment_uploads_safe is True
+        # An earlier paragraph carries a lone backtick, but the seam's OWN block
+        # closes its inline-code span (`code`) before the over-limit filler is
+        # cut, so nothing is left open at the seam.
+        r._buf = ["a ` char here\n\nthen `code` and " + "y" * 70 + "\n"]
+        await r._rotate_on_length()
+        assert r._segment_uploads_safe is True
+
+    @pytest.mark.asyncio
+    async def test_an_open_inline_code_opener_in_the_seam_block_degrades(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An inline-code opener still OPEN in the seam's own block degrades,
+        fail-closed.
+
+        The seam's block ends inside an unclosed inline-code span. Whether a
+        closing backtick arrives later on the tail is unknown at rotation, and if
+        it does the tail-alone read promotes a marker the full text keeps
+        literal -- so the classifier fails closed on the open opener in the
+        seam's own block rather than gambling on the closer never arriving.
+        """
+        r, _ = self._renderer(monkeypatch, 60)
+        assert r._segment_uploads_safe is True
+        # The seam's own block opens an inline-code span and does not close it
+        # before the over-limit line is cut.
+        r._buf = ["intro\n\nopen `code span " + "y" * 70 + "\n"]
+        await r._rotate_on_length()
+        assert r._segment_uploads_safe is False
+
+    @pytest.mark.asyncio
+    async def test_two_unmatched_backticks_in_separate_paragraphs_degrade(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Two unmatched backticks in SEPARATE paragraphs, then a literal local
+        image across the seam, must degrade (GPT finding on the whole-region
+        mask).
+
+        A whole-prefix mask pairs the two lone backticks across the blank line
+        and sees no debt, so a later ``![b](...)`` that the full text keeps
+        literal -- because the second paragraph's inline-code span still covers
+        it -- is uploaded once the tail is scanned alone. Block-bounding the mask
+        to the seam's own block (the reader's own segmentation) sees the second
+        paragraph's opener still open and degrades. Fail closed.
+        """
+        r, _ = self._renderer(monkeypatch, 60)
+        assert r._segment_uploads_safe is True
+        # Para 1 opens a lone backtick; blank line; para 2 opens another and its
+        # over-limit line is cut with the span still open -- a later
+        # ``![b](/tmp/b.png)`` on the tail, closed by a trailing backtick, is
+        # literal in the full text but real in the tail alone.
+        r._buf = [
+            "first `para with a lone tick\n\n"
+            "second `para " + "y" * 70 + " and ![b](/tmp/b.png) done`\n"
+        ]
+        await r._rotate_on_length()
+        assert r._segment_uploads_safe is False
+
+    @pytest.mark.asyncio
+    async def test_a_matched_inline_code_pair_across_the_seam_stays_eligible(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Inline-code opener MATCHED before the seam: a balanced pair leaves no
+        open context for the tail to resume, so uploads stay eligible."""
+        r, _ = self._renderer(monkeypatch, 60)
+        assert r._segment_uploads_safe is True
+        r._buf = ["a `code` here " + "y" * 70 + "\n"]
+        await r._rotate_on_length()
+        assert r._segment_uploads_safe is True
+
+    @pytest.mark.asyncio
+    async def test_an_open_fence_across_the_seam_does_not_disable_uploads(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Fence opener across the seam via a REOPENER tail: the splitter builds
+        ``tail = reopener + remainder`` with a synthetic ``"```lang\\n"`` the
+        source never had, so ``split_source.endswith(tail)`` is False.
+
+        The seam then sits inside an open fence -- literal in both readings and
+        already owned by the fence-aware per-chunk span scan -- so the classifier
+        is skipped and uploads stay eligible. A naive concatenation check would
+        have fabricated a closing-then-reopening fence and faked debt.
+        """
+        r, _ = self._renderer(monkeypatch, 60)
+        assert r._segment_uploads_safe is True
+        # A long code fence, still open, over the limit -- no orphaned ref.
+        r._buf = ["```py\n" + "x = 1\n" * 40]
+        await r._rotate_on_length()
+        assert r._segment_uploads_safe is True
+
+    @pytest.mark.asyncio
+    async def test_an_over_limit_indented_fenced_block_stays_eligible(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A fenced block whose lines are themselves indented, crossing the
+        limit, must not disable uploads.
+
+        The reopener tail makes ``split_source.endswith(tail)`` False, so the
+        seam classifier is skipped: every seam is inside the open fence, literal
+        in both readings. Otherwise the reopened fence's indent would have faked
+        indentation debt and disabled uploads for the whole segment.
+        """
+        r, _ = self._renderer(monkeypatch, 60)
+        assert r._segment_uploads_safe is True
+        r._buf = ["```py\n" + "    indented_code = 1\n" * 6]
+        await r._rotate_on_length()
+        assert r._segment_uploads_safe is True
+
+    @pytest.mark.asyncio
+    async def test_a_midline_cut_in_indented_code_degrades_uploads(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Indentation opener UNMATCHED across the seam (head indented, tail
+        not): a four-space indented logical line dirty-cut MID-LINE leaves the
+        tail continuing that literal-code context WITHOUT its indent.
+
+        The full text reads a marker on that line literal (indented code); the
+        de-indented tail reads it real. The classifications differ -- the seam
+        classifier sees the flip and fails closed. This is the original
+        local-path leak repro: left un-degraded, the semantic seal would upload
+        a source-literal file.
+        """
+        r, _ = self._renderer(monkeypatch, 60)
+        assert r._segment_uploads_safe is True
+        # One over-limit indented-code line, no ref yet; it is cut mid-line and
+        # the tail resumes the same logical line without the four-space indent.
+        r._buf = ["    " + "y" * 90 + "\n"]
+        await r._rotate_on_length()
+        assert r._segment_uploads_safe is False
+
+    @pytest.mark.asyncio
+    async def test_a_midline_cut_without_indent_keeps_uploads_eligible(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Indentation MATCHED (absent in both): a non-indented logical line cut
+        mid-line opens no literal-code context.
+
+        A marker on its tail is genuinely real in the full text too, so both
+        readings agree and there is no degrade.
+        """
+        r, _ = self._renderer(monkeypatch, 60)
+        assert r._segment_uploads_safe is True
+        r._buf = ["z" * 90 + "\n"]
+        await r._rotate_on_length()
+        assert r._segment_uploads_safe is True
+
+    @pytest.mark.asyncio
+    async def test_a_midline_cut_before_a_tab_led_tail_degrades_uploads(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Indentation opener UNMATCHED the OTHER way (head not indented, tail
+        tab-led): the mirror flip.
+
+        ``_safe_cut`` admits a mid-line boundary right before a leading ``\\t``
+        (a tab is not a delimiter lead), so the retained tail BEGINS tab-led and
+        reads as indented code at offset 0 -- while the source line's own start
+        is not indented. The full text reads a marker on that line REAL, the
+        tail-alone reading reads it LITERAL: the seal drops the image and ships
+        the raw local path to Discord as display text. The seam classifier fails
+        closed on the mismatch.
+        """
+        r, _ = self._renderer(monkeypatch, 60)
+        assert r._segment_uploads_safe is True
+        # Over-limit single logical line; the mid-line cut lands so the tail
+        # begins with a tab (>= four expanded columns) while the source line
+        # itself is not indented -- a literalness flip.
+        r._buf = ["z" * 59 + "\t  more code on the same over-limit logical line\n"]
+        await r._rotate_on_length()
+        assert r._segment_uploads_safe is False
+
+    @pytest.mark.asyncio
+    async def test_an_over_limit_fenced_block_does_not_fake_seam_debt(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A fenced block crossing the limit must not disable uploads: the
+        reopener tail makes the seam classifier skip (seam inside an open
+        fence, owned by the fence-aware per-chunk span scan)."""
+        r, _ = self._renderer(monkeypatch, 60)
+        assert r._segment_uploads_safe is True
+        # An indented fenced code block, over the limit, carrying no orphaned
+        # reference -- every seam is inside the open fence.
+        r._buf = ["```py\n" + "    indented_code = 1\n" * 6]
+        await r._rotate_on_length()
+        assert r._segment_uploads_safe is True
+
+    @pytest.mark.asyncio
+    async def test_the_original_local_path_leak_is_not_uploaded(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """End-to-end: the indentation-seam leak (the class all three review
+        blocks descended from) does not surface a workspace path as an upload.
+
+        A four-space indented over-limit line is cut mid-line; a later image
+        marker arrives on the de-indented tail. The full text keeps it literal
+        (indented code), so the file must NOT be extracted -- degrading routes
+        the seal to redacted display text, where the marker stays literal, and
+        no OutboundFile is produced.
+        """
+        r, cli = self._renderer(monkeypatch, 60)
+        assert r._segment_uploads_safe is True
+        # Rotate on the indented over-limit line -> degrade.
+        r._buf = ["    " + "y" * 90 + "\n"]
+        await r._rotate_on_length()
+        assert r._segment_uploads_safe is False
+        # The later marker arrives on the tail; the segment stays degraded, so
+        # the seal extracts nothing (no local file uploaded).
+        r._buf.append("![c](/tmp/c.png)\n")
+        await r._seal_current(extract_uploads=True)
+        assert cli.uploaded_files == []
+
+    @pytest.mark.asyncio
+    async def test_an_inline_code_span_opened_before_the_seam_degrades(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A `` ``code `` inline-code span opened in the sealed prefix, whose
+        closer sits DEEP in the live tail, degrades the segment.
+
+        The rotation seals a prefix that opens a two-backtick inline span; the
+        tail is later sealed WITHOUT that opener, so a marker the full text kept
+        literal because the span covered it reads as real once the tail is
+        scanned alone. The ref-set at the rotation seam cannot see it -- the tail
+        still carries the closing delimiter at that instant -- so the classifier
+        catches it as an inline-code opener with no closer before the seam. Fail
+        closed: the whole segment degrades.
+        """
+        r, _ = self._renderer(monkeypatch, 60)
+        assert r._segment_uploads_safe is True
+        # `` ``code `` opens a two-backtick inline span; the over-limit filler
+        # forces a rotation whose sealed prefix ends inside that open span,
+        # while the closer only arrives far down the live tail.
+        r._buf = ["``code\n" + "x" * 80 + "\n" + "y" * 80 + "\ntail and ![b](/tmp/b.png)\n``"]
+        await r._rotate_on_length()
+        assert r._segment_uploads_safe is False
 
     @pytest.mark.asyncio
     async def test_fence_grammar_seams_survive_a_rotation(
@@ -1016,7 +1469,7 @@ class TestRotationSplitting:
     ) -> None:
         """Swept oracle: a rotation IS the splitter's output, verbatim.
 
-        The renderer used to carry its own splitter and then undo part of it, and
+        The renderer must not carry its own splitter and then undo part of it, since
         every defect in that cluster was the append and the strip disagreeing on
         one shape. There is nothing left to disagree about, and this pins that:
         each chunk but the last is sealed exactly once, in order, and the last is
@@ -1110,19 +1563,16 @@ class TestExtractOptions:
         # each position — polynomial. The tempered body
         # (?:[^[]|\[(?!OPTIONS:))* forbids only a re-occurring "[OPTIONS:", so
         # the body is unambiguous (linear). A whitespace-padded unterminated tag
-        # and many repeated "[OPTIONS:" prefixes (the real pump) must both return
-        # promptly.
-        import time
-
-        for evil in (
-            "[OPTIONS:" + ("\t" * 200_000) + "x",
-            "[OPTIONS:" * 100_000 + "x",
-        ):
-            start = time.perf_counter()
-            body, opts = _extract_options(evil)
-            elapsed = time.perf_counter() - start
-            assert elapsed < 1.0, f"_extract_options took {elapsed:.2f}s (possible ReDoS)"
+        # and many repeated "[OPTIONS:" prefixes (the real pump) must both be
+        # rejected in CPU time linear in the pump -- see
+        # conftest.assert_rejected_without_backtracking for why this is not a
+        # 1.0 s wall-clock bound.
+        def reject(text: str) -> None:
+            body, opts = _extract_options(text)
             assert opts == []
+
+        assert_rejected_without_backtracking(reject, lambda n: "[OPTIONS:" + ("\t" * n) + "x")
+        assert_rejected_without_backtracking(reject, lambda n: "[OPTIONS:" * n + "x")
 
 
 class TestStripSteering:
@@ -1139,6 +1589,78 @@ class TestStripSteering:
     def test_an_unclosed_marker_cannot_span_table_rows(self) -> None:
         text = "[STEERING steer-deadbeef |\n| --- | --- |"
         assert _strip_steering(text) == text
+
+    def test_removes_a_marker_whose_summary_wrapped(self) -> None:
+        """kiro-cli's rephrase is free to wrap, and the frame is still a frame.
+
+        Every other reader of this frame says so: ``messaging.driver`` matches it
+        with ``re.DOTALL``, ``constants._STEERING_TAIL_PREFIX_RE`` closes the same
+        grammar's prefix with ``re.DOTALL``, and the dashboard's parser spells the
+        summary ``[\\s\\S]*?``. A class that stopped at the first line end left the
+        marker in the delivered Discord message.
+        """
+        text = "before [STEERING steer-ab12: switching to the job id\nand re-running it] after"
+        out = _strip_steering(text)
+        assert "STEERING" not in out
+        assert out.startswith("before") and out.endswith("after")
+
+    def test_the_chip_summary_survives_a_wrapped_marker(self) -> None:
+        """``_rotate_at_markers`` reads the summary at the offset the marker
+        pattern chose, so the two must agree on the same frame: a summary the
+        marker matched but this one did not leaves the steer chip blank."""
+        text = "[STEERING steer-ab12: switching to the job id\nand re-running it]"
+        marker = discord_renderer._STEER_MARKER_RE.search(text)
+        assert marker is not None
+        summary = discord_renderer._STEER_SUMMARY_RE.match(text, marker.start())
+        assert summary is not None
+        assert summary.group(1) == "switching to the job id\nand re-running it"
+
+    def test_a_dashed_steer_id_is_one_frame_to_both_patterns(self) -> None:
+        """``messaging.driver`` accepts ``[0-9a-f-]+`` for the id, so a dashed id
+        is a real frame; the two patterns here have to agree about it."""
+        text = "[STEERING steer-a180-ae7f: checked] tail"
+        marker = discord_renderer._STEER_MARKER_RE.search(text)
+        assert marker is not None
+        summary = discord_renderer._STEER_SUMMARY_RE.match(text, marker.start())
+        assert summary is not None and summary.group(1) == "checked"
+        assert _strip_steering(text).strip() == "tail"
+
+    def test_prose_that_merely_opens_with_the_sentinel_stays(self) -> None:
+        """The counterpart to allowing newlines, and the reason it is safe.
+
+        ``messaging.driver`` already rules that opening with the sentinel is not
+        being a marker. Without the id requirement, a class that spans lines would
+        swallow from ``[STEERING`` to any later ``]`` -- here a Markdown link two
+        lines down.
+        """
+        text = "[STEERING is the feature I mean\n\nsee the [docs](x) for it"
+        assert _strip_steering(text) == text
+
+    def test_the_grammar_agrees_with_the_messaging_driver(self) -> None:
+        """One frame, two readers: a corpus both must classify the same way.
+
+        This renderer is defence for callers that bypass ``TurnDriver``, so the
+        two spellings answer the same question about the same bytes; a divergence
+        is how one surface starts delivering what the other removes.
+        """
+        frames = [
+            "[STEERING steer-ab12: checked]",
+            "[STEERING steer-a180ae7f: 已并行查询悉尼天气,一并答复。]",
+            "[STEERING steer-a180-ae7f: checked]",
+            "[STEERING steer-ab12: line one\nline two]",
+            "[STEERING steer-ab12]",
+        ]
+        not_frames = [
+            "[STEERING is the feature I mean]",
+            "[STEERING steer-: empty id]",
+            "[STEERING steer-zzzz: not hex]",
+        ]
+        for text in frames:
+            assert discord_renderer._STEER_MARKER_RE.fullmatch(text), text
+            assert messaging_driver._STEER_MARKER_RE.match(text), text
+        for text in not_frames:
+            assert discord_renderer._STEER_MARKER_RE.fullmatch(text) is None, text
+            assert messaging_driver._STEER_MARKER_RE.match(text) is None, text
 
 
 class TestFindButtonLabel:
@@ -1288,12 +1810,13 @@ class TestDiscordAttachmentAdapter:
         client.attachment_bodies[url] = b"OggS" + b"\x00" * 32
         transcribed: list[str] = []
 
-        async def _transcribe(path: str) -> str:
+        async def _transcribe(path: str, _cfg: object) -> str:
             assert os.path.exists(path)
             transcribed.append(path)
             return "spoken words"
 
         monkeypatch.setattr("kiro_crew.transcribe.is_available", lambda: True)
+        monkeypatch.setattr("kiro_crew.transcribe.batch_duration_cap_secs", lambda _cfg: None)
         monkeypatch.setattr("kiro_crew.transcribe.transcribe_audio", _transcribe)
 
         result = await process_discord_attachments(
@@ -1789,7 +2312,7 @@ class TestRenderer:
         final = cli.final_text()
         assert final.count("```") % 2 == 0  # balanced -> no stray backticks
         # The fence must CLOSE, which the balance check above already proves;
-        # the message no longer ENDS on the closer because the turn footer is
+        # the message does not END on the closer because the turn footer is
         # appended as a trailing subtext line after it.
         assert final.startswith("```")
         assert final.split("-# Finished in ")[0].rstrip().endswith("```")
@@ -2138,6 +2661,29 @@ class TestDispatcher:
         return InboundMessage(channel_type="discord", user_id=user, conversation_id=chan, text=text)
 
     @pytest.mark.asyncio
+    async def test_member_memory_refusal_redacts_before_posting(self, monkeypatch) -> None:
+        from unittest.mock import AsyncMock
+
+        from kiro_crew.memory_stores import UnknownMemoryStore
+
+        private_path = "/home/alice/.kiro/crew/memory_stores/member-one/memory.db"
+        credential = "AKIAIOSFODNN7EXAMPLE"
+        failure = UnknownMemoryStore(
+            f"memory_unavailable: cannot open {private_path}; {credential}"
+        )
+        monkeypatch.setattr(
+            "kiro_crew.discord.transport_dispatch.session_store_for_turn",
+            AsyncMock(side_effect=failure),
+        )
+        dispatcher, client, sessions = _dispatcher({"u1"})
+        await dispatcher.handle_message(self._msg("hello"))
+        posted = "\n".join(text for text, _ in client.sent)
+        assert "memory_unavailable:" in posted
+        assert private_path not in posted and "alice" not in posted
+        assert credential not in posted
+        assert sessions.released == []
+
+    @pytest.mark.asyncio
     async def test_a_disconnected_conversation_gets_no_reply(self) -> None:
         """Disconnecting Discord in the dashboard must actually stop the replies.
 
@@ -2192,8 +2738,8 @@ class TestDispatcher:
         ACP session. ``on_turn_start`` does not send the indicator inline -- it
         spawns a refresh task -- so it must be called BEFORE the cold start, or
         the task is not even created until the cold start has finished and the
-        user sees several seconds of dead air. That regressed when attachment
-        ingestion was inserted ahead of ``on_turn_start`` (#1053). The shared
+        user sees several seconds of dead air. Inserting attachment ingestion
+        ahead of ``on_turn_start`` reintroduces exactly that. The shared
         skeleton in messaging/dispatch.py documents this order as "typing
         indicator before cold start"; telegram/transport_dispatch.py follows it.
 
@@ -2270,6 +2816,40 @@ class TestDispatcher:
         assert not sess.failures
         # Refused is not leaked -- the session-keyed semaphore still comes back.
         assert sess.released
+
+    @pytest.mark.asyncio
+    async def test_a_shutdown_refusal_is_not_spooled_for_a_restricted_session(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """An incognito or temporary conversation persists nothing, the spool included.
+
+        RED-BEFORE: without the restricted-session gate at the refusal point the
+        private message is written verbatim to ``refused.jsonl``.
+        """
+        from kiro_crew.messaging import inbound_spool as S
+
+        monkeypatch.setattr(S, "data_home", lambda: tmp_path)
+        d, _cli, sess = _dispatcher({"u1"})
+        sess.closing = True
+        spool = tmp_path / "inbound-spool" / "refused.jsonl"
+
+        # Persistent: the refusal is spooled.
+        await d.handle_message(self._msg("keep me"))
+        assert spool.exists() and "keep me" in spool.read_text(encoding="utf-8")
+        spool.unlink()
+        sess.reserve_inbound_callback = lambda: None
+
+        d._session_resume.route = mock.AsyncMock(
+            return_value=td_mod.RoutingDecision(resumed_key="dashboard:restricted")
+        )
+
+        async def _restricted(key: str) -> bool:
+            return key == "dashboard:restricted"
+
+        monkeypatch.setattr(d, "_session_restricted", _restricted)
+        await d.handle_message(self._msg("my secret"))
+
+        assert not spool.exists(), "an incognito message was persisted to the spool"
 
     @pytest.mark.asyncio
     async def test_monitor_wake_busy_at_dispatch_boundary_is_not_steered_or_queued(
@@ -2364,20 +2944,15 @@ class TestDispatcher:
             )
         )
         try:
-            await boundary_reached.wait()
+            await asyncio.wait_for(boundary_reached.wait(), timeout=5)
             await manager.get_or_create(key)  # A user turn wins the actual semaphore.
             resume_monitor.set()
 
-            # Fixed scheduler turns keep the assertion deterministic: the
-            # non-waiting claim completes immediately, while the old blocking
-            # path remains parked until the user lease is released in finally.
-            for _ in range(10):
-                await asyncio.sleep(0)
-                if monitor_task.done():
-                    break
-
-            assert monitor_task.done()
-            assert monitor_task.result() is MonitorDispatchResult.BUSY
+            # Await completion while the user still owns the semaphore. Real
+            # off-loop metadata reads may need more than a few scheduler turns;
+            # a blocking claim cannot finish before finally releases the user.
+            result = await asyncio.wait_for(asyncio.shield(monitor_task), timeout=5)
+            assert result is MonitorDispatchResult.BUSY
             assert provider.steered == []
             assert manager.dequeue(key) is None
             assert completions == []
@@ -2828,6 +3403,7 @@ class TestDispatcher:
     ) -> None:
         d, cli, sess = _dispatcher({"u1"})
         d.cfg.messaging.queue_mode = "queue"
+        _prime_live(d.cfg)
         download_started = asyncio.Event()
         finish_download = asyncio.Event()
         url = "https://cdn.discordapp.com/attachments/c/m/slow.png"
@@ -2915,8 +3491,11 @@ class TestDispatcher:
         assert "Kiro Crew — Discord" not in "\n".join(text for text, _ in cli.sent)
 
     @pytest.mark.asyncio
-    async def test_attachment_rejection_is_not_silent(self) -> None:
+    async def test_opaque_attachment_download_is_not_silent(self) -> None:
         d, cli, _ = _dispatcher({"u1"})
+        url = "https://cdn.discordapp.com/a.bin"
+        payload = b"complete opaque bytes"
+        cli.attachment_bodies[url] = payload
         await d.handle_message(
             InboundMessage(
                 channel_type="discord",
@@ -2927,16 +3506,20 @@ class TestDispatcher:
                     {
                         "filename": "archive.bin",
                         "content_type": "application/octet-stream",
-                        "size": 10,
-                        "url": "https://cdn.discordapp.com/a.bin",
+                        "size": len(payload),
+                        "url": url,
                     }
                 ],
             )
         )
         await asyncio.sleep(0)
 
-        assert "unsupported type" in d.ctx_builder.messages[-1]
-        assert cli.attachment_downloads == []
+        prompt = d.ctx_builder.messages[-1]
+        paths = [line for line in prompt.splitlines() if line.endswith(".bin")]
+        assert "[Attached file: archive.bin]" in prompt
+        assert cli.attachment_downloads == [url]
+        assert len(paths) == 1
+        assert not os.path.exists(paths[0])
 
     @pytest.mark.asyncio
     async def test_busy_attachment_waits_for_queued_turn_before_cleanup(self) -> None:
@@ -2967,7 +3550,7 @@ class TestDispatcher:
         sess.set_mirror_link(
             "dashboard:chat-1", ChannelLink("discord", channel_id="c1"), accepts_inbound=True
         )
-        await d._drain_queue(native_key, "u1", "c1")
+        await d._drain_queue(native_key)
         await asyncio.sleep(0)
 
         assert sess.get_origin_link(native_key) == ChannelLink("discord", channel_id="c1")
@@ -2998,12 +3581,12 @@ class TestDispatcher:
         first = _batch("first")
         second = _batch("second")
         sess.queued = [
-            ("t1", "first batch", {"attachments": first}),
-            ("t2", "second batch", {"attachments": second}),
-            ("t3", "after second", {"attachments": []}),
+            ("t1", "first batch", {"attachments": first, **_origin()}),
+            ("t2", "second batch", {"attachments": second, **_origin()}),
+            ("t3", "after second", {"attachments": [], **_origin()}),
         ]
 
-        await d._drain_queue(d._session_key("u1"), "u1", "c1")
+        await d._drain_queue(d._session_key("u1"))
 
         assert cli.attachment_downloads == [item["url"] for item in [*first, *second]]
         assert sess.queued == []
@@ -3056,7 +3639,7 @@ class TestDispatcher:
     @pytest.mark.asyncio
     async def test_compact_declined_on_auto_managed_backend(self) -> None:
         # A backend that cannot serve /compact gets the informational reply and
-        # compact() is NEVER dispatched (#8156).
+        # compact() is NEVER dispatched.
         d, cli, sess = _dispatcher({"u1"})
         calls: list[int] = []
 
@@ -3247,9 +3830,387 @@ class TestDispatcher:
         # unified:{agent} bucket — channel and user drop out of the key — so an
         # automatic bind would deliver one user's dashboard replies into another
         # user's chat. `!link` stays available: it names the channel the user is in.
+        # The ORIGIN record is the sibling write and answers to the same rule: an
+        # origin naming whoever wrote last would aim unattended output (the
+        # auto-compact notice) at that person regardless of whose turn produced it.
         d, _cli, sess = _dispatcher({"u1", "u2"}, dm_scope="unified")
         await d.handle_message(self._msg("hello", user="u1"))
         assert sess.mirror_links == {}
+        assert sess.origin_links == {}
+
+    @pytest.mark.asyncio
+    async def test_a_dm_turn_opens_the_crew_log_the_work_ledger_writes_into(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """The work ledger is a projection of the crew log: every write appends a
+        ``work/recorded`` entry to the ACTING session's log and rolls the cache back
+        (``crew_log_unrecorded``) when there is nowhere to append. A DM that session
+        control admits as a conductor therefore needs its log to exist before its
+        first ledger call, and only the turn path can create it -- the dashboard
+        runner does so on every turn, and this dispatcher runs its own turn loop.
+
+        Real emitter, real writer, isolated home. The admission itself is another
+        suite's subject (``test_session_control_owner_dm.py``) and is granted here.
+        """
+        import json
+
+        from aiohttp import web
+        from aiohttp.test_utils import make_mocked_request
+
+        from kiro_crew.crew_log import emit, projection
+        from kiro_crew.crew_log.resolve import unit_for_session_key
+        from kiro_crew.dashboard.handlers import work_ledger as ledger_routes
+
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "home"))
+        monkeypatch.setenv(emit.CREW_LOG_ENV, "1")
+        monkeypatch.setattr(emit, "_retry_delay", lambda _attempts: 0.0)
+        monkeypatch.setattr(FakeProvider, "session_id", "acp-owner-dm-turn", raising=False)
+        monkeypatch.setattr(FakeProvider, "served_model", "model-x", raising=False)
+        ledger_routes._BOARD_LOCKS.clear()
+
+        async def _recognized(*a: Any, **k: Any) -> None:
+            return None
+
+        monkeypatch.setattr(ledger_routes, "_recognize_session", _recognized)
+        monkeypatch.setattr(ledger_routes, "_is_restricted_session", lambda *a: False)
+        monkeypatch.setattr(ledger_routes, "_contained_channel_caller", lambda request, sk: "")
+        emit.reset_caches()
+        try:
+            d, _cli, sess = _dispatcher({"u1"})
+            d.ctx_builder.live_memory_mode_for_session = lambda key: "persistent"
+            # The route's own ``!model`` choice: what the allocation is ASKED for,
+            # which is not what the provider reports it serves.
+            d._model_pref[d._scope_id("u1", "")] = "model-requested"
+            await d.handle_message(self._msg("hello"))
+            key = d._session_key("u1", "")
+            unit = unit_for_session_key(sess, key)
+            assert unit == "acp-owner-dm-turn"
+
+            app = web.Application()
+            state = mock.MagicMock()
+            state.sessions = sess
+            app["state"] = state
+            req = make_mocked_request(
+                "POST", "/api/work-ledger/record", app=app, headers={"X-Session-Key": key}
+            )
+            req["internal_auth"] = True
+            req.json = mock.AsyncMock(  # type: ignore[method-assign]
+                return_value={"action": "goal", "goal": "ship it", "round": 1}
+            )
+            resp = await ledger_routes.api_work_ledger_record(req)
+            body = json.loads(resp.text)
+            assert (resp.status, body.get("code")) == (200, None), body
+
+            handle = projection.open_session_log(unit)
+            assert handle is not None
+            entries = list(handle.iter_from(1, known=projection.KNOWN_TYPES))
+            opened = [e for e in entries if e.type == "session/opened"]
+            assert len(opened) == 1
+            assert (opened[0].data["slot"], opened[0].data["agent"]) == (
+                key.replace(":", "_"),
+                "kirocrew",
+            )
+            assert opened[0].data["model"] == "model-x"
+            assert opened[0].data.get("model_requested") == "model-requested"
+            assert opened[0].data["class"] == {"memory": "persistent", "channel": True}
+            assert "parent" not in opened[0].data
+            assert [e.type for e in entries].count("work/recorded") == 1
+        finally:
+            emit.drain_for_shutdown(timeout=2.0)
+            emit.reset_caches()
+            ledger_routes._BOARD_LOCKS.clear()
+
+    @pytest.mark.asyncio
+    async def test_a_tab_on_the_conversation_and_the_channel_state_one_class(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """A channel conversation with a dashboard tab has TWO writers of one crew log:
+        this dispatcher and the dashboard runner, which states the slot's workspace
+        beside memory, app and channel. The emitter appends ``session/class`` whenever
+        the class it is handed differs from what the log last stated, so an opener
+        stating every member but the workspace would have the two writers record a
+        move on every switch between them -- a move that never happened. Both read
+        the slot the dashboard surfaces the conversation under, so a tab turn between
+        two channel turns leaves the log with its opening entry and no ``session/class``.
+
+        Real emitter, real writer, isolated home. The dashboard runner's write is its
+        own ``on_session_opened`` for the surfaced slot, carrying the class
+        ``_crew_log_class`` and ``_crew_log_workspace`` state for it.
+        """
+        from types import SimpleNamespace
+
+        from kiro_crew.crew_log import emit, projection
+        from kiro_crew.dashboard.channel_slots import channel_slot_name
+
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "home"))
+        monkeypatch.setenv(emit.CREW_LOG_ENV, "1")
+        monkeypatch.setattr(emit, "_retry_delay", lambda _attempts: 0.0)
+        monkeypatch.setattr(FakeProvider, "session_id", "acp-tabbed-dm", raising=False)
+        emit.reset_caches()
+        try:
+            d, _cli, _sess = _dispatcher({"u1"})
+            d.ctx_builder.live_memory_mode_for_session = lambda key: "persistent"
+            key = d._session_key("u1", "")
+            # The slot the dashboard surfaces this conversation under, stating the
+            # workspace a live slot always states (its constructor default).
+            slots = {channel_slot_name(key): SimpleNamespace(workspace="default")}
+            d._session_resume.dashboard_state = SimpleNamespace(get_slot=slots.get)
+            await d.handle_message(self._msg("hello"))
+            # The tab's turn: the dashboard runner opens the same log from the slot.
+            emit.on_session_opened(
+                "acp-tabbed-dm",
+                agent="kirocrew",
+                slot=channel_slot_name(key),
+                memory="persistent",
+                channel=True,
+                workspace="default",
+            )
+            await d.handle_message(self._msg("hello again"))
+            assert emit.flush()
+            handle = projection.open_session_log("acp-tabbed-dm")
+            assert handle is not None
+            entries = list(handle.iter_from(1, known=projection.KNOWN_TYPES))
+            assert [e.type for e in entries if e.type == "session/class"] == []
+            opened = [e for e in entries if e.type == "session/opened"]
+            assert len(opened) == 1
+            assert opened[0].data["class"] == {
+                "memory": "persistent",
+                "channel": True,
+                "workspace": "default",
+            }
+        finally:
+            emit.drain_for_shutdown(timeout=2.0)
+            emit.reset_caches()
+
+    @pytest.mark.asyncio
+    async def test_a_resumed_dashboard_session_is_not_opened_by_the_channel(
+        self, monkeypatch
+    ) -> None:
+        """A dashboard session resumed into the chat is opened by the dashboard
+        runner, which alone holds its lineage (``_created_by``); an opener from here
+        would create that log without its ``parent``. The channel's own session is
+        opened, the resumed one is left to its owner."""
+        from kiro_crew.crew_log import emit as crew_log_emit
+
+        opened: list[str] = []
+        monkeypatch.setattr(
+            crew_log_emit,
+            "on_session_opened",
+            lambda session_id, **kw: opened.append(session_id),
+        )
+        monkeypatch.setattr(FakeProvider, "session_id", "acp-any", raising=False)
+        d, _cli, _sess = _dispatcher({"u1"})
+        await d.handle_message(self._msg("hello"))
+        assert opened == ["acp-any"]
+
+        opened.clear()
+        d, cli, sess = _dispatcher({"u1"})
+        resumed = ChannelLink("discord", channel_id="c1")
+        sess.mirror_links["dashboard:chat-7"] = resumed
+        sess.inbound_mirror_keys.add("dashboard:chat-7")
+        await d.handle_message(self._msg("hello world"))
+        assert "Answer: hello world" in (cli.final_text() or ""), "the resumed turn ran"
+        assert sess.origin_links == {}, "the own-session branch was not taken"
+        assert opened == []
+
+        # A same-DM NATIVE history picked through ``!sessions`` is a channel session
+        # whose turns nobody else runs: it is opened here, under ITS key. A fresh
+        # conversation id, because the routing expectation recorded above for
+        # ``c1`` names the dashboard session and would refuse a different binding.
+        opened.clear()
+        d, cli, sess = _dispatcher({"u1"})
+        natural = d._session_key("u1", "")
+        older = natural.rsplit(":gen", 1)[0] + ":gen0"
+        assert older != natural
+        sess.mirror_links[older] = ChannelLink("discord", channel_id="c9")
+        sess.inbound_mirror_keys.add(older)
+        await d.handle_message(self._msg("hello again", chan="c9"))
+        assert "Answer: hello again" in (cli.final_text() or ""), "the resumed turn ran"
+        assert sess.origin_links == {}, "the resumed branch was taken"
+        assert opened == ["acp-any"]
+
+    @pytest.mark.asyncio
+    async def test_a_recycled_conversation_opens_its_successor_log_citing_the_predecessor(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """A failed auto-compaction recycles the session: the pointer in the
+        slot-to-session mapping is emptied in place and the next turn cold-starts a
+        successor with a new id. Nothing but the ``previous`` edge on the successor's
+        ``session/opened`` joins the two crew logs, so without it the conversation's
+        earlier history falls off the succession chain. The dashboard runner reads
+        ``mapped_sid`` before its allocation for exactly this; the dispatcher must
+        read it at the same moment -- the recycle stashes the dropped id and
+        ``mapped_sid`` answers from that stash until the successor is mapped.
+
+        Real emitter and writer. The recycle is modelled at its observable seam: the
+        mapping still names the predecessor while the provider hands out a new id.
+        """
+        from kiro_crew.crew_log import emit, projection
+
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "home"))
+        monkeypatch.setenv(emit.CREW_LOG_ENV, "1")
+        monkeypatch.setattr(emit, "_retry_delay", lambda _attempts: 0.0)
+        monkeypatch.setattr(FakeProvider, "session_id", "acp-gen-1", raising=False)
+        emit.reset_caches()
+        try:
+            d, _cli, sess = _dispatcher({"u1"})
+            d.ctx_builder.live_memory_mode_for_session = lambda key: "persistent"
+            await d.handle_message(self._msg("hello"))
+            assert emit.flush(timeout=5.0)
+
+            # The recycle: the mapping keeps answering the dropped id from its stash
+            # (``SessionMap.mapped_sid`` reads ``discarded_sid``) while the next
+            # allocation cold-starts a successor under a new id.
+            sess.mapped_sid = lambda key: "acp-gen-1"
+            monkeypatch.setattr(FakeProvider, "session_id", "acp-gen-2", raising=False)
+            await d.handle_message(self._msg("and again"))
+            assert emit.flush(timeout=5.0)
+
+            handle = projection.open_session_log("acp-gen-2")
+            assert handle is not None
+            entries = list(handle.iter_from(1, known=projection.KNOWN_TYPES))
+            opened = [e for e in entries if e.type == "session/opened"]
+            assert len(opened) == 1
+            assert opened[0].data.get("previous") == {"sid": "acp-gen-1"}
+            # A warm turn maps the live id, so the successor's own next turn writes
+            # no edge and no second announcement.
+            sess.mapped_sid = lambda key: "acp-gen-2"
+            await d.handle_message(self._msg("still here"))
+            assert emit.flush(timeout=5.0)
+            entries = list(handle.iter_from(1, known=projection.KNOWN_TYPES))
+            assert [e.type for e in entries].count("session/opened") == 1
+        finally:
+            emit.drain_for_shutdown(timeout=2.0)
+            emit.reset_caches()
+
+    @pytest.mark.asyncio
+    async def test_the_predecessor_is_captured_inside_the_allocation_not_around_it(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """Two cold turns on one conversation race. The loser gets past the busy gate
+        and waits INSIDE ``get_or_create`` for the turn permit; meanwhile the winner
+        allocates an intermediate session and a failed compaction recycles it, so the
+        mapping now names THAT store. A predecessor read anywhere around the call --
+        even immediately before it -- predates the intermediate store, so the loser's
+        successor cites its grandparent and the intermediate log falls off the chain.
+        The store is captured by the allocation boundary inside its own critical
+        section and consumed after the claim.
+
+        Modelled at the boundary's seam: the double's ``get_or_create`` suspends
+        (the permit wait), the concurrent recycle lands during that suspension, and
+        the double captures the predecessor as the real boundary does -- at the
+        registration, not before the call."""
+        from kiro_crew.crew_log import emit, projection
+
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "home"))
+        monkeypatch.setenv(emit.CREW_LOG_ENV, "1")
+        monkeypatch.setattr(emit, "_retry_delay", lambda _attempts: 0.0)
+        emit.reset_caches()
+        try:
+            d, _cli, sess = _dispatcher({"u1"})
+            mapping = {"sid": ""}
+            sess.mapped_sid = lambda key: mapping["sid"]
+            # Two stores already written by this conversation: the older one, and
+            # the intermediate one the winner opened and had recycled.
+            for sid in ("acp-gen-0", "acp-gen-1"):
+                monkeypatch.setattr(FakeProvider, "session_id", sid, raising=False)
+                await d.handle_message(self._msg("hello"))
+                mapping["sid"] = sid
+            assert emit.flush(timeout=5.0)
+
+            # The loser's view when it reaches the allocation: the older store.
+            mapping["sid"] = "acp-gen-0"
+            real_get_or_create = sess.get_or_create
+
+            async def _wait_for_the_permit_then_allocate(key: str, **kwargs: Any) -> Any:
+                # Suspended inside the allocation, waiting for the permit. The
+                # winner's intermediate session is allocated and recycled meanwhile.
+                await asyncio.sleep(0)
+                mapping["sid"] = "acp-gen-1"
+                return await real_get_or_create(key, **kwargs)
+
+            sess.get_or_create = _wait_for_the_permit_then_allocate
+            monkeypatch.setattr(FakeProvider, "session_id", "acp-gen-2", raising=False)
+            await d.handle_message(self._msg("and again"))
+            assert emit.flush(timeout=5.0)
+
+            handle = projection.open_session_log("acp-gen-2")
+            assert handle is not None
+            opened = [
+                e
+                for e in handle.iter_from(1, known=projection.KNOWN_TYPES)
+                if e.type == "session/opened"
+            ]
+            assert len(opened) == 1
+            assert opened[0].data.get("previous") == {"sid": "acp-gen-1"}
+        finally:
+            emit.drain_for_shutdown(timeout=2.0)
+            emit.reset_caches()
+
+    @pytest.mark.asyncio
+    async def test_the_log_is_opened_at_the_allocation_even_when_the_turn_then_fails(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """A recycled conversation's next turn allocates the successor and then fails
+        before the turn runs -- here the attachment fetch raises. The allocation
+        stands: the successor is live and mapped, so the following turn is a warm
+        reuse whose predecessor read names the successor itself. If the log is first
+        created THEN, it carries no ``previous`` edge and the predecessor's history is
+        detached. So the log is opened the moment the allocation lands, before
+        renderer setup, attachment I/O or any other await."""
+        import contextlib
+
+        from kiro_crew.crew_log import emit, projection
+        from kiro_crew.discord import transport_dispatch as td
+
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "home"))
+        monkeypatch.setenv(emit.CREW_LOG_ENV, "1")
+        monkeypatch.setattr(emit, "_retry_delay", lambda _attempts: 0.0)
+        emit.reset_caches()
+        try:
+            d, _cli, sess = _dispatcher({"u1"})
+            monkeypatch.setattr(FakeProvider, "session_id", "acp-gen-0", raising=False)
+            await d.handle_message(self._msg("hello"))
+            assert emit.flush(timeout=5.0)
+
+            # The recycle stashed acp-gen-0; the next allocation cold-starts acp-gen-1
+            # and the turn then dies in the attachment fetch.
+            sess.mapped_sid = lambda key: "acp-gen-0"
+            monkeypatch.setattr(FakeProvider, "session_id", "acp-gen-1", raising=False)
+
+            async def _fetch_fails(client: Any, attachments: Any) -> Any:
+                raise RuntimeError("attachment fetch failed")
+
+            monkeypatch.setattr(td, "process_discord_attachments", _fetch_fails)
+            with contextlib.suppress(Exception):
+                await d.handle_message(
+                    InboundMessage(
+                        channel_type="discord",
+                        user_id="u1",
+                        conversation_id="c1",
+                        text="look at this",
+                        attachments=[{"filename": "a.png", "content_type": "image/png"}],
+                    )
+                )
+            assert emit.flush(timeout=5.0)
+
+            # The successor is live now: the next turn is a warm reuse.
+            sess.mapped_sid = lambda key: "acp-gen-1"
+            await d.handle_message(self._msg("and again"))
+            assert emit.flush(timeout=5.0)
+
+            handle = projection.open_session_log("acp-gen-1")
+            assert handle is not None
+            opened = [
+                e
+                for e in handle.iter_from(1, known=projection.KNOWN_TYPES)
+                if e.type == "session/opened"
+            ]
+            assert len(opened) == 1
+            assert opened[0].data.get("previous") == {"sid": "acp-gen-0"}
+        finally:
+            emit.drain_for_shutdown(timeout=2.0)
+            emit.reset_caches()
 
     @pytest.mark.asyncio
     async def test_a_thread_route_is_still_bound_under_a_unified_scope(self) -> None:
@@ -3332,7 +4293,7 @@ class TestDispatcher:
     async def test_unlink_clears_binding_stranded_by_generation_rotation(self) -> None:
         # THE stale-mirror regression: a binding written at one DM generation,
         # then the conversation rotates (!new / idle / daily reset). The row's
-        # key spelling no longer derives from the current session key, so the
+        # key spelling does not derive from the current session key, so the
         # key-addressed clears cannot reach it — yet it still occupies the
         # location and blocks `!session` resume. Unlink must free it by value.
         d, cli, sess = _dispatcher({"u1"})
@@ -3356,6 +4317,32 @@ class TestDispatcher:
         await d.handle_message(self._msg("!unlink"))
         assert sess.mirror_links == {}
         assert any("Unlinked" in t for t, _ in cli.sent)
+
+    @pytest.mark.asyncio
+    async def test_unlink_frees_a_paused_two_way_dashboard_mirror(self) -> None:
+        # The shape a dashboard Disconnect leaves behind: the owner connected a
+        # dashboard session to their own DM (two-way, because Discord resumes
+        # inbound), then disconnected it from the dashboard. Disconnect only
+        # PAUSES: the binding stays, the DM still routes here, and session
+        # control keeps refusing the session. One `/unlink` in the DM must free
+        # the location whatever the pause flag says, take the resumed-session
+        # exit (the binding accepted inbound), and nudge the dashboard so the
+        # chip and the menu stop showing a link that is gone.
+        d, cli, sess = _dispatcher({"u1"})
+        loc = ChannelLink("discord", channel_id="c1")
+        sess.mirror_links["dashboard:chat-42"] = loc
+        sess.inbound_mirror_keys.add("dashboard:chat-42")
+        sess.paused_deliveries.add(("dashboard:chat-42", False))
+        pushes: list[None] = []
+        d._session_resume._push_slots = lambda: pushes.append(None)  # type: ignore[method-assign]
+        await d.handle_message(self._msg("!unlink"))
+        assert sess.mirror_links == {}
+        assert sess.inbound_mirror_keys == set()
+        assert any("Left the resumed session" in t for t, _ in cli.sent)
+        assert pushes, "the dashboard projection was not refreshed after the sweep"
+        # Idempotent: a second unlink finds the location free.
+        await d.handle_message(self._msg("!unlink"))
+        assert any("wasn't linked" in t for t, _ in cli.sent)
 
     @pytest.mark.asyncio
     async def test_unlink_leaves_other_locations_alone(self) -> None:
@@ -3484,6 +4471,370 @@ class TestInteractions:
             DiscordApprovalDecider._NONCES.pop(key, None)
 
     @pytest.mark.asyncio
+    async def test_authorization_withdrawn_during_the_ack_stops_the_approval(self) -> None:
+        """The rosters are read once before the ack, and the ack serves the REST
+        ladder's own waits while the governance read after it is off-loop.
+
+        An operator who withdraws the user across that window must not have a stale
+        Approve press execute the governed tool, so the same two things the pre-ack
+        gate established are read again before anything resolves.
+        """
+        d, cli, _ = _dispatcher({"u1"})
+        key = DiscordApprovalDecider.key(d._session_key("u1"), "r1")
+        fut: "asyncio.Future[bool]" = asyncio.get_running_loop().create_future()
+        DiscordApprovalDecider._REGISTRY[key] = fut
+        nonce = DiscordApprovalDecider.register_nonce(key)
+
+        original_ack = cli.ack_component_interaction
+
+        async def _ack_then_revoke(*args: Any, **kwargs: Any) -> None:
+            await original_ack(*args, **kwargs)
+            d._allowed.discard("u1")
+
+        cli.ack_component_interaction = _ack_then_revoke  # type: ignore[method-assign]
+        try:
+            await d.on_interaction(self._itx(f"a:r1:{nonce}:1"))
+            assert cli.acked == ["i1"], "the ack itself still happens"
+            assert not fut.done(), "a withdrawn user must not resolve the approval"
+        finally:
+            DiscordApprovalDecider._REGISTRY.pop(key, None)
+            DiscordApprovalDecider._NONCES.pop(key, None)
+
+    @pytest.mark.asyncio
+    async def test_the_ack_path_reads_governance_before_the_rosters(self) -> None:
+        """The ceiling read is an await, so a roster reading taken before it can be
+        stale by the time anything resolves. The rosters are the final word, which is
+        the same contract the client's own mid-send predicate states.
+
+        Measured from the ACK onwards: the pre-ack gate reads a roster too, and it is
+        not what this pins.
+        """
+        d, cli, _ = _dispatcher({"u1"})
+        order: list[str] = []
+        key = DiscordApprovalDecider.key(d._session_key("u1"), "r1")
+        fut: "asyncio.Future[bool]" = asyncio.get_running_loop().create_future()
+        DiscordApprovalDecider._REGISTRY[key] = fut
+        nonce = DiscordApprovalDecider.register_nonce(key)
+
+        async def _ceiling(_channel: str) -> bool:
+            order.append("ceiling")
+            return True
+
+        original_ack = cli.ack_component_interaction
+        original_authorized = d._authorized
+
+        async def _ack(*args: Any, **kwargs: Any) -> None:
+            order.append("ack")
+            await original_ack(*args, **kwargs)
+
+        def _roster(user_id: str) -> bool:
+            order.append("roster")
+            return original_authorized(user_id)
+
+        import kiro_crew.discord.transport_dispatch as td
+
+        with mock.patch.object(td, "channel_inbound_permitted", _ceiling):
+            cli.ack_component_interaction = _ack  # type: ignore[method-assign]
+            d._authorized = _roster  # type: ignore[method-assign]
+            try:
+                await d.on_interaction(self._itx(f"a:r1:{nonce}:1"))
+            finally:
+                d._authorized = original_authorized  # type: ignore[method-assign]
+                DiscordApprovalDecider._REGISTRY.pop(key, None)
+                DiscordApprovalDecider._NONCES.pop(key, None)
+        assert "ack" in order, order
+        after_ack = order[order.index("ack") + 1 :]
+        assert after_ack[:2] == ["ceiling", "roster"], order
+
+    @pytest.mark.asyncio
+    async def test_a_reject_press_still_lands_after_a_withdrawal(self) -> None:
+        """A REJECT is a denial, which is what a withdrawal wants. Dropping it would
+        strand the pending approval until it times out.
+
+        Its CONFIRMATION is a different thing: an outbound write into the channel.
+        The reject reaches the resolution without the re-read the sibling branch does,
+        and the edit may serve no wait at all, in which case the ladder's own re-check
+        never runs and nothing else judges it. So the verdict is withheld.
+        """
+        d, cli, _ = _dispatcher({"u1"})
+        key = DiscordApprovalDecider.key(d._session_key("u1"), "r1")
+        fut: "asyncio.Future[bool]" = asyncio.get_running_loop().create_future()
+        DiscordApprovalDecider._REGISTRY[key] = fut
+        nonce = DiscordApprovalDecider.register_nonce(key)
+
+        original_ack = cli.ack_component_interaction
+
+        async def _ack_then_revoke(*args: Any, **kwargs: Any) -> None:
+            await original_ack(*args, **kwargs)
+            d._allowed.discard("u1")
+
+        cli.ack_component_interaction = _ack_then_revoke  # type: ignore[method-assign]
+        try:
+            await d.on_interaction(self._itx(f"a:r1:{nonce}:0"))
+            assert fut.result() is False, "the denial still resolves"
+            assert cli.edits == [], "the verdict must not reach a withdrawn destination"
+        finally:
+            DiscordApprovalDecider._REGISTRY.pop(key, None)
+            DiscordApprovalDecider._NONCES.pop(key, None)
+
+    @pytest.mark.asyncio
+    async def test_a_reject_press_writes_its_verdict_while_still_authorized(self) -> None:
+        """The paired case, so the guard above cannot pass by never writing at all."""
+        d, cli, _ = _dispatcher({"u1"})
+        key = DiscordApprovalDecider.key(d._session_key("u1"), "r1")
+        fut: "asyncio.Future[bool]" = asyncio.get_running_loop().create_future()
+        DiscordApprovalDecider._REGISTRY[key] = fut
+        nonce = DiscordApprovalDecider.register_nonce(key)
+        try:
+            await d.on_interaction(self._itx(f"a:r1:{nonce}:0"))
+            assert fut.result() is False
+            assert any("Denied" in t for _, t, _ in cli.edits)
+        finally:
+            DiscordApprovalDecider._REGISTRY.pop(key, None)
+            DiscordApprovalDecider._NONCES.pop(key, None)
+
+    @staticmethod
+    def _set_channels(pdir: Any, monkeypatch, *, allow: list[str]) -> None:
+        """Point the channels ceiling at a profile permitting exactly `allow`.
+
+        Written explicitly in both directions so neither test reads whatever profile
+        the host happens to carry.
+        """
+        import json
+
+        from kiro_crew.platform import governance_profiles as gp
+
+        pdir.mkdir(exist_ok=True)
+        monkeypatch.setattr(gp, "_PROFILES_DIR", pdir)
+        (pdir / "host.json").write_text(
+            json.dumps(
+                {
+                    "name": "host",
+                    "bind": {"type": "surface", "id": "host"},
+                    "channels": {"members": {"mode": "allow", "allow": allow}},
+                }
+            )
+        )
+        gp.reset_store()
+
+    @pytest.mark.asyncio
+    async def test_a_ceiling_denied_channel_keeps_its_card_exactly_as_posted(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """The reverse of the verdict-lands case: with the ceiling withdrawn, the press
+        writes NOTHING into the channel -- not the verdict, not a component strip.
+
+        The card is an ordinary channel message posted while the channel was still
+        permitted, so writing nothing leaves it in exactly that state. Asserted as the
+        fold of everything sent and every edit applied, not merely as an empty edit
+        list, because a component-only edit would also change what the channel shows.
+        """
+        from kiro_crew.platform import governance_profiles as gp
+
+        d, cli, _ = _dispatcher({"u1"})
+        card_id = await cli.send_message(
+            "c1", "🔐 Approve `shell`?", components=[{"approve": 1, "deny": 0}]
+        )
+        posted = (list(cli.sent), list(cli.send_channels))
+        self._set_channels(tmp_path / "profiles", monkeypatch, allow=["slack"])
+        key = DiscordApprovalDecider.key(d._session_key("u1"), "r1")
+        fut: "asyncio.Future[bool]" = asyncio.get_running_loop().create_future()
+        DiscordApprovalDecider._REGISTRY[key] = fut
+        nonce = DiscordApprovalDecider.register_nonce(key)
+        itx = DiscordInteraction(
+            interaction_id="i1",
+            interaction_token="tok",
+            channel_id="c1",
+            user_id="u1",
+            message_id=card_id,
+            custom_id=f"a:r1:{nonce}:0",
+            label="",
+            guild_id="",
+        )
+        try:
+            await d.on_interaction(itx)
+            assert fut.result() is False, "the denial still resolves"
+            assert cli.edits == [], "no verdict may be written into a denied channel"
+            assert cli.component_edits == [], "the buttons must not be stripped either"
+            assert (
+                list(cli.sent),
+                list(cli.send_channels),
+            ) == posted, "the card must remain exactly the message the operator last allowed"
+        finally:
+            DiscordApprovalDecider._REGISTRY.pop(key, None)
+            DiscordApprovalDecider._NONCES.pop(key, None)
+            gp.reset_store()
+
+    @pytest.mark.asyncio
+    async def test_the_confirmation_ceiling_is_read_after_the_ack_not_at_entry(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """A withdrawal landing DURING the ack must still withhold the edit.
+
+        A reading taken when the press arrived would answer `permitted` here, so this
+        separates a late read from an early one; the reject arm is the only press that
+        reaches the verdict without the pre-resolve gate having read the ceiling.
+        """
+        from kiro_crew.platform import governance_profiles as gp
+
+        d, cli, _ = _dispatcher({"u1"})
+        pdir = tmp_path / "profiles"
+        self._set_channels(pdir, monkeypatch, allow=["discord"])
+        key = DiscordApprovalDecider.key(d._session_key("u1"), "r1")
+        fut: "asyncio.Future[bool]" = asyncio.get_running_loop().create_future()
+        DiscordApprovalDecider._REGISTRY[key] = fut
+        nonce = DiscordApprovalDecider.register_nonce(key)
+        original_ack = cli.ack_component_interaction
+
+        async def _ack_then_revoke(*args: Any, **kwargs: Any) -> None:
+            await original_ack(*args, **kwargs)
+            self._set_channels(pdir, monkeypatch, allow=["slack"])
+
+        cli.ack_component_interaction = _ack_then_revoke  # type: ignore[method-assign]
+        try:
+            assert await td_mod.channel_inbound_permitted(
+                "discord"
+            ), "permitted when the press arrives"
+            await d.on_interaction(self._itx(f"a:r1:{nonce}:0"))
+            assert fut.result() is False, "the denial still resolves"
+            assert cli.edits == [], "a withdrawal during the ack must withhold the verdict"
+        finally:
+            DiscordApprovalDecider._REGISTRY.pop(key, None)
+            DiscordApprovalDecider._NONCES.pop(key, None)
+            gp.reset_store()
+
+    @pytest.mark.asyncio
+    async def test_the_confirmation_reads_the_ceiling_again_rather_than_reusing_it(self) -> None:
+        """An APPROVE press reads the ceiling twice: once before it resolves, once
+        before it writes.
+
+        Carrying the first answer forward would be a value taken before a suspension,
+        which is the defect class this change exists to close. Pinned by answering
+        `permitted` to the first read and `denied` to the second, which no reuse of a
+        single answer can satisfy. Both entry points share one answering function
+        because the reads are on opposite sides of the resolve and read opposite
+        directions: the press arriving is inbound, the verdict written is outbound.
+        """
+        d, cli, _ = _dispatcher({"u1"})
+        answers = [True, False]
+        key = DiscordApprovalDecider.key(d._session_key("u1"), "r1")
+        fut: "asyncio.Future[bool]" = asyncio.get_running_loop().create_future()
+        DiscordApprovalDecider._REGISTRY[key] = fut
+        nonce = DiscordApprovalDecider.register_nonce(key)
+
+        async def _ceiling(_channel: str) -> bool:
+            return answers.pop(0) if answers else False
+
+        try:
+            with mock.patch.object(td_mod, "channel_inbound_permitted", _ceiling):
+                with mock.patch.object(td_mod, "channel_outbound_permitted", _ceiling):
+                    await d.on_interaction(self._itx(f"a:r1:{nonce}:1"))
+            assert fut.result() is True, "the approval resolved under the first reading"
+            assert answers == [], "both readings must actually be taken"
+            assert cli.edits == [], "the verdict must not be written after the withdrawal"
+        finally:
+            DiscordApprovalDecider._REGISTRY.pop(key, None)
+            DiscordApprovalDecider._NONCES.pop(key, None)
+
+    @pytest.mark.asyncio
+    async def test_the_confirmation_gate_reads_the_outbound_authority(self) -> None:
+        """The verdict edit is a write this process makes, so the OUTBOUND ceiling
+        decides it.
+
+        Both entry points read the same `channels` allowlist, so a test that only
+        watched the verdict could not tell them apart. Pinned by answering permitted
+        inbound and denied OUTBOUND: the press resolves, because the inbound gate let
+        it through, and the edit is still withheld, which only a gate reading the
+        outbound entry point can do. Filing an egress refusal under an ingress name
+        leaves an operator asking why a message did not go out reading the wrong row.
+        """
+        d, cli, _ = _dispatcher({"u1"})
+        read: list[str] = []
+        key = DiscordApprovalDecider.key(d._session_key("u1"), "r1")
+        fut: "asyncio.Future[bool]" = asyncio.get_running_loop().create_future()
+        DiscordApprovalDecider._REGISTRY[key] = fut
+        nonce = DiscordApprovalDecider.register_nonce(key)
+
+        async def _inbound(_channel: str) -> bool:
+            read.append("inbound")
+            return True
+
+        async def _outbound(_channel: str) -> bool:
+            read.append("outbound")
+            return False
+
+        try:
+            with mock.patch.object(td_mod, "channel_inbound_permitted", _inbound):
+                with mock.patch.object(td_mod, "channel_outbound_permitted", _outbound):
+                    await d.on_interaction(self._itx(f"a:r1:{nonce}:1"))
+            assert fut.result() is True, "the inbound gate permitted the press"
+            assert "outbound" in read, "the verdict gate must consult the outbound ceiling"
+            assert cli.edits == [], "an outbound-denied channel gets no verdict written"
+        finally:
+            DiscordApprovalDecider._REGISTRY.pop(key, None)
+            DiscordApprovalDecider._NONCES.pop(key, None)
+
+    @pytest.mark.asyncio
+    async def test_the_confirmation_reads_the_rosters_after_the_ceiling_await(self) -> None:
+        """At the verdict gate too, the rosters are the last thing read before the write.
+
+        The ceiling read is an `await`; a roster reading taken before it describes a
+        state that can have changed by the time the edit is issued. Pinned by
+        withdrawing the user during the second ceiling read, which only a roster read
+        placed after it can see.
+        """
+        d, cli, _ = _dispatcher({"u1"})
+        calls: list[str] = []
+        key = DiscordApprovalDecider.key(d._session_key("u1"), "r1")
+        fut: "asyncio.Future[bool]" = asyncio.get_running_loop().create_future()
+        DiscordApprovalDecider._REGISTRY[key] = fut
+        nonce = DiscordApprovalDecider.register_nonce(key)
+
+        async def _ceiling(_channel: str) -> bool:
+            calls.append("ceiling")
+            if len(calls) == 2:
+                d._allowed.discard("u1")
+            return True
+
+        try:
+            with mock.patch.object(td_mod, "channel_inbound_permitted", _ceiling):
+                with mock.patch.object(td_mod, "channel_outbound_permitted", _ceiling):
+                    await d.on_interaction(self._itx(f"a:r1:{nonce}:1"))
+            assert len(calls) == 2, calls
+            assert cli.edits == [], "a roster read placed before the ceiling await is stale"
+        finally:
+            DiscordApprovalDecider._REGISTRY.pop(key, None)
+            DiscordApprovalDecider._NONCES.pop(key, None)
+
+    @pytest.mark.asyncio
+    async def test_a_dm_interaction_records_its_pairing_before_any_callback(self) -> None:
+        """Every callback answers the DM channel the press arrived on, without ever
+        opening it, and the mid-send re-check runs inside the first one.
+
+        Without the pairing a rate-limited reply to an authorized presser is refused,
+        which drops the reply rather than withholding it.
+        """
+        d, cli, _ = _dispatcher({"u1"})
+        key = DiscordApprovalDecider.key(d._session_key("u1"), "r1")
+        fut: "asyncio.Future[bool]" = asyncio.get_running_loop().create_future()
+        DiscordApprovalDecider._REGISTRY[key] = fut
+        nonce = DiscordApprovalDecider.register_nonce(key)
+        try:
+            await d.on_interaction(self._itx(f"a:r1:{nonce}:1"))
+            assert cli.dm_pairings.get("c1") == "u1"
+        finally:
+            DiscordApprovalDecider._REGISTRY.pop(key, None)
+            DiscordApprovalDecider._NONCES.pop(key, None)
+
+    @pytest.mark.asyncio
+    async def test_a_denied_presser_records_no_pairing(self) -> None:
+        """Recorded on the authorized path only, so a denied presser cannot plant a
+        pairing that would answer for their channel later."""
+        d, cli, _ = _dispatcher({"someone-else"})
+        await d.on_interaction(self._itx("a:r1:n:1"))
+        assert cli.dm_pairings == {}
+
+    @pytest.mark.asyncio
     async def test_channels_deny_drops_approval_interaction(self, tmp_path, monkeypatch) -> None:
         # HIGH (GPT pass 1 #1 + #4): a channels-governance DENY must stop a button
         # press from resolving a pending tool approval — otherwise a policy denial
@@ -3529,10 +4880,14 @@ class TestInteractions:
 
     @pytest.mark.asyncio
     async def test_channels_deny_still_resolves_reject_interaction(self, tmp_path, monkeypatch):
-        # MEDIUM (GPT round-13 #3): a REJECT press ("a:...:0") on a denied channel
+        # A REJECT press ("a:...:0") on a denied channel
         # must STILL resolve the pending approval as refused (False) — a reject is a
         # denial, exactly what a channels-deny wants, and silently dropping it would
         # strand the pending future until timeout (~300s). Only APPROVE is gated out.
+        #
+        # The CONFIRMATION is separate from the resolution: it is an outbound write
+        # into a channel the ceiling refuses, so it is withheld. The card
+        # stays exactly as it was posted while the channel was still allowed.
         import json
 
         from kiro_crew.platform import governance_profiles as gp
@@ -3561,7 +4916,7 @@ class TestInteractions:
                 "a reject on a denied channel must resolve the approval as refused, "
                 "not strand it"
             )
-            assert any("Denied" in t for _, t, _ in cli.edits)
+            assert cli.edits == [], "no verdict may be written into a denied channel"
         finally:
             DiscordApprovalDecider._REGISTRY.pop(key, None)
             DiscordApprovalDecider._NONCES.pop(key, None)
@@ -3676,7 +5031,7 @@ class TestContextThresholdNotices:
     @pytest.mark.asyncio
     async def test_soft_nudge_suppressed_on_auto_managed_backend(self) -> None:
         # The nudge advises !compact, which this backend refuses — it compacts
-        # on its own, so there is nothing for the user to act on (#8156).
+        # on its own, so there is nothing for the user to act on.
         d, cli, sess = _dispatcher({"u1"})
         sess.check_context_usage = lambda key, provider: 85.0
         provider = SimpleNamespace(manual_compact_unsupported_backend="kas")
@@ -3963,11 +5318,8 @@ class TestRenderTogglesAreWiredPerTurn:
 
         with (
             mock.patch.object(td_mod, "DiscordRenderer", _spy),
-            mock.patch("kiro_crew.config.loader.KiroCrewConfig.load") as load,
+            _live_discord(reactions_enabled=False, show_thinking=True),
         ):
-            load.return_value = SimpleNamespace(
-                discord=SimpleNamespace(reactions_enabled=False, show_thinking=True)
-            )
             await d.handle_message(_inbound("hi"))
         # Read per TURN, not off the boot config, so the dashboard toggle takes
         # effect on the next message instead of the next restart.
@@ -4000,6 +5352,132 @@ class TestUndeliveredTurnIsNotASuccess:
         d, _cli, sess = _dispatcher({"u1"})
         await d.handle_message(_inbound("hi"))
         assert sess.successes and not sess.failures
+
+
+class _RecordingCtx(FakeCtx):
+    """``FakeCtx`` that also keeps every ``build_message`` kwarg."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.build_calls: list[dict[str, Any]] = []
+
+    def build_message(self, text: str, is_new: bool, key: str, **kw: Any) -> Any:
+        self.build_calls.append({"text": text, "is_new": is_new, "key": key, **kw})
+        return super().build_message(text, is_new, key, **kw)
+
+
+def _arm_reinjection(sessions: Any) -> dict[str, Any]:
+    """Give the session stand-in the real manager's one-shot flag surface."""
+    ledger: dict[str, Any] = {"consumed": [], "marks": 0, "armed": True}
+
+    def _consume(key: str) -> bool:
+        ledger["consumed"].append(key)
+        was = ledger["armed"]
+        ledger["armed"] = False
+        return was
+
+    def _mark(key: str) -> None:
+        ledger["marks"] += 1
+        ledger["armed"] = True
+
+    sessions.consume_needs_reinjection = _consume
+    sessions.mark_needs_reinjection = _mark
+    return ledger
+
+
+class _DyingProvider(FakeProvider):
+    """A provider whose very next turn fails before any text lands."""
+
+    async def stream(self, message: str) -> Any:
+        raise RuntimeError("provider fell over")
+        yield  # pragma: no cover -- makes this an async generator
+
+
+class TestCompactionReinjection:
+    """The Discord turn loop is its own copy, so it must consume the flag itself.
+
+    ``session_compaction`` marks ``needs_reinjection`` after an in-place compaction
+    dropped the session-start context. A turn loop that does not read it runs
+    every turn after ``!compact`` without the skills index or the response-preferences
+    block.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_compacted_session_forwards_the_flag_to_build_message(self) -> None:
+        d, _cli, sess = _dispatcher({"u1"})
+        d.ctx_builder = _RecordingCtx()  # type: ignore[assignment]
+        ledger = _arm_reinjection(sess)
+        await d.handle_message(_inbound("hi"))
+        call = d.ctx_builder.build_calls[-1]
+        assert ledger["consumed"] == [call["key"]], "consumed under the key the turn runs as"
+        assert call["needs_reinjection"] is True
+        # Landed: consumed exactly once, and NOT put back.
+        assert ledger["marks"] == 0 and ledger["armed"] is False
+
+    @pytest.mark.asyncio
+    async def test_a_session_stand_in_without_the_flag_gets_the_false_default(self) -> None:
+        d, _cli, sess = _dispatcher({"u1"})
+        d.ctx_builder = _RecordingCtx()  # type: ignore[assignment]
+        assert not hasattr(sess, "consume_needs_reinjection")
+        await d.handle_message(_inbound("hi"))
+        assert d.ctx_builder.build_calls[-1]["needs_reinjection"] is False
+        assert sess.successes, "the turn still ran"
+
+    @pytest.mark.asyncio
+    async def test_a_cancelled_consuming_turn_puts_the_flag_back(self) -> None:
+        # A !stop completes the turn normally with stop_reason "cancelled", and
+        # the backend drops that turn from its transcript -- the re-injected
+        # context goes with it, so the flag must come back like a raised turn.
+        d, _cli, sess = _dispatcher({"u1"})
+        d.ctx_builder = _RecordingCtx()  # type: ignore[assignment]
+        ledger = _arm_reinjection(sess)
+
+        class _Cancelled(FakeProvider):
+            async def stream(self, message: str) -> Any:
+                yield _Ev(EVENT_COMPLETE, stop_reason="cancelled")
+
+        async def _cancelled(key: str, **kw: Any) -> Any:
+            return _Cancelled(), True, False
+
+        sess.get_or_create = _cancelled  # type: ignore[method-assign]
+        await d.handle_message(_inbound("hi"))
+        assert d.ctx_builder.build_calls[-1]["needs_reinjection"] is True
+        assert ledger["marks"] == 1 and ledger["armed"] is True
+
+    @pytest.mark.asyncio
+    async def test_a_delivery_failure_after_a_landed_turn_does_not_rearm(self) -> None:
+        # The provider completed the turn, so the re-injected context is in the
+        # conversation; Discord then failed every send. That is a delivery
+        # failure (recorded as one), not a lost prompt -- re-arming would inject
+        # the same context a second time on the next turn.
+        d, cli, sess = _dispatcher({"u1"})
+        d.ctx_builder = _RecordingCtx()  # type: ignore[assignment]
+        ledger = _arm_reinjection(sess)
+        cli.edit_ok = False
+        cli.fail_sends = True
+        await d.handle_message(_inbound("hi"))
+        assert d.ctx_builder.build_calls[-1]["needs_reinjection"] is True
+        assert sess.failures and not sess.successes, "undelivered is still a failure"
+        assert ledger["marks"] == 0 and ledger["armed"] is False
+
+    @pytest.mark.asyncio
+    async def test_a_failed_consuming_turn_puts_the_flag_back(self) -> None:
+        # The flag is cleared BEFORE build_message; a provider error on that very
+        # turn discards the prompt carrying the re-injected context. Without the
+        # re-arm the session runs without it until the NEXT compaction -- the
+        # contract the dashboard runner keeps in its finally, applied here.
+        d, _cli, sess = _dispatcher({"u1"})
+        d.ctx_builder = _RecordingCtx()  # type: ignore[assignment]
+        ledger = _arm_reinjection(sess)
+
+        async def _dying(key: str, **kw: Any) -> Any:
+            return _DyingProvider(), True, False
+
+        sess.get_or_create = _dying  # type: ignore[method-assign]
+        await d.handle_message(_inbound("hi"))
+        assert d.ctx_builder.build_calls[-1]["needs_reinjection"] is True
+        assert sess.failures and not sess.successes
+        assert ledger["marks"] == 1 and ledger["armed"] is True
 
 
 class TestGuildCommandRefusalsAreVisible:
@@ -4248,3 +5726,713 @@ class TestPerTurnConfigReadIsOffLoop:
         with mock.patch.object(td_mod.asyncio, "to_thread", _spy):
             await d.handle_message(_inbound("hi"))
         assert "_render_config" in offloaded
+
+
+class TestDrainSenderIdentity:
+    """A queue shared by two people must not be answered as one person.
+
+    Under ``messaging.dm_scope = "unified"`` every allow-listed person's direct chat
+    collapses into one session key -- ``build_dm_session_key`` reduces the bucket to
+    ``unified:{agent}``, dropping both channel and user -- so ONE queue holds messages
+    from several senders. A combined turn carries ONE envelope, so it may only combine
+    messages that share one.
+    """
+
+    _UNIFIED = "unified:kirocrew"
+
+    def test_the_surface_reports_whether_the_edit_landed(self) -> None:
+        """A rate-limited chat answers a refusal rather than raising, and the registry
+        can only keep that transition retryable if the wrapper reports it."""
+        d, cli, _sess = _dispatcher({7})
+        surface = d._receipt_surface("chan1")
+
+        async def go() -> tuple[bool, bool]:
+            cli.edit_ok = True
+            ok = await surface.edit_receipt("m1", "body")
+            cli.edit_ok = False
+            refused = await surface.edit_receipt("m1", "body")
+            return ok, refused
+
+        ok, refused = asyncio.run(go())
+        assert ok is True
+        assert refused is False
+
+    async def _queue(self, d: Any, sess: Any, *msgs: InboundMessage) -> None:
+        """Queue each message through the REAL enqueue, mid-turn.
+
+        End to end through the production writer, so the recorder and the reader are
+        covered together: an origin nothing reads back is not a fix, and an origin a
+        fixture spells by hand is not evidence production records one.
+        """
+        sess._busy = True
+        for msg in msgs:
+            assert await d._enqueue_with_receipt(
+                self._UNIFIED,
+                msg.conversation_id,
+                msg.text,
+                origin=_dc_origin(msg.user_id, msg.conversation_id, thread=msg.thread_id or ""),
+            ), "the fake session must accept a mid-turn enqueue"
+        sess._busy = False  # the turn they queued behind has finished
+
+    @staticmethod
+    async def _drain(d: Any, key: str) -> list[InboundMessage]:
+        """Drain, returning the envelope every replayed turn ran under."""
+        seen: list[InboundMessage] = []
+        original = d.handle_message
+
+        async def _spy(msg: Any, **kw: Any) -> None:
+            seen.append(msg)
+
+        d.handle_message = _spy
+        try:
+            await d._drain_queue(key)
+        finally:
+            d.handle_message = original
+        return seen
+
+    @pytest.mark.asyncio
+    async def test_the_receipt_counts_only_the_answered_senders_own_deferrals(self) -> None:
+        """ "+N deferred" is a promise TO ONE PERSON, so it may only count their messages.
+
+        ``len(remainder)`` also counts the other sender's entries and any entry another
+        TRANSPORT recorded. Each of those drains in its own turn, in its own channel, so
+        showing them here tells this person to expect a follow-up for text they never
+        wrote -- and when their own burst fit in one turn, their true count is zero.
+        """
+        d, _cli, sess = _dispatcher({"u1", "u2"}, dm_scope="unified")
+        deferred: list[int] = []
+
+        async def _flip(
+            session_key: str, channel_id: str, answered: list[str], n: int = 0, owner: str = ""
+        ) -> None:
+            deferred.append(n)
+
+        d._receipt_flip_locked = _flip
+        await self._queue(
+            d,
+            sess,
+            _inbound("mine", user_id="u1", conversation_id="c1"),
+            _inbound("theirs", user_id="u2", conversation_id="c2"),
+        )
+
+        await self._drain(d, self._UNIFIED)
+
+        assert deferred == [0, 0], "neither sender has a deferral of their OWN"
+
+    @pytest.mark.asyncio
+    async def test_a_senders_own_surplus_is_still_counted(self) -> None:
+        """The guard against fixing the count by always reporting zero."""
+        from kiro_crew.discord.transport_dispatch import _MAX_COLLAPSE
+
+        d, _cli, sess = _dispatcher({"u1"}, dm_scope="unified")
+        deferred: list[int] = []
+
+        async def _flip(
+            session_key: str, channel_id: str, answered: list[str], n: int = 0, owner: str = ""
+        ) -> None:
+            deferred.append(n)
+
+        d._receipt_flip_locked = _flip
+        await self._queue(
+            d,
+            sess,
+            *(
+                _inbound(f"m{i}", user_id="u1", conversation_id="c1")
+                for i in range(_MAX_COLLAPSE + 2)
+            ),
+        )
+
+        await self._drain(d, self._UNIFIED)
+
+        assert deferred[0] == 2, "both of this sender's own surplus messages are theirs"
+
+    @pytest.mark.asyncio
+    async def test_two_senders_on_one_queue_drain_as_two_turns(self) -> None:
+        """Each drained turn names the sender who wrote its text, in its own channel.
+
+        Under ``messaging.dm_scope = "unified"`` every allow-listed person's direct chat
+        collapses into one session key -- ``build_dm_session_key`` reduces the bucket to
+        ``unified:{agent}``, dropping both channel and user -- so ONE queue holds
+        messages from several senders. A combined turn carries ONE envelope, so it may
+        only combine messages that share one.
+        """
+        d, cli, sess = _dispatcher({"u1", "u2"}, dm_scope="unified")
+        await self._queue(
+            d,
+            sess,
+            _inbound("mine", user_id="u1", conversation_id="c1"),
+            _inbound("and mine", user_id="u2", conversation_id="c2"),
+        )
+
+        seen = await self._drain(d, self._UNIFIED)
+
+        assert [m.text for m in seen] == ["mine", "and mine"], "one turn each, FIFO order"
+        assert [m.user_id for m in seen] == ["u1", "u2"], "the turn must name its own author"
+        assert [m.conversation_id for m in seen] == ["c1", "c2"], "and answer in their own channel"
+        assert sess.queued == [], "the pump must drain the deferred entry too, not strand it"
+
+    @pytest.mark.asyncio
+    async def test_one_senders_burst_with_distinct_message_ids_still_collapses(self) -> None:
+        """The ordinary case is unchanged: one person's burst is ONE turn.
+
+        The two messages carry DISTINCT per-message ids, because Discord mints a
+        snowflake per message and two real messages never share one. Grouping on a
+        per-message identifier is the trap: it makes one person's own burst compare
+        unequal, so the collapse stops firing and every burst drains as N turns. The
+        origin records no such id, which is why the trap is avoided structurally here.
+        """
+        d, cli, sess = _dispatcher({"u1"}, dm_scope="unified")
+        first = _inbound_with_id("first", message_id="m-1")
+        second = _inbound_with_id("second", message_id="m-2")
+        assert first.message_id != second.message_id, "the point of this test"
+        await self._queue(d, sess, first, second)
+
+        seen = await self._drain(d, self._UNIFIED)
+
+        assert [m.text for m in seen] == ["first\n\nsecond"], "the burst must still collapse"
+        assert [m.user_id for m in seen] == ["u1"]
+        assert [m.conversation_id for m in seen] == ["c1"]
+
+    @pytest.mark.asyncio
+    async def test_a_third_sender_behind_two_does_not_jump_the_queue(self) -> None:
+        """A differing sender defers itself AND everything behind it, so FIFO is exact."""
+        d, cli, sess = _dispatcher({"u1", "u2"}, dm_scope="unified")
+        await self._queue(
+            d,
+            sess,
+            _inbound("a", user_id="u1", conversation_id="c1"),
+            _inbound("b", user_id="u2", conversation_id="c2"),
+            _inbound("c", user_id="u1", conversation_id="c1"),
+        )
+
+        seen = await self._drain(d, self._UNIFIED)
+
+        # "c" is the same sender as "a", but it arrived AFTER "b": collapsing it into
+        # the first turn would answer it ahead of a message that was queued earlier.
+        assert [(m.user_id, m.text) for m in seen] == [("u1", "a"), ("u2", "b"), ("u1", "c")]
+
+    @pytest.mark.asyncio
+    async def test_a_deferred_entry_keeps_its_own_origin_when_requeued(self) -> None:
+        """The re-enqueue must carry the origin, or the bug returns one iteration later."""
+        d, cli, sess = _dispatcher({"u1", "u2"}, dm_scope="unified")
+        await self._queue(
+            d,
+            sess,
+            _inbound("mine", user_id="u1", conversation_id="c1"),
+            _inbound("theirs", user_id="u2", conversation_id="c2"),
+        )
+        requeued: list[dict] = []
+        real_enqueue = sess.enqueue
+
+        def _spy(k: str, ts: str, text: str, **kw: Any) -> bool:
+            requeued.append(dict(kw))
+            return real_enqueue(k, ts, text, **kw)
+
+        sess.enqueue = _spy  # type: ignore[method-assign]
+
+        await self._drain(d, self._UNIFIED)
+
+        assert requeued, "the differing sender's entry must be re-enqueued, not dropped"
+        # Read back through the production reader rather than by spelling the storage
+        # keys, so renaming one cannot leave this test passing.
+        assert _queued_origin(requeued[0]) == _dc_origin("u2", "c2")
+
+    @pytest.mark.asyncio
+    async def test_the_receipt_is_flipped_in_the_channel_that_holds_its_bubble(self) -> None:
+        """The bubble belongs to whoever queued first, not to whoever opened the turn."""
+        d, cli, sess = _dispatcher({"u1", "u2"}, dm_scope="unified")
+        d.cfg.messaging.queue_mode = "queue"
+        _prime_live(d.cfg)
+        await self._queue(d, sess, _inbound("held", user_id="u2", conversation_id="c2"))
+        assert cli.send_channels and cli.send_channels[-1] == "c2", "the bubble lives in c2"
+
+        await self._drain(d, self._UNIFIED)
+
+        flips = [
+            channel
+            for channel, (_mid, text, _components) in zip(cli.edit_channels, cli.edits)
+            if "Now answering" in text
+        ]
+        assert flips, "the drain must flip the receipt"
+        assert flips[0] == "c2", "editing under another channel's address cannot land"
+
+    @pytest.mark.asyncio
+    async def test_a_queued_thread_message_replays_under_its_own_thread(self) -> None:
+        """The thread rides on the entry, so a thread queue keeps its route."""
+        d, cli, sess = _dispatcher({"u1"}, allowed_threads={"t9"}, dm_scope="unified")
+        await self._queue(d, sess, _inbound("in the thread", conversation_id="c1", thread_id="t9"))
+
+        seen = await self._drain(d, self._UNIFIED)
+
+        assert [m.text for m in seen] == ["in the thread"]
+        assert seen[0].thread_id == "t9"
+        assert seen[0].conversation_id == "c1"
+
+    def test_the_collapse_key_is_every_origin_field(self) -> None:
+        """Every field on this origin names WHO or WHERE, so all of them group.
+
+        Derived from ``_fields`` minus :data:`_NOT_A_SENDER` rather than restated, so
+        adding a field joins the key by DEFAULT: a WHO field left out would let two
+        people's messages collapse under one identity, while a surplus field only costs
+        a collapse. The empty exclusion set is pinned because widening it is how the
+        identity bug would return, and how the collapse would stop firing.
+        """
+        assert _NOT_A_SENDER == frozenset()
+        assert _QueuedOrigin._fields == ("user_id", "channel_id", "thread_id")
+        origin = _dc_origin("u1", "c1")
+        assert origin.sender_key == (origin.user_id, origin.channel_id, origin.thread_id)
+        # Different person, and the same person in a different place: unequal keys.
+        assert origin._replace(user_id="u2").sender_key != origin.sender_key
+        assert origin._replace(channel_id="c2").sender_key != origin.sender_key
+        assert origin._replace(thread_id="t9").sender_key != origin.sender_key
+
+    @pytest.mark.asyncio
+    async def test_an_entry_another_transport_recorded_is_deferred_not_lost(self) -> None:
+        """One queue can hold two transports, and neither may answer the other's.
+
+        Every DM dispatcher is built with the orchestrator's single ``SessionManager``,
+        and ``build_dm_session_key(..., dm_scope="unified", chat_type="direct")``
+        returns ``unified:{agent}`` for EVERY channel -- it drops the channel as well
+        as the user -- so a Discord DM and a Telegram DM to the same agent share one
+        queue. A Telegram-recorded entry carries no field Discord can address, so
+        answering it here would post one transport's reply into another's conversation,
+        and raising on it would discard every message already dequeued this iteration.
+        """
+        d, cli, sess = _dispatcher({"u1"}, dm_scope="unified")
+        foreign = {
+            "telegram_user_id": "7",
+            "telegram_chat_id": "70",
+            "telegram_thread_id": "",
+            "telegram_chat_type": "private",
+            "telegram_username": "",
+        }
+        assert _queued_origin(foreign) is None, "not this channel's entry to read"
+        sess.queued = [("t0", "theirs", dict(foreign))]
+
+        seen = await self._drain(d, self._UNIFIED)
+
+        assert seen == [], "Discord must not answer a Telegram-recorded message"
+        assert [text for _ts, text, _kw in sess.queued] == ["theirs"], "and must not lose it"
+        assert sess.queued[0][2] == foreign, "re-enqueued verbatim, for its own drain"
+
+    @pytest.mark.asyncio
+    async def test_a_foreign_entry_does_not_block_this_channels_own_messages(self) -> None:
+        """It steps aside rather than holding the queue: order is per sender, not global.
+
+        Blocking this channel's queue behind a foreign entry would strand it whenever
+        the other transport sends nothing further, and FIFO between two transports is
+        not something either sender can observe -- they are in different apps.
+        """
+        d, cli, sess = _dispatcher({"u1"}, dm_scope="unified")
+        await self._queue(d, sess, _inbound("mine", user_id="u1", conversation_id="c1"))
+        foreign = {
+            "telegram_user_id": "7",
+            "telegram_chat_id": "70",
+            "telegram_thread_id": "",
+            "telegram_chat_type": "private",
+            "telegram_username": "",
+        }
+        sess.queued.insert(0, ("t-first", "theirs", dict(foreign)))
+
+        seen = await self._drain(d, self._UNIFIED)
+
+        assert [m.text for m in seen] == ["mine"], "the foreign entry ahead of it must not block"
+        assert [text for _ts, text, _kw in sess.queued] == ["theirs"], "and stays for its own drain"
+
+    def test_a_partly_recorded_own_entry_is_a_producer_bug_not_a_fallback(self) -> None:
+        """An incomplete origin from THIS channel raises instead of guessing an address.
+
+        Both producers are in this module -- ``_enqueue_with_receipt`` and the drain's
+        own re-enqueue, which passes the entry's payload straight back -- so a partial
+        record can only mean a change here dropped a field. Defaulting to empty strings
+        would address the reply to an empty channel id, a silent misdelivery.
+
+        Ownership is read off the NEUTRAL channel field, which is why an entry can be
+        "mine, and broken" at all: without it, a missing field would be indistinguishable
+        from another transport's entry and would be silently set aside forever.
+        """
+        with pytest.raises(KeyError) as caught:
+            _queued_origin({"queued_channel": "discord", "discord_user_id": "u1"})
+        assert "discord_channel_id" in str(caught.value), "the error must name what is missing"
+
+        # An entry naming no channel, or another one, is the OTHER case: not this
+        # dispatcher's, deferred rather than raised on.
+        assert _queued_origin({}) is None
+        assert _queued_origin({"queued_channel": "telegram"}) is None
+
+    @pytest.mark.asyncio
+    async def test_the_enqueued_entry_records_the_senders_own_origin(self) -> None:
+        """Nothing downstream can recover an origin the entry never carried."""
+        d, cli, sess = _dispatcher({"u1"}, dm_scope="unified")
+        await self._queue(d, sess, _inbound("hello", user_id="u1", conversation_id="c1"))
+
+        assert _queued_origin(sess.queued[0][2]) == _dc_origin("u1", "c1")
+
+
+class TestRedactionNotice:
+    """When redaction rewrote what landed, one follow-up notice says so.
+
+    Discord edits its answer in place and rotates segments, so the tally counts
+    each LANDED message's final state and the notice goes out once, at the end
+    of ``on_done``. The shared wording is pinned in
+    ``test_credential_redaction_notice.py``.
+    """
+
+    _SECRET_URI = "postgresql://user:SuperSecret123@db.example.com:5432/prod"
+
+    @pytest.mark.asyncio
+    async def test_redacted_answer_is_followed_by_one_notice(self) -> None:
+        cli = FakeClient()
+        r = DiscordRenderer(cli, "chan1", DISCORD_CAPABILITIES, session_key="sk")  # type: ignore[arg-type]
+        await r.on_text_chunk(f"Run: psql {self._SECRET_URI}")
+        await r.on_done()
+
+        texts = [t for t, _c in cli.sent] + [t for _i, t, _c in cli.edits]
+        assert not any("SuperSecret123" in t for t in texts)
+        notices = [t for t, _c in cli.sent if "Security notice" in t]
+        assert len(notices) == 1
+        assert "SuperSecret123" not in notices[0]
+
+    @pytest.mark.asyncio
+    async def test_clean_answer_sends_no_notice(self) -> None:
+        cli = FakeClient()
+        r = DiscordRenderer(cli, "chan1", DISCORD_CAPABILITIES, session_key="sk")  # type: ignore[arg-type]
+        await r.on_text_chunk("All green, deploy finished.")
+        await r.on_done()
+
+        assert not any("Security notice" in t for t, _c in cli.sent)
+
+    @pytest.mark.asyncio
+    async def test_notice_send_failure_does_not_fail_a_delivered_turn(self) -> None:
+        cli = FakeClient()
+        real_send = cli.send_message
+
+        async def send_but_fail_the_notice(channel_id, text, **kw):
+            if "Security notice" in text:
+                raise RuntimeError("discord down after the answer")
+            return await real_send(channel_id, text, **kw)
+
+        cli.send_message = send_but_fail_the_notice  # type: ignore[method-assign]
+        r = DiscordRenderer(cli, "chan1", DISCORD_CAPABILITIES, session_key="sk")  # type: ignore[arg-type]
+        await r.on_text_chunk(f"Run: psql {self._SECRET_URI}")
+        await r.on_done()  # must not raise
+        # The answer itself landed.
+        assert any("[REDACTED: credential]" in t for t, _c in cli.sent) or any(
+            "[REDACTED: credential]" in t for _i, t, _c in cli.edits
+        )
+
+
+class TestRotationSeamCredentialSafety:
+    """A rotation must not hand the reader a key by putting two frames in a row.
+
+    The length cut lands on the RAW buffer and every frame is redacted ALONE, so a
+    credential the model wrote with markup across the cut matches nothing in either
+    frame -- and the reader's client renders the markup away and reads the halves
+    as one key, one message under the other.
+
+    Every shape here is asserted on the SCREEN: the frames the fake client actually
+    received, read the two ways a reader can produce (canonicalise the copied join,
+    and canonicalise each frame then read them in order). That is the same pair
+    ``joins_to_a_credential`` grades, but stated over the whole delivered sequence
+    and using only the redactor and the canonicaliser, so it holds whatever the
+    renderer did to get there.
+    """
+
+    def _renderer(
+        self, monkeypatch: pytest.MonkeyPatch, limit: int
+    ) -> tuple[DiscordRenderer, FakeClient]:
+        cli = FakeClient()
+        r = DiscordRenderer(cli, "chan1", DISCORD_CAPABILITIES, session_key="sk")  # type: ignore[arg-type]
+        monkeypatch.setattr(r, "_limit", lambda: limit)
+        monkeypatch.setattr("kiro_crew.discord.renderer._EDIT_THROTTLE_S", 1e9)
+        return r, cli
+
+    #: A cut inside an unbroken run of non-space characters is a HARD cut at the
+    #: budget, which is what puts the boundary inside the credential rather than at
+    #: some paragraph break the splitter would have preferred.
+    _LIMIT = 200
+
+    def _straddling_source(self, head: str, tail: str) -> str:
+        """One long word whose character at offset ``_LIMIT`` splits *head*/*tail*."""
+        return "a" * (self._LIMIT - len(head)) + head + tail + "b" * self._LIMIT
+
+    async def _screen(self, monkeypatch: pytest.MonkeyPatch, src: str) -> list[str]:
+        """Every frame the reader ends up with, rotation then final seal."""
+        r, cli = self._renderer(monkeypatch, self._LIMIT)
+        r._buf = [src]
+        await r._rotate_on_length()
+        await r._seal_current(extract_uploads=False)
+        return [text for text, _ in cli.sent]
+
+    @pytest.mark.asyncio
+    async def test_a_cut_after_trailing_space_is_graded_on_the_trimmed_form(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Discord shows the reader the trimmed text, so the grade must trim too.
+
+        This shape is MEASURED, not assumed. At this limit the splitter's own chunks
+        already sever, so the rotation does consult the offset search; the offset a
+        non-trimming transform returns leaves halves whose RAW forms are safe -- the
+        spaces sit between them -- while their DELIVERED forms sit flush and read as one
+        key. The assertion is therefore on the delivered forms: comparing the raw frames
+        is what makes this hazard invisible.
+        """
+        head, tail = "AKIAIOSF", "ODNN7EXAMPLE"
+        prefix = "word " * 20
+        src = prefix + head + "   " + tail + " trailing prose here"
+        r, cli = self._renderer(monkeypatch, len(prefix + head) + 3)
+        r._buf = [src]
+
+        await r._rotate_on_length()
+        await r._seal_current(extract_uploads=False)
+
+        frames = [text for text, _ in cli.sent]
+        assert len(frames) >= 2, f"fixture delivered {len(frames)} frame(s), so it grades no seam"
+        self._assert_no_key_on_screen([_delivered_form(f) for f in frames])
+
+    @staticmethod
+    def _assert_no_key_on_screen(frames: list[str]) -> None:
+        for reading in (
+            canonicalize_display("".join(frames)),
+            "".join(canonicalize_display(f) for f in frames),
+        ):
+            assert _redact_all(reading) == reading, f"key readable across frames: {frames}"
+
+    @pytest.mark.asyncio
+    async def test_a_held_image_ref_cannot_be_re_delivered_as_the_rejected_pair(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The offset search grades the source; the rotation delivers source PLUS held.
+
+        An image reference starting at or before the budget leaves the sealable
+        source SHORTER than the budget, so the search takes its ``limit >= len(text)``
+        early return and hands back the whole string. Re-assigning the frames from
+        that answer reproduces the byte-identical pair the gate above just rejected,
+        and the reader sees the label ``![my-secret-value](...)`` canonicalises to
+        sitting straight under a dangling ``SecretAccessKey=``. So the search's answer
+        is a candidate, not a verdict: the delivered pair is graded again and the
+        rotation delivers nothing rather than the pair it already refused.
+        """
+        limit = 100
+        head = "prose " * 10 + "SecretAccessKey="
+        held = "![my-secret-value](/tmp/kc-13494-missing.png)"
+        src = head + held
+        assert len(src) > limit, "fixture does not rotate"
+        assert len(head) <= limit, "fixture does not reach the search's early return"
+        assert _redact_all(head) == head and _redact_all(held) == held, "fixture leaks alone"
+        assert severs_a_credential(
+            [head, held], _redact_all, _delivered_form
+        ), "fixture is not a straddle, so the rotation never consults the search"
+
+        r, cli = self._renderer(monkeypatch, limit)
+        r._buf = [src]
+        await r._rotate_on_length()
+
+        assert cli.sent == [], "the rotation delivered the pair the gate rejected"
+        assert "".join(r._buf) == src, "withheld text must ride the next rotation intact"
+
+        await r._seal_current(extract_uploads=False)
+        self._assert_no_key_on_screen([_delivered_form(t) for t, _ in cli.sent])
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("head", "tail"), CREDENTIAL_STRADDLE_SHAPES)
+    async def test_a_straddled_credential_never_reaches_two_frames(
+        self, monkeypatch: pytest.MonkeyPatch, head: str, tail: str
+    ) -> None:
+        rejoined = (
+            canonicalize_display(head + tail),
+            canonicalize_display(head) + canonicalize_display(tail),
+        )
+        assert any(_redact_all(r) != r for r in rejoined), "fixture is not a straddle"
+
+        frames = await self._screen(monkeypatch, self._straddling_source(head, tail))
+        assert frames, "nothing was delivered at all"
+        self._assert_no_key_on_screen(frames)
+
+    @pytest.mark.asyncio
+    async def test_an_innocent_body_still_rotates(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Control: the grading refuses boundaries, it does not stop rotating."""
+        r, cli = self._renderer(monkeypatch, self._LIMIT)
+        r._buf = ["word " * 200]
+        await r._rotate_on_length()
+        assert cli.sent, "an innocent body was withheld"
+
+    @pytest.mark.asyncio
+    async def test_no_safe_offset_withholds_the_text_instead_of_sending_it(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The failure direction: nothing safe to cut means nothing goes out.
+
+        With no sampled offset safe, the rotation must not fall back on the cut it
+        already refused. It delivers NOTHING, keeps the buffer whole, and the final
+        seal then redacts that buffer as one string -- where the key is intact and
+        matches, so it is replaced rather than shown.
+        """
+        head, tail = "AKIAIOSF", "ODNN7EXAMPLE"
+        src = self._straddling_source(head, tail)
+        monkeypatch.setattr("kiro_crew.discord.renderer.safe_split_offset", lambda *a, **k: 0)
+        r, cli = self._renderer(monkeypatch, self._LIMIT)
+        r._buf = [src]
+
+        await r._rotate_on_length()
+
+        assert cli.sent == [], "text went out on a cut the grading had refused"
+        assert "".join(r._buf) == src, "the withheld text was not kept whole"
+
+    @pytest.mark.asyncio
+    async def test_a_presentation_fallback_retains_no_piece_over_the_budget(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A graded cut must not buy one safe boundary with every later one.
+
+        The presentation branch is TERMINAL: the piece it retains is parked as
+        ``_delivery_text`` with no further rotation ahead of it, and the only thing
+        that bounds it after that is ``_seal_current``'s own re-split -- which cuts
+        on length alone and grades no boundary. So a fallback that replaced the
+        splitter's bounded chunks with ``[head, whole remainder]`` moved the FIRST
+        boundary to safety and handed every later one in the same text to an
+        ungraded cut. The invariant is stated on the retained SIZE, which is what
+        makes it hold whatever the text is.
+
+        The sealed frames are deliberately not size-asserted: the seal redacts each
+        one, and the replacement text is longer than the key it covers, so a frame
+        legitimately ends up wider than the budget. That growth is the protection
+        working, not a boundary escaping.
+        """
+        head, tail = "AKIAIOSF", "ODNN7EXAMPLE"
+        # One unbroken word, so the splitter cuts hard at the budget and the first
+        # cut lands inside the credential. Several budgets wide, so a single graded
+        # offset would leave a remainder many times the budget.
+        src = "a" * (self._LIMIT - len(head)) + head + tail + "b" * (self._LIMIT * 6)
+        assert severs_a_credential(
+            await asyncio.to_thread(split_markdown_safe, src, self._LIMIT),
+            _redact_all,
+            _delivered_form,
+        ), "fixture does not sever, so it never reaches the graded fallback"
+
+        r, cli = self._renderer(monkeypatch, self._LIMIT)
+        r._delivery_text = src
+        await r._rotate_on_length()
+
+        retained = r._delivery_text or ""
+        assert len(cli.sent) > 1, "one frame only, so the fallback carved nothing"
+        assert len(retained) <= self._LIMIT, (
+            f"a {len(retained)}-char piece is retained against a {self._LIMIT} budget; "
+            "the seal's own re-split is the next cut and it grades no boundary"
+        )
+
+        await r._seal_current(extract_uploads=False)
+        self._assert_no_key_on_screen([_delivered_form(t) for t, _ in cli.sent])
+
+        await r._seal_current(extract_uploads=False)
+        delivered = "".join(text for text, _ in cli.sent)
+        assert head + tail not in delivered, "the final seal shipped the key"
+
+    @pytest.mark.asyncio
+    async def test_a_markup_span_covering_a_whole_piece_is_caught(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Piece length is no defence: canonicalising DROPS a link's target.
+
+        Three pieces, where no neighbouring PAIR reveals anything -- the link needs
+        its closing bracket, which is in the third piece -- while the full join
+        collapses the url to its label and puts that label against ``AKIA``. So the
+        middle piece is swallowed whole, which a pairwise grade cannot see.
+        """
+        key_head, key_tail = "AKIA", "IOSFODNN7EXAMPLE"
+        src = (
+            "a" * (self._LIMIT - len(key_head))
+            + key_head
+            + "["
+            + key_tail
+            + "](http://q/"
+            + "b" * self._LIMIT
+            + ") rest"
+        )
+        frames = await self._screen(monkeypatch, src)
+        assert frames, "nothing was delivered at all"
+        self._assert_no_key_on_screen(frames)
+
+    @pytest.mark.asyncio
+    async def test_a_retained_buffer_holds_only_source_text(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Whatever is kept live must be a SLICE of the source, never rejoined chunks.
+
+        ``split_markdown_safe`` does not concatenate back to its input: a chunk is
+        rstripped and a fence is closed at the seal and reopened after it. Rejoining
+        chunks would glue one paragraph's last word onto the next, or invent a fence
+        run the model never wrote, and that is the text the user is eventually sent.
+        """
+        src = (
+            "a" * (self._LIMIT - 8)
+            + "AKIAIOSF"
+            + "ODNN7EXAMPLE"
+            + "\n\npara two\n\n```py\nx = 1\n```\n\npara three "
+            + "c" * self._LIMIT
+        )
+        r, _cli = self._renderer(monkeypatch, self._LIMIT)
+        r._buf = [src]
+        await r._rotate_on_length()
+        retained = "".join(r._buf)
+        assert retained in src, "retained buffer is not a slice of the source"
+
+    @pytest.mark.asyncio
+    async def test_a_boundary_is_graded_on_the_text_the_seal_delivers(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A steering marker between the halves vanishes at the seal.
+
+        The grade must run on the delivered form. Graded raw, the marker separates
+        the halves and no credential pattern matches; delivered, the seal removes it
+        and the two messages sit flush together.
+        """
+        r, cli = self._renderer(monkeypatch, self._LIMIT)
+        r._buf = ["a" * (self._LIMIT - 8) + "AKIAIOSF" + "ODNN7EXAMPLE" + "b" * self._LIMIT]
+        await r._rotate_on_length()
+        await r._seal_current(extract_uploads=False)
+        self._assert_no_key_on_screen([text for text, _ in cli.sent])
+
+    @pytest.mark.asyncio
+    async def test_the_seals_own_split_grades_its_boundary(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The last cut before the wire is the one nothing rotates behind.
+
+        A buffer the rotation WITHHELD as unsafe is parked whole, so it arrives at
+        the seal over the platform cap. The seal splits it again -- and that cut had
+        no redactor, where Telegram's own splitter call has carried one all along. So
+        the gate that refused to cut handed the same text to a cut made on length
+        alone, and a key the markup spans is severed there instead.
+
+        The link target is a long run with no space in it, which is what makes the
+        cut land inside the credential rather than at a break the splitter prefers.
+        """
+        # The key lives in the link TARGET behind an innocuous label, broken by a run
+        # of ``*``. Neither whole-text reading sees it: canonicalising collapses the
+        # link to its label, and the literal form has the run between the halves. So
+        # the seal's own redaction finds nothing and the text arrives at the split
+        # intact. Canonicalising each delivered frame DROPS the emphasis run, which
+        # is what puts the halves flush once the cut lands inside it.
+        src = (
+            "a" * (DISCORD_MAX_TEXT - 100)
+            + "[l](https://x/AKIA"
+            + "*" * 300
+            + "IOSFODNN7EXAMPLE)"
+            + "b" * 400
+        )
+        assert len(src) > DISCORD_MAX_TEXT, "fixture does not reach the platform cap"
+        assert (
+            discord_renderer._redact_transformed(src) == src
+        ), "the seal's own redaction already catches it"
+        assert severs_a_credential(
+            split_markdown_safe(src, DISCORD_MAX_TEXT), _redact_all, _delivered_form
+        ), "an ungraded split of this fixture no longer severs"
+
+        r, cli = self._renderer(monkeypatch, self._LIMIT)
+        r._buf = [src]
+        await r._seal_current(extract_uploads=False)
+
+        frames = [text for text, _ in cli.sent]
+        assert len(frames) >= 2, f"fixture did not split at the seal: {len(frames)}"
+        self._assert_no_key_on_screen(frames)

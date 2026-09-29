@@ -1,21 +1,21 @@
-"""Every remaining agent-spec scan reads through the hardened reader (#6695).
+"""Every remaining agent-spec scan reads through the hardened reader.
 
 Seven call sites read ``~/.kiro/agents/*.json`` with a hand-rolled
 ``json.loads(read_text())`` until this migration; each now goes through
 ``agent_discovery._read_agent_spec`` -- the size-capped, sensitive-symlink- and
-non-object-refusing reader #5423 adopted for ``_resolve_agent_model``. Per
+non-object-refusing reader used for ``_resolve_agent_model``. Per
 surface this pins the two properties the migration promises: a refused spec is
 SKIPPED (it degrades exactly like an absent one, and the surface still
 answers), and a valid spec is unaffected under the same cap.
 
 Refusal is exercised with a LOWERED ``hooks.MAX_FILE_BYTES`` (the property is
 that the cap is consulted, not its value) and with non-object JSON -- both
-observable without planting symlinks, mirroring #5423's tests. One
+observable without planting symlinks, mirroring the reader's own tests. One
 representative symlink test proves the sensitive-target guard applies through
 a migrated caller; the guard itself lives in ``_read_agent_spec`` and has its
 own coverage.
 
-#6736 extends the migration to three more raw ``_load_json`` reads of
+The migration also covers three more raw ``_load_json`` reads of
 ``kirocrew.json`` (``mint._write_mint_agent_spec``,
 ``mint._agent_spec_entry_missing``, ``agent._install_heartbeat_agent``); their
 classes below pin the same two properties per site. For those three sites only
@@ -27,11 +27,13 @@ the ``oversized`` and symlink cases are differential against the old path
 from __future__ import annotations
 
 import ast
+import functools
 import json
 from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+import source_corpus
 from aiohttp import web
 
 from conftest import requires_symlinks
@@ -50,6 +52,12 @@ from kiro_crew.dashboard.handlers.mcp import (
     api_mcp_active,
 )
 
+# One xdist worker for the whole module: the call-site ratchet below streams src/ through
+# ``test/source_corpus.py`` once per target and memoises only its own small result. Under
+# `--dist loadgroup` an unmarked module is spread across workers and each worker re-pays
+# every one of those scans. Grouping keeps them single-copy per run.
+pytestmark = pytest.mark.xdist_group(name="tree_scan_test_agent_spec_hardened_reads")
+
 # The two refusal shapes cheap enough to plant per surface. "oversized" is the
 # differential case (the old read_text path had no cap, so it PARSED these);
 # "non_object" pins that valid-JSON-wrong-shape degrades as absent everywhere,
@@ -64,7 +72,7 @@ def agents_dir(tmp_path, monkeypatch):
 
     ``KIRO_AGENTS_DIR`` is the documented override hook every migrated site
     resolves through ``kiro_agents_dir_path()``; the cap is lowered rather than
-    writing a real 50 MB fixture (same trade #5423's tests made).
+    writing a real 50 MB fixture (same trade the reader's own tests made).
     """
     from kiro_crew import hooks
 
@@ -356,15 +364,15 @@ class TestResolveMcpServer:
             {"name": "kirocrew", "mcpServers": {"srv-hr": {"command": "c", "args": ["a"]}}},
         )
 
-        # #2602 widened the resolver contract to ``(argv, env)`` -- a spec with
+        # The resolver contract is ``(argv, env)`` -- a spec with
         # no env block resolves to an empty dict, not None.
         assert _resolve_mcp_server("srv-hr") == (("c", "a"), {})
 
     def test_a_declared_env_block_survives_the_hardened_read(self, agents_dir_resolver):
-        """The other half of the post-#2602 contract, on THIS module's read path.
+        """The other half of the resolver's env contract, on THIS module's read path.
 
         The case above pins the empty-env shape, which a resolver that dropped the
-        block entirely would also satisfy. #2602 added ``env`` because a launcher
+        block entirely would also satisfy. The contract carries ``env`` because a launcher
         that shells out to a helper reachable only via the PATH the config supplies
         dies at the JSON-RPC ``initialize`` handshake without it -- so the value has
         to arrive, not just the tuple shape. Nothing here asserted that: this file's
@@ -507,24 +515,30 @@ class TestLoadSteeringResources:
 
 
 class TestDenialAuditNeverRaises:
-    """A failing denial audit must not break either never-raise promise.
+    """A failing denial audit must not break any never-raise promise.
 
     The refusal paths are the only places this module calls out to another
     subsystem, and for some surfaces it is the process's FIRST SEL use --
     constructing that singleton mkdirs its home. On an unwritable or hostile SEL
-    directory the audit therefore raises, and BOTH callers promise not to:
-    ``_read_agent_spec`` by the contract its ~15 bare call sites read it on, and
-    ``project_agent_names`` in its own docstring. Either raise would abort
-    whichever surface asked on exactly the hostile path the refusal handles --
-    and ``project_agent_names`` runs on EVERY turn of a project-agent-bound
-    session, with a caller-supplied path.
+    directory the audit therefore raises, and all three callers promise not to:
+    ``_read_agent_spec`` by the contract its ~15 bare call sites read it on,
+    ``project_agent_names`` in its own docstring, and ``project_agent_files`` in
+    its own ("Returns ``[]`` for a falsy or sensitive *project_dir*, and never
+    raises"). Any one of those raises would abort whichever surface asked on
+    exactly the hostile path the refusal handles -- and ``project_agent_names``
+    runs on EVERY turn of a project-agent-bound session with a caller-supplied
+    path, while ``project_agent_files`` is read bare by the Slack listing, the
+    dashboard side panel and the session-MCP resolution.
     """
 
     @staticmethod
     def _break_sel(monkeypatch):
         from kiro_crew import agent_discovery
 
+        # Every fence refuses: the project-directory and cache-key checks ask
+        # is_sensitive_path, the spec readers ask is_sensitive_canonical_path.
         monkeypatch.setattr(agent_discovery, "is_sensitive_path", lambda _p: True)
+        monkeypatch.setattr(agent_discovery, "is_sensitive_canonical_path", lambda _p: True)
 
         def _explode():
             raise OSError("SEL home is not writable")
@@ -554,12 +568,28 @@ class TestDenialAuditNeverRaises:
         assert result == frozenset()
         assert any("audit row lost" in r.message for r in caplog.records)
 
+    def test_project_files_audit_failure_still_yields_empty(self, tmp_path, monkeypatch, caplog):
+        """The file scan is reached directly too, so it needs its own coverage.
+
+        ``project_agent_names`` refuses the sensitive directory BEFORE it calls
+        the file scan, so its test above exercises only the name wrapper's own
+        audit. The surfaces that ask for the file list -- the Slack listing, the
+        side panel, the session-MCP resolution -- reach this refusal directly.
+        """
+        agent_discovery = self._break_sel(monkeypatch)
+
+        with caplog.at_level("WARNING", logger="kiro_crew.agent_discovery"):
+            result = agent_discovery.project_agent_files(tmp_path)
+
+        assert result == []
+        assert any("audit row lost" in r.message for r in caplog.records)
+
 
 class TestSensitiveSymlinkGuard:
     """One representative surface proves the symlink guard flows through.
 
     The guard's own matrix lives with ``_read_agent_spec``; this pins that a
-    migrated caller actually consults it (same shape as #5423's test).
+    migrated caller actually consults it (same shape as the reader's own test).
     """
 
     @requires_symlinks
@@ -571,7 +601,9 @@ class TestSensitiveSymlinkGuard:
         agents = tmp_path / "agents"
         agents.mkdir()
         (agents / "linked.json").symlink_to(target)
-        monkeypatch.setattr(agent_discovery, "is_sensitive_path", lambda p: str(target) in str(p))
+        monkeypatch.setattr(
+            agent_discovery, "is_sensitive_canonical_path", lambda p: str(target) in str(p)
+        )
         monkeypatch.setattr("kiro_crew.agent.KIRO_AGENTS_DIR", agents)
 
         out = _build_kiro_model_map()
@@ -580,7 +612,7 @@ class TestSensitiveSymlinkGuard:
 
 
 class TestWriteMintAgentSpec:
-    """connections.mint._write_mint_agent_spec -- the one-server mint spec (#6736).
+    """connections.mint._write_mint_agent_spec -- the one-server mint spec.
 
     A refused main spec must FAIL the mint (raise): the main-agent fallback
     spawns ``kiro-cli --agent kirocrew``, and the child would reload the very
@@ -619,7 +651,7 @@ class TestWriteMintAgentSpec:
 
 
 class TestAgentSpecEntryMissing:
-    """connections.mint._agent_spec_entry_missing -- the concurrent-uninstall probe (#6736).
+    """connections.mint._agent_spec_entry_missing -- the concurrent-uninstall probe.
 
     A refused main spec reads as absent, so the entry counts as missing; the old
     path PARSED an oversized spec and reported the entry present.
@@ -649,14 +681,16 @@ class TestAgentSpecEntryMissing:
         agents = tmp_path / "agents"
         agents.mkdir()
         (agents / AGENT_FILENAME).symlink_to(target)
-        monkeypatch.setattr(agent_discovery, "is_sensitive_path", lambda p: str(target) in str(p))
+        monkeypatch.setattr(
+            agent_discovery, "is_sensitive_canonical_path", lambda p: str(target) in str(p)
+        )
         monkeypatch.setattr("kiro_crew.agent.KIRO_AGENTS_DIR", agents)
 
         assert mint._agent_spec_entry_missing("probe") is True
 
 
 class TestInstallHeartbeatAgent:
-    """agent._install_heartbeat_agent -- the main-config mcpServers pull (#6736).
+    """agent._install_heartbeat_agent -- the main-config mcpServers pull.
 
     A refused main spec contributes no MCP entries (the heartbeat agent installs
     with an empty toolset, same as when the main entry does not exist yet); the
@@ -715,7 +749,9 @@ class TestDenialAttribution:
 
         path = tmp_path / "protected.json"
         path.write_text(json.dumps({"name": "linked"}), encoding="utf-8")
-        monkeypatch.setattr(agent_discovery, "is_sensitive_path", lambda p: str(path) in str(p))
+        monkeypatch.setattr(
+            agent_discovery, "is_sensitive_canonical_path", lambda p: str(path) in str(p)
+        )
         events: list[dict] = []
         monkeypatch.setattr(
             agent_discovery,
@@ -766,7 +802,7 @@ class TestDenialAttribution:
 
 
 class TestProjectNamesDenialAttribution:
-    """Sensitive-project-dir denials name the surface that asked (#6764).
+    """Sensitive-project-dir denials name the surface that asked.
 
     Same contract as :class:`TestDenialAttribution`, for the OTHER denial path
     in the module: ``project_agent_names`` refuses a sensitive project
@@ -869,11 +905,127 @@ class TestProjectNamesDenialAttribution:
         assert events[0]["source"] == "unknown"
 
 
+class TestProjectFilesDenialAttribution:
+    """The file scan's own sensitive-project-dir denial is recorded and attributed.
+
+    ``project_agent_files`` is the third denial path in the module, and the one
+    most callers reach directly rather than through the name scan: the Slack
+    listing and name resolution, the dashboard side panel's base-spec and shadow
+    checks, the session-MCP and agent-shadow project lookups, doctor's model
+    resolution and member essential context each hand it a caller-supplied
+    directory. Refusing one is a probe of a protected tree, so it owes a SEL row
+    under the asking surface's labels, exactly like the reader and the name scan.
+    """
+
+    @staticmethod
+    def _denial_events(tmp_path, monkeypatch):
+        """Return a sensitive project dir and a spy collecting SEL fields."""
+        from types import SimpleNamespace
+
+        from kiro_crew import agent_discovery
+
+        project_dir = tmp_path / "protected-project"
+        project_dir.mkdir()
+        monkeypatch.setattr(
+            agent_discovery, "is_sensitive_path", lambda p: str(project_dir) in str(p)
+        )
+        events: list[dict] = []
+        monkeypatch.setattr(
+            agent_discovery,
+            "_sel",
+            lambda: SimpleNamespace(log_api_access=lambda **kw: events.append(kw)),
+        )
+        return project_dir, events
+
+    def test_a_refused_project_dir_emits_a_denial_row(self, tmp_path, monkeypatch):
+        """The refusal stands AND is recorded, under labels naming this function."""
+        from kiro_crew.agent_discovery import project_agent_files
+
+        project_dir, events = self._denial_events(tmp_path, monkeypatch)
+
+        assert project_agent_files(project_dir) == []
+        assert events == [
+            {
+                "caller": "agent_discovery",
+                "operation": "project_agent_files",
+                "outcome": "denied",
+                "source": "project_agent_files",
+                "resources": str(project_dir),
+                "error": "sensitive project dir rejected",
+            }
+        ]
+
+    def test_labelled_call_attributes_the_denial_to_that_surface(self, tmp_path, monkeypatch):
+        from kiro_crew.agent_discovery import project_agent_files
+
+        project_dir, events = self._denial_events(tmp_path, monkeypatch)
+
+        assert (
+            project_agent_files(project_dir, operation="side_readonly_spec", source="dashboard")
+            == []
+        )
+        assert len(events) == 1
+        assert events[0]["operation"] == "side_readonly_spec"
+        assert events[0]["source"] == "dashboard"
+        assert events[0]["caller"] == "agent_discovery"
+        assert events[0]["outcome"] == "denied"
+
+    def test_source_defaults_independently_of_operation(self, tmp_path, monkeypatch):
+        """Supplying an operation must not corrupt the source vocabulary."""
+        from kiro_crew.agent_discovery import project_agent_files
+
+        project_dir, events = self._denial_events(tmp_path, monkeypatch)
+
+        assert project_agent_files(project_dir, operation="list_agents") == []
+        assert events[0]["operation"] == "list_agents"
+        assert events[0]["source"] == "project_agent_files"
+
+    def test_the_legacy_listing_shape_is_audited_too(self, tmp_path, monkeypatch):
+        """Slack's ``include_legacy`` call takes the same refusal, so it owes a row.
+
+        ``include_legacy`` widens what a permitted directory yields; it is read
+        after the fence, so it can neither reach nor excuse a sensitive one.
+        """
+        from kiro_crew.agent_discovery import project_agent_files
+
+        project_dir, events = self._denial_events(tmp_path, monkeypatch)
+
+        result = project_agent_files(
+            project_dir, include_legacy=True, operation="slack_list_agents", source="slack"
+        )
+        assert result == []
+        assert len(events) == 1
+        assert events[0]["operation"] == "slack_list_agents"
+        assert events[0]["source"] == "slack"
+
+    def test_the_name_scan_records_the_refusal_once(self, tmp_path, monkeypatch):
+        """One refusal, one row: the name scan fences before it reaches the files.
+
+        ``project_agent_names`` decides sensitivity before any filesystem access
+        and returns, so the file scan is never entered on that path and the
+        operator sees a single denial rather than a pair for one request.
+        """
+        from kiro_crew.agent_discovery import project_agent_names
+
+        project_dir, events = self._denial_events(tmp_path, monkeypatch)
+
+        result = project_agent_names(project_dir, operation="chat_turn", source="dashboard")
+        assert result == frozenset()
+        assert len(events) == 1
+        assert events[0]["operation"] == "chat_turn"
+        assert events[0]["source"] == "dashboard"
+
+
 # Exact direct-call inventory. A new caller must name its user-facing operation
 # and interface channel (or ``unknown`` for a helper shared across interfaces).
 # Forwarding helpers are pinned as forwarding rather than forced to use a fixed
 # literal that would erase the caller's attribution.
 _EXPECTED_CALL_SITE_LABELS: dict[str, list[tuple[str, str]]] = {
+    # One read: the launch loop reads each authored spec to project it. Alias
+    # reclaim is keyed on lease liveness and reads no authored source.
+    "kiro_crew/acp/skill_projection.py": [
+        ("native_skill_projection", "acp"),
+    ],
     # Two reads, deliberately labelled apart: the session-MCP translation resolves
     # the PROJECT checkout first (kiro-cli resolves --agent there before the user
     # level) and falls back to the user-level spec, so a refusal names which of the
@@ -886,12 +1038,29 @@ _EXPECTED_CALL_SITE_LABELS: dict[str, list[tuple[str, str]]] = {
         ("agent_spec_lookup", "unknown"),
         ("migrate_agent_specs", "unknown"),
     ],
+    "kiro_crew/agent_capabilities.py": [("capability_publish", "dashboard")],
     "kiro_crew/agent_discovery.py": [
         ("agent_skill_globs", "unknown"),
+        # ``agent_welcome_message`` reads the PROJECT checkout's specs itself
+        # (project scope shadows the user level, as `list_agents` resolves it),
+        # so it names the hint read rather than forwarding: a refused checkout
+        # spec is attributed to the greeting, not to whichever surface asked.
+        ("agent_welcome_message", "unknown"),
+        ("forward:operation", "forward:source"),
+        ("forward:operation", "forward:source"),
+        # ``spec_by_declared_name`` scans specs it did not name for whichever
+        # surface resolves an agent id and finds no ``<agent_id>.json``; it
+        # forwards so each such surface attributes its own denials.
+        ("forward:operation", "forward:source"),
+        # ``agent_spec_stems`` reads each ``*.md`` to decide whether it is a
+        # spec at all, for the Slack listings; it forwards for the same reason.
         ("forward:operation", "forward:source"),
         ("list_agents", "unknown"),
         ("list_agents", "unknown"),
         ("resolve_project_agent_name", "unknown"),
+    ],
+    "kiro_crew/apps/builtins/auto_improvement/spine/crew_runner.py": [
+        ("auto_improvement_assignment", "unknown")
     ],
     "kiro_crew/cli_doctor.py": [("doctor", "cli"), ("doctor", "cli"), ("doctor", "cli")],
     "kiro_crew/config/loader.py": [("load_config", "unknown")],
@@ -903,12 +1072,36 @@ _EXPECTED_CALL_SITE_LABELS: dict[str, list[tuple[str, str]]] = {
         ("connections_warm_mint", "dashboard"),
         ("connections_warm_mint", "dashboard"),
     ],
-    "kiro_crew/context.py": [("steering_resources", "unknown")],
+    "kiro_crew/context.py": [
+        ("agent_prompt", "context"),
+        ("steering_resources", "unknown"),
+    ],
     "kiro_crew/cron_script.py": [("cron_resolve_mcp_server", "cron")],
+    # The templates tab's read-only rule for a definition PATCH reads the spec
+    # file the PATCH targets, so it labels itself as that PATCH; create re-reads
+    # the SOURCE it copies inside the spec lock (the fork/publish shape).
+    "kiro_crew/dashboard/handlers/agent_templates.py": [
+        ("api_agent_detail", "dashboard"),
+        ("api_agent_template_create", "dashboard"),
+        ("api_agent_template_delete", "dashboard"),
+        ("api_agent_template_delete", "dashboard"),
+    ],
     "kiro_crew/dashboard/handlers/agents.py": [
         ("api_agent_detail", "dashboard"),
         ("api_agent_detail", "dashboard"),
+        # PATCH's locked overwrite re-reads the spec INSIDE agents_spec_lock so
+        # the merge+sanitize applies to the current disk state, not a stale
+        # pre-lock snapshot.
+        ("api_agent_detail", "dashboard"),
+        # Fork/publish create closures re-read the SOURCE inside the lock too —
+        # the pre-lock snapshot can miss a concurrent refresh's writes (GPT
+        # round-10 stale-copy finding).
+        ("api_agent_fork", "dashboard"),
+        ("api_agent_publish", "dashboard"),
         ("api_agents_sync", "dashboard"),
+        # The fork/publish endpoints share _load_template_specs, which forwards
+        # its ``operation`` argument -- each caller still names itself.
+        ("forward:operation", "dashboard"),
     ],
     "kiro_crew/dashboard/handlers/hooks.py": [("api_kiro_hooks", "dashboard")],
     "kiro_crew/dashboard/handlers/mcp.py": [
@@ -917,15 +1110,31 @@ _EXPECTED_CALL_SITE_LABELS: dict[str, list[tuple[str, str]]] = {
         ("mcp_server_rows", "dashboard"),
         ("mcp_stub_eligibility", "dashboard"),
     ],
+    # The side chat's derived read-only spec reads the base agent's spec in
+    # BOTH scopes, project first (kiro-cli resolves --agent there before the
+    # user level); one label for both so a refusal attributes to the side turn.
+    "kiro_crew/dashboard/side_readonly_spec.py": [
+        ("side_readonly_spec", "dashboard"),
+        ("side_readonly_spec", "dashboard"),
+    ],
     "kiro_crew/mcp_discovery.py": [("mcp_discovery_agent_config", "unknown")],
+    "kiro_crew/member_essential_context.py": [
+        ("member_essentials", "context"),
+        ("member_essentials", "context"),
+    ],
     "kiro_crew/session.py": [
         ("forward:operation", "forward:source"),
         ("resolve_agent_model", "unknown"),
     ],
+    # The spawn gate walks every spec for the PARENT agent's
+    # ``toolsSettings.subagent.availableAgents`` allowlist, and keeps a file the
+    # reader refuses as unreadable (refuse) rather than as "no spec"; a denial
+    # there belongs to the sub-agent surface that asked to spawn.
+    "kiro_crew/subagent.py": [("spawn_available_agents", "subagent")],
 }
 
 
-# Same contract for ``project_agent_names`` (#6764): its sensitive-project-dir
+# Same contract for ``project_agent_names``: its sensitive-project-dir
 # denial carries operation/source, so every scan-reaching call site must name
 # its user-facing operation and interface channel. ``warm_project_agent_names``
 # is pinned as forwarding -- a fixed literal there would erase the attribution
@@ -933,9 +1142,43 @@ _EXPECTED_CALL_SITE_LABELS: dict[str, list[tuple[str, str]]] = {
 # absent by design: it is a pure in-memory lookup that performs no filesystem
 # work and can never reach the denial log line.
 _EXPECTED_PROJECT_NAMES_CALL_SITE_LABELS: dict[str, list[tuple[str, str]]] = {
+    "kiro_crew/agent.py": [("require_fork_governance", "unknown")],
     "kiro_crew/agent_discovery.py": [("forward:operation", "forward:source")],
     "kiro_crew/config/loader.py": [("project_declares_agent", "unknown")],
     "kiro_crew/dashboard/handlers/agents.py": [("api_kirocrew_agents", "dashboard")],
+}
+
+
+# The file scan under the name scan: most surfaces want the FILES, so they reach
+# the refusal directly and must name themselves the same way. ``agent.py`` holds
+# two lookups with different user-facing meanings (resolving a markdown spec for
+# an agent, and deciding whether a checkout shadows a managed agent), so they are
+# labelled apart. The in-module hop inside ``project_agent_names`` is pinned as
+# forwarding: a literal there would erase the surface that asked.
+_EXPECTED_PROJECT_FILES_CALL_SITE_LABELS: dict[str, list[tuple[str, str]]] = {
+    "kiro_crew/acp/session_mcp.py": [("session_mcp_project_agent", "unknown")],
+    "kiro_crew/agent.py": [
+        ("agent_project_shadow", "unknown"),
+        ("markdown_spec_lookup", "unknown"),
+    ],
+    # No ``kiro_crew/agent_discovery.py`` entry on purpose. The two in-module
+    # readers (``list_agents``, ``project_agent_names``) decide this scope's
+    # sensitivity THEMSELVES -- pinned in
+    # ``_EXPECTED_SCOPE_GUARD_CALL_SITE_LABELS`` -- and then scan through the
+    # unguarded ``_scan_project_agent_files``. Re-entering this reader would
+    # decide a second time on the same scope, and a second verdict that
+    # disagreed would record a denial for a tree the caller already read.
+    "kiro_crew/cli_doctor.py": [("doctor", "cli")],
+    # The base-spec read and the shadow check are one surface's two questions
+    # about the same checkout, so one label covers both.
+    "kiro_crew/dashboard/side_readonly_spec.py": [
+        ("side_readonly_spec", "dashboard"),
+        ("side_readonly_spec", "dashboard"),
+    ],
+    "kiro_crew/member_essential_context.py": [("member_essentials", "context")],
+    # Slack's shared discovery helper forwards the operation its two routes name
+    # (the listing, the name resolution); the channel is fixed, so it is a literal.
+    "kiro_crew/slack/handler.py": [("forward:operation", "slack")],
 }
 
 
@@ -948,13 +1191,16 @@ _EXPECTED_WARM_CALL_SITE_LABELS: dict[str, list[tuple[str, str]]] = {
     "kiro_crew/dashboard/chat_handlers.py": [
         ("api_chat", "dashboard"),
         ("api_chat_slot_agent", "dashboard"),
+        ("api_chat_slot_agent", "dashboard"),
     ],
     "kiro_crew/dashboard/chat_runner.py": [("chat_turn", "unknown")],
+    "kiro_crew/dashboard/chat_threads.py": [("thread_reply", "dashboard")],
     "kiro_crew/dashboard/handlers/side.py": [("side_panel", "dashboard")],
     "kiro_crew/spawn_warm.py": [("spawn_warm", "unknown")],
 }
 
 
+@functools.lru_cache(maxsize=None)
 def _labelled_call_sites(target: str) -> dict[str, list[tuple[str | None, str | None]]]:
     """Return every *target* call site and its label pair.
 
@@ -968,11 +1214,20 @@ def _labelled_call_sites(target: str) -> dict[str, list[tuple[str | None, str | 
     well, and its labels are read from the handing-off call, which is where the
     forwarded kwargs are written. This applies to every entry in
     ``_RATCHET_INVENTORY``, not to any one callee.
+
+    Cached per *target*: the source tree cannot change mid-run and both tests in
+    ``TestCallSiteLabelRatchet`` ask the same targets. The scan itself goes through
+    ``test/source_corpus.py``: one streamed read of ``src/`` per target, and a
+    parse of only the files whose text names *target* at all. That narrowing cannot
+    hide a site -- every match above is an identifier equal to *target* (a ``Name``
+    id, an ``Attribute`` attr, or a positional ``Name`` argument), and the corpus
+    matches identifiers on NFKC-normalised text, which is how CPython folds them at
+    parse time. Before this the function did its own ``rglob`` + ``ast.parse`` of
+    all ~1,600 modules once PER TARGET (6 x ~9 s per run).
     """
-    src = Path(__file__).resolve().parent.parent / "src"
+    src = source_corpus.src_root().parent
     sites: dict[str, list[tuple[str | None, str | None]]] = {}
-    for path in sorted(src.rglob("*.py")):
-        tree = ast.parse(path.read_text(encoding="utf-8"), str(path))
+    for path, _text, tree in source_corpus.parsed_candidates(require_any=(target,)):
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
@@ -1006,13 +1261,90 @@ def _labelled_call_sites(target: str) -> dict[str, list[tuple[str | None, str | 
     }
 
 
+# The parsed-specs snapshot forwards attribution the same way: its cached read
+# serves several surfaces, so a fixed literal inside it would erase which
+# surface triggered a denial. Callers therefore name themselves at the call
+# site, and the wrapper's own `_read_agent_spec` call is pinned as forwarding.
+_EXPECTED_PARSED_SPECS_CALL_SITE_LABELS: dict[str, list[tuple[str, str]]] = {
+    # ``cached_agent_specs`` is the on-loop face of the same snapshot: it
+    # forwards its caller's labels into the pool-side refresh, so the surface
+    # that asked still owns the denial. Pinned as forwarding, like the wrapper.
+    "kiro_crew/agent_discovery.py": [
+        ("agent_skill_globs", "unknown"),
+        ("forward:operation", "forward:source"),
+    ],
+    # The named-agent model resolver runs on the event loop from the provider
+    # factory; it reads the snapshot so a warm call re-parses nothing, and keeps
+    # the label its per-file hardened read carried.
+    "kiro_crew/config/loader.py": [("load_config", "unknown")],
+    "kiro_crew/dashboard/handlers/_shared.py": [("skills_loaded_by_agents", "dashboard")],
+    # Export/import warn about crew rows whose template this machine lacks.
+    "kiro_crew/portability.py": [("portability", "dashboard")],
+}
+
+
 # The ratchet's coverage: every attribution-labelled helper in the module, with
 # its exact call-site inventory. Extending attribution to a new helper means
-# adding it here so its callers keep the two vocabularies separate too (#6764
-# added ``project_agent_names``, mirroring #6722's ``_read_agent_spec``).
+# adding it here so its callers keep the two vocabularies separate too.
+# The declared-name scan serves the two surfaces that resolve an agent id
+# through it when they find no ``<agent_id>.json``: the KAS projection that
+# starts the session, and the tool-policy read that session's managed MCP
+# servers make. It reads specs it did not name in a user-writable directory, so
+# every caller names the surface whose resolution the denial belongs to.
+_EXPECTED_DECLARED_NAME_CALL_SITE_LABELS: dict[str, list[tuple[str, str]]] = {
+    "kiro_crew/acp/kas_agents.py": [("kas_agent_projection", "unknown")],
+    "kiro_crew/dashboard/handlers/sessions.py": [("session_tool_policy", "dashboard")],
+}
+
+
+# The strict reader is the direct-filename read for the three surfaces that
+# need the failure CLASS (transient vs deterministic) rather than ``None``: the
+# KAS projection, the overlay rewriter and the tool-policy read. Each names
+# itself so a sensitive-target denial is attributed to the surface that asked.
+# The tool-policy read has TWO sites under one label: the direct-filename read,
+# and the sweep that asks whether any spec in the directory is unreadable before
+# reporting "no policy" -- the declared-name scan folds a refusal into "no
+# match", so that sweep is how the surface learns the difference. Both belong to
+# the same resolution and so carry the same label.
+# The crewmate prune re-reads a bound spec under the agents lock right before it
+# deletes the row built from it; a spec that cannot be read as a spec refuses
+# the delete, so that read needs the failure to surface rather than fold to None.
+_EXPECTED_STRICT_CALL_SITE_LABELS: dict[str, list[tuple[str, str]]] = {
+    "kiro_crew/acp/kas_agents.py": [("kas_agent_projection", "unknown")],
+    "kiro_crew/crewmate_prune_migration.py": [("crewmate_prune", "dashboard")],
+    "kiro_crew/dashboard/handlers/sessions.py": [
+        ("session_tool_policy", "dashboard"),
+        ("session_tool_policy", "dashboard"),
+    ],
+    "kiro_crew/doctor_deadpath.py": [("doctor", "cli")],
+    "kiro_crew/mcp_gateway/rewriter.py": [("mcp_overlay_rewrite", "unknown")],
+    "kiro_crew/slack/handler.py": [("slack_resolve_agent", "slack")],
+}
+
+
+# The guard those three paths share. It is not a reader -- it decides, and emits
+# the denial row when the answer is "protected tree" -- but it is where the
+# ``operation``/``source`` pair now reaches the log, so a literal written here in
+# place of a forward would erase the asking surface from every denial the
+# enclosing function records. ``list_agents`` is the one in-module caller that IS
+# the surface, so its literals are the pinned exception.
+_EXPECTED_SCOPE_GUARD_CALL_SITE_LABELS: dict[str, list[tuple[str, str]]] = {
+    "kiro_crew/agent_discovery.py": [
+        ("forward:operation", "forward:source"),
+        ("forward:operation", "forward:source"),
+        ("list_agents", "unknown"),
+    ],
+}
+
+
 _RATCHET_INVENTORY: dict[str, dict[str, list[tuple[str, str]]]] = {
+    "_project_scope_denied": _EXPECTED_SCOPE_GUARD_CALL_SITE_LABELS,
     "_read_agent_spec": _EXPECTED_CALL_SITE_LABELS,
+    "parsed_agent_specs": _EXPECTED_PARSED_SPECS_CALL_SITE_LABELS,
+    "project_agent_files": _EXPECTED_PROJECT_FILES_CALL_SITE_LABELS,
     "project_agent_names": _EXPECTED_PROJECT_NAMES_CALL_SITE_LABELS,
+    "read_agent_spec_strict": _EXPECTED_STRICT_CALL_SITE_LABELS,
+    "spec_by_declared_name": _EXPECTED_DECLARED_NAME_CALL_SITE_LABELS,
     "warm_project_agent_names": _EXPECTED_WARM_CALL_SITE_LABELS,
 }
 

@@ -15,7 +15,6 @@ import chatReducer, {
   appendMessage,
   appendQueuedMessage,
   appendSlotMessage,
-  captureStatelessCard,
   capturePendingAskId,
   shouldResolveAskOnSend,
   clearFolderSuggestion,
@@ -40,7 +39,6 @@ import chatReducer, {
   requestStop,
   resolveQuestionCard,
   resumeFromHistory,
-  retireStatelessQuestion,
   selectComposerBusy,
   selectContinuable,
   selectSlotPendingApproval,
@@ -51,7 +49,7 @@ import chatReducer, {
   setActiveSlot,
   setFolderSuggestion,
   setFollowupCard,
-  setGoalLoops,
+  setAutomations,
   setQuestionCard,
   setQuestionDraft,
   setSlotStatusDetail,
@@ -63,7 +61,7 @@ import chatReducer, {
   sseActivityEvent,
   sseChatMessage,
   sseContextUsage,
-  sseGoalLoop,
+  sseAutomation,
   sseMcpAppRender,
   sseSideQueue,
   sseSubagentBatchChunks,
@@ -78,7 +76,16 @@ import chatReducer, {
   warmSlotCache,
 } from '../store/chatSlice'
 import { isStopEvent } from '../lib/stopEvent'
-import dashboardReducer, { sseSlots } from '../store/dashboardSlice'
+import type { LegacyGoalLoop } from '../monitoring/automation'
+
+const goalLoop = (
+  slotKey: string,
+  { active = true, cycleCount = 1, maxCycles = 5 }: Partial<LegacyGoalLoop> = {},
+): LegacyGoalLoop => ({
+  kind: 'legacy_goal_loop', id: `loop-${slotKey}`, slotKey, message: '', idleSecs: 60,
+  maxCycles, cycleCount, active, lastFireAt: 0, stoppedReason: '',
+})
+import dashboardReducer, { fetchSlots, sseSlots } from '../store/dashboardSlice'
 import notificationsReducer from '../store/notificationsSlice'
 import instancesReducer from '../store/instancesSlice'
 import type { ChatMessage, ChatSlot } from '../types'
@@ -89,6 +96,7 @@ const apiMock = vi.hoisted(() => ({
   chatSlots: vi.fn(),
   chatMode: vi.fn(),
   chatSlotProject: vi.fn(),
+  dashboardConfig: vi.fn(),
   createChatSlot: vi.fn(),
   deleteChatSlot: vi.fn(),
   deleteSession: vi.fn(),
@@ -132,6 +140,7 @@ const POISON = ['__proto__', 'constructor', 'prototype'] as const
 beforeEach(() => {
   for (const fn of Object.values(apiMock)) fn.mockReset()
   apiMock.chatSlots.mockResolvedValue([])
+  apiMock.dashboardConfig.mockResolvedValue({ default_memory_mode: 'persistent' })
   apiMock.setSlotColor.mockResolvedValue({})
   apiMock.stopChatSlot.mockResolvedValue({})
   apiMock.stopChatSlotForce.mockResolvedValue({})
@@ -152,30 +161,21 @@ describe('chatSlice exported helpers', () => {
   })
 
   it('reads a pending question card fail-closed', () => {
-    const map = { real: { slot: 'real', questions: [], cardId: 'card-1' } }
-    expect(pendingQuestionFor(map, 'real')?.cardId).toBe('card-1')
+    const map = { real: { slot: 'real', questions: [], serverCardId: 'card-1' } }
+    expect(pendingQuestionFor(map, 'real')?.serverCardId).toBe('card-1')
     expect(pendingQuestionFor(map, 'absent')).toBeNull()
     expect(pendingQuestionFor(undefined, 'real')).toBeNull()
     expect(pendingQuestionFor(map, null)).toBeNull()
     for (const bad of POISON) expect(pendingQuestionFor(map, bad)).toBeNull()
   })
 
-  it('captures a stateless card identity but never a server-owned one', () => {
-    const stateless = { s: { slot: 's', questions: [], cardId: 'card-7' } }
-    expect(captureStatelessCard(stateless, 's')).toBe('card-7')
-    const serverOwned = { s: { slot: 's', ask_id: 'ask-1', questions: [], cardId: 'card-7' } }
-    expect(captureStatelessCard(serverOwned, 's')).toBeNull()
-    expect(captureStatelessCard(stateless, 'absent')).toBeNull()
-    const unminted = { s: { slot: 's', questions: [] } }
-    expect(captureStatelessCard(unminted, 's')).toBeNull()
-  })
-
-  // The mirror capture for blocking cards, which the send path resolves over the
-  // network because an agent is parked on the request.
+  // The send-time capture for blocking cards, which the send path resolves over
+  // the network because an agent is parked on the request. (A stateless card
+  // has no send-time capture: the server retires it on the user row.)
   it('captures a blocking card ask_id but never a stateless one', () => {
-    const blocking = { s: { slot: 's', ask_id: 'ask-1', questions: [], cardId: 'card-7' } }
+    const blocking = { s: { slot: 's', ask_id: 'ask-1', questions: [] } }
     expect(capturePendingAskId(blocking, 's')).toBe('ask-1')
-    const stateless = { s: { slot: 's', questions: [], cardId: 'card-7' } }
+    const stateless = { s: { slot: 's', questions: [] } }
     expect(capturePendingAskId(stateless, 's')).toBeNull()
     expect(capturePendingAskId(blocking, 'absent')).toBeNull()
     expect(capturePendingAskId(undefined, 's')).toBeNull()
@@ -187,9 +187,9 @@ describe('chatSlice exported helpers', () => {
   // selection lives only in the component — the same work-in-progress invariant
   // the stateless path keeps.
   it('declines to capture a blocking card that holds an answer in progress', () => {
-    const drafting = { s: { slot: 's', ask_id: 'ask-1', questions: [], cardId: 'card-7', draftActive: true } }
+    const drafting = { s: { slot: 's', ask_id: 'ask-1', questions: [], draftActive: true } }
     expect(capturePendingAskId(drafting, 's')).toBeNull()
-    const settled = { s: { slot: 's', ask_id: 'ask-1', questions: [], cardId: 'card-7', draftActive: false } }
+    const settled = { s: { slot: 's', ask_id: 'ask-1', questions: [], draftActive: false } }
     expect(capturePendingAskId(settled, 's')).toBe('ask-1')
   })
 
@@ -237,13 +237,15 @@ describe('chatSlice prototype-pollution guards', () => {
     store.dispatch(setActiveSlot('real'))
     for (const bad of POISON) {
       store.dispatch(setStopPressedAt({ slotId: bad, ts: 1 }))
-      store.dispatch(setSlotStatusDetail({ slot: bad, kind: 'tool', text: 't', ts: 1 }))
+      store.dispatch(setSlotStatusDetail({ slot: bad, kind: 'tool', purpose: 't', ts: 1 }))
       store.dispatch(sseContextUsage({ slot: bad, pct: 50, window_tokens: 100 }))
       store.dispatch(hydrateSlotMessages({ slot: bad, messages: [{ role: 'user', content: 'x' } as ChatMessage] }))
       store.dispatch(appendSlotMessage({ slot: bad, message: { role: 'user', content: 'x' } as ChatMessage }))
       store.dispatch(sseSubagentQueued({ slot: bad, queued: 3 }))
-      store.dispatch(sseGoalLoop({ slot: bad, active: true, cycle_count: 1, max_cycles: 5 }))
-      store.dispatch(setGoalLoops([{ slot: bad, active: true, cycle_count: 1, max_cycles: 5 }]))
+      store.dispatch(sseAutomation(goalLoop(bad)))
+      store.dispatch(setAutomations({
+        records: [goalLoop(bad)], legacyComplete: true, structuredComplete: true,
+      }))
       store.dispatch(sseToolActivity({ slot: bad, tool: 't', kind: 'tool', purpose: '', input_preview: '' }))
       store.dispatch(sseActivityEvent({ slot: bad, kind: 'note', text: 'n' }))
       store.dispatch(clearTerminalSubagents({ slot: bad }))
@@ -260,7 +262,7 @@ describe('chatSlice prototype-pollution guards', () => {
     expect(Object.keys(s.slotContextPct)).toEqual([])
     expect(Object.keys(s.slotMessages)).toEqual([])
     expect(Object.keys(s.subagentQueued)).toEqual([])
-    expect(Object.keys(s.goalLoops)).toEqual([])
+    expect(Object.keys(s.automations)).toEqual([])
     expect(Object.keys(s.slotSide)).toEqual([])
     expect(s.messages).toEqual([])
     expect(s.toolLog).toEqual([])
@@ -271,7 +273,6 @@ describe('chatSlice prototype-pollution guards', () => {
     for (const bad of POISON) {
       store.dispatch(setQuestionCard({ slot: bad, questions: [{ question: 'q', options: [] }] }))
       store.dispatch(setQuestionDraft({ slot: bad, active: true }))
-      store.dispatch(retireStatelessQuestion({ slot: bad, expected: 'card-1' }))
       store.dispatch(clearQuestionCard({ slot: bad }))
       store.dispatch(setFollowupCard({ slot: bad, items: [{ title: 't', description: 'd', prompt: 'p' }] }))
       store.dispatch(clearFollowupCard({ slot: bad }))
@@ -483,36 +484,28 @@ describe('chatSlice bounded retention', () => {
 })
 
 describe('chatSlice question cards', () => {
-  it('keeps one card per re-delivered ask but re-mints identity for a fresh one', () => {
+  it('keeps one entry per re-delivered server identity and replaces on a new one', () => {
     const store = makeStore()
     const questions = [{ question: 'Ship it?', options: [{ label: 'Yes' }] }]
     store.dispatch(setQuestionCard({ slot: 'front', ask_id: 'ask-1', questions }))
-    const first = chat(store).pendingQuestions.front.cardId
-    store.dispatch(setQuestionCard({ slot: 'front', ask_id: 'ask-1', questions }))
-    expect(chat(store).pendingQuestions.front.cardId).toBe(first)
-    store.dispatch(setQuestionCard({ slot: 'front', ask_id: 'ask-1', questions, fresh: true }))
-    expect(chat(store).pendingQuestions.front.cardId).not.toBe(first)
+    const first = chat(store).pendingQuestions.front
+    store.dispatch(setQuestionCard({ slot: 'front', ask_id: 'ask-1', questions: [...questions] }))
+    expect(chat(store).pendingQuestions.front).toBe(first)
+    store.dispatch(setQuestionCard({ slot: 'front', ask_id: 'ask-2', questions }))
+    expect(chat(store).pendingQuestions.front).not.toBe(first)
+    expect(chat(store).pendingQuestions.front.ask_id).toBe('ask-2')
   })
 
-  it('retires a stateless card only for the identity the send captured', () => {
+  it('clears a stateless card only for the server identity the dismiss named', () => {
     const store = makeStore()
-    store.dispatch(setQuestionCard({ slot: 'front', questions: [{ question: 'q', options: [] }] }))
-    const captured = captureStatelessCard(chat(store).pendingQuestions, 'front')
-    store.dispatch(retireStatelessQuestion({ slot: 'front', expected: 'card-stale' }))
+    store.dispatch(setQuestionCard({ slot: 'front', card_id: 'card-1', questions: [{ question: 'q', options: [] }] }))
+    store.dispatch(clearQuestionCard({ slot: 'front', card_id: 'card-stale' }))
     expect(chat(store).pendingQuestions.front).toBeDefined()
-    store.dispatch(retireStatelessQuestion({ slot: 'front', expected: captured as string }))
+    store.dispatch(clearQuestionCard({ slot: 'front', card_id: 'card-1' }))
     expect(chat(store).pendingQuestions.front).toBeUndefined()
-    // A retire against an empty slot is a no-op rather than a throw.
-    store.dispatch(retireStatelessQuestion({ slot: 'front', expected: 'card-1' }))
+    // A clear against an empty slot is a no-op rather than a throw.
+    store.dispatch(clearQuestionCard({ slot: 'front', card_id: 'card-1' }))
     expect(chat(store).pendingQuestions.front).toBeUndefined()
-  })
-
-  it('never retires a server-owned card through the stateless path', () => {
-    const store = makeStore()
-    store.dispatch(setQuestionCard({ slot: 'front', ask_id: 'ask-1', questions: [{ question: 'q', options: [] }] }))
-    const cardId = chat(store).pendingQuestions.front.cardId as string
-    store.dispatch(retireStatelessQuestion({ slot: 'front', expected: cardId }))
-    expect(chat(store).pendingQuestions.front).toBeDefined()
   })
 
   it('clears a server-owned card by ask id across slots', () => {
@@ -773,20 +766,24 @@ describe('chatSlice workflow runs', () => {
   })
 })
 
-describe('chatSlice goal loops and queued sub-agent counts', () => {
-  it('keeps only active loops and normalises their counters', () => {
+describe('chatSlice automations and queued sub-agent counts', () => {
+  it('keeps only active legacy loops', () => {
     const store = makeStore()
-    store.dispatch(setGoalLoops([
-      { slot: 'a', active: true, cycle_count: 3.7, max_cycles: 24 },
-      { slot: 'b', active: false, cycle_count: 9, max_cycles: 24 },
-    ]))
-    expect(chat(store).goalLoops.a).toEqual({ cycle_count: 3, max_cycles: 24 })
-    expect(chat(store).goalLoops.b).toBeUndefined()
+    store.dispatch(setAutomations({
+      records: [
+      goalLoop('a', { cycleCount: 3, maxCycles: 24 }),
+      goalLoop('b', { active: false, cycleCount: 9, maxCycles: 24 }),
+      ],
+      legacyComplete: true,
+      structuredComplete: true,
+    }))
+    expect(chat(store).automations.a).toEqual(goalLoop('a', { cycleCount: 3, maxCycles: 24 }))
+    expect(chat(store).automations.b).toBeUndefined()
 
-    store.dispatch(sseGoalLoop({ slot: 'a', active: true, cycle_count: 4, max_cycles: 24 }))
-    expect(chat(store).goalLoops.a.cycle_count).toBe(4)
-    store.dispatch(sseGoalLoop({ slot: 'a', active: false, cycle_count: 5, max_cycles: 24 }))
-    expect(chat(store).goalLoops.a).toBeUndefined()
+    store.dispatch(sseAutomation(goalLoop('a', { cycleCount: 4, maxCycles: 24 })))
+    expect((chat(store).automations.a as LegacyGoalLoop).cycleCount).toBe(4)
+    store.dispatch(sseAutomation(goalLoop('a', { active: false, cycleCount: 5, maxCycles: 24 })))
+    expect(chat(store).automations.a).toBeUndefined()
   })
 
   it('drops a zero queued count instead of showing an empty waiting badge', () => {
@@ -948,6 +945,16 @@ describe('chatSlice selectors', () => {
     expect(selectTurnInterrupted(root(store))).toBe(false)
   })
 
+  it('treats a trailing dispatching inject as a new, unanswered turn floor', () => {
+    for (const injectKind of ['cron', 'mcp_app', 'recovery', 'user_replay', 'synthesis']) {
+      const store = makeStore()
+      store.dispatch(setActiveSlot('front'))
+      store.dispatch(appendMessage({ role: 'assistant', content: 'answered' } as ChatMessage))
+      store.dispatch(appendMessage({ role: 'inject', content: 'dispatched prompt', meta: { injectKind } } as ChatMessage))
+      expect(selectTurnInterrupted(root(store)), injectKind).toBe(true)
+    }
+  })
+
   it('reads an interruption from a trailing user row or an error after the answer', () => {
     const store = makeStore()
     store.dispatch(setActiveSlot('front'))
@@ -957,6 +964,31 @@ describe('chatSlice selectors', () => {
     expect(selectTurnInterrupted(root(store))).toBe(true)
 
     store.dispatch(appendMessage({ role: 'assistant', content: 'partial' } as ChatMessage))
+    expect(selectTurnInterrupted(root(store))).toBe(false)
+    store.dispatch(appendMessage({ role: 'error', content: 'gateway died' } as ChatMessage))
+    expect(selectTurnInterrupted(root(store))).toBe(true)
+  })
+
+  it('treats a trailing nudge row as a new, unanswered turn floor', () => {
+    const store = makeStore()
+    store.dispatch(setActiveSlot('front'))
+    store.dispatch(appendMessage({ role: 'user', content: 'watch it' } as ChatMessage))
+    store.dispatch(appendMessage({ role: 'assistant', content: 'watching' } as ChatMessage))
+    store.dispatch(appendMessage({ role: 'inject', content: 'stopped', meta: { kind: 'stop_event' } } as ChatMessage))
+    expect(selectTurnInterrupted(root(store))).toBe(false)
+    store.dispatch(appendMessage({ role: 'nudge', content: '[auto-nudge cycle 2] check', meta: { nudge: { cycle: 2 } } } as ChatMessage))
+    expect(selectTurnInterrupted(root(store))).toBe(true)
+    store.dispatch(appendMessage({ role: 'assistant', content: 'checked' } as ChatMessage))
+    expect(selectTurnInterrupted(root(store))).toBe(false)
+  })
+
+  it('reads a trailing error when the loaded window holds only tool rows', () => {
+    // A long turn pushed its opener and reply past the window into the frozen
+    // prefix; only its tool rows and the restart's error row were loaded.
+    const store = makeStore()
+    store.dispatch(setActiveSlot('front'))
+    store.dispatch(appendMessage({ role: 'tool_result', content: 'read page 1' } as ChatMessage))
+    store.dispatch(appendMessage({ role: 'tool_result', content: 'read page 2' } as ChatMessage))
     expect(selectTurnInterrupted(root(store))).toBe(false)
     store.dispatch(appendMessage({ role: 'error', content: 'gateway died' } as ChatMessage))
     expect(selectTurnInterrupted(root(store))).toBe(true)
@@ -990,6 +1022,45 @@ describe('chatSlice slot reconcile from the authoritative slots list', () => {
     expect(chat(store).followups.gone).toBeUndefined()
     expect(chat(store).slotContextPct.gone).toBeUndefined()
   })
+
+  it('retires a folder-suggestion card once any client files the session', () => {
+    const store = makeStore()
+    store.dispatch(setActiveSlot('front'))
+    store.dispatch(setFolderSuggestion({ slot: 'front', folderId: 'f1', folderName: 'Work', breadcrumb: 'Work' }))
+    store.dispatch(setFolderSuggestion({ slot: 'back', folderId: 'f1', folderName: 'Work', breadcrumb: 'Work' }))
+
+    // A frame that still shows both sessions unfiled leaves both cards alone.
+    store.dispatch(sseSlots([slotRow('front'), slotRow('back')]))
+    expect(chat(store).folderSuggestions.front).toBeDefined()
+    expect(chat(store).folderSuggestions.back).toBeDefined()
+
+    // Another window accepted the card (or dragged the session into a folder):
+    // the broadcast snapshot now carries folder_id, and the card must go —
+    // including for the ACTIVE slot, which the residue reconcile never touches.
+    store.dispatch(sseSlots([slotRow('front', { folder_id: 'f1' }), slotRow('back')]))
+    expect(chat(store).folderSuggestions.front).toBeUndefined()
+    expect(chat(store).folderSuggestions.back).toBeDefined()
+  })
+
+  it('trusts a fetch reply for card retirement only before the first live snapshot', async () => {
+    // Before any live frame: the reply is the only authority, so it retires.
+    apiMock.chatSlots.mockResolvedValueOnce([slotRow('s1', { folder_id: 'f1' })])
+    const cold = makeStore()
+    cold.dispatch(setFolderSuggestion({ slot: 's1', folderId: 'f1', folderName: 'Work', breadcrumb: 'Work' }))
+    await cold.dispatch(fetchSlots())
+    expect(chat(cold).folderSuggestions.s1).toBeUndefined()
+
+    // After a live frame: a reply can be STALE — a filed session's key reused
+    // by a fresh session would still carry the old tenant's folder_id, and
+    // clearing on it would delete the replacement's one-shot card (never
+    // re-offered). Live frames own the cleanup once seen.
+    apiMock.chatSlots.mockResolvedValueOnce([slotRow('s1', { folder_id: 'f1' })])
+    const warm = makeStore()
+    warm.dispatch(sseSlots([slotRow('s1')]))
+    warm.dispatch(setFolderSuggestion({ slot: 's1', folderId: 'f2', folderName: 'Later', breadcrumb: 'Later' }))
+    await warm.dispatch(fetchSlots())
+    expect(chat(warm).folderSuggestions.s1).toBeDefined()
+  })
 })
 
 describe('chatSlice thunks', () => {
@@ -1004,17 +1075,19 @@ describe('chatSlice thunks', () => {
     await store.dispatch(fetchHistory(true))
     expect(chat(store).history.map(s => s.key)).toEqual(['s1', 's2'])
     expect(chat(store).historyOffset).toBe(2)
-    expect(apiMock.sessions).toHaveBeenLastCalledWith(30, 1, false, true)
+    expect(apiMock.sessions).toHaveBeenLastCalledWith(30, 1, false, true, true)
   })
 
-  it('asks the server to exclude sessions already open as tabs', async () => {
+  it('asks the server to exclude sessions already open as tabs, and machine runs', async () => {
     // Older sessions is the complement of the tab list above it. The exclusion
     // has to happen server-side: historyOffset advances by the row count
-    // received, so dropping rows on the client desynchronises paging.
+    // received, so dropping rows on the client desynchronises paging. The fifth
+    // argument is `user_only`: a subagent or workflow transcript has no title, so
+    // it would render its own storage key as the row label in this pane.
     apiMock.sessions.mockResolvedValueOnce({ sessions: [], has_more: false })
     const store = makeStore()
     await store.dispatch(fetchHistory(false))
-    expect(apiMock.sessions).toHaveBeenLastCalledWith(30, 0, false, true)
+    expect(apiMock.sessions).toHaveBeenLastCalledWith(30, 0, false, true, true)
   })
 
   it('drops the resumed row from history so the pane stops listing it', async () => {
@@ -1166,6 +1239,94 @@ describe('chatSlice thunks', () => {
     expect(chat(store).stopPressedAt.front).toBe(0)
   })
 
+  /* A Stop press the backend answers with `not running` proves the tab's busy
+   * view was stale: a member DM thread (never the active slot) had kept its
+   * Stop button after a `_done` that never reached it, and every press came
+   * back as this no-op with nothing visible happening (#9547). The answer
+   * settles the client's own run state on whichever path holds it. */
+  it('settles a background slot idle when the backend answers a Stop with not running', async () => {
+    apiMock.stopChatSlot.mockResolvedValueOnce({ ok: true, info: 'not running', already_stopping: false })
+    const store = makeStore()
+    store.dispatch(setActiveSlot('front'))
+    // A chunk frame for a slot that is NOT active marks it streaming in slotRun.
+    store.dispatch(sseChatMessage({ slot: 'member-a', role: 'chunk', content: 'wor', seq: 1 }))
+    expect(chat(store).slotRun['member-a']?.state).toBe('streaming')
+
+    await store.dispatch(requestStop({ slotId: 'member-a', force: false }))
+    expect(apiMock.stopChatSlot).toHaveBeenCalledWith('member-a')
+    expect(chat(store).slotRun['member-a']?.state).toBe('idle')
+    // The active mirror belongs to another slot and is untouched.
+    expect(chat(store).activeSlot).toBe('front')
+  })
+
+  it('settles the active slot when its Stop is answered with not running', async () => {
+    apiMock.stopChatSlot.mockResolvedValueOnce({ ok: true, info: 'not running', already_stopping: false })
+    const store = makeStore()
+    store.dispatch(setActiveSlot('front'))
+    store.dispatch(sseChatMessage({ slot: 'front', role: 'chunk', content: 'wor', seq: 1 }))
+    expect(chat(store).slotState).toBe('streaming')
+
+    await store.dispatch(requestStop({ slotId: 'front', force: false }))
+    expect(chat(store).slotState).toBe('idle')
+    expect(chat(store).slotRunning).toBe(false)
+    expect(chat(store).slotStopping).toBe(false)
+  })
+
+  it('leaves the run state alone when the backend reports a stop already in progress', async () => {
+    apiMock.stopChatSlot.mockResolvedValueOnce({ ok: true, info: 'stop already in progress', already_stopping: true })
+    const store = makeStore()
+    store.dispatch(setActiveSlot('front'))
+    store.dispatch(sseChatMessage({ slot: 'member-a', role: 'chunk', content: 'wor', seq: 1 }))
+    await store.dispatch(requestStop({ slotId: 'member-a', force: false }))
+    expect(chat(store).slotRun['member-a']?.state).toBe('streaming')
+  })
+
+  it('a not-running reply that lands after a NEWER turn started does not idle that turn', async () => {
+    // The reply is delayed until a user frame (a cron/channel injection) has
+    // started a new turn on the slot; the stale answer must be ignored.
+    let release: (v: unknown) => void = () => {}
+    apiMock.stopChatSlot.mockImplementationOnce(() => new Promise((r) => { release = r }))
+    const store = makeStore()
+    store.dispatch(setActiveSlot('front'))
+    store.dispatch(sseChatMessage({ slot: 'member-a', role: 'chunk', content: 'a', seq: 1 }))
+    const pending = store.dispatch(requestStop({ slotId: 'member-a', force: false }))
+    // New turn begins while the request is in flight.
+    store.dispatch(sseChatMessage({ slot: 'member-a', role: '_done', content: '' }))
+    store.dispatch(sseChatMessage({ slot: 'member-a', role: 'user', content: 'cron says hi', meta: { mid: 'm-new' } }))
+    store.dispatch(sseChatMessage({ slot: 'member-a', role: 'chunk', content: 'b', seq: 1 }))
+    release({ ok: true, info: 'not running', already_stopping: false })
+    await pending
+    expect(chat(store).slotRun['member-a']?.state).toBe('streaming')
+  })
+
+  it('reports a failed stop request instead of swallowing it', async () => {
+    apiMock.stopChatSlot.mockRejectedValueOnce(new Error('offline'))
+    const store = makeStore()
+    const res = await store.dispatch(requestStop({ slotId: 'member-a', force: false }))
+    expect(requestStop.fulfilled.match(res)).toBe(true)
+    expect(res.payload).toEqual({ error: 'offline' })
+    // The press stamp is cleared so a retry is not debounced away.
+    expect(chat(store).stopPressedAt['member-a']).toBe(0)
+  })
+
+  it('reports a 2xx refusal (ok:false) as a failed stop', async () => {
+    apiMock.stopChatSlot.mockResolvedValueOnce({ ok: false, error: 'could not reach the crew running this session to stop it', code: 'remote_stop_unreachable' })
+    const store = makeStore()
+    const res = await store.dispatch(requestStop({ slotId: 'member-a', force: false }))
+    expect(res.payload).toEqual({ error: 'could not reach the crew running this session to stop it' })
+    expect(chat(store).stopPressedAt['member-a']).toBe(0)
+  })
+
+  it('leaves the run state alone when a real stop is accepted', async () => {
+    apiMock.stopChatSlot.mockResolvedValueOnce({ ok: true })
+    const store = makeStore()
+    store.dispatch(setActiveSlot('front'))
+    store.dispatch(sseChatMessage({ slot: 'member-a', role: 'chunk', content: 'wor', seq: 1 }))
+    await store.dispatch(requestStop({ slotId: 'member-a', force: false }))
+    // Turn end is owned by the `_done` frame the cancel will produce.
+    expect(chat(store).slotRun['member-a']?.state).toBe('streaming')
+  })
+
   it('keeps the user where they are when a create resolves after they moved', async () => {
     apiMock.createChatSlot.mockImplementation(async () => {
       // The user switches away while the POST is in flight.
@@ -1177,6 +1338,46 @@ describe('chatSlice thunks', () => {
     await store.dispatch(createSlot({ agent: 'kirocrew' }))
     expect(chat(store).creatingSlot).toBe(false)
     expect(chat(store).activeSlot).toBe('elsewhere')
+  })
+
+  it('applies the configured default memory mode to a new dashboard chat', async () => {
+    apiMock.dashboardConfig.mockResolvedValue({ default_memory_mode: 'temporary' })
+    apiMock.createChatSlot.mockResolvedValue({ key: 'temporary-slot' })
+    const store = makeStore()
+    await store.dispatch(createSlot(undefined))
+    expect(apiMock.createChatSlot.mock.calls[0][4]).toBe('temporary')
+  })
+
+  it('preserves an explicit memory-mode choice without reading the default', async () => {
+    apiMock.createChatSlot.mockResolvedValue({ key: 'incognito-slot' })
+    const store = makeStore()
+    await store.dispatch(createSlot({ memory_mode: 'incognito' }))
+    expect(apiMock.dashboardConfig).not.toHaveBeenCalled()
+    expect(apiMock.createChatSlot.mock.calls[0][4]).toBe('incognito')
+  })
+
+  it('fails closed to temporary when the configured default is malformed', async () => {
+    apiMock.dashboardConfig.mockResolvedValue({ default_memory_mode: 'surprise' })
+    apiMock.createChatSlot.mockResolvedValue({ key: 'temporary-slot' })
+    const store = makeStore()
+    await store.dispatch(createSlot(undefined))
+    expect(apiMock.createChatSlot.mock.calls[0][4]).toBe('temporary')
+  })
+
+  it('keeps New chat available but temporary when the config read fails', async () => {
+    apiMock.dashboardConfig.mockRejectedValue(new Error('offline'))
+    apiMock.createChatSlot.mockResolvedValue({ key: 'temporary-slot' })
+    const store = makeStore()
+    await store.dispatch(createSlot(undefined))
+    expect(apiMock.createChatSlot.mock.calls[0][4]).toBe('temporary')
+  })
+
+  it('keeps the historical persistent default for an older backend', async () => {
+    apiMock.dashboardConfig.mockResolvedValue({})
+    apiMock.createChatSlot.mockResolvedValue({ key: 'persistent-slot' })
+    const store = makeStore()
+    await store.dispatch(createSlot(undefined))
+    expect(apiMock.createChatSlot.mock.calls[0][4]).toBe('persistent')
   })
 
   it('carries a caller-supplied title on the create request', async () => {
@@ -1241,6 +1442,44 @@ describe('chatSlice thunks', () => {
     expect(chat(store).creatingSlot).toBe(false)
   })
 
+  // The sidebar row and the activated empty transcript must land in ONE store
+  // update: a separate optimistic dispatch before `fulfilled` rendered the new
+  // row over the OLD chat for a frame and charged the sidebar its insertion
+  // render twice. Pinned by counting store notifications between the POST
+  // resolving and the thunk settling.
+  it('publishes and activates the created slot in a single store update', async () => {
+    apiMock.createChatSlot.mockResolvedValue({ key: 'one-shot' })
+    const store = makeStore()
+    store.dispatch(setActiveSlot('origin'))
+    const seen: Array<{ inList: boolean; active: string | null }> = []
+    const unsubscribe = store.subscribe(() => {
+      const state = root(store)
+      seen.push({
+        inList: state.dashboard.slots.some(s => s.key === 'one-shot'),
+        active: state.chat.activeSlot,
+      })
+    })
+    await store.dispatch(createSlot(undefined))
+    unsubscribe()
+    // The first notification in which the row exists is the one that activated
+    // it: no intermediate "row present, old chat still active" state.
+    const first = seen.find(s => s.inList)
+    expect(first).toEqual({ inList: true, active: 'one-shot' })
+    expect(root(store).dashboard.slots.filter(s => s.key === 'one-shot')).toHaveLength(1)
+  })
+
+  it('does not duplicate a slot the live slots frame announced before the create response', async () => {
+    apiMock.createChatSlot.mockImplementation(async () => {
+      // The broadcast beats the HTTP reply, the documented common case.
+      store.dispatch(sseSlots([{ key: 'announced', title: 'announced', running: false } as never]))
+      return { key: 'announced' }
+    })
+    const store = makeStore()
+    await store.dispatch(createSlot(undefined))
+    expect(root(store).dashboard.slots.filter(s => s.key === 'announced')).toHaveLength(1)
+    expect(chat(store).activeSlot).toBe('announced')
+  })
+
   it('resyncs the slots list when a delete fails on the server', async () => {
     apiMock.chatSlotDetail.mockResolvedValue({ messages: [], running: false })
     apiMock.deleteChatSlot.mockRejectedValue(new Error('500'))
@@ -1251,6 +1490,147 @@ describe('chatSlice thunks', () => {
     expect(apiMock.chatSlots).toHaveBeenCalled()
     // The optimistic navigation still happened: no peer session to fall back to.
     expect(chat(store).activeSlot).toBeNull()
+  })
+
+  // A 404 on DELETE means the server no longer has the slot, which is the end
+  // state the close asked for: a second tab or a repeat click racing a slow
+  // first close must not surface an error or put the row back (#14823).
+  it('treats a 404 on DELETE as a completed close', async () => {
+    apiMock.chatSlotDetail.mockResolvedValue({ messages: [], running: false })
+    apiMock.deleteChatSlot.mockRejectedValue(Object.assign(new Error('not found'), { status: 404 }))
+    const store = makeStore()
+    store.dispatch(sseSlots([slotRow('doomed'), slotRow('peer')]))
+    store.dispatch(setActiveSlot('doomed'))
+
+    apiMock.chatSlots.mockResolvedValue([slotRow('peer')])
+    const outcome = await store.dispatch(deleteSlot('doomed'))
+    expect(outcome.type).toBe('chat/deleteSlot/fulfilled')
+    expect(root(store).dashboard.closingSlots).toEqual({})
+    expect(root(store).dashboard.slots.map(s => s.key)).toEqual(['peer'])
+  })
+
+  // The 404 path drops its close hold, so a slot list serialized before the
+  // server popped the key (a poll or reconnect refetch already in flight at
+  // click time) would re-add the closed row with nothing left to remove it.
+  // The recovery refetch is the authoritative list that settles it.
+  it('refetches after a 404 close so a pre-close slot list cannot keep the row', async () => {
+    apiMock.chatSlotDetail.mockResolvedValue({ messages: [], running: false })
+    let answerStale: (v: unknown) => void = () => {}
+    let answerRecovery: (v: unknown) => void = () => {}
+    apiMock.chatSlots
+      .mockReturnValueOnce(new Promise(resolve => { answerStale = resolve }))
+      .mockReturnValueOnce(new Promise(resolve => { answerRecovery = resolve }))
+    apiMock.deleteChatSlot.mockRejectedValue(Object.assign(new Error('not found'), { status: 404 }))
+    const store = makeStore()
+    store.dispatch(sseSlots([slotRow('doomed'), slotRow('peer')]))
+    store.dispatch(setActiveSlot('doomed'))
+
+    const stale = store.dispatch(fetchSlots())
+    await store.dispatch(deleteSlot('doomed'))
+    // The pre-pop reply lands first and, with no hold left, re-adds the row...
+    answerStale([slotRow('doomed'), slotRow('peer')])
+    await stale
+    expect(apiMock.chatSlots).toHaveBeenCalledTimes(2)
+    // ...and the list serialized after the pop takes it out again.
+    answerRecovery([slotRow('peer')])
+    for (let i = 0; i < 6; i++) await Promise.resolve()
+    expect(root(store).dashboard.slots.map(s => s.key)).toEqual(['peer'])
+  })
+
+  // The two HTTP replies are unordered: the pre-close reply can also land AFTER
+  // the recovery one, when no later list is guaranteed. It is paired with the
+  // key before the hold is released, so its stale row is dropped on arrival.
+  it('drops a pre-close slot list that lands after the 404 close\'s recovery refetch', async () => {
+    apiMock.chatSlotDetail.mockResolvedValue({ messages: [], running: false })
+    let answerStale: (v: unknown) => void = () => {}
+    apiMock.chatSlots
+      .mockReturnValueOnce(new Promise(resolve => { answerStale = resolve }))
+      .mockResolvedValueOnce([slotRow('peer')])
+    apiMock.deleteChatSlot.mockRejectedValue(Object.assign(new Error('not found'), { status: 404 }))
+    const store = makeStore()
+    store.dispatch(sseSlots([slotRow('doomed'), slotRow('peer')]))
+    store.dispatch(setActiveSlot('doomed'))
+
+    const stale = store.dispatch(fetchSlots())
+    await store.dispatch(deleteSlot('doomed'))
+    for (let i = 0; i < 6; i++) await Promise.resolve()
+    expect(apiMock.chatSlots).toHaveBeenCalledTimes(2)
+    answerStale([slotRow('doomed'), slotRow('peer')])
+    await stale
+    expect(root(store).dashboard.slots.map(s => s.key)).toEqual(['peer'])
+    expect(root(store).dashboard.staleSlotFetches).toEqual({})
+  })
+
+  // Only the fetches already in flight at the 404 are distrusted: the recovery
+  // refetch is dispatched after the pairing, so a slot the popping close put
+  // back still shows from it.
+  it('trusts the recovery refetch when the popping close restored the slot', async () => {
+    apiMock.chatSlotDetail.mockResolvedValue({ messages: [], running: false })
+    let answerStale: (v: unknown) => void = () => {}
+    apiMock.chatSlots
+      .mockReturnValueOnce(new Promise(resolve => { answerStale = resolve }))
+      .mockResolvedValueOnce([slotRow('doomed'), slotRow('peer')])
+    apiMock.deleteChatSlot.mockRejectedValue(Object.assign(new Error('not found'), { status: 404 }))
+    const store = makeStore()
+    store.dispatch(sseSlots([slotRow('doomed'), slotRow('peer')]))
+    store.dispatch(setActiveSlot('doomed'))
+
+    const stale = store.dispatch(fetchSlots())
+    await store.dispatch(deleteSlot('doomed'))
+    for (let i = 0; i < 6; i++) await Promise.resolve()
+    expect(root(store).dashboard.slots.map(s => s.key)).toContain('doomed')
+    answerStale([slotRow('doomed'), slotRow('peer')])
+    await stale
+    expect(root(store).dashboard.slots.map(s => s.key)).toContain('doomed')
+  })
+
+  // A 404 close closed nothing, and the close that did pop the key can still
+  // fail and restore the slot, so this tab keeps the slot's view state for an
+  // authoritative list to settle. A close that did succeed still evicts it.
+  it('keeps the slot\'s view state on a 404 close and evicts it on a real one', async () => {
+    apiMock.chatSlotDetail.mockResolvedValue({ messages: [{ role: 'assistant', content: 'hi' }], running: false })
+    apiMock.chatSlots.mockResolvedValue([slotRow('doomed'), slotRow('peer')])
+    apiMock.deleteChatSlot.mockRejectedValueOnce(Object.assign(new Error('not found'), { status: 404 }))
+    const store = makeStore()
+    store.dispatch(sseSlots([slotRow('doomed'), slotRow('peer')]))
+    await store.dispatch(switchSlot('doomed'))
+    expect(chat(store).slotMessages.doomed).toBeDefined()
+
+    const gone = await store.dispatch(deleteSlot('doomed'))
+    expect(gone.type).toBe('chat/deleteSlot/fulfilled')
+    expect(chat(store).slotMessages.doomed).toBeDefined()
+
+    apiMock.deleteChatSlot.mockResolvedValueOnce({ ok: true })
+    const closed = await store.dispatch(deleteSlot('doomed'))
+    expect(closed.type).toBe('chat/deleteSlot/fulfilled')
+    expect(chat(store).slotMessages.doomed).toBeUndefined()
+  })
+
+  // The 404 can land while another close of the same key is mid-flight on the
+  // server, and that close can still fail and restore the slot. This request
+  // closed nothing, so it must not hold the restored row out of view.
+  it('shows a slot the server restores after a 404 close', async () => {
+    apiMock.chatSlotDetail.mockResolvedValue({ messages: [], running: false })
+    apiMock.deleteChatSlot.mockRejectedValue(Object.assign(new Error('not found'), { status: 404 }))
+    const store = makeStore()
+    store.dispatch(sseSlots([slotRow('doomed'), slotRow('peer')]))
+    store.dispatch(setActiveSlot('doomed'))
+
+    await store.dispatch(deleteSlot('doomed'))
+    store.dispatch(sseSlots([slotRow('doomed'), slotRow('peer')]))
+    expect(root(store).dashboard.slots.map(s => s.key)).toContain('doomed')
+  })
+
+  it('still fails the close on a non-404 status', async () => {
+    apiMock.chatSlotDetail.mockResolvedValue({ messages: [], running: false })
+    apiMock.deleteChatSlot.mockRejectedValue(Object.assign(new Error('boom'), { status: 500 }))
+    const store = makeStore()
+    store.dispatch(sseSlots([slotRow('doomed'), slotRow('peer')]))
+    store.dispatch(setActiveSlot('doomed'))
+
+    const outcome = await store.dispatch(deleteSlot('doomed'))
+    expect(outcome.type).toBe('chat/deleteSlot/rejected')
+    expect(apiMock.chatSlots).toHaveBeenCalled()
   })
 
   // The dismissed tab must not wait on an unrelated conversation's transcript.
@@ -1305,6 +1685,77 @@ describe('chatSlice thunks', () => {
     expect(settled).toBe(true)
     expect(outcome.type).toBe('chat/deleteSlot/fulfilled')
     expect(chat(store).slotLoading).toBe(false)
+  })
+
+  // A failed close must put the row back, and the recovery refetch can answer
+  // BEFORE `rejected` fires (the thunk trails an unbounded peer navigation), so
+  // the close tombstone has to be gone by the time that reply is applied (#11224).
+  it('restores a failed close\'s row from the recovery refetch that beats `rejected`', async () => {
+    let releasePeer: (v: unknown) => void = () => {}
+    const peerFetch = new Promise(resolve => { releasePeer = resolve })
+    apiMock.chatSlotDetail.mockReturnValue(peerFetch)
+    apiMock.deleteChatSlot.mockRejectedValue(new Error('500'))
+    apiMock.chatSlots.mockResolvedValue([slotRow('doomed'), slotRow('peer')])
+    const store = makeStore()
+    store.dispatch(sseSlots([slotRow('doomed'), slotRow('peer')]))
+    store.dispatch(setActiveSlot('doomed'))
+
+    const pending = store.dispatch(deleteSlot('doomed'))
+    // Drain the DELETE rejection and the recovery fetchSlots while the peer
+    // navigation is still parked on its transcript load.
+    for (let i = 0; i < 6; i++) await Promise.resolve()
+    expect(apiMock.chatSlots).toHaveBeenCalled()
+    expect(root(store).dashboard.slots.map(s => s.key)).toContain('doomed')
+    expect(root(store).dashboard.closingSlots).toEqual({})
+    expect(root(store).dashboard.slotFetchesInFlight).toEqual([])
+
+    releasePeer({ messages: [], running: false })
+    const outcome = await pending
+    expect(outcome.type).toBe('chat/deleteSlot/rejected')
+    expect(root(store).dashboard.slots.map(s => s.key)).toContain('doomed')
+  })
+
+  // A successful close must move its hold to the confirmed phase when the
+  // DELETE resolves, not when `fulfilled` fires after the unbounded peer
+  // navigation: a transcript load that outlasts the in-flight cap would
+  // otherwise expire a hold whose close actually succeeded (#11224).
+  it('confirms the close hold when the DELETE resolves, before the peer navigation settles', async () => {
+    vi.useFakeTimers()
+    try {
+      vi.setSystemTime(new Date('2026-09-16T06:00:00Z'))
+      let releasePeer: (v: unknown) => void = () => {}
+      const peerFetch = new Promise(resolve => { releasePeer = resolve })
+      let resolveDelete: (v: unknown) => void = () => {}
+      const deleteCall = new Promise(resolve => { resolveDelete = resolve })
+      apiMock.chatSlotDetail.mockReturnValue(peerFetch)
+      apiMock.deleteChatSlot.mockReturnValue(deleteCall)
+      const store = makeStore()
+      store.dispatch(sseSlots([slotRow('doomed'), slotRow('peer')]))
+      store.dispatch(setActiveSlot('doomed'))
+
+      const pending = store.dispatch(deleteSlot('doomed'))
+      for (let i = 0; i < 4; i++) await Promise.resolve()
+      expect(root(store).dashboard.closingSlots['doomed']?.inFlightUntil).not.toBeNull()
+
+      // A slow but successful DELETE resolves at 25 s; navigation stays parked.
+      vi.setSystemTime(new Date('2026-09-16T06:00:25Z'))
+      resolveDelete({})
+      for (let i = 0; i < 6; i++) await Promise.resolve()
+      expect(root(store).dashboard.closingSlots['doomed']?.inFlightUntil).toBeNull()
+
+      // 40 s: past where the in-flight cap would have expired, inside the
+      // confirmed cap. A straggler frame still listing the key must not
+      // resurrect the row of a close the server already confirmed.
+      vi.setSystemTime(new Date('2026-09-16T06:00:40Z'))
+      store.dispatch(sseSlots([slotRow('doomed'), slotRow('peer')]))
+      expect(root(store).dashboard.slots.map(s => s.key)).toEqual(['peer'])
+
+      releasePeer({ messages: [], running: false })
+      const outcome = await pending
+      expect(outcome.type).toBe('chat/deleteSlot/fulfilled')
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('evicts every per-slot cache once a delete succeeds', async () => {

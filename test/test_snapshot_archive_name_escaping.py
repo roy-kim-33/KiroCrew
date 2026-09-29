@@ -9,9 +9,9 @@ from __future__ import annotations
 
 import json
 import tarfile
-from pathlib import Path
 
 import pytest
+from test_snapshot import snapshot_family_source
 
 from kiro_crew import snapshot as snap
 
@@ -110,7 +110,7 @@ class TestTheRuleCoversEveryArchiveDerivedPrint:
         filter, the manifest reader and the root-selection refusal -- three places that
         do not otherwise look alike, which is how two of them were missed.
         """
-        source = Path(snap.__file__).read_text(encoding="utf-8")
+        source = snapshot_family_source()
         assert "{info.name}" not in source, "a tar member name is interpolated without _safe_name"
         assert "', '.join(dropped)" not in source, "manifest keys are joined without _safe_name"
         assert (
@@ -120,11 +120,9 @@ class TestTheRuleCoversEveryArchiveDerivedPrint:
     def test_the_helper_escapes_control_bytes_and_keeps_printable_text(self):
         """The escaping property itself, asserted directly on `_safe_name`.
 
-        This used to compare `_safe_name` against a shared sanitiser that lived beside the
-        off-host destination code; that helper is gone and the escaping now lives inside
-        `_safe_name`. The property is unchanged: every control byte is rendered as a
-        visible `\\xNN` escape so it cannot drive the terminal, while ordinary printable
-        text is left intact and an empty value falls back.
+        `_safe_name` owns the escaping property directly. Every control byte is
+        rendered as a visible `\\xNN` escape so it cannot drive the terminal, while
+        ordinary printable text is left intact and an empty value falls back.
         """
         got = snap._safe_name(EVIL)
         # No raw control byte survives -- neither the cursor-up escape nor the CR.

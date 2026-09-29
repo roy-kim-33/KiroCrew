@@ -14,8 +14,8 @@
  *
  * The characterization net (ChatPage.scrollShell.recipe.test.tsx, the golden
  * frames, and the mutation harness) pins this file's tokens byte-for-byte;
- * fadeClearance geometry stays with the page, which supplies its clearance
- * padding via `scrollerStyle`.
+ * dockClearance geometry stays with the page, which supplies the floating
+ * dock's clearance padding via `scrollerStyle`.
  */
 import React from 'react'
 import { Loader } from 'lucide-react'
@@ -24,6 +24,12 @@ import { i18nT } from '../../i18n/t'
 export interface TranscriptVirtWiring {
   topSentinelRef: React.MutableRefObject<HTMLDivElement | null>
   bottomSentinelRef: React.MutableRefObject<HTMLDivElement | null>
+  /** The virtualizer's ref for the wrapper around `belowRows`: its
+   *  ResizeObserver watches that wrapper so chrome mounting or growing below
+   *  the rows (the working footer under a reply gone quiet) is followed like
+   *  tail growth. Optional so a wiring that predates it (tests, a host with no
+   *  trailing chrome) still type-checks; the wrapper renders either way. */
+  trailingRef?: React.MutableRefObject<HTMLDivElement | null>
   offsetBefore: number
   offsetAfter: number
 }
@@ -35,6 +41,7 @@ export default function TranscriptScrollShell({
   loadingOlder,
   spinnerNearTop,
   scrollerStyle,
+  headerSpacer = true,
   aboveRows,
   belowRows,
   children,
@@ -51,6 +58,11 @@ export default function TranscriptScrollShell({
   spinnerNearTop?: boolean
   /** Host-owned geometry merged onto the scroller (e.g. the fade-band clearance padding). */
   scrollerStyle?: React.CSSProperties
+  /** Reserve the main chat's overlay-header band (h-16) above the rows. On by
+   *  default — the page contract. A host whose scroller sits directly under
+   *  its own title bar (a split pane, the side panel, an embed) turns it off;
+   *  its padding travels through `scrollerStyle` instead. */
+  headerSpacer?: boolean
   /** Page content above the rows (the earlier-messages paging bar). */
   aboveRows?: React.ReactNode
   /** Page content below the rows (footer, survey, tail spacer). */
@@ -107,7 +119,7 @@ export default function TranscriptScrollShell({
       onScroll={onScroll}
     >
       {/* Header spacer */}
-      <div className="h-16" />
+      {headerSpacer && <div className="h-16" />}
       {aboveRows}
       {/* Top sentinel: drives upward window expansion via virtualizer's IO. */}
       <div ref={virt.topSentinelRef} aria-hidden style={{ height: 1 }} />
@@ -148,7 +160,14 @@ export default function TranscriptScrollShell({
       <div aria-hidden className="vc-spacer-skeleton mx-auto w-full" style={{ height: virt.offsetAfter, maxWidth: 'var(--mc-content-width, 900px)', overflowAnchor: 'none' }} />
       {/* Bottom sentinel: drives downward window expansion when in jump mode. */}
       <div ref={virt.bottomSentinelRef} aria-hidden style={{ height: 1 }} />
-      {belowRows}
+      {/* Trailing chrome, in one block so the virtualizer can OBSERVE it: the
+          footer that mounts here when a reply goes quiet grows the content
+          under a bottom-pinned reader with no row resize and no viewport
+          change to announce it. A plain block wrapper, no class of its own,
+          so the slot content keeps its width and the theming contract. */}
+      <div ref={virt.trailingRef} data-vc-trailing="">
+        {belowRows}
+      </div>
     </div>
   )
 }

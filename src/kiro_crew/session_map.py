@@ -12,6 +12,7 @@ import functools
 import json
 import logging
 import os
+import secrets
 import tempfile
 import threading
 from collections.abc import Callable, Iterator
@@ -28,11 +29,15 @@ from kiro_crew.messaging.link import (
     UNBIND_REASON_UNSPECIFIED,
     UNBIND_REASONS,
     ChannelLink,
+    binding_token,
     canonical_key,
     is_channel_session_key,
     legacy_dashboard_mirror_key,
+    split_dm_session_key,
 )
+from kiro_crew.messaging.privacy_mode import PRIVACY_LRU_MAX, _serialized, needs_tightening
 from kiro_crew.sel import _infer_source, sel
+from kiro_crew.validation import bounded_session_id
 
 logger = logging.getLogger(__name__)
 
@@ -46,8 +51,8 @@ SESSION_MAP_FILENAME = "session_map.json"
 # Resolved per call, never captured at import: an import-time binding freezes
 # the data home and defeats pod isolation, the lazy legacy-home migration and
 # test isolation. The name below is an opt-in override (None = live home) so
-# existing monkeypatch call sites keep working. See config.md "Data Home" and
-# issue #874; dashboard/handlers/usage.py is the reference implementation.
+# existing monkeypatch call sites keep working. See config.md "Data Home";
+# dashboard/handlers/usage.py is the reference implementation.
 _KIRO_SESSIONS_DIR: Path | None = None
 
 
@@ -56,19 +61,139 @@ def _kiro_sessions_dir() -> Path:
     return _KIRO_SESSIONS_DIR if _KIRO_SESSIONS_DIR is not None else kiro_sessions_dir()
 
 
+#: Below this many bytes a kiro-cli session's ``.jsonl`` holds no turn: the
+#: conversation exists on disk but ``session/load`` has nothing to restore, so
+#: :meth:`SessionMap.get` prunes the mapping rather than resume it. The ONE
+#: definition of that bar, read only through :func:`_jsonl_holds_a_turn` -- by
+#: :meth:`SessionMap.get`, which prunes on it, and by
+#: :func:`session_files_resumable`, the whole-rule predicate a reader outside
+#: this module asks -- so the two cannot drift.
+_RESUMABLE_JSONL_MIN_BYTES = 10
+
+
+def _jsonl_holds_a_turn(sessions_dir: Path, sid: str) -> bool:
+    try:
+        size = (sessions_dir / f"{sid}.jsonl").stat().st_size
+    except FileNotFoundError:
+        size = 0
+    return size >= _RESUMABLE_JSONL_MIN_BYTES
+
+
+def session_files_resumable(sid: str, provider: str = "") -> bool:
+    """Whether *sid*'s on-disk files still let ``session/load`` resume it.
+
+    The same rule :meth:`SessionMap.get` applies before it hands a sid out, in
+    one place so a second reader cannot drift from it. Only kiro-cli keeps
+    transcripts at a flat path this process can stat -- the ``{sid}.json``
+    present and the ``{sid}.jsonl`` holding at least one turn. For every other
+    backend the sid's validity is decided by ``session/load`` itself, so this
+    answers True and leaves the typed refusal to the resume. An absent
+    provider label means kiro-cli.
+    """
+    if (provider or PROVIDER_LABEL_DEFAULT) != PROVIDER_LABEL_DEFAULT:
+        return True
+    if not sid:
+        return False
+    sessions_dir = _kiro_sessions_dir()
+    return (sessions_dir / f"{sid}.json").exists() and _jsonl_holds_a_turn(sessions_dir, sid)
+
+
 # Per-conversation flag recording a refusal of automatic origin mirroring. Named
 # here rather than at the caller because it is an ON-DISK contract: the map
 # persists it, so renaming the literal would silently re-enable mirroring for
 # every conversation that had already turned it off.
 MIRROR_OPT_OUT_FLAG = "mirror_opt_out"
 
+#: Set on a conversation whose owning app was uninstalled: its next cold start must
+#: start EMPTY. Clearing the sid alone stops the native resume and not the replay —
+#: the transcript stays on disk by design, so ``build_session_replay`` would inject
+#: the removed app's history into the first turn of the next installation under the
+#: same slot key, which is the bug the pointer drop exists to prevent. Persisted
+#: rather than in-memory because the two writers are different processes (the
+#: gateway-less CLI has no live manager) and because a gateway restart between the
+#: uninstall and the reinstall must not lose it. One-shot: consumed, and cleared as
+#: it is consumed, by the first cold start that honours it.
+SUPPRESS_REPLAY_FLAG = "suppress_replay"
+
+# Highest explicit DM generation acknowledged before its first provider turn.
+# Stored on the stable bucket entry so repeated /new commands cost one integer,
+# not one immortal map row per empty generation.
+GENERATION_FLOOR_FIELD = "generation_floor"
+
 # Flags that are durable SETTINGS rather than session-scoped state, and so keep
 # their entry alive through :meth:`SessionMap.prune`. Membership is opt-in
 # BECAUSE immortality has a cost: an entry that prune can never collect is a row
-# the map carries forever, and every mutation rewrites the whole map. A flag
-# describing one session (Slack's ``temporary`` / ``incognito`` threads) must
-# stay collectable — one leaked row per such thread would grow without bound.
-_DURABLE_FLAGS = frozenset({MIRROR_OPT_OUT_FLAG})
+# the map carries forever, and every mutation rewrites the whole map.
+# ``SUPPRESS_REPLAY_FLAG`` is durable for the reason the paragraph above gives, not
+# as an exception to it: it is a decision about the key's NEXT cold start, written at
+# a moment when there is no session at all, and ``prune`` deletes a sid-less entry
+# that nothing holds back. Losing it there would lose it in precisely the case it
+# exists for — clear the pointer, restart the gateway, reinstall — so the flag would
+# be decorative. The forever-row cost does not apply to it either: the flag is
+# ONE-SHOT, so the row it keeps alive is collectable again as soon as the first
+# cold start consumes it. (The privacy flags below are retained on separate
+# grounds and bounded by a count; their own comment says why.)
+_DURABLE_FLAGS = frozenset({MIRROR_OPT_OUT_FLAG, SUPPRESS_REPLAY_FLAG})
+
+# The ``!temporary`` / ``!incognito`` privacy modes, spelled exactly as
+# ``messaging.privacy_mode`` names them (MODE_TEMPORARY / MODE_INCOGNITO; a test
+# pins the two spellings together), strictest first (the ranking
+# ``privacy_mode.strictest`` uses; pinned by the same test). A privacy flag
+# keeps its entry through BOTH stale paths (``prune`` and the per-read repair
+# clear only a dead ``sid``), and no collection step removes such a row
+# either: the flag is the record the channel's inbound gate reads --
+# ``privacy_mode.hydrate`` restores the trackers from this map alone, never
+# from the transcript header -- so a row removed for any reason, however
+# complete the header, leaves that gate reading the thread as persistent after
+# the next restart: its turns persisted and agent memory writes admitted again.
+# The transcript header (``memory_mode``, the field every memory reader refuses
+# on) is still ENSURED for every flagged row whose transcript exists, off the
+# event loop and off the map lock, by :meth:`SessionMap.stamp_privacy_headers`,
+# which the startup path runs after ``prune`` (awaited in place by a blocking
+# start, inside its scheduled task by a non-blocking one, so the callers that
+# restart the pool live never wait on the sweep) -- a transcript read is disk
+# I/O the loop must not pay and the lock must not be held across (see the class
+# docstring). The retained rows are bounded by a COUNT, and the bound is held
+# by refusing, never by evicting: a NEW privacy flag past ``PRIVACY_ROW_CAP``
+# is refused fail-closed (``set_flag`` raises :class:`PrivacyRowRefused`; the
+# modifier tells the user the message was not processed), while every row
+# already retained stays -- evicting one would run that thread as persistent,
+# the leak the flag closes. Retiring rows once the header carries the mode
+# needs that gate to read the header, a separate change; until then a row's
+# removal is a privacy leak, not housekeeping, and nothing here performs one.
+_PRIVACY_STRICTNESS = ("temporary", "incognito")
+
+#: How many privacy-flagged rows the map RETAINS -- the same bound the
+#: process-local trackers already hold (``privacy_mode.PRIVACY_LRU_MAX``,
+#: least-recently-marked eviction there), because the trackers hydrate from
+#: these rows: a row past their bound would be one no tracker could carry
+#: anyway. Reached, the bound REFUSES the next new flag rather than evicting a
+#: row (see the module comment above). One small row each, so the cap is a
+#: few megabytes of map at most, not a constraint an install meets in use.
+PRIVACY_ROW_CAP = PRIVACY_LRU_MAX
+#: The longest session key a privacy row is retained for. The map had no key
+#: bound; this one is enforced at the same gate as the cap, and it is generous:
+#: every channel key is under a hundred characters, and the transcript's
+#: filename (``history._safe_key(key) + ".jsonl"``, plus its ``.lock`` sidecar)
+#: has to fit the 255-byte name limit every filesystem shares, so a key past this
+#: has no transcript to protect.
+PRIVACY_ROW_KEY_MAX = 200
+
+
+class PrivacyRowRefused(ValueError):
+    """The map refused to retain a privacy row for *key* -- fail-closed.
+
+    ``reason`` is ``"limit"`` (``PRIVACY_ROW_CAP`` rows already retained) or
+    ``"key_too_long"`` (over ``PRIVACY_ROW_KEY_MAX``). Raised by :meth:`SessionMap.set_flag`
+    before anything is written; ``privacy_mode.apply_mode`` turns it into the
+    user-facing refusal and its audit record.
+    """
+
+    def __init__(self, key: str, reason: str) -> None:
+        super().__init__(f"privacy row refused for {key[:80]!r}: {reason}")
+        self.key = key
+        self.reason = reason
+
 
 # How long a deferred flush waits before serializing, so a burst of mutations
 # (a subagent wave calling ``set`` once per spawn) collapses into one write
@@ -80,24 +205,125 @@ _FLUSH_DEBOUNCE_SECS = 0.05
 
 
 def _has_durable_flag(entry: dict) -> bool:
-    """True iff *entry* carries a flag that must outlive its native session."""
+    """True iff *entry* carries a durable SETTING (:data:`_DURABLE_FLAGS`)."""
     flags = entry.get("flags")
     if not isinstance(flags, dict):
         return False
     return any(flags.get(name) for name in _DURABLE_FLAGS)
 
 
+def _privacy_flags_on(entry: dict) -> list[str]:
+    """The privacy flags *entry* carries, strictest first (``[]`` for none)."""
+    flags = entry.get("flags")
+    if not isinstance(flags, dict):
+        return []
+    return [name for name in _PRIVACY_STRICTNESS if flags.get(name)]
+
+
+def _header_records_privacy_mode(key: str, flagged: list[str]) -> bool:
+    """True iff *key*'s transcript header carries a mode at least as strict as *flagged*.
+
+    The header (``memory_mode``, the field every memory reader refuses on, and
+    the durable record the channel gate will read once it stops hydrating from
+    the map alone) is ENSURED here, not merely read: a thread flagged before the
+    modifier stamped headers has the mode in its map row alone, so the mode is
+    copied into an EXISTING transcript's header first (``update_metadata_if``,
+    tighten-only, ``require_existing`` -- this must never create a transcript),
+    and only then is the header consulted. A transcript that does not exist, an
+    unreadable header, or a header carrying a weaker mode than the flag all
+    answer False. The answer decides nothing about the map row -- no privacy row
+    is removed on it (see :func:`_keeps_entry`) -- it is the count
+    :meth:`SessionMap.stamp_privacy_headers` reports.
+
+    Disk I/O on purpose kept out of every guarded method: call it from a worker
+    thread with no map lock held (:meth:`SessionMap.stamp_privacy_headers`).
+    """
+    if not flagged:
+        return False
+    # Call-time import, like ``channel_key_for_stem``'s ``_safe_key`` below, and
+    # for weight rather than a cycle (there is none: nothing in ``history``'s
+    # import graph imports this module). ``kiro_crew.history`` is the memory
+    # facade -- the consolidator, skills, the vector-memory constants ride in
+    # with it -- and this module is a leaf of the session layer: ``import
+    # kiro_crew.session`` loads 519 modules without it and 1006 with it
+    # (measured), for every process that needs sessions and no memory.
+    from kiro_crew.history import ConversationLog, transcript_privacy_mode
+
+    mode = flagged[0]
+
+    def _tighten_only(metadata: dict) -> bool:
+        # Normalized first: a raw ``Temporary`` would compare as unknown, and an
+        # incognito stamp would then overwrite the stricter mode. No write at
+        # all when the header already records the mode -- this runs for every
+        # flagged row on every boot.
+        return needs_tightening(transcript_privacy_mode(metadata.get("memory_mode")), mode)
+
+    log = ConversationLog()
+    try:
+        log.update_metadata_if(key, {"memory_mode": mode}, _tighten_only, require_existing=True)
+        header_mode = transcript_privacy_mode(log.get_metadata(key).get("memory_mode"))
+    except Exception:
+        return False
+    if not header_mode:
+        return False
+    # ``_PRIVACY_STRICTNESS`` is strictest first: the header is enough iff it is
+    # at least as strict as the strictest flag the entry carries.
+    return _PRIVACY_STRICTNESS.index(header_mode) <= _PRIVACY_STRICTNESS.index(mode)
+
+
 def _survives_prune(entry: dict) -> bool:
     """True iff *entry* holds state that must outlive its native session.
 
-    The ONE predicate behind every stale branch of :meth:`SessionMap.prune`, so
-    they cannot disagree about what a missing session file is allowed to take
-    with it. Two kinds of state qualify: a durable flag (a per-conversation
-    setting) and a channel binding — a Slack thread or a ``mirror`` — which is
-    the identity that routes a conversation back to its channel. Prune may clear
-    a stale ``sid`` on such an entry, but never discards the entry itself.
+    Durable settings, an explicit generation floor, and channel bindings all
+    outlive a provider session. The generation floor prevents a restart from
+    reusing a history key after ``/new`` was acknowledged before the first turn.
+    Entry-only, no I/O; :func:`_keeps_entry` adds the privacy-flag rule.
     """
-    return bool(_has_durable_flag(entry) or entry.get("slack_thread_ts") or entry.get("mirror"))
+    floor = entry.get(GENERATION_FLOOR_FIELD)
+    has_generation_floor = isinstance(floor, int) and not isinstance(floor, bool) and floor > 0
+    return bool(
+        _has_durable_flag(entry)
+        or has_generation_floor
+        or entry.get("slack_thread_ts")
+        or entry.get("mirror")
+    )
+
+
+def _keeps_entry(entry: dict) -> bool:
+    """The one predicate both stale paths ask: keep *entry* (clearing only its ``sid``)?
+
+    :func:`_survives_prune` for the durable reasons, plus a privacy flag, which
+    keeps the entry for as long as the flag is on: it is the record the
+    channel's inbound gate hydrates from, so no stale path and no startup step
+    removes the row (the module comment above ``_PRIVACY_STRICTNESS`` says why,
+    and which separate change would let one go: a header-reading gate on the
+    inbound path -- kirodotdev/KiroCrew#13218 -- after which a flagged row whose
+    transcript header carries the mode can be collected again). Kept rows are
+    bounded at ``PRIVACY_ROW_CAP`` by REFUSING the next new flag
+    (:meth:`SessionMap.set_flag`), never by evicting one here. No I/O: this runs
+    under the map lock, on the event loop.
+    """
+    return _survives_prune(entry) or bool(_privacy_flags_on(entry))
+
+
+def _stash_and_clear_sid(entry: dict) -> bool:
+    """Drop *entry*'s ``sid`` while keeping it as ``discarded_sid``. True if it changed.
+
+    One definition for every path that empties ``sid`` in place, because the
+    three that existed disagreed and the disagreement was reachable: a provider
+    switch stashed the id it dropped, while both stale paths -- the startup
+    prune and the per-read repair -- dropped theirs and left an OLDER id
+    standing in ``discarded_sid``. A history reader then answered that older id
+    as the key's last store, citing a predecessor two links back and orphaning
+    the one between them. Which path emptied the field is not a distinction any
+    reader of it can use, so the field cannot be written by only some of them.
+    """
+    sid = entry.get("sid")
+    if not sid:
+        return False
+    entry["discarded_sid"] = sid
+    entry["sid"] = ""
+    return True
 
 
 # The callable shape a lost-binding announcement is delivered through:
@@ -110,6 +336,26 @@ UnbindListener = Callable[[str, ChannelLink, str], None]
 # :data:`_MAP_LOCK`: a clearing call site may hold a throwaway ``SessionMap()``, and
 # a per-instance listener would leave those removals unannounced.
 _UNBIND_LISTENER: UnbindListener | None = None
+
+# The callable shape a COMMITTED channel binding is announced through: ``(session_key,)``.
+# Deliberately carries only the key: the sink resolves the session itself, because what
+# it records is a property of that session rather than of the link.
+BindListener = Callable[[str], None]
+
+# Announces that a session's conversation is now published to a channel. Registered by
+# the gateway, which is the only layer that can see a session's memory mode and owning
+# app -- this store sees the binding and nothing else about the session. MODULE-level
+# for the same reason as :data:`_UNBIND_LISTENER`: a binding call site may hold a
+# throwaway ``SessionMap()``, and a per-instance listener would leave those
+# announcements unmade.
+#
+# It exists because the crew log records a session's CLASS, and a reader deciding
+# whether another session may read that log asks about the whole life of the log rather
+# than about now. Sampling the class at each turn's start misses a link that commits
+# and is removed inside ONE turn, and content authored through it is in the log with no
+# record that it was published. Announcing the commit is what closes that: the record
+# is written when the fact becomes true, not when someone next looks.
+_BIND_LISTENER: BindListener | None = None
 
 
 def _normalize_unbind_reason(reason: str) -> str:
@@ -142,6 +388,33 @@ def set_unbind_listener(callback: UnbindListener | None) -> None:
     """
     global _UNBIND_LISTENER
     _UNBIND_LISTENER = callback
+
+
+def set_bind_listener(callback: BindListener | None) -> None:
+    """Register (or clear, with None) the sink for COMMITTED channel bindings.
+
+    Invoked as ``callback(session_key)`` once the IN-MEMORY binding is committed and
+    while the map lock is still held, which is what makes it precede any traffic: routing
+    an inbound message reads this map, so no message can be attributed to the session
+    before the announcement has been made. The guarantee rests on that in-memory commit
+    ALONE, and deliberately so: the ordering that matters is against readers of the map,
+    and they read the dict, not the file. Where the file write has reached by then varies
+    by context and is not part of the guarantee -- on a thread running an event loop it is
+    only queued, while a caller with no running loop (CLI, tests, worker threads) has
+    already written it inline. A sink that waited for the disk would hold the lock across
+    a write on the one path that must not pay for it, without buying any ordering the
+    in-memory commit does not already give.
+
+    Best-effort at the call site, on the same contract as its unbind sibling -- it runs
+    on a synchronous path, so it must not block, and an exception it raises is
+    swallowed rather than failing the bind. That is safe here only because the thing it
+    records is fail-closed at the far end: the record is handed to the crew log's
+    writer without waiting, and a write the writer permanently loses is itself recorded,
+    which the class fold reads as a hole and a cross-session read refuses on. So a lost
+    announcement costs a refusal, never a silent grant.
+    """
+    global _BIND_LISTENER
+    _BIND_LISTENER = callback
 
 
 # Serializes every structural access to the map. MODULE-level, not per-instance,
@@ -488,7 +761,7 @@ class SessionMap:
         - on a thread running an event loop: mark dirty and schedule ONE
           debounced flush task. The task serializes under the lock and does the
           disk write in a worker thread, so the loop never pays the write
-          inline (issue #2405). A mutation landing while a flush is in flight
+          inline. A mutation landing while a flush is in flight
           re-marks dirty, and the task loops until it observes a clean map, so
           a trailing mutation is never dropped.
         - no running loop (CLI, tests, worker threads): write inline on the
@@ -771,12 +1044,7 @@ class SessionMap:
             return sid
         sessions_dir = _kiro_sessions_dir()
         if sid and (sessions_dir / f"{sid}.json").exists():
-            jsonl = sessions_dir / f"{sid}.jsonl"
-            try:
-                jsonl_size = jsonl.stat().st_size
-            except FileNotFoundError:
-                jsonl_size = 0
-            if jsonl_size < 10:
+            if not _jsonl_holds_a_turn(sessions_dir, sid):
                 logger.info("Session %s has empty JSONL — pruning stale entry for %s", sid, key)
                 self._repair_or_remove_stale(matched_key)
                 return None
@@ -789,18 +1057,19 @@ class SessionMap:
     def _repair_or_remove_stale(self, key: str) -> None:
         """Drop a stale entry, or clear only its ``sid`` when state must outlive it.
 
-        Asks :func:`_survives_prune`, the same predicate :meth:`prune` uses, so
-        the two stale paths cannot disagree: an entry carrying a channel binding
-        or a durable flag keeps the entry and loses only the dead ``sid``. The
+        Asks :func:`_keeps_entry`, the same predicate :meth:`prune` uses, so
+        the two stale paths cannot disagree: an entry carrying a channel binding,
+        a durable flag or a privacy flag keeps the entry and loses only the dead
+        ``sid`` (a privacy-flagged entry is never removed by any path -- see
+        :func:`_keeps_entry` -- and this one never reads a transcript). The
         binding is the conversation's identity — deleting it here would strand the
         channel. No inbound-unbind audit or notice fires on the repair branch,
         because no binding was removed; the removal branch reaches an entry that
         holds none.
         """
         entry = self._data.get(key)
-        if entry is not None and _survives_prune(entry):
-            if entry.get("sid"):
-                entry["sid"] = ""
+        if entry is not None and _keeps_entry(entry):
+            if _stash_and_clear_sid(entry):
                 self._save()
             return
         self._remove_entry(key, reason=UNBIND_REASON_ENTRY_DELETED)
@@ -817,6 +1086,52 @@ class SessionMap:
         Alias folding is shared with :meth:`get` via ``_resolve_alias``.
         """
         return self._resolve_alias(key)[1] is not None
+
+    def mapped_sid(self, key: str) -> str:
+        """Read-only, in-memory: the session ID *key* maps to, or ``""``.
+
+        The value half of :meth:`has_hint`, and undecorated for the same reason:
+        one dict lookup through the shared alias fold, no disk and no mutation,
+        so it is safe on the event loop and carries no cross-thread hazard.
+
+        It answers a question :meth:`get` deliberately does not. ``get`` asks
+        "can this ID still be resumed", which is why it stats the transcript and
+        PRUNES the entry when that file is gone or empty. A caller recording
+        HISTORY wants the opposite: the ID this key was last serving, whether or
+        not a resume would now succeed. Routing such a caller through ``get``
+        loses the ID exactly when the two stores disagree -- a crew log unit can
+        outlive a truncated ACP transcript -- and mutates the map as a side
+        effect of being asked to describe it.
+
+        So this is not an alternative spelling of ``get``: a caller deciding
+        whether to RESUME must still use ``get``, whose file check is the whole
+        point, and must not treat a value from here as a resumable session.
+
+        A sid that was emptied in place still answers, from ``discarded_sid``.
+        Three paths empty it and all three record what they dropped, through
+        :func:`_stash_and_clear_sid`: the provider switch, the poisoned
+        conversation discard, and the two stale paths whose transcript went
+        missing. For the resume question an emptied sid IS the answer, which is
+        why ``get`` must not see the stash. For the history question it is not:
+        the emptied id is exactly "the ID this key was last serving", so reading
+        ``sid`` alone would report a key that has served a session all day as
+        having served none, and a successor would cite no predecessor at all.
+        Recording it on only some of those paths is worse than recording it on
+        none, because the field then holds a genuine id that is not the latest
+        one, and a successor cites a predecessor two links back.
+        """
+        entry = self._resolve_alias(key)[1]
+        if not entry:
+            return ""
+        sid = entry.get("sid")
+        if isinstance(sid, str) and sid:
+            return bounded_session_id(sid) or ""
+        # `or ""` rather than a second bounding helper: this reader's callers want
+        # "no id" as the empty string, and the shared bound answers None. Spelling
+        # the sentinel at the call site keeps one definition of the bound, which is
+        # what the two private copies that preceded it could not do -- they had
+        # already diverged on exactly this sentinel.
+        return bounded_session_id(entry.get("discarded_sid")) or ""
 
     @staticmethod
     def _inbound_binding(entry: dict) -> ChannelLink | None:
@@ -835,6 +1150,37 @@ class SessionMap:
             return ChannelLink.from_dict(raw)
         except (TypeError, ValueError):
             return None
+
+    # Per-binding identity, persisted BESIDE each binding (``mirror_nonce`` next to
+    # ``mirror``, ``slack_link_nonce`` next to the Slack fields). Minted when a
+    # binding is created or its target changes, kept across an identical rewrite
+    # (the inbound paths re-write the same coordinates on every turn), dropped
+    # with the binding. The dashboard's slots row digests it into the row's
+    # opaque ``binding`` token (``messaging.link.binding_token``), so a
+    # binding recreated to the SAME target after an unlink never spells the token
+    # a row drawn from the old one carried: a delayed unlink that names the old
+    # row is refused instead of deleting the new binding. Not a secret -- it only
+    # ever leaves as part of a digest -- but random rather than a counter, so a
+    # deleted-and-recreated entry cannot restart the sequence and collide.
+    @staticmethod
+    def _new_binding_nonce() -> str:
+        return secrets.token_hex(8)
+
+    def _note_bind(self, key: str) -> None:
+        """Announce one COMMITTED channel binding. The choke point both bind paths use.
+
+        Called after the binding is persisted and inside the map lock, so it describes
+        something that has happened and precedes anything that could route through it.
+        Best-effort, matching :meth:`_note_inbound_unbind`: a broken sink must not turn
+        a bind into a raise.
+        """
+        listener = _BIND_LISTENER
+        if listener is None:
+            return
+        try:
+            listener(key)
+        except Exception:
+            logger.warning("channel-bind listener failed for %s", key, exc_info=True)
 
     def _note_inbound_unbind(self, key: str, link: ChannelLink, reason: str) -> None:
         """Audit and announce the removal of one inbound resume binding.
@@ -962,7 +1308,7 @@ class SessionMap:
         return entry.get("provider", "")
 
     @_guarded
-    def clear_sid(self, key: str) -> None:
+    def clear_sid(self, key: str) -> bool:
         """Clear the stored session ID without removing the entry.
 
         Used on provider switch (the SID is incompatible with the new
@@ -970,15 +1316,28 @@ class SessionMap:
         is stashed as ``discarded_sid`` so the operation is diagnosable and
         manually reversible — the native conversation still exists on disk;
         only the pointer to it is dropped.
+
+        Returns whether a pointer was actually dropped, so a caller clearing a
+        SET of keys can report how many conversations it orphaned without a
+        second lookup. ``get`` is the wrong probe for that: it gates on the
+        transcript file existing and prunes stale entries as a side effect, so
+        it answers "is this resumable" rather than "is a pointer recorded".
         """
         entry = self._data.get(canonical_key(key))
-        if entry and entry.get("sid"):
-            entry["discarded_sid"] = entry["sid"]
-            entry["sid"] = ""
+        if entry and _stash_and_clear_sid(entry):
             self._save()
+            return True
+        return False
 
     def get_discarded_sid(self, key: str) -> str:
-        """Return the last sid dropped by :meth:`clear_sid`, or ''."""
+        """Return the last sid dropped from *key* by any path, or ''.
+
+        Written by every path that empties ``sid`` in place -- the provider
+        switch, the startup prune and the per-read stale repair -- through
+        :func:`_stash_and_clear_sid`. Naming only one of them here once let the
+        two stale paths drop a sid without recording it, leaving an older id
+        standing as the key's last store.
+        """
         entry = self._data.get(canonical_key(key))
         if not entry:
             return ""
@@ -1000,7 +1359,7 @@ class SessionMap:
 
         An entry carrying a DURABLE flag or a channel binding is never deleted,
         and when its ``sid`` has gone stale the ``sid`` is cleared instead —
-        :func:`_survives_prune` is the single predicate both stale branches ask,
+        :func:`_keeps_entry` is the single predicate both stale branches ask,
         so neither can start discarding what the other keeps. A durable flag is a
         per-conversation SETTING, not session state: it can be written before the
         conversation has ever run a turn (``/unlink`` as the very first message
@@ -1013,24 +1372,29 @@ class SessionMap:
         message from the channel opens a fresh session instead of resuming the
         one it is bound to.
 
-        Session-SCOPED flags (a temporary or incognito thread) are deliberately
-        NOT durable: they describe one session, so keeping their entries alive
-        would leak a never-collected row per such thread and grow the map — which
-        every mutation rewrites — without bound.
+        A privacy-mode flag (a temporary or incognito thread) keeps its entry here
+        too, and nothing else removes it either: the flag is the record the
+        channel's inbound gate hydrates from, so the row stays until that gate
+        can read the transcript header instead (:func:`_keeps_entry`, and the
+        module comment above ``_PRIVACY_STRICTNESS``). What this loop-side,
+        lock-held method must NOT do for such a row is read its transcript;
+        ensuring the header records the mode is disk I/O, and
+        :meth:`stamp_privacy_headers`, awaited right after this on the startup
+        path, does it on a worker thread.
 
         Returns the number of entries removed; a ``sid``-only reset is a repair,
         not a removal, so it is not counted.
 
         Collection goes through :meth:`_remove_entry` rather than deleting out of
         ``_data``, so it inherits the audit and the announcement every other
-        removal path gets. Today that is unreachable — :func:`_survives_prune`
-        holds every bound entry back — and reaching the choke point anyway is the
-        point: a future loosening of that predicate then lands on an audited path
-        instead of silently collecting a live binding. On prune's only production
-        path (``start_pool``, on the startup loop) the per-entry saves coalesce
-        through ``_save``'s debounced deferred flush into one worker-thread
-        write; off the loop each save writes inline, which no production caller
-        does.
+        removal path gets. For bound entries that is unreachable --
+        :func:`_survives_prune` holds every bound entry back -- and reaching the
+        choke point anyway is the point: a future loosening of that predicate then
+        lands on an audited path instead of silently collecting a live binding. On
+        prune's only production path (``start_pool``, on the startup loop) the
+        per-entry saves coalesce through ``_save``'s debounced deferred flush into
+        one worker-thread write; off the loop each save writes inline, which no
+        production caller does.
         """
         sessions_dir = _kiro_sessions_dir()
         stale: list[str] = []
@@ -1041,10 +1405,10 @@ class SessionMap:
             if (entry.get("provider") or PROVIDER_LABEL_DEFAULT) != PROVIDER_LABEL_DEFAULT:
                 continue
             sid = entry.get("sid")
-            survives = _survives_prune(entry)
+            survives = _keeps_entry(entry)
             if sid and not (sessions_dir / f"{sid}.json").exists():
                 if survives:
-                    entry["sid"] = ""
+                    _stash_and_clear_sid(entry)
                     repaired = True
                 else:
                     stale.append(key)
@@ -1061,7 +1425,7 @@ class SessionMap:
             # One more dirty-mark after the rebuild. ``_save`` is loop-aware:
             # on prune's only production path (``start_pool`` on the startup
             # loop) the saves coalesce into one deferred flush whose disk
-            # write runs on a worker thread (#2405) — the loop still pays the
+            # write runs on a worker thread — the loop still pays the
             # serialize, never the write. A ``batched_save`` here would write
             # inline at batch exit on that same loop.
             self._save()
@@ -1071,6 +1435,91 @@ class SessionMap:
             # the same stale sid and repairs it again forever.
             self._save()
         return len(stale)
+
+    @_guarded
+    def privacy_flagged_entries(self) -> dict[str, list[str]]:
+        """Every entry carrying a privacy flag: key -> its flags, strictest first.
+
+        The cheap, lock-held half of :meth:`stamp_privacy_headers`: it names the
+        rows whose transcript header must record the mode and performs NO
+        filesystem call. Every flagged row qualifies -- channel-bound or not,
+        live ``sid``, cleared ``sid`` or none -- because the header is the record
+        for the THREAD, not for the provider session that happened to serve it,
+        and ensuring it is idempotent (tighten-only, never creating a
+        transcript). Nothing here decides a removal: no privacy row is removed
+        (:func:`_keeps_entry`).
+        """
+        return {
+            key: flagged
+            for key, entry in self._data.items()
+            if (flagged := _privacy_flags_on(entry))
+        }
+
+    def privacy_flags(self, key: str) -> list[str]:
+        """*key*'s privacy flags as the map holds them NOW, strictest first (``[]`` for none).
+
+        The per-row re-read :meth:`stamp_privacy_headers` makes once it holds
+        the row's durable-write lock: the snapshot it walks only names
+        candidates, and what the row says under the lock decides whether its
+        header is stamped. A single-key probe, undecorated like
+        :meth:`get_flag` (the class docstring's threading contract); *key* is a
+        canonical map key, as the snapshot names them.
+        """
+        entry = self._data.get(key)
+        return _privacy_flags_on(entry) if isinstance(entry, dict) else []
+
+    async def stamp_privacy_headers(self) -> int:
+        """Ensure every privacy-flagged row's EXISTING transcript header records its mode.
+
+        The startup path awaits this right after :meth:`prune`. The rows are
+        NAMED under the map lock with no filesystem call
+        (:meth:`privacy_flagged_entries`) -- a snapshot of candidates, nothing
+        more -- and each is then stamped one at a time under that row's
+        durable-write lock (``privacy_mode._serialized``, the lock the
+        modifier's commit and a reservation's release hold across their own
+        row-and-header sequences): the row is re-read under the lock
+        (:meth:`privacy_flags`), a row the re-read finds unflagged is skipped,
+        and only a row still flagged has its transcript header probed and --
+        for a row flagged before the modifier stamped headers, or tightened
+        since -- written, on a worker thread
+        (:func:`_header_records_privacy_mode`: tighten-only,
+        ``require_existing``, so a transcript that does not exist stays that
+        way). The event loop never pays a transcript read for these rows and
+        the map lock is never held across one.
+
+        Serialized with the release because the snapshot goes stale: on a
+        non-blocking pool start the sweep runs as a detached task while traffic
+        flows, and a reservation released after the snapshot restores the
+        header and clears the row under ITS lock. Unserialized, a stamp from
+        the snapshot alone writes the released mode back into a header the
+        release has just restored, over a row that is gone -- and nothing
+        loosens a header from there: the sweep only tightens, from rows, and a
+        later release of the same mode reads the stale stamp as its own
+        ``header_before`` and restores to it, so the thread's consolidation
+        stays refused for good. Under the row's lock the stamp lands either
+        before the release, which then finds the header still saying the mode
+        and restores it, or after it, when the re-read finds no flag and
+        nothing is written.
+
+        REMOVES NOTHING. A privacy row is the record the channel's inbound gate
+        hydrates from, and removing it -- however complete the header -- leaves
+        that gate reading the thread as persistent after the next restart (the
+        module comment above ``_PRIVACY_STRICTNESS``). A flag tightened DURING
+        the probe leaves the header stamped with the mode the worker saw: never
+        looser than before, since the stamp is tighten-only, and never lost,
+        since the next pass reads the current flags and re-stamps the tightened
+        mode. Returns the number of rows whose header records the mode
+        afterwards -- housekeeping telemetry, nothing acts on it.
+        """
+        recorded = 0
+        for key in self.privacy_flagged_entries():
+            async with _serialized(key):
+                flagged = self.privacy_flags(key)
+                if not flagged:
+                    continue
+                if await asyncio.to_thread(_header_records_privacy_mode, key, flagged):
+                    recorded += 1
+        return recorded
 
     @_guarded
     def mapped_sids_by_key(self) -> dict[str, str]:
@@ -1185,6 +1634,14 @@ class SessionMap:
                 "slack_thread_ts": thread_ts,
                 "slack_channel_id": channel_id,
             }
+            entry = self._data[key]
+        # A NEW binding (this branch is only reached when the coordinates changed
+        # or the entry is new) gets its own identity; the clear sentinel carries
+        # none. See ``_new_binding_nonce``.
+        if thread_ts:
+            entry["slack_link_nonce"] = self._new_binding_nonce()
+        else:
+            entry.pop("slack_link_nonce", None)
         if thread_ts:
             # Same policy as the tie-break: a self-derived claim never
             # displaces a live owner from the reverse index — it routes the
@@ -1195,6 +1652,12 @@ class SessionMap:
             else:
                 self._thread_to_session[thread_ts] = key
         self._save()
+        if thread_ts:
+            # A real binding, not the clear sentinel. The identical-coordinates branch
+            # above returns before reaching here, so the inbound path re-writing the
+            # same thread every turn does not announce: this fires on a binding that
+            # CHANGED, which is what the sink records.
+            self._note_bind(key)
 
     @_guarded
     def get_slack_link(self, key: str) -> tuple[str | None, str | None]:
@@ -1223,6 +1686,7 @@ class SessionMap:
             del self._thread_to_session[old_ts]
         entry.pop("slack_thread_ts", None)
         entry.pop("slack_channel_id", None)
+        entry.pop("slack_link_nonce", None)
         # The mute dies with the binding it muted. A marker left behind would
         # silently re-mute whatever link the user establishes next.
         was_paused = entry.pop("slack_paused", None) is not None
@@ -1329,7 +1793,14 @@ class SessionMap:
             )
         entry = self._ensure_entry(key)
         displaced = self._inbound_binding(entry)
-        entry["mirror"] = link.to_dict()
+        stored = link.to_dict()
+        # Identity travels with the TARGET: a rewrite of the same coordinates
+        # (the dispatcher rebinds a channel-born session's own conversation on
+        # every inbound turn) is the same binding and keeps its nonce; a new
+        # target, or a binding where none stood, is a new binding.
+        if entry.get("mirror") != stored or not entry.get("mirror_nonce"):
+            entry["mirror_nonce"] = self._new_binding_nonce()
+        entry["mirror"] = stored
         if accepts_inbound:
             entry["mirror_accepts_inbound"] = True
         else:
@@ -1338,6 +1809,7 @@ class SessionMap:
         # as the Slack path: a marker outliving its binding re-mutes the next one.
         entry.pop("mirror_paused", None)
         self._save()
+        self._note_bind(key)
         if displaced is not None and (displaced != link or not accepts_inbound):
             self._note_inbound_unbind(key, displaced, reason)
 
@@ -1438,6 +1910,21 @@ class SessionMap:
         that only carries ``slack_thread_ts`` / ``slack_channel_id`` it
         synthesizes the equivalent Slack ``ChannelLink`` so callers never have
         to special-case Slack. Returns None when the session mirrors nowhere.
+
+        A Slack row that names NO thread is not a mirror and is never synthesized
+        into one. ``set_channel`` writes a channel conversation's namespaced bucket
+        (``discord:<id>``) into the legacy ``slack_channel_id`` field on the first
+        turn, and ``clear_mirror_link`` pops only the ``mirror`` row -- so without
+        this filter every unlinked channel session, and every new one on its first
+        turn, read back a Slack link nobody chose. An empty ``thread_ts`` is Slack's
+        own clear sentinel and never enters the thread index, so nothing can be
+        delivered through such a row: it is bookkeeping, and it names no audience.
+        Filtered HERE rather than by each reader because the readers cannot all be
+        enumerated: ``bind_origin_mirror`` and the owner-DM predicate each carried
+        their own copy of the test, and the ``!sessions`` resume, the dashboard's
+        link projection and the containment probe read this method too and would
+        each have needed one. The thread, not the channel type, is what separates
+        a binding from bookkeeping: a real Slack mirror always names its thread.
         """
         entry = self._data.get(self._mirror_key(key))
         if not entry:
@@ -1447,7 +1934,7 @@ class SessionMap:
             return ChannelLink.from_dict(raw)
         ts = entry.get("slack_thread_ts")
         ch = entry.get("slack_channel_id")
-        if ts or ch:
+        if ts:
             return ChannelLink(channel_type=SLACK_NAMESPACE, channel_id=ch, thread_id=ts)
         return None
 
@@ -1464,6 +1951,37 @@ class SessionMap:
         """
         entry = self._data.get(canonical_key(key))
         return bool(entry and entry.get("mirror_accepts_inbound"))
+
+    @_guarded
+    def mirror_link_nonce(self, key: str) -> str:
+        """The per-binding nonce of the mirror :meth:`get_mirror_link` returns.
+
+        Resolved exactly as ``get_mirror_link`` resolves the binding, so the two
+        always describe the same row: the explicit ``mirror`` carries
+        ``mirror_nonce``; a legacy Slack session whose mirror is synthesized from
+        the Slack fields carries that link's ``slack_link_nonce``. ``""`` for no
+        binding, and for a binding written before nonces existed -- whose token
+        then digests the coordinates alone, as it always did.
+        """
+        entry = self._data.get(self._mirror_key(key))
+        if not entry:
+            return ""
+        if entry.get("mirror"):
+            return str(entry.get("mirror_nonce") or "")
+        if entry.get("slack_thread_ts"):
+            return str(entry.get("slack_link_nonce") or "")
+        return ""
+
+    @_guarded
+    def slack_link_nonce(self, key: str) -> str:
+        """The per-binding nonce of the Slack thread :meth:`get_slack_link` returns.
+
+        ``""`` for no link and for a link written before nonces existed.
+        """
+        entry = self._data.get(canonical_key(key))
+        if not entry or not entry.get("slack_thread_ts"):
+            return ""
+        return str(entry.get("slack_link_nonce") or "")
 
     @_guarded
     def find_mirror_sessions(
@@ -1522,6 +2040,7 @@ class SessionMap:
                 continue
             inbound = self._inbound_binding(entry)
             entry.pop("mirror", None)
+            entry.pop("mirror_nonce", None)
             entry.pop("mirror_accepts_inbound", None)
             entry.pop("mirror_paused", None)
             cleared.append(key)
@@ -1544,23 +2063,110 @@ class SessionMap:
         Resolves through :meth:`_mirror_key` so an unlink reaches a binding still
         held under the legacy spelling — otherwise a mirror that reads as live
         could not be turned off.
+
+        Both spellings go in ONE clear. A channel session that rebound from the
+        dashboard can hold two rows -- the canonical binding every read prefers
+        and the pre-unification ``dashboard:`` row it superseded -- and
+        ``_mirror_key`` falls back to the older row the moment the canonical one
+        is gone. Clearing the winner alone therefore does not unlink the session:
+        the next read answers the OLD target, the dashboard redraws the row it
+        just reported removed, and that mirror keeps delivering. Every row that
+        held a binding is popped before the single save, so no reader can
+        observe the fallback in between.
         """
-        mkey = self._mirror_key(key)
-        entry = self._data.get(mkey)
-        if not entry:
-            return False
-        if entry.get("mirror") is not None:
+        canon = canonical_key(key)
+        rows = [canon]
+        if is_channel_session_key(canon):
+            rows.append(legacy_dashboard_mirror_key(canon))
+        lost: list[tuple[str, ChannelLink]] = []
+        cleared = False
+        for row_key in rows:
+            entry = self._data.get(row_key)
+            if not entry or entry.get("mirror") is None:
+                continue
             inbound = self._inbound_binding(entry)
             entry.pop("mirror", None)
+            entry.pop("mirror_nonce", None)
             entry.pop("mirror_accepts_inbound", None)
             entry.pop("mirror_paused", None)
-            self._save()
+            cleared = True
             if inbound is not None:
-                self._note_inbound_unbind(mkey, inbound, reason)
+                lost.append((row_key, inbound))
+        if cleared:
+            self._save()
+            for row_key, inbound in lost:
+                self._note_inbound_unbind(row_key, inbound, reason)
             return True
-        if entry.get("slack_thread_ts") or entry.get("slack_channel_id"):
+        # No explicit ``mirror`` on either spelling: the only mirror left to clear
+        # is the one ``get_mirror_link`` synthesizes from the legacy Slack fields.
+        mkey = self._mirror_key(key)
+        entry = self._data.get(mkey)
+        if entry and (entry.get("slack_thread_ts") or entry.get("slack_channel_id")):
             return self.clear_slack_link(mkey)
         return False
+
+    # ── Compare-and-clear: the one way an unlink that NAMES a binding clears it ──
+    # A route that reads the binding, compares it and then clears it performs two
+    # steps, and a rebind landing between them -- another thread's `!sessions`
+    # pick, a rival claim, the dispatcher re-asserting an origin mirror -- is
+    # cleared by a stale unlink that matched the binding before it. Both steps
+    # therefore live HERE, under the map's own lock, and the unlink routes call
+    # nothing else: `test_channel_connect_row.py` enumerates them and asserts it.
+
+    @_guarded
+    def clear_mirror_link_if(
+        self,
+        key: str,
+        channel_type: str,
+        token: str,
+        *,
+        reason: str = UNBIND_REASON_UNSPECIFIED,
+    ) -> bool:
+        """Clear *key*'s mirror iff it is exactly the binding ``(channel_type, token)`` names.
+
+        *token* is the row's :func:`~kiro_crew.messaging.link.binding_token`; it
+        is recomputed from the binding this map holds and that binding's own
+        nonce, and the compare and the clear are one guarded step, so nothing can
+        rebind between them. Returns True iff the binding was cleared (the whole
+        of :meth:`clear_mirror_link`: both spellings, one save, the unbind
+        audit); False means a MISMATCH -- the binding changed under the caller,
+        or there is none -- and nothing was touched. No binding matches nothing:
+        an unlink naming a row whose binding is already gone is refused, never
+        reported as an unlink.
+        """
+        current = self.get_mirror_link(key)
+        if current is None:
+            return False
+        if (current.channel_type or "").lower() != channel_type:
+            return False
+        if binding_token(current, self.mirror_link_nonce(key)) != token:
+            return False
+        return self.clear_mirror_link(key, reason=reason)
+
+    @_guarded
+    def clear_slack_link_if(self, key: str, channel_type: str, token: str) -> bool:
+        """Clear *key*'s Slack thread iff it is exactly the binding ``(channel_type, token)`` names.
+
+        The Slack twin of :meth:`clear_mirror_link_if`, on the Slack fields the
+        dashboard's row is projected from. On a match the thread is cleared on
+        *key* and, for a ``dashboard:``-keyed session, on the bare key too: the
+        turn runner copies a dashboard session's link from the bare key onto the
+        prefixed one when a turn runs, so a clear that left either spelling would
+        see the next turn re-inherit the link (a channel key has no such twin).
+        Returns True iff cleared; False is a mismatch and nothing was touched.
+        """
+        thread_ts, channel_id = self.get_slack_link(key)
+        if not thread_ts:
+            return False
+        current = ChannelLink(SLACK_NAMESPACE, channel_id=channel_id, thread_id=thread_ts)
+        if channel_type != SLACK_NAMESPACE:
+            return False
+        if binding_token(current, self.slack_link_nonce(key)) != token:
+            return False
+        cleared = self.clear_slack_link(key)
+        if key.startswith("dashboard:"):
+            cleared = self.clear_slack_link(key[len("dashboard:") :]) or cleared
+        return cleared
 
     @_guarded
     def set_mirror_paused(self, key: str, paused: bool, *, origin: bool = False) -> bool:
@@ -1614,7 +2220,7 @@ class SessionMap:
           from the CANONICAL row -- the session's own -- never through
           ``_mirror_key``. That conversation is permanent, so the flag cannot be
           orphaned by its target disappearing; it CAN be orphaned by the lookup
-          moving, which is what keying it to the mirror binding used to do.
+          moving, which is what keying it to the mirror binding would do.
         * ``origin=False`` requires an explicit ``mirror`` dict, and follows the
           binding through ``_mirror_key``.
         """
@@ -1631,19 +2237,43 @@ class SessionMap:
         return entry.get("mirror_paused") is True
 
     @_guarded
+    def reserve_generation(self, session_key: str) -> None:
+        """Persist the generation in *session_key* before its first provider turn.
+
+        The watermark lives on the stable bucket entry instead of materializing
+        one map row per empty generation. It is monotonic: a delayed or repeated
+        command can never lower the restart seed and make an older history key
+        reusable.
+        """
+        parsed = split_dm_session_key(canonical_key(session_key))
+        if parsed is None:
+            raise ValueError(f"not a canonical DM session key: {session_key!r}")
+        bucket, generation = parsed
+        if generation <= 0:
+            return
+        entry = self._ensure_entry(bucket)
+        current = entry.get(GENERATION_FLOOR_FIELD)
+        if isinstance(current, int) and not isinstance(current, bool) and current >= generation:
+            return
+        entry[GENERATION_FLOOR_FIELD] = generation
+        self._save()
+
+    @_guarded
     def max_generation(self, bucket: str) -> int:
         """Return the highest persisted DM generation for a session *bucket*.
 
         The bucket is the generation-0 key (e.g.
         ``telegram:<agent>:direct:<user>``); generations persist as ``{bucket}``
-        (gen 0) and ``{bucket}:gen{N}``. Returns the max ``N`` with a persisted
-        entry, or -1 when the bucket has none. Channels seed their in-memory
-        generation counter from this so ``/new`` and idle/daily reset advance
-        past any generation left on disk (restart-safe) instead of colliding
-        with a stale session and resuming it.
+        (gen 0) and ``{bucket}:gen{N}``. An explicit ``/new`` also records a
+        monotonic generation floor on the bucket before the first provider turn.
+        Returns the highest of those sources, or -1 when the bucket has none.
         """
         bucket = canonical_key(bucket)
         best = 0 if bucket in self._data else -1
+        entry = self._data.get(bucket)
+        floor = entry.get(GENERATION_FLOOR_FIELD) if entry else None
+        if isinstance(floor, int) and not isinstance(floor, bool):
+            best = max(best, floor)
         prefix = f"{bucket}:gen"
         for key in self._data:
             if key.startswith(prefix):
@@ -1653,9 +2283,16 @@ class SessionMap:
         return best
 
     @_guarded
-    def find_key_by_sid(self, session_id: str) -> str | None:
-        """Find the session map key for a given kiro-cli session ID."""
+    def find_key_by_sid(self, session_id: str, *, exclude: str = "") -> str | None:
+        """Find the session map key for a given kiro-cli session ID.
+
+        *exclude* skips one key, for a caller asking whether ANOTHER key maps the same
+        session -- the question "is this session still somebody's" cannot be answered by
+        a lookup that can return the very key the caller is retiring.
+        """
         for k, entry in self._data.items():
+            if exclude and k == exclude:
+                continue
             sid = entry.get("sid") if isinstance(entry, dict) else entry
             if sid == session_id:
                 return k
@@ -1736,8 +2373,32 @@ class SessionMap:
         last flag removes the sub-dict so empty state does not accrete on disk.
         Idempotent: writing an unchanged value still persists (cheap) so callers
         need not pre-check.
+
+        Setting a PRIVACY flag on an entry that carries none yet makes that
+        entry a retained row (see the module comment above ``_PRIVACY_STRICTNESS``),
+        so it passes the row gate first: for a key over ``PRIVACY_ROW_KEY_MAX``
+        (``"key_too_long"``), then past ``PRIVACY_ROW_CAP`` retained rows
+        (``"limit"``; the count is one pass over the map, paid only when a new
+        row is admitted), :class:`PrivacyRowRefused` carrying that reason is
+        raised and nothing is written -- fail-closed, the caller refuses the
+        turn. Tightening a row already retained (``incognito`` then
+        ``temporary``) is never refused: it adds no row. The gate lives here and
+        nowhere else: a caller that must know before an irreversible step
+        (``privacy_mode.reserve``) applies the flag ahead of that step and takes
+        it back if the step fails, rather than pre-checking a count another
+        writer can change under it.
         """
         key = canonical_key(key)
+        if (
+            value
+            and flag in _PRIVACY_STRICTNESS
+            and not _privacy_flags_on(self._data.get(key) or {})
+        ):
+            if len(key) > PRIVACY_ROW_KEY_MAX:
+                raise PrivacyRowRefused(key, "key_too_long")
+            retained = sum(1 for entry in self._data.values() if _privacy_flags_on(entry))
+            if retained >= PRIVACY_ROW_CAP:
+                raise PrivacyRowRefused(key, "limit")
         if value:
             entry = self._ensure_entry(key)
         else:

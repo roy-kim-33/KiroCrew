@@ -88,7 +88,7 @@ async def _run_script_callback(gw, job, script_result=None, vet_reason=None, sid
     ``vet_reason`` feeds the fire-time governance gate (None = job may run);
     patching vet_job_at_fire_time also stands in for the script-path
     resolution it performs, which the removed gateway-level
-    resolve_script_path call used to cover.
+    resolve_script_path call also covered.
 
     Pass ``side_effect`` to make the mocked call raise instead of returning.
     """
@@ -204,7 +204,7 @@ class TestScriptExecution:
     async def test_skip_defers_strike_reset_to_execute(self):
         # The Skip branch must NOT reset the counter or lift auto-pause itself:
         # that is record_success's job, reached only through
-        # CronScheduler._execute, whose reset is guarded by the _cancelled_jobs
+        # CronScheduler._execute, whose reset is guarded by the cancel markers
         # cancel-race check. An unguarded reset in this branch would clear the
         # pause and re-enable a job cancelled mid-tick, so the callback layer
         # leaves the bookkeeping untouched and defers to _execute. (The guarded
@@ -640,7 +640,7 @@ class TestFireTimeGatesScriptAndMessage:
     @pytest.mark.asyncio
     async def test_script_fire_time_capability_deny_blocks_execution(self):
         # capabilities.cron disabled AFTER the script job was scheduled must
-        # deny the run at fire time — previously only the path was re-resolved.
+        # deny the run at fire time, not merely re-resolve the path.
         gw = _make_gw()
         job = _make_script_job()
         result, mock_run, _, mock_sel = await self._run_script_real_vet(
@@ -727,8 +727,8 @@ class TestFireTimeGatesScriptAndMessage:
 
     @pytest.mark.asyncio
     async def test_message_fire_time_capability_deny_blocks_dispatch(self):
-        # Message (LLM) jobs previously had NO fire-time capabilities.cron
-        # check at all: disabling the capability after scheduling had no
+        # Message (LLM) jobs need a fire-time capabilities.cron
+        # check: without it, disabling the capability after scheduling has no
         # effect. The gate must block the session dispatch entirely.
         gw = _make_gw()
         job = CronJob(
@@ -1054,6 +1054,62 @@ async def _run_llm_callback(gw, job, *, get_or_create_side_effect=None):
         return result, _stream_mock
 
 
+class TestLlmCronAdmission:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("with_modes", [False, True])
+    async def test_execution_binding_runs_off_loop(self, monkeypatch, with_modes):
+        from kiro_crew import execution_context
+
+        gw = _make_gw_for_llm()
+        gw.ctx_builder._session_memory_modes = {} if with_modes else None
+        job = _make_llm_job()
+        loop_thread = threading.get_ident()
+        bindings = []
+        original = execution_context.bind_session_execution
+
+        def bind(key, execution):
+            bindings.append((threading.get_ident(), key, execution))
+            return original(key, execution)
+
+        monkeypatch.setattr(execution_context, "bind_session_execution", bind)
+        result, _ = await asyncio.wait_for(_run_llm_callback(gw, job), 10)
+        assert result == "Agent response here"
+        # Mode publication also tightens the same canonical record.
+        assert len(bindings) == (2 if with_modes else 1)
+        thread, key, captured = bindings[0]
+        assert all(thread != loop_thread for thread, _, _ in bindings)
+        assert key == f"cron:{job.id}"
+        assert captured == execution_context.read_session_execution(key, required=True)
+
+    @pytest.mark.asyncio
+    async def test_session_closing_retains_undispatched_one_shot(self):
+        from kiro_crew.session import SessionClosingError
+
+        gw = _make_gw_for_llm()
+        job = _make_llm_job(
+            delete_after_run=True,
+            last_result="stale result",
+            consecutive_failures=2,
+        )
+
+        async def _side_effect(*_args, **_kwargs):
+            raise SessionClosingError("automatic update owns admission")
+
+        result, stream = await _run_llm_callback(
+            gw,
+            job,
+            get_or_create_side_effect=_side_effect,
+        )
+
+        assert result is None
+        assert job.run_never_started is True
+        assert job.last_status == "error"
+        assert job.last_error == "gateway admission is closed"
+        assert job.last_result == ""
+        assert job.consecutive_failures == 2
+        stream.assert_not_awaited()
+
+
 class TestModelFallback:
     """Test _acquire_with_model_fallback and _annotate_model_downgrade paths."""
 
@@ -1229,7 +1285,7 @@ class TestThrottleFallbackCronWiring:
         assert _annotate_model_fallback("text", provider) == "text"
 
     def test_gateway_annotator_is_the_shared_body(self):
-        """DRIFT PIN (#5447 item 4): the gateway name must BE the shared
+        """DRIFT PIN: the gateway name must BE the shared
         helper next to TURN_FALLBACK_ATTR — not a re-spelled copy."""
         from kiro_crew.llm_helpers import annotate_model_fallback
         from kiro_crew.slack.gateway import _annotate_model_fallback
@@ -1238,7 +1294,7 @@ class TestThrottleFallbackCronWiring:
 
     @pytest.mark.asyncio
     async def test_chain_exhaustion_story_reaches_the_failure_alert(self):
-        """#5447 item 1: a cron turn failing after the chain exhausted must
+        """A cron turn failing after the chain exhausted must
         alert with the WHOLE walk (the story the walk attached to the
         exception), not just the last candidate's error — on BOTH the
         dashboard notify and the Slack DM legs, and even when the backend
@@ -1406,7 +1462,7 @@ class TestExecutePreservesCallbackStatus:
 
 
 class TestCronUsageRow:
-    """Issue #647: every model-spending cron turn appends exactly one usage row
+    """Every model-spending cron turn appends exactly one usage row
     tagged surface='cron'; the zero-token script/command modes append none."""
 
     @pytest.mark.asyncio
@@ -1518,7 +1574,7 @@ class TestCronUsageRow:
 def test_shutdown_cancel_keeps_the_last_completed_result(tmp_path) -> None:
     """A shutdown cancel must not wipe the previous run's result.
 
-    stop() cancels the in-flight task but never adds the job to _cancelled_jobs,
+    stop() cancels the in-flight task but never adds the job to the cancel markers,
     so the funnel's result-less clear would otherwise run on every gateway stop
     and persist an empty result over the last completed run's output.
     """
@@ -1542,7 +1598,8 @@ def test_shutdown_cancel_keeps_the_last_completed_result(tmp_path) -> None:
         svc._jobs = [job]
         svc._save()
         with patch.object(svc, "_execute", side_effect=_hang):
-            task = asyncio.create_task(svc._run_job_isolated(job))
+            claim = svc._claim_run(job.id, "scheduled")
+            task = asyncio.create_task(svc._run_job_isolated(job, claim))
             await asyncio.sleep(0.05)
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -1562,7 +1619,7 @@ async def _run_script_callback_behind_a_busy_worker(gw, job, script_result, hold
     front would let the gate run first and the script would then find a free
     worker and never queue.
 
-    The gate itself no longer touches this pool: it runs on the dedicated
+    The gate itself does not touch this pool: it runs on the dedicated
     ``mc-crongate`` pool with a bound of its own, so starving the cron pool
     cannot starve the gate. That independence is the point -- it is why this
     fixture can saturate the cron pool without perturbing the gate under test.
@@ -1753,7 +1810,7 @@ class TestCronPoolQueueWait:
 
             ran = threading.Event()
 
-            async def _execute(_job):
+            async def _execute(_job, _meta=None):
                 return await ex.run_in_cron_pool(ran.set, timeout=30, queue_timeout=60)
 
             svc._execute = _execute  # type: ignore[method-assign]
@@ -1785,7 +1842,7 @@ class TestCronPoolQueueWait:
         )
         job.timeout_secs = 2
 
-        async def _slow(_job):
+        async def _slow(_job, _meta=None):
             await asyncio.sleep(30)
 
         svc._execute = _slow  # type: ignore[method-assign]
@@ -1879,10 +1936,13 @@ class TestCronPoolQueueWait:
         import time as _time
         from unittest.mock import AsyncMock as _AsyncMock
 
+        from kiro_crew.cron import _RunClaim
+
         never = asyncio.get_running_loop().create_future()  # a task that is not done
         holder = asyncio.ensure_future(asyncio.wait_for(never, timeout=30))
-        svc._job_start_times[job.id] = _time.time() - elapsed_secs
-        svc._running_tasks[job.id] = holder
+        svc._claims[job.id] = _RunClaim(
+            trigger="scheduled", claimed_at=_time.time() - elapsed_secs, task=holder
+        )
         svc._jobs = [job]
         reaped = _AsyncMock()
         svc._force_reap = reaped  # type: ignore[method-assign]

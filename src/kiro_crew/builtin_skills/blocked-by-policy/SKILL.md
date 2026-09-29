@@ -1,6 +1,6 @@
 ---
 name: blocked-by-policy
-description: What to do when a Kiro Crew safety policy blocks a tool call — how to tell a policy block from a user refusal, and the sanctioned path for each class of block (AWS credentials, enterprise SSO, key files, the governance trust root, exfiltration-shaped requests, and the self-protection floor). Load when a tool result says a command was denied, when a credential or AWS access attempt is refused, or before concluding that this host lacks a capability.
+description: What to do when a Kiro Crew safety policy blocks a tool call — tell a policy block from a user refusal, then take the sanctioned path for that class (AWS creds, SSO, key files, trust root, exfiltration, self-protection). Load on any 'command denied' result or refused credential/AWS access.
 triggers: blocked by security policy, user denied tool execution, access to sensitive path, sensitive credential path, data-exfiltration pattern, governance trust-root, permission denied by policy, cannot access aws, no aws credentials, aws access denied, sso login, credential path, credential tool not available
 ---
 
@@ -192,14 +192,24 @@ The reason has two possible forms:
 - `Blocked: <sentence>` — the always-on floor (sensitive paths, the trust root,
   exfiltration shapes). These name the class directly.
 
+Where the `kirocrew-debug` tools are granted, `debug_refusals` reads the gateway's
+own record and gives each refusal its real class, which the refusal text alone does
+not carry — in particular `unverifiable_path`, a path the resolver never finished
+judging, which is retried rather than worked around.
+
 ## Useful checks
 
 - `kirocrew doctor` — reports the credential posture: which AWS profiles are
   configured, whether a `credential_process` is in play, and whether this host
   mounts an MCP server that vends credentials.
-- `kirocrew policy show` / `explain <scope> <item>` — the governance ceiling, on
-  a host that has one. CLI only, deliberately: there is no tool for enumerating
-  your own ceiling.
+- `kirocrew policy show [--ids]` / `policy explain <scope> <item>` /
+  `policy profile <name>` / `policy source` / `policy validate` — the governance
+  ceiling, where it comes from, and whether it loads. `policy show --ids` lists
+  each denied-command category's rule ids instead of just counts, which is what
+  you want when a refusal names a pattern you cannot place. `policy explain`
+  takes optional `--session-key`, `--agent` and `--app` so you can ask about a
+  surface other than your own. CLI only, deliberately: there is no tool for
+  enumerating your own ceiling.
 
 ## What not to do
 

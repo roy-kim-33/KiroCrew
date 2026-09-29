@@ -4,15 +4,18 @@ from __future__ import annotations
 
 import asyncio
 import re
+from unittest.mock import MagicMock
 
 import pytest
 
 from conftest import MockSlackClient
 from kiro_crew.context import ContextBuilder
-from kiro_crew.hooks import AutoReplyHook, HookManager, HooksConfig
+from kiro_crew.hooks import HOOK_REPLY, AutoReplyHook, HookManager, HooksConfig
+from kiro_crew.messaging import auto_title
 from kiro_crew.providers.base import LLMEvent
 from kiro_crew.slack.format import CONTINUATION, SLACK_MSG_LIMIT, split_message
 from kiro_crew.slack.handler import (
+    _THINKING,
     _THINKING_PLACEHOLDER,
     _build_phase_emojis,
     _condense_thinking,
@@ -26,6 +29,12 @@ from kiro_crew.slack.handler import (
     set_allowed_users,
     set_owner_id,
 )
+
+#: These tests exercise the SLACK side (thread renaming), not the record
+#: pin, so they pass the value production supplies when there is nothing to
+#: pin. ``maybe_auto_title`` requires it, which is what stops a call site
+#: from reading the record inside the task and reopening the window.
+_PRESENT_PIN = auto_title.RecordPin(auto_title.RECORD_PRESENT, "")
 
 
 @pytest.fixture(autouse=True)
@@ -166,8 +175,28 @@ class FakeSessionManager:
     def dequeue(self, key):
         return None
 
-    def clear_queue(self, key):
+    def clear_queue(self, key, owned_by=None):
         pass
+
+    # Interface parity with the real SessionManager's user-Stop record: a
+    # replay gap is opened around a transient-compaction reset so a Stop landing
+    # while the key has no session still counts. These tests never issue one,
+    # so the count stays wherever a test's own override puts it.
+    def stop_generation(self, key):
+        return getattr(self, "_stop_gen", 0)
+
+    # Idempotent like the real manager: reopening an open gap keeps it and
+    # closing a closed one is a no-op, so the recorded sequence is the gap's
+    # actual lifetime rather than a count of call sites.
+    def open_replay_gap(self, key):
+        if not getattr(self, "_gap_open", False):
+            self.replay_gaps = getattr(self, "replay_gaps", []) + [("open", key)]
+        self._gap_open = True
+
+    def close_replay_gap(self, key):
+        if getattr(self, "_gap_open", False):
+            self.replay_gaps = getattr(self, "replay_gaps", []) + [("close", key)]
+        self._gap_open = False
 
     async def stop_turn(self, key, *, force=False, on_soft=None, on_hard=None):
         """Fake stop_turn that defaults to 'soft' outcome."""
@@ -181,6 +210,56 @@ class FakeSessionManager:
 
 
 class TestHandleMessage:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "private_path",
+        [
+            "/home/alice/memory.db",
+            "/Users/alice/memory.db",
+            r"C:\Users\alice\memory.db",
+        ],
+    )
+    async def test_private_memory_refusal_is_safe_before_native_slack_delivery(
+        self, monkeypatch, private_path
+    ):
+        from unittest.mock import AsyncMock, Mock
+
+        from kiro_crew.memory_stores import UnknownMemoryStore
+        from kiro_crew.slack import handler
+
+        secret = "ghp_" + "A" * 36
+        refusal = AsyncMock(
+            side_effect=UnknownMemoryStore(
+                f"memory_unavailable: cannot open {private_path}; token={secret}. "
+                "Repair this member's memory. Global Memory V1 was not used."
+            )
+        )
+        monkeypatch.setattr(handler, "session_store_for_turn", refusal)
+        slack = MockSlackClient()
+        sessions = FakeSessionManager()
+        acquire = AsyncMock()
+        release = Mock()
+        monkeypatch.setattr(sessions, "get_or_create", acquire)
+        monkeypatch.setattr(sessions, "release", release)
+
+        await asyncio.wait_for(
+            handle_message(slack, sessions, "C1", "continue my task", None, "msg1", "U1"),
+            timeout=5,
+        )
+
+        refusal.assert_awaited_once()
+        acquire.assert_not_awaited()
+        release.assert_not_called()
+        wire = "\n".join(
+            action[1].get("text") or ""
+            for action in slack.actions
+            if action[0] in ("post", "update", "append_stream", "stop_stream")
+        )
+        assert "memory_unavailable" in wire
+        assert "Repair this member's memory" in wire
+        assert "Global Memory V1 was not used" in wire
+        assert "alice" not in wire and private_path not in wire and secret not in wire
+
     @pytest.fixture(autouse=True)
     def _ensure_reactions_enabled(self, monkeypatch):
         """Ensure StatusReactionController is enabled regardless of user config."""
@@ -215,9 +294,9 @@ class TestHandleMessage:
 
     @pytest.mark.asyncio
     async def test_channels_deny_drops_slack_inbound(self, tmp_path, monkeypatch):
-        # HIGH (GPT round-7 pass 2, user-directed): Slack is a GOVERNED transport.
-        # A channels policy that allows only non-slack members must drop a Slack
-        # inbound message before any turn runs — no reply posted.
+        # Slack is a GOVERNED transport: a channels policy that allows only
+        # non-slack members must drop a Slack inbound message before any turn
+        # runs — no reply posted.
         import json
 
         from kiro_crew.platform import governance_profiles as gp
@@ -1844,6 +1923,65 @@ class TestPerThreadAgent:
             _hydrated_sessions.discard("thread1")
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("change_during", ["hydration", "memory"])
+    @pytest.mark.parametrize("new_owner", ["dashboard:new-owner", None])
+    async def test_reroute_uses_the_owner_after_async_memory_reads(
+        self, monkeypatch, change_during, new_owner
+    ):
+        from kiro_crew.slack import handler
+
+        old_owner = "dashboard:old-owner"
+        thread_ts = "1783733803.877979"
+        final_key = new_owner or f"slack:{thread_ts}"
+        hydrated_keys = []
+        memory_keys = []
+        privacy_keys = []
+
+        class RelinkedSessions(FakeSessionManager):
+            owner_key = old_owner
+
+            def get_session_for_thread(self, thread_ts):
+                return self.owner_key
+
+            def set_slack_link(self, key, thread_ts, channel_id):
+                self.owner_key = key
+
+        sessions = RelinkedSessions()
+
+        async def hydrate(key, _log):
+            hydrated_keys.append(key)
+            if key == old_owner and change_during == "hydration":
+                await asyncio.sleep(0)
+                sessions.owner_key = new_owner
+
+        async def resolve_memory(_builder, key):
+            memory_keys.append(key)
+            if key == old_owner and change_during == "memory":
+                await asyncio.sleep(0)
+                sessions.owner_key = new_owner
+            return f"memory:{key}"
+
+        monkeypatch.setattr(handler, "_hydrate_thread_overrides", hydrate)
+        monkeypatch.setattr(handler, "session_store_for_turn", resolve_memory)
+        monkeypatch.setattr(
+            handler, "_hydrate_conv_flags", lambda _sessions, key: privacy_keys.append(key)
+        )
+        await asyncio.wait_for(
+            handle_message(
+                MockSlackClient(), sessions, "C1", "hello", thread_ts, "msg1", "U_OWNER"
+            ),
+            timeout=5,
+        )
+
+        assert old_owner in hydrated_keys
+        assert final_key in hydrated_keys
+        assert memory_keys == ([old_owner, final_key] if change_during == "memory" else [final_key])
+        assert sessions.keys_seen == [final_key]
+        assert privacy_keys[-1] == final_key
+        assert old_owner not in privacy_keys
+        assert sessions.get_session_for_thread(thread_ts) == final_key
+
+    @pytest.mark.asyncio
     async def test_a_pinned_reroute_keeps_the_askers_agent(self):
         """The sibling reassignment, same defect.
 
@@ -2155,7 +2293,16 @@ class TestAutoTitleSlack:
         sessions = FakeSessionManager()
         sessions._provider = FakeProvider([LLMEvent(kind="text_chunk", text="ETL Debug Session")])
         _mark_titled("sk1")
-        await _maybe_auto_title_slack(slack, sessions, "C1", "sk1", None, "help me", "sure")
+        await _maybe_auto_title_slack(
+            slack,
+            sessions,
+            "C1",
+            "sk1",
+            None,
+            "help me",
+            "sure",
+            pin=_PRESENT_PIN,
+        )
         title_actions = [a for a in slack.actions if a[0] == "set_thread_title"]
         assert len(title_actions) == 1
         assert title_actions[0][1]["title"] == "ETL Debug Session"
@@ -2165,11 +2312,10 @@ class TestAutoTitleSlack:
     async def test_auto_title_unexpected_error_surfaces_at_warning(self, caplog):
         """An unexpected failure is logged at WARNING with the exception type.
 
-        Regression for #4800: this blanket handler runs on a fire-and-forget
-        task, so its log line is the only place a real defect surfaces. At
-        DEBUG it masked a deterministic cross-loop ``RuntimeError`` into three
-        order-dependent CI flake classes (#4177, #4789). The claim must also be
-        released so the next exchange retries.
+        This blanket handler runs on a fire-and-forget task, so its log line is
+        the only place a real defect surfaces. At DEBUG it masks a deterministic
+        cross-loop ``RuntimeError`` into an order-dependent CI flake. The claim
+        must also be released so the next exchange retries.
         """
         import logging
 
@@ -2187,7 +2333,14 @@ class TestAutoTitleSlack:
         # logger that emits nothing passes vacuously (its sibling below did).
         with caplog.at_level(logging.WARNING, logger="kiro_crew.messaging.auto_title"):
             await _maybe_auto_title_slack(
-                slack, ExplodingSessionManager(), "C1", "sk-err", None, "help", "sure"
+                slack,
+                ExplodingSessionManager(),
+                "C1",
+                "sk-err",
+                None,
+                "help",
+                "sure",
+                pin=_PRESENT_PIN,
             )
 
         warnings = [
@@ -2220,7 +2373,14 @@ class TestAutoTitleSlack:
         _mark_titled("sk-slow")
         with caplog.at_level(logging.DEBUG, logger="kiro_crew.messaging.auto_title"):
             await _maybe_auto_title_slack(
-                slack, TimingOutSessionManager(), "C1", "sk-slow", None, "help", "sure"
+                slack,
+                TimingOutSessionManager(),
+                "C1",
+                "sk-slow",
+                None,
+                "help",
+                "sure",
+                pin=_PRESENT_PIN,
             )
 
         assert not [
@@ -2242,7 +2402,16 @@ class TestAutoTitleSlack:
         sessions = FakeSessionManager()
         sessions._provider = FakeProvider([LLMEvent(kind="text_chunk", text="SKIP")])
         _mark_titled("sk2")
-        await _maybe_auto_title_slack(slack, sessions, "C1", "sk2", None, "hi", "hello")
+        await _maybe_auto_title_slack(
+            slack,
+            sessions,
+            "C1",
+            "sk2",
+            None,
+            "hi",
+            "hello",
+            pin=_PRESENT_PIN,
+        )
         title_actions = [a for a in slack.actions if a[0] == "set_thread_title"]
         assert len(title_actions) == 0
         assert "sk2" not in _titled_threads
@@ -2256,7 +2425,16 @@ class TestAutoTitleSlack:
         sessions = FakeSessionManager()
         sessions._provider = None  # will cause AttributeError
         _mark_titled("sk3")
-        await _maybe_auto_title_slack(slack, sessions, "C1", "sk3", None, "test", "test")
+        await _maybe_auto_title_slack(
+            slack,
+            sessions,
+            "C1",
+            "sk3",
+            None,
+            "test",
+            "test",
+            pin=_PRESENT_PIN,
+        )
         assert "sk3" not in _titled_threads
 
     @pytest.mark.asyncio
@@ -2276,6 +2454,7 @@ class TestAutoTitleSlack:
             None,
             'parse this: {"key": "value"}',
             "sure, here's the parsed output",
+            pin=_PRESENT_PIN,
         )
         title_actions = [a for a in slack.actions if a[0] == "set_thread_title"]
         assert len(title_actions) == 1
@@ -2849,7 +3028,7 @@ class TestCompactCommand:
     async def test_compact_declined_on_auto_managed_backend(self):
         # A backend that cannot serve /compact (the provider names it via
         # manual_compact_unsupported_backend) gets the informational reply and
-        # compact() is NEVER dispatched (#8156).
+        # compact() is NEVER dispatched.
         provider = self._make_provider_with_compact()
         calls = []
 
@@ -3081,6 +3260,435 @@ class TestStopReasonCompactionFailed:
         assert any(
             r.startswith("reset:") for r in sessions.removed
         ), f"no session reset after COMPACTION_FAILED: {sessions.removed}"
+
+
+class _SequencedProvider(FakeProvider):
+    """A provider whose successive ``stream`` calls play different scripts.
+
+    The first script ends in the synthetic COMPACTION_FAILED completion; what
+    the next one does is the test's choice. ``transient`` is the ACP layer's
+    verdict on WHY compaction failed (``None`` models a provider that predates
+    the attribute).
+    """
+
+    def __init__(self, scripts, *, transient):
+        super().__init__()
+        self._scripts = list(scripts)
+        #: Turns of the USER's message only. The handler also streams a
+        #: session-naming prompt on a new session (auto-title); that is not an
+        #: attempt and plays no script.
+        self.turns = 0
+        self.turn_prompts: list[str] = []
+        if transient is not None:
+            self.last_compaction_transient = transient
+
+    #: Prompts that are the user's turn: the bare text (no context builder) or a
+    #: built prompt carrying it -- never the auto-title prompt, which quotes it.
+    def _is_turn(self, message: str) -> bool:
+        return "hello" in message and not message.startswith("You are a session naming agent")
+
+    async def stream(self, message, timeout=120.0):
+        if not self._is_turn(message):
+            async for event in super().stream(message, timeout):
+                yield event
+            return
+        self.turn_prompts.append(message)
+        script = self._scripts[min(self.turns, len(self._scripts) - 1)]
+        self.turns += 1
+        for event in script:
+            yield event
+
+
+def _visible_texts(slack):
+    """Every text the thread saw: fresh posts and edits of the placeholder."""
+    return [a[1]["text"] for a in slack.actions if a[0] in ("post", "update")]
+
+
+def _abandoned():
+    from kiro_crew.acp.types import STOP_REASON_COMPACTION_FAILED
+
+    return [LLMEvent(kind="complete", stop_reason=STOP_REASON_COMPACTION_FAILED)]
+
+
+def _answered():
+    return [LLMEvent(kind="text_chunk", text="The answer is 42"), LLMEvent(kind="complete")]
+
+
+class TestTransientCompactionRetry:
+    """A turn abandoned after a TRANSIENT compaction failure -- a throttled or
+    5xx'd summarization call, nothing wrong with the message -- is replayed
+    instead of dropped. Slack's replay is a nested ``handle_message`` call with
+    every argument unchanged, running inside the original task: it resolves the
+    same session, keeps the same activation and pinning, can still read the
+    attachment files the text refers to, and needs no queue drain from whoever
+    dispatched the original. A permanent verdict keeps the give-up behaviour."""
+
+    @pytest.mark.asyncio
+    async def test_a_transient_failure_replays_the_message(self):
+        from kiro_crew.slack.handler import _COMPACTION_RETRY_NOTICE, _NO_RESPONSE
+
+        slack = MockSlackClient()
+        provider = _SequencedProvider([_abandoned(), _answered()], transient=True)
+        sessions = FakeSessionManager(provider)
+        log = MagicMock()
+
+        await handle_message(
+            slack, sessions, "C1", "hello", "thread1", "msg1", "U1", conversation_log=log
+        )
+
+        assert provider.turns == 2, "the same message is sent again"
+        assert "reset:thread1" in sessions.removed
+        assert sessions.keys_seen.count("thread1") == 2, "the replay acquires a fresh session"
+        texts = _visible_texts(slack)
+        assert any(_COMPACTION_RETRY_NOTICE in t for t in texts), texts
+        assert any("The answer is 42" in t for t in texts), texts
+        assert not any(_NO_RESPONSE in t for t in texts), texts
+        # The abandoned attempt persists nothing: the log carries the user's
+        # message exactly once, with the reply the replay produced.
+        user_rows = [c for c in log.append.call_args_list if c.args[1] == "user"]
+        assert len(user_rows) == 1, log.append.call_args_list
+        assert not any(
+            _COMPACTION_RETRY_NOTICE in str(c.args) for c in log.append.call_args_list
+        ), "the retry notice is shown, never recorded"
+        # ONE gap spans the whole replay, closed by the outer attempt once the
+        # nested call has settled and released its permit.
+        assert sessions.replay_gaps == [("open", "thread1"), ("close", "thread1")]
+
+    @pytest.mark.asyncio
+    async def test_a_permanent_failure_keeps_the_give_up_behaviour(self):
+        slack = MockSlackClient()
+        provider = _SequencedProvider([_abandoned(), _answered()], transient=False)
+        sessions = FakeSessionManager(provider)
+
+        await handle_message(slack, sessions, "C1", "hello", "thread1", "msg1", "U1")
+
+        assert provider.turns == 1, "a compaction that overflowed the window is not replayed"
+        assert "reset:thread1" in sessions.removed
+        assert sessions.keys_seen.count("thread1") == 1
+        assert sessions.replay_gaps == [("open", "thread1"), ("close", "thread1")]
+
+    @pytest.mark.asyncio
+    async def test_a_provider_without_a_verdict_is_not_read_as_transient(self):
+        slack = MockSlackClient()
+        provider = _SequencedProvider([_abandoned(), _answered()], transient=None)
+        sessions = FakeSessionManager(provider)
+
+        await handle_message(slack, sessions, "C1", "hello", "thread1", "msg1", "U1")
+
+        assert provider.turns == 1
+
+    @pytest.mark.asyncio
+    async def test_an_emitted_turn_is_not_replayed_even_when_transient(self):
+        """Verbatim replay is only safe before anything landed in the thread."""
+        slack = MockSlackClient()
+        provider = _SequencedProvider(
+            [[LLMEvent(kind="text_chunk", text="partial"), *_abandoned()], _answered()],
+            transient=True,
+        )
+        sessions = FakeSessionManager(provider)
+
+        await handle_message(slack, sessions, "C1", "hello", "thread1", "msg1", "U1")
+
+        assert provider.turns == 1
+        assert "reset:thread1" in sessions.removed
+
+    @pytest.mark.asyncio
+    async def test_the_budget_is_per_message_and_bounded(self):
+        """A throttle that keeps firing gets exactly ``_COMPACTION_FAILED_RETRIES``
+        replays; the attempt after the last one gives up and posts as the old
+        code did."""
+        import kiro_crew.slack.handler as handler_mod
+
+        budget = handler_mod._COMPACTION_FAILED_RETRIES
+        slack = MockSlackClient()
+        provider = _SequencedProvider([_abandoned()], transient=True)  # never recovers
+        sessions = FakeSessionManager(provider)
+
+        await handle_message(slack, sessions, "C1", "hello", "thread1", "msg1", "U1")
+
+        assert provider.turns == budget + 1
+        assert sessions.removed.count("reset:thread1") == budget + 1
+        assert sessions.replay_gaps[-1] == ("close", "thread1"), "the gap never outlives the turn"
+        from kiro_crew.slack.handler import _NO_RESPONSE
+
+        assert any(_NO_RESPONSE in t for t in _visible_texts(slack)), "the last attempt posts"
+
+    @pytest.mark.asyncio
+    async def test_a_cancellation_during_the_reset_still_closes_the_gap(self):
+        """``!stop`` cancels the handler task; landing in the reset await, that
+        skips every close inside the try. A gap left open would make every later
+        claim on this key wait forever, so the outer ``finally`` closes it."""
+
+        class _CancelInReset(FakeSessionManager):
+            async def reset(self, key):
+                await super().reset(key)
+                raise asyncio.CancelledError()
+
+        slack = MockSlackClient()
+        provider = _SequencedProvider([_abandoned(), _answered()], transient=True)
+        sessions = _CancelInReset(provider)
+
+        with pytest.raises(asyncio.CancelledError):
+            await handle_message(slack, sessions, "C1", "hello", "thread1", "msg1", "U1")
+
+        assert sessions.replay_gaps[0] == ("open", "thread1")
+        assert sessions.replay_gaps[-1] == ("close", "thread1")
+
+    @pytest.mark.asyncio
+    async def test_a_stop_during_the_reset_gap_keeps_the_message_dropped(self):
+        """A ``!stop`` landing while the abandoned session is being reset finds
+        no session to cancel. The manager records it inside the replay gap the
+        handler opens before the reset; the replay re-reads the count right
+        before it would open a prompt and ends without one."""
+
+        class _StopInGap(FakeSessionManager):
+            async def reset(self, key):
+                await super().reset(key)
+                assert ("open", key) in getattr(self, "replay_gaps", []), "gap opens before reset"
+                self._stop_gen = getattr(self, "_stop_gen", 0) + 1
+
+        slack = MockSlackClient()
+        provider = _SequencedProvider([_abandoned(), _answered()], transient=True)
+        sessions = _StopInGap(provider)
+
+        await handle_message(slack, sessions, "C1", "hello", "thread1", "msg1", "U1")
+
+        assert provider.turns == 1, "the stopped message must not run again"
+        assert sessions.keys_seen.count("thread1") == 2, "the replay acquired, then bailed"
+        assert not any("The answer is 42" in t for t in _visible_texts(slack))
+        assert sessions.replay_gaps[0] == ("open", "thread1")
+        assert sessions.replay_gaps[-1] == ("close", "thread1")
+
+    @pytest.mark.asyncio
+    async def test_a_hook_reply_persists_only_after_the_replay_gap_resolves(self):
+        """A hook auto-reply acquires no session, so ``get_or_create``'s wait on
+        the replay gap never fences it. Posted into a thread whose older message
+        sits between its reset and its replay, its record would file AHEAD of
+        the replayed turn the thread saw first. The canned reply still posts at
+        once; the conversation log is written only once the gap owner settled."""
+
+        class _GapSessions(FakeSessionManager):
+            def __init__(self, provider):
+                super().__init__(provider)
+                self.gap = asyncio.Event()
+                self.waited: list[str] = []
+
+            async def await_replay_gap(self, key):
+                self.waited.append(key)
+                await self.gap.wait()
+
+        slack = MockSlackClient()
+        sessions = _GapSessions(FakeProvider())
+        log = MagicMock()
+        builder = MagicMock()
+        builder.hooks.on_message = MagicMock(
+            return_value=MagicMock(action=HOOK_REPLY, text="canned answer")
+        )
+
+        task = asyncio.create_task(
+            handle_message(
+                slack,
+                sessions,
+                "C1",
+                "ping",
+                "thread1",
+                "msg1",
+                "U1",
+                context_builder=builder,
+                conversation_log=log,
+            )
+        )
+        # The turn parks on the gap (real thread hops precede the hook check).
+        for _ in range(200):
+            if sessions.waited:
+                break
+            await asyncio.sleep(0.01)
+        assert sessions.waited == ["thread1"]
+        assert any("canned answer" in t for t in _visible_texts(slack)), "the reply posts at once"
+        assert log.append.call_count == 0, "the record must wait for the replay to settle"
+        assert not task.done()
+
+        sessions.gap.set()
+        await asyncio.wait_for(task, 5)
+        user_rows = [c for c in log.append.call_args_list if c.args[1] == "user"]
+        assert len(user_rows) == 1, log.append.call_args_list
+        assert sessions.keys_seen == [], "a hook reply acquires no session"
+
+    @pytest.mark.asyncio
+    async def test_a_stop_with_no_session_is_still_recorded_on_the_manager(self):
+        """The handler's ``!stop`` fallback answers "Nothing running." when the
+        key has no session -- which is exactly the state of a turn between its
+        abandoned attempt and its compaction replay. The Stop is recorded on
+        the manager BEFORE that check, so the replay can see it."""
+
+        class _NotingSessions(FakeSessionManager):
+            def __init__(self, provider, owner=None):
+                super().__init__(provider)
+                self.noted: list[str] = []
+                self.owner = owner
+
+            def note_stop(self, key):
+                self.noted.append(key)
+                return True
+
+            def get_session_for_thread(self, thread_ts):
+                return self.owner
+
+        set_owner_id("U_OWNER")
+        set_allowed_users({"U_OWNER"})
+        slack = MockSlackClient()
+        sessions = _NotingSessions(FakeProvider())
+
+        await handle_message(slack, sessions, "C1", "!stop", "thread1", "msg1", "U_OWNER")
+
+        assert sessions.noted == ["thread1"]
+        assert any("Nothing running" in t for t in _visible_texts(slack))
+
+        # A linked thread records against the session that OWNS the thread --
+        # the key its turns and their replay actually run under.
+        slack = MockSlackClient()
+        sessions = _NotingSessions(FakeProvider(), owner="dashboard:chat-7")
+        await handle_message(slack, sessions, "C1", "!stop", "thread1", "msg1", "U_OWNER")
+        assert sessions.noted == ["dashboard:chat-7"]
+
+    @pytest.mark.asyncio
+    async def test_a_thinking_only_attempt_takes_its_placeholder_down_before_replaying(
+        self, monkeypatch
+    ):
+        """Reasoning is not output that a replay could duplicate, so a
+        thinking-only abandoned attempt IS replayed -- but the 💭 placeholder it
+        posted above where its answer would have gone must not stay behind, and
+        its reaction ladder / stall watchdog must be finalized before the nested
+        call takes over the Slack message."""
+        import dataclasses
+
+        from kiro_crew.config.loader import KiroCrewConfig
+
+        _real_cfg = KiroCrewConfig.load()
+        # The real ``agent`` section, not a stub of it: ``handler._get_default_agent``
+        # reads ``load().agent.default_agent`` and caches it in a module global, so a
+        # config object carrying only ``slack`` raises unless some earlier test in the
+        # same process happened to warm that cache first.
+        monkeypatch.setattr(
+            "kiro_crew.slack.handler.KiroCrewConfig.load",
+            lambda: dataclasses.replace(
+                _real_cfg,
+                slack=dataclasses.replace(
+                    _real_cfg.slack, show_thinking=True, reactions_enabled=False
+                ),
+            ),
+        )
+        slack = MockSlackClient()
+        provider = _SequencedProvider(
+            [[LLMEvent(kind="thinking_chunk", text="hmm"), *_abandoned()], _answered()],
+            transient=True,
+        )
+        sessions = FakeSessionManager(provider)
+
+        await handle_message(slack, sessions, "C1", "hello", "thread1", "msg1", "U1")
+
+        assert provider.turns == 2, "a thinking-only attempt is still replayable"
+        posted_thinking = [
+            a[1]["ts"] for a in slack.actions if a[0] == "post" and "💭" in a[1]["text"]
+        ]
+        deleted = [a[1]["ts"] for a in slack.actions if a[0] == "delete"]
+        assert posted_thinking, "the abandoned attempt reserved a reasoning slot"
+        assert posted_thinking[0] in deleted, "and the replay took it down"
+
+    @pytest.mark.asyncio
+    async def test_the_replay_reruns_the_users_text_not_the_cancelled_turn_preamble(self):
+        """After a soft-cancel the first attempt folds a cancelled-turn preamble
+        into the prompt it sends the model. The replay must re-run what the user
+        TYPED: the nested call derives its own preamble from its own one-shot
+        gate (already consumed here, so none), and the conversation log records
+        the user's text, never the preamble a previous attempt prepended."""
+        from types import SimpleNamespace
+
+        from kiro_crew.context import ContextBuilder
+
+        log = MagicMock()
+        log.get_metadata.return_value = {}
+        log.get_metadata_status.return_value = ({}, True)
+        log.recent.return_value = [
+            {"role": "user", "content": "earlier question"},
+            {"role": "assistant", "content": "earlier partial answer"},
+        ]
+        ctx = ContextBuilder(conversation_log=log)
+        slack = MockSlackClient()
+        provider = _SequencedProvider([_abandoned(), _answered()], transient=True)
+        sessions = FakeSessionManager(provider)
+        sessions._sessions = {
+            "thread1": SimpleNamespace(prev_turn_cancelled=True, provider=provider)
+        }
+
+        await handle_message(
+            slack,
+            sessions,
+            "C1",
+            "hello",
+            "thread1",
+            "msg1",
+            "U1",
+            context_builder=ctx,
+            conversation_log=log,
+        )
+
+        assert provider.turns == 2
+        first, replay = provider.turn_prompts
+        assert "earlier question" in first, "the abandoned attempt carried the preamble"
+        assert "earlier question" not in replay, "the replay re-ran the user's text alone"
+        user_rows = [c.args[2] for c in log.append.call_args_list if c.args[1] == "user"]
+        assert user_rows == ["hello"], user_rows
+
+    @pytest.mark.asyncio
+    async def test_the_replay_carries_every_argument_of_the_original(self, monkeypatch):
+        """Pinning, activation, asker and action context all travel with the
+        replay -- that is what makes a nested call Slack's own replay rather than
+        a re-dispatch that forgets how the message arrived."""
+        import kiro_crew.slack.handler as handler_mod
+
+        seen: list[dict] = []
+        real = handler_mod.handle_message
+
+        async def _recording(*args, **kwargs):
+            if kwargs.get("_compaction_replay") is not None:
+                seen.append({"args": args, **kwargs})
+                return None
+            return await real(*args, **kwargs)
+
+        monkeypatch.setattr(handler_mod, "handle_message", _recording)
+        slack = MockSlackClient()
+        provider = _SequencedProvider([_abandoned()], transient=True)
+        sessions = FakeSessionManager(provider)
+
+        await real(
+            slack,
+            sessions,
+            "C1",
+            "hello",
+            "thread1",
+            "msg1",
+            "U1",
+            team_id="T1",
+            channel_agent="ops",
+            user_display_name="Alice",
+            action_context="clicked a button",
+            channel_activation="review",
+            from_trusted_bot=True,
+            had_voice_input=True,
+        )
+
+        assert len(seen) == 1
+        call = seen[0]
+        assert call["args"] == (slack, sessions, "C1", "hello", "thread1", "msg1", "U1")
+        assert call["team_id"] == "T1"
+        assert call["channel_agent"] == "ops"
+        assert call["user_display_name"] == "Alice"
+        assert call["action_context"] == "clicked a button"
+        assert call["channel_activation"] == "review"
+        assert call["from_trusted_bot"] is True
+        assert call["had_voice_input"] is True
+        assert call["_compaction_replay"].attempt == 1
 
 
 class TestBuildTimingFooter:
@@ -3512,6 +4120,86 @@ class TestToolElapsedTimer:
         assert all("⏱" not in d for d in details_list), f"⏱ leaked into details: {details_list}"
 
 
+class _TaskCardRefusedSlack(MockSlackClient):
+    """append_task is refused; every other call is healthy.
+
+    The shape of a long tool phase meeting a Slack rate limit: the elapsed-time
+    refresh is the only thing touching the stream and Slack turns it down.
+    """
+
+    async def append_task(self, channel, ts, task_id, title, status, details="", output=""):
+        await super().append_task(
+            channel, ts, task_id, title, status, details=details, output=output
+        )
+        return False
+
+
+class _StreamAppendRefusedOnceSlack(MockSlackClient):
+    """The first append_stream is refused, so real text forces one rotation."""
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self._n_append = 0
+
+    async def append_stream(self, channel, ts, text):
+        self._n_append += 1
+        await super().append_stream(channel, ts, text)
+        return self._n_append > 1
+
+
+class TestTaskCardNeverAbandonsTheStream:
+    """A refused task card must not cost the reader their in-progress message.
+
+    Rotating on a task-card failure stops the stream the reader is watching and
+    continues the same answer in a NEW message, so the thread reads as a reply
+    that failed followed minutes later by an unexplained second reply. A task
+    card is decoration, so skipping it withholds no answer text;
+    ``_append_stream`` still rotates when real text is refused.
+    """
+
+    @pytest.mark.asyncio
+    async def test_refused_task_card_does_not_open_a_second_stream(self):
+        slack = _TaskCardRefusedSlack()
+        slack._stream_enabled = True
+        provider = FakeProvider(
+            [
+                LLMEvent(kind="text_chunk", text="looking"),
+                LLMEvent(kind="tool_call", title="Run Shell", tool_kind="execute"),
+                LLMEvent(kind="text_chunk", text=" done"),
+            ]
+        )
+        sessions = FakeSessionManager(provider)
+        await handle_message(slack, sessions, "C1", "do it", None, "msg1", "U1")
+
+        starts = [a for a in slack.actions if a[0] == "start_stream"]
+        assert len(starts) == 1, slack.actions
+        assert [a for a in slack.actions if a[0] == "append_task"], slack.actions
+        # One stream opened, one stopped: the answer stayed in a single message.
+        stops = [a for a in slack.actions if a[0] == "stop_stream"]
+        assert len(stops) == 1, slack.actions
+        assert stops[0][1]["ts"] == starts[0][1]["ts"], slack.actions
+
+    @pytest.mark.asyncio
+    async def test_refused_real_text_still_rotates_and_says_it_continues(self):
+        """The branch that protects answer delivery is untouched, and the
+        replacement stream opens with the continuation marker so the two
+        messages read as one answer."""
+        slack = _StreamAppendRefusedOnceSlack()
+        slack._stream_enabled = True
+        # Trailing space: StreamRedactor withholds a trailing credential-class
+        # run, so a chunk with no separator never reaches append_stream at all.
+        provider = FakeProvider([LLMEvent(kind="text_chunk", text="hello ")])
+        sessions = FakeSessionManager(provider)
+        await handle_message(slack, sessions, "C1", "hi", None, "msg1", "U1")
+
+        starts = [a for a in slack.actions if a[0] == "start_stream"]
+        assert len(starts) == 2, slack.actions
+        assert starts[0][1]["text"] is None, starts
+        # The literal, not the constant: a test that imports the constant still
+        # passes when the marker is emptied out.
+        assert "continued" in (starts[1][1]["text"] or ""), starts
+
+
 class TestCondenseThinking:
     """Unit tests for the _condense_thinking blockquote/truncation helper."""
 
@@ -3590,6 +4278,36 @@ class _ApprovingProvider:
 
     async def approve_tool(self, request_id: str) -> None:
         self.approved.append(request_id)
+
+
+class _FloorRefusingProvider:
+    """approve_tool answers False: the transport's gate refused the call."""
+
+    def __init__(self) -> None:
+        self.approved: list[str] = []
+
+    async def approve_tool(self, request_id: str) -> bool:
+        self.approved.append(request_id)
+        return False
+
+
+class TestSlackApproveTransportFloor:
+    @pytest.mark.asyncio
+    async def test_approve_click_refused_by_floor_returns_reject(self):
+        """The card must not be relabelled as approved when approve_tool refused."""
+        from kiro_crew.slack.handler import _ACTION_REJECT, _OUTCOME_REJECTED, _PendingApproval
+
+        set_owner_id("U1")
+        set_allowed_users({"U1"})
+        prov = _FloorRefusingProvider()
+        pending = _PendingApproval(prov, "req-floor", session_key="chat-floor")
+        _pending_approvals["C1:tsf"] = pending
+
+        result = await handle_interaction("C1", "tsf", "approve_tool", user_id="U1")
+
+        assert result == _ACTION_REJECT
+        assert prov.approved == ["req-floor"]
+        assert pending.future.result() == _OUTCOME_REJECTED
 
 
 class TestSlackTrustSubagentPropagation:
@@ -3692,3 +4410,418 @@ class TestPerSessionTrust:
     def test_add_trusted_session_empty_key_is_noop(self):
         add_trusted_session("")
         assert "" not in _trusted_sessions
+
+
+class TestLiveTurnPresentationFailure:
+    """A presentation-side Slack call that raises mid-run must not flip the
+    placeholder to the terminal "🔧 Something went wrong" message nor record a
+    session failure while the ACP turn is still live and will finish with the
+    correct, complete reply.
+
+    The exposed calls run on the first ``tool_call`` event, before any text has
+    streamed, so ``accumulated`` is empty. A non-ACP raise there is not caught by
+    the typed ``except`` arms (all ``kiro_crew.acp.client`` errors) and would
+    reach the generic ``except Exception`` catch-all, which renders the terminal
+    error and records a failure. These tests assert the raise is swallowed and
+    the turn still delivers.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _ensure_reactions_enabled(self, monkeypatch):
+        import dataclasses
+
+        from kiro_crew.config.loader import KiroCrewConfig
+
+        _real_load = KiroCrewConfig.load
+
+        def _patched_load():
+            cfg = _real_load()
+            return dataclasses.replace(
+                cfg, slack=dataclasses.replace(cfg.slack, reactions_enabled=True)
+            )
+
+        monkeypatch.setattr(KiroCrewConfig, "load", _patched_load)
+
+    @pytest.mark.asyncio
+    async def test_progress_card_raise_does_not_render_terminal_error(self):
+        # A slack client whose progress-card call raises like a real Slack API
+        # refusal / rate limit — NOT swallowed internally, so it propagates into
+        # the handler's loop exactly as a non-swallowing client would.
+        class RaisingCardSlack(MockSlackClient):
+            def __init__(self):
+                super().__init__()
+                self._stream_enabled = True  # take the Slack streaming path
+
+            async def append_task(self, *a, **kw):
+                raise RuntimeError("ratelimited: chat.appendStream")
+
+        # A FakeSessionManager that records whether the turn was marked failed.
+        class TrackingSessions(FakeSessionManager):
+            def __init__(self, provider):
+                super().__init__(provider)
+                self.record_failure_calls = 0
+                self.record_success_calls = 0
+
+            async def record_failure(self, key):
+                self.record_failure_calls += 1
+                return False
+
+            def record_success(self, key):
+                self.record_success_calls += 1
+
+        slack = RaisingCardSlack()
+        # tool_call FIRST (accumulated empty at the raise), then the real reply.
+        provider = FakeProvider(
+            [
+                LLMEvent(
+                    kind="tool_call",
+                    title="Running: grep",
+                    tool_kind="execute",
+                    tool_purpose="searching the repo",
+                ),
+                LLMEvent(kind="text_chunk", text="The answer is 42"),
+            ]
+        )
+        sessions = TrackingSessions(provider)
+
+        await handle_message(slack, sessions, "C1", "do something slow", None, "msg1", "U1")
+
+        # 1. The turn was NOT recorded as a failure — a cosmetic card refusal is
+        #    not the turn dying.
+        assert sessions.record_failure_calls == 0
+        # 2. The terminal error string was never sent to Slack on any surface.
+        all_text = " ".join(
+            str(a[1].get("text") or "")
+            for a in slack.actions
+            if a[0] in ("post", "update", "append_stream", "stop_stream")
+        )
+        assert "Something went wrong" not in all_text, slack.actions
+        # 3. The real reply still reached the user.
+        assert "The answer is 42" in all_text, slack.actions
+        # 4. The turn completed successfully.
+        assert sessions.record_success_calls == 1
+
+    @pytest.mark.asyncio
+    async def test_stream_start_and_fallback_both_fail_still_posts_reply(self):
+        """The one sub-path the card test does not reach: streaming is on, but
+        ``start_stream`` demotes (returns None) AND the ``chat.update`` fallback
+        ``post_message`` raises. ``_ensure_stream_started`` must leave
+        ``stream_ts`` falsy so end of turn posts the accumulated reply directly —
+        NOT route through the placeholder-edit branch against a ts that does not
+        exist (which loses a single-part reply silently while recording success).
+        """
+
+        class DemotedThenRaisingSlack(MockSlackClient):
+            def __init__(self):
+                super().__init__()
+                self._stream_enabled = True
+                self._real_ts: set[str] = set()
+
+            async def start_stream(self, *a, **kw):
+                # Demote: chat.startStream unavailable → non-streaming fallback.
+                return None
+
+            async def post_message(self, channel, text, thread_ts=None, **kw):
+                # The ``chat.update`` placeholder fallback goes through the base
+                # ``post_message`` and raises on a Slack refusal. The FINAL answer
+                # post is a separate call with the real reply text and must still
+                # go through, so only the placeholder text is refused.
+                if text == _THINKING:
+                    raise RuntimeError("channel_not_found: chat.postMessage")
+                ts = await super().post_message(channel, text, thread_ts=thread_ts, **kw)
+                self._real_ts.add(ts)
+                return ts
+
+            async def update_message(self, channel, ts, text):
+                # Editing a message that was never posted fails, exactly as the
+                # Slack API rejects chat.update against a non-existent ts. The
+                # handler swallows that at debug, so a reply routed here instead
+                # of to a fresh post_message is lost silently — which is the
+                # data-loss defect the buggy truthy sentinel introduced.
+                if ts not in self._real_ts:
+                    raise RuntimeError(f"message_not_found: chat.update ts={ts}")
+                return await super().update_message(channel, ts, text)
+
+        class TrackingSessions(FakeSessionManager):
+            def __init__(self, provider):
+                super().__init__(provider)
+                self.record_failure_calls = 0
+                self.record_success_calls = 0
+
+            async def record_failure(self, key):
+                self.record_failure_calls += 1
+                return False
+
+            def record_success(self, key):
+                self.record_success_calls += 1
+
+        slack = DemotedThenRaisingSlack()
+        # tool_call FIRST so _ensure_stream_started runs with accumulated empty,
+        # then a single-part reply — the part that must not be lost.
+        provider = FakeProvider(
+            [
+                LLMEvent(
+                    kind="tool_call",
+                    title="Running: grep",
+                    tool_kind="execute",
+                    tool_purpose="searching the repo",
+                ),
+                LLMEvent(kind="text_chunk", text="The answer is 42"),
+            ]
+        )
+        sessions = TrackingSessions(provider)
+
+        await handle_message(slack, sessions, "C1", "do something slow", None, "msg1", "U1")
+
+        # The reply must arrive via a real ``post`` (the end-of-turn else branch),
+        # NOT an ``update`` against a bogus placeholder ts — an update there is
+        # swallowed and the single-part reply is lost. Asserting specifically on
+        # ``post`` is what makes the truthy-sentinel regression fail this test.
+        reply_posts = [str(a[1].get("text") or "") for a in slack.actions if a[0] == "post"]
+        assert any("The answer is 42" in p for p in reply_posts), slack.actions
+        # No terminal error, and the turn is not falsely failed.
+        all_text = " ".join(
+            str(a[1].get("text") or "")
+            for a in slack.actions
+            if a[0] in ("post", "update", "stop_stream")
+        )
+        assert "Something went wrong" not in all_text, slack.actions
+        assert sessions.record_failure_calls == 0
+
+
+class TestStreamingLoopPresentationGuards:
+    """Presentation-guard sweep: every remaining presentation-side Slack
+    call inside the streaming loop must be best-effort. The real ``SlackClient``
+    swallows its own API errors, but a client or transport that raises instead
+    would escape into the generic ``except Exception`` catch-all (the typed arms
+    are all ``kiro_crew.acp.client`` errors), rendering the terminal
+    "🔧 Something went wrong" message and recording a session failure on a turn
+    that is still live. Each test drives one guarded site with a raising client
+    and asserts: no failure recorded, no terminal placeholder, reply delivered.
+    """
+
+    class _TrackingSessions(FakeSessionManager):
+        def __init__(self, provider):
+            super().__init__(provider)
+            self.record_failure_calls = 0
+            self.record_success_calls = 0
+
+        async def record_failure(self, key):
+            self.record_failure_calls += 1
+            return False
+
+        def record_success(self, key):
+            self.record_success_calls += 1
+
+    @staticmethod
+    def _all_text(slack) -> str:
+        return " ".join(
+            str(a[1].get("text") or "")
+            for a in slack.actions
+            if a[0] in ("post", "update", "append_stream", "stop_stream")
+        )
+
+    @pytest.mark.asyncio
+    async def test_set_thread_status_raise_in_tool_and_text_branches(self):
+        """``set_thread_status`` raises in the TOOL_CALL branch (tool status) and
+        again in the TEXT_CHUNK branch (the ``_status_dirty`` reset): both are
+        decoration and must be swallowed."""
+
+        class RaisingStatusSlack(MockSlackClient):
+            def __init__(self):
+                super().__init__()
+                self._stream_enabled = True
+                self.status_raises = 0
+
+            async def set_thread_status(self, *a, **kw):
+                # Out-of-scope calls for this sweep: the pre-loop base-status
+                # call (before the stream opens) and the end-of-turn/error-path
+                # status CLEARS (empty status). Raise only on the in-loop
+                # TOOL_CALL / TEXT_CHUNK branch calls this sweep guards —
+                # non-empty statuses sent after the stream opened.
+                status = a[2] if len(a) > 2 else kw.get("status", "")
+                if not status or not any(m == "start_stream" for m, _ in self.actions):
+                    return await super().set_thread_status(*a, **kw)
+                self.status_raises += 1
+                raise RuntimeError("ratelimited: assistant.threads.setStatus")
+
+        slack = RaisingStatusSlack()
+        # tool_call hits the TOOL_CALL-branch status; the following text chunk
+        # (with _status_dirty=True) hits the TEXT_CHUNK-branch reset.
+        provider = FakeProvider(
+            [
+                LLMEvent(
+                    kind="tool_call",
+                    title="Running: grep",
+                    tool_kind="execute",
+                    tool_purpose="searching the repo",
+                ),
+                LLMEvent(kind="text_chunk", text="The answer is 42"),
+            ]
+        )
+        sessions = self._TrackingSessions(provider)
+
+        await handle_message(slack, sessions, "C1", "do something slow", None, "msg1", "U1")
+
+        assert slack.status_raises >= 2, slack.actions  # both branches actually fired
+        assert sessions.record_failure_calls == 0
+        all_text = self._all_text(slack)
+        assert "Something went wrong" not in all_text, slack.actions
+        assert "The answer is 42" in all_text, slack.actions
+        assert sessions.record_success_calls == 1
+
+    @pytest.mark.asyncio
+    async def test_wait_finalize_stop_stream_raise(self):
+        """``stop_stream`` raising at the wait-tool finalize must not fail the
+        turn: the stream is abandoned either way and the next chunk reopens a
+        fresh one. Only the finalize call (no ``final_text``) raises — the
+        end-of-turn delivery call carries the reply and stays live."""
+
+        class RaisingFinalizeSlack(MockSlackClient):
+            def __init__(self):
+                super().__init__()
+                self._stream_enabled = True
+                self.finalize_raises = 0
+
+            async def stop_stream(self, channel, ts, final_text=None):
+                if final_text is None:
+                    self.finalize_raises += 1
+                    raise RuntimeError("message_not_found: chat.stopStream")
+                return await super().stop_stream(channel, ts, final_text)
+
+        slack = RaisingFinalizeSlack()
+        provider = FakeProvider(
+            [
+                LLMEvent(
+                    kind="tool_call",
+                    title="Running: wait",
+                    tool_kind="execute",
+                    tool_purpose="waiting for CI",
+                ),
+                LLMEvent(kind="text_chunk", text="The answer is 42"),
+            ]
+        )
+        sessions = self._TrackingSessions(provider)
+
+        await handle_message(slack, sessions, "C1", "babysit the build", None, "msg1", "U1")
+
+        assert slack.finalize_raises >= 1, slack.actions  # the finalize path actually fired
+        assert sessions.record_failure_calls == 0
+        all_text = self._all_text(slack)
+        assert "Something went wrong" not in all_text, slack.actions
+        assert "The answer is 42" in all_text, slack.actions
+        assert sessions.record_success_calls == 1
+
+    @pytest.mark.asyncio
+    async def test_append_stream_raise_with_failed_rotation(self):
+        """``append_stream`` raising (instead of returning False) must route into
+        the existing rotation path, and the rotation's own ``start_stream``
+        raising must demote to chat.update — never escape to the catch-all. The
+        reply is still delivered from ``accumulated`` at end of turn."""
+
+        class RaisingAppendSlack(MockSlackClient):
+            def __init__(self):
+                super().__init__()
+                self._stream_enabled = True
+                self._started_once = False
+                self.append_raises = 0
+
+            async def start_stream(self, *a, **kw):
+                # First open succeeds (streaming path taken); the rotation's
+                # reopen raises like a transport failure.
+                if self._started_once:
+                    raise RuntimeError("fatal_error: chat.startStream")
+                self._started_once = True
+                return await super().start_stream(*a, **kw)
+
+            async def append_stream(self, *a, **kw):
+                self.append_raises += 1
+                raise RuntimeError("ratelimited: chat.appendStream")
+
+        slack = RaisingAppendSlack()
+        provider = FakeProvider([LLMEvent(kind="text_chunk", text="The answer is 42")])
+        sessions = self._TrackingSessions(provider)
+
+        await handle_message(slack, sessions, "C1", "hello", None, "msg1", "U1")
+
+        assert slack.append_raises >= 1, slack.actions  # the guarded site actually fired
+        assert sessions.record_failure_calls == 0
+        all_text = self._all_text(slack)
+        assert "Something went wrong" not in all_text, slack.actions
+        assert "The answer is 42" in all_text, slack.actions
+        assert sessions.record_success_calls == 1
+
+    @pytest.mark.asyncio
+    async def test_append_retry_raise_after_successful_rotation_still_delivers(self):
+        """Rotation SUCCEEDS but the retry append raises too, and EVERY append
+        on the turn is refused: the raise still maps onto the refused-append
+        outcome — the turn stays live and shows no terminal error — but a stream
+        that delivered no text at all did not reach the reader, so the verdict is
+        a failure, not a success booked from the mere fact a stream was opened.
+        (Re-delivering a dropped delta on a stream that DID land text is the
+        delivery-debt follow-up, deliberately out of this sweep's scope.)"""
+
+        class AlwaysRaisingAppendSlack(MockSlackClient):
+            def __init__(self):
+                super().__init__()
+                self._stream_enabled = True
+                self.append_raises = 0
+
+            async def append_stream(self, *a, **kw):
+                self.append_raises += 1
+                raise RuntimeError("ratelimited: chat.appendStream")
+
+        slack = AlwaysRaisingAppendSlack()
+        provider = FakeProvider([LLMEvent(kind="text_chunk", text="The answer is 42")])
+        sessions = self._TrackingSessions(provider)
+
+        await handle_message(slack, sessions, "C1", "hello", None, "msg1", "U1")
+
+        # Both the first append and the post-rotation retry fired and raised.
+        assert slack.append_raises >= 2, slack.actions
+        # No terminal error surfaces: the appends are swallowed, not escalated to
+        # the catch-all, so the turn completes cleanly.
+        all_text = self._all_text(slack)
+        assert "Something went wrong" not in all_text, slack.actions
+        # But nothing was delivered, so the single verdict is a failure.
+        assert sessions.record_success_calls == 0, slack.actions
+        assert sessions.record_failure_calls == 1
+
+    @pytest.mark.asyncio
+    async def test_initial_start_stream_raise_demotes_to_fallback(self):
+        """The lazy first ``start_stream`` in ``_ensure_stream_started`` raising
+        must demote to the chat.update path exactly like a ``None`` return —
+        not escape to the catch-all from the first event."""
+
+        class RaisingStartSlack(MockSlackClient):
+            def __init__(self):
+                super().__init__()
+                self._stream_enabled = True
+                self.start_raises = 0
+
+            async def start_stream(self, *a, **kw):
+                self.start_raises += 1
+                raise RuntimeError("fatal_error: chat.startStream")
+
+        slack = RaisingStartSlack()
+        provider = FakeProvider(
+            [
+                LLMEvent(
+                    kind="tool_call",
+                    title="Running: grep",
+                    tool_kind="execute",
+                    tool_purpose="searching the repo",
+                ),
+                LLMEvent(kind="text_chunk", text="The answer is 42"),
+            ]
+        )
+        sessions = self._TrackingSessions(provider)
+
+        await handle_message(slack, sessions, "C1", "hello", None, "msg1", "U1")
+
+        assert slack.start_raises >= 1, slack.actions  # the guarded site actually fired
+        assert sessions.record_failure_calls == 0
+        all_text = self._all_text(slack)
+        assert "Something went wrong" not in all_text, slack.actions
+        assert "The answer is 42" in all_text, slack.actions
+        assert sessions.record_success_calls == 1

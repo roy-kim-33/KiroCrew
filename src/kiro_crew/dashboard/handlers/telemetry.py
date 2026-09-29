@@ -64,10 +64,12 @@ _STARTUP_METRIC = "kirocrew.session.startup.duration"
 # emitter naming the instrument differently is a silently empty panel.
 _TURN_METRIC = TURN_METRIC
 # The turn's two billing histograms. Claimed BY NAME below, ahead of the generic
-# histogram branch, because that branch reports every statistic under `*_ms`
-# keys: a credit or a dollar amount arriving there would be rendered as a
-# millisecond duration on the Telemetry page. They are reported inside the turn
-# block under unit-neutral keys instead, each carrying its own `unit`.
+# histogram branch, because they are reported inside the turn block with their
+# own attribution split, which the generic branch has no shape for. Their unit is
+# handled the same way every non-duration histogram's is: unit-neutral keys, each
+# carrying its own `unit`, never the `*_ms` keys the duration family uses. The
+# generic branch resolves which of its own names need that from
+# `_non_ms_histogram_units()`.
 _TURN_CREDITS_METRIC = TURN_CREDITS_METRIC
 _TURN_COST_METRIC = TURN_COST_METRIC
 # The end-to-end startup point. The claude path emits no ``phase`` attribute at
@@ -131,6 +133,34 @@ def _lifetime_total_gauge_names() -> "frozenset[str]":
     return _lifetime_total_gauges
 
 
+# Same first-use deferral, same reason: resolved inside the per-request path so
+# importing this module on the boot path does not pull the instrument modules in.
+_non_ms_units: "dict[str, str] | None" = None
+
+
+def _non_ms_histogram_units() -> "dict[str, str]":
+    """Generic-surface histograms that are NOT milliseconds, and their units.
+
+    ``_Hist.stats()`` names every field ``*_ms``, which is correct for the
+    duration family and a unit lie for anything else: a resident set reported as
+    ``p50_ms`` is rendered with a millisecond suffix by the frontend. The two
+    turn billing histograms avoid this by being claimed by name ahead of the
+    generic branch; a sampled histogram has no dedicated block to be claimed
+    into, so the generic branch reads this mapping and reports those under
+    unit-neutral keys instead.
+
+    The mapping lives with the emitter rather than here, for the reason the
+    lifetime-total roster does: the module that declares an instrument is the one
+    that knows what its reading means, so no unit is re-spelled by a reader.
+    """
+    global _non_ms_units
+    if _non_ms_units is None:
+        from kiro_crew.metrics.events import NON_MS_HISTOGRAM_UNITS
+
+        _non_ms_units = dict(NON_MS_HISTOGRAM_UNITS)
+    return _non_ms_units
+
+
 # Only terminal-fault outcomes count toward fault_rate. The two watchdog
 # recovery outcomes ("tool_stall" and "stale_recover") are NOT faults: a
 # recovered stall is re-driven in place and tracked separately under
@@ -152,13 +182,12 @@ def _lifetime_total_gauge_names() -> "frozenset[str]":
 # or "unknown" (minted by this aggregator for attribute-less points) — the
 # cross-module test enforces that, so a dead entry cannot linger and mislead
 # readers about what fault_rate counts.
-# "cancelled" is deliberately ABSENT, and its absence is a FIX rather than an
-# omission: a user cancel used to fold into "error", so every press of Stop
-# landed in this numerator and the one outcome the operator caused on purpose
-# was reported as the system failing. It now has its own label and stays out of
-# the numerator, while remaining in the DENOMINATOR alongside "ok" and the
-# recovered stalls — a cancelled turn did run, so removing it would shrink the
-# population fault_rate is a share of.
+# "cancelled" is deliberately ABSENT rather than omitted by accident: folding a
+# user cancel into "error" would put every press of Stop in this numerator and
+# report the one outcome the operator caused on purpose as the system failing. It
+# has its own label and stays out of the numerator, while remaining in the
+# DENOMINATOR alongside "ok" and the recovered stalls — a cancelled turn did run,
+# so removing it would shrink the population fault_rate is a share of.
 # "unclassified" is deliberately ABSENT: it marks a turn whose surface had no
 # stop reason to give (a bare TurnUsage at a helper call site), so counting it
 # would invent a fault for every clean background turn the moment this metric
@@ -308,8 +337,9 @@ class _Hist:
 
     Merging them positionally fabricates values. Two generations with the same
     bucket-count length would pass a naive length check while meaning entirely
-    different things — a pre-change sample sitting in the old ``+Inf`` bucket
-    would be added to the new ``+Inf`` bucket, and a 5s sample could be counted
+    different things — a sample from one generation sitting in its ``+Inf``
+    bucket would be added to the other's ``+Inf`` bucket, and a 5s sample could be
+    counted
     into a 5-minute bucket, letting ``_pct_from_buckets`` report a p90 that no
     turn ever took. Grouping also keeps ``count``/``sum``/``min``/``max``
     consistent with the percentiles: accumulating those across generations while
@@ -321,9 +351,9 @@ class _Hist:
     long as it out-counted the new one: right after a boundary change the window
     still holds up to ``_WINDOW_DAYS`` of old samples against a handful of new
     ones, so the OLD bounds would be reported — for the turn metric that means
-    continuing to serve the very ceiling-pinned percentiles this grouping exists
-    to eliminate, while omitting the new samples entirely. Recency makes the
-    change take effect on the first post-change sample. The reported population
+    serving the very ceiling-pinned percentiles this grouping exists to eliminate,
+    while omitting the new samples entirely. Recency makes a boundary change take
+    effect on the first sample after it. The reported population
     is then small but truthful, and ``count`` says so; fuller-but-wrong is the
     failure mode being fixed.
 
@@ -561,9 +591,9 @@ def _finite(raw: Any) -> float | None:
     ``_aggregate`` and every field ``_Hist.add`` consumes. Shards are
     external input and Python's ``json`` accepts ``Infinity``/``NaN``
     literals, so a bare ``float(...)`` admits values that poison sums and an
-    ``int(float(...))`` timestamp conversion raises ``OverflowError`` — four
-    review rounds landed in this branch before this invariant: every scalar
-    passes through here, and anything non-numeric or non-finite becomes None.
+    ``int(float(...))`` timestamp conversion raises ``OverflowError``. The
+    invariant: every scalar passes through here, and anything non-numeric or
+    non-finite becomes None.
     """
     try:
         v = float(raw)
@@ -848,12 +878,17 @@ def _other_series(
     this list renders the same order on every request.
     """
     out: list[dict[str, Any]] = []
+    non_ms = _non_ms_histogram_units()
     for name in sorted(other_hist):
-        s = other_hist[name].stats()
+        unit = non_ms.get(name)
+        s = _amount_stats(other_hist[name], unit) if unit else other_hist[name].stats()
         s.update({"name": name, "kind": "histogram"})
         splits = other_split.get(name)
         if splits:
-            s["splits"] = {sig: splits[sig].stats() for sig in sorted(splits)}
+            s["splits"] = {
+                sig: (_amount_stats(splits[sig], unit) if unit else splits[sig].stats())
+                for sig in sorted(splits)
+            }
         out.append(s)
     for name in sorted(other_ctr):
         rec = other_ctr[name]
@@ -1033,8 +1068,9 @@ def _aggregate(shard_paths: list[Path]) -> dict[str, Any]:
     # stream.
     other_cum: dict[str, dict[tuple[str, str, str], list[tuple[int, float]]]] = {}
     turn = _Hist()
-    # The turn's billed amount, kept OUT of other_hist so it is never reported
-    # under `*_ms` keys. Exactly one of the two is populated on a given host —
+    # The turn's billed amount, claimed by name so it is reported inside the turn
+    # block with its per-model attribution split, which the generic surface has no
+    # shape for. Exactly one of the two is populated on a given host —
     # the acp backend bills credits, claude_code bills dollars — so the other
     # reports an empty stat block, which reads as "this host does not bill here"
     # rather than as a measured zero.

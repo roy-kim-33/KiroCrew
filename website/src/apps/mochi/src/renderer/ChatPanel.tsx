@@ -19,6 +19,7 @@ import {
   Palette,
   PawPrint,
   Pin,
+  PinOff,
   RotateCcw,
   Settings,
   Shield,
@@ -37,8 +38,10 @@ import Markdown from 'react-markdown'
 import type { Components } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import rehypeRaw from 'rehype-raw'
-import { rehypeSanitize, remarkVerbatimUnknownTags } from '../../../../components/MarkdownRenderer'
-import { mdImageDestToPath } from '../../../../utils/fileTokens'
+import { rehypeSanitize, rehypeStableRootKeys, remarkVerbatimUnknownTags } from '../../../../components/MarkdownRenderer'
+import { capWhitespaceRuns, remarkBoundDepth, rehypeBoundRawDepth } from '../../../../utils/markdownDepthBound'
+import { mdImageDestToPath, normalizeWindowsPath } from '../../../../utils/fileTokens'
+import { copyToClipboard } from '../../../../utils/clipboard'
 import { classifyPlatform } from '../../../../hooks/useGatewayPlatform'
 import { useImeGuard } from '../../../../hooks/useImeGuard'
 import type { ChatMessage } from '../shared/types'
@@ -131,6 +134,17 @@ export const PinnedSidePanel: React.FC<PinnedSidePanelProps> = ({ pins, updatedP
           0%, 100% { opacity: 1; transform: scale(1); }
           50% { opacity: 0.6; transform: scale(0.85); }
         }
+        /* Chip row highlight + unpin reveal on hover OR keyboard focus. Using
+           :focus-within (not JS hover state) means the keyboard path matches the
+           pointer path with no extra handlers, and the always-rendered unpin
+           button — hidden here until reveal — is the chip's natural tab stop. */
+        .pin-chip:hover, .pin-chip:focus-within { background: rgba(255,255,255,0.07) !important; }
+        .pin-chip-unpin { opacity: 0; pointer-events: none; transition: opacity 0.15s ease; }
+        .pin-chip:hover .pin-chip-unpin,
+        .pin-chip:focus-within .pin-chip-unpin { opacity: 1; pointer-events: auto; }
+        /* The control must be reachable and visible whenever it itself has focus,
+           even if a browser scopes :focus-within differently. */
+        .pin-chip-unpin:focus, .pin-chip-unpin:focus-visible { opacity: 1; pointer-events: auto; }
       `}</style>
       <div style={{
         flex: 1,
@@ -154,9 +168,18 @@ export const PinnedSidePanel: React.FC<PinnedSidePanelProps> = ({ pins, updatedP
           </div>
         ) : (() => {
           // Group pins by full parent path (use full path as key to avoid collisions)
+          //
+          // `normalizeWindowsPath` first, or that collision-avoidance is exactly
+          // inverted on Windows: the store only accepts an ABSOLUTE path
+          // (`pinned_files_service.py`, `os.path.isabs`) and keeps it verbatim, so
+          // `pin.path` is a native `C:\…` string with no forward slash in it. A
+          // bare `split('/')` then yields one element, `pop()` empties it, and
+          // every pin — whatever folder it is really in — lands in the same
+          // bucket. Only a Windows-SHAPED path is rewritten, so a POSIX
+          // directory legitimately named `we\ird` is left alone.
           const folderMap = new Map<string, PinnedFileEntry[]>()
           for (const pin of pins) {
-            const parts = pin.path.split('/')
+            const parts = normalizeWindowsPath(pin.path).split('/')
             parts.pop() // remove filename
             const fullParent = parts.join('/') || '/'
             if (!folderMap.has(fullParent)) folderMap.set(fullParent, [])
@@ -214,8 +237,12 @@ const PinnedChip: React.FC<{
   lang?: string
   onMarkSeen?: (path: string) => void
 }> = ({ pin, isUpdated, isDeleted, onMarkSeen }) => {
-  const [hovered, setHovered] = useState(false)
-  const displayName = pin.label || pin.path.split('/').pop() || pin.path
+  // Same native-path rule as the grouping above. `add_pin` fills `label` with
+  // `os.path.basename`, so this fallback is only reached by an entry that
+  // reached the store without one — the reader tolerates arbitrary shapes in
+  // `pinned-files.json` — but when it is reached a bare `split('/')` renders
+  // the whole `C:\…` path where the file name belongs.
+  const displayName = pin.label || normalizeWindowsPath(pin.path).split('/').pop() || pin.path
   const extColor = getExtColor(pin.path)
 
   const handleClick = () => {
@@ -247,7 +274,11 @@ const PinnedChip: React.FC<{
     padding: '5px 8px',
     borderRadius: 8,
     cursor: clickable ? 'pointer' : 'default',
-    background: clickable && hovered ? 'rgba(255,255,255,0.07)' : 'transparent',
+    // Hover / keyboard-focus highlight is applied via the `.pin-chip` CSS class
+    // (see PinnedSidePanel's <style>): `:hover` and `:focus-within` both light
+    // the row and reveal the unpin control, so the keyboard path matches the
+    // pointer path without any React hover state.
+    background: 'transparent',
     transition: 'background 0.15s ease',
     position: 'relative',
     opacity: isDeleted ? 0.35 : 1,
@@ -287,31 +318,37 @@ const PinnedChip: React.FC<{
         }} />
       )}
 
-      {/* Dismiss button — appears on hover, macOS red dot style */}
-      {hovered && !isDeleted && (
+      {/* Unpin control. Rendered ALWAYS (not hover-gated) so it is a real
+          keyboard tab stop and discoverable by screen-reader virtual cursor and
+          touch; the `.pin-chip-unpin` class hides it visually until the chip is
+          hovered OR focus lands inside it. A pin-off icon PLUS a visible "Unpin"
+          word — the panel otherwise shows no pin vocabulary, so text on reveal
+          is what tells the user this removes (not adds) the pin, and the
+          accessible name carries the filename too. */}
+      {!isDeleted && (
         <button
           onClick={handleDismiss}
+          className="pin-chip-unpin"
           title={i18nT('apps.mochi.pinned.unpin')}
-          aria-label={i18nT('apps.mochi.pinned.unpin')}
+          aria-label={`${i18nT('apps.mochi.pinned.unpin')} ${displayName}`}
           style={{
-            width: 14,
-            height: 14,
-            borderRadius: '50%',
-            background: 'rgba(239,68,68,0.85)',
-            border: 'none',
-            color: '#fff',
-            fontSize: 8,
-            lineHeight: '14px',
-            textAlign: 'center',
-            cursor: 'pointer',
-            padding: 0,
             display: 'flex',
             alignItems: 'center',
-            justifyContent: 'center',
+            gap: 3,
+            height: 16,
+            borderRadius: 4,
+            padding: '0 4px',
+            background: 'transparent',
+            border: 'none',
+            color: 'var(--text-muted, rgba(255,255,255,0.6))',
+            fontSize: 10,
+            lineHeight: 1,
+            cursor: 'pointer',
             flexShrink: 0,
           }}
         >
-          <X size={12} />
+          <PinOff size={12} />
+          <span>{i18nT('apps.mochi.pinned.unpin')}</span>
         </button>
       )}
     </>
@@ -319,14 +356,18 @@ const PinnedChip: React.FC<{
 
   if (!clickable) {
     return (
-      // Hover intent only: the two listeners reveal the chip's own unpin button and
-      // nothing else. This branch is the chip that has no path to open, so the
-      // wrapper carries no action a keyboard could reach — the reachable control is
-      // the <button> inside `body`.
-      // eslint-disable-next-line jsx-a11y/no-static-element-interactions -- passive hover reveal, not an interaction; the only action lives on the nested <button>
+      // Inert chip: no path to open, so the wrapper carries no click action and
+      // is not itself a tab stop — the real keyboard tab stop is the always-
+      // rendered unpin <button> inside `body`, which lands focus on an
+      // actionable control rather than a silent wrapper. `role="group"` +
+      // `aria-label={pin.path}` give the chip an accessible name (the full path)
+      // that a screen reader announces in browse mode, where before the path
+      // lived only in the mouse-only `title`. `.pin-chip` drives the hover /
+      // focus-within reveal of the unpin control.
       <div
-        onMouseEnter={() => setHovered(true)}
-        onMouseLeave={() => setHovered(false)}
+        role="group"
+        aria-label={pin.path}
+        className="pin-chip"
         title={pin.path}
         style={chipStyle}
       >
@@ -338,8 +379,8 @@ const PinnedChip: React.FC<{
   return (
     <Clickable
       onClick={handleClick}
-      onMouseEnter={() => setHovered(true)}
-      onMouseLeave={() => setHovered(false)}
+      className="pin-chip"
+      aria-label={pin.path}
       title={pin.path}
       style={chipStyle}
     >
@@ -1670,6 +1711,9 @@ const LocalImage: React.FC<{ path: string; onClickImage?: (src: string) => void 
  */
 const StreamingMarkdown = React.memo<{ content: string }>(({ content }) => {
   useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
+  // The whitespace-run cap (see markdownDepthBound) is applied per TEXT
+  // segment below, after widget extraction, so a widget body reaches
+  // WidgetFrame byte-identical -- its <pre> indentation included.
   const cleaned = content.replace(/^\n+/, '')
   // If there's a complete widget in the stream, render it
   if (hasWidgets(cleaned)) {
@@ -1683,20 +1727,20 @@ const StreamingMarkdown = React.memo<{ content: string }>(({ content }) => {
           // Last text segment after final widget — still streaming
           if (i > lastWidget) {
             const stripped = seg.content.replace(/<mcwidget[\s\S]*$/, '')
-            const prepared = fixStreamingFences(stripped)
+            const prepared = fixStreamingFences(capWhitespaceRuns(stripped))
             return <React.Fragment key={i}>
               <Markdown remarkPlugins={MD_REMARK} rehypePlugins={MD_REHYPE} components={mdComponents}>{prepared}</Markdown>
               <span style={{ animation: 'blink 1s step-end infinite', display: 'inline-flex', verticalAlign: 'middle' }}><PawPrint size={11} /></span>
             </React.Fragment>
           }
-          return <Markdown key={i} remarkPlugins={MD_REMARK} rehypePlugins={MD_REHYPE} components={mdComponents}>{seg.content}</Markdown>
+          return <Markdown key={i} remarkPlugins={MD_REMARK} rehypePlugins={MD_REHYPE} components={mdComponents}>{capWhitespaceRuns(seg.content)}</Markdown>
         })}
       </>
     )
   }
   // Strip any partial/unclosed <mcwidget tag during streaming
   const stripped = cleaned.replace(/<mcwidget[\s\S]*$/, '')
-  const prepared = fixStreamingFences(stripped)
+  const prepared = fixStreamingFences(capWhitespaceRuns(stripped))
   return (
     <>
       <Markdown remarkPlugins={MD_REMARK} rehypePlugins={MD_REHYPE} components={mdComponents}>{prepared}</Markdown>
@@ -1707,8 +1751,9 @@ const StreamingMarkdown = React.memo<{ content: string }>(({ content }) => {
 
 /** Ensure blank line before fences glued to text, and close any unclosed fence. */
 function fixStreamingFences(s: string): string {
-  // Ensure blank line before opening fences glued to preceding text
-  s = s.replace(/([^\n])(\n?)(```\w*\n)/g, (_, pre, nl, fence) =>
+  // The info string is the whole backtick-free line, including attributes and
+  // a leading space, matching the dashboard's FENCE_OPEN.
+  s = s.replace(/([^\n])(\n?)(```[^`\n]*\n)/g, (_, pre, nl, fence) =>
     nl ? pre + nl + fence : pre + '\n\n' + fence
   )
   // If there's an odd number of ``` fences, the last one is unclosed — close it
@@ -1717,7 +1762,11 @@ function fixStreamingFences(s: string): string {
   return s
 }
 
-const MD_REMARK = [remarkGfm, remarkVerbatimUnknownTags]
+// `remarkBoundDepth` first: it bounds the parsed tree's depth inside parse(),
+// ahead of remark-gfm's recursive post-parse transform. Shared with the
+// core renderer, for the same reason the sanitizer is: this panel parses
+// the same untrusted message content through the same kind of pipeline.
+const MD_REMARK = [remarkBoundDepth, remarkGfm, remarkVerbatimUnknownTags]
 /**
  * Raw HTML must be ADMITTED, then SANITIZED — in that order.
  *
@@ -1727,7 +1776,13 @@ const MD_REMARK = [remarkGfm, remarkVerbatimUnknownTags]
  * The sanitizer is the core's, imported rather than copied: admitting raw HTML
  * is exactly the point where a second, drifting allowlist would become a hole.
  */
-const MD_REHYPE = [rehypeRaw, rehypeSanitize]
+// ``rehypeStableRootKeys`` goes LAST, after ``rehypeSanitize``, and the order is
+// load-bearing rather than cosmetic: the sanitizer keeps only allowlisted
+// attributes, and ``style`` is on neither the global list nor any list for
+// ``div``. Ahead of it the wrapper would lose ``display: contents`` and become a
+// real layout box around every block, which is a visible regression that the
+// keys it stabilises would not reveal.
+const MD_REHYPE = [rehypeBoundRawDepth, rehypeRaw, rehypeSanitize, rehypeStableRootKeys]
 
 /**
  * Typed against react-markdown's own `Components`, so each override receives the
@@ -1735,20 +1790,29 @@ const MD_REHYPE = [rehypeRaw, rehypeSanitize]
  * MarkdownRenderer uses) instead of an `any` that hides a misspelled prop.
  */
 const mdComponents: Components = {
-  // `href` and the children are restated after the spread — both already arrive in
-  // `p`, so this is the same anchor at runtime — because an <a> whose href is only
-  // ever supplied by a spread is indistinguishable from a bare <a onClick>: it is
-  // not focusable and Enter does not fire it, and neither a reader nor the linter
-  // can tell it apart from a real link.
-  a: (p) => <a {...p} href={p.href} style={{ color: 'var(--accent)', textDecoration: 'none', cursor: 'pointer' }}
+  // react-markdown's defaultUrlTransform rewrites a destination whose scheme is
+  // outside its allowlist (and an empty `[x]()` destination) to href="". An
+  // anchor with an empty href still paints as a live link and its "Copy Link
+  // Address" resolves to the current page URL, so a refused destination renders
+  // as inert text instead -- same degradation as md-notebook's Preview.
+  //
+  // On the anchor path, `href` and the children are restated after the spread --
+  // both already arrive in `p`, so this is the same anchor at runtime -- because
+  // an <a> whose href is only ever supplied by a spread is indistinguishable
+  // from a bare <a onClick>: it is not focusable and Enter does not fire it, and
+  // neither a reader nor the linter can tell it apart from a real link.
+  a: (p) => p.href ? <a {...p} href={p.href} style={{ color: 'var(--accent)', textDecoration: 'none', cursor: 'pointer' }}
     onMouseEnter={(e) => (e.currentTarget.style.textDecoration = 'underline')}
     onMouseLeave={(e) => (e.currentTarget.style.textDecoration = 'none')}
-    onClick={(e) => { e.preventDefault(); const href = p.href; if (href) api?.openExternal?.(href) }}>{p.children}</a>,
+    onClick={(e) => { e.preventDefault(); const href = p.href; if (href) api?.openExternal?.(href) }}>{p.children}</a>
+    : <span>{p.children}</span>,
   table: (p) => <table style={{ borderCollapse: 'collapse', fontSize: 11, width: '100%', margin: '4px 0' }} {...p} />,
   th: (p) => <th style={{ border: '1px solid var(--border)', padding: '3px 6px', textAlign: 'left', fontWeight: 600 }} {...p} />,
   td: (p) => <td style={{ border: '1px solid var(--border)', padding: '3px 6px' }} {...p} />,
   code: (p) => {
-    const match = /language-(\w+)/.exec(p.className || '')
+    // Whole class token, not its leading `\w+` run: `language-error-report`
+    // labels as `error-report`, not `error` (same rule as MarkdownRenderer).
+    const match = /language-(\S+)/.exec(p.className || '')
     if (match) {
       return <MochiCodeBlock lang={match[1]} code={String(p.children).replace(/\n$/, '')} />
     }
@@ -2006,7 +2070,18 @@ export const Bubble = React.memo<{ message: ChatMessage; onOption?: (text: strin
     const approvalActions = [
       ['approve', i18nT('apps.mochi.approval.btn_approve'), '#2e7d32', Check],
       ...(req.trustGrantable === true
-        ? [['trust', i18nT('apps.mochi.approval.btn_trust'), '#1565c0', Handshake]]
+        ? [[
+          'trust',
+          // With scopes this button only OPENS the tier list, so the bare verb is
+          // right. Without them the same click IS the broadest grant, so the
+          // button must name what it grants: consent has to match the scope, and
+          // an unqualified "Trust" beside one tool reads as trusting that tool.
+          hasTrustScopes
+            ? i18nT('apps.mochi.approval.btn_trust')
+            : i18nT('apps.mochi.approval.trust_all_tools'),
+          '#1565c0',
+          Handshake,
+        ]]
         : []),
       ['reject', i18nT('apps.mochi.approval.btn_reject'), '#c62828', Ban],
     ] as [string, string, string, React.ComponentType<{ size?: number }>][]
@@ -2065,8 +2140,14 @@ export const Bubble = React.memo<{ message: ChatMessage; onOption?: (text: strin
                       ellipsis would re-collide the very labels the 64-char budget
                       distinguishes. minWidth:0 lets the flex item shrink;
                       overflowWrap:'anywhere' lets an unbreakable run (a sha, a
-                      base64 arg) wrap instead of clipping past the panel edge. */}
-                  <span style={{ minWidth: 0, overflowWrap: 'anywhere' }}>
+                      base64 arg) wrap instead of clipping past the panel edge.
+                      whiteSpace:'pre-wrap' because the default COLLAPSES runs of
+                      whitespace, which for an exact-string grant is an elision
+                      one character wide: `grep "a  b" f` would render as
+                      `grep "a b" f` while granting the two-space string. The
+                      budget clamp above is a layout decision for this narrow
+                      column; collapsing whitespace earns nothing anywhere. */}
+                  <span style={{ minWidth: 0, overflowWrap: 'anywhere', whiteSpace: 'pre-wrap' }}>
                     {i18nT('apps.mochi.approval.trust_this_command', { cmd: truncateCommandLabel(req.fullCommand) })}
                   </span></button>
               )}
@@ -2083,8 +2164,11 @@ export const Bubble = React.memo<{ message: ChatMessage; onOption?: (text: strin
             </div>
           )}
           {req.trustGrantable === true && !hasTrustScopes && (
+            // This hint renders ONLY on the scopeless path, where the button
+            // grants the whole session. It therefore describes the session and
+            // names no tool: naming the pending tool understates the grant.
             <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 5 }}>
-              {i18nT('apps.mochi.approval.trust_hint', { tool: req.tool })}
+              {i18nT('apps.mochi.approval.trust_hint')}
             </div>
           )}
         </div>
@@ -2174,14 +2258,14 @@ export const Bubble = React.memo<{ message: ChatMessage; onOption?: (text: strin
                     return <>
                       {segments.map((seg, i) => seg.type === 'widget'
                         ? <WidgetFrame key={i} html={seg.content} title={seg.title} />
-                        : <Markdown key={i} remarkPlugins={MD_REMARK} rehypePlugins={MD_REHYPE} components={mdComponents}>{seg.content}</Markdown>
+                        : <Markdown key={i} remarkPlugins={MD_REMARK} rehypePlugins={MD_REHYPE} components={mdComponents}>{capWhitespaceRuns(seg.content)}</Markdown>
                       )}
                       {images.map((p, i) => <LocalImage key={`img-${i}`} path={p} onClickImage={onImageClick} />)}
                     </>
                   }
 
                   return <>
-                    {cleanText && <Markdown remarkPlugins={MD_REMARK} rehypePlugins={MD_REHYPE} components={mdComponents}>{cleanText}</Markdown>}
+                    {cleanText && <Markdown remarkPlugins={MD_REMARK} rehypePlugins={MD_REHYPE} components={mdComponents}>{capWhitespaceRuns(cleanText)}</Markdown>}
                     {images.map((p, i) => <LocalImage key={i} path={p} onClickImage={onImageClick} />)}
                   </>
                 })()
@@ -2230,9 +2314,11 @@ export const Bubble = React.memo<{ message: ChatMessage; onOption?: (text: strin
             <button
               className="copy-md-btn"
               onClick={() => {
-                navigator.clipboard.writeText(text)
-                setCopied(true)
-                setTimeout(() => setCopied(false), 1500)
+                copyToClipboard(text).then((ok) => {
+                  if (!ok) return
+                  setCopied(true)
+                  setTimeout(() => setCopied(false), 1500)
+                })
               }}
               title={copied ? i18nT('apps.mochi.chatPanel.copied') : i18nT('apps.mochi.chatPanel.copy_markdown')}
               aria-label={copied ? i18nT('apps.mochi.chatPanel.copied') : i18nT('apps.mochi.chatPanel.copy_markdown')}

@@ -27,7 +27,7 @@ individual methods on fields that are otherwise live (today: the unread
 
 Consumption sites are discovered by **static analysis of the real source tree**
 (``ast``), not from a hand-maintained list — a list would itself rot. See
-:func:`_find_seam_reads`.
+:func:`_scan_seam_reads`.
 
 The same shape guards the one accessor that opts OUT of the fail-closed contract.
 ``context.installed_context()`` answers ``None`` instead of refusing to compose,
@@ -47,6 +47,7 @@ from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Set, Tuple
 
 import pytest
+from source_corpus import parsed_candidates
 
 import kiro_crew
 from kiro_crew.config.loader import KiroCrewConfig
@@ -76,6 +77,11 @@ from kiro_crew.platform.interfaces import InboundToken, SessionPrincipal
 
 # ── Static-analysis configuration ──
 
+# One xdist worker for the whole module: every seam test here derives from ONE
+# module-scoped streaming scan of src/. Under `--dist loadgroup` an unmarked module is
+# spread across workers and each worker re-pays that scan -- measured at 5 workers x 40-75s
+# per full run for this file alone. Grouping keeps the scan single-copy per run.
+pytestmark = pytest.mark.xdist_group(name="tree_scan_test_platform_cpp_seam_coverage")
 _SRC_ROOT = Path(kiro_crew.__file__).resolve().parent
 
 # Directories under the package that are NOT core consumption sites.
@@ -154,58 +160,82 @@ def _rel(path: Path) -> str:
     return str(path.relative_to(_SRC_ROOT.parent))
 
 
-def _find_seam_reads(field_names: Set[str]) -> Dict[str, List[str]]:
-    """Map each context field name → ``["module.py:LINE", ...]`` read sites.
+def _parsed_core_source_files() -> Iterator[Tuple[Path, ast.AST]]:
+    """Yield ``(path, tree)`` for each core source file that can hold a seam read.
 
-    Recognizes both documented CPP read shapes:
+    One tree at a time, never a list: retaining every core module's AST at once
+    (the shape this generator replaced) held ~1.2 GB of live nodes on the worker
+    for the rest of the module -- the single largest RSS step in the suite -- and
+    slowed every later garbage collection that had to traverse them. The one
+    consumer, :func:`_scan_seam_reads`, extracts what it needs from each tree and
+    drops it before the next is parsed.
 
-        current_context().identity.status()      → identity
-        ctx = current_context(); ctx.jail        → jail
+    Narrowed through ``test/source_corpus.py``'s ``parsed_candidates`` rather than a
+    private ``rglob`` + ``read_text``: a seam read is an attribute on a call to one
+    of ``_CONTEXT_FACTORIES`` or on a name in ``_CONTEXT_VAR_NAMES``, so a file whose
+    text contains none of those identifiers cannot produce a match and is never a
+    false negative to skip (the corpus NFKC-folds both sides, as CPython does for
+    identifiers). Streamed as well as narrowed: ``ctx`` is a substring of
+    ``context``, so the candidate set is most of the tree, and a tuple of every
+    candidate's text would be ~120 MiB live before the first parse. The
+    ``platform``/``_vendor`` exclusion stays here, because which files this gate
+    polices is this gate's contract. A file that fails to parse is skipped,
+    the same defensive behavior as a per-scanner parse.
+    """
+    for path, _text, tree in parsed_candidates(
+        require_any=tuple(sorted(_CONTEXT_FACTORIES | _CONTEXT_VAR_NAMES))
+    ):
+        if _EXCLUDED_DIRS & set(path.relative_to(_SRC_ROOT).parts):
+            continue
+        yield path, tree
 
-    Deliberately conservative — it under-counts rather than over-counts. A
+
+def _scan_seam_reads(
+    field_names: Set[str], parsed_files: Iterator[Tuple[Path, ast.AST]]
+) -> Tuple[Dict[str, List[str]], Dict[str, List[str]]]:
+    """One walk per tree producing both ``(field_reads, method_reads)``.
+
+    ``field_reads`` maps each context field name -> ``["module.py:LINE", ...]``
+    read sites, recognizing both documented CPP read shapes:
+
+        current_context().identity.status()      -> identity
+        ctx = current_context(); ctx.jail        -> jail
+
+    ``method_reads`` maps ``"field.method"`` -> read sites for methods reached via
+    the seam, shape ``<ctx-expr>.<field>.<method>``. Only direct attribute access
+    counts; ``getattr(ctx.identity, name)`` is deliberately not chased (dynamic,
+    and not a documented read shape).
+
+    Both maps come out of the SAME ``ast.walk`` so the tree is visited once and
+    can be released as soon as this loop moves on; two scanners over a shared,
+    retained list of every parsed module would hold hundreds of MiB of AST for
+    the rest of the worker's life.
+
+    Deliberately conservative -- it under-counts rather than over-counts. A
     genuinely-wired field reached by some *other* shape would show up as an
-    unexpected failure here (loud, fixable by teaching this scanner the shape)
-    rather than as a silently-passing gate, which is the outcome that matters:
-    this test's job is to make inertness impossible to miss.
+    unexpected failure (loud, fixable by teaching this scanner the shape) rather
+    than as a silently-passing gate, which is the outcome that matters: this
+    gate's job is to make inertness impossible to miss.
     """
     reads: Dict[str, List[str]] = {name: [] for name in field_names}
-    for path in _core_source_files():
-        try:
-            tree = ast.parse(path.read_text(encoding="utf-8"))
-        except (SyntaxError, UnicodeDecodeError):  # pragma: no cover - defensive
-            continue
+    method_reads: Dict[str, List[str]] = {}
+    for path, tree in parsed_files:
+        rel = _rel(path)
         for node in ast.walk(tree):
             if not isinstance(node, ast.Attribute):
                 continue
             if node.attr in field_names and _is_context_expr(node.value):
-                reads[node.attr].append(f"{_rel(path)}:{node.lineno}")
-    return reads
-
-
-def _find_method_reads(field_names: Set[str]) -> Dict[str, List[str]]:
-    """Map ``"field.method"`` → read sites, for methods reached via the seam.
-
-    Shape: ``<ctx-expr>.<field>.<method>``. Only direct attribute access counts;
-    ``getattr(ctx.identity, name)`` is deliberately not chased (dynamic, and not
-    a documented read shape).
-    """
-    method_reads: Dict[str, List[str]] = {}
-    for path in _core_source_files():
-        try:
-            tree = ast.parse(path.read_text(encoding="utf-8"))
-        except (SyntaxError, UnicodeDecodeError):  # pragma: no cover - defensive
-            continue
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Attribute):
-                continue
+                reads[node.attr].append(f"{rel}:{node.lineno}")
             inner = node.value
-            if not isinstance(inner, ast.Attribute):
-                continue
-            if inner.attr in field_names and _is_context_expr(inner.value):
+            if (
+                isinstance(inner, ast.Attribute)
+                and inner.attr in field_names
+                and _is_context_expr(inner.value)
+            ):
                 method_reads.setdefault(f"{inner.attr}.{node.attr}", []).append(
-                    f"{_rel(path)}:{node.lineno}"
+                    f"{rel}:{node.lineno}"
                 )
-    return method_reads
+    return reads, method_reads
 
 
 # ── installed_context() peek discovery ──
@@ -309,13 +339,26 @@ def context_field_names() -> Set[str]:
 
 
 @pytest.fixture(scope="module")
-def field_reads(context_field_names: Set[str]) -> Dict[str, List[str]]:
-    return _find_seam_reads(context_field_names)
+def seam_reads(
+    context_field_names: Set[str],
+) -> Tuple[Dict[str, List[str]], Dict[str, List[str]]]:
+    """``(field_reads, method_reads)`` from one streaming pass over the core tree.
+
+    Module-scoped so the parse is paid once per module, and a tuple of two small
+    result maps rather than the parsed trees, so what the module retains for the
+    rest of its life is a few hundred site strings and not every module's AST.
+    """
+    return _scan_seam_reads(context_field_names, _parsed_core_source_files())
 
 
 @pytest.fixture(scope="module")
-def method_reads(context_field_names: Set[str]) -> Dict[str, List[str]]:
-    return _find_method_reads(context_field_names)
+def field_reads(seam_reads) -> Dict[str, List[str]]:
+    return seam_reads[0]
+
+
+@pytest.fixture(scope="module")
+def method_reads(seam_reads) -> Dict[str, List[str]]:
+    return seam_reads[1]
 
 
 # ── The scanner must actually work (guards against a vacuous gate) ──
@@ -424,7 +467,7 @@ class TestSeamCoverage:
         )
 
     def test_reserved_slots_are_real_fields(self, context_field_names) -> None:
-        """A reservation for a field that no longer exists is dead weight."""
+        """A reservation for a field that does not exist is dead weight."""
         unknown = sorted(set(RESERVED_SLOTS) - context_field_names)
         assert not unknown, f"RESERVED_SLOTS names non-existent field(s): {unknown}"
 
@@ -552,7 +595,7 @@ class TestInstalledContextPeeks:
     def test_scanner_finds_the_real_call_sites(self, peek_sites) -> None:
         """The scan must see the live tree, not an empty one."""
         assert peek_sites, "peek scanner found no installed_context() call site at all"
-        assert "security.py::_exempt_exact_hosts" in peek_sites, sorted(peek_sites)
+        assert "security/exfil.py::_exempt_exact_hosts" in peek_sites, sorted(peek_sites)
 
     def test_scanner_does_not_count_the_definition(self, peek_sites) -> None:
         """``def installed_context()`` is not a call — the accessor is not its own

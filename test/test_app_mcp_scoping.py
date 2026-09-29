@@ -5,7 +5,7 @@ The shared ``~/.kiro/settings/mcp.json`` is read by everything else under
 MCP servers there leaked private app tools into surfaces that never installed
 the app. These tests pin the fix: registration targets the agent config, the
 shared file is left alone, and a ``clean`` rebuild re-derives app entries from
-the enabled apps' manifests (the shared file can no longer supply them).
+the enabled apps' manifests (the shared file does not supply them).
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ def fake_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Point the module-level ~/.kiro paths at a tmp home.
 
     The paths are module constants resolved at import time, so they are patched
-    directly rather than via ``HOME`` (which they no longer consult).
+    directly rather than via ``HOME`` (which they do not consult).
     """
     from kiro_crew.apps import bridges
 
@@ -201,10 +201,16 @@ class TestGrantVersusGovernance:
         """
         from types import SimpleNamespace
 
-        from kiro_crew.platform.governance import _ceiling_mentions_mcp_server
+        from kiro_crew.platform.governance import (
+            ScopedRuleset,
+            _ceiling_mentions_mcp_server,
+        )
 
-        # deny-mode ruleset naming ONE tool under the server
-        ruleset = SimpleNamespace(mode="deny", allow=(), deny=("@srv/delete",))
+        # deny-mode ruleset naming ONE tool under the server. A REAL ruleset, not
+        # a namespace with the same fields: the reader asks the control for its
+        # patterns, so a stand-in that cannot answer proves nothing about a
+        # composed ceiling, which is the shape a second policy tier produces.
+        ruleset = ScopedRuleset(mode="deny", deny=("@srv/delete",))
         ceiling = SimpleNamespace(get=lambda scope: ruleset if scope == "mcp" else None)
 
         assert _ceiling_mentions_mcp_server(ceiling, "srv") is True
@@ -215,9 +221,12 @@ class TestGrantVersusGovernance:
         """Allow-mode listing a subset must not let the whole server through."""
         from types import SimpleNamespace
 
-        from kiro_crew.platform.governance import _ceiling_mentions_mcp_server
+        from kiro_crew.platform.governance import (
+            ScopedRuleset,
+            _ceiling_mentions_mcp_server,
+        )
 
-        ruleset = SimpleNamespace(mode="allow", allow=("@srv/read",), deny=())
+        ruleset = ScopedRuleset(mode="allow", allow=("@srv/read",))
         ceiling = SimpleNamespace(get=lambda scope: ruleset if scope == "mcp" else None)
         assert _ceiling_mentions_mcp_server(ceiling, "srv") is True
 
@@ -225,9 +234,12 @@ class TestGrantVersusGovernance:
         """`@srv-other` must not count as an opinion about `@srv`."""
         from types import SimpleNamespace
 
-        from kiro_crew.platform.governance import _ceiling_mentions_mcp_server
+        from kiro_crew.platform.governance import (
+            ScopedRuleset,
+            _ceiling_mentions_mcp_server,
+        )
 
-        ruleset = SimpleNamespace(mode="deny", allow=(), deny=("@srv-other",))
+        ruleset = ScopedRuleset(mode="deny", deny=("@srv-other",))
         ceiling = SimpleNamespace(get=lambda scope: ruleset if scope == "mcp" else None)
         assert _ceiling_mentions_mcp_server(ceiling, "srv") is False
 
@@ -325,7 +337,7 @@ class TestRebuildSurvival:
     """A clean rebuild must re-derive app servers from the manifests.
 
     Before the fix the entries were mirrored in from the shared file; now that
-    apps no longer write it, the manifests are the only source — so without this
+    apps do not write it, the manifests are the only source — so without this
     re-derivation a clean rebuild would silently drop every app's tools.
     """
 
@@ -493,8 +505,8 @@ class TestBothWritePointsConsultTheCeiling:
     """`allowedTools` is written in TWO places; one predicate governs both.
 
     Auto-approve is the only path that never reaches `hooks.on_tool_call`, so a
-    list written without consulting the ceiling is a set of tools the ceiling can
-    no longer refuse. Closing that in app-agent materialization
+    list written without consulting the ceiling is a set of tools the ceiling
+    cannot refuse. Closing that in app-agent materialization
     (`apps/bridges.py`) left the OTHER writer — the host agent's shared-MCP sync
     in `agent.py` — appending every user-installed server's `@ref` unconditionally,
     so on a governed host the primary agent kept the whole bypass. These pin that
@@ -770,6 +782,16 @@ class TestACapabilityGrantNeedsALiteralTrue:
         assert AppAdmissionPolicy.from_dict({"require_signature": False}).require_signature is False
 
 
+def _pin_honour_auto_approve(monkeypatch: pytest.MonkeyPatch, honour: bool) -> None:
+    """Pin ``mcp.honour_auto_approve`` through the real read path the floor uses."""
+    from kiro_crew.config import live
+    from kiro_crew.config.loader import KiroCrewConfig
+
+    cfg = KiroCrewConfig()
+    cfg.mcp.honour_auto_approve = honour
+    monkeypatch.setattr(live, "snapshot", lambda: cfg)
+
+
 class TestAutoApproveIsFilteredAtTheWriteChokepoint:
     """One map-level pass, not one patch per source.
 
@@ -794,10 +816,14 @@ class TestAutoApproveIsFilteredAtTheWriteChokepoint:
         assert out["srv"]["command"] == "x"
         assert out["other"] == {"command": "y"}
 
-    def test_an_ungoverned_host_is_untouched(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_an_ungoverned_host_keeps_it_only_with_the_opt_in(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An absent ceiling does not buy the exemption -- the opt-in does."""
         from kiro_crew.platform import governance as gov
 
         monkeypatch.setattr(gov, "may_skip_gate_now", lambda ref: True)
+        _pin_honour_auto_approve(monkeypatch, True)
         spec = {"srv": {"command": "x", "autoApprove": ["a"]}}
         assert gov.strip_ungoverned_auto_approve(spec)["srv"]["autoApprove"] == ["a"]
 
@@ -810,6 +836,269 @@ class TestAutoApproveIsFilteredAtTheWriteChokepoint:
 
         assert "_strip_ungoverned_auto_approve" in inspect.getsource(agent.install_agent)
         assert "_strip_ungoverned_auto_approve" in inspect.getsource(bridges._register_agents)
+
+
+class TestOnlyTheOwnersOwnAutoApproveIsHonoured:
+    """The opt-in respects the OWNER's statement, not any writer's.
+
+    "Owner-written" was first implemented as "undeclared by any spec", and the
+    declared set covers only the managed registry and the edition's contribution.
+    An app's own ``<app>:<server>`` entry is in neither, so an installed app that
+    shipped ``autoApprove`` inherited the exemption on every default-config host --
+    a third party exempting its own tools from the gate with no card, which is the
+    opposite of the decision the opt-in records. The wrong SHAPE is the sibling
+    hole: the strict floor coerces a non-list to ``[]``, and preserving one writes
+    a spec kiro-cli rejects, with no self-heal for an invalid file.
+    """
+
+    @staticmethod
+    def _honoured(monkeypatch: pytest.MonkeyPatch, servers: dict) -> dict:
+        from kiro_crew.platform import governance as gov
+
+        monkeypatch.setattr(gov, "may_skip_gate_now", lambda ref: True)
+        monkeypatch.setattr(gov, "_declared_auto_approve", lambda emitted: {})
+        _pin_honour_auto_approve(monkeypatch, True)
+        return dict(gov.strip_ungoverned_auto_approve(servers, audit=False))
+
+    def test_an_apps_own_server_is_not_the_owner(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """``apps/bridges.py`` keys an app's own servers ``<app>:<server>``."""
+        out = self._honoured(
+            monkeypatch, {"weather:api": {"command": "w", "autoApprove": ["write_all"]}}
+        )
+        assert "autoApprove" not in out["weather:api"], "an app manifest grant must not survive"
+        assert out["weather:api"]["command"] == "w", "the server itself must stay available"
+
+    def test_an_entry_kiro_crew_authored_is_not_the_owner(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A marker means we wrote it into a file we do not own -- our emission."""
+        from kiro_crew.mcp_provenance import stamp
+
+        out = self._honoured(
+            monkeypatch, {"mail": stamp({"command": "m", "autoApprove": ["email_send"]})}
+        )
+        assert "autoApprove" not in out["mail"]
+
+    def test_the_owners_own_entry_still_survives(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The provenance test must not cost the owner the thing they asked for."""
+        out = self._honoured(monkeypatch, {"mail": {"command": "m", "autoApprove": ["email_send"]}})
+        assert out["mail"]["autoApprove"] == ["email_send"]
+
+    def test_a_name_the_caller_calls_third_party_is_not_the_owner(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """For a map that MIXES the two: the shared `mcp.json` an app registers into.
+
+        The app's entries there carry its `<app>:` prefix, so naming them is exact
+        and closed, and the owner's own entries in the same file keep the opt-in.
+        """
+        from kiro_crew.platform import governance as gov
+
+        monkeypatch.setattr(gov, "may_skip_gate_now", lambda ref: True)
+        monkeypatch.setattr(gov, "_declared_auto_approve", lambda emitted: {})
+        _pin_honour_auto_approve(monkeypatch, True)
+        out = gov.strip_ungoverned_auto_approve(
+            {
+                "shipped": {"command": "s", "autoApprove": ["write_all"]},
+                "mine": {"command": "m", "autoApprove": ["email_send"]},
+            },
+            audit=False,
+            third_party={"shipped"},
+        )
+        assert "autoApprove" not in out["shipped"], "an app-chosen key must not survive"
+        assert out["mine"]["autoApprove"] == ["email_send"], "the owner's own key must survive"
+
+    def test_a_whole_map_that_is_an_apps_declines_the_opt_in(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No key of it is honoured, and a DECLARED verb still survives.
+
+        Naming an app's keys is an enumeration that goes stale: the manifest's
+        servers, the shipped agent spec's own un-namespaced keys and the per-agent
+        policy's `servers` keys were each found only after the previous one was
+        covered. A writer whose whole map is an app's therefore declines the opt-in
+        instead of listing what it knows about today.
+        """
+        from kiro_crew.platform import governance as gov
+
+        monkeypatch.setattr(gov, "may_skip_gate_now", lambda ref: True)
+        monkeypatch.setattr(gov, "_declared_auto_approve", lambda emitted: {"ours": ("read",)})
+        _pin_honour_auto_approve(monkeypatch, True)
+        out = gov.strip_ungoverned_auto_approve(
+            {
+                "policy_written": {"command": "p", "autoApprove": ["write_all"]},
+                "ours": {"command": "o", "autoApprove": ["read"]},
+            },
+            audit=False,
+            honour_owner_written=False,
+        )
+        assert "autoApprove" not in out["policy_written"], "no app key may be honoured"
+        assert out["ours"]["autoApprove"] == ["read"], "a DECLARED verb still survives"
+
+    def test_the_app_agent_writer_declines_the_opt_in(self) -> None:
+        """Pin the call shape: the app writer must not re-grow a key enumeration."""
+        import inspect
+
+        from kiro_crew.apps import bridges
+
+        src = inspect.getsource(bridges._register_agents)
+        assert "honour_owner_written=False" in src
+        assert "third_party=" not in src, "an app's keys must not be enumerated here"
+
+    @pytest.mark.parametrize("asked", ["email_send", {"email_send": True}, ["ok", 7], None])
+    def test_a_value_that_is_not_a_list_of_str_is_not_preserved(
+        self, monkeypatch: pytest.MonkeyPatch, asked: object
+    ) -> None:
+        """Preserving one writes a spec kiro-cli rejects, and no rebuild repairs it."""
+        out = self._honoured(monkeypatch, {"mail": {"command": "m", "autoApprove": asked}})
+        assert "autoApprove" not in out["mail"], f"{asked!r} reached the emitted spec"
+        assert out["mail"]["command"] == "m"
+
+
+class TestAnUngovernedHostDoesNotKeepAutoApprove:
+    """The ungoverned host was the hole, and no ceiling could close it.
+
+    ``may_skip_gate_now`` is always true where no ceiling is installed, so a
+    ``mcp.json`` entry's own ``autoApprove`` was copied verbatim into the written
+    spec. kiro-cli then approves those tools locally and emits no permission
+    request, so ``hooks.on_tool_call`` never runs and there is no card left to
+    fall through to -- against the dashboard's own "auto-approve reads, ask for
+    writes" promise. The floor is local and fail-closed; the opt-in is the way
+    back, and a ceiling still wins over it.
+    """
+
+    ENTRY = {"mail": {"command": "mail-mcp", "autoApprove": ["email_reply"]}}
+
+    @staticmethod
+    def _strip(
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        governed: bool,
+        honour: bool,
+        seeded: dict | None = None,
+    ) -> dict:
+        from kiro_crew.platform import governance as gov
+
+        monkeypatch.setattr(gov, "may_skip_gate_now", lambda ref: not governed)
+        monkeypatch.setattr(gov, "_declared_auto_approve", lambda emitted: seeded or {})
+        _pin_honour_auto_approve(monkeypatch, honour)
+        entry = {k: dict(v) for k, v in TestAnUngovernedHostDoesNotKeepAutoApprove.ENTRY.items()}
+        return dict(gov.strip_ungoverned_auto_approve(entry, audit=False))
+
+    def test_a_verb_the_spec_declares_survives_without_the_opt_in(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The floor is user-only: Kiro Crew's own emission is not the hole.
+
+        A blanket floor would strip a shipped server's own tools, and the operator
+        who lost them would set the opt-in to get them back -- which honours their
+        hand-added grants too. A fix most operators must switch off is worse than
+        none, so what a managed or edition spec DECLARES is kept.
+        """
+        out = self._strip(
+            monkeypatch, governed=False, honour=False, seeded={"mail": ("email_reply",)}
+        )
+        assert out["mail"]["autoApprove"] == ["email_reply"]
+
+    def test_only_the_declared_verbs_survive(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A user verb added ALONGSIDE a declared one is dropped on its own."""
+        from kiro_crew.platform import governance as gov
+
+        monkeypatch.setattr(gov, "may_skip_gate_now", lambda ref: True)
+        monkeypatch.setattr(gov, "_declared_auto_approve", lambda emitted: {"mail": ("email_read",)})
+        _pin_honour_auto_approve(monkeypatch, False)
+        out = gov.strip_ungoverned_auto_approve(
+            {"mail": {"command": "m", "autoApprove": ["email_read", "email_send"]}},
+            audit=False,
+        )
+        assert out["mail"]["autoApprove"] == ["email_read"]
+
+    def test_the_key_does_not_reach_the_emitted_spec(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        out = self._strip(monkeypatch, governed=False, honour=False)
+        assert "autoApprove" not in out["mail"]
+        assert out["mail"]["command"] == "mail-mcp", "the server itself must stay available"
+
+    def test_the_opt_in_brings_it_back(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        out = self._strip(monkeypatch, governed=False, honour=True)
+        assert out["mail"]["autoApprove"] == ["email_reply"]
+
+    @pytest.mark.parametrize("honour", [False, True])
+    def test_a_governed_ref_is_stripped_either_way(
+        self, monkeypatch: pytest.MonkeyPatch, honour: bool
+    ) -> None:
+        """Tightest-wins: the opt-in is a local floor, never a ceiling override."""
+        out = self._strip(monkeypatch, governed=True, honour=honour)
+        assert "autoApprove" not in out["mail"]
+
+    @pytest.mark.parametrize("honour", [False, True])
+    def test_a_governed_ref_loses_even_a_declared_verb(
+        self, monkeypatch: pytest.MonkeyPatch, honour: bool
+    ) -> None:
+        """The ceiling outranks a declaration as well as the opt-in."""
+        out = self._strip(
+            monkeypatch, governed=True, honour=honour, seeded={"mail": ("email_reply",)}
+        )
+        assert "autoApprove" not in out["mail"]
+
+    def test_an_unreadable_config_withholds_the_exemption(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Fail-closed: this value decides whether the approval gate runs at all."""
+        from kiro_crew.config import live
+        from kiro_crew.platform import governance as gov
+
+        def _torn() -> None:
+            raise OSError("config momentarily unreadable")
+
+        monkeypatch.setattr(gov, "may_skip_gate_now", lambda ref: True)
+        monkeypatch.setattr(live, "snapshot", _torn)
+        out = gov.strip_ungoverned_auto_approve(
+            {"mail": {"command": "mail-mcp", "autoApprove": ["email_reply"]}}, audit=False
+        )
+        assert "autoApprove" not in out["mail"]
+
+
+class TestADeclarationCoversOnlyItsOwnTransport:
+    """A declaration names a server by NAME, and a user owns the file that name lives in.
+
+    So the verbs are bound to the transport the declaring spec describes: point the
+    name at another command and the replacement inherits nothing, or a declared verb
+    becomes a way to auto-approve an arbitrary binary.
+    """
+
+    SPEC = {"declared": {"command": "/opt/edition/mcp", "args": ["serve"], "autoApprove": ["read"]}}
+
+    def _lookup(self, monkeypatch: pytest.MonkeyPatch, emitted: dict) -> dict:
+        from kiro_crew import agent
+
+        monkeypatch.setattr(agent, "_MANAGED_MCP_SERVERS", dict(self.SPEC))
+        monkeypatch.setattr(agent, "_extra_mcp_servers", lambda: {})
+        return agent.declared_auto_approve(emitted)
+
+    def test_the_matching_entry_carries_the_declaration(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        out = self._lookup(
+            monkeypatch, {"declared": {"command": "/opt/edition/mcp", "args": ["serve"]}}
+        )
+        assert out == {"declared": ("read",)}
+
+    @pytest.mark.parametrize(
+        "entry",
+        [
+            {"command": "/tmp/mine", "args": ["serve"]},
+            {"command": "/opt/edition/mcp", "args": ["serve", "--extra"]},
+            {"url": "https://example.invalid"},
+            "not-even-a-dict",
+        ],
+    )
+    def test_a_replaced_transport_carries_nothing(
+        self, monkeypatch: pytest.MonkeyPatch, entry: object
+    ) -> None:
+        assert self._lookup(monkeypatch, {"declared": entry}) == {}
+
+    def test_an_absent_entry_carries_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        assert self._lookup(monkeypatch, {}) == {}
 
 
 class TestEveryWriterRevokesAStaleGrant:
@@ -915,7 +1204,7 @@ class TestTemplateGrantsAreCeilingFilteredAtBuild:
     own file (``_install_research_agent``) shipped the template's floor-gated
     builtins (``fs_read``, ``code``, …) on a blanket auto-approve list —
     ``code`` auto-approved means unrestricted edits that never reach the
-    PreToolUse gate (#7401). Filtering at the constructor holds the invariant
+    PreToolUse gate. Filtering at the constructor holds the invariant
     by the predicate rather than by each installer's author remembering it.
     """
 
@@ -1239,6 +1528,67 @@ class TestStripAutoApproveIsAudited:
         assert "autoApprove" not in out["srv"]
         assert events and events[0]["operation"] == "mcp_auto_approve_withheld"
         assert "@srv" in events[0]["resources"]
+
+    def test_honouring_an_owner_written_list_emits_its_own_event(self, monkeypatch) -> None:
+        """GRANTING an exemption is a permission decision too.
+
+        The default respects an ``autoApprove`` the owner wrote, and those calls
+        never reach the tool gate, so without this event the only autoApprove an
+        operator can find in the feed is one that was taken AWAY -- the allowed
+        ones would leave no trace of why they were allowed.
+        """
+        from kiro_crew.platform import governance as gov
+
+        monkeypatch.setattr(gov, "may_skip_gate_now", lambda ref: True)  # ungoverned
+        monkeypatch.setattr(gov, "_auto_approve_is_honoured", lambda: True)
+        monkeypatch.setattr(gov, "_declared_auto_approve", lambda servers: {})
+        events: list[dict] = []
+
+        monkeypatch.setattr(
+            gov,
+            "sel",
+            lambda: type("S", (), {"log_api_access": lambda _s, **k: events.append(k)})(),
+        )
+        out = gov.strip_ungoverned_auto_approve({"srv": {"url": "u", "autoApprove": ["x"]}})
+        assert out["srv"]["autoApprove"] == ["x"], "the owner's own choice is respected"
+        assert events and events[0]["operation"] == "mcp_auto_approve_honoured"
+        assert "@srv" in events[0]["resources"]
+
+    def test_a_declared_list_is_not_reported_as_the_owners_decision(self, monkeypatch) -> None:
+        """What a server spec declares is Kiro Crew's own emission, not a choice
+        the owner made, so honouring it is not a grant worth a record."""
+        from kiro_crew.platform import governance as gov
+
+        monkeypatch.setattr(gov, "may_skip_gate_now", lambda ref: True)
+        monkeypatch.setattr(gov, "_auto_approve_is_honoured", lambda: True)
+        monkeypatch.setattr(gov, "_declared_auto_approve", lambda servers: {"srv": ("x",)})
+        events: list[dict] = []
+
+        monkeypatch.setattr(
+            gov,
+            "sel",
+            lambda: type("S", (), {"log_api_access": lambda _s, **k: events.append(k)})(),
+        )
+        out = gov.strip_ungoverned_auto_approve({"srv": {"url": "u", "autoApprove": ["x"]}})
+        assert out["srv"]["autoApprove"] == ["x"]
+        assert events == []
+
+    def test_the_ceiling_still_wins_over_the_owners_choice(self, monkeypatch) -> None:
+        """The ceiling is the OPERATOR's policy, not the owner's preference.
+
+        Respecting an owner-written ``autoApprove`` is a floor decision on an
+        ungoverned host. A governed ref keeps nothing whatever the config says, so
+        no value of ``mcp.honour_auto_approve`` can widen an enterprise ceiling.
+        """
+        from kiro_crew.platform import governance as gov
+
+        monkeypatch.setattr(gov, "may_skip_gate_now", lambda ref: False)  # governed
+        monkeypatch.setattr(gov, "_auto_approve_is_honoured", lambda: True)  # owner said keep
+        monkeypatch.setattr(gov, "_declared_auto_approve", lambda servers: {})
+        out = gov.strip_ungoverned_auto_approve(
+            {"srv": {"url": "u", "autoApprove": ["x"]}}, audit=False
+        )
+        assert "autoApprove" not in out["srv"]
 
 
 class TestRebuildDoesNotResurrectDeregisteredApps:

@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, memo } from 'react'
 import { useImeGuard } from '../hooks/useImeGuard'
 import { AnimatePresence, motion, useReducedMotion } from 'framer-motion'
 import { ChevronDown, ChevronRight, ChevronsDownUp, ChevronsUpDown, MessageSquare } from 'lucide-react'
+import { Glass } from './Glass'
 
 import { i18nT } from '../i18n/t'
 import { useLanguageGeneration } from '../i18n/useLanguageGeneration'
@@ -36,6 +37,24 @@ interface QuestionCardProps {
   onDraftChange?: (active: boolean) => void
 }
 
+/** Which questions a freshly mounted card starts folded shut.
+ *
+ *  Only questions after the first, and only when there is more than one. The
+ *  predicate deliberately matches the auto-fold on answering below: a lone
+ *  question is what the card exists for, so folding it would buy nothing and cost
+ *  every single-question card an extra click before it can be answered. With
+ *  several, a fully open card is taller than the viewport and buries the composer
+ *  and the conversation above it, so it opens at one question and walks DOWN as
+ *  each answer folds the question it settled.
+ *
+ *  Shared by the initial state and the question-set reset so the two cannot
+ *  drift: a replaced payload has to behave exactly like a fresh mount.
+ */
+const initialCollapsed = (questions: Question[]): Record<number, boolean> =>
+  questions.length > 1
+    ? Object.fromEntries(questions.slice(1).map((_, i) => [i + 1, true]))
+    : {}
+
 function QuestionCard({ questions, onSubmit, onDismiss, busy = false, onDraftChange }: QuestionCardProps) {
   useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const ime = useImeGuard()
@@ -53,8 +72,10 @@ function QuestionCard({ questions, onSubmit, onDismiss, busy = false, onDraftCha
   /* Which questions are folded shut. A 3-question card with four options each is
      taller than the viewport, so an un-foldable card buries the composer and the
      conversation above it. Answering also folds the question it answered, so a
-     multi-question card walks DOWN towards Submit instead of growing past it. */
-  const [collapsed, setCollapsed] = useState<Record<number, boolean>>({})
+     multi-question card walks DOWN towards Submit instead of growing past it.
+     A fresh card starts in that walked-down shape rather than at full height:
+     see `initialCollapsed`. */
+  const [collapsed, setCollapsed] = useState<Record<number, boolean>>(() => initialCollapsed(questions))
   /* All three state maps are keyed by question INDEX, which only holds while the
      question set does. PendingQuestionCard keys this component by `ask_id` — but
      a legacy (ask_id-less) card falls back to the slot key, so a second
@@ -76,7 +97,7 @@ function QuestionCard({ questions, onSubmit, onDismiss, busy = false, onDraftCha
     setLastKey(questionKey)
     setSelections({})
     setCustomInputs({})
-    setCollapsed({})
+    setCollapsed(initialCollapsed(questions))
   }
 
   const toggleCollapsed = (qIdx: number) =>
@@ -114,12 +135,32 @@ function QuestionCard({ questions, onSubmit, onDismiss, busy = false, onDraftCha
       return { ...prev, [qIdx]: next }
     })
     setCustomInputs(prev => ({ ...prev, [qIdx]: '' }))
-    /* Auto-fold the question this pick just settled. Only for single-select — a
-       multi-select is not finished after one click — only when the card holds
-       more than one question, and never when the click DESELECTED (there is no
-       answer to summarise and the user is still choosing). */
+    /* Auto-fold the question this pick just settled, and open the next one that
+       still has no answer. Only for single-select — a multi-select is not
+       finished after one click — only when the card holds more than one
+       question, and never when the click DESELECTED (there is no answer to
+       summarise and the user is still choosing).
+
+       The fold and the hand-off have to happen together. Folding alone would
+       leave every following question shut, because a fresh card already starts
+       with them folded, so each one would cost a click on a muted row to find
+       before it could be answered. Together they walk the card DOWN: exactly one
+       question is open at a time, it is always the next one that needs an
+       answer, and the card ends fully folded on Submit once nothing is left.
+       Answered means a picked option or typed custom text, the same pair Submit
+       reads, so re-opening an earlier question to change its pick hands off to
+       whatever is still outstanding rather than to the question after it. */
     if (!multi && !wasSelected && questions.length > 1) {
-      setCollapsed(prev => ({ ...prev, [qIdx]: true }))
+      const answered = (i: number) =>
+        i === qIdx ||
+        (selections[i]?.size ?? 0) > 0 ||
+        (customInputs[i] ?? '').trim() !== ''
+      const nextUnanswered = questions.findIndex((_, i) => !answered(i))
+      setCollapsed(prev => ({
+        ...prev,
+        [qIdx]: true,
+        ...(nextUnanswered === -1 ? {} : { [nextUnanswered]: false }),
+      }))
     }
   }
 
@@ -159,7 +200,12 @@ function QuestionCard({ questions, onSubmit, onDismiss, busy = false, onDraftCha
        only once you can reach a chevron. The cap is viewport-relative so the
        composer and the conversation keep their share on a short window, with an
        absolute ceiling so a tall window does not stretch the card to fill it. */
-    <div className="border border-accent/30 rounded-xl bg-card shadow-md overflow-hidden animate-scale-in flex flex-col max-h-[min(60vh,32rem)]">
+    <Glass variant="chip" radius={12} className="glass-accent glass-shadow rounded-xl animate-scale-in flex flex-col max-h-[min(60vh,32rem)]">
+      {/* The clip lives one level in, not on the pane: the pane's hairlines sit
+          half a pixel OUTSIDE its top and bottom edges, and `overflow: hidden`
+          on the pane itself would cut them. The inner box inherits the radius
+          so the scroller's edge and its scrollbar are still clipped to the arc. */}
+      <div className="flex flex-col min-h-0 overflow-hidden rounded-[inherit]">
       {/* The scroller holds ONLY the questions; the action row below stays out of
           it so Submit / Dismiss are reachable without scrolling to the end. */}
       <div className="flex-1 min-h-0 overflow-y-auto">
@@ -210,11 +256,18 @@ function QuestionCard({ questions, onSubmit, onDismiss, busy = false, onDraftCha
                       residual strip that jumps away when the animation ends. */}
                   <div className="pt-2.5 flex flex-col gap-1.5">
                   {q.options.map(opt => {
-                    const isSelected = selections[qIdx]?.has(opt.label)
+                    const isSelected = !!selections[qIdx]?.has(opt.label)
                     return (
                       <button
                         key={opt.label}
                         onClick={() => toggleOption(qIdx, opt.label, q.multiSelect ?? false)}
+                        /* WCAG 4.1.2: the selected state must be programmatic, not
+                           CSS-only. aria-pressed (toggle button) in BOTH modes: it
+                           matches multiSelect's independent toggles exactly, and for
+                           single-select it keeps the intended click-again-to-deselect
+                           honest — role=radio would promise a control that cannot be
+                           unchecked by re-activating it, which this one can. */
+                        aria-pressed={isSelected}
                         className={`text-left px-3 py-2 rounded-lg text-[13px] cursor-pointer transition-all border ${
                           isSelected
                             ? 'border-accent text-text bg-accent-subtle/60'
@@ -244,7 +297,7 @@ function QuestionCard({ questions, onSubmit, onDismiss, busy = false, onDraftCha
                     if (ime.isComposing(e)) return
                     if (allAnswered && !busy) handleSubmit()
                   }}
-                  className="mt-2 w-full px-3 py-2 rounded-lg border border-border bg-bg text-text text-[13px] placeholder:text-muted focus-visible:border-accent focus:outline-none"
+                  className="mt-2 w-full px-3 py-2 rounded-lg border border-border bg-bg text-text text-[13px] placeholder:text-muted focus-visible:border-accent focus:outline-hidden"
                 />
                 </motion.div>
               )}
@@ -273,6 +326,7 @@ function QuestionCard({ questions, onSubmit, onDismiss, busy = false, onDraftCha
             onClick={onDismiss}
             disabled={busy}
             aria-label={i18nT('components.questionCard.dismiss_question_without_answering')}
+            title={i18nT('components.questionCard.dismiss_hint')}
             className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md text-[13px] font-medium cursor-pointer transition-all disabled:opacity-30 disabled:cursor-not-allowed bg-transparent text-muted hover:text-text border border-border"
           >
             {i18nT('components.questionCard.dismiss')}
@@ -286,7 +340,19 @@ function QuestionCard({ questions, onSubmit, onDismiss, busy = false, onDraftCha
           <MessageSquare size={14} /> {i18nT('components.questionCard.submit')}
         </button>
       </div>
-    </div>
+      {/* Dismiss is the only control that ends a question nobody is going to
+          answer, so it has to say what it does: the label alone reads as "hide
+          this for now" and a user who suspects it might throw the question away
+          leaves a dead card parked above the composer instead. Rendered as a
+          line rather than only as the button's title, because a tooltip does not
+          exist for touch or for a keyboard user reading the row. */}
+      {onDismiss && (
+        <div className="px-4 pb-3 -mt-1.5 text-[12px] text-muted shrink-0 text-right">
+          {i18nT('components.questionCard.dismiss_hint')}
+        </div>
+      )}
+      </div>
+    </Glass>
   )
 }
 

@@ -28,6 +28,9 @@ from kiro_crew.acp.liveness import (
     VERDICT_DEAD,
     VERDICT_UNKNOWN,
     VERDICT_WORKING,
+    DarwinProcessBackend,
+    LivenessOracle,
+    ProcessRow,
     ToolCallState,
 )
 from kiro_crew.acp.session_handle import AcpSessionHandle, WatchdogSettings
@@ -39,6 +42,7 @@ from kiro_crew.acp.types import (
     STOP_REASON_TOOL_STALL,
     JsonRpcMessage,
 )
+from kiro_crew.config.loader import WatchdogConfig
 from kiro_crew.dashboard.state import (
     STALE_RECOVERY_PREFIX,
     TOOL_STALL_RECOVERY_PREFIX,
@@ -84,6 +88,10 @@ class _FreshActivityRuntime:
     @property
     def _last_activity(self) -> float:
         return time.monotonic()
+
+
+# The shipped global windows, so a default change lands here without a literal to chase.
+_GLOBAL = WatchdogConfig()
 
 
 def _make_handle(
@@ -584,8 +592,8 @@ def test_per_agent_override_narrows_watchdog_snapshot(monkeypatch):
     assert wd.tool_stall_suspect_secs == 900.0
     assert wd.tool_stall_hard_cap_secs == 1800.0
     # Non-overridden windows inherit the globals untouched.
-    assert wd.model_silent_probe_secs == 900.0
-    assert wd.stale_window_secs == 300.0
+    assert wd.model_silent_probe_secs == _GLOBAL.model_silent_probe_secs
+    assert wd.stale_window_secs == _GLOBAL.stale_window_secs
 
 
 def test_per_agent_override_zero_inherits_global(monkeypatch):
@@ -599,8 +607,8 @@ def test_per_agent_override_zero_inherits_global(monkeypatch):
     })
 
     wd = _load_watchdog_settings("builder")
-    assert wd.tool_stall_suspect_secs == 3600.0
-    assert wd.tool_stall_hard_cap_secs == 3600.0
+    assert wd.tool_stall_suspect_secs == _GLOBAL.tool_stall_suspect_secs
+    assert wd.tool_stall_hard_cap_secs == _GLOBAL.tool_stall_hard_cap_secs
 
 
 def test_kiro_binding_name_is_not_resolved(monkeypatch):
@@ -619,7 +627,7 @@ def test_kiro_binding_name_is_not_resolved(monkeypatch):
         ),
     })
 
-    assert _load_watchdog_settings("pr-reviewer-kiro").tool_stall_suspect_secs == 3600.0
+    assert _load_watchdog_settings("pr-reviewer-kiro").tool_stall_suspect_secs == _GLOBAL.tool_stall_suspect_secs
 
 
 def test_shared_binding_cannot_collide_canonical_names(monkeypatch):
@@ -657,7 +665,7 @@ def test_handle_snapshots_crew_agent_overrides(monkeypatch):
     assert handle._watchdog.tool_stall_suspect_secs == 450.0
     assert handle._watchdog.agent_override is True
     bare = AcpSessionHandle("s2", asyncio.Queue(), rt)
-    assert bare._watchdog.tool_stall_suspect_secs == 3600.0
+    assert bare._watchdog.tool_stall_suspect_secs == _GLOBAL.tool_stall_suspect_secs
     assert bare._watchdog.agent_override is False
 
 
@@ -676,7 +684,7 @@ def test_rebind_watchdog_follows_warm_pool_rekey(monkeypatch):
     rt = MagicMock()
     rt.pid = None
     handle = AcpSessionHandle("s1", asyncio.Queue(), rt)  # pool spawn: no crew
-    assert handle._watchdog.tool_stall_suspect_secs == 3600.0
+    assert handle._watchdog.tool_stall_suspect_secs == _GLOBAL.tool_stall_suspect_secs
 
     handle.rebind_watchdog("claimer")
     assert handle._crew_agent == "claimer"
@@ -684,7 +692,7 @@ def test_rebind_watchdog_follows_warm_pool_rekey(monkeypatch):
     assert handle._watchdog.agent_override is True
 
     handle.rebind_watchdog("")
-    assert handle._watchdog.tool_stall_suspect_secs == 3600.0
+    assert handle._watchdog.tool_stall_suspect_secs == _GLOBAL.tool_stall_suspect_secs
     assert handle._watchdog.agent_override is False
 
 
@@ -695,8 +703,8 @@ def test_unknown_agent_inherits_global(monkeypatch):
 
     _cfg_with_agent_overrides(monkeypatch, {})
 
-    assert _load_watchdog_settings("nope").tool_stall_suspect_secs == 3600.0
-    assert _load_watchdog_settings("").tool_stall_suspect_secs == 3600.0
+    assert _load_watchdog_settings("nope").tool_stall_suspect_secs == _GLOBAL.tool_stall_suspect_secs
+    assert _load_watchdog_settings("").tool_stall_suspect_secs == _GLOBAL.tool_stall_suspect_secs
 
 
 @pytest.mark.asyncio
@@ -827,6 +835,46 @@ def test_extract_log_redirect_target():
     assert extract_log_redirect_target("cmd 2>&1") == ""  # fd-dup only — no file
     assert extract_log_redirect_target("cmd > /dev/null 2>&1") == ""
     assert extract_log_redirect_target("plain command") == ""
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        # The redirect operator must open a token: the `>` inside `->` / `=>`
+        # (Markdown prose, JS fat arrows) is not a redirect.
+        ("... then spawn MERGE (lane files -> findings/FINAL.tsv) and RECALL ...", ""),
+        ("step 1 -> step 2", ""),
+        ("const f = (x) => x + 1", ""),
+        ('cmd && echo "a -> b"', ""),
+        # Real redirects keep working, including an fd digit or `&>` before the
+        # operator and an operator at the very start of the text.
+        ("npm test > test.log 2>&1", "test.log"),
+        ("make all >> build.log", "build.log"),
+        ("cmd 2> err.log", "err.log"),
+        ("cmd 1>> app.log", "app.log"),
+        ("cmd &> both.log", "both.log"),
+        ("> out.txt", "out.txt"),
+        # fd-dup forms have no file target; a redirect after one is still found.
+        ("cmd 2>&1", ""),
+        ("cmd >&2", ""),
+        ("cmd 2>&1 > out.log", "out.log"),
+        # A target never carries a closing parenthesis along.
+        ("(cmd > out.log)", "out.log"),
+    ],
+)
+def test_extract_log_redirect_target_operator_opens_a_token(text, expected):
+    assert extract_log_redirect_target(text) == expected
+
+
+def test_build_tool_stall_recovery_prompt_file_write_content_has_no_redirect_hint():
+    # The stalled tool's raw input is scanned whatever the tool's kind; for a
+    # file write that is the file's content, and an arrow in it is not a redirect.
+    body = build_tool_stall_recovery_prompt(
+        "Editing notes.md", 1802, command="merge lane files -> findings/FINAL.tsv) then report"
+    )
+    assert "redirected to" not in body
+    assert "FINAL.tsv" not in body
+    assert "partial results" in body.lower()
 
 
 # ── F2: TOCTOU race — progress frame during oracle must prevent cancel ────────
@@ -1132,6 +1180,15 @@ def _consult_handle(sample_secs: float = 3.0) -> AcpSessionHandle:
     rt.send_notification = AsyncMock()
     wd = WatchdogSettings(wellness_sample_secs=sample_secs)
     handle = AcpSessionHandle("sA", asyncio.Queue(), rt, watchdog=wd)
+    # Fabricated PIDs must never query the host process table. fresh() carries
+    # this backend across retirement while preserving the real oracle logic.
+    process_backend = MagicMock(spec=DarwinProcessBackend)
+    process_backend.descendants.return_value = None
+    process_backend.row.return_value = None
+    process_backend.cpu_nanos.return_value = None
+    handle._oracle = LivenessOracle(
+        sample_min_secs=sample_secs, darwin_backend=process_backend
+    )
     handle._turn_done.clear()
     handle._inflight_tool = ToolCallState(title="bash", command="sleep 1", is_shell=True)
     return handle
@@ -1551,7 +1608,7 @@ async def test_a_previous_tools_walk_cannot_claim_the_new_tools_child():
 
 
 @pytest.mark.asyncio
-async def test_tracked_child_still_carries_across_ticks_after_retirement():
+async def test_tracked_child_still_carries_across_ticks_after_retirement(monkeypatch):
     """Retirement must not break the cross-tick contract it sits next to.
 
     ``check_tool``'s exact-exit detection depends on ``_tracked_child`` surviving
@@ -1561,6 +1618,14 @@ async def test_tracked_child_still_carries_across_ticks_after_retirement():
     new instance the way they did before — including through the in-flight gate,
     which releases as soon as a walk completes.
     """
+    # The fabricated runtime is unreadable, but its tracked PID can belong to
+    # an unrelated live process on the host. The fixture must isolate both.
+    host_backend = MagicMock(spec=DarwinProcessBackend)
+    host_backend.descendants.return_value = None
+    host_backend.row.return_value = ProcessRow(pid=4321, started=0.0, cmdline="sleep 1")
+    monkeypatch.setattr(
+        "kiro_crew.acp.liveness.select_darwin_backend", lambda _proc: host_backend
+    )
     handle = _consult_handle()
     handle._retire_liveness_state()
     live = handle._oracle
@@ -1585,3 +1650,6 @@ async def test_tracked_child_still_carries_across_ticks_after_retirement():
     assert evidence.startswith("shell child exited")
     assert verdict == VERDICT_UNKNOWN  # inside CHILD_EXIT_GRACE_SECS
     assert live._child_gone_ts is not None
+    host_backend.descendants.assert_not_called()
+    host_backend.row.assert_not_called()
+    host_backend.cpu_nanos.assert_not_called()

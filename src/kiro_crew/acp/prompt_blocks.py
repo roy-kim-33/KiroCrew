@@ -31,20 +31,34 @@ import io
 import json
 import logging
 import os
-import re
 from pathlib import Path
 
 from kiro_crew.hooks import is_unc_shape, safe_read_file_bytes, unc_probe_allowed
 
+# The path grammar and the history scrubber live in the LEAF module
+# kiro_crew.image_refs for the same reason the Pillow machinery lives in
+# kiro_crew.imaging: kiro_crew.context needs the scrubber and the
+# agent-sdk-boundary gate forbids application code from importing
+# kiro_crew.acp. The pattern names are re-exported because this module and
+# its tests are where they have always been read from.
+from kiro_crew.image_refs import (  # noqa: F401 -- re-exported, see comment
+    _PATH_RE,
+    _POSIX_PATH_RE,
+    _WINDOWS_PATH_RE,
+    STRIPPED_IMAGE_MARKER,
+    strip_image_refs,
+)
+
 # The budget constants and Pillow machinery live in the LEAF module
 # kiro_crew.imaging (shared with the gateway's tool-result rewrite, which must
 # not import the ACP package). The two constants are re-exported because this
-# module is where the prompt path's callers and tests historically found them.
+# module is where the prompt path's callers and tests import them from.
 from kiro_crew.imaging import (  # noqa: F401 -- constants re-exported, see comment
     MAX_IMAGE_B64_BYTES,
     MAX_IMAGE_EDGE_PX,
     downscale_image_block,
 )
+from kiro_crew.messaging.raster import SNIFF_BYTES, sniff_raster_mime
 from kiro_crew.platform_compat import first_linked_ancestor, is_link_or_junction
 
 logger = logging.getLogger(__name__)
@@ -67,6 +81,7 @@ IMAGE_MEDIA_TYPES: dict[str, str] = {
 #: a file that passed ingestion is not silently dropped here.
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 
+<<<<<<< HEAD
 #: Formats every major vision provider accepts natively. Anything outside this
 #: set (AVIF, HEIC, TIFF, ICO, …) has to be transcoded to PNG before it is
 #: inlined, or the backend returns 400 "Could not process image". Mirrors the
@@ -215,6 +230,8 @@ _WINDOWS_PATH_RE = re.compile(
 
 _PATH_RE = _WINDOWS_PATH_RE if os.name == "nt" else _POSIX_PATH_RE
 
+=======
+>>>>>>> upstream/main
 
 def build_prompt_blocks(
     message: str,
@@ -262,8 +279,8 @@ def build_prompt_blocks(
                 continue
             path = Path(raw)
             suffix = path.suffix.lower()
-            mime = IMAGE_MEDIA_TYPES.get(suffix)
-            if mime is None:
+            suffix_mime = IMAGE_MEDIA_TYPES.get(suffix)
+            if suffix_mime is None:
                 # Unreachable for regex-produced candidates today (_PATH_RE's
                 # suffix group and IMAGE_MEDIA_TYPES share one key set), kept
                 # as the lexical backstop should the two ever drift.
@@ -312,6 +329,7 @@ def build_prompt_blocks(
                 # stays in the text; it is NOT inlined.
                 logger.warning("acp prompt: image read refused for %s", path.name)
                 continue
+<<<<<<< HEAD
             # Magic-byte sniff is authoritative: a channel that lies about
             # content-type (Discord serving PNG bytes as webp) would otherwise
             # inline a payload the backend rejects with 400. When the real
@@ -342,6 +360,30 @@ def build_prompt_blocks(
                     continue
                 raw_bytes = transcoded
                 mime = "image/png"
+=======
+            # The suffix selects path CANDIDATES; the bytes decide what reaches
+            # the wire. Require a complete sniff window so a truncated header
+            # cannot become a pass-through image when Pillow is unavailable.
+            mime = (
+                sniff_raster_mime(raw_bytes[:SNIFF_BYTES])
+                if len(raw_bytes) >= SNIFF_BYTES
+                else None
+            )
+            if mime is None or mime not in IMAGE_MEDIA_TYPES.values():
+                logger.warning(
+                    "acp prompt: %s is not a supported raster by content - "
+                    "sending path, not inline",
+                    path.name,
+                )
+                continue
+            if mime != suffix_mime:
+                logger.info(
+                    "acp prompt: %s is %s by content, not %s by suffix; using content",
+                    path.name,
+                    mime,
+                    suffix_mime,
+                )
+>>>>>>> upstream/main
             downscaled = downscale_image_block(
                 raw_bytes, mime, max_edge=max_image_edge, max_b64_bytes=max_image_b64_bytes
             )
@@ -397,8 +439,8 @@ def summarize_prompt_structure(blocks: object) -> dict:
       than a size describing a payload the counts claim is empty.
 
     This summary is deliberately safe to log: it carries no content and
-    therefore cannot leak credentials or user data. That is a hard requirement
-    (issue #6022) -- the kiro-cli data dir is fenced precisely because it holds
+    therefore cannot leak credentials or user data. That is a hard
+    requirement -- the kiro-cli data dir is fenced precisely because it holds
     SSO tokens, so the outbound-request diagnostics must expose counts, types,
     and sizes ONLY, never the bytes themselves.
 

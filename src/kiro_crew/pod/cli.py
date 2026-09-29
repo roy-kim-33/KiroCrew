@@ -11,6 +11,7 @@ import contextlib
 import io
 import json
 import logging
+import os
 import re
 import subprocess
 import sys
@@ -54,8 +55,117 @@ def _die(msg: str) -> NoReturn:
     sys.exit(1)
 
 
-def _wait_healthy(cfg: PodConfig, name: str, port: int, tries: int = 45) -> int:
-    """Poll until the pod itself serves (200/401/403), or bail fast on failure.
+# Default health-wait budget for `pod up`, in seconds. A first pod boot does
+# real extra work beyond serving /api/health -- config migration, staging CLI
+# files, minting a fresh .local_secret -- and on a loaded host a healthy
+# gateway was measured needing well past the old 45s wall, so the default is
+# twice that. Override per-run with `pod up --wait-secs` or the env var below.
+POD_HEALTH_WAIT_SECS_DEFAULT = 90
+POD_HEALTH_WAIT_SECS_ENV = "KIROCREW_POD_HEALTH_SECS"
+# Floor so a misconfigured tiny value cannot make every boot fail before the
+# gateway has any chance to answer; ceiling so an absurd value cannot wedge
+# `pod up` for hours or overflow float arithmetic on the deadline.
+_POD_HEALTH_WAIT_FLOOR_SECS = 5
+_POD_HEALTH_WAIT_CEIL_SECS = 3600
+#: :func:`_wait_healthy` verdict: the pod was still serving when the budget expired,
+#: having published no internal-API credential. Distinct from every other verdict
+#: because it is the only one describing a LIVE gateway, and because it is the one
+#: verdict no HTTP status can express. Two causes reach it -- a credential write that
+#: failed, and one that simply landed after the budget -- so the message names both
+#: the journal and the budget escalation and lets the pod's own log separate them.
+#: Negative for the same reason as :data:`rt.HEALTH_FOREIGN`: the caller's success
+#: test is membership in ``(200, 401, 403)``, so every non-answer must fall outside
+#: it. Kept here rather than in ``rt`` because it is this wait's verdict, not a
+#: property of a pod.
+#:
+#: Derived from ``rt.HEALTH_FOREIGN`` rather than written as a literal, and pinned
+#: distinct by a test: the two sentinels share one return channel, and -2 was
+#: already taken, so a literal here silently routed this verdict into the
+#: foreign-port branch and told the operator to pick a different port for a
+#: credential problem.
+HEALTH_NO_CREDENTIAL = rt.HEALTH_FOREIGN - 1
+#: The budget expired while the gateway WAS serving on the final poll, but it had
+#: not been serving long enough for the credential verdict to be honest about it.
+#:
+#: Carried as its own verdict rather than collapsed into the bare status, because
+#: "it answered, just not for long" is knowledge only this wait has, and folding it
+#: into ``last_http`` destroys it: that is 0 whenever no error status was seen, which
+#: is indistinguishable from a port nothing ever answered. The caller then re-derived
+#: liveness from the unit -- and ``restarts == 0`` is false for every pod that ever
+#: auto-restarted, exactly the recovered-pod population this wait exists to serve --
+#: so a gateway last seen answering 200 was reported as never healthy, with the one
+#: remedy that applies (a bigger budget) suppressed.
+#:
+#: Derived from :data:`HEALTH_NO_CREDENTIAL` for the reason given above it, and pinned
+#: distinct from every sibling by a test.
+HEALTH_SERVING_TOO_BRIEFLY = HEALTH_NO_CREDENTIAL - 1
+#: How long a pod must have been CONTIGUOUSLY serving before the exhausted budget
+#: is attributed to its credential write rather than to a slow boot. One poll
+#: interval, which is the smallest span that can carry the claim: the verdict says
+#: the gateway was watched serving, a full poll was waited out, and no credential
+#: appeared. A gateway that binds in the final second is serving on the last poll
+#: while having had no chance to publish, and its remedy is a bigger budget.
+_MIN_SERVING_SPAN_SECS = 1.0
+
+
+def _health_wait_secs(args: argparse.Namespace) -> int:
+    """Resolve the `pod up` health-wait budget in seconds: flag > env > default.
+
+    The env var must parse as a positive integer; a malformed value warns on
+    stderr and falls back to the default rather than raising, so a typo in a
+    profile cannot make `pod up` unbootable. The result is clamped to a small
+    floor for the same reason in the other direction.
+    """
+    secs = getattr(args, "wait_secs", None)
+    if secs is not None:
+        if secs <= 0:
+            # The warning promises the default, so the default is what applies:
+            # an invalid explicit flag does not fall through to the env var.
+            print(
+                f"pod: ignoring --wait-secs {secs} (not a positive integer); "
+                f"using the default {POD_HEALTH_WAIT_SECS_DEFAULT}s",
+                file=sys.stderr,
+            )
+            secs = POD_HEALTH_WAIT_SECS_DEFAULT
+    else:
+        raw = os.environ.get(POD_HEALTH_WAIT_SECS_ENV, "").strip()
+        if raw:
+            try:
+                secs = int(raw)
+                if secs <= 0:
+                    raise ValueError(raw)
+            except ValueError:
+                print(
+                    f"pod: ignoring {POD_HEALTH_WAIT_SECS_ENV}={raw!r} (not a "
+                    f"positive integer); using the default "
+                    f"{POD_HEALTH_WAIT_SECS_DEFAULT}s",
+                    file=sys.stderr,
+                )
+                secs = POD_HEALTH_WAIT_SECS_DEFAULT
+    if secs is None:
+        secs = POD_HEALTH_WAIT_SECS_DEFAULT
+    return min(max(secs, _POD_HEALTH_WAIT_FLOOR_SECS), _POD_HEALTH_WAIT_CEIL_SECS)
+
+
+def _wait_healthy(
+    cfg: PodConfig,
+    name: str,
+    port: int,
+    tries: int = POD_HEALTH_WAIT_SECS_DEFAULT,
+    superseded: str = "",
+) -> int:
+    """Poll until the pod is USABLE (serving 200/401/403 *and* credentialled), or
+    bail fast on failure.
+
+    *superseded* is the credential that was on disk BEFORE this command started the
+    gateway, and readiness then requires a credential that is not that one. A pod
+    home survives a crash -- ``clear_marker`` runs only on a graceful shutdown and
+    the stale-marker prune deliberately never removes the credential -- so without
+    this a reboot of a crashed pod reads its predecessor's secret on the first poll,
+    calls the pod ready before the new gateway has published anything, and hands the
+    mint a credential that gateway never minted. Left ``""`` when there is nothing
+    to supersede: a pod that was ALREADY active is not a new generation, so its
+    current credential is the right one and must not be waited out.
 
     Returns the HTTP code on success, or a negative sentinel on early failure:
       -1 = the unit's gateway crashed / is crash-looping (a broken worktree build
@@ -63,8 +173,37 @@ def _wait_healthy(cfg: PodConfig, name: str, port: int, tries: int = 45) -> int:
            caller surfaces the gateway's own journal as the cause.
       ``rt.HEALTH_FOREIGN`` = the port answers, but another process owns it, so
            this pod's gateway cannot have bound it.
+      :data:`HEALTH_NO_CREDENTIAL` = the pod was STILL serving when the budget
+           expired, having published no internal-API credential for long enough to
+           rule out a gateway that had only just bound, so the mint that follows
+           this wait could never have succeeded.
+      :data:`HEALTH_SERVING_TOO_BRIEFLY` = the pod was serving on the final poll but
+           for less than that span, so the budget is what ran out rather than the
+           credential write. The caller reports a slow boot and names the budget.
+
+    Serving is NOT the whole readiness signal, which is why the credential is part
+    of the success condition rather than something the caller checks afterwards. A
+    gateway publishes its credential only after its listener is bound, so from the
+    bind until the end of the remaining startup work the port is already answering
+    while the credential does not exist yet. ``up`` mints immediately after this
+    wait returns, so a wait that stopped at the HTTP status would hand the mint a
+    pod whose credential is still unwritten and die with "no internal-API
+    credential ... is it running?" -- on a loaded runner, intermittently, naming a
+    cause ("is it running?") that is the opposite of true.
+
     A pod IS the worktree's gateway, so a dead gateway is a real, expected signal —
-    we just want it fast and clearly attributed, not a silent 45s timeout.
+    we just want it fast and clearly attributed, not a silent timeout. ``tries``
+    is the WALL-CLOCK budget in seconds, enforced by a monotonic deadline
+    (default ``POD_HEALTH_WAIT_SECS_DEFAULT``, overridable via `pod up
+    --wait-secs` or ``KIROCREW_POD_HEALTH_SECS``): polls run about once per
+    second when the port answers fast, and a slow probe (a bound-but-silent
+    socket eats the probe's own timeout) shortens the remaining sleeps rather
+    than stretching the budget, so the total overrun is at most one probe. The
+    credential check shares that one budget rather than adding a second timer, so
+    the operator's existing knob still bounds the whole wait.
+    The exhausted-budget return is 0 only when NOTHING ever answered the
+    port: a real HTTP status (the last polled one, or the last one seen
+    before the port went silent) is returned whenever the gateway spoke.
 
     A foreign responder does NOT end the wait on sight. The pod may still be
     starting, and its own gateway may be moments from winning the port back after
@@ -75,21 +214,158 @@ def _wait_healthy(cfg: PodConfig, name: str, port: int, tries: int = 45) -> int:
     journal that only says "address already in use".
     """
     saw_foreign = False
-    for _ in range(tries):
+    last_http = 0
+    serving_since = None
+    deadline = time.monotonic() + max(tries, 1)
+    while True:
         code = rt.health(cfg, name, port)
-        if code in (200, 401, 403):
+        # Timestamped AFTER the probe returns, because that is when the reading is
+        # true. `health` does real I/O -- a connect, a request, and an ownership
+        # lookup once something answered -- so a timestamp taken before it would
+        # credit the probe's own latency as time this pod spent serving. The span
+        # below is what separates "watched it serve and still found no credential"
+        # from "it had no chance to publish yet", and inflating it by the probe
+        # latency lets a single slow 200 satisfy the span on its own, reporting a
+        # slow boot as a credential failure.
+        observed = time.monotonic()
+        serving = code in (200, 401, 403)
+        # Contiguous, so a gateway that served, dropped and came back is timed from
+        # the comeback rather than credited with the gap.
+        serving_since = (
+            (serving_since if serving and serving_since is not None else observed)
+            if serving
+            else None
+        )
+        live = rt.published_credential(cfg, name, port)
+        if serving and live and live != superseded:
             return code
         if code == rt.HEALTH_FOREIGN:
             saw_foreign = True
+        elif serving:
+            # Cleared only on POSITIVE proof of ownership, which a serving code is
+            # not. `health` downgrades to HEALTH_FOREIGN only when `port_owner`
+            # PROVES a foreign responder, and returns the status unchanged for
+            # ``OWNER_UNPROVEN`` -- a pid on the port with no fresh record behind it,
+            # which is what a failed or unavailable listener lookup leaves. Treating
+            # "not provably foreign" as "provably ours" would clear the latch for a
+            # still-foreign port whose attestation merely stopped working, which is
+            # the reverse of what this latch is for. `port_owner` is asked directly,
+            # and only while the latch is set, so the extra attestation is confined to
+            # the one path whose verdict can change and the common boot pays nothing.
+            if saw_foreign and rt.port_owner(cfg, name, port) == rt.OWNER_POD:
+                saw_foreign = False
+        elif code > 0:
+            # Any real HTTP answer is remembered: a gateway that served an
+            # error and then went silent DID answer, and reporting 0 for it
+            # would misattribute a broken health route as a slow boot.
+            #
+            # Only NON-serving codes reach this line, which the branch above now
+            # guarantees structurally, and that restriction is load-bearing rather
+            # than tidy. Membership in ``(200, 401, 403)`` is the caller's whole
+            # success test, so remembering a serving code here would let the
+            # exhausted-budget return hand back a 200 for a pod that has stopped
+            # serving and has no credential -- reported as success, straight into a
+            # mint that cannot work.
+            last_http = code
         state, restarts = rt.unit_state(cfg, name)
         # failed = exited non-zero and not restarting; restarts>0 = crash-looping.
-        if state == "failed" or restarts > 0:
+        #
+        # Not consulted while the port is SERVING. This fast-fail exists to stop
+        # waiting on a gateway that is not coming up, and a gateway that is
+        # answering has come up -- so the two readings cannot both be acted on.
+        # ``restarts`` is the unit's CUMULATIVE NRestarts and nothing in this
+        # package resets it, so a pod that ever auto-restarted carries it forever:
+        # once the credential joined readiness, a healthy recovered pod serving
+        # without its new credential yet would take the crash verdict, and the
+        # caller's cleanup would delete the home of the pod that had just
+        # recovered. While serving, the only honest outcomes are success and the
+        # credential verdict, both reached below.
+        if not serving and (state == "failed" or restarts > 0):
             return rt.HEALTH_FOREIGN if saw_foreign else -1
-        time.sleep(1)
-    final = rt.health(cfg, name, port)
-    if final in (200, 401, 403):
-        return final
-    return rt.HEALTH_FOREIGN if (saw_foreign or final == rt.HEALTH_FOREIGN) else final
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            # Re-read before attributing anything, because every other reading in
+            # this iteration predates the work the iteration did: the credential was
+            # read at the top, and `health` and `unit_state` each do real I/O whose
+            # latency is exactly the window this wait exists to cover. A credential
+            # published inside that window is present but unseen, and the verdicts
+            # below would then report "the gateway published none" about a pod that
+            # had -- and the caller tears down a pod it started over an empty home on
+            # that word. One file read is the whole cost of resting the verdict on
+            # the freshest observation available at the moment it is made.
+            live = rt.published_credential(cfg, name, port)
+            if serving and live and live != superseded:
+                return code
+            if saw_foreign:
+                return rt.HEALTH_FOREIGN
+            # Ahead of the bare status, for the same reason FOREIGN is: a pod
+            # STILL serving at the deadline with no credential is not a slow boot,
+            # and returning its 200 would send the caller on to a mint that cannot
+            # succeed.
+            #
+            # Keyed on this LAST poll, and deliberately not on a sticky "was ever
+            # seen serving" flag: a latch would mean a gateway that answered 200
+            # once inside the very bind-to-credential window this wait exists for,
+            # and then died or started serving 5xx for the remaining budget, still
+            # exhausted into the credential verdict -- the one attribution that
+            # says the gateway is healthy.
+            #
+            # The span requirement is the other half. A gateway that binds in the
+            # final second of its budget is serving on the last poll while having
+            # had no chance at all to publish, and the honest reading of that is a
+            # slow boot whose remedy is a bigger budget. Requiring the serving
+            # state to have survived a full poll interval means the verdict rests
+            # on having watched the pod serve, waited, and still found no
+            # credential.
+            # Keyed on the start timestamp rather than on `serving`, which is the same
+            # condition one inference away: `serving_since` is set exactly when
+            # serving and cleared otherwise, so testing it directly is both equivalent
+            # and the honest predicate -- a span cannot be measured without the
+            # instant it started.
+            if (
+                serving_since is not None
+                and (time.monotonic() - serving_since) >= _MIN_SERVING_SPAN_SECS
+            ):
+                return HEALTH_NO_CREDENTIAL
+            if serving:
+                # Serving too briefly to blame the credential write. Its own code
+                # must still not be returned, because membership in
+                # ``(200, 401, 403)`` is the caller's whole success test and this
+                # pod has no credential -- but neither may it become ``last_http``,
+                # which is 0 here and reads as "nothing ever answered". The caller
+                # needs the distinction to reach for a bigger budget instead of
+                # sending the operator after a dead process.
+                return HEALTH_SERVING_TOO_BRIEFLY
+            return code or last_http
+        time.sleep(min(1.0, remaining))
+
+
+def _wait_escalation_hint(name: str, wait_secs: int) -> str:
+    """How to give a slow pod more time, or why there is no more to give.
+
+    ``_health_wait_secs`` clamps to :data:`_POD_HEALTH_WAIT_CEIL_SECS`, so advice
+    naming a value above the ceiling sends the operator to retry the budget that
+    just failed. The question is therefore whether THIS budget is already at the
+    ceiling -- not whether doubling it would exceed one, which is true for every
+    budget past the halfway mark and would withhold the real remedy from, say, a
+    2000s wait the resolver honours verbatim. Below the ceiling there is always
+    more to ask for, so the advice names the smaller of double and the ceiling,
+    which is the larger value the resolver will actually honour.
+
+    Shared by both exhausted-budget verdicts because the arithmetic is what was
+    wrong, not either message.
+    """
+    if wait_secs >= _POD_HEALTH_WAIT_CEIL_SECS:
+        return (
+            f"The budget is already at its {_POD_HEALTH_WAIT_CEIL_SECS}s ceiling, so a "
+            f"longer wait cannot be requested -- this is the worktree's own boot time "
+            f"to fix."
+        )
+    raised = min(wait_secs * 2, _POD_HEALTH_WAIT_CEIL_SECS)
+    return (
+        f"Raise the wait with `kirocrew pod up {name} --wait-secs {raised}` or "
+        f"{POD_HEALTH_WAIT_SECS_ENV}={raised}."
+    )
 
 
 def _resolve_or_die(cfg: PodConfig, name: str) -> Path:
@@ -144,8 +420,25 @@ def _verify_seed_landed(cfg: PodConfig, name: str, scenario: str, home_was_popul
     )
 
 
+def _require_up_user_bus(name: str) -> None:
+    """Diagnose Linux user-bus reachability before pod-up preparation.
+
+    launchd and Task Scheduler keep their established gates at the operations
+    that use them. Running those capability probes here would mutate host
+    service state before pod-up reaches its platform-specific seam.
+    """
+    if not rt.IS_LINUX:
+        return
+    try:
+        rt.require_backend()
+    except rt.PodError as exc:
+        _audit("pod.up", "failure", f"name={name}", error=str(exc)[:120])
+        raise
+
+
 def _up(cfg: PodConfig, args: argparse.Namespace) -> None:
     name = rt.validate_name(args.name)
+    _require_up_user_bus(name)
     checkout = _resolve_or_die(cfg, name)
 
     scenario = ""
@@ -205,6 +498,10 @@ def _up(cfg: PodConfig, args: argparse.Namespace) -> None:
         if crons:
             env_updates["CRONS"] = "1"
             boot_flags.append("--crons")
+        no_embeddings = bool(getattr(args, "no_embeddings", False))
+        if no_embeddings:
+            env_updates["EMBEDDINGS"] = "0"
+            boot_flags.append("--no-embeddings")
 
         # Read the unit's state BEFORE choosing a port, and inside the mutex: the
         # two questions are one decision. An `up` against an already-active pod is
@@ -213,6 +510,15 @@ def _up(cfg: PodConfig, args: argparse.Namespace) -> None:
         # reader. Only a pod that is not running is choosing a port at all.
         was_active = rt.is_active(cfg, name)
         home_was_populated = _home_holds_state(cfg, name)
+        # Empty on the already-active path and set only where a gateway is really
+        # started (see the capture beside `start_pod`). An already-active pod is not
+        # a new generation, so its current credential is the correct one and the
+        # health wait must accept it rather than wait it out for the whole budget.
+        superseded_credential = ""
+        # Set only where `start_pod` actually returned success, so it records what
+        # THIS invocation did rather than what a probe inferred about the unit. The
+        # failed-wait cleanup keys on it because that cleanup can delete a home.
+        started_here = False
         # State that predates this command must be judged BEFORE `start_pod`:
         # any failed health wait calls `stop_pod`, whose zero-residue cleanup is
         # allowed to delete the pod home. Post-health verification remains for a
@@ -273,6 +579,15 @@ def _up(cfg: PodConfig, args: argparse.Namespace) -> None:
                     )
                 if env_updates:
                     rt.write_env_file(cfg, name, env_updates)
+                # Read the OUTGOING credential before the gateway can replace it:
+                # this is the value the health wait must refuse to accept as proof
+                # that the generation we are about to start has published its own.
+                # A crashed pod leaves its predecessor's secret behind (nothing
+                # clears it), so without this capture the wait is satisfied by the
+                # dead generation on its very first poll. Read here rather than at
+                # the top of `_up` because the port is only final once allocation
+                # has run, and the credential is keyed by port.
+                superseded_credential = rt.published_credential(cfg, name, port)
                 cp = rt.start_pod(cfg, name)
                 if cp.returncode != 0:
                     _audit(
@@ -282,6 +597,7 @@ def _up(cfg: PodConfig, args: argparse.Namespace) -> None:
                         error="backend start failed",
                     )
                     _die(f"starting pod {name} failed: {(cp.stderr or '').strip()}")
+                started_here = True
         else:
             # Re-resolve INSIDE the lock. `port` above was read before we held it,
             # so a concurrent same-name `up` that pinned a fallback in the meantime
@@ -299,36 +615,179 @@ def _up(cfg: PodConfig, args: argparse.Namespace) -> None:
                     f"(kirocrew pod down {name} && kirocrew pod up {name} {joined}).",
                     file=sys.stderr,
                 )
-        # Record boot-time settings: a pod in `yolo` auto-approves every tool and
-        # one with the scheduler on runs work unattended, so the audit trail must
-        # say so rather than recording only that a pod came up. Mark the
+        # Record boot-time settings: a pod in `yolo` auto-approves every tool, one
+        # with the scheduler on runs work unattended, and one without embeddings
+        # answers search from a different index than a normal pod -- so the audit
+        # trail must say so rather than recording only that a pod came up. Mark the
         # requested-but-not-yet-effective case: `boot` reads these once at start,
         # so a setting recorded against a live pod has not applied yet.
+        # `embeddings=off` is keyed on what the pod boots WITH, not on this command's
+        # flag. The merge-preserving env file keeps EMBEDDINGS=0 from an earlier `up`,
+        # so a re-up without the flag boots the same embedding-light pod; and a
+        # KIROCREW_SKIP_MODEL_DOWNLOAD=1 already in this environment is what
+        # pod_context hands every `pod exec` and what an inheriting boot carries,
+        # with no key ever written. Either pod answers search from a different
+        # index, and a row that said nothing would contradict the journal line
+        # `boot` prints for both (it keys on the effective env the same way).
+        embeddings_off = (
+            no_embeddings
+            or rt.embeddings_disabled(rt.read_env_file(cfg, name))
+            or os.environ.get(rt.SKIP_MODEL_DOWNLOAD_ENV) == "1"
+        )
         resources = f"name={name} port={port}"
         if approval:
             resources += f" approval={approval}"
         if crons:
             resources += " crons=on"
+        if embeddings_off:
+            resources += " embeddings=off"
         if boot_flags and was_active:
             resources += " applied=next_boot"
         _audit("pod.up", "allowed", resources)
 
-        code = _wait_healthy(cfg, name, port)
+        wait_secs = _health_wait_secs(args)
+        code = _wait_healthy(cfg, name, port, tries=wait_secs, superseded=superseded_credential)
         if code not in (200, 401, 403):
             # A pod IS the worktree's own gateway. If it won't boot, that's a broken
             # worktree build (bad import / config / unbuilt dist) — NOT a pod-tooling
             # fault. Surface the gateway's own journal so the dev fixes the real cause,
-            # and stop the half-started unit so we don't leak a crash-looping service.
+            # and stop a unit this command started so we don't leak a crash-looping
+            # service — stopping only, when the home predates us, because reclaiming
+            # it would delete state this command did not create.
             #
             # This failure cleanup runs INSIDE the same mutex hold as our start:
             # released between the two, a down + replacement up could interleave
-            # during the health wait, and this stop_pod would then unload and
-            # erase the REPLACEMENT pod. Holding the lock across the whole boot
-            # transaction means the pod we stop here can only be the one we
-            # started.
+            # during the health wait, and the stop below would then act on the
+            # REPLACEMENT pod. Holding the lock across the whole boot transaction
+            # means the pod stopped here can only be the one we started.
             tail = rt.recent_journal(cfg, name, 30)
             print(tail, file=sys.stderr)
-            rt.stop_pod(cfg, name)
+            # Attribution must be read BEFORE stop_pod tears the unit down:
+            # after the stop, unit_state cannot tell a slow boot from a dead
+            # gateway. Positive evidence only, and the two inputs that can carry
+            # it are kept apart. HEALTH_SERVING_TOO_BRIEFLY is the port itself
+            # answering, which needs no corroboration. code == 0 means nothing
+            # ever answered, so liveness has to come from the unit: an
+            # active/activating unit with zero restarts is the inverse of the
+            # crash signal _wait_healthy returns -1 on, while "unknown" and
+            # "inactive" keep the timeout verdict. A real HTTP error like 404/5xx
+            # is neither: the gateway IS serving and its health route is broken,
+            # which more wait can never fix, so it keeps the timeout verdict too.
+            still_starting = False
+            if code == HEALTH_SERVING_TOO_BRIEFLY:
+                # No unit read at all: the port answering on the final poll is
+                # stronger evidence the gateway is alive than anything the unit can
+                # say, and it is evidence the unit read actively contradicts --
+                # `restarts` is cumulative with nothing in this package resetting it,
+                # so a recovered pod fails `restarts == 0` forever and would be
+                # reported as never healthy while it was answering 200.
+                still_starting = True
+            elif code == 0:
+                state, restarts = rt.unit_state(cfg, name)
+                still_starting = state in ("active", "activating") and restarts == 0
+            # Torn down ONLY when this invocation both started the gateway and
+            # found no state predating it. Two recorded facts, because a liveness
+            # probe cannot answer either question: `is_active` shells
+            # `systemctl is-active --quiet`, which succeeds only for `active`, so a
+            # unit in `activating` or in `Restart=on-failure` backoff -- a
+            # crash-loop this package documents as the ordinary case -- reads as not
+            # running, and keying the stop on that reads a PRE-EXISTING pod as one
+            # this command created. `stop_pod` reaches `cleanup_home`, which rmtree's
+            # the isolated HOME with its sessions and config and nothing restores it,
+            # so the guard has to rest on facts that cannot be wrong about the past:
+            # `started_here` is set where `start_pod` actually succeeded, and
+            # `home_was_populated` was read before it and fails closed. A pod that is
+            # genuinely broken but not ours to delete is `pod down`'s business, and
+            # the operator still gets the verdict and the journal below.
+            # Two questions, deliberately not one. Stopping is owed whenever THIS
+            # invocation started the gateway: the unit is `Restart=on-failure` with
+            # `RestartSec=5` and no `StartLimit` override, so a crash outside
+            # `RestartPreventExitStatus` -- a gateway that raises at import exits 1,
+            # which is not a terminal boot code -- respawns every five seconds for as
+            # long as nobody stops it. The 5s gap never fills systemd's default
+            # ten-second burst window, so the rate limiter never retires it either.
+            # Walking away from a unit this command started is a leak.
+            #
+            # Deleting is permitted only when this invocation ALSO created the home.
+            # `stop_pod` reaches `cleanup_home`, which rmtree's the isolated HOME with
+            # its sessions and config and nothing restores it, so state that predates
+            # the command must survive a failed wait.
+            #
+            # Neither question is answerable from `is_active`: it shells
+            # `systemctl is-active --quiet`, which succeeds only for `active`, so a pod
+            # in `activating` or in restart backoff reads as not running and a
+            # pre-existing crash-looping pod would be treated as one this command
+            # created. `started_here` and `home_was_populated` are facts about what
+            # happened; the probe is a guess about the past.
+            destroyed = started_here and not home_was_populated
+            halted = started_here and home_was_populated
+            halt_failed = ""
+            stop_failed = ""
+            if destroyed:
+                # The return code is inspected for the same reason `halt_pod`'s is:
+                # the notice below claims this command tore the pod down, and this
+                # call is the only evidence for that claim. A non-zero `stop_pod`
+                # means the gateway may still be live or its HOME survived, and an
+                # operator told it was cleaned up would leave a crash-looping unit
+                # running on a port they believe is free.
+                stop = rt.stop_pod(cfg, name)
+                if stop.returncode != 0:
+                    detail = (stop.stderr or stop.stdout or "").strip()
+                    stop_failed = (
+                        f" Tearing it down FAILED (rc={stop.returncode}), so the gateway "
+                        f"may still be running and its isolated home may survive: "
+                        f"{detail or 'no diagnostic'}"
+                    )
+            elif halted:
+                # The return code is inspected rather than discarded, because the
+                # notice below claims the service was stopped and this call is the
+                # only evidence for that claim. `halt_pod` returns non-zero for the
+                # cases that matter most -- a Linux reload it refused to proceed
+                # without, a launchd bootout or a Windows retirement it could not
+                # confirm -- and every one of them leaves the gateway RUNNING. An
+                # operator told "stopped" would then leave a crash-looping unit in
+                # place believing it was handled, which is the failure this whole
+                # branch exists to prevent.
+                halt = rt.halt_pod(cfg, name)
+                if halt.returncode != 0:
+                    detail = (halt.stderr or halt.stdout or "").strip()
+                    halt_failed = (
+                        f" Stopping it FAILED (rc={halt.returncode}), so the gateway may "
+                        f"still be running: {detail or 'no diagnostic'}"
+                    )
+            # Computed ONCE and appended to every verdict below, because the guard is
+            # verdict-independent and the notice has to be too. Saying nothing on four
+            # of five exits leaves the operator believing `up` cleaned up after itself,
+            # and the next thing they do is derived from that belief -- rerunning, or
+            # reallocating the port under a live gateway. Each branch states only what
+            # this command DID, never what the unit is doing: a pod that has genuinely
+            # failed is not running, so claiming it is would replace one false
+            # impression with another.
+            if destroyed:
+                # Silent on success: a pod this command created and then removed
+                # leaves the operator nothing to act on, so there is nothing to say.
+                left_running = (
+                    ""
+                    if not stop_failed
+                    else f"{stop_failed} Retire it with `kirocrew pod down {name}`."
+                )
+            elif halted:
+                left_running = (
+                    " The gateway this command started has been stopped, but its "
+                    "isolated home was KEPT because it held state beforehand. Reclaim "
+                    f"it deliberately with `kirocrew pod down {name}`.{halt_failed}"
+                    if not halt_failed
+                    else (
+                        " Its isolated home was KEPT because it held state beforehand."
+                        f"{halt_failed} Retire it with `kirocrew pod down {name}`."
+                    )
+                )
+            else:
+                left_running = (
+                    " This pod was NOT stopped: this command did not start it, and "
+                    "tearing it down would delete an isolated home it did not create. "
+                    f"Retire it deliberately with `kirocrew pod down {name}`."
+                )
             if code == rt.HEALTH_FOREIGN:
                 # Reported ahead of the crash verdict: the port being taken is
                 # WHY this gateway could not boot, and it is fixed by choosing a
@@ -349,15 +808,62 @@ def _up(cfg: PodConfig, args: argparse.Namespace) -> None:
                     f"  Which pods hold which ports: kirocrew pod ls\n"
                     f"  Give this pod its own port:  add PORT=<free port> to "
                     f"{cfg.env_file(name)}, then `kirocrew pod up {name}` again."
+                    f"{left_running}"
                 )
             if code == -1:
                 _die(
                     f"{name}: the worktree's gateway failed to start (see journal above). "
                     f"This is the worktree build, not pod — fix it, then `kirocrew pod up {name}` again."
+                    f"{left_running}"
+                )
+            if code == HEALTH_NO_CREDENTIAL:
+                # Reported ahead of the slow-boot verdict below, which this would
+                # otherwise be mistaken for: the gateway was serving when the budget
+                # expired, so "still starting" is false. Two causes reach here and
+                # the message names both, because the pod's own journal is what
+                # separates them: a failed credential write, or one that simply
+                # landed after the budget.
+                _audit(
+                    "pod.up",
+                    "failure",
+                    f"name={name} port={port}",
+                    error="serving but no internal-API credential published",
+                )
+                _die(
+                    f"{name}: the gateway was still serving on :{port} when the "
+                    f"{wait_secs}s readiness budget expired, but had published no "
+                    f"internal-API credential, so this pod cannot be driven. Its "
+                    f"journal is above: a write error there is the cause. If it "
+                    f"shows none, the gateway published late rather than failing. "
+                    f"{_wait_escalation_hint(name, wait_secs)} "
+                    f"This is the worktree's gateway, not pod.{left_running}"
+                )
+            if still_starting:
+                # Slow boot, not a dead gateway: the process is alive and readiness
+                # did not complete inside the budget. Deliberately does NOT claim the
+                # port is silent, because this branch covers two states and only one
+                # of them is: it is also reached by HEALTH_SERVING_TOO_BRIEFLY, where
+                # the gateway was serving on the final poll but for less than the span
+                # the credential verdict requires. Asserting "/api/health not yet
+                # answering" is false for that one, and false in the direction that
+                # sends the operator to look for a dead process. A bigger budget is
+                # the remedy for both.
+                _audit(
+                    "pod.up",
+                    "failure",
+                    f"name={name} port={port}",
+                    error="health wait exhausted while gateway alive",
+                )
+                _die(
+                    f"{name}: gateway still starting after {wait_secs}s on :{port} "
+                    f"(process alive; readiness did not complete -- it had not answered "
+                    f"/api/health with a published credential for long enough to judge). "
+                    f"{_wait_escalation_hint(name, wait_secs)}{left_running}"
                 )
             _die(
                 f"{name}: gateway never became healthy on :{port} within timeout "
                 f"(see journal above; check the worktree's gateway start path)."
+                f"{left_running}"
             )
 
         if scenario and not home_was_populated:
@@ -378,19 +884,28 @@ def _up(cfg: PodConfig, args: argparse.Namespace) -> None:
     #   in `mint_token`, which raised before dialling anything.
     token = ""
     unproven = ""
-    try:
-        token = rt.mint_token(cfg, name, args.ttl)
-    except rt.PodOwnershipUnproven as exc:
-        unproven = str(exc)
-        _audit(
-            "pod.token",
-            "denied",
-            f"name={name} port={port}",
-            error="ownership unprovable; credential withheld",
-        )
-    except rt.PodError as exc:
-        _audit("pod.token", "failure", f"name={name} port={port}", error="mint failed")
-        _die(str(exc))
+    if getattr(args, "no_token", False):
+        # The caller (the gateway's agent pod surface) will mint in-process. A
+        # sandboxed `pod up` child runs in its own user namespace, which the pod
+        # refuses to certify as the local owner (member_owner_token_refused), so
+        # minting here would fail the whole boot for a caller that never wanted
+        # this token. Skip the mint entirely: an empty `token` is the handle's
+        # documented "no credential" signal and the gateway supplies its own.
+        _audit("pod.token", "skipped", f"name={name} port={port} reason=no-token")
+    else:
+        try:
+            token = rt.mint_token(cfg, name, args.ttl)
+        except rt.PodOwnershipUnproven as exc:
+            unproven = str(exc)
+            _audit(
+                "pod.token",
+                "denied",
+                f"name={name} port={port}",
+                error="ownership unprovable; credential withheld",
+            )
+        except rt.PodError as exc:
+            _audit("pod.token", "failure", f"name={name} port={port}", error="mint failed")
+            _die(str(exc))
     if token:
         _audit("pod.token", "allowed", f"name={name} port={port} ttl={args.ttl}")
     base = f"http://127.0.0.1:{port}"
@@ -421,6 +936,8 @@ def _up(cfg: PodConfig, args: argparse.Namespace) -> None:
         if token:
             print(f"  token    : {token}")
             print(f"  open     : {base}/?token={token}")
+        elif getattr(args, "no_token", False):
+            print("  token    : (skipped by request: --no-token)")
         else:
             print("  token    : (withheld — ownership of the port could not be proven)")
         print(f"  stop     : kirocrew pod down {name}")
@@ -453,8 +970,10 @@ def _down(cfg: PodConfig, args: argparse.Namespace) -> None:
         # fatal: a reclaim that could not finish must not report success.
         # On macOS it is always fatal, because a loaded-but-dead agent has no pid
         # (was_up False) yet still needs its unload CONFIRMED before anything is
-        # torn down.
-        if cp.returncode != 0 and (was_up or had_home or rt.IS_MACOS):
+        # torn down. Windows is the same shape: a task whose gateway already died
+        # leaves no supervised pid, so `was_up` is False while the task itself is
+        # still registered and must be deleted before the HOME is reclaimed.
+        if cp.returncode != 0 and (was_up or had_home or rt.IS_MACOS or rt.IS_WINDOWS):
             _audit("pod.down", "failure", f"name={name}", error=f"stop rc={cp.returncode}")
             _die(f"stopping pod {name} failed: {(cp.stderr or '').strip()}")
         if rt.RECLAIMED_MARKER in (cp.stdout or ""):
@@ -517,7 +1036,41 @@ def _ls(cfg: PodConfig, args: argparse.Namespace) -> None:
             print(f"{n:<28} {p:<7} {_health_label(rt.health(cfg, n, p))}")
     else:
         print("no pods running")
+    _print_refusals(cfg)
     _print_orphans(cfg, orphans)
+
+
+def _print_refusals(cfg: PodConfig) -> None:
+    """Report pods whose LAST boot refused terminally.
+
+    ``PodConfig.refusal_file``'s whole justification is that a terminal refusal is
+    visible in different amounts on the two service managers -- systemd leaves the
+    unit ``failed``, while launchd sees the exit-0 that stops its restart loop and
+    reads it as an ordinary clean exit -- and that ``pod ls`` should report the same
+    fact either way. It did not: a refused pod is not running, so it fell out of the
+    listing entirely and ``ls`` printed "no pods running". The note existed with no
+    reader, and a pod that silently vanishes from ``ls`` is exactly how a boot
+    failure hides.
+
+    Rendered as its own section rather than a row in the main table, mirroring
+    :func:`_print_orphans`: a refused pod has no port and no health, so a table row
+    would have to invent both.
+    """
+    try:
+        names = sorted(p.name[: -len(".refused")] for p in cfg.pods_dir.glob("*.refused"))
+    except OSError:
+        return
+    refused = [(n, rt.refusal_reason(cfg, n)) for n in names]
+    refused = [(n, why) for n, why in refused if why]
+    if not refused:
+        return
+    print(
+        f"\n{len(refused)} pod(s) REFUSED to boot — the last attempt stopped on a "
+        "safety check and did not start a gateway:"
+    )
+    for name, why in refused:
+        print(f"  {name:<26} {why}")
+        print(f"  {'':<26} clear: kirocrew pod down {name}")
 
 
 def _print_orphans(cfg: PodConfig, orphans: list[str]) -> None:
@@ -773,8 +1326,11 @@ def _prune_one_decide(cfg: PodConfig, name: str) -> tuple[str, str, str, str]:
                 )
             # macOS: a per-pod plist means "installed" (a name mid-`up`), not
             # orphaned — same predicate orphan_homes applies, re-checked at
-            # delete time for writers that bypass the mutex.
+            # delete time for writers that bypass the mutex. Windows: its
+            # per-pod `.cmd` wrapper carries exactly the same meaning.
             if rt.IS_MACOS and rt.launchd.plist_path(cfg, name).exists():
+                return "skipped", "pod is now installed", "denied", "pod is now installed"
+            if rt.IS_WINDOWS and rt.win_backend.task_script_path(cfg, name).exists():
                 return "skipped", "pod is now installed", "denied", "pod is now installed"
             cp = rt.stop_pod(cfg, name)
             if cp.returncode != 0:
@@ -799,6 +1355,10 @@ def _prune_one_decide(cfg: PodConfig, name: str) -> tuple[str, str, str, str]:
 
 def _status(cfg: PodConfig, args: argparse.Namespace) -> None:
     name = rt.validate_name(args.name)
+    # A bare `systemctl is-active` answers "down" on a host with no user
+    # manager, so gate first and let the dispatch layer print the refusal.
+    if rt.IS_LINUX:
+        rt.require_backend()
     port = rt.derive_port(cfg, name)
     up = rt.is_active(cfg, name)
     code = rt.health(cfg, name, port) if up else 0
@@ -940,9 +1500,9 @@ def _logs(cfg: PodConfig, args: argparse.Namespace) -> None:
     # Gate before exec'ing the log mechanism — on an unsupported host this would
     # otherwise raise a bare FileNotFoundError instead of the documented refusal.
     rt.require_backend()
-    if rt.IS_MACOS:
-        # launchd has no journal; the plist routes stdout/stderr to files and
-        # recent_journal tails them.
+    if rt.IS_MACOS or rt.IS_WINDOWS:
+        # Neither launchd nor Task Scheduler has a journal; the plist / the .cmd
+        # wrapper route stdout/stderr to files and recent_journal tails them.
         print(rt.recent_journal(cfg, name, args.lines))
         return
     subprocess.run(
@@ -992,8 +1552,27 @@ def _run_internal(cfg: PodConfig, args: argparse.Namespace) -> None:
     # Audit BEFORE boot — boot() exec()s the gateway and never returns on success.
     _audit("pod.boot", "allowed", f"name={args.name}")
     rc = rt.boot(cfg, args.name)
+    # Audit the HONEST code, before any service-manager translation below.
     _audit("pod.boot", "failure", f"name={args.name}", error=f"exit={rc}")
-    sys.exit(rc)
+    # launchd has no RestartPreventExitStatus: its only restart discriminator is
+    # the success/failure axis, and this backend's KeepAlive restarts on NON-ZERO.
+    # A terminal refusal must therefore exit 0 or launchd re-runs it every 5s.
+    # ``rt.terminal_exit_code`` is the record-CONDITIONAL gate -- it translates only
+    # when the refusal note actually landed, so a refusal that could not be recorded
+    # keeps its honest non-zero instead of looking like a clean exit. Do NOT call
+    # ``launchd.launchd_exit_code`` directly here; it states the platform semantics
+    # but knows nothing about whether the record exists. Windows needs no
+    # translation at all: Task Scheduler never restarts a non-zero exit, so the
+    # honest code is already the terminal one. The branch below says so, and
+    # `test_the_runtime_wrapper_does_not_translate_on_windows` pins it there --
+    # which is where a change that adds a restart policy would have to look.
+    exit_code = rt.terminal_exit_code(cfg, args.name, rc)
+    if exit_code != rc:
+        print(
+            f"kirocrew-pod: exiting 0 instead of {rc} so launchd does not restart "
+            f"into the same refusal every 5s; recorded at {cfg.refusal_file(args.name)}"
+        )
+    sys.exit(exit_code)
 
 
 def _cleanup_internal(cfg: PodConfig, args: argparse.Namespace) -> None:

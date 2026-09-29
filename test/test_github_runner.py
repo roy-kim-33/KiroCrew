@@ -3,7 +3,7 @@
 One module now owns trusted-binary resolution, the minimal child environment,
 and the SEL-audited spawn chokepoint for every ``gh``-spawning surface (the
 dashboard PR sidebar, Issue Radar, Code Review Sage). These tests lock in the
-properties that used to drift between the three copies:
+properties that would otherwise drift between the three callers:
 
 * resolver precedence (caller override → ``KIROCREW_GH_BIN`` → candidates),
   including the fail-loud rule for an override that is SET but empty or wrong
@@ -29,7 +29,7 @@ import pytest
 
 pytestmark = pytest.mark.skipif(
     sys.platform == "win32",
-    # NOT because the hardening is POSIX-only -- it no longer is. These
+    # NOT because the hardening is POSIX-only -- it is not. These
     # assertions pin the POSIX policy's own messages ("world-writable", "owned
     # by another user (uid ...)") and build `#!/bin/sh` gh stubs, none of which
     # the Windows branch produces or can execute. The Windows policy has its
@@ -556,7 +556,7 @@ class TestReExports:
             runner.parse_github_repo_url("https://evil.example/o/r")
 
     def test_source_providers_gh_auth_keys_derive_from_the_canonical_union(self):
-        """D3 lock-in: the sidebar's gh key set can no longer drift from the
+        """D3 lock-in: the sidebar's gh key set cannot drift from the
         app-side passthrough — it derives from the runner's canonical list,
         minus the enterprise tokens its github.com-pinned child can never use."""
         from kiro_crew.dashboard.handlers import source_providers
@@ -564,3 +564,76 @@ class TestReExports:
         assert source_providers._PROVIDER_AUTH_ENV_KEYS["gh"] == frozenset(
             runner.GH_ENV_PASSTHROUGH
         ) - {"GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"}
+
+
+class TestRepoUrlSegmentsAreBoundedInWidth:
+    """``parse_github_repo_url`` bounds both halves of each segment it admits: the
+    charset AND the width. A charset with no quantifier is satisfied by a segment of
+    any size, and this parser's own docstring says those values reach a subprocess
+    argv. Every width below is derived from the published limit rather than written
+    down, so the bound has exactly one home.
+    """
+
+    def test_the_two_limits_are_githubs_own_published_maximums(self):
+        """The widths below are all derived from these two constants, so the
+        constants themselves are the one thing a derived width cannot check:
+        loosening either would leave every other case in this class green. A
+        github.com account login -- user or organization -- is 1-39 characters, and
+        a repository name is at most 100. Both parsers are pinned to the
+        github.com host, so these are the ceilings for every value that reaches
+        them.
+        """
+        assert runner.GITHUB_MAX_OWNER_CHARS == 39
+        assert runner.GITHUB_MAX_REPO_CHARS == 100
+
+    def test_an_owner_at_githubs_login_limit_is_accepted(self):
+        owner = "o" * runner.GITHUB_MAX_OWNER_CHARS
+        parsed_owner, _ = runner.parse_github_repo_url(f"https://github.com/{owner}/repo")
+
+        assert len(parsed_owner) == runner.GITHUB_MAX_OWNER_CHARS
+
+    def test_a_repository_at_githubs_name_limit_is_accepted(self):
+        repo = "r" * runner.GITHUB_MAX_REPO_CHARS
+        _, parsed_repo = runner.parse_github_repo_url(f"https://github.com/owner/{repo}")
+
+        assert len(parsed_repo) == runner.GITHUB_MAX_REPO_CHARS
+
+    @pytest.mark.parametrize("over", [1, 2, 5000])
+    def test_an_owner_wider_than_githubs_login_limit_is_refused(self, over: int):
+        owner = "o" * (runner.GITHUB_MAX_OWNER_CHARS + over)
+
+        with pytest.raises(runner.RepoUrlError):
+            runner.parse_github_repo_url(f"https://github.com/{owner}/repo")
+
+    @pytest.mark.parametrize("over", [1, 2, 5000])
+    def test_a_repository_wider_than_githubs_name_limit_is_refused(self, over: int):
+        repo = "r" * (runner.GITHUB_MAX_REPO_CHARS + over)
+
+        with pytest.raises(runner.RepoUrlError):
+            runner.parse_github_repo_url(f"https://github.com/owner/{repo}")
+
+    def test_the_dot_git_suffix_is_stripped_before_the_width_is_judged(self):
+        """A name at the limit stays legal when the URL spells the ``.git`` clone
+        form, because the suffix is removed before the bound is applied."""
+        repo = "r" * runner.GITHUB_MAX_REPO_CHARS
+        _, parsed_repo = runner.parse_github_repo_url(f"https://github.com/owner/{repo}.git")
+
+        assert len(parsed_repo) == runner.GITHUB_MAX_REPO_CHARS
+
+    @pytest.mark.parametrize(
+        ("pattern_name", "limit_name"),
+        [
+            ("GITHUB_OWNER_SEGMENT_RE", "GITHUB_MAX_OWNER_CHARS"),
+            ("GITHUB_REPO_SEGMENT_RE", "GITHUB_MAX_REPO_CHARS"),
+        ],
+    )
+    def test_a_trailing_newline_cannot_escape_the_bound(self, pattern_name: str, limit_name: str):
+        """``$`` also matches immediately before a final newline, so a bound
+        anchored with it admits one character past the maximum and disagrees with
+        itself between ``match`` and ``fullmatch``."""
+        pattern = getattr(runner, pattern_name)
+        widest = "x" * getattr(runner, limit_name)
+
+        assert pattern.match(widest) is not None
+        assert pattern.match(f"{widest}\n") is None
+        assert pattern.fullmatch(f"{widest}\n") is None

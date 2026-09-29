@@ -40,6 +40,9 @@ class FakeEvent:
     request_id: str = "req-1"
     options: list = field(default_factory=list)
     text: str = ""
+    # Mirrors LLMEvent's diff-content-block path (default ""): the edit gate
+    # reads it on every permission frame, not only behind an edit tool_kind.
+    diff_path: str = ""
 
 
 class FakeProvider:
@@ -241,7 +244,7 @@ class TestResolveSensitiveBashCommand:
         from kiro_crew.llm_helpers import _resolve_permission
 
         provider = FakeProvider()
-        event = FakeEvent(title="Running: cat ~/.aws/credentials")
+        event = FakeEvent(title="Running: curl http://169.254.169.254/latest/meta-data/")
         result = await _resolve_permission(
             provider, event, ToolApprovalPolicy.AUTO_APPROVE, hooks=None
         )
@@ -255,7 +258,7 @@ class TestResolveSensitiveBashCommand:
         provider = FakeProvider()
         event = FakeEvent(
             title="Bash",
-            tool_input=json.dumps({"command": "cat ~/.ssh/id_rsa"}),
+            tool_input=json.dumps({"command": "env | grep AWS_SECRET"}),
         )
         result = await _resolve_permission(
             provider, event, ToolApprovalPolicy.AUTO_APPROVE, hooks=None
@@ -286,7 +289,9 @@ class TestResolveDenyPatternsToolInput:
         provider = FakeProvider()
         event = FakeEvent(
             title="Bash",
-            tool_input=json.dumps({"command": "get_secret_value --secret-id prod-db"}),
+            tool_input=json.dumps(
+                {"command": "aws secretsmanager delete-secret --secret-id prod-db"}
+            ),
         )
         result = await _resolve_permission(
             provider, event, ToolApprovalPolicy.AUTO_APPROVE, hooks=None
@@ -301,7 +306,9 @@ class TestResolveDenyPatternsToolInput:
         provider = FakeProvider()
         event = FakeEvent(
             title="Execute",
-            tool_input=json.dumps({"args": {"cmd": "get_secret_value my-secret"}}),
+            tool_input=json.dumps(
+                {"args": {"cmd": "aws secretsmanager delete-secret --secret-id my-secret"}}
+            ),
         )
         result = await _resolve_permission(
             provider, event, ToolApprovalPolicy.AUTO_APPROVE, hooks=None
@@ -314,11 +321,11 @@ class TestResolveDenyPatterns:
     """BUILTIN_DENY_PATTERNS enforcement."""
 
     @pytest.mark.asyncio
-    async def test_get_secret_denied(self, mock_sel):
+    async def test_delete_secret_denied(self, mock_sel):
         from kiro_crew.llm_helpers import _resolve_permission
 
         provider = FakeProvider()
-        event = FakeEvent(title="get_secret_value")
+        event = FakeEvent(title="aws secretsmanager delete-secret --secret-id prod-db")
         result = await _resolve_permission(
             provider, event, ToolApprovalPolicy.AUTO_APPROVE, hooks=None
         )
@@ -330,7 +337,7 @@ class TestResolveDenyPatterns:
         from kiro_crew.llm_helpers import _resolve_permission
 
         provider = FakeProvider()
-        event = FakeEvent(title="aws cloudformation delete_stack --stack-name prod")
+        event = FakeEvent(title="aws cloudformation delete-stack --stack-name prod")
         result = await _resolve_permission(
             provider, event, ToolApprovalPolicy.AUTO_APPROVE, hooks=None
         )
@@ -356,14 +363,17 @@ class TestResolveHonorsOptOut:
     re-introduce "disabled but still blocked"."""
 
     @pytest.mark.asyncio
-    async def test_disabled_builtin_allowed_when_hooks_opt_out(self, mock_sel):
+    async def test_disabled_builtin_allowed_when_hooks_opt_out(self, mock_sel, monkeypatch):
         from kiro_crew.hooks import HookManager, HooksConfig
         from kiro_crew.llm_helpers import _resolve_permission
 
         # User disabled the ec2 terminate-instances built-in in the dashboard.
-        mgr = HookManager(
-            HooksConfig(denied_commands_disabled_ids=["aws-destructive-ec2-terminate-instances"])
+        disabled_ids = ["aws-destructive-ec2-terminate-instances"]
+        monkeypatch.setattr(
+            "kiro_crew.hooks.load_denied_commands_state",
+            lambda: {"disabled_ids": disabled_ids},
         )
+        mgr = HookManager(HooksConfig(denied_commands_disabled_ids=disabled_ids))
         provider = FakeProvider()
         event = FakeEvent(title="aws ec2 terminate-instances --instance-ids i-1")
         result = await _resolve_permission(
@@ -374,13 +384,16 @@ class TestResolveHonorsOptOut:
         assert "req-1" in provider.approved
 
     @pytest.mark.asyncio
-    async def test_other_builtin_still_denied_when_one_disabled(self, mock_sel):
+    async def test_other_builtin_still_denied_when_one_disabled(self, mock_sel, monkeypatch):
         from kiro_crew.hooks import HookManager, HooksConfig
         from kiro_crew.llm_helpers import _resolve_permission
 
-        mgr = HookManager(
-            HooksConfig(denied_commands_disabled_ids=["aws-destructive-ec2-terminate-instances"])
+        disabled_ids = ["aws-destructive-ec2-terminate-instances"]
+        monkeypatch.setattr(
+            "kiro_crew.hooks.load_denied_commands_state",
+            lambda: {"disabled_ids": disabled_ids},
         )
+        mgr = HookManager(HooksConfig(denied_commands_disabled_ids=disabled_ids))
         provider = FakeProvider()
         # A DIFFERENT destructive command the user did NOT disable stays blocked.
         event = FakeEvent(title="aws cloudformation delete-stack --stack-name prod")
@@ -489,7 +502,7 @@ class TestAgentExecRedaction:
                 FakeEvent(kind="complete", title=""),
             ]
         )
-        fake_sessions.get_or_create = AsyncMock(return_value=(fake_provider,))
+        fake_sessions.get_or_create = AsyncMock(return_value=(fake_provider, True, False))
         fake_sessions.release = MagicMock()
 
         agent_fn = build_agent_fn(fake_sessions, run_id="test-run")
@@ -509,7 +522,7 @@ class TestAgentExecRedaction:
                 FakeEvent(kind="complete", title=""),
             ]
         )
-        fake_sessions.get_or_create = AsyncMock(return_value=(fake_provider,))
+        fake_sessions.get_or_create = AsyncMock(return_value=(fake_provider, True, False))
         fake_sessions.release = MagicMock()
 
         agent_fn = build_agent_fn(fake_sessions, run_id="test-run")
