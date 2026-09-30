@@ -4,20 +4,22 @@ Covers ``SubagentManager._is_startup_stalled`` (which a wedged, never-started
 subagent trips) and ``_force_reap(reason="startup_timeout")`` (the clear
 "failed to start" error + tombstone cause it produces).
 
-Regression target: a subagent whose ``_run_inner`` wedged before launching its
-runtime (no pid) and before its first turn used to sit for the full 1800s
-deadline and then surface a misleading "Reaped after 1800s [turn 0/100]"
-error. The startup watchdog now reaps it after a short window with an accurate
-"Failed to start" message, while never touching an agent that is merely
-awaiting spawn approval.
+A subagent whose ``_run_inner`` wedges before launching its runtime (no pid)
+and before its first turn must not sit for the full 1800s deadline and then
+surface a misleading "Reaped after 1800s [turn 0/100]" error. The startup
+watchdog reaps it after a short window with an accurate "Failed to start"
+message, while never touching an agent that is merely awaiting spawn approval.
 """
 
 from __future__ import annotations
 
+import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from kiro_crew.providers.base import EVENT_COMPLETE
 from kiro_crew.subagent import SubagentInfo, SubagentManager
 
 
@@ -67,6 +69,59 @@ def test_stalled_false_when_runtime_launched():
     assert mgr._is_startup_stalled(info, now) is False
 
 
+def test_stalled_false_after_first_provider_stream_begins():
+    mgr = _make_manager(startup_timeout=120)
+    now = 1_000.0
+    info = _info(_exec_started=now - 600, _first_stream_started=now - 590, _pid=None, turns=0)
+    assert mgr._is_startup_stalled(info, now) is False
+
+
+@pytest.mark.asyncio
+async def test_recovery_execution_resets_the_first_stream_marker():
+    """A recovered run must be eligible for its own startup watchdog window."""
+    from kiro_crew.execution_context import execution_for_store
+    from kiro_crew.subagent_persistence import create_agent_folder
+
+    sessions = MagicMock()
+    provider = AsyncMock()
+    provider.start = AsyncMock()
+    provider.shutdown = AsyncMock()
+    provider.context_usage_pct = lambda: 0.0
+    provider.context_used_tokens = MagicMock(return_value=0)
+    provider.context_window_tokens = MagicMock(return_value=0)
+
+    async def stream(*_args, **_kwargs):
+        yield SimpleNamespace(kind=EVENT_COMPLETE, stop_reason="end_turn", runtime_global=False)
+
+    provider.stream = MagicMock(side_effect=stream)
+    marker_at_acquire: list[float | None] = []
+
+    async def get_or_create(*_args, **_kwargs):
+        marker_at_acquire.append(info._first_stream_started)
+        return provider, True, False
+
+    sessions.get_or_create = AsyncMock(side_effect=get_or_create)
+    sessions.get_pid = MagicMock(return_value=None)
+    sessions.release = MagicMock()
+    sessions.reset = AsyncMock()
+    sessions.record_success = MagicMock()
+    sessions.get_agent = MagicMock(return_value="")
+    sessions.get_agent_selection = MagicMock(return_value=("template", ""))
+    sessions.get_approval_policy = MagicMock(return_value="auto")
+    sessions.has_session = MagicMock(return_value=True)
+    ctx = MagicMock()
+    ctx.build_message = MagicMock(return_value=("message", None))
+    ctx.hooks.auto_approve_subagent_tools = False
+    mgr = SubagentManager(sessions=sessions, ctx_builder=ctx)
+    mgr._should_use_session_sharing = MagicMock(return_value=False)  # type: ignore[method-assign]
+    info = _info(_first_stream_started=1.0, execution_context=execution_for_store(""))
+    await asyncio.to_thread(create_agent_folder, info.id, execution_context=info.execution_context)
+
+    await mgr._run_inner(info, "subagent:a1b2c3d4")
+
+    assert marker_at_acquire == [None]
+
+
 def test_stalled_false_when_a_turn_was_produced():
     mgr = _make_manager(startup_timeout=120)
     now = 1_000.0
@@ -106,6 +161,23 @@ async def test_force_reap_startup_timeout_error_and_tombstone_cause():
     assert "exceeded" not in info.error  # not the generic deadline message
     mgr._write_tombstone.assert_called_once()
     assert mgr._write_tombstone.call_args.args[1] == "startup_timeout"
+
+
+@pytest.mark.asyncio
+async def test_startup_reap_names_the_co_tenant_frames_it_received():
+    """A start that received only another tenant's fanned-out traffic reads
+    apart, in its reap record, from one whose stream stayed silent."""
+    mgr = _make_manager(startup_timeout=120)
+    _neuter_force_reap_collaborators(mgr)
+    silent = _info(_exec_started=1.0, _pid=None, turns=0)
+    crowded = _info(_exec_started=1.0, _pid=None, turns=0)
+    crowded._startup_cotenant_frames = 7
+
+    await mgr._force_reap("a1b2c3d4", silent, 130.0, reason="startup_timeout")
+    await mgr._force_reap("e5f6a7b8", crowded, 130.0, reason="startup_timeout")
+
+    assert "0 co-tenant frame(s) received, none addressed to this session" in silent.error
+    assert "7 co-tenant frame(s) received, none addressed to this session" in crowded.error
 
 
 @pytest.mark.asyncio

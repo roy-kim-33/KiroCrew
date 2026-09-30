@@ -1,4 +1,4 @@
-import { ApiError, friendlyErrText, toApiError } from '../api/apiError'
+import { ApiError, friendlyErrText, toApiError, isTerminalApprovalRefusal } from '../api/apiError'
 
 /** A minimal Response stand-in: only what toApiError reads. */
 const res = (status: number, body: string, headers: Record<string, string> = {}): Response =>
@@ -35,6 +35,16 @@ describe('toApiError', () => {
   it('keeps a non-JSON body as the message', async () => {
     const e = await toApiError(res(502, 'upstream said no'))
     expect(e.message).toBe('upstream said no')
+  })
+
+  it('shows HTTP <status> for an edge HTML error page, not its markup', async () => {
+    // What a tunnel or proxy serves while the gateway restarts: the document
+    // reached the message verbatim, so the dashboard topbar rendered the markup.
+    const page = '<!DOCTYPE html><html><head><meta charset="utf-8"><title>502</title></head><body>Bad Gateway</body></html>'
+    const e = await toApiError(res(502, page))
+    expect(e.message).toBe('HTTP 502')
+    expect(e.message).not.toContain('<')
+    expect(e.body).toBe(page)
   })
 
   it('flags an auth-expiry refusal so callers can drop futile retries', async () => {
@@ -78,6 +88,20 @@ describe('toApiError', () => {
     const e = await toApiError(res(400, 'bad'))
     expect(e).toBeInstanceOf(Error)
     expect(e.name).toBe('ApiError')
+  })
+})
+
+describe('isTerminalApprovalRefusal', () => {
+  it.each([
+    ['a 404', new ApiError(404, 'not found or expired'), true],
+    ['the endpoint\'s own 400', new ApiError(400, 'no pending approval'), true],
+    ['a duck-typed 404 from a mocked client', Object.assign(new Error('gone'), { status: 404 }), true],
+    ['an auth-required 404', new ApiError(404, 'sign in again', '', true), false],
+    ['any other 400', new ApiError(400, 'unknown action'), false],
+    ['a transport failure', new Error('Failed to fetch'), false],
+    ['a non-object rejection', 'nope', false],
+  ])('classifies %s', (_label, err, terminal) => {
+    expect(isTerminalApprovalRefusal(err)).toBe(terminal)
   })
 })
 

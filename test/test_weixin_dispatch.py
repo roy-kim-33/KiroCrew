@@ -112,6 +112,7 @@ class FakeSessions:
         self.acquired = False
         self.mirror_links: dict[str, object] = {}
         self.opted_out = False
+        self.reserved_generations: list[str] = []
 
     def is_busy(self, key):
         return self._busy
@@ -149,6 +150,12 @@ class FakeSessions:
 
     def has_session(self, key):
         return True
+
+    def reserve_generation(self, session_key: str) -> None:
+        self.reserved_generations.append(session_key)
+
+    async def aflush(self) -> None:
+        return None
 
     def max_generation(self, *a, **kw):
         # seed_generation() probes for the highest existing generation; a fresh
@@ -387,7 +394,55 @@ def test_new_command_starts_a_fresh_session_without_a_turn(tmp_path):
 
     assert provider.prompts == []  # no LLM turn for a command
     assert before != after  # generation advanced
+    assert sessions.reserved_generations == [after]
     assert "新对话" in client.sent[0]["text"]
+
+
+def test_inline_callback_reservation_releases_before_poll_task_continues(tmp_path):
+    class Reservation:
+        def __init__(self):
+            self.releases = 0
+
+        def release(self):
+            self.releases += 1
+
+    d, _client, sessions = _make(tmp_path)
+    reservation = Reservation()
+    sessions.reserve_inbound_callback = lambda: reservation
+
+    async def run():
+        await d.handle_message(_msg("/help"))
+        # The caller is still the long-lived poll task here. A task-done lease
+        # would remain held until disconnect and defer every future update.
+        assert reservation.releases == 1
+
+    asyncio.run(run())
+
+
+def test_update_pause_spools_new_before_generation_side_effects(tmp_path, monkeypatch):
+    import kiro_crew.messaging.dispatch as dispatch
+
+    d, client, sessions = _make(tmp_path)
+    sessions.reserve_inbound_callback = lambda: None
+    spooled: list[tuple[str, Any]] = []
+
+    async def capture(*, channel_type, route):
+        spooled.append((channel_type, route))
+
+    monkeypatch.setattr(dispatch, "spool_refused_turn", capture)
+    before = d._session_key("userA")
+
+    asyncio.run(d.handle_message(_msg("/new")))
+
+    assert d._session_key("userA") == before
+    assert sessions.reserved_generations == []
+    assert client.sent == []
+    assert len(spooled) == 1
+    channel_type, refused = spooled[0]
+    assert channel_type == "weixin"
+    assert refused is not None
+    assert refused.conversation_id == "userA"
+    assert refused.text == "/new"
 
 
 def test_compact_command_compacts_without_a_turn(tmp_path):
@@ -401,7 +456,7 @@ def test_compact_command_compacts_without_a_turn(tmp_path):
 
 def test_compact_command_declined_on_auto_managed_backend(tmp_path):
     # A backend that cannot serve /compact gets the informational reply and
-    # compact() is NEVER dispatched (#8156).
+    # compact() is NEVER dispatched.
     provider = FakeProvider()
     provider.manual_compact_unsupported_backend = "kas"
     d, client, sessions = _make(tmp_path, provider=provider)
@@ -422,7 +477,7 @@ def test_compact_none_capability_preserves_dispatch(tmp_path):
 
 def test_hard_threshold_declines_silently_on_auto_managed_backend(tmp_path):
     # No /compact to dispatch and no notice: the backend compacts on its own
-    # as context fills (#8156).
+    # as context fills.
     provider = FakeProvider()
     provider.manual_compact_unsupported_backend = "kas"
     d, client, sessions = _make(tmp_path, provider=provider)
@@ -434,7 +489,7 @@ def test_hard_threshold_declines_silently_on_auto_managed_backend(tmp_path):
 
 def test_soft_nudge_suppressed_on_auto_managed_backend(tmp_path):
     # The nudge advises /compact, which this backend refuses — it compacts on
-    # its own, so there is nothing for the user to act on (#8156).
+    # its own, so there is nothing for the user to act on.
     provider = FakeProvider()
     provider.manual_compact_unsupported_backend = "kas"
     d, client, sessions = _make(tmp_path, provider=provider)
@@ -649,7 +704,7 @@ def test_turn_failure_records_failure_and_still_releases(tmp_path):
 def test_delivery_failure_is_not_recorded_as_success(tmp_path):
     """An undelivered reply must fail the turn, not persist as a success.
 
-    Regression: the renderer used to swallow send errors, so a send timeout left
+    The renderer must not swallow send errors, or a send timeout leaves
     the dispatcher recording + persisting a reply the user never received.
     """
     rows: list[tuple[str, str]] = []
@@ -1006,3 +1061,73 @@ def test_a_turn_does_not_auto_bind_the_conversation_as_a_mirror(tmp_path):
         "path does not re-check the allow-list, so a revoked user would keep "
         "receiving session content"
     )
+
+
+def test_renderer_follows_a_redacted_answer_with_one_notice(tmp_path):
+    from kiro_crew.security import CREDENTIAL_REDACTION_TAGS
+
+    client = FakeClient()
+    r = WeixinRenderer(
+        client,
+        "userA",
+        WEIXIN_CAPABILITIES,
+        ctx_store=ContextTokenStore(str(tmp_path)),
+        account_id="acct1",
+    )
+
+    async def go():
+        # The TurnDriver's stream arrives already redacted, so the placeholder
+        # tag is what this channel delivers and what the tally counts.
+        await r.on_text_chunk(f"Run: psql {CREDENTIAL_REDACTION_TAGS[0]}")
+        await r.on_done()
+
+    asyncio.run(go())
+    notices = [m["text"] for m in client.sent if "Security notice" in m["text"]]
+    assert len(notices) == 1
+    assert client.sent[-1]["text"] == notices[0]  # below the answer
+
+
+def test_renderer_sends_no_notice_for_a_clean_answer(tmp_path):
+    client = FakeClient()
+    r = WeixinRenderer(
+        client,
+        "userA",
+        WEIXIN_CAPABILITIES,
+        ctx_store=ContextTokenStore(str(tmp_path)),
+        account_id="acct1",
+    )
+
+    async def go():
+        await r.on_text_chunk("All green, deploy finished.")
+        await r.on_done()
+
+    asyncio.run(go())
+    assert not any("Security notice" in m["text"] for m in client.sent)
+
+
+def test_a_failed_notice_send_does_not_fail_a_delivered_turn(tmp_path):
+    from kiro_crew.security import CREDENTIAL_REDACTION_TAGS
+
+    client = FakeClient()
+    real_send = client.send_message
+
+    async def send_but_fail_the_notice(*, to, text, context_token, client_id):
+        if "Security notice" in text:
+            raise RuntimeError("weixin down after the answer")
+        return await real_send(to=to, text=text, context_token=context_token, client_id=client_id)
+
+    client.send_message = send_but_fail_the_notice  # type: ignore[method-assign]
+    r = WeixinRenderer(
+        client,
+        "userA",
+        WEIXIN_CAPABILITIES,
+        ctx_store=ContextTokenStore(str(tmp_path)),
+        account_id="acct1",
+    )
+
+    async def go():
+        await r.on_text_chunk(f"Run: psql {CREDENTIAL_REDACTION_TAGS[0]}")
+        await r.on_done()  # must not raise: the answer above already landed
+
+    asyncio.run(go())
+    assert any(CREDENTIAL_REDACTION_TAGS[0] in m["text"] for m in client.sent)

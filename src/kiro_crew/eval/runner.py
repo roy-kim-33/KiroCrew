@@ -20,6 +20,12 @@ from typing import Any
 
 from kiro_crew.eval.scenario import Assertion, AssertionType, Scenario, SeedProfile, Session, Turn
 from kiro_crew.memory import MemoryStore
+from kiro_crew.memory_stores import DEFAULT_MEMORY_STORE
+from kiro_crew.permission_floor import (
+    OUTCOME_PENDING_APPROVAL,
+    OUTCOME_REJECTED_TRANSPORT_FLOOR,
+    refusal_for,
+)
 from kiro_crew.providers.base import (
     EVENT_COMPLETE,
     EVENT_PERMISSION_REQUEST,
@@ -230,10 +236,10 @@ class EvalRunner:
 
         config = KiroCrewConfig.load()
         memory = MemoryStore(workspace=ws)
-        memory.init()
+        await asyncio.to_thread(memory.init)
 
         if scenario.seed:
-            _seed_profile(ws, scenario.seed)
+            await asyncio.to_thread(_seed_profile, ws, scenario.seed)
 
         # Set env so providers share the same memory directory
         # NOTE: os.environ mutation is process-global — not safe for concurrent runs.
@@ -242,6 +248,7 @@ class EvalRunner:
 
         session_mgr = None
         vector_store = None
+        skills = None
         try:
             # Memory-loop components
             conv_log = ConversationLog(base_dir=ws)
@@ -349,7 +356,9 @@ class EvalRunner:
             if session_mgr:
                 await session_mgr.close_all()
             if vector_store:
-                vector_store.close()
+                await asyncio.to_thread(vector_store.close)
+            if skills:
+                await asyncio.to_thread(skills.close)
             if old_ws is None:
                 os.environ.pop("KIROCREW_WORKSPACE", None)
             else:
@@ -391,7 +400,11 @@ class EvalRunner:
         # Build memory context once for the first turn of non-first sessions
         memory_context = ""
         if ctx_builder is not None:
-            memory_context = ctx_builder.build_session_context(session_key=session_key)
+            memory_context = await asyncio.to_thread(
+                ctx_builder.build_session_context,
+                session_key=session_key,
+                memory_store=DEFAULT_MEMORY_STORE,
+            )
 
         session_result = SessionResult(name=session_def.name)
         try:
@@ -472,29 +485,71 @@ class EvalRunner:
             elif event.kind == EVENT_PERMISSION_REQUEST:
                 from kiro_crew.security import is_sensitive_path
 
-                safety = self._classify_safe_tool(event)
-                if safety in ("exact", "prefix_api"):
-                    # Known read-only API — approve without path check
+                reason = await asyncio.to_thread(
+                    refusal_for,
+                    event,
+                    session_key=session_key,
+                    agent="",
+                    security_only=False,
+                )
+                if reason is not None:
+                    logger.warning("Rejected tool by permission gate: %s", event.title)
                     sel().log_tool_invocation(
                         session_key=session_key,
                         tool_name=event.title,
-                        outcome="approved",
+                        outcome="rejected_hook_deny",
                         source="eval_runner",
                     )
-                    await provider.approve_tool(event.request_id)
+                    await provider.reject_tool(event.request_id)
+                    continue
+
+                safety = self._classify_safe_tool(event)
+                if safety in ("exact", "prefix_api"):
+                    # Known read-only API — approve without path check.
+                    # Audit BEFORE the wire call (approve_tool can raise); the
+                    # definitive row follows.
+                    sel().log_tool_invocation(
+                        session_key=session_key,
+                        tool_name=event.title,
+                        outcome=OUTCOME_PENDING_APPROVAL,
+                        source="eval_runner",
+                    )
+                    approval_sent = await provider.approve_tool(event.request_id)
+                    sel().log_tool_invocation(
+                        session_key=session_key,
+                        tool_name=event.title,
+                        outcome=(
+                            "approved"
+                            if approval_sent is not False
+                            else OUTCOME_REJECTED_TRANSPORT_FLOOR
+                        ),
+                        source="eval_runner",
+                    )
                 elif safety == "prefix_fs":
                     # Filesystem operation — deny-by-default path check
                     target = self._extract_path_from_input(event.tool_input or "")
                     if target:
                         target = str(Path(target).expanduser().resolve())
                     if target and not is_sensitive_path(target):
+                        # Audit BEFORE the wire call (approve_tool can raise);
+                        # the definitive row follows.
                         sel().log_tool_invocation(
                             session_key=session_key,
                             tool_name=event.title,
-                            outcome="approved",
+                            outcome=OUTCOME_PENDING_APPROVAL,
                             source="eval_runner",
                         )
-                        await provider.approve_tool(event.request_id)
+                        approval_sent = await provider.approve_tool(event.request_id)
+                        sel().log_tool_invocation(
+                            session_key=session_key,
+                            tool_name=event.title,
+                            outcome=(
+                                "approved"
+                                if approval_sent is not False
+                                else OUTCOME_REJECTED_TRANSPORT_FLOOR
+                            ),
+                            source="eval_runner",
+                        )
                     else:
                         outcome = "rejected_sensitive" if target else "rejected_no_path"
                         logger.warning("Rejected tool (path check failed): %s", event.title)

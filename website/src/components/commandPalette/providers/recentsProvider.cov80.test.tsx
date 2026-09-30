@@ -100,14 +100,22 @@ describe('hasPlaceholderTitle / isEmptyNewSlot', () => {
 })
 
 describe('prepareCurrentSlots', () => {
-  it('orders empty-new first, then pinned, then recency', () => {
+  it('orders empty-new first, then recency, with a pin claiming no place', () => {
     const { ordered, hasEmptyNew } = prepareCurrentSlots([
       slot({ key: 'zzq-old', last_activity_ts: 1_000 }),
       slot({ key: 'zzq-pinned', pinned: true, last_activity_ts: 500 }),
       slot({ key: 'zzq-new', title: 'New Session…', messages: 0 }),
       slot({ key: 'zzq-recent', last_activity_ts: 2_000 }),
     ])
-    expect(ordered.map((s) => s.key)).toEqual(['zzq-new', 'zzq-pinned', 'zzq-recent', 'zzq-old'])
+    // The pinned slot is the LEAST recent of the three and sorts last: this list
+    // answers "what was I just in", so a pin cannot lift a stale session over
+    // fresher ones. It still renders its pin.
+    expect(ordered.map((s) => s.key)).toEqual([
+      'zzq-new',
+      'zzq-recent',
+      'zzq-old',
+      'zzq-pinned',
+    ])
     expect(hasEmptyNew).toBe(true)
   })
 
@@ -179,7 +187,7 @@ describe('sessionStatus', () => {
     const st = sessionStatus(slot({ key: 'zzq', running: true }), [], {
       kind: 'tool',
       toolName: 'fs_read',
-      text: 'zzq reading',
+      purpose: 'zzq reading',
     })
     expect(st.label).toBeTruthy()
   })
@@ -237,7 +245,7 @@ describe('useRecentsProvider — Current group', () => {
     const { result } = harness([slot({ key: 'zzq-a', title: 'zzq A' })])
     const rows = await result.current.search('')
     rows.find((r) => r.id === 'recents:cur:zzq-a')?.onActivate?.()
-    expect(thunks.switchSlot).toHaveBeenCalledWith('zzq-a')
+    expect(thunks.switchSlot).toHaveBeenCalledWith({ key: 'zzq-a', announceOnMissing: true })
     expect(navigateSpy).toHaveBeenCalledWith('/chat')
   })
 

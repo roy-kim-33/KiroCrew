@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
 import os
 from unittest.mock import AsyncMock, MagicMock
 
@@ -11,7 +12,7 @@ from aiohttp import web
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.history import ConversationLog
 from kiro_crew.kiro_prerequisite import KiroPrerequisiteService
-from kiro_crew.messaging.link import ChannelLink
+from kiro_crew.messaging.link import ChannelLink, binding_token
 
 #: Draining is a LOOP because a drained task may register another -- not because any
 #: current one does (``chat_slack`` has a single ``create_task``, and the backfill
@@ -28,7 +29,7 @@ def move_transcript_past(log: ConversationLog, key: str, sig: float) -> None:
     (~15.6 ms on Windows), leaving the second write with an mtime identical
     to the first -- a staged "transcript moved on" then has not moved on at
     all, and any staleness assertion keyed on the mtime signature becomes a
-    coin flip (#2981, same class as #2449). Pinning the mtime makes the test
+    coin flip. Pinning the mtime makes the test
     exercise the signature COMPARISON rather than the platform's clock
     resolution (testing-conventions.md § Determinism).
     """
@@ -46,7 +47,7 @@ async def drain_background_tasks(state) -> None:
     the Slack mock straight afterwards races it: it usually wins on an idle machine and
     loses under load. That flake surfaces as a plain count mismatch (``assert 0 == 2``)
     or as ``'NoneType' object has no attribute 'args'``, on a DIFFERENT test in the
-    class each run, and names neither the task nor the race (#4130).
+    class each run, and names neither the task nor the race.
 
     Awaiting the not-yet-done members is an exact wait on the real completion
     condition rather than a sleep. An empty set means the task already finished; a
@@ -96,36 +97,117 @@ def _make_ready_kiro_prerequisite() -> KiroPrerequisiteService:
     return _READY_KIRO_PREREQUISITE
 
 
+def stub_readonly_spec_publisher(monkeypatch) -> list[tuple[str, str | None]]:
+    """Stand in for the side turn's derived-spec publisher.
+
+    ``_run_side_turn`` derives ``<agent>--readonly`` from the live kiro agent
+    registry before it creates the side session; under a test home that
+    registry holds no base spec, so the real publisher would refuse every turn
+    (``base_spec_missing``). The stub answers with the derived name and a fixed
+    digest and records the base it was asked for. The real derivation and
+    publication are covered by ``test_side_readonly_spec.py``.
+    """
+    from kiro_crew.dashboard.side_readonly_spec import PublishedSpec
+
+    calls: list[tuple[str, str | None]] = []
+
+    def _fake_publish(base_name: str, project_dir: str | None = None) -> PublishedSpec:
+        calls.append((base_name, project_dir))
+        return PublishedSpec(name=f"{base_name}--readonly", digest="d" * 64)
+
+    monkeypatch.setattr("kiro_crew.dashboard.handlers.side.publish_readonly_spec", _fake_publish)
+    return calls
+
+
 def _make_state(tmp_path, **kwargs):
     """Create a DashboardState with mocked services and real ConversationLog."""
     sessions = MagicMock(count=0)
+    sessions.get_provider = MagicMock(return_value=None)
+    sessions.resumable_sid = MagicMock(return_value=None)
     sessions.remove = AsyncMock()
     sessions.discard_conversation = AsyncMock()
     sessions.aflush = AsyncMock()
     sessions.recycle_background = AsyncMock()
     sessions.get_pid = MagicMock(return_value=None)
+    # No live provider by default, and a destroy that can be awaited: the side
+    # turn asks ``get_provider`` whether a session is retained and destroys a
+    # stale one. A bare MagicMock answers "yes" to the first and cannot be
+    # awaited for the second. Tests that want a live provider set it explicitly.
+    sessions.get_provider = MagicMock(return_value=None)
+    sessions.destroy = AsyncMock()
     # Real in-memory Slack-link store rather than bare MagicMocks. The unlink
     # path unpacks get_slack_link into (thread_ts, channel_id) and branches on
     # whether a link is PRESENT, and a MagicMock satisfies neither: it iterates
     # empty (ValueError on unpack) and is unconditionally truthy. Parity with
     # SessionStore: absent -> (None, None); clear -> True iff a link was there.
     _slack_links: dict[str, tuple[str, str]] = {}
+    # Per-binding nonces, with ``SessionMap``'s semantics: minted when a binding
+    # is created or its coordinates change, kept across an identical rewrite,
+    # dropped with the binding. The slots row digests them into its ``binding``
+    # token and the unlink endpoints read them for the compare, so a double
+    # without them would make every recreated binding read like the old row --
+    # the exact ABA the real map's nonce exists to refuse.
+    _slack_nonces: dict[str, str] = {}
+    _mirror_nonces: dict[str, str] = {}
+    _nonce_counter = itertools.count(1)
+
+    def _mint_nonce():
+        return f"nonce-{next(_nonce_counter):04d}"
 
     def _set_slack_link(key, thread_ts, channel_id):
         if thread_ts or channel_id:
+            if _slack_links.get(key) != (thread_ts, channel_id) or key not in _slack_nonces:
+                _slack_nonces[key] = _mint_nonce()
             _slack_links[key] = (thread_ts, channel_id)
         else:
             _slack_links.pop(key, None)
+            _slack_nonces.pop(key, None)
 
     def _get_slack_link(key):
         return _slack_links.get(key, (None, None))
 
     def _clear_slack_link(key):
+        _slack_nonces.pop(key, None)
         return _slack_links.pop(key, None) is not None
+
+    def _slack_link_nonce(key):
+        return _slack_nonces.get(key, "") if key in _slack_links else ""
+
+    def _clear_slack_link_if(key, channel_type, token):
+        # ``SessionMap.clear_slack_link_if``: compare the row's token against the
+        # link held (with its nonce) and clear only on equality -- both key
+        # spellings of a dashboard session, as the real map does.
+        thread_ts, channel_id = _get_slack_link(key)
+        if not thread_ts or channel_type != "slack":
+            return False
+        current = ChannelLink("slack", channel_id=channel_id, thread_id=thread_ts)
+        if binding_token(current, _slack_link_nonce(key)) != token:
+            return False
+        cleared = _clear_slack_link(key)
+        if key.startswith("dashboard:"):
+            cleared = _clear_slack_link(key[len("dashboard:") :]) or cleared
+        return cleared
 
     sessions.set_slack_link = MagicMock(side_effect=_set_slack_link)
     sessions.get_slack_link = MagicMock(side_effect=_get_slack_link)
     sessions.clear_slack_link = MagicMock(side_effect=_clear_slack_link)
+    sessions.slack_link_nonce = MagicMock(side_effect=_slack_link_nonce)
+    sessions.clear_slack_link_if = MagicMock(side_effect=_clear_slack_link_if)
+
+    # Real in-memory INBOUND channel-link store (``get_origin_link``/``set_origin_link``, the SessionManager surface), for
+    # the same reason: a bare MagicMock return is unconditionally truthy, so a
+    # reader asking "does this session have a channel link" would see one on
+    # every key. Parity with SessionStore: absent -> None.
+    _channel_links: dict[str, object] = {}
+
+    def _set_link(key, link):
+        _channel_links[key] = link
+
+    def _get_link(key):
+        return _channel_links.get(key)
+
+    sessions.set_origin_link = MagicMock(side_effect=_set_link)
+    sessions.get_origin_link = MagicMock(side_effect=_get_link)
 
     # Real in-memory mirror-link store, for the same reason as the Slack one and
     # with a sharper failure mode: callers branch on whether a mirror is PRESENT,
@@ -136,24 +218,70 @@ def _make_state(tmp_path, **kwargs):
     # drain's mirror-retarget comparison reads the link's identity fields, so a
     # bare tuple would make every mirror identical).
     _mirror_links: dict[str, ChannelLink] = {}
+    #: Keys whose binding accepts INBOUND messages, so ``find_mirror_sessions``
+    #: can answer the ``inbound_only`` question the resume paths ask.
+    _inbound_keys: set[str] = set()
 
-    def _set_mirror_link(key, channel_id, thread_ts):
+    def _set_mirror_link(key, channel_id=None, thread_ts=None, *, accepts_inbound=False, reason=""):
+        # Two shapes reach this double. Production is
+        # ``(key, ChannelLink, *, accepts_inbound, reason)``; the Slack-era callers
+        # in these tests pass ``(key, channel_id, thread_ts)``. Accepting both is
+        # what lets ONE double serve every mirror path — without the keyword-only
+        # arguments the channel-neutral link endpoint raises TypeError, which
+        # surfaces as a 500 and hides whatever the test was actually asserting.
+        if isinstance(channel_id, ChannelLink):
+            if _mirror_links.get(key) != channel_id or key not in _mirror_nonces:
+                _mirror_nonces[key] = _mint_nonce()
+            _mirror_links[key] = channel_id
+            if accepts_inbound:
+                _inbound_keys.add(key)
+            else:
+                _inbound_keys.discard(key)
+            return
         if channel_id or thread_ts:
-            _mirror_links[key] = ChannelLink(
-                channel_type="slack", channel_id=channel_id, thread_id=thread_ts
-            )
+            link = ChannelLink(channel_type="slack", channel_id=channel_id, thread_id=thread_ts)
+            if _mirror_links.get(key) != link or key not in _mirror_nonces:
+                _mirror_nonces[key] = _mint_nonce()
+            _mirror_links[key] = link
         else:
             _mirror_links.pop(key, None)
+            _mirror_nonces.pop(key, None)
+            _inbound_keys.discard(key)
 
     def _get_mirror_link(key):
         return _mirror_links.get(key)
 
-    def _clear_mirror_link(key):
+    def _clear_mirror_link(key, *, reason=""):
+        _inbound_keys.discard(key)
+        _mirror_nonces.pop(key, None)
         return _mirror_links.pop(key, None) is not None
+
+    def _mirror_link_nonce(key):
+        return _mirror_nonces.get(key, "") if key in _mirror_links else ""
+
+    def _clear_mirror_link_if(key, channel_type, token, *, reason=""):
+        # ``SessionMap.clear_mirror_link_if``: the compare and the clear as one
+        # step; False is a mismatch (or no binding) and nothing is touched.
+        current = _get_mirror_link(key)
+        if current is None or (current.channel_type or "").lower() != channel_type:
+            return False
+        if binding_token(current, _mirror_link_nonce(key)) != token:
+            return False
+        return _clear_mirror_link(key, reason=reason)
+
+    def _find_mirror_sessions(link, *, inbound_only=False):
+        return [
+            key
+            for key, candidate in _mirror_links.items()
+            if candidate == link and (not inbound_only or key in _inbound_keys)
+        ]
 
     sessions.set_mirror_link = MagicMock(side_effect=_set_mirror_link)
     sessions.get_mirror_link = MagicMock(side_effect=_get_mirror_link)
     sessions.clear_mirror_link = MagicMock(side_effect=_clear_mirror_link)
+    sessions.mirror_link_nonce = MagicMock(side_effect=_mirror_link_nonce)
+    sessions.clear_mirror_link_if = MagicMock(side_effect=_clear_mirror_link_if)
+    sessions.find_mirror_sessions = MagicMock(side_effect=_find_mirror_sessions)
     state = DashboardState(
         sessions=sessions,
         crons=MagicMock(list_jobs=MagicMock(return_value=[]), status=MagicMock(return_value={})),
@@ -276,11 +404,29 @@ def _make_folder_app(state: DashboardState) -> web.Application:
     return app
 
 
-def _make_tags_app(state: DashboardState) -> web.Application:
+def _make_tags_app(
+    state: DashboardState, *, authenticate_owner: bool = True, booted_store: bool = True
+) -> web.Application:
     """Minimal aiohttp app with chat_tags endpoints (vocabulary, columns, drop, slot tags)."""
+    from kiro_crew.dashboard import chat_tag_grants
+
+    # A real boot always writes the grant store (``DashboardState.load_tags``
+    # seeds it, empty on an upgraded install), and an owner create refuses to
+    # mint into a MISSING one. Mirror that boot here unless the test has
+    # arranged a store condition of its own: an existing (even broken) file,
+    # a boot quarantine it is exercising, or ``booted_store=False`` for a
+    # test about the missing store itself.
+    if (
+        booted_store
+        and not chat_tag_grants._store_path().exists()
+        and not chat_tag_grants._quarantined_this_boot
+    ):
+        chat_tag_grants.seed_default_grants([])
+        chat_tag_grants.refresh_cache()
     from kiro_crew.dashboard.chat_tags import (
         api_chat_slot_drop,
         api_chat_slot_tags,
+        api_chat_tag_adopt,
         api_chat_tag_column_create,
         api_chat_tag_column_delete,
         api_chat_tag_column_update,
@@ -292,10 +438,21 @@ def _make_tags_app(state: DashboardState) -> web.Application:
         api_chat_tags,
     )
 
-    app = web.Application()
+    @web.middleware
+    async def _test_auth_middleware(request: web.Request, handler):
+        """Simulate owner claims installed by token_auth_middleware."""
+        if authenticate_owner:
+            if "app" not in request:
+                request["app"] = ""
+            if "user" not in request:
+                request["user"] = "local-app"
+        return await handler(request)
+
+    app = web.Application(middlewares=[_test_auth_middleware])
     app["state"] = state
     app.router.add_get("/api/chat/tags", api_chat_tags)
     app.router.add_post("/api/chat/tags", api_chat_tag_create)
+    app.router.add_post("/api/chat/tags/{id}/adopt", api_chat_tag_adopt)
     app.router.add_patch("/api/chat/tags/{id}", api_chat_tag_update)
     app.router.add_delete("/api/chat/tags/{id}", api_chat_tag_delete)
     app.router.add_put("/api/chat/slots/{slot}/tags", api_chat_slot_tags)

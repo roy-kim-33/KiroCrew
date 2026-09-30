@@ -35,7 +35,13 @@ provider cannot be registered while the gate silently keeps comparing three.
 **Each client module is the stable composition façade for its provider.** The
 routes and tests continue to import `github_client`, `gitlab_client` and
 `azure_client`; those modules retain the protocol surface, exception aliases,
-constants and patchable I/O chokepoints. Provider-specific sibling modules keep
+the constants something actually binds, and patchable I/O chokepoints. A mirror
+NOTHING binds is not part of that surface: the sibling that owns the value reads
+its own module global, so a façade copy is never the seam it resembles and
+patching it changes nothing. Binding means the façade's own code, a test that
+asserts on the façade attribute, or a documented cross-surface pointer such as
+`_MEMBER_ASSOC_RANK`, which `website/src/apps/issue-radar/context.tsx` names as
+the anchor the frontend ranking tracks. Provider-specific sibling modules keep
 the implementation boundaries explicit: `*_transport.py` owns URL, environment,
 request and pagination mechanics; `*_normalization.py` converts provider payloads
 into the shared GitHub-shaped records; and `github_queries.py` owns GitHub's
@@ -193,6 +199,43 @@ All routes live under `/api/apps/issue-radar/` and are registered by
 `apps/builtins/issue_radar/backend/routes.py:register_routes`. Every handler is
 wrapped in `_require_enabled` (returns 403 when the app is disabled).
 
+**`backend/routes.py` is the route layer's facade, and the handlers live in
+`backend/http_routes/`.** The facade owns what every handler runs first: request
+identity (`_key_from_request`, `_key_from_body`, `_account_key`), the enabled,
+connected-repo and write-permission gates (`_require_enabled`, `_connected`,
+`_repo_can_write`), per-repo store scoping (`_scope`, `_st`), the SEL audit
+(`_audit`) and the provider-neutral error aliases. It also keeps `/connect`, whose
+off-loop URL parse `tests/test_gitlab.py` pins to that file, the probe-gated
+list-poll decision (see Client-Side List Polling) and `register_routes`. Each
+private `http_routes` module owns one responsibility:
+
+| Module | Owns |
+|---|---|
+| `http_routes/repositories.py` | `/repos` (GET, DELETE), `/me`, `/recent-repos`, `/settings`, `/settings/role`, `/labels`, `/members`, and the cache-first label loader `_load_labels_for_ai` |
+| `http_routes/items.py` | `/issues`, `/issue`, `/pulls`, `/pulls/search`, `/pull`, `/ref`, both first-page fast paths, and the open-issue loader `_load_open_issues_for_reco` |
+| `http_routes/deps.py` | `/deps` and its per-app refresh-task and rebuild-lock registries |
+| `http_routes/ai.py` | `/issue-ai`, `/pull-ai`, the one-shot model adapter `_run_oneshot_model`, and the output-language resolution every AI surface shares |
+| `http_routes/recommendations.py` | `/recommendations` (GET, POST) and `/labels/create` |
+| `http_routes/tagging.py` | `/tagging` (GET, POST) and `/labels/apply-bulk` |
+| `http_routes/issue_writes.py` | `/labels/apply`, `/issue/state`, `/issue/assignees` |
+| `http_routes/investigation.py` | `/investigation` (GET, PUT) |
+| `http_routes/pr_actions.py` | every `/pull/*` action, `/pull/runs`, `/pulls/bulk`, and the shared `_pr_action_preamble` / `_run_pr_action` |
+
+The facade re-exports every name those modules define, so `routes.<name>` keeps
+resolving for the tests, for `crew_routes`' gate chain and for other modules' docs.
+**A patch on `backend.routes` of a gate or a seam intercepts the call wherever it
+is made.** An owner module reaches everything the facade owns, and every seam the
+suites patch (the cache-first loaders, the model calls, `_run_pr_action`,
+`_refuse_if_head_moved`, the locked write helpers, `_ui_language`,
+`_TAG_BATCH_MAX`), through a function-local `from .. import routes` and a
+call-time `routes.<name>` read. Any other name an owner calls within its own
+module, such as `_pr_action_preamble` from the PR handlers, is bound there, so
+patching it on the facade reaches only the callers that read it through the
+facade. `test/test_issue_radar_http_routes_surface.py` fails an owner module that
+binds a gate or a seam itself. The import is function-local because the facade
+imports the owners, so a module-scope import back would be a cycle. The same test
+extends the per-repo store-scoping guard over every owner module.
+
 | Method | Path | Purpose |
 |--------|------|---------|
 | POST | `/connect` | Connect a repo (validates URL, verifies `gh` access) |
@@ -235,6 +278,28 @@ The Investigate / Review buttons open a KiroCrew chat session seeded with a
 triage prompt. When the agent concludes it writes its verdict back into the
 item's investigation record — that is what puts a verdict + summary on the
 issue's card instead of leaving it in chat scrollback.
+
+The session opens in the repo's configured **`workspace_path`** (a per-repo,
+local-only triage setting stored in `config.json`, alongside `triage_labels` and
+`notify_on_new_issue`, and normalized by `store._normalize_settings`) so the agent
+sees the repo's real source instead of the gateway's default cwd. The frontend forwards it as the new slot's
+`project` on `createSlot`, which sets the working directory via `chatSlotProject`
+after create. An empty setting passes `null`, leaving the slot on the default cwd
+(the pre-workspace behavior). It is applied only when a FRESH session is opened;
+a resumed slot keeps the working directory it was born with, so changing the
+setting never moves the cwd of a conversation already running — which is why the
+Repo Settings readout says "New Investigate sessions will run in …", not that the
+next click will. The path is stored verbatim and never validated against the
+filesystem — the path resolves on the machine running the gateway (which may be a
+different host than the operator's), and a not-yet-checked-out path is a
+legitimate empty state. Because it is unvalidated, `chatSlotProject` can still
+reject it at slot-create time (missing dir on the gateway host, or a sensitive
+path); `createSlot` then deletes the just-made slot and throws, which reaches
+`openSession`'s `catch` and surfaces in the hook's `error` state — the same
+contract the chat sidebar uses ("Not a directory"). A bad path is deliberately
+NOT swallowed into a default-cwd session: doing so would silently pin the whole
+investigation thread in the wrong directory, recreating the wrong-cwd failure
+this feature removes.
 
 That write goes through the **`issue_radar_record_investigation` MCP tool**, not
 a raw HTTP call. An agent session holds no dashboard credential:
@@ -337,6 +402,19 @@ would otherwise lose an update. An analysed issue the model declined to label is
 stored as an EMPTY list, not omitted — otherwise "the next un-analysed slice"
 would return the same unlabelable issues forever.
 
+The connected-repo reader treats a non-object `config.json` as an empty config,
+and filters non-object rows from its `repos` list. A malformed row cannot stop
+the app from listing or updating other connected repositories.
+
+Every cache parser applies the same rule to its own file: a JSON root that parses
+but is not an object is unusable. Readers return a MISS so the route refetches and
+the next write heals the file; write-through patchers skip that individual file
+and continue patching the other caches. Without that, a hand-edited or restored
+cache fails its route or aborts the remaining post-write cache repairs. The
+investigation record is deliberately excluded — it is the only copy of a user's
+findings, so reading a malformed root as "absent" would let the next write replace
+it.
+
 ## Permissions
 
 Write routes (`/labels/apply`, `/labels/apply-bulk`, `/issue/state`,
@@ -388,8 +466,8 @@ deliberate narrowing:
      one GitLab value in the set. Note the read side still reports `can_be_merged` as
      `mergeable: true` — "no conflicts" is a true, useful signal for the pane's warning;
      the merge *gate* keys off the raw status instead, which is why
-     `gitlab_client._MERGEABLE_STATUSES` and `routes._MERGE_ALLOWED_STATES` deliberately
-     differ.
+     `gitlab_client._MERGEABLE_STATUSES` and `http_routes/pr_actions.py`'s
+     `_MERGE_ALLOWED_STATES` deliberately differ.
 
    A gate that cannot tell must refuse — and such a PR is still one click from
    `auto_merge`, which lets the provider decide once the checks finish. A provider 405 is
@@ -609,7 +687,7 @@ Three further properties are load-bearing:
 
 - **Normalized into REST's vocabulary at the parse boundary.** GraphQL SHOUTS its enums
   (`CLEAN`, `MERGEABLE`, `OPEN`) where REST is lowercase, so `_parse_summary_rows`
-  lowers them; `routes._MERGE_ALLOWED_STATES` and the frontend's `MERGE_READY_STATES`
+  lowers them; `pr_actions._MERGE_ALLOWED_STATES` and the frontend's `MERGE_READY_STATES`
   both compare lowercase, and an un-lowered `CLEAN` would match neither and read as
   "not ready" — silently keeping the broken arm on offer.
 - **`UNKNOWN` stays unknown, and it is the COMMON case.** GitHub computes mergeability
@@ -760,7 +838,7 @@ Two safeguards, both deliberate:
   own `gh search` shares. `_PROBE_COALESCE_SEC` (15s) shares one reading per (repo, kind)
   across every open tab, so a 30s interval costs at most 2 probes/min/kind however many
   tabs are open. Halve the floor and that stops holding. Nothing enforces the
-  relationship across the language boundary, so `issueRadarPolling.test.ts` asserts
+  relationship across the language boundary, so `issueRadarPolling.test.tsx` asserts
   `min(choices) == 2 × 15s`: if the backend constant moves, that test is what says this
   floor must move with it.
 - **`/pulls/search` opts out of BOTH new knobs.** Prefetch does not reach it, and
@@ -797,7 +875,7 @@ space: `gcTime = CACHE_RETENTION_MS` (**30 min**). Four properties:
 
 That is sufficient on its own because the surfaces gate their loading copy on `isLoading`,
 which is false whenever data is present: a remount inside the retention window paints the
-retained rows immediately and any refetch runs behind them. `issueRadarPolling.test.ts`
+retained rows immediately and any refetch runs behind them. `issueRadarPolling.test.tsx`
 pins the retention, its scoping, and the not-pending property.
 
 The lists additionally keep their previous rows on screen while a new key loads, so
@@ -814,7 +892,7 @@ a same-slug repo on another host is correctly a different repo) and returns `und
 across a switch, which renders the honest loading state. The ticked selection is already
 cleared on `scopeKey`, but that effect runs *after* the paint — it closes the window one
 render late rather than never opening it, which is why the placeholder itself is scoped.
-`issueRadarPolling.test.ts` pins both halves.
+`issueRadarPolling.test.tsx` pins both halves.
 
 `add_pr_comment` is a separate function from `add_issue_comment` even though the two
 coincide on GitHub (one number sequence per repo): GitLab numbers issues and merge
@@ -972,7 +1050,7 @@ does not read as the whole repo. Net cost: exactly one extra single-page request
 cold repo-open. `list_open_issues_first_page` is on the `ProviderClient` protocol, so
 GitLab and Azure DevOps each implement the symmetric single-page variant (Azure's is
 one WIQL+hydrate pair capped at `_PAGE_SIZE`, in the same changed-date order as the
-full list) and `test_provider_parity` holds.
+full list) and `apps/builtins/issue_radar/tests/test_gitlab.py::TestClientParity::test_every_module_implements_the_whole_surface` holds.
 
 `GET /pulls?first_page=1` (open state only) is the PR twin, handled by
 `_handle_pulls_first_page` with one added rule: the first page is returned
@@ -991,7 +1069,7 @@ skeleton until the full list lands; the footer shows a `pullsPartial` "loading t
 hint. `list_open_pulls_first_page` is on the `ProviderClient` protocol (GitLab's variant
 is card-complete already, since it inlines `head_pipeline`; Azure's is un-enriched like
 GitHub's, because its check state is a per-PR policy-evaluation call), and
-`test_provider_parity` holds.
+`apps/builtins/issue_radar/tests/test_gitlab.py::TestClientParity::test_every_module_implements_the_whole_surface` holds.
 
 `enrich_pulls` runs its two INDEPENDENT GraphQL families — card summaries and merge
 readiness — **concurrently** on a two-worker `ThreadPoolExecutor` rather than
@@ -1144,8 +1222,17 @@ the list, the filters, the selected item — is untouched.
   the ACTIVE repo (case-insensitively) is claimed. Trailing segments (`/files`),
   query strings and `#issuecomment-…` fragments are ignored — same target. Any
   other link (a different repo, an Enterprise host, `/discussions/`, `/commit/`,
-  a relative href, a non-`http(s)` scheme) keeps its existing behaviour and opens
-  externally. A repo is identified by owner/repo only, so a same-path URL on an
+  a relative href) is NOT claimed: it falls through to `MdAnchor`'s own branch
+  ladder (forge/Jira chips, unfurl chips, session links, path interception,
+  default anchor — see `MarkdownRenderer.tsx`, which owns that contract and its
+  tests), exactly as if no override were installed. Two facts matter to an
+  override author: a scheme `defaultUrlTransform` also refuses (anything
+  outside `http(s)`, `mailto:`, `xmpp:`, `irc(s):` and the renderer's
+  editor-scheme allowlist) never reaches the override at all — `urlTransform`
+  rejects it and the renderer shows the label as inert text (no anchor); and a
+  `mailto:`/`xmpp:`/`irc(s):` href DOES reach the override, so a provider must
+  keep its own scheme check.
+  A repo is identified by owner/repo only, so a same-path URL on an
   Enterprise host is a DIFFERENT repo and is never claimed.
 - **Interception** happens at the ANCHOR, not on the DOM: `MarkdownRenderer`
   exposes a `LinkOverrideCtx` seam (a predicate-style render override consulted by
@@ -1200,9 +1287,15 @@ the list, the filters, the selected item — is untouched.
   check is answered from POSIX ownership (`st_uid` + the group/other write bits)
   or, on Windows, from the object's ACL — see
   `github_runner.check_provider_path_component_windows` and
-  `kiro_crew.windows_acl`. An **elevated** Windows gateway is refused for the same
-  reason a root POSIX one is: its children would be elevated too, which makes the
-  ownership walk vacuous.
+  `kiro_crew.windows_acl`. A **root** POSIX gateway is refused: the sandbox
+  masks the credential homes from the agent's children but leaves the filesystem
+  writable, and a provider child runs unsandboxed with those credentials, so a
+  root agent could overwrite a root-owned `gh` that the ownership walk cannot
+  tell from the operator's install. An **elevated** Windows gateway (the
+  built-in `Administrator` account is always elevated) is not refused: Windows
+  has no OS sandbox here, so the agent's shell already holds the gateway's full
+  token and the refusal would remove the feature without removing any exposure.
+  The ACL walk runs unchanged for it, keyed on the gateway user's SID.
 - **Azure DevOps is POSIX only (macOS/Linux).** `azure_client._az_bin` refuses
   `win32` before it resolves anything, and raises `ProviderCliError` rather than
   `ProviderSetupError` so the connect dialog does not offer an install that would

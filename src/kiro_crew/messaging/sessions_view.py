@@ -6,8 +6,9 @@ answers about each transcript on disk: what it is called, which agent ran it,
 and whether it is live. That reading is pure filesystem work with no channel in
 it, so it lives here and each surface owns only its own rendering.
 
-Dependency direction stays one-way: this module imports ``config.paths`` and
-``security`` and nothing from ``kiro_crew.slack`` / ``kiro_crew.dashboard``.
+Dependency direction stays one-way: this module imports ``config.paths``,
+``history`` and ``security``, and nothing from ``kiro_crew.slack`` /
+``kiro_crew.dashboard``.
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from kiro_crew.config.paths import data_home
+from kiro_crew.history import transcript_sort_key, transcript_stem
 from kiro_crew.security import redact
 from kiro_crew.sel import sel
 
@@ -37,6 +39,14 @@ _SESSIONS_MAX_MSG_CHARS = 4000
 _SESSIONS_MAX_PREVIEW = 5
 _SESSIONS_DEFAULT_LIMIT = 10
 
+#: Metadata-line field holding the instant of a session's newest HUMAN turn,
+#: written by the dashboard slot save (``chat_persistence._save_slot_to_history``)
+#: and read here as the ranking key. It sits on line 0, so ranking on it costs one
+#: line per candidate rather than a transcript read, and it is CONTENT: unlike
+#: ``st_mtime`` it survives archival, consolidation, rotation, backup and
+#: migration, none of which are conversation activity.
+_META_LAST_USER_AT = "last_user_at"
+
 _SESSION_KIND_DASHBOARD = "dashboard"
 _SESSION_KIND_TASKRUNNER = "taskrunner"
 _SESSION_KIND_OTHER = "other"
@@ -51,6 +61,77 @@ def _sessions_dir() -> Path:
     shadowing this — there is one override knob, not two.
     """
     return data_home() / "sessions"
+
+
+def _rank_by_human_activity(jsonl: Path, mtime: float) -> float:
+    """Rank *jsonl* by its newest human turn, falling back to *mtime*.
+
+    Returns epoch seconds: the transcript's recorded human turn when it has a
+    usable one, and *mtime* otherwise.
+
+    ``st_mtime`` records the last WRITE, and a write is machine activity: a cron
+    wake, a monitor loop, a subagent turn, an auto-title refresh and any bulk
+    maintenance pass over the directory all advance it although nobody read the
+    session. A pass that iterates in activity order INVERTS the list outright,
+    because the freshest session is rewritten first and so ends up holding the
+    oldest stamp. A recorded human turn has none of those properties: it is
+    content, so archival, consolidation, rotation, backup and migration all leave
+    it alone.
+
+    Costs ONE line. Line 0 is always the metadata line -- every writer in
+    ``history`` rewrites it in place instead of appending a second record -- so a
+    stamp that is missing, malformed, or not on a metadata line costs a single
+    ``readline`` and falls back rather than raising.
+    """
+    try:
+        with jsonl.open(encoding="utf-8") as fh:
+            first = fh.readline()
+    except (OSError, UnicodeError):
+        # Unreadable, deleted between the glob and this open, or not valid UTF-8.
+        # The decode case is why ``UnicodeError`` is caught and not merely
+        # tolerated: this runs for EVERY candidate before the ``limit`` break, so
+        # one corrupt transcript anywhere in the directory would otherwise raise
+        # out through the collector and render "Sessions unavailable" on every
+        # surface, on every scan, until someone deleted the file. A
+        # ``UnicodeDecodeError`` is a ``ValueError``, so the I/O clause alone does
+        # not stop it. Rank by mtime; the read loop below skips the file if it is
+        # still unreadable there.
+        return mtime
+    if not first:
+        return mtime
+    try:
+        head = json.loads(first.strip())
+    except ValueError:
+        # Covers json.JSONDecodeError, which subclasses ValueError.
+        return mtime
+    if not isinstance(head, dict) or head.get("_type") != "metadata":
+        return mtime
+    stamped = head.get(_META_LAST_USER_AT)
+    if not isinstance(stamped, str) or not stamped:
+        return mtime
+    try:
+        bucket, seconds = transcript_sort_key(stamped)
+    except (ValueError, OverflowError, OSError):
+        # A stamp can PARSE and still be unusable. ``transcript_sort_key``
+        # resolves a naive value with ``astimezone()``, which raises at the
+        # representable boundary -- measured, not hypothetical: "year 0 is out of
+        # range" for ``0001-01-01T00:00:00`` and "year 10000" for
+        # ``9999-12-31T23:59:59`` -- and ``timestamp()`` can overflow on some
+        # platforms. This helper promises that a bad stamp costs one readline and
+        # falls back, so the CONVERSION has to sit inside that promise too:
+        # otherwise one such file raises out through the collector and every
+        # surface renders "Sessions unavailable" on every scan until someone
+        # deletes it.
+        return mtime
+    if bucket != 0:
+        # Unparseable. ``transcript_sort_key`` reports that through its BUCKET,
+        # and pairs it with a fallback epoch of 0.0 -- so a rank taken from its
+        # seconds alone would not merely be wrong, it would pin the session to
+        # 1970 and bury it below every other row permanently. The file's mtime is
+        # a real instant, so fall back to it: a corrupt stamp costs the session
+        # its precision, not its place in the list.
+        return mtime
+    return seconds
 
 
 # ---------------------------------------------------------------------------
@@ -92,6 +173,85 @@ def _default_session_title(key: str, kind: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Dismissal
+# ---------------------------------------------------------------------------
+
+
+def _resolved_session_key(stem_key: str, sessions: "SessionManager | None") -> str:
+    """The real session key behind a transcript filename, where one is knowable.
+
+    ``history._safe_key`` folds every ``:`` in a session key to ``_`` to build
+    the filename, and that fold is not reversible: nothing in
+    ``slack_C123.1700000000`` says which underscores were colons. Two cases can
+    still be answered:
+
+    * ``dashboard_`` has exactly one colon, at a fixed position, so *stem_key*
+      arrives already unfolded from the caller;
+    * a CHANNEL session's unfolded key is held by the session map, and
+      ``SessionManager.channel_key_for_stem`` is the only authority on it. An
+      empty answer means "not knowable", and then the folded spelling stands.
+
+    Getting this wrong is not cosmetic here. The key decides ``has_session``,
+    so a live Slack conversation read under its folded spelling looks idle --
+    which now means its row is HIDDEN if it carries a dismissal, and the End
+    button on that row carries a key naming no live session, so it writes the
+    dismissal without stopping the process it appeared to end. It is also the
+    key the Resume and End buttons carry, so the resolved spelling is what
+    makes those buttons address the session the channel is actually running.
+
+    *sessions* is duck-typed (the collector documents only ``has_session``), so
+    the resolver is optional and its absence simply leaves the fold in place.
+
+    The answer is VERIFIED rather than trusted: it counts only when folding it
+    back reproduces the stem that was asked about, the same check
+    ``messaging.session_resume`` applies to this resolver. Binding a row to a
+    key the filename does not fold to would put the End button on one
+    conversation and the transcript of another.
+    """
+    resolve = getattr(sessions, "channel_key_for_stem", None)
+    if not callable(resolve):
+        return stem_key
+    try:
+        resolved = str(resolve(stem_key) or "")
+    except Exception:  # noqa: BLE001 - a listing must not fail on a map read
+        logger.debug("sessions view: stem resolve failed for %s", stem_key, exc_info=True)
+        return stem_key
+    if not resolved or transcript_stem(resolved) != stem_key:
+        return stem_key
+    return resolved
+
+
+def _row_is_ended(*, dismissed: bool, active: bool) -> bool:
+    """True when a row has been dismissed and is not live again.
+
+    THE definition of "ended" for every surface that lists sessions, so the
+    End button, the row marker and the opt-in cannot drift apart.
+
+    *dismissed* is the transcript metadata's ``closed`` flag — the durable
+    record that the user put this conversation away, written by the Slack End
+    button and by a dashboard tab close. There is one such record per
+    transcript: a tab and its channel conversation share the file, so a
+    dismissal is stored once and every surface reads the same one.
+
+    A live session outranks the flag. ``has_session`` is true only while a
+    process is actually serving the key, so a resumed conversation is back in
+    the list immediately, without waiting for anyone to rewrite the file.
+
+    The flag alone otherwise decides, and deliberately **not** "unless the
+    file was written after the dismissal", which is how
+    ``dashboard.channel_slots._close_stands`` reads the same flag for the
+    dashboard's own listing. The two surfaces are answering different
+    questions. That one asks whether a conversation outran a closed tab and
+    compares against the channel's last write. This one asks whether the user
+    still wants the row, and background housekeeping writes the file without
+    the user doing anything — consolidation on end, skill extraction, an
+    auto-title. Letting any write undo the dismissal would put the row
+    straight back, which is the behaviour End is supposed to stop.
+    """
+    return dismissed and not active
+
+
+# ---------------------------------------------------------------------------
 # Collector
 # ---------------------------------------------------------------------------
 
@@ -103,10 +263,11 @@ def _collect_recent_sessions(
     kind: "str | Iterable[str] | None" = None,
     sessions_dir: Path | None = None,
     with_messages: bool = True,
+    include_ended: bool = False,
 ) -> list[dict]:
     """Read JSONLs under ``<config_dir>/sessions/`` and return a sorted list.
 
-    Each row: ``{key, title, agent, mtime, active, kind, msgs}`` where
+    Each row: ``{key, title, agent, mtime, active, ended, kind, msgs}`` where
     ``msgs`` is a list of ``{"role": str, "content": str}`` dicts (last
     ``_SESSIONS_MAX_PREVIEW`` user/assistant messages, truncated to
     ``_SESSIONS_MAX_MSG_CHARS`` chars but **not** redacted — redaction
@@ -120,22 +281,62 @@ def _collect_recent_sessions(
     an iterable of kinds (the Home Tab uses this to fetch dashboard +
     taskrunner in a single directory scan), or ``None`` for no filter.
 
-    Sorted by mtime descending, capped at *limit*. The kind filter and the
-    mtime sort key are both derivable without opening a file (kind from the
-    filename stem, mtime from ``stat``), so only the newest *limit*
-    matching transcripts are actually read — the directory can hold an
-    unbounded number of historical sessions without the read cost growing
-    with it. Files that turn out to be empty or unreadable are skipped and
-    the scan continues down the mtime order, so the result still holds
-    *limit* rows whenever enough valid transcripts exist.
+    *include_ended* keeps rows the user has dismissed. Default ``False``: a
+    dismissed row is what the End button promises to take away, and leaving
+    it in means End appears to do nothing while the row still competes for
+    one of *limit* slots. See :func:`_row_is_ended` for what counts.
+
+    Sorted by last HUMAN activity descending, capped at *limit*. The rank key is
+    a session's ``last_user_at`` metadata stamp when it has one and its
+    ``st_mtime`` when it does not, because mtime measures machine activity: a
+    cron wake, a monitor loop, a subagent, or any bulk pass over the directory
+    rewrites the file and reorders the whole list, and a pass that iterates in
+    activity order inverts it. The kind filter still needs no file open (kind
+    comes from the filename stem), and the rank costs ONE line per candidate --
+    line 0 is always the metadata line -- so only the newest *limit*
+    matching transcripts are read in FULL. It is the whole-transcript reads that
+    stay capped at *limit*, not the scan: the one-line rank read does grow with
+    the directory, by one open and one short read per file, which is what a
+    content-based rank costs and what ``stat`` cannot answer.
+
+    Three things are skipped: an empty file, an unreadable one, and a
+    dismissed row. Skipping keeps going down the rank order rather than ending
+    the scan, so the result still holds *limit* rows whenever enough usable
+    transcripts exist. The first two are corrupt-file cases; a dismissal is an
+    ORDINARY state, so with the *n* highest-ranked rows dismissed, *n*
+    transcripts are read and discarded before the first row is kept. That cost
+    is accepted rather than avoided, because the flag lives on the metadata
+    line and cannot be read from ``stat``, and because the alternative --
+    letting a dismissed row hold its slot -- is the bug this exists to fix. It
+    is bounded by the directory and cheap to bound further:
+    ``with_messages=False`` reads only line 0, which is where the flag is.
 
     This function performs synchronous filesystem I/O (directory scan plus
-    up to *limit* whole-file reads, each bounded only by transcript size).
+    up to *limit* whole-file reads plus one per skipped candidate, each
+    bounded only by transcript size).
     Callers on the asyncio event loop MUST use
     :func:`_collect_recent_sessions_off_loop` instead of calling this
     directly — a multi-MB transcript read on the loop stalls every other
     task, including the loop-watchdog heartbeat.
     """
+    # A configured limit below 1 cannot render anything: the read loop breaks on
+    # ``len(rows) >= limit`` before it opens a file, so 0 and every negative
+    # value produce an empty list and the surface silently stops working. Treat
+    # such a value as unset rather than as "show nothing" -- an operator turning
+    # the list off disables the surface, and this is the one chokepoint every
+    # caller passes through, so no surface can skip the guard.
+    #
+    # Coerced rather than compared directly: the value now arrives from config
+    # (``slack.sessions_limit``) through a caller that may hold a stub or a
+    # hand-edited file, and an uncomparable value here would raise INSIDE each
+    # surface's try block -- turning a bad number into "Sessions unavailable"
+    # plus an error audit instead of a list.
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        limit = _SESSIONS_DEFAULT_LIMIT
+    if limit < 1:
+        limit = _SESSIONS_DEFAULT_LIMIT
     sessions_dir = sessions_dir if sessions_dir is not None else _sessions_dir()
     if not sessions_dir.exists():
         return []
@@ -150,7 +351,7 @@ def _collect_recent_sessions(
     # Pre-scan: classify + stat every entry WITHOUT reading it, then sort
     # newest-first so the read loop below opens at most ``limit`` valid
     # transcripts instead of every file in the directory.
-    candidates: list[tuple[float, Path, str, str]] = []
+    candidates: list[tuple[float, float, Path, str, str]] = []
     for jsonl in sessions_dir.glob("*.jsonl"):
         if jsonl.is_symlink():
             continue
@@ -170,14 +371,18 @@ def _collect_recent_sessions(
         except OSError:
             # Deleted between glob and stat — skip.
             continue
-        candidates.append((mtime, jsonl, key, row_kind))
+        rank_ts = _rank_by_human_activity(jsonl, mtime)
+        candidates.append((rank_ts, mtime, jsonl, key, row_kind))
 
-    # Stable sort keyed on mtime only, so equal-mtime entries keep
-    # directory-enumeration order (same tie order the full-scan sort had).
+    # Stable sort keyed on the human-activity rank only, so entries that tie on
+    # it keep directory-enumeration order (the same tie order the mtime sort
+    # had). A file with no recorded human turn ties on its mtime instead, so the
+    # two populations interleave on one timeline rather than one preceding the
+    # other wholesale.
     candidates.sort(key=lambda c: c[0], reverse=True)
 
     rows: list[dict] = []
-    for mtime, jsonl, key, row_kind in candidates:
+    for _rank_ts, mtime, jsonl, key, row_kind in candidates:
         if len(rows) >= limit:
             break
 
@@ -194,13 +399,20 @@ def _collect_recent_sessions(
                 with jsonl.open(encoding="utf-8") as fh:
                     first = fh.readline()
                 lines = [first] if first else []
-        except OSError:
+        except (OSError, UnicodeError):
+            # UnicodeError alongside the I/O clause for the same reason the rank
+            # helper catches it, and this is a SECOND decode site the helper
+            # cannot cover: a transcript whose line 0 decodes but whose body does
+            # not reaches here, and one such file would take down the whole list
+            # instead of costing its own row. Skipping keeps the scan walking
+            # down the rank order.
             continue
         if not lines:
             continue
 
         title = ""
         agent = "kirocrew"
+        dismissed = False
         msgs: list[dict] = []
 
         for line in lines:
@@ -214,6 +426,7 @@ def _collect_recent_sessions(
             if d.get("_type") == "metadata":
                 title = d.get("title") or title
                 agent = d.get("agent") or agent
+                dismissed = bool(d.get("closed"))
                 continue
             if not with_messages:
                 continue
@@ -230,14 +443,24 @@ def _collect_recent_sessions(
         if not title:
             title = _default_session_title(key, row_kind)
 
-        active = bool(sessions and sessions.has_session(key))
+        # Resolved HERE and not in the pre-scan: the resolver walks the session
+        # map, so doing it per candidate would make the scan cost grow with the
+        # directory, which the pre-scan exists to avoid. One resolve per
+        # candidate READ, which is *limit* kept rows plus the skipped ones --
+        # not *limit* flat, for the reason the read-count paragraph above gives.
+        row_key = _resolved_session_key(key, sessions)
+        active = bool(sessions and sessions.has_session(row_key))
+        ended = _row_is_ended(dismissed=dismissed, active=active)
+        if ended and not include_ended:
+            continue
         rows.append(
             {
-                "key": key,
+                "key": row_key,
                 "title": title[:80],
                 "agent": agent,
                 "mtime": mtime,
                 "active": active,
+                "ended": ended,
                 "kind": row_kind,
                 "msgs": msgs[-_SESSIONS_MAX_PREVIEW:],
             }
@@ -253,6 +476,7 @@ async def _collect_recent_sessions_off_loop(
     kind: "str | Iterable[str] | None" = None,
     sessions_dir: Path | None = None,
     with_messages: bool = True,
+    include_ended: bool = False,
 ) -> list[dict]:
     """Run :func:`_collect_recent_sessions` in a worker thread.
 
@@ -276,6 +500,9 @@ async def _collect_recent_sessions_off_loop(
     caller that discards it otherwise pays a multi-MB read per row for nothing.
     A ``False`` row still carries ``msgs``, as an empty list, so the shape does
     not fork.
+
+    *include_ended* keeps rows the user dismissed with End; see
+    :func:`_collect_recent_sessions`.
     """
     return await asyncio.to_thread(
         _collect_recent_sessions,
@@ -284,6 +511,7 @@ async def _collect_recent_sessions_off_loop(
         kind=kind,
         sessions_dir=sessions_dir,
         with_messages=with_messages,
+        include_ended=include_ended,
     )
 
 
@@ -311,6 +539,10 @@ async def collect_recent_sessions_audited(
     *caller* and *source* are the audit's subject and surface (e.g. a session key
     and ``"telegram"``). Returns the rows, or ``None`` when the collector failed
     and the caller only has to choose its own wording.
+
+    No ``include_ended`` passthrough: this wrapper has no callers yet, so the
+    parameter would be a surface nothing exercises. Add it with the first caller
+    that needs it.
     """
     try:
         rows = await _collect_recent_sessions_off_loop(

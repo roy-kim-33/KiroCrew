@@ -31,7 +31,7 @@ from installer_test_helpers import run_bounded
 
 #: The Node version the bootstrap fixtures build tarballs for. Asserted equal to
 #: both scripts' own default, so a bump cannot leave these tests exercising a
-#: version the installer no longer ships.
+#: version the installer does not ship.
 TESTED_NODE_VERSION = "22.23.2"
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -113,9 +113,11 @@ def _fake_node(stubs: Path) -> None:
         stubs / "node",
         "#!/bin/sh\n"
         'case "$*" in\n'
+        '  *"process.execPath"*) printf "%s\\n" "$0" ;;\n'
         '  *"process.versions.node.split"*) echo "${PWCLI_FAKE_NODE_MAJOR:-22}" ;;\n'
         '  *"process.versions.node"*) echo "${PWCLI_FAKE_NODE_MAJOR:-22}.0.0" ;;\n'
         '  -e*) printf "%s" "${PWCLI_FAKE_INSTALLED_VERSION:-}" ;;\n'
+        '  *"playwright-cli.js"*) exec "$@" ;;\n'
         "  *) : ;;\n"
         "esac\n"
         "exit 0\n",
@@ -144,7 +146,7 @@ def _fake_npm_succeeding(
     if browser_failure is None:
         browser_step = (
             '  printf "%s\\n" "${PLAYWRIGHT_DOWNLOAD_HOST:-unset}" \\\n'
-            '    > "$(dirname "$0")/../install-browser-called"\n'
+            '    > "$(dirname "$0")/../../../../install-browser-called"\n'
             "  exit 0\n"
         )
     else:
@@ -162,7 +164,8 @@ def _fake_npm_succeeding(
         '\\"global\\", previously loaded as \\"user\\"" >&2\n'
         "  exit 1\n"
         "fi\n"
-        'mkdir -p "$npm_config_prefix/bin"\n'
+        'mkdir -p "$npm_config_prefix/bin" '
+        '"$npm_config_prefix/lib/node_modules/@playwright/cli"\n'
         # QUOTED delimiter, and the marker path is resolved from $0 at RUN time
         # rather than interpolated at write time. With an unquoted `<<EOF` the
         # shell expanded `$npm_config_prefix` into the generated script as live
@@ -172,7 +175,7 @@ def _fake_npm_succeeding(
         # one test guarding the installer's path escaping inject from its own
         # fixture instead, and it wrote its marker into the process CWD where
         # that test's `tmp_path` assertion could not see it.
-        "cat > \"$npm_config_prefix/bin/playwright-cli\" <<'EOF'\n"
+        "cat > \"$npm_config_prefix/lib/node_modules/@playwright/cli/playwright-cli.js\" <<'EOF'\n"
         "#!/bin/sh\n"
         f'[ "$1" = "--version" ] && echo "{version}" && exit 0\n'
         'if [ "$1" = "install-browser" ]; then\n'
@@ -180,7 +183,9 @@ def _fake_npm_succeeding(
         "fi\n"
         "exit 0\n"
         "EOF\n"
-        'chmod 755 "$npm_config_prefix/bin/playwright-cli"\n'
+        'chmod 755 "$npm_config_prefix/lib/node_modules/@playwright/cli/playwright-cli.js"\n'
+        'ln -sf "../lib/node_modules/@playwright/cli/playwright-cli.js" '
+        '"$npm_config_prefix/bin/playwright-cli"\n'
         'printf "registry=%s\\n" "$npm_config_registry" > "$npm_config_prefix/npm-args"\n'
         'printf "userconfig=%s\\n" "${npm_config_userconfig:-unset}" >> "$npm_config_prefix/npm-args"\n'
         'printf "globalconfig=%s\\n" "${npm_config_globalconfig:-unset}" >> "$npm_config_prefix/npm-args"\n'
@@ -298,6 +303,90 @@ def _isolated_tool_env(tmp_path: Path, **extra: str) -> dict[str, str]:
     return env
 
 
+#: Magic bytes of a native executable on the platforms the POSIX installer runs on:
+#: ELF, and the four Mach-O encodings (thin, both endiannesses, and a fat binary).
+_NATIVE_EXECUTABLE_MAGIC = (
+    b"\x7fELF",
+    b"\xcf\xfa\xed\xfe",
+    b"\xce\xfa\xed\xfe",
+    b"\xfe\xed\xfa\xcf",
+    b"\xfe\xed\xfa\xce",
+    b"\xca\xfe\xba\xbe",
+)
+
+
+def _is_native_executable(path: Path) -> bool:
+    """True when *path* is a real machine-code binary, not a script or a symlink to one.
+
+    A version-manager shim (mise, asdf, nvm's lazy shims) is either a shell script
+    or a symlink whose target is the manager's own binary; both are told apart from
+    the tool they impersonate by what the resolved file IS, which does not change
+    between runs.
+    """
+    try:
+        with path.open("rb") as handle:
+            head = handle.read(4)
+    except OSError:
+        return False
+    return head.startswith(_NATIVE_EXECUTABLE_MAGIC) and os.access(path, os.X_OK)
+
+
+def _native_tool_on_path(name: str) -> Path | None:
+    """The first *name* on PATH that resolves to a native binary of that name.
+
+    Why not ``shutil.which``: on a developer machine the first hit is usually a
+    version-manager shim, and a shim resolves its toolchain THROUGH HOME. Under the
+    isolated HOME this suite runs tools in, it either fails or blocks trying to
+    provision a toolchain that is not there, and whether it does so within any
+    given bound depends on the manager's cache state at that moment -- so a skip
+    decided by running it was a race, and a run that reached the timeout had to
+    SIGKILL the shim's process tree. Judging the candidate by its resolved file
+    instead gives the same verdict on every run of one host: a real binary runs
+    with no HOME at all, and a host with only shims skips every time, with a reason
+    that says so.
+
+    Windows has no shim problem here and its executables carry PATHEXT, so the
+    ordinary lookup is the right one there.
+    """
+    if os.name == "nt":
+        found = shutil.which(name)
+        return Path(found) if found else None
+    for entry in os.environ.get("PATH", "").split(os.pathsep):
+        if not entry:
+            continue
+        try:
+            resolved = (Path(entry) / name).resolve(strict=True)
+        except OSError:
+            continue
+        if resolved.name == name and _is_native_executable(resolved):
+            return resolved
+    return None
+
+
+def _real_npm() -> tuple[Path, Path] | None:
+    """``(node, npm-cli.js)`` for the first npm on PATH that is npm itself, else None.
+
+    npm is a node script: its ``npm`` entry is a symlink to ``npm-cli.js`` whose
+    shebang is ``#!/usr/bin/env node``, so running it by name would resolve
+    ``node`` through PATH -- and hit the shim again. The pair is therefore
+    resolved statically (the ``npm`` entry must resolve to ``npm-cli.js`` and the
+    ``node`` beside it must be a native binary) and invoked as
+    ``node npm-cli.js ...``, which bypasses every shim and needs nothing from HOME.
+    Same verdict on every run of one host, by construction.
+    """
+    for entry in os.environ.get("PATH", "").split(os.pathsep):
+        if not entry:
+            continue
+        try:
+            npm_cli = (Path(entry) / "npm").resolve(strict=True)
+            node = (Path(entry) / "node").resolve(strict=True)
+        except OSError:
+            continue
+        if npm_cli.name == "npm-cli.js" and node.name == "node" and _is_native_executable(node):
+            return node, npm_cli
+    return None
+
+
 def _run(
     tmp_path: Path,
     stubs: Path,
@@ -306,10 +395,15 @@ def _run(
     extra_env: dict[str, str] | None = None,
     cwd: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    """Run the installer. Its working directory is *cwd*, or tmp_path when unstated.
+
+    Never the caller's: pytest's cwd is the checkout, and anything the installer
+    resolves or drops relative to where it was started would land there.
+    """
     env = _env(tmp_path, stubs, isolated=isolated)
     if extra_env:
         env.update(extra_env)
-    return run_bounded(["sh", str(INSTALLER_SH), *args], env=env, cwd=str(cwd) if cwd else None)
+    return run_bounded(["sh", str(INSTALLER_SH), *args], env=env, cwd=str(cwd or tmp_path))
 
 
 @pytest.fixture()
@@ -323,20 +417,20 @@ def stubs(tmp_path: Path) -> Path:
 
 
 @posix_only
-def test_installer_parses_as_posix_shell() -> None:
+def test_installer_parses_as_posix_shell(tmp_path: Path) -> None:
     """The documented entry point is `curl … | sh`, so the script must parse
     under a plain POSIX shell and not only under bash."""
-    subprocess.run(["sh", "-n", str(INSTALLER_SH)], check=True)
+    subprocess.run(["sh", "-n", str(INSTALLER_SH)], check=True, cwd=str(tmp_path))
 
 
 @posix_only
 @pytest.mark.skipif(shutil.which("ksh") is None, reason="no non-bash POSIX shell available here")
-def test_installer_parses_under_a_non_bash_shell() -> None:
+def test_installer_parses_under_a_non_bash_shell(tmp_path: Path) -> None:
     """On most Linux distributions /bin/sh IS bash, so `sh -n` above happily
     accepts bashisms that dash and BusyBox ash reject. ksh is a genuinely
     different POSIX implementation, so parsing there catches what `sh -n` cannot
     on a bash-provided /bin/sh."""
-    subprocess.run(["ksh", "-n", str(INSTALLER_SH)], check=True)
+    subprocess.run(["ksh", "-n", str(INSTALLER_SH)], check=True, cwd=str(tmp_path))
 
 
 def test_installer_avoids_bash_only_syntax() -> None:
@@ -346,7 +440,9 @@ def test_installer_avoids_bash_only_syntax() -> None:
     # construct is avoided naturally names it, and matching that would make the
     # check fire on its own rationale.
     body = "\n".join(
-        line for line in INSTALLER_SH.read_text().splitlines() if not line.lstrip().startswith("#")
+        line
+        for line in INSTALLER_SH.read_text(encoding="utf-8").splitlines()
+        if not line.lstrip().startswith("#")
     )
     for pattern, description in (
         (r"\[\[", "[[ ... ]] is a bash conditional"),
@@ -362,34 +458,41 @@ def test_installer_avoids_bash_only_syntax() -> None:
 
 
 def _usable_powershell(tmp_path: Path) -> str:
-    """A PowerShell that actually answers under an isolated HOME, or a skip.
+    """A PowerShell binary this suite can drive under an isolated HOME, or a skip.
 
-    Same hazard as the real-npm probe, and it bit for the same reason: a version
-    manager installs `pwsh` as a SHIM that resolves its toolchain through config
-    under HOME, so with HOME isolated the shim blocks trying to provision one.
-    Without this preflight each PowerShell test burned its full 120s timeout on a
-    developer machine with mise-managed PowerShell -- four minutes to say nothing.
-    A real interpreter answers `exit 0` instantly, which is the whole probe.
+    Decided by what is on disk, never by running a candidate against a clock. A
+    version manager installs `pwsh` as a SHIM that resolves its toolchain through
+    config under HOME, so with HOME isolated the shim blocks trying to provision
+    one -- and the earlier preflight, which ran it for ten seconds and skipped on
+    the timeout, could answer either way depending on the manager's cache state,
+    and every timeout ended in a SIGKILL of the shim's process tree. A native
+    interpreter is recognised as such (``_native_tool_on_path``) and then run;
+    a host that offers only shims skips with the same reason on every run.
     """
-    shell = shutil.which("pwsh") or shutil.which("powershell")
+    shell = _native_tool_on_path("pwsh") or _native_tool_on_path("powershell")
     if shell is None:
-        pytest.skip("no PowerShell on this host")
-    try:
-        probe = run_bounded(
-            [shell, "-NoProfile", "-NonInteractive", "-Command", "exit 0"],
-            env=_isolated_tool_env(tmp_path),
-            timeout=10,
+        pytest.skip(
+            "no native PowerShell binary on PATH (a version-manager shim does not "
+            "count: it cannot start under the isolated HOME this suite requires)"
         )
-    except (subprocess.TimeoutExpired, OSError):
-        pytest.skip(f"{shell} cannot run under an isolated HOME (version-manager shim)")
+    probe = run_bounded(
+        [str(shell), "-NoProfile", "-NonInteractive", "-Command", "exit 0"],
+        env=_isolated_tool_env(tmp_path),
+        timeout=60,
+        cwd=str(tmp_path),
+    )
     if probe.returncode != 0:
+        # A native interpreter that exits non-zero on `exit 0` is a host whose
+        # PowerShell install is broken (missing ICU, unreadable modules): the same
+        # answer on every run, so a skip that names it is stable. A hang is NOT
+        # skipped: run_bounded's TimeoutExpired propagates as the error it is.
         pytest.skip(f"{shell} did not start cleanly: {probe.stdout + probe.stderr}")
-    return shell
+    return str(shell)
 
 
 @pytest.mark.skipif(
-    shutil.which("pwsh") is None and shutil.which("powershell") is None,
-    reason="no PowerShell available to parse playwright-cli.ps1",
+    _native_tool_on_path("pwsh") is None and _native_tool_on_path("powershell") is None,
+    reason="no native PowerShell binary on PATH to parse playwright-cli.ps1",
 )
 def test_powershell_installer_parses(tmp_path: Path) -> None:
     """A syntax error in the Windows installer reaches every Windows user, and
@@ -411,6 +514,7 @@ def test_powershell_installer_parses(tmp_path: Path) -> None:
         [shell, "-NoProfile", "-NonInteractive", "-Command", script],
         env=env,
         timeout=120,
+        cwd=str(tmp_path),
     )
     assert result.returncode == 0, result.stdout + result.stderr
 
@@ -422,7 +526,7 @@ def test_powershell_installer_parses(tmp_path: Path) -> None:
 def test_help_documents_every_accepted_flag(tmp_path: Path, stubs: Path) -> None:
     """`--help` is the only documentation a piped-in installer can offer, so an
     added flag that never reaches the help text is a silent feature."""
-    body = INSTALLER_SH.read_text()
+    body = INSTALLER_SH.read_text(encoding="utf-8")
     parser = body.split("while [ $# -gt 0 ]; do", 1)[1].split("done", 1)[0]
     flags = {
         match.group(1) for match in re.finditer(r"^\s*(--[a-z][a-z-]*)\)", parser, re.MULTILINE)
@@ -634,20 +738,27 @@ def test_browser_cdn_failure_outranks_the_generic_transport_error(
 
 @posix_only
 def test_successful_install_writes_a_node_pinning_wrapper(tmp_path: Path, stubs: Path) -> None:
-    """The wrapper — not a symlink — is what makes a bootstrapped Node usable: an
-    npm-generated `#!/usr/bin/env node` shim resolves against the CALLER's PATH,
-    so a user with no Node on PATH would get "node: not found" from a tool that
-    installed cleanly."""
+    """The generated wrapper uses only the managed Node and package entry.
+
+    npm's ``#!/usr/bin/env node`` shim would select an interpreter from the
+    caller's PATH, which is both unreliable and unsafe for gateway-owned calls.
+    """
     _fake_node(stubs)
     _fake_npm_succeeding(stubs)
     result = _run(tmp_path, stubs, "--version", "0.1.18")
     assert result.returncode == 0, result.stderr
 
-    wrapper = tmp_path / "home" / ".local" / "bin" / "playwright-cli"
+    wrapper = tmp_path / "datahome" / "playwright-cli" / "managed-bin" / "playwright-cli"
     assert wrapper.exists()
     assert os.access(wrapper, os.X_OK)
     body = wrapper.read_text()
-    assert str(stubs) in body, "the wrapper must pin the Node the installer verified"
+    managed_root = tmp_path / "datahome" / "playwright-cli"
+    assert str(managed_root / "gateway-node") in body
+    assert (
+        str(managed_root / "lib" / "node_modules" / "@playwright" / "cli" / "playwright-cli.js")
+        in body
+    )
+    assert str(stubs) not in body, "the wrapper must not retain the source Node path"
     assert "exec " in body
     # No half-written wrapper is left behind by the atomic move.
     assert not (wrapper.parent / "playwright-cli.incoming").exists()
@@ -817,8 +928,10 @@ def _node_tarball(tmp_path: Path, base: str) -> Path:
         tree / "node",
         "#!/bin/sh\n"
         'case "$*" in\n'
+        '  *"process.execPath"*) printf "%s\\n" "$0" ;;\n'
         '  *"process.versions.node.split"*) echo 22 ;;\n'
         '  *"process.versions.node"*) echo 22.0.0 ;;\n'
+        '  *"playwright-cli.js"*) exec "$@" ;;\n'
         "  *) : ;;\n"
         "esac\n"
         "exit 0\n",
@@ -826,9 +939,13 @@ def _node_tarball(tmp_path: Path, base: str) -> Path:
     _write_stub(
         tree / "npm",
         "#!/bin/sh\n"
-        'mkdir -p "$npm_config_prefix/bin"\n'
-        'printf "#!/bin/sh\\necho 0.1.18\\n" > "$npm_config_prefix/bin/playwright-cli"\n'
-        'chmod 755 "$npm_config_prefix/bin/playwright-cli"\n'
+        'mkdir -p "$npm_config_prefix/bin" '
+        '"$npm_config_prefix/lib/node_modules/@playwright/cli"\n'
+        'printf "#!/bin/sh\\necho 0.1.18\\n" > '
+        '"$npm_config_prefix/lib/node_modules/@playwright/cli/playwright-cli.js"\n'
+        'chmod 755 "$npm_config_prefix/lib/node_modules/@playwright/cli/playwright-cli.js"\n'
+        'ln -sf "../lib/node_modules/@playwright/cli/playwright-cli.js" '
+        '"$npm_config_prefix/bin/playwright-cli"\n'
         "exit 0\n",
     )
     archive = tmp_path / f"{base}.tar.gz"
@@ -973,7 +1090,7 @@ def test_musl_and_old_glibc_hosts_select_an_executable_node_build() -> None:
     """nodejs.org publishes no musl build and nothing for pre-2.28 glibc: an
     official tarball on Alpine reports "not found", and on a RHEL 7-era host
     fails a GLIBC_2.28 symbol lookup. Both need the unofficial-builds mirror."""
-    body = INSTALLER_SH.read_text()
+    body = INSTALLER_SH.read_text(encoding="utf-8")
     selector = body.split("_resolve_node_artifact() {", 1)[1].split("\n}", 1)[0]
     assert "musl" in selector
     assert "glibc-217" in selector
@@ -988,7 +1105,7 @@ def test_an_unpublished_platform_pair_is_named_not_reported_as_a_network_fault()
     back as "check proxy access" sends the user to debug a firewall that is
     working, so the combination is refused up front -- and it must be refused on
     BOTH paths that can reach a download, including --dry-run's report."""
-    body = INSTALLER_SH.read_text()
+    body = INSTALLER_SH.read_text(encoding="utf-8")
     guard = body.split("_assert_bootstrap_supported() {", 1)[1].split("\n}", 1)[0]
     assert "armv7l" in guard and "musl" in guard
     assert "EX_MISSING_TOOL" in guard
@@ -1130,8 +1247,8 @@ def test_a_log_that_cannot_be_scrubbed_is_never_printed() -> None:
     is best-effort, so a log locked by a scanner survives with its token intact.
     The decision is carried in an explicit flag in both.
     """
-    assert "LOG_SUPPRESSED=1" in INSTALLER_SH.read_text()
-    ps1 = INSTALLER_PS1.read_text()
+    assert "LOG_SUPPRESSED=1" in INSTALLER_SH.read_text(encoding="utf-8")
+    ps1 = INSTALLER_PS1.read_text(encoding="utf-8")
     assert "$script:LogSuppressed = $true" in ps1
     tail = ps1[ps1.index("function Show-LogTail") :]
     guard = tail.index("$script:LogSuppressed")
@@ -1170,11 +1287,11 @@ def test_a_credential_containing_an_at_sign_is_fully_redacted(tmp_path: Path, st
 
 
 @posix_only
-def test_redaction_does_not_touch_an_at_sign_in_a_path() -> None:
+def test_redaction_does_not_touch_an_at_sign_in_a_path(tmp_path: Path) -> None:
     """The greedy match must stay inside the authority: npm prints scoped package
     paths, and rewriting one would corrupt the log it exists to make readable.
     """
-    script = INSTALLER_SH.read_text()
+    script = INSTALLER_SH.read_text(encoding="utf-8")
     body = script[script.index("_redact_urls() {") :]
     assert "[^/[:space:]]*@" in body
     probe = subprocess.run(
@@ -1183,6 +1300,7 @@ def test_redaction_does_not_touch_an_at_sign_in_a_path() -> None:
         capture_output=True,
         text=True,
         check=True,
+        cwd=str(tmp_path),
     )
     assert probe.stdout.splitlines()[0] == "https://npm.example/@scope/pkg"
     assert probe.stdout.splitlines()[1] == "https://***@npm.example/@scope/pkg"
@@ -1221,8 +1339,8 @@ def test_a_relative_prefix_is_absolute_in_the_generated_wrapper(
 
 
 @pytest.mark.skipif(
-    shutil.which("pwsh") is None and shutil.which("powershell") is None,
-    reason="no PowerShell available to execute the installer's own helpers",
+    _native_tool_on_path("pwsh") is None and _native_tool_on_path("powershell") is None,
+    reason="no native PowerShell binary on PATH to execute the installer's own helpers",
 )
 def test_the_powershell_helpers_behave_when_actually_executed(tmp_path: Path) -> None:
     """Everything else about the .ps1 in this suite is asserted from its TEXT,
@@ -1232,7 +1350,7 @@ def test_the_powershell_helpers_behave_when_actually_executed(tmp_path: Path) ->
     behaviour. The script itself cannot be dot-sourced: it exits early off
     Windows, by design.
     """
-    body = INSTALLER_PS1.read_text()
+    body = INSTALLER_PS1.read_text(encoding="utf-8")
 
     def _function(name: str) -> str:
         """Whole block, not one line: these helpers grow multi-line as the shapes
@@ -1254,6 +1372,7 @@ def test_the_powershell_helpers_behave_when_actually_executed(tmp_path: Path) ->
         [shell, "-NoProfile", "-NonInteractive", "-Command", script],
         env=_isolated_tool_env(tmp_path),
         timeout=120,
+        cwd=str(tmp_path),
     )
     assert result.returncode == 0, result.stdout + result.stderr
     credential, path_at, query, resolved = result.stdout.split()[:4]
@@ -1294,7 +1413,7 @@ def test_the_windows_script_refuses_root_and_drive_relative_prefixes() -> None:
     """`C:\\` trims to `C:`, which is drive-RELATIVE -- it names the working
     directory on that drive, not the drive root -- so it collapses the same way an
     empty string does. Both forms are rejected."""
-    body = INSTALLER_PS1.read_text()
+    body = INSTALLER_PS1.read_text(encoding="utf-8")
     assert "-Prefix may not be a filesystem root" in body
     assert "-BinDir may not be a filesystem root" in body
     assert body.count("'^[A-Za-z]:$'") == 2, "both parameters must reject a bare drive"
@@ -1335,7 +1454,7 @@ def test_a_node_without_npm_bootstraps_instead_of_demanding_npm(
     assert "install npm" not in result.stdout + result.stderr
     # The private Node was used, and the tool is installed and runnable.
     assert (tmp_path / "datahome" / "playwright-cli" / "node" / "bin" / "npm").exists()
-    assert (tmp_path / "home" / ".local" / "bin" / "playwright-cli").is_file()
+    assert (tmp_path / "datahome" / "playwright-cli" / "managed-bin" / "playwright-cli").is_file()
 
 
 def test_the_windows_installer_never_builds_a_cmd_command_line() -> None:
@@ -1345,10 +1464,39 @@ def test_the_windows_installer_never_builds_a_cmd_command_line() -> None:
     npm-cli.js, with no shell at any point, and the wrapper is invoked through the
     call operator so PowerShell owns the quoting.
     """
-    body = INSTALLER_PS1.read_text()
+    body = INSTALLER_PS1.read_text(encoding="utf-8")
     assert "cmd.exe /c" not in body, "a cmd.exe command line re-parses % in our paths"
     assert "npm-cli.js" in body, "the install must bypass npm.cmd when it can"
     assert "& $wrapper --version" in body
+
+
+def test_the_windows_installer_stages_native_node_for_gateway_execution() -> None:
+    body = INSTALLER_PS1.read_text(encoding="utf-8")
+    assert '$gatewayNode = Join-Path $Prefix "node.exe"' in body
+    assert "$nativeNode = Get-NodeProcessPath $script:NodeExe" in body
+    assert "Copy-Item -LiteralPath $nativeNode" in body
+    assert "Copy-Item -LiteralPath $script:NodeExe" not in body
+    assert "Move-Item -LiteralPath $gatewayNodeTmp -Destination $gatewayNode -Force" in body
+    assert "if (-not (Try-Node $gatewayNode))" in body
+    assert "$stagedRuntime = Get-NodeProcessPath $gatewayNode" in body
+    resolved = body.index("$nativeNode = Get-NodeProcessPath $script:NodeExe")
+    copied = body.index("Copy-Item -LiteralPath $nativeNode")
+    published = body.index(
+        "Move-Item -LiteralPath $gatewayNodeTmp -Destination $gatewayNode -Force"
+    )
+    verified = body.index("if (-not (Try-Node $gatewayNode))")
+    assert resolved < copied < published < verified
+
+
+def test_the_posix_installer_stages_node_for_gateway_execution() -> None:
+    body = INSTALLER_SH.read_text(encoding="utf-8")
+    assert 'GATEWAY_NODE="$PREFIX/gateway-node"' in body
+    assert "process.execPath" in body
+    assert 'mktemp "$PREFIX/.gateway-node.XXXXXX"' in body
+    assert 'mv "$_gateway_node_incoming" "$GATEWAY_NODE"' in body
+    wrapper = body[body.index("# ── gateway Node + wrapper") : body.index("# ── verify")]
+    assert 'exec $(_shell_quote "$GATEWAY_NODE") $(_shell_quote "$TARGET")' in wrapper
+    assert 'PATH=$(_shell_quote "$NODE_BIN_DIR")' not in wrapper
 
 
 def test_the_generated_wrapper_disables_delayed_expansion() -> None:
@@ -1357,7 +1505,7 @@ def test_the_generated_wrapper_disables_delayed_expansion() -> None:
     neighbours out of the PATH line, so the wrapper turns it off for its own
     scope. `%ERRORLEVEL%` is ordinary expansion and is unaffected.
     """
-    body = INSTALLER_PS1.read_text()
+    body = INSTALLER_PS1.read_text(encoding="utf-8")
     wrapper = body[body.index("$wrapperBody = @") :]
     setlocal = wrapper.index("setlocal DisableDelayedExpansion")
     path_line = wrapper.index('set "PATH=')
@@ -1453,8 +1601,10 @@ def test_the_node_floor_matches_what_the_product_requires_of_this_cli() -> None:
     """
     from kiro_crew.browser_cli.install import MIN_NODE_MAJOR as product_floor
 
-    sh = re.search(r"^MIN_NODE_MAJOR=(\d+)", INSTALLER_SH.read_text(), re.MULTILINE)
-    ps1 = re.search(r"^\$MinNodeMajor = (\d+)", INSTALLER_PS1.read_text(), re.MULTILINE)
+    sh = re.search(r"^MIN_NODE_MAJOR=(\d+)", INSTALLER_SH.read_text(encoding="utf-8"), re.MULTILINE)
+    ps1 = re.search(
+        r"^\$MinNodeMajor = (\d+)", INSTALLER_PS1.read_text(encoding="utf-8"), re.MULTILINE
+    )
     assert sh is not None and ps1 is not None
     assert int(sh.group(1)) == product_floor, (
         f"playwright-cli.sh accepts Node {sh.group(1)} but the product requires "
@@ -1548,13 +1698,13 @@ def test_both_installers_reject_a_reparse_point_before_writing_the_wrapper() -> 
     until the stack ran out. 5.1 cannot resolve a junction target without P/Invoke,
     so it is refused; the shell installer gets this from `cd -P`.
     """
-    ps1 = INSTALLER_PS1.read_text()
+    ps1 = INSTALLER_PS1.read_text(encoding="utf-8")
     # Every ANCESTOR, not just the leaf: a junction one level up aliases the pair
     # while both leaves look ordinary and the strings differ.
     assert "function Find-ReparsePointAncestor" in ps1
     assert "Split-Path -Parent $current" in ps1, "the walk must climb to the root"
     # The shell installer needs no equivalent: `cd -P` resolves every component.
-    assert 'cd -P -- "$PREFIX"' in INSTALLER_SH.read_text()
+    assert 'cd -P -- "$PREFIX"' in INSTALLER_SH.read_text(encoding="utf-8")
 
 
 @posix_only
@@ -1578,7 +1728,7 @@ def test_a_blocked_browser_cdn_exits_16_with_a_mirror_remedy(tmp_path: Path, stu
     assert "--download-host" in result.stderr, result.stderr
     assert "--skip-browsers" in result.stderr, result.stderr
     # The CLI itself stays installed -- only the browser is missing.
-    assert (tmp_path / "home" / ".local" / "bin" / "playwright-cli").is_file()
+    assert (tmp_path / "datahome" / "playwright-cli" / "managed-bin" / "playwright-cli").is_file()
 
 
 @posix_only
@@ -1617,12 +1767,12 @@ def test_a_credentialed_download_host_is_scrubbed_after_a_SUCCESSFUL_install(
 def test_replacing_a_bootstrapped_node_never_leaves_the_prefix_without_one(
     tmp_path: Path, stubs: Path, node_mirror: Path
 ) -> None:
-    """The wrapper pins the bootstrapped Node's directory, so a window in which that
-    directory does not exist is a window in which the user's installed CLI cannot
-    run. Deleting the old tree before promoting the new one creates exactly that
-    window, and it is reachable on an ordinary path: a stamped, runnable Node with
-    no npm is re-bootstrapped rather than reused. The old tree is moved aside and
-    only removed once the new one is in place.
+    """The private Node tree remains the installer's repair toolchain, so a window
+    in which that directory does not exist is a window in which an interrupted
+    upgrade cannot retry cleanly. Deleting the old tree before promoting the new
+    one creates exactly that window, and it is reachable on an ordinary path: a
+    stamped, runnable Node with no npm is re-bootstrapped rather than reused. The
+    old tree is moved aside and only removed once the new one is in place.
     """
     base = _expected_node_base(TESTED_NODE_VERSION)
     archive = _node_tarball(tmp_path, base)
@@ -1668,7 +1818,7 @@ def test_both_installers_move_the_old_node_aside_rather_than_deleting_it() -> No
     earlier version of this test forbade the removal outright and then failed on the
     rollback it was supposed to protect.
     """
-    sh = INSTALLER_SH.read_text()
+    sh = INSTALLER_SH.read_text(encoding="utf-8")
     aside = sh.index('mv "$PREFIX/node" "$_backup"')
     promote = sh.index('mv "$_stage/tree" "$PREFIX/node"')
     assert aside < promote, "the old tree must be moved aside before promotion"
@@ -1677,7 +1827,7 @@ def test_both_installers_move_the_old_node_aside_rather_than_deleting_it() -> No
             "removing the target before promotion is the window that breaks a " "working install"
         )
 
-    ps1 = INSTALLER_PS1.read_text()
+    ps1 = INSTALLER_PS1.read_text(encoding="utf-8")
     ps_aside = ps1.index('$backup = Join-Path $staging "previous"')
     ps_promote = ps1.index("Move-Item -LiteralPath $extracted -Destination $target")
     assert ps_aside < ps_promote
@@ -1734,6 +1884,7 @@ def test_a_node_that_does_not_run_here_leaves_the_previous_one_in_place(
             capture_output=True,
             text=True,
             check=False,
+            cwd=str(tmp_path),
         ).stdout.strip()
     )
 
@@ -1767,7 +1918,7 @@ def test_an_interrupted_rebootstrap_restores_the_previous_node(
     """SIGINT during promotion is the realistic interruption -- a user pressing
     Ctrl-C -- and it lands in the window where the old tree has been moved aside and
     the new one is not yet in place. The EXIT handler puts it back, so the wrapper
-    never ends up pinned to a Node that is no longer there.
+    never ends up pinned to a Node that is not there.
 
     Driven by making the tarball enormous enough that `tar` is still unpacking when
     the signal arrives, rather than by asserting on the script's text.
@@ -1809,6 +1960,7 @@ def test_an_interrupted_rebootstrap_restores_the_previous_node(
         stderr=subprocess.PIPE,
         text=True,
         start_new_session=True,
+        cwd=str(tmp_path),
     )
     try:
         # Long enough to be inside the bootstrap, short enough to be mid-unpack.
@@ -1937,7 +2089,7 @@ def test_both_installers_probe_the_staged_node_before_promoting_it() -> None:
     clear the interval should not exist: nothing under the prefix is touched until
     the downloaded bits are known to run.
     """
-    sh = INSTALLER_SH.read_text()
+    sh = INSTALLER_SH.read_text(encoding="utf-8")
     probe = sh.index('_try_node "$_stage/tree/bin/node"')
     aside = sh.index('mv "$PREFIX/node" "$_backup"')
     promote = sh.index('mv "$_stage/tree" "$PREFIX/node"')
@@ -1948,7 +2100,7 @@ def test_both_installers_probe_the_staged_node_before_promoting_it() -> None:
     bootstrap = sh[sh.index("_bootstrap_node() {") :]
     assert '_try_node "$PREFIX/node/bin/node"' not in bootstrap
 
-    ps1 = INSTALLER_PS1.read_text()
+    ps1 = INSTALLER_PS1.read_text(encoding="utf-8")
     ps_probe = ps1.index('Try-Node (Join-Path $extracted "node.exe")')
     ps_promote = ps1.index("Move-Item -LiteralPath $extracted -Destination $target")
     assert ps_probe < ps_promote
@@ -2187,7 +2339,7 @@ def test_powershell_survives_npm_writing_to_stderr() -> None:
     stderr as a NativeCommandError and promotes it to terminating -- which would
     abort before the failure classifier that is this installer's entire reason to
     exist, and skip writing the wrapper for a package that installed fine."""
-    body = INSTALLER_PS1.read_text()
+    body = INSTALLER_PS1.read_text(encoding="utf-8")
     installer = body.split("function Invoke-NpmInstall {", 1)[1].split("\n}", 1)[0]
     assert "$ErrorActionPreference = 'Continue'" in installer
     assert "catch {" in installer
@@ -2202,7 +2354,7 @@ def test_the_generated_cmd_wrapper_is_written_for_cmd_exe() -> None:
     """A batch file is read in the OEM code page and re-expands %. ASCII output
     would turn C:\\Users\\Jose-with-an-accent into `?`, and an unescaped % would
     point the wrapper at a target that does not exist."""
-    body = INSTALLER_PS1.read_text()
+    body = INSTALLER_PS1.read_text(encoding="utf-8")
     assert "-replace '%', '%%'" in body
     assert "Set-Content" in body and "-Encoding OEM" in body
     assert "exit /b %ERRORLEVEL%" in body
@@ -2220,7 +2372,7 @@ def test_windows_downloads_refuse_redirects() -> None:
     though the setting was still zero. The invariant is "no download follows a
     redirect", not "the flag is spelled inline".
     """
-    body = INSTALLER_PS1.read_text()
+    body = INSTALLER_PS1.read_text(encoding="utf-8")
     settings = re.findall(r"MaximumRedirection\s*(?:=|\s)\s*(\d+)", body)
     assert settings, "no MaximumRedirection setting found"
     assert set(settings) == {"0"}, f"a download may follow redirects: {settings}"
@@ -2238,7 +2390,7 @@ def test_windows_node_staging_is_on_the_prefix_volume() -> None:
     """Move-Item cannot move a directory across volumes, so staging in %TEMP%
     aborts the bootstrap after the download was already verified whenever TEMP
     and the prefix sit on different drives."""
-    body = INSTALLER_PS1.read_text()
+    body = INSTALLER_PS1.read_text(encoding="utf-8")
     staging = [ln for ln in body.splitlines() if "$staging = " in ln]
     assert staging, "staging assignment not found"
     assert "GetTempPath" not in staging[0]
@@ -2248,11 +2400,13 @@ def test_windows_node_staging_is_on_the_prefix_volume() -> None:
 def test_the_bootstrapped_node_version_agrees_across_both_scripts() -> None:
     """Three copies of this version exist (both scripts and this suite's
     fixtures) with nothing tying them together, so a bump in one place would
-    leave the tests green while no longer exercising the shipped value."""
-    sh_version = re.search(r'^NODE_VERSION="([0-9.]+)"', INSTALLER_SH.read_text(), re.MULTILINE)
+    leave the tests green while not exercising the shipped value."""
+    sh_version = re.search(
+        r'^NODE_VERSION="([0-9.]+)"', INSTALLER_SH.read_text(encoding="utf-8"), re.MULTILINE
+    )
     ps_version = re.search(
         r'^\s*\[string\]\$NodeVersion = "([0-9.]+)"',
-        INSTALLER_PS1.read_text(),
+        INSTALLER_PS1.read_text(encoding="utf-8"),
         re.MULTILINE,
     )
     assert sh_version and ps_version
@@ -2307,7 +2461,7 @@ def test_the_windows_script_scrubs_its_log_too() -> None:
     rewrite, so classifying afterwards can read nothing. See
     test_both_installers_classify_before_they_redact.
     """
-    body = INSTALLER_PS1.read_text()
+    body = INSTALLER_PS1.read_text(encoding="utf-8")
     assert "function Redact-Log" in body
     # Three call sites now: the failure path, the success path, and the
     # browser fetch on failure, and the browser fetch on success.
@@ -2322,7 +2476,7 @@ def test_windows_refuses_a_wrapper_it_cannot_represent() -> None:
     """A batch file is read in the console's OEM code page. A path character
     outside it is written as `?`, which would point the wrapper at a path that
     does not exist -- so the install fails closed instead of silently breaking."""
-    body = INSTALLER_PS1.read_text()
+    body = INSTALLER_PS1.read_text(encoding="utf-8")
     assert "OEMCodePage" in body
     assert "GetString($oemEncoding.GetBytes($wrapperBody))" in body
     assert "$ExVerify" in body.split("OEMCodePage", 1)[1][:800]
@@ -2364,7 +2518,12 @@ def test_an_embedded_newline_in_a_path_still_installs(tmp_path: Path, stubs: Pat
     wrapper = bindir / "playwright-cli"
     # Bounded and given an isolated environment: this spawns the wrapper, which
     # spawns node, so an unbounded call leaves a process tree behind on hang.
-    ran = run_bounded([str(wrapper), "--version"], env=_isolated_tool_env(tmp_path), timeout=120)
+    ran = run_bounded(
+        [str(wrapper), "--version"],
+        env=_isolated_tool_env(tmp_path),
+        timeout=120,
+        cwd=str(tmp_path),
+    )
     assert ran.returncode == 0, ran.stderr
     assert "0.1.18" in ran.stdout
 
@@ -2421,7 +2580,7 @@ def test_a_busybox_wget_host_that_already_has_node_still_installs(
     )
     result = _run(tmp_path, stubs, "--version", "0.1.18", isolated=True)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert (tmp_path / "home" / ".local" / "bin" / "playwright-cli").exists()
+    assert (tmp_path / "datahome" / "playwright-cli" / "managed-bin" / "playwright-cli").exists()
 
 
 @posix_only
@@ -2514,7 +2673,7 @@ def test_no_user_facing_message_interpolates_a_raw_url() -> None:
         positions = [text.index(e) for e in emitters if e in text]
         return text[min(positions) :] if positions else ""
 
-    for line in INSTALLER_SH.read_text().splitlines():
+    for line in INSTALLER_SH.read_text(encoding="utf-8").splitlines():
         stripped = _message_part(line.strip(), emitters_sh)
         if not stripped or line.strip().startswith("#"):
             continue
@@ -2524,7 +2683,7 @@ def test_no_user_facing_message_interpolates_a_raw_url() -> None:
             if re.search(re.escape(var) + r"(?![A-Za-z0-9_])", stripped):
                 offenders.append(f"sh: {stripped}")
     emitters_ps = ("Write-Host ", "Say ", "Warn ", "Die ")
-    for line in INSTALLER_PS1.read_text().splitlines():
+    for line in INSTALLER_PS1.read_text(encoding="utf-8").splitlines():
         stripped = _message_part(line.strip(), emitters_ps)
         if not stripped or line.strip().startswith("#"):
             continue
@@ -2550,7 +2709,7 @@ def test_an_authenticated_node_mirror_stays_possible_without_a_url_credential() 
     mirror is ACCEPTED and merely redacted in diagnostics. Redaction covers what the
     script prints; it cannot cover what the kernel publishes about a child process.
     """
-    body = INSTALLER_SH.read_text()
+    body = INSTALLER_SH.read_text(encoding="utf-8")
     assert "--netrc-optional" in body, "the documented escape has to be wired up"
     assert (
         "credentials file that curl and wget read" in body
@@ -2674,7 +2833,7 @@ def test_every_windows_native_call_tolerates_stderr() -> None:
     terminating error on PowerShell 5.1, so a Node that merely prints a startup
     warning would abort the install. One helper covers every call site rather
     than each being wrapped by hand and one being forgotten."""
-    body = INSTALLER_PS1.read_text()
+    body = INSTALLER_PS1.read_text(encoding="utf-8")
     assert "function Invoke-Native" in body
     for line in body.splitlines():
         stripped = line.strip()
@@ -2688,7 +2847,7 @@ def test_every_windows_native_call_tolerates_stderr() -> None:
 
 
 def test_the_windows_wrapper_cannot_replace_its_own_target() -> None:
-    body = INSTALLER_PS1.read_text()
+    body = INSTALLER_PS1.read_text(encoding="utf-8")
     assert "GetFullPath($wrapper) -eq [System.IO.Path]::GetFullPath($target)" in body
 
 
@@ -2701,7 +2860,7 @@ def test_every_powershell_function_is_defined_before_it_is_called() -> None:
     validator: the shell twin was reordered and this one was not, so a
     lockstep check is the only thing that catches the asymmetry.
     """
-    lines = INSTALLER_PS1.read_text().splitlines()
+    lines = INSTALLER_PS1.read_text(encoding="utf-8").splitlines()
     definitions: dict[str, int] = {}
     for number, line in enumerate(lines, start=1):
         match = re.match(r"\s*function\s+([A-Za-z][\w-]*)", line)
@@ -2729,7 +2888,7 @@ def test_an_empty_node_marker_does_not_crash_windows_resolution() -> None:
     on it throws — which under the global 'Stop' preference aborts before PATH or
     the bootstrap is even considered. An empty marker is an ordinary artifact of
     an interrupted `ensure-node.sh`."""
-    body = INSTALLER_PS1.read_text()
+    body = INSTALLER_PS1.read_text(encoding="utf-8")
     assert "([string](Get-Content -LiteralPath $marker -TotalCount 1)).Trim()" in body
 
 
@@ -2744,18 +2903,29 @@ def test_an_empty_node_marker_is_ignored_on_posix(tmp_path: Path, stubs: Path) -
     (data_home / "node-bin-dir").write_text("")
     result = _run(tmp_path, stubs, "--version", "0.1.18")
     assert result.returncode == 0, result.stdout + result.stderr
-    assert (tmp_path / "home" / ".local" / "bin" / "playwright-cli").exists()
+    assert (tmp_path / "datahome" / "playwright-cli" / "managed-bin" / "playwright-cli").exists()
 
 
 @posix_only
 @pytest.mark.skipif(
-    shutil.which("npm") is None, reason="no real npm to validate the config files with"
+    _real_npm() is None,
+    reason="no real npm on PATH to validate the config files with (a version-manager "
+    "shim does not count: it cannot start under the isolated HOME this suite requires)",
 )
 def test_real_npm_accepts_the_isolated_config_files(tmp_path: Path, stubs: Path) -> None:
     """--isolated-npmrc is THE documented remedy for the enterprise auth failure,
     so it has to work against real npm, not just against a stub. npm rejects one
     path used as two scopes, so the two empty files must be distinct — and only
     real npm can confirm that. `config get` needs no network.
+
+    The npm is resolved by ``_real_npm`` -- npm-cli.js plus the native node beside
+    it -- and invoked as ``node npm-cli.js``, so no version-manager shim is ever in
+    the process tree. That is what lets this test hold the same verdict on every
+    run: the earlier version ran whatever ``npm`` PATH resolved to, and on a
+    developer machine that is a shim which, under the isolated HOME, blocks trying
+    to provision a toolchain -- so the test skipped or passed by the clock, and each
+    skip cost a SIGKILL of the shim's tree. A real npm either answers or is a
+    failure; nothing here is decided by a timeout.
     """
     _fake_node(stubs)
     _fake_npm_succeeding(stubs)
@@ -2767,48 +2937,26 @@ def test_real_npm_accepts_the_isolated_config_files(tmp_path: Path, stubs: Path)
     assert user.is_file() and global_.is_file()
     assert user != global_
 
-    # HOME stays isolated. A version-manager shim (mise/asdf/nvm) resolves its
-    # toolchain through HOME, so under an isolated one it either fails or blocks
-    # trying to provision a toolchain that is not there -- on this host it hangs
-    # rather than exiting. Both outcomes SKIP: letting the shim see the real HOME
-    # would let it provision files outside tmp_path, which is the side effect this
-    # suite exists to prevent. Where npm is a standalone binary (CI), the probe
-    # runs and the contract below is genuinely enforced.
+    # HOME stays isolated: npm's own write targets must resolve inside tmp_path,
+    # which is the side effect this suite exists to prevent leaking.
     env = _isolated_tool_env(
         tmp_path,
         npm_config_userconfig=str(user),
         npm_config_globalconfig=str(global_),
     )
-
-    def _npm(*args: str, timeout: float) -> subprocess.CompletedProcess[str] | None:
-        """None means npm never got far enough to answer: a shim that blocks or
-        cannot start is indistinguishable from one that is merely slow.
-
-        Bounded through `run_bounded`, not `subprocess.run(timeout=...)`: the
-        latter kills only the direct child, so a version-manager shim that is
-        mid-provision leaves its downloader running -- writing outside tmp_path,
-        which is the whole hazard this probe is trying not to create.
-        """
-        try:
-            return run_bounded(["npm", *args], env=env, timeout=timeout)
-        except (subprocess.TimeoutExpired, OSError):
-            return None
-
-    # Preflight, so a shimmed npm costs five seconds rather than the full probe
-    # timeout on every developer machine: `npm --version` answers instantly when
-    # npm can run at all, and blocks exactly when the shim would have to provision.
-    if _npm("--version", timeout=5) is None:
-        pytest.skip("npm cannot run under an isolated HOME on this host (version-manager shim)")
-    probe = _npm("config", "get", "registry", "cache", "logs-dir", timeout=60)
-    if probe is None:
-        pytest.skip("npm did not answer `config get` under an isolated HOME")
+    node, npm_cli = _real_npm()  # type: ignore[misc]  # the skipif above proved it
+    # Bounded through `run_bounded` so a wedged npm cannot leave a tree behind; a
+    # timeout propagates as the error it is rather than becoming a skip.
+    probe = run_bounded(
+        [str(node), str(npm_cli), "config", "get", "registry", "cache", "logs-dir"],
+        env=env,
+        timeout=60,
+        cwd=str(tmp_path),
+    )
     combined = probe.stdout + probe.stderr
-    # The one outcome that is a real failure rather than an unusable npm: npm
-    # refusing the two config files. Anything else means npm never got far enough
-    # to judge them, which this host cannot distinguish from a broken shim.
+    # The failure this test exists to catch: npm refusing the two config files.
     assert "double-loading config" not in combined, combined
-    if probe.returncode != 0:
-        pytest.skip(f"npm could not resolve a toolchain under an isolated HOME: {combined}")
+    assert probe.returncode == 0, combined
     # The point of the isolation: npm's write targets resolve inside tmp_path, so
     # the run cannot deposit a cache or a debug log in the developer's real HOME.
     assert str(tmp_path) in probe.stdout, probe.stdout

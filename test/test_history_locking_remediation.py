@@ -12,7 +12,7 @@ Each test class reproduces one audited failure scenario:
    (a few huge messages), instead of growing without bound.
 5. ``delete_session`` uses ``unlink(missing_ok=True)`` and tolerates a
    concurrent removal instead of raising ``FileNotFoundError``.
-6. One-line metadata rewrites no longer ``fsync`` while holding the lock,
+6. One-line metadata rewrites do not ``fsync`` while holding the lock,
    shrinking the critical section every other writer contends on.
 """
 
@@ -619,9 +619,9 @@ class TestOnLoopPersistDiscipline:
         in the fast unit CI, independent of e2e coverage.
         """
         import ast
-        from pathlib import Path as _P
+        from pathlib import Path
 
-        repo_root = _P(__file__).resolve().parents[1]
+        repo_root = Path(__file__).resolve().parents[1]
         setup_src = (repo_root / "setup.py").read_text(encoding="utf-8")
         tree = ast.parse(setup_src)
 
@@ -656,8 +656,8 @@ class TestTabIdIndexInvalidation:
         self, tmp_path: Path
     ) -> None:
         """A session opened under an existing tab_id AFTER the chain was first
-        read must be linked in. Previously the append didn't invalidate the
-        cached index, so the second session's messages vanished from
+        read must be linked in. An append that does not invalidate the
+        cached index makes the second session's messages vanish from
         ``recent_chained``.
         """
         log = ConversationLog(base_dir=tmp_path)
@@ -693,8 +693,8 @@ class TestTabIdIndexInvalidation:
 
     def test_no_permanent_negative_sentinel(self, tmp_path: Path) -> None:
         """A chained read for a tab_id with no dashboard siblings must not poison
-        the cache: a sibling created afterwards is still discovered (the removed
-        ``[]`` sentinel used to suppress every future rebuild)."""
+        the cache: a sibling created afterwards is still discovered (a cached
+        ``[]`` sentinel would suppress every future rebuild)."""
         log = ConversationLog(base_dir=tmp_path)
         # slack-style key with a tab_id that the dashboard_chat-* glob misses,
         # so the first rebuild finds no entry for tab_id S.
@@ -1207,7 +1207,7 @@ class TestUpdateMetadataOffLoop:
 class TestOnLoopCallersOffload:
     """The audited async-path callers (``_persist_title`` behind auto-title /
     manual-title handlers, ``api_session_delete``) enter ``_locked`` via
-    ``update_metadata`` / ``delete_session``. Running that on the event-loop
+    ``update_metadata_if`` / ``delete_session``. Running that on the event-loop
     thread lets a wedged cross-process peer freeze chat/WS/heartbeat. These
     wiring tests lock in that the ``_locked`` work is dispatched off the loop."""
 
@@ -1225,13 +1225,13 @@ class TestOnLoopCallersOffload:
 
         loop_thread = threading.get_ident()
         seen: dict[str, int] = {}
-        real_update_metadata = log.update_metadata
+        real_update_metadata = log.update_metadata_if
 
-        def _spy(*args: object, **kwargs: object) -> None:
+        def _spy(*args: object, **kwargs: object) -> bool:
             seen["thread"] = threading.get_ident()
-            real_update_metadata(*args, **kwargs)  # type: ignore[arg-type]
+            return real_update_metadata(*args, **kwargs)  # type: ignore[arg-type]
 
-        log.update_metadata = _spy  # type: ignore[method-assign]
+        log.update_metadata_if = _spy  # type: ignore[method-assign]
         monkeypatch.setattr(
             chat_title, "slot_history_key", lambda _slot: "dashboard:t"
         )
@@ -1243,6 +1243,7 @@ class TestOnLoopCallersOffload:
         slot.title = "My Title"
         slot._title_origin = "auto"
         slot._title_refresh_mark = 8
+        slot._title_low_signal = False
         slot._title_epoch = 0
 
         asyncio.run(chat_title._persist_title(state, slot))
@@ -1256,6 +1257,7 @@ class TestOnLoopCallersOffload:
         # reload.
         assert persisted["title_origin"] == "auto"
         assert persisted["title_refresh_mark"] == 8
+        assert persisted["title_low_signal"] is False
 
     def test_api_session_delete_runs_delete_off_loop(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1281,6 +1283,7 @@ class TestOnLoopCallersOffload:
 
         state = MagicMock()
         state.conversation_log = log
+        state._slots = {}
         state.push_slots_update = MagicMock()
         state.push_refresh = MagicMock()
         monkeypatch.setattr(
@@ -1299,6 +1302,145 @@ class TestOnLoopCallersOffload:
         )
         assert b'"ok": true' in resp.body
         assert not log._path("gone").exists()
+
+
+class TestMetadataRenameRetryNeedsTheOffload:
+    """The offload is what earns a mutation the Windows rename retry.
+
+    A one-line metadata rewrite publishes through ``replace_with_retry``. On
+    Windows that rename is refused with ``PermissionError`` while any other
+    handle is open on the destination -- a concurrent transcript reader, an
+    indexer, an AV scanner. ``replace_with_retry`` absorbs that window, but only
+    OFF the event loop: on the loop it makes exactly ONE attempt and re-raises
+    rather than sleeping the sole loop (``no-blocking-call-on-event-loop``).
+
+    So an async caller that invokes a sync mutator directly gets no retry at all,
+    and a single transient reader is enough to fail its write on Windows. Every
+    production caller offloads; an async TEST that mutates as a setup convenience
+    has to do the same, or it inherits a Windows-only flake that no Linux run
+    reproduces. These tests pin both halves of that asymmetry.
+    """
+
+    KEY = "dashboard:resume-private"
+
+    def _seeded(self, tmp_path: Path) -> ConversationLog:
+        """A transcript with a metadata line, created off the loop."""
+        log = ConversationLog(base_dir=tmp_path)
+        log.append(self.KEY, "user", "seed")
+        return log
+
+    @staticmethod
+    def _windows_without_strict(monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(platform_compat, "IS_WINDOWS", True)
+        # Pin the discipline check to warn-and-proceed so these tests measure the
+        # rename, not an ambient strict-mode raise from the surrounding harness.
+        monkeypatch.setenv("KIROCREW_STRICT_ON_LOOP_PERSIST", "0")
+
+    def test_off_loop_metadata_write_retries_past_one_violation(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from windows_sim import replace_sharing_violation
+
+        self._windows_without_strict(monkeypatch)
+        log = self._seeded(tmp_path)
+        destination = log._path(self.KEY).name
+
+        async def _body() -> dict:
+            with replace_sharing_violation(match=destination, times=1) as seen:
+                await asyncio.to_thread(log.update_metadata, self.KEY, {"agent": "writer"})
+            return seen
+
+        seen = asyncio.run(_body())
+        assert seen["n"] >= 2, (
+            f"the rename was not retried past the violation (attempts={seen['n']}); "
+            f"one attempt means the write did not take the off-loop path"
+        )
+        assert log.get_metadata(self.KEY).get("agent") == "writer", (
+            "the retried rename did not publish the metadata"
+        )
+
+    def test_on_loop_metadata_write_is_refused_by_the_same_violation(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The control: identical contention, no offload, no retry.
+
+        This is the asymmetry the offload exists for. If this ever stops raising,
+        the on-loop branch of ``replace_with_retry`` changed and the reason an
+        async caller must offload needs re-deriving.
+        """
+        from windows_sim import replace_sharing_violation
+
+        self._windows_without_strict(monkeypatch)
+        log = self._seeded(tmp_path)
+        destination = log._path(self.KEY).name
+
+        async def _body() -> None:
+            with replace_sharing_violation(match=destination, times=1):
+                log.update_metadata(self.KEY, {"agent": "writer"})
+
+        with pytest.raises(PermissionError):
+            asyncio.run(_body())
+
+    def test_the_private_resume_test_offloads_its_transcript_setup(self) -> None:
+        """Pin the async caller whose un-offloaded setup flaked on Windows.
+
+        A direct ``state.conversation_log.<mutator>(...)`` in an async test body
+        runs on the loop and so opts out of the rename retry the two tests above
+        measure. The control on the offloaded form keeps an empty offender list
+        meaning "converted" rather than "the calls were deleted".
+        """
+        import ast
+
+        target = "test_http_resume_cannot_authorize_private_transcript"
+        mutators = {
+            "append",
+            "append_if_absent",
+            "delete_session",
+            "save_slot",
+            "set_title",
+            "update_metadata",
+        }
+        source = (Path(__file__).resolve().parent / "test_member_memory_runtime.py").read_text(
+            encoding="utf-8"
+        )
+        node = next(
+            (
+                n
+                for n in ast.walk(ast.parse(source))
+                if isinstance(n, (ast.AsyncFunctionDef, ast.FunctionDef)) and n.name == target
+            ),
+            None,
+        )
+        assert node is not None, (
+            f"{target} is gone from test_member_memory_runtime.py; move this guard "
+            f"to whatever replaced it rather than deleting it"
+        )
+
+        calls = [c for c in ast.walk(node) if isinstance(c, ast.Call)]
+        direct = sorted(
+            c.lineno
+            for c in calls
+            if isinstance(c.func, ast.Attribute)
+            and c.func.attr in mutators
+            and "conversation_log" in ast.unparse(c.func)
+        )
+        offloaded = [
+            c
+            for c in calls
+            if "to_thread" in ast.unparse(c.func)
+            and any("conversation_log" in ast.unparse(a) for a in c.args)
+        ]
+
+        assert direct == [], (
+            f"{target} mutates the conversation log ON the event loop at line(s) "
+            f"{direct}: that write gets a single rename attempt, so one transient "
+            f"reader handle fails it on Windows. Wrap it in asyncio.to_thread."
+        )
+        assert len(offloaded) >= 2, (
+            f"expected {target} to still drive its transcript setup through "
+            f"asyncio.to_thread; found {len(offloaded)} offloaded mutation(s), so the "
+            f"empty on-loop list above may just mean the setup was removed"
+        )
 
 
 # ── Bug 6: reduced lock hold — no fsync under lock for one-line metadata ──────
@@ -1527,7 +1669,7 @@ class TestDashboardSaveHoldsLock:
         The very NEXT save (window and disk both unchanged) then matches that
         cache and takes the O(window) fast path. If the fast path returns EMPTY
         foreign lines, the rebuilt ``meta + frozen + window`` payload drops the
-        previously-preserved append — a cron/workflow result followed by two
+        already-preserved append — a cron/workflow result followed by two
         dashboard saves silently loses the transcript line.
 
         Reproduces the sequence save -> foreign-append -> save -> save -> save
@@ -1614,7 +1756,7 @@ class TestDashboardSaveHoldsLock:
         """Pin the LEGACY id-less fallback: the narrowed, timestamp-first
         foreign-append identity (GPT 5.6 HIGH + arbiter long-term item 2).
 
-        Since the ``meta.mid`` tier landed (#5152), this ladder is the fallback
+        Since the ``meta.mid`` tier landed, this ladder is the fallback
         for disk lines that carry NO stable id — pre-id transcripts and writers
         that persist id-less durable copies. Every disk line and window entry
         here is deliberately id-less, so the input must reproduce the pre-id
@@ -1712,12 +1854,11 @@ class TestDashboardSaveHoldsLock:
 
 
 class TestForeignFoldMidIdentity:
-    """Pin the ``meta.mid`` tier (pass 0) of the save-side foreign-merge fold
-    (#5152, the save-side slice of the #381 successor identity).
+    """Pin the ``meta.mid`` tier (pass 0) of the save-side foreign-merge fold.
 
     Every window append mints a stable per-message id (``meta.mid``), a save
     persists it, and the durable-copy writers (workflow/cron injectors, CLI)
-    carry the window row's id onto their copy — so since #5133 the id is on
+    carry the window row's id onto their copy — so the id is on
     BOTH sides of the fold's comparison. Pass 0 uses it: an id match IS the
     same message (folded silently, never archived); an id-carrying disk line
     whose id matches NO window entry is foreign regardless of body equality
@@ -1772,7 +1913,7 @@ class TestForeignFoldMidIdentity:
         row) folds in pass 0 with an EMPTY ``dedup_dropped``: the ids matching
         exactly makes it unambiguous, so it must not be routed to the
         ``foreign-dedup`` archive the way the id-less fresh-ts tiebreak is
-        (issue #5152 consequence 1 — archive churn on every injection+save).
+        (consequence 1 — archive churn on every injection+save).
         """
         _prefix, foreign, dedup_dropped = self._fold(
             tmp_path,
@@ -1807,7 +1948,7 @@ class TestForeignFoldMidIdentity:
     ):
         """Two identical-content rows with DISTINCT ids resolve exactly: the
         window row's copy (same id) folds silently, the genuinely distinct row
-        (different id) is preserved as foreign (issue #5152 consequence 2 — the
+        (different id) is preserved as foreign (consequence 2 — the
         residual ambiguity the count-bounded tiebreak could only bound).
         """
         import json
@@ -2049,6 +2190,103 @@ class TestForeignFoldMidIdentity:
         )
         assert foreign == [], "the stale persisted copy must fold, window wins"
         assert dedup_dropped == [], "an id+ts corroborated fold is silent"
+
+    def test_id_match_corroborated_by_a_preserved_image_folds(self, tmp_path, monkeypatch):
+        """Same id, fresh ts, bodies differing ONLY in an image destination the
+        durable copy preserved (the window entry's own rewrite failed open because
+        the agent's scratch file was already gone): pass 0 folds it. Without the
+        image allowance the id match has no corroboration, the line falls through
+        the id-less tiers, and the transcript keeps two copies of one message,
+        one naming a dead file.
+        """
+        import json
+
+        from kiro_crew.chat_attachments import attachments_dir
+        from kiro_crew.dashboard.chat_persistence import _frozen_prefix_and_foreign_appends
+        from kiro_crew.dashboard.chat_utils import _history_key_for
+
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = self._make_state(tmp_path)
+        slot = state.get_or_create_slot("imgfold")
+        path = state.conversation_log._path(_history_key_for(slot.key))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        stored = attachments_dir(path.parent, path.stem) / "0123456789abcdef-shot.png"
+        scratch = tmp_path / "scratch" / "shot.png"  # never created: it is gone
+        disk_entries = [
+            {
+                "role": "assistant",
+                "content": f"see ![shot]({stored})",
+                "ts": "TY",
+                "meta": {"mid": "m-img"},
+            }
+        ]
+        lines = [json.dumps({"_type": "metadata", "created": "2026-01-01T00:00:00Z"})]
+        lines.extend(json.dumps(e) for e in disk_entries)
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        slot._frozen_prefix_cache = None
+        window_entries = [
+            {
+                "role": "assistant",
+                "content": f"see ![shot]({scratch})",
+                "ts": "TZ",
+                "meta": {"mid": "m-img"},
+            }
+        ]
+
+        _prefix, foreign, dedup_dropped = _frozen_prefix_and_foreign_appends(
+            slot, path, 0, window_entries
+        )
+        assert foreign == [], "the preserved-image durable copy must fold into the window"
+        assert dedup_dropped == []
+
+        # The allowance is for preserved images only: a same-id line whose TEXT
+        # differs is still uncorroborated and still preserved.
+        slot._frozen_prefix_cache = None
+        window_entries[0]["content"] = f"look ![shot]({scratch})"
+        _prefix, foreign, _dropped = _frozen_prefix_and_foreign_appends(
+            slot, path, 0, window_entries
+        )
+        assert len(foreign) == 1
+
+    def test_a_save_that_keeps_foreign_lines_logs_one_warning(self, tmp_path, monkeypatch, caplog):
+        """A save that keeps another writer's lines warns once per chat: a
+        re-scan after a trim is quiet, a swapped line warns again, and a save
+        with nothing foreign is quiet.
+        """
+        import json
+        import logging
+
+        from kiro_crew.dashboard.chat_persistence import _frozen_prefix_and_foreign_appends
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        caplog.set_level(logging.WARNING, logger="kiro_crew.dashboard.chat_persistence")
+        slot = self._make_state(tmp_path).get_or_create_slot("kc_warn_foreign")
+        path = tmp_path / "kc_warn_foreign.jsonl"
+        mine = {"role": "user", "content": "mine", "ts": "T1", "meta": {"mid": "m-1"}}
+
+        def scan(*disk):
+            lines = [json.dumps({"_type": "metadata", "created": "2026-01-01T00:00:00Z"})]
+            path.write_text("\n".join(lines + [json.dumps(e) for e in disk]) + "\n")
+            slot._frozen_prefix_cache = None  # what a _MAX_SLOT_MESSAGES trim does
+            caplog.clear()
+            _p, foreign, _d = _frozen_prefix_and_foreign_appends(slot, path, 0, [mine])
+            got = [r.getMessage() for r in caplog.records]
+            return foreign, [m for m in got if "another writer appended" in m]
+
+        other = {"role": "assistant", "content": "theirs", "ts": "T2", "meta": {"mid": "m-2"}}
+        foreign, warned = scan(mine, other)
+        assert len(foreign) == 1 and len(warned) == 1
+        assert " found 1 new line(s) " in warned[0] and "kc_warn_foreign" in warned[0]
+        assert "theirs" not in warned[0], "no message content in the log"
+
+        foreign, warned = scan(mine, other)  # same kept line, cache dropped
+        assert len(foreign) == 1 and warned == []
+
+        swapped = {**other, "ts": "T3", "meta": {"mid": "m-3"}}
+        foreign, warned = scan(mine, swapped)  # same count, different line
+        assert len(foreign) == 1 and len(warned) == 1
+
+        foreign, warned = scan(mine)
+        assert foreign == [] and warned == []
 
 
 class TestBestEffortSaveMarksDirty:

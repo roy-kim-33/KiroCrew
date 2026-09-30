@@ -6,7 +6,7 @@ A first-time stdlib import reads module files off disk. The launcher's Steps
 whose LSM restricts unprivileged user namespaces that post-unshare read is
 denied: Ubuntu 24.04 with ``apparmor_restrict_unprivileged_userns=1`` killed
 ``import platform`` at seccomp-install time with ``ModuleNotFoundError``, so
-every sandboxed spawn died inside the launcher (#8151). The isolation probe in
+every sandboxed spawn dies inside the launcher. The isolation probe in
 Auto-Improvement then read that crash as "push is not disabled".
 
 The structural rule these tests pin: every ``import`` in the generated launcher
@@ -32,6 +32,7 @@ import sys
 
 import pytest
 
+import kiro_crew.sandbox as sandbox_mod
 from kiro_crew.sandbox import _build_launcher_script
 
 pytestmark = pytest.mark.skipif(
@@ -44,6 +45,18 @@ pytestmark = pytest.mark.skipif(
 #: files), so asserting one level could miss an import reintroduced in a branch
 #: another level renders.
 _LEVELS = ("standard", "cc", "strict")
+
+
+@pytest.fixture(autouse=True)
+def _no_host_ssh_probe(monkeypatch):
+    """``_build_launcher_script`` asks the HOST's ``ssh -V`` for accept-new support.
+
+    Every test here parses the generated launcher; none is about that probe, and a
+    real ssh spawned from the test process is a host dependency the launcher text
+    must not vary with. Pinned at the module seam ``_build_launcher_script`` reads,
+    so no binary runs.
+    """
+    monkeypatch.setattr(sandbox_mod, "_ssh_supports_accept_new", lambda: True)
 
 
 @pytest.fixture(params=_LEVELS, ids=_LEVELS)
@@ -136,7 +149,7 @@ def test_probe_failure_markers_round_trip_against_the_launcher(level: str) -> No
     a launcher failure; each prefix must exist in the generated launcher (and
     the traceback marker must match the launcher's real filename prefix), or
     the list has drifted and real launcher deaths fall back to the misleading
-    push-isolation refusal this pairing exists to prevent (#8151).
+    push-isolation refusal this pairing exists to prevent.
     """
     import inspect
 

@@ -4,11 +4,13 @@ Research Lab (the `auto-research` builtin app) runs autonomous, multi-cycle camp
 
 `auto-research` is disabled by default. App enablement is the activation gate: a disabled app contributes no agents, skills, crons, or routes.
 
-> **Research Lab is research-only by design.** It gathers, analyzes, and reports — it does
-> **not** take actions on your systems (no writes, deployments, mutations, or code changes).
-> Its sub-agents run with read/research tools only, and any follow-up action is handed off
-> to the main agent for you to review and drive. This keeps campaigns safe to run
-> unattended and their results reproducible. See [Scope](#scope-research-only-by-design).
+> **Research Lab is not a permission boundary.** Its `kirocrew-research` worker is
+> generated from your main agent's configuration and therefore inherits the same MCP
+> servers and the same tool set — it can write files, run commands, and mutate systems
+> exactly as your main agent can. Research-only is the *intent* of the prompt it is
+> given, not a restriction the code enforces. Review the tools your main agent has
+> before leaving a campaign to run unattended. See
+> [Scope and permissions](#scope-and-permissions).
 
 ## Execution modes
 
@@ -24,14 +26,14 @@ A campaign can instead use **workflow** mode, which runs the Dynamic Workflow te
 ## Shared domain layer
 
 - **Grill tree** — interactive clarification that scopes the question into sub-questions
-  (a well-formed starting point). See `GrillTree.tsx`.
+  (a well-formed starting point).
 - **Success criteria** — optional natural-language done-condition, verified each cycle
   (`verification: {passed, detail}` on the finding).
 - **Limits** — max cycles (safety cap), idle interval, max sub-questions per round, budget.
 - **In-progress guidance** — user steering injected between cycles: the agent reads
   `guidance.txt` each cycle and incorporates it.
-- **Emergent sub-questions** — findings-driven follow-ups, ranked, depth-decayed, deduped,
-  activated into the checklist (`subquestion_queue.py`).
+- **Emergent sub-questions** — findings-driven follow-ups, ranked with depth decay,
+  de-duplicated, and activated into the checklist.
 - **Findings + report** — per-cycle `cycle_NNN.json` cards + consolidated `FINDINGS.md`,
   exportable to the Knowledge Library or as an HTML artifact.
 
@@ -44,13 +46,14 @@ A campaign can instead use **workflow** mode, which runs the Dynamic Workflow te
 ├── guidance.txt           # user nudge: agent reads + incorporates each cycle
 ├── emergent_questions.json # agent writes findings-driven follow-ups; ingested + consumed
 ├── findings/
-│   ├── cycle_001.json      # { cycle, summary, key_insight, sources_checked,
-│   ├── cycle_002.json      #   sources_empty, evidence_strength, verification }
+│   ├── cycle_000.json      # { cycle, summary, key_insight, sources_checked, sources_empty,
+│   ├── cycle_001.json      #   new_findings_count, evidence_strength, verification }
 │   └── ...
 └── FINDINGS.md            # cumulative report
 ```
 
-The agent writes each `cycle_NNN.json` finding card as it completes a cycle.
+The agent writes each `cycle_NNN.json` finding card as it completes a cycle,
+beginning with `cycle_000.json`.
 
 ## Campaign lifecycle
 
@@ -65,16 +68,24 @@ The agent writes each `cycle_NNN.json` finding card as it completes a cycle.
 | `failed` | Unresponsive (no activity past deadline) or execution failure |
 | `stopped` | User-stopped (terminal) |
 
-Pause/resume pauses/resumes the autonudge loop.
+In agent mode, pause/resume pauses/resumes the autonudge loop. In workflow mode, pause
+cancels the workflow run and resume starts a new one that appends to the same findings.
 
-## Key files
+### Who changes a campaign
 
-| File | Role |
-|------|------|
-| `src/kiro_crew/apps/builtins/auto_research/handlers.py` | Campaign CRUD, watchdog, grill tree, agent launch, emergent-exploration, findings, reports, SSE |
-| `src/kiro_crew/apps/builtins/auto_research/subquestion_queue.py` | Emergent sub-question queue (ranking, decay, dedup) |
-| `website/src/apps/auto-research/ResearchLabPage.tsx` | Setup wizard, campaign list/detail, finding cards |
-| `website/src/apps/auto-research/GrillTree.tsx` | Grill-tree clarification UI |
+- **You**, from the dashboard: create, start, pause, resume, stop, fork, add a question,
+  nudge with guidance, export, delete.
+- **The watchdog**, on its own: it moves a running campaign to `complete`, `stagnant`,
+  `needs_input`, `stopped` (the worker ended the run itself) or `failed`. After 24 hours it
+  withdraws the worker's tool auto-approval and waits in `needs_input` until you resume.
+  While the app is disabled it pauses every research loop and withdraws that approval.
+- **One status change at a time.** Your status actions and the watchdog's decisions on the
+  same campaign wait their turn, and a decision the watchdog reached about a run you have
+  since paused and resumed is discarded, never applied to the new run.
+- **The worker** never changes status itself. In agent mode it writes findings,
+  `FINDINGS.md`, `emergent_questions.json`, `questions.json` and, when it decides the research
+  is done, `worker_done.json` before stopping its loop; the watchdog reads those files and
+  decides. In workflow mode the watchdog reads the workflow run instead.
 
 ## Scope and permissions
 

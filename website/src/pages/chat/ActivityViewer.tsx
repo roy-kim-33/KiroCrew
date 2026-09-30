@@ -3,10 +3,13 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { useNavigate } from 'react-router-dom'
 import { Bot, ScrollText, X, Lock, CheckCircle, AlertCircle, Loader as LoaderIcon, Ban, Wrench, MessageCircleQuestionMark, Workflow, BookmarkPlus, Component, GitPullRequest, CircleDot, Square, RotateCcw, Clock, Search, Link as LinkIcon, ExternalLink } from 'lucide-react'
 import { api } from '../../api/client'
+import { isTerminalApprovalRefusal } from '../../api/apiError'
 import { LogViewer } from '../LogsPage'
 import Clickable from '../../components/Clickable'
+import ErrorNotice from '../../components/ErrorNotice'
 import type { SubagentActivity, ToolActivity, Artifact } from '../../types'
 import { countDiffStats } from '../../utils/diffLineCounts'
+import { toApiDecision } from '../../utils/approvalDecision'
 import type { ExtractedLink } from '../../utils/extractChatLinks'
 import { dedupResourceLinks, resourceKey } from '../../utils/extractChatLinks'
 import type { PullRequestLink } from '../../utils/pullRequestLinks'
@@ -23,17 +26,20 @@ import WorkflowSidebarRow, { type WfRunRow } from './WorkflowSidebarRow'
 import { runBelongsToSlot } from '../../apps/workflows/runModel'
 
 import { ContextBreakdownTab } from '../ContextBreakdownPanel'
+import { CrewLogTab } from './CrewLogPanel'
 import SessionSummaryTab from './SessionSummaryTab'
 import { i18nT } from '../../i18n/t'
+import { queuedWaitText } from './subagentQueuedReason'
 import GitPanel from '../../components/GitPanel'
 import { fmtDateFields } from '../../i18n/format'
 import { isModelDowngrade } from './subagentCompletion'
 import { normalizeModelKey } from '../../lib/model'
+import { fmtCredits } from '../../i18n/format'
 const STATUS = {
   pending: <Lock size={12} className="text-muted" />,
   running: <LoaderIcon size={12} className="text-accent animate-spin" />,
-  tool: <Wrench size={12} className="text-amber-400" />,
-  done: <CheckCircle size={12} className="text-green-400" />,
+  tool: <Wrench size={12} className="text-warn" />,
+  done: <CheckCircle size={12} className="text-ok" />,
   error: <AlertCircle size={12} className="text-danger" />,
   stopped: <Square size={12} className="text-muted" />,
 } as const
@@ -83,7 +89,16 @@ function DiskLoader({ id, autoLoad }: { id: string; autoLoad?: boolean }) {
   }, [autoLoad])
   if (text !== null) return <>{text}</>
   if (loading) return <span className="text-muted/30 italic">{i18nT('pages.chat.activityViewer.loading')}</span>
-  if (error) return <button className="text-danger/70 hover:text-danger text-[12px] underline cursor-pointer bg-transparent border-none p-0 font-mono" onClick={e => { e.stopPropagation(); load() }}>{i18nT('pages.chat.activityViewer.failed_click_to_retry')}</button>
+  // Retry and hand-off are two separate controls: the notice carries the
+  // agent hand-off (a side-panel read failure, nothing to lose), the button
+  // stays the retry. Folding "click to retry" into the error text made the
+  // notice itself the only affordance and left the failure a dead end.
+  if (error) return (
+    <span className="inline-flex flex-wrap items-center gap-2 font-body">
+      <ErrorNotice variant="inline" message={i18nT('pages.chat.activityViewer.output_load_failed')} askAgent />
+      <button type="button" className="text-accent/70 hover:text-accent text-[12px] underline cursor-pointer bg-transparent border-none p-0" onClick={e => { e.stopPropagation(); load() }}>{i18nT('pages.chat.activityViewer.retry')}</button>
+    </span>
+  )
   return <button className="text-accent/70 hover:text-accent text-[12px] underline cursor-pointer bg-transparent border-none p-0 font-mono" onClick={e => { e.stopPropagation(); load() }}>{i18nT('pages.chat.activityViewer.load_output_from_disk')}</button>
 }
 
@@ -106,6 +121,13 @@ function SubagentPane({ a, slot, onClick, selected }: { a: SubagentActivity; slo
 
   // Approval handling for pending subagents
   const dispatch = useAppDispatch()
+  // Outcome of the last approve / reject / cancel round-trip that FAILED. The
+  // Redux flags only roll back the busy state, which left a refused decision
+  // indistinguishable from one that never happened.
+  const [actionError, setActionError] = useState<string | null>(null)
+  // WHICH approval is gone, not merely that one was: the id scopes the
+  // withdrawal, so a later live approval here is never suppressed by it.
+  const [goneFor, setGoneFor] = useState<string | null>(null)
   // 1-click transcript: chip selection expands the card, scrolls it into
   // view, and (via DiskLoader autoLoad) fetches the output — then clears the
   // selection so a later re-click re-triggers.
@@ -119,6 +141,7 @@ function SubagentPane({ a, slot, onClick, selected }: { a: SubagentActivity; slo
   const onApprove = useCallback((e: React.MouseEvent, action: 'approve' | 'reject') => {
     e.stopPropagation()
     if (!a.approval_id) return
+    setActionError(null)
     dispatch(markSubagentApproving({ id: a.id, approving: true }))
     api.resolveApproval(a.approval_id, action).then(() => {
       // See the matching note in ChatInput's resolveOneSpawn: the backend's
@@ -129,7 +152,17 @@ function SubagentPane({ a, slot, onClick, selected }: { a: SubagentActivity; slo
       if (action === 'reject' && slot) {
         dispatch(sseSubagentDone({ slot, id: a.id, elapsed: 0, error: 'rejected' }))
       }
-    }).catch(() => dispatch(markSubagentApproving({ id: a.id, approving: false })))
+    }).catch((e: unknown) => {
+      dispatch(markSubagentApproving({ id: a.id, approving: false }))
+      const gone = isTerminalApprovalRefusal(e)
+      setGoneFor(gone ? a.approval_id ?? null : null)
+      const reason = e instanceof Error ? e.message : ''
+      setActionError(gone
+        ? i18nT('components.approvalCard.approval_no_longer_pending')
+        : reason
+          ? i18nT('components.approvalCard.decision_not_recorded_error', { error: reason })
+          : i18nT('components.approvalCard.decision_failed'))
+    })
   }, [a.approval_id, a.id, slot, dispatch])
 
   // Live elapsed timer for running subagents
@@ -155,11 +188,31 @@ function SubagentPane({ a, slot, onClick, selected }: { a: SubagentActivity; slo
 
   const onCancel = useCallback((e: React.MouseEvent) => {
     e.stopPropagation()
-    api.spawnDelete(a.id).catch(() => {})
+    setActionError(null)
+    // The card converges through the spawn/done stream on success; a refused
+    // delete leaves it running, so say so instead of letting the press vanish.
+    api.spawnDelete(a.id).catch(() => setActionError(i18nT('pages.chat.activityViewer.cancel_failed')))
   }, [a.id])
 
   const displayElapsed = isRunning ? elapsed : Math.round(a.elapsed || 0)
   const fmtElapsed = displayElapsed >= 60 ? `${Math.floor(displayElapsed / 60)}m ${displayElapsed % 60}s` : `${displayElapsed}s`
+  // A running card whose start time was only ASSUMED has no elapsed figure to
+  // show: the agent may have been running long before the frame that minted its
+  // entry, so a number here would be wrong rather than merely imprecise. A
+  // `subagent_done` or snapshot frame supplies real timing and this resolves.
+  // Withheld HERE rather than inside the line above so that line stays exactly
+  // as it was: its `m`/`s` concatenation is frozen i18n debt, and rewriting the
+  // line would move that debt onto a line this change wrote.
+  const shownElapsed = isRunning && a.startedAtAssumed ? '--' : fmtElapsed
+  // What the header calls this agent. An entry recovered from an incremental
+  // frame has no agent name, and showing nothing left two such cards reading as
+  // the same "Running Tool" with no way to tell them apart -- the same complaint
+  // the progress row had, so the same fallback answers it. This is not a redesign
+  // of the header, only a refusal to leave the recovered state anonymous.
+  const identity = a.agent || (a.id ? `agent #${a.id.slice(-6)}` : '')
+  const terminalCredits = isDone && typeof a.credits === 'number' && Number.isFinite(a.credits) && a.credits > 0
+    ? a.credits
+    : null
 
   // Inside the Subagents tab the "Subagent" prefix is redundant, and in a
   // narrow rail it was the part that survived truncation while the actual
@@ -196,7 +249,7 @@ function SubagentPane({ a, slot, onClick, selected }: { a: SubagentActivity; slo
       >
         <span className="shrink-0 flex items-center">{STATUS[a.status]}</span>
         <span className="text-[13px] font-semibold text-text truncate min-w-0" title={i18nT('pages.chat.activityViewer.subagent', { label: statusLabel })}>{statusLabel}</span>
-        {a.agent && <code className="text-[11px] text-muted/50 bg-bg-hover px-1.5 py-0.5 rounded shrink-[3] min-w-0 max-w-[6.5rem] truncate inline-block align-middle" title={a.agent}>{a.agent}</code>}
+        {identity && <code className="text-[11px] text-muted/50 bg-bg-hover px-1.5 py-0.5 rounded shrink-[3] min-w-0 max-w-[6.5rem] truncate inline-block align-middle" title={identity}>{identity}</code>}
         {(() => {
           const resolvedKnown = !!a.model
           const display = a.model || a.requestedModel || ''
@@ -235,25 +288,47 @@ function SubagentPane({ a, slot, onClick, selected }: { a: SubagentActivity; slo
             </code>
           )
         })()}
-        {!isPending && <span className="text-[11px] text-muted/40 ml-auto font-mono shrink-0 whitespace-nowrap tabular-nums">{fmtElapsed}</span>}
+        {!isPending && <span
+          data-testid="subagent-run-stats"
+          className="text-[11px] text-muted/40 ml-auto font-mono shrink-0 whitespace-nowrap tabular-nums"
+        >{shownElapsed}</span>}
         {isRunning && <button data-testid="subagent-cancel-btn" className="text-[11px] px-1.5 py-0.5 rounded border border-danger/40 text-danger/70 hover:bg-danger-subtle hover:text-danger cursor-pointer transition-all shrink-0 whitespace-nowrap inline-flex items-center" onClick={onCancel}><X className="lucide-inline" /> {i18nT('pages.chat.activityViewer.cancel')}</button>}
         {isDone && <span className="text-[14px] text-muted bg-bg-hover px-1.5 py-0.5 rounded shrink-0 ml-1">{collapsed ? '▸' : '▾'}</span>}
       </div>
-      {/* Input (task) */}
-      {!collapsed && (
+      {/* A recovered terminal entry can have usage but no task yet. Keep the
+          usage visible while withholding an empty input block. */}
+      {!collapsed && (a.task || (isDone && !isNative)) && (
         <div className="px-3 pt-1 pb-2">
-          <div className="text-[10px] text-muted/40 uppercase tracking-wider mb-1">{i18nT('pages.chat.activityViewer.input')}</div>
-          <pre className="px-2.5 py-2 bg-bg rounded-md text-[12px] font-mono whitespace-pre-wrap break-all max-h-[120px] overflow-y-auto text-muted/80 leading-relaxed">{a.task}</pre>
+          {isDone && !isNative && (
+            <div data-testid="subagent-credit-usage" className="text-[12px] text-muted font-mono tabular-nums break-words mb-2">
+              {terminalCredits === null
+                ? i18nT('pages.chat.activityViewer.credits_not_reported')
+                : i18nT('pages.chat.activityViewer.credits_used', {
+                    credits: fmtCredits(terminalCredits),
+                  })}
+            </div>
+          )}
+          {a.task && <>
+            <div className="text-[10px] text-muted/40 uppercase tracking-wider mb-1">{i18nT('pages.chat.activityViewer.input')}</div>
+            <pre className="px-2.5 py-2 bg-bg rounded-md text-[12px] font-mono whitespace-pre-wrap break-all max-h-[120px] overflow-y-auto text-muted/80 leading-relaxed">{a.task}</pre>
+          </>}
         </div>
       )}
       {/* Approval buttons for pending */}
-      {isPending && !a.approving && (
+      {isPending && !a.approving && goneFor !== a.approval_id && (
         <div className="px-3 pb-2 flex gap-1.5">
           <button className="px-2.5 py-1 rounded-md border border-border bg-transparent text-muted text-[12px] cursor-pointer hover:text-text hover:border-border-strong hover:bg-bg-hover transition-all" onClick={e => onApprove(e, 'approve')}><CheckCircle className="lucide-inline" /> {i18nT('pages.chat.activityViewer.approve')}</button>
           <button className="px-2.5 py-1 rounded-md border border-border bg-transparent text-muted text-[12px] cursor-pointer hover:text-danger hover:border-danger transition-all" onClick={e => onApprove(e, 'reject')}><Ban className="lucide-inline" /> {i18nT('pages.chat.activityViewer.reject')}</button>
         </div>
       )}
       {isPending && a.approving && <div className="px-3 pb-2 text-[12px] text-muted/50">{i18nT('pages.chat.activityViewer.resolving')}</div>}
+      {/* Activity panel, no draft to lose → hand-off on. Also covers a refused
+          Cancel on a running card. */}
+      {actionError && (
+        <div className="px-3 pb-2">
+          <ErrorNotice variant="inline" message={actionError} askAgent />
+        </div>
+      )}
       {/* Output (streaming body) */}
       {!isPending && !collapsed && (
       <>
@@ -264,10 +339,11 @@ function SubagentPane({ a, slot, onClick, selected }: { a: SubagentActivity; slo
           {a.lastTool && <div className="text-accent mt-1"><Wrench className="lucide-inline" /> {a.lastTool}</div>}
         </pre>
       </div>
-      {/* Error details */}
+      {/* Error details — a backend-reported subagent failure, so it takes the
+          shared notice (hand-off on: nothing in this panel is unsaved). */}
       {a.error && (
         <div className="px-3 py-1.5 text-[12px] border-t border-border/20 space-y-0.5">
-          <div className="text-red-400">{a.error}</div>
+          <ErrorNotice variant="inline" message={a.error} askAgent />
           {a.lastTool && <div className="text-muted/40">{i18nT('pages.chat.activityViewer.last_tool')} {a.lastTool}</div>}
         </div>
       )}
@@ -290,12 +366,27 @@ function ApprovalEntry({ entry }: { entry: ToolActivity }) {
   const [localDecision, setLocalDecision] = useState<string | null>(null)
   const isResolved = resolved || !!localDecision
   const [acting, setActing] = useState(false)
+  const [actionError, setActionError] = useState<string | null>(null)
+  // WHICH approval is gone, not merely that one was: the id scopes the
+  // withdrawal, so a later live approval here is never suppressed by it.
+  const [goneFor, setGoneFor] = useState<string | null>(null)
   const onAction = useCallback(async (action: string) => {
     setActing(true)
+    setActionError(null)
     setLocalDecision(action)
     try {
-      await api.resolveApproval(entry.approval_id!, action === 'rejected' ? 'reject' : 'approve')
-    } catch { setLocalDecision(null); setActing(false) }
+      await api.resolveApproval(entry.approval_id!, toApiDecision(action))
+    } catch (e: unknown) {
+      setLocalDecision(null); setActing(false)
+      const gone = isTerminalApprovalRefusal(e)
+      setGoneFor(gone ? entry.approval_id ?? null : null)
+      const reason = e instanceof Error ? e.message : ''
+      setActionError(gone
+        ? i18nT('components.approvalCard.approval_no_longer_pending')
+        : reason
+          ? i18nT('components.approvalCard.decision_not_recorded_error', { error: reason })
+          : i18nT('components.approvalCard.decision_failed'))
+    }
   }, [entry.approval_id])
 
   // This card mounts only for non-chat approvals (see the `isSpawnApproval`
@@ -304,23 +395,37 @@ function ApprovalEntry({ entry }: { entry: ToolActivity }) {
   // out are a one-shot approve or reject. Offering trust tiers here (or
   // labelling a decision "Trusted") would overstate the grant: the next
   // identical call prompts again (#5400).
+  //
+  // `onAction` above maps through the shared fail-closed `toApiDecision` rather
+  // than the inline `action === 'rejected' ? 'reject' : 'approve'` it used to
+  // spell. That ternary was fail-OPEN — any verb but `rejected` became an
+  // `approve` — and was safe only because the two buttons below pass literals.
+  // It was the last in-tree instance of the shape #5400/#5434/#5486 each shipped
+  // (#8193): a render gate is one edit away from being widened, and the mapping
+  // is what decides whether a widened gate grants or denies.
   const decisionLabel: Record<string, ReactNode> = { approved: <><CheckCircle className="lucide-inline" /> {i18nT('pages.chat.activityViewer.approved')}</>, rejected: <><Ban className="lucide-inline" /> {i18nT('pages.chat.activityViewer.rejected')}</> }
   const btnClass = 'px-2.5 py-1 rounded-md border border-border bg-transparent text-muted text-[12px] cursor-pointer hover:text-text hover:border-border-strong hover:bg-bg-hover transition-all'
   return (
     <div className={`mx-2 mb-2 rounded-lg border overflow-hidden shadow-sm transition-all ${isResolved ? 'border-ok/40 bg-card' : 'border-warn/40 bg-warn/5'}`}>
       <div className="flex items-center gap-2 px-3 py-2">
-        <span className="shrink-0 flex items-center">{isResolved ? <CheckCircle size={15} className="text-green-400" /> : <Lock size={15} className="text-muted" />}</span>
+        <span className="shrink-0 flex items-center">{isResolved ? <CheckCircle size={15} className="text-ok" /> : <Lock size={15} className="text-muted" />}</span>
         <span className="text-[13px] font-semibold text-text truncate min-w-0">{isResolved ? (decisionLabel[localDecision || ''] || i18nT('pages.chat.activityViewer.resolved')) : i18nT('pages.chat.activityViewer.approval_needed')}</span>
         <span className="text-[11px] text-muted/40 font-mono ml-auto shrink-0">{fmtTime(entry.ts)}</span>
       </div>
       {!isResolved && <div className="px-3 pb-2 text-[13px] text-muted/70">{entry.text}</div>}
-      {!isResolved && !acting && (
+      {!isResolved && !acting && goneFor !== entry.approval_id && (
         <div className="px-3 pb-2 flex gap-1.5">
           <button className={btnClass} onClick={() => onAction('approved')}><CheckCircle className="lucide-inline" /> {i18nT('pages.chat.activityViewer.approve')}</button>
           <button className={btnClass + ' hover:!text-danger hover:!border-danger'} onClick={() => onAction('rejected')}><Ban className="lucide-inline" /> {i18nT('pages.chat.activityViewer.reject')}</button>
         </div>
       )}
       {acting && <div className="px-3 pb-2 text-[12px] text-muted/50">{i18nT('pages.chat.activityViewer.resolving')}</div>}
+      {/* Approval card in the activity panel: no draft → hand-off on. */}
+      {actionError && (
+        <div className="px-3 pb-2">
+          <ErrorNotice variant="inline" message={actionError} askAgent />
+        </div>
+      )}
     </div>
   )
 }
@@ -373,7 +478,7 @@ function LinksTab({
               value={query}
               onChange={e => setQuery(e.target.value)}
               placeholder={i18nT('pages.chat.activityViewer.search_files')}
-              className="w-full h-7 pl-8 pr-8 rounded-md bg-bg-elevated border border-border text-[12px] text-text placeholder:text-muted/50 focus:outline-none focus-visible:border-border-strong transition-colors"
+              className="w-full h-7 pl-8 pr-8 rounded-md bg-bg-elevated border border-border text-[12px] text-text placeholder:text-muted/50 focus:outline-hidden focus-visible:border-border-strong transition-colors"
               aria-label={i18nT('pages.chat.activityViewer.search_files')}
             />
             {query && (
@@ -527,7 +632,7 @@ function SessionArtifactsTab({ slot, onArtifactOpen }: { slot: string; onArtifac
   // same panel. It is optional because this tab also renders outside a chat (no
   // panel to open into), where the standalone detail page stays the target.
   const navigate = useNavigate()
-  const { data: artifactData, isFetching: artifactsFetching } = useQuery<{ artifacts: Artifact[] }>({
+  const { data: artifactData, isFetching: artifactsFetching, isError: artifactsError } = useQuery<{ artifacts: Artifact[] }>({
     queryKey: ['session-artifact-records', slot],
     queryFn: () => api.artifacts({ touchedBy: slot }),
     enabled: !!slot,
@@ -535,7 +640,7 @@ function SessionArtifactsTab({ slot, onArtifactOpen }: { slot: string; onArtifac
   // The whole library, for section B. Its own query key so the session query's
   // invalidations don't force a refetch of the (larger) library list and vice
   // versa; both still refresh on the shared ['artifacts'] invalidation below.
-  const { data: libraryData, isFetching: libraryFetching } = useQuery<{ artifacts: Artifact[] }>({
+  const { data: libraryData, isFetching: libraryFetching, isError: libraryError } = useQuery<{ artifacts: Artifact[] }>({
     queryKey: ['artifacts', 'panel-library'],
     queryFn: () => api.artifacts({}),
   })
@@ -556,6 +661,10 @@ function SessionArtifactsTab({ slot, onArtifactOpen }: { slot: string; onArtifac
     onSuccess: invalidate,
   })
   const busySlug = pinMut.isPending ? (pinMut.variables as string) : null
+  // A refused save used to just un-busy the row. The backend reason (when it
+  // gives one) is the journal key, so it goes in `message`; the fixed lead is
+  // the title.
+  const pinErrorReason = pinMut.isError ? (pinMut.error instanceof Error ? pinMut.error.message : '') : ''
 
   const rows = useMemo<SessionArtifactRow[]>(() => {
     const out: SessionArtifactRow[] = (artifactData?.artifacts || []).map(toRow)
@@ -626,6 +735,24 @@ function SessionArtifactsTab({ slot, onArtifactOpen }: { slot: string; onArtifac
   return (
     <div className="flex-1 overflow-y-auto py-1.5">
       <div className="px-3 flex flex-col">
+        {/* Read failures first: without these a failed load rendered as the
+            "nothing touched yet" hero, which is a claim the panel cannot make.
+            Side panel with no draft → hand-off on for all three. */}
+        {artifactsError && (
+          <ErrorNotice className="mb-2" message={i18nT('pages.chat.activityViewer.artifacts_load_failed')} askAgent />
+        )}
+        {libraryError && (
+          <ErrorNotice className="mb-2" message={i18nT('pages.chat.activityViewer.library_load_failed')} askAgent />
+        )}
+        {pinMut.isError && (
+          <ErrorNotice
+            className="mb-2"
+            title={pinErrorReason ? i18nT('pages.chat.activityViewer.artifact_save_failed') : undefined}
+            message={pinErrorReason || i18nT('pages.chat.activityViewer.artifact_save_failed')}
+            askAgent
+            onDismiss={() => pinMut.reset()}
+          />
+        )}
         {/* Section A — this session. When the session has touched nothing yet, a
             short hero explains what the panel collects instead of an empty heading. */}
         {rows.length > 0 ? (
@@ -667,7 +794,7 @@ function SessionArtifactsTab({ slot, onArtifactOpen }: { slot: string; onArtifac
                 onChange={e => setLibQuery(e.target.value)}
                 placeholder={i18nT('pages.chat.activityViewer.artifacts_search_library')}
                 aria-label={i18nT('pages.chat.activityViewer.artifacts_search_library')}
-                className="w-full text-[12px] pl-7 pr-2.5 py-1.5 rounded-md bg-bg border border-border text-text placeholder:text-muted focus:outline-none focus-visible:border-accent transition-colors"
+                className="w-full text-[12px] pl-7 pr-2.5 py-1.5 rounded-md bg-bg border border-border text-text placeholder:text-muted focus:outline-hidden focus-visible:border-accent transition-colors"
               />
             </div>
             {libQuery.trim() && (
@@ -770,7 +897,7 @@ export default function ActivityViewer({ subagents, toolLog, open, onToggle, slo
   chatMode?: string
   /** When set, render ONLY this view and hide the internal SegmentedControl.
    *  Used by SidePanel, which owns the top-level tab strip. */
-  view?: 'changes' | 'issues' | 'subagents' | 'logs' | 'context' | 'links' | 'artifacts' | 'side' | 'workflows' | 'git' | 'summary' | 'pins'
+  view?: 'changes' | 'issues' | 'subagents' | 'logs' | 'crewlog' | 'context' | 'links' | 'artifacts' | 'side' | 'workflows' | 'git' | 'summary' | 'pins'
 }) {
   const dispatch = useAppDispatch()
   const [, setSelected] = useState(0)
@@ -803,6 +930,9 @@ export default function ActivityViewer({ subagents, toolLog, open, onToggle, slo
   // freshly-accepted wave, which is flatly false and the single most confusing
   // state this panel had.
   const queuedCount = useAppSelector(s => s.chat.subagentQueued?.[slot] ?? 0)
+  // Why they wait, when the gateway said (memory floor, critical posture, a
+  // paused adaptive cap); undefined keeps the concurrency text below.
+  const queuedReason = useAppSelector(s => s.chat.subagentQueuedReason?.[slot])
   // Render cap: bounds DOM at 60-100 agents; exceptions are always within
   // the cap thanks to the ordering above.
   const [showAllSubagents, setShowAllSubagents] = useState(false)
@@ -826,32 +956,46 @@ export default function ActivityViewer({ subagents, toolLog, open, onToggle, slo
     [ids, subagents],
   )
   const [retryingFailed, setRetryingFailed] = useState(false)
+  // Outcome of the last batch control (retry-failed / dismiss-done) that did
+  // not fully succeed. Both used to discard their settled results, so a
+  // rejected retry or a refused delete was invisible.
+  const [batchError, setBatchError] = useState<string | null>(null)
   const retryFailed = useCallback(() => {
     setRetryingFailed(true)
-    Promise.allSettled(failedRetryableIds.map(id => api.spawnRetry(id))).finally(() => setRetryingFailed(false))
+    setBatchError(null)
+    Promise.allSettled(failedRetryableIds.map(id => api.spawnRetry(id)))
+      .then(results => {
+        const rejected = results.filter(r => r.status === 'rejected').length
+        if (rejected > 0) setBatchError(i18nT('pages.chat.activityViewer.retry_failed_error', { count: rejected }))
+      })
+      .finally(() => setRetryingFailed(false))
   }, [failedRetryableIds])
   const dismissDone = useCallback(() => {
     // Slot-scoped by construction: delete exactly this slot's terminal cards
-    // by id — the global DELETE /api/spawn clear would nuke other sessions'
-    // completed agents too (their cards would 404 on status/output).
-    for (const id of terminalIds) api.spawnDelete(id).catch(() => {})
+    // by id via DELETE /api/spawn/{id}. There is no global clear route, so a
+    // cross-session wipe is not reachable from here.
+    // The local clear stays optimistic; a refused delete is reported so the
+    // user knows the card still exists server-side.
+    setBatchError(null)
+    void Promise.allSettled(terminalIds.map(id => api.spawnDelete(id))).then(results => {
+      if (results.some(r => r.status === 'rejected')) setBatchError(i18nT('pages.chat.activityViewer.dismiss_failed'))
+    })
     dispatchRedux(clearTerminalSubagents({ slot }))
   }, [dispatchRedux, slot, terminalIds])
 
-  // Dynamic Workflow runs (M6) — dedup + caching + self-managed polling
-  const { data: wfRuns = [] } = useQuery<WfRunRow[]>({
+  // Dynamic Workflow runs (M6) — dedup + caching + self-managed polling.
+  // Through the api client, which REJECTS on a non-OK response (its doc comment
+  // states the rule: "never as 'no runs'") and carries the backend body as an
+  // ApiError — the journal context the hand-off exists to recover. The raw
+  // fetch this replaces mapped a failure to `{ runs: [] }`.
+  const { data: wfRuns = [], isError: wfRunsError } = useQuery<WfRunRow[]>({
     queryKey: ['workflow-runs'],
-    queryFn: () =>
-      fetch('/api/workflows/runs', { credentials: 'same-origin' })
-        .then(r => (r.ok ? r.json() : { runs: [] }))
-        .then(d => (Array.isArray(d?.runs) ? d.runs : [])),
+    queryFn: () => api.workflowRuns().then(d => (Array.isArray(d?.runs) ? (d.runs as WfRunRow[]) : [])),
     enabled: open,
     refetchInterval: 2500,
   })
   const wfRunsForSlot = wfRuns.filter(r => runBelongsToSlot(r.session_key, slot))
   const wfRunningCount = wfRunsForSlot.filter(r => r.status === 'running').length
-
-  const visibleLog = toolLog.filter(e => e.type !== 'reasoning')
 
   // Subagent events are subscribed eagerly at WS connect time — no need to toggle here.
 
@@ -870,7 +1014,7 @@ export default function ActivityViewer({ subagents, toolLog, open, onToggle, slo
 
   // Auto-switch to subagents tab when subagents or spawn approvals first appear
   const hadSubagents = useRef(false)
-  const hasSpawnApprovals = visibleLog.some(e => e.type === 'approval' && isSpawnApproval(e))
+  const hasSpawnApprovals = toolLog.some(e => e.type === 'approval' && isSpawnApproval(e))
   const hasSubagentActivity = hasSubagents || hasSpawnApprovals
   useEffect(() => {
     if (hasSubagentActivity && !hadSubagents.current && !explicitTab.current) setTab('subagents')
@@ -898,7 +1042,7 @@ export default function ActivityViewer({ subagents, toolLog, open, onToggle, slo
     ...(hasIssues ? [{ key: 'issues' as const, label: i18nT('pages.chat.activityViewer.issues'), icon: <CircleDot size={13} />, count: issues!.length }] : []),
     { key: 'links', label: i18nT('pages.chat.activityViewer.links'), icon: <LinkIcon size={13} />, count: navLinks?.length || 0 },
     { key: 'artifacts', label: i18nT('pages.chat.activityViewer.artifacts'), icon: <Component size={13} /> },
-    { key: 'subagents', label: i18nT('pages.chat.activityViewer.subagents'), icon: <Bot size={13} />, count: ids.length + visibleLog.filter(isSpawnApproval).length },
+    { key: 'subagents', label: i18nT('pages.chat.activityViewer.subagents'), icon: <Bot size={13} />, count: ids.length + toolLog.filter(isSpawnApproval).length },
     { key: 'workflows', label: i18nT('pages.chat.activityViewer.workflows'), icon: <Workflow size={13} />, count: wfRunningCount },
     { key: 'logs', label: i18nT('pages.chat.activityViewer.logs'), icon: <ScrollText size={13} /> },
     { key: 'side', label: i18nT('pages.chat.activityViewer.side'), icon: <MessageCircleQuestionMark size={13} /> },
@@ -915,7 +1059,7 @@ export default function ActivityViewer({ subagents, toolLog, open, onToggle, slo
         <div className="px-3 py-2 shrink-0 flex justify-center">
           <SegmentedControl
             segments={TABS}
-            value={effectiveTab === 'context' || effectiveTab === 'git' || effectiveTab === 'summary' || effectiveTab === 'pins' ? tab : effectiveTab}
+            value={effectiveTab === 'context' || effectiveTab === 'crewlog' || effectiveTab === 'git' || effectiveTab === 'summary' || effectiveTab === 'pins' ? tab : effectiveTab}
             onChange={t => { setTab(t); explicitTab.current = true; dispatch(openActivityToTab(t)) }}
             layoutId="activity-tab"
           />
@@ -1000,9 +1144,15 @@ export default function ActivityViewer({ subagents, toolLog, open, onToggle, slo
               )}
             </div>
           )}
+          {/* Batch-control outcome. Activity panel, no draft → hand-off on. */}
+          {batchError && (
+            <div className="mx-2 mb-2">
+              <ErrorNotice message={batchError} askAgent onDismiss={() => setBatchError(null)} />
+            </div>
+          )}
           {/* Pending approvals */}
-          {visibleLog.filter(isSpawnApproval).map((entry, i) => (
-            <ApprovalEntry key={`a${i}`} entry={entry} />
+          {toolLog.filter(isSpawnApproval).map((entry, i) => (
+            <ApprovalEntry key={entry.approval_id || `a${i}`} entry={entry} />
           ))}
           {/* Accepted-but-not-started banner: the only signal for a wave still
               behind the concurrency cap. Shown alongside started agents too,
@@ -1015,7 +1165,7 @@ export default function ActivityViewer({ subagents, toolLog, open, onToggle, slo
             >
               <Clock size={12} className="shrink-0" aria-hidden />
               <span>
-                {queuedCount} {i18nT('pages.chat.activityViewer.waiting_to_start_queued_behind_the_concurrency_l')}
+                {queuedCount} {queuedWaitText(queuedReason) ?? i18nT('pages.chat.activityViewer.waiting_to_start_queued_behind_the_concurrency_l')}
               </span>
             </div>
           )}
@@ -1040,7 +1190,7 @@ export default function ActivityViewer({ subagents, toolLog, open, onToggle, slo
                 </button>
               )}
             </>
-          ) : visibleLog.filter(isSpawnApproval).length === 0 && queuedCount === 0 && (
+          ) : toolLog.filter(isSpawnApproval).length === 0 && queuedCount === 0 && (
             <div className="flex flex-col items-center justify-center h-full text-muted/30 gap-2">
               <span className="text-[24px]"><Bot className="lucide-inline" /></span>
               <span className="text-[13px]">{i18nT('pages.chat.activityViewer.no_subagents_running')}</span>
@@ -1052,6 +1202,11 @@ export default function ActivityViewer({ subagents, toolLog, open, onToggle, slo
       {/* Workflows tab (M6): live dynamic-workflow runs */}
       {effectiveTab === 'workflows' && (
         <div className="flex-1 overflow-y-auto py-2 px-3 flex flex-col gap-2">
+          {/* A failed list read is not "no runs": say so above whatever the
+              cache still holds. Status panel, no draft → hand-off on. */}
+          {wfRunsError && (
+            <ErrorNotice message={i18nT('pages.chat.activityViewer.workflow_runs_load_failed')} askAgent />
+          )}
           {wfRunsForSlot.length === 0 ? (
             <div className="flex flex-col items-center justify-center h-full text-muted/30 gap-2">
               <span className="text-[24px]"><Workflow className="lucide-inline" /></span>
@@ -1092,6 +1247,12 @@ export default function ActivityViewer({ subagents, toolLog, open, onToggle, slo
           in THIS session" — Logs for the tool calls, this for the context
           that was injected around them. */}
       {effectiveTab === 'context' && <ContextBreakdownTab slot={slot} subagents={subagents} />}
+
+      {/* Crew log — the five folds over this session's append-only record. Sits
+          beside Logs and Context for the same reason they sit together: all
+          three answer "what actually happened in THIS session", this one from
+          the record the gateway wrote rather than from live client state. */}
+      {effectiveTab === 'crewlog' && <CrewLogTab key={slot} slot={slot} />}
 
       {/* Session summary — the goal-level view of this session, so returning to
           it does not mean re-reading the transcript. */}

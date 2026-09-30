@@ -2,8 +2,9 @@
  * Settings registry extractor (Search Everywhere — Settings provider).
  *
  * Parses `src/pages/settings/*.tsx` for JSX usages of settings primitives
- * (SettingsToggle, SettingsSelect, SettingsInput, SettingsStepper,
- * SettingsButtonGroup) and extracts label + description + primitive type.
+ * (SettingsToggle, SettingsSelect, SettingsMultiSelect, SettingsInput,
+ * SettingsStepper, SettingsButtonGroup) and extracts label + description +
+ * primitive type.
  *
  * A label/description is read from EITHER form:
  *   - a string literal          `label="Zoom Level"`
@@ -27,6 +28,7 @@
 import * as fs from 'fs'
 import * as path from 'path'
 import { SETTINGS_MANUAL } from '../src/components/commandPalette/settingsManual'
+import { settingsRoute } from '../src/components/commandPalette/settingsRoute'
 import type { ManualSettingEntry, SettingEntry, SettingPrimitiveType } from '../src/components/commandPalette/settingsTypes'
 
 export type { SettingEntry, SettingPrimitiveType }
@@ -80,9 +82,9 @@ export function __resetCatalogCache(): void {
 /** Panel file → tab key mapping (derived from SettingsPage.tsx switch).
  *  Only panels that actually render inside a Settings tab are mapped — the
  *  fork is KiroACP-only and de-Amazoned, so upstream's Provider / Secretary /
- *  Sync / TaskKeeper panels are absent, and SharedMcpGatewayToggle /
- *  McpPoolableServers live on the standalone Developer page (not a Settings
- *  tab), so they are intentionally excluded to avoid dead deep-links.
+ *  Sync / TaskKeeper panels are absent, and controls that live on the
+ *  standalone Developer page rather than a Settings tab (e.g. McpManagement)
+ *  are intentionally excluded to avoid dead deep-links.
  *
  *  Entries may carry `params` — extra query params the deep link needs for
  *  the panel to actually mount (the Channels tab is a list-detail view, so
@@ -111,6 +113,8 @@ export const PANEL_TAB_MAP: Record<string, PanelTarget> = {
   'ComputerUsePanel.tsx': 'computer-use',
   'InstancesPanel.tsx': 'instances',
   'SecurityPanel.tsx': 'security',
+  'ConnectionsPanel.tsx': 'connections',
+  'SecretsPanel.tsx': 'secrets',
   'NotificationsPanel.tsx': 'notifications',
   'ShortcutsPanel.tsx': 'shortcuts',
   // Added upstream (auto-skill generation) without a mapping here, so its two
@@ -145,6 +149,33 @@ export const PANEL_TAB_MAP: Record<string, PanelTarget> = {
     { tab: 'channels', params: { channel: 'wecom' }, labelSuffix: 'WeCom' },
   ],
   'DeveloperPanel.tsx': 'developer',
+  // The Feature Previews cards DeveloperPanel mounts. Indexed on purpose: the
+  // old Developer-page tab kept itself out of search so "webhooks" would not
+  // advertise a hidden page, but a control visible on a Settings pane that
+  // search cannot find is the coverage gap settingsCoverage.test.ts exists to
+  // close — and the hit reaches the labelled opt-in switch, not the page.
+  'FeaturePreviewsSection.tsx': 'developer',
+  // The Crewmates section DeveloperPanel mounts under Feature Previews: the
+  // server-side crewmate switches (reply threads today). Same tab, so a
+  // SettingRef to `dashboard.crewmate_threads` deep-links to the row.
+  'CrewmatesSection.tsx': 'developer',
+  // The Decisions (Jev) card, which FeaturePreviewsSection mounts. Its own file
+  // because it is a list and a detail rather than one row, and mapped here for the
+  // reason the section above is: a control on a Settings pane that search cannot
+  // find is the coverage gap this map exists to close.
+  //
+  // Every entry it yields is GOVERNED, unlike the rest of this map: the fleet
+  // ceiling `capabilities.decisions` can withdraw the whole card, so
+  // `settingsSearchCore.DECISIONS_SETTING_IDS` withholds these ids from a search
+  // that knows the feature is denied. A control added here without being added
+  // there would advertise a row the page does not draw — `settingsSearchGovernance`
+  // asserts the two stay in step.
+  'DecisionsCard.tsx': 'developer',
+  // The card's per-point DETAIL panel, split into its own module so the card can
+  // stay synchronous while this rides a lazy boundary. Mapped to the same tab: a
+  // control added to it belongs to the same deep link, and leaving it unmapped
+  // would mean the extractor never looks at the file at all.
+  'DecisionsPointPanel.tsx': 'developer',
   'AboutPanel.tsx': 'about',
   'SttSettings.tsx': 'voice',
   // The `instances` tab mounts RemoteCrewPanel (SettingsPage.tsx), which also
@@ -152,6 +183,10 @@ export const PANEL_TAB_MAP: Record<string, PanelTarget> = {
   // tab so a primitive added to either lands on the right deep link.
   'RemoteCrewPanel.tsx': 'instances',
 }
+
+/** Panels whose controls sit in `case '<sub>':` pages of a SettingsSubNav;
+ *  each entry gets `params.sub` from the case it is rendered under. */
+const SUBNAV_CASE_PANELS = new Set(['ChatPanel.tsx', 'DisplayPanel.tsx', 'NotificationsPanel.tsx'])
 
 /** Map component name → our type enum. */
 const PRIMITIVE_MAP: Record<string, SettingPrimitiveType> = {
@@ -161,6 +196,7 @@ const PRIMITIVE_MAP: Record<string, SettingPrimitiveType> = {
   // nothing branches on `SettingEntry.type`, so a distinct value would be surface
   // with no reader. Give it a distinct one only when something renders it apart.
   SettingsCombobox: 'select',
+  SettingsMultiSelect: 'select',
   SettingsInput: 'input',
   SettingsStepper: 'stepper',
   SettingsButtonGroup: 'buttonGroup',
@@ -173,6 +209,9 @@ const PRIMITIVE_MAP: Record<string, SettingPrimitiveType> = {
   // type values.
   SecretField: 'input',
   TagListEditor: 'input',
+  // Regex -> URL rule-pair editor (ChatPanel). Same composite contract: `label`
+  // prop, `data-setting-label` on its frame, 'input' to every registry reader.
+  LinkPatternsEditor: 'input',
 }
 
 const PRIMITIVES = Object.keys(PRIMITIVE_MAP)
@@ -335,9 +374,16 @@ export function extractFromSource(
       const labelKey = extractTranslationKeyProp(props, 'label')
       const description = extractStringProp(props, 'description')
       const configKey = extractStringProp(props, 'configKey')
+      const settingId = extractStringProp(props, 'settingId')
+      // A rail-hosting panel renders each page in a `case '<key>':` block;
+      // search must open that page or the highlight finds nothing.
+      const caseKey = SUBNAV_CASE_PANELS.has(path.basename(fileName))
+        ? [...source.slice(0, tagStartMatch.index).matchAll(/\bcase '([a-z0-9-]+)':/g)].pop()?.[1]
+        : undefined
       for (const target of targets) {
         const tab = typeof target === 'string' ? target : target.tab
-        const params = typeof target === 'string' ? undefined : target.params
+        const targetParams = typeof target === 'string' ? undefined : target.params
+        const params = caseKey ? { ...targetParams, sub: caseKey } : targetParams
         const suffix = typeof target === 'string' ? undefined : target.labelSuffix
         // Suffix only labelKey entries: highlighting resolves labelKey to the
         // rendered (un-suffixed) label, so DOM lookup still works. A literal
@@ -356,6 +402,7 @@ export function extractFromSource(
           occurrence: 1,
           ...(params ? { params } : {}),
           ...(configKey ? { configKey } : {}),
+          ...(settingId ? { settingId } : {}),
         })
       }
     }
@@ -454,6 +501,88 @@ export function mergeManualEntries(generated: SettingEntry[], manual: ManualSett
     if (!generatedIds.has(m.id)) merged.push(m)
   }
   return merged
+}
+
+/** `?highlight=` value prefix that resolves a control by its schema config key
+ *  instead of its English label — see `useSettingHighlight`. */
+const HIGHLIGHT_KEY_PREFIX = 'key:'
+
+/** Banner for the generated agent registry. JSON carries no comments, so the
+ *  "do not edit" and the pointer to the scheme doc have to be a field. */
+const AGENT_REGISTRY_COMMENT =
+  'AUTO-GENERATED from the dashboard settings panels by '
+  + 'website/scripts/gen-settings-registry.mjs — DO NOT EDIT. '
+  + 'How to use a route: settings-deeplink.md (same directory).'
+
+/**
+ * One settings control as the AGENT sees it — enough to name a control and to
+ * open it, and nothing more.
+ *
+ * `labelKey` / `labelSuffix` / `type` / `occurrence` / `params` are all
+ * deliberately absent: they exist so the FRONTEND can re-resolve a label or
+ * assemble a URL, and every one of them is a way for a reader that is not the
+ * dashboard to build a subtly wrong link. The prebuilt `route` is what replaces
+ * them.
+ */
+export interface AgentSettingEntry {
+  /** Registry id, `<tab>.<kebab-label>` — the identity used in `?highlight=`. */
+  id: string
+  /** English label as the panel renders it. */
+  label: string
+  /** Settings tab key, for naming the destination in prose ("Display → …"). */
+  tab: string
+  /** Prebuilt in-app link `/settings/<tab>[/<sub>]?…&highlight=…`, usable verbatim. */
+  route: string
+  /** In-panel help text, when the control has any. */
+  description?: string
+  /** Schema key this control writes, when it maps to exactly one. */
+  configKey?: string
+}
+
+/**
+ * Project the UI registry onto the agent-facing subset, with a prebuilt route.
+ *
+ * The route is built by `settingsRoute`, the same adapter the command palette
+ * uses, rather than assembled here from `tab` + `id`: a third of the entries
+ * carry `params` whose second-level key must become a PATH SEGMENT, and a
+ * reader that concatenated `/settings/<tab>?highlight=<id>` would land on a tab
+ * with no pane selected and no control to flash. Shipping the finished link
+ * means the agent never assembles one.
+ *
+ * `key:<configKey>` wins over the id form wherever a config key exists: the id
+ * form resolves this registry's ENGLISH label against the rendered DOM, so it
+ * cannot match a translated dashboard, while the `key:` form is a direct
+ * `data-setting-key` lookup. Same rule `test_tips.py` enforces for the curated
+ * tips' anchors.
+ */
+export function buildAgentRegistry(entries: SettingEntry[]): AgentSettingEntry[] {
+  return entries.map(entry => ({
+    id: entry.id,
+    label: entry.label,
+    tab: entry.tab,
+    // The highlight source is the ONLY thing overridden — path segments and the
+    // remaining query params stay `settingsRoute`'s business, so the two link
+    // forms cannot drift on where a sub-selection lives.
+    route: settingsRoute(
+      entry.configKey ? { ...entry, id: `${HIGHLIGHT_KEY_PREFIX}${entry.configKey}` } : entry,
+    ),
+    ...(entry.description ? { description: entry.description } : {}),
+    ...(entry.configKey ? { configKey: entry.configKey } : {}),
+  }))
+}
+
+/**
+ * Serialize the agent-facing registry bundled into the Python docs package
+ * (`src/kiro_crew/docs/settings-registry.generated.json`).
+ *
+ * Emitted from the SAME extraction pass as `settingsRegistry.gen.ts` so the
+ * agent's enumeration cannot describe a different set of controls than the
+ * dashboard renders; the vitest guard byte-matches this output against the
+ * committed file.
+ */
+export function generateAgentRegistryJson(entries: SettingEntry[]): string {
+  const payload = { $comment: AGENT_REGISTRY_COMMENT, settings: buildAgentRegistry(entries) }
+  return `${JSON.stringify(payload, null, 2)}\n`
 }
 
 /**

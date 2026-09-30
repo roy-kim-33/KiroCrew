@@ -584,6 +584,18 @@ async def api_computer_use_config_save(request: web.Request) -> web.Response:
             {"error": "dashboard user required", "code": "dashboard_user_required"},
             status=403,
         )
+    # After the app-token refusal above, so an app token keeps its own
+    # ``dashboard_user_required`` answer: the keystone is the owner's switch,
+    # and a dashboard user who is not the owner may not flip it either.
+    # Body-scope import, like the sibling gates in this package
+    # (``connections.py``, ``mcp_apps.py``, ``files.py``): ``source_providers``
+    # reaches back into sibling handler modules, so importing the helper at
+    # module scope from here would close a cycle.
+    from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+
+    owner_denied = await require_owner_dashboard_request(request, "computer_use.config_save")
+    if owner_denied is not None:
+        return owner_denied
 
     try:
         body = await request.json()
@@ -761,10 +773,9 @@ async def api_computer_use_config_save(request: web.Request) -> web.Response:
         # (``agent._computer_use_spec_gate``): while it is off the server is not in
         # ``mcpServers`` at all, so no backend is spawned. A reset alone would
         # therefore restart every session into the SAME spec that omits the server
-        # — the tools would not appear until the next gateway start, which is a
-        # regression in the one path that has to work. Rebuilding here keeps the
-        # user-visible contract ("enable, sessions restart, tools are there")
-        # exactly as it was.
+        # — the tools would not appear until the next gateway start. Rebuilding
+        # here holds the user-visible contract: enable, sessions restart, tools
+        # are there.
         #
         # UNDER THE CONFIG LOCK, reacquired: the rebuild READS the keystone and
         # WRITES the spec, so leaving it outside would let two overlapping PUTs
@@ -777,8 +788,8 @@ async def api_computer_use_config_save(request: web.Request) -> web.Response:
         # so this cannot self-deadlock.
         #
         # A rebuild failure must not fail the SAVE: the write already landed and
-        # was audited. The fallback is the pre-existing behaviour — the tool
-        # surface appears on the next gateway start.
+        # was audited. The fallback is the un-rebuilt spec — the tool surface
+        # appears on the next gateway start.
         #
         # The import is function-local and must STAY function-local, which is not
         # a style choice: it makes the name resolve at CALL time, so
@@ -801,8 +812,8 @@ async def api_computer_use_config_save(request: web.Request) -> web.Response:
             sessions_reset = await _reset_all_sessions(request)
         except Exception:
             # The write already landed and was audited; a restart failure must not
-            # report the SAVE as failed. Worst case is the pre-existing behaviour:
-            # the new tool surface appears on the next cold session.
+            # report the SAVE as failed. Worst case: the new tool surface appears
+            # on the next cold session.
             logger.exception("computer-use enable saved, but session reset failed")
 
     payload = await _full_payload()
@@ -853,11 +864,16 @@ async def api_computer_use_invoke(request: web.Request) -> web.Response:
     shim) still get 4xx.
 
     The identity fields are not an authorization claim this handler trusts: the
-    ``session_key`` is resolved STRICTLY on the shim side (``KIROCREW_SESSION_KEY``,
-    else ``KIROCREW_HOST_PID`` + the HMAC sidecar), which refuses an unresolvable
-    key before it reaches the wire. Passing them in the body is how the gateway
-    learns which surface is calling — it is the AUDIT identity, not a permit; the
-    trust comes from the local-secret handshake plus that strict resolution.
+    ``session_key`` is resolved STRICTLY on the shim side (the gateway-injected
+    caller block, else ``KIROCREW_SESSION_KEY``, else ``KIROCREW_HOST_PID`` + the
+    HMAC sidecar). An unresolvable key is NOT refused there: the shim substitutes
+    its ``unresolved:<pid>[#<nonce>]`` placeholder in the body and sends no
+    ``X-Session-Key`` header at all, so the middleware's kernel peer check has no
+    claim to verify and the call proceeds unnamed (``mcp_computer._declares_identity``).
+    Passing them in the body is how the gateway learns which surface is calling; it
+    is the AUDIT identity and the ``SnapshotIndex`` namespace, not a permit. The
+    trust comes from the local-secret handshake plus the peer check on any key
+    that IS declared.
 
     ``approval_recorded`` is passed as ``False`` and does not change any outcome:
     nothing reads it. It is not minted from the request body, because a body field

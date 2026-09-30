@@ -82,7 +82,8 @@ describe('side panel + menu (shadcn dropdown)', () => {
     for (const label of ['Pins', 'Issues', 'Subagents', 'Workflows', 'Side Chat', 'Browser']) {
       expect(screen.getByRole('menuitem', { name: label })).toBeTruthy()
     }
-    // Pinned views are auto-managed and must never be offered here.
+    // The permanently pinned views are always in the strip already, so they must
+    // never be offered here.
     expect(screen.queryByRole('menuitem', { name: 'Files' })).toBeNull()
     // Diagnostics are behind Developer Mode, which this harness has off.
     expect(screen.queryByRole('menuitem', { name: 'Logs' })).toBeNull()
@@ -145,7 +146,7 @@ describe('newMenuSections', () => {
     // Only that row goes — its group still carries the rest, so the group is not
     // dropped and nothing else is collateral.
     expect(kinds({ devMode: true, terminalEnabled: true, summaryEnabled: false })[0])
-      .toEqual(['pins', 'issues', 'links', 'subagents', 'workflows', 'git'])
+      .toEqual(['command-center', 'pins', 'issues', 'links', 'subagents', 'workflows', 'git'])
   })
 
   it('keeps each group id fixed however the gates fall', () => {
@@ -180,9 +181,9 @@ describe('newMenuSections', () => {
 
   it('groups by session output, workspaces, then diagnostics', () => {
     expect(kinds({ devMode: true, terminalEnabled: true })).toEqual([
-      ['summary', 'pins', 'issues', 'links', 'subagents', 'workflows', 'git'],
-      ['side', 'browser'],
-      ['logs', 'context'],
+      ['command-center', 'summary', 'pins', 'issues', 'links', 'subagents', 'workflows', 'git'],
+      ['side', 'browser', 'terminal'],
+      ['logs', 'context', 'crewlog'],
     ])
   })
 
@@ -197,15 +198,16 @@ describe('newMenuSections', () => {
         }
       }
     }
-    // Both gates closed: diagnostics gone outright — two groups, not three with a hole.
+    // Both gates closed: diagnostics gone outright, Terminal dropped from
+    // Workspaces — two groups, not three with a hole.
     expect(kinds({ devMode: false, terminalEnabled: false })).toEqual([
-      ['summary', 'pins', 'issues', 'links', 'subagents', 'workflows', 'git'],
+      ['command-center', 'summary', 'pins', 'issues', 'links', 'subagents', 'workflows', 'git'],
       ['side', 'browser'],
     ])
-    // Terminal enabled doesn't change menu (terminal moved to app-wide panel).
+    // Terminal back, diagnostics still gated.
     expect(kinds({ devMode: false, terminalEnabled: true })).toEqual([
-      ['summary', 'pins', 'issues', 'links', 'subagents', 'workflows', 'git'],
-      ['side', 'browser'],
+      ['command-center', 'summary', 'pins', 'issues', 'links', 'subagents', 'workflows', 'git'],
+      ['side', 'browser', 'terminal'],
     ])
   })
 })

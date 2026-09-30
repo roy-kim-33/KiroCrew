@@ -27,13 +27,16 @@ from unittest.mock import MagicMock
 
 import pytest
 from aiohttp import web
+from aiohttp.client_exceptions import ClientConnectionResetError
 from aiohttp.test_utils import TestClient, TestServer, make_mocked_request
+from dashboard_owner_helpers import as_owner
 
 import kiro_crew.apps.routes as routes_mod
 from conftest import requires_symlinks
 from kiro_crew.apps.manager import (
     APP_MANIFEST_FILENAME,
     AppResult,
+    disable_app,
     enable_app,
     install_app,
     register_external_app,
@@ -98,25 +101,36 @@ def _setup_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return home
 
 
-def _make_app(*, app_identity: str | None = None) -> web.Application:
+def _make_app(
+    *, app_identity: str | None = None, dashboard_user: str | None = None
+) -> web.Application:
     """An aiohttp app with the routes registered.
 
     ``app_identity`` stands in for ``token_auth_middleware`` having
     authenticated an APP token, which is what the proxy's cross-app guard
-    reads off ``request["app"]``.
+    reads off ``request["app"]``. ``dashboard_user`` stands in for the same
+    middleware having authenticated a DASHBOARD subject (``request["user"]``
+    with an empty ``request["app"]``); the owner gate then compares it to
+    ``state.owner_id``, which the test state pins to ``"owner"``.
     """
     middlewares = []
-    if app_identity is not None:
+    if app_identity is not None or dashboard_user is not None:
 
         @web.middleware
         async def _identity(
             request: web.Request, handler: Any
         ) -> web.StreamResponse:
-            request["app"] = app_identity
+            request["app"] = app_identity if app_identity is not None else ""
+            if dashboard_user is not None:
+                request["user"] = dashboard_user
             return await handler(request)
 
         middlewares.append(_identity)
     app = web.Application(middlewares=middlewares)
+    if dashboard_user is not None:
+        app["state"] = SimpleNamespace(
+            owner_id="owner", broadcast_ws=lambda *a, **k: None
+        )
     register_app_routes(app)
     return app
 
@@ -513,10 +527,10 @@ async def test_get_app_keeps_genuinely_local_app_repositoryless(
 async def test_list_apps_reports_a_tracked_but_exited_backend_as_not_running(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A record outliving its process must not be reported as running (#5726).
+    """A record outliving its process must not be reported as running.
 
-    The handler used to hardcode ``running: True`` for anything present in the process
-    table, so a backend that exited was reported as up until something popped its entry.
+    The handler must not hardcode ``running: True`` for anything present in the process
+    table: a backend that has exited would be reported as up until something popped it.
     """
     _setup_env(tmp_path, monkeypatch)
     _install(tmp_path)
@@ -572,7 +586,7 @@ class TestInstallValidation:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         _setup_env(tmp_path, monkeypatch)
-        async with TestClient(TestServer(_make_app())) as client:
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
             resp = await client.post(
                 "/api/apps/install",
                 data="not-json",
@@ -587,11 +601,44 @@ class TestInstallValidation:
     ) -> None:
         home = _setup_env(tmp_path, monkeypatch)
         src = _make_app_source(tmp_path, minKiroCrewVersion="999.0.0")
-        async with TestClient(TestServer(_make_app())) as client:
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
             resp = await client.post("/api/apps/install", json={"source": str(src)})
             assert resp.status == 400
             assert "999.0.0" in (await resp.json())["error"]
         assert not (home / "apps" / APP).exists()
+
+    @pytest.mark.asyncio
+    async def test_local_install_declaring_session_approval_does_not_start(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Same gate as the registry paths: a fresh local install whose manifest
+        # declares the grant is consent-pending, so nothing is registered and no
+        # backend starts until the user enables it from the disclosure surface.
+        _setup_env(tmp_path, monkeypatch)
+        src = _make_app_source(tmp_path, permissions={"sessionApproval": True})
+        started: list[str] = []
+        registered: list[str] = []
+
+        async def _register(name: str):
+            registered.append(name)
+            return routes_mod.RegistrationResult()
+
+        async def _start(name: str) -> None:
+            started.append(name)
+
+        monkeypatch.setattr(routes_mod, "_register_app_off_loop", _register)
+        monkeypatch.setattr(routes_mod, "_start_backend_after_install", _start)
+        monkeypatch.setattr(routes_mod, "stop_app_backend", lambda n: None)
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
+            resp = await client.post("/api/apps/install", json={"source": str(src)})
+            assert resp.status == 201
+            body = await resp.json()
+        assert body["notice"] == "session_approval_reconsent"
+        assert started == []
+        assert registered == []
+        info = routes_mod.get_app(APP)
+        assert info["enabled"] is False
+        assert info["sessionApprovalConsentPending"] is True
 
     @pytest.mark.asyncio
     async def test_unreadable_manifest_refuses_without_ownership_identity(
@@ -606,7 +653,7 @@ class TestInstallValidation:
             raise AssertionError("install must not proceed without a stable app identity")
 
         monkeypatch.setattr(routes_mod, "install_app", _must_not_install)
-        async with TestClient(TestServer(_make_app())) as client:
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
             resp = await client.post("/api/apps/install", json={"source": str(src)})
             assert resp.status == 409
             body = await resp.json()
@@ -631,7 +678,7 @@ class TestInstallValidation:
             return real_install(source, expected_name=expected_name)
 
         monkeypatch.setattr(routes_mod, "install_app", _change_identity_then_install)
-        async with TestClient(TestServer(_make_app())) as client:
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
             resp = await client.post("/api/apps/install", json={"source": str(src)})
             assert resp.status == 400
             body = await resp.json()
@@ -644,7 +691,7 @@ class TestInstallValidation:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         _setup_env(tmp_path, monkeypatch)
-        async with TestClient(TestServer(_make_app())) as client:
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
             resp = await client.post(
                 "/api/apps/install", json={"source": str(tmp_path / "nope")}
             )
@@ -672,7 +719,7 @@ class TestInstallValidation:
 
         monkeypatch.setattr(routes_mod, "install_app", _must_not_install)
 
-        async with TestClient(TestServer(_make_app())) as client:
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
             resp = await client.post(
                 "/api/apps/install", json={"source": str(source)}
             )
@@ -694,7 +741,7 @@ class TestRegisterExternal:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         _setup_env(tmp_path, monkeypatch)
-        async with TestClient(TestServer(_make_app())) as client:
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
             resp = await client.post(
                 "/api/apps/register",
                 data="{",
@@ -718,7 +765,7 @@ class TestRegisterExternal:
         body: dict[str, str],
     ) -> None:
         _setup_env(tmp_path, monkeypatch)
-        async with TestClient(TestServer(_make_app())) as client:
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
             resp = await client.post("/api/apps/register", json=body)
             assert resp.status == 400
             assert "required" in (await resp.json())["error"]
@@ -728,7 +775,7 @@ class TestRegisterExternal:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         _setup_env(tmp_path, monkeypatch)
-        async with TestClient(TestServer(_make_app())) as client:
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
             resp = await client.post(
                 "/api/apps/register",
                 json={
@@ -751,7 +798,7 @@ class TestRegisterExternal:
         from kiro_crew.apps.manager import _read_installed
 
         _setup_env(tmp_path, monkeypatch)
-        async with TestClient(TestServer(_make_app())) as client:
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
             response = await client.post(
                 "/api/apps/register",
                 json={
@@ -777,7 +824,7 @@ class TestRegisterExternal:
         from kiro_crew.apps.manager import _builtin_owns_install, _read_installed
 
         _setup_env(tmp_path, monkeypatch)
-        async with TestClient(TestServer(_make_app())) as client:
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
             first = await client.post(
                 "/api/apps/register",
                 json={
@@ -820,7 +867,7 @@ class TestRegisterExternal:
         )
         safe_source = "https://clone.example.test/owner/ext-app.git"
 
-        async with TestClient(TestServer(_make_app())) as client:
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
             registered = await client.post(
                 "/api/apps/register",
                 json={
@@ -896,7 +943,7 @@ class TestRegisterExternal:
         from kiro_crew.apps.manager import INSTALLED_META_FILENAME, app_dir
 
         _setup_env(tmp_path, monkeypatch)
-        async with TestClient(TestServer(_make_app())) as client:
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
             registered = await client.post(
                 "/api/apps/register",
                 json={
@@ -974,7 +1021,7 @@ class TestRegisterExternal:
             )
             _invalidate_config_cache()
 
-        async with TestClient(TestServer(_make_app())) as client:
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
             response = await client.post(
                 "/api/apps/register",
                 json={
@@ -1037,7 +1084,7 @@ class TestRegisterExternal:
                 request_entered.set()
             return await handler(request)
 
-        app = web.Application(middlewares=[_mark_request])
+        app = as_owner(web.Application(middlewares=[_mark_request]))
         register_app_routes(app)
         repository = "https://clone.example.test/owner/ext-app.git"
 
@@ -1098,7 +1145,7 @@ class TestRegisterExternal:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         _setup_env(tmp_path, monkeypatch)
-        async with TestClient(TestServer(_make_app())) as client:
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
             resp = await client.post(
                 "/api/apps/register",
                 json={
@@ -1122,7 +1169,7 @@ class TestUpdateApp:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         _setup_env(tmp_path, monkeypatch)
-        async with TestClient(TestServer(_make_app())) as client:
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
             resp = await client.post("/api/apps/ghost/update")
             assert resp.status == 404
 
@@ -1134,7 +1181,7 @@ class TestUpdateApp:
         register_external_app(
             "ext-app", "1.0.0", "External App", lifecycle="app", resources="app"
         )
-        async with TestClient(TestServer(_make_app())) as client:
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
             resp = await client.post("/api/apps/ext-app/update")
             assert resp.status == 400
             assert "lifecycle='app'" in (await resp.json())["error"]
@@ -1147,7 +1194,7 @@ class TestUpdateApp:
         register_external_app(
             "ext-app", "1.0.0", "External App", lifecycle="gateway", resources="app"
         )
-        async with TestClient(TestServer(_make_app())) as client:
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
             # Body is not JSON at all, so the source also cannot come from there.
             resp = await client.post(
                 "/api/apps/ext-app/update",
@@ -1180,7 +1227,7 @@ class TestUpdateApp:
 
         monkeypatch.setattr(routes_mod, "update_app", _must_not_update)
 
-        async with TestClient(TestServer(_make_app())) as client:
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
             resp = await client.post(f"/api/apps/{APP}/update", json={})
             assert resp.status == 409
             body = await resp.json()
@@ -1189,36 +1236,192 @@ class TestUpdateApp:
         assert calls == [(APP, True)]
 
     @pytest.mark.asyncio
-    async def test_registry_update_delegates_admission_and_keeps_resources(
+    async def test_registry_update_stops_the_backend_before_replacing_files(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # For an installed app ``install_from_registry`` reaches ``update_app``,
+        # which replaces the live tree. On Windows that is a
+        # sharing violation while the backend still holds a file open under it,
+        # so the backend must be stopped (and its resources scrubbed) BEFORE the
+        # install runs -- the same order the local-source branch already uses.
         _setup_env(tmp_path, monkeypatch)
         _install(tmp_path)
-        deregistered: list[str] = []
+        enable_app(APP)
+        calls: list[str] = []
 
-        async def _must_not_preflight(*args: Any, **kwargs: Any) -> bool:
-            raise AssertionError("registry admission belongs to install_from_registry")
+        async def _ok_install(name: str, **kwargs: Any) -> dict[str, Any]:
+            calls.append("install")
+            return {"ok": True, "name": name}
 
+        monkeypatch.setattr(routes_mod, "is_registry_source", lambda s: True)
+        monkeypatch.setattr(routes_mod, "registry_name_from_source", lambda s: APP)
+        monkeypatch.setattr(routes_mod, "install_from_registry", _ok_install)
         monkeypatch.setattr(
-            routes_mod, "stop_retained_startup_hooks", _must_not_preflight
+            routes_mod, "deregister_app", lambda n: calls.append("deregister")
+        )
+        monkeypatch.setattr(
+            routes_mod, "stop_app_backend", lambda n: calls.append("stop")
+        )
+        monkeypatch.setattr(
+            routes_mod, "start_app_backend", lambda n: calls.append("start")
         )
 
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
+            resp = await client.post(f"/api/apps/{APP}/update", json={})
+            assert resp.status == 200
+        assert calls == ["stop", "deregister", "install", "start"], calls
+
+    @pytest.mark.asyncio
+    async def test_registry_update_failure_restores_an_enabled_app(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The backend is down when the install fails, so the route must bring the
+        # app back itself: re-register the old resources and restart the backend.
+        _setup_env(tmp_path, monkeypatch)
+        _install(tmp_path)
+        enable_app(APP)
+        calls: list[str] = []
+
         async def _failed_install(name: str, **kwargs: Any) -> dict[str, Any]:
+            calls.append("install")
             return {"ok": False, "name": name, "error": "clone failed"}
 
         monkeypatch.setattr(routes_mod, "is_registry_source", lambda s: True)
         monkeypatch.setattr(routes_mod, "registry_name_from_source", lambda s: APP)
         monkeypatch.setattr(routes_mod, "install_from_registry", _failed_install)
         monkeypatch.setattr(
-            routes_mod, "deregister_app", lambda n: deregistered.append(n)
+            routes_mod, "deregister_app", lambda n: calls.append("deregister")
+        )
+        monkeypatch.setattr(
+            routes_mod, "register_app", lambda n: calls.append("register")
+        )
+        monkeypatch.setattr(
+            routes_mod, "stop_app_backend", lambda n: calls.append("stop")
+        )
+        monkeypatch.setattr(
+            routes_mod, "start_app_backend", lambda n: calls.append("start")
         )
 
-        async with TestClient(TestServer(_make_app())) as client:
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
             resp = await client.post(f"/api/apps/{APP}/update", json={})
             assert resp.status == 400
             assert (await resp.json())["error"] == "clone failed"
-        # Nothing was torn down, so the app is still usable.
-        assert deregistered == []
+        assert calls == ["stop", "deregister", "install", "register", "start"], calls
+
+    @pytest.mark.asyncio
+    async def test_registry_update_failure_leaves_a_disabled_app_stopped(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Recovery restores what was there. A disabled app had no registered
+        # resources and no backend, and ``register_app`` does not consult
+        # ``enabled``, so re-registering here would publish its agents, skills,
+        # MCP servers and crons with the app still shown as disabled.
+        _setup_env(tmp_path, monkeypatch)
+        _install(tmp_path)
+        disable_app(APP)
+        calls: list[str] = []
+
+        async def _failed_install(name: str, **kwargs: Any) -> dict[str, Any]:
+            calls.append("install")
+            return {"ok": False, "name": name, "error": "clone failed"}
+
+        monkeypatch.setattr(routes_mod, "is_registry_source", lambda s: True)
+        monkeypatch.setattr(routes_mod, "registry_name_from_source", lambda s: APP)
+        monkeypatch.setattr(routes_mod, "install_from_registry", _failed_install)
+        monkeypatch.setattr(
+            routes_mod, "deregister_app", lambda n: calls.append("deregister")
+        )
+        monkeypatch.setattr(
+            routes_mod, "register_app", lambda n: calls.append("register")
+        )
+        monkeypatch.setattr(
+            routes_mod, "stop_app_backend", lambda n: calls.append("stop")
+        )
+        monkeypatch.setattr(
+            routes_mod, "start_app_backend", lambda n: calls.append("start")
+        )
+
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
+            resp = await client.post(f"/api/apps/{APP}/update", json={})
+            assert resp.status == 400
+        assert calls == ["stop", "deregister", "install"], calls
+
+    @pytest.mark.asyncio
+    async def test_local_update_failure_leaves_a_disabled_app_unregistered(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Same recovery rule on the local-source path: nothing is published for
+        # an app the user has disabled.
+        _setup_env(tmp_path, monkeypatch)
+        _install(tmp_path)
+        disable_app(APP)
+        calls: list[str] = []
+
+        monkeypatch.setattr(
+            routes_mod,
+            "update_app",
+            lambda source, expected_name=None: AppResult(
+                ok=False, name=APP, error="source manifest mismatch"
+            ),
+        )
+        monkeypatch.setattr(
+            routes_mod, "deregister_app", lambda n: calls.append("deregister")
+        )
+        monkeypatch.setattr(
+            routes_mod, "register_app", lambda n: calls.append("register")
+        )
+        monkeypatch.setattr(
+            routes_mod, "stop_app_backend", lambda n: calls.append("stop")
+        )
+        monkeypatch.setattr(
+            routes_mod, "start_app_backend", lambda n: calls.append("start")
+        )
+
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
+            resp = await client.post(f"/api/apps/{APP}/update", json={})
+            assert resp.status == 400
+        assert calls == ["stop", "deregister"], calls
+
+    @pytest.mark.asyncio
+    async def test_registry_update_refuses_before_stopping_while_startup_hook_runs(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The stop runs before ``install_from_registry``, so the route needs its
+        # own bounded preflight ahead of it: a retryable refusal must leave app
+        # state untouched (no stop, no scrub, no install), as on the local path.
+        _setup_env(tmp_path, monkeypatch)
+        _install(tmp_path)
+        enable_app(APP)
+        calls: list[str] = []
+
+        async def _stop_retained(app_name: str, *, bounded: bool) -> bool:
+            calls.append(f"preflight:{bounded}")
+            return False
+
+        monkeypatch.setattr(
+            routes_mod, "stop_retained_startup_hooks", _stop_retained
+        )
+
+        async def _must_not_install(name: str, **kwargs: Any) -> dict[str, Any]:
+            raise AssertionError("files must not be replaced while old code runs")
+
+        monkeypatch.setattr(routes_mod, "is_registry_source", lambda s: True)
+        monkeypatch.setattr(routes_mod, "registry_name_from_source", lambda s: APP)
+        monkeypatch.setattr(routes_mod, "install_from_registry", _must_not_install)
+        monkeypatch.setattr(
+            routes_mod, "deregister_app", lambda n: calls.append("deregister")
+        )
+        monkeypatch.setattr(
+            routes_mod, "stop_app_backend", lambda n: calls.append("stop")
+        )
+
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
+            resp = await client.post(f"/api/apps/{APP}/update", json={})
+            assert resp.status == 409
+            body = await resp.json()
+        assert body["code"] == "startup_hook_still_running"
+        assert body["retryable"] is True
+        assert calls == ["preflight:True"], calls
 
     @pytest.mark.asyncio
     async def test_registry_update_success_reregisters(
@@ -1245,17 +1448,59 @@ class TestUpdateApp:
             routes_mod, "start_app_backend", lambda n: calls.append("start")
         )
 
-        async with TestClient(TestServer(_make_app())) as client:
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
             resp = await client.post(f"/api/apps/{APP}/update", json={})
             assert resp.status == 200
             data = await resp.json()
         assert data["ok"] is True
         assert "registration" in data
-        # Old resources are only swapped out AFTER the re-install succeeded — and the
-        # backend is stopped BEFORE they are scrubbed, so the health watch has lost its
-        # tracking record and cannot re-register the old manifest's MCP servers in
-        # between (see app-kit-platform §17).
+        # The backend is stopped BEFORE its resources are scrubbed, so the health
+        # watch has lost its tracking record and cannot re-register the old
+        # manifest's MCP servers in between (see app-kit-platform §17); both run
+        # before the re-install replaces the files.
         assert calls == ["stop", "deregister", "start"]
+
+    @pytest.mark.asyncio
+    async def test_registry_update_that_widens_session_approval_does_not_restart(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # ``update_app`` drops ``enabled`` when the new version newly asks for
+        # session control. The route must read THAT state, not its pre-update
+        # snapshot, or it registers resources and starts a backend for an app the
+        # user has not re-consented to.
+        _setup_env(tmp_path, monkeypatch)
+        _install(tmp_path)
+        enable_app(APP)
+        calls: list[str] = []
+
+        async def _reconsent_install(name: str, **kwargs: Any) -> dict[str, Any]:
+            disable_app(name)  # what update_app does on a widened grant
+            return {"ok": True, "name": name, "notice": "session_approval_reconsent"}
+
+        monkeypatch.setattr(routes_mod, "is_registry_source", lambda s: True)
+        monkeypatch.setattr(routes_mod, "registry_name_from_source", lambda s: APP)
+        monkeypatch.setattr(routes_mod, "install_from_registry", _reconsent_install)
+        monkeypatch.setattr(
+            routes_mod, "deregister_app", lambda n: calls.append("deregister")
+        )
+        monkeypatch.setattr(
+            routes_mod, "register_app", lambda n: calls.append("register")
+        )
+        monkeypatch.setattr(
+            routes_mod, "stop_app_backend", lambda n: calls.append("stop")
+        )
+        monkeypatch.setattr(
+            routes_mod, "start_app_backend", lambda n: calls.append("start")
+        )
+
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
+            resp = await client.post(f"/api/apps/{APP}/update", json={})
+            assert resp.status == 200
+            data = await resp.json()
+        assert data["ok"] is True
+        assert data["notice"] == "session_approval_reconsent"
+        assert "registration" not in data
+        assert calls == ["stop", "deregister"]
 
     @pytest.mark.asyncio
     async def test_local_update_failure_restores_registration(
@@ -1285,7 +1530,7 @@ class TestUpdateApp:
 
         monkeypatch.setattr(routes_mod, "register_app", _register)
 
-        async with TestClient(TestServer(_make_app())) as client:
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
             resp = await client.post(f"/api/apps/{APP}/update", json={})
             assert resp.status == 400
             assert (await resp.json())["error"] == "source manifest mismatch"
@@ -1310,7 +1555,7 @@ class TestUpdateApp:
         monkeypatch.setattr(routes_mod, "stop_app_backend", lambda n: None)
         monkeypatch.setattr(routes_mod, "start_app_backend", lambda n: None)
 
-        async with TestClient(TestServer(_make_app())) as client:
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
             resp = await client.post(f"/api/apps/{APP}/update", json={})
             assert resp.status == 200
             data = await resp.json()
@@ -1364,6 +1609,7 @@ class TestUpdateApp:
         # repository boundary itself.
         token = generate_token(APP, ttl_seconds=300, app=APP)
         app = web.Application(middlewares=[token_auth_middleware()])
+        app["state"] = SimpleNamespace(owner_id="owner")
         register_app_routes(app)
         async with TestClient(TestServer(app)) as client:
             resp = await client.post(
@@ -1371,10 +1617,10 @@ class TestUpdateApp:
                 params={"token": token},
                 json={"source": str(attacker_source)},
             )
-            assert resp.status == 400
+            assert resp.status == 403
             body = await resp.json()
 
-        assert body["code"] == "app_trust_repository_mismatch"
+        assert body["code"] == "owner_only"
         installed = get_app(APP)
         assert installed is not None
         assert installed["version"] == "1.0.0"
@@ -1388,25 +1634,19 @@ class TestUpdateApp:
 
 
 class TestUninstallPreview:
-    """``handle_uninstall_preview`` is not on the router (no
-    ``add_get('/api/apps/{name}/uninstall/preview')`` in
-    ``register_app_routes``), so it is exercised as a handler with a mocked
-    request rather than over HTTP.
+    """``GET /api/apps/{name}/uninstall/preview`` driven over the router.
+
+    The requests go through a real aiohttp test client against an app built
+    by ``register_app_routes``, so every assertion here depends on the route
+    registration itself: removing the ``add_get`` turns each of these into a
+    404 failure.
     """
 
     @staticmethod
     async def _preview(name: str) -> tuple[int, dict[str, Any]]:
-        request = make_mocked_request(
-            "GET",
-            f"/api/apps/{name}/uninstall/preview",
-            match_info={"name": name},
-            app=web.Application(),
-        )
-        resp = await routes_mod.handle_uninstall_preview(request)
-        # Response.body is `bytes | Payload | None`; only the bytes case is
-        # JSON-decodable, so narrow explicitly rather than feeding mypy a union.
-        raw = resp.body if isinstance(resp.body, bytes) else b"{}"
-        return resp.status, json.loads(raw or b"{}")
+        async with TestClient(TestServer(_make_app())) as client:
+            resp = await client.get(f"/api/apps/{name}/uninstall/preview")
+            return resp.status, await resp.json()
 
     @pytest.mark.asyncio
     async def test_not_installed(
@@ -1458,6 +1698,20 @@ class TestUninstallPreview:
         }
         assert "dependencies" in data
 
+    @pytest.mark.asyncio
+    async def test_app_tokens_are_refused(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An app token reaches its own ``/api/apps/{name}/**`` namespace via
+        ``_app_owns_path``, but the preview discloses sibling app names in the
+        shared-dependency classification -- so app-identity requests get 403,
+        even for the app's own preview."""
+        _setup_env(tmp_path, monkeypatch)
+        _install(tmp_path)
+        async with TestClient(TestServer(_make_app(app_identity=APP))) as client:
+            resp = await client.get(f"/api/apps/{APP}/uninstall/preview")
+            assert resp.status == 403
+
 
 class TestUninstallRefusals:
     @pytest.mark.asyncio
@@ -1465,7 +1719,7 @@ class TestUninstallRefusals:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         _setup_env(tmp_path, monkeypatch)
-        async with TestClient(TestServer(_make_app())) as client:
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
             resp = await client.post("/api/apps/ghost/uninstall")
             assert resp.status == 404
 
@@ -1477,7 +1731,7 @@ class TestUninstallRefusals:
         register_external_app(
             "locked-app", "1.0.0", "Locked App", lifecycle="locked", resources="app"
         )
-        async with TestClient(TestServer(_make_app())) as client:
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
             resp = await client.post("/api/apps/locked-app/uninstall")
             assert resp.status == 400
             assert "lifecycle=locked" in (await resp.json())["error"]
@@ -1505,7 +1759,7 @@ class TestUninstallRefusals:
 
         monkeypatch.setattr(routes_mod, "uninstall_app", _must_not_uninstall)
 
-        async with TestClient(TestServer(_make_app())) as client:
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
             resp = await client.post(f"/api/apps/{APP}/uninstall", json={})
             assert resp.status == 409
             body = await resp.json()
@@ -1533,7 +1787,7 @@ class TestUninstallRefusals:
         monkeypatch.setattr(routes_mod, "clean_dependencies", _clean)
         monkeypatch.setattr(routes_mod, "canonical_dep_key", lambda k: k)
 
-        async with TestClient(TestServer(_make_app())) as client:
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
             resp = await client.post(
                 f"/api/apps/{APP}/uninstall",
                 json={"keep_specific": ["python:keepme", "", 7]},
@@ -1559,7 +1813,7 @@ class TestUninstallRefusals:
         monkeypatch.setattr(
             routes_mod, "classify_and_clean_for_uninstall", _classify
         )
-        async with TestClient(TestServer(_make_app())) as client:
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
             resp = await client.post(
                 f"/api/apps/{APP}/uninstall", json={"keep_dependencies": True}
             )
@@ -1590,7 +1844,7 @@ class TestUninstallRefusals:
 
         monkeypatch.setattr(routes_mod, "_run_lifecycle_script", _script)
         monkeypatch.setattr(routes_mod, "stop_app_backend", lambda n: None)
-        async with TestClient(TestServer(_make_app())) as client:
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
             resp = await client.post(f"/api/apps/{APP}/uninstall", json={})
             assert resp.status == 200
             log = (await resp.json())["uninstall_log"]
@@ -1613,7 +1867,7 @@ class TestUninstallRefusals:
             ),
         )
         monkeypatch.setattr(routes_mod, "stop_app_backend", lambda n: None)
-        async with TestClient(TestServer(_make_app())) as client:
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
             resp = await client.post(f"/api/apps/{APP}/uninstall", json={})
             assert resp.status == 400
             assert (await resp.json())["error"] == "permission denied"
@@ -1622,6 +1876,123 @@ class TestUninstallRefusals:
 # ---------------------------------------------------------------------------
 # Enable / disable warning + rollback branches
 # ---------------------------------------------------------------------------
+
+
+class TestEnableRefusesAppTokens:
+    """Enabling is the consent moment for ``permissions.sessionApproval``.
+
+    ``disable_app`` leaves the app's token valid and ``_app_owns_path`` grants
+    the token its own ``/api/apps/{name}/**`` namespace, so without a refusal
+    a disabled app -- including one an update left disabled because it newly
+    asked for session control -- could POST its own enable route and restore
+    the grant with no user moment.
+    """
+
+    @pytest.mark.asyncio
+    async def test_own_app_token_cannot_enable_itself(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _setup_env(tmp_path, monkeypatch)
+        _install(tmp_path, permissions={"sessionApproval": True})
+        assert disable_app(APP).ok
+        async with TestClient(TestServer(_make_app(app_identity=APP))) as client:
+            resp = await client.post(f"/api/apps/{APP}/enable")
+            assert resp.status == 403
+            assert (await resp.json())["code"] == "app_token_forbidden"
+        assert routes_mod.get_app(APP)["enabled"] is False
+
+    @pytest.mark.asyncio
+    async def test_dashboard_caller_still_enables(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _setup_env(tmp_path, monkeypatch)
+        _install(tmp_path, permissions={"sessionApproval": True})
+        assert disable_app(APP).ok
+        monkeypatch.setattr(routes_mod, "start_app_backend", lambda n: None)
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
+            # A fresh install that declares the grant is consent-pending, so the
+            # owner enables it through the disclosure surface.
+            resp = await client.post(
+                f"/api/apps/{APP}/enable", json={"sessionApprovalConsent": True}
+            )
+            assert resp.status == 200
+        assert routes_mod.get_app(APP)["enabled"] is True
+
+    @pytest.mark.asyncio
+    async def test_non_owner_dashboard_user_cannot_consent(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Consent hands an app control of the OWNER's sessions, so a signed-in
+        # non-owner dashboard user is refused exactly like the other
+        # machine-global mutations (403 owner_only), and nothing is enabled.
+        _setup_env(tmp_path, monkeypatch)
+        _install(tmp_path, permissions={"sessionApproval": True})
+        monkeypatch.setattr(routes_mod, "start_app_backend", lambda n: None)
+        async with TestClient(TestServer(_make_app(dashboard_user="guest"))) as client:
+            resp = await client.post(
+                f"/api/apps/{APP}/enable", json={"sessionApprovalConsent": True}
+            )
+            body = await resp.json()
+        assert resp.status == 403
+        assert body["code"] == "owner_only"
+        assert routes_mod.get_app(APP)["enabled"] is False
+        assert routes_mod.get_app(APP)["sessionApprovalConsentPending"] is True
+
+    @pytest.mark.asyncio
+    async def test_non_owner_dashboard_user_cannot_enable(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Enabling registers the app's agents, skills, MCP servers and crons and
+        # starts its backend, so a signed-in non-owner dashboard user is refused
+        # with 403 owner_only even without a consent body, and nothing runs.
+        _setup_env(tmp_path, monkeypatch)
+        _install(tmp_path, setup={"onEnable": "echo should-not-run"})
+        reached: list[str] = []
+
+        async def _script(*args: Any, **kwargs: Any) -> dict[str, Any]:
+            reached.append("on_enable_script")
+            return {"output": "", "failed": False}
+
+        monkeypatch.setattr(routes_mod, "_run_lifecycle_script", _script)
+        monkeypatch.setattr(
+            routes_mod, "start_app_backend", lambda n: reached.append("start_app_backend")
+        )
+        async with TestClient(TestServer(_make_app(dashboard_user="guest"))) as client:
+            resp = await client.post(f"/api/apps/{APP}/enable")
+            body = await resp.json()
+        assert resp.status == 403
+        assert body["code"] == "owner_only"
+        assert reached == []
+        assert routes_mod.get_app(APP)["enabled"] is False
+
+    @pytest.mark.asyncio
+    async def test_pending_consent_requires_disclosure_flag(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _setup_env(tmp_path, monkeypatch)
+        result = register_external_app(
+            APP,
+            "1.0.0",
+            "Consent App",
+            manifest_data={
+                "name": APP,
+                "version": "1.0.0",
+                "permissions": {"sessionApproval": True},
+            },
+        )
+        assert result.notice == "session_approval_reconsent"
+        monkeypatch.setattr(routes_mod, "start_app_backend", lambda n: None)
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
+            denied = await client.post(f"/api/apps/{APP}/enable")
+            assert denied.status == 400
+            assert (await denied.json())["code"] == "session_approval_consent_required"
+            accepted = await client.post(
+                f"/api/apps/{APP}/enable",
+                json={"sessionApprovalConsent": True},
+            )
+            assert accepted.status == 200
+        assert routes_mod.get_app(APP)["enabled"] is True
+        assert routes_mod.get_app(APP)["sessionApprovalConsentPending"] is False
 
 
 class TestEnableBranches:
@@ -1649,7 +2020,7 @@ class TestEnableBranches:
 
         monkeypatch.setattr(routes_mod, "_run_lifecycle_script", _must_not_run)
         monkeypatch.setattr(routes_mod, "start_app_backend", lambda n: None)
-        async with TestClient(TestServer(_make_app())) as client:
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
             resp = await client.post(f"/api/apps/{APP}/enable")
             assert resp.status == 200
             body = await resp.json()
@@ -1668,7 +2039,7 @@ class TestEnableBranches:
         monkeypatch.setattr(routes_mod, "_run_lifecycle_script", _failed)
         monkeypatch.setattr(routes_mod, "start_app_backend", lambda n: None)
         monkeypatch.setattr(routes_mod, "stop_app_backend", lambda n: None)
-        async with TestClient(TestServer(_make_app())) as client:
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
             resp = await client.post(f"/api/apps/{APP}/enable")
             assert resp.status == 400
             body = await resp.json()
@@ -1689,7 +2060,7 @@ class TestEnableBranches:
 
         monkeypatch.setattr(routes_mod, "on_app_enable", _boom)
         monkeypatch.setattr(routes_mod, "start_app_backend", lambda n: None)
-        async with TestClient(TestServer(_make_app())) as client:
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
             resp = await client.post(f"/api/apps/{APP}/enable")
             assert resp.status == 200
             body = await resp.json()
@@ -1713,7 +2084,7 @@ class TestEnableBranches:
 
         monkeypatch.setattr(routes_mod, "on_app_enable", _hooks)
         monkeypatch.setattr(routes_mod, "start_app_backend", lambda n: None)
-        async with TestClient(TestServer(_make_app())) as client:
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
             resp = await client.post(f"/api/apps/{APP}/enable")
             assert resp.status == 200
             issues = (await resp.json())["hooks"]["health_status"]["issues"]
@@ -1724,7 +2095,7 @@ class TestEnableBranches:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         _setup_env(tmp_path, monkeypatch)
-        async with TestClient(TestServer(_make_app())) as client:
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
             resp = await client.post("/api/apps/ghost/enable")
             assert resp.status == 404
 
@@ -1756,7 +2127,7 @@ class TestDisableBranches:
         monkeypatch.setattr(routes_mod, "teardown_app_runtime", _must_not_teardown)
         monkeypatch.setattr(routes_mod, "disable_app", _must_not_disable)
 
-        async with TestClient(TestServer(_make_app())) as client:
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
             resp = await client.post(f"/api/apps/{APP}/disable")
             assert resp.status == 409
             body = await resp.json()
@@ -1771,7 +2142,7 @@ class TestDisableBranches:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         _setup_env(tmp_path, monkeypatch)
-        async with TestClient(TestServer(_make_app())) as client:
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
             resp = await client.post("/api/apps/ghost/disable")
             assert resp.status == 404
 
@@ -1792,7 +2163,7 @@ class TestDisableBranches:
         # Patched on the SHARED teardown, not on `routes`: this PR routes the
         # disable path's hook/backend/onDisable work through
         # `apps/teardown.py::teardown_app_runtime`, the one implementation the
-        # trust-revocation path also calls, so `routes` no longer holds these
+        # trust-revocation path also calls, so `routes` does not hold these
         # symbols. The behaviour these tests pin is unchanged — the warnings still
         # surface on the disable response — only the module that owns the step moved.
         from kiro_crew.apps import teardown as teardown_mod
@@ -1806,7 +2177,7 @@ class TestDisableBranches:
         # "could not be run" rather than "script failed".
         monkeypatch.setattr(teardown_mod, "run_lifecycle_script", _failed)
         monkeypatch.setattr(teardown_mod, "stop_app_backend", lambda n: None)
-        async with TestClient(TestServer(_make_app())) as client:
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
             resp = await client.post(f"/api/apps/{APP}/disable")
             assert resp.status == 200
             body = await resp.json()
@@ -1832,14 +2203,14 @@ class TestDisableBranches:
         # Patched on the SHARED teardown, not on `routes`: this PR routes the
         # disable path's hook/backend/onDisable work through
         # `apps/teardown.py::teardown_app_runtime`, the one implementation the
-        # trust-revocation path also calls, so `routes` no longer holds these
+        # trust-revocation path also calls, so `routes` does not hold these
         # symbols. The behaviour these tests pin is unchanged — the warnings still
         # surface on the disable response — only the module that owns the step moved.
         from kiro_crew.apps import teardown as teardown_mod
 
         monkeypatch.setattr(teardown_mod, "on_app_disable", _boom)
         monkeypatch.setattr(teardown_mod, "stop_app_backend", lambda n: None)
-        async with TestClient(TestServer(_make_app())) as client:
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
             resp = await client.post(f"/api/apps/{APP}/disable")
             assert resp.status == 200
             assert any(
@@ -1861,14 +2232,14 @@ class TestDisableBranches:
         # Patched on the SHARED teardown, not on `routes`: this PR routes the
         # disable path's hook/backend/onDisable work through
         # `apps/teardown.py::teardown_app_runtime`, the one implementation the
-        # trust-revocation path also calls, so `routes` no longer holds these
+        # trust-revocation path also calls, so `routes` does not hold these
         # symbols. The behaviour these tests pin is unchanged — the warnings still
         # surface on the disable response — only the module that owns the step moved.
         from kiro_crew.apps import teardown as teardown_mod
 
         monkeypatch.setattr(teardown_mod, "on_app_disable", _hooks)
         monkeypatch.setattr(routes_mod, "stop_app_backend", lambda n: None)
-        async with TestClient(TestServer(_make_app())) as client:
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
             resp = await client.post(f"/api/apps/{APP}/disable")
             assert (await resp.json())["warnings"] == ["2 job(s) left enabled"]
 
@@ -1885,10 +2256,83 @@ class TestDisableBranches:
             lambda name: AppResult(ok=False, name=name, error="metadata locked"),
         )
         monkeypatch.setattr(routes_mod, "stop_app_backend", lambda n: None)
-        async with TestClient(TestServer(_make_app())) as client:
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
             resp = await client.post(f"/api/apps/{APP}/disable")
             assert resp.status == 400
             assert (await resp.json())["error"] == "metadata locked"
+
+
+class TestRepeatedToggleIsIdempotent:
+    """A repeated enable skips the Python hooks; overlapping disables run app code once."""
+
+    @pytest.mark.asyncio
+    async def test_repeated_enable_runs_hooks_once_and_repeats_the_rest(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _setup_env(tmp_path, monkeypatch)
+        _install(tmp_path, setup={"onEnable": "setup.sh"})
+        calls: list[str] = []
+
+        async def _script(*args: Any, **kwargs: Any) -> dict[str, Any]:
+            calls.append("onEnable")
+            return {"output": "", "failed": False}
+
+        async def _hooks(*args: Any, **kwargs: Any) -> None:
+            calls.append("hooks")
+
+        monkeypatch.setattr(routes_mod, "_run_lifecycle_script", _script)
+        monkeypatch.setattr(routes_mod, "on_app_enable", _hooks)
+        monkeypatch.setattr(routes_mod, "start_app_backend", lambda n: calls.append("backend"))
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
+            first = await client.post(f"/api/apps/{APP}/enable")
+            assert first.status == 200
+            assert calls == ["backend", "onEnable", "hooks"]
+            second = await client.post(f"/api/apps/{APP}/enable")
+            assert second.status == 200
+            assert (await second.json())["message"] == f"{APP} is already enabled"
+        # The flag is not evidence onEnable ran, so the script and backend start repeat.
+        assert calls == ["backend", "onEnable", "hooks", "backend", "onEnable"]
+
+    @pytest.mark.asyncio
+    async def test_concurrent_disables_run_on_disable_once(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _setup_env(tmp_path, monkeypatch)
+        _install(tmp_path, setup={"onDisable": "teardown.sh"})
+        enable_app(APP)
+        from kiro_crew.apps import teardown as teardown_mod
+
+        both_read = asyncio.Event()
+        real_get_app = routes_mod.get_app
+        reads = 0
+
+        def _get_app(name: str) -> Any:
+            nonlocal reads
+            reads += 1
+            if reads == 2:
+                both_read.set()
+            return real_get_app(name)
+
+        scripts: list[str] = []
+
+        async def _script(*args: Any, **kwargs: Any) -> dict[str, Any]:
+            scripts.append("onDisable")
+            # Hold the lock until the second request has read its pre-lock metadata.
+            await asyncio.wait_for(both_read.wait(), timeout=5)
+            return {"output": "", "failed": False}
+
+        monkeypatch.setattr(routes_mod, "get_app", _get_app)
+        monkeypatch.setattr(teardown_mod, "run_lifecycle_script", _script)
+        monkeypatch.setattr(teardown_mod, "stop_app_backend", lambda n: None)
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
+            first, second = await asyncio.gather(
+                client.post(f"/api/apps/{APP}/disable"),
+                client.post(f"/api/apps/{APP}/disable"),
+            )
+            assert (first.status, second.status) == (200, 200)
+            messages = {(await r.json())["message"] for r in (first, second)}
+        assert messages == {f"disabled {APP}", f"{APP} is already disabled"}
+        assert scripts == ["onDisable"]
 
 
 # ---------------------------------------------------------------------------
@@ -2063,7 +2507,7 @@ class TestRegistryInstall:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         _setup_env(tmp_path, monkeypatch)
-        async with TestClient(TestServer(_make_app())) as client:
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
             resp = await client.post(
                 "/api/apps/registry/install",
                 data="{",
@@ -2076,7 +2520,7 @@ class TestRegistryInstall:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         _setup_env(tmp_path, monkeypatch)
-        async with TestClient(TestServer(_make_app())) as client:
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
             resp = await client.post("/api/apps/registry/install", json={})
             assert resp.status == 400
             assert "name required" in (await resp.json())["error"]
@@ -2091,7 +2535,7 @@ class TestRegistryInstall:
             return {"ok": False, "name": name, "needsClientInstall": True}
 
         monkeypatch.setattr(routes_mod, "install_from_registry", _needs_client)
-        async with TestClient(TestServer(_make_app())) as client:
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
             resp = await client.post(
                 "/api/apps/registry/install", json={"name": "some-app"}
             )
@@ -2113,7 +2557,7 @@ class TestRegistryInstall:
             }
 
         monkeypatch.setattr(routes_mod, "install_from_registry", _failed)
-        async with TestClient(TestServer(_make_app())) as client:
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
             resp = await client.post(
                 "/api/apps/registry/install", json={"name": "some-app"}
             )
@@ -2127,9 +2571,9 @@ class TestRegistryInstall:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         _setup_env(tmp_path, monkeypatch)
-        _install(tmp_path)
 
         async def _ok(name: str, **kwargs: Any) -> dict[str, Any]:
+            _install(tmp_path)
             return {"ok": True, "name": APP, "log": "done"}
 
         started: list[str] = []
@@ -2137,7 +2581,7 @@ class TestRegistryInstall:
         monkeypatch.setattr(
             routes_mod, "start_app_backend", lambda n: started.append(n)
         )
-        async with TestClient(TestServer(_make_app())) as client:
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
             resp = await client.post(
                 "/api/apps/registry/install", json={"name": APP}
             )
@@ -2145,6 +2589,33 @@ class TestRegistryInstall:
             body = await resp.json()
         assert "registration" in body
         assert started == [APP]
+
+    @pytest.mark.asyncio
+    async def test_reconsent_stops_and_deregisters_without_restart(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _setup_env(tmp_path, monkeypatch)
+        _install(tmp_path)
+        enable_app(APP)
+        calls: list[str] = []
+
+        async def _reconsent(name: str, **kwargs: Any) -> dict[str, Any]:
+            disable_app(name)
+            return {"ok": True, "name": name}
+
+        monkeypatch.setattr(routes_mod, "install_from_registry", _reconsent)
+        monkeypatch.setattr(routes_mod, "register_app", lambda n: calls.append("register"))
+        monkeypatch.setattr(routes_mod, "deregister_app", lambda n: calls.append("deregister"))
+        monkeypatch.setattr(routes_mod, "stop_app_backend", lambda n: calls.append("stop"))
+        monkeypatch.setattr(routes_mod, "start_app_backend", lambda n: calls.append("start"))
+
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
+            resp = await client.post("/api/apps/registry/install", json={"name": APP})
+            assert resp.status == 201
+            body = await resp.json()
+
+        assert body["registration"]["agents"] == []
+        assert calls == ["stop", "deregister"]
 
 
 # ---------------------------------------------------------------------------
@@ -2158,7 +2629,7 @@ class TestRegistryInstallStream:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         _setup_env(tmp_path, monkeypatch)
-        async with TestClient(TestServer(_make_app())) as client:
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
             resp = await client.post(
                 "/api/apps/registry/install-stream",
                 data="{",
@@ -2171,7 +2642,7 @@ class TestRegistryInstallStream:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         _setup_env(tmp_path, monkeypatch)
-        async with TestClient(TestServer(_make_app())) as client:
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
             resp = await client.post("/api/apps/registry/install-stream", json={})
             assert resp.status == 400
 
@@ -2180,9 +2651,9 @@ class TestRegistryInstallStream:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         _setup_env(tmp_path, monkeypatch)
-        _install(tmp_path)
 
         async def _streaming(name: str, log_lines: Any = None, **kw: Any) -> dict:
+            _install(tmp_path)
             assert log_lines is not None
             log_lines.append("step one")
             # Multi-line output must be reframed as multiple data: lines so a
@@ -2192,7 +2663,7 @@ class TestRegistryInstallStream:
 
         monkeypatch.setattr(routes_mod, "install_from_registry", _streaming)
         monkeypatch.setattr(routes_mod, "start_app_backend", lambda n: None)
-        async with TestClient(TestServer(_make_app())) as client:
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
             resp = await client.post(
                 "/api/apps/registry/install-stream", json={"name": APP}
             )
@@ -2208,6 +2679,44 @@ class TestRegistryInstallStream:
         assert "registration" in done
 
     @pytest.mark.asyncio
+    async def test_streaming_update_that_widens_session_approval_stops_the_app(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The detail page's Update button goes through this SSE route. When the
+        # re-clone takes the update path and ``update_app`` leaves the app
+        # disabled pending re-consent, the route must behave like its two
+        # siblings: stop and scrub the OLD version, and neither register nor
+        # start the new one.
+        _setup_env(tmp_path, monkeypatch)
+        _install(tmp_path)
+        enable_app(APP)
+        calls: list[str] = []
+
+        async def _reconsent(name: str, log_lines: Any = None, **kw: Any) -> dict:
+            disable_app(name)  # what update_app does on a widened grant
+            return {"ok": True, "name": name}
+
+        monkeypatch.setattr(routes_mod, "install_from_registry", _reconsent)
+        monkeypatch.setattr(routes_mod, "register_app", lambda n: calls.append("register"))
+        monkeypatch.setattr(
+            routes_mod, "deregister_app", lambda n: calls.append("deregister")
+        )
+        monkeypatch.setattr(routes_mod, "stop_app_backend", lambda n: calls.append("stop"))
+        monkeypatch.setattr(routes_mod, "start_app_backend", lambda n: calls.append("start"))
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
+            resp = await client.post(
+                "/api/apps/registry/install-stream", json={"name": APP}
+            )
+            assert resp.status == 200
+            events = _sse_events(await resp.text())
+        name, payload = events[-1]
+        assert name == "done"
+        done = json.loads(payload)
+        assert done["ok"] is True
+        assert done["registration"]["agents"] == []
+        assert calls == ["stop", "deregister"]
+
+    @pytest.mark.asyncio
     async def test_failed_install_reports_done_with_error(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -2217,7 +2726,7 @@ class TestRegistryInstallStream:
             return {"ok": False, "name": name, "error": "build failed"}
 
         monkeypatch.setattr(routes_mod, "install_from_registry", _failed)
-        async with TestClient(TestServer(_make_app())) as client:
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
             resp = await client.post(
                 "/api/apps/registry/install-stream", json={"name": "some-app"}
             )
@@ -2226,6 +2735,42 @@ class TestRegistryInstallStream:
         name, payload = events[-1]
         assert name == "done"
         assert json.loads(payload)["error"] == "build failed"
+
+    @pytest.mark.asyncio
+    async def test_the_build_gate_refusal_reaches_the_client_verbatim(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The reason a refused install failed must travel ON the payload.
+
+        The desktop build-step refusal is logged to ``security_events.jsonl``
+        either way, but the dashboard's consent modal can only show a cause the
+        ``done`` event carries. Pinned as the sentence, not a truthy ``error``
+        key, because the UI renders this string — a generic placeholder
+        substituted here would leave the user with a refusal and no stated
+        reason, the dead end this test exists to prevent.
+        """
+        _setup_env(tmp_path, monkeypatch)
+        refusal = (
+            "Python apps that require a build step are not supported in Kiro Crew's "
+            "desktop build: its bundled interpreter is inside the signed "
+            "application bundle and cannot install packages"
+        )
+
+        async def _refused(name: str, log_lines: Any = None, **kw: Any) -> dict:
+            return {"ok": False, "name": name, "error": refusal}
+
+        monkeypatch.setattr(routes_mod, "install_from_registry", _refused)
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
+            resp = await client.post(
+                "/api/apps/registry/install-stream", json={"name": "some-app"}
+            )
+            assert resp.status == 200
+            events = _sse_events(await resp.text())
+        name, payload = events[-1]
+        assert name == "done"
+        done = json.loads(payload)
+        assert done["ok"] is False
+        assert done["error"] == refusal
 
     @pytest.mark.asyncio
     async def test_needs_client_install_short_circuits_done(
@@ -2237,7 +2782,7 @@ class TestRegistryInstallStream:
             return {"ok": True, "name": name, "needsClientInstall": True}
 
         monkeypatch.setattr(routes_mod, "install_from_registry", _needs_client)
-        async with TestClient(TestServer(_make_app())) as client:
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
             resp = await client.post(
                 "/api/apps/registry/install-stream", json={"name": "some-app"}
             )
@@ -2256,12 +2801,62 @@ class TestRegistryInstallStream:
             raise RuntimeError("clone exploded")
 
         monkeypatch.setattr(routes_mod, "install_from_registry", _boom)
-        async with TestClient(TestServer(_make_app())) as client:
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
             resp = await client.post(
                 "/api/apps/registry/install-stream", json={"name": "some-app"}
             )
             events = _sse_events(await resp.text())
         assert json.loads(events[-1][1])["error"] == "clone exploded"
+
+    @pytest.mark.asyncio
+    async def test_client_gone_at_write_eof_is_not_an_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A browser tab closed mid-install makes the final write_eof raise
+        # ClientConnectionResetError ("Cannot write to closing transport").
+        # That is a routine disconnect, not a server error — it must not
+        # escape the handler, where aiohttp would log an unhandled
+        # "Error handling request" traceback.
+        _setup_env(tmp_path, monkeypatch)
+
+        async def _failed(name: str, log_lines: Any = None, **kw: Any) -> dict:
+            return {"ok": False, "name": name, "error": "build failed"}
+
+        monkeypatch.setattr(routes_mod, "install_from_registry", _failed)
+
+        writes: list[bytes] = []
+
+        async def _prepare(self, request):  # noqa: ANN001 - stub mirrors aiohttp
+            return None
+
+        async def _write(self, data):  # noqa: ANN001 - stub mirrors aiohttp
+            writes.append(bytes(data))
+
+        async def _gone(self, data=b""):  # noqa: ANN001 - stub mirrors aiohttp
+            raise ClientConnectionResetError("Cannot write to closing transport")
+
+        monkeypatch.setattr(web.StreamResponse, "prepare", _prepare)
+        monkeypatch.setattr(web.StreamResponse, "write", _write)
+        monkeypatch.setattr(web.StreamResponse, "write_eof", _gone)
+
+        request = MagicMock()
+
+        async def _json() -> dict:
+            return {"name": "some-app"}
+
+        request.json = _json
+        # Owner identity, as token_auth_middleware would set it.
+        identity = {"app": "", "user": "owner"}
+        request.__contains__.side_effect = identity.__contains__
+        request.__getitem__.side_effect = identity.__getitem__
+        request.get.side_effect = identity.get
+        request.app = {"state": SimpleNamespace(owner_id="owner")}
+
+        resp = await routes_mod.handle_registry_install_stream(request)
+
+        assert isinstance(resp, web.StreamResponse)
+        # The done event was still flushed before the client vanished.
+        assert any(b"event: done" in w for w in writes)
 
 
 # ---------------------------------------------------------------------------
@@ -2576,7 +3171,7 @@ class TestNoEntryBlobCloneUrlResolution:
     async def test_no_entry_branch_does_not_re_read_the_registry(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # REGRESSION (PR 5027 round 4 — GPT 5.6 BLOCKING: registry cache re-read
+        # Invariant (registry cache re-read
         # blocks the event loop).  Before the subtraction the no-entry branch ran
         # ``clone_url = _registry_git_url(repo)``, which re-consulted
         # ``get_registry_app_by_repo`` — an unbounded SYNCHRONOUS registry
@@ -2659,7 +3254,7 @@ class TestBlobProxy:
     async def test_ref_with_traversal_is_rejected_400(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ref: str
     ) -> None:
-        # REGRESSION (PR 5027 round 6 — GPT 5.6 BLOCKING: ``ref`` cache-path
+        # Invariant (``ref`` cache-path
         # traversal).  ``ref`` becomes a path segment in the blob cache tree
         # (``.../{repo_key}/{ref}/{file_path}``).  ``_SAFE_REF_RE`` permits ``.``
         # and ``/``, so ``../<other-repo-key>/main`` matches the regex; the
@@ -2731,7 +3326,7 @@ class TestBlobProxy:
     async def test_repo_key_reuse_across_registries_does_not_serve_stale_bytes(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # REGRESSION (PR 5027 round 6 — GPT 5.6 BLOCKING: private cache entries
+        # Invariant (private cache entries
         # outlive their provenance).  ``_blob_cache_key`` once keyed the cache dir
         # on the ``repo`` STRING alone.  Chain: registry A (private) caches a blob
         # under repo key X; A is removed and registry B is later configured reusing
@@ -2860,7 +3455,7 @@ class TestBlobProxy:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         # The resolved-path check must fire BEFORE any mkdir, so a symlinked
-        # cache subtree cannot be used to write outside the blob cache root.
+        # cache subtree cannot write outside the blob cache root.
         _setup_env(tmp_path, monkeypatch)
         monkeypatch.setattr(routes_mod, "known_registry_repos", lambda: {"acme"})
         # The cache key is provenance-bound, so the handler resolves a clone URL
@@ -2908,7 +3503,7 @@ class TestBlobProxy:
         assert not _is_safe_repo_identifier("org/app")
 
 # ---------------------------------------------------------------------------
-# Blob-fetch credential posture (same-repo carve-out, PR 918 extended to the
+# Blob-fetch credential posture (same-repo carve-out at the
 # third clone chokepoint).  These pin the env + sandbox-mode PAIR the blob
 # clone uses per origin, without asserting raw git argv (wrap_argv is patched
 # to capture only the mode it was handed).
@@ -3044,7 +3639,7 @@ class TestFetchGitBlobCredentialPosture:
         # ``_fetch_git_blob`` (part of the untouched SSRF gate), so it is patched on
         # the registry module.  The credential-posture helpers, by contrast, were
         # hoisted to ``routes`` module scope, so they are patched there — patching
-        # ``reg_mod`` would no longer intercept the module-level name.
+        # ``reg_mod`` would not intercept the module-level name.
         monkeypatch.setattr(reg_mod, "is_clone_host_trusted", lambda url: True)
         # Sentinel env dicts so the test asserts WHICH builder was used without
         # depending on the host's real environment contents.
@@ -3091,7 +3686,7 @@ class TestFetchGitBlobCredentialPosture:
 
         # Control: an owner-designated entry whose URL is ``url``.  The caller
         # threads ``git_url=url`` — the SAME URL the carve-out was decided for —
-        # so the carve-out is honored.  ``_fetch_git_blob`` no longer re-resolves
+        # so the carve-out is honored.  ``_fetch_git_blob`` does not re-resolve
         # from ``repo``; it uses the threaded value for both the decision and the
         # clone.
         ok = await routes_mod._fetch_git_blob(
@@ -3141,7 +3736,7 @@ class TestFetchGitBlobCredentialPosture:
     async def test_injected_cloneurl_never_becomes_the_credentialed_clone_target(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # REGRESSION (PR 5027 cross-registry finding), now enforced by CONSTRUCTION
+        # Enforced by CONSTRUCTION
         # rather than a downgrade recheck.  Two registries are configured — A
         # (repo=urlA) and B (repo=urlB, a separately-configured PRIVATE registry).
         # A's untrusted index injects an app entry that carries an explicit
@@ -3151,7 +3746,7 @@ class TestFetchGitBlobCredentialPosture:
         # injected ``cloneUrl`` while the credential decision used ``_entry_git_url``,
         # so the two resolvers named different URLs and the clone could reach urlB
         # with owner credentials.  The subtraction deletes the divergence: that
-        # resolver is gone and ``cloneUrl`` is no longer read anywhere, so the only
+        # resolver is gone and ``cloneUrl`` is not read anywhere, so the only
         # URL that can reach the clone is the one the caller threads — urlA, the
         # entry's own ``gitUrl``, byte-identical to the URL the carve-out was
         # decided for.  urlB is never the clone target, credentialed or otherwise,
@@ -3363,7 +3958,7 @@ class TestBlobProxyOwnerDesignatedWiring:
     async def test_query_ref_differing_from_configured_branch_is_not_owner_designated(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # REGRESSION (PR 5027 round 6 — GPT 5.6 BLOCKING: the credential grant
+        # Invariant (the credential grant
         # ignored the effective ref).  ``ref`` falls back to the entry's
         # configured branch ONLY when the query param is empty; a caller can
         # otherwise supply any ``_SAFE_REF_RE``-valid ``ref`` (e.g.
@@ -3467,7 +4062,7 @@ class TestBlobProxyOwnerDesignatedWiring:
     async def test_concurrent_refresh_cannot_redirect_credentialed_clone(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # REGRESSION (PR 5027 round 3 — TOCTOU between the credential decision and
+        # Invariant (TOCTOU between the credential decision and
         # the clone).  ``handle_blob_proxy`` decides ``owner_designated`` and
         # resolves the clone URL from ONE registry entry, then threads that URL
         # into ``_fetch_git_blob``.  The bug this pins: if the callee re-resolved
@@ -3558,7 +4153,7 @@ class TestBlobProxyOwnerDesignatedWiring:
     async def test_ambiguous_provenance_downgrades_to_anonymous_strict(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # REGRESSION (PR 5027 round 5 — GPT 5.6 BLOCKING: cross-registry confused
+        # Invariant (cross-registry confused
         # deputy).  ``get_registry_app_by_repo`` selects the entry by ``repo`` key
         # alone (bundled first, then each external registry), provenance-blind.  If
         # two configured registries — A (owner-designated for repo key X) and B (a
@@ -3643,7 +4238,7 @@ class TestBlobProxyOwnerDesignatedWiring:
     async def test_owner_designated_branch_resolves_sandbox_mode_off_the_event_loop(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # REGRESSION (PR 5027 round 5 — Opus 4.8 BLOCKING: synchronous config-load
+        # Invariant (synchronous config-load
         # on the event loop).  Inside ``_fetch_git_blob``'s ``owner_designated``
         # branch, ``_context_clone_sandbox_mode(git_url)`` flows
         # ``_configured_registry_hosts`` -> ``_effective_registries`` ->
@@ -3822,11 +4417,24 @@ class _FakeSession:
         return None
 
 
-async def _swap_proxy_session(app: web.Application, exc: BaseException) -> None:
-    real = app.get("_proxy_session")
-    if real is not None and not real.closed:
-        await real.close()
-    app["_proxy_session"] = _FakeSession(exc)
+def _fail_proxy_backend_with(app: web.Application, exc: BaseException) -> None:
+    """Make the proxy's outbound session raise ``exc``, installed BEFORE start.
+
+    ``register_app_routes`` creates the real ``ClientSession`` in an
+    ``on_startup`` hook; hooks run in registration order, so this one runs
+    right after it, closes the real session (its connector would otherwise
+    outlive the test) and installs the fake while the app is still mutable.
+    An ``app[...]`` write after the test server has started is deprecated by
+    aiohttp.
+    """
+
+    async def _swap(app_: web.Application) -> None:
+        real = app_.get("_proxy_session")
+        if real is not None and not real.closed:
+            await real.close()
+        app_["_proxy_session"] = _FakeSession(exc)
+
+    app.on_startup.append(_swap)
 
 
 class TestApiProxyAuthorization:
@@ -3914,8 +4522,8 @@ class TestApiProxyAuthorization:
             routes_mod, "_resolve_app_backend_url", lambda n: "http://127.0.0.1:1"
         )
         app = _make_app()
+        _fail_proxy_backend_with(app, aiohttp.ClientError("refused"))
         async with TestClient(TestServer(app)) as client:
-            await _swap_proxy_session(client.app, aiohttp.ClientError("refused"))
             resp = await client.get(f"/apps/{APP}/api/ping")
             assert resp.status == 502
             assert (await resp.json())["error"] == "backend unreachable"
@@ -3933,8 +4541,8 @@ class TestApiProxyAuthorization:
             routes_mod, "_resolve_app_backend_url", lambda n: "http://127.0.0.1:1"
         )
         app = _make_app()
+        _fail_proxy_backend_with(app, asyncio.TimeoutError())
         async with TestClient(TestServer(app)) as client:
-            await _swap_proxy_session(client.app, asyncio.TimeoutError())
             resp = await client.post(f"/apps/{APP}/api/run", json={"x": 1})
             assert resp.status == 504
             assert (await resp.json())["error"] == "backend timeout"
@@ -4076,7 +4684,7 @@ class TestRegistriesConfigFailures:
     ) -> None:
         home = _setup_env(tmp_path, monkeypatch)
         (home / "config.json").write_text("{ not json", encoding="utf-8")
-        async with TestClient(TestServer(_make_app())) as client:
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
             resp = await client.put(
                 "/api/apps/registries",
                 json={"registries": [{"repo": "AcmeApps"}]},
@@ -4094,7 +4702,7 @@ class TestRegistriesConfigFailures:
         (home / "config.json").write_text(
             json.dumps({"registries": None}), encoding="utf-8"
         )
-        async with TestClient(TestServer(_make_app())) as client:
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
             resp = await client.put(
                 "/api/apps/registries",
                 json={"registries": [{"repo": "https://git.example/org/apps"}]},
@@ -4142,7 +4750,7 @@ def test_disable_route_normalizes_the_name_before_the_builtin_lookup():
 async def test_update_stops_the_backend_before_deregistering_resources(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Teardown order is load-bearing, not cosmetic (#5726 review).
+    """Teardown order is load-bearing, not cosmetic.
 
     `stop_app_backend` pops the tracking record, which is what stops the health watch
     from reconciling MCP for the app. Deregistering first leaves a window in which a
@@ -4166,7 +4774,7 @@ async def test_update_stops_the_backend_before_deregistering_resources(
         routes_mod, "update_app", lambda *a, **k: {"success": False, "error": "stop here"}
     )
 
-    async with TestClient(TestServer(_make_app())) as client:
+    async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
         await client.post(f"/api/apps/{APP}/update", json={"source": str(tmp_path / "src")})
 
     assert order[:2] == ["stop", "deregister"], (
@@ -4178,7 +4786,7 @@ async def test_update_stops_the_backend_before_deregistering_resources(
 async def test_enable_does_not_re_register_after_the_backend_starts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Enable must not re-register MCP after start_app_backend returns (#5726 review).
+    """Enable must not re-register MCP after start_app_backend returns.
 
     A call made here is queued behind the handler, so the adopted backend's watch can
     demote and scrub in between — and the queued write would then restore the dead url,
@@ -4201,7 +4809,224 @@ async def test_enable_does_not_re_register_after_the_backend_starts(
         ),
     )
 
-    async with TestClient(TestServer(_make_app())) as client:
-        await client.post(f"/api/apps/{APP}/enable", json={})
+    async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
+        resp = await client.post(f"/api/apps/{APP}/enable", json={})
+        assert resp.status == 200
 
     assert called == [], "enable re-registered after start; the adoption path owns that"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["prepare", "write", "write_eof"])
+async def test_app_ui_stream_client_disconnect_is_quiet(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+) -> None:
+    """A closed tab is routine at every UI-file response boundary."""
+    home = _setup_env(tmp_path, monkeypatch)
+    ui = home / "apps" / APP / "ui"
+    ui.mkdir(parents=True)
+    (ui / "app.js").write_bytes(b"console.log('ok')")
+
+    calls: list[str] = []
+
+    async def _prepare(self: web.StreamResponse, request: web.Request) -> None:
+        calls.append("prepare")
+        if boundary == "prepare":
+            raise ClientConnectionResetError("Cannot write to closing transport")
+
+    async def _write(self: web.StreamResponse, data: bytes) -> None:
+        calls.append("write")
+        if boundary == "write":
+            raise ClientConnectionResetError("Cannot write to closing transport")
+
+    async def _write_eof(self: web.StreamResponse, data: bytes = b"") -> None:
+        calls.append("write_eof")
+        if boundary == "write_eof":
+            raise ClientConnectionResetError("Cannot write to closing transport")
+
+    monkeypatch.setattr(web.StreamResponse, "prepare", _prepare)
+    monkeypatch.setattr(web.StreamResponse, "write", _write)
+    monkeypatch.setattr(web.StreamResponse, "write_eof", _write_eof)
+
+    request = MagicMock()
+    request.match_info = {"name": APP, "path": "app.js"}
+    request.if_none_match = ()
+    request.if_modified_since = None
+
+    response = await routes_mod.handle_app_ui_file(request)
+
+    assert isinstance(response, web.StreamResponse)
+    expected = {
+        "prepare": ["prepare"],
+        "write": ["prepare", "write"],
+        "write_eof": ["prepare", "write", "write_eof"],
+    }
+    assert calls == expected[boundary]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["prepare", "write", "write_eof"])
+async def test_app_proxy_stream_client_disconnect_is_quiet(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+) -> None:
+    """A closed browser must not turn a successful upstream stream into 502."""
+    _setup_env(tmp_path, monkeypatch)
+    monkeypatch.setattr(routes_mod, "is_app_enabled", lambda name: True)
+    monkeypatch.setattr(
+        routes_mod,
+        "_resolve_app_backend_url",
+        lambda name: "http://127.0.0.1:7777",
+    )
+    monkeypatch.setattr(routes_mod, "_get_app_secret", lambda name: "proxy-secret")
+
+    class _Content:
+        async def iter_any(self):  # noqa: ANN202 - aiohttp stream stub
+            yield b"upstream payload"
+
+    class _Upstream:
+        status = 200
+        headers: dict[str, str] = {}
+        content = _Content()
+
+    class _Context:
+        async def __aenter__(self) -> _Upstream:
+            return _Upstream()
+
+        async def __aexit__(self, *args: Any) -> None:
+            return None
+
+    class _Session:
+        closed = False
+
+        def request(self, **kwargs: Any) -> _Context:
+            return _Context()
+
+    calls: list[str] = []
+
+    async def _prepare(self: web.StreamResponse, request: web.Request) -> None:
+        calls.append("prepare")
+        if boundary == "prepare":
+            raise ClientConnectionResetError("Cannot write to closing transport")
+
+    async def _write(self: web.StreamResponse, data: bytes) -> None:
+        calls.append("write")
+        if boundary == "write":
+            raise ClientConnectionResetError("Cannot write to closing transport")
+
+    async def _write_eof(self: web.StreamResponse, data: bytes = b"") -> None:
+        calls.append("write_eof")
+        if boundary == "write_eof":
+            raise ClientConnectionResetError("Cannot write to closing transport")
+
+    monkeypatch.setattr(web.StreamResponse, "prepare", _prepare)
+    monkeypatch.setattr(web.StreamResponse, "write", _write)
+    monkeypatch.setattr(web.StreamResponse, "write_eof", _write_eof)
+
+    request = MagicMock()
+    request.match_info = {"name": APP, "path": "ping"}
+    request.get = lambda key, default="": default
+    request.rel_url = routes_mod.yarl.URL("/apps/cov-test-app/api/ping")
+    request.headers = {}
+    request.can_read_body = False
+    request.method = "GET"
+    request.app = {"_proxy_session": _Session()}
+
+    response = await routes_mod.handle_app_api_proxy(request)
+
+    assert isinstance(response, web.StreamResponse)
+    assert response.status == 200
+    expected = {
+        "prepare": ["prepare"],
+        "write": ["prepare", "write"],
+        "write_eof": ["prepare", "write", "write_eof"],
+    }
+    assert calls == expected[boundary]
+
+
+class TestLifecycleRoutesAreOwnerOnly:
+    """Register, uninstall and disable answer 403 to anyone but the owner.
+
+    Rows: a non-owner dashboard subject (``app == ""``) and an app token, both
+    before any side effect. The app token row on register names ANOTHER
+    installed app in the body, and the app token rows on uninstall and disable
+    target the app's own ``/api/apps/<self>/**`` path.
+    """
+
+    @pytest.mark.asyncio
+    async def test_non_owner_cannot_register(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _setup_env(tmp_path, monkeypatch)
+        body = {"name": "rogue-app", "version": "1.0.0", "displayName": "R"}
+        async with TestClient(TestServer(_make_app(dashboard_user="channel-user"))) as client:
+            resp = await client.post("/api/apps/register", json=body)
+            assert resp.status == 403
+            assert (await resp.json())["code"] == "owner_only"
+        assert routes_mod.get_app("rogue-app") is None
+
+    @pytest.mark.asyncio
+    async def test_app_token_cannot_register_over_another_app(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from kiro_crew.apps.manager import app_dir
+
+        _setup_env(tmp_path, monkeypatch)
+        _install(tmp_path)
+        before = (app_dir(APP) / APP_MANIFEST_FILENAME).read_text(encoding="utf-8")
+        body = {"name": APP, "version": "9.9.9", "displayName": "Other"}
+        app = _make_app(app_identity="other-app", dashboard_user="other-app")
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post("/api/apps/register", json=body)
+            assert resp.status == 403
+        after = (app_dir(APP) / APP_MANIFEST_FILENAME).read_text(encoding="utf-8")
+        assert after == before
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("app_identity", "user"), [(None, "channel-user"), (APP, APP)]
+    )
+    async def test_uninstall_is_refused(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        app_identity: str | None,
+        user: str,
+    ) -> None:
+        _setup_env(tmp_path, monkeypatch)
+        _install(tmp_path)
+        calls: list[str] = []
+
+        def _uninstall(name: str, **_kw: Any) -> AppResult:
+            calls.append(name)
+            return AppResult(ok=True, name=name, message="stub")
+
+        monkeypatch.setattr(routes_mod, "uninstall_app", _uninstall)
+        app = _make_app(app_identity=app_identity, dashboard_user=user)
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(f"/api/apps/{APP}/uninstall", json={"purge_data": True})
+            assert resp.status == 403
+        assert calls == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("app_identity", "user"), [(None, "channel-user"), (APP, APP)]
+    )
+    async def test_disable_is_refused(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        app_identity: str | None,
+        user: str,
+    ) -> None:
+        _setup_env(tmp_path, monkeypatch)
+        _install(tmp_path)
+        assert enable_app(APP).ok
+        app = _make_app(app_identity=app_identity, dashboard_user=user)
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(f"/api/apps/{APP}/disable")
+            assert resp.status == 403
+        assert routes_mod.get_app(APP)["enabled"] is True

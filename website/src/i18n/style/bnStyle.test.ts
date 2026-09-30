@@ -5,6 +5,8 @@
  */
 
 import { describe, it, expect } from 'vitest'
+import { execFileSync } from 'node:child_process'
+import { join } from 'node:path'
 import { CATALOGS as RUNTIME_CATALOGS } from '../catalogs'
 
 function flatten(obj: unknown, prefix = ''): Record<string, string> {
@@ -41,6 +43,95 @@ describe('bn punctuation (style/bn.md §1)', () => {
     // Baselined: existing catalog may use periods
     expect(bad.length, report(bad)).toBeLessThanOrEqual(30)
   })
+
+  // The ceiling's companion: it tolerates the inherited catalog, but it cannot say
+  // whose violation it is, so a branch that adds one rides under it until the count
+  // crosses and the round that reds belongs to someone else. See
+  // docs/ci/i18n-gates.md.
+  it('[changed-values] ends a Bengali sentence with dari at zero tolerance', () => {
+    const changed = changedBnValues()
+    if (changed === null) {
+      // eslint-disable-next-line no-console -- stdout IS this gate's report channel, and this skip is reachable on a bare local run
+      console.log('[changed-values] skipped — I18N_BASE_REF is unset, so there is no branch to diff.')
+      return
+    }
+    const bad = Object.entries(changed)
+      .filter(([, value]) => BENGALI.test(value) && /[\u0980-\u09ff]\.$/.test(value))
+      .map(([key, value]) => `${key}: ${JSON.stringify(value.slice(-30))}`)
+    expect(bad, `${report(bad)}\n\nThere is no ceiling to raise for these — the value is yours.`)
+      .toEqual([])
+  })
+})
+
+/* ── §5 register, scoped to the values THIS BRANCH wrote ── */
+
+const REPO = join(__dirname, '..', '..', '..', '..')
+const CATALOG = 'website/src/i18n/locales/bn.json'
+
+/** The আপনি pronoun family. Any of these addresses the reader honorifically. */
+const HONORIFIC = /আপনি|আপনার|আপনাকে|আপনাদের|আপনারা/
+/**
+ * The আপনি-form imperatives whose তুমি-form §5 spells out (করো, দেখো, বেছে নাও).
+ * The trailing lookahead is load-bearing, never a bare substring match: `দেখানো`
+ * ("shown", an impersonal participle that addresses nobody) opens with `দেখান`,
+ * so a match without it would flag compliant copy and the gate would be answered
+ * by weakening it.
+ */
+const FORMAL_IMPERATIVE = /(?:করুন|দেখুন|দেখান|বেছে নিন)(?![ঀ-৿])/
+
+/**
+ * The bn values this branch added or edited, or null when there is nothing to
+ * diff against (`I18N_BASE_REF` unset — a bare local run; CI always supplies it).
+ *
+ * Diff scope rather than a catalog-wide sweep, for the same reason
+ * `changedValueQa` is diff-scoped: the inherited catalog is majority-আপনি, so a
+ * repo-wide assertion could only land as another baselined COUNT, and a count
+ * cannot tell "one fixed" from "one fixed and one broken". Nothing is stored
+ * here, so two i18n branches have no ledger line to conflict on, and every value
+ * a branch writes is held to §5 at zero tolerance.
+ */
+function changedBnValues(): Record<string, string> | null {
+  const baseRef = process.env.I18N_BASE_REF
+  if (!baseRef) return null
+  const git = (args: string[]) =>
+    execFileSync('git', args, { cwd: REPO, encoding: 'utf-8', maxBuffer: 64 * 1024 * 1024 })
+  // A ref that IS configured but cannot be resolved throws: a gate that cannot
+  // run must fail, never pass quietly.
+  git(['rev-parse', '--verify', `${baseRef}^{commit}`])
+  let from: string
+  try {
+    from = git(['merge-base', baseRef, 'HEAD']).trim()
+  } catch {
+    // CI checks out at depth 1 and fetches the base at depth 1 too, so there is
+    // no shared history to find a merge base in; the base tip needs only the two
+    // trees.
+    from = baseRef
+  }
+  let base: Record<string, string> = {}
+  try {
+    base = flatten(JSON.parse(git(['show', `${from}:${CATALOG}`])))
+  } catch {
+    // No catalog at the base ref: every value in it is this branch's.
+  }
+  // The right-hand side is the runtime catalog, which is the WORKING TREE — the
+  // state a developer running this locally is asking about.
+  return Object.fromEntries(Object.entries(bn).filter(([key, value]) => base[key] !== value))
+}
+
+describe('bn register (style/bn.md §5)', () => {
+  it('[changed-values] addresses the reader as তুমি, never আপনি', () => {
+    const changed = changedBnValues()
+    if (changed === null) {
+      // eslint-disable-next-line no-console -- stdout IS this gate's report channel: a gate that returns silently is one nobody can tell ran, and this skip is reachable on a bare local run
+      console.log('[changed-values] skipped — I18N_BASE_REF is unset, so there is no branch to diff.')
+      return
+    }
+    const bad = Object.entries(changed)
+      .filter(([, value]) => HONORIFIC.test(value) || FORMAL_IMPERATIVE.test(value))
+      .map(([key, value]) => `${key}: ${JSON.stringify(value.slice(0, 60))}`)
+    expect(bad, `${report(bad)}\n\nThere is no ceiling to raise for these — the value is yours.`)
+      .toEqual([])
+  })
 })
 
 describe('bn numerals (style/bn.md §2)', () => {
@@ -51,5 +142,33 @@ describe('bn numerals (style/bn.md §2)', () => {
       .filter(([, v]) => BENGALI_DIGITS.test(v))
       .map(([k]) => k)
     expect(bad.length, report(bad)).toBeLessThanOrEqual(8)
+  })
+
+  /**
+   * The ceiling above is inherited debt, and a ceiling alone cannot say WHOSE
+   * violation it is: a branch that adds one rides under it until the count
+   * finally crosses, and then the gate reds on whichever unrelated pull request
+   * happens to run next -- which is how two values added in separate PRs took
+   * this lane, and every other open PR's lane, red at once.
+   *
+   * So the count keeps guarding the inherited catalog while the values THIS
+   * BRANCH wrote are held at zero, exactly as §5's register check already is.
+   * Diff-scoped on purpose: the assertion names the key and the branch that owns
+   * it, and nothing is stored, so two i18n branches have no ledger line to
+   * conflict on.
+   */
+  it('[changed-values] uses Western digits at zero tolerance', () => {
+    const BENGALI_DIGITS = /[\u09e6-\u09ef]/
+    const changed = changedBnValues()
+    if (changed === null) {
+      // eslint-disable-next-line no-console -- stdout IS this gate's report channel, and this skip is reachable on a bare local run
+      console.log('[changed-values] skipped — I18N_BASE_REF is unset, so there is no branch to diff.')
+      return
+    }
+    const bad = Object.entries(changed)
+      .filter(([, value]) => BENGALI_DIGITS.test(value))
+      .map(([key, value]) => `${key}: ${JSON.stringify(value.slice(0, 60))}`)
+    expect(bad, `${report(bad)}\n\nThere is no ceiling to raise for these — the value is yours.`)
+      .toEqual([])
   })
 })

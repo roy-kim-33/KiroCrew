@@ -11,10 +11,21 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 
+@web.middleware
+async def _owner_identity(request, handler):
+    request["user"] = "local-app"
+    request["app"] = ""
+    state = request.app.get("state")
+    if state is not None:
+        state.owner_id = ""
+    return await handler(request)
+
+
 def _make_app() -> web.Application:
     from kiro_crew.dashboard.handlers import api_kirocrew_config_patch
 
-    app = web.Application()
+    app = web.Application(middlewares=[_owner_identity])
+    app["state"] = MagicMock()
     app.router.add_patch("/api/config/kirocrew", api_kirocrew_config_patch)
     return app
 
@@ -72,6 +83,54 @@ async def _patch(client, path, value):
     return await client.patch("/api/config/kirocrew", json={"path": path, "value": value})
 
 
+def _arm(app: web.Application, state: SimpleNamespace) -> None:
+    """Wire the server's real config appliers and the watcher onto a PATCH app.
+
+    A PATCH applies none of its side effects in the handler: it writes, then
+    runs one watcher cycle, and the registered appliers -- the same ones
+    ``server._register_config_watch`` arms at boot -- do the work. Tests that pin
+    "a PATCH takes effect without a restart" therefore arm exactly that
+    registration against a stubbed state, so they exercise the real path a CLI
+    or ``$EDITOR`` write also takes. The gateway starts the watcher post-bind
+    (``_kick_config_watch``, never an ``on_startup`` hook, per
+    ``no-new-work-on-gateway-boot-path``); this harness has no bind step, so it
+    awaits the same ``start`` from an ``on_startup`` hook of its own. Cleanup
+    stops it; the suite-wide autouse fixture then drops the process watcher.
+    """
+    from kiro_crew.config import live
+    from kiro_crew.config.loader import KiroCrewConfig
+    from kiro_crew.dashboard.server import _register_config_watch
+
+    app["state"] = state
+    state.set_dynamic_cards_enabled = MagicMock()
+    initial = KiroCrewConfig.load()
+    _register_config_watch(app, state, initial=initial)  # type: ignore[arg-type]
+
+    async def _start_watch(_app: web.Application) -> None:
+        await live.watch().start(initial=initial)
+
+    app.on_startup.append(_start_watch)
+
+
+def _live_state(**overrides) -> SimpleNamespace:
+    """The slice of ``DashboardState`` the config appliers reach for."""
+    sessions = MagicMock(spec=["refresh_defaults", "reload_provider_factory"])
+    sessions.refresh_defaults = AsyncMock()
+    sessions.reload_provider_factory = AsyncMock()
+    base = dict(
+        sessions=sessions,
+        subagents=MagicMock(spec=["update_completion_keep"]),
+        workflow_service=None,
+        channel_manager=None,
+        _slots={},
+        push_slots_update=lambda: None,
+        push_refresh=MagicMock(),
+        notify=MagicMock(),
+    )
+    base.update(overrides)
+    return SimpleNamespace(**base)
+
+
 # ── Per-role models (agent.role_models.*) ─────────────────────────────────
 
 
@@ -86,6 +145,36 @@ class TestRoleModels:
         assert data["agent"]["role_models"]["subagent"] == "claude-sonnet-4.6"
         # Sibling agent keys survive the nested write.
         assert data["agent"]["approval_mode"] == "auto"
+
+    @pytest.mark.asyncio
+    async def test_a_write_the_publish_floor_refuses_is_a_coded_400_not_a_500(
+        self, tmp_config, monkeypatch
+    ) -> None:
+        """``ConfigWriteRefused`` is a ``ValueError``, but it is the operator's input
+        being declined, not a server failure: it must be answered as a coded 400
+        carrying the floor's one-line instruction, before the generic ``ValueError``
+        arm that reports a malformed section as a 500. The field is not editable
+        through this surface today, so the refusal is raised the way the floor
+        raises it rather than provoked through the body."""
+        from kiro_crew.config import loader as loader_mod
+        from kiro_crew.config.loader import ConfigWriteRefused
+
+        message = (
+            "agent.deepseek_env entry 'DEEPSEEK_API_KEY' holds a literal value, so the "
+            "config write was refused."
+        )
+
+        def refuse(*_args, **_kwargs):
+            raise ConfigWriteRefused(message)
+
+        monkeypatch.setattr(loader_mod, "update_config_locked", refuse)
+        async with TestClient(TestServer(_make_app())) as c:
+            resp = await _patch(c, "agent.role_models.subagent", "auto")
+            assert resp.status == 400
+            body = await resp.json()
+            assert body["code"] == "config_write_refused"
+            assert body["error"] == message
+        assert json.loads(tmp_config.read_text(encoding="utf-8")) == _seed_config()
 
     @pytest.mark.asyncio
     async def test_role_model_auto_allowed(self, tmp_config) -> None:
@@ -125,9 +214,14 @@ class TestRoleModels:
 
     @pytest.mark.asyncio
     async def test_background_role_triggers_rebuild(self, tmp_config) -> None:
-        # A background-model change must rewrite the lite/heartbeat specs.
+        # A background-model change must rewrite the lite/heartbeat specs. The
+        # rewrite is the server's ``agent.role_models.background`` applier, so
+        # the test arms the real registration and lets the PATCH's watcher
+        # cycle drive it.
+        app = _make_app()
+        _arm(app, _live_state())
         with patch("kiro_crew.agent.rebuild_agent_config") as rebuild:
-            async with TestClient(TestServer(_make_app())) as c:
+            async with TestClient(TestServer(app)) as c:
                 resp = await _patch(c, "agent.role_models.background", "claude-sonnet-4.6")
                 assert resp.status == 200
             rebuild.assert_called_once()
@@ -207,6 +301,48 @@ class TestTerminalShell:
             assert resp.status == 400
 
 
+# ── Terminal completion popup (dashboard.terminal.completion.enabled) ─────
+
+
+class TestTerminalCompletionEnabled:
+    """The Settings → Display → Terminal toggle behind the completion popup."""
+
+    @pytest.mark.asyncio
+    async def test_false_written_nested(self, tmp_config) -> None:
+        app, _ = _make_app_with_state()
+        async with TestClient(TestServer(app)) as client:
+            resp = await _patch(client, "dashboard.terminal.completion.enabled", False)
+            assert resp.status == 200
+        data = json.loads(tmp_config.read_text())
+        assert data["dashboard"]["terminal"]["completion"]["enabled"] is False
+
+    @pytest.mark.asyncio
+    async def test_write_keeps_sibling_completion_keys(self, tmp_config) -> None:
+        # `completion.commands` (the probe allowlist) lives in the same object;
+        # flipping the toggle must not drop it.
+        tmp_config.write_text(
+            json.dumps({"dashboard": {"terminal": {"completion": {"commands": ["gh"]}}}})
+        )
+        app, _ = _make_app_with_state()
+        async with TestClient(TestServer(app)) as client:
+            resp = await _patch(client, "dashboard.terminal.completion.enabled", False)
+            assert resp.status == 200
+        data = json.loads(tmp_config.read_text())
+        assert data["dashboard"]["terminal"]["completion"] == {
+            "commands": ["gh"],
+            "enabled": False,
+        }
+
+    @pytest.mark.asyncio
+    async def test_non_boolean_rejected(self, tmp_config) -> None:
+        # `bool("false")` is True: the route must refuse rather than coerce, so
+        # the completion reader's literal-``False`` check keeps meaning "off".
+        app, _ = _make_app_with_state()
+        async with TestClient(TestServer(app)) as client:
+            resp = await _patch(client, "dashboard.terminal.completion.enabled", "false")
+            assert resp.status == 400
+
+
 class TestPatchGeneral:
     @pytest.mark.asyncio
     async def test_unknown_field_returns_400(self, tmp_config) -> None:
@@ -246,6 +382,60 @@ class TestEnumValidator:
         async with TestClient(TestServer(_make_app())) as c:
             resp = await _patch(c, "agent.approval_mode", 123)
             assert resp.status == 400
+
+
+# ── Sidebar folder sort mode ─────────────────────────────────────────────
+
+
+class TestFolderSortRoundTrip:
+    """``dashboard.folder_sort`` is the one stored copy of the sidebar's folder
+    order, written by the sidebar menu and read back by the sidebar AND by the
+    ``kirocrew-dashboard`` MCP server -- so what a PATCH stores must be exactly
+    what a fresh load reads, and nothing outside the mode list may land."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("mode", ["custom", "name", "created"])
+    async def test_every_mode_round_trips_through_the_config_file(self, tmp_config, mode) -> None:
+        from kiro_crew.config.loader import KiroCrewConfig
+
+        async with TestClient(TestServer(_make_app())) as c:
+            resp = await _patch(c, "dashboard.folder_sort", mode)
+            assert resp.status == 200, await resp.text()
+        stored = json.loads(tmp_config.read_text(encoding="utf-8"))
+        assert stored["dashboard"]["folder_sort"] == mode
+        assert KiroCrewConfig.load().dashboard.folder_sort == mode
+
+    @pytest.mark.asyncio
+    async def test_a_value_outside_the_mode_list_is_refused_and_the_file_untouched(
+        self, tmp_config
+    ) -> None:
+        from kiro_crew.config.loader import KiroCrewConfig
+
+        async with TestClient(TestServer(_make_app())) as c:
+            assert (await _patch(c, "dashboard.folder_sort", "name")).status == 200
+            for bad in ("alphabetical", "", "Name", 1, None, ["name"]):
+                resp = await _patch(c, "dashboard.folder_sort", bad)
+                assert resp.status == 400, bad
+        assert KiroCrewConfig.load().dashboard.folder_sort == "name"
+
+    def test_the_allowlist_enum_is_the_loader_list_spelled_once(self) -> None:
+        """Three spellings of the same set -- the dataclass field's enum metadata,
+        the shared constant, and the PATCH allowlist -- pinned equal, so a fourth
+        mode cannot be writable without being loadable or the other way round."""
+        from dataclasses import fields
+
+        from kiro_crew.config.sections import (
+            FOLDER_SORT_DEFAULT,
+            FOLDER_SORT_MODES,
+            DashboardConfig,
+        )
+        from kiro_crew.dashboard.handlers.core import _EDITABLE_CONFIG
+
+        spec = _EDITABLE_CONFIG["dashboard.folder_sort"]
+        assert spec == {"type": "enum", "values": list(FOLDER_SORT_MODES)}
+        field = next(f for f in fields(DashboardConfig) if f.name == "folder_sort")
+        assert field.metadata["enum"] == list(FOLDER_SORT_MODES)
+        assert field.default == FOLDER_SORT_DEFAULT == "custom"
 
 
 # ── Int validator ────────────────────────────────────────────────────────
@@ -316,6 +506,29 @@ class TestFloatValidator:
 
 
 class TestBoolValidator:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("value", [False, True])
+    async def test_tool_search_toggle_round_trips(self, tmp_config, value) -> None:
+        data = _seed_config()
+        data["agent"]["tool_search"] = not value
+        tmp_config.write_text(json.dumps(data), encoding="utf-8")
+        async with TestClient(TestServer(_make_app())) as client:
+            response = await _patch(client, "agent.tool_search", value)
+            assert response.status == 200
+            assert (await response.json())["agent"]["tool_search"] is value
+        data["agent"]["tool_search"] = value
+        assert json.loads(tmp_config.read_text(encoding="utf-8"))["agent"] == data["agent"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("value", ["false", 0, None])
+    async def test_tool_search_rejects_non_boolean(self, tmp_config, value) -> None:
+        before = tmp_config.read_bytes()
+        async with TestClient(TestServer(_make_app())) as client:
+            response = await _patch(client, "agent.tool_search", value)
+            assert response.status == 400
+            assert (await response.json())["error"] == "must be a boolean"
+        assert tmp_config.read_bytes() == before
+
     @pytest.mark.asyncio
     async def test_valid_bool_passes(self, tmp_config) -> None:
         async with TestClient(TestServer(_make_app())) as c:
@@ -466,30 +679,49 @@ class TestCompletionKeepHotReload:
 
     @pytest.mark.asyncio
     async def test_mode_change_calls_setter_with_loader_validated_value(self, tmp_config) -> None:
-        """PATCH agent.completion_keep invokes update_completion_keep with the
-        loader-validated mode and the current chars value."""
-        app, subagents = _make_app_with_state()
-        async with TestClient(TestServer(app)) as c:
-            resp = await _patch(c, "agent.completion_keep", "tail")
-            assert resp.status == 200
-        subagents.update_completion_keep.assert_called_once()
-        mode, chars = subagents.update_completion_keep.call_args.args
-        assert mode == "tail"
+        """PATCH agent.completion_keep reaches the manager's applier before the
+        response, carrying the loader-validated mode and the current chars.
+
+        ``SubagentManager`` registers its own applier in its constructor and
+        ``test_subagent_config_hot_reload`` pins what it does with the change;
+        this end pins that a PATCH delivers the change synchronously.
+        """
+        from kiro_crew.config import live
+
+        seen: list = []
+        app = _make_app()
+        _arm(app, _live_state())
+        sub = live.subscribe("agent.completion_keep", callback=seen.append, name="probe")
+        try:
+            async with TestClient(TestServer(app)) as c:
+                resp = await _patch(c, "agent.completion_keep", "tail")
+                assert resp.status == 200
+        finally:
+            sub.cancel()
+        assert len(seen) == 1
+        assert seen[0].new.agent.completion_keep == "tail"
         # Default chars come from the loader since the seed config doesn't
         # set agent.completion_keep_chars.
-        assert isinstance(chars, int)
+        assert isinstance(seen[0].new.agent.completion_keep_chars, int)
 
     @pytest.mark.asyncio
     async def test_chars_change_calls_setter(self, tmp_config) -> None:
-        """PATCH agent.completion_keep_chars invokes update_completion_keep."""
-        app, subagents = _make_app_with_state()
-        async with TestClient(TestServer(app)) as c:
-            resp = await _patch(c, "agent.completion_keep_chars", 7500)
-            assert resp.status == 200
-        subagents.update_completion_keep.assert_called_once()
-        mode, chars = subagents.update_completion_keep.call_args.args
-        assert chars == 7500
-        assert mode in ("head", "tail", "both")  # whatever the loader settled on
+        """PATCH agent.completion_keep_chars reaches the manager's applier."""
+        from kiro_crew.config import live
+
+        seen: list = []
+        app = _make_app()
+        _arm(app, _live_state())
+        sub = live.subscribe("agent.completion_keep_chars", callback=seen.append, name="probe")
+        try:
+            async with TestClient(TestServer(app)) as c:
+                resp = await _patch(c, "agent.completion_keep_chars", 7500)
+                assert resp.status == 200
+        finally:
+            sub.cancel()
+        assert len(seen) == 1
+        assert seen[0].new.agent.completion_keep_chars == 7500
+        assert seen[0].new.agent.completion_keep in ("head", "tail", "both")
 
     @pytest.mark.asyncio
     async def test_invalid_mode_does_not_call_setter(self, tmp_config) -> None:
@@ -633,13 +865,54 @@ class TestDefaultModelPatch:
     @pytest.mark.asyncio
     async def test_reloads_provider_factory(self, tmp_config) -> None:
         """The factory captures the model at build time — defaults must refresh."""
-        app, sessions = _make_app_with_sessions()
-        async with TestClient(TestServer(app)) as c:
-            assert (await _patch(c, "agent.model", "claude-sonnet-4.5")).status == 200
-        sessions.refresh_defaults.assert_awaited_once()
+        # ``SessionManager`` owns the ``refresh_defaults`` applier (pinned in
+        # test_session_config_hot_reload); this end pins that the PATCH delivers
+        # the change synchronously and that the server's own appliers never
+        # take the destructive provider-switch path for a default change.
+        from kiro_crew.config import live
+
+        seen: list = []
+        state = _live_state()
+        app = _make_app()
+        _arm(app, state)
+        sub = live.subscribe("agent.model", callback=seen.append, name="probe")
+        try:
+            with patch(
+                "kiro_crew.agent.rebuild_agent_config_reporting",
+                return_value=(tmp_config, True),
+            ):
+                async with TestClient(TestServer(app)) as c:
+                    assert (await _patch(c, "agent.model", "claude-sonnet-4.5")).status == 200
+        finally:
+            sub.cancel()
+        assert [c.new.agent.model for c in seen] == ["claude-sonnet-4.5"]
         # A default change must NEVER take the destructive path — that clears
         # _sessions and shuts live providers down, killing in-flight turns.
-        sessions.reload_provider_factory.assert_not_awaited()
+        state.sessions.reload_provider_factory.assert_not_awaited()
+        state.push_refresh.assert_called_once_with("agents")
+
+    @pytest.mark.asyncio
+    async def test_failed_spec_rebuild_surfaces_error_and_stays_pending(self, tmp_config) -> None:
+        """PATCH persists first, so a failed derived-spec rebuild must be visible
+        and remain queued for the watcher's automatic retry."""
+        from kiro_crew.config import live
+
+        state = _live_state()
+        app = _make_app()
+        _arm(app, state)
+        with patch(
+            "kiro_crew.agent.rebuild_agent_config_reporting",
+            side_effect=OSError("spec directory is read-only"),
+        ):
+            async with TestClient(TestServer(app)) as c:
+                resp = await _patch(c, "agent.model", "claude-sonnet-4.5")
+                assert resp.status == 200
+
+        state.push_refresh.assert_not_called()
+        state.notify.assert_called_once()
+        assert any(
+            "agent.model" in missed for _subscription, missed in live.watch()._stale.values()
+        )
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -700,13 +973,26 @@ class TestDefaultReasoningEffortPatch:
 
     @pytest.mark.asyncio
     async def test_reloads_provider_factory(self, tmp_config) -> None:
-        app, sessions = _make_app_with_sessions()
-        async with TestClient(TestServer(app)) as c:
-            assert (await _patch(c, "agent.reasoning_effort", "xhigh")).status == 200
-        sessions.refresh_defaults.assert_awaited_once()
+        # ``SessionManager`` owns the ``refresh_defaults`` applier (pinned in
+        # test_session_config_hot_reload); this end pins that the PATCH delivers
+        # the change synchronously and that the server's own appliers never
+        # take the destructive provider-switch path for a default change.
+        from kiro_crew.config import live
+
+        seen: list = []
+        state = _live_state()
+        app = _make_app()
+        _arm(app, state)
+        sub = live.subscribe("agent.reasoning_effort", callback=seen.append, name="probe")
+        try:
+            async with TestClient(TestServer(app)) as c:
+                assert (await _patch(c, "agent.reasoning_effort", "xhigh")).status == 200
+        finally:
+            sub.cancel()
+        assert [c.new.agent.reasoning_effort for c in seen] == ["xhigh"]
         # A default change must NEVER take the destructive path — that clears
         # _sessions and shuts live providers down, killing in-flight turns.
-        sessions.reload_provider_factory.assert_not_awaited()
+        state.sessions.reload_provider_factory.assert_not_awaited()
 
 
 # ── Local telemetry switch (telemetry.enabled) ───────────────────────────
@@ -743,10 +1029,24 @@ class TestTelemetryEnabledPatch:
             assert (await _patch(c, "telemetry.enabled", "yes")).status == 400
 
     @pytest.mark.asyncio
-    async def test_drops_the_memoized_recorder(self, tmp_config) -> None:
-        with patch("kiro_crew.metrics.provider.shutdown") as reset:
-            async with TestClient(TestServer(_make_app())) as c:
-                assert (await _patch(c, "telemetry.enabled", True)).status == 200
+    async def test_drops_the_memoized_recorder(self, tmp_config, monkeypatch) -> None:
+        # The recorder rebuild is the telemetry applier ``metrics.provider``
+        # registers at boot; arm it the way boot does and let the PATCH's
+        # watcher cycle drive it.
+        from kiro_crew.metrics import provider as metrics_provider
+
+        monkeypatch.setattr(metrics_provider, "_config_sub", None)
+        app = _make_app()
+        _arm(app, _live_state())
+        metrics_provider.watch_config()
+        try:
+            with patch("kiro_crew.metrics.provider.shutdown") as reset:
+                async with TestClient(TestServer(app)) as c:
+                    assert (await _patch(c, "telemetry.enabled", True)).status == 200
+        finally:
+            sub = metrics_provider._config_sub
+            if sub is not None:
+                sub.cancel()
         reset.assert_called_once()
 
     @pytest.mark.asyncio

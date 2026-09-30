@@ -380,10 +380,9 @@ describe('FileExplorerPage reveal', () => {
   })
 
   it('does not alert locally when the mocked backend resolves with a copy fallback', async () => {
-    // The copy-fallback confirmation is centralized in api.revealPath itself
-    // (client.ts), right next to its copyToClipboard call, so this call site
-    // must not also alert — that would double-notify once the real client
-    // resolves.
+    // The copy fallback is centralized in revealOrOpen (FilePathMenu.tsx),
+    // which calls api.revealPath and then copyToClipboard itself without an
+    // alert, so this call site must not add one once the real client resolves.
     const reveal = spyReveal({ ok: true, copy: '/home/user/notes.txt' })
     const alerted = captureAlert()
     renderPage()
@@ -404,7 +403,13 @@ describe('FileExplorerPage reveal', () => {
     await ready()
     await openFromTree('notes.txt')
     await pickFromOverflow('Show in file manager')
-    await waitFor(() => expect(alerted).toHaveBeenCalledWith(i18nT('components.filePathMenu.reveal_failed')))
+    // In place under the viewer bar through the shared ErrorNotice — no
+    // blocking dialog, and the raw server prose never reaches it.
+    const notice = await screen.findByTestId('file-viewer-reveal-error')
+    expect(notice).toHaveAttribute('role', 'alert')
+    expect(notice).toHaveTextContent(i18nT('components.filePathMenu.reveal_failed'))
+    expect(notice).not.toHaveTextContent('access denied')
+    expect(alerted).not.toHaveBeenCalled()
   })
 
   /** Publish a gateway platform into the cache the prerequisite gate owns. */
@@ -860,5 +865,35 @@ describe('FileExplorerPage backend banner', () => {
     // Cached data keeps the page initialized, so the banner is reachable.
     await waitFor(() => expect(screen.getByText(/Backend not reachable/)).toBeInTheDocument())
     expect(screen.getByText(/connection refused/)).toBeInTheDocument()
+  })
+
+  it('surfaces a folder-open (tree) failure instead of a silent blank pane', async () => {
+    const { qc } = renderPage()
+    await ready()
+    // A refresh of an already-listed folder fails (e.g. it became unreadable).
+    // React Query keeps the last good data, so the tree stays put — but the
+    // banner must appear so the failure is not silent.
+    vi.mocked(fileExplorerApi.tree).mockRejectedValue(new Error('path not allowed'))
+    await act(async () => {
+      await qc.refetchQueries({ queryKey: ['file-explorer', 'tree'] }).catch(() => {})
+    })
+    await waitFor(() => expect(screen.getByText(/Cannot open this folder/)).toBeInTheDocument())
+    expect(screen.getByText(/path not allowed/)).toBeInTheDocument()
+  })
+
+  it('shows an empty state, not a perpetual skeleton, when a folder fails to load with no prior data', async () => {
+    // First load of the folder errors (no cached entries to fall back on): a
+    // symlink resolving outside the allow-list makes /api/tree 403 from the
+    // start. The pane must resolve to an empty state rather than a loading
+    // skeleton that never completes.
+    vi.mocked(fileExplorerApi.tree).mockRejectedValue(new Error('path not allowed'))
+    renderPage()
+    // Not ready() — that waits for .mc-fe-tree, which never appears on a first-
+    // load error. The banner and the empty state are the terminal render.
+    await waitFor(() => expect(screen.getByText(/Cannot open this folder/)).toBeInTheDocument())
+    expect(screen.getByText(/This folder is unavailable/)).toBeInTheDocument()
+    expect(document.querySelector('.mc-fe-tree')).not.toBeInTheDocument()
+    // A recovery action sits beside the empty state so the user is not stuck.
+    expect(screen.getByText(/Go to parent folder/)).toBeInTheDocument()
   })
 })

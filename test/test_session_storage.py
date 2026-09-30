@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import shutil
+import threading
 import time
 from pathlib import Path, PurePosixPath
 from typing import Callable
@@ -26,7 +27,7 @@ import pytest
 
 from kiro_crew import session_storage
 from kiro_crew.config import paths
-from kiro_crew.history import transcript_stem
+from kiro_crew.history import ConversationLog, transcript_stem
 from kiro_crew.session_storage import SessionIndex, SessionStorageError
 
 _NOW = 1_700_000_000.0
@@ -87,6 +88,17 @@ def _transcript(crew_home: Path, stem: str, *, size: int, age_days: float) -> in
 def _archive_segment(crew_home: Path, stem: str, stamp: str, *, size: int, age_days: float) -> int:
     path = crew_home / "sessions" / "archive" / f"{stem}__{stamp}.jsonl"
     path.write_bytes(b"a" * size)
+    mtime = _NOW - age_days * _DAY
+    os.utime(path, (mtime, mtime))
+    return size
+
+
+def _attachment(crew_home: Path, stem: str, name: str, *, size: int, age_days: float) -> int:
+    """One image in the session's attachments directory, aged with its transcript."""
+    adir = crew_home / "sessions" / f"{stem}.attachments"
+    adir.mkdir(exist_ok=True)
+    path = adir / name
+    path.write_bytes(b"i" * size)
     mtime = _NOW - age_days * _DAY
     os.utime(path, (mtime, mtime))
     return size
@@ -161,6 +173,717 @@ class TestPairing:
 
         assert report.total_sessions == 2
         assert report.reclaimable_sessions == 2
+
+
+def _crew_log(unit_id: str, slot: str, *, closed: bool = True) -> int:
+    """One session crew-log unit whose header names *slot*; its size on disk.
+
+    Closed ``destroyed``, the one close the retention sweep collects, so a test that runs
+    the sweep sees a unit it would take unless something holds it.
+    """
+    from crew_log_type_helpers import minimal_data
+
+    from kiro_crew.crew_log import CrewLog
+    from kiro_crew.crew_log.schema import KIND_SESSION
+
+    log = CrewLog.create(KIND_SESSION, unit_id, owner="default", agent="kirocrew", slot=slot)
+    log.append("session/opened", minimal_data(KIND_SESSION, "session/opened"), src="gateway")
+    if closed:
+        log.append("session/closed", {"reason": "destroyed"}, src="gateway")
+    path = log.path
+    del log
+    old = _NOW - 40 * _DAY
+    for child in path.parent.iterdir():
+        os.utime(child, (old, old))
+    return sum(child.stat().st_size for child in path.parent.iterdir() if child.is_file())
+
+
+def _crew_log_exists(unit_id: str) -> bool:
+    from kiro_crew.crew_log import CrewLog
+    from kiro_crew.crew_log.schema import KIND_SESSION
+
+    return CrewLog.exists(KIND_SESSION, unit_id)
+
+
+class TestCrewLogsAreTheSessions:
+    """A session's crew logs are measured, reclaimed and restored with it.
+
+    One unit per ACP id the conversation ran under, so a reset leaves two; both
+    belong to the transcript their header's slot names.
+    """
+
+    def test_the_report_counts_every_crew_log_unit(self, stores: tuple[Path, Path]) -> None:
+        crew_home, _ = stores
+        crew = _transcript(crew_home, "dashboard_chat-1", size=50, age_days=40)
+        before_reset = _crew_log("acp-before-reset", "chat-1")
+        after_reset = _crew_log("acp-after-reset", "chat-1")
+
+        report = session_storage.measure(_index(), now=_NOW)
+
+        assert report.total_sessions == 1
+        assert report.total_bytes == crew + before_reset + after_reset
+
+    def test_a_mapped_crew_log_unit_keeps_its_session_active(
+        self, stores: tuple[Path, Path]
+    ) -> None:
+        crew_home, _ = stores
+        _transcript(crew_home, "dashboard_chat-1", size=50, age_days=40)
+        _crew_log("acp-mapped", "chat-1")
+
+        index = _index(active={"acp-mapped"})
+        with pytest.raises(SessionStorageError, match="still in use"):
+            session_storage.move_to_trash(
+                ["dashboard_chat-1"], reason="manual", index=index, now=_NOW
+            )
+
+        assert _crew_log_exists("acp-mapped")
+
+    def test_trash_stages_them_outside_the_batch_and_restore_puts_them_back(
+        self, stores: tuple[Path, Path]
+    ) -> None:
+        from kiro_crew.crew_log.store import crew_log_trash_root
+
+        crew_home, _ = stores
+        _transcript(crew_home, "dashboard_chat-1", size=50, age_days=40)
+        size = _crew_log("acp-before-reset", "chat-1") + _crew_log("acp-after-reset", "chat-1")
+
+        batch = session_storage.move_to_trash(
+            ["dashboard_chat-1"], reason="manual", index=_index(), now=_NOW
+        )
+
+        assert not _crew_log_exists("acp-before-reset")
+        assert not _crew_log_exists("acp-after-reset")
+        staged = session_storage.trash_root() / batch.batch_id
+        assert not any(
+            "log.jsonl" == path.name for path in staged.rglob("*")
+        ), "a crew log was staged in the agent-writable batch"
+        assert (crew_log_trash_root() / batch.batch_id / "dashboard_chat-1").is_dir()
+        assert batch.bytes == 50 + size
+        assert session_storage.list_trash()[0].bytes == 50 + size
+
+        assert session_storage.restore(batch.batch_id) == 1
+
+        assert _crew_log_exists("acp-before-reset")
+        assert _crew_log_exists("acp-after-reset")
+        assert not (crew_log_trash_root() / batch.batch_id).exists()
+
+    def test_emptying_the_trash_removes_the_staged_crew_logs(
+        self, stores: tuple[Path, Path]
+    ) -> None:
+        from kiro_crew.crew_log.store import crew_log_trash_root
+
+        crew_home, _ = stores
+        _transcript(crew_home, "dashboard_chat-1", size=50, age_days=40)
+        _crew_log("acp-before-reset", "chat-1")
+        batch = session_storage.move_to_trash(
+            ["dashboard_chat-1"], reason="manual", index=_index(), now=_NOW
+        )
+
+        freed = session_storage.empty_trash([batch.batch_id])
+
+        # The manifest is freed too, so the total is at least what was staged.
+        assert freed >= batch.bytes
+        assert not (crew_log_trash_root() / batch.batch_id).exists()
+        assert not _crew_log_exists("acp-before-reset")
+
+    def test_a_crew_log_a_writer_holds_leaves_the_whole_session_in_place(
+        self, stores: tuple[Path, Path]
+    ) -> None:
+        from crew_log_type_helpers import minimal_data
+
+        from kiro_crew.crew_log import CrewLog
+        from kiro_crew.crew_log.schema import KIND_SESSION
+
+        crew_home, _ = stores
+        _transcript(crew_home, "dashboard_chat-1", size=50, age_days=40)
+        _crew_log("acp-idle", "chat-1")
+        held = CrewLog.create(KIND_SESSION, "acp-held", owner="default", agent="k", slot="chat-1")
+        held.append("session/opened", minimal_data(KIND_SESSION, "session/opened"), src="gateway")
+        old = _NOW - 40 * _DAY
+        for child in held.path.parent.iterdir():
+            os.utime(child, (old, old))
+
+        with pytest.raises(SessionStorageError, match="resumed"):
+            session_storage.move_to_trash(
+                ["dashboard_chat-1"], reason="manual", index=_index(), now=_NOW
+            )
+
+        assert (crew_home / "sessions" / "dashboard_chat-1.jsonl").is_file()
+        assert _crew_log_exists("acp-idle"), "a unit staged before the refusal was not put back"
+        assert _crew_log_exists("acp-held")
+        del held
+
+    def test_an_unreadable_crew_log_staging_keeps_the_whole_session_staged(
+        self, stores: tuple[Path, Path], monkeypatch
+    ) -> None:
+        """A staging that cannot be listed is not an empty one.
+
+        Read as empty, the restore would put the transcript back, drop the manifest
+        entry, and leave the staged units with nothing that lists or restores them.
+        """
+        from kiro_crew.crew_log.store import crew_log_trash_root
+
+        crew_home, _ = stores
+        live = crew_home / "sessions" / "dashboard_chat-1.jsonl"
+        _transcript(crew_home, "dashboard_chat-1", size=50, age_days=40)
+        _crew_log("acp-before-reset", "chat-1")
+        _crew_log("acp-after-reset", "chat-1")
+        batch = session_storage.move_to_trash(
+            ["dashboard_chat-1"], reason="manual", index=_index(), now=_NOW
+        )
+        staging = crew_log_trash_root() / batch.batch_id / "dashboard_chat-1"
+        staged_before = sorted(child.name for child in staging.iterdir())
+        real_iterdir = Path.iterdir
+
+        def _unreadable(self: Path):
+            if self == staging:
+                raise PermissionError(errno.EACCES, "injected listing failure", str(self))
+            return real_iterdir(self)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(Path, "iterdir", _unreadable)
+            assert session_storage.restore(batch.batch_id) == 0
+
+        assert not live.exists(), "the transcript went back without its crew logs"
+        assert session_storage.list_trash()[0].sessions == 1
+        assert sorted(child.name for child in staging.iterdir()) == staged_before
+        assert not _crew_log_exists("acp-before-reset")
+        assert not _crew_log_exists("acp-after-reset")
+
+        assert session_storage.restore(batch.batch_id) == 1
+        assert live.is_file()
+        assert _crew_log_exists("acp-before-reset")
+        assert _crew_log_exists("acp-after-reset")
+
+    @pytest.mark.parametrize("failure", ["listing", "walk"])
+    def test_a_crew_log_scan_that_cannot_complete_moves_nothing(
+        self, stores: tuple[Path, Path], monkeypatch, failure: str
+    ) -> None:
+        """A reclaim stages what the scan lists, so a short scan would split a session.
+
+        The transcript would go to the trash and its crew logs would stay behind,
+        attached to no row. So an incomplete crew-log scan refuses the whole move; the
+        storage report, a read, still answers with what it could list.
+        """
+        from kiro_crew.crew_log import store as crew_store
+
+        crew_home, _ = stores
+        live = crew_home / "sessions" / "dashboard_chat-1.jsonl"
+        _transcript(crew_home, "dashboard_chat-1", size=50, age_days=40)
+        _crew_log("acp-before-reset", "chat-1")
+
+        def _unlistable(**_kwargs):
+            raise OSError(errno.EIO, "injected crew-log listing failure")
+
+        def _unwalkable(_directory: Path):
+            raise OSError(errno.EIO, "injected crew-log walk failure")
+
+        with monkeypatch.context() as patch:
+            if failure == "listing":
+                patch.setattr(crew_store, "session_units_by_slot", _unlistable)
+            else:
+                patch.setattr(session_storage, "_tree_files", _unwalkable)
+            with pytest.raises(SessionStorageError, match="no session was moved"):
+                session_storage.move_to_trash(
+                    ["dashboard_chat-1"], reason="manual", index=_index(), now=_NOW
+                )
+            assert session_storage.measure(_index(), now=_NOW).total_sessions == 1
+
+        assert live.is_file()
+        assert _crew_log_exists("acp-before-reset")
+        assert session_storage.list_trash() == []
+
+    def test_a_staging_directory_that_cannot_be_created_puts_the_crew_logs_back(
+        self, stores: tuple[Path, Path], monkeypatch
+    ) -> None:
+        """The crew logs move first, so a later failure must return them with the rest."""
+        crew_home, _ = stores
+        live = crew_home / "sessions" / "dashboard_chat-1.jsonl"
+        _transcript(crew_home, "dashboard_chat-1", size=50, age_days=40)
+        _crew_log("acp-before-reset", "chat-1")
+        real_mkdir = Path.mkdir
+        batches = session_storage.trash_root()
+
+        def _mkdir(self: Path, *args, **kwargs):
+            if batches in self.parents and self.name == "crew":
+                raise OSError(errno.ENOSPC, "injected mkdir failure", str(self))
+            return real_mkdir(self, *args, **kwargs)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(Path, "mkdir", _mkdir)
+            try:
+                session_storage.move_to_trash(
+                    ["dashboard_chat-1"], reason="manual", index=_index(), now=_NOW
+                )
+            except SessionStorageError:
+                pass
+
+        assert live.is_file()
+        assert _crew_log_exists("acp-before-reset")
+        assert not self._held("acp-before-reset")
+        assert all(batch.sessions == 0 for batch in session_storage.list_trash())
+
+    def test_a_resume_after_the_last_refresh_keeps_the_crew_logs_and_the_session(
+        self, stores: tuple[Path, Path], monkeypatch
+    ) -> None:
+        """A read-only resume maps the session after *refresh* last looked.
+
+        Its mapping is in the live map, not yet in the file *refresh* reads, and it
+        writes nothing the mtime guard could see. The liveness read and the staging share
+        the lock the resume maps under, so the resume is seen and nothing moves.
+        """
+        import threading
+
+        from kiro_crew.crew_log import store as crew_store
+
+        crew_home, _ = stores
+        live = crew_home / "sessions" / "dashboard_chat-1.jsonl"
+        _transcript(crew_home, "dashboard_chat-1", size=50, age_days=40)
+        _crew_log("acp-before-reset", "chat-1")
+        lock = threading.RLock()
+        live_map: dict[str, str] = {}
+        real_purge = session_storage._purge_search_index
+        real_stage = crew_store.stage_unit
+        staged_under_lock: list[bool] = []
+
+        def _resume_then_purge(stems):
+            with lock:
+                live_map["acp-resumed"] = "dashboard_chat-1"
+            return real_purge(stems)
+
+        def _stage(*args, **kwargs):
+            staged_under_lock.append(lock._is_owned())  # type: ignore[attr-defined]
+            return real_stage(*args, **kwargs)
+
+        def _live_index() -> SessionIndex:
+            return _index(dict(live_map), active=set(live_map))
+
+        monkeypatch.setattr(session_storage, "_purge_search_index", _resume_then_purge)
+        monkeypatch.setattr(crew_store, "stage_unit", _stage)
+
+        try:
+            session_storage.move_to_trash(
+                ["dashboard_chat-1"],
+                reason="manual",
+                index=_index(),
+                now=_NOW,
+                refresh=_index,
+                activation=(lock, _live_index),
+            )
+        except SessionStorageError:
+            pass
+
+        assert live.is_file()
+        assert _crew_log_exists("acp-before-reset")
+        assert staged_under_lock == []
+        assert all(batch.sessions == 0 for batch in session_storage.list_trash())
+
+    def test_crew_logs_are_staged_inside_the_activation_lock(
+        self, stores: tuple[Path, Path], monkeypatch
+    ) -> None:
+        import threading
+
+        from kiro_crew.crew_log import store as crew_store
+
+        crew_home, _ = stores
+        _transcript(crew_home, "dashboard_chat-1", size=50, age_days=40)
+        _crew_log("acp-before-reset", "chat-1")
+        lock = threading.RLock()
+        real_stage = crew_store.stage_unit
+        staged_under_lock: list[bool] = []
+
+        def _stage(*args, **kwargs):
+            staged_under_lock.append(lock._is_owned())  # type: ignore[attr-defined]
+            return real_stage(*args, **kwargs)
+
+        monkeypatch.setattr(crew_store, "stage_unit", _stage)
+
+        batch = session_storage.move_to_trash(
+            ["dashboard_chat-1"],
+            reason="manual",
+            index=_index(),
+            now=_NOW,
+            activation=(lock, _index),
+        )
+
+        assert batch.sessions == 1
+        assert staged_under_lock == [True]
+
+    def test_a_unit_put_back_by_a_refused_move_carries_no_hold(
+        self, stores: tuple[Path, Path]
+    ) -> None:
+        """The staged unit goes back live with its session, so nothing keeps it held.
+
+        Named to sort first, so it is staged before the unit a writer holds refuses the move.
+        """
+        from crew_log_type_helpers import minimal_data
+
+        from kiro_crew.crew_log import CrewLog
+        from kiro_crew.crew_log.schema import KIND_SESSION
+
+        crew_home, _ = stores
+        _transcript(crew_home, "dashboard_chat-1", size=50, age_days=40)
+        _crew_log("acp-a-idle", "chat-1")
+        held = CrewLog.create(KIND_SESSION, "acp-z-held", owner="default", agent="k", slot="chat-1")
+        held.append("session/opened", minimal_data(KIND_SESSION, "session/opened"), src="gateway")
+        old = _NOW - 40 * _DAY
+        for child in held.path.parent.iterdir():
+            os.utime(child, (old, old))
+
+        with pytest.raises(SessionStorageError, match="resumed"):
+            session_storage.move_to_trash(
+                ["dashboard_chat-1"], reason="manual", index=_index(), now=_NOW
+            )
+
+        assert _crew_log_exists("acp-a-idle")
+        assert _crew_log_exists("acp-z-held")
+        assert not self._held("acp-a-idle")
+        del held
+
+    def test_an_occupied_crew_log_name_keeps_the_whole_session_staged(
+        self, stores: tuple[Path, Path]
+    ) -> None:
+        crew_home, _ = stores
+        _transcript(crew_home, "dashboard_chat-1", size=50, age_days=40)
+        _crew_log("acp-before-reset", "chat-1")
+        _crew_log("acp-after-reset", "chat-1")
+        batch = session_storage.move_to_trash(
+            ["dashboard_chat-1"], reason="manual", index=_index(), now=_NOW
+        )
+        _crew_log("acp-after-reset", "chat-2")  # the name is taken again
+
+        assert session_storage.restore(batch.batch_id) == 0
+
+        assert not (crew_home / "sessions" / "dashboard_chat-1.jsonl").exists()
+        assert not _crew_log_exists("acp-before-reset"), "restored without its sibling"
+        assert session_storage.list_trash()[0].sessions == 1
+
+    @staticmethod
+    def _fail_the_restore_after_the_crew_logs_went_back(monkeypatch, mode: str) -> list:
+        """Make the transcript's restore fail, then make staging a unit back fail too.
+
+        ``fsync``: every crew-log directory sync fails from then on, so neither unit can
+        be staged again. ``owned``: the session is resumed mid-restore, so the unit it
+        writes is leased and stays live. Returns the handles a resume keeps open.
+        """
+        from crew_log_type_helpers import minimal_data
+
+        from kiro_crew.crew_log import CrewLog
+        from kiro_crew.crew_log import store as crew_store
+        from kiro_crew.crew_log.schema import KIND_SESSION
+
+        failing = {"on": False}
+        handles: list = []
+        real_sync = crew_store._sync_down
+
+        def _sync_down(top: Path, leaf: Path) -> None:
+            if failing["on"]:
+                raise OSError(errno.EIO, "injected fsync failure")
+            real_sync(top, leaf)
+
+        def _move(src: Path, dst: Path, **_kwargs) -> bool:
+            if mode == "fsync":
+                failing["on"] = True
+                raise OSError(errno.EIO, "injected transcript move failure")
+            resumed = CrewLog.open(KIND_SESSION, "acp-before-reset")
+            resumed.append(
+                "session/opened", minimal_data(KIND_SESSION, "session/opened"), src="gateway"
+            )
+            handles.append(resumed)
+            return False
+
+        monkeypatch.setattr(crew_store, "_sync_down", _sync_down)
+        monkeypatch.setattr(session_storage, "_move_file_exclusive", _move)
+        return handles
+
+    @staticmethod
+    def _held(unit_id: str) -> bool:
+        from kiro_crew.crew_log.schema import KIND_SESSION
+        from kiro_crew.crew_log.store import TRASH_HOLD_FILE, unit_dir_for
+
+        directory = unit_dir_for(KIND_SESSION, unit_id)
+        return directory is not None and (directory / TRASH_HOLD_FILE).exists()
+
+    @pytest.mark.parametrize("mode", ["fsync", "owned"])
+    def test_a_unit_a_failed_restore_cannot_stage_again_is_held_from_the_sweep(
+        self, stores: tuple[Path, Path], monkeypatch, mode: str
+    ) -> None:
+        """A failed rollback leaves a unit live beside a staged transcript: it is held.
+
+        The session stays listed in the trash, the sweep does not expire the live half,
+        and restoring the session once the failure has passed makes it whole and lets
+        the unit age out again.
+        """
+        from kiro_crew.crew_log import store as crew_store
+
+        crew_home, _ = stores
+        live = crew_home / "sessions" / "dashboard_chat-1.jsonl"
+        _transcript(crew_home, "dashboard_chat-1", size=50, age_days=40)
+        _crew_log("acp-before-reset", "chat-1")
+        _crew_log("acp-after-reset", "chat-1")
+        batch = session_storage.move_to_trash(
+            ["dashboard_chat-1"], reason="manual", index=_index(), now=_NOW
+        )
+        with monkeypatch.context() as patch:
+            handles = self._fail_the_restore_after_the_crew_logs_went_back(patch, mode)
+            assert session_storage.restore(batch.batch_id) == 0
+
+        assert not live.exists(), "the transcript left the trash without its session"
+        assert session_storage.list_trash()[0].sessions == 1
+        assert _crew_log_exists("acp-before-reset")
+        assert self._held("acp-before-reset")
+        # Far past every retention window: a held unit is still not collected.
+        assert crew_store.sweep_expired(0, now=time.time() + 400 * 86400)[0] == 0
+        assert _crew_log_exists("acp-before-reset")
+
+        handles.clear()
+        assert session_storage.restore(batch.batch_id) == 1
+
+        assert live.is_file()
+        assert not self._held("acp-before-reset")
+        assert not self._held("acp-after-reset")
+        if mode == "fsync":
+            assert crew_store.sweep_expired(0, now=time.time() + 400 * 86400) == (2, 0)
+
+    def test_a_sweep_between_publishing_the_units_and_the_commit_takes_nothing(
+        self, stores: tuple[Path, Path], monkeypatch
+    ) -> None:
+        """The units go back before the transcript; a sweep in that gap must not take them.
+
+        Both units are closed and far past the window by the time the sweep runs, so an
+        unheld unit is collectable. Once the restore commits the holds are released and
+        the same sweep collects them, so the hold lasts exactly as long as the restore.
+        """
+        from kiro_crew.crew_log import store as crew_store
+
+        crew_home, _ = stores
+        live = crew_home / "sessions" / "dashboard_chat-1.jsonl"
+        _transcript(crew_home, "dashboard_chat-1", size=50, age_days=40)
+        _crew_log("acp-before-reset", "chat-1")
+        _crew_log("acp-after-reset", "chat-1")
+        batch = session_storage.move_to_trash(
+            ["dashboard_chat-1"], reason="manual", index=_index(), now=_NOW
+        )
+        later = time.time() + 400 * 86400
+        swept: list[tuple[int, int]] = []
+        real_move = session_storage._move_file_exclusive
+
+        def _sweep_then_move(src: Path, dst: Path, **kwargs) -> bool:
+            if not swept:
+                swept.append(crew_store.sweep_expired(0, now=later))
+            return real_move(src, dst, **kwargs)
+
+        monkeypatch.setattr(session_storage, "_move_file_exclusive", _sweep_then_move)
+
+        assert session_storage.restore(batch.batch_id) == 1
+
+        assert swept == [(0, 0)], "the sweep collected a unit the restore had published"
+        assert live.is_file()
+        assert _crew_log_exists("acp-before-reset")
+        assert _crew_log_exists("acp-after-reset")
+        assert not self._held("acp-before-reset")
+        assert not self._held("acp-after-reset")
+        assert crew_store.sweep_expired(0, now=later) == (2, 0)
+
+    def test_a_unit_whose_hold_cannot_be_made_durable_is_not_published(
+        self, stores: tuple[Path, Path], monkeypatch
+    ) -> None:
+        """The hold is synced before the unit goes back; a failed sync keeps it staged.
+
+        Published with a hold that is not on disk, a power loss would bring the unit back
+        unheld and the sweep could expire it while its transcript is still in the trash.
+        """
+        from kiro_crew.crew_log import store as crew_store
+        from kiro_crew.crew_log.store import crew_log_trash_root
+
+        crew_home, _ = stores
+        live = crew_home / "sessions" / "dashboard_chat-1.jsonl"
+        _transcript(crew_home, "dashboard_chat-1", size=50, age_days=40)
+        _crew_log("acp-before-reset", "chat-1")
+        batch = session_storage.move_to_trash(
+            ["dashboard_chat-1"], reason="manual", index=_index(), now=_NOW
+        )
+
+        def _fail(_directory: Path) -> None:
+            raise OSError(errno.EIO, "injected hold sync failure")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(crew_store, "_sync_hold_dir", _fail)
+            assert session_storage.restore(batch.batch_id) == 0
+
+        assert not _crew_log_exists("acp-before-reset")
+        assert not live.exists()
+        assert (crew_log_trash_root() / batch.batch_id / "dashboard_chat-1").is_dir()
+        assert session_storage.list_trash()[0].sessions == 1
+
+        assert session_storage.restore(batch.batch_id) == 1
+        assert _crew_log_exists("acp-before-reset")
+        assert not self._held("acp-before-reset")
+
+    def test_emptying_the_batch_releases_a_held_unit(
+        self, stores: tuple[Path, Path], monkeypatch
+    ) -> None:
+        from kiro_crew.crew_log.store import crew_log_trash_root
+
+        crew_home, _ = stores
+        _transcript(crew_home, "dashboard_chat-1", size=50, age_days=40)
+        _crew_log("acp-before-reset", "chat-1")
+        batch = session_storage.move_to_trash(
+            ["dashboard_chat-1"], reason="manual", index=_index(), now=_NOW
+        )
+        with monkeypatch.context() as patch:
+            self._fail_the_restore_after_the_crew_logs_went_back(patch, "fsync")
+            assert session_storage.restore(batch.batch_id) == 0
+        assert self._held("acp-before-reset")
+
+        session_storage.empty_trash([batch.batch_id])
+
+        assert not (crew_log_trash_root() / batch.batch_id).exists()
+        assert _crew_log_exists("acp-before-reset")
+        assert not self._held("acp-before-reset")
+
+    def test_a_manifest_uid_cannot_step_out_of_the_crew_log_staging(
+        self, stores: tuple[Path, Path]
+    ) -> None:
+        """The manifest is agent-writable; its uid must never become a ``..`` path."""
+        from kiro_crew.crew_log.schema import KIND_SESSION
+        from kiro_crew.crew_log.store import crew_log_root, crew_log_trash_root
+
+        crew_home, _ = stores
+        _transcript(crew_home, "dashboard_chat-1", size=50, age_days=40)
+        _crew_log("acp-forge", "chat-1")
+        batch = session_storage.move_to_trash(
+            ["dashboard_chat-1"], reason="manual", index=_index(), now=_NOW
+        )
+        # The planted staging: a real unit moved outside the hidden tree, and a manifest
+        # entry whose uid walks back out to it.
+        planted = session_storage.trash_root() / batch.batch_id / "forge"
+        planted.mkdir()
+        staged_uid = crew_log_trash_root() / batch.batch_id / "dashboard_chat-1"
+        for unit_dir in staged_uid.iterdir():
+            unit_dir.rename(planted / unit_dir.name)
+        escape = os.path.relpath(planted, crew_log_trash_root() / batch.batch_id)
+        manifest = session_storage.trash_root() / batch.batch_id / session_storage.MANIFEST_NAME
+        # First after the header, while the batch's crew-log staging still exists for
+        # the ``..`` to walk back out of.
+        header, *entries = manifest.read_text(encoding="utf-8").splitlines()
+        planted_entry = json.dumps({"uid": escape, "files": []})
+        manifest.write_text("\n".join([header, planted_entry, *entries]) + "\n", encoding="utf-8")
+
+        session_storage.restore(batch.batch_id)
+
+        assert not any((crew_log_root(KIND_SESSION)).glob("*")), "a planted unit was published"
+
+    def test_crew_logs_that_cannot_go_back_are_recorded_not_dropped(
+        self, stores: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A failed move puts the crew logs back; one it cannot is listed, never lost."""
+        from kiro_crew.crew_log.store import crew_log_trash_root
+
+        crew_home, _ = stores
+        _transcript(crew_home, "dashboard_chat-1", size=50, age_days=40)
+        _crew_log("acp-recreated", "chat-1")
+
+        def _unstatable(_path):
+            raise OSError("stat failed")
+
+        monkeypatch.setattr(session_storage, "_file_stamp", _unstatable)
+        monkeypatch.setattr(session_storage, "_restore_crew_logs", lambda *_a: None)
+
+        with pytest.raises(SessionStorageError, match="can be restored"):
+            session_storage.move_to_trash(
+                ["dashboard_chat-1"], reason="manual", index=_index(), now=_NOW
+            )
+
+        assert (crew_home / "sessions" / "dashboard_chat-1.jsonl").is_file()
+        (batch,) = session_storage.list_trash()
+        manifest = session_storage.trash_root() / batch.batch_id / session_storage.MANIFEST_NAME
+        entries = [json.loads(line) for line in manifest.read_text().splitlines()[1:]]
+        assert entries == [{"uid": "dashboard_chat-1", "files": []}]
+        assert any((crew_log_trash_root() / batch.batch_id / "dashboard_chat-1").iterdir())
+
+    def test_a_linked_threads_dir_keeps_the_crew_logs_staged_too(
+        self, stores: tuple[Path, Path]
+    ) -> None:
+        """The restore that refuses a sidecar link takes nothing of the session back."""
+        crew_home, _ = stores
+        _transcript(crew_home, "dashboard_chat-1", size=50, age_days=40)
+        threads = crew_home / "sessions" / ".threads"
+        threads.mkdir()
+        sidecar = threads / "dashboard_chat-1.json"
+        sidecar.write_text("{}", encoding="utf-8")
+        old = _NOW - 40 * _DAY
+        os.utime(sidecar, (old, old))
+        _crew_log("acp-with-threads", "chat-1")
+        batch = session_storage.move_to_trash(
+            ["dashboard_chat-1"], reason="manual", index=_index(), now=_NOW
+        )
+        # Linked to a directory INSIDE the session store, so the origin checks pass and
+        # the restore reaches the link refusal itself.
+        threads.rmdir()
+        threads.symlink_to(crew_home / "sessions" / "archive", target_is_directory=True)
+
+        assert session_storage.restore(batch.batch_id) == 0
+
+        assert not _crew_log_exists("acp-with-threads"), "half the session came back"
+
+    def test_empty_refuses_a_batch_holding_crew_logs_its_manifest_does_not_list(
+        self, stores: tuple[Path, Path]
+    ) -> None:
+        from kiro_crew.crew_log.store import crew_log_trash_root
+
+        crew_home, _ = stores
+        _transcript(crew_home, "dashboard_chat-1", size=50, age_days=40)
+        batch = session_storage.move_to_trash(
+            ["dashboard_chat-1"], reason="manual", index=_index(), now=_NOW
+        )
+        # What a put-back that could not record its entry leaves behind.
+        stray = crew_log_trash_root() / batch.batch_id / "dashboard_chat-9" / "unit"
+        stray.mkdir(parents=True)
+        (stray / "log.jsonl").write_text("{}\n", encoding="utf-8")
+        skips: list[str] = []
+
+        assert session_storage.empty_trash([batch.batch_id], on_skip=skips.append) == 0
+
+        assert skips == [session_storage.SKIP_UNLISTED_FILES]
+        assert (stray / "log.jsonl").is_file()
+
+    def test_a_batch_removed_behind_the_trash_does_not_authorize_deleting_its_crew_logs(
+        self, stores: tuple[Path, Path]
+    ) -> None:
+        """The batch directory is agent-writable; its absence approves nothing."""
+        from kiro_crew.crew_log.store import crew_log_trash_root
+
+        crew_home, _ = stores
+        _transcript(crew_home, "dashboard_chat-1", size=50, age_days=40)
+        _transcript(crew_home, "dashboard_chat-2", size=50, age_days=40)
+        _crew_log("acp-kept", "chat-1")
+        victim = session_storage.move_to_trash(
+            ["dashboard_chat-1"], reason="manual", index=_index(), now=_NOW
+        )
+        other = session_storage.move_to_trash(
+            ["dashboard_chat-2"], reason="manual", index=_index(), now=_NOW
+        )
+        shutil.rmtree(session_storage.trash_root() / victim.batch_id)
+
+        session_storage.empty_trash([other.batch_id])
+
+        assert any((crew_log_trash_root() / victim.batch_id / "dashboard_chat-1").iterdir())
+
+    def test_a_session_made_only_of_crew_logs_round_trips(self, stores: tuple[Path, Path]) -> None:
+        _crew_log("acp-orphan", "chat-gone")
+
+        units = {u.uid: u for u in session_storage.select_reclaimable(_index(), 0, now=_NOW)}
+        assert set(units) == {"acp-orphan"}
+
+        batch = session_storage.move_to_trash(
+            ["acp-orphan"], reason="manual", index=_index(), now=_NOW
+        )
+        assert batch.sessions == 1
+        assert not _crew_log_exists("acp-orphan")
+
+        assert session_storage.restore(batch.batch_id) == 1
+        assert _crew_log_exists("acp-orphan")
 
 
 class TestActiveExclusion:
@@ -692,6 +1415,173 @@ class TestRestoreIsAllOrNothing:
         assert seg.read_bytes() == b"a" * 16
         assert session_storage.list_trash() == []
 
+    def test_restore_publishes_transcript_under_history_lock(
+        self,
+        stores: tuple[Path, Path],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        crew_home, kiro_home = stores
+        _cli_half(kiro_home, "aaaa1111", log_bytes=8, age_days=40)
+        _transcript(crew_home, "dashboard_chat-1", size=8, age_days=40)
+        batch = session_storage.move_to_trash(
+            ["aaaa1111"],
+            reason="manual",
+            index=_index({"aaaa1111": "dashboard_chat-1"}),
+            now=_NOW,
+        )
+        active_locks: set[str] = set()
+        real_locked = ConversationLog._locked_stem
+        real_move = session_storage._move_file_exclusive
+        transcript = crew_home / "sessions" / "dashboard_chat-1.jsonl"
+        replay = kiro_home / "sessions" / "cli" / "aaaa1111.jsonl"
+
+        @contextlib.contextmanager
+        def recording_lock(log: ConversationLog, key: str):
+            with real_locked(log, key):
+                active_locks.add(key)
+                try:
+                    yield
+                finally:
+                    active_locks.remove(key)
+
+        def observed_move(src: Path, dst: Path) -> bool:
+            if dst == replay:
+                assert active_locks == set()
+            if dst == transcript:
+                assert "dashboard_chat-1" in active_locks
+            return real_move(src, dst)
+
+        monkeypatch.setattr(ConversationLog, "_locked_stem", recording_lock)
+        monkeypatch.setattr(session_storage, "_move_file_exclusive", observed_move)
+
+        assert session_storage.restore(batch.batch_id) == 1
+        assert transcript.is_file()
+
+    @pytest.mark.parametrize(
+        "stem",
+        ["slack_1785370133.085469", "1785370133.085469"],
+    )
+    def test_restore_locks_both_slack_transcript_aliases(
+        self,
+        stores: tuple[Path, Path],
+        monkeypatch: pytest.MonkeyPatch,
+        stem: str,
+    ) -> None:
+        crew_home, kiro_home = stores
+        thread_ts = "1785370133.085469"
+        _cli_half(kiro_home, "aaaa1111", log_bytes=8, age_days=40)
+        _transcript(crew_home, stem, size=8, age_days=40)
+        batch = session_storage.move_to_trash(
+            ["aaaa1111"],
+            reason="manual",
+            index=_index({"aaaa1111": stem}),
+            now=_NOW,
+        )
+        active_locks: set[str] = set()
+        real_locked = ConversationLog._locked_stem
+        real_move = session_storage._move_file_exclusive
+        transcript = crew_home / "sessions" / f"{stem}.jsonl"
+
+        @contextlib.contextmanager
+        def recording_lock(log: ConversationLog, key: str):
+            with real_locked(log, key):
+                active_locks.add(key)
+                try:
+                    yield
+                finally:
+                    active_locks.remove(key)
+
+        def observed_move(src: Path, dst: Path) -> bool:
+            if dst == transcript:
+                assert {thread_ts, f"slack_{thread_ts}"} <= active_locks
+            return real_move(src, dst)
+
+        monkeypatch.setattr(ConversationLog, "_locked_stem", recording_lock)
+        monkeypatch.setattr(session_storage, "_move_file_exclusive", observed_move)
+
+        assert session_storage.restore(batch.batch_id) == 1
+        assert transcript.is_file()
+
+    def test_waiting_canonical_append_re_resolves_after_bare_restore(
+        self,
+        stores: tuple[Path, Path],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        crew_home, kiro_home = stores
+        thread_ts = "1785370133.085469"
+        _cli_half(kiro_home, "aaaa1111", log_bytes=8, age_days=40)
+        _transcript(crew_home, thread_ts, size=8, age_days=40)
+        batch = session_storage.move_to_trash(
+            ["aaaa1111"],
+            reason="manual",
+            index=_index({"aaaa1111": thread_ts}),
+            now=_NOW,
+        )
+        sessions_dir = crew_home / "sessions"
+        log = ConversationLog(base_dir=sessions_dir)
+        writer_waiting = threading.Event()
+        release_writer = threading.Event()
+        errors: list[BaseException] = []
+        real_locked = ConversationLog._locked
+        writer: threading.Thread
+
+        @contextlib.contextmanager
+        def paused_writer_lock(current_log: ConversationLog, key: str):
+            if threading.current_thread() is writer:
+                writer_waiting.set()
+                if not release_writer.wait(timeout=5):
+                    raise TimeoutError("restore never released the waiting append")
+            with real_locked(current_log, key):
+                yield
+
+        def append_after_restore() -> None:
+            try:
+                log.append(f"slack:{thread_ts}", "user", "writer")
+            except BaseException as exc:
+                errors.append(exc)
+
+        monkeypatch.setattr(ConversationLog, "_locked", paused_writer_lock)
+        writer = threading.Thread(target=append_after_restore)
+        started = False
+        try:
+            writer.start()
+            started = True
+            assert writer_waiting.wait(timeout=5)
+            assert session_storage.restore(batch.batch_id) == 1
+        finally:
+            release_writer.set()
+            if started:
+                writer.join(timeout=5)
+                assert not writer.is_alive(), "restore race worker outlived its test"
+
+        canonical = sessions_dir / f"slack_{thread_ts}.jsonl"
+        bare = sessions_dir / f"{thread_ts}.jsonl"
+        assert errors == []
+        assert not canonical.exists()
+        assert b'"content": "writer"' in bare.read_bytes()
+
+    def test_canonical_occupant_blocks_bare_alias_restore(
+        self,
+        stores: tuple[Path, Path],
+    ) -> None:
+        crew_home, kiro_home = stores
+        thread_ts = "1785370133.085469"
+        _cli_half(kiro_home, "aaaa1111", log_bytes=8, age_days=40)
+        _transcript(crew_home, thread_ts, size=8, age_days=40)
+        batch = session_storage.move_to_trash(
+            ["aaaa1111"],
+            reason="manual",
+            index=_index({"aaaa1111": thread_ts}),
+            now=_NOW,
+        )
+        canonical = crew_home / "sessions" / f"slack_{thread_ts}.jsonl"
+        canonical.write_bytes(b"new canonical transcript")
+
+        assert session_storage.restore(batch.batch_id) == 0
+        assert canonical.read_bytes() == b"new canonical transcript"
+        assert not (crew_home / "sessions" / f"{thread_ts}.jsonl").exists()
+        assert [item.batch_id for item in session_storage.list_trash()] == [batch.batch_id]
+
     def test_a_full_restore_never_writes_to_the_batch_it_is_leaving(
         self, stores: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -717,21 +1607,30 @@ class TestRestoreIsAllOrNothing:
         def _no_writes_here(*args: object, **kwargs: object) -> None:
             raise AssertionError(f"the full-restore path wrote by name: {args!r}")
 
-        monkeypatch.setattr(session_storage, "atomic_write", _no_writes_here)
-        # A cleanup that DECLINES, which is what makes the stale listing reachable: the
-        # batch stays instead of going away with its manifest.
-        monkeypatch.setattr(session_storage, "_remove_emptied_batch", lambda *a, **k: False)
+        # Scoped to just these two patches: `monkeypatch` is the same instance
+        # the `stores` fixture pins KIROCREW_HOME/KIRO_HOME with, and
+        # `monkeypatch.undo()` unwinds its WHOLE stack in LIFO order, including
+        # entries pushed before this test ever ran. An `undo()` here to restore
+        # `atomic_write` also unpins the data home, and the `empty_trash()` call
+        # below then resolves `trash_root()` against the operator's real
+        # `~/.kiro/crew` and writes a real `trash/session-storage.lock`.
+        with pytest.MonkeyPatch.context() as scoped:
+            scoped.setattr(session_storage, "atomic_write", _no_writes_here)
+            # A cleanup that DECLINES, which is what makes the stale listing reachable: the
+            # batch stays instead of going away with its manifest.
+            scoped.setattr(session_storage, "_remove_emptied_batch", lambda *a, **k: False)
 
-        assert session_storage.restore(batch.batch_id) == 1
+            assert session_storage.restore(batch.batch_id) == 1
 
-        assert (kiro_home / "sessions" / "cli" / "aaaa1111.jsonl").read_bytes() == b"c" * 8
-        kept = session_storage.list_trash()
-        assert [b.batch_id for b in kept] == [batch.batch_id], "kept, not removed"
-        # The accepted residual, pinned so that clearing it later is a deliberate change.
-        assert kept[0].sessions == 1, "the listing goes stale rather than being rewritten"
+            assert (kiro_home / "sessions" / "cli" / "aaaa1111.jsonl").read_bytes() == b"c" * 8
+            kept = session_storage.list_trash()
+            assert [b.batch_id for b in kept] == [batch.batch_id], "kept, not removed"
+            # The accepted residual, pinned so that clearing it later is a deliberate change.
+            assert kept[0].sessions == 1, "the listing goes stale rather than being rewritten"
 
         # And the user is not stuck with it: the explicit empty still takes the batch.
-        monkeypatch.undo()
+        # KIROCREW_HOME/KIRO_HOME (set by the `stores` fixture, outside the `with`
+        # above) are still pinned here.
         session_storage.empty_trash()
         assert session_storage.list_trash() == []
 
@@ -801,6 +1700,33 @@ class TestRestoreIsAllOrNothing:
         # than a silently ignored field.
         assert not victim.exists()
         assert restored == 0
+
+    @pytest.mark.skipif(not hasattr(os, "O_DIRECTORY"), reason="POSIX descriptor-relative move")
+    def test_a_pinned_move_of_a_planted_link_never_publishes_its_target(
+        self, tmp_path: Path
+    ) -> None:
+        """The descriptor-relative branch is ``linkat``, which CPython asks to
+        FOLLOW the source by default: a link planted in the staged trash would then
+        be resolved and a hard link to its target -- a credential store, say --
+        published under `.threads`. The mover must link the link itself (or refuse),
+        never expose the target's bytes at the destination."""
+        secret = tmp_path / "secret"
+        secret.write_bytes(b"AKIA-not-for-the-agent")
+        staged = tmp_path / "trash"
+        staged.mkdir()
+        planted = staged / "chat.json"
+        planted.symlink_to(secret)
+        dest_dir = tmp_path / ".threads"
+        dest_dir.mkdir()
+        dst = dest_dir / "chat.json"
+        dir_fd = os.open(dest_dir, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            session_storage._move_file_exclusive(planted, dst, dst_dir_fd=dir_fd)
+        finally:
+            os.close(dir_fd)
+        if dst.exists() or dst.is_symlink():
+            assert dst.is_symlink(), "the destination must never be a plain file of the target"
+        assert secret.stat().st_nlink == 1, "no second name was given to the target"
 
     def test_an_exclusive_move_never_replaces_an_occupied_destination(self, tmp_path: Path) -> None:
         """The no-clobber guarantee itself, independent of any restore path."""
@@ -1115,6 +2041,418 @@ class TestSidecarFiles:
         assert sidecar.read_bytes() == b"lock"
 
 
+class TestThreadSidecarRestoresUnderTheTranscriptLock:
+    """The reply-thread sidecar is written under the transcript's lock, so restore
+    publishes it -- and rolls it back -- under that same lock, beside the
+    transcript. Published before the lock, a reply a recreated chat committed in
+    between would ride the sidecar back to trash on a lost race."""
+
+    def _sidecar(self, crew_home: Path, stem: str) -> Path:
+        d = crew_home / "sessions" / ".threads"
+        d.mkdir(exist_ok=True)
+        p = d / f"{stem}.json"
+        p.write_text(json.dumps({"version": 1, "threads": {}}), encoding="utf-8")
+        aged = _NOW - 40 * _DAY
+        os.utime(p, (aged, aged))
+        return p
+
+    def test_the_sidecar_appears_only_once_the_transcript_lock_is_held(
+        self, stores: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        crew_home, kiro_home = stores
+        _cli_half(kiro_home, "aaaa1111", log_bytes=8, age_days=40)
+        _transcript(crew_home, "dashboard_chat-1", size=50, age_days=40)
+        sidecar = self._sidecar(crew_home, "dashboard_chat-1")
+        transcript = crew_home / "sessions" / "dashboard_chat-1.jsonl"
+        batch = session_storage.move_to_trash(
+            ["aaaa1111"], reason="manual", index=_index({"aaaa1111": "dashboard_chat-1"}), now=_NOW
+        )
+        assert not sidecar.exists() and not transcript.exists()
+
+        seen: dict[str, bool] = {}
+        real_locked = session_storage.ConversationLog.locked_stems
+
+        @contextlib.contextmanager
+        def _observing(self_log, stems):
+            with real_locked(self_log, stems):
+                # Nothing under the lock's protection exists before it is taken.
+                seen["sidecar_before"] = sidecar.exists()
+                seen["transcript_before"] = transcript.exists()
+                yield
+                seen["sidecar_inside"] = sidecar.exists()
+                seen["transcript_inside"] = transcript.exists()
+
+        monkeypatch.setattr(session_storage.ConversationLog, "locked_stems", _observing)
+        assert session_storage.restore(batch.batch_id) == 1
+        assert seen == {
+            "sidecar_before": False,
+            "transcript_before": False,
+            "sidecar_inside": True,
+            "transcript_inside": True,
+        }
+        assert sidecar.exists() and transcript.exists()
+
+    def test_one_vanished_sidecar_costs_no_other_session_its_freshness(
+        self, stores: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A reply writes only the sidecar, so its mtime is what keeps a threaded
+        session young. Each entry is stat'ed on its own: a sidecar renamed away by
+        a concurrent delete mid-scan must not empty the whole list and age every
+        other threaded session by its transcript alone."""
+        crew_home, _kiro_home = stores
+        _transcript(crew_home, "dashboard_chat-1", size=50, age_days=40)
+        _transcript(crew_home, "dashboard_chat-2", size=50, age_days=40)
+        fresh = self._sidecar(crew_home, "dashboard_chat-1")
+        os.utime(fresh, (_NOW, _NOW))
+        vanishing = self._sidecar(crew_home, "dashboard_chat-2")
+        real_scandir = os.scandir
+
+        class _Vanishing:
+            """An ``os.scandir`` iterator whose listing of the vanishing sidecar
+            is the moment it disappears -- the concurrent delete, mid-scan."""
+
+            def __init__(self, it):
+                self._it = it
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return self._it.__exit__(*exc)
+
+            def close(self):
+                self._it.close()
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                entry = next(self._it)
+                if entry.name == vanishing.name and vanishing.exists():
+                    vanishing.unlink()
+                return entry
+
+        def _scandir(path=".", *a, **k):
+            it = real_scandir(path, *a, **k)
+            if isinstance(path, int) or os.fspath(path) != os.fspath(fresh.parent):
+                return it
+            return _Vanishing(it)
+
+        monkeypatch.setattr(session_storage.os, "scandir", _scandir)
+        by_stem = {
+            u.stems[0]: u for u in session_storage.list_units(_index(), cached=False) if u.stems
+        }
+        assert by_stem["dashboard_chat-1"].age_days(_NOW) < 1, "the fresh sidecar still counts"
+        assert by_stem["dashboard_chat-2"].age_days(_NOW) >= 40
+
+    def test_a_sidecar_alone_is_not_restored_onto_a_recreated_chat(
+        self, stores: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A staged sidecar whose transcript is not in the batch takes the same
+        transcript recheck under the lock: a chat recreated under that stem is a
+        different chat, and the old replies must not be attached to it."""
+        crew_home, kiro_home = stores
+        _cli_half(kiro_home, "aaaa1111", log_bytes=8, age_days=40)
+        _transcript(crew_home, "dashboard_chat-1", size=50, age_days=40)
+        sidecar = self._sidecar(crew_home, "dashboard_chat-1")
+        transcript = crew_home / "sessions" / "dashboard_chat-1.jsonl"
+        batch = session_storage.move_to_trash(
+            ["aaaa1111"], reason="manual", index=_index({"aaaa1111": "dashboard_chat-1"}), now=_NOW
+        )
+        staged_dir = session_storage.trash_root() / batch.batch_id / "crew"
+        # The transcript never comes back from this batch (a kill mid-staging left
+        # the sidecar behind on its own); the chat is then recreated.
+        (staged_dir / "dashboard_chat-1.jsonl").unlink()
+        manifest = session_storage.trash_root() / batch.batch_id / session_storage.MANIFEST_NAME
+        lines = manifest.read_text(encoding="utf-8").splitlines()
+        entry = json.loads(lines[1])
+        entry["files"] = [f for f in entry["files"] if not str(f["rel"]).endswith(".jsonl")]
+        assert any(str(f["rel"]).endswith(".json") for f in entry["files"]), "the sidecar stays"
+        manifest.write_text(f"{lines[0]}\n{json.dumps(entry)}\n", encoding="utf-8")
+        transcript.write_bytes(b"new chat")
+        assert session_storage.restore(batch.batch_id) == 0
+        assert not sidecar.exists(), "old replies must not land beside the new chat"
+        assert (staged_dir / ".threads" / "dashboard_chat-1.json").exists()
+        assert transcript.read_bytes() == b"new chat"
+
+    def test_a_lost_race_rolls_the_sidecar_back_under_the_lock_too(
+        self, stores: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        crew_home, kiro_home = stores
+        _cli_half(kiro_home, "aaaa1111", log_bytes=8, age_days=40)
+        _transcript(crew_home, "dashboard_chat-1", size=50, age_days=40)
+        sidecar = self._sidecar(crew_home, "dashboard_chat-1")
+        transcript = crew_home / "sessions" / "dashboard_chat-1.jsonl"
+        batch = session_storage.move_to_trash(
+            ["aaaa1111"], reason="manual", index=_index({"aaaa1111": "dashboard_chat-1"}), now=_NOW
+        )
+        real_locked = session_storage.ConversationLog.locked_stems
+
+        @contextlib.contextmanager
+        def _recreate_under_lock(self_log, stems):
+            with real_locked(self_log, stems):
+                # The chat comes back the instant the lock is taken: the restore
+                # must lose the race for BOTH files and leave both staged.
+                transcript.write_bytes(b"new chat")
+                yield
+
+        monkeypatch.setattr(session_storage.ConversationLog, "locked_stems", _recreate_under_lock)
+        assert session_storage.restore(batch.batch_id) == 0
+        assert transcript.read_bytes() == b"new chat"
+        assert not sidecar.exists()
+        staged = (
+            session_storage.trash_root()
+            / batch.batch_id
+            / "crew"
+            / ".threads"
+            / "dashboard_chat-1.json"
+        )
+        assert staged.exists()
+
+    def test_a_link_where_the_sidecar_directory_should_be_leaves_the_batch_staged(
+        self, stores: tuple[Path, Path]
+    ) -> None:
+        crew_home, kiro_home = stores
+        _cli_half(kiro_home, "aaaa1111", log_bytes=8, age_days=40)
+        _transcript(crew_home, "dashboard_chat-1", size=50, age_days=40)
+        self._sidecar(crew_home, "dashboard_chat-1")
+        batch = session_storage.move_to_trash(
+            ["aaaa1111"], reason="manual", index=_index({"aaaa1111": "dashboard_chat-1"}), now=_NOW
+        )
+        threads_dir = crew_home / "sessions" / ".threads"
+        elsewhere = crew_home / "elsewhere"
+        elsewhere.mkdir()
+        if threads_dir.exists():
+            threads_dir.rmdir()
+        threads_dir.symlink_to(elsewhere, target_is_directory=True)
+        assert session_storage.restore(batch.batch_id) == 0
+        assert list(elsewhere.iterdir()) == []
+        assert not (crew_home / "sessions" / "dashboard_chat-1.jsonl").exists()
+
+    def test_a_link_swapped_in_under_the_lock_cannot_redirect_the_publish(
+        self, stores: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The preflight's link check has a window; the publish closes it by
+        addressing the pinned `.threads` descriptor, so a link swapped in after
+        preflight is refused and nothing lands under its target."""
+        crew_home, kiro_home = stores
+        _cli_half(kiro_home, "aaaa1111", log_bytes=8, age_days=40)
+        _transcript(crew_home, "dashboard_chat-1", size=50, age_days=40)
+        self._sidecar(crew_home, "dashboard_chat-1")
+        batch = session_storage.move_to_trash(
+            ["aaaa1111"], reason="manual", index=_index({"aaaa1111": "dashboard_chat-1"}), now=_NOW
+        )
+        threads_dir = crew_home / "sessions" / ".threads"
+        elsewhere = crew_home / "elsewhere"
+        elsewhere.mkdir()
+        real_locked = session_storage.ConversationLog.locked_stems
+
+        @contextlib.contextmanager
+        def _swap_under_lock(self_log, stems):
+            with real_locked(self_log, stems):
+                if threads_dir.exists() and not threads_dir.is_symlink():
+                    threads_dir.rmdir()
+                if not threads_dir.exists():
+                    threads_dir.symlink_to(elsewhere, target_is_directory=True)
+                yield
+
+        monkeypatch.setattr(session_storage.ConversationLog, "locked_stems", _swap_under_lock)
+        assert session_storage.restore(batch.batch_id) == 0
+        assert list(elsewhere.iterdir()) == []
+        assert not (crew_home / "sessions" / "dashboard_chat-1.jsonl").exists()
+
+
+class TestAttachmentsAreTheThirdHalf:
+    """``<stem>.attachments/`` holds the images a transcript's rows reference, so it
+    is measured, moved, restored and emptied with the transcript -- leaving it
+    behind would keep served images for a session the user reclaimed."""
+
+    def test_attachment_bytes_are_the_sessions(self, stores: tuple[Path, Path]) -> None:
+        crew_home, kiro_home = stores
+        cli = _cli_half(kiro_home, "aaaa1111", log_bytes=100, age_days=40)
+        crew = _transcript(crew_home, "dashboard_chat-1", size=50, age_days=40)
+        img = _attachment(crew_home, "dashboard_chat-1", "abcd-shot.png", size=900, age_days=40)
+
+        report = session_storage.measure(_index({"aaaa1111": "dashboard_chat-1"}), now=_NOW)
+
+        assert report.total_sessions == 1
+        assert report.total_bytes == cli + crew + img
+
+    def test_a_fresh_attachment_keeps_the_session_fresh(self, stores: tuple[Path, Path]) -> None:
+        """An image written hours ago is activity on the session, whatever the
+        transcript's own mtime says."""
+        crew_home, _ = stores
+        _transcript(crew_home, "dashboard_chat-1", size=50, age_days=40)
+        _attachment(crew_home, "dashboard_chat-1", "abcd-shot.png", size=9, age_days=0.2)
+
+        with pytest.raises(SessionStorageError, match="touched in the last"):
+            session_storage.move_to_trash(
+                ["dashboard_chat-1"], reason="manual", index=_index(), now=_NOW
+            )
+
+    def test_attachments_move_restore_and_empty_with_the_session(
+        self, stores: tuple[Path, Path]
+    ) -> None:
+        crew_home, kiro_home = stores
+        _cli_half(kiro_home, "aaaa1111", log_bytes=8, age_days=40)
+        _transcript(crew_home, "dashboard_chat-1", size=8, age_days=40)
+        _attachment(crew_home, "dashboard_chat-1", "abcd-shot.png", size=33, age_days=40)
+        _attachment(crew_home, "dashboard_chat-1", "ef01-other.png", size=44, age_days=40)
+        adir = crew_home / "sessions" / "dashboard_chat-1.attachments"
+
+        batch = session_storage.move_to_trash(
+            ["aaaa1111"],
+            reason="manual",
+            index=_index({"aaaa1111": "dashboard_chat-1"}),
+            now=_NOW,
+        )
+
+        # Moved: the images travel under the directory's own name, and the drained
+        # directory does not linger as an empty shell beside the live sessions.
+        staged = session_storage.trash_root() / batch.batch_id / "crew" / adir.name
+        assert (staged / "abcd-shot.png").read_bytes() == b"i" * 33
+        assert (staged / "ef01-other.png").read_bytes() == b"i" * 44
+        assert not adir.exists()
+        entry = json.loads(
+            (session_storage.trash_root() / batch.batch_id / session_storage.MANIFEST_NAME)
+            .read_text(encoding="utf-8")
+            .splitlines()[1]
+        )
+        assert str(adir / "abcd-shot.png") in {r["origin"] for r in entry["files"]}
+
+        # Restored: the directory comes back with its files.
+        assert session_storage.restore(batch.batch_id) == 1
+        assert (adir / "abcd-shot.png").read_bytes() == b"i" * 33
+        assert (adir / "ef01-other.png").read_bytes() == b"i" * 44
+        assert (crew_home / "sessions" / "dashboard_chat-1.jsonl").is_file()
+
+        # Emptied: nothing of the session is left anywhere.
+        batch = session_storage.move_to_trash(
+            ["aaaa1111"],
+            reason="manual",
+            index=_index({"aaaa1111": "dashboard_chat-1"}),
+            now=_NOW,
+        )
+        freed = session_storage.empty_trash([batch.batch_id])
+        assert freed >= 8 + 8 + 33 + 44
+        assert not adir.exists()
+        assert not (session_storage.trash_root() / batch.batch_id).exists()
+        assert session_storage.list_trash() == []
+
+    def test_the_drained_attachments_dir_is_removed_under_the_transcript_lock(
+        self, stores: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The empty-shell ``rmdir`` runs while the unit's transcript lock is held.
+
+        A writer resuming the session creates the directory and lands its first
+        image under that same lock, so an ``rmdir`` issued after the lock is
+        released could take the directory between the ``mkdir`` and the file --
+        the image copy fails open and the row keeps its scratch path.
+        """
+        crew_home, kiro_home = stores
+        _cli_half(kiro_home, "aaaa1111", log_bytes=8, age_days=40)
+        _transcript(crew_home, "dashboard_chat-1", size=8, age_days=40)
+        _attachment(crew_home, "dashboard_chat-1", "abcd-shot.png", size=33, age_days=40)
+        adir = crew_home / "sessions" / "dashboard_chat-1.attachments"
+
+        events: list[tuple[str, str]] = []
+        real_locked_stem = ConversationLog._locked_stem
+
+        @contextlib.contextmanager
+        def recording_locked_stem(self: ConversationLog, key: str):
+            events.append(("enter", key))
+            try:
+                with real_locked_stem(self, key):
+                    yield
+            finally:
+                events.append(("exit", key))
+
+        real_rmdir = os.rmdir
+
+        def recording_rmdir(path, *args, **kwargs):
+            events.append(("rmdir", str(path)))
+            return real_rmdir(path, *args, **kwargs)
+
+        monkeypatch.setattr(ConversationLog, "_locked_stem", recording_locked_stem)
+        monkeypatch.setattr(os, "rmdir", recording_rmdir)
+
+        session_storage.move_to_trash(
+            ["aaaa1111"],
+            reason="manual",
+            index=_index({"aaaa1111": "dashboard_chat-1"}),
+            now=_NOW,
+        )
+        assert not adir.exists()
+
+        rmdir_at = events.index(("rmdir", str(adir)))
+        before = events[:rmdir_at]
+        opened = [i for i, e in enumerate(before) if e == ("enter", "dashboard_chat-1")]
+        assert opened, "the transcript lock was never taken before the rmdir"
+        assert ("exit", "dashboard_chat-1") not in before[
+            opened[-1] :
+        ], "the attachments directory was removed after the transcript lock was released"
+
+    def test_a_foreign_entry_in_the_attachments_dir_is_not_taken(
+        self, stores: tuple[Path, Path]
+    ) -> None:
+        """This code writes only flat files there. A subdirectory is not the
+        session's and is left alone -- and so is the now non-empty directory."""
+        crew_home, _ = stores
+        _transcript(crew_home, "dashboard_chat-1", size=8, age_days=40)
+        _attachment(crew_home, "dashboard_chat-1", "abcd-shot.png", size=5, age_days=40)
+        adir = crew_home / "sessions" / "dashboard_chat-1.attachments"
+        (adir / "foreign").mkdir()
+        aged = _NOW - 40 * _DAY
+        os.utime(adir / "foreign", (aged, aged))
+
+        batch = session_storage.move_to_trash(
+            ["dashboard_chat-1"], reason="manual", index=_index(), now=_NOW
+        )
+
+        assert batch.sessions == 1
+        assert not (adir / "abcd-shot.png").exists()
+        assert (adir / "foreign").is_dir()
+        assert session_storage.restore(batch.batch_id) == 1
+        assert (adir / "abcd-shot.png").read_bytes() == b"i" * 5
+
+    def test_an_unreadable_attachments_dir_leaves_the_session_whole(
+        self, stores: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Files the scan cannot see cannot be moved, so nothing of the session is:
+        moving the transcript alone would orphan images that are still served."""
+        crew_home, _ = stores
+        _transcript(crew_home, "dashboard_chat-1", size=8, age_days=40)
+        _attachment(crew_home, "dashboard_chat-1", "abcd-shot.png", size=5, age_days=40)
+        adir = crew_home / "sessions" / "dashboard_chat-1.attachments"
+        real_scandir = os.scandir
+
+        def refusing(path=".", *a, **k):
+            if isinstance(path, (str, os.PathLike)) and Path(path) == adir:
+                raise PermissionError(errno.EACCES, "denied", str(path))
+            return real_scandir(path, *a, **k)
+
+        monkeypatch.setattr(session_storage.os, "scandir", refusing)
+        with pytest.raises(SessionStorageError, match="none of the selected sessions"):
+            session_storage.move_to_trash(
+                ["dashboard_chat-1"], reason="manual", index=_index(), now=_NOW
+            )
+
+        assert (crew_home / "sessions" / "dashboard_chat-1.jsonl").is_file()
+        assert (adir / "abcd-shot.png").is_file()
+
+    def test_a_manifest_cannot_route_an_attachment_outside_its_store(
+        self, stores: tuple[Path, Path]
+    ) -> None:
+        """The origin is DERIVED from the staged path, and the directory name in it
+        must be a session id: a tampered record cannot name another directory."""
+        assert session_storage._canonical_origin("crew/../x.attachments/a.png") is None
+        assert session_storage._canonical_origin("crew/not a session.attachments/a.png") is None
+        assert session_storage._canonical_origin("crew/x.attachments/a/b.png") is None
+        crew_home, _ = stores
+        origin = session_storage._canonical_origin("crew/dashboard_chat-1.attachments/a.png")
+        assert origin == crew_home / "sessions" / "dashboard_chat-1.attachments" / "a.png"
+
+
 class TestFreshSessionsAreProtected:
     """The session map is not a complete registry of live sessions.
 
@@ -1303,7 +2641,7 @@ class TestBatchIdentityIsTheDirectory:
 class TestTrashBatchNamesAreLogSafe:
     """A batch directory name is agent-controlled and can embed a newline; every
     ``list_trash`` log line that carries it must escape it, or one record forges
-    additional records (refs #6315, the #6281 log-forgery class).
+    additional records (the log-forgery class).
     """
 
     _FORGED = "20240101T000000-deadbeef\nWARNING forged: batch cleared by operator"
@@ -1384,7 +2722,7 @@ class TestTrashBatchNamesAreLogSafe:
                 return True
 
         # Shaped for `_summarize_manifest` — (header, sessions, staged_bytes) —
-        # because that is the seam `list_trash` reads since #6312. Patching
+        # because that is the seam `list_trash` reads. Patching
         # `_read_manifest` instead lets the real `_summarize_manifest` run, and it
         # does `batch / MANIFEST_NAME`, which a name-only double cannot support.
         manifests: dict[str, tuple[dict[str, object], int, int] | None] = {
@@ -1397,7 +2735,7 @@ class TestTrashBatchNamesAreLogSafe:
         # (i.e. `pathlib.Path.iterdir`) globally leaks across the xdist worker:
         # a sibling test in the same process that legitimately iterates a real
         # directory then reaches the unpatched `_summarize_manifest`, which does
-        # `<_ForgedDir> / MANIFEST_NAME` and raises TypeError (refs #6425).
+        # `<_ForgedDir> / MANIFEST_NAME` and raises TypeError.
         class _ForgedRoot(type(session_storage.trash_root())):
             def iterdir(self):  # type: ignore[override]
                 return iter([_ForgedDir()])
@@ -1425,7 +2763,7 @@ class TestTrashBatchNamesAreLogSafe:
 
 class TestUntrustedNamesAreLogSafeOutsideListTrash:
     """The forgery primitive of :class:`TestTrashBatchNamesAreLogSafe`, at the
-    sibling sites outside ``list_trash`` (refs #6344, the #6281 class).
+    sibling sites outside ``list_trash`` (the log-forgery class).
 
     Two operands carry it, and they are not equally reachable. A manifest-supplied
     ``uid`` is read off disk with no validation, so its sites take a forged value
@@ -1674,19 +3012,27 @@ class TestUntrustedNamesAreLogSafeOutsideListTrash:
         planted = OSError(13, "Permission denied", str(forged / self._FORGED_NAME))
 
         # ``session_storage.os`` is the global module, so this patch is also seen
-        # by ``shutil.rmtree`` during fixture teardown (which passes ``topdown=``
-        # on Windows).  Accept the real signature and divert only the walk of the
-        # forged batch, delegating every other call to the genuine ``os.walk``.
+        # by other walk users during teardown. Accept the real signature and
+        # divert only the walk of the forged batch, delegating every other call
+        # to the genuine function. Both mechanisms are patched because
+        # ``_unlisted_files`` picks fwalk-vs-walk at call time by availability
+        # (fwalk does not exist on Windows).
+        real_fwalk = getattr(os, "fwalk", None)
         real_walk = os.walk
 
-        def _walk(top, *args, onerror=None, **kwargs):  # type: ignore[no-untyped-def]
-            if Path(top) == forged:
-                assert callable(onerror)
-                onerror(planted)
-                return iter(())
-            return real_walk(top, *args, onerror=onerror, **kwargs)
+        def _divert(real):  # type: ignore[no-untyped-def]
+            def inner(top, *args, onerror=None, **kwargs):  # type: ignore[no-untyped-def]
+                if Path(top) == forged:
+                    assert callable(onerror)
+                    onerror(planted)
+                    return iter(())
+                return real(top, *args, onerror=onerror, **kwargs)
 
-        monkeypatch.setattr(session_storage.os, "walk", _walk)
+            return inner
+
+        monkeypatch.setattr(session_storage.os, "walk", _divert(real_walk))
+        if real_fwalk is not None:
+            monkeypatch.setattr(session_storage.os, "fwalk", _divert(real_fwalk))
         monkeypatch.setattr(session_storage, "_manifest_rels", lambda batch: [])
 
         with pytest.raises(SessionStorageError) as raised:
@@ -1713,10 +3059,10 @@ class TestScanCache:
         calls = 0
         real = session_storage._scan_raw_uncached
 
-        def counted(sid_for_stem):
+        def counted(sid_for_stem, **kwargs):
             nonlocal calls
             calls += 1
-            return real(sid_for_stem)
+            return real(sid_for_stem, **kwargs)
 
         monkeypatch.setattr(session_storage, "_scan_raw_uncached", counted)
 
@@ -1802,10 +3148,10 @@ class TestScanCache:
         calls = 0
         real = session_storage._scan_raw_uncached
 
-        def counted(sid_for_stem):
+        def counted(sid_for_stem, **kwargs):
             nonlocal calls
             calls += 1
-            return real(sid_for_stem)
+            return real(sid_for_stem, **kwargs)
 
         monkeypatch.setattr(session_storage, "_scan_raw_uncached", counted)
         session_storage.move_to_trash(["aaaa1111"], reason="manual", index=_index(), now=_NOW)
@@ -1842,10 +3188,10 @@ class TestScanCache:
         calls = 0
         real = session_storage._scan_raw_uncached
 
-        def counted(sid_for_stem):
+        def counted(sid_for_stem, **kwargs):
             nonlocal calls
             calls += 1
-            return real(sid_for_stem)
+            return real(sid_for_stem, **kwargs)
 
         monkeypatch.setattr(session_storage, "_scan_raw_uncached", counted)
         # A distinct dict object with equal contents built in the opposite
@@ -1880,10 +3226,10 @@ class TestScanCache:
         calls = 0
         real = session_storage._scan_raw_uncached
 
-        def counted(sid_for_stem):
+        def counted(sid_for_stem, **kwargs):
             nonlocal calls
             calls += 1
-            return real(sid_for_stem)
+            return real(sid_for_stem, **kwargs)
 
         monkeypatch.setattr(session_storage, "_scan_raw_uncached", counted)
         # Same keys, same length — only one value repointed.
@@ -1916,10 +3262,10 @@ class TestScanCache:
         calls = 0
         real = session_storage._scan_raw_uncached
 
-        def counted(sid_for_stem):
+        def counted(sid_for_stem, **kwargs):
             nonlocal calls
             calls += 1
-            return real(sid_for_stem)
+            return real(sid_for_stem, **kwargs)
 
         monkeypatch.setattr(session_storage, "_scan_raw_uncached", counted)
         pairing[stem2] = "aaaa1111"  # the caller's own dict, edited in place
@@ -1974,11 +3320,38 @@ class TestScanCache:
                 assert got == expected, f"disagreement on {a!r} vs {b!r}"
 
 
+def _pin_a_fake_default_home(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, legacy: bool = False
+) -> None:
+    """Put the process in the DEFAULT-home posture, against a fake host home.
+
+    These tests need ``data_home()`` to BE the default (or the legacy default), so
+    ``reclaim_block_reason`` takes its shared-store branch. Pinning ``_resolved_home``
+    to ``paths._default_home()`` under the operator's real ``HOME`` achieved that by
+    pointing the process at the operator's real ``~/.kiro/crew``: the next
+    ``config_dir()`` then ``mkdir``s it and drops the recovery breadcrumb beside it,
+    and the rootdir floor now fails a test that leaves the real default resolved. So
+    the host home is faked first: every resolver here reads ``Path.home()``
+    (``session_storage`` for both defaults and the pod root, ``paths`` for the data
+    home), so the posture holds exactly as before, one directory over.
+    """
+    host_home = tmp_path / "host-home"
+    host_home.mkdir(exist_ok=True)
+    monkeypatch.setenv("HOME", str(host_home))
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: host_home))
+    monkeypatch.delenv("KIROCREW_HOME", raising=False)
+    monkeypatch.delenv("KIRO_HOME", raising=False)
+    monkeypatch.setattr(
+        paths, "_resolved_home", paths.legacy_home() if legacy else paths._default_home()
+    )
+    monkeypatch.setattr(paths, "_config_dir_memo", None)
+
+
 class TestCotenantCache:
     """The co-tenant lookup follows the scan cache's rules: reads may reuse, mutations never.
 
     :func:`_scan_units` is the single funnel for four public entry points, and its
-    co-tenant dependency used to bypass the 30s cache entirely — every read paid a
+    co-tenant dependency can bypass the 30s cache entirely — every read paying a
     pod-root enumeration plus a map read per leftover pod even on a scan-cache hit.
     The cache is OPT-IN per call site because the same value gates destructive
     paths; the safety tests below are what stop a later refactor from making it
@@ -2159,8 +3532,7 @@ class TestCotenantCache:
         monkeypatch.delenv("KIRO_HOME", raising=False)
         # Pin the default home rather than clearing the memo; see
         # TestSharedStoreRefusal for why re-resolving on a real machine is unsafe.
-        monkeypatch.setattr(paths, "_resolved_home", paths._default_home())
-        monkeypatch.setattr(paths, "_config_dir_memo", None)
+        _pin_a_fake_default_home(monkeypatch, tmp_path)
 
         session_storage.cotenant_sids(cached=True)  # prime
         calls = self._count_pod_scans(monkeypatch)
@@ -2176,8 +3548,7 @@ class TestCotenantCache:
         monkeypatch.setenv("KIROCREW_POD_ROOT", str(tmp_path / "pods"))
         monkeypatch.delenv("KIROCREW_HOME", raising=False)
         monkeypatch.delenv("KIRO_HOME", raising=False)
-        monkeypatch.setattr(paths, "_resolved_home", paths._default_home())
-        monkeypatch.setattr(paths, "_config_dir_memo", None)
+        _pin_a_fake_default_home(monkeypatch, tmp_path)
 
         session_storage.cotenant_sids(cached=True)  # prime
         calls = self._count_pod_scans(monkeypatch)
@@ -2193,8 +3564,7 @@ class TestCotenantCache:
         monkeypatch.setenv("KIROCREW_POD_ROOT", str(tmp_path / "pods"))
         monkeypatch.delenv("KIROCREW_HOME", raising=False)
         monkeypatch.delenv("KIRO_HOME", raising=False)
-        monkeypatch.setattr(paths, "_resolved_home", paths._default_home())
-        monkeypatch.setattr(paths, "_config_dir_memo", None)
+        _pin_a_fake_default_home(monkeypatch, tmp_path)
 
         session_storage.cotenant_sids(cached=True)  # prime
         calls = self._count_pod_scans(monkeypatch)
@@ -2239,8 +3609,7 @@ class TestSharedStoreRefusal:
         # next data_home() RE-RESOLVE, which on a real machine initializes or
         # migrates the operator's actual data home — and leaves that resolution
         # memoized for every later test in the same worker.
-        monkeypatch.setattr(paths, "_resolved_home", paths._default_home())
-        monkeypatch.setattr(paths, "_config_dir_memo", None)
+        _pin_a_fake_default_home(monkeypatch, tmp_path)
 
         assert session_storage.reclaim_block_reason() == ""
 
@@ -2256,8 +3625,7 @@ class TestSharedStoreRefusal:
         monkeypatch.delenv("KIROCREW_HOME", raising=False)
         monkeypatch.delenv("KIRO_HOME", raising=False)
         monkeypatch.setenv("KIROCREW_POD_ROOT", str(tmp_path / "pods"))
-        monkeypatch.setattr(paths, "_resolved_home", paths.legacy_home())
-        monkeypatch.setattr(paths, "_config_dir_memo", None)
+        _pin_a_fake_default_home(monkeypatch, tmp_path, legacy=True)
 
         assert session_storage.reclaim_block_reason() == ""
 
@@ -2307,7 +3675,10 @@ class TestSharedStoreRefusal:
                 onerror(OSError(5, "simulated read failure"))
             return iter(())
 
+        # Both mechanisms: ``_unlisted_files`` picks fwalk-vs-walk at call time
+        # by availability (fwalk does not exist on Windows).
         monkeypatch.setattr(session_storage.os, "walk", failing_walk)
+        monkeypatch.setattr(session_storage.os, "fwalk", failing_walk, raising=False)
 
         assert session_storage.empty_trash([batch.batch_id]) == 0
         # The batch survives, so nothing was destroyed on an unverifiable scan.
@@ -2366,8 +3737,7 @@ class TestSharedStoreRefusal:
         monkeypatch.setenv("KIROCREW_POD_ROOT", str(pod_root))
         monkeypatch.delenv("KIROCREW_HOME", raising=False)
         monkeypatch.delenv("KIRO_HOME", raising=False)
-        monkeypatch.setattr(paths, "_resolved_home", paths._default_home())
-        monkeypatch.setattr(paths, "_config_dir_memo", None)
+        _pin_a_fake_default_home(monkeypatch, tmp_path)
 
         assert session_storage.reclaim_block_reason() == ""
         protected, refusals = session_storage.cotenant_sids()
@@ -2394,8 +3764,7 @@ class TestSharedStoreRefusal:
         monkeypatch.setenv("KIROCREW_POD_ROOT", str(pod_root))
         monkeypatch.delenv("KIROCREW_HOME", raising=False)
         monkeypatch.delenv("KIRO_HOME", raising=False)
-        monkeypatch.setattr(paths, "_resolved_home", paths._default_home())
-        monkeypatch.setattr(paths, "_config_dir_memo", None)
+        _pin_a_fake_default_home(monkeypatch, tmp_path)
 
         reason = session_storage.reclaim_block_reason()
         assert "wt-legacy-shared" in reason
@@ -2420,8 +3789,7 @@ class TestSharedStoreRefusal:
         monkeypatch.setenv("KIROCREW_POD_ROOT", str(pod_root))
         monkeypatch.delenv("KIROCREW_HOME", raising=False)
         monkeypatch.delenv("KIRO_HOME", raising=False)
-        monkeypatch.setattr(paths, "_resolved_home", paths._default_home())
-        monkeypatch.setattr(paths, "_config_dir_memo", None)
+        _pin_a_fake_default_home(monkeypatch, tmp_path)
 
         assert session_storage.reclaim_block_reason() == ""
         assert session_storage.cotenant_sids() == (frozenset(), ())
@@ -2449,8 +3817,7 @@ class TestSharedStoreRefusal:
         monkeypatch.setenv("KIROCREW_POD_ROOT", str(pod_root))
         monkeypatch.delenv("KIROCREW_HOME", raising=False)
         monkeypatch.delenv("KIRO_HOME", raising=False)
-        monkeypatch.setattr(paths, "_resolved_home", paths._default_home())
-        monkeypatch.setattr(paths, "_config_dir_memo", None)
+        _pin_a_fake_default_home(monkeypatch, tmp_path)
 
         protected, refusals = session_storage.cotenant_sids()
         assert protected == frozenset({"legacysid01"})
@@ -2580,8 +3947,7 @@ class TestSharedStoreRefusal:
         monkeypatch.setenv("KIROCREW_POD_ROOT", str(pod_root))
         monkeypatch.delenv("KIROCREW_HOME", raising=False)
         monkeypatch.delenv("KIRO_HOME", raising=False)
-        monkeypatch.setattr(paths, "_resolved_home", paths._default_home())
-        monkeypatch.setattr(paths, "_config_dir_memo", None)
+        _pin_a_fake_default_home(monkeypatch, tmp_path)
 
         reason = session_storage.reclaim_block_reason()
         assert "make reclaiming unsafe" in reason
@@ -2617,8 +3983,7 @@ class TestSharedStoreRefusal:
         monkeypatch.setenv("KIROCREW_POD_ROOT", str(tmp_path / "no-pods-here"))
         monkeypatch.delenv("KIROCREW_HOME", raising=False)
         monkeypatch.delenv("KIRO_HOME", raising=False)
-        monkeypatch.setattr(paths, "_resolved_home", paths._default_home())
-        monkeypatch.setattr(paths, "_config_dir_memo", None)
+        _pin_a_fake_default_home(monkeypatch, tmp_path)
 
         assert session_storage.reclaim_block_reason() == ""
 
@@ -2813,9 +4178,9 @@ class TestSharedStoreRefusal:
         order: list[str] = []
         real_scan = session_storage._scan_units
 
-        def watched_scan(index: SessionIndex):
+        def watched_scan(index: SessionIndex, **kwargs):
             order.append("scan")
-            return real_scan(index)
+            return real_scan(index, **kwargs)
 
         def refresh() -> SessionIndex:
             order.append("refresh")
@@ -2891,7 +4256,7 @@ class TestSharedStoreRefusal:
 class TestCotenantNamesAreLogSafe:
     """A co-tenant directory name is agent-influenced and can embed a newline;
     both ``cotenant_sids`` log sites that carry it must escape it, or one record
-    forges additional records (refs #6371, the #6281/#6315 log-forgery class).
+    forges additional records (the log-forgery class).
     """
 
     _FORGED = "wt-evil\nWARNING forged: reclaim authorized by operator"
@@ -2902,8 +4267,7 @@ class TestCotenantNamesAreLogSafe:
         monkeypatch.setenv("KIROCREW_POD_ROOT", str(pod_root))
         monkeypatch.delenv("KIROCREW_HOME", raising=False)
         monkeypatch.delenv("KIRO_HOME", raising=False)
-        monkeypatch.setattr(paths, "_resolved_home", paths._default_home())
-        monkeypatch.setattr(paths, "_config_dir_memo", None)
+        _pin_a_fake_default_home(monkeypatch, tmp_path)
         return pod_root
 
     def _make_forged_pod(self, pod_root: Path) -> Path:
@@ -3014,9 +4378,8 @@ class TestCotenantRefusalTextIsForgeSafe:
     """The raw co-tenant name also exits ``cotenant_sids`` inside the refusals
     tuples and is interpolated into two downstream refusal-text surfaces. Neither
     is a log line today, but one caller-side ``logger.warning(str(exc))`` away
-    from re-opening the #6281/#6371 forgery class — so both must carry the name
-    repr'd, exactly like the log sites ``TestCotenantNamesAreLogSafe`` pins
-    (refs #6430).
+    from re-opening the forgery class — so both must carry the name
+    repr'd, exactly like the log sites ``TestCotenantNamesAreLogSafe`` pins.
     """
 
     _FORGED = "wt-evil\nWARNING forged: reclaim authorized by operator\x1b[31m"
@@ -3034,8 +4397,7 @@ class TestCotenantRefusalTextIsForgeSafe:
         monkeypatch.setenv("KIROCREW_POD_ROOT", str(tmp_path / "pods"))
         monkeypatch.delenv("KIROCREW_HOME", raising=False)
         monkeypatch.delenv("KIRO_HOME", raising=False)
-        monkeypatch.setattr(paths, "_resolved_home", paths._default_home())
-        monkeypatch.setattr(paths, "_config_dir_memo", None)
+        _pin_a_fake_default_home(monkeypatch, tmp_path)
         monkeypatch.setattr(
             session_storage, "cotenant_sids", lambda *, cached=False: (frozenset(), self._REFUSALS)
         )
@@ -3053,7 +4415,7 @@ class TestCotenantRefusalTextIsForgeSafe:
         self, stores: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """The ``SessionStorageError`` raised at the move renders one-line and
-        escaped, so a caller logging ``str(exc)`` cannot be used to forge a
+        escaped, so a caller logging ``str(exc)`` cannot forge a
         second record.
         """
         _, kiro_home = stores
@@ -3787,11 +5149,10 @@ class TestEmptyTrash:
                 session_storage.staged_targets([batch.batch_id])
 
         assert swapped == [True], "the swap must land inside the window under test"
-        # This assertion got STRONGER. It used to say only that whatever came back had its
-        # identity and its size describing one directory -- the impostor's -- because binding
-        # the pair was all the code could then promise. The manifest header now has to name
-        # the batch it was read from as well, so a different batch renamed into the selected
-        # name is refused outright rather than approved self-consistently under the wrong id.
+        # The manifest header must name the batch it was read from, not just carry an
+        # identity and a size describing one directory -- the impostor's. That way a
+        # different batch renamed into the selected name is refused outright rather than
+        # approved self-consistently under the wrong id.
         assert (staged / session_storage.MANIFEST_NAME).is_file(), "and it is left alone"
 
     def test_a_header_with_no_batch_id_is_refused_rather_than_waved_through(
@@ -4712,11 +6073,11 @@ class TestEmptyTrash:
     ) -> None:
         """The batch's own name gets the same treatment its interior directories get.
 
-        The final scan proves the batch empty by DESCRIPTOR and the removal used to
-        address a NAME, so a swap in between removed an empty replacement instead. That
-        was the worst of the name-addressed removals rather than the mildest: by then the
-        manifest has already been moved aside, so the real batch was left holding data
-        with nothing to list it -- and the caller reported success.
+        The final scan proves the batch empty by DESCRIPTOR; a removal that addressed a
+        NAME instead would let a swap in between remove an empty replacement. That is the
+        worst of the name-addressed removals rather than the mildest: by then the
+        manifest has already been moved aside, so the real batch is left holding data
+        with nothing to list it -- and the caller reports success.
 
         Here the manifest move is the trigger, which puts the swap exactly in that
         interval.
@@ -5051,7 +6412,7 @@ class TestEmptyTrash:
 
         Checking a path and then handing the SAME path to `rmtree` re-resolves it, so a
         swap in between is followed. The rename removes that: by the time anything is
-        removed the approved name no longer exists, and the name being removed is one that
+        removed the approved name does not exist, and the name being removed is one that
         existed for microseconds.
 
         Asserted structurally rather than by racing. A test that tries to land a swap
@@ -5092,7 +6453,7 @@ class TestEmptyTrash:
 
         It is not `OSError`, so it escaped every caller that turns a failed read into a
         refusal and reached the request handler as an unexplained snapshot failure - and
-        that handler used to answer a named selection by deleting it unchecked. Depth is
+        that handler would answer a named selection by deleting it unchecked. Depth is
         reachable by anything that can write into the trash, so the walk is iterative:
         deep enough still fails, but with `EMFILE`, which is an `OSError` and is handled.
         """
@@ -5295,7 +6656,7 @@ class TestEmptyTrash:
 
         POSIX has no unlink-by-inode - the stdlib's own `_rmtree_safe_fd` addresses names
         too - so this cannot be closed the way the directories were. What it can do is
-        refuse a name that no longer denotes the object the pinned scan saw, which is the
+        refuse a name that does not denote the object the pinned scan saw, which is the
         interval between that scan and the unlink. The swap here lands inside it.
         """
         if not session_storage._FD_SAFE_DELETE:
@@ -5488,7 +6849,7 @@ class TestSingleTrashPass:
 
     @staticmethod
     def _counted_manifest_reads(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
-        """Count via ``_summarize_manifest``: since #6281 it is ``list_trash``'s
+        """Count via ``_summarize_manifest``: it is ``list_trash``'s
         per-batch cost (the count-only streamed pass), and it is hit through the
         module global, so it sees every ``list_trash`` pass no matter which
         module's imported name made the call."""
@@ -5679,7 +7040,7 @@ class TestManifestReaders:
     def test_corrupt_lines_are_counted_and_logged_once(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """#6292 item 3: mid-file corruption is no longer silent — one aggregated
+        """Mid-file corruption is not silent — one aggregated
         warning per read, counting only genuinely corrupt lines."""
         lines = [
             json.dumps(self._header()),
@@ -5811,7 +7172,7 @@ class TestManifestReaders:
     def test_a_cap_boundary_read_does_not_destroy_a_record_boundary(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """GPT round-2 finding 1: a cap-sized read that cuts a physical line
+        """a cap-sized read that cuts a physical line
         mid-way must not condemn the bounded, individually valid records inside
         it. A 255-char record + \\u2028 + another record on one physical line,
         with the cap at 256, must yield both records."""
@@ -5829,7 +7190,7 @@ class TestManifestReaders:
     def test_a_final_line_ended_by_a_unicode_boundary_is_complete_corruption(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """GPT round-2 finding 2: 'garbage\\u2028' at EOF IS terminated under
+        """'garbage\\u2028' at EOF IS terminated under
         splitlines semantics — a complete corrupt record that must warn, not a
         crash-partial that hides at debug."""
         blob = json.dumps(self._header()) + "\n" + "garbage {\u2028"
@@ -5954,3 +7315,77 @@ class TestManifestReaders:
         assert listed[0].sessions == batch.sessions == 2
         assert listed[0].bytes == batch.bytes
         assert listed[0].bytes > 0
+
+
+class TestReclaimHoldsTheSessionLockAcrossTheIndexPurge:
+    """The search index's copy of a session's text must not come back after the move.
+
+    The index keeps that copy; the background indexer rebuilds a row from any
+    transcript still in place. A purge that merely PRECEDED the move therefore left a
+    window -- the indexer's write lands after it, and the text is in the index once
+    the files are gone. Both sides take ``ConversationLog._locked``, so the invariant
+    is that the purge runs while the reclaim holds that lock.
+    """
+
+    def test_the_purge_runs_while_the_unit_lock_is_held(
+        self, stores: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import threading
+
+        from kiro_crew.history import ConversationLog
+
+        crew_home, kiro_home = stores
+        _cli_half(kiro_home, "aaaa1111", log_bytes=2048, age_days=40)
+        _transcript(crew_home, "dashboard_chat-1", size=300, age_days=40)
+
+        exclusive: list[bool] = []
+        real_purge = session_storage._purge_search_index
+
+        def probing_purge(stems: list[str]) -> bool:
+            # Reentrant for the holding thread, so probe from another one.
+            lock_path = str(crew_home / "sessions" / f"{stems[0]}.jsonl")
+            lock = ConversationLog._file_locks.get(lock_path)
+            if lock is None:
+                exclusive.append(False)
+                return real_purge(stems)
+
+            def probe() -> None:
+                got = lock.acquire(blocking=False)
+                exclusive.append(not got)
+                if got:
+                    lock.release()
+
+            thread = threading.Thread(target=probe)
+            thread.start()
+            thread.join(timeout=10)
+            return real_purge(stems)
+
+        monkeypatch.setattr(session_storage, "_purge_search_index", probing_purge)
+
+        batch = session_storage.move_to_trash(
+            ["aaaa1111"],
+            reason="manual",
+            index=_index({"aaaa1111": "dashboard_chat-1"}),
+            now=_NOW,
+        )
+
+        assert batch.sessions == 1
+        assert exclusive == [True], "the purge ran without the session lock held"
+
+    def test_a_refused_purge_leaves_the_session_in_place(
+        self, stores: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        crew_home, kiro_home = stores
+        _cli_half(kiro_home, "aaaa1111", log_bytes=2048, age_days=40)
+        _transcript(crew_home, "dashboard_chat-1", size=300, age_days=40)
+        monkeypatch.setattr(session_storage, "_purge_search_index", lambda stems: False)
+
+        with pytest.raises(session_storage.SessionStorageError):
+            session_storage.move_to_trash(
+                ["aaaa1111"],
+                reason="manual",
+                index=_index({"aaaa1111": "dashboard_chat-1"}),
+                now=_NOW,
+            )
+
+        assert (crew_home / "sessions" / "dashboard_chat-1.jsonl").is_file()

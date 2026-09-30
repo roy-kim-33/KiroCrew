@@ -1,28 +1,33 @@
 import type { DisplayItem } from '../pages/chat/types'
-import { TURN_OPENER_ROLES } from '../pages/chat/groupDisplayItems'
+import { isSubagentCompletionMessage } from '../pages/chat/subagentCompletion'
 import { mdImageDestToPath } from './fileTokens'
 import { type PasteBlock, expandAll } from './pasteTokens'
 
 /**
  * Geometry + selection helpers for the pinned-prompt banner (the most recent
- * user prompt that has scrolled fully behind the chat fold, shown as a sticky
- * band under the session title).
+ * user prompt that has scrolled up to the chat fold, shown as a sticky band
+ * under the session title).
  *
- * The hand-off is **bottom-edge driven**: a prompt scrolls with the transcript
- * until its bubble's BOTTOM edge reaches the bottom of the banner band, i.e.
- * until the row is entirely hidden behind the band; only then does it collapse
- * into the banner. It is then pushed out by the NEXT prompt as that prompt's top
- * border meets it (`computePinPush`) — a separate, earlier line, so a tall prompt
- * shows no banner at all while it is being read.
+ * The hand-off is **top-edge driven**: a prompt scrolls with the transcript
+ * until its bubble's TOP edge reaches the card's own resting top, and hands over
+ * there. That line is where the card sits, so the bubble stops travelling at the
+ * exact pixel the card occupies — which is the whole point. It is then pushed out
+ * by the NEXT prompt as that prompt's top border meets it (`computePinPush`).
  *
- * Why the bottom edge and not the top (the original sticky-style rule): a prompt
- * taller than the band — an essay, a pasted stack trace — satisfies "top has
- * reached the fold" the instant it is sent, so it would collapse into a one-line
- * banner before the user could read it, and its still-laid-out (but hidden) row
- * left a prompt-sized hole above the response. Tracking the bottom edge means a
- * tall prompt stays fully readable and scrolls away line by line. For a
- * one-line prompt the two rules fire on the same pixel (its bubble height equals
- * the collapsed card height), so short-prompt behaviour is unchanged.
+ * Why the top edge and not the bottom (the rule this replaced): the bottom-edge
+ * rule waited until the row was entirely behind the band, so any prompt TALLER
+ * than the card kept scrolling after it had passed the card's position, went out
+ * of sight behind the header, and the card then appeared back down at the fold —
+ * content jumping down the screen after having scrolled past its own resting
+ * place (measured at 78px for a four-line prompt against a one-line card). The
+ * top edge cannot do that: `snapBackPx` is 0 by construction.
+ *
+ * The hand-off line therefore does NOT depend on the card's height, and must not:
+ * the clamp (`PINNED_RESTING_LINES`) is a presentation choice that may change, and
+ * a hand-off derived from it moves the swap point with it. A prompt no taller than
+ * the clamp hands over with no size change at all; a taller one FOLDS in place at
+ * the line, animated by the card's own height morph (see PinnedPrompt), instead of
+ * being swapped after a journey. Both fall out of the same rule at any clamp value.
  *
  * The banner cannot be a real sticky element because the transcript is
  * virtualized — a row scrolled far above the window unmounts, so the sticky node
@@ -47,31 +52,61 @@ export const ROW_PAD_Y = 4
 export const DEFAULT_PINNED_CARD_H = 46.75
 
 /**
- * Viewport Y of the hand-off line: the BOTTOM edge of the banner band. A prompt
- * pins once its row bottom has risen to or above this line (the row is then
- * completely covered by the band, so the swap is invisible), and un-pins the
- * moment it drops back below it.
+ * Viewport Y of the hand-off line: the card's own resting TOP edge. A prompt pins
+ * once its row top has reached this line, and un-pins the moment it drops back
+ * below it.
  *
- * @param foldY         viewport Y of the fold sentinel = the band's top edge
- * @param collapsedCardH measured height of the collapsed banner card
+ * The row and the band both put `ROW_PAD_Y` above their bubble, so a row whose TOP
+ * is on the fold has its bubble on the card's top: handing over there is a swap
+ * between two boxes that start at the same pixel, whatever either one's height is.
+ *
+ * Takes no card height ON PURPOSE. The previous rule added the card's measured
+ * height to this line, which coupled the swap point to the clamp: change
+ * `PINNED_RESTING_LINES` and the hand-off moved, and any prompt taller than the
+ * clamp overshot the line by exactly the difference. Keeping the clamp out of the
+ * line is what makes the fix hold at every clamp value.
+ *
+ * @param foldY viewport Y of the fold sentinel = the band's top edge
  */
-export function pinHandoffY(foldY: number, collapsedCardH: number): number {
-  return foldY + ROW_PAD_Y * 2 + collapsedCardH
+export function pinHandoffY(foldY: number): number {
+  return foldY
 }
 
 /**
- * Rows that can take the pin: the ones that OPEN a turn.
+ * Rows that can take the pin: what the HUMAN typed.
  *
- * Derived from `TURN_OPENER_ROLES` rather than restated, because the two lists
- * disagreeing is the defect this exists to prevent. A nudge and a subagent
- * completion are machine-injected, but each IS the thing that started the turn
- * being read, and a session made almost entirely of them (a babysit loop, a
- * workflow fan-out) otherwise offers no pinnable row cycle after cycle — the walk
- * upward skips every one and lands on the human's last typed message, dozens of
- * turns and tens of thousands of pixels away.
+ * Deliberately NARROWER than `TURN_OPENER_ROLES`. A nudge and a subagent
+ * completion open turns too (the grouping keeps treating them that way), but they
+ * are machine-injected: a banner that quotes "Auto-nudge · cycle 36" over the
+ * transcript tells the reader nothing they asked, and in a babysit loop it
+ * re-pins on EVERY cycle, so scrolling through the session shows a fresh machine
+ * row taking the band every few screens. The banner exists to answer "what did I
+ * ask that this is a reply to", and only a row the user authored can answer it —
+ * so the walk upward skips every machine opener and lands on the last typed
+ * prompt, however many cycles ago that was. The distance is the honest answer:
+ * nothing closer was the user's.
+ *
+ * A STEER (`meta.steer`, set by the `steer_push` echo) IS admitted, on the same
+ * grounds that admit any other typed row: the user wrote it, and inside the reply
+ * that followed it, it is the most recent thing they asked. This deliberately
+ * differs from the turn-BOUNDARY scans that share its shape —
+ * `isTurnBoundaryUser` in `thinking.ts` and the `lastUserIdx` walk in
+ * `selectors.ts` (both in `store/chat`), the turn-head walk in
+ * `app-sdk/turnPolicyBlock.ts` — all of which must skip a steer because they
+ * answer "where does this turn BEGIN", and a row injected into a running turn
+ * cannot end that scan. The banner answers "what did I last ask", so it takes the
+ * opposite answer. The row that OPENED a steered turn is not lost: it is the head
+ * of the steer's own prompt run, so it is where clicking the banner lands
+ * (`jumpAnchorIdx`) or one step further up the chain.
+ *
+ * A subagent completion in OLDER scrollback was persisted under role `user`
+ * (before the `subagent` role existed) and IS excluded, by SHAPE rather than by
+ * role: the same completion-event parser the transcript card uses recognises it.
  */
 function isPrompt(item: DisplayItem | undefined): boolean {
-  return !!item && item.kind === 'single' && TURN_OPENER_ROLES.has(item.msg.role)
+  if (!item || item.kind !== 'single') return false
+  const { msg } = item
+  return msg.role === 'user' && !isSubagentCompletionMessage(msg)
 }
 
 /**
@@ -105,30 +140,6 @@ export function findNextPromptIdx(items: DisplayItem[], afterIdx: number): numbe
 }
 
 /**
- * Whether a transcript row must be HIDDEN because the banner stands in for it.
- *
- * Pure and here rather than inline in a style attribute because it is the one rule
- * in the feature whose failure DELETES a message: the row is hidden on the promise
- * that the banner shows the same content in the same place, and any state that
- * breaks that promise while leaving this true makes the message unreachable in
- * both places at once. `minimized` is checked first for exactly that reason — a
- * chip stands in for nothing.
- *
- * Identity beats position: the pin's index is computed in a scroll rAF and a
- * streaming append can shift the list before the row renders, which hid the wrong
- * row. Match on the message timestamp when the pin has one, falling back to the
- * index only for a message carrying none, and pass no timestamp for a grouped row.
- */
-export function pinHidesRow(
-  pin: { ts?: string; idx: number } | null,
-  minimized: boolean,
-  row: { ts?: string; idx: number },
-): boolean {
-  if (minimized || !pin) return false
-  return pin.ts != null ? row.ts === pin.ts : pin.idx === row.idx
-}
-
-/**
  * Display index of the row the pinned-prompt jump should scroll to when the
  * user asks for `target`.
  *
@@ -145,19 +156,20 @@ export function pinHidesRow(
  * puts a non-prompt row (or the top of the list) on the line instead, so the
  * previous turn's banner survives and the chain continues.
  *
- * The walk deliberately consumes MACHINE turn openers too (nudge and subagent
- * rows — `isPrompt` derives from `TURN_OPENER_ROLES`), not only consecutive
- * user rows like a steer following its prompt. The mechanism-backed case is a
- * fan-out whose completions drain back to back: each is a turn opener and none
- * of them carries a reply of its own, so they lay out as one run of consecutive
- * opener rows. Consecutive
- * nudge rows arise only when nudged turns persist no reply (an errored or
- * cancelled cycle — a normal cycle interposes its tool/assistant rows). In
- * both shapes each row is pinnable, and each belongs to the same contextual
- * block as the row directly above the run: jumping to any member lands at the
- * block's top, where the exchange reads in order — stopping mid-run would
- * drop the reader between two machine rows with the context that explains
- * them still hidden above.
+ * The walk consumes only rows `isPrompt` admits — consecutive rows the USER
+ * typed: a steer sent before the turn produced any output, a double-send, a
+ * prompt typed while the previous one was still queued. Those are exactly the
+ * rows that can pin and push, so they are the only ones that can straddle. A
+ * steer sent before the turn produced any output lies directly on its opener, so
+ * the walk anchors there and clicking that pinned steer scrolls to the prompt
+ * that started the work; a steer that arrived after some output has a reply row
+ * above it and is its own anchor. Machine openers (nudge and
+ * subagent rows) are not prompts here, so a run of them above the target is an
+ * ordinary non-prompt gap and the walk stops at the target: the previous user
+ * prompt's banner then survives the landing exactly as it would over any other
+ * reply row. A nudge is a one-line self-labelled system row and a subagent
+ * completion a self-labelled headline card, so a landing beside either reads on
+ * its own, with the banner above it naming the prompt the whole block answers.
  *
  * Walking up lengthens the jump. The virtualizer's near/far decision
  * (`mountIndex` in useVirtualChat) compares the anchor's jump window against
@@ -221,6 +233,48 @@ export function pinPushTravel(bannerH: number): number {
   return ROW_PAD_Y + bannerH
 }
 
+/**
+ * Height the pinned card should be on this frame — the progressive fold.
+ *
+ * The card's top is fixed at `foldY + ROW_PAD_Y`. Its bottom should sit on the
+ * pinned BUBBLE's bottom edge: the card is a stand-in for the bubble alone, and
+ * what follows the bubble in its row — the message's action strip, then the
+ * reply — is left in place under the hidden row (see `[data-pinned-standin]` in
+ * index.css), so matching the bubble's edge is what keeps the card from ever
+ * covering those controls while leaving no gap of its own. The height wanted is
+ * therefore the distance from the card's top to the bubble's bottom.
+ *
+ * Bounded at both ends, and each bound is load-bearing:
+ *   - never above `standinH`, the height the card has at the hand-off frame (from
+ *     its own top to the bubble's bottom), so a freshly pinned prompt is a
+ *     pixel-exact stand-in rather than a taller box that pushes the reply down.
+ *     That is the bubble's height only when the bubble starts where the card does:
+ *     a steer's accent bubble sits under its badge, so its stand-in is taller by
+ *     that offset, and a ceiling of the bubble's own height stopped the card short
+ *     of the bubble's bottom — a blank band above the strip for the first pixels
+ *     of scroll after hand-off;
+ *   - never below `restingH`, because the card cannot show less than its clamp. Past
+ *     that point the bubble's slot is smaller than the card and the strip and reply
+ *     slide under it, which is the same one-line overlap the band already has at rest.
+ *
+ * @param bubbleBottomFromFold pinned bubble's bottom edge, relative to the fold line
+ * @param restingH             settled height of the clamped card
+ * @param standinH             distance from the card's top to the bubble's bottom
+ *                             at the hand-off frame — the card's natural height
+ */
+export function computeLiveCardH(
+  bubbleBottomFromFold: number,
+  restingH: number,
+  standinH: number,
+): number {
+  // A stand-in smaller than the clamp (a one-word prompt) has nothing to fold: the
+  // card is already its resting size and the max() below would otherwise stretch
+  // it past the bubble it is copying.
+  const ceiling = Math.max(restingH, standinH)
+  const wanted = bubbleBottomFromFold - ROW_PAD_Y
+  return Math.min(ceiling, Math.max(restingH, wanted))
+}
+
 export function computePinPush(bannerH: number, foldY: number, nextTop: number | null): number {
   if (nextTop == null || bannerH <= 0) return 0
   const travel = pinPushTravel(bannerH)
@@ -230,19 +284,35 @@ export function computePinPush(bannerH: number, foldY: number, nextTop: number |
 }
 
 /**
- * Lines of prompt text the COLLAPSED card shows before clamping.
+ * Lines of prompt text the card shows AT REST — one.
  *
- * One line was the original choice and it loses too much: a long prompt is the
- * one most worth summarising, and a single clamped line of it is usually just its
- * opening clause. Three keeps the card small enough to sit under the title
- * without dominating the viewport, and it widens the range over which the card is
- * a pixel-exact copy of the bubble it replaces — every prompt up to three lines
- * now hands over with no size change at all, where before only a one-liner did.
+ * The card sits over the top of whatever reply the reader is scrolling through,
+ * so its resting height is space taken from that reply. Three resting lines
+ * (the earlier value) cost ~13% of a phone viewport on every long turn, and the
+ * reporter of #4984 named it as the one piece of chrome that actively gets in
+ * the way of reading. One line is enough to answer "what did I ask" at a
+ * glance; the fuller preview is one hover away (`PINNED_PREVIEW_LINES`), and
+ * the whole prompt one click away (the chevron).
  *
- * Consequence for the hand-off line: a taller card pushes `pinHandoffY` DOWN,
- * which makes the pin condition (`rowBottom <= handoffY`) EASIER to satisfy, so a
- * card growing after it mounts can never invalidate the pin that mounted it. The
- * coupling is monotone in the safe direction — see the test of the same name.
+ * Consequence for the hand-off line: the card's settled resting height is what
+ * `pinHandoffY` is derived from, and a SHORTER card moves that line UP, so a
+ * prompt hands over sooner. The pin condition (`rowBottom <= handoffY`) is
+ * evaluated against this settled height only — the hover peek and the full
+ * expansion grow the live card but never re-report a collapsed height — so a
+ * card growing after it mounts can never invalidate the pin that mounted it.
+ * See the test of the same name.
+ */
+export const PINNED_RESTING_LINES = 1
+
+/**
+ * Lines of prompt text the card shows while the pointer is over it or a control
+ * inside it has keyboard focus — the PEEK.
+ *
+ * A single clamped line of a long prompt is usually just its opening clause;
+ * three lines is the amount that reliably carries the ask. Hover is the right
+ * trigger because it costs the reader nothing when they are not interested: the
+ * card grows only while they point at it and shrinks back the moment they leave.
+ * Touch has no hover, so on touch the chevron is the way to more than one line.
  */
 export const PINNED_PREVIEW_LINES = 3
 
@@ -305,7 +375,13 @@ export function promptPreview(content: string): string {
   return content
     .replace(FENCE_RE, ' … ')
     .replace(IMAGE_MD_RE, ' ')
-    .replace(/\[attached_file \d+\]\s*(\S+)/g, (_m, p: string) => p.split('/').pop() || '')
+    // The serializer's hair-space separators around an inline marker exist
+    // for the wire readers; drop only those (one right before a marker, one
+    // right after its path) so `(@a.txt), then` does not read `( a.txt ) , then`.
+    // A hair space anywhere else is the user's and falls to the whitespace
+    // pass below like any other space (fork GPT review).
+    .replace(/\u200a(?=\[attached_file \d+\])/g, '')
+    .replace(/\[attached_file \d+\]\s*(\S+)\u200a?/g, (_m, p: string) => p.split('/').pop() || '')
     .replace(/\s+/g, ' ')
     .trim()
 }
@@ -475,6 +551,35 @@ export interface PinnedPromptState {
   bodyBeyondPreview: boolean
   push: number
   bannerH: number
+  /**
+   * Height the card should be RIGHT NOW, in px — the progressive fold.
+   *
+   * The card stands in for a row whose slot is still laid out (the row is hidden,
+   * not removed), so a card SHORTER than that slot leaves a blank gap between
+   * itself and the reply below. That gap is the size of the difference: measured
+   * at 794px in a 700px viewport for a 30-line prompt against a one-line clamp.
+   * Tracking the slot's remaining height removes the gap by construction — the
+   * card is exactly as tall as the part of the row still above the reply, and it
+   * shrinks line by line as the row scrolls away until it reaches its clamp.
+   *
+   * Computed from the ROW, never from the card (see computeLiveCardH). A height
+   * derived from measuring the card would close a loop: the card's height feeds
+   * `onCollapsedHeight`, which feeds `pinHandoffY` and `pinPushTravel`, which move
+   * the geometry that decides the height. The resting height keeps that reporting
+   * role alone.
+   */
+  liveH?: number
+  /**
+   * The hidden row's action strip is still UNCOVERED — some of it sits below the
+   * card's resting bottom, on screen. The hosts write it as the `folding` value
+   * of the row's `data-pinned-standin` marker, which is what index.css re-shows
+   * the strip on. Deliberately not `liveH != null`: the fold ends with the card
+   * at its clamp while the strip, which hangs under the bubble, is still wholly
+   * below the card, and it slides under over the next strip's-height of scroll —
+   * the marker has to hold until it has. A boolean rather than a distance, so the
+   * state only changes at the two edges where the marker flips.
+   */
+  stripUncovered?: boolean
 }
 
 /** What the scroll recompute knows before any derivation is done. */
@@ -484,12 +589,12 @@ export interface PinnedPromptInput {
   /** Stored (collapsed) prompt content — the identity the derivation keys on. */
   raw: string
   pastes: PasteBlock[]
-  /** Compact label a machine-authored row shows instead of its payload. */
-  machineLabel: string | null
-  /** Body such a row reveals when expanded, when it differs from `raw`. */
-  machineBody?: string
   push: number
   bannerH: number
+  /** See `PinnedPromptState.liveH`. Recomputed every scroll frame. */
+  liveH?: number
+  /** See `PinnedPromptState.stripUncovered`. Recomputed every scroll frame. */
+  stripUncovered?: boolean
 }
 
 /**
@@ -509,25 +614,30 @@ export function nextPinnedPromptState(
   prev: PinnedPromptState | null,
   input: PinnedPromptInput,
 ): PinnedPromptState {
-  const { idx, ts, raw, pastes, machineLabel, machineBody, push, bannerH } = input
+  const { idx, ts, raw, pastes, push, bannerH, liveH, stripUncovered } = input
   const sameMsg = prev !== null && prev.idx === idx && prev.raw === raw && prev.ts === ts
-  if (sameMsg && prev.push === push && prev.bannerH === bannerH) return prev
-  if (sameMsg) return { ...prev, push, bannerH }
-  const derived = machineLabel === null ? derivePinnedPromptText(raw, pastes) : null
-  const text = machineLabel ?? derived?.text ?? ''
-  const full = machineBody ?? derived?.body ?? raw
+  if (sameMsg && prev.push === push && prev.bannerH === bannerH && prev.liveH === liveH
+    && prev.stripUncovered === stripUncovered) return prev
+  // `liveH` DOES move every frame — that is the fold. It is carried on the
+  // same-message path for exactly that reason, unlike `push`/`bannerH` which only
+  // change when the geometry does. `stripUncovered` flips on a later frame of
+  // the same pin (the strip slides under the resting card), so it rides here too.
+  if (sameMsg) return { ...prev, push, bannerH, liveH, stripUncovered }
+  const { text, body: full, images } = derivePinnedPromptText(raw, pastes)
   return {
     idx,
     ts,
     text,
     raw,
     full,
-    images: derived?.images ?? [],
-    // By COMPARISON, not by being machine-authored: a short multiline paste never
-    // clamps, so this flag is the only thing that can reach its body.
+    images,
+    // By COMPARISON: a short multiline paste never clamps, so this flag is the
+    // only thing that can reach its body.
     bodyBeyondPreview: full !== text,
     push,
     bannerH,
+    liveH,
+    stripUncovered,
   }
 }
 

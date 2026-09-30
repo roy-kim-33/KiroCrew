@@ -3,7 +3,7 @@
 ## Overview
 
 Dev Fleet is a builtin App Store app (`kiro_crew/apps/builtins/dev_fleet/`) for
-managing KiroCrew feature worktrees (git worktrees of the main repo) and their isolated
+managing Kiro Crew feature worktrees (git worktrees of the main repo) and their isolated
 pod test instances. It runs as a managed app backend SUBPROCESS: an aiohttp server on the
 backend-assigned port, reached only through the gateway proxy. Every proxied request
 carries an HMAC signature (`X-KiroCrew-Proxy: <ts>:<hmac>` over
@@ -17,9 +17,10 @@ Gateway session auth (token/cookie) gates the proxy entrance as with all builtin
    dropping records git flags `prunable` (checkout directory deleted without a
    `git worktree prune`); the primary checkout is never dropped, since it anchors `is_main`
 2. **Pod integration** — spin up/down/restart isolated pod instances per worktree
-3. **Pull+Build sync** — pull origin/main and rebuild (venv + frontend dist)
+3. **Pull+Build sync** — pull the resolved base branch and rebuild (venv + frontend dist)
 4. **Prune** — safely remove merged/empty worktrees with PR-shipped verification
-5. **Rebase** — rebase feature branches onto main with conflict detection + abort
+5. **Rebase** — rebase feature branches onto the resolved base branch with conflict
+   detection + abort (refused while that base is a guess — see Base Branch Resolution)
 6. **GitHub PR status** — TTL-cached `gh pr list` queries for merge state
 7. **Make Live** — repoint the live gateway at another worktree via a
    live-target pointer file (no service definition is ever mutated)
@@ -78,7 +79,7 @@ repository adopted as the main checkout would have its worktrees listed and Pull
 rebase and worktree-removal git commands run inside it. Tiers 1–2 skip the test *during
 discovery* because the user named that path — a typo must surface as an error against it
 rather than be silently replaced by a discovered checkout — but the path is still validated
-once at startup, and `_repo()` — the single accessor every git argv and path build goes
+once, on the attempt that resolves it, and `_repo()` — the single accessor every git argv and path build goes
 through — then raises `RepoUnreadable` naming it. The gate lives in the accessor rather than
 in worktree discovery because sync and the background refresher reach git without passing
 through discovery, and `pull --ff-only` plus `pip install -e` inside an unrelated repository
@@ -105,6 +106,50 @@ When no tier resolves, `MAIN_REPO` is `""` — never a synthesized path. Discove
 produces a red "Discovery Error" naming a directory the user never chose, which reads as a
 broken app rather than an unanswered question.
 
+That unresolved state is retried, not latched. `ensure_main_repo_discovered()` records
+"done" only once a checkout RESOLVED, and `/fleet` calls
+`worktree_ops._ensure_repo_resolved()` per poll, so an operator who writes
+`dev_fleet.repo_path` while the gateway is running gets a fleet on the next poll rather
+than after a restart. A resolved install returns at a truthiness guard before any await,
+so the retry costs nothing once there is a fleet to serve. An unresolved one re-runs tiers
+2 and 5 on the subprocess executor and spawns no subprocess, because `_load_fallback_repos`
+and `_upstream_remote` both decline before reaching git while `_repo()` raises; the
+credential-helper warm is guarded by its own `None` sentinel, so its two `git config` calls
+stay once-per-process.
+
+Only tier 2 self-heals. `_load_dev_fleet_cfg` re-reads `config.json` on every call, whereas
+tier 1 is read off this process's own environment, which no outside shell can change, so
+setting `KIROCREW_DEVFLEET_REPO` still requires a restart and the setup card names the two
+routes separately. A resolved path that FAILS the marker test latches too, and renders the
+`RepoUnreadable` banner naming the path and the remedy. That latch is reopened by
+`_invalid_resolution_is_stale` once the configured string changes: because tier 2 is
+re-read per call, an operator who corrects a typo would otherwise meet exactly the frozen
+banner this chain removes for the not-found case. The test compares against the string the
+latching attempt read rather than against `MAIN_REPO`, which is the `_resolve_primary_checkout`
+form of it, so a path that needed rewriting does not read as changed on every poll; a valid
+resolution still returns at its first guard with no await, and an env-set path cannot change
+inside one process, so neither pays for the reopening. Reopening also requires the config
+read itself to have succeeded. An unreadable or half-written `config.json` yields the same
+empty string as one naming no path, so reopening on that difference would send discovery to
+the INFERRED tiers and latch a checkout the operator never named while their own setting sat
+in a file this process merely failed to read, and every later git call would target it.
+`_load_dev_fleet_cfg_checked` reports whether every file present parsed, and only a whole
+read can say the operator's answer changed; a parseable file carrying no `repo_path` is an
+answer rather than a gap, so that case still reopens. The attempt then takes ONE checked
+read and hands it to `_discover_main_repo` rather than letting that function read tier 2
+again, because two reads of one file can disagree: the staleness test could see a whole
+corrected path and reopen while a second read returned the empty string and sent
+discovery to the INFERRED tiers. That latch passes the marker test, so it is VALID and
+therefore final, nothing re-resolves it and only a restart clears it. A partial read
+publishes nothing at all and the next poll retries against a settled file. Every
+global the chain writes is a function of the current attempt alone, including the
+invalid-path message, which an attempt that finds nothing clears rather than inherits —
+`MAIN_REPO` from one attempt beside an earlier attempt's verdict would hand `_repo()` a path
+whose markers were never checked. A late resolution also restarts the background refresher,
+which returns rather than idles when there is no usable checkout; leaving it stopped would serve a
+fleet whose rows never refresh again, so the setup card disappears and the page looks alive
+while nothing fetches (`test/test_dev_fleet_repo_reresolution.py`).
+
 Because `""` would make `git -C ""` operate on the backend's own working directory (and
 `Path("")` is `Path(".")`), no consumer reads the global directly: every site that runs git
 against the checkout or builds paths from it resolves it through the `_repo()` accessor,
@@ -112,7 +157,8 @@ which returns the path or raises `RepoNotConfigured`. Sites that deliberately de
 instead of failing catch it and say what the degraded answer is — upstream-remote
 resolution falls back to `origin`, build-pending detection reports nothing pending,
 fallback-remote loading leaves the list empty, sync refuses with its usual
-`{"ok": false}` shape, and the background refresher idles. Bare `MAIN_REPO` loads outside
+`{"ok": false}` shape, and the background refresher stops until a later resolution
+restarts it. Bare `MAIN_REPO` loads outside
 the accessor are limited to truthiness guards. An AST ratchet scans every Dev Fleet backend
 component (`test/test_dev_fleet_repo_accessor.py`) and permits the authoritative load only
 inside `repository._repo()`; helpers in every sibling module must route through that
@@ -170,19 +216,146 @@ verification. Route names below are relative to that prefix.
 | `/apps/dev-fleet/api/pod/token` | `{name}` | Mint a dashboard token for the pod |
 | `/apps/dev-fleet/api/pod/provision` | `{name}` | Start async venv+dist build (returns `{run_id}`) |
 | `/apps/dev-fleet/api/pod/provision/dismiss` | `{name, run_id}` | Forget a terminal provision failure when the run id still matches |
-| `/apps/dev-fleet/api/rebase` | `{name}` | Rebase worktree onto origin/main |
-| `/apps/dev-fleet/api/restart-gateway` | — | Restart the live gateway through its service-manager backend; returns the pre-restart `start_id` for the restart handshake |
-| `/apps/dev-fleet/api/make-live` | `{path, dry_run?}` | Repoint the live gateway at another worktree (see Make Live); a real cutover returns `start_id` for the restart handshake |
+| `/apps/dev-fleet/api/rebase` | `{name}` | Rebase worktree onto `{remote}/{base branch}` |
+
+Two routes are served by the **gateway process** rather than the backend, under the
+in-gateway namespace `/api/apps/dev-fleet/` (`gateway_routes.py`, mounted by the
+`BUILTIN_NAMES` loop). Both are **dashboard-owner only** and refuse any app token:
+
+| Route | Body | Purpose |
+|---|---|---|
+| `POST /api/apps/dev-fleet/restart-gateway` | — | Restart the live gateway through its service-manager backend; returns the pre-restart `start_id` for the restart handshake |
+| `POST /api/apps/dev-fleet/make-live` | `{path, dry_run?, expected_staged?}` | Repoint the live gateway at another worktree (see Make Live); a real cutover returns `start_id` for the restart handshake |
+| `GET /api/apps/dev-fleet/live-target` | `?fresh=1` | The pointer-state read broker `{live, staged, staged_cancel_available, previous}` (`previous` is the pointer's validated one-level undo target, so the fleet's Undo banner needs no pointer read of its own) — admits ONLY Dev Fleet's own app token (how the sandboxed backend learns which row is live); a dashboard human and any other app's token are refused |
+
+Why these two moved: they write the live-target pointer (or hold its cutover latch), and
+that file is bind-masked from the sandboxed backend **and every child it spawns** — a
+nested sandbox is denied by design, so a worktree's `npm ci` lifecycle script runs in the
+backend's namespace. See *Make Live → Pointer file*.
+
+### Agent surface (gateway process, `/api/apps/dev-fleet/pod/*`)
+
+A second, deliberately small pod surface exists for AGENT sessions, served **in the
+gateway process** rather than by the backend subprocess (`agent_pod_api.py`).
+
+Why it is separate rather than a reuse of the proxied routes above: on Linux, an agent
+session runs behind a sandbox with its own user namespace, so it cannot `connect(2)`
+the systemd user-bus socket that pod lifecycle verbs need, and `kirocrew pod up` in
+an agent shell fails with a bare `Permission denied`. The gateway is the process the
+sandbox launcher descends from, so it holds the host bus. The agent reaches these routes the
+way it reaches any tool — an MCP call, then loopback HTTP — with no D-Bus passthrough
+into the sandbox. The proxied `/apps/dev-fleet/api/*` routes cannot serve this: they
+require a dashboard cookie or token, which an agent does not hold, and admitting an
+internal-secret caller there would expose the app's whole backend surface.
+
+| Method | Route | Input | Description |
+|--------|-------|-------|-------------|
+| POST | `/api/apps/dev-fleet/pod/up` | `{worktree}` | Boot a pod; answers the CLI's `--json` handle (`base_url`, `token`, `port`, `ttl`). The token is minted **in the gateway process** when pod config is available (see *Token mint runs in the gateway*); otherwise the CLI mints it. Provisioning is NOT reachable here: a cold venv + SPA build is minutes of work, and one blocking request for that dies to any timeout with no way to learn the outcome. An unbuilt worktree is refused with the CLI's own remedy; the dashboard's Provision button streams the same work under a run id |
+| POST | `/api/apps/dev-fleet/pod/down` | `{worktree}` | Stop the pod and reclaim its isolated HOME |
+| GET | `/api/apps/dev-fleet/pod/status?worktree=` | — | `{name, status, port, health}`, as `pod status --json` reports it |
+| GET | `/api/apps/dev-fleet/pod/list` | — | `{pods: [{name, port, health}]}` for every pod active on the host, unfiltered by repo |
+
+Contract:
+
+- **Gated on the app being enabled** (`_require_enabled`), since routes are
+  registered at startup and Dev Fleet ships `defaultEnabled: false`.
+- **No operator opt-in and no per-call approval, deliberately.** A pod runs the code
+  in a git worktree an agent can write, started by the per-user service manager
+  (systemd `--user` on Linux or launchd on macOS), so it
+  executes outside the agent's sandbox. That reachability is Kiro Crew's DOCUMENTED
+  posture rather than something these routes introduce: `security.md`, under "Scoped
+  user-bus locator forward", records that sandboxed agent shells legitimately run
+  `systemctl --user` and the `kirocrew pod` CLI, and names the residual in the same
+  paragraph; the builtin `pod-e2e` skill has always told agents to boot pods. An
+  extra gate here would not close that residual — every other path to it stays open —
+  it would only stop the agent-driven QA loop these routes exist to restore. Agent
+  pod control is an intended capability, so it is not gated. State the residual
+  precisely rather than comfortably: on a host whose OUTER sandbox denies the user
+  bus, these routes are the one path from an agent-writable worktree to code running
+  unsandboxed as the user, so enabling Dev Fleet on such a host now carries that
+  surface. App admission policy can deny the app outright where that is unwanted.
+- **Named one by one in `server._STRICT_INTERNAL_API_PATHS`**, never as a
+  `/api/apps/dev-fleet/pod` prefix. That table is exact-or-prefix
+  (`path == entry or path.startswith(entry + "/")`), and this app's neighbourhood
+  includes worktree prune and the Make Live cutover, which must not become reachable
+  by holding the internal secret.
+- **STRICT, not mixed** — no browser calls them. Each handler re-asserts local origin
+  AND `internal_auth`, because a `local_only=False` deployment reclassifies strict
+  paths as mixed (same reason `/api/computer-use/frame` re-asserts both). Local origin
+  is the UNION of the AF_UNIX socket and a loopback address, mirroring the
+  middleware's own `_unix_sock is not None or is_loopback(...)`: `mcp_core` prefers
+  the gateway's unix socket whenever the file exists, and `request.remote` is empty
+  over AF_UNIX, so testing the loopback half alone would refuse every call on the
+  platform pods actually run on.
+- **No pod logic of its own.** Every handler delegates to the same `worktree_ops`
+  helpers the dashboard's buttons call, so "up" means one thing and a pod's status
+  has one definition.
+- **Token mint runs in the gateway when its pod config is available.** `_pod_up`
+  resolves config once before boot. With config, it boots the pod with
+  `pod up --no-token` and then mints the pod's 2h dashboard token
+  IN THIS GATEWAY PROCESS (`runtime.mint_token`, the same in-process path
+  `_pod_token` uses), stamping it into the `--json` handle. Before boot it captures
+  the expected worktree path. One executor callable holds `pod_name_mutex` while
+  strictly re-reading the checkout pin and minting. A missing or changed pin
+  returns `ok=False`, `code=pod_checkout_mismatch`, and no token; an unreadable
+  pin or another mint error returns `code=pod_token_mint_failed`. This prevents a
+  same-name pod from another checkout replacing the intended token recipient.
+  The gateway emits `pod.token` audit rows: `allowed` for a mint, `denied` for a
+  pin mismatch or unproven ownership, and `failure` for a mint error. Rows carry
+  the name and `ttl=2h`, plus the port once attributed, never the token; caller
+  is `dev_fleet` and source is `app`. Audit failures log a warning without changing
+  the mint result. Without config,
+  including the Windows CLI fallback, it omits `--no-token` and keeps the CLI's
+  token. An unproven port owner leaves `ok=True` and `token=""`, with a redacted
+  `warning` explaining why the credential is withheld; other mint errors fail
+  the operation. The CLI's `--no-token` emits the `pod.token` audit outcome
+  `skipped` with `reason=no-token`, and human output says the token is skipped
+  by request rather than claiming an ownership check failed. It must mint in
+  the gateway on Linux because of
+  who the pod's `/api/token/local` will certify: that route gates on
+  `local_owner_bootstrap_allowed`, which on Linux requires the CALLER to share the
+  pod gateway's user + mount namespaces. The `pod up` child is spawned through
+  `sandboxed_spawn_argv`, so on Linux it runs in its OWN user namespace, and the
+  pod refuses it with `member_owner_token_refused` — most visibly from a
+  crew-member session, whose runtime is itself a dedicated sandbox. The gateway is
+  the host-namespace process the sandbox launcher descends from, so it is the one
+  the pod accepts. This does NOT widen `/api/token/local`: a sandboxed foreign
+  process is still refused; the fix only moves the mint to a process the gate
+  already trusts.
+- **Refusals are 409 with a literal `code`** (`pod_up_failed`, `pod_down_failed`,
+  `pod_status_failed`, `pod_list_failed`); malformed input is 400
+  (`invalid_worktree`, `invalid_body`). A refused lifecycle op is a host-state
+  answer, not a gateway bug. `repository._repo()` raises when no main checkout is
+  configured, and the read verbs catch that rather than letting a setup problem
+  surface as a 500.
+- **Every lifecycle CHANGE and every guard denial is written to the Security Event
+  Log** under `dev_fleet.agent.*` (`pod_up`, `pod_down`, `machine_guard`): the caller
+  is unattended, so the trail is what makes the run reviewable. The read verbs are
+  not audited there — they change nothing, and the framework-level tool log already
+  records the call.
+
+The model-facing half is the `pod_up` / `pod_down` / `pod_status` / `pod_ls` tools on
+`kirocrew-core` (`mcp_tools/apps.py`). The pod token is returned to the agent
+verbatim — redacting it would hand back an unusable handle — which is safe because it
+is a 2h credential scoped to that pod's own gateway, minted server-side from the
+pod's own internal-API credential so the agent never touches the secret itself.
 
 ## Authorization
 
-All endpoints inherit gateway session auth. No additional RBAC — all authenticated users
-can manage worktrees. Destructive operations (remove, prune) require client-side confirmation
-dialogs in the frontend.
+The backend-proxied endpoints (`/apps/dev-fleet/api/...`) inherit gateway session
+auth with no additional RBAC — all authenticated users can manage worktrees, and
+destructive operations (remove, prune) require client-side confirmation dialogs in
+the frontend. The two in-gateway write routes, `POST /api/apps/dev-fleet/make-live`
+and `POST /api/apps/dev-fleet/restart-gateway`, are the exception: they are
+dashboard-**owner** only and refuse every app token, because the pointer they write
+selects the code the gateway executes next (see *Make Live → Pointer file*). The
+in-gateway read and lease routes admit only Dev Fleet's own backend token.
 
 ## Input Validation
 
-- `name` parameter is validated against the discovered worktree set before any operation
+- `name` parameter is validated against the discovered worktree set before any operation.
+  The agent surface's `pod down` also accepts a missing checkout only when this
+  repository retains the matching git worktree record (see *Pod identity guard*).
 - Ambiguous worktree names (multiple checkouts with same basename) return HTTP 400
 - `force` must be a boolean when provided
 - Main worktree removal is always refused regardless of force flag
@@ -245,18 +418,49 @@ name never has two workers racing to remove the same worktree. The frontend rend
 failure reason); the preview dialog maps the kept-list verdict codes to human-readable
 reasons so users can see why a worktree is a candidate or is kept.
 
-**Scan feedback:** the preview that opens that dialog (`prune-candidates`) runs `git` —
-and for merged-verdict candidates a `gh` lookup — per worktree, so on a large fleet the
-click is followed by seconds of silence before the dialog can appear. The Prune merged
-button therefore swaps its trash glyph for a spinner and sets `aria-busy` for the
-duration: disabling alone is indistinguishable from a wedged page, and a user who reads
-it as hung clicks again or reloads mid-scan.
+**Scan feedback:** the preview that opens that dialog (`prune-candidates`) runs `git` --
+and for merged- or closed-verdict candidates a `gh` lookup -- per worktree. Those
+per-worktree verdicts run concurrently, bounded by `_PRUNE_CONCURRENCY` (the same bound
+the parallel prune workers use), because a serial scan of a large fleet exceeds the
+gateway app proxy's 30s `_PROXY_TIMEOUT` and returns a 504. The scan is read-only git
+(`rev-parse`, `status`, `rev-list`/`cherry`, `merge-base`) and never takes
+`_GIT_MUTATION_LOCK`, which only the destructive removal path holds; candidate and kept
+lists are emitted in discovery order regardless of which verdict finishes first. Even
+concurrent, the scan takes time on a large fleet, so the Prune merged button swaps its
+trash glyph for a spinner and sets `aria-busy` for the duration: disabling alone is
+indistinguishable from a wedged page, and a user who reads it as hung clicks again or
+reloads mid-scan.
+
+The merged/closed head-OID check (`_fetch_pr_head_oid`) resolves the PR by
+`gh pr list --head <branch> --state all`, not `gh pr view <branch>`, so a merged PR whose
+head branch was deleted on merge still resolves its head OID and its worktree becomes a
+candidate rather than being withheld as `merged_unverified` forever. The lookup reads the
+whole PR set for the head and authorizes removal only when no `OPEN` PR is present; it
+requests one row beyond a fixed ceiling and fails closed if the head carries more PRs than
+that ceiling, so a reused branch name can never authorize removing new work.
 
 ## Pod Integration
 
-Relies on `kiro_crew.pod` subpackage (optional import — degrades gracefully if unavailable):
+Relies on `kiro_crew.pod` subpackage (optional import — degrades gracefully if unavailable).
+On Linux, `runtime.require_backend()` runs `systemctl --user is-system-running` once at
+pod verb entry and at each Dev Fleet removal safety gate. `kirocrew doctor` runs the same
+probe for its advisory row. Low-level `systemctl()`, `is_active()`, and `main_pid()` calls
+keep only the cheap platform, executable, and bus-address checks, so a multi-query verb does
+not pay a five-second probe before every unit command. A provably absent bus address returns
+`no_session` without spawning systemctl, and that pre-spawn check is the only source of
+backend absence. Every spawned probe failure is operational except a positive permission-denied
+match, which is `sandboxed_away`; neither can become `PodBackendAbsent`. Probe and unit operations
+resolve `systemctl` through `platform_compat.trusted_system_bin()` and pass that absolute path to
+the subprocess seam; a PATH entry can neither execute code nor forge the removal-safety verdict.
+If no trusted executable exists, the operation fails closed. Dev Fleet therefore refuses
+removal instead of treating the host as unable to contain a live pod. Spawned probes use
+`LC_ALL=C`, distinguish a reachable manager,
+an outer sandbox denial, and an unclassified failure, and retain systemctl's raw
+diagnostic. Dev Fleet runs both backend probes through `subprocess_executor()` so
+worktree removal never blocks the gateway event loop.
 
-- `runtime.active_names(cfg)` — systemctl list (blocking, offloaded via `run_in_executor`)
+- `runtime.active_names(cfg)` — one point-in-time systemctl/launchctl listing per fleet build
+  (blocking, offloaded via `run_in_executor`), shared by every worktree row
 - `runtime.derive_port(cfg, name)` — cksum-based port derivation (blocking, offloaded)
 - `runtime.health(cfg, name, port, timeout)` — identity-gated HTTP probe (blocking,
   offloaded). Takes the pod's NAME, not just its port, because a derived port is
@@ -270,8 +474,11 @@ Relies on `kiro_crew.pod` subpackage (optional import — degrades gracefully if
 - `runtime.mint_token(cfg, name, ttl)` — credential minting (blocking, offloaded).
   Requires POSITIVE ownership proof and refuses when ownership is merely
   unprovable, unlike `health`, which keeps its reading: this call sends the pod's
-  own `.local_secret`, so failing open would hand a credential to whatever
-  answered
+  own internal-API credential, so failing open would hand a credential to whatever
+  answered. That credential resolves per listener first, from the pod home's
+  `run/gateway-<port>.secret`, and falls back to the shared `.local_secret` only
+  for a gateway predating the per-listener file — the shared slot is one per data
+  home, so a live second gateway leaves it naming the other generation
 - `runtime.recent_journal(cfg, name, n)` — journalctl tail (blocking, offloaded)
 - `provision.has_venv(path)` / `provision.has_dist(path)` — filesystem checks (offloaded)
 
@@ -289,6 +496,87 @@ running" bug, issue #220). As defence-in-depth, `_pod_up` and `_pod_down` both
 re-check `runtime.active_names` after the CLI returns and fail closed
 (`pod not active after start` / `pod still active after shutdown`) — a CLI exit 0
 is never taken as proof of the state change, in either direction.
+
+### Pod runtime ownership
+
+Dev Fleet, the pod CLI and the pod test suite all reach the pod runtime as one
+namespace, `kiro_crew.pod.runtime`. That module holds the core: pod names and the
+pod exception types, the per-pod env file, git worktree resolution, a pod's
+identity paths, the `systemd --user` adapter with the launchd / Task Scheduler
+dispatch (`require_backend`, `is_active`, `main_pid`, `unit_state`,
+`active_names`, `recent_journal`), the lifecycle locks (`pod_name_mutex`,
+`pod_plane_mutex`), seed sanitization, `build_pod_env` and `_ensure_pod_dir`. Six
+owners build on that core. The core imports them at the end of its own body, once
+its own names are bound and before it installs its forwarding, so each owner's
+module-level bindings are taken when `kiro_crew.pod.runtime` is imported, as they
+were when it was one module, and never later inside a test's patch of the module
+they come from:
+
+| Owner | Owns |
+|---|---|
+| `runtime_ports` | `derive_port`, the recorded-claim scan and `allocate_port` |
+| `runtime_attestation` | `port_owner`: the gateway PID record against the service manager's `MainPID`, with listener corroboration |
+| `runtime_client` | `health`, `published_credential`, `mint_token` and `pod_api`, each gated on that verdict |
+| `runtime_home` | fixture seeding, the OS home and runtime auth store, `cleanup_home`, `orphan_homes` |
+| `runtime_lifecycle` | `start_pod`, `stop_pod` (drain, reclaim, verify), `halt_pod` (stop only, HOME kept) and `install_backend` |
+| `runtime_boot` | `boot`, `pod exec` and the terminal-refusal record |
+
+`runtime.<name>` keeps resolving for every name the owners took over (the table
+`runtime._EXPORTS_BY_OWNER`): a read is answered by the owner, and a write or
+delete — a test's monkeypatch — is forwarded to it. The owner is looked up by its
+dotted name through `importlib.import_module` on each access, which answers from
+`sys.modules` and waits on the import lock for an owner another thread is still
+importing. So `monkeypatch` and `mock.patch` round-trip, nested or mixed.
+`__all__` lists every public name, so a star import carries the moved names too.
+
+`mock.patch(..., create=True)` on a forwarded name would delete the owner's binding
+when it exits, so `test/test_pod_runtime_refactor_create_guard.py` fails on such a
+patch. It reads every test file that mentions `patch` and `pod` or `dev_fleet`, the
+packages that bind the runtime, and resolves the patch callable and target from the
+file's syntax: import aliases, name assignments, `importlib.import_module` and
+`pytest.importorskip` of a known string, module-name strings, f-strings,
+concatenation, and the `rt` the pod CLI and Dev Fleet bind. A name is looked up
+first among the enclosing functions' parameters. A target that is a parameter, a
+call's result, a name bound only from another call or subscript, or text it cannot
+spell fails as `<dynamic>`; a def, a class or a literal is read as not the runtime.
+
+Owners read core names as `runtime.<name>` at call time, and another owner's names
+through that owner's module, so a patch of any of those names through `runtime`
+reaches every reader. A module the runtime imports (`time`, `launchd`, `pinned_fs`)
+is one shared object: patch its attributes, such as `runtime.time.sleep`. The names
+bound to a module once the owners have loaded (`runtime._MODULE_NAMES`) are refused
+through `runtime`, both a write of anything else and a delete, because each
+importing module holds its own binding; every other name takes any value and gives
+it back. This is the opposite choice from the Dev Fleet backend facade above, where
+tests patch the owner: here the facade is the permanent surface every caller
+already uses, not a migration step. The core stays in `runtime.py` because
+repository gates and other specs cite it there: the spawn-audit allowlist, the
+subprocess-encoding baseline, `require_systemd`, seed sanitization and
+`build_pod_env`. Purging `kiro_crew.pod.runtime` from `sys.modules` and importing it
+again is unsupported, because every owner holds the core module object.
+
+### Pod identity guard
+
+Pod names are global basenames while Dev Fleet scopes worktrees to `MAIN_REPO`,
+so every pod verb first runs `_pod_checkout_guard`. It resolves the name to this
+repo's worktree, reads the pod's pinned `CHECKOUT` strictly, and refuses when the
+pin names a different checkout, carries no verifiable `CHECKOUT`, or is absent
+while a unit under that name is active. A matching pin proceeds, and so does no
+pin with no live unit. Every refusal is about identity: acting on a basename
+collision would stop another repository's pod or delete its HOME.
+
+A missing checkout is attributed only by git's retained worktree record for this
+repository. `repository._find_retained_worktree_path` includes a `prunable`
+record that normal discovery omits. When no record names the worktree, the agent
+surface refuses and the CLI `kirocrew pod down <name>` remains the remedy.
+
+For a retained record, `_pod_down` submits `_reclaim_pod_locked` to the
+subprocess executor. The helper runs under `pod_name_mutex`, re-reads the pin,
+and refuses unless it still matches the retained path. It also refuses when that
+path is back on disk, because a new pod may own the name. Pin attribution and
+teardown are one locked transaction, so a same-name pod cannot be accepted
+between the ownership decision and `stop_pod`. `up` requires a discovered
+checkout and never takes this missing-checkout path.
 
 ### Pod HOME reclamation on worktree removal
 
@@ -505,7 +793,16 @@ red state.
 **Failure persistence:** on failure/timeout the run is **not** cleared — the
 strip shows a red `✕ Provision failed (exit N)` label with the log
 auto-expanded, and both persist until the user clicks the dismiss `×`
-(dismiss also refreshes the fleet). On success it flashes a green
+(dismiss also refreshes the fleet). The notice's message is the failing step's
+stderr tail, read from the same `::steperr::<idx>::<line>` markers the sync
+runner emits (`provision.py::_run` pipes each step's two streams, relays both
+to stderr line by line, and `_fail` re-emits the stderr tail of the step whose
+failure ENDED provisioning — a recovered failure such as `npm ci` falling back
+to `npm install` is log text only). The last output line is the fallback, for a
+gateway whose provision emits no markers. See "When there is no reserved code"
+below for why the last line alone names a progress line; the same relay, the
+same byte-derived read cap, and the same marker filtering in the log panel
+apply to both runners. On success it flashes a green
 `✓ Provisioned` briefly, then clears (the fleet refetch flips the row to its
 built state).
 
@@ -532,7 +829,7 @@ duplicate Restart Gateway causes a second real ~10s gateway outage
 
 ### Restart identity handshake
 
-`POST /apps/dev-fleet/api/restart-gateway` returns `{"ok": true, "start_id": …}`
+`POST /api/apps/dev-fleet/restart-gateway` (gateway process) returns `{"ok": true, "start_id": …}`
 after the platform manager accepts the restart. Linux schedules detached
 `systemd-run`; macOS submits `launchctl stop` under the loaded contract described
 below. The bounce happens after the response, so success does not mean the new
@@ -571,6 +868,26 @@ scheduling the restart and hands it to the frontend:
   different code with the identical early-200 hazard, so a real
   `POST …/make-live` cutover also returns the pre-restart `start_id` and the UI
   recovers on an identity change.
+
+### Completed-cutover Undo banner
+
+After the reloaded fleet proves the pointer target is the checkout actually
+running, `undo_target` exposes the validated, still-discovered
+`previous_checkout`. The page renders a persistent success banner naming the
+current checkout and a **Switch back to `<previous>`** button. The inverse action opens a confirmation
+that names the destination and accurately distinguishes an automatic restart
+from a staged/manual one, then posts `{path, undo: true}` through the same Make
+Live transaction and restart handshake.
+
+The banner is deliberately absent while a pointer is staged but not running:
+**Cancel staged cutover** is the inverse in that state, while Undo is the inverse
+of a completed cutover. Dismissing the banner stores its current
+`current→previous` pair in per-tab `sessionStorage`, so page reloads and Dev Fleet
+revisits keep that pair hidden. The stored pair is spent as soon as a loaded fleet
+payload reports a different pair or none at all, so a later Make Live is visible
+even when it recreates the very same pair (feature → main dismissed, back to main,
+the same feature live again). A successful Undo consumes `previous_checkout`, so the reloaded page has
+no accidental redo banner.
 
 ### Restarting UI state
 
@@ -649,6 +966,56 @@ upstream's. Skipping is what makes it safe, and it costs an edition nothing —
 the only artifact this path could produce for it is a bundle it must never
 serve.
 
+**The frontend half is also suppressed on a backend-only sync — one whose
+incoming ref changes nothing under `website/`.** Both `npm ci` and `npm build +
+stage` are then work with no output: no new lockfile to install, no new source to
+build, and the staged bundle is already the current one. The decision is made by
+the `Verify dependencies` preflight, the one step that runs after `fetch` has
+pinned the incoming ref and before `merge` makes the worktree equal to it — the
+only point where "does the incoming ref touch the frontend?" has a correct answer.
+It cannot be decided when the step list is assembled, because the per-PID sync ref
+is not written until fetch runs; on a long-lived gateway's second sync it would
+still point at the prior tip. The preflight signals the verdict by exiting a
+reserved code (`EXIT_FRONTEND_SKIP`, 48) that the runner trusts ONLY from the
+preflight's own label — a worktree-run step exiting the same code is demoted to a
+plain failure, so it cannot forge a "skip the build". The runner then suppresses
+the two frontend steps whole, transaction included: a suppressed `npm ci` must not
+enter the `node_modules` transaction, whose move-aside-then-drop-backup on a no-op
+exit would delete the tree.
+
+The suppression fires only when ALL of these hold together, so the tree that
+produced the staged bundle and the tree now on disk are provably identical across
+tracked files, untracked files, and installed packages:
+
+1. the incoming ref changes nothing under `website/` (the tracked `git diff` the
+   probe skip already computes);
+2. the working subtree is clean INCLUDING untracked files (`git status
+   --porcelain --untracked-files=normal -- website` empty) — the same check the
+   fingerprint is STAMPED behind, re-checked before it is TRUSTED, so an untracked
+   `website/` file added between build and skip cannot ride through;
+3. `node_modules` is complete against the lockfile (`npm ls --all` exits 0), which
+   closes the partial-tree residual a bare "populated" check would leave;
+4. a build-source fingerprint — the git tree id of `website/` stamped beside the
+   staged bundle on the last successful build, and only when that build's tree was
+   clean — equals the incoming ref's `website/` tree.
+
+Any single failure, or any uncertainty (missing or failing `git`/`npm`, a
+timeout), returns "run", so the unknown case always rebuilds; the suppression
+cannot hold while a rebuild is owed.
+
+**Declared bound: this is a skip optimisation, so it has an inherent
+check-then-skip window.** The preflight decides before the merge, the runner
+suppresses after it, and the fingerprint is read right after the build; a tree
+changed by a concurrent writer in between yields a STALE build, never a wrong or
+corrupt one. This is the defining window of every build cache — closing it
+completely would need a lock held across the whole build, which destroys the
+~28 s the suppression saves. The worst outcome is a stale build on the operator's
+OWN checkout, rebuilt by re-running Pull + Build: no data lost, nothing corrupted,
+and whoever changed the tree mid-sync is who sees the result. The window is kept
+as narrow as it cheaply can be without a lock — the cleanliness check and the
+tree-id read run back-to-back under the staging lock, and the preflight runs
+immediately before the merge.
+
 The final **npm build + stage** step builds the frontend and copies `website/dist` into
 `src/kiro_crew/static/dist` under the Dev Fleet backend's OWN interpreter, with
 the target repo passed as an argument. Resolving the helper from the target
@@ -705,6 +1072,67 @@ stdlib-only, so the copy needs no package context. Both halves matter: `-I` drop
 the cwd from `sys.path`, and the snapshot means an editable install cannot make
 the tree being synced supply the code doing the verifying.
 
+**The install rehearsal happens on the CHECKOUT's filesystem, not in `TMPDIR`.**
+`tempfile.mkdtemp()` with no `dir` takes `TMPDIR`, which on a default Linux host
+is `/tmp` — commonly a memory-backed filesystem whose inode count is capped at
+mount time and shared with every process on the box. A `node_modules` tree is tens
+of thousands of files, so unrelated litter there can starve Pull + Build while
+tens of gigabytes are still free, and the install is charged to RAM. Residency is
+a correctness property before it is a capacity one: this step exists to *rehearse*
+the real `npm ci`, and a rehearsal held on a filesystem with a different free-room
+budget answers a different question — it can pass where the real step fails for
+room, or fail where the real step would have succeeded. The scratch is taken from
+the repo ROOT rather than `website/`, which is the same filesystem in any ordinary
+checkout but keeps the directory outside both the frontend project `npm` resolves
+config against and the subtree the backend-only skip decision reads.
+
+**The repo root is used only where git hides the name.** The probe code ships with
+the installed gateway while the ignore rule covering its scratch name is a commit
+in the checkout's own history, so a fleet checkout parked on an older ref can run
+this code with no rule for it — and a probe killed in that window leaves an
+untracked directory in the checkout root, which reads as dirty and fail-closes
+`Prune merged`. So `_scratch_name_is_ignored` asks `git check-ignore` about a
+generated name and the repo hosts the scratch only on a yes. `git check-ignore` is
+the oracle rather than a read of `.gitignore`, because ignore resolution spans
+several files with precedence and negation. An unanswerable question — missing
+git, a timeout, not a repo — is read as NOT ignored: being wrong that way costs a
+rehearsal on `TMPDIR`, which is the step's previous behaviour, while the other way
+costs a checkout that silently reads dirty.
+
+**Being out of room is the verdict, never a reason to relocate.** A scratch
+creation that fails for room says the filesystem the real install targets has
+none, which is exactly the answer the step is there to produce; retrying somewhere
+roomier would certify a filesystem the install never touches. Only conditions that
+make the repo unusable as a host at all — missing, not writable, or not hiding the
+name — fall back. "Out of room" covers `ENOSPC` and `EDQUOT` together, because a
+per-user quota is how a managed host says the same thing, and the operator-facing
+sentence names neither a single filesystem nor a single budget: the install writes
+both the scratch and the package cache, which need not share a filesystem, and
+each can exhaust bytes or file slots while the other looks healthy.
+
+**Abandoned scratch directories are swept before a new one is created.** `probe`
+removes its own in a `finally`, so what survives is a run that never reached it —
+SIGKILL, an OOM kill, a reboot. `/tmp` was age-cleaned by the host; the checkout
+root is cleaned by nobody and the name is git-ignored, so without a sweeper an
+abandoned tree accumulates there invisibly. The sweep removes prefix-matching
+directories older than `_SCRATCH_STALE_SECS` (6 h), runs whenever the repo *could*
+host a scratch — including when the ignore gate then sends this probe to `TMPDIR`,
+since litter from an earlier gateway build is what an un-ignored checkout needs
+cleared — and is best-effort, because housekeeping must never be why a
+verification does not happen. Ordering it before creation is what makes it a
+remedy rather than hygiene: the room the litter holds is charged to the same
+budgets the incoming install is measured against. It takes no lock, so the age
+window is the concurrency guard, and the guard holds only while the window
+exceeds every deadline the module declares. That comparison is not left to prose:
+a test reads `probe`'s own default timeout and each fixed helper timeout out of
+the source, charges one probe with all of them back to back, and requires
+`_SCRATCH_STALE_SECS` to exceed that sum by a wide margin — 21600 s against
+1320 s today. Raising a deadline, or adding a helper, without widening the window
+fails that test rather than shipping a sweep that deletes a live probe's scratch.
+The ownership marker cannot cover this case: a running probe's scratch is
+genuinely marked and genuinely prefix-named, so age is the only thing that tells
+it from litter.
+
 **The generated runner itself carries `-I` too, and for the same reason.** `python
 -c` puts the inherited cwd at `sys.path[0]`, ahead of the standard library, and
 the cwd a module-style app backend hands down is the gateway's own source root —
@@ -737,15 +1165,14 @@ still probes. Anything the comparison cannot answer — a failing or missing `gi
 a timeout — probes as well: the unknown case costs an install rather than a
 guarantee.
 
-A populated tree is evidence, not a verified install, and the bound is worth
-stating: a prior frontend sync whose post-merge `npm ci` died partway can leave a
-partial tree beside the merged lockfile, and later backend-only syncs will skip on
-it, since from there on the subtree is unchanged and nothing re-examines it. The
-consequence is the same class as the dead-registry residual — the skip decides only
-whether this sync pays for a rehearsal, so a refusal lands one step later rather
-than never, and the transaction keeps the checkout consistent either way. Issue
-[#7132](https://github.com/kirodotdev/KiroCrew/issues/7132) tracks the stronger
-evidence check that would close it.
+A populated tree is evidence, not a verified install. On its own that would let a
+partial tree — a prior frontend sync whose post-merge `npm ci` died partway,
+leaving packages missing beside the merged lockfile — pass as "populated". For
+the PROBE skip that residual is benign (the skip decides only whether this sync
+pays for a rehearsal, so a refusal lands one step later rather than never, and the
+transaction keeps the checkout consistent either way). For the frontend-STEP
+suppression below it would not be benign, so that path does not rely on the
+populated check alone — see the build-currency preconditions there.
 
 The condition is the whole subtree rather than just `package-lock.json` /
 `package.json` / `.npmrc`, and the difference is load-bearing. With those three
@@ -774,6 +1201,100 @@ failure, because every other step runs worktree-controlled code that can exit an
 number it likes; and only the sync run kind is stamped at all, since `_start_run`
 is shared with `provision`, whose script enforces no such reservation.
 
+**When there is no reserved code, the failure is named from the failing step's
+stderr — never from the last output line.** Every step's stdout and stderr land
+in ONE pipe (`_start_run` spawns the runner with `stderr=STDOUT`, and steps
+inherit it), and a child block-buffers stdout to a pipe while writing stderr
+unbuffered — so the stdout buffer flushes at process EXIT, *after* the
+diagnostic. The stream order is therefore not evidence of what failed. A refused
+`git merge --ff-only` demonstrates it exactly:
+
+```
+error: Your local changes to the following files would be overwritten by merge:
+        config-baseline.json
+Please commit your changes or stash them before you merge.
+Aborting
+Updating 2f9ed9724..bf09e50e5     <- stdout, flushed last
+```
+
+`run_step` therefore gives each step's stderr its own pipe, pumps it through to
+stdout line by line (so the log and the live "current activity" line are
+unchanged), and remembers its last `_STEPERR_TAIL` non-blank lines. When the step
+fails, `run_steps` re-emits those as `::steperr::<idx>::<line>` markers, and the
+UI's ladder is `cause` → the `::steperr::` block → the last output line. Both
+marker families are filtered out of the log panel: the stderr lines already
+appear there in their own order, so the markers would only duplicate the tail.
+`pod/provision.py::_run` speaks the same protocol for the provision run (its
+markers go to stderr, so a `pod up --json --provision` stdout stays pure JSON),
+which is why one frontend helper, `syncFailureTail`, names both failures.
+
+Order WITHIN each stream is preserved; order ACROSS the two is unspecified. The
+child writes stdout straight to the inherited descriptor while the pump relays
+stderr, so the two interleave by timing rather than by causality. That is the
+premise of the change rather than a gap in it — a position in this stream was
+never evidence of what failed, which is why the tail is labelled instead of
+located.
+
+**The pump reads with a cap, it does not iterate the handle.** A step runs
+worktree-controlled code, so it can write a newline-free blob of any length, and
+`for line in stream` would allocate the whole blob inside the runner — the
+unbounded-read shape `test_jsonl_util.py::TestNoUnboundedHandleIteration`
+refuses. `readline(_STEPERR_READ_CAP)` bounds every allocation instead: a longer
+run arrives as cap-sized pieces, each forwarded, so splitting is the only effect and
+the
+blob is merely split across lines. The repo's own `jsonl_util` bounded readers
+are unavailable here — this module is stdlib-only and executes from a snapshot by
+path — so the bound is spelled with the stdlib.
+
+**That cap is derived from the gateway's byte limit, not chosen.** The two ends
+count different units: `readline` caps CHARACTERS because the stream is a text
+wrapper, while the gateway reads this pipe with `asyncio.StreamReader.readline()`,
+whose 64 KiB limit counts BYTES — and a line past it raises `LimitOverrunError`
+there, whose handler reaps the whole process tree. A character encodes to at most
+4 UTF-8 bytes and the pump appends one newline, so the cap is
+`(_GATEWAY_LINE_BYTES - 1) // 4`. A round-number character cap would satisfy the
+byte ceiling only for ASCII, and multibyte stderr — a non-ASCII checkout path, a
+localized git message — is ordinary. `test_dev_fleet_sync_runner.py` asserts the
+ENCODED length of every forwarded line, since an ASCII fixture cannot see the
+gap. A remembered tail line is separately capped at `_STEPERR_LINE_CHARS`, because
+the tail is rendered in a one-notice banner rather than in a log.
+
+**The drain after the step exits is bounded too.** `pump.join` waits
+`_STEPERR_DRAIN_S` and no longer. EOF on that pipe needs every writer gone, and a
+GRANDCHILD inherits the write end — `npm` spawns several — so one survivor keeps
+it open and EOF never arrives. An unbounded join would turn that survivor from a
+cosmetic leak into a wedged Pull+Build, so late lines are dropped instead. What
+that costs is precise: everything the STEP ITSELF wrote is relayed, since its
+bytes are in the pipe by the time `wait()` returns; what can be dropped is output
+written after the cutoff by something that outlived the step, which is the
+survivor this bound exists for.
+
+**This runner is the SOLE writer to its stdout pipe, and that is what makes the
+byte bound real.** Capping our own writes bounds nothing while a step also owns
+the descriptor: it can emit a newline-free blob that prepends to a terminated
+relay line, and the merged inter-newline run the gateway reads then exceeds
+`_GATEWAY_LINE_BYTES` however tightly each writer capped itself — which raises in
+the reader and reaps the process tree. So `run_step` pipes stdout as well as
+stderr, relays each on its own pump, and every write in the module — both pumps
+and every `::step::` / `::steperr::` / transaction line — goes through `emit`,
+which holds one lock for the whole line. A step that deliberately interleaves
+newline-free stdout blobs with terminated stderr lines produces 15 spliced lines
+without that, which `test_concurrent_stdout_cannot_splice_a_relayed_line` pins by
+mutation.
+
+`run_step`'s docstring states the guarantees exhaustively, as four numbered
+lines. Read them there rather than inferring them from prose here — sweeping
+wording about the log being complete or in order is what made this paragraph wrong
+twice.
+
+`::steperr::` is a **label on a worktree-controlled stream, not a diagnosis.** It
+never sets `lastIsCause`, so it renders as the raw tail it is — a step printing a
+plausible sentence to stderr gains exactly what it already had, its output shown
+verbatim. The one shape that is guarded is an all-blank forged tail, which would
+resolve to the empty string and make `ErrorNotice` render nothing: blank marker
+texts are dropped, and the last-line fallback skips marker lines too, so a forged
+marker can neither hide the notice nor be surfaced raw.
+
 The build and the copy are ONE step because they share ONE holder of the staging
 lock (`.dist.staging.lock`, next to `static/dist`). `npm run build` empties
 `website/dist` before repopulating it, so a peer flow — another sync, or the
@@ -793,11 +1314,12 @@ directory is unaffected.
 
 ## Make Live
 
-`POST /apps/dev-fleet/api/make-live` repoints the live gateway at a different
-worktree by writing a **live-target pointer file** (`live_target.json`). The
-gateway resolves this pointer at startup and `execve`s into the named checkout's
-own `kirocrew` binary — moving the working directory and `PATH` with it. No
-service definition is ever mutated.
+`POST /api/apps/dev-fleet/make-live` — served by the **gateway process**, not the
+Dev Fleet backend — repoints the live gateway at a different worktree by writing a
+**live-target pointer file** (`live_target.json`). The gateway resolves this
+pointer at startup and `execve`s into the named checkout's own `kirocrew` binary
+— moving the working directory and `PATH` with it. No service definition is
+ever mutated.
 
 The mechanism is the version-selector shape used by `rustup` (reads
 `rust-toolchain.toml`), the Go toolchain (`go` execs from the `toolchain` line
@@ -809,14 +1331,185 @@ Location: `config_dir() / "live_target.json"` (inside the active data home,
 typically `~/.kiro/crew/live_target.json`). Contents:
 
 ```json
-{"checkout": "/absolute/path/to/worktree"}
+{
+  "checkout": "/absolute/path/to/worktree",
+  "previous_checkout": "/absolute/path/to/previous-worktree"
+}
 ```
+
+`previous_checkout` is optional and records exactly one completed cutover for the
+post-restart **Undo** banner. Both fields validate as executable Kiro Crew
+checkouts before they are written. At read time, `checkout` follows the normal
+boot validation, while the Undo path validates `previous_checkout`; rebuilding
+the checkout already running does not hide an otherwise safe return target.
+Ordinary Make Live replaces the history with the checkout currently
+running when that checkout validates; otherwise the cutover succeeds without an
+Undo destination. Undo consumes the stored history (the rewritten pointer omits `previous_checkout`) rather than turning the inverse into an
+implicit redo. Legacy pointers containing only `checkout` remain valid and
+simply expose no Undo action.
 
 Written atomically (temp file + `os.replace`) with mode `0o600`. The file is
 **keystone-fenced** (in `_CREW_SECRET_LEAVES`) so agent tools can neither read
-nor write it — only the human-driven dashboard cutover action writes it, and
-the gateway's startup reader (`live_target.maybe_reexec`) opens it directly
-rather than through the gate.
+nor write it, and **bind-masked at the OS level in every sandbox tier**
+(`sandbox._CREW_HIDDEN_LEAVES`) — including the Dev Fleet backend's own
+namespace. The only writer is the gateway process, on the dashboard owner's own
+authenticated request; the gateway's startup reader (`live_target.maybe_reexec`)
+opens it directly rather than through the gate.
+
+**Why the backend does not get the file back.** The backend is a sandboxed
+spawn, and it spawns `npm ci` / build steps for arbitrary worktrees. A nested
+sandbox is denied on both platforms, so `wrap_argv` runs those children *inside
+the backend's namespace* with no re-mask: any file the backend could write, a
+worktree's lifecycle script could write. A per-backend carve-out (the shape
+md-notebook's Notes state uses) therefore hands a routine Pull+Build the power to
+choose the gateway's next image. Instead:
+
+- **The cutover runs in the gateway** (`gateway_routes.handle_make_live` →
+  `live._make_live`). `_make_live` refuses with `wrong_process` if it is ever
+  invoked in a process that has a pointer provider installed (i.e. the backend).
+  `_MAKE_LIVE_LOCK` / `_MAKE_LIVE_COMMITTED` live in the gateway with it, so
+  `restart-gateway` moved too.
+- **The backend reads pointer state through the gateway.** `server.main` installs
+  a `GatewayPointerBroker` (`pointer_broker.py`) as `live`'s pointer provider: it
+  exchanges the app secret at `POST /api/apps/dev-fleet/token` and reads
+  `GET /api/apps/dev-fleet/live-target` (30 s display cache; `fresh=1` for the
+  removal guards). The broker aims at `KIROCREW_BOUND_PORT`, which
+  `apps/backend.py` hands to this one backend at spawn from the gateway's own
+  environment — the port is exported the moment it is reserved
+  (`dashboard.server._reserve_dashboard_port`, before any backend spawns;
+  `_export_bound_port` republishes it once the site serves), and
+  `dashboard.server.start_dashboard` spawns this backend in a second wave
+  (`apps.backend.DEV_FLEET_APP_NAME`; the main wave still runs before
+  `runner.setup()` so every other app's startup hooks find their backend up). A
+  backend spawned before the bind would have no port for its whole lifetime;
+  `test_bound_port_backends_start_only_after_the_export_and_the_rest_before_setup`
+  pins both orders.
+  `_live_worktree_path`, `_staged_target_resolved` and
+  `_staged_cancel_available` route through it. A broker outage raises
+  `PointerUnavailable` — never `None`: the fleet view degrades (no row is marked
+  live or staged, the payload carries `live_state_known: false` and the fleet view renders an
+  error notice above the rows — "Live state unavailable" — so "state unknown" is never
+  read as "nothing is live", and the backend logs why), while
+  worktree removal and the prune override screen **refuse**, because "nothing is
+  live" from an outage would let a removal delete a staged cutover target. Toasts
+  on those refusals carry the plain sentence; the exception text stays in the log.
+- **No inline filesystem reads on the gateway loop.** `_make_live_inner` now runs
+  on the loop that serves the whole dashboard, so every probe of the pointer, the
+  checkout path or the service drop-in (`snapshot`, `_staged_target`, `exists`,
+  `_in_pod`, `_same_path`, the plan's `validate`, `write_target`, `restore`,
+  artifact validation), the worktree selector's `resolve()` walk
+  (`repository._find_worktree_by_path`) and the live-path resolution
+  (`_live_worktree_path`'s pointer/running-checkout comparison and the launchd
+  link read) hop to the subprocess executor, and the service backends' own
+  filesystem work (the systemd drop-in write, the launchd launcher write, plist
+  probes before status and restart, the foreground confinement/marker scan and
+  detached spawn) does the same inside `gateway_service.py`; only in-memory state
+  and the `_MAKE_LIVE_LOCK` checks stay inline.
+- **Removal leases, held in the gateway's memory** (`live.acquire_removal_lease` /
+  `renew_removal_lease` / `release_removal_lease` / `removal_in_progress`; routes
+  `POST` / `PUT` / `DELETE /api/apps/dev-fleet/live-target/removal-lease`), replace
+  the exclusion `_MAKE_LIVE_LOCK` provided when the cutover and a worktree removal
+  ran in one process. The backend takes a lease on the worktree it is about to
+  remove (`live.removal_lease`, via `GatewayPointerBroker`) and holds it across the
+  protection re-check and `git worktree remove`; the gateway refuses a lease while
+  `_MAKE_LIVE_LOCK` is held or a cutover has committed, and `_make_live` /
+  `_restart_gateway` refuse `busy` while any lease is live — checked again under
+  `_MAKE_LIVE_LOCK`, where no new lease can be granted, so the window is closed from
+  both sides. A restart tree-kills the backend, which is why it must not land
+  mid-removal. Three properties carry the design:
+  - **A lease is a capability.** `POST {path}` returns an unguessable token
+    (`secrets.token_urlsafe(24)`); `PUT {token}` (heartbeat) and `DELETE {token}`
+    require it, and a wrong token is a no-op. The shared Dev Fleet app credential is
+    readable by the backend's build children, so a path-only release would let any
+    of them cancel a removal's lease; the capability travels only in the `POST`
+    reply. A child can still *acquire* leases and so delay a cutover — which it could
+    already cause by running `git worktree remove` itself.
+  - **A lease is short (30 s) and heartbeated (every 10 s)** by its holder for as
+    long as the removal runs, through `_GIT_MUTATION_LOCK` queueing and the mutation
+    itself. The gateway holds at most `_REMOVAL_LEASE_MAX_OUTSTANDING` (32) leases,
+    live or inside their grace barrier — an order of magnitude above the parallel
+    prune width — and refuses acquisition at the cap (a normal `busy` answer): the
+    acquiring token is readable by the backend's build children, so an unbounded
+    table would be a memory and sweep-cost lever. A *refused* renewal (the gateway restarted and forgot the lease) marks
+    the lease lost; the removal checks `live.removal_lease_lost(path)` after taking
+    `_GIT_MUTATION_LOCK`, and proves the lease FRESH (`live.confirm_removal_lease`, a
+    renewal through the gateway) at each point of no return: immediately before the
+    user-approved untracked-file discard, and again — via `_run_cmd`'s `pre_spawn`
+    gate — after sandbox preparation and immediately before `git worktree remove`
+    is spawned. A refusal before the discard deletes nothing and says so; a refusal
+    after it is reported through the discard-aware path ("discarded N untracked
+    file(s), but then could not remove the worktree"), never as a bland retry. A
+    transient broker error on renewal is retried next tick. A mutation already under
+    way is never cancelled — cancelling `git` mid-write is the corruption this
+    exclusion exists to prevent. A refused acquisition is reported by cause — the
+    gateway declined (a cutover is in progress: wait) versus the gateway could not be
+    reached (check it is running) — and every later refusal leads with the
+    consequence ("the gateway could not confirm that no cutover overlaps this
+    removal") rather than the mechanism.
+  - **Simplification of last resort.** If the lease protocol proves flaky in
+    practice, the stateless fallback is to refuse removal outright whenever a cutover
+    is staged or in flight — coarser, but with no timers to tune. Reach for that
+    before adjusting the TTL, heartbeat or grace values.
+  - **A lapsed lease keeps blocking for a grace barrier** (90 s past its TTL, i.e.
+    longer than the 60 s mutation timeout plus margin) unless explicitly released:
+    the holder may be inside the uninterruptible mutation with no way to be told, so
+    cutovers and restarts stay excluded until it must have finished. Renewal is
+    refused for the whole barrier so a holder that fell behind learns the loss rather
+    than resuming on a barrier about to end.
+  Deliberately *not* a lock file: a file in the crew data home is replaceable by any
+  same-uid process in the backend's namespace, so two sides can end up holding
+  different inodes and stop excluding each other. A refused lease — or a broker
+  outage at acquisition — makes the removal refuse.
+- **Authorization is the owner's request, never a backend credential.** The
+  write routes refuse every app principal, including Dev Fleet's own token: that
+  token is readable by every build child in the backend's namespace. The read
+  route and the removal-lease routes admit ONLY Dev Fleet's own token. The read's
+  one consumer is the backend's broker (the dashboard reads the redacted fleet
+  payload, never this route) and its answer carries unredacted checkout paths;
+  the token buys a build child two paths and no write — the running checkout,
+  which `sys.executable` already tells it, and the staged checkout, which it could
+  not otherwise learn in-sandbox: a path to a checkout the fleet already lists,
+  not a capability to select it. A lease
+  latches `busy` on the owner-only cutover and restart, so it is not a read
+  either. A dashboard human without an app principal — a Slack-allowlisted
+  non-owner holding a plain dashboard token included — is refused on all of them.
+- **Every pointer write stages in the masked directory.** `write_target` and
+  `restore` publish through `live_target._publish_pointer`: the owner-only temp is
+  written into `~/.kiro/crew/live-target-staging/` (the same masked, precreated
+  directory the launcher's stub uses, spelled once per module and pinned equal by
+  test), renamed onto the pointer, and the published inode is then checked to be a
+  regular file with exactly one link — otherwise the pointer is unlinked again and
+  the write fails, leaving the safe default (no pointer: the gateway boots its own
+  image). A plain `atomic_write` would stage beside the target, in the data-home
+  root every sandbox can see and, being same-uid, `link(2)` before the rename.
+- **Absent-equivalent document.** `mount(2)` cannot target a path that does not
+  exist, so an absent pointer would be an unmasked pointer, and an agent namespace
+  spawned while it was absent could *create* one the next boot execs. Before every
+  Linux namespace spawn the launcher materialises `live_target.json` as
+  `live_target.NO_TARGET_DOCUMENT` (`{"checkout": null}`), owner-only. The temp is
+  staged inside `~/.kiro/crew/live-target-staging/` — a directory masked in every
+  mode and precreated — never beside the target: the data-home root is visible in
+  every sandbox, and a temp there is a name a concurrent namespace could `link(2)`,
+  keeping a second writable path to the inode the gateway later reads (a bind mask
+  covers a path, not an inode). The materialiser also refuses to launch when the
+  pointer — pre-existing or just published — has a link count other than one. This
+  stub is a point fix for the one hidden leaf whose absence is a code-execution
+  input; the other file leaves in `sandbox._CREW_HIDDEN_LEAVES` share the
+  absent-mask gap (secret disclosure, not execution) and are tracked as a separate,
+  class-level follow-up rather than closed here.
+  `read_target_reason` reads the stub as `(None, None)` exactly like an absent
+  file. A present `checkout` of another type, or a missing key, is still reported
+  as a defect. **Downgrade note:** the stub is an ordinary file and survives a roll
+  back to a build that predates this reader. That older reader logs
+  `the live-target pointer has no 'checkout' string` at every boot — behaviour is
+  still correct (both readers resolve it to "no live target" and start the
+  installed build), only the wording is alarming. Delete
+  `~/.kiro/crew/live_target.json` on the downgraded host to silence it.
+- **Foreground restart.** `ForegroundBackend` used to refuse from the backend
+  (`backend_confined`: a replacement spawned inside the sandbox would inherit its
+  confinement). In the gateway there is no confinement, so the last-resort
+  foreground restart is now *attempted* where the backend could only advise a
+  manual one — the same detached `kirocrew restart` the CLI's own restart uses.
 
 ### Live-worktree resolution
 
@@ -828,9 +1521,13 @@ Reading the definition first would report that stale checkout as live.
 
 ### Request / Response
 
-Request body: `{path, dry_run?}` — `path` is a worktree path (validated against
-the discovered set, never an arbitrary path); `dry_run` (bool, default false)
-returns the plan without writing the pointer.
+Request body: `{path, dry_run?, undo?}` — `path` is a worktree path
+(validated against the discovered set, never an arbitrary path); `dry_run` (bool,
+default false) returns the plan without writing the pointer. `undo` (bool,
+default false) requires `path` to equal the pointer's validated
+`previous_checkout`; that binding is checked again under the Make Live lock, so
+a stale banner cannot reverse a newer cutover. `undo` and `expected_staged` are
+mutually exclusive.
 
 - **dry_run success:** `{ok: true, dry_run: true, plan: {mechanism, pointer_path,
   exec, restart, target, [manual_restart]}}`
@@ -839,6 +1536,9 @@ returns the plan without writing the pointer.
 - **cutover success (staged only):** `{ok: true, cutover: true, staged_only: true,
   target, plan, manual_restart, notice}` — the pointer is written and correct;
   the operator finishes the cutover by restarting the gateway themselves.
+- **Undo success:** the same automatic/staged result shapes; the target becomes
+  the prior checkout and `previous_checkout` is consumed before the restart is
+  scheduled.
 - **refusal:** `{ok: false, code, error}` — `code` is one of the values below.
 
 The handler additionally returns HTTP 400 for a missing/non-string `path` or a
@@ -863,6 +1563,8 @@ The `plan` object describes the cutover mechanism:
 | `pod` | called from inside a pod — a throwaway test instance must never repoint the live gateway |
 | `pod_indeterminate` | pod status could not be resolved (config home unresolvable) — **fail-closed**, never treated as "not a pod" |
 | `already_live` | the target is already the live gateway |
+| `undo_changed` | the requested Undo path no longer equals the pointer's validated previous checkout (stale banner or newer cutover); refresh before retrying |
+| `undo_not_ready` | the requested inverse is still the running checkout, so the original cutover is only staged; use Cancel staged cutover instead |
 | `missing_venv` | the worktree has no `.venv/bin/kirocrew` (Provision it first) |
 | `venv_not_executable` | the worktree's `.venv/bin/kirocrew` exists but is **not executable** (`chmod +x` it or re-Provision) — a non-executable binary would stop the live gateway but could not start the replacement, leaving no gateway running |
 | `missing_dist` | the worktree has no built `src/kiro_crew/static/dist/index.html` (Pull+Build first) — a cutover without a built dist serves a broken dashboard |
@@ -966,14 +1668,22 @@ Returns the resolved checkout path on success.
 Before writing the pointer, the prior state is snapshotted via
 `live_target.snapshot()` — the raw file content, or `None` when the file is
 absent. An UNREADABLE (as opposed to absent) pointer aborts here: `restore(None)`
-interprets `None` as "there was nothing" and deletes the file, so continuing
+interprets `None` as "there was nothing" and unpins the target, so continuing
 would let a failed restart destroy a live target the code merely could not read.
 
 If the pointer write raises `InvalidTarget` the cutover is refused without
 rollback (no state was changed). If it raises `OSError`, or if the detached
 restart fails to launch, the pointer is restored to its prior state via
-`live_target.restore(prior)` — rewriting the old content, or deleting the file
-when there was none. The refusal response carries `rolled_back: true|false`.
+`live_target.restore(prior)` — rewriting the old content, or, when there was
+none, publishing the absent-equivalent `NO_TARGET_DOCUMENT` stub rather than
+unlinking. The stub reads exactly as absence to every consumer, but it keeps a
+maskable regular file under the pointer's name at every instant: the sandbox
+mask cannot cover a name that does not exist, so an unlink here would open a
+window between the rollback and the next launcher's own materialising stub in
+which an agent could create the pointer and select the checkout the gateway
+executes next. Both branches go through the same hardened publisher (masked
+staging, owner-only mode, single-link check). The refusal response carries
+`rolled_back: true|false`.
 
 ### Platform scope
 
@@ -1003,13 +1713,31 @@ overrides every config file, including an agent-writable repo-local one.
 Two different jobs live in that one dict, and they are worth keeping apart:
 
 - **Config-driven execution.** `GIT_ALLOW_PROTOCOL` / `GIT_PROTOCOL_FROM_USER`
-  make git itself refuse `ext::` and custom remote helpers; the four
+  make git itself refuse `ext::` and custom remote helpers; the nine
   `GIT_CONFIG_KEY_*` / `VALUE_*` pairs disable `core.fsmonitor` and
-  `core.hooksPath`, reset `credential.helper` to empty, and pin `core.sshCommand`
-  to plain `ssh`. Each of those is a config key a repo can set to name a program
-  git will spawn. (The operator's own *global* credential helpers are re-pinned
-  after the reset — see `_GIT_TRUSTED_HELPERS` — because a global config is
-  operator-owned rather than part of the repo attack surface.)
+  `core.hooksPath`, reset `credential.helper` to empty, pin `core.sshCommand`
+  to plain `ssh`, pin all four signature-program spellings, and turn
+  `log.showSignature` off. Each of those is a config key a repo can set to name a
+  program git will spawn. (The operator's own *global* credential helpers are
+  re-pinned after the reset — see `_GIT_TRUSTED_HELPERS` — because a global config
+  is operator-owned rather than part of the repo attack surface.)
+
+  Signature **verification** is the third execution vector, and a plain read
+  reaches it: `[log] showSignature=true` makes every `git log` verify what it
+  prints, and verification execs the program named by `gpg.program`. All four
+  spellings are pinned because `gpg.<format>.program` selects per format and
+  `gpg.openpgp.program` is a synonym that *overrides* the bare key — pinning one
+  leaves the other as an unpinned way to name the same exec. The trigger is pinned
+  beside the programs, because a program name is a value and this is a place not
+  to depend on one.
+- **What git writes on a read.** `GIT_OPTIONAL_LOCKS=0` is also not a config key.
+  `git status` refreshes the index's stat cache and saves it back under
+  `index.lock`, so a command that is a read to its caller is a **write** to the
+  repository. Every fleet render runs one per row, so without this the fleet
+  contends with the operator's own git for the lock on the ordinary path. Pinned on
+  the env chokepoint rather than as `--no-optional-locks` per call site, so the argv
+  this module builds keeps naming just its subcommand and a read added later
+  inherits it.
 - **Which object graph git answers from.** `GIT_NO_REPLACE_OBJECTS=1` is not a
   config key and is not about code execution. A `refs/replace/<oid>` ref
   substitutes one object for another in *every* read, so `log`,
@@ -1020,8 +1748,102 @@ Two different jobs live in that one dict, and they are worth keeping apart:
   from a grafted walk is simply wrong. `git replace` is a legitimate local
   operation, so this is a correctness pin first and a tamper pin second. It is
   therefore an env var in its own right and **not** one of the counted config
-  pairs: `GIT_CONFIG_COUNT` stays at 4. `platform/update_governance.py` and
-  `auto_improvement`'s clone setup pin it for the same reason.
+  pairs, as `GIT_OPTIONAL_LOCKS` is not: `GIT_CONFIG_COUNT` counts only the config
+  pairs, and the loader that appends the operator's trusted helpers starts its own
+  numbering from that count rather than from a literal.
+  `platform/update_governance.py` and `auto_improvement`'s clone setup pin
+  `GIT_NO_REPLACE_OBJECTS` for the same reason.
+
+## Base Branch Resolution
+
+`repository.BASE_BRANCH` is the resolved checkout's **own** default branch, not the
+literal `main`. It is resolved once per discovery attempt, in the order the answer is
+trustworthy, and from **one** remote only:
+
+| Tier | Source | Stated or guessed |
+|---|---|---|
+| 1 | the remote's **live** advertised `HEAD` (`ls-remote --symref` on `origin`, or the sole remote under any name) | **stated** |
+| 2 | the first of `_LOCAL_BASE_CANDIDATES` (`main`, `master`) that exists | guessed | <!-- wokeignore:rule=master -->
+| 3 | the branch the checkout is on | guessed |
+
+Only tier 1 states anything, and it asks the remote what its `HEAD` is **now** rather
+than trusting the local `refs/remotes/origin/HEAD` tracking ref — that ref is recorded
+once by `clone` or a manual `git remote set-head` and is never refreshed by `fetch`, so
+after the remote's default moves it names a branch the remote has stopped defaulting to.
+A conventional name merely *existing* locally is likewise not the repository declaring
+its default: a `main` left behind by a rename to `trunk` is the ordinary residue of that
+rename, and a hand-added or unreachable remote advertises no `HEAD` to confirm against —
+so "stale candidate, no remote answer" is a pairing of two normal dev-box states rather
+than an exotic one. Trusting tier 2 would let a rebase rewrite a worktree onto
+`origin/main` while the real base is `trunk`, and the fetch cannot catch it, because
+that stale `main` is still a fetchable ref.
+
+The remote whose live HEAD earns tier 1 is resolved in **two passes**, because the
+remote the rebase must fetch from is `branch.<base>.remote` — which cannot be read
+until the base is known. The first pass reads the remote the checkout is CONFIGURED to
+track — `git config branch.<checked-out>.remote`, knowable up front — falling back to
+`origin` (or a sole remote under another name) only when none is configured, and
+resolves a PROVISIONAL base against that remote's advertised HEAD. Once that base is
+named, the second pass reads the base's OWN configured remote (`branch.<base>.remote`):
+if it names a different remote, the base is RE-VERIFIED against that remote's advertised
+HEAD, and only a match earns the positive (paired with that remote); if that remote
+cannot confirm, the answer is NOT positive and a rebase refuses. Reading the base's own
+remote removes a guess: a fork whose checkout tracks `origin` (advertising `main`) while
+the base `main` tracks `upstream` is an ordinary dev-box state, and pairing the base
+with `origin` there would rebase onto `origin/main` — a base the configured upstream
+never stated — rewriting the worktree's commits with no undo. The checked-out branch's
+remote is only a PROXY for the base's remote; the base's own remote is the authoritative
+statement, read second once the base names it. The local candidates need no remote at
+all.
+
+Every tier's answer passes `_plausible_branch_name` before it can reach an argv: a
+leading `-` would be read as an option, and `..` is the range separator every
+consumer interpolates around. A resolution that finds nothing leaves the value at
+`main`, which is what every consumer read before any repository was known.
+
+`_BASE_BRANCH_POSITIVE` records whether the repository **stated** its default or this
+module guessed it, and `base_branch_mutation_refusal()` is the one place that reads it.
+Reads are served either way — being wrong about the label costs a row's caption. Rebase
+refuses on a guess, before the fetch: it rewrites a worktree's commits onto
+`{remote}/{base}` and returns `ok` with no rollback path once the replay is clean.
+
+`_rebase_locked` **re-resolves** the base branch immediately before reading that gate,
+into a **local** snapshot (`repository._resolve_base_snapshot()`, returning
+`(base, positive, remote)`) rather than the shared `BASE_BRANCH` global. The remote is
+part of that snapshot: the positive verdict is earned from one remote's advertised
+`HEAD`, so the rebase fetches and replays from THAT same remote. That remote is the
+base's OWN configured remote (`branch.<base>.remote`) whenever it names one that
+differs from the checkout's — read on the snapshot's second pass, once the base is
+known — so a fork whose checkout tracks `origin` while `branch.main.remote = upstream`
+verifies and rebases onto `upstream`'s base, not `origin`'s, and a clean replay cannot
+rewrite the worktree onto a base the verdict never verified. Discovery latches once per process, so
+a base resolved at startup would be the only answer the process ever holds — which would
+make a refusal permanent for the process. Resolving locally also keeps the rebase off
+the global that `_sync_start_locked` reads across its own awaits: a sync checks
+`HEAD == BASE_BRANCH` and later re-reads it before it fetches and merges, so a rebase
+mutating that global mid-flight (default `main` → `trunk`) would make the sync merge a
+base it never validated — the rebase holds only its worktree lock, never `_SYNC_LOCK`.
+Because the resolver reads the remote's **live** `HEAD`, a checkout whose remote
+publishes a default is served on its next attempt once that remote is reachable, with
+no manual step and no locally recorded ref to go stale. A few short git reads on an
+operation that already fetches is what makes that promise true.
+
+## Remote URL Derivations
+
+`runtime.remote_url_locator()` is the one home of what may be derived from a git
+remote URL: everything before a `?` or `#`. It lives in `runtime` because
+`fleet_state` imports `repository`, so the reverse import would be a cycle — and a
+rule that cannot be shared gets copied, which is what left three derivation sites each
+carrying their own suffix pattern.
+
+`git remote set-url` accepts a query and smart-HTTP transports honour it, so an
+operator's own remote can legitimately hold `?access_token=…`. No derivation wants
+that credential: one becomes the browser base rendered into an issue-link `href`, the
+others become an `owner/repo` handed to `gh --repo` in child argv. The cut must
+**precede** any pattern anchored on `$`, because a retained query sits between a
+trailing `.git` and the end of the string — so the suffix the pattern means to strip
+survives *and* the token rides into the result, and one remote derives a different
+name than the same remote written without a query.
 
 ## Output Redaction
 
@@ -1033,8 +1855,9 @@ All user-visible output passes through `redact_credentials()` and
 The app declares `platform.os: ["macos", "linux", "windows"]` in `app.json`,
 because that is where it genuinely runs: the fleet view, PR status, commit and
 disk figures, Provision, Sync, Rebase and Prune are git and filesystem work with
-no systemd in them. Only the pod plane needs Linux; Make Live stages its pointer
-on every platform (only the automatic restart needs a drivable service manager).
+no service-manager dependency in them. The pod plane needs systemd `--user` on
+Linux or launchd on macOS; Windows has no supported pod backend. Make Live stages
+its pointer on every platform (only the automatic restart needs a drivable service manager).
 The app says so in the UI rather than in the manifest — a `highlights` line
 states the pod requirement, and `GET /api/fleet` carries the reason that renders
 as a banner.
@@ -1047,7 +1870,8 @@ the pre-#1254 silence (an absent `platform` block defaults to
 `["macos", "linux"]`, quietly advertising macOS parity).
 
 The declaration is **not** an install gate for this app: `installMode` is the
-default `"server"` and the App Store's platform check at `registry.py` only
+default `"server"` and the App Store's platform check in `install_from_registry`
+(`apps/registry_pipeline/install.py`) only
 refuses `installMode: "client"` apps, so dev-fleet installs and enables
 everywhere regardless. What the list drives is the App Store detail page, which
 renders it verbatim (`AppDetailPage.tsx` → "Platform: macos, linux, windows").
@@ -1058,9 +1882,9 @@ things:
 | Flag | Meaning | True when |
 |---|---|---|
 | `_POD_IMPORTED` | the `kiro_crew.pod` modules imported, so its platform-neutral helpers are callable | the import succeeded (any platform) |
-| `_POD_AVAILABLE` | pods can actually **run** here | Linux **and** `systemctl` on PATH |
+| `_POD_AVAILABLE` | pods can actually **run** here | Linux with `systemctl` on PATH, or macOS with `launchctl` on PATH |
 
-Conflating the two used to report every worktree as "not built" off Linux, since
+Conflating the two used to report every worktree as "not built" on hosts without a runnable pod backend, since
 the `prov.has_venv` / `prov.has_dist` calls — plain filesystem checks — sat
 behind the pod-runnable gate. Build state is now computed on every platform.
 
@@ -1073,19 +1897,23 @@ offering controls that fail:
 | `pods_unavailable_reason` | the human-readable reason, or `null` when pods are available |
 
 Before this existed, the reason string was computed into `_POD_ERROR` and then
-**never read by anything** — a non-Linux user saw pod controls that silently
-failed with no explanation.
+**never read by anything** — a user on a host without a runnable pod backend saw
+pod controls that silently failed with no explanation.
 
 Per-platform behavior:
 
 - **Linux + systemd `--user`** — everything works.
-- **macOS / Windows / Linux without `systemctl`** — the Fleet view, per-branch PR
-  status, commit counts, disk usage, Provision, Sync (pull main + rebuild),
-  Rebase and Prune all work. The UI shows a notice carrying
+- **macOS + launchd** — pod lifecycle and the non-pod fleet actions work. macOS
+  pods have no enforced memory/CPU ceiling. Automatic Make Live additionally
+  requires the current LaunchAgent restart contract; otherwise it stages the
+  pointer and asks the operator to restart manually.
+- **Windows / macOS without `launchctl` / Linux without `systemctl`** — the Fleet
+  view, per-branch PR status, commit counts, disk usage, Provision, Sync (pull
+  main + rebuild), Rebase and Prune all work. The UI shows a notice carrying
   `pods_unavailable_reason` and hides the actions that cannot work: Spin up /
   Restart / Stop pod, Open, QA + video. Make Live and Provision are **not**
-  hidden — `kirocrew pod provision` does not touch systemd, so building a
-  worktree's venv + dist works anywhere; Make Live stages the pointer on any
+  hidden — `kirocrew pod provision` does not touch a service manager, so building
+  a worktree's venv + dist works anywhere; Make Live stages the pointer on any
   platform and reports `staged_only` when it cannot bounce the gateway itself.
 - **Make Live** — staging (pointer write) works on every platform. Automatic
   restart requires an active systemd `--user` unit or a current macOS

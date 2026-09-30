@@ -65,7 +65,11 @@ def _app(service: FakeService, *, app_name: str | None = "") -> web.Application:
         return await handler(request)
 
     app = web.Application(middlewares=[authenticated_identity])
-    app["state"] = SimpleNamespace(workflow_service=service)
+    # ``authenticated_identity`` above presents ``user="test-user"``; naming that
+    # subject as the owner is what makes the dashboard-user rows model the owner's
+    # own session rather than a non-owner the write routes now refuse. The
+    # app-token rows are unaffected -- they are refused on their app claim.
+    app["state"] = SimpleNamespace(workflow_service=service, owner_id="test-user")
     app.router.add_get("/api/workflows/definitions", api_workflow_definitions)
     app.router.add_post("/api/workflows/definitions", api_workflow_definitions_create)
     app.router.add_post(
@@ -113,10 +117,7 @@ async def test_definition_run_reports_executor_rejection_instead_of_not_found() 
     service = FakeService()
 
     async def reject_start(_workflow_ref, **_kwargs):
-        return {
-            "error": "Too many concurrent tasks (3/3).",
-            "admission_rejected": True,
-        }
+        return {"error": "Too many concurrent tasks (3/3)."}
 
     service.start_definition = reject_start  # type: ignore[method-assign]
     async with TestClient(TestServer(_app(service))) as client:
@@ -154,6 +155,7 @@ async def test_definition_update_returns_conflict_and_run_maps_input() -> None:
             "args": {"level": "deep"},
             "author": "slot:main",
             "session_key": "slot:main",
+            "expected_store": None,
             "budget_total": None,
             "timeout_secs": None,
         },
@@ -362,9 +364,14 @@ async def test_definition_disk_operations_are_offloaded_from_the_gateway_loop(
             )
         ).status == 200
 
+    # The definition read paths serialize their response off-loop too
+    # (_json_response_off_loop's worker), so each GET contributes two
+    # to_thread hops: the disk read, then redact + json.dumps.
     assert calls == [
         "list_definitions",
+        "_redact_and_serialize",
         "save_definition",
         "get_definition",
+        "_redact_and_serialize",
         "update_definition",
     ]

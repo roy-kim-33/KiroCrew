@@ -21,6 +21,7 @@ from kiro_crew.messaging.link import (
     UNBIND_REASON_PRUNED_STALE,
     UNBIND_REASON_UNSPECIFIED,
     ChannelLink,
+    binding_token,
     legacy_dashboard_mirror_key,
     release_conversation_location,
 )
@@ -107,6 +108,177 @@ class TestNonSlackMirror:
         assert got is not None and got.channel_id == "2"
 
 
+class TestBindingNonce:
+    """Each binding carries its own identity beside it, and it dies with it.
+
+    The dashboard's slots row digests the nonce into the row's opaque token, so
+    a binding recreated to the very same target after an unlink never reads like
+    the row drawn from the old one -- the delayed-unlink ABA the coordinates
+    alone cannot see.
+    """
+
+    def test_mirror_nonce_is_minted_on_create_and_kept_across_an_identical_rewrite(
+        self, session_map
+    ):
+        link = ChannelLink(channel_type="discord", channel_id="dm-1")
+        assert session_map.mirror_link_nonce("dashboard:chat-1") == ""
+        session_map.set_mirror_link("dashboard:chat-1", link)
+        nonce = session_map.mirror_link_nonce("dashboard:chat-1")
+        assert nonce and len(nonce) == 16
+        # The dispatcher rebinds a channel-born session's own conversation on
+        # every inbound turn: same coordinates, same binding, same nonce.
+        session_map.set_mirror_link("dashboard:chat-1", link, accepts_inbound=True)
+        session_map.set_mirror_link("dashboard:chat-1", link)
+        assert session_map.mirror_link_nonce("dashboard:chat-1") == nonce
+
+    def test_mirror_nonce_changes_with_the_target_and_across_an_unlink(self, session_map):
+        link = ChannelLink(channel_type="discord", channel_id="dm-1")
+        session_map.set_mirror_link("dashboard:chat-1", link)
+        first = session_map.mirror_link_nonce("dashboard:chat-1")
+        session_map.set_mirror_link(
+            "dashboard:chat-1", ChannelLink(channel_type="telegram", channel_id="2")
+        )
+        moved = session_map.mirror_link_nonce("dashboard:chat-1")
+        assert moved and moved != first
+        # Unlink, then reconnect the SAME target: a new binding, a new nonce.
+        assert session_map.clear_mirror_link("dashboard:chat-1") is True
+        assert session_map.mirror_link_nonce("dashboard:chat-1") == ""
+        assert "mirror_nonce" not in session_map._data["dashboard:chat-1"]
+        session_map.set_mirror_link("dashboard:chat-1", link)
+        assert session_map.mirror_link_nonce("dashboard:chat-1") not in ("", first, moved)
+
+    def test_mirror_nonce_goes_with_a_location_sweep(self, session_map):
+        link = ChannelLink(channel_type="discord", channel_id="dm-1")
+        session_map.set_mirror_link("dashboard:chat-1", link)
+        assert session_map.clear_mirror_links_at(link) == ["dashboard:chat-1"]
+        assert "mirror_nonce" not in session_map._data["dashboard:chat-1"]
+        assert session_map.mirror_link_nonce("dashboard:chat-1") == ""
+
+    def test_slack_nonce_follows_the_thread_link(self, session_map):
+        assert session_map.slack_link_nonce("dashboard:chat-1") == ""
+        session_map.set_slack_link("dashboard:chat-1", "ts-1", "D-dm")
+        first = session_map.slack_link_nonce("dashboard:chat-1")
+        assert first and len(first) == 16
+        # The inbound path re-writes the same ts/channel every turn: kept.
+        session_map.set_slack_link("dashboard:chat-1", "ts-1", "D-dm")
+        assert session_map.slack_link_nonce("dashboard:chat-1") == first
+        # A rebind is a new binding.
+        session_map.set_slack_link("dashboard:chat-1", "ts-2", "D-dm")
+        second = session_map.slack_link_nonce("dashboard:chat-1")
+        assert second and second != first
+        # The legacy Slack-synthesized mirror reads the SAME nonce, so the row
+        # and the compare agree whichever accessor drew them.
+        assert session_map.mirror_link_nonce("dashboard:chat-1") == second
+        # Cleared, then re-linked to the same thread: new again.
+        assert session_map.clear_slack_link("dashboard:chat-1") is True
+        assert session_map.slack_link_nonce("dashboard:chat-1") == ""
+        assert "slack_link_nonce" not in session_map._data["dashboard:chat-1"]
+        session_map.set_slack_link("dashboard:chat-1", "ts-2", "D-dm")
+        assert session_map.slack_link_nonce("dashboard:chat-1") not in ("", first, second)
+        # The clear sentinel carries no identity.
+        session_map.set_slack_link("dashboard:chat-1", "", None)
+        assert session_map.slack_link_nonce("dashboard:chat-1") == ""
+
+    def test_a_binding_written_before_nonces_reads_as_none(self, session_map):
+        plant_binding(
+            session_map, "dashboard:chat-1", ChannelLink(channel_type="discord", channel_id="dm-1")
+        )
+        assert session_map.mirror_link_nonce("dashboard:chat-1") == ""
+        entry = session_map._ensure_entry("dashboard:chat-2")
+        entry["slack_thread_ts"] = "ts-legacy"
+        entry["slack_channel_id"] = "D-dm"
+        assert session_map.slack_link_nonce("dashboard:chat-2") == ""
+        assert session_map.mirror_link_nonce("dashboard:chat-2") == ""
+
+
+class TestCompareAndClear:
+    """``clear_mirror_link_if`` / ``clear_slack_link_if``: compare and clear, one step.
+
+    The primitives the dashboard's unlink routes call instead of reading the
+    binding, comparing and clearing in three route-level steps. A match clears
+    exactly like the plain clear (both spellings, the nonce, the pause flag); a
+    mismatch on channel OR token, or no binding at all, touches nothing.
+    """
+
+    def test_mirror_match_clears_and_a_mismatch_touches_nothing(self, session_map):
+        link = ChannelLink(channel_type="discord", channel_id="dm-1")
+        session_map.set_mirror_link("dashboard:chat-1", link, accepts_inbound=True)
+        session_map.set_mirror_paused("dashboard:chat-1", True)
+        token = binding_token(link, session_map.mirror_link_nonce("dashboard:chat-1"))
+
+        assert session_map.clear_mirror_link_if("dashboard:chat-1", "telegram", token) is False
+        assert (
+            session_map.clear_mirror_link_if("dashboard:chat-1", "discord", binding_token(link))
+            is False
+        )
+        assert session_map.clear_mirror_link_if("dashboard:chat-1", "discord", "") is False
+        assert session_map.get_mirror_link("dashboard:chat-1") == link
+        assert session_map.is_mirror_paused("dashboard:chat-1") is True
+
+        assert session_map.clear_mirror_link_if("dashboard:chat-1", "discord", token) is True
+        assert session_map.get_mirror_link("dashboard:chat-1") is None
+        assert session_map.mirror_link_nonce("dashboard:chat-1") == ""
+        assert session_map.mirror_accepts_inbound("dashboard:chat-1") is False
+        assert session_map.is_mirror_paused("dashboard:chat-1") is False
+        # Gone is a mismatch too: a row whose binding is already gone is refused.
+        assert session_map.clear_mirror_link_if("dashboard:chat-1", "discord", token) is False
+
+    def test_mirror_match_takes_the_superseded_legacy_row_with_it(self, session_map):
+        session_map.set("discord:chan-9", "sid-9")
+        session_map._data[legacy_dashboard_mirror_key("discord:chan-9")] = {
+            "mirror": ChannelLink("telegram", channel_id="tg-old").to_dict()
+        }
+        new = ChannelLink("telegram", channel_id="tg-new")
+        session_map.set_mirror_link("discord:chan-9", new)
+        token = binding_token(new, session_map.mirror_link_nonce("discord:chan-9"))
+        assert session_map.clear_mirror_link_if("discord:chan-9", "telegram", token) is True
+        assert session_map.get_mirror_link("discord:chan-9") is None
+        assert (
+            session_map._data[legacy_dashboard_mirror_key("discord:chan-9")].get("mirror") is None
+        )
+
+    def test_a_binding_from_before_nonces_matches_its_coordinates_only_token(self, session_map):
+        session_map.set("dashboard:chat-2", "sid-2")
+        link = ChannelLink(channel_type="discord", channel_id="dm-2")
+        session_map._data["dashboard:chat-2"]["mirror"] = link.to_dict()
+        assert session_map.mirror_link_nonce("dashboard:chat-2") == ""
+        assert (
+            session_map.clear_mirror_link_if("dashboard:chat-2", "discord", binding_token(link))
+            is True
+        )
+        assert session_map.get_mirror_link("dashboard:chat-2") is None
+
+    def test_slack_match_clears_both_spellings_and_a_mismatch_touches_nothing(self, session_map):
+        session_map.set_slack_link("dashboard:chat-1", "ts-1", "D-dm")
+        # The turn runner's copy of the link onto the bare key: planted, because a
+        # live claim on the same thread would evict the prefixed owner instead.
+        session_map._data["chat-1"] = {
+            "sid": "",
+            "slack_thread_ts": "ts-1",
+            "slack_channel_id": "D-dm",
+        }
+        row = ChannelLink("slack", channel_id="D-dm", thread_id="ts-1")
+        token = binding_token(row, session_map.slack_link_nonce("dashboard:chat-1"))
+        stale = binding_token(ChannelLink("slack", channel_id="D-dm", thread_id="ts-0"))
+
+        assert session_map.clear_slack_link_if("dashboard:chat-1", "slack", stale) is False
+        assert session_map.clear_slack_link_if("dashboard:chat-1", "discord", token) is False
+        assert session_map.get_slack_link("dashboard:chat-1") == ("ts-1", "D-dm")
+
+        assert session_map.clear_slack_link_if("dashboard:chat-1", "slack", token) is True
+        assert session_map.get_slack_link("dashboard:chat-1") == (None, None)
+        assert session_map.get_slack_link("chat-1") == (None, None), "the bare twin must go too"
+        assert session_map.slack_link_nonce("dashboard:chat-1") == ""
+        assert session_map.clear_slack_link_if("dashboard:chat-1", "slack", token) is False
+
+    def test_slack_twin_on_a_channel_key_clears_only_that_key(self, session_map):
+        session_map.set_slack_link("discord:chan-9", "ts-1", "D-dm")
+        row = ChannelLink("slack", channel_id="D-dm", thread_id="ts-1")
+        token = binding_token(row, session_map.slack_link_nonce("discord:chan-9"))
+        assert session_map.clear_slack_link_if("discord:chan-9", "slack", token) is True
+        assert session_map.get_slack_link("discord:chan-9") == (None, None)
+
+
 class TestSlackRouting:
     def test_set_mirror_routes_to_slack_link(self, session_map):
         session_map.set("dashboard:chat-1", "sid-abc")
@@ -139,12 +311,21 @@ class TestLegacyFallback:
         got = session_map.get_mirror_link("dashboard:chat-1")
         assert got == ChannelLink(channel_type="slack", channel_id="C9", thread_id="ts-9")
 
-    def test_channel_only_legacy_link(self, session_map):
+    def test_a_threadless_slack_row_is_not_a_mirror(self, session_map):
+        """``set_channel`` stamps a channel conversation's namespaced bucket into
+        the legacy ``slack_channel_id`` field with no thread, and ``clear_mirror_link``
+        pops only ``mirror`` -- so every new channel session on its first turn, and
+        every unlinked one afterwards, carries exactly this row. An empty
+        ``thread_ts`` is Slack's clear sentinel and never enters the thread index, so
+        nothing can be delivered through it: the store filters it here, once, instead
+        of handing every reader a Slack link nobody chose."""
         session_map.set("dashboard:chat-1", "sid-abc")
         session_map._data["dashboard:chat-1"]["slack_channel_id"] = "C9"
         session_map._data["dashboard:chat-1"]["slack_thread_ts"] = None
-        got = session_map.get_mirror_link("dashboard:chat-1")
-        assert got == ChannelLink(channel_type="slack", channel_id="C9", thread_id=None)
+        assert session_map.get_mirror_link("dashboard:chat-1") is None
+        session_map.set_slack_link("discord:agent:direct:7:gen1", "", "discord:7")
+        assert session_map.get_slack_link("discord:agent:direct:7:gen1") == ("", "discord:7")
+        assert session_map.get_mirror_link("discord:agent:direct:7:gen1") is None
 
 
 class TestGetMirrorLinkNone:
@@ -172,13 +353,14 @@ class TestMirrorReverseLookup:
             accepts_inbound=True,
         )
 
-        assert session_map.find_mirror_sessions(link, inbound_only=True) == [
-            "dashboard:chat-1"
-        ]
-        assert session_map.find_mirror_sessions(
-            ChannelLink(channel_type="discord", channel_id="dm-2"),
-            inbound_only=True,
-        ) == []
+        assert session_map.find_mirror_sessions(link, inbound_only=True) == ["dashboard:chat-1"]
+        assert (
+            session_map.find_mirror_sessions(
+                ChannelLink(channel_type="discord", channel_id="dm-2"),
+                inbound_only=True,
+            )
+            == []
+        )
 
     def test_duplicate_locations_are_explicit_not_arbitrarily_resolved(self, session_map):
         link = ChannelLink(channel_type="discord", channel_id="dm-1")
@@ -285,9 +467,7 @@ class TestClearMirrorLinksAt:
         assert session_map.get_mirror_link("dashboard:chat-1") is None
 
     def test_slack_bindings_are_out_of_scope(self, session_map):
-        session_map.set(
-            "dashboard:chat-1", "sid-abc"
-        )  # Slack link needs an entry to attach to
+        session_map.set("dashboard:chat-1", "sid-abc")  # Slack link needs an entry to attach to
         session_map.set_mirror_link(
             "dashboard:chat-1",
             ChannelLink(channel_type="slack", channel_id="C1", thread_id="ts-1"),
@@ -354,6 +534,32 @@ class TestReleaseConversationLocation:
         )
         assert reply == "✅ Unlinked."
         assert swept == []
+
+    def test_a_paused_dashboard_mirror_into_this_dm_is_swept(self, session_map):
+        # The row a dashboard Disconnect leaves at a DM, planted verbatim (ids
+        # invented): a DASHBOARD-keyed session whose explicit mirror names the
+        # owner's Discord DM with no thread, disconnected from the dashboard
+        # (`mirror_paused`) and accepting inbound because the owner replied from
+        # the DM. Neither the `dashboard:` key nor the pause nor the null thread
+        # may hide it from the value sweep: the location is matched as a whole
+        # ChannelLink, `thread_id=None` on both sides, and the sweep pops the
+        # pause flag with the binding so nothing of the mirror outlives it.
+        session_map.set("dashboard:chat-42", "sid-dash")
+        entry = session_map._data["dashboard:chat-42"]
+        entry["mirror"] = {"channel_type": "discord", "channel_id": "chan-1", "thread_id": None}
+        entry["mirror_accepts_inbound"] = True
+        entry["mirror_paused"] = True
+        session_map._save()
+        assert session_map.is_mirror_paused("dashboard:chat-42") is True
+        reply, swept = release_conversation_location(
+            session_map, key=self.KEY, location=self.LINK, channel="discord"
+        )
+        assert reply == "✅ Unlinked."
+        assert swept == ["dashboard:chat-42"]
+        assert session_map.get_mirror_link("dashboard:chat-42") is None
+        assert session_map.find_mirror_sessions(self.LINK, inbound_only=True) == []
+        assert session_map.is_mirror_paused("dashboard:chat-42") is False
+        assert "mirror_paused" not in session_map._data["dashboard:chat-42"]
 
     def test_the_three_clears_are_one_write(self, session_map):
         # Freeing a location is ONE action. Its three clears each rewrite the
@@ -468,9 +674,7 @@ class TestPersistence:
             sm.set_mirror_link("dashboard:chat-1", link, accepts_inbound=True)
         with patch("kiro_crew.session_map.config_dir", return_value=tmp_path):
             sm2 = SessionMap()
-            assert sm2.find_mirror_sessions(link, inbound_only=True) == [
-                "dashboard:chat-1"
-            ]
+            assert sm2.find_mirror_sessions(link, inbound_only=True) == ["dashboard:chat-1"]
 
     def test_mirror_round_trips_to_disk(self, tmp_path):
         with patch("kiro_crew.session_map.config_dir", return_value=tmp_path):
@@ -512,6 +716,29 @@ class TestLegacyDashboardSpelling:
         fresh = ChannelLink(channel_type="telegram", channel_id="new")
         session_map.set_mirror_link(self.CHANNEL, fresh)
         assert session_map.get_mirror_link(self.CHANNEL) == fresh
+
+    def test_clear_removes_the_superseded_legacy_row_too(self, session_map):
+        """An unlink must not hand the read back to the binding it superseded.
+
+        A channel session that rebound from the dashboard holds TWO rows: the
+        canonical binding every read prefers, and the pre-unification row it
+        superseded. Clearing the winner alone moves ``_mirror_key`` back to the
+        legacy row, so the session that was just unlinked reads as mirrored
+        again -- to its OLD target -- and nothing the user did is undone by
+        the click that reported success. One clear takes both rows.
+        """
+        session_map.set_mirror_link(
+            self.LEGACY, ChannelLink(channel_type="telegram", channel_id="old")
+        )
+        session_map.set_mirror_link(
+            self.CHANNEL, ChannelLink(channel_type="telegram", channel_id="new")
+        )
+        assert session_map.clear_mirror_link(self.CHANNEL) is True
+        assert session_map.get_mirror_link(self.CHANNEL) is None
+        assert session_map.mirror_link_nonce(self.CHANNEL) == ""
+        assert session_map._data[self.LEGACY].get("mirror") is None
+        # Nothing left to clear: the second call is the documented no-op.
+        assert session_map.clear_mirror_link(self.CHANNEL) is False
 
     def test_no_fallback_for_dashboard_born_key(self, session_map):
         # Only a channel key has a legacy twin; a dashboard session must not
@@ -571,21 +798,20 @@ class TestConversationOwnership:
             "dashboard:chat-2",
         ]
 
-    def test_a_non_resuming_transport_is_never_refused(self, session_map):
-        """Pins the blast radius: a Telegram chat cannot become inbound-committed.
+    def test_telegram_outbound_mirrors_stay_open_until_resume_claim(self, session_map):
+        """Telegram outbound mirrors remain shareable until one accepts inbound.
 
-        ``telegram/transport_dispatch.py`` calls ``set_mirror_link`` without
-        catching this exception, and an uncaught raise inside a channel command
-        handler is a dropped task and a silent no-reply. It stays unreachable
-        because Telegram does not declare ``supports_session_resume``, so the
-        dashboard never marks its bindings inbound and nothing else does either.
+        Two outbound-only dashboard mirrors may target the same chat. Once a
+        selected session claims that chat for inbound resume, every other occupant
+        becomes a blocker so routing can never become ambiguous.
         """
         chat = ChannelLink(channel_type="telegram", channel_id="55", thread_id=None)
         session_map.set_mirror_link("dashboard:chat-1", chat)
-        # Two dashboard sessions mirroring one Telegram chat: allowed before this
-        # rule, allowed after it.
         session_map.set_mirror_link("dashboard:chat-2", chat)
         assert len(session_map.find_mirror_sessions(chat)) == 2
+
+        with pytest.raises(ConversationOwnershipConflict):
+            session_map.set_mirror_link("dashboard:chat-3", chat, accepts_inbound=True)
 
     def test_the_same_session_may_rebind_itself(self, session_map):
         """A reconnect is not a rivalry."""
@@ -711,8 +937,7 @@ class TestBatchedSave:
 
 
 class TestAutomaticMirrorOptOut:
-
-    """The persisted refusal of automatic origin mirroring (issue #2959).
+    """The persisted refusal of automatic origin mirroring.
 
     A channel that binds its own conversation on every inbound turn re-asserts
     the mirror after a restart, so the in-channel "off" has to outlive the
@@ -785,9 +1010,7 @@ class TestAutomaticMirrorOptOut:
         flagged = [k for k, e in session_map._data.items() if e.get("flags")]
         assert flagged == ["telegram:kirocrew:direct:7"]
 
-    def test_a_refusal_stored_under_the_old_generation_key_is_still_honoured(
-        self, session_map
-    ):
+    def test_a_refusal_stored_under_the_old_generation_key_is_still_honoured(self, session_map):
         """Upgrading must not silently restore mirroring.
 
         An earlier build keyed the refusal by the generation-suffixed session key.
@@ -810,10 +1033,7 @@ class TestAutomaticMirrorOptOut:
         assert mgr.mirror_opt_out("telegram:kirocrew:direct:7:gen3") is True
         # Promoted to the bucket, and the generation row retired with it.
         assert session_map.get_flag("telegram:kirocrew:direct:7", MIRROR_OPT_OUT_FLAG) is True
-        assert (
-            session_map.get_flag("telegram:kirocrew:direct:7:gen3", MIRROR_OPT_OUT_FLAG)
-            is False
-        )
+        assert session_map.get_flag("telegram:kirocrew:direct:7:gen3", MIRROR_OPT_OUT_FLAG) is False
         # And it now survives the rotation that would have dropped it.
         assert mgr.mirror_opt_out("telegram:kirocrew:direct:7:gen4") is True
 
@@ -825,28 +1045,28 @@ class TestAutomaticMirrorOptOut:
         mgr.set_mirror_opt_out(key, False)
         assert mgr.mirror_opt_out(key) is False
 
-    def test_a_session_scoped_flag_does_not_make_an_entry_immortal(self, session_map):
+    def test_an_unlisted_flag_does_not_make_an_entry_immortal(self, session_map):
         """Immortality is opt-in, because prune is the only collection path.
 
-        Slack's ``temporary`` / ``incognito`` flags describe ONE session, not a
-        durable preference. Keeping their entries would leak a row per such
-        thread — and the map is rewritten whole on every mutation, so the leak
-        costs every later write, not just disk.
+        A flag that is neither a durable setting (``_DURABLE_FLAGS``) nor a
+        privacy mode (``_PRIVACY_STRICTNESS``) describes ONE session. Keeping its
+        entry would leak a row per such session — and the map is rewritten whole
+        on every mutation, so the leak costs every later write, not just disk.
+        The privacy modes are the listed exception, for a reason recorded at
+        ``_PRIVACY_STRICTNESS`` and pinned in ``test_session_map_conv_state.py``.
         """
-        for flag in ("temporary", "incognito"):
+        for flag in ("pinned", "muted"):
             key = f"slack:kirocrew:{flag}"
             session_map.set_flag(key, flag, True)
         assert session_map.prune() == 2
-        assert session_map.get_flag("slack:kirocrew:temporary", "temporary") is False
-        assert session_map.get_flag("slack:kirocrew:incognito", "incognito") is False
+        assert session_map.get_flag("slack:kirocrew:pinned", "pinned") is False
+        assert session_map.get_flag("slack:kirocrew:muted", "muted") is False
 
-    def test_a_stale_sid_is_still_collected_when_the_flag_is_session_scoped(
-        self, session_map
-    ):
-        """The repair branch is for settings only, not for any flag at all."""
+    def test_a_stale_sid_is_still_collected_when_the_flag_is_unlisted(self, session_map):
+        """The repair branch is for the listed flags only, not for any flag at all."""
         key = "slack:kirocrew:direct:7"
         session_map.set(key, "sid-that-no-longer-exists")
-        session_map.set_flag(key, "temporary", True)
+        session_map.set_flag(key, "pinned", True)
         assert session_map.prune() == 1
         assert key not in session_map._data
 
@@ -862,9 +1082,7 @@ class TestAutomaticMirrorOptOut:
         assert session_map.prune() == 0
         assert session_map.get_flag(key, MIRROR_OPT_OUT_FLAG) is True
 
-    def test_prune_clears_a_stale_sid_instead_of_dropping_the_opt_out(
-        self, session_map, tmp_path
-    ):
+    def test_prune_clears_a_stale_sid_instead_of_dropping_the_opt_out(self, session_map, tmp_path):
         """The other stale branch: the setting must outlive the native session.
 
         A conversation that HAS run turns carries a ``sid``. When kiro-cli
@@ -929,9 +1147,7 @@ class TestInboundUnbindIsLoud:
     future caller inherits the behavior instead of having to remember it.
     """
 
-    def test_clear_mirror_link_audits_and_announces(
-        self, session_map, unbind_calls, sel_events
-    ):
+    def test_clear_mirror_link_audits_and_announces(self, session_map, unbind_calls, sel_events):
         session_map.set_mirror_link("dashboard:chat-1", INBOUND_LINK, accepts_inbound=True)
         assert session_map.clear_mirror_link("dashboard:chat-1", reason="dashboard_unlink")
 
@@ -963,18 +1179,25 @@ class TestInboundUnbindIsLoud:
         "removal, reason",
         [
             # An explicit clear through set_mirror_link(None).
-            (lambda m, k: m.set_mirror_link(k, None, reason="dashboard_unlink"),
-             "dashboard_unlink"),
+            (
+                lambda m, k: m.set_mirror_link(k, None, reason="dashboard_unlink"),
+                "dashboard_unlink",
+            ),
             # An overwrite onto another location ends the old resume as thoroughly.
-            (lambda m, k: m.set_mirror_link(
-                k,
-                ChannelLink(channel_type="discord", channel_id="chan-2"),
-                accepts_inbound=True,
-                reason="origin_rebind",
-            ), "origin_rebind"),
-            # Same location, inbound flag dropped: no longer resumable.
-            (lambda m, k: m.set_mirror_link(k, INBOUND_LINK, reason="origin_rebind"),
-             "origin_rebind"),
+            (
+                lambda m, k: m.set_mirror_link(
+                    k,
+                    ChannelLink(channel_type="discord", channel_id="chan-2"),
+                    accepts_inbound=True,
+                    reason="origin_rebind",
+                ),
+                "origin_rebind",
+            ),
+            # Same location, inbound flag dropped: not resumable.
+            (
+                lambda m, k: m.set_mirror_link(k, INBOUND_LINK, reason="origin_rebind"),
+                "origin_rebind",
+            ),
             # A whole-entry delete carrying its caller's reason.
             (lambda m, k: m.delete(k, reason="session_destroyed"), "session_destroyed"),
             # A caller that names none is recorded as unattributed, not skipped.
@@ -989,9 +1212,7 @@ class TestInboundUnbindIsLoud:
 
         assert unbind_calls == [("dashboard:chat-1", INBOUND_LINK, reason)]
 
-    def test_rebinding_the_same_inbound_binding_is_not_a_removal(
-        self, session_map, unbind_calls
-    ):
+    def test_rebinding_the_same_inbound_binding_is_not_a_removal(self, session_map, unbind_calls):
         session_map.set_mirror_link("dashboard:chat-1", INBOUND_LINK, accepts_inbound=True)
         session_map.set_mirror_link("dashboard:chat-1", INBOUND_LINK, accepts_inbound=True)
 
@@ -1028,10 +1249,10 @@ class TestPruneRemovesThroughTheChokePoint:
 
     ``_survives_prune`` keeps every bound entry out of prune's delete branch, so
     today prune cannot reach a binding at all — which is precisely why this needs
-    pinning rather than leaving to inspection. Prune used to delete straight out
-    of ``_data``, so the audit and the announcement were not skipped by policy,
-    they were simply unreachable: any future loosening of that predicate would
-    have reopened a silent binding-removal path and nothing in the trail would
+    pinning rather than leaving to inspection. Deleting straight out of ``_data``
+    would leave the audit and the announcement not skipped by policy but simply
+    unreachable: any loosening of that predicate would reopen a silent
+    binding-removal path and nothing in the trail would
     have named prune as the remover.
     """
 
@@ -1056,9 +1277,7 @@ class TestPruneRemovesThroughTheChokePoint:
         assert UNBIND_REASON_PRUNED_STALE in audits[0]["resources"]
         assert unbind_calls == [(key, INBOUND_LINK, UNBIND_REASON_PRUNED_STALE)]
 
-    def test_collecting_an_unbound_row_stays_silent(
-        self, session_map, unbind_calls, sel_events
-    ):
+    def test_collecting_an_unbound_row_stays_silent(self, session_map, unbind_calls, sel_events):
         """The reachable case is unchanged: garbage strands nobody, so no event.
 
         Routing prune through the choke point must not start narrating ordinary
@@ -1077,7 +1296,7 @@ class TestPruneRemovesThroughTheChokePoint:
         """Prune on a running loop pays no inline whole-map write.
 
         ``_save`` defers the disk write to a worker thread precisely so the
-        loop never blocks on serialization (its docstring cites #2405), and
+        loop never blocks on serialization, and
         prune's sole caller is ``start_pool`` on the startup loop. Routing
         removals through the choke point must keep that property: per-key
         audits, zero loop-thread writes, one coalesced flush afterwards.
@@ -1113,9 +1332,7 @@ class TestPruneRemovesThroughTheChokePoint:
             assert len(replace_threads) == 1
             assert replace_threads[0] is not loop_thread
 
-    def test_a_collected_thread_binding_leaves_the_index(
-        self, session_map, monkeypatch
-    ):
+    def test_a_collected_thread_binding_leaves_the_index(self, session_map, monkeypatch):
         """The reverse index cannot outlive the entry that owned the thread."""
         key = "dashboard:chat-1"
         session_map.set_slack_link(key, "1700000000.000100", "C123")
@@ -1135,18 +1352,28 @@ class TestOutboundOnlyStaysQuiet:
             # An outbound-only mirror, cleared by key and deleted with its entry;
             # a Slack binding (its own reverse index); and an inbound flag with no
             # mirror, which routes nothing and so is no loss.
-            (lambda m: m.set_mirror_link("dashboard:chat-1", INBOUND_LINK),
-             lambda m: m.clear_mirror_link("dashboard:chat-1")),
-            (lambda m: m.set_mirror_link("dashboard:chat-1", INBOUND_LINK),
-             lambda m: m.delete("dashboard:chat-1")),
-            (lambda m: m.set_mirror_link(
-                "dashboard:chat-1",
-                ChannelLink(channel_type="slack", channel_id="C1", thread_id="ts-1"),
-             ),
-             lambda m: m.clear_mirror_link("dashboard:chat-1")),
-            (lambda m: (m._ensure_entry("dashboard:chat-1").update(
-                {"mirror_accepts_inbound": True}), m._save()),
-             lambda m: m.delete("dashboard:chat-1")),
+            (
+                lambda m: m.set_mirror_link("dashboard:chat-1", INBOUND_LINK),
+                lambda m: m.clear_mirror_link("dashboard:chat-1"),
+            ),
+            (
+                lambda m: m.set_mirror_link("dashboard:chat-1", INBOUND_LINK),
+                lambda m: m.delete("dashboard:chat-1"),
+            ),
+            (
+                lambda m: m.set_mirror_link(
+                    "dashboard:chat-1",
+                    ChannelLink(channel_type="slack", channel_id="C1", thread_id="ts-1"),
+                ),
+                lambda m: m.clear_mirror_link("dashboard:chat-1"),
+            ),
+            (
+                lambda m: (
+                    m._ensure_entry("dashboard:chat-1").update({"mirror_accepts_inbound": True}),
+                    m._save(),
+                ),
+                lambda m: m.delete("dashboard:chat-1"),
+            ),
         ],
     )
     def test_losing_it_announces_nothing(
@@ -1169,9 +1396,7 @@ class TestOutboundOnlyStaysQuiet:
 class TestAnnouncementIsBestEffort:
     """A broken notifier or audit sink cannot fail the removal that provoked it."""
 
-    def test_listener_exception_is_swallowed_and_logged_at_warning(
-        self, session_map, caplog
-    ):
+    def test_listener_exception_is_swallowed_and_logged_at_warning(self, session_map, caplog):
         def _explode(key, link, reason):
             raise RuntimeError("notifier down")
 
@@ -1189,9 +1414,7 @@ class TestAnnouncementIsBestEffort:
     def test_manager_registers_on_the_shared_registry(self, session_map, tmp_path):
         """A removal through a DIFFERENT map instance is announced too."""
         calls: list[str] = []
-        _manager_over(session_map).set_unbind_listener(
-            lambda key, link, reason: calls.append(key)
-        )
+        _manager_over(session_map).set_unbind_listener(lambda key, link, reason: calls.append(key))
         try:
             session_map.set_mirror_link("dashboard:chat-1", INBOUND_LINK, accepts_inbound=True)
             with patch("kiro_crew.session_map.config_dir", return_value=tmp_path):
@@ -1212,9 +1435,7 @@ class TestAuditDoesNotBlockTheLoop:
     """
 
     @pytest.mark.asyncio
-    async def test_the_loop_keeps_beating_while_the_audit_runs(
-        self, session_map, unbind_calls
-    ):
+    async def test_the_loop_keeps_beating_while_the_audit_runs(self, session_map, unbind_calls):
         """The clear must RETURN while the sink is still blocked.
 
         Timing the synchronous call is the only assertion that fails when ``sel()``
@@ -1251,9 +1472,7 @@ class TestAuditDoesNotBlockTheLoop:
             release.set()
 
     @pytest.mark.asyncio
-    async def test_an_audit_failure_is_isolated_and_logged_at_warning(
-        self, session_map, caplog
-    ):
+    async def test_an_audit_failure_is_isolated_and_logged_at_warning(self, session_map, caplog):
         session_map.set_mirror_link("dashboard:chat-1", INBOUND_LINK, accepts_inbound=True)
         with caplog.at_level(logging.WARNING, logger="kiro_crew.session_map"):
             with patch("kiro_crew.session_map.sel", side_effect=RuntimeError("sel down")):
@@ -1285,16 +1504,12 @@ class TestAuditDoesNotBlockTheLoop:
 class TestReasonIsNormalizedAtTheChokePoint:
     """An unexpected reason must not reach SEL or the notice copy."""
 
-    def test_an_unknown_reason_is_normalized_and_warned(
-        self, session_map, unbind_calls, caplog
-    ):
+    def test_an_unknown_reason_is_normalized_and_warned(self, session_map, unbind_calls, caplog):
         session_map.set_mirror_link("dashboard:chat-1", INBOUND_LINK, accepts_inbound=True)
         with caplog.at_level(logging.WARNING, logger="kiro_crew.session_map"):
             session_map.clear_mirror_link("dashboard:chat-1", reason="totally_made_up")
 
-        assert unbind_calls == [
-            ("dashboard:chat-1", INBOUND_LINK, UNBIND_REASON_UNSPECIFIED)
-        ]
+        assert unbind_calls == [("dashboard:chat-1", INBOUND_LINK, UNBIND_REASON_UNSPECIFIED)]
         assert any("totally_made_up" in r.getMessage() for r in caplog.records)
 
 
@@ -1351,9 +1566,7 @@ class TestGetRepairsRatherThanUnbinds:
         assert reloaded.get_mirror_link(key) == INBOUND_LINK
         assert unbind_calls == []
 
-    def test_a_truly_unbound_stale_entry_is_still_collected(
-        self, session_map, unbind_calls
-    ):
+    def test_a_truly_unbound_stale_entry_is_still_collected(self, session_map, unbind_calls):
         key = "dashboard:chat-1"
         session_map.set(key, "sid-gone")
 

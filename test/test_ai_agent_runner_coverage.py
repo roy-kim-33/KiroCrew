@@ -157,8 +157,9 @@ class _FakeProvider:
             return object()  # no __aiter__ -> the watchdog degrades gracefully
         return _AsyncEvents(self._events, stall_s=self._stall_s)
 
-    async def approve_tool(self, rid) -> None:
+    async def approve_tool(self, rid) -> bool:
         self.approved.append(rid)
+        return True
 
     async def reject_tool(self, rid) -> None:
         self.rejected.append(rid)
@@ -1110,8 +1111,8 @@ def test_session_runner_unavailable_when_config_load_raises(monkeypatch):
 def test_session_runner_logs_the_reason_availability_failed(monkeypatch, caplog):
     """``create_provider_factory`` cannot return None, so False is reachable ONLY from the
     ``except`` — the raised exception is therefore the sole record of why the backend went
-    offline, and discarding it left the operator-facing offline reason unable to name a
-    cause (#6566). The boolean contract is unchanged; only the log is added."""
+    offline, and discarding it leaves the operator-facing offline reason unable to name
+    a cause."""
 
     def _boom():
         raise RuntimeError("acp -> client -> session -> config.loader circular import")
@@ -1521,13 +1522,29 @@ async def test_reject_tolerates_a_provider_that_cannot_be_told(fake_sel):
 
 
 @pytest.mark.asyncio
-async def test_approve_records_a_one_shot_approval_before_granting_it(fake_sel):
-    provider = _FakeProvider()
+@pytest.mark.parametrize(
+    ("approval_sent", "expected_outcome"),
+    [(True, "auto_approved"), (False, R.OUTCOME_REJECTED_TRANSPORT_FLOOR)],
+)
+async def test_approve_audits_pending_then_transport_result(
+    fake_sel, approval_sent, expected_outcome
+):
+    class _Provider(_FakeProvider):
+        async def approve_tool(self, rid) -> bool:
+            self.approved.append(rid)
+            return approval_sent
+
+    provider = _Provider()
     await R.SessionAgentRunner._approve(provider, "r1", tool="fsWrite", session_key="s")
+
     assert provider.approved == ["r1"]
-    (call,) = fake_sel.calls
-    assert call["critical"] is True
-    assert call["outcome"] == "auto_approved"
+    assert [call["outcome"] for call in fake_sel.calls] == [
+        R.OUTCOME_PENDING_APPROVAL,
+        expected_outcome,
+    ]
+    assert fake_sel.calls[0]["critical"] is True
+    if not approval_sent:
+        assert "auto_approved" not in [call["outcome"] for call in fake_sel.calls]
 
 
 @pytest.mark.asyncio

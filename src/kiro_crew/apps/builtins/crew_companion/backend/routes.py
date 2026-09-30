@@ -27,13 +27,13 @@ from typing import Any, Awaitable, Callable
 
 from aiohttp import web
 
-from kiro_crew.apps.builtins.crew_companion.hooks import get_appearances, get_store
-from kiro_crew.apps.builtins.crew_companion.pack_transfer import (
+from kiro_crew.appearance_packs.transfer import (
     export_bundle,
     fetch_petdex_pet,
     import_bundle,
     save_sprite_pack,
 )
+from kiro_crew.apps.builtins.crew_companion.hooks import get_appearances, get_store
 from kiro_crew.apps.manager import is_app_enabled
 
 logger = logging.getLogger(__name__)
@@ -44,6 +44,10 @@ logger = logging.getLogger(__name__)
 # rejects absurd values (400-digit ints, 1e309→inf) with a 400 instead of
 # letting them overflow deeper in the scheduler.
 _MAX_RECURRENCE_MINUTES = 10 * 366 * 24 * 60
+
+# A reminder is a sentence, and a fire copies its text into the persisted pending
+# queue, so an unbounded text could push the store past its load cap and wedge every tick.
+_MAX_TEXT_CHARS = 500
 
 APP_NAME = "crew-companion"
 _BASE = f"/api/apps/{APP_NAME}"
@@ -87,11 +91,11 @@ def _require_enabled(handler: Handler) -> Handler:
 
     The write-failure translation lives here, in the one wrapper every route
     already goes through, rather than in each of the seven handlers that mutate
-    the store. The store used to log an OSError and return ``{"ok": True}``, so a
-    full or read-only data home produced a 200: the panel cleared the input and
-    the reminder was gone after a restart. Now the store raises, and a raise that
-    reached aiohttp would be a bare 500 with no machine-readable ``code`` — which
-    is what ``test/test_error_code_contract.py`` exists to prevent. Putting it
+    the store. The store RAISES on a failed write: logging the OSError and
+    returning ``{"ok": True}`` would turn a full or read-only data home into a
+    200, clearing the panel's input for a reminder that is gone after a restart.
+    A raise that reached aiohttp would be a bare 500 with no machine-readable
+    ``code`` — which is what ``test/test_error_code_contract.py`` prevents. Putting it
     here also means a route added later cannot forget it.
     """
 
@@ -159,6 +163,14 @@ async def _handle_pending_get(request: web.Request) -> web.StreamResponse:
 # ── writes ──────────────────────────────────────────────────────────────────
 
 
+def _text_error(text: Any) -> web.Response | None:
+    if not isinstance(text, str) or not text.strip():
+        return _bad_request("text is required", "text_required")
+    if len(text) > _MAX_TEXT_CHARS:
+        return _bad_request("text is too long", "text_too_long")
+    return None
+
+
 async def _handle_add(request: web.Request) -> web.StreamResponse:
     """Store an already-resolved reminder.
 
@@ -173,8 +185,8 @@ async def _handle_add(request: web.Request) -> web.StreamResponse:
 
     text = body.get("text")
     fire_at = body.get("fireAt")
-    if not isinstance(text, str) or not text.strip():
-        return _bad_request("text is required", "text_required")
+    if (bad := _text_error(text)) is not None:
+        return bad
     if not isinstance(fire_at, str) or not fire_at.strip():
         return _bad_request("fireAt is required", "fire_at_required")
 
@@ -195,7 +207,7 @@ async def _handle_add(request: web.Request) -> web.StreamResponse:
 
     try:
         result = await asyncio.to_thread(
-            store.add, text, fire_at, int(every) if every else None
+            store.add, str(text), fire_at, int(every) if every else None
         )
     except ValueError as exc:
         return _bad_request(str(exc), "invalid_reminder")
@@ -209,6 +221,21 @@ async def _handle_remove(request: web.Request) -> web.StreamResponse:
     if not isinstance(ident, str) or not ident:
         return _bad_request("id is required", "id_required")
     return web.json_response(await asyncio.to_thread(store.remove, ident))
+
+
+async def _handle_update(request: web.Request) -> web.StreamResponse:
+    store = get_store()
+    assert store is not None
+    body = await _body(request)
+    ident, text = body.get("id"), body.get("text")
+    if not isinstance(ident, str) or not ident:
+        return _bad_request("id is required", "id_required")
+    if (bad := _text_error(text)) is not None:
+        return bad
+    result = await asyncio.to_thread(store.update, ident, str(text))
+    if not result["ok"]:
+        return web.json_response({"error": "not found", "code": "reminder_not_found"}, status=404)
+    return web.json_response(result)
 
 
 async def _handle_skip(request: web.Request) -> web.StreamResponse:
@@ -279,7 +306,7 @@ async def _handle_appearance_detail(request: web.Request) -> web.StreamResponse:
     pack_id = request.query.get("id", "")
     detail = await asyncio.to_thread(get_appearances().pack_detail, pack_id)
     if detail is None:
-        # Not found rather than a 400: an id that no longer resolves is the normal
+        # Not found rather than a 400: an id that does not resolve is the normal
         # outcome of a pack the user just deleted, not a malformed request.
         return _bad_request("no such appearance pack", "pack_not_found")
     return web.json_response(detail)
@@ -375,6 +402,7 @@ def register_routes(app: web.Application) -> None:
     app.router.add_post(f"{_BASE}/reminders/add", _require_enabled(_handle_add))
     app.router.add_post(f"{_BASE}/reminders/remove", _require_enabled(_handle_remove))
     app.router.add_post(f"{_BASE}/reminders/skip", _require_enabled(_handle_skip))
+    app.router.add_post(f"{_BASE}/reminders/update", _require_enabled(_handle_update))
     app.router.add_post(f"{_BASE}/reminders/config", _require_enabled(_handle_config))
     app.router.add_get(f"{_BASE}/stats", _require_enabled(_handle_stats_get))
     app.router.add_get(f"{_BASE}/pending", _require_enabled(_handle_pending_get))

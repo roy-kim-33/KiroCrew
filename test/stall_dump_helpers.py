@@ -18,7 +18,7 @@ _SITE = "/opt/venv/lib/python3.12/site-packages/kiro_crew"
 
 # The field crash, frames innermost-first exactly as faulthandler prints them.
 CRON_STACK = [
-    f'  File "{_SITE}/security.py", line 7969 in is_sensitive_bash_command',
+    f'  File "{_SITE}/security/__init__.py", line 7969 in is_sensitive_bash_command',
     f'  File "{_SITE}/llm_helpers.py", line 2058 in _resolve_permission',
     f'  File "{_SITE}/llm_helpers.py", line 1596 in stream_and_collect',
     f'  File "{_SITE}/slack/gateway.py", line 1192 in _cron_stream_with_posttoken_resume',
@@ -30,7 +30,7 @@ CRON_STACK = [
     '  File "/usr/lib/python3.12/asyncio/base_events.py", line 1986 in _run_once',
 ]
 CHAT_STACK = [
-    f'  File "{_SITE}/security.py", line 7969 in is_sensitive_bash_command',
+    f'  File "{_SITE}/security/__init__.py", line 7969 in is_sensitive_bash_command',
     f'  File "{_SITE}/hooks.py", line 713 in on_tool_call',
     f'  File "{_SITE}/dashboard/chat_runner.py", line 7742 in _run_turn',
     '  File "/usr/lib/python3.12/asyncio/events.py", line 88 in _run',
@@ -40,6 +40,21 @@ SLACK_STACK = [
     f'  File "{_SITE}/llm_helpers.py", line 1596 in stream_and_collect',
     f'  File "{_SITE}/slack/gateway.py", line 5219 in _handle_message',
     f'  File "{_SITE}/slack/handler.py", line 3397 in handle',
+]
+# A dump whose loop wedged inside the per-turn event drain, and whose outer
+# frames (dashboard/state.py) match no surface rule of their own.
+DISPATCH_STACK = [
+    f'  File "{_SITE}/acp/session_handle.py", line 2838 in _dispatch_events',
+    f'  File "{_SITE}/dashboard/state.py", line 6307 in run_background_turn',
+    '  File "/usr/lib/python3.12/asyncio/events.py", line 88 in _run',
+    '  File "/usr/lib/python3.12/asyncio/base_events.py", line 1999 in _run_once',
+]
+# The dedicated-process twin of DISPATCH_STACK: the same drain class, in the
+# read loop AcpClient runs for a session that owns its own process.
+PROMPT_LOOP_STACK = [
+    f'  File "{_SITE}/acp/client.py", line 9694 in _prompt_loop',
+    f'  File "{_SITE}/acp/client.py", line 9766 in send_message_stream',
+    '  File "/usr/lib/python3.12/asyncio/events.py", line 88 in _run',
 ]
 IDLE_WORKER = [
     '  File "/usr/lib/python3.12/threading.py", line 359 in wait',

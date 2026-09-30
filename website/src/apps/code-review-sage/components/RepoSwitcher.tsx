@@ -24,6 +24,7 @@ import { repoSlug, useSage, type ActiveRepo } from '../context'
 import { loadRecentRepos, rememberRecentRepo } from '../lib/persist'
 
 import { i18nT } from '../../../i18n/t'
+import ErrorNotice from '../../../components/ErrorNotice'
 export default function RepoSwitcher() {
   const {
     pinnedRepos, pinnedLoading, activeRepo, setActiveRepo,
@@ -110,7 +111,7 @@ export default function RepoSwitcher() {
                 onKeyDown={(e) => e.stopPropagation()}
                 placeholder={i18nT('apps.codeReviewSage.components.repoSwitcher.filter_repos')}
                 aria-label={i18nT('apps.codeReviewSage.components.repoSwitcher.filter_repositories')}
-                className="w-full rounded-lg border border-border bg-card px-2.5 py-1.5 text-[13px] text-text placeholder:text-muted outline-none focus-visible:border-accent"
+                className="w-full rounded-lg border border-border bg-card px-2.5 py-1.5 text-[13px] text-text placeholder:text-muted outline-hidden focus-visible:border-accent"
               />
             </div>
           )}
@@ -180,7 +181,7 @@ export default function RepoSwitcher() {
       </DropdownMenu>
 
       {pinError && (
-        <div className="px-1 pt-1 text-[11.5px] text-danger">{pinError.message}</div>
+        <ErrorNotice message={pinError.message} variant="inline" askAgent className="px-1 pt-1" />
       )}
     </div>
   )

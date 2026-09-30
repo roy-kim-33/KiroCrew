@@ -16,9 +16,10 @@ existing suite leaves untouched:
 * ``/api/outbox`` and ``/api/outbox/{filename}`` — listing filters and the
   download refusals.
 * ``/api/reveal`` — the ``action=open`` arms and the no-opener fallback.
-* ``/api/upload`` and ``/api/screenshot`` — the non-macOS refusal and, with a
-  faked ``asyncio.create_subprocess_exec``, the success, cancel and timeout
-  arms. No real process is ever spawned.
+* ``/api/upload`` and ``/api/screenshot`` — the non-macOS refusal, the refusal
+  when the dialog binary does not resolve out of the trusted system directories,
+  and, with a faked ``asyncio.create_subprocess_exec``, the success, cancel and
+  timeout arms. No real process is ever spawned.
 * ``/api/dashboard/config`` — the PUT field validation matrix and the
   cancellation audit arm.
 * ``_content_matches_ext`` / ``_fuzzy_score`` — pure-function branches.
@@ -42,7 +43,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
-from tmpdir_helpers import short_tmp_base
+from dashboard_owner_helpers import as_owner
+from tmpdir_helpers import SHORT_TMP_PREFIX, short_tmp_base
 
 from kiro_crew import atomic_write as atomic_write_mod
 from kiro_crew import pinned_fs, platform_compat
@@ -85,13 +87,13 @@ def mock_sel():
 def _app(method: str, route: str, handler) -> web.Application:
     app = web.Application()
     app.router.add_route(method, route, handler)
-    return app
+    return as_owner(app)
 
 
 def _get_app(route: str, handler) -> web.Application:
     app = web.Application()
     app.router.add_get(route, handler)  # allow_head=True → HEAD hits the same handler
-    return app
+    return as_owner(app)
 
 
 # ── /api/file-read ──
@@ -186,9 +188,11 @@ class TestFileRead:
 
     @pytest.mark.asyncio
     async def test_schema_violation_is_400(self, mock_sel):
-        # '$' is outside FILE_READ_SCHEMA's allowed character class.
+        # A newline in the path: FILE_READ_SCHEMA refuses it because it splits
+        # the log line the path is written into. Ordinary punctuation is NOT a
+        # violation -- a filename may legally hold it.
         async with TestClient(TestServer(self._client_app())) as client:
-            resp = await client.get("/api/file-read?path=/tmp/$evil")
+            resp = await client.get("/api/file-read?path=/tmp/a%0Ab")
             assert resp.status == 400
             assert (await resp.json())["error"] == "invalid input"
 
@@ -196,7 +200,12 @@ class TestFileRead:
     async def test_forbidden_path_is_400(self, tmp_path, mock_sel):
         f = tmp_path / "blocked.txt"
         f.write_text("x", encoding="utf-8")
-        with patch.object(files_mod, "_validate_dashboard_path", return_value=None):
+        # Stubbed on the `handlers` package, not on `files_mod`: this endpoint
+        # opens through the shared open-and-check prefix, which resolves the
+        # validator through that package at call time (its documented
+        # monkey-patch seam, kept for the circular import). Same spelling the
+        # file-raw class below uses, for the same reason.
+        with patch("kiro_crew.dashboard.handlers._validate_dashboard_path", return_value=None):
             async with TestClient(TestServer(self._client_app())) as client:
                 resp = await client.get(f"/api/file-read?path={f}")
                 assert resp.status == 400
@@ -263,7 +272,9 @@ class TestFileRead:
 class TestFileWrite:
     @staticmethod
     def _client_app() -> web.Application:
-        return _app("POST", "/api/file-write", files_mod.api_file_write)
+        # Owner-gated route: the identity is plumbing so these tests stay on the
+        # branch each one names (the gate itself: test_file_write_owner_gate.py).
+        return as_owner(_app("POST", "/api/file-write", files_mod.api_file_write))
 
     @pytest.mark.asyncio
     async def test_writes_content_atomically(self, tmp_path, mock_sel):
@@ -299,7 +310,7 @@ class TestFileWrite:
     async def test_schema_violation_is_400(self, mock_sel):
         async with TestClient(TestServer(self._client_app())) as client:
             resp = await client.post(
-                "/api/file-write", json={"path": "/tmp/$evil", "content": "x"}
+                "/api/file-write", json={"path": "/tmp/a\nb", "content": "x"}
             )
             assert resp.status == 400
             assert (await resp.json())["error"] == "invalid input"
@@ -570,7 +581,7 @@ class TestFileWatch:
     @pytest.mark.asyncio
     async def test_schema_violation_is_400(self, mock_sel):
         async with TestClient(TestServer(self._client_app())) as client:
-            resp = await client.get("/api/file-watch?path=/tmp/$evil")
+            resp = await client.get("/api/file-watch?path=/tmp/a%0Ab")
             assert resp.status == 400
             assert (await resp.json())["error"] == "invalid input"
 
@@ -607,9 +618,9 @@ class TestFileWatch:
 
     @pytest.mark.asyncio
     async def test_symlink_swapped_after_validation_aborts_stream(self, tmp_path, mock_sel):
-        """The watcher re-resolves the path on every change and bails if the
-        realpath moved, so a post-validation symlink swap cannot be used to
-        stream a different file's contents."""
+        """The watcher re-resolves the path on every change and bails when the
+        realpath moves, so a post-validation symlink swap cannot stream a
+        different file's contents."""
         f = tmp_path / "swapped.md"
         f.write_text("content\n", encoding="utf-8", newline="\n")
         target = str(f)
@@ -651,7 +662,7 @@ def outbox(tmp_path):
     reject the fixture rather than the code under test. Same reasoning as
     ``test_outbox_binary.py``.
     """
-    base = Path(tempfile.mkdtemp(dir=short_tmp_base()))
+    base = Path(tempfile.mkdtemp(prefix=SHORT_TMP_PREFIX + "files-", dir=short_tmp_base()))
     odir = base / "outbox"
     odir.mkdir()
     with patch("kiro_crew.config.loader.outbox_dir", return_value=odir):
@@ -944,6 +955,19 @@ class _FakeProc:
             raise ProcessLookupError
 
 
+@pytest.fixture()
+def trusted_dialog_bin(monkeypatch):
+    """Resolve the dialog binaries without probing this host.
+
+    Both handlers pin their binary to the fixed system directories, and the
+    machine running these tests holds neither one there, so a darwin-simulating
+    test would otherwise land on the unavailable arm instead of the spawn.
+    """
+    monkeypatch.setattr(
+        platform_compat, "trusted_system_bin", lambda name: f"/usr/bin/{name}"
+    )
+
+
 class TestNativePickers:
     @pytest.mark.asyncio
     async def test_upload_is_refused_off_macos(self, mock_sel):
@@ -956,7 +980,43 @@ class TestNativePickers:
                 assert "only available on macOS" in (await resp.json())["error"]
 
     @pytest.mark.asyncio
-    async def test_upload_returns_selected_paths(self, mock_sel):
+    async def test_upload_is_refused_when_osascript_is_not_trusted(self, mock_sel, monkeypatch):
+        """An osascript that does not resolve out of the trusted directories is a
+        refusal, not a bare-name spawn: PATH can lead with an agent-writable
+        directory, so the bare name is exactly what must never run."""
+        monkeypatch.setattr(platform_compat, "trusted_system_bin", lambda name: None)
+        spawn = AsyncMock()
+        with patch("sys.platform", "darwin"), patch("asyncio.create_subprocess_exec", spawn):
+            async with TestClient(
+                TestServer(_app("POST", "/api/upload", files_mod.api_upload))
+            ) as client:
+                resp = await client.post("/api/upload")
+                assert resp.status == 501
+                body = await resp.json()
+                assert body["code"] == "file_picker_unavailable"
+                assert "unavailable" in body["error"]
+        spawn.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_screenshot_is_refused_when_screencapture_is_not_trusted(
+        self, mock_sel, monkeypatch, tmp_path
+    ):
+        monkeypatch.setattr(files_mod, "_SCREENSHOT_DIR", tmp_path / "shots")
+        monkeypatch.setattr(platform_compat, "trusted_system_bin", lambda name: None)
+        spawn = AsyncMock()
+        with patch("sys.platform", "darwin"), patch("asyncio.create_subprocess_exec", spawn):
+            async with TestClient(
+                TestServer(_app("POST", "/api/screenshot", files_mod.api_screenshot))
+            ) as client:
+                resp = await client.post("/api/screenshot")
+                assert resp.status == 501
+                body = await resp.json()
+                assert body["code"] == "screenshot_unavailable"
+                assert "unavailable" in body["error"]
+        spawn.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_upload_returns_selected_paths(self, mock_sel, trusted_dialog_bin):
         proc = _FakeProc(stdout=b"/Users/x/a.png\n\n/Users/x/b.txt\n")
         with patch("sys.platform", "darwin"), \
              patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)) as spawn:
@@ -966,10 +1026,10 @@ class TestNativePickers:
                 resp = await client.post("/api/upload")
                 assert resp.status == 200
                 assert (await resp.json())["paths"] == ["/Users/x/a.png", "/Users/x/b.txt"]
-        assert spawn.await_args.args[0] == "osascript"
+        assert spawn.await_args.args[0] == "/usr/bin/osascript"
 
     @pytest.mark.asyncio
-    async def test_upload_cancelled_dialog_returns_no_paths(self, mock_sel):
+    async def test_upload_cancelled_dialog_returns_no_paths(self, mock_sel, trusted_dialog_bin):
         proc = _FakeProc(stdout=b"\n  \n")
         with patch("sys.platform", "darwin"), \
              patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
@@ -980,7 +1040,7 @@ class TestNativePickers:
                 assert await resp.json() == {"paths": []}
 
     @pytest.mark.asyncio
-    async def test_upload_timeout_kills_dialog_and_returns_504(self, mock_sel):
+    async def test_upload_timeout_kills_dialog_and_returns_504(self, mock_sel, trusted_dialog_bin):
         proc = _FakeProc(fail_first=True, kill_raises=True)
         with patch("sys.platform", "darwin"), \
              patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
@@ -1003,7 +1063,8 @@ class TestNativePickers:
                 assert "only available on macOS" in (await resp.json())["error"]
 
     @pytest.mark.asyncio
-    async def test_screenshot_returns_captured_path(self, tmp_path, mock_sel, monkeypatch):
+    async def test_screenshot_returns_captured_path(self, tmp_path, mock_sel, monkeypatch,
+                                                    trusted_dialog_bin):
         shots = tmp_path / "screenshots"
         monkeypatch.setattr(files_mod, "_SCREENSHOT_DIR", shots)
         captured: dict[str, tuple] = {}
@@ -1022,13 +1083,13 @@ class TestNativePickers:
                 resp = await client.post("/api/screenshot")
                 assert resp.status == 200
                 path = (await resp.json())["path"]
-        assert captured["argv"][:2] == ("screencapture", "-i")
+        assert captured["argv"][:2] == ("/usr/bin/screencapture", "-i")
         assert Path(path).parent == shots
         assert Path(path).read_bytes().startswith(b"\x89PNG")
 
     @pytest.mark.asyncio
     async def test_screenshot_user_cancel_returns_empty_path(self, tmp_path, mock_sel,
-                                                             monkeypatch):
+                                                             monkeypatch, trusted_dialog_bin):
         monkeypatch.setattr(files_mod, "_SCREENSHOT_DIR", tmp_path / "shots")
         with patch("sys.platform", "darwin"), \
              patch("asyncio.create_subprocess_exec", AsyncMock(return_value=_FakeProc())):
@@ -1040,7 +1101,8 @@ class TestNativePickers:
                 assert await resp.json() == {"path": ""}
 
     @pytest.mark.asyncio
-    async def test_screenshot_timeout_returns_504(self, tmp_path, mock_sel, monkeypatch):
+    async def test_screenshot_timeout_returns_504(self, tmp_path, mock_sel, monkeypatch,
+                                                  trusted_dialog_bin):
         monkeypatch.setattr(files_mod, "_SCREENSHOT_DIR", tmp_path / "shots")
         proc = _FakeProc(fail_first=True)
         with patch("sys.platform", "darwin"), \
@@ -1187,6 +1249,88 @@ class TestDashboardConfigPut:
         assert got["jira_hosts"] == []
 
     @pytest.mark.asyncio
+    async def test_link_patterns_round_trip(self, config_client_app):
+        rules = [{"pattern": r"\bPROJ-\d+\b", "url": "https://tracker.example.com/browse/{match}"}]
+        async with TestClient(TestServer(config_client_app)) as client:
+            resp = await client.put("/api/dashboard/config", json={"link_patterns": rules})
+            assert resp.status == 200
+            got = await (await client.get("/api/dashboard/config")).json()
+        assert got["link_patterns"] == rules
+
+    @pytest.mark.asyncio
+    async def test_link_patterns_preserve_pattern_whitespace_exactly(self, config_client_app):
+        # Whitespace in a regex is load-bearing: `PROJ-\d+ ` (trailing space)
+        # matches different text than `PROJ-\d+`. Neither the PUT handler nor
+        # the load-time coercer may strip it -- trimming is for blank-DETECTION
+        # only. Silent stripping broadened the stored pattern (mints links the
+        # operator never wrote); the two edge-space twins below are DIFFERENT
+        # regexes and must both survive, not collapse into the dedup 400.
+        rules = [
+            {"pattern": r"PROJ-\d+ ", "url": "https://one.example/{match}"},
+            {"pattern": r"PROJ-\d+", "url": "https://two.example/{match}"},
+            {"pattern": r" ID-\d+", "url": "https://three.example/{match}"},
+        ]
+        async with TestClient(TestServer(config_client_app)) as client:
+            resp = await client.put("/api/dashboard/config", json={"link_patterns": rules})
+            assert resp.status == 200
+            got = await (await client.get("/api/dashboard/config")).json()
+        # Byte-exact round trip through PUT -> disk -> coercer -> GET.
+        assert got["link_patterns"] == rules
+
+    @pytest.mark.asyncio
+    async def test_link_patterns_accept_mixed_case_scheme(self, config_client_app):
+        # The editor validates with the browser's URL parser, whose scheme is
+        # case-insensitive -- `HTTPS://x/{match}` passes the inline check, so
+        # the PUT (and the load coercer) must accept it too or the save dies
+        # with no inline warning. Stored byte-exactly, normalised nowhere.
+        rules = [{"pattern": r"\bCASE-\d+\b", "url": "HTTPS://tracker.example.com/browse/{match}"}]
+        async with TestClient(TestServer(config_client_app)) as client:
+            resp = await client.put("/api/dashboard/config", json={"link_patterns": rules})
+            assert resp.status == 200
+            got = await (await client.get("/api/dashboard/config")).json()
+        assert got["link_patterns"] == rules
+
+    @pytest.mark.asyncio
+    async def test_link_patterns_rejects_malformed(self, config_client_app):
+        bad_bodies = [
+            {"link_patterns": "not-a-list"},
+            {"link_patterns": ["not-a-dict"]},
+            {"link_patterns": [{"pattern": "", "url": "https://x.example/{match}"}]},
+            {"link_patterns": [{"pattern": "ok", "url": "javascript:alert(1)"}]},
+            {"link_patterns": [{"pattern": "ok", "url": "https://x.example/no-placeholder"}]},
+            {"link_patterns": [{"pattern": "ok", "url": "https://x.example/{match}"}] * 51},
+            {"link_patterns": [{"pattern": "a" * 301, "url": "https://x.example/{match}"}]},
+            # Duplicate patterns: the load-time coercer keeps only the first,
+            # so accepting both would persist a rule that GET then omits and a
+            # later editor save would silently drop from disk. Distinct urls
+            # under the same pattern are still one duplicate.
+            {
+                "link_patterns": [
+                    {"pattern": r"\bDUP-\d+\b", "url": "https://one.example/{match}"},
+                    {"pattern": r"\bDUP-\d+\b", "url": "https://two.example/{match}"},
+                ]
+            },
+            # Renderer parity: normaliseHref refuses userinfo and a '{match}'
+            # in the authority (the token could steer the host), so accepting
+            # these would store rules that never linkify and show no warning.
+            {"link_patterns": [{"pattern": "ok", "url": "https://{match}.example.com/x"}]},
+            {"link_patterns": [{"pattern": "ok", "url": "https://user:pw@x.example/{match}"}]},
+            {"link_patterns": [{"pattern": "ok", "url": "https://x.example:{match}/t"}]},
+            # Whitespace in the authority: Python's urlsplit tolerates it but
+            # the browser's URL parser refuses it, so the rule would store
+            # fine and silently never linkify.
+            {"link_patterns": [{"pattern": "ok", "url": "https://exa mple.com/{match}"}]},
+        ]
+        async with TestClient(TestServer(config_client_app)) as client:
+            for body in bad_bodies:
+                resp = await client.put("/api/dashboard/config", json=body)
+                assert resp.status == 400, body
+                assert (await resp.json())["code"] == "invalid_link_patterns"
+            # A malformed save persisted nothing.
+            got = await (await client.get("/api/dashboard/config")).json()
+        assert got["link_patterns"] == []
+
+    @pytest.mark.asyncio
     async def test_boolean_fields_reject_non_booleans(self, config_client_app):
         bool_fields = [
             "restore_sessions",
@@ -1255,12 +1399,21 @@ class TestDashboardConfigPut:
             assert resp.status == 400
             assert "verbosity" in (await resp.json())["error"]
 
+            resp = await client.put(
+                "/api/dashboard/config", json={"default_memory_mode": "forgetful"}
+            )
+            assert resp.status == 400
+            body = await resp.json()
+            assert "default_memory_mode" in body["error"]
+            assert body["code"] == "invalid_default_memory_mode"
+
     @pytest.mark.asyncio
     async def test_full_valid_put_round_trips_through_get(self, config_client_app):
         payload = {
             "restore_sessions": True,
             "restore_window_minutes": 30,
             "merge_queued_messages": True,
+            "default_memory_mode": "temporary",
             "widget_density": "less",
             "verbosity": "ultra",
             "quick_send": True,
@@ -1353,6 +1506,54 @@ class TestContentMatchesExt:
         # No reliable magic for text or SVG: the extension allowlist is the gate.
         assert files_mod._content_matches_ext(".md", b"# anything")
         assert files_mod._content_matches_ext(".svg", b"<svg/>")
+
+
+class TestResolveRasterExt:
+    WEBP = b"RIFF\x10\x00\x00\x00WEBPVP8 " + b"\x00" * 8
+    PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 8
+    HEIC = b"\x00\x00\x00\x18ftypheic" + b"\x00" * 8
+    MP4 = b"\x00\x00\x00\x18ftypisom" + b"\x00" * 8
+
+    def test_truthful_name_is_kept_verbatim(self):
+        # ".jpeg" stays ".jpeg" -- not normalised to the canonical ".jpg".
+        assert files_mod._resolve_raster_ext(".jpeg", b"\xff\xd8\xff\xe1" + b"\x00" * 12) == ".jpeg"
+        assert files_mod._resolve_raster_ext(".png", self.PNG) == ".png"
+
+    def test_mislabelled_raster_maps_to_the_sniffed_types_extension(self):
+        assert files_mod._resolve_raster_ext(".jpeg", self.WEBP) == ".webp"
+        assert files_mod._resolve_raster_ext(".jpg", self.PNG) == ".png"
+        assert files_mod._resolve_raster_ext(".png", b"GIF89a" + b"\x00" * 10) == ".gif"
+
+    def test_non_raster_bytes_resolve_to_nothing(self):
+        assert files_mod._resolve_raster_ext(".jpeg", self.HEIC) is None
+        assert files_mod._resolve_raster_ext(".png", b"<html>") is None
+        assert files_mod._resolve_raster_ext(".webp", b"RIFF\x00\x00\x00\x00WAVEmore") is None
+
+    def test_non_raster_extension_is_not_this_helpers_business(self):
+        assert files_mod._resolve_raster_ext(".pdf", b"%PDF-1.4") is None
+        assert files_mod._resolve_raster_ext(".svg", self.PNG) is None
+
+    def test_every_sniffable_raster_has_a_canonical_extension(self):
+        from kiro_crew.messaging import raster
+
+        assert set(files_mod._RASTER_MIME_EXT) == set(raster._MAGIC)
+        assert set(files_mod._RASTER_MIME_EXT.values()) <= set(files_mod._RASTER_EXT_MIME)
+
+    def test_mismatch_message_names_heif_containers(self):
+        msg = files_mod._content_mismatch_message(".jpeg", self.HEIC)
+        assert msg.startswith("This .jpeg file is really a HEIC/AVIF photo")
+        assert ".webp" in msg
+
+    def test_mismatch_message_for_other_bmff_brands_stays_generic(self):
+        # An mp4 wearing .jpeg is not a photo container; do not call it one.
+        msg = files_mod._content_mismatch_message(".jpeg", self.MP4)
+        assert msg.startswith("This file is not really a .jpeg image")
+
+    def test_mismatch_message_for_non_raster_extensions_is_unchanged(self):
+        assert (
+            files_mod._content_mismatch_message(".docx", b"nope")
+            == "File content does not match its type: .docx"
+        )
 
 
 class TestFuzzyScore:

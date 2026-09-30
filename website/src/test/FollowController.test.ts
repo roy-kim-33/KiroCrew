@@ -5,8 +5,6 @@
 //   - a user scroll-up is never overridden by a late widget load (race-proof)
 //   - our own programmatic pins are not mistaken for user scrolls
 import { describe, it, expect } from 'vitest'
-import { readFileSync } from 'node:fs'
-import { join } from 'node:path'
 import * as fc from 'fast-check'
 import {
   computeAtBottom,
@@ -20,7 +18,45 @@ import {
   SELF_SCROLL_EPSILON,
   DEFAULT_BOTTOM_THRESHOLD,
   FOLLOW_REENGAGE_PX,
+  scrollIntentPending,
 } from '../hooks/virtualizer/FollowController'
+
+describe('scrollIntentPending — an input still waiting for its scroll event', () => {
+  // The one input term the position-only resting rule keeps: between an upward
+  // input (or a scrollbar grab) and the scroll event it causes, the reader still
+  // rests on our write to the pixel, and a pin landing in that frame would
+  // override the scroll they have begun. Returns the ms left on the hold so the
+  // caller can retry the held pin exactly at expiry.
+  it('is pending, with the time left, while the stamp is newer than the last scroll event and inside the window', () => {
+    expect(scrollIntentPending(1000, 990, 900, 150)).toBe(140)
+  })
+  it('is spent once a scroll event of any origin has arrived after it', () => {
+    expect(scrollIntentPending(1000, 990, 995, 150)).toBe(0)
+  })
+  it('expires with the settle window when no scroll event ever comes (unscrollable transcript)', () => {
+    expect(scrollIntentPending(1200, 990, 900, 150)).toBe(0)
+    expect(scrollIntentPending(1140, 990, 900, 150)).toBe(0)
+  })
+  it('never pends with no intent on record', () => {
+    expect(scrollIntentPending(1000, Number.NEGATIVE_INFINITY, 900, 150)).toBe(0)
+    expect(scrollIntentPending(1000, Number.NEGATIVE_INFINITY, Number.NEGATIVE_INFINITY, 150)).toBe(0)
+  })
+  it('property: a stamp older than the last scroll event is never pending', () => {
+    fc.assert(fc.property(
+      fc.double({ min: 0, max: 1e6, noNaN: true }), fc.double({ min: 0, max: 1e6, noNaN: true }), fc.double({ min: 1, max: 1e4, noNaN: true }),
+      (up, delta, settle) => {
+        const scroll = up + Math.abs(delta) + 1e-9
+        return scrollIntentPending(scroll + 1, up, scroll, settle) === 0
+      },
+    ))
+  })
+  it('property: the hold never outlives the settle window', () => {
+    fc.assert(fc.property(
+      fc.double({ min: 0, max: 1e6, noNaN: true }), fc.double({ min: 0, max: 1e4, noNaN: true }), fc.double({ min: 1, max: 1e4, noNaN: true }),
+      (stamp, elapsed, settle) => scrollIntentPending(stamp + elapsed, stamp, Number.NEGATIVE_INFINITY, settle) <= settle,
+    ))
+  })
+})
 
 describe('geometry helpers', () => {
   it('bottomTarget is scrollHeight - clientHeight, clamped at 0', () => {
@@ -195,17 +231,34 @@ describe('resolveUserScrollStick — direction-aware follow decision', () => {
     ).toBe(true)
   })
 
-  it('still follows at the TRUE bottom however the reader got there', () => {
-    // Rule 1 is untouched: a mid-stream shrink drops scrollTop to exactly the
-    // new bottom (which reads as an upward move), and releasing there froze
-    // streaming follow for the rest of the turn. At the true bottom there is
-    // nothing below to be yanked to.
+  it('still follows at the TRUE bottom when follow was already armed', () => {
+    // Rule 1's real case: a mid-stream shrink drops scrollTop to exactly the new
+    // bottom (which reads as an upward move), and releasing there froze
+    // streaming follow for the rest of the turn. The reader it protects is one
+    // who was ALREADY following -- the shrink's own scroll event is the first
+    // thing that could have released them.
+    expect(
+      resolveUserScrollStick({
+        stick: true, followOutput: true,
+        scrollTop: 600, prevScrollTop: 900, geom: { scrollTop: 600, scrollHeight: 1000, clientHeight: 400 },
+      }),
+    ).toBe(true)
+  })
+
+  it('does NOT re-arm a RELEASED reader the content collapse clamped to the true bottom', () => {
+    // Same geometry, same arrival at the exact bottom -- but this reader had
+    // already scrolled up, so nothing here is them coming back. The content
+    // below them shrank past where they sat and the engine clamped them flush.
+    // Re-arming hands the rest of the turn to the pin and every later token
+    // drags them along: the phone report of scrolling up to read mid-stream and
+    // being taken to the end seconds later. This is rule 3's "band arrives at a
+    // STILL reader" one distance band further in, where a clamp always lands.
     expect(
       resolveUserScrollStick({
         stick: false, followOutput: true,
         scrollTop: 600, prevScrollTop: 900, geom: { scrollTop: 600, scrollHeight: 1000, clientHeight: 400 },
       }),
-    ).toBe(true)
+    ).toBe(false)
   })
 })
 
@@ -217,20 +270,95 @@ describe('evaluateAutoPin — the race-proof core', () => {
     expect(r).toEqual({ pin: false, stick: false, target: 600 })
   })
 
-  it('IDLE: releases a reader sitting above the bottom instead of pinning them', () => {
-    // Follow means "keep me at the end of a LIVE turn". With nothing running
-    // there is no output to follow, so a reader 120px up is not following — and
-    // pinning them is a spring-back with no cause (reported from a phone after
-    // scrolling up about a hundred pixels with nothing streaming). Releasing
-    // rather than merely skipping matters: leaving follow armed would hand the
-    // yank to whichever turn starts next.
-    //
-    // `lastWriteTop` EQUALS scrollTop on purpose, so the pre-existing
-    // scroll-up release cannot fire and this pins the idle rule alone: the gap
-    // opened because content grew below the fold, not because anyone scrolled.
+  it('IDLE: a reader whose scrollTop has LEFT our last write is released, not pinned', () => {
+    // Follow means "keep me at the end". With nothing running there is no
+    // output to follow, so a reader 120px up who is NOT resting on our write
+    // (they moved down to 480 from a write at 300 and stopped short of the
+    // bottom) is not following — pinning them is a spring-back with no cause
+    // (reported from a phone after scrolling around with nothing streaming).
+    // Releasing rather than merely skipping matters: leaving follow armed
+    // would hand the yank to whichever turn starts next.
     const up = { scrollTop: 480, scrollHeight: 1000, clientHeight: 400 } // 120px above bottom
-    const r = evaluateAutoPin({ stick: true, geom: up, lastWriteTop: 480, runActive: false })
+    const r = evaluateAutoPin({ stick: true, geom: up, lastWriteTop: 300, runActive: false })
     expect(r).toEqual({ pin: false, stick: false, target: 600 })
+  })
+
+  it('IDLE with nothing written this session: a reader above the bottom is released', () => {
+    const up = { scrollTop: 480, scrollHeight: 1000, clientHeight: 400 }
+    const r = evaluateAutoPin({ stick: true, geom: up, lastWriteTop: -1, runActive: false })
+    expect(r).toEqual({ pin: false, stick: false, target: 600 })
+  })
+
+  describe('resting on our write — who opened the gap', () => {
+    // Distance alone cannot say who opened a gap while idle, and the two causes
+    // want opposite answers: a reader who scrolled up must be left alone, a
+    // reader the CONTENT moved away from must be carried back. Position is the
+    // discriminator: a reader resting exactly where our last write put them
+    // never scrolled (a scroll moves scrollTop), so the gap is content's — a new
+    // message landing in an idle chat, a row settling from its estimate — and
+    // they are carried, live turn or not. WebKit has no native scroll anchoring,
+    // so this is also what stands between an entry pin and a transcript that
+    // opens a viewport above its end.
+    const up = { scrollTop: 480, scrollHeight: 1000, clientHeight: 400 }
+
+    it('IDLE + resting on our write: the gap is content\'s, so the reader is carried back', () => {
+      // `lastWriteTop` EQUALS scrollTop: nobody scrolled, content grew below
+      // the fold (a crewmate's complete reply landing in a DM whose turn is
+      // over). This is the "new message arrived and I had to scroll by hand"
+      // report, and it pins.
+      const r = evaluateAutoPin({ stick: true, geom: up, lastWriteTop: 480, runActive: false })
+      expect(r).toEqual({ pin: true, stick: true, target: 600 })
+    })
+
+    it('hardware input that moved nothing is not a move: position alone decides', () => {
+      // A wheel-down at the end, a finger that landed and lifted, a scrollbar
+      // grab that went nowhere: each stamps input and leaves scrollTop on our
+      // write. The predicate takes no input signal at all, so there is nothing
+      // for such a stamp to flip — the same geometry pins regardless of what
+      // the caller believes about input. (The old `readerMovedSinceWrite`
+      // argument read every stamp as "the reader left" and released here.)
+      const r = evaluateAutoPin({ stick: true, geom: up, lastWriteTop: 480, runActive: false })
+      expect(r).toEqual({ pin: true, stick: true, target: 600 })
+    })
+
+    it('scrollTop has LEFT our last write: not ours to close (a reveal in flight)', () => {
+      // scrollTop below our last write AND away from the bottom is the
+      // user-scroll-up signature. A programmatic reveal -- a search hit, a
+      // pinned prompt, find-in-page -- wears it too when its scroll event has
+      // not dispatched yet as a height commit lands. Either way the position
+      // says the reader is no longer where we put them, so the release stands.
+      const r = evaluateAutoPin({ stick: true, geom: up, lastWriteTop: 600, runActive: true })
+      expect(r).toEqual({ pin: false, stick: false, target: 600 })
+      const idle = evaluateAutoPin({ stick: true, geom: up, lastWriteTop: 600, runActive: false })
+      expect(idle).toEqual({ pin: false, stick: false, target: 600 })
+    })
+
+    it('resting on a re-baselined write counts as resting', () => {
+      // The scroll handler re-baselines lastWriteTop onto the clamped scrollTop
+      // (or onto where a reader's own return to the bottom left them); the
+      // regrowth then opens the gap with scrollTop unchanged. That is the entry
+      // shape on a phone and the re-engaged reader's shape in a DM, and both
+      // are carried.
+      const r = evaluateAutoPin({ stick: true, geom: up, lastWriteTop: 480, runActive: false })
+      expect(r).toEqual({ pin: true, stick: true, target: 600 })
+    })
+
+    it('at the bottom: still following, nothing to write', () => {
+      const r = evaluateAutoPin({ stick: true, geom: tall, lastWriteTop: 600, runActive: false })
+      expect(r).toEqual({ pin: false, stick: true, target: 600 })
+    })
+
+    it('never overrides a released stick or an owning restore', () => {
+      expect(evaluateAutoPin({ stick: false, geom: up, lastWriteTop: 480 }).pin).toBe(false)
+      const r = evaluateAutoPin({ stick: true, geom: up, lastWriteTop: 480, restoreGate: true })
+      expect(r).toEqual({ pin: false, stick: false, target: 600 })
+    })
+
+    it('resting within the self-scroll epsilon still counts (sub-pixel jitter)', () => {
+      const jitter = { scrollTop: 481, scrollHeight: 1000, clientHeight: 400 }
+      const r = evaluateAutoPin({ stick: true, geom: jitter, lastWriteTop: 480, runActive: false })
+      expect(r).toEqual({ pin: true, stick: true, target: 600 })
+    })
   })
 
 
@@ -509,8 +637,12 @@ describe('resolveUserScrollStick — what brought the reader to the bottom', () 
   })
 
   it('omitting viewportGrowth keeps the previous meaning for callers with no signal', () => {
+    // With no growth reported the landing is read as a CONTENT clamp, so an
+    // already-following reader is carried across it. Stated with stick armed
+    // because that is the state rule 1 protects; a released reader is covered by
+    // its own case above.
     const armed = resolveUserScrollStick({
-      stick: false,
+      stick: true,
       followOutput: true,
       scrollTop: 600,
       prevScrollTop: 600,
@@ -551,21 +683,68 @@ describe('resolveUserScrollStick — a clamp only ever lowers scrollTop', () => 
   })
 })
 
-describe('both consumers report the viewport signal', () => {
-  it('the app-sdk hook passes viewportGrowth from its own scroll-event baseline', () => {
-    // Review finding: this hook observes pane resizes and the soft keyboard — the
-    // exact causes of a viewport-growth clamp — yet omitted the signal, so it kept
-    // the original defect while the chat virtualizer was fixed. The baseline must
-    // be its own, advanced by the scroll handler: a ref the ResizeObserver could
-    // advance first would fold the growth away before the clamp is classified.
-    const src = readFileSync(join(__dirname, '..', 'app-sdk', 'useChatScrollFollow.ts'), 'utf8')
-    const call = src.slice(src.indexOf('resolveUserScrollStick({'))
-    const args = call.slice(0, call.indexOf('})'))
-    expect(args).toMatch(/viewportGrowth:/)
-    expect(args).toContain('lastScrollClientHRef.current')
-    // Advanced in the scroll handler, not in the observer.
-    expect(src).toMatch(/prevScrollTopRef\.current = geom\.scrollTop\s*\n\s*lastScrollClientHRef\.current = geom\.clientHeight/)
-    // Not reusing the write-tracking ref, whose meaning is different.
-    expect(args).not.toContain('lastWriteClientHRef')
+describe('resolveUserScrollStick — a clamp under an upward user input is the reader', () => {
+  // A user scroll-UP concurrent with a mid-turn content shrink terminates within
+  // epsilon of the NEW bottom, wearing the same signature as the engine's clamp.
+  // The intent listeners stamp the input's own direction before the scroll event
+  // dispatches, so a fresh UPWARD stamp is the discriminator: with it the landing
+  // is the reader's own move and releases follow; without it the landing is the
+  // engine's clamp and keeps follow, which is what rule 1 is for.
+  const geom = { scrollTop: 600, scrollHeight: 1000, clientHeight: 400 }
+
+  it('a content-shrink clamp with NO recent input keeps stick armed', () => {
+    const armed = resolveUserScrollStick({
+      stick: true,
+      followOutput: true,
+      scrollTop: 600,
+      prevScrollTop: 620,
+      geom,
+      upwardInputWithinSettle: false,
+    })
+    expect(armed).toBe(true)
+  })
+
+  it('a clamp inside the settle window of a DOWNWARD input keeps stick armed', () => {
+    // A wheel-down at the bottom is an ordinary input while a stream is live: it
+    // stamps hard input but NOT upward intent, and a content-shrink clamp landing
+    // inside its settle window must not release follow — the reader asked to stay
+    // at the end. Only confirmed upward input disables the clamp guard, so the
+    // caller passes false here exactly as it does for a directionless grab.
+    const armed = resolveUserScrollStick({
+      stick: true,
+      followOutput: true,
+      scrollTop: 600,
+      prevScrollTop: 620,
+      geom,
+      upwardInputWithinSettle: false,
+    })
+    expect(armed).toBe(true)
+  })
+
+  it('the same clamp WITHIN the settle window of an upward input releases stick', () => {
+    const armed = resolveUserScrollStick({
+      stick: true,
+      followOutput: true,
+      scrollTop: 600,
+      prevScrollTop: 620,
+      geom,
+      upwardInputWithinSettle: true,
+    })
+    expect(armed).toBe(false)
+  })
+
+  it('a genuine downward re-engage under an upward stamp still follows', () => {
+    // A clamp only ever lowers scrollTop, so a downward move is the reader's own
+    // and must re-engage even with a fresh input stamp — the release is for
+    // non-downward landings only.
+    const armed = resolveUserScrollStick({
+      stick: false,
+      followOutput: true,
+      scrollTop: 600,
+      prevScrollTop: 400,
+      geom,
+      upwardInputWithinSettle: true,
+    })
+    expect(armed).toBe(true)
   })
 })

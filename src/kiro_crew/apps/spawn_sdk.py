@@ -18,10 +18,11 @@ spawn that never happened instead of counting a failure and backing off.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 from typing import Awaitable, Callable
 
-from kiro_crew.agent_discovery import list_agents
+from kiro_crew.agent_discovery import is_internal_agent_spec, list_agents
 from kiro_crew.sel import sel
 
 logger = logging.getLogger(__name__)
@@ -171,7 +172,13 @@ def build_spawn_impl(subagents: object) -> SpawnImpl:
             # approval_mode="auto", a full-privilege escalation from the app's own
             # restricted background agent.
             prefix = f"{app}--"
-            known = {a.name for a in agents if a.filename.startswith(prefix)}
+            # Kiro Crew's own generated specs are never an app's agent, even when
+            # derived from one (``<app>--<agent>--readonly`` shares the prefix).
+            known = {
+                a.name
+                for a in agents
+                if a.filename.startswith(prefix) and not is_internal_agent_spec(a)
+            }
         except Exception as exc:  # noqa: BLE001 — cannot confirm → refuse
             reason = f"cannot verify agent {agent!r} for app {app!r}: {exc}"
             _audit_spawn_denied(app, agent, reason)
@@ -187,8 +194,7 @@ def build_spawn_impl(subagents: object) -> SpawnImpl:
         # app's per-app governance profile — a profile that denies
         # ``capabilities.spawn`` for this app must win even when the policy
         # ceiling alone would permit. Omitting it was a Level-2 (PROFILE) bypass.
-        info = subagents.spawn(  # type: ignore[attr-defined]
-            task,
+        spawn_kwargs = dict(
             agent=agent,
             silent=silent,
             approval_mode="auto",
@@ -198,6 +204,13 @@ def build_spawn_impl(subagents: object) -> SpawnImpl:
             # skip the manager's synchronous re-scan on the event loop.
             _agent_prevalidated=True,
         )
+        # Event-loop caller: the durable row is written on the store's writer
+        # thread (``spawn_async``); a manager double without it spawns inline.
+        spawn_async = getattr(subagents, "spawn_async", None)
+        if inspect.iscoroutinefunction(spawn_async):
+            info = await spawn_async(task, **spawn_kwargs)
+        else:
+            info = subagents.spawn(task, **spawn_kwargs)  # type: ignore[attr-defined]
         if info is None:
             return ""
         if getattr(info, "error", ""):
@@ -214,7 +227,7 @@ def build_spawn_impl(subagents: object) -> SpawnImpl:
 def build_done_probe(subagents: object) -> DoneProbe:
     """Adapt a live ``SubagentManager`` to :data:`DoneProbe`.
 
-    An id the manager no longer tracks reads as done: the reaper prunes
+    An id the manager does not track reads as done: the reaper prunes
     records, and "gone" must never hold a caller's serial lock open.
     """
 

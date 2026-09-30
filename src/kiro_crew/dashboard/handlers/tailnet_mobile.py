@@ -30,7 +30,7 @@ The payload is a URL with a session token in its query string. It is not logged,
 not stored, and not returned by the status endpoint — only by an explicit POST.
 Behind ``tailscale serve`` every request reaches the gateway from ``127.0.0.1``,
 so per-device session pinning cannot distinguish the phone from anything else on
-the tailnet (issue #1762): the token is the only real credential, which is why
+the tailnet: the token is the only real credential, which is why
 the default TTL here is an hour rather than the 20-hour ceiling the CLI uses.
 
 **Publishing is the consent for staying awake.** A phone loses the dashboard the
@@ -60,7 +60,6 @@ from kiro_crew.dashboard.token_auth import (
     LINK_WINDOW_SECS,
     MAX_SESSION_TTL_SECS,
     generate_token,
-    parse_duration,
 )
 from kiro_crew.qr import render_qr_data_uri
 
@@ -73,7 +72,7 @@ TAILSCALE_DOWNLOAD_URL = "https://tailscale.com/download"
 
 #: Default lifetime of the session a scanned QR opens. Deliberately far below the
 #: 20-hour ceiling: behind ``tailscale serve`` the session cannot be pinned to the
-#: scanning device (#1762), so this token is the only thing standing between the
+#: scanning device, so this token is the only thing standing between the
 #: tailnet and the dashboard. An hour is enough for a phone session and short
 #: enough that a leaked link stops mattering quickly.
 DEFAULT_QR_TTL_SECS = 3600
@@ -83,6 +82,16 @@ DEFAULT_QR_TTL_SECS = 3600
 #: suits a CLI token typed on the operator's own machine is too generous for a
 #: credential that travels as a scannable image.
 MAX_QR_TTL_SECS = 12 * 3600
+
+#: Pixels per QR module for the access code. The connect dialog and the Overview
+#: card show this image at its natural size when the container is wide enough, so
+#: each module is exactly 4 CSS pixels (8 device pixels on a 2x screen).
+#: ``max-w-full`` scales the image down in a narrower container. The access URL
+#: carries a signed token, so the symbol runs to about 80 modules, and at 4 pixels
+#: a module it fits the dialog. It is not the shared default of 8: that image is
+#: about twice the dialog's width, so the browser would shrink it by a fractional
+#: factor.
+MOBILE_QR_BOX_SIZE = 4
 
 Step = Literal[
     "pinned",
@@ -106,6 +115,7 @@ def _derive_step(
     trusted: bool,
     startup_host: str,
     published: bool | None,
+    port_free: bool | None,
 ) -> Step:
     """The one next action, derived HERE and nowhere else.
 
@@ -133,7 +143,12 @@ def _derive_step(
     6. ``occupied`` — serve holds this port/mount for something that is not this
        dashboard, or its state could not be determined. Publishing would REPLACE
        it, so this refuses and the card renders the manual command
-       (``kirocrew tailnet up``) for the operator to run deliberately.
+       (``kirocrew tailnet up``) for the operator to run deliberately. Decided
+       on ``port_free``, not on ``published`` alone: a stranger's handler at the
+       mount reads ``published=False`` exactly as a free port does, and offering
+       the publish button for it walked the operator into ``publish()``'s own
+       refusal one click later. Serve config that sits entirely on OTHER ports
+       is neither — it is invisible to this write and derives ``publish``.
     7. ``publish`` — everything is in place; one action left.
     8. ``ready`` — published and trusted.
     """
@@ -169,10 +184,12 @@ def _derive_step(
         return "restart_gateway"
     if published is True:
         return "ready"
-    # ``published is None`` is "could not tell", which is NOT "free". Publishing
-    # over an unknown mount is the destructive direction, so an undetermined
-    # state lands with the occupied case — same refusal, same manual escape.
-    return "publish" if published is False else "occupied"
+    # Only a provably free port earns the publish button; ``None`` ("could not
+    # tell") and ``False`` (something else holds the mount) are both the
+    # destructive direction and land with the occupied case — same refusal,
+    # same manual escape. This mirrors ``publish()``'s own guard, so the card
+    # never offers an action the write side will refuse.
+    return "publish" if (published is False and port_free is True) else "occupied"
 
 
 def _dashboard_port(request: web.Request) -> int:
@@ -257,6 +274,13 @@ async def api_tailnet_mobile_status(request: web.Request) -> web.Response:
     port = _dashboard_port(request)
     live = await _live_state(request, port)
     probe = live.probe
+    # ONLY the fields the card renders. The status body once mirrored the whole
+    # probe (installed/reachable/logged_in/trusted/startup_trusted/published/
+    # governance_pinned) plus serve_port/dashboard_port/qr_ttl_secs/host, but
+    # the card derives everything it shows from ``step`` — the one owner of the
+    # state machine — and read none of those. An unread field on a network-facts
+    # body is disclosure surface with no consumer, so the body carries only what
+    # is actually rendered.
     return web.json_response(
         {
             # A per-process marker lets the setup flow prove that a requested
@@ -266,29 +290,18 @@ async def api_tailnet_mobile_status(request: web.Request) -> web.Response:
             # mint one last boot-bound QR before exiting.
             "boot_id": current_boot_id(),
             "step": live.step,
-            "host": probe.name,
             "origin": f"https://{probe.name}" if probe.name else "",
-            "installed": probe.installed,
-            "reachable": probe.reachable,
-            "logged_in": probe.logged_in,
             # The OTHER devices on this tailnet. Carried because publishing and
             # the QR both succeed on a tailnet of one, and the scan then fails in
             # the phone's browser with nothing on this machine to blame.
             "peer_count": probe.peer_count,
             "peers_online": probe.peers_online,
-            "trusted": live.trusted,
-            "startup_trusted": live.startup_host == probe.name,
-            "published": live.published,
             "keep_awake": live.keep_awake,
-            "governance_pinned": live.pinned,
             # Verbatim daemon/serve text, never a rephrasing. The classification
             # above is a best-effort hint; this is what Tailscale actually said,
             # and it is the only thing that stays correct if upstream rewords.
             "detail": live.serve_detail or probe.detail,
             "download_url": TAILSCALE_DOWNLOAD_URL,
-            "qr_ttl_secs": DEFAULT_QR_TTL_SECS,
-            "serve_port": tailnet_serve.SERVE_HTTPS_PORT,
-            "dashboard_port": port,
         }
     )
 
@@ -311,20 +324,18 @@ class _LiveState(NamedTuple):
 async def _live_state(request: web.Request, port: int) -> _LiveState:
     """Probe the machine and derive the single next step, for EVERY caller.
 
-    Extracted so the status read and the QR mint cannot disagree about what this
-    machine may currently do. They previously disagreed in the direction that
-    matters: the card refused to offer a QR unless the derived step was ``ready``,
-    while the mint endpoint re-checked two of ``_derive_step``'s seven
-    preconditions by hand (a name exists; serve reports published) and silently
-    admitted the other five. Every precondition the mint did not re-implement was
-    a way to obtain a credential the card would never have offered — which is why
-    this endpoint accumulated four separate blocking review findings, one per
-    missed precondition, rather than one.
+    Shared so the status read and the QR mint cannot disagree about what this
+    machine may currently do. A disagreement runs in the direction that matters:
+    the card refuses to offer a QR unless the derived step is ``ready``, so a mint
+    endpoint re-checking only two of ``_derive_step``'s seven preconditions by
+    hand (a name exists; serve reports published) silently admits the other five.
+    Every precondition the mint does not re-implement is a way to obtain a
+    credential the card would never have offered.
 
     ``_derive_step`` is documented as deriving the next action "HERE and nowhere
-    else", so the fix is to honour that rather than to add a fifth hand-rolled
-    check. Reading one function's answer is also the only version of this that
-    stays correct when a step is added later.
+    else", and this honours that rather than adding a hand-rolled check. Reading
+    one function's answer is also the only version of this that stays correct when
+    a step is added later.
     """
     try:
         cfg = await asyncio.to_thread(KiroCrewConfig.load)
@@ -347,6 +358,7 @@ async def _live_state(request: web.Request, port: int) -> _LiveState:
         name="", installed=False, reachable=False, logged_in=False, detail=""
     )
     published: bool | None = None
+    port_free: bool | None = None
     serve_detail = ""
     if not pinned:
         # Both are subprocess round trips; neither may run on the event loop.
@@ -354,6 +366,7 @@ async def _live_state(request: web.Request, port: int) -> _LiveState:
         if probe.name and port:
             state = await asyncio.to_thread(tailnet_serve.serve_state, port)
             published = state.published
+            port_free = state.port_free
             serve_detail = state.detail
 
     startup_host = tailnet.running_tailnet_origin(request.app)[0]
@@ -363,6 +376,7 @@ async def _live_state(request: web.Request, port: int) -> _LiveState:
         trusted=trusted,
         startup_host=startup_host,
         published=published,
+        port_free=port_free,
     )
     return _LiveState(
         step=step,
@@ -886,23 +900,26 @@ async def api_tailnet_mobile_qr(request: web.Request) -> web.Response:
         )
     host = live.probe.name
 
-    ttl = DEFAULT_QR_TTL_SECS
+    # The QR session lifetime is fixed at the endpoint default. A caller-supplied
+    # ``ttl`` was accepted here once, but no caller ever sent one — both the card
+    # and the connect modal mint with no body — so it was dead request surface on
+    # a credential-minting endpoint. Clamped to this endpoint's own ceiling and
+    # the global session ceiling so a future raise of DEFAULT_QR_TTL_SECS cannot
+    # exceed what token_auth itself allows; the caller's own remaining lifetime is
+    # applied further down, after the last awaited step before the mint, so it
+    # cannot go stale while this handler waits.
+    ttl = min(DEFAULT_QR_TTL_SECS, MAX_QR_TTL_SECS, MAX_SESSION_TTL_SECS)
+
+    # Drain the request body even though nothing here reads it. The caller's
+    # remaining-lifetime check below is deliberately taken AFTER this await: a
+    # client that trickles the body in byte by byte controls how long this
+    # handler waits, and a session in its last seconds must not stretch the mint
+    # past its own expiry while the body arrives. The awaited step is the point
+    # of the guard, not the payload -- so the read stays, the value is discarded.
     try:
-        body = await request.json()
+        await request.json()
     except Exception:
-        body = {}
-    if isinstance(body, dict):
-        raw_ttl = body.get("ttl")
-        if isinstance(raw_ttl, str) and raw_ttl.strip():
-            parsed = parse_duration(raw_ttl)
-            if parsed:
-                ttl = parsed
-    # Clamped by this endpoint's own ceiling first, then the global session
-    # ceiling, so neither a caller-supplied value nor a future raise of
-    # MAX_QR_TTL_SECS can exceed what token_auth itself allows. The caller's
-    # own remaining lifetime is applied further down, after the last awaited
-    # step before the mint, so it cannot go stale while this handler waits.
-    ttl = min(ttl, MAX_QR_TTL_SECS, MAX_SESSION_TTL_SECS)
+        pass
 
     state_obj = request.app.get("state")
     owner_id = str(getattr(state_obj, "owner_id", "") or "")
@@ -976,7 +993,7 @@ async def api_tailnet_mobile_qr(request: web.Request) -> web.Response:
     #
     # GATED on daemon-verified tailnet identity, and the gate is what makes this
     # offerable at all rather than merely convenient. Behind ``tailscale serve``
-    # every request reaches the gateway from 127.0.0.1 (#1762), so with identity
+    # every request reaches the gateway from 127.0.0.1, so with identity
     # trust off the pin is ``ip:127.0.0.1`` for every tailnet client and the
     # cookie is a bearer credential any of them could replay. A session that ends
     # at the next restart bounds that exposure; one that outlives the process does
@@ -1084,7 +1101,7 @@ async def api_tailnet_mobile_qr(request: web.Request) -> web.Response:
     url = f"https://{host}/?token={token}"
     try:
 
-        image = await asyncio.to_thread(render_qr_data_uri, url)
+        image = await asyncio.to_thread(render_qr_data_uri, url, box_size=MOBILE_QR_BOX_SIZE)
     except Exception:
         logger.debug("tailnet mobile QR encode failed", exc_info=True)
         await _audit_async(request, "tailnet.mobile.qr", "denied", "encode-failed")
@@ -1110,6 +1127,5 @@ async def api_tailnet_mobile_qr(request: web.Request) -> web.Response:
             # ``exp`` to the session TTL, so a short-lived caller's link dies
             # with the ttl it lent — report the live window, not the constant.
             "link_window_secs": min(LINK_WINDOW_SECS, ttl),
-            "host": host,
         }
     )

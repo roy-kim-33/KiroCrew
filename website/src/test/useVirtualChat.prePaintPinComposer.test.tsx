@@ -126,18 +126,41 @@ describe('pre-paint bottom pin and the composer', () => {
     expect(writes.filter((w) => w > parked)).toEqual([])
   })
 
-  it('does not re-target the bottom when nothing is running', () => {
-    // Isolates the idle rule on THIS path: the viewport is unchanged, so the
-    // shrink freeze cannot be what holds the reader. Content grew below the fold
-    // with nobody scrolling, which is the state where follow is still armed and
-    // the reader is no longer at the bottom.
-    const { view, state, writes } = mountAtBottom(false, 'idle')
-    const parked = state.scrollTop
+  it('carries a STILL reader back when content grows under them with nothing running', () => {
+    // Viewport unchanged, no turn, no input: content grew below the fold with
+    // nobody scrolling. Follow is still armed and the reader is no longer at the
+    // bottom -- but every pixel of that gap is ours, so the idle rule must not
+    // read it as the reader having left. This is the entry case on WebKit, which
+    // has no native scroll anchoring to absorb a post-pin reprice: releasing here
+    // left the transcript open a viewport above the end with nothing to bring it
+    // back.
+    const { view, state, writes, bottom } = mountAtBottom(false, 'idle-still')
+    state.scrollHeight += 300
+    landHeightCommit(view)
+
+    expect(state.scrollTop).toBe(bottom())
+    expect(writes).toContain(bottom())
+  })
+
+  it('does not re-target the bottom when nothing is running and the reader has moved', () => {
+    // Same growth, but the reader has genuinely LEFT the bottom since we last
+    // placed them: a wheel-up and the scroll event it caused, which moved
+    // scrollTop off our write and released follow. With nothing running there
+    // is no output to follow, so the gap is theirs to keep -- the height commit
+    // must not re-target the bottom under them. (An input that moved nothing is
+    // deliberately NOT a departure any more: see the idlePinGuard suite.)
+    const { view, el, state, writes, bottom } = mountAtBottom(false, 'idle-moved')
+    act(() => { el.dispatchEvent(new WheelEvent('wheel', { deltaY: -120 })) })
+    const parked = state.scrollTop - 100
+    state.scrollTop = parked
+    act(() => { el.dispatchEvent(new Event('scroll')) })
+    expect(view.result.current.getFollow()).toBe(false)
     state.scrollHeight += 300
     landHeightCommit(view)
 
     expect(state.scrollTop).toBe(parked)
-    expect(writes.filter((w) => w > parked)).toEqual([])
+    expect(writes.filter((w) => Math.abs(w - bottom()) < 2)).toEqual([])
+    expect(view.result.current.getFollow()).toBe(false)
   })
 
   it('still re-targets the bottom for a genuine reprice mid-turn', () => {

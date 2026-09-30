@@ -32,10 +32,13 @@ from pathlib import Path
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
+from dashboard_owner_helpers import as_owner
 
 from kiro_crew.apps.builtins.meetings.backend import store
 from kiro_crew.apps.builtins.meetings.backend.domain import session as sess
-from kiro_crew.apps.builtins.meetings.backend.routes import _common, register_routes
+from kiro_crew.apps.builtins.meetings.backend.routes import _common
+from kiro_crew.apps.builtins.meetings.backend.routes import audio_import as _audio_import
+from kiro_crew.apps.builtins.meetings.backend.routes import register_routes
 
 
 @pytest.fixture(name="root")
@@ -51,9 +54,11 @@ def reset_module_state_fixture():
     """No test may leak the active meeting or the dictionary into the next one."""
     _common.ACTIVE.clear()
     sess.shared_dictionary().load_terms([])
+    _audio_import._imports_in_flight.clear()
     yield
     _common.ACTIVE.clear()
     sess.shared_dictionary().load_terms([])
+    _audio_import._imports_in_flight.clear()
 
 
 @pytest.fixture(name="enabled")
@@ -68,11 +73,11 @@ def enabled_fixture(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def make_app(root: Path) -> web.Application:
-    """An aiohttp Application carrying only this app's routes."""
+    """An aiohttp Application carrying only this app's routes, called as the owner."""
     application = web.Application()
     application["_meetings_data_root"] = root
     register_routes(application)
-    return application
+    return as_owner(application)
 
 
 @pytest.fixture(name="app")
@@ -92,6 +97,11 @@ class FakeSessionManager:
         self.calls: list[tuple[str, str, str]] = []
         self.released: list[str] = []
         self.fail = fail
+        #: When None, every key reports as live (the default — the gateway's real
+        #: manager has a live session for each slot it created). Set to a concrete
+        #: set to model a sweep having retired some slots out from under a meeting,
+        #: which is what ``MeetingSession.abandoned`` reads.
+        self.live_keys: set[str] | None = None
 
     async def get_or_create(self, key: str, agent: str | None = None, **_kwargs):
         if self.fail:
@@ -100,6 +110,16 @@ class FakeSessionManager:
 
     def release(self, key: str) -> None:
         self.released.append(key)
+
+    def has_session(self, key: str) -> bool:
+        """Whether a live session exists for *key* (mirrors the real manager).
+
+        Defaults to True for every key so tests that do not care about slot
+        liveness are unchanged; assign ``live_keys`` to model a retirement.
+        """
+        if self.live_keys is None:
+            return True
+        return key in self.live_keys
 
     def prompts_for(self, agent_id: str) -> list[str]:
         """Every prompt sent to *agent_id*'s slot, in order."""

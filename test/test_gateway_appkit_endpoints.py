@@ -22,6 +22,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 from chat_test_helpers import _make_app as _make_chat_app
 from chat_test_helpers import _make_state as _make_chat_state
+from dashboard_owner_helpers import as_owner
 
 from kiro_crew.apps.manager import APP_MANIFEST_FILENAME
 from kiro_crew.apps.routes import register_app_routes
@@ -37,6 +38,18 @@ from kiro_crew.dashboard.chat_utils import (
 )
 from kiro_crew.dashboard.handlers import api_mcp_server_detail
 from kiro_crew.dashboard.state import _MAX_PENDING_CONTEXT, DashboardState, _ChatSlot
+
+
+class _StageManager:
+    def running_agents_for(self, _parent: str) -> list[dict]:
+        return []
+
+    async def has_pending_work_for_async(self, _parent: str) -> bool:
+        return False
+
+    async def wait_for_parent_reports(self, _parent: str, _owner: str = "") -> bool:
+        return False
+
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -139,7 +152,20 @@ class TestMcpServerRegistration:
 
     @asynccontextmanager
     async def _make_client(self):
-        app = web.Application()
+        # ``/api/mcp/servers`` is listed in
+        # ``dashboard.server._STRICT_INTERNAL_API_PATHS``, so the transport this
+        # class exercises is the App Kit SDK's: a loopback process presenting
+        # ``X-Internal-Secret``, which ``token_auth`` grants and marks
+        # ``internal_auth``. The handler reads that mark to tell this caller from a
+        # browser session, which must be the dashboard owner, so the fixture has to
+        # publish it the way the middleware does or every request here lands on the
+        # owner gate instead of on the registration behaviour under test.
+        @web.middleware
+        async def _internal_secret_grant(request, handler):
+            request["internal_auth"] = True
+            return await handler(request)
+
+        app = web.Application(middlewares=[_internal_secret_grant])
         app.router.add_put("/api/mcp/servers/{name}", api_mcp_server_detail)
         app.router.add_delete("/api/mcp/servers/{name}", api_mcp_server_detail)
         async with TestClient(TestServer(app)) as c:
@@ -503,9 +529,9 @@ class TestContextDrain:
     def test_drain_formats_context(self):
         """Pending context entries are formatted with source labels.
 
-        Calls the real ``drain_pending_context`` (this test previously
+        Calls the real ``drain_pending_context`` (this test avoids the stub that
         simulated the drain inline, so it kept passing while the production
-        frame changed underneath it — e.g. the #4780 silent-consumption
+        frame changed underneath it — e.g. the silent-consumption
         contract line would never have shown up here).
         """
         from kiro_crew.dashboard.chat_runner import (
@@ -955,7 +981,7 @@ class TestReverseProxy:
 
         try:
             async with self._make_client() as client:
-                # Test path containing space (%20) (#2053)
+                # Test path containing space (%20)
                 resp = await client.get("/apps/proxy-app/api/read?path=/tmp/my%20notes.md")
                 assert resp.status == 200, f"Expected 200, got {resp.status}"
                 data = await resp.json()
@@ -1745,7 +1771,7 @@ class TestNoteEndpoint:
         """The running turn must not consume a note written after it started.
 
         `_run_chat` drains the pending-context queue long after `slot.task` is
-        assigned, so a POST landing in that window used to hand its context to
+        assigned, so a POST landing in that window would hand its context to
         the turn already in flight: the note shaped the request it was written
         after, and the next turn found the queue empty because the drain clears
         it. Both drains are asserted -- the second is what proves it was held
@@ -2390,6 +2416,10 @@ class TestNoteEndpoint:
         class _Req:
             app = {"state": state}
             match_info = {"slot": "s1"}
+            # A real request always exposes both; ``read_bounded_json``
+            # reads them to decide a body is present and declares JSON.
+            can_read_body = True
+            content_type = "application/json"
 
             def get(self, key, default=""):
                 return "owner-app" if key == "app" else default
@@ -2420,6 +2450,10 @@ class TestNoteEndpoint:
         class _Req:
             app = {"state": state}
             match_info = {"slot": "s1"}
+            # A real request always exposes both; ``read_bounded_json``
+            # reads them to decide a body is present and declares JSON.
+            can_read_body = True
+            content_type = "application/json"
 
             def get(self, key, default=""):
                 return "owner-app" if key == "app" else default
@@ -2722,6 +2756,10 @@ class TestNoteEndpoint:
         class _Req:
             app = {"state": state}
             match_info = {"slot": "s1"}
+            # A real request always exposes both; ``read_bounded_json``
+            # reads them to decide a body is present and declares JSON.
+            can_read_body = True
+            content_type = "application/json"
 
             def get(self, key, default=""):
                 return "owner-app" if key == "app" else default
@@ -2803,8 +2841,7 @@ class TestNoteEndpoint:
         state = MagicMock()
         state.broadcast_ws = MagicMock()
         state.push_slots_update = MagicMock()
-        state.subagents = MagicMock()
-        state.subagents.running_agents_for = MagicMock(return_value=[])
+        state.subagents = _StageManager()
 
         slot = _ChatSlot("stage-slot", mode="orchestrator")
         slot._auto_run = False
@@ -2849,8 +2886,7 @@ class TestNoteEndpoint:
         state = MagicMock()
         state.broadcast_ws = MagicMock()
         state.push_slots_update = MagicMock()
-        state.subagents = MagicMock()
-        state.subagents.running_agents_for = MagicMock(return_value=[])
+        state.subagents = _StageManager()
 
         slot = _ChatSlot("stage-slot", mode="orchestrator")
         slot._auto_run = True
@@ -2988,7 +3024,7 @@ class TestAutomaticSuccessorsDoNotConsumeNotes:
     def test_the_stage_loop_still_flushes_on_every_exit_path(self):
         """(c) hazard: withholding must delay delivery, never lose it.
 
-        The stage loop no longer flushes above its auto-go row, so its EXIT call
+        The stage loop does not flush above its auto-go row, so its EXIT call
         is the only delivery point for a plan that runs to completion and then
         idles. That call sits in the function's ``finally`` and is reached by the
         completed, paused and cancelled paths alike -- asserted structurally
@@ -3459,7 +3495,7 @@ class TestUninstallAppSourcesCleanup:
 
     @asynccontextmanager
     async def _make_client(self):
-        app = web.Application()
+        app = as_owner(web.Application())
         register_app_routes(app)
         async with TestClient(TestServer(app)) as c:
             yield c
@@ -3575,7 +3611,18 @@ class TestRegistryInstallStream:
 
     @asynccontextmanager
     async def _make_client(self):
-        app = web.Application()
+        from types import SimpleNamespace
+
+        # Stands in for token_auth_middleware authenticating the dashboard
+        # owner, which the registry-install owner gate requires.
+        @web.middleware
+        async def _owner(request, handler):
+            request["app"] = ""
+            request["user"] = "owner"
+            return await handler(request)
+
+        app = web.Application(middlewares=[_owner])
+        app["state"] = SimpleNamespace(owner_id="owner")
         register_app_routes(app)
         async with TestClient(TestServer(app)) as c:
             yield c
@@ -3612,7 +3659,7 @@ class TestRegistryInstallStream:
         real call performs a fresh, deliberately UNCACHED HTTPS fetch on
         every install (a planted cache row must not supply install
         coordinates), so without this pin the test's verdict depended on
-        live network from the runner (#4236): a transient fetch failure
+        live network from the runner: a transient fetch failure
         takes the fail-closed ``CatalogUnavailable`` branch instead, which
         the companion test below pins separately.
         """
@@ -3642,7 +3689,7 @@ class TestRegistryInstallStream:
         authoritative absence, ``CatalogUnavailable`` means "could not ask" —
         and the install path must refuse rather than fall back to unpinned
         coordinates. Both branches are now deterministic instead of being
-        selected by the CI runner's live network (#4236).
+        selected by the CI runner's live network.
         """
         from kiro_crew.apps import official_catalog
 
@@ -3804,7 +3851,7 @@ class TestInstallFromRegistryLogLines:
         """Pin "catalog reachable, app absent" for the unknown-app path.
 
         These tests exercise the same live-fetching resolution path as
-        ``test_unknown_app_streams_error`` (#4236); without the pin their
+        ``test_unknown_app_streams_error``; without the pin their
         verdict depends on the runner's network.
         """
         monkeypatch.setattr(
@@ -3842,7 +3889,18 @@ class TestRegistryInstallStreamSecurity:
 
     @asynccontextmanager
     async def _make_client(self):
-        app = web.Application()
+        from types import SimpleNamespace
+
+        # Stands in for token_auth_middleware authenticating the dashboard
+        # owner, which the registry-install owner gate requires.
+        @web.middleware
+        async def _owner(request, handler):
+            request["app"] = ""
+            request["user"] = "owner"
+            return await handler(request)
+
+        app = web.Application(middlewares=[_owner])
+        app["state"] = SimpleNamespace(owner_id="owner")
         register_app_routes(app)
         async with TestClient(TestServer(app)) as c:
             yield c

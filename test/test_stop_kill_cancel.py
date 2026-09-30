@@ -307,7 +307,7 @@ class TestKillPathIsPlatformCorrect:
 
     @pytest.mark.asyncio
     async def test_shutdown_falls_back_to_process_kill_when_tree_kill_fails(self):
-        """The fallback that the uncaught AttributeError used to skip.
+        """The fallback that an uncaught AttributeError would skip.
 
         A Windows ``kill_process_tree`` failure must still reach
         ``process.kill()`` -- otherwise a backend that ignores stdin close is
@@ -483,6 +483,7 @@ class TestDetachOnCancelFailure:
 
         class _RaisingBackend:
             supports_caller_identity = True
+            control_plane = False
             quarantined = False
 
             def __init__(self) -> None:
@@ -662,6 +663,8 @@ class TestConservativeShutdown:
         mgr._tasks = {}
         mgr._report_tasks = set()
         mgr._report_owners = {}
+        # The reap coalesces concurrent stops through this per-run map.
+        mgr._reaps_in_flight = {}
         # Fork adaptation: _force_reap pumps the spawn queue after freeing a
         # slot (a1933a4b, ported earlier in this branch); an empty queue makes
         # _drain_queue return immediately without touching other attrs.
@@ -728,6 +731,8 @@ class TestConservativeShutdown:
         mgr._tasks = {}
         mgr._report_tasks = set()
         mgr._report_owners = {}
+        # The reap coalesces concurrent stops through this per-run map.
+        mgr._reaps_in_flight = {}
         # Fork adaptation: see test_session_sharing_never_kills_runtime.
         mgr._queue = []
         mgr._running_count = 2

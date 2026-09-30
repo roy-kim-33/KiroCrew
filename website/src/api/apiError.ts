@@ -1,8 +1,8 @@
 /**
  * The typed API error, its message extraction, and a Response -> error factory.
  *
- * Split out of `api/client.ts` so an APP can import it. `client.ts` is ~3.5k
- * lines and its module graph pulls in `queryClient`, `installApiTransport`,
+ * Split out of `api/client.ts` so an APP can import it. `client.ts` owns the
+ * transport, and its module graph pulls in `queryClient`, `installApiTransport`,
  * artifact-write bookkeeping and the error journal — side effects a standalone
  * app has no business importing just to name an error type. Apps that already
  * import `client.ts` for other reasons are unaffected; the three that do not
@@ -12,6 +12,7 @@
  * import path — and every test that mocks `../api/client` — keeps working.
  */
 import { i18nT } from '../i18n/t'
+import { looksLikeHtmlDocument, edgeChallengeMessage, noteEdgeAuthChallenge } from './edgeAuthChallenge'
 
 /**
  * A failed API call, carrying the HTTP status so callers can branch on specific
@@ -30,14 +31,61 @@ export class ApiError extends Error {
    * authenticates (403 + `X-Auth-Required`). Call sites branch on this to drop
    * retry affordances that cannot succeed until the user re-authenticates. */
   readonly authRequired: boolean
-  constructor(status: number, message: string, body = '', authRequired = false) {
+  /** An interposed proxy answered with its own sign-in page, so no amount of
+   * retrying reaches the gateway at all. Distinct from `authRequired`, which the
+   * gateway's own 403 also sets and whose silent refresh recovers on retry. */
+  readonly edgeChallenge: boolean
+  constructor(
+    status: number,
+    message: string,
+    body = '',
+    authRequired = false,
+    edgeChallenge = false,
+  ) {
     super(message)
     this.name = 'ApiError'
     this.status = status
     this.body = body
     this.authRequired = authRequired
+    this.edgeChallenge = edgeChallenge
   }
 }
+
+/**
+ * True for a rejection that means "the resource is absent" (HTTP 404), as
+ * opposed to a request that FAILED. Duck-typed on `status` rather than
+ * `instanceof ApiError` so a page that reads it keeps working under a mocked
+ * `api/client` (the suites reject with `Object.assign(new Error(), { status })`),
+ * and so any future ApiError-shaped rejection from a different transport counts.
+ */
+export const isNotFoundError = (e: unknown): boolean =>
+  typeof e === 'object' && e !== null && (e as { status?: unknown }).status === 404
+
+/** True when an approval refusal is terminal — the approval itself is gone (404,
+ *  or the endpoint's `no pending approval` 400). Duck-typed like {@link isNotFoundError}. */
+export const isTerminalApprovalRefusal = (e: unknown): boolean => {
+  if (typeof e !== 'object' || e === null) return false
+  const r = e as { status?: unknown; message?: unknown; authRequired?: unknown }
+  // 403 + re-auth leaves the approval live once the user signs back in.
+  if (r.authRequired) return false
+  return r.status === 404 || (r.status === 400 && r.message === 'no pending approval')
+}
+
+/**
+ * Does this failure come from an interposed proxy's own sign-in page?
+ *
+ * Lives here rather than in `api/client` so `api/queryClient` can read it: client
+ * imports queryClient to invalidate caches, so the reverse import would be a cycle.
+ *
+ * Narrower than the gateway's own `authRequired`, deliberately. That 403 also needs a
+ * person, but there `attemptSilentRefresh` plus the one retry recovers a slept-laptop
+ * cookie invisibly -- a successful refresh invalidates only `['auth-me']` and
+ * `staleTime` is `Infinity`, so a query whose retry was cancelled holds an error card
+ * until something else invalidates its key. A proxy challenge has no such recovery:
+ * the request never reached the gateway.
+ */
+export const isEdgeChallengeError = (e: unknown): boolean =>
+  e instanceof ApiError && e.edgeChallenge
 
 /**
  * Map raw edge/proxy error bodies to a human-readable message. A dashboard
@@ -46,6 +94,10 @@ export class ApiError extends Error {
  * — rendering that verbatim in an error card is a terrible UX. The mapped
  * message only ever shows after the QueryClient's 429 retry ladder
  * (api/queryClient.ts) is exhausted.
+ *
+ * Returns `''` for a body carrying no human message, which is the signal every
+ * caller already turns into `HTTP <status>` — so that wording stays decided in
+ * one place. The raw body remains on `ApiError.body` for diagnostics.
  */
 export const friendlyErrText = (status: number, body: string): string => {
   if (status === 429) {
@@ -62,6 +114,9 @@ export const friendlyErrText = (status: number, body: string): string => {
       if (typeof msg === 'string' && msg.trim()) return msg
     } catch { /* not JSON — fall through to raw body */ }
   }
+  // An error PAGE has no message field to unwrap, so returning it verbatim put
+  // `<!DOCTYPE html><html><head><meta charset="utf…` in the dashboard's topbar.
+  if (looksLikeHtmlDocument(trimmed)) return ''
   return body
 }
 
@@ -91,7 +146,25 @@ export const friendlyErrText = (status: number, body: string): string => {
  */
 export async function toApiError(r: Response): Promise<ApiError> {
   const body = await r.text().catch(() => '')
-  const authRequired = r.status === 403 && r.headers?.get?.('X-Auth-Required') === 'true'
-  const message = friendlyErrText(r.status, body) || `HTTP ${r.status}`
-  return new ApiError(r.status, message, body, authRequired)
+  const gatewayAuth = r.status === 403 && r.headers?.get?.('X-Auth-Required') === 'true'
+  // The same refusal reaches app bundles through here, and their `/apps/<app>/api/…`
+  // calls traverse the same proxy, so without this they print a bare `HTTP 403`.
+  // Not consulted when the gateway's own header is present: that header proves the
+  // gateway answered, and its HTML denial page would otherwise match.
+  const edge = gatewayAuth
+    ? null
+    : noteEdgeAuthChallenge(r.status, r.headers?.get?.('content-type') ?? null, body)
+  const message = edgeChallengeMessage(edge)
+    || friendlyErrText(r.status, body)
+    || `HTTP ${r.status}`
+  // Every one of these needs a person: the gateway never saw the request, so a silent
+  // retry a second later reproduces it whether a session lapsed or a firewall refused.
+  const edgeChallenge = edge !== null
+  return new ApiError(
+    r.status,
+    message,
+    body,
+    gatewayAuth || edgeChallenge,
+    edgeChallenge,
+  )
 }

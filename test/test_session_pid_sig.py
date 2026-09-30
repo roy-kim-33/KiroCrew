@@ -36,7 +36,7 @@ def records_from_this_module(caplog, level="ERROR"):
     Nothing about this module had changed.
 
     Scoping by logger name is strictly narrower than scoping by level: these
-    assertions still require an exact count, they just no longer count other
+    assertions still require an exact count, they just do not count other
     people's records as ours.
     """
     return [
@@ -140,7 +140,7 @@ class TestVerify:
 
     def test_tampered_txt_refused(self, cfg):
         """FORGERY: legitimate pair, then the .txt is redirected at another
-        slot — the old signature no longer matches."""
+        slot — the old signature does not match."""
         session_pid_sig.publish_session_pid(4242, SESSION_KEY)
         (cfg / "session_pid_4242.txt").write_text(
             "dashboard:victim", encoding="utf-8"
@@ -237,10 +237,10 @@ class TestLenientReader:
 
 
 class TestPidRecycleGuard:
-    """Issue #8343: the mapping and its MAC bound only the pid NUMBER, so a
-    recycled pid kept verifying and answered with the previous owner's
-    session key until the next restart's orphan sweep. Publication now also
-    records the process START TOKEN (``platform_compat.get_process_start_id``
+    """The mapping and its MAC binding only the pid NUMBER let a recycled pid
+    keep verifying and answer with the previous owner's session key until the
+    next restart's orphan sweep. Publication also records the process START
+    TOKEN (``platform_compat.get_process_start_id``
     — the same incarnation identity ``session_pid.py``'s
     ``<gw>:<pid>:<start_token>`` sweep records use), the signature covers it,
     and BOTH readers refuse on a proven mismatch.
@@ -281,6 +281,31 @@ class TestPidRecycleGuard:
             session_pid_sig.publish_session_pid(4242, SESSION_KEY)
             assert session_pid_sig.verify_session_pid(4242) == SESSION_KEY
             assert session_pid_sig.read_session_pid_txt(4242) == SESSION_KEY
+
+    def test_a_recycled_mapping_attests_no_membership(self, cfg):
+        """A proven recycle discards the TENANT SECTION too, not just the key.
+
+        The roster belonged to the pid's previous owner. Carried through the
+        refusal it would still satisfy ``shared`` (``tenant_count > 1``), which
+        is one half of ``peer_resolve``'s stop condition (``session_key or
+        shared``) -- so a mapping this very function disproved would become the
+        peer walk's ANSWER, and ``admits`` would then deny a legitimate caller
+        against a stale roster with a ``peer_session_mismatch`` 403.
+        """
+        with self._live_token("111"):
+            session_pid_sig.publish_session_pid(
+                4242, SESSION_KEY, co_tenants=[SESSION_KEY, "dashboard:chat-8-999"]
+            )
+        with self._live_token("222"):
+            mapping = session_pid_sig.read_session_pid_mapping(4242)
+        assert mapping.refusal == session_pid_sig.REFUSAL_RECYCLED
+        assert mapping.session_key == ""
+        # The three membership answers a stale mapping must not give.
+        assert mapping.shared is False
+        assert mapping.membership_complete is False
+        assert mapping.admits(SESSION_KEY) is False
+        assert mapping.tenants == ()
+        assert mapping.tenant_count == 0
 
     def test_legacy_tokenless_file_still_resolves(self, cfg):
         """BACKWARD COMPATIBILITY: a signed mapping written before the
@@ -433,8 +458,8 @@ class TestDomainSeparation:
 
 class TestTrustRootRecovery:
     """SEL signs from key bytes it cached at init, while this protocol re-reads
-    the file on every call. Since #2588 the shared accessor re-resolves a key
-    that MOVED (a concurrent legacy -> ``trust/`` migration), so what reaches
+    the file on every call. The shared accessor re-resolves a key that MOVED
+    (a concurrent legacy -> ``trust/`` migration), so what reaches
     recovery is the residue no path can resolve: a key deleted, unreadable,
     truncated, or replaced by bytes that are not the anchor. Those would
     otherwise take this protocol down for the life of the process — with a
@@ -513,7 +538,7 @@ class TestTrustRootRecovery:
 
 
 class TestTrustRootRelocationIsFollowed:
-    """#2588 item 1, from the dependent protocol's side.
+    """Trust-root relocation is followed, from the dependent protocol's side.
 
     Deliberately does NOT use the ``cfg`` fixture: that fixture patches
     ``sel_hmac_key_path`` to a fixed path, which is exactly the seam under test.
