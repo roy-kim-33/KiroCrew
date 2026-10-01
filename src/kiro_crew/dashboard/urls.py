@@ -20,6 +20,7 @@ import ipaddress
 import logging
 import os
 import socket
+import threading
 from pathlib import Path
 from urllib.parse import parse_qs, quote, urlparse
 
@@ -30,15 +31,22 @@ _DEFAULT_PORT = 5476
 _BIND_LOCAL = "127.0.0.1"
 _BIND_ALL = "0.0.0.0"
 
-# Loopback hostnames that all resolve to the same machine but are *distinct
+# Loopback host NAMES that all resolve to the same machine but are *distinct
 # browser origins* (origin = scheme://host:port). The dashboard SPA stores user
 # settings (theme, zoom, layout, ...) in per-origin localStorage, so a user who
 # reaches the dashboard on more than one of these names gets a separate, empty
 # settings bucket each time — settings appear to "reset". We canonicalize
 # navigations among this set onto a single host (see should_canonicalize_host).
-_CANONICALIZABLE_LOOPBACK_HOSTS = frozenset(
-    {"127.0.0.1", "::1", "localhost", "kirocrew.localhost"}
-)
+#
+# The literal addresses are here because this gateway holds BOTH loopback
+# families on its port (see _start_secondary_loopback_site): every name and
+# literal in this set therefore reaches the same listener, so converging them is
+# a spelling change and nothing more. The credential question is handled where it
+# actually arises -- a request CARRYING one is never redirected at all, whatever
+# it names, because a 302 preserves the query (see should_canonicalize_host). That
+# gate does not depend on which families are bound, which matters because the
+# second bind is best-effort and degrades.
+_CANONICALIZABLE_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost", "kirocrew.localhost"})
 
 
 # ---------------------------------------------------------------------------
@@ -52,6 +60,48 @@ def machine_hostname() -> str | None:
         return socket.gethostname()
     except Exception:
         return None
+
+
+#: Ceiling on the startup hostname lookup. The hint it feeds is cosmetic; the
+#: gateway's event loop is not.
+HOSTNAME_RESOLVE_TIMEOUT_SECS = 2.0
+
+
+def _resolve_hostname_bounded(host: str, timeout: float | None = None) -> str | None:
+    """Resolve *host* with a bounded wait.
+
+    ``gethostbyname`` has no timeout, and an unresolved mDNS hostname can stall
+    for 15+ seconds. Gateway startup reaches this helper through
+    ``format_dashboard_urls`` inside ``asyncio.to_thread``, while synchronous
+    CLI setup calls it directly. The bound keeps both startup paths responsive.
+
+    The lookup runs on a daemon thread and is abandoned, not cancelled, on
+    timeout: the resolver call cannot be interrupted, and a leaked daemon thread
+    that ends a few seconds later costs nothing, while a leaked block on the
+    loop costs the gateway.
+    """
+    if timeout is None:
+        timeout = HOSTNAME_RESOLVE_TIMEOUT_SECS
+    result: list[str] = []
+
+    def _lookup() -> None:
+        try:
+            result.append(socket.gethostbyname(host))
+        except Exception:
+            pass
+
+    worker = threading.Thread(target=_lookup, name="kc-hostname-resolve", daemon=True)
+    try:
+        worker.start()
+    except RuntimeError:
+        # Thread exhaustion. This function's whole contract is a BEST-EFFORT
+        # answer -- its one caller uses it only to decide whether to print an
+        # extra `ssh -NL` hint line -- so an unstarted resolver means "unresolved",
+        # not an exception thrown through the code that prints the dashboard's
+        # URLs. Losing a hint line beats losing the banner.
+        return None
+    worker.join(timeout)
+    return result[0] if result else None
 
 
 def is_loopback(host: str) -> bool:
@@ -328,19 +378,27 @@ def should_canonicalize_host(
     *,
     method: str,
     sec_fetch_dest: str | None,
+    carries_credential: bool = False,
 ) -> bool:
     """Return True if a request should be 302-redirected to *canonical_host*.
 
-    Converges loopback aliases (127.0.0.1 / localhost / kirocrew.localhost) onto
-    a single origin so the SPA's per-origin localStorage settings are not split
-    across hostnames (see _CANONICALIZABLE_LOOPBACK_HOSTS). Conservative on every
-    axis so it can never touch a request that isn't a same-machine top-level
-    page navigation:
+    Converges the loopback names AND literals (localhost / kirocrew.localhost /
+    127.0.0.1 / ::1) onto a single origin so the SPA's per-origin localStorage
+    settings are not split across spellings. Converging the literals is safe
+    because this gateway holds both loopback families on its port, so every
+    spelling in that set reaches the same listener (see
+    _CANONICALIZABLE_LOOPBACK_HOSTS). Conservative on every axis so it can never
+    touch a request that isn't a same-machine top-level page navigation:
 
     * only GET/HEAD (never a mutating request),
     * only true top-level document navigations (``Sec-Fetch-Dest: document`` —
       absent/empty/websocket/XHR are left alone, so APIs and WebSockets and
       sub-resource fetches are never redirected),
+    * only when the request carries no credential: a 302 preserves the query, so
+      redirecting a ``?token=`` navigation would hand that bearer to whatever
+      answers the canonical name. The caller decides what counts as a credential;
+      a request bearing one is served where it was sent, and the settings bucket
+      loses a redirect it was never entitled to at that price,
     * only when both the request host and the canonical host are in the
       canonicalizable loopback set (real hostnames / reverse-proxy vhosts are
       never redirected),
@@ -352,6 +410,8 @@ def should_canonicalize_host(
     if method not in ("GET", "HEAD"):
         return False
     if sec_fetch_dest != "document":
+        return False
+    if carries_credential:
         return False
     host = _host_without_port(request_host or "")
     if host not in _CANONICALIZABLE_LOOPBACK_HOSTS:
@@ -394,12 +454,9 @@ def format_dashboard_urls(
     if local_only and not has_custom_host and not _is_remote:
         mh_local = machine_hostname()
         if mh_local and mh_local != "localhost":
-            try:
-                ip = socket.gethostbyname(mh_local)
-                if ip and ip != "127.0.0.1":
-                    lines.append(f"👻 Remote:    ssh -NL {port}:localhost:{port} {mh_local}")
-            except Exception:
-                pass
+            ip = _resolve_hostname_bounded(mh_local)
+            if ip and ip != "127.0.0.1":
+                lines.append(f"👻 Remote:    ssh -NL {port}:localhost:{port} {mh_local}")
 
     proxy = devspaces_proxy_url(port)
     if proxy and not local_only:

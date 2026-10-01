@@ -1,9 +1,9 @@
-"""expected_history_key pin at the tags/folders forced-save call sites (#7519).
+"""expected_history_key pin at the tags/folders forced-save call sites.
 
 ``save_slot_off_loop`` / ``_save_slot_to_history`` resolve their target
 transcript from live routing at write time, so a ``linked_session_key`` rebind
 during the persist await can redirect a durable write to a transcript the
-caller never authorized against. PR #7346 added the ``expected_history_key``
+caller never authorized against. An earlier change added the ``expected_history_key``
 refuse-if-moved pin (save returns ``False``, writing nothing, when the live
 key has moved off the pinned one) and wired it at the autocompact endpoint;
 these tests pin the REMAINING forced-save sites the same way, mirroring
@@ -140,10 +140,9 @@ class TestRefusalDispositionPerSite:
             assert refusing.await_args.kwargs["expected_history_key"] == pinned
 
     @pytest.mark.asyncio
-    async def test_slot_mode_rolls_back_both_fields_and_409(self):
+    async def test_slot_mode_rolls_back_and_409(self):
         slot = _ChatSlot("test")
-        slot.mode = "orchestrator"
-        slot._auto_run = True
+        slot.mode = "custom-mode"
         state = MagicMock(spec=DashboardState)
         state._slots = {slot.key: slot}
         state.push_slots_update = MagicMock()
@@ -154,10 +153,7 @@ class TestRefusalDispositionPerSite:
                 resp = await client.patch("/api/chat/slots/test/mode", json={"mode": ""})
                 assert resp.status == 409
                 assert (await resp.json())["code"] == "session_gone"
-        # Both live fields restored: the mode AND the auto-run flag the
-        # transition cleared on the way through.
-        assert slot.mode == "orchestrator"
-        assert slot._auto_run is True
+        assert slot.mode == "custom-mode"
         assert refusing.await_args.kwargs["expected_history_key"] == pinned
 
     @pytest.mark.asyncio
@@ -305,16 +301,14 @@ class TestRefusalRollbackHardening:
             # While THIS request's save awaits, a concurrent writer commits
             # and is acknowledged; then this save is refused. The stale
             # rollback must not erase the newer value.
-            target.mode = "crew"
+            target.mode = "design-critique"
             return False
 
         with patch("kiro_crew.dashboard.chat_folders.save_slot_off_loop", _concurrent_writer_wins):
             async with TestClient(TestServer(_make_mode_app(state))) as client:
-                resp = await client.patch(
-                    "/api/chat/slots/test/mode", json={"mode": "orchestrator"}
-                )
+                resp = await client.patch("/api/chat/slots/test/mode", json={"mode": ""})
                 assert resp.status == 409
-        assert slot.mode == "crew"
+        assert slot.mode == "design-critique"
 
     @pytest.mark.asyncio
     async def test_tags_rebind_while_waiting_on_lock_is_refused_before_mutation(

@@ -1,5 +1,5 @@
-import { formatShortcut, IS_MAC, shortcutLabel } from '../../hooks/useKeyboardShortcuts'
-import { SHORTCUT_GROUPS, ShortcutRow, KeyCapSequence, GlobalHotkeyRow, PANEL_TOGGLE_LABEL_KEY, groupShortcuts, shortcutGroupLabel, useShortcutPrefs } from '../../components/ShortcutsModal'
+import { IS_MAC } from '../../hooks/useKeyboardShortcuts'
+import { SHORTCUT_GROUPS, ShortcutGroupRows, KeyCapSequence, GlobalHotkeyRow, PANEL_TOGGLE_LABEL_KEY, groupShortcuts, shortcutGroupLabel, shortcutsHelpText, useShortcutPrefs } from '../../components/ShortcutsModal'
 import { SettingsSection, SettingsCard, SettingsToggle, SettingsButtonGroup } from '../../components/settings'
 import { useQuickSearchShortcut } from '../../hooks/useQuickSearchShortcut'
 import { usePanelToggleShortcuts } from '../../hooks/usePanelToggleShortcuts'
@@ -116,7 +116,7 @@ function PanelToggleConfig() {
                 bindings), so the trade is disclosed here, at the moment it is
                 made, rather than left to be discovered by a broken Ctrl+C. */}
             {PANEL_TOGGLES_SKIPPING_SHELL.has(id) && (
-              <div className="text-[12px] text-muted px-2 pb-1">{i18nT('pages.settings.shortcutsPanel.skips_shell_hint')}</div>
+              <div className="text-[12px] text-muted px-2 pb-1">{i18nT(IS_MAC ? 'pages.settings.shortcutsPanel.skips_shell_hint_mac' : 'pages.settings.shortcutsPanel.skips_shell_hint')}</div>
             )}
           </div>
         )
@@ -143,7 +143,7 @@ export function ShortcutsPanel() {
       <SettingsCard>
         <SettingsToggle
           label={i18nT('pages.settings.shortcutsPanel.enable_shortcuts')}
-          description={i18nT('pages.settings.shortcutsPanel.turn_keyboard_shortcuts_on_or_off_globally', { mod: IS_MAC ? '⌥' : 'Alt' })}
+          description={i18nT('pages.settings.shortcutsPanel.turn_keyboard_shortcuts_on_or_off_globally', { chord: shortcutsHelpText() })}
           checked={enabled}
           onChange={toggle}
         />
@@ -167,9 +167,7 @@ export function ShortcutsPanel() {
                 compacted ordinal would shift every later card's delay whenever a
                 group toggles. */}
             <SettingsCard index={gi + 1}>
-              {entries.map(s => (
-                <ShortcutRow key={s.id} label={shortcutLabel(s)} keys={formatShortcut(s).split(' + ')} />
-              ))}
+              <ShortcutGroupRows entries={entries} hintClass="text-[12px] text-muted px-2 pb-1" />
             </SettingsCard>
           </div>
         )

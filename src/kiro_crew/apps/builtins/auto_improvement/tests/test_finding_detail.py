@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+from unittest import mock
 
 import pytest
 from aiohttp import web
@@ -45,8 +46,17 @@ def _write_ledger(root: Path, rows: list[dict]) -> None:
     )
 
 
+@web.middleware
+async def _as_dashboard_owner(request: web.Request, handler):  # type: ignore[no-untyped-def]
+    """Stamp the dashboard owner's claims, as the gateway's token middleware would."""
+    request["app"] = ""
+    request["user"] = "owner-subject"
+    return await handler(request)
+
+
 async def _client() -> TestClient:
-    app = web.Application()
+    app = web.Application(middlewares=[_as_dashboard_owner])
+    app["state"] = mock.MagicMock(owner_id="owner-subject")
     routes.register_routes(app)
     client = TestClient(TestServer(app))
     await client.start_server()
@@ -106,7 +116,7 @@ class TestFindingDetail:
 
     @pytest.mark.asyncio
     async def test_cr_field_is_exposed_as_pr(self, data_home: Path) -> None:
-        """The spine's ledger field is historically ``cr``. The API must surface it
+        """The spine's ledger field is named ``cr``. The API must surface it
         as ``pr`` or the UI never renders a pull-request link."""
         _write_ledger(
             data_home,
@@ -466,8 +476,6 @@ class TestCommitButton:
             src = inspect.getsource(getattr(routes, name))
             # The gate is now ONE shared helper (`_refuse_while_running`) rather than four
             # inline copies — a hand-rolled fourth copy is how the guarded status set drifts.
-            # This test previously grepped for the inline `run_in_progress` literal, and the
-            # refactor tripped it, which is the guard working.
             assert "_refuse_while_running(" in src, f"{name} can act mid-run"
 
         # And the helper itself must still consult the supervisor and refuse with 409.

@@ -16,6 +16,22 @@ const path = require("path");
 
 const KIROCREW_EXE_NAMES = new Set(["kirocrew", "kirocrew-backend"]);
 const PYTHON_EXE_RE = /^(?:python(?:\d+(?:\.\d+)*)?w?|py)$/i;
+// The module a `python -m <module>` gateway is booted from. `kiro_crew` is the
+// core. A composed edition boots from its companion's own top-level module so
+// the composition root runs instead of the core CLI, and the companion is named
+// `kirocrew_<edition>` (the `kirocrew.plugins` entry-point convention the Python
+// side reads in `port_resolution._gateway_module_roots()`). This process has no
+// installed-entry-point view of that Python environment, so it matches the
+// naming convention instead; the core never learns any edition's name. Exact
+// top-level module only: a dotted submodule is not a gateway entry point.
+const KIROCREW_MODULE_RE = /^(?:kiro_crew|kirocrew_[a-z0-9][a-z0-9_]*)$/;
+// A gateway module is only a gateway when argparse's first positional after it
+// is a server subcommand -- the same set `port_resolution._KIROCREW_SERVER_SUBCOMMANDS`
+// gates `kirocrew stop` on. Without this the module name alone would authorize a
+// SIGKILL of any process that merely imports a `kirocrew_*` module on our port.
+// Both constants are pinned to their Python twins by
+// `test/test_cli.py::TestDesktopGatewayIdentityParity`; change them together.
+const KIROCREW_SERVER_SUBCOMMANDS = new Set(["gateway", "dashboard", "start"]);
 
 function commandLineTokens(commandLine) {
   const tokens = [];
@@ -72,23 +88,46 @@ function executableSelector(tokens) {
 
 /**
  * Match only a Kiro Crew executable, or a Python process whose first execution
- * selector invokes the `kiro_crew` module or a Kiro Crew script. Later process
- * arguments never establish ownership, so SSH aliases and unrelated script
- * arguments cannot authorize a kill. Absolute Windows executables must also
- * match the exact path selected by the launch resolver.
+ * selector invokes a Kiro Crew gateway module (`kiro_crew`, or a composed
+ * edition's `kirocrew_<edition>` companion — `KIROCREW_MODULE_RE`) followed by
+ * a server subcommand (`KIROCREW_SERVER_SUBCOMMANDS`), or a Kiro Crew script.
+ * Later process arguments never establish ownership, so SSH aliases and
+ * unrelated script arguments cannot authorize a kill.
+ *
+ * An absolute Windows executable is additionally path-bound: it must be a
+ * file the launch resolver selected. Both sides of the path comparison go
+ * through `canonicalizePath` (a junction-following realpath in production;
+ * identity by default) because a Toolbox-style install launches through a
+ * `current` junction while Windows reports the running process by the
+ * directory the junction resolved to. A path the resolver did not select stays
+ * foreign, so a matching basename elsewhere can still never authorize a kill.
  */
-function isKirocrewCommand(commandLine, { trustedExecutablePaths = [] } = {}) {
+function isKirocrewCommand(
+  commandLine,
+  { trustedExecutablePaths = [], canonicalizePath = () => "" } = {}
+) {
   const tokens = commandLineTokens(commandLine);
   if (!tokens.length) return false;
 
   const windowsExecutablePath = normalizedWindowsAbsolutePath(tokens[0]);
   if (windowsExecutablePath) {
-    const trusted = new Set(
-      trustedExecutablePaths
-        .map(normalizedWindowsAbsolutePath)
-        .filter(Boolean)
-    );
-    if (!trusted.has(windowsExecutablePath)) return false;
+    const canonical = (candidate) => {
+      try {
+        return normalizedWindowsAbsolutePath(canonicalizePath(candidate));
+      } catch {
+        return "";
+      }
+    };
+    const trusted = new Set();
+    for (const candidate of trustedExecutablePaths) {
+      const normalized = normalizedWindowsAbsolutePath(candidate);
+      if (!normalized) continue;
+      trusted.add(normalized);
+      const resolved = canonical(normalized);
+      if (resolved) trusted.add(resolved);
+    }
+    const observed = [windowsExecutablePath, canonical(windowsExecutablePath)];
+    if (!observed.some((candidate) => candidate && trusted.has(candidate))) return false;
   }
 
   const selector = windowsExecutablePath
@@ -106,7 +145,13 @@ function isKirocrewCommand(commandLine, { trustedExecutablePaths = [] } = {}) {
 
   while (index < tokens.length) {
     const token = tokens[index];
-    if (token === "-m") return tokens[index + 1] === "kiro_crew";
+    if (token === "-m") {
+      // Module AND server subcommand, both in their fixed argparse slots. The
+      // subcommand is the first positional after the module, so only that slot
+      // is read: a later argument (`-m kiro_crew run gateway`) never qualifies.
+      return KIROCREW_MODULE_RE.test(tokens[index + 1] || "")
+        && KIROCREW_SERVER_SUBCOMMANDS.has(tokens[index + 2]);
+    }
     if (token === "-c" || token === "-") return false;
     if (token === "--") {
       index += 1;
@@ -312,10 +357,14 @@ async function stopGatewayGracefully(
   if (treeKillInFlight) {
     await Promise.race([
       treeKillInFlight,
-      new Promise((r) => {
-        const t = setTimeout(r, timeoutMs);
-        if (typeof t.unref === "function") t.unref();
-      }),
+      // Deliberately NOT unref()'d. This function is awaited by its caller on a
+      // shutdown path (quit / auto-update), so a live timer here is exactly what
+      // should hold the process open until the backstop fires or the tree kill
+      // settles. An unref'd timer cannot keep the event loop alive on its own;
+      // once nothing else is pending (the common case in a test process, and any
+      // real caller once this is the last outstanding thing) the loop drains and
+      // resolves the surrounding Promise.race before the backstop ever runs.
+      new Promise((r) => { setTimeout(r, timeoutMs); }),
     ]);
   }
 }
@@ -470,7 +519,49 @@ async function forceStopPort(
 }
 
 /**
+ * Is anything holding the LISTEN socket on `port`?
+ *
+ * Most callers need only that, not the holder's identity: they are waiting for a
+ * port to clear, or watching for a service manager to rebind one. The kernel's
+ * pid list answers the question on its own, so this reads no process command
+ * line and consults no identity predicate. A same-user process is therefore
+ * unable to move the verdict by choosing what argv it presents, because nothing
+ * here looks at argv.
+ *
+ *   "bound"   — at least one local pid holds the LISTEN socket.
+ *   "free"    — nothing is listening locally.
+ *   "unknown" — the probe itself could not run (no lsof / EACCES). Distinct from
+ *               "free" so a caller can refuse to act on a port it cannot see,
+ *               exactly as classifyPortOwner's own "unknown" does.
+ *
+ * @param {number} port
+ * @param {object} deps
+ * @param {(port:number)=>Promise<number[]>} deps.getListenPids  lsof -t
+ * @returns {Promise<"bound"|"free"|"unknown">}
+ */
+async function probePortBinding(port, { getListenPids, log = () => {} }) {
+  let pids;
+  try {
+    pids = await getListenPids(port);
+  } catch (e) {
+    log(`port-binding: could not probe :${port} (${e && e.message}) — binding unknown`);
+    return "unknown";
+  }
+  if (!pids.length) {
+    log(`port-binding: :${port} is free`);
+    return "free";
+  }
+  log(`port-binding: :${port} is held by pid ${pids.join(", ")}`);
+  return "bound";
+}
+
+/**
  * Classify who LOCALLY owns the LISTEN socket on `port`.
+ *
+ * Callers that only need to know whether the port is occupied must use
+ * probePortBinding instead: the identity judgement below rests on the holder's
+ * own command line, which a same-user process controls, so spending it on a
+ * question the pid list already answers widens that weakness for no gain.
  *
  * This exists because an HTTP identity probe CANNOT distinguish a local rival
  * gateway from a remote one reached through a port-forward: `ssh -L 5476:...`
@@ -559,6 +650,7 @@ module.exports = {
   stopGatewayGracefully,
   forceStopPort,
   classifyPortOwner,
+  probePortBinding,
   isServiceManaged,
   isKirocrewCommand,
   INIT_PPID,

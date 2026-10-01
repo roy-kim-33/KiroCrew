@@ -15,11 +15,22 @@ compatibility seams through :class:`BackgroundRuntimeDeps`.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
-from collections.abc import AsyncIterator, Callable, Mapping, MutableMapping, Set
+import time
+from collections.abc import AsyncIterator, Callable, MutableMapping, Set
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
+from kiro_crew.agent_scratch import SharedScratchJoinError
+from kiro_crew.agent_sdk.tool_search import ToolSearchSettings
+from kiro_crew.kiro_prerequisite import (
+    identity_park_grace_remaining,
+    pre_spawn_identity,
+    spawn_pid,
+    stamp_spawn_identity,
+)
 from kiro_crew.metrics.sessions import (
     END_REASON_RECYCLED,
     discard_session_start,
@@ -30,10 +41,6 @@ from kiro_crew.metrics.sessions import (
 if TYPE_CHECKING:
     from kiro_crew.acp.types import AcpEvent
     from kiro_crew.providers.base import LLMProvider
-else:
-    # Runtime-importing providers.base from this leaf enters the
-    # providers -> acp -> runtime -> session_pid -> providers cycle.
-    LLMProvider = Any
 
 
 class _BackgroundSessionEntry(Protocol):
@@ -51,21 +58,18 @@ class _BackgroundRuntime(Protocol):
 
     pid: int | None
     acp_backend: str
-    _session_queues: Mapping[str, object]
+    #: The session tree's ``$KIROCREW_SCRATCH`` directory; a replacement inherits it.
+    work_scratch_dir: Path | None
 
     def is_alive(self) -> bool: ...
 
-    def has_active_sessions(self) -> bool: ...
-
     def has_active_or_initializing_sessions(self) -> bool: ...
-
-    def _stale_by_age(self) -> bool: ...
 
     async def _is_stale(self) -> str | None: ...
 
     async def spawn(self) -> None: ...
 
-    async def kill(self, expected: bool = False) -> None: ...
+    async def kill(self, expected: bool = False, reason: str = "") -> None: ...
 
     async def create_session(self, *, agent: str) -> object: ...
 
@@ -84,8 +88,16 @@ class _BackgroundOwner(Protocol):
     _lock: asyncio.Lock
     _closing: bool
     _start_sem: asyncio.Semaphore
+    #: The facade's start-to-registration PID guard (see ``spawn_pid``):
+    #: freshly-started background providers/runtimes are shielded here while
+    #: the spawn-identity stamp read suspends before registration.
+    _starting_pids: set[int]
 
     async def _ensure_background(self) -> None: ...
+
+    def _advance_session_generation(self, key: str) -> int: ...
+
+    def _dispatch_hard_kill(self, provider: LLMProvider) -> None: ...
 
     def _configured_bg_backend_raw(self) -> str | None: ...
 
@@ -106,6 +118,8 @@ class _BackgroundOwner(Protocol):
 
     async def _provider_backed_bg_session(self) -> object: ...
 
+    def get_pid(self, key: str) -> int | None: ...  # pid-owner-ok: _bg runtime owner
+
     async def _reacquire_and_validate(
         self,
         key: str,
@@ -120,6 +134,13 @@ class BackgroundRuntimeState:
     runtime: _BackgroundRuntime | None = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     draining: list[_BackgroundRuntime] = field(default_factory=list)
+    #: The ``$KIROCREW_SCRATCH`` tree the sessions on the ``_bg`` runtime use,
+    #: recorded from every runtime observed in the slot and handed to each
+    #: replacement. State, not a call-local: a stale runtime is detached and
+    #: the slot cleared BEFORE its replacement spawns, so a replacement that
+    #: fails to spawn would otherwise leave the next call with no runtime to
+    #: read the tree from, and its replacement would start an empty one.
+    inherited_scratch: Path | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,6 +160,12 @@ class BackgroundRuntimeDeps:
     acp_backend_kiro: str
     bg_recycle_pct: float
     bg_blind_recycle_prompts: int
+    #: ``session.watchdog_rss_max_mb`` read live, off the same state the cleanup
+    #: sweep's RSS check reads, so a config change applies on the next
+    #: background turn. ``0`` disables the RSS criterion, as it does there.
+    rss_max_mb: Callable[[], int]
+    #: Resident MiB of a pid's whole process tree, or ``None`` when unreadable.
+    tree_rss_mb: Callable[[int], int | None]
     runtime_backends: Callable[[], Set[str]]
     context_pct_is_unknown: Callable[[LLMProvider], bool]
     runtime_types: Callable[
@@ -245,37 +272,80 @@ class BackgroundSessionRuntime:
         # Create outside lock
         if not self._owner._provider_factory:
             return
+        # The permit is retained through stamping AND registration, not just
+        # the process start: the identity sweep drains every cold-start permit
+        # as its quiescence barrier, so releasing the permit while this
+        # provider is started-but-unregistered would let a concurrent sweep
+        # reconcile the store change this spawn straddled while the (possibly
+        # wrong-account) provider is invisible to it -- it would then register,
+        # unstamped by the sweep's epoch handling, after the sweep completed.
+        # Holding the permit keeps this spawn inside the barrier until the
+        # registry can see the result. Explicit acquire/release rather than
+        # ``async with`` so the start-failure return keeps its original
+        # exception semantics while the registration section (whose failures
+        # must PROPAGATE, per the rollback handler below) also stays under the
+        # permit. Lock order matches the sweep's own (permit -> owner._lock).
+        await self._owner._start_sem.acquire()
         try:
-            provider = self._owner._provider_factory(background_key, agent=background_agent)
-            async with self._owner._start_sem:
-                await provider.start()
-        except Exception:
-            logger.warning("Failed to create background session", exc_info=True)
-            return
-        async with self._owner._lock:
-            # _closing is rechecked because the start above spans the window
-            # in which close_all takes its session snapshot: registering now
-            # would leak this provider past graceful shutdown.
-            if not self._owner._closing and background_key not in self._owner._sessions:
-                sess = self._deps.session_factory(
-                    provider=provider,
-                    first_turn=self._deps.first_turn_nothing_armed,
-                    agent=background_agent,
+            try:
+                provider = self._owner._provider_factory(background_key, agent=background_agent)
+                pre_spawn = await pre_spawn_identity(
+                    getattr(self._owner, "spawn_identity_reader", None)
                 )
-                self._owner._sessions[background_key] = sess
-                try:
-                    await record_session_started(background_key)
-                except BaseException:
-                    # Cancelled between registering and recording: roll the entry
-                    # back so no claimant sees a session the caller is tearing
-                    # down, and consume the crumb so it cannot become a false
-                    # crash at the next boot.
-                    if self._owner._sessions.get(background_key) is sess:
-                        del self._owner._sessions[background_key]
-                    await discard_session_start(background_key)
-                    raise
-                logger.info("Background session created")
+                await provider.start()
+            except Exception:
+                logger.warning("Failed to create background session", exc_info=True)
                 return
+            # Best-effort spawn-account record; see flag_identity_stamp_mismatches.
+            # A cancellation landing in this read would leak the started
+            # provider before registration below, so kill it on the way out
+            # (the permit's finally releases the barrier either way). The read
+            # also suspends before the session map can see this provider, so
+            # shield its PID from the orphan sweep for the span.
+            starting_pid = spawn_pid(provider)
+            if starting_pid is not None:
+                self._owner._starting_pids.add(starting_pid)
+            try:
+                try:
+                    await stamp_spawn_identity(
+                        getattr(self._owner, "spawn_identity_reader", None),
+                        provider,
+                        pre_spawn=pre_spawn,
+                    )
+                except BaseException:
+                    self._owner._dispatch_hard_kill(provider)
+                    raise
+                async with self._owner._lock:
+                    # _closing is rechecked because the start above spans the window
+                    # in which close_all takes its session snapshot: registering now
+                    # would leak this provider past graceful shutdown.
+                    if not self._owner._closing and background_key not in self._owner._sessions:
+                        sess = self._deps.session_factory(
+                            provider=provider,
+                            first_turn=self._deps.first_turn_nothing_armed,
+                            agent=background_agent,
+                        )
+                        self._owner._sessions[background_key] = sess
+                        self._owner._advance_session_generation(background_key)
+                        try:
+                            await record_session_started(background_key)
+                        except BaseException:
+                            # Cancelled between registering and recording: roll the entry
+                            # back so no claimant sees a session the caller is tearing
+                            # down, and consume the crumb so it cannot become a false
+                            # crash at the next boot.
+                            if self._owner._sessions.get(background_key) is sess:
+                                del self._owner._sessions[background_key]
+                                self._owner._advance_session_generation(background_key)
+                            await discard_session_start(background_key)
+                            raise
+                        logger.info("Background session created")
+                        return
+            finally:
+                if starting_pid is not None:
+                    self._owner._starting_pids.discard(starting_pid)
+        finally:
+            self._owner._start_sem.release()
         # Racing registration lost, or shutdown began while we were starting:
         # tear the fresh provider down instead of registering it.
         await provider.shutdown()
@@ -308,11 +378,18 @@ class BackgroundSessionRuntime:
         Caller MUST hold ``_bg_runtime_lock``. A runtime that is still busy
         stays parked for the next pass; a failed kill also stays parked so the
         process is retried rather than orphaned. ``kill()`` is called even on an
-        already-dead runtime so it can release PID bookkeeping.
+        already-dead runtime so it can release PID bookkeeping. A runtime the
+        spawn-identity gate parked additionally keeps a kill grace on top of
+        the busy probe (see ``identity_park_grace_remaining``); backend-switch
+        parks carry no mark and keep their original timing.
         """
         logger = self._deps.logger
+        now = time.monotonic()
         remaining: list[_BackgroundRuntime] = []
         for runtime in self._draining_bg_runtimes:
+            if identity_park_grace_remaining(runtime, now) > 0.0:
+                remaining.append(runtime)
+                continue
             try:
                 busy = runtime.is_alive() and runtime.has_active_or_initializing_sessions()
             except Exception:
@@ -325,8 +402,8 @@ class BackgroundSessionRuntime:
                 remaining.append(runtime)
                 continue
             try:
-                await runtime.kill(expected=True)  # drained backend-switch teardown
-                logger.info("Reaped a drained _bg runtime spawned under the previous backend")
+                await runtime.kill(expected=True, reason="drained displacement teardown")
+                logger.info("Reaped a drained displaced _bg runtime (PID %s)", runtime.pid)
             except Exception:
                 logger.warning("Failed to reap a drained _bg runtime; will retry", exc_info=True)
                 remaining.append(runtime)
@@ -340,44 +417,72 @@ class BackgroundSessionRuntime:
     ) -> None:
         """Displace a cached runtime after a configured backend switch.
 
+        Caller MUST hold ``_bg_runtime_lock``. Names the backend-switch cause for
+        :meth:`_detach_bg_runtime_locked`, which owns the policy; kept as its own
+        entry point because the facade and its callers pass the two backends
+        positionally.
+        """
+        await self._detach_bg_runtime_locked(
+            runtime,
+            f"backend switched from {cached_backend!r} to {configured_backend!r}",
+        )
+
+    async def _detach_bg_runtime_locked(
+        self,
+        runtime: _BackgroundRuntime,
+        cause: str,
+        *,
+        park_only: bool = False,
+    ) -> None:
+        """Free the ``_bg`` slot, killing or parking ``runtime`` per its load.
+
         Caller MUST hold ``_bg_runtime_lock``. An idle runtime is killed; a busy
-        one, or one whose kill failed, is parked until its handles drain.
+        one, or one whose kill failed, is parked on ``_draining_bg_runtimes``
+        until its handles drain. ``cause`` is the operator-facing attribution and
+        is logged with every outcome: a staleness recycle and a backend flap have
+        different remedies, so the two must never read alike.
+
+        ``park_only`` parks even an idle runtime instead of killing it here. The
+        periodic sweep uses it, because that caller's idle reading can be one
+        statement stale: ``get_bg_session`` pins the runtime under this lock,
+        RELEASES the lock, and only then calls ``create_session`` -- which is
+        where ``_session_inits_in_flight`` is raised. Killing inside that window
+        would surface as ``AcpRuntimeDead`` on a caller that did nothing wrong.
+        Parking cannot: the reaper re-probes on a later tick, by which time the
+        pinned start has either registered (busy -- it stays parked) or failed.
         """
         logger = self._deps.logger
         try:
             busy = runtime.has_active_or_initializing_sessions()
         except Exception:
             busy = True
-        if busy:
+        if busy or park_only:
             logger.info(
-                "Parking the _bg runtime (PID %s, backend %r) to drain after a "
-                "switch to backend %r",
+                "Parking the _bg runtime (PID %s) to drain — %s",
                 runtime.pid,
-                cached_backend,
-                configured_backend,
+                cause,
             )
             self._draining_bg_runtimes.append(runtime)
             if len(self._draining_bg_runtimes) > 1:
                 # Each entry is a live agent process shielded from the orphan
-                # sweep; more than one parked at a time means backend flapping
-                # is outpacing the drain, which should be visible, not silent.
+                # sweep; more than one parked at a time means displacement is
+                # outpacing the drain, which should be visible, not silent.
                 logger.warning(
-                    "%d _bg runtimes are parked draining after backend switches",
+                    "%d _bg runtimes are parked draining (most recent: %s)",
                     len(self._draining_bg_runtimes),
+                    cause,
                 )
         else:
             logger.info(
-                "Recycling the _bg runtime (PID %s) spawned under backend %r; "
-                "configured backend is now %r",
+                "Recycling the idle _bg runtime (PID %s) — %s",
                 runtime.pid,
-                cached_backend,
-                configured_backend,
+                cause,
             )
             try:
-                await runtime.kill(expected=True)  # deliberate backend-switch teardown
+                await runtime.kill(expected=True, reason="deliberate displacement teardown")
             except Exception:
                 logger.warning(
-                    "Backend-switch kill failed; parking the runtime for the reaper",
+                    "Displacement kill failed; parking the runtime for the reaper",
                     exc_info=True,
                 )
                 self._draining_bg_runtimes.append(runtime)
@@ -403,6 +508,64 @@ class BackgroundSessionRuntime:
             if configured is None or cached_backend == configured:
                 return
             await self._owner._displace_bg_runtime_locked(runtime, cached_backend, configured)
+
+    async def reap_idle_stale_bg_runtime(self) -> bool:
+        """Retire the shared background runtime once it is idle AND stale.
+
+        The staleness ceilings (``_DEFAULT_MAX_AGE_SECS`` 6 h,
+        ``_DEFAULT_MAX_RSS_MB`` 500 MiB) were only ever evaluated on the REUSE
+        path in :meth:`get_bg_session`, and the shared runtime's pid is shielded
+        from the orphan sweep for its whole life. A runtime that stops being
+        reused is therefore never asked the question again and never reaped by
+        anything else: it lives until the gateway restarts. Observed on an
+        operator host: 11 agent runtimes holding 6.0 GB, six of them 14.5 h old
+        and five of those over the 500 MiB ceiling, against 4 live slots.
+
+        This is the periodic caller that asks the question off the reuse path, so
+        a runtime nobody is calling is still bounded. It only ever retires a
+        runtime with NO active or initializing session, and it PARKS rather than
+        kills (see ``park_only`` on :meth:`_detach_bg_runtime_locked`), so a
+        co-tenant session can never be dropped by it. Returns True when the slot
+        was freed.
+        """
+        logger = self._deps.logger
+        async with self._bg_runtime_lock:
+            if self._owner._closing:
+                # Same gate as every other park: a shutdown has already swept
+                # past, so parking now would strand a shielded process.
+                return False
+            runtime = self._bg_runtime
+            if runtime is None or not runtime.is_alive():
+                return False
+            try:
+                if runtime.has_active_or_initializing_sessions():
+                    return False
+            except Exception:
+                # Fail toward preserving work: a probe that cannot answer must
+                # not retire a runtime whose handles may be live.
+                logger.debug("idle-stale sweep: session probe failed", exc_info=True)
+                return False
+            try:
+                stale_reason = await runtime._is_stale()
+            except Exception:
+                logger.debug("idle-stale sweep: staleness probe failed", exc_info=True)
+                return False
+            if not stale_reason:
+                return False
+            # Re-read the slot: the awaited staleness probe releases the event
+            # loop, and a concurrent displacement may have replaced or cleared it
+            # while we were off it. Retiring on the stale reading of a runtime
+            # other than the one in the slot would park somebody else's live
+            # process.
+            if self._bg_runtime is not runtime:
+                return False
+            # ``_detach_bg_runtime_locked`` clears the slot itself on every path.
+            await self._detach_bg_runtime_locked(
+                runtime,
+                f"idle and stale by {stale_reason} (periodic sweep)",
+                park_only=True,
+            )
+            return True
 
     async def _provider_backed_bg_session(self) -> object:
         """Return the shared provider-backed background-session adapter."""
@@ -455,6 +618,16 @@ class BackgroundSessionRuntime:
                     )
                 await self._owner._reap_drained_bg_runtimes_locked()
                 runtime = self._bg_runtime
+                # The runtime this call may replace, read before any detach
+                # clears the slot: its work directory is what every replacement
+                # inherits (see the spawn below). Kept on the STATE, not in a
+                # local: a detach followed by a failed replacement spawn leaves
+                # the slot empty for the next call, which must still hand the
+                # tree on. Read the way this block reads ``acp_backend``; a
+                # value that is not a path is no inheritance.
+                predecessor_scratch = getattr(runtime, "work_scratch_dir", None)
+                if isinstance(predecessor_scratch, Path):
+                    self.state.inherited_scratch = predecessor_scratch
                 configured_backend_raw = self._owner._configured_bg_backend_raw()
                 configured_backend = (
                     configured_backend_raw
@@ -474,24 +647,21 @@ class BackgroundSessionRuntime:
                             cached_backend,
                             configured_backend_raw,
                         )
-                    elif not runtime.has_active_sessions():
-                        reason = await runtime._is_stale()
-                        if reason:
-                            logger.info(
-                                "get_bg_session: recycling stale _bg runtime "
-                                "(PID %s, reason=%s)",
-                                runtime.pid,
-                                reason,
+                    else:
+                        # Age AND RSS are probed whether or not co-tenant
+                        # handles are live: a multiplexed runtime that never
+                        # reaches a zero-session window would otherwise never
+                        # be bounded at all, which is how this process was
+                        # observed growing to multi-GB RSS over a day of
+                        # uptime. Displacing a busy runtime does not interrupt
+                        # it — it is parked to drain, and only new callers are
+                        # moved to the replacement.
+                        stale_reason = await runtime._is_stale()
+                        if stale_reason:
+                            await self._detach_bg_runtime_locked(
+                                runtime,
+                                f"stale by {stale_reason}",
                             )
-                            await runtime.kill(expected=True)  # deliberate staleness recycle
-                            self._bg_runtime = None
-                    elif runtime._stale_by_age():
-                        logger.info(
-                            "get_bg_session: _bg runtime (PID %s) stale by age "
-                            "but has %d active session(s); deferring recycle",
-                            runtime.pid,
-                            len(runtime._session_queues),
-                        )
 
                 if runtime_capable and (
                     self._bg_runtime is None or not self._bg_runtime.is_alive()
@@ -500,20 +670,130 @@ class BackgroundSessionRuntime:
                     # its PID tracking + sweep-protection shield.
                     if self._bg_runtime is not None:
                         try:
-                            await self._bg_runtime.kill()
+                            await self._bg_runtime.kill(
+                                expected=True, reason="background runtime reap"
+                            )
                         except Exception:
                             logger.debug(
                                 "get_bg_session: dead _bg runtime kill failed",
                                 exc_info=True,
                             )
-                    runtime = AcpRuntime(
-                        agent=self._deps.runtime_agent,
-                        sandbox_mode=getattr(self._owner._cfg.agent, "sandbox", "auto"),
-                        acp_backend=configured_backend,
-                        expect_mcp_reports=False,
+                    agent_cfg = self._owner._cfg.agent
+
+                    # The replacement takes over the sessions the previous
+                    # runtime served, so it takes over their work directory
+                    # too: without this a recycle (age, RSS, backend flap, a
+                    # crash) hands every session on the runtime an EMPTY
+                    # ``$KIROCREW_SCRATCH`` mid-task, and the files it staged
+                    # for its subagents are masked from the new process.
+                    # The successor joins the directory's owner marker beside
+                    # the draining predecessor at spawn; a swept directory is
+                    # dropped there.
+                    def build_runtime(shared_scratch: Path | None) -> Any:
+                        return AcpRuntime(
+                            agent=self._deps.runtime_agent,
+                            sandbox_mode=getattr(agent_cfg, "sandbox", "auto"),
+                            acp_backend=configured_backend,
+                            expect_mcp_reports=False,
+                            shared_scratch=shared_scratch,
+                            # Same operator choice the foreground provider threads
+                            # in; on a wire-settings host the runtime sends it
+                            # explicitly (gated on the background agent's own
+                            # loader grant) rather than leaving it to the host's
+                            # default.
+                            tool_search=ToolSearchSettings.from_config(
+                                getattr(agent_cfg, "tool_search", True),
+                                getattr(agent_cfg, "tool_search_min_pct", None),
+                                getattr(agent_cfg, "tool_search_min_tokens", None),
+                            ),
+                        )
+
+                    replacement = build_runtime(self.state.inherited_scratch)
+                    # Bracket the spawn with identity reads so the runtime
+                    # carries a spawn stamp: sessions demuxed onto it inherit
+                    # its credential, and the registry pass in
+                    # ``flag_identity_stamp_mismatches`` can only compare a
+                    # stamp that was recorded. Unstamped would be fail-safe but
+                    # silently blind for this runtime's whole lifetime.
+                    pre_spawn = await pre_spawn_identity(
+                        getattr(self._owner, "spawn_identity_reader", None)
                     )
-                    await runtime.spawn()
-                    self._bg_runtime = runtime
+                    try:
+                        await replacement.spawn()
+                    except SharedScratchJoinError:
+                        # Only the INHERITED tree's marker: the spawner raises
+                        # this subclass at its adopt site alone, so a failure on
+                        # the replacement's OWN marker (plain
+                        # ScratchBoundaryError) propagates with the inherit kept
+                        # -- that tree still holds the sessions' staged work and
+                        # says nothing about why the own marker was tampered.
+                        abandoned = self.state.inherited_scratch
+                        if abandoned is None:
+                            raise
+                        # The inherited tree is mounted read-write into every
+                        # agent process the predecessor served, so its owner
+                        # marker can be replaced with a link from inside the
+                        # sandbox. The spawn refused to join it (the right
+                        # answer for that spawn); keeping the inherit would make
+                        # EVERY replacement refuse the same way and leave the
+                        # ``_bg`` slot without a runtime for good. Abandon the
+                        # inherit instead: the sessions lose their staged files
+                        # to the tampering, the tree stays on disk for a human,
+                        # and the slot recovers.
+                        self.state.inherited_scratch = None
+                        logger.warning(
+                            "get_bg_session: the inherited work directory %r could not be "
+                            "joined; abandoning it so the background runtime can be "
+                            "replaced (its files stay on disk, unowned)",
+                            abandoned.name,
+                            exc_info=True,
+                        )
+                        replacement = build_runtime(None)
+                        # A fresh spawn needs its own bracket: the first
+                        # pre-read bounded the FAILED spawn, not this one.
+                        pre_spawn = await pre_spawn_identity(
+                            getattr(self._owner, "spawn_identity_reader", None)
+                        )
+                        await replacement.spawn()
+                    # Best-effort spawn-account record on the runtime object
+                    # itself (the registry gate reads ``runtime.spawn_identity``
+                    # directly); see flag_identity_stamp_mismatches. A
+                    # cancellation landing in this read would leak the spawned
+                    # replacement before it becomes ``_bg_runtime``, so tear
+                    # it down on the way out. The read also suspends before
+                    # the ``_bg`` slot (the orphan sweep's companion-PID
+                    # union) can see it, so shield its PID for the span.
+                    starting_pid = spawn_pid(replacement)
+                    if starting_pid is not None:
+                        self._owner._starting_pids.add(starting_pid)
+                    try:
+                        try:
+                            await stamp_spawn_identity(
+                                getattr(self._owner, "spawn_identity_reader", None),
+                                replacement,
+                                pre_spawn=pre_spawn,
+                            )
+                        except BaseException:
+                            with contextlib.suppress(Exception):
+                                await replacement.kill(
+                                    expected=True,
+                                    reason="spawn-stamp interrupted before registration",
+                                )
+                            raise
+                        self._bg_runtime = replacement
+                    finally:
+                        if starting_pid is not None:
+                            self._owner._starting_pids.discard(starting_pid)
+                    # Recorded NOW, off the live runtime, not at the next
+                    # acquisition: a backend switch retires the runtime through
+                    # _retire_stale_backend_bg_runtime without another call
+                    # reading it as a predecessor, and a tree nobody remembered
+                    # is swept an hour after its owner exits -- switching back
+                    # would start empty. Also the truth when the inherit was
+                    # dropped (swept) or abandoned: the tree this runtime HAS.
+                    live_tree = getattr(replacement, "work_scratch_dir", None)
+                    if isinstance(live_tree, Path):
+                        self.state.inherited_scratch = live_tree
                 # Pinned under the lock: use the selected object even if a later
                 # displacement changes the shared slot.
                 selected = self._bg_runtime if runtime_capable else None
@@ -533,7 +813,9 @@ class BackgroundSessionRuntime:
                 async with self._bg_runtime_lock:
                     if self._bg_runtime is not None and not self._bg_runtime.is_alive():
                         try:
-                            await self._bg_runtime.kill()
+                            await self._bg_runtime.kill(
+                                expected=True, reason="background runtime reap"
+                            )
                         except Exception:
                             logger.debug(
                                 "get_bg_session: dead _bg runtime kill failed",
@@ -541,6 +823,43 @@ class BackgroundSessionRuntime:
                             )
                         self._bg_runtime = None
         raise AcpRuntimeDead("get_bg_session exhausted retries")
+
+    async def _rss_recycle_reason(self, background_key: str) -> str | None:
+        """The recycle reason when the background tree is at or over its ceiling.
+
+        The ceiling is ``session.watchdog_rss_max_mb``; ``0`` disables the check.
+        The RSS sweep in ``session_cleanup`` skips persistent keys and the
+        background key is one, so this is the only path that compares this
+        runtime's tree against that number. It belongs here rather than there
+        because the sweep resets a session in place, while ``recycle_background``
+        spawns the replacement before retiring the old provider.
+
+        A pid with no reading, or a reading that raises, yields ``None`` so the
+        context and prompt criteria decide the turn on their own.
+        """
+        ceiling = self._deps.rss_max_mb()
+        if ceiling <= 0:
+            return None
+        # This module owns the background runtime: it spawns the provider, is the
+        # one place that retires it, and the background key is a pool of one, so
+        # the reading below attributes the tree to the session that alone holds it.
+        pid = self._owner.get_pid(background_key)  # pid-owner-ok: owns the _bg runtime
+        if pid is None:
+            return None
+        try:
+            # Off-loop: the reading walks ``/proc`` for the whole tree, and this
+            # runs after every background turn.
+            rss = await asyncio.to_thread(self._deps.tree_rss_mb, pid)
+        except Exception:
+            self._deps.logger.debug(
+                "recycle_background: tree RSS read failed for pid %s",
+                pid,
+                exc_info=True,
+            )
+            return None
+        if rss is None or rss < ceiling:
+            return None
+        return f"tree rss={rss}MB exceeds {ceiling}MB"
 
     async def recycle_background(self) -> None:
         """Recycle the persistent background provider when context is full."""
@@ -564,49 +883,86 @@ class BackgroundSessionRuntime:
             session.prompt_count += 1
 
             pct = provider.context_usage_pct()
-            needs_recycle = pct >= self._deps.bg_recycle_pct
             post_compaction = pct == 0.0 and self._deps.context_pct_is_unknown(provider)
-            if not needs_recycle and post_compaction:
-                needs_recycle = True
-            elif not needs_recycle and pct == 0.0:
-                needs_recycle = session.prompt_count >= self._deps.bg_blind_recycle_prompts
-
-            if not needs_recycle:
-                return
-
-            if pct > 0:
+            if pct >= self._deps.bg_recycle_pct:
                 reason = f"context at {pct:.0f}%"
             elif post_compaction:
                 reason = "compacted in place (context size unknown)"
+            elif session.prompt_count >= self._deps.bg_blind_recycle_prompts:
+                # The prompt backstop is deliberately NOT gated on pct == 0.0.
+                # Background turns are tiny text prompts that never approach the
+                # percentage threshold, so keying the backstop on "the backend
+                # reports nothing" retired it permanently the moment any real
+                # percentage was read — leaving this provider with no lifetime
+                # bound at all for the rest of the gateway's uptime.
+                reason = f"blind ({session.prompt_count} prompts, context at {pct:.0f}%)"
+            elif (rss_reason := await self._rss_recycle_reason(background_key)) is not None:
+                # Last, so the cheaper criteria keep naming themselves and the
+                # tree walk is spent only on a turn that would otherwise keep
+                # this provider. A background transcript of oversized records
+                # drives the runtime past the ceiling long before either of the
+                # criteria above fires, which is the whole gap this closes.
+                reason = rss_reason
             else:
-                reason = f"blind ({session.prompt_count} prompts)"
+                return
             logger.info("Recycling background session — %s", reason)
 
             if not self._owner._provider_factory:
                 return
             # Spawn the replacement BEFORE tearing the old one down: a failed
-            # spawn leaves the working session in place.
+            # spawn leaves the working session in place. As in
+            # ``_ensure_background``, the permit is retained through stamping
+            # and adoption so the identity sweep's permit barrier covers the
+            # whole started-but-not-yet-adopted window (permit -> owner._lock,
+            # the sweep's own lock order).
+            await self._owner._start_sem.acquire()
             try:
-                replacement = self._owner._provider_factory(
-                    background_key,
-                    agent=background_agent,
-                )
-                async with self._owner._start_sem:
+                try:
+                    replacement = self._owner._provider_factory(
+                        background_key,
+                        agent=background_agent,
+                    )
+                    pre_spawn = await pre_spawn_identity(
+                        getattr(self._owner, "spawn_identity_reader", None)
+                    )
                     await replacement.start()
-            except Exception:
-                logger.warning(
-                    "Background session recycle kept the old provider — "
-                    "replacement failed to start",
-                    exc_info=True,
-                )
-                return
+                except Exception:
+                    logger.warning(
+                        "Background session recycle kept the old provider — "
+                        "replacement failed to start",
+                        exc_info=True,
+                    )
+                    return
+                # Best-effort spawn-account record; see flag_identity_stamp_mismatches.
+                # A cancellation landing in this read would leak the started
+                # replacement before adoption below, so kill it on the way out.
+                # The read also suspends before adoption makes the PID visible
+                # through the session map, so shield it for the span.
+                starting_pid = spawn_pid(replacement)
+                if starting_pid is not None:
+                    self._owner._starting_pids.add(starting_pid)
+                try:
+                    try:
+                        await stamp_spawn_identity(
+                            getattr(self._owner, "spawn_identity_reader", None),
+                            replacement,
+                            pre_spawn=pre_spawn,
+                        )
+                    except BaseException:
+                        self._owner._dispatch_hard_kill(replacement)
+                        raise
 
-            async with self._owner._lock:
-                # Lifecycle methods do not take the turn semaphore, so the entry
-                # can still have moved while the replacement was starting.
-                adopted = self._owner._sessions.get(background_key) is session
-                if adopted:
-                    session.adopt_provider(replacement)
+                    async with self._owner._lock:
+                        # Lifecycle methods do not take the turn semaphore, so the entry
+                        # can still have moved while the replacement was starting.
+                        adopted = self._owner._sessions.get(background_key) is session
+                        if adopted:
+                            session.adopt_provider(replacement)
+                finally:
+                    if starting_pid is not None:
+                        self._owner._starting_pids.discard(starting_pid)
+            finally:
+                self._owner._start_sem.release()
 
             doomed = provider if adopted else replacement
             try:
@@ -637,6 +993,7 @@ class BackgroundSessionRuntime:
         # deliberately cycle-scoped, never per concurrently gathered task.
         async with self._owner._lock:
             old = self._owner._sessions.pop(heartbeat_key, None)
+            self._owner._advance_session_generation(heartbeat_key)
             if old:
                 # Same tick as the pop, before the shutdown await. An unrecorded
                 # removal here does not merely lose a sample: the start crumb

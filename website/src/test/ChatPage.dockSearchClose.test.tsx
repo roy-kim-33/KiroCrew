@@ -16,11 +16,15 @@
  * props) with the find pane open and asserts the find input disappears and the
  * target panel appears.
  *
- * Uses the REAL usePanelState / useDiffPanel / useMessageSearch hooks so the
+ * The Dashboard dock (CommandCenterDock) is the third such opener: its
+ * open-panel action must land on a visible panel, not one mounted and hidden
+ * behind the find pane.
+ *
+ * Uses the REAL useMessageSearch hook so the
  * single-dock precedence + close-on-open wiring is exercised end to end.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { render, screen, fireEvent, waitFor, act } from '@testing-library/react'
+import { render, screen, fireEvent, waitFor, act, within } from '@testing-library/react'
 import type { ReactNode } from 'react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { Provider } from 'react-redux'
@@ -56,8 +60,8 @@ vi.mock('../components/DiffPanel', async () => {
 })
 
 // Everything else ChatPage pulls in that is irrelevant to dock/search wiring.
-// NOTE: usePanelState / useDiffPanel / useMessageSearch are intentionally NOT
-// mocked — the test exercises the real hooks. DetailPanel + SearchBar are also
+// NOTE: useMessageSearch is intentionally NOT
+// mocked — the test exercises the real hook. DetailPanel + SearchBar are also
 // real so the find pane and diff pane actually mount/unmount.
 vi.mock('react-virtuoso', () => ({ Virtuoso: () => null }))
 // The real message list uses a custom virtualizer (useVirtualChat) driven by
@@ -119,7 +123,8 @@ vi.mock('../api/client', () => ({
     get: (_t, prop: string) => {
       if (!(prop in apiMocks)) {
         apiMocks[prop] = vi.fn().mockResolvedValue(
-          prop === 'chatSlotDetail' ? { messages: [], has_more: false, total: 0 } : {},
+          prop === 'chatSlotDetail' ? { messages: [], has_more: false, total: 0 }
+            : prop === 'pendingQuestions' || prop === 'approvals' ? [] : {},
         )
       }
       return apiMocks[prop]
@@ -137,13 +142,24 @@ Object.defineProperty(window, 'matchMedia', {
     addEventListener: vi.fn(), removeEventListener: vi.fn(), dispatchEvent: vi.fn(),
   })),
 })
-globalThis.fetch = vi.fn().mockResolvedValue({
+// The file-read stub. Re-installed in `beforeEach` below as well: the MSW
+// server in integration/setup.ts patches `globalThis.fetch` in `beforeAll`,
+// which runs AFTER this module-level assignment, so without the re-install the
+// read lands on the mock server's 501 catch-all — and a failed read no longer
+// opens a tab (it reports through the pane notice), so the panel never shows.
+const fileReadStub = () => vi.fn().mockResolvedValue({
   ok: true, status: 200,
+  // A real Response always carries headers, and the read path asks this one
+  // whether the file is binary. Using the platform's own Headers keeps the mock
+  // Response-shaped rather than growing a bespoke getter per field read.
+  headers: new Headers(),
   text: () => Promise.resolve('file content'),
   json: () => Promise.resolve({}),
 }) as never
+globalThis.fetch = fileReadStub()
 
-import ChatPage, { virtualKeyFor, turnLeadKey } from '../pages/ChatPage'
+import ChatPage from '../pages/ChatPage'
+import { virtualKeyFor, turnLeadKey } from '../pages/chat/ChatPageMessageContent'
 import type { DisplayItem } from '../pages/chat/types'
 import type { ChatMessage } from '../types'
 
@@ -154,16 +170,20 @@ const ASSISTANT_MSG = {
   meta: { file_changes: [{ path: '/f.txt', status: 'modified' }] },
 }
 
-const renderChatPage = () => {
+const renderChatPage = ({ withWorker = false } = {}) => {
   const slot = { key: 'chat-1', title: 'chat-1', messages: 1, running: false, mode: '', created: '', last_ts: '' }
-  apiMocks.chatSlots = vi.fn().mockResolvedValue([slot])
+  // A subagent slot the active chat spawned makes the Dashboard dock
+  // `relevant` (useCommandCenter scopes more than one slot to this root).
+  const worker = { key: 'worker-1', title: 'worker', messages: 0, running: true, mode: '', created: '', last_ts: '', created_by: 'chat-1' }
+  const slots = withWorker ? [slot, worker] : [slot]
+  apiMocks.chatSlots = vi.fn().mockResolvedValue(slots)
   // On mount ChatPage loads the active slot's detail; return the seeded
   // message so the post-mount reconcile keeps it (an empty list would wipe it).
   apiMocks.chatSlotDetail = vi.fn().mockResolvedValue({ messages: [ASSISTANT_MSG], has_more: false, total: 1 })
   const store = createTestStore({
     dashboard: {
       status: { platform: 'darwin' }, connected: false,
-      slots: [slot], approvalMode: 'normal', channelTrusted: false, refreshTrigger: 0,
+      slots, approvalMode: 'normal', channelTrusted: false, refreshTrigger: 0,
       unreadSlots: [], updateProgress: null,
       subagentRunning: {}, subagentDetails: {}, subagentText: {},
       sessionDefaultColor: null, sessionColorsMode: 'tint', sessionColorsPalette: 'horizon', sessionColorsIntensity: 'clear',
@@ -213,6 +233,7 @@ const openFind = () => {
 describe('ChatPage – opening a dock panel closes the find pane', () => {
   beforeEach(() => {
     Object.keys(apiMocks).forEach(k => delete apiMocks[k])
+    globalThis.fetch = fileReadStub()
   })
 
   it('Ctrl+F opens the find pane', async () => {
@@ -255,6 +276,26 @@ describe('ChatPage – opening a dock panel closes the find pane', () => {
     await waitFor(() => {
       expect(screen.getByTestId('md-panel')).toBeTruthy()
       expect(screen.queryByPlaceholderText(FIND_PLACEHOLDER)).toBeNull()
+    })
+  })
+
+  it('the dock\'s open-panel action closes the find pane and shows the command-center panel', async () => {
+    localStorage.clear()
+    renderChatPage({ withWorker: true })
+    const card = await screen.findByTestId('command-center-dock')
+    openFind()
+    expect(await screen.findByPlaceholderText(FIND_PLACEHOLDER)).toBeTruthy()
+
+    act(() => {
+      fireEvent.click(within(card).getByRole('button', { name: 'Open Dashboard' }))
+    })
+
+    // The panel must be visible, not mounted-and-hidden behind the find pane.
+    await waitFor(() => {
+      expect(screen.queryByPlaceholderText(FIND_PLACEHOLDER)).toBeNull()
+      const heading = document.querySelector<HTMLElement>('[data-command-center-heading]')
+      expect(heading).toBeTruthy()
+      expect(heading!.closest('[hidden]')).toBeNull()
     })
   })
 })
@@ -347,10 +388,10 @@ describe('virtualKeyFor — #253 stability extended to the virtualizer/HeightCac
   it('two sibling groups whose leads share a coarse-clock ts get DISTINCT keys (mid tie-break)', () => {
     const msgKey = makeMsgKey()
     // The reducer explicitly supports distinct rows stamped in the same OS
-    // tick (see isRedeliveredMessage in chatSlice) — row identity is meta.mid.
-    // The index key this change replaces was unique by construction; the mid
-    // tie-break keeps that property so sibling groups never alias each
-    // other's HeightCache entry or React key.
+    // tick (see isRedeliveredMessage in transcript.ts under store/chat) — row
+    // identity is meta.mid. The index key this change replaces was unique by
+    // construction; the mid tie-break keeps that property so sibling groups
+    // never alias each other's HeightCache entry or React key.
     const a: DisplayItem = {
       kind: 'group',
       msgs: [{ role: 'tool', content: '🔧 grep', cls: '', ts: 'tick-7', meta: { mid: 'm-1' } }],

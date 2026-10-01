@@ -13,11 +13,11 @@ from types import SimpleNamespace
 from typing import Any
 
 from kiro_crew.acp.types import EVENT_COMPLETE, EVENT_TEXT_CHUNK
+from kiro_crew.messaging.commands import compact_refusal_plain_text
 from kiro_crew.messaging.driver import APPROVAL_AUTO
 from kiro_crew.messaging.transport import InboundMessage
 from kiro_crew.session_allocation import SessionClosingError
 from kiro_crew.whatsapp.commands import (
-    COMPACT_AUTO_MANAGED_TEXT,
     COMPACT_AUTO_TEXT,
     COMPACT_BUSY_TEXT,
     COMPACT_FAILED_TEXT,
@@ -103,6 +103,7 @@ class FakeSessions:
         #: channel, which is the only case an unseeded counter gets right.
         self.persisted_generations = dict(persisted_generations or {})
         self.generation_lookups: list[str] = []
+        self.reserved_generations: list[str] = []
         self._busy = busy
         self.released = 0
         self.successes = 0
@@ -130,6 +131,12 @@ class FakeSessions:
 
     def has_session(self, key: str) -> bool:
         return self._session_exists
+
+    def reserve_generation(self, session_key: str) -> None:
+        self.reserved_generations.append(session_key)
+
+    async def aflush(self) -> None:
+        return None
 
     def max_generation(self, bucket: str) -> int:
         self.generation_lookups.append(bucket)
@@ -213,6 +220,7 @@ class FakeTransport:
         self.pending_verdicts: dict[int, GroupVerdict] = {}
         self.group_gate = FakeGroupGate()
         self.pending_message_id: dict[int, str] = {}
+        self.pending_original: dict[int, tuple[str, int]] = {}
         #: Phase reactions go through the TRANSPORT, not the client: it owns the
         #: echo tracker, because a reaction is a message and echoes back.
         self.reactions: list[tuple[str, str]] = []
@@ -264,6 +272,8 @@ def _make(provider=None, busy=False, transport_fail=False, **session_kwargs):
 
 
 _DM = "447700900000@s.whatsapp.net"
+
+
 _GROUP = "12345-67890@g.us"
 
 
@@ -305,14 +315,43 @@ def test_group_scope_uses_forum_chat_type_in_session_key():
 # ── dispatcher: commands ────────────────────────────────────────────────────
 def test_new_command_starts_a_fresh_session_without_a_turn():
     provider = FakeProvider()
-    d, _client, _sessions, transport = _make(provider=provider)
+    d, _client, sessions, transport = _make(provider=provider)
     before = d._session_key(_DM)
     asyncio.run(d.handle_message(_msg("/new")))
     after = d._session_key(_DM)
 
     assert provider.prompts == []  # no LLM turn for a command
     assert before != after  # generation advanced
+    assert sessions.reserved_generations == [after]
     assert any("fresh session" in t.lower() for _, t in transport.sent)
+
+
+def test_update_pause_spools_dm_new_before_generation_side_effects(monkeypatch):
+    import kiro_crew.messaging.dispatch as dispatch
+
+    d, _client, sessions, transport = _make(provider=FakeProvider())
+    sessions.reserve_inbound_callback = lambda: None
+    inbound = _msg("/new")
+    transport.pending_original[id(inbound)] = ("/new", 0)
+    spooled: list[tuple[str, Any]] = []
+
+    async def capture(*, channel_type, route):
+        spooled.append((channel_type, route))
+
+    monkeypatch.setattr(dispatch, "spool_refused_turn", capture)
+    before = d._session_key(_DM)
+
+    asyncio.run(d.handle_message(inbound))
+
+    assert d._session_key(_DM) == before
+    assert sessions.reserved_generations == []
+    assert transport.sent == []
+    assert len(spooled) == 1
+    channel_type, refused = spooled[0]
+    assert channel_type == "whatsapp"
+    assert refused is not None
+    assert refused.conversation_id == _DM
+    assert refused.text == "/new"
 
 
 def test_compact_command_compacts_in_place_without_a_turn():
@@ -327,13 +366,16 @@ def test_compact_command_compacts_in_place_without_a_turn():
 
 def test_compact_command_declined_on_auto_managed_backend():
     # A backend that cannot serve /compact gets the informational reply and
-    # compact() is NEVER dispatched (#8156).
+    # compact() is NEVER dispatched.
     provider = FakeProvider()
     provider.manual_compact_unsupported_backend = "kas"
     d, _client, sessions, transport = _make(provider=provider)
     asyncio.run(d.handle_message(_msg("/compact")))
     assert (provider.compacts, provider.waits) == (0, 0)
-    assert [t for _, t in transport.sent] == [COMPACT_AUTO_MANAGED_TEXT]
+    # The shared plain-text refusal, so this assertion follows the wording
+    # wherever it lives rather than pinning a constant this surface no
+    # longer owns.
+    assert [t for _, t in transport.sent] == [compact_refusal_plain_text("kas")]
     assert sessions.released == 1, "the turn semaphore must always be handed back"
 
 
@@ -349,7 +391,7 @@ def test_compact_none_capability_preserves_dispatch():
 
 def test_the_hard_threshold_declines_silently_on_auto_managed_backend():
     # No /compact to dispatch and no notice: the backend compacts on its own
-    # as context fills (#8156).
+    # as context fills.
     provider = FakeProvider("answered")
     provider.manual_compact_unsupported_backend = "kas"
     d, _client, _sessions, transport = _make(provider=provider, context_pct=96.0)
@@ -360,7 +402,7 @@ def test_the_hard_threshold_declines_silently_on_auto_managed_backend():
 
 def test_the_soft_nudge_is_suppressed_on_auto_managed_backend():
     # The nudge advises /compact, which this backend refuses — it compacts on
-    # its own, so there is nothing for the user to act on (#8156).
+    # its own, so there is nothing for the user to act on.
     provider = FakeProvider("answered")
     provider.manual_compact_unsupported_backend = "kas"
     d, _client, _sessions, transport = _make(provider=provider, context_pct=85.0)
@@ -375,6 +417,71 @@ def test_busy_session_without_steer_asks_to_resend():
     asyncio.run(d.handle_message(_msg("second message")))
     assert provider.prompts == []
     assert any("resend" in t.lower() for _, t in transport.sent)
+
+
+def test_a_member_waits_while_the_operators_group_turn_streams():
+    """A group has two buckets (the operator's and the members'), and a reply
+    streaming from either is a reply in this chat. Back-pressure is keyed on the
+    conversation: the member gets the busy receipt and never steers the
+    operator's turn, even though their own bucket is idle."""
+    from kiro_crew.whatsapp.transport_dispatch import BUSY_NOTE
+
+    provider = FakeProvider()
+    d, _client, sessions, transport = _make(provider=provider)
+    transport._is_operator = False
+    operator_key = d._session_key(_GROUP, is_operator=True)
+    sessions.is_busy = lambda key: key == operator_key  # type: ignore[method-assign]
+    asyncio.run(d.handle_message(_msg("me too", conv=_GROUP, user="447700900111")))
+    assert provider.prompts == []
+    assert [t for _, t in transport.sent] == [BUSY_NOTE]
+
+
+def test_stop_acts_on_the_members_bucket_when_that_is_the_live_one():
+    """/stop is the channel's only cancel affordance and the operator types it
+    at the conversation, not at a bucket: when the members' tool-less bucket is
+    the one streaming, that is the turn it stops."""
+    from kiro_crew.whatsapp.transport_dispatch import STOPPED_TEXT
+
+    d, _client, sessions, transport = _make()
+    member_key = d._session_key(_GROUP, is_operator=False)
+    sessions.is_busy = lambda key: key == member_key  # type: ignore[method-assign]
+    stopped: list[str] = []
+
+    async def stop_turn(key):
+        stopped.append(key)
+        return "soft"
+
+    sessions.stop_turn = stop_turn  # type: ignore[attr-defined]
+    asyncio.run(d._handle_stop(_GROUP))
+    assert stopped == [member_key]
+    assert [t for _, t in transport.sent] == [STOPPED_TEXT]
+
+
+def test_a_repeat_stop_while_compacting_forces_and_keeps_the_shared_queue():
+    """The first /stop during a compaction is declined; the second inside the
+    window forces. The force keeps the queue: under a unified ``dm_scope`` it
+    holds other channels' messages, and ``stop_turn`` parks them for the
+    successor rather than letting the reset drop them."""
+    from kiro_crew import session_lifecycle as sl
+    from kiro_crew.whatsapp.transport_dispatch import STOP_DECLINED_COMPACTING_TEXT, STOPPED_TEXT
+
+    sl._stop_declined_markers.clear()
+    d, _client, sessions, transport = _make()
+    sessions.is_compacting = lambda key: True  # type: ignore[attr-defined]
+    calls: list[dict] = []
+
+    async def stop_turn(key, **kw):
+        calls.append(kw)
+        return "compacting" if not kw.get("force") else "hard"
+
+    sessions.stop_turn = stop_turn  # type: ignore[attr-defined]
+    asyncio.run(d._handle_stop(_GROUP))
+    assert calls == [{}]
+    assert [t for _, t in transport.sent] == [STOP_DECLINED_COMPACTING_TEXT]
+    asyncio.run(d._handle_stop(_GROUP))
+    assert calls[-1] == {"force": True, "preserve_queue": True}
+    assert [t for _, t in transport.sent][-1] == STOPPED_TEXT
+    sl._stop_declined_markers.clear()
 
 
 def test_busy_session_folds_into_current_reply_when_steerable():
@@ -643,6 +750,51 @@ def _captured_turn(monkeypatch, dispatcher, inbound):
     return seen.get("turn")
 
 
+# ── durable inbound spool route ──────────────────────────────────────────────
+
+
+def test_dm_route_spools_the_pre_ingestion_original_not_the_prompt(monkeypatch):
+    """The route text is what the user SENT, read from ``pending_original``.
+
+    By the time the dispatcher runs, ``inbound.text`` has been rewritten by
+    ``receive`` with attachment context and temp paths, and ``user_text`` may
+    carry the group's private rules. The restart notice quotes the spooled text,
+    so only the pre-ingestion original may be spooled.
+    """
+    d, _client, _sessions, transport = _make()
+    inbound = _msg("look at this\n\n/tmp/kc-att/img-1.jpg")
+    inbound.attachments = ["/tmp/kc-att/img-1.jpg"]
+    transport.pending_original[id(inbound)] = ("look at this", 1)
+
+    turn = _captured_turn(monkeypatch, d, inbound)
+
+    assert turn is not None and turn.inbound_route is not None
+    assert turn.inbound_route.text == "look at this", "the ingested prompt was spooled"
+    assert turn.inbound_route.attachments_dropped == 1
+    assert turn.inbound_route.conversation_id == _DM
+
+
+def test_dm_route_is_not_declared_without_a_captured_original(monkeypatch):
+    """No fallback to ``inbound.text``: an envelope that skipped ``receive`` is not spooled."""
+    d, _client, _sessions, _transport = _make()
+
+    turn = _captured_turn(monkeypatch, d, _msg("hi"))
+
+    assert turn is not None and turn.inbound_route is None
+
+
+def test_group_route_is_never_declared(monkeypatch):
+    """``may_send_to`` knows nothing of the group roster, so groups are not spooled."""
+    d, _client, _sessions, transport = _make()
+    inbound = _msg("hi group", conv=_GROUP)
+    transport.pending_original[id(inbound)] = ("hi group", 0)
+    transport.pending_verdicts[id(inbound)] = GroupVerdict(respond=True)
+
+    turn = _captured_turn(monkeypatch, d, inbound)
+
+    assert turn is not None and turn.inbound_route is None
+
+
 def test_a_non_operator_turn_never_inherits_auto_approval(monkeypatch):
     """`auto` is the operator's grant, not an admitted stranger's.
 
@@ -751,6 +903,26 @@ def test_a_non_operator_never_shares_the_operators_unified_session():
     assert operator_key.startswith("unified:"), "the operator keeps cross-surface continuity"
     assert not peer_key.startswith("unified:"), "a peer must not land in the shared bucket"
     assert operator_key != peer_key
+
+
+def test_a_non_operator_is_keyed_under_the_tool_less_agent():
+    """A `deny_all_tools` turn is driven on the tool-less agent, and the shared
+    pipeline refuses one whose session is already bound to another agent. So a
+    non-operator's bucket must be built under that agent from the start, in a DM
+    and in a group alike; the group's shared session stays the operator's.
+    """
+    from kiro_crew.messaging.dispatch import TOOLLESS_TURN_AGENT
+
+    d, _client, _sessions, transport = _make()
+    peer_dm = d._session_key("447711111111@s.whatsapp.net", is_operator=False)
+    assert peer_dm.split(":")[1] == TOOLLESS_TURN_AGENT
+
+    operator_group = d._session_key(_GROUP, is_operator=True)
+    member_group = d._session_key(_GROUP, is_operator=False)
+    assert operator_group.split(":")[1] == d._resolve_agent()
+    assert member_group.split(":")[1] == TOOLLESS_TURN_AGENT
+    assert member_group != operator_group, "a member must not reach the operator's tooled session"
+    assert _GROUP in member_group, "the member's bucket is still per group"
 
 
 # ── phase reactions: the marker must report the OUTCOME ─────────────────────
@@ -1043,3 +1215,83 @@ def test_the_operators_unified_bucket_is_the_one_seeded():
 def test_a_fresh_machine_still_starts_at_generation_zero():
     d, _client, _sessions, _transport = _make()
     assert d._conv.current_gen(_DM) == 0
+
+
+def test_a_scope_seeds_from_the_member_bucket_when_it_is_ahead():
+    """A group's members talk in a bucket of their own (tool-less agent, ``guest``
+    segment) that shares the scope's generation counter. If only members talked
+    since the last restart, the operator's bucket is behind; seeding from it
+    alone would hand a member a generation whose session is still on disk."""
+    from kiro_crew.messaging.dispatch import TOOLLESS_TURN_AGENT
+    from kiro_crew.messaging.link import (
+        CHAT_TYPE_FORUM,
+        DM_SCOPE_PER_CHANNEL_PEER,
+        build_dm_session_key,
+    )
+    from kiro_crew.whatsapp.transport_dispatch import GUEST_SCOPE_SEGMENT
+
+    d, _client, sessions, _transport = _make()
+    member_bucket = build_dm_session_key(
+        "whatsapp",
+        TOOLLESS_TURN_AGENT,
+        f"{_GROUP}:{GUEST_SCOPE_SEGMENT}",
+        gen=0,
+        dm_scope=DM_SCOPE_PER_CHANNEL_PEER,
+        chat_type=CHAT_TYPE_FORUM,
+    )
+    sessions.persisted_generations["whatsapp:kirocrew:forum:" + _GROUP] = 1
+    sessions.persisted_generations[member_bucket] = 5
+    assert d._conv.current_gen(_GROUP) == 5
+    # The seeded generation is what the member's key is then built with.
+    assert d._session_key(_GROUP, is_operator=False) != member_bucket
+
+
+def test_a_decline_whose_reply_never_sends_leaves_the_next_press_a_first_press():
+    """``_say`` logs its own send error rather than raising, so the decline must
+    read its answer: an operator who saw nothing presses again within seconds,
+    and that press must be declined again rather than reset their session."""
+    from kiro_crew import session_lifecycle as sl
+    from kiro_crew.whatsapp.transport_dispatch import STOP_DECLINED_COMPACTING_TEXT
+
+    sl._stop_declined_markers.clear()
+    d, _client, sessions, transport = _make()
+    sessions.is_compacting = lambda key: True  # type: ignore[attr-defined]
+    calls: list[dict] = []
+
+    async def stop_turn(key, **kw):
+        calls.append(kw)
+        return "compacting" if not kw.get("force") else "hard"
+
+    sessions.stop_turn = stop_turn  # type: ignore[attr-defined]
+
+    working = transport.send_message
+    down = True
+
+    async def _flaky(jid, text):
+        if down:
+            raise RuntimeError("whatsapp 503")
+        return await working(jid, text)
+
+    transport.send_message = _flaky  # type: ignore[assignment]
+    asyncio.run(d._handle_stop(_GROUP))
+    assert calls == [{}]
+    assert sl._stop_declined_markers == {}, "an undelivered warning arms nothing"
+    # Delivery works again; the retry is still a first press, declined.
+    down = False
+    asyncio.run(d._handle_stop(_GROUP))
+    assert calls == [{}, {}], "no force on a press the operator was never warned about"
+    assert [t for _, t in transport.sent] == [STOP_DECLINED_COMPACTING_TEXT]
+    sl._stop_declined_markers.clear()
+
+
+def test_say_reports_whether_the_message_landed():
+    d, _client, _sessions, transport = _make()
+    assert asyncio.run(d._say(_GROUP, "hi")) is True
+
+    async def _down(_jid, _text):
+        raise RuntimeError("whatsapp 503")
+
+    transport.send_message = _down  # type: ignore[assignment]
+    assert asyncio.run(d._say(_GROUP, "hi")) is False
+    d.transport = None
+    assert asyncio.run(d._say(_GROUP, "hi")) is False

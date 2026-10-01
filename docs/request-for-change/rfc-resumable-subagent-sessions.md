@@ -13,6 +13,12 @@ superseded-by: []
 ---
 # RFC: Resumable Subagent Sessions
 
+> **Current behaviour: see [`../system-specs/modules/subagent.md`](../system-specs/modules/subagent.md).**
+> Continuable conversations shipped instead of the record-store ladder below —
+> `spawn_continue`, `keep=`, the follow-up watcher and context-group
+> inheritance on continuation are all specified there. This document is the
+> record of a probe that changed a design.
+
 - Status: partial, and **what shipped diverges from this plan** — Phase 0 ran and its verdict is recorded in PR #1023's description (a shared-arm sid is *not* loadable after `session/terminate`). That negative verdict redirected the work: instead of the record store → record view → promotion ladder below, PRs #1023 and #1246 shipped **continuable conversations** — `spawn_continue` / `spawn_steer` / `spawn_release` MCP tools, `keep_transcript` on the session handle, and a conversation TTL registry that survives gateway restart. Still unbuilt: Phase 1's record store (no `SubagentRecord`, no records file), Phase 2's `subagent_record_retention_enabled` / `_days` config keys (retention is conversation-TTL based instead), Phase 3's record view (`GET /api/spawn/{id}/record` does not exist), and Phase 4's guaranteed deliverable — promoting a run into an **ordinary chat session labelled a replay**. Note "promotion" in the shipped code means promoting a *conversation's retention*, not seeding a dashboard chat session. This document was never revised after Phase 0; read it as the original plan, not as a description of main.
 - Author: zezhexu
 - Created: 2026-07-28
@@ -38,7 +44,7 @@ The single enforcement point for non-resumability is one tuple entry. `"subagent
 |---|---|---|
 | Turns | One logical prompt. The retry ladder may re-issue it or send one continuation (`subagent_manager/run.py`, `_stream_with_transient_retry` inside `_run_inner_impl`), but nothing carries a *new* instruction | No HTTP route or MCP tool accepts a follow-up message into a run |
 | ACP session id | Persisted to `state.json` under the comment "Record session_id and provider type for session file cleanup" (the `update_state` call in `subagent_manager/run.py`'s `_run_inner_impl`) | Read only by deletion paths (`subagent.py:1187-1192`, `subagent_persistence.py:275-280`). The one artifact needed to resume exists so it can be deleted |
-| Transcript | Assistant text chunks only (`write_result_chunk`, called from `subagent_manager/run.py`'s `_run_inner_impl` on assistant-text events), truncated to `RESULT_FILE_MAX_BYTES = 512_000` with an in-file marker (`context_management.py:26,329-352`) | No roles, no prompt, no tool sequence — cannot be rendered as a conversation or replayed into one |
+| Transcript | Assistant text chunks only (`write_result_chunk`, called from `subagent_manager/run.py`'s `_run_inner_impl` on assistant-text events), truncated to `RESULT_FILE_MAX_BYTES = 512_000` with an in-file marker (`context_management.RESULT_FILE_MAX_BYTES`, `cap_result_file`) | No roles, no prompt, no tool sequence — cannot be rendered as a conversation or replayed into one |
 | Prompt | Only the redacted task line, in `state.json` | A run cannot be re-issued from disk |
 | Gateway restart | `_reconcile_orphans` (`subagent.py:1115`) identity-verifies the child PID (`subagent.py:1152-1168`), terminates it, tombstones `gateway_restart`, deletes its kiro session files, notifies the parent | Nothing partial is recoverable |
 | Retention | `mark_delivered` schedules folder pruning after `agent.subagent_result_ttl_secs` (default 3600, `config/loader.py:755-756`) | Within an hour of success nothing recoverable remains |
@@ -161,7 +167,7 @@ Surfaced as a "Continue as chat" action on the record view and the inline `Subag
 
 Records are served read-only by their own routes (`GET /api/spawn/{id}/record` and a records list) and rendered as a record view, reachable from the inline `SubagentRunCard`, the Subagents panel, and by URL. Read access is **workspace-global**, consistent with chat history — an explicit decision, not a default inherited from `spawn_status`, which performs no ownership check today (`dashboard/handlers/messaging.py:255-300`).
 
-Records are deliberately **not** dashboard slots. `_ChatSlot.to_dict` emits `"surface": self.mode` as a forward-compat alias (`dashboard/state.py:1459`), so there is no independent surface to assign; `_persist_open_slots` + `restore_open_slots` would rehydrate a record as an ordinary writable slot across a restart; and read-only would be a client-side fiction while the chat send path (`POST /api/chat`, `dashboard/server.py:1660`, slot in the request body) stayed reachable for the id. Consequently no change is needed to the three hard-coded surface **filter predicates** (`ChatPage.tsx:544-550`, `dashboardSlice.ts:280-292`, `chatSlice.ts:668-671`); the sidebar records section is additive in `ChatSidebar.tsx`.
+Records are deliberately **not** dashboard slots. `_ChatSlot.to_dict` emits `"surface": self.mode` as a forward-compat alias (`dashboard/state.py:1459`), so there is no independent surface to assign; `_persist_open_slots` + `restore_open_slots` would rehydrate a record as an ordinary writable slot across a restart; and read-only would be a client-side fiction while the chat send path (`POST /api/chat`, `dashboard/server.py:1660`, slot in the request body) stayed reachable for the id. Consequently no change is needed to the three hard-coded surface **filter predicates** (`ChatPage.tsx:544-550`, `dashboardSlice.ts:280-292`, `deleteSlot` in `chatSlice.ts`); the sidebar records section is additive in `ChatSidebar.tsx`.
 
 ## Migration plan
 

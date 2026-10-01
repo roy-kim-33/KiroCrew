@@ -1,4 +1,4 @@
-"""Acceptance tests for the promise-only turn guard (#2686).
+"""Acceptance tests for the promise-only turn guard.
 
 The bug: a turn that ends right after the model ANNOUNCES an immediate action
 ("I'll do that now") without making the tool call was recorded as a landed
@@ -14,7 +14,13 @@ maps to one bullet in the issue's acceptance-coverage list.
 
 from __future__ import annotations
 
+import inspect
+
+import pytest
+
 from kiro_crew.acp.types import STOP_REASON_CANCELLED, STOP_REASON_END_TURN, STOP_REASON_REFUSAL
+from kiro_crew.dashboard import chat_utils as _chat_utils
+from kiro_crew.dashboard import chat_utils as chat_utils_module
 from kiro_crew.dashboard.chat_utils import (
     CRON_NOTIFICATION_KIND,
     SUBAGENT_COMPLETION_KIND,
@@ -22,10 +28,43 @@ from kiro_crew.dashboard.chat_utils import (
     RecoveryPayload,
     is_promise_only_terminal,
     is_synthetic_payload_item,
+    is_synthetic_recovery_item,
     should_recover_promise_only,
 )
 
 _END = STOP_REASON_END_TURN
+
+
+def _is_false_current_tool_blocker(text: str) -> bool:
+    assert hasattr(
+        _chat_utils, "is_false_current_tool_blocker"
+    ), "false current-tool-blocker recovery is missing"
+    return _chat_utils.is_false_current_tool_blocker(text)
+
+
+def _is_false_current_tool_blocker_near_miss(text: str) -> bool:
+    assert hasattr(
+        _chat_utils, "is_false_current_tool_blocker_near_miss"
+    ), "false tool-blocker drift detection is missing"
+    return _chat_utils.is_false_current_tool_blocker_near_miss(text)
+
+
+def _tool_calls_are_read_only_preparation(
+    calls: int,
+    identities: tuple[tuple[str, str, str, bool], ...],
+    successful_ids: frozenset[str],
+    *,
+    builtin_identity_trusted: bool = True,
+) -> bool:
+    assert hasattr(
+        _chat_utils, "tool_calls_are_read_only_preparation"
+    ), "read-only preparation accounting is missing"
+    return _chat_utils.tool_calls_are_read_only_preparation(
+        calls,
+        identities,
+        successful_ids,
+        builtin_identity_trusted=builtin_identity_trusted,
+    )
 
 
 def _recover(**over):
@@ -41,10 +80,32 @@ def _recover(**over):
         is_cancelled=False,
         refusal_reasons=[],
         turn_tool_calls=0,
+        turn_tool_identities=(),
+        successful_tool_call_ids=frozenset(),
+        builtin_identity_trusted=True,
+        directive_user_origin=True,
         in_stage_execution=False,
     )
     kw.update(over)
+    parameters = inspect.signature(should_recover_promise_only).parameters
+    if "turn_tool_identities" not in parameters:
+        assert kw["turn_tool_calls"] == 0, "canonical tool identity recovery is missing"
+        kw.pop("turn_tool_identities")
+        kw.pop("successful_tool_call_ids")
+    if "directive_user_origin" not in parameters:
+        assert kw["turn_tool_calls"] == 0, "authenticated-user replay is missing"
+        kw.pop("directive_user_origin")
+    if "builtin_identity_trusted" not in parameters:
+        assert kw["turn_tool_calls"] == 0, "builtin identity provenance is missing"
+        kw.pop("builtin_identity_trusted")
     return should_recover_promise_only(**kw)
+
+
+def _has_progress_claim(text: str) -> bool:
+    """Resolve at call time so a reverted helper fails an assertion, not collection."""
+    detector = getattr(chat_utils_module, "has_unfinished_progress_claim", None)
+    assert detector is not None, "the foreground-progress detector is missing"
+    return bool(detector(text))
 
 
 # 1. A confirmed promise-only response CONTINUES instead of landing.
@@ -54,6 +115,203 @@ def test_promise_only_response_triggers_recovery():
     assert is_promise_only_terminal("Yes. I can open the PR for you, and I’ll do that now.")
     assert is_promise_only_terminal("I'll go ahead and run the gate now.")
     assert is_promise_only_terminal("Let me open that PR right away.")
+
+
+# A progress-status sentence can be honest while the turn is streaming, but it
+# becomes false the instant a normal turn ends unless separately visible
+# background work owns the continuation. This is notice-only: earlier tools may
+# have side effects, so the runner must never replay the turn automatically.
+def test_terminal_foreground_progress_claim_is_detected():
+    assert _has_progress_claim(
+        "I'm continuing with the full local gate run; the new screenshot is the lower frame above."
+    )
+    assert _has_progress_claim("I’m still working on the PR.")
+    assert _has_progress_claim("I am proceeding with the validation now.")
+    assert _has_progress_claim("Next, I'm running the broader test suite.")
+    assert _has_progress_claim("I'll keep working on this.")
+    assert _has_progress_claim("Setup is done. I'm continuing with the full local gate run.")
+    assert _has_progress_claim("Setup is done. I'm running checks.")
+    assert _has_progress_claim("I'm running the monitor in the background.")
+    assert _has_progress_claim("Here's the plan\nI'm continuing with the build now.")
+
+
+def test_completed_or_background_status_is_not_foreground_progress_claim():
+    for text in (
+        "The full local gate run passed.",
+        "I finished the validation and opened the PR.",
+        "I'm running checks. They passed.",
+        "The subagent is still working on the build.",
+        "The monitor will continue checking every five minutes.",
+        "I'm continuing the quotation from the previous paragraph.",
+        "I'm continuing with the explanation: here is the answer.",
+        "Done. I'm continuing with the explanation: here is the answer.",
+    ):
+        assert _has_progress_claim(text) is False
+
+
+_OBSERVED_FALSE_TOOL_BLOCKERS = (
+    "I’m blocked from further tool execution in the resumed session: "
+    "the screenshot delivery tools are no longer callable here.",
+    "I’m proceeding, but this turn’s tool budget was exhausted immediately "
+    "after loading the workflow. No publish or deployment has happened yet.",
+)
+
+
+def test_observed_false_tool_blocker_phrasings_match():
+    for text in _OBSERVED_FALSE_TOOL_BLOCKERS:
+        assert _is_false_current_tool_blocker(text) is True
+        assert _is_false_current_tool_blocker_near_miss(text) is False
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "I'm blocked from further tool execution.",
+        "I'm blocked from further tool execution in the resumed session: "
+        "the screenshot delivery tools are accessible here.",
+        "I'm proceeding, but this turn's tool budget was exhausted immediately "
+        "after searching the workflow.",
+    ),
+)
+def test_unobserved_false_tool_blocker_variants_remain_manual(text: str):
+    assert _is_false_current_tool_blocker(text) is False
+    assert _is_false_current_tool_blocker_near_miss(text) is True
+
+
+_EXPECTED_READ_ONLY_PREPARATION_TOOLS = (
+    "fs_read",
+    "glob",
+    "grep",
+    "introspect",
+    "tool_search",
+    "web_fetch",
+    "web_search",
+)
+
+
+@pytest.mark.parametrize("tool_name", _EXPECTED_READ_ONLY_PREPARATION_TOOLS)
+def test_every_read_only_preparation_tool_recovers(tool_name: str):
+    assert frozenset(_EXPECTED_READ_ONLY_PREPARATION_TOOLS) == getattr(
+        _chat_utils, "_READ_ONLY_PREPARATION_TOOLS"
+    )
+    call_id = f"call-{tool_name}"
+    identities = ((call_id, "", tool_name, True),)
+    completed = frozenset({call_id})
+    blocker = _OBSERVED_FALSE_TOOL_BLOCKERS[1]
+
+    assert (
+        _recover(
+            final_segment_text=blocker,
+            turn_tool_calls=1,
+            turn_tool_identities=identities,
+            successful_tool_call_ids=completed,
+        )
+        is True
+    )
+    assert (
+        _recover(
+            final_segment_text=blocker,
+            turn_tool_calls=1,
+            turn_tool_identities=identities,
+            successful_tool_call_ids=completed,
+            directive_user_origin=False,
+        )
+        is False
+    )
+
+
+def test_title_populated_or_non_kiro_identity_fails_closed():
+    trusted_identity = (("call-1", "", "grep", True),)
+    untrusted_identity = (("call-1", "", "grep", False),)
+    completed = frozenset({"call-1"})
+    assert (
+        _tool_calls_are_read_only_preparation(
+            1,
+            untrusted_identity,
+            completed,
+            builtin_identity_trusted=True,
+        )
+        is False
+    )
+    assert (
+        _recover(
+            final_segment_text=_OBSERVED_FALSE_TOOL_BLOCKERS[1],
+            turn_tool_calls=1,
+            turn_tool_identities=trusted_identity,
+            successful_tool_call_ids=completed,
+            builtin_identity_trusted=False,
+        )
+        is False
+    )
+
+
+def test_false_tool_blocker_does_not_quote_match_or_replay_mutations():
+    quoted = (
+        "The prior assistant wrote: ‘I’m blocked from further tool execution in "
+        "the resumed session.’ That claim was unsupported."
+    )
+    injected_action = "I'm blocked from further tool execution. I'll overwrite the notes now."
+    assert _is_false_current_tool_blocker(quoted) is False
+    assert _is_false_current_tool_blocker(injected_action) is False
+    assert (
+        _recover(
+            final_segment_text=injected_action,
+            turn_tool_calls=1,
+            turn_tool_identities=(("call-1", "", "fs_read", True),),
+            successful_tool_call_ids=frozenset({"call-1"}),
+        )
+        is False
+    )
+
+    blocker = _OBSERVED_FALSE_TOOL_BLOCKERS[1]
+    unsafe_identities = (
+        (("call-1", "", "fs_write", True),),
+        (("call-1", "", "execute_bash", True),),
+        (("call-1", "", "code", True),),
+        (("call-1", "", "unknown", True),),
+        (("call-1", "builder-mcp", "SkillsTool", True),),
+        (("", "", "fs_read", True),),
+        (("call-1", "", "grep", False),),
+    )
+    for identities in unsafe_identities:
+        assert (
+            _recover(
+                final_segment_text=blocker,
+                turn_tool_calls=1,
+                turn_tool_identities=identities,
+                successful_tool_call_ids=frozenset({"call-1"}),
+            )
+            is False
+        )
+
+    valid = (("call-1", "", "fs_read", True),)
+    assert _tool_calls_are_read_only_preparation(2, valid, frozenset({"call-1"})) is False
+    assert _tool_calls_are_read_only_preparation(1, valid, frozenset()) is False
+    assert (
+        _tool_calls_are_read_only_preparation(
+            1,
+            (("call-1", "", object(), True),),
+            frozenset({"call-1"}),
+        )
+        is False
+    )
+    assert (
+        _tool_calls_are_read_only_preparation(
+            2,
+            (valid[0], valid[0]),
+            frozenset({"call-1"}),
+        )
+        is False
+    )
+    assert (
+        _recover(
+            final_segment_text=blocker,
+            turn_tool_calls=1,
+            turn_tool_identities=valid,
+            successful_tool_call_ids=frozenset(),
+        )
+        is False
+    )
 
 
 # 2. Ordinary text-only informational answers still COMPLETE (no recovery).
@@ -92,7 +350,7 @@ def test_completed_action_then_summary_does_not_trigger():
         assert _recover(final_segment_text=text) is False
 
 
-# 4b. Permission-seeking / no-action closers must NOT fire (AI-review #2696).
+# 4b. Permission-seeking / no-action closers must NOT fire.
 #     These read as immediate to a naive regex but are the opposite of a promise
 #     to act: the turn is correctly yielding to the user or declining to act.
 def test_permission_seeking_and_no_action_closers_do_not_trigger():
@@ -108,8 +366,8 @@ def test_permission_seeking_and_no_action_closers_do_not_trigger():
         assert _recover(final_segment_text=text) is False
 
 
-# 4c. A NEGATED commitment before the immediacy marker must NOT fire (AI-review
-#     #2696 F1): "I'm not going to open the PR now" is an explicit non-action, but
+# 4c. A NEGATED commitment before the immediacy marker must NOT fire:
+#     "I'm not going to open the PR now" is an explicit non-action, but
 #     the bare `going to`/`won't`/`can't` forms would otherwise match the immediacy
 #     regex. True promises with no negation must still fire.
 def test_negated_commitment_does_not_trigger():
@@ -121,7 +379,7 @@ def test_negated_commitment_does_not_trigger():
         "I can't do that right now.",
         "I cannot open it now.",
         "I'm no longer going to open it now.",
-        # spelled-out "do not" (缩写 don't was covered; the full form was missed) (#2696 GPT round)
+        # spelled-out "do not" (the full form, not just the contraction don't)
         "I do not think I'll open the PR now.",
         "I do not want to open it right now.",
         "It does not need to be opened now.",
@@ -133,7 +391,7 @@ def test_negated_commitment_does_not_trigger():
     assert is_promise_only_terminal("I'm going to open the PR now.") is True
 
 
-# 4d. A soft Stop in progress must NOT recover (AI-review #2696 B1): a Stop pressed
+# 4d. A soft Stop in progress must NOT recover: a Stop pressed
 #     while the promise streamed can lose the cancel race and arrive as a normal
 #     end_turn; re-queueing then would dispatch the stopped action. Every sibling
 #     recovery path gates on this stop-state, so this one does too.
@@ -143,7 +401,7 @@ def test_stop_in_progress_does_not_trigger():
     assert _recover(stop_in_progress=False) is True
 
 
-# 4e. Approval-gated closers must NOT fire (AI-review #2696 UX round 2): a
+# 4e. Approval-gated closers must NOT fire: a
 #     conditional promise ("If that looks good, I'll push it now") leaves the
 #     decision with the user; auto-continuing it dispatches an action the user
 #     was still being asked to approve.
@@ -154,16 +412,16 @@ def test_approval_gated_closer_does_not_trigger():
         "If you're happy with the plan, I'll do that now.",
         "With your approval, I'll push it now.",
         "Once you confirm, I'll do that right away.",
-        # "when you" / "after you" conditions (AI-review #2696 round 3)
+        # "when you" / "after you" conditions
         "When you confirm, I'll do that now.",
         "After you confirm, I'll delete it now.",
         "After you approve, I'll push it right away.",
-        # any conditional `if` opener, and will-not / I'll-not negation (round 4)
+        # any conditional `if` opener, and will-not / I'll-not negation
         "If CI passes, I'll delete it now.",
         "If the build is green, I'll merge it now.",
         "I will not delete it now.",
         "I'll not delete it now.",
-        # temporal/conditional-gate class (once/when/after/as soon as), round 4
+        # temporal/conditional-gate class (once/when/after/as soon as)
         "Once tests are green, I'll merge it now.",
         "When the build passes, I'll push it now.",
         "After CI, I'll deploy it now.",
@@ -176,7 +434,7 @@ def test_approval_gated_closer_does_not_trigger():
     assert is_promise_only_terminal("Yes, I'll open the PR now.") is True
 
 
-# 4m. Consent-DEFERRAL closers must NOT fire (AI-review #2696 GPT round, blocking):
+# 4m. Consent-DEFERRAL closers must NOT fire:
 #     a turn that says it will WAIT FOR / AWAIT the user's approval before acting
 #     ("I'll wait for your approval before I delete it right now") reads as an
 #     immediate promise to a naive regex, but auto-continuing it dispatches the very
@@ -204,8 +462,8 @@ def test_consent_deferral_closer_does_not_trigger():
     assert is_promise_only_terminal("I'll open the awaited PR now.") is True
 
 
-# 4n. Subordinating-CONDITIONAL conjunctions must NOT fire (AI-review #2696 design
-#     round): the approval-gate deny-list missed "unless / assuming / provided that /
+# 4n. Subordinating-CONDITIONAL conjunctions must NOT fire: the
+#     approval-gate deny-list covers "unless / assuming / provided that /
 #     as long as" — each conditions the action on the user, so auto-continuing is a
 #     false-accept. Closes the conjunction CLASS; the risky ones are bound to a
 #     following pronoun/complementizer so a benign adjective still fires.
@@ -226,10 +484,7 @@ def test_conditional_subordinator_closer_does_not_trigger():
     assert is_promise_only_terminal("I'll open the given file now.") is True
 
 
-# 4i. Third-person "going to" must NOT fire (AI-review #2696 GPT round): the bare
-
-
-# 4i. Third-person "going to" must NOT fire (AI-review #2696 GPT round): the bare
+# 4i. Third-person "going to" must NOT fire: the bare
 #     `going to` alternative matched informational statements with no first-person
 #     commitment ("The deployment is going to start now"), injecting an unrelated
 #     continuation. Only the subject-bound `i'm going to` form remains.
@@ -248,9 +503,9 @@ def test_third_person_going_to_does_not_trigger():
 
 
 # 4j. The reject gates are scoped to the TERMINAL sentence, not the whole segment
-#     (AI-review #2696 design round): an everyday `if`/`when`/`after`/`let me know`
+#     — an everyday `if`/`when`/`after`/`let me know`
 #     or negation in an EARLIER sentence must NOT veto a genuine promise that sits
-#     only in the final sentence — that asymmetric scope landed the exact #2686
+#     only in the final sentence — that asymmetric scope would leave the
 #     symptom unrecovered. A conditional/no-action that IS the terminal sentence
 #     still rejects.
 def test_reject_gates_scoped_to_terminal_sentence():
@@ -273,14 +528,13 @@ def test_reject_gates_scoped_to_terminal_sentence():
         assert _recover(final_segment_text=text) is False
 
 
-# 4k. Caller contract (AI-review #2696 GPT round): the runner set its
-#     `_produced_visible_output` flag True ONLY on the mid-turn reset-to-empty paths
-#     (steer/compaction/clear/agent-switch); a normal streamed-text turn left it
-#     False, so a promise-only turn reached the guard with it False and recovery
-#     NEVER fired for the actual #2686 scenario. The runner now derives the argument
-#     as `bool(assistant_text.strip()) or _produced_visible_output`; a non-empty
-#     final segment is itself visible output. This locks that derivation so a promise
-#     drives recovery even when the raw flag is False, while an empty segment does not.
+# 4k. Caller contract: the runner derives the `produced_visible_output`
+#     argument as `bool(assistant_text.strip()) or _produced_visible_output`,
+#     because the raw flag is set True only on mid-turn reset-to-empty paths
+#     (steer/compaction/clear/agent-switch) and a normal streamed-text turn
+#     leaves it False. A non-empty final segment is itself visible output, so a
+#     promise drives recovery even when the raw flag is False, while an empty
+#     segment does not.
 def test_nonempty_final_segment_counts_as_visible_output():
     promise = "Yes, I'll open the PR now."
     assert (
@@ -295,7 +549,7 @@ def test_nonempty_final_segment_counts_as_visible_output():
     )
 
 
-# 4h. A pending mid-turn STEER must block recovery (AI-review #2696 round 3): a
+# 4h. A pending mid-turn STEER must block recovery: a
 #     steer ("don't delete") lives in slot._pending_steers, a separate channel
 #     from _queue that is only requeued in _run_chat's finally (after the guard).
 #     Firing recovery while a steer is pending would dispatch the announced action
@@ -307,7 +561,7 @@ def test_pending_steer_does_not_trigger():
 
 
 # 4f. A Stop that already resolved back to idle DURING the turn must still block
-#     recovery (AI-review #2696 GPT round 2 blocking): _stop_state alone misses
+#     recovery: _stop_state alone misses
 #     it because it snaps back to idle; the monotonic _stop_generation counter
 #     preserves the "a stop happened during this turn" signal.
 def test_stop_generation_changed_does_not_trigger():
@@ -316,8 +570,8 @@ def test_stop_generation_changed_does_not_trigger():
     assert _recover(stop_generation_unchanged=True) is True
 
 
-# 4g. A non-empty user-follow-up queue must block recovery (AI-review #2696 GPT
-#     round 2 blocking): queue_insert(0, ...) would jump the continuation ahead
+# 4g. A non-empty user-follow-up queue must block recovery:
+#     queue_insert(0, ...) would jump the continuation ahead
 #     of a user "don't do that" message; respect the user's ordering.
 def test_non_empty_queue_does_not_trigger():
     assert _recover(queue_empty=False) is False
@@ -325,8 +579,8 @@ def test_non_empty_queue_does_not_trigger():
     assert _recover(queue_empty=True) is True
 
 
-# 4o. A turn that made ANY tool call must NOT recover (AI-review #2696 GPT round,
-#     blocking): a completed side-effecting tool (e.g. send_message) followed by
+# 4o. A turn that made ANY tool call must NOT recover: a completed
+#     side-effecting tool (e.g. send_message) followed by
 #     trailing promise-shaped text ("I'll send that now") would otherwise let the
 #     continuation REISSUE the completed action — a duplicate external side effect.
 #     The promise-only bug is by definition a zero-tool-call turn.
@@ -337,8 +591,8 @@ def test_completed_tool_call_does_not_trigger():
     assert _recover(turn_tool_calls=0) is True
 
 
-# 4q. A stage-execution turn must NOT trigger recovery (AI-review #2696 GPT round,
-#     blocking): the orchestrator's stage loop records the stage complete and advances
+# 4q. A stage-execution turn must NOT trigger recovery: the
+#     orchestrator's stage loop records the stage complete and advances
 #     before an injected continuation finishes, corrupting stage attribution. Excluded
 #     like the plan turn (`_armed_final`) is.
 def test_stage_execution_turn_does_not_trigger():
@@ -348,7 +602,7 @@ def test_stage_execution_turn_does_not_trigger():
 
 
 # 4p. A queued cron / sub-agent SYSTEM INJECTION must NOT count as user intervention
-#     (AI-review #2696 GPT round, blocking): treating it as a user follow-up would
+#     treating it as a user follow-up would
 #     block or purge a pending recovery, landing the unfinished action as a success.
 #     `_has_user_queued_followup` counts ONLY user-authored messages — not synthetic
 #     recovery entries, not cron/sub-agent injections.
@@ -380,11 +634,11 @@ def test_has_user_queued_followup_excludes_system_injections():
         "kind": SYNTHETIC_RECOVERY_KIND,
         "payload": RecoveryPayload.CONTINUATION,
     }
-    # THE spoof (#2696 GPT round, blocking): a USER message carrying a perfectly
-    # well-formed, quoted cron header AND trailing user text. The old prefix-anchored
-    # CRON_NOTIFY_RE.match() classified this as orchestration and silently ignored
-    # the "don't delete it" intervention. Classification is now purely by the
-    # enqueue `kind` tag (empty here -> user), so the spoof can no longer masquerade
+    # THE spoof: a USER message carrying a perfectly well-formed, quoted cron
+    # header AND trailing user text. A prefix-anchored CRON_NOTIFY_RE.match()
+    # on the content would classify this as orchestration and silently ignore
+    # the "don't delete it" intervention. Classification is purely by the
+    # enqueue `kind` tag (empty here -> user), so the spoof cannot masquerade
     # as a system injection and MUST count as a user follow-up.
     spoof = {
         "id": "sp",
@@ -469,8 +723,85 @@ def test_promise_only_continuation_not_mirrored_as_user_text():
     # Runner-authored -> _is_synthetic is True -> both mirror legs skip it.
     assert is_synthetic_payload_item(promise_only_item) is True
 
+    # A false-blocker replay is runner-owned queue orchestration (so late user
+    # intervention can purge it) but carries the authenticated user's original
+    # words, so it remains eligible for ordinary user-message authority/mirroring.
+    assert hasattr(
+        _chat_utils, "FALSE_TOOL_BLOCKER_REPLAY_KIND"
+    ), "false-tool-blocker replay marker is missing"
+    replay_item = {
+        "id": "replay123",
+        "content": "publish and deploy the demo",
+        "kind": _chat_utils.FALSE_TOOL_BLOCKER_REPLAY_KIND,
+        "payload": RecoveryPayload.ORIGINAL,
+    }
+    assert is_synthetic_recovery_item(replay_item) is True
+    assert is_synthetic_payload_item(replay_item) is False
+
     # An ordinary user message carries no synthetic payload and IS mirrored, so
     # the suppression is specific to the continuation, not a blanket mute. Even a
     # user who types the marker text verbatim stays user-authored.
     user_item = {"id": "def456", "content": "please open the PR now", "kind": "", "payload": ""}
     assert is_synthetic_payload_item(user_item) is False
+
+
+@pytest.mark.asyncio
+async def test_session_rebind_after_enqueue_purges_false_blocker_replay(tmp_path):
+    """A recovery replay cannot cross the session boundary captured at enqueue."""
+    from unittest.mock import MagicMock, patch
+
+    from chat_test_helpers import _make_state
+
+    from kiro_crew.dashboard.chat_runner import _start_next_queued_turn
+    from kiro_crew.dashboard.chat_utils import (
+        FALSE_TOOL_BLOCKER_REPLAY_KIND,
+        RecoveryPayload,
+        effective_session_key,
+    )
+
+    state = _make_state(tmp_path)
+    state.broadcast_ws = MagicMock()
+    state.sessions.stop_generation = lambda _key: 0
+    slot = state.get_or_create_slot("rebound-false-blocker")
+    slot.linked_session_key = "slack:session-a"
+    request = "Delete the deployment"
+    slot.queue_insert(
+        0,
+        request,
+        kind=FALSE_TOOL_BLOCKER_REPLAY_KIND,
+        payload=RecoveryPayload.ORIGINAL,
+        directive_user_origin=True,
+    )
+    slot._promise_only_retries = 1
+    slot._promise_only_stop_gen = slot._stop_generation
+    slot._promise_only_session_stop_gen = 0
+    slot._promise_only_session_key = effective_session_key(slot)
+    assert slot._promise_only_session_key == "slack:session-a"
+
+    slot.linked_session_key = "slack:session-b"
+    cfg = MagicMock()
+    cfg.dashboard.merge_queued_messages = False
+
+    def _unexpected_dispatch(_state, _slot, coro):
+        coro.close()
+        raise AssertionError("recovery replay dispatched after a session rebind")
+
+    with (
+        patch("kiro_crew.dashboard.chat_runner.KiroCrewConfig.load", return_value=cfg),
+        patch(
+            "kiro_crew.dashboard.chat_runner.spawn_guarded_turn",
+            side_effect=_unexpected_dispatch,
+        ),
+    ):
+        started = await _start_next_queued_turn(state, slot)
+
+    assert started is False
+    assert all(item.get("kind") != FALSE_TOOL_BLOCKER_REPLAY_KIND for item in slot._queue)
+    assert slot._promise_only_retries == 0
+    assert slot._promise_only_session_key == "slack:session-b"
+    assert any(
+        msg.get("role") == "notice"
+        and "moved to another session" in msg.get("content", "")
+        and "nothing was run" in msg.get("content", "")
+        for msg in slot.messages
+    )

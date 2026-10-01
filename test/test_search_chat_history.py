@@ -7,8 +7,16 @@ These exercise the acceptance criteria EB-1, EB-3, EB-4, EB-5, EB-7b from
 
 from __future__ import annotations
 
+import pytest
+
 from kiro_crew import mcp_core
 from kiro_crew.history import ConversationLog
+
+
+@pytest.fixture(autouse=True)
+def established_session(monkeypatch):
+    monkeypatch.setenv("KIROCREW_SESSION_KEY", "dashboard:global-v1")
+
 
 # ── Pure helpers ──
 
@@ -252,7 +260,7 @@ class TestWorkspaceScope:
         monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
         self._seed_two_workspaces(tmp_path)
         # Resolve caller identity to the alpha-workspace session.
-        monkeypatch.setattr(mcp_core, "_resolve_session_key", lambda: "dashboard_chat-self")
+        monkeypatch.setenv("KIROCREW_SESSION_KEY", "dashboard_chat-self")
         out = mcp_core._call_tool_inner("search_chat_history", {"query": "widget bug"})
         assert "dashboard_chat-alpha" in out  # EB-cc3: same workspace surfaces
         assert "dashboard_chat-beta" not in out  # other workspace hidden
@@ -260,22 +268,22 @@ class TestWorkspaceScope:
     def test_all_workspaces_opt_in(self, tmp_path, monkeypatch):
         monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
         self._seed_two_workspaces(tmp_path)
-        monkeypatch.setattr(mcp_core, "_resolve_session_key", lambda: "dashboard_chat-self")
+        monkeypatch.setenv("KIROCREW_SESSION_KEY", "dashboard_chat-self")
         out = mcp_core._call_tool_inner(
             "search_chat_history", {"query": "widget bug", "all_workspaces": True}
         )
         assert "dashboard_chat-alpha" in out
         assert "dashboard_chat-beta" in out  # opt-in surfaces both
 
-    def test_unresolvable_caller_scopes_to_default_not_all(self, tmp_path, monkeypatch):
-        # Fail-closed: an unresolvable caller (no workspace) must NOT fail open to
+    def test_caller_without_workspace_scopes_to_default_not_all(self, tmp_path, monkeypatch):
+        # An established caller without workspace metadata must NOT fail open to
         # every workspace. It scopes to the "default" bucket (unset workspace).
         monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
         self._seed_two_workspaces(tmp_path)
         # Add an unset-workspace ("default" bucket) match.
         cl = ConversationLog(base_dir=tmp_path / "sessions")
         cl.append("dashboard_chat-default", "user", "the widget bug in default ws")
-        monkeypatch.setattr(mcp_core, "_resolve_session_key", lambda: "")
+        monkeypatch.setenv("KIROCREW_SESSION_KEY", "dashboard:no-workspace")
         out = mcp_core._call_tool_inner("search_chat_history", {"query": "widget bug"})
         assert "dashboard_chat-default" in out  # default bucket included
         assert "dashboard_chat-alpha" not in out  # named workspaces excluded
@@ -316,14 +324,14 @@ class TestGetChatSessionWorkspaceGate:
     def test_same_workspace_allowed(self, tmp_path, monkeypatch):
         monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
         self._seed(tmp_path)
-        monkeypatch.setattr(mcp_core, "_resolve_session_key", lambda: "dashboard_chat-self")
+        monkeypatch.setenv("KIROCREW_SESSION_KEY", "dashboard_chat-self")
         out = mcp_core._call_tool_inner("get_chat_session", {"session_key": "dashboard_chat-alpha"})
         assert "secret alpha content" in out
 
     def test_cross_workspace_denied(self, tmp_path, monkeypatch):
         monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
         self._seed(tmp_path)
-        monkeypatch.setattr(mcp_core, "_resolve_session_key", lambda: "dashboard_chat-self")
+        monkeypatch.setenv("KIROCREW_SESSION_KEY", "dashboard_chat-self")
         out = mcp_core._call_tool_inner("get_chat_session", {"session_key": "dashboard_chat-beta"})
         assert "Access denied" in out
         assert "secret beta content" not in out
@@ -331,11 +339,119 @@ class TestGetChatSessionWorkspaceGate:
     def test_cross_workspace_all_workspaces_opt_in(self, tmp_path, monkeypatch):
         monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
         self._seed(tmp_path)
-        monkeypatch.setattr(mcp_core, "_resolve_session_key", lambda: "dashboard_chat-self")
+        monkeypatch.setenv("KIROCREW_SESSION_KEY", "dashboard_chat-self")
         out = mcp_core._call_tool_inner(
             "get_chat_session", {"session_key": "dashboard_chat-beta", "all_workspaces": True}
         )
         assert "secret beta content" in out
+
+
+class TestLineTightenedBetweenCheckAndRead:
+    """The privacy gate is re-asked AFTER the rows are read.
+
+    Both tools check the metadata line, then read rows. A writer -- a same-key
+    hand-over landing a restricted tab's rows, a second gateway on the same data
+    home -- can tighten the line between the two, and a reader that trusted its
+    first look would hand back rows the file now says are private. The re-check
+    reads the line as it is once the rows are in hand.
+    """
+
+    @staticmethod
+    def _tighten_on_read(monkeypatch, _method_name):
+        """Tighten the line as the seam takes the transcript lock for the rows.
+
+        The tightening writer takes the same lock, so it lands before the seam's
+        hold (modelled here) or after it -- never inside; landing first, it is
+        what the seam's own check sees, whichever plain read the seam wraps.
+        """
+        real_locked_stems = ConversationLog.locked_stems
+        fired: set[str] = set()
+
+        def _tighten_then_lock(self, stems):
+            # The seam takes the whole lock set through ``locked_stems``.
+            stems = list(stems)
+            if any("dashboard_chat-1" in stem for stem in stems) and "done" not in fired:
+                fired.add("done")
+                self.update_metadata("dashboard_chat-1", {"memory_mode": "incognito"})
+            return real_locked_stems(self, stems)
+
+        monkeypatch.setattr(ConversationLog, "locked_stems", _tighten_then_lock)
+
+    def test_search_drops_a_session_tightened_during_its_row_read(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+        _seed_sessions(tmp_path)
+        self._tighten_on_read(monkeypatch, "read_messages")
+        out = mcp_core._call_tool_inner("search_chat_history", {"query": "redis"})
+        assert "dashboard_chat-1" not in out
+        assert "redis.timeout" not in out
+
+    def test_get_chat_session_refuses_a_session_tightened_during_its_row_read(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+        _seed_sessions(tmp_path)
+        self._tighten_on_read(monkeypatch, "recent")
+        out = mcp_core._call_tool_inner("get_chat_session", {"session_key": "dashboard_chat-1"})
+        assert "private" in out
+        assert "redis.timeout" not in out
+
+    def test_get_chat_session_refuses_an_unreadable_line_after_the_read(
+        self, tmp_path, monkeypatch
+    ):
+        """Fail closed: a line that cannot be read once the rows are in hand."""
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+        _seed_sessions(tmp_path)
+        # The first look goes through ``get_metadata`` (a bare dict, unreadable
+        # reads as {}); the re-check is the one caller of the status form here.
+        real_status = ConversationLog.get_metadata_status
+
+        def _unreadable(self, key):
+            if key == "dashboard_chat-1":
+                return {}, False
+            return real_status(self, key)
+
+        monkeypatch.setattr(ConversationLog, "get_metadata_status", _unreadable)
+        out = mcp_core._call_tool_inner("get_chat_session", {"session_key": "dashboard_chat-1"})
+        # An unreadable line is a transient failure, not a measured privacy mode:
+        # the rows are withheld, and the user is told to retry, not that the chat
+        # is private.
+        assert "redis.timeout" not in out
+        assert "private" not in out
+        assert "retry" in out.lower() or "being written" in out.lower()
+
+
+class TestABusyTranscriptSaysRetry:
+    def test_get_chat_session_says_busy_not_private(self, tmp_path, monkeypatch):
+        from kiro_crew.history import TranscriptBusy
+
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+        _seed_sessions(tmp_path)
+
+        def _busy(self, key, *args, **kwargs):
+            raise TranscriptBusy("held by another writer")
+
+        monkeypatch.setattr(ConversationLog, "derive_recent", _busy)
+        out = mcp_core._call_tool_inner("get_chat_session", {"session_key": "dashboard_chat-1"})
+        assert "try again" in out
+        assert "private" not in out
+        assert "redis.timeout" not in out
+
+    def test_search_skips_a_busy_session_and_keeps_the_rest(self, tmp_path, monkeypatch):
+        from kiro_crew.history import TranscriptBusy
+
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+        _seed_sessions(tmp_path)
+        real = ConversationLog.derive_messages
+
+        def _busy_for_one(self, key):
+            if key == "dashboard_chat-1":
+                raise TranscriptBusy("held by another writer")
+            return real(self, key)
+
+        monkeypatch.setattr(ConversationLog, "derive_messages", _busy_for_one)
+        out = mcp_core._call_tool_inner("search_chat_history", {"query": "redis"})
+        assert "dashboard_chat-1" not in out
+        assert not out.startswith("Error")
 
 
 class TestPostMergeHardening:
@@ -417,7 +533,7 @@ class TestPostMergeHardening:
             cl.update_metadata(f"decoy-{i}", {"workspace": "alpha"})
         # one real default-bucket match
         cl.append("real", "user", "the widget bug we discussed")
-        monkeypatch.setattr(mcp_core, "_resolve_session_key", lambda: "")
+        monkeypatch.setenv("KIROCREW_SESSION_KEY", "dashboard:no-workspace")
         out = mcp_core._call_tool_inner("search_chat_history", {"query": "widget", "limit": 5})
         assert "real" in out
         assert "decoy-" not in out

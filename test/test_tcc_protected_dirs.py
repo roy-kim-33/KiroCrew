@@ -18,6 +18,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
+from dashboard_owner_helpers import as_owner
 
 from kiro_crew import platform_compat
 from kiro_crew.dashboard.file_index import FileIndex
@@ -204,7 +205,7 @@ class TestFileIndexPruning:
 
     @pytest.mark.asyncio
     async def test_home_root_offers_dot_dir_but_not_tcc_dir(self, tmp_path):
-        """A dot-dir is an offered candidate (#5677); a TCC dir is not.
+        """A dot-dir is an offered candidate; a TCC dir is not.
 
         Regression: offering dot-dirs as candidates must not also start offering
         (and os.stat-ing) the TCC-gated top-level folders from a $HOME root --
@@ -266,8 +267,11 @@ def _make_app() -> web.Application:
     app.router.add_get("/api/file-search", api_file_search)
     state = MagicMock()
     state.file_indexes.get.return_value = None  # force the walk fallback
+    # A MagicMock attribute reads as a non-empty configured owner id, which no
+    # caller can equal, so the owner gate would answer every row alike.
+    state.owner_id = ""
     app["state"] = state
-    return app
+    return as_owner(app)
 
 
 @pytest.fixture()

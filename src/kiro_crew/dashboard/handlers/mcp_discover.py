@@ -17,7 +17,6 @@ import re
 
 from aiohttp import web
 
-from kiro_crew.dashboard.handlers.discover import _redact_external
 from kiro_crew.dashboard.handlers.mcp import (
     _find_server_spec_anywhere,
     _get_mcp_lock,
@@ -25,6 +24,8 @@ from kiro_crew.dashboard.handlers.mcp import (
     _offload_config_write,
     _set_kirocrew_entry,
 )
+from kiro_crew.external_text import redact_external_text as _redact_external
+from kiro_crew.mcp_cleanup import mcp_entry_is_muted
 from kiro_crew.mcp_providers.base import ProviderRegistry, ProviderUnavailableError
 from kiro_crew.mcp_providers.capability import CapabilityProvider
 from kiro_crew.mcp_providers.official import OfficialRegistryProvider
@@ -138,8 +139,10 @@ async def api_mcp_discover(request: web.Request) -> web.Response:
     """GET /api/mcp/discover?q=<query>[&provider=<name>][&limit=N]
 
     Multi-provider MCP server search. A query shorter than 2 chars returns
-    ``{"results": [], "providers": [...]}`` WITHOUT calling any provider —
-    the cheap availability probe the frontend gates its UI on.
+    ``{"results": [], "providers": [...], "provider_outcomes": []}``
+    WITHOUT calling any provider — the cheap availability probe the frontend
+    gates its UI on. Completed searches add one ``provider_outcomes`` row per
+    attempted provider while preserving the legacy ``providers`` name list.
     """
     query = request.query.get("q", "").strip()
     provider_filter = request.query.get("provider", "").strip() or None
@@ -152,9 +155,13 @@ async def api_mcp_discover(request: web.Request) -> web.Response:
     provider_names = [p.name for p in registry.available_providers]
 
     if len(query) < _MIN_QUERY_LEN:
-        return web.json_response({"results": [], "providers": provider_names})
+        return web.json_response(
+            {"results": [], "providers": provider_names, "provider_outcomes": []}
+        )
 
-    results = await registry.search(query, provider=provider_filter, limit=limit)
+    search_response = await registry.search_with_outcomes(
+        query, provider=provider_filter, limit=limit
+    )
 
     # Cross-ref against KiroCrew's configured servers so the UI can badge
     # already-installed entries. list_servers() reads config files
@@ -162,7 +169,7 @@ async def api_mcp_discover(request: web.Request) -> web.Response:
     configured = await asyncio.to_thread(_configured_server_names)
 
     items = []
-    for r in results:
+    for r in search_response.results:
         # A discovered server lands in config under its sanitized short name
         # (or, for legacy slashed ids, its kiro-safe alias) — check all
         # plausible keys plus the raw provider id (edition registry ids).
@@ -186,6 +193,11 @@ async def api_mcp_discover(request: web.Request) -> web.Response:
             }
         )
 
+    provider_outcomes = [
+        {"name": _redact_external(outcome.name), "status": outcome.status}
+        for outcome in search_response.provider_outcomes
+    ]
+    failed_provider_count = sum(outcome["status"] != "ok" for outcome in provider_outcomes)
     sel().log_tool_invocation(
         session_key=request.get("session_key", "dashboard"),
         tool_name="discover_mcp_servers",
@@ -195,9 +207,16 @@ async def api_mcp_discover(request: web.Request) -> web.Response:
             "query": query,
             "provider_filter": provider_filter or "all",
             "result_count": str(len(items)),
+            "failed_provider_count": str(failed_provider_count),
         },
     )
-    return web.json_response({"results": items, "providers": provider_names})
+    return web.json_response(
+        {
+            "results": items,
+            "providers": provider_names,
+            "provider_outcomes": provider_outcomes,
+        }
+    )
 
 
 async def api_mcp_discover_detail(request: web.Request) -> web.Response:
@@ -263,6 +282,15 @@ async def api_mcp_discover_install(request: web.Request) -> web.Response:
     write it into the KiroCrew scope enabled=true (reusing the mcp.py write
     helpers). provider=capability: delegate to the edition manager.
     """
+    # Body-scope import, like the sibling gates in this package
+    # (``connections.py``, ``mcp_apps.py``, ``files.py``): ``source_providers``
+    # reaches back into sibling handler modules, so importing the helper at
+    # module scope from here would close a cycle.
+    from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+
+    owner_denied = await require_owner_dashboard_request(request, "mcp_discover_install")
+    if owner_denied is not None:
+        return owner_denied
     try:
         body = await request.json()
     except Exception:
@@ -345,8 +373,9 @@ async def _install_from_official(request: web.Request, server_id: str) -> web.Re
             # Identical spec already present — a reinstall is a pure no-op:
             # the user's env values AND enabled/disabled state survive.
             # (Re-enabling here would reopen the one-click path around the
-            # configure-then-enable consent step.)
-            enable_now = not existing.get("disabled", False)
+            # configure-then-enable consent step.) Reported through the launch
+            # predicate, so a non-boolean ``disabled`` reads as off here too.
+            enable_now = not mcp_entry_is_muted(existing)
 
     # Rebuild the rendered agent configs so the new server loads on the next
     # session, mirroring api_mcp_apply. Best-effort: the config write above

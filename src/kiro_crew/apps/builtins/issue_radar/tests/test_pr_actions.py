@@ -26,6 +26,7 @@ import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from aiohttp import web
@@ -894,6 +895,9 @@ def _req(payload: object) -> web.Request:
     the malformed-body paths are reached.
     """
     request = make_mocked_request("POST", "/api/apps/issue-radar/pull/state")
+    request.app["state"] = SimpleNamespace(owner_id="")
+    request["user"] = "local-app"
+    request["app"] = ""
 
     async def _json(*_args: object, **_kwargs: object) -> object:
         if isinstance(payload, Exception):
@@ -943,7 +947,7 @@ class TestReviewRoutePinning(unittest.TestCase):
 
         GitLab's ``/approve`` takes a real ``sha`` precondition, but GitHub's
         ``commit_id`` is only ATTRIBUTION — GitHub accepts a review naming a commit that
-        is no longer the head and records it there, and whether that stale approval still
+        is not the head and records it there, and whether that stale approval still
         counts toward branch protection is a per-repo setting. Where "dismiss stale
         approvals" is off, an unchecked approval satisfies protection on code nobody
         read. So the app reads the head itself, exactly as the merge route does.

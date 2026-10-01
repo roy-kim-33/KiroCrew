@@ -17,9 +17,12 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+import platform
 from typing import Any
 
 import aiohttp
+
+from kiro_crew import __version__ as _kirocrew_version
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +34,26 @@ DEFAULT_API_BASE = "https://wakatime.com/api/v1"
 # more than this should chunk; the client does not silently drop the tail.
 MAX_HEARTBEATS_PER_REQUEST = 25
 
+
+def _user_agent() -> str:
+    """A WakaTime-plugin-style User-Agent.
+
+    WakaTime resolves the editor and operating system for its dashboard from
+    this header, not from a heartbeat body field, so identifying Kiro Crew here
+    is what keeps activity from landing under ``Unknown OS`` / ``Unknown``. The
+    shape mirrors the official plugins,
+    ``wakatime/<ver> (<os>-<release>) kirocrew/<ver>``, whose leading slot is
+    the wakatime-cli version. Kiro Crew speaks the API directly and bundles no
+    wakatime-cli, so both slots carry Kiro Crew's own package version.
+    """
+    try:
+        os_name = platform.system() or "unknown"
+        os_release = platform.release() or ""
+    except Exception:
+        os_name, os_release = "unknown", ""
+    return f"wakatime/{_kirocrew_version} ({os_name}-{os_release}) kirocrew/{_kirocrew_version}"
+
+
 _DEFAULT_TIMEOUT_SECS = 30
 
 
@@ -39,6 +62,17 @@ class WakaTimeAuthError(Exception):
 
     Distinct from a transport failure (which returns ``None``): a wrong key is a
     configuration problem the caller should surface, not retry.
+    """
+
+
+class WakaTimeUnavailableError(Exception):
+    """Raised by the ``*_strict`` read verbs when the upstream call fails.
+
+    The plain read verbs (:meth:`get_summaries`, :meth:`get_stats`) swallow every
+    ``_api`` failure into an empty result so an agent turn degrades quietly. A
+    caller that must tell "the request failed" apart from "there is no data" — a
+    billing export, where an empty result is a real figure — uses the strict verb
+    instead and gets this exception on failure rather than a silent ``[]``.
     """
 
 
@@ -57,7 +91,7 @@ class WakaTimeClient:
     def _headers(self) -> dict[str, str]:
         # WakaTime Basic auth: the API key is the username, password empty.
         token = base64.b64encode(f"{self._api_key}:".encode()).decode("ascii")
-        return {"Authorization": f"Basic {token}"}
+        return {"Authorization": f"Basic {token}", "User-Agent": _user_agent()}
 
     # ── Session lifecycle ──
 
@@ -144,7 +178,7 @@ class WakaTimeClient:
         """Confirm the key works by reading the current user. Raises
         :class:`WakaTimeAuthError` on 401/403, returns the user dict on success.
 
-        Used to validate a newly-entered key before persisting it. Distinct from
+        Validates a newly-entered key before persisting it. Distinct from
         the read verbs: a caller wants a hard signal that the key is valid, not a
         silent empty result.
         """
@@ -202,6 +236,32 @@ class WakaTimeClient:
                 return [d for d in data if isinstance(d, dict)]
         return []
 
+    async def fetch_summaries(
+        self, start: str, end: str, *, project: str | None = None
+    ) -> list[dict]:
+        """Like :meth:`get_summaries`, but RAISE on an upstream failure.
+
+        ``_api`` returns ``None`` on any failure (non-2xx, transport error,
+        timeout, exhausted 429) and a dict on success (``{}`` for an empty 2xx).
+        This verb turns that ``None`` into :class:`WakaTimeUnavailableError` so a
+        caller can tell "the summaries request failed" apart from "the range has
+        no activity" — the two are indistinguishable through :meth:`get_summaries`,
+        which is what makes a silent empty billing export possible. A successful
+        summaries response always carries a ``data`` list (empty for a range with
+        no activity), so anything without one — ``None`` from ``_api``, or the
+        ``{}`` ``_api`` returns for a non-JSON 200 body (plausible from a
+        self-hosted backend behind a proxy) — is treated as a failure and raises,
+        never as a false-empty export.
+        """
+        params = {"start": start, "end": end}
+        if project:
+            params["project"] = project
+        result = await self._api("GET", "/users/current/summaries", params=params)
+        data = result.get("data") if isinstance(result, dict) else None
+        if not isinstance(data, list):
+            raise WakaTimeUnavailableError("WakaTime summaries request failed or returned no data")
+        return [d for d in data if isinstance(d, dict)]
+
     async def get_stats(self, wakatime_range: str = "last_7_days") -> dict[str, Any]:
         """GET aggregate stats for a named range (e.g. ``last_7_days``).
 
@@ -213,6 +273,23 @@ class WakaTimeClient:
             if isinstance(data, dict):
                 return data
         return {}
+
+    async def fetch_stats(self, wakatime_range: str = "last_7_days") -> dict[str, Any]:
+        """Like :meth:`get_stats`, but RAISE on an upstream failure.
+
+        Same contract as :meth:`fetch_summaries`: a successful stats response
+        always carries a ``data`` dict (its fields empty for a range with no
+        activity), so anything without one — ``None`` from ``_api`` on a failure,
+        or the ``{}`` ``_api`` returns for a non-JSON 200 body — is a failure and
+        raises :class:`WakaTimeUnavailableError` rather than degrading to a false
+        empty result. Used where an empty payload must not be mistaken for real
+        zero data.
+        """
+        result = await self._api("GET", f"/users/current/stats/{wakatime_range}")
+        data = result.get("data") if isinstance(result, dict) else None
+        if not isinstance(data, dict):
+            raise WakaTimeUnavailableError("WakaTime stats request failed or returned no data")
+        return data
 
     async def get_durations(self, date: str, *, project: str | None = None) -> list[dict]:
         """GET the duration blocks for a single ``date`` (YYYY-MM-DD).

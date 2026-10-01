@@ -62,6 +62,8 @@ class FakeGit:
 
     def __init__(self) -> None:
         self.calls: list[tuple[str, ...]] = []
+        #: The ``cwd`` each call was given, index-aligned with ``calls``.
+        self.cwds: list[str | None] = []
         self.rules: list[tuple[tuple[str, ...], int, str, str]] = []
         self.raise_on: tuple[str, ...] = ()
 
@@ -72,8 +74,14 @@ class FakeGit:
     def joined(self) -> list[str]:
         return [" ".join(call) for call in self.calls]
 
-    def __call__(self, *args: str, timeout: float = 60.0) -> subprocess.CompletedProcess[str]:
+    def __call__(
+        self, *args: str, timeout: float = 60.0, cwd: str | None = None
+    ) -> subprocess.CompletedProcess[str]:
+        # ``cwd`` is RECORDED rather than merely tolerated: the real ``_git`` pins the
+        # child's working directory to the same absolute path it passes as ``-C``, and a
+        # double that swallowed the kwarg could not witness that pin at all.
         self.calls.append(tuple(args))
+        self.cwds.append(cwd)
         if self.raise_on and all(word in args for word in self.raise_on):
             raise subprocess.SubprocessError("stub refuses this call")
         for words, rc, out, err in self.rules:
@@ -328,8 +336,7 @@ class TestNeutralizeOrigin:
 
     def test_an_unreadable_config_is_not_treated_as_a_breach(self, git: FakeGit) -> None:
         """The clone is gone (swept, or the watcher lost the race) — there is nothing to
-        assert, and refusing here would strand a watcher on a directory that no longer
-        exists."""
+        assert, and refusing here would strand a watcher on a directory that does not exist."""
         git.raise_on = ("get-url",)
         assert W.assert_origin_neutralized("/clone") == (True, [])
 

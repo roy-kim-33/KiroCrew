@@ -68,6 +68,27 @@ vi.mock('framer-motion', async () => {
   }
 })
 
+// Count row-menu renders through the real components: the displacement test
+// below pins that a moved row does not rebuild its menus.
+const menuRenders = { dropdown: 0, contextContent: 0 }
+vi.mock('../components/ui/dropdown-menu', async (orig) => {
+  const React = await import('react')
+  const real = await orig<typeof import('../components/ui/dropdown-menu')>()
+  const DropdownMenu = (props: React.ComponentProps<typeof real.DropdownMenu>) => {
+    menuRenders.dropdown++
+    return React.createElement(real.DropdownMenu, props)
+  }
+  return { ...real, DropdownMenu }
+})
+vi.mock('../components/ui/context-menu', async (orig) => {
+  const React = await import('react')
+  const real = await orig<typeof import('../components/ui/context-menu')>()
+  const ContextMenuContent = React.forwardRef((props: React.ComponentProps<typeof real.ContextMenuContent>, ref) => {
+    menuRenders.contextContent++
+    return React.createElement(real.ContextMenuContent, { ...props, ref } as React.ComponentProps<typeof real.ContextMenuContent>)
+  })
+  return { ...real, ContextMenuContent }
+})
 vi.mock('../components/ProjectPicker', () => ({ default: () => null }))
 // Legacy single-lane list (no tag columns) keeps the rows flat + easy to query.
 vi.mock('../pages/chat/ChatSettings', () => ({
@@ -91,7 +112,7 @@ Object.defineProperty(window, 'matchMedia', {
   })),
 })
 
-import ChatSidebar, { sessionRowRenderProbe } from '../pages/ChatSidebar'
+import ChatSidebar, { sessionRowRenderProbe, SIDEBAR_DISPLACEMENT_WINDOW } from '../pages/ChatSidebar'
 import { setSlotStatusDetail } from '../store/chatSlice'
 
 const slot = (key: string, over: Record<string, unknown> = {}) => ({
@@ -180,6 +201,43 @@ function renderSidebarParts() {
   return { store, sidebarBelowProviders, wrap }
 }
 
+/** Like renderSidebarParts, but the row set is the caller's and the returned
+ *  element takes the CURRENT slot array, so a harness can insert a row below
+ *  the providers (the production shape for a slots-frame arrival). */
+function renderSidebarWithSlots(slots: ReturnType<typeof slot>[]) {
+  const store = createTestStore({
+    dashboard: {
+      status: {}, connected: true, slots, approvalMode: 'normal',
+      channelTrusted: false, refreshTrigger: 0, unreadSlots: [], updateProgress: null,
+      slotsLoaded: true,
+      subagentRunning: {}, subagentDetails: {}, subagentText: {},
+      sessionDefaultColor: null, sessionColorsMode: 'tint', sessionColorsPalette: 'horizon', sessionColorsIntensity: 'clear',
+    } as unknown as RootState['dashboard'],
+    chat: {
+      activeSlot: null, slotStatusDetail: {}, subagents: {}, slotActivity: {},
+      subagentQueued: {}, goalLoops: {}, workflowRuns: {},
+    } as unknown as RootState['chat'],
+  })
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
+  qc.setQueryData(['chat-folders'], [])
+  const sidebarWithSlots = (rows: ReturnType<typeof slot>[]) => (
+    <ChatSidebar
+      slots={rows} activeSlot={null} unreadSlots={EMPTY_UNREAD}
+      history={EMPTY_HISTORY} historyHasMore={false} defaultAgent="" installedAgents={EMPTY_AGENTS}
+    />
+  )
+  const wrap = (children: React.ReactElement) => (
+    <QueryClientProvider client={qc}>
+      <Provider store={store}>
+        <ThemeProvider>
+          <MemoryRouter>{children}</MemoryRouter>
+        </ThemeProvider>
+      </Provider>
+    </QueryClientProvider>
+  )
+  return { store, sidebarWithSlots, wrap }
+}
+
 const counts: Record<string, number> = {}
 beforeEach(() => {
   localStorage.clear()
@@ -200,11 +258,11 @@ describe('chat sidebar — session row memo boundary', () => {
     for (const k of Object.keys(counts)) delete counts[k]
 
     act(() => {
-      // A server-supplied status kind passes its text through verbatim
-      // (toolStatusLabel), so the assertion is independent of the
-      // simplifiedToolNames preference.
+      // A server-supplied status (a `thinking` phase whose label is not the
+      // fixed literal) passes its label through verbatim (toolStatusLabel), so
+      // the assertion is independent of the simplifiedToolNames preference.
       store.dispatch(setSlotStatusDetail({
-        slot: 'k-b', kind: 'status', text: 'Poking the build', ts: 1,
+        slot: 'k-b', kind: 'thinking', label: 'Poking the build', ts: 1,
       }))
     })
 
@@ -241,6 +299,72 @@ describe('chat sidebar — session row memo boundary', () => {
     act(() => { setters[setters.length - 1](true) })
 
     expect(counts).toEqual({})
+  })
+
+  // A top insertion shifts every row's paint ordinal by one. Unclamped, that
+  // voids all N memo boundaries for one visible change; the clamp bounds the
+  // re-render set to the window plus the new row, so the cost of New Chat stops
+  // scaling with the session count. Rows past the window keep their (shared)
+  // stamp and bail out — they snap rather than slide, by design.
+  it('a top insertion re-renders only the rows inside the displacement window', () => {
+    const N = SIDEBAR_DISPLACEMENT_WINDOW + 40
+    const initial = Array.from({ length: N }, (_, i) => slot(`r-${String(i).padStart(3, '0')}`))
+    const setters: Array<(v: typeof initial) => void> = []
+    function Harness({ sidebar }: { sidebar: (s: typeof initial) => React.ReactElement }) {
+      const [rows, setRows] = React.useState(initial)
+      setters.push(setRows)
+      return sidebar(rows)
+    }
+    const { sidebarWithSlots, wrap } = renderSidebarWithSlots(initial)
+    render(wrap(<Harness sidebar={sidebarWithSlots} />))
+    expect(Object.keys(counts)).toHaveLength(N)
+    for (const k of Object.keys(counts)) delete counts[k]
+
+    act(() => { setters[setters.length - 1]([slot('r-new'), ...initial]) })
+
+    const rerendered = Object.keys(counts).sort()
+    // The new row mounts…
+    expect(rerendered).toContain('r-new')
+    // …the displaced rows that took ordinals 1..WINDOW re-render (their stamp
+    // moved)…
+    for (let i = 0; i < SIDEBAR_DISPLACEMENT_WINDOW; i++) {
+      expect(counts[`r-${String(i).padStart(3, '0')}`]).toBeGreaterThan(0)
+    }
+    // …and every row that was already at or past the window bails out.
+    for (let i = SIDEBAR_DISPLACEMENT_WINDOW; i < N; i++) {
+      expect(counts[`r-${String(i).padStart(3, '0')}`]).toBeUndefined()
+    }
+    expect(rerendered).toHaveLength(SIDEBAR_DISPLACEMENT_WINDOW + 1)
+  })
+
+  // A displaced row re-renders for the layout spring, but nothing in its ⋯
+  // dropdown or its context-menu content depends on position: those elements
+  // are memoized and React skips them. Building them on every displacement is
+  // ~90% of a pin's render work in a 65-session sidebar.
+  it('a displaced row re-renders without rebuilding its menus', () => {
+    const N = 20
+    const initial = Array.from({ length: N }, (_, i) => slot(`m-${String(i).padStart(2, '0')}`))
+    const setters: Array<(v: typeof initial) => void> = []
+    function Harness({ sidebar }: { sidebar: (s: typeof initial) => React.ReactElement }) {
+      const [rows, setRows] = React.useState(initial)
+      setters.push(setRows)
+      return sidebar(rows)
+    }
+    const { sidebarWithSlots, wrap } = renderSidebarWithSlots(initial)
+    render(wrap(<Harness sidebar={sidebarWithSlots} />))
+    for (const k of Object.keys(counts)) delete counts[k]
+    menuRenders.dropdown = 0
+    menuRenders.contextContent = 0
+
+    act(() => { setters[setters.length - 1]([slot('m-new'), ...initial]) })
+
+    // Every existing row moved down one slot and re-rendered...
+    for (const row of initial) expect(counts[row.key]).toBeGreaterThan(0)
+    // ...but only the NEW row built a context menu, and the dropdowns built are
+    // the new row's plus whatever the sidebar shell owns -- nowhere near one per
+    // displaced row.
+    expect(menuRenders.contextContent).toBe(1)
+    expect(menuRenders.dropdown).toBeLessThan(N / 2)
   })
 })
 

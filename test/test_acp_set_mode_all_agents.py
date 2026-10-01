@@ -1,6 +1,6 @@
 """Regression test: session/set_mode must be called for ALL agents, not just default.
 
-Bug introduced in 24f98e5 (2026-02-27) — set_mode was skipped for custom agents
+set_mode can be skipped for custom agents
 under the incorrect assumption that --agent CLI flag alone activates the agent.
 In reality, --agent loads the agent config but set_mode is required to activate
 the agent's prompt/persona in the session.
@@ -86,6 +86,36 @@ async def test_set_mode_fails_closed_when_agent_not_in_advertised_modes(tmp_path
         c for c in client._send_request.call_args_list if c.args[0] == METHOD_SET_MODE
     ]
     assert set_mode_calls == [], "the wrong agent mode must never be activated"
+
+
+@pytest.mark.asyncio
+async def test_unavailable_readonly_spec_is_explained_not_sent_to_setup(tmp_path, monkeypatch):
+    """A derived ``<agent>--readonly`` side spec is not created by ``kirocrew
+    setup``, so the refusal names what it is and the base agent instead."""
+    import json
+
+    from kiro_crew import agent as agent_mod
+    from kiro_crew.acp.client import AcpError
+    from kiro_crew.dashboard import side_readonly_spec as srs
+
+    registry = tmp_path / "agents"
+    registry.mkdir()
+    monkeypatch.setattr(agent_mod, "KIRO_AGENTS_DIR", registry)
+    monkeypatch.setattr(srs, "_refresh_materialized_snapshot", lambda: None)
+    (registry / "scout.json").write_text(json.dumps({"name": "scout"}), encoding="utf-8")
+    srs.publish_readonly_spec("scout")
+
+    client = _make_client("scout--readonly", tmp_path)
+    client._session_id = None
+    client._send_request = AsyncMock(return_value=1)
+    client._wait_for_response = AsyncMock(side_effect=await _wait_with_modes(["kirocrew"]))
+    client._drain_notifications = AsyncMock()
+
+    with patch("pathlib.Path.exists", return_value=False), patch("pathlib.Path.stat"):
+        with pytest.raises(AcpError, match="not available") as exc:
+            await client._initialize_session()
+    assert "kirocrew setup --agent-only" not in str(exc.value)
+    assert "name 'scout'" in str(exc.value)
 
 
 @pytest.mark.asyncio

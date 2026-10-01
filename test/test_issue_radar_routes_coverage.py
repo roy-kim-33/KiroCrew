@@ -36,6 +36,7 @@ from urllib.parse import urlencode
 
 from aiohttp import web
 from aiohttp.test_utils import make_mocked_request
+from dashboard_owner_helpers import NoConfiguredOwner
 
 from kiro_crew.apps.builtins.issue_radar.backend import github_client as gh
 from kiro_crew.apps.builtins.issue_radar.backend import provider, routes, store
@@ -69,6 +70,10 @@ def _json_request(method: str, path: str, body: object) -> web.Request:
     exactly what the handlers' ``except Exception -> 400`` branch is written for.
     """
     req = make_mocked_request(method, f"{BASE}/{path}")
+    if "state" not in req.app:
+        req.app["state"] = NoConfiguredOwner()
+    req["user"] = "local-app"
+    req["app"] = ""
     if body is None:
         req.json = AsyncMock(side_effect=ValueError("not json"))  # type: ignore[method-assign]
     else:
@@ -2004,8 +2009,8 @@ class TestPrAiFingerprint(unittest.TestCase):
 
     def test_an_edited_comment_changes_it(self):
         # Editing a comment changes neither its created_at nor the comment count,
-        # so a metadata-only digest would keep serving a summary written from text
-        # that no longer exists.
+        # so a metadata-only digest would keep serving a summary written from the
+        # replaced text.
         self.assertNotEqual(
             self._fp(), self._fp(timeline=[_ev("comment", "a", "2026-01-01", "edited")])
         )

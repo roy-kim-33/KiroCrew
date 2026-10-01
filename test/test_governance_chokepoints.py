@@ -163,6 +163,190 @@ class TestSpawnGate:
         assert subagent._vet_spawn_governance("cli_chat", "anything") is None
 
 
+_SPAWN_OFF = {
+    "version": 1,
+    "boot": {"fail_closed": True},
+    "capabilities": {"spawn": {"enabled": False}},
+}
+_SPAWN_RESEARCHER_ONLY = {
+    "version": 1,
+    "boot": {"fail_closed": True},
+    "capabilities": {
+        "spawn": {
+            "enabled": True,
+            "scopes": {"agents": {"mode": "allow", "allow": ["researcher"]}},
+        }
+    },
+}
+
+
+def _kas_spawn_event(target: str):
+    """The permission event Crew builds from KAS 2.24's sub-agent spawn request."""
+    from kiro_crew.acp._dispatch import build_permission_event
+    from kiro_crew.acp.types import JsonRpcMessage
+
+    params = {
+        "sessionId": "s1",
+        "toolCall": {"toolCallId": "invoke_subagent_t1", "title": f"Sub-agent: {target}"},
+        "options": [{"optionId": "allow_once", "name": "Allow", "kind": "allow_once"}],
+        "_meta": {
+            "kiro": {
+                "toolId": "invoke_sub_agent",
+                "consent": {"capability": "subagent", "resource": target, "askType": "implicit"},
+            }
+        },
+    }
+    event, _ = build_permission_event(
+        JsonRpcMessage(id=1, method="session/request_permission", params=params),
+        shell_cache={},
+        kas_consent_meta=True,
+    )
+    return event
+
+
+def _gate(event):
+    from kiro_crew.hooks import HookManager, hook_gate_kwargs
+
+    return HookManager().on_tool_call(
+        event.title, session_key="cli_chat", **hook_gate_kwargs(event)
+    )
+
+
+class TestKasSpawnIsVettedAgainstTheSpawnPolicy:
+    """A KAS spawn the gate classifies must meet ``capabilities.spawn`` before any
+    grant or prompt -- the ``tools`` question alone cannot see a spawn policy."""
+
+    def test_a_disabled_spawn_capability_denies_it(self):
+        from kiro_crew.hooks import TOOL_DENY
+
+        _install(_SPAWN_OFF)
+        event = _kas_spawn_event("researcher")
+        assert event.spawn_target == "researcher"
+        result = _gate(event)
+        assert result.action == TOOL_DENY
+        assert "spawn policy" in (result.reason or "")
+
+    def test_the_agents_scope_is_judged_on_the_stated_target(self):
+        from kiro_crew.hooks import TOOL_DENY
+
+        _install(_SPAWN_RESEARCHER_ONLY)
+        assert _gate(_kas_spawn_event("deployer")).action == TOOL_DENY
+        assert _gate(_kas_spawn_event("researcher")).action != TOOL_DENY
+
+    def test_an_ungoverned_host_does_not_deny_it(self):
+        from kiro_crew.hooks import TOOL_DENY
+
+        _install(None)
+        assert _gate(_kas_spawn_event("anything")).action != TOOL_DENY
+
+    def test_a_call_with_no_spawn_target_is_not_spawn_vetted(self):
+        """Every other backend's events carry no target, so their gate is unchanged."""
+        from kiro_crew.hooks import TOOL_DENY, HookManager
+
+        _install(_SPAWN_OFF)
+        result = HookManager().on_tool_call("Sub-agent: researcher", session_key="cli_chat")
+        assert result.action != TOOL_DENY
+
+
+class TestKasSpawnHonoursTheCallersTaskProfile:
+    """A profile bound to the spawning agent's name is half of ``policy ∩ profile``;
+    the spawn vet must reach it the way the gate's ``tools`` plane does."""
+
+    def test_a_task_profile_that_forbids_spawning_denies_it(self):
+        import json
+
+        from kiro_crew.hooks import TOOL_DENY, HookManager, hook_gate_kwargs
+
+        _install(None)
+        (gp._PROFILES_DIR / "researcher.json").write_text(
+            json.dumps(
+                {
+                    "name": "researcher",
+                    "bind": {"type": "task", "id": "researcher"},
+                    "capabilities": {"spawn": {"enabled": False}},
+                }
+            )
+        )
+        gp.reset_store()
+        event = _kas_spawn_event("helper")
+        gate = HookManager()
+        denied = gate.on_tool_call(
+            event.title, session_key="cli_chat", agent="researcher", **hook_gate_kwargs(event)
+        )
+        assert denied.action == TOOL_DENY
+        assert "spawn policy" in (denied.reason or "")
+        other = gate.on_tool_call(
+            event.title, session_key="cli_chat", agent="writer", **hook_gate_kwargs(event)
+        )
+        assert other.action != TOOL_DENY
+
+
+class TestSpawnGrantIsWithheldUnderASpawnPolicy:
+    """An auto-approved spawn raises no request, so the per-spawn check would never
+    run for it: while a spawn policy restricts spawning, no ``allowedTools`` writer
+    -- the KAS projection or kiro-cli's own spec -- keeps ``use_subagent``."""
+
+    def test_a_disabled_spawn_capability_withholds_it_on_kas(self):
+        from kiro_crew.acp import kas_agents
+
+        _install(_SPAWN_OFF)
+        kept = kas_agents._ceiling_permitted(["use_subagent", "web_fetch"], "a")
+        assert kept == ["web_fetch"]
+
+    def test_a_disabled_spawn_capability_withholds_it_on_kiro_cli(self):
+        from kiro_crew import agent
+
+        _install(_SPAWN_OFF)
+        assert agent._may_auto_approve("use_subagent") is False
+        assert agent._may_auto_approve("web_fetch") is True
+
+    def test_an_agents_scope_withholds_it(self):
+        from kiro_crew.platform.governance import may_skip_gate_now
+
+        _install(_SPAWN_RESEARCHER_ONLY)
+        assert may_skip_gate_now("use_subagent") is False
+
+    def test_a_profile_that_restricts_spawning_withholds_it(self):
+        import json
+
+        from kiro_crew.platform.governance import may_skip_gate_now
+
+        _install(None)
+        (gp._PROFILES_DIR / "researcher.json").write_text(
+            json.dumps(
+                {
+                    "name": "researcher",
+                    "bind": {"type": "task", "id": "researcher"},
+                    "capabilities": {"spawn": {"enabled": False}},
+                }
+            )
+        )
+        gp.reset_store()
+        assert may_skip_gate_now("use_subagent") is False
+
+    def test_an_enabled_unscoped_spawn_capability_keeps_it(self):
+        from kiro_crew.acp import kas_agents
+        from kiro_crew.platform.governance import may_skip_gate_now
+
+        _install(
+            {
+                "version": 1,
+                "boot": {"fail_closed": True},
+                "capabilities": {"spawn": {"enabled": True}},
+            }
+        )
+        assert may_skip_gate_now("use_subagent") is True
+        assert kas_agents._ceiling_permitted(["use_subagent"], "a") == ["use_subagent"]
+
+    def test_no_policy_leaves_both_backends_unchanged(self):
+        from kiro_crew import agent
+        from kiro_crew.acp import kas_agents
+
+        _install(None)
+        assert agent._may_auto_approve("use_subagent") is True
+        assert kas_agents._ceiling_permitted(["use_subagent"], "a") == ["use_subagent"]
+
+
 # ── shared helpers ──
 class TestHelpers:
     def test_governance_permits_capability(self):
@@ -311,16 +495,12 @@ class TestThemeInstallGate:
 
     def test_default_ungoverned_permits(self):
         _install(None)
-        d = gp.governance_permits(
-            "capabilities.theme_install", "", log_warning=False
-        )
+        d = gp.governance_permits("capabilities.theme_install", "", log_warning=False)
         assert d.permitted
 
     def test_policy_present_but_silent_permits(self):
         _install({"version": 1, "boot": {"fail_closed": True}})
-        d = gp.governance_permits(
-            "capabilities.theme_install", "", log_warning=False
-        )
+        d = gp.governance_permits("capabilities.theme_install", "", log_warning=False)
         assert d.permitted
 
     def test_policy_disabled_blocks(self):
@@ -333,9 +513,7 @@ class TestThemeInstallGate:
                 "capabilities": {"theme_install": {"enabled": False}},
             }
         )
-        d = gp.governance_permits(
-            "capabilities.theme_install", "", log_warning=False
-        )
+        d = gp.governance_permits("capabilities.theme_install", "", log_warning=False)
         assert not d.permitted
 
     def test_evaluation_error_fails_closed(self, monkeypatch):
@@ -394,7 +572,7 @@ class TestThemeExperienceGate:
         assert not d.permitted
 
     def test_evaluation_error_fails_closed(self, monkeypatch):
-        # Regression (GPT 5.6 HIGH on PR #107): the chat_runner injection gate
+        # The chat_runner injection gate
         # passes fail_closed=True because governance is the ONLY enforcement of
         # the enterprise persona off-switch. A governance-evaluation error must
         # yield a DENYING Decision (persona skipped), not the default
@@ -924,6 +1102,18 @@ class TestAppsGate:
 
         assert manager._app_activation_denied("anything") is None
 
+    def test_platform_composition_error_still_propagates(self, monkeypatch):
+        from kiro_crew.apps import manager
+        from kiro_crew.platform.context import PlatformCompositionError
+
+        def _raise_composition_error(*_args, **kwargs):
+            assert kwargs["fail_closed"] is True
+            raise PlatformCompositionError("governance composition failed")
+
+        monkeypatch.setattr(gp, "governance_permits", _raise_composition_error)
+        with pytest.raises(PlatformCompositionError, match="governance composition failed"):
+            manager._app_activation_denied("anything", fail_closed=True)
+
     def test_host_bound_profile_governs_app_activation(self):
         # H-p4: app activation runs through the _host session key
         # (surface "host"), so a profile bound to surface:host narrows it on top
@@ -1030,6 +1220,62 @@ class TestFilesystemEgressAtGate:
             raw_params={"path": "/home/u/workspace/site.py"},
         )
         assert allowed.action != TOOL_DENY
+
+    def test_filesystem_write_denied_via_diff_only_edit(self):
+        # The same confinement must bind an edit whose target is named ONLY in
+        # the diff content block (event.diff_path): governance classifies the
+        # params-union-diff-block target set, so a diff-only edit outside the
+        # allow-list is denied rather than reaching the ceiling pathless.
+        # Paths come from _fs_tree so they are platform-absolute: a POSIX
+        # literal fails os.path.isabs on Windows and would trip the unanchored
+        # hard-deny instead of exercising the ceiling this test is about.
+        _install(
+            {
+                "version": 1,
+                "boot": {"fail_closed": True},
+                "filesystem": {
+                    "write": {"mode": "allow", "allow": [self._fs_tree("workspace", "**")]}
+                },
+            }
+        )
+        from kiro_crew.hooks import TOOL_DENY, HookManager
+
+        hooks = HookManager()
+        denied = hooks.on_tool_call(
+            "code",
+            session_key="cli_chat",
+            tool_kind="edit",
+            raw_params={"command": "create", "fileText": "x"},
+            diff_path=self._fs_tree("secrets", "creds.txt"),
+        )
+        assert denied.action == TOOL_DENY
+        allowed = hooks.on_tool_call(
+            "code",
+            session_key="cli_chat",
+            tool_kind="edit",
+            raw_params={"command": "create", "fileText": "x"},
+            diff_path=self._fs_tree("workspace", "site.py"),
+        )
+        assert allowed.action != TOOL_DENY
+
+    def test_diff_block_route_keeps_the_network_egress_pair(self):
+        # Routing a call onto the edit branch because its frame carried a diff
+        # block must never DROP a pair the pre-route classification would have
+        # emitted: a kindless (or fetch-kind) call carrying BOTH a url param
+        # and a diff block keeps its network.egress pair, so a governed egress
+        # ceiling still binds it.
+        from kiro_crew.platform.governance import classify_tool_args
+
+        pairs = classify_tool_args(
+            "",
+            {"url": "https://evil.com/x"},
+            diff_path=self._fs_tree("workspace", "site.py"),
+        )
+        assert ("network.egress", "evil.com") in pairs, (
+            "a diff-block call carrying a url shed its egress pair -- an "
+            "egress-governed ceiling no longer binds it"
+        )
+        assert ("filesystem.write", self._fs_tree("workspace", "site.py")) in pairs
 
     def test_filesystem_write_traversal_escape_denied(self):
         # A ``..`` traversal that lexically escapes the allow-prefix must be
@@ -1267,8 +1513,8 @@ class TestFilesystemEgressAtGate:
         )
         assert r.action == TOOL_DENY
 
-    # ── array-nested path extraction (issue #6558: governance parity with the
-    #    hooks keystone; the flat top-level-only extractor missed nested paths). ──
+    # ── array-nested path extraction (governance parity with the
+    #    hooks keystone; a flat top-level-only extractor misses nested paths). ──
     def test_nested_array_read_path_is_classified(self):
         # A batch-shaped tool buries its target inside an array argument. The
         # governance plane must surface it (before the fix this returned ()).
@@ -1348,9 +1594,7 @@ class TestFilesystemEgressAtGate:
             "fs_read",
             session_key="cli_chat",
             tool_kind="read",
-            raw_params={
-                "operations": [{"mode": "Line", "path": self._fs_tree("ws", "doc.md")}]
-            },
+            raw_params={"operations": [{"mode": "Line", "path": self._fs_tree("ws", "doc.md")}]},
         )
         assert allowed.action != TOOL_DENY
 
@@ -1568,7 +1812,7 @@ class TestKeystoneOnRealPath:
 
 
 class TestPermissionEventCarriesRawParams:
-    """Regression for the inert-wiring defect: the EVENT_PERMISSION_REQUEST the
+    """The EVENT_PERMISSION_REQUEST the
     gate actually runs on must carry raw_tool_params, or filesystem.write /
     network.egress enforcement is a no-op in production."""
 
@@ -1796,7 +2040,9 @@ class TestGovernanceDegradedIsObservable:
 
             sel_file = sel_dir / "security_events.jsonl"
             records = [
-                json.loads(line) for line in sel_file.read_text(encoding="utf-8").splitlines() if line.strip()
+                json.loads(line)
+                for line in sel_file.read_text(encoding="utf-8").splitlines()
+                if line.strip()
             ]
             degraded = [r for r in records if r.get("event_type") == "governance_degraded"]
             assert degraded, "a governance_degraded SEL record must be persisted"
@@ -1849,7 +2095,7 @@ class TestChokepointsFailClosed:
 
         monkeypatch.setattr(gp, "governance_permits", _boom)
         reason = subagent._vet_spawn_governance("dashboard:ui", "researcher")
-        assert reason is not None  # denial (previously returned None = allow)
+        assert reason is not None  # denial (None would mean allow)
         assert "fail-closed" in reason
 
     def test_vet_spawn_governance_reraises_composition_error(self, monkeypatch):

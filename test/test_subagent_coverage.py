@@ -15,14 +15,15 @@ import asyncio
 import contextlib
 import math
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from conftest import absent_sysconf
 from kiro_crew import subagent as sa
-from kiro_crew.subagent import SubagentInfo, SubagentManager
+from kiro_crew.subagent import SubagentDelivery, SubagentInfo, SubagentManager
 
 # ── Fixtures / builders ───────────────────────────────────────────────────
 
@@ -321,34 +322,46 @@ class TestDigestHoldSecs:
 
 
 class TestCheckMemoryAvailable:
-    def test_parses_mem_available(self) -> None:
-        text = "MemTotal:       1000 kB\nMemAvailable:    8388608 kB\n"
-        with patch.object(sa, "safe_read_file", return_value=text):
-            ok, gb = sa.check_memory_available(min_gb=4.0)
+    def test_parses_mem_available(self, tmp_path: Path) -> None:
+        f = tmp_path / "meminfo"
+        f.write_text("MemTotal:       1000 kB\nMemAvailable:    8388608 kB\n")
+        ok, gb = sa.check_memory_available(min_gb=4.0, path=str(f))
         assert ok is True
         assert gb == 8.0
 
-    def test_below_threshold_reports_not_ok(self) -> None:
-        text = "MemAvailable:    1048576 kB\n"
-        with patch.object(sa, "safe_read_file", return_value=text):
-            ok, gb = sa.check_memory_available(min_gb=4.0)
+    def test_below_threshold_reports_not_ok(self, tmp_path: Path) -> None:
+        f = tmp_path / "meminfo"
+        f.write_text("MemAvailable:    1048576 kB\n")
+        ok, gb = sa.check_memory_available(min_gb=4.0, path=str(f))
         assert (ok, gb) == (False, 1.0)
 
-    def test_sensitive_path_fails_open(self) -> None:
-        with patch.object(sa, "safe_read_file", side_effect=PermissionError):
-            assert sa.check_memory_available() == (True, -1.0)
+    def test_path_gate_not_consulted(self, tmp_path: Path) -> None:
+        """The fixed kernel path is read with plain open, never the gate."""
+        f = tmp_path / "meminfo"
+        f.write_text("MemAvailable:    8388608 kB\n")
+        with (
+            patch("kiro_crew.hooks.safe_read_file", side_effect=AssertionError),
+            patch("kiro_crew.hooks.is_sensitive_path", side_effect=AssertionError),
+        ):
+            assert sa.check_memory_available(min_gb=4.0, path=str(f)) == (True, 8.0)
+
+    def test_permission_error_fails_open(self) -> None:
+        with patch("builtins.open", side_effect=PermissionError):
+            assert sa.check_memory_available(path="/test/meminfo") == (True, -1.0)
 
     def test_read_error_fails_open(self) -> None:
-        with patch.object(sa, "safe_read_file", side_effect=OSError):
-            assert sa.check_memory_available() == (True, -1.0)
+        with patch("builtins.open", side_effect=OSError):
+            assert sa.check_memory_available(path="/test/meminfo") == (True, -1.0)
 
-    def test_malformed_line_fails_open(self) -> None:
-        with patch.object(sa, "safe_read_file", return_value="MemAvailable:  notanumber kB\n"):
-            assert sa.check_memory_available() == (True, -1.0)
+    def test_malformed_line_fails_open(self, tmp_path: Path) -> None:
+        f = tmp_path / "meminfo"
+        f.write_text("MemAvailable:  notanumber kB\n")
+        assert sa.check_memory_available(path=str(f)) == (True, -1.0)
 
-    def test_missing_key_fails_open(self) -> None:
-        with patch.object(sa, "safe_read_file", return_value="MemTotal: 12 kB\n"):
-            assert sa.check_memory_available() == (True, -1.0)
+    def test_missing_key_fails_open(self, tmp_path: Path) -> None:
+        f = tmp_path / "meminfo"
+        f.write_text("MemTotal: 12 kB\n")
+        assert sa.check_memory_available(path=str(f)) == (True, -1.0)
 
 
 class TestReadIntFile:
@@ -372,6 +385,17 @@ class TestReadIntFile:
 
 
 class TestCgroupAvailable:
+    @pytest.fixture(autouse=True)
+    def _fixed_cgroup_roots(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Calculation cases use fixed mounts, independent of the host's /proc."""
+        v2 = PurePosixPath("/sys/fs/cgroup")
+        v1 = PurePosixPath("/sys/fs/cgroup/memory")
+        monkeypatch.setattr(sa, "_cgroup_memory_roots", lambda: [(v2, v2, True), (v1, v1, False)])
+        # These cases fabricate only the limit/usage files; the page-cache read
+        # goes through ``open`` and would otherwise see the runner's real
+        # /sys/fs/cgroup/memory.stat.
+        monkeypatch.setattr(sa, "_read_inactive_file_bytes", lambda directory, v2: 0)
+
     def _reader(self, values: dict[str, int | None]):
         return lambda path: values.get(path)
 
@@ -423,12 +447,22 @@ class TestCgroupAvailable:
         monkeypatch.setattr(sa, "_read_int_file", self._reader({}))
         assert sa._cgroup_available_gb() == -1.0
 
-    def test_usage_absent_treated_as_zero(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    @pytest.mark.parametrize("usage, expected", [(None, 0.0), (0, 2.0)])
+    def test_usage_unknown_is_distinct_from_zero(
+        self, monkeypatch: pytest.MonkeyPatch, usage: int | None, expected: float
+    ) -> None:
         gib = 1024**3
         monkeypatch.setattr(
-            sa, "_read_int_file", self._reader({"/sys/fs/cgroup/memory.max": 2 * gib})
+            sa,
+            "_read_int_file",
+            self._reader(
+                {
+                    "/sys/fs/cgroup/memory.max": 2 * gib,
+                    "/sys/fs/cgroup/memory.current": usage,
+                }
+            ),
         )
-        assert sa._cgroup_available_gb() == pytest.approx(2.0)
+        assert sa._cgroup_available_gb() == expected
 
 
 class TestAvailableMemoryGb:
@@ -485,27 +519,53 @@ class TestMacosAvailableMemory:
     ``raising=False`` — the probe's own ``hasattr`` guard is what CI exercises."""
 
     def test_page_size_unavailable(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(
-            os, "sysconf", lambda _name: (_ for _ in ()).throw(ValueError), raising=False
-        )
+        real_sysconf = getattr(os, "sysconf", absent_sysconf)
+
+        def fake_sysconf(name):
+            if name == "SC_PAGE_SIZE":
+                raise ValueError("SC_PAGE_SIZE unavailable")
+            return real_sysconf(name)
+
+        monkeypatch.setattr(os, "sysconf", fake_sysconf, raising=False)
         assert sa._macos_available_memory_gb() == -1.0
 
     def test_nonpositive_page_size(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(os, "sysconf", lambda _name: 0, raising=False)
+        real_sysconf = getattr(os, "sysconf", absent_sysconf)
+        monkeypatch.setattr(
+            os, "sysconf", lambda n: 0 if n == "SC_PAGE_SIZE" else real_sysconf(n), raising=False
+        )
         assert sa._macos_available_memory_gb() == -1.0
 
     def test_no_reclaimable_pages(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(os, "sysconf", lambda _name: 4096, raising=False)
+        real_sysconf = getattr(os, "sysconf", absent_sysconf)
+        monkeypatch.setattr(
+            os,
+            "sysconf",
+            lambda n: 4096 if n == "SC_PAGE_SIZE" else real_sysconf(n),
+            raising=False,
+        )
         monkeypatch.setattr(sa, "_macos_vm_reclaimable_pages", lambda: None)
         assert sa._macos_available_memory_gb() == -1.0
 
     def test_zero_pages_fails_open(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(os, "sysconf", lambda _name: 4096, raising=False)
+        real_sysconf = getattr(os, "sysconf", absent_sysconf)
+        monkeypatch.setattr(
+            os,
+            "sysconf",
+            lambda n: 4096 if n == "SC_PAGE_SIZE" else real_sysconf(n),
+            raising=False,
+        )
         monkeypatch.setattr(sa, "_macos_vm_reclaimable_pages", lambda: 0)
         assert sa._macos_available_memory_gb() == -1.0
 
     def test_computes_gb_from_pages(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(os, "sysconf", lambda _name: 4096, raising=False)
+        real_sysconf = getattr(os, "sysconf", absent_sysconf)
+        monkeypatch.setattr(
+            os,
+            "sysconf",
+            lambda n: 4096 if n == "SC_PAGE_SIZE" else real_sysconf(n),
+            raising=False,
+        )
         monkeypatch.setattr(sa, "_macos_vm_reclaimable_pages", lambda: 262144)
         assert sa._macos_available_memory_gb() == pytest.approx(1.0)
 
@@ -698,13 +758,15 @@ class TestPidHelpers:
         with patch.object(os, "stat", return_value=SimpleNamespace(st_ctime=500.0)):
             assert SubagentManager._is_orphan_process(4242, 100.0) is False
 
-    def test_kill_orphan_swallows_missing_process(self) -> None:
+    @pytest.mark.asyncio
+    async def test_kill_orphan_swallows_missing_process(self) -> None:
         with patch.object(sa.platform_compat, "kill_pid", side_effect=ProcessLookupError):
-            SubagentManager._kill_orphan_pid(4242)  # must not raise
+            await SubagentManager._kill_orphan_pid(4242)  # must not raise
 
-    def test_kill_orphan_calls_platform_kill(self) -> None:
+    @pytest.mark.asyncio
+    async def test_kill_orphan_calls_platform_kill(self) -> None:
         with patch.object(sa.platform_compat, "kill_pid") as kill:
-            SubagentManager._kill_orphan_pid(4242)
+            await SubagentManager._kill_orphan_pid(4242)
         assert kill.call_args[0][0] == 4242
 
 
@@ -810,7 +872,7 @@ class TestSampleLiveCounts:
         assert (info.last_procs, info.last_stubs) == (7, 6)
 
     def test_one_walk_per_agent_not_one_per_metric(self) -> None:
-        """The whole point of #3970: RSS, CPU and both counts come off ONE walk.
+        """The whole point: RSS, CPU and both counts come off ONE walk.
 
         Patching the shared sample is not enough to prove that — a sweep that
         still called three readers would also pass the assertions above. Count
@@ -905,7 +967,7 @@ class TestRecordCost:
         info.peak_cpu_cores = 0.75
         with patch.object(sa, "append_cost_sample") as append:
             mgr._record_cost(info)
-        append.assert_called_once_with("scout", 1.5, 0.75)
+        append.assert_called_once_with("scout", 1.5, 0.75, shared=False)
 
     def test_store_failure_is_swallowed(self) -> None:
         mgr = _manager()
@@ -1049,12 +1111,20 @@ class TestReadSurfaces:
         sampled.last_rss_gb = 0.5
         sampled.peak_rss_gb = 0.75
         sampled.last_cpu_cores = 1.234
-        mgr._agents.update({"fresh": fresh, "sampled": sampled})
+        sampled._rss_samples = 1
+        # A respawned run: the peak survives from the dead process, but THIS
+        # process has not been measured yet, so it must render as unmeasured
+        # rather than as "0 MB resident".
+        respawned = _info("respawned", parent_session_key="dash:1")
+        respawned.peak_rss_gb = 0.75
+        mgr._agents.update({"fresh": fresh, "sampled": sampled, "respawned": respawned})
         rows = {r["id"]: r for r in mgr.task_memory_rows()}
         assert rows["fresh"]["sampled"] is False
         assert rows["sampled"]["sampled"] is True
         assert rows["sampled"]["rss_mb"] == pytest.approx(512.0)
         assert rows["sampled"]["cpu_cores"] == pytest.approx(1.23)
+        assert rows["respawned"]["sampled"] is False
+        assert rows["respawned"]["rss_mb"] == 0.0
 
     def test_task_memory_rows_carry_proc_and_stub_counts(self) -> None:
         """The regression this fixes: the fields were absent, so the Sessions
@@ -1078,10 +1148,10 @@ class TestReadSurfaces:
         assert mgr.task_memory_rows() == []
 
     def test_task_memory_rows_redact_before_truncate(self) -> None:
-        """#5582: a credential straddling the 80-char cut must not leak a fragment.
+        """A credential straddling the 80-char cut must not leak a fragment.
 
         The old spelling ``_redact(a.task[:80])`` sliced first, so a key cut at
-        the boundary lost its tail and no longer matched the credential regex —
+        the boundary loses its tail and does not match the credential regex —
         the raw prefix escaped into the session-memory surface.
         The fabricated AKIA-shaped literal is inlined rather than bound to a
         ``secret``-named variable, which would trip CodeQL's name-based
@@ -1116,6 +1186,30 @@ class TestReadSurfaces:
         mgr = _manager(max_concurrent=7)
         mgr._running_count = 4
         assert (mgr.max_concurrent, mgr.running_count) == (7, 4)
+
+    @pytest.mark.asyncio
+    async def test_pending_work_count_covers_post_slot_lifecycle_tasks(self) -> None:
+        mgr = _manager()
+        release = asyncio.Event()
+        recovery = asyncio.create_task(release.wait())
+        report = asyncio.create_task(release.wait())
+        followup = asyncio.create_task(release.wait())
+        reconcile = asyncio.create_task(release.wait())
+        completed = asyncio.create_task(asyncio.sleep(0))
+        await completed
+        mgr._running_count = 0
+        mgr._queue = [{"parent_session_key": "dash:1"}]
+        mgr._tasks = {"run:recovery": recovery, "done": completed}
+        mgr._report_tasks = {report}
+        mgr._followup_watchers = {"run": followup}
+        mgr._reconcile_task = reconcile
+        mgr._abandoned_state_writers = {"state-writer"}
+        try:
+            # queue + recovery + report + follow-up + reconciliation + writer
+            assert mgr.pending_work_count == 6
+        finally:
+            release.set()
+            await asyncio.gather(recovery, report, followup, reconcile)
 
 
 class TestQueueDepth:
@@ -1231,6 +1325,250 @@ class TestNotifyInjectionFailed:
         ):
             mgr.notify_injection_failed(_info(parent_session_key="dash:1"))
 
+    @pytest.mark.asyncio
+    async def test_a_teardown_cancelled_run_announces_nothing(self, tmp_path: Path) -> None:
+        """A run whose parent ended must not queue a failure into that parent.
+
+        The notice is drained into the LLM's context on the parent key's next
+        turn, so a queued one outlives the conversation it describes.
+        """
+        seen: list[dict] = []
+
+        async def _on_event(_etype: str, _info: SubagentInfo, extra: dict) -> None:
+            seen.append(extra)
+
+        mgr = _manager(on_event=_on_event)
+        info = _info(parent_session_key="dash:1")
+        mgr._teardown_cancelled_ids.add(info.id)
+        with patch("kiro_crew.dashboard.chat_utils.dashboard_slot_key", return_value="slot-1"):
+            mgr.notify_injection_failed(info)
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert seen == []
+
+    @pytest.mark.asyncio
+    async def test_a_teardown_cancelled_member_arms_no_digest_flush(self) -> None:
+        """The hold-expiry sweep must not arm a flush for a wave whose parent ended.
+
+        A wave member parks its siblings' announces on its own digest. When the hold
+        ages out the reaper forces a partial flush -- and that flush is a SYNTHETIC
+        record with a fresh id, so the delivery gate keyed on run ids can never
+        recognise it. It would reach ``_on_done`` on its own and rebuild the retired
+        parent's conversation minutes after the teardown. The member is therefore
+        skipped at the source, in the expiry scan.
+        """
+        import kiro_crew.subagent as _facade
+
+        mgr = _manager(on_done=AsyncMock())
+        held = _info(parent_session_key="dash:1")
+        held.batch_id = "wave-1"
+        held.batch_total = 2
+        held._digest_held_at = 1.0
+        mgr._agents[held.id] = held
+
+        scan = mgr._waves._expired_digest_holds
+        with patch.object(_facade, "DIGEST_HOLD_SECS", 5.0):
+            assert scan(1000.0), (
+                "the scan found no expiry for an aged hold, so this test is not "
+                "exercising the gate it claims to"
+            )
+            mgr._teardown_cancelled_ids.add(held.id)
+            assert scan(1000.0) == []
+
+    @pytest.mark.asyncio
+    async def test_a_suppressed_report_drops_its_own_digest_hold(self) -> None:
+        """Skipping the delivery also releases what the run was holding.
+
+        Leaving ``_digest_held_at`` set would let the next expiry sweep arm the flush
+        this run's own suppression exists to prevent, and leaving
+        ``_digest_settle_deliveries``
+        on the record would leave its held siblings with an ungated delivery. The
+        siblings are marked, not tombstoned: their results never reached a parent, so
+        orphan reconciliation must still be able to find them.
+        """
+        mgr = _manager(on_done=AsyncMock())
+        info = _info(parent_session_key="dash:1")
+        info.done = False
+        info._digest_held_at = 1.0
+        info._digest_settle_deliveries = [
+            SubagentDelivery("sib-1", 1.0, 0.1),
+            SubagentDelivery("sib-2", 2.0, 0.2),
+        ]
+        mgr._agents[info.id] = info
+        mgr._teardown_cancelled_ids.add(info.id)
+
+        await mgr._report_terminal(
+            info,
+            source="test",
+            injection_timeout_reason="delivery timed out",
+            mark_delivered_on_success=False,
+        )
+
+        assert info._digest_held_at == 0.0
+        assert info._digest_settle_deliveries == []
+        assert "sib-1" in mgr._teardown_cancelled_ids
+        assert "sib-2" in mgr._teardown_cancelled_ids
+        mgr._on_done.assert_not_awaited()
+
+    def test_the_teardown_gate_forgets_by_age_and_never_by_count(self) -> None:
+        """Eviction is AGE, because a capacity rule can drop a live gate.
+
+        One parent with more queued children than any capacity would evict its own
+        earliest ids while their reports were still being spawned, and those reports then
+        walk through the gate and rebuild the conversation the teardown took down. An age
+        rule cannot: the TTL exceeds every window in which a marked run has an announce
+        left. A read must not extend an entry's life either, or the TTL stops describing
+        what is retained.
+        """
+        from kiro_crew.subagent import _AgingIdSet
+
+        ids = _AgingIdSet(3600.0)
+        ids.update(str(n) for n in range(10_000))
+        assert len(ids) == 10_000, "a count rule evicted ids whose runs can still announce"
+        assert "0" in ids
+
+        aged = _AgingIdSet(1.0)
+        with patch("kiro_crew.subagent.time.monotonic", return_value=1_000.0):
+            aged.update(["old-1", "old-2"])
+        with patch("kiro_crew.subagent.time.monotonic", return_value=1_000.5):
+            assert "old-1" in aged  # a read does not refresh it
+        with patch("kiro_crew.subagent.time.monotonic", return_value=1_100.0):
+            aged.add("new-1")
+        assert list(aged) == ["new-1"]
+
+    @pytest.mark.asyncio
+    async def test_a_suppressed_report_discards_its_own_gate_entry(self) -> None:
+        """The gate keeps an id until that run's delivery is suppressed, not for a span.
+
+        Age is only the backstop. Once the report has been dropped, ``_on_done`` was never
+        called, so none of the gateway's injection paths can fire for this run either --
+        the entry has done its job. Leaving it to expire instead made the gate depend on a
+        TTL in the ordinary case, and an approval-parked run (deliberately not cancelled,
+        because the approval is a person's to answer) can outlive any short one.
+        """
+        mgr = _manager(on_done=AsyncMock())
+        info = _info(parent_session_key="dash:1")
+        info.done = False
+        mgr._agents[info.id] = info
+        mgr._teardown_cancelled_ids.add(info.id)
+
+        await mgr._report_terminal(
+            info,
+            source="test",
+            injection_timeout_reason="delivery timed out",
+            mark_delivered_on_success=False,
+        )
+
+        mgr._on_done.assert_not_awaited()
+        assert info.id not in mgr._teardown_cancelled_ids, (
+            "the gate entry outlived the suppression it existed for, so the set depends on "
+            "its age backstop even on the ordinary path"
+        )
+
+    @pytest.mark.usefixtures("healthy_host_memory")
+    @pytest.mark.asyncio
+    async def test_a_rejected_spawn_approval_after_teardown_does_not_recreate_the_conversation(
+        self,
+    ) -> None:
+        """The REJECTION path announces too, and it never reached ``_report_terminal``.
+
+        A spawn parked on its approval is marked by the teardown and deliberately not
+        cancelled, because the approval is a person's to answer. When that person then
+        DECLINES, the spawn gate takes its own terminal exit: it claims the finalize and
+        calls ``_safe_announce`` directly, without passing through the terminal report
+        where the delivery gate lives. So the one representation the teardown is certain
+        to have marked walked straight into ``_on_done``, which resolves the parent key
+        through the session registry and CREATES a session when none is live -- rebuilding
+        the conversation the teardown had just taken down and seeding it with the refusal
+        of a spawn that key never asked for.
+
+        Driven through the real gate rather than a hand-built record: ``spawn`` registers,
+        the approval callback parks, ``snapshot_teardown_children`` arms the mark exactly
+        as ``session_lifecycle`` does, and only then is the prompt answered ``False``.
+        """
+        approval_gate = asyncio.Event()
+
+        async def _park_then_decline(
+            _request_id: str, _description: str, _parent: str = ""
+        ) -> bool:
+            await approval_gate.wait()
+            return False
+
+        sessions = _sessions()
+        # "ask" is what makes the spawn consult the interactive callback at all;
+        # the agent seams below are what let vetting pass on a bare double.
+        sessions.get_approval_policy = MagicMock(return_value="ask")
+        sessions.get_agent = MagicMock(return_value="")
+        sessions.get_agent_selection = MagicMock(return_value=("template", ""))
+        ctx = MagicMock()
+        ctx.build_message = MagicMock(return_value=("built", None))
+        ctx.hooks.on_tool_call = MagicMock()
+        ctx.hooks.auto_approve_subagent_spawn = False
+
+        mgr = _manager(
+            sessions=sessions,
+            ctx_builder=ctx,
+            on_spawn_approval=_park_then_decline,
+            on_done=AsyncMock(),
+            is_yolo=lambda: False,
+        )
+        info = mgr.spawn("t", parent_session_key="dash:1")
+        assert info is not None
+        for _ in range(20):
+            await asyncio.sleep(0)
+        registered = mgr._agents.get(info.id)
+        assert registered is not None, f"spawn did not register: {info.error!r}"
+        assert registered._awaiting_approval is True, "precondition: parked on its prompt"
+
+        # The teardown's synchronous half. It returns nothing to cancel for a parked
+        # run and marks it for delivery suppression instead -- that split is the point.
+        assert mgr.snapshot_teardown_children("dash:1") == ()
+        assert info.id in mgr._teardown_cancelled_ids
+
+        approval_gate.set()
+        for _ in range(200):
+            await asyncio.sleep(0)
+            if registered.done:
+                break
+
+        assert registered.done is True, "the decline did not reach its terminal exit"
+        mgr._on_done.assert_not_awaited()
+
+        for task in list(mgr._tasks.values()):
+            task.cancel()
+        await asyncio.sleep(0)
+
+    def test_the_gate_backstop_outlasts_a_human_approval_window(self) -> None:
+        """The age backstop must not prune a run that is waiting on a person.
+
+        An approval-parked run is deliberately not cancelled, so it can sit for as long as
+        the person takes. An hour let a later teardown prune its mark while it waited, and
+        the completion then injected into whatever the key served by then.
+        """
+        from kiro_crew.subagent import _TEARDOWN_GATE_TTL_SECS
+
+        assert _TEARDOWN_GATE_TTL_SECS >= 86400.0, (
+            "the backstop is shorter than a person plausibly takes to answer an approval, "
+            f"so a waiting run's mark can be pruned before it completes: {_TEARDOWN_GATE_TTL_SECS}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_sibling_of_a_teardown_cancelled_run_still_announces(self) -> None:
+        """The gate is per-id: a run the teardown did not touch is unaffected."""
+        seen: list[dict] = []
+
+        async def _on_event(_etype: str, _info: SubagentInfo, extra: dict) -> None:
+            seen.append(extra)
+
+        mgr = _manager(on_event=_on_event)
+        mgr._teardown_cancelled_ids.add("some-other-agent")
+        info = _info(parent_session_key="dash:1")
+        with patch("kiro_crew.dashboard.chat_utils.dashboard_slot_key", return_value="slot-1"):
+            mgr.notify_injection_failed(info)
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert seen and seen[0]["slot"] == "slot-1"
+
 
 # ── Injection-failure notice: outcome-aware copy ──────────────────────────
 
@@ -1238,11 +1576,12 @@ class TestNotifyInjectionFailed:
 class TestInjectionNoticeOutcome:
     """The pure helper maps a terminal record to a truthful outcome line."""
 
-    def test_completed_keeps_the_finished_copy(self) -> None:
+    def test_completed_states_the_outcome_without_a_mechanism(self) -> None:
         info = _info(done=True, result="ok")
-        assert sa._injection_notice_outcome(info) == (
-            "The agent finished but result delivery timed out."
-        )
+        line = sa._injection_notice_outcome(info)
+        assert line == "The agent finished, but its result could not be delivered."
+        # The cause belongs to ``reason``, printed on the line above this one.
+        assert "timed out" not in line
 
     def test_failed_run_does_not_claim_finished(self) -> None:
         info = _info(done=True, error="Timed out after 30 minutes", _exec_started=123.0)
@@ -1291,6 +1630,79 @@ class TestInjectionNoticeOutcome:
         assert sa._injection_notice_outcome(info) == (
             "The agent failed before a result could be delivered."
         )
+
+
+class TestInjectionNoticeDoesNotContradictItsReason:
+    """A completed run's outcome line must not name a mechanism.
+
+    ``notify_injection_failed`` prints ``reason`` one line above the outcome
+    line, and most of its callers pass something that is not a timeout:
+    ``slack/gateway.py`` sends "provider dead after prompt-busy retries",
+    "ACP process died", a raw ``str(exception)`` from a failed injection turn,
+    and the last injection-failure reason after the attempt cap. A completed
+    branch that asserts "delivery timed out" contradicts every one of them, in
+    a message whose reader is the LLM deciding what to do next.
+    """
+
+    #: The reasons the four non-timeout call sites actually pass, verbatim.
+    NON_TIMEOUT_REASONS = [
+        "provider dead after prompt-busy retries",
+        "ACP process died",
+        "AcpError: stream closed while waiting for result",
+        "no active session for parent",
+    ]
+
+    async def _notice_for(self, info: SubagentInfo, reason: str) -> str:
+        seen: list[dict] = []
+
+        async def _on_event(_etype: str, _info: SubagentInfo, extra: dict) -> None:
+            seen.append(extra)
+
+        mgr = _manager(on_event=_on_event)
+        with patch("kiro_crew.dashboard.chat_utils.dashboard_slot_key", return_value="slot-1"):
+            mgr.notify_injection_failed(info, reason=reason)
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert seen, "expected a subagent_injection_failed event"
+        return str(seen[0]["failure_msg"])
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("reason", NON_TIMEOUT_REASONS)
+    async def test_a_non_timeout_reason_is_not_overridden_by_the_outcome_line(
+        self, reason: str
+    ) -> None:
+        info = _info(parent_session_key="dash:1", done=True, result="ok", _exec_started=123.0)
+        msg = await self._notice_for(info, reason)
+        assert reason in msg, "the caller's reason must still be shown"
+        assert (
+            "timed out" not in msg
+        ), f"the notice says the delivery timed out while its own reason says {reason!r}"
+        assert "The agent finished, but its result could not be delivered." in msg
+
+    @pytest.mark.asyncio
+    async def test_a_real_timeout_still_reads_as_one(self) -> None:
+        """Neutral copy loses nothing: the timeout callers say so in ``reason``."""
+        info = _info(parent_session_key="dash:1", done=True, result="ok", _exec_started=123.0)
+        msg = await self._notice_for(info, "injection timed out after 300s")
+        assert "injection timed out after 300s" in msg
+        assert "The agent finished, but its result could not be delivered." in msg
+
+    @pytest.mark.asyncio
+    async def test_the_result_recovery_hint_still_agrees_with_the_line(self) -> None:
+        """ "could not be delivered" must not read as "there is nothing to read":
+        when a result file exists the notice still points at it."""
+        info = _info(
+            parent_session_key="dash:1",
+            done=True,
+            result="ok",
+            result_path="/tmp/subagent-result.txt",
+            _exec_started=123.0,
+        )
+        with patch("os.path.getsize", return_value=42):
+            msg = await self._notice_for(info, "ACP process died")
+        assert "The agent finished, but its result could not be delivered." in msg
+        assert "/tmp/subagent-result.txt" in msg
+        assert "Use the read tool" in msg
 
 
 class TestNotifyInjectionFailedOutcomeCopy:
@@ -1347,7 +1759,7 @@ class TestNotifyInjectionFailedOutcomeCopy:
         assert "finished" not in msg
 
     @pytest.mark.asyncio
-    async def test_post_run_delivery_timeout_keeps_existing_copy_and_hint(
+    async def test_post_run_delivery_failure_keeps_the_completed_copy_and_hint(
         self, tmp_path: Path
     ) -> None:
         result = tmp_path / "result.txt"
@@ -1356,7 +1768,7 @@ class TestNotifyInjectionFailedOutcomeCopy:
             parent_session_key="dash:1", done=True, result="hello", result_path=str(result)
         )
         msg = await self._notice_for(info)
-        assert "The agent finished but result delivery timed out." in msg
+        assert "The agent finished, but its result could not be delivered." in msg
         assert "Result saved at" in msg
 
 
@@ -1802,29 +2214,33 @@ class TestAnnounceDigestFlush:
     async def test_settles_holds_after_clean_handoff(self) -> None:
         mgr = _manager(on_done=AsyncMock())
         info = _info(batch_id="w1")
-        info._digest_settle_ids = ["m1", "m2"]
+        info._digest_settle_deliveries = [
+            SubagentDelivery("m1", 1.0, 0.1),
+            SubagentDelivery("m2", 2.0, 0.2),
+        ]
         with patch.object(sa, "mark_delivered") as mark:
             await mgr._announce_digest_flush(info)
         assert [c[0][0] for c in mark.call_args_list] == ["m1", "m2"]
-        assert info._digest_settle_ids == []
+        assert info._digest_settle_deliveries == []
 
     @pytest.mark.asyncio
     async def test_routing_failure_leaves_holds_unsettled(self) -> None:
         mgr = _manager(on_done=AsyncMock(side_effect=RuntimeError("route down")))
         info = _info(batch_id="w1")
-        info._digest_settle_ids = ["m1"]
+        info._digest_settle_deliveries = [SubagentDelivery("m1", 1.0, 0.1)]
         with patch.object(sa, "mark_delivered") as mark:
             await mgr._announce_digest_flush(info)
         mark.assert_not_called()
-        assert info._digest_settle_ids == ["m1"]
+        assert [d.agent_id for d in info._digest_settle_deliveries] == ["m1"]
 
-    def test_settle_swallows_tombstone_failure(self) -> None:
+    @pytest.mark.asyncio
+    async def test_settle_swallows_tombstone_failure(self) -> None:
         mgr = _manager()
         info = _info()
-        info._digest_settle_ids = ["m1"]
+        info._digest_settle_deliveries = [SubagentDelivery("m1", 1.0, 0.1)]
         with patch.object(sa, "mark_delivered", side_effect=OSError):
-            mgr._settle_digest_holds(info)
-        assert info._digest_settle_ids == []
+            await mgr._settle_digest_holds(info)
+        assert info._digest_settle_deliveries == []
 
 
 class TestAnnounceRejection:
@@ -1917,13 +2333,33 @@ class TestGetParentRuntime:
 
 
 class TestIsCcProvider:
-    def test_delegates_to_backend_probe(self) -> None:
-        with patch("kiro_crew.providers.acp.is_claude_backend", return_value=True):
-            assert SubagentManager._is_cc_provider(object()) is True
+    """Which HOME tree a session's files live in, asked as a capability.
 
-    def test_non_claude_backend(self) -> None:
-        with patch("kiro_crew.providers.acp.is_claude_backend", return_value=False):
-            assert SubagentManager._is_cc_provider(object()) is False
+    ``_is_cc_provider`` reads ``SessionCapabilities.provider_seam`` through
+    ``capabilities_of``, so these tests hand it a provider carrying a real
+    capability record instead of patching a module-level predicate. The third case
+    is the one a bare attribute read gets wrong: a shape that is not a provider
+    must answer False, which is what the ``isinstance`` gate in ``capabilities_of``
+    buys.
+    """
+
+    @staticmethod
+    def _provider(backend: str) -> SimpleNamespace:
+        from kiro_crew.agent_sdk.capabilities import capabilities_for
+
+        return SimpleNamespace(capabilities=capabilities_for(backend))
+
+    def test_claude_seam_routes_to_the_claude_home(self) -> None:
+        from kiro_crew.acp_backends import ACP_BACKEND_CLAUDE
+
+        assert SubagentManager._is_cc_provider(self._provider(ACP_BACKEND_CLAUDE)) is True
+
+    @pytest.mark.parametrize("backend", ["", "kas", "codex"])
+    def test_non_claude_backend(self, backend: str) -> None:
+        assert SubagentManager._is_cc_provider(self._provider(backend)) is False
+
+    def test_a_shape_that_is_not_a_provider_answers_false(self) -> None:
+        assert SubagentManager._is_cc_provider(object()) is False
 
 
 # ── Manager: intentional cancel contract ──────────────────────────────────

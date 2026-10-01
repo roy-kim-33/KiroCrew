@@ -7,7 +7,7 @@
  */
 import React, { useState, useRef, useEffect, useMemo, useCallback } from 'react'
 import { api } from '../mochiApi'
-import { buildSrcdoc, THEME_VAR_NAMES } from '../../../../lib/widgetSrcdoc'
+import { buildSrcdoc, readThemeVars } from '../../../../lib/widgetSrcdoc'
 
 import { i18nT } from '../../../../i18n/t'
 import { ArrowUpRight } from 'lucide-react'
@@ -20,15 +20,6 @@ const MAX_HEIGHT = 600
  * Mochi's windows receive the core CSS *variables* (not component styles), so
  * the same names resolve here and the widget inherits the live theme.
  */
-function readThemeVars(): Record<string, string> {
-  const cs = getComputedStyle(document.documentElement)
-  const out: Record<string, string> = {}
-  for (const name of THEME_VAR_NAMES) {
-    const v = cs.getPropertyValue(name).trim()
-    if (v) out[name] = v
-  }
-  return out
-}
 
 /** 'light' | 'dark', matching the attribute the dashboard and Mochi both set. */
 function currentMode(): 'light' | 'dark' {
@@ -56,6 +47,10 @@ export const WidgetFrame: React.FC<WidgetFrameProps> = ({ html, title = 'Widget'
       themeVars: readThemeVars(),
       mode: currentMode(),
       includeHeightReporter: true,
+      // This frame (and the popout window that reuses this document) is
+      // sandbox="allow-scripts" with no allow-popups, so a target="_blank"
+      // rewrite would be a blocked popup, not an external open.
+      rewriteBareLinks: false,
     }),
     [html],
   )
@@ -100,6 +95,12 @@ export const WidgetFrame: React.FC<WidgetFrameProps> = ({ html, title = 'Widget'
         ref={iframeRef}
         srcDoc={srcdoc}
         sandbox="allow-scripts"
+        // NO clipboard-write delegation here, deliberately. These frames host
+        // agent-generated HTML whose scripts run on load, so a delegated
+        // permission would let one overwrite the user's clipboard with no Copy
+        // action at all. Copying still works: lib/widgetSrcdoc.ts injects an
+        // execCommand fallback that a real button press satisfies and a
+        // gesture-less on-load script does not.
         style={{
           width: '100%',
           height,

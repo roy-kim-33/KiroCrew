@@ -27,7 +27,9 @@ import { useNavigate } from 'react-router-dom'
 import { useAppDispatch } from '../../../store'
 import { createSlot, switchSlot, deleteSlot } from '../../../store/chatSlice'
 import { api } from '../../../api/client'
-import { readSendReceipt } from '../../../utils/sendDelivery'
+import { sendTurn } from '../../../chat-core/transport/sendTurn'
+import { ensureChatFolder } from '../../../utils/ensureChatFolder'
+import { settleSeedReceipt } from '../../../utils/seedReceipt'
 import { isMissingSlotError } from '../../../utils/thunkError'
 import { issueRadarApi, type InvestigationRecord, type ItemKind, RepoRef } from '../api'
 import { repoScopeKey } from './links'
@@ -42,14 +44,17 @@ export function truncate(s: string, max: number = TITLE_MAX): string {
 }
 
 /** Resolve the "Issue Radar - <repo>" chat folder id, creating it on first use.
- * Matches by name — folders have no upsert. */
+ * Matches by name — folders have no upsert. A rejected list or create propagates
+ * untouched; a create that answers without an id throws, so the `Promise<string>`
+ * contract holds without a silent `undefined` folder id. */
 async function resolveFolderId(repo: string): Promise<string> {
-  const name = `${FOLDER_PREFIX}${repo}`
-  const folders = (await api.chatFolders()) as Array<{ id: string; name: string }>
-  const existing = Array.isArray(folders) ? folders.find((f) => f.name === name) : undefined
-  if (existing?.id) return existing.id
-  const created = (await api.createChatFolder(name)) as { id: string }
-  return created.id
+  const id = await ensureChatFolder({
+    list: () => api.chatFolders(),
+    create: (name) => api.createChatFolder(name),
+    name: `${FOLDER_PREFIX}${repo}`,
+  })
+  if (!id) throw new Error('Chat folder create returned no id')
+  return id
 }
 
 /** Identity of one investigable item, for state that must not follow the user to
@@ -81,6 +86,11 @@ export interface OpenSessionArgs {
   prompt: string
   /** The item's existing record, when it has one (drives resume). */
   existing: InvestigationRecord | null
+  /** Local working-directory path for the chat session, from the repo's
+   * `workspace_path` setting. Empty/undefined leaves the session on the default
+   * cwd. Applied only on a FRESH session; a resumed slot keeps the cwd it was
+   * born with. */
+  workspacePath?: string
   /** Open a replacement session even though the item's work already CONCLUDED.
    *
    * Off by default, and that default is the point: a concluded record whose
@@ -140,7 +150,7 @@ export function useAgentSession(): UseAgentSession {
   const [concludedFor, setConcludedFor] = useState<string | null>(null)
 
   const openSession = useCallback(
-    async ({ repoRef, number, kind = 'issue', title, prompt, existing, force = false }: OpenSessionArgs): Promise<InvestigationRecord | null> => {
+    async ({ repoRef, number, kind = 'issue', title, prompt, existing, force = false, workspacePath }: OpenSessionArgs): Promise<InvestigationRecord | null> => {
       setBusy(true)
       // Set once a slot exists but is not yet linked to an investigation record;
       // cleared on success. See the rollback in the catch below.
@@ -264,7 +274,24 @@ export function useAgentSession(): UseAgentSession {
 
         // ── Fresh session: folder → slot (filed + titled) → seed+run → link.
         const folderId = await resolveFolderId(repoRef.repo)
-        const slot = await dispatch(createSlot({ folder_id: folderId, title })).unwrap()
+        // App-owned workstreams choose their memory contract explicitly; a
+        // general chat preference must not silently alter their behavior.
+        //
+        // Open the session in the repo's configured working copy so the
+        // investigation sees its real source. Empty setting -> `null`, which
+        // leaves the slot on the gateway's default cwd (pre-workspace behavior).
+        // `createSlot` applies the project via chatSlotProject after create and,
+        // if the gateway REJECTS it (the path does not exist on the gateway host,
+        // or is sensitive), deletes the just-made slot and throws. That throw
+        // reaches the `catch` below and surfaces in this hook's `error` state —
+        // the SAME contract the chat sidebar uses (it shows "Not a directory").
+        // A bad path must NOT silently fall back to the default cwd: that would
+        // pin the whole investigation thread (a resumed slot keeps its birth cwd)
+        // in the wrong directory with no signal, recreating the exact wrong-cwd
+        // failure this feature exists to remove.
+        const slot = await dispatch(
+          createSlot({ folder_id: folderId, title, memory_mode: 'persistent', project: workspacePath || null }),
+        ).unwrap()
         // The slot is persisted but not yet linked to an investigation record, so
         // a failure before the seed leaves an EMPTY session behind — and the next
         // attempt, finding no record, would create another one. Rollback covers
@@ -276,31 +303,22 @@ export function useAgentSession(): UseAgentSession {
         createdSlotKey = slot.key
         // Seed + auto-run the first turn (background task; persisted + survives
         // the navigation). await ensures the user message is stored before we
-        // switch, so it paints immediately on arrival.
-        // api.sendChat hands back the raw fetch response, and fetch RESOLVES on
-        // 4xx/5xx — so without this check a rejected prompt still got recorded and
-        // navigated to, leaving a resumable but empty session.
-        const seedInFlight = api.sendChat(prompt, slot.key)
+        // switch, so it paints immediately on arrival. The chat-core transport
+        // owns the receipt contract (`POST /api/chat?ws=1` RESOLVES on 4xx/5xx,
+        // a 200 can still decline with `{ok:false}`, a hung POST is bounded by
+        // its deadline) and never rejects: every outcome is a receipt status.
+        const seedInFlight = sendTurn({ message: prompt, slot: slot.key })
         createdSlotKey = null
-        const seeded = await seedInFlight
-        // A REFUSAL, not merely a non-2xx: `/api/chat` also declines inside a 200
-        // by answering `{ok:false}`, and a status-only check passed that as a
-        // success -- recording and navigating to exactly the empty session this
-        // guard exists to prevent. `readSendReceipt` owns that distinction for
-        // every send site. An UNREADABLE 2xx receipt deliberately does NOT land
-        // here: the request was accepted, so the seed may be running, and
-        // deleting the slot would cancel real work over a mangled reply.
-        if (seeded && typeof seeded === 'object' && 'ok' in seeded) {
-          const { body, outcome } = await readSendReceipt(seeded as Response)
-          if (outcome === 'refused') {
-            // Rejected outright, so nothing is running: the empty slot is safe
-            // (and wrong) to remove.
-            await dispatch(deleteSlot(slot.key)).unwrap().catch(() => {})
-            const reason = typeof body.error === 'string' && body.error
-              ? body.error
-              : `HTTP ${(seeded as Response).status}`
-            throw new Error(`could not seed the session (${reason})`)
-          }
+        const receipt = await seedInFlight
+        // `settleSeedReceipt` owns the seed policy (shared with the other app
+        // seeder): only a seed that provably never ran -- refused, or no receipt
+        // and the slot stays empty -- tears the empty slot down; recording and
+        // navigating to it would be exactly the empty session this guard exists
+        // to prevent. Everything else is, or may be, running and is recorded.
+        const verdict = await settleSeedReceipt(receipt, slot.key)
+        if (!verdict.ran) {
+          await dispatch(deleteSlot(slot.key)).unwrap().catch(() => {})
+          throw new Error(verdict.reason)
         }
         const res = await issueRadarApi.saveInvestigation(repoRef, number, {
           slot_key: slot.key,

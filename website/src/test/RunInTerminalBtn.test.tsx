@@ -1,7 +1,9 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { screen, fireEvent, act, waitFor } from '@testing-library/react'
+import { screen, fireEvent, act, waitFor, render } from '@testing-library/react'
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { renderWithProviders } from './helpers'
 import RunInTerminalBtn from '../components/RunInTerminalBtn'
+import { RUN_IN_TERMINAL_RESULT_FALLBACK_MS } from '../utils/fenceShell'
 
 // "Run in terminal" dispatches a `mc:run-in-terminal` request on window;
 // ChatPage opens a terminal tab in the active chat, runs it, and replies with a
@@ -9,7 +11,7 @@ import RunInTerminalBtn from '../components/RunInTerminalBtn'
 //
 // A click does not run anything on its own — it opens a confirmation dialog
 // showing the exact command, and only the dialog's Run button dispatches.
-let requests: { code: string; reqId: string }[] = []
+let requests: { code: string; reqId: string; lang?: string }[] = []
 function onReq(e: Event) { requests.push((e as CustomEvent).detail) }
 function replyLast(ok: boolean) {
   const last = requests[requests.length - 1]
@@ -60,6 +62,13 @@ describe('RunInTerminalBtn', () => {
     clickAndConfirm()
     expect(requests).toHaveLength(1)
     expect(requests[0].code).toBe('echo hello')
+  })
+
+  it('carries the fence language in the run request', () => {
+    renderWithProviders(<RunInTerminalBtn code="set greeting hello" lang="fish" />)
+    clickAndConfirm()
+    expect(requests).toHaveLength(1)
+    expect(requests[0].lang).toBe('fish')
   })
 
   it('does not run when the dialog is cancelled', () => {
@@ -132,7 +141,7 @@ describe('RunInTerminalBtn', () => {
   it('shows error when no result arrives (timeout)', () => {
     renderWithProviders(<RunInTerminalBtn code="ls" />)
     clickAndConfirm()
-    act(() => { vi.advanceTimersByTime(8000) })
+    act(() => { vi.advanceTimersByTime(RUN_IN_TERMINAL_RESULT_FALLBACK_MS) })
     expect(screen.getByLabelText("Couldn't run in terminal")).toBeInTheDocument()
   })
 
@@ -162,5 +171,53 @@ describe('RunInTerminalBtn', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Run in terminal' }))
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
     expect(requests).toHaveLength(0)
+  })
+
+  // When dashboard.terminal.reuse_current is on, confirming COPIES the command
+  // rather than running it (ChatPage's handler copies to the clipboard and
+  // replies copied:true). The confirm dialog must say Copy, not Run, so it does
+  // not promise an action it will not take.
+  describe('reuse-current (copy) path', () => {
+    /** Pre-seed the kirocrewConfig cache BEFORE mount so willCopy is settled on
+     *  the first render (no post-mount state churn), then open the dialog. The
+     *  suite runs on fake timers, so async findBy* would stall — everything is
+     *  synchronous. */
+    function openDialogWithReuse(reuse: boolean) {
+      const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+      queryClient.setQueryData(['kirocrewConfig'], { dashboard: { terminal: { reuse_current: reuse } } })
+      render(
+        <QueryClientProvider client={queryClient}>
+          <RunInTerminalBtn code="echo hi" />
+        </QueryClientProvider>,
+      )
+      act(() => {
+        fireEvent.click(screen.getByRole('button', { name: 'Run in terminal' }))
+      })
+    }
+
+    it('shows Copy button and copy copy in the dialog when reuse is on', () => {
+      openDialogWithReuse(true)
+      expect(screen.getByRole('button', { name: 'Copy' })).toBeInTheDocument()
+      expect(screen.queryByRole('button', { name: /^Run( anyway)?$/ })).not.toBeInTheDocument()
+      expect(screen.getByRole('dialog').textContent).toContain('paste into the terminal')
+      expect(screen.getByRole('dialog').textContent).not.toContain('will run in a new terminal tab')
+    })
+
+    it('keeps the Run button when reuse is off', () => {
+      openDialogWithReuse(false)
+      expect(screen.getByRole('button', { name: 'Run' })).toBeInTheDocument()
+      expect(screen.queryByRole('button', { name: 'Copy' })).not.toBeInTheDocument()
+    })
+
+    it('flashes the copied state when the reuse path confirms', () => {
+      openDialogWithReuse(true)
+      act(() => { fireEvent.click(screen.getByRole('button', { name: 'Copy' })) })
+      expect(requests).toHaveLength(1)
+      act(() => {
+        const last = requests[requests.length - 1]
+        window.dispatchEvent(new CustomEvent('mc:run-in-terminal-result', { detail: { reqId: last.reqId, ok: true, copied: true } }))
+      })
+      expect(screen.getByLabelText('Copied — paste it into the terminal')).toBeInTheDocument()
+    })
   })
 })

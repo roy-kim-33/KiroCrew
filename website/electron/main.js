@@ -15,6 +15,7 @@ const os = require("os");
 const path = require("path");
 
 const { findConfiguredDashboardPort } = require("./data-home");
+const { defaultedPort } = require("./gateway-auth-hint");
 const {
   classifyBundleLocation,
   containingDirForBundle,
@@ -23,22 +24,26 @@ const {
 } = require("./bundle-location");
 const { DEFAULT_REMOTE_BIN } = require("./remote-token");
 const {
-  migrateRemoteHostConfig,
-  remoteHostPort,
-  getRemoteHostConfig,
+  fallbackLocalPort,
   isSelectablePort,
+  legacyMigrationPort,
+  migrateRemoteHostConfig,
+  selectLaunchPort,
 } = require("./host-config");
 const { isLocalGatewayEnabled } = require("./local-gateway");
 const { seedRenamedStore } = require("./store-rename");
 const { resolveHome, secretCandidates } = require("./home-dir");
 const { identityFamily } = require("./instance-guard");
 const { initNativeLogging } = require("./native-logging");
+const { armCrashCollector, collectCrashReports } = require("./crash-collector");
 const { initGpuPolicy } = require("./disable-gpu");
+const { initGpuCrashFallback } = require("./gpu-crash-fallback");
 const { cancelPendingTrayHide } = require("./hide-to-tray");
 const { exitImmersiveModes } = require("./blocking-prompt");
 const { createMetricsRecorder } = require("./perf-metrics");
 const { initMochi, shutdownMochi } = require("./mochi/index");
 const { borrowSessionToken } = require("./mochi-session-token");
+const { clearCacheOnUpgrade } = require("./upgrade-cache");
 const {
   initCrewCompanion,
   shutdownCrewCompanion,
@@ -61,12 +66,27 @@ function reopenCrewCompanionAfterUpdate() {
 const { createGatewaySupervisor } = require("./gateway-supervisor");
 const { createWindowLifecycle } = require("./window-lifecycle");
 const { createIpcRegistrar } = require("./ipc-registrar");
+const { installEarlyBootGuard } = require("./early-boot-guard");
+
+// Everything from here to `app.whenReady()` runs synchronously at module load,
+// before Chromium is ready and before any window, tray, or crash reporter
+// exists. The guard turns a throw anywhere in that span into a log entry, a
+// native error box, and exit(1) instead of a silent process death. `glog` and
+// `gatewayLogPath` are function declarations further down; they hoist, so the
+// guard can call them when it fires. The ready handler releases it once the
+// post-ready safety net below can take over.
+const releaseEarlyBootGuard = installEarlyBootGuard({
+  app,
+  dialog,
+  glog,
+  logPath: gatewayLogPath,
+});
 
 // Carry settings across the npm name rename before electron-store opens the
 // destination. Construction writes defaults, after which the seed could no
 // longer distinguish a first launch from an existing store.
 seedRenamedStore(app.getPath("userData"), {
-  log: (message) => console.log("store migration: " + message),
+  log: (message) => glog("store migration: " + message),
 });
 
 const store = new Store({
@@ -83,62 +103,65 @@ const store = new Store({
     autoDownloadUpdates: true,
     runLocalGateway: true,
     linuxFrameless: null,
+    // Written by gpu-crash-fallback.js when the GPU process dies at startup;
+    // read before Chromium initializes on the next launch.
+    gpuSoftwareFallback: null,
   },
 });
 
 const KIROCREW_HOME = resolveHome();
 
-function resolvePort() {
+// dashboard.url in the resolved data home is the backend source of truth.
+const CONFIGURED_PORT = findConfiguredDashboardPort(fs, path, [KIROCREW_HOME]);
+
+// Resolved above the migration because both readers need it: an explicit
+// override is the port this launch binds, so it is also the port a legacy crew
+// has to be keyed under. 0 means absent or unusable.
+const ENV_PORT = (() => {
   const raw = process.env.KIROCREW_PORT;
-  if (raw) {
-    const parsed = parseInt(raw, 10);
-    if (isNaN(parsed) || parsed < 1 || parsed > 65535) {
-      console.warn('Invalid KIROCREW_PORT="' + raw + '", falling back to 5476');
-      return 5476;
-    }
-    return parsed;
-  }
+  if (!raw) return 0;
+  const parsed = parseInt(raw, 10);
+  // isSelectablePort, not just a range check: an override short-circuits
+  // selection, so a port selection would REFUSE reaches the launch through here
+  // untouched. Port 80 is refused because the shell's own URL loses it --
+  // `new URL("http://localhost:80").port` is "" -- so every per-port lookup
+  // misses, `isGatewayLocalForWindow` reads a tunnelled crew as local, and the
+  // idle heartbeat sends `X-Internal-Secret` to it. Guarding only the selection
+  // path left this route open: `legacyMigrationPort` then keyed a `remoteHosts`
+  // entry under 80 as well, which is the miss that makes the crew read as local.
+  if (isSelectablePort(parsed)) return parsed;
+  // An unusable value counts as absent rather than as a request for the product
+  // default, so every launch with no usable port of its own takes the same
+  // decision through selection. The warning stays, because the value was given
+  // and ignored.
+  console.warn('Invalid KIROCREW_PORT="' + raw + '", choosing a port as if it were unset');
+  return 0;
+})();
 
-  // dashboard.url in the resolved data home is the backend source of truth.
-  const configuredPort = findConfiguredDashboardPort(fs, path, [KIROCREW_HOME]);
+// Ahead of port selection, because selection is the reader that has to see the
+// crew. A legacy `remoteHost` carries no port of its own, so until it is folded
+// into `remoteHosts` there is no configured crew for selection to weigh, and the
+// launch decides as though the machine had none -- which is the shadowing this
+// whole path exists to prevent.
+if (migrateRemoteHostConfig(store, legacyMigrationPort({
+  envPort: ENV_PORT,
+  configuredPort: CONFIGURED_PORT,
+}))) {
+  glog("Migrated legacy remoteHost into remoteHosts before selecting a port");
+}
 
-  // With "Run a local gateway" off, a dashboard.url naming a port that has no
-  // remote host of its own records a backend which will not run here: nothing
-  // binds it and there is no host to mint a token from. A machine switched from
-  // local to remote-only keeps exactly that record, so honouring it would
-  // rebuild the dead end the opt-out is meant to avoid. A dashboard.url that
-  // DOES name a configured crew still wins -- that is the user choosing between
-  // crews rather than a leftover.
-  if (!isLocalGatewayEnabled(store)) {
-    if (
-      configuredPort
-      && isSelectablePort(configuredPort)
-      && getRemoteHostConfig(store, configuredPort)?.host
-    ) {
-      return configuredPort;
-    }
-    const remotePort = remoteHostPort(store);
-    if (remotePort) {
-      console.log(
-        "Local gateway is off; targeting the configured remote crew on port " + remotePort,
-      );
-      return remotePort;
-    }
-    // No crew is configured, so there is no better target than the local
-    // record: naming the port the user configured beats naming the default.
-  }
-
-  if (configuredPort) return configuredPort;
-  console.debug("No usable dashboard.url port in the data home, falling back to 5476");
-  return 5476;
+function resolvePort() {
+  if (ENV_PORT) return ENV_PORT;
+  return selectLaunchPort({
+    store,
+    configuredPort: CONFIGURED_PORT,
+    localGatewayEnabled: isLocalGatewayEnabled(store),
+    log: glog,
+  });
 }
 
 const PORT = resolvePort();
 const BACKEND_URL = "http://localhost:" + PORT;
-
-if (migrateRemoteHostConfig(store, PORT)) {
-  console.log("Migrated legacy remoteHost to remoteHosts[" + PORT + "]");
-}
 
 app.name = identityFamily(app.getVersion()) === "nightly"
   ? "Kiro Crew Nightly"
@@ -172,10 +195,23 @@ function glog(line) {
   const entry = "[" + new Date().toISOString() + "] " + line + "\n";
   try {
     fs.appendFileSync(gatewayLogPath(), entry);
-  } catch {
-    // Never let logging break launch or recovery.
+  } catch (error) {
+    // Preserve the diagnostic when the file sink itself is unavailable.
+    console.error(
+      "[gateway-launch] " + line + " (log write failed: "
+        + (error && error.message ? error.message : error) + ")",
+    );
   }
-  console.log("[gateway-launch] " + line);
+}
+
+function gwarn(line) {
+  glog(line);
+  console.warn("[gateway-launch] " + line);
+}
+
+function gerror(line) {
+  glog(line);
+  console.error("[gateway-launch] " + line);
 }
 
 function readInternalSecret() {
@@ -196,6 +232,55 @@ let isQuitting = false;
 let desktopMetricsRecorder = null;
 let windows = null;
 
+let crashScan = null;
+// Separate from `crashScan` so a scan that failed is not retried on every call:
+// the failure is a broken path or a missing directory, not a transient.
+let crashScanDone = false;
+
+/**
+ * Scan for crash artifacts once per app session, on first demand.
+ *
+ * LAZY on purpose, unlike `initNativeLogging` above. Native logging has to be
+ * armed before Chromium initializes, but this only READS what a previous run
+ * left behind — and it reads files, on the launch immediately after a crash,
+ * which is the launch a user is already watching impatiently. Nothing needs the
+ * answer until the dashboard's crash notice asks for it, so it costs nothing
+ * until then and nothing at all on a run where the dashboard never opens.
+ */
+function scanCrashArtifacts() {
+  if (crashScanDone) return crashScan;
+  crashScanDone = true;
+  try {
+    crashScan = collectCrashReports({
+      logsDir: path.dirname(gatewayLogPath()),
+      crashDumpsDir: app.getPath("crashDumps"),
+      // macOS only. `.ips` reports are the ONLY channel that captures a
+      // main-process abort the Crashpad handler did not survive to write, so
+      // they are worth a second directory here. Linux and Windows have no
+      // equivalent user-readable per-app report directory, and passing "" makes
+      // the collector skip the scan rather than guess at a path.
+      diagnosticReportsDir: process.platform === "darwin"
+        ? path.join(app.getPath("home"), "Library", "Logs", "DiagnosticReports")
+        : "",
+      appName: app.getName(),
+      // BOTH names, because they are different strings and neither derives from
+      // the other: `electron/package.json` sets `executableName` to
+      // `kirocrew-desktop` (and the nightly channel overrides it again), while
+      // `getName()` is `Kiro Crew`. Off darwin a minidump is our only crash
+      // channel, so recognising the executable name is what makes Linux work.
+      execName: path.basename(process.execPath),
+      fs,
+      log: glog,
+    });
+  } catch (e) {
+    // A diagnostic that breaks the launch it exists to explain is worse than no
+    // diagnostic. `getPath`/`getName` are the only calls here that can throw.
+    glog("crash scan unavailable: " + (e && e.message));
+    crashScan = null;
+  }
+  return crashScan;
+}
+
 const requestQuit = () => {
   // Window close handlers consult this synchronously. Set it before app.quit()
   // so a real quit can never be misread as a hide-to-tray request.
@@ -208,6 +293,35 @@ const requestQuit = () => {
 if (!app.requestSingleInstanceLock()) {
   app.exit(0);
 } else {
+  // Record the moment this build became able to collect crashes, BEFORE the
+  // crash reporter can produce one. The scan below is lazy — it runs when the
+  // dashboard first asks — and the first scan has to distinguish artifacts that
+  // predate this feature (which are history, and are marked seen without being
+  // read) from ones this build produced. Deciding that at scan time answers the
+  // wrong question: an app that crashes before the dashboard ever opens would
+  // have its dump written off as pre-existing on the next launch, which is
+  // exactly the crash worth reporting. This writes only the cutoff, does not
+  // read any artifact, and is idempotent — a second launch keeps the first
+  // stamp — so it is cheap enough to sit on the boot path.
+  //
+  // THE ORDER OF THESE TWO CALLS IS LOAD-BEARING. This must precede
+  // `initNativeLogging`, because that is what calls `crashReporter.start()` and
+  // so what makes Crashpad able to write a dump at all. Stamping afterwards
+  // leaves a window — short, but covering precisely the startup crashes this
+  // feature is most needed for — in which a dump exists with no cutoff on
+  // record. The next launch then stamps a cutoff LATER than that dump's mtime,
+  // the first scan reads it as history, and it is marked seen without ever being
+  // surfaced: the crash is silently lost, which is the one outcome this whole
+  // feature exists to prevent. Do not reorder for tidiness. Arming first is also
+  // free: `armCrashCollector` uses nothing `initNativeLogging` sets up, neither
+  // call creates `logsDir`, and the state write fails soft (logs and returns
+  // null) rather than throwing.
+  armCrashCollector({
+    logsDir: path.dirname(gatewayLogPath()),
+    fs,
+    log: glog,
+  });
+
   initNativeLogging({
     logsDir: path.dirname(gatewayLogPath()),
     appendSwitch: (name, value) => app.commandLine.appendSwitch(name, value),
@@ -224,6 +338,20 @@ if (!app.requestSingleInstanceLock()) {
     appendSwitch: (name) => app.commandLine.appendSwitch(name),
     env: process.env,
     argv: process.argv,
+    log: glog,
+  });
+
+  // Same timing constraint as the opt-in above: a persisted software-rendering
+  // decision has to reach Chromium before it initializes. Also arms the
+  // `child-process-gone` listener that makes that decision, so a GPU process
+  // that dies before the dashboard loads relaunches the app once in software
+  // mode instead of letting Chromium abort it with no window and no log.
+  initGpuCrashFallback({
+    app,
+    store,
+    backendUrl: BACKEND_URL,
+    isQuitting: () => isQuitting,
+    requestQuit,
     log: glog,
   });
 
@@ -253,7 +381,20 @@ const gateway = createGatewaySupervisor({
   cancelPendingTrayHide,
   exitImmersiveModes,
   log: glog,
+  warn: gwarn,
+  error: gerror,
   logPath: gatewayLogPath,
+  // The port a successor re-exec'd from the error dialog will select. That
+  // successor starts with the local-gateway setting on, which is why the
+  // setting is named here rather than read: the store write that turns it on
+  // and this prediction describe the same next process. Running the same pure
+  // function that successor will run is what keeps the two answers identical.
+  // The port the successor will BIND, which is a different question from the
+  // port this launch targets: selection names a crew's port so a live tunnel
+  // there is adopted, and a new gateway must not bind that same port. This
+  // process pins the answer into the successor's environment, so the port it
+  // watches is the port the successor takes.
+  predictLocalPort: () => fallbackLocalPort(store, glog),
 });
 
 windows = createWindowLifecycle({
@@ -263,11 +404,12 @@ windows = createWindowLifecycle({
   port: PORT,
   glog,
   readInternalSecret,
-  fetchLocalToken: (...args) => gateway.fetchLocalToken(...args),
+  mintLocalToken: (...args) => gateway.mintLocalToken(...args),
   fetchRemoteToken: (...args) => gateway.fetchRemoteToken(...args),
   isQuitting: () => isQuitting,
   requestQuit,
   connectWindow: (...args) => gateway.connect(...args),
+  syncTunnel: () => gateway.syncTunnel(),
 });
 
 const ipcRegistrar = createIpcRegistrar({
@@ -280,6 +422,7 @@ const ipcRegistrar = createIpcRegistrar({
   glog,
   closeCrewCompanionForUpdate,
   reopenCrewCompanionAfterUpdate,
+  crashScan: scanCrashArtifacts,
 });
 
 /**
@@ -355,10 +498,17 @@ async function offerRelocationIfUnupdatable() {
 async function fetchMochiGatewayAuth(backendUrl = BACKEND_URL) {
   // Keep the dashboard established credential order: local secret, explicit
   // SSH host, then a token borrowed from the already-authenticated session.
-  const localValue = await gateway.fetchLocalToken(backendUrl);
+  // Every credential here is delivered to `backendUrl` as written, which is what
+  // keeps the shell on one origin and its renderer on one storage bucket. What
+  // makes that address safe for a locally minted token is the mint's own refusal:
+  // `localhost` names both loopback families, so mintLocalToken() produces
+  // nothing unless this gateway holds every family that host resolves to.
+  const localValue = await gateway.mintLocalToken(backendUrl);
   if (localValue) return { value: localValue, viaCookie: false };
-  const { token: remoteValue } = await gateway.fetchRemoteToken(new URL(backendUrl).port);
-  if (remoteValue) return { value: remoteValue, viaCookie: false };
+  const { token: remoteValue } = await gateway.fetchRemoteToken(defaultedPort(backendUrl));
+  if (remoteValue) {
+    return { value: remoteValue, viaCookie: false };
+  }
   const borrowed = await borrowSessionToken({
     electronSession: session.defaultSession,
     backendUrl,
@@ -370,20 +520,35 @@ async function fetchMochiGatewayAuth(backendUrl = BACKEND_URL) {
 // bounded renderer/gateway recovery paths can still run.
 process.on("uncaughtException", (error) => {
   try {
-    glog("uncaughtException: " + (error && error.stack ? error.stack : error));
+    gerror("uncaughtException: " + (error && error.stack ? error.stack : error));
   } catch {
     // Logging must never throw from the safety net.
   }
 });
 process.on("unhandledRejection", (reason) => {
   try {
-    glog("unhandledRejection: " + (reason && reason.stack ? reason.stack : reason));
+    gerror("unhandledRejection: " + (reason && reason.stack ? reason.stack : reason));
   } catch {
     // Same last-resort rule as uncaughtException.
   }
 });
 
 app.whenReady().then(async () => {
+  // The crash reporter and the keep-alive safety net above are armed; from
+  // here on an exception is recovered, not fatal.
+  releaseEarlyBootGuard();
+
+  // A managed SSH forward does not survive sleep; reopen it on wake. A no-op
+  // unless this launch is keeping one.
+  try {
+    electron.powerMonitor.on("resume", () => {
+      glog("power: resumed from sleep");
+      gateway.reopenTunnel();
+    });
+  } catch (error) {
+    glog("power: could not watch for resume: " + (error && error.message));
+  }
+
   const frameDecision = windows.platform.linuxFrameDecision;
   if (frameDecision) {
     glog(
@@ -425,6 +590,18 @@ app.whenReady().then(async () => {
 
   await gateway.start();
   await gateway.connect(mainWindow);
+  // The gateway now answers and the dashboard is loading. After an upgrade, drop
+  // the old build's cached copies and connect again: a fresh navigation replaces
+  // the pending one, where a reload would replay the uncommitted splash.
+  const cleared = await clearCacheOnUpgrade({
+    session: session.defaultSession,
+    store,
+    appVersion: app.getVersion(),
+    probe: () => fetch(BACKEND_URL + "/api/health", { signal: AbortSignal.timeout(2000) })
+      .then((response) => (response.ok ? response.json() : null)).catch(() => null),
+    log: glog,
+  });
+  if (cleared && !mainWindow.isDestroyed()) await gateway.connect(mainWindow);
 
   // Optional companion surfaces start only after the primary gateway handoff.
   // Both are best-effort and must never block an otherwise usable dashboard.
@@ -437,7 +614,7 @@ app.whenReady().then(async () => {
   try {
     initCrewCompanion({
       backendUrl: BACKEND_URL,
-      fetchLocalToken: (...args) => gateway.fetchLocalToken(...args),
+      mintLocalToken: (...args) => gateway.mintLocalToken(...args),
       glog,
       getDashboardWindow: () => windows.focusedDashboardWindow() || null,
     });

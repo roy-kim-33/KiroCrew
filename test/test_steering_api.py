@@ -65,10 +65,18 @@ def _write_steering(root: Path, rel: str, body: str = "# Title\nrules\n") -> Pat
     return path
 
 
+#: The subject ``_make_app``'s identity middleware presents, and the id ``_state``
+#: reports as its owner. Steering writes are owner-only, so a suite about file
+#: resolution and content handling models the owner's own session.
+_OWNER_SUBJECT = "U0OWNER0000"
+
+
 def _state(project: str | Path | None = None, *, restricted: bool = False):
     """A MagicMock DashboardState exposing one slot with a project dir."""
     slot = MagicMock(project=str(project) if project else "", is_restricted=restricted)
-    return MagicMock(_slots={"default": slot}, _restricted_keys=set())
+    return MagicMock(
+        _slots={"default": slot}, _restricted_keys=set(), owner_id=_OWNER_SUBJECT
+    )
 
 
 def _project_headers(project: str | Path) -> dict[str, str]:
@@ -80,8 +88,22 @@ def _project_headers(project: str | Path) -> dict[str, str]:
     return {STEERING_PROJECT_HEADER: _project_key(Path(project))}
 
 
+@web.middleware
+async def _owner_identity(request, handler):
+    """What ``token_auth`` publishes for the owner's own dashboard session.
+
+    Without it these requests carry no dashboard-user claim at all, and the
+    owner gate on the write routes refuses them before the assertion each test is
+    about. The restricted-session rows are unaffected: ``_blocked`` runs first and
+    still answers for a restricted tab, owner or not.
+    """
+    request["user"] = _OWNER_SUBJECT
+    request["app"] = ""
+    return await handler(request)
+
+
 def _make_app(state):
-    app = web.Application()
+    app = web.Application(middlewares=[_owner_identity])
     app["state"] = state
     app.router.add_get("/api/steering", api_steering)
     app.router.add_post("/api/steering", api_steering_create)
@@ -169,6 +191,52 @@ class TestListing:
         assert "SHOULD-NOT-APPEAR" not in json.dumps(out)
         # The ordinary neighbour is unaffected.
         assert by_key["user/innocent.md"]["description"] == "Innocent"
+
+    def test_a_refused_head_read_leaves_an_audit_line(self, fake_home, monkeypatch):
+        """An entry listed with no description must not also be invisible.
+
+        The refused document keeps its entry and answers an empty description on
+        purpose: in the HTTP response it is byte-identical to a document that
+        simply has none, so the endpoint is no oracle for which files the gate
+        protects. SEL is operator-side, so the withholding is recorded there — as
+        THAT the bytes were withheld, never why: the gate judges and reads
+        through one descriptor and answers a bare ``None``, and re-``stat``-ing
+        the path to recover a cause would be another by-name look at exactly the
+        input this read stopped trusting. The ordinary neighbour must not
+        produce a line, or the log says nothing.
+        """
+        from kiro_crew.dashboard.handlers import steering as mod
+
+        sel_mock = MagicMock()
+        monkeypatch.setattr("kiro_crew.dashboard.handlers.sel", lambda: sel_mock)
+        root = fake_home / ".kiro" / "steering"
+        _write_steering(root, "innocent.md", "# Innocent\n")
+        denied = _write_steering(root, "denied.md", "# Denied\n")
+        real_read = mod.safe_read_file_bytes_nolink
+
+        def _gate(path, **kw):
+            # The gate's own refusal shape for a hardlinked, non-regular,
+            # escaped or unreadable inode: a bare ``None``, no exception.
+            if Path(path) == denied:
+                return None
+            return real_read(path, **kw)
+
+        # steering.py imports the helper at module scope, so patch it there.
+        monkeypatch.setattr(mod, "safe_read_file_bytes_nolink", _gate)
+        out = list_steering_blocking(None)
+        by_key = {f["key"]: f for f in out["files"]}
+        # The HTTP-visible shape is unchanged: listed, no description.
+        assert by_key["user/denied.md"]["description"] == ""
+        assert by_key["user/innocent.md"]["description"] == "Innocent"
+        refusals = [
+            c
+            for c in sel_mock.log_tool_invocation.call_args_list
+            if c.kwargs.get("tool_name") == "api_steering_list"
+            and c.kwargs.get("outcome") != "ok"
+        ]
+        assert [c.kwargs["outcome"] for c in refusals] == ["error"]
+        assert refusals[0].kwargs["tool_kind"] == "steering"
+        assert refusals[0].kwargs["metadata"]["path"].endswith("denied.md")
 
     def test_nested_files_and_home_redaction(self, fake_home):
         _write_steering(fake_home / ".kiro" / "steering", "team/style.md")
@@ -588,7 +656,9 @@ class TestProjectResolution:
             f"slot{i}": MagicMock(project=str(p), is_restricted=False)
             for i, p in enumerate(projects)
         }
-        return MagicMock(_slots=slots, _restricted_keys=set())
+        return MagicMock(
+            _slots=slots, _restricted_keys=set(), owner_id=_OWNER_SUBJECT
+        )
 
     def test_single_shared_project_is_used(self, fake_home, tmp_path):
         proj = tmp_path / "proj"
@@ -649,7 +719,9 @@ class TestProjectStateReason:
             f"slot{i}": MagicMock(project=str(p), is_restricted=False)
             for i, p in enumerate(projects)
         }
-        return MagicMock(_slots=slots, _restricted_keys=set())
+        return MagicMock(
+            _slots=slots, _restricted_keys=set(), owner_id=_OWNER_SUBJECT
+        )
 
     def test_single_slot_with_project_is_set(self, fake_home, tmp_path):
         proj = tmp_path / "proj"
@@ -860,6 +932,38 @@ class TestReadEndpoint:
 
         async with TestClient(TestServer(_make_app(_state()))) as client:
             assert (await client.get("/api/steering/user/a.md")).status == 413
+
+    @pytest.mark.asyncio
+    async def test_a_refused_scoped_read_is_audited_as_withheld(self, fake_home, monkeypatch):
+        """The 404 stays a 404; the SEL line stops calling it ``not_found``.
+
+        A refused descriptor read is answered exactly as an unknown key is, so
+        the response reveals nothing about which files the gate protects — but
+        an audit line that ALSO says ``not_found`` makes the refusal
+        indistinguishable from a typo in the operator's log as well. The line
+        records that bytes were withheld (``error``), never the cause, for the
+        reason the listing test gives.
+        """
+        from kiro_crew.dashboard.handlers import steering as mod
+
+        sel_mock = MagicMock()
+        monkeypatch.setattr("kiro_crew.dashboard.handlers.sel", lambda: sel_mock)
+        _write_steering(fake_home / ".kiro" / "steering", "a.md", "# A\nbody\n")
+        # steering.py imports the helper at module scope, so patch it there.
+        monkeypatch.setattr(mod, "safe_read_file_bytes_nolink", lambda *_a, **_kw: None)
+        async with TestClient(TestServer(_make_app(_state()))) as client:
+            resp = await client.get("/api/steering/user/a.md")
+            assert resp.status == 404
+            body = await resp.json()
+        # Same body an unknown key answers.
+        assert body == {"error": "not found"}
+        reads = [
+            c
+            for c in sel_mock.log_tool_invocation.call_args_list
+            if c.kwargs.get("tool_name") == "api_steering_read"
+        ]
+        assert [c.kwargs["outcome"] for c in reads] == ["error"]
+        assert reads[0].kwargs["metadata"] == {"key": "user/a.md"}
 
     @pytest.mark.asyncio
     async def test_oversize_file_is_413(self, fake_home):
@@ -1112,15 +1216,20 @@ class TestUpdateDeleteEndpoints:
             ).status == 200
 
         kwargs = captured["kwargs"]
-        # On a platform with the xattr syscalls the handler must hand over a real
-        # descriptor; where they do not exist (Windows) the contract is the
-        # opposite -- open_access_control_source returns None ON PURPOSE, because
-        # os.replace there fails while any other handle is open on either path.
-        # Asserting `int` unconditionally would demand the very handle that would
-        # break every save. Either way the kwarg must be PASSED, so a revert to
-        # the bits-only call still fails here.
+        # The handler's gate is PIN-FIRST, not xattr-first. When the parent
+        # pins (its own _DIR_FD_SUPPORTED plus the stage-and-rename probe),
+        # open_access_control_source hands back a real descriptor even where
+        # the xattr syscalls are absent — the MODE carry below reads the bits
+        # off that descriptor so they come from the pinned inode (macOS:
+        # openat and no listxattr). Only on the unpinned floor does the xattr
+        # flag decide, and None there (Windows) is deliberate — os.replace
+        # fails while any other handle is open on either path. Asserting
+        # `int` unconditionally would demand the very handle that would break
+        # every save there. Either way the kwarg must be PASSED, so a revert
+        # to the bits-only call still fails here.
+        handler_pins = mod._DIR_FD_SUPPORTED and aw.pinned_parent_replace_supported()
         assert "preserve_access_control_from" in kwargs
-        if aw.ACCESS_CONTROL_XATTRS_SUPPORTED:
+        if handler_pins or aw.ACCESS_CONTROL_XATTRS_SUPPORTED:
             assert isinstance(kwargs["preserve_access_control_from"], int)
             assert captured["source_bytes"] == b"original\n"
         else:  # pragma: no cover - exercised on Windows CI only

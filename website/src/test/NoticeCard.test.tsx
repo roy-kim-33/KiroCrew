@@ -92,6 +92,16 @@ describe('NoticeCard', () => {
     expect(container.querySelector('.sr-only')).toBeNull()
   })
 
+  it('keeps a multi-line notice on its own lines', () => {
+    // A Slack thread's first message is recorded as a notice above the reply;
+    // its line breaks are the only structure it has.
+    const content = 'Thread started by Kiro Crew on Slack:\nShould the budget reset?\n- yes\n- no'
+    const { container } = render(<NoticeCard content={content} />)
+    const text = container.querySelector('[data-testid="notice-card-text"]')!
+    expect(text.classList.contains('whitespace-pre-line')).toBe(true)
+    expect(text.textContent).toBe(content)
+  })
+
   it('spans the full column width like the RecoveryCard it stacks with', () => {
     const { container } = render(<NoticeCard content="notice" />)
     const card = container.querySelector('[data-testid="notice-card"]')!
@@ -160,12 +170,15 @@ describe('NoticeCard', () => {
 })
 
 describe('registry wiring', () => {
-  it("ChatPage renders the notice role through NoticeCard, not a hand-rolled box", () => {
+  it("ChatPage renders the notice role through the registry's NoticeCard entry, not a copy of its own", () => {
     const here = dirname(fileURLToPath(import.meta.url))
     const src = readFileSync(resolve(here, '../pages/ChatPage.tsx'), 'utf8')
     // Since chat-core P5-a the page dispatches through the app-sdk registry;
-    // the notice row is the page's `notice` host entry (same id as the default).
-    expect(src).toMatch(/id: 'notice', roles: \['notice'\], render: [^\n]*<NoticeCard/)
+    // since P5-c it keeps NO `notice` entry of its own -- the default entry
+    // below is the one row both the page and every pane draw. A page entry
+    // reusing the id would shadow it here alone, so its absence is the pin.
+    expect(src).not.toMatch(/id: 'notice'/)
+    expect(src).not.toMatch(/import NoticeCard from/)
     // The old inline branch carried its own class recipe; its return must be
     // gone so the style cannot fork again at this call site.
     expect(src).not.toMatch(/m\.role === 'notice'.*className=/)

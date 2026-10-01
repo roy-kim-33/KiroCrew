@@ -22,19 +22,27 @@ import contextlib
 import json
 import logging
 import os
+import random
 import signal
-import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
 from kiro_crew import platform_compat
+from kiro_crew.code_fingerprint import code_fingerprint, warm_code_fingerprint
 from kiro_crew.config.paths import config_dir
-from kiro_crew.env import resolve_krb5_ccname
+from kiro_crew.env import mcp_runtime_path, resolve_krb5_ccname
 from kiro_crew.mcp_gateway import transport
 from kiro_crew.mcp_gateway.pool import READ_BUFFER_LIMIT_BYTES
 from kiro_crew.mcp_gateway.shutdown_budget import TOTAL_SHUTDOWN_BUDGET_SECS
+from kiro_crew.metrics.events import (
+    LIVENESS_ESCALATED_LATENCY_MS,
+    LIVENESS_ESCALATED_PROBES,
+    emit_counter,
+    emit_histogram,
+)
+from kiro_crew.recovery.ladder import L4_GATEWAYD, LADDER, default_ladder
 from kiro_crew.sandbox import _SENSITIVE_ENV_PREFIXES as _SANDBOX_SENSITIVE_ENV_PREFIXES
 
 logger = logging.getLogger(__name__)
@@ -60,16 +68,37 @@ _LIVENESS_PING_INTERVAL_SECS = 30.0
 # daemon that would have recovered on its own. Empirically, the 2-fail
 # threshold raced with run_chaos.py and produced spurious
 # "gatewayd_pid_changed_unexpectedly" during legitimate chaos tests.
+#
+# Reaching the threshold takes more than three quiet cycles: a cycle counts only
+# when NEITHER probe answered (``_ping_with_escalation``), because the fast bound
+# measures load rather than liveness and on its own cannot tell a dead accept
+# loop from an event loop that is merely saturated. Under a wide fan-out that
+# confusion killed a live daemon ten times in thirty-five minutes, and each kill
+# severed every session's kirocrew-core transport.
 _LIVENESS_MAX_CONSECUTIVE_FAILURES = 3
+# Deadline for the ESCALATED probe, run once after a fast ping misses. The fast
+# ping's 2s bound measures load, not liveness: a daemon carrying 100+ concurrent
+# connections can be entirely healthy and still not reach its pong handler
+# inside 2s, and because ``_ping_raw`` gives up at its own deadline the manager
+# never SEES the late reply — so no amount of evidence in the pong helps unless
+# something waits long enough to collect it. That is this probe's whole job. It
+# runs at most once per interval, so the cost is one slow round-trip on a box
+# already in trouble, and it is what makes "busy" distinguishable from "dead".
+_LIVENESS_ESCALATED_TIMEOUT_SECS = 20.0
 # SIGTERM → SIGKILL grace period on shutdown. DERIVED, never a literal: a
 # hand-written 5.0 here was shorter than gatewayd's own 10s drain window, so the
 # supervisor SIGKILLed every restart that had attached stubs before the daemon
 # could reach ``pool.shutdown_all()``. Sourcing it from the daemon's published
 # budget makes that inversion unrepresentable.
 _SHUTDOWN_GRACE_SECS = TOTAL_SHUTDOWN_BUDGET_SECS
-# Respawn backoff: start here, double up to max.
-_RESPAWN_BACKOFF_START_SECS = 1.0
-_RESPAWN_BACKOFF_MAX_SECS = 60.0
+# Respawn backoff: the L4 rung of the shared recovery ladder. Floor and cap are
+# READ from ``recovery.ladder.LADDER`` rather than held here so the gatewayd
+# supervisor, the backend respawn, the ACP runtime rebuild and the task store
+# retry on one schedule with one jitter (RFC overload-resilience §7). The two
+# names stay because the stub mirrors the cap by name and a test pins it.
+_L4_POLICY = LADDER.layer(L4_GATEWAYD)
+_RESPAWN_BACKOFF_START_SECS = _L4_POLICY.base_secs
+_RESPAWN_BACKOFF_MAX_SECS = _L4_POLICY.max_secs
 # How many times start() will re-run assess-then-spawn before giving up. Two,
 # because the socket can change hands exactly once under a single start: a stale
 # incumbent yields and another gateway instance on the same machine wins the
@@ -177,6 +206,17 @@ class GatewaySpec:
     max_backends: int = 64  # keep in sync w/ McpGatewayConfig.max_backends (cover N agents x S servers)
     mcp_target_env: dict[str, str] = None  # type: ignore[assignment]
     prewarm_count: int = 0  # keep in sync w/ McpGatewayConfig.prewarm_count; 0 = disabled
+    # Admission (keep in sync w/ McpGatewayConfig.spawn_concurrency_* etc.).
+    spawn_concurrency_initial: int = 4
+    spawn_concurrency_min: int = 1
+    spawn_concurrency_max: int = 8
+    spawn_queue_wait_secs: int = 600
+    initialize_timeout_secs: int = 10
+    # Host budget ceilings; 0 = derive from the resource_status sample taken at
+    # spawn (procs, fds) or unbounded (rss_mb).
+    host_budget_max_procs: int = 0
+    host_budget_max_rss_mb: int = 0
+    host_budget_max_fds: int = 0
 
     def __post_init__(self) -> None:
         # dataclass(frozen) + mutable default → use object.__setattr__.
@@ -196,6 +236,13 @@ class GatewayManager:
     #: class-level-default reasoning as ``_stand_downs_issued`` above: the
     #: watchdog reads it on paths that build this object via ``__new__``.
     _last_drift_check: float = 0.0
+    #: Whether the spent-stand-down-budget settle has been announced. The
+    #: watchdog re-enters ``_repair_or_adopt`` on every drift re-check for as
+    #: long as a refusing incumbent holds the socket, and the settle verdict
+    #: never changes once the budget is spent — so it is logged at ERROR once
+    #: and at DEBUG thereafter. Class-level default for the same ``__new__``
+    #: reasoning as above.
+    _cap_settle_logged: bool = False
 
     def __init__(self, spec: GatewaySpec) -> None:
         self._spec = spec
@@ -205,7 +252,12 @@ class GatewayManager:
         self._adopted = False
         self._stand_downs_issued = 0
         self._last_drift_check = 0.0
+        self._cap_settle_logged = False
         self._lifecycle_lock = asyncio.Lock()
+        # Detached fire-and-forget telemetry tasks (saturation-signal emits).
+        # Held only so the event loop keeps a strong reference until each
+        # finishes; each removes itself on done. Never awaited by any caller.
+        self._telemetry_tasks: set[asyncio.Task[None]] = set()
 
     @property
     def socket_path(self) -> Path:
@@ -249,16 +301,40 @@ class GatewayManager:
         # before our own spawn does. Round two assesses that daemon the same way
         # round one assessed the first, and the cap is what stops two instances
         # trading the socket indefinitely.
+        # Off-loop once, before the first _code_drift reads it synchronously.
+        await warm_code_fingerprint()
         for _attempt in range(_ELECTION_ROUNDS):
             incumbent = await self._ping_payload()
             if incumbent is not None:
+                if self._owned_by_a_live_other(incumbent):
+                    # Another gateway process still owns this daemon. Two
+                    # gateways on one data home is not a supported layout,
+                    # and adopting the daemon would tear it out from under
+                    # its owner -- or, on a managed-service restart racing
+                    # the old process's exit, adopt a daemon whose owner
+                    # sweeper is about to take it down mid-traffic. Neither
+                    # is ours to serve from. Refuse the broker; stubs fall
+                    # back to per-session exec, which keeps every tool
+                    # working, and the next start meets a free socket once
+                    # the owner and its daemon have gone.
+                    logger.error(
+                        "mcp-gateway: the daemon on %s is owned by another LIVE gateway "
+                        "(pid %s) — not adopting it. Two gateways on one data home is "
+                        "unsupported; if this is a restart, the previous gateway has not "
+                        "finished exiting. Starting without a shared broker.",
+                        self._spec.socket_path,
+                        incumbent.get("owner_pid"),
+                    )
+                    return False
                 # Adoption skips _spawn_once, which is the ONLY place
                 # spec.mcp_target_env is applied. Check the incumbent actually
                 # covers what this spec would have given it, and say so if not.
                 missing = self._adoption_drift(incumbent)
-                if not missing:
+                stale_code = self._code_drift(incumbent)
+                orphaned = self._orphaned(incumbent)
+                if not missing and not stale_code and not orphaned:
                     return self._adopt_incumbent()
-                verdict = await self._repair_or_adopt(missing)
+                verdict = await self._repair_or_adopt(missing, stale_code, orphaned)
                 if verdict == _ADOPT:
                     return self._adopt_incumbent()
                 if verdict == _ABORT:
@@ -274,7 +350,12 @@ class GatewayManager:
             spawned = await self._spawn_and_confirm()
             if spawned is None:
                 return False
-            if not self._adoption_drift(spawned):
+            if (
+                not self._adoption_drift(spawned)
+                and not self._code_drift(spawned)
+                and not self._owned_by_a_live_other(spawned)
+                and not self._orphaned(spawned)
+            ):
                 if self.is_running:
                     self._watchdog = asyncio.create_task(
                         self._run_watchdog(), name="mcp-gateway-watchdog"
@@ -294,7 +375,8 @@ class GatewayManager:
             # our exited handle and let the next round assess it as an incumbent.
             logger.warning(
                 "mcp-gateway: our spawn on %s lost the election to a daemon that "
-                "cannot resolve the configured target stems — re-electing",
+                "cannot serve this gateway (target stems or code revision) — "
+                "re-electing",
                 self._spec.socket_path,
             )
             self._process = None
@@ -326,7 +408,54 @@ class GatewayManager:
         )
         return True
 
-    async def _repair_or_adopt(self, missing: list[str]) -> str:
+    def _owned_by_a_live_other(self, pong: dict) -> bool:
+        """True when the pong names an owner that is alive and is not this process.
+
+        ``owner_pid`` 0 or absent means an operator-run or pre-owner daemon: no
+        one else's, so adoptable on the other gates. A dead owner is an orphan
+        (its sweeper will take it down shortly) and is adoptable on the other
+        gates too -- adopting it costs nothing and bridges the gap until it
+        exits and the watchdog spawns ours.
+        """
+        owner = pong.get("owner_pid")
+        if isinstance(owner, bool) or not isinstance(owner, int) or owner <= 0:
+            return False
+        if owner == os.getpid():
+            return False
+        return platform_compat.pid_exists(owner)
+
+    def _orphaned(self, pong: dict) -> bool:
+        """True when the pong names an owner that has exited.
+
+        Such a daemon is already scheduled to leave: its owner-liveness sweeper
+        ends it within two probes of noticing. Adopting it would hand every
+        session a broker that exits under them mid-call, so it is treated as
+        DRAINING -- asked to stand down now (it confirms its owner is gone before
+        agreeing) and replaced by a daemon this process owns. No owner recorded
+        (0 or absent) is not an orphan: nothing is scheduled to end it.
+        """
+        owner = pong.get("owner_pid")
+        if isinstance(owner, bool) or not isinstance(owner, int) or owner <= 0:
+            return False
+        if owner == os.getpid():
+            return False
+        return not platform_compat.pid_exists(owner)
+
+    def _code_drift(self, pong: dict) -> bool:
+        """True when the incumbent runs different code than this process.
+
+        The pong carries the daemon's ``code_fingerprint``. A daemon that omits it
+        (a pre-fingerprint build) is stale by construction: it predates this
+        code, so it is treated as drifted rather than as unverifiable. A daemon
+        resolving every stem can still be running a checkout two days old, and
+        the target check cannot see that -- this is the check that can.
+        """
+        theirs = pong.get("fingerprint")
+        return not isinstance(theirs, str) or theirs != code_fingerprint()
+
+    async def _repair_or_adopt(
+        self, missing: list[str], stale_code: bool = False, orphaned: bool = False
+    ) -> str:
         """Try to replace a stale incumbent; decide what the caller does next.
 
         Returns :data:`_SPAWN` (it yielded, put our own daemon there),
@@ -341,28 +470,52 @@ class GatewayManager:
         Refusing to adopt would instead leave the socket held by a daemon nobody
         supervises and no working broker at all.
         """
+        grounds: list[str] = []
+        if missing:
+            grounds.append(f"cannot resolve {', '.join(missing)}")
+        if stale_code:
+            grounds.append("runs different code than this gateway")
+        if orphaned:
+            grounds.append("belongs to a gateway that has exited and is about to stop itself")
         if self._stand_downs_issued >= _MAX_STAND_DOWN_REQUESTS:
             # Oscillation guard. Reached only when this process has already asked
-            # _MAX_STAND_DOWN_REQUESTS times, which in practice means another
-            # live gateway instance keeps re-winning the socket with a different
-            # target map. Settle instead of trading the socket forever.
-            logger.error(
-                "mcp-gateway: incumbent on %s still cannot resolve %s, but this "
-                "gateway has already issued %d stand-downs — adopting it instead "
-                "of contending further. Another gateway instance is likely "
-                "sharing this socket path with a different stub set; these "
-                "servers' stubs stay on per-session exec.",
+            # _MAX_STAND_DOWN_REQUESTS times: either another live gateway
+            # instance keeps re-winning the socket with a different target map,
+            # or the incumbent predates the stand-down grounds this code sends
+            # (a survivor from a replaced install) and will never honour one.
+            # Settle instead of trading the socket forever.
+            #
+            # Settling is a DECISION, so it is announced once. The watchdog's
+            # drift re-check lands here every _DRIFT_RECHECK_INTERVAL_SECS for
+            # as long as the incumbent holds the socket, and re-logging the
+            # same settled verdict at ERROR turned one upgrade skew into a
+            # permanent ~288-line/day log storm in the field. Repeats go to
+            # DEBUG; _adoption_drift's own WARNING still names any newly
+            # missing stems each re-check, so new degradation stays visible.
+            log = logger.debug if self._cap_settle_logged else logger.error
+            self._cap_settle_logged = True
+            log(
+                "mcp-gateway: incumbent on %s still %s, but this gateway has "
+                "already issued %d stand-downs — adopting it instead of "
+                "contending further. %s",
                 self._spec.socket_path,
-                ", ".join(missing),
+                " and ".join(grounds),
                 self._stand_downs_issued,
+                "Another gateway instance is likely sharing this socket path "
+                "with a different stub set; these servers' stubs stay on "
+                "per-session exec."
+                if missing
+                else "Run `kirocrew restart` to replace it.",
             )
             return _ADOPT
         logger.warning(
-            "mcp-gateway: incumbent on %s cannot resolve %s — asking it to "
-            "stand down so a daemon with the current target map can bind",
-            self._spec.socket_path, ", ".join(missing),
+            "mcp-gateway: incumbent on %s %s — asking it to stand down so a daemon "
+            "matching this gateway can bind",
+            self._spec.socket_path, " and ".join(grounds),
         )
-        outcome = await self._request_stand_down(missing)
+        outcome = await self._request_stand_down(
+            missing, stale_code=stale_code, orphaned=orphaned
+        )
         if outcome == _RELEASED:
             logger.info(
                 "mcp-gateway: stale incumbent stood down and released %s — "
@@ -381,6 +534,18 @@ class GatewayManager:
                 self._spec.socket_path, _SHUTDOWN_GRACE_SECS,
             )
             return _ABORT
+        if stale_code:
+            # Fail-open like the drift case (a refusing daemon is still serving),
+            # but say plainly what it costs: every control frame this gateway
+            # exchanges with that daemon's pooled backends may be one revision
+            # out of step.
+            logger.error(
+                "mcp-gateway: adopting a daemon on %s that runs DIFFERENT CODE than "
+                "this gateway and refused to stand down. Pooled MCP backends may "
+                "speak a stale protocol (session directives, app calls); run "
+                "`kirocrew restart` to replace it.",
+                self._spec.socket_path,
+            )
         return _ADOPT
 
     async def _spawn_and_confirm(self) -> Optional[dict]:
@@ -455,7 +620,15 @@ class GatewayManager:
         # live before we hand control back to the caller. Without this the
         # socket appearing only proves bind() succeeded; the handler task
         # might still be wiring up when the first stub connects.
-        pong = await self._ping_payload()
+        #
+        # Escalated, because the miss path TERMINATES the daemon this call just
+        # spawned. A cold start on a loaded host does its own work before it can
+        # answer -- fingerprint warming, prewarm, socket setup -- so the fast
+        # bound can time out against a daemon that is coming up correctly, and
+        # killing it reports the start as failed and drops every stub to
+        # per-session exec, which is the process pile-up this change exists to
+        # avoid.
+        pong = await self._ping_with_escalation()
         if pong is None:
             logger.warning("mcp-gateway ping failed — treating start as failure")
             await self._terminate_process(grace_secs=_SHUTDOWN_GRACE_SECS)
@@ -510,25 +683,56 @@ class GatewayManager:
         # long-lived background daemon's forked children inherit a usable
         # ticket for any credential-gated MCP server.
         resolve_krb5_ccname(env)
-        # A background daemon can inherit a minimal PATH (e.g. under
-        # systemd-user), so prepend the user-local bin dir where MCP
-        # server launchers are commonly installed.
-        local_bin = str(Path.home() / ".local" / "bin")
-        existing_path = env.get("PATH", "")
-        extra_dirs = [p for p in (local_bin,) if p and p not in existing_path.split(os.pathsep)]
-        if extra_dirs:
-            env["PATH"] = os.pathsep.join([*extra_dirs, existing_path]) if existing_path else os.pathsep.join(extra_dirs)
-        argv = [
-            sys.executable,
-            "-m", _GATEWAYD_MODULE,
+        # A background daemon can inherit a minimal PATH (e.g. launched from
+        # Electron or under systemd-user), so extend it with the well-known MCP
+        # launcher dirs. This MUST be ``mcp_runtime_path``: operator-contributed
+        # MCP dirs lead (an explicitly named dir outranks a built-in guess),
+        # followed by ``augmented_path`` as one block in the exact order the
+        # kiro-cli spawn path uses, so wrappers that exec another BARE tool name
+        # resolve it. ``mcp_search_path`` is not correct here because this is an
+        # inherited daemon PATH, not a spec-authored PATH; treating it as the
+        # latter would move system entries ahead of managed launcher dirs.
+        #
+        # Off the loop, like the other blocking calls in this method: on a cold
+        # cache ``mcp_runtime_path`` calls ``augmented_path``, which globs every
+        # version-manager root for Node bin dirs (``_node_all_bin_dirs``, whose
+        # own docstring calls repeating that glob a GIL-contention risk).
+        # Measured 5ms warm-cache against 35 such dirs, but it is filesystem work
+        # with no ceiling on a slow or remote home, and this method already
+        # offloads a single chmod.
+        env["PATH"] = await asyncio.to_thread(mcp_runtime_path, env.get("PATH", ""))
+        # ``-P``: the daemon inherits this process's cwd -- the home directory
+        # under the service unit -- and ``-m`` would put it ahead of the stdlib.
+        argv = platform_compat.isolated_python_argv(
+            "-P", "-m", _GATEWAYD_MODULE,
             "--socket", str(self._spec.socket_path),
+            # This process is the daemon's one owner: it exits when we are
+            # gone (start-time-checked, so a recycled PID does not count)
+            # instead of lingering for the next gateway to adopt.
+            "--owner-pid", str(os.getpid()),
             "--idle-timeout-secs", str(self._spec.idle_timeout_secs),
             "--max-backends", str(self._spec.max_backends),
-        ]
+        )
         # Only pass --prewarm-count when enabled so the daemon command line
         # stays unchanged (and tests stay byte-identical) in the default case.
         if self._spec.prewarm_count > 0:
             argv += ["--prewarm-count", str(self._spec.prewarm_count)]
+        # Admission: the spawn gate's fixed capacity and bounds, the queue wait
+        # and initialize budgets, and the host-budget ceilings. Ceilings left at
+        # 0 are derived in the daemon from ``--host-available-mb``, which is
+        # sampled HERE: the gateway process already runs the memory probe for
+        # its own sub-agent cap, and the daemon must not import that machinery.
+        argv += [
+            "--spawn-concurrency", str(self._spec.spawn_concurrency_initial),
+            "--spawn-concurrency-min", str(self._spec.spawn_concurrency_min),
+            "--spawn-concurrency-max", str(self._spec.spawn_concurrency_max),
+            "--spawn-queue-wait-secs", str(self._spec.spawn_queue_wait_secs),
+            "--initialize-timeout-secs", str(self._spec.initialize_timeout_secs),
+            "--host-budget-max-procs", str(self._spec.host_budget_max_procs),
+            "--host-budget-max-rss-mb", str(self._spec.host_budget_max_rss_mb),
+            "--host-budget-max-fds", str(self._spec.host_budget_max_fds),
+            "--host-available-mb", str(await asyncio.to_thread(self._host_available_mb)),
+        ]
         # Credential-rotation drain (seam-routed): the daemon is a separately
         # spawned process that never boots the platform, so the already-booted
         # gateway process resolves the watch paths here and threads each as a
@@ -578,6 +782,25 @@ class GatewayManager:
             # MemoryError) that would otherwise leak ``log_fh`` until
             # GC — a real risk under a watchdog respawn storm.
             log_fh.close()
+
+    @staticmethod
+    def _host_available_mb() -> float:
+        """Available host memory in MiB from the ``resource_status`` probe, or
+        ``-1.0`` when it is unavailable (the daemon then uses its floors).
+
+        Blocking (reads ``/proc`` or calls the platform API); callers offload
+        it. Never raises: a failed sample must not stop the daemon spawning.
+        """
+        try:
+            from kiro_crew.resource_status import probe
+
+            available_gb = probe().available_gb
+        except Exception:
+            logger.debug("host memory sample for the daemon's host budget failed", exc_info=True)
+            return -1.0
+        if available_gb is None or available_gb < 0:
+            return -1.0
+        return float(available_gb) * 1024.0
 
     @staticmethod
     def _credential_watch_paths() -> list[Path]:
@@ -692,7 +915,9 @@ class GatewayManager:
         )
         return missing
 
-    async def _request_stand_down(self, need: list[str]) -> str:
+    async def _request_stand_down(
+        self, need: list[str], *, stale_code: bool = False, orphaned: bool = False
+    ) -> str:
         """Ask a stale incumbent to yield the socket.
 
         Returns :data:`_RELEASED` (accepted and the lock is free),
@@ -727,7 +952,17 @@ class GatewayManager:
         wait out another process's drain.
         """
         self._stand_downs_issued += 1
-        reply = await self._control_roundtrip({"type": "stand-down", "need": sorted(need)})
+        frame: dict[str, Any] = {"type": "stand-down", "need": sorted(need)}
+        if stale_code:
+            # Names OUR code so the daemon can confirm the mismatch itself; a
+            # daemon on the same fingerprint refuses, which is correct.
+            frame["caller_fingerprint"] = code_fingerprint()
+        if orphaned:
+            # A claim, not an instruction: the daemon re-checks its own owner
+            # before honouring it, so a caller cannot end a daemon whose
+            # gateway is alive by asserting otherwise.
+            frame["orphaned"] = True
+        reply = await self._control_roundtrip(frame)
         if reply is None or reply.get("type") != "standing-down":
             logger.warning(
                 "mcp-gateway: stand-down request on %s was not accepted (%s)",
@@ -785,31 +1020,77 @@ class GatewayManager:
             except Exception:
                 pass
 
-    async def _ping_payload(self) -> Optional[dict]:
+    async def _ping_payload(self, *, timeout: Optional[float] = None) -> Optional[dict]:
         """The daemon's ``pong`` payload, or ``None`` if it did not answer one.
 
         Split out of :meth:`_ping_once` so the adoption gate can read the
         coverage report the reply carries without changing the boolean contract
-        the five other call sites rely on.
+        the five other call sites rely on. ``timeout`` overrides the default
+        round-trip deadline for the escalated liveness probe, which must outlast
+        a loaded event loop to collect the load evidence at all.
         """
-        msg = await self._ping_raw()
+        msg = await self._ping_raw(timeout=timeout)
         return msg if isinstance(msg, dict) and msg.get("type") == "pong" else None
 
     async def _ping_once(self) -> bool:
         """Return ``True`` iff the daemon replies ``{"type":"pong"}`` within
         ``_PING_TIMEOUT_SECS``. Any transport or parse error → ``False``.
+
+        A wider deadline belongs to the decisions that would DISPLACE a running
+        daemon, which reach it through :meth:`_ping_with_escalation`.
         """
         return (await self._ping_payload()) is not None
 
-    async def _ping_raw(self) -> Optional[dict]:
-        """One ping round-trip; the decoded reply, or ``None`` on any failure."""
+    async def _ping_raw(self, *, timeout: Optional[float] = None) -> Optional[dict]:
+        """One ping round-trip; the decoded reply, or ``None`` on any failure.
+
+        An explicit ``timeout`` bounds the WHOLE round-trip; without one, each
+        step keeps its own ``_PING_TIMEOUT_SECS``, which is what the fast-bound
+        call sites have always had.
+
+        Both halves of that are load-bearing, and the reason is arithmetic
+        rather than tidiness. The escalated bound has to reach every step: the
+        connect is what blocks against a saturated accept backlog, so a probe
+        that widened only the connect would collect no more late pongs than the
+        fast one. But it must not give each step its own 20s, because on the
+        adopted path this probe's duration IS the outage window -- nothing is
+        listening on that address until a replacement lands, so every attached
+        stub is unable to serve a call for as long as the probe runs. Per step
+        the escalated probe alone reaches 3 x 20s, and with the fast probe's own
+        3 x 2s ahead of it the worst case is 66s on top of the up-to-30s notice
+        latency. Shared, the pair is bounded at 26s. The outage is what the
+        number buys down; the probe should not be the largest term in it.
+
+        The fast path is deliberately NOT collapsed onto one 2s budget:
+        a loaded daemon needing 1.5s to accept and 1.5s to answer passes today
+        and would start reading as dead, which is the misverdict this module is
+        being fixed to stop producing.
+        """
+        loop = asyncio.get_running_loop()
+
+        if timeout is None:
+
+            def _left() -> float:
+                return _PING_TIMEOUT_SECS
+
+        else:
+            deadline = loop.time() + timeout
+
+            def _left() -> float:
+                # Never zero or negative: wait_for(0) raises immediately, which
+                # would report a spent budget as a transport failure. Never
+                # above the caller's bound either: ``deadline - now`` is a
+                # rounded float and can land a hair over ``timeout`` on the
+                # first step.
+                return min(timeout, max(0.001, deadline - loop.time()))
+
         try:
             reader, writer = await asyncio.wait_for(
                 transport.connect(
                     self._spec.socket_path,
                     limit=READ_BUFFER_LIMIT_BYTES,
                 ),
-                timeout=_PING_TIMEOUT_SECS,
+                timeout=_left(),
             )
         except (asyncio.TimeoutError, OSError) as exc:
             logger.warning("mcp-gateway ping connect failed: %s", exc)
@@ -817,12 +1098,12 @@ class GatewayManager:
         try:
             writer.write(b'{"type":"ping"}\n')
             try:
-                await asyncio.wait_for(writer.drain(), timeout=_PING_TIMEOUT_SECS)
+                await asyncio.wait_for(writer.drain(), timeout=_left())
             except (asyncio.TimeoutError, ConnectionError):
                 return None
             try:
                 line = await asyncio.wait_for(
-                    reader.readuntil(b"\n"), timeout=_PING_TIMEOUT_SECS,
+                    reader.readuntil(b"\n"), timeout=_left(),
                 )
             except (asyncio.TimeoutError, asyncio.IncompleteReadError,
                     asyncio.LimitOverrunError):
@@ -838,6 +1119,22 @@ class GatewayManager:
                 await writer.wait_closed()
             except Exception:
                 pass
+
+    async def set_spawn_capacity(self, capacity: int) -> Optional[int]:
+        """Move the daemon's spawn-gate capacity (adaptive controller actuator).
+
+        Returns the capacity the daemon actually applied (it clamps to its own
+        ``[floor, ceiling]``), or ``None`` when the daemon did not answer or
+        rejected the frame -- the caller keeps the value pending and retries
+        on its next tick rather than assuming it took effect.
+        """
+        reply = await self._control_roundtrip(
+            {"type": "set-spawn-capacity", "capacity": int(capacity)}
+        )
+        if not reply or reply.get("type") != "spawn-capacity":
+            return None
+        applied = reply.get("capacity")
+        return int(applied) if isinstance(applied, int) and not isinstance(applied, bool) else None
 
     async def stats(self) -> dict:
         """Return the daemon's pool snapshot, or ``{}`` on any error."""
@@ -902,9 +1199,11 @@ class GatewayManager:
             return False
         self._last_drift_check = now
         missing = self._adoption_drift(pong)
-        if not missing:
+        stale_code = self._code_drift(pong)
+        orphaned = self._orphaned(pong)
+        if not missing and not stale_code and not orphaned:
             return False
-        verdict = await self._repair_or_adopt(missing)
+        verdict = await self._repair_or_adopt(missing, stale_code, orphaned)
         if verdict != _SPAWN:
             # _ADOPT: it will not yield (or this manager has spent its
             # stand-down budget) and the cost is already on the record via
@@ -944,6 +1243,28 @@ class GatewayManager:
         )
         return True
 
+    @staticmethod
+    def _next_respawn_backoff(current: float) -> float:
+        """The delay after ``current`` on the L4 schedule: doubled, capped, jittered.
+
+        Reads the module floor/cap at call time (tests pin the floor to 0) and
+        applies the ladder's equal jitter so two supervisors that lost their
+        daemons together do not respawn in lock-step. Never below the floor and
+        never above ``_RESPAWN_BACKOFF_MAX_SECS`` -- the value the stub's
+        reconnect budget is derived from.
+        """
+        floor = _RESPAWN_BACKOFF_START_SECS
+        cap = _RESPAWN_BACKOFF_MAX_SECS
+        raw = min(max(current, floor) * 2, cap)
+        if raw <= 0:
+            return 0.0
+        # Equal jitter over the doubled value (see recovery.policy): the low half
+        # is guaranteed, the high half is drawn. The exponent is expressed as
+        # "double what we slept last time" because the loop holds the delay, not
+        # an attempt count.
+        jittered = raw / 2.0 + random.random() * (raw / 2.0)
+        return float(min(cap, max(floor, jittered)))
+
     async def _run_watchdog(self) -> None:
         """Supervise the daemon: respawn on exit or on liveness failure.
 
@@ -970,16 +1291,33 @@ class GatewayManager:
                     # drift too: an adopted daemon never re-applies a spec,
                     # so without this a survivor that goes stale after
                     # adoption stays stale for its whole life.
-                    pong = await self._ping_payload()
+                    # A miss here gets the same escalated probe the owned path
+                    # uses, and then acts on it -- deliberately, on ONE miss,
+                    # unlike the owned path's three-cycle grace. The two paths
+                    # differ in what a slow verdict costs. If an adopted daemon
+                    # really is gone, nothing is listening on its address, and
+                    # every attached stub is unable to serve a call until a
+                    # replacement binds -- so here the verdict's latency IS the
+                    # outage. One escalated miss displaces at 26s worst case
+                    # (2+2+2 fast, then 20 escalated); three cycles would take
+                    # 26 + 30 + 26 + 30 + 26 = 138s, five times the outage for
+                    # evidence the escalation already provides. The owned path
+                    # can afford its grace because its own socket stays bound
+                    # while it waits, so waiting there costs nothing.
+                    # The load misverdict this change exists to fix is already
+                    # handled by the escalation: a daemon that answers either
+                    # probe is alive and is never displaced.
+                    pong = await self._ping_with_escalation(observe=True)
                     if pong is not None:
                         if await self._reconcile_adopted(pong):
                             continue
                         await asyncio.sleep(_LIVENESS_PING_INTERVAL_SECS)
                         continue
                     logger.warning(
-                        "mcp-gateway: adopted daemon on %s is gone — "
-                        "re-electing (spawning a replacement)",
+                        "mcp-gateway: adopted daemon on %s did not answer "
+                        "within %.0fs — re-electing (spawning a replacement)",
                         self._spec.socket_path,
+                        _LIVENESS_ESCALATED_TIMEOUT_SECS,
                     )
                     self._adopted = False
                     try:
@@ -999,7 +1337,7 @@ class GatewayManager:
                         # hot-loop at the floor interval.
                         self._adopted = True
                         await asyncio.sleep(backoff)
-                        backoff = min(backoff * 2, _RESPAWN_BACKOFF_MAX_SECS)
+                        backoff = self._next_respawn_backoff(backoff)
                     else:
                         # Spawned — reset backoff; the next iteration enters the
                         # wait-race to supervise the fresh process.
@@ -1020,7 +1358,7 @@ class GatewayManager:
                     # Escalate backoff (mirroring the main proc-exit path) so a
                     # persistent spawn failure does not hot-loop at the floor.
                     await asyncio.sleep(backoff)
-                    backoff = min(backoff * 2, _RESPAWN_BACKOFF_MAX_SECS)
+                    backoff = self._next_respawn_backoff(backoff)
                     continue
                 # Spawned — reset backoff; next iteration enters the wait-race.
                 backoff = _RESPAWN_BACKOFF_START_SECS
@@ -1080,7 +1418,7 @@ class GatewayManager:
                 "mcp-gateway: %s — respawning in %.1fs", exit_reason, backoff,
             )
             await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, _RESPAWN_BACKOFF_MAX_SECS)
+            backoff = self._next_respawn_backoff(backoff)
             if self._stopping:
                 return
             # Before respawning, check whether another daemon already owns
@@ -1101,14 +1439,33 @@ class GatewayManager:
             # needed its own check because it returns to the caller instead of
             # looping back to a gate.
             incumbent = await self._ping_payload()
+            if incumbent is not None and self._owned_by_a_live_other(incumbent):
+                # Same rule as start: another live gateway's daemon is not ours
+                # to adopt or replace. Back off and look again; the owner's exit
+                # takes the daemon with it and frees the socket.
+                logger.error(
+                    "mcp-gateway: the daemon on %s is owned by another LIVE gateway "
+                    "(pid %s) — waiting rather than adopting it",
+                    self._spec.socket_path,
+                    incumbent.get("owner_pid"),
+                )
+                await asyncio.sleep(backoff)
+                backoff = self._next_respawn_backoff(backoff)
+                continue
             if incumbent is not None:
                 missing = self._adoption_drift(incumbent)
-                verdict = _ADOPT if not missing else await self._repair_or_adopt(missing)
+                stale_code = self._code_drift(incumbent)
+                orphaned = self._orphaned(incumbent)
+                verdict = (
+                    _ADOPT
+                    if not missing and not stale_code and not orphaned
+                    else await self._repair_or_adopt(missing, stale_code, orphaned)
+                )
                 if verdict == _ABORT:
                     # Draining incumbent: neither adoptable nor replaceable yet.
                     # Back off and re-assess rather than spawning into a held lock.
                     await asyncio.sleep(backoff)
-                    backoff = min(backoff * 2, _RESPAWN_BACKOFF_MAX_SECS)
+                    backoff = self._next_respawn_backoff(backoff)
                     continue
                 if verdict == _ADOPT:
                     self._adopted = True
@@ -1136,20 +1493,30 @@ class GatewayManager:
             except Exception:
                 logger.exception("mcp-gateway: respawn failed — will retry")
                 continue
+            # One L4 rebuild. The ladder counts it and, on a SECOND respawn
+            # inside its cooldown, escalates to L5 -- which is a notification,
+            # never an automatic gateway restart; this loop keeps supervising.
+            default_ladder().record_restart(L4_GATEWAYD)
+            default_ladder().observe_failure(
+                L4_GATEWAYD, "gatewayd", reason=exit_reason, retry_after_secs=None
+            )
             # Reset backoff after a successful respawn that stays alive
             # for at least 30s.
             await asyncio.sleep(30.0)
             if self._process is not None and self._process.returncode is None:
                 backoff = _RESPAWN_BACKOFF_START_SECS
+                default_ladder().observe_success(L4_GATEWAYD, "gatewayd")
 
     async def _liveness_probe_loop(self) -> str:
         """Ping the daemon every ``_LIVENESS_PING_INTERVAL_SECS``.
 
         Returns a human-readable reason string as soon as
-        ``_LIVENESS_MAX_CONSECUTIVE_FAILURES`` consecutive ping round-trips
-        fail. Never returns normally — either the coroutine is cancelled
-        by the outer watchdog race (daemon exited first) or it returns a
-        failure reason.
+        ``_LIVENESS_MAX_CONSECUTIVE_FAILURES`` consecutive cycles miss BOTH
+        probes: each cycle is the fast ping and then, only if it missed, one
+        escalated probe (see :meth:`_ping_with_escalation`), and a daemon that
+        answers either one is alive. Never returns normally — either the
+        coroutine is cancelled by the outer watchdog race (daemon exited
+        first) or it returns a failure reason.
         """
         consecutive_failures = 0
         while True:
@@ -1158,21 +1525,102 @@ class GatewayManager:
                 # Outer loop will notice _stopping and exit; yield a
                 # benign reason that gets ignored on stop.
                 return "stopping"
-            ok = await self._ping_once()
-            if ok:
+            # One probe pair per cycle: the fast ping, then -- only if it missed
+            # -- one escalated one. A miss is NOT yet evidence of death, because
+            # the fast bound measures how loaded the daemon is and ``_ping_raw``
+            # gives up at it, so a healthy daemon serving 100+ connections looks
+            # identical to a dead one. Killing the wrong one costs every attached
+            # session its tools.
+            if await self._ping_with_escalation(observe=True) is not None:
                 consecutive_failures = 0
                 continue
             consecutive_failures += 1
             logger.warning(
-                "mcp-gateway: liveness ping failed (%d/%d consecutive)",
+                "mcp-gateway: liveness ping failed (%d/%d consecutive): "
+                "no reply within %.0fs",
                 consecutive_failures, _LIVENESS_MAX_CONSECUTIVE_FAILURES,
+                _LIVENESS_ESCALATED_TIMEOUT_SECS,
             )
             if consecutive_failures >= _LIVENESS_MAX_CONSECUTIVE_FAILURES:
                 return (
                     f"zombie detected: {consecutive_failures} consecutive "
                     f"ping failures over "
                     f"{int(consecutive_failures * _LIVENESS_PING_INTERVAL_SECS)}s"
+                    f" (no reply within {_LIVENESS_ESCALATED_TIMEOUT_SECS:.0f}s)"
                 )
+
+    async def _ping_with_escalation(self, *, observe: bool = False) -> Optional[dict]:
+        """The daemon's pong, allowing for a loaded event loop.
+
+        The fast probe's 2s bound measures load, not liveness, and
+        :meth:`_ping_raw` gives up at that bound — so a daemon serving 100+
+        connections can be entirely healthy and still look silent. One slow
+        round-trip is what separates the two, and every decision that would
+        DISPLACE a running daemon has to make it. ``None`` means no answer even
+        with the escalated deadline.
+
+        Not used by the one-shot assessment gates (start-up election, the
+        post-respawn incumbent check) or by the public status probe. For the
+        status probe that is deliberate: a UI poll is waiting on it. For the
+        assessment gates it is only a scope boundary — their miss path can
+        unlink a LIVE daemon's socket, because ``transport.probe_live`` reads a
+        saturated accept backlog as not-live. See the daemon-lifecycle spec;
+        that defect belongs to the endpoint lifecycle, not to this verdict.
+
+        Observability (``observe=True`` only): the escalation itself is the
+        precursor state to every kill/reconnect cycle — the fast bound missed,
+        so the daemon is loaded, and this longer probe is the only thing that
+        can tell loaded-but-alive from dead. That state is otherwise silent, so
+        the watchdog callers surface it: a counter of escalated probes
+        (``answered`` distinguishes loaded-but-alive from dead) and, when the
+        daemon answers, the OBSERVED round-trip latency the fast bound throws
+        away — the load evidence an operator needs to see saturation before it
+        becomes an outage, and the field data against which
+        ``_LIVENESS_ESCALATED_TIMEOUT_SECS`` can be checked. ``observe`` is
+        False for the start-up confirmation caller: a fast miss there is a
+        daemon still coming up, not a saturated one, and would pollute the
+        series with start-up noise. The emit is fire-and-forget so telemetry
+        never gates the verdict — on the adopted path this probe's duration IS
+        the outage, and an awaited emit on a saturated executor would extend it.
+        """
+        pong = await self._ping_payload()
+        if pong is not None:
+            return pong
+        started = time.perf_counter()
+        escalated = await self._ping_payload(timeout=_LIVENESS_ESCALATED_TIMEOUT_SECS)
+        if not observe:
+            # Start-up confirmation caller: a fast miss here is a daemon still
+            # coming up, not a saturated one, so it is not the signal.
+            return escalated
+        # Read the clock the instant the probe returns, BEFORE any emit: the
+        # counter/histogram calls do a lazy provider import and record
+        # synchronously, and that cost must not land inside the measured span —
+        # it would show up as daemon latency, worst on the sub-millisecond
+        # round trip this series exists to keep honest.
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        answered = escalated is not None
+
+        # Off the event loop AND fire-and-forget: the FIRST emit in this process
+        # builds the metrics recorder synchronously (disk config load, deferred
+        # SDK import, an install-id file dance — tens of ms). This runs on the
+        # supervisor's own loop, and on the adopted path the probe's duration IS
+        # the outage, so neither an inline emit nor an awaited thread hop may
+        # extend the verdict. The emit is swallowed-error best-effort, so a
+        # detached task that fails changes nothing the caller sees.
+        def _emit_saturation_signal() -> None:
+            emit_counter(LIVENESS_ESCALATED_PROBES, {"answered": answered})
+            if answered:
+                emit_histogram(
+                    LIVENESS_ESCALATED_LATENCY_MS,
+                    elapsed_ms,
+                    {"process": "gatewayd"},
+                    unit="ms",
+                )
+
+        task = asyncio.ensure_future(asyncio.to_thread(_emit_saturation_signal))
+        self._telemetry_tasks.add(task)
+        task.add_done_callback(self._telemetry_tasks.discard)
+        return escalated
 
     async def _terminate_process(self, *, grace_secs: float) -> None:
         proc = self._process

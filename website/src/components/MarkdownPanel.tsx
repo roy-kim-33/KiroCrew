@@ -1,36 +1,48 @@
 import { safeSetItem } from '../utils/safeStorage'
+import { composerDraftStoreFor } from '../utils/composerDraftStore'
+import { clearAnnotationHighlight, paintAnnotationHighlight } from '../utils/annotationHighlight'
 import { hasCommandModifier } from '../utils/commandModifier'
 import { memo, useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo, useImperativeHandle, forwardRef } from 'react'
 import { createPortal } from 'react-dom'
 import { useNavigate } from 'react-router-dom'
-import { RefreshCw, Ellipsis, ChevronRight, Columns2, Hash, WrapText, FoldVertical, Maximize2, Minimize2, MessageSquare, MessageSquarePlus, Copy, BookOpen, BookmarkPlus, Camera, Check, X, Component, FileText, FileDiff, Folders, TriangleAlert, CaseSensitive, ChevronUp, ChevronDown } from 'lucide-react'
+import { RefreshCw, Ellipsis, ChevronRight, Columns2, Hash, WrapText, FoldVertical, Maximize2, Minimize2, MessageSquare, Copy, BookOpen, BookmarkPlus, Camera, Check, X, Component, FileText, FileDiff, Folders, TriangleAlert, CaseSensitive, ChevronUp, ChevronDown } from 'lucide-react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import DetailPanel from './DetailPanel'
+import ErrorNotice from './ErrorNotice'
+import { errMessage } from '../utils/thunkError'
 import { useConfirm } from './ConfirmDialog'
 import Clickable from './Clickable'
-import { CommentPopover, CommentList, formatCommentsMessage, type InlineComment } from './CommentOverlay'
+import { CommentList, formatCommentsMessage, type InlineComment } from './CommentOverlay'
 import { useListboxKeyboard } from '../hooks/useListboxKeyboard'
-import SelectionToolbar, { type SelectionAction } from './SelectionToolbar'
+import { useFileMenuItems, visibleFileMenuItems, invokeFileMenuItem, FileMenuItemIcon, FileMenuItemLabel } from '../apps/fileMenuContributions'
+import SelectionToolbar, { type SelectionAction, type SelectionComposer } from './SelectionToolbar'
 import MarkdownOutlineRail from './MarkdownToc'
 import { useFileWatch } from '../hooks/useFileWatch'
 import { useBranding } from '../hooks/useBranding'
 import { usePersistedBool } from '../hooks/usePersistedBool'
+import { useDiffSplit } from '../hooks/useDiffSplit'
 import { countLines } from './FileChangeChips'
 import { store } from '../store'
 import { findBestOccurrence } from '../hooks/useMarkdownCommentHighlights'
-import { detectFileType } from './FileRenderers'
+import { detectFileType, BinaryFileCard } from './FileRenderers'
 import { ContentRenderer, MD_EXTS, extOf, langFor, wrapCode } from './ContentRenderer'
 import { api } from '../api/client'
-import { fileReadUrl, fileDownloadUrl } from '../utils/fileReadUrl'
+import { fileReadUrl, downloadFileToDisk, downloadFileName } from '../utils/fileReadUrl'
+import { downloadBlob } from '../utils/download'
+import { fetchFileRead, fileReadQueryKey, isPartialRead } from '../utils/fileReadQuery'
+import { documentBodyEpochNow } from '../hooks/usePanelTabs'
 import { loadCommentDrafts, saveCommentDrafts, setCommentsForFile } from '../utils/commentDrafts'
 import { copyToClipboard } from '../utils/clipboard'
+import { WINDOWS_ABS_PATH_RE } from '../utils/urlTransform'
+import { anchorFromRange } from '../utils/selectionAnchor'
 import { useLanguageGeneration } from '../i18n/useLanguageGeneration'
 
 // ── CSS Custom Highlight API accessors ───────────────────────────────────────
-// Preview find highlights matches via the browser-native CSS Custom Highlight
-// API (CSS.highlights + Range) instead of injecting <mark> nodes. The preview
-// is React-reconciled (react-markdown), so mutating its DOM would crash React
-// on the next re-render; ranges live outside the DOM and never touch it.
+// Preview find AND the annotation selection paint via the browser-native CSS
+// Custom Highlight API (CSS.highlights + Range) instead of injecting <mark>
+// nodes. The preview is React-reconciled (react-markdown), so mutating its DOM
+// would crash React on the next re-render; ranges live outside the DOM and
+// never touch it.
 // These types aren't in this TS lib yet, so we reach them through narrow casts
 // and feature-detect at runtime (graceful no-highlight fallback when absent).
 type FindHighlight = object
@@ -49,6 +61,9 @@ const FIND_HL_SUPPORTED = !!FindHighlightCtor && !!cssHighlights
 // search at once they would overlap visually, never crash.
 const FIND_HL_ALL = 'mc-find'
 const FIND_HL_CURRENT = 'mc-find-current'
+// The annotation (open-composer) highlight lives in utils/annotationHighlight:
+// the artifact hosts paint through the same registry name, and ranges are
+// aggregated per owner so one host's open/close cannot erase another's paint.
 
 /**
  * Locate the first char of `selected` in the raw source `content` and return
@@ -68,17 +83,109 @@ export interface BreadcrumbSegment { seg: string; path: string; isFile: boolean 
  *
  * A leading slash is preserved explicitly: joining segments with '/' drops it,
  * which would turn an absolute path into a relative one the folder browser then
- * resolves against the wrong root. Exported for unit tests.
+ * resolves against the wrong root. A drive-rooted Windows path (`C:\x`, `C:/x`)
+ * needs no such restoration: unlike POSIX's leading '/', its root is not a
+ * separator at all, so split()+filter(Boolean) leaves it in place as the first
+ * segment ('C:') and the plain join reconstructs it correctly on its own — the
+ * bug here was never the missing prefix, it was that the OLD split (`/` only)
+ * read a whole backslash path as a single segment. Splitting on either
+ * separator, and rejoining with whichever one the input used, fixes the
+ * Windows shape. Only a drive-rooted path (`WINDOWS_ABS_PATH_RE`) is split on
+ * `\`: on POSIX a backslash is a legal filename character, so
+ * `/tmp/we\ird.md` stays one segment. One exception to the plain join: when the
+ * path is short enough (<= 3 segments) that the drive itself is a shown crumb,
+ * its own path is the drive ROOT (`C:\`), not the bare `C:` the join yields --
+ * on Windows a bare `C:` is drive-RELATIVE (the drive's current directory),
+ * which would break the absolute-path contract of `BreadcrumbSegment`.
+ * Exported for unit tests.
  */
 export function breadcrumbSegments(filePath: string): BreadcrumbSegment[] {
-  const isAbs = filePath.startsWith('/')
-  const allSegs = filePath.replace(/\/+$/, '').split('/').filter(Boolean)
+  const isPosixAbs = filePath.startsWith('/')
+  const isWindows = WINDOWS_ABS_PATH_RE.test(filePath)
+  const sep = isWindows && filePath.includes('\\') ? '\\' : '/'
+  const splitAt = isWindows ? /[\\/]+/ : /\/+/
+  const allSegs = filePath.split(splitAt).filter(Boolean)
   const shown = Math.min(3, allSegs.length)
   return allSegs.slice(-3).map((seg, j) => {
     const absIndex = allSegs.length - shown + j
-    const joined = allSegs.slice(0, absIndex + 1).join('/')
-    return { seg, path: isAbs ? '/' + joined : joined, isFile: absIndex === allSegs.length - 1 }
+    const joined = allSegs.slice(0, absIndex + 1).join(sep)
+    // The drive segment alone (`C:`) is drive-relative; its root needs the
+    // trailing separator (`C:\` / `C:/`) to be absolute.
+    const isDriveSeg = isWindows && absIndex === 0
+    const path = isPosixAbs ? '/' + joined : isDriveSeg ? joined + sep : joined
+    return { seg, path, isFile: absIndex === allSegs.length - 1 }
   })
+}
+
+/**
+ * The file-viewer header's path display. Only the last three segments are shown
+ * (see breadcrumbSegments), so the full path lives in the hover affordance.
+ *
+ * Three routes to the full path, one per user:
+ * - `title` shows it on POINTER hover.
+ * - `role="group"` + `aria-label={filePath}` name the focused element with the
+ *   full path, so a SCREEN READER announces it on focus.
+ * - a small readout below the breadcrumb, shown only while it has keyboard
+ *   focus, prints the full path for a SIGHTED KEYBOARD-only user, who hears no
+ *   aria-label and to whom a native `title` does not open on focus.
+ *
+ * `tabIndex={0}` is what puts the element in the tab order in the first place.
+ * The label and the readout both ARE the path (runtime data), so no localized
+ * string is added. Right-click still opens the FilePathMenu.
+ *
+ * Exported so the accessibility contract is unit-testable without mounting the
+ * whole panel (which drags in the Pierre editor tree).
+ */
+export function FileHeaderBreadcrumb({ filePath }: { filePath: string }) {
+  const crumbs = breadcrumbSegments(filePath)
+  const [focused, setFocused] = useState(false)
+  return (
+    // Content-sized (NOT flex-1), so the header keeps its original order:
+    // breadcrumb, then the diff-stats badge beside the filename, then the
+    // spacer, then the actions. The focus readout below is anchored to the
+    // header BAR (its relative ancestor), not to this row, so its width is the
+    // panel's, not the compressed breadcrumb's -- see the readout comment.
+    <>
+      <FilePathMenu filePath={filePath}>
+        {/* Focusable so a keyboard user can read the full path: a screen reader
+            from the accessible name, a sighted keyboard user from the readout
+            below. Same focusable-region pattern as CodeBlock / FileRenderers. */}
+        {/* eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions */}
+        <div
+          className="flex items-center min-w-0 outline-hidden focus-visible:ring-1 focus-visible:ring-accent rounded-sm"
+          title={filePath}
+          role="group"
+          aria-label={filePath}
+          // eslint-disable-next-line jsx-a11y/no-noninteractive-tabindex
+          tabIndex={0}
+          onFocus={() => setFocused(true)}
+          onBlur={() => setFocused(false)}
+        >
+          {crumbs.map((c, i) => (
+            <span key={i} className="flex items-center min-w-0 text-[12px]">
+              {i > 0 && <ChevronRight size={14} className="text-muted opacity-60 shrink-0 mx-0.5" />}
+              <span className={`truncate ${c.isFile ? 'text-text-strong font-medium' : 'text-muted'}`}>{c.seg}</span>
+            </span>
+          ))}
+        </div>
+      </FilePathMenu>
+      {focused && (
+        // The visible half of the keyboard route: the full path on screen for a
+        // sighted keyboard user. aria-hidden because the group's aria-label
+        // already carries it, so a screen reader would otherwise hear it twice.
+        // Anchored left-3 right-3 to the header BAR (its relative ancestor, with
+        // matching px-3), so its right edge is the panel's inner edge: the path
+        // wraps (break-all) inside the panel and the box grows downward, never
+        // past the edge, at any panel width -- and the header's own layout
+        // (diff badge included) is left exactly as it was.
+        <span
+          aria-hidden="true"
+          data-testid="file-header-full-path"
+          className="absolute left-3 right-3 top-full mt-1 z-10 px-2 py-1 rounded-md border border-border bg-bg-elevated text-[11px] font-mono text-text-strong break-all shadow-sm"
+        >{filePath}</span>
+      )}
+    </>
+  )
 }
 
 export function findCoords(content: string, selected: string): { line: number; column: number } | undefined {
@@ -176,11 +283,35 @@ export function resolveSourcePos(range: Range, root: HTMLElement, content: strin
 interface Props {
   filePath: string
   content: string
+  /** `/api/file-read` refused to decode this file (a NUL byte inside its sniff
+   *  window), so `content` is empty BY DESIGN and the body renders a
+   *  download/reveal card. Without it the panel put 512 KB of U+FFFD in the
+   *  code editor and offered to save it back over the real bytes. Rich types
+   *  (image, pdf, video, …) keep their own viewer — they are binary too, and
+   *  they read the file through `/api/file-raw`, not through this buffer. */
+  binary?: boolean
+  /** The read that filled the buffer did not hand over the whole file -- cut at
+   *  the gateway's cap (`X-Truncated`) or with credentials redacted
+   *  (`X-Redacted`). Host-owned like `binary`, for the same reason: the seed
+   *  read that fills a tab runs before any panel mounts, and the body cannot
+   *  tell about itself (a whole file may quote the redaction tag). Decides only
+   *  WORDS and a file name once the file is gone: the banner and the close
+   *  prompt say "only part of it", and a download of it is named `.partial`. */
+  partial?: boolean
   onContentChange: (c: string) => void
   /** Disk-originated content (file watch, Refresh). Document tabs restamp
    *  their saved baseline here so a re-open still treats the tab as clean;
-   *  omitted by other hosts, which fall back to onContentChange. */
-  onDiskContent?: (c: string) => void
+   *  omitted by other hosts, which fall back to onContentChange.
+   *
+   *  `binary` is the verdict for the bytes THIS read saw. It travels with the
+   *  content because the two are one fact about one read: a file that was text
+   *  when the tab opened can be replaced on disk by binary bytes (a build
+   *  output, a checkout, an agent write), and patching the buffer while leaving
+   *  the verdict at its hydrated value leaves the editor live over bytes it
+   *  cannot represent — where a save would overwrite them. `undefined` means
+   *  the caller has no verdict to report and the stored one stands. `partial`
+   *  travels the same way, for the same read. */
+  onDiskContent?: (c: string, binary?: boolean, partial?: boolean) => void
   onSave: (filePath: string, content: string) => Promise<void>
   onClose: () => void
   liveWatch?: boolean
@@ -256,6 +387,36 @@ import FilePathMenu, { revealOrOpen, useRevealLabel, useCanOpenFile } from './Fi
  */
 const RICH_FILE_TYPES = ['image', 'svg', 'csv', 'json', 'jsonl', 'html', 'pdf', 'excalidraw', 'video', 'audio', 'sheet', 'office']
 
+/**
+ * The subset of {@link RICH_FILE_TYPES} whose viewer reads the FILE, not the
+ * buffer -- each of these fetches from `filePath` (`/api/file-raw`,
+ * `/api/file-stream`, `/api/file-sheet`, `/api/file-office-preview`) and never
+ * looks at `content`.
+ *
+ * That distinction is what decides who gets the binary card. The rest of
+ * `RICH_FILE_TYPES` -- `svg`, `csv`, `json`, `jsonl`, `html`, `excalidraw` --
+ * renders FROM the content string, so a file whose bytes could not be decoded
+ * leaves those viewers with `''`: an empty table, an empty tree, a blank frame.
+ * A `.json` file that is actually a database, or a `.csv` with a NUL in it,
+ * belongs on the card exactly as a `.zip` does.
+ *
+ * Named by mechanism rather than by "is rich", because the reason a viewer may
+ * skip the card is that it can still show the real bytes -- not that it happens
+ * to be a viewer.
+ */
+const BYTE_BACKED_FILE_TYPES = new Set(['image', 'pdf', 'sheet', 'office', 'video', 'audio'])
+
+/** Outcome of one of this panel's own disk reads (Refresh, Cancel, the watch).
+ *  `superseded` means a newer read of this panel started before this one
+ *  answered, or the panel moved to another path: apply nothing, say nothing. */
+type DiskRead =
+  | { kind: 'ok'; text: string; binary: boolean; partial: boolean }
+  /** The file is not on disk (404): a real answer, rendered as the same
+   *  placeholder the chip click and the cold-tab hydration show for it. */
+  | { kind: 'missing' }
+  | { kind: 'failed' }
+  | { kind: 'superseded' }
+
 /** Comment hint banner — shown once per session for markdown files */
 function CommentHint({ onDismiss }: { onDismiss: () => void }) {
   return (
@@ -274,22 +435,21 @@ function CommentHint({ onDismiss }: { onDismiss: () => void }) {
 
 const HINT_KEY = 'kirocrew:comment-hint-dismissed'
 
-async function downloadFile(filePath: string) {
-  try {
-    const res = await fetch(fileDownloadUrl(filePath))
-    // eslint-disable-next-line no-console -- surface download failures for diagnostics
-    if (!res.ok) { console.error('downloadFile failed', res.status, res.statusText); alert(i18nT('components.markdownPanel.download_failed')); return }
-    const blob = await res.blob()
-    const a = document.createElement('a')
-    const url = URL.createObjectURL(blob)
-    a.href = url
-    a.download = filePath.split('/').pop() || 'download'
-    document.body.appendChild(a)
-    a.click()
-    document.body.removeChild(a)
-    setTimeout(() => URL.revokeObjectURL(url), 2_000)
-    // eslint-disable-next-line no-console -- surface download failures for diagnostics
-  } catch (err) { console.error('downloadFile failed', err); alert(i18nT('components.markdownPanel.download_failed')) }
+/** How often a visible tab whose file is gone asks the disk whether it is
+ *  back: `api_file_watch`'s own poll cadence (1 s), so a recreated file lands
+ *  as fast as a change would through the stream the tab cannot hold meanwhile. */
+const MISSING_FILE_RETRY_MS = 1_000
+/** The ceiling the retry backs off to: each attempt doubles the wait, so a
+ *  file that stays gone costs one GET (and one SEL `not_found` record) every
+ *  30 s, not every second, until the tab is hidden or the file is back. */
+const MISSING_FILE_RETRY_MAX_MS = 30_000
+
+/** Report a failure to the panel, which renders it through the shared
+ *  ErrorNotice (replacing the blocking `alert()` these paths used to raise). */
+type ReportError = (message: string) => void
+
+async function downloadFile(filePath: string, onError: ReportError) {
+  await downloadFileToDisk(filePath, onError)
 }
 
 /**
@@ -397,10 +557,23 @@ function KnowledgeToggleIconButton({ state }: { state: ReturnType<typeof useFile
  * moved it was a keypress, so arrow-key navigation keeps its indicator while a
  * mouse click paints nothing.
  */
-const menuRowCls = 'flex items-center gap-2 w-full px-3 py-1.5 text-[13px] text-text cursor-pointer border-none bg-transparent text-left whitespace-nowrap hover:bg-bg-hover focus-visible:bg-bg-hover focus:outline-none'
+// `min-w-0 overflow-hidden`: the menu is capped in width (see the container below), and
+// a row's truncating children only shrink when the row itself may shrink past its
+// content. Without it a long app-contributed label sets the row's width and spills past
+// the cap instead of being clipped by it.
+const menuRowCls = 'flex items-center gap-2 w-full min-w-0 overflow-hidden px-3 py-1.5 text-[13px] text-text cursor-pointer border-none bg-transparent text-left whitespace-nowrap hover:bg-bg-hover focus-visible:bg-bg-hover focus:outline-hidden'
 
-export function OverflowMenu({ filePath, content, onRefresh, refreshDisabled, refreshTitle, onFullscreen, fullscreen, onSnapshot, snapshotting, wordWrap, onToggleWordWrap, lineNums, onToggleLineNums, collapseUnchanged, onToggleCollapseUnchanged, diffSplit, onToggleDiffSplit }: {
+export function OverflowMenu({ filePath, content, onError, onRefresh, refreshDisabled, refreshTitle, onFullscreen, fullscreen, onSnapshot, snapshotting, wordWrap, onToggleWordWrap, lineNums, onToggleLineNums, collapseUnchanged, onToggleCollapseUnchanged, diffSplit, onToggleDiffSplit, onDownload }: {
   filePath: string; content: string
+  /** Where a failed row action (add to knowledge, promote, snapshot, save,
+   *  download, open/reveal, an app-contributed row's dispatch) is reported: the
+   *  panel renders it through the shared ErrorNotice. The menu itself closes on
+   *  select, so it cannot host the notice. */
+  onError: ReportError
+  /** What the Download row does instead of fetching the path: the panel passes
+   *  its buffer download while the file is gone from disk, where the fetch
+   *  would only answer 404 for the one file the banner just said to keep. */
+  onDownload?: () => void
   /** View actions folded in from the old header row (side-panel revamp): the
    *  ⋯ menu is the single home for everything that isn't a mode toggle. */
   onRefresh?: () => void; refreshDisabled?: boolean; refreshTitle?: string
@@ -456,8 +629,10 @@ export function OverflowMenu({ filePath, content, onRefresh, refreshDisabled, re
   // Platform-aware reveal label from the shared owner (FilePathMenu) so this
   // overflow and FileViewer's overflow name the identical action identically.
   const revealLabel = useRevealLabel()
-  const knowledge = useFileKnowledgeState(filePath)
-  const artifact = useFileArtifactState(filePath, content)
+  const knowledge = useFileKnowledgeState(filePath, onError)
+  const artifact = useFileArtifactState(filePath, content, onError)
+  const contribItems = useFileMenuItems('file-overflow')
+  const contribRows = visibleFileMenuItems(contribItems, { path: filePath, kind: 'file' })
   const delayedClose = () => { closeTimerRef.current = setTimeout(() => setOpen(false), 800) }
   useEffect(() => () => { if (closeTimerRef.current) clearTimeout(closeTimerRef.current) }, [])
   // Reset the per-mutation success flags whenever the menu closes so the
@@ -487,7 +662,7 @@ export function OverflowMenu({ filePath, content, onRefresh, refreshDisabled, re
         <Ellipsis size={15} />
       </button>
       {open && (
-        <div ref={listRef} role="menu" tabIndex={-1} onKeyDown={onListKeyDown} className="absolute right-0 top-full mt-1 z-50 rounded-lg bg-bg-elevated border border-border shadow-lg py-1 min-w-[180px] w-max">
+        <div ref={listRef} role="menu" tabIndex={-1} onKeyDown={onListKeyDown} className="absolute right-0 top-full mt-1 z-50 rounded-lg bg-bg-elevated border border-border shadow-lg py-1 min-w-[180px] w-max max-w-[min(420px,calc(100vw-2rem))]">
           {onRefresh && (
             <button role="menuitem" data-option tabIndex={-1} className={`${menuRowCls} disabled:opacity-40`} disabled={refreshDisabled} title={refreshTitle} onClick={() => { onRefresh(); setOpen(false) }}>
               <RefreshCw size={14} className="lucide-inline" /> {i18nT('components.markdownPanel.refresh')}
@@ -572,12 +747,12 @@ export function OverflowMenu({ filePath, content, onRefresh, refreshDisabled, re
               drive Finder on the gateway, so it sees the fallbacks only. Same
               gates the shared FilePathMenu applies. */}
           {canOpen && (
-            <button role="menuitem" data-option tabIndex={-1} className={menuRowCls} onClick={() => { void revealOrOpen(filePath, 'open'); setOpen(false) }}>
+            <button role="menuitem" data-option tabIndex={-1} className={menuRowCls} onClick={() => { void revealOrOpen(filePath, 'open', { onError }); setOpen(false) }}>
               {i18nT('components.markdownPanel.open_with_default_app')}
             </button>
           )}
           {directLocal && (
-            <button role="menuitem" data-option tabIndex={-1} className={menuRowCls} onClick={() => { void revealOrOpen(filePath, 'reveal'); setOpen(false) }}>
+            <button role="menuitem" data-option tabIndex={-1} className={menuRowCls} onClick={() => { void revealOrOpen(filePath, 'reveal', { onError }); setOpen(false) }}>
               {revealLabel}
             </button>
           )}
@@ -587,9 +762,34 @@ export function OverflowMenu({ filePath, content, onRefresh, refreshDisabled, re
           <button role="menuitem" data-option tabIndex={-1} className={menuRowCls} onClick={() => { copyToClipboard(content); setOpen(false) }}>
             {i18nT('components.markdownPanel.copy_content')}
           </button>
-          <button role="menuitem" data-option tabIndex={-1} className={menuRowCls} onClick={() => { downloadFile(filePath); setOpen(false) }}>
+          <button role="menuitem" data-option tabIndex={-1} className={menuRowCls} onClick={() => { if (onDownload) onDownload(); else void downloadFile(filePath, onError); setOpen(false) }}>
             {i18nT('components.markdownPanel.download')}
           </button>
+          {/* App-contributed rows (`contributes.fileMenuItems`, surface
+              'file-overflow'), LAST and in their own group: the core rows above are
+              a fixed vocabulary a reader learns, and splicing third-party rows into
+              the middle of it would move a familiar row whenever an app is
+              installed. Activation POSTs the file's PATH to the app's own endpoint;
+              core imports no app code. Filtered by the declaration's `when`
+              predicate, so the stock build (no declaring app) renders neither the
+              rows nor the separator. `data-option` is what makes each row navigable
+              to `useListboxKeyboard`. */}
+          {contribRows.length > 0 && <div className="h-px bg-border my-1 mx-2" />}
+          {contribRows.map(item => (
+            <button
+              key={`${item.app}:${item.id}`}
+              role="menuitem"
+              data-option
+              tabIndex={-1}
+              className={menuRowCls}
+              onClick={() => {
+                invokeFileMenuItem(item, { surface: 'file-overflow', path: filePath, kind: 'file' }, onError)
+                setOpen(false)
+              }}
+            >
+              <FileMenuItemIcon name={item.icon} /> <FileMenuItemLabel item={item} />
+            </button>
+          ))}
         </div>
       )}
     </div>
@@ -602,13 +802,15 @@ export function OverflowMenu({ filePath, content, onRefresh, refreshDisabled, re
  * inline row-2 buttons and the overflow ⋮ entry share a single fetch via
  * React Query's cache.
  */
-function useFileKnowledgeState(filePath: string) {
+function useFileKnowledgeState(filePath: string, onError: ReportError) {
   const queryClient = useQueryClient()
-  const { data } = useQuery({
+  const { data, error: queryError } = useQuery({
     queryKey: ['knowledge-config', filePath],
     queryFn: async () => {
       const r = await fetch('/api/knowledge/config')
-      if (!r.ok) return null
+      // A failed read used to resolve to `null`, which rendered as "not added"
+      // — a failure dressed as a state. Reject instead so the panel can say so.
+      if (!r.ok) throw new Error(i18nT('components.markdownPanel.knowledge_status_failed'))
       const cfg = await r.json()
       const sr = await fetch(`/api/knowledge/sources?uri=${encodeURIComponent(filePath)}`)
       const sources = sr.ok ? await sr.json() : []
@@ -635,9 +837,9 @@ function useFileKnowledgeState(filePath: string) {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['knowledge-config', filePath] })
     },
-    onError: (err) => alert((err as Error).message),
+    onError: (err) => onError((err as Error).message),
   })
-  return { formats, alreadyAdded, add, adding, added, addResult, reset }
+  return { formats, alreadyAdded, add, adding, added, addResult, reset, queryError }
 }
 
 /**
@@ -645,9 +847,9 @@ function useFileKnowledgeState(filePath: string) {
  * adding/snapshotting mutations. `live_dirty` flows through so
  * the inline Snapshot button can gate visibility/enable correctly.
  */
-function useFileArtifactState(filePath: string, content: string) {
+function useFileArtifactState(filePath: string, content: string, onError: ReportError) {
   const queryClient = useQueryClient()
-  const { data } = useQuery({
+  const { data, error: queryError } = useQuery({
     queryKey: ['artifact-by-source-path', filePath],
     queryFn: async () => {
       const res = await api.artifacts({ source_path: filePath })
@@ -684,6 +886,17 @@ function useFileArtifactState(filePath: string, content: string) {
       if (res.headers.get('X-Truncated') === 'true') {
         throw new Error(i18nT('components.markdownPanel.file_too_large_to_add'))
       }
+      // Same class as the truncation refusal above: the response is not the
+      // document. For a file the read could not decode the body is an envelope
+      // (`{"binary": true, ...}`), so promoting `res.text()` would store that
+      // JSON AS the artifact's content -- and an artifact is COPIED, so nothing
+      // would reference the original and the wrong content would be permanent.
+      // The affordance is hidden for such a file; this is the chokepoint, which
+      // is what covers the fullscreen toolbar's copy of the button and any
+      // later caller.
+      if (res.headers.get('X-File-Binary') === 'true') {
+        throw new Error(i18nT('components.markdownPanel.binary_file_cannot_be_added'))
+      }
       const fresh = await res.text()
       // Same slot is passed as the X-Session-Key so the server's
       // restricted-session gate sees the REAL session. With the transport's
@@ -704,7 +917,7 @@ function useFileArtifactState(filePath: string, content: string) {
       queryClient.invalidateQueries({ queryKey: ['artifact-by-source-path', filePath] })
       queryClient.invalidateQueries({ queryKey: ['artifacts'] })
     },
-    onError: (err) => alert((err as Error).message),
+    onError: (err) => onError((err as Error).message),
   })
   const { mutate: snapshot, isPending: snapshotting, isSuccess: snapshotted } = useMutation({
     mutationFn: async () => {
@@ -717,7 +930,7 @@ function useFileArtifactState(filePath: string, content: string) {
       queryClient.invalidateQueries({ queryKey: ['artifact-versions', existing?.slug] })
       queryClient.invalidateQueries({ queryKey: ['artifact-events', existing?.slug] })
     },
-    onError: (err) => alert((err as Error).message),
+    onError: (err) => onError((err as Error).message),
   })
   const { mutate: toggleSave, isPending: toggling } = useMutation({
     mutationFn: async () => {
@@ -752,10 +965,10 @@ function useFileArtifactState(filePath: string, content: string) {
       queryClient.invalidateQueries({ queryKey: ['artifact-by-source-path', filePath] })
       queryClient.invalidateQueries({ queryKey: ['artifacts'] })
     },
-    onError: (err) => alert((err as Error).message),
+    onError: (err) => onError((err as Error).message),
   })
   const saved = !!existing?.pinned
-  return { existing, add, adding, added, resetAdd, snapshot, snapshotting, snapshotted, toggleSave, toggling, saved }
+  return { existing, add, adding, added, resetAdd, snapshot, snapshotting, snapshotted, toggleSave, toggling, saved, queryError }
 }
 
 /** Working-tree diff view (current buffer vs HEAD), Pierre-rendered.
@@ -767,6 +980,30 @@ function useFileArtifactState(filePath: string, content: string) {
  * listener already picks up — no editor-specific selection bridge needed. */
 /** Diff mode with nothing to show: the file matches its baseline, so the diff
  *  canvas would render empty. Say so and offer the way out. */
+/** What a tab shows while its file is not on disk: a banner OVER the document,
+ *  never in place of it. The buffer underneath may be the only copy left of a
+ *  file deleted outside the dashboard, so the last copy stays on screen and the
+ *  banner says what it is -- and carries the two ways to keep it, because a
+ *  sentence that says "copy it or save it elsewhere" without them leaves the
+ *  reader guessing which toolbar icon it means. Both act on the BUFFER: the ⋯
+ *  menu's Download fetches the path, which a gone file answers 404, so this
+ *  Download hands the browser the text on screen under the file's name, and
+ *  Copy content puts it on the clipboard. A PARTIAL buffer -- a read the
+ *  gateway cut at 512 000 characters or redacted -- says so instead, and never
+ *  calls itself the only remaining version. Same band and the same action
+ *  styles as the unsaved-changes banner, so the two conditions the tab can be
+ *  in read alike. */
+function MissingFileBanner({ onDownload, onCopy, copied, partial }: { onDownload: () => void; onCopy: () => void; copied: boolean; partial: boolean }) {
+  return (
+    <div data-testid="markdown-panel-missing-file" role="status" className="flex flex-wrap items-center gap-2 min-h-[40px] px-3 py-2 bg-[color-mix(in_srgb,var(--warn)_12%,transparent)] border-b border-[color-mix(in_srgb,var(--warn)_30%,transparent)] shrink-0">
+      <TriangleAlert size={13} className="text-warn shrink-0" />
+      <span className="flex-1 basis-[12rem] min-w-0 text-[12px] text-text">{i18nT(partial ? 'components.markdownPanel.file_not_found_partial_copy' : 'components.markdownPanel.file_not_found_last_copy')}</span>
+      <button className="px-2.5 h-[26px] rounded-md text-[11.5px] font-medium text-muted hover:text-text border border-border bg-transparent cursor-pointer transition-colors shrink-0" onClick={onCopy}>{copied ? i18nT('components.markdownPanel.copied') : i18nT('components.markdownPanel.copy_content')}</button>
+      <button className="px-3 h-[26px] rounded-md text-[11.5px] font-semibold border border-accent text-accent-fg bg-accent cursor-pointer hover:bg-accent-hover transition-all shrink-0" onClick={onDownload}>{i18nT('components.markdownPanel.download')}</button>
+    </div>
+  )
+}
+
 function ZeroDiffNotice({ onExitDiff, message }: { onExitDiff: () => void; message?: string }) {
   return (
     <div className="h-full flex flex-col items-center justify-center gap-2.5 text-muted px-6 text-center">
@@ -815,22 +1052,15 @@ function DiffViewBlock({ diffMode, fileName, originalContent, content, lineNums,
   )
 }
 
-/** Shared comment overlay — popover + comment list */
-const CommentOverlayBlock = memo(function CommentOverlayBlock({ popover, addComment, setPopover, onSubmitComments, comments, editComment, removeComment, submitAllComments, containerRef, scrollRef, connected = true }: {
-  popover: { x: number; y: number } | null; addComment: (text: string) => void; setPopover: (v: null) => void
-  onSubmitComments?: (message: string) => void; comments: InlineComment[]; editComment: (id: string, text: string) => void; removeComment: (id: string) => void; submitAllComments: (extraPrompt?: string) => void; containerRef?: React.RefObject<HTMLElement | null>; scrollRef?: React.RefObject<HTMLElement | null>; connected?: boolean
+/** Shared comment overlay — the pending-comment list. (The input itself lives
+ *  in `SelectionToolbar`'s composer, which opens on selection.) */
+const CommentOverlayBlock = memo(function CommentOverlayBlock({ onSubmitComments, comments, editComment, removeComment, submitAllComments, connected = true }: {
+  onSubmitComments?: (message: string) => void; comments: InlineComment[]; editComment: (id: string, text: string) => void; removeComment: (id: string) => void; submitAllComments: (extraPrompt?: string) => void; connected?: boolean
 }) {
   useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
+  if (!onSubmitComments) return null
   return (
-    <>
-      {popover && (
-        <CommentPopover x={popover.x} y={popover.y} onSubmit={addComment} containerRef={containerRef} scrollRef={scrollRef}
-          onCancel={() => { setPopover(null); window.getSelection()?.removeAllRanges() }} />
-      )}
-      {onSubmitComments && (
-        <CommentList comments={comments} onEdit={editComment} onRemove={removeComment} onSubmitAll={submitAllComments} enableExtraPrompt connected={connected} />
-      )}
-    </>
+    <CommentList comments={comments} onEdit={editComment} onRemove={removeComment} onSubmitAll={submitAllComments} enableExtraPrompt connected={connected} />
   )
 })
 
@@ -839,14 +1069,16 @@ const CommentOverlayBlock = memo(function CommentOverlayBlock({ popover, addComm
  *  control can't bypass the "Discard unsaved changes?" confirmation. */
 export interface MarkdownPanelHandle {
   requestClose: () => void
-  /** Run `nav` unless the buffer is dirty, in which case ask first. For an
-   *  external control that REPLACES this panel's file (the browser rail's tree
-   *  click re-targets the tab in place), which destroys the buffer just as a
-   *  close does but reaches none of the close paths. */
+  /** Run `nav` with a predicate that says whether this buffer may be replaced
+   *  in place. For an external control that REPLACES this panel's file (the
+   *  browser rail's tree click re-targets the tab in place), which destroys the
+   *  buffer just as a close does but reaches none of the close paths. Asks the
+   *  disk first, the way the close does, so a file deleted under a live stream
+   *  is found before the buffer -- then its only copy -- is replaced. */
   requestNavigate: (nav: (stillClean: () => boolean) => void) => void
 }
 
-export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPanel({ filePath, content, onContentChange, onDiskContent, onSave, onClose, liveWatch, onSubmitComments, connected = true, onRefresh, reserveWidth, initialDiffMode, onDiffModeChange, embedded, active = true, savedBaseline, revealLine, onRevealConsumed, browserRail, railOpen, onRailToggle, scrollMemoryKey }: Props, ref) {
+export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPanel({ filePath, content, binary, partial, onContentChange, onDiskContent, onSave, onClose, liveWatch, onSubmitComments, connected = true, onRefresh, reserveWidth, initialDiffMode, onDiffModeChange, embedded, active = true, savedBaseline, revealLine, onRevealConsumed, browserRail, railOpen, onRailToggle, scrollMemoryKey }: Props, ref) {
   useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const ime = useImeGuard()
   const qc = useQueryClient()
@@ -876,6 +1108,10 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
   // else editable opens straight in the Pierre editor — there is no separate
   // read-only source mode for code files.
   const [editing, setEditing] = useState(() => {
+    // Undecodable bytes have no buffer to edit, and a code file's default IS
+    // the editor -- so this has to be refused in the initializer, not in an
+    // effect, or the editor paints for a frame before the card replaces it.
+    if (binary && !BYTE_BACKED_FILE_TYPES.has(detectFileType(filePath))) return false
     if (revealLine && revealTargetsSource) return true
     if (MD_EXTS.has(extOf(filePath))) return false
     return !RICH_FILE_TYPES.includes(detectFileType(filePath))
@@ -888,7 +1124,7 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
   }, [diffMode, onDiffModeChange])
   // Unified vs side-by-side diff rendering — persisted, and shares its key
   // with SidePanel's diff tabs so the preference is app-wide.
-  const [diffSplit, setDiffSplit] = usePersistedBool('mc-diff-split', true)
+  const [diffSplit, setDiffSplit] = useDiffSplit()
   const diffInitFileRef = useRef<string | null>(null)
   const [saving, setSaving] = useState(false)
   const [dirty, setDirty] = useState(() => savedBaseline != null && content !== savedBaseline)
@@ -897,6 +1133,12 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
   // the moment they are about to discard the buffer.
   const dirtyRef = useRef(dirty)
   dirtyRef.current = dirty
+  // The same mirrors for the buffer and its verdict: a disk read that lands
+  // after its await compares against what the tab shows NOW.
+  const contentRef = useRef(content)
+  contentRef.current = content
+  const binaryRef = useRef(!!binary)
+  binaryRef.current = !!binary
   const { confirm, confirmDialog, confirmOpen } = useConfirm()
   // When a saved baseline is provided (inline preview), keep `dirty` derived
   // from content-vs-disk so a RESTORED draft is dirty and the close guard fires.
@@ -906,6 +1148,15 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
     if (savedBaseline != null) setDirty(content !== savedBaseline)
   }, [content, savedBaseline])
   const [saveError, setSaveError] = useState<string | null>(null)
+  // The outcome of the last row action (add to knowledge, promote, snapshot,
+  // save-as-artifact, download, open/reveal) that FAILED. These used to raise a
+  // blocking `alert()` from inside the mutation hooks; they now land here and
+  // render beside the save error through the shared ErrorNotice.
+  const [actionError, setActionError] = useState<string | null>(null)
+  // Scoped to the file it was raised for: a late rejection from the previous
+  // file's action must not render under the file now open.
+  useEffect(() => { setActionError(null) }, [filePath])
+  const reportActionError = useCallback<ReportError>((message) => setActionError(message), [])
   // Editor view preferences — persisted so they survive tab switches/reloads.
   const [lineNums, setLineNums] = usePersistedBool('mc-file-linenums', true)
   const [wordWrap, setWordWrap] = usePersistedBool('mc-file-wordwrap', true)
@@ -931,47 +1182,29 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
     prevFilePathRef.current = filePath
     setComments(draftsRef.current[filePath] ?? [])
   }
-  const [popover, setPopover] = useState<{ x: number; y: number; anchor: string; line?: number; column?: number; startOffset?: number } | null>(null)
-  const highlightMarksRef = useRef<HTMLElement[]>([])
-
+  // The anchor of the selection the composer is currently open over, resolved
+  // while the DOM selection was still live (focus in the input collapses it).
+  // A ref, not state: it is read only by the submit handler, and nothing renders
+  // from it.
+  const pendingAnchorRef = useRef<{ anchor: string; line?: number; column?: number; startOffset?: number } | null>(null)
+  // Whether the annotation box is open — read by the panel's document-level
+  // Escape handler so it yields the key to the box instead of closing the panel.
+  const composerOpenRef = useRef(false)
+  // The annotation highlight paints through CSS.highlights, never by wrapping
+  // preview text in <mark> elements: the preview is React-owned, and splitting
+  // or merging its text nodes leaves fibers pointing at nodes React did not
+  // place, which crashes the next commit that rewrites that text. Ranges live
+  // outside the DOM, so a content re-render simply stops painting them. When
+  // the API is absent both callbacks are no-ops, matching how find degrades.
+  const annotationHighlightOwnerRef = useRef<object>({})
   const clearHighlightMarks = useCallback(() => {
-    for (const mark of highlightMarksRef.current) {
-      const parent = mark.parentNode
-      if (!parent) continue
-      while (mark.firstChild) parent.insertBefore(mark.firstChild, mark)
-      parent.removeChild(mark)
-      parent.normalize()
-    }
-    highlightMarksRef.current = []
+    clearAnnotationHighlight(annotationHighlightOwnerRef.current)
   }, [])
 
   const applyHighlightMarks = useCallback((range: Range) => {
-    clearHighlightMarks()
-    const marks: HTMLElement[] = []
-    const treeWalker = document.createTreeWalker(range.commonAncestorContainer, NodeFilter.SHOW_TEXT)
-    const textNodes: Text[] = []
-    let node: Node | null
-    while ((node = treeWalker.nextNode())) {
-      if (range.intersectsNode(node)) textNodes.push(node as Text)
-    }
-    if (textNodes.length === 0 && range.startContainer.nodeType === Node.TEXT_NODE) {
-      textNodes.push(range.startContainer as Text)
-    }
-    for (const textNode of textNodes) {
-      const start = textNode === range.startContainer ? range.startOffset : 0
-      const end = textNode === range.endContainer ? range.endOffset : textNode.length
-      if (start === end) continue
-      const highlightRange = document.createRange()
-      highlightRange.setStart(textNode, start)
-      highlightRange.setEnd(textNode, end)
-      const mark = document.createElement('mark')
-      mark.style.backgroundColor = 'var(--accent-subtle, rgba(99, 102, 241, 0.15))'
-      mark.style.borderRadius = '2px'
-      highlightRange.surroundContents(mark)
-      marks.push(mark)
-    }
-    highlightMarksRef.current = marks
-  }, [clearHighlightMarks])
+    paintAnnotationHighlight(annotationHighlightOwnerRef.current, range)
+  }, [])
+  useEffect(() => () => clearHighlightMarks(), [clearHighlightMarks])
   const [refreshing, setRefreshing] = useState(false)
   const [hintDismissed, setHintDismissed] = useState(() => localStorage.getItem(HINT_KEY) === '1')
   const [fullscreen, setFullscreen] = useState(false)
@@ -985,8 +1218,8 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
   // Artifact + knowledge state power the header star/knowledge toggles and
   // the ⋯ menu's Snapshot entry (same query cache as the OverflowMenu's own
   // hooks, so states stay coherent).
-  const knowledge = useFileKnowledgeState(filePath)
-  const artifactState = useFileArtifactState(filePath, content)
+  const knowledge = useFileKnowledgeState(filePath, reportActionError)
+  const artifactState = useFileArtifactState(filePath, content, reportActionError)
   const previewRef = useRef<HTMLDivElement>(null)
   const sidePanelScrollRef = useRef<HTMLDivElement>(null)
   // Cross-remount scroll memory for the embedded (side-panel) scroll box —
@@ -1006,6 +1239,24 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
   const isMarkdown = MD_EXTS.has(ext)
   const isRichType = RICH_FILE_TYPES.includes(fileType)
   useEffect(() => { if (isRichType) setDiffMode(false) }, [isRichType])
+  // The verdict can arrive AFTER mount: a restored cold tab renders with
+  // `binary` undefined and gets it from the hydration read, so the initializer
+  // above is not the only entry point. Neither a source diff nor an edit buffer
+  // means anything for bytes that were never decoded.
+  const showBinaryCard = !!binary && !BYTE_BACKED_FILE_TYPES.has(fileType)
+  const wasBinaryCardRef = useRef(showBinaryCard)
+  useEffect(() => {
+    const wasShowing = wasBinaryCardRef.current
+    wasBinaryCardRef.current = showBinaryCard
+    if (!showBinaryCard) {
+      // Bytes that decoded after all: a code file's default view IS the editor and
+      // `canPreview` renders no Edit toggle for it, so a stale false strands the tab.
+      if (wasShowing) setEditing(!isMarkdown && !isRichType)
+      return
+    }
+    setDiffMode(false)
+    setEditing(false)
+  }, [showBinaryCard, isMarkdown, isRichType])
   // ── Preview-mode find (Cmd+F) ─────────────────────────────────────────────
   // Three surfaces compete for Cmd+F: the editor owns it while editing (it stops
   // propagation before anything else sees the key), and ChatPage's chat-find
@@ -1127,8 +1378,9 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
     // eslint-disable-next-line react-hooks/exhaustive-deps -- runFind is stable per `fullscreen`; listing it would re-run on every match repaint
   }, [findOpen, findTerm, findCase, content, fullscreen])
 
-  // Highlight names are global; clear them if the panel unmounts while find is
-  // open so a stale highlight can't leak onto the next preview.
+  // Find highlight names belong to the one active panel, so clear them if it
+  // unmounts. Annotation ranges use per-owner cleanup above; deleting their
+  // global registry entry here would erase ranges owned by other mounted tabs.
   useEffect(() => () => {
     if (cssHighlights) { cssHighlights.delete(FIND_HL_ALL); cssHighlights.delete(FIND_HL_CURRENT) }
   }, [])
@@ -1172,7 +1424,7 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
           if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); closeFind() }
         }}
         placeholder={i18nT('components.markdownPanel.find_in_document')}
-        className="bg-transparent border-none outline-none text-text placeholder:text-muted w-[170px] text-[13px]"
+        className="bg-transparent border-none outline-hidden text-text placeholder:text-muted w-[170px] text-[13px]"
         aria-label={i18nT('components.markdownPanel.find_in_document_2')}
       />
       <button onClick={() => setFindCase((c) => !c)} className={`p-0.5 rounded cursor-pointer border-none transition-colors ${findCase ? 'bg-accent/20 text-accent' : 'bg-transparent text-muted hover:text-text'}`} title={i18nT('components.markdownPanel.case_sensitive')} aria-label={i18nT('components.markdownPanel.case_sensitive')}><CaseSensitive size={15} /></button>
@@ -1186,23 +1438,387 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
   const lang = langFor(ext)
   const displayContent = isMarkdown ? content : wrapCode(content, ext)
 
+  /** Read the file as it is now, with the verdict the read produced.
+   *
+   * ALWAYS a fresh fetch of the disk. That is the one rule every read of this
+   * panel rests on -- the catch-up on a mount, a remount or a return, the
+   * post-edit read a save or an undo starts, Refresh, Cancel, the watch's
+   * re-read: each exists to see the file as it is NOW, and any body that is
+   * not this fetch's can predate the change it must find. Not the read that
+   * opened the tab (a file deleted between that GET and the mount left the tab
+   * counted as caught up while its stream 404'd into a silent terminal error,
+   * and the edit and save that followed recreated the deleted file from the
+   * stale copy); not a `['file-read', path]` entry still inside its 10 s
+   * window (after a save it holds the pre-save body); not a fetch already in
+   * flight for an older moment. The mount right after a chip open costs one
+   * GET again -- the price of a buffer the disk vouches for.
+   *
+   * Only the NEWEST of this panel's reads may land: each read aborts the one
+   * before it and answers `superseded` if a later one started while it was in
+   * flight, so an older re-read cannot put back bytes -- or a verdict -- that
+   * a newer one has already replaced. Reporting stays with each caller because
+   * only it knows whether a human is waiting on the result. */
+  const diskReadAbortRef = useRef<AbortController | null>(null)
+  /** Reads of this panel not yet settled. The watch consults it: an equal frame
+   *  is quiet only when no read is in flight (see the callback). */
+  const diskReadsInFlightRef = useRef(0)
+
+  const readFromDisk = useCallback(async (): Promise<DiskRead> => {
+    diskReadAbortRef.current?.abort()
+    const ac = new AbortController()
+    diskReadAbortRef.current = ac
+    // A purge of document bodies (the owner's redaction switch flipped) between
+    // start and finish makes this read's bytes stale under the pass now in
+    // force: superseded, never applied. The tab rehydrates through a fresh read.
+    const epoch = documentBodyEpochNow()
+    diskReadsInFlightRef.current++
+    try {
+      const r = await fetchFileRead(filePath, ac.signal)
+      if (ac.signal.aborted || documentBodyEpochNow() !== epoch) return { kind: 'superseded' }
+      if (r.ok) return { kind: 'ok', text: r.text, binary: r.binary, partial: isPartialRead(r) }
+      return r.status === 404 ? { kind: 'missing' } : { kind: 'failed' }
+    } catch {
+      return ac.signal.aborted ? { kind: 'superseded' } : { kind: 'failed' }
+    } finally {
+      diskReadsInFlightRef.current--
+    }
+  }, [filePath])
+
+  // A path change or unmount withdraws the read in flight, so it cannot apply
+  // or report its result to a tab that has moved on.
+  useEffect(() => () => {
+    diskReadAbortRef.current?.abort()
+    diskReadAbortRef.current = null
+  }, [filePath])
+
+  /** The file is not on disk (a read answered 404), whatever the buffer holds.
+   *  This is what parks the stream (a 404 stream closes for good) and runs the
+   *  retry, so a recreated file lands even when the buffer is empty or the
+   *  host's placeholder. Whether the buffer is a LAST COPY worth a banner and a
+   *  close guard is a separate question, answered by `lastCopy` below. Cleared
+   *  by any read that finds the file, and by a re-target of the tab. */
+  const [missingOnDisk, setMissingOnDisk] = useState(false)
+  useEffect(() => { setMissingOnDisk(false) }, [filePath])
+  /** Whether the buffer holds only PART of the file: the read that filled it
+   *  was cut at the gateway's cap or had credentials redacted. The verdict is
+   *  the host's (`partial`), stamped from the read's headers by whichever read
+   *  filled the buffer -- the opening read before this panel mounted as much as
+   *  the panel's own -- and never guessed from the body: a whole file may quote
+   *  the redaction tag, and a guess about it could only be wrong. Such a buffer
+   *  is not the whole file: the banner and the close prompt say so instead of
+   *  calling it the file's remaining contents, and a download of it is named
+   *  `.partial`. That is ALL the verdict changes -- words and a file name. The
+   *  guard, the banner and the exits stand for a partial buffer exactly as for
+   *  a whole one: it is the most of the file that survives. */
+  const partialCopy = !!partial
+  const partialCopyRef = useRef(partialCopy)
+  partialCopyRef.current = partialCopy
+  /** Whether the buffer IS a copy worth keeping once the file is gone: text the
+   *  disk once vouched for. Not the "file not found" sentence the host seeds
+   *  into a tab opened on a path already missing (`openFile`, the cold-tab
+   *  hydration), not a binary tab's empty text buffer, not an empty file --
+   *  a banner over those would offer to download the placeholder prose, or
+   *  nothing, under the file's name. Judged by the buffer, not by whether THIS
+   *  panel instance has seen a successful read: a panel remounted after the
+   *  side panel was collapsed carries the tab store's copy of a file deleted
+   *  meanwhile -- a real last copy with no successful read behind it here. */
+  const bufferIsLastCopy = useCallback(() =>
+    !binaryRef.current && contentRef.current !== '' &&
+    contentRef.current !== i18nT('pages.chatPage.file_not_found_on_disk_it_may_have_been_moved_or'), [])
+  /** The banner and the close guard: the file is gone AND the buffer is a copy
+   *  worth keeping. Rendered as a banner OVER the document, never in the
+   *  buffer: `content` and its saved baseline keep the last text on screen. */
+  const lastCopy = missingOnDisk && !binary && content !== '' &&
+    content !== i18nT('pages.chatPage.file_not_found_on_disk_it_may_have_been_moved_or')
+  /** The banner's two exits, on the BUFFER: a gone file has no path to fetch,
+   *  so the browser is handed the text on screen, under the file's name. The
+   *  copy answers: "Copied" on the button for a moment, or the panel's action
+   *  notice when the clipboard refused -- a silent miss here would sit right
+   *  next to the invitation to discard the only copy. */
+  const downloadLastCopy = useCallback(() => {
+    // A partial copy goes out under a name that says so, never under the
+    // file's own: with the original gone, that would pass a prefix off as it.
+    downloadBlob(new Blob([content], { type: 'text/plain;charset=utf-8' }), downloadFileName(filePath) + (partialCopy ? '.partial' : ''))
+  }, [content, filePath, partialCopy])
+  const [lastCopyCopied, setLastCopyCopied] = useState(false)
+  const lastCopyCopiedTimer = useRef<ReturnType<typeof setTimeout>>(undefined)
+  useEffect(() => () => clearTimeout(lastCopyCopiedTimer.current), [])
+  const copyLastCopy = useCallback(async () => {
+    if (!(await copyToClipboard(content))) { reportActionError(i18nT('components.markdownPanel.copy_failed')); return }
+    setLastCopyCopied(true)
+    clearTimeout(lastCopyCopiedTimer.current)
+    lastCopyCopiedTimer.current = setTimeout(() => setLastCopyCopied(false), 1500)
+  }, [content, reportActionError])
+
+  /** Drop the `['file-read', path]` cache entry rather than rewrite it, so a
+   *  reopen inside its 10 s window refetches instead of rehydrating a body a
+   *  disk read has just proven stale -- open, then save within the window, is
+   *  exactly that. Every read this panel makes drops it, restamped or not. */
+  const evictFileRead = useCallback(() => {
+    qc.removeQueries({ queryKey: fileReadQueryKey(filePath), exact: true })
+  }, [qc, filePath])
+
+  /** Apply a disk read to the tab: buffer, saved baseline and verdict together,
+   *  with the cache entry dropped. A body landed, so the file is there. */
+  const applyDiskRead = useCallback((disk: { text: string; binary: boolean; partial: boolean }) => {
+    evictFileRead()
+    setMissingOnDisk(false)
+    if (onDiskContent) onDiskContent(disk.text, disk.binary, disk.partial)
+    else onContentChange(disk.text)
+  }, [evictFileRead, onDiskContent, onContentChange])
+
+
+  /** The catch-up latch: where this tab stands against its file since it last
+   *  became visible. `due` -- a read has to run at the next clean moment: the
+   *  tab is hidden, the user has edited a clean buffer (handleChange), the tab
+   *  has left edit mode (the stretch it held no stream for), or the read it
+   *  started was overtaken by the user's typing and dropped. `reading`
+   *  -- one is in flight, and a re-render starts no second one. `done` --
+   *  nothing to do until the tab is hidden or edited again: a read applied, or
+   *  failed and was reported. Every mount starts `due`, a visible one too: the
+   *  buffer a remounted tab is handed is the tab store's copy, which may
+   *  predate a change made while the panel was unmounted, and the re-armed
+   *  stream's first frame does not cover a file emptied meanwhile
+   *  (`api_file_watch` emits only when content differs from its initial empty
+   *  string). One GET per mount of the visible tab buys a buffer the disk
+   *  vouches for. */
+  const catchUpRef = useRef<'due' | 'reading' | 'done'>('due')
+
+  /** Adopt the disk truth: THE catch-up procedure, shared by the activation
+   *  effect, the watch and every clean moment that owes a read.
+   *
+   * One procedure, one rule. The read is always `readFromDisk` -- a fresh fetch
+   * of the file as it is now, never the read that opened the tab, never a
+   * cached body, never skipped for a mount, a remount or an edit edge -- and
+   * the tab counts as caught up only inside the branch that adopts THAT
+   * fetch's answer, right here. Nothing else writes `done`: the effect below
+   * and the edit fences only ever move the latch to `due` or `reading`.
+   *
+   * A change on disk IS the truth, so it goes through onDiskContent when the
+   * host can restamp its saved baseline; falling back to onContentChange keeps
+   * non-tab hosts unchanged. Three results are dropped rather than applied:
+   * superseded by a later read, or the user started typing while it was in
+   * flight -- two ways this result has nothing to say -- and an unreadable file,
+   * which is NOT quiet: the panel is then showing a revision it knows is
+   * superseded and cannot describe the current one, which the user has to be
+   * told rather than left to infer from a document that stopped changing.
+   *
+   * The catch-up latch moves on the read's OUTCOME, here, never on its start.
+   * Only an applied read makes the tab current, so `reading` becomes `done`
+   * once the bytes are on screen. A read the typing overtook puts the tab
+   * back to `due`: the buffer it would have replaced is dirty now, and once
+   * those edits are undone it is a clean buffer at the pre-change revision,
+   * which a later save would write over the newer file -- so the next clean
+   * moment re-reads instead of trusting it. A superseded read says nothing;
+   * the newer read that overtook it decides. A failed read is reported, and
+   * counts as this return's attempt (`done`) rather than staying `due`: the
+   * host hands the panel fresh callbacks on every render, so a tab left `due`
+   * would re-read and re-report as fast as the host renders. The next return
+   * tries again.
+   *
+   * A file that is gone (404) is not a failure: it is a real answer, and the
+   * chip click, the cold-tab hydration and the reload all render a tab opened
+   * on a missing path as a placeholder -- so the catch-up says so too, quietly,
+   * instead of raising the read-failure notice on every return to that tab. As
+   * a STATE, not as content: the buffer and its saved baseline keep the last
+   * text, which may be the only copy left of a file deleted outside the
+   * dashboard, and that copy stays on screen under a banner that says what it
+   * is and carries the two ways to keep it. Only when the buffer IS such a copy
+   * (bufferIsLastCopy): a tab seeded with the host's placeholder sentence, or
+   * a binary tab, has nothing the banner could truthfully call a last copy. A
+   * read that finds the file again clears the banner. */
+  const adoptDisk = useCallback(async (opts?: { quietFailure?: boolean }): Promise<DiskRead['kind']> => {
+    const disk = await readFromDisk()
+    if (disk.kind === 'superseded') return disk.kind
+    // Whatever this read answered, the shared cache entry for the path does
+    // not outlive it: a body older than the disk (open, then save within the
+    // 10 s window) would rehydrate on a reopen, and a cached 404 or failure
+    // would answer the next open.
+    evictFileRead()
+    // `missingOnDisk` is a fact about the FILE, not an edit to the buffer, so
+    // it is recorded before the dirty early-return below: a 404 latches it and
+    // a body clears it, dirty or not. The early-return protects the EDITS --
+    // a dirty tab adopts nothing -- and the flag touches none of them; left
+    // false for a dirty tab, the banner that names the gone file and the
+    // Download that keeps the edits would both stay off exactly when the
+    // buffer is the only place those edits exist.
+    if (disk.kind === 'missing') setMissingOnDisk(true)
+    else if (disk.kind === 'ok') setMissingOnDisk(false)
+    if (dirtyRef.current) { catchUpRef.current = 'due'; return disk.kind }
+    if (disk.kind === 'failed') {
+      if (catchUpRef.current === 'reading') catchUpRef.current = 'done'
+      // The retry reports its first failure and is quiet after: the banner
+      // already stands, and a notice per tick would only repeat it.
+      if (!opts?.quietFailure) reportActionError(i18nT('components.markdownPanel.cannot_read_file'))
+      return disk.kind
+    }
+    // The disk says what the tab already shows -- the common outcome of a
+    // mount or a return to an unchanged file: current, nothing to restamp.
+    if (disk.kind === 'ok' && (disk.text !== contentRef.current || disk.binary !== binaryRef.current || disk.partial !== partialCopyRef.current)) applyDiskRead(disk)
+    // Not unconditionally `done`: a landing after the tab was hidden again
+    // finds the latch back at `due`, and the next return must read afresh.
+    if (catchUpRef.current === 'reading') catchUpRef.current = 'done'
+    return disk.kind
+  }, [applyDiskRead, evictFileRead, readFromDisk, reportActionError])
+  const adoptDiskRef = useRef(adoptDisk)
+  adoptDiskRef.current = adoptDisk
+
+  // The watch tracks the disk for a clean, non-editing tab -- and ONLY the tab
+  // the user can see. Every open tab used to arm its own watch, and each watch
+  // is one EventSource: one HTTP/1.1 connection held open for as long as the
+  // tab exists. Chromium allows six connections per host, so six idle tabs
+  // starved every other request the dashboard makes -- uploads, chat sends,
+  // polls -- for as long as the streams stayed open (#14236). A hidden tab holds
+  // no stream; it catches up in the effect below when it comes back. Nor does a
+  // tab whose file is gone: `api_file_watch` answers 404 for a missing path and
+  // `useFileWatch` closes such a stream for good, so a watch armed while the
+  // file was gone would never see it recreated. The retry below covers that
+  // stretch, and the read that finds the file again arms the stream afresh.
+  const watchArmable = !!liveWatch && !editing && !dirty && !missingOnDisk
   useFileWatch(
-    liveWatch && !editing && !dirty ? filePath : null,
-    // A watch-fired change IS the disk truth, so route it through
-    // onDiskContent when the host can restamp its saved baseline; falling
-    // back to onContentChange keeps non-tab hosts unchanged.
-    useCallback((c: string) => { (onDiskContent ?? onContentChange)(c) }, [onDiskContent, onContentChange]),
+    watchArmable && active ? filePath : null,
+    // The event's own `content` is never APPLIED. `/api/file-watch` decodes
+    // with `errors="replace"` and carries no binary verdict, so a file replaced
+    // on disk by binary bytes would push U+FFFD into the buffer AND leave the
+    // card decision at its hydrated value — editor live, save destructive. The
+    // event says "it changed"; the re-read says what it now is, and if the
+    // re-read cannot answer then NOTHING is applied: the buffer stays at the
+    // last revision whose verdict is known, which is stale but honest, where
+    // the event body would be new content under an old verdict.
+    //
+    // It IS compared. The backend starts a stream from mtime 0, so a re-armed
+    // stream's first poll tick always writes a frame with the whole body, and
+    // on an activation that frame arrives beside the catch-up read; re-reading
+    // on it made every tab switch two GETs. A frame whose text equals the clean
+    // buffer says nothing the tab does not already show and costs no read --
+    // unless a read is still in flight: that read may land with OLDER bytes
+    // than this frame (the file changed and changed back between the two), and
+    // equality with the displayed text would let the stale landing become the
+    // baseline, so the frame supersedes the read instead. Any difference
+    // re-reads -- a real change, a CRLF file (the stream's text-mode read
+    // normalizes newlines, the re-read does not), a body past the stream's
+    // cap -- and so does every frame on a binary tab, whose text buffer is
+    // empty: equality with no read pending is the ONLY case skipped, and equal
+    // text is nothing to adopt. One GET per activation of the one file on
+    // screen, on a subscription only armed while the panel is visible, clean
+    // and not editing.
+    useCallback((frameText: string) => {
+      if (diskReadsInFlightRef.current === 0 && !binaryRef.current && frameText === contentRef.current) return
+      void adoptDisk()
+    }, [adoptDisk]),
   )
+
+  // The catch-up for a parked watch: a tab that was hidden re-reads its file
+  // when it becomes the visible one, so a change made while it held no stream
+  // lands the moment the user can see the tab, not never -- silently stale
+  // would be the failure, because the saved baseline still looks current. The
+  // same guards as the watch apply through adoptDisk: a dirty tab keeps its
+  // edits and does not re-read (the edits are the user's work), and a read
+  // that typing or a newer read has overtaken is dropped. `editing` gates the
+  // stream, not this read: a live push would land under the user's cursor, but
+  // a tab that was hidden has no cursor in it, and a clean editor buffer left
+  // stale is exactly what a later save would write over the newer file. The
+  // tab counts as caught up only once a read has APPLIED -- adoptDisk settles
+  // the latch, this effect only starts the read: one that comes back with
+  // unsaved edits reads nothing, and reads the moment those edits are undone,
+  // saved or discarded while it is visible -- undone in particular, since that
+  // leaves a clean buffer showing the pre-change revision -- and so does one
+  // whose read the user's typing overtook. A mount reads too (the latch starts
+  // `due`; see it). Leaving edit mode while visible re-arms the watch, and
+  // re-arms this read as well: a clean editor buffer held no stream while it
+  // was being edited, so a change made then reached the tab only through the
+  // re-armed stream's connect-time frame -- and there is no such frame for a
+  // file emptied meanwhile (`api_file_watch` compares against its initial
+  // empty string). The read does not wait for the re-armed stream to say
+  // anything: a saturated connection budget is exactly what delays that
+  // stream, and the tab must be current whether or not its stream connects.
+  const catchUpArmable = !!liveWatch && !dirty
+  const wasEditingRef = useRef(editing)
+  useEffect(() => {
+    if (wasEditingRef.current && !editing) catchUpRef.current = 'due'
+    wasEditingRef.current = editing
+    if (!active) { catchUpRef.current = 'due'; return }
+    if (catchUpRef.current !== 'due' || !catchUpArmable) return
+    catchUpRef.current = 'reading'
+    void adoptDisk()
+  }, [active, editing, catchUpArmable, adoptDisk])
+
+  // While the file is gone, the stream cannot stand in for the disk (see the
+  // watch above), so the visible tab asks the disk itself, on the cadence the
+  // backend's own watch polls at. The retry runs only while the banner shows,
+  // the tab is on screen and the buffer is clean -- a dirty buffer is the
+  // user's work, and adoptDisk would drop the result anyway -- and the read
+  // that finds the file clears `missingOnDisk`, which ends the retry and arms
+  // the stream again. One GET a second for the one deleted file on screen: the
+  // alternative is a banner that keeps saying "not found" over a buffer a save
+  // would write over the recreated file. Each retry is scheduled only once the
+  // previous read has SETTLED, never on a fixed interval: a read slower than
+  // the cadence would otherwise be aborted by the next tick, every tick, and a
+  // recreated file would never land.
+  useEffect(() => {
+    if (!missingOnDisk || !active || !catchUpArmable) return
+    let stopped = false
+    let delay = MISSING_FILE_RETRY_MS
+    let reported = false
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const tick = async () => {
+      // Never over a read already out -- the activation catch-up, the close
+      // guard, the watch: starting one would abort it. Skip the tick instead.
+      // Through a ref: the host hands the panel fresh callbacks on every
+      // render, and an effect keyed on adoptDisk itself would restart before
+      // its first read went out.
+      if (diskReadsInFlightRef.current === 0) {
+        const verdict = await adoptDiskRef.current({ quietFailure: reported })
+        if (verdict === 'failed') reported = true
+      }
+      delay = Math.min(delay * 2, MISSING_FILE_RETRY_MAX_MS)
+      if (!stopped) timer = setTimeout(() => { void tick() }, delay)
+    }
+    timer = setTimeout(() => { void tick() }, delay)
+    return () => { stopped = true; clearTimeout(timer) }
+  }, [missingOnDisk, active, catchUpArmable])
 
 
   // Detect if file has uncommitted changes and pre-fetch HEAD content
-  const { data: diffData, isFetching: diffChecking } = useQuery({
+  const { data: diffData, isFetching: diffChecking, error: diffQueryError } = useQuery({
     queryKey: ['file-diff', filePath],
     queryFn: () => api.fileDiff(filePath),
     enabled: !!filePath && !isRichType,
     staleTime: 10_000,
   })
   const originalContent = diffData?.original ?? ''
+  // Every failure the panel owns, rendered in ONE place (both layouts mount it
+  // under the header). The three background reads used to fail silently: a
+  // rejected knowledge / artifact / diff query rendered as "not added" / no
+  // artifact / no diff.
+  //
+  // askAgent decision: OFF while the editor buffer is dirty — the hand-off
+  // navigates away and would discard unsaved edits — ON otherwise (nothing to
+  // lose, and a failed gateway read or write is what the agent can diagnose).
+  // The save failure itself is always OFF: by definition the buffer holds the
+  // edits that were NOT persisted.
+  const panelNotices = (saveError || actionError || knowledge.queryError || artifactState.queryError || diffQueryError) ? (
+    <div className="flex flex-col gap-1.5">
+      {/* No hand-off: the editor buffer holds the unsaved edits this save failed to write. */}
+      <ErrorNotice message={saveError} onDismiss={() => setSaveError(null)} testId="markdown-panel-save-error" />
+      <ErrorNotice message={actionError} askAgent={!dirty} onDismiss={() => setActionError(null)} testId="markdown-panel-action-error" />
+      <ErrorNotice
+        message={knowledge.queryError ? (errMessage(knowledge.queryError) || i18nT('components.markdownPanel.knowledge_status_failed')) : null}
+        askAgent={!dirty}
+        testId="markdown-panel-knowledge-error"
+      />
+      <ErrorNotice
+        message={artifactState.queryError ? (errMessage(artifactState.queryError) || i18nT('components.markdownPanel.artifact_status_failed')) : null}
+        askAgent={!dirty}
+        testId="markdown-panel-artifact-error"
+      />
+      <ErrorNotice
+        message={diffQueryError ? (errMessage(diffQueryError) || i18nT('components.markdownPanel.diff_status_failed')) : null}
+        askAgent={!dirty}
+        testId="markdown-panel-diff-error"
+      />
+    </div>
+  ) : null
   // The backend reports WHY there is nothing to diff against. `not_git` means
   // the file is outside any git work tree, so there is no baseline at all —
   // rendering the diff would present the whole file as added against a
@@ -1250,23 +1866,31 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
     try {
       if (onRefresh) { await onRefresh(filePath) }
       else {
-        const res = await fetch(fileReadUrl(filePath))
-        if (!res.ok) return
-        const text = await res.text()
+        const disk = await readFromDisk()
+        // A newer read owns the answer; this one has nothing to add or report.
+        if (disk.kind === 'superseded') return
+        // A click that produces nothing reads as a broken button. A file that
+        // is gone produces the banner -- the verdict has its own place, with
+        // the exits that keep the buffer -- so only a read that could not
+        // answer at all goes through the panel's action notice.
+        if (disk.kind === 'missing') { setMissingOnDisk(true); return }
+        if (disk.kind === 'failed') { reportActionError(i18nT('components.markdownPanel.cannot_read_file')); return }
         // The read is async, and the dirty check above ran at click time:
         // anything typed while it was in flight made the buffer dirty, and
         // these disk bytes must not clobber that work.
         if (dirtyRef.current) return
-        ;(onDiskContent ?? onContentChange)(text)
+        applyDiskRead(disk)
       }
     } finally { setRefreshing(false) }
-  }, [filePath, onContentChange, onDiskContent, onRefresh, refreshing, dirty])
+  }, [filePath, onRefresh, refreshing, dirty, readFromDisk, applyDiskRead, reportActionError])
 
   // Discard pending edits (matches the artifact detail page's Cancel button).
   // Re-reads the file from disk into the buffer, clearing dirty. Confirms first
   // because edits are gone for good. Only markdown-ish files have a preview to
   // return to; code files stay in source mode (Cancel just discards edits).
-  const canPreview = isMarkdown
+  // Also gates Cancel's "return to preview" — there is no preview to return
+  // to, and no buffer to discard.
+  const canPreview = isMarkdown && !showBinaryCard
   const handleCancel = useCallback(async () => {
     if (!dirty) { if (canPreview) setEditing(false); return }
     if (!(await confirm({
@@ -1277,17 +1901,26 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
     try {
       if (onRefresh) { await onRefresh(filePath) }
       else {
-        const res = await fetch(fileReadUrl(filePath))
         // Cancel means "match the disk", so the re-read moves the saved
         // baseline too (onDiskContent), the same as Refresh — otherwise the
         // stale baseline could later read a deliberate edit back to it as
         // clean and let a close discard that work.
-        if (res.ok) (onDiskContent ?? onContentChange)(await res.text())
+        const disk = await readFromDisk()
+        if (disk.kind === 'superseded') return
+        // Cancel means "match the disk". If the disk could not be read -- or the
+        // file is gone -- the buffer still holds the edits, so the dirty flag
+        // MUST stay set, or a later close discards work the panel just claimed
+        // was safe. A gone file is said by the banner, over the edits it now
+        // offers to keep; a read that could not answer is reported. Either way
+        // the user is left exactly where they were.
+        if (disk.kind === 'missing') { setMissingOnDisk(true); return }
+        if (disk.kind === 'failed') { reportActionError(i18nT('components.markdownPanel.cannot_read_file')); return }
+        applyDiskRead(disk)
       }
       setDirty(false)
       if (canPreview) setEditing(false)
     } finally { setRefreshing(false) }
-  }, [dirty, filePath, onContentChange, onDiskContent, onRefresh, canPreview, confirm])
+  }, [dirty, filePath, onRefresh, canPreview, confirm, readFromDisk, applyDiskRead, reportActionError])
 
   const resolveSelectionCoords = useCallback((fallbackText?: string) => {
     const sel = window.getSelection()
@@ -1308,10 +1941,7 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
           // of the same anchor text can be disambiguated at highlight time.
           let startOffset: number | undefined
           try {
-            const preRange = document.createRange()
-            preRange.setStart(root, 0)
-            preRange.setEnd(range.startContainer, range.startOffset)
-            startOffset = preRange.toString().length + (raw.length - raw.trimStart().length)
+            startOffset = anchorFromRange(root, range)?.startOffset
           } catch { /* leave undefined */ }
           return { anchor, rect, range: range.cloneRange(), line: coords?.line, column: coords?.column, startOffset }
         }
@@ -1325,38 +1955,106 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
     return undefined
   }, [content, displayContent, isMarkdown])
 
-  const handleCommentAction = useCallback((text: string, rect: DOMRect) => {
+  // Where an in-progress comment lives between teardowns the toolbar cannot
+  // guard (a chat-slot switch replaces the side panel wholesale). Per file,
+  // per passage; see `composerDraftStoreFor`.
+  const composerDraftStore = useMemo(() => composerDraftStoreFor(`mc-comment-composer-draft:${filePath}`), [filePath])
+
+  // An unsaved comment draft makes this tab NOT clean for the navigate/close
+  // guards below: a rail click must open the next file beside it rather than
+  // re-target this tab under the draft's anchor, a close must ask first, and
+  // so must the view switches (Edit, full screen) that unmount the box.
+  const composerDraftRef = useRef(false)
+  // The passage the open draft belongs to, so a confirmed discard from one of
+  // the panel's own guards clears that slot alone — a draft saved for another
+  // passage of this file stays where it is.
+  const composerDraftPassageRef = useRef<{ anchor: string; start: number } | null>(null)
+  const handleComposerDraftChange = useCallback((hasDraft: boolean, passage: { anchor: string; start: number } | null) => {
+    composerDraftRef.current = hasDraft
+    composerDraftPassageRef.current = hasDraft ? passage : null
+  }, [])
+  const clearActiveDraftSlot = useCallback(() => {
+    const p = composerDraftPassageRef.current
+    if (p) composerDraftStore.clear(p.anchor, p.start)
+    composerDraftPassageRef.current = null
+  }, [composerDraftStore])
+  /** Run `proceed` unless an unsaved comment draft would be lost, in which case
+   *  ask first — in the draft's own words, since "unsaved changes" would read as
+   *  file edits at risk. */
+  const guardDraft = useCallback(async (proceed: () => void) => {
+    if (composerDraftRef.current) {
+      if (!(await confirm({
+        title: i18nT('components.markdownPanel.discard_unsaved_comment'),
+        confirmLabel: i18nT('components.markdownPanel.discard_comment_button'),
+      }))) return
+      // A confirmed discard: THIS draft's persisted copy must not resurface.
+      clearActiveDraftSlot()
+    }
+    proceed()
+  }, [confirm, clearActiveDraftSlot])
+
+  const handleComposerOpen = useCallback((text: string) => {
+    composerOpenRef.current = true
     const info = resolveSelectionCoords(text)
     if (info) {
       if (info.range) applyHighlightMarks(info.range)
-      const popRect = info.rect.width > 0 ? info.rect : rect
-      setPopover({ x: popRect.left, y: popRect.bottom, anchor: info.anchor, line: info.line, column: info.column, startOffset: info.startOffset })
+      else clearHighlightMarks()
+      pendingAnchorRef.current = { anchor: info.anchor, line: info.line, column: info.column, startOffset: info.startOffset }
     } else {
-      // No DOM selection to map — use the reported rect directly
-      setPopover({ x: rect.left, y: rect.top, anchor: text, line: undefined, column: undefined })
+      // No DOM selection to map — anchor on the text the toolbar captured.
+      clearHighlightMarks()
+      pendingAnchorRef.current = { anchor: text }
     }
-    window.getSelection()?.removeAllRanges()
-  }, [resolveSelectionCoords, applyHighlightMarks])
+  }, [resolveSelectionCoords, applyHighlightMarks, clearHighlightMarks])
 
-  const handleCopyAction = useCallback((text: string) => {
-    if (text) copyToClipboard(text)
-  }, [])
-
-  const selectionActions: SelectionAction[] = useMemo(() => {
-    if (!onSubmitComments) return [{ id: 'copy', icon: <Copy size={12} />, label: 'Copy', onClick: handleCopyAction }]
-    return [
-      { id: 'comment', icon: <MessageSquarePlus size={12} />, label: 'Comment', onClick: handleCommentAction },
-      { id: 'copy', icon: <Copy size={12} />, label: 'Copy', onClick: handleCopyAction },
-    ]
-  }, [onSubmitComments, handleCommentAction, handleCopyAction])
-
-  const addComment = useCallback((text: string) => {
-    if (!popover) return
-    const newComment: InlineComment = { id: Math.random().toString(36).substring(2), anchor: popover.anchor, text, line: popover.line, column: popover.column, startOffset: popover.startOffset }
-    setComments(prev => [...prev, newComment])
-    setPopover(null)
+  const handleComposerClose = useCallback(() => {
+    composerOpenRef.current = false
+    composerDraftRef.current = false
+    pendingAnchorRef.current = null
     clearHighlightMarks()
-  }, [popover, clearHighlightMarks])
+  }, [clearHighlightMarks])
+
+  // Returns the clipboard result so the toolbar's checkmark is truthful.
+  const handleCopyAction = useCallback((text: string) => copyToClipboard(text), [])
+
+  const selectionActions: SelectionAction[] = useMemo(() => [
+    // Icon-only beside the composer (14px), icon + label on the plain row (12px,
+    // matching chat's toolbar). The hint says WHAT is copied — next to a comment
+    // input, "Copy" alone reads as copying the draft.
+    { id: 'copy', icon: <Copy size={onSubmitComments ? 14 : 12} />, label: i18nT('components.selectionToolbar.copy'), hint: onSubmitComments ? i18nT('components.selectionToolbar.copy_selection_hint') : undefined, onClick: handleCopyAction },
+  ], [onSubmitComments, handleCopyAction])
+
+  const handleComposerSubmit = useCallback((comment: string, text: string) => {
+    const info = pendingAnchorRef.current ?? { anchor: text }
+    const newComment: InlineComment = { id: Math.random().toString(36).substring(2), anchor: info.anchor, text: comment, line: info.line, column: info.column, startOffset: info.startOffset }
+    setComments(prev => [...prev, newComment])
+    composerOpenRef.current = false
+    composerDraftRef.current = false
+    pendingAnchorRef.current = null
+    clearHighlightMarks()
+  }, [clearHighlightMarks])
+
+  // Only a host that can receive comments gets the type-first box; otherwise
+  // the toolbar is the plain Copy row it always was.
+  // Escape / ✕ over a typed draft ask in the same words as Edit / full screen / close.
+  const confirmDiscardDraft = useCallback(() => confirm({
+    title: i18nT('components.markdownPanel.discard_unsaved_comment'),
+    confirmLabel: i18nT('components.markdownPanel.discard_comment_button'),
+    // The same prompt is raised from inside the full-screen shell (z-[9999]).
+    layer: 'top',
+  }), [confirm])
+  // Where an in-progress comment lives between teardowns the toolbar cannot
+  // guard (a chat-slot switch replaces the side panel wholesale). Per file, in
+  // sessionStorage: it should survive the switch, not a browser session.
+
+  const selectionComposer: SelectionComposer | undefined = useMemo(() => onSubmitComments ? {
+    onOpen: handleComposerOpen,
+    onSubmit: handleComposerSubmit,
+    onClose: handleComposerClose,
+    onDraftChange: handleComposerDraftChange,
+    confirmDiscard: confirmDiscardDraft,
+    draftStore: composerDraftStore,
+  } : undefined, [onSubmitComments, handleComposerOpen, handleComposerSubmit, handleComposerClose, handleComposerDraftChange, confirmDiscardDraft, composerDraftStore])
 
   const removeComment = useCallback((id: string) => {
     setComments(prev => prev.filter(c => c.id !== id))
@@ -1385,7 +2083,7 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
   }, [])
 
   useEffect(() => {
-    if (editing) { setPopover(null); clearHighlightMarks(); window.getSelection()?.removeAllRanges() }
+    if (editing) { pendingAnchorRef.current = null; clearHighlightMarks(); window.getSelection()?.removeAllRanges() }
   }, [editing, clearHighlightMarks])
 
   // Centralize persistence: fires on any comments mutation (add / remove /
@@ -1601,12 +2299,30 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
     }
   }, [comments, displayContent, editing, fullscreen, removeCommentTooltip, flashCommentRow])
 
+  /** Bumped by every local edit (handleChange). A save clears `dirty` only if
+   *  no edit landed while its write was in flight: the file holds `content` as
+   *  of the keypress, and a keystroke typed before the write round-trips is not
+   *  in it. Marking that buffer clean misfiles the keystroke -- and, with the
+   *  catch-up latch left `due` by the first edit, the clean flip would start a
+   *  read that puts the just-written text back over it. */
+  const editGenRef = useRef(0)
   const handleSave = useCallback(async () => {
     setSaving(true); setSaveError(null)
-    try { await onSave(filePath, content); setDirty(false); qc.invalidateQueries({ queryKey: ['file-diff', filePath] }) }
+    const editGen = editGenRef.current
+    try {
+      await onSave(filePath, content)
+      // The disk now holds `content`, so whatever the shared `['file-read',
+      // path]` entry holds predates it: dropped, not rewritten. This panel puts
+      // no body into the shared cache -- it only reads the disk -- and a
+      // consumer opening the path inside the window refetches. The post-save
+      // catch-up read is a fresh fetch either way (see readFromDisk).
+      evictFileRead()
+      if (editGenRef.current === editGen) setDirty(false)
+      qc.invalidateQueries({ queryKey: ['file-diff', filePath] })
+    }
     catch (err) { setSaveError(err instanceof Error ? err.message : i18nT('components.markdownPanel.save_failed')) }
     finally { setSaving(false) }
-  }, [filePath, content, onSave, qc])
+  }, [filePath, content, onSave, qc, evictFileRead])
 
   const handleSaveRef = useRef(handleSave)
   useEffect(() => { handleSaveRef.current = handleSave }, [handleSave])
@@ -1622,23 +2338,118 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
   }, [])
 
   const guardedClose = useCallback(async () => {
-    if (dirty && !(await confirm({
-      title: i18nT('components.markdownPanel.discard_unsaved_changes'),
-      confirmLabel: i18nT('components.markdownPanel.discard_changes_button'),
-    }))) return
+    // A buffer whose file is gone from disk is the only copy there is, edited
+    // or not, so the file being gone decides the prompt: "Discard unsaved
+    // changes?" would imply a saved version survives the close, and none does.
+    // Same stakes as unsaved edits, same prompt shape, same precedence over a
+    // comment draft. A live-watched tab asks the disk first, dirty or not:
+    // `api_file_watch` polls on silently through a FileNotFoundError, so a file
+    // deleted while its tab was on screen has told the panel nothing (and a
+    // dirty tab reads nothing on its own), and the close is the last moment
+    // the copy can still be kept. A PARTIAL buffer (a truncated or redacted
+    // read) is guarded exactly the same -- it is the most of the file that
+    // survives -- and only the prompt's words change: the partial verdict is a
+    // guess from the body's shape, and a guess may add a caveat but must never
+    // lift the guard, or the sole copy of a whole file that happens to contain
+    // the redaction tag would close unasked.
+    let gone = lastCopy
+    let unverified = false
+    if (!gone && liveWatch) {
+      // Quiet: whatever this read cannot answer, the dialog below says, so a
+      // notice as well would tell it twice and outlive a Cancel.
+      const verdict = await adoptDisk({ quietFailure: true })
+      // The user may have typed while the read was out (which also aborts it):
+      // `dirty` captured above is stale, so nothing below trusts it, and an
+      // overtaken read closes nothing -- the next Escape asks again. A read
+      // that FAILED could not say whether the file is there: that is a
+      // question for the user, not a silent refusal (a gateway that is down
+      // would otherwise make the tab impossible to close).
+      if (verdict === 'superseded') return
+      // ...and only when there is a copy the answer could protect: an empty
+      // buffer, the seeded "file not found" sentence or a binary tab's empty
+      // text buffer would be told it "may hold the only remaining version" of
+      // nothing.
+      unverified = verdict === 'failed' && bufferIsLastCopy()
+      gone = verdict === 'missing' && bufferIsLastCopy()
+    }
+    const dirtyNow = dirtyRef.current
+    const partialNow = partialCopyRef.current
+    const name = downloadFileName(filePath)
+    // The rescue rides in the dialog: the body names Download and carries it,
+    // so keeping the copy is one click there, not cancel-then-hunt.
+    const rescue = (text: string) => (
+      <span className="flex flex-wrap items-center gap-2">
+        <span>{text}</span>
+        <button type="button" data-testid="markdown-panel-dialog-download" className="px-2.5 h-[26px] rounded-md text-[11.5px] font-medium border border-border bg-transparent text-text hover:bg-bg-hover cursor-pointer transition-colors shrink-0" onClick={downloadLastCopy}>{i18nT('components.markdownPanel.download')}</button>
+      </span>
+    )
+    if (gone) {
+      const body = partialNow
+        ? (dirtyNow ? 'components.markdownPanel.close_partial_copy_dirty_body' : 'components.markdownPanel.close_partial_copy_body')
+        : (dirtyNow ? 'components.markdownPanel.close_last_copy_dirty_body' : 'components.markdownPanel.close_last_copy_body')
+      if (!(await confirm({
+        title: i18nT('components.markdownPanel.close_last_copy'),
+        body: rescue(i18nT(body, { name })),
+        confirmLabel: i18nT('components.markdownPanel.close_last_copy_button'),
+      }))) return
+    } else if (unverified) {
+      if (!(await confirm({
+        title: i18nT('components.markdownPanel.close_unverified'),
+        body: rescue(i18nT(dirtyNow ? 'components.markdownPanel.close_unverified_dirty_body' : 'components.markdownPanel.close_unverified_body', { name })),
+        confirmLabel: i18nT('components.markdownPanel.close_unverified_button'),
+      }))) return
+    } else if (dirtyNow) {
+      // An open comment draft is unsaved work too: closing discards it. The
+      // prompt names what is at risk — file edits take precedence when both are.
+      if (!(await confirm({
+        title: i18nT('components.markdownPanel.discard_unsaved_changes'),
+        confirmLabel: i18nT('components.markdownPanel.discard_changes_button'),
+      }))) return
+    } else if (composerDraftRef.current) {
+      if (!(await confirm({
+        title: i18nT('components.markdownPanel.discard_unsaved_comment'),
+        confirmLabel: i18nT('components.markdownPanel.discard_comment_button'),
+      }))) return
+      clearActiveDraftSlot()
+    }
     onClose()
-  }, [dirty, onClose, confirm])
-  const guardedNavigate = useCallback((nav: (stillClean: () => boolean) => void) => {
+  }, [lastCopy, liveWatch, filePath, adoptDisk, bufferIsLastCopy, downloadLastCopy, onClose, confirm, clearActiveDraftSlot])
+  // Mirrors `lastCopy` for the navigate predicate below, which the host asks
+  // after its own await.
+  const lastCopyRef = useRef(lastCopy)
+  lastCopyRef.current = lastCopy
+  const guardedNavigate = useCallback(async (nav: (stillClean: () => boolean) => void) => {
     // Navigation never destroys this buffer, so there is nothing to confirm: a
     // dirty tab is left exactly as it is and the new file opens as its own tab.
     // Only a CLEAN tab is re-targeted in place. Closing still asks, because
     // closing really does discard.
     //
+    // A tab with an open comment draft is not clean either: re-targeting it
+    // would leave the draft (and the anchor it was resolved against) hanging
+    // over a different file, so the next file opens beside it instead. Nor is
+    // a tab whose buffer is the last copy of a file that is gone: re-targeting
+    // it in place would discard that copy as surely as closing it.
+    //
+    // Whether it IS such a copy is asked of the disk first, the way the close
+    // asks: a file deleted while its tab was on screen has told the panel
+    // nothing (the watch polls on silently), so a clean tab's stored verdict
+    // can be stale, and a re-target on it would discard the only copy with no
+    // word. The read is the close path's own -- one fresh GET, the missing
+    // verdict latched, the buffer left alone -- and a read that could not
+    // answer (failed, or overtaken by typing) spares the tab too: opening
+    // beside costs nothing, discarding on a guess costs the copy.
+    //
     // The predicate is what decides between those two outcomes, and the caller
     // re-asks it after its file read: the user can start typing during the read,
     // so an answer computed here would already be stale.
-    nav(() => !dirtyRef.current)
-  }, [])
+    let unsure = false
+    if (liveWatch && !dirtyRef.current && !composerDraftRef.current && !lastCopyRef.current) {
+      const verdict = await adoptDisk({ quietFailure: true })
+      unsure = verdict !== 'ok' && verdict !== 'missing'
+      if (verdict === 'missing' && bufferIsLastCopy()) unsure = true
+    }
+    nav(() => !unsure && !dirtyRef.current && !composerDraftRef.current && !lastCopyRef.current)
+  }, [liveWatch, adoptDisk, bufferIsLastCopy])
 
   // Expose the guarded close so an external control (e.g. the Files-tab inline
   // preview's "Back to files" bar) routes through the same dirty confirmation
@@ -1646,8 +2457,9 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
   // `requestClose` deliberately swallows guardedClose's promise: the handle's
   // contract is fire-and-forget (() => void), and an imperative caller that
   // received the promise could `act()` on it un-awaited and wedge React's act
-  // scope in tests — the close outcome is observable via onClose only.
-  useImperativeHandle(ref, () => ({ requestClose: () => { void guardedClose() }, requestNavigate: guardedNavigate }), [guardedClose, guardedNavigate])
+  // scope in tests — the close outcome is observable via onClose only. The
+  // same for `requestNavigate`: its outcome is the `nav` call.
+  useImperativeHandle(ref, () => ({ requestClose: () => { void guardedClose() }, requestNavigate: (nav) => { void guardedNavigate(nav) } }), [guardedClose, guardedNavigate])
 
   useEffect(() => {
     const h = (e: KeyboardEvent) => {
@@ -1662,15 +2474,44 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
       // save shortcut must not fire — a mid-dialog Cmd+S would persist the very
       // draft the user is about to confirm discarding.
       if (confirmOpen) return
-      if (e.key === 'Escape') { if (popover) { setPopover(null); clearHighlightMarks() } else if (fullscreen) setFullscreen(false); else guardedClose() }
-      if ((e.metaKey || e.ctrlKey) && e.key === 's' && editing && dirty) { e.preventDefault(); handleSaveRef.current() }
+      // An open annotation box owns Escape: the toolbar closes it (and hands the
+      // selection back) on its own; the panel must not ALSO close or prompt.
+      if (e.key === 'Escape') { if (composerOpenRef.current) return; if (fullscreen) setFullscreen(false); else guardedClose() }
+      // Own the save chord whenever the editor is active, not only when dirty:
+      // the editor-local capture handler in PierreEditorImpl exists only after
+      // its lazy chunk resolves and only sees keydowns targeting its own
+      // subtree, so during the load window this document-level handler is the
+      // one place the chord can be claimed. Match case-insensitively so
+      // Caps Lock / Shift+Cmd+S also count. preventDefault stops AppKit's
+      // default (selecting the word under the cursor); only issue the write
+      // when dirty so a clean buffer does not trigger a redundant save.
+      // Bail if PierreEditorImpl's capture handler already claimed the chord
+      // (defaultPrevented) so the save fires once, not twice.
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 's' && editing && !e.defaultPrevented) {
+        e.preventDefault()
+        if (dirty) handleSaveRef.current()
+      }
     }
     document.addEventListener('keydown', h)
     return () => document.removeEventListener('keydown', h)
-  }, [active, guardedClose, editing, dirty, fullscreen, popover, clearHighlightMarks, confirmOpen])
+  }, [active, guardedClose, editing, dirty, fullscreen, confirmOpen])
 
-  const handleChange = useCallback((v: string) => { onContentChange(v); setDirty(true) }, [onContentChange])
-  const clearPopover = useCallback(() => { setPopover(null); clearHighlightMarks() }, [clearHighlightMarks])
+  // The first edit of a clean buffer fences the disk. A read still in flight
+  // describes a buffer the user has now typed into: if the user saves before it
+  // lands, `dirty` is clear again when it does and it would restamp the
+  // just-saved text with the older revision -- and a read that Refresh had
+  // already overtaken would otherwise leave the catch-up latch at `reading`
+  // with no landing left to move it. Withdrawing the read makes it
+  // `superseded`, which applies nothing and says nothing; `due` makes the next
+  // clean moment -- save, undo or discard -- start a post-edit read. Only the
+  // first edit: while the buffer is dirty the one read that can be in flight
+  // is Cancel's, and Cancel means match the disk. Synchronous with the edit,
+  // before the buffer moves, so no landing can slip between the two.
+  const handleChange = useCallback((v: string) => {
+    editGenRef.current++
+    if (!dirtyRef.current) { diskReadAbortRef.current?.abort(); catchUpRef.current = 'due' }
+    onContentChange(v); setDirty(true)
+  }, [onContentChange])
 
   // Lock body scroll when fullscreen overlay is open
   useEffect(() => {
@@ -1680,7 +2521,7 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
   }, [fullscreen])
 
   const editorToolbarButtons = (<>
-    {!isRichType && (
+    {!isRichType && !showBinaryCard && (
       <button className={`p-1.5 rounded-md border cursor-pointer ${diffMode ? 'border-accent text-accent bg-accent-subtle' : 'border-border text-muted hover:text-text hover:border-border-strong'}`} onClick={toggleDiffMode} title={i18nT('components.markdownPanel.toggle_diff_view')} aria-label={i18nT('components.markdownPanel.toggle_diff_view')}><FileDiff size={14} /></button>
     )}
     {!isRichType && editing && (
@@ -1690,23 +2531,25 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
       <button className={`p-1.5 rounded-md border cursor-pointer transition-all ${lineNums ? 'border-accent text-accent bg-accent-subtle' : 'border-border text-muted hover:text-text hover:border-border-strong'}`} onClick={() => setLineNums(!lineNums)} title={i18nT('components.markdownPanel.toggle_line_numbers')} aria-label={i18nT('components.markdownPanel.toggle_line_numbers')}><Hash size={14} /></button>
     )}
     {canPreview && (
-      <button className={`px-2 py-1 rounded-md text-[12px] font-medium border cursor-pointer transition-all ${editing ? 'border-accent text-accent bg-accent-subtle' : 'border-border text-muted hover:text-text hover:border-border-strong'}`} onClick={() => { setEditing(!editing) }}>{editing ? i18nT('components.markdownPanel.preview') : i18nT('components.markdownPanel.edit')}</button>
+      <button className={`px-2 py-1 rounded-md text-[12px] font-medium border cursor-pointer transition-all ${editing ? 'border-accent text-accent bg-accent-subtle' : 'border-border text-muted hover:text-text hover:border-border-strong'}`} onClick={() => { void guardDraft(() => setEditing(!editing)) }}>{editing ? i18nT('components.markdownPanel.preview') : i18nT('components.markdownPanel.edit')}</button>
     )}
     {!isRichType && editing && (
       <button className={`px-2 py-1 rounded-md text-[12px] font-medium border transition-all disabled:opacity-40 ${dirty ? 'border-accent text-accent-fg bg-accent cursor-pointer hover:bg-accent-hover' : 'border-border text-muted cursor-default'}`} disabled={saving || !dirty} onClick={handleSave}>{saving ? i18nT('components.markdownPanel.saving') : i18nT('components.markdownPanel.save')}</button>
     )}
   </>)
 
-  // Breadcrumb: last two directories + filename (full path in tooltip/copy).
-  const crumbs = breadcrumbSegments(filePath)
   // Diff-mode +N/-N stats over the same original/modified pair the diff view shows.
   const diffStats = useMemo(() => countLines(originalContent, content), [originalContent, content])
   // Snapshot (⋯ menu): capture current content as a new artifact version;
   // unsaved edits are persisted first so the snapshot reflects the screen.
   const handleSnapshot = useCallback(async () => {
+    if (showBinaryCard) {
+      reportActionError(i18nT('components.markdownPanel.binary_file_cannot_be_added'))
+      return
+    }
     if (dirty) await handleSave()
     artifactState.snapshot()
-  }, [dirty, handleSave, artifactState])
+  }, [showBinaryCard, dirty, handleSave, artifactState, reportActionError])
 
   return (
     <>
@@ -1728,18 +2571,9 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
            height auto) with the editor options and Save / Cancel so the
            main bar never crowds. */
         <div className="shrink-0 border-b border-border">
-          <div className="flex items-center gap-2 h-[38px] px-3">
+          <div className="relative flex items-center gap-2 h-[38px] px-3">
             <FileText size={14} className="text-muted shrink-0" />
-            <FilePathMenu filePath={filePath}>
-            <span className="flex items-center min-w-0" title={filePath}>
-              {crumbs.map((c, i) => (
-                <span key={i} className="flex items-center min-w-0 text-[12px]">
-                  {i > 0 && <ChevronRight size={14} className="text-muted opacity-60 shrink-0 mx-0.5" />}
-                  <span className={`truncate ${c.isFile ? 'text-text-strong font-medium' : 'text-muted'}`}>{c.seg}</span>
-                </span>
-              ))}
-            </span>
-            </FilePathMenu>
+            <FileHeaderBreadcrumb filePath={filePath} />
             {diffMode && !diffUnavailable && (diffStats.added > 0 || diffStats.removed > 0) && (
               <span className="text-[11px] font-mono font-semibold shrink-0">
                 {diffStats.added > 0 && <span className="text-ok">+{diffStats.added}</span>}
@@ -1747,7 +2581,7 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
               </span>
             )}
             <span className="flex-1 min-w-[8px]" />
-            <FileArtifactActionButton state={artifactState} />
+            {!showBinaryCard && <FileArtifactActionButton state={artifactState} />}
             {(() => {
               const kExt = '.' + (filePath.split('.').pop() || '').toLowerCase()
               const canK = knowledge.formats && knowledge.formats.includes(kExt)
@@ -1757,11 +2591,11 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
             {canPreview && (
               <button
                 className="px-2.5 h-[26px] rounded-md text-[11.5px] font-medium text-muted hover:text-text hover:bg-bg-hover bg-transparent border-none cursor-pointer transition-colors shrink-0"
-                onClick={() => setEditing(!editing)}
+                onClick={() => { void guardDraft(() => setEditing(!editing)) }}
                 aria-pressed={editing}
               >{editing ? i18nT('components.markdownPanel.preview') : i18nT('components.markdownPanel.edit')}</button>
             )}
-            {!isRichType && (
+            {!isRichType && !showBinaryCard && (
               <button className={barIconBtn(diffMode)} onClick={toggleDiffMode} title={i18nT('components.markdownPanel.toggle_diff_view')} aria-label={i18nT('components.markdownPanel.toggle_diff_view')} aria-pressed={diffMode}><FileDiff size={14} /></button>
             )}
             {onRailToggle && (
@@ -1773,10 +2607,10 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
                 aria-pressed={!!railOpen}
               ><Folders size={14} /></button>
             )}
-            <OverflowMenu filePath={filePath} content={content}
+            <OverflowMenu filePath={filePath} content={content} onError={reportActionError} onDownload={lastCopy ? downloadLastCopy : undefined}
               onRefresh={handleRefresh} refreshDisabled={refreshing || dirty} refreshTitle={dirty ? i18nT('components.markdownPanel.save_or_discard_changes_first') : i18nT('components.markdownPanel.refresh_file_re_read_from_disk')}
-              onFullscreen={() => setFullscreen(f => !f)} fullscreen={fullscreen}
-              onSnapshot={artifactState.existing ? handleSnapshot : undefined} snapshotting={artifactState.snapshotting}
+              onFullscreen={() => { void guardDraft(() => setFullscreen(f => !f)) }} fullscreen={fullscreen}
+              onSnapshot={artifactState.existing && !showBinaryCard ? handleSnapshot : undefined} snapshotting={artifactState.snapshotting}
               wordWrap={wordWrap} onToggleWordWrap={() => setWordWrap(!wordWrap)}
               lineNums={lineNums} onToggleLineNums={() => setLineNums(!lineNums)}
               collapseUnchanged={collapseUnchanged} onToggleCollapseUnchanged={() => setCollapseUnchanged(!collapseUnchanged)}
@@ -1786,7 +2620,7 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
         </div>
       }
     >
-      {saveError && <div className="text-[11px] text-danger">{saveError}</div>}
+      {panelNotices}
       {/* Comment hint for markdown files */}
       {isMarkdown && !editing && onSubmitComments && !hintDismissed && (
         <CommentHint onDismiss={dismissHint} />
@@ -1815,16 +2649,18 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
               </div>
             </div>
           </div>
+          {lastCopy && <MissingFileBanner onDownload={downloadLastCopy} onCopy={() => { void copyLastCopy() }} copied={lastCopyCopied} partial={partialCopy} />}
           {/* In markdown preview the scroll box runs flush to the panel's right
               border so the overlay scrollbar and outline rail share that edge;
               pr-6 keeps the text clear of the ticks. */}
           <div ref={sidePanelScrollRef} onScroll={scrollMemory.onScroll} className={`flex-1 min-h-0 overflow-auto ${isMarkdown && !editing ? 'scrollbar-overlay pr-6' : ''}`}>
-            {zeroDiff && <ZeroDiffNotice onExitDiff={toggleDiffMode} />}
-            {diffUnavailableText && !editing && <ZeroDiffNotice message={diffUnavailableText} onExitDiff={toggleDiffMode} />}
-            {!zeroDiff && !diffUnavailable && !diffChecking && !isRichType && (
+            {showBinaryCard && <BinaryFileCard filePath={filePath} />}
+            {!showBinaryCard && zeroDiff && <ZeroDiffNotice onExitDiff={toggleDiffMode} />}
+            {!showBinaryCard && diffUnavailableText && !editing && <ZeroDiffNotice message={diffUnavailableText} onExitDiff={toggleDiffMode} />}
+            {!showBinaryCard && !zeroDiff && !diffUnavailable && !diffChecking && !isRichType && (
               <DiffViewBlock flush sideBySide={diffSplit} diffMode={diffMode && !editing} fileName={fileName} originalContent={originalContent} content={content} lineNums={lineNums} wordWrap={wordWrap} collapseUnchanged={collapseUnchanged} />
             )}
-            {!zeroDiff && (!diffUnavailable || editing) && (!diffMode || editing) && <ContentRenderer flush isRichType={isRichType} fileType={fileType} filePath={filePath} content={content} editing={editing} lang={lang} lineNums={lineNums} wordWrap={wordWrap} onChange={handleChange} onSave={handleSave}
+            {!showBinaryCard && !zeroDiff && (!diffUnavailable || editing) && (!diffMode || editing) && <ContentRenderer flush isRichType={isRichType} fileType={fileType} filePath={filePath} content={content} editing={editing} lang={lang} lineNums={lineNums} wordWrap={wordWrap} onChange={handleChange} onSave={handleSave}
               diffBase={diffMode && editing ? (originalContent || null) : undefined} diffSplit={diffSplit} diffExpandUnchanged={!collapseUnchanged}
               previewRef={previewRef} displayContent={displayContent} isMarkdown={isMarkdown} markdownClassName="msg-content text-sm leading-relaxed" editorRef={setRevealEditor} />}
           </div>
@@ -1840,8 +2676,11 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
             : browserRail
         )}
       </div>
-      {!fullscreen && !editing && <SelectionToolbar containerRef={sidePanelScrollRef} actions={selectionActions} />}
-      {!fullscreen && <CommentOverlayBlock popover={popover} addComment={addComment} setPopover={clearPopover} onSubmitComments={onSubmitComments} comments={comments} editComment={editComment} removeComment={removeComment} submitAllComments={submitAllComments} connected={connected} />}
+      {/* Keyed by file: a re-target of this tab (e.g. a slot switch) must not
+          carry an open composer — and the anchor it resolved against the OLD
+          file — over to the new one. Remount drops it and fires onClose. */}
+      {!fullscreen && !editing && <SelectionToolbar key={filePath} containerRef={sidePanelScrollRef} actions={selectionActions} composer={selectionComposer} suspended={!active} />}
+      {!fullscreen && <CommentOverlayBlock onSubmitComments={onSubmitComments} comments={comments} editComment={editComment} removeComment={removeComment} submitAllComments={submitAllComments} connected={connected} />}
     </DetailPanel>
     {fullscreen && createPortal(
       // The onKeyDown here implements a focus trap for the modal dialog; a
@@ -1877,7 +2716,7 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
           <span className="text-base font-semibold text-text-strong truncate">{fileName}</span>
           <div className="flex items-center gap-1.5">
             <button className="p-1.5 rounded-md border border-border text-muted hover:text-text hover:border-border-strong cursor-pointer transition-all disabled:opacity-40" onClick={handleRefresh} disabled={refreshing || dirty} title={dirty ? i18nT('components.markdownPanel.save_or_discard_changes_first') : i18nT('components.markdownPanel.refresh_file')} aria-label={i18nT('components.markdownPanel.refresh_file')}><RefreshCw size={14} className={refreshing ? 'animate-spin' : ''} /></button>
-            <FileArtifactActionButton state={artifactState} />
+            {!showBinaryCard && <FileArtifactActionButton state={artifactState} />}
             {(() => {
               const ext = '.' + (filePath.split('.').pop() || '').toLowerCase()
               const canK = knowledge.formats && knowledge.formats.includes(ext)
@@ -1885,27 +2724,29 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
               return <KnowledgeToggleIconButton state={knowledge} />
             })()}
             {editorToolbarButtons}
-            <OverflowMenu filePath={filePath} content={content} />
-            <button className="p-1.5 rounded-md border border-border text-muted hover:text-text hover:border-border-strong cursor-pointer transition-all" onClick={() => setFullscreen(false)} title={i18nT('components.markdownPanel.exit_full_screen_esc')} aria-label={i18nT('components.markdownPanel.exit_full_screen')}><Minimize2 size={14} /></button>
+            <OverflowMenu filePath={filePath} content={content} onError={reportActionError} onDownload={lastCopy ? downloadLastCopy : undefined} />
+            <button className="p-1.5 rounded-md border border-border text-muted hover:text-text hover:border-border-strong cursor-pointer transition-all" onClick={() => { void guardDraft(() => setFullscreen(false)) }} title={i18nT('components.markdownPanel.exit_full_screen_esc')} aria-label={i18nT('components.markdownPanel.exit_full_screen')}><Minimize2 size={14} /></button>
           </div>
         </div>
-        {saveError && <div className="px-16 text-[11px] text-danger">{saveError}</div>}
+        {panelNotices && <div className="px-16">{panelNotices}</div>}
         {isMarkdown && !editing && onSubmitComments && !hintDismissed && <div className="px-16"><CommentHint onDismiss={dismissHint} /></div>}
+        {lastCopy && <div className="px-4 sm:px-16"><MissingFileBanner onDownload={downloadLastCopy} onCopy={() => { void copyLastCopy() }} copied={lastCopyCopied} partial={partialCopy} /></div>}
         {/* Body */}
         <div data-mc-mdpanel className="relative flex-1 overflow-hidden min-h-0">
           {findBar}
           <div ref={fullscreenBodyRef} className="h-full overflow-auto px-16 py-4">
-            {zeroDiff && <ZeroDiffNotice onExitDiff={toggleDiffMode} />}
-            {diffUnavailableText && !editing && <ZeroDiffNotice message={diffUnavailableText} onExitDiff={toggleDiffMode} />}
-            {!zeroDiff && !diffUnavailable && !isRichType && <DiffViewBlock sideBySide={diffSplit} diffMode={diffMode && !editing} fileName={fileName} originalContent={originalContent} content={content} lineNums={lineNums} wordWrap={wordWrap} collapseUnchanged={collapseUnchanged} />}
-            {!zeroDiff && (!diffUnavailable || editing) && (!diffMode || editing) && <ContentRenderer isRichType={isRichType} fileType={fileType} filePath={filePath} content={content} editing={editing} lang={lang} lineNums={lineNums} wordWrap={wordWrap} onChange={handleChange} onSave={handleSave}
+            {showBinaryCard && <BinaryFileCard filePath={filePath} />}
+            {!showBinaryCard && zeroDiff && <ZeroDiffNotice onExitDiff={toggleDiffMode} />}
+            {!showBinaryCard && diffUnavailableText && !editing && <ZeroDiffNotice message={diffUnavailableText} onExitDiff={toggleDiffMode} />}
+            {!showBinaryCard && !zeroDiff && !diffUnavailable && !isRichType && <DiffViewBlock sideBySide={diffSplit} diffMode={diffMode && !editing} fileName={fileName} originalContent={originalContent} content={content} lineNums={lineNums} wordWrap={wordWrap} collapseUnchanged={collapseUnchanged} />}
+            {!showBinaryCard && !zeroDiff && (!diffUnavailable || editing) && (!diffMode || editing) && <ContentRenderer isRichType={isRichType} fileType={fileType} filePath={filePath} content={content} editing={editing} lang={lang} lineNums={lineNums} wordWrap={wordWrap} onChange={handleChange} onSave={handleSave}
               diffBase={diffMode && editing ? (originalContent || null) : undefined} diffSplit={diffSplit} diffExpandUnchanged={!collapseUnchanged}
               previewRef={fullscreenPreviewRef} displayContent={displayContent} isMarkdown={isMarkdown} previewStyle={mdPreviewStyle} editorRef={setRevealEditor} />}
           </div>
           {isMarkdown && !editing && <MarkdownOutlineRail containerRef={fullscreenBodyRef} />}
         </div>
-        {!editing && <SelectionToolbar containerRef={fullscreenBodyRef} actions={selectionActions} />}
-        <CommentOverlayBlock popover={popover} addComment={addComment} setPopover={clearPopover} onSubmitComments={onSubmitComments} comments={comments} editComment={editComment} removeComment={removeComment} submitAllComments={submitAllComments} connected={connected} scrollRef={fullscreenBodyRef} />
+        {!editing && <SelectionToolbar key={filePath} containerRef={fullscreenBodyRef} actions={selectionActions} composer={selectionComposer} suspended={!active} />}
+        <CommentOverlayBlock onSubmitComments={onSubmitComments} comments={comments} editComment={editComment} removeComment={removeComment} submitAllComments={submitAllComments} connected={connected} />
         {/* Footer */}
         <Clickable className="shrink-0 flex items-center px-3 h-6 text-[11px] text-muted font-mono truncate cursor-pointer hover:text-text transition-colors" title={i18nT('components.markdownPanel.click_to_copy_path')} onClick={() => copyToClipboard(filePath)}>{filePath}</Clickable>
       </div>,

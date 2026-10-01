@@ -38,12 +38,17 @@ from kiro_crew.apps.builtins.design_tweak.backend import (
 )
 from kiro_crew.apps.proxy_auth import verify_proxy_request
 from kiro_crew.hooks import FileTooLargeError, safe_read_file_bytes_nolink
+from kiro_crew.platform.context import redact_via_context
 from kiro_crew.platform_compat import (
     CREATE_NEW_PROCESS_GROUP,
+    IS_MACOS,
     IS_POSIX,
     SIGKILL,
     SIGTERM,
+    address_covers_loopback,
+    find_port_listeners,
     get_ppid,
+    is_link_or_junction,
     kill_process_tree,
     trusted_system_bin,
 )
@@ -67,11 +72,13 @@ _RUNTIME_COMPAT_IMPORTS = (
     SIGKILL,
     SIGTERM,
     _html,
+    address_covers_loopback,
     cast,
     get_credential_patterns,
     get_ppid,
     glob,
     http.client,
+    is_link_or_junction,
     is_sensitive_path,
     kill_process_tree,
     parse_qs,
@@ -151,7 +158,11 @@ else:
 
 QUEUE_DIR = DATA_DIR / "queue"
 HANDLED_DIR = DATA_DIR / "handled"
-CONFIG_FILE = DATA_DIR / "config.json"
+# The project registry lives at ``DATA_DIR / "config.json"`` and is resolved on
+# every access (``request_state.config_file``), never frozen into a constant: a
+# caller that repoints ``DATA_DIR`` to an isolated directory -- the way this
+# module is sandboxed -- must have registry writes follow it, not land under the
+# ``DATA_DIR`` captured at import.
 # Directory creation stays in main(); imports are side-effect-free and never
 # touch the operator's real data home.
 
@@ -208,7 +219,7 @@ MAX_DRAFT_COMMENTS = 200
 MAX_THREAD_ENTRIES = 500
 # On-disk ceiling for ONE queue record. The SAME number gates the write and the
 # read deliberately: a record the writer accepts but the reader refuses is a
-# draft the user can no longer see, and silently losing queued work is worse than
+# draft the user cannot see, and silently losing queued work is worse than
 # refusing the append that would have caused it. Kept distinct from
 # `MAX_BODY_BYTES` (which bounds ONE inbound payload) because a record
 # accumulates many payloads over its life — they are equal today, and conflating
@@ -260,11 +271,33 @@ _CHILD_ENV_STRIP_PREFIXES = dev_preview.CHILD_ENV_STRIP_PREFIXES
 _LOCKFILES = dev_preview.LOCKFILES
 _DEV_SCRIPTS = dev_preview.DEV_SCRIPTS
 _PROC_TREE_MAX_DEPTH = dev_preview.PROC_TREE_MAX_DEPTH
+_LOG_TAIL_BYTES = dev_preview.LOG_TAIL_BYTES
+_LOG_PORT_LIMIT = dev_preview.LOG_PORT_LIMIT
+_ANSI_RE = dev_preview.ANSI_RE
+_LOG_URL_RE = dev_preview.LOG_URL_RE
 
 _HEADER_NAME_RE = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
 _LSOF_TIMEOUT = 4
 _PROBE_TIMEOUT = 1.5
 _START_TIMEOUT = 45
+_DEV_LOG_TAIL_CHARS = 800
+# Read at most this many bytes from the END of the log into one buffer, then
+# redact that whole buffer in a single pass. The window bounds memory yet is far
+# wider than the retained tail, so a credential whose opening anchor (e.g. a PEM
+# ``-----BEGIN ... PRIVATE KEY-----`` header) sits above the tail is still in the
+# buffer the redactor sees. A single-pass redaction has no chunk seam a secret
+# could straddle to escape scrubbing.
+_DEV_LOG_READ_WINDOW = 64 * 1024
+# PEM private-key markers for detecting a key body bisected by the window
+# start (an END with no preceding BEGIN inside the window). Mirrors the header
+# shape the redaction floor anchors on: any "-----BEGIN/END ... PRIVATE KEY-----".
+_PEM_BEGIN_RE = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")
+_PEM_END_RE = re.compile(r"-----END [A-Z ]*PRIVATE KEY-----")
+# A line that is nothing but PEM/base64 key-body material: the base64 charset
+# ([A-Za-z0-9+/=]) with no spaces. Matches the anchorless body of a key whose
+# BEGIN header sat above a mid-file window start, when no END marker falls
+# inside the window for the END-masking to catch.
+_PEM_BODY_LINE_RE = re.compile(r"[A-Za-z0-9+/=]+")
 _STOP_GRACE = 3
 _RELAY_TIMEOUT = 30
 _WS_IDLE = 3600
@@ -419,14 +452,10 @@ def _sanitize_selection_sources(sel_obj: Any, root: str) -> None:
 
 
 def _read_request(fp: Path) -> dict | None:
-    """Read only after the MAX_RECORD_BYTES st_size gate, before read_text."""
-
     return request_state.read_request(runtime, fp)
 
 
 def _write_request(fp: Path, req: dict) -> None:
-    """Publish through the shared chokepoint with max_bytes=MAX_RECORD_BYTES."""
-
     return request_state.write_request(runtime, fp, req)
 
 
@@ -521,8 +550,6 @@ def _static_response(
     base: str,
     script: str = INJECT_PUBLIC,
 ) -> tuple[int, str, bytes]:
-    """Serve only after containment and the _is_kirocrew_internal policy floor."""
-
     return preview_files.static_response(runtime, root_str, rel, base, script)
 
 
@@ -576,12 +603,34 @@ def _lsof_fields(args: list[str]) -> list[dict]:
     return out
 
 
+def _tcp_listeners(port: int) -> list[Any]:
+    """Enumerate LISTEN sockets on one TCP port through the shared primitive.
+
+    Kept in the composition root because it is an audited process sink like
+    ``_lsof_fields``: ``platform_compat.find_port_listeners`` shells out to the
+    platform's own tool (``lsof`` on POSIX, in-box ``netstat`` on Windows) and
+    already owns the hard parts — the OEM console codepage, locale-independent
+    LISTEN detection, and telling a v4 wildcard bind from a v6-only one.  This
+    app must not grow a second copy of that parse.
+    """
+
+    return find_port_listeners(port)
+
+
 def _loopback_listeners() -> dict[int, int]:
     return dev_preview.loopback_listeners(runtime)
 
 
 def _cwd_for_pids(pids: list[int]) -> dict[int, str]:
     return dev_preview.cwd_for_pids(runtime, pids)
+
+
+def _dev_log_ports(log_path: str) -> list[int]:
+    return dev_preview.dev_log_ports(runtime, log_path)
+
+
+def _owned_listener(log_path: str, root_pid: int, pgid: int | None) -> dict | None:
+    return dev_preview.owned_listener(runtime, log_path, root_pid, pgid)
 
 
 def _serves_html(port: int) -> bool:
@@ -629,7 +678,6 @@ def _start_inject_proxy(dev_url: str) -> tuple[object | None, str]:
 
 
 def _front_with_proxy(project_id: str, dev_url: str) -> str:
-    # The boundary's bind-failure result is `return ""`; never expose upstream.
     return dev_preview.front_with_proxy(runtime, project_id, dev_url)
 
 
@@ -652,6 +700,104 @@ def _in_proc_tree(pid: int, root_pid: int, pgid: int | None) -> bool:
 class _DevProxyHandler(dev_preview.DevProxyHandlerBase):
     runtime = runtime
     timeout = _CLIENT_READ_TIMEOUT
+
+
+def _read_dev_log_tail(log: Path) -> str:
+    """Return the bounded, redacted diagnostic tail of a failed dev-server launch.
+
+    Read at most ``_DEV_LOG_READ_WINDOW`` bytes from the END of the log into one
+    buffer, redact that whole buffer in a single ``redact_via_context`` pass so a
+    loaded companion's credential policy applies, then keep the last
+    ``_DEV_LOG_TAIL_CHARS`` characters. The window bounds memory while
+    staying far wider than the retained tail.
+
+    When the log is larger than the window the read starts mid-file, so the
+    window's own start is UNTRUSTED: it can slice through a credential, orphaning
+    a secret's body from the opening anchor the redactor keys on. A ``-----BEGIN
+    ... PRIVATE KEY-----`` header that sat before the window leaves an anchorless
+    key body at the window start that the header-anchored redactor would miss.
+    So on a truncated read the partial first line is dropped and, if a
+    ``-----END ... PRIVATE KEY-----`` marker appears with no preceding ``BEGIN``
+    inside the window, everything up to and including that END (the bisected key
+    body) is masked before redaction. Redacting in one pass over what remains
+    leaves no boundary a secret could straddle to escape scrubbing.
+    """
+
+    try:
+        with log.open("rb") as handle:
+            size = handle.seek(0, os.SEEK_END)
+            start = max(0, size - _DEV_LOG_READ_WINDOW)
+            handle.seek(start)
+            # Cap the read LENGTH, not just its start: a descendant that
+            # inherited the log fd can keep appending after the parent exits, so
+            # an unsized read() would follow the file to its live EOF and defeat
+            # the bound. Reading at most _DEV_LOG_READ_WINDOW bytes keeps memory
+            # bounded regardless.
+            window = handle.read(_DEV_LOG_READ_WINDOW).decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+    if start > 0:
+        window = _drop_truncated_window_head(window)
+    return redact_via_context(window)[-_DEV_LOG_TAIL_CHARS:]
+
+
+def _drop_truncated_window_head(window: str) -> str:
+    """Discard the untrusted head of a window that began mid-file.
+
+    The first line is partial (the read cut into it). Beyond it, a key whose
+    ``BEGIN`` header sat above the window start leaves an anchorless body the
+    header-anchored redactor cannot scrub. Two guards remove it: drop through
+    the partial first line and every leading PEM/base64 body line, then mask
+    through the first ``-----END ... PRIVATE KEY-----`` marker. The leading-body
+    drop is what closes the case where NO END marker falls inside the window (so
+    the END-mask never fires); the END-mask additionally covers a later full PEM.
+    No orphaned key body survives into the redacted tail in either case.
+    """
+
+    # Drop the whole first line unconditionally. On a mid-file read the first
+    # line is normally a fragment the seek bisected, so it is discarded. When the
+    # seek happens to land exactly on a line boundary this drops one intact line
+    # too — that is deliberate and cheap: at worst one non-secret diagnostic line
+    # is lost from a bounded tail, and paying it always keeps this guard simple
+    # rather than reconstructing whether the preceding byte was a newline.
+    newline = window.find("\n")
+    if newline != -1:
+        window = window[newline + 1 :]
+    # Then drop the LEADING run of PEM/base64 key-body lines — only the base64
+    # charset ([A-Za-z0-9+/=]), no spaces — but ONLY when that run is TWO OR MORE
+    # consecutive such lines. A wrapped PEM key body is always multi-line (PEM
+    # wraps base64 at 64 chars), so a run of ≥2 base64-only lines at the head of a
+    # mid-file window is the anchorless body of a key whose ``BEGIN`` header sat
+    # above the window start — and when NO ``-----END ... PRIVATE KEY-----`` marker
+    # falls inside the window the END-masking below never fires, so those body
+    # lines would otherwise reach the redactor and a later labeled secret shrinking
+    # under redaction could leave them in the retained tail. Requiring ≥2 lines is
+    # what keeps a single legitimate base64-charset diagnostic line (a hash, an id,
+    # a long token) from being discarded. Dropping the run closes the no-END case
+    # regardless of any END; it costs at most a run of non-secret base64-shaped
+    # diagnostic lines from a bounded tail.
+    lines = window.split("\n")
+    run = 0
+    for line in lines:
+        stripped = line.strip()
+        if stripped and _PEM_BODY_LINE_RE.fullmatch(stripped):
+            run += 1
+            continue
+        break
+    if run >= 2:
+        window = "\n".join(lines[run:])
+    # Mask through the first END marker in the window. On a mid-file read the
+    # region before that END is untrusted: it is either the anchorless body of a
+    # key whose BEGIN header sat above the window start, or a self-contained PEM
+    # the redactor would scrub anyway — so discarding it never loses legitimate
+    # content, while keeping it can leak an orphaned key body. Masking through
+    # the FIRST END unconditionally is why a later ``BEGIN`` cannot re-expose the
+    # bisected body: a preceding-BEGIN test would skip the mask exactly when an
+    # orphan body is followed by a fresh full PEM.
+    end = _PEM_END_RE.search(window)
+    if end is not None:
+        window = window[end.end() :]
+    return window
 
 
 def _start_dev_proc(project_id: str, root: Path) -> dict:
@@ -734,35 +880,48 @@ def _start_dev_proc(project_id: str, root: Path) -> dict:
     deadline = time.time() + _START_TIMEOUT
     while time.time() < deadline:
         if proc.poll() is not None:
-            tail = ""
-            try:
-                tail = log.read_text("utf-8", errors="replace")[-800:]
-            except OSError:
-                pass
+            tail = _read_dev_log_tail(log)
             _DEV_PROCS.pop(project_id, None)
             return {
                 "ok": False,
                 "error": f"`{' '.join(cmd)}` exited ({proc.returncode}).",
                 "log": tail,
             }
-        for candidate in _detect_dev_servers(root, probe=False):
-            if candidate["pid"] == proc.pid or _in_proc_tree(candidate["pid"], proc.pid, pgid):
-                _DEV_PROCS[project_id]["url"] = candidate["url"]
-                framed = _front_with_proxy(project_id, candidate["url"])
-                return {
-                    "ok": True,
-                    "url": framed,
-                    "devUrl": candidate["url"],
-                    "port": candidate["port"],
-                    "injected": bool(framed) and framed != candidate["url"],
-                }
+        # Two discovery channels, historical one first. `_detect_dev_servers`
+        # matches on port -> pid -> working directory and stays authoritative
+        # wherever it can answer. `_owned_listener` covers the hosts where it
+        # structurally cannot — Windows has no pid -> cwd source in this repo, and
+        # neither does a POSIX box without `lsof`. There the old single-channel
+        # loop ran the full timeout, then `_stop_dev_proc` KILLED a perfectly
+        # healthy dev server and reported it as never having started.
+        candidate = next(
+            (
+                found
+                for found in _detect_dev_servers(root, probe=False)
+                if found["pid"] == proc.pid or _in_proc_tree(found["pid"], proc.pid, pgid)
+            ),
+            None,
+        )
+        if candidate is None:
+            candidate = _owned_listener(str(log), proc.pid, pgid)
+        if candidate is not None:
+            _DEV_PROCS[project_id]["url"] = candidate["url"]
+            framed = _front_with_proxy(project_id, candidate["url"])
+            return {
+                "ok": True,
+                "url": framed,
+                "devUrl": candidate["url"],
+                "port": candidate["port"],
+                "injected": bool(framed) and framed != candidate["url"],
+            }
         time.sleep(0.4)
 
     _stop_dev_proc(project_id)
-    return {
+    result: dict[str, Any] = {
         "ok": False,
         "error": f"`{' '.join(cmd)}` did not start listening within {_START_TIMEOUT}s.",
     }
+    return result
 
 
 class Handler(http_api.Handler):
@@ -771,7 +930,12 @@ class Handler(http_api.Handler):
     def _h_pick_folder(self) -> None:
         """Open the trusted macOS native folder picker."""
 
-        if _sys.platform != "darwin":
+        if not IS_MACOS:
+            # Honest degradation rather than a dead end: the panel's manual path
+            # field registers a project identically, so this refuses on every
+            # non-macOS host rather than only where the native chooser is absent.
+            # This is the path Linux has always taken; Windows now joins it rather
+            # than being excluded over it.
             return self._json(501, {"error": "native picker is macOS-only"})
         if not _PICK_LOCK.acquire(blocking=False):
             return self._json(409, {"error": "a folder picker is already open"})
@@ -815,12 +979,31 @@ class Handler(http_api.Handler):
 atexit.register(_stop_all_dev_procs)
 
 
+class _Server(ThreadingHTTPServer):
+    """The listener, with the address-reuse flag bound to the platform.
+
+    ``http.server.HTTPServer`` hardcodes ``allow_reuse_address = 1``, and that flag
+    does not mean the same thing on both families. On POSIX it only waives
+    TIME_WAIT so a restart can rebind. On Windows ``SO_REUSEADDR`` additionally
+    lets a socket bind an address that already has a LIVE listener, so a second
+    Design Tweak backend on ``PORT`` would bind successfully and the two would
+    split incoming requests instead of one failing.
+
+    The gateway detects a port collision by checking that the spawned child died on
+    its initial bind (``kiro_crew/apps/backend.py``), which only works while the
+    bind is actually allowed to fail. So the flag is off on Windows and EADDRINUSE
+    is permitted to surface. This mirrors the workflows backend's ``_Server``.
+    """
+
+    allow_reuse_address = IS_POSIX
+
+
 def main() -> int:
     """Create data directories and run the loopback HTTP server."""
 
     QUEUE_DIR.mkdir(parents=True, exist_ok=True)
     HANDLED_DIR.mkdir(parents=True, exist_ok=True)
-    server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+    server = _Server(("127.0.0.1", PORT), Handler)
     print(f"[{APP_NAME}] listening on http://127.0.0.1:{PORT}  data={DATA_DIR}")
     try:
         server.serve_forever()

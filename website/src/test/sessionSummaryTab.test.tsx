@@ -73,7 +73,7 @@ function payload(over: Partial<SessionSummary> = {}): SessionSummary {
 }
 
 /** SlotState is not exported from chatSlice, so the union is restated here.
- *  Keep it in step with `SlotState` in `website/src/store/chatSlice.ts`. */
+ *  Keep it in step with `SlotState` (`state.ts` in `website/src/store/chat`). */
 type StreamState = 'idle' | 'streaming' | 'tool_running' | 'stopping' | 'compacting'
 
 /** The panel subscribes to the store for the live-turn signal
@@ -894,7 +894,7 @@ describe('cost discipline', () => {
 
 describe('theme tokens', () => {
   it('paints its two pinned bars with real surface tokens', () => {
-    // A Tailwind utility only exists if its key is MAPPED in tailwind.config.js.
+    // A Tailwind utility only exists if its key is MAPPED in src/tailwind-theme.css.
     // `--panel` / `--panel-strong` are defined in index.css but never mapped, so
     // `bg-panel` and `bg-panel-strong` compile to nothing and the element paints
     // the colour behind it — which is invisible in code review and, on a dark

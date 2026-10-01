@@ -40,6 +40,7 @@ vi.mock('../../store/chatSlice', () => ({
   // `keepTargetOnMissing` decides whether a 404 unwinds to the previous slot.
   switchSlot: (arg: string | { key: string; keepTargetOnMissing?: boolean }) =>
     typeof arg === 'string' ? { type: 'switchSlot', key: arg } : { type: 'switchSlot', ...arg },
+  requestFolderReveal: (folderId: string) => ({ type: 'requestFolderReveal', folderId }),
 }))
 vi.mock('../../components/commandPalette/paletteActions', () => ({
   usePaletteActions: () => ({ navigate, enterInsertOrNewSession, newSessionWithToken }),
@@ -61,6 +62,14 @@ vi.mock('../../hooks/useVisualViewport', () => ({ useVisualViewport: () => ({ he
 vi.mock('../../hooks/useDialogFocusTrap', () => ({ useDialogFocusTrap: () => {} }))
 const cycleTheme = vi.fn()
 vi.mock('../../hooks/useTheme', () => ({ useTheme: () => ({ cycle: cycleTheme }) }))
+// Only the filing call is stubbed — it talks to the folder API. `commandFolderName`
+// stays REAL: it decides what the folder is called, which is exactly what these tests
+// assert, and a stub would let them agree with themselves.
+const fileSessionInCommandFolder = vi.fn(async () => 'folder-1')
+vi.mock('./sessionFolder', async importOriginal => ({
+  ...(await importOriginal<typeof import('./sessionFolder')>()),
+  fileSessionInCommandFolder: (...args: unknown[]) => fileSessionInCommandFolder(...(args as [])),
+}))
 
 /** Resolve the promise `createSlot` dispatch is expected to produce. */
 const resolvingDispatch = () => dispatch.mockReturnValue({ unwrap: () => Promise.resolve('slot-1') })
@@ -164,16 +173,21 @@ describe('CommandBarOverlay rows', () => {
   })
 
   it('renders settings subtitles that tell same-label rows apart', () => {
-    // Two `Speed` selects live in the Voice tab, distinguished in the registry only
-    // by their description. A tab-only subtitle renders them identically, which is
-    // the shipped defect: the user cannot tell which row they are choosing. The tab
-    // name must also be localized, never a raw machine key like `computer-use`.
+    // Several `Speed` selects live in the Voice tab, one per TTS provider,
+    // distinguished in the registry only by their description. A tab-only
+    // subtitle renders them identically, which is the shipped defect: the user
+    // cannot tell which row they are choosing. The tab name must also be
+    // localized, never a raw machine key like `computer-use`.
+    //
+    // The count is derived, not pinned: adding a provider adds a row, and a
+    // literal here would fail for that rather than for a lost subtitle. What
+    // must hold is one DISTINCT subtitle per duplicate row, whatever the count.
     mount()
     fireEvent.change(screen.getByRole('combobox'), { target: { value: 'speed' } })
     const dupes = SETTINGS_REGISTRY.filter(e => e.label === 'Speed' && e.tab === 'voice')
-    expect(dupes.length).toBe(2)
+    expect(dupes.length).toBeGreaterThan(1)
     const subtitles = dupes.map(e => settingsSubtitle(e))
-    expect(new Set(subtitles).size).toBe(2)
+    expect(new Set(subtitles).size).toBe(dupes.length)
     for (const s of subtitles) {
       expect(s).toContain(settingsTabLabel('voice'))
       expect(screen.getByText(s)).toBeTruthy()
@@ -307,7 +321,7 @@ describe('CommandBarOverlay rows', () => {
     // the App Store, find the app and disable it by hand.
     const onClose = mount()
     fireEvent.change(screen.getByRole('combobox'), { target: { value: 'zzzznomatch' } })
-    const hint = await screen.findByText(/disable Command Bar in the App Store/)
+    const hint = await screen.findByText(/turn full search back on/)
     fireEvent.mouseDown(hint.closest('[role="option"]') as HTMLElement)
     expect(navigate).toHaveBeenCalledWith('/apps/detail/command-bar')
     expect(onClose).toHaveBeenCalled()
@@ -324,10 +338,10 @@ describe('CommandBarOverlay rows', () => {
         screen.getAllByRole('option').some(o => o.textContent?.includes('Toggle Theme')),
       ).toBe(true),
     )
-    expect(screen.queryByText(/disable Command Bar in the App Store/)).toBeNull()
+    expect(screen.queryByText(/turn full search back on/)).toBeNull()
     // With nothing matched, the dead end is real and the row appears.
     fireEvent.change(input, { target: { value: 'zzzznomatch' } })
-    expect(await screen.findByText(/disable Command Bar in the App Store/)).toBeTruthy()
+    expect(await screen.findByText(/turn full search back on/)).toBeTruthy()
   })
 
   it('Escape dismisses from a focusable sibling, not only from the input', async () => {
@@ -453,6 +467,57 @@ describe('CommandBarOverlay rows', () => {
     await waitFor(() => expect(sessionSearch.mock.calls.length).toBeGreaterThan(before))
   })
 
+  it('refuses a STALE Enter, so a fast typist never opens the wrong session', async () => {
+    // Every scoped view ranks from the DEBOUNCED query, so for one debounce interval
+    // after a keystroke its rows answer the previous query, and an Enter in that window
+    // acts on the row selected against it. Reported in the crewmates view; the guard is
+    // on the activation path all four views share, so each one pins it.
+    const openAlpha = vi.fn()
+    const openBeta = vi.fn()
+    const hit = (title: string, onActivate: () => void) => ({
+      id: `sessions:${title}`,
+      providerId: 'sessions',
+      title,
+      icon: null,
+      score: 1,
+      indices: [],
+      onActivate,
+    })
+    sessionSearch.mockResolvedValue([hit('Alpha planning', openAlpha)])
+    mount()
+    const input = screen.getByRole('combobox')
+    fireEvent.mouseDown(rowByText('Search Sessions'))
+    fireEvent.change(input, { target: { value: 'alpha' } })
+    expect(await screen.findByText('Alpha planning')).toBeTruthy()
+    sessionSearch.mockResolvedValue([hit('Beta review', openBeta)])
+    fireEvent.change(input, { target: { value: 'beta' } })
+    // No debounce tick: the row on screen still answers `alpha`.
+    fireEvent.keyDown(input, { key: 'Enter' })
+    expect(openAlpha).not.toHaveBeenCalled()
+    // Once the rows catch up, the same Enter opens what was typed.
+    await waitFor(() => {
+      expect(screen.queryByText('Beta review')).not.toBeNull()
+      expect(screen.queryByText('Alpha planning')).toBeNull()
+    })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    expect(openBeta).toHaveBeenCalled()
+  })
+
+  it('leaves the sessions failure a row, with none of the artifacts scope notice', async () => {
+    // Guard on a deliberate boundary. The artifacts scope renders its failure through
+    // ErrorNotice above the list, and it would have been easy to reach that surface for
+    // both scopes on the grounds that they should match. They should not: the sessions
+    // row's text was never a backend string, so nothing about it misled anyone, and
+    // changing it would mean a feature PR reshaping a surface it does not own. Without
+    // this, the gate can be removed and every other test here still passes.
+    sessionSearch.mockRejectedValue(new Error('gateway down'))
+    mount()
+    fireEvent.mouseDown(rowByText('Search Sessions'))
+    fireEvent.change(screen.getByRole('combobox'), { target: { value: 'quarterly' } })
+    await screen.findByText('Search failed')
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
   it('opens the sessions view on its recents listing, not on an empty screen', async () => {
     // Entering a view used to land on a centred "keep typing" sentence: no rows, so no
     // selection, so nothing Enter could do -- and that rowless state is the only
@@ -575,22 +640,98 @@ describe('CommandBarOverlay rows', () => {
     expect(rows[0].textContent).not.toContain('Command')
     // Activating one switches to it, the same way every other surface opens a session.
     fireEvent.mouseDown(rows[0])
-    expect(dispatch).toHaveBeenCalledWith({ type: 'switchSlot', key: 'slot-a' })
+    expect(dispatch).toHaveBeenCalledWith({ type: 'switchSlot', key: 'slot-a', announceOnMissing: true })
   })
 
   it('shows no attention section when nothing is waiting on the user', () => {
     // A section that is always present is a section the user learns to skip; the whole
     // value of this one is that its presence means something. A RUNNING session is not
-    // waiting on anyone, so it must not be lifted here either.
+    // waiting on anyone, so it must not be lifted here either — it belongs to the
+    // recent group below, which is a switch list and makes no claim on the reader.
     storeState.dashboard.slots = [
       { key: 'slot-c', title: 'Refactor the parser', running: true, messages: 9 },
       { key: 'slot-d', title: 'Idle thread', messages: 3 },
     ]
     mount()
     expect(screen.queryByText('Needs You')).toBeNull()
-    expect(screen.queryByText('Refactor the parser')).toBeNull()
-    // The commands are back at the top where they were.
-    expect(screen.getAllByRole('option')[0].textContent).toMatch(/New Session|Search Sessions|Toggle Theme/)
+    expect(screen.queryByText('Approve')).toBeNull()
+    expect(screen.queryByText('Answer')).toBeNull()
+    expect(rowByText('Refactor the parser')).toBeTruthy()
+  })
+
+  it('offers the sessions the reader was last in, newest first, above the commands', () => {
+    // The most common reason this surface is opened: get me back to what I was doing.
+    // It used to mean entering the sessions view and typing a name from memory, so the
+    // answer the store already held cost two steps and a recall.
+    storeState.dashboard.slots = [
+      { key: 'slot-old', title: 'Last week thread', messages: 3, last_activity_ts: 1_000 },
+      { key: 'slot-new', title: 'This morning thread', messages: 5, last_activity_ts: 3_000 },
+      { key: 'slot-mid', title: 'Yesterday thread', messages: 2, last_activity_ts: 2_000 },
+    ]
+    mount()
+    const rows = screen.getAllByRole('option')
+    expect(screen.getByText('Recent sessions')).toBeTruthy()
+    // Order is the claim — recency, not the alphabet and not the frecency store.
+    expect(rows[0].textContent).toContain('This morning thread')
+    expect(rows[1].textContent).toContain('Yesterday thread')
+    expect(rows[2].textContent).toContain('Last week thread')
+    // Ahead of the commands, which keep their own block underneath.
+    expect(rows[3].textContent).toMatch(/New Session|Search Sessions|Toggle Theme/)
+    // A session row carries no static kind word; its column is for live state.
+    expect(rows[0].textContent).not.toContain('Command')
+    // Activating one switches to it, the same way every other surface opens a session.
+    fireEvent.mouseDown(rows[0])
+    expect(dispatch).toHaveBeenCalledWith({
+      type: 'switchSlot',
+      key: 'slot-new',
+      announceOnMissing: true,
+    })
+  })
+
+  it('caps the recent group at three, leaving the rest to the sessions view', () => {
+    // The group's value is that it needs no reading. A fourth row buys a little more
+    // coverage and spends that property, and the whole corpus is one row below.
+    storeState.dashboard.slots = Array.from({ length: 7 }, (_, i) => ({
+      key: `slot-${i}`,
+      title: `Thread ${i}`,
+      messages: 2,
+      last_activity_ts: 1_000 - i,
+    }))
+    mount()
+    const titles = screen.getAllByRole('option').map(r => r.textContent ?? '')
+    expect(titles.filter(t => /Thread \d/.test(t))).toHaveLength(3)
+    expect(titles[0]).toContain('Thread 0')
+    expect(screen.queryByText('Thread 3')).toBeNull()
+    expect(rowByText('Search Sessions')).toBeTruthy()
+  })
+
+  it('keeps a session out of the recent group when it is already in the one above', () => {
+    // A session waiting on the reader is on screen with its pill. A second, quieter
+    // copy of it three rows down adds nothing and makes the page look longer than the
+    // number of sessions it is actually about.
+    storeState.dashboard.slots = [
+      { key: 'slot-a', title: 'Deploy the pricing service', pending_approval: true, messages: 4, last_activity_ts: 3_000 },
+      { key: 'slot-b', title: 'Idle thread', messages: 2, last_activity_ts: 1_000 },
+    ]
+    mount()
+    expect(screen.getAllByText('Deploy the pricing service')).toHaveLength(1)
+    expect(rowByText('Idle thread')).toBeTruthy()
+  })
+
+  it('leaves an empty untitled session out of the recent group', () => {
+    // Switching into a blank chat is what New Session is for, and one blank row is
+    // indistinguishable from another — so they would fill the group with rows that
+    // cannot be told apart.
+    storeState.dashboard.slots = [
+      { key: 'slot-blank', title: 'New Session…', messages: 0, last_activity_ts: 9_000 },
+      { key: 'slot-real', title: 'Real thread', messages: 4, last_activity_ts: 1_000 },
+    ]
+    mount()
+    const rows = screen.getAllByRole('option')
+    expect(rows[0].textContent).toContain('Real thread')
+    // The New Session COMMAND is still there; what is absent is a session row for the
+    // blank slot, which would be a second row reading the same way.
+    expect(screen.getAllByText(/New Session/)).toHaveLength(1)
   })
 
   it('always gives the typed text a way to reach an agent', async () => {
@@ -608,7 +749,7 @@ describe('CommandBarOverlay rows', () => {
     // `pendingInput` by REPLACING the slot's draft and persisting it, so inserting
     // here would silently destroy a half-written message the user had not sent.
     // Created WITHOUT activating, so nothing has focus until the claim is checked.
-    await waitFor(() => expect(dispatch).toHaveBeenCalledWith({ type: 'createSlot', arg: { activate: false } }))
+    await waitFor(() => expect(dispatch).toHaveBeenCalledWith({ type: 'createSlot', arg: expect.objectContaining({ activate: false }) }))
     await waitFor(() =>
       expect(dispatch).toHaveBeenCalledWith({
         type: 'switchSlot',
@@ -618,6 +759,9 @@ describe('CommandBarOverlay rows', () => {
     )
     await waitFor(() => expect(dispatch).toHaveBeenCalledWith({ type: 'setPendingInput', text: 'why did the deploy stall' }))
     expect(enterInsertOrNewSession).not.toHaveBeenCalled()
+    // NOT filed into a command folder: this is a sentence the reader wrote, so it
+    // belongs wherever they are working rather than under a command's name.
+    expect(fileSessionInCommandFolder).not.toHaveBeenCalled()
   })
 
   it('keeps the question recoverable when the session cannot be created', async () => {
@@ -699,7 +843,7 @@ describe('CommandBarOverlay rows', () => {
     // The user walks away before the gateway answers.
     rerender(false)
     release({ key: 'slot-9' })
-    await waitFor(() => expect(dispatch).toHaveBeenCalledWith({ type: 'createSlot', arg: { activate: false } }))
+    await waitFor(() => expect(dispatch).toHaveBeenCalledWith({ type: 'createSlot', arg: expect.objectContaining({ activate: false }) }))
     // No activation, no seed, no navigation -- the abandoned create is allowed to leak
     // a slot, but it must not touch shared state.
     expect(dispatch).not.toHaveBeenCalledWith({ type: 'switchSlot', key: 'slot-9' })
@@ -722,7 +866,7 @@ describe('CommandBarOverlay rows', () => {
     await waitFor(() => expect(screen.getByLabelText('Working…')).toBeTruthy())
     unmount()
     release({ key: 'slot-9' })
-    await waitFor(() => expect(dispatch).toHaveBeenCalledWith({ type: 'createSlot', arg: { activate: false } }))
+    await waitFor(() => expect(dispatch).toHaveBeenCalledWith({ type: 'createSlot', arg: expect.objectContaining({ activate: false }) }))
     expect(dispatch).not.toHaveBeenCalledWith({ type: 'switchSlot', key: 'slot-9' })
     expect(dispatch).not.toHaveBeenCalledWith({ type: 'setPendingInput', text: 'why did the deploy stall' })
     expect(navigate).not.toHaveBeenCalled()
@@ -797,6 +941,7 @@ describe('CommandBarOverlay contributed commands', () => {
     enterInsertOrNewSession.mockReset()
     newSessionWithToken.mockReset()
     cycleTheme.mockReset()
+    fileSessionInCommandFolder.mockClear()
     storeState.dashboard = { slots: [], unreadSlots: [] }
     storeState.chat = { slotStatusDetail: {}, activeSlot: null }
     window.localStorage.clear()
@@ -923,7 +1068,7 @@ describe('CommandBarOverlay contributed commands', () => {
     mountWithApps([appWith([APPROVE_ALL])])
     enterCommand(/Approve all PRs/)
     expect(screen.queryAllByRole('option')).toHaveLength(0)
-    expect(dispatch).not.toHaveBeenCalledWith({ type: 'createSlot', arg: { activate: false } })
+    expect(dispatch).not.toHaveBeenCalledWith({ type: 'createSlot', arg: expect.objectContaining({ activate: false }) })
     expect(navigate).not.toHaveBeenCalled()
   })
 
@@ -931,7 +1076,63 @@ describe('CommandBarOverlay contributed commands', () => {
     dispatch.mockReturnValue({ unwrap: () => Promise.resolve({ key: 'slot-new' }) })
     mountWithApps([appWith([STANDUP])])
     enterCommand(/Write my standup/)
-    expect(dispatch).toHaveBeenCalledWith({ type: 'createSlot', arg: { activate: false } })
+    expect(dispatch).toHaveBeenCalledWith({
+      type: 'createSlot',
+      arg: { activate: false, memory_mode: 'persistent' },
+    })
+  })
+
+  it("files the session it opened under the command's own folder", async () => {
+    dispatch.mockReturnValue({ unwrap: () => Promise.resolve({ key: 'slot-new' }) })
+    mountWithApps([appWith([STANDUP])])
+    enterCommand(/Write my standup/)
+    await waitFor(() => expect(fileSessionInCommandFolder).toHaveBeenCalled())
+    const [slotKey, folderName] = fileSessionInCommandFolder.mock.calls[0] as unknown as [
+      string,
+      string,
+    ]
+    expect(slotKey).toBe('slot-new')
+    // The row's own title, so a second command lands in a folder of its own rather
+    // than sharing one with every other row this app contributed.
+    expect(folderName).toBe('Write my standup')
+  })
+
+  it('files an argument-taking command under its title too', async () => {
+    dispatch.mockReturnValue({ unwrap: () => Promise.resolve({ key: 'slot-approve' }) })
+    mountWithApps([appWith([APPROVE_ALL])])
+    const input = enterCommand(/Approve all PRs/)
+    fireEvent.change(input, { target: { value: LINK } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    await waitFor(() => expect(fileSessionInCommandFolder).toHaveBeenCalled())
+    expect(fileSessionInCommandFolder.mock.calls[0]?.[1]).toBe('Approve all PRs')
+  })
+
+  it('files nothing when the seed was abandoned mid-flight', async () => {
+    // The prompt never became a message, so there is no session worth filing -- and a
+    // folder named after a command that did not run is worse than an unfiled session.
+    let resolveSlot: (v: unknown) => void = () => {}
+    dispatch.mockReturnValue({ unwrap: () => new Promise(res => (resolveSlot = res)) })
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    client.setQueryData(['apps'], [appWith([STANDUP])])
+    const onClose = vi.fn()
+    const view = render(
+      <QueryClientProvider client={client}>
+        <CommandBarOverlay open onClose={onClose} />
+      </QueryClientProvider>,
+    )
+    enterCommand(/Write my standup/)
+    // Dismissed while the create is still in flight, which revokes the run's claim.
+    view.rerender(
+      <QueryClientProvider client={client}>
+        <CommandBarOverlay open={false} onClose={onClose} />
+      </QueryClientProvider>,
+    )
+    await act(async () => {
+      resolveSlot({ key: 'slot-abandoned' })
+      await Promise.resolve()
+    })
+    expect(dispatch).not.toHaveBeenCalledWith({ type: 'setPendingInput', text: STANDUP.prompt })
+    expect(fileSessionInCommandFolder).not.toHaveBeenCalled()
   })
 
   it("refuses a value the app's own pattern rejects, creating nothing", async () => {
@@ -942,7 +1143,7 @@ describe('CommandBarOverlay contributed commands', () => {
     fireEvent.keyDown(input, { key: 'Enter' })
     // The app supplies the message, because only the app knows what shape it wanted.
     await waitFor(() => expect(screen.getByRole('alert').textContent).toContain('Not a GitHub link.'))
-    expect(dispatch).not.toHaveBeenCalledWith({ type: 'createSlot', arg: { activate: false } })
+    expect(dispatch).not.toHaveBeenCalledWith({ type: 'createSlot', arg: expect.objectContaining({ activate: false }) })
     expect(onClose).not.toHaveBeenCalled()
     expect(input.value).toBe('https://gitlab.com/g/p/-/merge_requests/1')
   })
@@ -977,7 +1178,7 @@ describe('CommandBarOverlay contributed commands', () => {
     await waitFor(() =>
       expect(screen.getByRole('alert').textContent).toContain('no longer available'),
     )
-    expect(dispatch).not.toHaveBeenCalledWith({ type: 'createSlot', arg: { activate: false } })
+    expect(dispatch).not.toHaveBeenCalledWith({ type: 'createSlot', arg: expect.objectContaining({ activate: false }) })
   })
 
   it('refuses to send a prompt that differs from the one it previewed', async () => {
@@ -1010,7 +1211,7 @@ describe('CommandBarOverlay contributed commands', () => {
 
     fireEvent.keyDown(screen.getByRole('combobox'), { key: 'Enter' })
     await waitFor(() => expect(screen.getByRole('alert').textContent).toContain('changed'))
-    expect(dispatch).not.toHaveBeenCalledWith({ type: 'createSlot', arg: { activate: false } })
+    expect(dispatch).not.toHaveBeenCalledWith({ type: 'createSlot', arg: expect.objectContaining({ activate: false }) })
     // The refreshed preview shows the new text, so the next Enter is informed.
     expect(screen.getByText(/Delete every branch behind https/)).toBeTruthy()
   })
@@ -1151,7 +1352,7 @@ describe('CommandBarOverlay contributed commands', () => {
 
     fireEvent.keyDown(screen.getByRole('combobox'), { key: 'Enter' })
     await waitFor(() => expect(screen.getByRole('alert').textContent).toContain('changed'))
-    expect(dispatch).not.toHaveBeenCalledWith({ type: 'createSlot', arg: { activate: false } })
+    expect(dispatch).not.toHaveBeenCalledWith({ type: 'createSlot', arg: expect.objectContaining({ activate: false }) })
   })
 
   it('a stale activation does not clear a live one\'s duplicate-run guard', async () => {
@@ -1222,7 +1423,7 @@ describe('CommandBarOverlay contributed commands', () => {
 
     fireEvent.keyDown(input, { key: 'Enter' })
     await waitFor(() => expect(screen.getByRole('alert')).toBeTruthy())
-    expect(dispatch).not.toHaveBeenCalledWith({ type: 'createSlot', arg: { activate: false } })
+    expect(dispatch).not.toHaveBeenCalledWith({ type: 'createSlot', arg: expect.objectContaining({ activate: false }) })
   })
 
   it('shows the resolved prompt before an auto-sending command fires', async () => {
@@ -1368,7 +1569,9 @@ describe('CommandBarOverlay contributed commands', () => {
     // The composed meta, not a bare app-name match: with no subtitle the fallback renders
     // the app name too, so a loose matcher would pass on the subtitle alone and prove
     // nothing about the meta column this fix is about.
-    expect(screen.getByText(`PR Bulk Ops \u00B7 Command`)).toBeTruthy()
+    // The VALIDATED identifier, not the fixture's `displayName`: provenance never comes
+    // from a field the app chooses, or it could claim to be the host.
+    expect(screen.getByText(`pr-bulk-ops \u00B7 Command`)).toBeTruthy()
   })
 
   it('names the contributing app even when the app wrote its own subtitle', () => {
@@ -1379,7 +1582,7 @@ describe('CommandBarOverlay contributed commands', () => {
     mountWithApps([appWith([APPROVE_ALL])])
     enterCommand(/Approve all PRs/)
     expect(screen.getByText(APPROVE_ALL.subtitle)).toBeTruthy()
-    expect(screen.getByText('PR Bulk Ops')).toBeTruthy()
+    expect(screen.getByText('pr-bulk-ops')).toBeTruthy()
   })
 
   it.each(['__proto__', 'constructor', 'toString'])(
@@ -1434,7 +1637,7 @@ describe('CommandBarOverlay contributed commands', () => {
     const input = enterCommand(/Approve all PRs/)
     fireEvent.change(input, { target: { value: LINK } })
     fireEvent.keyDown(input, { key: 'Enter' })
-    await waitFor(() => expect(dispatch).toHaveBeenCalledWith({ type: 'createSlot', arg: { activate: false } }))
+    await waitFor(() => expect(dispatch).toHaveBeenCalledWith({ type: 'createSlot', arg: expect.objectContaining({ activate: false }) }))
     await waitFor(() =>
       expect(dispatch).toHaveBeenCalledWith({
         type: 'switchSlot',
@@ -1512,5 +1715,135 @@ describe('CommandBarOverlay contributed commands', () => {
     await Promise.resolve()
     expect(dispatch).not.toHaveBeenCalledWith({ type: 'setPendingInput', text: expect.anything() })
     expect(navigate).not.toHaveBeenCalledWith('/chat?autoSend=1')
+  })
+})
+
+/**
+ * What the root list looks like once the reader has typed.
+ *
+ * Group order is the idle page's filing order — the product decision about what a
+ * launcher OPENS on. A query is a different question, so these pin the two halves:
+ * a typed query is one list ranked by match, and the section headers that name the
+ * blocks go with the blocks.
+ */
+describe('CommandBarOverlay root ordering under a query', () => {
+  beforeEach(() => {
+    dispatch.mockReset()
+    navigate.mockReset()
+    sessionSearch.mockReset()
+    sessionSearch.mockResolvedValue([])
+    recentsSearch.mockReset()
+    recentsSearch.mockResolvedValue([])
+    enterInsertOrNewSession.mockReset()
+    newSessionWithToken.mockReset()
+    storeState.dashboard = { slots: [], unreadSlots: [] }
+    storeState.chat = { slotStatusDetail: {}, activeSlot: null }
+    window.localStorage.clear()
+    vi.spyOn(console, 'warn').mockImplementation(() => {})
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  /** The app the reader is typing toward, as the apps API returns it. */
+  const DEV_FLEET = {
+    name: 'dev-fleet',
+    displayName: 'Dev Fleet',
+    enabled: true,
+    origin: 'registry',
+    manifest: { ui: { pages: [{ label: 'Dev Fleet', route: '/apps/dev-fleet' }] } },
+  }
+
+  /** A DIFFERENT app, contributing the command that used to outrank it. */
+  const PR_BULK_OPS = {
+    name: 'pr-bulk-ops',
+    displayName: 'PR Bulk Ops',
+    enabled: true,
+    origin: 'registry',
+    manifest: {
+      contributes: {
+        commands: [
+          {
+            id: 'approve-merge-all',
+            title: 'Approve and merge all PRs',
+            subtitle:
+              'Merge every ready pull request behind a link, approving first where allowed',
+            prompt: 'Approve and merge every ready pull request.',
+          },
+        ],
+      },
+    },
+  }
+
+  function mountWith(apps: unknown[]) {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    client.setQueryData(['apps'], apps)
+    render(
+      <QueryClientProvider client={client}>
+        <CommandBarOverlay open onClose={vi.fn()} />
+      </QueryClientProvider>,
+    )
+  }
+
+  /** The section headers the list is rendering, top to bottom. */
+  const renderedHeaders = () =>
+    Array.from(document.querySelectorAll('div.uppercase.tracking-wide.text-muted')).map(
+      el => el.textContent ?? '',
+    )
+
+  const rowIndex = (re: RegExp) =>
+    screen.getAllByRole('option').findIndex(el => re.test(el.textContent ?? ''))
+
+  it('puts the app the reader is spelling out above a command that only matched its subtitle', () => {
+    // The reported bug. `dev fle` scores the Dev Fleet app 216 and this contributed
+    // command 60 — the command's own title does not match at all, only its subtitle —
+    // and the command was still shown first, because `commands` files before `apps`.
+    mountWith([DEV_FLEET, PR_BULK_OPS])
+    fireEvent.change(screen.getByRole('combobox'), { target: { value: 'dev fle' } })
+    const app = rowIndex(/Dev Fleet/)
+    const command = rowIndex(/Approve and merge all PRs/)
+    // Both rows are on screen: the command still matches, it just ranks below.
+    expect(app).toBeGreaterThanOrEqual(0)
+    expect(command).toBeGreaterThan(app)
+  })
+
+  it('names a recent session in its own column once the headers are gone', () => {
+    // The headers are what named a recent row, and `kindLabel` deliberately returns
+    // nothing for one (its column belongs to live state). An IDLE session has no live
+    // state either, so under a query the row would be a glyph and a title while every
+    // row beside it still showed its word. The group's own name stands in there.
+    storeState.dashboard = {
+      slots: [{ key: 'chat-7', title: 'Fleet notes', messages: 4, running: false }],
+      unreadSlots: [],
+    }
+    mountWith([DEV_FLEET, PR_BULK_OPS])
+    const input = screen.getByRole('combobox')
+    // Idle page: the header above the row says it, so the column stays empty.
+    const idleRow = screen.getAllByRole('option').find(el => /Fleet notes/.test(el.textContent ?? ''))
+    expect(idleRow).toBeTruthy()
+    expect(renderedHeaders()).toContain('Recent sessions')
+    expect(idleRow?.textContent).not.toContain('Recent sessions')
+    // Under a query the header is gone and the row carries the name instead.
+    fireEvent.change(input, { target: { value: 'fleet' } })
+    expect(renderedHeaders()).toEqual([])
+    const queriedRow = screen
+      .getAllByRole('option')
+      .find(el => /Fleet notes/.test(el.textContent ?? ''))
+    expect(queriedRow).toBeTruthy()
+    expect(queriedRow?.textContent).toContain('Recent sessions')
+  })
+
+  it('drops the group headers while a query ranks the list, and restores them when it clears', () => {
+    mountWith([DEV_FLEET, PR_BULK_OPS])
+    const input = screen.getByRole('combobox')
+    expect(renderedHeaders()).toContain('Commands')
+    fireEvent.change(input, { target: { value: 'dev fle' } })
+    // One ranked list: a group can now appear, be left and appear again, so a header
+    // per transition would print the same word twice over rows it does not describe.
+    expect(renderedHeaders()).toEqual([])
+    // The headers belong to the idle page, so clearing the query brings them back.
+    fireEvent.change(input, { target: { value: '' } })
+    expect(renderedHeaders()).toContain('Commands')
   })
 })
