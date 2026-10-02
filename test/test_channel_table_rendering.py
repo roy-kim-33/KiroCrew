@@ -8,6 +8,7 @@ converts, that the turn's canonical text does not, and that a target declaring
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import replace
 from typing import Any
@@ -15,6 +16,7 @@ from typing import Any
 import pytest
 
 from kiro_crew.acp.types import EVENT_COMPLETE, EVENT_TEXT_CHUNK, AcpEvent
+from kiro_crew.discord.client import EDIT_FAILED, EDIT_OK
 from kiro_crew.discord.renderer import DiscordRenderer, _transform_buries_refs
 from kiro_crew.discord.transport import DISCORD_CAPABILITIES
 from kiro_crew.messaging.driver import APPROVAL_AUTO, TurnDriver
@@ -151,6 +153,13 @@ class FakeDiscordClient:
     ) -> bool:
         self.uploads.append(list(files or []))
         return await self.edit_message(channel_id, message_id, text, **kw)
+
+    async def edit_message_with_files_outcome(
+        self, channel_id: str, message_id: str, text: str, files: Any, **kw: Any
+    ) -> str:
+        # Mirror the production client: delegate to the bool edit and classify.
+        ok = await self.edit_message_with_files(channel_id, message_id, text, files, **kw)
+        return EDIT_OK if ok else EDIT_FAILED
 
     def uploaded(self) -> list[Any]:
         """Every attachment Discord was actually handed, across sends and edits."""
@@ -879,7 +888,7 @@ class TestDeliveryFraming:
         body = [f"| Row 000 | Bearer {token} | {'x' * 30} |"]
         # Grown to fill the cap rather than to a fixed row count: WeCom's budget is
         # derived from its 20480-BYTE reply limit, so a hardcoded 700 rows was sized
-        # against a cap that no longer exists and the "fits the cap" premise silently
+        # against a cap that does not exist and the "fits the cap" premise silently
         # inverted. Derived, the test keeps its meaning whatever the budget becomes.
         index = 1
         while len(header + "\n".join(body)) + 24 < cap:
@@ -1063,7 +1072,12 @@ class TestTableCardNeverBuriesAnUpload:
         renderer = DiscordRenderer(
             client, "chan", DISCORD_CAPABILITIES, session_key="sk", uploads_allowed=True
         )
-        renderer.authorize_upload_root("/tmp")  # string only; touches no filesystem
+        # String only; touches no filesystem. Spelled from the host's own root
+        # rather than "/tmp": authorize_upload_root() keeps only an ABSOLUTE root,
+        # and ntpath.isabs("/tmp") is False from Python 3.13 (a bare slash without
+        # a drive is relative to the current drive on Windows), which leaves uploads
+        # disabled and fails every test on this fixture there.
+        renderer.authorize_upload_root(os.path.abspath(os.sep))
         assert renderer._uploads_enabled(), "fixture must model an upload-capable transport"
         return client, renderer
 

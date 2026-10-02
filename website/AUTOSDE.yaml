@@ -60,7 +60,7 @@ custom-rules:
     rule: |
       Use CSS custom property design tokens instead of hardcoded Tailwind color classes. Hardcoded colors break dark/light theme switching.
 
-      Use the semantic tokens defined in `index.css` and mapped in `tailwind.config.js`:
+      Use the semantic tokens defined in `index.css` and mapped in `src/tailwind-theme.css`:
       - `bg-[var(--bg)]`, `bg-[var(--card)]` instead of `bg-gray-900`
       - `text-[var(--text)]`, `text-[var(--muted)]` instead of `text-gray-400`
       - `border-[var(--border)]` instead of `border-gray-700`
@@ -132,7 +132,7 @@ custom-rules:
       value owned in another file. That is how this repo accumulated a long series of
       one-component-at-a-time mobile patches. A page whose narrow layout is an
       afterthought is not conformant to this pattern even when its class string
-      matches; see the narrow-viewport section of website/docs/page-layout.md for the
+      matches; see website/docs/narrow-viewport.md for the
       recommended baseline.
 
       Required structure:
@@ -141,7 +141,7 @@ custom-rules:
          container. What this rule requires is the structure — `overflow-y-auto
          flex-1 min-h-0` plus a horizontal gutter, not a specific gutter value. The
          narrow gutter shown here is a RECOMMENDATION, not a requirement: see the
-         narrow-viewport section of website/docs/page-layout.md. A page using a single
+         website/docs/narrow-viewport.md. A page using a single
          gutter value at every width is conformant; do not flag it. When a page does
          narrow its gutter, `PageHeader`'s must match, or the title sits inset from the
          content it labels.
@@ -225,6 +225,77 @@ custom-rules:
           <span className="truncate">{basename(s.project)}</span>
         </span>
       )}
+      ```
+
+  - id: connection-card-caveat-tip
+    blocking: true
+    file-patterns:
+      - "src/pages/connections/**/*.tsx"
+    rule: |
+      On a Connections card, anything the user should know BEFORE pressing an
+      action -- a provider-side prerequisite, what a button will open or change,
+      a one-time setup the provider needs -- renders as the amber warning
+      triangle (`PrerequisiteTip`) placed immediately before that action, in the
+      same row. Never as an always-visible band, callout, or paragraph inside
+      the card.
+
+      Why: the gallery is a grid of identical cards, and a band is paid by every
+      card that reaches the state, forever, for prose a user reads once. It
+      also makes rows ragged (the card grows by the band's height while its
+      neighbours do not) and buries the one control the state exists for under
+      three lines of explanation. The triangle costs one 24px slot, previews on
+      hover or focus, pins on click, and keeps the action row the same shape in
+      every state. It is the pattern the maintainer chose after trying bands and
+      reverting them; a reviewer suggestion to "make the warning visible" is
+      answered by this rule, not by a band.
+
+      A caveat, which goes in the tip:
+      - "Requires an Atlassian account with a Jira or Confluence site …"
+      - "<provider> needs a one-time setup. Configure OAuth app opens …"
+      - Anything phrased as what will happen, or what must be true, when the
+        user acts.
+
+      NOT a caveat, which may stay inline:
+      - A verdict about the card's CURRENT state that the user must act on
+        (`not-verified`, `needs-attention`): the card is reporting a fact, not
+        annotating a button.
+      - A form the state needs (the remote return-address relay while waiting
+        for approval): controls, not prose.
+      - The state badge in the header and the one-line value prop.
+
+      One tip per action row. If two caveats apply to one action, merge the copy
+      into one bubble; never render two triangles or a triangle plus a band.
+      Reuse `PrerequisiteTip` with the existing `prerequisites_for_provider`
+      label and `before_you_connect` heading -- do not fork a second tooltip
+      component or a second heading key for a new state.
+
+      Bad:
+      ```tsx
+      <div className="space-y-3">
+        <div className="flex items-start gap-2 rounded-md border border-border bg-bg-hover p-2.5 text-[12px]">
+          <Lock className="h-3.5 w-3.5 shrink-0 text-muted" aria-hidden="true" />
+          <span>{t('pages.connectionsPage.needs_configuration_help', { provider: provider.name })}</span>
+        </div>
+        <div className="flex items-center justify-between gap-3">
+          {docsLink}
+          <Link to={settingsHref}>{t('pages.connectionsPage.configure_oauth_app')}</Link>
+        </div>
+      </div>
+      ```
+
+      Good:
+      ```tsx
+      <div className="flex items-center justify-between gap-3">
+        {docsLink}
+        <div className="flex items-center gap-2">
+          <PrerequisiteTip
+            label={t('pages.connectionsPage.prerequisites_for_provider', { provider: provider.name })}
+            heading={t('pages.connectionsPage.before_you_connect')}
+            text={t('pages.connectionsPage.needs_configuration_help', { provider: provider.name })}
+          />
+          <Link to={settingsHref}>{t('pages.connectionsPage.configure_oauth_app')}</Link>
+        </div>
+      </div>
       ```
 
   - id: max-two-buttons-per-row
@@ -503,8 +574,8 @@ custom-rules:
       Exception: do not flag emoji usage in
       SecretaryPage.tsx (inline emoji reaction picker),
       folderEmoji.ts + FolderConfigModal.tsx (folder icon picker — FOLDER_EMOJIS
-      grid + custom-emoji input), ChatSidebar.tsx (FolderGlyph renders the
-      folder's icon as data),
+      grid + custom-emoji input), FolderGlyph.tsx (renders the folder's icon as
+      data; extracted from ChatSidebar.tsx),
       scene components (src/pages/scenes/), useTheme.ts, or themeEditor.tsx
       (theme display names). These are intentional decorative/data uses.
 
@@ -563,15 +634,21 @@ custom-rules:
         setup wizard) — AND the omission carries a `{/* No hand-off: … */}`
         comment naming the draft it protects, the established form in
         `src/pages/settings/RemoteCrewPanel.tsx`.
+      - Inside Radix menu content, `askAgent` MUST stay off on the passive
+        notice and the hand-off MUST render as a sibling `ErrorNoticeMenuItem`.
+        Give the `ErrorNotice` an `id` and pass that same value as the menu
+        item's `describedBy`; this is the third sanctioned state, because a
+        nested button is skipped by the menu's roving focus.
       - `onHandoff` lets a dialog close itself before the navigation (the
         `App.tsx` update-modal form). It does NOT make the navigation safe:
         the tree beneath the dialog still unmounts, so over an unsaved draft
         the no-hand-off form applies, `onHandoff` or not.
 
-      On the `askAgent` choice, the REVIEWER blocks on the missing decision,
-      never on the direction of it: an added or touched `ErrorNotice` carrying
-      neither `askAgent` nor a `No hand-off` comment, or a comment that names
-      no concrete draft. (The hand-written-surface ban above is its own
+      On the hand-off choice, the REVIEWER blocks on a missing decision, never
+      on the direction of it: an added or touched `ErrorNotice` must carry
+      `askAgent`, a `No hand-off` comment naming a concrete draft, or a sibling
+      `ErrorNoticeMenuItem` in the same conditional branch whose `describedBy`
+      matches the notice's `id`. (The hand-written-surface ban above is its own
       blocking trigger.) Whether a subtree holds unsaved state is not visible
       in a hunk, so a reviewer never demands `askAgent` be turned on — a wrong
       demand causes exactly the data loss the default prevents. Doubt a
@@ -598,6 +675,47 @@ custom-rules:
         happen, a save that did not persist), that state is ALSO rendered
         in-page through `ErrorNotice`; a toast as the ONLY report of it is a
         violation.
+
+      The ban is on the SURFACE, not on a class name. Because the test is
+      "where does the value come from", these shapes are the same violation
+      even though none of them contains `text-danger` or `role="alert"`:
+      - The error is assigned to a variable or prop first and then rendered
+        through a neutral container — `const msg = query.error ?? mutErr`
+        into a plain `<div>`, an `EmptyState subtitle={error}`, a
+        `PageHeader subtitle`, an `error` prop on a child chip, a value
+        carried through redux (`progress.detail`) or interpolated into an
+        i18n string (`i18nT('failed_with', { error })`). Follow the value
+        back to its source; a rename does not launder it.
+      - A toast or notification-center entry (`addNotification`, `useNotify`,
+        a hand-rolled toast) is the ONLY report of a failure that leaves the
+        user in a failed state. Same for a page-local `ToastHost` that
+        bypasses the app-sdk `useNotify` seam: that carve-out exists because
+        the seam cannot host the hand-off, so a local toast the page fully
+        controls gets no carve-out at all.
+      - The error sits in a `role="status"` / `aria-live` region, or in a
+        warn- or muted-toned box (`text-warn`, `text-muted`, a `<td>`). Toning
+        a failure down to a polite status does not make it status; a load
+        that did not happen is still a failure.
+      - The error text lives only in a `title=` / `aria-label=` / tooltip
+        (`InfoTip`) attribute or behind an icon-only glyph. Hover text is not
+        a surface: it is invisible on touch, unreadable to a screen reader in
+        most positions, and offers no hand-off.
+      - A native `alert()` / `window.alert()`. It blocks the tab, carries no
+        context, and cannot hand off; render the failure in-page instead.
+      - The failure is never rendered at all: a `useMutation` with no
+        `onError` and no `isError` read, a `useQuery` whose `isError` never
+        reaches the JSX, a `.catch(() => {})` that turns a transport failure
+        into an empty / not-found / default state, an `if (r.ok) {…}` with no
+        else branch, or a `copyToClipboard` boolean that is ignored so the
+        button paints "Copied" after the write failed. A silent failure is
+        the dead end this rule exists to remove; the diff that adds or
+        touches the request also renders its failure.
+      - One state variable fed by BOTH a client-side validation check and a
+        server rejection, rendered in one place. Split it: the validation
+        hint stays plain text, the rejection goes through `ErrorNotice` with
+        the `askAgent` decision. (The inverse — a validation-only value
+        passed to `ErrorNotice` — dresses a hint as an error and is also
+        wrong.)
 
       Bad:
       ```tsx

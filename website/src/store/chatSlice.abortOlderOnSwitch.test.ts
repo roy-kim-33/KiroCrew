@@ -32,9 +32,11 @@ vi.mock('../api/client', () => ({
       const end = before !== undefined ? Math.max(0, Math.min(before, TOTAL)) : TOTAL
       const start = Math.max(0, end - lim)
       const body = { messages: HISTORY.slice(start, end), has_more: start > 0, total: TOTAL, next_before: start }
-      // switchSlot's fetch is unpaginated and normally must not block; only the
-      // older page is held open, because that is the request under test.
-      if (before === undefined) {
+      // switchSlot's legs normally must not block; only the user's older page is
+      // held open, because that is the request under test. A switch leg is the
+      // window itself (no cursor) or a step of its coverage walk (a cursor but no
+      // abort signal -- `loadOlderMessages` is the caller that passes one).
+      if (before === undefined || signal === undefined) {
         if (!holdSwitchDetail) return Promise.resolve(body)
         return new Promise((resolve) => { releaseSwitch.push(() => resolve(body)) })
       }
@@ -233,9 +235,11 @@ describe('an abort is distinguishable from a real failure', () => {
     const path = await import('node:path')
     const src = fs.readFileSync(path.resolve(__dirname, '../pages/ChatPage.tsx'), 'utf8')
 
-    // The catch must return on an abort BEFORE reaching the notice.
+    // The catch must return on an abort BEFORE reaching the notice. A failed
+    // page load is an ERROR (it renders through ErrorNotice via
+    // `setPinLoadError`), distinct from the `setPinNotice` answers.
     const guard = src.indexOf('if (isSupersededPagingRejection(err)) return')
-    const notice = src.indexOf('setPinNotice(loadFailedNotice)', guard)
+    const notice = src.indexOf('setPinLoadError(loadFailedNotice)', guard)
     expect(guard).toBeGreaterThan(-1)
     expect(notice).toBeGreaterThan(guard)
   })
@@ -260,7 +264,7 @@ describe('an abort is distinguishable from a real failure', () => {
     // A fetch error is transient. Only the two genuinely-gone branches may claim
     // the history no longer holds the row; the catch gets its own copy.
     expect(body.match(/setPinNotice\(notFoundNotice\)/g)).toHaveLength(2)
-    expect(body.match(/setPinNotice\(loadFailedNotice\)/g)).toHaveLength(1)
+    expect(body.match(/setPinLoadError\(loadFailedNotice\)/g)).toHaveLength(1)
     const catchGuard = body.indexOf('if (isSupersededPagingRejection(err)) return')
     expect(body.indexOf('setPinNotice(notFoundNotice)', catchGuard)).toBe(-1)
   })
@@ -455,13 +459,13 @@ describe('a background refresh must not re-validate a cursor a pending switch in
 
     // The second switch's own settle does not end it either, because this slot
     // carries cached rows with no previously-known server total: a bounded window
-    // cannot be proven to cover the gap, so the switch retries UNBOUNDED. Its
+    // cannot be proven to cover the gap, so the switch walks the window older. Its
     // claim has to outlive the bounded leg for the same reason the first release
     // must not clear it — releasing between the two legs reopens the window.
     releaseSwitch[1]()
     await flush()
     await flush()
-    // A retry WAS issued (the count is not pinned: a superseded leg may retry too,
+    // A walk leg WAS issued (the count is not pinned: a superseded leg may walk too,
     // and its answer is discarded rather than being this test's business).
     expect(releaseSwitch.length).toBeGreaterThan(2)
     expect(store.getState().chat.slotSwitchRequestId).not.toBeNull()

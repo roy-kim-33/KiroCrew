@@ -11,6 +11,7 @@ import json
 import logging
 import random
 import time
+import weakref
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -18,11 +19,35 @@ from dataclasses import field as dataclass_field
 from enum import Enum
 from typing import TYPE_CHECKING, Any
 
-from kiro_crew import name_grant
+from kiro_crew import name_grant, permission_floor
 from kiro_crew.acp.client import AcpError, AcpPromptBusy, advertised_model_ids
 from kiro_crew.acp.types import EVENT_STEER_CONSUMED, TurnUsage
+from kiro_crew.agent_sdk.drivers.acp import resolve_pin_spelling_on
 from kiro_crew.config.loader import KiroCrewConfig
-from kiro_crew.hooks import fire_tool_hooks, get_global_hook_store
+from kiro_crew.constants import (
+    DENY_CAUSE_INVALID_NAME,
+    DENY_CAUSE_POLICY,
+    DENY_CAUSE_SURFACE_POLICY,
+)
+from kiro_crew.credential_errors import is_credential_propagation_delay
+from kiro_crew.deny_notice import steer_refusal_notice
+from kiro_crew.hooks import (
+    _EDIT_TOOL_KIND,
+    _normalize_tool_name,
+    fire_tool_hooks,
+    get_global_hook_store,
+    hook_gate_kwargs,
+)
+from kiro_crew.image_refs import strip_image_refs
+from kiro_crew.messaging.link import canonical_key
+from kiro_crew.permission_floor import OUTCOME_REJECTED_TRANSPORT_FLOOR
+from kiro_crew.platform.tool_paths import (
+    command_shaped_strings,
+    edit_target_candidates,
+    is_document_writing_tool,
+    mcp_document_body_keys,
+    split_document_bodies,
+)
 from kiro_crew.providers.base import (
     EVENT_COMPLETE,
     EVENT_PERMISSION_REQUEST,
@@ -36,19 +61,30 @@ from kiro_crew.security import (
     MAX_SCANNABLE_COMMAND_CHARS,
     is_denied,
     is_sensitive_bash_command,
-    is_sensitive_path,
+    is_sensitive_write_path,
+    is_unverifiable_path_refusal,
     redact_credentials,
     redact_exfiltration_urls,
+    sensitive_path_refusal,
 )
 from kiro_crew.sel import sel as _sel
 
 _PROMPT_BUSY_RETRIES = 2
 _PROMPT_BUSY_DELAY = 1.5  # seconds between retries
 
-# Cap on the wrapper chain walked to find a turn's billing stats. A provider is
-# wrapped at most a few layers deep, so a longer walk means a cycle or an
-# unrelated object graph, not a deeper seam.
-_WRAPPER_WALK_MAX_NODES = 8
+# Runaway guard for the wrapper chain walked to find a turn's billing stats,
+# NOT a depth limit. The walk is depth-first along the documented holders and
+# identity-deduped, so a real provider stack is exhausted long before this;
+# the bound exists for a source that synthesizes attributes (a ``MagicMock``
+# answers every ``getattr`` with a fresh child). Sized so no plausible wrapper
+# depth reaches it: session sharing, a channel link, a subagent companion and
+# a fallback wrapper each add a layer, and the same object graph is the one
+# ``dashboard.handlers.usage._wrapper_chain`` walks for the model with the
+# same guard.
+_WRAPPER_WALK_MAX_NODES = 64
+
+# Holder attributes the billing-stats walk follows, in order.
+_BILLING_STAT_HOLDERS: tuple[str, ...] = ("_client", "_handle", "_sess", "provider")
 
 # Sentinel for "no prior stats object was observed", distinct from a provider that
 # legitimately exposes None. Used by provider_last_turn_usage's identity guard.
@@ -84,7 +120,10 @@ _JITTER_RNG = random.Random()
 # Matched against the formatted AcpError message (see acp.client._format_acp_error).
 # Auth/validation markers are deliberately ABSENT so those fail fast — a retry
 # cannot fix an expired token or a bad request, and silently retrying them would
-# only delay the correct "re-auth"/"fix the request" signal to the operator.
+# only delay the correct "re-auth"/"fix the request" signal to the operator. The
+# one auth-shaped exception (a credential IAM has not propagated yet) is handled
+# structurally in _is_transient_acp_error, ABOVE the exclusion list, because no
+# marker here could ever be reached for it — see is_credential_propagation_delay.
 _TRANSIENT_MARKERS = (
     "internal server error",
     "internal error: api error",
@@ -117,6 +156,27 @@ _TRANSIENT_MARKERS = (
     # straight and typographic quotes both match the substring.
     "selected is temporarily unavailable",
     "transient error (http 5xx)",  # _format_acp_error's generic-5xx message
+    # kiro-cli's post-stream wrapper ("The service failed to process the
+    # request (request_id: ...)"). Matches the raw provider text and
+    # _format_acp_error's rewrite alike, since the rewrite keeps the phrase.
+    "failed to process the request",
+    # IAM credential-propagation race, matched against _format_acp_error's
+    # rewritten wording. The RAW provider sentence ("The security token included
+    # in the request is invalid") is matched structurally instead — see the
+    # is_credential_propagation_delay call below.
+    "credential-propagation delay",
+    # Connection-level failures (client._RE_CONNECTION): raw errno tokens for
+    # restored errors, plus the formatter's wording for fresh ones.
+    "econnrefused",
+    "econnreset",
+    "econnaborted",
+    "etimedout",
+    "epipe",
+    "ehostunreach",
+    "eai_again",
+    "socket hang up",
+    "fetch failed",
+    "could not reach the model backend",
 )
 
 
@@ -124,6 +184,12 @@ def _is_transient_acp_error(msg: str) -> bool:
     """True iff an AcpError message looks like a retryable transient backend
     failure. Auth failures are explicitly excluded (they need re-auth, not retry)."""
     low = msg.lower()
+    if is_credential_propagation_delay(msg):
+        # The one auth-shaped failure a retry DOES fix: a credential IAM has not
+        # propagated yet. Checked BEFORE the exclusions below because Bedrock
+        # ships this rejection AS UnrecognizedClientException, so the
+        # short-circuit would return False and no marker could ever be reached.
+        return True
     if (
         "authentication failed" in low
         or "accessdenied" in low
@@ -153,6 +219,27 @@ def is_transient_backend_error(msg: str) -> bool:
     backend failure (5xx / throttle / stream-reset) rather than an
     auth/validation error. Public alias of :func:`_is_transient_acp_error`."""
     return _is_transient_acp_error(msg)
+
+
+def is_prompt_busy(exc: BaseException) -> bool:
+    """True when *exc* says the backend already holds an in-flight prompt.
+
+    Structural first, with the substring as a fallback: ``_format_acp_error``
+    rewrites the backend's "prompt already in progress" into friendly prose that
+    drops the marker, so a string-only check silently loses the recovery for
+    every producer that formats before raising — which the shared-runtime
+    ``AcpSessionHandle`` does. The fallback still covers unformatted /
+    history-restored messages, and stays scoped to ``AcpError`` so an unrelated
+    exception that happens to mention progress is never mistaken for a wedge.
+
+    Shared with ``channel.run_channel_agent``, whose recovery is the same
+    contract (replace the session, replay once) reached from a different surface.
+    One predicate, so the two cannot come to disagree about what a wedge IS —
+    and so a consumer outside this module never needs the ACP layer to ask.
+    """
+    return isinstance(exc, AcpPromptBusy) or (
+        isinstance(exc, AcpError) and "already in progress" in str(exc)
+    )
 
 
 def acp_error_is_transient(exc: BaseException) -> bool:
@@ -380,10 +467,39 @@ def provider_fallback_active(provider: Any) -> bool:
     return isinstance(marker, (tuple, list)) and len(marker) >= 2
 
 
+def provider_model_pin_refused(provider: LLMProvider) -> bool:
+    """True when *provider*'s adapter refused its pinned model at startup.
+
+    A config-option backend applies a pin non-strictly: a refusal leaves the
+    session on the backend default and raises nothing. The session records the
+    refused id as ``model_pin_refused``. Callers treat a True here exactly as a
+    caught model-unavailable error: annotate the downgrade and blank the
+    explicit pin on the usage row.
+    """
+    # Declared on LLMProvider. The str check keeps a test double's auto-made
+    # attribute from reading as a refusal.
+    value = provider.model_pin_refused
+    return isinstance(value, str) and bool(value)
+
+
+def provider_model_pin_partial(provider: LLMProvider) -> str:
+    """The bare model *provider* runs when its pair pin only half applied.
+
+    A ``<model>[<effort>]`` pin is applied as two writes. When the model lands
+    and the effort does not, the session runs the bare model, not the pin and
+    not the default. Returns that bare model, or ``""``. A caller billing by the
+    pin bills this value instead.
+    """
+    value = provider.model_pin_partial
+    return value if isinstance(value, str) else ""
+
+
 def next_fallback_candidate(
     chain: Sequence[str],
     active_model: str,
     advertised: Sequence[str] | None,
+    *,
+    backend: str = "",
 ) -> str | None:
     """First usable fallback candidate from *chain*, or ``None``.
 
@@ -396,8 +512,19 @@ def next_fallback_candidate(
     list fails OPEN (candidates accepted): entitlement unknown is not
     entitlement denied, matching ``model_is_unusable``'s stance, and the
     substitute ``set_model`` path re-validates against the live list anyway.
+
+    A persisted chain entry can carry a stale ``<namespace>::<bare-id>``
+    qualifier from the catalog that advertised it (the catalog/session
+    spelling-mismatch class)
+    while the session advertises the bare id, so membership is judged through
+    :func:`resolve_pin_spelling` (the shared fold) rather than literally — an
+    entry absent under BOTH spellings is still skipped, and the active-model
+    skip applies to the folded spelling too. The CHAIN's own spelling is what
+    is returned (``FallbackState.next_candidate`` locates the applied
+    candidate with ``remaining.index``); wire-facing consumers re-fold it via
+    :func:`_fallback_wire_spelling`.
     """
-    adv = {a.strip().lower() for a in (advertised or []) if isinstance(a, str) and a.strip()}
+    adv = [a for a in (advertised or []) if isinstance(a, str) and a.strip()]
     act = (active_model or "").strip().lower()
     for cand in chain:
         if not isinstance(cand, str):
@@ -405,11 +532,37 @@ def next_fallback_candidate(
         low = cand.strip().lower()
         if not low or low == act:
             continue
-        if adv and low not in adv:
-            logger.debug("model fallback: skipping %r (not advertised)", cand)
-            continue
+        if adv:
+            served = resolve_pin_spelling_on(cand, adv, backend=backend)
+            if not served:
+                logger.debug("model fallback: skipping %r (not advertised)", cand)
+                continue
+            if served.strip().lower() == act:
+                # Post-fold active skip: a qualified entry that resolves to
+                # the currently-failing model cannot help.
+                continue
         return cand
     return None
+
+
+def _fallback_wire_spelling(
+    candidate: str, advertised: Sequence[str] | None, *, backend: str = ""
+) -> str:
+    """The spelling of *candidate* to send on the wire and keep in records.
+
+    A chain entry stays in its OWN spelling for ``FallbackState`` bookkeeping
+    (``remaining.index``), but everything later compared against SERVED models
+    — the substitute ``set_model`` call, the swap witness, the sticky
+    :data:`TURN_FALLBACK_ATTR` marker the restore probe reads, and the
+    active/walked records — must carry the ADVERTISED spelling: a
+    ``<namespace>::``-qualified spelling there is one the backend never
+    advertised (``AcpClient.set_model``'s explicit-pick guard would raise) and
+    desynchronizes the restore probe from the session it watches. Falls back
+    to the candidate's own spelling when the advertised set cannot resolve it
+    (empty/unknown fails open, matching :func:`next_fallback_candidate`).
+    """
+    ids = [a for a in (advertised or []) if isinstance(a, str) and a.strip()]
+    return (resolve_pin_spelling_on(candidate, ids, backend=backend) if ids else "") or candidate
 
 
 @dataclass
@@ -431,10 +584,12 @@ class FallbackState:
     primary: str = ""
     walked: list[str] = dataclass_field(default_factory=list)
 
-    def next_candidate(self, active_model: str, advertised: Sequence[str] | None) -> str | None:
+    def next_candidate(
+        self, active_model: str, advertised: Sequence[str] | None, *, backend: str = ""
+    ) -> str | None:
         """Advance to and return the next usable candidate, or ``None``."""
         remaining = self.chain[self.pos :]
-        cand = next_fallback_candidate(remaining, active_model, advertised)
+        cand = next_fallback_candidate(remaining, active_model, advertised, backend=backend)
         if cand is None:
             self.pos = len(self.chain)
             return None
@@ -491,9 +646,13 @@ async def advance_fallback_candidate(
     chain skipping the primary, unadvertised ids, and the currently-active
     (failing) candidate; applies the first candidate whose substitute
     ``set_model`` lands; publishes the sticky marker
-    (:data:`TURN_FALLBACK_ATTR`); and emits the greppable swap warning.
-    Returns the applied candidate, or ``None`` when the chain is exhausted or
-    the provider exposes no ``set_model`` seam — the caller then surfaces the
+    (:data:`TURN_FALLBACK_ATTR`); and emits the greppable swap warning. A
+    ``<namespace>::``-qualified chain entry is applied AND recorded under its
+    advertised spelling (:func:`_fallback_wire_spelling`) — the wire, the
+    marker, and the walked/active records must agree with the served model
+    the restore probe later compares against. Returns the applied candidate
+    (advertised spelling), or ``None`` when the chain is exhausted or the
+    provider exposes no ``set_model`` seam — the caller then surfaces the
     original error exactly as before this feature existed.
     """
     advertised = provider_advertised_ids(provider)
@@ -515,22 +674,26 @@ async def advance_fallback_candidate(
     set_model_fn = resolve_substitute_set_model(provider)
     if set_model_fn is None:
         return None
+    backend = provider_backend(provider)
     while True:
-        cand = fb_state.next_candidate(fb_state.primary or active, advertised)
+        cand = fb_state.next_candidate(fb_state.primary or active, advertised, backend=backend)
         if cand is None:
             return None
-        if cand.strip().lower() == (active or "").strip().lower():
+        # The chain's own spelling drove the walk bookkeeping; the wire and
+        # every served-model comparison below use the advertised spelling.
+        wire = _fallback_wire_spelling(cand, advertised, backend=backend)
+        if wire.strip().lower() == (active or "").strip().lower():
             # With a marker-seeded primary, the chain can still name the
             # CURRENTLY-failing fallback the session sits on — retrying it is
             # what this walk exists to escape.
             continue
         _raw_before = provider_raw_model(provider)
         try:
-            await set_model_fn(cand)
+            await set_model_fn(wire)
         except Exception:
             logger.debug(
                 "model fallback: set_model(%r) failed; skipping candidate",
-                cand,
+                wire,
                 exc_info=True,
             )
             continue
@@ -545,38 +708,126 @@ async def advance_fallback_candidate(
         if (
             _raw_before
             and _raw_after == _raw_before
-            and _raw_after.strip().lower() != cand.strip().lower()
+            and _raw_after.strip().lower() != wire.strip().lower()
         ):
             logger.debug(
                 "model fallback: set_model(%r) was a silent no-op (model still %r); "
                 "skipping candidate",
-                cand,
+                wire,
                 _raw_after,
             )
             continue
-        fb_state.active = cand
+        fb_state.active = wire
         fb_state.attempts = 1
-        fb_state.walked.append(cand)
+        fb_state.walked.append(wire)
         try:
-            setattr(provider, TURN_FALLBACK_ATTR, (fb_state.primary, cand))
+            setattr(provider, TURN_FALLBACK_ATTR, (fb_state.primary, wire))
         except Exception:
             logger.debug("publishing fallback marker failed", exc_info=True)
         logger.warning(
             "model fallback: %s -> %s (reason=throttle-exhaustion, surface=%s%s)",
             fb_state.primary or "?",
-            cand,
+            wire,
             surface,
             log_suffix,
         )
-        return cand
+        return wire
+
+
+def pick_epoch_host(provider: Any) -> Any:
+    """The one object the explicit-pick epoch lives on for this session.
+
+    A pick and a refusal-fallback restore can hold DIFFERENT layers of the
+    same session — the model handler holds the ``AcpProvider`` wrapper while
+    the chat runner's acquisition can hand the wrapped client — so both must
+    resolve the SAME host or the writer stamps an object the reader never
+    sees. The innermost wrapped client wins, following the same unwrap order
+    as :func:`resolve_substitute_set_model`; a bare test client resolves to
+    itself.
+    """
+    for attr in ("client", "_client"):
+        try:
+            inner = getattr(provider, attr, None)
+        except Exception:  # pragma: no cover - exotic property getters
+            inner = None
+        if inner is not None and not callable(inner):
+            return inner
+    return provider
+
+
+_slot_switch_session_locks: "weakref.WeakValueDictionary[str, asyncio.Lock]" = (
+    weakref.WeakValueDictionary()
+)
+
+
+def slot_switch_session_lock(session_key: str) -> asyncio.Lock:
+    """The per-session lock every explicit model switch runs under.
+
+    Serializes model switches for aliases of ONE session — a channel-born
+    slot and its dashboard twin drive one wire session through disjoint slot
+    objects, so per-slot locks cannot order their switches. The switch
+    handlers in ``chat_handlers`` acquire it between ``slot._lock`` and
+    ``slot._model_pick_lock`` (the lock-order contract is documented at
+    their acquisition site); the chat runner's refusal-fallback restore
+    acquires it before the pick lock, so a restore's ``set_model(primary)``
+    await cannot interleave with an alias pick and silently overwrite the
+    user's selection. Lives here rather than in
+    ``chat_handlers`` because ``chat_handlers`` imports from the runner —
+    the runner could not import it back without a cycle.
+
+    Keyed on the CANONICAL spelling of the session key: a Slack session can
+    be addressed by its bare legacy ``thread_ts`` (a slot restored from an
+    old transcript) and by ``slack:<thread_ts>`` (its canonical sibling), and
+    ``SessionManager`` folds the two onto one live session. Two spellings
+    that name one session must take one lock, or two aliases would serialize
+    against nobody; ``canonical_key`` is the same fold the manager applies.
+
+    A ``WeakValueDictionary`` so a session's lock is collected once no
+    request holds it; unrelated sessions resolve different keys and so take
+    different locks.
+
+    An ``asyncio.Lock`` binds to the loop it is first contended on and
+    raises ``RuntimeError`` when awaited from any other loop. A cached lock
+    that is still alive when a different loop asks for the same key (a test
+    holding a reference past its per-test loop, an embedder that runs the
+    gateway on a fresh loop) is therefore unusable to the caller, so it is
+    replaced rather than returned. Holders on the old loop keep their lock;
+    the two loops cannot contend with each other in any case.
+    """
+    session_key = canonical_key(session_key)
+    lock = _slot_switch_session_locks.get(session_key)
+    if lock is not None and _bound_to_other_loop(lock):
+        lock = None
+    if lock is None:
+        lock = asyncio.Lock()
+        _slot_switch_session_locks[session_key] = lock
+    return lock
+
+
+def _bound_to_other_loop(lock: asyncio.Lock) -> bool:
+    """Whether ``lock`` is bound to a loop other than the running one.
+
+    ``asyncio.Lock`` records its loop in ``_loop`` on first contention and
+    leaves it ``None`` before that; an unbound lock is usable from any loop.
+    With no running loop the caller is synchronous setup code and the lock
+    is handed back unchanged.
+    """
+    bound = getattr(lock, "_loop", None)
+    if bound is None:
+        return False
+    try:
+        running = asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    return bound is not running
 
 
 def resolve_substitute_set_model(provider: Any) -> Callable[[str], Awaitable[None]] | None:
     """The provider's substitute-path ``set_model`` coroutine, or ``None``.
 
     Prefers ``provider.set_model``; falls back to the wrapped client
-    (``provider.client`` / ``provider._client``) for wrappers like
-    ``AcpProvider`` that do not re-export it. Callers pre-filter candidates
+    (``provider.client`` / ``provider._client``) for wrappers that do not
+    re-export it. Callers pre-filter candidates
     against the advertised list, so the explicit-pick guard inside
     ``AcpClient.set_model`` / ``AcpSessionProvider.set_model`` does not fire
     for a served candidate.
@@ -610,6 +861,24 @@ def provider_advertised_ids(provider: Any) -> list[str]:
         return advertised_model_ids(getter())
     except Exception:
         return []
+
+
+def provider_backend(provider: Any) -> str:
+    """The provider's ACP backend id, ``""`` when unknown.
+
+    Lets the fallback walk fold a bare pair-id chain entry (e.g. a codex pin)
+    to its advertised wire spelling via :func:`resolve_pin_spelling_on`, the
+    same backend-aware fold the cold-start, substitute and warm-pool wire
+    sites apply; an unknown backend keeps the generic (backend-less) fold.
+    """
+    for attr in ("backend",):
+        try:
+            val = getattr(provider, attr, "")
+        except Exception:  # pragma: no cover - exotic property getters
+            val = ""
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    return ""
 
 
 def provider_active_model(provider: Any) -> str:
@@ -915,9 +1184,13 @@ def _extract_tool_input_strings(tool_input: str) -> list[str]:
 # gateway and losing the whole turn.
 #
 # Known cost of that trade: a permission-gated write of a benign file larger
-# than this lands its whole content in ``tool_input`` and is refused. The durable
-# fix is to stop running the SHELL-COMMAND matcher over fields that never carry a
-# command. Tracked in https://github.com/kirodotdev/KiroCrew/issues/8053.
+# than this lands its whole content in ``tool_input`` and is refused WHEN the
+# frame's provenance is unknown. An edit with trusted provenance is judged by
+# its target path instead (``_edit_target_denial``), and every other non-shell
+# tool with trusted provenance has its document-body fields skipped
+# (``platform.tool_paths.command_shaped_strings``), so neither reaches this
+# ceiling on a body; the residual is the unclassified frame, which keeps the
+# full scan by design. Tracked in https://github.com/kirodotdev/KiroCrew/issues/8053.
 #
 # One number for both tiers: the shell gate refuses a command above
 # ``security.MAX_SCANNABLE_COMMAND_CHARS`` on its own (every caller, not only
@@ -926,9 +1199,44 @@ def _extract_tool_input_strings(tool_input: str) -> list[str]:
 _MAX_SCANNABLE_TOOL_INPUT_CHARS = MAX_SCANNABLE_COMMAND_CHARS
 
 
+def _path_tier_exempt(event: object) -> str | None:
+    """The one string of *event* the path tier does not resolve, or ``None``.
+
+    The path tier reads a PATH; a shell tool's COMMAND is command text, which the
+    gate does not match paths in because the OS sandbox holds the credential
+    stores away from the shell. Only the recovered command text
+    (``AcpEvent.shell_command``) is exempt, and only when the client classified
+    the frame as shell AND no MCP server serves it: kiro-cli can classify an
+    execute-kind frame as shell while also naming an MCP server
+    (``classify_tool_call`` carries the identity and keeps the shell verdict),
+    and an MCP-served tool runs outside the sandbox. Every OTHER string of a
+    shell frame stays path-gated -- a shell-kind tool with structured
+    parameters (kiro-cli ``use_aws``) can carry a discrete credential path as an
+    argument, and in ``standard`` sandbox mode ``~/.aws`` is visible to the
+    shell, so the path tier over that argument is the control there, not the
+    sandbox. Same condition as ``hooks.on_tool_call``; both read the client's
+    own classification, never the payload's.
+    """
+    if not bool(getattr(event, "is_shell", False)):
+        return None
+    if getattr(event, "mcp_server_name", "") or "":
+        return None
+    command = getattr(event, "shell_command", None)
+    return command if isinstance(command, str) and command else None
+
+
+def _is_exempt_command_text(text: str, exempt_command: str | None) -> bool:
+    """*text* is the exempt command, with or without a display prefix."""
+    if exempt_command is None:
+        return False
+    return text == exempt_command or _normalize_tool_name(text) == exempt_command
+
+
 def _title_denial(
     title: str,
     denied_regexes: list[str] | None,
+    *,
+    exempt_command: str | None = None,
 ) -> tuple[str, str] | None:
     """Return the always-enforced denial for the tool *title*, or ``None``.
 
@@ -941,7 +1249,21 @@ def _title_denial(
     place. The tuple is ``(kind, reason)`` with *kind* ``"path"`` / ``"bash"`` /
     ``"regex"``; the reasons are the exact strings the on-loop checks produced.
     """
-    if is_sensitive_path(title):
+    # The path tier reads a PATH. A shell tool's recovered COMMAND is command text,
+    # which the gate deliberately does not match paths in (``hooks.on_tool_call``
+    # makes the same exemption): resolving ``cd /x && grep ...`` as a filename
+    # never matched, but it spent a resolver round-trip per call and, under a
+    # stall, refused the command as a sensitive path. ``exempt_command`` is
+    # :func:`_path_tier_exempt`'s answer -- the one string that is that text; a
+    # title that is not the command stays gated.
+    path_refusal = (
+        None if _is_exempt_command_text(title, exempt_command) else sensitive_path_refusal(title)
+    )
+    if path_refusal:
+        # A stall is passed through as worded (recognised by its fixed prefix, which
+        # the deny guidance classifies by); a match keeps this producer's wording.
+        if is_unverifiable_path_refusal(path_refusal):
+            return ("path", path_refusal)
         return ("path", f"Blocked: sensitive path: {title}")
     bash_reason = is_sensitive_bash_command(title)
     if bash_reason:
@@ -952,9 +1274,78 @@ def _title_denial(
     return None
 
 
+def _edit_target_denial(
+    raw_params: dict | None, diff_path: str = ""
+) -> tuple[str, str, str] | None:
+    """The always-enforced denial for a file-EDIT tool call, or ``None``.
+
+    An edit's ``tool_input`` is a DOCUMENT: ``_dispatch.derive_edit_diff`` renders
+    the file's new content (or a strReplace pair) as a unified diff, and that text
+    is what ``event.tool_input`` carries. Handing it to :func:`_first_tool_input_denial`
+    read the document as a shell command line, so writing a Markdown page that says
+    ``git push origin main``, a docstring that says ``kirocrew restart``, or prose
+    that names ``~/.ssh`` was refused -- and a body over
+    :data:`_MAX_SCANNABLE_TOOL_INPUT_CHARS` was refused for its LENGTH (the
+    tool-input length-cap defect). That is the same class the cron-script body
+    gate rework closed: a document is not the shell gate's subject.
+
+    What an edit can actually do is decided by WHERE it writes, so the gate for an
+    edit is the resolved target path, exactly as ``hooks.on_tool_call`` decides it:
+    every accepted path spelling in the params (``target_paths``) goes through
+    :func:`is_sensitive_write_path`, which is the read+write keystone PLUS the
+    write-only tier (config, the agents dir). A walk that hit its work cap is
+    denied as unverifiable, mirroring the hook gate's fail-closed shape. The
+    title-tier scan of the request still runs before this, unchanged.
+
+    The target set is the UNION of the params' path spellings and *diff_path*,
+    the path the tool_call's ``{"type": "diff"}`` content block named. A backend
+    may stream trusted params that carry no path key at all and name the file
+    only in that block (``_dispatch`` caches it per toolCallId onto the
+    permission event as ``diff_path``), so judging the params alone would judge
+    nothing. Two unverifiable shapes fail closed: an EMPTY union (an edit whose
+    params and content block together name no target has no proven target to
+    judge, and the document scan is not a fallback here -- a document that
+    happens to contain no denied text is not evidence that the write is safe),
+    and an UNANCHORED diff path (relative after ``~``/env expansion, which
+    resolves against the gateway CWD rather than the agent workspace, so its
+    sensitivity cannot be established -- see ``edit_target_candidates``). The
+    caller reaches this on trusted provenance (see ``_resolve_permission``) or
+    on a client-cached diff block, which is write-plane evidence on its own;
+    a call with neither trusted params nor a diff block never gets here and
+    keeps the document scan.
+    """
+    candidates = edit_target_candidates(raw_params, diff_path)
+    if candidates.truncated:
+        return (
+            "path",
+            "Blocked: tool arguments too large to verify for sensitive paths " "(deny-by-default)",
+            "",
+        )
+    if candidates.unanchored:
+        return (
+            "path",
+            "Blocked: file edit names a relative target path that cannot be "
+            "verified (deny-by-default)",
+            "",
+        )
+    if not candidates:
+        return (
+            "path",
+            "Blocked: file edit names no target path to verify (deny-by-default)",
+            "",
+        )
+    for path in candidates:
+        if is_sensitive_write_path(path):
+            return ("path", f"Blocked: write to protected path: {path}", path)
+    return None
+
+
 def _first_tool_input_denial(
     strings: list[str],
     denied_regexes: list[str] | None,
+    *,
+    exempt_command: str | None = None,
+    command_rules: bool = True,
 ) -> tuple[str, str, str] | None:
     """Return the first tool_input denial among *strings*, or ``None``.
 
@@ -971,6 +1362,11 @@ def _first_tool_input_denial(
     own wall clock -- a denied oversized string is recoverable, a worker parked
     for minutes on a pathological payload is not -- and an oversized one is
     denied rather than scanned or skipped.
+
+    ``command_rules=False`` applies the size ceiling and the path tier only:
+    the caller passes it for a named MCP document body
+    (``platform.tool_paths.MCP_DOCUMENT_BODY_FIELDS``), which is stored text
+    and not a command line.
 
     The tuple is ``(kind, reason, matched_string)`` where *kind* is
     ``"path"`` / ``"bash"`` / ``"regex"`` / ``"oversize"``. Mechanism
@@ -990,8 +1386,19 @@ def _first_tool_input_denial(
                 ),
                 s[:64],
             )
-        if is_sensitive_path(s):
+        # Same exemption as ``_title_denial``: only the recovered command text is
+        # command text. A shell frame's OTHER payload strings (a structured
+        # ``use_aws`` argument naming a path) stay path-gated -- see
+        # :func:`_path_tier_exempt`.
+        path_refusal = (
+            None if _is_exempt_command_text(s, exempt_command) else sensitive_path_refusal(s)
+        )
+        if path_refusal:
+            if is_unverifiable_path_refusal(path_refusal):
+                return ("path", path_refusal, s)
             return ("path", f"Blocked: sensitive path in tool_input: {s}", s)
+        if not command_rules:
+            continue
         _input_bash = is_sensitive_bash_command(s)
         if _input_bash:
             return ("bash", _input_bash, s)
@@ -1005,11 +1412,145 @@ def _first_tool_input_denial(
 
 
 class ToolApprovalPolicy(Enum):
-    """How to handle tool permission requests during streaming."""
+    """How to handle tool permission requests during streaming.
+
+    ``READ_ONLY`` is the dashboard "Reads" approval mode's semantics ported to
+    surfaces that have no interactive approver: provably read-only calls are
+    auto-approved through the SAME hook gate the Reads mode uses (deny floor
+    first, then the read-only classifier), and every call that is not provably
+    read-only is rejected — where the Reads mode would ask, this policy
+    refuses. Requires ``hooks``; without a gate to classify with it fails
+    closed and rejects everything, exactly like ``REJECT_ALL``.
+
+    Only the classifier's own verdict approves under ``READ_ONLY``. The hook
+    gate is asked ``classifier_only``, so its GRANT tiers — the operator's
+    ``auto_approve_tools`` globs and the app-own-server rule, which vouch for
+    the caller and say nothing about what the call does — are skipped rather
+    than honoured, and an auto-approve is then trusted only when the result
+    carries the classifier's ``read_only`` tag. A grant that shadows a
+    read-only call therefore still gets the read approved (by the classifier),
+    and a grant that shadows a write approves nothing.
+
+    With no approver to catch an over-approval, ``classifier_only`` also
+    restricts proof to HOST-TRUSTED facts: the recovered shell command judged
+    by ``is_read_only_bash``, or a built-in the host knows to be read-only
+    (``hooks._HOST_READ_ONLY_BUILTIN_TOOLS``) named by the non-model-authored
+    ``_meta.kiro.toolName`` with no MCP server behind it, and only when the
+    event carries ``mcp_identity_trusted`` (the pair came from the
+    provenance-verified caches, not an inline payload). The agent-influenced
+    ACP ``kind`` and the model-authored title may narrow but never prove, so a
+    mutating tool labelled ``kind="read"``, a read-looking title, and any
+    MCP-served tool (no host-trusted read-only marker exists for one) are
+    rejected here where the interactive Reads mode would still ask.
+    """
 
     AUTO_APPROVE = "auto_approve"
     REJECT_ALL = "reject_all"
     HOOK_BASED = "hook_based"
+    READ_ONLY = "read_only"
+
+
+#: Rejects scheduled while a deny site was being CANCELLED mid-steer. Strongly
+#: referenced so the event loop cannot drop them before they answer the wire.
+_orphan_rejects: set[asyncio.Task[Any]] = set()
+
+
+async def _steer_host_deny(
+    provider: Any, event: Any, reason: str, *, cause: str, title: str = ""
+) -> None:
+    """Tell the model, in-band, that the HOST denied this call -- not the person.
+
+    A rejected permission reaches the model as kiro-cli's fixed "User denied tool
+    execution", so without this it reads a refusal that never happened and
+    abandons or routes around a call nobody objected to. Awaited immediately
+    BEFORE each host-deny ``reject_tool`` in this module: while the permission
+    request is still unanswered the turn is provably in flight, which is what
+    gets the notice queued rather than dropped (see ``kiro_crew.deny_notice``).
+
+    Every deny in this module is a HOST verdict, but *cause* says which kind,
+    and it is REQUIRED because the wrong noun sends the model the wrong way.
+    ``DENY_CAUSE_POLICY`` is for a safety rule judging the call itself (an
+    always-deny pattern, a hook deny, a withheld name grant): its notice appends
+    class-specific remediation keyed off the reason and the model's own title.
+    ``DENY_CAUSE_SURFACE_POLICY`` is for the surface refusing the call (the
+    reject-all / read-only policies, the tool-free background one-liner): no
+    remediation, because on a surface where the tool cannot run at all, telling
+    the model which sanctioned command to run instead -- triggered by nothing
+    more than a credential-shaped word in its own title -- would be a second
+    wall. ``DENY_CAUSE_INVALID_NAME`` is for the empty title, the one deny the
+    model can simply fix. The one genuine USER rejection
+    (``interactive_rejected``) must NOT call this: there kiro-cli's wording is
+    the truth, and "this was NOT a user action" would be a lie.
+    ``test_llm_helpers_deny_notice`` walks the file to keep both halves honest.
+
+    *reason* may echo agent-authored text (a matched path, a hook's reason), so it
+    is redacted here; the shared helper redacts the title. *title* overrides the
+    event's own when a caller renders the call differently -- the channel agent
+    stream (``kiro_crew.channel``) reuses this helper and names a permission
+    request by ``event.text`` where ``event.title`` is empty. The reason is
+    otherwise passed VERBATIM, as the chat runner does: a rule-authored refusal's
+    fixed lead (``Blocked by security policy: ``, the unverifiable-path stall
+    prefix) is the structural key ``deny_guidance.classify_deny`` reads before any
+    text scan, and trimming it would let an agent-spelled path move a stall into
+    the credential class. The synthetic reasons this module authors carry no lead
+    of their own, since the notice writes ``Blocked: <title>: <reason>`` itself,
+    and a title-less call (the empty-title deny) is named rather than left as a
+    bare colon. Best-effort by
+    construction: ``steer_refusal_notice`` probes ``supports_refusal_steer`` and swallows
+    every failure, so a backend without a steer channel behaves exactly as before
+    and the caller's reject always runs.
+
+    Cancellation mid-steer (a timed background turn, a stalled pipe hitting the
+    turn deadline) must still answer the wire: a stranded
+    ``session/request_permission`` blocks the backend forever and wedges every
+    later turn behind it, and the caller's own ``reject_tool`` is the statement
+    the cancellation skips. The reject is scheduled as a strongly referenced
+    task (``_orphan_rejects`` keeps it alive, ``_orphan_reject_done`` retires it
+    and reads its outcome) and this coroutine re-raises IMMEDIATELY. It does not
+    wait for the reject, not even bounded: the cancellation IS the caller's
+    deadline, and the pipe that stalled the steer is the pipe the reject drains
+    into, so any wait here runs after the caller's budget is spent and stretches
+    a declared bound (a 5 s ``run_bg_oneliner`` would resolve at 10 s). The
+    event loop steps the orphan task while the caller unwinds. Whether it still
+    reaches the wire depends on the caller's teardown: the multiplexed
+    ``_ProviderBgSession.destroy()`` only releases its turn semaphore and the
+    shared transport stays up, while a runtime-backed ``AcpSessionHandle`` is
+    terminated by its ``destroy()`` and the write then fails -- which
+    ``_orphan_reject_done`` reports as the unanswered request it is, the same
+    end state the caller's own skipped ``reject_tool`` would have left behind,
+    now visible in the log. The SEL row for the decision is already written --
+    every caller audits before this await.
+    """
+    safe_reason, _ = redact_exfiltration_urls(reason or "")
+    safe_reason, _ = redact_credentials(safe_reason)
+    title = title or str(getattr(event, "title", "") or "") or "unnamed tool call"
+    try:
+        await steer_refusal_notice(provider, title, safe_reason, cause=cause)
+    except asyncio.CancelledError:
+        reject = asyncio.ensure_future(provider.reject_tool(event.request_id))
+        _orphan_rejects.add(reject)
+        reject.add_done_callback(_orphan_reject_done)
+        raise
+
+
+def _orphan_reject_done(task: asyncio.Task[Any]) -> None:
+    """Retire an orphan reject and RETRIEVE its outcome.
+
+    ``_steer_host_deny`` re-raises without awaiting this task; if the caller then
+    tears the transport down, the write fails after nobody is awaiting it.
+    Reading the exception here is what keeps
+    asyncio from reporting a bare "Task exception was never retrieved" at GC
+    instead of the real signal -- that a permission request went unanswered.
+    """
+    _orphan_rejects.discard(task)
+    if task.cancelled():
+        logger.debug("orphan reject_tool cancelled before it reached the wire")
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.warning(
+            "orphan reject_tool failed; the permission request may be unanswered: %r", exc
+        )
 
 
 # ── Stream and Collect ──
@@ -1024,6 +1565,10 @@ async def run_bg_oneliner(
     sel_session_key: str = "_bg",
     timeout: float | None = None,
     strict_model: bool = False,
+    crew_log_kind: str = "",
+    crew_log_session_key: str = "",
+    max_output_bytes: int | None = None,
+    retry_rejected_model: bool = True,
 ) -> str:
     """Stream a single prompt through an ephemeral background session and return
     the accumulated text.
@@ -1047,13 +1592,31 @@ async def run_bg_oneliner(
     are audited under the generic ``"bg_oneliner"`` source rather than silently
     dropping the SEL event.
 
+    ``crew_log_kind`` and ``crew_log_session_key`` name what this call is and which
+    session it is charged to, and BOTH are required for it to reach that session's
+    crew log. Most callers are not charged to any one session -- a tip, a folder icon,
+    a cron label -- so the default is to write nothing rather than attribute shared
+    work to whichever session happened to trigger it.
+
     Errors propagate to the caller (the ``_bg`` session is still ``destroy()``-ed
     in ``finally``): callers that want best-effort "" fallback wrap the call
     themselves, while callers that surface the failure (title/nav) get it
     unchanged. ``sessions`` is duck-typed (a ``SessionManager``-like object
     exposing ``get_bg_session()``) rather than statically imported, so this
     low-level helper stays free of a dashboard/session import cycle.
+
+    ``max_output_bytes`` bounds accumulated UTF-8 text before concatenation;
+    ``retry_rejected_model=False`` disables the extra reactive model call for a
+    caller that accounts each attempt against a hard call budget. Neither changes
+    the configured-model resolution or the default behavior of other callers.
     """
+    # Pinned before the acquisition below, not in the teardown that writes it: a
+    # slot reset, switch or compaction gives the successor a new ACP session id,
+    # and a teardown-time lookup would file this spend under a session that never
+    # incurred it. The acquisition is itself a suspension point -- it can take the
+    # background runtime lock and start a runtime -- so resolving after it is
+    # already late enough to name the successor.
+    _crew_log_owner = _background_crew_log_owner(sessions, crew_log_session_key, crew_log_kind)
     session = await sessions.get_bg_session()
     # The stats object as it stands BEFORE this turn. The runner replaces it when
     # a turn actually begins, so comparing identity at teardown separates a turn
@@ -1068,6 +1631,7 @@ async def run_bg_oneliner(
 
     async def _drive(model_to_use: str | None) -> str:
         text = ""
+        output_bytes = 0
         set_model = getattr(session, "set_model", None)
         # Pass the caller's preference (often the governed "auto") to set_model,
         # which resolves it against the session's advertised model list at the
@@ -1109,8 +1673,17 @@ async def run_bg_oneliner(
             raise RuntimeError(
                 "run_bg_oneliner(strict_model=True) requires a session with set_model()"
             )
-        async for event in session.prompt(prompt):
+        # A one-liner's prompt is text ABOUT a session (a summary, a title, a
+        # label), so any image path in it is quoted history, not an attachment.
+        # Left in, the prompt builder re-inlines every still-readable file as an
+        # image block: a session summary carried one per pasted screenshot, and
+        # a text-only background model rejected the whole request on each pass.
+        async for event in session.prompt(strip_image_refs(prompt)):
             if event.kind == EVENT_TEXT_CHUNK:
+                if max_output_bytes is not None:
+                    output_bytes += len(event.text.encode("utf-8"))
+                    if output_bytes > max_output_bytes:
+                        raise ValueError("background response exceeded its output budget")
                 text += event.text
             elif event.kind == EVENT_PERMISSION_REQUEST:
                 # Audit the denial BEFORE rejecting: every permission decision
@@ -1118,12 +1691,21 @@ async def run_bg_oneliner(
                 # reject_tool transport failure must NOT skip the audit.
                 # ``sel_source`` carries a non-empty default so callers that
                 # don't attribute a feature still produce an audit record.
+                # The audit raises: a deny whose row cannot be written is not
+                # answered on the wire, so it never proceeds unaudited.
                 _sel().log_tool_invocation(
                     session_key=sel_session_key,
                     tool_name=getattr(event, "title", "unknown") or "unknown",
                     outcome="denied",
                     source=sel_source or "bg_oneliner",
                     request_id=str(event.request_id),
+                )
+                await _steer_host_deny(
+                    session,
+                    event,
+                    "this background one-liner is tool-free by contract; answer "
+                    "from the prompt alone",
+                    cause=DENY_CAUSE_SURFACE_POLICY,
                 )
                 await session.reject_tool(event.request_id)
             elif event.kind == EVENT_TOOL_CALL:
@@ -1162,7 +1744,7 @@ async def run_bg_oneliner(
             advertised = getattr(exc, "advertised", None) or []
             fallback = (
                 first_advertised_fallback(advertised, rejected)
-                if rejected and not strict_model
+                if rejected and not strict_model and retry_rejected_model
                 else None
             )
             if not fallback:
@@ -1199,6 +1781,21 @@ async def run_bg_oneliner(
                 # cache tokens with zero credits AND zero fresh token counts;
                 # a gate testing only the kiro dimensions silently drops it.
                 if usage_has_billing(usage):
+                    _served = str(getattr(session, "served_model", "") or "").strip()
+                    _elapsed_ms = int((time.monotonic() - turn_started) * 1000)
+                    # Same numbers, second destination: the usage store answers
+                    # "what did the account spend", the owning session's ledger
+                    # answers "what was spent on THIS session's behalf". A caller
+                    # that names neither a kind nor an owner is work not charged to
+                    # any one session (tips, a cron label) and writes nothing.
+                    _record_background_crew_log(
+                        _crew_log_owner,
+                        crew_log_kind,
+                        usage,
+                        model=_served,
+                        provider=_provider_label(session),
+                        elapsed_ms=_elapsed_ms,
+                    )
                     await persist_token_record_async(
                         sel_session_key,
                         # The model the session SERVED, never the one requested: a
@@ -1206,17 +1803,108 @@ async def run_bg_oneliner(
                         # above, so recording the request would bill the spend to a
                         # model that did not run. An unreadable served model falls
                         # through to model_source rather than naming a guess.
-                        str(getattr(session, "served_model", "") or "").strip(),
+                        _served,
                         usage,
                         _provider_label(session),
                         surface=f"bg:{sel_source}",
-                        elapsed_ms=int((time.monotonic() - turn_started) * 1000),
+                        elapsed_ms=_elapsed_ms,
                         model_source=session,
                     )
             except Exception:
                 logger.debug("bg oneliner accounting failed source=%s", sel_source, exc_info=True)
         finally:
             await session.destroy()
+
+
+def _background_crew_log_owner(sessions: Any, crew_log_session_key: str, crew_log_kind: str) -> str:
+    """The crew log unit a background call is charged to, resolved BEFORE the call.
+
+    Resolution has to happen here rather than in the teardown that writes the
+    entry, and the reason is the resolver's own contract: it answers which unit a
+    slot's work is landing in NOW. A slot can be reset, switched, or compacted
+    while the model call is in flight, and the successor cold-starts a new ACP
+    session id -- so a teardown-time lookup would hand this call's spend to a
+    session that did not incur it, silently, in an append-only file. Reading it
+    before the call pins the unit that was current when the work was ordered.
+
+    Answers ``""`` when the caller named no owner or no kind, which is most of
+    them: a background call is shared infrastructure by default, and picking a
+    session for a tip or a cron label would put someone else's cost in a user's
+    log. Also ``""`` when the flag is off or the owner cannot be resolved.
+    """
+    if not crew_log_session_key or not crew_log_kind:
+        return ""
+    try:
+        from kiro_crew.crew_log import emit as crew_log_emit
+        from kiro_crew.crew_log.resolve import unit_for_session_key
+
+        if not crew_log_emit.enabled():
+            return ""
+        # The session manager the caller already holds is the resolver's only input
+        # here, and it is enough: a background call runs BETWEEN the owner's turns,
+        # where the owning slot holds no live ACP client and the registry is the
+        # authoritative source anyway.
+        return unit_for_session_key(sessions, crew_log_session_key)
+    except Exception:
+        logger.debug(
+            "crew log: resolving a background owner failed kind=%s",
+            crew_log_kind,
+            exc_info=True,
+        )
+        return ""
+
+
+def _record_background_crew_log(
+    owner_sid: str,
+    crew_log_kind: str,
+    usage: Any,
+    *,
+    model: str,
+    provider: str,
+    elapsed_ms: int,
+) -> None:
+    """File one background model call in the crew log of the session it served.
+
+    ``owner_sid`` is the unit :func:`_background_crew_log_owner` pinned before the
+    call, never a key resolved here -- see that function for why the timing is the
+    whole point. An empty value means "do not write", which covers an unnamed
+    caller, a disabled flag and an unresolvable owner alike.
+
+    Both background entry points -- the one-liner and the shared-session context
+    manager -- reach this from the same place in their teardown: after the turn's
+    usage has been snapshotted and the same ``usage_has_billing`` gate the usage
+    store uses has passed. So the two agree on WHETHER a call is billable, which is
+    the judgement that would otherwise drift. They do not agree on persistence: the
+    usage store writes on its own path and can fail there, and this entry is queued
+    for a writer that can drop it at a ceiling, so either side can be missing a call
+    the other recorded.
+
+    Best-effort, like the accounting beside it. This is describing spend, not
+    controlling it, and it must never be why a background task raises.
+    """
+    if not owner_sid or not crew_log_kind:
+        return
+    try:
+        from kiro_crew.crew_log import emit as crew_log_emit
+
+        crew_log_emit.on_background_completed(
+            owner_sid,
+            kind=crew_log_kind,
+            model=model,
+            provider=provider,
+            credits=float(getattr(usage, "credits", 0.0) or 0.0),
+            input_tokens=int(getattr(usage, "input_tokens", 0) or 0),
+            output_tokens=int(getattr(usage, "output_tokens", 0) or 0),
+            cache_read_tokens=int(getattr(usage, "cache_read_tokens", 0) or 0),
+            cache_write_tokens=int(getattr(usage, "cache_creation_tokens", 0) or 0),
+            duration_ms=int(elapsed_ms),
+        )
+    except Exception:
+        logger.debug(
+            "crew log: recording a background call failed kind=%s",
+            crew_log_kind,
+            exc_info=True,
+        )
 
 
 def _billing_stats(provider: Any) -> Any:
@@ -1273,7 +1961,7 @@ def _attempt_usage(provider: Any, *, since: Any = _NO_PRIOR_STATS) -> TurnUsage:
         # predating the converter) fall through to the credits-only constructor,
         # which is byte-identical for the kiro seam. The converter's failure is
         # contained so a faulty to_turn_usage degrades to the credits read
-        # rather than silently zeroing a turn that previously billed.
+        # rather than silently zeroing a turn that did bill.
         to_usage = getattr(stats, "to_turn_usage", None)
         if callable(to_usage):
             try:
@@ -1393,23 +2081,30 @@ def _billing_stat_holders(provider: Any) -> "list[Any]":
     provider on ``_handle``, and the shared background session hands non-kiro
     callers a thin adapter whose only link to the runner is ``_sess.provider``.
     Walking all of them keeps a background turn on the claude_code / bedrock seam
-    from reporting 0 credits for a turn that was billed. Bounded and
-    identity-deduped so a self-referential wrapper chain cannot loop.
+    from reporting 0 credits for a turn that was billed. Depth-first along
+    :data:`_BILLING_STAT_HOLDERS` and identity-deduped, so a self-referential
+    wrapper chain cannot loop and a stack of wrapper layers cannot exhaust the
+    node budget on holder-less siblings before the runner is reached — the
+    stats sit at the bottom of the chain, and a breadth-first walk with a node
+    budget stops short of them a few layers down. :data:`_WRAPPER_WALK_MAX_NODES`
+    is a runaway guard for attribute-synthesizing sources, not a depth limit.
 
     A name absent from this tuple is exactly how a new seam's spend went
-    unreported, which is why the billing read now prefers the provider's declared
+    unreported, which is why the billing read prefers the provider's declared
     :meth:`LLMProvider.billing_stats` and only falls back here.
     """
     out: list[Any] = []
     seen: set[int] = set()
+    # A stack: the LAST entry is visited next, so children are pushed in
+    # reverse holder order to come off in holder order.
     frontier: list[Any] = [provider]
     while frontier and len(out) < _WRAPPER_WALK_MAX_NODES:
-        node = frontier.pop(0)
+        node = frontier.pop()
         if node is None or id(node) in seen:
             continue
         seen.add(id(node))
         out.append(node)
-        for attr in ("_client", "_handle", "_sess", "provider"):
+        for attr in reversed(_BILLING_STAT_HOLDERS):
             frontier.append(getattr(node, attr, None))
     return out
 
@@ -1449,12 +2144,37 @@ def _provider_label(provider: Any) -> str:
         return ""
 
 
+async def _cleanup_memory_consolidation_session(
+    sessions: Any, key: str, memory_store: str, log: Any
+) -> None:
+    """Retire one generated runtime before removing its private artifacts."""
+    try:
+        await sessions.remove(key)
+    except Exception:
+        # A provider that failed to retire may still have a live process or a
+        # late PID proof. Preserve both the transcript and binding in that case;
+        # deleting authority while the process survives would be unsafe.
+        logger.debug("memory consolidation session retirement failed", exc_info=True)
+        return
+    try:
+
+        # remove() waits for retirement but preserves resumable mappings. This
+        # generated UUID has no user continuation, so discard that mapping too.
+        await sessions.destroy(key)
+        await asyncio.to_thread(log.delete_memory_consolidation_session, key, memory_store)
+    except Exception:
+        logger.debug("memory consolidation artifact cleanup failed", exc_info=True)
+
+
 @asynccontextmanager
 async def background_turn(
     sessions: Any,
     *,
     task: str,
     agent: "str | None" = None,
+    memory_store: str = "",
+    crew_log_kind: str = "",
+    crew_log_session_key: str = "",
 ) -> "AsyncIterator[Any]":
     """Take the shared background session for ONE turn, then release and account.
 
@@ -1486,10 +2206,40 @@ async def background_turn(
     """
     from kiro_crew.session import BACKGROUND_AGENT, BACKGROUND_KEY  # circular import
 
-    if agent is None:
-        client, _new, _resumed = await sessions.get_or_create(BACKGROUND_KEY)
-    else:
-        client, _new, _resumed = await sessions.get_or_create(BACKGROUND_KEY, agent=agent)
+    key = BACKGROUND_KEY
+    # Pinned before the first suspension point for the same reason the other
+    # background helper does it: the owning slot can be reset or recycled while
+    # this turn runs, and its successor is a different ledger unit. Everything the
+    # resolver reads is a parameter, so it does not need the session this function
+    # is about to acquire.
+    _crew_log_owner = _background_crew_log_owner(sessions, crew_log_session_key, crew_log_kind)
+    if memory_store:
+        from uuid import uuid4
+
+        from kiro_crew.execution_context import bind_session_execution, execution_for_store
+        from kiro_crew.history import ConversationLog
+        from kiro_crew.memory_stores import memory_store_version, require_memory_store
+
+        await asyncio.to_thread(require_memory_store, memory_store)
+        if memory_store_version(memory_store) != 2:
+            raise ValueError("Dedicated member consolidation requires private V2 memory")
+        key = f"memory-consolidation:{memory_store}:{uuid4().hex}"
+        log = ConversationLog()
+        try:
+            execution = execution_for_store(memory_store, template_id=agent or "kirocrew")
+            await asyncio.to_thread(bind_session_execution, key, execution)
+        except BaseException:
+            await _cleanup_memory_consolidation_session(sessions, key, memory_store, log)
+            raise
+    try:
+        if agent is None:
+            client, _new, _resumed = await sessions.get_or_create(key)
+        else:
+            client, _new, _resumed = await sessions.get_or_create(key, agent=agent)
+    except BaseException:
+        if memory_store:
+            await _cleanup_memory_consolidation_session(sessions, key, memory_store, log)
+        raise
     # The stats object as it stands BEFORE this turn. The shared session serves
     # many turns, and the runner replaces this object only once a turn actually
     # begins, so identity is what separates a turn that ran from one whose
@@ -1517,7 +2267,7 @@ async def background_turn(
         # and an await ordered ahead of this would let a cancelled task hold the
         # shared semaphore forever.
         try:
-            sessions.release(BACKGROUND_KEY)
+            sessions.release(key)
         except Exception:
             logger.debug("background session release failed task=%s", task, exc_info=True)
         # Recycle sits in a finally for the same cancellation reason, and follows
@@ -1538,8 +2288,16 @@ async def background_turn(
                 # shared predicate covers the claude seam's cost and cache
                 # dimensions alongside the kiro credits/token signals.
                 if usage_has_billing(usage):
+                    _record_background_crew_log(
+                        _crew_log_owner,
+                        crew_log_kind,
+                        usage,
+                        model=str(getattr(client, "served_model", "") or "").strip(),
+                        provider=_provider_label(client),
+                        elapsed_ms=turn_elapsed_ms,
+                    )
                     await persist_token_record_async(
-                        BACKGROUND_KEY,
+                        key,
                         "",
                         usage,
                         _provider_label(client),
@@ -1552,7 +2310,10 @@ async def background_turn(
                 logger.debug("background turn accounting failed task=%s", task, exc_info=True)
         finally:
             try:
-                await sessions.recycle_background()
+                if memory_store:
+                    await _cleanup_memory_consolidation_session(sessions, key, memory_store, log)
+                else:
+                    await sessions.recycle_background()
             except Exception:
                 logger.debug("background recycle failed task=%s", task, exc_info=True)
 
@@ -1585,7 +2346,9 @@ async def stream_and_collect(
         provider: The LLM provider to stream through.
         message: The prompt to send.
         approval_policy: How to handle tool permission requests.
-        hooks: HookManager for HOOK_BASED approval policy.
+        hooks: HookManager for the HOOK_BASED and READ_ONLY approval policies.
+            AUTO_APPROVE consults the shared identity-aware permission floor
+            directly.
         on_chunk: Optional callback invoked with each text chunk (for progress).
         on_tool_approval: Optional async callback for interactive approval.
         on_steer_consumed: Optional callback invoked with the backend's
@@ -1625,13 +2388,11 @@ async def stream_and_collect(
         app: Owning app name, forwarded to the gate so the app's governance
             PROFILE is resolved — not just the enterprise ceiling.
 
-            All three matter for ``HOOK_BASED`` callers specifically. The gate
-            resolves ``ceiling ∩ profile``, and it can only look up a profile it
-            has been told the name of; with all three empty it applied the
-            ceiling alone, so an app profile narrowing (say) ``filesystem.write``
-            was silently not enforced for tools this helper approved. Callers
-            using ``REJECT_ALL`` or ``AUTO_APPROVE`` are unaffected — the first
-            runs no tools, the second never consults the gate.
+            All three matter for ``AUTO_APPROVE``, ``HOOK_BASED``, and
+            ``READ_ONLY`` callers. The gate resolves ``ceiling ∩ profile``, and
+            it can only look up a profile it has been told the name of; with all
+            three empty it applies the ceiling alone. ``REJECT_ALL`` runs no
+            tools. Every other policy consults the gate before an approval.
         fallback_models: Ordered chain of model ids tried when the same-model
             transient budget exhausts on a throttle/capacity error (Case 2.75).
             Empty (the default) disables the chain — behavior is byte-for-byte
@@ -1651,15 +2412,13 @@ async def stream_and_collect(
         m.strip() for m in (fallback_models or ()) if isinstance(m, str) and m.strip()
     )
     _fb_state = FallbackState(_fb_chain) if _fb_chain else None
-    # Cross-attempt tool-activity flag for the fallback chain ONLY. Case 2's
-    # same-model retry keys off ``result_text`` alone (pre-existing behavior,
-    # pinned byte-for-byte by the empty-chain regression tests), but the chain
-    # replays the ORIGINAL prompt up to FALLBACK_CANDIDATE_ATTEMPTS × len(chain)
-    # more times — a tool that completed an external mutation before any text
-    # streamed would be re-run on every one of them. Same activity predicate as
-    # the sub-agent ladder and the dashboard's ``_turn_emitted``: any fired
-    # tool call blocks the replay, text or no text.
-    _fb_tool_activity = False
+    # Cross-attempt tool activity for every retry that replays the ORIGINAL
+    # prompt. A tool can complete an external mutation before any text streams,
+    # so both the same-model retry (Case 2) and fallback chain (Case 2.75) stop
+    # once any attempt fires a tool call. Prompt-busy keeps its separate retry
+    # contract, but activity from that attempt remains sticky for a later
+    # transient error.
+    _turn_tool_activity = False
     # Sticky-restore probe (§restore policy): if an earlier turn on this
     # provider fell back, try ONCE to move back to the primary before this
     # turn streams. Quiet on success (log only); a still-throttled primary
@@ -1731,9 +2490,9 @@ async def stream_and_collect(
                 elif event.kind == EVENT_TOOL_CALL:
                     tool_call_count += 1
                     # Sticky across attempts (never reset in the retry loop):
-                    # once ANY attempt fired a tool, the fallback chain must
-                    # not replay the original prompt — see _fb_tool_activity.
-                    _fb_tool_activity = True
+                    # once ANY attempt fired a tool, a transient path must not
+                    # replay the original prompt — see _turn_tool_activity.
+                    _turn_tool_activity = True
                     if on_tool_gate:
                         executed_calls.append((event.tool_call_id or "", event.title or ""))
                     if max_turns is not None and tool_call_count > max_turns:
@@ -1776,18 +2535,14 @@ async def stream_and_collect(
             return result_text
         except AcpError as exc:
             msg = str(exc)
-            # Prompt-busy is matched STRUCTURALLY first, with the substring kept
-            # as a fallback. _format_acp_error rewrites the backend's "prompt
-            # already in progress" into friendly prose that no longer carries
-            # the marker, so a string-only check silently loses BOTH arms below
-            # (cancel+retry and PromptBusyExhaustedError) for any producer that
-            # formats before raising — which the shared-runtime AcpSessionHandle
-            # now does. Unattended callers (workflows/agent_pool, handlers/side,
-            # the subagent-completion injector) depend on those arms to reset a
-            # wedged parent session, so losing them surfaces a generic failure
-            # and leaves the session stuck. The fallback still covers
-            # unformatted / history-restored messages.
-            busy = isinstance(exc, AcpPromptBusy) or "already in progress" in msg
+            # See is_prompt_busy for why this is structural rather than a
+            # substring test. Both arms below (cancel+retry and
+            # PromptBusyExhaustedError) hang off it, and the unattended callers
+            # (workflows/agent_pool, handlers/side, the subagent-completion
+            # injector) depend on them to reset a wedged parent session, so a
+            # missed wedge surfaces a generic failure and leaves the session
+            # stuck.
+            busy = is_prompt_busy(exc)
 
             # ── Case 1: prompt-busy (provider mid-turn) — cancel + retry. ──
             if busy:
@@ -1827,9 +2582,12 @@ async def stream_and_collect(
             #   - `not result_text`: only retry if NO tokens have streamed yet.
             #     A partial response must not be retried — the re-run would
             #     duplicate the already-emitted output.
+            #   - `not _turn_tool_activity`: only retry if no attempt fired a
+            #     tool call. A textless tool can already have mutated state.
             if (
                 retry_transient
                 and not result_text
+                and not _turn_tool_activity
                 and acp_error_is_transient(exc)
                 and transient_attempts < _TRANSIENT_RETRIES
             ):
@@ -1860,18 +2618,14 @@ async def stream_and_collect(
             # Empty chain ⇒ this block is inert and Case 3 surfaces the error
             # exactly as before this feature existed.
             #
-            # ``not _fb_tool_activity`` is load-bearing over and above
+            # ``not _turn_tool_activity`` is load-bearing over and above
             # ``not result_text``: a tool call can complete an EXTERNAL
-            # MUTATION before any text streams, and unlike Case 2's bounded
-            # same-model retry (pre-existing semantics, deliberately
-            # untouched), the chain replays the original prompt on every
-            # candidate — re-running that mutation each time. Any fired tool
-            # across ANY attempt disables the chain for this call; the error
-            # then surfaces exactly as it did before this feature.
+            # MUTATION before any text streams. Any fired tool across ANY
+            # attempt disables every original-prompt replay for this call.
             if (
                 retry_transient
                 and not result_text
-                and not _fb_tool_activity
+                and not _turn_tool_activity
                 and _fb_state is not None
                 and acp_error_is_transient(exc)
                 and transient_attempts >= _TRANSIENT_RETRIES
@@ -2082,9 +2836,24 @@ async def _resolve_permission(
             **extra,
         )
 
+    # Audit FIRST, before any wire I/O for this decision, at every deny below:
+    # the steer and the rejection both await the ACP pipe, and a backend that
+    # stops reading stdin blocks those awaits until the turn deadline cancels
+    # this coroutine -- an SEL write sequenced after them never runs (see
+    # test_deny_audit_first for the chat runner's statement of the same rule).
+    # The audit raises: a decision whose SEL row cannot be written is not
+    # answered on the wire at all (backend-security-controls), so a deny never
+    # proceeds unaudited. The caller's own deadline bounds the unanswered
+    # request.
     if policy == ToolApprovalPolicy.REJECT_ALL:
-        await provider.reject_tool(event.request_id)
         _log("rejected", metadata={"reason": "reject_all_policy"})
+        await _steer_host_deny(
+            provider,
+            event,
+            "this surface runs under a reject-all tool policy",
+            cause=DENY_CAUSE_SURFACE_POLICY,
+        )
+        await provider.reject_tool(event.request_id)
         return False
 
     # ── Always-enforced deny checks (regardless of approval policy) ──
@@ -2093,8 +2862,11 @@ async def _resolve_permission(
     # be bypassed by callers that skip HookManager wiring.
     normalized = event.title or ""
     if not normalized:
-        await provider.reject_tool(event.request_id)
         _log("denied", error="Blocked: missing tool title", metadata={"mechanism": "always_deny"})
+        await _steer_host_deny(
+            provider, event, "the tool call carried no title", cause=DENY_CAUSE_INVALID_NAME
+        )
+        await provider.reject_tool(event.request_id)
         return False
     # Honor the user's Settings>Security opt-out + governance pins on this
     # surface too (cron / Slack / workflow / heartbeat). Without threading the
@@ -2135,33 +2907,158 @@ async def _resolve_permission(
     # (kiro-cli convention), but tool_input may contain additional arguments or
     # the actual path when the title is a generic tool name (e.g. "Read", "Bash").
     _tool_input = event.tool_input or ""
-    _input_strings = _extract_tool_input_strings(_tool_input) if _tool_input else []
+    # A file EDIT's tool_input is the document being written, not a command
+    # line; its gate is the target path (see _edit_target_denial). The reroute is
+    # taken only on TRUSTED provenance, never on the payload's own word:
+    # ``tool_kind`` on a permission frame is the agent-influenced ``kind`` the
+    # payload carries (display/telemetry metadata -- see _dispatch), so a shell
+    # call could forge ``kind="edit"`` to skip the command scan. What the client
+    # itself established from the preceding tool_call frame is ``shell_classified``
+    # (the shell cache hit) with ``is_shell`` False, and ``raw_params_trusted`` (the
+    # params came from that same cache, not an inline fallback). A frame missing
+    # any of those has no proven target to judge and keeps the document scan as
+    # the fail-closed fallback. Once rerouted, the target set is the params'
+    # paths plus ``event.diff_path`` (the content block's path the client
+    # cached), and an empty set is denied -- see _edit_target_denial.
+    _edit_params = (
+        event.raw_tool_params
+        if (
+            event.tool_kind == _EDIT_TOOL_KIND
+            and event.shell_classified
+            and not event.is_shell
+            and event.raw_params_trusted
+            and isinstance(event.raw_tool_params, dict)
+        )
+        else None
+    )
+    # Target-gating and document-scan suppression are SEPARATE decisions. A
+    # diff content block is write-plane evidence on its own — ``diff_path`` is
+    # the client's own cache from the preceding tool_call frame, not the
+    # agent-influenced ``kind`` — so the target denial also runs for a
+    # kindless or mislabelled non-shell call that carries one (strictly
+    # tightening: that call keeps its document scan below AND gains the
+    # target gate). Suppressing the document scan stays keyed on the fully
+    # trusted edit reroute (``_edit_params is not None``) alone.
+    _edit_target_gated = _edit_params is not None or bool(event.diff_path and not event.is_shell)
+    # Every OTHER non-shell tool with client-established provenance gets a
+    # FIELD-SCOPED scan: the same three predicates, over every string in the
+    # trusted params except a document body (``platform.tool_paths.
+    # DOCUMENT_BODY_KEYS`` -- ``content``, ``fileText``, ``newStr``, ...). A body
+    # is prose or source, and reading it as a shell command line refused a write
+    # that merely QUOTED ``rm -rf /`` or named a credential path. Provenance is
+    # the client's, never the payload's: ``shell_classified`` with ``is_shell``
+    # False (the shell cache the preceding tool_call frame populated -- a shell
+    # tool keeps the full scan, for it ``command`` IS what executes),
+    # ``raw_params_trusted`` (params from that same cache, so the strings judged
+    # are the ones that execute), and ``mcp_identity_trusted`` (the tool_name /
+    # server caches HIT, so the tool is a resolved built-in or a resolved MCP
+    # tool, not an unknown), and the resolved name must be a BUILT-IN document
+    # writer (``platform.tool_paths.is_document_writing_tool``): an MCP tool can
+    # execute whatever it calls ``content``, so its fields are all scanned. A frame
+    # missing any of those attributes, or carrying it as false, is an UNKNOWN tool
+    # and keeps the full document scan (fail closed). Every non-body string --
+    # a ``command`` word, a path, a URL -- still reaches the scan, and a walk
+    # that hits its work cap is denied as unverifiable.
+    _scoped_params = (
+        event.raw_tool_params
+        if (
+            _edit_params is None
+            and getattr(event, "shell_classified", False)
+            and not event.is_shell
+            and getattr(event, "raw_params_trusted", False)
+            and getattr(event, "mcp_identity_trusted", False)
+            and is_document_writing_tool(
+                getattr(event, "tool_name", ""), getattr(event, "mcp_server_name", "")
+            )
+            and isinstance(getattr(event, "raw_tool_params", None), dict)
+        )
+        else None
+    )
+    # A Kiro Crew core MCP tool listed in ``platform.tool_paths.
+    # MCP_DOCUMENT_BODY_FIELDS`` (``knowledge_add_document``'s ``content``)
+    # stores that field as document text, so the field skips the command-text
+    # rules -- the deny list and the argv floor -- that read a page mentioning a
+    # product subcommand as an attempt to run it. The body keeps the size
+    # ceiling and the path tier; every other argument keeps the full scan. Same
+    # provenance bar as the built-in scoping above, and the identity is the
+    # cached server AND tool, so a same-named tool on another server, or a frame
+    # whose identity did not come from the caches, keeps the full scan.
+    _mcp_body_keys = (
+        mcp_document_body_keys(
+            getattr(event, "tool_name", ""), getattr(event, "mcp_server_name", "")
+        )
+        if (
+            _edit_params is None
+            and _scoped_params is None
+            and getattr(event, "shell_classified", False)
+            and not event.is_shell
+            and getattr(event, "raw_params_trusted", False)
+            and getattr(event, "mcp_identity_trusted", False)
+            and isinstance(getattr(event, "raw_tool_params", None), dict)
+        )
+        else frozenset()
+    )
+    _scoped_truncated = False
+    _body_strings: list[str] = []
+    if _edit_params is not None:
+        _input_strings: list[str] = []
+    elif _scoped_params is not None:
+        _scoped_strings = command_shaped_strings(_scoped_params)
+        _scoped_truncated = _scoped_strings.truncated
+        _input_strings = list(_scoped_strings)
+    elif _mcp_body_keys and isinstance(event.raw_tool_params, dict):
+        _rest_params, _body_strings = split_document_bodies(event.raw_tool_params, _mcp_body_keys)
+        _scoped_strings = command_shaped_strings(_rest_params, body_keys=frozenset())
+        _scoped_truncated = _scoped_strings.truncated
+        _input_strings = list(_scoped_strings)
+    else:
+        _input_strings = _extract_tool_input_strings(_tool_input) if _tool_input else []
 
     def _scan_off_loop() -> tuple[str, str, str, str] | None:
         # One worker hop for the title and the whole tool_input loop. Both are
         # regex-heavy over agent-supplied text; on the event loop a ~9 KB shell
         # title held the loop past the 25 s stall watchdog and took the gateway
-        # down (the title tier used to run inline here while only the tool_input
-        # tier was offloaded, so that crash path survived the first offload).
+        # down (an inline title tier with only the tool_input
+        # tier offloaded leaves exactly that crash path open).
         # ``re`` HOLDS the GIL for one match call, so the hop does not keep the
         # loop live inside a single scan -- the linear patterns and the size
         # ceiling do that; what the hop buys is the realpath I/O inside
         # ``is_sensitive_path`` (which does release the GIL) and yields between
         # the strings. Title first, so a request denied on its title
         # reports the title-tier reason and mechanism exactly as before.
-        title_hit = _title_denial(normalized, _denied_regexes)
+        title_hit = _title_denial(
+            normalized, _denied_regexes, exempt_command=_path_tier_exempt(event)
+        )
         if title_hit is not None:
             return (title_hit[0], title_hit[1], normalized, "always_deny")
+        if _edit_target_gated:
+            edit_hit = _edit_target_denial(_edit_params, event.diff_path)
+            if edit_hit is not None:
+                return (*edit_hit, "always_deny_input")
+        if _scoped_truncated:
+            # The field-scoped walk could not finish, so the strings it did
+            # collect are not the whole payload: refuse rather than scan a part.
+            return (
+                "oversize",
+                "Blocked: tool arguments too large to security-scan (deny-by-default)",
+                "",
+                "always_deny_input",
+            )
         if _input_strings:
-            input_hit = _first_tool_input_denial(_input_strings, _denied_regexes)
+            input_hit = _first_tool_input_denial(
+                _input_strings, _denied_regexes, exempt_command=_path_tier_exempt(event)
+            )
             if input_hit is not None:
                 return (*input_hit, "always_deny_input")
+        if _body_strings:
+            body_hit = _first_tool_input_denial(_body_strings, _denied_regexes, command_rules=False)
+            if body_hit is not None:
+                return (*body_hit, "always_deny_input")
         return None
 
     _hit = await asyncio.to_thread(_scan_off_loop)
     if _hit is not None:
         _kind, _reason, _matched, _tier = _hit
-        await provider.reject_tool(event.request_id)
         _log(
             "denied",
             error=_reason,
@@ -2169,21 +3066,65 @@ async def _resolve_permission(
                 "mechanism": (_regex_deny_mechanism(_matched, _tier) if _kind == "regex" else _tier)
             },
         )
+        await _steer_host_deny(provider, event, _reason, cause=DENY_CAUSE_POLICY)
+        await provider.reject_tool(event.request_id)
         return False
 
-    if policy == ToolApprovalPolicy.HOOK_BASED and hooks:
+    if policy == ToolApprovalPolicy.READ_ONLY and hooks is None:
+        # Fail closed: READ_ONLY's classifier IS the hook gate. Without one
+        # there is no way to prove a call read-only, so the policy degrades to
+        # REJECT_ALL rather than to the caller-less auto-approve below.
+        _log("rejected", metadata={"reason": "read_only_policy_no_hooks"})
+        await _steer_host_deny(
+            provider,
+            event,
+            "this surface is read-only and has no hook gate to prove a call "
+            "read-only, so every tool call is refused",
+            cause=DENY_CAUSE_SURFACE_POLICY,
+        )
+        await provider.reject_tool(event.request_id)
+        return False
+
+    if policy == ToolApprovalPolicy.AUTO_APPROVE:
+        reason = await asyncio.to_thread(
+            permission_floor.refusal_for,
+            event,
+            session_key=session_key,
+            agent=agent,
+            app=app,
+            security_only=False,
+        )
+        if reason is not None:
+            # The permission floor's verdict is a host deny on the call itself
+            # (a TOOL_DENY from the shared gate, or the gate failing closed):
+            # policy wording, audited first, steered before the wire.
+            _log(
+                "denied",
+                error=reason,
+                metadata={"mechanism": "policy_deny"},
+            )
+            await _steer_host_deny(provider, event, reason, cause=DENY_CAUSE_POLICY)
+            await provider.reject_tool(event.request_id)
+            return False
+
+    if policy in (ToolApprovalPolicy.HOOK_BASED, ToolApprovalPolicy.READ_ONLY) and hooks:
         tool_result = hooks.on_tool_call(
             event.title,
             session_key=session_key,
             agent=agent,
             app=app,
-            tool_kind=event.tool_kind,
-            raw_params=event.raw_tool_params,
-            command=event.shell_command,
-            is_shell=event.is_shell,
+            **hook_gate_kwargs(event),
+            # READ_ONLY asks for the classifier's verdict alone: the gate skips
+            # its grant tiers (`auto_approve_tools`, app-own-server), which vouch
+            # for the caller rather than for the call's effect, so a grant that
+            # shadows a read still lets the classifier approve the read and a
+            # grant that shadows a write approves nothing. Under READ_ONLY the
+            # provenance flag above is also what lets a host-known built-in
+            # (``fs_read``) count as proven read-only. HOOK_BASED keeps the
+            # grants — its approver is the card they skip.
+            classifier_only=policy == ToolApprovalPolicy.READ_ONLY,
         )
         if tool_result.action == TOOL_DENY:
-            await provider.reject_tool(event.request_id)
             # A hook deny is either a hard security check or the governance
             # ceiling. Only the former says the attempt itself was the problem,
             # and the distinction rides on the result's own field rather than
@@ -2197,8 +3138,30 @@ async def _resolve_permission(
                     )
                 },
             )
+            await _steer_host_deny(provider, event, tool_result.reason, cause=DENY_CAUSE_POLICY)
+            await provider.reject_tool(event.request_id)
             return False
         if tool_result.action == TOOL_AUTO_APPROVE:
+            if policy == ToolApprovalPolicy.READ_ONLY and not tool_result.read_only:
+                # READ_ONLY honours the classifier's verdict alone, and the
+                # result says which route produced it: ``read_only`` is set only
+                # by the read-only classifier, never by a grant (the operator's
+                # `auto_approve_tools` globs, the app-own-server rule), which
+                # vouches for the caller and says nothing about the call's
+                # effect. The gate is asked classifier-only above, so an
+                # untagged auto-approve here comes from a gate that does not
+                # carry the tag — a double, a tier that omits it — and this
+                # surface has no approver to hand it to. Refuse, as policy
+                # state: the same call is allowed where a card exists.
+                _log("rejected", metadata={"reason": "read_only_policy_unclassified"})
+                await _steer_host_deny(
+                    provider,
+                    event,
+                    "this surface is read-only and the call could not be proven " "read-only",
+                    cause=DENY_CAUSE_SURFACE_POLICY,
+                )
+                await provider.reject_tool(event.request_id)
+                return False
             # The hook granted this by NAME (its `auto_approve_tools` globs, or
             # the read-only allowlist). Verify it UNCONDITIONALLY: this helper
             # serves unattended callers (cron / autonudge / heartbeat / Meetings
@@ -2210,14 +3173,21 @@ async def _resolve_permission(
             # silent auto-approve of a shadowed name on an unwatched turn.
             _ng_refusal = await name_grant.refusal_for_event(event)
             if _ng_refusal is None:
-                await provider.approve_tool(event.request_id)
-                _log("auto_approved", metadata={"reason": "hook_auto_approve"})
-                return True
-            logger.warning(
-                "declining a hook auto-approve: %s; the request falls through "
-                "to this caller's approval path",
-                _ng_refusal.log_text,
-            )
+                approval_sent = await provider.approve_tool(event.request_id)
+                if approval_sent is not False:
+                    _log("auto_approved", metadata={"reason": "hook_auto_approve"})
+                else:
+                    _log(
+                        OUTCOME_REJECTED_TRANSPORT_FLOOR,
+                        metadata={"mechanism": "always_deny_transport"},
+                    )
+                return approval_sent is not False
+            if name_grant.should_log_decline(session_key, _ng_refusal):
+                logger.warning(
+                    "declining a hook auto-approve: %s; the request falls through "
+                    "to this caller's approval path",
+                    _ng_refusal.log_text,
+                )
             name_grant.log_decline(
                 source="",
                 session_key=session_key,
@@ -2231,22 +3201,53 @@ async def _resolve_permission(
             # only positive authorization and it was withheld, so fall through
             # to deny-by-default rather than the caller-less auto-approve below.
             if on_tool_approval is None:
-                await provider.reject_tool(event.request_id)
                 _log("rejected", metadata={"reason": "name_grant_headless_reject"})
+                await _steer_host_deny(
+                    provider,
+                    event,
+                    "the hook's name-based grant was withheld ("
+                    f"{_ng_refusal.log_text}) and this surface has no approver",
+                    cause=DENY_CAUSE_SURFACE_POLICY,
+                )
+                await provider.reject_tool(event.request_id)
                 return False
+
+    if policy == ToolApprovalPolicy.READ_ONLY:
+        # Everything the hook gate did not deny (rejected above) or positively
+        # classify as read-only (approved above, name-grant verified) lands
+        # here: `allow` results, and auto-approves whose name grant was
+        # withheld (a grant-shaped auto-approve is refused above, before the
+        # name check). Where the interactive Reads mode would fall through to the
+        # approval card, this policy refuses — reject is the fallback, and it
+        # runs BEFORE the interactive callback so a caller passing one cannot
+        # widen the policy.
+        _log("rejected", metadata={"reason": "read_only_policy"})
+        await _steer_host_deny(
+            provider,
+            event,
+            "this surface is read-only and the call was not classified read-only",
+            cause=DENY_CAUSE_SURFACE_POLICY,
+        )
+        await provider.reject_tool(event.request_id)
+        return False
 
     # Interactive approval if callback provided
     if on_tool_approval:
         approved = await on_tool_approval(event)
         if not approved:
-            await provider.reject_tool(event.request_id)
+            # The person said no: no notice (kiro-cli's wording is the truth
+            # here), but the audit still precedes the wire like every other deny.
             _log("rejected", metadata={"reason": "interactive_rejected"})
+            await provider.reject_tool(event.request_id)
             return False
 
     # Default: auto-approve
-    await provider.approve_tool(event.request_id)
-    _log("auto_approved")
-    return True
+    approval_sent = await provider.approve_tool(event.request_id)
+    if approval_sent is not False:
+        _log("auto_approved")
+    else:
+        _log(OUTCOME_REJECTED_TRANSPORT_FLOOR, metadata={"mechanism": "always_deny_transport"})
+    return approval_sent is not False
 
 
 # ── JSON Parsing ──
@@ -2308,7 +3309,7 @@ def _extract_json_of_type(
             # error must not escape. Fail the WHOLE scan closed: a truncated
             # scan cannot certify a preferred match as unambiguous, so keeping
             # candidates collected before the bomb would let a worked example
-            # launder past the ambiguity refusal (GPT review, #4974 round 4).
+            # launder past the ambiguity refusal.
             # Callers already have recovery paths for None (schema retry loop,
             # the spine's forcing re-emit); salvaging a prefix of a reply that
             # contains a nesting bomb is not worth defeating them.
@@ -2451,7 +3452,7 @@ async def save_conversation_turn_off_loop(
     The whole turn is written under one :meth:`~kiro_crew.history.ConversationLog.atomic_appends`
     hold. ``append`` locks per ROW, so without it two concurrent turns for the
     same session could interleave into ``user_A, user_B, assistant_A,
-    assistant_B`` -- turns that no longer pair up, which no timestamp ordering can
+    assistant_B`` -- turns that do not pair up, which no timestamp ordering can
     repair because each row's ``ts`` is individually correct. On the loop that was
     impossible (a synchronous caller never yields between its two appends), so the
     hazard is introduced BY offloading and has to be closed here rather than

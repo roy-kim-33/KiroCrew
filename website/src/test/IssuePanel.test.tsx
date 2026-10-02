@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import type { IssueSource } from '../types'
 import type { PullRequestLink } from '../utils/pullRequestLinks'
@@ -136,6 +136,42 @@ describe('IssuePanel', () => {
     fireEvent.click(screen.getByRole('tab', { name: /Linked/ }))
     expect(screen.getByText('Guard the empty label list')).toBeInTheDocument()
     expect(screen.getByText('#12')).toBeInTheDocument()
+    // #8487: the linked change's `state` ('OPEN') renders through the catalog
+    // ("Open"), not the raw wire value CSS-capitalized. The header state and
+    // this linked-change state both read "Open", so there are now two.
+    expect(screen.getAllByText('Open').length).toBeGreaterThanOrEqual(2)
+  })
+
+  // #8487: a linked change's lifecycle `state` used to print the raw wire value
+  // lowercased with a CSS `capitalize`. A mapped lifecycle value now renders
+  // from the catalog (casing from the catalog, no `capitalize`); an unmapped
+  // provider-specific state (e.g. a Jira workflow state) is untranslated by
+  // design and KEEPS its `capitalize`, so it does not read all-lowercase next
+  // to the catalog-cased siblings.
+  it('renders a mapped state from the catalog and keeps capitalize on the unmapped raw fallback', async () => {
+    const jiraLinked: IssueSource = {
+      ...openIssue,
+      linkedChanges: [
+        // A mapped lifecycle value.
+        { provider: 'github', url: 'https://github.com/acme/widgets/pull/13', number: 13, title: 'Merged change', state: 'MERGED' },
+        // An unmapped Jira workflow state.
+        { provider: 'jira', url: 'https://jira.example/browse/PROJ-1', number: 1, title: 'Jira ticket', state: 'In Review', issueKey: 'PROJ-1' },
+      ],
+    }
+    mockApi.fetchIssueSource.mockImplementation(() => Promise.resolve(jiraLinked))
+    renderPanel()
+    await screen.findByText('Crash on empty label list')
+
+    fireEvent.click(screen.getByRole('tab', { name: /Linked/ }))
+    // Mapped: catalog label, casing from the catalog — no `capitalize`.
+    const mapped = screen.getByText('Merged')
+    expect(mapped).toBeInTheDocument()
+    expect(mapped.className).not.toContain('capitalize')
+    // Unmapped: the raw value (lowercased text node), but `capitalize` restored
+    // so it renders "In Review", not "in review", beside the mapped siblings.
+    const raw = screen.getByText('in review')
+    expect(raw).toBeInTheDocument()
+    expect(raw.className).toContain('capitalize')
   })
 
   it('hides the Linked tab when the provider reported no linked changes', async () => {
@@ -218,5 +254,50 @@ describe('IssuePanel', () => {
     expect(text).toContain('- Labels: bug, good first issue')
     expect(text).toContain('- Reported by: octocat')
     expect(text).toContain(`- Issue: ${openIssue.url}`)
+  })
+
+  it('qualifies source tabs with their project when two projects share a number', async () => {
+    // Issue numbers are only unique per project: group-a/svc#1 and
+    // group-b/svc#1 would render two identical `#1` tabs. The qualifier
+    // prefixes each with its project path, same as the Changes panel.
+    renderPanel({
+      issues: [
+        { url: 'https://gitlab.com/group-a/svc/-/issues/1', provider: 'gitlab', number: 1, repo: 'svc', kind: 'issue' },
+        { url: 'https://gitlab.com/group-b/svc/-/issues/1', provider: 'gitlab', number: 1, repo: 'svc', kind: 'issue' },
+      ],
+    })
+
+    expect(await screen.findByRole('tab', { name: /group-a\/svc #1/i })).toBeInTheDocument()
+    expect(screen.getByRole('tab', { name: /group-b\/svc #1/i })).toBeInTheDocument()
+  })
+
+  it('keeps bare numbers on a single-project issue strip', async () => {
+    renderPanel({
+      issues: [
+        { url: 'https://gitlab.com/group-a/svc/-/issues/1', provider: 'gitlab', number: 1, repo: 'svc', kind: 'issue' },
+        { url: 'https://gitlab.com/group-a/svc/-/issues/2', provider: 'gitlab', number: 2, repo: 'svc', kind: 'issue' },
+      ],
+    })
+
+    const tabs = await screen.findAllByRole('tab')
+    for (const tab of tabs) expect(tab.textContent ?? '').not.toContain('group-a/svc')
+  })
+
+  it('clamps the cached-refresh notice to one line so it cannot push Retry out of the compact row', async () => {
+    renderPanel({ issues: [links[0]] })
+    await screen.findByText('Crash on empty label list')
+
+    mockApi.fetchIssueSource.mockRejectedValue(new Error('gh: 503 upstream unavailable'))
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh issue' }))
+
+    const notice = await screen.findByTestId('issue-panel-refresh-error')
+    const msg = within(notice).getByText(/showing the last loaded version/)
+    expect(msg).toHaveClass('line-clamp-1')
+    // `truncate` would be inert on the inline-flex root, and its nowrap inherits
+    // down and cancels the wrap the message declares for itself.
+    expect(notice.className).not.toMatch(/truncate|whitespace-nowrap/)
+    // Localised: the longest catalogs wrap this label onto a second line.
+    const retry = screen.getByRole('button', { name: 'Retry' })
+    expect(retry).toHaveClass('shrink-0', 'whitespace-nowrap')
   })
 })

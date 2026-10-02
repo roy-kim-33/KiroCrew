@@ -15,11 +15,16 @@ The provider is faked end-to-end so tests stay hermetic — no network.
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
+from dashboard_owner_helpers import as_owner
+
+from conftest import make_dir_link
+from kiro_crew import platform_compat
 
 
 @pytest.fixture
@@ -87,6 +92,10 @@ def _make_app(state, provider):
 
     app = web.Application()
     app["state"] = state
+    # Install is owner-gated; the owner identity is plumbing so these tests stay on
+    # the branch each one names (the gate itself: test_non_owner_file_and_skill_writes).
+    state.owner_id = ""
+    as_owner(app)
     app.router.add_get("/api/skills/-/discover", discover_mod.api_skills_discover)
     app.router.add_get(
         "/api/skills/-/discover/preview", discover_mod.api_skills_discover_preview
@@ -250,6 +259,172 @@ class TestDiscoverInstall:
             assert (link / "SKILL.md").exists()
             # ...and NOTHING landed at the old symlink target.
             assert list(outside.iterdir()) == []
+        finally:
+            await client.close()
+
+    async def test_install_overwrite_replaces_junctioned_skill_dir(
+        self, fake_home, reset_registry, tmp_path
+    ):
+        """The same regression as the test above, spelled the way Windows spells it.
+
+        `skill_dir.is_symlink()` is False for a junction, so the leaf-link defence
+        never fires. With `overwrite=True` the next line is
+        `shutil.rmtree(skill_dir)`, and `rmtree` REFUSES a junction exactly as it
+        refuses a symlink — an uncaught `OSError` out of
+        `asyncio.to_thread(_write_bundle)`, which has no `except` in scope.
+
+        A junction is not an exotic spelling of this layout: a *directory* symlink
+        on Windows needs `SeCreateSymbolicLinkPrivilege`, a junction needs none, so
+        it is the shape an unprivileged process can actually plant.
+        """
+        client, skills_dir = await self._client(fake_home)
+        try:
+            outside = tmp_path / "outside-target"
+            outside.mkdir()
+            provider_dir = skills_dir / "fakeprov"
+            provider_dir.mkdir(parents=True, exist_ok=True)
+            link = provider_dir / "fake-skill"
+            make_dir_link(link, outside)
+
+            # Guard the guard, through an oracle OUTSIDE the module under test:
+            # if this were an ordinary directory the test would prove nothing.
+            assert platform_compat.is_link_or_junction(link)
+            assert link.exists(), "the link must be followable, or rmtree never runs"
+
+            resp = await client.post(
+                "/api/skills/-/discover/install",
+                json={
+                    "provider": "fakeprov",
+                    "skill_id": "fake-skill",
+                    "overwrite": True,
+                },
+            )
+            assert resp.status == 200
+            assert not platform_compat.is_link_or_junction(link)
+            assert (link / "SKILL.md").exists()
+            # ...and NOTHING landed at the old link target.
+            assert list(outside.iterdir()) == []
+        finally:
+            await client.close()
+
+    async def test_the_junctions_target_survives_being_replaced(
+        self, fake_home, reset_registry, tmp_path
+    ):
+        """Removing the link must not remove what it pointed at.
+
+        This is the property `unlink_link_or_junction` exists for and the reason
+        the defence cannot simply be `shutil.rmtree`: a junction is a directory
+        reparse point, so it is unlinked with `rmdir` — which detaches the
+        junction and never touches the target's contents.
+
+        The sibling test above proves nothing was WRITTEN outside the root; this
+        one proves nothing was DELETED outside it either.
+        """
+        client, skills_dir = await self._client(fake_home)
+        try:
+            outside = tmp_path / "outside-target"
+            outside.mkdir()
+            bystander = outside / "keep-me.txt"
+            bystander.write_text("not ours to delete", encoding="utf-8")
+            provider_dir = skills_dir / "fakeprov"
+            provider_dir.mkdir(parents=True, exist_ok=True)
+            link = provider_dir / "fake-skill"
+            make_dir_link(link, outside)
+            assert platform_compat.is_link_or_junction(link)
+
+            resp = await client.post(
+                "/api/skills/-/discover/install",
+                json={
+                    "provider": "fakeprov",
+                    "skill_id": "fake-skill",
+                    "overwrite": True,
+                },
+            )
+            assert resp.status == 200
+            assert bystander.read_text(encoding="utf-8") == "not ours to delete"
+            assert (link / "SKILL.md").exists()
+            assert not (outside / "SKILL.md").exists()
+        finally:
+            await client.close()
+
+
+_OVERWRITE = {"provider": "fakeprov", "skill_id": "fake-skill", "overwrite": True}
+
+
+@pytest.mark.asyncio
+class TestDiscoverInstallStagedSwap:
+    """An overwrite builds the new bundle aside and swaps it in only once it verifies."""
+
+    async def _installed(self, fake_home):
+        provider = FakeProvider()
+        client, skills_dir = await TestDiscoverInstall()._client(fake_home, provider)
+        resp = await client.post("/api/skills/-/discover/install", json=_OVERWRITE)
+        assert resp.status == 200
+        skill_dir = skills_dir / "fakeprov" / "fake-skill"
+        (skill_dir / "my-notes.md").write_text("local edit", encoding="utf-8")
+        return client, provider, skill_dir
+
+    @staticmethod
+    def _assert_old_intact(skill_dir):
+        assert (skill_dir / "my-notes.md").read_text(encoding="utf-8") == "local edit"
+        assert (skill_dir / "rules" / "extra.md").read_text(encoding="utf-8") == "# Extra rules"
+        assert [p.name for p in skill_dir.parent.iterdir()] == ["fake-skill"]
+
+    async def test_success_replaces_and_leaves_no_staging_dir(self, fake_home, reset_registry):
+        client, provider, skill_dir = await self._installed(fake_home)
+        try:
+            provider._bundle = [("SKILL.md", "---\nname: fake-skill\n---\n# v2")]
+            resp = await client.post("/api/skills/-/discover/install", json=_OVERWRITE)
+            assert resp.status == 200
+            assert (skill_dir / "SKILL.md").read_text(encoding="utf-8").endswith("# v2")
+            assert sorted(p.name for p in skill_dir.iterdir()) == ["SKILL.md"]
+            assert [p.name for p in skill_dir.parent.iterdir()] == ["fake-skill"]
+        finally:
+            await client.close()
+
+    async def test_failed_write_keeps_the_old_install(self, fake_home, reset_registry):
+        client, provider, skill_dir = await self._installed(fake_home)
+        try:
+            # "rules" as a file, then as a directory: unwritable on every OS.
+            provider._bundle = [("SKILL.md", "# v2"), ("rules", "x"), ("rules/a.md", "y")]
+            resp = await client.post("/api/skills/-/discover/install", json=_OVERWRITE)
+            assert resp.status == 500
+            assert (await resp.json())["code"] == "bundle_write_failed"
+            self._assert_old_intact(skill_dir)
+        finally:
+            await client.close()
+
+    async def test_bundle_without_skill_md_keeps_the_old_install(self, fake_home, reset_registry):
+        client, provider, skill_dir = await self._installed(fake_home)
+        try:
+            provider._bundle = [("README.md", "# no skill here")]
+            resp = await client.post("/api/skills/-/discover/install", json=_OVERWRITE)
+            assert resp.status == 500
+            assert "SKILL.md" in (await resp.json())["error"]
+            self._assert_old_intact(skill_dir)
+        finally:
+            await client.close()
+
+    async def test_refused_swap_rename_keeps_the_old_install(
+        self, fake_home, reset_registry, monkeypatch
+    ):
+        # A Windows directory rename can fail under AV or an open handle.
+        from kiro_crew.dashboard.handlers import discover as discover_mod
+
+        client, provider, skill_dir = await self._installed(fake_home)
+
+        def _publish(src, dst):
+            raise PermissionError(13, "Access is denied", str(dst))
+
+        # Patch the module's own `platform_compat` name only, never the shared module.
+        fake = SimpleNamespace(**{**vars(platform_compat), "publish_dir_noreplace": _publish})
+        monkeypatch.setattr(discover_mod, "platform_compat", fake)
+        try:
+            provider._bundle = [("SKILL.md", "# v2")]
+            resp = await client.post("/api/skills/-/discover/install", json=_OVERWRITE)
+            assert resp.status == 500
+            assert (await resp.json())["code"] == "bundle_write_failed"
+            self._assert_old_intact(skill_dir)
         finally:
             await client.close()
 
@@ -557,7 +732,7 @@ class TestDiscoverInstallHumanOnly:
 
 @pytest.mark.asyncio
 class TestDiscoverInstallLogSanitization:
-    """Regression for CWE-117 log forging in the install handler's error logs.
+    """CWE-117 log forging must not be possible in the install handler's error logs.
 
     Both the timeout path and the failure path log a provider-influenced
     ``skill_id`` (and, on failure, the scrubbed exception text). These must be

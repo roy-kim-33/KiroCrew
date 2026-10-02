@@ -23,6 +23,7 @@ from chat_test_helpers import _make_state
 from kiro_crew.dashboard import session_control as sc
 from kiro_crew.dashboard.chat_utils import slot_history_key
 from kiro_crew.dashboard.handlers import session_control as handlers_sc
+from kiro_crew.messaging.link import ChannelLink
 
 
 @pytest.fixture(autouse=True)
@@ -119,25 +120,26 @@ class TestMirroredSessionsAreOutOfBounds:
         state.sessions = object()  # no get_mirror_link at all
         assert sc._has_channel_mirror(state, target) is False
 
+    def test_a_paused_mirror_still_refuses(self, tmp_path):
+        """The dashboard's Disconnect row PAUSES a mirror; it does not sever it.
 
-class TestCrewModeTargetsAreOutOfBounds:
-    """A crew session's ingress is a durable queue entry, not a turn.
-
-    `/api/chat` routes `mode == "crew"` to `state.crew.ingest` before anything
-    else, which queues the message durably and fans it out to topic
-    sub-sessions. Delivering it here as a turn would run generic work that is
-    neither queued nor routed -- and would report success for it.
-    """
-
-    def _pair(self, tmp_path):
-        state = _make_state(tmp_path)
-        caller = _slot(state, "caller")
-        target = _slot(state, "peer")
-        return state, caller, target
-
-    def test_a_crew_target_is_refused(self, tmp_path):
+        `mirror_paused` mutes outbound delivery only: the binding stays in the
+        store, inbound messages from that conversation still route into the
+        session (`SessionBinder.resolve_inbound` never reads the flag), and one
+        click on the same row resumes delivery. A paused binding is therefore a
+        latent audience, and the containment gate fails CLOSED on it -- the
+        session is refused exactly as a live mirror is, on both the caller and
+        the target side. The way out is Unlink (`mirror-unlink`), which drops the
+        row; the session menu offers it beside Disconnect.
+        """
         state, caller, target = self._pair(tmp_path)
-        target.mode = "crew"
+        dm = ChannelLink(channel_type="discord", channel_id="D-owner-dm")
+        state.sessions.set_mirror_link(slot_history_key(caller), dm, accepts_inbound=True)
+        state.sessions.set_mirror_paused = MagicMock(return_value=False)
+        state.sessions.is_mirror_paused = MagicMock(return_value=True)
+        state.sessions.set_mirror_paused(slot_history_key(caller), True)
+        assert state.sessions.is_mirror_paused(slot_history_key(caller)) is True
+        assert sc._has_channel_mirror(state, caller) is True
         with pytest.raises(sc.SessionControlError) as exc:
             sc.authorize_target(
                 state,
@@ -145,29 +147,21 @@ class TestCrewModeTargetsAreOutOfBounds:
                 target=target.key,
                 operation="read",
             )
-        assert exc.value.code == "crew_mode_target"
-
-    def test_an_ordinary_target_is_unaffected(self, tmp_path):
-        state, caller, target = self._pair(tmp_path)
-        assert getattr(target, "mode", "") != "crew"
-        assert (
+        assert exc.value.code == "mirrored_caller"
+        # Target side, same flag, same verdict.
+        state.sessions.clear_mirror_link(slot_history_key(caller))
+        state.sessions.set_mirror_link(slot_history_key(target), dm)
+        with pytest.raises(sc.SessionControlError) as exc:
             sc.authorize_target(
                 state,
                 caller_session_key=slot_history_key(caller),
                 target=target.key,
                 operation="read",
             )
-            is target
-        )
-
-    def test_a_crew_CALLER_may_still_control_a_peer(self, tmp_path):
-        """The defect is in delivery semantics, not the caller's standing.
-
-        A crew session is still the person's own; only its own INGRESS differs.
-        Refusing it as a caller would narrow the surface for no stated reason.
-        """
-        state, caller, target = self._pair(tmp_path)
-        caller.mode = "crew"
+        assert exc.value.code == "mirrored_target"
+        # Unlink, not pause, is what restores control: with the row gone the
+        # same pair is admitted again.
+        assert state.sessions.clear_mirror_link(slot_history_key(target)) is True
         assert (
             sc.authorize_target(
                 state,

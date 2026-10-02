@@ -11,8 +11,8 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { Provider } from 'react-redux'
 import { MemoryRouter, Routes, Route, useLocation, useSearchParams, useNavigate } from 'react-router-dom'
 import { createTestStore } from './helpers'
-import { switchSlot } from '../store/chatSlice'
-import { sseSlots } from '../store/dashboardSlice'
+import { deleteSlot, switchSlot } from '../store/chatSlice'
+import { addSlotOptimistic, fetchSlots, sseConnected, sseSlotPatch, sseSlots } from '../store/dashboardSlice'
 import { ThemeProvider } from '../hooks/useTheme'
 import type { RootState } from '../store'
 import type { ChatSlot } from '../types'
@@ -44,7 +44,6 @@ vi.mock('../pages/ChatSidebar', () => ({ default: () => null, SIDEBAR_MIN: 200, 
 vi.mock('../pages/chat/ChatSettings', () => ({ loadChatConfig: () => ({ contentWidth: 'compact' }), CONTENT_WIDTH: { compact: { messages: '900px', input: '916px' }, comfortable: { messages: '84%', input: '85%' }, full: { messages: '92%', input: '93%' } } }))
 
 // --- Stub hooks ---
-vi.mock('../hooks/usePanelState', () => ({ usePanelState: () => ({ isOpen: false, openPanel: vi.fn(), closePanel: vi.fn() }), useDiffPanel: () => ({ isOpen: false, filePath: '', original: '', modified: '', openDiff: vi.fn(), closeDiff: vi.fn() }) }))
 vi.mock('../hooks/useBranding', () => ({ useBranding: () => ({ botName: 'Test', avatar: '' }) }))
 vi.mock('../hooks/useAgents', () => ({ useAgents: () => ({ agents: [], defaultAgent: null }) }))
 vi.mock('../hooks/useFilteredDropdown', () => ({ useFilteredDropdown: () => ({ filtered: [], query: '', setQuery: vi.fn(), selectedIndex: 0, setSelectedIndex: vi.fn(), onKeyDown: vi.fn() }) }))
@@ -55,10 +54,10 @@ vi.mock('../api/client', () => ({
   api: Object.fromEntries(
     ['sessions', 'chatSlotDetail', 'createChatSlot', 'deleteChatSlot', 'resumeChatSlot',
      'deleteSession', 'agentDetail', 'approveChatSlot', 'chatSlotAgent', 'chatSlotModel',
-     'chatSlotWorkspace', 'models', 'planAction', 'planFromChat', 'renameSlot',
+     'chatSlotWorkspace', 'models', 'planFromChat', 'renameSlot',
      'resolveApproval', 'screenshot', 'slackChannels', 'slackLink', 'spawnList',
      'stopChatSlot', 'uploadFiles', 'voiceSynthesize', 'workspaces', 'chatSlots',
-     'notifications', 'status', 'generateTitle'].map(k => [k, vi.fn().mockResolvedValue(
+     'notifications', 'status', 'generateTitle', 'kirocrewConfig', 'agentResolvedModel'].map(k => [k, vi.fn().mockResolvedValue(
       k === 'chatSlotDetail' ? { messages: [], has_more: false, total: 0 } : {}
     )])
   ),
@@ -75,11 +74,13 @@ Object.defineProperty(window, 'matchMedia', {
 })
 globalThis.fetch = vi.fn().mockResolvedValue({ ok: true, json: () => Promise.resolve({}) }) as unknown as typeof fetch
 
+import { closeHoldForUrl } from '../pages/chat/useChatPageSessionController'
 import ChatPage from '../pages/ChatPage'
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { i18nT } from '../i18n/t'
 import { api } from '../api/client'
+import { __resetErrorJournalForTests, recordError } from '../utils/errorReport'
 
 /** Slot keys `chatSlotDetail` was asked for — i.e. which sessions got fetched. */
 function detailCalls(): string[] {
@@ -92,20 +93,24 @@ const slot = (key: string, title?: string, mode = ''): ChatSlot => ({
 
 /** Helper to capture the current URL from MemoryRouter */
 let currentUrl = ''
+let seenUrls: string[] = []
 function UrlCapture() {
   const loc = useLocation()
   const [sp] = useSearchParams()
   currentUrl = loc.pathname + (sp.toString() ? '?' + sp.toString() : '')
+  if (seenUrls.at(-1) !== currentUrl) seenUrls.push(currentUrl)
   return null
 }
 
 /** Exposes the router's navigate() so tests can drive a real Back/Forward POP. */
 let navBack: () => void = () => {}
 let navForward: () => void = () => {}
+let navTo: (to: string) => void = () => {}
 function NavController() {
   const n = useNavigate()
   navBack = () => n(-1)
   navForward = () => n(1)
+  navTo = (to: string) => n(to)
   return null
 }
 
@@ -153,7 +158,6 @@ function renderChatPage(opts: {
           <MemoryRouter initialEntries={entries ?? [route]}>
             <Routes>
               <Route path="/chat/:slug?" element={<ChatPage mode={mode} />} />
-              <Route path="/orchestrated/:slug?" element={<ChatPage mode="orchestrator" />} />
               {/* Stands in for any non-chat dashboard page a session link is
                   followed FROM (System, Telemetry) — it only has to be a
                   distinct history entry. */}
@@ -175,7 +179,9 @@ function renderChatPage(opts: {
 
 beforeEach(() => {
   localStorage.clear()
+  __resetErrorJournalForTests()
   currentUrl = ''
+  seenUrls = []
 })
 
 afterEach(() => {
@@ -192,7 +198,9 @@ const slots = [
   slot('chat-3-300'), // no title (title === key)
 ]
 
-const orchSlots = [
+/** Legacy Autopilot slots: still persisted under the retired 'orchestrator'
+ *  mode, rendered as ordinary chats. */
+const legacyAutopilotSlots = [
   slot('orch-1-100', 'Plan migration', 'orchestrator'),
   slot('orch-2-200', 'Review design', 'orchestrator'),
 ]
@@ -382,10 +390,10 @@ describe('ChatPage ?sid= URL parameter', () => {
       vi.useRealTimers()
     })
 
-    /** Control for the gate above: it must DELAY the deadline to the list's
-     *  arrival, not remove it. A key genuinely absent from a list that has landed
-     *  still earns the banner. */
-    it('still declares it missing once a list arrives without the key', async () => {
+    /** A slot list can be authoritative for what it carries without being the
+     *  final restored list. If a later frame proves the linked session is live,
+     *  the deadline's stale verdict must be withdrawn and the link resolved. */
+    it('withdraws not found when a later slot frame carries the key', async () => {
       vi.useFakeTimers()
       const { store } = renderChatPage({ route: '/chat?sid=chat-9-900', slots: [], slotsLoaded: false })
       await vi.advanceTimersByTimeAsync(5100)
@@ -394,6 +402,65 @@ describe('ChatPage ?sid= URL parameter', () => {
       await act(async () => { store.dispatch(sseSlots(slots)) })
       await vi.advanceTimersByTimeAsync(5100)
       expect(screen.getByText(/session "chat-9-900" not found/i)).toBeTruthy()
+
+      await act(async () => {
+        store.dispatch(sseSlots([...slots, slot('chat-9-900', 'Late Session')]))
+      })
+      await vi.advanceTimersByTimeAsync(50)
+      expect(screen.queryByText(/session "chat-9-900" not found/i)).toBeNull()
+      expect(store.getState().chat.activeSlot).toBe('chat-9-900')
+      vi.useRealTimers()
+    })
+
+    /** A late list entry proves the key exists, but its transcript can still fail
+     *  to load. Recovery must replace the stale not-found verdict with the
+     *  existing open-session failure instead of clearing every visible error. */
+    it('keeps a visible error when the late session detail cannot load', async () => {
+      vi.useFakeTimers()
+      const report = recordError({
+        source: 'api',
+        message: 'detail load failed',
+        status: 503,
+        code: 'slot_detail_failed',
+        endpoint: '/api/chat/slots/chat-9-900',
+      })
+      vi.mocked(api.chatSlotDetail).mockRejectedValueOnce(new Error(report.message))
+      const { store } = renderChatPage({ route: '/chat?sid=chat-9-900', slots: [], slotsLoaded: false })
+      await act(async () => { store.dispatch(sseSlots(slots)) })
+      await vi.advanceTimersByTimeAsync(5100)
+      expect(screen.getByText(/session "chat-9-900" not found/i)).toBeTruthy()
+
+      await act(async () => {
+        store.dispatch(sseSlots([...slots, slot('chat-9-900', 'Late Session')]))
+        await Promise.resolve()
+        await Promise.resolve()
+      })
+      expect(screen.queryByText(/session "chat-9-900" not found/i)).toBeNull()
+      expect(screen.getByText(
+        i18nT('store.chatSlice.session_open_error_named', { name: 'Late Session' }),
+      )).toBeTruthy()
+      expect(screen.getAllByRole('alert')).toHaveLength(1)
+      expect(store.getState().chat.switchSlotGone?.report).toMatchObject({
+        endpoint: '/api/chat/slots/chat-9-900',
+        status: 503,
+        code: 'slot_detail_failed',
+      })
+      vi.useRealTimers()
+    })
+
+    /** Control for the recovery above: repeated authoritative frames that omit
+     *  the key do not revoke the missing-session verdict. */
+    it('keeps not found while later slot frames still omit the key', async () => {
+      vi.useFakeTimers()
+      const { store } = renderChatPage({ route: '/chat?sid=chat-9-900', slots: [], slotsLoaded: false })
+      await act(async () => { store.dispatch(sseSlots(slots)) })
+      await vi.advanceTimersByTimeAsync(5100)
+      expect(screen.getByText(/session "chat-9-900" not found/i)).toBeTruthy()
+
+      await act(async () => { store.dispatch(sseSlots([...slots])) })
+      await vi.advanceTimersByTimeAsync(50)
+      expect(screen.getByText(/session "chat-9-900" not found/i)).toBeTruthy()
+      expect(store.getState().chat.activeSlot).not.toBe('chat-9-900')
       vi.useRealTimers()
     })
   })
@@ -403,6 +470,54 @@ describe('ChatPage ?sid= URL parameter', () => {
   // flight, the deep-link load would trip the POP bail so the first switch never
   // updated the URL until a reload; loading at /chat (no ?sid) hides that.
   describe('switch after deep-link load (Mesh chat-switch bug)', () => {
+
+    /** Revoking the stale verdict must not undo a session choice made after the
+     *  deadline. The late frame clears the lie but leaves the user where they went. */
+    it('does not override a user switch when the denied slot arrives later', async () => {
+      vi.useFakeTimers()
+      const { store } = renderChatPage({
+        route: '/chat?sid=chat-9-900',
+        activeSlot: 'chat-1-100',
+        slots: [],
+        slotsLoaded: false,
+      })
+      await act(async () => { store.dispatch(sseSlots(slots)) })
+      await vi.advanceTimersByTimeAsync(5100)
+      expect(screen.getByText(/session "chat-9-900" not found/i)).toBeTruthy()
+
+      await act(async () => { await store.dispatch(switchSlot('chat-2-200')) })
+      await act(async () => {
+        store.dispatch(sseSlots([...slots, slot('chat-9-900', 'Late Session')]))
+      })
+      await vi.advanceTimersByTimeAsync(50)
+      expect(screen.queryByText(/session "chat-9-900" not found/i)).toBeNull()
+      expect(store.getState().chat.activeSlot).toBe('chat-2-200')
+      vi.useRealTimers()
+    })
+
+    it('does not override a user who switches away and back before the denied slot arrives', async () => {
+      vi.useFakeTimers()
+      const { store } = renderChatPage({
+        route: '/chat?sid=chat-9-900',
+        activeSlot: 'chat-1-100',
+        slots: [],
+        slotsLoaded: false,
+      })
+      await act(async () => { store.dispatch(sseSlots(slots)) })
+      await vi.advanceTimersByTimeAsync(5100)
+      expect(screen.getByText(/session "chat-9-900" not found/i)).toBeTruthy()
+
+      await act(async () => { await store.dispatch(switchSlot('chat-2-200')) })
+      await act(async () => { await store.dispatch(switchSlot('chat-1-100')) })
+      await act(async () => {
+        store.dispatch(sseSlots([...slots, slot('chat-9-900', 'Late Session')]))
+      })
+      await vi.advanceTimersByTimeAsync(50)
+      expect(screen.queryByText(/session "chat-9-900" not found/i)).toBeNull()
+      expect(store.getState().chat.activeSlot).toBe('chat-1-100')
+      vi.useRealTimers()
+    })
+
     it('updates URL when switching sessions after loading with ?sid= present', async () => {
       const { store } = renderChatPage({ route: '/chat/fix-login-bug?sid=chat-2-200', slots })
       await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-2-200'))
@@ -467,6 +582,20 @@ describe('ChatPage ?sid= URL parameter', () => {
       // A switch AFTER the deep link must still reach the URL.
       await act(async () => { await store.dispatch(switchSlot('chat-1-100')) })
       await waitFor(() => expect(currentUrl).toContain('sid=chat-1-100'))
+    })
+
+    // The same legacy parameter naming the session that is ALREADY active, on a
+    // session whose title equals its key (so the path needs no slug): the sync
+    // effect's no-op bail must not keep `?slot=` in the address bar.
+    it('normalizes a legacy ?slot= URL that names the active session', async () => {
+      const { store } = renderChatPage({
+        entries: ['/developer', '/chat?slot=chat-1-100'],
+        activeSlot: 'chat-1-100',
+        slots: [slot('chat-1-100'), slot('chat-2-200')],
+      })
+      await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-1-100'))
+      await waitFor(() => expect(currentUrl).toContain('sid=chat-1-100'))
+      expect(currentUrl).not.toContain('slot=')
     })
 
     // A session created and linked in one go (the app pages' create-then-navigate)
@@ -540,19 +669,19 @@ describe('ChatPage ?sid= URL parameter', () => {
     })
   })
 
-  describe('orchestrated mode (unified view)', () => {
-    it('uses /chat base path for orchestrator sessions', async () => {
-      const allSlots = [...slots, ...orchSlots]
-      renderChatPage({ route: '/chat', activeSlot: 'orch-1-100', slots: allSlots, mode: 'orchestrator' })
+  describe('legacy Autopilot slots (unified view)', () => {
+    it('uses /chat base path for a legacy Autopilot slot', async () => {
+      const allSlots = [...slots, ...legacyAutopilotSlots]
+      renderChatPage({ route: '/chat', activeSlot: 'orch-1-100', slots: allSlots })
       await waitFor(() => {
         expect(currentUrl).toContain('/chat/plan-migration')
         expect(currentUrl).toContain('sid=orch-1-100')
       })
     })
 
-    it('keeps orchestrator sessions under the unified /chat surface', async () => {
-      const allSlots = [...slots, ...orchSlots]
-      renderChatPage({ route: '/chat?sid=orch-1-100', slots: allSlots, mode: 'orchestrator' })
+    it('keeps a legacy Autopilot slot under the unified /chat surface', async () => {
+      const allSlots = [...slots, ...legacyAutopilotSlots]
+      renderChatPage({ route: '/chat?sid=orch-1-100', slots: allSlots })
       await waitFor(() => {
         expect(currentUrl).toContain('/chat')
         expect(currentUrl).not.toMatch(/^\/orchestrated/)
@@ -628,7 +757,7 @@ describe('ChatPage ?sid= URL parameter', () => {
           // switchSlot that would clear messages). These tests exercise
           // the POP retrace logic itself, which inherently needs the
           // gateway available.
-          status: { platform: 'darwin' }, connected: true, slots: initialSlots, approvalMode: 'normal',
+          status: { platform: 'darwin' }, connected: true, slots: initialSlots, slotsLoaded: true, approvalMode: 'normal',
           channelTrusted: false, refreshTrigger: 0, unreadSlots: [], updateProgress: null,
           subagentRunning: {}, subagentDetails: {}, subagentText: {},
           sessionDefaultColor: null, sessionColorsMode: 'tint', sessionColorsPalette: 'horizon', sessionColorsIntensity: 'clear',
@@ -662,6 +791,15 @@ describe('ChatPage ?sid= URL parameter', () => {
       return { store }
     }
 
+    async function settle(store: ReturnType<typeof createTestStore>, rows: ChatSlot[]) {
+      // The first three authoritative lists spend and retire the confirmed close
+      // hold. The retirement list is still filtered; only the fourth list can
+      // authoritatively establish whether the key remains absent.
+      for (let i = 0; i < 4; i++) {
+        await act(async () => { store.dispatch(sseSlots(rows)) })
+      }
+    }
+
     it('retraces the correct session across two Back steps then Forward', async () => {
       const navSlots = [slot('chat-1-100', 'Alpha'), slot('chat-2-200', 'Beta'), slot('chat-3-300', 'Gamma')]
       const { store } = renderForPop(navSlots)
@@ -689,6 +827,60 @@ describe('ChatPage ?sid= URL parameter', () => {
       await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-2-200'))
     })
 
+    it('does not rewrite a live history entry omitted by a stale slot list', async () => {
+      const navSlots = [slot('chat-1-100', 'Alpha'), slot('chat-2-200', 'Beta'), slot('chat-3-300', 'Gamma')]
+      const { store } = renderForPop(navSlots)
+
+      await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-1-100'))
+      await act(async () => { await store.dispatch(switchSlot('chat-2-200')) })
+      await waitFor(() => expect(currentUrl).toContain('sid=chat-2-200'))
+      await act(async () => { await store.dispatch(switchSlot('chat-3-300')) })
+      await waitFor(() => expect(currentUrl).toContain('sid=chat-3-300'))
+
+      vi.mocked(api.chatSlots).mockResolvedValueOnce([navSlots[0], navSlots[2]] as never)
+      await act(async () => { await store.dispatch(fetchSlots()) })
+      expect(store.getState().dashboard.slots.map(s => s.key)).not.toContain('chat-2-200')
+
+      await act(async () => { navBack() })
+      await waitFor(() => expect(currentUrl).toContain('sid=chat-3-300'))
+      await act(async () => { store.dispatch(sseSlots(navSlots)) })
+      await waitFor(() => expect(store.getState().dashboard.slots.map(s => s.key)).toContain('chat-2-200'))
+
+      for (let i = 0; i < 2 && store.getState().chat.activeSlot !== 'chat-2-200'; i++) {
+        await act(async () => { navBack() })
+        await new Promise(r => setTimeout(r, 20))
+      }
+      expect(store.getState().chat.activeSlot).toBe('chat-2-200')
+    })
+
+    // A session closed here and then resumed under the same key is live again:
+    // a later list that omits it must not get its history entry rewritten.
+    it('does not rewrite the entry of a closed session that was resumed', async () => {
+      const navSlots = [slot('chat-1-100', 'Alpha'), slot('chat-2-200', 'Beta'), slot('chat-3-300', 'Gamma')]
+      const { store } = renderForPop(navSlots)
+
+      await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-1-100'))
+      await act(async () => { await store.dispatch(switchSlot('chat-2-200')) })
+      await waitFor(() => expect(currentUrl).toContain('sid=chat-2-200'))
+      await act(async () => { await store.dispatch(switchSlot('chat-3-300')) })
+      await waitFor(() => expect(currentUrl).toContain('sid=chat-3-300'))
+
+      await act(async () => { await store.dispatch(deleteSlot('chat-2-200')) })
+      await act(async () => { store.dispatch(addSlotOptimistic(navSlots[1])) })
+      vi.mocked(api.chatSlots).mockResolvedValueOnce([navSlots[0], navSlots[2]] as never)
+      await act(async () => { await store.dispatch(fetchSlots()) })
+      expect(store.getState().dashboard.slots.map(s => s.key)).not.toContain('chat-2-200')
+      await settle(store, navSlots)
+      await waitFor(() => expect(store.getState().dashboard.slots.map(s => s.key)).toContain('chat-2-200'))
+
+      await act(async () => { navBack() })
+      for (let i = 0; i < 2 && store.getState().chat.activeSlot !== 'chat-2-200'; i++) {
+        await act(async () => { navBack() })
+        await new Promise(r => setTimeout(r, 20))
+      }
+      expect(store.getState().chat.activeSlot).toBe('chat-2-200')
+    })
+
     // Regression (URL-lock): after a Back/Forward POP, useNavigationType() stays
     // 'POP' until our own navigate() runs. A subsequent sidebar switch changes
     // activeSlot, re-firing the POP→sid effect while still 'POP'; reading the
@@ -710,6 +902,645 @@ describe('ChatPage ?sid= URL parameter', () => {
       await act(async () => { await store.dispatch(switchSlot('chat-3-300')) })
       await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-3-300'))
       await waitFor(() => expect(currentUrl).toContain('sid=chat-3-300'))
+    })
+
+    // Regression: closing the active session left its `?sid=` entry in history
+    // and pushed the landing session on top of it. Back then landed on the dead
+    // entry, the POP reader ignored it (the session is gone), and URL sync
+    // pushed again — so Back never got past the closed session and Forward was
+    // wiped every time. The dead entry must be overwritten instead.
+    it('lets Back get past a closed session and keeps Forward', async () => {
+      const navSlots = [slot('chat-1-100', 'Alpha'), slot('chat-2-200', 'Beta'), slot('chat-3-300', 'Gamma')]
+      const { store } = renderForPop(navSlots)
+
+      await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-1-100'))
+      await act(async () => { await store.dispatch(switchSlot('chat-2-200')) })
+      await waitFor(() => expect(currentUrl).toContain('sid=chat-2-200'))
+      await act(async () => { await store.dispatch(switchSlot('chat-3-300')) })
+      await waitFor(() => expect(currentUrl).toContain('sid=chat-3-300'))
+      const urlWritesBeforeClose = seenUrls.length
+
+      await act(async () => { await store.dispatch(deleteSlot('chat-3-300')) })
+      await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-2-200'))
+      expect(currentUrl).toContain('sid=chat-3-300')
+      expect(seenUrls).toHaveLength(urlWritesBeforeClose)
+      await settle(store, [navSlots[0], navSlots[1]])
+      await waitFor(() => expect(currentUrl).toContain('sid=chat-2-200'))
+
+      // The closed session's entry now names chat-2 (one inert Back at most);
+      // the next Back must reach chat-1. Pre-fix every Back re-landed on chat-3.
+      for (let i = 0; i < 3 && store.getState().chat.activeSlot !== 'chat-1-100'; i++) {
+        await act(async () => { navBack() })
+        await new Promise(r => setTimeout(r, 20))
+      }
+      await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-1-100'))
+      expect(currentUrl).not.toContain('chat-3-300')
+
+      // Forward survives: chat-1 → chat-2.
+      await act(async () => { navForward() })
+      await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-2-200'))
+      expect(currentUrl).not.toContain('chat-3-300')
+    })
+
+    it('does not rewrite the entry of a session another tab resumed inside the close hold window', async () => {
+      const navSlots = [slot('chat-1-100', 'Alpha'), slot('chat-2-200', 'Beta'), slot('chat-3-300', 'Gamma')]
+      const { store } = renderForPop(navSlots)
+
+      await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-1-100'))
+      await act(async () => { await store.dispatch(switchSlot('chat-2-200')) })
+      await act(async () => { await store.dispatch(switchSlot('chat-3-300')) })
+      await waitFor(() => expect(currentUrl).toContain('sid=chat-3-300'))
+      const urlWritesBeforeClose = seenUrls.length
+
+      await act(async () => { await store.dispatch(deleteSlot('chat-3-300')) })
+      await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-2-200'))
+      expect(currentUrl).toContain('sid=chat-3-300')
+      expect(seenUrls).toHaveLength(urlWritesBeforeClose)
+
+      await act(async () => { store.dispatch(sseSlots(navSlots)) })
+      expect(store.getState().dashboard.slots.map(s => s.key)).not.toContain('chat-3-300')
+      await act(async () => { await store.dispatch(switchSlot('chat-1-100')) })
+      await waitFor(() => expect(currentUrl).toContain('sid=chat-1-100'))
+      await act(async () => { navBack() })
+      await waitFor(() => expect(currentUrl).toContain('sid=chat-3-300'))
+      const writesAfterBack = seenUrls.length
+      await new Promise(r => setTimeout(r, 30))
+      expect(seenUrls).toHaveLength(writesAfterBack)
+      expect(store.getState().chat.activeSlot).toBe('chat-1-100')
+
+      for (let i = 0; i < 3; i++) {
+        await act(async () => { store.dispatch(sseSlots(navSlots)) })
+      }
+      await waitFor(() => expect(store.getState().dashboard.slots.map(s => s.key)).toContain('chat-3-300'))
+      if (store.getState().chat.activeSlot !== 'chat-3-300') {
+        await act(async () => { navBack() })
+      }
+      await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-3-300'))
+    })
+
+    it('replaces the closed entry only once its hold has retired and a later list omits it', async () => {
+      const navSlots = [slot('chat-1-100', 'Alpha'), slot('chat-2-200', 'Beta'), slot('chat-3-300', 'Gamma')]
+      const { store } = renderForPop(navSlots)
+
+      await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-1-100'))
+      await act(async () => { await store.dispatch(switchSlot('chat-2-200')) })
+      await act(async () => { await store.dispatch(switchSlot('chat-3-300')) })
+      await waitFor(() => expect(currentUrl).toContain('sid=chat-3-300'))
+      const urlWritesBeforeClose = seenUrls.length
+
+      await act(async () => { await store.dispatch(deleteSlot('chat-3-300')) })
+      await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-2-200'))
+      expect(currentUrl).toContain('sid=chat-3-300')
+      expect(seenUrls).toHaveLength(urlWritesBeforeClose)
+
+      for (let i = 0; i < 3; i++) {
+        await act(async () => { store.dispatch(sseSlots([navSlots[0], navSlots[1]])) })
+      }
+      expect(currentUrl).toContain('sid=chat-3-300')
+      expect(seenUrls).toHaveLength(urlWritesBeforeClose)
+
+      await act(async () => { store.dispatch(sseSlots([navSlots[0], navSlots[1]])) })
+      await waitFor(() => expect(currentUrl).toContain('sid=chat-2-200'))
+      expect(seenUrls).toHaveLength(urlWritesBeforeClose + 1)
+      for (let i = 0; i < 2 && store.getState().chat.activeSlot !== 'chat-1-100'; i++) {
+        await act(async () => { navBack() })
+      }
+      await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-1-100'))
+      await act(async () => { navForward() })
+      await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-2-200'))
+    })
+
+    // A close the server refuses brings the session back (recovery refetch), so
+    // its history entry must still lead there. Overwriting it at close time, as
+    // an unconditional replace would, strands the restored session behind Back.
+    it('keeps the entry of a session whose close failed', async () => {
+      const navSlots = [slot('chat-1-100', 'Alpha'), slot('chat-2-200', 'Beta'), slot('chat-3-300', 'Gamma')]
+      const { store } = renderForPop(navSlots)
+
+      await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-1-100'))
+      await act(async () => { await store.dispatch(switchSlot('chat-2-200')) })
+      await waitFor(() => expect(currentUrl).toContain('sid=chat-2-200'))
+      await act(async () => { await store.dispatch(switchSlot('chat-3-300')) })
+      await waitFor(() => expect(currentUrl).toContain('sid=chat-3-300'))
+
+      // Hold the DELETE open across a render, as a real request is: settling it
+      // in the same flush would restore the row before URL sync ever ran.
+      let failClose!: (e: Error) => void
+      vi.mocked(api.deleteChatSlot).mockReturnValueOnce(new Promise((_, reject) => { failClose = reject }) as never)
+      vi.mocked(api.chatSlots).mockResolvedValueOnce(navSlots as never)
+      let closing!: Promise<unknown>
+      act(() => { closing = store.dispatch(deleteSlot('chat-3-300')) })
+      await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-2-200'))
+      await new Promise(r => setTimeout(r, 30))
+      await act(async () => { failClose(new Error('offline')); await closing })
+      await waitFor(() => expect(store.getState().dashboard.slots.map(s => s.key)).toContain('chat-3-300'))
+      await waitFor(() => expect(currentUrl).toContain('sid=chat-2-200'))
+
+      await act(async () => { navBack() })
+      await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-3-300'))
+    })
+
+    // A session closed while NOT on screen keeps its history entry. Back onto
+    // it must rewrite that entry in place and keep going, not push over it.
+    it('lets Back step over the entry of a session closed off screen', async () => {
+      const navSlots = [slot('chat-1-100', 'Alpha'), slot('chat-2-200', 'Beta'), slot('chat-3-300', 'Gamma')]
+      const { store } = renderForPop(navSlots)
+
+      await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-1-100'))
+      await act(async () => { await store.dispatch(switchSlot('chat-2-200')) })
+      await waitFor(() => expect(currentUrl).toContain('sid=chat-2-200'))
+      await act(async () => { await store.dispatch(switchSlot('chat-3-300')) })
+      await waitFor(() => expect(currentUrl).toContain('sid=chat-3-300'))
+
+      await act(async () => { await store.dispatch(deleteSlot('chat-2-200')) })
+      expect(store.getState().chat.activeSlot).toBe('chat-3-300')
+      await settle(store, [navSlots[0], navSlots[2]])
+
+      await act(async () => { navBack() })
+      await waitFor(() => expect(currentUrl).toContain('sid=chat-3-300'))
+      await act(async () => { navBack() })
+      await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-1-100'))
+
+      await act(async () => { navForward() })
+      await act(async () => { navForward() })
+      await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-3-300'))
+      expect(currentUrl).not.toContain('chat-2-200')
+    })
+
+    // A failed close whose recovery refetch is still out when Back arrives: the
+    // missing row is not proof that the session was deleted, and its history
+    // entry must remain available once the refetch restores it.
+    it('holds a Back onto a failed close until the recovery refetch lands', async () => {
+      const navSlots = [slot('chat-1-100', 'Alpha'), slot('chat-2-200', 'Beta'), slot('chat-3-300', 'Gamma')]
+      const { store } = renderForPop(navSlots)
+
+      await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-1-100'))
+      await act(async () => { await store.dispatch(switchSlot('chat-2-200')) })
+      await waitFor(() => expect(currentUrl).toContain('sid=chat-2-200'))
+      await act(async () => { await store.dispatch(switchSlot('chat-3-300')) })
+      await waitFor(() => expect(currentUrl).toContain('sid=chat-3-300'))
+
+      let failClose!: (e: Error) => void
+      vi.mocked(api.deleteChatSlot).mockReturnValueOnce(new Promise((_, reject) => { failClose = reject }) as never)
+      let restore!: (v: unknown) => void
+      vi.mocked(api.chatSlots).mockReturnValueOnce(new Promise(resolve => { restore = resolve }) as never)
+      let closing!: Promise<unknown>
+      act(() => { closing = store.dispatch(deleteSlot('chat-3-300')) })
+      await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-2-200'))
+      await new Promise(r => setTimeout(r, 30))
+      await act(async () => { failClose(new Error('offline')); await closing })
+      expect(store.getState().dashboard.slots.map(s => s.key)).not.toContain('chat-3-300')
+
+      await act(async () => { navBack() })
+      await new Promise(r => setTimeout(r, 30))
+      expect(store.getState().chat.activeSlot).toBe('chat-2-200')
+
+      await act(async () => { restore(navSlots) })
+      await waitFor(() => expect(store.getState().dashboard.slots.map(s => s.key)).toContain('chat-3-300'))
+      await act(async () => { navBack() })
+      await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-3-300'))
+    })
+
+    // Visit 1 -> 2 -> 3, then close 2 off screen. The helper leaves the browser
+    // on chat-3 with a confirmed tombstone for chat-2.
+    async function closeMiddleOffScreen() {
+      const navSlots = [slot('chat-1-100', 'Alpha'), slot('chat-2-200', 'Beta'), slot('chat-3-300', 'Gamma')]
+      const view = renderForPop(navSlots)
+      const { store } = view
+      await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-1-100'))
+      await act(async () => { await store.dispatch(switchSlot('chat-2-200')) })
+      await waitFor(() => expect(currentUrl).toContain('sid=chat-2-200'))
+      await act(async () => { await store.dispatch(switchSlot('chat-3-300')) })
+      await waitFor(() => expect(currentUrl).toContain('sid=chat-3-300'))
+      await act(async () => { await store.dispatch(deleteSlot('chat-2-200')) })
+      await settle(store, [navSlots[0], navSlots[2]])
+      return { store }
+    }
+
+    // A second Back while the first is held must be honoured, not dropped.
+    it('honours a second Back pressed while a dead entry is held', async () => {
+      const navSlots = [slot('chat-1-100', 'Alpha'), slot('chat-2-200', 'Beta'), slot('chat-3-300', 'Gamma')]
+      const { store } = renderForPop(navSlots)
+      await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-1-100'))
+      await act(async () => { await store.dispatch(switchSlot('chat-2-200')) })
+      await waitFor(() => expect(currentUrl).toContain('sid=chat-2-200'))
+      await act(async () => { await store.dispatch(switchSlot('chat-3-300')) })
+      await waitFor(() => expect(currentUrl).toContain('sid=chat-3-300'))
+
+      let finishClose!: () => void
+      vi.mocked(api.deleteChatSlot).mockReturnValueOnce(new Promise<void>(resolve => { finishClose = resolve }) as never)
+      let closing!: Promise<unknown>
+      act(() => { closing = store.dispatch(deleteSlot('chat-2-200')) })
+      await waitFor(() => expect(store.getState().dashboard.slots.map(s => s.key)).not.toContain('chat-2-200'))
+
+      await act(async () => { navBack() })
+      await new Promise(r => setTimeout(r, 30))
+      expect(currentUrl).toContain('sid=chat-2-200')
+      await act(async () => { navBack() })
+      await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-1-100'))
+
+      await act(async () => { finishClose(); await closing })
+      await settle(store, [navSlots[0], navSlots[2]])
+      await act(async () => { navForward() })
+      await waitFor(() => expect(currentUrl).toContain('sid=chat-1-100'))
+      await act(async () => { navForward() })
+      await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-3-300'))
+      expect(currentUrl).not.toContain('chat-2-200')
+    })
+
+    // A concurrent close answers this tab's DELETE with 404. Until the server
+    // reports that close's outcome, the current history entry stays untouched.
+    it('lets Back get past a session whose close DELETE returns 404 and keeps Forward', async () => {
+      const navSlots = [slot('chat-1-100', 'Alpha'), slot('chat-2-200', 'Beta'), slot('chat-3-300', 'Gamma')]
+      const { store } = renderForPop(navSlots)
+
+      await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-1-100'))
+      await act(async () => { await store.dispatch(switchSlot('chat-2-200')) })
+      await waitFor(() => expect(currentUrl).toContain('sid=chat-2-200'))
+      await act(async () => { await store.dispatch(switchSlot('chat-3-300')) })
+      await waitFor(() => expect(currentUrl).toContain('sid=chat-3-300'))
+      const urlWritesBeforeClose = seenUrls.length
+
+      vi.mocked(api.deleteChatSlot).mockRejectedValueOnce(Object.assign(new Error('not found'), { status: 404 }))
+      vi.mocked(api.chatSlots).mockResolvedValueOnce([navSlots[0], navSlots[1]] as never)
+      await act(async () => { await store.dispatch(deleteSlot('chat-3-300')) })
+      await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-2-200'))
+      expect(currentUrl).toContain('sid=chat-3-300')
+      expect(seenUrls).toHaveLength(urlWritesBeforeClose)
+
+      await act(async () => {
+        store.dispatch(sseSlotPatch({ slots: [], removed: ['chat-3-300'] }))
+      })
+      await waitFor(() => expect(currentUrl).toContain('sid=chat-2-200'))
+      expect(seenUrls).toHaveLength(urlWritesBeforeClose + 1)
+      await settle(store, [navSlots[0], navSlots[1]])
+      expect(seenUrls).toHaveLength(urlWritesBeforeClose + 1)
+
+      for (let i = 0; i < 3 && store.getState().chat.activeSlot !== 'chat-1-100'; i++) {
+        await act(async () => { navBack() })
+        await new Promise(r => setTimeout(r, 20))
+      }
+      await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-1-100'))
+      expect(currentUrl).not.toContain('chat-3-300')
+
+      await act(async () => { navForward() })
+      await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-2-200'))
+      expect(currentUrl).not.toContain('chat-3-300')
+    })
+
+    // A post-pop recovery reply can be followed by a pre-pop WebSocket frame.
+    // That unpaired straggler must not release the close hold or rewrite history.
+    it('holds a 404 close through a pre-pop straggler frame', async () => {
+      const navSlots = [slot('chat-1-100', 'Alpha'), slot('chat-2-200', 'Beta'), slot('chat-3-300', 'Gamma')]
+      const { store } = renderForPop(navSlots)
+
+      await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-1-100'))
+      await act(async () => { await store.dispatch(switchSlot('chat-2-200')) })
+      await waitFor(() => expect(currentUrl).toContain('sid=chat-2-200'))
+      await act(async () => { await store.dispatch(switchSlot('chat-3-300')) })
+      await waitFor(() => expect(currentUrl).toContain('sid=chat-3-300'))
+      const urlWritesBeforeClose = seenUrls.length
+
+      vi.mocked(api.deleteChatSlot).mockRejectedValueOnce(Object.assign(new Error('not found'), { status: 404 }))
+      vi.mocked(api.chatSlots).mockResolvedValueOnce([navSlots[0], navSlots[1]] as never)
+      await act(async () => { await store.dispatch(deleteSlot('chat-3-300')) })
+      await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-2-200'))
+      expect(currentUrl).toContain('sid=chat-3-300')
+      expect(seenUrls).toHaveLength(urlWritesBeforeClose)
+
+      await act(async () => { store.dispatch(sseSlots(navSlots)) })
+      expect(store.getState().dashboard.slots.map(s => s.key)).not.toContain('chat-3-300')
+      expect(store.getState().dashboard.closingSlots['chat-3-300']?.awaitingOutcome).toBe(true)
+      expect(currentUrl).toContain('sid=chat-3-300')
+      expect(seenUrls).toHaveLength(urlWritesBeforeClose)
+
+      const urlCountBeforeConfirmation = seenUrls.length
+      await act(async () => {
+        store.dispatch(sseSlotPatch({ slots: [], removed: ['chat-3-300'] }))
+      })
+      await waitFor(() => expect(currentUrl).toContain('sid=chat-2-200'))
+      expect(seenUrls).toHaveLength(urlCountBeforeConfirmation + 1)
+      await settle(store, [navSlots[0], navSlots[1]])
+      expect(seenUrls).toHaveLength(urlCountBeforeConfirmation + 1)
+      for (let i = 0; i < 3 && store.getState().chat.activeSlot !== 'chat-1-100'; i++) {
+        await act(async () => { navBack() })
+        await new Promise(r => setTimeout(r, 20))
+      }
+      await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-1-100'))
+      await act(async () => { navForward() })
+      await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-2-200'))
+      expect(seenUrls.slice(urlCountBeforeConfirmation).every(url => !url.includes('chat-3-300'))).toBe(true)
+    })
+
+    it('keeps a 404 close history entry when the competing close rolls back', async () => {
+      const navSlots = [slot('chat-1-100', 'Alpha'), slot('chat-2-200', 'Beta'), slot('chat-3-300', 'Gamma')]
+      const { store } = renderForPop(navSlots)
+
+      await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-1-100'))
+      await act(async () => { await store.dispatch(switchSlot('chat-2-200')) })
+      await waitFor(() => expect(currentUrl).toContain('sid=chat-2-200'))
+      await act(async () => { await store.dispatch(switchSlot('chat-3-300')) })
+      await waitFor(() => expect(currentUrl).toContain('sid=chat-3-300'))
+
+      let restore!: (v: unknown) => void
+      vi.mocked(api.deleteChatSlot).mockRejectedValueOnce(Object.assign(new Error('not found'), { status: 404 }))
+      vi.mocked(api.chatSlots).mockReturnValueOnce(new Promise(resolve => { restore = resolve }) as never)
+      await act(async () => { await store.dispatch(deleteSlot('chat-3-300')) })
+      await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-2-200'))
+
+      await act(async () => { navBack() })
+      await waitFor(() => expect(currentUrl).toContain('sid=chat-2-200'))
+      await act(async () => { navForward() })
+      await waitFor(() => expect(currentUrl).toContain('sid=chat-3-300'))
+      expect(store.getState().chat.activeSlot).toBe('chat-2-200')
+
+      await act(async () => { restore(navSlots) })
+      await waitFor(() => expect(store.getState().dashboard.slots.map(s => s.key)).toContain('chat-3-300'))
+      await waitFor(() => expect(currentUrl).toContain('sid=chat-2-200'))
+      await act(async () => { navBack() })
+      await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-3-300'))
+    })
+
+    it('repairs a 404 close history entry after the durable removed frame', async () => {
+      const navSlots = [slot('chat-1-100', 'Alpha'), slot('chat-2-200', 'Beta'), slot('chat-3-300', 'Gamma')]
+      const { store } = renderForPop(navSlots)
+
+      await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-1-100'))
+      await act(async () => { await store.dispatch(switchSlot('chat-2-200')) })
+      await waitFor(() => expect(currentUrl).toContain('sid=chat-2-200'))
+      await act(async () => { await store.dispatch(switchSlot('chat-3-300')) })
+      await waitFor(() => expect(currentUrl).toContain('sid=chat-3-300'))
+
+      vi.mocked(api.deleteChatSlot).mockRejectedValueOnce(Object.assign(new Error('not found'), { status: 404 }))
+      vi.mocked(api.chatSlots).mockResolvedValueOnce([navSlots[0], navSlots[1]] as never)
+      await act(async () => { await store.dispatch(deleteSlot('chat-3-300')) })
+      await act(async () => { navBack() })
+      await waitFor(() => expect(currentUrl).toContain('sid=chat-2-200'))
+      await act(async () => { navForward() })
+      await waitFor(() => expect(currentUrl).toContain('sid=chat-3-300'))
+      expect(store.getState().chat.activeSlot).toBe('chat-2-200')
+
+      await act(async () => {
+        store.dispatch(sseSlotPatch({ slots: [], removed: ['chat-3-300'] }))
+      })
+      await waitFor(() => expect(currentUrl).toContain('sid=chat-2-200'))
+      const writesAfterRemoved = seenUrls.length
+      await settle(store, [navSlots[0], navSlots[1]])
+      expect(seenUrls).toHaveLength(writesAfterRemoved)
+      for (let i = 0; i < 2 && store.getState().chat.activeSlot !== 'chat-1-100'; i++) {
+        await act(async () => { navBack() })
+      }
+      await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-1-100'))
+      await act(async () => { navForward() })
+      await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-2-200'))
+      expect(currentUrl).not.toContain('chat-3-300')
+    })
+
+    // Back onto an off-screen close while its DELETE is pending is left alone.
+    // When recovery restores the session, the URL writer puts the live pane back
+    // on top without rewriting the restored entry behind it.
+    it('leaves a Back onto a pending close alone and keeps the restored entry reachable', async () => {
+      const navSlots = [slot('chat-1-100', 'Alpha'), slot('chat-2-200', 'Beta'), slot('chat-3-300', 'Gamma')]
+      const { store } = renderForPop(navSlots)
+
+      await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-1-100'))
+      await act(async () => { await store.dispatch(switchSlot('chat-2-200')) })
+      await waitFor(() => expect(currentUrl).toContain('sid=chat-2-200'))
+      await act(async () => { await store.dispatch(switchSlot('chat-3-300')) })
+      await waitFor(() => expect(currentUrl).toContain('sid=chat-3-300'))
+
+      let failClose!: (e: Error) => void
+      vi.mocked(api.deleteChatSlot).mockReturnValueOnce(new Promise((_, reject) => { failClose = reject }) as never)
+      let restore!: (v: unknown) => void
+      vi.mocked(api.chatSlots).mockReturnValueOnce(new Promise(resolve => { restore = resolve }) as never)
+      let closing!: Promise<unknown>
+      act(() => { closing = store.dispatch(deleteSlot('chat-2-200')) })
+      await waitFor(() => expect(store.getState().dashboard.slots.map(s => s.key)).not.toContain('chat-2-200'))
+
+      await act(async () => { navBack() })
+      await waitFor(() => expect(currentUrl).toContain('sid=chat-2-200'))
+      expect(store.getState().chat.activeSlot).toBe('chat-3-300')
+
+      await act(async () => { failClose(new Error('offline')); await closing })
+      await act(async () => { restore(navSlots) })
+      await waitFor(() => expect(store.getState().dashboard.slots.map(s => s.key)).toContain('chat-2-200'))
+      await waitFor(() => expect(currentUrl).toContain('sid=chat-3-300'))
+      expect(store.getState().chat.activeSlot).toBe('chat-3-300')
+
+      await act(async () => { navBack() })
+      await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-2-200'))
+    })
+
+    // Visit 1 -> 2 -> 3, then close chat-3 with its DELETE held open. The helper
+    // leaves the browser on the landing (chat-2) while the URL still names chat-3.
+    async function closeActiveWithPendingDelete(outcome: { resolve?: (r: () => void) => void; reject?: (r: (e: Error) => void) => void }) {
+      const navSlots = [slot('chat-1-100', 'Alpha'), slot('chat-2-200', 'Beta'), slot('chat-3-300', 'Gamma')]
+      const { store } = renderForPop(navSlots)
+      await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-1-100'))
+      await act(async () => { await store.dispatch(switchSlot('chat-2-200')) })
+      await waitFor(() => expect(currentUrl).toContain('sid=chat-2-200'))
+      await act(async () => { await store.dispatch(switchSlot('chat-3-300')) })
+      await waitFor(() => expect(currentUrl).toContain('sid=chat-3-300'))
+      const urlWritesBeforeClose = seenUrls.length
+
+      vi.mocked(api.deleteChatSlot).mockReturnValueOnce(new Promise<void>((resolve, reject) => {
+        outcome.resolve?.(resolve)
+        outcome.reject?.(reject)
+      }) as never)
+      let closing!: Promise<unknown>
+      act(() => { closing = store.dispatch(deleteSlot('chat-3-300')) })
+      await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-2-200'))
+      await new Promise(r => setTimeout(r, 30))
+      // The landing write waits for the DELETE's outcome.
+      expect(currentUrl).toContain('sid=chat-3-300')
+      expect(seenUrls).toHaveLength(urlWritesBeforeClose)
+      expect(store.getState().dashboard.closingSlots['chat-3-300']?.inFlightUntil).not.toBeNull()
+      return { store, navSlots, closing, urlWritesBeforeClose }
+    }
+
+    it('replaces the closed entry on the durable removed frame without any later list', async () => {
+      let finishClose!: () => void
+      const { store, closing, urlWritesBeforeClose } = await closeActiveWithPendingDelete({
+        resolve: resolve => { finishClose = resolve },
+      })
+
+      // The server publishes durable removal before the DELETE response reaches
+      // this tab. No full slot list follows on a patch-capable idle connection.
+      await act(async () => {
+        store.dispatch(sseSlotPatch({ slots: [], removed: ['chat-3-300'] }))
+      })
+      await waitFor(() => expect(currentUrl).toContain('sid=chat-2-200'))
+      expect(seenUrls).toHaveLength(urlWritesBeforeClose + 1)
+      expect(seenUrls.slice(urlWritesBeforeClose).every(url => !url.includes('chat-3-300'))).toBe(true)
+
+      await act(async () => { finishClose(); await closing })
+      expect(seenUrls).toHaveLength(urlWritesBeforeClose + 1)
+      for (let i = 0; i < 2 && store.getState().chat.activeSlot !== 'chat-1-100'; i++) {
+        await act(async () => { navBack() })
+      }
+      await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-1-100'))
+      await act(async () => { navForward() })
+      await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-2-200'))
+      expect(currentUrl).not.toContain('chat-3-300')
+    })
+
+    it('repairs a Back onto a durably removed entry without any later list', async () => {
+      const navSlots = [slot('chat-1-100', 'Alpha'), slot('chat-2-200', 'Beta'), slot('chat-3-300', 'Gamma')]
+      const { store } = renderForPop(navSlots)
+      await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-1-100'))
+      await act(async () => { await store.dispatch(switchSlot('chat-2-200')) })
+      await act(async () => { await store.dispatch(switchSlot('chat-3-300')) })
+      await waitFor(() => expect(currentUrl).toContain('sid=chat-3-300'))
+
+      let finishClose!: () => void
+      vi.mocked(api.deleteChatSlot).mockReturnValueOnce(new Promise<void>(resolve => {
+        finishClose = resolve
+      }) as never)
+      let closing!: Promise<unknown>
+      act(() => { closing = store.dispatch(deleteSlot('chat-2-200')) })
+      await waitFor(() => expect(store.getState().dashboard.slots.map(s => s.key)).not.toContain('chat-2-200'))
+      await act(async () => {
+        store.dispatch(sseSlotPatch({ slots: [], removed: ['chat-2-200'] }))
+      })
+      await act(async () => { finishClose(); await closing })
+
+      const writesBeforeBack = seenUrls.length
+      await act(async () => { navBack() })
+      await waitFor(() => {
+        expect(seenUrls.length).toBeGreaterThan(writesBeforeBack)
+        expect(currentUrl).toContain('sid=chat-3-300')
+      })
+      expect(store.getState().chat.activeSlot).toBe('chat-3-300')
+      await act(async () => { navBack() })
+      await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-1-100'))
+      await act(async () => { navForward() })
+      await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-3-300'))
+      expect(currentUrl).not.toContain('chat-2-200')
+    })
+
+    // Only the close's LANDING write waits for the DELETE. A session the user
+    // picks while that DELETE is still out is pushed as any other switch, so the
+    // address bar names the session on screen and every stop made in that window
+    // is a Back target. The closing entry left behind is repaired when Back
+    // reaches it, once this tab saw the close confirmed.
+    it('pushes a switch made while the close DELETE is pending and repairs the dead entry on Back', async () => {
+      let finishClose!: () => void
+      const { store, navSlots, closing } = await closeActiveWithPendingDelete({ resolve: r => { finishClose = r } })
+      const urlWritesBeforeSwitch = seenUrls.length
+
+      await act(async () => { await store.dispatch(switchSlot('chat-1-100')) })
+      await waitFor(() => expect(currentUrl).toContain('sid=chat-1-100'))
+      expect(seenUrls.length).toBeGreaterThan(urlWritesBeforeSwitch)
+      expect(store.getState().dashboard.closingSlots['chat-3-300']?.inFlightUntil).not.toBeNull()
+
+      await act(async () => { finishClose(); await closing })
+      await new Promise(r => setTimeout(r, 30))
+      expect(currentUrl).toContain('sid=chat-1-100')
+      await settle(store, [navSlots[0], navSlots[1]])
+
+      // Back lands on chat-3's dead entry: repaired in place to the session on screen.
+      await act(async () => { navBack() })
+      await waitFor(() => expect(currentUrl).toContain('sid=chat-1-100'))
+      expect(store.getState().chat.activeSlot).toBe('chat-1-100')
+      // Back again reaches chat-2, the stop before the close.
+      await act(async () => { navBack() })
+      await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-2-200'))
+      expect(currentUrl).toContain('sid=chat-2-200')
+      // Forward survives, through the repaired entry.
+      await act(async () => { navForward() })
+      await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-1-100'))
+      expect(currentUrl).not.toContain('chat-3-300')
+    })
+
+    // Without a switch, the landing write still waits: nothing is written while
+    // the DELETE is out, and the confirmation REPLACES the dead entry rather than
+    // pushing over it, so Back reaches the stop before the close in one step.
+    it('holds only the landing write while the close DELETE is pending', async () => {
+      let finishClose!: () => void
+      const { store, closing, urlWritesBeforeClose } = await closeActiveWithPendingDelete({ resolve: r => { finishClose = r } })
+
+      await act(async () => { finishClose(); await closing })
+      expect(currentUrl).toContain('sid=chat-3-300')
+      expect(seenUrls).toHaveLength(urlWritesBeforeClose)
+      await settle(store, [slot('chat-1-100', 'Alpha'), slot('chat-2-200', 'Beta')])
+      await waitFor(() => expect(currentUrl).toContain('sid=chat-2-200'))
+      // One write, and a replace: there is no entry above the landing to go Forward to.
+      expect(seenUrls).toHaveLength(urlWritesBeforeClose + 1)
+      await act(async () => { navForward() })
+      await new Promise(r => setTimeout(r, 30))
+      expect(currentUrl).toContain('sid=chat-2-200')
+      expect(store.getState().chat.activeSlot).toBe('chat-2-200')
+
+      // The replaced entry now names chat-2 (one inert Back at most); the next
+      // Back must reach chat-1.
+      for (let i = 0; i < 2 && store.getState().chat.activeSlot !== 'chat-1-100'; i++) {
+        await act(async () => { navBack() })
+        await new Promise(r => setTimeout(r, 20))
+      }
+      await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-1-100'))
+      expect(currentUrl).not.toContain('chat-3-300')
+      await act(async () => { navForward() })
+      await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-2-200'))
+      expect(currentUrl).not.toContain('chat-3-300')
+    })
+
+    // A switch during the window followed by a FAILED close: the recovery list
+    // brings the closed session back, and the entry its switch left behind is
+    // live again — Back reaches it, and nothing was rewritten.
+    it('keeps the entry left behind by a switch during a close that then fails', async () => {
+      let failClose!: (e: Error) => void
+      const { store, navSlots, closing } = await closeActiveWithPendingDelete({ reject: r => { failClose = r } })
+      vi.mocked(api.chatSlots).mockResolvedValueOnce(navSlots as never)
+
+      await act(async () => { await store.dispatch(switchSlot('chat-1-100')) })
+      await waitFor(() => expect(currentUrl).toContain('sid=chat-1-100'))
+      const urlWritesBeforeFailure = seenUrls.length
+
+      await act(async () => { failClose(new Error('offline')); await closing })
+      await waitFor(() => expect(store.getState().dashboard.slots.map(s => s.key)).toContain('chat-3-300'))
+      await new Promise(r => setTimeout(r, 30))
+      expect(currentUrl).toContain('sid=chat-1-100')
+      expect(seenUrls).toHaveLength(urlWritesBeforeFailure)
+
+      await act(async () => { navBack() })
+      await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-3-300'))
+      expect(currentUrl).toContain('sid=chat-3-300')
+      await act(async () => { navForward() })
+      await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-1-100'))
+    })
+
+    // `closingSlots` is a plain object, while sid is raw URL input. Inherited
+    // names must not impersonate a close hold and pin activeSlot -> URL sync.
+    it('does not treat a prototype URL key as an in-flight close', async () => {
+      expect(closeHoldForUrl({}, 'toString')).toBeUndefined()
+      expect(closeHoldForUrl({}, 'constructor')).toBeUndefined()
+      expect(closeHoldForUrl({}, '__proto__')).toBeUndefined()
+
+      const navSlots = [slot('chat-1-100', 'Alpha')]
+      const { store } = renderForPop(navSlots)
+      await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-1-100'))
+      await waitFor(() => expect(currentUrl).toContain('sid=chat-1-100'))
+
+      await act(async () => { navTo('/chat?sid=toString') })
+      expect(seenUrls).toContain('/chat?sid=toString')
+      await waitFor(() => expect(currentUrl).toContain('sid=chat-1-100'))
+    })
+
+    // A reconnect clears `slotsLoaded`, but a close this tab observed as
+    // confirmed remains sufficient to repair its dead history entry.
+    it('holds a Back onto a dead entry across a reconnect', async () => {
+      const { store } = await closeMiddleOffScreen()
+      act(() => { store.dispatch(sseConnected()) })
+      expect(store.getState().dashboard.slotsLoaded).toBe(false)
+
+      await act(async () => { navBack() })
+      await waitFor(() => expect(currentUrl).toContain('sid=chat-3-300'))
+      expect(store.getState().dashboard.slotsLoaded).toBe(false)
+
+      await act(async () => { navBack() })
+      await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-1-100'))
+      await act(async () => { navForward() })
+      await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-3-300'))
     })
   })
 })

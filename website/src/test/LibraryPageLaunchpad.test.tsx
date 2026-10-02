@@ -191,7 +191,8 @@ describe('LibraryPage — pin badge and persistence', () => {
 
       // Persistence: the sidebar nav id (`app-<name>` for an AppHost-routed
       // app) lands in the HIDDEN set, and same-tab listeners are notified —
-      // the only path by which the App.tsx sidebar filter learns of it.
+      // the only path by which the sidebar filter (shell/nav/appRail.tsx)
+      // learns of it.
       expect(JSON.parse(localStorage.getItem(APP_NAV_HIDDEN_KEY)!)).toEqual(['app-secretary'])
       expect(synced).toHaveBeenCalled()
 
@@ -268,6 +269,10 @@ describe('LibraryPage — pin badge and persistence', () => {
 
 describe('LibraryPage — disabled tiles', () => {
   beforeEach(() => {
+    // Disabled apps are hidden by the Library's default "enabled only" view, so
+    // a suite about disabled-tile rendering opts into the show-all view (the
+    // persisted `mc-apps-library-show-all` toggle, '1' = show all).
+    localStorage.setItem('mc-apps-library-show-all', '1')
     listApps.mockResolvedValue([installedApp('secretary', 'Secretary', { enabled: false }), RADAR])
   })
 

@@ -6,14 +6,16 @@ import asyncio
 import functools
 import logging
 import os
+import re
 import shlex
 import shutil
 import subprocess
 import sys
 import time
+import urllib.parse
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from kiro_crew import platform_compat
 from kiro_crew.apps.builtins.dev_fleet import npm_preflight, sync_runner
@@ -49,6 +51,33 @@ def _redact_pr(pr: dict | None) -> dict | None:
     }
 
 
+# --- the one home of "what part of a git remote URL may be derived from" ---
+#
+# It lives HERE, in the module both ``repository`` and ``fleet_state`` already
+# import, because ``fleet_state`` imports ``repository`` and so the reverse
+# import is a cycle -- and a rule that cannot be shared gets copied, which is
+# what left three derivation sites each carrying their own suffix pattern.
+
+
+def remote_url_locator(remote_url: str) -> str:
+    """The locator half of a git remote URL: everything before a ``?`` or ``#``.
+
+    ``git remote set-url`` accepts a query or fragment and smart-HTTP transports
+    honour it, so an operator's own remote can legitimately hold
+    ``?access_token=...`` -- a personal access token in the URL is a common way to
+    make https pushes work unattended. No derivation this app makes from a remote
+    URL wants that credential: one becomes a browser URL rendered into an
+    issue-link ``href``, the others become an ``owner/repo`` name handed to
+    ``gh --repo`` in a child process's argv.
+
+    The cut must PRECEDE any pattern that anchors on ``$``. A retained ``?...``
+    sits between a trailing ``.git`` and the end of the string, so a suffix the
+    pattern means to strip survives, and one remote then derives a different name
+    than the same remote written without a query.
+    """
+    return re.split(r"[?#]", remote_url or "", maxsplit=1)[0].strip()
+
+
 # --- stream watchdog deadline (module constant so tests can patch it) ---
 _RUN_DEADLINE_S = 1800
 
@@ -60,7 +89,7 @@ _RUN_DEADLINE_S = 1800
 #                    ``prov.has_dist``, both plain filesystem checks) may be
 #                    called. True on every platform unless the import failed.
 #   _POD_AVAILABLE — pods can actually RUN here, i.e. Linux with ``systemctl``.
-# Conflating the two used to report every worktree as "not built" off Linux,
+# Conflating the two reports every worktree as "not built" off Linux,
 # even though the build state is knowable everywhere.
 _POD_IMPORTED = False
 _POD_AVAILABLE = False
@@ -120,7 +149,7 @@ def _find_cli() -> list[str]:
     ``__main__`` also performs the SSL-cert / UTF-8-console setup that must run
     before ``kiro_crew.cli`` is imported, so it is the only correct ``-m`` entry.
     """
-    return [sys.executable, "-m", "kiro_crew"]
+    return platform_compat.isolated_python_argv("-P", "-m", "kiro_crew")
 
 
 # Git hardening injected as ENVIRONMENT (same precedence as `git -c`, which
@@ -145,12 +174,23 @@ def _find_cli() -> list[str]:
 # first and a tamper pin second, and it is an env var rather than a config pair
 # so no config precedence applies to it at all. ``update_governance`` and
 # ``auto_improvement``'s clone setup already pin it for the same reason.
+#
+# GIT_OPTIONAL_LOCKS is the other non-config pin, and it is about WHAT GIT WRITES
+# on a read. ``git status`` refreshes the index's stat cache and saves it back,
+# taking ``index.lock`` to do so, which makes a command that is a read to its
+# caller a WRITE to the repository. Every fleet render runs one per row, so the
+# fleet contends with the operator's own git for the lock on the ordinary path.
+# Set to ``0`` here rather than as a ``--no-optional-locks`` flag per call site so
+# the argv this handler builds stays the subcommand it names, and so a read added
+# later inherits it. Nothing this handler needs is lost: the porcelain answer is
+# identical, and a real mutation still takes the locks it REQUIRES.
 # Harmless for non-git commands (pip/npm ignore GIT_*).
 _GIT_ENV_NEUTRALIZERS: dict[str, str] = {
     "GIT_ALLOW_PROTOCOL": "https:ssh",
     "GIT_PROTOCOL_FROM_USER": "0",
     "GIT_NO_REPLACE_OBJECTS": "1",
-    "GIT_CONFIG_COUNT": "4",
+    "GIT_OPTIONAL_LOCKS": "0",
+    "GIT_CONFIG_COUNT": "9",
     "GIT_CONFIG_KEY_0": "core.fsmonitor",
     "GIT_CONFIG_VALUE_0": "false",
     "GIT_CONFIG_KEY_1": "core.hooksPath",
@@ -159,6 +199,39 @@ _GIT_ENV_NEUTRALIZERS: dict[str, str] = {
     "GIT_CONFIG_VALUE_2": "",
     "GIT_CONFIG_KEY_3": "core.sshCommand",
     "GIT_CONFIG_VALUE_3": "ssh",
+    # Signature VERIFICATION is a third code-execution vector beside the two above,
+    # and it is reached by a READ: ``[log] showSignature=true`` in a repository's own
+    # config makes git verify every signature it prints, and verification EXECS the
+    # program these keys name. ``.git/config`` is agent-writable, which is the same
+    # premise that makes ``core.fsmonitor`` and ``core.hooksPath`` worth pinning
+    # here. ``update_governance`` pins the same key against the same vector.
+    #
+    # All four spellings, not just ``gpg.program``: ``gpg.<format>.program`` selects
+    # the program per signature format, and ``gpg.openpgp.program`` is a synonym for
+    # ``gpg.program`` that overrides it -- pinning only the bare key would leave the
+    # synonym as an unpinned way to name the same exec.
+    "GIT_CONFIG_KEY_4": "gpg.program",
+    "GIT_CONFIG_VALUE_4": "true",
+    "GIT_CONFIG_KEY_5": "gpg.openpgp.program",
+    "GIT_CONFIG_VALUE_5": "true",
+    "GIT_CONFIG_KEY_6": "gpg.ssh.program",
+    "GIT_CONFIG_VALUE_6": "true",
+    "GIT_CONFIG_KEY_7": "gpg.x509.program",
+    "GIT_CONFIG_VALUE_7": "true",
+    # The TRIGGER, pinned beside the four programs it would exec. ``showSignature``
+    # is what turns a plain ``git log`` into a verifying one, so pinning only the
+    # programs would leave every log read able to spawn a child -- ``true`` now, but
+    # a program name is a value and this is a place not to depend on one.
+    #
+    # Pinned HERE rather than as ``--no-show-signature`` at each ``log`` call site,
+    # for the reason GIT_OPTIONAL_LOCKS above is: the argv this handler builds keeps
+    # naming just its subcommand, and a ``log`` read added later inherits the pin
+    # instead of having to remember a flag. The flag form also has a measured cost --
+    # an earlier round of this change put a global flag in the argv and broke 28
+    # shard tests whose stubs match the argv they expect, in a file this change does
+    # not own.
+    "GIT_CONFIG_KEY_8": "log.showSignature",
+    "GIT_CONFIG_VALUE_8": "false",
 }
 
 # The credential.helper reset above kills repo-injected helpers (the attack
@@ -330,10 +403,10 @@ def _bin_override_var(name: str) -> str:
 def _unresolved_tool_message(name: str) -> str:
     """User-facing message for an unresolved trusted tool.
 
-    Blames the HOST toolchain, not the checkout (issue #2530: the previous
-    wording folded this failure into "git worktree discovery failed in
-    <repo>", sending users to debug a healthy repository), and names the
-    operator remedy in the same voice as the missing-checkout branch. The
+    Blames the HOST toolchain, not the checkout (folding this failure into
+    "git worktree discovery failed in <repo>" sends users to debug a healthy
+    repository), and names the operator remedy in the same voice as the
+    missing-checkout branch. The
     trusted-PATH detail stays in the log line, not here: it is unactionable
     noise in a UI banner.
     """
@@ -426,7 +499,7 @@ def _toolchain_bin(name: str) -> str | None:
 
     Managed toolchain first, system npm second: a distribution's node can be
     older than ``website/package.json``'s ``engines`` (Amazon Linux 2023 ships
-    node 18 against ``>=22``), while ``ensure-node.sh`` installs a version
+    node 18 against ``>=22.12.0``), while ``ensure-node.sh`` installs a version
     chosen to satisfy the build.
     """
     return find_node_tool(name, _TRUSTED_PATH) or _trusted_bin(name)
@@ -439,8 +512,16 @@ async def _run_cmd(
     env: dict | None = None,
     timeout: int = 30,
     mode: str = "standard",
+    pre_spawn: Callable[[], Awaitable[str | None]] | None = None,
 ) -> tuple[int, str, str]:
     """Run a subprocess asynchronously, return (returncode, stdout, stderr).
+
+    ``pre_spawn`` is a last gate evaluated AFTER sandbox preparation and IMMEDIATELY
+    before the child is spawned — the spawn is the only await that follows it. It
+    returns ``None`` to proceed or a reason to refuse (``(-1, "", reason)``). The
+    worktree removal passes its lease renewal here, so "the gateway still excludes
+    a cutover from this worktree" is proven with nothing of unbounded duration —
+    the preparation hop included — left between the proof and the mutation.
 
     Every spawn routes through ``sandboxed_spawn_argv`` (OS isolation +
     credential-scrubbed env): these commands run against agent-influenced
@@ -456,7 +537,11 @@ async def _run_cmd(
     # PATH begins with agent-writable dirs, where a planted git/gh shim
     # would otherwise run with workflow credentials on every auto-refresh.
     if cmd and "/" not in cmd[0]:
-        trusted = _trusted_bin(cmd[0])
+        # A cache miss stats and resolves candidates under _TRUSTED_PATH: filesystem
+        # work, so it hops off the loop like the preparation step below.
+        trusted = await asyncio.get_running_loop().run_in_executor(
+            subprocess_executor(), _trusted_bin, cmd[0]
+        )
         if trusted is None:
             return -1, "", (f"{_UNRESOLVED_TOOL_PREFIX}{cmd[0]!r} in {_TRUSTED_PATH}")
         cmd = [trusted, *cmd[1:]]
@@ -478,6 +563,15 @@ async def _run_cmd(
     except RuntimeError as exc:
         # Fail closed: no sandbox backend and unsandboxed exec not opted in.
         return -1, "", f"sandbox unavailable: {exc}"
+    if pre_spawn is not None:
+        refusal = await pre_spawn()
+        if refusal is not None:
+            if cleanup:
+                try:
+                    os.unlink(cleanup)
+                except OSError:
+                    pass
+            return -1, "", refusal
     try:
         proc = await create_subprocess_limited(
             *cmd,
@@ -521,7 +615,13 @@ async def _run_cmd(
             await platform_compat.kill_and_reap(proc)
             raise
         return (
-            proc.returncode or 0,
+            # An unknown status is a FAILURE, not a success. ``or 0`` mapped None to
+            # 0, and 0 is what every caller here reads as "that worked": a row would
+            # report a clean tree, and a mutation's caller would go on to the next
+            # step, on the strength of an exit status nobody ever saw. None is
+            # reachable after ``communicate`` returns on a child whose status the
+            # event loop has not reaped yet, so it is not a theoretical branch.
+            proc.returncode if proc.returncode is not None else -1,
             (stdout or b"").decode(errors="replace"),
             (stderr or b"").decode(errors="replace"),
         )
@@ -590,8 +690,8 @@ def _kill_tree_sync(pid: int) -> None:
         try:
             platform_compat.kill_process_tree(child)
         except (ProcessLookupError, OSError, ValueError):
-            # Already reaped by the group kill, or a pid we may no longer
-            # signal — the primary kill has happened either way.
+            # Already reaped by the group kill, or a pid we may not be able
+            # to signal — the primary kill has happened either way.
             continue
 
 
@@ -616,7 +716,7 @@ _ACTIVE_RUNS: dict[str, tuple[asyncio.Task, Any]] = {}
 # there is no risk of asyncio lock contention or done-callback deadlocks.
 # LoopBoundLock (not a bare asyncio.Lock) because a module-global primitive
 # binds to the import-time loop and raises RuntimeError from any other loop
-# (Python 3.10+, see #4800) — this module is imported once but serves
+# (Python 3.10+) — this module is imported once but serves
 # whichever loop the gateway runs.
 _SHUTDOWN_ADMISSION_LOCK = LoopBoundLock()
 _SHUTDOWN_IN_PROGRESS = False
@@ -698,11 +798,18 @@ async def _start_run(
     cwd: str | None = None,
     env: dict | None = None,
     cleanup_paths: list[str] | None = None,
+    on_finish: Callable[[], None] | None = None,
 ) -> str:
     """Start a background subprocess with output streaming and watchdog.
 
     ``cleanup_paths``: sandbox launcher/profile temp files from
     ``sandboxed_spawn_argv`` — deleted when the run finishes.
+
+    ``on_finish``: invoked once when the run reaches ANY terminal state
+    (done, timeout, spawn failure, shutdown abort, cancellation) — a killed
+    run may still have mutated disk, so terminal means finished, not
+    succeeded. Must be a cheap synchronous callable; exceptions are logged
+    and never propagate into the worker's own cleanup.
     """
     rid = uuid.uuid4().hex[:12]
     # The run KIND, captured before the output loop can touch it. `label` is
@@ -906,6 +1013,11 @@ async def _start_run(
                 _RUNS[rid]["exit_code"] = -1
                 _RUNS[rid]["output"].append("[error] " + str(exc))
         finally:
+            if on_finish is not None:
+                try:
+                    on_finish()
+                except Exception:  # noqa: BLE001
+                    logger.exception("run %s on_finish callback failed", rid)
             for cp in cleanup_paths or []:
                 # A caller may register a temp FILE, or a temp directory it
                 # created for one (the dependency-only sync stages a snapshot
@@ -970,6 +1082,22 @@ _POSIX_SAFE_ENV_KEYS = (
     "TMPDIR",
     "XDG_RUNTIME_DIR",
     "DBUS_SESSION_BUS_ADDRESS",
+    # A registry URL, not a credential: it is how an operator points every
+    # Dev Fleet npm step (the preflight rehearsal AND the real `npm ci` /
+    # `npm run build`) at a public registry or a private mirror when the
+    # host's ~/.npmrc default registry is unreachable or its token has
+    # expired. npm_preflight's own docstring insists its flags MIRROR the
+    # real install step, so this must reach both or they resolve
+    # differently. Do NOT add any `NPM_CONFIG_*_AUTHTOKEN`, `NPM_TOKEN`,
+    # `_auth`-suffixed key, `NPM_CONFIG_USERCONFIG` (points at a file that
+    # may hold a token), or a wildcard `NPM_CONFIG_*` — those are
+    # credentials or can carry them, and this allowlist exists so
+    # worktree-controlled build scripts cannot read gateway credentials.
+    # `_build_env` additionally validates the VALUE of this key before
+    # forwarding it — see `_sanitized_npm_registry_env` — since URL syntax
+    # itself permits a userinfo-embedded credential, a query, or a fragment
+    # that "not a credential" does not rule out.
+    "NPM_CONFIG_REGISTRY",
 )
 
 # Windows counterparts of the POSIX set above, written in the spelling Microsoft
@@ -1028,6 +1156,37 @@ def _is_safe_env_key(key: str) -> bool:
     return platform_compat.env_key_allowed(key, _SAFE_ENV_KEYS)
 
 
+def _sanitized_npm_registry_env(value: str) -> "str | None":
+    """Validate an operator-set npm registry URL before it reaches a
+    worktree-controlled build subprocess.
+
+    The allowlist comment above the ``NPM_CONFIG_REGISTRY`` entry asserts it
+    is "a registry URL, not a credential", but URL syntax itself permits
+    userinfo (``https://user:token@host/``), a query string, or a fragment —
+    any of which can carry a secret through exactly the boundary that
+    allowlist exists to hold. A value can also carry embedded whitespace
+    (e.g. a control character or a second smuggled value) that survives
+    ``urlsplit`` inside the netloc/path rather than being rejected by it.
+    Returns *value* unchanged only when it is a bare ``http``/``https``
+    origin plus path with none of those, and ``None`` otherwise so the
+    caller drops the key outright (fail closed) rather than forward a
+    value that is not purely a location.
+    """
+    if not value or any(ch.isspace() for ch in value):
+        return None
+    try:
+        parsed = urllib.parse.urlsplit(value)
+    except ValueError:
+        return None
+    if parsed.scheme not in ("http", "https"):
+        return None
+    if not parsed.netloc or "@" in parsed.netloc:
+        return None
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        return None
+    return value
+
+
 def _build_env(*, with_credentials: bool = False) -> dict:
     """Allowlisted base environment for build/CLI subprocesses.
 
@@ -1067,6 +1226,9 @@ def _build_env(*, with_credentials: bool = False) -> dict:
     remove one on the assumption that the other covers it.
     """
     out = {k: v for k, v in os.environ.items() if _is_safe_env_key(k)}
+    _registry_value = out.get("NPM_CONFIG_REGISTRY")
+    if _registry_value is not None and _sanitized_npm_registry_env(_registry_value) is None:
+        del out["NPM_CONFIG_REGISTRY"]
     out["PATH"] = _TRUSTED_PATH if with_credentials else _build_path()
     out.update(_GIT_ENV_NEUTRALIZERS)
     if with_credentials and _GIT_TRUSTED_HELPERS:
@@ -1127,6 +1289,7 @@ __all__ = (
     "_run_cmd",
     "_run_uninterruptible",
     "_sanitize_helper_value",
+    "_sanitized_npm_registry_env",
     "_sel",
     "_start_run",
     "_toolchain_bin",
@@ -1135,5 +1298,6 @@ __all__ = (
     "_warm_build_path",
     "logger",
     "prov",
+    "remote_url_locator",
     "rt",
 )

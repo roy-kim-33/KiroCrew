@@ -2,6 +2,8 @@ import tsParser from '@typescript-eslint/parser'
 import tsPlugin from '@typescript-eslint/eslint-plugin'
 import reactHooksPlugin from 'eslint-plugin-react-hooks'
 import jsxA11y from 'eslint-plugin-jsx-a11y'
+import approvalOneShotDecision from './eslint-rules/approval-one-shot-decision.js'
+import { plugin as shadcn } from '@shadcn/lint'
 
 export default [
   {
@@ -21,9 +23,16 @@ export default [
       '@typescript-eslint': tsPlugin,
       'react-hooks': reactHooksPlugin,
       'jsx-a11y': jsxA11y,
+      'approval-one-shot': approvalOneShotDecision,
     },
     rules: {
       ...tsPlugin.configs.recommended.rules,
+      // The one-shot approval endpoint records no standing grant, so a trust
+      // verb decided inline at the call site is laundered into `approve` before
+      // the request is made — upstream of both the typed client and the
+      // backend's 400. 'error', not 'warn': this is a consent path, and a
+      // warning would ride the --max-warnings ratchet instead of failing.
+      'approval-one-shot/no-inline-one-shot-decision': 'error',
       // Downgrade jsx-a11y's recommended severities to 'warn' so they ride the
       // --max-warnings ratchet instead of failing the build outright — but keep
       // whatever the preset switched OFF off. A blanket rewrite to 'warn' also
@@ -64,6 +73,32 @@ export default [
       // 'warn' riding the ratchet. The one deliberate eval lives in the .mjs
       // generator block below, guarded by its own reviewed directive.
       'no-eval': 'error',
+      // A browser-native confirm()/alert()/prompt() opens an OS-drawn dialog
+      // that ignores every theme token and blocks the whole renderer thread.
+      // The dashboard owns these decisions in-app: destructive choices go
+      // through useConfirm() / ConfirmDialog, errors and acknowledgements
+      // through the in-app notice and status surfaces. The window-qualified
+      // forms (`window.confirm`) reach the same globals, so no-restricted-
+      // properties pairs with no-restricted-globals to cover both spellings.
+      //
+      // 'error', not 'warn': like the native-<select> gate above this is a gate
+      // on a set that only shrinks, so it stays out of the --max-warnings budget
+      // where a real regression would be indistinguishable from unrelated noise.
+      // The 35 modules that still call these globals are exempted by name in the
+      // allowlist block below (see issue #15662); every other renderer file is
+      // refused a new call. Electron main-process dialogs live outside src/ and
+      // are untouched. Tests drive these globals through the harness and are
+      // exempted alongside the native-<select> rule in the test blocks below.
+      'no-restricted-globals': ['error',
+        { name: 'confirm', message: 'No browser-native confirm() — use useConfirm() / ConfirmDialog. See issue #15662.' },
+        { name: 'alert', message: 'No browser-native alert() — route through the in-app notice or status surface. See issue #15662.' },
+        { name: 'prompt', message: 'No browser-native prompt() — use the native text-entry dialog. See issue #15662.' },
+      ],
+      'no-restricted-properties': ['error',
+        { object: 'window', property: 'confirm', message: 'No window.confirm() — use useConfirm() / ConfirmDialog. See issue #15662.' },
+        { object: 'window', property: 'alert', message: 'No window.alert() — route through the in-app notice or status surface. See issue #15662.' },
+        { object: 'window', property: 'prompt', message: 'No window.prompt() — use the native text-entry dialog. See issue #15662.' },
+      ],
       // A native <select> renders an OS-drawn popup: it ignores every theme
       // token, cannot be styled per row, and looks nothing like the rest of the
       // dashboard. Every dropdown goes through the shared Radix components —
@@ -78,6 +113,56 @@ export default [
         selector: "JSXOpeningElement[name.name='select']",
         message: 'No native <select> — its popup is drawn by the OS and ignores the theme. Use SimpleSelect, SearchableSelect, SettingsSelect, or DropdownMenu. See website/docs/page-layout.md.',
       }],
+    },
+  },
+  {
+    // Allowlist for no-restricted-globals / no-restricted-properties: the
+    // renderer modules that still call a browser-native confirm/alert/prompt
+    // today (issue #15662). The gate above is 'error' for every OTHER renderer
+    // file, so a NEW native dialog anywhere else is refused; these 35 are the
+    // standing inventory, migrated to useConfirm() / in-app surfaces in later
+    // PRs. This list only SHRINKS: delete a path the moment its last native
+    // dialog is gone, never add one. Keep it sorted.
+    files: [
+      'src/apps/auto-improvement/AutoImprovementPage.tsx',
+      'src/apps/auto-research/ResearchLabPage.tsx',
+      'src/apps/crew-companion/GalleryPanel.tsx',
+      'src/apps/design-tweak/DesignTweakPage.tsx',
+      'src/apps/meetings/MeetingView.tsx',
+      'src/apps/meetings/MeetingsPage.tsx',
+      'src/apps/mochi/src/renderer/GalleryPanel.tsx',
+      'src/apps/papyrus/PapyrusPage.tsx',
+      'src/apps/papyrus/ProjectList.tsx',
+      'src/components/RestartButton.tsx',
+      'src/components/TagManagerList.tsx',
+      'src/components/WebAppArtifactCard.tsx',
+      'src/components/notifications/NotificationFeed.tsx',
+      'src/components/themeEditor.tsx',
+      'src/hooks/useKeyboardShortcuts.ts',
+      'src/hooks/useSessionActions.ts',
+      'src/pages/ArtifactDetailPage.tsx',
+      'src/pages/ArtifactsPage.tsx',
+      'src/pages/ChannelPage.tsx',
+      'src/pages/ChatSidebar.tsx',
+      'src/pages/ProjectsPage.tsx',
+      'src/pages/knowledge/DetailView.tsx',
+      'src/pages/knowledge/SourcesList.tsx',
+      'src/pages/knowledge/index.tsx',
+      'src/pages/members/MembersPage.tsx',
+      'src/pages/members/NewCrewmateDialog.tsx',
+      'src/pages/overview/AgentCfgTab.tsx',
+      'src/pages/overview/AgentTemplatesTab.tsx',
+      'src/pages/overview/KiroCrewCfgTab.tsx',
+      'src/pages/overview/MemoryTab.tsx',
+      'src/pages/overview/PortabilityTab.tsx',
+      'src/pages/overview/PromptsTab.tsx',
+      'src/pages/overview/SkillsTab.tsx',
+      'src/pages/overview/SteeringTab.tsx',
+      'src/utils/popoutController.ts',
+    ],
+    rules: {
+      'no-restricted-globals': 'off',
+      'no-restricted-properties': 'off',
     },
   },
   {
@@ -140,10 +225,125 @@ export default [
     // for a plain <select> is the ESTABLISHED way to make one driveable in jsdom
     // (Radix commits discrete events through flushSync, which throws inside
     // Testing Library's act() — see src/test/CrewEditorSelect.test.tsx). Nothing
-    // here renders to a user.
+    // here renders to a user. The native-dialog gate is off here for the same
+    // reason: a test that stubs window.confirm to drive a flow is harness code.
     files: ['src/**/*.test.{ts,tsx}', 'src/test/**/*.{ts,tsx}'],
     rules: {
       'no-restricted-syntax': 'off',
+      'no-restricted-globals': 'off',
+      'no-restricted-properties': 'off',
+    },
+  },
+  {
+    // Design-system lint (@shadcn/lint). Reads the compiled Tailwind v4 theme
+    // from src/index.css via components.json, so "known" means "this project's
+    // Tailwind emits CSS for it" — custom @utility names and plain class
+    // selectors in the theme's import graph count, a typo does not.
+    //
+    // Three rules are on, all hard-zero like the rest of this file:
+    //   no-raw-colors           — palette colors (`text-green-500`) and literal
+    //                             SVG colors instead of theme tokens. This is the
+    //                             class-level half of scripts/check-theme-colors.mjs,
+    //                             which only sees CSS/hex literals.
+    //   no-unknown-classes      — a class Tailwind generates nothing for. Covers
+    //                             every utility; scripts/check-phantom-classes.mjs
+    //                             is scoped to color utilities.
+    //   require-static-classes  — a className built from an opaque value on a
+    //                             ui/ component; the other two rules cannot read it.
+    //
+    // no-restyle is NOT enabled here: the tree carries a few hundred call sites
+    // that restyle ui/ components (DropdownMenuItem, TableCell, …) and CI runs
+    // --max-warnings 0, so 'warn' would fail the build outright. Enabling it is a
+    // design decision (fix the sites or write per-component contracts), not a
+    // lint toggle. The backlog is held where it is by scripts/check-restyle-
+    // ratchet.mjs, which runs the rule through its own config against a per-file
+    // baseline that can only shrink. Keep that script's CONFIG in step with the
+    // parser options and carve-outs of this block.
+    // no-inline-styles and no-arbitrary-values are off by design: inline
+    // `style={}` is the mandated styling method for apps (docs/app-kit), and the
+    // theme's translucent surfaces are `bg-[color-mix(…)]` arbitrary values
+    // because the color tokens carry no alpha channel.
+    files: ['src/**/*.{ts,tsx}'],
+    plugins: { shadcn },
+    rules: {
+      'shadcn/no-raw-colors': ['error', {
+        // `fill-none` is `fill: none`, not a color; the rule reads any `fill-*`
+        // it does not recognise as a palette name.
+        allow: ['fill-none'],
+      }],
+      'shadcn/no-unknown-classes': ['error', {
+        // "Unknown" means the theme's import graph produces no CSS for it. Two
+        // kinds of class are real but invisible to that graph, and are allowed
+        // here by the stylesheet that defines them. An entry allows a NAME, it
+        // does not generate CSS: keep each one next to its defining file and
+        // delete it when that file goes.
+        allow: [
+          // Apps whose stylesheet is a TS template string injected as <style>,
+          // so no .css file exists for the linter to follow.
+          'cc-*', 'is-remove',   // apps/crew-companion/styles.ts + panel.css
+          'mc-fe-*',             // apps/file-explorer/styles.ts
+          'mdnb-*',              // apps/md-notebook/styles.ts
+          'sb-*',                // apps/spec-builder/inlineStyles.ts
+          'wc-*',                // apps/issue-radar/WelcomeCarousel.tsx <style>
+          'spin',                // components/PullRequestPanel.tsx <style>
+          // Selector hooks with no CSS by design: Playwright specs, tests and
+          // hooks/useMessageSearch.ts locate these elements by class.
+          'message-bubble', 'input-area', 'chat-container', 'session-agent-label', 'primary',
+          'pierre-editor-fallback',
+          // styles/message-font-size.css (imported in main.tsx, outside index.css's
+          // @source graph): the bubble scope, the chip/text size classes, and the
+          // marker MarkdownRenderer's link chips carry.
+          'mc-message-font-*', 'mc-md-ref-chip',
+          // styles/crew-notes.css (imported in main.tsx, outside index.css's
+          // @source graph): the crewmate Notes-panel readability scope.
+          'crew-notes',
+          // components/crew/layout/layoutEditor.css (imported by LayoutEditor.tsx,
+          // outside index.css's @source graph): the layout editor's Neo-Frame
+          // "Bench" build-mode classes and their drag/drop/target state hooks,
+          // all le-prefixed so no generic state name is exempted repo-wide.
+          'le-*',
+        ],
+      }],
+      'shadcn/require-static-classes': 'error',
+    },
+  },
+  {
+    // Component implementations compose their own cva()/variant helpers at the
+    // call site, which require-static-classes cannot resolve (the rule's own
+    // docs prescribe this override). The other two rules stay on here.
+    files: ['src/components/ui/**/*.{ts,tsx}'],
+    rules: {
+      'shadcn/require-static-classes': 'off',
+    },
+  },
+  {
+    // The ghost mascot is artwork: its white and black are the drawing's own
+    // colors, shared with the Electron boot sequence, not a theme surface.
+    files: ['src/components/KiroGhost.tsx'],
+    rules: {
+      'shadcn/no-raw-colors': 'off',
+    },
+  },
+  {
+    // The Mochi renderer windows load neither Tailwind nor the theme tokens (see
+    // the native-<select> override above), so "does Tailwind emit this class" and
+    // "is this a theme color" have no meaning there: every class is a hook for
+    // its own inline <style> block.
+    files: ['src/apps/mochi/src/renderer/**/*.{ts,tsx}'],
+    rules: {
+      'shadcn/no-raw-colors': 'off',
+      'shadcn/no-unknown-classes': 'off',
+      'shadcn/require-static-classes': 'off',
+    },
+  },
+  {
+    // Tests pass throwaway class names (`custom-cls`, `seam-mark`) to assert that
+    // a component forwards className; nothing here renders to a user.
+    files: ['src/**/*.test.{ts,tsx}', 'src/test/**/*.{ts,tsx}'],
+    rules: {
+      'shadcn/no-raw-colors': 'off',
+      'shadcn/no-unknown-classes': 'off',
+      'shadcn/require-static-classes': 'off',
     },
   },
 ]

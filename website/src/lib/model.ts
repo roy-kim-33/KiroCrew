@@ -75,6 +75,14 @@ export function normalizeModelKey(name: string): string {
  *  the heuristic only — a verdict does not come from that list, so a stale list
  *  says nothing about it.
  *
+ *  `effective` is the id the live session resolved to, and it is consulted ONLY
+ *  when everything above lands on `auto`. `auto` is the truthful answer for a
+ *  slot that inherits (no pin, or a withheld one) but it names nothing a user
+ *  can recognise, while the session is running one specific model. So that one
+ *  case is replaced by the model's own picker row — an id the list does not
+ *  carry stays `auto`, since a chip matching no row is worse than the honest
+ *  sentinel. Every other answer is returned untouched.
+ *
  *  This is a DISPLAY decision only. Never feed the result into a write — a
  *  lossy label must not become persisted state (see ChatPage's pin-to-agent
  *  row, which writes the slot's real model).
@@ -84,6 +92,28 @@ export function displayModel(
   models: { name: string }[],
   degraded = false,
   withheld: boolean | null | undefined = null,
+  effective = '',
+): string {
+  const shown = displayPinnedModel(pinned, models, degraded, withheld)
+  if (shown !== 'auto') return shown
+  const inherited = normalizeModelKey(effective)
+  if (!inherited || inherited === 'auto') return shown
+  const row = models.find(m => normalizeModelKey(m.name) === inherited)
+  return row ? row.name : shown
+}
+
+/** The pin-only half of `displayModel`: what the PIN alone says to display.
+ *
+ *  Split out so the inherited-model substitution above is a single post-step on
+ *  one answer (`auto`) rather than a branch inside each verdict path, and so a
+ *  caller that must judge the PIN itself — the pin-to-agent row, through
+ *  `pinIsWithheld` — can still get the unsubstituted answer.
+ */
+function displayPinnedModel(
+  pinned: string,
+  models: { name: string }[],
+  degraded: boolean,
+  withheld: boolean | null | undefined,
 ): string {
   const key = normalizeModelKey(pinned)
   if (!key || key === 'auto') return 'auto'
@@ -118,4 +148,33 @@ export function pinIsWithheld(pinned: string, shown: string): boolean {
   // without it "nothing pinned" would read as withheld and disable the row.
   if (!key || key === 'auto') return false
   return normalizeModelKey(shown) === 'auto'
+}
+
+/** The marker the composer chip puts beside the model it names.
+ *
+ *  `default` only when that model IS the Settings default and the slot takes it
+ *  from there: the session was served it, or a slot with no model of its own
+ *  resolved to it through an agent that pins nothing. `auto` when the session
+ *  was served a different model for a slot that picked Auto or holds a
+ *  withheld pin, i.e. a model chosen for the user. No marker otherwise: a pin,
+ *  an agent's own model, or a default this surface cannot see (`null`).
+ *
+ *  `shown` / `pinShown` are `displayModel` with and without `served_model`.
+ */
+export function modelChipMarker(
+  slotModel: string,
+  shown: string,
+  pinShown: string,
+  settingsDefault: string | null,
+  agentPinned = false,
+): 'default' | 'auto' | null {
+  const key = normalizeModelKey(shown)
+  if (!key || key === 'auto' || settingsDefault === null) return null
+  const slotKey = normalizeModelKey(slotModel)
+  const isDefault = !!settingsDefault && normalizeModelKey(settingsDefault) === key
+  if (key !== normalizeModelKey(pinShown)) {
+    if (isDefault) return 'default'
+    return slotKey ? 'auto' : null
+  }
+  return !slotKey && !agentPinned && isDefault ? 'default' : null
 }

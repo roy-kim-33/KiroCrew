@@ -183,7 +183,7 @@ class TestUrlBoundary:
         # This mirrors the script's own ``--test`` growth check (and reuses its
         # budgets, so tuning one tunes both) because it failed the same way and for
         # the same reason: dividing two measured durations puts the whole burden on
-        # the timer, and the wall-clock form this test used to carry was the single
+        # the timer, and a wall-clock form of this test would be the single
         # largest source of Backend Tests (Windows) flakes.
         #
         # * WRONG CLOCK. ``time.monotonic()`` is ``GetTickCount64()`` on Windows, a
@@ -211,11 +211,7 @@ class TestUrlBoundary:
             best_base = 0.0
             found = (0, 0)
 
-            def once(count: int) -> tuple[float, int]:
-                line = "!KiroCrew" * count
-                began = time.process_time()
-                hits = len(_hits(line, path="big.md"))
-                return time.process_time() - began, hits
+            once = gate._timed_scan
 
             for _ in range(gate._PERF_ATTEMPTS):
                 base_time, base_hits = once(base)
@@ -228,13 +224,23 @@ class TestUrlBoundary:
                     best, best_base = candidate, base_time
             return (0.0 if best is math.inf else best), best_base, found[0], found[1]
 
-        # Grow the workload until the baseline is big enough to divide. A regressed
-        # scan clears the floor at the first size, so only the fast case ever pays
-        # for a larger one.
+        # Grow the workload until the baseline is big enough to divide. The floor is
+        # counted in ticks of Windows' ~15.625ms CPU clock (see the script's
+        # _PERF_MIN_BASE_SECS): at a 2-tick baseline a linear scan can read
+        # (2*2+1)/(2-1) = 5x from quantisation alone, and a 0.031s baseline on a slow
+        # runner is exactly two ticks. One probe scan per size picks where to start;
+        # a size whose MEASURED baseline still lands under the floor (it can read a
+        # tick below its probe) moves on to the next size, so only the largest size
+        # can ever skip. A regressed scan clears the floor at the first size.
+        start = len(gate._PERF_BASE_SIZES) - 1
+        for i, size in enumerate(gate._PERF_BASE_SIZES):
+            if gate._timed_scan(size)[0] >= gate._PERF_MIN_BASE_SECS:
+                start = i
+                break
         base_count = 0
         ratio = base_time = 0.0
         base_found = doubled_found = 0
-        for base_count in gate._PERF_BASE_SIZES:
+        for base_count in gate._PERF_BASE_SIZES[start:]:
             ratio, base_time, base_found, doubled_found = ratio_of(base_count)
             if base_time >= gate._PERF_MIN_BASE_SECS:
                 break
@@ -347,6 +353,7 @@ class TestScope:
             "website/src/i18n/locales/zh-CN.json",
             "website/src/i18n/locales/en-XA.json",
             "src/kiro_crew/data/tips_catalog.json",
+            "src/kiro_crew/docs/settings-registry.generated.json",
         ):
             assert gate.in_scope(path), path
             assert not gate.enforced(path), path
@@ -357,6 +364,7 @@ class TestScope:
             "website/src/i18n/locales/en.manual.json",
             "website/src/i18n/glossary.json",
             "src/kiro_crew/docs/skills.md",
+            "website/src/pages/settings/NotificationsPanel.tsx",
         ):
             assert gate.enforced(path), path
 
@@ -632,11 +640,11 @@ class TestDiffScopedRun:
     def test_self_test_actually_judges_the_growth_ratio(self, tmp_path) -> None:
         """The repeated-brands check must reach a verdict, not skip itself.
 
-        Its baseline used to be a fixed 20k brands, which costs fast hardware
-        ~19-21ms against a 20ms measurement floor. Landing under the floor made
-        the check print `ok ... ratio not judged` and test nothing, so on a fast
-        machine the quadratic guard was a coin-flip no-op. The workload now grows
-        until the baseline is measurable, so a real ratio is always reported.
+        A fixed 20k-brand baseline costs fast hardware ~19-21ms against a 20ms
+        measurement floor. Landing under the floor makes the check print
+        `ok ... ratio not judged` and test nothing, so on a fast machine the
+        quadratic guard is a coin-flip no-op. The workload grows until the
+        baseline is measurable, so a real ratio is always reported.
         """
         root = self._repo(tmp_path)
         self._commit(root, "doc.md", "clean\n", "base")

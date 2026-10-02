@@ -5,17 +5,18 @@
  * which is a claim about EVERY consumer of the surface registry, not about one
  * component. So this file pins the gate at each door a user could walk through:
  * the storage primitive, the registry predicate, the Search Everywhere Pages
- * provider, and the Developer > Feature Previews toggle that opens them all. A
- * test that only covered the nav rail would have passed while the palette still
- * shipped a one-keystroke path to the same page.
+ * provider, and the Settings > Developer > Feature Previews toggle that opens
+ * them all. A test that only covered the nav rail would have passed while the
+ * palette still shipped a one-keystroke path to the same page.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import type { ReactElement } from 'react'
-import { render, screen, renderHook, act, cleanup } from '@testing-library/react'
-import { MemoryRouter } from 'react-router-dom'
+import { render, screen, renderHook, act, cleanup, waitFor } from '@testing-library/react'
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { MemoryRouter, useLocation, useNavigationType } from 'react-router-dom'
 
-// DeveloperPage's sibling tabs are heavy and irrelevant here — the last describe
-// only needs the page's tab rail and the Feature Previews pane behind it.
+// DeveloperPage's tabs are heavy and irrelevant here — the last describe only
+// needs the page's tab rail and its legacy-link redirect.
 vi.mock('../pages/LogsPage', () => ({ LogViewer: () => <div /> }))
 vi.mock('../pages/SystemPage', () => ({ default: () => <div /> }))
 vi.mock('../pages/TelemetryPanel', () => ({ default: () => <div /> }))
@@ -45,8 +46,10 @@ import notificationsReducer from '../store/notificationsSlice'
 import '../surfaces/builtins'
 import {
   PREVIEW_CREW,
+  PREVIEW_DASHBOARD,
   PREVIEW_FLAG_EVENT,
   PREVIEW_FLAG_PREFIX,
+  PREVIEW_INSTANCE_SESSIONS,
   PREVIEW_REMOTE_CREW_CHAT,
   PREVIEW_WEBHOOKS,
   readPreviewFlag,
@@ -54,7 +57,8 @@ import {
 } from '../utils/previewFlags'
 import { usePreviewFlag, usePreviewFlagRevision } from '../hooks/usePreviewFlag'
 import { createPagesProvider } from '../components/commandPalette/providers/pagesProvider'
-import { FeaturePreviewsTab } from '../pages/developer/FeaturePreviewsTab'
+import { api } from '../api/client'
+import { FeaturePreviewsSection, FEATURE_PREVIEWS_HIGHLIGHT_ANCHOR } from '../pages/settings/FeaturePreviewsSection'
 import DeveloperPage from '../pages/DeveloperPage'
 
 const TEST_ICON: ReactElement = <span />
@@ -123,7 +127,7 @@ describe('preview flag storage', () => {
   it('keeps every flag under the shared prefix', () => {
     // Cross-tab listeners match on the prefix rather than a list of known flags,
     // so a flag named outside it would silently stop updating other tabs.
-    for (const flag of [PREVIEW_WEBHOOKS, PREVIEW_CREW, PREVIEW_REMOTE_CREW_CHAT]) {
+    for (const flag of [PREVIEW_WEBHOOKS, PREVIEW_CREW, PREVIEW_REMOTE_CREW_CHAT, PREVIEW_INSTANCE_SESSIONS]) {
       expect(flag.startsWith(PREVIEW_FLAG_PREFIX)).toBe(true)
     }
   })
@@ -340,9 +344,33 @@ describe('usePreviewFlagRevision', () => {
   })
 })
 
-describe('Developer > Feature Previews', () => {
+describe('Settings > Developer > Feature Previews', () => {
+  // One card in this section — Decisions — is backed by gateway state rather
+  // than a `previewFlags.ts` key: whether it is drawn at all reads
+  // `decisions_enabled` off `['dashboardConfig']` (the `capabilities.decisions`
+  // ceiling), its switch reads the consent keystone and its share reads
+  // `['kirocrewConfig']`. All three stubbed here rather than left to reach
+  // the network: every case below is about the four localStorage previews, and a
+  // real read cannot succeed under vitest (a failed one would render an
+  // ErrorNotice with its own "Ask the agent" link and pollute the link census).
+  // `decisionsCard.test.tsx` owns that card's own states.
+  beforeEach(() => {
+    vi.spyOn(api, 'dashboardConfig').mockResolvedValue({ decisions_enabled: true } as never)
+    vi.spyOn(api, 'kirocrewConfig').mockResolvedValue({} as never)
+    vi.spyOn(api, 'getDecisionsConsent').mockResolvedValue({
+      enabled: false, endpoint: '', configured_endpoint: 'https://api.typesafe.ai/v1/systemone', permits: false,
+    })
+  })
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
   const renderTab = () =>
-    render(<MemoryRouter><FeaturePreviewsTab /></MemoryRouter>)
+    render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <MemoryRouter><FeaturePreviewsSection /></MemoryRouter>
+      </QueryClientProvider>,
+    )
 
   /** `aria-checked` via the ATTRIBUTE: the Toggle is a `div role="switch"`, and
    *  the reflected `ariaChecked` DOM property is not populated for one. */
@@ -372,16 +400,18 @@ describe('Developer > Feature Previews', () => {
 
   it('carries a crew card that starts off', () => {
     // One card per feature: crew's own toggle, not a row folded into the
-    // webhooks card. `{ name: /^crew$/i }` because "Crew Members" appears in
-    // this card's description and a loose /crew/ would match either.
+    // webhooks card. Anchored (`^…$`) because the label's words also appear in
+    // this card's description and in the "Chat on a crew" card next to it. The
+    // label names the page the flag holds so it stops sharing a bare "Crew"
+    // with that neighbour, which a newcomer could not tell apart.
     renderTab()
-    expect(screen.getByRole('switch', { name: /^crew$/i }).getAttribute('aria-checked')).toBe('false')
+    expect(screen.getByRole('switch', { name: /^crewmates$/i }).getAttribute('aria-checked')).toBe('false')
   })
 
   it('persists the crew opt-in under its own key, leaving webhooks alone', async () => {
     renderTab()
     await act(async () => {
-      screen.getByRole('switch', { name: /^crew$/i }).click()
+      screen.getByRole('switch', { name: /^crewmates$/i }).click()
     })
     expect(localStorage.getItem(PREVIEW_CREW)).toBe('1')
     // Two flags, two keys: a shared write would release both features at once.
@@ -399,32 +429,212 @@ describe('Developer > Feature Previews', () => {
     // Counted as `<button>` ELEMENTS rather than by accessible name: the name of
     // a link that no longer exists is not in any catalog, so a name query could
     // never fail. `SettingsToggle`'s own row is a `div role="button"`, so it is
-    // correctly not counted here.
+    // correctly not counted here. The "See what it looks like" button each card
+    // may carry (`FeaturePreviewIntroButton`) is excluded by its test id: it is
+    // not an ingress — it opens an explainer dialog, never the page — and it is
+    // present on either side of the toggle by design.
     const { container } = renderTab()
-    const realButtons = () => Array.from(container.querySelectorAll('button'))
-    expect(realButtons()).toHaveLength(0)
+    /**
+     * The Decisions card is INCLUDED, subtree and all.
+     *
+     * In the state this test renders — governance permitting, consent off, no stored
+     * credential — that card draws no buttons at all: its point rows are
+     * `role="tab"`, and the credential's reveal and replace controls exist only once a
+     * key is stored. So excluding its frame subtracted an empty set and left the census
+     * blind to the largest card on the tab for no benefit.
+     *
+     * Counting it is what makes this a ratchet rather than decoration: a button
+     * appearing anywhere in that subtree in this state fails here, which is exactly the
+     * ingress drift the census exists to catch. A future state that legitimately draws
+     * one belongs in `decisionsCard.test.tsx`, which pins the card's own states.
+     */
+    const realButtons = () =>
+      Array.from(
+        container.querySelectorAll('button:not([data-testid="feature-preview-intro-button"])'),
+      )
+    /**
+     * The Decisions card is WALKED, not allowed for.
+     *
+     * Its subtree is asserted as an exact set, so a button appearing there fails here --
+     * and so does a second copy of one already expected. A name filter over the whole
+     * tab would have done neither: it went unscoped, so the same name on another card
+     * disappeared from the census too, and it bounded no count.
+     *
+     * The two it draws once settled: the hand-off on its read-failure notice (this tab
+     * stubs no API, so the card's reads fail here) and the credential field's reveal.
+     * Neither navigates. A third belongs in the expected set with a reason, never behind
+     * a blanket allowance -- and because the set is exact, a duplicate of one of these
+     * fails too, which a name filter could not catch.
+     */
+    const nameOf = (b: Element) =>
+      (b.textContent?.trim() || b.getAttribute('aria-label') || '?').trim()
+    // SettingsCard is borderless now (no `.card-glow`); its root carries
+    // `animate-rise`, which is the enclosing card frame the switch sits in.
+    const decisionsFrame = () =>
+      screen.queryByRole('switch', { name: 'Decisions (Jev)' })?.closest('.animate-rise') ?? null
+    const decisionsButtons = () =>
+      Array.from(
+        decisionsFrame()?.querySelectorAll(
+          'button:not([data-testid="feature-preview-intro-button"])',
+        ) ?? [],
+      )
+        .map(nameOf)
+        .sort()
+    // Outside that card, unfiltered and unchanged: this is the ingress property.
+    const ingressButtons = () =>
+      realButtons()
+        .filter(el => !decisionsFrame()?.contains(el))
+        .map(nameOf)
+        .sort()
+    expect(ingressButtons()).toEqual([])
     await act(async () => {
-      screen.getByRole('switch', { name: /^crew$/i }).click()
+      screen.getByRole('switch', { name: /^crewmates$/i }).click()
     })
-    expect(realButtons()).toHaveLength(0)
+    expect(ingressButtons()).toEqual([])
+    // The Decisions subtree, exactly. A new button here -- or a duplicate of one of
+    // these -- fails, which a name allowance could not do.
+    // The Decisions subtree, exactly, once its reads have settled. Awaited rather than
+    // sampled: the card draws only the credential reveal until its reads land and adds
+    // the hand-off on the read-failure notice after, so a bare expect reads whichever
+    // moment it hit. A button this set does not name never converges, so it fails here.
+    await waitFor(() => {
+      expect(decisionsButtons()).toEqual(['Ask the agent', 'Show'])
+    })
     // The webhooks card still HAS its link, so this is an asymmetry on purpose
     // rather than the ingress mechanism having been broken for both.
     await act(async () => {
       screen.getByRole('switch', { name: /webhooks/i }).click()
     })
-    expect(realButtons().map(b => b.textContent?.trim())).toEqual(['Open Webhooks'])
+    expect(ingressButtons()).toEqual(['Open Webhooks'])
+    // And the card beside it still draws only its own two.
+    expect(decisionsButtons()).toEqual(['Ask the agent', 'Show'])
   })
 
-  it('is its own tab on the Developer page, not part of Config', async () => {
-    // Pin both halves of the move: Config must not carry the switch, and the
-    // rail must offer the tab that does — otherwise the opt-ins become
-    // unreachable while every unit test above still passes.
+  it('renders the section header and the section-wide caveat once, above the cards', () => {
+    // The caveat used to be the Developer-page tab's description, rendered by
+    // SidePanelLayout as the page header. Inside Settings the section has to
+    // carry it itself — once, not per card — or the toggles read as released
+    // features that merely happen to be off.
+    renderTab()
+    expect(screen.getByRole('heading', { name: /feature previews/i })).toBeTruthy()
+    expect(screen.getAllByText(/unpolished on purpose/i)).toHaveLength(1)
+  })
+
+  it('carries the redirect anchor on ONE element that wraps the whole section', async () => {
+    // `?highlight=key:<anchor>` rings the element carrying data-setting-key.
+    // The old-bookmark reader asked a section-sized question, so the ring must
+    // enclose the header and every card — an anchor on a single card would
+    // answer "is this row selected?" instead.
+    const { container } = renderTab()
+    // Awaited: the Decisions card is not drawn until the governance read
+    // (`decisions_enabled`) lands, so the last switch arrives a tick late.
+    await waitFor(() => {
+      expect(screen.getAllByRole('switch')).toHaveLength(8)
+    })
+    const anchors = container.querySelectorAll(`[data-setting-key="${FEATURE_PREVIEWS_HIGHLIGHT_ANCHOR}"]`)
+    expect(anchors).toHaveLength(1)
+    const anchor = anchors[0]
+    expect(anchor.contains(screen.getByRole('heading', { name: /feature previews/i }))).toBe(true)
+    // The count is here so a card added outside the anchor fails rather than
+    // silently escaping the ring. The last is Decisions, whose switch is
+    // backend config — a different write path, the same ring.
+    for (const s of screen.getAllByRole('switch')) expect(anchor.contains(s)).toBe(true)
+  })
+
+  it('carries a Dynamic Dashboard card that starts off and hosts the automatic-cards switch in both states', async () => {
+    // The gateway-wide cost opt-in rides inside the preview's card, and stays
+    // there with the preview off: it is server state, and hiding its only
+    // control would leave a spend running that this machine cannot stop.
+    renderTab()
+    const card = screen.getByRole('switch', { name: /^dynamic dashboard$/i })
+    expect(card.getAttribute('aria-checked')).toBe('false')
+    const autoOff = await screen.findByRole('switch', { name: /automatic cards for all sessions/i })
+    expect(screen.getByTestId('feature-preview-dashboard-settings')).toContainElement(autoOff)
+    await act(async () => { card.click() })
+    expect(localStorage.getItem(PREVIEW_DASHBOARD)).toBe('1')
+    expect(localStorage.getItem(PREVIEW_WEBHOOKS)).not.toBe('1')
+    expect(await screen.findByRole('switch', { name: /automatic cards for all sessions/i })).toBeTruthy()
+  })
+
+  it('carries a remote-crew-sessions card that starts off and writes only its own key', async () => {
+    // The toggle IS this preview's whole affordance — it has no page of its own,
+    // so nothing else on the page would reveal a card that failed to render or
+    // an onChange wired to the wrong constant. Four flags now share one section,
+    // and a shared write would release every unfinished surface at once, so the
+    // sibling assertions are the point rather than padding.
+    //
+    // `/^remote crew sessions$/i` anchored: the card's description also says
+    // "Sessions list", and the accessible name is the label alone.
+    renderTab()
+    const toggle = () => screen.getByRole('switch', { name: /^remote crew sessions$/i })
+    expect(toggle().getAttribute('aria-checked')).toBe('false')
+    await act(async () => { toggle().click() })
+    expect(localStorage.getItem(PREVIEW_INSTANCE_SESSIONS)).toBe('1')
+    expect(toggle().getAttribute('aria-checked')).toBe('true')
+    for (const other of [PREVIEW_WEBHOOKS, PREVIEW_CREW, PREVIEW_REMOTE_CREW_CHAT]) {
+      expect(localStorage.getItem(other)).not.toBe('1')
+    }
+  })
+
+  it('is gone from the Developer page rail', () => {
+    // Pin the removal, not just the addition: a tab left behind would offer the
+    // same four switches from two places, and the two would drift.
     render(<MemoryRouter initialEntries={['/developer?tab=config']}><DeveloperPage /></MemoryRouter>)
     expect(screen.getByTestId('kirocrew-cfg')).toBeTruthy()
+    expect(screen.queryByRole('button', { name: /feature previews/i })).toBeNull()
     expect(screen.queryByRole('switch', { name: /webhooks/i })).toBeNull()
+  })
 
-    const tab = screen.getByRole('button', { name: /feature previews/i })
-    await act(async () => { tab.click() })
-    expect(screen.getByRole('switch', { name: /webhooks/i })).toBeTruthy()
+  it('redirects the old tab link to Settings > Developer with a replace', () => {
+    // `/developer?tab=feature-previews` survives in bookmarks, docs and palette
+    // history. Without the redirect SidePanelLayout would fall back to the
+    // first tab silently — the toggles would look deleted rather than moved.
+    // The probe reads the FINAL location AND the navigation type: a push would
+    // leave the pre-move URL one Back press away.
+    function LocationProbe() {
+      const loc = useLocation()
+      const navType = useNavigationType()
+      return <div data-testid="loc">{`${navType} ${loc.pathname}${loc.search}`}</div>
+    }
+    render(
+      <MemoryRouter initialEntries={['/developer?tab=feature-previews']}>
+        <DeveloperPage />
+        <LocationProbe />
+      </MemoryRouter>,
+    )
+    // The destination is the Settings tab that now hosts the cards, ringing
+    // the whole section (its `data-setting-key` anchor) so the reader lands ON
+    // the moved thing — the section, not one of its rows. Literal on purpose:
+    // this is the URL contract old bookmarks and docs depend on.
+    expect(screen.getByTestId('loc').textContent).toBe(
+      `REPLACE /settings/developer?highlight=key%3A${FEATURE_PREVIEWS_HIGHLIGHT_ANCHOR}`,
+    )
+  })
+
+  it('signposts the move from the rail footer, to the same ringed section', () => {
+    // The redirect only catches a URL that still names the old tab. Someone
+    // who navigates by memory (rail > Developer) finds the tab gone, so the
+    // footer every tab shares points onward — and to the SAME target as the
+    // redirect, so the two doors cannot drift apart.
+    render(<MemoryRouter initialEntries={['/developer?tab=config']}><DeveloperPage /></MemoryRouter>)
+    const link = screen.getByRole('link', { name: /feature previews moved to settings > developer/i })
+    expect(link.getAttribute('href')).toBe(`/settings/developer?highlight=key%3A${FEATURE_PREVIEWS_HIGHLIGHT_ANCHOR}`)
+  })
+
+  it('leaves every other Developer tab link alone', () => {
+    // The redirect keys on ONE legacy value. A broader match (any unknown tab)
+    // would hijack the page's own unknown-tab fallback, which SidePanelLayout
+    // owns and the queryParamConsumer tests pin.
+    function LocationProbe() {
+      const loc = useLocation()
+      return <div data-testid="loc">{loc.pathname + loc.search}</div>
+    }
+    render(
+      <MemoryRouter initialEntries={['/developer?tab=config']}>
+        <DeveloperPage />
+        <LocationProbe />
+      </MemoryRouter>,
+    )
+    expect(screen.getByTestId('loc').textContent).toBe('/developer?tab=config')
   })
 })

@@ -6,7 +6,7 @@ import asyncio
 import json
 import logging
 from pathlib import Path
-from typing import Any, Callable, TypeVar
+from typing import Any, Awaitable, Callable, TypeVar
 
 from kiro_crew.loop_lock import LoopBoundLock
 
@@ -61,8 +61,15 @@ class FolderRepository:
         path_provider: Callable[[], Path],
         write_confirmed: Callable[[Path, list[dict[str, Any]]], None],
         on_committed: Callable[[], None] | None = None,
+        prepare: Callable[[], Awaitable[None]] | None = None,
     ) -> _T:
         """Serialize one mutation and retain it only after a confirmed off-loop write.
+
+        ``prepare``, when given, is awaited under the lock before the callback
+        runs, for a mutation whose decision needs off-loop reads that no folder
+        writer may get between (the folder cleanup reads channel settings and
+        the cron store there). It must not touch folder state; an exception it
+        raises propagates with nothing changed.
 
         The callback mutates the live list while the store lock is held.  Only
         the blocking write crosses the thread boundary, and it receives a
@@ -76,6 +83,8 @@ class FolderRepository:
         It is deliberately skipped for no-op and rolled-back transactions.
         """
         async with lock:
+            if prepare is not None:
+                await prepare()
             before = [dict(folder) for folder in folders_provider()]
             changed, value = mutate(folders_provider())
             if not changed:
@@ -100,6 +109,23 @@ class FolderRepository:
         """Expose only committed folder state to a synchronous reader."""
         async with lock:
             return read(folders_provider())
+
+    @staticmethod
+    async def hold(
+        folders_provider: Callable[[], list[dict[str, Any]]],
+        lock: LoopBoundLock,
+        section: Callable[[list[dict[str, Any]]], Awaitable[_T]],
+    ) -> _T:
+        """Run an awaitable *section* while the store lock is held.
+
+        For a critical section that must exclude folder writers but whose own
+        work belongs off the loop (a file lock, an unlink) -- the same shape
+        :meth:`mutate` uses for its confirmed write. *section* receives a
+        SNAPSHOT of the committed list, never the live one: it must not
+        mutate folder state, and a stale copy cannot leak past the hold.
+        """
+        async with lock:
+            return await section([dict(folder) for folder in folders_provider()])
 
     @staticmethod
     def write_confirmed(

@@ -197,7 +197,9 @@ async def _pod_checkout_guard(name: str) -> str | None:
     return None
 
 
-def _reclaim_pod_locked(cfg, name: str, expected_checkout: str) -> tuple[str, str]:
+def _reclaim_pod_locked(
+    cfg, name: str, expected_checkout: str, *, require_missing_checkout: bool = False
+) -> tuple[str, str]:
     """Attribute pod *name* and tear it down as ONE locked transaction.
 
     Runs entirely inside ``rt.pod_name_mutex``, which is the cross-process flock
@@ -215,12 +217,13 @@ def _reclaim_pod_locked(cfg, name: str, expected_checkout: str) -> tuple[str, st
     submitted to the executor as one callable, so ``stop_pod``'s own acquisition
     nests instead of deadlocking.
 
-    *expected_checkout* is this repo's worktree path for *name*, resolved by the
-    caller before the lock -- it is not the racy half, since a foreign ``up``
-    moves the PIN, never our own worktree.
+    *expected_checkout* identifies this repository's checkout for *name*. The
+    missing-checkout teardown passes git's retained worktree record. When
+    *require_missing_checkout* is true, the locked transaction refuses if that
+    path is back on disk because a new pod may own the name.
 
-    Mirrors :func:`_pod_checkout_guard`'s attribution rules, and the CLI's
-    post-teardown env-file clear, so behaviour matches the paths it replaces.
+    Mirrors :func:`_pod_checkout_guard`'s attribution rules and clears the
+    checkout pin after a successful reclaim.
 
     Returns ``(outcome, detail)`` with outcome one of:
       ``reclaimed``  -- ours, torn down, HOME verified gone
@@ -265,6 +268,11 @@ def _reclaim_pod_locked(cfg, name: str, expected_checkout: str) -> tuple[str, st
             return "foreign", (
                 f"pod {name!r} is pinned to a different checkout " "(basename collision)"
             )
+        if require_missing_checkout and Path(expected_checkout).exists():
+            return "handed_over", (
+                f"pod {name!r}: its checkout {expected_checkout!r} is back on disk, "
+                "so a new pod may own the name"
+            )
         cp = runtime.rt.stop_pod(cfg, name)
         if cp.returncode != 0:
             # Redacted like every other detail this helper returns: it reaches the
@@ -282,6 +290,54 @@ def _reclaim_pod_locked(cfg, name: str, expected_checkout: str) -> tuple[str, st
         return "reclaimed", ""
 
 
+def _mint_pod_token_locked(cfg, name: str, expected_checkout: str) -> dict:
+    """Revalidate the boot's checkout and mint under one pod-name lock off-loop."""
+    outcome, audit_error = "failure", "mint failed"
+    resources = f"name={name} ttl=2h"
+    try:
+        with runtime.rt.pod_name_mutex(cfg, name):
+            env_exists, pinned = _read_pin_strict(cfg, name)
+            if not env_exists or not pinned:
+                error = f"pod {name!r} has no verifiable checkout pin — token withheld"
+            elif Path(pinned).resolve() != Path(expected_checkout).resolve():
+                error = f"pod {name!r} is pinned to a different checkout — token withheld"
+            else:
+                error = ""
+            if error:
+                outcome, audit_error = "denied", "checkout pin mismatch; credential withheld"
+                return {"ok": False, "code": "pod_checkout_mismatch", "error": error}
+            port = runtime.rt.derive_port(cfg, name)
+            resources = f"name={name} port={port} ttl=2h"
+            token = runtime.rt.mint_token(cfg, name, "2h")
+            outcome, audit_error = "allowed", ""
+            return {"ok": True, "token": token}
+    except runtime.rt.PodOwnershipUnproven as exc:
+        outcome, audit_error = "denied", "ownership unprovable; credential withheld"
+        return {
+            "ok": True,
+            "token": "",
+            "warning": f"pod is up but token withheld: {runtime._redact(str(exc))}",
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "ok": False,
+            "code": "pod_token_mint_failed",
+            "error": f"pod is up but token mint failed: {runtime._redact(str(exc))}",
+        }
+    finally:
+        try:
+            runtime._sel().log_api_access(
+                caller="dev_fleet",
+                operation="pod.token",
+                outcome=outcome,
+                source="app",
+                resources=resources,
+                error=audit_error,
+            )
+        except Exception as exc:  # noqa: BLE001
+            runtime.logger.warning("SEL audit failed for pod.token: %s", runtime._redact(str(exc)))
+
+
 async def _pod_up(name: str) -> dict:
     guard = await _pod_checkout_guard(name)
     if guard:
@@ -289,7 +345,18 @@ async def _pod_up(name: str) -> dict:
     # Resolve the node toolchain off the loop before building the pod env:
     # `pod up` runs the provision chain (npm ci + vite) when asked to.
     await runtime._warm_build_path()
+    cfg = runtime._load_cfg()
     cmd = runtime._find_cli() + ["pod", "up", name, "--json"]
+    # A sandboxed child has its own user namespace, which the pod refuses to
+    # certify as the local owner. Let the gateway mint only when it has config;
+    # otherwise the CLI owns the whole operation (including Windows pods).
+    expected_checkout = ""
+    if cfg is not None:
+        target, ferr = await repository._find_worktree(name)
+        if target is None:
+            return {"ok": False, "error": ferr or f"unknown worktree: {name!r}"}
+        expected_checkout = target["path"]
+        cmd.append("--no-token")
     rc, stdout, stderr = await runtime._run_cmd(
         cmd, cwd=repository._repo(), env=_pod_env(), timeout=180
     )
@@ -299,7 +366,6 @@ async def _pod_up(name: str) -> dict:
     # pod is up. Confirm the unit is actually active, else fail closed rather
     # than flash a false "started" — the same false-success class as a false
     # "stopped", in the opposite direction.
-    cfg = runtime._load_cfg()
     if runtime._POD_AVAILABLE and cfg:
         try:
             loop = asyncio.get_running_loop()
@@ -312,40 +378,78 @@ async def _pod_up(name: str) -> dict:
                 "error": f"cannot verify pod start: {runtime._redact(str(exc))}",
             }
     try:
-        return {"ok": True, **json.loads(stdout)}
+        handle = json.loads(stdout)
     except ValueError:
-        return {"ok": True, "output": stdout}
+        handle = {"output": stdout}
+    # Use the same config that selects --no-token, so boot and mint cannot
+    # disagree about which process supplies the credential.
+    if cfg is not None:
+        minted = await asyncio.get_running_loop().run_in_executor(
+            subprocess_executor(), _mint_pod_token_locked, cfg, name, expected_checkout
+        )
+        if not minted["ok"]:
+            return minted
+        handle.update(minted)
+    handle["ok"] = True
+    return handle
 
 
 async def _pod_down(name: str) -> dict:
-    guard = await _pod_checkout_guard(name)
-    if guard:
-        return {"ok": False, "error": guard}
-    await runtime._warm_build_path()
-    cmd = runtime._find_cli() + ["pod", "down", name]
-    rc, stdout, stderr = await runtime._run_cmd(
-        cmd, cwd=repository._repo(), env=_pod_env(), timeout=30
-    )
-    if rc != 0:
-        return {"ok": False, "error": runtime._redact(stderr or stdout)}
-    # Post-stop verification: a CLI exit 0 is NOT proof the unit stopped (a
-    # broken `-m` entry point can no-op with rc 0, and a real stop
-    # can still fail or time out). Re-check the live unit state and fail CLOSED
-    # if the pod is still active — mirrors the post-shutdown recheck in
-    # _worktree_remove so "Stopped" is never reported for a pod still running.
+    target, ferr = await repository._find_worktree(name)
+    if target is not None:
+        guard = await _pod_checkout_guard(name)
+        if guard:
+            return {"ok": False, "error": guard}
+        await runtime._warm_build_path()
+        cmd = runtime._find_cli() + ["pod", "down", name]
+        rc, stdout, stderr = await runtime._run_cmd(
+            cmd, cwd=repository._repo(), env=_pod_env(), timeout=30
+        )
+        if rc != 0:
+            return {"ok": False, "error": runtime._redact(stderr or stdout)}
+        # Post-stop verification: a CLI exit 0 is NOT proof the unit stopped (a
+        # broken `-m` entry point can no-op with rc 0, and a real stop
+        # can still fail or time out). Re-check the live unit state and fail CLOSED
+        # if the pod is still active -- mirrors the post-shutdown recheck in
+        # _worktree_remove so "Stopped" is never reported for a pod still running.
+        cfg = runtime._load_cfg()
+        if runtime._POD_AVAILABLE and cfg:
+            try:
+                loop = asyncio.get_running_loop()
+                active = await loop.run_in_executor(
+                    subprocess_executor(), runtime.rt.active_names, cfg
+                )
+                if name in active:
+                    return {"ok": False, "error": "pod still active after shutdown"}
+            except Exception as exc:  # noqa: BLE001
+                return {
+                    "ok": False,
+                    "error": f"cannot verify pod shutdown: {runtime._redact(str(exc))}",
+                }
+        return {"ok": True, "error": None}
+
+    recorded, rerr = await repository._find_retained_worktree_path(name)
+    if recorded is None:
+        return {"ok": False, "error": ferr or rerr or f"worktree not found: {name!r}"}
     cfg = runtime._load_cfg()
-    if runtime._POD_AVAILABLE and cfg:
-        try:
-            loop = asyncio.get_running_loop()
-            active = await loop.run_in_executor(subprocess_executor(), runtime.rt.active_names, cfg)
-            if name in active:
-                return {"ok": False, "error": "pod still active after shutdown"}
-        except Exception as exc:  # noqa: BLE001
-            return {
-                "ok": False,
-                "error": f"cannot verify pod shutdown: {runtime._redact(str(exc))}",
-            }
-    return {"ok": True, "error": None}
+    if cfg is None or not runtime._POD_AVAILABLE:
+        return {"ok": False, "error": ferr or f"worktree not found: {name!r}"}
+    try:
+        outcome, detail = await asyncio.get_running_loop().run_in_executor(
+            subprocess_executor(),
+            functools.partial(
+                _reclaim_pod_locked,
+                cfg,
+                name,
+                recorded,
+                require_missing_checkout=True,
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"cannot reclaim pod: {runtime._redact(str(exc))}"}
+    if outcome == "reclaimed":
+        return {"ok": True, "error": None}
+    return {"ok": False, "error": detail}
 
 
 async def _pod_restart(name: str) -> dict:
@@ -386,6 +490,67 @@ async def _pod_logs(name: str, n: int = 120) -> dict:
     return {"ok": True, "logs": runtime._redact(raw)}
 
 
+async def _pod_status(name: str) -> dict:
+    """One pod's unit state, port and health, as ``kirocrew pod status`` reports it.
+
+    Delegated to the CLI rather than recomposed from ``rt.is_active`` +
+    ``rt.derive_port`` + ``rt.health`` so there is ONE definition of what a pod's
+    status is. A second composition here would drift from the CLI's the first time
+    either side learned a new health verdict (``HEALTH_FOREIGN`` is already one),
+    and an agent comparing the two would be told different things about one pod.
+    """
+    guard = await _pod_checkout_guard(name)
+    if guard:
+        return {"ok": False, "error": guard}
+    await runtime._warm_build_path()
+    rc, stdout, stderr = await runtime._run_cmd(
+        runtime._find_cli() + ["pod", "status", name, "--json"],
+        cwd=repository._repo(),
+        env=_pod_env(),
+        timeout=30,
+    )
+    if rc != 0:
+        return {"ok": False, "error": runtime._redact(stderr or stdout)}
+    try:
+        parsed = json.loads(stdout)
+    except ValueError:
+        return {"ok": False, "error": "pod status returned unparseable JSON"}
+    if not isinstance(parsed, dict):
+        return {"ok": False, "error": "pod status returned an unexpected shape"}
+    return {"ok": True, **parsed}
+
+
+async def _pod_ls() -> dict:
+    """Every pod ACTIVE on this host, not only this repo's.
+
+    Deliberately unscoped: the answer's whole use is collision reasoning (which
+    ports are taken, what is already running), and a list filtered to one repo's
+    worktrees would omit exactly the pod that explains a refusal. Read-only and
+    name/port/health only -- it exposes no other checkout's contents.
+
+    ``repository._repo()`` raises when no main checkout is configured. That is NOT
+    caught here: it is raised on every branch of every pod verb (cwd, ``_pod_env``,
+    and inside ``_pod_checkout_guard``'s discovery chain), so the agent surface
+    catches it once at the handler instead of each helper catching its own branch.
+    """
+    await runtime._warm_build_path()
+    rc, stdout, stderr = await runtime._run_cmd(
+        runtime._find_cli() + ["pod", "ls", "--json"],
+        cwd=repository._repo(),
+        env=_pod_env(),
+        timeout=30,
+    )
+    if rc != 0:
+        return {"ok": False, "error": runtime._redact(stderr or stdout)}
+    try:
+        parsed = json.loads(stdout)
+    except ValueError:
+        return {"ok": False, "error": "pod ls returned unparseable JSON"}
+    if not isinstance(parsed, list):
+        return {"ok": False, "error": "pod ls returned an unexpected shape"}
+    return {"ok": True, "pods": parsed}
+
+
 async def _pod_provision(name: str) -> dict:
     guard = await _pod_checkout_guard(name)
     if guard:
@@ -415,6 +580,12 @@ async def _pod_provision(name: str) -> dict:
             cwd=repository._repo(),
             env=p_env,
             cleanup_paths=[p_cleanup] if p_cleanup else None,
+            # Provisioning builds .venv and the SPA dist INSIDE the worktree
+            # that `du -sm` measures, so a completed (or killed-partway) run
+            # materially changes disk use: drop the disk cache's freshness
+            # stamp at every terminal state so the next /disk poll
+            # re-aggregates instead of serving pre-provision totals.
+            on_finish=fleet_state._disk_invalidate,
         )
         fleet_state._PROVISION_INFLIGHT[name] = rid
     return {"ok": True, "run_id": rid}
@@ -503,7 +674,22 @@ async def _worktree_remove_locked(
     path = target["path"]
     branch = target.get("branch")
 
-    live_path = await live._live_worktree_path(fresh=True)
+    # Pointer state comes from the gateway (the pointer file is masked from this
+    # backend). An outage there is NOT "nothing is live": refusing is the only
+    # answer that cannot delete the checkout a cutover is staged on.
+    try:
+        live_path = await live._live_worktree_path(fresh=True)
+    except live.PointerUnavailable as exc:
+        runtime.logger.warning(
+            "worktree remove: live-target state unavailable: %s", runtime._redact(str(exc))
+        )
+        return {
+            "ok": False,
+            "error": (
+                "refusing: cannot verify which checkout is live or staged "
+                "-- retry when the gateway answers"
+            ),
+        }
     if live_path is not None and repository._same_path(path, live_path):
         return {
             "ok": False,
@@ -753,10 +939,10 @@ async def _worktree_remove_locked(
     # about working-tree edits. `git worktree remove --force` bypasses git's
     # own dirty check and would irrecoverably destroy uncommitted edits.
     # Contract: NO path from this gate ever passes --force to git:
-    #   - dirty is not False → refuse outright (round 5)
+    #   - dirty is not False → refuse outright
     #   - dirty is False → drop --force so git's own dirty check is the
     #     atomic last line against edits arriving in the check-to-removal
-    #     window (round 6, mirrors the unmerged-clean TOCTOU pattern)
+    #     window (mirrors the unmerged-clean TOCTOU pattern)
     if force and fleet_state._is_pr_merged(pr) and branch:
         dirty = await _dirty_now()
         if dirty is not False:
@@ -908,10 +1094,46 @@ async def _worktree_remove_locked(
     # A concurrent /make-live can stage this worktree between the
     # eager live-path check above and ``git worktree remove``; every removal
     # caller delegates this ownership to the same internal critical section.
-    async with live._MAKE_LIVE_LOCK:
+    #
+    # ``_MAKE_LIVE_LOCK`` serialises removals against each other in THIS
+    # process, but the cutover (and the gateway restart that tree-kills this
+    # backend) runs in the GATEWAY process, so the gateway-held removal LEASE is
+    # what actually excludes them (live.py). The lease is refused while a
+    # cutover is in flight, and a broker outage is a refusal too: this removal
+    # cannot prove no cutover is staging the very path it is about to delete.
+    async with live._MAKE_LIVE_LOCK, live.removal_lease(path) as _leased:
+        if not _leased:
+            # Two causes with opposite remedies, so one assertive message each.
+            if _leased.refusal == "unavailable":
+                return {
+                    "ok": False,
+                    "error": (
+                        "refusing: can't reach the gateway to check for a staged cutover "
+                        "-- confirm it's running, then retry"
+                    ),
+                }
+            return {
+                "ok": False,
+                "error": (
+                    "refusing: a Make Live cutover is in progress -- retry once it " "has completed"
+                ),
+            }
         # Protection re-check under the lock closes the TOCTOU window between
         # the eager checks at function entry and the actual deletion.
-        _live2 = await live._live_worktree_path(fresh=True)
+        try:
+            _live2 = await live._live_worktree_path(fresh=True)
+            _staged2 = await live._staged_target_resolved()
+        except live.PointerUnavailable as exc:
+            runtime.logger.warning(
+                "worktree remove: live-target state unavailable: %s", runtime._redact(str(exc))
+            )
+            return {
+                "ok": False,
+                "error": (
+                    "refusing: cannot verify which checkout is live or staged "
+                    "-- retry when the gateway answers"
+                ),
+            }
         if _live2 is not None and repository._same_path(path, _live2):
             return {
                 "ok": False,
@@ -920,12 +1142,11 @@ async def _worktree_remove_locked(
                     "switch the gateway to another checkout first"
                 ),
             }
-        _staged2 = live._staged_target()
         if _staged2 is not None and repository._same_path(path, _staged2):
             return {
                 "ok": False,
                 "error": (
-                    "refusing: this worktree is a staged live-gateway cutover "
+                    "refusing: this worktree is a staged Make Live cutover "
                     "target -- cancel the staged cutover before removing"
                 ),
             }
@@ -952,8 +1173,9 @@ async def _worktree_remove_locked(
             # the socket were removed under a running pod, that pod is now
             # uncontrollable and will terminate on its next watchdog cycle.
             # As a defense-in-depth measure, we also probe the unit file directly.
+            loop = asyncio.get_running_loop()
             try:
-                runtime.rt.require_backend()
+                await loop.run_in_executor(subprocess_executor(), runtime.rt.require_backend)
             except runtime.rt.PodBackendAbsent:
                 # Defense-in-depth: attempt a direct unit-state query. If this
                 # somehow succeeds (bus re-appeared between require_backend and
@@ -989,6 +1211,11 @@ async def _worktree_remove_locked(
                     residue,
                     name,
                 )
+            except runtime.rt.PodError as exc:
+                return {
+                    "ok": False,
+                    "error": f"cannot verify pod backend: {runtime._redact(str(exc))}",
+                }
             else:
                 try:
                     loop = asyncio.get_running_loop()
@@ -1113,19 +1340,36 @@ async def _worktree_remove_locked(
         # / `update-ref -d` against the shared MAIN_REPO would race on the worktree
         # admin dir and packed-refs locks, so only one worker mutates at a time.
         async with _GIT_MUTATION_LOCK:
+            # The removal lease excludes a gateway cutover/restart from landing on
+            # this worktree, and it is heartbeated while we queued here. If a
+            # renewal was REFUSED (the gateway restarted and forgot the lease), the
+            # exclusion is gone: stop before the mutation rather than inside it.
+            if live.removal_lease_lost(path):
+                return {
+                    "ok": False,
+                    "error": (f"{_LEASE_REFUSAL_PREFIX} -- nothing was changed; retry the removal"),
+                }
             # TOCTOU recheck: the pod-inactive verification above happened BEFORE
             # this lock was acquired. Under parallel prune a worker can queue here
             # behind other removals — long enough for another session to restart
             # the pod. Removing the checkout under a live pod would leave its
             # gateway running from deleted files, so re-verify inactivity now.
             if runtime._POD_AVAILABLE and cfg:
+                loop = asyncio.get_running_loop()
                 try:
-                    runtime.rt.require_backend()
+                    await loop.run_in_executor(subprocess_executor(), runtime.rt.require_backend)
                 except runtime.rt.PodBackendAbsent:
                     pass  # backend provably absent — no pods can exist
+                except runtime.rt.PodError as exc:
+                    return {
+                        "ok": False,
+                        "error": (
+                            "cannot re-verify pod backend before removal: "
+                            f"{runtime._redact(str(exc))}"
+                        ),
+                    }
                 else:
                     try:
-                        loop = asyncio.get_running_loop()
                         active3 = await loop.run_in_executor(
                             subprocess_executor(), runtime.rt.active_names, cfg
                         )
@@ -1139,9 +1383,13 @@ async def _worktree_remove_locked(
                             "ok": False,
                             "error": f"cannot re-verify pod state before removal: {runtime._redact(str(exc))}",
                         }
-            # Execute the approved untracked-only discard. This is the LAST
-            # point before the removal, so a gate that refused above never got
-            # here and never destroyed anything.
+            # Execute the approved untracked-only discard. Once it runs, work the
+            # user approved for deletion is gone even if the removal itself is later
+            # refused — so when a discard is pending THIS is the point of no return,
+            # and the lease is proven fresh here (a renewal through the gateway, not
+            # the possibly-stale heartbeat view) before anything is destroyed. The
+            # git spawn below re-proves it through the pre-spawn gate; a refusal
+            # THERE, after the discard, is reported as such rather than as "retry".
             #
             # Deletion is per-file `os.unlink`, not `git clean`: it removes only
             # the enumerated names, cannot recurse into a path whose type changed
@@ -1156,7 +1404,17 @@ async def _worktree_remove_locked(
             # --force, so git's own dirty check stays the atomic last line
             # against a tracked edit that landed in the meantime -- the same
             # TOCTOU contract every other path here honours.
+            discard_ran = False
             if pending_discard is not None:
+                if not await live.confirm_removal_lease(path):
+                    return {
+                        "ok": False,
+                        "error": (
+                            f"{_LEASE_REFUSAL_PREFIX}, so the approved untracked files "
+                            "were left in place -- nothing was deleted; retry the removal"
+                        ),
+                    }
+                discard_ran = True
                 if force_use_git_force:  # pragma: no cover - defensive
                     return {
                         "ok": False,
@@ -1174,10 +1432,21 @@ async def _worktree_remove_locked(
                 )
                 post_tracked, post_untracked = await repository._dirty_split(path)
                 if discard_err or post_tracked is not False or post_untracked:
+                    # A per-file helper can fail on the Nth entry after deleting
+                    # N-1, and new dirt can appear after every approved file is
+                    # gone: neither refusal is a no-op, so count what is already
+                    # deleted and say it.
+                    gone = await loop.run_in_executor(
+                        subprocess_executor(),
+                        repository._count_missing,
+                        path,
+                        pending_discard,
+                    )
                     runtime.logger.info(
                         "worktree_removal_audit: worktree=%s branch=%s caller=%s "
                         "approved_discard=%s discard_err=%s tracked_after=%s "
-                        "untracked_after=%s action=refused_discard_incomplete",
+                        "untracked_after=%s already_deleted=%s "
+                        "action=refused_discard_incomplete",
                         name,
                         branch,
                         _caller,
@@ -1185,18 +1454,22 @@ async def _worktree_remove_locked(
                         bool(discard_err),
                         post_tracked,
                         len(post_untracked),
+                        gone,
+                    )
+                    _reason = discard_err or (
+                        "the worktree is not clean after the discard: "
+                        f"{len(post_untracked)} untracked file(s) remain"
+                        + (", and tracked files changed" if post_tracked else "")
+                    )
+                    _already = (
+                        f"{gone} of {len(pending_discard)} approved untracked "
+                        "file(s) were already deleted; "
+                        if gone
+                        else "no approved file was deleted; "
                     )
                     return {
                         "ok": False,
-                        "error": (
-                            discard_err
-                            or (
-                                "could not discard the worktree's untracked files "
-                                "(the tree is not clean afterwards -- a file may "
-                                "have appeared after the discard was approved)"
-                            )
-                        )
-                        + " -- removal aborted",
+                        "error": f"{_reason} -- {_already}removal aborted",
                     }
                 runtime.logger.info(
                     "worktree_removal_audit: worktree=%s branch=%s caller=%s "
@@ -1210,6 +1483,18 @@ async def _worktree_remove_locked(
             cmd = ["git", "-C", repo, "worktree", "remove", path]
             if force_use_git_force:
                 cmd.append("--force")
+
+            # The point of no return is guarded by an explicit lease RENEWAL, run by
+            # ``_run_cmd`` after its sandbox-preparation hop and immediately before
+            # the child is spawned — nothing of unbounded duration sits between the
+            # proof and the mutation. A renewal that succeeds means the gateway
+            # excludes cutovers/restarts from this worktree for a TTL, and for the
+            # grace barrier beyond that should this process die mid-mutation.
+            async def _lease_gate() -> str | None:
+                if await live.confirm_removal_lease(path):
+                    return None
+                return f"{_LEASE_REFUSAL_PREFIX} -- git was not run; retry the removal"
+
             # Run the destructive mutation uninterruptibly. On gateway
             # shutdown dev_fleet_cleanup cancels the prune worker; a naive
             # cancel would either SIGKILL the child (via _run_cmd's handler) or,
@@ -1219,13 +1504,24 @@ async def _worktree_remove_locked(
             # locks -- until the timeout-bounded `git worktree remove` has
             # finished, then lets the cancellation propagate at that safe point.
             rc, stdout, stderr = await runtime._run_uninterruptible(
-                runtime._run_cmd(cmd, timeout=60)
+                runtime._run_cmd(
+                    cmd, timeout=_GIT_WORKTREE_REMOVE_TIMEOUT_SECS, pre_spawn=_lease_gate
+                )
             )
             if rc != 0:
+                # The pre-spawn lease gate refused: git never ran, so this is not
+                # a git failure and must not be read as "dirty at removal". With
+                # no discard pending nothing was destroyed and a plain refusal is
+                # right; after a discard it falls through to the discard-aware
+                # report below, which says what is already gone.
+                if stderr.startswith(_LEASE_REFUSAL_PREFIX) and not discard_ran:
+                    return {"ok": False, "error": stderr}
                 # When the removal runs without --force (TOCTOU guard for
                 # clean-unmerged override), a git refusal means the tree became
-                # dirty in the window — surface it as a specific audit event.
-                if force and not force_use_git_force:
+                # dirty in the window — surface it as a specific audit event. A
+                # lease-gate refusal is not one: git never ran.
+                lease_refused = stderr.startswith(_LEASE_REFUSAL_PREFIX)
+                if force and not force_use_git_force and not lease_refused:
                     runtime.logger.info(
                         "worktree_removal_audit: worktree=%s branch=%s caller=%s "
                         "force=%s dirty_at_removal=True verdict_oid=%s "
@@ -1337,6 +1633,11 @@ async def _worktree_remove_locked(
             (verdict_oid or "").strip()[:12] if verdict_oid else "none",
         )
         fleet_state._fleet_forget(name)
+        # A removed checkout materially changes worktree disk use, and this is
+        # the chokepoint every removal path already routes through: drop the
+        # disk cache's freshness stamp so the next /disk poll re-aggregates
+        # instead of serving pre-removal totals for the rest of the TTL.
+        fleet_state._disk_invalidate()
         return {
             "ok": True,
             "removed": True,
@@ -1403,6 +1704,68 @@ def _venv_python(repo: str) -> Path | None:
         if cand.is_file():
             return cand
     return None
+
+
+def _frontend_build_steps(
+    *,
+    npm_bin: str,
+    git_bin: str,
+    repo: str,
+) -> list[tuple[list[str], str, dict, str]]:
+    """The ``npm ci`` and ``npm build + stage`` steps, in order.
+
+    Returns both steps unconditionally. Whether they RUN is decided at run time
+    by the sync runner, which suppresses a step whose label is in its
+    frontend-skip set when the trusted preflight step exits the frontend-skip
+    verdict. That decision is made by the preflight -- the one point that runs
+    after ``fetch`` pinned the incoming ref and before ``merge`` -- so it is made
+    in the only window where "does the incoming ref touch the frontend?" has a
+    correct answer. Deciding it here at assembly time would read the per-PID sync
+    ref before fetch wrote it, so on a long-lived gateway's second sync it would
+    compare against the PRIOR tip and skip a rebuild an incoming frontend change
+    genuinely needed.
+
+    The two steps suppress together because the runner keys on their labels off
+    one preflight verdict, and they must: ``npm ci`` reifies the incoming
+    lockfile and ``npm build + stage`` compiles the source, sharing the one
+    precondition the verdict encodes.
+
+    ``git_bin`` is the sync's trusted-bin absolute git path; it is threaded into
+    ``build_and_stage`` so the read-only build-source fingerprint's git calls use
+    a trusted binary rather than a PATH search.
+    """
+    return [
+        ([npm_bin, "ci", "--prefix", "website"], "strict", runtime._build_env(), "npm ci"),
+        # Build and stage as ONE step, holding the staging lock across both.
+        # `npm run build` empties website/dist, so a peer flow (the dashboard's
+        # own update, pod provisioning) staging concurrently would copy a
+        # partially written tree — and a bundle's lazy chunks are not reachable
+        # from index.html, so no post-hoc inspection detects that reliably.
+        # Covering only the copy is not enough; the holder has to span the build.
+        #
+        # Run with THIS backend's interpreter, not the target checkout's: the
+        # logic is revision-independent, while resolving it from the target would
+        # make the step's very EXISTENCE contingent on the pulled revision
+        # carrying build_and_stage, turning an older target into an ImportError
+        # that fails the whole Pull+Build. The repo to build, npm's resolved
+        # trusted path, and git's trusted path are passed in rather than
+        # re-resolved.
+        (
+            [
+                sys.executable,
+                "-c",
+                "import sys;from kiro_crew.frontend import build_and_stage;"
+                "sys.exit(0 if build_and_stage(sys.argv[1], npm=sys.argv[2], "
+                "git=sys.argv[3]) else 1)",
+                repo,
+                npm_bin,
+                git_bin,
+            ],
+            "strict",
+            runtime._build_env(),
+            "npm build + stage",
+        ),
+    ]
 
 
 #: Trusted loader for the sync-runner snapshot. A FIXED literal — nothing is
@@ -1695,8 +2058,10 @@ async def _sync_start_locked() -> dict:
                 "ok": False,
                 "error": (
                     "could not stage the dependency preflight: "
-                    f"{exc.strerror or exc} — free space in the temporary "
-                    "directory and press Pull + Build again"
+                    f"{exc.strerror or exc} — check BOTH the free bytes (df -h) "
+                    "and the free file count (df -i) on the temporary directory, "
+                    "because either budget can be exhausted while the other still "
+                    "looks healthy — then free room and press Pull + Build again"
                 ),
             }
         # File before directory: the run's cleanup unlinks each entry and falls
@@ -1718,6 +2083,14 @@ async def _sync_start_locked() -> dict:
                     str(repo),
                     "--ref",
                     sync_base_ref,
+                    # Asks this step to exit EXIT_FRONTEND_SKIP (a reserved code
+                    # trusted only from this step) when the incoming ref proves
+                    # the frontend install/build is already present, so the
+                    # runner suppresses the later npm ci and build+stage steps.
+                    # A flag, not a value -- the verdict travels as this step's
+                    # exit code and lives in runner state, never a file another
+                    # same-UID step could forge.
+                    "--emit-frontend-skip",
                 ],
                 "strict",
                 runtime._build_env(),
@@ -1787,37 +2160,18 @@ async def _sync_start_locked() -> dict:
             "edition; the shipped bundle is left in place"
         )
     else:
-        raw_steps += [
-            ([npm_bin, "ci", "--prefix", "website"], "strict", runtime._build_env(), "npm ci"),
-            # Build and stage as ONE step, holding the staging lock across both.
-            # `npm run build` empties website/dist, so a peer flow (the
-            # dashboard's own update, pod provisioning) staging concurrently
-            # would copy a partially written tree — and a bundle's lazy chunks
-            # are not reachable from index.html, so no post-hoc inspection of
-            # the copy detects that reliably. Covering only the copy is not
-            # enough; the holder has to span the build.
-            #
-            # Run with THIS backend's interpreter, not the target checkout's, for
-            # the same reason the staging step does: the logic is
-            # revision-independent, while resolving it from the target would make
-            # the step's very EXISTENCE contingent on the pulled revision
-            # carrying build_and_stage, turning an older target into an
-            # ImportError that fails the whole Pull+Build. The repo to build and
-            # npm's resolved trusted path are passed in rather than re-resolved.
-            (
-                [
-                    sys.executable,
-                    "-c",
-                    "import sys;from kiro_crew.frontend import build_and_stage;"
-                    "sys.exit(0 if build_and_stage(sys.argv[1], npm=sys.argv[2]) else 1)",
-                    repo,
-                    npm_bin,
-                ],
-                "strict",
-                runtime._build_env(),
-                "npm build + stage",
-            ),
-        ]
+        # Append the reinstall AND the rebuild. Whether they RUN is decided at
+        # run time by the sync runner: it suppresses these two labels when the
+        # preflight step (which runs after fetch pinned the incoming ref and
+        # before merge) exits the frontend-skip verdict -- the incoming ref
+        # changed nothing under website/ and node_modules is populated. A
+        # backend-only sync -- the common case, since most syncs move only
+        # Python -- otherwise pays a full `npm ci` (which DELETES node_modules
+        # before reinstalling from an unchanged lockfile) and a full vite build
+        # that reproduces a byte-identical bundle. The decision is made
+        # post-fetch, carried by the preflight's trusted exit code rather than
+        # in-process here where the ref is not yet fetched.
+        raw_steps += _frontend_build_steps(npm_bin=npm_bin, git_bin=git_bin, repo=str(repo))
     cleanups: list[str] = []
     # The preflight's snapshot is removed with the run's other temporaries. It is
     # registered here rather than left behind: a leaked mkdtemp per sync is how
@@ -1896,8 +2250,10 @@ async def _sync_start_locked() -> dict:
             "ok": False,
             "error": (
                 "could not stage the sync runner: "
-                f"{exc.strerror or exc} — free space in the temporary directory "
-                "and press Pull + Build again"
+                f"{exc.strerror or exc} — check BOTH the free bytes (df -h) and the "
+                "free file count (df -i) on the temporary directory, because either "
+                "budget can be exhausted while the other still looks healthy — then "
+                "free room and press Pull + Build again"
             ),
         }
     # Files before their directory: the run's cleanup unlinks each entry and
@@ -1928,11 +2284,27 @@ async def _sync_start_locked() -> dict:
         str(npm_preflight.EXIT_TREE_AMBIGUOUS),
         "--exit-restore-failed",
         str(npm_preflight.EXIT_RESTORE_FAILED),
+        "--exit-frontend-skip",
+        str(npm_preflight.EXIT_FRONTEND_SKIP),
+        # The two labels the runner suppresses when the preflight asserts the
+        # frontend-skip verdict. They MATCH the labels _frontend_build_steps
+        # gives those steps; kept literal here rather than derived so the runner
+        # (which imports nothing from kiro_crew) is told exactly what to skip.
+        "--frontend-labels",
+        "npm ci,npm build + stage",
         "--steps-sha256",
         steps_sha256,
     ]
     rid = await runtime._start_run(
-        runtime._SYNC_RUN_LABEL, cmd, env=runtime._build_env(), cleanup_paths=cleanups
+        runtime._SYNC_RUN_LABEL,
+        cmd,
+        env=runtime._build_env(),
+        cleanup_paths=cleanups,
+        # A dependency sync writes pip installs into the repo .venv and
+        # `npm ci` into website/node_modules — both inside trees `du -sm`
+        # measures — so it invalidates the disk cache the same way a
+        # provision run does.
+        on_finish=fleet_state._disk_invalidate,
     )
     _SYNC_RID = rid
     return {"ok": True, "run_id": rid}
@@ -1969,7 +2341,7 @@ async def _rebase_locked(target: dict) -> dict:
     if st is None:
         return {"ok": False, "error": "cannot verify worktree state (git status failed)"}
     if st:
-        # Same fileless refusal the removal path used to give. Name the dirt so
+        # Same fileless refusal the removal path gives. Name the dirt so
         # the user can act on it. The GATE is deliberately unchanged: an
         # untracked file cannot conflict semantically, but it can still block
         # the rebase's checkout when it collides with a path a replayed commit
@@ -1982,11 +2354,41 @@ async def _rebase_locked(target: dict) -> dict:
             **_fields,
             "error": "worktree has uncommitted changes" + _detail,
         }
-    remote = await repository._upstream_remote()
-    if await repository._git(path, "fetch", remote, repository.BASE_BRANCH, timeout=90) is None:
-        return {"ok": False, "error": f"git fetch {remote} {repository.BASE_BRANCH} failed"}
+    # Re-resolved HERE, not inherited from discovery. Discovery latches once per
+    # process (`_DISCOVERY_DONE`), so a base resolved at startup is the only answer the
+    # process would ever hold -- and a refusal would then not clear until a restart. A
+    # few short git reads on an operation that already fetches is what makes that
+    # promise true.
+    #
+    # Resolved into LOCALS, never into the shared `repository.BASE_BRANCH` global.
+    # `_sync_start_locked` checks `HEAD == BASE_BRANCH` and then re-reads that global
+    # across several awaits before it fetches and merges; a rebase mutating the global
+    # in that window (default main->trunk) would make the sync fetch and merge a base
+    # it never validated, holding only `_wt_lock` and never `_SYNC_LOCK`. Keeping the
+    # answer local removes the shared mutable state the two operations contended over,
+    # rather than serializing two unrelated subsystems under one lock: this rebase acts
+    # only on the base it itself resolved, and the sync's global is left untouched.
+    base_branch, base_positive, base_remote = await repository._resolve_base_snapshot()
+    if base_branch is None:
+        base_branch = repository.BASE_BRANCH
+    # Before the fetch, and before anything is rewritten: a base branch nobody stated
+    # is a guess, and this is the one operation here that cannot be undone from its own
+    # result -- a clean replay onto the wrong base returns ok and names no rollback.
+    # The dirt gate above already refuses on the cheaper hazard. Checked against the
+    # LOCAL snapshot, so the verdict is about the base this rebase will act on.
+    base_refusal = repository.base_branch_mutation_refusal(base_branch, base_positive)
+    if base_refusal is not None:
+        return {"ok": False, "error": base_refusal}
+    # The SAME remote the snapshot verified the base against -- not a remote re-derived
+    # from `branch.<base>.remote`, which can name a different one (`origin` advertises
+    # `main` while `branch.main.remote = upstream`) and let a clean replay rewrite the
+    # worktree onto a base the positive verdict never checked. Base and remote are one
+    # snapshot; the fetch and the rebase use its remote.
+    remote = base_remote
+    if await repository._git(path, "fetch", remote, base_branch, timeout=90) is None:
+        return {"ok": False, "error": f"git fetch {remote} {base_branch} failed"}
     rc, stdout, stderr = await runtime._run_cmd(
-        ["git", "-C", path, "rebase", f"{remote}/{repository.BASE_BRANCH}"],
+        ["git", "-C", path, "rebase", f"{remote}/{base_branch}"],
         timeout=180,
         mode="strict",
     )
@@ -2036,6 +2438,16 @@ _PRUNE_CONCURRENCY = 4
 # here: all acquirers are aiohttp handlers and tasks on the app's single
 # gateway loop — no worker thread runs its own loop against this .git.
 _GIT_MUTATION_LOCK = LoopBoundLock()
+#: Ceiling on ``git worktree remove``. ``live._REMOVAL_LEASE_GRACE_SECS`` must exceed it:
+#: a lapsed removal lease keeps excluding cutovers/restarts for the grace barrier, and the
+#: barrier is only a guarantee while the mutation it shields cannot outlive it. A test
+#: pins the ordering so a bump here cannot silently reopen the overlap window.
+_GIT_WORKTREE_REMOVE_TIMEOUT_SECS = 60
+#: Every refusal that stems from the gateway not vouching for the removal starts with
+#: this consequence-first sentence; the post-spawn interpretation matches on it.
+_LEASE_REFUSAL_PREFIX = (
+    "refusing: the gateway could not confirm that no cutover overlaps this removal"
+)
 
 
 # Prune verdicts an untracked-discard approval is allowed to override. Both are
@@ -2153,12 +2565,32 @@ async def _prunable(path: str, branch: str | None) -> dict:
 
 async def _prune_candidates() -> dict:
     worktrees = await repository._discover_worktrees()
+    # The per-worktree verdict (_prunable) is several read-only git calls plus
+    # one or more networked gh calls (a PR-status lookup, its per-repo fallback
+    # traversal, and a merged/closed head-OID check), so a plain serial loop
+    # scales with fleet size: a 111-worktree fleet floors at ~57s even at one gh
+    # call each, double the gateway app proxy's 30s _PROXY_TIMEOUT, so the
+    # preview returns 504 and the button never renders. Run the verdicts
+    # concurrently under the same _PRUNE_CONCURRENCY bound the parallel prune
+    # workers use -- this path is read-only git (rev-parse, status,
+    # rev-list/cherry, merge-base) so it never touches _GIT_MUTATION_LOCK, which
+    # only the destructive removal path holds.
+    prunable = [w for w in worktrees if not w.get("is_main")]
+    sem = asyncio.Semaphore(_PRUNE_CONCURRENCY)
+
+    async def _verdict(w: dict) -> tuple[dict, dict]:
+        async with sem:
+            v = await _prunable(w["path"], w.get("branch"))
+        return w, v
+
+    # gather preserves the argument order in its result list regardless of
+    # completion order, so candidates/kept below stay deterministic (input
+    # discovery order) even though the verdicts finish out of order.
+    verdicts = await asyncio.gather(*(_verdict(w) for w in prunable))
+
     candidates, kept = [], []
-    for w in worktrees:
-        if w.get("is_main"):
-            continue
+    for w, v in verdicts:
         name = Path(w["path"]).name
-        v = await _prunable(w["path"], w.get("branch"))
         row = {"name": name, "code": v["code"], "branch": w.get("branch")}
         if v["ok"]:
             # A closed-PR candidate carries the ancestry warning so the
@@ -2183,7 +2615,7 @@ async def _prune_candidates() -> dict:
                 row["dirty_untracked"] = v.get("dirty_untracked")
                 row["dirty_untracked_paths"] = v.get("dirty_untracked_paths")
             kept.append(row)
-    return {"ok": True, "candidates": candidates, "kept": kept, "scanned": len(worktrees) - 1}
+    return {"ok": True, "candidates": candidates, "kept": kept, "scanned": len(prunable)}
 
 
 async def _prune_run(
@@ -2399,8 +2831,9 @@ async def _status_refresher() -> None:
     except repository.RepoUnavailable as exc:
         # No usable checkout to fetch or cache — nothing found, or the configured
         # path is not one. Returning ends the task instead of logging a traceback
-        # every cycle forever; the resolved value only changes on restart, so
-        # there is nothing to wait for.
+        # every cycle forever. A checkout found LATER restarts it from
+        # ``_ensure_repo_resolved``, which is the only thing that can change this
+        # answer inside one process.
         runtime.logger.info("dev-fleet: status refresher idle — %s", exc)
         return
     while True:
@@ -2414,6 +2847,45 @@ async def _status_refresher() -> None:
         except Exception:
             runtime.logger.exception("dev-fleet status refresher failed")
         await asyncio.sleep(_NET_REFRESH_S)
+
+
+async def _ensure_repo_resolved() -> None:
+    """Re-run main-checkout discovery while no VALID checkout is resolved, and start the
+    status refresher when an attempt resolves one.
+
+    ``/api/fleet`` calls this per poll. A resolved and valid install returns at the
+    first guard before any await, so the cost is paid only in the two states that have
+    no fleet to serve -- nothing found, and a configured path carrying no markers --
+    and the setup card or banner the user is looking at stops being a lie within one
+    poll instead of at the next gateway restart.
+
+    The refresher start lives here rather than in ``repository`` because the loop
+    and its task handle are owned at this level and ``repository`` sits below it in
+    the component DAG. Starting it is not optional bookkeeping: ``_status_refresher``
+    RETURNS when there is no usable checkout rather than idling, so a late resolution
+    that left it stopped would serve a fleet whose rows never refresh again — the setup
+    card disappears, the page looks alive, and nothing fetches. That is a worse
+    state than the honest "restart the gateway" this replaces.
+    """
+    global _refresher_task
+    # A resolved and VALID checkout returns here before any await. A resolved-but-invalid
+    # one falls through, because the operator can still correct the path its banner names
+    # and `repository` reopens that latch once the configured string changes.
+    if repository.MAIN_REPO and not repository._REPO_INVALID_MSG:
+        return
+    await repository.ensure_main_repo_discovered()
+    try:
+        repository._repo()
+    except repository.RepoUnavailable:
+        # Nothing found, or the path found carries no markers. Asked through the
+        # accessor rather than by testing `MAIN_REPO` for truthiness: an invalid path is
+        # truthy, and `_status_refresher` returns on its first line for one, so starting
+        # it would mint a task per poll that dies immediately.
+        return
+    if _background_tasks_disabled():
+        return
+    if _refresher_task is None or _refresher_task.done():
+        _refresher_task = asyncio.create_task(_status_refresher())
 
 
 # --- auto-prune reaper (opt-in) ---------------------------------------------
@@ -2554,6 +3026,7 @@ __all__ = (
     "_auto_prune_once",
     "_auto_prune_reaper",
     "_background_tasks_disabled",
+    "_ensure_repo_resolved",
     "_pod_checkout_guard",
     "_pod_down",
     "_pod_env",

@@ -45,13 +45,33 @@ from kiro_crew.validation import ValidationError
 # ── Fire-path harness (mirrors test_autonudge_dashboard_fire.py) ──
 
 
+def _owner_dashboard_identity():
+    """The owner's dashboard claims, for the routes the owner gate covers.
+
+    ``app == ""`` with the owner's subject: ``state.owner_id`` when one is
+    configured, else the signed local bootstrap subject.
+    """
+    from aiohttp import web
+
+    @web.middleware
+    async def middleware(request, handler):
+        state = request.app.get("state")
+        request["user"] = str(getattr(state, "owner_id", "") or "") or "local-app"
+        request["app"] = ""
+        return await handler(request)
+
+    return middleware
+
+
 def _loop(**kw) -> NudgeLoop:
     base = dict(
         id="loop-abc",
         slot_key="chat-1-1785",
         message="the full multi-paragraph babysit instruction",
         idle_secs=300,
-        max_cycles=24,
+        # Uncapped: a capped loop adds a ``[patrol budget: ...]`` line to the
+        # tag (``test_patrol_budget.py``), which these banner pins are not about.
+        max_cycles=0,
         cycle_count=3,
     )
     base.update(kw)
@@ -122,7 +142,7 @@ async def _fire_full(loop: NudgeLoop, *, ledger: str = "") -> tuple[str, str, di
     spawned: list[asyncio.Task] = []
 
     def _spawn(_state, _slot, coro, **_kwargs):
-        # #5184 dispatches ``_run_chat`` inside a coroutine handed to
+        # The chat fire dispatches ``_run_chat`` inside a coroutine handed to
         # ``spawn_guarded_turn``; RUN it (mirroring the dashboard-fire tests)
         # so the prompt reaches the patched ``_run_chat`` rather than closing
         # the coroutine unrun.
@@ -142,6 +162,20 @@ async def _fire_full(loop: NudgeLoop, *, ledger: str = "") -> tuple[str, str, di
     prompt = run_chat.call_args.args[2]
     meta = slot.append.call_args.kwargs["meta"]["nudge"]
     return appended, prompt, meta
+
+
+class TestCappedLoopShowsItsBudget:
+    @pytest.mark.asyncio
+    async def test_the_prompt_carries_the_budget_line(self) -> None:
+        """A capped loop's prompt names what is left, under the unchanged tag.
+
+        The conductor renews its patrol from this line; without it the cap runs
+        out and the loop deactivates before any turn could call monitor_update.
+        """
+        loop = _loop(max_cycles=24)
+        row, prompt = await _fire(loop)
+        assert prompt == f"[auto-nudge cycle 4]\n[patrol budget: cycle 4/24]\n{loop.message}"
+        assert row == prompt
 
 
 class TestDefaultRowIsUnchanged:
@@ -248,7 +282,7 @@ class TestBannerDivergesTheRowFromThePrompt:
 
 
 class TestNonStringBannerCannotWedgeTheLoop:
-    """A truthy NON-STRING ``banner`` used to crash every dashboard fire.
+    """A truthy NON-STRING ``banner`` must not crash a dashboard fire.
 
     ``banner: str`` is a plain dataclass annotation, unenforced at runtime, and
     ``_load`` constructs a loop straight from parsed JSON with no coercion. So a
@@ -746,7 +780,7 @@ class TestRestSurface:
         state._slots = {
             "chat-1-123": MagicMock(workspace="default", memory_mode="persistent", mode="chat")
         }
-        app = web.Application()
+        app = web.Application(middlewares=[_owner_dashboard_identity()])
         app["state"] = state
         app.router.add_post("/api/autonudge", _handler.api_autonudge_start)
         app.router.add_patch("/api/autonudge/{loop_id}", _handler.api_autonudge_update)
@@ -965,7 +999,7 @@ class TestRestSurface:
         """Negative control: redaction that does NOT grow the value stays accepted.
 
         The exfiltration placeholder replaces the whole matched URL and here
-        measures 27 characters SHORTER, so this at-cap banner ends well inside the
+        measures 39 characters SHORTER, so this at-cap banner ends well inside the
         bound. Without this, a fix that rejected any banner whose redaction
         changed it — or that simply lowered the cap — would pass the two arms
         above while refusing legitimate input. Complements
@@ -973,7 +1007,8 @@ class TestRestSurface:
         """
         from aiohttp.test_utils import TestClient, TestServer
 
-        url = "https://a.co/upload?data=aGVsbG8gd29ybGQgdGhpcyBpcyBiYXNlNjQ="
+        # 48-char padded base64: a run of 40+ on its own, not via ``data=``.
+        url = "https://a.co/upload?data=aGVsbG8gd29ybGQgdGhpcyBpcyBiYXNlNjQgcGF5bG9hZA=="
         at_cap_with_url = "y" * (MAX_BANNER_CHARS - len(url)) + url
         assert len(at_cap_with_url) == MAX_BANNER_CHARS, "fixture is not at the cap"
         svc = self._svc()
@@ -1075,8 +1110,8 @@ class TestMonitorToolsCanSetTheBanner:
 
         ``test_autonudge_stop_auth.py`` pins the monitor_start payload with EXACT
         dict equality, so emitting ``banner`` unconditionally would break a
-        contract test belonging to another file. A caller that sets no banner must
-        see the payload it saw before.
+        contract test belonging to another file. This assertion follows the
+        finite-runtime default while keeping the banner absent.
         """
         result = _call_tool_inner("monitor_start", {"message": "watch CI", "max_cycles": 5})
         args = session_directive.decode(result, "monitor_start")
@@ -1084,7 +1119,7 @@ class TestMonitorToolsCanSetTheBanner:
             "message": "watch CI",
             "idle_secs": 300,
             "max_cycles": 5,
-            "max_runtime_secs": 0,
+            "max_runtime_secs": 14400,
             "gate": True,
         }, "the no-banner payload shape changed (banner must stay absent; gate is the tool default)"
 
@@ -1107,7 +1142,10 @@ class TestMonitorToolsCanSetTheBanner:
             patch("kiro_crew.autonudge_authz.authorize_and_add_nudge", authz),
         ):
             await sda._monitor_start(
-                MagicMock(), "chat-9-1", {"message": "go", "banner": "watching CI"}
+                MagicMock(),
+                "chat-9-1",
+                {"message": "go", "banner": "watching CI"},
+                producer_is_channel=False,
             )
         assert authz.await_args.kwargs["banner"] == "watching CI"
 

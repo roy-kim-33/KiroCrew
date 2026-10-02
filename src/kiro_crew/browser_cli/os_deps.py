@@ -1,4 +1,4 @@
-"""Which Linux hosts ``install-browser --with-deps`` can actually serve.
+"""Which Linux hosts ``install-browser --with-deps`` can serve, and the remedy for the rest.
 
 Playwright's OS-dependency installer is **apt-only**. On a distribution it does
 not recognize it does not decline -- it picks its nearest Ubuntu package set and
@@ -9,10 +9,12 @@ managed workstation usually does not have. The observed shape on Amazon Linux
 never typed, and because the flag and the browser download are one CLI
 invocation, that refusal takes the download down with it.
 
-So the flag is offered only where it means something, and everywhere else the
-operator is handed the one command that does work on their distribution. The
-package list is the remedy for a failure they must fix with root; nothing here
-elevates, and nothing here runs a package manager.
+So the flag is offered only where it means something (:func:`with_deps_supported`),
+and everywhere else the operator is handed the one command that does work on
+their distribution. The package list is the remedy for a failure they must fix
+with root; nothing here elevates, and nothing here runs a package manager. Every
+remedy names the engine it was composed for, because a Chromium package list
+does not make Firefox or WebKit launch.
 
 The read blocks (the os-release file), so a caller on the event loop offloads
 them -- the same contract as the rest of this package.
@@ -22,6 +24,7 @@ from __future__ import annotations
 
 import logging
 import platform
+import shutil
 from functools import lru_cache
 
 from kiro_crew import platform_compat
@@ -39,22 +42,35 @@ FAMILY_UNKNOWN = "unknown"
 #: base only in ``ID_LIKE``.
 _DEBIAN_IDS = frozenset({"debian", "ubuntu"})
 
-#: ``ID``/``ID_LIKE`` tokens that mean dnf/yum. ``amzn`` reports
-#: ``ID_LIKE=fedora``, so the ``ID_LIKE`` scan covers Amazon Linux without
-#: naming it, but it is listed anyway: Amazon Linux 2 omits ``ID_LIKE``.
-_RPM_IDS = frozenset(
-    {
-        "rhel",
-        "fedora",
-        "centos",
-        "amzn",
-        "rocky",
-        "almalinux",
-        "ol",
-        "opensuse",
-        "sles",
-        "suse",
-    }
+#: The SUSE side of the rpm family. rpm-packaged, so they belong in
+#: :data:`_RPM_IDS`, but their manager is ``zypper`` and their Chromium
+#: dependency packages are named differently from the Fedora/RHEL set
+#: (``libgbm1`` for ``mesa-libgbm``) -- so no command this module could compose
+#: from :data:`_RPM_CHROMIUM_PACKAGES` works there, even when ``dnf`` or
+#: ``yum`` happens to be installed from SUSE's own repos. Lineage decides,
+#: not which binaries the host carries: see :func:`_rpm_package_manager`.
+_SUSE_IDS = frozenset({"opensuse", "sles", "suse"})
+
+#: ``ID``/``ID_LIKE`` tokens that mean rpm packaging. Family membership says how
+#: packages are NAMED, not which manager installs them: Fedora-lineage hosts
+#: carry ``dnf`` or ``yum``, while the SUSE tokens mean ``zypper`` -- so the
+#: manager is probed per host (see :func:`_rpm_package_manager`), never assumed
+#: from the family. ``amzn`` reports ``ID_LIKE=fedora``, so the ``ID_LIKE`` scan
+#: covers Amazon Linux without naming it, but it is listed anyway: Amazon Linux 2
+#: omits ``ID_LIKE``.
+_RPM_IDS = (
+    frozenset(
+        {
+            "rhel",
+            "fedora",
+            "centos",
+            "amzn",
+            "rocky",
+            "almalinux",
+            "ol",
+        }
+    )
+    | _SUSE_IDS
 )
 
 #: Chromium's shared-library dependencies as rpm package names.
@@ -109,18 +125,54 @@ _RPM_CHROMIUM_PACKAGES: tuple[str, ...] = (
 
 #: Remedy for the apt family. Deliberately not a package list: Playwright installs
 #: its own, correct, per-version set there, and a copy here would go stale against
-#: the CLI the user actually has.
-_APT_DEPS_COMMAND = "sudo npx playwright install-deps chromium"
+#: the CLI the user actually has. ``install-deps`` takes the engine name, so the
+#: command is completed per engine and never claims Chromium's set fixes Firefox
+#: or WebKit. Privilege elevation is composed separately by :func:`_sudo_prefix`
+#: so minimal root containers do not need a ``sudo`` binary.
+_APT_DEPS_COMMAND = "npx playwright install-deps {engine}"
 
-#: Remedy for the rpm family, completed with :data:`_RPM_CHROMIUM_PACKAGES`.
-_DNF_DEPS_COMMAND_PREFIX = "sudo dnf install -y "
+#: Remedy prefix for the rpm family, completed with :data:`_RPM_CHROMIUM_PACKAGES`.
+#: ``{manager}`` is filled with whichever supported manager this host actually
+#: has -- see :func:`_rpm_package_manager` -- because half the rpm family does
+#: not carry ``dnf``, and a hardcoded manager fails on its own first argument
+#: exactly the way the module docstring warns about. Privilege elevation is
+#: composed separately by :func:`_sudo_prefix`.
+_RPM_DEPS_COMMAND_PREFIX = "{manager} install -y "
 
 #: What a blocked operator is told. One sentence of cause, then the command, so the
 #: actionable part is last and survives being appended after a truncated stderr.
 _MISSING_DEPS_HINT = (
-    "The browser needs OS libraries that only root can install. "
-    "Run this yourself, then retry the install:\n{command}"
+    "The {title} browser needs OS libraries that only root can install. "
+    "Run this yourself, then retry the download:\n{command}"
 )
+
+#: What an rpm-family operator is told for an engine this module has no verified
+#: package list for. It names the engine and points at the library names
+#: Playwright printed above it, rather than offering Chromium's list as a fix.
+_UNLISTED_ENGINE_HINT = (
+    "The {title} browser needs OS libraries that only root can install. Kiro Crew "
+    "has no verified package list for {title} on this distribution: install the "
+    "libraries Playwright names above with your package manager, then retry the "
+    "download."
+)
+
+#: Engines whose rpm package set is :data:`_RPM_CHROMIUM_PACKAGES`.
+_RPM_LISTED_ENGINES = frozenset({"chromium"})
+
+#: Display names for the hint text. The engine argument is already allowlisted
+#: by the caller; an unlisted value falls back to itself.
+_ENGINE_TITLES = {"chromium": "Chromium", "firefox": "Firefox", "webkit": "WebKit"}
+
+
+def _sudo_prefix() -> str:
+    """Use ``sudo`` only when the host actually provides it.
+
+    A host without ``sudo`` is either already root, where no prefix is needed,
+    or unprivileged, where no command this module can compose can elevate it. In
+    the latter case a bare command's permission error is the truthful remedy;
+    failing first on a nonexistent ``sudo`` token is not.
+    """
+    return "sudo " if shutil.which("sudo") else ""
 
 
 def _os_release_ids() -> set[str]:
@@ -181,35 +233,84 @@ def with_deps_supported() -> bool:
     return linux_family() == FAMILY_DEBIAN
 
 
-def manual_deps_command() -> str | None:
-    """The command the operator can run with root to install the OS libraries.
+def _rpm_package_manager() -> str | None:
+    """The supported rpm-family manager for this host, or ``None``.
+
+    Lineage first, then the probe. A SUSE host (:data:`_SUSE_IDS` in its
+    os-release tokens) is answered ``None`` outright: its packages are named
+    differently, so a command completed from this module's list would fail on
+    its package list instead of its first argument -- the same defect the probe
+    exists to remove, wearing a different hat -- and that stays true even when
+    ``dnf`` or ``yum`` is installed there from SUSE's own repos. The caller
+    falls back to the silence the :func:`manual_deps_command` docstring
+    prescribes.
+
+    Everyone else in the family is probed in a deterministic order: ``dnf``
+    (the current generation -- Fedora, RHEL/CentOS 8+, Amazon Linux 2023), then
+    ``yum`` (the older one -- Amazon Linux 2, 7-era RHEL/CentOS), then
+    ``microdnf`` (minimal RHEL/UBI images, which ship it exclusively). All
+    three take the same rpm package names and the same ``install -y`` syntax,
+    so :data:`_RPM_CHROMIUM_PACKAGES` completes any of them; only the manager
+    token differs. The probe is a ``PATH`` stat, not a spawn -- this module
+    still never runs a package manager.
+    """
+    if _os_release_ids() & _SUSE_IDS:
+        return None
+    for manager in ("dnf", "yum", "microdnf"):
+        if shutil.which(manager):
+            return manager
+    return None
+
+
+def manual_deps_command(engine: str = "chromium") -> str | None:
+    """The command the operator can run with root to install *engine*'s OS libraries.
 
     ``None`` off Linux, where the browser download alone is sufficient and there
     is nothing to install. On an unknown Linux the return is also ``None``: a
     guessed package manager is worse than silence, because a command that fails
     on its own first argument reads as the product being broken rather than as
-    the host being unrecognized.
+    the host being unrecognized. The same rule governs the rpm family's SUSE
+    side (whose packages this module's list cannot name), any rpm host with no
+    supported manager on ``PATH``, and every engine other than Chromium on the
+    rpm family (:data:`_RPM_LISTED_ENGINES`): no verified command can be
+    composed, so none is -- see :func:`_rpm_package_manager`.
     """
     family = linux_family()
     if family == FAMILY_DEBIAN:
-        return _APT_DEPS_COMMAND
+        return _sudo_prefix() + _APT_DEPS_COMMAND.format(engine=engine)
     if family == FAMILY_RPM:
-        return _DNF_DEPS_COMMAND_PREFIX + " ".join(_RPM_CHROMIUM_PACKAGES)
+        if engine not in _RPM_LISTED_ENGINES:
+            return None
+        manager = _rpm_package_manager()
+        if manager is None:
+            return None
+        return (
+            _sudo_prefix()
+            + _RPM_DEPS_COMMAND_PREFIX.format(manager=manager)
+            + " ".join(_RPM_CHROMIUM_PACKAGES)
+        )
     return None
 
 
-def missing_deps_hint() -> str:
-    """One line for a failed browser step, or ``""`` when there is nothing to add.
+def missing_deps_hint(engine: str = "chromium") -> str:
+    """One line for a failed *engine* download, or ``""`` when there is nothing to add.
 
     Appended to a step's failure detail rather than raised as its own state: the
     settings panel already shows that detail verbatim, so this turns an opaque
-    package-manager refusal into the command that resolves it without adding a
+    host-validation failure into the command that resolves it without adding a
     surface to the UI or a string to the translation catalogs.
+
+    An rpm-family host downloading an engine with no verified package list gets
+    an engine-named manual instruction instead of a command
+    (:data:`_UNLISTED_ENGINE_HINT`). An unrecognized host still gets nothing.
     """
-    command = manual_deps_command()
-    if command is None:
-        return ""
-    return _MISSING_DEPS_HINT.format(command=command)
+    title = _ENGINE_TITLES.get(engine, engine)
+    command = manual_deps_command(engine)
+    if command is not None:
+        return _MISSING_DEPS_HINT.format(title=title, command=command)
+    if linux_family() == FAMILY_RPM and engine not in _RPM_LISTED_ENGINES:
+        return _UNLISTED_ENGINE_HINT.format(title=title)
+    return ""
 
 
 #: How Playwright announces that the browser it just downloaded cannot run.

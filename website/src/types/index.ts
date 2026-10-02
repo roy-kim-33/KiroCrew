@@ -4,10 +4,11 @@ export interface StatusData {
   sessions: number
   messages: number
   /**
-   * `null` means UNKNOWN — the WS pusher's count refresh has not succeeded
-   * yet (e.g. the lesson store is failing). StatCard renders null as a
-   * loading skeleton; publishing 0 instead would assert an authoritative
-   * false zero (issue #7204). HTTP/SSE paths always send numbers.
+   * `null` means UNKNOWN — the shared count cache has not refreshed
+   * successfully yet (e.g. the lesson store is failing). StatCard renders null
+   * as a loading skeleton; publishing 0 instead would assert an authoritative
+   * false zero (issue #7204). All three transports (WS push, /api/status, SSE)
+   * read the same cache and may send null.
    */
   cron_jobs: number | null
   subagents: number
@@ -75,6 +76,13 @@ export interface StatusData {
   update_managed_by?: string
   update_can_arm?: boolean
   /**
+   * What an available update leads to on this install: `install` (with the
+   * auto-update switch on), `notify` (the switch cannot install here),
+   * `mandatory` (a policy floor installs it regardless), or `unknown` before
+   * the gateway first derives it. The update loop acts on the same answer.
+   */
+  update_auto_effect?: 'install' | 'notify' | 'mandatory' | 'unknown'
+  /**
    * Commit distance from a git checkout's upstream, both directions. Diverged
    * (both > 0) reports `update_available: false` exactly like a current
    * checkout — the destructive apply paths must never be offered local
@@ -139,6 +147,14 @@ export interface StatusData {
   yolo_duration?: '30m' | '1h' | '6h' | '12h' | '24h' | 'until_shutdown'
   /** Whether enterprise governance currently allows the until_shutdown option. */
   yolo_until_shutdown_permitted?: boolean
+  /** Auto-approve modes forbidden by the `approval_modes` policy scope. Today the
+   * scope governs `yolo` only, so this is `['yolo']` or empty; `normal`, `trust`
+   * and `trust_reads` are non-deniable and never appear. The approval-mode picker
+   * HIDES each named mode, except one still selected when the policy lands — that
+   * row stays visible and disabled, so the button label always has a matching row.
+   * Absent/empty means every mode is selectable. List-driven so widening the
+   * scope's vocabulary needs no type change. */
+  disabled_approval_modes?: string[]
   no_crons?: boolean
   /** True when the gateway has a live Slack (Socket Mode) connection. */
   slack_connected?: boolean
@@ -158,7 +174,7 @@ export interface StatusData {
    * AMBIGUOUS by construction: it is what an unconfigured channel and a
    * configured one that never started both look like. Nothing in this payload
    * separates them — each channel's own config endpoint reports `configured`,
-   * which is what Settings > Channels reads.
+   * which is what Settings > Messaging Channels reads.
    */
   channels?: Record<string, { connected: boolean; error: string }>
   /** Governance enforcement health. */
@@ -177,6 +193,8 @@ export interface UpdateCheckResult {
   mode?: string
   can_download?: boolean
   can_apply?: boolean
+  /** This install can use the nonce-backed host approval flow. */
+  can_arm?: boolean
   requires_restart?: boolean
   channel?: string
   latest_version?: string
@@ -384,6 +402,8 @@ export interface SessionTrashResult {
 }
 
 export interface CronJob {
+  member_id?: string
+  memory_store?: string
   id: string; name: string; message: string
   enabled: boolean; schedule: string; last_status: string
   cron_expr?: string | null; every?: number | null; every_secs?: number | null
@@ -396,13 +416,31 @@ export interface CronJob {
   /** When true, this cron's runs do not appear as a chat session in the active
    * session list (results still go to Slack/notifications + History). Default false. */
   hide_in_chat?: boolean
+  /** When true, omit optional saved context and prior session history. V1 also
+   * skips its memory, lessons, steering and skills injection; member V2 retains
+   * its complete essential guidance and protected identity. Default false. */
+  minimal_context?: boolean
   last_run_ts?: number; next_run_ts?: number | null; has_result?: boolean; has_slot?: boolean
+  /** Retry telemetry for the LAST completed run: how many transient-backend
+   *  retries it took (0 = none needed) and when that run finished. Absent on
+   *  an older gateway or a job that has never run. */
+  last_retry_count?: number
+  /** The `last_run_ts` `last_retry_count` describes; a mismatch means the count
+   *  belongs to an earlier run (a cancelled run advances `last_run_ts` only). */
+  last_retry_run_ts?: number
   /** IANA timezone the cron expression's hour/minute fields are stored in.
    * Absent / null for legacy jobs created without an explicit TZ — treat as UTC. */
   timezone?: string | null
   skip_dates?: string[] | null
   script?: string | null; command?: string | null; last_result?: string | null; last_error?: string | null
   is_running?: boolean; running_since?: number | null
+  /** The installed app that owns this job, or null/absent for a person-owned
+   * one. Host-derived from the job's `created_by` stamp, which an app never
+   * supplies, so it cannot be used to claim another app's jobs. Absent on an
+   * older gateway. */
+  app?: string | null
+  /** True only when the USER paused the job; execution never sets it. */
+  user_paused?: boolean
   /** Operator-granted vault secrets injected into a script/command job's env at
    * fire time: env-var name -> vault secret NAME (values never leave the vault).
    * Absent/null when the job holds no grant. */
@@ -413,15 +451,132 @@ export interface CronJob {
   secret_env_pending?: Record<string, string> | null
   secret_env_pending_ts?: number | null
   folder_id?: string
+  /** Sidebar chat folder this job's `cron-{id}` tab is filed into, or ""/absent
+   *  for a job that is not filed. Persistent jobs only: a stateless job has no
+   *  job-wide tab, and the backend refuses the pair at save time. A different
+   *  tree from `folder_id` directly above, which groups this job's ROW on the
+   *  Schedule page — the two are never read off each other. */
+  chat_folder_id?: string
+  /** False for a job that runs on a fresh session every fire. The form does not
+   *  edit it; it only reads it to disable the chat-folder picker. */
+  persistent_session?: boolean
   /** Chat session that owns this job — ownership decides chat-side reachability
    * (cron_list only lists a session its own jobs). Null for an ownerless job,
    * which is invisible to every chat session and manageable only from the
    * Schedule page or the CLI. */
   session_key?: string | null
+  /** Schedule-page template preset id this job was seeded from (e.g.
+   * "error-digest"), or null/absent for a blank create or any non-dashboard
+   * create surface. Compared against the live SCHEDULE_PRESETS catalog on the
+   * Schedule page to hint when the source template's prompt has since changed. */
+  source_preset?: string | null
+  /** The source template's prompt text as it was when this job was saved. The
+   * Schedule page compares THIS against the live template prompt (did the
+   * template move?), never the job's current message (which the user may have
+   * edited), so the "template updated" hint is attributable. Null/absent when
+   * the job carries no template lineage. */
+  source_template_prompt?: string | null
 }
 
 export interface Lesson {
   rule: string; category: string; ts: string
+  /** The `DELETE /api/lessons` selector that names exactly this row. A lesson's
+   *  identity is `(rule, repo_scope)`, so two same-rule rows in two scopes are
+   *  two lessons: `""` is the global row, a fragment is that scope's row, and
+   *  `null` is a row whose stored scope is unusable -- send NO selector for it,
+   *  the unselective delete is the only path that reaches such a row. */
+  repo_scope?: string | null
+  /** Which JSONL file the row was read from, when the list is the JSONL union of
+   *  the global file and the active workspace's. `DELETE /api/lessons` defaults to
+   *  the global file, so a workspace row's delete must carry these back or it
+   *  removes a same-text global row and leaves this one. Absent on vector rows,
+   *  where the delete reaches the store whatever `scope` says. */
+  scope?: 'global' | 'workspace'
+  workspace?: string
+}
+
+/** One row of `GET /api/memory/stores` — a declared memory store.
+ *
+ *  Every count is BEST-EFFORT. A store whose file is missing or unreadable
+ *  answers `exists: false` with null counts instead of failing the listing, so
+ *  one damaged silo cannot hide every healthy one from the picker. `null`
+ *  therefore means "not known" and must never be rendered as zero.
+ */
+export interface MemoryStoreSummary {
+  /** Declared name. `'default'` addresses the global store. */
+  name: string
+  owner_member?: string
+  /** The owner's validated avatar override; use owner_member as its exact seed. */
+  owner_avatar?: unknown
+  memory_version?: number | null
+  is_default: boolean
+  /** `'v1'` is the shared schema every install starts on; `'crew'` is the
+   *  faceted per-silo schema. Typed open so a lineage added later still
+   *  renders instead of falling through a closed union. */
+  lineage: 'v1' | 'crew' | string
+  exists: boolean
+  semantic_count: number | null
+  episodic_count: number | null
+  lessons_count: number | null
+  /** Whether carve facets apply. False on the v1 lineage, whose rows carry no
+   *  facet columns at all — which is a different answer from "no rows". */
+  facets_supported: boolean
+  backup_count: number | null
+  /** ISO-8601 UTC, or null when the store has never been backed up. */
+  newest_backup: string | null
+}
+
+/** One row of `GET /api/memory/retired` — an episode a semantic write superseded.
+ *
+ *  Nothing hard-deletes an episode, so the text survives and the row can be put
+ *  back. `retired_times` counts retirements rather than rows, because an episode
+ *  can be retired, restored and retired again.
+ */
+export interface RetiredMemory {
+  id: string
+  text: string
+  /** Key of the semantic entry that superseded it; empty when unrecorded. */
+  superseded_by?: string
+  retired_times?: number
+  /** ISO-8601 stamp of the MOST RECENT retirement. */
+  ts?: string
+}
+
+/** One row of `GET /api/memory/backups`.
+ *
+ *  `name` is the only handle a restore takes. The route returns no filesystem
+ *  path on purpose: that would hand the browser the data-home layout.
+ */
+export interface MemoryBackup {
+  name: string
+  size_bytes: number
+  /** ISO-8601 UTC, read from the stamped file name rather than the file's mtime,
+   *  which a copy or a restore rewrites while the name still says when the
+   *  contents were taken. */
+  taken_at: string
+}
+
+/** One row of a carve page (`GET /api/memory/carve` with no `count_by`).
+ *
+ *  The embedding and `value_json` are absent from the wire by design, so a
+ *  carve hands back a partition rather than a vector.
+ */
+export interface MemoryCarveEntry {
+  id: string
+  kind: string
+  key?: string
+  text?: string
+  tags?: string
+  importance?: number
+  confidence?: number
+  source?: string
+  created_at?: string
+  updated_at?: string
+  scope?: string
+  surface?: string
+  crew?: string
+  session_key?: string
+  derived_from?: string
 }
 
 export interface Skill {
@@ -610,10 +765,18 @@ export interface DiscoveredMcpServer {
   deprecated: boolean
 }
 
+/** Outcome of one provider leg in an MCP discovery search. */
+export interface McpProviderOutcome {
+  name: string
+  status: 'ok' | 'timeout' | 'error'
+}
+
 /** Response from GET /api/mcp/discover */
 export interface McpDiscoverResponse {
   results: DiscoveredMcpServer[]
   providers: string[]
+  /** Additive for compatibility with gateways that predate outcome reporting. */
+  provider_outcomes?: McpProviderOutcome[]
 }
 
 /** Install-plan preview inside the discover detail response. */
@@ -674,6 +837,11 @@ export interface McpScopePresence {
   [scope: string]: boolean
 }
 
+export interface McpTempRefusal {
+  key: string; path: string
+  cause: 'sealed' | 'unclassifiable' | 'check-failed'
+}
+
 export interface McpServer {
   name: string; command: string; args?: string[]
   url?: string
@@ -696,12 +864,31 @@ export interface McpServer {
    *  alongside `authChallenge`; absent is "unknown", which is why the sign-in
    *  wording is gated on an explicit `false`. */
   authGrantPresent?: boolean
+  /** Spec-declared temp keys the probe refused (path already redacted); the
+   *  probe ran with the managed temp instead. Absent when nothing was refused. */
+  tempRefusals?: McpTempRefusal[]
   /** Optional status-enrichment fields supplied by newer runtimes. */
   accountLabel?: string
   connectedSince?: string
   /** True when the entry lives in KiroCrew's own mcp.json — the scope the
    *  Edit JSON action reads and writes (consent-disabled rows included). */
   kirocrewManaged?: boolean
+  /** Which config switched the row off, from the backend — never inferred from
+   *  `enabled` + `kirocrewManaged`. `kirocrew`: a disable in Kiro Crew's own
+   *  store, which the Kiro Crew scope badge + Apply lifts (the consent step).
+   *  `shared`: a disable in a config this panel does not write for enable (the
+   *  shared Kiro MCP config the IDE edits, or a provider global), so the row is
+   *  inert here; a row disabled in both reads `shared`. `null` when enabled. */
+  disabledIn?: 'shared' | 'kirocrew' | null
+  /** The file to edit to re-enable a `shared` row, home collapsed to `~`, when
+   *  the backend can name it; `null` when it cannot. */
+  disabledInFile?: string | null
+  /** WHY the row is off, when the switch is not the honest story: `invalid`
+   *  means the config's `disabled` is not a boolean (`"false"`, `1`, `null`) and
+   *  the backend read it fail-closed -- an invalid value never launches a
+   *  server -- so the fix is to repair the value where it sits, not to flip a
+   *  switch. `null` when enabled or when some config really says `true`. */
+  disabledReason?: 'invalid' | null
   /** Consecutive failed probes on record. Absent means none — a healthy server
    *  carries neither this nor `quarantined`. */
   probeFailures?: number
@@ -736,6 +923,9 @@ export interface TodoTask {
   text: string
   /** kiro-cli's todo model is a plain boolean — there is no in-progress state. */
   completed: boolean
+  /** True while a person's click holds this row's state and the agent has not
+   * yet confirmed it in its own list. Absent on rows the agent itself set. */
+  person?: boolean
 }
 
 /**
@@ -773,6 +963,15 @@ export interface TodoList {
 export interface McpSessionReport {
   /** Server names Kiro Crew put on the wire for this session. */
   configured: string[]
+  /**
+   * Agent-spec `@server` tool refs that named no server this session receives.
+   *
+   * A different claim from every bucket below: those say what a *configured*
+   * server reported, this says the spec asked for one that was never
+   * configured — so it has no row here to be missing from. Optional because a
+   * gateway from before the guard shipped sends no such key.
+   */
+  unresolved_refs?: string[]
   /** Reported initialized. */
   ready: string[]
   /** Reported a startup failure. */
@@ -786,7 +985,17 @@ export interface McpSessionReport {
 export interface SessionLink {
   channel: string
   label: string
+  /** Redacted display tail of the conversation id — never the id, never a key. */
   target: string
+  /**
+   * Opaque identity of the whole binding (channel, full conversation id, thread),
+   * minted server-side. An unlink names it, and the server refuses a row whose
+   * binding has since been replaced — `target` alone cannot tell a Slack thread
+   * from its same-channel replacement. Optional for the same reason as `paused`:
+   * a cached `slots` payload from before this field shipped has none, and a
+   * row sent without it is refused as stale rather than unlinking anything.
+   */
+  binding?: string
   /**
    * `origin` — the conversation the session started on.
    * `out`    — dashboard replies are mirrored there (one-way, from `!link`).
@@ -799,6 +1008,21 @@ export interface SessionLink {
    * `channel` alone does not identify a row; pair it with origin-ness.
    */
   direction: 'origin' | 'out' | 'both'
+  /**
+   * Messages sent in that conversation land in THIS session. The server's
+   * statement of inbound routing, per row, because it is not readable from the
+   * other fields: a Slack thread is `out` (Slack routes replies through its own
+   * thread index, not the mirror's inbound marker) yet a reply there resumes
+   * this session; a `both` mirror routes inbound by that marker; a one-way
+   * `out` mirror only receives replies; the conversation a session was born in
+   * is where its turns come from. What a sever destroys differs between a row
+   * that drives the session and one that does not, so the menu's sub-lines
+   * read this rather than inferring it from `direction` or the channel name —
+   * the inference is wrong for a paused Slack row. Optional for the same
+   * reason as `binding`: a cached `slots` payload from before this field
+   * shipped has none, and such a row reads as not driving until the next push.
+   */
+  drives_session?: boolean
   live: boolean
   /**
    * The user disconnected this channel: turn output stops flowing there, but the
@@ -857,6 +1081,11 @@ export interface RemoteCrewCapabilities {
 }
 
 export interface ChatSlot {
+  /** Which namespace `agent` was chosen in: a configured member, a shared
+   *  provider template, or "" when the choice was made by name alone or came
+   *  back from history. Display provenance for the picker's selected row; the
+   *  backend never reads it as authority. */
+  agent_kind?: 'member' | 'template' | ''
   /** The agent that will actually answer, when it is NOT the requested `agent`;
    *  "" / absent means nothing to report. The backend stores `agent` verbatim
    *  (the user's intent) and reports the divergence here instead of rewriting it,
@@ -872,6 +1101,22 @@ export interface ChatSlot {
    *  the absence of an answer, never a denial. DISPLAY only — the pin is
    *  deliberately kept when withheld, so this must not drive a write. */
   model_withheld?: boolean | null
+  /** Whether this session's turns ask Jev which model tier to run on -- the chat
+   *  picker's `Auto (Jev)` entry (`lib/jevRoute.ts`, `decisions/points/model_route.py`).
+   *
+   *  Shipped on every slot, so "the owner picked a model by hand" is a positive
+   *  value rather than an absent key. Unlike `model_withheld` and `served_model`
+   *  this IS the owner's own choice, so it drives the picker's highlight: a routed
+   *  slot stores `model: 'auto'`, and highlighting the Auto row would name a
+   *  behaviour the session does not have. */
+  jev_route?: boolean
+  /** The model id the live session actually resolved to; `''`/absent when not
+   *  known. A slot with no pin — or one whose pin was withheld — runs on the
+   *  backend's own choice, which the pin cannot name, so this is what lets a
+   *  chip say the model instead of `auto`. DISPLAY only, like
+   *  `model_withheld`: it describes the session, so it must not drive a
+   *  write. */
+  served_model?: string
   /** Remote-execution binding. `executor` is "local" for an ordinary session and
    *  "remote" for one whose turns run on a connected crew; `instance_id` names
    *  that crew. The backend ships BOTH on every slot so "runs locally" is a
@@ -881,7 +1126,23 @@ export interface ChatSlot {
    *  inside a request routed back through that instance. */
   executor?: 'local' | 'remote'
   instance_id?: string
-  key: string; title?: string; messages: number; running: boolean; stopping?: boolean; pending_approval?: boolean; created?: string; last_ts?: string; last_turn_ts?: string; last_message?: string; agent?: string; model?: string; reasoning_effort?: string; mode?: string; surface?: string; workspace?: string; trust?: boolean; trust_reads?: boolean; folder_id?: string; pinned?: boolean; tags?: string[]; links?: SessionLink[]; slack_linked?: boolean; slack_channel?: string; slack_thread_ts?: string; color_index?: number | null; color_hex?: string | null; memory_mode?: 'persistent' | 'incognito' | 'temporary'; clean_mode?: boolean; project?: string; forked_from?: string | null; source_links?: { provider: SourceProviderId; number: number; url: string; label?: string; repo?: string; ci?: 'running' | 'passed' | 'failed' | null; state?: 'open' | 'draft' | 'merged' | 'closed'; mergeable?: string; mergeStateStatus?: string; kind?: 'change' | 'issue' }[]; source_links_total?: number
+  /** The identity the sidebar renders this row under, resolved by the SERVER.
+   *
+   *  A purely local session is its own key. A remote-bound one — minted on a crew
+   *  or adopted from a peer row — is `<instance_id>:<peer_key>`, the identity the
+   *  peer row already carried. Preserving it across the bind is what makes the row
+   *  the user clicked BECOME the session, rather than a second element appearing
+   *  beside it, and it keeps a `data-session-row` selector stable across the adopt.
+   *
+   *  Absent on an older payload, and absent on a peer row — `sessionRowIdentity`
+   *  falls back to `peer_id` + `key` for those. Never parse it to recover the local
+   *  slot key: read `key`. */
+  row_identity?: string
+  /** Provider session identity when it differs from the dashboard slot key. */
+  linked_session_key?: string
+  /** Prompts held for a later turn on this slot. */
+  queue_depth?: number
+  key: string; title?: string; messages: number; running: boolean; stopping?: boolean; pending_approval?: boolean; created?: string; last_ts?: string; last_turn_ts?: string; last_message?: string; agent?: string; model?: string; reasoning_effort?: string; mode?: string; surface?: string; workspace?: string; trust?: boolean; trust_scope?: string; trust_reads?: boolean; folder_id?: string; pinned?: boolean; tags?: string[]; tags_revision?: string; links?: SessionLink[]; slack_linked?: boolean; slack_channel?: string; slack_thread_ts?: string; color_index?: number | null; color_hex?: string | null; memory_mode?: 'persistent' | 'incognito' | 'temporary'; project?: string; forked_from?: string | null; source_links?: { provider: SourceProviderId; number: number; url: string; label?: string; repo?: string; ci?: 'running' | 'passed' | 'failed' | null; state?: 'open' | 'draft' | 'merged' | 'closed'; mergeable?: string; mergeStateStatus?: string; kind?: 'change' | 'issue'; identity?: string }[]; source_links_total?: number
   /** Provenance bucket from the backend `SlotOrigin` ("user" | "app" | "cron"
    * | "system"; absent/"" for untagged background slots). The session-pulse
    * survey shows only on a "user" slot, so an imported Slack thread, a
@@ -894,6 +1155,17 @@ export interface ChatSlot {
    * DM thread to the worker sessions it drives — the Crew Members drawer
    * filters the live slots on it. */
   created_by?: string
+  /** The session tree's parent edge for this slot, attached to every row by
+   * `_attach_slot_parents`: `{slot, key}`, or null when this slot has no parent.
+   * `slot` is the parent's own citation and `key` names the parent's row IN THIS
+   * payload (bare slot key), or null when the parent is not running or sits on a
+   * cycle.
+   *
+   * Distinct from `created_by`, and both are needed to know whether a slot is a
+   * root: `created_by` is the birth-time edge, written once, while this one
+   * carries the edge an adopt or release moves later. An adopted session has an
+   * empty `created_by` and a parent here. */
+  parent?: { slot: string; key: string | null } | null
   /** Artifact companion binding: slug of the artifact this slot is a companion
    * chat for. Set at slot create and persisted in the history meta line, so the
    * binding survives a gateway restart and a History-page resume. */
@@ -901,7 +1173,7 @@ export interface ChatSlot {
   /** Metadata for kind="webapp" artifacts (deploy state, architecture, costs). */
   webapp_metadata?: WebAppMetadata
   // Board fields
-  has_options?: boolean; options?: string[]; pending_approval_info?: PendingApproval | null; last_activity_ts?: string; waiting_for_input?: boolean; prompt_preview?: string; subagents_running?: boolean; orchestrating?: boolean
+  has_options?: boolean; options_ts?: string; options?: string[]; pending_approval_info?: PendingApproval | null; last_activity_ts?: string; waiting_for_input?: boolean; prompt_preview?: string; subagents_running?: boolean; orchestrating?: boolean
   /** An unanswered question card the turn is parked on, so the row would
    * otherwise read "Thinking…" with nothing able to advance it. Narrower than
    * `waiting_for_input` (true of every finished turn, and therefore no signal)
@@ -914,6 +1186,14 @@ export interface ChatSlot {
   interrupted?: boolean
   // Soft-stop state machine
   stop_state?: 'idle' | 'soft_pending' | 'killing'
+  /** An automatic context compaction holds the session right now. Not a turn,
+   * so `running` stays false while it runs, which is exactly what made it look
+   * like a stall worth pressing Stop on (#14841). The composer shows it and
+   * the Stop button becomes a warning while it is set. */
+  compacting?: boolean
+  /** A cooperative Stop was declined moments ago (compaction); the next press
+   * escalates to the force stop. Read from the same window the backend uses. */
+  stop_declined?: boolean
   /** In-flight `wait` tool sleep, absent when nothing is sleeping. `deadline_ts`
    * is absolute seconds on the BACKEND clock (Date.now() / 1000 territory), so
    * the transcript can count down against it and survive a page reload;
@@ -1085,16 +1365,36 @@ export interface PullRequestSource {
 }
 
 export interface ChatFolder {
-  id: string; name: string; collapsed?: boolean; order: number; parent_id?: string; color?: string; default_agent?: string; project_dir?: string; hidden?: boolean; history_count?: number
+  id: string; name: string; collapsed?: boolean; order: number; parent_id?: string; color?: string; icon?: string; default_agent?: string; project_dir?: string; hidden?: boolean; history_count?: number
+  /** Epoch seconds the folder was created, written by every folder creator since
+   *  the sidebar's `created` sort existed. Absent on a row from before that; such
+   *  a row sorts as older than every stamped one. Read only through
+   *  `folderComparator('created')`, which mirrors the Python reader. */
+  created_at?: number
   /** Tag ids (from the tag vocabulary) copied onto every NEW chat filed into
    *  this folder. Absent = no tags, mirroring the optional `color`. */
   tags?: string[]
+  /** Extra steering directories loaded, in addition to the global and project
+   *  steering, for every chat whose folder is in this folder's subtree.
+   *  ACCUMULATIVE up the parent_id chain (unlike `project_dir`, which is
+   *  nearest-wins). Absent = none, mirroring the optional `tags`. */
+  steering_dirs?: string[]
+  /** Principal that owns the folder: an app's name, `member:<store>` for a
+   *  crew member, absent/empty for the person. Folder steering from an
+   *  ancestor owned by ANOTHER principal is never delivered to this folder's
+   *  chats, so the inherited list filters on it. */
+  owner_app?: string
   /** Channel namespace when this folder was created by per-channel session filing (e.g. 'discord'). */
   channel?: string
 }
 
+export type AgentTagPolicy = 'none' | 'add-only' | 'add-remove'
+
 export interface ChatTag {
   id: string; name: string; color: string; order: number; status?: boolean
+  agent?: AgentTagPolicy
+  agent_provenanced?: boolean
+  agent_store_degraded?: boolean
 }
 
 export type TagColumnMode = 'any' | 'all' | 'none'
@@ -1121,13 +1421,36 @@ export interface ChatMessage {
   /** Structured metadata for role-specific data (e.g. tool_input for permission messages). */
   meta?: Record<string, unknown>
   /** Regenerated variants of an assistant message (most recent last). */
-  variants?: { content: string; ts?: string }[]
+  variants?: { content: string; ts?: string; blocked_links?: unknown; redactions?: unknown }[]
   /** Which variant index is currently active. */
   variant_idx?: number
   /** Counter for consecutive identical tool message deduplication. */
   _toolCount?: number
   /** Message kind discriminator for special message types (e.g. 'stop_event'). */
   kind?: string
+  /** On a `streaming` row of a slot snapshot: the newest chunk seq the server
+   *  folded into it. The client seeds its replay guard (`lastChunkSeq`) from it
+   *  so a live chunk that races the snapshot is not appended a second time.
+   *  Absent from an older gateway, which means "apply every chunk as before". */
+  seq?: number
+  /** Gateway process generation that numbered `seq` (folded snapshot rows). */
+  gen?: string
+  /** One skill-selection decision the gateway stamped on the row that ends the
+   *  turn, when the Decisions (Jev) seam answered for it. Typed `unknown`
+   *  because the shape is validated at the read, by
+   *  `pages/chat/decisionRecord.ts` — the strip draws nothing for a record it
+   *  cannot check. The gateway stamps it under `meta` on both doors, and this
+   *  top-level spelling is accepted as well, the split `kind` above has too. */
+  decisions_strip?: unknown
+  /** One risk annotation the gateway stamped on a TOOL row when the Decisions
+   *  (Jev) seam answered `tool.risk` for that call. Typed `unknown` because the
+   *  shape is validated at the read, by `pages/chat/toolRiskRecord.ts` — the
+   *  badge draws nothing for a record it cannot check, and nothing for the `safe`
+   *  tier. An ANNOTATION: the permission decision was taken without it, so a
+   *  record never means the call was stopped or altered. Stamped under `meta` on
+   *  both doors; this top-level spelling is accepted too, as `decisions_strip`
+   *  and the split `kind` above are. */
+  decisions_tool_risk?: unknown
 }
 
 export interface SubagentActivity {
@@ -1150,7 +1473,16 @@ export interface SubagentActivity {
   childSession?: string
   status: 'pending' | 'running' | 'tool' | 'done' | 'error' | 'stopped'
   streaming: string; lastTool: string
-  startedAt: number; elapsed: number; error?: string
+  startedAt: number; elapsed: number; credits?: number; error?: string
+  /** True when `startedAt` was ASSUMED rather than observed, which is the case
+   *  for an entry minted by `upsertSlotSub` from an incremental frame: that frame
+   *  carries no start time, so the entry records its arrival instant. The agent
+   *  may already have been running for minutes, so a row MUST NOT render an
+   *  elapsed figure derived from it -- a card reading "3s" for a five-minute run
+   *  is the two-numbers-disagree confusion the idle row exists to remove. Cleared
+   *  by any frame that supplies real timing: a `subagent_snapshot` replay carries
+   *  `started`, and `subagent_done` carries `elapsed`. */
+  startedAtAssumed?: boolean
   toolCount?: number      // observed tool calls (incl. auto-approved) — running-card progress
   stalled?: boolean       // reaper flagged this subagent as idle/stalled
   /** Seconds of no stream activity measured when the reaper raised `stalled`
@@ -1173,12 +1505,25 @@ export interface SubagentActivity {
   result?: string
 }
 
+/** Where `clampToolOutput` (wire.ts in store/chat) removed the middle of a tool
+ *  payload: the stored string is `head + '\n' + tail`, `at` is the offset of
+ *  the tail (right after that newline) and `count` is how many characters were
+ *  dropped between the two. Renderers put the localized marker there at view
+ *  time, so the store never holds a rendered string and the marker follows a
+ *  later language switch. */
+export interface ToolPayloadCut {
+  at: number
+  count: number
+}
+
 export interface ToolActivity {
   type: string
-  text: string          // reasoning text or tool name
+  text: string          // tool name (or approval / activity label)
   purpose?: string      // tool purpose
   input?: string        // tool input (commands, file content, etc.)
   output?: string       // tool output (stdout, results, etc.)
+  input_cut?: ToolPayloadCut   // set only when `input` was clamped
+  output_cut?: ToolPayloadCut  // set only when `output` was clamped
   ts: number
   execution_started_at?: number // when execution began (after approval); survives remount
   auto?: boolean        // auto-approved tool call
@@ -1188,6 +1533,8 @@ export interface ToolActivity {
   rejected?: boolean     // true when approval was rejected
   kind?: string          // ACP tool kind; execute is the legacy shell signal
   is_shell?: boolean     // shell tools can expose an indeterminate live status
+  tool_name?: string     // trusted programmatic tool name (_meta.kiro.toolName), when sent
+  mcp_server?: string    // MCP server that served the call (_meta.kiro.mcpServerName), when sent
 }
 
 /** Parsed content block produced by the block assembler. */
@@ -1228,6 +1575,9 @@ export interface NotificationChannel {
 }
 
 export interface PendingApproval {
+  origin?: 'native' | 'coordinator'
+  request_mid?: string
+  tool_purpose?: string
   tool: string
   tool_input: string
   tool_kind: string
@@ -1250,8 +1600,11 @@ export interface TaskDetail {
 export type RunStatus = 'planning' | 'planned' | 'running' | 'completed' | 'failed' | 'cancelled' | 'paused' | 'pausing';
 export interface ProjectRun {
   task_id: string; name?: string; running: boolean; status: RunStatus
-  steps: number; completed: number; failed: number; skipped: number
-  current_step: number; spec: string; spec_name: string; error: string
+  /** Total step count. Named for the wire: `build_status` emits `tasks`, and
+   *  `steps`/`current_step` — the names this interface used to declare — are
+   *  sent by no producer, so both read `undefined` on every row. */
+  tasks: number; completed: number; failed: number; skipped: number
+  current_task: number; spec: string; spec_name: string; error: string
   tokens_used: number; replan_count: number; task_details: TaskDetail[]
   started_at: number; finished_at: number
   work_dir: string; branch_name: string
@@ -1290,6 +1643,18 @@ export interface ArtifactPublication {
   published_by: string
   /** Conflict / sync-failure message surfaced to the UI; empty when healthy. */
   last_error: string
+  /** Publish SUCCEEDED but the link is not usable yet (e.g. CloudFront still
+   *  rolling out). NOT an error — rendered as a neutral/warn line beside the
+   *  link, never in the danger surface `last_error` drives. Empty when the link
+   *  is already reachable. */
+  notice: string
+  /** Machine discriminator for `notice`, so the UI can pick the right copy
+   *  instead of assuming every notice is "still rolling out". One of
+   *  `"rolling_out"` | `"distribution_disabled"` | `"unknown"`, or empty when
+   *  there is no notice. The frontend selects its string from this and falls
+   *  back to a generic (no time promise) line for an unrecognised value.
+   *  Optional so an older gateway that omits it reads as "". */
+  notice_code?: string
 }
 
 /** A publishing provider's self-described capabilities for a given artifact kind,
@@ -1303,6 +1668,15 @@ export interface PublishProviderDescriptor {
   /** False => tooling not installed yet; installs automatically on first publish.
    *  Optional: older gateways omit it (treat as available). */
   available?: boolean
+  /** The provider's own remedy text for `available: false` -- which action makes it
+   *  available. Optional: older gateways omit it, and a row with no hint simply shows
+   *  none rather than inventing one. */
+  install_hint?: string
+  /** False => the published link requires authentication (content is stored privately),
+   *  so the publish flow shows neither the public-exposure warning nor the "publish
+   *  publicly" acknowledgment. Optional: older gateways omit it, and absence means
+   *  reachable -- a missing warning on a public link is the worse mistake. */
+  public_reachable?: boolean
   sharing_model: {
     supports_private: boolean
     supports_shared: boolean

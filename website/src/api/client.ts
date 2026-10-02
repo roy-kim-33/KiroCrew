@@ -1,1200 +1,252 @@
-import { resizeImageForModel, type ResizeInfo } from '../utils/resizeImage'
-import type {
-  AppContributor,
-  ChatSlot,
-  IssueSource,
-  McpApplyChange,
-  PullRequestCheck,
-  PullRequestSource,
-  PullRequestStatusBatch,
-  PublishProviderDescriptor,
-  SessionDoc,
-  SessionInventoryDetail,
-  SessionInventoryList,
-  SessionLaneKey,
-  SessionStorageCleanup,
-  SessionStorageEmptyJob,
-  SessionStorageReport,
-  SessionTrashResult,
-  UpdateCheckResult,
-  WorkflowRunSummary,
-} from '../types'
-import type { RemoteCrewCapabilities } from '../hooks/useRemoteCapabilities'
-import { ApiError, friendlyErrText } from './apiError'
+/**
+ * The dashboard's API client: the `api` singleton and the transport under it.
+ *
+ * This module owns the transport and its auth recovery: the `X-Session-Key`
+ * default, the request helpers, the `j`/`jNullable` parsers that journal every
+ * failure as an `ApiError`, the 403 `X-Auth-Required` silent refresh, the
+ * embedded-pane hand-off, the re-auth banner and the stale-owner prompt. It
+ * installs those helpers as the blessed `apiTransport` at load.
+ *
+ * The endpoints themselves live by domain under `./client/`, one module per
+ * product area, each a `create*Endpoints` factory handed that transport. `api`
+ * is assembled here from their segments, spread in the order the methods have
+ * always had, so it stays one plain object: `vi.spyOn(api, name)` and the
+ * `{ ...mod.api, name: vi.fn() }` mock factories keep working. The wire types
+ * those modules own are re-exported below, so every import path is unchanged.
+ */
+import { installSessionExpiryHandler } from './sessionExpirySignal'
+import { ApiError, friendlyErrText, toApiError } from './apiError'
 import { refreshOnce, __resetRefreshOnceForTests } from './refreshOnce'
 import {
   STALE_OWNER_SESSION_CODE,
   installStaleOwnerHandler,
   noteStaleOwnerResponse,
 } from './staleOwnerSignal'
+import { edgeChallengeMessage, noteEdgeAuthChallenge } from './edgeAuthChallenge'
 import { beginArtifactWrite, endArtifactWrite } from '../lib/artifactWrites'
 import { withDeadline } from '../lib/withDeadline'
-
-/** Deadline for `api.skills`. Measured on one host inside twenty minutes: 0.62s
- *  healthy, then 9.76s, 41.41s, 168.71s for a byte-identical payload. 15s clears
- *  the 9.76s case that still completed and cuts off the pathological ones.
- *  Rationale in the CR description. */
-export const SKILLS_TIMEOUT_MS = 15_000
-
-/** Deadline for `api.slashCommands`. Same value as the `$`-menu's above, for the
- *  same reason and against the same gateway: both menus are composer affordances
- *  whose fetch blocks Enter while it is unsettled, so a divergent bound here
- *  would only be a second number to explain. Rationale in the CR description. */
-export const SLASH_COMMANDS_TIMEOUT_MS = 15_000
 import { installApiTransport } from './apiTransport'
-import type { SessionSummary } from '../types/sessionSummary'
-import { queryClient } from './queryClient'
-import { getStoredConsent } from '../utils/themeConsent'
-import { recordError, parseErrorCode, requestPath } from '../utils/errorReport'
+import { isDeadlineError, queryClient, invalidateAcrossQueryClients } from './queryClient'
+import { recordError, attachReport, parseErrorCode, requestPath } from '../utils/errorReport'
 import { i18nT } from '../i18n/t'
-import { normalizeInstalledApp, normalizeInstalledApps } from '../components/appstore/types'
-import { TAB_ID } from './tabId'
-
-/**
- * Resolve the theme-consent token to transmit for an installed pack's chat.
- *
- * Two-tier consent, wire side: the client does not compute a trust boolean —
- * it just transmits the RAW stored grant (the sha256 the user granted for the
- * persona content they saw). The backend does the content-binding check: it
- * injects the persona only if this token equals sha256 of the persona.md it
- * reads, so a re-install that swaps persona.md (new sha) does not match the
- * stale grant and the never-consented persona is never injected.
- *
- * Installed/custom packs are keyed `custom-<slug>` in colorTheme (useTheme), so
- * slice(7) drops the `custom-` prefix to recover the slug. Returns null (field
- * omitted from the body) when there's nothing transmittable: no colorTheme, a
- * built-in theme, no stored grant, or a legacy `'1'`/`''` token (which must
- * re-prompt, never activate).
- */
-function themeConsentSha(colorTheme?: string): string | null {
-  if (!colorTheme || !colorTheme.startsWith('custom-')) return null
-  const stored = getStoredConsent(colorTheme.slice('custom-'.length))
-  if (stored === null || stored === '' || stored === '1') return null
-  return stored
-}
-
-/** One machine-readable ground for a sharing verdict.
- *
- *  `code` is stable and is what the UI translates. `detail` is verbatim data
- *  from the server or the config (an env name, a capability path, a protocol
- *  version) and is deliberately NOT translated.
- */
-/** Response of POST /api/reveal. When the backend cannot drive a file manager
- *  (a remote or headless session) it degrades to a clipboard copy: `copy` is the
- *  path to write. The caller (`revealOrOpen`) writes the clipboard silently — the
- *  affordance that routed here already promised a copy. */
-type RevealResult = { copy?: string }
-
-export type McpShareReason = {
-  code: string
-  detail: string
-}
-
-export interface WorkflowLineage {
-  workflow_id: string
-  revision: number
-}
-
-export interface WorkflowDefinitionRevision {
-  revision: number
-  source: string
-  created_at: string
-}
-
-export interface WorkflowDefinition {
-  schema_version: number
-  id: string
-  slug: string
-  name: string
-  description: string
-  created_at: string
-  updated_at: string
-  revision: number
-  format: 'python' | 'task-plan'
-  source: string
-  content_hash: string
-  derived_from: WorkflowLineage | null
-  revisions: WorkflowDefinitionRevision[]
-}
-
-export interface WorkflowDefinitionWrite {
-  source: string
-  format?: 'python' | 'task-plan'
-  name?: string
-  description?: string
-  slug?: string
-  derived_from?: WorkflowLineage | null
-}
-/** The gateway's advisory reading of whether a server's backend can be shared.
- *
- *  `strength` is the evidence tier, weakest first: `unknown`, `no_objection`,
- *  `declared`, `disqualified`, `refuted`. Only `declared` sets `recommendShare`,
- *  because finding nothing disqualifying is an absence of evidence rather than
- *  evidence of absence.
- *
- *  The wire object also carries a separate stub recommendation, which is not
- *  declared here: a TS type is structural, so the field costs a reader something
- *  and buys nothing until a component actually renders it.
- */
-export type McpShareRecommendation = {
-  strength: string
-  // Two axes, not one verdict. `recommendStub` is the safe half — Kiro Crew's
-  // stub in the path, backend still 1:1 with the session — while
-  // `recommendShare` is the one that introduces co-tenancy. A bulk action has to
-  // consult whichever one the global sharing switch makes true of a click.
-  recommendStub: boolean
-  recommendShare: boolean
-  reasons: McpShareReason[]
-}
-
-/**
- * Where an operator-requested measurement pass got to.
- *
- * ``running`` is the only field a caller may branch on to decide whether to keep
- * polling: ``done`` and ``total`` are a readout, and both are 0 both before a
- * pass starts and when a pass found nothing to measure. ``error`` names the
- * exception class of a pass that stopped early, because a pass that dies
- * silently is indistinguishable from one that finished with nothing to do.
- */
-export type McpMeasureProgress = {
-  running: boolean
-  // Servers attempted, which is what the progress line advances on.
-  done: number
-  // How many of those produced a verdict. Lower than `done` whenever a pre-flight
-  // could not run, so any claim about the outcome is built from this one.
-  measured: number
-  total: number
-  error?: string
-}
-
-export type McpManagedServer = {
-  name: string
-  stub: boolean            // effective: can_stub AND in_allowlist
-  can_stub: boolean       // stdio AND not denylisted — a property of the server, not a choice
-  in_allowlist: boolean    // present in config mcp_gateway.stub_servers
-  entry_poolable: boolean  // some agent entry sets poolable:true — RETIRED, informational only
-  agents: string[]         // agent configs that declare this server
-  transport: string        // "stdio" (stubbable) or "http" (no stdio pipe to interpose on)
-  denylisted: boolean      // in UNPOOLABLE_SERVERS — can never be pooled
-  // True when stubbing this server cannot produce a SHARED backend anyway: the
-  // rewriter leaves an env-declaring entry unwrapped rather than spawn a pooled
-  // backend without a declared key. Optional for the same reason as
-  // `recommendation` — an older gateway does not send it, and its absence must
-  // read as "no obstacle known", not as an obstacle.
-  pooling_blocked_by_env?: boolean
-  // Optional because the field is only as old as the shareability detector: a
-  // dashboard served from this build can be pointed at an older gateway (Make
-  // Live to an earlier worktree), and a row with no verdict must read as "not
-  // measured" rather than crash the table.
-  recommendation?: McpShareRecommendation
-}
-
-export const SEARCH_MIN_CHARS = 2  // backend session search threshold (must match kiro_crew.history.SEARCH_MIN_CHARS)
-
-/**
- * A Connections provider's approval-URL mint, as the card reads it.
- *
- * `idle` means no mint exists — distinct from `failed`, which is a mint that ran
- * and produced nothing. `oauth_url` is present only while `waiting`, and only
- * while the process holding the URL is alive: the backend reports `expired`
- * rather than serving a URL no redirect can be redeemed against.
- */
-export interface ConnectionMintState {
-  slug: string
-  state: 'idle' | 'minting' | 'waiting' | 'granted' | 'failed' | 'expired'
-  oauth_url?: string
-  reason?: string
-  /** Opaque id of the backend row, unique across gateway restarts as well as
-   *  within one process. Reported so a row can be told apart from its
-   *  successor for the same provider. */
-  token?: string
-}
-
-/**
- * A provider's authorization verdict from GET /api/connections/status.
- *
- * This is the AUTHORIZATION axis only: `grantPresent` says whether kiro-cli
- * holds an OAuth grant. Endpoint reachability is a separate axis carried by the
- * `/api/mcp` server status — the two together are what let the card tell a
- * provider authorized outside the dashboard (grant present, probe answers 401)
- * from one never authorized (no grant, same 401). `connectedSince` is a
- * persisted first-authorization timestamp, present only while a grant exists.
- */
-export interface ConnectionStatus {
-  slug: string
-  status: 'connected' | 'awaiting_consent' | 'not_connected'
-  reason?: string
-  grantPresent: boolean
-  /** True when the grant lookup itself failed, so `grantPresent: false` means
-   *  "could not look" rather than "absent". */
-  grantIndeterminate?: boolean
-  connectedSince?: string
-}
-
-/** Authenticated provider-tool verdict returned by POST /api/connections/test. */
-export interface ConnectionTestResult {
-  schema_version: number
-  slug: string
-  verdict: 'usable' | 'no_tools' | 'failed'
-  code: string
-  toolCount: number
-}
-
-/**
- * A single task-runner plan step as sent to the server. Known fields are
- * typed; the payload is forwarded verbatim, so extra fields are permitted via
- * the index signature.
- */
-export interface PlanStepInput {
-  title?: string
-  description?: string
-  depends_on?: number[]
-  requires_approval?: boolean
-  [key: string]: unknown
-}
-
-/** Final payload resolved by installFromRegistryStream's SSE `done` event. */
-export interface InstallStreamResult {
-  ok?: boolean
-  error?: string
-  /**
-   * Machine-readable failure code. The registry install path checks the
-   * execution gate BEFORE cloning, so a third-party install can be refused with
-   * `app_execution_denied` — and because the stream RESOLVES that refusal (SSE
-   * `done`) instead of rejecting, the code has to travel on the result for the
-   * consent modal to open at all.
-   */
-  code?: string
-  needsClientInstall?: boolean
-  clientInstall?: { shell?: string; postInstall?: string }
-}
-
-
-/**
- * The Playwright CLI browser view, as reported by `GET /api/browser/view` and
- * returned again by `POST /api/browser/view/start`.
- *
- * The CLI serves its own dashboard over loopback HTTP (`show --port`), which
- * already carries the session grid, live screencast, tab bar and full remote
- * mouse/keyboard input — so the dashboard's Browser panel frames that URL rather
- * than assembling a picture from pushed screenshot frames.
- *
- * Three states, and the UI must be able to tell them apart:
- *   • `running`     — `url` and `port` are set; frame it.
- *   • `stopped`     — installed but no view server up; a start is worth offering.
- *   • `unavailable` — it cannot run here at all (CLI not installed, unsupported
- *                     host). `reason` says why, in words meant for a human.
- *
- * `reason` is server-authored prose, so it is rendered VERBATIM and never
- * translated: inventing a catalog key for it would either drop the detail or
- * assert a cause the server did not report. A null `reason` is the caller's cue
- * to fall back to its own generic (translated) copy.
- */
-export interface BrowserInstallData {
-  installed: boolean
-  cli_path: string | null
-  cli_version: string | null
-  node_ok: boolean
-  node_version: string | null
-  browser_ok: boolean
-  installing: boolean
-  last_error: string | null
-  token: boolean
-  /** Per-engine download state, keyed by engine name (chromium/firefox/webkit).
-   *  Optional so an older gateway that predates it degrades to "unknown" rather
-   *  than rendering every engine as missing. */
-  browsers?: Record<string, boolean>
-  /** The OS-appropriate standalone installer command, composed by the gateway
-   *  because only it knows which OS it runs on. Offered when Node blocks the
-   *  in-app install. Optional so an older gateway simply shows nothing extra
-   *  rather than rendering `undefined`. */
-  standalone_install?: string
-}
-
-export interface BrowserViewData {
-  status: 'running' | 'stopped' | 'unavailable'
-  url: string | null
-  port: number | null
-  reason: string | null
-}
-
-/** ADVISORY macOS permission rows. Never a gate — macOS attributes a TCC grant
- * to the responsible parent process, so `missing` can coexist with a working
- * capture, and `unknown` means the probe could not be run. */
-export interface ComputerUsePermissions {
-  accessibility: string
-  screen_recording: string
-  responsible_hint: string
-}
-
-/** Computer-use config as returned by GET /api/computer-use/config.
- *
- * `enabled` comes from the keystone `computer_use.json`, not `config.json`; the
- * numeric fields are the config.json budgets. There is deliberately no
- * `read_only`/governance-lock field — computer use is one operator opt-in with no
- * `computer_use*` governance scope, so nothing can forbid it and there is nothing to
- * grey out. An unsupported platform is the separate `supported: false` branch. */
-export interface ComputerUseConfigData {
-  enabled: boolean
-  supported: boolean
-  platform: string
-  reason: string
-  max_tree_nodes: number
-  max_tree_depth: number
-  text_limit: number
-  attach_screenshot: boolean
-  screenshot_max_px: number
-  screenshot_jpeg_quality: number
-  /** Draw a visible cursor gliding to each real-pointer target. macOS only. */
-  cursor_motion: boolean
-  /** False off macOS, where there is no overlay to draw — the row is hidden. */
-  cursor_motion_supported: boolean
-  allowed_apps: string[]
-  extra_denied_apps: string[]
-  /** Non-empty ONLY when the keystone's policy could not be parsed. The two lists
-   *  above are then empty because they were unreadable — not because no restriction
-   *  is configured — and the panel must be able to tell those apart. The GET
-   *  deliberately still succeeds in that case: a hand-edited keystone used to 500
-   *  this endpoint, which made the only UI that can repair the file unreachable. */
-  policy_error?: string
-  permissions: ComputerUsePermissions
-  limits: Record<string, [number, number]>
-  /** Sessions restarted by the last PUT so kiro-cli re-reads the tool list.
-   *  Only ever non-zero on a save that FLIPPED `enabled` (see the handler);
-   *  absent on GET. */
-  sessions_reset?: number
-}
-
-/** Writable computer-use fields sent to PUT /api/computer-use/config. */
-export interface ComputerUseConfigSave {
-  enabled: boolean
-  max_tree_nodes: number
-  max_tree_depth: number
-  text_limit: number
-  attach_screenshot: boolean
-  screenshot_max_px: number
-  screenshot_jpeg_quality: number
-  cursor_motion: boolean
-  allowed_apps: string[]
-  extra_denied_apps: string[]
-}
-
-/** Slack config as returned by GET /api/slack/config (secrets masked). */
-export interface SlackConfigData {
-  connected: boolean
-  connect_error: string
-  configured: boolean
-  read_only: boolean
-  bot_token_set: boolean
-  app_token_set: boolean
-  bot_token_preview: string
-  app_token_preview: string
-  owner_id: string
-  command: string
-  allowed_enterprise_ids: string[]
-  reactions_enabled: boolean
-  show_thinking: boolean
-  /** Sidebar folder this channel's sessions are filed into ("" = off, the default). */
-  session_folder?: string
-}
-
-/** Writable Slack config fields sent to PUT /api/slack/config. */
-export interface SlackConfigSave {
-  bot_token: string
-  bot_token_clear: boolean
-  app_token: string
-  app_token_clear: boolean
-  owner_id: string
-  command: string
-  allowed_enterprise_ids: string[]
-  reactions_enabled: boolean
-  show_thinking: boolean
-  /** Sidebar folder this channel's sessions are filed into ("" = off, the default). */
-  session_folder?: string
-}
-
-/** Discord config as returned by GET /api/discord/config (secret masked). */
-export interface DiscordConfigData {
-  connected: boolean
-  connect_error: string
-  configured: boolean
-  read_only: boolean
-  bot_token_set: boolean
-  bot_token_preview: string
-  enabled: boolean
-  allowed_user_ids: string[]
-  allowed_thread_ids: string[]
-  /** Shared server channels an approved user may start a turn in. */
-  allowed_channel_ids: string[]
-  /** Promote an allowed-channel message into a fresh public thread. Default on. */
-  auto_thread: boolean
-  soft_threshold_pct: number
-  /** Phase-reaction ladder on the user's own message. Default on. */
-  reactions_enabled: boolean
-  /** Surface the model's reasoning as a Discord subtext note. Default off. */
-  show_thinking: boolean
-  /** Sidebar folder this channel's sessions are filed into ("" = off, the default). */
-  session_folder?: string
-}
-
-/** Telegram config as returned by GET /api/telegram/config (secret masked). */
-export interface TelegramConfigData {
-  connected: boolean
-  connect_error: string
-  configured: boolean
-  read_only: boolean
-  bot_token_set: boolean
-  bot_token_preview: string
-  enabled: boolean
-  allowed_user_ids: string[]
-  soft_threshold_pct: number
-  /** Post the model's reasoning after each answer as a collapsed quote. */
-  show_thinking?: boolean
-  /** Speak each answer as a voice/audio message alongside the text. */
-  voice_replies?: boolean
-  // Forum per-topic config. chat_ids are negative supergroup ids as strings.
-  allow_forum?: boolean
-  allowed_forum_chat_ids?: string[]
-  /** When to answer inside an allow-listed topic: "always" | "mention" | "off". */
-  forum_activation?: string
-  /** Sidebar folder this channel's sessions are filed into ("" = off, the default). */
-  session_folder?: string
-}
-
-/** Writable Discord config fields sent to PUT /api/discord/config. */
-export interface DiscordConfigSave {
-  bot_token: string
-  bot_token_clear: boolean
-  enabled: boolean
-  allowed_user_ids: string[]
-  allowed_thread_ids: string[]
-  allowed_channel_ids: string[]
-  auto_thread: boolean
-  soft_threshold_pct: number
-  reactions_enabled: boolean
-  show_thinking: boolean
-  /** Sidebar folder this channel's sessions are filed into ("" = off, the default). */
-  session_folder?: string
-}
-
-/** Writable Telegram config fields sent to PUT /api/telegram/config. */
-export interface TelegramConfigSave {
-  bot_token: string
-  bot_token_clear: boolean
-  enabled: boolean
-  allowed_user_ids: string[]
-  soft_threshold_pct: number
-  show_thinking?: boolean
-  voice_replies?: boolean
-  allow_forum?: boolean
-  allowed_forum_chat_ids?: string[]
-  forum_activation?: string
-  /** Sidebar folder this channel's sessions are filed into ("" = off, the default). */
-  session_folder?: string
-}
-
-/** WeCom config as returned by GET /api/wecom/config (secrets masked). */
-export interface WeComConfigData {
-  connected: boolean
-  connect_error: string
-  configured: boolean
-  read_only: boolean
-  /** Primary secret slot = WECOM_SECRET. */
-  bot_token_set: boolean
-  bot_token_preview: string
-  /** Second credential slot = WECOM_BOT_ID. */
-  bot_id_set: boolean
-  bot_id_preview: string
-  enabled: boolean
-  allowed_user_ids: string[]
-  /** Explicit opt-in: every org member may DM the bot (allow-list bypassed). */
-  allow_all_users: boolean
-  soft_threshold_pct: number
-  /** Sidebar folder this channel's sessions are filed into ("" = off, the default). */
-  session_folder?: string
-}
-
-/** Writable WeCom config fields sent to PUT /api/wecom/config. */
-export interface WeComConfigSave {
-  bot_token: string
-  bot_token_clear: boolean
-  bot_id: string
-  bot_id_clear: boolean
-  enabled: boolean
-  allowed_user_ids: string[]
-  allow_all_users: boolean
-  soft_threshold_pct: number
-  /** Sidebar folder this channel's sessions are filed into ("" = off, the default). */
-  session_folder?: string
-}
-
-/** Feishu (飞书/Lark) config as returned by GET /api/feishu/config (secrets masked). */
-export interface FeishuConfigData {
-  /** Receiver-thread liveness, not a credential probe — see DashboardState. */
-  connected: boolean
-  connect_error: string
-  configured: boolean
-  read_only: boolean
-  /** Primary secret slot = FEISHU_APP_SECRET. */
-  bot_token_set: boolean
-  bot_token_preview: string
-  /** Second credential slot = FEISHU_APP_ID. */
-  bot_id_set: boolean
-  bot_id_preview: string
-  enabled: boolean
-  /** Stored as feishu.allowed_open_ids; the shared panel's user allow-list. */
-  allowed_user_ids: string[]
-  /** Whether group conversations are served at all (fails closed). */
-  allow_group: boolean
-  allowed_group_ids: string[]
-  soft_threshold_pct: number
-  /** Sidebar folder this channel's sessions are filed into ("" = off, the default). */
-  session_folder?: string
-  /**
-   * Whether lark-oapi (the optional [feishu] extra) is importable by the gateway
-   * process. False means the channel is skipped at boot however complete the
-   * rest of this config is.
-   */
-  sdk_installed?: boolean
-  /** False where a pip install cannot work: bundled app, no pip, PEP 668. */
-  sdk_install_supported?: boolean
-  /** Install command naming the gateway's OWN interpreter; "" when not useful. */
-  sdk_install_command?: string
-}
-
-/** Writable Feishu config fields sent to PUT /api/feishu/config. */
-export interface FeishuConfigSave {
-  bot_token: string
-  bot_token_clear: boolean
-  bot_id: string
-  bot_id_clear: boolean
-  enabled: boolean
-  allowed_user_ids: string[]
-  allow_group: boolean
-  allowed_group_ids: string[]
-  soft_threshold_pct: number
-  /** Sidebar folder this channel's sessions are filed into ("" = off, the default). */
-  session_folder?: string
-}
-
-/** Webex config as returned by GET /api/webex/config (secret masked). */
-export interface WebexConfigData {
-  connected: boolean
-  connect_error: string
-  configured: boolean
-  read_only: boolean
-  bot_token_set: boolean
-  bot_token_preview: string
-  enabled: boolean
-  allowed_emails: string[]
-  /** Answer in group spaces as well as DMs. Off by default: a reply in a space is
-   *  visible to every member, including people not on the email allow-list. */
-  allow_group_rooms: boolean
-  /** Spaces the bot may answer in. Empty = deny all, so the switch alone grants nothing. */
-  allowed_room_ids: string[]
-  /** Reply under the message's own thread when it has one. */
-  reply_in_thread: boolean
-  /** Context % at which the bot suggests /compact instead of auto-compacting. */
-  soft_threshold_pct: number
-  /** Context % at which it force-compacts so the window never overflows. */
-  hard_threshold_pct: number
-  /** Sidebar folder this channel's sessions are filed into ("" = off, the default). */
-  session_folder?: string
-}
-
-/** Writable Webex config fields sent to PUT /api/webex/config. */
-export interface WebexConfigSave {
-  bot_token: string
-  bot_token_clear: boolean
-  enabled: boolean
-  allowed_emails: string[]
-  allow_group_rooms: boolean
-  allowed_room_ids: string[]
-  reply_in_thread: boolean
-  soft_threshold_pct: number
-  hard_threshold_pct: number
-  /** Sidebar folder this channel's sessions are filed into ("" = off, the default). */
-  session_folder?: string
-}
-
-/**
- * iMessage channel status + config, from GET /api/imessage/config.
- *
- * The only channel payload with no credential in it: the transport is the
- * operator's own Messages.app, so there is nothing to mask or rotate.
- */
-export interface IMessageConfigData {
-  connected: boolean
-  connect_error: string
-  configured: boolean
-  read_only: boolean
-  /** False off macOS, where there is no iMessage to reach. */
-  supported: boolean
-  enabled: boolean
-  db_path: string
-  allowed_handles: string[]
-  service: string
-  /** Sidebar folder this channel's sessions are filed into ("" = off, the default). */
-  session_folder?: string
-}
-
-/** Writable iMessage config fields sent to PUT /api/imessage/config. */
-export interface IMessageConfigSave {
-  enabled: boolean
-  db_path: string
-  allowed_handles: string[]
-  service: string
-  /** Sidebar folder this channel's sessions are filed into ("" = off, the default). */
-  session_folder?: string
-}
-
-/** Microsoft Teams channel status + config, from GET /api/teams/config. */export interface TeamsConfigData {
-  connected: boolean
-  connect_error: string
-  configured: boolean
-  read_only: boolean
-  app_id_set: boolean
-  app_password_set: boolean
-  enabled: boolean
-  /** Azure AD tenant id for a single-tenant bot; "" = multi-tenant. Not a secret. */
-  tenant_id: string
-  allowed_emails: string[]
-  /**
-   * Whether PyJWT is importable in the gateway's environment. The inbound Bot
-   * Framework webhook validates a signed JWT, so the channel refuses to start
-   * without it and the panel has to say so — optional because a gateway that
-   * predates the field sends none, and absent must not read as false.
-   */
-  jwt_available?: boolean
-  /** Context percentage at which the channel nudges the user to compact. */
-  soft_threshold_pct?: number
-  /** Context percentage at which the channel compacts without being asked. */
-  hard_threshold_pct?: number
-  /** Sidebar folder this channel's sessions are filed into ("" = off, the default). */
-  session_folder?: string
-}
-
-/** Weixin (iLink personal WeChat) config from GET /api/weixin/config.
- *  There is no credential field: the bot credential is obtained through the QR
- *  login flow and stored server-side, so the client only sees status. */
-export interface WeixinConfigData {
-  connected: boolean
-  connect_error: string
-  configured: boolean
-  read_only: boolean
-  credential_set: boolean
-  enabled: boolean
-  account_id: string
-  dm_policy: string
-  allowed_user_ids: string[]
-  /** Sidebar folder this channel's sessions are filed into ("" = off, the default). */
-  session_folder?: string
-}
-
-/** Writable Teams config fields sent to PUT /api/teams/config. The secret
- *  (app_password) is write-only and stored in .env, never config.json. */
-export interface TeamsConfigSave {
-  app_id: string
-  app_password: string
-  app_password_clear: boolean
-  tenant_id: string
-  enabled: boolean
-  allowed_emails: string[]
-  /**
-   * Context thresholds, as whole percentages in 1..100 with
-   * `hard_threshold_pct >= soft_threshold_pct`. The backend answers 400 with a
-   * machine-readable `code` when the pair violates that, so the panel checks it
-   * client-side first.
-   */
-  soft_threshold_pct: number
-  hard_threshold_pct: number
-  /** Sidebar folder this channel's sessions are filed into ("" = off, the default). */
-  session_folder?: string
-}
-
-/** Writable Weixin config fields sent to PUT /api/weixin/config. */
-export interface WeixinConfigSave {
-  enabled: boolean
-  dm_policy: string
-  allowed_user_ids: string[]
-  disconnect: boolean
-  /** Sidebar folder this channel's sessions are filed into ("" = off, the default). */
-  session_folder?: string
-}
-
-/** One opted-in WhatsApp group, as stored in config and edited in the panel. */
-export interface WhatsAppGroup {
-  /** The group JID (e.g. 1203...@g.us). */
-  jid: string
-  /** Human label shown in the editor (from get_joined_groups or typed in). */
-  name: string
-  /** How the agent participates: only when @-mentioned, when its rules say it
-   *  can help, or off (opted out while kept in the list). */
-  mode: 'mention' | 'rules' | 'off'
-  /** Free-text rules injected when mode='rules' — when the agent may speak. */
-  rules: string
-  /** Minimum seconds between agent replies in this group (anti-flood). */
-  cooldown_s: number
-}
-
-/** WhatsApp (personal account, QR-paired via neonize) config from
- *  GET /api/whatsapp/config. There is no credential field: pairing is done by
- *  QR scan and the session lives server-side in the neonize SQLite store, so
- *  the client only ever sees connection status + policy. */
-export interface WhatsAppConfigData {
-  configured: boolean
-  connected: boolean
-  connect_error: string
-  read_only: boolean
-  enabled: boolean
-  /** Who may DM the agent: only the linked number (self), an allow-list, anyone
-   *  (open), or nobody (disabled). */
-  dm_policy: 'self' | 'allowlist' | 'open' | 'disabled'
-  /** Allowed WhatsApp numbers (digits only, no @-suffix) when dm_policy is
-   *  'allowlist'. Empty = deny all (fail closed). */
-  allowed_wa_ids: string[]
-  groups: WhatsAppGroup[]
-  /** Sidebar folder this channel's sessions are filed into ("" = off, the default). */
-  session_folder?: string
-  /** Pairing/connection lifecycle: unpaired → pairing → connected, or a terminal
-   *  logged_out / banned / error. Drives the status badge. */
-  state: 'unpaired' | 'pairing' | 'connected' | 'logged_out' | 'banned' | 'error'
-}
-
-/** Writable WhatsApp config fields sent to PUT /api/whatsapp/config. */
-export interface WhatsAppConfigSave {
-  enabled: boolean
-  dm_policy: 'self' | 'allowlist' | 'open' | 'disabled'
-  allowed_wa_ids: string[]
-  groups: WhatsAppGroup[]
-  /** Sidebar folder this channel's sessions are filed into ("" = off, the default). */
-  session_folder?: string
-}
-
-/** A built-in denied-command rule as returned by GET /api/security/denied-commands. */
-export interface DeniedCommandRule {
-  id: string
-  pattern: string
-  category: string
-  description: string
-  enabled: boolean
-  pinned: boolean
-  /** Why the rule is locked (forced-on, non-toggleable): 'floor' = enforced by
-   *  an always-on floor built into Kiro Crew; 'policy' = governance-pinned;
-   *  null/absent = freely toggleable. Additive — `pinned` keeps its
-   *  governance-only meaning. */
-  lock_reason?: 'floor' | 'policy' | null
-  /** Where the rule came from: 'builtin' = shipped in Kiro Crew's catalog;
-   *  'edition' = contributed by a composed edition through the `denied_rules`
-   *  seam. Edition rules are default-on and freely toggleable (never locked),
-   *  and are grouped by their own `category`, so the panel needs no special
-   *  case. Optional so an older gateway's response still type-checks. */
-  source?: 'builtin' | 'edition'
-}
-
-/** A user-authored denied-command pattern. */
-export interface DeniedUserRule {
-  id: string
-  pattern: string
-  enabled: boolean
-  /** Operator prose shown in the refusal when this rule fires. Optional: rules
-   *  added before the field existed, and rules added without one, omit it. */
-  note?: string
-}
-
-/** What a paid AWS service would bill, and whether the operator confirmed it. */
-export interface AwsConsentStatus {
-  service: string
-  serviceLabel: string
-  /** Configured profile name. Empty means the provider's own default chain. */
-  profile: string
-  /** Human-readable rendering of `profile` for display. */
-  credentialSource: string
-  region: string
-  account: string
-  arn: string
-  identityResolved: boolean
-  identityDetail: string
-  granted: boolean
-  /** Operator-facing explanation when `granted` is false. */
-  reason: string
-  /** True when this GET withdrew a stale grant because the account changed. */
-  revokedOnAccountChange: boolean
-  grant: { account: string; region: string; profile: string; granted_at: string } | null
-}
-
-/** Full denied-commands snapshot returned by every denied-commands endpoint. */
-export interface DeniedCommandsData {
-  builtins: DeniedCommandRule[]
-  user_added: DeniedUserRule[]
-  disable_all: boolean
-  effective_count: number
-  governance_locked: boolean
-}
-
-/** Serialized effective control for one governed scope (archetype-specific). */
-export interface GovernanceScopeDetail {
-  /** ruleset / scopedmap-members / capability-inner: the set MODE plus how many
-   *  entries it holds. POSTURE ONLY — the endpoint deliberately never sends the
-   *  rule CONTENTS (allow/deny globs, command patterns) to the browser, because
-   *  the dashboard is reachable by the agent's own Playwright tooling and the
-   *  exact deny patterns are the security ceiling the agent is fenced from. The
-   *  human operator reads the authoritative rules from the policy files directly. */
-  mode?: string
-  allow_count?: number
-  deny_count?: number
-  /** ruleset intersection (allow∩ that can't flatten): the composed halves. */
-  components?: GovernanceScopeDetail[]
-  /** ordinal: the enforced floor value + its strictness scale. */
-  scale?: string
-  floor?: string
-  /** capability: on/off + inner allowlists (e.g. spawn→agents). */
-  enabled?: boolean
-  inner?: Record<string, GovernanceScopeDetail>
-  /** scopedmap (channels): allowed members + per-member posture. */
-  members?: GovernanceScopeDetail
-  posture?: Record<string, Record<string, GovernanceScopeDetail>>
-}
-
-/** One row of the effective governance ceiling for a single scope. */
-export interface GovernanceScope {
-  scope: string
-  archetype: 'ruleset' | 'ordinal' | 'capability' | 'scopedmap'
-  /** false = neither policy nor profile governs it → the scope permits. */
-  governed: boolean
-  source: 'policy' | 'profile' | 'policy+profile' | 'ungoverned'
-  /** WHOSE ceiling this row describes, so a host-only pin is not read as
-   *  install-wide. `host_profile` = the host-surface profile contributes, so the
-   *  value is that ONE surface's posture (the host profile disables cron and
-   *  messaging because the host process performs neither; the cron and messaging
-   *  surfaces enable them under their own profiles). `policy_wide` = policy alone
-   *  governs, which applies to every surface. Absent/'' = ungoverned. */
-  scope_note?: '' | 'host_profile' | 'policy_wide'
-  detail: GovernanceScopeDetail
-}
-
-/** Central-policy-distribution posture, from the `distribution` key of
- *  GET /api/governance/policy.
- *
- *  POSTURE ONLY, and one field more strictly than the rest of that payload: the
- *  producer reports the source's SCHEME and never its URL, because the endpoint is
- *  the fleet's control plane and the dashboard is reachable by the agent's own
- *  browser tooling. Every value is a number, a boolean, or a machine-readable enum,
- *  so the dashboard renders translated text and no English arrives in the JSON body.
- *
- *  Only `configured` is guaranteed: the producer's fail-safe path answers
- *  `{configured: false}` alone when the posture itself could not be resolved, so
- *  every other field is optional and a reader must treat absence as unknown rather
- *  than as a zero. */
-export interface GovernanceDistributionData {
-  /** Whether this host fetches its ceiling from a central source at all. False
-   *  also covers "could not tell" — pair it with `error_code`. */
-  configured: boolean
-  /** URL scheme of the source (`https`, `file`, `http`), never the URL. '' when
-   *  unconfigured. */
-  source_scheme?: string
-  /** Seconds between background re-fetches, already clamped to the polling floor.
-   *  0 = fetched at boot only. */
-  refresh_interval_seconds?: number
-  /** The fleet's staleness bound on the cached copy. 0 = no bound. */
-  max_cache_age_seconds?: number
-  /** What the host does when no ceiling can be established: refuse to start, or
-   *  fall through to the next policy tier and report a governance incident. */
-  on_unavailable?: 'fail_closed' | 'degrade' | ''
-  /** Whether the background poll loop is alive in this process. */
-  refresher_running?: boolean
-  /** Whether a last-known-good copy recorded against THIS source is on disk. */
-  cache_present?: boolean
-  /** Age of that copy in seconds; null when there is none. */
-  cache_age_seconds?: number | null
-  /** Outcome of the most recent background refresh. '' before the first one. */
-  last_refresh_status?: 'not_configured' | 'unchanged' | 'applied' | 'rejected' | 'unreachable' | ''
-  /** Seconds since that refresh; null when none has run. */
-  last_refresh_age_seconds?: number | null
-  /** Why the posture could not be resolved, as an enum the dashboard maps to
-   *  translated copy. '' when nothing went wrong. */
-  error_code?: 'misconfigured' | ''
-}
-
-/** GET /api/governance/policy — the read-only effective ceiling across scopes. */
-export interface GovernancePolicyData {
-  /** Policy schema version, or null when no enterprise ceiling is present. */
-  version: number | null
-  /** Whether a Level-1 enterprise ceiling is in effect at all. */
-  has_policy: boolean
-  /** The bound host-surface profile name, or null. */
-  profile: string | null
-  /** The surface this snapshot resolved (always "host"); narrower per-surface/
-   *  app/task profiles can tighten a scope further at runtime. */
-  surface?: string
-  /** Surfaces OTHER than host that carry their own bound profile — names only.
-   *  Rendered so a reader can see that a host row's "disabled" is one surface's
-   *  posture, not the whole install's. */
-  other_bound_surfaces?: string[]
-  /** True when the resolved profile is a deny-all fallback because the file
-   *  could not be read or parsed — enforcement is correct (fail-closed) but the
-   *  operator should know the ceiling is synthetic, not intentional. */
-  fallback_profiles?: string[]
-  /** Capability scopes a profile names that this build does not register —
-   *  typically scopes a companion edition adds, though a misspelled scope key
-   *  lands here too. Keyed by profile stem, sorted scope names as values;
-   *  present only for profiles carrying such scopes, and deliberately NOT
-   *  narrowed to the host profile — every loaded profile reports. Producer:
-   *  the governance security payload (PR #5544). Tolerated at load time and
-   *  inert in this build. */
-  unknown_profile_scopes?: Record<string, string[]>
-  /** Where the ceiling itself comes from, when a central source publishes it.
-   *  Present on BOTH the normal and the fail-safe snapshot, so a host whose first
-   *  fetch has not landed — `has_policy: false`, `profile: null` — can still be told
-   *  apart from a host that has no enterprise ceiling at all. */
-  distribution?: GovernanceDistributionData
-  /** True when governance resolution failed — the viewer shows a soft notice. */
-  unavailable: boolean
-  scopes: GovernanceScope[]
-}
-
-/** One concrete element behind a security-posture count. */
-export interface PostureItem {
-  /** What the control covers — a blocked path, a redaction sink, a credential family. */
-  label: string
-  /** Optional "how/where" secondary text. */
-  detail: string
-}
-
-/** One expandable security control from GET /api/security/posture.
- *
- *  POSTURE ONLY, by the same contract as the governance viewer: items are public
- *  control definitions (blocked path patterns, redaction sink modules, credential
- *  FAMILY names) and derived counts — never credential material, governance rule
- *  contents, or user data. `count` is `items.length` server-side, so a pill can
- *  never drift from the list it summarizes. */
-export interface PostureControl {
-  key: string
-  label: string
-  /** Noun for the count, e.g. "output paths" — rendered as `${count} ${unit}`. */
-  unit: string
-  summary: string
-  /** Repo-relative path of the module that enforces the control. */
-  source: string
-  /** null when the control could not be resolved (see `unavailable`). */
-  count: number | null
-  items: PostureItem[]
-  /** True when this control's detail could not be resolved; the rest still render. */
-  unavailable: boolean
-}
-
-/** GET /api/security/posture — expandable detail behind every posture count. */
-export interface SecurityPostureData {
-  controls: PostureControl[]
-  /** Flat `key → count` map for callers that only need the pill values. */
-  counts: Record<string, number | null>
-}
-
-/**
- * GET /api/tailnet/status — whether this machine's Tailscale MagicDNS name is in
- * the dashboard's Origin allow-list.
- *
- * `state` is derived SERVER-SIDE and the UI must render off it directly rather
- * than recomputing it from the other fields: one owner for the state machine
- * means the two layers cannot disagree about what "active" means. Precedence is
- * `pinned` > `off` > `unresolved` > `active`.
- *
- * `host` / `origin` / `resolved_at` describe the STARTUP resolution — the value
- * that actually went into `build_allowed_origins` — not a fresh probe. A live
- * probe could report a name the running origin set does not contain (daemon came
- * up after the gateway), and rendering that as trusted is the same
- * checked-but-never-ran defect the posture registry guards against.
- */
-export interface TailnetStatusData {
-  /** `dashboard.tailscale.enabled` as actually loaded, post-hydration. */
-  enabled: boolean
-  /** `capabilities.tailnet_origin` pinned off at the POLICY layer. */
-  governance_pinned: boolean
-  /** MagicDNS name resolved at startup; `''` when none was. */
-  host: string
-  /** `https://<host>`; `''` when `host` is `''`. */
-  origin: string
-  /** Epoch seconds of that startup resolution; `0` when it never resolved. */
-  resolved_at: number
-  state: 'pinned' | 'off' | 'unresolved' | 'active'
-}
-
-/** The single next action for tailnet mobile access.
- *
- * Ordered by what blocks what, and derived SERVER-side (see
- * `handlers/tailnet_mobile._derive_step`) so this list is rendered, never
- * re-computed here — one owner for the state machine.
- *
- * - `pinned` — an administrator's policy forbids tailnet access. Dead end.
- * - `install` / `start_daemon` / `sign_in` / `enable_magicdns` — the four ways
- *   there is no usable tailnet name, kept apart because each is a different
- *   errand for the operator.
- * - `enable_https` — the tailnet has not granted certificate provisioning for
- *   that name; this requires one-time tailnet administrator consent.
- * - `trust_off` — a name exists but the gateway will not accept it as an origin
- *   yet, so publishing would yield a reachable dashboard answering 403.
- * - `restart_gateway` — configured and resolvable NOW, but this server did not
- *   trust that exact name at startup. The one-click flow restarts and resumes.
- * - `occupied` — serve holds the mount for something that is not this dashboard,
- *   or its state is undeterminable; publishing would REPLACE it.
- * - `publish` — everything in place, one action left.
- * - `ready` — published and trusted.
- */
-export type TailnetMobileStep =
-  | 'pinned'
-  | 'install'
-  | 'start_daemon'
-  | 'sign_in'
-  | 'enable_magicdns'
-  | 'enable_https'
-  | 'trust_off'
-  | 'restart_gateway'
-  | 'occupied'
-  | 'publish'
-  | 'ready'
-
-/** Live readiness for tailnet mobile access (`GET /api/tailnet/mobile`).
- *
- * Unlike `TailnetStatusData` this IS a live daemon probe: it answers "what can
- * this machine do next", where the other answers "what does the running server
- * already trust". Both are needed and they are not interchangeable. */
-export interface TailnetMobileData {
-  /** Per-process marker used only to prove a requested restart completed. */
-  boot_id: string
-  step: TailnetMobileStep
-  /** MagicDNS name as resolved right now; `''` when unresolvable. */
-  host: string
-  origin: string
-  installed: boolean
-  reachable: boolean
-  logged_in: boolean
-  /** Other devices on this tailnet. `0` means there is nothing to reach this
-   *  dashboard FROM — publishing and the QR both still succeed, so this is the
-   *  only signal that the scan is going to fail. */
-  peer_count: number
-  /** How many of those are online right now. */
-  peers_online: number
-  /** `dashboard.tailscale.enabled` — the origin-trust config switch. */
-  trusted: boolean
-  /** Whether the RUNNING server trusted this exact name at startup. */
-  startup_trusted: boolean
-  /** `null` when serve state could not be determined — never render as false. */
-  published: boolean | null
-  keep_awake: boolean
-  governance_pinned: boolean
-  /** Verbatim daemon/serve text. Shown as-is; never rephrased client-side. */
-  detail: string
-  download_url: string
-  qr_ttl_secs: number
-  serve_port: number
-  dashboard_port: number
-}
-
-/** Result of a publish/unpublish attempt. `detail` carries the daemon's own
- *  words, which is the only part guaranteed to stay correct if Tailscale
- *  rewords its errors. */
-export interface TailnetMobileMutation {
-  ok: boolean
-  code: string
-  detail: string
-}
-
-/** Phone-connection methods surviving the governance filter. `kind` names the
- *  renderer; the dashboard skips a kind it does not recognise, so an edition's
- *  new method degrades to absent on an older frontend, never to a broken panel. */
-export interface MobileConnectMethodsData {
-  methods: { id: string; kind: string }[]
-}
-
-/** Durable config established by the explicit mobile setup action. */
-export interface TailnetMobileConfigure {
-  /** Trust/origin settings are snapshotted by middleware at gateway boot. */
-  restart_required: boolean
-}
-
-/** A minted mobile-access QR. Carries a LIVE session token in both fields, so
- *  it is fetched only on explicit user action and never cached. */
-export interface TailnetMobileQr {
-  /** `https://<host>/?token=<token>` — treat as a credential. */
-  url: string
-  /** PNG data URI, rendered server-side (no client QR library). */
-  image: string
-  /** Lifetime of the session the link opens. */
-  ttl_secs: number
-  /** Window in which the LINK must be opened — much shorter than `ttl_secs`,
-   *  and the part that surprises people. */
-  link_window_secs: number
-  host: string
-}
-
-/**
- * GET /api/security/trusted-apps — per-app grants that let a third-party app
- * run its own code (Python in-process, its own backend, manifest shell
- * commands).  Third-party app code is refused by default; a grant is made for
- * ONE app at a time from the trust-consent modal, so `apps` is the explicit
- * allow list and `allowAll` is the separate blanket escape hatch.
- */
-export interface TrustedAppsData {
-  /** Grants the execution gate ACTUALLY enforces (valid app names, sorted). */
-  apps: string[]
-  /**
-   * Entries stored in `config.json` that the gate IGNORES because they fail the
-   * app-name charset — a hand-edited config can hold `LD-App`, `ld-app ` with a
-   * trailing space, a fullwidth homoglyph, `..` or `*`. They must render
-   * separately from `apps`: folded in, the panel claims trust that does not
-   * exist and the user cannot tell why their app is still blocked.
-   */
-  ineffective: string[]
-  /** Blanket grant — trusts every third-party app, present or future. */
-  allowAll: boolean
-}
-
-/**
- * DELETE /api/security/trusted-apps/{name} — the refreshed snapshot PLUS whether
- * the revoke also had to DISABLE the app. Revoking trust has to stop the app's
- * code from running, so the backend disables a currently-enabled app in the same
- * transaction; the UI must say so, otherwise an app silently stops working.
- */
-export interface TrustedAppsRevokeResult extends TrustedAppsData {
-  disabled: boolean
-}
-
-/**
- * Whether THIS MACHINE has an ACP backend's components installed.
- *
- * `'unknown'` means the check itself failed, and it is NOT a synonym for
- * `'missing'`: telling someone to install what they may already have costs them a
- * global package install for nothing. Consumers must keep the three apart.
- */
-export type AcpBackendInstalled = 'installed' | 'missing' | 'unknown'
-
-/**
- * One row of `GET /api/acp-backends` — a backend the code knows about, paired
- * with what this build can serve and what this machine actually has.
- *
- * `selectable` is a BUILD/edition-and-policy fact (the same set
- * `PATCH /api/config/kirocrew` validates against); `installed` is a machine fact.
- * They are independent: a build can serve a backend whose binary is absent, and a
- * machine can hold a backend this build refuses to run.
- *
- * `missing_components` is non-empty only when `installed === 'missing'`;
- * `install_command` is `''` when there is nothing to suggest.
- */
-export interface AcpBackendProbe {
-  id: string
-  policy_id: string
-  selectable: boolean
-  installed: AcpBackendInstalled
-  missing_components: string[]
-  install_command: string
-  /**
-   * Installed on disk, but the RUNNING gateway already resolved its absence and
-   * cached that for the process's life — so a session started now would still
-   * fail. Disables the option and says restart, rather than offering a control
-   * that is guaranteed to error.
-   */
-  restart_required: boolean
-}
+import type { ClientTransport } from './client/transport'
+import { createSystemEndpoints } from './client/system'
+import { createTelemetryEndpoints } from './client/telemetry'
+import { createChatEndpoints } from './client/chat'
+import { createOnboardingEndpoints } from './client/onboarding'
+import { createSecurityEndpoints } from './client/security'
+import { createRemoteAccessEndpoints } from './client/remoteAccess'
+import { createFeatureDiscoveryEndpoints } from './client/featureDiscovery'
+import { createThemesEndpoints } from './client/themes'
+import { createInstancesEndpoints } from './client/instances'
+import { createCloudEndpoints } from './client/cloud'
+import { createMemoryEndpoints } from './client/memory'
+import { createSessionsEndpoints } from './client/sessions'
+import { createMcpEndpoints } from './client/mcp'
+import { createAgentsEndpoints } from './client/agents'
+import { createChatSlotSettingsEndpoints } from './client/chatSlotSettings'
+import { createFilesEndpoints } from './client/files'
+import { createCronEndpoints } from './client/cron'
+import { createHooksEndpoints } from './client/hooks'
+import { createSkillsEndpoints } from './client/skills'
+import { createSteeringEndpoints } from './client/steering'
+import { createConnectionsEndpoints } from './client/connections'
+import { createConfigEndpoints } from './client/config'
+import { createCapabilityManagerEndpoints } from './client/capabilityManager'
+import { createVoiceEndpoints } from './client/voice'
+import { createSourceControlEndpoints } from './client/sourceControl'
+import { createMonitorsEndpoints } from './client/monitors'
+import { createChatOrganizationEndpoints } from './client/chatOrganization'
+import { createNotificationsEndpoints } from './client/notifications'
+import { createSubagentsEndpoints } from './client/subagents'
+import { createApprovalsEndpoints } from './client/approvals'
+import { createTaskRunnerEndpoints } from './client/taskRunner'
+import { createWorkflowsEndpoints } from './client/workflows'
+import { createUpdatesEndpoints } from './client/updates'
+import { createAgentChannelsEndpoints } from './client/agentChannels'
+import { createAppsEndpoints } from './client/apps'
+import { createArtifactsEndpoints } from './client/artifacts'
+import { createBrowserAndComputerUseEndpoints } from './client/browserAndComputerUse'
+import { createDecisionsEndpoints } from './client/decisions'
+import { createMessagingEndpoints } from './client/messaging'
+import { createAutoResearchEndpoints } from './client/autoResearch'
+import type { DecisionsConsentData } from './client/decisions'
+
+export type { TunnelStatus } from './client/system'
+export type { WakaTimeStatsEntry, WakaTimeStats } from './client/telemetry'
+export type {
+  KiroPrerequisiteStatus,
+  KasLoginStatus,
+  KasLoginDeviceSession,
+  KasLoginPollResult,
+  KasLoginLoopbackSession,
+  AgentImportCategory,
+  AgentImportSource,
+  AgentImportSkipped,
+  AgentImportScanResponse,
+  AgentImportSelection,
+  AgentImportConflictStrategy,
+  AgentImportApplyRequest,
+  AgentImportSummary,
+  AgentImportApplyResponse,
+} from './client/onboarding'
+export type {
+  DeniedCommandRule,
+  DeniedUserRule,
+  AwsConsentStatus,
+  FileDeliveryGrant,
+  FileDeliveryConsentStatus,
+  CredentialRedactionState,
+  ArmedFileDeliveryConsent,
+  DeniedCommandsData,
+  GovernanceScopeDetail,
+  GovernanceScope,
+  GovernanceDistributionData,
+  GovernancePolicyData,
+  PostureItem,
+  PostureControl,
+  SecurityPostureData,
+  TrustedAppsData,
+  TrustedAppsRevokeResult,
+  ManagedSecret,
+  SecretsListResponse,
+} from './client/security'
+export type {
+  TailnetStatusData,
+  TailnetMobileStep,
+  TailnetMobileData,
+  TailnetMobileMutation,
+  MobileConnectMethodsData,
+  TailnetMobileConfigure,
+  TailnetMobileQr,
+} from './client/remoteAccess'
+export type {
+  SuggestionKind,
+  SuggestionItem,
+  FeatureVideo,
+  FeatureVideoNext,
+  FeatureVideoProbe,
+  FeatureVideoStatus,
+} from './client/featureDiscovery'
+export type {
+  InstanceTunnelStatus,
+  SsoStatus,
+  InstanceView,
+  AddInstanceBody,
+} from './client/instances'
+export { filenameFromDisposition } from './client/instances'
+export type {
+  CloudCoords,
+  CloudPreflight,
+  RemoteProvisioner,
+  LaunchJobStatus,
+  LaunchStepState,
+  LaunchStep,
+  CloudLaunchSignin,
+  KiroLoginTarget,
+  CloudIdentity,
+  LaunchJob,
+  LaunchTaskSighting,
+  LaunchTaskReport,
+} from './client/cloud'
+export type { MemoryCarveQuery, MemoryCarveResult } from './client/memory'
+export { SEARCH_MIN_CHARS } from './client/sessions'
+export type {
+  McpShareReason,
+  McpShareRecommendation,
+  McpMeasureProgress,
+  McpManagedServer,
+} from './client/mcp'
+export type {
+  MemberRosterRow,
+  MemberActivityEntry,
+  CrewTeam,
+  CrewPanelData,
+  CrewPanelMeta,
+} from './client/agents'
+export { SLASH_COMMANDS_TIMEOUT_MS } from './client/chatSlotSettings'
+export type {
+  WebhookFreshness,
+  WebhookOutcome,
+  WebhookTokenEntry,
+  WebhookContextEntry,
+  WebhookRunRecord,
+  WebhooksView,
+  WebhookTokenCreated,
+  WebhookTestResult,
+} from './client/hooks'
+export type { SkillScriptValidation } from './client/skills'
+export { SKILLS_TIMEOUT_MS } from './client/skills'
+export { FILE_SEARCH_TIMEOUT_MS, BROWSE_FILES_TIMEOUT_MS } from './client/files'
+export type {
+  ConnectionMintState,
+  ConnectionStatus,
+  ConnectionOAuthClientSource,
+  ConnectionOAuthClient,
+  ConnectionOAuthClientSave,
+  ConnectionTestResult,
+} from './client/connections'
+export type { AcpBackendInstalled, AcpBackendProbe } from './client/config'
+export type { MonitorWrite, MonitorResponse } from './client/monitors'
+export type {
+  ChannelFolderBackfillMoved,
+  ChannelFolderBackfillReport,
+} from './client/chatOrganization'
+export type { PlanStepInput } from './client/taskRunner'
+export type {
+  WorkflowLineage,
+  WorkflowDefinitionRevision,
+  WorkflowDefinition,
+  WorkflowDefinitionWrite,
+} from './client/workflows'
+export type {
+  InstallStreamResult,
+  ExternalRegistryRow,
+  FileMenuSurface,
+  FileMenuContext,
+} from './client/apps'
+export type { AppPublishProvider } from './client/artifacts'
+export { browserInstallConflictJob } from './client/browserAndComputerUse'
+export type {
+  BrowserInstallData,
+  BrowserEngine,
+  BrowserEngineStatus,
+  BrowserInstallJob,
+  BrowserViewData,
+  BrowserOpenData,
+  ComputerUsePermissions,
+  ComputerUseConfigData,
+  ComputerUseConfigSave,
+} from './client/browserAndComputerUse'
+export type {
+  DecisionsConsentData,
+  DecisionPointData,
+  DecisionFeedbackSide,
+  DecisionVerdictValue,
+} from './client/decisions'
+export type {
+  SlackConfigData,
+  SlackConfigSave,
+  DiscordConfigData,
+  TelegramConfigData,
+  DiscordConfigSave,
+  TelegramConfigSave,
+  WeComConfigData,
+  WeComConfigSave,
+  FeishuConfigData,
+  FeishuConfigSave,
+  WebexConfigData,
+  WebexConfigSave,
+  IMessageConfigData,
+  IMessageConfigSave,
+  TeamsConfigData,
+  WeixinConfigData,
+  TeamsConfigSave,
+  WeixinConfigSave,
+  WhatsAppGroup,
+  WhatsAppConfigData,
+  WhatsAppConfigSave,
+} from './client/messaging'
 
 let _sessionExpiredShown = false
 
@@ -1203,7 +255,7 @@ let _sessionExpiredShown = false
  * because that session is still AUTHENTICATED: ordinary polls keep succeeding,
  * so the `j` wrapper's clear-banner-on-2xx self-dismissal would remove the one
  * instruction that recovers the owner-gated surfaces. It clears via the
- * banner's own ✕ or the sign-in reload, never via a 2xx.
+ * banner's own X or a successful in-banner token exchange, never via a 2xx.
  */
 let _staleOwnerBanner = false
 
@@ -1221,8 +273,19 @@ export function isAuthBannerShown(): boolean {
  * to auth-banner state transitions. The banner itself is a vanilla DOM
  * element managed by this module; the events let consumers (e.g.
  * `ChatPage`) suppress redundant offline UI when auth is the real blocker.
+ *
+ * Two events, and the difference is load-bearing. `mc-auth-cleared` means
+ * only THE BANNER IS GONE, which includes the reader dismissing it with its
+ * X while the session is still broken. `mc-auth-recovered` means
+ * AUTHENTICATION WORKS AGAIN, and is emitted from `removeAuthBanner` alone --
+ * every one of whose callers is gated on a 2xx or on an accepted token
+ * exchange. A consumer that acts on recovery (dropping a stale auth failure)
+ * must read the second; a consumer that only mirrors banner presence reads
+ * the first.
  */
-function _emitAuthEvent(kind: 'mc-auth-required' | 'mc-auth-cleared'): void {
+function _emitAuthEvent(
+  kind: 'mc-auth-required' | 'mc-auth-cleared' | 'mc-auth-recovered',
+): void {
   if (typeof window === 'undefined') return
   try { window.dispatchEvent(new CustomEvent(kind)) } catch { /* ignore */ }
 }
@@ -1230,9 +293,10 @@ function _emitAuthEvent(kind: 'mc-auth-required' | 'mc-auth-cleared'): void {
 /**
  * Clear the session-expired banner if it is currently shown.
  * Called automatically from the `j` response wrapper on any 2xx response so
- * the banner self-dismisses once auth is restored (e.g. via the in-banner
- * token-paste flow that reloads with `?token=X`, OR via a successful poll
- * after gateway restart wiped the session table).
+ * the banner self-dismisses once auth is restored (e.g. via a successful poll
+ * after gateway restart wiped the session table). The in-banner token paste
+ * calls it directly once its exchange succeeds, since that path deliberately
+ * issues no request whose 2xx would reach `j`.
  *
  * Idempotent: safe to call on every response.
  */
@@ -1253,6 +317,11 @@ export function removeAuthBanner(): void {
   const el = document.getElementById('mc-session-expired')
   if (el) el.remove()
   _emitAuthEvent('mc-auth-cleared')
+  // Reaching here means a caller proved auth works: every call site is behind a
+  // 2xx or an accepted token exchange. The banner's own X does NOT come through
+  // here -- it tears the banner down inline -- so this event, unlike
+  // `mc-auth-cleared`, is never fired by a reader simply dismissing the notice.
+  _emitAuthEvent('mc-auth-recovered')
 }
 
 // Reactive warm-path recovery: background-poll 403s funnel here, through the
@@ -1310,6 +379,110 @@ export function __resetAuthRecoveryStateForTests(): void {
   }
 }
 
+/**
+ * Exchange a pasted token for a session cookie WITHOUT leaving the page.
+ *
+ * The auth middleware reads `?token=` AHEAD of the session cookie on every path,
+ * and because such a token did not arrive from the cookie it writes the session
+ * cookie onto that response once the handler returns (`dashboard/token_auth.py`,
+ * the `if not from_cookie` branch). `GET /api/auth/me` is deliberately kept off
+ * the bypass list so it runs the full auth path. One credentialed request on that
+ * endpoint therefore establishes the session in place.
+ *
+ * This used to be `window.location.href = ...?token=...`, which authenticated by
+ * exactly the same mechanism and threw away every piece of in-memory state on the
+ * way. Whatever the user had typed into the panel that prompted the re-auth went
+ * with it -- for Settings -> Secrets that was a credential they had already
+ * pasted, which is the loss this replaces (#12240).
+ *
+ * Answers false for any non-2xx and for a transport failure, including the 404 an
+ * older gateway gives for this endpoint. The caller keeps the banner up on false,
+ * so a server that cannot exchange in place leaves the user exactly where they
+ * were rather than half-signed-in.
+ */
+/**
+ * What one in-banner exchange established.
+ *
+ * `reached` is false only when the request never got an answer -- an unreachable
+ * gateway, a dropped connection. It is separate from `ok` because the two need
+ * different words: a refused token asks the user to paste a better one, while an
+ * unreachable gateway makes "not accepted" an assertion about a check that never
+ * ran.
+ *
+ * `ok` means some credential is live: enough to drop a plain-expiry banner,
+ * which was raised because nothing was. `tokenAccepted` is the gateway's answer
+ * to the narrower question -- is the token in THIS request what authenticated it
+ * -- and `ownerOk` to whether that caller also clears the owner gate. A token
+ * minted before the owner was configured is valid, so it can be accepted and
+ * still denied; resolving an owner denial needs both. A gateway that predates
+ * either field leaves it false, which keeps the prompt up rather than dismissing
+ * one it cannot vouch for.
+ */
+type PasteExchange = {
+  reached: boolean
+  ok: boolean
+  tokenAccepted: boolean
+  ownerOk: boolean
+}
+
+const EXCHANGE_UNREACHABLE: PasteExchange = {
+  reached: false,
+  ok: false,
+  tokenAccepted: false,
+  ownerOk: false,
+}
+
+async function exchangePastedToken(token: string): Promise<PasteExchange> {
+  try {
+    const r = await fetch('/api/auth/me?token=' + encodeURIComponent(token), {
+      credentials: 'include',
+    })
+    if (!r.ok) return { reached: true, ok: false, tokenAccepted: false, ownerOk: false }
+    try {
+      const body = (await r.json()) as
+        | { token_accepted?: unknown; owner_ok?: unknown }
+        | null
+      return {
+        reached: true,
+        ok: true,
+        tokenAccepted: body?.token_accepted === true,
+        ownerOk: body?.owner_ok === true,
+      }
+    } catch {
+      // 2xx with an unreadable body: the session is live, but nothing vouches
+      // for the pasted token, so it counts as the unproven case.
+      return { reached: true, ok: true, tokenAccepted: false, ownerOk: false }
+    }
+  } catch {
+    return EXCHANGE_UNREACHABLE
+  }
+}
+
+/**
+ * Render *sentence* into *el* with the command wrapped in a <code> element.
+ *
+ * The command comes from `api.client.reauth_command`, so the value split on is
+ * the SAME value a translator sees, and no untranslated literal sits in this
+ * module. Falls back to the plain sentence when the command is absent from it,
+ * because a translation that moved or dropped it must still be readable --
+ * losing the chip is a styling regression, whereas rendering nothing would be a
+ * blank banner. `ApiClient.coverage.test.tsx` pins the relationship across every
+ * catalog, so a translation that breaks it reddens CI rather than silently
+ * costing the chip.
+ */
+function setInstructionWithCommandChip(el: HTMLElement, sentence: string): void {
+  const command = i18nT('api.client.reauth_command')
+  const at = command ? sentence.indexOf(command) : -1
+  if (at < 0) {
+    el.textContent = sentence
+    return
+  }
+  el.append(document.createTextNode(sentence.slice(0, at)))
+  const chip = document.createElement('code')
+  chip.textContent = command
+  el.append(chip, document.createTextNode(sentence.slice(at + command.length)))
+}
+
 function showSessionExpiredBanner(lead?: string): void {
   if (_sessionExpiredShown) return
   _sessionExpiredShown = true
@@ -1321,9 +494,6 @@ function showSessionExpiredBanner(lead?: string): void {
     'padding:12px 20px;text-align:center;font:14px/1.5 system-ui;'
   const b = document.createElement('b')
   b.textContent = lead ?? i18nT('api.client.session_expired')
-  const code = document.createElement('code')
-  code.textContent = 'kirocrew token'
-  code.style.cssText = 'background:#7f1d1d;padding:2px 6px;border-radius:4px'
   const input = document.createElement('input')
   input.type = 'text'
   input.placeholder = i18nT('api.client.paste_token_url_or_raw_token')
@@ -1333,16 +503,123 @@ function showSessionExpiredBanner(lead?: string): void {
     'outline:2px solid transparent;outline-offset:2px;transition:border-color 0.2s,box-shadow 0.2s;'
   input.addEventListener('focus', () => { input.style.borderColor = '#fff'; input.style.boxShadow = '0 0 0 3px rgba(255,255,255,0.25),0 0 20px rgba(255,255,255,0.1)' })
   input.addEventListener('blur', () => { input.style.borderColor = '#fca5a5'; input.style.boxShadow = 'none' })
+  // A refused paste has to say so. The exchange's only other cue is the field
+  // re-enabling, which is indistinguishable from nothing having happened, so
+  // without this the user presses Enter again and concludes the banner is
+  // broken. `role="status"` announces the text when it appears, since a sighted
+  // user sees it arrive and a screen-reader user otherwise would not.
+  //
+  // A `div`, and deliberately unstyled: block layout puts it on its own line
+  // without an inline-spacing rule, and it inherits the banner's white-on-red
+  // type, which clears contrast at this size where a lighter red would not.
+  const failure = document.createElement('div')
+  failure.setAttribute('role', 'status')
   input.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') {
       const v = input.value.trim()
       if (!v) return
       let t: string | null = null
       try { t = new URL(v).searchParams.get('token') } catch { t = v }
-      if (t) window.location.href = `${window.location.protocol}//${window.location.host}?token=${encodeURIComponent(t)}`
+      if (!t) return
+      // Disabled for the round trip so a second Enter cannot start a second
+      // exchange. The pasted text is left in the field: on a refusal the user
+      // corrects it rather than re-pasting from scratch.
+      input.disabled = true
+      // Drop the previous attempt's refusal now, so the next one is visibly a
+      // new answer rather than text that was already on screen.
+      failure.textContent = ''
+      void exchangePastedToken(t).then(({ reached, ok, tokenAccepted, ownerOk }) => {
+        input.disabled = false
+        if (!reached) {
+          // The request never got an answer, so nothing judged the token. Saying
+          // it was not accepted would assert a check that never ran and send the
+          // user to re-run a command that cannot help.
+          failure.textContent = i18nT('api.client.token_exchange_unreachable')
+          input.focus()
+          return
+        }
+        if (!ok) {
+          failure.textContent = i18nT('api.client.token_not_accepted')
+          input.focus()
+          return
+        }
+        // An owner denial is resolved by ONE event: a credential that both
+        // authenticates AND clears the owner gate. A 2xx here establishes
+        // neither. `/api/auth/me` is not owner-gated, so this session -- still
+        // authenticated, still owner-denied -- answers 200 on its cookie, and
+        // the middleware quietly falls back to that cookie when the pasted token
+        // is invalid. A token minted before the owner was configured is valid
+        // too, so it is accepted and still denied everywhere the gate fronts.
+        // Clearing the latch on the status alone, or on acceptance alone, would
+        // hide the prompt while every owner-gated call kept failing, and the
+        // user would learn that from their next refused save.
+        //
+        // So the latch drops only when the gateway reports both. Without them
+        // the banner stays up and says the token was not accepted, which is the
+        // accurate reading of a 200 that proves neither.
+        if (_staleOwnerBanner && !(tokenAccepted && ownerOk)) {
+          failure.textContent = i18nT('api.client.token_not_accepted')
+          input.focus()
+          return
+        }
+        // `removeAuthBanner` returns early while the latch is set --
+        // deliberately, because that session keeps answering 2xx on everything
+        // the owner gate does not front, so an unrelated success proves
+        // nothing. Dropping it here is what lets the banner clear on its own
+        // recovery, which the previous full-page reload hid by wiping the
+        // document.
+        _staleOwnerBanner = false
+        // Auth works again. `removeAuthBanner` drops the banner and clears the
+        // terminal-refresh latch, so a LATER lapse in this document retries the
+        // silent path instead of going straight back to the banner.
+        removeAuthBanner()
+        // Only queries that failed AND are holding nothing get refetched.
+        //
+        // `status === 'error'` alone is not enough, and the earlier version of
+        // this comment was wrong to say an error-state query has no data to sync
+        // from. React Query KEEPS the last successful `data` when a later
+        // refetch fails: measured against `@tanstack/query-core`, a query that
+        // succeeds and then fails a refetch reports `status: 'error'` with its
+        // `data` still defined and unchanged. Refetching one of those
+        // re-delivers data to whatever watches it, and
+        // `McpCustomServerModal`'s effect runs
+        // `setText(JSON.stringify(specQuery.data.spec, ...))` on every change of
+        // `specQuery.data` -- so an unsaved spec draft would be silently
+        // overwritten by the server's copy. A no-argument
+        // `invalidateQueries()` does that to every panel at once, which is the
+        // wider version of the same bug.
+        //
+        // `data === undefined` narrows it to queries that never carried a
+        // successful value: exactly the ones the lapse broke, and the only ones
+        // with nothing to overwrite a draft with.
+        invalidateAcrossQueryClients({
+          predicate: (q) => q.state.status === 'error' && q.state.data === undefined,
+        })
+      })
     }
   })
-  el.append(b, ' Run ', code, ' then paste URL: ', input)
+  // The connective text around the command used to sit here as two bare English
+  // It used to be two bare English fragments wrapped around a <code> element,
+  // which left the banner untranslated everywhere while the panel's own error
+  // card was translated. A key per fragment is not the fix: the i18n gate
+  // rejects a value that ends mid-sentence, because the translator cannot
+  // reorder around a sibling it never sees -- and several languages need the
+  // command somewhere English does not put it. `api.client.
+  // session_expired_sign_in_again` already carries this same command inline in a
+  // whole sentence across every locale, so this follows that precedent. A `div`
+  // so it needs no inline spacing rule.
+  //
+  // The command still gets its own <code> element, found by splitting the
+  // rendered sentence on the command itself rather than by a placeholder: that
+  // keeps one whole translatable sentence in one key AND keeps the command
+  // visually separable, which is the whole reason a reader can tell where it
+  // begins and ends.
+  const instruction = document.createElement('div')
+  setInstructionWithCommandChip(
+    instruction,
+    i18nT('api.client.run_kirocrew_token_then_paste_sign_in_url'),
+  )
+  el.append(b, instruction, input, failure)
   const dismiss = document.createElement('button')
   dismiss.textContent = '✕'
   dismiss.style.cssText =
@@ -1420,7 +697,7 @@ function handleStaleOwnerSession(): void {
   // raised moments earlier would otherwise keep its clear-on-2xx self-dismissal
   // and vanish on the next successful poll — this session still succeeds on
   // everything the owner gate does not front, so once the stale denial is seen
-  // only the ✕ or a sign-in reload may clear the prompt.
+  // only the X or a successful in-banner token exchange may clear the prompt.
   _staleOwnerBanner = true
   if (_sessionExpiredShown) return
   // Embedded in the Instances pane stack: hand recovery to the hub, mirroring
@@ -1444,6 +721,7 @@ function handleStaleOwnerSession(): void {
 // it supplies the prompt those detections raise. Re-exported so consumers of
 // the blessed transport can reference the wire contract from one place.
 installStaleOwnerHandler(handleStaleOwnerSession)
+installSessionExpiryHandler(checkSessionExpired)
 export { STALE_OWNER_SESSION_CODE }
 
 /**
@@ -1454,7 +732,7 @@ export { STALE_OWNER_SESSION_CODE }
  * every existing consumer, and every test that mocks `../api/client`, is
  * unchanged by the move.
  */
-export { ApiError, friendlyErrText }
+export { ApiError, friendlyErrText, toApiError }
 
 /**
  * Whether *e* is a failure the user can only clear by signing back in.
@@ -1464,9 +742,15 @@ export { ApiError, friendlyErrText }
  * useless to a user: it neither says the session is what broke nor points at
  * the re-auth banner. Call sites use this to swap a futile retry for the one
  * action that recovers.
+ *
+ * An interposed proxy's challenge is deliberately NOT one of these, though it
+ * also sets `authRequired`: the gateway never saw that request, so its sign-in
+ * banner and token flow cannot clear it, and offering them names the wrong
+ * system. Those failures carry their own remedy in the message instead. Call
+ * sites that only want the retry withdrawal read `authRequired` directly.
  */
 export const isAuthExpiredError = (e: unknown): boolean =>
-  e instanceof ApiError && e.authRequired
+  e instanceof ApiError && e.authRequired && !e.edgeChallenge
 
 /**
  * Build the ApiError AND journal it.
@@ -1477,7 +761,7 @@ export const isAuthExpiredError = (e: unknown): boolean =>
  * `e.message`. `utils/errorReport` then lets a shared error banner recover that
  * context from the message alone — see AskAgentButton / ErrorNotice.
  */
-const apiFailure = (r: Response, errText: string): ApiError => {
+const apiFailure = (r: Response, errText: string, benign?: BenignDenial): ApiError => {
   // An auth denial's own reason text ("invalid signature") describes HMAC
   // verification, not anything the user can act on, and every card that renders
   // it hides the fact that one re-auth clears all of them at once. Substitute
@@ -1490,48 +774,196 @@ const apiFailure = (r: Response, errText: string): ApiError => {
   // the BODY, which checkSessionExpired (a pre-body Response hook) cannot read;
   // the prompt itself is idempotent, so the factory raising it cannot spam.
   const staleOwnerSession = noteStaleOwnerResponse(r.status, errText)
+  // A third denial neither of the above can see: a proxy in front of the gateway
+  // answered with its own sign-in page, so the signals are status + type + body.
+  // Skipped when the gateway's own header is present: that header proves the request
+  // reached the gateway, so nothing interposed answered it.
+  const edgeOutcome = authRequired || staleOwnerSession
+    ? null
+    : noteEdgeAuthChallenge(r.status, r.headers.get('content-type'), errText)
+  // Every one of these needs a person: the gateway never saw the request, so a silent
+  // retry a second later reproduces it whether a session lapsed or a firewall refused.
+  const edgeAuthExpired = edgeOutcome !== null
   const message = staleOwnerSession
     ? i18nT('api.client.stale_owner_session_sign_in_again')
     : authRequired
       ? i18nT('api.client.session_expired_sign_in_again')
-      : friendlyErrText(r.status, errText) || `HTTP ${r.status}`
-  recordError({
-    source: 'api',
-    message,
-    status: r.status,
-    code: parseErrorCode(errText),
-    endpoint: requestPath(r.url),
-    detail: errText,
-  })
+      : edgeChallengeMessage(edgeOutcome)
+        || friendlyErrText(r.status, errText)
+        || `HTTP ${r.status}`
+  const code = parseErrorCode(errText)
+  // One specific denial on one endpoint is a DESIGNED, benign signal rather than a
+  // failure worth showing the user — a disabled optional feature answering its own
+  // probe (instances is deny-by-default; see listInstances). The caller opts that
+  // one out via `benign`: the ApiError is still THROWN so the caller's catch runs,
+  // but it is not journaled, so it cannot surface as a spurious error report on an
+  // unrelated route (e.g. /chat/new-session mounting the sidebar).
+  //
+  // The match is on status AND the gateway's own `code`, never status alone. The
+  // same endpoint answers 403 to a non-owner caller and to a Slack-origin request,
+  // and both are real authorization failures a reader needs; keyed on status they
+  // would be silently swallowed along with the routine one.
+  //
+  // The three auth-recovery denials above are additionally excluded, including the
+  // edge challenge: a proxy answering with its own sign-in page carries no code of
+  // ours, so it cannot match `benign`, but the term is kept explicit because each of
+  // the three needs a person and none may ever be opted out by a call site.
+  const expectedBenign = !!benign
+    && r.status === benign.status
+    && code === benign.code
+    && !authRequired
+    && !staleOwnerSession
+    && !edgeAuthExpired
+  const report = expectedBenign
+    ? undefined
+    : recordError({
+      source: 'api',
+      message,
+      status: r.status,
+      code,
+      endpoint: requestPath(r.url),
+      detail: errText,
+    })
   // A stale-owner denial is authRequired in the sense call sites care about:
   // no retry can succeed until the user signs in again.
-  return new ApiError(r.status, message, errText, authRequired || staleOwnerSession)
+  //
+  // The journal entry rides on the error itself (`attachReport`): the journal is
+  // resolved by exact message, newest first, so two reads refused with the same
+  // server line ("Access denied") would otherwise both resolve to whichever failed
+  // LAST and hand the agent the wrong endpoint. `reportForError` reads this first.
+  // A benign denial is not journaled, so it has no report to pin.
+  const error = new ApiError(
+    r.status, message, errText,
+    authRequired || staleOwnerSession || edgeAuthExpired,
+    edgeAuthExpired,
+  )
+  return report ? attachReport(error, report) : error
 }
 
-const j = async (r: Response) => {
+/**
+ * The auth-recovery half of `j` for a response that is handed back RAW instead
+ * of parsed (the chat-core transport's wire): the pre-body 403 `X-Auth-Required`
+ * hook, and the body-borne stale-owner code a 401 carries -- read off a CLONE so
+ * the caller's own `json()` still works. Fire-and-forget: the recovery prompts
+ * are idempotent and the receipt read must not wait on them. A 2xx also clears
+ * a stale session-expired banner, exactly as `j` does -- a send that succeeds
+ * after auth was restored elsewhere must not leave the banner up.
+ */
+function sendResponseAuthRecovery(r: Response): Response {
   checkSessionExpired(r)
   if (r.ok) removeAuthBanner()
+  if (r.status === 401) {
+    // Best-effort: a wire may hand back a Response-like without `clone`.
+    try {
+      void r.clone().text().then((body) => noteStaleOwnerResponse(r.status, body)).catch(() => {})
+    } catch { /* not a real Response; nothing to read */ }
+  }
+  return r
+}
+
+/**
+ * A non-2xx this endpoint's caller handles itself, identified by the denial it
+ * IS rather than by the status it arrives with.
+ *
+ * Status alone is not enough to identify a denial, and on the motivating
+ * endpoint it is actively wrong: `/api/instances` answers 403 for a disabled
+ * feature, for a non-owner caller, and for a Slack-origin request, and only the
+ * first is routine. `code` is the machine-readable discriminator the gateway
+ * emits for exactly that case, so both must match before anything is opted out.
+ */
+type BenignDenial = { readonly status: number; readonly code: string }
+
+/**
+ * The one parser body behind `j`, `jNullable` and `jInstancesDisabled`.
+ *
+ * `benign` and `nullOn204` are the ONLY differences between the three, so they
+ * share this rather than holding copies that drift as the auth-recovery steps
+ * above change.
+ */
+const parseJson = async (r: Response, benign?: BenignDenial, nullOn204 = false) => {
+  checkSessionExpired(r)
+  if (r.ok) removeAuthBanner()
+  // Before the !r.ok branch, because 204 IS ok: the banner clear above still runs,
+  // exactly as it did when this was its own copy of the body.
+  if (nullOn204 && r.status === 204) return null
   if (!r.ok) {
     const errText = await r.text()
-    throw apiFailure(r, errText)
+    throw apiFailure(r, errText, benign)
   }
   return r.json()
 }
+
+const j = (r: Response) => parseJson(r)
 
 /**
  * Nullable variant of j(): preserves auth recovery + ApiError semantics but
  * returns null on 204 (No Content). Used by tips endpoints.
  */
-const jNullable = async (r: Response) => {
-  checkSessionExpired(r)
-  if (r.ok) removeAuthBanner()
-  if (r.status === 204) return null
-  if (!r.ok) {
-    const errText = await r.text()
-    throw apiFailure(r, errText)
-  }
-  return r.json()
+const jNullable = (r: Response) => parseJson(r, undefined, true)
+
+/**
+ * The one denial in the dashboard that is a DESIGNED, benign signal rather than
+ * a failure worth journaling: `/api/instances` answering its own list probe on
+ * an install where the control plane is simply off.
+ *
+ * Deliberately NOT a `(status, code)` parameter pair. A parser taking those
+ * would hand every domain module a general "ignore this status everywhere"
+ * opt-out, and there is exactly one denial that has earned it. A second one
+ * would be a second constant here, reviewed on its own merits — which is the
+ * point: each addition is a visible decision at the facade rather than a call
+ * site quietly passing different arguments.
+ */
+const INSTANCES_DISABLED: BenignDenial = { status: 403, code: 'instances_disabled' }
+
+/**
+ * `j` for the one benign denial above — nothing else.
+ *
+ * `j`'s exact semantics (auth recovery, `ApiError` on non-2xx) EXCEPT that a 403
+ * carrying `instances_disabled` is thrown but NOT recorded in the error journal.
+ * Any other denial on that same endpoint, INCLUDING another 403, journals
+ * normally: `/api/instances` also answers 403 to a non-owner caller and to a
+ * Slack-origin request, and both are real authorization failures a reader needs.
+ *
+ * Why it exists: the instances control plane is deny-by-default
+ * (`instances.enabled` off), so a 403 to its own list probe is expected on most
+ * installs. Journaling it made the sidebar's routine `['instances']` query
+ * publish a spurious "/api/instances -> 403" error report on whatever route
+ * mounted the sidebar (e.g. /chat/new-session).
+ *
+ * Handed to the domain modules through `ClientTransport` rather than imported by
+ * them, for the reason that interface's own docstring gives: a module must reach
+ * the SAME parser objects the facade installs, or an edition's calls and core's
+ * calls diverge.
+ */
+const jInstancesDisabled = (r: Response) => parseJson(r, INSTANCES_DISABLED)
+
+/** Add transport failures that have no HTTP Response to the same journal as apiFailure.
+ *
+ *  The journaled report is also PINNED to the rejection (`attachReport`). Every deadline here
+ *  rejects with the one contract message, so a notice resolving its report by message alone
+ *  (`findReport`) lands on whichever bounded read timed out LAST -- and hands the agent another
+ *  read's endpoint. The notice reads the pinned report first (`reportForError`). */
+function withJournaledDeadline<T>(
+  ms: number,
+  outer: AbortSignal | undefined,
+  endpoint: string,
+  attempt: (signal: AbortSignal) => Promise<T>,
+): Promise<T> {
+  return withDeadline(ms, outer, attempt).catch((error: unknown) => {
+    if (isDeadlineError(error)) {
+      const report = recordError({
+        source: 'api',
+        message: error instanceof Error ? error.message : String(error),
+        code: 'timeout',
+        endpoint,
+      })
+      // `isDeadlineError` has already established this is a non-null object.
+      attachReport(error as object, report)
+    }
+    throw error
+  })
 }
+
 // X-Session-Key ensures the server-side ephemeral gate always runs.
 // Without it, browser requests would skip the `if sk:` check — a fail-open
 // path that an MCP subprocess could exploit by omitting its own header.
@@ -1564,15 +996,15 @@ function trackArtifactWrite(url: string, res: Promise<Response>): Promise<Respon
   return res.finally(() => endArtifactWrite(slug))
 }
 
-/** Precondition header for a steering workspace write. Omitted when the caller
- *  has no project key, which the server treats as fail-closed for `workspace/`
- *  keys — an absent view is not an agreeing one. */
-const projectHeader = (projectKey?: string): HeadersInit | undefined =>
-  projectKey ? { 'X-Steering-Project': projectKey } : undefined
-
 const get = (url: string, sessionKey?: string, signal?: AbortSignal) =>
   fetch(url, { headers: { ...(sessionKey ? { 'X-Session-Key': sessionKey } : _sk) }, ...(signal ? { signal } : {}) })
-const post = (url: string, body?: object, sessionKey?: string, extra?: HeadersInit) =>
+const post = (
+  url: string,
+  body?: object,
+  sessionKey?: string,
+  extra?: HeadersInit,
+  redirect?: RequestRedirect,
+) =>
   trackArtifactWrite(url, fetch(url, {
     method: 'POST',
     // sessionKey overrides the shared `dashboard:ui` placeholder with the REAL
@@ -1582,6 +1014,11 @@ const post = (url: string, body?: object, sessionKey?: string, extra?: HeadersIn
     // of a specific chat slot must pass it.
     // `extra` carries a per-call precondition header (a view the server must
     // still agree with) without every caller re-implementing the header merge.
+    // `redirect` is for a caller whose URL is not core's to choose: a validated
+    // target that answers 3xx would otherwise be followed automatically, and the
+    // check that approved the FIRST url never sees the second. Defaulted so no
+    // existing caller changes behaviour.
+    ...(redirect ? { redirect } : {}),
     headers: { 'Content-Type': 'application/json', ...(sessionKey ? { 'X-Session-Key': sessionKey } : _sk), ...extra },
     body: body ? JSON.stringify(body) : undefined,
   }))
@@ -1589,7 +1026,7 @@ const put = (url: string, body: object, sessionKey?: string, extra?: HeadersInit
   trackArtifactWrite(url, fetch(url, { method: 'PUT', headers: { 'Content-Type': 'application/json', ...(sessionKey ? { 'X-Session-Key': sessionKey } : _sk), ...extra }, body: JSON.stringify(body) }))
 const del = (url: string, body?: object, sessionKey?: string, extra?: HeadersInit) =>
   trackArtifactWrite(url, fetch(url, { method: 'DELETE', headers: { ...(body ? { 'Content-Type': 'application/json' } : {}), ...(sessionKey ? { 'X-Session-Key': sessionKey } : _sk), ...extra }, body: body ? JSON.stringify(body) : undefined }))
-const patch = (url: string, body: object, sessionKey?: string) =>
+const patch = (url: string, body: object, sessionKey?: string, signal?: AbortSignal) =>
   trackArtifactWrite(url, fetch(url, {
     method: 'PATCH',
     // Same override as post(): replace the shared `dashboard:ui` placeholder with
@@ -1597,6 +1034,7 @@ const patch = (url: string, body: object, sessionKey?: string) =>
     // restricted-session gate applies to it.
     headers: { 'Content-Type': 'application/json', ...(sessionKey ? { 'X-Session-Key': sessionKey } : _sk) },
     body: JSON.stringify(body),
+    signal,
   }))
 
 // Publish the blessed transport so a downstream edition can build its OWN typed
@@ -1605,257 +1043,9 @@ const patch = (url: string, body: object, sessionKey?: string) =>
 // file or writing methods on raw fetch. See api/apiTransport.ts.
 installApiTransport({ get, post, put, del, patch, j, jNullable })
 
-export interface InstanceTunnelStatus {
-  instance_id: string
-  state: 'disconnected' | 'connecting' | 'connected' | 'error' | 'stopped'
-  local_port?: number
-  remote_port?: number
-  error?: string
-  connected_at?: number
-  token_ttl_remaining?: number
-  diagnosis?: {
-    code:
-      | 'ok'
-      | 'not_connected'
-      | 'ssh_unreachable'
-      | 'ssm_unreachable'
-      | 'remote_down'
-      | 'tunnel_down'
-      | 'unknown'
-    ok: boolean
-    reason: string
-    probes: { name: string; ok: boolean }[]
-  }
-}
-
-export interface SsoStatus {
-  state: 'ok' | 'expiring' | 'expired' | 'unknown'
-  seconds_remaining: number | null
-  expires_at: number | null
-  reason: string
-}
-
-export interface InstanceView {
-  id: string
-  name: string
-  ssh_host: string
-  remote_port: number
-  local_port: number
-  ttl: string
-  remote_bin: string
-  /** Transport used to reach the instance. Older records default to 'ssh'. */
-  connection_method: 'ssh' | 'ssm'
-  /** SSM-only: EC2 instance id (i-...) or SSM managed-instance id (mi-...). */
-  ssm_target: string
-  /** SSM-only: named AWS profile ('' = default credential chain). */
-  aws_profile: string
-  /** SSM-only: AWS region ('' = profile/environment default). */
-  aws_region: string
-  ssm_run_as: string
-  was_connected: boolean
-  status: InstanceTunnelStatus
-}
-
-export interface AddInstanceBody {
-  name: string
-  /** Required when connection_method is 'ssh' (the default). */
-  ssh_host?: string
-  remote_port?: number
-  ttl?: string
-  remote_bin?: string
-  /** Transport to reach the instance. Defaults to 'ssh' when omitted. */
-  connection_method?: 'ssh' | 'ssm'
-  /** Required when connection_method is 'ssm': i-... / mi-... instance id. */
-  ssm_target?: string
-  aws_profile?: string
-  aws_region?: string
-  ssm_run_as?: string
-  id?: string
-}
-
-/* ── Cloud provisioning (GET/POST /api/cloud/*) ──
- * Shapes mirror the backend launch-job model (cloud/launch_job.py). `size_key`
- * is the stable CLI id (light|balanced|power); `balanced` is the recommended
- * "Development" default. */
-
-/** AWS preflight for the cloud launcher. Booleans are per-capability checks;
- *  `note`/`detail` are server-authored human text rendered verbatim. */
-/** AWS coordinates a cloud lifecycle call needs beyond the stack tag.
- *
- *  `instanceId` is only meaningful for destroy, where the gateway uses it to
- *  drop the local Instances registration alongside the stack.
- */
-export interface CloudCoords {
-  profile?: string
-  region?: string
-  instanceId?: string
-}
-
-const cloudQuery = (c?: CloudCoords): string => {
-  const q = new URLSearchParams()
-  if (c?.profile) q.set('profile', c.profile)
-  if (c?.region) q.set('region', c.region)
-  if (c?.instanceId) q.set('instance_id', c.instanceId)
-  const s = q.toString()
-  return s ? `?${s}` : ''
-}
-
-export interface CloudPreflight {
-  reachable: boolean
-  account: string
-  arn: string
-  ec2_reachable: boolean
-  cloudformation_reachable: boolean
-  ssm_reachable: boolean
-  note: string
-  detail: string
-  session_manager_plugin: boolean
-  /** Copy-pasteable install command for the GATEWAY's platform, resolved
-   *  server-side (the browser cannot know that host's OS). "" when the platform
-   *  has no one-liner. */
-  session_manager_plugin_command?: string
-}
-
-export type LaunchJobStatus =
-  | 'pending' | 'running' | 'awaiting_signin' | 'done' | 'failed' | 'cancelled'
-export type LaunchStepState = 'pending' | 'active' | 'done' | 'failed' | 'skipped'
-
-/** One step of a launch job (preflight/provision/signin/connect). `label` and
- *  `detail` are server-authored and rendered verbatim, not translated. */
-export interface LaunchStep {
-  key: string
-  label: string
-  state: LaunchStepState
-  detail?: string
-}
-
-/** The device-code sign-in prompt surfaced while a job is `awaiting_signin`. */
-export interface CloudLaunchSignin {
-  url: string
-  code: string
-  ports?: number[]
-}
-
-export interface LaunchJob {
-  id: string
-  profile: string
-  region: string
-  size_key: string
-  tag: string
-  status: LaunchJobStatus
-  steps: LaunchStep[]
-  instance_id?: string
-  signin?: CloudLaunchSignin | null
-  signin_detected?: boolean
-  error?: string
-  created_at: number
-  updated_at: number
-}
-
-/** Tunnel status surfaced by GET /api/tunnel/status (backend TunnelManager).
- *  Enables mobile dashboard access via a remote tunnel. */
-export interface TunnelStatus {
-  state: 'disabled' | 'starting' | 'connected' | 'reconnecting' | 'error' | 'stopped'
-  url: string
-  error: string
-  uptime: number
-  reconnect_attempt: number
-  /**
-   * Why a `disabled` tunnel is off. `boot_flag` means the gateway was started
-   * with `--no-tunnel` and will never publish, whatever `tunnel.enabled` says in
-   * its config (a Dev Fleet pod always boots that way). Empty for every other
-   * state and for an ordinary unconfigured tunnel. Optional because a gateway
-   * older than this field does not send it.
-   */
-  reason?: string
-}
-
-export interface KiroPrerequisiteStatus {
-  platform: string
-  installed: boolean
-  authenticated: boolean
-  ready: boolean
-  initial_setup_complete: boolean
-  repair_required: boolean
-  docs_url: string
-  /**
-   * The command the USER runs to sign in (`kiro-cli login`). Supplied by the
-   * gateway and rendered verbatim in a `<code>` — never a catalog value, because
-   * a translated command cannot be typed.
-   */
-  login_command: string
-  sso_login_command: string
-  setup_allowed: boolean
-  /**
-   * True when the CLI binary is present and executable but could not be
-   * VERIFIED because this host cannot build a sandbox (verification runs the
-   * binary inside it). A categorically different condition from a missing
-   * binary — a failed sandbox build carries no information about whether the
-   * CLI is installed.
-   */
-  sandbox_unavailable: boolean
-  /** Machine-readable: 'transient' | 'foreign_sandbox' | 'no_backend' | ''. */
-  sandbox_failure_kind: string
-  /** Technical probe reason, e.g. 'unshare(CLONE_NEWNS) failed with errno 1 (EPERM)'. */
-  sandbox_detail: string
-  /**
-   * Machine-readable host mechanism behind a Linux user-namespace denial:
-   * 'apparmor_userns' | 'max_user_namespaces' | 'no_user_ns' | 'userns_denied' | ''.
-   * Selects which concrete remedy the gate renders — the errno alone leaves the
-   * user with nothing to act on.
-   */
-  sandbox_remedy: string
-  /**
-   * Kiro Crew's own agent spec files missing from the kiro-cli agents directory.
-   * Non-empty means kiro-cli will answer every session/set_mode with
-   * "Mode '<name>' not found", so `ready` is forced false and `repair_required`
-   * true — a viable binary and a good `whoami` are NOT sufficient on their own.
-   */
-  missing_agent_specs: string[]
-  /**
-   * Failure text from the repair the Check again button attempts when specs are
-   * missing. Empty when none was attempted or it succeeded. Shown verbatim and
-   * untranslated: it names the failing install step.
-   */
-  agent_spec_repair_error: string
-  /**
-   * Kiro Crew's own specs that are PRESENT on disk but which the installed
-   * kiro-cli refuses to load. Presence and acceptance are different questions: a
-   * rejected spec is dropped from kiro-cli's agent table, so `--agent kirocrew`
-   * resolves to the default agent with none of Kiro Crew's MCP servers — the
-   * same total failure as an absent spec, which statting the file cannot detect.
-   * Non-empty forces `ready` false and `repair_required` true.
-   *
-   * Optional because a gateway older than this field does not send it.
-   */
-  rejected_agent_specs?: string[]
-  /**
-   * kiro-cli's own reason for the first rejection above, sanitized. Shown
-   * verbatim and untranslated: it names the file and the construct refused.
-   */
-  agent_spec_rejection_detail?: string
-  /**
-   * Whether the installed kiro-cli exposes the `acp` subcommand every Kiro Crew
-   * session is launched through. False means the CLI runs and is signed in but
-   * is too OLD to start a session, so `ready` is forced false. The remedy is an
-   * update, not a reinstall. Optional because a gateway older than this field
-   * does not send it — treat a missing value as `true` (supported).
-   */
-  acp_supported?: boolean
-  /**
-   * The command that updates the CLI in place (`kiro-cli update`). Unlike
-   * `login_command`, Kiro Crew also runs this FOR the owner via the update-cli
-   * POST — it is the CLI's own self-update. Rendered verbatim in a `<code>`.
-   */
-  update_command?: string
-  /**
-   * Failure text from an update-cli attempt. Empty when none was attempted or it
-   * succeeded. Shown verbatim and untranslated: it names why the self-update did
-   * not complete.
-   */
-  cli_update_error?: string
-}
-
+// The Kiro credit-usage wire payload and the view model normalized from it stay
+// defined here, side by side: `KiroAccountModal` and `api/kiroUsage.ts` read
+// them from this module, and `./client/telemetry` imports them as types.
 export interface KiroBonusCreditGrantPayload {
   name: string
   used: number
@@ -1865,7 +1055,10 @@ export interface KiroBonusCreditGrantPayload {
 
 export interface KiroUsagePayload {
   available?: boolean
-  /** Why usage is unavailable when `available` is false (e.g. `api_key_auth`). */
+  /**
+   * Why usage is unavailable when `available` is false (`api_key_auth` or
+   * `signin_required`); absent when the gateway simply holds no reading.
+   */
   reason?: string
   credits_used?: number
   credits_covered?: number
@@ -1881,6 +1074,13 @@ export interface KiroUsagePayload {
   email?: string
   account_type?: string
   start_url?: string
+}
+
+/** `POST /api/sessions/usage/refresh` — the GET envelope plus the declined-scrape marker. */
+export interface KiroUsageRefreshResponse {
+  usage?: KiroUsagePayload
+  skipped?: 'scrape_parked'
+  retry_after?: number
 }
 
 export interface KiroBonusCreditGrant {
@@ -1906,246 +1106,71 @@ export interface KiroCreditUsage {
   startUrl?: string
 }
 
-export interface KasLoginStatus {
-  authenticated: boolean
-  /** Provider of the active sign-in (e.g. 'google', 'github', 'builder_id'), null when signed out. */
-  provider: string | null
-  /** Human-readable account identity (email / profile ARN), null when signed out. */
-  identity: string | null
-  /**
-   * How a sign-in can return to this gateway. 'loopback' means the browser and
-   * the gateway share a machine, so the OAuth callback lands directly on a
-   * local port; 'device' means the gateway is remote and the user instead
-   * approves a short code in their own browser (no callback required).
-   */
-  transport: 'loopback' | 'device'
+// Every endpoint owner under `./client/` is built on this one transport: the
+// helper objects just installed as the blessed `apiTransport`, plus the recovery
+// hooks the methods that read their own response call directly.
+const transport: ClientTransport = {
+  get,
+  post,
+  put,
+  del,
+  patch,
+  j,
+  jNullable,
+  jInstancesDisabled,
+  sessionKeyHeader: _sk,
+  checkSessionExpired,
+  removeAuthBanner,
+  sendResponseAuthRecovery,
+  withJournaledDeadline,
 }
 
-export interface KasLoginDeviceSession {
-  /** Handle for polling this sign-in attempt. */
-  login_id: string
-  /** The short code the user types into the verification page. */
-  user_code: string
-  /** The page (opened on ANY device) where the code is entered. */
-  verification_uri_complete: string
-  /** ISO-8601 UTC instant the code stops working. */
-  expires_at: string
-}
+const system = createSystemEndpoints(transport)
+const telemetry = createTelemetryEndpoints(transport)
+const chat = createChatEndpoints(transport)
+const onboarding = createOnboardingEndpoints(transport)
+const security = createSecurityEndpoints(transport)
+const remoteAccess = createRemoteAccessEndpoints(transport)
+const featureDiscovery = createFeatureDiscoveryEndpoints(transport)
+const themes = createThemesEndpoints(transport)
+const instances = createInstancesEndpoints(transport)
+const cloud = createCloudEndpoints(transport)
+const memory = createMemoryEndpoints(transport)
+const sessions = createSessionsEndpoints(transport)
+const mcp = createMcpEndpoints(transport)
+const agents = createAgentsEndpoints(transport)
+const chatSlotSettings = createChatSlotSettingsEndpoints(transport)
+const files = createFilesEndpoints(transport)
+const cron = createCronEndpoints(transport)
+const hooks = createHooksEndpoints(transport)
+const skills = createSkillsEndpoints(transport)
+const steering = createSteeringEndpoints(transport)
+const connections = createConnectionsEndpoints(transport)
+const config = createConfigEndpoints(transport)
+const capabilityManager = createCapabilityManagerEndpoints(transport)
+const voice = createVoiceEndpoints(transport)
+const sourceControl = createSourceControlEndpoints(transport)
+const monitors = createMonitorsEndpoints(transport)
+const chatOrganization = createChatOrganizationEndpoints(transport)
+const notifications = createNotificationsEndpoints(transport)
+const subagents = createSubagentsEndpoints(transport)
+const approvals = createApprovalsEndpoints(transport)
+const taskRunner = createTaskRunnerEndpoints(transport)
+const workflows = createWorkflowsEndpoints(transport)
+const updates = createUpdatesEndpoints(transport)
+const agentChannels = createAgentChannelsEndpoints(transport)
+const apps = createAppsEndpoints(transport)
+const artifacts = createArtifactsEndpoints(transport)
+const browserAndComputerUse = createBrowserAndComputerUseEndpoints(transport)
+const decisions = createDecisionsEndpoints(transport)
+const messaging = createMessagingEndpoints(transport)
+const autoResearch = createAutoResearchEndpoints(transport)
 
-export interface KasLoginPollResult {
-  status: 'pending' | 'authorized' | 'expired' | 'error'
-  /** Machine-readable failure code — error responses carry one too. */
-  code?: string
-  error?: string
-}
-
-/**
- * A loopback (PKCE) sign-in the gateway is listening for on a local port. The
- * dashboard opens `auth_url` in the user's browser; the portal redirects back
- * to `http://localhost:<port>` on this machine, and the gateway finishes the
- * exchange itself — the user confirms nothing. Polled with the same login_id.
- */
-export interface KasLoginLoopbackSession extends KasLoginDeviceSession {
-  auth_url: string
-  port: number
-}
-
-export interface AgentImportCategory {
-  id: string
-  label: string
-  count: number
-  description?: string
-}
-
-export interface AgentImportSource {
-  id: string
-  name: string
-  detected: boolean
-  detail?: string
-  categories: AgentImportCategory[]
-}
-
-export interface AgentImportSkipped {
-  source: string
-  category: string
-  reason: string
-  count?: number
-}
-
-export interface AgentImportScanResponse {
-  sources: AgentImportSource[]
-  skipped?: AgentImportSkipped[]
-  merge_only: true
-}
-
-export interface AgentImportSelection {
-  id: string
-  categories: string[]
-}
-
-/** Skip keeps KiroCrew's item; rename installs alongside; overwrite replaces it
- *  after the backend writes a restore copy. Omitting the field means 'skip'. */
-export type AgentImportConflictStrategy = 'skip' | 'rename' | 'overwrite'
-
-export interface AgentImportApplyRequest {
-  sources: AgentImportSelection[]
-  conflict_strategy?: AgentImportConflictStrategy
-}
-
-export interface AgentImportSummary {
-  imported: number
-  deduplicated: number
-  skipped: number
-  conflicts: number
-  /** How many of `conflicts` a retry with rename/overwrite could clear. */
-  resolvable_conflicts: number
-}
-
-export interface AgentImportApplyResponse {
-  ok: true
-  conflict_strategy: AgentImportConflictStrategy
-  summary: AgentImportSummary
-}
-
-/* ── Inbound webhooks (GET /api/webhooks) ──
- * Shapes mirror the pinned backend contract. Both one-time secrets — the bearer
- * token and the HMAC signing secret — only ever appear in
- * `WebhookTokenCreated`, from the create call; `GET /api/webhooks` never echoes
- * either one. */
-
-export type WebhookFreshness = 'fresh' | 'stale' | 'expired'
-
-export type WebhookOutcome =
-  | 'completed' | 'timeout' | 'error' | 'rejected_capacity' | 'unauthorized' | 'disabled'
-
-export interface WebhookTokenEntry {
-  id: string
-  label: string
-  /** Leading, non-secret slice of the raw token, e.g. `kc_whk_4f2b`. */
-  display_prefix: string
-  last4: string
-  created_at: number
-  /** null / 0 until the token authorizes its first call. */
-  last_used_at: number | null
-  /** True when a caller using this token must also send a timestamp + HMAC
-   *  signature of the raw body. The signing secret itself is never in this
-   *  payload — it is returned once, from the create call. Legacy config tokens
-   *  have no signing secret, so they report false. */
-  require_signature: boolean
-  /** True for the legacy `hooks.webhook_token` config scalar, which cannot be
-   *  deleted from the dashboard. */
-  legacy: boolean
-  /** Operator-owned destination. Empty only for legacy or pre-routing rows. */
-  agent: string
-  /** Per-source admission switch; absent historical rows normalize to true. */
-  enabled: boolean
-}
-
-export interface WebhookContextEntry {
-  hook_id: string
-  session_key: string
-  registered_at: number
-  age_seconds: number
-  freshness: WebhookFreshness
-  context_summary: string
-  context_chars: number
-}
-
-export interface WebhookRunRecord {
-  id: string
-  /** null for a 401 — the caller is unknown at that point. */
-  hook_id: string | null
-  session_key: string
-  name?: string
-  outcome: WebhookOutcome
-  started_at: number
-  duration_ms: number
-  result_chars: number
-  token_id: string | null
-  delivered: boolean
-  detail?: string
-}
-
-export interface WebhooksView {
-  /** Effective state: `has_tokens && switch_on`. */
-  enabled: boolean
-  /** The kill switch on its own. False ⇒ every inbound call is answered
-   *  with 503 before any auth work, while tokens and history are kept. */
-  switch_on: boolean
-  /** True when at least one token exists (stored or legacy). */
-  has_tokens: boolean
-  url: string
-  slots: { in_use: number; max: number }
-  limits: {
-    session_key_prefix: string
-    message_max: number
-    timeout_default: number
-    timeout_max: number
-    max_concurrent: number
-    /** Raw request-body cap in bytes. Optional: a server predating the cap
-     *  omits it, and the page falls back rather than rendering `undefined`. */
-    body_max_bytes?: number
-    /** Accepted clock skew, in seconds, for a signed request's timestamp. */
-    signature_window_seconds: number
-  }
-  tokens: WebhookTokenEntry[]
-  contexts: WebhookContextEntry[]
-  runs: WebhookRunRecord[]
-}
-
-export interface WebhookTokenCreated {
-  ok: boolean
-  /** The raw secret — returned exactly once and unrecoverable afterwards. */
-  token: string
-  /** The HMAC signing secret — also returned exactly once. Absent when the
-   *  token was minted bearer-only (`require_signature: false`). */
-  signing_secret?: string
-  entry: WebhookTokenEntry
-}
-
-export interface WebhookTestResult {
-  ok: boolean
-  status: number
-  session_key?: string
-  error?: string
-}
-
-/** One row of GET /api/members — a global crew as a Crew Members roster entry.
- *  Crew-record fields (kiro_agent, workspace, memory_store, model, …) are
- *  spread verbatim from the backend dataclass; only the fields the page reads
- *  are typed here, and extras pass through untyped by design so a new backend
- *  field is not a frontend break. */
-export interface MemberRosterRow {
-  /** Crew name — the display identity and the agent the DM thread pins to. */
-  name: string
-  /** Stable path-safe slug deriving the member dir and the slot key. */
-  slug: string
-  /** The pinned DM thread's slot key ('' until first open / unbound). */
-  slot_key: string
-  /** O(1) liveness: the bound slot is mid-turn right now. */
-  running: boolean
-  /** Epoch seconds of the DM transcript's last write; 0 = never talked. */
-  last_active_ts?: number
-  last_message?: string
-  kiro_agent?: string
-  workspace?: string
-  memory_store?: string
-  model?: string
-  [extra: string]: unknown
-}
-
-/** One entry of GET /api/members/{slug}/activity — a recorded engagement.
- *  `via` distinguishes a session the user opened with the member ('chat')
- *  from an orchestrator routing decision ('select_crew'); the latter records
- *  intent, not a run. */
-export interface MemberActivityEntry {
-  /** Epoch seconds (UTC) the engagement was recorded. */
-  ts: number
-  via: 'chat' | 'select_crew' | string
-  project?: string
-}
-
+// Spread in the order the methods have always had, so the key order is
+// unchanged. A key two segments both defined would silently take the later
+// one; `ApiClient.refactor.facade.test.ts` holds every key to one owner.
 export const api = {
+<<<<<<< HEAD
   status: () => fetch('/api/status').then(j),
   tunnelStatus: () => fetch('/api/tunnel/status').then(j) as Promise<TunnelStatus>,
   system: () => fetch('/api/system').then(j),
@@ -3284,14 +2309,27 @@ export const api = {
    *  server's sanitized Content-Disposition filename. */
   exportPlanYaml: async (taskId: string) => {
     const r = await get('/api/taskrunner/' + encodeURIComponent(taskId) + '/plan.yaml')
+=======
+  ...system.statusAndStorage,
+  ...telemetry.usageReadouts,
+  ...sessions.crewBoard,
+  // Defined here rather than in ./client/telemetry: it reads
+  // `api.wakatimeExportUrl` at call time, so replacing that member reroutes the
+  // download.
+  /** Download the export as a file. Fetches rather than navigating, so an
+   *  upstream 502 raises here (surfaced through ErrorNotice) instead of
+   *  replacing the dashboard with the raw error body. The saved filename comes
+   *  from the endpoint's own sanitized Content-Disposition. */
+  wakatimeExportDownload: async (start: string, end: string, format: 'csv' | 'json') => {
+    const r = await get(api.wakatimeExportUrl(start, end, format))
+>>>>>>> upstream/main
     if (!r.ok) {
-      const t = await r.text()
-      throw new ApiError(r.status, t || `HTTP ${r.status}`)
+      throw await toApiError(r)
     }
     const blob = await r.blob()
     const cd = r.headers.get('Content-Disposition') || ''
-    const m = /filename="?([^";]+)"?/.exec(cd)
-    const filename = (m && m[1]) || `${taskId}.yaml`
+    const m = /filename\*?=(?:UTF-8'')?"?([^";]+)"?/.exec(cd)
+    const filename = (m && decodeURIComponent(m[1])) || `wakatime-hours-${start}-to-${end}.${format}`
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
     a.href = url
@@ -3301,352 +2339,99 @@ export const api = {
     a.remove()
     URL.revokeObjectURL(url)
   },
-  // Update
-  checkUpdate: () => fetch('/api/update/check').then(j) as Promise<UpdateCheckResult>,
-  changelog: () => fetch('/api/changelog').then(j),
-  releases: () => fetch('/api/releases').then(j),
-  applyUpdate: () => post('/api/update').then(j),
-  setAutoUpdate: (enabled: boolean) => post('/api/update/auto', { enabled }).then(j),
-  /**
-   * Move this install onto another release channel. Changes which feed the next
-   * check compares against; it never installs anything, so the response is the
-   * re-run check against the NEW channel.
-   */
-  setUpdateChannel: (channel: string) => post('/api/update/channel', { channel }).then(j) as Promise<UpdateCheckResult>,
-  /**
-   * Restart the gateway without updating. The connection drops as the process
-   * image is replaced, so callers must treat a network failure after a 200 as
-   * the expected path rather than an error.
-   */
-  restartGateway: () => post('/api/restart').then(j),
-  // In-app wheel update step-up: arming records the request and returns the
-  // host command to run; the approval nonce never reaches this client.
-  armUpdate: () => post('/api/update/arm').then(j) as Promise<{ ok?: boolean; armed?: boolean; request_id?: string; version?: string; expires_in?: number; approve_command?: string; error?: string; code?: string }>,
-  armStatus: () => fetch('/api/update/arm').then(j) as Promise<{ armed: boolean; request_id?: string; version?: string; expires_in?: number; approve_command?: string }>,
-  cancelUpdate: () => post('/api/update/cancel').then(j),
-  simulateUpdate: (opts?: { delay?: number; fail_at?: string }) => post('/api/update/simulate', opts || {}).then(j),
-  pickFiles: () => post('/api/upload').then(j) as Promise<{ paths: string[] }>,
-  fileDiff: (path: string) => fetch('/api/file-diff?path=' + encodeURIComponent(path)).then(j) as Promise<{ diff: string; original: string; status?: 'clean' | 'modified' | 'untracked' | 'not_git' | 'error' }>,
-  /** Fuzzy file search for @-mention picker. `kind` distinguishes folder hits from files.
-   *  `kinds` narrows the result set server-side — 'files' or 'dirs'; omitted returns both.
-   *  Filtering server-side rather than dropping unwanted hits here matters because the
-   *  backend caps results BEFORE the response, so a client-side filter would silently
-   *  shrink an already-capped list. `limit` raises the server's result cap (default 15);
-   *  the server clamps it to a fixed ceiling, so a large value cannot amplify the walk. */
-  fileSearch: (q: string, project?: string, signal?: AbortSignal, kinds?: 'files' | 'dirs', limit?: number) => {
-    const p = new URLSearchParams({ q })
-    if (project) p.set('project', project)
-    if (kinds) p.set('kinds', kinds)
-    if (limit) p.set('limit', String(limit))
-    return fetch(`/api/file-search?${p}`, signal ? { signal } : undefined).then(j) as Promise<{ results: Array<{ path: string; name: string; size: number; mtime: number; kind?: 'file' | 'dir' }>; root: string }>
-  },
-  /** Upload files via browser File API (cross-platform) */
-  uploadFiles: async (files: File[]) => {
-    // Downscale oversized images client-side so they fit the model's image
-    // limits before they ever reach the server (see resizeImage.ts).
-    const prepared = await Promise.all(files.map(f => resizeImageForModel(f)))
-    const resized = prepared.map(p => p.info).filter((i): i is ResizeInfo => i !== null)
-    const fd = new FormData()
-    prepared.forEach(p => fd.append('file', p.file))
-    const res = await fetch('/api/upload/file', { method: 'POST', body: fd })
-    checkSessionExpired(res)
-    let body: { paths?: unknown; error?: string }
-    try { body = await res.json() } catch { body = {} }
-    if (!res.ok) return { paths: [] as string[], error: body.error || res.statusText, resized, resizedByPath: {} as Record<string, ResizeInfo> }
-    if (!Array.isArray(body.paths)) return { paths: [] as string[], error: i18nT('api.client.unexpected_server_response'), resized, resizedByPath: {} as Record<string, ResizeInfo> }
-    // The server appends one path per multipart 'file' part in order, so
-    // paths[i] is prepared[i]'s stored location — zip them to key resize
-    // details by the exact server path the attachment chip renders from.
-    const paths = body.paths as string[]
-    const resizedByPath: Record<string, ResizeInfo> = {}
-    prepared.forEach((p, i) => { if (p.info && paths[i]) resizedByPath[paths[i]] = p.info })
-    return { ...(body as { paths: string[]; error?: string }), resized, resizedByPath }
-  },
-  screenshot: () => post('/api/screenshot').then(j) as Promise<{ path: string }>,
-  // Custom Themes
-  themes: () => fetch('/api/themes').then(j),
-  // Dashboard config
-  dashboardConfig: () => fetch('/api/dashboard/config').then(j),
-  updateDashboardConfig: (body: object) => put('/api/dashboard/config', body).then(j),
-  createTheme: (body: object) => post('/api/themes', body).then(j),
-  installTheme: (source: { type: 'local'; path: string } | { type: 'github'; url: string }) =>
-    post('/api/themes/install', { source }).then(j),
-  updateTheme: (slug: string, body: object) => put('/api/themes/' + encodeURIComponent(slug), body).then(j),
-  deleteTheme: (slug: string) => del('/api/themes/' + encodeURIComponent(slug)).then(j),
-  themeDetail: (slug: string) => fetch('/api/themes/' + encodeURIComponent(slug)).then(j),
-  // Workspace theme config (server-authoritative)
-  themeBoot: () => fetch('/api/theme/boot').then(j),
-  updateThemeConfig: (body: {
-    mode?: string
-    color?: string
-    /** BCP-47 UI language tag; '' means follow the browser. */
-    language?: string
-    onboarded?: boolean
-    import_onboarded?: boolean
-    /** Gates the gateway's first heartbeat; see `beacon.telemetry_permitted`. */
-    privacy_acked?: boolean
-  }) =>
-    put('/api/config/theme', body).then(j),
-  // Voice
-  voiceConfig: () => fetch('/api/voice/config').then(j),
-  updateVoiceConfig: (body: object) => put('/api/voice/config', body).then(j),
-  voiceVoices: () => fetch('/api/voice/voices').then(j),
-  // Paid-AWS-service consent (Amazon Polly for TTS, Amazon Transcribe for STT).
-  // The GET reports what would be billed AND performs the identity probe, so it
-  // is the call that surfaces the account before the operator agrees to it.
-  awsConsent: (service: string) =>
-    fetch('/api/aws/consent?service=' + encodeURIComponent(service)).then(j) as Promise<AwsConsentStatus>,
-  grantAwsConsent: (service: string, shown: { profile: string; region: string; account: string }) =>
-    post('/api/aws/consent', {
-      service,
-      // Echo back exactly what was on screen. The backend rejects a mismatch, so
-      // a confirmation can only ever apply to the account the operator read.
-      expectedProfile: shown.profile,
-      expectedRegion: shown.region,
-      expectedAccount: shown.account,
-    }).then(j) as Promise<{ ok?: boolean; error?: string; code?: string; identityDetail?: string }>,
-  revokeAwsConsent: (service: string) =>
-    del('/api/aws/consent?service=' + encodeURIComponent(service)).then(j) as Promise<{ ok?: boolean; removed?: boolean }>,
-  voiceSynthesize: (slot: string, text: string, opts?: { voice?: string; engine?: string; rate?: string; pitch?: string }) =>
-    post('/api/voice/synthesize', { slot, text, ...opts }).then(j),
-
-  // Channels
-  channelsList: () => fetch('/api/channels').then(j),
-  channelPresets: () => fetch('/api/channels/presets').then(j),
-  channelGet: (id: string) => fetch('/api/channels/' + encodeURIComponent(id)).then(j),
-  channelCreate: (topic: string, agents: object[]) => post('/api/channels', { topic, agents }).then(j),
-  channelClose: (id: string) => del('/api/channels/' + encodeURIComponent(id)).then(j),
-  channelPost: (id: string, content: string, mention?: string | string[], thread_id?: string) => post('/api/channels/' + encodeURIComponent(id) + '/messages', { content, mention, thread_id }).then(j),
-  channelAddAgent: (id: string, agent: object) => post('/api/channels/' + encodeURIComponent(id) + '/agents', agent).then(j),
-  channelUpdateAgent: (id: string, aid: string, updates: object) => patch('/api/channels/' + encodeURIComponent(id) + '/agents/' + encodeURIComponent(aid), updates).then(j),
-  channelDismissAgent: (id: string, aid: string) => del('/api/channels/' + encodeURIComponent(id) + '/agents/' + encodeURIComponent(aid)).then(j),
-  channelWakeAgent: (id: string, aid: string) => post('/api/channels/' + encodeURIComponent(id) + '/agents/' + encodeURIComponent(aid) + '/wake', {}).then(j),
-  channelApproveAgent: (id: string, aid: string, action: string, pattern?: string) => post('/api/channels/' + encodeURIComponent(id) + '/agents/' + encodeURIComponent(aid) + '/approve', pattern ? { action, pattern } : { action }).then(j),
-  channelClearContext: (id: string, scope: 'all' | 'agent', agentId?: string) => post('/api/channels/' + encodeURIComponent(id) + '/clear-context', scope === 'agent' ? { scope, agent_id: agentId } : { scope }).then(j),
-
-  // --- Apps ---
-  // Installed-app payloads are normalized HERE rather than in a queryFn. The
-  // registry feed has one consumer, so `AppsPage` can narrow it at its own
-  // `useQuery`; `/api/apps` has four (the Apps page, the left rail, the command
-  // palette, the migration check), and normalizing per consumer is how the
-  // fourth one gets forgotten. This is the boundary all four share.
-  listApps: () => fetch('/api/apps').then(j).then(normalizeInstalledApps),
-  getApp: (name: string) => fetch('/api/apps/' + encodeURIComponent(name)).then(j).then(normalizeInstalledApp),
-  getAppManifest: (name: string) => fetch('/api/apps/' + encodeURIComponent(name) + '/manifest').then(j),
-  installApp: (source: string) => post('/api/apps/install', { source }).then(j),
-  enableApp: (name: string) => post('/api/apps/' + encodeURIComponent(name) + '/enable').then(j),
-  disableApp: (name: string) => post('/api/apps/' + encodeURIComponent(name) + '/disable').then(j),
-  openApp: (name: string) => post('/api/apps/' + encodeURIComponent(name) + '/open').then(j),
-  uninstallApp: (name: string, keepData = true, keepDependencies?: boolean, keepSpecific?: string[]) =>
-    post('/api/apps/' + encodeURIComponent(name) + '/uninstall', {
-      ...(keepData === false ? { purge_data: true } : {}),
-      ...(keepDependencies ? { keep_dependencies: true } : {}),
-      ...(keepSpecific?.length ? { keep_specific: keepSpecific } : {}),
-    }).then(j),
-  uninstallPreview: (name: string) =>
-    fetch('/api/apps/' + encodeURIComponent(name) + '/uninstall/preview').then(j) as Promise<{
-      app: string
-      resources: { agents: string[]; skills: string[]; crons: string[] }
-      dependencies: {
-        removable: { id: string; type: string; reason: string }[]
-        shared: { id: string; type: string; usedBy: string[]; reason: string }[]
-        userInstalled: { id: string; type: string; reason: string }[]
-      }
-    }>,
-  updateApp: (name: string, source?: string) => post('/api/apps/' + encodeURIComponent(name) + '/update', source ? { source } : {}).then(j),
-  migrateCleanup: (name: string) => del('/api/apps/' + encodeURIComponent(name) + '/migrate-cleanup').then(j),
-  // apps is intentionally `any[]`: each page (AppsPage/MigrationPage/AppDetailPage)
-  // narrows it to its own local RegistryApp shape at the call site. Typing it as
-  // unknown[] here would break those structural assignments across files.
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  listRegistry: () => fetch('/api/apps/registry').then(j) as Promise<{ apps: any[]; serverPlatform: { os: string; arch: string }; categoryOrder?: string[]; editorialSections?: unknown[] }>,
-  listRegistries: () => fetch('/api/apps/registries').then(j) as Promise<{ registries: { name: string; repo: string; branch: string; trust?: string }[]; pinned?: { name: string; repo: string; branch: string; trust?: string }[] }>,
-  updateRegistries: (registries: { name: string; repo: string; branch: string; trust?: string }[]) => put('/api/apps/registries', { registries }).then(j) as Promise<{ ok: boolean; registries: { name: string; repo: string; branch: string; trust?: string }[]; newlyTrustedHosts: string[] }>,
-  // Drops the server's on-disk caches of the published documents (catalog /
-  // category order / editorial) so the NEXT listRegistry() is rebuilt from
-  // fresh fetches instead of waiting out TTLs. A POST because it is a state
-  // change (cache deletion + outbound fetches) and must sit behind the CSRF
-  // boundary a GET query param would bypass. Deliberately NOT under
-  // /api/apps/: that namespace grants an app named `registry` implicit
-  // path ownership (token_auth._app_owns_path).
-  refreshAppStore: () => post('/api/app-store/refresh').then(j) as Promise<{ ok: boolean }>,
-  refreshRegistries: (repo?: string) => post('/api/apps/registries/refresh', repo ? { repo } : {}).then(j) as Promise<{ ok: boolean; refreshed: string[]; failed: string[]; results: { name: string; ok: boolean }[]; apps: number; lastSyncedAt: string }>,
-  installFromRegistry: (name: string) => post('/api/apps/registry/install', { name }).then(j),
-  /**
-   * Stream install logs via SSE.  Calls `onLog` for each line and resolves
-   * with the final result JSON when the install completes.
-   */
-  installFromRegistryStream: async (
-    name: string,
-    onLog: (line: string) => void,
-    signal?: AbortSignal,
-  ): Promise<InstallStreamResult> => {
-    const res = await fetch('/api/apps/registry/install-stream', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', ..._sk },
-      body: JSON.stringify({ name }),
-      signal,
-    })
-    if (!res.ok || !res.body) {
-      const text = await res.text()
-      throw new Error(text || `HTTP ${res.status}`)
-    }
-    const reader = res.body.getReader()
-    const decoder = new TextDecoder()
-    let buf = ''
-    try {
-      while (true) {
-        const { done, value } = await reader.read()
-        if (done) break
-        buf += decoder.decode(value, { stream: true })
-        // Parse SSE frames: "event: <type>\ndata: <payload>\n\n"
-        const frames = buf.split('\n\n')
-        buf = frames.pop() || ''
-        for (const frame of frames) {
-          if (!frame.trim()) continue
-          let eventType = ''
-          const dataLines: string[] = []
-          for (const line of frame.split('\n')) {
-            if (line.startsWith('event: ')) eventType = line.slice(7)
-            else if (line.startsWith('data: ')) dataLines.push(line.slice(6))
-            else if (line === 'data:') dataLines.push('')
-          }
-          const data = dataLines.join('\n')
-          if (eventType === 'log') {
-            onLog(data)
-          } else if (eventType === 'done') {
-            try { return JSON.parse(data) } catch { return { ok: false, error: data } }
-          }
-        }
-      }
-      return { ok: false, error: i18nT('api.client.stream_ended_without_completion') }
-    } finally {
-      reader.releaseLock()
-    }
-  },
-  registerApp: (body: object) => post('/api/apps/register', body).then(j),
-
-  // Artifacts
-  /** List artifacts. `session` scopes to the artifacts one chat session
-   *  ORIGINATED; `touchedBy` widens that to every artifact the session was
-   *  involved with — created, read, edited, iterated on or reverted — which is
-   *  what the in-session Artifacts tab lists. `pinned` filters on the star. */
-  artifacts: (filters?: { tag?: string; kind?: string; q?: string; source_path?: string; snippet?: boolean; contentMatch?: boolean; session?: string; touchedBy?: string; pinned?: boolean }) => {
-    const params = new URLSearchParams()
-    if (filters?.tag) params.set('tag', filters.tag)
-    if (filters?.kind) params.set('kind', filters.kind)
-    if (filters?.q) params.set('q', filters.q)
-    if (filters?.source_path) params.set('source_path', filters.source_path)
-    if (filters?.snippet) params.set('snippet', '1')
-    if (filters?.contentMatch) params.set('content', '1')
-    if (filters?.session) params.set('session', filters.session)
-    if (filters?.touchedBy) params.set('touched_by', filters.touchedBy)
-    if (filters?.pinned !== undefined) params.set('pinned', filters.pinned ? '1' : '0')
-    const s = params.toString()
-    return get(`/api/artifacts${s ? `?${s}` : ''}`).then(j)
-  },
-  artifact: (slug: string) => get(`/api/artifacts/${encodeURIComponent(slug)}`).then(j),
-  artifactVersion: (slug: string, version: number) =>
-    get(`/api/artifacts/${encodeURIComponent(slug)}/versions/${version}`).then(j),
-  artifactVersions: (slug: string) =>
-    get(`/api/artifacts/${encodeURIComponent(slug)}/versions`).then(j),
-  artifactEvents: (slug: string) =>
-    get(`/api/artifacts/${encodeURIComponent(slug)}/events`).then(j),
-  /** Record a `referenced` breadcrumb so a chat session that merely OPENED an
-   *  artifact still counts as having touched it (the "This session" section
-   *  reads the same event log via `touched_by`).
-   *
-   *  Unlike every other method here this cannot use the shared `post` helper:
-   *  that helper hardcodes `X-Session-Key: dashboard:ui`, which the events
-   *  handler deliberately maps to "no session" — the breadcrumb would be
-   *  recorded against nothing and never surface in the panel. The real slot
-   *  key is therefore sent scope-qualified (`dashboard:<slot>`), the same form
-   *  MCP callers send and the one the store's `_strip_session_scope` normalizes
-   *  to the bare slot that `touched_by` compares against.
-   *
-   *  Rejects on a non-2xx like the other methods (notably 403 for an incognito
-   *  slot, which is correct deny-by-default) — callers treat a breadcrumb as
-   *  best-effort and swallow the failure rather than failing the user's click. */
-  recordArtifactReference: (slug: string, slot: string, metadata?: { message_ts?: string; widget_index?: number }) =>
-    fetch(`/api/artifacts/${encodeURIComponent(slug)}/events`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Session-Key': `dashboard:${slot}` },
-      body: JSON.stringify({ type: 'referenced', ...(metadata ? { metadata } : {}) }),
-    }).then(j),
-  createArtifact: (
-    body: { name: string; content: string; kind?: string; source?: string; description?: string; tags?: string[]; slug?: string; source_path?: string; origin_session_key?: string; folder?: string },
-    // Pass the owning slot (as `dashboard:<slot>`) when the save is made on
-    // behalf of a chat session, so the server's restricted-session gate sees the
-    // real session instead of the shared placeholder.
-    sessionKey?: string,
+  ...chat.summaries,
+  ...telemetry.privacyPosture,
+  ...onboarding.readiness,
+  ...security.posture,
+  ...remoteAccess.mobileAccess,
+  ...security.policies,
+  ...featureDiscovery.suggestions,
+  ...themes.branding,
+  ...instances.registryAndTransfer,
+  ...cloud.launcher,
+  ...memory.memoryAndVectors,
+  ...sessions.runtimes,
+  ...telemetry.creditUsage,
+  ...mcp.probeCache,
+  ...agents.crew,
+  ...chatSlotSettings.selection,
+  ...files.projects,
+  ...cron.jobs,
+  ...security.secrets,
+  ...cron.historyAndFolders,
+  ...memory.lessons,
+  // Defined here rather than in ./client/memory: learn-cron-dashboard.md names
+  // this module as the home of `deleteLesson`.
+  // The selector is sent only when it is a string: `""` names the global row
+  // and a fragment names that scope's row, while an absent key deletes every
+  // scope's same-rule row -- which is the only delete that can reach a row the
+  // list reports as `null` (stored scope present but unusable). Passing `null`
+  // through would be refused (400 repo_scope_not_string) rather than widened.
+  // `selectors` are the row's own from the list: `scope` / `workspace` pick the
+  // JSONL file (the route defaults to the global one, so a workspace row's delete
+  // has to carry them back), and `exact` narrows the rule match to the whole
+  // rule -- the route matches by SUBSTRING by default, which is right for a CLI
+  // fragment and wrong for a table row that holds the full text ("use tabs"
+  // would also take "always use tabs").
+  deleteLesson: (
+    rule: string,
+    repoScope?: string | null,
+    selectors?: { scope?: 'global' | 'workspace'; workspace?: string; exact?: boolean },
   ) =>
-    // DEFAULTED from origin_session_key rather than left to each caller. Every
-    // save that belongs to a chat session already names it in the body for
-    // attribution, so deriving the header from that makes the gate apply by
-    // construction -- an opt-in argument meant a caller that only set
-    // origin_session_key (WidgetFrame's save-as-artifact) still sent the shared
-    // `dashboard:ui` placeholder and an incognito session's write was allowed
-    // through. An explicit sessionKey still wins for callers that need to differ.
-    post(
-      '/api/artifacts',
-      body,
-      sessionKey
-        ?? (body.origin_session_key ? `dashboard:${body.origin_session_key}` : undefined),
-    ).then(j),
-  /** Atomically resolve a just-created blank document being left: keep it, save
-   *  the draft still in the editor, or delete the abandoned shell. The store
-   *  decides under its own lock -- deciding here would race a concurrent save. */
-  settleBlankArtifact: (
-    slug: string,
-    body: { untitled_name: string; draft: string; allow_delete: boolean },
-  ) =>
-    post(`/api/artifacts/${encodeURIComponent(slug)}/settle`, body).then(j) as
-      Promise<{ outcome: 'kept' | 'saved' | 'deleted' }>,
-  updateArtifact: (slug: string, body: { content?: string; name?: string; kind?: string; description?: string; tags?: string[]; actor?: 'user' | 'agent'; event_type?: 'edited' | 'iterated' | 'reverted'; from_version?: number; snapshot?: boolean }) =>
-    patch(`/api/artifacts/${encodeURIComponent(slug)}`, body).then(j),
-  deleteArtifact: (slug: string) => del(`/api/artifacts/${encodeURIComponent(slug)}`).then(j),
-  // Artifact library folders
-  artifactFolders: () => get('/api/artifact-folders').then(j),
-  createArtifactFolder: (body: { name: string; parent_id?: string; color?: string }) =>
-    post('/api/artifact-folders', body).then(j),
-  updateArtifactFolder: (id: string, body: { name?: string; parent_id?: string; order?: number; icon?: string; color?: string }) =>
-    patch(`/api/artifact-folders/${encodeURIComponent(id)}`, body).then(j),
-  deleteArtifactFolder: (id: string, deleteContents: boolean) =>
-    del(`/api/artifact-folders/${encodeURIComponent(id)}?delete_contents=${deleteContents ? 'true' : 'false'}`).then(j),
-  /** Move an artifact into a folder ("" = unfile to root). Metadata-only — no version bump. */
-  setArtifactFolder: (slug: string, folderId: string) =>
-    patch(`/api/artifacts/${encodeURIComponent(slug)}/folder`, { folder_id: folderId }).then(j),
-  /** Pin/unpin (favorite) an artifact. Metadata-only — no version bump. */
-  // sessionKey: pass `dashboard:<slot>` when the pin is made on behalf of a chat
-  // session, so the server's restricted-session gate sees the real session rather
-  // than the transport's shared `dashboard:ui` placeholder (which satisfies the
-  // `if sk:` check but names no session, so a restricted slot was never gated).
-  setArtifactPinned: (slug: string, pinned: boolean, sessionKey?: string) =>
-    patch(`/api/artifacts/${encodeURIComponent(slug)}/pin`, { pinned }, sessionKey).then(j),
-  /** Virtual list of non-code documents from chat sessions. Pass `session`
-   * (a slot key) to scope to a single session. */
-  artifactSessionDocs: (session?: string) =>
-    get(`/api/artifacts/session-docs${session ? `?session=${encodeURIComponent(session)}` : ''}`).then(j) as Promise<{ docs: SessionDoc[] }>,
-  /** Turn a session document path into a real, saved (pinned) file-backed artifact.
-   * `originSessionKey` records the saving session; `slug_collided_with` names the plain slug, present only when the store had to suffix it. */
-  materializeArtifact: (path: string, originSessionKey?: string) =>
-    post('/api/artifacts/materialize', { path, ...(originSessionKey ? { origin_session_key: originSessionKey } : {}) }).then(j) as Promise<{ slug: string; slug_collided_with?: string }>,
-  // Artifact publishing / sharing. Local publish/sharing management
-  // only — remote-browse / clone / fork surfaces are not part of this edition.
-  publishArtifact: (slug: string, body: { visibility?: 'PRIVATE' | 'SHARED' | 'PUBLIC'; shared_with?: string[]; provider?: string }) =>
-    post(`/api/artifacts/${encodeURIComponent(slug)}/publish`, body).then(j),
-  /** Publishing providers available for an artifact kind, with per-kind support
-   *  + sharing/sync/discovery descriptors. Drives the share-panel
-   *  picker (selector shown only when >1 capable provider). */
-  getArtifactPublishProviders: (kind: string): Promise<{ providers: PublishProviderDescriptor[]; kind: string }> =>
-    get(`/api/artifacts/publish-providers?kind=${encodeURIComponent(kind)}`).then(j),
-  /** Provider-routed clone/fork of a remote artifact into the local store.
-   *  external_id travels in the body (not the path) — provider-native ids can
-   *  contain "/", which a path segment can't carry. */
-  cloneRemoteArtifact: (provider: string, externalId: string) =>
-    post(`/api/remote-artifacts/${encodeURIComponent(provider)}/clone`, { external_id: externalId }).then(j),
-  forkRemoteArtifact: (provider: string, externalId: string) =>
-    post(`/api/remote-artifacts/${encodeURIComponent(provider)}/fork`, { external_id: externalId }).then(j),
+    del('/api/lessons', {
+      rule,
+      ...(typeof repoScope === 'string' ? { repo_scope: repoScope } : {}),
+      ...(selectors?.scope ? { scope: selectors.scope } : {}),
+      ...(selectors?.workspace ? { workspace: selectors.workspace } : {}),
+      ...(selectors?.exact ? { exact: true } : {}),
+    }).then(j) as Promise<{ ok: boolean }>,
+  ...hooks.triggers,
+  ...skills.library,
+  ...steering.files,
+  ...skills.curation,
+  ...mcp.servers,
+  ...connections.accounts,
+  ...mcp.gateway,
+  ...config.settings,
+  ...telemetry.kiroUsage,
+  ...capabilityManager.catalog,
+  ...voice.speechToText,
+  ...sourceControl.providers,
+  ...chat.slotList,
+  ...monitors.loops,
+  ...chat.slots,
+  ...chatOrganization.sidebar,
+  ...chat.send,
+  ...system.taskQueue,
+  ...memory.knowledge,
+  ...notifications.inbox,
+  ...sessions.history,
+  ...instances.peerReads,
+  ...sessions.historyDetail,
+  ...chat.composerAutocomplete,
+  ...subagents.spawned,
+  ...approvals.requests,
+  ...system.logs,
+  ...taskRunner.runs,
+  ...files.reveal,
+  ...system.diagnostics,
+  ...workflows.engine,
+  ...taskRunner.plans,
+  ...updates.lifecycle,
+  ...files.fileOps,
+  ...themes.themeList,
+  ...config.dashboardRead,
+  ...featureDiscovery.featureVideos,
+  ...config.dashboardWrite,
+  ...themes.themeEditing,
+  ...voice.voiceSettings,
+  ...security.consents,
+  ...voice.synthesis,
+  ...agentChannels.channels,
+  ...apps.platform,
+  ...artifacts.library,
+  // Defined here rather than in ./client/artifacts: the i18n gate reads the
+  // query-string template below as copy, and a moved line counts as written.
   browseRemoteArtifacts: (provider: string, opts?: { scope?: string; q?: string; pageToken?: string }) =>
     get(
       `/api/remote-artifacts/${encodeURIComponent(provider)}/browse` +
@@ -3654,180 +2439,52 @@ export const api = {
         (opts?.q ? `&q=${encodeURIComponent(opts.q)}` : '') +
         (opts?.pageToken ? `&pageToken=${encodeURIComponent(opts.pageToken)}` : ''),
     ).then(j),
-  // Read-only detail fetch for a provider-hosted artifact (metadata + content),
-  // powering the remote-artifact detail page's viewer. external_id can contain
-  // "/", so it is percent-encoded into the path segment.
-  remoteArtifactDetail: (provider: string, externalId: string) =>
-    get(`/api/remote-artifacts/${encodeURIComponent(provider)}/${encodeURIComponent(externalId)}`).then(j),
-  // Remote artifact comments (view-without-fork): these write straight through
-  // to the provider (scope=shared) and are TTL-cached server-side. external_id
-  // + comment_id travel in the path, percent-encoded (provider-native ids may
-  // contain "/").
-  remoteArtifactComments: (provider: string, externalId: string) =>
-    get(`/api/remote-artifacts/${encodeURIComponent(provider)}/${encodeURIComponent(externalId)}/comments`).then(j),
-  postRemoteArtifactComment: (provider: string, externalId: string, body: { text: string; anchor?: object }) =>
-    post(`/api/remote-artifacts/${encodeURIComponent(provider)}/${encodeURIComponent(externalId)}/comments`, body).then(j),
-  replyRemoteArtifactComment: (provider: string, externalId: string, commentId: string, body: { text: string }) =>
-    post(`/api/remote-artifacts/${encodeURIComponent(provider)}/${encodeURIComponent(externalId)}/comments/${encodeURIComponent(commentId)}/reply`, body).then(j),
-  markReviewRemoteComment: (provider: string, externalId: string, commentId: string) =>
-    post(`/api/remote-artifacts/${encodeURIComponent(provider)}/${encodeURIComponent(externalId)}/comments/${encodeURIComponent(commentId)}/review`, {}).then(j),
-  deleteRemoteComment: (provider: string, externalId: string, commentId: string) =>
-    del(`/api/remote-artifacts/${encodeURIComponent(provider)}/${encodeURIComponent(externalId)}/comments/${encodeURIComponent(commentId)}`).then(j),
-  updateArtifactSharing: (slug: string, body: { visibility: 'PRIVATE' | 'SHARED' | 'PUBLIC'; shared_with?: string[] }) =>
-    patch(`/api/artifacts/${encodeURIComponent(slug)}/sharing`, body).then(j),
-  unpublishArtifact: (slug: string) => del(`/api/artifacts/${encodeURIComponent(slug)}/publish`).then(j),
-  /** Stash model-authored HTML and get back a URL a sandboxed iframe can load.
-   *
-   *  Artifact and widget frames cannot use a `blob:` URL: some WebKit-based
-   *  in-app browsers refuse the load outright and can take the page down with
-   *  it, and a sandboxed `srcdoc` frame blank-renders on WebKit. The returned
-   *  URL carries a short-lived client-bound token and the response pins
-   *  `Content-Security-Policy: sandbox`, so the document keeps an opaque origin
-   *  even opened top-level. See dashboard/handlers/sandbox_doc.py.
-   */
-  sandboxDocUrl: (html: string) =>
-    post('/api/sandbox-doc', { html }).then(j) as Promise<{ url: string }>,
-  refreshArtifactSharing: (slug: string) => post(`/api/artifacts/${encodeURIComponent(slug)}/publish/refresh`, {}).then(j),
-  pullLatest: (slug: string) =>
-    post(`/api/artifacts/${encodeURIComponent(slug)}/pull-latest`, {}).then(j),
-  upstreamStatus: (slug: string) =>
-    get(`/api/artifacts/${encodeURIComponent(slug)}/upstream-status`).then(j),
-  overwriteRemote: (slug: string) =>
-    post(`/api/artifacts/${encodeURIComponent(slug)}/overwrite-remote`, {}).then(j),
-  // Artifact comments (durable, local per-slug store)
-  artifactComments: (slug: string) =>
-    get(`/api/artifacts/${encodeURIComponent(slug)}/comments`).then(j),
-  postArtifactComment: (slug: string, body: { text: string; scope?: string; anchor?: object; is_agent?: boolean; author?: string }) =>
-    post(`/api/artifacts/${encodeURIComponent(slug)}/comments`, body).then(j),
-  replyArtifactComment: (slug: string, commentId: string, body: { text: string; is_agent?: boolean; author?: string }) =>
-    post(`/api/artifacts/${encodeURIComponent(slug)}/comments/${encodeURIComponent(commentId)}/reply`, body).then(j),
-  markCommentReview: (slug: string, commentId: string) =>
-    post(`/api/artifacts/${encodeURIComponent(slug)}/comments/${encodeURIComponent(commentId)}/review`, {}).then(j),
-  resolveComment: (slug: string, commentId: string) =>
-    post(`/api/artifacts/${encodeURIComponent(slug)}/comments/${encodeURIComponent(commentId)}/resolve`, {}).then(j),
-  reopenComment: (slug: string, commentId: string) =>
-    post(`/api/artifacts/${encodeURIComponent(slug)}/comments/${encodeURIComponent(commentId)}/reopen`, {}).then(j),
-  deleteArtifactComment: (slug: string, commentId: string) =>
-    del(`/api/artifacts/${encodeURIComponent(slug)}/comments/${encodeURIComponent(commentId)}`).then(j),
-  editArtifactComment: (slug: string, commentId: string, body: { text: string }) =>
-    patch(`/api/artifacts/${encodeURIComponent(slug)}/comments/${encodeURIComponent(commentId)}`, body).then(j),
-  // Playwright CLI browser view. GET reports; POST /start is idempotent and
-  // returns the SAME shape, so a start needs no follow-up read.
-  getBrowserInstall: () => get('/api/browser/install').then(j) as Promise<BrowserInstallData>,
-  setBrowserToken: (token: string) => put('/api/browser/token', { token }).then(j) as Promise<{ok: boolean; token: boolean}>,
-  installBrowserCli: () => post('/api/browser/install', {}).then(j) as Promise<BrowserInstallData>,
-  installBrowserEngine: (engine: string) => post('/api/browser/engine', { engine }).then(j) as Promise<BrowserInstallData>,
-  getBrowserView: () => get('/api/browser/view').then(j) as Promise<BrowserViewData>,
-  startBrowserView: () => post('/api/browser/view/start', {}).then(j) as Promise<BrowserViewData>,
-  // Computer use (desktop automation). The PUT returns the refreshed snapshot so
-  // the panel re-renders from server truth rather than its optimistic guess.
-  getComputerUseConfig: () => get('/api/computer-use/config').then(j) as Promise<ComputerUseConfigData>,
-  saveComputerUseConfig: (body: Partial<ComputerUseConfigSave>) =>
-    put('/api/computer-use/config', body).then(j) as Promise<ComputerUseConfigData>,
-  // Slack integration config
-  getSlackConfig: () => get('/api/slack/config').then(j) as Promise<SlackConfigData>,
-  getSlackManifest: () => get('/api/slack/manifest').then(j) as Promise<{ alias: string; manifest: string; create_url: string }>,
-  saveSlackConfig: (body: Partial<SlackConfigSave>) => put('/api/slack/config', body).then(j) as Promise<{ ok: boolean; restart_required: boolean; verify_warning: string }>,
-  // Discord integration config
-  getDiscordConfig: () => get('/api/discord/config').then(j) as Promise<DiscordConfigData>,
-  saveDiscordConfig: (body: Partial<DiscordConfigSave>) => put('/api/discord/config', body).then(j) as Promise<{ ok: boolean; restart_required: boolean; verify_warning: string }>,
-  // Telegram integration config
-  getTelegramConfig: () => get('/api/telegram/config').then(j) as Promise<TelegramConfigData>,
-  saveTelegramConfig: (body: Partial<TelegramConfigSave>) => put('/api/telegram/config', body).then(j) as Promise<{ ok: boolean; restart_required: boolean; verify_warning: string }>,
-  getWeComConfig: () => get('/api/wecom/config').then(j) as Promise<WeComConfigData>,
-  getFeishuConfig: () => get('/api/feishu/config').then(j) as Promise<FeishuConfigData>,
-  saveFeishuConfig: (body: Partial<FeishuConfigSave>) => put('/api/feishu/config', body).then(j) as Promise<{ ok: boolean; restart_required: boolean; verify_warning: string }>,
-  saveWeComConfig: (body: Partial<WeComConfigSave>) => put('/api/wecom/config', body).then(j) as Promise<{ ok: boolean; restart_required: boolean; verify_warning: string }>,
-  // Webex integration config
-  getWebexConfig: () => get('/api/webex/config').then(j) as Promise<WebexConfigData>,
-  saveWebexConfig: (body: Partial<WebexConfigSave>) => put('/api/webex/config', body).then(j) as Promise<{ ok: boolean; restart_required: boolean; verify_warning: string }>,
-  // iMessage — no credential to send or mask; the transport is the operator's
-  // own Messages.app on this machine.
-  getIMessageConfig: () => get('/api/imessage/config').then(j) as Promise<IMessageConfigData>,
-  saveIMessageConfig: (body: Partial<IMessageConfigSave>) => put('/api/imessage/config', body).then(j) as Promise<{ ok: boolean; restart_required: boolean; verify_warning: string }>,
-  // Effective per-channel governance policy decision: { slack: true, discord: false, ... }
-  // (true = permitted, false = denied by the `channels` policy, null = governance
-  // evaluation transiently failed → shown as "unavailable", NOT "Off by admin").
-  // All-true when no policy governs channels (standard build). Drives the Settings
-  // channel-tab "Off by admin" greying — the editable panel is replaced by a
-  // disabled/unavailable state.
-  getGovernanceChannels: () => get('/api/governance/channels').then(j) as Promise<Record<string, boolean | null>>,
-  getTeamsConfig: () => get('/api/teams/config').then(j) as Promise<TeamsConfigData>,
-  saveTeamsConfig: (body: Partial<TeamsConfigSave>) => put('/api/teams/config', body).then(j) as Promise<{ ok: boolean; restart_required: boolean; verify_warning: string }>,
-  // Weixin (iLink personal WeChat) — QR login flow. The bot credential is
-  // written server-side; the client only ever sees connection status.
-  getWeixinConfig: () => get('/api/weixin/config').then(j) as Promise<WeixinConfigData>,
-  saveWeixinConfig: (body: Partial<WeixinConfigSave>) => put('/api/weixin/config', body).then(j) as Promise<{ ok: boolean; restart_required: boolean }>,
-  weixinQrStart: () => post('/api/channels/weixin/qr/start', {}).then(j) as Promise<{ session_id: string; qrcode_img_content: string; error?: string }>,
-  weixinQrStatus: (sessionId: string) => get(`/api/channels/weixin/qr/status?session_id=${encodeURIComponent(sessionId)}`).then(j) as Promise<{ status: string; connected?: boolean; account_id?: string; error?: string }>,
-
-  // WhatsApp (personal account, QR-paired via neonize) — QR pairing flow. The
-  // session lives server-side in the neonize SQLite store; the client only ever
-  // sees connection status + policy, never a credential.
-  getWhatsAppConfig: () => get('/api/whatsapp/config').then(j) as Promise<WhatsAppConfigData>,
-  saveWhatsAppConfig: (body: Partial<WhatsAppConfigSave>) => put('/api/whatsapp/config', body).then(j) as Promise<{ ok: boolean; restart_required: boolean }>,
-  // `state` is the live client's pairing state, and it is the only authority on
-  // whether a rotating code exists: the endpoint REPORTS pairing rather than
-  // starting it (pairing begins inside the channel's own connect()), so a caller
-  // that ignores this field renders a wait for a code that will never arrive.
-  whatsAppQrStart: () => post('/api/channels/whatsapp/qr/start', {}).then(j) as Promise<{ ok: boolean; state?: string; error?: string }>,
-  whatsAppQrStatus: () => get('/api/channels/whatsapp/qr/status').then(j) as Promise<{ state: string; qr_data_url: string | null; detail: string }>,
-  // Two distinguishable successes: a bare `ok` means the device is unlinked and
-  // the local session is gone, while `code: 'session_file_kept'` means the device
-  // IS unlinked but the store holding its keys survived. A refused logout is an
-  // ApiError(502) carrying `code: 'logout_failed'`, the device is still linked
-  // there, and the session is kept deliberately so a retry is possible.
-  whatsAppUnlink: () => post('/api/channels/whatsapp/unlink', {}).then(j) as Promise<{ ok: boolean; warning?: string; code?: string }>,
-  getWhatsAppGroups: () => get('/api/whatsapp/groups').then(j) as Promise<{ groups: { jid: string; name: string }[] }>,
-
-  // Auto-research
-  researchValidate: (body: object) => post("/api/apps/auto-research/validate", body).then(j),
-  researchGrillExpand: (body: object) => post("/api/apps/auto-research/grill/expand", body).then(j),
-  researchCampaigns: () => get("/api/apps/auto-research/campaigns").then(j),
-  researchCampaign: (id: string) => get("/api/apps/auto-research/campaigns/" + id).then(j),
-  researchCreate: (body: object) => post("/api/apps/auto-research/campaigns", body).then(j),
-  researchAction: (id: string, action: string, body?: object) => patch("/api/apps/auto-research/campaigns/" + id, { action, ...body }).then(j),
-  researchGrillTree: (id: string) => get("/api/apps/auto-research/campaigns/" + id + "/grill-tree").then(j),
-  researchNudge: (id: string, text: string) => post("/api/apps/auto-research/campaigns/" + id + "/nudge", { text }).then(j),
-  researchAddQuestion: (id: string, text: string) => post("/api/apps/auto-research/campaigns/" + id + "/questions", { text }).then(j),
-  researchToKnowledge: (id: string) => post("/api/apps/auto-research/campaigns/" + id + "/to-knowledge", {}).then(j),
-  researchKnowledgeStatus: (id: string) => get("/api/apps/auto-research/campaigns/" + id + "/knowledge-status").then(j),
-  researchToArtifact: (id: string) => post("/api/apps/auto-research/campaigns/" + id + "/to-artifact", {}).then(j),
-  researchReportStatus: (id: string) => get("/api/apps/auto-research/campaigns/" + id + "/report-status").then(j),
-  researchReport: (id: string) => get("/api/apps/auto-research/campaigns/" + id + "/report").then(j),
-  researchDelete: (id: string) => del("/api/apps/auto-research/campaigns/" + id).then(j),
-
-  artifactTeardown: (slug: string) => post(`/api/deploy/teardown/${slug}`, { confirm: true }).then(j),
-  publishProviders: () => get('/api/publish-providers').then(j) as Promise<{ providers: AppPublishProvider[] }>,
-  publishToProvider: async (slug: string, providerId: string, provider?: AppPublishProvider, ttlHours?: number) => {
-    // Route to the provider's declared endpoint with the payload shape
-    // that _do_deploy expects (site_id + artifact_slug). ttl_hours is sent on
-    // BOTH preview and confirm so the previewed TTL matches what is deployed
-    // (omitting it here makes preview use the backend 72h default).
-    const endpoint = provider?.endpoint || '/api/deploy/deploy'
-    const payload: Record<string, unknown> = { site_id: slug, artifact_slug: slug, provider_id: providerId }
-    if (ttlHours !== undefined) payload.ttl_hours = ttlHours
-    const r = await post(endpoint, payload)
-    checkSessionExpired(r)
-    if (r.ok) { removeAuthBanner(); return r.json() }
-    // 409 = scan blocked — parse body so PublishHub can render findings panel
-    if (r.status === 409) { return r.json() }
-    const errText = await r.text()
-    throw new ApiError(r.status, errText || `HTTP ${r.status}`)
-  },
-
-  // Tips
-  tipsNext: () => get('/api/tips/next').then(jNullable) as Promise<{ tip: { id: string; feature: string; title: string; body: string; why: string; doc: string; doc_link?: string; cta_prompt: string; action?: { kind: 'route'; label: string; route: string } | null } | null; glow: boolean } | null>,
-  tipsStatus: () => get('/api/tips/status').then(j) as Promise<{ enabled_config: boolean; opted_out: boolean; cadence_hours: number }>,
-  tipsFeedback: (id: string, action: 'shown' | 'ack' | 'dismiss' | 'snooze' | 'helpful' | 'optout' | 'optin') => post('/api/tips/feedback', { id, action }).then(j),
-}
-
-export interface AppPublishProvider {
-  id: string
-  label: string
-  icon: string
-  kinds: string[]
-  configured: boolean
-  setupRoute: string
-  endpoint: string
+  ...artifacts.remoteAndComments,
+  ...browserAndComputerUse.hostAutomation,
+  ...decisions.consentRead,
+  // Defined here rather than in ./client/decisions: decisions.md names this
+  // module as the home of the optional-`enabled` consent write.
+  // Enabling echoes the endpoint the card showed: the gateway binds consent to
+  // that address and answers 409 if config.json moved it since the read.
+  // `toolArgs` and `compaction` are each OMITTED when the caller does not pass one,
+  // and that omission is meaningful: the gateway preserves the recorded scope for an
+  // absent field, so an ordinary switch flip can neither grant nor erase it. Pass a
+  // boolean only for the switch the owner actually acted on — including `false`,
+  // because on this route a revoke has to be written and cannot be left out.
+  // `enabled` is OPTIONAL, and leaving it out is what makes a scope write safe rather
+  // than careful: a body that carries the switch can only carry what this client last
+  // read, so a view read before a revoke turns egress back on. Omitted, the route reads
+  // the switch and the endpoint off the keystone under its own lock, and the write moves
+  // only the scopes named. A body with neither the switch nor a scope is a 400.
+  saveDecisionsConsent: (
+    enabled?: boolean,
+    endpoint?: string,
+    toolArgs?: boolean,
+    compaction?: boolean,
+    memoryText?: boolean,
+  ) =>
+    put('/api/decisions/consent', enabled === undefined
+      ? {
+        endpoint,
+        ...(toolArgs === undefined ? {} : { tool_args: toolArgs }),
+        ...(compaction === undefined ? {} : { compaction }),
+        ...(memoryText === undefined ? {} : { memory_text: memoryText }),
+      }
+      : enabled
+        ? {
+          enabled,
+          endpoint,
+          ...(toolArgs === undefined ? {} : { tool_args: toolArgs }),
+          ...(compaction === undefined ? {} : { compaction }),
+          ...(memoryText === undefined ? {} : { memory_text: memoryText }),
+        }
+        : { enabled }).then(j) as Promise<DecisionsConsentData>,
+  ...decisions.scopesAndFeedback,
+  ...messaging.channelConfigs,
+  ...autoResearch.drafts,
+  ...apps.sessionStatus,
+  ...autoResearch.campaigns,
+  ...apps.fileMenu,
+  ...artifacts.publishing,
+  ...featureDiscovery.tips,
 }

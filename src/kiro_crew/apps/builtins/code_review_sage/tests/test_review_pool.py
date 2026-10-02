@@ -47,6 +47,7 @@ class FakeHandle:
         self._script = script or []
         self._gate = gate
         self.approvals: list = []
+        self.rejections: list = []
         self.destroyed = False
 
     async def prompt(self, message, timeout=0):
@@ -58,6 +59,9 @@ class FakeHandle:
 
     async def approve_tool(self, request_id, option_id=None):
         self.approvals.append(request_id)
+
+    async def reject_tool(self, request_id):
+        self.rejections.append(request_id)
 
     async def destroy(self):
         self.destroyed = True
@@ -82,6 +86,7 @@ class FakeRuntime:
         self._seq = 0
         self.script = []
         self.gate = None
+        self.last_handle = None
         FakeRuntime.instances.append(self)
 
     def is_alive(self):
@@ -90,8 +95,9 @@ class FakeRuntime:
     async def spawn(self):
         self.spawned = True
 
-    async def kill(self, *, expected: bool = False):
+    async def kill(self, *, expected: bool = False, reason: str = ""):
         self.killed = True
+        self.kill_reason = reason
 
     async def create_session(self, cwd=None, agent=None):
         self._seq += 1
@@ -99,6 +105,7 @@ class FakeRuntime:
         self.active += 1
         self.max_active = max(self.max_active, self.active)
         h = FakeHandle(self, sid, script=list(self.script), gate=self.gate)
+        self.last_handle = h
         self.sessions[sid] = h
         self._session_queues[sid] = object()
         # mirror the handle destroy -> pop from _session_queues too
@@ -125,16 +132,29 @@ def _install_fake_runtime(test, script=None, gate=None):
     test.addCleanup(lambda: setattr(rp, "AcpRuntime", orig))
 
 
+def _work_dir(test) -> str:
+    """A real, test-owned scratch directory for ``ReviewPool(work_dir=...)``.
+
+    Even with ``AcpRuntime`` faked, ``ReviewPool._ensure_runtime_locked`` still calls
+    the real ``_write_effort_overlay``, which does ``mkdir(parents=True)`` and writes
+    ``<work_dir>/.kiro/settings/cli.json`` on disk — a fixed path like ``/tmp/x`` would
+    be a real cross-test/cross-file race under xdist, not a placeholder string.
+    """
+    tmp = tempfile.TemporaryDirectory()
+    test.addCleanup(tmp.cleanup)
+    return tmp.name
+
+
 # ── Batch lifecycle + isolation ─────────────────────────────────────────────
 class TestBatchLifecycle(unittest.IsolatedAsyncioTestCase):
     async def test_lazy_no_runtime_until_used(self):
         _install_fake_runtime(self)
-        ReviewPool(work_dir="/tmp/x")
+        ReviewPool(work_dir=_work_dir(self))
         self.assertEqual(FakeRuntime.instances, [])   # nothing spawned on construction
 
     async def test_begin_batch_spawns_one_runtime_shared_across_sends(self):
         _install_fake_runtime(self, script=[_ev(rp.EVENT_TEXT_CHUNK, text="hi")])
-        pool = ReviewPool(work_dir="/tmp/x")
+        pool = ReviewPool(work_dir=_work_dir(self))
         await pool.begin_batch()
         self.assertEqual(len(FakeRuntime.instances), 1)
         self.assertTrue(FakeRuntime.instances[0].is_alive())
@@ -148,7 +168,7 @@ class TestBatchLifecycle(unittest.IsolatedAsyncioTestCase):
 
     async def test_end_batch_kills_runtime_only_when_drained(self):
         _install_fake_runtime(self)
-        pool = ReviewPool(work_dir="/tmp/x")
+        pool = ReviewPool(work_dir=_work_dir(self))
         await pool.begin_batch()          # batches 0->1 spawns
         await pool.begin_batch()          # batches 1->2 (overlapping run)
         rt = FakeRuntime.instances[0]
@@ -159,7 +179,7 @@ class TestBatchLifecycle(unittest.IsolatedAsyncioTestCase):
 
     async def test_new_batch_after_drain_spawns_fresh_runtime(self):
         _install_fake_runtime(self)
-        pool = ReviewPool(work_dir="/tmp/x")
+        pool = ReviewPool(work_dir=_work_dir(self))
         await pool.begin_batch()
         await pool.end_batch()
         await pool.begin_batch()
@@ -168,7 +188,7 @@ class TestBatchLifecycle(unittest.IsolatedAsyncioTestCase):
 
     async def test_session_created_and_destroyed_per_task(self):
         _install_fake_runtime(self, script=[_ev(rp.EVENT_TEXT_CHUNK, text="x")])
-        pool = ReviewPool(work_dir="/tmp/x")
+        pool = ReviewPool(work_dir=_work_dir(self))
         await pool.begin_batch()
         await pool.send("task")
         rt = FakeRuntime.instances[0]
@@ -180,7 +200,7 @@ class TestBatchLifecycle(unittest.IsolatedAsyncioTestCase):
     async def test_standalone_send_lazily_spawns(self):
         # No begin_batch (standalone CLI path) -> acquire() spawns on first send.
         _install_fake_runtime(self, script=[_ev(rp.EVENT_TEXT_CHUNK, text="y")])
-        pool = ReviewPool(work_dir="/tmp/x")
+        pool = ReviewPool(work_dir=_work_dir(self))
         out = await pool.send("z")
         self.assertEqual(out, "y")
         self.assertEqual(len(FakeRuntime.instances), 1)
@@ -192,7 +212,7 @@ class TestBatchLifecycle(unittest.IsolatedAsyncioTestCase):
         # reports ok=False and the driver never marks the PR reviewed), and the
         # session must still be destroyed.
         _install_fake_runtime(self, script=[_ev(rp.EVENT_COMPLETE, stop_reason="timeout")])
-        pool = ReviewPool(work_dir="/tmp/x")
+        pool = ReviewPool(work_dir=_work_dir(self))
         await pool.begin_batch()
         with self.assertRaises(RuntimeError):
             await pool.send("t")
@@ -205,7 +225,7 @@ class TestBatchLifecycle(unittest.IsolatedAsyncioTestCase):
         # and surface as a failure (matched explicitly, not just by prefix).
         _install_fake_runtime(
             self, script=[_ev(rp.EVENT_COMPLETE, stop_reason=rp.STOP_REASON_TOOL_STALL)])
-        pool = ReviewPool(work_dir="/tmp/x")
+        pool = ReviewPool(work_dir=_work_dir(self))
         await pool.begin_batch()
         with self.assertRaises(RuntimeError):
             await pool.send("t")
@@ -228,7 +248,7 @@ class TestBatchLifecycle(unittest.IsolatedAsyncioTestCase):
         rp.AcpRuntime = factory  # type: ignore[assignment]
         self.addCleanup(lambda: setattr(rp, "AcpRuntime", orig))
         FakeRuntime.instances = []
-        pool = ReviewPool(work_dir="/tmp/x")
+        pool = ReviewPool(work_dir=_work_dir(self))
         with self.assertRaises(RuntimeError):
             await pool.begin_batch()                 # spawn fails
         self.assertEqual(pool._holder._batches, 0)   # counter not leaked
@@ -243,7 +263,7 @@ class TestConcurrency(unittest.IsolatedAsyncioTestCase):
     async def test_semaphore_caps_concurrent_sessions(self):
         gate = asyncio.Event()
         _install_fake_runtime(self, script=[_ev(rp.EVENT_TEXT_CHUNK, text="q")], gate=gate)
-        pool = ReviewPool(max_workers=2, work_dir="/tmp/x")
+        pool = ReviewPool(max_workers=2, work_dir=_work_dir(self))
         await pool.begin_batch()
         tasks = [asyncio.create_task(pool.send(f"t{i}")) for i in range(4)]
         await asyncio.sleep(0.05)
@@ -256,7 +276,7 @@ class TestConcurrency(unittest.IsolatedAsyncioTestCase):
         await pool.end_batch()
 
     async def test_effective_max_concurrent_clamped(self):
-        pool = ReviewPool(max_workers=999, work_dir="/tmp/x")
+        pool = ReviewPool(max_workers=999, work_dir=_work_dir(self))
         self.assertEqual(pool._max, MAX_CONCURRENT_CEIL)
 
 
@@ -268,7 +288,7 @@ class TestApprovalAndAudit(unittest.IsolatedAsyncioTestCase):
             _ev(rp.EVENT_TEXT_CHUNK, text="done"),
         ]
         _install_fake_runtime(self, script=script)
-        pool = ReviewPool(work_dir="/tmp/x")
+        pool = ReviewPool(work_dir=_work_dir(self))
         await pool.begin_batch()
         out = await pool.send("t")
         self.assertEqual(out, "done")
@@ -277,6 +297,71 @@ class TestApprovalAndAudit(unittest.IsolatedAsyncioTestCase):
         # find it via the runtime's last created session id
         self.assertEqual(rt._seq, 1)
         await pool.end_batch()
+
+    async def test_policy_deny_is_rejected_before_auto_approval(self):
+        script = [
+            _ev(
+                rp.EVENT_PERMISSION_REQUEST,
+                request_id="r-policy",
+                title="WorkspaceSearch",
+                tool_kind="other",
+            )
+        ]
+        _install_fake_runtime(self, script=script)
+        refusal_for = getattr(rp, "refusal_for", None)
+        self.assertIsNotNone(refusal_for, "review pool has no identity-bearing permission gate")
+        seen = {}
+
+        def _deny(event, **kwargs):
+            seen.update(kwargs)
+            return "policy"
+
+        with unittest.mock.patch.object(rp, "refusal_for", _deny):
+            pool = ReviewPool(agent="review-agent", work_dir=_work_dir(self))
+            expected_agent = pool._agent
+            await pool.begin_batch()
+            await pool.send("t")
+            handle = FakeRuntime.instances[0].last_handle
+            await pool.end_batch()
+
+        self.assertEqual(handle.approvals, [])
+        self.assertEqual(handle.rejections, ["r-policy"])
+        self.assertEqual(seen["session_key"], handle.session_id)
+        self.assertEqual(seen["agent"], expected_agent)
+        self.assertEqual(seen["app"], "code-review-sage")
+        self.assertFalse(seen["security_only"])
+
+    async def test_policy_deny_audit_survives_reject_failure(self):
+        calls: list = []
+
+        class _FakeSel:
+            def log_tool_invocation(self, **kwargs):
+                calls.append(kwargs)
+
+        async def _reject(_handle, _request_id):
+            raise RuntimeError("wire closed")
+
+        script = [
+            _ev(
+                rp.EVENT_PERMISSION_REQUEST,
+                request_id="r-policy",
+                title="WorkspaceSearch",
+                tool_kind="other",
+            )
+        ]
+        _install_fake_runtime(self, script=script)
+        with unittest.mock.patch.object(rp, "refusal_for", lambda *_a, **_kw: "policy"), \
+                unittest.mock.patch.object(rp, "_sel", lambda: _FakeSel()), \
+                unittest.mock.patch.object(FakeHandle, "reject_tool", _reject):
+            pool = ReviewPool(work_dir=_work_dir(self))
+            await pool.begin_batch()
+            with self.assertRaisesRegex(RuntimeError, "wire closed"):
+                await pool.send("t")
+            await pool.end_batch()
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["outcome"], "rejected_hook_deny")
+        self.assertEqual(calls[0]["request_id"], "r-policy")
 
     async def test_tool_call_emits_sel_audit(self):
         calls: list = []
@@ -291,7 +376,7 @@ class TestApprovalAndAudit(unittest.IsolatedAsyncioTestCase):
         orig_sel = rp._sel
         rp._sel = lambda: _FakeSel()          # type: ignore[assignment]
         self.addCleanup(lambda: setattr(rp, "_sel", orig_sel))
-        pool = ReviewPool(work_dir="/tmp/x")
+        pool = ReviewPool(work_dir=_work_dir(self))
         await pool.begin_batch()
         await pool.send("t")
         await pool.end_batch()
@@ -316,7 +401,7 @@ class TestApprovalAndAudit(unittest.IsolatedAsyncioTestCase):
         orig_sel = rp._sel
         rp._sel = lambda: _FakeSel()          # type: ignore[assignment]
         self.addCleanup(lambda: setattr(rp, "_sel", orig_sel))
-        pool = ReviewPool(work_dir="/tmp/x")
+        pool = ReviewPool(work_dir=_work_dir(self))
         await pool.begin_batch()
         await pool.send("t")
         await pool.end_batch()
@@ -345,7 +430,7 @@ class TestStatsAndConfig(unittest.IsolatedAsyncioTestCase):
 
     async def test_stats_reflect_alive_runtime(self):
         _install_fake_runtime(self)
-        pool = ReviewPool(work_dir="/tmp/x")
+        pool = ReviewPool(work_dir=_work_dir(self))
         await pool.begin_batch()
         st = pool.stats()
         self.assertTrue(st["runtime_alive"])
@@ -378,7 +463,7 @@ class TestSyncDispatchBridge(unittest.TestCase):
         orig = rp.AcpRuntime
         rp.AcpRuntime = factory  # type: ignore[assignment]
         try:
-            pool = ReviewPool(work_dir="/tmp/x")
+            pool = ReviewPool(work_dir=_work_dir(self))
             dispatch = make_sync_dispatch(self.loop, pool, default_timeout=5)
             out = dispatch("hi", 5)
             self.assertTrue(out["ok"])
@@ -401,7 +486,7 @@ class TestSyncDispatchBridge(unittest.TestCase):
         orig = rp.AcpRuntime
         rp.AcpRuntime = factory  # type: ignore[assignment]
         try:
-            pool = ReviewPool(work_dir="/tmp/x")
+            pool = ReviewPool(work_dir=_work_dir(self))
             dispatch = make_sync_dispatch(self.loop, pool, default_timeout=5)
             out = dispatch("x", 5)
             self.assertFalse(out["ok"])
@@ -461,6 +546,60 @@ class TestReviewEffort(unittest.TestCase):
 
     def test_write_effort_overlay_never_raises(self):
         _write_effort_overlay("/proc/nonexistent/\x00bad", "claude-sonnet-4.6")
+
+    def test_a_planted_link_at_the_overlay_name_takes_no_bytes(self):
+        """`work_dir` is the review worker's OWN cwd, so it is plantable.
+
+        A by-name `write_text` follows a link at the final component and
+        TRUNCATES whatever it points at, which turns this best-effort overlay
+        into an arbitrary-file-truncation primitive for a prompt-injected worker.
+        The staged replace lands on the NAME instead: the link is replaced, and
+        the file it aliased keeps its bytes.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            victim = Path(tmp) / "victim.txt"
+            victim.write_text("keep me\n", encoding="utf-8")
+            settings = Path(tmp) / ".kiro" / "settings"
+            settings.mkdir(parents=True)
+            cli = settings / "cli.json"
+            try:
+                cli.symlink_to(victim)
+            except (OSError, NotImplementedError):
+                self.skipTest("planting the attack needs symlink creation")
+
+            _write_effort_overlay(tmp, "claude-sonnet-4.6", "high")
+
+            self.assertEqual(victim.read_text(encoding="utf-8"), "keep me\n",
+                             "the aliased file was written through")
+            self.assertFalse(cli.is_symlink(), "the link survived the publish")
+
+    def test_a_planted_link_at_the_overlay_name_contributes_no_keys(self):
+        """The overlay READS `cli.json` before publishing the merged document.
+
+        The sibling case above covers the write: the publish lands on the name, so
+        the aliased file keeps its bytes. This covers the read, where the harm runs
+        the other way -- a following read copies the aliased document's keys INTO
+        the document published under this name, and the next worker loads that as
+        its own settings. The no-follow read refuses the plant, so the overlay is
+        built from "no settings yet".
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            victim = Path(tmp) / "victim.json"
+            victim.write_text('{"borrowed_key": "not-from-this-file"}', encoding="utf-8")
+            settings = Path(tmp) / ".kiro" / "settings"
+            settings.mkdir(parents=True)
+            cli = settings / "cli.json"
+            try:
+                cli.symlink_to(victim)
+            except (OSError, NotImplementedError):
+                self.skipTest("planting the attack needs symlink creation")
+
+            _write_effort_overlay(tmp, "claude-sonnet-4.6", "high")
+
+            published = json.loads(cli.read_text(encoding="utf-8"))
+            self.assertNotIn("borrowed_key", published,
+                             "the aliased document's keys were republished")
+            self.assertEqual(list(published), ["chat.modelDefaults"])
 
     def test_reviewer_model_falls_back_to_default(self):
         self.assertEqual(

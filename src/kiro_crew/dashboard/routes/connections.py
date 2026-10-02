@@ -114,6 +114,13 @@ def register(app: web.Application) -> None:
     app.router.add_post(
         "/api/instances/{id}/refresh-token", handlers_instances.api_instances_refresh_token
     )
+    # Chained-crew mint: a hub that reaches this crew by riding one of OUR
+    # forwards has no key for it, so it asks us to mint with its own dashboard
+    # port as the token's embed-parent claim. Registered here, before the
+    # catch-all proxy route, so `{path:.*}` cannot swallow it.
+    app.router.add_post(
+        "/api/instances/{id}/embed-token", handlers_instances.api_instances_embed_token
+    )
     app.router.add_post(
         "/api/instances/{id}/disconnect", handlers_instances.api_instances_disconnect
     )
@@ -128,6 +135,14 @@ def register(app: web.Application) -> None:
     app.router.add_get(
         "/api/instances/{id}/capabilities", handlers_instances.api_instances_capabilities
     )
+    # Peer live-session read for the merged-sessions sidebar. A dedicated route
+    # rather than a bare proxy hop because the peer's reply needs a hub-side
+    # filter: the peer lists the slots THIS hub drives for its own
+    # remote-execution bindings, and without that filter one conversation renders
+    # twice (see api_instances_chat_slots). Also registered BEFORE the catch-all.
+    app.router.add_get(
+        "/api/instances/{id}/chat-slots", handlers_instances.api_instances_chat_slots
+    )
     # Generic chat proxy — the carrier for the remote-crew chat view. Forwards
     # a bounded slice of the peer's /api surface over the already-open tunnel;
     # method/path policy lives in the handler (see api_instances_proxy).
@@ -139,11 +154,24 @@ def register(app: web.Application) -> None:
     # instance in the user's own AWS account as a durable launch job.
     app.router.add_get("/api/cloud/preflight", handlers_cloud.api_cloud_preflight)
     app.router.add_get("/api/cloud/iam-policy", handlers_cloud.api_cloud_iam_policy)
+    # The lanes the Set-up tab may offer (CPP remote_provisioners seam); the
+    # built-in EC2 lane plus whatever the edition composes in.
+    app.router.add_get("/api/cloud/provisioners", handlers_cloud.api_cloud_provisioners)
+    app.router.add_get("/api/cloud/identity", handlers_cloud.api_cloud_identity)
     app.router.add_get("/api/cloud/launch", handlers_cloud.api_cloud_launch_list)
     app.router.add_post("/api/cloud/launch", handlers_cloud.api_cloud_launch_create)
     app.router.add_get("/api/cloud/launch/{id}", handlers_cloud.api_cloud_launch_get)
+    # The ECS task a Fargate launch started, read live: the cloud panel's
+    # liveness source for that lane (the EC2 lane's is the Instances registry).
+    app.router.add_get("/api/cloud/launch/{id}/task", handlers_cloud.api_cloud_launch_task)
     app.router.add_post("/api/cloud/launch/{id}/cancel", handlers_cloud.api_cloud_launch_cancel)
     app.router.add_post("/api/cloud/launch/{id}/signin", handlers_cloud.api_cloud_launch_signin)
+    # Re-runs ONLY the sign-in step on a crew that ended up unsigned; never
+    # re-provisions (see api_cloud_launch_signin_restart).
+    app.router.add_post(
+        "/api/cloud/launch/{id}/signin/restart",
+        handlers_cloud.api_cloud_launch_signin_restart,
+    )
     app.router.add_post("/api/cloud/{tag}/stop", handlers_cloud.api_cloud_stop)
     app.router.add_post("/api/cloud/{tag}/start", handlers_cloud.api_cloud_start)
     app.router.add_delete("/api/cloud/{tag}", handlers_cloud.api_cloud_destroy)

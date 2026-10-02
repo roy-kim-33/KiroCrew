@@ -1,18 +1,21 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { MessageCircleQuestionMark, RotateCcw } from 'lucide-react'
-import { useMutation } from '@tanstack/react-query'
+import { useMutation, useQuery } from '@tanstack/react-query'
 import { api } from '../../api/client'
 import { useAppSelector, useAppDispatch } from '../../store'
 import { sideClose, sideOptimisticAppend, sideOptimisticRollback, sseSideQueue, sideReleaseConsumed, queueEditBroadcastAt } from '../../store/chatSlice'
 import QueueStack from '../../components/QueueStack'
-import { useChatScrollFollow } from '../../app-sdk/useChatScrollFollow'
 import ChatMessageList from '../../app-sdk/ChatMessageList'
 import FollowUpBar from '../../components/FollowUpBar'
 import { deriveFollowUpOptions } from '../../app-sdk/protocol'
 import { useComposerDraft, draftByteSize } from '../../app-sdk/useComposerDraft'
 import ChatInput from '../../components/ChatInput'
+import ErrorNotice from '../../components/ErrorNotice'
 import { SlotProvider } from '../../providers/SlotContext'
 import { useConnected } from '../../hooks/useConnected'
+import { consumeSideChatSeed, readSideChatDraft, restoreSideChatDraft, writeSideChatDraft, writeSideChatPastes, useSideChatDraft } from '../../chat-core/composer/sideChatDrafts'
+import { type PasteBlock, expandAll as expandPasteTokens, pruneBlocks } from '../../utils/pasteTokens'
+import { mergeIntoDraft as appendToDraft } from '../../utils/chatDrafts'
 import type { SideMessage, SideQueueEntry } from '../../store/chatSlice'
 import type { ChatMessage } from '../../types'
 
@@ -41,7 +44,10 @@ const EMPTY_SIDE_QUEUE: SideQueueEntry[] = []
 type SideSubmit = { q: string; steer: boolean; optimistic: boolean; slot: string;
   /** True when `q` came from a follow-up chip rather than the composer, so the draft the
    *  user is still writing must survive the send. */
-  override?: boolean }
+  override?: boolean
+  /** The composer's TOKEN text and the blocks behind it, when `q` was expanded from a
+   *  collapsed paste — what a failed submit hands back, so the pill returns as a pill. */
+  display?: string; pastes?: PasteBlock[] }
 
 /** Put `released` text back in the composer without discarding what is there.
  *
@@ -66,6 +72,20 @@ function relativeTime(iso: string): string | null {  const diff = Date.now() - n
 export default function SideChat({ slot }: { slot: string }) {
   const connected = useConnected()
   const dispatch = useAppDispatch()
+  // The footer describes what the backend enforces, so it follows the selected
+  // harness: the derived `<agent>--readonly` spec is a kiro-cli mechanism, and on
+  // any other backend the side turn runs with no tools at all (REJECT_ALL). The
+  // kiro backend is the empty string (`ACP_BACKEND_KIRO`), so an unloaded or
+  // absent value reads as kiro — the default the gateway itself falls back to.
+  const cfgQ = useQuery<{ agent?: { acp_backend?: string } }>({
+    queryKey: ['kirocrewConfig'],
+    queryFn: () => api.kirocrewConfig(),
+  })
+  // Mirrors the backend: the read-only allowance is granted only when the
+  // loaded config names the kiro backend; a turn whose config cannot load runs
+  // with no tools, so the footer claims nothing until the config is loaded and
+  // says so when the load failed.
+  const readOnlyToolsAvailable = cfgQ.isSuccess && !(cfgQ.data?.agent?.acp_backend ?? '')
   const reduxSide = useAppSelector(s => s.chat.slotSide[slot])
   const parentTurnCount = useAppSelector(s =>
     s.chat.messages.filter(m => m.role === 'user' || m.role === 'assistant').length
@@ -74,6 +94,11 @@ export default function SideChat({ slot }: { slot: string }) {
   // Transient, non-error feedback (e.g. a steer the server had to demote to a
   // queue entry). Kept apart from localError so it renders as a notice, not red.
   const [localNotice, setLocalNotice] = useState<string | null>(null)
+  // Length validation for the draft: nothing failed, the question simply has
+  // not been sent yet, so it is a hint beside the composer — not an
+  // ErrorNotice, which is for an operation that went wrong. It stays until the
+  // draft changes (the user is acting on it) or a send goes out.
+  const [lengthHint, setLengthHint] = useState<string | null>(null)
 
   // Retire the notice on its own so it cannot outlive the moment it describes.
   useEffect(() => {
@@ -81,12 +106,9 @@ export default function SideChat({ slot }: { slot: string }) {
     const t = setTimeout(() => setLocalNotice(null), NOTICE_TTL_MS)
     return () => clearTimeout(t)
   }, [localNotice])
-  // Stick-to-bottom follow shared with ChatPane/ChatEmbed (FollowController
-  // semantics): the RO on the content wrapper re-pins on growth ANYWHERE in
-  // the transcript and on collapse shrink, and only a genuine user scroll up
-  // releases it.
-  const follow = useChatScrollFollow({ resetKey: slot })
-  const scrollRef = follow.scrollerRef
+  // The transcript is ChatMessageList's virtualized mount (chat-core P5-e):
+  // it owns the scroller and the stick-to-bottom follow, so a long side
+  // thread costs the DOM of its viewport, not of its history.
 
   const messages = reduxSide?.messages ?? EMPTY_SIDE_MESSAGES
   const isPending = reduxSide?.pending ?? false
@@ -118,27 +140,7 @@ export default function SideChat({ slot }: { slot: string }) {
   )
 
   /** Derived from the same helper the main chat uses, so "options only after the answer
-   *  settles" and "a later user message clears them" behave identically.
-   *
-   *  `followUpIsPlan` is DELIBERATELY dropped here (#6754; sibling issue #6057 covers
-   *  the same drop in ChatEmbed): this side panel is not a plan-capable host, so a
-   *  plan-shaped chip stays on the composer-draft path instead of dispatching
-   *  POST /api/chat/slots/{slot}/plan-action. Why that is a recorded exclusion rather
-   *  than a live mis-dispatch:
-   *  - A side turn runs as an aside to the parent session, never as an orchestrator
-   *    turn, so a plan-shaped answer in the side buffer is conversational output, not
-   *    a plan awaiting dispatch; `useComposerDraft` owning the chip (pick → edits the
-   *    draft, amendable before send) is therefore the correct behaviour, not a
-   *    fallback.
-   *  - The dispatch path gates on the HOST slot's mode (ChatPage reads
-   *    `effectiveMode === 'orchestrator'` off the slot record before dispatching).
-   *    This panel does not read the host slot's mode today — its transcript is the
-   *    side buffer, a private mini-conversation beside the parent slot — and wiring
-   *    `usePlanActionMutation` in would first need that mode selector added, gating
-   *    on the PARENT's mode for a conversation that is not the parent's.
-   *  - An unconditional dispatch (no mode gate) would let any plan-shaped side
-   *    answer cancel or advance the parent's real plan.
-   *  Pinned by src/test/SideChat.planExclusion.test.tsx. */
+   *  settles" and "a later user message clears them" behave identically. */
   const { followUpOptions } = useMemo(
     () => deriveFollowUpOptions(transcript, isStreaming),
     [transcript, isStreaming]
@@ -148,11 +150,61 @@ export default function SideChat({ slot }: { slot: string }) {
    *  follow-up pick does to the text, where a handed-back submit goes, when Enter is a send
    *  and when it is an IME committing a candidate, and how tall the box may grow. Derived
    *  here from `followUpOptions`, so the hook has to be called after that. */
-  const composer = useComposerDraft({ followUpOptions, maxBytes: MAX_QUESTION_BYTES, maxHeight: MAX_INPUT_H })
+  // The draft lives OUTSIDE this component (chat-core's sideChatDrafts, per
+  // slot): every host unmounts the panel through a control that sits right
+  // beside the composer — another activity tab, the Members drawer's
+  // "Details", closing it, switching members — and an uncontrolled draft died
+  // with each of those. The store is the ONLY source of truth and this is a
+  // subscription to it: typing, a failed request handing its text back, and
+  // the selection toolbar's Ask seeding a quote all write the store, and the
+  // panel re-renders from it. Controlled mode hands the hook the stored text
+  // and takes every change back; `send`'s `setDraft('')` therefore clears the
+  // store too. A cached copy in state was tried and rejected — a failed submit
+  // restores text into the store while the panel may be bound elsewhere, and
+  // a cache then hid that restored text (and the next keystroke overwrote it)
+  // when the panel came back.
+  const { text: storedDraft, seedTick, pastes: pasteBlocks } = useSideChatDraft(slot)
+  const onDraftChange = useCallback((next: string) => { writeSideChatDraft(slot, next); setLengthHint(null) }, [slot])
+  // The collapsed paste blocks behind the `[ Paste #N · M lines ]` tokens in
+  // the draft — the sidecar ChatInput needs before it collapses a large paste
+  // into a chip at all. They live in the same store entry as the text (so a
+  // remount restores both, and neither outlives the page), are expanded at
+  // send, and clear with the text.
+  const onPasteBlocksChange = useCallback((next: PasteBlock[]) => { writeSideChatPastes(slot, next) }, [slot])
+  const composer = useComposerDraft({ followUpOptions, maxBytes: MAX_QUESTION_BYTES, maxHeight: MAX_INPUT_H, draft: storedDraft, onDraftChange })
   const {
     draft, setDraft,
     picked: pickedOptions, toggleOption, mergeIntoDraft, exceedsByteLimit,
   } = composer
+
+  /** Hand text back to the draft of the slot it belongs to — ALWAYS through the
+   *  store, never through the composer's `mergeIntoDraft`: in controlled mode
+   *  that resolves its updater against the render-time draft, so two failures
+   *  landing in one tick (two queued edits rejected together) would both build
+   *  on the same stale base and the second would erase the first's restore.
+   *  `readSideChatDraft` is synchronous and current, so successive restores
+   *  compose; the shown composer re-renders from the store like every other
+   *  write. Restoring to a slot the panel is not showing is the same write —
+   *  the store entry waits for that slot's panel.
+   *
+   *  This is the ONLY way an async callback may write a draft. Every writer
+   *  of the draft, and why each lands on the right slot:
+   *  - typing / follow-up chips / `send`'s clear → `setDraft` → the slot the
+   *    panel shows at that moment, which is the slot the user is acting on;
+   *  - the Select-to-Ask seed → `seedSideChatDraft(slot, …)` writes the store
+   *    entry of the slot that was asked about, mounted panel or not;
+   *  - a cancelled queue card's release → read from `slotSide[slot]` for the
+   *    slot shown; a release for a hidden slot waits in the store until that
+   *    slot's panel is on screen;
+   *  - a failed submit (`sendMutation.onError`) and a failed queue edit
+   *    (`editQueued.onError`) → `restoreDraftTo(vars.slot, …)`: the slot
+   *    captured at request time, because the panel may have been re-bound
+   *    (split view's Ask, a member switch) while the request was in flight.
+   *  A `mergeIntoDraft` inside a mutation callback would be the wrong-slot bug
+   *  again — reach for this instead. */
+  const restoreDraftTo = useCallback((target: string, text: string) => {
+    writeSideChatDraft(target, appendToDraft(readSideChatDraft(target), text))
+  }, [])
 
   /** Wrapper around the native composer; the Select-to-Ask seed resolves the
    *  textarea through it (`textarea[data-composer-input]`) instead of a
@@ -220,12 +272,15 @@ export default function SideChat({ slot }: { slot: string }) {
     onMutate: ({ q, optimistic, slot: target, override }: SideSubmit) => {
       setLocalError(null)
       setLocalNotice(null)
+      setLengthHint(null)
       if (optimistic) {
         const message: SideMessage = { role: 'user', content: q, ts: new Date().toISOString() }
         dispatch(sideOptimisticAppend({ slot: target, message }))
       }
       // Only a composer submit owns the composer's text. An override send carries its own
       // text, so clearing here would throw away a draft the user has not sent yet.
+      // The blocks go with the text: `writeSideChatDraft('')` prunes every block
+      // whose token left the text, which for an empty text is all of them.
       if (!override) setDraft('')
     },
     onSuccess: (res, vars) => {
@@ -320,7 +375,15 @@ export default function SideChat({ slot }: { slot: string }) {
       if (vars.optimistic) dispatch(sideOptimisticRollback(vars.slot))
       // Nothing was accepted, so hand the text back — merged, not chosen: the
       // user may have started a new draft while the request was in flight.
-      mergeIntoDraft(vars.q)
+      // Back to the slot it was SUBMITTED for (`vars.slot`), not whichever slot
+      // this panel shows now: a host can re-bind the panel while the request
+      // is in flight (split view's Ask, a member switch), and handing A's
+      // question to B's draft would lose it for A and corrupt B.
+      // A paste that was collapsed goes back collapsed — token text plus its
+      // blocks (restoreSideChatDraft carries them in) — never as the expanded
+      // lines, which would lose the tokens' identity on the retry.
+      if (vars.pastes?.length && vars.display) restoreSideChatDraft(vars.slot, vars.display, vars.pastes)
+      else restoreDraftTo(vars.slot, vars.q)
     },
   })
 
@@ -422,8 +485,10 @@ export default function SideChat({ slot }: { slot: string }) {
       // The editor is already closed (it closes on save, before the request resolves), so
       // this text has nowhere else to live: a 404 means the entry drained and its card is
       // gone, and a surviving card still shows the pre-edit content. Merge, never assign —
-      // the composer may hold a question the user has since started typing.
-      mergeIntoDraft(vars.content)
+      // the composer may hold a question the user has since started typing — and into
+      // the draft of the slot the edit was FOR (`vars.slot`), not whichever slot the
+      // panel shows now; see `restoreDraftTo`.
+      restoreDraftTo(vars.slot, vars.content)
     },
     onSettled: (_d, _e, vars) => { markQueuePending(vars.queueId, false) },
   })
@@ -465,39 +530,36 @@ export default function SideChat({ slot }: { slot: string }) {
     },
   })
 
-  // Scroll follow lives in useChatScrollFollow (wired on the scroller below);
-  // no tail-keyed effect — the hook's ResizeObserver sees every height change.
+  // Scroll follow lives in the virtualizer behind ChatMessageList; no
+  // tail-keyed effect — its measurement sees every height change.
 
   // Select-to-Ask seed: when the user clicks "Ask" in the selection toolbar,
-  // ChatPage opens this panel and fires a `side-seed` CustomEvent carrying the
-  // selected text. Prefill the draft with the selection as a grounding
-  // blockquote and focus the input so the user types their actual question
-  // (which then fires sideOpen → sideTurn as usual). Isolated from main context.
+  // the host opens this panel and `seedSideChatDraft` (chat-core) writes the
+  // selection into THIS slot's draft as a grounding blockquote — the draft
+  // subscription above renders it, whether the panel was already mounted or
+  // came up afterwards. What is left to do here is the focus nudge: put the
+  // caret after the quote so the user immediately types the question (which
+  // then fires sideOpen → sideTurn as usual). `seedTick` marks a seed still
+  // WAITING for the caret (a panel mounting onto an already-seeded slot nudges
+  // once on mount, which is exactly the late-mount case); the nudge consumes
+  // it, so a later remount of a once-seeded slot — reopening the Side tab, a
+  // member switch and back — leaves focus where the user has it.
   useEffect(() => {
-    const onSeed = (e: Event) => {
-      const detail = (e as CustomEvent<{ text?: string }>).detail
-      const sel = detail?.text?.trim()
-      if (!sel) return
-      const quoted = sel.split('\n').map(line => `> ${line}`).join('\n')
-      setDraft(prev => (prev.trim() ? `${prev.trimEnd()}\n\n${quoted}\n\n` : `${quoted}\n\n`))
-      // Focus + place caret at the end so the user immediately types the question.
-      requestAnimationFrame(() => {
-        const el = composerWrapRef.current?.querySelector<HTMLTextAreaElement>('textarea[data-composer-input]')
-        if (el) {
-          el.focus()
-          const len = el.value.length
-          el.setSelectionRange(len, len)
-          // Scroll to the top so the START of a long quote is visible (focusing
-          // + caret-at-end scrolls to the bottom otherwise, hiding the quote).
-          el.scrollTop = 0
-        }
-      })
-    }
-    window.addEventListener('side-seed', onSeed)
-    return () => window.removeEventListener('side-seed', onSeed)
-    // `setDraft` comes from the SDK hook, so its stability is not something the
-    // linter can see for itself — declared rather than assumed.
-  }, [setDraft])
+    if (!seedTick) return
+    const frame = requestAnimationFrame(() => {
+      const el = composerWrapRef.current?.querySelector<HTMLTextAreaElement>('textarea[data-composer-input]')
+      if (el) {
+        el.focus()
+        const len = el.value.length
+        el.setSelectionRange(len, len)
+        // Scroll to the top so the START of a long quote is visible (focusing
+        // + caret-at-end scrolls to the bottom otherwise, hiding the quote).
+        el.scrollTop = 0
+      }
+      consumeSideChatSeed(slot)
+    })
+    return () => cancelAnimationFrame(frame)
+  }, [seedTick, slot])
 
   // Auto-grow of the input is the SDK hook's job — the `min-h-[52px]` class below
   // still floors an empty box at ~2 rows, so this surface keeps its own resting size.
@@ -506,8 +568,15 @@ export default function SideChat({ slot }: { slot: string }) {
    *  is the source of truth. Every call site wraps this in an arrow, so a click event can never
    *  arrive here as the override. */
   const send = useCallback((override?: string, steerRequested = false) => {
-    const q = (override ?? draft).trim()
-    if (!q || sendMutation.isPending || !slot) return
+    const typed = (override ?? draft).trim()
+    if (!typed || sendMutation.isPending || !slot) return
+    // Collapsed pastes expand for the model here, on both the send and the
+    // steer branch (one path). The side transcript carries no per-message
+    // meta, so the bubble shows the expanded text as well — what the server
+    // stores and re-serves. Only a composer submit owns the composer's blocks:
+    // an override (a follow-up chip) supplies its own text and has none.
+    const blocks = override != null ? [] : pruneBlocks(typed, pasteBlocks)
+    const q = blocks.length ? expandPasteTokens(typed, blocks) : typed
     if (exceedsByteLimit(q)) {
       // The limit is enforced in UTF-8 bytes (server contract), but a byte count is
       // not actionable to the user — report a character target instead, derived
@@ -521,7 +590,10 @@ export default function SideChat({ slot }: { slot: string }) {
       const chars = [...q].length
       const bytes = draftByteSize(q)
       const max = Math.floor((chars * MAX_QUESTION_BYTES) / bytes)
-      setLocalError(i18nT('pages.chat.sideChat.question_too_long', {
+      // The count is of the EXPANDED text, so when a collapsed paste is part of
+      // it the message says so: the composer visibly holds one line and a pill,
+      // and a bare "yours: 12,000" against that would read as nonsense.
+      setLengthHint(i18nT(blocks.length ? 'pages.chat.sideChat.question_too_long_with_paste' : 'pages.chat.sideChat.question_too_long', {
         max: fmtNumber(max),
         current: fmtNumber(chars),
       }))
@@ -533,8 +605,8 @@ export default function SideChat({ slot }: { slot: string }) {
     // STARTS — a steer's bubble has to land above the streaming answer and a
     // queued one is a card, so the server frame places both.
     const steer = isBusy && steerRequested
-    sendMutation.mutate({ q, steer, optimistic: !isBusy, slot, override: override != null })
-  }, [draft, slot, sendMutation, isBusy, exceedsByteLimit])
+    sendMutation.mutate({ q, steer, optimistic: !isBusy, slot, override: override != null, ...(blocks.length ? { display: typed, pastes: blocks } : {}) })
+  }, [draft, pasteBlocks, slot, sendMutation, isBusy, exceedsByteLimit])
 
   const sendErr = sendMutation.error
   const displayError = sendErr
@@ -583,35 +655,45 @@ export default function SideChat({ slot }: { slot: string }) {
           </button>
         </div>
       )}
-      <div ref={scrollRef} onScroll={follow.onScroll} className="flex-1 overflow-y-auto px-3 py-2">
-        <div ref={follow.contentRef} className="space-y-2">
-        {messages.length === 0 ? (
-          <div className="flex flex-col items-center justify-center h-full text-muted gap-2 py-8">
-            {/* The icon is decoration and stays faint; the sentence is the only
-                place the UI states that this transcript is discarded, so it reads
-                at full muted contrast rather than inheriting the icon's /30. */}
-            <span className="text-[24px] text-muted/30"><MessageCircleQuestionMark className="lucide-inline" /></span>
-            <span className="text-[13px]">{i18nT('pages.chat.sideChat.ask_a_side_question_main_agent_keeps_working')}</span>
-          </div>
-        ) : (
-          <ChatMessageList messages={transcript} running={isBusy} />
-        )}
-        {isPending && lastMsg?.role === 'user' && (
-          <div className="flex items-center gap-1.5 px-2.5 py-2 text-muted">
-            <span className="flex gap-0.5">
-              <span className="w-1.5 h-1.5 rounded-full bg-current animate-pulse" style={{ animationDelay: '0ms' }} />
-              <span className="w-1.5 h-1.5 rounded-full bg-current animate-pulse" style={{ animationDelay: '150ms' }} />
-              <span className="w-1.5 h-1.5 rounded-full bg-current animate-pulse" style={{ animationDelay: '300ms' }} />
-            </span>
-            <span className="text-[12px] streaming-indicator">{i18nT('pages.chat.sideChat.thinking')}</span>
-          </div>
-        )}
-        </div>
-      </div>
+      <ChatMessageList
+        messages={transcript}
+        running={isBusy}
+        transcript={{
+          sessionId: `side:${slot}`,
+          scrollerStyle: { paddingLeft: 12, paddingRight: 12, paddingTop: 8, paddingBottom: 8 },
+          aboveRows: messages.length === 0 ? (
+            <div className="flex flex-col items-center justify-center h-full text-muted gap-2 py-8">
+              {/* The icon is decoration and stays faint; the sentence is the only
+                  place the UI states that this transcript is discarded, so it reads
+                  at full muted contrast rather than inheriting the icon's /30. */}
+              <span className="text-[24px] text-muted/30"><MessageCircleQuestionMark className="lucide-inline" /></span>
+              <span className="text-[13px]">{i18nT('pages.chat.sideChat.ask_a_side_question_main_agent_keeps_working')}</span>
+            </div>
+          ) : undefined,
+          belowRows: isPending && lastMsg?.role === 'user' ? (
+            <div className="flex items-center gap-1.5 px-2.5 py-2 text-muted">
+              <span className="flex gap-0.5">
+                <span className="w-1.5 h-1.5 rounded-full bg-current animate-pulse" style={{ animationDelay: '0ms' }} />
+                <span className="w-1.5 h-1.5 rounded-full bg-current animate-pulse" style={{ animationDelay: '150ms' }} />
+                <span className="w-1.5 h-1.5 rounded-full bg-current animate-pulse" style={{ animationDelay: '300ms' }} />
+              </span>
+              <span className="text-[12px]">{i18nT('pages.chat.sideChat.thinking')}</span>
+            </div>
+          ) : undefined,
+        }}
+      />
       {displayError && (
-        <div className="px-3 py-1 text-[12px] text-danger border-t border-border">{displayError}</div>
+        <div className="px-3 py-1 border-t border-border">
+          {/* No hand-off: the side-chat composer draft (the failed question is
+              merged back into it by the mutation's onError) is unsaved local
+              state — a navigation would discard it. */}
+          <ErrorNotice variant="inline" message={displayError} />
+        </div>
       )}
-      {!displayError && localNotice && (
+      {!displayError && lengthHint && (
+        <div className="px-3 py-1 text-[12px] text-warn border-t border-border" role="status" data-testid="side-chat-length-hint">{lengthHint}</div>
+      )}
+      {!displayError && !lengthHint && localNotice && (
         <div className="px-3 py-1 text-[12px] text-muted border-t border-border" role="status">{localNotice}</div>
       )}
       {queueCards.length > 0 && (
@@ -642,11 +724,27 @@ export default function SideChat({ slot }: { slot: string }) {
           resolves the textarea through a wrapper query. Capability shaping is by
           omission: no upload/voice/agent/model props, so the slim surface
           renders none of that chrome — same component, fewer capabilities. */}
-      <div ref={composerWrapRef} data-side-chat-input="" className="border-t border-border p-2 shrink-0">
+      {/* Tinted band: two composers can share one screen (the thread's and this
+          one — on the Members page they sit side by side, same send arrow). One
+          is off the record, the other steers a live run, so the off-record one
+          must read differently at a glance, not only from the panel header. */}
+      {/* `data-side-chat-slot` is a test / capture-harness hook naming the slot
+          this composer belongs to (nothing in production reads it). */}
+      <div ref={composerWrapRef} data-side-chat-input="" data-side-chat-slot={slot} className="border-t border-accent/30 bg-accent/5 p-2 shrink-0">
+        {/* The band says what it is IN WORDS: the blind read of the tint alone
+            was "two filled-in boxes that look almost identical". Same icon as
+            the toolbar's Ask, so the seeded composer is recognisably where
+            that button led. */}
+        <div className="flex items-center gap-1.5 px-1 pb-1.5 text-[11px] font-medium text-accent" data-testid="side-chat-off-record">
+          <MessageCircleQuestionMark size={12} aria-hidden />
+          {i18nT('pages.chat.sideChat.off_record_marker')}
+        </div>
         <SlotProvider slotId={slot}>
           <ChatInput
             value={draft}
             onChange={setDraft}
+            pasteBlocks={pasteBlocks}
+            onPasteBlocksChange={onPasteBlocksChange}
             onSend={() => { void send() }}
             canSteer
             onSteer={() => { void send(undefined, true) }}
@@ -658,9 +756,24 @@ export default function SideChat({ slot }: { slot: string }) {
             promptOptimizer={false}
             connected={connected}
           />
-          <div role="note" className="px-1 pt-1.5 text-[11px] leading-4 text-muted">
-            {i18nT('pages.chat.sideChat.context_only_tools_unavailable')}
-          </div>
+          {cfgQ.isError ? (
+            // No agent hand-off: the composer above still works (the turn runs
+            // without tools), so there is nothing for the agent to take over.
+            <ErrorNotice
+              variant="inline"
+              className="px-1 pt-1.5 text-[11px] leading-4"
+              message={i18nT('pages.chat.sideChat.context_only_config_unavailable')}
+              testId="side-chat-config-error"
+            />
+          ) : cfgQ.isSuccess ? (
+            <div role="note" className="px-1 pt-1.5 text-[11px] leading-4 text-muted">
+              {i18nT(
+                readOnlyToolsAvailable
+                  ? 'pages.chat.sideChat.context_only_tools_unavailable'
+                  : 'pages.chat.sideChat.context_only_tools_unavailable_backend',
+              )}
+            </div>
+          ) : null}
         </SlotProvider>
       </div>
     </div>

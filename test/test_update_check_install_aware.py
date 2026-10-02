@@ -13,9 +13,14 @@ could not complete sets ``error`` and leaves ``checked`` False.
 
 from __future__ import annotations
 
+import ast
 import asyncio
+import contextlib
+import inspect
 import json
+import os
 import subprocess
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiohttp
@@ -23,6 +28,7 @@ import pytest
 
 from kiro_crew.dashboard.handlers import updates
 from kiro_crew.platform import update_capability, update_layout, update_provider
+from kiro_crew.platform.update_capability import AutoUpdateEffect
 from kiro_crew.platform.update_provider import CommandProvider, UpdateCheckResult
 
 # A well-formed manifest, shaped like the real feed document.
@@ -49,6 +55,63 @@ def _init_repo(path) -> None:
     subprocess.run(
         ["git", "init", "-q"], cwd=str(path), check=True, capture_output=True, timeout=30
     )
+
+
+def _pin_probe_git(monkeypatch, tmp_path):
+    """Resolve the worktree probe's git to a fake under ``tmp_path``.
+
+    ``update_capability._git_toplevel`` finds git through ``trusted_system_bin``
+    (fixed system directories, never PATH) and asks ``rev-parse --show-toplevel``
+    about the install root. Left alone, that is the HOST's git running from the
+    test process -- and on a host that keeps git outside those directories the
+    probe silently degrades to the on-disk fallback, so which branch a test
+    exercised depended on the machine. The fake answers the one question the
+    probe asks the way git does: the ``-C`` root itself when it carries ``.git``,
+    exit 128 otherwise. Every argv it sees is appended to ``git-calls.log``
+    beside it. The probe's own reading of real repositories is covered in
+    ``test_update_capability.py``; here the install shape is a precondition.
+    """
+    bin_dir = tmp_path / "fake-bin"
+    bin_dir.mkdir()
+    log = bin_dir / "git-calls.log"
+    if os.name == "nt":
+        fake = bin_dir / "git.cmd"
+        fake.write_text(
+            "@echo off\r\n"
+            f'echo %* >> "{log}"\r\n'
+            ":loop\r\n"
+            'if "%~1"=="" goto miss\r\n'
+            'if "%~1"=="-C" (\r\n'
+            '  if exist "%~2\\.git" (echo %~2& exit /b 0)\r\n'
+            "  goto miss\r\n"
+            ")\r\n"
+            "shift\r\n"
+            "goto loop\r\n"
+            ":miss\r\n"
+            "echo fatal: not a git repository 1>&2\r\n"
+            "exit /b 128\r\n",
+            encoding="utf-8",
+        )
+    else:
+        fake = bin_dir / "git"
+        fake.write_text(
+            "#!/bin/sh\n"
+            f'printf \'%s\\n\' "$*" >> "{log}"\n'
+            "root=\n"
+            'while [ "$#" -gt 0 ]; do\n'
+            '  if [ "$1" = "-C" ]; then root=$2; shift; fi\n'
+            "  shift\n"
+            "done\n"
+            'if [ -n "$root" ] && [ -e "$root/.git" ]; then printf \'%s\\n\' "$root"; exit 0; fi\n'
+            "echo 'fatal: not a git repository' >&2\n"
+            "exit 128\n",
+            encoding="utf-8",
+        )
+        fake.chmod(0o755)
+    monkeypatch.setattr(
+        "kiro_crew.platform.update_capability.trusted_system_bin", lambda _name: str(fake)
+    )
+    return fake
 
 
 def _manifest(**overrides: object) -> bytes:
@@ -85,7 +148,7 @@ def _wheel_install(monkeypatch, tmp_path):
     """Default every test in this module to a WHEEL install on the insider lane.
 
     A git checkout is opt-in per test (``_git_install``), because the interesting
-    new behaviour is the layout that used to be skipped entirely.
+    layout is the one skipped entirely without that checkout.
     """
     monkeypatch.delenv("KIROCREW_PROJECT_DIR", raising=False)
     monkeypatch.delenv("KIROCREW_CDN_BASE", raising=False)
@@ -221,7 +284,7 @@ class TestWheelInstallCheck:
         `derive_capability` composes the installer command from the channel at
         DERIVATION time; the feed check reads the channel again to build the URL. A
         switch (the endpoint, or `cli.sh` writing the file directly) landing between
-        the two used to publish the new lane's name beside the OLD lane's command —
+        the two can publish the new lane's name beside the OLD lane's command —
         and the command is the half the user acts on, so copy-pasting it would move
         the install straight back.
         """
@@ -673,6 +736,7 @@ class TestGitCheckoutStillWorks:
     @pytest.fixture
     def _git_install(self, monkeypatch, tmp_path):
         _init_repo(tmp_path)
+        _pin_probe_git(monkeypatch, tmp_path)
         monkeypatch.setenv("KIROCREW_PROJECT_DIR", str(tmp_path))
         # These tests exercise the CHECK against a scripted git; the process
         # running them does not load kiro_crew from tmp_path, so the provenance
@@ -1085,50 +1149,144 @@ class TestCheckIsRateLimitedEvenOnFailure:
         asyncio.run(updates._do_update_check())
         assert updates._last_update_check > 0.0
 
-    def test_overlapping_checks_are_single_flight(self, monkeypatch):
-        # /api/status fires this as a background task on every poll until the
-        # interval clock is stamped, and the clock is only stamped when a check
-        # FINISHES — so concurrent polls used to stack one CDN fetch each, every
-        # one holding a session for the full timeout.
+    def test_overlapping_checks_share_and_await_one_verdict(self, monkeypatch):
+        # Concurrent manual checks and the automatic coordinator must consume
+        # the same completed verdict. Returning early can silently skip apply.
         calls = {"n": 0}
+        started = asyncio.Event()
+        release = asyncio.Event()
 
-        async def _slow(url: str) -> tuple[int, bytes]:
+        async def _blocked(url: str) -> tuple[int, bytes]:
             calls["n"] += 1
-            await asyncio.sleep(0.05)
+            started.set()
+            await release.wait()
             return 200, _manifest(version="0.1.3rc2")
 
-        monkeypatch.setattr(updates, "_fetch_feed_bytes", _slow)
+        monkeypatch.setattr(updates, "_fetch_feed_bytes", _blocked)
         monkeypatch.setattr(updates, "_local_version", "0.1.2rc3")
 
         async def _drive() -> None:
-            await asyncio.gather(*(updates._do_update_check() for _ in range(5)))
+            leader = asyncio.create_task(updates._do_update_check())
+            await asyncio.wait_for(started.wait(), timeout=1)
+            follower = asyncio.create_task(updates._do_update_check())
+            await asyncio.sleep(0)
+            assert not follower.done(), "a follower returned before the shared verdict existed"
+            release.set()
+            await asyncio.gather(leader, follower)
 
         asyncio.run(_drive())
         assert calls["n"] == 1
-        # The winner's verdict still lands — the no-ops must not blank it.
         assert updates.get_update_info()["update_available"] is True
 
-    def test_the_flag_is_released_even_when_the_check_raises(self, monkeypatch):
-        # A stuck flag would wedge the check for the process's lifetime.
+    def test_cancelled_manual_creator_does_not_stop_coordinator_follower(self, monkeypatch):
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def _blocked() -> None:
+            started.set()
+            await release.wait()
+
+        monkeypatch.setattr(updates, "_run_update_check", _blocked)
+
+        async def _drive() -> None:
+            creator = asyncio.create_task(updates._do_update_check())
+            await asyncio.wait_for(started.wait(), timeout=1)
+            worker = updates._check_task
+            assert worker is not None
+
+            creator.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await creator
+            assert not worker.cancelled()
+            assert not worker.done()
+
+            coordinator = asyncio.create_task(updates._do_update_check())
+            release.set()
+            await coordinator
+            assert worker.done()
+            assert updates._check_task is None
+            assert updates._check_task_generation is None
+
+        asyncio.run(_drive())
+
+    def test_cancelled_only_caller_does_not_cache_completed_worker(self, monkeypatch):
+        started = asyncio.Event()
+        release = asyncio.Event()
+        calls = 0
+
+        async def _blocked_once() -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                started.set()
+                await release.wait()
+
+        monkeypatch.setattr(updates, "_run_update_check", _blocked_once)
+
+        async def _drive() -> None:
+            creator = asyncio.create_task(updates._do_update_check())
+            await asyncio.wait_for(started.wait(), timeout=1)
+            worker = updates._check_task
+            assert worker is not None
+
+            creator.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await creator
+            release.set()
+            await worker
+            await asyncio.sleep(0)
+            assert updates._check_task is None
+
+            await updates._do_update_check()
+            assert calls == 2
+
+        asyncio.run(_drive())
+
+    def test_gateway_shutdown_cancels_the_shared_check(self, monkeypatch):
+        started = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        async def _blocked() -> None:
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+
+        monkeypatch.setattr(updates, "_run_update_check", _blocked)
+
+        async def _drive() -> None:
+            coordinator = asyncio.create_task(updates._do_update_check())
+            await asyncio.wait_for(started.wait(), timeout=1)
+            await updates._cancel_update_check()
+            with pytest.raises(asyncio.CancelledError):
+                await coordinator
+            assert cancelled.is_set()
+            assert updates._check_task is None
+            assert updates._check_task_generation is None
+
+        asyncio.run(_drive())
+
+    def test_task_ownership_is_released_even_when_check_raises(self, monkeypatch):
+        # A finished task reference would wedge checks for the process's lifetime.
         async def _boom(url: str) -> tuple[int, bytes]:
             raise RuntimeError("unexpected")
 
         monkeypatch.setattr(updates, "_fetch_feed_bytes", _boom)
         asyncio.run(updates._do_update_check())
-        assert updates._check_in_flight is False
+        assert updates._check_task is None
         assert updates.get_update_info()["error_code"] == "unknown"
 
-    def test_the_flag_is_released_when_the_DERIVATION_raises(self, monkeypatch):
+    def test_task_ownership_is_released_when_derivation_raises(self, monkeypatch):
         # The derivation runs before any branch is chosen, so a raise there is the
-        # one that can escape the single-flight guard. A leaked flag makes every
-        # later check a silent no-op: the gateway stops noticing updates at all
-        # and nothing surfaces the fact.
+        # one that can escape ordinary result containment. A leaked task owner
+        # makes later callers join a dead worker instead of checking again.
         def _boom() -> object:
             raise RuntimeError("git exploded")
 
         monkeypatch.setattr(updates, "derive_capability", _boom)
         asyncio.run(updates._do_update_check())
-        assert updates._check_in_flight is False
+        assert updates._check_task is None
         assert updates.get_update_info()["error_code"] == "unknown"
         assert updates.get_update_info()["check_status"] == "failed"
 
@@ -1153,14 +1311,32 @@ class TestAutoApplyGuard:
         # drag in credentials, the slot manager and the whole boot path.
         orch = object.__new__(GatewayOrchestrator)
         orch.dashboard_state = MagicMock()
+        orch._update_apply_deferred = False
+        orch._mandatory_update_deferred_at = None
+        orch._mandatory_update_deferred_key = None
+        orch._session_tasks = {}
+        orch.sessions = MagicMock()
+        orch.sessions.pause_turn_admission_for_update = AsyncMock(return_value=True)
+        orch.sessions.resume_turn_admission_after_update = AsyncMock()
+        orch.sessions.drain_active_turns = AsyncMock(return_value=0)
+        orch._schedule_inbound_replay = MagicMock()
         orch._auto_apply_update = AsyncMock()
         orch._auto_apply_wheel_update = AsyncMock()
         return orch
 
-    def _run(self, info: dict[str, object], *, auto_update: bool, dist: str = "wheel"):
+    def _run(
+        self,
+        info: dict[str, object],
+        *,
+        auto_update: bool,
+        managed_venv: bool = True,
+        busy: int = 0,
+        effect=None,
+    ):
         import kiro_crew.dashboard.handlers as handlers
 
         orch = self._orchestrator()
+        orch._in_flight_work_counts = MagicMock(return_value=(busy, 0))
         cfg = MagicMock()
         cfg.auto_update = auto_update
         from kiro_crew.platform.governance import UpdatePins
@@ -1175,16 +1351,29 @@ class TestAutoApplyGuard:
                         "kiro_crew.platform.update_governance.update_required",
                         return_value=False,
                     ):
-                        # The installer may only be driven for the `wheel` stamp,
-                        # so the stamp is part of the case rather than whatever
-                        # this test host happens to be built as.
-                        with patch("kiro_crew.slack.gateway.distribution", return_value=dist):
+                        # Runtime ownership is authoritative. Old managed wheels
+                        # predate the build stamp and report "source", while a
+                        # foreign wheel must never be rewritten by Kiro Crew.
+                        with patch(
+                            "kiro_crew.platform.wheel_engine.running_from_managed_venv",
+                            return_value=managed_venv,
+                        ):
                             # No commands in the policy pins, so resolve_provider
                             # returns None and the code falls through to the legacy
                             # path under test.
-                            with patch(
-                                "kiro_crew.platform.governance.active_update_pins",
-                                return_value=UpdatePins(),
+                            with (
+                                patch(
+                                    "kiro_crew.platform.governance.active_update_pins",
+                                    return_value=UpdatePins(),
+                                ),
+                                (
+                                    patch(
+                                        "kiro_crew.slack.gateway.auto_update_effect",
+                                        return_value=effect,
+                                    )
+                                    if effect is not None
+                                    else contextlib.nullcontext()
+                                ),
                             ):
                                 asyncio.run(orch._check_for_updates())
         finally:
@@ -1192,7 +1381,34 @@ class TestAutoApplyGuard:
             handlers._update_info.update(original)
         return orch
 
-    def test_wheel_install_notifies_instead_of_applying(self):
+    def test_managed_install_auto_applies_without_consulting_the_build_stamp(self):
+        info = {
+            "update_available": True,
+            "can_apply": False,
+            "managed_by": "kirocrew",
+            "remediation": {
+                "kind": "command",
+                "message": "Re-run the installer to upgrade.",
+                "command": "curl -fsSL … | sh",
+            },
+        }
+        with patch(
+            "kiro_crew.slack.gateway.distribution",
+            side_effect=AssertionError("managed-venv ownership must replace the build stamp"),
+        ):
+            orch = self._run(
+                info,
+                auto_update=True,
+                managed_venv=True,
+                effect=AutoUpdateEffect("install", "wheel"),
+            )
+        orch._auto_apply_update.assert_not_awaited()
+        orch._auto_apply_wheel_update.assert_awaited_once()
+        orch.sessions.pause_turn_admission_for_update.assert_awaited_once()
+        orch.sessions.resume_turn_admission_after_update.assert_awaited_once()
+        orch._schedule_inbound_replay.assert_called_once()
+
+    def test_busy_managed_install_defers_and_keeps_update_pending(self):
         orch = self._run(
             {
                 "update_available": True,
@@ -1205,11 +1421,96 @@ class TestAutoApplyGuard:
                 },
             },
             auto_update=True,
+            managed_venv=True,
+            busy=1,
+            effect=AutoUpdateEffect("install", "wheel"),
         )
-        # The git apply must NOT run on a non-git tree.
+        orch._auto_apply_wheel_update.assert_not_awaited()
+        assert orch._update_apply_deferred is True
+        orch.sessions.pause_turn_admission_for_update.assert_awaited_once()
+        orch.sessions.resume_turn_admission_after_update.assert_awaited_once()
+        orch._schedule_inbound_replay.assert_called_once()
+        orch.dashboard_state.push_refresh.assert_called_with("update_available")
+
+    def test_mandatory_busy_update_keeps_deferring_after_the_grace_limit(self):
+        orch = self._orchestrator()
+        orch._mandatory_update_deferred_at = 0.0
+        orch._mandatory_update_deferred_key = "floor:9.9.9"
+        orch._in_flight_work_counts = MagicMock(return_value=(1, 0))
+
+        prepared = asyncio.run(
+            orch._prepare_auto_update_apply(
+                mandatory=True,
+                mandatory_key="floor:9.9.9",
+            )
+        )
+
+        assert prepared is False
+        orch.sessions.pause_turn_admission_for_update.assert_awaited_once()
+        orch.sessions.drain_active_turns.assert_not_awaited()
+        orch.sessions.resume_turn_admission_after_update.assert_awaited_once()
+        assert orch._update_apply_deferred is True
+        assert orch._mandatory_update_deferred_at == 0.0
+        assert orch._mandatory_update_deferred_key == "floor:9.9.9"
+
+    def test_mandatory_update_does_not_drain_through_background_work(self):
+        orch = self._orchestrator()
+        orch._mandatory_update_deferred_at = 0.0
+        orch._mandatory_update_deferred_key = "floor:9.9.9"
+        # The active provider turn may belong to the TaskRunner represented by
+        # the background count. Cancelling it would lose work while apply still
+        # remains deferred.
+        orch._in_flight_work_counts = MagicMock(return_value=(1, 1))
+
+        prepared = asyncio.run(
+            orch._prepare_auto_update_apply(
+                mandatory=True,
+                mandatory_key="floor:9.9.9",
+            )
+        )
+
+        assert prepared is False
+        orch.sessions.drain_active_turns.assert_not_awaited()
+        orch.sessions.resume_turn_admission_after_update.assert_awaited_once()
+        orch._schedule_inbound_replay.assert_called_once()
+        assert orch._update_apply_deferred is True
+
+    def test_new_mandatory_target_gets_a_fresh_deferral_window(self):
+        orch = self._orchestrator()
+        orch._mandatory_update_deferred_at = 0.0
+        orch._mandatory_update_deferred_key = "old-floor:1.0.0"
+        orch._in_flight_work_counts = MagicMock(return_value=(1, 0))
+
+        prepared = asyncio.run(
+            orch._prepare_auto_update_apply(
+                mandatory=True,
+                mandatory_key="new-floor:2.0.0",
+            )
+        )
+
+        assert prepared is False
+        orch.sessions.drain_active_turns.assert_not_awaited()
+        orch.sessions.resume_turn_admission_after_update.assert_awaited_once()
+        assert orch._mandatory_update_deferred_at is not None
+        assert orch._mandatory_update_deferred_key == "new-floor:2.0.0"
+
+    def test_foreign_environment_never_runs_the_managed_installer(self):
+        orch = self._run(
+            {
+                "update_available": True,
+                "can_apply": False,
+                "managed_by": "kirocrew",
+                "remediation": {
+                    "kind": "command",
+                    "message": "Re-run the installer to upgrade.",
+                    "command": "curl -fsSL … | sh",
+                },
+            },
+            auto_update=True,
+            managed_venv=False,
+        )
         orch._auto_apply_update.assert_not_awaited()
-        # The wheel auto-apply IS called (new behavior).
-        orch._auto_apply_wheel_update.assert_awaited_once()
+        orch._auto_apply_wheel_update.assert_not_awaited()
 
     def test_git_checkout_auto_applies_when_the_version_moved(self):
         """The git apply needs `version_newer`, not just `available`.
@@ -1229,6 +1530,7 @@ class TestAutoApplyGuard:
                 "version_newer": True,
             },
             auto_update=True,
+            effect=AutoUpdateEffect("install", "git"),
         )
         orch._auto_apply_update.assert_awaited_once()
 
@@ -1274,6 +1576,441 @@ class TestAutoApplyGuard:
         )
         assert "Already on latest version" not in capsys.readouterr().out
 
+    def test_failed_apply_replay_waits_for_the_existing_pass(self, tmp_path):
+        from kiro_crew.slack import gateway
+
+        orch = object.__new__(gateway.GatewayOrchestrator)
+        replay = AsyncMock()
+        orch._replay_spooled_inbound = replay
+        release = asyncio.Event()
+
+        async def _scenario() -> None:
+            async def _existing() -> None:
+                await release.wait()
+
+            previous = asyncio.create_task(_existing())
+            orch._inbound_replay_task = previous
+            with patch.object(gateway.inbound_spool, "spool_path", return_value=tmp_path):
+                orch._schedule_inbound_replay()
+            scheduled = orch._inbound_replay_task
+            await asyncio.sleep(0)
+            replay.assert_not_awaited()
+            release.set()
+            await scheduled
+
+        asyncio.run(_scenario())
+        replay.assert_awaited_once_with(spool=tmp_path)
+
+
+class TestRecurringAutoUpdateCoordinator:
+    def test_rechecks_after_the_interval(self):
+        from kiro_crew.slack import gateway
+
+        orch = object.__new__(gateway.GatewayOrchestrator)
+        orch._check_for_updates = AsyncMock(side_effect=[None, asyncio.CancelledError()])
+        sleep = AsyncMock(return_value=None)
+
+        async def _drive() -> None:
+            with patch.object(gateway.asyncio, "sleep", sleep):
+                with pytest.raises(asyncio.CancelledError):
+                    await orch._run_update_checks()
+
+        asyncio.run(_drive())
+        assert orch._check_for_updates.await_count == 2
+        sleep.assert_awaited_once_with(updates._UPDATE_CHECK_INTERVAL)
+
+    def test_busy_deferral_retries_soon(self):
+        from kiro_crew.slack import gateway
+
+        orch = object.__new__(gateway.GatewayOrchestrator)
+        calls = 0
+
+        async def _check() -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                orch._update_apply_deferred = True
+                return
+            raise asyncio.CancelledError
+
+        orch._check_for_updates = AsyncMock(side_effect=_check)
+        sleep = AsyncMock(return_value=None)
+
+        async def _drive() -> None:
+            with patch.object(gateway.asyncio, "sleep", sleep):
+                with pytest.raises(asyncio.CancelledError):
+                    await orch._run_update_checks()
+
+        asyncio.run(_drive())
+        sleep.assert_awaited_once_with(gateway.GatewayOrchestrator._UPDATE_BUSY_RETRY_SECS)
+
+
+class TestUpdateBackgroundWorkContract:
+    """Make the distributed restart boundary fail CI when a launcher drifts."""
+
+    @staticmethod
+    def _registrations(kind: str, tree: ast.AST) -> list[ast.AST]:
+        found: list[ast.AST] = []
+        for node in ast.walk(tree):
+            if kind == "subagents":
+                queued = (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "append"
+                    and isinstance(node.func.value, ast.Attribute)
+                    and node.func.value.attr == "_queue"
+                )
+                running = (
+                    isinstance(node, ast.AugAssign)
+                    and isinstance(node.target, ast.Attribute)
+                    and node.target.attr == "_running_count"
+                    and isinstance(node.op, ast.Add)
+                )
+                if queued or running:
+                    found.append(node)
+            elif kind == "cron":
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "add"
+                    and isinstance(node.func.value, ast.Attribute)
+                    and node.func.value.attr == "_running_script_ids"
+                ):
+                    found.append(node)
+            elif kind == "taskrunner":
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "add"
+                    and isinstance(node.func.value, ast.Attribute)
+                    and node.func.value.attr == "_start_ids_in_flight"
+                ):
+                    found.append(node)
+            elif kind == "workflows":
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "run_background"
+                ):
+                    found.append(node)
+        return found
+
+    @staticmethod
+    def _is_admission_guard(statement: ast.stmt) -> bool:
+        if not isinstance(statement, ast.If):
+            return False
+        names_gate = any(
+            isinstance(node, ast.Attribute)
+            and node.attr in {"admission_closed", "_admission_closed"}
+            or isinstance(node, ast.Constant)
+            and node.value == "admission_closed"
+            for node in ast.walk(statement.test)
+        )
+        exits_on_closed = any(
+            isinstance(node, (ast.Raise, ast.Return)) for node in ast.walk(statement)
+        )
+        return names_gate and exits_on_closed
+
+    def _has_dominating_admission_guard(
+        self, node: ast.AST, parents: dict[ast.AST, ast.AST]
+    ) -> bool:
+        current = node
+        while current in parents:
+            parent = parents[current]
+            for field in ("body", "orelse", "finalbody"):
+                block = getattr(parent, field, None)
+                if not isinstance(block, list) or current not in block:
+                    continue
+                index = block.index(current)
+                if any(self._is_admission_guard(statement) for statement in block[:index]):
+                    return True
+                break
+            current = parent
+        return False
+
+    def test_one_cron_branch_cannot_cover_another(self):
+        tree = ast.parse("""
+async def callback(job):
+    if job.command:
+        if getattr(sessions, "admission_closed", False):
+            return
+        self._running_script_ids.add(job.id)
+    if job.script:
+        self._running_script_ids.add(job.id)
+""")
+        registrations = self._registrations("cron", tree)
+        parents = {
+            child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)
+        }
+        guarded = [
+            self._has_dominating_admission_guard(registration, parents)
+            for registration in registrations
+        ]
+
+        assert guarded == [True, False]
+
+    def test_every_background_registration_is_gated_and_counted(self):
+        root = Path(__file__).resolve().parents[1] / "src" / "kiro_crew"
+        from kiro_crew.slack import gateway
+
+        census = inspect.getsource(gateway.GatewayOrchestrator._in_flight_work_counts)
+        for token in (
+            "sessions.inbound_callback_count",
+            "inbound_spool.pending_refusal_write_count()",
+            'getattr(slot, "task", None)',
+            'getattr(slot, "_in_stage_execution", False)',
+            'getattr(owner, "_handler_tasks", None)',
+            'getattr(self, "_channel_handles", {})',
+        ):
+            assert token in census, f"channel callback census lost {token}"
+
+        from kiro_crew.subagent import SubagentManager
+
+        subagent_census = inspect.getsource(SubagentManager.pending_work_count.fget)
+        for token in (
+            "self._tasks.values()",
+            "self._report_tasks",
+            "self._followup_watchers.values()",
+            'getattr(self, "_reconcile_task", None)',
+            "self._abandoned_state_writers",
+            "len(self._queue)",
+            "self._running_count",
+        ):
+            assert token in subagent_census, f"subagent lifecycle census lost {token}"
+        contracts = {
+            # Subagent admission is a PACKAGE: every module in it is read as one
+            # unit, so a registration site anywhere inside counts here and a new
+            # module cannot carry one in unseen.
+            # Six sites: three in gate.py (the spawn queue append, the
+            # ClaimPoint reserve-then-commit running-count increment, the
+            # registered start's running-count increment), the window refill
+            # append in taskq_bridge.py, the resume reservation in waits.py,
+            # and the approval-released start's queue append in pump.py
+            # (``_admit_released_start_impl``: a start whose spawn prompt
+            # resolved re-enters the queue to be metered into startup).
+            "subagents": (
+                sorted((root / "subagent_manager" / "admission").glob("*.py")),
+                6,
+                ("subagents.pending_work_count",),
+            ),
+            "cron": (
+                [root / "slack" / "gateway.py"],
+                2,
+                ("len(self._running_script_ids)",),
+            ),
+            "taskrunner": (
+                [root / "taskrunner.py"],
+                3,
+                ("runner.running",),
+            ),
+            "workflows": (
+                [root / "workflows" / "service.py"],
+                3,
+                ("workflows.list_runs()", 'run.get("status") == "running"'),
+            ),
+        }
+
+        for kind, (paths, expected_count, census_tokens) in contracts.items():
+            registrations: list[tuple[Path, ast.AST, dict[ast.AST, ast.AST]]] = []
+            for path in paths:
+                tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+                parents = {
+                    child: parent
+                    for parent in ast.walk(tree)
+                    for child in ast.iter_child_nodes(parent)
+                }
+                registrations.extend(
+                    (path, node, parents) for node in self._registrations(kind, tree)
+                )
+            assert (
+                len(registrations) == expected_count
+            ), f"{kind} registration sites changed; update the admission/census contract"
+            for path, registration, parents in registrations:
+                assert self._has_dominating_admission_guard(registration, parents), (
+                    f"{kind} registers at {path.name}:{registration.lineno} without a "
+                    "dominating terminating admission guard"
+                )
+            for token in census_tokens:
+                assert token in census, f"{kind} registers work but is absent from the census"
+
+    def test_every_pre_turn_channel_reserves_before_commands(self):
+        root = Path(__file__).resolve().parents[1] / "src" / "kiro_crew"
+        owners = {
+            path.parent.name
+            for path in root.glob("*/client.py")
+            if "_handler_tasks" in path.read_text(encoding="utf-8")
+        }
+        if "_handler_tasks" in (root / "imessage" / "rpc.py").read_text(encoding="utf-8"):
+            owners.add("imessage")
+        owners.add("slack")  # host-managed handler set lives on GatewayOrchestrator
+        # These transports dispatch through inline receive paths, so they need a
+        # dispatcher reservation even where WhatsApp/Weixin now also expose the
+        # upstream receive segment in a client handler registry.
+        inline_owners = {"feishu", "whatsapp", "weixin"}
+        owners.update(inline_owners)
+        assert owners == {
+            "discord",
+            "feishu",
+            "imessage",
+            "slack",
+            "teams",
+            "telegram",
+            "webex",
+            "wecom",
+            "whatsapp",
+            "weixin",
+        }
+
+        dispatcher_paths = {owner: root / owner / "transport_dispatch.py" for owner in owners}
+        dispatcher_paths["slack-native"] = root / "slack" / "handler.py"
+        for owner, path in dispatcher_paths.items():
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            handlers = [
+                node
+                for node in ast.walk(tree)
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name in {"handle_message", "handle_message_transport"}
+            ]
+            assert handlers, f"{owner} has no inbound handler in {path.name}"
+            for handler in handlers:
+                admit_lines = [
+                    node.lineno
+                    for node in ast.walk(handler)
+                    if isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id in {"admit_inbound_callback", "hold_inbound_callback"}
+                ]
+                assert admit_lines, f"{owner} handler does not reserve inbound callback work"
+                governance_lines = [
+                    node.lineno
+                    for node in ast.walk(handler)
+                    if isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id == "inbound_permitted"
+                ]
+                if owner in inline_owners:
+                    assert governance_lines and min(admit_lines) < min(
+                        governance_lines
+                    ), f"{owner} suspends for governance before callback reservation"
+                effect_lines = [
+                    node.lineno
+                    for node in ast.walk(handler)
+                    if isinstance(node, ast.Call)
+                    and (
+                        (isinstance(node.func, ast.Name) and node.func.id == "parse_command")
+                        or (
+                            isinstance(node.func, ast.Attribute)
+                            and node.func.attr == "_handle_admitted"
+                        )
+                    )
+                ]
+                if effect_lines:
+                    assert min(admit_lines) < min(
+                        effect_lines
+                    ), f"{owner} reserves only after command handling"
+
+        for owner in ("telegram", "discord", "teams"):
+            source = dispatcher_paths[owner].read_text(encoding="utf-8")
+            assert "refused_resume_is_restricted" in source
+            assert "_refused_turn_restricted" in source
+        teams_source = dispatcher_paths["teams"].read_text(encoding="utf-8")
+        assert "inbound_restricted=session_restricted" in teams_source
+
+    def test_upstream_inline_receivers_register_before_dispatch(self):
+        root = Path(__file__).resolve().parents[1] / "src" / "kiro_crew"
+        contracts = (
+            (root / "whatsapp" / "client.py", "_on_message", "on_message"),
+            (root / "weixin" / "transport.py", "_poll_forever", "receive"),
+        )
+        for path, function_name, dispatch_name in contracts:
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            function = next(
+                node
+                for node in ast.walk(tree)
+                if isinstance(node, ast.AsyncFunctionDef) and node.name == function_name
+            )
+            registrations = [
+                node.lineno
+                for node in ast.walk(function)
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "add"
+                and "_handler_tasks" in ast.unparse(node.func.value)
+            ]
+            dispatches = [
+                node.lineno
+                for node in ast.walk(function)
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == dispatch_name
+            ]
+            assert registrations and dispatches
+            assert min(registrations) < min(
+                dispatches
+            ), f"{path.parent.name} receives a callback before making it census-visible"
+
+        assert "_handler_tasks" in (root / "whatsapp" / "client.py").read_text(encoding="utf-8")
+        assert "_handler_tasks" in (root / "weixin" / "client.py").read_text(encoding="utf-8")
+
+    def test_slack_socket_reserves_before_ack(self):
+        path = Path(__file__).resolve().parents[1] / "src" / "kiro_crew" / "slack" / "events.py"
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        listener = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.AsyncFunctionDef) and node.name == "_on_event"
+        )
+        admit = [
+            node.lineno
+            for node in ast.walk(listener)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "admit_inbound_callback"
+        ]
+        ack = [
+            node.lineno
+            for node in ast.walk(listener)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "send_socket_mode_response"
+        ]
+        assert admit and ack and min(admit) < min(ack)
+
+    def test_every_auto_apply_path_uses_the_final_restart_fence(self):
+        path = Path(__file__).resolve().parents[1] / "src" / "kiro_crew" / "slack" / "gateway.py"
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        methods = {
+            node.name: node
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        for name in ("_auto_apply_update", "_auto_apply_wheel_update"):
+            attrs = {
+                node.func.attr
+                for node in ast.walk(methods[name])
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+            }
+            assert "_restart_after_update" in attrs
+            assert "reexec_python_module" not in attrs
+
+        prepare_attrs = {
+            node.func.attr
+            for node in ast.walk(methods["_prepare_auto_update_apply"])
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        }
+        assert "drain_active_turns" not in prepare_attrs
+
+        restart = methods["_restart_after_update"]
+        calls: dict[str, list[int]] = {}
+        for node in ast.walk(restart):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                calls.setdefault(node.func.attr, []).append(node.lineno)
+        drains = sorted(calls["_drain_update_callback_work"])
+        assert len(drains) == 2
+        assert drains[0] < calls["fence_update_restart"][0]
+        assert calls["fence_update_restart"][0] < calls["close_all"][0] < drains[1]
+        assert drains[1] < calls["reexec_python_module"][0]
+
 
 class TestCommandManagedCheck:
     """A policy-pinned command provider owns the check: no feed, no git, no channel.
@@ -1290,13 +2027,15 @@ class TestCommandManagedCheck:
         saved_info = dict(updates._update_info)
         saved_clock = updates._last_update_check
         saved_generation = updates._check_generation
-        saved_flight = updates._check_in_flight
+        saved_task = updates._check_task
+        saved_task_generation = updates._check_task_generation
         yield
         updates._update_info.clear()
         updates._update_info.update(saved_info)
         updates._last_update_check = saved_clock
         updates._check_generation = saved_generation
-        updates._check_in_flight = saved_flight
+        updates._check_task = saved_task
+        updates._check_task_generation = saved_task_generation
 
     def _run(self, provider: CommandProvider, result: UpdateCheckResult) -> dict:
         # ``derive_capability`` and both built-in checkers are booby-trapped:
@@ -1366,3 +2105,453 @@ class TestCommandManagedCheck:
         assert info["update_available"] is None
         assert info["error_code"] == "unknown"
         assert info["latest_version"] == ""
+
+
+# --- auto_update_effect: one derivation, the status field and the loop agree ---
+
+
+def _pin_install_shape(
+    monkeypatch,
+    *,
+    managed_by: str,
+    branch: str = "main",
+    tracks: bool = True,
+    exec_config: str = "",
+    blocked: str = "",
+    managed_venv: bool = True,
+    cdn_safe: bool = True,
+    provider=None,
+    floor: bool = False,
+    platform: str = "linux",
+    shell: bool = True,
+):
+    """Pin every input ``auto_update_effect`` reads, at the seams it reads them."""
+    from kiro_crew.platform import (
+        update_capability,
+        update_governance,
+        update_layout,
+        update_provider,
+        wheel_engine,
+    )
+
+    monkeypatch.setattr(
+        update_capability,
+        "derive_capability",
+        lambda **_kw: update_capability.UpdateCapability(
+            supported=True,
+            managed_by=managed_by,
+            mode="notify",
+            can_download=True,
+            can_apply=managed_by == "git",
+            requires_restart=True,
+        ),
+    )
+    monkeypatch.setattr("kiro_crew.platform_compat.trusted_git_bin", lambda: "/usr/bin/git")
+    monkeypatch.setattr(update_governance, "_git", lambda _root, *_args: branch)
+    monkeypatch.setattr(update_governance, "repo_exec_config_reason", lambda _root: exec_config)
+    monkeypatch.setattr(update_governance, "tracks_upstream", lambda _root, _b, **_k: tracks)
+    monkeypatch.setattr(update_governance, "resolve_remote_url", lambda *_a, **_k: "https://x")
+    monkeypatch.setattr(update_governance, "update_blocked_reason", lambda _url: blocked)
+    monkeypatch.setattr(update_governance, "update_required", lambda _v: floor)
+    monkeypatch.setattr(wheel_engine, "running_from_managed_venv", lambda: managed_venv)
+    monkeypatch.setattr(update_layout, "cdn_bases_are_safe", lambda: cdn_safe)
+    monkeypatch.setattr(update_layout, "cdn_bases", lambda: ("https://a", "https://b"))
+    monkeypatch.setattr(update_capability, "_installer_runs_here", lambda: platform != "win32")
+    monkeypatch.setattr(
+        "kiro_crew.platform_compat.trusted_system_bin", lambda _n: "/bin/sh" if shell else None
+    )
+    monkeypatch.setattr(update_provider, "resolve_provider", lambda: provider)
+
+
+def _provider(*, can_apply: bool):
+    from kiro_crew.platform.update_provider import UpdateCheckResult
+
+    provider = MagicMock()
+    provider.can_apply = MagicMock(return_value=can_apply)
+    provider.check = AsyncMock(return_value=UpdateCheckResult(available=True, remote_version="9"))
+    provider.apply = AsyncMock(return_value=False)
+    return provider
+
+
+_SHAPES = [
+    pytest.param({"managed_by": "git"}, "install", "git", id="git-primary-branch"),
+    pytest.param({"managed_by": "git", "branch": "feature/x"}, "notify", None, id="git-feature"),
+    pytest.param({"managed_by": "git", "branch": "HEAD"}, "notify", None, id="git-detached"),
+    pytest.param({"managed_by": "git", "tracks": False}, "notify", None, id="git-untracked"),
+    pytest.param({"managed_by": "git", "branch": "develop"}, "notify", None, id="fork-develop"),
+    pytest.param(
+        {"managed_by": "git", "exec_config": "a filter driver"}, "notify", None, id="git-exec"
+    ),
+    pytest.param({"managed_by": "git", "blocked": "pinned"}, "notify", None, id="git-pinned-away"),
+    pytest.param({"managed_by": "git", "floor": True}, "mandatory", "git", id="git-below-floor"),
+    pytest.param(
+        {"managed_by": "git", "branch": "feature/x", "floor": True},
+        "notify",
+        None,
+        id="git-feature-below-floor",
+    ),
+    pytest.param({"managed_by": "kirocrew"}, "install", "wheel", id="managed-venv"),
+    pytest.param(
+        {"managed_by": "kirocrew", "cdn_safe": False}, "notify", None, id="managed-venv-unsafe-cdn"
+    ),
+    pytest.param(
+        {"managed_by": "kirocrew", "managed_venv": False}, "notify", None, id="foreign-wheel"
+    ),
+    pytest.param(
+        {"managed_by": "kirocrew", "platform": "win32"}, "notify", None, id="managed-on-windows"
+    ),
+    pytest.param(
+        {"managed_by": "kirocrew", "shell": False}, "notify", None, id="managed-without-a-shell"
+    ),
+    pytest.param(
+        {"managed_by": "kirocrew", "blocked": "pinned"}, "notify", None, id="managed-pinned-away"
+    ),
+    pytest.param(
+        {"managed_by": "kirocrew", "floor": True}, "mandatory", "wheel", id="managed-below-floor"
+    ),
+    pytest.param({"managed_by": "electron"}, "notify", None, id="desktop-bundle"),
+    pytest.param({"managed_by": "container", "floor": True}, "notify", None, id="container-floor"),
+    pytest.param(
+        {"managed_by": "kirocrew", "provider": "apply"}, "install", "provider", id="provider-apply"
+    ),
+    pytest.param(
+        {"managed_by": "kirocrew", "provider": "check-only"}, "notify", None, id="provider-no-apply"
+    ),
+    pytest.param(
+        {"managed_by": "kirocrew", "provider": "check-only", "floor": True},
+        "notify",
+        None,
+        id="provider-no-apply-below-floor",
+    ),
+]
+
+
+class TestAutoUpdateEffect:
+    """The effect the status surface publishes is the action the loop takes."""
+
+    @staticmethod
+    def _shape(monkeypatch, shape):
+        shape = dict(shape)
+        kind = shape.pop("provider", None)
+        provider = None if kind is None else _provider(can_apply=kind == "apply")
+        _pin_install_shape(monkeypatch, provider=provider, **shape)
+        return provider
+
+    @pytest.mark.parametrize("shape, effect, route", _SHAPES)
+    def test_the_effect_of_each_install_shape(self, monkeypatch, shape, effect, route):
+        from kiro_crew.platform.update_capability import auto_update_effect
+
+        self._shape(monkeypatch, shape)
+        answer = auto_update_effect(running_version="1.0.0")
+
+        assert (answer.effect, answer.route) == (effect, route)
+        # A shape that cannot install says why, for the log line it ends in.
+        assert bool(answer.reason) is (route is None)
+        # Only the source pin refuses every path, the manual ones included.
+        assert answer.blocked is bool(shape.get("blocked"))
+
+    @pytest.mark.parametrize("shape, effect, route", _SHAPES)
+    def test_the_update_loop_acts_on_that_effect(self, monkeypatch, shape, effect, route):
+        """``install`` applies with the switch on; ``mandatory`` applies with it off;
+        ``notify`` never pauses admission, even with the switch on."""
+        import kiro_crew.dashboard.handlers as handlers
+        from kiro_crew.platform.governance import UpdatePins
+
+        provider = self._shape(monkeypatch, shape)
+        orch = TestAutoApplyGuard._orchestrator()
+        orch._prepare_auto_update_apply = AsyncMock(return_value=True)
+        orch._finish_auto_update_apply = AsyncMock()
+        orch._restart_after_update = AsyncMock()
+        cfg = MagicMock()
+        cfg.auto_update = effect != "mandatory"
+
+        original = dict(handlers._update_info)
+        try:
+            handlers._update_info.clear()
+            handlers._update_info.update(
+                {
+                    "update_available": True,
+                    "version_newer": True,
+                    "can_apply": shape["managed_by"] == "git",
+                    "managed_by": shape["managed_by"],
+                    "remediation": {"kind": "command", "message": "m", "command": "c"},
+                }
+            )
+            with (
+                patch.object(handlers, "_do_update_check", new_callable=AsyncMock),
+                patch("kiro_crew.config.KiroCrewConfig.load", return_value=cfg),
+                patch(
+                    "kiro_crew.platform.governance.active_update_pins", return_value=UpdatePins()
+                ),
+            ):
+                asyncio.run(orch._check_for_updates())
+            published = dict(handlers._update_info)
+        finally:
+            handlers._update_info.clear()
+            handlers._update_info.update(original)
+
+        applied = {
+            "git": orch._auto_apply_update.await_count,
+            "wheel": orch._auto_apply_wheel_update.await_count,
+            "provider": provider.apply.await_count if provider is not None else 0,
+        }
+        if route is None:
+            orch._prepare_auto_update_apply.assert_not_awaited()
+            assert set(applied.values()) == {0}
+            if provider is not None:
+                # Notify really notifies: the provider's verdict reaches the badge.
+                assert published["update_available"] is True
+        else:
+            orch._prepare_auto_update_apply.assert_awaited_once()
+            assert applied[route] == 1
+            assert sum(applied.values()) == 1
+
+
+def test_a_provider_the_check_resolves_stops_the_built_in_routes(monkeypatch):
+    """A live policy refresh must not let a built-in route apply.
+
+    The effect is derived before the check (it reads no check result), so a
+    provider configured in between is first seen by the check itself. A provider
+    OWNS the update, so no built-in route may apply that cycle.
+    """
+    import kiro_crew.dashboard.handlers as handlers
+    from kiro_crew.platform.governance import UpdatePins
+    from kiro_crew.platform.update_capability import MANAGED_BY_COMMAND
+
+    _pin_install_shape(monkeypatch, managed_by="git")
+    orch = TestAutoApplyGuard._orchestrator()
+    orch._prepare_auto_update_apply = AsyncMock(return_value=True)
+    orch._finish_auto_update_apply = AsyncMock()
+    cfg = MagicMock()
+    cfg.auto_update = True
+
+    async def _check_installs_a_provider():
+        # What `_do_update_check` does once a policy provider is configured.
+        handlers._update_info.update(
+            {
+                "managed_by": MANAGED_BY_COMMAND,
+                "update_available": True,
+                "version_newer": True,
+                "can_apply": False,
+            }
+        )
+
+    original = dict(handlers._update_info)
+    try:
+        handlers._update_info.clear()
+        with (
+            patch.object(handlers, "_do_update_check", _check_installs_a_provider),
+            patch("kiro_crew.config.KiroCrewConfig.load", return_value=cfg),
+            patch("kiro_crew.platform.governance.active_update_pins", return_value=UpdatePins()),
+        ):
+            asyncio.run(orch._check_for_updates())
+    finally:
+        handlers._update_info.clear()
+        handlers._update_info.update(original)
+
+    orch._prepare_auto_update_apply.assert_not_awaited()
+    orch._auto_apply_update.assert_not_awaited()
+    orch._auto_apply_wheel_update.assert_not_awaited()
+
+
+def test_a_wheel_route_without_an_installer_command_does_not_pause_admission(monkeypatch):
+    """The command comes from the CHECK, so the route cannot vouch for it."""
+    import kiro_crew.dashboard.handlers as handlers
+    from kiro_crew.platform.governance import UpdatePins
+
+    _pin_install_shape(monkeypatch, managed_by="kirocrew")
+    orch = TestAutoApplyGuard._orchestrator()
+    orch._prepare_auto_update_apply = AsyncMock(return_value=True)
+    orch._finish_auto_update_apply = AsyncMock()
+    cfg = MagicMock()
+    cfg.auto_update = True
+
+    original = dict(handlers._update_info)
+    try:
+        handlers._update_info.clear()
+        handlers._update_info.update(
+            {"update_available": True, "managed_by": "kirocrew", "remediation": None}
+        )
+        with (
+            patch.object(handlers, "_do_update_check", new_callable=AsyncMock),
+            patch("kiro_crew.config.KiroCrewConfig.load", return_value=cfg),
+            patch("kiro_crew.platform.governance.active_update_pins", return_value=UpdatePins()),
+        ):
+            asyncio.run(orch._check_for_updates())
+    finally:
+        handlers._update_info.clear()
+        handlers._update_info.update(original)
+
+    orch._prepare_auto_update_apply.assert_not_awaited()
+    orch._auto_apply_wheel_update.assert_not_awaited()
+
+
+def test_every_unattended_apply_consults_the_effect_first():
+    """A ``_prepare_auto_update_apply`` call follows an ``_auto_update_effect`` read.
+
+    Read from the source: a new apply branch that skips the derivation would
+    pause admission for an update the status surface says this install will not
+    apply. ``_retry_pending_update_restart`` is the one exception: it retries the
+    restart of an update already applied, and decides nothing about installing.
+    """
+    import ast
+    import inspect
+
+    from kiro_crew.slack import gateway
+
+    cls = next(
+        node
+        for node in ast.walk(ast.parse(inspect.getsource(gateway)))
+        if isinstance(node, ast.ClassDef) and node.name == "GatewayOrchestrator"
+    )
+
+    def _calls(fn, name):
+        return [
+            node.lineno
+            for node in ast.walk(fn)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == name
+        ]
+
+    callers = {}
+    for fn in cls.body:
+        if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            prepares = _calls(fn, "_prepare_auto_update_apply")
+            if prepares:
+                callers[fn.name] = (prepares, _calls(fn, "_auto_update_effect"))
+
+    assert set(callers) == {
+        "_check_for_updates_legacy",
+        "_check_for_updates_via_provider",
+        "_retry_pending_update_restart",
+    }
+    for name, (prepares, effects) in callers.items():
+        if name == "_retry_pending_update_restart":
+            continue
+        assert effects and min(effects) < min(prepares), name
+
+
+def test_a_provider_without_can_apply_still_installs(monkeypatch):
+    """A provider predating ``can_apply`` keeps applying when asked, as before."""
+    from kiro_crew.platform.update_capability import auto_update_effect
+
+    legacy = MagicMock(spec=["check", "apply"])
+    _pin_install_shape(monkeypatch, managed_by="kirocrew", provider=legacy)
+
+    answer = auto_update_effect(running_version="1.0.0")
+    assert (answer.effect, answer.route) == ("install", "provider")
+
+
+def test_a_source_pinned_install_below_the_floor_is_not_told_to_run_kirocrew_update(
+    monkeypatch,
+):
+    """The pin refuses `kirocrew update` too, so no badge points at it."""
+    import kiro_crew.dashboard.handlers as handlers
+    from kiro_crew.platform.governance import UpdatePins
+
+    _pin_install_shape(monkeypatch, managed_by="git", blocked="pinned", floor=True)
+    orch = TestAutoApplyGuard._orchestrator()
+    orch._prepare_auto_update_apply = AsyncMock(return_value=True)
+    original = dict(handlers._update_info)
+    try:
+        handlers._update_info.clear()
+        handlers._update_info.update(
+            {
+                "update_available": False,
+                "can_apply": True,
+                "managed_by": "git",
+                "remediation": {"kind": "command", "message": "m", "command": "kirocrew update"},
+            }
+        )
+        with (
+            patch.object(handlers, "_do_update_check", new_callable=AsyncMock),
+            patch("kiro_crew.platform.governance.active_update_pins", return_value=UpdatePins()),
+        ):
+            asyncio.run(orch._check_for_updates())
+        forced = handlers._update_info["update_available"]
+    finally:
+        handlers._update_info.clear()
+        handlers._update_info.update(original)
+
+    orch._prepare_auto_update_apply.assert_not_awaited()
+    assert forced is False
+
+
+# Every gate an unattended apply path re-checks after admission is paused must
+# also be read by the route that decides whether it runs at all, or the
+# derivation drifts back into pause-then-skip. The apply path's gate set is
+# DERIVED from the helpers it calls, so a newly added gate fails here until the
+# route reads it too — or until it is declared dynamic below, with its reason.
+_GATE_HELPER_MODULES = (
+    "kiro_crew.platform.update_governance",
+    "kiro_crew.platform.update_layout",
+    "kiro_crew.platform.wheel_engine",
+)
+
+#: Helpers an apply path calls that the STATIC derivation cannot read, with why.
+_DYNAMIC_GATES = {
+    # Reads the tree as it is right now, after the fetch this apply ran.
+    "commits_ahead": "measured against the commit this apply just fetched",
+    "hidden_worktree_edits": "the working tree's state at apply time",
+    "resolve_remote_url": "an input to update_blocked_reason, not a gate itself",
+    "git_command_env": "builds the environment, decides nothing",
+    "loggable_path": "formats a path for a log line",
+    "cdn_bases": "an input to update_blocked_reason, not a gate itself",
+    "wheel_update_command": "composes the installer command the check supplies",
+    "respawn_executable": "resolves the restart target after a successful apply",
+    "running_from_managed_venv": "read by the route; the apply trusts the route",
+    "min_version": "the floor's value, already folded into the effect",
+    "update_required": "the floor verdict, already folded into the effect",
+}
+
+_APPLY_ROUTES = [("_auto_apply_update", "_git_route"), ("_auto_apply_wheel_update", "_wheel_route")]
+
+
+def _gate_helper_names() -> set[str]:
+    """Every callable the gate-helper modules DEFINE (re-exports are not gates)."""
+    import importlib
+
+    names: set[str] = set()
+    for module in _GATE_HELPER_MODULES:
+        loaded = importlib.import_module(module)
+        for name in dir(loaded):
+            value = getattr(loaded, name, None)
+            if callable(value) and getattr(value, "__module__", None) == module:
+                names.add(name)
+    return names
+
+
+@pytest.mark.parametrize("apply_name, route_name", _APPLY_ROUTES)
+def test_the_derivation_reads_every_static_gate_its_apply_path_reads(apply_name, route_name):
+    import ast
+    import inspect
+
+    from kiro_crew.platform import update_capability
+    from kiro_crew.slack import gateway
+
+    def _names(module, name: str) -> set[str]:
+        fn = next(
+            node
+            for node in ast.walk(ast.parse(inspect.getsource(module)))
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name
+        )
+        return {
+            node.attr if isinstance(node, ast.Attribute) else node.id
+            for node in ast.walk(fn)
+            if isinstance(node, (ast.Attribute, ast.Name))
+        }
+
+    # platform_compat's two update gates: a trusted git, and a trusted shell
+    # for the installer. Named rather than derived, because that module's
+    # surface is every POSIX call the product makes.
+    helpers = _gate_helper_names() | {"trusted_git_bin", "trusted_system_bin"}
+    static_gates = (_names(gateway, apply_name) & helpers) - set(_DYNAMIC_GATES)
+    assert static_gates, "no gate helper found in the apply path — is the parse right?"
+    missing = static_gates - _names(update_capability, route_name)
+    assert not missing, (
+        f"{apply_name} re-checks {sorted(missing)}, which {route_name} never reads: the "
+        "derivation would answer 'install' for an install the apply then refuses, after "
+        "admission is already paused. Read it in the route, or declare it in "
+        "_DYNAMIC_GATES with its reason."
+    )

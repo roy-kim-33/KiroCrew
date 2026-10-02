@@ -17,6 +17,7 @@ import { useQuery } from '@tanstack/react-query'
 import { Webhook, ExternalLink, TriangleAlert, ShieldCheck, WebhookOff } from 'lucide-react'
 import { api, type WebhookTokenEntry } from '../api/client'
 import { Badge, Btn, Skeleton } from './ui'
+import ErrorNotice from './ErrorNotice'
 import { timeAgo } from '../utils/timeAgo'
 import { crewWebhooksQueryKey, webhookBoundToCrew, webhookCanCallIn } from './crew/wakesCrew'
 
@@ -71,8 +72,15 @@ function TokenRow({ token, systemOff }: { token: WebhookTokenEntry; systemOff: b
   )
 }
 
-export default function CrewWebhookSection({ crew }: { crew: string }) {
+export default function CrewWebhookSection({ crew, onNavigateAway }: {
+  crew: string
+  /** How to leave for the Webhooks page. Mounted inside an editor with other
+   *  unsaved panes, the host passes a guarded navigate so the jump asks before
+   *  discarding them; a standalone mount omits it and navigates directly. */
+  onNavigateAway?: (to: string) => void
+}) {
   const navigate = useNavigate()
+  const leaveFor = onNavigateAway ?? ((to: string) => navigate(to))
   const { data, isLoading, isError, refetch } = useQuery({
     queryKey: crewWebhooksQueryKey,
     queryFn: () => api.webhooks(),
@@ -92,9 +100,18 @@ export default function CrewWebhookSection({ crew }: { crew: string }) {
     ? <Skeleton className="h-12" />
     : isError
       ? (
-        <div className="flex items-center gap-2 rounded-md border border-warn-subtle bg-warn-subtle px-3 py-2.5 text-[11.5px] leading-relaxed text-muted" role="alert">
-          <TriangleAlert className="lucide-inline shrink-0" aria-hidden="true" />
-          <span className="flex-1">{i18nT('components.crewWebhookSection.could_not_load_webhooks')}</span>
+        <div className="flex items-center gap-2">
+          {/* Read failure; the section holds no draft of its own (tokens are
+              edited on the Webhooks page). Suppressed when hosted in the
+              in-place editor (`onNavigateAway` set): the /chat hand-off would
+              unmount the host modal's unsaved panes, which this section cannot
+              see — Retry still works there. */}
+          <ErrorNotice
+            askAgent={!onNavigateAway}
+            testId="crew-webhook-load-error"
+            className="flex-1"
+            message={i18nT('components.crewWebhookSection.could_not_load_webhooks')}
+          />
           <Btn onClick={() => { void refetch() }}>{i18nT('components.crewWebhookSection.retry')}</Btn>
         </div>
       )
@@ -111,7 +128,7 @@ export default function CrewWebhookSection({ crew }: { crew: string }) {
     <section className="flex flex-col gap-3" data-testid="crew-webhook-section">
       <div className="flex items-center gap-2">
         <h3 className="text-[12px] font-semibold uppercase tracking-wider text-muted">{i18nT('components.crewWebhookSection.webhooks_that_wake_this_crew')}</h3>
-        <Btn className="ml-auto" onClick={() => navigate('/webhooks')}>
+        <Btn className="ml-auto" onClick={() => leaveFor('/webhooks')}>
           <ExternalLink className="lucide-inline" aria-hidden="true" />
           {i18nT('components.crewWebhookSection.open_webhooks')}
         </Btn>

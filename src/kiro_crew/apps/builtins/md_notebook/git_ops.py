@@ -31,6 +31,7 @@ from pathlib import Path, PureWindowsPath
 from typing import Any, Iterator, Optional
 
 from kiro_crew import platform_compat
+from kiro_crew.git_worktree_scope import worktree_probe_failure_is_empty_scope
 
 logger = logging.getLogger(__name__)
 
@@ -108,7 +109,14 @@ def is_inflight_temp(path: str) -> bool:
 # where subprocess spawn and filesystem latency are slow or highly variable
 # (e.g. shared Windows CI runners) — mirrors FE_GIT_TIMEOUT_SEC in the
 # file_explorer app.
-GIT_TIMEOUT_SEC = int(os.environ.get("MDNB_GIT_TIMEOUT_SEC", 30))
+#: Windows pays a much higher cost per git invocation — process creation is
+#: dearer and Defender real-time-scans the object store — and one sync() or
+#: status() pass issues six to ten of them, so a large vault hit
+#: ``git <cmd> timed out after 30s`` on a host where nothing was actually wrong.
+#: The budget is doubled there so the app works unconfigured, with
+#: MDNB_GIT_TIMEOUT_SEC still overriding on either platform.
+_DEFAULT_GIT_TIMEOUT_SEC = 60 if platform_compat.IS_WINDOWS else 30
+GIT_TIMEOUT_SEC = int(os.environ.get("MDNB_GIT_TIMEOUT_SEC", _DEFAULT_GIT_TIMEOUT_SEC))
 GIT_NETWORK_TIMEOUT_SEC = int(os.environ.get("MDNB_GIT_NETWORK_TIMEOUT_SEC", 180))
 
 
@@ -304,12 +312,16 @@ def _windows_git_bin_dirs() -> tuple[str, ...]:
     """
     dirs: list[str] = []
     program_files = os.environ.get("ProgramFiles", r"C:\Program Files")
+    # A 32-bit host interpreter sees %ProgramFiles% as "Program Files (x86)" while
+    # a 64-bit Git-for-Windows installs under "Program Files", so probing only the
+    # former failed closed with git_failed on an otherwise correct machine.
+    program_w6432 = os.environ.get("ProgramW6432", "")
     localappdata = os.environ.get("LOCALAPPDATA", "")
-    roots = (
-        [program_files, os.path.join(localappdata, "Programs")]
-        if localappdata
-        else [program_files]
-    )
+    roots = [program_files]
+    if program_w6432 and program_w6432 != program_files:
+        roots.append(program_w6432)
+    if localappdata:
+        roots.append(os.path.join(localappdata, "Programs"))
     for root in roots:
         dirs.append(os.path.join(root, "Git", "cmd"))
         dirs.append(os.path.join(root, "Git", "bin"))
@@ -322,8 +334,9 @@ def _windows_git_bin_dirs() -> tuple[str, ...]:
 #: otherwise shadow ``git`` with a planted binary that then runs unsandboxed on
 #: the next sync. On a normal POSIX host git lives in one of these, so PATH is
 #: never consulted there. The Windows entries cover both the machine-wide and
-#: the per-user Git-for-Windows install roots (the backend itself is macOS/Linux
-#: only; these serve Windows dev hosts and CI test runners).
+#: the per-user Git-for-Windows install roots, and are load-bearing rather than
+#: a test-runner convenience: the manifest declares Windows, so this is the
+#: lookup a real Windows user's vault operations go through.
 _GIT_BIN_DIRS: tuple[str, ...] = (
     "/usr/bin",
     "/bin",
@@ -339,7 +352,8 @@ def _git_bin() -> str:
     Only the trusted system directories above are searched — never ``PATH`` —
     so a planted binary in a workspace-writable PATH entry cannot win. The
     Windows entries cover both the machine-wide and the per-user
-    Git-for-Windows install roots (Windows dev hosts and CI test runners).
+    Git-for-Windows install roots, which the manifest's Windows declaration makes
+    a real user path rather than a CI convenience.
     Fails closed if git is not found in a trusted location.
     """
     global _git_bin_memo
@@ -357,9 +371,19 @@ def _git_bin() -> str:
             if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
                 _git_bin_memo = candidate
                 return candidate
+    # Windows has no OS sandbox backend, so this fail-close is the only thing
+    # standing between a vault operation and an untrusted binary — say what to
+    # install rather than leaving the user with a bare git_failed.
+    detail = (
+        " On Windows, install Git for Windows (winget install --id Git.Git) in its "
+        "default location, or set MD_NOTEBOOK_GIT_BIN to git.exe. PATH is "
+        "deliberately not consulted, so a git only PATH knows about is not used."
+        if platform_compat.IS_WINDOWS
+        else ""
+    )
     raise GitError(
         "no trusted git binary found in a system location "
-        f"({', '.join(_GIT_BIN_DIRS)}); install git or set MD_NOTEBOOK_GIT_BIN"
+        f"({', '.join(_GIT_BIN_DIRS)}); install git or set MD_NOTEBOOK_GIT_BIN{detail}"
     )
 
 
@@ -380,10 +404,16 @@ async def run_git(
     pat: Optional[str] = None,
     check: bool = True,
     timeout: int = GIT_TIMEOUT_SEC,
+    errors: str = "replace",
 ) -> tuple[int, str, str]:
     """Run a git command. Returns (returncode, stdout, stderr).
 
     Never runs through a shell, so no argument can be interpreted as one.
+
+    ``errors`` is ``"replace"`` for display-bound output. A caller whose
+    stdout names a filesystem path fed to an ``os`` call passes
+    ``"surrogateescape"`` so non-UTF-8 path bytes round-trip through
+    ``os.fsencode`` (see :func:`kiro_crew.subprocess_utf8.utf8_path_stdout`).
     """
     env = {
         **os.environ,
@@ -418,7 +448,27 @@ async def run_git(
         # into an unbounded wait for a surviving helper's EOF.
         await platform_compat.kill_and_reap(proc)
         raise GitError(f"git {args[0]} timed out after {timeout}s") from None
-    stdout = out.decode("utf-8", "replace")
+    except asyncio.CancelledError:
+        # Shutdown cancels the background syncer mid-``sync`` (see
+        # ``syncer.stop_syncer``), and this child is deliberately session-
+        # detached, so a bare re-raise would leave a ``git merge`` still
+        # rewriting the working tree AFTER ``vault_write_lock`` releases —
+        # restarted note writers would then overlap an orphaned merge and
+        # corrupt the tree/index. Kill and reap the whole isolated tree BEFORE
+        # propagating. The reap runs as a shielded task and is awaited to
+        # completion even if this frame is cancelled again mid-cleanup, so a
+        # second cancellation cannot re-orphan the child; then the original
+        # cancellation is propagated.
+        reap = asyncio.ensure_future(platform_compat.kill_and_reap(proc))
+        while not reap.done():
+            try:
+                await asyncio.shield(reap)
+            except asyncio.CancelledError:
+                # Re-cancelled while reaping — keep waiting for the reap itself,
+                # which is bounded by its own timeout, rather than abandoning it.
+                continue
+        raise
+    stdout = out.decode("utf-8", errors)
     stderr = err.decode("utf-8", "replace")
     if check and proc.returncode != 0:
         tail = " ".join(stderr.strip().splitlines()[-3:])
@@ -459,7 +509,13 @@ async def _git_dir(dir_: str) -> Optional[str]:
     at the real git dir; an agent could rewrite it to redirect sync into an
     unrelated same-origin checkout. Persisting this at attach/clone time and
     re-checking before sync detects that redirection."""
-    code, out, _ = await run_git(["rev-parse", "--absolute-git-dir"], dir_, check=False)
+    # surrogateescape: this answer is handed to ``os.path.realpath`` and later
+    # compared against the persisted trusted git dir, so a non-UTF-8 byte in the
+    # real path must survive as a PEP 383 surrogate ``os.fsencode`` restores
+    # byte-exactly -- a U+FFFD from the display decode names no real path.
+    code, out, _ = await run_git(
+        ["rev-parse", "--absolute-git-dir"], dir_, check=False, errors="surrogateescape"
+    )
     if code != 0 or not out.strip():
         return None
     try:
@@ -527,7 +583,13 @@ async def clone_vault(
         validate_remote_url(url),
         dir_,
     ]
-    await run_git(args, pat=pat, timeout=GIT_NETWORK_TIMEOUT_SEC)
+    # The one git call in this module with no repository to run inside yet, so it
+    # is pinned to the clone's parent instead of inheriting the gateway's cwd:
+    # ``dir_`` is absolute and git creates the leaf itself, so the parent is the
+    # only directory the command needs to exist.
+    parent = os.path.dirname(os.path.abspath(dir_))
+    await asyncio.to_thread(os.makedirs, parent, exist_ok=True)
+    await run_git(args, cwd=parent, pat=pat, timeout=GIT_NETWORK_TIMEOUT_SEC)
     vault: dict[str, Any] = {
         "id": vault_id,
         "name": name or repo_name(url),
@@ -698,8 +760,8 @@ async def status(dir_: str, subfolder: Optional[str] = None) -> list[FileChange]
     # transaction. Everything else is filesystem content and stays visible.
     #
     # The consequence is deliberate: an orphan left behind when a cleanup unlink
-    # lost the race becomes VISIBLE once its transaction ends and ownership can
-    # no longer be evidenced. That is the safe direction to fail. Reaping an
+    # lost the race becomes VISIBLE once its transaction ends and nothing can
+    # evidence ownership. That is the safe direction to fail. Reaping an
     # aged orphan is a lifecycle problem with its own answer; a permanent
     # filename-shape exclusion is not that answer, because it cannot tell an
     # orphan from a file the user put there.
@@ -870,12 +932,16 @@ async def repo_supplied_driver(dir_: str) -> str:
     driver-free, so the caller must not proceed.
     """
     scopes = ["--local"]
+    # --bool folds every git-true spelling (yes/on/1/valueless) to "true"; a
+    # raw string compare misses those spellings and skips the scope git still
+    # honors. A garbled value exits non-zero here AND kills the guarded git
+    # command itself with the same parse error, so skipping the scope is safe.
     code, out, _ = await run_git(
-        ["config", "--local", "--includes", "--get", "extensions.worktreeConfig"],
+        ["config", "--local", "--includes", "--bool", "--get", "extensions.worktreeConfig"],
         dir_,
         check=False,
     )
-    if code == 0 and out.strip().lower() == "true":
+    if code == 0 and out.strip() == "true":
         scopes.append("--worktree")
 
     for scope in scopes:
@@ -887,6 +953,27 @@ async def repo_supplied_driver(dir_: str) -> str:
             # the probe itself failed and we cannot clear the repo.
             if out.strip() == "" and err.strip() == "":
                 continue
+            if scope == "--worktree":
+                # Probe-first, classify after: git creates config.worktree
+                # lazily, so a probe that failed on a genuinely ABSENT file is
+                # the empty scope, not an unreadable one (the shared decision
+                # in kiro_crew.git_worktree_scope). The classification stats
+                # the filesystem, so it runs off the event loop.
+                # surrogateescape: this answer is handed to the classifier's
+                # ``os.lstat``, so a non-UTF-8 byte in the real path must
+                # survive as a PEP 383 surrogate ``os.fsencode`` restores
+                # byte-exactly -- a U+FFFD from the display decode would miss
+                # an existing ``config.worktree`` and clear a scope git reads.
+                gd_code, gd_out, _ = await run_git(
+                    ["rev-parse", "--absolute-git-dir"], dir_, check=False,
+                    errors="surrogateescape",
+                )
+                if await asyncio.to_thread(
+                    worktree_probe_failure_is_empty_scope,
+                    gd_out if gd_code == 0 else "",
+                    dir_,
+                ):
+                    continue
             return "unprobeable config"
         for key in out.splitlines():
             k = key.strip().lower()
@@ -1018,7 +1105,7 @@ async def sync(
         elif not origin_urls:
             raise GitError(f"No remote.origin.url configured for {dir_}")
 
-        # Refuse to sync if the vault's git remote no longer matches the URL it
+        # Refuse to sync if the vault's git remote does not match the URL it
         # was created/attached with. A vault's `.git/config` is agent-writable,
         # so a prompt-injected agent could repoint `remote.origin.url` (or
         # `pushurl`) at an attacker and have auto-sync upload the note history

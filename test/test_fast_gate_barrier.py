@@ -1,6 +1,6 @@
 """The Fast Gate barrier: what `await-fast-gate` must guarantee for the split to be safe.
 
-The eleven cheap blocking gates live in ``.github/workflows/fast-gate.yml`` so that
+The cheap blocking gates live in ``.github/workflows/fast-gate.yml`` so that
 two consumers can key on them before the expensive work starts: ci.yml's heavy jobs
 wait through ``await-fast-gate``, and the five fork reviewers trigger on the
 workflow's completion. A ``needs:`` edge cannot cross a workflow file, so that
@@ -41,21 +41,43 @@ from kiro_crew.subprocess_utf8 import UTF8_TEXT
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _CI = _REPO_ROOT / ".github" / "workflows" / "ci.yml"
 _FAST_GATE = _REPO_ROOT / ".github" / "workflows" / "fast-gate.yml"
+_BUILD = _REPO_ROOT / ".github" / "workflows" / "build.yml"
 
-# The eleven gates the split moved. Named explicitly rather than derived from the
-# file, so a gate silently DROPPED during a future edit fails here.
+# The gates the split moved. Named explicitly rather than derived from the
+# file, so a gate silently DROPPED during a future edit fails here. scrub-lint is
+# gone: its replacement is the internal-content-scan check, which runs in its own
+# workflow because it needs OIDC and a private ruleset, not a repo script.
 _GATE_JOBS = (
-    "scrub-lint",
     "vendor-manifest",
     "brand-lint",
+    "comment-history-lint",
     "focus-cue-lint",
     "feature-map-lint",
     "changelog-history",
+    "decision-ledger-history",
     "builtin-skill-scope",
     "loop-bound-locks",
     "testpaths-coverage",
+    "cwd-relative-repo-reads",
     "harness-parity",
     "docs-lint",
+)
+# Every job in fast-gate.yml, in file order: the moved gates plus the one gate
+# that was born there. Explicit for the same reason as _GATE_JOBS -- a job added
+# without the push/variable clause would be the one job left running on a
+# queue-on push, and a file-derived list would admit it silently.
+_FAST_GATE_JOBS = _GATE_JOBS[:-1] + ("memory-store-seam", "docs-lint")
+
+#: The exact `if` clause that trims a job off the push path while the repository
+#: variable MERGE_QUEUE_ENABLED is 'true', and keeps it there while it is unset.
+_PUSH_SKIP_CLAUSE = "github.event_name != 'push' || vars.MERGE_QUEUE_ENABLED != 'true'"
+#: The exact clause under which the boot leg admits a push with no needs to lean on.
+_PUSH_ADMIT_CLAUSE = "github.event_name == 'push' && vars.MERGE_QUEUE_ENABLED == 'true'"
+#: The exact run-level concurrency group of every workflow a push to main runs:
+#: a group per COMMIT only on the queue-on push, the per-ref group otherwise.
+_PUSH_GROUP_EXPR = (
+    "${{ " + _PUSH_ADMIT_CLAUSE + " && format('{0}-{1}', github.workflow, github.sha)"
+    " || format('{0}-{1}', github.workflow, github.ref) }}"
 )
 
 # DENY-BY-DEFAULT: every job in ci.yml must wait for the barrier unless it is
@@ -114,8 +136,79 @@ def barrier_step(ci: dict) -> dict:
     return steps[0]
 
 
+def _assert_push_to_main_reaches_exactly_the_macos_boot_leg(ci: dict) -> None:
+    jobs = ci["jobs"]
+    skipped_on_push = {
+        name for name, spec in jobs.items() if _PUSH_SKIP_CLAUSE in str(spec.get("if", ""))
+    }
+    assert skipped_on_push == {
+        "changes",
+        "await-fast-gate",
+        "coverage-gate",
+        "frontend-coverage-merge",
+    }
+    # A bare `!= 'push'` anywhere else would trim a job off the push path with
+    # the variable unset, which is the state this contract keeps at full matrix.
+    bare = {
+        name
+        for name, spec in jobs.items()
+        if "github.event_name != 'push'" in str(spec.get("if", ""))
+    }
+    assert (
+        bare == skipped_on_push
+    ), f"push-skips not gated on MERGE_QUEUE_ENABLED: {bare - skipped_on_push}"
+
+    for name, spec in jobs.items():
+        if name in skipped_on_push or name == "e2e-boot-matrix":
+            continue
+        needs = spec.get("needs") or []
+        direct_needs = {needs} if isinstance(needs, str) else set(needs)
+        assert direct_needs & {"changes", "await-fast-gate"}, (
+            f"{name} does not directly need changes or await-fast-gate, so a push "
+            "could reach it after those jobs skip"
+        )
+        guard = str(spec.get("if", ""))
+        assert (
+            "always()" not in guard and "!cancelled()" not in guard
+        ), f"{name} overrides the skipped dependency with {guard!r} and can run on push"
+
+    boot = jobs["e2e-boot-matrix"]
+    boot_guard = str(boot["if"])
+    assert _PUSH_ADMIT_CLAUSE in boot_guard
+    assert "!cancelled()" in boot_guard
+    # The admission is the whole conjunction, never a bare push: with the
+    # variable unset a push must go through the needs like every other event.
+    assert boot_guard.count("github.event_name == 'push'") == 1
+    assert "(github.event_name == 'push' ||" not in boot_guard
+
+    matrix_os = str(boot["strategy"]["matrix"]["os"])
+    sides = matrix_os.split("||")
+    assert (
+        len(sides) == 3
+    ), f"expected non-push / queue-on / queue-off matrix split, got: {matrix_os}"
+    non_push_side, queue_on_side, queue_off_side = sides
+    assert "github.event_name != 'push'" in non_push_side
+    assert "vars.MERGE_QUEUE_ENABLED == 'true'" in queue_on_side
+    assert "&&" not in queue_off_side, "the fallback literal must be unguarded"
+
+    def platforms(side: str) -> list[str]:
+        start = side.index("[")
+        end = side.index("]", start) + 1
+        parsed = json.loads(side[start:end])
+        assert isinstance(parsed, list) and all(isinstance(item, str) for item in parsed)
+        return parsed
+
+    non_push_platforms = platforms(non_push_side)
+    queue_on_platforms = platforms(queue_on_side)
+    queue_off_platforms = platforms(queue_off_side)
+    assert non_push_platforms == ["ubuntu-latest", "windows-latest"]
+    assert queue_on_platforms == ["macos-15"]
+    assert queue_off_platforms == ["ubuntu-latest", "macos-15", "windows-latest"]
+    assert not any("macos" in platform for platform in non_push_platforms)
+
+
 class TestTheGatesLiveInTheGateWorkflow:
-    def test_all_eleven_gates_are_in_fast_gate_and_none_left_in_ci(
+    def test_all_gates_are_in_fast_gate_and_none_left_in_ci(
         self, ci: dict, fast_gate: dict
     ) -> None:
         missing = [job for job in _GATE_JOBS if job not in fast_gate["jobs"]]
@@ -125,24 +218,148 @@ class TestTheGatesLiveInTheGateWorkflow:
         strays = [job for job in _GATE_JOBS if job in ci["jobs"]]
         assert not strays, f"gate job(s) back in ci.yml, racing the matrix again: {strays}"
 
-    @pytest.mark.parametrize("job", _GATE_JOBS)
-    def test_every_gate_is_unconditional(self, fast_gate: dict, job: str) -> None:
+    @pytest.mark.parametrize("job", tuple(_workflow(_FAST_GATE)["jobs"]))
+    def test_every_gate_skips_only_the_queued_push(self, fast_gate: dict, job: str) -> None:
         # A `needs:` lets a failed sibling skip it and an `if:` lets a diff shape
-        # dodge it. These gates are cheap precisely so that neither is needed.
+        # dodge it. The ONE condition a gate may carry is the exact push/variable
+        # clause: on a push to main while MERGE_QUEUE_ENABLED is 'true' the merge
+        # group already ran every gate on this tree, so the push run skips
+        # whole -- and then neither this workflow nor ci.yml requests a fleet
+        # slot on the queue-on push path (only fleet-labelled jobs can be
+        # orphaned; build.yml's matrix resolver and the heal-exempt ratchet
+        # audit are what remain). Equality, not containment: an extra `&&` term is a way
+        # to dodge, and `==`/`!=` swapped would skip every PR instead.
         spec = fast_gate["jobs"][job]
         assert "needs" not in spec, f"{job} gained a dependency and can now be skipped"
-        assert "if" not in spec, f"{job} gained a condition and can now be dodged"
+        assert (
+            spec.get("if") == _PUSH_SKIP_CLAUSE
+        ), f"{job} must carry exactly the push/variable clause, got {spec.get('if')!r}"
+
+    def test_the_queued_push_run_is_all_skipped_not_failed(self, fast_gate: dict) -> None:
+        # Job by job above, and here as a whole: the job list is pinned so a gate
+        # ADDED without the clause (which would be the one job left running on the
+        # queue-on push, holding a fleet slot) fails, and so does one dropped.
+        assert tuple(fast_gate["jobs"]) == _FAST_GATE_JOBS
+        carrying = {
+            name for name, spec in fast_gate["jobs"].items() if spec.get("if") == _PUSH_SKIP_CLAUSE
+        }
+        assert carrying == set(_FAST_GATE_JOBS)
+        # No barrier or aggregate job exists to turn a skipped sibling into a
+        # failure: nothing in the file has a `needs:` at all.
+        assert not any("needs" in spec for spec in fast_gate["jobs"].values())
 
     def test_the_gate_workflow_matches_ci_triggers(self, ci: dict, fast_gate: dict) -> None:
+        """Re-derived stronger: pin both workflows' complete, identical trigger dictionaries."""
         # `on` is a YAML 1.1 boolean, so PyYAML keys the trigger block on True.
-        ci_on = ci.get("on", ci.get(True))
-        fg_on = fast_gate.get("on", fast_gate.get(True))
-        assert fg_on == ci_on, (
-            "Fast Gate's triggers drifted from ci.yml's. They must match: a WIDER "
-            "filter newly reviews fork PRs on a non-main base (the fork reviewers key "
-            "on this workflow), and a NARROWER one leaves await-fast-gate waiting for "
-            "a run that never starts."
+        ci_on = dict(ci.get("on", ci.get(True)))
+        fg_on = dict(fast_gate.get("on", fast_gate.get(True)))
+        expected = {
+            "push": {"branches": ["main"]},
+            "pull_request": {"branches": ["main"]},
+            "merge_group": {"types": ["checks_requested"]},
+        }
+        assert ci_on == expected
+        # Fast Gate runs on a push too: with MERGE_QUEUE_ENABLED unset, ci.yml's
+        # barrier consumes that run before the full push matrix.
+        assert fg_on == expected, (
+            "Fast Gate's triggers drifted from ci.yml's. A WIDER filter newly reviews "
+            "fork PRs on a non-main base (the fork reviewers key on this workflow), and "
+            "a NARROWER one leaves await-fast-gate waiting for a run that never starts."
         )
+        assert list(fg_on) == list(expected), "keep the trigger order matching ci.yml"
+
+    @pytest.mark.parametrize("path", [_CI, _FAST_GATE, _BUILD], ids=lambda p: p.name)
+    def test_a_push_is_grouped_per_commit_only_while_the_queue_is_on(self, path: Path) -> None:
+        """Re-derived stronger: the exact concurrency block, on every workflow a push runs.
+
+        With MERGE_QUEUE_ENABLED unset a push runs the FULL matrix, so it must keep
+        today's per-ref group: one running plus one pending, later pushes evict the
+        pending one. A per-SHA group there would let N concurrent main matrices hold
+        2N hosted macOS jobs with nothing evicting or queueing them. Only the trimmed
+        queue-on push (one macOS leg per commit) earns a group per commit.
+        """
+        assert _workflow(path)["concurrency"] == {
+            "group": _PUSH_GROUP_EXPR,
+            "cancel-in-progress": "${{ github.event_name == 'pull_request' }}",
+        }
+        # The variable gates the per-SHA arm only; the per-ref fallback is unguarded.
+        sha_arm, _, ref_arm = _PUSH_GROUP_EXPR.partition(" || ")
+        assert sha_arm.startswith("${{ " + _PUSH_ADMIT_CLAUSE + " && ")
+        assert "github.sha" in sha_arm and "github.sha" not in ref_arm
+        assert "vars." not in ref_arm and "github.ref" in ref_arm
+
+    def test_a_push_to_main_reaches_exactly_the_macos_boot_leg(self, ci: dict) -> None:
+        """Re-derived stronger: pin the push path job by job under both states of
+        MERGE_QUEUE_ENABLED -- trimmed to the mac boot leg when set, full matrix when unset."""
+        _assert_push_to_main_reaches_exactly_the_macos_boot_leg(ci)
+
+
+class TestFastGatePythonRuntime:
+    @staticmethod
+    def _assert_runtime(spec: dict) -> None:
+        steps = spec["steps"]
+        setups = [
+            i
+            for i, step in enumerate(steps)
+            if step.get("uses", "").startswith("actions/setup-python@")
+        ]
+        assert len(setups) == 1, "expected exactly one Python setup"
+        index = setups[0]
+        setup = steps[index]
+        assert setup["uses"] == (
+            "actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97"
+        ), "Python setup must use the pinned action"
+        assert setup.get("with", {}).get("python-version") == "3.12", "expected Python 3.12"
+        assert "if" not in setup, "Python setup must be unconditional"
+        assert "continue-on-error" not in setup, "Python setup must be blocking"
+        assert "continue-on-error" not in spec, "the runtime failure must fail the job"
+        assert index > 0 and steps[index - 1].get("uses", "").startswith(
+            "actions/checkout@"
+        ), "Python setup must follow checkout"
+        runs = [i for i, step in enumerate(steps) if "run" in step]
+        assert runs and index < min(runs), "Python setup must precede every run step"
+
+    @pytest.mark.parametrize("job", tuple(_workflow(_FAST_GATE)["jobs"]))
+    def test_every_actual_job_sets_up_python_before_running(self, fast_gate: dict, job: str):
+        self._assert_runtime(fast_gate["jobs"][job])
+
+    @pytest.mark.parametrize(
+        "defect",
+        [
+            "missing",
+            "duplicate",
+            "old-version",
+            "unpinned",
+            "late",
+            "conditional",
+            "soft-step",
+            "soft-job",
+        ],
+    )
+    def test_runtime_contract_rejects_broken_setup(self, defect: str) -> None:
+        # Fresh workflow data keeps each mutation independent of the module fixture.
+        spec = _workflow(_FAST_GATE)["jobs"]["memory-store-seam"]
+        self._assert_runtime(spec)
+        steps = spec["steps"]
+        setup = steps[1]
+        if defect == "missing":
+            steps.pop(1)
+        elif defect == "duplicate":
+            steps.insert(2, dict(setup))
+        elif defect == "old-version":
+            setup["with"]["python-version"] = "3.11"
+        elif defect == "unpinned":
+            setup["uses"] = "actions/setup-python@v7"
+        elif defect == "late":
+            steps.append(steps.pop(1))
+        elif defect == "conditional":
+            setup["if"] = "runner.environment == 'github-hosted'"
+        elif defect == "soft-step":
+            setup["continue-on-error"] = True
+        else:
+            spec["continue-on-error"] = True
+        with pytest.raises(AssertionError):
+            self._assert_runtime(spec)
 
 
 class TestTheBarrierIdentifiesTheRightRun:
@@ -417,3 +634,107 @@ class TestTheSelectorBehavesOnRealPayloadShapes:
         # The caller treats null as "keep waiting", so a jq error here would turn a
         # transient empty page into a hard failure on the first poll.
         assert self._select(barrier_step["run"], payload) is None
+
+
+class TestTheConclusionArmsBehaveOnRealConclusions:
+    """The assertions above pin the case statement's TEXT. This one runs it.
+
+    ``action_required`` is what GitHub reports for a fork run that is still awaiting
+    maintainer approval, and it arrives with ``status=completed``. An arm order or a
+    glob that swallowed it back into the terminal ``*)`` branch would put the matrix
+    back at the mercy of which of the two pending runs a maintainer approves first,
+    so the extracted arms are executed rather than only read.
+    """
+
+    _POLLING = "__barrier_would_poll_again__"
+    _STATUS = "__barrier_status__="
+
+    @staticmethod
+    def _case(script: str) -> str:
+        start = script.find('case "$conclusion" in')
+        assert start != -1, "could not locate the conclusion case statement"
+        end = script.find("esac", start)
+        assert end != -1, "the conclusion case statement lost its esac"
+        return script[start : end + len("esac")]
+
+    def _exec(self, script: str, conclusion: str, cwd: Path) -> subprocess.CompletedProcess[str]:
+        if shutil.which("sh") is None:  # pragma: no cover - CI images ship sh
+            pytest.skip("no POSIX shell available")
+        program = (
+            "set -eu\n"
+            'conclusion="$1"\n'
+            'url="https://github.com/x/actions/runs/1"\n'
+            # The raw API value at this point in the loop, so a rename is visible.
+            'status="completed"\n'
+            f"{self._case(script)}\n"
+            # Reached only when no arm exited: the loop falls through to its
+            # TOTAL_BUDGET check and sleeps for another poll. $status is what the
+            # budget-spent message below the case interpolates, so it is reported
+            # too rather than inspected as source text.
+            f'printf "%s\\n" "{self._POLLING}"\n'
+            f'printf "{self._STATUS}%s\\n" "$status"\n'
+        )
+        return subprocess.run(
+            ["sh", "-c", program, "sh", conclusion],
+            capture_output=True,
+            # The program is shell text sliced out of ci.yml at runtime, so a
+            # future arm could carry a relative-path write. Spawning in the
+            # checkout would leave that file behind; tmp_path cannot.
+            cwd=cwd,
+            **UTF8_TEXT,
+        )
+
+    def _status_after(self, script: str, conclusion: str, cwd: Path) -> str:
+        proc = self._exec(script, conclusion, cwd)
+        assert proc.returncode == 0, proc.stderr
+        line = [ln for ln in proc.stdout.splitlines() if ln.startswith(self._STATUS)]
+        assert len(line) == 1, f"the case did not report a single $status: {proc.stdout!r}"
+        return line[0][len(self._STATUS) :]
+
+    def test_a_pending_fork_approval_keeps_polling_rather_than_failing(
+        self, barrier_step: dict, tmp_path: Path
+    ) -> None:
+        proc = self._exec(barrier_step["run"], "action_required", tmp_path)
+        assert proc.returncode == 0, proc.stderr
+        assert self._POLLING in proc.stdout, (
+            "action_required left the case with a non-zero exit instead of falling "
+            "through to the TOTAL_BUDGET check, so a fork PR still loses its whole "
+            "matrix to whichever of the two pending runs is approved first"
+        )
+        assert "::error::" not in proc.stdout
+
+    def test_a_pending_fork_approval_names_the_state_it_waits_on(
+        self, barrier_step: dict, tmp_path: Path
+    ) -> None:
+        # The fail-closed message below the case interpolates $status, whose raw API
+        # value here is "completed": left alone it reports a completed run as still
+        # waiting and names no pending approval for the reader to act on. Asserted on
+        # the value the shell actually leaves behind, not on the arm's source text,
+        # so re-assigning the same "completed" back cannot satisfy it.
+        status = self._status_after(barrier_step["run"], "action_required", tmp_path)
+        assert status != "completed", (
+            "the action_required arm no longer renames $status, so the budget-spent "
+            "error reads \"still 'completed'\" about a run nobody has judged"
+        )
+        assert "approval" in status.lower(), (
+            "the renamed state does not name the pending approval, which is the one "
+            f"thing the reader has to act on: {status!r}"
+        )
+
+    def test_success_still_releases_the_matrix(self, barrier_step: dict, tmp_path: Path) -> None:
+        proc = self._exec(barrier_step["run"], "success", tmp_path)
+        assert proc.returncode == 0, proc.stderr
+        assert self._POLLING not in proc.stdout, "success no longer leaves the loop"
+
+    @pytest.mark.parametrize(
+        "conclusion",
+        ["failure", "cancelled", "timed_out", "startup_failure", "neutral", "skipped"],
+    )
+    def test_every_other_conclusion_is_still_terminal(
+        self, barrier_step: dict, conclusion: str, tmp_path: Path
+    ) -> None:
+        proc = self._exec(barrier_step["run"], conclusion, tmp_path)
+        assert proc.returncode == 1, f"{conclusion} stopped failing closed"
+        assert "::error::" in proc.stdout
+        assert self._POLLING not in proc.stdout
+        assert self._STATUS not in proc.stdout

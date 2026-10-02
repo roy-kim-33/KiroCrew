@@ -12,20 +12,51 @@ import time as _time
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
-from kiro_crew import git_coord, name_grant, platform_compat, shutdown_event
+from kiro_crew import git_coord, name_grant, platform_compat, runtime_death, shutdown_event
 from kiro_crew.acp.client import AcpProcessDied
+from kiro_crew.agent_sdk.drivers.acp_vocab import (
+    STOP_CLASS_CANCELLED,
+    STOP_CLASS_FAILED,
+    STOP_CLASS_RECOVERING,
+    STOP_CLASS_STALLED,
+    STOP_RECOVERY_MAX_RETRIES,
+    classify_stop_reason,
+)
+from kiro_crew.agent_sdk.spec_hooks import (
+    invalidate_stale_kas_session,
+    refuse_stale_switch,
+    reproject_claimed_session,
+    running_agent,
+    turn_spec_hooks,
+)
 from kiro_crew.config.loader import KiroCrewConfig
+from kiro_crew.constants import DENY_CAUSE_POLICY, DENY_CAUSE_SURFACE_POLICY
 from kiro_crew.executors import run_in_embed_pool
-from kiro_crew.hooks import TOOL_AUTO_APPROVE, TOOL_DENY, fire_tool_hooks, get_global_hook_store
-from kiro_crew.llm_helpers import provider_last_turn_usage, stream_and_collect_json
+from kiro_crew.hooks import (
+    TOOL_AUTO_APPROVE,
+    TOOL_DENY,
+    fire_tool_hooks,
+    get_global_hook_store,
+    hook_gate_kwargs,
+    permission_pre_tool_block,
+)
+from kiro_crew.llm_helpers import (
+    _steer_host_deny,
+    provider_last_turn_usage,
+    stream_and_collect_json,
+)
+from kiro_crew.messaging.dispatch import consume_reinjection, rearm_reinjection
 from kiro_crew.messaging.link import telemetry_channel_of
+from kiro_crew.permission_floor import OUTCOME_REJECTED_TRANSPORT_FLOOR
 from kiro_crew.providers.base import (
+    EVENT_AGENT_SWITCHED,
     EVENT_COMPLETE,
     EVENT_PERMISSION_REQUEST,
     EVENT_TEXT_CHUNK,
     EVENT_TOOL_CALL,
     LLMEvent,
 )
+from kiro_crew.recovery.ladder import L3_ACP_RUNTIME, default_ladder
 from kiro_crew.safety_override import safety_override
 from kiro_crew.sandbox import (
     create_subprocess_limited,
@@ -45,11 +76,58 @@ from kiro_crew.task_models import (
 )
 from kiro_crew.task_planner import group_parallel_tasks
 
+if TYPE_CHECKING:
+    from kiro_crew.taskq.adapters.runner import Admitted
+
 _MID_STREAM_COMPACT_PCT = 90.0
+
+#: What the model is told when an unattended task run refuses a tool call it has
+#: no positive authorization for. Says what the surface permits (the
+#: surface-policy notice tells the model to read exactly that) and nothing
+#: about the call itself, which was never judged.
+_HEADLESS_DENY_REASON = (
+    "this task run is unattended: no approval handler is attached and no hook "
+    "auto-approve trusts this tool, so only tools listed in hooks.auto_approve_tools "
+    "can run here"
+)
 
 
 class _ContextOverflow(Exception):
     """Raised when context usage exceeds threshold mid-stream."""
+
+
+class _TurnNotCompleted(Exception):
+    """The stream ended on a non-success stop reason (stall, cancel, error).
+
+    The task runner consumes the same ACP completions as the main chat and
+    the sub-agent run, so it maps them through the same classifier
+    (``classify_stop_reason``). Raised INSIDE the attempt's try, and handled by
+    its own branch in :func:`execute_task`: a ``stalled`` / ``recovering``
+    class re-runs the turn after the recovery ladder's L3 delay (the row is
+    ``recovering`` meanwhile), a ``cancelled`` or non-retryable ``failed``
+    class ends the step FAILED with its partial preserved, and a retryable
+    ``error:`` class goes through the existing bounded retry ladder.
+    """
+
+    def __init__(
+        self, stop_class: str, stop_reason: str, *, partial: bool, retryable: bool = False
+    ) -> None:
+        self.stop_class = stop_class
+        self.stop_reason = stop_reason
+        self.partial = partial
+        self.retryable = retryable
+        note = " — partial output preserved in the task result" if partial else ""
+        super().__init__(f"turn ended {stop_class} (stop_reason={stop_reason!r}){note}")
+
+    @property
+    def recoverable(self) -> bool:
+        return self.stop_class in (STOP_CLASS_STALLED, STOP_CLASS_RECOVERING)
+
+
+async def _recovery_delay(secs: float) -> None:
+    """Module seam for the ladder's wait between a stalled turn and its re-run."""
+    if secs > 0:
+        await asyncio.sleep(secs)
 
 
 if TYPE_CHECKING:
@@ -57,6 +135,43 @@ if TYPE_CHECKING:
     from kiro_crew.session import SessionManager
 
 logger = logging.getLogger(__name__)
+
+# Prefix of ``task.error`` when self-review could not judge the step at all.
+_REVIEW_UNVERIFIED = "Self-review could not verify the step"
+
+
+async def _reset_session_quietly(sessions: "SessionManager", session_key: str) -> None:
+    """Reset the ACP session for the next turn; a reset that fails is not fatal.
+
+    Every re-prompt of a session whose previous turn did not finish goes through
+    one, because a StreamReader another coroutine is still waiting on answers
+    ``readuntil() called while another coroutine is already waiting``.
+    """
+    try:
+        await sessions.reset(session_key)
+    except Exception:
+        logger.debug("Session reset before a re-run failed", exc_info=True)
+
+
+async def _end_stalled_step(
+    task: "Task",
+    sessions: "SessionManager",
+    session_key: str,
+    stop: "_TurnNotCompleted",
+    why: str,
+) -> bool:
+    """Fail *task* on a stalled turn whose in-place recovery cannot be taken.
+
+    Always False, for the caller to return. *why* is the ONE thing that differs
+    between the answers -- the in-place budget spent, the durable ``recovering``
+    write refused, the row gone before the re-claim, the re-claimed row refusing
+    the ``running`` mark -- and the partial already in ``task.result`` is kept
+    whichever it was.
+    """
+    await _reset_session_quietly(sessions, session_key)
+    task.status = TaskStatus.FAILED
+    task.error = f"{stop.stop_class} ({stop.stop_reason}) — {why} — partial result preserved"
+    return False
 
 
 async def _check_error_loop(
@@ -95,10 +210,18 @@ async def execute_single_task(
     log_task_fn: Callable,
     extract_lesson_fn: Callable,
     session_key: str = "",
+    taskq: "Admitted | None" = None,
 ) -> bool:
-    """Execute one task with approval gate, self-review, and memory update."""
+    """Execute one task with approval gate, self-review, and memory update.
+
+    ``taskq`` is the step's admitted task-queue row (``taskq.adapters.runner``)
+    when the runner has one attached; it carries the stop-reason recovery and
+    the dependency / input waits through the shared store. ``None`` is the
+    legacy path.
+    """
     if not session_key:
         session_key = f"{SESSION_PREFIX}:{run.task_id}:task{task.index}"
+    _exec_kw = {"taskq": taskq} if taskq is not None else {}
 
     task.status = TaskStatus.IN_PROGRESS
     now = _time.time()
@@ -201,21 +324,37 @@ async def execute_single_task(
         work_dir,
         on_notify,
         session_key,
+        **_exec_kw,
     )
     run.last_task_time = _time.time()
 
     if success:
-        committed = False
+        committed = commit_failed = False
         if run.branch_name:
             try:
                 sha = await git_coord.commit_step(run, task)
                 committed = bool(sha)
             except Exception:
+                commit_failed = True
                 logger.debug("Git commit failed for task %d", task.index, exc_info=True)
 
         task.status = TaskStatus.REVIEWING
-        review_ok = await self_review(run, task, sessions, agent, session_key)
-        if not review_ok:
+        # Passed only when set, so the common call keeps its existing shape.
+        _review_kw = {"commit_failed": True} if commit_failed else {}
+        review_ok = await self_review(
+            run, task, sessions, agent, session_key, ctx=ctx, **_review_kw
+        )
+        if not review_ok and task.error.startswith(_REVIEW_UNVERIFIED):
+            # Nothing to judge the step by: fail it. A re-run would repeat any
+            # push or CR the step made and pass without a review.
+            task.status = TaskStatus.FAILED
+            success = False
+            await on_notify(
+                f"❌ Task {task.index}/{len(run.tasks)} failed",
+                f"{task.title}\n{task.error}",
+                run=run,
+            )
+        elif not review_ok:
             if committed and run.branch_name:
                 try:
                     await git_coord.revert_step(run)
@@ -234,6 +373,7 @@ async def execute_single_task(
                 work_dir,
                 on_notify,
                 session_key,
+                **_exec_kw,
             )
             if success and run.branch_name:
                 try:
@@ -262,19 +402,62 @@ async def execute_single_task(
     return success
 
 
-async def _reject_and_log(client, history, session_key, agent, event, *, metadata=None):
-    """Reject a tool call and log the rejection."""
-    await client.reject_tool(event.request_id)
+async def _reject_and_log(
+    client,
+    history,
+    session_key,
+    agent,
+    event,
+    *,
+    cause: str | None,
+    reason: str = "",
+    outcome: str = "rejected",
+    error: str | None = None,
+    metadata=None,
+):
+    """Audit a tool rejection, tell the model WHO refused it, then answer the wire.
+
+    The task runner's single reject funnel: every ``reject_tool`` in this module
+    goes through here so a path added later cannot deny by omission
+    (``test_taskrunner_deny_notice`` walks the file to keep that true).
+
+    *cause* is REQUIRED and says whether the HOST refused this call. A rejected
+    permission reaches the model as kiro-cli's fixed "User denied tool
+    execution"; for a host deny that is a refusal that never happened, and the
+    model abandons or routes around a call nobody objected to. So a host cause
+    (``DENY_CAUSE_POLICY`` for a hook or policy verdict on the call itself,
+    ``DENY_CAUSE_SURFACE_POLICY`` for the unattended run refusing every
+    un-trusted call) steers the in-band notice through ``llm_helpers``'
+    ``_steer_host_deny`` BEFORE the reject -- while the permission request is
+    still unanswered the turn is provably in flight, which is what gets the
+    notice queued rather than dropped (see ``kiro_crew.deny_notice``). ``None``
+    is the explicit verdict that this is NOT a host deny and must stay bare:
+    the interactive handler said no (kiro-cli's wording is then the truth, and
+    "this was NOT a user action" would be a lie), or the turn is being torn
+    down for a mid-stream compaction and re-run, so there is no continuing turn
+    for a notice to correct. A caller has to write one or the other; there is
+    no default to inherit the wrong answer from.
+
+    The SEL row is written FIRST, before the steer and the reject, as on every
+    other deny surface: the steer is one more bounded await on the ACP pipe, and
+    a backend that stops reading stdin cancels this coroutine at the turn
+    deadline with the decision acted on and never audited if the row came last.
+    ``outcome`` / ``error`` let a hook deny keep the row shape it always wrote.
+    """
     history.log_tool_invocation(
         session_key=session_key,
         agent=agent or "kirocrew",
         source="taskrunner",
         tool_name=event.title,
         tool_kind=event.tool_kind,
-        outcome="rejected",
+        outcome=outcome,
         request_id=event.request_id,
+        **({"error": error} if error else {}),
         **({"metadata": metadata} if metadata else {}),
     )
+    if cause is not None:
+        await _steer_host_deny(client, event, reason, cause=cause)
+    await client.reject_tool(event.request_id)
 
 
 async def execute_task(
@@ -289,23 +472,68 @@ async def execute_task(
     work_dir: Path,
     on_notify: Callable,
     session_key: str = "",
+    taskq: "Admitted | None" = None,
 ) -> bool:
     """Execute a single task with retries and process recovery.
 
     Separate budgets:
     - Logic/test failures: up to MAX_RETRIES attempts
     - Process crashes (AcpProcessDied): up to MAX_RECOVERIES, not counted as attempts.
+    - Stalled / recovering turns (stop reason): the recovery ladder's L3 rung
+      (``taskq.admission.ladder`` when attached, the process default
+      otherwise) approves each re-run and spaces it, and
+      ``STOP_RECOVERY_MAX_RETRIES`` is the ceiling on how many this step takes
+      in place; not counted as attempts, because the turn that stalled never
+      finished being attempted once and the two budgets bound different things.
+    - A dependency signal (429, 5xx, auth) parks the step in
+      ``waiting_dependency`` through ``taskq`` and re-runs it when woken; not
+      counted as an attempt. Terminal signals fail the step.
     """
     if not session_key:
         session_key = f"{SESSION_PREFIX}:{run.task_id}:task{task.index}"
     recoveries = 0
     compactions = 0
+    stop_recoveries = 0
+    dependency_waits = 0
     attempt = 0
+    # The agent a mid-step mode switch moved the session to, carried across
+    # attempts so a retry on that same session is gated by ITS hooks. Only the
+    # hook lookup reads it; the claim still asks for the step's own agent.
+    switched_agent = ""
     previous_error = ""
     consecutive_same_error = 0
     result_prefix = ""
 
-    while attempt < MAX_RETRIES:
+    # Operator answers applied to this step's prompt. They are marked consumed
+    # (``input_consumed``) only once the step has durably COMPLETED: a crash
+    # between applying an answer and the turn finishing must leave it
+    # replayable, or the re-dispatched step asks the operator again.
+    applied_answers: list[str] = []
+
+    async def _consume_applied_answers() -> None:
+        if taskq is None:
+            return
+        for question_id in applied_answers:
+            await taskq.admission.consume_answer_async(taskq.task_id, question_id)
+        applied_answers.clear()
+
+    if taskq is not None:
+        # A step re-dispatched after a crash that landed between the operator's
+        # answer and the re-admission: the answer lives on the row's wake event
+        # (never only in RAM), so the resumed turn sees it exactly as the
+        # uninterrupted turn would have.
+        recorded = await taskq.admission.recorded_answer_async(taskq.task_id)
+        if recorded is not None:
+            applied_answers.append("recovered")
+            task.description = f"{task.description}\n\n## Operator input\n{recorded}\n"
+
+    # ``attempt`` is the TURN ordinal (the re-run prompt reads it), and
+    # ``MAX_RETRIES`` bounds the LOGIC failures only: an in-place stall recovery
+    # the ladder approved raises this ceiling by its own turn instead of
+    # spending an attempt on work that never finished being attempted once.
+    # ``stop_recoveries`` is itself bounded (``STOP_RECOVERY_MAX_RETRIES``), so
+    # the ceiling is too.
+    while attempt < MAX_RETRIES + stop_recoveries:
         attempt += 1
 
         if shutdown_event.is_set():
@@ -319,19 +547,53 @@ async def execute_task(
         logger.info("Task %d/%d (attempt %d): %s", task.index, len(run.tasks), attempt, task.title)
 
         _acquired = False
+        # Post-compaction re-injection bookkeeping for the finally: whether this
+        # turn consumed the one-shot flag, and whether it landed (recorded success).
+        _needs_reinjection = False
+        _turn_landed = False
+        # The provider THIS attempt ran on, for the death handler's attribution
+        # question. Reset per attempt and set only once the session is open, so a
+        # death before the open asks about nothing (and is charged, as before)
+        # rather than about the previous attempt's provider -- ``client`` itself
+        # survives the loop, so reading it directly would attribute this
+        # attempt's death to a runtime it never used.
+        _turn_provider: object | None = None
         try:
-            await check_context(session_key, sessions)
+            from kiro_crew.context import inherit_session_memory
 
-            client, is_new, _resumed = await sessions.open_task_session(
-                f"{SESSION_PREFIX}:{run.task_id}:runtime",
-                session_key,
-                agent=agent or None,
-                cwd=str(work_dir) if work_dir else None,
+            memory_store = await inherit_session_memory(
+                ctx, f"{SESSION_PREFIX}:{run.task_id}:runtime", session_key
             )
+            await check_context(session_key, sessions)
+            # A reused KAS session whose registered batch auto-approves what a
+            # PreToolUse hook now covers is reset, so the claim re-projects it.
+            await invalidate_stale_kas_session(sessions, session_key, agent or "kirocrew")
+
+            def _claim():
+                return sessions.open_task_session(
+                    f"{SESSION_PREFIX}:{run.task_id}:runtime",
+                    session_key,
+                    agent=agent or None,
+                    cwd=str(work_dir) if work_dir else None,
+                )
+
+            client, is_new, _resumed = await _claim()
             _acquired = True
+            # Decided again under the lease: the pre-claim reset is declined for a
+            # session another turn holds, and this claim may have waited for it.
+            client, is_new, _resumed = await reproject_claimed_session(
+                sessions, session_key, agent or "kirocrew", (client, is_new, _resumed), _claim
+            )
+            _turn_provider = client
 
             task_prompt = await build_task_prompt(run, task, attempt, work_dir)
             if ctx:
+                # The check_context above (and the post-turn usage check) can
+                # compact this session in place, which drops its session-start
+                # context. Read-and-clear the one-shot flag so this turn
+                # re-injects that context exactly once; the finally re-arms it
+                # if the turn never lands.
+                _needs_reinjection = consume_reinjection(sessions, session_key)
                 # Off-loop: build_message embeds the episodic query (blocking urllib).
                 full_prompt, _ = await run_in_embed_pool(
                     ctx.build_message,
@@ -341,9 +603,25 @@ async def execute_task(
                     agent=agent or None,
                     project=str(work_dir) if work_dir else None,
                     provider_type=KiroCrewConfig.load().agent.provider,
+                    memory_store=memory_store,
+                    context_provider=client,
+                    resumed=_resumed,
+                    needs_reinjection=_needs_reinjection,
                 )
             else:
                 full_prompt = task_prompt
+
+            # The step's agent spec hooks, when its backend never receives them
+            # (none on kiro-cli, whose harness runs the field itself). On such a
+            # backend PreToolUse hooks gate each permission request; the KAS
+            # projection turns every call they cover into one.
+            # A step with no agent runs the runtime's default one, and that is
+            # the spec the session's projection gated.
+            # The agent this session runs NOW: a retry on a session an earlier
+            # attempt switched runs the switched-to agent, so its hooks gate.
+            _spec = await turn_spec_hooks(
+                client, running_agent(client, switched_agent or agent or "kirocrew")
+            )
 
             result_text = ""
             _chunk_count = 0
@@ -365,6 +643,41 @@ async def execute_task(
                     run.last_task_time = _time.time()
                     run.tokens_used += max(1, len(event.text) // 4)
                 elif event.kind == EVENT_PERMISSION_REQUEST:
+                    _spec_block = None
+                    if _spec.gated:
+                        _spec_block = (
+                            "the agent spec's hooks could not be read"
+                            if _spec.unreadable
+                            else await permission_pre_tool_block(
+                                get_global_hook_store(),
+                                _spec.hooks,
+                                _spec.cwd,
+                                event.title,
+                                event.tool_input,
+                                tool_identity=event.tool_name,
+                                mcp_server=event.mcp_server_name,
+                                harness_tool_id=event.harness_tool_id,
+                                parent_session_key=session_key or None,
+                                agent_role=(agent or "kirocrew"),
+                            )
+                        )
+                    if _spec_block is not None:
+                        logger.warning("task step PreToolUse hook blocked a tool: %s", _spec_block)
+                        # A PreToolUse gate verdict on the call itself (a
+                        # delivered deny, or a gate with no verdict, which
+                        # blocks) -- the policy cause, as the chat runner
+                        # steers the same BLOCKED strings.
+                        await _reject_and_log(
+                            client,
+                            sel(),
+                            session_key,
+                            agent,
+                            event,
+                            cause=DENY_CAUSE_POLICY,
+                            reason=_spec_block,
+                            metadata={"reason": "spec_hook_deny"},
+                        )
+                        continue
                     # Honor the user-configured auto-approve trust (hook
                     # TOOL_AUTO_APPROVE from hooks.auto_approve_tools) before the
                     # interactive prompt, so explicit trust is respected instead
@@ -376,21 +689,21 @@ async def execute_task(
                             event.title,
                             session_key=session_key,
                             agent=agent,
-                            tool_kind=event.tool_kind,
-                            raw_params=event.raw_tool_params,
-                            command=event.shell_command,
-                            is_shell=event.is_shell,
+                            **hook_gate_kwargs(event),
                         )
                         if tool_result.action == TOOL_DENY:
-                            await client.reject_tool(event.request_id)
-                            sel().log_tool_invocation(
-                                session_key=session_key,
-                                agent=agent or "kirocrew",
-                                source="taskrunner",
-                                tool_name=event.title,
-                                tool_kind=event.tool_kind,
+                            # The hook judged the call itself: a policy
+                            # verdict, with the hook's own reason so the class
+                            # remediation can key off it.
+                            await _reject_and_log(
+                                client,
+                                sel(),
+                                session_key,
+                                agent,
+                                event,
+                                cause=DENY_CAUSE_POLICY,
+                                reason=tool_result.reason or "",
                                 outcome="denied",
-                                request_id=event.request_id,
                                 error="hook_deny",
                             )
                             continue
@@ -473,12 +786,16 @@ async def execute_task(
                     # would be skipped whenever a tool is about to be rejected.
                     pct = client.context_usage_pct()
                     if pct >= _MID_STREAM_COMPACT_PCT:
+                        # Not a verdict on the call: the turn is abandoned
+                        # here and re-run after compaction, so there is no
+                        # continuing turn for a deny notice to correct.
                         await _reject_and_log(
                             client,
                             sel(),
                             session_key,
                             agent,
                             event,
+                            cause=None,
                             metadata={"reason": "context_overflow", "pct": pct},
                         )
                         raise _ContextOverflow(pct)
@@ -491,7 +808,12 @@ async def execute_task(
                         run.last_task_time = _time.time()
                         approved = await on_tool_approval(event)
                         if not approved:
-                            await _reject_and_log(client, sel(), session_key, agent, event)
+                            # The person (or the surface answering for them)
+                            # said no: kiro-cli's "user denied" is the truth
+                            # here, so no notice -- interactive_rejected.
+                            await _reject_and_log(
+                                client, sel(), session_key, agent, event, cause=None
+                            )
                             continue
                         approve_reason = "interactive_approved"
                     else:
@@ -505,25 +827,36 @@ async def execute_task(
                         # would bypass the SafetyOverride 24h TTL, and honoring the
                         # override would reintroduce the global-YOLO dependency this
                         # change deliberately avoids.
+                        # The SURFACE refuses the call, not a rule about the
+                        # call itself: nothing here can approve it, so the
+                        # notice names what this run permits instead of a
+                        # sanctioned alternative the model should run.
                         await _reject_and_log(
                             client,
                             sel(),
                             session_key,
                             agent,
                             event,
+                            cause=DENY_CAUSE_SURFACE_POLICY,
+                            reason=_HEADLESS_DENY_REASON,
                             metadata={"reason": "headless_no_authorization"},
                         )
                         continue
 
-                    await client.approve_tool(event.request_id)
-                    run.last_task_time = _time.time()
+                    approval_sent = await client.approve_tool(event.request_id)
+                    if approval_sent is not False:
+                        run.last_task_time = _time.time()
                     sel().log_tool_invocation(
                         session_key=session_key,
                         agent=agent or "kirocrew",
                         source="taskrunner",
                         tool_name=event.title,
                         tool_kind=event.tool_kind,
-                        outcome="approved",
+                        outcome=(
+                            "approved"
+                            if approval_sent is not False
+                            else OUTCOME_REJECTED_TRANSPORT_FLOOR
+                        ),
                         request_id=event.request_id,
                         metadata={
                             "task": task.index,
@@ -534,31 +867,72 @@ async def execute_task(
                             "source": run.source,
                         },
                     )
+                elif event.kind == EVENT_AGENT_SWITCHED:
+                    # A mid-run mode switch runs a different agent, so ITS spec hooks gate
+                    # the permission requests that follow, not the previous agent's. An
+                    # unnamed switch falls back to the agent the session recorded for it.
+                    switched_agent = event.text or switched_agent
+                    _spec = await turn_spec_hooks(client, event.text or "")
+                    await refuse_stale_switch(client, event.text or "")
                 elif event.kind == EVENT_TOOL_CALL:
-                    # Fire PreToolUse hooks for auto-approved tools (informational only)
+                    # Fire PreToolUse hooks for auto-approved tools (informational only).
+                    # On a gated turn this frame precedes the call's permission request,
+                    # so nothing has approved it yet.
                     sel().log_tool_invocation(
                         session_key=session_key,
                         agent=agent or "kirocrew",
                         source="taskrunner",
                         tool_name=event.title,
                         tool_kind=event.tool_kind,
-                        outcome="auto_approved",
+                        outcome="invoked" if _spec.gated else "auto_approved",
                         metadata={"task": task.index, "task_id": run.task_id},
                     )
-                    await fire_tool_hooks(
-                        get_global_hook_store(),
-                        event.title,
-                        event.tool_input,
-                        parent_session_key=session_key or None,
-                        agent_role=(agent or "kirocrew"),
-                    )
+                    # A gated turn runs them on the permission request instead.
+                    if not _spec.gated:
+                        await fire_tool_hooks(
+                            get_global_hook_store(),
+                            event.title,
+                            event.tool_input,
+                            parent_session_key=session_key or None,
+                            agent_role=(agent or "kirocrew"),
+                        )
                 elif event.kind == EVENT_COMPLETE:
                     _complete_event = event
                     break
 
             final_result = result_prefix + result_text
             task.result = redact_credentials(redact_exfiltration_urls(final_result)[0])[0]
+            # A stream that ended without any EVENT_COMPLETE proves nothing: the
+            # provider never said the turn finished, so it is not a PASSED step
+            # (the classifier below would read the absent reason as a normal
+            # end of turn). Retryable, like the transport-death ``error:``
+            # family: the bounded retry ladder re-prompts from the partial.
+            if _complete_event is None:
+                raise _TurnNotCompleted(
+                    STOP_CLASS_FAILED, "", partial=bool(result_text), retryable=True
+                )
+            # EVENT_COMPLETE only says the stream ended: a watchdog stall, a
+            # runtime cancel or a transport death must not become a PASSED
+            # step. Same mapping as chat_runner / subagent run.py.
+            _stop = classify_stop_reason(str(getattr(_complete_event, "stop_reason", "") or ""))
+            if not _stop.is_success:
+                raise _TurnNotCompleted(
+                    _stop.name,
+                    _stop.stop_reason,
+                    partial=bool(result_text),
+                    retryable=bool(_stop.retryable),
+                )
             sessions.record_success(session_key)
+            # The prompt (with any re-injected context) reached the model and
+            # the turn completed, so the finally must NOT restore the flag. A
+            # cancelled or stalled stream, or one that ended without any
+            # completion, never gets here: the raises above hand those to the
+            # retry ladder, and the finally re-arms.
+            _turn_landed = True
+            # A landed turn proves recovery worked, so the next shared death
+            # starts its own count instead of inheriting one -- the same reason
+            # the chat runner clears it on a landed turn.
+            runtime_death.clear_shared_deaths(session_key)
             sessions.check_context_usage(session_key, client)
 
             # ── Per-turn usage row: attribute task-runner spend. ──
@@ -595,21 +969,51 @@ async def execute_task(
                 logger.debug("usage row (taskrunner) persist failed", exc_info=True)
 
         except AcpProcessDied:
-            recoveries += 1
+            # Whose failure was this? A task runs its sub-agents on its own
+            # runtime, so a death here can be a process event several accounts
+            # witnessed rather than this task's fault -- and MAX_RECOVERIES then
+            # fails a task that did nothing wrong. The death was classified once
+            # where it was detected; this reads that record. A single-tenant
+            # runtime, and a death before the session opened, are charged exactly
+            # as before.
+            _own_fault = runtime_death.caused_by_this_session(_turn_provider)
+            if _own_fault:
+                recoveries += 1
+            else:
+                runtime_death.note_shared_death(session_key)
+            # ``recoveries`` stays MONOTONIC. Assigning the shared streak into it
+            # would refund budget already spent: two own-fault deaths followed by
+            # one shared death would read as 1, and the third own-fault death
+            # would still be under the limit -- replaying task work that is not
+            # idempotent. So the two counts run side by side and the LIMIT is
+            # tested against whichever is further along, exactly as the chat
+            # runner does with its own `_death_attempts`.
+            _death_attempts = max(recoveries, runtime_death.shared_deaths(session_key))
+            if not _own_fault:
+                logger.warning(
+                    "Task %d lost a turn to a SHARED runtime's death (%d running) — "
+                    "not charging this task's recovery budget",
+                    task.index,
+                    runtime_death.shared_deaths(session_key),
+                )
             partial = task.result or ""
-            task.error = f"Process died (recovery {recoveries}/{MAX_RECOVERIES})"
+            task.error = f"Process died (recovery {_death_attempts}/{MAX_RECOVERIES})"
             logger.warning(
                 "Task %d: process died (recovery %d/%d), partial: %.200s",
                 task.index,
-                recoveries,
+                _death_attempts,
                 MAX_RECOVERIES,
                 partial,
             )
             await sessions.reset(session_key)
 
-            if recoveries > MAX_RECOVERIES:
+            if _death_attempts > MAX_RECOVERIES:
                 task.status = TaskStatus.FAILED
-                task.error = f"Process died {recoveries} times — giving up"
+                task.error = (
+                    f"Process died {_death_attempts} times — giving up"
+                    if _own_fault
+                    else f"The runtime this task shares died {_death_attempts} times — giving up"
+                )
                 return False
 
             if partial:
@@ -619,7 +1023,7 @@ async def execute_task(
                 )
             await on_notify(
                 f"💀 Task {task.index}: process died",
-                f"Recovering ({recoveries}/{MAX_RECOVERIES})…",
+                f"Recovering ({_death_attempts}/{MAX_RECOVERIES})…",
                 run=run,
             )
             run.last_task_time = _time.time()
@@ -664,11 +1068,186 @@ async def execute_task(
 
         except asyncio.CancelledError:
             raise
+        except _TurnNotCompleted as tnc:
+            # ``task.result`` already carries the flagged partial (set before
+            # the classifier ran); every branch below preserves it.
+            task.error = str(tnc)
+            if tnc.recoverable and taskq is not None:
+                # Stalled / recovering: the recovery ladder's L3 rung (the ACP
+                # runtime) says whether one more re-run is allowed and how
+                # long to wait; the row is ``recovering`` for the wait and is
+                # re-claimed under a new generation before the re-run.
+                # Imported here, not at module scope, for the reason the
+                # dependency arm below states: a disabled queue never pays for
+                # ``kiro_crew.taskq`` on this module's import path.
+                from kiro_crew.taskq.adapters.runner import (
+                    RunnerAdmissionRefused,
+                    RunnerTaskCancelled,
+                )
+
+                stop_recoveries += 1
+                reason = f"{tnc.stop_class}: {tnc.stop_reason}"
+                decision = taskq.admission.decide_recovery(taskq, unit=session_key, reason=reason)
+                # This step's OWN in-place ceiling, spent by its stalls and by
+                # nothing else. The ladder's L3 count is per-unit and DECAYS
+                # after its cooldown, so a stall once per cooldown would be
+                # approved for ever; ``STOP_RECOVERY_MAX_RETRIES`` is the
+                # non-decaying bound the chat slot's ``_tool_stall_retries``
+                # and the sub-agent's ``_stop_recovery_used`` also spend.
+                in_place_left = stop_recoveries <= STOP_RECOVERY_MAX_RETRIES
+                if decision is not None:
+                    retry = decision.retry and in_place_left
+                    delay = float(decision.delay_secs)
+                else:
+                    retry = in_place_left
+                    delay = (
+                        default_ladder().backoff_secs(L3_ACP_RUNTIME, stop_recoveries)
+                        if retry
+                        else 0.0
+                    )
+                if not retry:
+                    return await _end_stalled_step(
+                        task,
+                        sessions,
+                        session_key,
+                        tnc,
+                        f"in-place recovery exhausted after {stop_recoveries} attempt(s)",
+                    )
+                if not await taskq.recovering_async(reason=reason, delay_secs=delay):
+                    # PERSIST BEFORE PUBLISH: the ``recovering`` row IS the
+                    # statement that this turn's work is to be re-run, and the
+                    # re-claim below takes only a row the store put back in a
+                    # claimable state. A write that did not commit therefore
+                    # ends the step -- never a wait on a row that is still
+                    # ``running``, whose re-claim raises the whole run down.
+                    return await _end_stalled_step(
+                        task,
+                        sessions,
+                        session_key,
+                        tnc,
+                        "the durable recovering write did not commit, so no re-run was started",
+                    )
+                await on_notify(
+                    f"\u267b\ufe0f Task {task.index}: turn {tnc.stop_class}",
+                    f"{tnc.stop_reason} — re-running in {delay:.0f}s (recovery {stop_recoveries})",
+                    run=run,
+                )
+                await _recovery_delay(delay)
+                try:
+                    await taskq.reclaim()
+                except (RunnerTaskCancelled, RunnerAdmissionRefused) as exc:
+                    # The row ended while it waited (an operator cancel during
+                    # the backoff), or the store refused the claim. In band,
+                    # because raising unwinds an accepted RUN over one step
+                    # whose own row already says what became of it.
+                    return await _end_stalled_step(
+                        task, sessions, session_key, tnc, f"the row was not re-claimed: {exc}"
+                    )
+                if not await taskq.running_async(
+                    {"index": task.index, "recovery": stop_recoveries}
+                ):
+                    # The same fence one state later: the reclaim's ``admit``
+                    # committed ``starting`` under the new generation, so a
+                    # refused ``starting -> running`` is a newer owner or a
+                    # store outage. Re-running the turn under it would leave the
+                    # row unable to take any wait the turn needs (``starting``
+                    # reaches no WAITING state), and under a fence it would run
+                    # work whose row belongs to another incarnation.
+                    return await _end_stalled_step(
+                        task,
+                        sessions,
+                        session_key,
+                        tnc,
+                        "the re-claimed row did not take the running mark",
+                    )
+                # The re-run is the next TURN (``attempt`` rises, so its prompt
+                # names the stall and continues from the partial) but not a
+                # logic attempt, which is why ``stop_recoveries`` raises the
+                # ceiling this loop is bounded by instead of spending it.
+                await _reset_session_quietly(sessions, session_key)
+                run.last_task_time = _time.time()
+                continue
+            elif not tnc.recoverable and (
+                tnc.stop_class == STOP_CLASS_CANCELLED or not tnc.retryable
+            ):
+                # A runtime cancel or a refusal is not a logic failure to
+                # re-prompt around: the step ends with what it produced.
+                task.status = TaskStatus.FAILED
+                task.error = f"{tnc.stop_class} ({tnc.stop_reason}) — partial result preserved"
+                return False
+            # Then the bounded retry ladder every failed attempt goes through:
+            # a stall without a task queue, and a retryable ``error:`` (pipe
+            # death, process exit) with or without one. The retry prompt names
+            # the stall and continues from the partial -- never a bare re-run.
+            logger.warning("Task %d attempt %d failed: %s", task.index, attempt, tnc)
+            await sessions.record_failure(session_key)
+            try:
+                await sessions.reset(session_key)
+            except Exception:
+                logger.debug("Session reset between retries failed", exc_info=True)
+            if previous_error and task.error == previous_error:
+                consecutive_same_error += 1
+                if await _check_error_loop(task, consecutive_same_error, on_notify, run):
+                    return False
+            else:
+                consecutive_same_error = 0
+            previous_error = task.error
+            run.last_task_time = _time.time()
+            if attempt < MAX_RETRIES + stop_recoveries:
+                continue
+            task.status = TaskStatus.FAILED
+            return False
         except Exception as exc:
             task.error = str(exc)
             logger.warning("Task %d attempt %d failed: %s", task.index, attempt, exc)
             await sessions.record_failure(session_key)
 
+            # A dependency error (a 429 with Retry-After, a 5xx, an auth
+            # failure) is not a logic failure: the step parks in
+            # ``waiting_dependency`` and its lane slot is released until the
+            # coordinator wakes it. Terminal signals end the step.
+            # Imported here, not at module scope: at module scope this pulls
+            # ``kiro_crew.taskq`` (and its store) into every importer of
+            # ``kiro_crew.dashboard.handlers``, which the AUTOSDE boot-path rule
+            # forbids for a subsystem a disabled queue never uses.
+            if taskq is None:
+                signal = None
+            else:
+                from kiro_crew.taskq.dependency import (
+                    DEFAULT_MAX_ATTEMPTS as DEPENDENCY_MAX_ATTEMPTS,
+                )
+                from kiro_crew.taskq.dependency import (
+                    classify_exception,
+                )
+
+                signal = classify_exception(exc)
+            if signal is not None and taskq is not None:
+                dependency_waits += 1
+                if not signal.retryable or dependency_waits > DEPENDENCY_MAX_ATTEMPTS:
+                    task.status = TaskStatus.FAILED
+                    task.error = (
+                        f"dependency {signal.dependency_scope} {signal.kind}: {signal.detail}"
+                    )
+                    return False
+                await on_notify(
+                    f"\u23f3 Task {task.index}: waiting on {signal.dependency_scope}",
+                    f"{signal.kind}: {signal.detail or exc}",
+                    run=run,
+                )
+                resumed = await taskq.admission.yield_dependency(taskq, signal)
+                if not resumed:
+                    task.status = TaskStatus.FAILED
+                    task.error = (
+                        f"dependency {signal.dependency_scope} unavailable: "
+                        f"{signal.detail or exc}"
+                    )
+                    return False
+                # No ``running`` mark here: the row already carries one when the
+                # wait returns True -- a wake that re-claimed it wrote the mark,
+                # and a wait that never persisted left the row running.
+                run.last_task_time = _time.time()
+                attempt -= 1
+                continue
             # Reset session between retries to avoid StreamReader corruption
             # ("readuntil() called while another coroutine is already waiting")
             try:
@@ -689,11 +1268,17 @@ async def execute_task(
             else:
                 consecutive_same_error = 0
             previous_error = task.error
-            if attempt < MAX_RETRIES:
+            if attempt < MAX_RETRIES + stop_recoveries:
                 continue
             task.status = TaskStatus.FAILED
             return False
         finally:
+            # A turn that consumed the post-compaction flag but never landed
+            # discarded the prompt carrying the re-injected context; put the
+            # flag back so the next attempt re-injects it.
+            rearm_reinjection(
+                sessions, session_key, consumed=_needs_reinjection, landed=_turn_landed
+            )
             if _acquired:
                 sessions.release(session_key)
 
@@ -714,13 +1299,14 @@ async def execute_task(
                 else:
                     consecutive_same_error = 0
                 previous_error = task.error
-                if attempt < MAX_RETRIES:
+                if attempt < MAX_RETRIES + stop_recoveries:
                     continue
                 task.status = TaskStatus.FAILED
                 return False
 
         task.status = TaskStatus.PASSED
         task.error = ""
+        await _consume_applied_answers()
         return True
 
     task.status = TaskStatus.FAILED
@@ -834,8 +1420,8 @@ async def check_context(session_key: str, sessions: "SessionManager") -> None:
     path gateway compaction uses — so the task runner inherits concurrent-
     trigger dedup, the failure/ineffective cooldown, turn-semaphore exclusion,
     the still-critical post-compaction reset, and skills-index reinjection,
-    instead of bypassing them all with a direct ``provider.compact()``
-    (#4686). A ``"busy"`` decline (a turn holds the semaphore) is final for
+    instead of bypassing them all with a direct ``provider.compact()``.
+    A ``"busy"`` decline (a turn holds the semaphore) is final for
     this check: never fall back to a direct compact — the next check retries
     once the turn drains.
     """
@@ -853,9 +1439,21 @@ async def self_review(
     sessions: "SessionManager",
     agent: str,
     session_key: str = "",
+    *,
+    ctx: "ContextBuilder | None" = None,
+    commit_failed: bool = False,
 ) -> bool:
-    """Review task using a separate session that reads the actual git diff."""
+    """Review task using a separate session that reads the actual git diff.
+
+    Fails closed: a review error, or a git run whose step has no diff to show,
+    returns False with ``task.error`` starting ``_REVIEW_UNVERIFIED``. A step
+    whose commit failed (non-fatal by design) has no diff for that reason, so it
+    keeps the generic review instead.
+    """
     review_key = f"{SESSION_PREFIX}:{run.task_id}:review"
+    from kiro_crew.context import inherit_session_memory
+
+    await inherit_session_memory(ctx, f"{SESSION_PREFIX}:{run.task_id}:runtime", review_key)
     try:
         diff = ""
         if run.branch_name:
@@ -864,6 +1462,10 @@ async def self_review(
             except Exception:
                 pass
 
+        if run.branch_name and not commit_failed and not diff.strip():
+            task.error = f"{_REVIEW_UNVERIFIED}: the step left no diff to review"
+            logger.warning("Task %d unverified: no diff on a git run", task.index)
+            return False
         if diff.strip():
             prompt = (
                 "You are an independent review agent. You did NOT write this code.\n"
@@ -939,8 +1541,9 @@ async def self_review(
             return False
         return True
     except Exception:
-        logger.debug("Self-review failed", exc_info=True)
-        return True  # don't block on review failure
+        logger.warning("Self-review errored for task %d", task.index, exc_info=True)
+        task.error = f"{_REVIEW_UNVERIFIED}: the review itself failed"
+        return False
     finally:
         sessions.release(review_key)
         await sessions.reset(review_key)

@@ -1,7 +1,24 @@
 import { defineConfig, devices } from '@playwright/test'
 
+// Specs that need the WebKit engine (mobile-Safari-only behaviour). They are
+// owned by the opt-in `webkit-mobile` project below and IGNORED by `chromium`,
+// so the default run never collects them: the E2E gate installs Chromium only
+// (`npx playwright install chromium`), its darkening floor counts a skip as a
+// failure, and a fork pull request cannot change the workflow to install a
+// second engine. Run them locally with PLAYWRIGHT_RUN_WEBKIT=1 after
+// `npx playwright install webkit` (on a host Playwright's WebKit does not
+// support, the `mcr.microsoft.com/playwright:<version>-noble` image with
+// `--network host` reaches a gateway on the host).
+const WEBKIT_SPECS = /\.webkit\.spec\.ts$/
+const RUN_WEBKIT = process.env.PLAYWRIGHT_RUN_WEBKIT === '1'
+const STORAGE_STATE = process.env.PLAYWRIGHT_STORAGE_STATE || 'playwright/.auth/state.json'
+
 export default defineConfig({
   testDir: './playwright',
+  // Dedicated gateways isolate artifacts by scenario; the shared suite keeps its default.
+  outputDir: process.env.PLAYWRIGHT_RUN_MEMORY_EVIDENCE === '1'
+    ? process.env.PLAYWRIGHT_MEMORY_EVIDENCE_OUTPUT_DIR
+    : undefined,
   fullyParallel: true, // Enable parallel execution
   forbidOnly: !!process.env.CI,
   retries: process.env.CI ? 2 : 0,
@@ -22,9 +39,20 @@ export default defineConfig({
   // budget-expiry soft-stop, which the fake does model ([[SLOW_NOACK]] withholds
   // the cancel ack), so it moved to @needs-agent. The tag stays wired as the
   // seam for a spec that genuinely needs real model semantics.
-  grepInvert: process.env.PLAYWRIGHT_RUN_AGENT_SPECS
-    ? /@needs-live-agent/
-    : /@needs-agent|@needs-live-agent/,
+  //
+  // @memory-evidence tags memory-embedding-evidence.spec.ts, whose every test
+  // needs a gateway PREPARED for one state (a missing custom model path, a
+  // standing rebuild, an exhausted download). The shared-gateway run must not
+  // collect it: against that gateway every test would fail on its own
+  // precondition. test/e2e/test_memory_ui_evidence.py boots one gateway per
+  // state and opts the spec back in with PLAYWRIGHT_RUN_MEMORY_EVIDENCE=1.
+  grepInvert: new RegExp(
+    [
+      '@needs-live-agent',
+      ...(process.env.PLAYWRIGHT_RUN_AGENT_SPECS ? [] : ['@needs-agent']),
+      ...(process.env.PLAYWRIGHT_RUN_MEMORY_EVIDENCE ? [] : ['@memory-evidence']),
+    ].join('|'),
+  ),
   use: {
     baseURL: process.env.PLAYWRIGHT_BASE_URL || 'http://localhost:5476',
     // Pin the browser locale. Most specs assert English prose, and the app
@@ -54,12 +82,29 @@ export default defineConfig({
     { name: 'setup', testMatch: /auth\.setup\.ts/ },
     {
       name: 'chromium',
+      testIgnore: WEBKIT_SPECS,
       use: {
         ...devices['Desktop Chrome'],
-        storageState: process.env.PLAYWRIGHT_STORAGE_STATE || 'playwright/.auth/state.json',
+        storageState: STORAGE_STATE,
       },
       dependencies: ['setup'],
     },
+    // Opt-in. iPhone emulation on Playwright's WebKit (isMobile + touch), the
+    // engine the mobile tab-return fix targets. Reuses the same session cookie
+    // the setup project persisted -- storage state is engine-independent.
+    ...(RUN_WEBKIT
+      ? [
+          {
+            name: 'webkit-mobile',
+            testMatch: WEBKIT_SPECS,
+            use: {
+              ...devices['iPhone 13'],
+              storageState: STORAGE_STATE,
+            },
+            dependencies: ['setup'],
+          },
+        ]
+      : []),
   ],
 
   // Note: Make sure kirocrew gateway is running on port 5476 before running tests

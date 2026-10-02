@@ -8,6 +8,8 @@ import WorkflowRunTree from '../../apps/workflows/WorkflowRunTree'
 import WorkflowSourcePanel from '../../apps/workflows/WorkflowSourcePanel'
 import { useRunSnapshot } from '../../apps/workflows/useRunSnapshot'
 import { runBelongsToSlot } from '../../apps/workflows/runModel'
+import ErrorNotice from '../../components/ErrorNotice'
+import { Glass } from '../../components/Glass'
 
 import { i18nT } from '../../i18n/t'
 import { useLanguageGeneration } from '../../i18n/useLanguageGeneration'
@@ -92,21 +94,30 @@ const WorkflowProgressBar = memo(function WorkflowProgressBar({ slot }: { slot: 
     // is empty. Whenever this bar is the topmost thing in that stack, an auto
     // z-index let the mask's opaque tail shave its top border and corners.
     <div className="px-4 mx-auto w-full relative z-[2]" style={{ maxWidth: 'var(--mc-content-width, 900px)' }}>
-      <div
-        data-testid="workflow-progress-bar"
-        className={`mb-1 rounded-md bg-accent/10 border border-accent/20 animate-slide-up ${
-          anyExpanded ? 'max-h-[45vh] overflow-y-auto overflow-x-hidden overscroll-contain' : 'overflow-hidden'
-        }`}
-      >
-        {visible.map(r => (
-          <ExpandableRunRow
-            key={r.run_id}
-            run={r}
-            expanded={!!expanded[r.run_id]}
-            onToggle={() => toggle(r.run_id)}
-          />
-        ))}
-      </div>
+      {/* The pane is the dock's glass (components/Glass.tsx, accent tint step)
+          and the scroll box is a child of it, not the pane itself: the glass
+          layers are absolutely positioned inside their host, so a host that
+          scrolls would carry its own blur and light bands away with the rows.
+          The clip lives on that child too: the pane's hairlines sit half a
+          pixel OUTSIDE its top and bottom edges, and `overflow: hidden` on the
+          pane itself would cut them (see QuestionCard). */}
+      <Glass variant="chip" radius={8} className="mb-1 glass-accent animate-slide-up">
+        <div
+          data-testid="workflow-progress-bar"
+          className={`rounded-[inherit] ${
+            anyExpanded ? 'max-h-[45vh] overflow-y-auto overflow-x-hidden overscroll-contain' : 'overflow-hidden'
+          }`}
+        >
+          {visible.map(r => (
+            <ExpandableRunRow
+              key={r.run_id}
+              run={r}
+              expanded={!!expanded[r.run_id]}
+              onToggle={() => toggle(r.run_id)}
+            />
+          ))}
+        </div>
+      </Glass>
     </div>
   )
 })
@@ -160,7 +171,7 @@ function ExpandableRunRow({
       >
         <span className="shrink-0 mt-0.5">
           {run.status === 'running' && <Loader2 size={14} className="text-accent animate-spin" />}
-          {run.status === 'finished' && <CheckCircle2 size={14} className="text-green-500" />}
+          {run.status === 'finished' && <CheckCircle2 size={14} className="text-ok" />}
           {(run.status === 'failed' || run.status === 'cancelled') && <AlertCircle size={14} className="text-danger" />}
         </span>
         <div className="min-w-0 flex-1">
@@ -174,23 +185,32 @@ function ExpandableRunRow({
           {run.status === 'running' && lastLog && (
             <div className="text-muted truncate italic text-[12px]">{lastLog}</div>
           )}
-          {run.status === 'failed' && errMsg && (
-            <div className="text-danger truncate text-[12px]">{errMsg}</div>
-          )}
         </div>
         <ChevronDown
           size={14}
           className={`text-muted shrink-0 mt-0.5 transition-transform ${expanded ? 'rotate-180' : ''}`}
         />
       </button>
+      {/* Outside the toggle button, not inside it as the plain red line was:
+          the notice carries its own hand-off button, and a button inside a
+          button is invalid markup that screen readers flatten. askAgent on —
+          the bar is a status surface with nothing editable, and the composer
+          draft beneath it is persisted per slot, so a hand-off loses nothing. */}
+      {run.status === 'failed' && errMsg && (
+        <div className="pl-9 pr-3 pb-1.5">
+          <ErrorNotice variant="inline" message={errMsg} askAgent testId="workflow-run-error" />
+        </div>
+      )}
 
       {expanded && (
         <div className="px-3 pb-2 pt-1 flex flex-col gap-2">
-          {snapshotError && (
-            <div className="text-[11px] text-red-500 border border-red-500/30 rounded p-2">
-              {i18nT('pages.chat.workflowProgressBar.could_not_load_run_snapshot')} {sanitizeLlmOutput(snapshotError).slice(0, 200)}
-            </div>
-          )}
+          {/* The label is the `title` and the backend reason the `message`, so
+              the reason stays the journal lookup key for the hand-off. */}
+          <ErrorNotice
+            title={i18nT('pages.chat.workflowProgressBar.could_not_load_run_snapshot')}
+            message={snapshotError ? sanitizeLlmOutput(snapshotError).slice(0, 200) : null}
+            askAgent
+          />
           <WorkflowRunTree
             events={snapshot?.events ?? []}
             status={
@@ -199,6 +219,7 @@ function ExpandableRunRow({
             }
             result={snapshot?.result}
             error={snapshot?.error ?? run.error ?? null}
+            errorCode={snapshot?.error_code}
           />
           <WorkflowSourcePanel
             run_id={run.run_id}

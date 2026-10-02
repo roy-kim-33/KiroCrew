@@ -17,8 +17,10 @@ that group's gate fails exactly one test.
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from types import SimpleNamespace
 
+from kiro_crew import context as context_module
 from kiro_crew.config.loader import config_path
 from kiro_crew.context import (
     CONTEXT_GROUP_LESSONS,
@@ -32,6 +34,18 @@ from kiro_crew.memory import MemoryStore
 from kiro_crew.skills import SkillsLoader
 
 ALL_GROUPS = frozenset(SWITCHABLE_CONTEXT_GROUPS)
+
+
+class _FrozenClock(datetime):
+    """A ``datetime`` whose ``now()`` does not advance.
+
+    The render carries a minute-resolution timestamp, so two renders that
+    straddle a minute boundary differ in that line alone.
+    """
+
+    @classmethod
+    def now(cls, tz=None):  # type: ignore[override]
+        return datetime(2026, 1, 1, 12, 0).replace(tzinfo=tz)
 
 
 def _builder(tmp_path) -> ContextBuilder:
@@ -63,8 +77,9 @@ def _builder(tmp_path) -> ContextBuilder:
 class TestDefaultIsUnchanged:
     """The all-on paths must not drift from the pre-feature builder."""
 
-    def test_none_and_all_groups_are_identical(self, tmp_path):
+    def test_none_and_all_groups_are_identical(self, tmp_path, monkeypatch):
         """A parent passing no flag (all groups) == every other caller (None)."""
+        monkeypatch.setattr(context_module, "datetime", _FrozenClock)
         b = _builder(tmp_path)
         assert b.build_session_context(context_groups=None) == b.build_session_context(
             context_groups=ALL_GROUPS
@@ -88,7 +103,9 @@ class TestMemoryGroup:
         ctx = _builder(tmp_path).build_session_context()
         assert "## User Preferences" in ctx
         assert "Prefers tabs over spaces" in ctx
+        # The activity half rides along as budgeted background.
         assert "## Active Projects" in ctx
+        assert "memory_recall" in ctx
 
     def test_absent_when_withheld(self, tmp_path):
         ctx = _builder(tmp_path).build_session_context(
@@ -142,16 +159,12 @@ class TestProjectGroup:
     """
 
     def test_present_by_default(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(
-            "kiro_crew.context._build_docs_section", lambda: "[DOCS-SENTINEL]\n\n"
-        )
+        monkeypatch.setattr("kiro_crew.context._build_docs_section", lambda: "[DOCS-SENTINEL]\n\n")
         ctx = _builder(tmp_path).build_session_context()
         assert "[DOCS-SENTINEL]" in ctx
 
     def test_absent_when_withheld(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(
-            "kiro_crew.context._build_docs_section", lambda: "[DOCS-SENTINEL]\n\n"
-        )
+        monkeypatch.setattr("kiro_crew.context._build_docs_section", lambda: "[DOCS-SENTINEL]\n\n")
         ctx = _builder(tmp_path).build_session_context(
             context_groups=ALL_GROUPS - {CONTEXT_GROUP_PROJECT}
         )
@@ -172,40 +185,41 @@ class TestProjectGroup:
 
 
 class TestEpisodicMemoryGate:
-    """Episodic memory lives in build_message, not build_session_context.
-
-    It is the one memory-group section injected on the per-message path, so a
-    gate that covered only build_session_context would leave it flowing to a
-    sub-agent whose parent withheld memory. The vector store is stubbed so the
-    assertion is about the gate, not about embedding availability.
-    """
+    """Episodes ride in the budgeted activity block; both halves follow inheritance."""
 
     def _builder_with_episodic(self, tmp_path):
         builder = _builder(tmp_path)
         store = builder.get_memory_for(None)
         store._vector_store = SimpleNamespace(
             get_episodic_context=lambda query_text, cap: "[EPISODIC-SENTINEL]",
-            get_semantic_context=lambda query_text, cap: "",
-            get_lessons_context=lambda query_text, cap, project_dir=None: "",
+            get_semantic_context=lambda query_text, cap, facts_only=False: "",
+            get_preferences_context=lambda query_text="", cap=0: "[PREFERENCE-SENTINEL]",
+            get_lessons_context=lambda query_text, cap, project_dir=None, background=False, hard_cap=0, directive_budget=0, experience_budget=0: "",
             has_any_lesson=lambda: True,
         )
         return builder
 
-    def test_injected_by_default(self, tmp_path):
-        msg, _ = self._builder_with_episodic(tmp_path).build_message("q", True, "s1")
-        assert "[EPISODIC-SENTINEL]" in msg
+    def test_activity_rides_the_memory_group_once(self, tmp_path):
+        builder = self._builder_with_episodic(tmp_path)
+        msg, _ = builder.build_message("q", True, "s1")
+        assert msg.count("[EPISODIC-SENTINEL]") == 1
+        assert msg.count("[PREFERENCE-SENTINEL]") == 1
+        assert "[EPISODIC-SENTINEL]" in builder.memory.get_context(query="q")
 
     def test_withheld_with_the_memory_group(self, tmp_path):
         msg, _ = self._builder_with_episodic(tmp_path).build_message(
             "q", True, "s1", context_groups=ALL_GROUPS - {CONTEXT_GROUP_MEMORY}
         )
         assert "[EPISODIC-SENTINEL]" not in msg
+        assert "[PREFERENCE-SENTINEL]" not in msg
+        assert "[Memory tools]" not in msg
 
     def test_survives_withholding_an_unrelated_group(self, tmp_path):
         msg, _ = self._builder_with_episodic(tmp_path).build_message(
             "q", True, "s1", context_groups=ALL_GROUPS - {CONTEXT_GROUP_PROJECT}
         )
         assert "[EPISODIC-SENTINEL]" in msg
+        assert "[PREFERENCE-SENTINEL]" in msg
 
 
 class TestContextScopeMarker:

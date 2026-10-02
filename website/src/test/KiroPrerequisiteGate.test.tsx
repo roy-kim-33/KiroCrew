@@ -9,7 +9,7 @@ import KiroPrerequisiteGate, {
 import { renderWithProviders } from './helpers'
 
 vi.mock('../utils/clipboard', () => ({
-  copyToClipboard: vi.fn().mockResolvedValue(undefined),
+  copyToClipboard: vi.fn().mockResolvedValue(true),
   copyCode: vi.fn(),
 }))
 
@@ -43,6 +43,7 @@ function status(overrides: Partial<KiroPrerequisiteStatus> = {}): KiroPrerequisi
     docs_url: 'https://kiro.dev/cli/',
     login_command: 'kiro-cli login',
     sso_login_command: 'kiro-cli login --use-device-flow --license pro',
+    bundled_cli: false,
     setup_allowed: true,
     sandbox_unavailable: false,
     sandbox_failure_kind: '',
@@ -53,6 +54,13 @@ function status(overrides: Partial<KiroPrerequisiteStatus> = {}): KiroPrerequisi
     ...overrides,
   }
 }
+
+// The Pod remedy block is real nested YAML. Matched on the code element's exact
+// text: RTL's default matcher collapses whitespace, which would hide a lost
+// newline or indentation — exactly the defect that makes a paste invalid.
+const POD_YAML = 'securityContext:\n  appArmorProfile:\n    type: Unconfined'
+const podBlock = () =>
+  screen.getByText((_, el) => el?.tagName === 'CODE' && el.textContent === POD_YAML)
 
 describe('KiroPrerequisiteGate', () => {
   beforeEach(() => {
@@ -185,6 +193,19 @@ describe('KiroPrerequisiteGate', () => {
     expect(screen.queryByRole('button', { name: 'Sign in to Kiro' })).not.toBeInTheDocument()
   })
 
+  it('pins its footer actions to the bottom of the scrolling scrim on a phone', async () => {
+    // Same stacked layout as the onboarding chapters: without the pinned
+    // footer the actions sit below the fold under the browser toolbar.
+    vi.mocked(api.kiroPrerequisite).mockResolvedValue(status({ platform: 'Windows' }))
+    renderWithProviders(
+      <KiroPrerequisiteGate><div>Dashboard loaded</div></KiroPrerequisiteGate>,
+    )
+    const footer = await screen.findByTestId('gate-footer')
+    const cls = footer.className.split(/\s+/)
+    expect(cls).toEqual(expect.arrayContaining(['sticky', 'bottom-0', 'bg-card', 'sm:static']))
+    expect(footer.className).toContain('env(safe-area-inset-bottom)')
+  })
+
   it('tells an installed-but-signed-out CLI to sign in via Kiro CLI', async () => {
     // Any Kiro CLI that runs is usable regardless of install source, so this
     // state must show the sign-in instruction and the exact command — and no
@@ -215,6 +236,71 @@ describe('KiroPrerequisiteGate', () => {
     expect(screen.getByRole('button', { name: /Check again/ })).toBeEnabled()
     expect(screen.queryByRole('button', { name: 'Sign in to Kiro' })).not.toBeInTheDocument()
     expect(screen.queryByText(/unverified executable/)).not.toBeInTheDocument()
+    // A PATH install: bare commands, nothing muted, no bundled-copy hint.
+    expect(screen.queryByText(/desktop app.s own copy of Kiro CLI/)).not.toBeInTheDocument()
+  })
+
+  it('explains then mutes the shared bundled path', async () => {
+    // A desktop install resolves the app's own kiro-cli, which is not on the
+    // user's PATH, so both commands open with the same quoted absolute path and
+    // differ only after `login`. Two full lines read as one command shown twice,
+    // so the shared run is muted and the tail carries the weight; the copied
+    // text is still the whole command. The hint saying what the path is applies
+    // to both commands equally, so it appears ONCE before either path is read.
+    const bin =
+      "'/Applications/Kiro Crew.app/Contents/Resources/backend-dist/kiro-cli/kiro-cli-chat'"
+    vi.mocked(api.kiroPrerequisite).mockResolvedValue(status({
+      installed: true,
+      authenticated: false,
+      bundled_cli: true,
+      login_command: `${bin} login`,
+      sso_login_command: `${bin} login --use-device-flow --license pro`,
+    }))
+
+    renderWithProviders(
+      <KiroPrerequisiteGate><div>Dashboard loaded</div></KiroPrerequisiteGate>,
+    )
+
+    await screen.findByText(/Sign in with Kiro CLI on the gateway host/)
+    const codes = screen.getAllByText(
+      (_, el) => el?.tagName === 'CODE' && (el.textContent ?? '').startsWith(bin),
+    )
+    expect(codes.map((c) => c.textContent)).toEqual([
+      `${bin} login`,
+      `${bin} login --use-device-flow --license pro`,
+    ])
+    for (const code of codes) {
+      expect(code.querySelector('span.text-muted')?.textContent).toBe(`${bin} `)
+    }
+    const hints = screen.getAllByText(/desktop app.s own copy of Kiro CLI.*exactly as shown/)
+    expect(hints).toHaveLength(1)
+    expect(
+      hints[0].compareDocumentPosition(codes[0]) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy()
+  })
+
+  it('a copy that fails says so under the box instead of painting Copied', async () => {
+    // Both clipboard paths can be denied (no API, execCommand refused). The
+    // command is the only instruction on this screen, so a silent miss strands
+    // the user; the failure renders through ErrorNotice and clears on success.
+    const { copyToClipboard } = await import('../utils/clipboard')
+    vi.mocked(copyToClipboard).mockResolvedValueOnce(false).mockResolvedValueOnce(true)
+    vi.mocked(api.kiroPrerequisite).mockResolvedValue(status({ installed: true }))
+
+    renderWithProviders(
+      <KiroPrerequisiteGate><div>Dashboard loaded</div></KiroPrerequisiteGate>,
+    )
+
+    await screen.findByText(/Sign in with Kiro CLI on the gateway host/)
+    const [button] = screen.getAllByRole('button', { name: /Copy command/ })
+    fireEvent.click(button)
+    const notice = await screen.findByTestId('kiro-gate-copy-failed')
+    expect(notice.textContent).toMatch(/Copy failed/)
+    expect(screen.queryByRole('button', { name: /Copied/ })).toBeNull()
+
+    fireEvent.click(button)
+    await waitFor(() => expect(screen.queryByTestId('kiro-gate-copy-failed')).toBeNull())
+    expect(screen.getAllByRole('button', { name: /Copied/ }).length).toBeGreaterThan(0)
   })
 
   it('exposes no way to start a sign-in from the dashboard', async () => {
@@ -748,6 +834,53 @@ describe('KiroPrerequisiteGate', () => {
     expect(screen.queryByText('Dashboard loaded')).not.toBeInTheDocument()
   })
 
+  it('shows the probe diagnostic when the backend backstop degrades a probe exception to 200', async () => {
+    // The backend's last-resort backstop reports an exception as a retryable
+    // not-ready 200 body (never a 500), so `prerequisite` resolves and the
+    // ApiError branch above never fires — this is the "Setup Check Unavailable
+    // with no reason" symptom the diagnostic exists to fix.
+    vi.mocked(api.kiroPrerequisite).mockResolvedValue(status({
+      installed: true,
+      probe_error: 'OSError: probe wedged',
+    }))
+
+    renderWithProviders(
+      <KiroPrerequisiteGate><div>Dashboard loaded</div></KiroPrerequisiteGate>,
+    )
+
+    expect(await screen.findByText('We could not check Kiro CLI.')).toBeInTheDocument()
+    expect(screen.getByText(/OSError: probe wedged/)).toBeInTheDocument()
+    expect(screen.queryByText('Dashboard loaded')).not.toBeInTheDocument()
+  })
+
+  it('names the probe exit status alongside the message when both are present', async () => {
+    vi.mocked(api.kiroPrerequisite).mockResolvedValue(status({
+      installed: true,
+      probe_error: 'toolbox: kiro-cli is not registered',
+      probe_status: 127,
+    }))
+
+    renderWithProviders(
+      <KiroPrerequisiteGate><div>Dashboard loaded</div></KiroPrerequisiteGate>,
+    )
+
+    expect(
+      await screen.findByText(/toolbox: kiro-cli is not registered \(exit 127\)/),
+    ).toBeInTheDocument()
+  })
+
+  it('does not show a diagnostic screen when there is nothing to report', async () => {
+    // No probe_error at all: the ordinary first-run screen renders as before.
+    vi.mocked(api.kiroPrerequisite).mockResolvedValue(status())
+
+    renderWithProviders(
+      <KiroPrerequisiteGate><div>Dashboard loaded</div></KiroPrerequisiteGate>,
+    )
+
+    expect(await screen.findByText('Set up Kiro')).toBeInTheDocument()
+    expect(screen.queryByTestId('kiro-gate-status-error')).not.toBeInTheDocument()
+  })
+
   it('terminates an unpunctuated gateway error before the next sentence', async () => {
     vi.mocked(api.kiroPrerequisite).mockRejectedValue(new ApiError(401, 'Token required'))
 
@@ -755,8 +888,13 @@ describe('KiroPrerequisiteGate', () => {
       <KiroPrerequisiteGate><div>Dashboard loaded</div></KiroPrerequisiteGate>,
     )
 
+    // The gateway's message is the ErrorNotice (terminated as a sentence, since
+    // it is read as one), and the retry hint is its own line beneath it.
+    const alert = await screen.findByTestId('kiro-gate-status-error')
+    expect(alert).toHaveAttribute('role', 'alert')
+    expect(alert).toHaveTextContent('Token required.')
     expect(
-      await screen.findByText('Token required. Retry the gateway check before starting a session.'),
+      screen.getByText('Retry the gateway check before starting a session.'),
     ).toBeInTheDocument()
   })
 
@@ -1037,6 +1175,75 @@ describe('KiroPrerequisiteGate', () => {
     expect(screen.queryByText('1.')).not.toBeInTheDocument()
   })
 
+  it('names the container policy and both spellings of the AppArmor switch for a refused mount', async () => {
+    // Issue #10765: a non-root Kubernetes pod granted both namespaces and its
+    // runtime's default AppArmor profile then refused the launcher's first
+    // mount. The probe now names that step, so the gate can say the fix is the
+    // container's policy — not root, not CAP_SYS_ADMIN, not a sysctl — and
+    // spell it for Docker and for a Pod.
+    vi.mocked(api.kiroPrerequisite).mockResolvedValue(status({
+      installed: true,
+      sandbox_unavailable: true,
+      sandbox_failure_kind: 'no_backend',
+      sandbox_detail: 'mount(MS_REC|MS_PRIVATE) on / failed with errno 13 (EACCES)',
+      sandbox_remedy: 'mount_denied',
+    }))
+
+    renderWithProviders(
+      <KiroPrerequisiteGate><div>Dashboard loaded</div></KiroPrerequisiteGate>,
+    )
+
+    expect(await screen.findByText('How to fix')).toBeInTheDocument()
+    expect(
+      screen.getByText(/--security-opt apparmor=unconfined/),
+    ).toBeInTheDocument()
+    // Real nested YAML, so it drops into a Pod manifest as-is.
+    expect(podBlock()).toBeInTheDocument()
+    // Each block is captioned, so the reader knows which of the two is theirs.
+    expect(screen.getByText('Docker')).toBeInTheDocument()
+    expect(screen.getByText('Kubernetes Pod')).toBeInTheDocument()
+    // Namespaces work here, so the generic "no OS-level sandbox" body would be
+    // false; the container body names what actually refused.
+    expect(screen.queryByText(/provides no OS-level sandbox/)).not.toBeInTheDocument()
+    expect(screen.getByText(/grants the user and mount namespaces/)).toBeInTheDocument()
+    // A host userns remedy would be the wrong fix for a pod that already grants them.
+    expect(screen.queryByText('kirocrew service install')).not.toBeInTheDocument()
+    expect(screen.queryByText(/sysctl/)).not.toBeInTheDocument()
+    expect(screen.getByText('kirocrew doctor')).toBeInTheDocument()
+  })
+
+  it('copies each container spelling on its own', async () => {
+    // Two blocks for one switch, because Docker and a Pod spell it differently;
+    // each must paste as something usable by itself — the Pod block as the
+    // whole nested YAML, newlines included.
+    const { copyToClipboard } = await import('../utils/clipboard')
+    vi.mocked(copyToClipboard).mockClear()
+    vi.mocked(api.kiroPrerequisite).mockResolvedValue(status({
+      installed: true,
+      sandbox_unavailable: true,
+      sandbox_failure_kind: 'no_backend',
+      sandbox_detail: 'mount(MS_REC|MS_PRIVATE) on / failed with errno 13 (EACCES)',
+      sandbox_remedy: 'mount_denied',
+    }))
+
+    renderWithProviders(
+      <KiroPrerequisiteGate><div>Dashboard loaded</div></KiroPrerequisiteGate>,
+    )
+
+    await screen.findByText('How to fix')
+    fireEvent.click(podBlock().closest('button')!)
+    await waitFor(() =>
+      expect(copyToClipboard).toHaveBeenCalledWith(POD_YAML),
+    )
+    const docker = screen.getByText(/--security-opt apparmor=unconfined/)
+    fireEvent.click(docker.closest('button')!)
+    await waitFor(() =>
+      expect(copyToClipboard).toHaveBeenLastCalledWith(
+        '--security-opt apparmor=unconfined --security-opt seccomp=kirocrew-seccomp.json',
+      ),
+    )
+  })
+
   it('still points at doctor when the mechanism is unknown', async () => {
     // An unclassified failure has no command to offer, but a dead end with a
     // retry button was the original complaint. The diagnostic pointer is the
@@ -1084,6 +1291,39 @@ describe('KiroPrerequisiteGate', () => {
     const column = document.querySelector('div.flex-1.overflow-y-auto')
     expect(column).not.toBeNull()
     expect(column!.contains(button)).toBe(false)
+  })
+
+  it('cues the reader that the tall remedy column scrolls', async () => {
+    // The mount_denied remedy overflows the panel's fixed height, so the footer
+    // divider below reads as the end of the content unless the fold is marked.
+    // jsdom does no layout, so the scroll geometry is stubbed on the region.
+    vi.mocked(api.kiroPrerequisite).mockResolvedValue(status({
+      installed: true,
+      sandbox_unavailable: true,
+      sandbox_failure_kind: 'no_backend',
+      sandbox_detail: 'mount(MS_REC|MS_PRIVATE) on / failed with errno 13 (EACCES)',
+      sandbox_remedy: 'mount_denied',
+    }))
+
+    renderWithProviders(
+      <KiroPrerequisiteGate><div>Dashboard loaded</div></KiroPrerequisiteGate>,
+    )
+
+    await screen.findByText('How to fix')
+    const region = screen.getByTestId('gate-scroll-region')
+    // Overflowing, scrolled to the top: only the bottom cue should show.
+    Object.defineProperty(region, 'clientHeight', { configurable: true, get: () => 300 })
+    Object.defineProperty(region, 'scrollHeight', { configurable: true, get: () => 640 })
+    Object.defineProperty(region, 'scrollTop', { configurable: true, get: () => 0 })
+    fireEvent.scroll(region)
+    await waitFor(() => expect(screen.getByTestId('gate-scroll-cue-bottom')).toBeInTheDocument())
+    expect(screen.queryByTestId('gate-scroll-cue-top')).not.toBeInTheDocument()
+
+    // Scrolled to the very end: nothing is hidden below, so the bottom cue goes.
+    Object.defineProperty(region, 'scrollTop', { configurable: true, get: () => 340 })
+    fireEvent.scroll(region)
+    await waitFor(() => expect(screen.queryByTestId('gate-scroll-cue-bottom')).not.toBeInTheDocument())
+    expect(screen.getByTestId('gate-scroll-cue-top')).toBeInTheDocument()
   })
 
   it('offers no host remedy when a foreign sandbox is the cause', async () => {

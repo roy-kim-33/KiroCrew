@@ -1,8 +1,9 @@
 /**
  * Behavioural coverage for the shared dashboard API client (`src/api/client.ts`).
  *
- * `client.ts` is one transport layer plus ~450 thin typed methods over it. What
- * can actually break here is (a) the transport contract — session-key header,
+ * `client.ts` is one transport layer plus the `api` object of thin typed methods
+ * over it, most of them defined by domain in `src/api/client/*.ts`. What can
+ * actually break here is (a) the transport contract — session-key header,
  * auth recovery, `ApiError` + error journalling, artifact-write tracking — and
  * (b) URL/body CONSTRUCTION in the methods that are not one-liners: query
  * builders, conditionally-omitted body keys, path encoding, the SSE reader, the
@@ -32,8 +33,12 @@ import {
   attemptSilentRefresh,
   __resetAuthRecoveryStateForTests,
   SEARCH_MIN_CHARS,
+  BROWSE_FILES_TIMEOUT_MS,
+  FILE_SEARCH_TIMEOUT_MS,
 } from '../api/client'
-import { recentErrors, __resetErrorJournalForTests } from '../utils/errorReport'
+import { STALE_OWNER_SESSION_CODE, __resetStaleOwnerHandlerForTests, installStaleOwnerHandler } from '../api/staleOwnerSignal'
+import { queryClient } from '../api/queryClient'
+import { recentErrors, reportForError, __resetErrorJournalForTests } from '../utils/errorReport'
 import { copyToClipboard } from '../utils/clipboard'
 import { resizeImageForModel } from '../utils/resizeImage'
 import { hasPendingArtifactWrite, __resetArtifactWrites } from '../lib/artifactWrites'
@@ -57,17 +62,18 @@ type Init = RequestInit & { headers?: Record<string, string> }
 function res(
   status: number,
   body: unknown,
-  opts: { headers?: Record<string, string>; text?: string } = {},
+  opts: { headers?: Record<string, string>; text?: string; url?: string } = {},
 ): Response {
   const text = opts.text ?? (typeof body === 'string' ? body : JSON.stringify(body))
   return {
     ok: status >= 200 && status < 300,
     status,
-    url: 'http://localhost:6776/api/probe',
+    url: opts.url ?? 'http://localhost:6776/api/probe',
     headers: { get: (k: string) => opts.headers?.[k] ?? opts.headers?.[k.toLowerCase()] ?? null },
     json: async () => (typeof body === 'string' ? JSON.parse(body) : body),
     text: async () => text,
     blob: async () => new Blob([text]),
+    clone: () => res(status, body, opts),
   } as unknown as Response
 }
 
@@ -136,6 +142,22 @@ describe('client transport', () => {
     expect(call(2).body).toEqual({ enabled: false })
   })
 
+  it('uses a distinct adoption route before ordinary tag policy PATCH', async () => {
+    await api.adoptChatTag('tag / one', true)
+    expect(call()).toMatchObject({
+      url: '/api/chat/tags/tag%20%2F%20one/adopt',
+      method: 'POST',
+      body: { status: true },
+    })
+
+    await api.updateChatTag('tag / one', { agent: 'add-only' })
+    expect(call(1)).toMatchObject({
+      url: '/api/chat/tags/tag%20%2F%20one',
+      method: 'PATCH',
+      body: { agent: 'add-only' },
+    })
+  })
+
   it('DELETE omits the JSON content type when it carries no body, and sets it when it does', async () => {
     await api.deleteUserDeniedCommand('r1')
     expect(call().method).toBe('DELETE')
@@ -145,6 +167,34 @@ describe('client transport', () => {
     await api.deleteLesson('never force push')
     expect(call(1).headers['Content-Type']).toBe('application/json')
     expect(call(1).body).toEqual({ rule: 'never force push' })
+  })
+
+  it('deleteLesson sends the repo_scope selector only when it is a string (#10651)', async () => {
+    // A lesson's identity is (rule, repo_scope). The route reads the selector by
+    // presence: "" names the global row, a fragment names that scope's row, and
+    // an ABSENT key deletes every scope's same-rule row.
+    await api.deleteLesson('never force push', 'src/pkg')
+    expect(call().body).toEqual({ rule: 'never force push', repo_scope: 'src/pkg' })
+    await api.deleteLesson('never force push', '')
+    expect(call(1).body).toEqual({ rule: 'never force push', repo_scope: '' })
+    // null marks a row whose stored scope is unusable: the route refuses a null
+    // selector (400), so the client must send none -- the unselective delete is
+    // the only path that reaches such a row.
+    await api.deleteLesson('never force push', null)
+    expect(call(2).body).toEqual({ rule: 'never force push' })
+    expect(call(2).body).not.toHaveProperty('repo_scope')
+    // The row's JSONL tier rides along when the list reported one, so the route
+    // deletes from the file the row was read from rather than its global default.
+    await api.deleteLesson('never force push', '', { scope: 'workspace', workspace: 'ws-1' })
+    expect(call(3).body).toEqual({ rule: 'never force push', repo_scope: '', scope: 'workspace', workspace: 'ws-1' })
+    await api.deleteLesson('never force push', '', { scope: undefined, workspace: undefined })
+    expect(call(4).body).toEqual({ rule: 'never force push', repo_scope: '' })
+    // `exact` is sent only when true: the route's default is the substring match
+    // the CLI relies on, and a table row that holds the whole rule opts out of it.
+    await api.deleteLesson('never force push', '', { exact: true })
+    expect(call(5).body).toEqual({ rule: 'never force push', repo_scope: '', exact: true })
+    await api.deleteLesson('never force push', '', { exact: false })
+    expect(call(6).body).not.toHaveProperty('exact')
   })
 
   it('POST omits the body entirely when none is given', async () => {
@@ -157,6 +207,28 @@ describe('client transport', () => {
     // so a restricted (incognito) slot was never recognised as restricted.
     await api.setArtifactPinned('cr-queue', true, 'dashboard:chat-3')
     expect(call().headers['X-Session-Key']).toBe('dashboard:chat-3')
+  })
+
+  it('the feature-video routes put the caller\'s session key on the wire', async () => {
+    // Both routes are gated server-side by `_is_restricted_session`, which treats
+    // the shared `dashboard:ui` placeholder as NOT restricted -- so a key that never
+    // reaches the header makes that guard unreachable and lets a session which keeps
+    // nothing record a PERMANENT verdict.
+    await api.featureVideoNext('dashboard:chat-4')
+    expect(call().url).toBe('/api/feature-videos/next')
+    expect(call().headers['X-Session-Key']).toBe('dashboard:chat-4')
+
+    await api.featureVideoFeedback('vid-1', 'seen', 'dashboard:chat-4')
+    expect(call(1).url).toBe('/api/feature-videos/feedback')
+    expect(call(1).headers['X-Session-Key']).toBe('dashboard:chat-4')
+    expect(call(1).body).toEqual({ id: 'vid-1', status: 'seen' })
+  })
+
+  it('the feature-video routes fall back to the placeholder when no key is passed', async () => {
+    await api.featureVideoNext()
+    expect(call().headers['X-Session-Key']).toBe('dashboard:ui')
+    await api.featureVideoFeedback('vid-1', 'dismissed')
+    expect(call(1).headers['X-Session-Key']).toBe('dashboard:ui')
   })
 
   it('createArtifact derives the session key from origin_session_key when none is passed', async () => {
@@ -279,6 +351,28 @@ describe('client response handling', () => {
     })
   })
 
+  it('pins each failure its OWN journal entry, so two same-message refusals do not alias', async () => {
+    // The journal resolves by exact message, newest first. Two endpoints refused with the one
+    // server line ("Access denied") therefore both resolved to whichever failed LAST, and the
+    // first notice handed the agent the second read's endpoint. The transport pins the entry
+    // to the error it throws; `reportForError` reads that before the journal.
+    const denied = (url: string) =>
+      res(403, '{"error":"Access denied","code":"access_denied"}', { url })
+    fetchMock.mockResolvedValueOnce(denied('http://localhost:6776/api/security/stats'))
+    const first = await api.securityStats().catch((e: unknown) => e)
+    fetchMock.mockResolvedValueOnce(denied('http://localhost:6776/api/apps/demo/trust'))
+    const second = await api.trustApp('demo').catch((e: unknown) => e)
+
+    expect(first).toBeInstanceOf(ApiError)
+    expect(second).toBeInstanceOf(ApiError)
+    // Both journaled under one message; the newest is the second read's.
+    expect(recentErrors().map(r => r.message)).toEqual(['Access denied', 'Access denied'])
+    expect(recentErrors()[0].endpoint).toBe('/api/apps/demo/trust')
+
+    expect(reportForError(first)?.endpoint).toBe('/api/security/stats')
+    expect(reportForError(second)?.endpoint).toBe('/api/apps/demo/trust')
+  })
+
   it('maps an API-Gateway throttle body to a readable message', () => {
     const msg = friendlyErrText(429, '{"message":"Rate exceeded","throttlingReasons":null}')
     expect(msg).not.toContain('throttlingReasons')
@@ -286,7 +380,16 @@ describe('client response handling', () => {
   })
 
   it('jNullable returns null on 204 rather than exploding on an empty body', async () => {
-    fetchMock.mockResolvedValue(res(204, null, { text: '' }))
+    // The fixture's `json()` must REJECT, as a real 204 `Response` does: there is no
+    // body to parse. With the lenient `res()` default (`json: async () => null` for a
+    // null body) this test passed even with the 204 branch removed entirely, so it
+    // could not fail and was not guarding the behaviour its name claims. Verified by
+    // removing the branch: lenient fixture green, this one red.
+    const noContent = {
+      ...res(204, null, { text: '' }),
+      json: async () => { throw new SyntaxError('Unexpected end of JSON input') },
+    } as unknown as Response
+    fetchMock.mockResolvedValue(noContent)
     await expect(api.tipsNext()).resolves.toBeNull()
     await expect(api.onboardingImportState({ completed: true })).resolves.toBeNull()
   })
@@ -373,7 +476,7 @@ describe('session-expired banner', () => {
     const el = banner() as HTMLElement
     // The recovery instructions are the point of the banner: the command to run
     // and a field to paste the resulting URL into.
-    expect(el.querySelector('code')?.textContent).toBe('kirocrew token')
+    expect(el.textContent).toContain('kirocrew token')
     expect(el.querySelector('input')).not.toBeNull()
     expect(el.querySelector('button')?.textContent).toBe('✕')
   })
@@ -411,6 +514,44 @@ describe('session-expired banner', () => {
     } finally {
       window.removeEventListener('mc-auth-required', required)
       window.removeEventListener('mc-auth-cleared', cleared)
+    }
+  })
+
+  it('emits mc-auth-recovered on real recovery but never on a dismiss', async () => {
+    // Two events, and the whole point is that they are NOT interchangeable.
+    // `mc-auth-cleared` means the banner is gone, which a dismiss also achieves;
+    // `mc-auth-recovered` means authentication works. A consumer that resets a
+    // stale auth failure must only ever hear the second, so this pins the
+    // difference at the producer -- the side no synthetic dispatchEvent can test.
+    const cleared = vi.fn()
+    const recovered = vi.fn()
+    window.addEventListener('mc-auth-cleared', cleared)
+    window.addEventListener('mc-auth-recovered', recovered)
+    try {
+      fetchMock.mockResolvedValue(res(401, 'revoked'))
+      checkSessionExpired(res(403, '', { headers: { 'X-Auth-Required': 'true' } }))
+      await vi.waitFor(() => expect(banner()).not.toBeNull())
+
+      const dismiss = Array.from(banner()?.querySelectorAll('button') ?? []).find(
+        b => b.textContent === '✕',
+      )
+      expect(dismiss).toBeDefined()
+      dismiss?.click()
+      // Precondition, not the claim: prove the click landed, so the assertions
+      // below cannot pass merely because nothing happened.
+      expect(banner()).toBeNull()
+      expect(cleared).toHaveBeenCalled()
+      expect(recovered).not.toHaveBeenCalled()
+
+      // Now the real thing. Raise the banner again and clear it the way every
+      // 2xx and every accepted token exchange does.
+      checkSessionExpired(res(403, '', { headers: { 'X-Auth-Required': 'true' } }))
+      await vi.waitFor(() => expect(banner()).not.toBeNull())
+      removeAuthBanner()
+      expect(recovered).toHaveBeenCalled()
+    } finally {
+      window.removeEventListener('mc-auth-cleared', cleared)
+      window.removeEventListener('mc-auth-recovered', recovered)
     }
   })
 
@@ -455,31 +596,52 @@ describe('session-expired banner', () => {
       Object.defineProperty(window, 'location', { value: original, writable: true, configurable: true })
     })
 
+    /**
+     * Paste *value*, press Enter, and report the URL the exchange requested.
+     *
+     * The paste used to navigate, so these cases read `location.href`. It now
+     * exchanges the token in place against `/api/auth/me?token=...`, which
+     * authenticates by the same mechanism the navigation did -- the auth
+     * middleware takes a query token ahead of the cookie and writes the session
+     * cookie onto the response -- without discarding the page's in-memory state
+     * (#12240). What each case is really about, extracting the token out of a
+     * pasted URL and encoding it for a query string, is unchanged; only where the
+     * token is sent has moved. `location.href` is asserted separately to stay
+     * untouched, so a regression back to navigating fails here.
+     */
     async function pasteAndEnter(value: string) {
       fetchMock.mockResolvedValue(res(401, 'revoked'))
       checkSessionExpired(res(403, '', { headers: { 'X-Auth-Required': 'true' } }))
       await vi.waitFor(() => expect(banner()).not.toBeNull())
       const input = banner()!.querySelector('input') as HTMLInputElement
+      fetchMock.mockClear()
+      // The exchange is awaited by the handler, so the request is visible on the
+      // mock but the paste itself resolves nothing for the caller to await.
+      fetchMock.mockResolvedValue(res(200, '{}'))
       input.value = value
       input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }))
-      return window.location.href
+      await vi.waitFor(() => {
+        if (!fetchMock.mock.calls.length) throw new Error('no exchange requested')
+      }).catch(() => {})
+      expect(window.location.href).toBe('https://desk.example:6776/')
+      return (fetchMock.mock.calls[0]?.[0] as string | undefined) ?? null
     }
 
     it('extracts the token out of a pasted `kirocrew token` URL', async () => {
       expect(await pasteAndEnter('http://127.0.0.1:6776/?token=abc123&x=1'))
-        .toBe('https://desk.example:6776?token=abc123')
+        .toBe('/api/auth/me?token=abc123')
     })
 
     it('accepts a bare token, which is not a parseable URL', async () => {
-      expect(await pasteAndEnter('rawtoken')).toBe('https://desk.example:6776?token=rawtoken')
+      expect(await pasteAndEnter('rawtoken')).toBe('/api/auth/me?token=rawtoken')
     })
 
     it('percent-encodes a token containing URL-significant characters', async () => {
-      expect(await pasteAndEnter('a+b/c=')).toBe('https://desk.example:6776?token=a%2Bb%2Fc%3D')
+      expect(await pasteAndEnter('a+b/c=')).toBe('/api/auth/me?token=a%2Bb%2Fc%3D')
     })
 
     it('does nothing on an empty field', async () => {
-      expect(await pasteAndEnter('   ')).toBe('https://desk.example:6776/')
+      expect(await pasteAndEnter('   ')).toBeNull()
     })
 
     it('ignores keys other than Enter', async () => {
@@ -487,9 +649,158 @@ describe('session-expired banner', () => {
       checkSessionExpired(res(403, '', { headers: { 'X-Auth-Required': 'true' } }))
       await vi.waitFor(() => expect(banner()).not.toBeNull())
       const input = banner()!.querySelector('input') as HTMLInputElement
+      fetchMock.mockClear()
       input.value = 'abc'
       input.dispatchEvent(new KeyboardEvent('keydown', { key: 'a', bubbles: true }))
+      expect(fetchMock).not.toHaveBeenCalled()
       expect(window.location.href).toBe('https://desk.example:6776/')
+    })
+
+    /**
+     * Raise the banner and press Enter on *value*, with the exchange answering
+     * *exchange*. Returns the banner so a case can read what it now says.
+     */
+    async function pasteWithExchange(value: string, exchange: Response) {
+      fetchMock.mockResolvedValue(res(401, 'revoked'))
+      checkSessionExpired(res(403, '', { headers: { 'X-Auth-Required': 'true' } }))
+      await vi.waitFor(() => expect(banner()).not.toBeNull())
+      const input = banner()!.querySelector('input') as HTMLInputElement
+      fetchMock.mockClear()
+      fetchMock.mockResolvedValue(exchange)
+      input.value = value
+      input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }))
+      await vi.waitFor(() => expect(fetchMock).toHaveBeenCalled())
+      return input
+    }
+
+    it('says so when the exchange refuses the token, instead of failing silently', async () => {
+      const input = await pasteWithExchange('stale-token', res(401, 'expired'))
+      // The refusal has to be VISIBLE. Re-enabling the field is the only other
+      // cue and is indistinguishable from nothing having happened, which is what
+      // makes a user press Enter again and conclude the banner is broken.
+      await vi.waitFor(() => {
+        expect(banner()!.textContent).toContain('sign-in URL was not accepted')
+      })
+      expect(input.disabled).toBe(false)
+      // Still shown: the user corrects a refused token rather than re-pasting.
+      expect(banner()).not.toBeNull()
+    })
+
+    it('announces the refusal to a screen reader as well as showing it', async () => {
+      await pasteWithExchange('stale-token', res(401, 'expired'))
+      await vi.waitFor(() => {
+        const live = banner()!.querySelector('[role="status"]')
+        expect(live?.textContent).toContain('sign-in URL was not accepted')
+      })
+    })
+
+    it('drops the previous refusal when a new attempt starts', async () => {
+      const input = await pasteWithExchange('stale-token', res(401, 'expired'))
+      await vi.waitFor(() =>
+        expect(banner()!.textContent).toContain('sign-in URL was not accepted'),
+      )
+      // A second attempt must not leave the old answer on screen while it runs,
+      // or a user cannot tell which attempt the text belongs to.
+      fetchMock.mockClear()
+      fetchMock.mockImplementation(() => new Promise(() => {}))
+      input.value = 'another-token'
+      input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }))
+      await vi.waitFor(() => expect(fetchMock).toHaveBeenCalled())
+      expect(banner()!.querySelector('[role="status"]')!.textContent).toBe('')
+    })
+
+    it('sets the command as its own <code> element, not as prose', async () => {
+      fetchMock.mockResolvedValue(res(401, 'revoked'))
+      checkSessionExpired(res(403, '', { headers: { 'X-Auth-Required': 'true' } }))
+      await vi.waitFor(() => expect(banner()).not.toBeNull())
+      // The sentence is ONE translatable unit, so the chip is found by splitting
+      // the rendered text on the command itself. Without it the command reads as
+      // prose and a reader cannot see where it begins and ends.
+      const chip = banner()!.querySelector('code')
+      expect(chip?.textContent).toBe('kirocrew token')
+      // Still one sentence around it, not a fragment.
+      expect(banner()!.textContent).toContain('in a terminal')
+      expect(banner()!.textContent).toContain('press Enter')
+    })
+
+    it('every catalog keeps the command its instruction is split on', async () => {
+      // The chip rests on a relationship between two catalog values that this
+      // module does not own: each locale's instruction must contain that same
+      // locale's `reauth_command` verbatim. Pin the RELATIONSHIP, so a
+      // translation that breaks it fails here instead of silently costing the
+      // chip.
+      const catalogs = import.meta.glob<Record<string, unknown>>(
+        '../i18n/locales/*.json',
+        { eager: true },
+      )
+      const broken: string[] = []
+      let checked = 0
+      for (const [path, mod] of Object.entries(catalogs)) {
+        // `en.json` holds no api.client section, and `en-XA` is the GENERATED
+        // pseudolocale: its generator accents every ASCII letter, so it carries
+        // no verbatim command by construction and is not a shipping locale.
+        if (path.endsWith('en.json') || path.endsWith('en-XA.json')) continue
+        const root = (mod as { default?: Record<string, unknown> }).default ?? mod
+        const client = (root as { api?: { client?: Record<string, string> } }).api?.client
+        const command = client?.reauth_command
+        const instruction = client?.run_kirocrew_token_then_paste_sign_in_url
+        if (command === undefined || instruction === undefined) continue
+        checked += 1
+        if (!instruction.includes(command)) broken.push(path)
+      }
+      // A vacuous pass is the failure mode here: zero catalogs checked would
+      // assert nothing at all.
+      expect(checked).toBeGreaterThanOrEqual(12)
+      expect(broken).toEqual([])
+    })
+
+    it('refetches only the queries that FAILED and hold nothing, so no draft is overwritten', async () => {
+      const spy = vi.spyOn(queryClient, 'invalidateQueries').mockResolvedValue(undefined)
+      try {
+        await pasteWithExchange('good-token', res(200, '{}'))
+        await vi.waitFor(() => expect(spy).toHaveBeenCalled())
+        const arg = spy.mock.calls.at(-1)?.[0] as
+          | { predicate?: (q: { state: { status: string; data?: unknown } }) => boolean }
+          | undefined
+        // A no-argument invalidateQueries() refetches EVERY active query,
+        // including ones holding good data -- and a panel whose effect syncs
+        // editor state from its query would then overwrite an unsaved draft.
+        // Asserting the filter exists is what stops a regression back to that.
+        expect(arg?.predicate).toBeTypeOf('function')
+        expect(arg!.predicate!({ state: { status: 'error' } })).toBe(true)
+        expect(arg!.predicate!({ state: { status: 'success' } })).toBe(false)
+        expect(arg!.predicate!({ state: { status: 'pending' } })).toBe(false)
+        // The status is not enough on its own. React Query keeps the last
+        // successful `data` when a refetch fails, so an error-state query can
+        // still be holding a value -- and refetching THAT is what re-delivers
+        // server data to a sync effect and wipes the draft. `McpCustomServerModal`
+        // has exactly such an effect on `specQuery.data`.
+        expect(arg!.predicate!({ state: { status: 'error', data: { spec: {} } } })).toBe(false)
+        expect(arg!.predicate!({ state: { status: 'error', data: null } })).toBe(false)
+        expect(arg!.predicate!({ state: { status: 'error', data: undefined } })).toBe(true)
+      } finally {
+        spy.mockRestore()
+      }
+    })
+  })
+
+  describe('banner copy', () => {
+    it('tells the reader WHERE to run the command, and asks for a sign-in URL', async () => {
+      fetchMock.mockResolvedValue(res(401, 'revoked'))
+      checkSessionExpired(res(403, '', { headers: { 'X-Auth-Required': 'true' } }))
+      await vi.waitFor(() => expect(banner()).not.toBeNull())
+      // "Run kirocrew token" alone left a reader guessing where to run it; the
+      // panel's own error sentence already said "in a terminal", so the banner
+      // saying less than the card was the inconsistency. The command sits inside
+      // that sentence rather than in its own <code>, because a value that stops
+      // mid-sentence cannot be reordered by a translator.
+      expect(banner()!.textContent).toContain('in a terminal')
+      expect(banner()!.textContent).toContain('kirocrew token')
+      // On this page the user is already holding a credential for the secrets
+      // form, so a field labelled "token" invites pasting the wrong one.
+      const input = banner()!.querySelector('input') as HTMLInputElement
+      expect(input.placeholder).toContain('sign-in URL')
+      expect(input.placeholder).not.toContain('raw token')
     })
   })
 
@@ -577,6 +888,31 @@ describe('session-expired banner', () => {
 /* ──────────────────── 2. URL and body construction ──────────────────── */
 
 describe('query-string builders', () => {
+  it('memory records preserve the chosen store, filter and page without leaking query delimiters', async () => {
+    await api.memoryRecords('member-reviewer', { q: 'owner+team@example.com & release', kind: 'fact' }, 50, 25)
+    const query = new URL(call().url, 'http://localhost').searchParams
+    expect(Object.fromEntries(query)).toEqual({ store: 'member-reviewer', q: 'owner+team@example.com & release', kind: 'fact', offset: '50', limit: '25' })
+    await api.memoryRecords('', { q: '', kind: 'all' })
+    expect(call(1).url).toBe('/api/memory/records?store=default&q=&kind=all&offset=0&limit=50')
+  })
+
+  it('memory history encodes record identity and keeps later pages in the same store', async () => {
+    await api.memoryRecordHistory('member-reviewer', { kind: 'fact', id: 'user.contact+team&release' }, 25, 50)
+    const query = new URL(call().url, 'http://localhost').searchParams
+    expect(Object.fromEntries(query)).toEqual({ store: 'member-reviewer', kind: 'fact', id: 'user.contact+team&release', limit: '25', offset: '50' })
+    await api.memoryRecordHistory('', { kind: 'fact', id: 'user.contact' })
+    expect(call(1).url).toBe('/api/memory/records/history?store=default&kind=fact&id=user.contact&limit=25')
+  })
+
+  it('wakatimeExportUrl builds the export href with encoded dates and the format', () => {
+    expect(api.wakatimeExportUrl('2026-09-01', '2026-09-07', 'csv')).toBe(
+      '/api/wakatime/export?start=2026-09-01&end=2026-09-07&format=csv',
+    )
+    expect(api.wakatimeExportUrl('2026-09-01', '2026-09-07', 'json')).toBe(
+      '/api/wakatime/export?start=2026-09-01&end=2026-09-07&format=json',
+    )
+  })
+
   it('kiroPrerequisite distinguishes latched read, coalesced poll and explicit probe', async () => {
     await api.kiroPrerequisite()
     expect(call().url).toBe('/api/kiro-prerequisite')
@@ -664,14 +1000,16 @@ describe('query-string builders', () => {
     expect(call(1).url).toBe('/api/sessions?limit=10&offset=20&preview=1')
     await api.sessions(30, 0, false, true)
     expect(call(2).url).toBe('/api/sessions?limit=30&offset=0&exclude_open=1')
+    await api.sessions(30, 0, false, true, true)
+    expect(call(3).url).toBe('/api/sessions?limit=30&offset=0&exclude_open=1&user_only=1')
     await api.sessionsSearch('a b', 5)
-    expect(call(3).url).toBe('/api/sessions/search?q=a%20b&limit=5')
+    expect(call(4).url).toBe('/api/sessions/search?q=a%20b&limit=5')
     await api.vectorEpisodic(10, 5, 'promo,l6')
-    expect(call(4).url).toBe('/api/memory/episodic?limit=10&offset=5&tags=promo%2Cl6')
+    expect(call(5).url).toBe('/api/memory/episodic?limit=10&offset=5&tags=promo%2Cl6')
     await api.vectorEpisodic()
-    expect(call(5).url).toBe('/api/memory/episodic?limit=50&offset=0')
+    expect(call(6).url).toBe('/api/memory/episodic?limit=50&offset=0')
     await api.vectorEpisodicSearch('q', 'tag')
-    expect(call(6).url).toBe('/api/memory/episodic/search?q=q&tags=tag')
+    expect(call(7).url).toBe('/api/memory/episodic/search?q=q&tags=tag')
   })
 
   it('discovery endpoints append provider and limit only when set', async () => {
@@ -716,14 +1054,22 @@ describe('query-string builders', () => {
     expect(call(4).url).toBe('/api/file-diff?path=%2Frepo%2Fa%20b.ts')
   })
 
-  it('fileSearch scopes to a project and forwards the abort signal', async () => {
+  it('scopes fileSearch to a project and relays the abort signal under its deadline', async () => {
     const ctl = new AbortController()
     await api.fileSearch('cli', 'kirocrew', ctl.signal)
     expect(call().url).toBe('/api/file-search?q=cli&project=kirocrew')
-    expect(call().init?.signal).toBe(ctl.signal)
+    // The fetch gets the DEADLINE's signal, not the caller's: the bound lives in
+    // the client, so a caller cannot opt out of it by handing over its own.
+    const relayed = call().init?.signal as AbortSignal
+    expect(relayed).toBeInstanceOf(AbortSignal)
+    expect(relayed).not.toBe(ctl.signal)
+    // Relay is asserted where observable -- on a request still in flight; this one
+    // has settled, so its timer and listener are already released.
+
+    // A caller that passes no signal is bounded all the same.
     await api.fileSearch('cli')
     expect(call(1).url).toBe('/api/file-search?q=cli')
-    expect(call(1).init).toBeUndefined()
+    expect(call(1).init?.signal).toBeInstanceOf(AbortSignal)
   })
 
   it('artifactSessionDocs can scope to one session', async () => {
@@ -770,6 +1116,11 @@ describe('query-string builders', () => {
 })
 
 describe('path encoding', () => {
+  it('uses the legacy slot route for one session automation snapshot', async () => {
+    await api.autonudgeForSlot('chat/1')
+    expect(call().url).toBe('/api/autonudge/slot/chat%2F1')
+  })
+
   it('percent-encodes single-segment ids', async () => {
     await api.artifact('a/b')
     expect(call().url).toBe('/api/artifacts/a%2Fb')
@@ -843,13 +1194,45 @@ describe('path encoding', () => {
 })
 
 describe('request bodies with conditionally-omitted keys', () => {
-  it('createChatSlot sends only the fields it was given', async () => {
+  it('createChatSlot resolves an omitted mode and preserves explicit fields', async () => {
+    fetchMock.mockResolvedValueOnce(okJson({ default_memory_mode: 'temporary' }))
     await api.createChatSlot()
-    expect(call().body).toEqual({})
-    await api.createChatSlot('n', 'a', 'm', 'mode', 'mem', 't', false, 'slug', 'f1')
-    expect(call(1).body).toEqual({
+    expect(call().url).toBe('/api/dashboard/config')
+    expect(call(1).body).toEqual({ memory_mode: 'temporary' })
+
+    await api.createChatSlot('n', 'a', 'm', 'mode', 'mem', 't', 'slug', 'f1')
+    expect(call(2).body).toEqual({
       name: 'n', agent: 'a', model: 'm', mode: 'mode', memory_mode: 'mem',
-      title: 't', clean_mode: false, artifact: 'slug', folder_id: 'f1',
+      title: 't', artifact: 'slug', folder_id: 'f1',
+    })
+  })
+
+  it('createChatSlot carries adopt_remote_slot and resolves NO default memory mode for it', async () => {
+    // THE ADOPT WIRE FORMAT. `adopt_remote_slot` is the peer session's own slot
+    // key, and it rides the SAME create route beside `instance_id` — the contract
+    // deliberately adds no second endpoint, because the local slot is created the
+    // same way either way and only what it binds to changes.
+    await api.createChatSlot(
+      undefined, undefined, undefined, undefined, undefined, undefined,
+      undefined, undefined, 'inst-a', 'chat-9',
+    )
+    expect(call().url).toBe('/api/chat/slots')
+    expect(call().body).toEqual({ instance_id: 'inst-a', adopt_remote_slot: 'chat-9' })
+    // No `/api/dashboard/config` read at all: an adopt inherits the PEER
+    // session's `memory_mode`, so resolving this machine's default would send a
+    // value the server has to ignore — and if it ever stopped ignoring it, an
+    // incognito peer session would land here as a persistent transcript. That is
+    // why `memory_mode` is ABSENT above rather than defaulted, and why exactly
+    // one request went out.
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+
+    // An explicit mode still wins: a caller that names one means it.
+    await api.createChatSlot(
+      undefined, undefined, undefined, undefined, 'incognito', undefined,
+      undefined, undefined, 'inst-a', 'chat-9',
+    )
+    expect(call(1).body).toEqual({
+      memory_mode: 'incognito', instance_id: 'inst-a', adopt_remote_slot: 'chat-9',
     })
   })
 
@@ -933,13 +1316,6 @@ describe('request bodies with conditionally-omitted keys', () => {
     expect(call(2).body).toHaveProperty('client')
   })
 
-  it('handoffSlot posts no body when the channel is left to the server', async () => {
-    await api.handoffSlot('chat-1')
-    expect(call().init?.body).toBeUndefined()
-    await api.handoffSlot('chat-1', 'slack')
-    expect(call(1).body).toEqual({ channel: 'slack' })
-  })
-
   it('cancelTaskRunner and installDiscoveredSkill keep their optional fields optional', async () => {
     await api.cancelTaskRunner()
     expect(call().init?.body).toBeUndefined()
@@ -991,8 +1367,10 @@ describe('request bodies with conditionally-omitted keys', () => {
   it('mcpGatewaySetStub has a single and a batch form', async () => {
     await api.mcpGatewaySetStub('fs', true)
     expect(call().body).toEqual({ name: 'fs', stub: true })
+    await api.mcpGatewaySetStub('fs', true, 'command-hash:env-hash')
+    expect(call(1).body).toEqual({ name: 'fs', stub: true, expected_launch: 'command-hash:env-hash' })
     await api.mcpGatewaySetStubMany(['fs', 'git'], false)
-    expect(call(1).body).toEqual({ names: ['fs', 'git'], stub: false })
+    expect(call(2).body).toEqual({ names: ['fs', 'git'], stub: false })
   })
 
   it('createTagColumn/updateTagColumn pass the filter mode straight through', async () => {
@@ -1096,14 +1474,160 @@ describe('sendChat theme consent', () => {
     expect(call().init?.signal).toBe(ctl.signal)
   })
 
-  it('steerChat always injects into the running turn', async () => {
-    await api.steerChat('now', 'chat-1')
-    expect(call().url).toBe('/api/chat?ws=1')
-    expect(call().body).toEqual({ message: 'now', slot: 'chat-1', steer: true })
+  it('hands the raw response back but still runs session-expiry recovery on a 403 auth challenge', async () => {
+    // The transport reads the receipt itself, so a 4xx must RESOLVE -- but an
+    // expired session must not degrade into a bare "refused" send: the same
+    // silent-refresh path every `j`-parsed call takes runs first. (The steer
+    // helper this wire replaced went through `j` and had it.)
+    __resetAuthRecoveryStateForTests()
+    fetchMock.mockResolvedValueOnce(res(403, '', { headers: { 'X-Auth-Required': 'true' } }))
+    fetchMock.mockResolvedValue(okJson({ ok: true }))
+    const r = await api.sendChat('hi', 'chat-1')
+    expect(r.status).toBe(403)
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/auth/refresh', expect.anything()))
+  })
+
+  it('clears a stale session-expired banner when the send itself succeeds', async () => {
+    // `j` dismisses the banner on any 2xx; the raw-response wire must too, or a
+    // steer that succeeds after auth was restored in another tab leaves the
+    // banner up until some unrelated parsed request happens to land.
+    __resetAuthRecoveryStateForTests()
+    fetchMock.mockResolvedValue(res(401, 'revoked'))
+    checkSessionExpired(res(403, '', { headers: { 'X-Auth-Required': 'true' } }))
+    await vi.waitFor(() => expect(document.getElementById('mc-session-expired')).not.toBeNull())
+    try {
+      fetchMock.mockResolvedValue(okJson({ ok: true }))
+      const r = await api.sendChat('hi', 'chat-1')
+      expect(r.ok).toBe(true)
+      expect(document.getElementById('mc-session-expired')).toBeNull()
+    } finally {
+      document.getElementById('mc-session-expired')?.remove()
+    }
+  })
+
+  it('raises the stale-owner prompt on a 401 stale-session body, and the receipt stays readable', async () => {
+    // The stale-owner code travels in the BODY, which the pre-body hook cannot
+    // read; the wire reads it off a clone so the transport's own `json()` still
+    // works. (`steerChat` reached this through `j`; the transport must too.)
+    const onStale = vi.fn()
+    installStaleOwnerHandler(onStale)
+    try {
+      fetchMock.mockResolvedValueOnce(res(401, { error: 'sign in again', code: STALE_OWNER_SESSION_CODE }))
+      const r = await api.sendChat('hi', 'chat-1')
+      expect(r.status).toBe(401)
+      await expect(r.json()).resolves.toMatchObject({ code: STALE_OWNER_SESSION_CODE })
+      await vi.waitFor(() => expect(onStale).toHaveBeenCalled())
+    } finally {
+      __resetStaleOwnerHandlerForTests()
+    }
   })
 })
 
 /* ─────────────── 3. the non-trivial method implementations ─────────────── */
+
+describe('deadline-bound endpoints', () => {
+  // Exercised against a stubbed `fetch`, the only layer where the bound is
+  // observable -- the component harnesses stub `api.*` and would bypass it.
+
+  const realTimeout = globalThis.setTimeout
+
+  /** Shrink the deadline without touching the production composition, and record the
+   *  value it asked for, so the assertion costs milliseconds rather than a real 10s
+   *  wait. Same shape the base's other client-deadline suites use. */
+  function shrinkDeadline(ms: number, record?: (asked: number) => void) {
+    vi.spyOn(globalThis, 'setTimeout').mockImplementation(((fn: () => void, asked?: number) => {
+      record?.(asked ?? 0)
+      return realTimeout(fn, ms)
+    }) as unknown as typeof globalThis.setTimeout)
+  }
+
+  const wedged = () => fetchMock.mockImplementation(
+    (_u: string, init?: RequestInit) =>
+      new Promise((_resolve, reject) => {
+        const s = init?.signal
+        if (s?.aborted) return reject(s.reason)
+        s?.addEventListener('abort', () => reject(s.reason), { once: true })
+      }),
+  )
+
+  it('rejects with the TimeoutError-named Error shape the cause-keyed notices decode', async () => {
+    // A transport default that rejects with any other shape stops `isDeadlineError` recognising
+    // it, silently degrading every cause-keyed notice here to the generic "failed" copy.
+    const { isDeadlineError } = await import('../api/queryClient')
+    const { searchErrorCause } = await import('../lib/searchErrorCause')
+    wedged()
+    shrinkDeadline(20)
+    const err = await api.browseFiles('/p').then(() => null, (e: unknown) => e)
+    expect(err).toBeInstanceOf(Error)
+    expect((err as Error).name).toBe('TimeoutError')
+    expect(isDeadlineError(err)).toBe(true)
+    expect(searchErrorCause(err)).toBe('timed_out')
+  })
+
+  it('bounds api.recentProjects, the picker sibling that shares the wedged loop', async () => {
+    // Fail-first: unbounded, the Recent tab sat empty for as long as the gateway hung.
+    const asked: number[] = []
+    wedged()
+    shrinkDeadline(20, ms => asked.push(ms))
+    await expect(api.recentProjects()).rejects.toMatchObject({ name: 'TimeoutError' })
+    expect(asked).toContain(BROWSE_FILES_TIMEOUT_MS)
+  })
+
+  it('bounds api.browseDirs too, the sibling both directory pickers spin on', async () => {
+    // Fail-first: unbounded, this promise never settled and the Project/Workspace
+    // pickers sat on an empty browse list for as long as they stayed open.
+    const asked: number[] = []
+    wedged()
+    shrinkDeadline(20, ms => asked.push(ms))
+    await expect(api.browseDirs('/p')).rejects.toMatchObject({ name: 'TimeoutError' })
+    expect(asked).toContain(BROWSE_FILES_TIMEOUT_MS)
+  })
+
+  it('bounds api.browseFiles, so a wedged gateway stops the folder listing spinning', async () => {
+    // Fail-first: unbounded, this promise never settled and FolderPanel showed its
+    // loading state for as long as the panel stayed open.
+    const asked: number[] = []
+    wedged()
+    shrinkDeadline(20, ms => asked.push(ms))
+    await expect(api.browseFiles('/p')).rejects.toMatchObject({ name: 'TimeoutError' })
+    expect(asked).toContain(BROWSE_FILES_TIMEOUT_MS)
+  })
+
+  it('bounds api.projectTree by the WHOLE-TREE deadline, not the one-level listing one', async () => {
+    // The listing bound is documented as shorter "because a listing walks one level, not the
+    // tree", so the tree read sharing it contradicted that; assertion two is the drift control.
+    const asked: number[] = []
+    wedged()
+    shrinkDeadline(20, ms => asked.push(ms))
+    await expect(api.projectTree('/p')).rejects.toMatchObject({ name: 'TimeoutError' })
+    expect(asked).toContain(FILE_SEARCH_TIMEOUT_MS)
+    expect(asked).not.toContain(BROWSE_FILES_TIMEOUT_MS)
+  })
+
+  it('leaves api.projectGitStatus UNBOUNDED, the scope this PR declares and its comment states', async () => {
+    // Bounding it puts the raw English deadline message into every locale, because the git
+    // panel renders the server message verbatim and has no timeout copy of its own.
+    const asked: number[] = []
+    wedged()
+    shrinkDeadline(20, ms => asked.push(ms))
+    void api.projectGitStatus('/p').catch(() => {})
+    await new Promise(resolve => realTimeout(resolve, 60))
+    expect(asked).not.toContain(BROWSE_FILES_TIMEOUT_MS)
+  })
+
+  it('passes the caller signal through browseFiles, so a superseded listing is cancelled', async () => {
+    const ac = new AbortController()
+    fetchMock.mockImplementation(
+      (_u: string, init?: RequestInit) =>
+        new Promise((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), { once: true })
+        }),
+    )
+    const p = api.browseFiles('/p', ac.signal)
+    ac.abort(new Error('superseded'))
+    await expect(p).rejects.toBeTruthy()
+  })
+})
 
 describe('revealPath', () => {
   // The transport is side-effect-free: it posts the action and returns the wire
@@ -1221,6 +1745,21 @@ describe('uploadFiles', () => {
     } as unknown as Response)
     const out = await api.uploadFiles([png('a.png')])
     expect(out).toMatchObject({ paths: [], error: 'Internal Server Error' })
+  })
+
+  it("hands the caller's AbortSignal to the request, so an upload can be cancelled", async () => {
+    const ac = new AbortController()
+    fetchMock.mockResolvedValue(okJson({ paths: ['/up/a.png'] }))
+    await api.uploadFiles([png('a.png')], ac.signal)
+    // Without this the composer's cancel control has nothing to abort: the
+    // request runs to completion whatever the user does.
+    expect(call().init?.signal).toBe(ac.signal)
+  })
+
+  it('omits signal entirely when the caller passes none', async () => {
+    fetchMock.mockResolvedValue(okJson({ paths: ['/up/a.png'] }))
+    await api.uploadFiles([png('a.png')])
+    expect(call().init?.signal).toBeUndefined()
   })
 
   it('refuses to trust a 200 whose paths field is not an array', async () => {
@@ -1421,21 +1960,116 @@ describe('publishToProvider', () => {
   })
 })
 
+describe('voice synthesis request ownership', () => {
+  it('announces the request synchronously and sends the same id to the gateway', async () => {
+    const started = vi.fn()
+    window.addEventListener('voice-synthesis-start', started)
+    try {
+      const synthesis = api.voiceSynthesize('slot-1', '你好')
+      expect(started).toHaveBeenCalledOnce()
+      const detail = (started.mock.calls[0][0] as CustomEvent).detail
+      expect(detail.slot).toBe('slot-1')
+      expect(detail.request_id).toEqual(expect.any(String))
+      await synthesis
+      expect(call().body).toEqual({ slot: 'slot-1', text: '你好', request_id: detail.request_id })
+    } finally {
+      window.removeEventListener('voice-synthesis-start', started)
+    }
+  })
+
+  it('preserves the structured HTTP error for the request owner to filter', async () => {
+    const failed = vi.fn()
+    fetchMock.mockResolvedValue(res(502, { error: 'provider unavailable', code: 'voice_model_config_invalid' }))
+    window.addEventListener('voice-synthesis-failed', failed)
+    try {
+      await expect(api.voiceSynthesize('slot-1', '你好', { request_id: 'request-1' })).rejects.toBeInstanceOf(ApiError)
+      expect(failed).toHaveBeenCalledOnce()
+      expect((failed.mock.calls[0][0] as CustomEvent).detail).toEqual({
+        slot: 'slot-1', request_id: 'request-1', code: 'voice_model_config_invalid',
+      })
+    } finally {
+      window.removeEventListener('voice-synthesis-failed', failed)
+    }
+  })
+})
+
 /* ─────────────────── 4. whole-surface request invariant ─────────────────── */
 
 describe('every api method issues one well-formed /api request', () => {
   // Exercised individually above with the fixtures they need (a Blob, a
   // ReadableStream, a File list, an object-URL download).
-  // `skills` and `slashCommands` join them because each wraps its fetch in a
-  // deadline, so it USES the signal argument rather than forwarding it.
-  const HAND_TESTED = new Set(['sttTranscribe', 'uploadFiles', 'uploadCrewAvatar', 'installFromRegistryStream', 'exportPlanYaml', 'skills', 'slashCommands'])
+  // `skills` joins them because it wraps the fetch in a deadline, so it USES the
+  // signal argument rather than forwarding it; junk there is not a URL question.
+  // `appSessionStatus` cannot be probed positionally: its 4th argument is a
+  // boolean selecting between the two prefixes an app backend may be served at,
+  // and the generic probe passes the truthy string 'sw-4', which legitimately
+  // routes to the reverse-proxy base `/apps/<app>/api/` rather than `/api/`.
+  // Covered exhaustively by `appSessionStatus.test.ts` — both prefixes, app-name
+  // encoding, the statusPath guard, and the junk-leak assertions this table
+  // would otherwise apply.
+  // `wakatimeExportUrl` is a pure URL builder: it RETURNS the string the export
+  // anchor navigates to and issues no fetch, so the one-request probe below
+  // cannot apply. Covered by a direct URL assertion in `query-string builders`.
+  const HAND_TESTED = new Set(['sttTranscribe', 'uploadFiles', 'uploadCrewAvatar', 'installFromRegistryStream', 'exportPlanYaml', 'skills', 'slashCommands', 'appSessionStatus', 'wakatimeExportUrl'])
 
   type AnyFn = (...args: unknown[]) => unknown
   const methods = Object.entries(api as unknown as Record<string, AnyFn>)
     .filter(([name, fn]) => typeof fn === 'function' && !HAND_TESTED.has(name))
 
+  // A deadline composes its own signal with the caller's, so identity is not the
+  // contract for these methods. Keep this list narrow: every other dispatched
+  // signal must still be the exact one supplied by the caller.
+  const DEADLINE_WRAPPED_METHODS = new Set([
+    'fileSearch',
+    'browseFiles',
+    'browseDirs',
+    'browseDrives',
+    'recentProjects',
+    'projectTree',
+  ])
+  const CALLER_SIGNAL = new AbortController().signal
+
+  // Methods whose URL comes out of an ARGUMENT'S FIELD rather than a positional
+  // string. The generic `'sw-1'` args below would make such a method build its
+  // URL from `undefined` — a harness artifact, not a defect in the method — so
+  // each one names the minimal shape its URL is read from. Signal-bearing methods
+  // also receive a real signal so the probe can assert their dispatch contract.
+  const ARGS: Record<string, unknown[]> = {
+    // Memory reads take typed objects; positional strings do not satisfy the
+    // query/record contract and would manufacture undefined URL parameters.
+    memoryRecords: ['member-reviewer', { q: 'contact', kind: 'fact' }, 0, 50],
+    memoryRecordHistory: ['member-reviewer', { kind: 'fact', id: 'user.contact' }, 25, 0],
+    // `invokeFileMenuItem(item, ctx)`: the URL is `item.endpoint`.
+    invokeFileMenuItem: [
+      { id: 'send', app: 'doc-store', endpoint: '/api/apps/doc-store/send' },
+      { surface: 'file-overflow', path: '/tmp/a.txt', kind: 'file' },
+    ],
+    // `importSessionFromFile(file)` posts the file's BYTES as the request body,
+    // deliberately un-wrapped. The generic `'sw-1'` would arrive as a STRING
+    // body, which `call()` above then tries to JSON-parse -- a harness artifact,
+    // not a defect: a real caller hands this a Blob, exactly as here, and a Blob
+    // body is left alone the same way a FormData one is.
+    importSessionFromFile: [new Blob(['{}'], { type: 'application/gzip' })],
+    updateInstance: ['sw-1', {}, { signal: CALLER_SIGNAL }],
+    chatSlotDetail: ['sw-1', undefined, undefined, CALLER_SIGNAL],
+    sendChat: ['sw-1', 'sw-2', 'sw-3', CALLER_SIGNAL],
+    spawnStatus: ['sw-1', { signal: CALLER_SIGNAL }],
+    fileSearch: ['sw-1', 'sw-2', CALLER_SIGNAL],
+    pathComplete: ['sw-1', 'sw-2', 'sw-3', CALLER_SIGNAL],
+    browseFiles: ['sw-1', CALLER_SIGNAL],
+  }
+
   it('covers the whole surface (guards against the table silently shrinking)', () => {
     expect(methods.length).toBeGreaterThan(300)
+  })
+
+  it('keeps deadline-bound file reads in the universal request probe', () => {
+    expect(methods.map(([name]) => name)).toEqual(expect.arrayContaining([
+      'fileSearch',
+      'browseFiles',
+      'browseDirs',
+      'recentProjects',
+    ]))
   })
 
   it.each(methods.map(([name]) => name))('%s', async (name) => {
@@ -1443,14 +2077,22 @@ describe('every api method issues one well-formed /api request', () => {
     // Generic positional arguments. Every method is a thin URL/body builder, so
     // what this asserts is the construction itself: a forgotten argument or a
     // botched template literal shows up as `undefined` inside the path.
-    await Promise.resolve(fn('sw-1', 'sw-2', 'sw-3', 'sw-4'))
+    await Promise.resolve(fn(...(ARGS[name] ?? ['sw-1', 'sw-2', 'sw-3', 'sw-4'])))
 
-    expect(fetchMock, `${name} issued no request`).toHaveBeenCalledTimes(1)
-    const { url, init } = call()
+    const expectedRequests = name === 'createChatSlot' ? 2 : 1
+    expect(fetchMock, `${name} issued the wrong request count`).toHaveBeenCalledTimes(expectedRequests)
+    const { url, init } = call(expectedRequests - 1)
     expect(typeof url, `${name} did not pass a string URL`).toBe('string')
     expect(url.startsWith('/api/'), `${name} escaped the /api prefix: ${url}`).toBe(true)
     for (const junk of ['undefined', '[object Object]', 'NaN', '/null']) {
       expect(url.includes(junk), `${name} leaked ${junk} into ${url}`).toBe(false)
+    }
+    if (init?.signal !== undefined) {
+      if (DEADLINE_WRAPPED_METHODS.has(name)) {
+        expect(init.signal, `${name} dropped its deadline signal`).toBeInstanceOf(AbortSignal)
+      } else {
+        expect(init.signal, `${name} did not forward the caller signal`).toBe(CALLER_SIGNAL)
+      }
     }
     // A body is only ever sent with a method that can carry one.
     if (init?.body !== undefined) {

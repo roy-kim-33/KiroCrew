@@ -55,13 +55,21 @@ describe('stub-dashboard-api config fixture', () => {
     renderWithProviders(<KiroCrewCfgTab />)
     // Reaching the first table means the three Object.entries() calls that
     // threw under the catch-all's `{}` all survived.
+<<<<<<< HEAD
     expect(await screen.findByText('RoyCrew Agents')).toBeInTheDocument()
+=======
+    expect(await screen.findByRole('heading', { name: /Crewmates/ })).toBeInTheDocument()
+>>>>>>> upstream/main
     expect(screen.getAllByRole('table').length).toBeGreaterThanOrEqual(3)
   })
 
   it('populates every table the tab renders, not just the headers', async () => {
     renderWithProviders(<KiroCrewCfgTab />)
+<<<<<<< HEAD
     await screen.findByText('RoyCrew Agents')
+=======
+    await screen.findByRole('heading', { name: /Crewmates/ })
+>>>>>>> upstream/main
     // An empty-but-present object would still render three tables with zero
     // rows -- a screenshot of empty tables is barely better evidence than a
     // blank page, so the fixture has to carry actual entries.
@@ -78,7 +86,11 @@ describe('stub-dashboard-api config fixture', () => {
     // pins the field name so the drift cannot silently return.
     expect(Object.values(KIROCREW_CONFIG_FIXTURE.workspaces)[0]).toHaveProperty('dir')
     renderWithProviders(<KiroCrewCfgTab />)
+<<<<<<< HEAD
     await screen.findByText('RoyCrew Agents')
+=======
+    await screen.findByRole('heading', { name: /Crewmates/ })
+>>>>>>> upstream/main
     expect(screen.getByText('~/.kiro/crew/workspace')).toBeInTheDocument()
   })
 
@@ -106,7 +118,11 @@ describe('stub-dashboard-api config fixture', () => {
     expect(KIROCREW_CONFIG_FIXTURE.workspaces).toHaveProperty(KIROCREW_CONFIG_FIXTURE.default_workspace)
     expect(KIROCREW_CONFIG_FIXTURE.memory_stores).toHaveProperty(KIROCREW_CONFIG_FIXTURE.default_memory_store)
     renderWithProviders(<KiroCrewCfgTab />)
+<<<<<<< HEAD
     await screen.findByText('RoyCrew Agents')
+=======
+    await screen.findByRole('heading', { name: /Crewmates/ })
+>>>>>>> upstream/main
     expect(screen.getAllByText('default').length).toBeGreaterThan(0)
   })
 

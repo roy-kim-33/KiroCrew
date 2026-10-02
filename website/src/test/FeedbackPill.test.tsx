@@ -9,8 +9,9 @@
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { render, screen } from '@testing-library/react'
+import { fireEvent, render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
+import { i18nT } from '../i18n/t'
 
 import FeedbackPill from '../components/FeedbackPill'
 
@@ -176,5 +177,52 @@ describe('FeedbackPill', () => {
     expect(screen.getByTestId('prerelease-report-chip').getAttribute('title')).toMatch(
       /nightly/i,
     )
+  })
+
+  it('tells the user up front, in plain words, that Request a Feature starts a chat that spends monthly usage (#13342)', () => {
+    // The action is a metered agent turn by design (the agent drafts and files
+    // the request), but its wording promised a feedback form: a capped user
+    // learned the difference only from the usage-limit error. The explanation
+    // is real copy, not a native `title` -- a DOM bubble the button names via
+    // aria-describedby, opened synchronously on keyboard focus (and on hover
+    // intent), so it is readable by keyboard and screen-reader users and can be
+    // photographed. It opens BELOW the pill: the pill lives in the top bar.
+    // The visible label stays the action, so the button's accessible NAME is
+    // unchanged and every caller that finds it by that name keeps working.
+    mount()
+    const button = screen.getByRole('button', { name: /request a feature/i })
+    expect(button).not.toHaveAttribute('title')
+    expect(screen.queryByRole('tooltip')).toBeNull()
+    fireEvent.focus(button)
+    const tip = screen.getByRole('tooltip')
+    expect(tip.id).toBe(button.getAttribute('aria-describedby'))
+    expect(tip).toHaveAttribute('data-placement', 'below')
+    expect(tip).toHaveTextContent(i18nT('components.feedbackPill.request_feature_starts_agent'))
+    // Plain words: no "inference", no "agent conversation"; it names the cost.
+    expect(tip.textContent).toMatch(/monthly usage/i)
+    expect(tip.textContent).not.toMatch(/inference/i)
+    expect(button).toHaveAccessibleName(/request a feature/i)
+  })
+
+  it('a touch tap still shows the usage warning (openOnTap), since the bubble is the only place it appears', () => {
+    // The shared hook ignores a tap's replayed mouseenter/focus by default so a
+    // bubble does not cost iOS the click. This anchor opts out: the warning
+    // exists so a phone user sees "this spends monthly usage" BEFORE the tap
+    // starts the metered turn (#13342), and nothing else on the pill says so.
+    // Same event order as the `tap()` helper in InstantTip.test.tsx: the touch
+    // pointer's own events, the replayed mouse events (mousedown -> focus),
+    // then the click.
+    const { onRequestFeature } = mount()
+    const button = screen.getByRole('button', { name: /request a feature/i })
+    fireEvent.pointerEnter(button, { pointerType: 'touch' })
+    fireEvent.pointerDown(button, { pointerType: 'touch' })
+    fireEvent.pointerUp(button, { pointerType: 'touch' })
+    fireEvent.mouseEnter(button)
+    fireEvent.mouseDown(button)
+    fireEvent.focus(button)
+    fireEvent.mouseUp(button)
+    fireEvent.click(button)
+    expect(screen.getByTestId('feedback-pill-request-feature-tip')).toBeInTheDocument()
+    expect(onRequestFeature).toHaveBeenCalledTimes(1)
   })
 })

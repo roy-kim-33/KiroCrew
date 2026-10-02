@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { Zap, ChevronRight } from 'lucide-react'
+import ErrorNotice from '../../components/ErrorNotice'
 import { i18nT } from '../../i18n/t'
 import { mcpToolStatus, type McpToolStatus } from '../../lib/mcpLoadedTools'
 import {
@@ -176,12 +177,12 @@ export default function McpToolsPanel({
           const sessionReason = mcpSessionFailureReason(s.name, sessionReport)
           const sessionLabel = i18nT(SESSION_LABEL_KEY[sessionState])
           // With a report in hand the mark answers "did this start HERE" and is
-          // drawn as a ring; without one it falls back to the configured enabled
-          // flag as a filled dot, which is all the dashboard used to know. The
-          // row's own opacity still carries disabled.
+          // drawn as a ring. Without one the configured `enabled` flag is a read of
+          // mcp.json, so painting it `ok` claimed a session nobody had measured.
+          // The row's own opacity still carries disabled.
           const serverDotClass = hasSessionReport
             ? `w-2 h-2 ${SESSION_DOT_CLASS[sessionState]}`
-            : `w-1.5 h-1.5 ${serverDim ? 'bg-muted' : 'bg-ok'}`
+            : `w-1.5 h-1.5 ${serverDim ? 'bg-muted' : SESSION_DOT_CLASS.no_report}`
           const toggleRow = () => {
             if (tools.length) toggle(s.name)
           }
@@ -227,6 +228,19 @@ export default function McpToolsPanel({
                   <ChevronRight size={11} className={`text-muted transition-transform ${isOpen ? 'rotate-90' : ''}`} />
                 )}
               </button>
+              {/* A server that failed to start HERE is an error, not a legend
+                  entry: the ring + tooltip alone left it invisible to keyboard
+                  and touch users and to anyone not hovering. Rendered whether or
+                  not the report carried a reason. Dropdown, no draft → hand-off on. */}
+              {hasSessionReport && sessionState === 'failed' && (
+                <div className="ml-3.5 mb-1">
+                  <ErrorNotice
+                    variant="inline"
+                    message={sessionReason ? `${sessionLabel}: ${sessionReason}` : sessionLabel}
+                    askAgent
+                  />
+                </div>
+              )}
               {isOpen && (
                 <div className="ml-3.5 mb-1 space-y-0.5">
                   {tools.length === 0 ? (

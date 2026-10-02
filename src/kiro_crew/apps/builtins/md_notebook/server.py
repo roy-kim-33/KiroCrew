@@ -15,11 +15,11 @@ Two kinds of vault: one this app cloned into ``<home>/vaults/``, and one
 the git CLI. The attached case is why saves are guarded against concurrent
 external edits and why the note listing is re-scanned rather than trusted.
 """
+
 from __future__ import annotations
 
 import asyncio
 import contextlib
-import functools
 import json
 import logging
 import ntpath
@@ -28,6 +28,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from pathlib import Path, PurePosixPath
@@ -39,8 +40,9 @@ from kiro_crew import hooks, platform_compat, security
 from kiro_crew.apps.builtins.md_notebook import git_ops
 from kiro_crew.apps.builtins.md_notebook import notes as notes_mod
 from kiro_crew.apps.proxy_auth import raw_request_target, verify_proxy_request
-from kiro_crew.atomic_write import atomic_write, replace_with_retry
+from kiro_crew.atomic_write import refuse_linked_parent, replace_with_retry
 from kiro_crew.config.paths import config_dir
+from kiro_crew.constants import WINDOWS_DEVICE_STEMS
 from kiro_crew.loop_lock import LoopBoundLock
 from kiro_crew.platform_compat import restrict_to_owner
 from kiro_crew.sel import sel
@@ -50,12 +52,19 @@ logger = logging.getLogger(__name__)
 PORT = int(os.environ.get("PORT", 9137))
 APP_NAME = os.environ.get("KIROCREW_APP_NAME", "md-notebook")
 
+#: The state writers' staging directory, a TOP-LEVEL leaf in the crew data home. Must stay
+#: byte-identical to ``sandbox._MD_NOTEBOOK_STAGING_LEAF``, which is what masks it from the
+#: agent and hands it back to this backend's own spawn — a mismatch would silently stage
+#: PAT bytes outside the mask. Spelled here rather than imported so this app backend does
+#: not pull the sandbox module into its own process; a test pins the two together.
+_STAGING_LEAF = "md-notebook-staging"
 
-# Data-home paths are resolved LAZILY, never at import time (issue #874): the
+
+# Data-home paths are resolved LAZILY, never at import time: the
 # active KiroCrew home depends on KIROCREW_HOME, which a pod, the legacy-home
 # migration, or the test-isolation fixture can change AFTER this module is
 # imported. `_HOME` is the override hook (None = live-resolve); tests do
-# `monkeypatch.setattr(server, "_HOME", tmp)`. See config/paths.py / issue #874.
+# `monkeypatch.setattr(server, "_HOME", tmp)`. See config/paths.py.
 _HOME: Optional[Path] = None
 
 
@@ -219,6 +228,34 @@ async def _save_locks_for(*paths: str) -> "AsyncIterator[None]":
         yield
 
 
+# Per-vault write lock, shared by the note writers and by every `git_ops.sync`
+# caller (the manual Sync, the autosave commit, the background syncer). A sync's
+# `git merge` rewrites the working tree — it can replace a folder the writer
+# just checked with a symlink the remote committed — so a writer's
+# check-and-write and a merge must never overlap. Held by the writer for
+# exactly one offloaded check-and-write call (`_create_unique`,
+# `_make_note_dirs_checked`, `_stage_note_text_checked`, `_move_sync`,
+# `_to_trash`), never across an `await` between them -- except the save's
+# publish: a GUARDED save re-takes it around each freshness-check-and-publish
+# and a TOKENLESS save holds it from staging through publication, because a
+# merge landing between a check (or the unchecked first attempt) and the
+# publish would be silently overwritten. The merge holds it for the whole
+# sync.
+#
+# Lock order, everywhere: per-path save locks FIRST, this lock SECOND. The
+# sync path takes only this one, so no cycle is possible.
+_vault_write_locks: dict[str, LoopBoundLock] = {}
+
+
+def vault_write_lock(local_path: str) -> LoopBoundLock:
+    """The lock a vault's writers and its sync share. Keyed by ``localPath``."""
+    lock = _vault_write_locks.get(local_path)
+    if lock is None:
+        lock = LoopBoundLock()
+        _vault_write_locks[local_path] = lock
+    return lock
+
+
 # Serializes every vaults.json read-modify-write. Clone/attach/forget/knowledge
 # each read the vault list, mutate it, and write it back; without this lock two
 # concurrent mutations from separate tabs would both read the old list and the
@@ -365,9 +402,11 @@ def _discard_staged_sync(tmp: Path) -> None:
 def _atomic_write_text_sync(path: Path, content: str) -> None:
     """Stage, publish, and clean up on failure -- the single-attempt whole.
 
-    Kept for callers that write a file with no freshness contract and no retry
-    (the settings store). The note save drives the two halves itself so it can
-    republish one temp across attempts.
+    Stages BESIDE the target (a note inside the vault, possibly a different
+    filesystem from the crew home). State files (vaults/settings/PAT) use
+    ``_write_state_staged_sync`` instead, which stages in the masked staging
+    dir. The note save drives the two halves itself so it can republish one
+    temp across attempts.
     """
     tmp = _new_staged_note_path(path)
     with git_ops.inflight_temp(tmp):
@@ -379,18 +418,94 @@ def _atomic_write_text_sync(path: Path, content: str) -> None:
             raise
 
 
+def _staging_dir() -> Path:
+    """The masked write-staging directory every STATE writer publishes through.
+
+    Every state writer (vaults/settings/PAT) stages its temp file HERE and renames onto
+    its target. A temp staged beside the target — the previous shape — carries the real PAT
+    bytes under a name the OS sandbox's three leaf masks do not cover, and a SIGKILL
+    between write and rename left that unmasked sibling readable by a same-uid sandboxed
+    agent forever.
+
+    A TOP-LEVEL directory in the crew data home (``sandbox._MD_NOTEBOOK_STAGING_LEAF``),
+    NOT a child of the state directory, for the reason the sibling ``aws-control-staging``
+    leaf records: a mask covers the leaf, not its ancestors, so a staging dir under the
+    agent-writable ``workspace/md-notebook`` could be renamed out from under its own mask
+    and a later PAT write would publish through the replacement, unmasked, into a live
+    agent's view. It stays on the same filesystem as the targets, so the publish rename is
+    still atomic. NOTE saves are deliberately untouched — they stage beside the note inside
+    the vault, which may be a different filesystem, and hold no secret.
+    """
+    # Mirrors ``_crew_data_home``'s resolution, minus the app subdirectory: the staging
+    # directory is a sibling of ``workspace``, not of the state files. Under the ``_HOME``
+    # test hook it sits beside that hook's directory, which keeps it on the same
+    # filesystem as the targets — the only property the rename depends on.
+    if _HOME is not None:
+        return _HOME.parent / _STAGING_LEAF
+    try:
+        base = config_dir()
+    except Exception:
+        override = os.environ.get("KIROCREW_HOME")
+        base = Path(override) if override else Path.home() / ".kiro" / "crew"
+    return base / _STAGING_LEAF
+
+
+def _write_state_staged_sync(target: Path, content: str, *, fsync_file: bool = False) -> None:
+    """Stage *content* in the masked staging dir, then rename onto *target*.
+
+    ``mkstemp`` opens the temp 0600 on POSIX before any payload byte;
+    ``restrict_to_owner`` adds the owner-only DACL on Windows (chmod is a no-op
+    there), warn-not-fail per the original PAT policy — losing the credential
+    write is worse than a permissions warning. On failure the temp is removed;
+    a removal that itself fails leaves the orphan inside the mask, not beside
+    the target.
+    """
+    staging = _staging_dir()
+    # The planted-link refusal atomic_write enforces:
+    # atomic_write(restrict_to_owner=True)
+    # refuses a secret write whose parent chain passes through a planted
+    # symlink/junction — otherwise mkdir(parents=True), mkstemp and the rename
+    # all follow the link and the token lands OUTSIDE the sensitive-path fence
+    # while the caller sees success. Moving the staging off atomic_write must
+    # not shed that guard. Both chains this write walks, checked BEFORE the
+    # mkdirs (mkdir walks THROUGH a planted link and would build the tree
+    # under its target); the probe name is never created, only its chain is
+    # judged.
+    refuse_linked_parent(target)
+    refuse_linked_parent(staging / ".chain-probe")
+    staging.mkdir(parents=True, exist_ok=True)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=str(staging), suffix=".tmp")
+    tmp = Path(tmp_name)
+    try:
+        try:
+            restrict_to_owner(tmp)
+        except OSError:
+            logger.warning("could not restrict a staged state temp to owner-only", exc_info=True)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fd = -1
+            fh.write(content)
+            if fsync_file:
+                fh.flush()
+                os.fsync(fh.fileno())
+        replace_with_retry(tmp, target)
+    except BaseException:
+        if fd >= 0:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        raise
+
+
 def _write_vaults_sync(vaults: list[dict[str, Any]]) -> None:
     """Replace the vault registry, retrying the Windows rename window.
 
     Same reason as the note writer above: this file is read back by every
     later request, so a handle can be open on it when the rename lands.
+    Staged in the masked staging dir — see :func:`_staging_dir`.
     """
-    target = _vaults_json()
-    target.parent.mkdir(parents=True, exist_ok=True)
-    tmp = target.with_name(f"vaults.json.{uuid.uuid4().hex}.tmp")
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(vaults, fh, indent=2)
-    replace_with_retry(tmp, target)
+    _write_state_staged_sync(_vaults_json(), json.dumps(vaults, indent=2))
 
 
 def _read_pat_sync() -> Optional[str]:
@@ -411,22 +526,15 @@ def _read_pat_sync() -> Optional[str]:
 
 
 def _write_pat_sync(pat: str) -> None:
-    target = _pat_file()
-    target.parent.mkdir(parents=True, exist_ok=True)
-    # Write to an owner-only sibling temp, fsync, then atomically replace. A
-    # direct O_TRUNC open would empty the existing token before the new bytes
-    # land, so a failure partway (a full disk is the realistic one) would lose a
-    # valid credential.
-    #
-    # os.chmod's 0600 is a no-op on Windows (it only toggles read-only), leaving
-    # the token readable by other accounts. restrict_to_owner applies an
-    # owner-only DACL there and chmod 0600 on POSIX, and atomic_write applies it
-    # to the temp BEFORE any payload byte — narrower than the previous
-    # write-then-restrict here, which left the token in a parent-inherited-DACL
-    # file until the lockdown landed. restrict_on_error="warn"
-    # keeps the original policy: a chmod failure warns rather than losing the
-    # credential. Written 0600 and never echoed back (only a boolean).
-    atomic_write(target, pat, fsync=True, restrict_to_owner=True, restrict_on_error="warn")
+    # Stage in the MASKED staging dir, fsync, then atomically replace. A direct
+    # O_TRUNC open would empty the existing token before the new bytes land, so
+    # a failure partway (a full disk is the realistic one) would lose a valid
+    # credential — and a temp staged BESIDE the target would hold the real PAT
+    # bytes at a name the sandbox's leaf masks do not cover (see _staging_dir).
+    # The temp is 0600 from mkstemp on POSIX and owner-only-DACL'd on Windows
+    # before any payload byte, warn-not-fail; written 0600 and never echoed
+    # back (only a boolean).
+    _write_state_staged_sync(_pat_file(), pat, fsync_file=True)
 
 
 async def read_vaults() -> list[dict[str, Any]]:
@@ -521,13 +629,14 @@ def _read_settings_sync() -> dict[str, Any]:
 
 
 def _write_settings_sync(settings: dict[str, Any]) -> None:
-    # Create the settings file's OWN parent, like the PAT write does — since
-    # settings.json now resolves under the crew data home (or the _HOME test
-    # hook), not under _home(), the two dirs diverge and mkdir'ing _home() would
-    # leave the settings dir absent and the write failing with ENOENT.
-    target = _settings_json()
-    target.parent.mkdir(parents=True, exist_ok=True)
-    _atomic_write_text_sync(target, json.dumps(settings, indent=2))
+    # Staged in the masked staging dir like the other state writers (see
+    # _staging_dir); the helper creates both the staging dir and the target's
+    # own parent, which diverges from _home() when the _HOME test hook is unset.
+    # fsync preserved from the previous path (_stage_note_text_sync fsync'd):
+    # settings carry the autoSync authorization bit and the lastSync stamp, and
+    # a rename published from an unflushed page cache can discard an
+    # acknowledged toggle on power loss.
+    _write_state_staged_sync(_settings_json(), json.dumps(settings, indent=2), fsync_file=True)
 
 
 async def read_settings() -> dict[str, Any]:
@@ -565,6 +674,32 @@ async def record_last_sync(vault_id: str) -> int:
 _gh_cache: dict[str, Any] = {"value": None, "at": 0.0}
 
 
+def _windows_gh_candidates() -> list[str]:
+    """Fixed GitHub-CLI install roots on Windows. PATH is still NOT consulted.
+
+    Only the machine-wide install roots: ``%ProgramFiles%`` and
+    ``%ProgramW6432%`` (where a 64-bit install lands when the host interpreter
+    is 32-bit and ``%ProgramFiles%`` resolves to the x86 tree). Both need an
+    admin-elevated installer to write to, matching the no-PATH-hijack property
+    ``_find_gh``'s docstring relies on.
+
+    Deliberately NOT ``%LOCALAPPDATA%\\Programs`` (winget's per-user install
+    root): unlike Program Files, it sits inside the user's own profile and is
+    writable by anything running as that user -- including this agent. Trusting
+    a ``gh.exe`` planted there would let it run unsandboxed the next time a
+    vault operation mints a gh-derived token, with the backend's PAT and proxy
+    secret in scope. A user who installed gh per-user only (no admin rights)
+    still authenticates via a stored PAT; this is a narrower gh-derived-auth
+    surface on Windows, not a hard requirement.
+    """
+    roots: list[str] = []
+    for var in ("ProgramFiles", "ProgramW6432"):
+        value = os.environ.get(var)
+        if value and value not in roots:
+            roots.append(value)
+    return [os.path.join(root, "GitHub CLI", "gh.exe") for root in roots]
+
+
 def _find_gh() -> Optional[str]:
     """Absolute path to a trusted ``gh``, or None. PATH is NOT consulted — a
     workspace-writable entry could shadow ``gh`` with a planted binary that runs
@@ -585,6 +720,11 @@ def _find_gh() -> Optional[str]:
             "/usr/bin/gh",
         ]
     )
+    if not override and platform_compat.IS_WINDOWS:
+        # None of the entries above can ever match on Windows, so gh-derived auth
+        # was unavailable there however the user had logged in. Same rule, same
+        # reason: fixed install roots only, never PATH.
+        candidates = _windows_gh_candidates()
     for candidate in candidates:
         if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
             return candidate
@@ -680,7 +820,74 @@ async def vault_path(vault: dict[str, Any], rel: Optional[str] = None) -> Path:
     return await asyncio.to_thread(_resolve)
 
 
-def require_note_path(rel: Any, field: str = "path") -> str:
+#: Characters Win32 forbids in a path component. Refused for a name the app is
+#: about to CREATE on every platform, and for every name when running on Windows,
+#: because a vault is meant to be portable: a note named ``a:b.md`` created on
+#: macOS makes the Windows clone of the same vault un-checkoutable (git's own
+#: ``core.protectNTFS`` refuses it, reported only as a clone failure), and on
+#: Windows the same move does not fail at all — ``os.replace`` writes an NTFS
+#: ALTERNATE DATA STREAM on a file named ``a``, which ``_list_note_files_sync``
+#: never walks, so the note silently disappears from the app instead of erroring.
+_UNPORTABLE_CHARS = frozenset('<>:"|?*')
+
+
+def _reject_unportable_component(part: str, field: str) -> None:
+    """Refuse one path component Win32 cannot represent. Raises ``ApiError`` 400.
+
+    Applied on EVERY platform for a name the caller is about to CREATE (a move
+    destination, a new-note folder, or a saved path's new components), so an
+    unportable name never enters a vault that is meant to travel; and on Windows
+    for every name, where such a path is not merely unwise but silently wrong. Reading and re-saving an oddly-named note that already
+    exists on a POSIX host stays allowed — that is the only way a user can rename
+    it to something portable.
+    """
+    if _UNPORTABLE_CHARS.intersection(part) or any(ord(ch) < 32 for ch in part):
+        raise ApiError(
+            f'{field} must not contain < > : " | ? * or a control character — '
+            "such a name cannot exist on Windows, so it would break any Windows "
+            "clone of this vault",
+            400,
+            code="path_not_a_note",
+        )
+    if part != part.rstrip(". "):
+        raise ApiError(
+            f"{field} must not have a path component ending in a dot or a space — "
+            "Windows silently strips it, so the name would not round-trip",
+            400,
+            code="path_not_a_note",
+        )
+    if part.split(".", 1)[0].lower() in WINDOWS_DEVICE_STEMS:
+        raise ApiError(
+            f"{field} uses '{part}', a name Windows reserves for a device",
+            400,
+            code="path_not_a_note",
+        )
+
+
+def _reject_unportable_new_components(root: Path, rel: str) -> None:
+    """Refuse a save that would CREATE a path component Win32 cannot hold.
+
+    A save mkdirs missing parents and may create the note itself, so every
+    component that does not exist yet is a NEW name entering the vault and is
+    held to the portability rule on every platform — the same rationale as
+    ``require_note_path``'s ``for_new``. Components that already exist are left
+    alone: re-saving an oddly-named note a POSIX vault already contains stays
+    allowed, which is the only way a user can rename it to something portable.
+
+    Runs one synchronous ``exists`` stat per component, so call it off the
+    event loop.
+    """
+    current = root
+    missing = False
+    for part in PurePosixPath(rel.replace("\\", "/")).parts:
+        if not missing:
+            current = current / part
+            missing = not current.exists()
+        if missing:
+            _reject_unportable_component(part, "path")
+
+
+def require_note_path(rel: Any, field: str = "path", *, for_new: bool = False) -> str:
     """Validate a caller-supplied path as one this app is allowed to touch.
 
     Containment is not enough. ``safe_join`` / ``vault_mutation_path`` only prove
@@ -698,6 +905,10 @@ def require_note_path(rel: Any, field: str = "path") -> str:
 
     Raises ``ApiError`` 400; callers pass ``field`` so the message names the
     parameter the caller actually sent (``from`` / ``to`` on a move).
+
+    ``for_new`` marks a path the caller is about to CREATE (a move destination).
+    Those are additionally held to what Win32 can represent, on every platform,
+    so a vault does not acquire a note only some of its clones can check out.
     """
     if not rel or not isinstance(rel, str):
         raise ApiError(f"{field} is required", 400, code="path_required")
@@ -708,16 +919,25 @@ def require_note_path(rel: Any, field: str = "path") -> str:
             400,
             code="path_not_a_note",
         )
+    if for_new or platform_compat.IS_WINDOWS:
+        for part in parts:
+            _reject_unportable_component(part, field)
     if not parts[-1].lower().endswith(".md"):
         raise ApiError(f"{field} must be a .md note", 400, code="path_not_a_note")
     return rel
 
 
-def require_folder_path(folder: Any) -> Optional[str]:
+def require_folder_path(folder: Any, *, for_new: bool = False) -> Optional[str]:
     """Validate an optional caller-supplied FOLDER (the new-note target).
 
     Same undotted rule as `require_note_path`, without the `.md` requirement: a
     folder is not a note. Without it a new note could be created inside `.git`.
+
+    ``for_new`` marks a folder the caller is about to CREATE (``api_note_new``
+    mkdirs it). Such a name is additionally held to what Win32 can represent,
+    on every platform — the same rationale as ``require_note_path``: a vault
+    travels, and a folder named ``CON`` written on a POSIX host makes every
+    Windows clone un-checkoutable (core.protectNTFS).
     """
     if folder is None or folder == "":
         return None
@@ -730,6 +950,13 @@ def require_folder_path(folder: Any) -> Optional[str]:
             400,
             code="path_not_a_note",
         )
+    if for_new or platform_compat.IS_WINDOWS:
+        # With ``for_new`` the folder IS about to be created, so the
+        # portability rule applies on every platform; without it the folder is
+        # merely resolved, and the check still stops a note being written into
+        # a folder Win32 cannot address when running ON Windows.
+        for part in parts:
+            _reject_unportable_component(part, "folder")
     return folder
 
 
@@ -747,10 +974,22 @@ async def trash_dir_path(vault: dict[str, Any]) -> Path:
     So any symlink is refused, escaping or not. `lstat` via `is_symlink()` is the
     only test that can see it — `exists()` and `is_dir()` both follow the link.
     On Windows the same redirection is possible via a directory JUNCTION, which
-    `is_symlink()` does NOT report, so `is_link_or_junction` is used to catch both.
+    `is_symlink()` does NOT report, so `is_link_or_junction` catches both.
     """
     trash_dir = await vault_mutation_path(vault, git_ops.TRASH_DIR)
-    if await asyncio.to_thread(platform_compat.is_link_or_junction, trash_dir):
+    await asyncio.to_thread(reject_linked_trash, trash_dir)
+    return trash_dir
+
+
+def reject_linked_trash(trash_dir: Path) -> None:
+    """Raise ``trash_is_symlink`` when the `.trash` entry is a link or junction.
+
+    Synchronous (one ``lstat``): the delete calls it again as the FIRST statement
+    of the worker that mkdirs and moves into `.trash`, under ``vault_write_lock``,
+    so a ``git merge`` cannot install the link between the check and the write —
+    the same shape as ``reject_linked_folder_component`` for the other writers.
+    """
+    if platform_compat.is_link_or_junction(trash_dir):
         raise ApiError(
             f"this vault's {git_ops.TRASH_DIR} is a symlink — refusing to use it, "
             "because a trashed note would be written somewhere the app does not "
@@ -758,7 +997,6 @@ async def trash_dir_path(vault: dict[str, Any]) -> Path:
             400,
             code="trash_is_symlink",
         )
-    return trash_dir
 
 
 async def vault_mutation_path(vault: dict[str, Any], rel: str) -> Path:
@@ -780,6 +1018,161 @@ async def vault_mutation_path(vault: dict[str, Any], rel: str) -> Path:
         return root / PurePosixPath(rel.replace("\\", "/"))
 
     return await asyncio.to_thread(_resolve)
+
+
+def linked_folder_component(vault: dict[str, Any], folder: str) -> bool:
+    """True if any component of the LEXICAL in-vault ``folder`` is a link.
+
+    ``safe_join`` returns the REALPATH, and a realpath passes containment as long
+    as the link's TARGET is inside the vault — so a cloned
+    ``Projects -> .git/refs/heads`` resolves to the vault's own ``.git`` and any
+    write that mkdirs or creates through ``Projects`` lands inside ``.git``. The
+    component validators screen only what the caller typed, and a link's own
+    name carries no dot. So walk the components themselves, root-first, from the
+    vault root: the scope's (``subfolder``) first, then ``folder``'s. The scope
+    is walked too because ``content_root`` returns its REALPATH — started from
+    there, a scope that is itself a tracked link would already be resolved past
+    the link before the walk began. Only those components: the vault root's own
+    ancestors are the user's filesystem (``~/Notes -> /Volumes/SSD/Notes``,
+    macOS's ``/tmp``), not the vault's content, and a link there is not a link
+    inside the vault. Normalised the way ``safe_join`` normalises, or
+    ``Projects\\Sub`` would be one component here and two there.
+
+    Synchronous filesystem I/O (one ``lstat`` per component): call it from
+    the SAME worker thread as the write it guards, as that write's first
+    statement, and hold ``vault_write_lock`` around that one offloaded call.
+    The two together are what make the check mean something: the walk sees the
+    tree as it is at that instant, and the lock is what keeps the tree that way
+    until the ``mkdir``/``open`` — every ``git merge`` that could swap a checked
+    folder for a link (``api_sync``, ``api_commit``, ``syncer._sync_vault``)
+    holds the same lock for its whole run. Never ``to_thread`` the check on its
+    own and the write after: the ``await`` between them is outside the lock's
+    cover only if the lock is released too, but it is also a window in which
+    a same-process writer can be reordered against the check. One walk for
+    every step that creates through folder components — ``api_note_new`` and
+    ``api_note_duplicate`` (create), ``api_note_save`` (``mkdir``, then the
+    staging ``open``) and ``api_note_move`` (``mkdir`` + rename) — so the next
+    write path gets the same check, and the same lock, by calling it rather
+    than re-deriving it.
+    """
+    current = Path(vault["localPath"])
+    for raw in (vault.get("subfolder") or "", folder or ""):
+        for part in PurePosixPath(raw.replace("\\", "/")).parts:
+            current = current / part
+            if platform_compat.is_link_or_junction(current):
+                return True
+    return False
+
+
+def reject_linked_folder_component(vault: dict[str, Any], folder: str) -> None:
+    """Raise ``folder_is_symlink`` when ``linked_folder_component`` finds one.
+
+    The offending component is not echoed: which entry is a link is filesystem
+    layout the caller supplied a path to guess at.
+    """
+    if linked_folder_component(vault, folder):
+        raise ApiError("cannot write through a symlinked folder", 400, code="folder_is_symlink")
+
+
+def resolve_write_dir_checked(vault: dict[str, Any], folder: str) -> Path:
+    """Reject a linked folder component, THEN resolve its directory — atomically.
+
+    The single ``realpath`` that turns a note's folder into the absolute
+    directory a write creates through (``safe_join`` at the heart of
+    ``vault_path`` / ``content_root``) FOLLOWS an in-vault symlink: a cloned
+    ``Projects -> .git/refs/heads`` resolves to the vault's own ``.git`` and,
+    because that target is still inside the vault, passes containment. When that
+    resolution runs BEFORE ``vault_write_lock`` is taken and its result is then
+    written to inside the lock, a sync's merge that lands (or removes) the link
+    while the writer parks on the lock leaves the write pointed at the STALE
+    resolved target: the in-lock lexical walk sees the tree the merge produced
+    and passes, while the ``mkdir``/``open`` still lands at the cached link
+    target.
+
+    Resolving here — as the FIRST offloaded step run INSIDE the lock, after the
+    lexical reject and in the SAME worker thread as the write it feeds — closes
+    that window. The reject sees the tree as it is at this instant; the
+    resolution reads that same tree (and because the reject cleared every linked
+    folder component first, this ``realpath`` has no in-vault folder link to
+    follow); and the lock holds the tree that way through the following
+    ``mkdir``/``open`` — every ``git merge`` that could swap a component holds
+    the same lock for its whole run. Callers pass the note's folder (``''`` for a
+    root note) and append the note name to the returned directory themselves,
+    because that name is chosen (new/duplicate) or already known (save/move)
+    without changing which directory the write lands in.
+    """
+    reject_linked_folder_component(vault, folder)
+    root = content_root(vault)
+    # Canonicalise on BOTH branches. `safe_join` already realpaths the folder
+    # case; the empty-folder (root note) case must too, or a vault whose stored
+    # `localPath` traverses a symlink (a relocated crew home, `MD_NOTEBOOK_HOME`
+    # through an alias — `api_vault_clone` persists the path verbatim) returns a
+    # non-canonical root here while the save's `tmp.parent` comparison uses a
+    # realpath, so every root-level save would be refused `folder_is_symlink`.
+    return safe_join(root, folder) if folder else Path(os.path.realpath(str(root)))
+
+
+def mutation_path_checked(vault: dict[str, Any], rel: str) -> Path:
+    """Validate under the write lock, retaining the lexical scope and note entry.
+
+    Run in the mutation's worker: a scope resolved before the lock can name a
+    stale link target. Containment checks may resolve the note for validation,
+    but rename must receive the lexical entry so a final alias moves as a link.
+    """
+    reject_linked_folder_component(vault, note_folder(rel))
+    safe_join(content_root(vault), rel)
+    scope = PurePosixPath((vault.get("subfolder") or "").replace("\\", "/"))
+    return Path(vault["localPath"]) / scope / PurePosixPath(rel.replace("\\", "/"))
+
+
+def note_folder(rel: str) -> str:
+    """The folder part of a vault-relative note path, '' for a root note."""
+    parent = PurePosixPath(rel.replace("\\", "/")).parent
+    return "" if parent == PurePosixPath(".") else parent.as_posix()
+
+
+def _make_note_dirs_checked(vault: dict[str, Any], rel: str) -> None:
+    """``mkdir -p`` a note's parent, the link walk + resolution as its first steps.
+
+    One offloaded step, so no ``await`` separates the check from the ``mkdir``
+    (see ``linked_folder_component``). ``resolve_write_dir_checked`` rejects a
+    linked folder component and resolves the parent afresh here — after the
+    reject and under the vault lock — rather than trusting a path resolved before
+    the lock; the ``mkdir`` then lands in that resolved directory, which (with
+    every linked component rejected) is the note's own lexical parent.
+    """
+    resolved = resolve_write_dir_checked(vault, note_folder(rel))
+    resolved.mkdir(parents=True, exist_ok=True)
+
+
+def _stage_note_text_checked(vault: dict[str, Any], rel: str, tmp: Path, content: str) -> None:
+    """``_stage_note_text_sync`` with the link walk + resolution as its first steps.
+
+    The staging ``open`` is the save's only write that CREATES through the
+    folder components (the publish is a rename of the staged file, which exists
+    in the real directory or not at all), so it is the step the walk must
+    precede in the same thread. A ``mkdir`` that just ran is no proof: an empty
+    untracked directory is one ``git merge`` may replace with the link, while a
+    directory holding the untracked temp is one it refuses to. Rejecting a linked
+    component AND resolving the directory here — under the lock, before the open
+    — is what keeps the staging temp from being opened through a link target
+    resolved before the lock. ``tmp`` is a sibling of the caller's lexical
+    ``abs_path`` (already registered with ``inflight_temp`` before this runs); the
+    resolved directory equals that lexical parent once every linked component is
+    rejected, so the registered temp is the one that gets opened.
+    """
+    resolved = resolve_write_dir_checked(vault, note_folder(rel))
+    if resolved != Path(os.path.realpath(str(tmp.parent))):
+        # The typed folder resolved somewhere other than the temp's own
+        # directory — only reachable if an in-vault link slipped past the
+        # lexical reject. Both sides are canonicalised so a legitimate symlink
+        # ABOVE the vault root (an attached ``~/Notes`` alias, a relocated crew
+        # home, ``MD_NOTEBOOK_HOME`` through an alias — all supported) does not
+        # trip this: ``tmp.parent`` is the lexical ``content_root/<folder>`` and
+        # ``resolved`` is its realpath, so they differ only when an in-vault
+        # component is itself a link, which is exactly the write we refuse.
+        raise ApiError("cannot write through a symlinked folder", 400, code="folder_is_symlink")
+    _stage_note_text_sync(tmp, content)
 
 
 def safe_join(root: Path, rel_path: str) -> Path:
@@ -827,11 +1220,6 @@ def _list_note_files_sync(root: Path) -> list[str]:
 
 async def list_note_files(root: Path) -> list[str]:
     return await asyncio.to_thread(_list_note_files_sync, root)
-
-
-async def make_dirs(path: Path) -> None:
-    """Create a directory and its parents, tolerating an existing one."""
-    await asyncio.to_thread(functools.partial(path.mkdir, parents=True, exist_ok=True))
 
 
 def mark_self_write(abs_path: Path) -> None:
@@ -910,17 +1298,23 @@ async def scan_changes(vault: dict[str, Any]) -> dict[str, Any]:
 async def read_note_text(path: Path) -> Optional[str]:
     """Vault file contents, or None when the gate refuses the path.
 
-    EVERY read of vault content goes through here. `safe_join` proves a path
-    stays inside the vault, but a vault is any folder the user attaches and a
-    `.md` entry inside it can be a symlink to a private key, so containment is
-    not enough on its own. `safe_read_file_bytes` canonicalizes via realpath,
-    refuses a sensitive resolved target and opens with O_NOFOLLOW.
+    EVERY read of vault content goes through ``_read_note_text_sync``.
+    `safe_join` proves a path stays inside the vault, but a vault is any folder
+    the user attaches and a `.md` entry inside it can be a symlink to a private
+    key, so containment is not enough on its own. `safe_read_file_bytes`
+    canonicalizes via realpath, refuses a sensitive resolved target and opens
+    with O_NOFOLLOW.
 
-    Centralized deliberately: this gate was previously applied per call site and
-    each new read path was a fresh hole.
+    Centralized deliberately: applied per call site instead, every new read path
+    is a fresh hole.
     """
+    return await asyncio.to_thread(_read_note_text_sync, path)
+
+
+def _read_note_text_sync(path: Path) -> Optional[str]:
+    """Read through the sensitive-path gate in the caller's filesystem worker."""
     try:
-        data = await asyncio.to_thread(hooks.safe_read_file_bytes, str(path))
+        data = hooks.safe_read_file_bytes(str(path))
     except (OSError, hooks.FileTooLargeError):
         return None
     if data is None:
@@ -1201,7 +1595,7 @@ async def api_vault_clone(request: web.Request) -> web.Response:
         raise ApiError("url is required", 400, code="url_required")
     # Use a submitted token TRANSIENTLY for this clone; persist it only after the
     # clone succeeds. Writing it up front would let a failed clone (bad URL or
-    # bad token) overwrite a previously-valid stored PAT and break every existing
+    # bad token) overwrite a valid stored PAT and break every existing
     # vault's auth.
     submitted_pat = str(body["pat"]) if body.get("pat") else None
     pat = submitted_pat or await resolve_auth()
@@ -1442,13 +1836,14 @@ async def api_pat(request: web.Request) -> web.Response:
     if pat:
         await asyncio.to_thread(_write_pat_sync, str(pat))
     else:
-        def _remove() -> None:
-            try:
-                os.unlink(_pat_file())
-            except FileNotFoundError:
-                pass
-
-        await asyncio.to_thread(_remove)
+        # Clear by atomically REPLACING with an empty file, never by unlink:
+        # the empty file is the reader's absent-equivalent (_read_pat_sync maps
+        # "" to None), while removing the inode deletes the sandbox mask's
+        # mount target — a clear landing between the launcher's materialize and
+        # mount steps would leave that namespace maskless, and a later PAT save
+        # would be readable inside it. Routed through the same staged writer as
+        # the save so the guards match.
+        await asyncio.to_thread(_write_pat_sync, "")
     return web.json_response(
         {"hasPat": bool(await read_pat()), "hasGhAuth": bool(await gh_token())}
     )
@@ -1509,9 +1904,7 @@ async def api_note_read(request: web.Request) -> web.Response:
     )
 
 
-async def _assert_note_is_fresh(
-    abs_path: Path, rel: str, base_mtime: object
-) -> None:
+async def _assert_note_is_fresh(abs_path: Path, rel: str, base_mtime: object) -> None:
     """Raise 409 ESTALE if the note changed on disk since the client read it.
 
     Split out of the save handler so the retry below can re-run it. It must be
@@ -1567,9 +1960,7 @@ async def _observed_note_mtime(abs_path: Path) -> Optional[float]:
         return None
 
 
-async def _assert_note_unchanged(
-    abs_path: Path, rel: str, observed: Optional[float]
-) -> None:
+async def _assert_note_unchanged(abs_path: Path, rel: str, observed: Optional[float]) -> None:
     """Raise 409 ESTALE if the note moved off *observed* since it was sampled.
 
     The tokenless counterpart to `_assert_note_is_fresh`. A save with no
@@ -1646,7 +2037,7 @@ async def _publish_note_once(abs_path: Path, tmp: Path, attempt: int) -> bool:
 
 
 async def _save_note_contents(
-    abs_path: Path, rel: str, content: str, base_mtime: object
+    vault: dict[str, Any], abs_path: Path, rel: str, content: str, base_mtime: object
 ) -> None:
     """Publish *content*, retrying a contended rename without losing a write.
 
@@ -1707,28 +2098,36 @@ async def _save_note_contents(
         #
         # It runs BEFORE the directory is created, though. A save whose note and
         # parent were deleted externally is already destined for 409, and
-        # `make_dirs` would put the parent back on the way to refusing: a request
+        # the `mkdir` would put the parent back on the way to refusing: a request
         # that changes nothing should not resurrect a directory the user removed.
         # This costs one extra stat on the happy path and weakens nothing -- the
         # per-attempt check under the lock is still the one that authorizes a
         # publish.
         await _assert_note_is_fresh(abs_path, rel, base_mtime)
-        await make_dirs(abs_path.parent)
+        async with vault_write_lock(vault["localPath"]):
+            await asyncio.to_thread(_make_note_dirs_checked, vault, rel)
         tmp = _new_staged_note_path(abs_path)
         # Register BEFORE staging: opening the temp is the first instant Sync
         # can see it. Keep ownership through failure cleanup as well as publish,
         # so there is no visible gap at either end of the transaction.
         with git_ops.inflight_temp(tmp):
             try:
-                await asyncio.to_thread(_stage_note_text_sync, tmp, content)
+                async with vault_write_lock(vault["localPath"]):
+                    await asyncio.to_thread(_stage_note_text_checked, vault, rel, tmp, content)
                 for attempt in range(_SAVE_MAX_ATTEMPTS):
-                    async with _save_lock(str(abs_path)):
+                    # Both locks, per attempt: the per-note lock orders API
+                    # writers, and the vault lock keeps a sync's merge out of
+                    # the gap between the freshness check and the publish --
+                    # a merge there would pass the check (it ran first) and be
+                    # replaced by the publish with a 200. Same order as
+                    # everywhere else: the per-note lock first.
+                    async with _save_lock(str(abs_path)), vault_write_lock(vault["localPath"]):
                         await _assert_note_is_fresh(abs_path, rel, base_mtime)
                         if await _publish_note_once(abs_path, tmp, attempt):
                             return
-                    # Outside the lock: a writer arriving here is one the next
-                    # attempt's check is meant to notice, so blocking it would
-                    # hide the conflict.
+                    # Outside both locks: a writer arriving here -- an API save,
+                    # a merge -- is one the next attempt's check is meant to
+                    # notice, so blocking it would hide the conflict.
                     await asyncio.sleep(_SAVE_BACKOFF_SECONDS)
                 return
             except BaseException:
@@ -1742,15 +2141,26 @@ async def _save_note_contents(
     # a later save could take the lock, publish, and answer 200 while the earlier
     # one was still writing its temp, and the earlier one then published over it.
     # Both answered 200; the later edit was gone.
-    async with _save_lock(str(abs_path)):
-        await make_dirs(abs_path.parent)
+    #
+    # The vault write lock is held for the SAME span, and for the same reason.
+    # A sync's merge is a writer this path cannot detect either: the first
+    # attempt publishes without a check (overwriting the sampled state IS the
+    # save), so a merge landing between staging and the publish -- a sync that
+    # queued behind the staging call's lock, say -- would be overwritten with a
+    # 200. The guarded path can release the vault lock across its backoff because
+    # it re-takes it with the per-note lock around every check-and-publish, and
+    # `_assert_note_is_fresh` then sees a merged note as a foreign write and
+    # answers 409; here nothing would, so the merge has to wait for the publish.
+    # Order: the per-note lock first, the vault lock second, as everywhere else.
+    async with _save_lock(str(abs_path)), vault_write_lock(vault["localPath"]):
+        await asyncio.to_thread(_make_note_dirs_checked, vault, rel)
         tmp = _new_staged_note_path(abs_path)
         with git_ops.inflight_temp(tmp):
             try:
                 # Registration precedes the worker-thread open and remains until
                 # cleanup completes, so Sync never sees an unowned temp even if
                 # staging itself is slow or fails partway.
-                await asyncio.to_thread(_stage_note_text_sync, tmp, content)
+                await asyncio.to_thread(_stage_note_text_checked, vault, rel, tmp, content)
                 # The server's OWN baseline, standing in for the absent
                 # `baseMtime`: the state this save is about to overwrite.
                 # Sampled after staging (which writes the temp, never the note)
@@ -1767,9 +2177,9 @@ async def _save_note_contents(
                         await _assert_note_unchanged(abs_path, rel, observed)
                     if await _publish_note_once(abs_path, tmp, attempt):
                         return
-                    # Still inside the lock: with no token there is nothing to
-                    # detect an interleaved API write with, so ordering has to
-                    # be preserved.
+                    # Still inside both locks: with no token there is nothing
+                    # to detect an interleaved API write OR merge with, so
+                    # ordering has to be preserved.
                     await asyncio.sleep(_SAVE_BACKOFF_SECONDS)
             except BaseException:
                 # Every non-success exit -- staging failure, an exhausted
@@ -1797,15 +2207,21 @@ async def api_note_save(request: web.Request) -> web.Response:
     # islink() misses, so check both to keep the guard from being POSIX-only.
     if await asyncio.to_thread(platform_compat.is_link_or_junction, abs_path):
         raise ApiError("cannot save through a symlink", 400, code="note_is_symlink")
+    # The folder components the save creates through are walked inside
+    # `_save_note_contents`, in the thread that does each create: a linked one
+    # resolves inside the vault and passes containment, see the helper.
+    root = await vault_path(vault)
+    # Components this save would CREATE are held to the portability rule on
+    # every platform; existing ones stay saveable (the rename escape hatch).
+    await asyncio.to_thread(_reject_unportable_new_components, root, rel)
     base_mtime = body.get("baseMtime")
-    await _save_note_contents(abs_path, rel, content, base_mtime)
+    await _save_note_contents(vault, abs_path, rel, content, base_mtime)
     mark_self_write(abs_path)
     cache = await get_cache(vault)
     cache["index"].update(
         notes_mod.SearchDoc(path=rel, title=notes_mod.note_basename(rel), content=content)
     )
     # Backlinks are a whole-vault relation, so recompute them from disk.
-    root = await vault_path(vault)
     contents = {}
     for p in await list_note_files(root):
         text = await read_note_text(root / p)
@@ -1829,11 +2245,14 @@ async def api_note_delete(request: web.Request) -> web.Response:
     require_writable(vault)
     rel = require_note_path(request.query.get("path"))
     abs_path = await vault_mutation_path(vault, rel)
-    # Refuses a vault-supplied `.trash` symlink outright — see `trash_dir_path`.
-    trash_dir = await trash_dir_path(vault)
     name = notes_mod.note_basename(rel.replace("\\", "/"))
 
-    def _to_trash() -> str:
+    def _to_trash() -> tuple[str, Path, Path]:
+        # Derive the lexical source under the lock, after rejecting linked
+        # folders, so a scope swap cannot retain a stale resolved target.
+        abs_path = mutation_path_checked(vault, rel)
+        trash_dir = content_root(vault) / git_ops.TRASH_DIR
+        reject_linked_trash(trash_dir)
         trash_dir.mkdir(parents=True, exist_ok=True)
         for n in range(1, MAX_UNTITLED):
             candidate = trash_dir / (f"{name}.md" if n == 1 else f"{name} {n}.md")
@@ -1857,21 +2276,25 @@ async def api_note_delete(request: web.Request) -> web.Response:
                 with contextlib.suppress(OSError):
                     os.unlink(candidate)
                 raise
-            return candidate.name
+            return candidate.name, abs_path, candidate
         raise ApiError("could not find a free name in the trash", 409, code="no_free_note_name")
 
     # Share the note's save lock: a concurrent debounced save could otherwise
-    # recreate the note right after it is moved away.
-    async with _save_lock(str(abs_path)):
+    # recreate the note right after it is moved away. Then the vault write lock,
+    # so no sync's merge runs between the `.trash` check and the move into it.
+    async with _save_lock(str(abs_path)), vault_write_lock(vault["localPath"]):
         try:
-            trashed = await asyncio.to_thread(_to_trash)
+            trashed, abs_path, trash_dest = await asyncio.to_thread(_to_trash)
         except FileNotFoundError as exc:
             raise ApiError(f"no such note: {rel}", 404, code="no_such_note") from exc
     mark_self_write(abs_path)
-    mark_self_write(trash_dir / trashed)
+    # Mark the destination the worker actually computed under the lock, rather
+    # than re-deriving it here with `content_root` — two `os.path.realpath`
+    # syscalls that must not run on the event loop for a network-mounted vault.
+    mark_self_write(trash_dest)
     # Rebuild rather than drop one index entry: the deleted note's own
     # [[wikilinks]] disappear with it, so every note it pointed at keeps a
-    # backlink to a note that no longer exists until the next rebuild.
+    # backlink to a missing note until the next rebuild.
     await rebuild_cache(vault)
     return web.json_response({"ok": True, "trashed": f"{git_ops.TRASH_DIR}/{trashed}"})
 
@@ -1886,18 +2309,22 @@ async def api_note_new(request: web.Request) -> web.Response:
     vault = await require_vault(request)
     require_writable(vault)
     body = await json_body(request)
-    folder = require_folder_path(body.get("folder"))
-    directory = await vault_path(vault, folder or None)
+    folder = require_folder_path(body.get("folder"), for_new=True)
 
-    def _create_unique() -> tuple[str, str]:
+    def _create_unique() -> tuple[str, str, Path]:
         """Find a free name and create the file, in one thread.
 
-        Done in a single offloaded step for two reasons: the search is up to
-        MAX_UNTITLED stat calls, which must not run on the event loop; and
-        testing then creating in one place leaves no window for a second
-        request to take the name between the two (the exclusive-create flag is
-        what actually decides it).
+        Done in a single offloaded step for four reasons: the search is up to
+        MAX_UNTITLED stat calls, which must not run on the event loop; testing
+        then creating in one place leaves no window for a second request to
+        take the name between the two (the exclusive-create flag is what
+        actually decides it); the symlink walk runs here, right before the
+        `mkdir`, so nothing awaits between the check and the create; and the
+        destination directory is RESOLVED here, after that walk and under the
+        vault lock, so a merge cannot leave the write aimed at a stale
+        link target resolved before the lock (see `resolve_write_dir_checked`).
         """
+        directory = resolve_write_dir_checked(vault, folder or "")
         directory.mkdir(parents=True, exist_ok=True)
         for n in range(1, MAX_UNTITLED):
             name = "Untitled.md" if n == 1 else f"Untitled {n}.md"
@@ -1910,10 +2337,11 @@ async def api_note_new(request: web.Request) -> web.Response:
             # falls back to the basename), so the heading was a duplicate that
             # rendered as a headline and did not track a later rename.
             os.close(fd)
-            return name, ""
+            return name, "", directory
         raise ApiError("could not find a free note name", 409, code="no_free_note_name")
 
-    name, content = await asyncio.to_thread(_create_unique)
+    async with vault_write_lock(vault["localPath"]):
+        name, content, directory = await asyncio.to_thread(_create_unique)
     rel = f"{folder}/{name}" if folder else name
     mark_self_write(directory / name)
     cache = await get_cache(vault)
@@ -1934,14 +2362,6 @@ async def api_note_duplicate(request: web.Request) -> web.Response:
     require_writable(vault)
     body = await json_body(request)
     src_rel = require_note_path(body.get("path"))
-    src = await vault_path(vault, src_rel)
-    # Read through the central sensitive-path gate, not open(). A `.md` entry in
-    # an attached vault can be a symlink aimed at a private key; copying it would
-    # land that content INSIDE the vault, where the search index would serve it
-    # and the next sync's `git add -A` would push it to the remote.
-    content = await read_note_text(src)
-    if content is None:
-        raise ApiError(f"no such note: {src_rel}", 404, code="no_such_note")
     # Normalize the separator BEFORE deriving the name and folder. `safe_join`
     # accepts a Windows-style "dir\note.md" (it normalizes internally to validate
     # containment), but `rfind("/")` would then find no separator and
@@ -1951,11 +2371,20 @@ async def api_note_duplicate(request: web.Request) -> web.Response:
     rel_posix = src_rel.replace("\\", "/")
     stem = notes_mod.note_basename(rel_posix)
     folder = rel_posix[: rel_posix.rfind("/")] if "/" in rel_posix else ""
-    # Resolve the destination directory from the validated relative folder, so
-    # the copy can only ever be written beside its source inside the vault.
-    directory = await vault_path(vault, folder or None)
 
-    def _create_unique() -> str:
+    def _create_unique() -> tuple[str, Path]:
+        # The copy is created through the source's folder components, so the
+        # same walk, in the same thread as the create (see the helper). The
+        # destination directory is resolved here too — after the walk and under
+        # the vault lock — so the copy can only ever land beside its source
+        # inside the vault, never at a link target resolved before the lock.
+        directory = resolve_write_dir_checked(vault, folder)
+        # Resolve and read the source in this locked worker too: content read
+        # through a transient folder link must not become a tracked copy.
+        src = safe_join(content_root(vault), src_rel)
+        content = _read_note_text_sync(src)
+        if content is None:
+            raise ApiError(f"no such note: {src_rel}", 404, code="no_such_note")
         for n in range(1, MAX_UNTITLED):
             name = f"{stem} copy.md" if n == 1 else f"{stem} copy {n}.md"
             try:
@@ -1974,10 +2403,11 @@ async def api_note_duplicate(request: web.Request) -> web.Response:
                 with contextlib.suppress(OSError):
                     os.unlink(directory / name)
                 raise
-            return name
+            return name, directory
         raise ApiError("could not find a free note name", 409, code="no_free_note_name")
 
-    name = await asyncio.to_thread(_create_unique)
+    async with vault_write_lock(vault["localPath"]):
+        name, directory = await asyncio.to_thread(_create_unique)
     rel = f"{folder}/{name}" if folder else name
     mark_self_write(directory / name)
     # Rebuild rather than patch: the copy inherits the source's [[wikilinks]], and
@@ -1995,27 +2425,40 @@ async def api_note_move(request: web.Request) -> web.Response:
     require_writable(vault)
     body = await json_body(request)
     src_rel = require_note_path(body.get("from"), "from")
-    dst_rel = require_note_path(body.get("to"), "to")
+    dst_rel = require_note_path(body.get("to"), "to", for_new=True)
     if src_rel == dst_rel:
         return web.json_response({"ok": True, "path": dst_rel})
     src = await vault_mutation_path(vault, src_rel)
     dst = await vault_mutation_path(vault, dst_rel)
+
+    def _move_sync() -> tuple[Path, Path]:
+        """Check, mkdir and rename against one locked tree in one worker.
+
+        Re-derive both lexical entries after their folder walks: a scoped vault
+        must not retain a scope link's resolved target across lock acquisition,
+        and a final-component alias must move as a link rather than its target.
+        """
+        src = mutation_path_checked(vault, src_rel)
+        dst = mutation_path_checked(vault, dst_rel)
+        # `exists()` follows the link, so a DANGLING symlink at dst reads as
+        # absent and os.rename would silently replace that directory entry.
+        # `is_symlink()` catches the link itself.
+        if dst.exists() or dst.is_symlink():
+            raise ApiError(f"a note already exists at {dst_rel}", 409, code="note_already_exists")
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.rename(src, dst)
+        except FileNotFoundError as exc:
+            raise ApiError(f"no such note: {src_rel}", 404, code="no_such_note") from exc
+        return src, dst
+
     # Lock BOTH the source and destination across check-and-rename: a concurrent
     # save/delete on the source, or another move to the same destination, would
     # otherwise interleave — the source save could recreate/split the moved note,
     # or two moves could both pass the exists() check and POSIX rename would
     # silently overwrite. Sorted acquisition avoids a lock-order deadlock.
-    async with _save_locks_for(str(src), str(dst)):
-        # `exists()` follows the link, so a DANGLING symlink at dst reads as
-        # absent and os.rename would silently replace that directory entry.
-        # `is_symlink()` catches the link itself.
-        if await asyncio.to_thread(dst.exists) or await asyncio.to_thread(dst.is_symlink):
-            raise ApiError(f"a note already exists at {dst_rel}", 409, code="note_already_exists")
-        await make_dirs(dst.parent)
-        try:
-            await asyncio.to_thread(os.rename, src, dst)
-        except FileNotFoundError as exc:
-            raise ApiError(f"no such note: {src_rel}", 404, code="no_such_note") from exc
+    async with _save_locks_for(str(src), str(dst)), vault_write_lock(vault["localPath"]):
+        src, dst = await asyncio.to_thread(_move_sync)
     mark_self_write(src)
     mark_self_write(dst)
     # The path is part of index and backlink identity, so rebuild rather than patch.
@@ -2028,20 +2471,23 @@ async def api_sync(request: web.Request) -> web.Response:
     # sync commits, merges, and pushes — all writes — so a read-only vault must
     # not reach it.
     require_writable(vault)
-    result = await git_ops.sync(
-        vault["localPath"],
-        branch=vault.get("branch"),
-        pat=await resolve_auth(),
-        # Scoped vaults must only commit their own subtree — the rest of the
-        # repository is the user's unrelated work.
-        subfolder=vault.get("subfolder"),
-        # Refuse to push if the vault's remote was repointed since clone/attach.
-        trusted_remote=vault.get("remoteUrl"),
-        # Refuse if the vault's `.git` pointer was redirected since clone/attach.
-        trusted_gitdir=vault.get("gitDir"),
-        # Attached from a repo with no remote: commit locally, never push.
-        local_only=bool(vault.get("localOnly")),
-    )
+    # The merge inside rewrites the working tree; no note may be created
+    # through a folder it is replacing — see `vault_write_lock`.
+    async with vault_write_lock(vault["localPath"]):
+        result = await git_ops.sync(
+            vault["localPath"],
+            branch=vault.get("branch"),
+            pat=await resolve_auth(),
+            # Scoped vaults must only commit their own subtree — the rest of the
+            # repository is the user's unrelated work.
+            subfolder=vault.get("subfolder"),
+            # Refuse to push if the vault's remote was repointed since clone/attach.
+            trusted_remote=vault.get("remoteUrl"),
+            # Refuse if the vault's `.git` pointer was redirected since clone/attach.
+            trusted_gitdir=vault.get("gitDir"),
+            # Attached from a repo with no remote: commit locally, never push.
+            local_only=bool(vault.get("localOnly")),
+        )
     await rebuild_cache(vault)
     # Stamped here as well as in the background loop, so the backend is the single
     # writer of `lastSync` for both trigger paths. Returned alongside the result
@@ -2062,16 +2508,20 @@ async def api_commit(request: web.Request) -> web.Response:
     vault = await require_vault(request)
     # Committing writes to the repository, so a read-only vault must not reach it.
     require_writable(vault)
-    result = await git_ops.sync(
-        vault["localPath"],
-        branch=vault.get("branch"),
-        subfolder=vault.get("subfolder"),
-        # Refuse if the vault's `.git` pointer was redirected since clone/attach:
-        # that decides WHICH repository these commits land in. The remote checks
-        # are skipped inside sync() for a commit-only run — nothing is pushed.
-        trusted_gitdir=vault.get("gitDir"),
-        commit_only=True,
-    )
+    # `commit_only=True` returns before any merge, so what this serialises is the
+    # index and working-tree writes the commit itself makes: no note may be staged
+    # or written underneath them — see `vault_write_lock`.
+    async with vault_write_lock(vault["localPath"]):
+        result = await git_ops.sync(
+            vault["localPath"],
+            branch=vault.get("branch"),
+            subfolder=vault.get("subfolder"),
+            # Refuse if the vault's `.git` pointer was redirected since clone/attach:
+            # that decides WHICH repository these commits land in. The remote checks
+            # are skipped inside sync() for a commit-only run — nothing is pushed.
+            trusted_gitdir=vault.get("gitDir"),
+            commit_only=True,
+        )
     await rebuild_cache(vault)
     return web.json_response({"result": result})
 
@@ -2188,7 +2638,12 @@ async def api_pick_folder(request: web.Request) -> web.Response:
     process, so it can ask the OS and hand back what the user picked.
     """
     if not pick_folder_supported():
-        raise ApiError("folder chooser is only available on macOS", 501, code="folder_chooser_unsupported")
+        raise ApiError(
+            "the folder chooser is only available on macOS — on Windows and Linux, "
+            "paste the vault folder's absolute path into the field instead",
+            501,
+            code="folder_chooser_unsupported",
+        )
     path = await asyncio.to_thread(_pick_folder_sync)
     return web.json_response({"path": path, "cancelled": path is None})
 
@@ -2250,7 +2705,5 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s"
-    )
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
     raise SystemExit(main())

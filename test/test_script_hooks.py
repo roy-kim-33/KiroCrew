@@ -435,6 +435,24 @@ class TestRunScriptHook:
         assert env["KIROCREW_HOOK_EVENT"] == HOOK_EVENT_USER_PROMPT_SUBMIT
         assert env["KIROCREW_HOOK_CONTEXT"] == "prompt text"
 
+    def test_subprocess_env_caps_context_on_all_events(self):
+        from kiro_crew.hooks import _hook_subprocess_env
+
+        big = "x" * 200_000
+        for event in (
+            HOOK_EVENT_USER_PROMPT_SUBMIT,
+            HOOK_EVENT_AGENT_SPAWN,
+            HOOK_EVENT_PRE_TOOL_USE,
+        ):
+            hook = ScriptHook(
+                id=f"env-cap-{event}",
+                name="env-cap",
+                event=event,
+                command="echo ok",
+            )
+            env = _hook_subprocess_env(hook, big)
+            assert env["KIROCREW_HOOK_CONTEXT"] == big[:500]
+
     @pytest.mark.skipif(_IS_WINDOWS, reason="systemd user-bus wrapping is POSIX-only")
     @pytest.mark.asyncio
     async def test_subprocess_routes_allowlist_through_safe_spawn_funnel(self, monkeypatch):
@@ -451,7 +469,7 @@ class TestRunScriptHook:
             return list(argv), wrapper_env, None
 
         proc = MagicMock()
-        # Main's capped-output path (#5442) drains proc.stdout/proc.stderr via
+        # Main's capped-output path drains proc.stdout/proc.stderr via
         # _read_capped_stream(reader.read(n)) rather than proc.communicate, and
         # feeds proc.stdin then awaits proc.wait(). Model those so the funnel's
         # env assertions below run against a process that completes cleanly.

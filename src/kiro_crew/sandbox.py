@@ -1,8 +1,20 @@
 """OS-level sandbox for agent child processes.
 
-Hides sensitive credential paths (``~/.aws``, ``~/.gnupg``, etc.) from the
-kiro-cli subprocess tree and exposes ``~/.ssh/known_hosts`` while hiding
-other SSH files (keys, config, etc.), using platform-native isolation:
+Hides sensitive credential paths from the kiro-cli subprocess tree using
+platform-native isolation, per tier:
+
+- ``standard`` (what the default ``"auto"`` resolves to) masks ``~/.gnupg``,
+  ``~/.docker``, ``~/.azure``, ``~/.config/gcloud``, the crew vault and the
+  governance cache -- and DELIBERATELY leaves ``~/.aws``, ``~/.ssh`` and
+  ``~/.kube`` visible so the aws CLI, ``credential_process``, git-over-SSH and
+  kubectl keep working inside the agent (see ``_STANDARD_DIRS``). The file
+  tools still refuse those paths through ``is_sensitive_path``; a spawned
+  shell's ``open()`` is not fenced at this tier.
+- ``strict`` masks all of the above plus ``~/.aws``, ``~/.kube``,
+  ``~/.config/gh`` and ``~/.ssh`` (exposing only ``~/.ssh/known_hosts``).
+- ``cc`` is the Claude Code backend's tier: ``strict`` minus ``~/.ssh`` and
+  ``~/.config/gh``, with a read-only copy of ``~/.aws/config`` exposed for
+  Bedrock auth.
 
 - **Linux**: fork → ``unshare(CLONE_NEWUSER)`` → parent writes identity
   UID/GID map → ``unshare(CLONE_NEWNS)`` → bind-mount empty dirs → exec.
@@ -13,8 +25,9 @@ The parent KiroCrew process is completely unaffected — isolation applies
 only to the spawned child.  Falls back gracefully to no sandbox when the
 OS mechanism is unavailable (logged as warning).
 
-Config: ``"sandbox": "auto" | "off"`` in ``~/.kiro/crew/config.json``.
-``"auto"`` (default) uses namespace sandbox on Linux, seatbelt on macOS.
+Config: ``"sandbox": "auto" | "strict" | "off"`` in ``~/.kiro/crew/config.json``.
+``"auto"`` (default) uses the standard-tier namespace sandbox on Linux and
+seatbelt on macOS; ``"strict"`` is the opt-in tier that also hides ``~/.aws``.
 """
 
 from __future__ import annotations
@@ -26,6 +39,7 @@ import ctypes.util
 import errno
 import functools
 import hashlib
+import importlib
 import json
 import logging
 import os
@@ -33,21 +47,32 @@ import re
 import select
 import shlex
 import shutil
+import socket
 import stat
 import subprocess
 import sys
+import sys as _sys
 import tempfile
 import threading
 import time
+import urllib.parse
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from types import ModuleType
+from typing import TYPE_CHECKING, Literal, NamedTuple
 
-from kiro_crew import platform_compat
-from kiro_crew.config.paths import config_dir
-from kiro_crew.constants import KIROCREW_SPAWNED_ENV, KIROCREW_SPAWNED_VALUE
+from kiro_crew import platform_compat, sandbox_launcher, sandbox_mount_sweep, sandbox_seatbelt
+from kiro_crew.atomic_write import fsync_dir, refuse_linked_parent
+from kiro_crew.config.paths import config_dir, kiro_agents_dir
+from kiro_crew.constants import (
+    KIROCREW_SANDBOX_TOOL_ENV,
+    KIROCREW_SANDBOX_TOOL_VALUE,
+    KIROCREW_SPAWNED_ENV,
+    KIROCREW_SPAWNED_VALUE,
+)
 from kiro_crew.identity_stores import AUTH_SQLITE_DB, AUTH_SQLITE_SIDECAR_SUFFIXES
 from kiro_crew.pinned_fs import fd_real_path
 from kiro_crew.platform import current_context
+from kiro_crew.terminal_safe import safe_terminal_line
 
 try:
     import resource as _resource_mod
@@ -55,7 +80,7 @@ except ImportError:  # non-POSIX (Windows)
     _resource_mod = None  # type: ignore[assignment]
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping, Sequence
+    from collections.abc import Callable, Iterable, Mapping, Sequence
     from concurrent.futures import ThreadPoolExecutor
     from typing import Any
 
@@ -65,73 +90,41 @@ logger = logging.getLogger(__name__)
 # Any file older than this threshold is garbage regardless of PID liveness.
 _LAUNCHER_MAX_AGE_SECONDS = 3600
 
-# Bind-mount SOURCES staged by the namespace launcher (empty dirs/files bound
-# over credential paths, plus the SSH shadow dir). The kernel pins a source for
-# the mount's lifetime, so the launcher cannot unlink them and they orphan when
-# the sandboxed process exits. The launcher names them with this prefix plus
-# its own pid ("kirocrew_sb_<pid>_..."); the pid is the liveness key the
-# janitor probes. The age threshold backstops recycled pids for the removals
-# that stay safe against a live mount (plain files and empty dirs).
-_MOUNT_SOURCE_PREFIX = "kirocrew_sb_"
-_MOUNT_SOURCE_MAX_AGE_SECONDS = 24 * 3600
-
-# Pin-scan stabilization budget: a mount-namespace holder can fork a successor
-# and exit between the /proc listing and its own mountinfo read, so a pass
-# that observed a vanish rescans newly appeared pids; past this many passes
-# coverage is reported as unproven instead of looping.
-_PIN_SCAN_MAX_PASSES = 3
-
-
-class _PinScanCoverage:
-    """Whether the pin scan read every task that could hold a sandbox source.
-
-    Filled by :func:`_mount_pinned_source_names` beside its host-wide
-    ``complete`` flag. That flag drops for reasons that cannot involve a
-    sandbox source -- another user's unreadable task, or one departing on the
-    final pass -- and on a busy host it can stay down indefinitely, which is
-    how the directory class came to accumulate without bound. ``covered`` asks
-    the narrower question the gate needs: was every task that could hold a
-    source this uid staged read, and did none depart between the final
-    listing and its read? Those are this uid's tasks (the sandboxed child
-    keeps this uid with NO_NEW_PRIVS), the overflow uid's (how a nested user
-    namespace stats) and root's (root can ``nsenter`` any namespace) -- so a
-    ``hidepid`` procfs, which hides root's tasks, clears it too. A task that
-    departs on the FINAL pass may have handed its namespace to a child forked
-    after that listing, which only a re-listing could have seen and none
-    followed, so such a departure clears ``covered``; one on an earlier pass
-    was followed by a re-listing and is accounted for. When ``covered`` holds
-    the pinned set is authoritative for every possible holder.
-    """
-
-    __slots__ = ("covered",)
-
-    def __init__(self) -> None:
-        self.covered = True
-
-
-def _task_uid(proc_root: str, name: str) -> int | None:
-    """The uid ``/proc/<name>`` stats as, or None once it is gone."""
-    try:
-        return os.stat(os.path.join(proc_root, name)).st_uid
-    except OSError:
-        return None
-
-
-# The overflow uid: what /proc/<pid> stats to for a process whose uid has no
-# mapping in the reader's user namespace. Such a holder CAN be binding our
-# sources, so it is a coverage gap, not a foreign user. The value is a
-# writable sysctl, so it is read from the host; an unreadable sysctl answers
-# None, and the scan then treats EVERY unreadable non-own uid as a gap.
-_OVERFLOW_UID_SYSCTL = "/proc/sys/kernel/overflowuid"
-
-
-@functools.lru_cache(maxsize=1)
-def _overflow_uid() -> int | None:
-    try:
-        return int(Path(_OVERFLOW_UID_SYSCTL).read_text().strip())
-    except (OSError, ValueError):
-        return None
-
+#: Artifact families the sweep reclaims, by filename prefix -> accepted
+#: suffixes. Every family tags the writing process's PID after the prefix.
+_SANDBOX_ARTIFACT_PREFIX = "kirocrew_sandbox_"
+#: The two artifacts written under that prefix, each named once. Three readers depend on
+#: these agreeing: the ``mkstemp`` calls that write them, the run-dir sweep's accepted
+#: suffixes below, and ``session_pid``'s managed-agent gate, which imports both to tell
+#: the Linux launcher apart from the macOS seatbelt profile sitting beside it under the
+#: same prefix.
+_LAUNCHER_SCRIPT_SUFFIX = ".py"
+_SEATBELT_PROFILE_SUFFIX = ".sb"
+_PI_GATE_ARTIFACT_PREFIX = "kirocrew_pi_gate_"
+# Named ONCE because two sweeps accept this family: the run dir still holds artifacts
+# written before they moved, and the gate dir holds the current ones. Two spellings could
+# drift and leave one of those directories unswept. ``.tmp`` is the mkstemp stage both pi
+# artifacts pass through before publication.
+_PI_GATE_ARTIFACT_SUFFIXES: tuple[str, ...] = (".sh", ".cmd", ".ts", ".tmp")
+_RUN_DIR_ARTIFACTS: dict[str, tuple[str, ...]] = {
+    _SANDBOX_ARTIFACT_PREFIX: (_SEATBELT_PROFILE_SUFFIX, _LAUNCHER_SCRIPT_SUFFIX),
+    # The run sweep accepts pi artifacts as well as sandbox launchers.
+    _PI_GATE_ARTIFACT_PREFIX: _PI_GATE_ARTIFACT_SUFFIXES,
+}
+# The DeepSeek Harness gate shares the pi-gate leaf: the sealed plugin
+# (``kirocrew_dsh_gate_<pid>.mjs``), its per-launch patch
+# (``kirocrew_dsh_gate_<pid>.patch.yml``) and the mkstemp stages both are
+# renamed from (``kirocrew_dsh_gate_<pid>_*.tmp`` / ``kirocrew_dsh_patch_<pid>_*.tmp``).
+# Like the pi artifacts they are written once per gateway process and reused, so
+# the PID in the name is the owner's own and liveness, not age, decides staleness.
+_DSH_GATE_ARTIFACT_PREFIX = "kirocrew_dsh_gate_"
+_DSH_PATCH_ARTIFACT_PREFIX = "kirocrew_dsh_patch_"
+_DSH_GATE_ARTIFACT_SUFFIXES: tuple[str, ...] = (".mjs", ".patch.yml", ".tmp")
+_PI_GATE_DIR_ARTIFACTS: dict[str, tuple[str, ...]] = {
+    _PI_GATE_ARTIFACT_PREFIX: _PI_GATE_ARTIFACT_SUFFIXES,
+    _DSH_GATE_ARTIFACT_PREFIX: _DSH_GATE_ARTIFACT_SUFFIXES,
+    _DSH_PATCH_ARTIFACT_PREFIX: (".tmp",),
+}
 
 # Legacy sandbox launcher directory (before migration to <config_dir>/run/).
 _LEGACY_LAUNCHER_DIR = "/tmp"
@@ -188,8 +181,82 @@ _CREW_HOME_PREFIXES: tuple[str, ...] = (".kiro/crew", ".kirocrew")
 # in none of them. Spelled here rather than imported so this low-level module keeps not
 # importing the 7k-line security module (the ``_POLICY_CACHE_LEAF`` convention above).
 
+#: The live-target pointer's file name under the crew data home.
+#:
+#: The pointer names the checkout the gateway execs into at startup, so it is masked from
+#: EVERY sandboxed process — including Dev Fleet's own backend, whose cutover runs in the gateway.
+#: That backend is a sandboxed spawn whose ``npm ci`` / build children run inside the same
+#: namespace (a nested sandbox is denied by design), so any leaf it could reach, a
+#: worktree's lifecycle script could reach too. The cutover therefore runs in the gateway
+#: process (``dev_fleet/gateway_routes.py``) and the mask here stays whole; what this
+#: module adds is a MOUNT TARGET for it (:func:`_materialize_live_target_mask_target`), so
+#: the mask is never vacuous on a host that has not pinned a target yet. Spelled here
+#: rather than imported from ``service.live_target`` to keep this low-level module free of
+#: that import chain; ``test_sandbox_dev_fleet_live_target.py`` pins the spellings equal.
+_LIVE_TARGET_LEAF: str = "live_target.json"
+#: The masked DIRECTORY the pointer's absent-equivalent stub is staged in before it is
+#: linked into place. Staging beside the target — in the data-home root — would put the
+#: temp at a name every sandbox can see: a concurrent namespace could ``link(2)`` it and
+#: keep a second, writable path to the inode the gateway later reads, and a bind mask
+#: covers a PATH, not an inode. A hidden directory covers every name inside it, present
+#: and future, so the temp is never visible; :func:`_materialize_live_target_mask_target`
+#: additionally refuses any pointer whose link count is not exactly one. Same shape and
+#: reason as ``_MD_NOTEBOOK_STAGING_LEAF`` / ``aws-control-staging``.
+_LIVE_TARGET_STAGING_LEAF: str = "live-target-staging"
+
+#: The masked DIRECTORY the gateway's own auth stores are staged in before they are
+#: published. ``token_signing.key`` and ``refresh_chains.json`` are masked as individual
+#: FILES, and a mask covers a PATH rather than an inode, so a temp staged BESIDE either of
+#: them sits in the data-home root -- which is writable in-sandbox -- under a name no mask
+#: covers. A same-uid agent that lists that root while a write is in flight can ``link(2)``
+#: the temp and keep reading the bytes after the publish rename, and the spawn-time
+#: :data:`_CREW_HARDLINK_REFUSED_LEAVES` check cannot see it: that check runs before a
+#: spawn, while this window opens during one. A crash between write and publish leaves the
+#: same unmasked file on disk holding the same bytes.
+#:
+#: A directory mask covers every name inside it, present and future, so both the staging
+#: window and a crash orphan are covered. Same shape and reason as
+#: :data:`_LIVE_TARGET_STAGING_LEAF`, :data:`_MD_NOTEBOOK_STAGING_LEAF` and
+#: ``aws-control-staging``; the gateway process is the only writer, so unlike md-notebook it
+#: needs no backend carve-out to hand the directory back to a sandboxed app.
+_AUTH_STORE_STAGING_LEAF: str = "auth-store-staging"
+
+#: The md-notebook builtin's name, and its own state files under the crew data home.
+#: Named so the mask, the backend carve-out that lifts it, and the materialiser that
+#: gives it a mount target cannot drift apart on a literal.
+MD_NOTEBOOK_APP_NAME: str = "md-notebook"
+_MD_NOTEBOOK_STATE_LEAVES: tuple[str, ...] = (
+    f"workspace/{MD_NOTEBOOK_APP_NAME}/pat",
+    f"workspace/{MD_NOTEBOOK_APP_NAME}/vaults.json",
+    f"workspace/{MD_NOTEBOOK_APP_NAME}/settings.json",
+)
+#: The backend's write-staging directory, masked as a WHOLE DIRECTORY like ``whatsapp``.
+#: Every md-notebook state writer stages its temp file HERE and renames onto its target,
+#: because a temp staged BESIDE the target carries the real PAT bytes under a name the
+#: three leaf masks do not cover — and a SIGKILL between write and rename leaves that
+#: unmasked sibling readable by a same-uid sandboxed agent forever. A directory mask
+#: covers every name inside it, present and future, so the staging window and any crash
+#: orphan both stay masked.
+#:
+#: A TOP-LEVEL leaf, for the same reason ``aws-control-staging`` is one: a mask covers the
+#: leaf, not its ancestors, so a staging dir under the agent-writable
+#: ``workspace/md-notebook`` could be renamed out from under its own mask and a later PAT
+#: write would publish through the replacement, unmasked, into a live agent's view. It
+#: stays on the same filesystem as the state files (both under the crew data home), so the
+#: publish rename is still atomic.
+_MD_NOTEBOOK_STAGING_LEAF: str = f"{MD_NOTEBOOK_APP_NAME}-staging"
+
 #: Crew-home leaves with no legitimate in-sandbox reader — bind-masked in every mode.
 _CREW_HIDDEN_LEAVES: tuple[str, ...] = (
+    # Gateway diagnostics: recorded host and gateway state, plus loop-stall dumps.
+    # The gateway process writes these; an agent reads them through the owner-gated
+    # /api/debug routes and the kirocrew-debug MCP tools, which redact on the way
+    # out. The raw rows do not: they carry frame labels, folded stacks and process
+    # detail that the read path scrubs, so a sandboxed session reading the files
+    # directly would collect exactly what the routes exist to filter. Whole
+    # DIRECTORY rather than a leaf file, because the day files rotate by name and
+    # the append pins the directory itself.
+    "diag",
     # Channel credentials. Already file-masked in cc/strict via ``_CC_FILES``; listing
     # it here extends the same treatment to standard, where a spawned command could
     # otherwise read every Slack/Discord token off disk.
@@ -197,11 +264,97 @@ _CREW_HIDDEN_LEAVES: tuple[str, ...] = (
     # App data holding live credentials or owner-authorization bits. Whole DIRECTORY,
     # not the leaf file, because an atomic write renames a sibling temp into place.
     "apps/aws-control/data",
+    # Gateway-owned transfer staging for the aws-control app: the AWS CLI lands
+    # object bytes here before the gateway reads them back. Masked so a same-UID
+    # agent cannot swap a destination for a link between the gateway's create
+    # and the CLI's open; the CLI spawn that must write into it names its
+    # per-call directory in ``extra_visible_dirs``, which lifts the mask for
+    # that one fixed-argv child only. A TOP-LEVEL leaf rather than one under
+    # ``apps/aws-control/``: a mask covers the leaf, not its ancestors, and an
+    # agent-writable ancestor could be renamed out from under it mid-transfer.
+    "aws-control-staging",
+    # Restart-surviving vouches (``kiro_crew._durable_vouch``). Each file is the
+    # gateway's word that a session may reach its member's private store, so a
+    # sandboxed writer could forge admission to a peer member's memory. Only the
+    # unsandboxed gateway reads or writes it. Deliberately NOT under ``trust/``,
+    # which stays read-write for the SEL log.
+    "vouched-executions",
+    # Quarantine markers for auto-improvement clones whose provisional rollback AND
+    # retirement both failed. Each marker is the only durable record that a clone still
+    # carrying a REFUSED, unscanned commit must never be reused, and the process it has to
+    # outlive is an agent's: masked so a reviewer's shell cannot plant, rewrite or delete
+    # one. Nothing in-sandbox reads it -- the marker is written and consulted host-side by
+    # `auto_improvement.backend.clone_setup` -- so HIDDEN rather than READONLY. A TOP-LEVEL
+    # leaf for the `aws-control-staging` reason: a mask covers the leaf, not its ancestors,
+    # and a marker under `apps/auto-improvement/data/` would sit below a directory an agent
+    # can rename out from under the mount.
+    "quarantined-clones",
     "apps/meetings/data/edits",
     "whatsapp",
-    "workspace/md-notebook/pat",
-    "workspace/md-notebook/vaults.json",
-    "workspace/md-notebook/settings.json",
+    # The refused-inbound spool. Fenced from agent FILE TOOLS by
+    # ``security._CREW_SECRET_LEAVES``; masked here so a spawned command cannot
+    # reach it either -- an entry an agent could write is posted on the next
+    # start, verbatim, as a gateway-authored notice into the conversation it
+    # names. Whole directory, because the spool is written by atomic replace via
+    # a sibling temp name, and because the lock file beside it is what serializes
+    # concurrent refusals. Nothing inside the sandbox reads or writes it: both
+    # the spool write and the notice pass happen in the GATEWAY process, which
+    # opens the paths directly.
+    "inbound-spool",
+    # The durable task queue (``tasks/tasks.db`` + SQLite siblings). Fenced
+    # from agent file tools by ``security._CREW_SECRET_LEAVES``; masked here so
+    # a spawned shell's ``sqlite3`` cannot read other sessions' task prompts or
+    # rewrite their rows. Whole directory (WAL/journal/shm siblings). Nothing
+    # in-sandbox touches it: the subagent manager, the runner adapters and
+    # ``/api/tasks`` all live in the gateway process and open it directly.
+    "tasks",
+    # The per-process scratch root (``agent_scratch``): every kiro-cli session
+    # and every shared runtime gets ``<home>/scratch/<label>-<rand>`` as its
+    # ``TMPDIR``. Masked as a WHOLE so one session tree cannot open another's
+    # scratch; each spawn passes its OWN directory back through
+    # ``extra_private_dirs`` (``acp/client.py``, ``acp/runtime.py``) -- a
+    # window INSIDE the mask, not a lift of it -- and a spawn made on behalf of
+    # an existing session tree (a companion runtime, a dedicated subagent
+    # process, a recycled runtime's successor) passes the TREE's work directory
+    # as a second such window, so ``$KIROCREW_SCRATCH`` names one place for the
+    # whole tree. Siblings from other trees stay hidden either way.
+    "scratch",
+    # The cross-process work root (``work_root``): ``<home>/work/<key>``, for
+    # state that must OUTLIVE the process that created it. Masked as a whole and
+    # given NO window, which is the difference from ``scratch`` above: the only
+    # caller that may allocate is UNSANDBOXED gateway code (the maintenance
+    # sweep), and no environment variable names the root. The other two classes
+    # that plausibly want durable state do NOT qualify and must not be told
+    # otherwise -- a script cron's ``boot_platform()`` shares the agent's mount
+    # namespace (see the reconciliation note above) and an app backend is itself a
+    # sandboxed spawn -- so each is served the way the Notes state files below
+    # are: whatever SPAWNS it allocates host-side and passes that one key
+    # directory back as a window, never a lift of the mask. Leaving the mask
+    # window-less is what keeps the failure honest: on Linux the mask is a
+    # WRITABLE empty tmpfs bind, so an in-sandbox allocation would otherwise
+    # succeed and lose its bytes with the namespace.
+    # Keys are deterministic by design -- an
+    # issue or pull-request number, so a later run finds the directory again --
+    # so an unmasked root would let one session tree guess a name and rewrite
+    # another job's in-flight clone, a sharper hazard than the random-suffixed
+    # scratch names carry. The mask alone would be VACUOUS here, which is why this
+    # leaf appears in two more places: the root is created lazily by the first
+    # ``allocate_work`` call, so it is also in ``_CREW_PRECREATE_HIDDEN_DIR_LEAVES``
+    # (the loop below binds nothing over an absent name), and it is in
+    # ``security.paths`` so the file tools refuse it too. All three, because each
+    # one alone leaves a different path open.
+    "work",
+    # The Notes state files below are OWNED by the md-notebook backend, which is itself
+    # a sandboxed spawn (`apps/backend.py`), so the mask alone would break the app: the
+    # registry write's final rename gets EPERM and attach/clone always fails.
+    # The backend spawn therefore passes them back as ``extra_visible_dirs`` via
+    # :func:`app_backend_visible_targets` — the mask still applies to every OTHER
+    # sandboxed process, which is the population it exists to fence.
+    *_MD_NOTEBOOK_STATE_LEAVES,
+    # The staging directory those three writers publish through. Masked as a whole
+    # DIRECTORY so the in-flight temp — which holds the same bytes as the leaves above,
+    # PAT included — and any crash orphan are covered at every name, present and future.
+    _MD_NOTEBOOK_STAGING_LEAF,
     # Browser session material. The extension token reaches the CLI through the
     # environment, never by ``open()``, so masking the file costs nothing; the other
     # four are retired leaves with no reader left in the tree. The LIVE browser paths
@@ -216,7 +369,39 @@ _CREW_HIDDEN_LEAVES: tuple[str, ...] = (
     # enforced by the HTTP routes. Every legitimate reader goes through the gateway, so
     # OS-masking closes the sideways path without touching a live consumer.
     "ledger",
+    # The conductor work ledger: a worker's full file toolset must not reach any
+    # conductor's records except through the routes that check its binding.
+    "work-ledger",
+    # Every append-only per-unit crew log, crew and session alike (crew_log/store.py).
+    # The design treats the crew log as the authority a conductor reads instead of
+    # re-deriving, so an in-sandbox process able to write here could forge an
+    # entry attributed to the gateway or rewrite the history it is reporting
+    # into. The library's write rules bind only callers who go through it, and the
+    # file-tool fence answers only the agent's own tools -- neither answers a
+    # sandboxed subprocess calling ``open()``, which is what this entry is for.
+    # Nothing in-sandbox reads one: the store runs in the GATEWAY process, so
+    # HIDDEN rather than READONLY. Named at the shared ``crew-log`` root, so a
+    # future unit kind is covered without a new entry.
+    "crew-log",
+    # The RETIRED root, for the reason its file-tool fence is kept: this rename
+    # ships no migration, so entries an older build wrote under ``<home>/ledgers``
+    # are still on disk and would lose their OS mask on upgrade. Deliberately NOT in
+    # ``_CREW_PRECREATE_HIDDEN_DIR_LEAVES``: that set exists for a root the store
+    # creates LAZILY, and nothing creates this one any more, so there is no writer to
+    # race. Precreating it would re-materialise the retired name on every machine.
+    "ledgers",
     "cron-history",
+    # The single-use step-up nonce that authorizes recording a flagged-file
+    # delivery grant. Whole DIRECTORY (arm renames a sibling ``.tmp`` into place),
+    # with NO in-sandbox reader: the gateway writes it on arm and the host
+    # ``kirocrew file-delivery approve`` reads it. Masked because a same-UID agent
+    # could otherwise FORGE a nonce here with a runtime-constructed shell path
+    # (the file gate's text/argv matcher does not see such a path) and then drive
+    # the owner's loopback browser to POST that chosen nonce, recording a grant
+    # with no human present -- the exact self-approval hole the step-up exists to
+    # close. Deliberately NOT under ``trust/``, which is sandbox-visible for SEL
+    # appends.
+    "file-delivery-consent-pending",
     # The cron in-flight markers, masked rather than sealed read-only because
     # nothing in the sandbox reads one: they are written and cleared by the run
     # task in the GATEWAY process, and the boot-time loop-stall breaker that acts
@@ -224,15 +409,83 @@ _CREW_HIDDEN_LEAVES: tuple[str, ...] = (
     # in-sandbox ``mcp_cron`` service is a store accessor and never starts.
     "cron-running",
     "workflow_library",
+    # The crew appearance library: user-imported packs a crew wears. Written and
+    # read only by the GATEWAY (the owner-gated ``/api/appearances`` routes); no
+    # in-sandbox code opens it. Left visible, a sandboxed agent could ``rm -rf``
+    # packs the user cannot get back -- the same data-loss class ``backup`` and
+    # ``workflow_library`` are masked for.
+    "appearance-library",
+    # The chat_tag authorization store (grant rows saying which tags an agent
+    # may self-apply). It governs what the AGENT is allowed to do, so it must
+    # not be writable by the population it governs — and ``trust/`` cannot
+    # host it, because that directory stays sandbox read-write for the SEL
+    # appends above. Written and read only by the GATEWAY (dashboard tag CRUD
+    # + the chat_tag applier); no in-sandbox code opens it.
+    "tag-grants",
     "agentcore-inbound",
     "routing",
     "webhooks",
-    "live_target.json",
+    # The live-target pointer: it names the checkout the gateway ``execve``s into at
+    # startup, so a sandboxed process that could write it would choose the code the
+    # whole host runs next. Masked from Dev Fleet's OWN backend as well — that spawn's
+    # build children share its namespace, so a carve-out for it is a carve-out for any
+    # worktree's lifecycle script. The only writer is the gateway process (Dev Fleet's
+    # in-gateway cutover route); the backend reads pointer state through that route.
+    # Given a mount target before every spawn by
+    # :func:`_materialize_live_target_mask_target`, because an ABSENT file cannot be
+    # masked and the data-home root is writable in-sandbox.
+    _LIVE_TARGET_LEAF,
+    # Where that pointer's absent-equivalent stub is staged before being linked in; a
+    # whole-directory mask so the in-flight temp is never a visible, linkable name.
+    _LIVE_TARGET_STAGING_LEAF,
     "backup",
     "mcp-apps",
+    # Published crew webview records. Same model as the entries above, and named
+    # here rather than under ``trust/`` for a specific reason: ``trust`` is a
+    # declared READ-WRITE exception below (in-sandbox ``verify_session_pid`` reads
+    # ``trust/sel_hmac.key`` and the in-sandbox MCP servers append to the audit
+    # log), so a record under it stayed writable by a sandboxed command that built
+    # the path at runtime -- defeating command matching, which has no literal path
+    # to match. Masking costs no live consumer: the publishing MCP tool does not
+    # import the store at all, it POSTs to ``/api/agent-panel/publish``, so the
+    # gateway process is the only writer and the only reader.
+    #
+    # Listed in ``_CREW_PRECREATE_HIDDEN_DIR_LEAVES`` too, because on Linux the
+    # mask is a bind mount and the loop guards on ``isdir`` -- an absent directory
+    # is SKIPPED, which on a fresh install is exactly the disposition this entry
+    # exists to deny.
+    "crew-panels",
+    # Subagent panel dismissals (``subagent_persistence``): one file per run whose
+    # finished card the operator dismissed. Exactly the same shape as
+    # ``crew-panels`` and here for the same reason rather than under ``trust/``:
+    # the record is an OWNER decision about what the panel hides, so a sandboxed
+    # process that built the path at runtime must not be able to forge one (hiding
+    # a run nobody dismissed) or unlink one (resurrecting a cleared card), and
+    # ``trust`` stays sandbox read-write for SEL. Masking costs no live consumer:
+    # the gateway is the only writer (the dismiss route and the manager settle) and
+    # the only reader (the panel's durable rebuild).
+    #
+    # In ``_CREW_PRECREATE_HIDDEN_DIR_LEAVES`` too, because the directory is created
+    # on the FIRST dismissal -- so on a fresh install the ``isdir`` guard would skip
+    # it and the mask would be vacuous for the life of that sandbox, which is
+    # precisely the disposition this entry exists to deny.
+    "panel-dismissals",
+    # Crewmate teams (``crew_teams.py``): which crewmates are on which team. The
+    # same shape as ``crew-panels`` and for the same reason it is not under
+    # ``trust/``: a team is the OWNER's grouping, so the crewmates it groups must
+    # not be able to rewrite it, and ``trust`` stays sandbox read-write. Two
+    # owner-invoked writers open it, neither sandboxed: the gateway (the
+    # owner-gated ``/api/teams`` routes, the crew create/delete/package-sync
+    # hooks) and ``kirocrew agent create`` / ``delete`` from the operator's shell. Whole
+    # directory: ``atomic_write`` publishes through a sibling temp.
+    "crew-teams",
     # Auth stores and signing keys owned by the gateway web server alone.
     "token_signing.key",
     "refresh_chains.json",
+    # The staging directory those two publish through. Masked as a whole DIRECTORY so the
+    # in-flight temp -- which holds the same key and chain-state bytes as the two leaves
+    # above -- and any crash orphan are covered at every name, present and future.
+    _AUTH_STORE_STAGING_LEAF,
     "kas",
     "ops_mission_control_secrets.json",
     "ops_mission_control_policy.json",
@@ -251,10 +504,34 @@ _CREW_HIDDEN_LEAVES: tuple[str, ...] = (
     *(f"{AUTH_SQLITE_DB}{suffix}" for suffix in AUTH_SQLITE_SIDECAR_SUFFIXES),
 )
 
-#: Crew-home CEILINGS: read by in-sandbox code, never writable by it. Exposed
-#: read-only rather than hidden — see the READONLY note above for why hiding a
-#: ceiling inverts its effect.
+#: Hidden leaves whose Linux mask must refuse the read instead of answering it empty.
+#:
+#: The Linux mask is an empty file bound over the real one, so a sandboxed ``rsync``,
+#: ``cp -a`` or ``tar`` of the data home reads zero bytes and copies them as the file's
+#: contents. For ``token_signing.key`` that copy is permanent damage: the gateway never
+#: overwrites an existing key (``token_secret._load_or_create_secret`` only creates one
+#: with ``O_EXCL`` or a non-clobbering link), so a destination that receives the empty
+#: copy signs with an ephemeral secret on every boot. An unreadable mask makes the copy
+#: fail loudly instead: rsync reports ``Permission denied``, leaves the destination's
+#: key untouched and exits 23. The macOS backend already denies this read, so this is
+#: the same answer on Linux. Nothing in a sandbox reads the key; the gateway, which
+#: does, runs outside it.
+_CREW_UNREADABLE_MASK_LEAVES: frozenset[str] = frozenset({"token_signing.key"})
+assert _CREW_UNREADABLE_MASK_LEAVES <= set(_CREW_HIDDEN_LEAVES)
+
+#: Crew-home ceilings and gateway-managed data: readable by sandboxed code,
+#: never writable by it. See the READONLY note above for why hiding a ceiling
+#: inverts its effect; named memory stores need write integrity, not secrecy.
 _CREW_READONLY_LEAVES: tuple[str, ...] = (
+    # Gateway-owned run records restore app authorization on cold continuation.
+    # Keep results readable, but agent code must not rewrite its app owner.
+    # The second root holds the same authority for retained V1 runs only.
+    "subagents",
+    "member-memory-bindings",
+    # Built-in named-store writes run in the gateway. Keep arbitrary sandboxed
+    # code from rewriting that learning authority while allowing reads; this
+    # ordinary sandbox rule is not a cross-member confidentiality boundary.
+    "memory_stores",
     # The governance ceiling and its trust root. ``boot_platform()`` resolves both
     # inside the sandbox for a script cron, and an absent file means "no ceiling".
     "security_policy.json",
@@ -269,6 +546,114 @@ _CREW_READONLY_LEAVES: tuple[str, ...] = (
     "computer_use.json",
     "oauth_endpoints.json",
     "aws_service_consent.json",
+    # The runtime config and its overlay. They are ordinary settings files, but they
+    # also carry the switches that LOOSEN confinement -- ``agent.sandbox`` (``"off"``
+    # skips this very sandbox for every later spawn), ``agent.apps_allow_third_party`` /
+    # ``agent.apps_trusted`` (admit app code the gateway runs in-process, outside any
+    # sandbox), ``agent.sandbox_allow_unsandboxed_exec``, ``agent.approval_mode``. The
+    # loader's load-time clamp neutralises an inflated number, not a loosened switch, and
+    # ``is_sensitive_write_path`` fences only the file-edit tool: a spawned shell's
+    # ``open(..., "w")`` reaches the file however the write is spelled, so only a kernel
+    # denial holds. Both files are sealed because ``KiroCrewConfig.load()`` deep-merges
+    # ``config.local.json`` OVER ``config.json``, so sealing one leaves the setting
+    # writable through the other. Every legitimate writer -- the dashboard config API,
+    # the channel handlers, the gateway's boot-time default and migrations, and
+    # ``kirocrew config`` from the operator's own terminal -- runs outside the sandbox;
+    # reads stay open, and an in-sandbox ``kirocrew config set`` fails with a pointer to
+    # those surfaces (``cli_config``). The ``<leaf>.lock`` sidecar stays writable: it
+    # carries no setting, and the vector-memory publish takes it from wherever it runs.
+    "config.json",
+    "config.local.json",
+    # Recorded consent to send conversation state to the external decision
+    # provider. Same class as ``aws_service_consent.json``: a writable grant lets
+    # an auto-approved agent switch on, for itself, the egress of the messages it
+    # is being prompt-injected through. The read-only mount is the load-bearing
+    # half; the shell gate matches no paths.
+    "decisions_consent.json",
+    # The decision log that keystone's feature writes. Sealing the grant and
+    # leaving the RECORD writable would be half a control: an agent that cannot
+    # switch the seam on can still append a ``kind="feedback"`` line -- the exact
+    # shape ``decisions.log.build_feedback_row`` produces -- and the owner's own
+    # summary would count a verdict nobody gave. A top-level DIRECTORY, like
+    # ``profiles``: read stays open (a directory bind shows live contents, so a
+    # day-file written later is visible), and every legitimate writer is the
+    # gateway, outside the sandbox. Nothing writes a decision row from inside one.
+    "decisions",
+    # The hosts a reader allowed long-query links for, per workspace. Every entry
+    # relaxes the exfiltration check for that host, so a writable list lets a
+    # prompt-injected agent allow the host it wants to send conversation data to.
+    # A top-level DIRECTORY for the ``decisions`` reasons: the gateway is the only
+    # writer, an empty directory reads as "no host allowed", and a directory bind
+    # shows the gateway's later writes live.
+    "redaction-allow",
+    # Recorded consent to deliver a scanner-flagged file. Same class as
+    # ``aws_service_consent.json``: a writable grant lets an auto-approved agent
+    # consent, on the owner's behalf, to shipping the owner's secrets. This seal is
+    # the load-bearing half of that design -- ``is_sensitive_path`` covers the leaf
+    # on the file-tool path, but the shell gate matches no paths at all, and as the
+    # READONLY note above says a kernel write denial is what holds regardless of
+    # how a command spells the way there.
+    "file_delivery_consent.json",
+    # Recorded consent to forward SSH_AUTH_SOCK into the sandbox. Same class as
+    # ``aws_service_consent.json``: keeping the socket grants USE of the operator's
+    # ssh-agent keys for the session, so a writable enable lets a prompt-injected
+    # agent flip its own forwarding on and a subagent it spawns then authenticates
+    # as the operator. This kernel write-denial is the load-bearing half --
+    # ``is_sensitive_path`` covers the leaf on the file-tool path, but the shell
+    # gate matches no paths, so the read-only mount is what holds regardless of how
+    # a command spells the way there.
+    "ssh_auth_sock_consent.json",
+    # The owner's credential-redaction switch. Same class as the consent
+    # records above: a writable record lets a prompt-injected agent switch off
+    # the credential pass in the owner's dashboard file viewer, the one surface
+    # the switch governs.
+    # A missing or unreadable file reads as ON, so this kernel write-denial is
+    # what keeps the switch the owner's regardless of how a command spells the
+    # way there.
+    "credential_redaction.json",
+    # The browser launcher and its vendored Node package tree. Agent browser
+    # commands must read and execute this directory, while a write would choose
+    # the binary the unsandboxed gateway executes during startup reclamation or
+    # an owner address-bar launch. The gateway installer runs outside the agent
+    # sandbox, so it can still replace the managed copy.
+    "playwright-cli",
+    # The cloud launcher's config. In-sandbox code READS it (the provisioner selector calls
+    # ``CloudConfig.load()``, and so does the launch record's legacy fallback, which every
+    # ``cloud`` verb reaches through ``LaunchState.load``), and a WRITE would let an
+    # agent choose the container image a Fargate launch runs -- the task's execution
+    # role delivers the model credential into that image before it starts, so a
+    # rewritten ``fargate.image`` turns the owner's next launch into credential
+    # delivery to an image the owner never chose. The digest rule constrains the
+    # reference's FORM, not who owns the registry, so it is no obstacle. Same
+    # both-layers treatment ``playwright-cli`` gets, for the reason the READONLY note
+    # gives: ``is_sensitive_write_path`` covers the leaf on the file-tool path, while
+    # a sandboxed shell's ``open(..., "w")`` reaches it however the write is spelled,
+    # and only a kernel denial holds there. Nothing in the product writes this file at
+    # all -- the launch path's own fields live in ``cloud.launch_state`` -- so the seal
+    # costs no writer anything; it is the operator's file and only they write it.
+    "cloud.json",
+    # The launch RECORD. Sealed for a reason of its own rather than by association: the tag
+    # in it is what ``cloud destroy`` resolves without ``--tag``, so a writable copy lets a
+    # sandboxed process choose which stack a ``destroy --yes`` deletes. The write gate above
+    # covers the agent's file-edit tool; only a kernel denial covers a sandboxed shell's
+    # ``open(..., "w")``, however the write is spelled. Absent-file coverage is the
+    # pre-create list below, because a name nothing occupies is a name an agent creates.
+    "cloud_launch_state.json",
+    # The pi gate launcher and sealed extension must be readable and executable by
+    # the enforced harness's child, but never writable by it. The launcher cache
+    # accepts an existing path after ``isfile`` without re-verifying its content, so
+    # a writable child could plant the launcher a later session executes.
+    #
+    # On the precreate and no-follow lists above as well, for the same two reasons
+    # ``playwright-cli`` is: ``mount(2)`` cannot seal an absent path, so a leaf left off
+    # them stays WRITABLE in-sandbox until pi first runs, and the mounted NAME has to
+    # stay the real directory because the gateway later execs out of it. Those lists are
+    # walked identically for every backend and carry no per-adapter branch, so an
+    # unsafe state here refuses the spawn exactly as it does for any other entry.
+    # ``acp/client.py``'s ``_pi_gate_artifact_dir`` re-checks the same states on the pi
+    # spawn path, before the sandbox is built, so a pi session refuses with a message
+    # that names the directory it actually resolves.
+    "pi-gate",
     # The app dev-mode AUTHORIZATION record (operator grants binding each dev
     # app to its resolved ui root — see apps/dev_mode.py). Sealing it makes
     # "operator, not agent" kernel-enforced: a sandboxed process cannot mint,
@@ -278,6 +663,71 @@ _CREW_READONLY_LEAVES: tuple[str, ...] = (
     # gateway ensures the file exists at startup (see apply_dev_mode's
     # reconcile) because the Linux launcher can only seal an EXISTING target.
     "apps/.dev-grants.json",
+    # The settings-seed provenance record (``acp.seed_provenance``), an
+    # AUTHORIZATION record on the same footing as the dev-mode grants above: an
+    # entry in it is what lets Crew OVERWRITE and then DELETE
+    # ``<work_dir>/.claude/settings.local.json``, because a re-seed proceeds only
+    # when the file on disk still matches the recorded ``(size, sha256)``. A
+    # sandboxed process that can write it can enter a digest for a settings file
+    # the USER hand-wrote, and the next gateway start adopts that file, replaces
+    # its ``permissions.defaultMode`` with Crew's, and unlinks it on reset.
+    # READONLY rather than hidden because the write is the whole risk: the record
+    # holds no secret (work-dir paths and digests), so masking it would buy
+    # nothing and cost an operator the ability to see why a seed was adopted.
+    # Paired with the same leaf on ``security``'s write floors -- the deny rules
+    # fence how a command SPELLS this path, and the kernel denial is what still
+    # holds when a spelling is built at runtime (``$(printf ...)``).
+    "settings_seeds.json",
+    # The crew webview template directory. A ceiling in exactly the sense above:
+    # the whole value of splitting a panel into human-authored TEMPLATE and
+    # agent-published DATA is that layout is authored by a person, so a crew must
+    # never be able to write one -- a template it authored could put markup, and
+    # therefore a hostile issue body's markup, straight into the operator's
+    # dashboard. ``security._CREW_SECRET_LEAVES`` fences it from the agent FILE
+    # TOOLS; sealing it read-only here closes the other half, because a fence that
+    # only covers file tools is bypassed by any spawned shell that can write.
+    #
+    # READ-ONLY rather than masked, and the direction matters: templates are
+    # versioned, human-reviewed repo content with nothing secret in them, so
+    # reading one costs nothing, while hiding a directory the OPERATOR drops
+    # overrides into would silently change which template renders.
+    "panel-templates",
+    # The fork-lineage / model-state sidecar (agent_state.py). Same
+    # input-to-an-authorization-decision class as the ceilings above:
+    # ``forked_from`` / ``private_to`` decide whether the fork endpoint treats
+    # a template as one crew's private copy, so a forged entry makes the
+    # owner's next PATCH mutate a SHARED template. The tool gate and the bash
+    # text matcher fence the spelled paths, but a spawned interpreter's
+    # ``open()`` or a split-string shell path reaches the file by constructed
+    # runtime paths no text gate can see — only an OS disposition closes that.
+    # Read-only, not hidden: in-sandbox readers (a script cron's fork-info
+    # reads) must keep working, and every legitimate WRITER (the dashboard
+    # fork/publish/reset handlers, the CLI) runs in the unsandboxed gateway or
+    # user process. Absent-file coverage differs per backend: the seatbelt
+    # denies by literal path (creation IS a write), while the Linux mount seal
+    # needs a file to bind — so this leaf is ALSO in
+    # ``_CREW_PRECREATE_READONLY_FILE_LEAVES`` and gets materialised as ``{}``
+    # before every namespace spawn.
+    "agent_model_state.json",
+    # The sidecar's cross-process advisory lock. Unsealed, a sandboxed process
+    # can unlink and recreate it, so concurrent writers lock DIFFERENT inodes
+    # and the loser's stale read-modify-write erases lineage the winner just
+    # recorded — the lock file's identity is what makes the lock a lock. No
+    # sandboxed process legitimately takes it: every locker (agent_state's
+    # mutators via the dashboard/CLI) runs unsandboxed. Absent-file coverage
+    # mirrors the sidecar's own entry via the pre-create list.
+    "agent_model_state.json.lock",
+    # The operator's approved MCP launch fingerprints (``mcp_gateway.launch_approval``).
+    # An input to a decision that runs a program OUTSIDE the sandbox: gatewayd
+    # spawns a stubbed server's backend as the user, and this record is what says
+    # which command a stubbed name may run. A sandboxed writer could approve its own
+    # command. Read-only, not hidden: it holds hashes and server names, no secret.
+    # Every writer (the dashboard stub toggle, the gateway's rewrite pass) runs in
+    # the gateway process, outside the sandbox.
+    "mcp-launch-approvals",
+    # Gateway resolve-once artifacts choose the entry point substituted for an
+    # approved npm launcher. The installer runs in the unsandboxed gateway.
+    "mcp/resolved",
 )
 
 #: Crew-home leaves that MUST stay read-write for a sandboxed process. Every entry is
@@ -315,6 +765,675 @@ _CREW_HIDDEN_DIRS: list[str] = _crew_home_entries(_CREW_HIDDEN_LEAVES)
 #: Exposed read-only in every mode.
 _CREW_READONLY_TARGETS: list[str] = _crew_home_entries(_CREW_READONLY_LEAVES)
 
+
+#: Leaves NO foreign harness's child may read by default, even though a sandboxed
+#: process may. Absent from :data:`_CREW_CHILD_READABLE_LEAVES` and therefore kept in
+#: the enforced adapter's OS credential mask.
+#:
+#: Two reasons put a leaf here, and the distinction matters to anyone adding one.
+#: Almost every entry carries a live credential or a capability, so no child should
+#: ever read it. One entry instead belongs to a SINGLE harness, so a blanket grant
+#: would be too wide: it is withheld here and handed back to that one harness by
+#: ``tool_gate.adapter_hidden_credential_dirs``, which keys its gate-artifact
+#: exclusion on the backend. "Withheld" therefore means "not granted to everyone",
+#: not always "secret".
+#:
+#: Paired with that list rather than derived from it. Neither is the complement of
+#: the other at runtime: both are written out, and
+#: ``test_sandbox_governance_mask`` pins that together they cover
+#: ``_CREW_SANDBOX_VISIBLE_LEAVES | _CREW_READONLY_LEAVES`` exactly and do not
+#: overlap. That pin is the whole point -- see :data:`_CREW_CHILD_READABLE_LEAVES`.
+#:
+#: Every entry carries a live credential or a capability, so handing it to a
+#: third-party binary that self-approves its own passive reads is the exact class
+#: that mask exists to compensate for. The first-class path's own disposition is
+#: looser (``AGENTS.md`` records ``sel_hmac.key`` as a knowingly-carried VISIBLE
+#: residual with no OS fence), and widening that residual from Crew-shipped binaries
+#: to any enforced harness is a decision an operator makes, not one a mask change
+#: inherits. Closing it properly means moving each in-sandbox reader behind the
+#: gateway -- never a looser mask.
+#:
+#: ``run`` is here for the same reason and needs one extra fact, because
+#: :data:`_CREW_SANDBOX_VISIBLE_LEAVES` says the child "cannot exec if it is masked".
+#: That is true of the tier's OWN mask and not of this one: the Linux launcher
+#: bind-mounts the empty dirs AFTER it is already running and only then execs
+#: (``fork -> unshare(CLONE_NEWUSER) -> unshare(CLONE_NEWNS) -> bind -> exec``), so a
+#: masked ``run`` never blocks the launcher that lives in it. It blocks only a child
+#: that execs a SECOND artifact out of ``run`` from inside the namespace. The answer
+#: for such a child is to move its artifact to a credential-free leaf of its own,
+#: never to expose ``run`` and with it ``run/gateway-<port>.secret``, which
+#: ``config.loader.read_local_secret`` resolves BEFORE the shared ``.local_secret``.
+#:
+#: The pi gate is exactly that child, and it takes that answer: its launcher and
+#: sealed extension live under their own ``pi-gate`` leaf, so a pi session starts with
+#: ``run`` masked. Keeping ``run`` masked is what makes such a leaf the answer;
+#: exposing it to unbreak one harness would hand the gateway credential to four.
+_CREW_CHILD_WITHHELD_LEAVES: tuple[str, ...] = (
+    # The per-listener gateway credential (``run/gateway-<port>.secret``).
+    "run",
+    # The SEL trust root and the audit key inside it.
+    "trust",
+    "sel_hmac.key",
+    # The dashboard internal-API bearer secret.
+    ".local_secret",
+    # Capability-bearing job state: a cron entry carries the session key its run
+    # executes under, so a readable store leaks that key and a writable one mints work.
+    "crons.json",
+    # Durable cross-session capability, and the reason this entry reads as a
+    # surprise: the leaf name says "bindings", but a binding FILE carries the raw
+    # session key it binds (``member_memory_auth.bind_private_session_store`` writes
+    # ``{"version": 1, "session_key": <raw>, "memory_store": ...}``), under both
+    # ``sessions/<digest>/`` and ``pids/``. So reading the directory hands over every
+    # member's key, not a digest of one, and a leaked session key stays usable.
+    "member-memory-bindings",
+    # The SEL audit log and its rotation directory. Withheld for the WRITE side above
+    # all: ``_CREW_SANDBOX_VISIBLE_LEAVES`` keeps these read-write precisely so an
+    # in-sandbox MCP server can append, and a foreign harness with the same access can
+    # rewrite or truncate the record of its own actions. Losing the append makes an
+    # audit-or-deny write fail, which DENIES the action it was auditing -- the safe
+    # direction, and the reason this is a withhold rather than a carve-out.
+    "security_events.jsonl",
+    "security_events.d",
+    # Both admission stores hold ``trust_keys``: signer -> SHARED SECRET, verified with
+    # ``hmac.new`` plus ``compare_digest`` (``apps/admission.py``). A child that reads
+    # one can sign a manifest or a policy that admission then accepts, so these are
+    # credential files rather than the plain ceilings they resemble. Withholding them
+    # costs in-sandbox app admission, in the safe direction: an empty
+    # ``app_admission.json`` reads as deny-all and an empty ``admission_policy.json``
+    # refuses to compose, so an app is turned away rather than admitted unchecked.
+    "admission_policy.json",
+    "app_admission.json",
+    # Every other readable leaf can name the in-sandbox reader that breaks without it.
+    # This one cannot: the gateway owns both the writes and the reads, so nothing in a
+    # sandbox needs it. The seal beside it answers a WRITE ("not a cross-member
+    # confidentiality boundary" is a statement about rewriting a learning authority),
+    # and that argument does not carry to a read by a foreign harness, whose passive
+    # reads are the very thing this mask compensates for -- they reach no gate and
+    # leave no record. One member's silo holding another's preferences and lessons is
+    # worth a denial that costs nothing.
+    "memory_stores",
+    # The governance ceiling, its trust root, and every policy or consent document
+    # beside them. Withheld as one family because they share one reader and one risk:
+    # each is an INPUT TO AN AUTHORIZATION DECISION that an in-sandbox process makes,
+    # and an enforced harness's child reads them through a channel that reaches no gate
+    # and leaves no record. Hiding them costs in-sandbox governance resolution, and it
+    # costs it CLOSED: the launcher binds an empty file, an empty ceiling document makes
+    # ``boot_platform()`` raise, and an empty consent record reads as consent withheld,
+    # so a session refuses rather than proceeding ungoverned. That is the same direction
+    # the rest of this list takes, which is why they sit together.
+    "security_policy.json",
+    "profiles",
+    "denied_commands.json",
+    "computer_use.json",
+    "oauth_endpoints.json",
+    "decisions_consent.json",
+    "file_delivery_consent.json",
+    "ssh_auth_sock_consent.json",
+    "credential_redaction.json",
+    # The paid-AWS consent grant. Unlike its sibling consent records this one stores
+    # IDENTIFIERS as well as a decision -- ``Grant.to_dict`` writes ``account`` and
+    # ``arn`` -- so a read tells a foreign child which AWS account and caller identity
+    # the owner works as. It sits on the read+write keystone floor, so no in-sandbox
+    # reader had it before this change either: the app backend that consults it is not
+    # an enforced-harness child. Withholding it costs nothing that worked.
+    "aws_service_consent.json",
+    # The ONE entry here that holds no secret. It carries the launcher and sealed
+    # extension of a single harness's tool gate, and only that harness's child has to
+    # execute them, so the grant is made per backend in
+    # ``tool_gate.adapter_hidden_credential_dirs`` rather than to every child here.
+    # Withheld from the shared set for reach, not for secrecy: a leaf no other child
+    # needs is a leaf no other child should get, and the narrower grant says which one
+    # does. The read gate still fences it from the agent's own file tools, and the
+    # read-only and no-follow seals still stop any child replacing what it execs.
+    #
+    # The literal, not ``tool_gate.PI_GATE_ARTIFACT_LEAF``: that module resolves this
+    # one lazily to avoid a load-time cycle, so importing its constant here would
+    # close the cycle from the other side. The seal lists above spell it the same way.
+    "pi-gate",
+)
+
+#: Leaves an ENFORCED harness's child MAY read. The other half of the pair above.
+#:
+#: Written out rather than computed as "everything not withheld", because the two
+#: spellings fail in opposite directions and only one of them fails safely.
+#:
+#: A complement would make classification OPTIONAL: a credential-bearing leaf added
+#: later to :data:`_CREW_SANDBOX_VISIBLE_LEAVES` or :data:`_CREW_READONLY_LEAVES`
+#: would land in the child-readable set by default and be handed to a foreign harness
+#: -- silently, because nothing reads as wrong and no test knows the leaf exists. A
+#: docstring asking the next author to check the withhold list is not a control.
+#:
+#: Written out, classification is MANDATORY: a new leaf appears in neither list, the
+#: completeness pin in ``test_sandbox_governance_mask`` fails, and the author has to
+#: say which side it belongs on. The drift a hand-maintained list normally invites is
+#: exactly what that pin converts from silent into loud, which is why duplicating the
+#: names here costs nothing real.
+#:
+#: So the default direction is the point. Before this pair existed a forgotten leaf
+#: stayed masked and broke a boot, which someone notices. Under a complement it would
+#: be exposed, which nobody notices.
+_CREW_CHILD_READABLE_LEAVES: tuple[str, ...] = (
+    # The browser launcher an agent browser command must read and execute. The only
+    # entry here the read gate also fences, so the only one whose exclusion changes
+    # what an enforced child can open; the rest are already outside the mask.
+    "playwright-cli",
+    # Authorization and lineage records an in-sandbox reader resolves. Read-only
+    # sealed for the same reason: a forged entry decides a later grant.
+    "apps/.dev-grants.json",
+    "settings_seeds.json",
+    "agent_model_state.json",
+    "agent_model_state.json.lock",
+    # Gateway-owned run records, read to restore app authorization on a cold
+    # continuation. The risk they carry is a rewritten app owner, not a read, and the
+    # read-only seal is what answers it. Classified for completeness rather than for
+    # effect: this leaf is not on the read-gate floor, so the mask never covers it and
+    # neither classification changes what any child can open.
+    "subagents",
+    # The decision log. Same shape as the entry above, and for the reason this module
+    # gives it: read stays open on purpose, every legitimate writer is the gateway
+    # outside the sandbox, and nothing writes a decision row from inside one. Also off
+    # the read-gate floor, so the mask never covered it either way.
+    "decisions",
+    # Allowed hosts for the exfiltration check. Host names, not credentials; the
+    # risk is a write, answered by the read-only seal.
+    "redaction-allow",
+    # The operator's cloud configuration and the launch record beside it. Neither holds
+    # a credential (``CloudConfig`` documents the file as the operator's own, with none),
+    # and in-sandbox code READS both: the provisioner selector resolves the Fargate block
+    # and every ``cloud`` verb reaches the record through ``LaunchState.load``. What they
+    # carry is a WRITE risk -- the image a launch runs, the stack a destroy resolves --
+    # and the read-only seal above is what answers it. Withholding them would mask a read
+    # the product depends on and buy nothing.
+    "cloud.json",
+    "cloud_launch_state.json",
+    # The runtime config and its overlay. NOT credential-free, unlike ``cloud.json``:
+    # a channel bot token stored inline (``telegram.bot_token``, ``discord.bot_token``,
+    # ``weixin``/``webex``; the ``sensitive`` fields in ``config/sections.py``) lives
+    # in these files, and the env/.env spelling those fields recommend is only a
+    # recommendation. The read is granted anyway because in-sandbox code DEPENDS on it:
+    # every ``KiroCrewConfig.load()`` in a sandboxed CLI or MCP server opens both, and
+    # withholding them would mask a read the product cannot run without. It is also
+    # not a widening: neither is on the read-gate floor (``is_sensitive_path`` is False
+    # for both), so the mask never covered them and a child could always open them --
+    # classifying them here keeps exactly what it had. The risk the seal answers is the
+    # WRITE: the switches that loosen confinement, which the read-only entry above
+    # refuses.
+    "config.json",
+    "config.local.json",
+    # The crew webview template directory. Holds no credential and is no input to an
+    # authorization decision an in-sandbox process makes: a template decides how a
+    # published panel is laid out, never who may publish one, and every reader runs
+    # in the gateway (``agent_panel.available_templates`` behind the dashboard route,
+    # the renderer behind publish) -- the ``kirocrew-panel`` MCP server asks that
+    # route over HTTP rather than opening the directory itself. Classified for
+    # completeness rather than for effect, like ``subagents`` above: the leaf is
+    # WRITE-protected only (``security.paths._WRITE_PROTECTED_HOME_PATHS``), not on
+    # the read-gate floor, so the mask never covers it and neither classification
+    # changes what any child can open. The risk it carries is a WRITE (crew-authored
+    # markup reaching the operator's dashboard), and the read-only seal above is what
+    # answers it.
+    "panel-templates",
+    # Launch fingerprints and server names: no credential, and the decision it
+    # feeds is made by gatewayd outside any sandbox, never by a child reading it.
+    "mcp-launch-approvals",
+    # Launch trees and records contain no credential. Their integrity is enforced
+    # by the read-only mount; foreign harnesses may read the resolved package tree.
+    "mcp/resolved",
+)
+
+
+def crew_host_runtime_leaves() -> tuple[str, ...]:
+    """Crew-home leaves an ENFORCED harness's child may read, per this module.
+
+    :data:`_CREW_CHILD_READABLE_LEAVES` verbatim -- the half of this module's
+    non-hidden crew leaves that is no input to an authorization decision and either
+    holds no credential or is one an in-sandbox Crew process cannot boot without: the
+    browser launcher, the authorization sidecars (``apps/.dev-grants.json``,
+    ``settings_seeds.json``, the model-state pair), the gateway-owned run and decision
+    records, the operator's cloud configuration, and the runtime config pair
+    (``config.json`` / ``config.local.json``). That last pair is the exception the
+    "either" carries: it can hold an inline channel bot token, and stays readable
+    because every in-sandbox ``KiroCrewConfig.load()`` depends on it and it was never
+    on the read-gate floor to begin with -- see its entry in the list.
+    Its sibling :data:`_CREW_CHILD_WITHHELD_LEAVES` carries the rest, and
+    ``test_sandbox_governance_mask`` pins the pair complete and disjoint against
+    ``_CREW_SANDBOX_VISIBLE_LEAVES | _CREW_READONLY_LEAVES``, so a leaf added to
+    either source list must be classified before it can ship.
+
+    Two of the withheld entries are counter-intuitive on their names alone, which is
+    why the pin exists rather than a convention: ``member-memory-bindings`` stores raw
+    session keys rather than digests, and ``run`` holds the per-listener gateway
+    credential next to the launcher. "Sounds like metadata" is not a classification.
+
+    Published for the ONE caller that builds a second, independent mask over the same
+    data home -- ``agent_sdk.tool_gate.adapter_hidden_credential_dirs``, the OS
+    credential mask an enforced adapter is confined by. That mask projects the whole
+    READ-GATE floor, and the floor covers a Crew runtime artifact for a different
+    reason than a credential: it stops the AGENT'S OWN FILE TOOLS from opening one,
+    while Crew's writers open it directly. Handed to a sandbox as a deny list, the
+    same entry hides the artifact from the CHILD -- which is not the reader the floor
+    was aiming at, and is the reader these lists exist to serve.
+
+    The governance ceiling is NOT in this set, and that is deliberate rather than an
+    omission -- see the governance family in
+    :data:`_CREW_CHILD_WITHHELD_LEAVES`. It is the case where the two readers pull
+    hardest in opposite directions: an empty bind over ``security_policy.json`` makes
+    ``boot_platform()`` raise, so an in-sandbox Crew process under an enforced harness
+    stops booting on exactly the governed hosts that set one. That cost is accepted
+    because it lands in the safe direction -- a session refuses rather than proceeding
+    ungoverned -- and a ceiling is an INPUT TO AN AUTHORIZATION DECISION, which a
+    foreign harness's child reads through a channel that reaches no gate and leaves no
+    record. So do not read the paragraph above as licence to move a ceiling or a
+    consent record here to make a harness boot.
+
+    Subtracting these is not a hole. An unenforced harness's child already sees every
+    leaf that remains (those harnesses get no mask at all), each readonly entry is
+    independently re-sealed read-only by ``wrap_argv``, and the read gate still fences
+    all of them from the agent's own file tools. The two controls keep covering
+    different readers.
+
+    Derived from the lists, never re-spelled. A hand-copied list would drift the
+    moment a leaf is added above, and the drift is silent in the safe-looking
+    direction: the new leaf keeps its mask entry and the enforced harnesses alone
+    lose it.
+    """
+    return _CREW_CHILD_READABLE_LEAVES
+
+
+def _resolved_kiro_agents_targets() -> list[str]:
+    """The RESOLVED kiro agents tree — fork/template specs AND their advisory
+    lock — sealed read-only as a directory.
+
+    The specs are what fork governance sanitizes (allowedTools ceiling,
+    autoApprove strip), so a sandboxed process that can rewrite one hands its
+    next spawn forged grants — the seal is the enforcement the governance
+    passes rely on. Read stays open (kiro-cli resolves its own spec here);
+    every legitimate WRITER (fork/publish/reset handlers, the fork refresh,
+    CLI setup) runs unsandboxed.
+
+    Resolved per spawn through :func:`kiro_agents_dir` — never a hard-coded
+    home-relative literal — so a relocated data home is covered by the same
+    entry. Same contract as :func:`_relocated_crew_targets`: ``normpath``
+    never ``realpath`` (event-loop safety), and never raises.
+    """
+    try:
+        return [os.path.normpath(str(kiro_agents_dir()))]
+    except Exception:
+        return []
+
+
+#: Hidden crew-home leaves one app's OWN backend must read and write.
+#:
+#: These leaves sit in ``_CREW_HIDDEN_LEAVES`` to fence AGENT subprocesses (a
+#: prompt-injected shell must not repoint a vault's push target or lift the PAT), but
+#: the named app's backend is each leaf's only legitimate reader/writer — and that
+#: backend is itself a sandboxed spawn, so the blanket mask breaks the app.
+#: ``apps/backend.py`` passes the resolved paths back as ``extra_visible_dirs`` when
+#: spawning exactly that app's backend; every other sandboxed process keeps the mask.
+#:
+#: Keyed by app name as ``apps/backend.py`` spawns it. Only apps with a SPAWNED
+#: backend belong here — an in-process builtin (routes/hooks) runs unsandboxed in the
+#: gateway and needs no exemption.
+_APP_BACKEND_OWNED_LEAVES: dict[str, tuple[str, ...]] = {
+    # NOT here: dev-fleet's live-target pointer. Its backend is that leaf's writer, but a
+    # carve-out would reach every descendant of that long-lived spawn — a nested sandbox
+    # is denied by design, so ``wrap_argv`` runs its ``npm ci`` / build children inside
+    # the SAME namespace — and a worktree's lifecycle script could then pick the code
+    # the gateway execs next. The pointer stays masked; Dev Fleet moves the cutover to a
+    # gateway-process route instead (``dev_fleet/gateway_routes.py``).
+    MD_NOTEBOOK_APP_NAME: (
+        *_MD_NOTEBOOK_STATE_LEAVES,
+        # The writers stage here and rename onto the leaves above, so the backend needs
+        # this directory back too — carving out only the three targets would leave every
+        # state write failing on the masked staging dir instead of the masked leaf.
+        _MD_NOTEBOOK_STAGING_LEAF,
+    ),
+}
+
+
+def app_backend_visible_targets(app_name: str, mode: str = "standard") -> tuple[str, ...]:
+    """Absolute paths of the hidden leaves *app_name*'s own backend owns.
+
+    Resolved the same way the launcher and seatbelt builders spell their hidden
+    targets — ``$HOME``-joined across both data-home spellings, plus the relocated
+    paths when ``KIROCREW_HOME`` moves the data home — so each returned path matches
+    its mask entry exactly and ``_hidden_path_contains_visible_path`` lifts it.
+
+    A spelling that sits BENEATH an independently masked directory is REFUSED,
+    not carved (see :func:`carveout_shadowed_by_foreign_mask`): carving it out
+    would take that whole foreign mask down with it. The backend keeps its
+    EPERM on such a host, which is strictly safer than unmasking a foreign
+    tree.
+
+    Returns ``()`` for an app with no owned leaves, leaving its spawn unchanged.
+    *mode* is the tier the caller passes to :func:`wrap_argv` for the same
+    spawn — the shadow guard judges against that tier (post-clamp), so a
+    future caller wrapping at ``cc``/``strict`` must say so here too.
+    """
+    leaves = _APP_BACKEND_OWNED_LEAVES.get(app_name)
+    if not leaves:
+        return ()
+    home = str(Path.home())
+    targets = [os.path.join(home, entry) for entry in _crew_home_entries(leaves)]
+    targets.extend(_relocated_crew_targets(leaves))
+    return tuple(
+        target
+        for target in targets
+        if not carveout_shadowed_by_foreign_mask(target, mode=mode)
+        and not carveout_chain_has_planted_link(target)
+    )
+
+
+def crew_home_visible_spellings(path: str) -> tuple[str, ...]:
+    """*path*, spelled every way the masks spell the crew data home.
+
+    ``extra_visible_dirs`` lifts a mask entry only when
+    :func:`_hidden_path_contains_visible_path` sees that entry CONTAIN one of the
+    spellings it was handed, and that predicate is purely lexical (``commonpath``
+    over ``abspath``, never ``realpath`` — the builders run on the event loop).
+    The masks meanwhile carry THREE spellings of one crew-home directory: the two
+    ``$HOME``-joined prefixes (:data:`_CREW_HOME_PREFIXES`, from
+    ``Path.home()``, which does not resolve links) and the resolved
+    :func:`config_dir` path :func:`_relocated_crew_targets` adds.
+
+    A carve-out naming only one of them lifts only that entry. Where a second
+    spelling ALIASES the same directory — a symlinked ``$HOME``, so
+    ``config_dir()`` returns the link-resolved path and ``Path.home()`` returns
+    the link — its mask survives and bind-mounts an empty directory back over the
+    tree the carve-out just exposed. The child then gets ``ENOENT`` on a file the
+    gateway can stat, which reads as a missing file rather than as a mask.
+
+    A home-joined prefix may instead name a different crew data home. Adding its
+    spelling would lift that foreign tree's mask, so each prefix root is admitted
+    only when ``stat`` reports the same directory identity as :func:`config_dir`.
+    Missing, non-directory, and unstatable roots stay excluded. This filesystem
+    resolution must run off the event loop; its caller runs in a worker thread.
+    The launcher and Seatbelt builders remain purely lexical on the event loop.
+
+    So a crew-home carve-out is passed as the whole proven-alias spelling set.
+    :func:`app_backend_visible_targets` already does this for its FIXED leaves;
+    this function does it for a path computed per call — a transfer staging
+    directory, named only once the transfer starts — which no static list can
+    enumerate.
+
+    *path* is returned alone when it is not under the data home: an ordinary
+    workspace or repo carve-out has no crew-home spelling to add. Never raises —
+    an unresolvable home yields the one spelling the caller already had, which is
+    the behaviour before this function existed.
+    """
+    target = os.path.abspath(path)
+    spellings = [target]
+    try:
+        root = os.path.normpath(str(config_dir()))
+        home = str(Path.home())
+        rel = os.path.relpath(target, root)
+    except Exception:  # pragma: no cover - defensive; a spawn must not fail on this
+        logger.debug("could not re-spell the crew-home carve-out %s", path, exc_info=True)
+        return tuple(spellings)
+    # Outside the data home (``..`` in the relative path, or a different drive on
+    # Windows, which makes ``relpath`` raise above): nothing to re-spell.
+    if rel == os.pardir or rel.startswith(os.pardir + os.sep) or os.path.isabs(rel):
+        return tuple(spellings)
+    try:
+        root_info = os.stat(root)
+    except Exception:  # pragma: no cover - defensive; exclusion is the safe answer
+        logger.debug("could not identify crew-home root %s", root, exc_info=True)
+        return tuple(spellings)
+    if not stat.S_ISDIR(root_info.st_mode):
+        return tuple(spellings)
+    root_identity = (root_info.st_dev, root_info.st_ino)
+    for prefix in _CREW_HOME_PREFIXES:
+        candidate_root = os.path.normpath(os.path.join(home, prefix))
+        try:
+            candidate_info = os.stat(candidate_root)
+        except Exception:
+            continue
+        if not stat.S_ISDIR(candidate_info.st_mode):
+            continue
+        if (candidate_info.st_dev, candidate_info.st_ino) != root_identity:
+            continue
+        spelling = os.path.normpath(os.path.join(candidate_root, rel))
+        if spelling not in spellings:
+            spellings.append(spelling)
+    return tuple(spellings)
+
+
+def carveout_chain_has_planted_link(path: str) -> bool:
+    """Whether *path*'s parent chain passes through a link, so it must not be carved out.
+
+    The boolean form of :func:`atomic_write.refuse_linked_parent`, for
+    the two producers that must DEGRADE rather than raise. An app's state leaves sit under
+    an agent-writable tree, so a link planted at an intermediate component means this
+    process cannot tell which directory a write to that name will land in — and handing a
+    spawn a carve-out for such a name unmasks whatever the link currently points at.
+
+    Refusing the CARVE-OUT is the proportionate response, not refusing the spawn. Withhold
+    it and the owning backend fails on its own masked state, which is the app's problem;
+    refuse the spawn and one optional app's on-disk layout takes every sandboxed process on
+    the host down with it. The two are safe together because they are keyed off this one
+    predicate: while it holds, the backend cannot write the state, so a leaf left
+    unmaterialised — and therefore unmasked — has nothing to expose.
+
+    Fails toward "unsafe": an unresolvable chain is reported as planted, so the carve-out is
+    withheld rather than granted on a path this process could not verify.
+    """
+    try:
+        refuse_linked_parent(path)
+    except OSError as exc:
+        logger.warning(
+            "SECURITY: not carving %s out of the sandbox masks — a parent component is a "
+            "link (%s), so this process cannot tell which directory a write to that name "
+            "would reach. The owning app backend will fail on its own state until the link "
+            "is replaced with a real directory; every other spawn is unaffected.",
+            path,
+            exc,
+        )
+        return True
+    except Exception:  # pragma: no cover - defensive; a spawn must not fail on this
+        logger.debug("could not check the carve-out chain for %s", path, exc_info=True)
+        return True
+    return False
+
+
+def _window_is_a_hidden_target(path: str, hidden_dirs: Iterable[str]) -> bool:
+    """Whether *path* as a private window IS one of the directories that stay hidden.
+
+    A mask lift written as a window. Refused on every backend and at every producer,
+    because nothing downstream can make it safe: the window is the masked tree.
+    """
+    probe = path.rstrip(os.sep)
+    return any(probe == hidden.rstrip(os.sep) for hidden in hidden_dirs)
+
+
+def _window_contains_a_hidden_target(path: str, hidden_dirs: Iterable[str]) -> bool:
+    """Whether *path* as a private window would hold a directory that stays hidden.
+
+    Unlike the EQUALS case this one is an ORDERING problem rather than a contradiction:
+    the window is re-bound read-write over the tree, so a nested mask applied BEFORE
+    that bind lands on the path the window then shadows, and the leaf comes back with
+    it. A backend that can re-apply the nested mask AFTER binding the window -- the
+    Linux launcher does, from a descriptor it already holds -- keeps the leaf hidden and
+    the rest of the window live. A backend that expresses masks as path rules with no
+    ordering it controls cannot, so there it stays refused.
+
+    This is why the question is asked of the whole mask set rather than of the one
+    parent a window matched: an entry can be a proper descendant of one hidden tree
+    while being an ancestor of another hidden leaf inside it -- ``apps/meetings/data``
+    under a masked ``apps`` tree holds the masked ``apps/meetings/data/edits`` -- and a
+    per-parent test accepts it on the strength of the first relationship.
+    """
+    probe = path.rstrip(os.sep)
+    return any(hidden.rstrip(os.sep).startswith(probe + os.sep) for hidden in hidden_dirs)
+
+
+def _private_window_spellings(
+    extra_private_dirs: tuple[str, ...],
+    hidden_dirs: list[str],
+    *,
+    remasks_contained_targets: bool = False,
+) -> list[str]:
+    """The ``extra_private_dirs`` entries that name a PROPER descendant of a
+    directory that stays hidden.
+
+    A private window is the one directory a spawn keeps inside a masked tree
+    -- its own scratch under the masked scratch root. Unlike
+    ``extra_visible_dirs`` it never lifts the parent's mask: siblings stay
+    hidden, only the window is re-exposed (read-write, it is the process's
+    own). An entry that is not inside a hidden tree needs no window and is
+    dropped. Lexical, like every other path rule here.
+
+    An entry that EQUALS a hidden target is always refused: the window IS the masked
+    tree, and nothing downstream can make that safe. An entry that CONTAINS one is
+    refused UNLESS the caller states it re-applies the nested mask after binding the
+    window (``remasks_contained_targets``) -- the Linux launcher does, so the leaf stays
+    hidden and the app keeps its data view; the Seatbelt profile cannot order its rules
+    that way, so there the refusal stands. This is the single gate every caller's windows
+    pass through, so both decisions belong here and not in each producer, and refusing is
+    the fail-closed direction: the window is withheld and the parent's mask keeps
+    covering the path.
+    """
+    windows: list[str] = []
+    for raw in extra_private_dirs:
+        path = os.path.abspath(raw)
+        refused = _window_is_a_hidden_target(path, hidden_dirs) or (
+            not remasks_contained_targets and _window_contains_a_hidden_target(path, hidden_dirs)
+        )
+        if refused:
+            # NEITHER path is logged. The mask set's own entries name credential and
+            # authorization stores, so writing them into a log records the layout of
+            # exactly what the set exists to hide. The refusal is deterministic and
+            # reproducible from the caller's own arguments, and the one producer that
+            # can hit it in ordinary operation names the app itself at debug level,
+            # so the path adds nothing a reader cannot already get.
+            logger.warning(
+                "SECURITY: not opening a private window that is or contains a masked "
+                "directory -- a window is re-bound read-write over the mask, so that "
+                "path stays masked for this spawn. Every other window and the spawn "
+                "itself are unaffected."
+            )
+            continue
+        for parent in hidden_dirs:
+            if path.startswith(parent.rstrip(os.sep) + os.sep):
+                windows.append(path)
+                break
+    return list(dict.fromkeys(windows))
+
+
+def carveout_shadowed_by_foreign_mask(path: str, mode: str = "standard") -> bool:
+    """Whether carving *path* out of the sandbox masks would unmask a foreign tree.
+
+    ``_hidden_path_contains_visible_path`` cancels any hidden mask entry that
+    CONTAINS a visible path, so an ``extra_visible_dirs`` spelling that sits
+    beneath an independently masked directory takes that whole foreign mask
+    down with it — a data home relocated beneath a credential directory (e.g.
+    ``KIROCREW_HOME`` under ``~/.aws``) would hand every spawn that asks for a
+    crew-home carve-out the entire credential tree. Both EQUALITY-shaped
+    crew-home carve-out producers call this before adding a spelling —
+    :func:`app_backend_visible_targets` and the policy-cache site in
+    ``apps/backend.py``. The aws-control per-call staging carve-out is the
+    ANCESTOR-LIFT shape instead: its temp dir is a proper descendant of the mask
+    entry the lift cancels, so asking about that dir refuses on every layout,
+    the default one included. It asks about the staging ROOT instead — the mask
+    entry itself, which the equality rule below exempts while every OTHER masked
+    ancestor still refuses. Same verdict, no parameter: no mask entry can sit
+    between a root and the per-call dir minted directly inside it, and that dir
+    is a fresh random name no list carries. On refusal the mask stays
+    and the carve-out's consumer fails closed (EPERM for an app backend's own
+    state, an unreadable cache for a cache-only backend), which is strictly
+    safer than unmasking a foreign tree. The refusal is logged with the
+    offending ancestor so the misconfiguration is actionable.
+
+    The mask universe is the EFFECTIVE tier's dir list — *mode* run through the
+    same ``sandbox.min_level`` clamp :func:`wrap_argv` applies (see
+    :func:`effective_sandbox_mode`) — NOT the union of every tier: ``standard``
+    deliberately leaves ``~/.aws`` visible, so a data home relocated beneath it
+    shadows nothing in an ungoverned standard-mode spawn, and refusing there
+    would break the carve-out's consumer for zero security gain. A governed
+    floor that clamps the spawn up is honoured by construction, because the
+    clamp result is what selects the list. Two deliberate asymmetries, both in
+    the refusal direction: ``cc`` uses the launcher's list on every platform
+    (the macOS profile builder drops ``.aws`` from it in favour of file-level
+    rules, so macOS ``cc`` can only over-refuse), and a tier that cannot be
+    resolved falls back to the union of every tier. The relocated mask entries
+    the builders add in every mode are included on BOTH paths, so a carve-out
+    leaf beneath a relocated wholesale mask is judged against it too. Two
+    builder additions are deliberately absent: ``_voice_runtime_sandbox_paths``
+    (fixed runtime sockets no crew-home carve-out can sit beneath) and a
+    caller's ``extra_hidden_dirs`` (neither guarded producer's spawn passes
+    any).
+
+    The floor is re-read by ``wrap_argv`` at wrap time; a floor RAISED in the
+    interval between this check and the wrap is honoured for the masks but not
+    for this refusal. Exploiting that window requires an operator to both
+    tighten governance and have already relocated the data home beneath a
+    newly-masked tree — operator actions, not agent-reachable ones.
+
+    Equality is not shadowing — carve-out spellings ARE masked entries, and
+    unhiding exactly themselves is the carve-out's whole job; only a PROPER
+    ancestor is foreign. An ancestor-lift producer therefore asks about the mask
+    entry it lifts, never about the descendant it hands to the spawn.
+
+    Fails toward refusal, never raises: when home (or the path itself) cannot
+    be resolved the mask universe cannot be checked, so the spelling is
+    reported shadowed and the spawn proceeds with the mask intact.
+    """
+    try:
+        home = str(Path.home())
+        candidate = os.path.abspath(path)
+    except Exception:
+        logger.debug("could not resolve home for the carve-out shadow check", exc_info=True)
+        return True
+    try:
+        effective = effective_sandbox_mode(mode)
+        policy = _sandbox_policy()
+        if effective == "strict":
+            tier_dirs = list(policy.strict_dirs())
+        elif effective == "cc":
+            tier_dirs = list(policy.cc_dirs())
+        else:
+            # "standard" — and "off", where no mask exists and ``wrap_argv``
+            # ignores ``extra_visible_dirs`` entirely, so the verdict is inert.
+            tier_dirs = list(_STANDARD_DIRS)
+    except Exception:
+        # Deliberately swallows PlatformCompositionError, which
+        # ``_governance_sandbox_floor`` otherwise propagates so a floor never
+        # silently downgrades DENY to ALLOW: here the union fallback is a
+        # SUPERSET of every tier (refusal-leaning, the opposite of a
+        # downgrade), and ``wrap_argv`` re-reads the floor at wrap time and
+        # still raises for real.
+        tier_dirs = list(dict.fromkeys([*_STRICT_DIRS, *_CC_DIRS, *_STANDARD_DIRS]))
+    ancestors = [os.path.abspath(os.path.join(home, rel)) for rel in dict.fromkeys(tier_dirs)]
+    # The builders extend every mode's hidden set with the relocated crew
+    # entries; mirror that (on both the resolved-tier and fallback paths) so a
+    # relocated wholesale mask still counts. Both helpers never raise.
+    ancestors.extend(
+        os.path.abspath(entry)
+        for entry in (
+            *_relocated_crew_targets(_CREW_HIDDEN_LEAVES),
+            *_relocated_policy_cache_dirs(),
+        )
+    )
+    for ancestor in dict.fromkeys(ancestors):
+        if candidate == ancestor:
+            continue
+        try:
+            contained = os.path.commonpath((ancestor, candidate)) == ancestor
+        except ValueError:
+            continue
+        if contained:
+            logger.warning(
+                "SECURITY: refusing the sandbox carve-out for %s — it sits beneath "
+                "the independently masked directory %s, and carving it out would "
+                "unmask that whole tree. The carve-out's consumer will keep failing "
+                "on the masked path until the data home moves out from under that "
+                "directory.",
+                path,
+                ancestor,
+            )
+            return True
+    return False
+
+
 #: The subset of ``_CREW_READONLY_LEAVES`` the launcher may CREATE in order to seal.
 #:
 #: ``mount(2)`` cannot target a path that does not exist, so the READONLY seal below
@@ -326,21 +1445,37 @@ _CREW_READONLY_TARGETS: list[str] = _crew_home_entries(_CREW_READONLY_LEAVES)
 #: 1. An EMPTY document must mean what an ABSENT file means to the reader:
 #:
 #:    * ``profiles`` — an empty dir yields no profile, same as no dir;
+#:    * ``memory_stores`` — an empty root declares or provisions no store. The
+#:      gateway can later create named stores inside the directory bind; no
+#:      database, member configuration or Global V1 path is created here;
+#:    * ``playwright-cli`` — an empty dir means the launcher is absent,
+#:      exactly as a missing dir does; its directory bind shows a later gateway
+#:      install while withholding every agent-side write;
 #:    * ``computer_use.json`` — ``computer_use.enable_state.load_state`` reads ``{}``
 #:      as DISABLED, which is what an absent keystone means;
 #:    * ``oauth_endpoints.json`` — ``security._validate_operator_oauth_entries``
 #:      extends trust by nothing for ``{}``;
 #:    * ``aws_service_consent.json`` — ``aws_consent._read_all`` returns ``{}`` for
-#:      both absent and empty, so every service stays unconfirmed.
+#:      both absent and empty, so every service stays unconfirmed;
+#:    * ``decisions_consent.json`` — ``decisions.consent.load_state`` reads ``{}``
+#:      as NOT CONSENTED, which is what an absent keystone means;
+#:    * ``settings_seeds.json`` — ``acp.seed_provenance._load`` finds no ``seeds``
+#:      mapping in ``{}`` and returns having recorded nothing, so every settings
+#:      path reads as unowned. Identical to absent, and the leaf that most needs
+#:      materialising: it is written only once a claude-agent-acp session has
+#:      actually seeded a work dir, so on every install that has not it is exactly
+#:      the absent-and-therefore-writable name this list exists to close.
 #:
 #: 2. A STALE read of that empty document must fail toward refusal. The seal is a
 #:    bind mount, which pins the INODE for the sandbox's lifetime, while every
 #:    dashboard writer publishes through ``atomic_write`` (temp + rename), i.e. a NEW
 #:    inode. So a sandboxed reader keeps seeing the empty document even after the
-#:    operator writes the real one. For the three files above that freezes them at
-#:    "disabled" / "no consent" / "no extra endpoints" — narrower than the truth. The
-#:    empty ``profiles`` dir is exempt from the concern entirely: a directory bind
-#:    shows live contents, so a profile added later is visible.
+#:    operator writes the real one. For the three JSON files above that freezes them at
+#:    "disabled" / "no consent" / "no extra endpoints" — narrower than the truth, and
+#:    for ``settings_seeds.json`` at "Crew owns no settings file", so the writer takes
+#:    its leave-it-alone branch: the seed is not refreshed, and nothing is overwritten
+#:    or unlinked. The empty ``profiles`` dir is exempt from the concern entirely: a
+#:    directory bind shows live contents, so a profile added later is visible.
 #:
 #: DELIBERATELY EXCLUDED, and each for a different one of those two reasons:
 #:
@@ -363,21 +1498,414 @@ _CREW_READONLY_TARGETS: list[str] = _crew_home_entries(_CREW_READONLY_LEAVES)
 #: this list closes: a mask needs the opposite treatment (an empty bind OVER the
 #: name), and ``_CREW_HIDDEN_LEAVES`` has no reader to prove an empty document is
 #: absent-equivalent, so each leaf needs its own argument.
-_CREW_PRECREATE_READONLY_DIR_LEAVES: tuple[str, ...] = ("profiles",)
+_CREW_PRECREATE_READONLY_DIR_LEAVES: tuple[str, ...] = (
+    # Empty roots confer no run authority; directory mounts expose later
+    # gateway records without letting a sandbox create the missing root.
+    "subagents",
+    "member-memory-bindings",
+    "memory_stores",
+    "profiles",
+    # The crew webview template directory. A fence only fences an EXISTING path:
+    # the Linux launcher skips the read-only mount for an absent target, so on a
+    # fresh install -- where no operator has dropped an override yet -- the
+    # directory does not exist, the seal is silently skipped, and the agent can
+    # create it and author its own template. Which is precisely the write the
+    # read-only listing above exists to deny, so without this entry that listing
+    # protects only hosts that happen to have the directory already.
+    "panel-templates",
+    "playwright-cli",
+    # The decision log, on the ``profiles`` argument rather than the JSON one.
+    # (1) An EMPTY dir means what an ABSENT dir means to its only reader:
+    # A reader resolves a day-file by name and skips one that is not there, so no
+    # day-files is no rows either way. (2) A stale read cannot arise, because a
+    # directory bind shows LIVE contents -- a day-file the gateway writes later is
+    # seen, not frozen out. Without this entry the seal skips the absent directory,
+    # which is the state of every install that has never sampled a decision, and
+    # leaves exactly the name an agent would create in order to forge a verdict.
+    "decisions",
+    # The redaction allow-list, on the same argument: no file means no host
+    # allowed, which is what an empty directory means too, and the bind is live.
+    "redaction-allow",
+    # Pi's gate launcher and sealed extension. Materialised here rather than only by
+    # the adapter so the directory is a read-only mountpoint before ANY sandbox starts,
+    # including the first pi spawn on a fresh install.
+    "pi-gate",
+    # Empty directories are absent-equivalent to the approval and resolution readers.
+    # Pre-creation gives Linux concrete bind targets on a fresh install.
+    "mcp-launch-approvals",
+    "mcp/resolved",
+)
+#: Read-only directory leaves whose NAME must remain the mounted name. A resolving
+#: symlink is unsafe here: the mount follows its target and leaves the lexical name
+#: replaceable, which would let an agent choose the executable the gateway runs --
+#: or, for ``decisions``, keep writing the log the owner reads verdicts from after
+#: its target was sealed instead of the leaf. Every seal here is the load-bearing
+#: half of a control, so none may be satisfied by a link the governed party planted.
+_CREW_NOFOLLOW_READONLY_DIR_LEAVES: tuple[str, ...] = (
+    "playwright-cli",
+    "subagents",
+    "member-memory-bindings",
+    "decisions",
+    "redaction-allow",
+    "pi-gate",
+    "mcp-launch-approvals",
+    "mcp/resolved",
+)
+assert set(_CREW_NOFOLLOW_READONLY_DIR_LEAVES) <= set(_CREW_PRECREATE_READONLY_DIR_LEAVES)
+#: Read-only FILE leaves whose NAME must remain the sealed name, for the same reason
+#: as the directory list above and needing its own entry because the file loop below
+#: only WARNS on an alias where the directory loop REFUSES. A bind mount seals the
+#: link's REFERENT, so a leaf that resolves leaves the lexical name replaceable in a
+#: writable parent: a sandboxed process unlinks it and drops its own file there, and
+#: the seal is intact around a name that now means something else. For ``cloud.json``
+#: that name decides which container image a Fargate launch runs, and the task's
+#: execution role delivers the model credential into it.
+_CREW_NOFOLLOW_READONLY_FILE_LEAVES: tuple[str, ...] = ("cloud.json",)
+
+#: Every strict no-alias crew-home leaf a DELEGATED spawn's workspace must not overlap, with
+#: the wording that names which seal an operator is looking at. The refusal's target list is
+#: DERIVED from these keys rather than from one of the two lists above, because a list-shaped
+#: derivation covers one SHAPE and leaves the other uncovered with nothing saying so: a leaf
+#: sealed as a DIRECTORY is not reached by a derivation over the FILE leaves, and a workspace
+#: set to it keeps the write its seal denies. The assert below makes drift loud in both
+#: directions -- a sealed leaf with no wording, and wording for a leaf nothing seals.
+_DELEGATED_OVERLAP_LEAF_REASONS: "dict[str, tuple[str, str]]" = {
+    "cloud.json": (
+        "sealed cloud configuration",
+        "the agent could choose the container image a Fargate launch runs, and the task's "
+        "execution role delivers the model credential into it",
+    ),
+    "playwright-cli": (
+        "sealed browser runtime",
+        "the agent could replace the browser executable the gateway runs",
+    ),
+    # These two are gateway-owned run records: results stay readable, and agent code must
+    # not rewrite the app owner a continuation restores its authorization from. The wording
+    # follows _CREW_READONLY_LEAVES' own note on them. Every leaf sealed on either nofollow
+    # list needs an entry here, which is what the assert below enforces.
+    "subagents": (
+        "sealed run records",
+        "the agent could rewrite the app owner a cold continuation restores its "
+        "authorization from",
+    ),
+    "member-memory-bindings": (
+        "sealed run records",
+        "the agent could rewrite the app owner a retained V1 run restores its "
+        "authorization from",
+    ),
+    # Sealing the seam that turns the feature on without sealing the record it writes
+    # would be half a control: appending one feedback row is enough to put a verdict
+    # in the owner's own summary. Every legitimate writer is the gateway, outside the
+    # sandbox.
+    "decisions": (
+        "sealed decision log",
+        "the agent could append a feedback row the owner's summary counts as a "
+        "verdict nobody gave",
+    ),
+    "redaction-allow": (
+        "sealed redaction allow-list",
+        "the agent could allow the host it wants to send conversation data to",
+    ),
+    "pi-gate": (
+        "sealed pi gate runtime",
+        "the agent could plant the launcher a later pi session execs out of",
+    ),
+    "mcp-launch-approvals": (
+        "sealed MCP launch approvals",
+        "the agent could approve a command the gateway launches outside the sandbox",
+    ),
+    "mcp/resolved": (
+        "sealed resolved MCP launches",
+        "the agent could replace the executable the gateway substitutes for an approved launch",
+    ),
+}
+assert set(_DELEGATED_OVERLAP_LEAF_REASONS) == set(_CREW_NOFOLLOW_READONLY_FILE_LEAVES) | set(
+    _CREW_NOFOLLOW_READONLY_DIR_LEAVES
+)
+
 _CREW_PRECREATE_READONLY_FILE_LEAVES: tuple[str, ...] = (
+    # The launch record. Criterion 1 (an EMPTY document means what an ABSENT one means) is
+    # met by ``LaunchState.load`` treating a document carrying none of its three keys as no
+    # record at all and consulting the legacy fields, which is exactly what it does for an
+    # absent file -- so a pre-created ``{}`` cannot strand an install whose pointer still
+    # lives in ``cloud.json``. Criterion 2 (a stale sealed read fails toward refusal) holds
+    # too: a sandboxed reader frozen at ``{}`` sees no tag and the command exits with "no
+    # previous launch found" rather than acting on one, which is narrower than the truth.
+    "cloud_launch_state.json",
     "computer_use.json",
     "oauth_endpoints.json",
     "aws_service_consent.json",
+    "decisions_consent.json",
+    # ``file_delivery_consent._read_all`` returns ``{}`` for both absent and
+    # unreadable, and ``is_granted`` then reports no consent -- so an EMPTY
+    # document means exactly what an ABSENT one means (criterion 1). A stale
+    # sealed read also fails toward refusal: the writer publishes through
+    # ``atomic_write`` (new inode), so a sandboxed reader keeps seeing ``{}`` and
+    # stays frozen at "no consent", which is narrower than the truth
+    # (criterion 2).
+    "file_delivery_consent.json",
+    # Consent to forward SSH_AUTH_SOCK satisfies both criteria the way
+    # ``file_delivery_consent.json`` does: ``ssh_auth_sock_consent.is_granted``
+    # reports no consent for an absent, empty, AND unreadable store alike, so a
+    # pre-created ``{}`` means exactly "not forwarded" (criterion 1); the writer
+    # publishes through ``atomic_write`` (new inode), so a sandboxed reader frozen
+    # at ``{}`` under-reports consent, which is narrower than the truth
+    # (criterion 2). Without this entry the Linux mount seal skips the absent leaf
+    # -- the DEFAULT before any grant -- leaving it creatable from inside the
+    # namespace sandbox.
+    "ssh_auth_sock_consent.json",
+    # The credential-redaction switch satisfies both criteria the way
+    # ``file_delivery_consent.json`` does: ``redaction_switch.read_state`` reads
+    # absent, empty and unreadable alike as ENABLED, so a pre-created ``{}``
+    # means exactly what an absent file means (criterion 1); the writer
+    # publishes through ``atomic_write`` (new inode), so a sandboxed reader
+    # frozen at ``{}`` keeps redacting after the owner switches off, which is
+    # narrower than the truth (criterion 2).
+    "credential_redaction.json",
+    "settings_seeds.json",
+    # The runtime config and its overlay. Criterion 1: ``KiroCrewConfig.load()`` yields
+    # the same defaults for ``{}`` as for an absent file, and an empty overlay overrides
+    # nothing; the gateway creates ``config.json`` at boot, so in practice only the
+    # overlay is ever absent here -- which is exactly the name an agent would otherwise
+    # create to win the merge. Criterion 2 is met in the only sense that matters for a
+    # settings file: a sandboxed reader that sees an older document sees stale
+    # SETTINGS (a crew roster, a probe timeout), never a looser CONFINEMENT, because
+    # every decision these files feed that confines the agent -- its sandbox tier, app
+    # admission, unsandboxed-exec -- is taken by the gateway outside the sandbox, which
+    # reads the live file. Known Linux residual, shared with every leaf on this list:
+    # the host publishes each save through ``atomic_write`` (temp + rename), and the
+    # kernel detaches a file bind whose target is renamed over from another mount
+    # namespace, so the seal holds from spawn until the NEXT gateway save of that file
+    # and the name is then unsealed in that sandbox until it respawns. That save is
+    # not only the operator's: the gateway saves on its own (boot migrations,
+    # member-identity publication, memory-store provisioning) and an in-sandbox
+    # agent can reach some of those paths through an ordinary tool call. The fix
+    # for all sealed leaves at once is a read-only DIRECTORY bind, tracked separately.
+    "config.json",
+    "config.local.json",
+    # The cloud launcher's config, and the leaf where an ABSENT file is the more
+    # dangerous case: with no file there is no seal, so an agent could CREATE the
+    # whole ``fargate`` block -- its own image beside the owner's real secret ARNs --
+    # and the owner's next launch would deliver the model credential into it.
+    # Criterion 1: ``CloudConfig.load()`` returns the same defaults for ``{}`` as for
+    # an absent or unparseable file, and ``fargate_config()`` reads ``{}`` as no
+    # block, so an empty document means exactly what an absent one means.
+    # Criterion 2: a stale sealed read fails toward refusal. A pinned ``{}`` leaves a
+    # sandboxed reader seeing no Fargate block and no saved profile even after the
+    # operator writes one, so the lane stays UNREGISTERED and an in-sandbox launch
+    # reads as unconfigured -- narrower than the truth, never wider.
+    "cloud.json",
+    # The fork-lineage sidecar satisfies both criteria the way
+    # ``file_delivery_consent.json`` does: ``agent_state._read`` returns ``{}``
+    # for absent, unreadable, AND an empty document alike, so a pre-created
+    # ``{}`` means exactly "no lineage recorded" (criterion 1); the writer
+    # publishes through ``atomic_write`` (new inode), so a sandboxed reader
+    # frozen at ``{}`` under-reports fork status — which grants nothing, since
+    # the write seal is what withholds forgery and it applies regardless
+    # (criterion 2). Without this entry the Linux mount seal skips the absent
+    # sidecar — the DEFAULT state before any fork — leaving it creatable from
+    # inside the namespace sandbox.
+    "agent_model_state.json",
+    # The sidecar's advisory lock, same absent-file reasoning: the lock is
+    # created on first use, so without pre-creation a sandbox spawned before
+    # any lineage write finds it absent and creatable — and a sandbox-created
+    # lock is exactly the replaced-inode attack the read-only seal exists to
+    # stop. An empty lock file is absent-equivalent by definition: its content
+    # is never read, only its identity is locked.
+    "agent_model_state.json.lock",
 )
+
+#: The one masked leaf that carries its own argument (see the sibling-gap note
+#: above): a DIRECTORY the gateway creates on demand, whose EMPTY state is
+#: absent-equivalent because nothing but the gateway reads it -- it cuts a fresh
+#: per-call subdirectory for one CLI transfer and removes it again. Left to lazy
+#: creation, a sandbox spawned on a fresh install before the first transfer finds
+#: the target absent, the ``SENSITIVE_DIRS`` loop skips it, and the directory the
+#: gateway creates later appears INSIDE that running sandbox's view -- where a
+#: same-UID agent can swap the transfer's destination for a link. Materialised
+#: (empty, 0o700) before every namespace spawn instead, so the mask always has a
+#: name to bind over.
+#:
+#: ``appearance-library`` is here for the same reason with a different consequence:
+#: ``dashboard/appearances.py`` builds the crew library on FIRST USE, so an install
+#: that has never imported a pack has no directory for the mask loop to bind over,
+#: and the first import then creates it visible to every sandbox already running --
+#: where a same-UID agent can ``rm -rf`` packs the user cannot get back. The store
+#: tolerates finding its root already present and empty.
+#:
+#: ``quarantined-clones`` shares that first-use shape: the root is built when the
+#: first clone is quarantined, so an install that has never had one offers the mask
+#: loop no name, and the marker that must outlive an agent's process would be
+#: created visible to every sandbox already running. Its resolver treats an
+#: existing empty root as usable, and proves the root writable before certifying
+#: any clone, so materialising it early changes nothing it relies on.
+_CREW_PRECREATE_HIDDEN_DIR_LEAVES: tuple[str, ...] = (
+    "aws-control-staging",
+    # Same lazily-created shape as aws-control-staging: the file-delivery step-up
+    # nonce dir is created on demand only when the owner first ARMS a grant
+    # (``file_delivery_consent.arm_grant`` -> ``make_owner_only_dir(path.parent)``).
+    # On a fresh install with no prior arm the leaf is absent at spawn, the
+    # ``isdir``-guarded SENSITIVE_DIRS loop skips it, and a later dashboard arm
+    # materialises the nonce INSIDE a running sandbox's view -- where a same-UID
+    # agent reads it and drives the loopback /approve to self-grant. Precreated
+    # (empty, 0o700) before every spawn so the mask always has a name to bind over.
+    "file-delivery-consent-pending",
+    "appearance-library",
+    "quarantined-clones",
+    # First created by the first member-born session's vouch, so a sandbox spawned
+    # before then would otherwise see the directory appear unmasked.
+    "vouched-executions",
+    # md-notebook's write-staging directory, for the same reason and by the same rule: a
+    # direct child of the data home, so the plain ``mkdir`` above is sound. Left to lazy
+    # creation, a sandbox spawned before the first state write finds it absent, the
+    # ``SENSITIVE_DIRS`` loop skips it, and the directory the backend creates later shows
+    # up INSIDE that running sandbox — with the PAT staging window in it.
+    _MD_NOTEBOOK_STAGING_LEAF,
+    # The live-target stub's staging directory, by the same rule: created before the
+    # first spawn so the mask has a mount target, and the temp the materialiser stages
+    # in it is never visible to a running namespace.
+    _LIVE_TARGET_STAGING_LEAF,
+    # The auth stores' staging directory, by the same rule. Left to lazy creation, a sandbox
+    # spawned before the first key or chain-state write finds it absent, the ``SENSITIVE_DIRS``
+    # loop skips it, and the directory the gateway creates later shows up INSIDE that running
+    # sandbox -- with the signing-key staging window in it.
+    _AUTH_STORE_STAGING_LEAF,
+    # ``crew-panels`` is the same requirement seen from the mirror side of the
+    # ceilings above: a read-only ceiling is materialised so the SEAL can apply,
+    # a hidden leaf so the MASK can. The skip lands precisely on a fresh install,
+    # where the agent could then create the directory itself and write what the
+    # gateway later reads back as authoritative. Same failure the
+    # ``panel-templates`` ceiling has, one list over.
+    "crew-panels",
+    # Panel dismissals, by the same rule and with a sharper version of the same
+    # timing: this directory does not exist until the operator dismisses their
+    # first card, so on every fresh install the mask loop finds the name absent
+    # and skips it. A sandbox spawned in that window can then create the
+    # directory itself and forge dismissals the gateway reads back as the
+    # operator's, hiding runs from the panel. Materialising it empty gives the
+    # bind a target from first boot.
+    "panel-dismissals",
+    # Append-only per-unit crew logs, and the hazard is the sharpest here: the
+    # record is the AUTHORITY a reader trusts instead of re-deriving, and the
+    # store creates this root on its first write. A sandbox spawned before that
+    # write finds the name absent, the ``SENSITIVE_DIRS`` loop skips what does not
+    # exist, and the mask is then vacuous for the life of that sandbox -- which can
+    # itself create the directory and populate it with entries a conductor would
+    # read as the gateway's. Materialising it empty at 0700 gives the bind a name
+    # to cover before anything can write one. macOS needs no entry here: a
+    # Seatbelt deny is a path rule that holds for a name that does not exist yet.
+    "crew-log",
+    # The chat_tag grants store writes by atomic rename of a sibling temp, so
+    # the whole directory must exist before the isdir-guarded mask loop runs —
+    # otherwise the first sandbox spawned before the first grant write sees an
+    # unmasked leaf appear later.
+    "tag-grants",
+    # The crewmate-teams store is created on the first team the owner makes, so a
+    # sandbox spawned before that finds the name absent and the mask is vacuous
+    # for its lifetime; materialised empty at 0700 so the bind always has a
+    # target.
+    "crew-teams",
+    # The cross-process work root, and it needs this entry MORE than the stores
+    # above rather than less: it is created lazily by the first ``allocate_work``
+    # call, so on a fresh home the leaf is absent at every spawn until some job
+    # allocates, the ``isdir``-guarded ``SENSITIVE_DIRS`` loop skips what does not
+    # exist, and the mask is vacuous for the life of those sandboxes. The
+    # ``scratch`` sibling carries no entry because every spawn allocates one, so
+    # that root exists by construction; nothing allocates a work directory for a
+    # spawn. Left absent, a sandboxed agent could itself create the directory at a
+    # key it expects a job to use -- keys are deterministic by design -- and, since
+    # the allocation marker that distinguishes this module's own tree is a name in
+    # the code, plant that too, so ``allocate_work`` rejoins the planted tree rather
+    # than refusing it. Materialised empty at 0700 before every spawn so the bind
+    # always has a target.
+    "work",
+    # The refused-inbound spool root, and its consequence is the sharpest kind: the
+    # store is created by its own first write, so on a host where no inbound message
+    # has been refused the name is absent, the ``isdir``-guarded ``SENSITIVE_DIRS``
+    # loop skips it, and the mask is vacuous for the life of every sandbox spawned
+    # first. One of those can create the directory ITSELF and leave an entry the
+    # gateway reads on the next start and quotes verbatim, as the operator's own
+    # words, into a conversation the egress recheck still authorizes. The module's
+    # own refusals do not reach this shape -- they refuse a LINK at the directory,
+    # the leaf or the lock, and a directory an agent created is a real directory
+    # holding a plain single-linked file. Materialised empty at 0700, which is what
+    # the spool's own ``restrict_to_owner=True`` writes already require of it; its
+    # readers open the leaf inside, so an empty root reads exactly as an absent one.
+    "inbound-spool",
+)
+
+#: The masked md-notebook leaves materialised before a namespace spawn, and what each
+#: holds. This is the per-leaf argument the sibling-gap note above asks for: ``mount(2)``
+#: cannot mask an absent path and the ``SENSITIVE_FILES`` loop guards on ``isfile``, so an
+#: ABSENT leaf gets NO mask, and a namespace that outlives the leaf's later creation reads
+#: the real bytes — the PAT among them. That was vacuous while nothing could create these
+#: files on a sandboxed host; the backend carve-out
+#: (:func:`app_backend_visible_targets`) makes creation possible, so the mask has to be
+#: made non-vacuous first. Each document is its reader's absent-equivalent, and the
+#: md-notebook backend is the only reader:
+#:
+#:   * ``vaults.json`` — ``_read_vaults_sync`` returns ``[]`` for absent (OSError) and
+#:     for ``[]`` alike;
+#:   * ``settings.json`` — ``_load_settings_sync`` returns the defaults for absent and
+#:     reads ``{}`` as every-field-default;
+#:   * ``pat`` — ``_read_pat_sync`` maps absent (OSError) and empty (``"" or None``) both
+#:     to ``None``.
+#:
+#: The STALE-read criterion that excludes most hidden leaves does not arise: the agent's
+#: view is the pinned empty MASK file either way, never this document, which is exactly
+#: the mask's intent.
+_MD_NOTEBOOK_PRECREATE_CONTENT: dict[str, bytes] = {
+    f"workspace/{MD_NOTEBOOK_APP_NAME}/pat": b"",
+    f"workspace/{MD_NOTEBOOK_APP_NAME}/vaults.json": b"[]\n",
+    f"workspace/{MD_NOTEBOOK_APP_NAME}/settings.json": b"{}\n",
+}
+assert set(_MD_NOTEBOOK_PRECREATE_CONTENT) == set(_MD_NOTEBOOK_STATE_LEAVES)
+
+#: The masked live-target pointer materialised before a namespace spawn, and what it
+#: holds. Same gap as :data:`_MD_NOTEBOOK_PRECREATE_CONTENT` closes, arrived at from the
+#: opposite direction: the ``SENSITIVE_FILES`` loop guards on ``isfile``, so an ABSENT
+#: pointer gets NO mask, and a namespace that outlives the pointer's later creation sees
+#: the real file in a directory it can write. For md-notebook that gap leaks a secret; for
+#: this leaf it hands over a code-execution input — the pointer names the checkout the
+#: gateway ``execve``s into, so an agent that writes one chooses what the host runs next.
+#:
+#: That gap was never vacuous for THIS leaf: the crew data-home root is writable in every
+#: sandbox (an in-sandbox ``atomic_write`` stages its temp there), so with the pointer
+#: absent an agent shell can simply create one. The pointer's legitimate writer is now the
+#: gateway process (Dev Fleet's in-gateway cutover route); the sandboxed backend and its
+#: build children are readers at most, and only through that route.
+#:
+#: A DIRECT child of the data home, so :func:`_publish_empty_ceiling` needs no
+#: intermediate-component walk — the hazard :func:`_materialize_md_notebook_mask_targets`
+#: guards against (an agent-writable ancestor swapped for a link) has no path here.
+#:
+#: The document is the pointer's absent-equivalent by construction rather than by
+#: coincidence: ``live_target.NO_TARGET_DOCUMENT`` is defined for this purpose and
+#: ``read_target_reason`` answers ``(None, None)`` for it, exactly as for an absent file —
+#: no boot warning, no "unusable pointer" in the fleet view. Spelled as a literal here for
+#: the reason the leaf name is (this module does not import the config-loader chain);
+#: ``test_sandbox_dev_fleet_live_target.py`` pins the two equal.
+_LIVE_TARGET_PRECREATE_CONTENT: bytes = b'{\n  "checkout": null\n}\n'
 
 #: What a materialised ceiling holds — the empty JSON object every reader above
 #: already treats as its absent default. NOT a zero-byte file, which is not valid
 #: JSON and would read as CORRUPT rather than as absent.
 _EMPTY_CEILING_DOCUMENT: bytes = b"{}\n"
 
+#: Prefix of the in-flight temp ``_publish_empty_ceiling`` stages in its target's
+#: parent. Named so a sweep of that directory can tell a gateway-owned temp mid-publish
+#: from an orphan it is meant to remove.
+_CEILING_TEMP_PREFIX: str = ".kirocrew-ceiling-"
+
 
 def _sealable_absent_ceilings() -> tuple[list[str], list[str]]:
-    """Resolved (dir, file) ceiling paths that may be created so the seal can apply.
+    """Resolved (dir, file) paths that may be created so their disposition can apply.
+
+    Two kinds of directory, one requirement. A read-only ceiling is materialised so
+    the SEAL can apply; a hidden leaf is materialised so the MASK can. Both are
+    skipped by their launcher loop when absent, so both need the path to exist
+    before the loop runs, and the creation rules are identical -- 0o700, never
+    truncate, never remove, refuse a dangling symlink.
 
     Resolved through ``config_dir()`` — the LIVE data home — rather than expanded over
     both ``_CREW_HOME_PREFIXES`` the way the deny lists are. A deny rule covers both
@@ -396,10 +1924,27 @@ def _sealable_absent_ceilings() -> tuple[list[str], list[str]]:
     except Exception:  # pragma: no cover - defensive; a spawn must not fail on this
         logger.debug("could not resolve the crew data home for ceiling sealing", exc_info=True)
         return ([], [])
-    return (
-        [os.path.join(root, leaf) for leaf in _CREW_PRECREATE_READONLY_DIR_LEAVES],
-        [os.path.join(root, leaf) for leaf in _CREW_PRECREATE_READONLY_FILE_LEAVES],
-    )
+    file_targets = [os.path.join(root, leaf) for leaf in _CREW_PRECREATE_READONLY_FILE_LEAVES]
+    # Read-only ceilings AND hidden leaves: the seal needs the former to exist,
+    # the mask needs the latter (see the docstring), so both are materialised here.
+    dir_targets = [
+        os.path.join(root, leaf)
+        for leaf in _CREW_PRECREATE_READONLY_DIR_LEAVES + _CREW_PRECREATE_HIDDEN_DIR_LEAVES
+    ]
+    try:
+        # The kiro agents tree (fork governance's specs + their lock; see the
+        # readonly-target entry above): the Linux mount seal needs a directory
+        # to bind, and an install may not have created it yet — an unsealed
+        # absent dir would be creatable from inside the sandbox, placing
+        # forged specs where the next spawn resolves them. Gated on the crew
+        # data home existing so a host with no install at all is not
+        # scaffolded (the absent-data-home contract of the entries above).
+        agents_dir = kiro_agents_dir()
+        if os.path.isdir(root):
+            dir_targets.append(str(agents_dir))
+    except Exception:  # pragma: no cover - defensive, same posture as above
+        logger.debug("could not resolve the kiro agents dir for sealing", exc_info=True)
+    return (dir_targets, file_targets)
 
 
 class SandboxCeilingUnsealable(RuntimeError):
@@ -441,6 +1986,188 @@ def _warn_unsealed_ceiling(target: str, exc: "OSError | None") -> None:
         "writable inside the sandbox",
         target,
         exc if exc is not None else "publish failed",
+    )
+
+
+#: Protected leaves where an ALIASED name is a hard spawn failure, not a warning.
+#:
+#: These two are reached by the SEALING loop, where ``_warn_if_alias_backed`` warns
+#: deliberately: a sealed ceiling is an operator's config file and a dotfile manager
+#: (chezmoi, stow) legitimately symlinks one, so refusing would turn a normal setup into a
+#: spawn failure for a hole that is pre-existing and narrower than the breakage. The
+#: MASKED leaves are a different population and refuse through
+#: :func:`_refuse_aliased_masked_leaves`; this set is what the sealing loop refuses.
+#:
+#: These three are not config files and nothing has a reason to link them:
+#:
+#: * ``crew-panels`` -- created on demand by the GATEWAY and read by nothing else.
+#:   It is bind-MASKED, so a link means the mask attaches to the target while the
+#:   link name stays writable in the data home: a sandboxed process unlinks it,
+#:   drops its own directory, and forges records the gateway reads back as
+#:   authoritative -- past the ownership check and past the redactors.
+#: * ``panel-templates`` -- holds the human-authored TEMPLATE whose separation from
+#:   crew-published DATA is the whole containment story. Replacing that directory is
+#:   authoring markup that renders in the panel, not changing a setting.
+#: * ``panel-dismissals`` -- created on demand by the GATEWAY and read by nothing
+#:   else, and the link hazard is identical to ``crew-panels``: the mask attaches to
+#:   the target while the link NAME stays writable in the data home, so a sandboxed
+#:   process unlinks it, drops its own directory, and forges dismissals the gateway
+#:   reads back as the operator's -- hiding finished runs from the panel.
+#:
+#: So for these, a link is refused: the disposition must attach to the same name the
+#: reader uses, and following a link is exactly the gap that voids it.
+_CREW_NO_ALIAS_LEAVES: frozenset[str] = frozenset(
+    {"crew-panels", "panel-dismissals", "panel-templates"}
+)
+
+#: Masked leaves where a SYMLINK is tolerated, and why. Every other entry in
+#: :data:`_CREW_HIDDEN_LEAVES` refuses one through :func:`_refuse_aliased_masked_leaves`,
+#: so this set is the whole exception list and each member states its own reason.
+#:
+#: Tolerated means NOT REFUSED, never NOT LOOKED AT. The pass visits these leaves and logs a
+#: warning, because the alias really is outside the mask: excluding them from the walk would
+#: reproduce, on the credential leaf, exactly the silence the pass exists to end.
+#:
+#: * ``.env`` -- the operator's OWN channel-credential file, authored by hand and
+#:   documented as such (``docs/architecture/overview.md`` lists it as "channel tokens,
+#:   owner id"). It is the clearest member of the class ``_warn_if_alias_backed`` exists
+#:   for: a dotfile manager (chezmoi, stow) symlinks exactly this file, so refusing it
+#:   would turn an ordinary setup into a spawn failure for every agent on the host.
+#:
+#: Deliberately NOT here, having been checked for a supported second name and found to
+#: have none -- both resolve to one managed path with no override, so a link is not a
+#: relocation the product offers:
+#:
+#: * ``scratch`` -- ``agent_scratch.scratch_root()`` is ``config_dir() / "scratch"``;
+#: * ``work`` -- ``work_root.work_root()`` is ``config_dir() / "work"``, and the module
+#:   refuses a linked root at allocation and sweeps nothing through one;
+#: * ``backup`` -- no resolver in the tree reads an override for it either.
+#:
+#: The HARDLINK shape is tolerated for every leaf, which is why it is a property of the
+#: pass rather than an entry here: see :func:`_refuse_aliased_masked_leaves`.
+_CREW_ALIAS_TOLERATED_LEAVES: frozenset[str] = frozenset({".env"})
+
+#: Masked leaves where a planted link at an INTERMEDIATE component DEGRADES instead of
+#: refusing, because a sibling control already answers that case.
+#:
+#: Derived from :data:`_MD_NOTEBOOK_PRECREATE_CONTENT`, not hand-listed, so the two cannot
+#: drift. Those leaves are the ones :func:`carveout_chain_has_planted_link` governs, and its
+#: docstring states the reasoning this set defers to: withholding the CARVE-OUT is the
+#: proportionate response, since while the chain holds a planted link the owning backend
+#: cannot write that state at all, so a leaf left unmasked has nothing to expose. Refusing
+#: the spawn instead would let one optional app's on-disk layout take every sandboxed
+#: process on the host down with it -- an operator who symlinks ``workspace/`` to another
+#: disk would find no agent could start, over a file they may never have created.
+#:
+#: Every OTHER multi-component masked leaf refuses, because no such compensating control
+#: exists for it: nothing withholds anything when ``apps/aws-control`` is a link, so the
+#: mask binds the referent while the writable alias name persists.
+_CREW_ALIAS_CHAIN_DEGRADE_LEAVES: frozenset[str] = frozenset(_MD_NOTEBOOK_PRECREATE_CONTENT)
+
+#: Masked leaves where an extra HARD LINK refuses the spawn rather than warning.
+#:
+#: The mask binds a PATH, so it does not follow the inode: a second name on the same inode
+#: is an unmasked way to the same bytes, for reading AND for writing, and no check on the
+#: masked name can see it. That is the same reasoning
+#: :func:`_refuse_unless_sole_regular_link` already applies to the live-target pointer,
+#: where ``st_nlink != 1`` refuses; this set carries it to the leaves whose bytes are
+#: themselves a usable secret.
+#:
+#: MEMBERSHIP RULE, so a leaf added later inherits a decision instead of silence: the
+#: leaf's bytes are usable off this host on their own -- a signing key, a bearer token, a
+#: session cookie, a password. A leaf masked for INTEGRITY instead, where the harm is an
+#: agent WRITING it, stays a warning: the write alias is real, but those leaves each have a
+#: reader that re-validates the content, and refusing on them would widen the spawn-failure
+#: surface past the bytes an attacker can simply walk away with.
+#:
+#: Only a REGULAR FILE can carry a second hard link -- ``link(2)`` refuses a directory --
+#: so every directory leaf is outside this decision by shape rather than by judgement, and
+#: no entry here needs to name one.
+#:
+#: * ``token_signing.key`` -- signs dashboard access and refresh tokens. The bytes forge
+#:   any session cookie, so a read is a full authentication bypass.
+#: * ``refresh_chains.json`` -- the refresh-token chain state that decides which refresh
+#:   presentations are still live; a read continues an operator's session.
+#: * the auth SQLite store and its WAL, SHM and journal sidecars -- its own entry in
+#:   :data:`_CREW_HIDDEN_LEAVES` states the reason this set needs: the bytes ARE a live
+#:   bearer token, and the sidecars hold the same bytes mid-transaction.
+#: * ``.env`` -- the operator's channel credentials, the live Slack, Discord and Telegram
+#:   tokens. It is TOLERATED for a symlink in :data:`_CREW_ALIAS_TOLERATED_LEAVES` and
+#:   deliberately NOT tolerated here: that tolerance exists for the layout a dotfile
+#:   manager produces, and chezmoi and stow produce a SYMLINK or a copy. A hard link on
+#:   this file is not that supported layout, and it is the highest-value secret in the home.
+#: * the Notes personal access token -- a live bearer credential for the operator's
+#:   repositories. Reachable from inside the sandbox rather than only by pre-planting: the
+#:   Notes backend is itself a sandboxed spawn holding a legitimate window on this leaf, so
+#:   one agent can create the second name and an ordinary session then reads the token.
+#: * ``ops_mission_control_secrets.json`` -- the app's credential store by name.
+#: * ``browser-cookies.txt``, ``playwright-storage-state.json`` and
+#:   ``playwright-extension-token`` -- browser session material: site cookies, the storage
+#:   state that carries them plus localStorage tokens, and the extension's bearer token.
+#:   Retired leaves with no reader left in the tree, kept here for the reason
+#:   ``.kiro_cli_binary_trust.json`` gives for being masked at all -- a backup restore can
+#:   resurrect one, and a restored cookie jar is a live credential again.
+#:
+#: The cost is stated rather than hidden: an extra hard link refuses EVERY agent spawn on
+#: the host, including when the second name sits outside the sandbox where it is harmless,
+#: because ``st_nlink`` reports that a second name exists and not where it is.
+#: :func:`masked_credential_leaf_aliases` is what keeps that from arriving as an
+#: unexplained outage -- ``kirocrew doctor`` reports the condition before a spawn refuses
+#: on it, the same answer the live-target pointer's own read already gives for the same
+#: shape, and the refusal names the ``find -samefile`` command that locates the other name.
+_CREW_HARDLINK_REFUSED_LEAVES: frozenset[str] = frozenset(
+    {
+        "token_signing.key",
+        "refresh_chains.json",
+        AUTH_SQLITE_DB,
+        *(f"{AUTH_SQLITE_DB}{suffix}" for suffix in AUTH_SQLITE_SIDECAR_SUFFIXES),
+        ".env",
+        f"workspace/{MD_NOTEBOOK_APP_NAME}/pat",
+        "ops_mission_control_secrets.json",
+        "browser-cookies.txt",
+        "playwright-storage-state.json",
+        "playwright-extension-token",
+    }
+)
+
+
+#: The tolerated leaves must BE masked leaves -- an entry naming something outside
+#: :data:`_CREW_HIDDEN_LEAVES` would be an exception to nothing, and would read as a
+#: permission the pass never actually grants. Pinned by
+#: ``test_the_tolerated_set_names_only_masked_leaves`` rather than a module-level
+#: ``assert``, which ``python -O`` strips and which would make the invariant hold only
+#: in the builds that happen not to be optimised.
+
+
+def _refuse_if_aliased_protected_leaf(target: str) -> None:
+    """Refuse the spawn when a protected leaf is reachable under a second name.
+
+    Same two shapes ``_warn_if_alias_backed`` reports -- a symlink, or a regular
+    file with an extra hardlink -- but for :data:`_CREW_NO_ALIAS_LEAVES` the
+    outcome is a refusal. Warning and continuing is what made this silent: the log
+    said the path was sealed while the writes went somewhere else.
+    """
+    if os.path.basename(target.rstrip("/" + os.sep)) not in _CREW_NO_ALIAS_LEAVES:
+        return
+    try:
+        info = os.lstat(target)
+    except OSError:
+        return
+    if stat.S_ISLNK(info.st_mode):
+        pointed_at = "(unreadable)"
+        with contextlib.suppress(OSError):
+            pointed_at = os.readlink(target)
+        raise SandboxCeilingUnsealable(
+            f"the protected directory {target} is a SYMLINK -> {pointed_at}. Its "
+            "disposition attaches to this NAME, so the link would leave the name "
+            "replaceable inside the sandbox while reads and writes went to an "
+            "unfenced inode. Remove the link and use a real directory."
+        )
+    if stat.S_ISDIR(info.st_mode):
+        return
+    raise SandboxCeilingUnsealable(
+        f"the protected directory {target} is not a directory. It must be a real "
+        "directory under this name for its mask to apply."
     )
 
 
@@ -494,10 +2221,10 @@ def _warn_if_alias_backed(target: str) -> None:
 def _refuse_if_dangling_symlink(target: str) -> None:
     """Refuse the spawn when *target* is a symlink that resolves to nothing.
 
-    A RESOLVING symlink is left alone deliberately: it reads as present, so the launcher
-    seals the inode it resolves to. The residual exposure there — the link NAME stays
-    replaceable in a writable parent — is pre-existing for every ceiling, not specific to
-    one this function materialises, and closing it needs the data-home root sealed.
+    A RESOLVING symlink is left to the caller. Most legacy ceilings report that
+    alias and seal its referent; a strict directory such as the gateway launcher
+    follows this check with :func:`_refuse_if_symlink_leaf` because its lexical name
+    selects executable code and must remain the mounted name.
     """
     if not os.path.islink(target) or os.path.exists(target):
         return
@@ -505,15 +2232,173 @@ def _refuse_if_dangling_symlink(target: str) -> None:
     with contextlib.suppress(OSError):
         pointed_at = os.readlink(target)
     raise SandboxCeilingUnsealable(
-        f"the governance ceiling {target} is a DANGLING symlink -> {pointed_at}. "
+        f"the governance ceiling {safe_terminal_line(target)} is a DANGLING symlink -> "
+        f"{safe_terminal_line(pointed_at)}. "
         "mount(2) cannot seal it and it would leave the path writable inside the "
         "sandbox. Remove or repoint it, or lower sandbox_level to run without the seal "
         "deliberately."
     )
 
 
-def _publish_empty_ceiling(target: str, parent: str) -> bool:
-    """Write the empty document to a sibling temp file, then link it into place.
+def _refuse_if_symlink_leaf(target: str) -> None:
+    """Refuse when a masked or strict read-only directory leaf is a link.
+
+    Stronger than :func:`_refuse_if_dangling_symlink`, which refuses only a link that
+    resolves to nothing. A leaf that RESOLVES -- a link pointing at a real directory --
+    is the attacker's entry here: ``os.path.isdir`` follows it and reports a directory,
+    so the mask or seal binds over the link's TARGET, not the leaf name. The leaf name
+    lives in the writable data home, so a sandboxed process can unlink it and drop an
+    agent-controlled directory in its place. Refused, not removed, because ``lstat``
+    then ``unlink`` is not atomic.
+    """
+    try:
+        info = os.lstat(target)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise SandboxCeilingUnsealable(
+            f"cannot stat the masked directory {safe_terminal_line(target)} to check for "
+            f"a symlink: {safe_terminal_line(str(exc))}"
+        ) from exc
+    if stat.S_ISLNK(info.st_mode):
+        pointed_at = "(unreadable)"
+        with contextlib.suppress(OSError):
+            pointed_at = os.readlink(target)
+        raise SandboxCeilingUnsealable(
+            f"the masked directory {safe_terminal_line(target)} is a SYMLINK -> "
+            f"{safe_terminal_line(pointed_at)}. The mask would "
+            "bind over the link's target, not the name, leaving the leaf replaceable in a "
+            "writable parent so a sandboxed process could point the pre-created staging "
+            "directory at a tree it controls. Remove or repoint it."
+        )
+
+
+def _require_real_dir_nofollow(target: str) -> None:
+    """Confirm *target* is a real directory with NO-FOLLOW semantics, else refuse.
+
+    Called after ``mkdir`` loses the ``EEXIST`` race: something else won the create, and
+    ``FileExistsError`` alone does not say WHAT now sits at the name. A plain
+    ``os.path.isdir`` would follow a symlink that a racing sandboxed process planted in
+    the window between our checks, so the mask would bind over that link's target. Use
+    ``lstat`` (never follows) and require a real directory at the leaf itself; a link, a
+    file, or anything else there refuses the spawn rather than mask an attacker's target.
+    """
+    try:
+        info = os.lstat(target)
+    except OSError as exc:
+        raise SandboxCeilingUnsealable(
+            f"cannot re-check the masked directory {safe_terminal_line(target)} after a "
+            f"create race: {safe_terminal_line(str(exc))}"
+        ) from exc
+    if stat.S_ISLNK(info.st_mode):
+        pointed_at = "(unreadable)"
+        with contextlib.suppress(OSError):
+            pointed_at = os.readlink(target)
+        raise SandboxCeilingUnsealable(
+            f"the masked directory {safe_terminal_line(target)} became a SYMLINK -> "
+            f"{safe_terminal_line(pointed_at)} in the create "
+            "race. Refusing rather than binding the mask over the link's target."
+        )
+    if not stat.S_ISDIR(info.st_mode):
+        raise SandboxCeilingUnsealable(
+            f"cannot mask {safe_terminal_line(target)}: a non-directory won the create "
+            "race at the path"
+        )
+
+
+def _require_real_file_nofollow(
+    target: str, *, harm: str, remedy: str, fd: "int | None" = None
+) -> None:
+    """Confirm *target* is a lone regular file, else refuse. For strict file leaves only.
+
+    The file analogue of :func:`_require_real_dir_nofollow`, and stricter than
+    :func:`_warn_if_alias_backed` on purpose. That function only WARNS about the two
+    shapes an ``MS_RDONLY`` bind cannot cover -- a symlink whose NAME stays replaceable,
+    and a regular file carrying a second hardlink whose alias sits outside the mount --
+    because refusing them for every ceiling would turn an ordinary dotfile manager or
+    snapshot tool into a hard spawn failure, a wider blast radius than the exposure.
+
+    That trade is right for a ceiling whose worst case is a stale policy, and wrong for a
+    leaf whose contents pick an unrecoverable action. Two do: an aliased ``cloud.json``
+    picks the container image a Fargate launch runs, and the task's execution role
+    delivers the model credential into it; an aliased launch record picks which stack a
+    ``cloud destroy --yes`` deletes. Both refuse, and both refuse at the seam that
+    CONSUMES the file rather than on the spawn path, so the cost is one command's refusal
+    instead of every sandboxed spawn on a host whose files legitimately carry a second
+    name. Callers keep using :func:`_warn_if_alias_backed` for every other leaf.
+
+    *harm* names what a write through the second name buys, and *remedy* is the one
+    command that clears it. They come from the CALLER, with no default, because the two
+    strict leaves are refused for different reasons and a message naming the wrong
+    consequence sends an operator at the wrong file -- and because a third leaf must state
+    its own reason rather than silently inherit the first one's.
+
+    UNCONDITIONAL, and an earlier version of this was not. It exempted a file that
+    carried no Fargate block, on the reasoning that an alias selects no image when there
+    is no image -- which is wrong, because the agent does not need to swap a field it can
+    CREATE. Given a writable alias and no block, an agent writes a COMPLETE block through
+    the alias and the owner's next launch runs the image it chose. That is the same
+    reasoning that already put this leaf in the pre-create list, where an ABSENT file is
+    the dangerous case for exactly this reason; the exemption failed to carry it one step
+    further. Any rule that reads the file's current contents has the same hole, because
+    contents are what the attacker supplies, so this rule reads no contents at all.
+
+    *fd* is an OPEN descriptor for the file the caller has ALREADY READ, and it changes
+    which inode this answers about. Without it the check ``lstat``s the NAME and the
+    caller then opens that name again, so the inode that was judged and the inode that was
+    consumed are two separate resolutions and nothing ties them together. With it the
+    judgement lands on the very descriptor the bytes came from, so a swap at the name
+    between the two cannot put un-judged content in front of a caller: the alias question
+    is asked about what was read rather than about what the name pointed at earlier.
+
+    The symlink branch is skipped in that mode because it cannot arise there and cannot be
+    answered there: a descriptor obtained with ``O_NOFOLLOW`` refuses a symlinked leaf at
+    ``open`` time with ``ELOOP``, and ``fstat`` on an ordinary descriptor never reports
+    ``S_IFLNK`` in any case. Callers therefore keep the by-name form as well, which is what
+    still produces the symlink refusal and its remedy.
+    """
+    if fd is not None:
+        try:
+            info = os.fstat(fd)
+        except OSError as exc:
+            raise SandboxCeilingUnsealable(
+                f"cannot stat the strict governance ceiling {target}: {exc}"
+            ) from exc
+    else:
+        try:
+            info = os.lstat(target)
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            raise SandboxCeilingUnsealable(
+                f"cannot stat the strict governance ceiling {target}: {exc}"
+            ) from exc
+        if stat.S_ISLNK(info.st_mode):
+            pointed_at = "(unreadable)"
+            with contextlib.suppress(OSError):
+                pointed_at = os.readlink(target)
+            raise SandboxCeilingUnsealable(
+                f"the strict governance ceiling {target} is a SYMLINK -> {pointed_at}. The seal "
+                "binds the file it resolves to while the link name stays in a writable "
+                f"directory, so a sandboxed process could replace the name and {harm}. {remedy}"
+            )
+    if not stat.S_ISREG(info.st_mode):
+        raise SandboxCeilingUnsealable(
+            f"cannot seal {target}: it is not a regular file, so the read-only bind would "
+            f"not cover what a reader resolves there. {remedy}"
+        )
+    if info.st_nlink > 1:
+        raise SandboxCeilingUnsealable(
+            f"the strict governance ceiling {target} has {info.st_nlink} hardlinks. A bind "
+            "mount seals a MOUNT, not an inode, so a write through the other name reaches "
+            f"the very inode this ceiling exposes and can {harm}. {remedy}"
+        )
+
+
+def _publish_empty_ceiling(
+    target: str, parent: str, content: bytes = _EMPTY_CEILING_DOCUMENT
+) -> bool:
+    """Write *content* (default: the empty document) to a sibling temp, then link it in.
 
     Two steps rather than ``open(target, O_CREAT | O_EXCL)`` followed by a write,
     because the one-step form publishes the NAME before the BYTES: a crash, a full
@@ -539,13 +2424,13 @@ def _publish_empty_ceiling(target: str, parent: str) -> bool:
     fd = -1
     tmp = ""
     try:
-        fd, tmp = tempfile.mkstemp(dir=parent, prefix=".kirocrew-ceiling-", suffix=".tmp")
+        fd, tmp = tempfile.mkstemp(dir=parent, prefix=_CEILING_TEMP_PREFIX, suffix=".tmp")
         # ``os.write`` is not obliged to consume the whole buffer, and a short write is
         # not an error — it returns a count. Taking that count for success would link a
         # TRUNCATED document, which reads as corrupt rather than as absent and is the
         # exact outcome the temp-then-link shape exists to prevent. Loop, and treat zero
         # progress as an error so a filesystem that accepts nothing cannot spin here.
-        view = memoryview(_EMPTY_CEILING_DOCUMENT)
+        view = memoryview(content)
         while view:
             written = os.write(fd, view)
             if written <= 0:
@@ -566,7 +2451,61 @@ def _publish_empty_ceiling(target: str, parent: str) -> bool:
                 os.unlink(tmp)
 
 
-def _materialize_sealable_ceilings() -> list[str]:
+def _materialize_sealable_parent_dirs(target: str, leaf: str) -> None:
+    """Create a nested ceiling's parents without following aliases.
+
+    ``leaf`` is the full relative entry from the strict no-follow list. Each
+    intermediate component gets the same owner-only mode and post-race
+    validation as the final directory. The data-home root itself is never
+    created here.
+    """
+    relative = os.path.normpath(leaf)
+    suffix = os.sep + relative
+    normalized = os.path.normpath(target)
+    if not normalized.endswith(suffix):
+        raise SandboxCeilingUnsealable(
+            f"cannot derive the data home for nested governance ceiling {target}"
+        )
+    data_home = normalized[: -len(suffix)]
+    parent_relative = os.path.dirname(relative)
+    if not parent_relative or parent_relative == "." or not os.path.isdir(data_home):
+        return
+
+    current = data_home
+    for component in parent_relative.split(os.sep):
+        current = os.path.join(current, component)
+        _refuse_if_dangling_symlink(current)
+        _refuse_if_symlink_leaf(current)
+        if os.path.exists(current):
+            _require_real_dir_nofollow(current)
+            continue
+        try:
+            os.mkdir(current, 0o700)
+        except FileExistsError:
+            _require_real_dir_nofollow(current)
+        except OSError as exc:
+            raise SandboxCeilingUnsealable(
+                f"cannot create the governance ceiling parent {current}: {exc}"
+            ) from exc
+
+
+def _note_established(established: list[str] | None, target: str) -> None:
+    """Record *target* as seen present by THIS process, for the launcher to require.
+
+    Separate from each materialiser's return value, which means "what I created" and
+    is asserted as such by callers that check an existing ceiling was left alone. The
+    launcher needs a different set: every protected target this pass has just SEEN,
+    created or already there. It is collected HERE, where the pass is already
+    statting and creating off the event loop, and never in the launcher builder --
+    ``test_the_builder_does_not_stat_the_hidden_paths`` pins that the builder probes
+    no paths at all, because on a stalled home each probe would block the one loop
+    every session, cron and heartbeat shares.
+    """
+    if established is not None:
+        established.append(target)
+
+
+def _materialize_sealable_ceilings(established: list[str] | None = None) -> list[str]:
     """Create every absent sealable ceiling; return the paths actually created.
 
     Runs on the Linux spawn path only, immediately before the launcher builds its
@@ -595,9 +2534,11 @@ def _materialize_sealable_ceilings() -> list[str]:
     * a **creation failure** other than ``EEXIST`` — a read-only mount, or a filesystem
       with no hardlink support.
 
-    ``EEXIST`` is the one benign outcome, in both loops: the racing spawn that got there
-    first, or the operator's real document. Either way the path now exists, so the
-    launcher seals it and there is nothing to report.
+    ``EEXIST`` is benign for ordinary ceilings: another spawn or the operator won
+    the race and the launcher seals the winner. Strict executable directories have
+    a higher bar. Their winner is re-checked with ``lstat`` and must be a real
+    directory, because a symlink would move the mount off the name the gateway later
+    resolves.
 
     Never TRUNCATES and never REMOVES: an existing ceiling is left byte-for-byte alone,
     so this can only ever add the absent default.
@@ -606,11 +2547,33 @@ def _materialize_sealable_ceilings() -> list[str]:
     dir_targets, file_targets = _sealable_absent_ceilings()
 
     for target in dir_targets:
+        normalized = os.path.normpath(target)
+        strict_leaf = next(
+            (
+                leaf
+                for leaf in _CREW_NOFOLLOW_READONLY_DIR_LEAVES
+                if normalized.endswith(os.sep + os.path.normpath(leaf))
+            ),
+            None,
+        )
+        strict_nofollow = strict_leaf is not None
+        if strict_leaf is not None:
+            _materialize_sealable_parent_dirs(target, strict_leaf)
         _refuse_if_dangling_symlink(target)
+        # BEFORE the warn-and-continue below: for a protected leaf an alias is a
+        # refusal, and reaching `_warn_if_alias_backed` would log that the path was
+        # covered while the bytes went elsewhere.
+        _refuse_if_aliased_protected_leaf(target)
+        if strict_nofollow:
+            _refuse_if_symlink_leaf(target)
         if os.path.exists(target):
-            # Present, so the launcher will seal it -- but say so when the seal is
-            # reachable around rather than through this path.
-            _warn_if_alias_backed(target)
+            _note_established(established, target)
+            if strict_nofollow:
+                _require_real_dir_nofollow(target)
+            else:
+                # Present, so the launcher will seal it -- but say so when the seal is
+                # reachable around rather than through this path.
+                _warn_if_alias_backed(target)
             continue
         if not os.path.isdir(os.path.dirname(target)):
             continue
@@ -618,6 +2581,11 @@ def _materialize_sealable_ceilings() -> list[str]:
             # 0o700 needs no reassertion: a umask can only clear bits, never add them.
             os.mkdir(target, 0o700)
         except FileExistsError:
+            if strict_nofollow:
+                # A competing creator may have planted a link after the check above.
+                # Re-check the winner without following it before trusting the name.
+                _require_real_dir_nofollow(target)
+            _note_established(established, target)
             continue
         except OSError as exc:
             _warn_unsealed_ceiling(target, exc)
@@ -625,17 +2593,34 @@ def _materialize_sealable_ceilings() -> list[str]:
                 f"cannot create the governance ceiling {target}: {exc}"
             ) from exc
         created.append(target)
+        _note_established(established, target)
 
     for target in file_targets:
         parent = os.path.dirname(target)
         _refuse_if_dangling_symlink(target)
         if os.path.exists(target):
+            _note_established(established, target)
+            # WARNS for every leaf, strict ones included. This function runs from
+            # ``namespace_argv`` on every Linux sandboxed spawn, so refusing here refuses the
+            # whole host's agent work -- a chat turn, a cron job, a subagent -- whenever a
+            # governance leaf carries a second name, and a second name is what stow, chezmoi
+            # and ``rsync --link-dest`` leave behind. That cost is not paid for the residual:
+            # each strict leaf's real harm is answered at the seam that CONSUMES the file --
+            # ``require_unaliased_cloud_config`` from the provisioner seam for ``cloud.json``,
+            # whose alias would choose the container a launch hands the model credential to,
+            # and ``require_unaliased_launch_state`` from ``LaunchState.load`` for the launch
+            # record, whose alias would choose the stack a ``destroy --yes`` deletes.
+            # The seal is defence in depth here, not the property the design rests on.
+            #
+            # The warn still fires, because the alias really is outside the read-only bind:
+            # a silent skip would leave the log claiming a seal that another name reaches.
             _warn_if_alias_backed(target)
             continue
         if not os.path.isdir(parent):
             continue
         if _publish_empty_ceiling(target, parent):
             created.append(target)
+            _note_established(established, target)
         elif not os.path.exists(target):
             # Absent after a failed publish, so nothing won the race: the seal really
             # did not apply. ``exists`` rather than a plumbed-through errno because the
@@ -645,7 +2630,1918 @@ def _materialize_sealable_ceilings() -> list[str]:
                 f"cannot publish the governance ceiling {target}; it would stay writable "
                 "inside the sandbox"
             )
+        else:
+            # A competing creator won the publish. Re-checked on the same terms as the
+            # present-file branch above -- warned, not refused -- because the reason is the
+            # same: this path decides whether every spawn on the host runs, and the alias
+            # harm is answered where a launch consumes the file.
+            _warn_if_alias_backed(target)
+            # Accepted, so ESTABLISHED: losing the race still ends with the object there
+            # and this pass having just seen it, which is the same standing a target this
+            # pass created has. Leaving it out would hand the launcher a set missing
+            # exactly the names a concurrent creator touched.
+            _note_established(established, target)
 
+    return created
+
+
+def _warn_aliased_strict_leaves() -> None:
+    """Report an aliased strict leaf on the universal spawn path, without refusing.
+
+    Same two shapes :func:`_warn_if_alias_backed` covers, over the strict leaves, and
+    reported for the same reason: a second name on a configuration file is what a dotfile
+    manager or a hardlinking backup leaves behind, and refusing it here refuses EVERY
+    sandboxed spawn on the host. The seal is still not covering that alias, so saying
+    nothing would leave a log claiming a seal that is reachable under another name.
+
+    The refusal for the one leaf whose alias picks a credential recipient lives at the point
+    that consumes it, :func:`require_unaliased_cloud_config`, so the consequence lands on the
+    launch rather than on everything else the host does.
+    """
+    for leaf in _CREW_NOFOLLOW_READONLY_FILE_LEAVES:
+        _warn_if_alias_backed(os.path.join(str(config_dir()), leaf))
+
+
+def require_unaliased_cloud_config() -> None:
+    """Refuse an aliased ``cloud.json`` at the point a launch consumes it.
+
+    PUBLIC, and called from ``platform.defaults.DefaultRemoteProvisionerProvider`` where the
+    saved block becomes a `FargateLaunchEngine`. That is the only place the alias matters: a
+    write through an unsealed second name picks the container image a launch runs, and the
+    task's execution role delivers the model credential into it.
+
+    Placed here rather than on the spawn path so the refusal costs one lane's launch instead
+    of every sandboxed spawn on a host whose files legitimately carry a second name. It is
+    still unconditional on CONTENT -- an agent that can write through an alias does not need
+    to swap a block it can create -- and reads no file contents, only ``lstat``.
+
+    Platform-independent, and that is why it is one function rather than a check inside each
+    launcher: the refusal is a fact about the NAME and never depended on the sealing
+    mechanism, so a per-launcher copy would only give the two platforms something to drift
+    on. Both mechanisms are name-based and neither follows a link -- a read-only bind seals a
+    mount, a Seatbelt ``deny file-write*`` matches a pathname -- so in each case the alias
+    reaches the same inode by a name the rule does not cover.
+    """
+    for leaf in _CREW_NOFOLLOW_READONLY_FILE_LEAVES:
+        _require_real_file_nofollow(
+            os.path.join(str(config_dir()), leaf),
+            harm=(
+                "choose the container image a Fargate launch runs, which is what the task's "
+                "execution role delivers the model credential into"
+            ),
+            remedy=(
+                "Make the path a lone regular file: replace a link with a regular file, or "
+                "break the extra hardlink."
+            ),
+        )
+
+
+def _delete_file_command(target: str, *, windows: "bool | None" = None) -> str:
+    """The command an operator runs to delete *target*, in the shell they are actually in.
+
+    A refusal's whole value is that the person reading it can act on it, so the remedy has to
+    be a command that exists on their box. ``rm`` is not one on Windows outside PowerShell, and
+    POSIX single quotes are not quoting characters to ``cmd`` at all -- so ``shlex.quote`` on a
+    ``C:\\...`` path produces ``rm 'C:\\Users\\...'``, which names a command they do not have,
+    quoted in a way their shell would not accept, for a file they do have.
+
+    ``del`` is the one spelling that works in both shells a Windows operator is plausibly in:
+    a ``cmd`` builtin, and a PowerShell alias for ``Remove-Item``. Double quotes are what both
+    accept, and a Windows path cannot contain ``"``, so no escaping question arises.
+
+    *windows* defaults to this host and exists as a PARAMETER so BOTH renderings are
+    exercisable from one platform. Every platform defect in this area came from the same shape:
+    a string written once, verified where it was written, and asserted as general. A default-only
+    reading of ``IS_WINDOWS`` would leave the Windows branch measurable on Windows alone, which
+    is how this one reached CI.
+    """
+    on_windows = platform_compat.IS_WINDOWS if windows is None else windows
+    if on_windows:
+        return f'del "{target}"'
+    return f"rm {shlex.quote(target)}"
+
+
+def require_unaliased_launch_state(path: str, *, fd: "int | None" = None) -> None:
+    """Refuse an alias-backed launch record at the point a command consumes its tag.
+
+    PUBLIC, and called from ``cloud.launch_state.LaunchState.load`` -- the one read every
+    tag-consuming verb goes through, and the read ``cloud destroy`` resolves its target
+    from. The harm is narrower than ``cloud.json``'s and just as unrecoverable: a write
+    through an unsealed second name puts any tag in the record, and ``cloud destroy --yes``
+    deletes the stack it names. ``cloud launch`` re-attaching to a forged tag is the same
+    substitution, quieter.
+
+    The record is sealed against agent writes on three layers already -- the file-write
+    gate, the kernel read-only seal, and pre-creation so an absent name cannot be squatted
+    -- and every one of those covers a PATH. An alias reaches the same inode by a name none
+    of them names, which is exactly the gap this refuses; the layers are what keep an agent
+    from creating the alias in the first place, and this is what stops a tag being consumed
+    from one that already exists.
+
+    Takes the path being READ rather than deriving it, so the file this checks and the file
+    the caller goes on to consume cannot be two different files.
+
+    *fd* is how the check stops being a check-then-use. Without it this ``lstat``s the NAME
+    and the caller opens that name again, so the judged inode and the consumed inode are two
+    resolutions with a window between them. ``LaunchState.load`` therefore calls this twice:
+    once by name, which is what refuses a symlinked leaf and names the remedy, and once on
+    the DESCRIPTOR the record's bytes were actually read from, after the read. The second
+    call is what ties the answer to the inode that was consumed, so content that was never
+    judged cannot be put in front of a caller by swapping the name in between.
+
+    What that does NOT close, stated because the guard's value depends on it: an alias that
+    existed EARLIER, was written through in place, and was unlinked before this read leaves a
+    lone regular file holding forged bytes, and no ``lstat`` or ``fstat`` rule can see that
+    an inode once had a second name. Closing that shape needs the tag verified through a
+    channel the sandbox cannot reach, or the unbounded verb requiring an explicit ``--tag``;
+    both are design choices for the launch lane rather than something this seam can decide.
+    So this remains one layer of several -- what it now guarantees is that the layer answers
+    about the right inode.
+
+    NOT added to :data:`_CREW_NOFOLLOW_READONLY_FILE_LEAVES`. That list is walked where a
+    spawn is prepared, so a leaf in it refuses every sandboxed spawn on a host whose files
+    legitimately carry a second name (stow, chezmoi, ``rsync --link-dest``) -- the whole box
+    for one command's exposure, and the regression a review already blocked once. The warn
+    on the spawn path stays a warn.
+    """
+    _require_real_file_nofollow(
+        path,
+        harm=(
+            "choose which stack `kirocrew cloud destroy --yes` deletes, and a deleted stack "
+            "and its data do not come back"
+        ),
+        remedy=(
+            f"Remove the aliased name with `{_delete_file_command(path)}`; `kirocrew cloud list` "
+            "finds your instance again."
+        ),
+        fd=fd,
+    )
+
+
+def _materialize_maskable_dirs(established: list[str] | None = None) -> list[str]:
+    """Create the absent on-demand HIDDEN directories so the mask loop can bind over them.
+
+    The mirror image of :func:`_materialize_sealable_ceilings` for
+    :data:`_CREW_PRECREATE_HIDDEN_DIR_LEAVES`: the launcher's ``SENSITIVE_DIRS`` loop
+    is guarded on ``isdir``, so an absent target gets no empty bind over it and the
+    directory the gateway creates later is visible to the running sandbox. Same
+    fail-closed shape as the ceilings -- a dangling link squatting the name, a plain
+    file where the directory should be, or a creation failure other than ``EEXIST``
+    refuses the spawn, because launching anyway runs the agent with the directory
+    unmasked. Plain ``mkdir``, deliberately: every leaf here is a direct child of
+    the data home, and a leaf that needed an intermediate directory would have an
+    agent-writable ancestor a rename could swap out from under the mask.
+
+    Returns the paths it created, so a test can check each one reaches the launcher's
+    hidden list.
+    """
+    created: list[str] = []
+    try:
+        root = str(config_dir())
+    except Exception as exc:
+        # Fail CLOSED, unlike a best-effort lookup: a spawn that went ahead
+        # without the target would run the agent with the staging directory
+        # unmasked, which is exactly the exposure this function exists to
+        # prevent. A data home that cannot be resolved is a host problem to
+        # surface, not a mask to skip.
+        raise SandboxCeilingUnsealable(
+            f"cannot resolve the crew data home to materialise the masked directories: {exc}"
+        ) from exc
+    for leaf in _CREW_PRECREATE_HIDDEN_DIR_LEAVES:
+        target = os.path.join(root, leaf)
+        _refuse_if_dangling_symlink(target)
+        # A leaf that is itself a symlink/junction -- even one that RESOLVES to a real
+        # directory -- is the attack entry: ``isdir`` would follow it and the mask would
+        # bind over the target, not the replaceable name. Refuse before the isdir check.
+        _refuse_if_symlink_leaf(target)
+        if os.path.isdir(target):
+            _note_established(established, target)
+            continue
+        if os.path.exists(target):
+            raise SandboxCeilingUnsealable(
+                f"cannot mask {target}: a non-directory is sitting at the path"
+            )
+        try:
+            os.mkdir(target, 0o700)
+        except FileExistsError:
+            # Something won the create race. ``FileExistsError`` does not say what now
+            # sits at the name, so re-validate with NO-FOLLOW semantics: a symlink an
+            # attacker slipped in during the window must refuse, not be masked over.
+            _require_real_dir_nofollow(target)
+            _note_established(established, target)
+            continue
+        except OSError as exc:
+            raise SandboxCeilingUnsealable(
+                f"cannot create the masked directory {target}: {exc}"
+            ) from exc
+        created.append(target)
+        _note_established(established, target)
+    return created
+
+
+def _first_linked_component_below(root: str, leaf: str) -> str | None:
+    """The first component of *leaf* under *root* that is a link, or ``None``.
+
+    ROOT-FIRST, stopping at the first hit, which is the safety property rather than a
+    detail: each test runs only after every component above it is known not to be a link, so
+    the probe itself never traverses one. The same order and reason as
+    :func:`platform_compat.first_linked_ancestor`, which cannot be used directly here
+    because it walks EVERY ancestor, including the data home and its parents --
+    ``config_dir()`` documents that a symlinked data HOME is supported, so refusing that
+    would break a layout the product allows.
+
+    The leaf's own final component is excluded: the caller judges that with ``lstat``, and a
+    link there is the leaf-alias case rather than the ancestor case.
+
+    **Fails CLOSED on a component it cannot read**, raising rather than answering "not a
+    link". ``os.path.islink`` (and so ``is_link_or_junction``) answers False when the stat
+    fails, which makes "cannot tell" indistinguishable from "safe" -- and the data home is
+    agent-writable, so an agent can strip search permission from a directory it owns and turn
+    the whole walk into a silent pass. ABSENT is the one benign failure: a component that is
+    not there means nothing below it exists, so there is no alias to find.
+    """
+    parts = leaf.replace(os.sep, "/").split("/")[:-1]
+    walked = root
+    for part in parts:
+        if not part or part == ".":
+            continue
+        walked = os.path.join(walked, part)
+        try:
+            mode = os.lstat(walked).st_mode
+        except FileNotFoundError:
+            # Nothing below an absent component can exist, so nothing is aliased.
+            return None
+        except OSError as exc:
+            raise SandboxCeilingUnsealable(
+                f"cannot stat {safe_terminal_line(walked)} to check whether a masked path "
+                f"passes through a link: {safe_terminal_line(str(exc))}. Refusing rather "
+                "than assuming it is a real directory, because the mask would bind whatever "
+                "this component resolves to."
+            ) from exc
+        if stat.S_ISLNK(mode) or platform_compat.is_link_or_junction(walked):
+            return walked
+    return None
+
+
+def _masked_crew_home_roots() -> list[str]:
+    """Every crew data home the masks cover, de-duplicated, live one first.
+
+    The mask lists are NOT scoped to the live home, and that is the whole reason this
+    helper exists. :func:`_crew_home_entries` expands each hidden leaf across both
+    :data:`_CREW_HOME_PREFIXES`, so ``~/.kiro/crew/.env`` and ``~/.kirocrew/.env`` are
+    both masked whichever one ``config_dir()`` resolves to, and
+    :func:`_relocated_crew_targets` adds the resolved home on top when ``KIROCREW_HOME``
+    moves it out from under ``$HOME``. A check that resolves ``config_dir()`` alone
+    therefore judges one of the homes the launcher masks and none of the others.
+
+    Ordered live-home-first so a refusal names the home the operator is most likely
+    looking at, and de-duplicated so a relocation that happens to coincide with a prefix
+    is visited once. Live-first is also what keeps the occupant pass and the launcher's
+    lists in step: both spell a symlinked home's leaves the resolved way, the pass by
+    walking this root and the builder by folding the ``$HOME`` spellings onto it.
+
+    De-duplicated by DIRECTORY INODE, not by path string. A host part-way through a migration
+    legitimately points the legacy spelling AT the live home -- this module's own alias pass
+    documents that layout as one that must keep spawning -- and two strings for one directory
+    make every walk over them report each entry twice. The alias accounting compares a count
+    of located names against ``st_nlink``, so a doubled entry overshoots it and refuses a spawn
+    over a single link. A root that cannot be stat'ed keeps its place: absence is a state every
+    caller here already handles, and dropping it would silently narrow the set.
+
+    Never raises. A home that cannot be resolved contributes nothing and the remaining
+    roots still apply, because every caller here is a read that reports what it finds --
+    a probe that cannot resolve a path must not turn that into a verdict about the host.
+    """
+    roots: list[str] = []
+    try:
+        roots.append(str(config_dir()))
+    except Exception:  # pragma: no cover - defensive; a spawn must not fail on this
+        logger.debug("could not resolve the crew data home for the masked-leaf pass", exc_info=True)
+    try:
+        home = Path.home()
+        roots.extend(str(home / Path(prefix)) for prefix in _CREW_HOME_PREFIXES)
+    except Exception:  # pragma: no cover - defensive
+        logger.debug("could not resolve $HOME for the masked-leaf pass", exc_info=True)
+    unique: list[str] = []
+    seen_ids: set[tuple[int, int]] = set()
+    for root in dict.fromkeys(roots):
+        try:
+            info = os.stat(root)
+        except OSError:
+            # Absent, or unreadable to this process. Keep it: every caller treats an absent
+            # home as contributing nothing, and a stat failure is not grounds to narrow the
+            # set a refusal is measured against.
+            unique.append(root)
+            continue
+        key = (info.st_dev, info.st_ino)
+        if key in seen_ids:
+            continue
+        seen_ids.add(key)
+        unique.append(root)
+    return unique
+
+
+#: How many directory entries the alias walk may visit under ONE home before giving up.
+#: The walk exists to name the OTHER path to a credential's bytes, and it runs only once a
+#: masked leaf already carries a second hard link -- a state a healthy host never reaches --
+#: so the cap is not a throughput budget. It is a refusal to be walked into an unbounded tree
+#: by whoever controls the home's contents: the data home holds agent-writable subtrees, so
+#: without a cap a planted directory of a million entries turns every spawn into a stall.
+#: Exhausting it returns what was found so far, because a partial answer still names real
+#: aliases and the caller's fallback covers the rest.
+_ALIAS_WALK_MAX_ENTRIES = 20000
+
+
+class _AliasMask(NamedTuple):
+    """One discovered credential alias, with the inode it was when it was discovered.
+
+    The path alone is not enough for the launcher to act on. Discovery runs in the parent and
+    the bind runs later in the child, so a same-uid process can rename the alias and leave an
+    unrelated file at that path in between -- and a decoy is one ``ln`` away from carrying two
+    links, so neither the mode nor the link count tells it apart. Comparing the device and
+    inode numbers does, because the identity is what discovery actually established.
+    """
+
+    path: str
+    dev: int
+    ino: int
+
+
+class _InodeAliases(NamedTuple):
+    """Other names for one inode under one crew home, split by whether a mask covers them.
+
+    The split is the whole point. ``unmasked`` is what a caller must hide to close the hole;
+    ``masked`` is what is already unreachable. Both count as LOCATED, so a caller deciding
+    whether every link is accounted for must add them together -- reporting only ``unmasked``
+    is what would make an all-masked leaf look short a name and refuse a spawn that is
+    already safe.
+    """
+
+    unmasked: list[str]
+    masked: list[str]
+
+
+def _inode_aliases_under(root: str, target: str, info: os.stat_result) -> _InodeAliases:
+    """Other names under *root* for *target*'s inode, split into unmasked and masked.
+
+    The credential masks bind PATHS, so a second hard link to a masked leaf is a second way
+    to the same bytes and the mask says nothing about it. Naming that path is what lets a
+    caller close the hole by masking it too, instead of choosing between refusing every spawn
+    and leaving the bytes readable.
+
+    Only called when *target* already has ``st_nlink > 1``: the link count IS the trigger, and
+    the caller tests it explicitly rather than relying on the walk to come back empty.
+
+    Bounded and fail-soft by construction, because the tree is not this process's to trust:
+
+    * ``os.walk`` with ``followlinks=False``, so a planted directory symlink cannot redirect
+      the walk out of the home;
+    * every entry judged with ``lstat``, so a symlink is never followed to its target's inode;
+    * a cap of :data:`_ALIAS_WALK_MAX_ENTRIES` entries, returning what was found so far;
+    * any entry that cannot be stat'ed is skipped -- a walk is a read, and a path this
+      process cannot classify must not become a verdict about the host.
+
+    A path a mask already covers goes in ``masked``, not ``unmasked``: it is another masked
+    leaf, or it sits inside a whole-directory mask, so the bytes are unreachable under it and
+    hiding it again buys nothing. It is still REPORTED, because a caller that never heard of
+    it cannot tell an accounted-for leaf from one whose other name is somewhere unreachable.
+    The auth-store staging link this module deliberately keeps when ``fsync_dir`` raises is
+    exactly such a name, so dropping it silently refuses the spawn it was kept to rescue.
+    """
+    want = (info.st_dev, info.st_ino)
+    masked_leaves = {os.path.join(root, leaf) for leaf in _CREW_HIDDEN_LEAVES}
+    masked_dirs = tuple(
+        os.path.join(root, leaf) + os.sep for leaf in _CREW_HIDDEN_LEAVES if "/" not in leaf
+    )
+    found = _InodeAliases(unmasked=[], masked=[])
+    visited = 0
+
+    def _capped() -> bool:
+        """True once the cap is spent, saying so exactly once from ONE place.
+
+        Two call sites reach the cap -- the file loop and the directory count -- and an
+        earlier shape logged from only one of them, so a tree that hit the cap on
+        directories returned a partial answer that read as a complete one.
+        """
+        if visited <= _ALIAS_WALK_MAX_ENTRIES:
+            return False
+        logger.warning(  # nosemgrep: python.lang.security.audit.logging.logger-credential-leak.python-logger-credential-disclosure -- the word "credential" names what is being searched FOR; the arguments are a sanitised path and an integer cap, and no file is opened.  # noqa: E501  # fmt: skip
+            "sandbox: stopped the credential alias walk under %s after %d entries; "
+            "any alias beyond that point is not named here.",
+            safe_terminal_line(root),
+            _ALIAS_WALK_MAX_ENTRIES,
+        )
+        return True
+
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        # Directories count too. Counting only files let a subtree that is mostly
+        # directories -- a deep agent-writable tree with few leaves in it -- pass the
+        # cap untouched and enumerate in full, once per multilinked credential leaf per
+        # crew home, on the spawn path this cap exists to bound.
+        visited += len(dirnames)
+        for name in filenames:
+            visited += 1
+            if _capped():
+                return found
+            candidate = os.path.join(dirpath, name)
+            if candidate == target:
+                continue
+            try:
+                other = os.lstat(candidate)
+            except OSError:
+                continue
+            if not stat.S_ISREG(other.st_mode):
+                continue
+            if (other.st_dev, other.st_ino) != want:
+                continue
+            if candidate in masked_leaves or candidate.startswith(masked_dirs):
+                found.masked.append(candidate)
+            else:
+                found.unmasked.append(candidate)
+        if _capped():
+            # Clearing dirnames stops the descent as well: os.walk has already been handed
+            # this directory's children, so returning alone would end THIS walk while a
+            # generator resumed elsewhere would keep going.
+            dirnames[:] = []
+            return found
+    return found
+
+
+def _refuse_multilinked_credential_leaves(
+    *, masks_are_path_only: bool = False
+) -> tuple[_AliasMask, ...]:
+    """Close a second hard link on a masked CREDENTIAL leaf, and return what to mask.
+
+    The masks bind PATHS, so a second name to a masked leaf is a second way to the same
+    bytes that the mask says nothing about. Three outcomes, in the order they are preferred,
+    because only the first one costs nothing:
+
+    * EVERY other name is FOUND under a data home -- returned, for the caller to add to this
+      spawn's hidden set. The bytes become unreachable in every namespace, which is what a
+      refusal was standing in for, and no spawn is refused. This is the outcome that resolves
+      the tension the other two trade against. "Every" is the load-bearing word and is
+      COUNTED, not assumed: the leaf's own name plus the located ones must equal
+      ``st_nlink``. Masking one name out of two remaining leaves the other readable while
+      reporting the hole closed, and a walk that stopped at its cap reaches this same test
+      with a short count.
+    * a name is NOT under any data home, or not every name could be located -- the snapshot
+      and backup case (``cp -al``, rsnapshot, ``rsync --link-dest``), which cannot be masked
+      because it cannot be located without walking the filesystem. REFUSED in the live home,
+      which is the cost this control has always accepted there, and reported elsewhere.
+      Whatever WAS located is masked on the way, since a located name left readable would be
+      strictly worse, but it does not buy the first outcome.
+    * the leaf is absent, is a link, or is not a regular file -- skipped. Only a regular file
+      can carry a second hard link, and ``lstat`` never follows a link, so the symlink case
+      belongs to the pass that has a sentence for it.
+
+    Every masked home is INSPECTED, not only the live one, because the masks cover every home
+    (see :func:`_masked_crew_home_roots`) while ``config_dir()`` names one: a ``.env`` under
+    an un-migrated ``~/.kirocrew``, or one left in the default home by a ``KIROCREW_HOME``
+    relocation, holds live channel tokens and is masked.
+
+    Only the live home REFUSES, and only in the unlocatable case. A mask target is bound only
+    when it EXISTS -- the loop that seals them is gated on ``os.path.isdir``, whose own
+    comment records that an absent directory left unsealed "would be creatable from inside
+    the sandbox" -- so a home the install does not use is masked by nothing while it is
+    absent, and a sandboxed process can create it and write what it likes inside. A refusal
+    there would be reachable by the governed process itself: one ``mkdir`` plus one ``ln``,
+    and every later spawn refuses until an operator finds a dotfile in a directory they have
+    never opened. The live home carries the opposite properties: it exists, so it IS masked,
+    so nothing inside it can be planted from a sandbox.
+
+    The symlink and linked-component refusals in :func:`_refuse_aliased_masked_leaves` stay
+    live-home-only deliberately: a host part-way through a migration legitimately points the
+    legacy home AT the live one, and refusing every spawn for that layout would break working
+    hosts while closing nothing -- the two names then share a single inode, which the live
+    home's own pass already judges.
+
+    A leaf reached through a linked INTERMEDIATE component is skipped with a warning, not
+    refused. ``lstat`` leaves only the final component un-followed, so for a multi-component
+    leaf (``workspace/md-notebook/pat`` is the one such entry here) a planted link above it
+    makes this read report the link count of a file somewhere else entirely -- refusing on
+    that would fail every spawn over a number belonging to a file outside the data home.
+    The chain case has its own control: :data:`_CREW_ALIAS_CHAIN_DEGRADE_LEAVES` records
+    why those leaves degrade rather than refuse, and :func:`_refuse_aliased_masked_leaves`
+    applies it. Escalating here would invert that decision.
+    """
+    to_hide: list[_AliasMask] = []
+    try:
+        live_home = str(config_dir())
+    except Exception:  # pragma: no cover - defensive; a spawn must not fail on this
+        logger.debug("could not resolve the crew data home for the credential pass", exc_info=True)
+        live_home = ""
+    # Read ONCE, so the loop below and the per-leaf alias search cover exactly the same set.
+    # A leaf's second name can sit under a DIFFERENT crew home than the leaf itself, and a
+    # search narrower than this loop would miss it, come up short on the count, and refuse a
+    # spawn over a name it could have masked.
+    search_roots = list(_masked_crew_home_roots())
+    for root in search_roots:
+        for leaf in sorted(_CREW_HARDLINK_REFUSED_LEAVES):
+            target = os.path.join(root, leaf)
+            try:
+                linked = _first_linked_component_below(root, leaf)
+            except SandboxCeilingUnsealable:
+                # Same policy as the lstat below, and the same reason: a component this
+                # pass cannot classify is left to the live home's own fail-closed pass.
+                continue
+            if linked is not None:
+                logger.warning(  # nosemgrep: python.lang.security.audit.logging.logger-credential-leak.python-logger-credential-disclosure -- the word "credential" names the leaf CLASS; the arguments are two paths and no file is read.  # noqa: E501  # fmt: skip
+                    "sandbox: not reading the link count of the masked credential leaf %s. "
+                    "It is reached through a component that is a link (%s), so the count "
+                    "would belong to a file outside the data home. Replace the link with a "
+                    "real directory to close the alias.",
+                    target,
+                    linked,
+                )
+                continue
+            try:
+                info = os.lstat(target)
+            except FileNotFoundError:
+                continue
+            except OSError:
+                # A path this process cannot classify is judged by the live home's pass,
+                # which has the fail-closed sentence for it. Escalating here would refuse
+                # every spawn for an unreadable path in a home nothing is using.
+                continue
+            if not (stat.S_ISREG(info.st_mode) and info.st_nlink > 1):
+                continue
+            # The link count is the trigger, tested here rather than left to the walk coming
+            # back empty: the walk reads a tree this process does not control, so it runs
+            # only once there is a second name to find.
+            # Search EVERY masked home, not just the one holding the leaf: a second name can
+            # sit under another crew home, and a per-root search would miss it, leave the
+            # count short, and refuse a spawn over a name that was maskable all along.
+            walked = [
+                _inode_aliases_under(search_root, target, info) for search_root in search_roots
+            ]
+            found = sorted({alias for names in walked for alias in names.unmasked})
+            covered = sorted({alias for names in walked for alias in names.masked})
+            # EVERY link must be accounted for, not merely one. The leaf's own name is one, so
+            # the walk has to produce the other ``st_nlink - 1``. A leaf with three links where
+            # only one other name sits under a home leaves the third readable, and masking the
+            # one that was found would report the hole closed while it is open. A walk that
+            # stopped at its cap lands here too, and needs no separate flag: truncation only
+            # matters when it hid a link, and then this count is short.
+            # A name a mask ALREADY covers counts here as well. It is not added to ``to_hide``
+            # -- hiding it twice buys nothing -- but it is located and its bytes are
+            # unreachable, so leaving it out of the count would refuse a spawn whose every
+            # name is already safe. This module's own durability fallback produces exactly
+            # that layout: ``token_secret`` keeps the staging hard link when ``fsync_dir``
+            # raises, and the staging directory is masked whole.
+            accounted = len(found) + len(covered) + 1 == info.st_nlink
+            # Mask what WAS found either way. In the live home an unaccounted leaf refuses
+            # below and the masks are moot; elsewhere the spawn proceeds, and a located name
+            # left readable would be strictly worse than hiding it.
+            # The inode is carried with the path: the launcher binds later, and by then a
+            # rename plus a two-link decoy at the same name would satisfy every check that
+            # does not compare identity.
+            to_hide.extend(_AliasMask(alias, info.st_dev, info.st_ino) for alias in found)
+            if accounted:
+                if masks_are_path_only and root == live_home:
+                    # The caller hides by PATH RULE, not by an inode-verified bind. Nothing
+                    # denies a write to this alias's parent or its ancestors while the data
+                    # home root is writable in-sandbox, so the governed process renames a
+                    # parent and the rule names a path that does not hold the bytes -- no
+                    # race timing required. This module already carries that lesson: the
+                    # voice-runtime seal exists because "a same-UID agent [can] rename a
+                    # parent around the path-based subtree deny". Masking cannot stand in for
+                    # a refusal on such a platform, so the live home refuses here as it does
+                    # for an unlocatable name below.
+                    raise SandboxCeilingUnsealable(
+                        _masked_leaf_pathonly_alias_detail(target, found)
+                    )
+                # Every other name is known, so the hole can be CLOSED instead of traded
+                # against. Hiding them makes the bytes unreachable in every namespace, which
+                # is what a refusal was standing in for, and it costs no spawn -- so neither
+                # a real leaf left in an unused home stays readable, nor can a file the
+                # governed process wrote itself stop every launch on the host.
+                for alias in found:
+                    logger.warning(  # nosemgrep: python.lang.security.audit.logging.logger-credential-leak.python-logger-credential-disclosure -- the word "credential" names the leaf CLASS; the arguments are two sanitised paths and no file is read.  # noqa: E501  # fmt: skip
+                        "sandbox: masking %s for this spawn as well. It is a second name for "
+                        "the masked credential leaf %s, so the mask over that leaf alone "
+                        "would leave these bytes readable. Remove the extra link to stop "
+                        "this recurring.",
+                        safe_terminal_line(alias),
+                        safe_terminal_line(target),
+                    )
+                continue
+            if found or covered:
+                # Some names are located and at least one is NOT. Say so, and count the ones
+                # a mask already covered among the located: a message that named only what
+                # THIS pass masked would understate what is known and overstate the hole.
+                logger.warning(  # nosemgrep: python.lang.security.audit.logging.logger-credential-leak.python-logger-credential-disclosure -- the word "credential" names the leaf CLASS; the arguments are sanitised paths and counts, and no file is read.  # noqa: E501  # fmt: skip
+                    "sandbox: the masked credential leaf %s has %d hard links and only %d "
+                    "other name(s) could be located, so at least one name for these bytes is "
+                    "somewhere this pass cannot reach. Masking the located ones does not "
+                    "close the hole.",
+                    safe_terminal_line(target),
+                    info.st_nlink,
+                    len(found) + len(covered),
+                )
+            # Not every name is accounted for, so the remainder is outside the homes this
+            # pass can read -- the snapshot and backup case (``cp -al``, rsnapshot,
+            # ``rsync --link-dest``), which this control has always accepted as a cost in the
+            # live home rather than tried to locate across the filesystem.
+            if root == live_home:
+                raise SandboxCeilingUnsealable(_masked_leaf_multilink_detail(target, info.st_nlink))
+            logger.warning(  # nosemgrep: python.lang.security.audit.logging.logger-credential-leak.python-logger-credential-disclosure -- the word "credential" names the leaf CLASS; the argument is a path and a link count, and no file is read.  # noqa: E501  # fmt: skip
+                "sandbox: the masked credential leaf %s has %d hard links and the other name "
+                "is not under any data home, so it cannot be masked for this spawn. It is not "
+                "in the live data home either, so the spawn proceeds and this is reported "
+                "rather than refused: a home the install does not use is not masked while it "
+                "is absent, so anything inside it can have been created from inside a "
+                "sandbox, and refusing would let that stop every launch on the host. Remove "
+                "the extra name, or remove the unused home. kirocrew doctor lists this.",
+                safe_terminal_line(target),
+                info.st_nlink,
+            )
+    return tuple(to_hide)
+
+
+def _referent_identity(target: str, info: os.stat_result) -> tuple[int, int, int]:
+    """What *target* REACHES, as the launcher's pin will see it: ``(kind, dev, ino)``.
+
+    The occupant identity ``(dev, ino, is_link)`` names the entry at the name. The
+    pin needs more to judge what it will MOUNT over: for a link, the object the
+    mask lands on is the referent, and the link's own identity says nothing about
+    it. A referent swapped for another object of the same kind leaves the link
+    untouched, so only the referent's own device and inode can refuse that swap.
+    The kind settles a separate case: a directory loop and a file loop are both
+    offered every path, and after the directory loop has masked a directory, the
+    file loop reaches the stand-in -- a different object of the wrong kind, and
+    not a substitution. Only a wrong-kind object at a name the pass saw holding
+    THIS loop's kind is one. A link is followed once here, as the pin follows it.
+
+    Kind ``0`` absent (a dangling link), ``1`` directory, ``2`` regular file, ``3``
+    any other kind. For a name that is not a link, the referent is the entry
+    itself. For a link with no referent, device and inode are ``0``.
+    """
+    st = info
+    if stat.S_ISLNK(info.st_mode):
+        try:
+            st = os.stat(target)
+        except FileNotFoundError:
+            return (0, 0, 0)
+        except OSError:
+            return (3, 0, 0)
+    mode = st.st_mode
+    if stat.S_ISDIR(mode):
+        kind = 1
+    elif stat.S_ISREG(mode):
+        kind = 2
+    else:
+        kind = 3
+    return (kind, st.st_dev, st.st_ino)
+
+
+def _refuse_aliased_masked_leaves(
+    observed: dict[str, tuple[int, ...]] | None = None,
+) -> tuple[_AliasMask, ...]:
+    """Refuse the spawn when a MASKED leaf is reachable under a second name.
+
+    The mask is a bind mount, so it attaches to the path the leaf RESOLVES to while the
+    leaf's own name stays in the writable data home. A symlinked leaf therefore reads as
+    masked and is not: a sandboxed process unlinks the name, drops its own directory or
+    file there, and every later read goes to bytes it controls -- past whatever ownership
+    check or redactor the gateway applies to the masked path. Warning and continuing is
+    what made that silent, which is the whole reason this pass refuses.
+
+    **Both the leaf and its components below the data home.** ``lstat`` leaves only the
+    FINAL component un-followed, so a leaf checked that way alone still resolves through a
+    planted link at an intermediate component, and multi-component masked leaves genuinely
+    exist (``apps/aws-control/data``, ``apps/meetings/data/edits``, the md-notebook state
+    leaves). Those intermediates sit inside the agent-writable data home, so a link at one
+    of them lands the mask on an attacker-chosen tree while the lexical name stays
+    replaceable -- the same hole one level up. Components are walked root-first by
+    :func:`_first_linked_component_below`; the data home itself and its parents are NOT
+    walked, because ``config_dir()`` documents that a symlinked data HOME is supported.
+
+    Creates NOTHING. An ABSENT leaf is skipped, and that is what makes one pass safe over
+    EVERY masked leaf rather than only the materialised ones: a store that has not been
+    used yet offers no name to alias, and the retired ``ledgers`` root must not be
+    re-materialised on every machine (see its entry in :data:`_CREW_HIDDEN_LEAVES`, which
+    says so). Giving the leaves that need a mount target one is a different job, and
+    :func:`_materialize_maskable_dirs` does it for the nine it covers.
+
+    Runs LAST on the spawn path, after every materialiser, so a leaf with its own tailored
+    refusal answers first and keeps its own sentence: ``live_target.json`` shares its
+    wording with ``kirocrew doctor`` and the md-notebook leaves name their own documents,
+    and a generic message arriving first would replace both.
+
+    SYMLINKS refuse. An extra HARDLINK refuses for the leaves whose bytes are themselves a
+    usable secret and is WARNED for the rest -- :data:`_CREW_HARDLINK_REFUSED_LEAVES` is
+    that set and argues each entry. The split is where the cost sits: ``st_nlink`` says a
+    second name EXISTS and not where it is, so refusing also refuses a link that
+    ``rsync --link-dest`` or a snapshot tool left outside the sandbox, where it is
+    harmless. For a credential leaf that is the right trade and the same one
+    :func:`_refuse_unless_sole_regular_link` already makes for the live-target pointer; for
+    a leaf masked only so an agent cannot WRITE it, the reader re-validates the content and
+    a spawn-wide outage is not proportionate. Either way the warning is emitted HERE rather
+    than left to :func:`_warn_if_alias_backed`, which never runs over these leaves.
+
+    The credential refusal itself is issued by :func:`_refuse_multilinked_credential_leaves`,
+    called at the end of this pass, because it has to cover EVERY masked home while this
+    loop covers ``config_dir()``. The symlink and linked-component refusals stay scoped to
+    this one home on purpose; that function's docstring gives the reason.
+
+    A TOLERATED leaf is VISITED and WARNED, never skipped. Excluding it from the walk is the
+    same silence one level along: a symlinked ``.env`` carries live channel tokens and is
+    replaceable by the very mechanism described above, so saying nothing about it would
+    reproduce the property this pass ends while claiming to end it. Tolerating the layout is
+    the decision; tolerating it silently is not part of that decision.
+
+    Per spawn rather than once per process, matching :func:`_warn_if_alias_backed`'s own
+    stated reason: a host where this keeps happening has a real problem, and de-duplicating
+    would hide how often the control cannot be established.
+    """
+    try:
+        root = str(config_dir())
+    except Exception as exc:
+        # Fail CLOSED, like every other reason on this path: a spawn that skipped the
+        # check would run the agent against leaves whose masks may be attached to
+        # somewhere else entirely.
+        raise SandboxCeilingUnsealable(
+            f"cannot resolve the crew data home to check the masked leaves for an alias: {exc}"
+        ) from exc
+    for leaf in _CREW_HIDDEN_LEAVES:
+        # TOLERATED leaves are VISITED, not excluded. Excluding them from the walk is what
+        # made the exception silent: a symlinked ``.env`` -- live channel tokens, under the
+        # same unlink-and-replace mechanism this pass exists to refuse -- got no refusal and
+        # no log line either, which is the property being ended rather than an instance of
+        # it. Tolerating the dotfile-manager layout is right; tolerating it silently is not.
+        tolerated = leaf in _CREW_ALIAS_TOLERATED_LEAVES
+        target = os.path.join(root, leaf)
+        linked = _first_linked_component_below(root, leaf)
+        if linked is not None:
+            if leaf in _CREW_ALIAS_CHAIN_DEGRADE_LEAVES or tolerated:
+                # A sibling control already answers the first case; see
+                # ``_CREW_ALIAS_CHAIN_DEGRADE_LEAVES`` for why degrading beats refusing
+                # for exactly those leaves. A tolerated leaf is never refused at all.
+                logger.warning(
+                    "sandbox: the masked path %s passes through a component that is a link "
+                    "(%s), so the mask binds what that component resolves to. Not refused "
+                    "for this leaf -- replace the link with a real directory to close it.",
+                    target,
+                    linked,
+                )
+                continue
+            raise SandboxCeilingUnsealable(
+                f"the masked path {safe_terminal_line(target)} passes through a component "
+                f"that is a LINK ({safe_terminal_line(linked)}). The mask binds whatever "
+                "that component resolves to, so the name would stay writable inside the "
+                "sandbox while reads and writes reached an unmasked tree. Replace the link "
+                "with a real directory."
+            )
+        try:
+            info = os.lstat(target)
+        except FileNotFoundError:
+            # Genuinely absent. Nothing is aliased, and nothing is created.
+            continue
+        except OSError as exc:
+            # Every OTHER errno means this process could not judge the path, which is not
+            # the same as the path being safe. Treating them alike failed OPEN: the data
+            # home is agent-writable, so an agent that strips search permission from a
+            # directory it owns (``apps/``) turns EACCES into a silent skip, and the
+            # launcher's own ``isdir`` guard skips the mask for the same reason -- so the
+            # child can restore the permission and reach the protected state unmasked.
+            # Same split the sibling ``_refuse_if_symlink_leaf`` already makes.
+            raise SandboxCeilingUnsealable(
+                f"cannot stat the masked path {safe_terminal_line(target)} to check for an "
+                f"alias: {safe_terminal_line(str(exc))}. Refusing rather than treating an "
+                "unreadable path as absent, because the mask is skipped for a path that "
+                "cannot be classified."
+            ) from exc
+        if observed is not None:
+            # Record the identity this pass SAW as soon as the leaf is stat'd, BEFORE any
+            # classification branch below can ``continue`` past it. A tolerated symlink or
+            # a hard-linked credential leaf is left in place for this spawn (the mask binds
+            # what it resolves to), but the launcher must still hold the identity the pass
+            # observed: without it ``_carried_occupant`` returns nothing, the pin's
+            # substitution check never fires, and an unlink of that name before the child
+            # pins it lets the pin skip the now-absent path and expose the credential
+            # referent. Taken from the ``lstat`` above, so it costs no extra syscall.
+            observed[target] = (
+                info.st_dev,
+                info.st_ino,
+                int(stat.S_ISLNK(info.st_mode)),
+                *_referent_identity(target, info),
+            )
+        if stat.S_ISLNK(info.st_mode):
+            pointed_at = "(unreadable)"
+            with contextlib.suppress(OSError):
+                pointed_at = os.readlink(target)
+            if tolerated:
+                logger.warning(
+                    "sandbox: the masked path %s is a SYMLINK -> %s. The mask binds what "
+                    "the link resolves to, so this NAME stays writable inside the sandbox. "
+                    "Not refused, because this leaf is the operator's own file and a dotfile "
+                    "manager legitimately links it -- make it a regular file to close it.",
+                    target,
+                    pointed_at,
+                )
+                continue
+            raise SandboxCeilingUnsealable(
+                f"the masked path {safe_terminal_line(target)} is a SYMLINK -> "
+                f"{safe_terminal_line(pointed_at)}. The mask binds whatever the link "
+                "resolves to, so this NAME would stay writable inside the sandbox while "
+                "reads and writes reached an unmasked target. Remove the link and keep a "
+                "real directory or file under this name."
+            )
+        if stat.S_ISREG(info.st_mode) and info.st_nlink > 1:
+            if leaf in _CREW_HARDLINK_REFUSED_LEAVES:
+                # Refused by _refuse_multilinked_credential_leaves, which owns this
+                # condition across EVERY masked home rather than this loop's single one.
+                continue
+            logger.warning(
+                "sandbox: the masked path %s has %d hardlinks. The mask covers this path "
+                "only, so a read or write through another name reaches the same inode. "
+                "Not refused, because this leaf is masked so an agent cannot WRITE it and "
+                "its reader re-validates the content, while a hardlinking snapshot tool "
+                "leaves a link on an ordinary host -- remove the extra link to close it.",
+                target,
+                info.st_nlink,
+            )
+    # Every masked home, not just this loop's. The credential leaves are masked under each
+    # crew-home spelling and under a relocated home, so the pass has to cover the same set
+    # the masks do. Its return value is the paths this spawn must ALSO hide: a second name to
+    # a masked leaf that the mask does not already cover.
+    return _refuse_multilinked_credential_leaves()
+
+
+def _masked_leaf_pathonly_alias_detail(target: str, aliases: list[str]) -> str:
+    """The refusal sentence when the platform can only hide an alias BY PATH.
+
+    Separate from :func:`_masked_leaf_multilink_detail` because the condition is the
+    opposite one: there every other name is UNLOCATABLE, so nothing can be masked; here
+    every name IS located and masking them would ordinarily close the hole -- it is the
+    platform's masking that cannot be relied on, since a path rule stops naming the bytes
+    as soon as the governed process renames a parent it is free to write. Saying "another
+    path is readable" would misdescribe that, and the operator's remedy is the same
+    ``find`` command either way.
+    """
+    listed = ", ".join(safe_terminal_line(a) for a in aliases[:3])
+    more = "" if len(aliases) <= 3 else f" and {len(aliases) - 3} more"
+    return (
+        f"cannot mask {safe_terminal_line(target)}: this leaf holds a credential and is also "
+        f"reachable as {listed}{more}. On this platform a mask is a path rule rather than a "
+        "bind over the inode, and nothing stops the sandboxed process renaming a parent "
+        "directory so the rule no longer names these bytes, so hiding the other names cannot "
+        f"stand in for removing them. {_masked_leaf_alias_search_hint(target)}"
+    )
+
+
+def _masked_leaf_multilink_detail(target: str, links: int) -> str:
+    """The refusal sentence for a credential leaf reachable under more than one name.
+
+    Names the ``find`` invocation rather than only the condition, for the reason
+    :func:`_live_target_multilink_detail` gives: an ordinary snapshot run leaves a link, so
+    the operator who meets this has no reason to know which OTHER path shares the inode,
+    and without the command the remedy "remove the extra link" names no file to remove.
+
+    Its own sentence rather than the pointer's, which says "the live-target pointer" and
+    would name the wrong file here, and a module-level formatter rather than an inline
+    string so ``kirocrew doctor`` reports the condition in the same words BEFORE a spawn
+    refuses on it.
+    """
+    return (
+        f"cannot mask {safe_terminal_line(target)}: this leaf holds a credential and has "
+        f"{links} hard links, so a mask over this name would leave another path to the "
+        f"same bytes readable and writable. {_masked_leaf_alias_search_hint(target)}"
+    )
+
+
+def _masked_leaf_alias_search_hint(target: str) -> str:
+    """How to find the other names for *target*, without claiming anything is unmasked.
+
+    Its own function because the two readers need the same command and disagree about the
+    sentence before it: the launcher's refusal says the leaf cannot be masked, while
+    ``kirocrew doctor`` reports leaves whose every other name WAS located and is masked for
+    each spawn. Printing the refusal sentence for those said "masked for each spawn" and
+    "cannot mask" one line apart, so the operator could not tell which had happened.
+
+    :func:`_masked_leaf_multilink_detail` prepends the refusal sentence and is what a spawn
+    raises with; doctor uses this alone for a leaf that is accounted for.
+    """
+    # ``shlex.quote`` per path for the reason the pointer's formatter states: a data home
+    # holding a space otherwise turns the remedy into a two-directory search that answers a
+    # different question without erroring, so it has to survive being pasted.
+    # The search directory is the DATA HOME, not the leaf's own parent. Every entry in
+    # _CREW_HARDLINK_REFUSED_LEAVES but one is a root-level name, for which the two
+    # coincide; ``workspace/<md-notebook>/pat`` is the exception, and using its parent there
+    # would search one app's state directory while the sentence below promises the data home,
+    # so a second name anywhere else under the home would report as absent. Strip whichever
+    # leaf this target ends with to recover the home the caller was iterating.
+    search_dir = os.path.dirname(target)
+    for leaf in _CREW_HARDLINK_REFUSED_LEAVES:
+        suffix = os.sep + leaf.replace("/", os.sep)
+        if target.endswith(suffix):
+            search_dir = target[: -len(suffix)]
+            break
+    return (
+        "List the names under the data home with the command find "
+        f"{shlex.quote(safe_terminal_line(search_dir))} "
+        f"-samefile {shlex.quote(safe_terminal_line(target))} "
+        "-- that searches the data home only, and the tools that leave a link here "
+        "(snapshot and backup runs) usually keep theirs somewhere else, so if it reports "
+        "just this leaf, run it again from the mount point holding it with -xdev added: a "
+        "hard link cannot cross a filesystem, but it can sit anywhere on this one. Then "
+        "remove the extra link(s) and restart."
+    )
+
+
+def masked_credential_leaf_aliases() -> list[tuple[str, int, str, bool]]:
+    """Every masked CREDENTIAL leaf that is reachable under more than one name, for doctor.
+
+    The pre-spawn read that makes the refusal in :func:`_refuse_aliased_masked_leaves`
+    defensible, and the counterpart of :func:`live_target_pointer_unfitness` for the same
+    shape on the other leaves. The refusal is otherwise the operator's only notice, and it
+    arrives too late and in the wrong place: a hard link on a file in the home is ordinary
+    operation for a snapshot tool, so the condition appears without anybody doing anything
+    wrong, and the first symptom is that agents stop starting.
+
+    Read-only and total. It creates nothing, follows nothing, opens no file, and a data home
+    it cannot resolve or a leaf it cannot stat is reported as nothing rather than as a
+    fault, because doctor must not turn its own probe failure into a verdict about the host.
+    An absent leaf has no second name by construction.
+
+    Covers EVERY masked home (:func:`_masked_crew_home_roots`), the same set
+    :func:`_refuse_multilinked_credential_leaves` judges. A probe narrower than the refusal
+    is worse than no probe: it reports a clean host and the next spawn refuses anyway, which
+    is the failure this read exists to prevent.
+
+    Returns the leaf path, its link count, the home it was found under, and whether every
+    other name was LOCATED. The caller renders the same sentence the spawn would use instead
+    of paraphrasing it, and needs the other two to say what that spawn actually does: only
+    the live home refuses, and only when a name could not be located -- a leaf whose every
+    name is located is MASKED and the spawn proceeds. A reader told "REFUSED" for either of
+    the other two would act on a failure that is not coming.
+    """
+    found: list[tuple[str, int, str, bool]] = []
+    search_roots = list(_masked_crew_home_roots())
+    for root in search_roots:
+        for leaf in sorted(_CREW_HARDLINK_REFUSED_LEAVES):
+            target = os.path.join(root, leaf)
+            try:
+                if _first_linked_component_below(root, leaf) is not None:
+                    # Reached through a linked component, so the count would belong to a
+                    # file outside the data home. The spawn path skips this case for that
+                    # reason, and a probe that reports what the spawn does NOT refuse on
+                    # would fail doctor's exit code over a foreign path.
+                    continue
+            except SandboxCeilingUnsealable:
+                continue
+            try:
+                info = os.lstat(target)
+            except OSError:
+                continue
+            if stat.S_ISREG(info.st_mode) and info.st_nlink > 1:
+                # The SAME accounting the refusal performs, over the SAME set of homes, so the
+                # two cannot disagree: the launcher masks a leaf whose every other name is
+                # located and refuses one where a name is not, and a probe reporting only the
+                # link count cannot tell an operator which of those is coming. A name a mask
+                # already covers counts as located on both sides, for the same reason.
+                walked = [
+                    _inode_aliases_under(search_root, target, info) for search_root in search_roots
+                ]
+                located = {alias for names in walked for alias in names.unmasked} | {
+                    alias for names in walked for alias in names.masked
+                }
+                found.append((target, info.st_nlink, root, len(located) + 1 == info.st_nlink))
+    return found
+
+
+def _materialize_live_target_mask_target(
+    established: list[str] | None = None,
+) -> str | None:
+    """Publish the live-target pointer's absent-equivalent document so its mask can mount.
+
+    The FILE counterpart of :func:`_materialize_maskable_dirs`, and it shares that
+    function's simplifying property: the pointer is a DIRECT child of the data home, so
+    there is no agent-writable intermediate component for a planted link to redirect, and
+    no per-component descent is needed — the whole hazard
+    :func:`_materialize_md_notebook_mask_targets` walks chains to avoid.
+
+    Why at all: the launcher's ``SENSITIVE_FILES`` loop guards on ``isfile``, so an absent
+    pointer is an UNMASKED pointer for every namespace already running, and the crew data
+    home is writable at OS level. An agent in such a namespace can simply CREATE the
+    pointer, and the gateway ``execve``s into whatever it names at its next start.
+    Publishing the document first makes the mask non-vacuous, so every namespace binds an
+    empty file over the name from the outset.
+    :data:`_LIVE_TARGET_PRECREATE_CONTENT` carries the absent-equivalence argument.
+
+    Linux spawn path only, at the same site as the other materialisers: a Seatbelt deny is
+    a path rule that already holds for a name which does not exist yet, so macOS needs
+    nothing here. The LIVE data home only (``config_dir()``) — a stub under the deprecated
+    spelling would be a file nothing reads — and an absent data home is left absent.
+
+    **Fail-closed**, like the directory materialiser and for the same reason: launching
+    with the pointer maskless is the exposure this exists to prevent. Never truncates and
+    never removes — an existing regular file is left byte-for-byte alone, whether it holds
+    a real pin or this stub. Returns the path if it published one.
+    """
+    try:
+        root = str(config_dir())
+    except Exception:  # pragma: no cover - defensive; a spawn must not fail on this
+        logger.debug("could not resolve the crew data home for live-target masking")
+        return None
+    if not os.path.isdir(root):
+        return None
+    target = os.path.join(root, _LIVE_TARGET_LEAF)
+    # ANY symlink refuses, dangling or resolving, and in ONE sentence. A resolving link
+    # is the attack entry rather than just a dangling one: a mount follows its target, so
+    # the mask would bind over the referent while the lexical name stayed an
+    # agent-replaceable link in a writable directory. Refused before the isfile check,
+    # exactly as the directory materialiser refuses before its isdir check.
+    #
+    # This refuses a SUPERSET of what the two generic helpers
+    # (``_refuse_if_dangling_symlink`` then ``_refuse_if_symlink_leaf``) refused between
+    # them, so nothing is admitted that they rejected. The pointer gets its own for two
+    # reasons: those helpers say "the masked DIRECTORY <path> is a SYMLINK", which names
+    # the wrong kind of thing for a JSON document an operator is about to go look at; and
+    # the sentence is shared with ``live_target_pointer_unfitness`` so doctor's
+    # pre-spawn warning and this refusal cannot come to describe one file two ways.
+    _refuse_if_live_target_symlink(target)
+    if os.path.exists(target):
+        _refuse_unless_sole_regular_link(target)
+        _note_established(established, target)
+        return None
+    # The temp is staged in a MASKED directory, never beside the target: the data-home
+    # root is visible in every sandbox, so a temp there is a name a concurrent namespace
+    # can ``link(2)`` — and a bind mask covers a path, not the inode behind it. The
+    # staging directory is precreated (``_CREW_PRECREATE_HIDDEN_DIR_LEAVES``); it is a
+    # direct child of the data home, so its own chain has no agent-writable component.
+    staging = os.path.join(root, _LIVE_TARGET_STAGING_LEAF)
+    try:
+        os.makedirs(staging, mode=0o700, exist_ok=True)
+    except OSError as exc:
+        raise SandboxCeilingUnsealable(
+            f"cannot create {staging} to stage the live-target pointer's mask target: {exc}"
+        ) from exc
+    if not stat.S_ISDIR(os.lstat(staging).st_mode):
+        raise SandboxCeilingUnsealable(
+            f"{staging} is not a directory; refusing to stage the live-target pointer's "
+            "mask target through it"
+        )
+    if _publish_empty_ceiling(target, staging, content=_LIVE_TARGET_PRECREATE_CONTENT):
+        # ``os.link`` publishes by adding a second name to the temp's inode, and the
+        # temp is unlinked right after — so a link count above one here means someone
+        # else linked the inode in the window, and a mask over THIS name would not
+        # cover THEIR path to the bytes the gateway executes.
+        _refuse_unless_sole_regular_link(target)
+        _note_established(established, target)
+        return target
+    # A lost publish race is benign only if the winner cleared the same bar. Publishing is
+    # ``os.link``, which fails EEXIST rather than clobbering, so the ordinary loser finds a
+    # regular, singly-linked file here; anything else means the name is not maskable.
+    try:
+        _refuse_unless_sole_regular_link(target)
+        # Validated on the winner's own terms, so established -- see the ceiling loop's
+        # lost-publish arm for why a loser still counts as seen.
+        _note_established(established, target)
+        return None
+    except FileNotFoundError:
+        pass
+    raise SandboxCeilingUnsealable(
+        f"cannot give the live-target pointer's mask a mount target at {target}. "
+        "Launching anyway would leave the pointer maskless in every agent namespace, "
+        "where writing it selects the code the gateway starts next."
+    )
+
+
+def _refuse_if_live_target_symlink(target: str) -> None:
+    """Refuse the spawn when the live-target pointer's path is a symlink of any kind.
+
+    One check for both link shapes, because both fail the same way: a mask binds over the
+    path a link RESOLVES to, so the link's own name stays a writable entry in the data
+    home and a sandboxed process can replace it with a pin of its own. A dangling link is
+    the same hole with the referent missing.
+
+    Deliberately NOT the shared ``_refuse_if_symlink_leaf``: its sentence names "the
+    masked directory", and this target is a JSON document. It also has to be the sentence
+    :func:`live_target_pointer_unfitness` reports, so the pre-spawn warning and the
+    refusal stay one string.
+
+    Refused rather than removed: ``lstat`` then ``unlink`` is not atomic, so removing it
+    here would race whoever put it there.
+    """
+    try:
+        info = os.lstat(target)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise SandboxCeilingUnsealable(
+            f"cannot stat the live-target pointer {safe_terminal_line(target)} to check "
+            f"for a symlink: {safe_terminal_line(str(exc))}"
+        ) from exc
+    if not stat.S_ISLNK(info.st_mode):
+        return
+    points_at = "(unreadable)"
+    with contextlib.suppress(OSError):
+        points_at = os.readlink(target)
+    raise SandboxCeilingUnsealable(_live_target_symlink_detail(target, points_at))
+
+
+class LiveTargetUnfitness(NamedTuple):
+    """Why the live-target pointer cannot be masked, and what fixes it.
+
+    ``path`` is the pointer and ``detail`` is the SAME sentence
+    :class:`SandboxCeilingUnsealable` carries for that shape -- see
+    :func:`live_target_pointer_unfitness` for why the two must be one string.
+
+    Deliberately no shape TAG beside them: every reader wants the sentence rather than a
+    branch, and a constant a surface only MIGHT want is a guess about a caller that does
+    not exist. The shapes are still told apart without matching prose, by comparing
+    ``detail`` against the formatter that builds it, which is what the tests do. A surface
+    that needs to branch can add the tag then, against a real requirement.
+    """
+
+    path: str
+    detail: str
+
+
+# Every interpolated value in the three sentences below goes through
+# ``safe_terminal_line`` because BOTH readers print the sentence to a terminal verbatim:
+# doctor through ``_print_wrapped`` and ``kirocrew chat`` through ``❌ {exc}``. One of
+# those values is chosen by whoever planted the unfit pointer -- a SYMLINK's target comes
+# back from ``os.readlink`` as arbitrary bytes -- so it can carry OSC/CSI sequences that
+# retitle the window, write the clipboard, or redraw the lines around the diagnosis. The
+# adversary is the sandboxed agent this pointer-masking exists to contain, and an operator
+# running ``kirocrew doctor`` after "agents stopped starting" is the expected trigger, so
+# the bytes are defused where the sentence is BUILT rather than at each surface that
+# prints it -- a surface added later cannot forget.
+#
+# ``safe_terminal_line`` and not ``repr``: these sentences carry a path and a ``find``
+# invocation the operator is meant to COPY, and ``repr`` would quote the whole value and
+# escape its separators -- the same "two unusable fragments" outcome ``keep_tokens_whole``
+# exists to prevent. Stripping control sequences leaves an ordinary path byte-identical.
+def _live_target_irregular_detail(target: str) -> str:
+    """The refusal sentence for a non-regular file at the pointer's path."""
+    return (
+        f"cannot mask {safe_terminal_line(target)}: a non-regular file (a link, FIFO, "
+        "socket, or device node) is sitting at the live-target pointer's path. The "
+        "launcher's isdir/isfile loops classify neither, so its mask would be silently "
+        "skipped for every sandbox. Remove or replace it with a regular file."
+    )
+
+
+def _live_target_multilink_detail(target: str, links: int) -> str:
+    """The refusal sentence for a pointer reachable under more than one name.
+
+    Names the ``find`` invocation rather than only the condition: a hard link is left by
+    ordinary operation (``cp -al``, rsnapshot, a dotfile manager), so the operator who
+    meets this has no reason to know which OTHER path shares the inode, and without the
+    command the remedy "remove the extra link" names no file to remove.
+    """
+    # ``shlex.quote`` per path, rather than one pair of quotes around the whole command: a
+    # data home holding a space makes `find /opt/my data -samefile ...` a two-directory
+    # search that answers a different question WITHOUT erroring, so the remedy has to
+    # survive being pasted and not merely read correctly. Quoting applies to the DISPLAYED
+    # text, so for the pathological case of a path holding a control byte the command is
+    # illustrative rather than runnable; a terminal that cannot be driven matters more.
+    return (
+        f"cannot mask {safe_terminal_line(target)}: the live-target pointer has {links} "
+        "hard links, so a mask over this name would leave another path to the same "
+        "bytes unmasked. List the names under the data home with the command "
+        f"find {shlex.quote(safe_terminal_line(os.path.dirname(target)))} -samefile "
+        f"{shlex.quote(safe_terminal_line(target))} "
+        "-- that searches the data home only, and the tools that leave a link here "
+        "(snapshot and backup runs, a dotfile manager) usually keep theirs somewhere "
+        "else, so if it reports just the pointer, run it again from the mount point "
+        "holding it with -xdev added: a hard link cannot cross a filesystem, but it can "
+        "sit anywhere on this one. Then remove the extra link(s) and restart."
+    )
+
+
+def _live_target_symlink_detail(target: str, points_at: str) -> str:
+    """The refusal sentence for a symlink squatting the pointer's path.
+
+    Wording of its own rather than the shared directory-leaf refusal's: that helper is
+    reached for real directories too and says "the masked directory", which for
+    ``live_target.json`` names the wrong kind of thing to an operator reading it.
+
+    ``points_at`` is the one value here an adversary picks outright -- see the note above
+    this group for why it is defused when the sentence is built.
+    """
+    return (
+        f"cannot mask {safe_terminal_line(target)}: the live-target pointer is a "
+        f"SYMLINK -> {safe_terminal_line(points_at)}. "
+        "A mask binds over the link's target, not the name, so the name stays "
+        "replaceable in a writable directory and a sandboxed process could point it "
+        "at a checkout it controls. Replace it with a regular file, and restart."
+    )
+
+
+def _refuse_unless_sole_regular_link(target: str) -> None:
+    """Raise unless *target* is a regular file with exactly one hard link.
+
+    Two refusals, one reason each. A non-regular file (FIFO, socket, device): the
+    launcher's ``isdir``/``isfile`` loops classify neither, so its mask would be skipped
+    for every sandbox. A link count above one: a bind mask covers the NAME, so a second
+    name on the same inode is an unmasked path to the bytes the gateway ``execve``s from
+    — whether planted by a same-uid process in a namespace that could see a staging
+    temp, or left by an operator's ``ln``. ``FileNotFoundError`` propagates so a
+    publish-race caller can tell "gone" from "unfit".
+
+    The sentences come from the module-level formatters so ``kirocrew doctor`` can report
+    the same condition, in the same words, BEFORE a spawn refuses on it.
+    """
+    st = os.lstat(target)
+    if not stat.S_ISREG(st.st_mode):
+        raise SandboxCeilingUnsealable(_live_target_irregular_detail(target))
+    if st.st_nlink != 1:
+        raise SandboxCeilingUnsealable(_live_target_multilink_detail(target, st.st_nlink))
+
+
+def live_target_pointer_unfitness() -> LiveTargetUnfitness | None:
+    """Classify the LIVE live-target pointer the way a spawn would, WITHOUT spawning.
+
+    ``None`` means nothing to report: a healthy pointer, an absent one (the materialiser
+    publishes a stub for it), or no data home yet. Anything else is a shape that makes
+    :func:`_materialize_live_target_mask_target` refuse, so it refuses EVERY Linux agent
+    spawn on the host until an operator fixes it.
+
+    It exists because the refusal is the operator's only notice today, and it arrives too
+    late and in the wrong place: a hard link on a config file is ordinary operation for a
+    snapshot tool (``cp -al``, rsnapshot) and for a dotfile manager, so the condition
+    appears without anybody doing anything wrong, and the first symptom is that agents
+    stop starting. ``kirocrew doctor`` is where an operator looks for that, and this is
+    the read that lets it answer.
+
+    Shares the refusal's own sentences rather than paraphrasing them, so the pre-spawn
+    warning and the post-refusal error cannot drift into describing the same file two
+    different ways — and so a reworded remedy reaches both surfaces at once.
+
+    Read-only and total: it never creates, moves or removes anything, and a data home it
+    cannot resolve or stat is reported as nothing rather than as a fault, because doctor
+    must not turn its own probe failure into a verdict about the host.
+
+    The POINTER itself is the exception: if it exists but cannot be stat'd the ``OSError``
+    propagates rather than reading as fit, because ``None`` here means "nothing to
+    report" and a pointer whose shape is unknown may still refuse every spawn. Doctor
+    renders that as "could not check". Absent is the one genuinely fit failure to stat.
+    """
+    try:
+        root = str(config_dir())
+    except Exception:  # pragma: no cover - defensive; doctor must survive a bad home
+        logger.debug("could not resolve the crew data home for live-target fitness")
+        return None
+    if not os.path.isdir(root):
+        return None
+    target = os.path.join(root, _LIVE_TARGET_LEAF)
+    try:
+        st = os.lstat(target)
+    except FileNotFoundError:
+        # Absent is FIT: the materialiser publishes the absent-equivalent stub, which
+        # is the whole reason that function exists.
+        return None
+    except OSError:
+        # NOT ``return None``: None is this function's word for FIT, and an unreadable
+        # pointer is not fit -- it is unknown. Swallowing it would make doctor print
+        # nothing at all for a pointer it cannot classify, which reads as "checked,
+        # healthy" while every Linux spawn may still refuse on it. Doctor's own caller
+        # turns the raise into "could not check (...)", which is the honest answer and the
+        # one its docstring promises. Only the ABSENT case above is genuinely fit.
+        logger.debug("could not stat the live-target pointer %s", target, exc_info=True)
+        raise
+    if stat.S_ISLNK(st.st_mode):
+        points_at = "(unreadable)"
+        with contextlib.suppress(OSError):
+            points_at = os.readlink(target)
+        return LiveTargetUnfitness(
+            path=target,
+            detail=_live_target_symlink_detail(target, points_at),
+        )
+    if not stat.S_ISREG(st.st_mode):
+        return LiveTargetUnfitness(
+            path=target,
+            detail=_live_target_irregular_detail(target),
+        )
+    if st.st_nlink != 1:
+        return LiveTargetUnfitness(
+            path=target,
+            detail=_live_target_multilink_detail(target, st.st_nlink),
+        )
+    return None
+
+
+def _md_notebook_degraded_mask_dirs() -> list[str]:
+    """The md-notebook state directories to mask WHOLESALE because the app is degraded.
+
+    Normally only the three secret leaves are masked, and that is deliberate: the same
+    directory holds the vault clone data, which agents are meant to read. Masking it
+    wholesale on a healthy host would hide the user's notes from every agent — the app's
+    whole purpose.
+
+    When a component of the chain is a planted link the calculus inverts. The carve-out is
+    withheld under this same predicate, so the backend cannot write there and the app is
+    already non-functional for that root; hiding the directory costs nothing that still
+    works. What it buys is the one exposure skipping leaves behind: a legacy staging orphan
+    holding real PAT bytes that :func:`_sweep_one_md_notebook_state_dir` cannot delete
+    through a link, and that the three leaf masks do not cover because its name is neither
+    ``pat`` nor a state file. A directory mask covers every name inside it, orphans
+    included.
+
+    Masking is fail-safe in the direction that matters: the launcher binds an empty
+    directory over the resolved path INSIDE the namespace only, so a link pointing
+    somewhere unexpected costs that sandbox visibility of a path it should not have been
+    reading, never anything on the host.
+    """
+    dirs: list[str] = []
+    roots: list[str] = []
+    try:
+        roots.append(str(config_dir()))
+    except Exception:  # pragma: no cover - defensive; a spawn must not fail on this
+        logger.debug("could not resolve the crew data home for the md-notebook mask")
+    try:
+        home = Path.home()
+        roots.extend(str(home / Path(prefix)) for prefix in _CREW_HOME_PREFIXES)
+    except Exception:  # pragma: no cover - defensive
+        logger.debug("could not resolve $HOME for the md-notebook mask")
+    for root in dict.fromkeys(roots):
+        state_dir = os.path.join(root, *_MD_NOTEBOOK_STATE_COMPONENTS)
+        # Ask the predicate about a LEAF, exactly as the carve-out filter does, not about
+        # the directory: it judges a path's PARENT chain, so passing the directory would
+        # miss a link at the directory itself — the very case the sweep's final-component
+        # refusal leaves unswept. Sharing the input shape keeps "withheld" and "masked"
+        # literally the same decision rather than two that merely agree today.
+        probe = os.path.join(state_dir, os.path.basename(_MD_NOTEBOOK_STATE_LEAVES[0]))
+        if carveout_chain_has_planted_link(probe):
+            dirs.append(state_dir)
+    return dirs
+
+
+def _sweep_legacy_md_notebook_temps() -> list[str]:
+    """Remove pre-upgrade staging temps left BESIDE md-notebook's state files.
+
+    Before the staging directory existed, all three state writers staged a sibling of
+    their target: ``vaults.json.<hex>.tmp`` and ``settings.json.<hex>.tmp`` from
+    ``git_ops.staged_temp_name``, and ``tmp<random>.tmp`` from ``atomic_write``'s
+    ``mkstemp(dir=path.parent, suffix=".tmp")``. A SIGKILL in that window left a file
+    holding the real PAT bytes at a name NO mask covers — not the three leaves, and not
+    the staging directory. Materialising forward does not help: the exposure is an
+    artefact already on disk, so on an upgraded host the exact bytes this carve-out
+    exists to fence would stay readable by a same-uid agent forever.
+
+    Runs on EVERY sandbox launch path, Linux namespace and macOS Seatbelt alike, and is
+    deliberately NOT part of :func:`_materialize_md_notebook_mask_targets`. Materialising
+    is Linux-only for a good reason — a Seatbelt deny is a path rule that holds for a name
+    that does not exist yet — but that reasoning does not transfer to an orphan that DOES
+    exist at a name no rule names: the Seatbelt profile denies the leaves and the staging
+    directory, never an arbitrary ``*.tmp`` sibling, so skipping macOS would leave the
+    token readable there forever. For the same asymmetry it sweeps EVERY crew-home
+    spelling, live and legacy, while materialising touches only the live one.
+
+    Every ``*.tmp`` DIRECT child of the state directory is such an orphan by
+    construction: the state writers now stage inside the top-level staging directory, and
+    note temps live beside their note inside ``vaults/<id>/``. Directories, links, and
+    special files are left alone — only regular files are removed, judged by ``lstat`` so
+    a link is never followed.
+
+    **Fail-closed like the materialiser.** If an orphan cannot be removed the spawn is
+    refused, naming the path: launching would hand the agent the PAT this whole mechanism
+    is built to hide, and the operator can delete the file. Returns the paths it removed.
+    """
+    removed: list[str] = []
+    # Every crew-home spelling, not just the live one. The mask covers BOTH prefixes
+    # (see ``_crew_home_entries``), so a pre-upgrade orphan under an un-migrated or
+    # rolled-back ``~/.kirocrew`` is exposed exactly as one under the current home. This
+    # is the opposite requirement from MATERIALISING, which is live-home-only because a
+    # stub in a home nothing reads would be a file nobody opens: a token already written
+    # to the legacy home stays readable no matter which home is live now. De-duplicated so
+    # a relocated ``KIROCREW_HOME`` coinciding with a prefix is swept once.
+    roots: list[str] = []
+    try:
+        roots.append(str(config_dir()))
+    except Exception:  # pragma: no cover - defensive; a spawn must not fail on this
+        logger.debug(
+            "could not resolve the crew data home for the md-notebook sweep", exc_info=True
+        )
+    try:
+        home = Path.home()
+        roots.extend(str(home / Path(prefix)) for prefix in _CREW_HOME_PREFIXES)
+    except Exception:  # pragma: no cover - defensive
+        logger.debug("could not resolve $HOME for the md-notebook sweep", exc_info=True)
+    for root in dict.fromkeys(roots):
+        removed.extend(_sweep_one_md_notebook_state_dir(root))
+    return removed
+
+
+#: The components between a crew data home and the md-notebook state directory. The
+#: sweep descends them ONE AT A TIME from the home, so each name is resolved by the
+#: kernel inside a directory this process already holds open.
+_MD_NOTEBOOK_STATE_COMPONENTS: tuple[str, ...] = ("workspace", MD_NOTEBOOK_APP_NAME)
+
+
+def _open_dir_anchored(anchor: str, components: tuple[str, ...]) -> int | None:
+    """Open ``anchor/*components`` by descending one component at a time, or return None.
+
+    Every step uses ``O_NOFOLLOW | O_DIRECTORY`` relative to the descriptor of the step
+    above it, so the kernel refuses a link AT EACH component and resolves each name inside
+    a directory this process is already holding. Opening the joined PATH instead would be
+    unsound however carefully the chain was pre-checked: ``O_NOFOLLOW`` constrains only the
+    FINAL component, so an intermediate directory swapped between the check and the open
+    would silently redirect the whole descent, and the caller would then ``unlink`` inside
+    a tree the agent chose. The descriptor chain closes that window structurally rather
+    than narrowing it.
+
+    ``anchor`` must be a trusted path (a crew data home), and the caller owns the returned
+    descriptor. None means some component is absent, is not a directory, or is a link —
+    all of which are "nothing safe to do here", never an error to escalate.
+    """
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    try:
+        fd = os.open(anchor, flags)
+    except OSError:
+        return None
+    for name in components:
+        try:
+            nxt = os.open(name, flags | getattr(os, "O_NOFOLLOW", 0), dir_fd=fd)
+        except OSError:
+            os.close(fd)
+            return None
+        os.close(fd)
+        fd = nxt
+    return fd
+
+
+#: The published signing key's leaf name under a crew data home. Named once because three
+#: things key off it: the mask list, the legacy temp prefix below, and the staging
+#: reconciliation that compares a staged file's inode against this file's.
+_AUTH_STORE_PUBLISHED_KEY_LEAF: str = "token_signing.key"
+
+#: The name shape a pre-upgrade signing-key publish left in the crew data-home root:
+#: ``token_secret`` staged ``.<leaf>.<pid>.<hex>.tmp`` beside the key and published with
+#: ``os.link``, so a SIGKILL between that link and the cleanup unlink leaves a file holding
+#: the FULL signing key at a name no mask covers.
+#:
+#: Bounded to THIS prefix on purpose, and that bound is the load-bearing part. The
+#: md-notebook sweep can take every ``*.tmp`` in its directory because that directory holds
+#: nothing else; the data home root is shared, and ``atomic_write`` stages
+#: ``tmp<random>.tmp`` there for many unrelated stores. A blanket sweep would unlink another
+#: component's in-flight temp between its ``mkstemp`` and its rename and fail that write for
+#: no reason -- the same hazard ``_CEILING_TEMP_PREFIX`` is skipped for one directory down.
+#: A name carrying the leaf can only have come from this one publisher.
+_AUTH_STORE_LEGACY_TEMP_PREFIX: str = f".{_AUTH_STORE_PUBLISHED_KEY_LEAF}."
+
+
+def _reconcile_auth_store_staging_links() -> list[str]:
+    """Drop a staging name that is a SECOND HARD LINK to the published signing key.
+
+    Without this the hard-link refusal is a one-way door on a state the gateway's own
+    publisher creates on purpose. ``token_secret`` publishes the key with ``os.link`` from
+    a staged file and then unlinks the staged name; when the directory ``fsync`` after the
+    link fails it deliberately KEEPS that name, as a recoverable second name to an inode
+    whose only other name might not be durable yet, and a kill between the link and the
+    unlink leaves the same shape. Either way ``token_signing.key`` has two names, the leaf
+    is in :data:`_CREW_HARDLINK_REFUSED_LEAVES`, and every confined spawn then refuses --
+    with no automatic way out, because the operator's only exit is to find and remove the
+    name by hand.
+
+    Reconciling is sound precisely BECAUSE the two names share an inode: the destination
+    already resolves to the fully-written key, so the staged name carries no byte the
+    destination does not. That identity is also the bound. A staged file from a publish
+    still IN FLIGHT points at a different inode -- the key either does not exist yet or
+    still names the previous one -- so a concurrent writer's temp is never touched.
+    Anything that is not a regular file, and anything whose inode differs, is left alone.
+
+    **The key's own directory entry is synced BEFORE the second name is dropped, and a
+    sync the device refuses REFUSES the spawn.** Sharing an inode makes the second name
+    redundant for reading, not for durability: the publisher keeps it exactly when
+    ``fsync_dir`` on the key's parent failed, so at that moment the destination entry may
+    not have reached the device and the staged name is the inode's one other reference. A
+    crash after this function unlinked it, and before that entry commits, would leave the
+    inode with no name at all -- the signing key gone and every dashboard session invalid.
+    Syncing first is what makes dropping it lossless rather than probabilistic. Where a
+    directory sync cannot be EXPRESSED (Windows has no directory descriptor, some network
+    mounts reject it) ``fsync_dir`` returns quietly and the unlink proceeds, so the refusal
+    is reserved for a device that actively refused the write -- a host whose storage is
+    failing, where destroying the key's only durable name is the worse outcome.
+
+    The sync runs only when a matching alias was actually found. A healthy home returns at
+    the link-count test above, so this costs nothing on the ordinary spawn path.
+
+    Runs BEFORE :func:`_refuse_aliased_masked_leaves`, which is the ordering this function
+    exists to establish: cleanup that a refusal gates on must not sit behind it.
+
+    A root, staging directory, or key it cannot open or stat is SKIPPED rather than
+    escalated. Refusing here would fail every spawn for a layout that is merely unusual,
+    and the refusal downstream still judges whatever link count survives.
+    """
+    removed: list[str] = []
+    try:
+        live_home = str(config_dir())
+    except Exception:  # pragma: no cover - defensive; a spawn must not fail on this
+        logger.debug("could not resolve the crew data home for the reconciler", exc_info=True)
+        live_home = ""
+    for root in _masked_crew_home_roots():
+        try:
+            key_info = os.lstat(os.path.join(root, _AUTH_STORE_PUBLISHED_KEY_LEAF))
+        except OSError:
+            # No published key here, so no staged name can be a second link to one.
+            continue
+        if not stat.S_ISREG(key_info.st_mode) or key_info.st_nlink < 2:
+            continue
+        dir_fd = _open_dir_anchored(root, (_AUTH_STORE_STAGING_LEAF,))
+        if dir_fd is None:
+            continue
+        try:
+            aliases: list[str] = []
+            for name in os.listdir(dir_fd):
+                try:
+                    info = os.lstat(name, dir_fd=dir_fd)
+                except OSError:
+                    continue
+                if not stat.S_ISREG(info.st_mode):
+                    continue
+                if (info.st_dev, info.st_ino) != (key_info.st_dev, key_info.st_ino):
+                    # A different inode: an in-flight staging write, or an unrelated file.
+                    continue
+                aliases.append(name)
+            if not aliases:
+                continue
+            try:
+                fsync_dir(root)
+            except OSError as exc:
+                detail = (
+                    f"cannot sync {safe_terminal_line(root)} to make the token-signing "
+                    f"key's own directory entry durable: {safe_terminal_line(str(exc))}. "
+                    "The publisher kept a staging link as the key inode's second name "
+                    "because that same sync failed, so dropping it now could leave the key "
+                    "with no name at all after a crash, and keeping it leaves the masked "
+                    "leaf with a link count the spawn path refuses on. Fix the device or "
+                    "filesystem holding the data home, then restart."
+                )
+                if root == live_home:
+                    raise SandboxCeilingUnsealable(detail) from exc
+                logger.warning("SECURITY: %s", detail)
+                continue
+            for name in aliases:
+                candidate = os.path.join(root, _AUTH_STORE_STAGING_LEAF, name)
+                try:
+                    os.unlink(name, dir_fd=dir_fd)
+                except FileNotFoundError:
+                    continue
+                except OSError as exc:
+                    detail = (
+                        f"cannot remove the stale auth-store staging link "
+                        f"{safe_terminal_line(candidate)}: {safe_terminal_line(str(exc))}. It "
+                        "is a second name for the token-signing key, so the masked leaf has "
+                        "a link count the spawn path refuses on, and leaving it would make "
+                        "that refusal permanent. Remove it and restart."
+                    )
+                    if root == live_home:
+                        raise SandboxCeilingUnsealable(detail) from exc
+                    logger.warning("SECURITY: %s", detail)
+                    continue
+                logger.info(
+                    "sandbox: removed a stale auth-store staging link at %s. The publish it "
+                    "belonged to had already linked the key into place and that name is now "
+                    "synced, so this name was a redundant second name for the same inode "
+                    "and the masked leaf read as aliased.",
+                    safe_terminal_line(candidate),
+                )
+                removed.append(candidate)
+        finally:
+            os.close(dir_fd)
+    return removed
+
+
+def _sweep_legacy_auth_store_temps() -> list[str]:
+    """Remove pre-upgrade signing-key staging temps left in the crew data-home root.
+
+    The publisher stages inside :data:`_AUTH_STORE_STAGING_LEAF`, which is masked as a
+    whole directory. A temp written before that directory existed sits in the data-home
+    root instead, at a name no mask covers, holding the bytes that sign every dashboard
+    token -- so on an upgraded host it stays readable by a same-uid agent indefinitely.
+    Masking forward cannot reach it: the exposure is an artefact already on disk.
+
+    Swept on every launch path, Linux namespace and macOS Seatbelt alike, and across every
+    crew-home spelling rather than only the live one, for the reason
+    :func:`_sweep_legacy_md_notebook_temps` gives: a Seatbelt profile denies named paths,
+    never an arbitrary temp name, and a key already written under a rolled-back home stays
+    readable whichever home is live now.
+
+    Only regular files are removed, judged by ``lstat`` through a pinned descriptor so a
+    link is never followed. A root that cannot be opened is skipped rather than escalated:
+    skipping removes the deletion hazard entirely, while refusing would fail every spawn on
+    a host whose layout is merely unusual. A file that matches and cannot be removed DOES
+    refuse the spawn, naming the path -- launching would hand the agent the signing key.
+
+    A match is only removed once it is known not to be the key inode's last name, because
+    the pre-upgrade publisher kept exactly this name when its own directory sync failed:
+
+    * the published key is ABSENT -- nothing is removed, and the condition is REPORTED.
+      Whether this name is the inode's only one cannot be told apart from a staged write
+      that never published, or from a file created inside a sandbox: a home the install does
+      not use is masked by nothing while it is absent, so anything in it may be the governed
+      process's own work. Removing risks destroying a key an operator can still recover by
+      renaming it, and refusing would let one ``touch`` stop every launch on the host.
+    * the published key is present and shares this inode -- ``fsync_dir`` on the root first,
+      then remove. Sharing the inode means the key's own entry may not have reached the
+      device yet, so this is the protocol
+      :func:`_reconcile_auth_store_staging_links` uses for the same reason.
+    * the published key is present with a different inode -- removed. It is an older or
+      never-published staged copy, and the live key is reachable by its own name.
+
+    A sync or an unlink this pass cannot perform REFUSES the spawn in the live data home and
+    is reported elsewhere, for the reason
+    :func:`_refuse_multilinked_credential_leaves` gives at length: the live home exists and
+    is therefore masked, so nothing inside it was planted from a sandbox, while an unused
+    home is neither.
+    """
+    removed: list[str] = []
+    try:
+        live_home = str(config_dir())
+    except Exception:  # pragma: no cover - defensive; a spawn must not fail on this
+        logger.debug("could not resolve the crew data home for the legacy sweep", exc_info=True)
+        live_home = ""
+    for root in _masked_crew_home_roots():
+        dir_fd = _open_dir_anchored(root, ())
+        if dir_fd is None:
+            continue
+        try:
+            for name in os.listdir(dir_fd):
+                if not name.startswith(_AUTH_STORE_LEGACY_TEMP_PREFIX) or not name.endswith(".tmp"):
+                    continue
+                candidate = os.path.join(root, name)
+                try:
+                    info = os.lstat(name, dir_fd=dir_fd)
+                except OSError:
+                    continue
+                if not stat.S_ISREG(info.st_mode):
+                    continue
+                try:
+                    key_info = os.lstat(_AUTH_STORE_PUBLISHED_KEY_LEAF, dir_fd=dir_fd)
+                except FileNotFoundError:
+                    # No key at its own name, so this name may be the inode's only one --
+                    # or it may be a file created from inside a sandbox, because a home the
+                    # install does not use is masked by nothing while it is absent. Those
+                    # two are indistinguishable here, and refusing would let the governed
+                    # process stop every launch on the host with one touch(1). So report and
+                    # leave it: an operator can rename it onto the signing-key name to keep
+                    # every current session, or delete it to mint a fresh key.
+                    logger.warning(
+                        "SECURITY: leaving the legacy auth-store staging temp %s in place. "
+                        "%s is absent, so this name may be the only one left for the inode "
+                        "holding the token-signing key, and removing it could destroy a key "
+                        "that is still recoverable. It is not masked, so treat its bytes as "
+                        "exposed to anything running as this user: rename it onto the "
+                        "signing-key name to keep every current dashboard session, or delete "
+                        "it to mint a fresh key on the next start.",
+                        safe_terminal_line(candidate),
+                        safe_terminal_line(os.path.join(root, _AUTH_STORE_PUBLISHED_KEY_LEAF)),
+                    )
+                    continue
+                except OSError:
+                    # The key's own entry cannot be classified, so whether this name is its
+                    # last one is unknown. Skip rather than unlink: the same fail-closed
+                    # choice the descent above makes, and the mask still covers the key.
+                    continue
+                if (info.st_dev, info.st_ino) == (key_info.st_dev, key_info.st_ino):
+                    # This name is the published key's SECOND name, which the pre-upgrade
+                    # publisher kept exactly when its own directory sync failed. So the
+                    # key's own entry may not have reached the device, and this is the
+                    # inode's one other reference: sync first, on the same protocol the
+                    # staging reconciler uses.
+                    try:
+                        fsync_dir(root)
+                    except OSError as exc:
+                        detail = (
+                            f"cannot sync {safe_terminal_line(root)} before removing the "
+                            f"legacy auth-store staging temp {safe_terminal_line(candidate)}, "
+                            f"which is a second name for the token-signing key's own inode: "
+                            f"{safe_terminal_line(str(exc))}. Dropping it now could leave the "
+                            "key with no name at all after a crash, and keeping it leaves a "
+                            "cleartext key at a name no mask covers. Fix the device or "
+                            "filesystem holding the data home, then restart."
+                        )
+                        if root == live_home:
+                            raise SandboxCeilingUnsealable(detail) from exc
+                        logger.warning("SECURITY: %s", detail)
+                        continue
+                try:
+                    os.unlink(name, dir_fd=dir_fd)
+                except FileNotFoundError:
+                    continue
+                except OSError as exc:
+                    detail = (
+                        "cannot remove the legacy auth-store staging temp "
+                        f"{safe_terminal_line(candidate)}: {safe_terminal_line(str(exc))}. A "
+                        "pre-upgrade publish staged it beside the signing key, so it can hold "
+                        "the key that signs every dashboard token at a name no mask covers. "
+                        "Launching anyway would leave it readable inside every agent "
+                        "namespace -- delete it and retry."
+                    )
+                    if root == live_home:
+                        raise SandboxCeilingUnsealable(detail) from exc
+                    logger.warning("SECURITY: %s", detail)
+                    continue
+                logger.warning(
+                    "SECURITY: removed a legacy auth-store staging temp at %s. A "
+                    "pre-upgrade publish staged it beside the signing key, where no sandbox "
+                    "mask covers it, so it may have held the token-signing key in "
+                    "cleartext. Treat that key as exposed to anything that ran as this "
+                    "user; restart the gateway to mint a fresh one if in doubt.",
+                    safe_terminal_line(candidate),
+                )
+                removed.append(candidate)
+        finally:
+            os.close(dir_fd)
+    return removed
+
+
+def _sweep_one_md_notebook_state_dir(root: str) -> list[str]:
+    """Remove the legacy staging orphans in ONE md-notebook state directory.
+
+    The guards here are stricter than the sibling materialiser's for a concrete reason:
+    that function only ever creates, while this one ``unlink``s, and an unlink through an
+    attacker-chosen directory is irreversible.
+
+    The intermediate components (``workspace/``, ``workspace/md-notebook``) are
+    agent-writable, so a RESOLVING link planted at one of them would otherwise make this
+    sweep list and delete ``*.tmp`` files in a tree the agent picked. The descent from
+    *root* is therefore anchored and per-component (:func:`_open_dir_anchored`), and every
+    ``lstat`` and ``unlink`` is issued against the pinned final descriptor.
+
+    A root whose descent fails is SKIPPED, not escalated to a spawn refusal: skipping
+    removes the deletion hazard completely, and refusing would fail every agent spawn on a
+    host whose layout is merely unusual rather than hostile — one that symlinks the legacy
+    ``~/.kirocrew`` at the new home, say. An orphan under such a root survives unswept,
+    which is why the same predicate that degrades the app also masks the whole state
+    directory (:func:`_md_notebook_degraded_mask_dirs`): the orphan is then hidden from the
+    sandbox even though it could not be deleted.
+    """
+    removed: list[str] = []
+    state_dir = os.path.join(root, *_MD_NOTEBOOK_STATE_COMPONENTS)
+    dir_fd = _open_dir_anchored(root, _MD_NOTEBOOK_STATE_COMPONENTS)
+    if dir_fd is None:
+        # Absent, not a directory, or a link at some component. Nothing safe to do here.
+        return removed
+    try:
+        names = os.listdir(dir_fd)
+        protected = {os.path.basename(leaf) for leaf in _MD_NOTEBOOK_STATE_LEAVES}
+        for name in names:
+            if not name.endswith(".tmp") or name in protected:
+                continue
+            # ``_publish_empty_ceiling`` stages ITS temp in the target's parent — this
+            # very directory — under this prefix, and publishes with ``os.link``. Two
+            # concurrent spawns would otherwise let one's sweep unlink the other's
+            # in-flight temp between its ``mkstemp`` and its ``link``, failing that spawn
+            # for no reason. These are gateway-owned and short-lived, never the legacy
+            # orphans this sweep is for.
+            if name.startswith(_CEILING_TEMP_PREFIX):
+                continue
+            candidate = os.path.join(state_dir, name)
+            # Both syscalls go through the pinned descriptor, so the name is resolved
+            # inside the directory this function verified — never through a component
+            # something swapped after the check.
+            try:
+                if not stat.S_ISREG(os.lstat(name, dir_fd=dir_fd).st_mode):
+                    continue
+            except OSError:
+                continue
+            try:
+                os.unlink(name, dir_fd=dir_fd)
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                raise SandboxCeilingUnsealable(
+                    f"cannot remove the legacy md-notebook staging temp {candidate}: "
+                    f"{exc}. It was staged beside the state files by a pre-upgrade "
+                    "writer, so it can hold the real PAT bytes at a name no mask covers. "
+                    "Launching anyway would leave it readable inside every agent "
+                    "namespace — delete it and retry."
+                ) from exc
+            logger.warning(
+                "SECURITY: removed a legacy md-notebook staging temp at %s. A pre-upgrade "
+                "writer staged it beside the state files, where no sandbox mask covers "
+                "it, so it may have held the GitHub token in cleartext. Treat that token "
+                "as exposed to anything that ran as this user and rotate it if in doubt.",
+                candidate,
+            )
+            removed.append(candidate)
+    finally:
+        os.close(dir_fd)
+    return removed
+
+
+def _materialize_md_notebook_mask_targets(established: list[str] | None = None) -> list[str]:
+    """Create md-notebook's absent state files and staging dir so their masks can mount.
+
+    The NESTED counterpart to :func:`_materialize_maskable_dirs`, whose plain ``mkdir``
+    is sound only for a DIRECT child of the data home. These leaves sit under
+    ``workspace/md-notebook/``, and that restriction names exactly why the difference
+    matters: the intermediate components are agent-writable, so a RESOLVING link planted
+    at one of them would land the materialised files under an attacker-chosen tree while
+    the launcher masks the lexical path. Every chain this function walks therefore goes
+    through :func:`atomic_write.refuse_linked_parent` BEFORE any
+    ``mkdir``, because ``mkdir`` itself follows a planted link.
+
+    Closes the sibling gap named at :data:`_CREW_PRECREATE_READONLY_DIR_LEAVES`: the
+    ``SENSITIVE_FILES`` mask loop guards on ``isfile``, so an ABSENT leaf gets no mask at
+    all. :data:`_MD_NOTEBOOK_PRECREATE_CONTENT` carries the per-leaf absent-equivalence
+    argument that gap note requires.
+
+    Runs on the Linux spawn path only, at the same site as
+    :func:`_materialize_sealable_ceilings`; the macOS profile needs nothing here because
+    Seatbelt denies are path rules that hold for names that do not exist yet.
+    **Fail-closed** for the same reason the ceiling materialiser is: launching anyway
+    would run the agent with a mask the launcher silently skipped. Creation happens only
+    under the LIVE data home (``config_dir()``) — a stub in the deprecated spelling would
+    be a file nothing reads — and an absent data home root is left absent, mirroring
+    ``_sealable_absent_ceilings``.
+
+    Never truncates and never removes: an existing regular file is left byte-for-byte
+    alone, and ``EEXIST`` outcomes are the benign race.
+    """
+    created: list[str] = []
+    try:
+        root = str(config_dir())
+    except Exception:  # pragma: no cover - defensive; a spawn must not fail on this
+        logger.debug("could not resolve the crew data home for md-notebook masking", exc_info=True)
+        return created
+    if not os.path.isdir(root):
+        return created
+
+    # The staging DIRECTORY is not created here: it is a direct child of the data home, so
+    # ``_materialize_maskable_dirs`` above already covers it under its own rule. The legacy
+    # sweep is not here either — it must run on the macOS path too, so both launch sites
+    # call it directly.
+    for leaf, content in _MD_NOTEBOOK_PRECREATE_CONTENT.items():
+        target = os.path.join(root, leaf)
+        # A link planted at an intermediate component means this process cannot tell which
+        # directory the write would reach, so the leaf is SKIPPED rather than materialised —
+        # and the spawn proceeds. Refusing here would let one optional app's on-disk layout
+        # take every sandboxed process on the host down with it: an operator who symlinks
+        # ``workspace/`` to another disk would find no agent could start, over a Notes file
+        # they may never have created.
+        #
+        # Skipping is safe only because it is keyed off the SAME predicate that withholds
+        # the carve-out (:func:`carveout_chain_has_planted_link`, applied in
+        # :func:`app_backend_visible_targets`). While the condition holds the backend cannot
+        # write this state at all, so a leaf left unmaterialised — and therefore unmasked —
+        # has nothing to expose. The two must never be decided separately: granting the
+        # carve-out while skipping materialisation is exactly the hole this function exists
+        # to close, which is why a test pins them together.
+        if carveout_chain_has_planted_link(target):
+            continue
+        if os.path.exists(target):
+            # Present is acceptable only as a REGULAR file, and ``lstat`` is what
+            # decides — so this is also the LINK refusal. A mount RESOLVES its target,
+            # so a resolving link here would mask the referent while the lexical name
+            # stayed an agent-replaceable link in a writable parent: swap it after
+            # launch and a later PAT write publishes to an unmasked name inside the
+            # live namespace. (``atomic_write`` deliberately ALLOWS a leaf link,
+            # because ``os.replace`` does not follow the final component; a mount
+            # target has the opposite requirement.) A FIFO, socket, or device node is
+            # refused for a different reason: the launcher's hiding loops classify with
+            # ``isdir``/``isfile`` and a special file matches NEITHER, so its mask
+            # would be silently skipped for the whole sandbox.
+            if not stat.S_ISREG(os.lstat(target).st_mode):
+                raise SandboxCeilingUnsealable(
+                    f"the md-notebook state mask target {target} exists but is not a "
+                    "regular file (a link, or a special file). The mask would bind "
+                    "over a referent, or be skipped by the launcher's isdir/isfile "
+                    "loops. Remove or replace it with a regular file."
+                )
+            _note_established(established, target)
+            continue
+        parent = os.path.dirname(target)
+        try:
+            os.makedirs(parent, exist_ok=True)
+        except OSError as exc:
+            raise SandboxCeilingUnsealable(
+                f"cannot create {parent} to give the md-notebook state mask a mount "
+                f"target: {exc}. Launching anyway would leave {target} maskless in every "
+                "agent namespace once the Notes backend creates it."
+            ) from exc
+        if _publish_empty_ceiling(target, parent, content=content):
+            created.append(target)
+            _note_established(established, target)
+        else:
+            # A lost publish race is benign ONLY when the winner clears the SAME bar an
+            # existing target had to: a regular file. ``lstat`` judges it, so this also
+            # catches a DANGLING leaf link — ``exists()`` is False for one, so it reaches
+            # the publish, where ``os.link`` fails EEXIST on the link's own name. And it
+            # catches an agent racing ``mkfifo``/``symlink`` between the validation and
+            # the publish, which accepting bare existence here would have let through.
+            try:
+                winner = os.lstat(target)
+            except OSError as exc:
+                raise SandboxCeilingUnsealable(
+                    f"cannot re-check the md-notebook state mask target {target} after a "
+                    f"publish race: {exc}"
+                ) from exc
+            if not stat.S_ISREG(winner.st_mode):
+                raise SandboxCeilingUnsealable(
+                    f"the md-notebook state mask target {target} is not a regular file "
+                    "after the publish (a link, or a special file that won the race), so "
+                    "the mask would bind over a referent or be skipped by the launcher's "
+                    "isdir/isfile loops. Remove or replace it with a regular file."
+                )
+            # Validated and accepted, so established on the same footing as one this
+            # pass published itself.
+            _note_established(established, target)
     return created
 
 
@@ -659,7 +4555,7 @@ _STRICT_DIRS: list[str] = [
     ".azure",
     ".docker",
     ".kube",
-    # Encrypted secret vault (PR 1 of #2351). The ``.vault`` dir is also a
+    # Encrypted secret vault. The ``.vault`` dir is also a
     # keystone leaf in ``security._CREW_SECRET_LEAVES`` (which blocks the
     # agent's in-process tool-call file access), but a spawned ``python -c``
     # subprocess does an OS ``open()`` that never routes through that gate — so
@@ -744,6 +4640,85 @@ _CC_DIRS += _CREW_HIDDEN_DIRS
 _CC_DIRS += [".midway"]
 
 
+def _resolves_to(alias: str, canonical: str) -> bool:
+    """Whether *alias* is another NAME for *canonical*: its components resolve to it.
+
+    Resolution, not identity. A ``(st_dev, st_ino)`` match would also hold for a
+    bind mount of the data home at the alias, and a bind mount is a second MOUNT,
+    not a second name: a mask placed on the canonical path's entry does not appear
+    under the bind, so folding the alias onto the canonical would leave every leaf
+    under the alias unmasked. Only a path whose link components lead to the
+    canonical directory shares that directory's entries, and only such a path is
+    folded. ``realpath`` is strict, so an alias that cannot be resolved is a
+    different name and the caller keeps its entry.
+    """
+    if alias == canonical:
+        return True
+    try:
+        return os.path.realpath(alias, strict=True) == os.path.realpath(canonical, strict=True)
+    except OSError:
+        return False
+
+
+def _crew_home_alias_roots() -> tuple[tuple[str, str, int, int], ...]:
+    """``(alias, canonical, st_dev, st_ino)``: each ``$HOME``-joined crew root that IS the data home.
+
+    The tier lists spell every crew leaf under ``$HOME/<prefix>`` and the pre-spawn
+    passes spell it under ``config_dir()``, whose components may themselves be links
+    (a resolved ``KIROCREW_HOME``, or the default ``~/.kiro/crew`` linked to
+    ``~/.kirocrew``). On a host whose home is a link (``/home/u -> /mnt/home/u``)
+    those are two names for one directory, and
+    the launcher keeps every record per name -- the occupant a pass saw, the stand-in
+    a loop placed -- and compares them against the filesystem by identity, so two
+    names make the records disagree with what either name reaches. One path
+    resolution per crew root decides it here, in the pass that already stats these
+    roots, and the builder folds the alias spelling onto the canonical one so the
+    launcher is handed one name per directory. The test is resolution, not
+    identity: a bind mount of the data home at ``$HOME/<prefix>`` shares its
+    ``(st_dev, st_ino)`` but is a second mount, on which a mask placed at the
+    canonical path does not appear, so it keeps its own entry. A root
+    string-equal to the data home is no alias; an absent or unreadable root is
+    left as it is, since the launcher already handles an absent name.
+
+    The identity the decision rested on travels with the pair. The fold is a
+    check made here and acted on in the child, and the component that makes the
+    two spellings one directory -- the home link -- is a name a writer could
+    re-aim in between; the launcher re-reads each alias before it places a mask
+    and refuses unless it still reaches the recorded directory, so the folded
+    rules never stand for an alias that has moved.
+
+    Never raises: a home that cannot be resolved yields no pair.
+    """
+    try:
+        canonical = str(config_dir())
+        home = Path.home()
+    except Exception:  # pragma: no cover - defensive; a spawn must not fail on this
+        logger.debug("could not resolve the crew data home for the alias fold", exc_info=True)
+        return ()
+    pairs: list[tuple[str, str, int, int]] = []
+    for prefix in _CREW_HOME_PREFIXES:
+        alias = str(home / Path(prefix))
+        if alias == canonical:
+            continue
+        try:
+            info = os.stat(canonical)
+        except OSError:
+            continue
+        if _resolves_to(alias, canonical):
+            pairs.append((alias, canonical, info.st_dev, info.st_ino))
+    return tuple(pairs)
+
+
+def _fold_crew_home_alias(path: str, aliases: tuple[tuple[str, str, int, int], ...]) -> str:
+    """*path* respelled under the canonical root when it sits under an alias root."""
+    for alias, canonical, _dev, _ino in aliases:
+        if path == alias:
+            return canonical
+        if path.startswith(alias.rstrip("/") + "/"):
+            return canonical.rstrip("/") + path[len(alias.rstrip("/")) :]
+    return path
+
+
 def _relocated_crew_targets(leaves: tuple[str, ...]) -> list[str]:
     """The RESOLVED crew-home paths for *leaves*, when the data home is not under ``$HOME``.
 
@@ -754,13 +4729,15 @@ def _relocated_crew_targets(leaves: tuple[str, ...]) -> list[str]:
     need it for the same reason, so the resolution is shared here instead of restated.
 
     Returns only the paths that DIFFER from the ``$HOME``-relative spelling the lists
-    already carry, so the default layout gains no duplicate rule.
+    already carry, so the default layout gains no duplicate rule. Under a symlinked
+    home the resolved spelling differs as a STRING from the ``$HOME`` one while
+    naming the same directory; ``_build_launcher_script`` folds the ``$HOME``
+    spellings onto the resolved one (see ``_crew_home_alias_roots``) so the launcher
+    is handed one name per directory.
 
-    ``normpath``, never ``realpath`` — this runs inside ``_build_launcher_script`` and the
-    seatbelt builder, which execute on the event loop for every async spawn, and a
-    link-resolving syscall on a stalled NFS home would freeze the gateway with its
-    liveness heartbeat. A symlinked home therefore reports as relocated and yields a
-    redundant rule for a path that is covered either way, never a missing one.
+    ``normpath``, never ``realpath``: lexical on purpose, so this helper itself does
+    no filesystem call; the one identity decision per crew root is made in the
+    pre-spawn pass that already stats those roots.
 
     Never raises: a data home that cannot be resolved yields nothing and the
     ``$HOME``-relative entries still apply.
@@ -780,6 +4757,156 @@ def _relocated_crew_targets(leaves: tuple[str, ...]) -> list[str]:
             continue
         if resolved != default:
             out.append(resolved)
+    return out
+
+
+#: Tier leaves NOT re-anchored under a pod child's remapped home, because they ARE
+#: the pod's own MCP OAuth grant store: the child WRITES its grants under this tree
+#: and ``mcp_grant`` stats them there, so bind-masking it empty would discard every
+#: grant the pod mints. Nothing host-derived lives here -- the seeder creates
+#: ``.aws/sso/cache`` and copies nothing into it (see
+#: ``pod.runtime._seed_pod_os_home``), and sign-in comes from the runtime's own data
+#: store, so the carve-out exposes only pod-minted material. That is what answers
+#: the security review that blocked the earlier shape, in which the corridor also
+#: exposed COPIED HOST bearer tokens.
+_POD_OS_HOME_GRANT_STORE_LEAVES: frozenset[str] = frozenset({".aws"})
+
+#: Re-anchored IN ADDITION to the selected tier, so carving out the grant store
+#: above does not also expose the file-credential leg. These are the profile files
+#: whose ``AWS_CONFIG_FILE`` / ``AWS_SHARED_CREDENTIALS_FILE`` pass-through
+#: ``acp.client._apply_pod_home_remap`` deliberately deleted; a remapped ``HOME``
+#: makes both resolve inside the pod home, so they are masked by name there. Kept
+#: rather than folded into a narrower ``.aws/sso/cache``-only carve-out because the
+#: launcher's bind-mask has no directory-level exemption: a mask on ``.aws`` covers
+#: everything beneath it, and the only re-expose primitive is per-FILE, while grant
+#: filenames are sha256 keys that do not exist until the child mints them.
+_POD_OS_HOME_MASKED_SUBLEAVES: tuple[str, ...] = (
+    ".aws/config",
+    ".aws/credentials",
+    ".aws/cli",
+)
+
+
+def _pod_os_home_targets(dirs: tuple[str, ...]) -> list[str]:
+    """The sensitive-dir list re-anchored under a pod child's REMAPPED home.
+
+    Sibling of :func:`_relocated_crew_targets`, for the other root that moves.
+    ``acp.client._apply_pod_home_remap`` gives a pod's kiro-cli child a pod-owned
+    ``HOME`` (``KIROCREW_OS_HOME``) so its OAuth grants die with the pod, and
+    ``pod.runtime._seed_pod_os_home`` mirrors the runtime's identity store into it
+    (no host SSO cache contents are copied). Those are credentials, and every entry
+    in the tier lists is ``$HOME``-relative joined
+    against ``Path.home()`` -- the GATEWAY's home -- so none of them named the
+    remapped tree and the seeded token sat in an UNMASKED location that the child's
+    own ``$HOME`` resolves to.
+
+    **Why this lives here rather than in the two ACP transports.** Both of them
+    build their sandbox BEFORE applying the remap, so feeding the paths in through
+    ``extra_hidden_dirs`` would need the call order changed in two places and the
+    path set restated in both -- two independent copies of one rule, which is the
+    duplication rounds 8 and 9 removed from the pinned-write path. Computing it
+    inside the mask builder instead makes the mask correct for EVERY caller
+    regardless of when the remap runs, and re-anchors whichever tier list the
+    caller's mode selected rather than a hand-copied subset of it.
+
+    Gated on ``KIROCREW_POD == "1"`` exactly as ``config.paths`` gates the
+    resolver, so a non-pod session's mask is byte-identical to before. Returns only
+    paths that DIFFER from the ``$HOME``-relative spelling, so the default layout
+    gains no duplicate rule.
+
+    ``normpath``, never ``realpath``, for the reason :func:`_relocated_crew_targets`
+    records: this runs on the event loop for every async spawn. Never raises -- an
+    unresolvable value yields nothing and the ``$HOME``-relative entries still apply.
+
+    **One leaf is deliberately NOT re-anchored: the pod's own grant store.**
+    ``<os-home>/.aws`` is where the pod's kiro-cli child writes its OWN MCP OAuth
+    grants, which ``mcp_grant`` then stats through
+    ``config.paths.kiro_oauth_cache_home``. No host SSO cache contents are staged
+    into it -- ``_seed_pod_os_home`` creates ``.aws/sso/cache`` EMPTY, and the
+    earlier revision that copied the operator's tokens there was deleted -- so what
+    the tree holds is grants that pod itself minted. Bind-masking it empty still
+    breaks the feature: the child's grant writes land in the overlay instead of the
+    pod tree, so ``grant_presence`` answers "no grant" forever. A read-only per-file
+    re-expose (the ``expose_files`` primitive) cannot substitute, because the child
+    needs WRITE access and the grant filenames are sha256 keys that do not exist
+    until the child mints them -- there is nothing to enumerate at launcher-build
+    time.
+
+    What that costs, stated rather than implied: an agent tool call inside the pod
+    can read the grants that pod minted. That is accepted here because it is
+    strictly narrower than both baselines it replaces -- a pod child resolving the
+    REAL ``~/.aws/sso/cache``, and a non-pod kiro-cli child is
+    exposed the real credential homes by the standard tier for exactly this sign-in
+    reason. The tree is created by the pod and reclaimed by ``pod down``.
+
+    **A SECOND tree carries the same residual, and it is host-derived rather than
+    pod-minted: the staged identity store.** ``_seed_pod_os_home`` snapshots the
+    runtime identity store (``.local/share/{kiro-cli,amazon-q}`` and the platform
+    siblings, from ``identity_stores.store_mappings``) into the pod home, because
+    that is where the harness resolves its access token and a pod with no copy boots
+    signed-out. Those rows are absent from every masking tier ON PURPOSE --
+    ``test_the_agent_runtime_auth_stores_stay_visible`` pins them out, because the
+    harness is itself spawned inside this sandbox -- so this function emits nothing
+    for them and an agent shell descendant can read the staged bearer token.
+
+    That is NOT closed here, and the reason is structural rather than an oversight:
+    a bind-mask acts on a MOUNT NAMESPACE, and the harness and the tool subprocesses
+    it spawns share one. Hiding the store from the agent's shell hides it from
+    kiro-cli in the same act, which is the auth break the tier exclusion exists to
+    avoid. Crew owns no seam between the two audiences -- it wraps the harness, and
+    the harness spawns its own tools inside that wrapper. The layer that DOES
+    separate them is the tool gate: ``security.is_sensitive_path`` refuses every
+    staged store path (``identity_stores.fenced_home_dirs`` is spliced into
+    ``_SENSITIVE_HOME_DIRS`` and re-anchored under ``KIROCREW_OS_HOME``), so a
+    tool call naming the path is denied and only a raw ``open()`` inside a spawned
+    shell reaches it.
+
+    **The command matcher is not a second opinion on this, for ANY path.**
+    ``is_sensitive_bash_command`` carries a size ceiling, an IMDS check and an
+    environment-credential exfiltration check, and no path matcher at all.
+    Measured, it answers ALLOW for every path spelling -- ``~/.aws/credentials``
+    and ``~/.ssh/id_rsa`` included -- so the pod tree is not a special case
+    there. What bounds a shell is this mask and nothing else, which is
+    exactly why the carve-outs above are the interesting part of this function.
+
+    Pinned in both directions by
+    ``test_pod_runtime_auth_store.py::TestTheStagedStoresResidualIsPinned``; closing
+    the staged store's shell leg needs a pod-scoped sign-in that never places a host
+    bearer in the pod tree, which is a design change rather than a mask entry.
+
+    The file-credential leg stays closed: ``.aws/config`` and ``.aws/credentials``
+    are re-anchored EXPLICITLY, so the profile files whose pass-through
+    ``acp.client._apply_pod_home_remap`` deleted cannot resolve inside the pod home
+    either. Every other leaf in the tier is re-anchored unchanged.
+    """
+    if os.environ.get("KIROCREW_POD") != "1":
+        return []
+    os_home = os.environ.get("KIROCREW_OS_HOME")
+    if not os_home:
+        return []
+    try:
+        home_root = str(Path.home())
+    except Exception:  # pragma: no cover - defensive; a spawn must not fail on this
+        logger.debug("could not resolve the home root for pod os-home masking", exc_info=True)
+        return []
+    out: list[str] = []
+    # Only tiers that actually mask the grant-store leaf get the carve-out, and
+    # therefore the compensating sub-leaves. ``_STANDARD_DIRS`` deliberately omits
+    # ``.aws`` (standard leaves it visible so ``credential_process`` can reach
+    # Bedrock auth), so for that tier this function's output is unchanged --
+    # re-anchoring only ever mirrors what the selected tier already masks.
+    carved = _POD_OS_HOME_GRANT_STORE_LEAVES.intersection(dirs)
+    leaves = (*dirs, *(_POD_OS_HOME_MASKED_SUBLEAVES if carved else ()))
+    for leaf in leaves:
+        if leaf in carved:
+            continue
+        try:
+            relocated = os.path.normpath(os.path.join(os_home, leaf))
+            default = os.path.normpath(os.path.join(home_root, leaf))
+        except Exception:  # pragma: no cover - defensive
+            continue
+        if relocated != default:
+            out.append(relocated)
     return out
 
 
@@ -804,7 +4931,7 @@ def _relocated_policy_cache_dirs() -> list[str]:
     freezes the gateway and its liveness heartbeat. ``normpath`` is pure string work.
 
     The cost is precise and one-directional: where the home is a symlink (``/home/u`` →
-    ``/local/home/u`` is ordinary on managed hosts) the two spellings no longer compare
+    ``/local/home/u`` is ordinary on managed hosts) the two spellings do not compare
     equal, so a DEFAULT layout is reported as relocated and the resolved path is masked in
     addition to the ``$HOME``-relative one. That is a redundant rule for a directory that
     should be masked either way, never a missing one — the comparison was only ever
@@ -922,6 +5049,289 @@ def _voice_runtime_ancestor_guards() -> tuple[str, ...]:
     return _voice_runtime_paths_cache[4]
 
 
+def _path_identity(path: str) -> tuple[int, int] | None:
+    """``(st_dev, st_ino)`` for *path*, or ``None`` when it cannot be stat'd.
+
+    THE seam every identity comparison below goes through, so a path that
+    cannot be inspected (not created yet, an ancestor this process may not
+    traverse, a race that unlinks mid-walk) degrades to the spelling answer
+    instead of raising into the caller's spawn path.
+
+    ``os.lstat`` keeps the identity walk on the component named by the
+    spelling being checked. The canonical spelling was already resolved with
+    ``realpath(strict=True)``, so following each component again would add no
+    information and would make the lexical alias walk perform a second path
+    resolution.
+    """
+
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return None
+    return (info.st_dev, info.st_ino)
+
+
+def _identity_within_sealed_parent(path: str, parent: str) -> bool:
+    """Whether *path* is *parent* or lies inside it BY FILESYSTEM IDENTITY.
+
+    Spelling alone misses an alias the filesystem itself treats as the same
+    directory. On case-insensitive APFS ``<data home>/RUN`` and
+    ``<data home>/run`` are ONE directory, and ``realpath`` does not fold the
+    difference (it walks with ``lstat``/``readlink``, neither of which
+    canonicalizes case) -- so a differently-cased declaration walks straight
+    past the lexical predicate, which would let the probe honor it and hand the
+    child a TMPDIR the seal has already made read-only. Identity is the
+    filesystem's own answer, which covers firmlink and normalization aliases for
+    free.
+
+    A declared temp usually does NOT exist yet, so the walk simply climbs until
+    a component stats: the deepest EXISTING ancestor is what carries identity,
+    and if that ancestor is the sealed parent or lives under it then so does
+    every not-yet-created component below it -- *path* arrives resolved and
+    normalized, so no remainder can climb back out. Only the sealed parent's
+    identity is compared, never a case-folded spelling, so a case-SENSITIVE
+    filesystem keeps answering exactly as it did: there ``<data home>/RUN`` is a
+    different directory, it does not exist, and nothing seals it.
+
+    An unstat-able parent yields ``False`` rather than a folded-spelling guess.
+    :func:`_voice_runtime_parent_paths` primes and CREATES the sealed parent, so
+    that needs an out-of-band deletion race to reach -- and in that state
+    case-folding would mis-refuse a genuinely distinct ``RUN`` directory on a
+    case-sensitive filesystem, which is the worse answer: the OS seal is the
+    actual boundary, and this predicate only turns its EROFS into a clean
+    refusal.
+    """
+    parent_identity = _path_identity(parent)
+    if parent_identity is None:
+        return False
+    current = path
+    while True:
+        if _path_identity(current) == parent_identity:
+            return True
+        next_up = os.path.dirname(current)
+        if next_up == current:
+            return False
+        current = next_up
+
+
+#: Temp keys a child's ``tempfile``/``mktemp`` consults, in
+#: POSIX-then-Windows order. Spec keys are matched case-insensitively.
+CANONICAL_TEMP_KEYS = ("TMPDIR", "TMP", "TEMP")
+
+
+#: Operator-facing reason per refusal cause. ``check-failed`` belongs to the
+#: shared env wrapper below; the path classifier itself returns only the first
+#: two causes.
+DECLARED_TEMP_REFUSAL_REASONS = {
+    "sealed": ("it is inside the sandbox-sealed runtime parent, where the server " "cannot write"),
+    "unclassifiable": (
+        "it is relative and the daemon and child use different working directories, or its "
+        "canonical form cannot be established (a symlink cycle or a component that cannot "
+        "be traversed), so containment cannot be verified"
+    ),
+    "check-failed": "the seal check itself failed, so containment cannot be verified",
+}
+
+
+#: Why a spec-declared temp path is refused. ``sealed`` is a path inside
+#: ``<data home>/run``; ``unclassifiable`` is a path whose canonical form cannot
+#: be established (a symlink cycle, a component that cannot be traversed), so
+#: containment cannot be verified.
+DeclaredTempRefusal = Literal["sealed", "unclassifiable"]
+
+
+def classify_declared_temp_path(path: str) -> "DeclaredTempRefusal | None":
+    """Why a spec-declared temp *path* is refused, or ``None`` when it may be honored.
+
+    The cause matters to the caller because only ``"sealed"`` describes a
+    path inside ``<data home>/run``: an ``"unclassifiable"`` refusal is about a
+    path whose canonical form could not be established, and a diagnostic that
+    called it sealed would send an operator looking in the wrong place. Every
+    cause gets the same response -- stop honoring the path.
+
+    The question a caller must ask BEFORE it hands a sandboxed child a directory
+    that came from config text. ``<data home>/run`` is sealed read-only
+    on both backends, so a spec-declared ``TMPDIR`` under it silently gives the
+    child a temp dir it cannot write -- and the write carve-out is not the answer:
+    ``extra_writable_dirs`` is validated for SELF-DERIVED scratch paths only, so
+    pointing it at spec text would hand untrusted config a write window under
+    ``run``. A caller that gets a refusal cause must therefore stop honoring the
+    path, not try to open it.
+
+    Relative declarations are ``"unclassifiable"`` because the daemon and the
+    spawned child do not share a required working directory. The classifier
+    would resolve one against the daemon's cwd while ``spawn_backend`` runs the
+    child under ``work_dir``. Refusing the spelling is the only way to keep one
+    decision valid at every spawn boundary.
+
+    Windows: nothing else to refuse, so ``None`` for every absolute path. Kiro Crew has no
+    native Windows sandbox backend (see the delegation note in
+    :func:`wrap_argv`): a probe child there is either not spawned at all or runs
+    unsandboxed with a writable ``run``, so a declared temp under it is
+    writable and is honored exactly as it was before this check existed. Gating
+    here rather than resolving is also what keeps the check local -- on Windows
+    ``realpath`` and ``stat`` OPEN the path, so classifying untrusted config
+    text there would mean opening whatever it names.
+
+    Both spellings are tested because the data home may be a supported symlink
+    and path-based rules see each spelling independently. Spelling is only the
+    fast answer: :func:`_identity_within_sealed_parent` then asks the filesystem
+    itself, so a case, firmlink, or normalization alias of the seal cannot walk
+    past this predicate.
+
+    Blocking (``realpath``, the identity walk, plus the one-time priming of the
+    runtime directories), so an async caller must reach it off the event loop.
+    """
+    if not path:
+        return None
+    if not os.path.isabs(path):
+        return "unclassifiable"
+    if sys.platform == "win32":
+        return None
+    # realpath resolves the ORIGINAL spelling, BEFORE any lexical pass. Order is
+    # load-bearing: normalizing first collapses ``..`` lexically and so deletes
+    # the very symlink that ``..`` was climbing out of, which would make a
+    # ``<symlink-into-run>/../tmp`` declaration read as outside the seal while
+    # the child's libc resolves symlink-first and lands back inside it. Both
+    # spellings are still checked, since path-based sandbox rules
+    # see the lexical one independently.
+    #
+    # Strict first, so the kernel's own loop detection answers for a symlink
+    # cycle: the lenient form returns a cycle's link with the remainder appended
+    # and never raises, and comparing that half-resolved spelling would honor a
+    # declaration whose real location is unknown. A declared temp usually does
+    # not exist yet, so a missing component is the ordinary case and falls back
+    # to resolving as far as the path goes; every other failure (ELOOP, ENOTDIR,
+    # EACCES) leaves the canonical form unestablished, which is refused like any
+    # other unverifiable declaration.
+    try:
+        canonical = os.path.realpath(path, strict=True)
+    except FileNotFoundError:
+        canonical = os.path.realpath(path)
+    except OSError:
+        return "unclassifiable"
+    lexical = os.path.normpath(os.path.abspath(path))
+    spellings = tuple(dict.fromkeys((lexical, canonical)))
+    parents = _voice_runtime_parent_paths()
+    for spelling in spellings:
+        for parent in parents:
+            if _path_within(spelling, parent) or _identity_within_sealed_parent(spelling, parent):
+                return "sealed"
+    return None
+
+
+def classify_declared_temp_env(
+    env: "Mapping[str, object]",
+    declared_temp_keys: "Sequence[str] | None" = None,
+    *,
+    classifier: "Callable[[str], DeclaredTempRefusal | None] | None" = None,
+) -> tuple[tuple[str, ...], dict[str, tuple[str, str]], str]:
+    """Classify the temp declaration in *env* once for every MCP spawn path.
+
+    The first item is the accepted canonical key set in lookup order. The
+    second maps each refused key to ``(declared path, cause)``. The third names
+    a classifier failure for the WARNING. One refused key drops the whole temp
+    declaration because ``tempfile`` may consult a sibling first.
+
+    When *declared_temp_keys* is ``None``, every temp key in *env* is declared.
+    A caller whose environment mixes operator and ambient values passes the
+    operator-owned key names explicitly. Path inspection blocks, so async
+    callers run this function through :func:`asyncio.to_thread`.
+    """
+    if declared_temp_keys is None:
+        declared_upper = {
+            key.upper()
+            for key in env
+            if isinstance(key, str) and key.upper() in CANONICAL_TEMP_KEYS
+        }
+    else:
+        declared_upper = {
+            key.upper()
+            for key in declared_temp_keys
+            if isinstance(key, str) and key.upper() in CANONICAL_TEMP_KEYS
+        }
+    accepted = tuple(key for key in CANONICAL_TEMP_KEYS if key in declared_upper)
+    declared_values = {
+        key.upper(): value
+        for key, value in env.items()
+        if isinstance(key, str) and key.upper() in declared_upper and isinstance(value, str)
+    }
+    if not declared_values:
+        return accepted, {}, ""
+
+    check = classifier or classify_declared_temp_path
+    try:
+        refused: dict[str, tuple[str, str]] = {
+            key: (path, cause)
+            for key, path in declared_values.items()
+            if (cause := check(path)) is not None
+        }
+    except Exception as exc:
+        failure = f"{type(exc).__name__}: {exc}"
+        return (
+            (),
+            {key: (path, "check-failed") for key, path in declared_values.items()},
+            failure,
+        )
+    if refused:
+        return (), refused, ""
+    return accepted, {}, ""
+
+
+def _repr_declared_temp_log_value(
+    value: str,
+    redactor: "Callable[[str], str] | None",
+) -> str:
+    """Return one redacted, control-character-safe log field."""
+    display = value
+    if redactor is not None:
+        try:
+            display = redactor(value)
+        except Exception:
+            display = "<redaction failed>"
+    return repr(display)
+
+
+def declared_temp_refusal_reasons(
+    refused: "Mapping[str, tuple[str, str]]",
+    failure: str = "",
+    *,
+    redactor: "Callable[[str], str] | None" = None,
+) -> list[str]:
+    """Render one operator-facing reason per distinct refusal cause."""
+    reasons: list[str] = []
+    for _key, (_path, cause) in sorted(refused.items()):
+        reason = DECLARED_TEMP_REFUSAL_REASONS[cause]
+        if cause == "check-failed" and failure:
+            reason = f"{reason} ({_repr_declared_temp_log_value(failure, redactor)})"
+        if reason not in reasons:
+            reasons.append(reason)
+    return reasons
+
+
+def format_declared_temp_refusals(
+    refused: "Mapping[str, tuple[str, str]]",
+    *,
+    hidden_keys: "Sequence[str]" = (),
+    redactor: "Callable[[str], str] | None" = None,
+) -> str:
+    """Render refused key/path fields as one credential-safe log line.
+
+    ``repr`` keeps control characters inside the field instead of letting a
+    declared path forge another log record. Keys in *hidden_keys* came from a
+    resolved ``secret://`` value, so their path is never rendered at all.
+    """
+    hidden_upper = {key.upper() for key in hidden_keys}
+    fields: list[str] = []
+    for key, (path, _cause) in sorted(refused.items()):
+        if key.upper() in hidden_upper:
+            display = repr("<resolved secret>")
+        else:
+            display = _repr_declared_temp_log_value(path, redactor)
+        fields.append(f"{key}={display}")
+    return ", ".join(fields)
+
+
 _VOICE_GUARD_REMEDY = "Pick a project subdirectory that does not contain the Kiro Crew data home."
 
 _VoiceGuardRelationship = Literal["contains", "inside", "alias", "cannot-verify"]
@@ -980,8 +5390,7 @@ def _lexical_runtime_overlap(
     THE shared containment scan: :func:`voice_runtime_workspace_conflict` (the
     non-raising pre-flight) and :func:`assert_voice_runtime_outside_agent_workspace`
     (the fail-closed spawn guard) both call this, so the pre-flight cannot
-    silently drift from the guard it mirrors (Design/FP review round 2 — the
-    two previously carried independent copies of this loop).
+    silently drift from the guard it mirrors.
 
     Returns ``(workspace_path_to_name, runtime_path, relationship)`` for the
     first hit, or ``None``. Naming convention is the guard's: refusals always
@@ -1024,7 +5433,7 @@ def voice_runtime_workspace_conflict(workspace: str | os.PathLike[str]) -> str |
     today — refusing it here would remove a working configuration to prevent
     a macOS-only harm (and with macOS-worded copy).
 
-    Messages come from :func:`_voice_runtime_guard_message` (#7407) and the
+    Messages come from :func:`_voice_runtime_guard_message` and the
     containment scan is shared with the spawn-time guard
     (:func:`_lexical_runtime_overlap`), so the pre-flight warning and the
     spawn-time refusal read identically and cannot drift apart.
@@ -1453,6 +5862,13 @@ def _hidden_path_contains_visible_path(
 # Sensitive env var prefixes to scrub from the child environment.
 # Scrubbed in ALL modes (standard + strict) — credential_process reads
 # from ~/.aws/config, not env vars, so scrubbing is always safe.
+#
+# NOTE (applies to this list AND ``_AGENT_DENIED_ENV_KEYS`` below): inherited
+# ``ANTHROPIC_*`` / ``CLAUDE_CODE_*`` variables must keep flowing to
+# claude-harness children — the gateway's env-passthrough contract in
+# docs/system-specs/modules/claude-code-provider.md (its env-passthrough
+# section). Adding either namespace here silently breaks the custom-endpoint
+# auth documented in docs/guides/custom-llm-backend.md.
 _SENSITIVE_ENV_PREFIXES: list[str] = [
     "AWS_SECRET",
     "AWS_SESSION",
@@ -1507,6 +5923,12 @@ _PYTHON_ENV_PREFIXES: list[str] = [
 # has the same parent-side scrub as the POSIX sandbox launchers. Loader coverage
 # is pinned by regression test.
 _AGENT_DENIED_ENV_KEYS: list[str] = [
+    # The ACP frame recorder's switch. A child agent that inherited it (a
+    # nested Kiro Crew, or any tool that honours the variable) would record
+    # its own frames into the SAME per-backend file, interleaving another
+    # process's transcript with this gateway's. The recorder is a gateway-side
+    # development aid; the children it observes must not see the switch.
+    "KIROCREW_ACP_RECORD_FRAMES",
     "SLACK_BOT_TOKEN",
     "SLACK_APP_TOKEN",
     "SLACK_USER_TOKEN",
@@ -1523,6 +5945,9 @@ _AGENT_DENIED_ENV_KEYS: list[str] = [
     "FEISHU_APP_SECRET",
     "JIRA_API_TOKEN",
     "JIRA_TOKEN_",
+    "AZURE_DEVOPS_EXT_PAT",
+    "BITBUCKET_EMAIL",
+    "BITBUCKET_API_TOKEN",
     "KIROCREW_OWNER_ID",
     # The central-governance fetch configuration — see
     # ``platform/policy_distribution.py``. The URL is listed as well as the header,
@@ -1572,6 +5997,11 @@ def _sandbox_policy():
 # unshare(2) flags for the userns probe.
 _CLONE_NEWUSER = 0x10000000
 _CLONE_NEWNS = 0x00020000
+# mount(2) flags for the probe's propagation step: the launcher's first mount is
+# ``mount(NULL, "/", NULL, MS_REC|MS_PRIVATE, NULL)`` inside the fresh mount
+# namespace, so the probe performs exactly that call and nothing else.
+_PROBE_MS_REC = 0x4000
+_PROBE_MS_PRIVATE = 1 << 18
 
 # Errnos that indicate a TRANSIENT resource failure (fork/CDLL under momentary
 # pressure) — the kernel supports user namespaces, we just couldn't verify it
@@ -1600,8 +6030,19 @@ _WARM_JOIN_TIMEOUT_SECS = 2.0
 # momentary fd/disk pressure looks like, so the cap verdict stays TRANSIENT and
 # is never cached; the remedy travels with it so a host at a cap of 0 — which is
 # reported transient forever — still gets told which sysctl to raise.
+#
+# The third step is the launcher's FIRST mount: making propagation on ``/``
+# private inside the new mount namespace. Both unshare calls can succeed while
+# that mount is refused — a container whose runtime applies its default AppArmor
+# profile (``deny mount``) but no seccomp filter, the Kubernetes default on an
+# AppArmor node — and a probe that stopped at the unshares reported such a host
+# sandbox-capable, so every real spawn then died in the launcher with
+# ``sandbox: BLOCKED -- making mount propagation private on / failed: errno 13``
+# and was misread as a broken CLI. The probe therefore performs exactly that
+# mount, in a namespace that dies with the probe child, and nothing more.
 _PROBE_STEP_NEWUSER = "unshare(CLONE_NEWUSER)"
 _PROBE_STEP_NEWNS = "unshare(CLONE_NEWNS)"
+_PROBE_STEP_MOUNT_PRIVATE = "mount(MS_REC|MS_PRIVATE) on /"
 #: Wire step the probe child sends INSTEAD of "U" when its ``CLONE_NEWUSER`` EINVAL
 #: is explained by the child having been multithreaded, carrying the thread count.
 #: The parent classifies it exactly as it classifies a plain EINVAL -- the step
@@ -1644,6 +6085,10 @@ _PROBE_CHILD_GONE_ERRNOS = frozenset({errno.ESRCH, errno.ENOENT, errno.EPIPE})
 # background warm thread forever.
 _PROBE_HANDSHAKE_TIMEOUT_SECS = 5.0
 
+# Upper bound on the macOS sandbox-backend probe (`sandbox-exec` running
+# /usr/bin/true under an allow-default profile) that backend detection runs.
+_SANDBOX_BACKEND_PROBE_TIMEOUT_SECS: float = 5.0
+
 # Detail of the most recent failed userns probe: (transient, reason, remedy).
 # ``None`` means the last probe succeeded (or none has run yet). Consumed by
 # detect_backend() for cache policy and by wrap_argv() for error reporting.
@@ -1657,8 +6102,8 @@ _last_unshare_failure: tuple[bool, str, str] | None = None
 # ── Remedy tokens for a Linux user-namespace denial ──
 # The probe already knows WHICH step failed and with which errno, and those two
 # facts identify the host mechanism (see the table in docs/guides/install.md).
-# That knowledge used to die inside the reason string, leaving every presentation
-# layer to show a bare ``errno 1 (EPERM)`` and no way forward — issue #1660.
+# A reason string alone would leave every presentation layer showing a bare
+# ``errno 1 (EPERM)`` and no way forward.
 # These tokens carry the mechanism out to callers machine-readably, so the
 # dashboard, doctor and logs can each render their own remedy copy instead of
 # pattern-matching English prose out of the detail.
@@ -1671,12 +6116,13 @@ REMEDY_APPARMOR_USERNS = "apparmor_userns"  # Ubuntu >= 23.10 restricted profile
 REMEDY_MAX_USER_NAMESPACES = "max_user_namespaces"  # user.max_user_namespaces=0
 REMEDY_NO_USER_NS = "no_user_ns"  # kernel built without CONFIG_USER_NS
 REMEDY_USERNS_DENIED = "userns_denied"  # userns creation refused outright
+REMEDY_MOUNT_DENIED = "mount_denied"  # namespaces work; mount(2) refused inside them
 
 
 def _remedy_for_step(label: str, err: int) -> str:
-    """Name the host mechanism behind one failed unshare step.
+    """Name the host mechanism behind one failed probe step.
 
-    ``label`` is one of the two ``_PROBE_STEP_*`` constants for a real kernel
+    ``label`` is one of the ``_PROBE_STEP_*`` constants for a real kernel
     verdict; any other label is a harness failure (fork/pipe under pressure)
     which says nothing about the host and therefore has no remedy.
 
@@ -1684,7 +6130,17 @@ def _remedy_for_step(label: str, err: int) -> str:
     signature of Ubuntu's restricted-profile restriction rather than of userns
     being unavailable — the distinction that decides whether the fix is an
     AppArmor profile or a sysctl.
+
+    A refused propagation mount is only reachable after BOTH unshares succeeded:
+    the process holds every capability inside its new user namespace, so the
+    kernel itself never refuses this call — a policy layer did. EACCES is
+    AppArmor's answer (the container runtimes' default profile carries ``deny
+    mount``); EPERM is a seccomp filter's. Both are permanent for the life of
+    the container and share one remedy: relax that policy, or accept the
+    container as the only isolation boundary.
     """
+    if label == _PROBE_STEP_MOUNT_PRIVATE:
+        return REMEDY_MOUNT_DENIED if err in (errno.EACCES, errno.EPERM) else ""
     if label == _PROBE_STEP_NEWNS:
         return REMEDY_APPARMOR_USERNS if err == errno.EPERM else ""
     if label != _PROBE_STEP_NEWUSER:
@@ -1732,6 +6188,19 @@ _LINUX_REMEDY_GUIDANCE = {
         "kernel.unprivileged_userns_clone (it must be 1); inside a container "
         "this is usually the container's own seccomp filter denying unshare, "
         "which is fixed with container run flags rather than host config. "
+    ),
+    REMEDY_MOUNT_DENIED: (
+        "The user and mount namespaces were created, but making mount "
+        "propagation private on / inside them was refused, so the sandbox "
+        "cannot hide anything. Nothing in the kernel refuses this to a process "
+        "that owns the namespace: a policy layer did. Inside a container that is "
+        "the runtime's default AppArmor profile (it carries `deny mount`; "
+        "EACCES) or a seccomp filter without the mount family (EPERM). Run the "
+        "container with AppArmor unconfined (docker: --security-opt "
+        "apparmor=unconfined; Kubernetes: securityContext.appArmorProfile.type "
+        "Unconfined) and a seccomp profile that permits unshare and mount — no "
+        "root or CAP_SYS_ADMIN is needed — or accept the container as the only "
+        "isolation boundary with agent.sandbox_allow_unsandboxed_exec=true. "
     ),
 }
 
@@ -1909,6 +6378,39 @@ def _probe_child_unshare(libc: ctypes.CDLL, flags: int) -> int:
     return ctypes.get_errno() or errno.EPERM
 
 
+def _probe_child_make_private(libc: ctypes.CDLL) -> int:
+    """Make ``/`` recursively private in the probe child's new mount namespace.
+
+    Returns 0 or the errno, like :func:`_probe_child_unshare`, and is the same
+    seam for tests: the container shape ("both unshares ok, mount EACCES") is
+    simulated here rather than by running under a ``deny mount`` profile.
+
+    Runs ONLY after ``unshare(CLONE_NEWNS)`` succeeded, so the propagation
+    change is confined to a namespace no other process shares and that ends
+    with the child. Nothing is bind-mounted and no path is hidden: this is the
+    one mount the launcher performs before any of that, and the one a
+    container's policy refuses first.
+    """
+    ctypes.set_errno(0)
+    if libc.mount(None, b"/", None, _PROBE_MS_REC | _PROBE_MS_PRIVATE, None) == 0:
+        return 0
+    return ctypes.get_errno() or errno.EPERM
+
+
+def _probe_bind_libc(libc: ctypes.CDLL) -> None:
+    """Declare the two libc calls the probe child makes, for either probe path."""
+    libc.unshare.argtypes = [ctypes.c_int]
+    libc.unshare.restype = ctypes.c_int
+    libc.mount.argtypes = [
+        ctypes.c_char_p,
+        ctypes.c_char_p,
+        ctypes.c_char_p,
+        ctypes.c_ulong,
+        ctypes.c_void_p,
+    ]
+    libc.mount.restype = ctypes.c_int
+
+
 def _probe_child_thread_count() -> int:
     """Live threads in the probe child, or 0 when it cannot be determined.
 
@@ -1934,8 +6436,8 @@ def _probe_child_thread_count() -> int:
     ``st_nlink`` of ``/proc/self/task`` is ``2 + threads`` (each thread is a
     subdirectory), so this is one ``stat`` and no list: the probe child of a threaded
     process must not allocate, because another thread may have owned the allocator lock
-    at fork time and no longer exists to release it. Linux-only, like the rest of the
-    probe.
+    at fork time and does not exist in the child to release it. Linux-only, like the
+    rest of the probe.
     """
     try:
         return max(0, os.stat("/proc/self/task").st_nlink - 2)
@@ -2010,8 +6512,8 @@ def _probe_child_death(pid: int) -> str:
 
     A child killed by a signal (the OOM killer, a stray SIGKILL) is a momentary
     environmental failure rather than a kernel verdict, so naming the signal
-    preserves the diagnostic the combined-call probe used to read out of the
-    child's exit status. Non-blocking, so a child wedged past the handshake
+    preserves the diagnostic the child's exit status carries instead of reporting a
+    bare failure. Non-blocking, so a child wedged past the handshake
     deadline is described instead of waited on.
     """
     try:
@@ -2060,7 +6562,14 @@ def _probe_child_sequence(
     p2c_w: int,
     sweep_ranges: tuple[tuple[int, int], ...],
 ) -> None:
-    """Probe child: run the launcher's two unshare steps, reporting each on the pipe.
+    """Probe child: run the launcher's namespace handshake, reporting each step.
+
+    Three steps, in the launcher's order: ``unshare(CLONE_NEWUSER)``, then —
+    once the parent has written the identity maps — ``unshare(CLONE_NEWNS)``,
+    then — once the parent has read that verdict — the propagation mount on
+    ``/``. Each step is one line on the pipe and the child waits for the parent
+    between them: a report and its successor written back to back could land in
+    the same read and the second would be lost.
 
     Never returns. It reports raw errnos and classifies nothing, so the entire
     verdict lives in the parent where a test can drive it without forking.
@@ -2072,7 +6581,7 @@ def _probe_child_sequence(
         # Drop every other inherited descriptor before touching namespaces:
         # an orphaned probe child must not keep the gateway.lock fd (or the
         # dashboard listen socket) open and pin the home. Only the handshake
-        # ends and the standard streams survive. (#3150)
+        # ends and the standard streams survive.
         _close_fd_ranges(sweep_ranges)
         # Read BEFORE the unshare: it is the only moment the count is the one the
         # kernel judged. Reported only alongside an EINVAL, and only to explain it --
@@ -2089,7 +6598,13 @@ def _probe_child_sequence(
         # ordering is the entire point of the probe.
         if not os.read(p2c_r, 1):
             os._exit(0)  # parent abandoned the handshake; it already has a verdict
-        os.write(c2p_w, b"N:%d\n" % _probe_child_unshare(libc, _CLONE_NEWNS))
+        err = _probe_child_unshare(libc, _CLONE_NEWNS)
+        os.write(c2p_w, b"N:%d\n" % err)
+        if err:
+            os._exit(0)
+        if not os.read(p2c_r, 1):
+            os._exit(0)
+        os.write(c2p_w, b"P:%d\n" % _probe_child_make_private(libc))
         os._exit(0)
     except BaseException:
         os._exit(1)
@@ -2150,6 +6665,27 @@ def _probe_parent_sequence(
         return (False, True, f"probe child sent unexpected step {step!r}", "")
     if err:
         return _probe_failure(_PROBE_STEP_NEWNS, err)
+
+    # Release the child for the propagation mount only after its NEWNS report
+    # has been read: the two verdicts share one pipe and must not share a read.
+    try:
+        os.write(p2c_w, b"m")
+    except OSError as exc:
+        return _probe_harness_failure("probe handshake write", exc.errno or 0)
+
+    report = _probe_read_step(c2p_r)
+    if report is None:
+        return (
+            False,
+            True,
+            f"probe child {death(pid)}; no {_PROBE_STEP_MOUNT_PRIVATE} result",
+            "",
+        )
+    step, err = report
+    if step != "P":
+        return (False, True, f"probe child sent unexpected step {step!r}", "")
+    if err:
+        return _probe_failure(_PROBE_STEP_MOUNT_PRIVATE, err)
     return (True, False, "ok", "")
 
 
@@ -2201,6 +6737,8 @@ import ctypes, errno, os
 
 CLONE_NEWUSER = 0x10000000
 CLONE_NEWNS = 0x00020000
+MS_REC = 0x4000
+MS_PRIVATE = 1 << 18
 
 
 def threads():
@@ -2218,6 +6756,15 @@ def unshare(libc, flags):
     return ctypes.get_errno() or errno.EPERM
 
 
+def make_private(libc):
+    # The launcher's first mount, inside the namespace this child just created:
+    # nothing is bind-mounted or hidden, and the namespace ends with the child.
+    ctypes.set_errno(0)
+    if libc.mount(None, b"/", None, MS_REC | MS_PRIVATE, None) == 0:
+        return 0
+    return ctypes.get_errno() or errno.EPERM
+
+
 def main():
     try:
         # dlopen(NULL): resolve unshare() from the libc ALREADY loaded into this
@@ -2228,6 +6775,10 @@ def main():
         libc = ctypes.CDLL(None, use_errno=True)
         libc.unshare.argtypes = [ctypes.c_int]
         libc.unshare.restype = ctypes.c_int
+        libc.mount.argtypes = [
+            ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_ulong, ctypes.c_void_p,
+        ]
+        libc.mount.restype = ctypes.c_int
     except BaseException:
         os._exit(1)
     n = threads()
@@ -2240,17 +6791,24 @@ def main():
         os._exit(0)
     if not os.read(0, 1):
         os._exit(0)
-    os.write(1, b"N:%d\n" % unshare(libc, CLONE_NEWNS))
+    err = unshare(libc, CLONE_NEWNS)
+    os.write(1, b"N:%d\n" % err)
+    if err:
+        os._exit(0)
+    if not os.read(0, 1):
+        os._exit(0)
+    os.write(1, b"P:%d\n" % make_private(libc))
     os._exit(0)
 
 
 main()
 """
 
-#: Ceiling on the spawned probe. The child does two syscalls and one blocking read
-#: whose writer is this process, so anything near this is a wedged interpreter, not
-#: slow work. Exceeding it is reported TRANSIENT: a host that cannot start a Python
-#: in 20 seconds is under momentary pressure, not permanently sandbox-less.
+#: Ceiling on the spawned probe. The child does three syscalls and two blocking
+#: reads whose writer is this process, so anything near this is a wedged
+#: interpreter, not slow work. Exceeding it is reported TRANSIENT: a host that
+#: cannot start a Python in 20 seconds is under momentary pressure, not
+#: permanently sandbox-less.
 _PROBE_SPAWN_TIMEOUT_SECONDS = 20.0
 
 _probe_spawn_unavailable_logged = False
@@ -2288,7 +6846,7 @@ def _probe_unshare_via_spawn() -> tuple[bool, bool, str, str] | None:
     try:
         # close_fds is subprocess's default and does the job the fork path has to do
         # by hand: the child gets only its standard streams, so an orphaned probe
-        # cannot hold the gateway lock fd or the dashboard listen socket open (#3150).
+        # cannot hold the gateway lock fd or the dashboard listen socket open.
         proc = subprocess.Popen(
             [sys.executable, "-I", "-S", "-c", _PROBE_SHIM_CODE],
             stdin=subprocess.PIPE,
@@ -2338,20 +6896,25 @@ def _probe_unshare_via_fork() -> tuple[bool, bool, str, str]:
 
     Mirrors the sequence ``_build_launcher_script()`` actually performs — fork,
     child ``unshare(CLONE_NEWUSER)``, parent writes the identity UID/GID map,
-    child ``unshare(CLONE_NEWNS)`` — because the two flags do NOT behave the
-    same way when combined. A single ``unshare(CLONE_NEWUSER | CLONE_NEWNS)`` is
-    satisfied atomically and therefore SUCCEEDS on hosts where the split
-    sequence fails: with Ubuntu's ``kernel.apparmor_restrict_unprivileged_userns
-    = 1`` (the default since 23.10), creating a user namespace moves the process
-    into a restricted AppArmor profile carrying no CAP_SYS_ADMIN, so the
-    *second* unshare returns EPERM. The previous combined probe reported those
-    hosts as sandbox-capable and every real spawn then died with
-    ``sandbox: unshare(NEWNS) failed: errno 1``.
+    child ``unshare(CLONE_NEWNS)``, child ``mount(MS_REC|MS_PRIVATE)`` on ``/``
+    — because the steps do NOT behave the same way when combined or skipped. A
+    single ``unshare(CLONE_NEWUSER | CLONE_NEWNS)`` is satisfied atomically and
+    therefore SUCCEEDS on hosts where the split sequence fails: with Ubuntu's
+    ``kernel.apparmor_restrict_unprivileged_userns = 1`` (the default since
+    23.10), creating a user namespace moves the process into a restricted
+    AppArmor profile carrying no CAP_SYS_ADMIN, so the *second* unshare returns
+    EPERM. The previous combined probe reported those hosts as sandbox-capable
+    and every real spawn then died with ``sandbox: unshare(NEWNS) failed: errno
+    1``. The propagation mount is the same story one step later: a container
+    under its runtime's default AppArmor profile passes both unshares and
+    refuses the mount with EACCES, and a probe that stopped at the unshares
+    reported it sandbox-capable too.
 
     ``reason`` names the failing step so a caller can tell the mechanisms apart
-    — a NEWNS denial is the AppArmor userns restriction, whereas NEWUSER with
-    ENOSPC/EUSERS is ``user.max_user_namespaces=0`` — rather than reporting a
-    bare errno that fits both.
+    — a NEWNS denial is the AppArmor userns restriction, NEWUSER with
+    ENOSPC/EUSERS is ``user.max_user_namespaces=0``, and a mount denial is the
+    container runtime's policy — rather than reporting a bare errno that fits
+    all of them.
 
     Linux-only and off-loop only: ``_probe_unshare()`` guards the platform and
     defers to the background warm thread when a loop is running, so the fork,
@@ -2359,8 +6922,7 @@ def _probe_unshare_via_fork() -> tuple[bool, bool, str, str]:
     """
     try:
         libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
-        libc.unshare.argtypes = [ctypes.c_int]
-        libc.unshare.restype = ctypes.c_int
+        _probe_bind_libc(libc)
     except OSError as exc:
         return (False, exc.errno in _TRANSIENT_PROBE_ERRNOS, f"libc load failed: {exc}", "")
     except Exception as exc:  # find_library returning junk, ABI issues, ...
@@ -2379,7 +6941,7 @@ def _probe_unshare_via_fork() -> tuple[bool, bool, str, str]:
 
     # Compute the child's fd sweep BEFORE forking: sorting, sysconf, and tuple
     # building all allocate, and post-fork the allocator lock may be held by a
-    # thread that no longer exists in the child. (#3150)
+    # thread that does not exist in the child.
     sweep_ranges = _fd_sweep_ranges(frozenset({0, 1, 2, c2p_w, p2c_r}))
 
     try:
@@ -2405,9 +6967,9 @@ def _probe_unshare_via_fork() -> tuple[bool, bool, str, str]:
 # The event loop NEVER executes fork/waitpid/sleep for the probe. On-loop
 # callers with a cold cache get an immediate transient "none" (fail-closed,
 # self-heals in ms) and fire a background daemon thread that populates the
-# cache off-loop. Boot sites call prewarm_backend() to fill the cache before
-# any on-loop caller ever reaches detect_backend(), so the transient path is
-# typically never hit in production.
+# cache off-loop. Boot sites call warm_backend() (via asyncio.to_thread) to fill
+# the cache before any on-loop caller ever reaches detect_backend(), so the
+# transient path is typically never hit in production.
 
 _warm_thread: threading.Thread | None = None
 
@@ -2469,8 +7031,9 @@ def _kick_background_warm() -> None:
 def prewarm_backend() -> None:
     """Fire-and-forget boot hook: start background probe to fill the cache.
 
-    Call early in gateway startup (slack/gateway.py, mcp_gateway/gatewayd.py)
-    so the cache is warm before any on-loop spawn path reaches detect_backend().
+    The gateway boot sites (slack/gateway.py, mcp_gateway/daemon/cli.py::_amain)
+    call the blocking ``warm_backend`` instead, which waits for the probe so the
+    cache is warm before any on-loop spawn path reaches detect_backend().
     """
     if sys.platform != "linux":
         return  # probes are Linux-only
@@ -2569,7 +7132,14 @@ def _probe_unshare() -> bool:
 
 
 def userns_available() -> bool:
-    """Public: True if unprivileged user + mount namespaces work on this host.
+    """Public: True if this host can build the launcher's namespace sandbox.
+
+    "Build" means the whole handshake the launcher performs before it hides
+    anything: an unprivileged user namespace, a mount namespace inside it, and
+    a private propagation mount on ``/`` inside that. A host that grants the
+    namespaces but refuses the mount (a container under its runtime's default
+    AppArmor profile) is NOT sandbox-capable, and reporting it as such made
+    every real spawn die in the launcher instead.
 
     Stable cross-module entry point for the namespace-support probe, shared by
     the OS-level sandbox here and the JailProvider extension point
@@ -2687,7 +7257,14 @@ def _probe_sandbox_exec() -> bool:
         r = subprocess.run(
             [sb, "-f", profile_path, target],
             capture_output=True,
-            timeout=5,
+            timeout=_SANDBOX_BACKEND_PROBE_TIMEOUT_SECS,
+            # Pinned to the profile's own temp dir: the probe runs /usr/bin/true
+            # and reads nothing, so it has no claim on the caller's cwd -- and a
+            # spawn with cwd=None is indistinguishable, to a per-spawn audit,
+            # from one that ran in the checkout under test (the one class-7
+            # descriptor a per-spawn sweep reads, charged to an arbitrary
+            # first test on every worker).
+            cwd=os.path.dirname(profile_path),
         )
         if r.returncode != 0:
             detail = r.stderr.decode(errors="replace").strip()
@@ -2756,977 +7333,42 @@ def _ssh_supports_accept_new() -> bool:
     return False
 
 
-def _build_launcher_script(
-    sandbox_level: str = "strict",
-    *,
-    strip_python_env: bool = False,
-    extra_hidden_dirs: tuple[str, ...] = (),
-    extra_visible_dirs: tuple[str, ...] = (),
-    extra_writable_dirs: tuple[str, ...] = (),
-) -> str:
-    """Build a Python launcher script for the Linux namespace sandbox.
+def namespace_launcher_script_dir() -> str:
+    """The directory :func:`namespace_argv` writes its launcher script into.
 
-    The launcher is executed as a subprocess.  It:
+    ``<config_dir>/run``, normalized, and named here because two readers need the one
+    answer: :func:`_ensure_run_dir`, which creates it, and ``session_pid``'s
+    managed-agent gate, which has to recognise a launcher path it did not build. Normalized
+    HERE so both sides of that comparison see one spelling: ``mkstemp`` returns an
+    ``abspath`` of its ``dir`` on 3.12+, so an uncollapsed path reaches ``/proc``
+    collapsed anyway. The case that needs it is the DEFAULT home under a ``HOME``
+    containing ``..``; an explicit ``KIROCREW_HOME`` is already ``.resolve()``d by
+    ``config.paths``.
 
-    1. Forks a child.
-    2. Child calls ``unshare(CLONE_NEWUSER)`` and signals the parent.
-    3. Parent writes identity UID/GID map (``uid uid 1``) to
-       ``/proc/<child>/{setgroups,uid_map,gid_map}`` and signals back.
-    4. Child calls ``unshare(CLONE_NEWNS)``, sets mount propagation private,
-       bind-mounts empty dirs over credential paths, scrubs env vars,
-       and ``exec``s the real command.
+    A function rather than a constant because it reads the live data home, and a NAMED one
+    rather than two spellings of ``config_dir() / "run"`` because the writer and the
+    recogniser have to agree about it exactly. The launcher's other three shape values are
+    plain module constants, so the gate imports those directly instead.
 
-    The child retains the real UID/GID — no UID 0, no UID 65534.
+    Deliberately only the PREFERRED spelling. ``_ensure_run_dir`` degrades to the system
+    tmpdir when this directory cannot be created or chmod'd, and that directory is shared
+    with every other user of the host -- accepting it as a launcher location on a KILL
+    path would let a path anyone can write decide which process trees are reclaimable.
+    RESIDUAL, stated rather than closed: on a host where the crew ``run/`` directory
+    cannot be created, a sandboxed agent root is not recognised and its tracking entry is
+    retained instead of reaped, exactly as it was before the gate learned this shape.
+    Closing that needs identity the tmpdir path cannot supply.
+
+    This is also the only part of the launcher's shape that touches the filesystem:
+    ``config_dir()`` creates the data home if it is missing and can raise, so the gate
+    asks for it LAST, after every free test on the command line has already matched.
     """
-    home = str(Path.home())
-    uid = os.getuid()
-    gid = os.getgid()
-    # Source the sensitive-dir lists from the active PlatformContext so the
-    # The internal companion can extend them (+ .midway/.ada).  The Default adapter
-    # returns ``list(_STRICT_DIRS)`` / ``list(_CC_DIRS)``, so standalone is
-    # unchanged.  ``_STANDARD_DIRS`` is not an extension point (no interface
-    # method) and stays on the module global.
-    if sandbox_level == "standard":
-        dirs = _STANDARD_DIRS
-    elif sandbox_level == "cc":
-        dirs = _sandbox_policy().cc_dirs()
-    else:
-        dirs = _sandbox_policy().strict_dirs()
-    files = _CC_FILES if sandbox_level in ("cc", "strict") else []
-    expose_files = _CC_EXPOSE_FILES if sandbox_level == "cc" else []
-    env_prefixes = list(_SENSITIVE_ENV_PREFIXES)
-    if sandbox_level in ("cc", "strict"):
-        # Block agent subprocesses from reading credentials via os.environ
-        # (the file-level bind-mount of ~/.kiro/crew/.env hides them on disk;
-        # config/loader.py seeds them into os.environ for trusted children
-        # only — sandboxed agents must not see them either way).
-        env_prefixes = env_prefixes + list(_AGENT_DENIED_ENV_KEYS)
-    if strip_python_env:
-        # Foreign Python subprocess (kiro-cli's MCP servers) — do not let
-        # KiroCrew's PYTHONPATH/PYTHONHOME leak in and shadow their own deps.
-        env_prefixes = env_prefixes + list(_PYTHON_ENV_PREFIXES)
-    hide_ssh = sandbox_level == "strict"
-    hidden_dirs = [os.path.join(home, d) for d in dirs]
-    hidden_dirs.extend(_relocated_policy_cache_dirs())
-    hidden_dirs.extend(_relocated_crew_targets(_CREW_HIDDEN_LEAVES))
-    hidden_dirs.extend(_voice_runtime_sandbox_paths())
-    hidden_dirs.extend(os.path.abspath(path) for path in extra_hidden_dirs)
-    unhidden = [
-        path for path in hidden_dirs if _hidden_path_contains_visible_path(path, extra_visible_dirs)
-    ]
-    hidden_dirs = [path for path in hidden_dirs if path not in unhidden]
-    # The governance cache is READ-ONLY whenever it is exposed at all, and that is a
-    # property of the directory rather than of the caller's request: `extra_visible_dirs`
-    # otherwise cancels a target's whole rule set, so the one caller that legitimately
-    # needs to READ the ceiling (`apps/backend.py`, which boots in cache-only mode and
-    # resolves the fleet ceiling from this file) would get WRITE with it. That is the
-    # dangerous direction — the metadata records the source the next boot trusts, so a
-    # same-UID process that can rewrite the pair picks the ceiling for every later boot,
-    # and an app backend is arbitrary third-party code. Deciding it here means a future
-    # caller cannot re-open the hole by passing this path.
-    readonly_dirs = [path for path in unhidden if _is_policy_cache_dir(path)]
-    # ``run`` must stay readable because it holds this launcher, but making both
-    # its lexical and canonical spellings read-only prevents an agent from
-    # renaming the hidden voice-runtime mount out from under the path-based rule.
-    readonly_dirs.extend(_voice_runtime_parent_paths())
-    # The crew data home's ceilings. Read-only rather than hidden because in-sandbox
-    # code resolves them (a script cron's ``boot_platform()``, the config loader) and an
-    # absent ceiling reads as the permissive standalone default — masking one would
-    # REMOVE it. A caller's ``extra_visible_dirs`` cannot re-open the write side, for the
-    # reason spelled out for the governance cache above.
-    readonly_dirs.extend(
-        os.path.join(home, target)
-        for target in _CREW_READONLY_TARGETS
-        if os.path.join(home, target) not in hidden_dirs
-    )
-    # A relocated data home escapes every ``$HOME``-relative rule above, which would
-    # leave the ceiling writable on exactly the managed fleets that set it.
-    readonly_dirs.extend(
-        path for path in _relocated_crew_targets(_CREW_READONLY_LEAVES) if path not in hidden_dirs
-    )
-    # A caller-supplied hidden path may be a FILE, and the two launcher loops hide
-    # each kind differently: a directory gets an empty dir bind-mounted over it, a file
-    # gets an empty temp file. The dir loop is guarded by `if os.path.isdir(target)`, so
-    # a file entry matched neither it nor the file loop and was SILENTLY SKIPPED — the
-    # caller asked for it to be hidden, got no error, and it stayed readable.
-    #
-    # That is not hypothetical: `security.sensitive_home_dirs()` is not all directories
-    # (`sel_hmac.key`, `token_signing.key`, `.kiro/crew/.env` are files), and Papyrus
-    # passes that whole list as `extra_hidden_dirs` so a `.tex` cannot `\input` the
-    # gateway's own secrets into a rendered PDF.
-    #
-    # Every path goes in BOTH lists, and the CHILD classifies it. The child already
-    # re-checks with its own `isdir`/`isfile` per loop, so whichever branch matches does
-    # the work and the other skips — no double-mount, no wrong-kind mount. Classifying
-    # here instead would mean an `os.path.isfile()` per entry (52 of them) inside
-    # `_build_launcher_script`, which runs on the event loop for every async spawn: on a
-    # stalled NFS home those stats block the gateway and the liveness heartbeat. Letting
-    # the child decide keeps the syscalls in the child, where they are already happening
-    # and where blocking costs nothing but that one spawn.
-    #
-    # macOS is unaffected either way: for these entries the profile emits BOTH a
-    # `(subpath …)` and a `(literal …)` deny, so a plain-file leaf is covered
-    # without relying on how subpath treats a non-directory.
-    dirs_json = json.dumps(list(dict.fromkeys(hidden_dirs)))
-    readonly_json = json.dumps(list(dict.fromkeys(readonly_dirs)))
-    # Write carve-outs (#8653): validated against the same seals this script
-    # embeds. The launcher re-binds each approved directory over itself AFTER
-    # the READONLY seal and remounts that bind read-write, so the carve-out
-    # overrides only the runtime parent's seal — the validator refuses any
-    # candidate that would re-open a hidden tree, a ceiling, or the voice
-    # runtime. ``hidden_dirs`` was already filtered down to the entries that
-    # stay hidden, so ``hidden_dirs + unhidden`` reconstitutes the FULL
-    # pre-``extra_visible_dirs`` candidate set: the ``+ unhidden`` term is
-    # load-bearing, not redundant — dropping it would let a tree a caller
-    # re-exposed read-only grow a writable window through this parameter
-    # (pinned by test_launcher_refuses_carveout_inside_unhidden_tree).
-    runtime_parents = list(_voice_runtime_parent_paths())
-    writable_json = json.dumps(
-        _writable_carveout_spellings(
-            extra_writable_dirs,
-            subtree_guards=hidden_dirs
-            + unhidden
-            + [path for path in readonly_dirs if path not in set(runtime_parents)]
-            + ([os.path.join(home, ".ssh")] if hide_ssh else []),
-            literal_guards=[os.path.join(home, f) for f in files],
-            carveable_parents=runtime_parents,
-        )
-    )
-    files_json = json.dumps(
-        list(dict.fromkeys([os.path.join(home, f) for f in files] + hidden_dirs))
-    )
-    expose_json = json.dumps([(os.path.join(home, f), f.split("/")[-1]) for f in expose_files])
-    env_prefixes_json = json.dumps(env_prefixes)
-    ssh_dir = json.dumps(os.path.join(home, ".ssh"))
-    ssh_known_hosts = json.dumps(os.path.join(home, ".ssh", "known_hosts"))
-    sandbox_level_json = json.dumps(sandbox_level)
-    strict_host_key_opt = (
-        " -o StrictHostKeyChecking=accept-new" if _ssh_supports_accept_new() else ""
-    )
-
-    return f'''#!/usr/bin/env python3
-"""Namespace sandbox launcher — spawned by KiroCrew."""
-import sys
-# Harden against stdlib shadowing. This launcher runs as
-# ``python <config_dir>/run/kirocrew_sandbox_*.py``, so CPython prepends the
-# script's own directory (sys.path[0], typically <config_dir>/run/) to sys.path.
-# A stray sibling module left in that directory by another process — e.g.
-# struct.py, os.py — then shadows the real stdlib and crashes the imports below
-# (seen in the wild: "ImportError: cannot import name 'calcsize' from
-# '/tmp/struct.py'", which kills the agent subprocess on spawn). ``sys`` is a
-# builtin and cannot be shadowed, so importing it first is safe; drop the
-# launcher dir (and any cwd "" entry) before importing anything that resolves
-# from the filesystem.
-sys.path[:] = [p for p in sys.path if p not in ("", sys.path[0])]
-import ctypes
-import os
-import stat
-import tempfile
-
-# Hoisted from Steps 5/6 (used only AFTER unshare()+mount isolation): a
-# FIRST-TIME stdlib import reads module files off disk, and once the child has
-# entered its user+mount namespaces that read can be denied by the host's LSM
-# (seen in the wild: Ubuntu 24.04 with apparmor_restrict_unprivileged_userns=1
-# denies the post-unshare read, so ``import platform`` at seccomp-install time
-# died with ModuleNotFoundError and every sandboxed spawn failed -- #8151).
-# Import EVERYTHING this launcher needs while it is still pre-isolation, so no
-# post-isolation code ever touches the filesystem for stdlib. The static-scan
-# test pins this: every import in this generated script must be module-level.
-import platform as _plat
-import struct as _struct
-
-_CLONE_NEWUSER = 0x10000000
-_CLONE_NEWNS   = 0x00020000
-_MS_RDONLY     = 1
-_MS_NOSUID     = 2
-_MS_NODEV      = 4
-_MS_NOEXEC     = 8
-_MS_REMOUNT    = 32
-_MS_BIND       = 4096
-_MS_REC        = 16384
-_MS_PRIVATE    = 1 << 18
-
-# dlopen(NULL): resolve mount()/unshare()/prctl() from the libc ALREADY loaded
-# into this interpreter. Never ctypes.util.find_library here -- on Linux it
-# EXECUTES helper processes to locate libc (ldconfig first, then a PATH-resolved
-# gcc/cc/objdump/ld once ldconfig yields no match, i.e. on musl hosts). This
-# module scope runs BEFORE the fork and before either unshare() below, under an
-# environment the SPAWNING CALLER supplies -- so on such a host a
-# caller-controlled `gcc` on PATH would be same-user code execution ahead of the
-# confinement this launcher exists to establish.
-#
-# Same rule, same reason, as the spawned userns probe in ``_PROBE_SHIM_CODE``,
-# which already resolves libc this way; the launcher was the one pre-confinement
-# script still violating it. Not a new code path either: ``find_library``
-# returning None made this call ``CDLL(None)`` anyway, so dlopen(NULL) was
-# already the implicit fallback here. ``ctypes.util`` is deliberately left
-# unimported above so a future reintroduction fails loudly instead of silently
-# reopening the PATH lookup.
-_libc = ctypes.CDLL(None, use_errno=True)
-_libc.mount.argtypes = [
-    ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p,
-    ctypes.c_ulong, ctypes.c_void_p,
-]
-_libc.mount.restype = ctypes.c_int
-_libc.unshare.argtypes = [ctypes.c_int]
-_libc.unshare.restype = ctypes.c_int
-_libc.prctl = _libc.prctl if hasattr(_libc, "prctl") else None
-if _libc.prctl:
-    _libc.prctl.argtypes = [ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong]
-    _libc.prctl.restype = ctypes.c_int
-
-def _mount_or_die(source, target, flags, what):
-    """``mount(2)`` or refuse to exec, naming *what* and the errno.
-
-    Every mount in this launcher IS a security control -- each one hides a
-    credential path, or (for ``/``) pins mount propagation so the hiding
-    cannot escape. Discarding the return value makes those controls fail
-    OPEN: the path stays visible and the agent runs anyway, believing it is
-    hidden. Nothing downstream notices -- there is no post-mount emptiness
-    check, the launcher has no logger, and the pre-exec hardlink scan only
-    fires when a credential happens to carry an extra link.
-
-    So these refuse, matching what the rest of this launcher already does
-    when a control cannot be established: both ``unshare`` calls, the
-    seccomp-BPF install, and the hardlink scan all ``sys.exit``. What marks
-    those off from the decisions that DO degrade open is a rule, not a list:
-    a failed hiding mount is the one thing this helper exists to prevent,
-    nothing else here is one, and each of those others argues its case at
-    its own site -- the ``EXPOSE_FILES`` pre-read is one of them, named as
-    an example and not as a roster -- no count is kept here, since the count
-    is what goes stale. Read it narrowly: none is a failed hiding mount, NOT
-    the stronger claim that no credential can end up reachable. A degrade
-    elsewhere is never license to degrade a mount.
-
-    ``sandbox_level`` is the explicit opt-out for a host that cannot mount;
-    a silent unhidden credential is not.
-    """
-    if _libc.mount(source, target, None, flags, None) != 0:
-        _err = ctypes.get_errno()
-        sys.exit(
-            "sandbox: BLOCKED -- %s failed: errno %d (%s). The sandbox could not "
-            "establish this control, so the agent would run with the path "
-            "visible. Lower sandbox_level to run without it deliberately."
-            % (what, _err, os.strerror(_err))
-        )
-
-def _mount_or_warn(source, target, flags, what):
-    """``mount(2)`` that degrades OPEN with an advisory, for access-WIDENING mounts.
-
-    The write carve-out pair (#8653) is the inverse of every ``_mount_or_die``
-    site: those mounts WITHHOLD access and a silent failure hands the agent a
-    visible credential, so they refuse; these mounts GRANT access inside an
-    already-sealed subtree, so a failure means the path simply stays sealed --
-    the pre-carve-out behavior, in which the one consequence is that a probe's
-    private temp dir is unwritable. Killing the spawn for that would trade a
-    degraded probe for no probe at all.
-
-    Emits the classifier's ADVISORY severity (the prefix
-    ``_SANDBOX_LAUNCHER_WARNING_PREFIX`` in dashboard/handlers/worktree.py
-    matches; the severity set is ratcheted by test_worktree_create.py) and
-    reports success so callers can chain: the carve-out's remount is pointless
-    after its bind already failed.
-    """
-    if _libc.mount(source, target, None, flags, None) != 0:
-        sys.stderr.write(
-            "sandbox: WARNING -- %s failed (errno %d); continuing with the "
-            "path sealed\\n" % (what, ctypes.get_errno())
-        )
-        return False
-    return True
-
-def _locked_mount_flags(target):
-    """Mount flags on *target* the kernel may have LOCKED, ready to re-assert.
-
-    Inside an unprivileged user namespace the kernel treats a mount's
-    nosuid / nodev / noexec bits as locked and rejects with EPERM any remount
-    whose flag set would clear them. A bind created over *target* inherits
-    those bits -- locks included -- from its source mount (/tmp carries
-    nosuid,nodev by default on AL2023 / Fedora / RHEL), so the sealing
-    remount must carry them again. Called AFTER the bind step, so ``f_flag``
-    reflects the new bind's effective flags. Re-asserting a bit already in
-    force can only keep restrictions, never widen access. atime is left
-    alone: a remount that passes no atime flag preserves the existing mode,
-    which already satisfies MNT_LOCK_ATIME.
-
-    On ``statvfs`` failure fall back to 0 extra flags: the remount then
-    behaves exactly as it did before this helper existed, and a locked-flag
-    rejection still fails closed at the call site. Never degrades the seal.
-    """
-    try:
-        f_flag = os.statvfs(target).f_flag
-    except OSError:
-        return 0
-    flags = 0
-    # getattr, never bare os.ST_*: the launcher only ever RUNS on Linux, where
-    # all three exist, but the sandbox tests execute this helper's extracted
-    # source on every POSIX host and macOS defines only ST_RDONLY / ST_NOSUID
-    # -- a bare os.ST_NODEV there raises AttributeError, which the OSError
-    # fallback above deliberately does not swallow.
-    if f_flag & getattr(os, "ST_NOSUID", 0):
-        flags |= _MS_NOSUID
-    if f_flag & getattr(os, "ST_NODEV", 0):
-        flags |= _MS_NODEV
-    if f_flag & getattr(os, "ST_NOEXEC", 0):
-        flags |= _MS_NOEXEC
-    return flags
-
-REAL_UID = {uid}
-REAL_GID = {gid}
-SENSITIVE_DIRS = {dirs_json}
-READONLY_DIRS = {readonly_json}
-WRITABLE_DIRS = {writable_json}
-SENSITIVE_FILES = {files_json}
-EXPOSE_FILES = {expose_json}
-ENV_PREFIXES = {env_prefixes_json}
-SSH_DIR = {ssh_dir}
-SSH_KNOWN_HOSTS = {ssh_known_hosts}
-HIDE_SSH = {hide_ssh}
-SANDBOX_LEVEL = {sandbox_level_json}
-
-def main():
-    argv = sys.argv[1:]
-    if not argv:
-        sys.exit("sandbox_launcher: no command given")
-
-    # Export this launcher's HOST pid before any fork/namespace work. The
-    # gateway records exactly this pid (its direct Popen child) when it
-    # writes ``session_pid_<pid>.txt`` on session claim, so in-sandbox
-    # identity resolvers can look the file up directly via this env var
-    # instead of walking /proc — which breaks whenever the subtree's view
-    # of pids diverges from the host's (PID-namespace sandboxing).
-    os.environ["KIROCREW_HOST_PID"] = str(os.getpid())
-
-    # Two pipes for parent↔child synchronization
-    c2p_r, c2p_w = os.pipe()  # child signals "unshare done"
-    p2c_r, p2c_w = os.pipe()  # parent signals "maps written"
-
-    pid = os.fork()
-
-    if pid > 0:
-        # ── Parent: write identity UID/GID map ──
-        os.close(c2p_w)
-        os.close(p2c_r)
-        os.read(c2p_r, 1)  # wait for child to unshare(NEWUSER)
-        os.close(c2p_r)
-        with open(f"/proc/{{pid}}/setgroups", "w") as f:
-            f.write("deny")
-        with open(f"/proc/{{pid}}/uid_map", "w") as f:
-            f.write(f"{{REAL_UID}} {{REAL_UID}} 1\\n")
-        with open(f"/proc/{{pid}}/gid_map", "w") as f:
-            f.write(f"{{REAL_GID}} {{REAL_GID}} 1\\n")
-        os.write(p2c_w, b"x")  # signal child to proceed
-        os.close(p2c_w)
-        _, status = os.waitpid(pid, 0)
-        code = os.WEXITSTATUS(status) if os.WIFEXITED(status) else 1
-        sys.exit(code)
-    else:
-        # ── Child: unshare, wait for maps, mount, exec ──
-        os.close(c2p_r)
-        os.close(p2c_w)
-
-        # Step 1: enter user namespace
-        if _libc.unshare(_CLONE_NEWUSER) != 0:
-            sys.exit(f"sandbox: unshare(NEWUSER) failed: errno {{ctypes.get_errno()}}")
-        os.write(c2p_w, b"x")  # tell parent
-        os.close(c2p_w)
-        os.read(p2c_r, 1)  # wait for maps
-        os.close(p2c_r)
-
-        # Step 2: enter mount namespace (now we have a mapped UID)
-        if _libc.unshare(_CLONE_NEWNS) != 0:
-            sys.exit(f"sandbox: unshare(NEWNS) failed: errno {{ctypes.get_errno()}}")
-
-        # Private mount propagation
-        _mount_or_die(None, b"/", _MS_REC | _MS_PRIVATE,
-                      "making mount propagation private on /")
-
-        # Pick a tmpfs-backed source dir for bind-mount empty files/dirs. Same-fs
-        # binds (e.g. /tmp on ext4 over ~/.kiro/crew/.env on ext4) can corrupt the
-        # target's host directory entry via a kernel propagation race when the
-        # private NS is torn down — leaving the host file pointing at the empty
-        # source inode permanently. Cross-fs binds use distinct inode spaces and
-        # cannot leak that way. Fallback chain: /run/user/$UID → /dev/shm.
-        # Verify each candidate is on a different filesystem from HOME by
-        # comparing st_dev — same-fs candidates provide no isolation benefit.
-        _tmpfs_src = None
-        try:
-            _home_dev = os.stat(os.path.expanduser("~")).st_dev
-        except OSError:
-            _home_dev = None
-        for _candidate in (f"/run/user/{{REAL_UID}}", "/dev/shm"):
-            try:
-                if _home_dev is not None and os.stat(_candidate).st_dev == _home_dev:
-                    continue  # same fs as HOME — no isolation, race still possible
-                _probe = tempfile.mkdtemp(dir=_candidate, prefix="kirocrew_sbprobe_")
-                try:
-                    os.rmdir(_probe)
-                except FileNotFoundError:
-                    pass  # an external cleaner won the race — the root still works
-                _tmpfs_src = _candidate
-                break
-            except (OSError, ValueError):
-                continue
-        # _tmpfs_src=None falls through to system default tempdir (typically /tmp).
-        # In that case we accept the kernel-race risk because no tmpfs is
-        # available — better to function (with the original regression risk)
-        # than to refuse to start.
-
-        # Tag every bind-mount SOURCE with this process's pid. The kernel pins
-        # a bind source for the mount's lifetime, so these entries cannot be
-        # unlinked here and are orphaned when the sandboxed process exits; the
-        # pid in the name is the liveness key the periodic janitor
-        # (_cleanup_stale_sandbox_mount_sources) probes to reclaim them. exec
-        # preserves the pid, so this pid IS the running agent's pid. The
-        # tmpfs probe above deliberately uses the sibling "kirocrew_sbprobe_"
-        # prefix, OUTSIDE the pid-parsed family, so the janitor never races
-        # its mkdtemp/rmdir window.
-        _src_prefix = "kirocrew_sb_%d_" % os.getpid()
-
-        # Pre-read files that must survive dir hiding.
-        #
-        # An expose source that cannot be READ degrades to "not exposed" with a
-        # stderr warning, the same way the Step 7 hardlink scan degrades open.
-        # This read runs during sandbox SETUP, so letting the OSError propagate
-        # aborts the child before the command runs at all -- and selective
-        # exposure is an OPTIMIZATION (keep ~/.aws/config reachable so
-        # credential_process still resolves inside an otherwise-hidden ~/.aws),
-        # never a security control. Failing the whole spawn because an optional
-        # convenience is unreadable trades a working sandbox for no sandbox.
-        #
-        # `isfile` already covers ABSENT; this covers UNREADABLE, and the two
-        # are not the same test: `stat` can succeed on a path whose `open` is
-        # then denied. Seen in the wild as a filesystem restriction inherited
-        # from the parent process, denying read on a 0600 file the child's own
-        # uid owned -- so DAC bits and uid both looked correct while every
-        # cc-mode spawn on that host died here.
-        #
-        # Catching the error is the only guard that HOLDS. Do not "tighten" this
-        # into a pre-flight `os.access(src_path, os.R_OK)`: measured on the
-        # affected host, `os.stat()` succeeded and `os.access()` reported BOTH
-        # X_OK and R_OK as True while the operation was denied anyway. The
-        # weaker check looks equivalent from the source alone and would
-        # silently restore the abort.
-        #
-        # The warning is not optional. Skipping silently would leave the child
-        # with no ~/.aws/config and no explanation, turning a loud setup failure
-        # into a later auth failure that points nowhere near this line.
-        expose_data = {{}}
-        for src_path, filename in EXPOSE_FILES:
-            if os.path.isfile(src_path):
-                try:
-                    with open(src_path, "rb") as fh:
-                        expose_data[src_path] = fh.read()
-                except OSError as exc:
-                    print(
-                        "sandbox: WARNING — cannot read %s (%s); it will be "
-                        "ABSENT inside the sandbox. Anything depending on it "
-                        "(e.g. credential_process in ~/.aws/config) will fail."
-                        % (src_path, exc),
-                        file=sys.stderr,
-                    )
-
-        # Bind-mount empty dirs over credential paths (per-dir tmpdir to
-        # prevent content leaking across mounts via shared backing dir).
-        for d in SENSITIVE_DIRS:
-            target = d.encode()
-            if os.path.isdir(target):
-                per_dir_empty = tempfile.mkdtemp(dir=_tmpfs_src, prefix=_src_prefix).encode()
-                _mount_or_die(per_dir_empty, target, _MS_BIND,
-                              "hiding credential directory %s" % d)
-
-        # Exposed-but-read-only dirs (the governance cache): bind the real dir over
-        # itself, then remount that bind MS_RDONLY. Both steps are load-bearing --
-        # MS_RDONLY is ignored on the initial MS_BIND, so without the remount this
-        # loop would grant exactly the write access it exists to withhold. Creating
-        # the bind ourselves is necessary but NOT sufficient inside a user
-        # namespace: the kernel locks the source mount's nosuid/nodev/noexec bits,
-        # and rejects a remount that would drop them, so the seal re-asserts them
-        # via _locked_mount_flags -- re-asserting bits already in force can only
-        # keep restrictions, never widen access.
-        for d in READONLY_DIRS:
-            target = d.encode()
-            # ``exists``, not ``isdir``: a governance ceiling is a plain file
-            # (``security_policy.json``), and bind-over-self + MS_RDONLY seals a
-            # regular file exactly as it seals a directory. Guarding on ``isdir``
-            # would silently skip every ceiling FILE — the caller asks for it to be
-            # sealed, gets no error, and it stays writable.
-            if os.path.exists(target):
-                _mount_or_die(target, target, _MS_BIND,
-                              "exposing read-only path %s" % d)
-                _mount_or_die(target, target,
-                              _MS_REMOUNT | _MS_BIND | _MS_RDONLY
-                              | _locked_mount_flags(target),
-                              "sealing read-only path %s" % d)
-
-        # Writable carve-outs (#8653) — validated by the builder against every
-        # seal this script applies; each approved entry lives INSIDE the sealed
-        # runtime parent and covers no other protected path. MUST run AFTER the
-        # READONLY loop, for two reasons, the second stronger than the first:
-        # (a) the fresh bind inherits that mount's MS_RDONLY, which the remount
-        # then clears while re-asserting the kernel-locked nosuid/nodev/noexec
-        # bits (``_locked_mount_flags`` never returns MS_RDONLY); (b) a
-        # non-recursive MS_BIND does not replicate submounts, so if the parent
-        # self-bind were established AFTER the carve-out, lookups through the
-        # new parent mount would not find the carve-out mount at all and the
-        # writable window would vanish silently — the #8653 failure back with
-        # no error. Clearing MS_RDONLY here is permitted because the seal
-        # being cleared was created inside THIS namespace without
-        # MNT_LOCK_READONLY (a data home on a genuinely read-only underlying
-        # mount could not have produced the carve-out directory at all); the
-        # underlying filesystem's nosuid/nodev/noexec bits remain locked and
-        # are re-asserted, not dropped.
-        #
-        # These two mounts WIDEN access, so unlike every _mount_or_die above
-        # they fail OPEN: a host that refuses the bind or the remount keeps
-        # the seal, degrading to the pre-carve-out behavior (the probe's temp
-        # dir is unwritable, exactly as before this feature) instead of
-        # killing the spawn. A bind that succeeded whose remount then failed
-        # leaves a read-only bind stacked on a read-only parent — the sealed
-        # behavior, not a widening. The ``islink`` refusal mirrors the sweep
-        # hygiene rules: a symlink planted where the carve-out dir should be
-        # must not redirect the writable window elsewhere (the Seatbelt
-        # backend needs no equivalent, since its rules match the kernel's
-        # resolved operation path).
-        for d in WRITABLE_DIRS:
-            target = d.encode()
-            if not os.path.isdir(target) or os.path.islink(target):
-                continue
-            if _mount_or_warn(target, target, _MS_BIND,
-                              "writable carve-out bind for %s" % d):
-                _mount_or_warn(target, target,
-                               _MS_REMOUNT | _MS_BIND
-                               | _locked_mount_flags(target),
-                               "writable carve-out remount for %s" % d)
-
-        # Restore selectively exposed files into the now-empty mounts
-        for src_path, filename in EXPOSE_FILES:
-            if src_path in expose_data:
-                parent = os.path.dirname(src_path)
-                dest = os.path.join(parent, filename)
-                with open(dest, "wb") as fh:
-                    fh.write(expose_data[src_path])
-                # NOTE: this runs inside the embedded Linux-only namespace
-                # launcher script (a standalone /tmp file that imports only
-                # stdlib — sys/ctypes/os/stat/tempfile/platform/struct — and
-                # never kiro_crew), so it
-                # must stay a raw os.chmod, NOT platform_compat.chmod_safe
-                # (which is undefined in that process). The launcher never runs
-                # on Windows, so there is no portability loss.
-                os.chmod(dest, 0o444)
-
-        # Bind-mount empty files over individual sensitive files. Source the
-        # empty tempfile from a tmpfs (cross-fs) when available so the bind
-        # cannot corrupt the target's host directory entry on namespace exit.
-        for f in SENSITIVE_FILES:
-            target = f.encode()
-            if os.path.isfile(target):
-                fd, empty_path = tempfile.mkstemp(dir=_tmpfs_src, prefix=_src_prefix)
-                os.close(fd)
-                _mount_or_die(empty_path.encode(), target, _MS_BIND,
-                              "hiding sensitive file %s" % f)
-
-        # .ssh: hide keys but expose known_hosts content (strict only)
-        if HIDE_SSH and os.path.isdir(SSH_DIR):
-            kh_data = b""
-            if os.path.isfile(SSH_KNOWN_HOSTS):
-                # Host trust data FAILS CLOSED. This is deliberately NOT the
-                # degrade-open treatment the EXPOSE_FILES pre-read above gets,
-                # and the two sites are NOT symmetric:
-                #
-                #   - an unreadable ~/.aws/config costs REACHABILITY, so
-                #     skipping it trades a convenience for a working sandbox;
-                #   - an unreadable known_hosts costs VERIFICATION. The launcher
-                #     puts StrictHostKeyChecking=accept-new into
-                #     GIT_SSH_COMMAND, gated ONLY on that variable being unset
-                #     -- never on whether this read succeeded. So continuing
-                #     with an empty kh_data points UserKnownHostsFile at an
-                #     absent file while auto-accept is still on: every host then
-                #     reads as NEW and an interceptor's key is accepted. With
-                #     known_hosts present, accept-new REFUSES a CHANGED key.
-                #
-                # A degrade here would therefore convert "refuse a changed key"
-                # into "accept anything". Aborting is the safe direction: no
-                # sandbox at all beats one that has quietly stopped verifying
-                # hosts. Report first so the abort is diagnosable, then re-raise
-                # and let it kill setup.
-                try:
-                    with open(SSH_KNOWN_HOSTS, "rb") as fh:
-                        kh_data = fh.read()
-                except OSError as exc:
-                    print(
-                        "sandbox: FATAL — cannot read %s (%s). Refusing to "
-                        "continue: proceeding without it would leave host-key "
-                        "verification accepting any new key."
-                        % (SSH_KNOWN_HOSTS, exc),
-                        file=sys.stderr,
-                    )
-                    raise
-            # Cross-fs source for the same kernel-race reason as SENSITIVE_DIRS
-            # (line 371) and SENSITIVE_FILES (line 389).
-            ssh_tmp = tempfile.mkdtemp(dir=_tmpfs_src, prefix=_src_prefix).encode()
-            _mount_or_die(ssh_tmp, SSH_DIR.encode(), _MS_BIND,
-                          "hiding ssh key directory %s" % SSH_DIR)
-            if kh_data:
-                with open(os.path.join(SSH_DIR, "known_hosts"), "wb") as fh:
-                    fh.write(kh_data)
-
-        # Scrub sensitive env vars
-        for key in list(os.environ):
-            for prefix in ENV_PREFIXES:
-                if key.startswith(prefix):
-                    del os.environ[key]
-                    break
-
-        # Mark the sandboxed tree so in-sandbox wrap_argv calls know OS
-        # isolation is already active (nested unshare is seccomp-denied).
-        # Set AFTER the scrub loop so a scrubbed prefix cannot delete it.
-        os.environ["KIROCREW_SANDBOX_ACTIVE"] = "1"
-        # Record WHICH tier this sandbox was built at, so an in-sandbox
-        # wrap_argv passthrough can detect a requested-vs-active tier
-        # downgrade. Same non-scrubbable placement as the marker above.
-        os.environ["KIROCREW_SANDBOX_LEVEL"] = SANDBOX_LEVEL
-
-        # Fix /etc/ssh/ssh_config.d/ ownership issue: root-owned files
-        # appear as nobody:nobody inside the user namespace because UID 0
-        # is unmapped. SSH refuses to load them. Bypass with -F /dev/null.
-        if not os.environ.get("GIT_SSH_COMMAND"):
-            os.environ["GIT_SSH_COMMAND"] = (
-                "ssh -F /dev/null -o IdentityFile=~/.ssh/id_rsa"
-                " -o IdentityFile=~/.ssh/id_ecdsa"
-                " -o IdentityFile=~/.ssh/id_ed25519"
-                " -o UserKnownHostsFile=~/.ssh/known_hosts"
-                "{strict_host_key_opt}"
-            )
-
-        # Gradle would otherwise leave a daemon running after this sandboxed
-        # command exits, holding our mount namespace open with the credential
-        # paths still masked, plus the inherited seccomp filter and emptied
-        # capability bounding set. Nothing here changes what Gradle keys its
-        # daemon context on, so a later build OUTSIDE the sandbox matches and
-        # adopts that daemon, silently running under restrictions and a
-        # credential view it never asked for. Keyed on the EFFECTIVE LAST
-        # -Dorg.gradle.daemon= directive rather than on mere presence, because
-        # duplicate -D resolves last-wins: a trailing =true would otherwise
-        # survive, while appending when ours is already last just duplicates.
-        if [
-            _t
-            for _t in os.environ.get("GRADLE_OPTS", "").split()
-            if _t.startswith("-Dorg.gradle.daemon=")
-        ][-1:] != ["-Dorg.gradle.daemon=false"]:
-            os.environ["GRADLE_OPTS"] = (
-                os.environ.get("GRADLE_OPTS", "") + " -Dorg.gradle.daemon=false"
-            ).strip()
-
-        # ── Step 5: Drop capabilities + set NO_NEW_PRIVS ──
-        # Inside the user namespace, the child has CAP_SYS_ADMIN (owner of the
-        # NS) which lets it umount the credential bind-mounts. Drop ALL
-        # capabilities from the bounding set and set NO_NEW_PRIVS before exec.
-        # (_struct is imported in the preamble, pre-isolation -- see the hoist
-        # note there; importing it HERE crashed under AppArmor userns
-        # restriction, #8151.)
-
-        _PR_SET_NO_NEW_PRIVS = 38
-        _PR_CAPBSET_DROP = 24
-        if not _libc.prctl:
-            # prctl(2) is how BOTH remaining controls are applied: the
-            # capability-bounding drop plus NO_NEW_PRIVS here, and the
-            # seccomp-BPF install in Step 6. Without it the child keeps
-            # CAP_SYS_ADMIN over this mount namespace and can umount the
-            # credential masks, so refuse for the same reason the unknown-arch
-            # branch below does.
-            sys.exit(
-                "sandbox: BLOCKED — libc exposes no prctl(2), so neither the "
-                "capability-bounding drop nor the seccomp-BPF namespace-escape "
-                "filter can be applied. The agent would keep CAP_SYS_ADMIN in "
-                "this mount namespace and could unmount the credential masks, "
-                "so this spawn is refused. To run anyway WITHOUT OS-level "
-                "isolation, set agent.sandbox='off' or "
-                "agent.sandbox_allow_unsandboxed_exec=true in "
-                "~/.kiro/crew/config.json."
-            )
-        if _libc.prctl:
-            # Linux CAP_LAST_CAP is currently 41 (kernel 6.x); iterate 0..63 for
-            # forward-compatibility — dropping a non-existent cap just returns -1.
-            for _cap in range(64):
-                _libc.prctl(_PR_CAPBSET_DROP, _cap, 0, 0, 0)
-            # NO_NEW_PRIVS: prevents regaining caps via exec of setuid/setcap bins.
-            # Load-bearing beyond hardening: the mount-source sweep's directory
-            # gate (_cleanup_stale_sandbox_mount_sources) reclaims on the claim
-            # that every launcher descendant still stats as this uid (or the
-            # overflow uid from a nested userns), so a change here that lets a
-            # descendant change uid would turn that gate fail-open.
-            _ret = _libc.prctl(_PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)
-            if _ret != 0:
-                sys.exit("sandbox: BLOCKED — failed to set NO_NEW_PRIVS (prctl returned %d)" % _ret)
-
-        # ── Step 6: Install seccomp-BPF filter ──
-        # Deny mount/umount2/unshare/setns/pivot_root to prevent the sandboxed
-        # process from undoing the credential bind-mounts (namespace escape).
-        #
-        # NOTE: link/linkat were previously denied here to block hardlinking a
-        # credential inode out past its bind-mount (pentest finding #9). That
-        # deny has been removed; the vector is covered without a blanket syscall
-        # ban (which broke npm cacache / pnpm / ln for no gain). Masking is
-        # per-level: strict bind-masks its dir/file list PLUS ~/.ssh; cc masks
-        # the same MINUS ~/.ssh; standard masks only _STANDARD_DIRS (.gnupg,
-        # .gpg, .config/gcloud, .azure, .docker, crew-auth-staging). For a file
-        # that IS masked the credential inode has no reachable path, so no link
-        # source exists. For a file left UNMASKED at a given level (~/.ssh under
-        # cc; .aws/.ssh/_CC_FILES under standard) there is no privilege delta:
-        # it is already directly readable, so the command gate
-        # (security.is_sensitive_bash_command) is the control for BOTH reading
-        # and hardlinking it — the gate now resolves an agent-issued ln/link/cp
-        # source through is_sensitive_path(), refusing a link to a credential
-        # source at the same fidelity as a read (closing the "flatten onto a
-        # benign alias" bypass, GPT review PR #1339). npm's own fs.link() is a
-        # syscall and never transits that gate. seccomp cannot path-scope link
-        # (BPF cannot dereference the pathname pointer), so a syscall-layer form
-        # could only be all-or-nothing. NOTE: the Step-7 pre-exec nlink scan is
-        # NOT relied on here — it stats paths AFTER the masks, so it sees mask
-        # inodes, not real credential inodes. For AppSec (pre-existing / out of
-        # scope): that Step-7 gap; a hardlink alias is durable and symlink-
-        # resolution-invisible; and `mv` is not yet gate-covered. AppSec
-        # re-review required — this edits a pentest remediation.
-        #
-        # Additionally deny kill(-1, sig) — the signal BROADCAST that reaches
-        # every same-uid process on the host (gateway, other sessions). This
-        # is the accident-containment redo of the reverted PID-namespace
-        # isolation (24c320f6): a static arg filter blocks the hand-slip /
-        # runaway-script broadcast without changing the subtree's view of
-        # pids, so session identity, claim-push, and systemd stay intact.
-        # Only ``kill`` needs arg inspection: tkill/tgkill/pidfd_send_signal
-        # are inherently targeted (no broadcast semantics). pid==0 and
-        # negative process-group targets stay ALLOWED on purpose — the spawn
-        # already setsid()s, so every reachable process group is inside the
-        # sandbox session, and denying killpg breaks legitimate tooling
-        # (timeout(1), shell job control, cleanup traps).
-        if _libc.prctl:
-            _PR_SET_SECCOMP = 22
-            _SECCOMP_MODE_FILTER = 2
-            _SECCOMP_RET_ALLOW = 0x7FFF0000
-            _SECCOMP_RET_ERRNO = 0x00050000
-            _EPERM = 1
-            _BPF_LD = 0x00
-            _BPF_W = 0x00
-            _BPF_ABS = 0x20
-            _BPF_JMP = 0x05
-            _BPF_JEQ = 0x10
-            _BPF_K = 0x00
-            _BPF_RET = 0x06
-            # Syscall numbers (x86_64): mount=165, umount2=166, unshare=272,
-            # setns=308, pivot_root=155, kill=62
-            # aarch64: mount=40, umount2=39, unshare=97, setns=268,
-            # pivot_root=41, kill=129
-            # (_plat is imported in the preamble, pre-isolation -- importing it
-            # HERE was the reported #8151 crash: the post-unshare first-time
-            # stdlib read was denied and the whole launcher died.)
-            _machine = _plat.machine()
-            if _machine == "x86_64":
-                _DENY_SYSCALLS = (165, 166, 272, 308, 155)
-                _KILL_NR = 62
-            elif _machine == "aarch64":
-                _DENY_SYSCALLS = (40, 39, 97, 268, 41)
-                _KILL_NR = 129
-            else:
-                # No syscall table for this arch, so the filter that keeps the
-                # child from undoing the credential masks cannot be built.
-                # Refuse rather than skip: with unshare(2) still permitted the
-                # child can enter a nested user namespace, hold CAP_SYS_ADMIN
-                # over a copy of this mount tree, and umount every mask — the
-                # exact escape Step 6 exists to deny. _inside_kirocrew_sandbox()
-                # and docs/system-specs/modules/security.md both state that a
-                # sandboxed tree is confined "by the outer namespace + seccomp",
-                # so a silent skip makes that claim false while every caller
-                # still reads the spawn as isolated. sandbox_level="off" (or
-                # agent.sandbox_allow_unsandboxed_exec) is the explicit opt-out
-                # for a host that cannot be confined; a silent one is not.
-                sys.exit(
-                    "sandbox: BLOCKED — no seccomp syscall table for machine "
-                    "%r, so the namespace-escape filter (mount/umount2/unshare/"
-                    "setns/pivot_root) cannot be installed. The agent would run "
-                    "able to unshare a new namespace and unmount the credential "
-                    "masks, so this spawn is refused. Supported: x86_64, "
-                    "aarch64. To run anyway WITHOUT OS-level isolation, set "
-                    "agent.sandbox='off' or "
-                    "agent.sandbox_allow_unsandboxed_exec=true in "
-                    "~/.kiro/crew/config.json." % _machine
-                )
-
-            if _DENY_SYSCALLS:
-                # Architecture constants for seccomp arch validation
-                _AUDIT_ARCH_X86_64 = 0xC000003E
-                _AUDIT_ARCH_AARCH64 = 0xC00000B7
-                _SECCOMP_RET_KILL = 0x00000000
-                _expected_arch = _AUDIT_ARCH_X86_64 if _machine == "x86_64" else _AUDIT_ARCH_AARCH64
-
-                # BPF program layout (indices relative to start):
-                #   0: LD arch
-                #   1: JEQ expected_arch ? skip 1 : fall through
-                #   2: RET KILL                (unexpected arch)
-                #   3: LD syscall nr
-                #   4..4+n-1: JEQ deny_i -> DENY
-                #   k   = 4+n: JEQ kill_nr ? fall into arg check : jump ALLOW
-                #   k+1: LD args[0] low 32 bits    (seccomp_data offset 16)
-                #   k+2: JEQ 0xFFFFFFFF ? jump DENY : fall through
-                #   ALLOW = k+3: RET ALLOW
-                #   DENY  = k+4: RET ERRNO|EPERM
-                #
-                # Only the LOW 32 bits of args[0] are inspected. pid_t is a
-                # 32-bit int: the kernel truncates the register to 32 bits, so
-                # low==0xFFFFFFFF is exactly "pid == -1" regardless of what the
-                # upper half holds. The upper half MUST NOT be matched — the
-                # x86-64 ABI leaves it undefined for int arguments, and glibc's
-                # ``movl`` zero-extends, so kill(-1) typically arrives as
-                # 0x00000000_FFFFFFFF (a high==0xFFFFFFFF check silently never
-                # fires, which is a filter bypass, not a compat issue).
-                _insns = []
-                # Load arch: BPF_LD | BPF_W | BPF_ABS, offset=4 (seccomp_data.arch)
-                _insns.append(_struct.pack("<HBBI", _BPF_LD | _BPF_W | _BPF_ABS, 0, 0, 4))
-                # If arch == expected, skip next insn (jt=1); else fall through to kill
-                _insns.append(_struct.pack("<HBBI", _BPF_JMP | _BPF_JEQ | _BPF_K, 1, 0, _expected_arch))
-                # Kill on unexpected arch (blocks i386 int 0x80 bypass)
-                _insns.append(_struct.pack("<HBBI", _BPF_RET | _BPF_K, 0, 0, _SECCOMP_RET_KILL))
-                # Load syscall number: BPF_LD | BPF_W | BPF_ABS, offset=0
-                _insns.append(_struct.pack("<HBBI", _BPF_LD | _BPF_W | _BPF_ABS, 0, 0, 0))
-                # For each denied syscall: JEQ -> DENY (at index k+4)
-                _n_deny = len(_DENY_SYSCALLS)
-                for _i, _nr in enumerate(_DENY_SYSCALLS):
-                    _jt = (_n_deny - _i - 1) + 4  # jumps to the DENY RET at k+4
-                    _insns.append(_struct.pack("<HBBI",
-                        _BPF_JMP | _BPF_JEQ | _BPF_K, _jt, 0, _nr))
-                # k: nr == kill ? fall into arg check : jump to ALLOW (k+3)
-                _insns.append(_struct.pack("<HBBI",
-                    _BPF_JMP | _BPF_JEQ | _BPF_K, 0, 2, _KILL_NR))
-                # k+1: load args[0] low word (offset 16, little-endian layout)
-                _insns.append(_struct.pack("<HBBI", _BPF_LD | _BPF_W | _BPF_ABS, 0, 0, 16))
-                # k+2: low == 0xFFFFFFFF (pid -1) ? DENY (skip 1) : fall to ALLOW
-                _insns.append(_struct.pack("<HBBI",
-                    _BPF_JMP | _BPF_JEQ | _BPF_K, 1, 0, 0xFFFFFFFF))
-                # ALLOW: return SECCOMP_RET_ALLOW
-                _insns.append(_struct.pack("<HBBI", _BPF_RET | _BPF_K, 0, 0, _SECCOMP_RET_ALLOW))
-                # DENY: return SECCOMP_RET_ERRNO | EPERM
-                _insns.append(_struct.pack("<HBBI", _BPF_RET | _BPF_K, 0, 0, _SECCOMP_RET_ERRNO | _EPERM))
-
-                _prog_bytes = b"".join(_insns)
-                _n_insns = len(_insns)
-
-                # struct sock_fprog {{ unsigned short len; struct sock_filter *filter; }}
-                class _SockFprog(ctypes.Structure):
-                    _fields_ = [("len", ctypes.c_ushort),
-                                ("filter", ctypes.c_char_p)]
-
-                _fprog = _SockFprog()
-                _fprog.len = _n_insns
-                _fprog.filter = _prog_bytes
-                _ret = _libc.prctl(_PR_SET_SECCOMP, _SECCOMP_MODE_FILTER,
-                                   ctypes.addressof(_fprog), 0, 0)
-                if _ret != 0:
-                    sys.exit("sandbox: BLOCKED — failed to install seccomp-BPF filter (prctl returned %d)" % _ret)
-
-        # ── Step 7: Pre-exec hardlink scan ──
-        # Scan the agent workspace + /tmp for hardlinks (nlink > 1) whose
-        # inode matches a protected credential file. If found, refuse to exec.
-        # Only credential inodes with st_nlink > 1 enter the match set: an
-        # inode with a single link has no alias anywhere on the filesystem, so
-        # when every credential has nlink == 1 the walk is skipped entirely
-        # and the common healthy-host spawn pays nothing. When a walk does
-        # run, each root gets its OWN scan budget so a large workspace cannot
-        # starve the /tmp scan (the world-writable root this check exists
-        # for). On budget exhaustion the scan deliberately degrades OPEN with
-        # a stderr warning rather than failing closed: /tmp on a busy host can
-        # exceed any fixed budget from ordinary telemetry/cache churn, and
-        # exiting here would break every sandbox spawn on such hosts. The cost,
-        # plainly: an alias past the budget -- or past the quieter depth limit
-        # below -- is never stat'd, so a second path to a credential inode goes
-        # unchecked even though every mount held.
-        #
-        # REGULAR FILES ONLY, and that guard is what keeps the walk rare. Linux
-        # does not allow a hardlink to a directory, so nlink > 1 says nothing
-        # about a directory — and every directory has nlink >= 2 for `.` and
-        # `..`. `SENSITIVE_FILES` deliberately carries every hidden path of BOTH
-        # kinds (the hiding loops classify per entry, see `_build_launcher_script`),
-        # so without this check two ordinary directories — `~/.kiro/crew-auth-staging`
-        # and `~/.gnupg` on the measuring host — seeded the match set on every
-        # spawn. The 100k-entry walk of $CWD and /tmp then ran every time, costing
-        # 1.5s per sandboxed spawn and emitting the truncation warning constantly,
-        # while no credential had an alias at all.
-        _protected_inodes = set()
-        for _pd in SENSITIVE_DIRS:
-            if os.path.isdir(_pd):
-                for _root, _dirs_scan, _files_scan in os.walk(_pd):
-                    for _fname in _files_scan:
-                        try:
-                            _st = os.stat(os.path.join(_root, _fname))
-                            if stat.S_ISREG(_st.st_mode) and _st.st_nlink > 1:
-                                _protected_inodes.add((_st.st_dev, _st.st_ino))
-                        except OSError:
-                            pass
-                    break  # depth=1 for credential dirs
-        for _pf in SENSITIVE_FILES:
-            try:
-                _st = os.stat(_pf)
-                if stat.S_ISREG(_st.st_mode) and _st.st_nlink > 1:
-                    _protected_inodes.add((_st.st_dev, _st.st_ino))
-            except OSError:
-                pass
-
-        if _protected_inodes:
-            _MAX_SCAN_PER_ROOT = 100000
-            _dangerous_links = []
-            _truncated_roots = []
-            _cwd = os.getcwd()
-            for _scan_root in (_cwd, "/tmp"):
-                if not os.path.isdir(_scan_root):
-                    continue
-                _root_scanned = 0
-                _root_truncated = False
-                for _root2, _dirs2, _files2 in os.walk(_scan_root):
-                    # Depth limit: max 5 levels
-                    _depth = _root2[len(_scan_root):].count(os.sep)
-                    if _depth > 5:
-                        _dirs2.clear()
-                        continue
-                    for _fn2 in _files2:
-                        if _root_scanned >= _MAX_SCAN_PER_ROOT:
-                            _root_truncated = True
-                            break
-                        _root_scanned += 1
-                        _fp2 = os.path.join(_root2, _fn2)
-                        try:
-                            _st2 = os.lstat(_fp2)
-                            if _st2.st_nlink > 1:
-                                if (_st2.st_dev, _st2.st_ino) in _protected_inodes:
-                                    _dangerous_links.append(_fp2)
-                        except OSError:
-                            pass
-                    if _root_truncated:
-                        break
-                if _root_truncated:
-                    _truncated_roots.append((_scan_root, _root_scanned))
-            for _t_root, _t_count in _truncated_roots:
-                print(
-                    "sandbox: WARNING — pre-exec hardlink scan truncated at "
-                    "%d files in %s; scan incomplete (control degrades open)"
-                    % (_t_count, _t_root),
-                    file=sys.stderr,
-                )
-            if _dangerous_links:
-                sys.exit(
-                    f"sandbox: BLOCKED — found hardlink(s) to protected credential "
-                    f"inodes: {{_dangerous_links[:5]}}. Remove them before running."
-                )
-
-        os.execvp(argv[0], argv)
-
-if __name__ == "__main__":
-    main()
-'''
+    return os.path.normpath(os.path.abspath(str(config_dir() / "run")))
 
 
 def _ensure_run_dir() -> str:
     """Create ``<config_dir>/run/`` with mode 0o700, falling back to tmpdir on failure."""
-    run_dir = str(config_dir() / "run")
+    run_dir = namespace_launcher_script_dir()
     try:
         os.makedirs(run_dir, mode=0o700, exist_ok=True)
         # exist_ok does not re-apply mode on existing dirs — enforce explicitly.
@@ -3736,6 +7378,10 @@ def _ensure_run_dir() -> str:
         # (needs the execute/traverse bit) and would loosen, not tighten, access.
         os.chmod(run_dir, 0o700)  # nosemgrep: python.lang.security.audit.insecure-file-permissions.insecure-file-permissions  # noqa: E501  # fmt: skip
     except OSError:
+        # ``gettempdir()`` probes candidate directories for writability, so it is called
+        # HERE and not beside the preferred spelling: on a read-only-root container with
+        # no writable tmp it raises, and an eager call would have turned every namespace
+        # and seatbelt spawn into a failure instead of a degraded one.
         logger.warning("Cannot create %s; falling back to system tmpdir", run_dir)
         run_dir = tempfile.gettempdir()
     return run_dir
@@ -3775,9 +7421,15 @@ def namespace_argv(
     sandbox_level: str = "strict",
     *,
     strip_python_env: bool = False,
+    forward_ssh_auth_sock: bool = False,
     extra_hidden_dirs: tuple[str, ...] = (),
+    extra_hidden_dir_ids: tuple[tuple[str, int, int], ...] = (),
+    extra_alias_credential_ids: tuple[tuple[int, int], ...] = (),
     extra_visible_dirs: tuple[str, ...] = (),
+    extra_private_dirs: tuple[str, ...] = (),
+    extra_private_dir_ids: tuple[tuple[str, int, int], ...] = (),
     extra_writable_dirs: tuple[str, ...] = (),
+    extra_expose_files: tuple[str, ...] = (),
 ) -> list[str]:
     """Wrap *argv* via the Python namespace launcher.
 
@@ -3798,18 +7450,145 @@ def namespace_argv(
     # default install. Runs before the script is built so the paths exist by the time
     # the child mounts, and raises ``SandboxCeilingUnsealable`` rather than launching
     # with a keystone the seal could not cover.
-    _materialize_sealable_ceilings()
+    _required_targets: list[str] = []
+    _materialize_sealable_ceilings(_required_targets)
+    # The mask loop has the same guard (``isdir``), so the on-demand hidden
+    # directories get the same treatment for the same reason.
+    _materialize_maskable_dirs(_required_targets)
+    # And the ``SENSITIVE_FILES`` loop is guarded on ``isfile``, so md-notebook's state
+    # leaves — creatable on a sandboxed host now that the backend carve-out exists —
+    # need a mount target too.
+    _materialize_md_notebook_mask_targets(_required_targets)
+    # The live-target pointer needs one for a stronger reason than a leak: it names the
+    # checkout the gateway execs into, and there is no carve-out for it at all — it is
+    # creatable from any sandbox simply because the data-home ROOT is writable there and
+    # an absent name has no mask. Publishing the stub first makes the mask non-vacuous.
+    _materialize_live_target_mask_target(_required_targets)
+    # CLEANUP BEFORE THE REFUSAL, and this order is a contract rather than a preference.
+    # Both sweeps and the reconciliation remove names that are themselves hard links to a
+    # masked credential leaf -- a pre-upgrade orphan is a link to the signing key by
+    # construction, and so is a staging name the publisher kept when its directory sync
+    # failed. The refusal below reads ``st_nlink``, so running it first would refuse on a
+    # link count that the very next statement was about to fix, and refuse again on every
+    # later spawn: the cleanup written for that state would sit permanently behind the gate
+    # it is supposed to open. Neither sweep needs the refusal to have run, because each
+    # descends by pinned descriptor and skips a root it cannot open.
+    _sweep_legacy_md_notebook_temps()
+    _sweep_legacy_auth_store_temps()
+    _reconcile_auth_store_staging_links()
+    # LAST of the pre-spawn checks, and last on purpose: every masked leaf's NAME must be
+    # the name the mask binds, and the leaves above have already answered for themselves
+    # with sentences tailored to what they hold. This pass covers the rest -- the masked
+    # leaves nothing materialises, whose alias went unreported entirely -- and creates
+    # nothing, so an unused store stays absent.
+    # The identities the passes above SAW, carried into the launcher so the child can
+    # require a match before it follows a link at one of these names. The alias pass
+    # records them from the ``lstat`` it already performs, so the common case costs no
+    # syscall; the established targets are added here because a materialiser that just
+    # created one has not classified it, and they are warm. NOT every masked target: the
+    # launcher masks hundreds, and statting them all here would put the loop-blocking
+    # probe that ``test_the_builder_does_not_stat_the_hidden_paths`` documents back on
+    # the gateway's single loop. A name with no entry keeps its previous behaviour, and
+    # the module spec records that boundary.
+    #
+    # The same pass ALSO returns the path-only aliases this spawn must hide (the hard-link
+    # alias defence): one call fills ``_mask_occupants`` for the launcher's
+    # no-follow occupant check AND returns ``alias_masks`` for ``fail_closed_file_masks``.
+    _mask_occupants: dict[str, tuple[int, ...]] = {}
+    alias_masks = _refuse_aliased_masked_leaves(_mask_occupants)
+    for _target in dict.fromkeys(_required_targets):
+        if _target in _mask_occupants:
+            continue
+        try:
+            _info = os.lstat(_target)
+        except OSError as exc:
+            # FAIL CLOSED. ``_required_targets`` are names a pre-spawn materialiser just
+            # established as PRESENT; an ``lstat`` that now fails means the name changed
+            # between then and here -- renamed aside, or its permissions revoked -- which
+            # is the very substitution window this identity is carried to catch. Skipping
+            # it would carry NO identity, so ``_carried_occupant`` returns ``None`` in the
+            # launcher, the mismatch refusal never fires, and a decoy left at the name is
+            # sealed while the original stays writable at whatever name it moved to. Refuse
+            # the spawn instead, the same way an unsealable ceiling refuses.
+            raise SandboxCeilingUnsealable(
+                f"cannot re-stat the established mask target {safe_terminal_line(_target)} "
+                f"to carry its identity into the launcher: {safe_terminal_line(str(exc))}. "
+                "A pre-spawn pass saw it present, so a stat that now fails means the name "
+                "changed under this launch; refusing rather than masking whatever took its "
+                "place."
+            ) from exc
+        _mask_occupants[_target] = (
+            _info.st_dev,
+            _info.st_ino,
+            int(stat.S_ISLNK(_info.st_mode)),
+            *_referent_identity(_target, _info),
+        )
+    # ``~/.ssh`` is not a crew leaf, so no pass above sees it, and the strict tier masks
+    # it. One named ``lstat`` here is what lets the launcher require a match instead of
+    # taking its own first look after the fork -- a look that arrives on the far side of
+    # script build, ``mkstemp`` and ``unshare``, which is the window being closed.
+    if sandbox_level == "strict":
+        _ssh_target = os.path.join(os.path.expanduser("~"), ".ssh")
+        try:
+            _ssh_info = os.lstat(_ssh_target)
+        except OSError:
+            pass
+        else:
+            _mask_occupants[_ssh_target] = (
+                _ssh_info.st_dev,
+                _ssh_info.st_ino,
+                int(stat.S_ISLNK(_ssh_info.st_mode)),
+                *_referent_identity(_ssh_target, _ssh_info),
+            )
 
-    script = _build_launcher_script(
+    # Carry the alias-mask identities into the occupant map too. The alias pass
+    # already discovered each hard-linked credential alias and its device/inode
+    # (``_AliasMask``); handing those paths to the launcher only via
+    # ``fail_closed_file_masks``/``extra_hidden_dirs`` leaves ``_carried_occupant``
+    # with nothing to enforce for them, so a rename BETWEEN the alias check and the
+    # bind would let the pin mask a decoy left at the old name while the credential
+    # stays readable under its moved name. An alias is a regular-file hard link, so
+    # its recorded link flag is not-a-link (0), what the name reaches is a regular
+    # file (2), and the referent is the entry itself; the pin then refuses if the object at the name is not the one the
+    # pass saw, the same fail-closed rule every other masked target already gets.
+    for _am in alias_masks:
+        _mask_occupants.setdefault(_am.path, (_am.dev, _am.ino, 0, 2, _am.dev, _am.ino))
+
+    script = sandbox_launcher._build_launcher_script(
         sandbox_level,
         strip_python_env=strip_python_env,
-        extra_hidden_dirs=extra_hidden_dirs,
+        forward_ssh_auth_sock=forward_ssh_auth_sock,
+        extra_hidden_dirs=extra_hidden_dirs + tuple(m.path for m in alias_masks),
+        extra_hidden_dir_ids=extra_hidden_dir_ids,
+        extra_alias_credential_ids=extra_alias_credential_ids,
+        # The same paths again WITH the inode each one was at discovery, as the set whose
+        # absence or changed identity at mask time is a fault. Discovery and the bind are two
+        # separate acts: the mask loop's ordinary policy is to skip a target that is absent,
+        # which for a credential alias would mean a rename between the two silently leaves the
+        # bytes readable under the new name -- and a decoy left at the old name is one ``ln``
+        # from two links, so only the identity tells it apart.
+        fail_closed_file_masks=tuple((m.path, m.dev, m.ino) for m in alias_masks),
         extra_visible_dirs=extra_visible_dirs,
+        extra_private_dirs=extra_private_dirs,
+        extra_private_dir_ids=extra_private_dir_ids,
         extra_writable_dirs=extra_writable_dirs,
+        extra_expose_files=extra_expose_files,
+        required_mask_targets=tuple(_required_targets),
+        mask_occupants=_mask_occupants,
+        # Decided here, beside the passes that already stat the crew roots, so the
+        # builder stays free of filesystem calls and still hands the launcher one
+        # name per crew directory on a symlinked home.
+        crew_home_aliases=_crew_home_alias_roots(),
     )
     run_dir = _ensure_run_dir()
+    # Prefix and suffix from the module constants, not a second spelling of them: the
+    # run-dir sweep reclaims this family by prefix and ``session_pid``'s managed-agent
+    # gate RECOGNISES the launcher by prefix and suffix, so a literal here that drifted
+    # from either would leak the tempfile and cost every sandboxed root its reclaim.
     fd, path = tempfile.mkstemp(
-        suffix=".py", prefix=f"kirocrew_sandbox_{os.getpid()}_", dir=run_dir
+        suffix=_LAUNCHER_SCRIPT_SUFFIX,
+        prefix=f"{_SANDBOX_ARTIFACT_PREFIX}{os.getpid()}_",
+        dir=run_dir,
     )
     os.write(fd, script.encode())
     os.close(fd)
@@ -3834,7 +7613,7 @@ def _writable_carveout_spellings(
     literal_guards: list[str],
     carveable_parents: list[str],
 ) -> list[str]:
-    """Validate write carve-outs against the sandbox's own seals (#8653).
+    """Validate write carve-outs against the sandbox's own seals.
 
     ``extra_writable_dirs`` exists for exactly one purpose: a caller that hands
     a child its private scratch directory INSIDE the sealed runtime parent
@@ -3922,194 +7701,6 @@ def _writable_carveout_spellings(
 
 # ── Backend: macOS sandbox-exec ──
 
-_SEATBELT_PROFILE = """\
-(version 1)
-(allow default)
-{deny_rules}
-"""
-
-
-def _build_seatbelt_profile(
-    sandbox_level: str = "strict",
-    *,
-    extra_hidden_dirs: tuple[str, ...] = (),
-    extra_visible_dirs: tuple[str, ...] = (),
-    extra_writable_dirs: tuple[str, ...] = (),
-) -> str:
-    """Build a Seatbelt .sb profile denying reads of sensitive dirs."""
-    home = str(Path.home())
-    # Source the sensitive-dir lists from the active PlatformContext (Default
-    # adapter == today's module globals; internal companion adds .midway/.ada).
-    if sandbox_level == "standard":
-        dirs = _STANDARD_DIRS
-    elif sandbox_level == "cc":
-        # On macOS, don't hide .aws — credential_process and SSO token
-        # caches live under .aws/ and Seatbelt can't do partial exposure
-        # as cleanly as Linux bind mounts. Deny patterns still block LLM
-        # tool reads of credential files. The .aws-exclusion is applied to the
-        # context-sourced list so a companion's extra cc dirs are still hidden.
-        dirs = [d for d in _sandbox_policy().cc_dirs() if d != ".aws"]
-    else:
-        dirs = _sandbox_policy().strict_dirs()
-    files = _CC_FILES if sandbox_level in ("cc", "strict") else []
-    expose_files = _CC_EXPOSE_FILES if sandbox_level == "cc" else []
-    expose_abs = {os.path.join(home, f) for f in expose_files}
-    crew_hidden = _crew_hidden_sandbox_targets()
-    rules: list[str] = []
-    # Every masked target below doubles as a guard for the write carve-outs
-    # appended at the end: Seatbelt is last-match-wins, so an allow emitted
-    # after these denies re-opens whatever it covers, and the carve-out
-    # validator must therefore see the same target list the rules were built
-    # from (conservatively including entries `extra_visible_dirs` re-exposed).
-    masked_targets = (
-        [os.path.join(home, d) for d in dirs]
-        + _relocated_policy_cache_dirs()
-        + _relocated_crew_targets(_CREW_HIDDEN_LEAVES)
-        + list(_voice_runtime_sandbox_paths())
-    )
-    for target in masked_targets:
-        if _hidden_path_contains_visible_path(
-            target, extra_visible_dirs
-        ) and not _is_voice_runtime_dir(target):
-            # An exposed governance cache stays READ-only: keep the write and hardlink
-            # denies and drop only the read deny. `extra_visible_dirs` otherwise cancels
-            # the target's whole rule set, which would hand the one caller that needs to
-            # read the ceiling (`apps/backend.py` in cache-only mode) the ability to
-            # rewrite it — and the metadata records the source the next boot trusts, so
-            # that is the dangerous direction. Mirrors READONLY_DIRS on Linux.
-            if _is_policy_cache_dir(target):
-                sealed = target.replace('"', '\\"')
-                rules.append(f'(deny file-write* (subpath "{sealed}"))')
-                rules.append(f'(deny file-link (subpath "{sealed}"))')
-            continue
-        escaped = target.replace('"', '\\"')
-        # Check if any exposed files live under this dir
-        exposed_in_dir = [f for f in expose_abs if f.startswith(target + "/")]
-        if exposed_in_dir:
-            exceptions = " ".join(
-                f'(require-not (literal "{f.replace(chr(34), chr(92) + chr(34))}"))'
-                for f in exposed_in_dir
-            )
-            rules.append(f'(deny file-read* (require-all (subpath "{escaped}") {exceptions}))')
-        else:
-            rules.append(f'(deny file-read* (subpath "{escaped}"))')
-        if _is_policy_cache_dir(target) or _is_voice_runtime_dir(target) or target in crew_hidden:
-            # Linux bind-mounts these roots away, which blocks both directions.
-            # macOS needs an explicit write deny as well as the read rule above:
-            # governance metadata is a trust root, a writable voice-runtime image would
-            # race the gateway's authenticated decoder spawn, and a crew-home secret that
-            # is read-denied but writable can still be OVERWRITTEN -- forging
-            # ``token_signing.key`` needs no read at all. Scoped to those three sets on
-            # purpose: widening it to every hidden entry would also cover .aws, which a
-            # tool rewrites legitimately when it refreshes a cached token.
-            rules.append(f'(deny file-write* (subpath "{escaped}"))')
-            if target in crew_hidden:
-                # A leaf may be a plain file, which no subpath rule addresses.
-                rules.append(f'(deny file-write* (literal "{escaped}"))')
-        # Deny creating a HARDLINK whose target is under this dir.
-        # Seatbelt's file-read* deny is path-based, so a hardlink at a
-        # non-denied path (e.g. /tmp) reads the same inode past the deny rule.
-        # ``file-link`` fires on the link TARGET, so this stops the sandboxed
-        # agent from minting such a hardlink in the first place.  Blanket (no
-        # exposed-file exception): the agent never needs to hardlink a
-        # credential-dir file, and blocking it is harmless.
-        rules.append(f'(deny file-link (subpath "{escaped}"))')
-
-    # The voice image lives below ``run``. Keep that parent readable (the
-    # sandbox launcher itself is stored there), but deny every write through
-    # both lexical and canonical spellings. Literal ancestor rules prevent a
-    # same-UID agent from renaming a parent around the path-based subtree deny.
-    runtime_parents = list(_voice_runtime_parent_paths())
-    for target in runtime_parents:
-        escaped = target.replace('"', '\\"')
-        rules.append(f'(deny file-write* (literal "{escaped}"))')
-        rules.append(f'(deny file-write* (subpath "{escaped}"))')
-        rules.append(f'(deny file-link (subpath "{escaped}"))')
-    ancestor_guards = list(_voice_runtime_ancestor_guards())
-    for target in ancestor_guards:
-        escaped = target.replace('"', '\\"')
-        rules.append(f'(deny file-write* (literal "{escaped}"))')
-    # The crew data home's ceilings: readable (in-sandbox code resolves them) but never
-    # writable, so a sandboxed process cannot hand itself a ceiling. Mirrors
-    # READONLY_DIRS on Linux. Both spellings, because a ceiling may be a file
-    # (``literal``) or a directory (``subpath``), and ``file-link`` stops the agent
-    # minting a writable alias to the same inode.
-    readonly_targets = [
-        os.path.join(home, rel) for rel in _CREW_READONLY_TARGETS
-    ] + _relocated_crew_targets(_CREW_READONLY_LEAVES)
-    for target in readonly_targets:
-        escaped = target.replace('"', '\\"')
-        rules.append(f'(deny file-write* (literal "{escaped}"))')
-        rules.append(f'(deny file-write* (subpath "{escaped}"))')
-        rules.append(f'(deny file-link (subpath "{escaped}"))')
-    for f in files:
-        target = os.path.join(home, f)
-        escaped = target.replace('"', '\\"')
-        rules.append(f'(deny file-read* (literal "{escaped}"))')
-        # Also deny hardlinking the protected file (see above).
-        rules.append(f'(deny file-link (literal "{escaped}"))')
-    extra_hidden_targets = list(dict.fromkeys(os.path.abspath(path) for path in extra_hidden_dirs))
-    for target in extra_hidden_targets:
-        if _hidden_path_contains_visible_path(target, extra_visible_dirs):
-            continue
-        escaped = target.replace('"', '\\"')
-        rules.append(f'(deny file-read* (subpath "{escaped}"))')
-        rules.append(f'(deny file-write* (subpath "{escaped}"))')
-        rules.append(f'(deny file-link (subpath "{escaped}"))')
-        # BOTH shapes, because most of this list is plain FILES, not directories:
-        # sandbox_credential_targets() yields .codex/auth.json,
-        # .claude/.credentials.json, .netrc, .git-credentials, .npmrc, .pypirc,
-        # .docker/config.json, .kube/config, sel_hmac.key, token_signing.key.
-        # Whether a subpath rule alone covers a plain file is asserted in three
-        # comments in this tree and CONTRADICTED by the crew_hidden branch above
-        # ("A leaf may be a plain file, which no subpath rule addresses"), and
-        # nothing tests it -- no test in this repo executes sandbox-exec, so the
-        # claim has never been checked against the kernel. This mask is the ONLY
-        # compensating control for a harness whose passive reads never reach the
-        # gate, so it must not rest on an unverified reading of Seatbelt: the
-        # literal is redundant if subpath does cover files, and load-bearing if it
-        # does not.
-        rules.append(f'(deny file-read* (literal "{escaped}"))')
-        rules.append(f'(deny file-write* (literal "{escaped}"))')
-        rules.append(f'(deny file-link (literal "{escaped}"))')
-
-    # .ssh: deny all access except reading known_hosts (strict only)
-    ssh_guards: list[str] = []
-    if sandbox_level == "strict":
-        ssh_dir = os.path.join(home, ".ssh")
-        ssh_guards.append(ssh_dir)
-        ssh_escaped = ssh_dir.replace('"', '\\"')
-        ssh_kh = os.path.join(ssh_dir, "known_hosts")
-        ssh_kh_escaped = ssh_kh.replace('"', '\\"')
-        rules.append(
-            f'(deny file-read* (require-all (subpath "{ssh_escaped}")'
-            f' (require-not (literal "{ssh_kh_escaped}"))))'
-        )
-        rules.append(f'(deny file-write* (subpath "{ssh_escaped}"))')
-        # Block hardlinking any .ssh file (private keys) out of the
-        # denied subtree.  Blanket over the whole subpath — no known_hosts
-        # exception, since a hardlink to known_hosts has no legitimate use.
-        rules.append(f'(deny file-link (subpath "{ssh_escaped}"))')
-
-    # Write carve-outs (#8653), validated against every seal above and emitted
-    # LAST: Seatbelt is last-match-wins, so this allow overrides only the
-    # runtime-parent write seal for exactly the approved directory (both
-    # spellings — Seatbelt rules are path-based). The subtree's ``file-link``
-    # deny deliberately stays in force: a probe scratch dir never needs to mint
-    # hardlinks, and the deny is what stops aliasing a sealed inode into the
-    # writable window.
-    for spelling in _writable_carveout_spellings(
-        extra_writable_dirs,
-        subtree_guards=masked_targets + readonly_targets + extra_hidden_targets + ssh_guards,
-        literal_guards=ancestor_guards + [os.path.join(home, f) for f in files],
-        carveable_parents=runtime_parents,
-    ):
-        escaped = spelling.replace('"', '\\"')
-        rules.append(f'(allow file-write* (subpath "{escaped}"))')
-
-    return _SEATBELT_PROFILE.format(deny_rules="\n".join(rules))
-
-
 # kiro-cli >= 2.13 ships its own internal agent sandbox, toggled by the
 # "sandbox" key in this settings file. On macOS its in-process seatbelt init
 # cannot nest inside KiroCrew's sandbox-exec wrap — the kernel returns EPERM
@@ -4189,6 +7780,270 @@ def kiro_internal_sandbox_enabled() -> bool:
         return False
 
 
+def kiro_internal_sandbox_switch() -> tuple[str, str]:
+    """The settings file and key that toggle kiro-cli's internal sandbox.
+
+    Returns ``(path, key)`` so a diagnostic can name the exact switch an
+    operator has to edit — ``kiro_internal_sandbox_enabled`` answers *whether*
+    delegation is on but not *where* it was decided, and a caller that spelled
+    either half itself would drift silently the day kiro-cli renames one.
+
+    Reads the module globals at call time, so a test that repoints
+    :data:`_KIRO_INTERNAL_SETTINGS_PATH` gets its own path back here too.
+    """
+    return _KIRO_INTERNAL_SETTINGS_PATH, _KIRO_INTERNAL_SANDBOX_KEY
+
+
+#: The two isolation layers an agent spawn can be wrapped by, as the names a
+#: diagnostic prints. Constants rather than literals at each raise site: the
+#: layer travels into an exception type, a log line and an operator-facing
+#: remedy, and three spellings of the same layer is how a remedy ends up naming
+#: the wrong switch.
+SANDBOX_LAYER_CREW = "kirocrew"
+SANDBOX_LAYER_HARNESS = "harness-internal"
+
+
+def wrapped_by_crew_sandbox(argv: "Sequence[str]") -> bool:
+    """Whether *argv* -- as returned by :func:`wrap_argv` -- runs the child
+    through Kiro Crew's OWN sandbox layer.
+
+    Read off the wrapped argv rather than re-deriving the decision from mode +
+    platform + settings, because that decision is not a single expression: the
+    delegated branch still falls back to Crew's seatbelt when the caller asks for
+    path masks a delegated sandbox cannot enforce, the governance floor can clamp
+    a requested ``off`` back up, and the audit-or-deny step can refuse a
+    delegation after it was chosen. A second copy of that reasoning would answer
+    differently from the wrap on exactly the hosts where the answer matters. The
+    argv is the wrap's own record of what it did.
+
+    Keys on the two things only Crew's wrappers put in an argv -- the
+    ``KIROCREW_SANDBOX_ACTIVE`` env assignment the macOS seatbelt wrap prepends,
+    and the generated launcher script the Linux namespace wrap execs. The
+    delegated and unconfined paths add neither (they prepend at most ``env -u``
+    scrub flags), so this is False for both, which is the point: on those paths
+    the only sandbox left in the chain belongs to the harness.
+    """
+    marker = f"{_IN_SANDBOX_MARKER}="
+    for token in argv:
+        if not isinstance(token, str):
+            continue
+        if token.startswith(marker):
+            return True
+        if os.path.basename(token).startswith(_SANDBOX_ARTIFACT_PREFIX):
+            return True
+    return False
+
+
+def sandbox_init_remediation(layer: str, *, corroborated: bool) -> str:
+    """What an operator must change to get past a sandbox that will not initialize.
+
+    **The switch that turns a layer OFF is emitted only on a CORROBORATED
+    verdict**, and that is the whole shape of this function. The signature that
+    reaches the caller is the dead child's own stderr, and that child is the
+    unverified binary the sandbox exists to contain: a planted one can print any
+    line it likes. A message that answered it with "run
+    ``kirocrew config set agent.sandbox off``" would let that binary talk the
+    operator into removing the isolation it is running under -- the same hazard
+    :func:`launcher_refusal` states for its own callers, answered the same way it
+    prescribes. *corroborated* must therefore come from
+    :func:`corroborate_launcher_refusal` (a real launcher run around a trusted
+    no-op, whose stderr no child wrote), never from the child's text.
+
+    Uncorroborated, the message still names the layer -- that comes from the argv
+    Kiro Crew itself built, not from the child -- and routes the operator to the
+    check that can reach a verdict, which is where the switch lives.
+
+    Corroboration exists for Crew's Linux launcher only. On macOS the probe
+    validates an ``(allow default)`` profile against a fixed system binary while
+    the real wrap applies the strict generated one, so a passing probe is not
+    evidence that the real wrap works and the uncorroborated branch is the honest
+    answer there. Closing that gap is the real-wrap self-test, tracked separately.
+
+    It follows that the HARNESS layer never gets a switch from here at all, whatever
+    *corroborated* says: the only trusted run available speaks to Crew's launcher,
+    so treating its verdict as evidence about the harness's own sandbox would be a
+    cross-layer inference -- and on that branch the harness's sandbox is the only
+    isolation the child had.
+    """
+    if layer == SANDBOX_LAYER_HARNESS:
+        # Names NO switch, and *corroborated* cannot change that -- which is the
+        # point of reading this branch before that flag. Corroboration re-runs
+        # KIRO CREW'S OWN launcher, so a verdict from it is evidence about Crew's
+        # layer and says nothing whatever about the harness's internal sandbox.
+        # Letting it unlock this switch would be a cross-layer inference: a host
+        # that cannot build Crew's namespace would hand the operator the key that
+        # turns off the OTHER sandbox -- and on this branch that sandbox is the
+        # only isolation the child had, so the one confirmed thing would be that
+        # isolation is gone. The remaining evidence is the agent's own output, and
+        # the agent is the unverified binary that sandbox exists to contain.
+        return (
+            "the agent reported its own sandbox refusing, and Kiro Crew did not wrap "
+            "this spawn -- so that sandbox is the only isolation this child had. The "
+            "report above is the agent's own output and Kiro Crew has NOT confirmed "
+            "it; check the host's sandbox support"
+        )
+    if not corroborated:
+        return (
+            "Kiro Crew wrapped this spawn in its own OS sandbox, but the refusal above "
+            "is the agent's own output and not a verdict on this host -- and Kiro Crew's "
+            "own trusted sandbox run covers its Linux launcher only, so it has NOT "
+            "confirmed the failure here. Check the host's sandbox support before turning "
+            "either layer off"
+        )
+    return (
+        "a trusted launcher run confirms this host refuses Kiro Crew's own OS sandbox: "
+        "run `kirocrew config set agent.sandbox off`, which spawns agents unconfined "
+        "WHERE GOVERNANCE PERMITS IT -- a governance floor clamps the mode back up and "
+        "the request has no effect. Where it does take, it removes Kiro Crew's "
+        "OS-level isolation for EVERY agent process (no credential-path masks, no "
+        "data-home seal); each unconfined spawn is recorded in the security event log"
+    )
+
+
+def delegated_workspace_exposes_sealed_target(
+    work_dir: "str | os.PathLike[str] | None",
+) -> str | None:
+    """Reason a kiro-cli spawn must be refused because its workspace would leave a
+    SEALED target writable, or ``None`` when it may proceed.
+
+    Two targets, one guard. Both seals are rules of Kiro Crew's OWN launcher: the
+    kiro agents tree (:func:`_resolved_kiro_agents_targets`), whose fork and
+    template specs decide what the next spawn may do, and the strict no-alias
+    config leaf (``cloud.json``), which names the container image a Fargate launch
+    runs and therefore the image the task's execution role hands the model
+    credential to.
+
+    A spawn delegated to kiro-cli's internal sandbox (macOS with that sandbox
+    enabled, every first-party Windows spawn) never passes through that launcher,
+    and the delegated sandbox treats the workspace as writable — so a workspace
+    that IS, CONTAINS or sits INSIDE either target lets the child rewrite it.
+    Refusing here, before the spawn, is the only enforcement point left on those
+    paths. Where Kiro Crew's launcher does wrap the child both seals hold
+    regardless of workspace, so this returns ``None`` and keeps ``$HOME``-rooted
+    workspaces working there.
+
+    Deliberately NOT conditioned on what the config currently CONTAINS. An agent
+    does not need to swap a field it can create: given a writable path and no
+    Fargate block, it writes a complete one and the owner's next launch runs the
+    image it chose. A rule that reads the file's contents has that hole whatever
+    the contents are, because the contents are what the attacker supplies.
+
+    Same three-layer comparison as :func:`assert_voice_runtime_outside_agent_workspace`:
+    the lexical spelling AND the canonical (``realpath``) spelling of both sides,
+    then filesystem identity (``st_dev``/``st_ino``) walked along each side's
+    ancestor chain — so a symlinked or junctioned workspace that resolves into
+    the agents tree (or that the agents tree resolves into) is caught, not just
+    the spelling the caller configured. Runs off the event loop (it stats). A
+    workspace or agents dir that cannot be stat'ed fails CLOSED with a reason:
+    "cannot verify" is not "does not overlap". Never raises.
+    """
+    if work_dir is None:
+        return None
+    delegated = (sys.platform == "darwin" and kiro_internal_sandbox_enabled()) or (
+        sys.platform == "win32"
+    )
+    if not delegated:
+        return None
+    targets = _resolved_kiro_agents_targets() + [
+        os.path.join(str(config_dir()), leaf) for leaf in _DELEGATED_OVERLAP_LEAF_REASONS
+    ]
+    if not targets:
+        return None
+
+    def _reason(target: str, how: str) -> str:
+        # Named per target: the consequences differ, and an operator reading this needs to
+        # know which seal they are looking at. Looked up in the same mapping the target list
+        # is built from, so a covered leaf cannot render another leaf's consequence.
+        named = next(
+            (
+                reason
+                for leaf, reason in _DELEGATED_OVERLAP_LEAF_REASONS.items()
+                if _norm(target).endswith(os.sep + os.path.normcase(os.path.normpath(leaf)))
+            ),
+            None,
+        )
+        if named is not None:
+            what, consequence = named
+        else:
+            what = "kiro agents directory"
+            consequence = (
+                "the agent could rewrite template/fork specs and forge its next session's " "grants"
+            )
+        return (
+            f"workspace '{os.fspath(work_dir)}' overlaps the {what} "
+            f"'{target}' ({how}); on this platform the spawn is delegated to kiro-cli's "
+            f"internal sandbox, which treats the workspace as writable, so {consequence}. "
+            f"Choose a workspace that does not contain '{target}'."
+        )
+
+    def _norm(path: str) -> str:
+        return os.path.normcase(os.path.normpath(os.path.abspath(path)))
+
+    def _spellings(path: str) -> tuple[str, ...]:
+        # Lexical first, canonical second; de-duplicated when they coincide.
+        return tuple(dict.fromkeys((_norm(path), _norm(os.path.realpath(path)))))
+
+    def _lexically_overlaps(a: str, b: str) -> bool:
+        try:
+            return os.path.commonpath([a, b]) in (a, b)
+        except ValueError:
+            # Different drives (Windows): cannot overlap.
+            return False
+
+    def _identity_in_ancestor_chain(identity: tuple[int, int], path: str) -> bool:
+        current = os.path.abspath(path)
+        while True:
+            info = os.stat(current)
+            if (info.st_dev, info.st_ino) == identity:
+                return True
+            parent = os.path.dirname(current)
+            if parent == current:
+                return False
+            current = parent
+
+    try:
+        raw_work = os.fspath(work_dir)
+        work_spellings = _spellings(raw_work)
+    except Exception:
+        return _reason(targets[0], "workspace path could not be resolved")
+    for target in targets:
+        try:
+            agents_spellings = _spellings(target)
+        except Exception:
+            return _reason(target, "sealed target path could not be resolved")
+        # Layer 1+2: every spelling of one side against every spelling of the other.
+        for work in work_spellings:
+            for agents in agents_spellings:
+                if _lexically_overlaps(work, agents):
+                    return _reason(target, "path")
+        # Layer 3: filesystem identity, both directions. Only an EXISTING node can
+        # be an alias; a workspace the spawn is about to mkdir has no identity yet
+        # and its lexical spellings above are the whole story.
+        try:
+            if not os.path.exists(raw_work):
+                continue
+            work_ids = {(s.st_dev, s.st_ino) for s in (os.stat(p) for p in work_spellings)}
+            for work_id in work_ids:
+                for agents in agents_spellings:
+                    if os.path.exists(agents) and _identity_in_ancestor_chain(work_id, agents):
+                        return _reason(target, "alias")
+            for agents in agents_spellings:
+                if not os.path.exists(agents):
+                    continue
+                agents_stat = os.stat(agents)
+                for work in work_spellings:
+                    if _identity_in_ancestor_chain((agents_stat.st_dev, agents_stat.st_ino), work):
+                        return _reason(target, "alias")
+        except OSError as exc:
+            return _reason(
+                target,
+                "cannot verify: "
+                f"{getattr(exc, 'filename', None) or raw_work}: "
+                f"{getattr(exc, 'strerror', None) or exc}",
+            )
+    return None
+
+
 def _spawns_kiro_cli(argv: list[str]) -> bool:
     """True when *argv* launches kiro-cli (by basename, the same convention
     as ``_resolve_kiro_bin``).
@@ -4206,6 +8061,7 @@ def _delegate_to_kiro_internal_sandbox(
     sandbox_level: str,
     *,
     strip_python_env: bool = False,
+    forward_ssh_auth_sock: bool = False,
 ) -> tuple[list[str], str | None] | None:
     """Delegate an explicitly trusted kiro-cli spawn to its internal sandbox.
 
@@ -4271,15 +8127,32 @@ def _delegate_to_kiro_internal_sandbox(
     # seatbelt and must not burn the warning for the first real delegation).
     if not _kiro_delegation_warned:
         _kiro_delegation_warned = True
-        logger.warning(
-            "SECURITY: delegating this %s kiro-cli spawn to kiro-cli's internal "
-            "sandbox and skipping Kiro Crew's OS wrapper. Env scrubbing still "
-            "applies.",
-            "Windows" if sys.platform == "win32" else "macOS",
-        )
+        if sys.platform == "win32":
+            logger.warning(
+                "SECURITY: delegating this Windows kiro-cli spawn to kiro-cli's "
+                "internal sandbox and skipping Kiro Crew's OS wrapper. Env scrubbing "
+                "still applies."
+            )
+        else:
+            # macOS delegation is decided by a settings file, so name it: the
+            # operator who has to change this cannot find it from "delegating"
+            # alone, and the symptom they arrive with is a denied read of a
+            # path OUTSIDE the workspace, which looks like a macOS privacy
+            # (TCC) problem and is not one.
+            logger.warning(
+                "SECURITY: delegating this macOS kiro-cli spawn to kiro-cli's "
+                "internal sandbox and skipping Kiro Crew's OS wrapper (%s sets "
+                '"%s": true). Env scrubbing still applies. kiro-cli owns file '
+                "access for these spawns, so a path its own profile does not allow "
+                'fails with "Operation not permitted" regardless of what macOS '
+                "privacy settings grant; set that key to false to hand isolation "
+                "back to Kiro Crew's profile.",
+                _KIRO_INTERNAL_SETTINGS_PATH,
+                _KIRO_INTERNAL_SANDBOX_KEY,
+            )
     if sys.platform == "win32":
         return list(argv), None
-    unset_args = _sandbox_env_unset_args(sandbox_level, strip_python_env)
+    unset_args = _sandbox_env_unset_args(sandbox_level, strip_python_env, forward_ssh_auth_sock)
     if unset_args:
         return [_pinned_env_bin(), *unset_args, *argv], None
     return list(argv), None
@@ -4290,9 +8163,14 @@ def sandbox_exec_argv(
     sandbox_level: str = "strict",
     *,
     strip_python_env: bool = False,
+    forward_ssh_auth_sock: bool = False,
     extra_hidden_dirs: tuple[str, ...] = (),
+    extra_hidden_dir_ids: tuple[tuple[str, int, int], ...] = (),
     extra_visible_dirs: tuple[str, ...] = (),
+    extra_private_dirs: tuple[str, ...] = (),
+    extra_private_dir_ids: tuple[tuple[str, int, int], ...] = (),
     extra_writable_dirs: tuple[str, ...] = (),
+    extra_expose_files: tuple[str, ...] = (),
 ) -> tuple[list[str], str | None]:
     """Wrap *argv* with ``sandbox-exec -f <profile>``.
 
@@ -4306,24 +8184,138 @@ def sandbox_exec_argv(
     if resolved_argv:
         resolved_argv[0] = _resolve_agent_executable(resolved_argv[0])
 
-    profile = _build_seatbelt_profile(
+    # A pre-upgrade md-notebook staging temp holding the PAT sits at a name this profile
+    # never denies (it names the state leaves and the staging directory, not an arbitrary
+    # ``*.tmp`` sibling), so removing it is NOT Linux-only work. File materialisation
+    # stays on the namespace path — a Seatbelt deny is a path rule that holds for a name
+    # that does not exist yet — but an orphan already on disk needs sweeping here too.
+    _sweep_legacy_md_notebook_temps()
+    _sweep_legacy_auth_store_temps()
+    # Reconciled here as well. The stale name is a second name for the signing key either
+    # way, and leaving it to accumulate on a macOS host means the first Linux spawn on a
+    # shared data home meets a backlog of them.
+    _reconcile_auth_store_staging_links()
+    # A Seatbelt deny is path-shaped -- ``deny file-read* (subpath ...)`` names the leaf, not
+    # its inode -- so a second hard link on a credential leaf is read straight through the
+    # profile. That is the same exposure the namespace path refuses on, so this pass belongs
+    # on both launch paths and not only where a bind mask is what does the hiding. It runs
+    # AFTER the cleanup above, which is the ordering the namespace path also establishes: a
+    # link the cleanup would have removed must not be what refuses.
+    alias_masks = _refuse_multilinked_credential_leaves(masks_are_path_only=True)
+
+    # A caller that pins a window to an inode is asking for a guarantee no path-rule
+    # profile can make in full: the allow names a MUTABLE pathname, and a same-UID peer
+    # renaming an app onto it is read through that allow. The Linux child compares the
+    # descriptor it pinned; this backend has no counterpart at exec time. What it DOES have
+    # is the check the mask roots below already get -- read the name's own identity
+    # immediately before the profile is written, refuse on a mismatch, and state the
+    # residual instead of implying it. A window gets that same treatment, rather than being
+    # dropped: dropping a pinned window would deny the caller the directory it pinned.
+    for path_, dev, ino in extra_private_dir_ids:
+        if path_ not in extra_private_dirs:
+            continue
+        try:
+            win_st = os.lstat(path_)
+        except OSError as exc:
+            raise SandboxCeilingUnsealable(
+                f"cannot confirm the data window {safe_terminal_line(path_)} is still the "
+                f"one this spawn approved: {safe_terminal_line(str(exc))}. Refusing rather "
+                "than opening a window at a name whose identity cannot be read."
+            ) from exc
+        # NO-FOLLOW and a real directory, the two rules the producer recorded the approval
+        # under and the two the Linux child re-reads through
+        # ``O_PATH|O_NOFOLLOW|O_DIRECTORY``. A rename preserves the inode, so a followed
+        # lookup would compare the wrong object.
+        if not stat.S_ISDIR(win_st.st_mode):
+            raise SandboxCeilingUnsealable(
+                f"cannot open a data window at {safe_terminal_line(path_)}: the name is no "
+                "longer a directory, so the allow would carve out a link rather than the "
+                "tree this spawn approved. Refusing the spawn."
+            )
+        if (win_st.st_dev, win_st.st_ino) != (dev, ino):
+            raise SandboxCeilingUnsealable(
+                f"the data window {safe_terminal_line(path_)} is not the one this spawn "
+                "approved -- it was replaced after approval, so the allow would expose a "
+                "substitute. Refusing the spawn."
+            )
+    # A pinned MASK ROOT is the opposite direction and cannot be answered the same way.
+    # Withholding a WINDOW leaves the tree masked, so it costs a data view; withholding a
+    # MASK would leave the tree open, which is the exposure the pin was taken against --
+    # so the fail-closed answer here is to refuse the spawn, exactly as the Linux child
+    # does when its own comparison fails. Dropping the argument was the real defect: the
+    # approval was taken and then discarded, so the profile masked a pathname while the
+    # caller believed an inode had been settled.
+    #
+    # Checked as late as this backend can check anything -- immediately before the profile
+    # is written -- and honestly NOT race-free: a same-UID peer can still rename the tree
+    # between this ``lstat`` and the ``exec``, and no path-rule profile can close that,
+    # because the peer is outside the sandbox and Seatbelt has no inode predicate. What
+    # this does close is the case where the rename already happened, and it ends the
+    # silence in the case it cannot: the residual is stated here rather than implied by an
+    # argument that went nowhere.
+    for path_, dev, ino in extra_hidden_dir_ids:
+        try:
+            st = os.lstat(path_)
+        except OSError as exc:
+            raise SandboxCeilingUnsealable(
+                f"cannot confirm the masked directory {safe_terminal_line(path_)} is still "
+                f"the one this spawn approved: {safe_terminal_line(str(exc))}. Refusing "
+                "rather than masking a name whose identity cannot be read."
+            ) from exc
+        # NO-FOLLOW, and a real directory or nothing -- the two rules a caller's approval
+        # is recorded under, and the same pair the Linux child gets from ``O_PATH|O_NOFOLLOW|O_DIRECTORY``. A followed lookup
+        # compares the wrong object: a rename PRESERVES the inode, so moving the tree
+        # aside and leaving a symlink at the name resolves back to the approved
+        # ``(dev, ino)`` and passes, while the profile rule covers only the link's name
+        # and the tree stays readable where it was moved to. Checking the name's OWN
+        # identity makes the link a mismatch, and the explicit directory test says so in
+        # its own words rather than relying on the inodes differing.
+        if not stat.S_ISDIR(st.st_mode):
+            raise SandboxCeilingUnsealable(
+                f"cannot mask {safe_terminal_line(path_)}: the name is no longer a "
+                "directory, so masking it would cover a link while the directory this "
+                "spawn approved stays readable elsewhere. Refusing the spawn."
+            )
+        if (st.st_dev, st.st_ino) != (dev, ino):
+            raise SandboxCeilingUnsealable(
+                f"the masked directory {safe_terminal_line(path_)} is not the one this "
+                "spawn approved -- it was replaced after approval, so masking the name "
+                "would cover a substitute while the original stays readable under its new "
+                "one. Refusing the spawn."
+            )
+    profile = sandbox_seatbelt._build_seatbelt_profile(
         sandbox_level,
-        extra_hidden_dirs=extra_hidden_dirs,
+        # These entries become path RULES, not binds over an inode. That is weaker than it
+        # first appears: the rule keeps naming a path, and nothing here denies a write to the
+        # alias's parent or its ancestors while the data home root stays writable in-sandbox,
+        # so the governed process can rename a parent and read the bytes under a name no rule
+        # covers -- without needing to win any race. The seal for the voice runtime exists for
+        # exactly this reason. So a located alias on a CREDENTIAL leaf in the live home now
+        # refuses above rather than arriving here, and what still arrives is the case where a
+        # refusal would be disproportionate: a home the install does not use.
+        extra_hidden_dirs=extra_hidden_dirs + tuple(m.path for m in alias_masks),
         extra_visible_dirs=extra_visible_dirs,
+        extra_private_dirs=extra_private_dirs,
         extra_writable_dirs=extra_writable_dirs,
+        extra_expose_files=extra_expose_files,
     )
     run_dir = _ensure_run_dir()
+    # Constants, not a second spelling: the run-dir sweep reclaims this family by prefix
+    # and suffix, and a literal here that drifted from either would leak the profile.
     fd, path = tempfile.mkstemp(
-        suffix=".sb", prefix=f"kirocrew_sandbox_{os.getpid()}_", dir=run_dir
+        suffix=_SEATBELT_PROFILE_SUFFIX,
+        prefix=f"{_SANDBOX_ARTIFACT_PREFIX}{os.getpid()}_",
+        dir=run_dir,
     )
     os.write(fd, profile.encode())
     os.close(fd)
     # Build env -u flags for sensitive vars present in current env. cc/strict
     # additionally scrub agent-denied credential keys (Slack tokens, owner id)
     # since loader.py seeds them into os.environ for trusted children only.
-    unset_args = _sandbox_env_unset_args(sandbox_level, strip_python_env)
+    unset_args = _sandbox_env_unset_args(sandbox_level, strip_python_env, forward_ssh_auth_sock)
     # Mark the sandboxed tree, exactly as the Linux namespace launcher does after
-    # its own env scrub (see the export beside ``KIROCREW_HOST_PID``). Without
+    # its own env scrub (see the export beside ``KIROCREW_HOST_PID`` in the program
+    # ``sandbox_launcher._build_launcher_script`` renders). Without
     # this, an in-sandbox ``wrap_argv`` call cannot tell that KiroCrew's own
     # sandbox already confines it, tries to nest, and gets EPERM — which then
     # fail-closes every app-backend and MCP spawn on the host. Set as an ``env``
@@ -4350,12 +8342,23 @@ def sandbox_exec_argv(
     outer_env = _pinned_env_bin()
     sandbox_exec = platform_compat.trusted_system_bin("sandbox-exec") or "/usr/bin/sandbox-exec"
     return (
-        [outer_env, *unset_args, marker, level_assign, sandbox_exec, "-f", path, *resolved_argv],
+        [
+            outer_env,
+            *unset_args,
+            marker,
+            level_assign,
+            sandbox_exec,
+            "-f",
+            path,
+            *resolved_argv,
+        ],
         path,
     )
 
 
-def _sandbox_env_scrub_keys(sandbox_level: str, strip_python_env: bool) -> list[str]:
+def _sandbox_env_scrub_keys(
+    sandbox_level: str, strip_python_env: bool, forward_ssh_auth_sock: bool = False
+) -> list[str]:
     """Names of the live environment keys to scrub for a given sandbox level.
 
     The single source of the per-level scrub set, shared by
@@ -4369,10 +8372,17 @@ def _sandbox_env_scrub_keys(sandbox_level: str, strip_python_env: bool) -> list[
         prefixes.extend(_AGENT_DENIED_ENV_KEYS)
     if strip_python_env:
         prefixes.extend(_PYTHON_ENV_PREFIXES)
+    # Honour the SSH_AUTH_SOCK forward opt-in on the seatbelt
+    # ``env -u`` path (macOS) exactly as on the Linux launcher. The decision is
+    # passed in (resolved off-loop on the agent path) and defaults False, so a
+    # generic caller keeps the socket in the unset flags.
+    prefixes = _agent_scrub_prefixes(prefixes, forward_ssh_auth_sock)
     return [key for key in os.environ if any(key.startswith(p) for p in prefixes)]
 
 
-def _sandbox_env_unset_args(sandbox_level: str, strip_python_env: bool) -> list[str]:
+def _sandbox_env_unset_args(
+    sandbox_level: str, strip_python_env: bool, forward_ssh_auth_sock: bool = False
+) -> list[str]:
     """``env -u`` flags scrubbing sensitive vars for a sandboxed/delegated spawn.
 
     Shared by ``sandbox_exec_argv`` (seatbelt wrap) and
@@ -4381,32 +8391,13 @@ def _sandbox_env_unset_args(sandbox_level: str, strip_python_env: bool) -> list[
     the active isolation layer.
     """
     unset_args: list[str] = []
-    for key in _sandbox_env_scrub_keys(sandbox_level, strip_python_env):
+    for key in _sandbox_env_scrub_keys(sandbox_level, strip_python_env, forward_ssh_auth_sock):
         unset_args.extend(["-u", key])
     return unset_args
 
 
-def _parse_pid_segment(pid_str: str) -> int | None:
-    """Parse a pid segment from a sweep-owned filename, or None to skip.
-
-    Both sweeps (launcher scripts and mount sources) only ever WRITE an ASCII
-    positive decimal pid, so anything else is a foreign or planted name and
-    must fail toward "skip": non-ASCII decimals (``int()`` would accept
-    them), pid ``0`` (``os.kill(0, 0)`` probes the caller's own process group
-    and always reads alive), zero-padded segments, and — belt-and-braces,
-    NAME_MAX keeps real names far shorter than the int/str conversion limit —
-    a ``ValueError`` from ``int()`` itself.
-    """
-    if not pid_str.isascii() or not pid_str.isdecimal() or pid_str.startswith("0"):
-        return None
-    try:
-        return int(pid_str)
-    except ValueError:
-        return None
-
-
-def cleanup_stale_sandbox_profiles(*, legacy_dir: str | None = None) -> int:
-    """Remove orphan sandbox files from <config_dir>/run/ and legacy /tmp.
+def cleanup_stale_sandbox_profiles(*, data_home: Path, legacy_dir: str | None = None) -> int:
+    """Remove orphan sandbox files from runtime artifact directories and legacy /tmp.
 
     A file is removed when EITHER:
       - The tagged PID is dead (os.kill probe fails), OR
@@ -4423,65 +8414,121 @@ def cleanup_stale_sandbox_profiles(*, legacy_dir: str | None = None) -> int:
     Called from the periodic cleanup sweep in session.py, offloaded to the
     maintenance executor (blocking I/O).  Safe to call from sync contexts too.
 
+    *data_home* is the data home every path below is rooted at. The sweep runs on
+    a pool thread, and a pool thread resolves ``config_dir()`` whenever it happens
+    to be scheduled, which, under the test suite, is routinely AFTER the test
+    that queued it has torn down its ``KIROCREW_HOME`` pin, so the sweep then
+    walked (and could stamp or remove under) the operator's real ``~/.kiro/crew``.
+    The caller that knows the home resolves it on ITS thread and passes it in;
+    there is deliberately no default, so no future caller can reopen that path.
+
     Returns:
         Number of stale files removed.
     """
     now = time.time()
     if legacy_dir is None:
         legacy_dir = _LEGACY_LAUNCHER_DIR
-    run_dir = str(config_dir() / "run")
+    artifact_dirs = (
+        (str(data_home / "run"), _RUN_DIR_ARTIFACTS),
+        (str(data_home / "pi-gate"), _PI_GATE_DIR_ARTIFACTS),
+    )
     removed = 0
 
-    # ── Sweep <config_dir>/run/ (PID + age) ──
-    if os.path.isdir(run_dir):
-        for entry in os.listdir(run_dir):
-            if not entry.startswith("kirocrew_sandbox_"):
-                continue
-            if entry.endswith(".sb"):
-                suffix = ".sb"
-            elif entry.endswith(".py"):
-                suffix = ".py"
+    # ── Sweep runtime artifact directories (PID + age) ──
+    for artifact_dir, families in artifact_dirs:
+        artifact_fd: int | None = None
+        try:
+            if platform_compat.IS_WINDOWS:
+                # Windows has no os-level pinned-directory primitive, so this
+                # check-then-act arm retains an accepted replacement window.
+                if platform_compat.is_link_or_junction(artifact_dir):
+                    logger.warning(
+                        "Refusing to sweep linked or non-directory artifact directory: %s",
+                        artifact_dir,
+                    )
+                    continue
+                if not os.path.isdir(artifact_dir):
+                    continue
+                entries = os.listdir(artifact_dir)
             else:
-                continue
-            filepath = os.path.join(run_dir, entry)
-            # Age check first — handles the spawner-PID design flaw
-            try:
-                mtime = os.stat(filepath).st_mtime
-            except OSError:
-                continue
-            if (now - mtime) > _LAUNCHER_MAX_AGE_SECONDS:
                 try:
-                    os.remove(filepath)
-                    removed += 1
-                except OSError:
-                    pass
-                continue
-            # Fresh file — fall back to PID liveness check
-            middle = entry[len("kirocrew_sandbox_") : -len(suffix)]
-            pid = _parse_pid_segment(middle.split("_", 1)[0])
-            if pid is None:
-                continue
-            # Liveness probe via the shim — NEVER raw os.kill(pid, 0), which
-            # TERMINATES the target process on Windows (see platform_compat).
-            try:
-                alive = platform_compat.pid_exists(pid)
-            except OverflowError:
-                alive = False  # absurd pid digits from a corrupt filename — stale
-            if not alive:
+                    artifact_fd = os.open(
+                        artifact_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+                    )
+                except OSError as exc:
+                    if exc.errno == errno.ENOENT:
+                        continue
+                    if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+                        logger.warning(
+                            "Refusing to sweep linked or non-directory artifact directory: %s",
+                            artifact_dir,
+                        )
+                        continue
+                    raise
+                with os.scandir(artifact_fd) as iterator:
+                    entries = [entry.name for entry in iterator]
+
+            for entry in entries:
+                prefix = next((p for p in families if entry.startswith(p)), None)
+                if prefix is None:
+                    continue
+                suffix = next((x for x in families[prefix] if entry.endswith(x)), None)
+                if suffix is None:
+                    continue
+                filepath = os.path.join(artifact_dir, entry)
+                # Age check first — handles the spawner-PID design flaw. Not for the
+                # gate artifacts (pi and dsh): those are written once per gateway
+                # process and REUSED by every later spawn of that process, so their
+                # age says nothing, and the PID in their name is the owner's own.
                 try:
-                    os.remove(filepath)
-                    removed += 1
+                    if artifact_fd is None:
+                        mtime = os.stat(filepath).st_mtime
+                    else:
+                        mtime = os.stat(entry, dir_fd=artifact_fd, follow_symlinks=False).st_mtime
                 except OSError:
-                    pass
+                    continue
+                if prefix == _SANDBOX_ARTIFACT_PREFIX and (now - mtime) > _LAUNCHER_MAX_AGE_SECONDS:
+                    try:
+                        if artifact_fd is None:
+                            os.remove(filepath)
+                        else:
+                            os.unlink(entry, dir_fd=artifact_fd)
+                        removed += 1
+                    except OSError:
+                        pass
+                    continue
+                # Fresh file — fall back to PID liveness check
+                middle = entry[len(prefix) : -len(suffix)]
+                pid = sandbox_mount_sweep._parse_pid_segment(middle.split("_", 1)[0])
+                if pid is None:
+                    continue
+                # Liveness probe via the shim — NEVER raw os.kill(pid, 0), which
+                # TERMINATES the target process on Windows (see platform_compat).
+                try:
+                    alive = platform_compat.pid_exists(pid)
+                except OverflowError:
+                    alive = False  # absurd pid digits from a corrupt filename — stale
+                if not alive:
+                    try:
+                        if artifact_fd is None:
+                            os.remove(filepath)
+                        else:
+                            os.unlink(entry, dir_fd=artifact_fd)
+                        removed += 1
+                    except OSError:
+                        pass
+        finally:
+            if artifact_fd is not None:
+                os.close(artifact_fd)
 
     # ── Sweep legacy /tmp/kirocrew_sandbox_*.py (age only, no PID segment) ──
     if os.path.isdir(legacy_dir):
         try:
             with os.scandir(legacy_dir) as it:
                 for dentry in it:
-                    if not dentry.name.startswith("kirocrew_sandbox_"):
+                    if not dentry.name.startswith(_SANDBOX_ARTIFACT_PREFIX):
                         continue
-                    if not dentry.name.endswith(".py"):
+                    if not dentry.name.endswith(_LAUNCHER_SCRIPT_SUFFIX):
                         continue
                     try:
                         mtime = dentry.stat().st_mtime
@@ -4496,853 +8543,10 @@ def cleanup_stale_sandbox_profiles(*, legacy_dir: str | None = None) -> int:
         except OSError:
             pass
 
-    removed += _cleanup_stale_sandbox_mount_sources()
-    removed += _cleanup_legacy_mount_source_residue()
-    removed += _cleanup_retired_acp_snapshot_dir()
+    removed += sandbox_mount_sweep._cleanup_stale_sandbox_mount_sources()
+    removed += sandbox_mount_sweep._cleanup_legacy_mount_source_residue(data_home)
+    removed += sandbox_mount_sweep._cleanup_retired_acp_snapshot_dir(data_home)
     return removed
-
-
-def _mount_source_candidate_roots() -> list[str]:
-    """The tmpfs roots the namespace launcher stages bind-mount sources on.
-
-    Mirrors the launcher's own ``_tmpfs_src`` candidate chain —
-    ``/run/user/$UID``, ``/dev/shm``, then the system default tempdir (the
-    ``_tmpfs_src=None`` fallback). The tempdir entry is the gateway's own
-    ``tempfile.gettempdir()``, which matches the launcher's fallback only while
-    both resolve the same ``TMPDIR``; a launcher spawned with a divergent,
-    persistent ``TMPDIR`` stages its fallback entries somewhere this sweep
-    never visits, and nothing else reclaims them — a real limitation, reached
-    only when NO tmpfs candidate exists at all. ``os.getuid`` is
-    POSIX-only; the launcher itself is Linux-only, so a platform without it
-    simply has no per-user runtime root to sweep.
-    """
-    roots: list[str] = []
-    getuid = getattr(os, "getuid", None)
-    if getuid is not None:
-        roots.append(f"/run/user/{getuid()}")
-    roots.append("/dev/shm")
-    roots.append(tempfile.gettempdir())
-    return roots
-
-
-def _mount_pinned_source_names(
-    proc_root: str = "/proc",
-    *,
-    matcher: Callable[[str], bool] | None = None,
-    coverage: _PinScanCoverage | None = None,
-) -> tuple[set[str], bool]:
-    """Entry names of sandbox mount sources referenced by a live mount, plus
-    whether the scan positively covered every namespace a PROCESS could be
-    binding one from.
-
-    A bind mount records its source as the ``root`` field (field 4) of a
-    ``/proc/<pid>/mountinfo`` line, and the staged sources are direct children
-    of a tmpfs root, so the basename of that field is the staged entry's name
-    (mkdtemp names carry no spaces, so mountinfo's octal escaping never
-    applies to them). Only prefix-shaped basenames are collected — a foreign
-    mount whose root merely resembles a path cannot pin anything. Keying is by
-    basename, so two identically-named entries on different roots would share
-    a pin; mkdtemp's random suffix makes that vanishingly rare, and the error
-    lands on the retention side.
-
-    The launcher's mounts live in the sandboxed child's PRIVATE namespace —
-    invisible in the gateway's own mountinfo — and that namespace can outlive
-    the launcher pid through any surviving descendant (a build daemon, for
-    example), so every readable pid's mountinfo is consulted. Coverage is
-    what makes the answer usable, and it is established positively:
-
-    - The listing must show pid 1. ``hidepid``/``subset=pid`` procfs hides
-      other users' processes entirely — including a root holder that entered
-      a sandbox namespace — and pid 1 always exists, so its absence proves
-      the listing is filtered and the scan reports incomplete. It still reads
-      every pid the filtered listing DOES show (this uid's own processes are
-      never hidden from it, and every sandbox descendant keeps this uid), so
-      the pins a visible holder contributes reach the caller regardless: the
-      directory gate honours ``pinned`` before any other evidence.
-    - A holder can fork a successor and exit between the pid listing and its
-      own mountinfo read (the read then raises FileNotFoundError). The
-      successor was forked BEFORE the exit, so it is visible to the very next
-      listing: the scan re-lists after any pass that observed a vanish, and
-      finishes on a pass that saw none. A pid appearing WITHOUT a vanish
-      needs no rescan — it is either in a namespace whose surviving holders
-      this scan already read, or in a brand-new namespace, which can only
-      bind brand-new (fresh, live-pid) entries that are never reclaim
-      candidates in the same sweep. A scan still churning after
-      ``_PIN_SCAN_MAX_PASSES`` cannot prove coverage and reports incomplete.
-      (A successor recycled onto an already-seen pid NUMBER inside this
-      window escapes the re-listing; that needs the full pid space to wrap
-      within the scan's milliseconds, and the residual error is
-      retention-side only on the next sweep.)
-    - A read failure is forgiven in two cases and counts as a coverage gap
-      otherwise. ``EINVAL`` says that TASK has no ``nsproxy``, which is not yet
-      a statement about the NAMESPACE: a thread-group leader can exit through
-      ``pthread_exit`` while sibling threads keep running, and threads share the
-      nsproxy, so a live namespace can sit behind a zombie leader while
-      ``proc_root`` — which lists only leaders — shows nothing else to scan. So
-      the group is consulted through ``/proc/<pid>/task/<tid>/mountinfo``, with
-      exactly two outcomes per sibling and no third: one that READS contributes
-      pins and nothing else, and one that does not read, for ANY reason,
-      makes coverage unprovable. Departed siblings are counted rather than
-      excused, because one exiting between the listing and its read may have
-      spawned a successor THREAD first, and a thread is invisible to the outer
-      re-listing (which enumerates thread-group leaders only), so no re-listing
-      can recover it. Tasks in one group can also hold DIFFERENT mount
-      namespaces, since a thread may ``unshare(CLONE_NEWNS)``, so a readable
-      sibling never speaks for an unreadable one. When every sibling reads, the
-      leader's own departure still makes this a vanish, because a departing task
-      may have handed its namespace to a PROCESS forked after this pass's
-      listing and only a re-listing can see that. A LIVE leader that could be a
-      holder (this uid's, the overflow uid's, root's) has its siblings read the
-      same way, since a thread can ``unshare(CLONE_FS)`` + ``setns`` into a
-      namespace its leader is not in; a sibling that departed mid-read has its
-      whole group re-read on the next pass, one that would not read for any
-      other reason makes coverage unprovable. Any OTHER errno on the leader
-      is forgiven only when the pid provably belongs to a DIFFERENT real user
-      (its ``/proc/<pid>`` stats to a uid that is not ours, not root, and not
-      the host's overflow uid) — such a process cannot be binding a source this
-      uid staged, because the sandboxed child keeps this uid and NO_NEW_PRIVS.
-      Root can enter any namespace, and a holder in a foreign user namespace
-      stats as the overflow uid, so those count as coverage gaps.
-
-    A namespace held only by an nsfs fd or a bind-mounted ``ns/mnt`` — zero
-    member processes — has no mountinfo to scan and is out of scope; the
-    launcher never creates one. ``complete=False`` means absence-of-pin was
-    NOT established host-wide. When the caller passes ``coverage``, the scan
-    also answers the narrower question the directory gate needs
-    (:class:`_PinScanCoverage`): whether every task that could be a launcher
-    descendant — this uid's and the overflow uid's — was read, with none
-    departing between the final listing and its read. Root's tasks count as
-    possible holders too (root can ``nsenter`` any namespace), so a hidden or
-    unreadable root task — a filtered procfs included — lowers coverage along
-    with ``complete``; another user's unreadable or departing task lowers only
-    ``complete``.
-    """
-    pinned: set[str] = set()
-    complete = True
-    seen: set[str] = set()
-    getuid = getattr(os, "getuid", None)
-    own_uid = getuid() if getuid is not None else None
-    overflow_uid = _overflow_uid()
-    # Default: the keyed ``kirocrew_sb_<pid>_`` shape. ``matcher`` lets the
-    # legacy-residue sweep reuse this traversal — and, critically, its coverage
-    # accounting (zombie leaders via task/, the vanish re-listing, the
-    # foreign-uid forgiveness) — for a different name shape, instead of a
-    # second scan that gets those cases subtly wrong.
-    match = matcher or (lambda name: name.startswith(_MOUNT_SOURCE_PREFIX))
-    # Fast pre-filter per line; only valid for the default shape, since a
-    # custom matcher may accept names without the prefix.
-    line_hint = _MOUNT_SOURCE_PREFIX if matcher is None else None
-
-    def _collect(mountinfo_path: str) -> None:
-        """Add every matching bind SOURCE named in one mountinfo to ``pinned``.
-
-        Propagates ``OSError`` exactly as ``open`` would, so each caller decides
-        what an unreadable task means for coverage. A source removed while
-        still bound reads ``.../name//deleted``; the suffix is stripped so the
-        real name is what pins.
-        """
-        with open(mountinfo_path, encoding="utf-8", errors="replace") as fh:
-            for line in fh:
-                if line_hint is not None and line_hint not in line:
-                    continue
-                fields = line.split()
-                if len(fields) > 3:
-                    source = fields[3]
-                    if source.endswith("//deleted"):
-                        source = source[: -len("//deleted")]
-                    source = os.path.basename(source)
-                    if match(source):
-                        pinned.add(source)
-
-    # Coverage accounting for ``coverage``. A task of this uid (or the overflow
-    # uid) that could not be read is never re-read (it is in ``seen``), so it
-    # clears coverage for good. One that departed between a pass's listing and
-    # its read may have handed its namespace to a child forked after that
-    # listing: a re-listing shows the child, so a departure on a pass that IS
-    # followed by another pass is accounted for, and only the final pass's
-    # departures reach the caller.
-    unread_sticky = False
-    departed_this_pass = False
-    uids: dict[str, int | None] = {}
-
-    def _could_be_descendant(name: str) -> bool:
-        # A descendant stats as this uid, or as the overflow uid from inside a
-        # nested user namespace; root can ``nsenter`` ANY namespace, so a root
-        # task counts too. Without a uid to compare against (no ``os.getuid``;
-        # an unreadable overflowuid sysctl) every task might be one, so
-        # coverage fails closed rather than open.
-        uid = uids.get(name)
-        if own_uid is None or overflow_uid is None or uid is None:
-            return True
-        return uid == own_uid or uid == overflow_uid or uid == 0
-
-    def _report() -> None:
-        if coverage is not None and (unread_sticky or departed_this_pass):
-            coverage.covered = False
-
-    for _ in range(_PIN_SCAN_MAX_PASSES):
-        try:
-            listed = [n for n in os.listdir(proc_root) if n.isdecimal()]
-        except OSError:
-            if coverage is not None:
-                coverage.covered = False
-            return pinned, False
-        if "1" not in listed and "1" not in seen:
-            # Filtered procfs (hidepid/subset): coverage is unprovable, but the
-            # pids that ARE listed — this uid's own, which is where every
-            # sandbox descendant lives — still read fine and still pin. Keep
-            # walking so their pins reach the caller: a visible holder retains
-            # its source. Returning here instead would hand the gate an empty
-            # pinned set. Coverage falls with the flag: root's tasks are among
-            # the hidden ones, and root can hold any namespace.
-            complete = False
-            unread_sticky = True
-        new_pids = [n for n in listed if n not in seen]
-        vanished = False
-        departed_this_pass = False
-        # Learn every new task's uid FIRST, in one tight loop, so a task that
-        # departs during the (much longer) mountinfo walk below can still be
-        # told apart from another user's; one gone before even this read is
-        # treated as possibly ours.
-        uids = {name: _task_uid(proc_root, name) for name in new_pids}
-        for name in new_pids:
-            seen.add(name)
-            try:
-                _collect(os.path.join(proc_root, name, "mountinfo"))
-            except (FileNotFoundError, ProcessLookupError):
-                # May have handed its namespace to a child forked before the
-                # exit — visible to the next listing, so take another pass.
-                vanished = True
-                if _could_be_descendant(name):
-                    departed_this_pass = True
-            except OSError as exc:
-                if exc.errno == errno.EINVAL:
-                    # EINVAL says THIS TASK's nsproxy is gone, so this task is a
-                    # member of no mount namespace. That is NOT yet a statement
-                    # about the namespace: a thread-group leader can exit through
-                    # ``pthread_exit`` while sibling THREADS keep running, and
-                    # threads share the nsproxy, so the namespace — and its binds
-                    # on our sources — can still be alive behind a zombie leader.
-                    # ``proc_root`` lists only thread-group LEADERS, so the
-                    # re-listing below can never see those threads. Measured on a
-                    # real zombie leader: ``/proc/<tgid>/mountinfo`` is EINVAL
-                    # while ``/proc/<tgid>/task/<live-tid>/mountinfo`` reads fine.
-                    # So ask the group before concluding anything; one readable
-                    # thread yields the WHOLE namespace's mount table, because
-                    # every thread in the group shares it.
-                    task_dir = os.path.join(proc_root, name, "task")
-                    try:
-                        tids = os.listdir(task_dir)
-                    except FileNotFoundError:
-                        tids = []  # the group is gone entirely
-                    except OSError:
-                        complete = False  # cannot ask — coverage unprovable
-                        if _could_be_descendant(name):
-                            unread_sticky = True
-                        continue
-                    unaccounted = 0
-                    for tid in tids:
-                        if tid == name:
-                            continue  # the leader: it already answered EINVAL
-                        try:
-                            _collect(os.path.join(task_dir, tid, "mountinfo"))
-                        except OSError:
-                            unaccounted += 1
-                    # INVARIANT, and there is deliberately no third case: a sibling
-                    # that READS contributes pins and nothing else, and a sibling
-                    # that does not read, for ANY reason, makes coverage unprovable.
-                    #
-                    # Departed siblings are counted too, rather than excused. One
-                    # that exits between the ``tids`` snapshot and its read may have
-                    # spawned a successor THREAD first, and a successor thread is
-                    # invisible to the outer re-listing, which enumerates
-                    # thread-group LEADERS only — so no re-listing can recover it
-                    # and only fail-closed is honest. The cost is transient, never a
-                    # stall: a sibling caught mid-exit is a race, so the next sweep
-                    # sees a settled group, whereas the zombie LEADER this branch
-                    # exists for is a steady state and stays reclaimable.
-                    #
-                    # Tasks in one group can also hold DIFFERENT mount namespaces (a
-                    # thread may ``unshare(CLONE_NEWNS)``, and the launcher's own
-                    # user namespace grants its descendants the CAP_SYS_ADMIN that
-                    # needs), so a readable sibling never speaks for an unreadable
-                    # one.
-                    if unaccounted:
-                        complete = False
-                        if _could_be_descendant(name):
-                            unread_sticky = True
-                        continue
-                    # Otherwise this is a VANISH, unconditionally. Reaching this
-                    # branch at all means the LEADER departed, and a departing task
-                    # may have handed its namespace to a process forked after this
-                    # pass's listing, which only a re-listing can see — so a
-                    # sibling that could be read must not be able to cancel it:
-                    # the pins it yields are kept, its success is not evidence.
-                    #
-                    # This terminates: the pid enters ``seen`` above and is never
-                    # re-read, so a stable zombie costs exactly one extra pass,
-                    # while genuine churn exhausts ``_PIN_SCAN_MAX_PASSES`` and
-                    # returns complete=False, which retains rather than removes.
-                    vanished = True
-                    if _could_be_descendant(name):
-                        departed_this_pass = True
-                    continue
-                try:
-                    st_uid: int | None = os.stat(os.path.join(proc_root, name)).st_uid
-                except OSError:
-                    st_uid = None
-                if (
-                    own_uid is None
-                    or st_uid is None
-                    or overflow_uid is None
-                    or st_uid == own_uid
-                    or st_uid == 0
-                    or st_uid == overflow_uid
-                ):
-                    complete = False
-                    # Root's or another user's unreadable task is a host-wide
-                    # gap only; one that could be a launcher descendant also
-                    # clears the narrower coverage the gate relies on.
-                    if _could_be_descendant(name):
-                        unread_sticky = True
-            else:
-                # The leader read. Its THREADS may still hold OTHER mount
-                # namespaces -- a thread can ``unshare(CLONE_FS)`` and then
-                # ``setns`` into a sandbox's namespace while its leader stays
-                # outside, and root has the capability to do so anywhere -- and
-                # ``proc_root`` lists leaders only, so those namespaces are
-                # reachable through ``task/`` alone. Asked only for a possible
-                # holder (another user's threads cannot enter a namespace this
-                # uid staged), which keeps the cost to this uid's and root's
-                # groups: measured 3.5k sibling reads in 0.13s on a dev host.
-                if not _could_be_descendant(name):
-                    continue
-                task_dir = os.path.join(proc_root, name, "task")
-                try:
-                    tids = os.listdir(task_dir)
-                except FileNotFoundError:
-                    # The group went away right after the leader read: a
-                    # departure, with the same successor concern as any other.
-                    vanished = True
-                    departed_this_pass = True
-                    continue
-                except OSError:
-                    complete = False
-                    unread_sticky = True
-                    continue
-                departed = unreadable = False
-                for tid in tids:
-                    if tid == name:
-                        continue
-                    try:
-                        _collect(os.path.join(task_dir, tid, "mountinfo"))
-                    except (FileNotFoundError, ProcessLookupError):
-                        departed = True
-                    except OSError as exc:
-                        if exc.errno == errno.EINVAL:
-                            continue  # a thread mid-exit: it holds no namespace
-                        unreadable = True
-                if unreadable:
-                    complete = False
-                    unread_sticky = True
-                elif departed:
-                    # A thread that exited between the ``tids`` snapshot and its
-                    # read may have left a successor THREAD holding its
-                    # namespace, which the outer re-listing (leaders only)
-                    # cannot show -- so the GROUP is re-read on the next pass
-                    # rather than this being either excused or made sticky.
-                    seen.discard(name)
-                    vanished = True
-                    departed_this_pass = True
-        if not vanished:
-            # Every departure so far was followed by a re-listing, so what
-            # remains unaccounted for is the still-present tasks that could not
-            # be read (sticky) plus nothing from this pass's departures.
-            _report()
-            return pinned, complete
-    # Still churning after the pass budget — coverage unproven, and the final
-    # pass's departures had no re-listing to catch a successor.
-    _report()
-    return pinned, False
-
-
-#: Wall-clock budget for ONE reclaim pass, keyed and legacy alike. A pile that
-#: cannot be cleared inside it is left for the next pass: the sweep runs on the
-#: maintenance executor, whose threads other housekeeping shares, and reclaim is
-#: resumable by construction (each entry is decided independently, and nothing
-#: depends on a pass finishing). Measured for scale: 939k directories took ~11s
-#: on tmpfs, so this clears a normal backlog in one pass and spreads a
-#: pathological one over a few, instead of occupying a worker for a minute.
-_SWEEP_TIME_BUDGET_SECONDS = 10.0
-
-#: How often the budget is consulted. A clock read per entry would be a
-#: measurable share of the work at these counts; per batch is close enough for a
-#: budget whose only job is to bound the pass.
-_SWEEP_BUDGET_CHECK_EVERY = 4096
-
-
-def _cleanup_stale_sandbox_mount_sources(*, roots: Sequence[str] | None = None) -> int:
-    """Reclaim orphaned bind-mount sources staged by the namespace launcher.
-
-    The launcher stages one empty dir per SENSITIVE_DIRS entry, one empty file
-    per SENSITIVE_FILES entry, and (strict only) an SSH shadow dir holding a
-    known-hosts copy, all named ``kirocrew_sb_<pid>_*`` on a tmpfs root. The
-    kernel pins each source while its bind-mount lives, so the launcher cannot
-    remove them and they orphan when the sandboxed process exits. Left alone
-    they exhaust the runtime tmpfs (``/run/user/$UID``), at which point the
-    systemd user manager cannot allocate transient scope units and every
-    ``systemd-run --scope``-wrapped spawn fails.
-
-    An entry becomes a reclaim candidate when its embedded pid is dead, or
-    past ``_MOUNT_SOURCE_MAX_AGE_SECONDS`` (the backstop for a pid recycled
-    onto an unrelated live process — routine on a ``pid_max=32768`` host).
-    What a candidate's removal may touch is then decided by kind, because a
-    bind source is NOT protected by the kernel against the sweeper: removing
-    it succeeds from this namespace (mountinfo then shows ``//deleted``), a
-    removed source DIRECTORY leaves the live mount's root inode ``S_DEAD`` so
-    every create under the masked path fails from then on, and a non-empty
-    dir's contents are visible inside any namespace still binding it:
-
-    - Plain files: ``os.remove``. A file source's inode is held by the mount
-      like an open descriptor, so the masked view is unaffected.
-    - Dirs, empty or not: removed only when no readable mount namespace
-      references the entry (:func:`_mount_pinned_source_names`) AND absence
-      of a pin is positively established — by the scan proving it covered
-      every namespace on the host, OR by it having read every task that
-      could hold one (:class:`_PinScanCoverage`: this uid's, the overflow
-      uid's and root's tasks, none unreadable, none departed between the
-      final listing and its read). The second is what this fix adds. The
-      host-wide flag also drops for another user's unreadable or departing
-      task, which cannot be holding a source this uid staged (the sandboxed
-      child keeps this uid with NO_NEW_PRIVS; only root can enter a foreign
-      namespace), and requiring it alone is what stranded the directory
-      class permanently on the hosts this sweep exists for (observed:
-      929,540 dirs retained against 511 files reclaimed, the runtime tmpfs
-      back at 100% of its inodes and every spawn failing again). A recycled
-      pid reads live yet has no mount, so its entry is still reclaimed after
-      the age backstop rather than stranded, while a genuine long-lived
-      sandbox is pinned by its own process. A namespace no PROCESS holds has
-      no mountinfo to report a pin — an fd- or bind-pinned namespace with
-      zero members is out of scope, and the launcher never creates one — so
-      the pin set cannot go stale in the deleting direction. The
-      fresh-and-alive skip above stays load-bearing for the launcher's own
-      staging window (after ``mkdtemp``, before ``mount``), when its entries
-      are legitimately live and not yet pinned.
-
-    Deliberately conservative about names: only the recognized
-    ``kirocrew_sb_<pid>_`` shape with an ASCII positive pid is touched.
-    Foreign ``tmp*`` names carry no liveness key and are left alone, as are
-    ``kirocrew_sandbox_*`` launcher scripts, the ``kirocrew_sbprobe_*`` tmpfs
-    probe, and prefix matches whose segment is not an ASCII positive decimal
-    (an oversized all-digit segment IS the recognized shape — it probes
-    OverflowError, reads stale, and is reclaimed). Some of these roots are
-    world-writable, so a planted entry — including a deep tree built to make
-    ``rmtree`` recurse — must fail toward "skip", never toward an exception
-    that kills the sweep.
-
-    Returns:
-        Number of entries removed.
-    """
-    now = time.time()
-    started = time.monotonic()
-    examined = 0
-    budget_spent = False
-    if roots is None:
-        roots = _mount_source_candidate_roots()
-    # (pinned set, scan-was-complete) — built lazily, once, on the first
-    # directory candidate (empty ones included: rmdir is gated too).
-    pin_scan: tuple[set[str], bool] | None = None
-    # Whether that scan read every task that could be a launcher descendant
-    # (``_PinScanCoverage``) -- the narrower claim the gate accepts when the
-    # host-wide flag is down for reasons that cannot involve a sandbox.
-    coverage = _PinScanCoverage()
-    removed = 0
-    dirs_held_back = 0
-    for root in roots:
-        if budget_spent:
-            break
-        try:
-            entries = os.listdir(root)
-        except OSError:
-            continue
-        for entry in entries:
-            if not entry.startswith(_MOUNT_SOURCE_PREFIX):
-                continue
-            examined += 1
-            if (
-                examined % _SWEEP_BUDGET_CHECK_EVERY == 0
-                and (time.monotonic() - started) > _SWEEP_TIME_BUDGET_SECONDS
-            ):
-                # Out of budget: stop cleanly and let the next pass continue.
-                # Reclaim is resumable per entry, so a partial pass is progress,
-                # never an inconsistent state.
-                budget_spent = True
-                break
-            pid_str, sep, _rest = entry[len(_MOUNT_SOURCE_PREFIX) :].partition("_")
-            pid = _parse_pid_segment(pid_str) if sep else None
-            if pid is None:
-                continue  # foreign / probe / planted names — no liveness key
-            path = os.path.join(root, entry)
-            try:
-                mtime = os.lstat(path).st_mtime
-            except OSError:
-                continue
-            over_age = (now - mtime) > _MOUNT_SOURCE_MAX_AGE_SECONDS
-            # Liveness probe via the shim — NEVER raw os.kill(pid, 0), which
-            # TERMINATES the target on Windows (platform_compat).
-            try:
-                alive = platform_compat.pid_exists(pid)
-            except OverflowError:
-                alive = False  # absurd pid digits from a corrupt name — stale
-            if alive and not over_age:
-                continue
-            if os.path.isdir(path) and not os.path.islink(path):
-                # ANY dir removal — even rmdir of an empty one — S_DEADs a
-                # live mount's root inode, so absence of a pin must be
-                # POSITIVELY established: either the host-wide scan proved its
-                # coverage, or it read every task that could be a launcher
-                # descendant (``coverage.covered``). The second is what keeps
-                # another user's unreadable or departing task from retaining
-                # the class forever — it cannot be holding a source this uid
-                # staged.
-                if pin_scan is None:
-                    pin_scan = _mount_pinned_source_names(coverage=coverage)
-                pinned, scan_complete = pin_scan
-                if entry in pinned or not (scan_complete or coverage.covered):
-                    dirs_held_back += 1
-                    continue
-                try:
-                    os.rmdir(path)
-                    removed += 1
-                    continue
-                except OSError:
-                    pass
-                try:
-                    shutil.rmtree(path, ignore_errors=True)
-                except Exception:
-                    continue  # e.g. a planted tree deep enough to exhaust recursion
-                # ignore_errors swallows a partial failure — count only a
-                # confirmed removal.
-                if not os.path.lexists(path):
-                    removed += 1
-            else:
-                try:
-                    os.remove(path)
-                    removed += 1
-                except OSError:
-                    pass
-    if dirs_held_back:
-        # An always-closed pin scan is otherwise indistinguishable from a
-        # working one while the dominant (directory) leak class re-accumulates
-        # — surface it so an operator can tell retention from reclamation.
-        scan_complete = pin_scan is not None and pin_scan[1]
-        covered = scan_complete or coverage.covered
-        # WARNING for the incomplete case, INFO for the benign pinned one.
-        # Holding entries back because a live namespace binds them is normal
-        # operation; holding them back on an unprovable scan is a FAULT — now
-        # survivable, because a candidate whose staging group is gone is
-        # reclaimed anyway, so what remains here is confined to entries whose
-        # tree still looks alive. Coverage of every task that could be a
-        # launcher descendant counts as proven for this purpose.
-        (logger.info if covered else logger.warning)(
-            "sandbox mount-source sweep: %d dir candidate(s) held back (%s)",
-            dirs_held_back,
-            (
-                "pinned by a live mount namespace"
-                if covered
-                else "pin scan incomplete and descendant coverage unproven"
-            ),
-        )
-    if budget_spent:
-        logger.info(
-            "sandbox mount-source sweep: paused at the %.0fs budget after %d entries "
-            "(%d reclaimed this pass); the next pass resumes",
-            _SWEEP_TIME_BUDGET_SECONDS,
-            examined,
-            removed,
-        )
-    return removed
-
-
-#: Pre-#6268 builds staged their bind-mount sources with ``tempfile``'s DEFAULT
-#: names, so those entries carry no pid and the pid-keyed sweep above cannot
-#: reason about them at all. Every install that upgraded through that change
-#: therefore carries a permanent pile — 1,836,596 entries measured on one host,
-#: enough on its own to exhaust the runtime tmpfs's inodes and stop every
-#: ``systemd-run --scope``-wrapped spawn. This is ``tempfile``'s exact shape:
-#: the ``tmp`` prefix plus 8 characters of its own alphabet.
-_LEGACY_MOUNT_SOURCE_RE = re.compile(r"^tmp[a-z0-9_]{8}$")
-
-#: How many legacy-shaped candidates a root must hold before the legacy pass
-#: touches ANY of them. An unkeyed name carries no provenance, so the pile IS
-#: the provenance: no program's ordinary scratch use leaves dozens of empty,
-#: 0o700, day-old ``tmp*`` directories in the session runtime dir, whereas the
-#: leak this pass exists for left 1.8 million on one host. Below the threshold
-#: every candidate is retained and the pass retires — there is no pile to heal.
-_LEGACY_PILE_THRESHOLD = 64
-
-#: Written once a legacy pass has completed, so the scan is not repeated for the
-#: life of the install: no current build creates these names, so a completed
-#: pass is final.
-_LEGACY_RESIDUE_MARKER = ".legacy-mount-source-residue-swept"
-
-
-def _launcher_tmpfs_roots() -> list[str]:
-    """The root the legacy pass may walk: the session runtime dir alone.
-
-    Deliberately narrower than :func:`_mount_source_candidate_roots`. The legacy
-    sweep matches an unkeyed ``tmp*`` name, so it may only walk a root where
-    that shape is far more likely ours than a stranger's. ``/run/user/$UID`` is
-    the launcher's first pick, is scoped to this uid's login session (nothing
-    keeps durable state there), and is where the observed pile lived.
-    ``/dev/shm`` is NOT walked even though the launcher falls back to it: it is
-    a host-wide tmpfs where any same-uid program's ``tempfile`` scratch
-    legitimately lives, and an empty day-old scratch dir there can still be a
-    live program's — a host whose launcher fell back to ``/dev/shm`` keeps the
-    manual note in the issue instead. The shared system tempdir is excluded
-    for the same reason, more so.
-    """
-    getuid = getattr(os, "getuid", None)
-    if getuid is None:
-        return []
-    return [f"/run/user/{getuid()}"]
-
-
-def _bound_source_basenames(
-    proc_root: str = "/proc", *, coverage: _PinScanCoverage | None = None
-) -> tuple[set[str], bool]:
-    """Basenames of legacy-shaped bind sources named by any live mount, plus
-    whether coverage was positively established.
-
-    The same traversal as :func:`_mount_pinned_source_names` — zombie leaders
-    consulted through ``task/``, the vanish re-listing, foreign-uid forgiveness
-    — with the name predicate swapped for tempfile's shape, because the legacy
-    residue carries no recognizable prefix. A first cut re-implemented the walk
-    and got two things wrong that this delegation cannot: it filtered on the
-    root field's DIRNAME, which is the source's path *within its own
-    filesystem* (``/tmpab12cd34``, never ``/run/user/$UID/tmpab12cd34``) so the
-    fence silently matched nothing; and it reported every ``EINVAL`` as a
-    coverage gap, which on a real host with a couple of dozen zombie leaders
-    made the pass permanently inert.
-
-    Keyed by basename only, which is why no root is taken: a same-named entry
-    on another filesystem shares the pin, which errs toward retention.
-    """
-    return _mount_pinned_source_names(
-        proc_root,
-        matcher=lambda name: bool(_LEGACY_MOUNT_SOURCE_RE.match(name)),
-        coverage=coverage,
-    )
-
-
-def _cleanup_legacy_mount_source_residue() -> int:
-    """One-shot reclaim of the pre-#6268, pid-less bind-mount source residue.
-
-    An install that upgraded past #6268 gained a sweep that can never touch what
-    the OLD build left behind, so the pile it inherited keeps the runtime tmpfs
-    at its inode ceiling and every agent spawn keeps failing — an upgrade that
-    ships the reclaim fix but not this leaves such a host exactly as broken as
-    before. Runs from the same entry point as the keyed sweep, so the gateway's
-    first cleanup pass after an update heals the host without an operator ever
-    learning what ``Failed to start transient scope unit: No space left on
-    device`` meant.
-
-    An unkeyed name cannot be PROVEN to be ours, so every fence here is about
-    keeping a stranger's entry rather than reclaiming ours:
-
-    - only on the session runtime tmpfs the launcher picks first
-      (:func:`_launcher_tmpfs_roots`), never ``/dev/shm`` or the shared system
-      tempdir, where another same-uid program's ``tempfile`` scratch lives;
-    - only ``tempfile``'s exact shape (:data:`_LEGACY_MOUNT_SOURCE_RE`);
-    - only DIRECTORIES owned by THIS uid with the exact mode ``mkdtemp``
-      creates (0o700) — a hand-made or umask-shaped entry is not one of
-      these, and the old build's ``mkstemp`` file sources are left alone: an
-      unlinked file another program still holds open loses what it writes
-      next, which no fence here can rule out, while an empty dir holds
-      nothing to lose;
-    - only past ``_MOUNT_SOURCE_MAX_AGE_SECONDS``, which every real member of
-      this class is by construction (no build has created the shape since
-      #6268) while a live program's scratch dir usually is not;
-    - only when no live mount names the entry as its source, and only when
-      that absence was POSITIVELY established (:func:`_bound_source_basenames`
-      complete, or every possible holder read — the same two claims as the
-      keyed dir gate, since ``/run/user/$UID`` is reachable by this uid and
-      root alone);
-    - only once a root shows the PILE this pass exists for
-      (:data:`_LEGACY_PILE_THRESHOLD` candidates passing every fence above):
-      a stray scratch dir or two never trips it and is retained outright,
-      while the leak class arrives by the hundred thousand;
-    - dirs go through ``os.rmdir``, which REFUSES a non-empty directory: that
-      is the emptiness fence, so a populated stranger's dir survives without a
-      listing, and so does the legacy SSH shadow dir (it holds a known-hosts
-      copy) — left for the human note in the issue rather than removed here;
-    - the one-shot marker is stamped only by a pass that reached the end AND
-      found nothing retained for age alone, so a host upgrading within a day
-      of its last old-build spawn does not retire the pass on that cohort.
-
-    Returns:
-        Number of entries removed.
-    """
-    marker = config_dir() / _LEGACY_RESIDUE_MARKER
-    try:
-        if marker.exists():
-            return 0
-    except OSError:
-        return 0
-    roots = _launcher_tmpfs_roots()
-    coverage = _PinScanCoverage()
-    bound, complete = _bound_source_basenames(coverage=coverage)
-    if not (complete or coverage.covered):
-        # Absence-of-bind not established — retry on the next sweep rather than
-        # remove on the strength of an unproven scan, and do NOT stamp the
-        # marker, or one bad scan would retire the pass forever. The same two
-        # claims the keyed dir gate accepts: ``/run/user/$UID`` is 0o700 and
-        # this uid's, so its entries are reachable by this uid and root alone,
-        # which is exactly what ``covered`` vouches for. Say so at WARNING,
-        # like the keyed sweep's held-back report: on a host whose /proc never
-        # settles this pass stays inert every tick, and a silent return would
-        # be the same invisible-at-default-log-level failure the keyed sweep's
-        # diagnostic exists to end.
-        logger.warning(
-            "sandbox mount-source sweep: legacy pass retained everything — bind "
-            "coverage of /proc could not be established (pin scan incomplete, "
-            "holder coverage unproven); the pass retries on the next tick"
-        )
-        return 0
-    now = time.time()
-    started = time.monotonic()
-    examined = 0
-    budget_spent = False
-    getuid = getattr(os, "getuid", None)
-    own_uid = getuid() if getuid is not None else None
-    removed = 0
-
-    young_retained = False
-
-    def _reclaim(path: str) -> bool:
-        try:
-            os.rmdir(path)  # refuses a non-empty dir by design
-        except OSError:
-            return False
-        return True
-
-    for root in roots:
-        if budget_spent:
-            break
-        try:
-            entries = os.scandir(root)
-        except OSError:
-            continue
-        # Candidates are buffered until the root proves it holds the pile;
-        # below the threshold nothing in the buffer is touched. Once it is
-        # reached the buffer is drained and reclaim streams from then on.
-        pending: list[str] = []
-        engaged = False
-        with entries:
-            for entry in entries:
-                if not _LEGACY_MOUNT_SOURCE_RE.match(entry.name) or entry.name in bound:
-                    continue
-                examined += 1
-                if (
-                    examined % _SWEEP_BUDGET_CHECK_EVERY == 0
-                    and (time.monotonic() - started) > _SWEEP_TIME_BUDGET_SECONDS
-                ):
-                    budget_spent = True
-                    break
-                try:
-                    info = entry.stat(follow_symlinks=False)
-                except OSError:
-                    continue
-                if own_uid is not None and info.st_uid != own_uid:
-                    continue
-                # Directories only. The old build staged a mkstemp FILE per
-                # masked file too, but an unlinked file another program still
-                # holds open loses whatever it writes next, and nothing here
-                # can tell such a file from ours; an empty directory holds no
-                # data to lose and a stranger's mkdtemp dir gets ENOENT on its
-                # next create, an error rather than silent loss.
-                if not stat.S_ISDIR(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o700:
-                    continue
-                if (now - info.st_mtime) <= _MOUNT_SOURCE_MAX_AGE_SECONDS:
-                    young_retained = True  # ages into candidacy on a later pass
-                    continue
-                if engaged:
-                    removed += _reclaim(entry.path)
-                    continue
-                pending.append(entry.path)
-                if len(pending) >= _LEGACY_PILE_THRESHOLD:
-                    engaged = True
-                    for queued in pending:
-                        removed += _reclaim(queued)
-                    pending = []
-        if pending and not engaged:
-            logger.info(
-                "sandbox mount-source sweep: %d legacy-shaped entries under %s are below "
-                "the pile threshold (%d); retained as not provably ours",
-                len(pending),
-                root,
-                _LEGACY_PILE_THRESHOLD,
-            )
-    if budget_spent:
-        logger.info(
-            "sandbox mount-source sweep: legacy pass paused at the %.0fs budget after "
-            "%d entries (%d reclaimed); the next pass resumes",
-            _SWEEP_TIME_BUDGET_SECONDS,
-            examined,
-            removed,
-        )
-    elif young_retained:
-        logger.info(
-            "sandbox mount-source sweep: legacy pass complete but not retired — "
-            "legacy-shaped entries under the age fence remain; the next pass "
-            "that finds none stamps the marker"
-        )
-    else:
-        # Stamp only a pass that reached the end of the residue AND left no
-        # cohort behind for age, or a budget-truncated walk's remainder — or a
-        # host upgrading within a day of its last old-build spawn — would be
-        # retired unswept.
-        try:
-            marker.parent.mkdir(parents=True, exist_ok=True)
-            # Create-only and never through a symlink: a planted link at this
-            # path must fail the stamp (the pass just repeats) rather than
-            # have the gateway write wherever it points.
-            fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-            try:
-                os.write(fd, f"{int(now)} removed={removed}\n".encode())
-            finally:
-                os.close(fd)
-        except OSError:
-            # An unstampable marker only costs a repeat pass, which is idempotent.
-            logger.debug("legacy mount-source sweep: could not stamp %s", marker, exc_info=True)
-    if removed:
-        logger.info(
-            "sandbox mount-source sweep: reclaimed %d pre-prefix legacy entries "
-            "(one-shot; these carry no pid and no earlier build could reclaim them)",
-            removed,
-        )
-    return removed
-
-
-def _cleanup_retired_acp_snapshot_dir() -> int:
-    """Reclaim `<config_dir>/run/kiro-cli-snapshots` from before the in-place launch.
-
-    KiroCrew used to copy the whole kiro-cli binary here per ACP spawn generation
-    and exec the copy. The CLI is now launched in place, so nothing writes this
-    tree — but an install upgrading past that change keeps every orphaned copy
-    forever (observed: 196 MB in two ~100 MB copies). Nothing else reclaims them:
-    the sweep above only matches `kirocrew_sandbox_*` FILES in this same dir, and
-    the tree sits on `security._SENSITIVE_HOME_DIRS`, so the agent cannot delete
-    it either — on request or otherwise. Best-effort and idempotent; returns 1
-    when a tree was removed so the periodic sweep logs it.
-    """
-
-    retired = config_dir() / "run" / "kiro-cli-snapshots"
-    if not retired.is_dir():
-        return 0
-    shutil.rmtree(retired, ignore_errors=True)
-    # ignore_errors swallows partial failures, so report only a real removal.
-    return 0 if retired.exists() else 1
 
 
 # ── Public API ──
@@ -5367,15 +8571,32 @@ def _allow_no_isolation() -> bool:
         return False
 
 
+#: ``_unsandboxed_exec_grant()`` verdicts. Kept as constants because the warning
+#: text, the SEL ``resources`` string and the tests all have to name the same
+#: two cases, and a typo in any one of them would silently read as "not granted".
+UNSANDBOXED_BY_OPERATOR = "operator"
+UNSANDBOXED_BY_PLATFORM = "platform"
+
+
 def _allow_unsandboxed_exec() -> bool:
-    """Whether the operator has explicitly opted into allowing execution
-    without ANY sandbox backend (fail-open behavior).
+    """Whether execution is permitted when NO sandbox backend is available.
 
-    When False (default), wrap_argv will RAISE instead of returning unmodified
-    argv when no sandbox backend is available. This is the fail-closed behavior
-    required by a penetration-test finding.
+    The one boolean gate ``wrap_argv`` consults, and the seam a test patches to
+    pin a host as permitting or refusing. A plain read of
+    ``agent.sandbox_allow_unsandboxed_exec``, because that field CARRIES the
+    effective policy — :func:`~kiro_crew.config.loader
+    .unsandboxed_exec_platform_default` is resolved into it at load time, so an
+    undeclared key reads ``True`` on a platform with no installable
+    backend and a declared ``false`` reads ``False`` everywhere.
 
-    Read lazily from config to avoid an import cycle with the config loader.
+    Deliberately not keyed on whether the operator DECLARED the key. That would
+    make a full-document ``KiroCrewConfig.save()`` — which publishes
+    ``asdict(self.agent)``, materializing every field — turn "never decided" into
+    a declared lockdown and re-brick every spawn on such a platform. Meaning has
+    to live in the value, so that writing the resolved value back changes nothing.
+
+    An unreadable config yields ``False``: a broken config must never be a way to
+    obtain a LOOSER sandbox than the operator configured.
     """
     try:
         from kiro_crew.config.loader import (
@@ -5385,6 +8606,133 @@ def _allow_unsandboxed_exec() -> bool:
         return bool(getattr(KiroCrewConfig.load().agent, "sandbox_allow_unsandboxed_exec", False))
     except Exception:
         return False
+
+
+def _unsandboxed_grant_source(permitted: bool) -> str:
+    """Which permission let a spawn through, for the warning and the SEL event.
+
+    Derived FROM the gate's own verdict rather than resolved independently, so the
+    two can never contradict each other about one spawn — including when a test
+    patches :func:`_allow_unsandboxed_exec`, where an independent read would
+    describe the real host while the gate described the pinned one.
+
+    The split is not cosmetic: it is what lets the audit log say whether a host ran
+    unconfined because an operator accepted the risk or because the platform
+    default did, and only the operator case survives a later change to that
+    default. A declaration is what distinguishes them, so an unreadable config
+    reports the platform — the gate can only have said ``True`` there via the
+    platform branch anyway.
+    """
+    if not permitted:
+        return ""
+    return UNSANDBOXED_BY_OPERATOR if _unsandboxed_exec_key_declared() else UNSANDBOXED_BY_PLATFORM
+
+
+def _unsandboxed_exec_key_declared() -> bool:
+    """Whether the operator declared the opt-in key at all, for message wording.
+
+    Thin, failure-tolerant wrapper over
+    :func:`~kiro_crew.config.loader.unsandboxed_exec_declared` so a refusal can
+    tell "you set this to false" apart from "you never set it" without a broken
+    config turning the refusal itself into an exception. Diagnostic only — it never
+    decides whether a spawn runs.
+    """
+    try:
+        from kiro_crew.config.loader import (  # circular import: sandbox is a low-level dep
+            unsandboxed_exec_declared,
+        )
+
+        return unsandboxed_exec_declared()
+    except Exception:
+        return False
+
+
+def _forward_ssh_auth_sock() -> bool:
+    """Whether the operator has explicitly opted into keeping SSH_AUTH_SOCK in
+    the agent subprocess environment.
+
+    When False (default), SSH_AUTH_SOCK is scrubbed like every other entry in
+    ``_SENSITIVE_ENV_PREFIXES`` - today's behaviour, unchanged. When True, the
+    single ``SSH_AUTH_SOCK`` key is kept so git commit signing and git-over-SSH
+    inside the sandbox can reach the operator's ssh-agent. The socket grants USE
+    of the agent's keys, not possession; the private key material is never
+    forwarded, and under the strict tier ~/.ssh stays hidden/read-denied.
+
+    Consent lives on the KEYSTONE leaf ``ssh_auth_sock_consent.json``, NOT in the
+    agent-readable ``config.json``. Keeping the socket forwarded grants USE of the
+    operator's keys for the whole session, which is an authorization, not a
+    preference: an agent-writable enable could be flipped by a prompt-injected
+    shell, and the next subagent spawn -- which re-reads this per spawn -- would
+    then authenticate as the operator. The OS sandbox mounts the keystone
+    read-only for the agent's shell and ``is_sensitive_path`` fences the file
+    tools, so the consent cannot be flipped from inside the sandbox. This mirrors
+    ``computer_use.json`` and the other credential-class consents.
+
+    Fail-closed: any failure to read consent returns False, so the socket is
+    scrubbed unless the operator positively enabled forwarding. Read lazily to
+    avoid an import cycle with the config loader.
+
+    Windows has no ``SSH_AUTH_SOCK`` (Win32 OpenSSH's agent is a named pipe, not
+    a Unix-domain socket), so the forward is a no-op there regardless of consent:
+    an opt-in default-off feature must simply not be offered on a platform where
+    the concept it forwards does not exist. This mirrors ``_resolve_ssh_auth_sock``
+    returning early on Windows.
+    """
+    if platform_compat.IS_WINDOWS:
+        return False
+    try:
+        from kiro_crew import (
+            ssh_auth_sock_consent,  # circular import: sandbox is a low-level dep of config.loader
+        )
+
+        return ssh_auth_sock_consent.is_granted()
+    except Exception:
+        return False
+
+
+def unsandboxed_exec_permitted_by() -> str:
+    """Public read of the no-backend execution verdict, for diagnostics.
+
+    The same resolution :func:`wrap_argv` gates on, exposed so ``doctor`` reports
+    the policy the spawn path will actually apply instead of re-deriving it from
+    the config field — which records only what the operator DECLARED, and reads
+    ``False`` both for "locked down" and for "never decided".
+
+    Returns ``UNSANDBOXED_BY_OPERATOR``, ``UNSANDBOXED_BY_PLATFORM`` or ``""``.
+
+    Deliberately does NOT fold in the governance ``sandbox.min_level`` floor: the
+    floor is resolved per spawn against the mode that spawn requested, so a single
+    host-level answer would be wrong for some of them. A caller that reports this
+    verdict must say that a floor overrides it.
+    """
+    return _unsandboxed_grant_source(_allow_unsandboxed_exec())
+
+
+def _agent_scrub_prefixes(base: list[str], forward_ssh_auth_sock: bool) -> list[str]:
+    """Filter the ``SSH_AUTH_SOCK`` prefix out of *base* when *forward_ssh_auth_sock*
+    is set, else return *base* unchanged.
+
+    The forward decision is passed in as an already-resolved boolean, NOT read
+    from config here: config resolution (:func:`_forward_ssh_auth_sock`) is done
+    ONCE on the agent spawn path in the off-loop environment-prep hop, then
+    threaded down to the launcher builders as an explicit parameter -- exactly as
+    ``strip_python_env`` is. This keeps the synchronous config read off the
+    asyncio event loop (anchor: no-blocking-call-on-event-loop) AND scopes the
+    forward to agent spawns: the generic launcher builders default the flag to
+    False, so a non-agent caller (a third-party app ``openCommand`` going through
+    the same generic ``wrap_argv`` launcher, a ``sandboxed_spawn_argv`` spawn)
+    never re-admits the socket.
+
+    It filters the exact literal ``"SSH_AUTH_SOCK"`` prefix only; every other
+    credential prefix is untouched, so the opt-in can never widen into a general
+    env passthrough. The shared module constant ``_SENSITIVE_ENV_PREFIXES`` is
+    NEVER mutated here - mcp_gateway.manager imports it to refuse credential keys
+    in MCP declared-env forwarding, and that refusal must keep covering
+    SSH_AUTH_SOCK regardless of this flag.
+    """
+    if not forward_ssh_auth_sock:
+        return base
+    return [p for p in base if p != "SSH_AUTH_SOCK"]
 
 
 # Fallback tier for configured_sandbox_mode() when the config cannot be read.
@@ -5441,7 +8789,8 @@ def configured_sandbox_mode() -> str:
 # The single environment marker that proves this process is already INSIDE a
 # KiroCrew namespace sandbox. Deny-by-default: the gate keys ONLY on the
 # explicit, single-purpose ``KIROCREW_SANDBOX_ACTIVE``, which is exported at
-# exactly one site — the namespace launcher main() (see the export beside
+# exactly one site — the namespace launcher main() that
+# ``sandbox_launcher._build_launcher_script`` renders (see the export beside
 # ``KIROCREW_HOST_PID``). We deliberately do NOT key on ``KIROCREW_HOST_PID``:
 # it is dual-purpose session-identity plumbing, and gating a security-relevant
 # passthrough on a variable set for other reasons is a latent bypass. Since the
@@ -5752,8 +9101,8 @@ def agent_confinement_evidence() -> str | None:
 
     The runtime half of the operator-attestation check used by authorization
     gates whose input must come from a human at a host terminal and never from
-    an agent-spawned process (the app dev-mode out-of-install confirmation,
-    #6907). Returns a short human-readable reason when there is ANY evidence of
+    an agent-spawned process (the app dev-mode out-of-install confirmation).
+    Returns a short human-readable reason when there is ANY evidence of
     confinement, ``None`` when there is none.
 
     Deny-direction only, and deliberately so: each signal is unforgeable *in
@@ -5776,7 +9125,7 @@ def agent_confinement_evidence() -> str | None:
     return None
 
 
-def _warn_no_isolation(mode: str) -> None:
+def _warn_no_isolation(mode: str, granted_by: str = "") -> None:
     """Loudly surface that the agent subprocess is running WITHOUT OS-level
     isolation, so the fallback is never silent.
 
@@ -5786,15 +9135,38 @@ def _warn_no_isolation(mode: str) -> None:
     degradation of the security posture, so it is logged as a WARNING unless
     the operator has explicitly acknowledged it via
     ``agent.sandbox_allow_no_isolation``. Emitted once per process.
+
+    ``granted_by`` names which permission let the spawn through
+    (``UNSANDBOXED_BY_OPERATOR`` / ``UNSANDBOXED_BY_PLATFORM``) and changes the
+    REMEDY, not the severity. "Install a supported sandbox" is unactionable on a
+    platform that has none to install, and a warning whose only suggestion is
+    impossible trains readers to ignore it — so a platform-default grant is told
+    how to LOCK THE HOST DOWN instead. The default is empty so the existing
+    ``mode="off"`` callers keep the operator-shaped text.
     """
     if getattr(wrap_argv, "_warned", False):
         return
     wrap_argv._warned = True  # type: ignore[attr-defined]
     if _allow_no_isolation():
         logger.info(
-            "OS-level sandbox unavailable (mode=%s); running WITHOUT credential "
-            "isolation. Operator opted in via agent.sandbox_allow_no_isolation; "
-            "app-level checks are the only remaining boundary.",
+            "OS-level sandbox unavailable (mode=%s, permitted by %s); running "
+            "WITHOUT credential isolation. Operator opted in via "
+            "agent.sandbox_allow_no_isolation; app-level checks are the only "
+            "remaining boundary.",
+            mode,
+            granted_by or "config",
+        )
+        return
+    if granted_by == UNSANDBOXED_BY_PLATFORM:
+        logger.warning(
+            "SECURITY: this platform offers no OS-level sandbox backend for Kiro "
+            "Crew to apply (mode=%s), so the agent subprocess runs WITHOUT "
+            "credential isolation — ~/.aws, ~/.ssh and other secrets are readable "
+            "by it and only the bypassable app-level security.py checks remain. "
+            "This is the documented default for such a host, not a failure: no "
+            "backend can be installed here. To refuse these spawns instead, set "
+            "agent.sandbox_allow_unsandboxed_exec=false in ~/.kiro/crew/config.json "
+            "(or pin a governance sandbox.min_level, which overrides it fleet-wide).",
             mode,
         )
         return
@@ -6016,8 +9388,8 @@ def detect_backend(config_mode: str = "auto") -> str:
       spawn re-probes and self-heals.
     - ``config_mode="off"`` short-circuits to ``"none"`` without probing and
       without touching the cache. All other modes share one cache entry:
-      backend capability is mode-independent, so mode alternation no longer
-      forces pointless re-probes.
+      backend capability is mode-independent, so mode alternation does not
+      force pointless re-probes.
     """
     global _backend
     if config_mode == "off":
@@ -6040,6 +9412,45 @@ def detect_backend(config_mode: str = "auto") -> str:
         _backend = "none"
     logger.info("Sandbox backend: %s (config_mode=%s)", _backend, config_mode)
     return _backend
+
+
+#: Env marker the cron *script* launcher sets on its child -- the one way to tell
+#: that child apart at a spawn site every caller shares.
+CRON_SCRIPT_CHILD_ENV = "_KIROCREW_CRON_SCRIPT_CHILD"
+
+
+class UnauditedSpawnRefused(BaseException):
+    """A cron script child refused to proceed after an ENOSYS audit failure.
+
+    ``BaseException`` because it is raised inside the user function's own stack
+    (``ctx.call_tool`` re-enters ``wrap_argv``), and a script's own ``except
+    Exception`` must not be able to swallow it and return a success envelope.
+    """
+
+
+def refuse_unaudited_on_dead_fs(exc: BaseException, what: str) -> None:
+    """Turn a best-effort audit degrade into a refusal, for a cron script child.
+
+    Log-and-proceed is right for the gateway: denying a spawn on an audit hiccup
+    would brick built-in tooling and every in-sandbox MCP call. It is wrong for a
+    detached cron child, whose ``ENOSYS`` write means its filesystem is gone, so it
+    can neither audit nor persist what it does next. Both conditions are required.
+    """
+    if os.environ.get(CRON_SCRIPT_CHILD_ENV) != "1":
+        return
+    # SEL wraps its writes, so the errno can sit a link or two down the chain;
+    # ``seen`` bounds a cyclic one.
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        if isinstance(cur, OSError) and cur.errno == errno.ENOSYS:
+            raise UnauditedSpawnRefused(
+                f"{what}: the security-event log write failed with ENOSYS (errno 38), "
+                "so this cron child can neither audit nor persist -- refusing to "
+                "continue unaudited."
+            ) from exc
+        seen.add(id(cur))
+        cur = cur.__cause__ or cur.__context__
 
 
 class SandboxUnavailableError(RuntimeError):
@@ -6077,6 +9488,206 @@ class SandboxUnavailableError(RuntimeError):
         self.kind = kind
         self.detail = detail
         self.remedy = remedy
+
+
+#: Leading text of every line the Linux launcher writes when it ends WITHOUT
+#: exec'ing its child: ``_mount_or_die`` and the seccomp/prctl installs say
+#: ``sandbox: BLOCKED``, the two unshare steps say ``sandbox: unshare(``, a
+#: broken parent/child handshake or an unreadable ``known_hosts`` says
+#: ``sandbox: FATAL``, and a launcher invoked with no command says
+#: ``sandbox_launcher:``. The launcher is the only Kiro Crew code that writes
+#: a line shaped this way to a child's stderr, and it exits right after, so a
+#: refused child's captured output carries exactly one of these. Public because
+#: it is the ONE definition every consumer keys on — :func:`launcher_refusal`
+#: here and the clone probe's exit classifier in
+#: ``apps/builtins/auto_improvement/backend/clone_setup.py`` — and each prefix
+#: is pinned against the generated launcher by a round-trip test so the tuple
+#: cannot drift from the script that emits it. ``sandbox: WARNING`` is
+#: deliberately absent: the launcher warns and then still runs the child.
+LAUNCHER_EXIT_PREFIXES = (
+    "sandbox: BLOCKED",
+    "sandbox: FATAL",
+    "sandbox: unshare(",
+    "sandbox_launcher:",
+)
+_LAUNCHER_REFUSAL_RE = re.compile(
+    r"^sandbox: (?:BLOCKED (?:--|—) )?(?P<what>.+?) failed: errno (?P<errno>\d+)"
+)
+
+
+def launcher_refusal(output: str) -> tuple[str, str, str] | None:
+    """Classify the launcher's OWN refusal line in a refused child's output.
+
+    ``wrap_argv`` raises :class:`SandboxUnavailableError` when the sandbox
+    cannot be built BEFORE the spawn. The launcher can also refuse AFTER it — a
+    host that passed the probe can still deny a control at spawn time, and a
+    probe result cached under one policy can outlive a policy change. That
+    refusal reaches the caller only as a non-zero exit with the launcher's line
+    in the captured stderr, which every caller so far read as "the child is
+    broken": a present, signed-in kiro-cli was reported as not installed because
+    a container refused the launcher's first mount.
+
+    Returns the same ``(kind, detail, remedy)`` triple the typed error carries,
+    or ``None`` when *output* holds no launcher refusal. Keys ONLY on the
+    launcher's fixed prefixes, never on host capability.
+
+    **The line is untrusted, and this function is the CLASSIFIER, not the
+    verdict.** The child the launcher would have exec'd is the unverified
+    candidate itself, running inside the sandbox this module built, and a
+    planted binary can print the same prefix to stderr and exit 1. A caller that
+    reported this triple as a sandbox verdict would let that binary make the
+    first-run gate announce "sandbox unavailable" and hand the operator the
+    opt-out that disables the isolation it is running under. Callers deciding a
+    verdict use :func:`corroborate_launcher_refusal`, which re-runs the real
+    launcher around a trusted no-op with the refused spawn's own options and
+    classifies THAT run's own stderr through this function; the candidate's line
+    only decides whether to make that trusted run. This function is for
+    messaging (a diagnostic that quotes the line) and for that corroboration's
+    hint.
+
+    * A refused ``mount(2)`` or ``unshare(2)`` is ``no_backend`` — the host
+      cannot build the sandbox — and its errno is classified exactly as the
+      probe classifies the same step, so the remedy names the same mechanism
+      (a hiding mount refused with EACCES is the same policy that refuses the
+      propagation mount, so it shares :data:`REMEDY_MOUNT_DENIED`).
+    * The seccomp/prctl installs are ``no_backend`` with no mechanism token: the
+      host offers no way to apply the filter.
+    * A broken parent/child handshake (``FATAL ... did not publish``) is
+      ``transient``: the pipe protocol failed, which says nothing about the
+      host and self-heals on the next spawn.
+    * A refusal about HOST STATE is NOT a sandbox failure at all — a hardlinked
+      credential, an unreadable ``known_hosts``: the sandbox worked and found
+      something it must not paper over. Reported as ``None`` so the launcher's
+      line reaches the operator as the child's own complaint, which names the
+      file to fix. A launcher invoked with no command (``sandbox_launcher:``)
+      is the caller's defect, ``None`` for the same reason. Advisory
+      ``sandbox: WARNING`` lines never match: the launcher continued past them.
+    """
+    for raw in output.splitlines():
+        line = raw.strip()
+        if not line.startswith(LAUNCHER_EXIT_PREFIXES):
+            continue
+        if line.startswith("sandbox_launcher:"):
+            return None
+        if line.startswith("sandbox: FATAL"):
+            return ("transient", line, "") if "did not publish" in line else None
+        if "hardlink" in line:
+            return None
+        match = _LAUNCHER_REFUSAL_RE.match(line)
+        if match is None:
+            return ("no_backend", line, "")
+        what = match.group("what")
+        err = int(match.group("errno"))
+        if what.startswith("unshare(NEWUSER)"):
+            step = _PROBE_STEP_NEWUSER
+        elif what.startswith("unshare(NEWNS)"):
+            step = _PROBE_STEP_NEWNS
+        else:
+            step = _PROBE_STEP_MOUNT_PRIVATE
+        return ("no_backend", line, _remedy_for_step(step, err))
+    return None
+
+
+#: Wall-clock ceiling for the trusted corroboration run. The child is ``true``,
+#: which returns at once, so the budget is for the launcher's own setup (the
+#: namespace unshares, the propagation mount, the seccomp install) and a
+#: momentarily loaded host, and it bounds the worker thread so a wedged launcher
+#: cannot stall the caller.
+_TRUSTED_LAUNCHER_TIMEOUT_SECS = 15.0
+
+
+def corroborate_launcher_refusal(
+    output: str,
+    *,
+    mode: str = "strict",
+    extra_hidden_dirs: tuple[str, ...] = (),
+    extra_visible_dirs: tuple[str, ...] = (),
+) -> tuple[str, str, str] | None:
+    """A post-spawn sandbox verdict for a refused child -- from a TRUSTED launcher run.
+
+    The launcher's refusal line (:func:`launcher_refusal`) is the only signal a
+    post-spawn refusal leaves, and it cannot be trusted on its own: the child
+    was the unverified candidate, and a planted ``kiro-cli`` can print the same
+    line and exit 1. So the candidate's line decides only WHETHER to look
+    further. The verdict comes from re-running the REAL launcher around a
+    trusted no-op (``true``), under the refused spawn's own ``mode`` and
+    hidden/visible dirs, and classifying THAT run's own stderr -- text no child
+    wrote.
+
+    Running the whole launcher (not the boot probe) is what makes this cover
+    EVERY launcher step. The probe mirrors only the first three -- the two
+    unshares and the propagation mount -- so a policy that refused a LATER step
+    (a hiding bind mount, ``NO_NEW_PRIVS``, the seccomp-BPF install) left the
+    probe building the sandbox while every real spawn died, and the refusal was
+    reported as ``installed=False``. The no-op runs every step, so its stderr
+    carries whichever one this host refuses.
+
+    * No launcher line in *output*: ``None``, nothing run.
+    * Off Linux: ``None``, nothing run. The prefixes are the Linux launcher's,
+      so elsewhere a matching line can only be the child's own text.
+    * No trusted ``true`` on the host: ``None`` -- nothing safe to run.
+    * The sandbox cannot even be built for the no-op: the pre-spawn
+      :class:`SandboxUnavailableError`'s own ``(kind, detail, remedy)``.
+    * The no-op run times out: ``None``.
+    * The no-op run exits 0: ``None``. The candidate's line was forged, or the
+      refusal was momentary; either way the text reaches the operator as the
+      child's own complaint, never as a sandbox verdict.
+    * The no-op run exits non-zero: :func:`launcher_refusal` of ITS stderr -- a
+      real launcher refusal classified into the triple, or ``None`` when that
+      trusted line is host state (a hardlinked credential) rather than a sandbox
+      failure.
+
+    The candidate's own text can never become the verdict on any branch. The
+    real launcher blocks on a subprocess, so a caller on an event loop runs this
+    in a thread. It touches the backend cache for nothing: a spawn's report must
+    not move a process-wide verdict, even by way of a real launcher run.
+    """
+    if launcher_refusal(output) is None:
+        return None
+    if sys.platform != "linux":
+        return None
+    noop = platform_compat.trusted_system_bin("true")
+    if noop is None:
+        return None
+    try:
+        argv, env, cleanup_path = sandboxed_spawn_argv(
+            [noop],
+            mode=mode,
+            strip_python_env=True,
+            extra_hidden_dirs=extra_hidden_dirs,
+            extra_visible_dirs=extra_visible_dirs,
+        )
+    except SandboxUnavailableError as exc:
+        # The launcher could not be built at all for the trusted no-op, so the
+        # host offers the same verdict a pre-spawn refusal would have carried.
+        return (exc.kind, exc.detail, exc.remedy)
+    try:
+        # The spawn stays in this function, next to the ``sandboxed_spawn_argv``
+        # call that built its argv, so the spawn audit can see the routing and
+        # the resource ceiling together. ``stdin`` is closed so the child
+        # cannot block on input, and stderr is decoded leniently because it is
+        # the launcher's diagnostic, not structured data.
+        completed = run_limited(
+            argv,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=_TRUSTED_LAUNCHER_TIMEOUT_SECS,
+        )
+    except subprocess.TimeoutExpired:
+        # A launcher that will not return in the budget says nothing certain
+        # about the host; the operator still has the candidate's own line.
+        return None
+    finally:
+        if cleanup_path is not None:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(cleanup_path)
+    if completed.returncode == 0:
+        return None
+    return launcher_refusal(completed.stderr)
 
 
 def reset_backend() -> None:
@@ -6147,6 +9758,76 @@ def credential_mask_applies(mode: str) -> bool:
     # ENFORCED adapter reaches here at all: ``enforce_sandbox_floor`` returns early
     # for every harness this core does not enforce, so no first-class path changes.
     return False
+
+
+def spawn_delegates_masking() -> bool:
+    """Whether the agent spawn is DELEGATED, so Crew's own hidden-dir mask never runs.
+
+    :func:`credential_mask_applies` answers whether ``wrap_argv`` would thread
+    ``extra_hidden_dirs`` through the backend it selects. That is the right
+    question for a mode/backend hole and the wrong one for a DELEGATION hole: on
+    macOS with kiro-cli's internal sandbox enabled, a backend is present, so that
+    predicate answers True, and yet the spawn is handed to kiro-cli
+    (``_delegate_to_kiro_internal_sandbox``) and Crew's mask is not applied at
+    all. Native Windows delegates for the same reason with no Crew backend to
+    apply.
+
+    Kept here rather than in a caller, for the reason
+    :func:`credential_mask_applies` states about itself: a control whose security
+    argument depends on the mask must not carry its own copy of when the mask is
+    skipped. It is a SEPARATE predicate rather than a widening of that one
+    because the two answer different questions, and their existing callers depend
+    on the narrower answer -- a caller that only needs "would the backend carry
+    the mask" must not start refusing a delegated spawn it never cared about.
+
+    Read-only, and never raises: an unreadable delegation setting reads as
+    DELEGATED, which is the fail-closed direction -- a mask that may not run is
+    not trusted.
+    """
+    try:
+        if sys.platform == "win32":
+            return True
+        return bool(sys.platform == "darwin" and kiro_internal_sandbox_enabled())
+    except Exception:  # noqa: BLE001 -- an unverifiable setting is delegated, not trusted
+        return True
+
+
+def unconfined_live_agent_pid(pids: "Iterable[int]") -> int | None:
+    """The first pid among *pids* that is NOT actually confined, or ``None``.
+
+    Confinement is decided at SPAWN by :func:`wrap_argv`, and ``agent.sandbox``
+    is a live setting -- it carries no ``restart=True`` marker, so it reaches the
+    running gateway the moment it is saved. A session spawned while the tier was
+    ``off`` therefore stays unconfined after the config flips, and a control that
+    reads only :func:`configured_sandbox_mode` is asking about the NEXT spawn
+    while the hazard is a process already running. This asks about the processes.
+
+    Reuses the platform predicates ``member_memory_auth`` uses for the same
+    question rather than inventing a second answer: on Linux a confined child
+    holds different user/mount namespaces than the gateway, so MATCHING
+    namespaces mean unconfined; on macOS Seatbelt membership is read directly.
+    Both return ``None`` when the answer cannot be read, and an unreadable
+    process counts as UNCONFINED -- "cannot verify" is not "is confined".
+
+    Native Windows has no Crew confinement to verify, so every pid there answers
+    unconfined and a caller whose security argument needs the mask refuses on
+    that platform, which is the same posture ``spawn_delegates_masking`` takes.
+    """
+    for pid in pids:
+        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 1:
+            return pid if isinstance(pid, int) and not isinstance(pid, bool) else -1
+        try:
+            if sys.platform == "linux":
+                if platform_compat.process_namespaces_match(pid, os.getpid()) is not False:
+                    return pid
+            elif sys.platform == "darwin":
+                if platform_compat.process_is_sandboxed(pid) is not True:
+                    return pid
+            else:
+                return pid
+        except Exception:  # noqa: BLE001 -- unreadable is unconfined, never confined
+            return pid
+    return None
 
 
 def effective_sandbox_mode(mode: str) -> str:
@@ -6253,9 +9934,15 @@ def wrap_argv(
     mode: str = "auto",
     *,
     strip_python_env: bool = False,
+    forward_ssh_auth_sock: bool = False,
     extra_hidden_dirs: tuple[str, ...] = (),
+    extra_hidden_dir_ids: tuple[tuple[str, int, int], ...] = (),
+    extra_alias_credential_ids: tuple[tuple[int, int], ...] = (),
     extra_visible_dirs: tuple[str, ...] = (),
+    extra_private_dirs: tuple[str, ...] = (),
+    extra_private_dir_ids: tuple[tuple[str, int, int], ...] = (),
     extra_writable_dirs: tuple[str, ...] = (),
+    extra_expose_files: tuple[str, ...] = (),
     is_kiro_cli: bool | None = None,
     first_party_fixed_argv: bool = False,
 ) -> tuple[list[str], str | None]:
@@ -6268,16 +9955,26 @@ def wrap_argv(
               ``"strict"`` (hide everything), ``"off"`` (no sandbox).
         extra_hidden_dirs: Additional absolute directory trees to deny.
         extra_visible_dirs: Trusted paths that must remain visible when an
-            otherwise-hidden parent contains them.
+            otherwise-hidden parent contains them (the whole parent's mask is lifted).
+        extra_private_dirs: The spawn's OWN directories inside a hidden tree
+            (its ``agent_scratch`` dir under the masked scratch root). Re-exposed
+            read-write as a window; the parent's mask and every sibling stay hidden.
+        extra_expose_files: Absolute files to keep READABLE inside dirs that
+            ``extra_hidden_dirs`` hides. Linux restores a read-only COPY via
+            the launcher's ``EXPOSE_FILES`` primitive (cc mode's mechanism
+            for ``.aws/config``); Seatbelt carves a ``require-not (literal)``
+            exception out of the hidden dir's read deny (the shape it uses
+            for ``.ssh/known_hosts``). Writes and hardlinks stay denied on
+            both.
         extra_writable_dirs: Self-derived scratch directories INSIDE the sealed
             runtime parent (``<data home>/run``) that the child must be able to
-            write — e.g. the MCP probe's private ``TMPDIR`` (#8653). Validated
+            write — e.g. the MCP probe's private ``TMPDIR``. Validated
             by :func:`_writable_carveout_spellings`; a candidate that would
             re-open any other seal is refused with a security warning. Inert on
             backends with no path seal to carve (Windows, the no-backend
             fail-open path): there the directory is already writable.
         is_kiro_cli: Explicit executable classification for descriptor-backed
-            Kiro snapshots whose launch path no longer has a ``kiro-cli``
+            Kiro snapshots whose launch path has no ``kiro-cli``
             basename. ``None`` retains basename detection for other callers.
             Windows internal-sandbox delegation requires this to be exactly
             ``True``; basename inference can never grant that exception.
@@ -6360,7 +10057,8 @@ def wrap_argv(
                     ),
                     critical=True,  # synchronous write for audit integrity
                 )
-            except Exception:
+            except Exception as exc:
+                refuse_unaudited_on_dead_fs(exc, "mode=off delegation audit")
                 # Fail OPEN (not to seatbelt): an unaudited delegation with
                 # mode=off still applies env scrub but returns without seatbelt.
                 # This is deliberately different from _delegate_to_kiro_internal_sandbox
@@ -6371,7 +10069,9 @@ def wrap_argv(
                     _command_log_label(argv),
                     exc_info=True,
                 )
-            unset_args = _sandbox_env_unset_args("standard", strip_python_env)
+            unset_args = _sandbox_env_unset_args(
+                "standard", strip_python_env, forward_ssh_auth_sock
+            )
             if unset_args:
                 return [_pinned_env_bin(), *unset_args, *argv], None
             return list(argv), None
@@ -6474,7 +10174,8 @@ def wrap_argv(
                 },
                 critical=True,
             )
-        except Exception:
+        except Exception as exc:
+            refuse_unaudited_on_dead_fs(exc, "nested-sandbox passthrough audit")
             logger.warning(
                 "SEL audit failed for nested-sandbox passthrough — proceeding "
                 "unaudited: the outer namespace + seccomp still confine this "
@@ -6497,7 +10198,9 @@ def wrap_argv(
             # a planted ``env`` there would receive exactly the credentials
             # this scrub exists to withhold. No trusted binary → keep the
             # plain passthrough (never fail closed) and say so.
-            unset_args = _sandbox_env_unset_args(requested_level, strip_python_env)
+            unset_args = _sandbox_env_unset_args(
+                requested_level, strip_python_env, forward_ssh_auth_sock
+            )
             if unset_args:
                 scrub_keys = tuple(unset_args[1::2])
                 env_prefix = _unset_env_argv(scrub_keys)
@@ -6526,6 +10229,33 @@ def wrap_argv(
     # "strict" hides everything.
     sandbox_level = _mode_to_level(mode)
 
+    # The ONE place an aliased strict leaf is REPORTED, covering every spawn this function can
+    # produce: the Linux namespace wrap, the macOS Seatbelt wrap, the delegated kiro-cli spawn,
+    # and the Windows no-backend path. A rule stated once per platform branch is a rule each
+    # branch can be edited out of independently, and this one belongs to none of them: it is a
+    # fact about a NAME, settled before any mechanism is chosen. What stays platform-specific
+    # below is the mechanism that enforces a seal.
+    #
+    # It WARNS and lets the spawn through. The refusal lives where the file is CONSUMED --
+    # `provisioners.engine_for` for `cloud.json`, `LaunchState.load` for the launch record --
+    # because refusing here refused every sandboxed spawn on the host, a chat turn, a cron job,
+    # a subagent, whenever a leaf carried a second name, and an install laid down by stow,
+    # chezmoi or `rsync --link-dest` has that shape for reasons that have nothing to do with
+    # Fargate. The blast radius was the whole box; the exposure is one command. The alias harm
+    # is a refused command either way, and nothing else stops working.
+    #
+    # The warning matters most on the path that applies no seal of ours. A delegated spawn is
+    # confined by kiro-cli's own sandbox and Crew wraps nothing, so a write reaching
+    # `cloud.json` through an alias whose target sits outside the data home chooses the
+    # container image a Fargate launch runs, and the task's execution role hands the model
+    # credential to it. The check reads no file contents, so it needs no knowledge of which
+    # layer owns isolation and there is no encoding to bypass. Absent leaves cost nothing:
+    # `_warn_if_alias_backed` returns when the lstat fails.
+    #
+    # The passthrough tiers above return before this point, which is deliberate: with no
+    # sandbox at all Crew claims no seal, so there is nothing here to be bypassed.
+    _warn_aliased_strict_leaves()
+
     # macOS sandbox mutual exclusion: kiro-cli >= 2.13's internal sandbox cannot
     # initialize nested inside KiroCrew's seatbelt (kernel EPERM even under an
     # allow-all outer profile), so exactly one layer can own isolation. When
@@ -6533,23 +10263,28 @@ def wrap_argv(
     # KiroCrew's sandbox stays on for everything else and whenever kiro's is off.
     # Windows has no Kiro Crew OS sandbox backend. Official Kiro ACP spawns are
     # positively classified by their reviewed callers and delegate to Kiro's
-    # built-in sandbox; basename inference is deliberately insufficient to grant
-    # this exception, and neither is classification ALONE: the delegation hands
-    # isolation to a layer that only exists when kiro's internal sandbox is
-    # actually enabled, so the capability is VERIFIED here rather than assumed.
-    # Without that read, a Windows install with kiro's sandbox off got an
-    # unwrapped argv on the strength of a trust label, i.e. no isolation while
-    # the audit trail recorded a delegated one. All other Windows spawns — and a
-    # classified spawn whose capability is absent — retain the no-backend
-    # fail-closed path. Checked before backend detection so this is a
+    # built-in sandbox by default; basename inference is deliberately
+    # insufficient to grant this exception. All other Windows spawns retain the
+    # no-backend fail-closed path. Checked before backend detection so this is a
     # deterministic capability decision, never a fallback after a probe failure.
     # Linux namespace isolation is unaffected.
     kiro_spawn = _spawns_kiro_cli(argv) if is_kiro_cli is None else is_kiro_cli
     delegate_to_kiro = (
         sys.platform == "darwin" and kiro_spawn and kiro_internal_sandbox_enabled()
-    ) or (sys.platform == "win32" and is_kiro_cli is True and kiro_internal_sandbox_enabled())
+    ) or (sys.platform == "win32" and is_kiro_cli is True)
     if delegate_to_kiro:
-        if extra_hidden_dirs or extra_visible_dirs or extra_writable_dirs:
+        # ``extra_private_dirs`` is deliberately NOT in this test: a private
+        # window only RELAXES a mask owned by Kiro Crew (the scratch root) for the
+        # spawn's own directory. A delegated sandbox applies none of those
+        # masks, so the window is moot there and must not cost the delegation
+        # (on Windows that would send every session to the no-backend path).
+        if (
+            extra_hidden_dirs
+            or extra_hidden_dir_ids
+            or extra_visible_dirs
+            or extra_writable_dirs
+            or extra_expose_files
+        ):
             # A delegated sandbox cannot enforce KiroCrew-specific path hides.
             # macOS keeps the outer seatbelt. Windows falls through to its
             # no-backend policy and fail-closes unless explicitly opted in.
@@ -6558,38 +10293,64 @@ def wrap_argv(
                     argv,
                     sandbox_level,
                     strip_python_env=strip_python_env,
+                    forward_ssh_auth_sock=forward_ssh_auth_sock,
                     extra_hidden_dirs=extra_hidden_dirs,
+                    extra_hidden_dir_ids=extra_hidden_dir_ids,
                     extra_visible_dirs=extra_visible_dirs,
+                    extra_private_dirs=extra_private_dirs,
+                    extra_private_dir_ids=extra_private_dir_ids,
                     extra_writable_dirs=extra_writable_dirs,
+                    extra_expose_files=extra_expose_files,
                 )
         else:
             delegated = _delegate_to_kiro_internal_sandbox(
-                argv, sandbox_level, strip_python_env=strip_python_env
+                argv,
+                sandbox_level,
+                strip_python_env=strip_python_env,
+                forward_ssh_auth_sock=forward_ssh_auth_sock,
             )
             if delegated is not None:
                 return delegated
             if sys.platform == "darwin":
                 # Preserve macOS's audit-failure fallback: once delegation is
                 # refused, Kiro Crew's own seatbelt remains the safe owner.
-                return sandbox_exec_argv(argv, sandbox_level, strip_python_env=strip_python_env)
+                return sandbox_exec_argv(
+                    argv,
+                    sandbox_level,
+                    strip_python_env=strip_python_env,
+                    forward_ssh_auth_sock=forward_ssh_auth_sock,
+                )
 
     backend = detect_backend(config_mode=mode)
 
     if backend == "namespace":
-        if extra_hidden_dirs or extra_visible_dirs or extra_writable_dirs:
+        if (
+            extra_hidden_dirs
+            or extra_visible_dirs
+            or extra_private_dirs
+            or extra_writable_dirs
+            or extra_expose_files
+        ):
             wrapped = namespace_argv(
                 argv,
                 sandbox_level,
                 strip_python_env=strip_python_env,
+                forward_ssh_auth_sock=forward_ssh_auth_sock,
                 extra_hidden_dirs=extra_hidden_dirs,
+                extra_hidden_dir_ids=extra_hidden_dir_ids,
+                extra_alias_credential_ids=extra_alias_credential_ids,
                 extra_visible_dirs=extra_visible_dirs,
+                extra_private_dirs=extra_private_dirs,
+                extra_private_dir_ids=extra_private_dir_ids,
                 extra_writable_dirs=extra_writable_dirs,
+                extra_expose_files=extra_expose_files,
             )
         else:
             wrapped = namespace_argv(
                 argv,
                 sandbox_level,
                 strip_python_env=strip_python_env,
+                forward_ssh_auth_sock=forward_ssh_auth_sock,
             )
         # Caller deletes the generated launcher script. Its position is
         # ``1 + len(flags)``, NOT a hardcoded 1: the interpreter flags sit between
@@ -6597,19 +10358,32 @@ def wrap_argv(
         # hands the caller a flag to unlink) the moment that list changes.
         return wrapped, _launcher_script_of(wrapped)
     if backend == "sandbox-exec":
-        if extra_hidden_dirs or extra_visible_dirs or extra_writable_dirs:
+        if (
+            extra_hidden_dirs
+            or extra_hidden_dir_ids
+            or extra_visible_dirs
+            or extra_private_dirs
+            or extra_writable_dirs
+            or extra_expose_files
+        ):
             return sandbox_exec_argv(
                 argv,
                 sandbox_level,
                 strip_python_env=strip_python_env,
+                forward_ssh_auth_sock=forward_ssh_auth_sock,
                 extra_hidden_dirs=extra_hidden_dirs,
+                extra_hidden_dir_ids=extra_hidden_dir_ids,
                 extra_visible_dirs=extra_visible_dirs,
+                extra_private_dirs=extra_private_dirs,
+                extra_private_dir_ids=extra_private_dir_ids,
                 extra_writable_dirs=extra_writable_dirs,
+                extra_expose_files=extra_expose_files,
             )
         return sandbox_exec_argv(
             argv,
             sandbox_level,
             strip_python_env=strip_python_env,
+            forward_ssh_auth_sock=forward_ssh_auth_sock,
         )
 
     if backend == "none":
@@ -6624,19 +10398,21 @@ def wrap_argv(
         # so the error must not claim this host lacks a sandbox backend.
         #
         # FAIL-CLOSED: refuse to execute without sandbox unless explicitly opted in.
-        # This addresses a penetration-test finding — the previous behavior silently
-        # returned unmodified argv, allowing the agent subprocess to access all
-        # credential paths without any OS-level isolation.
+        # Returning unmodified argv would let the agent subprocess reach every
+        # credential path with no OS-level isolation.
         #
-        # ONE read of the opt-in: the gate below and the message that explains a
-        # refusal must describe the same state, and a concurrent config reload
-        # must not let them disagree about the same spawn.
+        # ONE read of the gate: the branch below, the warning on the permitted path
+        # and the message that explains a refusal must describe the same state, and
+        # a concurrent config reload must not let them disagree about the same
+        # spawn. ``granted_by`` is DERIVED from that one verdict rather than
+        # resolved again, so it cannot contradict it.
         opted_in = _allow_unsandboxed_exec()
-        # A governance ``sandbox.min_level`` floor OVERRIDES the config opt-in
-        # (issue #3162).  Before this, the floor did the opposite of what pinning
-        # it implies: it disabled the audited first-party carve-out below while
-        # leaving this broad opt-in untouched, so a governed fleet lost the
-        # constrained path and kept the unconstrained one.  ``config.json`` is not
+        granted_by = _unsandboxed_grant_source(opted_in)
+        # A governance ``sandbox.min_level`` floor OVERRIDES the config opt-in.
+        # The floor must not do the opposite of what pinning it implies:
+        # disabling the audited first-party carve-out below while leaving this
+        # broad opt-in untouched would leave a governed fleet without the
+        # constrained path and with the unconstrained one.  ``config.json`` is not
         # policy — the floor is — so the flag cannot re-open this on a governed
         # host.  Derived from the ONE floor read taken at the top of this call,
         # and via ``_floor_mandates_sandbox`` rather than raw truthiness, because
@@ -6650,7 +10426,7 @@ def wrap_argv(
                 "no probe detail recorded",
                 "",
             )
-            # First-party carve-out (issue #1563): a spawn whose full argv is
+            # First-party carve-out: a spawn whose full argv is
             # derived inside this package (never agent/repo/user-config text)
             # may proceed unconfined on a host that GENUINELY has no backend.
             # All three preconditions, structurally:
@@ -6707,34 +10483,66 @@ def wrap_argv(
                 )
             elif is_docker_container():
                 # Inside a Docker/OCI container the runtime's seccomp or
-                # AppArmor policy blocked unshare(CLONE_NEWUSER).  This is a
-                # container-policy restriction, NOT a kernel-level limitation
-                # on the host — the correct fix is at the container level, not
-                # disabling the sandbox everywhere.
-                guidance = (
-                    "Running inside a Docker/OCI container where the runtime's "
-                    "seccomp or AppArmor policy blocks user namespace creation "
-                    f"(probe: {probe_reason}). "
-                    "This is a container policy restriction, not a host kernel "
-                    "limitation. To resolve, choose one of:\n"
-                    "  (a) Use the Kiro Crew custom seccomp profile (adds "
-                    "unconditional unshare/clone/mount allows to the Docker "
-                    "default — less permissive than seccomp=unconfined):\n"
-                    "        # With a repo checkout:\n"
-                    "        docker run --security-opt "
-                    "seccomp=docker/seccomp/kirocrew-seccomp.json ...\n"
-                    "        # Without a checkout (image-only):\n"
-                    "        curl -fsSL https://raw.githubusercontent.com/"
-                    "kirodotdev/KiroCrew/main/docker/seccomp/kirocrew-seccomp.json"
-                    " -o kirocrew-seccomp.json\n"
-                    "        docker run --security-opt seccomp=kirocrew-seccomp.json ...\n"
-                    "  (b) Restart with explicit unsandboxed consent "
-                    "(the container is then the only isolation boundary):\n"
-                    "        docker run -e KIROCREW_ALLOW_UNSANDBOXED=1 ...\n"
-                    "  (c) Manually set agent.sandbox_allow_unsandboxed_exec=true "
-                    "in ~/.kiro/crew/config.json inside the container.\n"
-                    "See docs/guides/docker.md for the full sandbox troubleshooting guide."
-                )
+                # AppArmor policy blocked a step of the namespace handshake.
+                # This is a container-policy restriction, NOT a kernel-level
+                # limitation on the host — the correct fix is at the container
+                # level, not disabling the sandbox everywhere.
+                #
+                # WHICH step decides the advice. A refused unshare is seccomp
+                # (Docker's default profile gates it on CAP_SYS_ADMIN) and the
+                # shipped seccomp profile fixes it. A refused propagation MOUNT
+                # after both unshares succeeded is the runtime's default
+                # AppArmor profile (`deny mount`) — the Kubernetes default on an
+                # AppArmor node, where no seccomp profile is applied at all — and
+                # a seccomp profile cannot fix that, so prescribing one would
+                # send the operator through a change that leaves the probe
+                # failing exactly as before.
+                if probe_remedy == REMEDY_MOUNT_DENIED:
+                    guidance = (
+                        "Running inside a Docker/OCI container whose runtime "
+                        "policy permits user namespaces but refuses mount(2) "
+                        f"inside them (probe: {probe_reason}). This is the "
+                        "runtime's default AppArmor profile (`deny mount`) or a "
+                        "seccomp filter, not a host kernel limitation, and it "
+                        "needs no root or CAP_SYS_ADMIN to fix. Choose one of:\n"
+                        "  (a) Run the container with AppArmor unconfined, and a "
+                        "seccomp profile that permits unshare and mount:\n"
+                        "        docker run --security-opt apparmor=unconfined "
+                        "--security-opt seccomp=kirocrew-seccomp.json ...\n"
+                        "        # Kubernetes: securityContext.appArmorProfile: "
+                        "{type: Unconfined}\n"
+                        "  (b) Restart with explicit unsandboxed consent "
+                        "(the container is then the only isolation boundary):\n"
+                        "        docker run -e KIROCREW_ALLOW_UNSANDBOXED=1 ...\n"
+                        "  (c) Manually set agent.sandbox_allow_unsandboxed_exec=true "
+                        "in ~/.kiro/crew/config.json inside the container.\n"
+                        "See docs/guides/docker.md for the full sandbox troubleshooting guide."
+                    )
+                else:
+                    guidance = (
+                        "Running inside a Docker/OCI container where the runtime's "
+                        "seccomp or AppArmor policy blocks user namespace creation "
+                        f"(probe: {probe_reason}). "
+                        "This is a container policy restriction, not a host kernel "
+                        "limitation. To resolve, choose one of:\n"
+                        "  (a) Use the Kiro Crew custom seccomp profile (adds "
+                        "unconditional unshare/clone/mount allows to the Docker "
+                        "default — less permissive than seccomp=unconfined):\n"
+                        "        # With a repo checkout:\n"
+                        "        docker run --security-opt "
+                        "seccomp=docker/seccomp/kirocrew-seccomp.json ...\n"
+                        "        # Without a checkout (image-only):\n"
+                        "        curl -fsSL https://raw.githubusercontent.com/"
+                        "kirodotdev/KiroCrew/main/docker/seccomp/kirocrew-seccomp.json"
+                        " -o kirocrew-seccomp.json\n"
+                        "        docker run --security-opt seccomp=kirocrew-seccomp.json ...\n"
+                        "  (b) Restart with explicit unsandboxed consent "
+                        "(the container is then the only isolation boundary):\n"
+                        "        docker run -e KIROCREW_ALLOW_UNSANDBOXED=1 ...\n"
+                        "  (c) Manually set agent.sandbox_allow_unsandboxed_exec=true "
+                        "in ~/.kiro/crew/config.json inside the container.\n"
+                        "See docs/guides/docker.md for the full sandbox troubleshooting guide."
+                    )
             else:
                 guidance = _no_backend_guidance()
             # When the policy floor is what refused, every guidance above points
@@ -6764,6 +10572,22 @@ def wrap_argv(
                 refusal = (
                     "Sandbox backend unavailable and a governance policy forbids "
                     "unsandboxed execution. "
+                )
+            elif _unsandboxed_exec_key_declared():
+                # The operator DID decide, and decided to keep this host
+                # fail-closed. Telling them the flag "is not set" would send them
+                # to set a key they already set, so name their own decision as
+                # the thing to revisit. Diagnostic-only, so reading it here rather
+                # than alongside the gate costs at worst a stale WORDING under a
+                # concurrent config reload, never a wrong allow/deny.
+                sel_reason = (
+                    "No sandbox backend available and allow_unsandboxed_exec is declared false"
+                )
+                refusal = (
+                    "Sandbox backend unavailable and agent.sandbox_allow_unsandboxed_exec "
+                    "is set to false on this host, so unsandboxed execution stays "
+                    "refused. Change that key to true (or remove it to accept this "
+                    "platform's default) if you want these spawns to run unconfined. "
                 )
             else:
                 sel_reason = "No sandbox backend available and allow_unsandboxed_exec is not set"
@@ -6800,8 +10624,51 @@ def wrap_argv(
                 # they never read as advice to reconfigure a merely busy host.
                 remedy=probe_remedy,
             )
-        # Opted in: warn (or info) and return unmodified argv
-        _warn_no_isolation(mode)
+        # Permitted: audit, warn (or info), and return unmodified argv.
+        #
+        # The audit is not optional now that a PLATFORM DEFAULT can reach here.
+        # Before, everything on this path had an operator declaration behind it
+        # and the config file was itself the record; a spawn permitted because of
+        # the platform has no such record, so without this event an unconfined
+        # spawn would leave no trace at all. ``outcome="unconfined"`` matches the
+        # first-party carve-out's third outcome — neither ``denied`` (nothing was
+        # refused) nor ``allowed`` (nothing confines this spawn) — and
+        # ``resources`` names WHICH permission applied, so the log distinguishes
+        # an accepted risk from a default.
+        #
+        # Best-effort, like the carve-out and unlike the fail-closed ``denied``
+        # audit: this fires for every spawn on a backend-less host, and draining
+        # SEL synchronously on each one would put a flush on the gateway event
+        # loop. Denying the spawn on an audit hiccup would also brick every MCP
+        # server and app backend on Windows, which is the platform this path
+        # exists to serve.
+        try:
+            from kiro_crew.sel import sel  # circular import: sandbox is low-level
+
+            sel().log_tool_invocation(
+                session_key="sandbox",
+                agent="system",
+                source="sandbox.wrap_argv",
+                tool_name=_command_log_label(argv),
+                tool_kind="subprocess",
+                outcome="unconfined",
+                resources=(
+                    "operator declared agent.sandbox_allow_unsandboxed_exec=true"
+                    if granted_by == UNSANDBOXED_BY_OPERATOR
+                    else "platform default for a host with no sandbox backend"
+                ),
+            )
+        except Exception:
+            logger.warning(
+                "SEL audit failed for an unconfined spawn (%s permission) — "
+                "proceeding unaudited rather than bricking every agent "
+                "subprocess on a host that has no sandbox backend to fall back "
+                "on. Command: %s",
+                granted_by,
+                _command_log_label(argv),
+                exc_info=True,
+            )
+        _warn_no_isolation(mode, granted_by)
     return argv, None
 
 
@@ -6810,9 +10677,12 @@ async def wrap_argv_async(
     mode: str = "auto",
     *,
     strip_python_env: bool = False,
+    forward_ssh_auth_sock: bool = False,
     extra_hidden_dirs: tuple[str, ...] = (),
     extra_visible_dirs: tuple[str, ...] = (),
+    extra_private_dirs: tuple[str, ...] = (),
     extra_writable_dirs: tuple[str, ...] = (),
+    extra_expose_files: tuple[str, ...] = (),
     is_kiro_cli: bool | None = None,
     first_party_fixed_argv: bool = False,
     _prepare: Callable[..., tuple[list[str], str | None]] | None = None,
@@ -6830,12 +10700,18 @@ async def wrap_argv_async(
     options: dict[str, Any] = {"mode": mode}
     if strip_python_env:
         options["strip_python_env"] = True
+    if forward_ssh_auth_sock:
+        options["forward_ssh_auth_sock"] = True
     if extra_hidden_dirs:
         options["extra_hidden_dirs"] = extra_hidden_dirs
     if extra_visible_dirs:
         options["extra_visible_dirs"] = extra_visible_dirs
+    if extra_private_dirs:
+        options["extra_private_dirs"] = extra_private_dirs
     if extra_writable_dirs:
         options["extra_writable_dirs"] = extra_writable_dirs
+    if extra_expose_files:
+        options["extra_expose_files"] = extra_expose_files
     if is_kiro_cli is not None:
         options["is_kiro_cli"] = is_kiro_cli
     if first_party_fixed_argv:
@@ -6884,6 +10760,25 @@ def scrub_env(
     return {k: v for k, v in src.items() if not any(k.startswith(p) for p in prefixes)}
 
 
+def agent_env_scrub_prefixes() -> tuple[str, ...]:
+    """Name prefixes :func:`scrub_agent_subprocess_env` drops from an agent child.
+
+    DERIVED from the two lists that scrub actually composes, so a caller checking
+    "would this variable survive the scrub?" cannot drift from the scrub itself.
+    That question has one caller today: the ``agent.deepseek_env`` validator in
+    ``acp/client.py`` refuses to inject a name the scrub would strip, because the
+    injection happens BEFORE the scrub and the operator would otherwise get a
+    harness with no provider key and no error naming why.
+
+    Deliberately NOT the whole truth about a given spawn: ``forward_ssh_auth_sock``
+    re-admits ``SSH_AUTH_SOCK`` for an opted-in agent child, so a name matching
+    that prefix is reported as scrubbed here even though one spawn shape keeps it.
+    The caller's use is a refusal, so answering conservatively refuses a name that
+    might have worked rather than accepting one that silently would not.
+    """
+    return tuple(_SPAWN_SCRUB_ENV_PREFIXES) + tuple(_PYTHON_ENV_PREFIXES)
+
+
 def scrub_agent_denied_env(env: dict[str, str]) -> dict[str, str]:
     """Return a copy of *env* with gateway-owned channel credentials removed.
 
@@ -6913,7 +10808,9 @@ def scrub_agent_denied_env(env: dict[str, str]) -> dict[str, str]:
     }
 
 
-def scrub_agent_subprocess_env(env: dict[str, str] | None = None) -> dict[str, str]:
+def scrub_agent_subprocess_env(
+    env: dict[str, str] | None = None, *, forward_ssh_auth_sock: bool = False
+) -> dict[str, str]:
     """Return the full environment scrub required for a Kiro/ACP child.
 
     This is the parent-side equivalent of the OS launchers' sensitive-variable
@@ -6921,8 +10818,26 @@ def scrub_agent_subprocess_env(env: dict[str, str] | None = None) -> dict[str, s
     delegation because Windows cannot express the POSIX ``env -u`` prefix, and
     keeping it on every platform makes delegated and wrapped ACP spawns inherit
     the same environment policy.
+
+    This is the AGENT enforcement point, so the SSH_AUTH_SOCK
+    forward opt-in is applied HERE rather than in the generic :func:`scrub_env`,
+    which also serves non-agent callers (tailscale host children,
+    ``sandboxed_spawn_argv`` spawns) that must keep the socket scrubbed. The
+    decision is passed in as an already-resolved boolean (the caller resolves
+    :func:`_forward_ssh_auth_sock` once in its off-loop environment-prep hop, so
+    no synchronous config read runs on the asyncio event loop here); it defaults
+    False, so a caller that does not opt in scrubs the socket as before. When
+    set, the socket value is preserved across the scrub for the agent child
+    alone.
     """
-    return scrub_env(env, extra_prefixes=_PYTHON_ENV_PREFIXES)
+    scrubbed = scrub_env(env, extra_prefixes=_PYTHON_ENV_PREFIXES)
+    src = os.environ if env is None else env
+    if forward_ssh_auth_sock and "SSH_AUTH_SOCK" in src:
+        # scrub_env removed it unconditionally; re-add the socket for the agent
+        # child only. Restricted to the exact key, so nothing else the generic
+        # scrub dropped is reintroduced.
+        scrubbed["SSH_AUTH_SOCK"] = src["SSH_AUTH_SOCK"]
+    return scrubbed
 
 
 def sandboxed_spawn_argv(
@@ -6933,8 +10848,10 @@ def sandboxed_spawn_argv(
     strip_python_env: bool = False,
     extra_hidden_dirs: tuple[str, ...] = (),
     extra_visible_dirs: tuple[str, ...] = (),
+    extra_private_dirs: tuple[str, ...] = (),
     extra_writable_dirs: tuple[str, ...] = (),
     first_party_fixed_argv: bool = False,
+    is_kiro_cli: bool | None = None,
 ) -> tuple[list[str], dict[str, str], str | None]:
     """Single chokepoint for agent-influenced subprocess spawns.
 
@@ -6960,11 +10877,22 @@ def sandboxed_spawn_argv(
         extra_hidden_dirs: Additional absolute directory trees the caller needs
             hidden in both the macOS Seatbelt and Linux namespace profiles.
         extra_visible_dirs: Trusted paths that must remain visible when an
-            otherwise-hidden parent contains them.
+            otherwise-hidden parent contains them (the whole parent's mask is lifted).
+        extra_private_dirs: The spawn's OWN directories inside a hidden tree
+            (its ``agent_scratch`` dir under the masked scratch root). Re-exposed
+            read-write as a window; the parent's mask and every sibling stay hidden.
         extra_writable_dirs: Self-derived scratch directories inside the sealed
-            runtime parent that the child must be able to write (#8653) — see
+            runtime parent that the child must be able to write — see
             :func:`wrap_argv`. Validated; refused candidates degrade to the
             sealed behavior rather than blocking the spawn.
+        is_kiro_cli: Threaded to :func:`wrap_argv`. Whether the child carries
+            its own internal sandbox, which cannot nest inside Crew's. Exposed
+            here so a DELEGATING spawn can route through this chokepoint instead
+            of calling :func:`wrap_argv` directly: without it, such a caller had
+            to choose between the chokepoint (and silently lose the delegation
+            decision, asking for a tier the child cannot honour) and its own
+            hand-rolled wrap+scrub+scope (and drift from the contract every other
+            spawn gets). ``None`` keeps ``wrap_argv``'s own classification.
         first_party_fixed_argv: Threaded to :func:`wrap_argv`. True ONLY for
             spawns whose full argv is derived inside this package with zero
             agent/repo/user-config influence; every passing site must be
@@ -6976,15 +10904,17 @@ def sandboxed_spawn_argv(
         pass *scrubbed_env* as the subprocess ``env=`` and unlink *cleanup_path*
         (a temp launcher/profile) after the child exits.
     """
-    if extra_hidden_dirs or extra_visible_dirs or extra_writable_dirs:
+    if extra_hidden_dirs or extra_visible_dirs or extra_private_dirs or extra_writable_dirs:
         wrapped, cleanup = wrap_argv(
             argv,
             mode=mode,
             strip_python_env=strip_python_env,
             extra_hidden_dirs=extra_hidden_dirs,
             extra_visible_dirs=extra_visible_dirs,
+            extra_private_dirs=extra_private_dirs,
             extra_writable_dirs=extra_writable_dirs,
             first_party_fixed_argv=first_party_fixed_argv,
+            is_kiro_cli=is_kiro_cli,
         )
     else:
         wrapped, cleanup = wrap_argv(
@@ -6992,6 +10922,7 @@ def sandboxed_spawn_argv(
             mode=mode,
             strip_python_env=strip_python_env,
             first_party_fixed_argv=first_party_fixed_argv,
+            is_kiro_cli=is_kiro_cli,
         )
     # ``wrap_argv`` only strips PYTHONPATH/PYTHONHOME inside the launcher script,
     # so on the fail-open path (no sandbox backend, opted-in unsandboxed exec) it
@@ -7038,6 +10969,23 @@ def sandboxed_spawn_argv(
     # as KiroCrew-spawned even when its cmdline carries no KiroCrew fingerprint
     # (e.g. ``npx @playwright/mcp``).
     scrubbed[KIROCREW_SPAWNED_ENV] = KIROCREW_SPAWNED_VALUE
+    # Marks this tree as TOOL work -- a build, an ``npx`` install, a ``git``/``gh``
+    # read, a provisioning run. The runtime reconciler reads it back from the kernel's
+    # exec-time copy to leave such a tree out of its kill-candidate population: a tool
+    # subprocess lands in the agent slice that reconciler compares against, carries the
+    # inherited KIROCREW_SPAWNED marker, and is in no membership record, so once it
+    # outlives the age floor the argv0 basename test is the only thing between it and a
+    # signal. This marker is exec-time evidence instead: a same-uid process can set its
+    # own argv or write any file, and cannot alter a running process's environment.
+    #
+    # It describes the TREE, not each process in it, and this function is not limited
+    # to non-harness argv: ``is_kiro_cli`` exists precisely so a DELEGATING spawn can
+    # route here, and callers do (a pod child probe, an unattended fix-authoring
+    # agent). Since the marker is inherited, a harness can carry it without being tool
+    # work, so the reconciler's exclusion requires this marker AND a non-harness argv0
+    # -- see ``runtime_reconcile.RuntimeReconciler._unowned``. Stamping it here is
+    # therefore safe for any argv: it never decides an exclusion on its own.
+    scrubbed[KIROCREW_SANDBOX_TOOL_ENV] = KIROCREW_SANDBOX_TOOL_VALUE
     return wrapped, scrubbed, cleanup
 
 
@@ -7060,7 +11008,7 @@ async def shielded_prepare_off_loop(
 
     A REPEAT cancellation landing on a bare recovery ``await`` is a
     ``BaseException`` that would abandon the recovery before the unlink runs,
-    leaking the materialized launcher (#5841).  The settle-then-unlink therefore
+    leaking the materialized launcher.  The settle-then-unlink therefore
     runs as its own task, shielded from cancellations aimed at this caller; each
     absorbed repeat is ``uncancel()``-ed so an enclosing ``asyncio.timeout``
     still reports ``TimeoutError``, and the ORIGINAL cancellation is re-raised
@@ -7128,6 +11076,7 @@ async def sandboxed_spawn_argv_async(
     strip_python_env: bool = False,
     extra_hidden_dirs: tuple[str, ...] = (),
     extra_visible_dirs: tuple[str, ...] = (),
+    extra_private_dirs: tuple[str, ...] = (),
     extra_writable_dirs: tuple[str, ...] = (),
     first_party_fixed_argv: bool = False,
     executor: ThreadPoolExecutor | None = None,
@@ -7150,6 +11099,8 @@ async def sandboxed_spawn_argv_async(
         options["extra_hidden_dirs"] = extra_hidden_dirs
     if extra_visible_dirs:
         options["extra_visible_dirs"] = extra_visible_dirs
+    if extra_private_dirs:
+        options["extra_private_dirs"] = extra_private_dirs
     if extra_writable_dirs:
         options["extra_writable_dirs"] = extra_writable_dirs
     if first_party_fixed_argv:
@@ -7166,7 +11117,7 @@ async def sandboxed_spawn_argv_async(
 
 # ── cgroup v2 scope enforcement (fork bomb + memory DoS) ──
 # The RLIMIT preexec (resource_limit_preexec) caps a SINGLE process's FDs, but
-# RLIMIT is the wrong tool for the finding's headline threats: RLIMIT_NPROC is
+# RLIMIT is the wrong tool for the headline threats: RLIMIT_NPROC is
 # per-real-UID (not per-spawn-subtree) and RLIMIT_AS caps virtual not resident
 # memory. cgroup v2 pids.max / memory.max are the correct per-cgroup ceilings —
 # they bound the agent + all its MCP-server/tool descendants as one unit, and
@@ -7294,10 +11245,34 @@ def _default_max_memory_mb() -> int:
     return _CGROUP_FALLBACK_MAX_MEMORY_MB
 
 
-# Cached (available, reason) probe result — the environment doesn't change
-# within a process, and the probe shells out, so compute it once.
+# Cached (available, reason) probe result. Half of what it depends on is NOT
+# process-stable: the systemd user manager, its bus and the delegated user slice
+# belong to the user's LOGIN, and logind tears all three down at the last logout
+# on a host without lingering while ``XDG_RUNTIME_DIR`` stays set in our
+# environment. So the cache is keyed on a cheap fingerprint of that session state
+# (:func:`_cgroup_scope_session_fingerprint`) and re-validated on a TTL; see
+# :func:`_probe_cgroup_scope`.
 _CGROUP_SCOPE_PROBE: tuple[bool, str] | None = None
+# The fingerprint and monotonic timestamp the cached probe was computed against.
+_CGROUP_SCOPE_PROBE_SESSION: tuple[object, ...] | None = None
+_CGROUP_SCOPE_PROBE_AT = 0.0
+# Upper bound on how long a cached probe is trusted without recomputing it. The
+# fingerprint catches the normal logout (logind removes the runtime directory);
+# this catches a manager that died and left its socket file behind, which no
+# stat can tell apart from a live one. A recompute is a handful of small file
+# reads and one non-blocking connect(), so once a minute costs nothing.
+_CGROUP_SCOPE_PROBE_TTL_SECONDS = 60.0
+_CGROUP_SCOPE_PROBE_LOCK = threading.Lock()
 _CGROUP_WARNED = False
+# Appended to every "no reachable user manager" reason, so both the one-time
+# warning and the mid-run transition warning name the fix an operator can apply.
+_CGROUP_LINGER_REMEDY = (
+    "the systemd user manager is not running for this user, which logind does "
+    "when the last login session ends on a host without lingering; "
+    "`loginctl enable-linger $USER` keeps it running (it needs sudo on a managed "
+    "host such as a Cloud Desktop), and the ceiling returns on its own once the "
+    "manager is back"
+)
 
 
 def _warn_cgroup_unavailable(reason: str) -> None:
@@ -7320,28 +11295,195 @@ def _warn_cgroup_unavailable(reason: str) -> None:
     )
 
 
+def _user_slice_controllers_path() -> str:
+    """``cgroup.controllers`` of this uid's logind user slice."""
+    return f"/sys/fs/cgroup/user.slice/user-{os.getuid()}.slice/cgroup.controllers"
+
+
+def _user_bus_socket_paths() -> tuple[str, ...]:
+    """Filesystem sockets ``systemd-run --user`` may dial, most specific first.
+
+    ``DBUS_SESSION_BUS_ADDRESS``'s ``unix:path=`` entries, then the two sockets
+    systemd derives from ``XDG_RUNTIME_DIR``: the user manager's private socket
+    (``systemd-run --scope`` tries it first) and the session bus. Abstract and
+    non-unix transports are skipped -- they have no path to stat or dial here.
+
+    A D-Bus address value may percent-escape any byte (the spec's escaping is
+    ``%XX`` over the raw bytes), so it is decoded before use; probing the
+    escaped spelling literally would miss a live bus and drop the ceiling. A
+    decoded value carrying a NUL cannot name any filesystem socket and would
+    make ``os.stat`` raise ``ValueError`` on the spawn path, so it is skipped.
+    """
+    paths: list[str] = []
+    for entry in os.environ.get("DBUS_SESSION_BUS_ADDRESS", "").split(";"):
+        transport, _, params = entry.partition(":")
+        if transport != "unix":
+            continue
+        for param in params.split(","):
+            key, _, value = param.partition("=")
+            if key != "path" or not value:
+                continue
+            decoded = urllib.parse.unquote_to_bytes(value)
+            if decoded and b"\0" not in decoded:
+                paths.append(os.fsdecode(decoded))
+    runtime_dir = os.environ.get("XDG_RUNTIME_DIR", "")
+    if runtime_dir:
+        paths.append(os.path.join(runtime_dir, "systemd", "private"))
+        paths.append(os.path.join(runtime_dir, "bus"))
+    return tuple(dict.fromkeys(paths))
+
+
+def _stat_identity(path: str) -> tuple[int, int] | None:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_dev, st.st_ino)
+
+
+def _cgroup_scope_session_fingerprint() -> tuple[object, ...]:
+    """Cheap per-spawn identity of the login-scoped state the probe depends on.
+
+    Stats only -- no reads, no connects -- so it is safe on the event loop at
+    every spawn. Changes when logind removes or recreates the runtime directory,
+    when the user manager re-creates its sockets (new inode), when the user
+    slice comes or goes, or when the gateway's bus locators change. Off Linux it
+    is constant: nothing there is session-scoped.
+    """
+    if sys.platform != "linux":
+        return ()
+    runtime_dir = os.environ.get("XDG_RUNTIME_DIR", "")
+    sockets = _user_bus_socket_paths()
+    return (
+        runtime_dir,
+        _stat_identity(runtime_dir) if runtime_dir else None,
+        sockets,
+        tuple(_stat_identity(path) for path in sockets),
+        _stat_identity(_user_slice_controllers_path()),
+    )
+
+
+def _user_bus_reachable() -> tuple[bool, str]:
+    """True when some :func:`_user_bus_socket_paths` socket accepts a connection.
+
+    A socket FILE is not a bus: a manager that died leaves it behind (refused),
+    and a seccomp or LSM policy can refuse ``connect()`` outright (EPERM) --
+    either way ``systemd-run`` dies with ``Failed to connect to bus`` before it
+    execs the command it wraps. The connect is NON-BLOCKING, so a listener with
+    a full backlog answers EAGAIN instead of stalling the caller; that still
+    proves something is listening and counts as reachable. The connection is
+    closed at once, before any D-Bus authentication, which the bus treats as an
+    ordinary client hang-up.
+    """
+    paths = _user_bus_socket_paths()
+    if not paths:
+        return (False, "no XDG_RUNTIME_DIR (no systemd user session)")
+    failures: list[str] = []
+    for path in paths:
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+                sock.setblocking(False)
+                err = sock.connect_ex(path)
+        except OSError as exc:
+            err = exc.errno or errno.EIO
+        if err in (0, errno.EAGAIN, errno.EINPROGRESS):
+            return (True, "ok")
+        failures.append(f"{path}: {os.strerror(err)}")
+    return (False, f"user bus unreachable ({'; '.join(failures)}): {_CGROUP_LINGER_REMEDY}")
+
+
 def _probe_cgroup_scope() -> tuple[bool, str]:
     """Return (available, reason) for unprivileged cgroup-v2 scope enforcement.
 
     Requires, on Linux: a pure cgroup-v2 mount, the ``pids`` and ``memory``
     controllers delegated to our user slice, a ``systemd-run`` binary, and a
-    user session bus (XDG_RUNTIME_DIR). Any missing piece → not available.
+    REACHABLE user bus. Any missing piece → not available.
+
+    The answer follows the user's login rather than the process: it is
+    recomputed whenever :func:`_cgroup_scope_session_fingerprint` changes and at
+    most every :data:`_CGROUP_SCOPE_PROBE_TTL_SECONDS`. A gateway started inside
+    an SSH session therefore stops prepending ``systemd-run`` once logind has
+    stopped the user manager -- which it would otherwise keep doing, failing
+    every spawn with ``Failed to connect to bus`` -- and takes the same no-scope
+    path a gateway started after the logout takes; and it bounds spawns again
+    when the manager comes back. Either flip is logged (see
+    :func:`_log_cgroup_scope_transition`), so the ceiling is never lost quietly.
     """
-    global _CGROUP_SCOPE_PROBE
-    if _CGROUP_SCOPE_PROBE is None:
-        _CGROUP_SCOPE_PROBE = _compute_cgroup_scope_probe()
-    return _CGROUP_SCOPE_PROBE
+    global _CGROUP_SCOPE_PROBE, _CGROUP_SCOPE_PROBE_SESSION, _CGROUP_SCOPE_PROBE_AT
+    global _CPU_DELEGATED
+    session = _cgroup_scope_session_fingerprint()
+    now = time.monotonic()
+    cached = _CGROUP_SCOPE_PROBE
+    if (
+        cached is not None
+        and session == _CGROUP_SCOPE_PROBE_SESSION
+        and now - _CGROUP_SCOPE_PROBE_AT < _CGROUP_SCOPE_PROBE_TTL_SECONDS
+    ):
+        return cached
+    with _CGROUP_SCOPE_PROBE_LOCK:
+        cached = _CGROUP_SCOPE_PROBE
+        if (
+            cached is not None
+            and session == _CGROUP_SCOPE_PROBE_SESSION
+            and now - _CGROUP_SCOPE_PROBE_AT < _CGROUP_SCOPE_PROBE_TTL_SECONDS
+        ):
+            return cached
+        result = _compute_cgroup_scope_probe()
+        _CGROUP_SCOPE_PROBE = result
+        _CGROUP_SCOPE_PROBE_SESSION = session
+        _CGROUP_SCOPE_PROBE_AT = now
+        # The cpu controller lives in the same user slice; re-read it with the rest.
+        _CPU_DELEGATED = None
+    if cached is not None and cached[0] != result[0]:
+        _log_cgroup_scope_transition(result)
+    return result
+
+
+def _log_cgroup_scope_transition(result: tuple[bool, str]) -> None:
+    """Report a mid-run flip of scope availability, once per flip.
+
+    Losing the ceiling is a SECURITY warning even when the one-time startup
+    warning already fired for an earlier outage: the operator must be able to
+    see from the log WHEN new spawns stopped being bounded. It also marks the
+    one-time warning as spent, so ``cgroup_scope_argv`` does not repeat it.
+    """
+    global _CGROUP_WARNED
+    available, reason = result
+    if available:
+        logger.info(
+            "cgroup v2 scope enforcement is available again; new agent subprocesses "
+            "are bounded by the fork-bomb / memory-DoS ceilings once more."
+        )
+        return
+    _CGROUP_WARNED = True
+    logger.warning(
+        "SECURITY: cgroup v2 scope enforcement became unavailable while the gateway "
+        "was running (%s). New agent subprocesses start WITHOUT the fork-bomb / "
+        "memory-DoS ceilings (RLIMIT_NOFILE still applies) instead of failing with "
+        "'Failed to connect to bus'. See docs/architecture/resource-protection.md.",
+        reason,
+    )
 
 
 def _compute_cgroup_scope_probe() -> tuple[bool, str]:
     """Uncached capability check backing :func:`_probe_cgroup_scope`."""
     if sys.platform != "linux":
         return (False, "not Linux")
-    if shutil.which("systemd-run") is None:
-        return (False, "systemd-run not found")
-    # A user session bus is required for `systemd-run --user`.
+    # The same fixed-directory lookup ``cgroup_scope_argv`` pins its wrapper
+    # with, minus its PATH-walking miss diagnostic: this runs on the event loop
+    # each time the probe refreshes, so it must stay a handful of stats and
+    # never touch a PATH entry that may sit on a stalled mount. The miss is
+    # reported through the reason below instead.
+    if platform_compat.trusted_system_bin_quiet("systemd-run") is None:
+        return (False, "systemd-run not found in a trusted system directory")
+    # A user session bus is required for `systemd-run --user`. The variable
+    # alone proves nothing: a login shell sets it from $UID by formula, so it
+    # stays set after logind removed the directory it names.
     if not os.environ.get("XDG_RUNTIME_DIR"):
         return (False, "no XDG_RUNTIME_DIR (no systemd user session)")
+    bus_ok, bus_reason = _user_bus_reachable()
+    if not bus_ok:
+        return (False, bus_reason)
     # Pure cgroup v2 unified hierarchy.
     try:
         with open("/proc/self/cgroup", encoding="utf-8") as fh:
@@ -7353,9 +11495,7 @@ def _compute_cgroup_scope_probe() -> tuple[bool, str]:
     # The pids + memory controllers must be delegated to our user slice, else
     # systemd-run --scope can set the knobs but the kernel won't enforce them.
     try:
-        uid = os.getuid()
-        ctrl_path = f"/sys/fs/cgroup/user.slice/user-{uid}.slice/cgroup.controllers"
-        with open(ctrl_path, encoding="utf-8") as fh:
+        with open(_user_slice_controllers_path(), encoding="utf-8") as fh:
             controllers = set(fh.read().split())
         missing = {"pids", "memory"} - controllers
         if missing:
@@ -7374,16 +11514,15 @@ def _cpu_controller_delegated() -> bool:
     CPUWeight / CPUQuota on a ``systemd-run --user`` scope are only enforced
     when the cpu controller is delegated; emitting them without delegation is
     a silent no-op at best and a warning at worst, so callers gate the CPU
-    properties on this check. Cached alongside the main probe (the environment
-    is process-stable). Failure to read → False (skip CPU properties, keep
-    pids/memory enforcement).
+    properties on this check. Cached alongside the main probe, and dropped
+    whenever :func:`_probe_cgroup_scope` recomputes, because the user slice it
+    reads belongs to the login session. Failure to read → False (skip CPU
+    properties, keep pids/memory enforcement).
     """
     global _CPU_DELEGATED
     if _CPU_DELEGATED is None:
         try:
-            uid = os.getuid()
-            ctrl_path = f"/sys/fs/cgroup/user.slice/user-{uid}.slice/cgroup.controllers"
-            with open(ctrl_path, encoding="utf-8") as fh:
+            with open(_user_slice_controllers_path(), encoding="utf-8") as fh:
                 _CPU_DELEGATED = "cpu" in fh.read().split()
         except OSError:
             _CPU_DELEGATED = False
@@ -7709,6 +11848,50 @@ def apply_windows_resource_ceiling(pid: int) -> bool:
     )
 
 
+# Prefix of the scope unit name a caller gets from ``scope_unit_name``. Carries
+# the owning gateway's product name so a human reading ``systemctl --user
+# list-units`` can tell an agent scope from anything else in the slice, and is
+# the token the reverse lookup matches on.
+_SCOPE_UNIT_PREFIX = "kirocrew-rt-"
+# systemd unit names accept alphanumerics and ``:-_.\`` plus escapes; anything
+# else has to be escaped to be a legal name. Rather than escape, a token
+# carrying something else is REFUSED (see ``scope_unit_name``), because every
+# caller mints its own token and a token needing escapes is a caller bug.
+_SCOPE_UNIT_TOKEN_SAFE = re.compile(r"\A[A-Za-z0-9_-]{1,64}\Z")
+
+
+def scope_unit_name(token: str) -> str | None:
+    """The scope unit name for a spawn identified by *token*, or None.
+
+    ``cgroup_scope_argv`` otherwise lets systemd auto-name the scope
+    ``run-u<N>.scope``, whose only content is "the Nth transient unit this user
+    manager made". One scope holds one spawn, and one spawn is one agent
+    RUNTIME, which may serve several sessions -- so an anonymous scope name is
+    the reason a reader holding a scope (the slice OOM report at
+    :func:`check_agents_slice_pressure`, ``systemd-cgls``, an operator reading
+    ``systemctl --user list-units``) can name the victim's directory but not the
+    runtime it held, nor the sessions leasing that runtime. Naming the scope
+    after the runtime's own spawn token closes that: the SAME token travels in
+    the child's environment as ``KIROCREW_SPAWN_INSTANCE``, so a scope name and
+    a live process both resolve to one incarnation. For the case that matters
+    most -- a scope the kernel already killed, where both the environment and the
+    in-memory ``_process_instance`` are gone -- ``AcpRuntime`` logs this unit name
+    beside its pid at initialization, and sessions are logged against that same
+    pid as they are created, so the join survives the process.
+
+    Returns ``None`` when *token* cannot form a legal unit name, and the caller
+    then wraps the spawn exactly as before -- anonymously, but bounded. That
+    direction is deliberate: the scope's JOB is the DoS ceiling, and a naming
+    defect must never be able to cost a spawn its ceiling or fail the spawn
+    outright. ``token`` is expected to be an opaque random identifier, so it is
+    validated rather than escaped; a value needing escapes is a caller bug and
+    is refused rather than mangled into a name a reverse lookup would miss.
+    """
+    if not _SCOPE_UNIT_TOKEN_SAFE.match(token or ""):
+        return None
+    return f"{_SCOPE_UNIT_PREFIX}{token}.scope"
+
+
 def cgroup_scope_argv(argv: list[str]) -> list[str]:
     """Wrap *argv* in a transient systemd --user --scope with cgroup v2 limits.
 
@@ -7737,6 +11920,23 @@ def cgroup_scope_argv(argv: list[str]) -> list[str]:
 
     Layers OUTSIDE the OS-level sandbox: callers pass the already-``wrap_argv``-ed
     argv here so the child is filesystem-isolated AND cgroup-bounded.
+
+    The ceiling is per SPAWN, and therefore per agent RUNTIME rather than per
+    SESSION: one process can serve several sessions (a parent and the subagents
+    whose sessions are created on its runtime), and cgroup v2 kills a breaching
+    scope as ONE unit, so every session on that runtime goes together. The
+    per-scope values come from :func:`_cgroup_limits_from_config`, which is where
+    a ceiling that scales with the number of sessions a runtime serves would
+    attach -- it is the single place both the value and its config source are
+    resolved, so a scaling factor applied there reaches every caller without any
+    spawn site being taught about sessions.
+
+    The scope itself is left ANONYMOUS here -- systemd auto-names it
+    ``run-u<N>.scope``. A caller that can name the runtime it is spawning passes
+    the result through :func:`name_scope_unit`, which is a separate step so that
+    this function's argv stays byte-identical for the many callers wrapping a
+    one-off tool or app subprocess that no reader needs to resolve back to a
+    runtime.
 
     On a host without cgroup v2 delegation (older Linux, no systemd user
     session, macOS), returns *argv* unchanged and logs a one-time loud SECURITY
@@ -7800,6 +12000,33 @@ def cgroup_scope_argv(argv: list[str]) -> list[str]:
         "--",
         *argv,
     ]
+
+
+def name_scope_unit(argv: list[str], token: str) -> list[str]:
+    """Name the scope in a :func:`cgroup_scope_argv` result after *token*.
+
+    Returns *argv* UNCHANGED unless it really is a systemd-run scope wrapper AND
+    *token* forms a legal unit name (:func:`scope_unit_name`). Both degradations
+    are one decision: the scope's job is the DoS ceiling, the name is a
+    diagnostic, and a diagnostic must never cost a spawn its ceiling nor fail the
+    spawn outright. A host without cgroup delegation (where ``cgroup_scope_argv``
+    hands back the bare command) and a token that cannot be spelled as a unit
+    therefore both leave the spawn exactly as it would otherwise have been.
+
+    A separate step rather than a keyword on ``cgroup_scope_argv`` because that
+    function has dozens of callers and is widely replaced by one-argument stubs in
+    tests: a keyword there would make every one of those stubs refuse the call,
+    for callers that have no runtime to name anyway. The recognition check here
+    makes a stubbed wrap a silent no-op instead.
+
+    ``--unit`` goes BEFORE the ``--`` separator. After it, systemd-run reads it as
+    an argument to the wrapped command instead of a property of the scope.
+    """
+    unit = scope_unit_name(token)
+    if unit is None or "--scope" not in argv or "--" not in argv:
+        return argv
+    at = argv.index("--")
+    return [*argv[:at], "--unit", unit, *argv[at:]]
 
 
 # ── aggregate ceiling on the parent slice ──
@@ -8012,6 +12239,78 @@ def _read_cgroup_counters(path: Path) -> dict[str, int]:
     return counters
 
 
+def read_cgroup_int(path: str | Path) -> int | None:
+    """Read a single-value cgroup file (``memory.high``, ``memory.max`` and kin).
+
+    The one reader for every single-integer cgroup file the product consults,
+    here and in ``subagent``'s memory probe. ``None`` when the file is absent,
+    unparseable, or holds the ``max`` sentinel the kernel writes for "no
+    limit" -- every caller treats all three the same way, as "this bound does
+    not constrain".
+    """
+    try:
+        text = Path(path).read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not text.isdigit():
+        return None
+    return int(text)
+
+
+# Last ``memory.events`` ``high`` counter seen by ``agents_slice_throttling``.
+# Separate from ``_SLICE_MEMHIGH_EVENTS_SEEN``: that one paces a once-per-episode
+# WARNING from the reconcile worker, this one answers a yes/no question for a
+# caller that is about to commit a cold start. Sharing the baseline would let
+# either reader consume the other's climb.
+_SLICE_THROTTLE_PROBE_SEEN: int | None = None
+
+# ``time.monotonic()`` of the most recent counter advance any probe observed.
+# The advance itself is consumed by the probe that reads it (the baseline moves
+# to the new value), so a second probe moments later would otherwise read a
+# stable counter and answer ``False`` while the episode is still under way. The
+# timestamp makes the edge a shared, time-bounded fact instead of a
+# one-reader event: every probe inside the hold window agrees.
+_SLICE_THROTTLE_EDGE_AT: float | None = None
+_SLICE_THROTTLE_EDGE_HOLD_SECS = 60.0
+
+
+def agents_slice_throttling() -> bool:
+    """Whether the kernel is throttling the agents slice right now.
+
+    Two signals, either suffices. ``memory.current >= memory.high`` is the
+    kernel's own definition of "over the soft ceiling"; under sustained
+    pressure reclaim holds usage AT the ceiling rather than above it, so the
+    equality is the steady state, not an edge. The ``memory.events`` ``high``
+    counter climbing since this function's previous read is the second signal:
+    the kernel increments it every time it throttles, so during an episode it
+    advances between any two probes even when reclaim has momentarily pushed
+    usage under the line. The first read only baselines the counter. An
+    observed advance is held for ``_SLICE_THROTTLE_EDGE_HOLD_SECS`` so that
+    concurrent callers (two cold starts racing one counter tick) all read the
+    same verdict instead of the first one consuming the edge.
+
+    ``False`` whenever there is nothing to read (not Linux, no slice); an
+    unmeasurable host is never reported as throttled.
+    """
+    global _SLICE_THROTTLE_PROBE_SEEN, _SLICE_THROTTLE_EDGE_AT
+    slice_dir = _agents_slice_cgroup_dir()
+    if slice_dir is None:
+        return False
+    counter = _read_cgroup_counters(slice_dir / "memory.events").get("high")
+    previous = _SLICE_THROTTLE_PROBE_SEEN
+    now = time.monotonic()
+    if counter is not None:
+        _SLICE_THROTTLE_PROBE_SEEN = counter
+        if previous is not None and counter > previous:
+            _SLICE_THROTTLE_EDGE_AT = now
+    high = read_cgroup_int(slice_dir / "memory.high")
+    current = read_cgroup_int(slice_dir / "memory.current")
+    if high is not None and current is not None and current >= high:
+        return True
+    edge_at = _SLICE_THROTTLE_EDGE_AT
+    return edge_at is not None and (now - edge_at) < _SLICE_THROTTLE_EDGE_HOLD_SECS
+
+
 # Last-seen slice-level OOM counters, so only NEW kills are reported. Seeded
 # lazily from the current values on first read: kills that predate this
 # process must not fire a spurious warning at boot.
@@ -8073,7 +12372,7 @@ def check_agents_slice_pressure() -> str | None:
             victims.append(scope_dir.name)
 
     try:
-        # Scopes sit one level deeper than they used to: each instance places
+        # Scopes sit one level deep: each instance places
         # its own under a per-instance child slice (_agents_slice_name), so
         # scanning only direct children would report "(already reaped)" for
         # every real victim. Both shapes are walked rather than just the nested
@@ -8243,6 +12542,35 @@ def resource_limit_preexec() -> "Callable[[], None] | None":
     return _RESOURCE_PREEXEC  # type: ignore[return-value]
 
 
+_EXTRACTOR_PREEXEC: object = _UNSET
+
+
+def extractor_resource_limit_preexec() -> "Callable[[], None] | None":
+    """Legacy ``preexec_fn`` for :data:`RLIMIT_PROFILE_EXTRACTOR`, shim-less hosts only.
+
+    Same fixed ceiling ``_rlimit_spec`` emits for the profile, applied post-fork
+    through :func:`kiro_crew.security.apply_resource_limits`. ``None`` off POSIX,
+    where ``preexec_fn`` must not be passed.
+    """
+    global _EXTRACTOR_PREEXEC
+    if _EXTRACTOR_PREEXEC is _UNSET:
+        if os.name != "posix":
+            _EXTRACTOR_PREEXEC = None
+            return None
+        from kiro_crew.security import apply_resource_limits
+
+        _EXTRACTOR_PREEXEC = apply_resource_limits(
+            {
+                "resource_limits": {
+                    "max_memory_mb": _EXTRACTOR_MAX_AS_BYTES // (1024 * 1024),
+                    "max_cpu_seconds": _EXTRACTOR_MAX_CPU_SECS,
+                    "max_open_files": _EXTRACTOR_MAX_NOFILE,
+                }
+            }
+        )
+    return _EXTRACTOR_PREEXEC  # type: ignore[return-value]
+
+
 # Cached ``--rlimits=`` argv fragment for the process-group supervisor. Same
 # policy as ``resource_limit_preexec``, delivered post-exec instead of post-fork.
 _RESOURCE_SUPERVISOR_ARGV: object = _UNSET
@@ -8402,6 +12730,21 @@ except OSError:  # pragma: no cover - only if the install is truncated
 RLIMIT_PROFILE_TOOL = "tool"
 RLIMIT_PROFILE_BUILD = "build"
 RLIMIT_PROFILE_SESSION_HOST = "session_host"
+# A first-party document parser fed untrusted bytes (``pdf_extract_child``). Its
+# ceiling is FIXED, not read from ``resource_limits``: the ``tool`` profile only
+# applies RLIMIT_AS when an operator sets ``max_memory_mb`` (default 0), and a
+# parser whose allocation precedes any length check needs a memory bound that
+# is on by default. RLIMIT_AS caps VIRTUAL address space, which is why ``tool``
+# leaves it opt-in (Node/V8 reserves far more than it touches); this child is
+# pure CPython plus ``pdfplumber``, measured at ~270 MB VmPeak on a one-page
+# document, so 1 GiB is headroom for a large document and a hard stop for a
+# Flate bomb. RLIMIT_CPU ends a parse that never finishes; NOFILE matches the
+# ``tool`` default. Biases the OOM killer like ``tool``: this is the process to
+# lose.
+RLIMIT_PROFILE_EXTRACTOR = "extractor"
+_EXTRACTOR_MAX_AS_BYTES = 1024 * 1024 * 1024
+_EXTRACTOR_MAX_CPU_SECS = 60
+_EXTRACTOR_MAX_NOFILE = 1024
 # No limits and no OOM bias: the interactive terminal is the user's own shell,
 # not agent-executed code, and never carried either.
 RLIMIT_PROFILE_NONE = "none"
@@ -8410,6 +12753,7 @@ RLIMIT_PROFILE_NONE = "none"
 _PROFILE_OOM_BIAS = {
     RLIMIT_PROFILE_TOOL: True,
     RLIMIT_PROFILE_BUILD: True,
+    RLIMIT_PROFILE_EXTRACTOR: True,
     # session_host_preexec raises NOFILE and does nothing else -- notably it does
     # NOT bias the OOM score, and a trusted session host should not be the
     # preferred kill target.
@@ -8423,6 +12767,7 @@ _PROFILE_OOM_BIAS = {
 # the (agent-writable) package directory at spawn time.
 _SHIM_ARGV_SEPARATOR = "--"
 _SHIM_CHDIR_FD_FLAG = "--chdir-fd="
+_SHIM_CTTY_FD_FLAG = "--ctty-fd="
 
 _SHIM_ARGV_CACHE: dict[str, tuple[str, ...]] = {}
 _SHIM_UNAVAILABLE_LOGGED = False
@@ -8444,6 +12789,13 @@ def _rlimit_spec(profile: str) -> str:
         # pipe pairs for a whole tree of MCP servers, and the tool-grade 1024 cap
         # EMFILE-crashed it.
         return "RLIMIT_NOFILE:hard"
+    if profile == RLIMIT_PROFILE_EXTRACTOR:
+        # Fixed policy, independent of ``resource_limits``: see the constants.
+        return (
+            f"RLIMIT_AS:{_EXTRACTOR_MAX_AS_BYTES},"
+            f"RLIMIT_CPU:{_EXTRACTOR_MAX_CPU_SECS},"
+            f"RLIMIT_NOFILE:{_EXTRACTOR_MAX_NOFILE}"
+        )
 
     cfg: dict | None = None
     try:
@@ -8465,7 +12817,9 @@ def _rlimit_spec(profile: str) -> str:
     return ",".join(f"{name}:{value}" for name, value in resource_limit_spec(cfg))
 
 
-def spawn_shim_argv(profile: str = RLIMIT_PROFILE_TOOL) -> tuple[str, ...]:
+def spawn_shim_argv(
+    profile: str = RLIMIT_PROFILE_TOOL, *, ctty_fd: int | None = None
+) -> tuple[str, ...]:
     """Return the argv prefix that applies *profile*'s policy AFTER ``exec``.
 
     Prepend it to a command and pass ``preexec_fn=None``; the shim replaces
@@ -8475,15 +12829,25 @@ def spawn_shim_argv(profile: str = RLIMIT_PROFILE_TOOL) -> tuple[str, ...]:
     Python in the child, where a wedged child blocks the spawning thread inside
     ``Popen`` and pins every fd it inherited.
 
+    *ctty_fd* asks the shim to make the terminal on that inherited descriptor the
+    child's controlling terminal, which is what lets Ctrl+C reach an interactive
+    shell. It is a spawn-scoped request rather than part of a profile: the
+    descriptor belongs to one PTY, and the same profile serves spawns with no
+    terminal at all. Passing it also redirects the child's stdin, stdout and
+    stderr onto that descriptor.
+
     Returns an empty tuple when there is nothing for a shim to do -- on Windows
-    (no POSIX rlimits), for a profile that asks for nothing, or if the shim source
-    could not be captured. An empty result on a profile that DOES carry policy
-    means the caller must fall back to ``preexec_fn`` rather than drop it.
+    (no POSIX rlimits), for a profile that asks for nothing and no *ctty_fd*, or
+    if the shim source could not be captured. An empty result on a profile that
+    DOES carry policy means the caller must fall back to ``preexec_fn`` rather
+    than drop it. A caller that asked for *ctty_fd* must NOT fall back that way:
+    reintroducing the fork is the defect the request exists to avoid, so it spawns
+    without the shim and accepts a shell with no controlling terminal.
     """
     global _SHIM_UNAVAILABLE_LOGGED
     if os.name != "posix":
         return ()
-    key = profile
+    key = profile if ctty_fd is None else f"{profile}|ctty={ctty_fd}"
     cached = _SHIM_ARGV_CACHE.get(key)
     if cached is not None:
         return cached
@@ -8499,7 +12863,7 @@ def spawn_shim_argv(profile: str = RLIMIT_PROFILE_TOOL) -> tuple[str, ...]:
         return ()
     spec = _rlimit_spec(profile)
     bias = _PROFILE_OOM_BIAS.get(profile, True)
-    if not spec and not bias:
+    if not spec and not bias and ctty_fd is None:
         # Nothing to do post-exec: skip the interpreter hop entirely rather than
         # pay ~10ms to exec a shim that would only exec again.
         _SHIM_ARGV_CACHE[key] = ()
@@ -8509,6 +12873,8 @@ def spawn_shim_argv(profile: str = RLIMIT_PROFILE_TOOL) -> tuple[str, ...]:
         argv.append(f"--rlimits={spec}")
     if bias:
         argv.append("--oom-bias")
+    if ctty_fd is not None:
+        argv.append(f"{_SHIM_CTTY_FD_FLAG}{ctty_fd}")
     argv.append(_SHIM_ARGV_SEPARATOR)
     resolved = tuple(argv)
     _SHIM_ARGV_CACHE[key] = resolved
@@ -8549,6 +12915,8 @@ def _preexec_for_profile(profile: str) -> "Callable[[], None] | None":
         return session_host_preexec()
     if profile == RLIMIT_PROFILE_BUILD:
         return build_resource_limit_preexec()
+    if profile == RLIMIT_PROFILE_EXTRACTOR:
+        return extractor_resource_limit_preexec()
     return resource_limit_preexec()
 
 
@@ -8646,8 +13014,7 @@ def _pinned_spawn_path(
     if bound_identity is not None:
         # Local import: hooks imports sandbox at call time, so a module-level
         # dependency would be circular. `_fd_real_path` is private but already
-        # borrowed this way by `bound_agent_workspace_target` above; issue
-        # #6907 tracks promoting it to a shared home.
+        # borrowed this way by `bound_agent_workspace_target` above.
         from kiro_crew.hooks import _fd_real_path
 
         screened: list[str] = []
@@ -8696,6 +13063,7 @@ async def create_subprocess_limited(
     *argv: str,
     profile: str = RLIMIT_PROFILE_TOOL,
     chdir_fd: int | None = None,
+    windows_cleanup_owner: platform_compat._PendingWindowsTreeCleanup | None = None,
     **kwargs: Any,
 ) -> asyncio.subprocess.Process:
     """``asyncio.create_subprocess_exec`` with resource limits applied post-exec.
@@ -8731,6 +13099,21 @@ async def create_subprocess_limited(
     ``PATH`` after the shim has entered that directory. ``PATH=.:/usr/bin`` --
     or the same directory spelled absolutely -- would otherwise exec a binary
     out of the agent's own workspace, ahead of the sandbox meant to contain it.
+
+    A spawn landing while the launcher interpreter's install tree is being
+    rebuilt is retried, on the same budget and by the same discriminator as
+    :func:`popen_limited` -- this wrapper puts the same ``sys.executable`` at
+    the head of the spawned argv, so it was exposed to the identical blip. The
+    backoff uses ``asyncio.sleep``: a blocking sleep would freeze the event loop
+    for up to ~3.75s, which is precisely the hazard this wrapper exists to
+    avoid. Only the shim-prefixed spawn is retried -- the no-shim fallback below
+    execs the caller's own ``argv[0]``, so an ENOENT there is the caller's own
+    missing binary and must still surface on the first attempt.
+
+    There is deliberately no ``abort_retry`` hook here, unlike
+    :func:`popen_limited`: no caller mediates this wrapper's cancellation
+    through a registry keyed on the live child, so the lost-cancel window that
+    hook exists to close has no consumer. Add one when a caller needs it.
     """
     if "preexec_fn" in kwargs:
         raise TypeError(
@@ -8749,6 +13132,10 @@ async def create_subprocess_limited(
         # No shim (Windows, a no-op profile, or a truncated install): keep
         # whatever policy the profile carries on the legacy fork path. Dropping
         # the caps silently would be worse than the fork hazard.
+        if platform_compat.IS_WINDOWS and windows_cleanup_owner is not None:
+            return await platform_compat._create_windows_subprocess_owned(
+                windows_cleanup_owner, *argv, preexec_fn=_preexec_for_profile(profile), **kwargs
+            )
         return await asyncio.create_subprocess_exec(
             *argv, preexec_fn=_preexec_for_profile(profile), **kwargs
         )
@@ -8815,9 +13202,25 @@ async def create_subprocess_limited(
         resolved = argv[0]
     else:
         # A PATH search stats every entry, so it runs off the loop. One stalled
-        # NFS/autofs entry would otherwise freeze the gateway -- and the search it
-        # replaces used to happen in the child, never in this process.
+        # NFS/autofs entry would otherwise freeze the gateway.
         resolved = await asyncio.to_thread(_resolve_spawn_target, argv, search_env, search_cwd)
+    for delay in _INTERPRETER_ENOENT_DELAYS:
+        try:
+            return await asyncio.create_subprocess_exec(
+                *prefix, resolved, *argv[1:], preexec_fn=None, **kwargs
+            )
+        except FileNotFoundError as exc:
+            # ``prefix`` IS the head of the argv actually spawned, and prefix[0]
+            # is this process's own sys.executable -- the only shape the
+            # discriminator accepts.
+            if not _retry_interpreter_enoent(exc, prefix, delay):
+                raise
+            # asyncio.sleep, NOT time.sleep: a blocking sleep here would freeze
+            # the event loop for up to ~3.75s, which is the hazard this wrapper
+            # exists to avoid.
+            await asyncio.sleep(delay)
+    # Budget spent. Deliberately unguarded, exactly as in popen_limited: a
+    # genuinely broken install reports the error it reports today, ~4s later.
     return await asyncio.create_subprocess_exec(
         *prefix, resolved, *argv[1:], preexec_fn=None, **kwargs
     )
@@ -8894,11 +13297,36 @@ def run_limited(
     ``-c`` string, and both exceptions render ``cmd`` into their message, so
     reporting the spawned argv would put the whole shim in every failure log
     line.
+
+    A spawn landing while the launcher interpreter's install tree is being
+    rebuilt is retried, on the same budget and by the same discriminator as
+    :func:`popen_limited` -- this wrapper puts the same ``sys.executable`` at
+    ``cmd[0]``, so it was exposed to the identical blip. The retry sits INSIDE
+    the ``cmd``-rewriting handler so a ``CalledProcessError`` or
+    ``TimeoutExpired`` still reports the caller's own argv.
+
+    There is deliberately no ``abort_retry`` hook here, unlike
+    :func:`popen_limited`: this wrapper never hands back a handle, so no
+    cancellation registry can be keyed on the child and the lost-cancel hazard
+    that hook exists to close cannot arise. Add one when a caller needs it.
     """
     cmd, preexec = _prepare_limited_spawn(argv, profile, kwargs, "run_limited")
     reported = list(argv)
     try:
-        result = subprocess.run(cmd, preexec_fn=preexec, **kwargs)
+        for delay in _INTERPRETER_ENOENT_DELAYS:
+            try:
+                result = subprocess.run(cmd, preexec_fn=preexec, **kwargs)
+                break
+            except FileNotFoundError as exc:
+                if not _retry_interpreter_enoent(exc, cmd, delay):
+                    raise
+                time.sleep(delay)
+        else:
+            # Budget spent. Deliberately unguarded, exactly as in
+            # popen_limited: whatever this raises reaches the caller unchanged,
+            # so a genuinely broken install still reports the error it reports
+            # today -- just ~4s later.
+            result = subprocess.run(cmd, preexec_fn=preexec, **kwargs)
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
         exc.cmd = reported
         raise
@@ -8906,10 +13334,83 @@ def run_limited(
     return result
 
 
+#: Backoff between spawn attempts when the launcher interpreter is transiently
+#: absent. Five attempts, ~3.75s of waiting in total.
+#:
+#: ``sys.executable`` is often a symlink into a managed install tree, and
+#: rebuilding that tree DELETES and re-creates its entries -- including the
+#: interpreter :func:`wrap_argv` prepends to EVERY sandboxed argv. The tree is
+#: whole again in about a second, so a spawn landing inside that window dies with
+#: ENOENT on an interpreter that both existed before it and exists after it. The
+#: caller cannot tell that apart from a broken install: a cron records a hard
+#: failure (and counts a strike toward auto-pause) for a condition that already
+#: healed itself, and several crons sharing one tick fail together. Any packaging
+#: that relinks an interpreter in place reaches this -- an environment rebuild, a
+#: toolchain reinstall, a swapped container layer.
+_INTERPRETER_ENOENT_DELAYS: tuple[float, ...] = (0.25, 0.5, 1.0, 2.0)
+
+
+def _is_transient_interpreter_enoent(exc: OSError, cmd: "Sequence[str]") -> bool:
+    """True when ``exc`` is ENOENT for the interpreter WE prepended to ``cmd``.
+
+    Deliberately narrow, because ENOENT from ``Popen`` is ambiguous: it is raised
+    for a missing ``cwd`` and for a missing program alike, and a genuinely absent
+    user binary MUST still fail on the first attempt rather than after a delay.
+    So the only retryable shape is an ENOENT whose ``filename`` IS ``cmd[0]`` and
+    whose ``cmd[0]`` is this process's own ``sys.executable``. A missing-``cwd``
+    ENOENT names the directory and a missing user binary names that binary, so
+    both fall through untouched.
+
+    ``filename`` being populated is not guaranteed, so when it is absent fall
+    back to a live check that the interpreter really is gone from disk -- an
+    observation, rather than an assumption that this ENOENT must be ours.
+    """
+    if not cmd or cmd[0] != sys.executable:
+        return False
+    if exc.filename is not None:
+        return exc.filename == cmd[0]
+    return not os.path.exists(sys.executable)
+
+
+def _retry_interpreter_enoent(exc: OSError, cmd: "Sequence[str]", delay: float) -> bool:
+    """Decide whether *exc* is a retryable interpreter blip, and log it if so.
+
+    The single shared implementation behind all three spawn wrappers
+    (:func:`run_limited`, :func:`popen_limited`,
+    :func:`create_subprocess_limited`), which all put ``sys.executable`` at
+    ``cmd[0]`` via :func:`spawn_shim_argv` and are therefore exposed to the same
+    transient ENOENT. Returning ``False`` means the caller must re-raise
+    untouched.
+
+    What is deliberately NOT shared is the spawn itself, and the WAIT. The spawn
+    stays lexically inside each wrapper because both spawn audits key on
+    ``<relpath>::<enclosing function>``: hoisting any of the three into a common
+    helper would migrate its audit key, stranding the existing ``_SYNC_ALLOWED``
+    and ``BENIGN_SPAWNS`` entries as stale while the relocated call read as a
+    brand-new unrouted spawn. The wait is per-flavour because the async wrapper
+    must ``await asyncio.sleep`` -- a ``time.sleep`` there would block the event
+    loop for up to ~3.75s, which is the very hazard the async wrapper exists to
+    avoid. So each caller keeps its own two lines (wait, then re-check abort) and
+    shares the DECISION, which is where the subtlety actually lives.
+    """
+    if not _is_transient_interpreter_enoent(exc, cmd):
+        return False
+    # Log every retry: a silently-absorbed spawn failure would hide an install
+    # tree that has genuinely stopped converging.
+    logger.warning(
+        "sandbox launcher interpreter %r is absent; retrying spawn in "
+        "%.2fs (its install tree is probably mid-rebuild)",
+        sys.executable,
+        delay,
+    )
+    return True
+
+
 def popen_limited(
     argv: "Sequence[str]",
     *,
     profile: str = RLIMIT_PROFILE_TOOL,
+    abort_retry: "Callable[[], bool] | None" = None,
     **kwargs: "Any",
 ) -> "subprocess.Popen[Any]":
     """``subprocess.Popen`` with resource limits applied AFTER ``exec``.
@@ -8927,8 +13428,221 @@ def popen_limited(
     ``TimeoutExpired`` from ``self.args``, so leaving the shim there would put
     ~8 KB of shim source into the timeout message. Nothing in CPython reads
     ``self.args`` functionally -- only ``__repr__`` and that exception.
+
+    A spawn that lands while the launcher interpreter's install tree is being
+    rebuilt is retried rather than surfaced -- see
+    :data:`_INTERPRETER_ENOENT_DELAYS`. The retry loop is INLINE rather than
+    extracted into a helper on purpose: both spawn audits key on
+    ``<relpath>::<enclosing function>``, so moving this ``Popen`` into its own
+    function would migrate its key, stranding the ``popen_limited`` entries in
+    ``_SYNC_ALLOWED`` and ``BENIGN_SPAWNS`` as stale while the relocated call read
+    as a brand-new unrouted spawn.
+
+    ``abort_retry`` is consulted after each backoff, and matters only to a caller
+    whose cancellation is mediated by a REGISTRY keyed on the live child -- for
+    those, the backoff is a window in which a cancel is silently LOST rather than
+    merely delayed, because the canceller finds no registered child and records
+    nothing, and the retry then launches work the caller already cancelled.
+    Returning ``True`` re-raises the ENOENT instead of spawning, so the caller's
+    own cancellation path reports the run rather than running it. A caller that
+    holds the ``Popen`` handle itself and polls a stop flag (such as
+    ``auto_improvement.spine.agent_runner``, which calls ``_terminate_group`` on
+    the handle) loses nothing by omitting it: the stop is observed after the
+    spawn returns and the child is signalled then.
     """
     cmd, preexec = _prepare_limited_spawn(argv, profile, kwargs, "popen_limited")
-    proc = subprocess.Popen(cmd, preexec_fn=preexec, **kwargs)
+    for delay in _INTERPRETER_ENOENT_DELAYS:
+        try:
+            proc = subprocess.Popen(cmd, preexec_fn=preexec, **kwargs)
+            break
+        except FileNotFoundError as exc:
+            if not _retry_interpreter_enoent(exc, cmd, delay):
+                raise
+            time.sleep(delay)
+            # Checked AFTER the sleep, because that is when a cancellation
+            # racing the backoff will have landed. Spawning now would run work
+            # the caller has already cancelled, and the exit status would not
+            # say so.
+            if abort_retry is not None and abort_retry():
+                raise
+    else:
+        # Budget spent. Deliberately unguarded: whatever this raises reaches the
+        # caller unchanged, so a genuinely broken install still reports exactly
+        # the error it reports today -- just ~4s later.
+        proc = subprocess.Popen(cmd, preexec_fn=preexec, **kwargs)
     proc.args = list(argv)
     return proc
+
+
+# --------------------------------------------------------------------------- #
+# Compatibility facade. The two programs the sandbox writes out -- the Linux
+# namespace launcher and the macOS Seatbelt profile -- are generated by
+# ``kiro_crew.sandbox_launcher`` and ``kiro_crew.sandbox_seatbelt``, and the
+# reclaim of the launcher's stale bind-mount sources lives in
+# ``kiro_crew.sandbox_mount_sweep``. Every name that moved stays readable as
+# ``kiro_crew.sandbox.<name>``, and every one of them is FORWARDED: ``__getattr__``
+# reads it from its owner, and ``_ReExportModule`` sends a write or delete there, so a
+# patch of ``kiro_crew.sandbox.<name>`` reaches the owner's own callers however the
+# test spells it. A forwarded name is absent from this module's namespace on purpose --
+# a binding here would shadow the owner for every later read -- and this module's code
+# reads it as ``<owner>.<name>``.
+#
+# The builders read the plan they render from this module when they run, through a
+# function-local import, so a test that rebinds a tier list or a target helper here
+# reaches them as it did before the move.
+#
+# ``test/test_sandbox_refactor_facade.py`` pins both halves: every moved name is
+# forwarded and none is bound here, and each owner reads this module only through its
+# listed function-local imports.
+# --------------------------------------------------------------------------- #
+#: Owner module -> every name this module forwards to it.
+_EXPORTS_BY_OWNER: dict[str, tuple[str, ...]] = {
+    "kiro_crew.sandbox_launcher": ("_build_launcher_script",),
+    "kiro_crew.sandbox_seatbelt": ("_SEATBELT_PROFILE", "_build_seatbelt_profile"),
+    "kiro_crew.sandbox_mount_sweep": (
+        "_MOUNT_SOURCE_PREFIX",
+        "_MOUNT_SOURCE_MAX_AGE_SECONDS",
+        "_PIN_SCAN_MAX_PASSES",
+        "_MOUNT_TABLE_CACHE_MAX_ENTRIES",
+        "_MOUNT_TABLE_CACHE_MAX_BYTES",
+        "_PinScanCoverage",
+        "_task_uid",
+        "_OVERFLOW_UID_SYSCTL",
+        "_overflow_uid",
+        "_parse_pid_segment",
+        "_mount_source_candidate_roots",
+        "_mount_pinned_source_names",
+        "_SWEEP_TIME_BUDGET_SECONDS",
+        "_SWEEP_BUDGET_CHECK_EVERY",
+        "_cleanup_stale_sandbox_mount_sources",
+        "_LEGACY_MOUNT_SOURCE_RE",
+        "_LEGACY_PILE_THRESHOLD",
+        "_LEGACY_RESIDUE_MARKER",
+        "_launcher_tmpfs_roots",
+        "_bound_source_basenames",
+        "_cleanup_legacy_mount_source_residue",
+        "_cleanup_retired_acp_snapshot_dir",
+    ),
+}
+
+
+def _index_exports() -> dict[str, str]:
+    """Invert the owner table into forwarded name -> owner."""
+    return {name: owner for owner, names in _EXPORTS_BY_OWNER.items() for name in names}
+
+
+#: Forwarded name -> the dotted NAME of its owner, never the module object: the owner
+#: is read from :data:`sys.modules` on each use, so a module purged and imported again
+#: is seen at once instead of this table forwarding to the old copy.
+_EXPORTS: dict[str, str] = _index_exports()
+
+
+def _owner(name: str) -> ModuleType:
+    """Return the module that owns forwarded *name*, resolved on each access.
+
+    Read from :data:`sys.modules`, the one place a module is stored, so a purged or
+    replaced owner is seen at once. A loaded owner is read without an import call, so a
+    test that stubs ``importlib.import_module`` for its own subject does not reach this
+    facade's reads. Every owner is imported while this module loads, before the
+    forwarding is installed, so no reader can find one half-built; an owner purged
+    since is imported again here, and ``importlib.import_module`` waits on its import
+    lock while its body runs. ``_sys`` rather than ``sys``: tests rebind this module's
+    ``sys`` to steer the code that stays here.
+    """
+    dotted = _EXPORTS[name]
+    loaded = _sys.modules.get(dotted)
+    return loaded if loaded is not None else importlib.import_module(dotted)
+
+
+# Hidden from type checkers: mypy types every unknown attribute of a module that
+# defines ``__getattr__`` as ``Any``, so a mistyped ``sandbox.<name>`` would type-check.
+# mypy sees the forwarded names through the ``TYPE_CHECKING`` imports below instead.
+if not TYPE_CHECKING:
+
+    def __getattr__(name: str) -> Any:
+        """Read a forwarded name from the module that owns it (:pep:`562`)."""
+        if name not in _EXPORTS:
+            raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+        return getattr(_owner(name), name)
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(_EXPORTS))
+
+
+class _ReExportModule(ModuleType):
+    """Send a write or delete of a forwarded name to the module that owns it.
+
+    Binding it here instead would shadow the owner for every later read, because
+    ``__getattr__`` runs only for a name this module does not hold. Forwarded, a
+    ``monkeypatch`` or ``mock.patch`` round-trips: ``mock.patch`` restores a name this
+    module does not hold by deleting it and setting it back. With ``create=True`` it
+    skips the set, which would leave the owner without the name, so
+    ``test/test_sandbox_refactor_create_guard.py`` fails on any such patch. Every other
+    name is an ordinary attribute write: tests rebind the plan, the target helpers and
+    this module's imports on purpose, for the code that stays here and for the builders,
+    which read them from this module at call time.
+    """
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name in _EXPORTS:
+            setattr(_owner(name), name, value)
+        else:
+            super().__setattr__(name, value)
+
+    def __delattr__(self, name: str) -> None:
+        if name in _EXPORTS:
+            delattr(_owner(name), name)
+        else:
+            super().__delattr__(name)
+
+
+# Installed last, so the forwarding is live for every caller but never runs while this
+# module is still binding its own names.
+sys.modules[__name__].__class__ = _ReExportModule
+
+# ``from kiro_crew.sandbox import *`` binds only the names this list holds: nothing can
+# enumerate what ``__getattr__`` would serve, so a forwarded name reaches a star
+# importer only by being listed here. The list is DERIVED from what this module binds
+# plus the forwarding table, so it is not a third list of names to keep in step. The
+# bindings only the forwarding needs stay out of it, so a star import binds what it
+# bound before the owners existed.
+_NOT_EXPORTED = frozenset(
+    {"ModuleType", "importlib", "sandbox_launcher", "sandbox_mount_sweep", "sandbox_seatbelt"}
+)
+__all__ = sorted(
+    name
+    for name in set(globals()) | set(_EXPORTS)
+    if not name.startswith("_") and name not in _NOT_EXPORTED
+)
+
+if TYPE_CHECKING:  # the forwarded names, visible to type checkers and IDEs
+    from kiro_crew.sandbox_launcher import _build_launcher_script  # noqa: F401
+    from kiro_crew.sandbox_mount_sweep import (  # noqa: F401
+        _LEGACY_MOUNT_SOURCE_RE,
+        _LEGACY_PILE_THRESHOLD,
+        _LEGACY_RESIDUE_MARKER,
+        _MOUNT_SOURCE_MAX_AGE_SECONDS,
+        _MOUNT_SOURCE_PREFIX,
+        _MOUNT_TABLE_CACHE_MAX_BYTES,
+        _MOUNT_TABLE_CACHE_MAX_ENTRIES,
+        _OVERFLOW_UID_SYSCTL,
+        _PIN_SCAN_MAX_PASSES,
+        _SWEEP_BUDGET_CHECK_EVERY,
+        _SWEEP_TIME_BUDGET_SECONDS,
+        _bound_source_basenames,
+        _cleanup_legacy_mount_source_residue,
+        _cleanup_retired_acp_snapshot_dir,
+        _cleanup_stale_sandbox_mount_sources,
+        _launcher_tmpfs_roots,
+        _mount_pinned_source_names,
+        _mount_source_candidate_roots,
+        _overflow_uid,
+        _parse_pid_segment,
+        _PinScanCoverage,
+        _task_uid,
+    )
+    from kiro_crew.sandbox_seatbelt import (  # noqa: F401
+        _SEATBELT_PROFILE,
+        _build_seatbelt_profile,
+    )

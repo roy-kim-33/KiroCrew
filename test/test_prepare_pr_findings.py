@@ -132,11 +132,14 @@ class TestCredentialRedaction:
 
 
 # ---------------------------------------------------------------------------
-# Issue #2550: stable span_hash per reviewer finding + marker-regex parity.
+# Stable span_hash per reviewer finding + marker-regex parity.
 # ---------------------------------------------------------------------------
 
 STATUS_SCRIPT = SCRIPT.with_name("pr_status.py")
 REVIEW_CONTRACT_SCRIPT = SCRIPT.with_name("_review_contract.py")
+# pr_status.py imports this sibling too, so a bundle missing it is a bundle that
+# cannot start. The whole prepare-pr/ directory is the supported copy unit.
+GREEN_AGE_SCRIPT = SCRIPT.with_name("green_age.py")
 
 _HEAD = "f" * 40
 _OLD = "a" * 40
@@ -153,7 +156,7 @@ def test_entrypoint_runs_from_an_arbitrary_cwd_without_pythonpath(
     """The installed skill bundle resolves its sibling without cwd or PYTHONPATH help."""
     scripts_dir = tmp_path / "installed-skill" / "scripts"
     scripts_dir.mkdir(parents=True)
-    for source in (SCRIPT, STATUS_SCRIPT, REVIEW_CONTRACT_SCRIPT):
+    for source in (SCRIPT, STATUS_SCRIPT, REVIEW_CONTRACT_SCRIPT, GREEN_AGE_SCRIPT):
         shutil.copy2(source, scripts_dir / source.name)
 
     target_repo = tmp_path / "target-repo"
@@ -186,23 +189,34 @@ def test_entrypoint_runs_from_an_arbitrary_cwd_without_pythonpath(
 
 @pytest.mark.parametrize("entry_script", (SCRIPT, STATUS_SCRIPT), ids=("pr_findings", "pr_status"))
 def test_entrypoint_ignores_stale_review_contract_bytecode(
-    entry_script: Path, tmp_path: Path
+    entry_script: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Existing bytecode beside the installed skill must not override source."""
     scripts_dir = tmp_path / "installed-skill" / "scripts"
     scripts_dir.mkdir(parents=True)
-    for source in (SCRIPT, STATUS_SCRIPT):
+    for source in (SCRIPT, STATUS_SCRIPT, GREEN_AGE_SCRIPT):
         shutil.copy2(source, scripts_dir / source.name)
     contract_path = scripts_dir / "_review_contract.py"
     contract_path.write_text(
         'raise RuntimeError("stale review-contract bytecode was imported")\n',
         encoding="utf-8",
     )
-    py_compile.compile(
-        str(contract_path),
-        doraise=True,
-        invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH,
+    # The stale pyc has to sit where the CHILD will look: ``__pycache__`` beside
+    # the script, since the child runs with ``PYTHONPYCACHEPREFIX`` removed. The
+    # suite's rootdir conftest sets ``sys.pycache_prefix`` in THIS process, and
+    # a bare ``py_compile.compile`` honours it -- so without clearing it the plant
+    # landed in a per-user cache tree the child never reads (a host write, and a
+    # test that could not fail on the defect it guards).
+    monkeypatch.setattr(sys, "pycache_prefix", None)
+    stale_pyc = Path(
+        py_compile.compile(
+            str(contract_path),
+            doraise=True,
+            invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH,
+        )
     )
+    assert stale_pyc.parent == scripts_dir / "__pycache__", stale_pyc
+    assert stale_pyc.is_file()
     shutil.copy2(REVIEW_CONTRACT_SCRIPT, contract_path)
 
     target_repo = tmp_path / "target-repo"
@@ -312,7 +326,7 @@ class TestReviewContractExports:
         that drops or renames a
         stamp would silently orphan the parsers -- the freshness gate would see
         no stamps and stop gating. This drift is exactly what the marker-
-        grammar spec (docs/ci/prepare-pr-portability.md §5.9) exists to stop."""
+        grammar spec (docs/request-for-change/rfc-prepare-pr-portability.md §5.9) exists to stop."""
         workflows = {
             ".github/workflows/codex-review.yml": (
                 "[GPT-REVIEWED]",
@@ -339,7 +353,7 @@ class TestReviewContractExports:
                 assert marker in text, (
                     f"{rel} no longer emits {marker}; update _review_contract.py "
                     "and §5.9 of "
-                    "docs/ci/prepare-pr-portability.md together"
+                    "docs/request-for-change/rfc-prepare-pr-portability.md together"
                 )
 
 
@@ -378,7 +392,7 @@ class TestExtractFindings:
         module = _load_script()
         bindings = dict(_load_script().DEFAULT_MARKER_BINDINGS)
         comments = [
-            # Stale comment: findings for a diff that no longer exists.
+            # Stale comment: findings for a diff that does not exist.
             {
                 "user": {"type": "Bot"},
                 "body": (
@@ -416,7 +430,7 @@ class TestExtractFindings:
     def test_elided_current_head_stamp_still_yields_findings(self) -> None:
         """An elided stamp of THIS head stays fresh and blocking here.
 
-        ``sha_matches`` tolerates the emitter transcription artifact of PR 4107
+        ``sha_matches`` tolerates the emitter transcription artifact
         (a stamp that keeps the head's start and tail but drops its middle).
         ``pr_status.py``'s marker gate reports such a reviewer as fresh, so
         extraction must agree: a strict prefix match here would empty the
@@ -590,7 +604,7 @@ class TestDegradedRollup:
 
 
 # ---------------------------------------------------------------------------
-# Issue #4187: the one-lane / one-rationale-per-finding disposition rule is
+# The one-lane / one-rationale-per-finding disposition rule is
 # mechanical, not prose. A writer's disposition record claims the finding it
 # rules on by span= identity; the shared contract reports it here (non-gating)
 # and pr_status.py gates on the same computation.
@@ -865,7 +879,7 @@ class TestDispositionViolations:
         assert any("one rationale covers exactly one finding" in v for v in violations)
 
     def test_spanless_record_for_a_lane_with_findings_is_a_violation(self) -> None:
-        """The #3963 shape: a blanket comment with no finding identity at all.
+        """A blanket comment with no finding identity at all.
         Without this class the rule stays prose -- a record simply omits span=
         tokens and claims everything its rationale fits."""
         module = _load_script()
@@ -932,7 +946,7 @@ class TestDispositionViolations:
 
     def test_superseded_record_with_gone_stamps_is_not_relitigated(self) -> None:
         """Once the reviewer re-adjudicated on a new head (stamps rewritten in
-        place), a historical record whose claim can no longer be resolved is
+        place), a historical record whose claim cannot be resolved is
         left alone -- flagging it would permanently block legitimate history."""
         module = _load_script()
         span_gone = module.span_hash("gone.py", "gpt/BLOCKING")
@@ -1033,3 +1047,229 @@ class TestDispositionViolations:
 
         assert violations == sorted(violations)
         assert len(violations) == 1
+
+
+# ---------------------------------------------------------------------------
+# Whole-design lanes reach the drill-in with span ids of their own. FINDING_RE
+# reads the `BLOCKING -- path:line` shape only GPT and Opus emit, so a Design
+# or First Principles Watch item is invisible to FINDING_RE alone even though
+# SKILL.md ranks those lanes ABOVE the line-level ones in triage.
+# ---------------------------------------------------------------------------
+
+
+def _design_body(verdict: str = "CONCERNS", head: str = _HEAD) -> str:
+    return (
+        "<!-- design-review -->\n"
+        "Design-Verdict: {}\n\n"
+        "**The win32 predicate depends on a macOS-only settings file.**\n\n"
+        "### Watch\n"
+        "- Absent-file -> False raises SandboxUnavailableError at boot on a\n"
+        "  default Windows install.\n"
+        "  Clears when: kiro-cli confirms the key is read on win32.\n\n"
+        "### Suggestions\n"
+        "1. Split the probe out of the predicate.\n\n"
+        "[DESIGN-REVIEWED] {}".format(verdict, head)
+    )
+
+
+def _run_findings(module: ModuleType, comments: list[dict]) -> None:
+    payload = json.dumps(
+        {
+            "number": 42,
+            "url": "https://github.com/example/repo/pull/42",
+            "headRefOid": _HEAD,
+            "statusCheckRollup": [],
+        }
+    )
+
+    def fake_run(args: list[str]) -> tuple[int, str, str]:
+        if args[:3] == ["gh", "auth", "status"]:
+            return 0, "", ""
+        if args[:3] == ["gh", "pr", "view"]:
+            return 0, payload, ""
+        raise AssertionError("unexpected command: {}".format(args))
+
+    module.run = fake_run
+    module.iter_unresolved_threads = lambda *_a: iter(())
+    module.fetch_bot_comments = lambda *_a: comments
+
+
+class TestWholeDesignItems:
+    def test_design_items_print_above_the_line_level_findings(self, capsys) -> None:
+        module = _load_script()
+        gpt = {
+            "user": {"type": "Bot", "login": "github-actions[bot]"},
+            "body": (
+                "<!-- codex-ai-review -->\n"
+                "FINDING -- src/x.py:10 -- tighten -> Fix: x\n"
+                "[GPT-REVIEWED] " + _HEAD
+            ),
+        }
+        design = {"user": {"type": "Bot", "login": "github-actions[bot]"}, "body": _design_body()}
+        _run_findings(module, [gpt, design])
+
+        assert module.main(["pr_findings.py", "42"]) == 0
+
+        out = capsys.readouterr().out
+        items = list(
+            module.extract_design_items([design], _HEAD, dict(module.DEFAULT_MARKER_BINDINGS))
+        )
+        assert len(items) == 2
+        design_at = out.index("span=" + items[0]["span"])
+        gpt_at = out.index("span=" + module.span_hash("src/x.py", "gpt/FINDING"))
+        assert design_at < gpt_at, "whole-design items must outrank line-level findings"
+        assert "DESIGN: verdict=CONCERNS" in out
+        assert "[WATCH]" in out and "[SUGGESTIONS]" in out
+        assert "Clears when: kiro-cli confirms the key is read on win32." in out
+
+    def test_an_item_without_a_clears_when_line_prints_no_empty_one(self, capsys) -> None:
+        module = _load_script()
+        design = {
+            "user": {"type": "Bot", "login": "github-actions[bot]"},
+            "body": (
+                "<!-- design-review -->\n"
+                "Design-Verdict: CONCERNS\n\n"
+                "### Watch\n"
+                "- the deleted pin was the only regression guard\n\n"
+                "[DESIGN-REVIEWED] " + _HEAD
+            ),
+        }
+        _run_findings(module, [design])
+
+        module.main(["pr_findings.py", "42"])
+
+        out = capsys.readouterr().out
+        assert "the deleted pin was the only regression guard" in out
+        assert "Clears when:" not in out
+
+    def test_a_stale_design_stamp_contributes_no_items(self, capsys) -> None:
+        module = _load_script()
+        design = {
+            "user": {"type": "Bot", "login": "github-actions[bot]"},
+            "body": _design_body(head=_OLD),
+        }
+        _run_findings(module, [design])
+
+        module.main(["pr_findings.py", "42"])
+
+        out = capsys.readouterr().out
+        assert "no whole-design lane stamped for the current head" in out
+        assert "[WATCH]" not in out
+
+    def test_a_pass_lane_prints_its_verdict_with_no_items(self, capsys) -> None:
+        module = _load_script()
+        design = {
+            "user": {"type": "Bot", "login": "github-actions[bot]"},
+            "body": (
+                "<!-- design-review -->\n"
+                "Design-Verdict: PASS\n\n"
+                "**Sound: the change is scoped to the one predicate.**\n\n"
+                "[DESIGN-REVIEWED] " + _HEAD
+            ),
+        }
+        _run_findings(module, [design])
+
+        module.main(["pr_findings.py", "42"])
+
+        out = capsys.readouterr().out
+        assert "DESIGN: verdict=PASS" in out
+        assert "no Blockers/Watch/Subtraction/Suggestion items" in out
+
+    def test_control_characters_in_an_item_are_stripped(self, capsys) -> None:
+        """Item text is untrusted, model-authored bytes printed to a terminal."""
+        module = _load_script()
+        design = {
+            "user": {"type": "Bot", "login": "github-actions[bot]"},
+            "body": (
+                "<!-- design-review -->\n"
+                "Design-Verdict: CONCERNS\n\n"
+                "### Watch\n"
+                "- \x1b[31mred\x1b[0m item\n\n"
+                "[DESIGN-REVIEWED] " + _HEAD
+            ),
+        }
+        _run_findings(module, [design])
+
+        module.main(["pr_findings.py", "42"])
+
+        out = capsys.readouterr().out
+        assert "\x1b[" not in out
+        assert "red item" in out
+
+    def test_a_token_in_an_item_is_redacted(self, capsys) -> None:
+        module = _load_script()
+        design = {
+            "user": {"type": "Bot", "login": "github-actions[bot]"},
+            "body": (
+                "<!-- design-review -->\n"
+                "Design-Verdict: CONCERNS\n\n"
+                "### Watch\n"
+                "- the sample uses ghp_" + "a" * 30 + " inline\n\n"
+                "[DESIGN-REVIEWED] " + _HEAD
+            ),
+        }
+        _run_findings(module, [design])
+
+        module.main(["pr_findings.py", "42"])
+
+        out = capsys.readouterr().out
+        assert "ghp_" + "a" * 30 not in out
+        assert "[REDACTED]" in out
+
+    def test_the_design_helpers_are_the_shared_contract_in_both_entrypoints(self) -> None:
+        """Same seam as the existing parity pin: one definition of the design
+        extractor, resolved by both CLIs from the shared contract."""
+        findings = _load_script()
+        status = _load_status()
+        for name in (
+            "extract_design_items",
+            "design_lane_verdicts",
+            "CLEARS_WHEN_RE",
+        ):
+            assert getattr(findings, name) is getattr(findings._review_contract, name), name
+        for name in (
+            "extract_design_items",
+            "design_lane_verdicts",
+            "unanswered_concern_lanes",
+            "unanswered_concerns_reason",
+            "WHOLE_DESIGN_LANES",
+            "VERDICT_LINE_RE",
+        ):
+            assert getattr(status, name) is getattr(status._review_contract, name), name
+
+    def test_design_items_stay_out_of_the_extract_findings_universe(self) -> None:
+        """The load-bearing separation: disposition_violations (and therefore
+        pr-readiness.yml's server-side gate) reads extract_findings, so a
+        design body must contribute NO span there. Folding them in would turn a
+        valid spanless target=design record into a violation."""
+        module = _load_script()
+        design = {"user": {"type": "Bot", "login": "github-actions[bot]"}, "body": _design_body()}
+        bindings = dict(module.DEFAULT_MARKER_BINDINGS)
+
+        assert list(module.extract_findings([design], _HEAD, bindings)) == []
+        assert list(module.extract_design_items([design], _HEAD, bindings))
+
+    def test_the_not_justified_section_is_an_item_section(self) -> None:
+        """The section the prompts gained for the premise gate. Its items are
+        exactly the ones a PASS verdict would otherwise bury, so they must reach the loop with
+        span ids like any other."""
+        module = _load_script()
+        comment = {
+            "user": {"type": "Bot", "login": "github-actions[bot]"},
+            "body": (
+                "<!-- first-principles-review -->\n"
+                "First-Principles-Verdict: CONCERNS\n\n"
+                "### Not justified as shipped\n"
+                "- the win32 probe rides along on the macOS twin's symmetry\n"
+                "  Clears when: kiro-cli confirms the key is read on win32.\n\n"
+                "[FIRST-PRINCIPLES-REVIEWED] " + _HEAD
+            ),
+        }
+
+        items = list(
+            module.extract_design_items([comment], _HEAD, dict(module.DEFAULT_MARKER_BINDINGS))
+        )
+
+        assert [i["kind"] for i in items] == ["NOT JUSTIFIED AS SHIPPED"]
+        assert items[0]["reviewer"] == "first-principles"
+        assert items[0]["clears_when"] == "kiro-cli confirms the key is read on win32."

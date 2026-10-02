@@ -1,10 +1,10 @@
 ---
 title: Update Architecture (install-shape capability contract)
-status: draft
+status: partial
 author: zezhexu
 created: 2026-07-31
-last-audited: 2026-08-06
-audited-at: 8861f89e
+last-audited: 2026-09-22
+audited-at: 80bd0a81f
 doc-pr: 1003
 implementation-prs: [1734]
 tracking-issues: []
@@ -13,14 +13,13 @@ superseded-by: []
 ---
 # RFC: Update Architecture (install-shape capability contract)
 
-- Status: draft — **Phase 1 is now partly implemented.** PR #1734 (merged,
-  `8861f89e`) shipped the install-shape → behavior derivation for the *check* path
-  and the SPA surfaces that read it. What that PR closed, and what it did not, is
-  itemized under **Implementation status** below; the phase list further down has
-  been amended to match. Adjacent in-flight under a **different** design: PR #999
-  (`feat/emergency-release-controls`, open) adds a feed-served minimum version +
-  mandatory-update modal for the desktop lane only, without the capability
-  contract.
+- Status: partial — the backend capability contract
+  (`platform/update_capability.py`), managed-venv wheel engine
+  (`platform/wheel_engine.py`) and host-local dashboard approval step-up
+  (`platform/update_stepup.py`) ship. The source-tree automatic apply and legacy
+  `auto_update` surfaces remain, while the Phase 3 `state` / `progress` and
+  shared drain-and-restart contract are still open. The implementation-status
+  sections below preserve earlier audit snapshots; current code is authoritative.
 - Correction to the reference below: KiroCrew ships **five** distribution shapes, not the set implied — `beacon.py:155` lists `{dmg, appimage, wheel, source, docker}`.
 - Author: zezhexu
 - Created: 2026-07-31
@@ -43,13 +42,21 @@ cannot make yet, so superseded trees stay as manual recovery targets.
 `cli.sh` repoints the stable link at the legacy tree after its own installs,
 so the link always names the last-installed version whichever writer ran.
 Gateway restarts resolve their interpreter through the stable link
-(`respawn_executable`), which is the `updates.py` launch path from §3's list;
-the service-unit and macOS-launcher rewrites, the in-app Apply now ships WITH its OQ7 step-up: the SPA's
+(`respawn_executable`), which is the `updates.py` launch path from §3's list.
+Dashboard apply handlers load that resolver before an update can replace the
+running install tree and pass it to the restart helper. A plain restart loads
+the resolver when invoked.
+The service-unit and macOS-launcher rewrites remain separate. The in-app Apply
+now ships WITH its OQ7 step-up: the SPA's
 Update button arms a pending request (`POST /api/update/arm`; single-use
 nonce, TTL 10 min, written owner-only to the data home and never returned to
 the SPA), and `kirocrew update approve` on the gateway host presents the
 nonce back (`POST /api/update/approve`, loopback + unix-socket preferred),
-upon which the gateway runs the shadow apply itself and restarts. The full
+upon which the gateway removes the nonce before accepting the approval, fails
+closed if that removal does not succeed, and serializes that read-validate-remove
+against a concurrent re-arm so the request it removes is always the request it
+validated, then runs the shadow apply itself and
+restarts. The full
 drain lease (§5) and hash-pinned dependency constraints remain open. pipx
 installs keep the installer re-run.
 
@@ -211,13 +218,14 @@ re-asked which shapes it still governs.
    `isDesktop`; `SettingsPage.tsx:92` couples differently — it selects the
    desktop-only redux field `desktopUpdateAvailable`, mirrored from the Electron
    updater, so on a wheel install its update nudge simply never lights up. The
-   changelog modal at `App.tsx:1709` does neither. That modal fires on the first
+   changelog modal (`ChangelogModal`, `website/src/shell/updates/updateFlow.tsx`)
+   does neither. That modal fires on the first
    launch after a version change — i.e. immediately after an OTA install — and
    renders:
-   - an **inert** "Auto-update on restart" toggle (`App.tsx:1739`) writing
+   - an **inert** "Auto-update on restart" toggle (in `ChangelogModal`) writing
      `auto_update`, which nothing on a packaged install reads; and
    - an **Update now** button whenever `updateAvailable` is true, where
-     `updateAvailable` includes `desktopUpdateAvailable` (`App.tsx:728`,
+     `updateAvailable` includes `desktopUpdateAvailable` (the `updateAvailable` selector in `App.tsx`,
      mirrored from the Electron updater). It POSTs to the git-only
      `/api/update`, which answers 400 or `409 Not a git checkout — update by
      redeploying (e.g. \`kirocrew cloud launch\`)`. A `.dmg` user is told to run
@@ -230,8 +238,8 @@ re-asked which shapes it still governs.
    in-app Update button where `POST /api/update` would 409, and surfaces the
    installer command instead. The other two surfaces are **unchanged** —
    `SettingsPage.tsx` still selects the desktop-only `desktopUpdateAvailable`
-   (so its nudge still never lights on a wheel install), and the `App.tsx`
-   changelog modal still has no capability check at all. Phase 1b converts both.
+   (so its nudge still never lights on a wheel install), and the changelog
+   modal (`ChangelogModal`) still has no capability check at all. Phase 1b converts both.
    Note also that #1734 fixed the *check*, not the *apply*: Problem 1 stands in
    full.
 
@@ -425,7 +433,7 @@ opt-out. Without it in the contract, the UI can show that an update is
 mandatory but not why.
 
 The three consumers — `AboutPanel.tsx`, `SettingsPage.tsx`, and the
-`App.tsx:1709` changelog modal — read only this contract. Each sheds a
+changelog modal (`ChangelogModal`) — read only this contract. Each sheds a
 *different* coupling: `AboutPanel.tsx:491` loses its `isDesktop` branch,
 `SettingsPage.tsx:92` stops selecting `desktopUpdateAvailable` in favour of the
 contract's `state` / `latest_version`, and the changelog modal gains the
@@ -662,8 +670,8 @@ as one.
 - **Phase 1b — remaining.** Add `platform/update_capability.py` and serve the §2
   contract; collapse the three ad-hoc `.git` derivations into it (Open Question
   5); convert the two SPA surfaces 1a did **not** touch — `SettingsPage.tsx`
-  (still selecting the desktop-only `desktopUpdateAvailable`) and the `App.tsx`
-  changelog modal (still no capability check at all); de-arm the boot-time git
+  (still selecting the desktop-only `desktopUpdateAvailable`) and the changelog
+  modal, `ChangelogModal` (still no capability check at all); de-arm the boot-time git
   apply; retire the three `auto_update` surfaces named under Migration.
   **Problem 2 is only PARTLY closed by 1a** — `AboutPanel.tsx` reads capability,
   the other two surfaces do not, so the third-instance-of-the-same-class defect

@@ -102,7 +102,10 @@ class TestAgentCreate:
         assert "research" in saved["agents"]
         assert saved["agents"]["research"]["kiro_agent"] == "kirocrew"
         assert saved["agents"]["research"]["workspace"] == "default"
-        assert saved["agents"]["research"]["memory_store"] == "default"
+        store = saved["agents"]["research"]["memory_store"]
+        assert store != "default"
+        assert saved["memory_stores"][store]["owner_member"] == "research"
+        assert saved["memory_stores"][store]["memory_version"] == 2
 
     def test_create_duplicate_exits_nonzero(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -123,9 +126,139 @@ class TestAgentCreate:
         err = capsys.readouterr().err
         assert "already exists" in err
 
+    def test_create_free_form_name_keys_a_derived_id(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        cfg_path = _write_config(tmp_path, _base_config())
+
+        with (
+            unittest.mock.patch("kiro_crew.config.loader.config_path", return_value=cfg_path),
+            unittest.mock.patch(
+                "sys.argv",
+                ["kirocrew", "agent", "create", "--name", "Release Writer"],
+            ),
+        ):
+            main()
+
+        assert "Created agent: release-writer (display name: Release Writer)" in (
+            capsys.readouterr().out
+        )
+        saved = json.loads(cfg_path.read_text(encoding="utf-8"))
+        assert "Release Writer" not in saved["agents"]
+        assert saved["agents"]["release-writer"]["display_name"] == "Release Writer"
+
+    def test_create_display_name_flag_labels_an_id(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        cfg_path = _write_config(tmp_path, _base_config())
+
+        with (
+            unittest.mock.patch("kiro_crew.config.loader.config_path", return_value=cfg_path),
+            unittest.mock.patch(
+                "sys.argv",
+                ["kirocrew", "agent", "create", "--name", "scribe", "--display-name", "Scribe"],
+            ),
+        ):
+            main()
+
+        saved = json.loads(cfg_path.read_text(encoding="utf-8"))
+        assert saved["agents"]["scribe"]["display_name"] == "Scribe"
+
+    def test_create_rejects_free_form_template_identifier(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        cfg_path = _write_config(tmp_path, _base_config())
+
+        with (
+            unittest.mock.patch("kiro_crew.config.loader.config_path", return_value=cfg_path),
+            unittest.mock.patch(
+                "sys.argv",
+                [
+                    "kirocrew",
+                    "agent",
+                    "create",
+                    "--name",
+                    "dr. eggbot",
+                    "--kiro-agent",
+                    "dr. eggbot",
+                ],
+            ),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            main()
+
+        assert exc_info.value.code != 0
+        assert "invalid kiro agent name" in capsys.readouterr().err
+
+    def test_create_rejects_credential_shaped_member_name(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        cfg_path = _write_config(tmp_path, _base_config())
+        name = "https://user:password@example.com"
+        with (
+            unittest.mock.patch("kiro_crew.config.loader.config_path", return_value=cfg_path),
+            unittest.mock.patch(
+                "sys.argv",
+                [
+                    "kirocrew",
+                    "agent",
+                    "create",
+                    "--name",
+                    name,
+                    "--kiro-agent",
+                    "kirocrew",
+                ],
+            ),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            main()
+
+        assert exc_info.value.code != 0
+        error = capsys.readouterr().err
+        assert "invalid Crew Member name" in error
+        assert name not in error
+
 
 class TestAgentUpdate:
     """Test ``kirocrew agent update``."""
+
+    def test_template_update_retains_a_concurrent_workspace_edit(self, tmp_path: Path) -> None:
+        from kiro_crew.config.loader import update_config_locked
+        from kiro_crew.memory_stores import persist_member_config
+
+        data = _base_config()
+        data["agents"]["research"] = {
+            "kiro_agent": "kirocrew",
+            "workspace": "default",
+            "memory_store": "default",
+        }
+        cfg_path = _write_config(tmp_path, data)
+
+        def publish_after_concurrent_edit(*args, **kwargs):
+            def mutate(doc):
+                doc["agents"]["research"]["workspace"] = "concurrent-workspace"
+                return doc
+
+            update_config_locked(mutate=mutate)
+            return persist_member_config(*args, **kwargs)
+
+        with (
+            unittest.mock.patch("kiro_crew.config.loader.config_path", return_value=cfg_path),
+            unittest.mock.patch(
+                "kiro_crew.cli_commands.persist_member_config",
+                side_effect=publish_after_concurrent_edit,
+            ),
+            unittest.mock.patch(
+                "sys.argv",
+                ["kirocrew", "agent", "update", "research", "--kiro-agent", "new-template"],
+            ),
+        ):
+            main()
+
+        saved = json.loads(cfg_path.read_text(encoding="utf-8"))
+        assert saved["agents"]["research"]["kiro_agent"] == "new-template"
+        assert saved["agents"]["research"]["workspace"] == "concurrent-workspace"
+        assert saved["agents"]["research"]["memory_store"] == "default"
 
     def test_update_nonexistent_exits_nonzero(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -145,6 +278,30 @@ class TestAgentUpdate:
         assert exc_info.value.code != 0
         err = capsys.readouterr().err
         assert "not found" in err
+
+    def test_update_rejects_free_form_template_identifier(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        data = _base_config()
+        data["agents"]["research"] = {
+            "kiro_agent": "kirocrew",
+            "workspace": "default",
+            "memory_store": "default",
+        }
+        cfg_path = _write_config(tmp_path, data)
+
+        with (
+            unittest.mock.patch("kiro_crew.config.loader.config_path", return_value=cfg_path),
+            unittest.mock.patch(
+                "sys.argv",
+                ["kirocrew", "agent", "update", "research", "--kiro-agent", "dr. eggbot"],
+            ),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            main()
+
+        assert exc_info.value.code != 0
+        assert "invalid kiro agent name" in capsys.readouterr().err
 
 
 class TestAgentDelete:

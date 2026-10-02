@@ -10,7 +10,7 @@ main agent's turn-resilience ladder:
    preserved, ``user_stop`` tombstone, ``subagent_done`` carries ``stopped: true``.
 3. Unexpected-cancel one-shot auto-continue (``_schedule_cancel_recovery``):
    a non-user, non-shutdown task cancellation respawns the run exactly once.
-   Mirrors the main path's cancel recovery (PR #173).
+   Mirrors the main path's cancel recovery.
 4. Orphan-notification wiring: ``_try_inject_orphan_notification`` /
    ``_send_orphan_slack_dm`` delegate to the gateway-wired callbacks instead of
    being stubs.
@@ -103,12 +103,18 @@ def _mock_sessions(stream_factory) -> MagicMock:
     provider.start = AsyncMock()
     provider.shutdown = AsyncMock()
     provider.context_usage_pct = lambda: 0.0
+    # Read synchronously after every turn; as AsyncMock children they
+    # would hand back coroutines nobody awaits.
+    provider.context_window_tokens = lambda: 0
+    provider.context_used_tokens = lambda: 0
+    provider.mcp_session_report = MagicMock(return_value=None)
     provider.stream = MagicMock(side_effect=stream_factory)
     sessions.get_or_create = AsyncMock(return_value=(provider, True, False))
     sessions.release = MagicMock()
     sessions.reset = AsyncMock()
     sessions.record_success = MagicMock()
     sessions.get_agent = MagicMock(return_value="")
+    sessions.get_agent_selection = MagicMock(return_value=("template", ""))
     sessions.get_approval_policy = MagicMock(return_value="auto")
     sessions.has_session = MagicMock(return_value=True)
     sessions._provider = provider
@@ -137,6 +143,28 @@ async def _spawn_and_wait(mgr: SubagentManager, task: str = "do work") -> Subage
         assert info is not None
         await mgr._tasks[info.id]
     return info
+
+
+@pytest.mark.asyncio
+async def test_default_budget_allows_work_past_one_hundred_tools():
+    from kiro_crew.providers.base import EVENT_PERMISSION_REQUEST, LLMEvent
+
+    async def stream(*_args, **_kwargs):
+        for request_id in range(101):
+            yield LLMEvent(
+                kind=EVENT_PERMISSION_REQUEST,
+                title="read bounded input",
+                request_id=request_id,
+                tool_kind="mcp",
+            )
+        yield _text_event("verified result")
+        yield _complete_event()
+
+    manager = _manager(_mock_sessions(stream))
+    info = await _spawn_and_wait(manager)
+    assert info.error == ""
+    assert info.result == "verified result"
+    assert info.turns == 101
 
 
 # ── 1. Transient-backend retry ───────────────────────────────────────
@@ -175,6 +203,83 @@ async def test_transient_error_pretoken_retries_same_prompt():
     assert "recovered result" in info.result
     assert calls == ["built_message", "built_message"]  # pre-token: same prompt
     assert any(e[0] == "subagent_retrying" for e in events)
+
+
+@pytest.mark.asyncio
+async def test_registration_rate_limited_death_retries_pretoken_and_recovers():
+    """A pre-token AcpRegistrationRateLimited (runtime death whose stderr shows
+    a throttled dynamic registration) rides the same zero-activity ladder as any
+    transient: the SAME prompt is re-sent after backoff and the run completes,
+    instead of surfacing a terminal generic process death."""
+    from kiro_crew.acp.client import registration_rate_limited_error
+
+    calls: list[str] = []
+    throttled = registration_rate_limited_error(
+        "Runtime process died during prompt",
+        "Dynamic registration failed: Registration failed: HTTP 429 Too Many Requests",
+    )
+
+    def stream_factory(msg: str, *a, **kw):
+        calls.append(msg)
+
+        async def _gen():
+            if len(calls) <= 2:
+                raise throttled
+            yield _text_event("registered and recovered")
+            yield _complete_event()
+
+        return _gen()
+
+    mgr = _manager(_mock_sessions(stream_factory))
+    # The typed message names a throttle, so the dependency adapters would
+    # classify it and park the run on a coordinator wake this harness does not
+    # drive; a null coordinator pins the IN-TURN ladder, which is the seam
+    # under test.
+    mgr.dependency_coordinator_async = AsyncMock(return_value=None)
+    with patch("kiro_crew.subagent.transient_retry_delay", return_value=0.0):
+        info = await _spawn_and_wait(mgr)
+
+    assert info.error == ""
+    assert "registered and recovered" in info.result
+    # Zero activity on every failed attempt: the original prompt is replayed,
+    # never a continuation that could assume prior work.
+    assert calls == ["built_message"] * 3
+
+
+@pytest.mark.asyncio
+async def test_registration_rate_limited_exhaustion_surfaces_typed_message():
+    """Persistent registration throttling fails after the bounded budget with
+    the typed message (guidance, one retained cause) — not a stderr wall."""
+    from kiro_crew.acp.client import registration_rate_limited_error
+
+    calls: list[str] = []
+
+    def stream_factory(msg: str, *a, **kw):
+        calls.append(msg)
+
+        async def _gen():
+            raise registration_rate_limited_error(
+                "Runtime process died during prompt",
+                "Dynamic registration failed: Registration failed: HTTP 429 Too Many Requests",
+            )
+            yield  # noqa: unreachable — async generator marker
+
+        return _gen()
+
+    mgr = _manager(_mock_sessions(stream_factory))
+    # Same in-turn pin as the recovery test above: the message would otherwise
+    # classify as a dependency signal and wait on an undriven coordinator.
+    mgr.dependency_coordinator_async = AsyncMock(return_value=None)
+    with (
+        patch("kiro_crew.subagent.transient_retry_delay", return_value=0.0),
+        patch("kiro_crew.subagent.configured_fallback_chain", return_value=()),
+    ):
+        info = await _spawn_and_wait(mgr)
+
+    assert info.done is True
+    assert "rate-limited" in info.error
+    assert "retry later" in info.error
+    assert len(calls) == 1 + TRANSIENT_RETRIES  # initial + bounded retries
 
 
 @pytest.mark.asyncio
@@ -321,7 +426,7 @@ async def test_throttle_fallback_chain_exhausted_propagates():
 
     assert info.done is True
     assert "500" in info.error
-    # #5447 item 1: the terminal error text names the WHOLE walk, not just the
+    # The terminal error text names the WHOLE walk, not just the
     # last candidate's failure — the chain story is appended to info.error.
     assert "primary-model throttled" in info.error
     assert "fb-1" in info.error and "also unavailable" in info.error
@@ -331,7 +436,7 @@ async def test_throttle_fallback_chain_exhausted_propagates():
 
 @pytest.mark.asyncio
 async def test_throttle_fallback_ladder_routes_through_shared_budget_body():
-    """DRIFT PIN (#5447 item 2): the ladder must consult
+    """DRIFT PIN: the ladder must consult
     FallbackState.should_retry_active for the per-candidate budget. Forcing
     the shared body to refuse retries changes the attempt count — proof the
     budget is not re-encoded locally (mirror of the stream_and_collect pin in
@@ -379,7 +484,7 @@ async def test_throttle_fallback_story_survives_a_verbose_error():
     """A verbose backend error fills _describe_exception to its cap — the
     story must still be present in info.error (the error tail is what gets
     trimmed, never the walk), and the total stays bounded."""
-    from kiro_crew.subagent import _MAX_ERROR_DETAIL_LEN
+    from kiro_crew.process_identity import MAX_ERROR_DETAIL_LEN
 
     calls: list[str] = []
 
@@ -387,7 +492,7 @@ async def test_throttle_fallback_story_survives_a_verbose_error():
         calls.append(msg)
 
         async def _gen():
-            raise _TransientError("backend throttle 500 " + "x" * (3 * _MAX_ERROR_DETAIL_LEN))
+            raise _TransientError("backend throttle 500 " + "x" * (3 * MAX_ERROR_DETAIL_LEN))
             yield  # noqa: unreachable — async generator marker
 
         return _gen()
@@ -412,7 +517,7 @@ async def test_throttle_fallback_story_survives_a_verbose_error():
         info = await _spawn_and_wait(mgr)
 
     assert info.done is True
-    assert len(info.error) <= _MAX_ERROR_DETAIL_LEN
+    assert len(info.error) <= MAX_ERROR_DETAIL_LEN
     assert info.error.endswith("[primary-model throttled; fallbacks fb-1 also unavailable]")
 
 
@@ -650,7 +755,7 @@ async def test_orphan_injection_delegates_to_callback():
     with patch("kiro_crew.subagent.sel"):
         ok = await mgr._try_inject_orphan_notification("dashboard:main", "msg")
     assert ok is True
-    # The structured completion facts (#1792) are forwarded as a third arg;
+    # The structured completion facts are forwarded as a third arg;
     # a direct call with no meta passes None through unchanged.
     notify.assert_awaited_once_with("dashboard:main", "msg", None)
 
@@ -738,7 +843,7 @@ async def test_cancel_recovery_waits_for_slow_teardown():
 
     reset_done = asyncio.Event()
 
-    async def _slow_reset(key):
+    async def _slow_reset(key, **_):
         await asyncio.sleep(0.5)
         reset_done.set()
 
@@ -1007,6 +1112,11 @@ def test_no_raw_cancel_outside_chokepoint():
         # trigger a respawn (it only ever DISPATCHES via continue_conversation,
         # which cancel_all pre-empts by cancelling watchers first).
         "followup_watcher.cancel()",
+        # The pending async OPEN of the durable task store, cancelled by ``close()``.
+        # It is a store-open task, not a managed run: no terminal marker applies and
+        # cancelling it cannot trigger a respawn. Left pending it would complete after
+        # the close and re-attach the connection this method exists to release.
+        "taskq_open_task.cancel()",
     )
     chokepoint_src = inspect.getsource(subagent_mod.SubagentManager._cancel_task_intentionally)
     assert "task.cancel()" in chokepoint_src
@@ -1023,6 +1133,7 @@ def test_no_raw_cancel_outside_chokepoint():
         and "_reaper_task" not in line
         and "recovery_task" not in line
         and "report_task" not in line
+        and "taskq_open_task" not in line
     ]
     assert len(generic) == 1, (
         f"expected exactly one raw task.cancel() (the chokepoint body), " f"found: {generic}"
@@ -1110,3 +1221,92 @@ async def test_reconcile_single_orphan_dm_is_not_wrapped_in_digest():
     msg = dm.await_args.args[0]
     assert "solo-1" in msg
     assert "restart digest" not in msg
+
+
+def _streams_then_fails(error: Exception, text: str = "the answer "):
+    def stream_factory(msg: str, *a, **kw):
+        async def _gen():
+            if text:
+                yield _text_event(text)
+            raise error
+
+        return _gen()
+
+    return stream_factory
+
+
+_GENERATE_FAILED = "The model failed to generate a response (transient error)."
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("keep", ["head", "tail"])
+async def test_generate_failed_after_output_keeps_the_output_with_a_warning(keep):
+    """Output already streamed survives a transient generate failure the retry cannot fix.
+
+    Longer than the keep cap, so a warning added before the cap would be cut off."""
+    error, text = _TransientError(_GENERATE_FAILED), "x" * 4000
+    calls: list[str] = []
+    factory = _streams_then_fails(error, text)
+
+    def _recording(msg: str, *a, **kw):
+        calls.append(msg)
+        return factory(msg, *a, **kw)
+
+    mgr = _manager(_mock_sessions(_recording))
+    mgr.update_completion_keep(keep, 3000)
+    with patch("kiro_crew.subagent.transient_retry_delay", return_value=0.0):
+        info = await _spawn_and_wait(mgr)
+
+    assert info.outcome == "completed"
+    assert not info.error
+    assert info.partial is True
+    assert info.result.startswith("_Warning: the backend failed to generate")
+    assert "xxxx" in info.result
+    # The output is kept only after the one continue turn was tried.
+    assert len(calls) == 2 and calls[1] == _TRANSIENT_CONTINUE_MSG
+    # The disk copy, read by spawn_status / spawn_run, carries the warning too.
+    from pathlib import Path
+
+    assert info.result_path
+    assert "_Warning: the backend failed to generate" in Path(info.result_path).read_text()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "text"),
+    [
+        (_TransientError("500 mid-stream"), "the answer "),  # transient, not generate-failed
+        (_FatalError(_GENERATE_FAILED), "the answer "),  # not transient
+        (_TransientError(_GENERATE_FAILED), " "),  # whitespace-only output
+    ],
+)
+async def test_other_failures_after_output_still_fail(error, text):
+    mgr = _manager(_mock_sessions(_streams_then_fails(error, text)))
+    with patch("kiro_crew.subagent.transient_retry_delay", return_value=0.0):
+        info = await _spawn_and_wait(mgr)
+
+    assert info.outcome == "failed"
+    assert info.error
+
+
+@pytest.mark.asyncio
+async def test_control_tag_only_output_still_fails():
+    """Output that is only an [OPTIONS: ...] tag is empty once the tag is stripped."""
+    calls: list[str] = []
+
+    def stream_factory(msg: str, *a, **kw):
+        calls.append(msg)
+
+        async def _gen():
+            if len(calls) == 1:
+                yield _text_event("[OPTIONS: Retry | Stop]")
+            raise _TransientError(_GENERATE_FAILED)
+
+        return _gen()
+
+    mgr = _manager(_mock_sessions(stream_factory))
+    with patch("kiro_crew.subagent.transient_retry_delay", return_value=0.0):
+        info = await _spawn_and_wait(mgr)
+
+    assert info.outcome == "failed"
+    assert info.error
